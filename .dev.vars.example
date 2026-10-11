@@ -1,0 +1,8 @@
+# Copy to gitignored .dev.vars and set approved local development values.
+AUTH_BASE_URL=https://<auth-host>
+AUTH_CLIENT_ID=<client-id>
+AUTH_CALLBACK_URL=http://localhost:19130/auth/callback
+AUTH_ISSUER=https://<issuer>
+AUTH_JWKS_URL=https://<issuer>/.well-known/jwks.json
+HUB_ADMINS=<approved-admin-email>
+SESSION_SECRET=<random-secret-at-least-32-characters>

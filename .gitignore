@@ -5,3 +5,7 @@ dist/
 .local/
 __pycache__/
 *.pyc
+
+# Private launcher telemetry and validation evidence
+*-telemetry.jsonl
+evidence.log
