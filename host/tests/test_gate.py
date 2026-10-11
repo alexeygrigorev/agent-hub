@@ -31,17 +31,18 @@ class TestGate(unittest.TestCase):
         
         # First call hits subprocess
         res1 = gate.get_gate_status(MockClock(100.0))
-        self.assertTrue(res1["launch_allowed"])
+        self.assertFalse(res1["launch_allowed"])
+        self.assertEqual(res1["reason"], "pending#59")
         self.assertEqual(mock_run.call_count, 1)
         
         # Second call within 300s uses cache
         res2 = gate.get_gate_status(MockClock(200.0))
-        self.assertTrue(res2["launch_allowed"])
+        self.assertFalse(res2["launch_allowed"])
         self.assertEqual(mock_run.call_count, 1)
         
         # Third call after 300s hits subprocess again
         res3 = gate.get_gate_status(MockClock(500.0))
-        self.assertTrue(res3["launch_allowed"])
+        self.assertFalse(res3["launch_allowed"])
         self.assertEqual(mock_run.call_count, 2)
         
     @patch("os.path.exists")
@@ -52,8 +53,9 @@ class TestGate(unittest.TestCase):
         mock_run.return_value.stdout = '{"launch_allowed": true, "reason": "minimum available window 95% remaining"}'
         
         res = gate.get_gate_status(MockClock(100.0))
-        self.assertTrue(res["launch_allowed"])
-        self.assertEqual(res["reason"], "quota ok")
+        self.assertFalse(res["launch_allowed"])
+        self.assertEqual(res["reason"], "pending#59")
+        
 
     @patch("os.path.exists")
     @patch("subprocess.run")

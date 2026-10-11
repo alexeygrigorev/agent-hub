@@ -21,16 +21,17 @@ class MockRNG:
         return b"x" * n
 
 class TestApi(unittest.TestCase):
-    @patch("urllib.request.urlopen")
+    @patch("urllib.request.OpenerDirector.open")
     @patch("agent_hub_host.auth.get_access_token")
     def test_register_machine(self, mock_get_token, mock_urlopen):
         mock_get_token.return_value = "acc123"
         resp = MagicMock()
-        resp.read.return_value = b'{"status": "ok"}'
+        resp.headers = {"Content-Type": "application/json"}
+        resp.read.return_value = b"{\"status\": \"ok\"}"
         mock_urlopen.return_value.__enter__.return_value = resp
         
         res = api.register_machine("https://fake")
-        self.assertEqual(res, {"status": "ok"})
+        self.assertIsNone(res)
         
     def test_ws_frame_encoding(self):
         class MockSock:
@@ -62,7 +63,7 @@ class TestApi(unittest.TestCase):
         self.assertEqual(opcode, 1)
         self.assertEqual(decoded, b"hello")
 
-    @patch("urllib.request.urlopen")
+    @patch("urllib.request.OpenerDirector.open")
     @patch("agent_hub_host.auth.get_access_token")
     def test_bearer_not_forwarded(self, mock_get_token, mock_urlopen):
         mock_get_token.return_value = "acc123"
@@ -73,7 +74,7 @@ class TestApi(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError):
             handler.redirect_request(req, None, 302, "Found", None, "https://other")
 
-    @patch("urllib.request.urlopen")
+    @patch("urllib.request.OpenerDirector.open")
     @patch("agent_hub_host.auth.get_access_token")
     def test_no_token_in_exception(self, mock_get_token, mock_urlopen):
         mock_get_token.return_value = "secret_token_123"

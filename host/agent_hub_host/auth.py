@@ -4,18 +4,10 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from . import config
-
-def is_https_or_localhost(url: str) -> bool:
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme == "https":
-        return True
-    if parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1"):
-        return True
-    return False
+from . import api
 
 def device_login(base_url: str, client_kind: str, name: str, hostname: str, requested_scopes: list):
-    if not is_https_or_localhost(base_url):
-        raise ValueError("Only HTTPS URLs or localhost are permitted.")
+    api.check_url(base_url)
     
     code_url = f"{base_url}/api/device/code"
     code_payload = json.dumps({
@@ -27,8 +19,7 @@ def device_login(base_url: str, client_kind: str, name: str, hostname: str, requ
     
     req = urllib.request.Request(code_url, data=code_payload, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req) as response:
-            code_res = json.loads(response.read().decode("utf-8"))
+        code_res = api.safe_http_json(req)
     except urllib.error.URLError as e:
         raise RuntimeError(f"Network error during device code request: {e}")
     
@@ -58,19 +49,21 @@ def device_login(base_url: str, client_kind: str, name: str, hostname: str, requ
         
         treq = urllib.request.Request(token_url, data=token_payload, headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(treq) as response:
-                token_res = json.loads(response.read().decode("utf-8"))
-                config.update_config(
-                    access_token=token_res["access_token"],
-                    refresh_token=token_res.get("refresh_token"),
-                    base_url=base_url
-                )
-                print("Login successful.")
-                return
+            token_res = api.safe_http_json(treq)
+            config.update_config(
+                access_token=token_res["access_token"],
+                refresh_token=token_res.get("refresh_token"),
+                base_url=base_url
+            )
+            print("Login successful.")
+            return
         except urllib.error.HTTPError as e:
             if e.code == 400:
-                err_res = json.loads(e.read().decode("utf-8"))
-                err_code = err_res.get("error")
+                try:
+                    err_res = json.loads(e.read().decode("utf-8"))
+                    err_code = err_res.get("error")
+                except Exception:
+                    raise RuntimeError("Token error: malformed response")
                 if err_code == "authorization_pending":
                     continue
                 elif err_code == "slow_down":
@@ -107,13 +100,12 @@ def refresh_token():
         
         req = urllib.request.Request(token_url, data=token_payload, headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req) as response:
-                token_res = json.loads(response.read().decode("utf-8"))
-                config.update_config(
-                    access_token=token_res["access_token"],
-                    refresh_token=token_res.get("refresh_token", refresh)
-                )
-                return token_res["access_token"]
+            token_res = api.safe_http_json(req)
+            config.update_config(
+                access_token=token_res["access_token"],
+                refresh_token=token_res.get("refresh_token", refresh)
+            )
+            return token_res["access_token"]
         except urllib.error.HTTPError as e:
             config.clear_config()
             config.update_config(base_url=base_url)

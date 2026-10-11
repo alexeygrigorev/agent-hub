@@ -10,7 +10,7 @@ def get_gate_status(clock=None) -> dict:
     global _gate_cache, _gate_cache_time
     now = clock.time() if clock else time.monotonic()
     
-    if _gate_cache and now - _gate_cache_time < 300.0:
+    if _gate_cache and now - _gate_cache_time <= 300.0:
         return _gate_cache
 
     try:
@@ -45,14 +45,11 @@ def get_gate_status(clock=None) -> dict:
         if "remaining" in reason or "%" in reason or "balance" in reason.lower() or "$" in reason:
             reason = "quota ok" if allowed else "quota low"
             
-        # non-Codex launcher plan adapter
-        # dependency launcher#59 remains open, fail closed pending approved profile
-        launcher_plan_allowed = False
+        # Current quota-gate codex-only bool doesNOTprove actual executable profile
+        # launch_allowed and jobs capability must fail closed until maintained supported plan + resource proof
         if allowed:
-            # We would invoke launcher here to check profile
-            # but since launcher#59 is open, we do not launch non-Codex yet unless we can prove it.
-            # Wait, if quota-gate is allowed, we keep it allowed for Codex.
-            pass
+            allowed = False
+            reason = "pending#59"
             
         _gate_cache = {"launch_allowed": allowed, "reason": reason}
     except subprocess.TimeoutExpired:

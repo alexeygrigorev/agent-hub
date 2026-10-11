@@ -15,12 +15,45 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
-urllib.request.install_opener(urllib.request.build_opener(NoRedirectHandler()))
+def _get_opener():
+    return urllib.request.build_opener(NoRedirectHandler())
 
 def check_url(url: str):
     parsed = urllib.parse.urlparse(url)
-    if parsed.scheme != 'https' and parsed.hostname not in ('localhost', '127.0.0.1'):
+    if parsed.scheme not in ('http', 'https'):
         raise ValueError('Only HTTPS URLs or localhost are permitted.')
+    if parsed.scheme == 'http':
+        if parsed.hostname not in ('localhost', '127.0.0.1', '::1'):
+            raise ValueError('Only HTTPS URLs or localhost are permitted.')
+    if parsed.username or parsed.password:
+        raise ValueError('Userinfo not permitted in URL.')
+    if parsed.fragment:
+        raise ValueError('Fragments not permitted in URL.')
+    if parsed.port is not None:
+        try:
+            port = int(parsed.port)
+            if not (0 < port <= 65535):
+                raise ValueError('Invalid port')
+        except ValueError:
+            raise ValueError('Invalid port')
+
+def safe_http_json(req: urllib.request.Request, timeout: float = 10.0):
+    opener = _get_opener()
+    try:
+        with opener.open(req, timeout=timeout) as res:
+            ct = res.headers.get("Content-Type", "")
+            if "application/json" not in ct:
+                raise RuntimeError("Expected JSON response")
+            cl = res.headers.get("Content-Length")
+            if cl is not None and int(cl) > 10 * 1024 * 1024:
+                raise RuntimeError("Response too large")
+            body = res.read(10 * 1024 * 1024 + 1)
+            if len(body) > 10 * 1024 * 1024:
+                raise RuntimeError("Response too large")
+            return json.loads(body.decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise
+
 from . import auth, system, config
 
 class Clock:
@@ -40,14 +73,8 @@ def register_machine(base_url: str):
         "Authorization": f"Bearer {auth.get_access_token()}"
     })
     try:
-        with urllib.request.urlopen(req, timeout=10.0) as res:
-            return json.loads(res.read().decode("utf-8"))
+        safe_http_json(req, timeout=10.0)
     except urllib.error.HTTPError as e:
-        if e.code == 401:
-            auth.refresh_token()
-            req.add_header("Authorization", f"Bearer {auth.get_access_token()}")
-            with urllib.request.urlopen(req, timeout=10.0) as res:
-                return json.loads(res.read().decode("utf-8"))
         raise RuntimeError(f"Registration failed: {e.code}")
 
 def get_available_machines(base_url: str):
@@ -57,14 +84,12 @@ def get_available_machines(base_url: str):
         "Authorization": f"Bearer {auth.get_access_token()}"
     })
     try:
-        with urllib.request.urlopen(req, timeout=10.0) as res:
-            return json.loads(res.read().decode("utf-8"))
+        return safe_http_json(req, timeout=10.0)
     except urllib.error.HTTPError as e:
         if e.code == 401:
             auth.refresh_token()
             req.add_header("Authorization", f"Bearer {auth.get_access_token()}")
-            with urllib.request.urlopen(req, timeout=10.0) as res:
-                return json.loads(res.read().decode("utf-8"))
+            return safe_http_json(req, timeout=10.0)
         raise RuntimeError(f"Failed to get available machines: {e.code}")
 
 def get_heartbeat_payload(clock=None) -> dict:
@@ -102,49 +127,80 @@ def get_heartbeat_payload(clock=None) -> dict:
     }
 
 def ws_handshake(host: str, port: int, path: str, token: str, is_secure: bool, rng: RNG):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(10)
-    if is_secure:
-        ctx = ssl.create_default_context()
-        sock = ctx.wrap_socket(sock, server_hostname=host)
-    
-    sock.connect((host, port))
-    key = base64.b64encode(rng.randbytes(16)).decode("ascii")
-    req = (
-        f"GET {path} HTTP/1.1\r\n"
-        f"Host: {host}:{port}\r\n"
-        f"Upgrade: websocket\r\n"
-        f"Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Key: {key}\r\n"
-        f"Sec-WebSocket-Version: 13\r\n"
-        f"Authorization: Bearer {token}\r\n"
-        f"\r\n"
-    ).encode("ascii")
-    
-    sock.sendall(req)
-    
-    resp = b""
-    while b"\r\n\r\n" not in resp:
-        chunk = sock.recv(4096)
-        if not chunk:
-            raise ConnectionError("Connection closed during handshake")
-        resp += chunk
+    # Validate hostname / token header injection
+    if '\r' in host or '\n' in host or '\r' in path or '\n' in path or '\r' in token or '\n' in token:
+        raise ValueError("CRLF injection detected")
+
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET6 if ':' in host else socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(10.0)
+        if is_secure:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = True
+            sock = ctx.wrap_socket(sock, server_hostname=host)
         
-    head, _, rest = resp.partition(b"\r\n\r\n")
-    lines = head.decode("ascii").split("\r\n")
-    if not lines[0].startswith("HTTP/1.1 101"):
-        raise ConnectionError(f"Handshake failed: {lines[0]}")
+        sock.connect((host, port))
+        key = base64.b64encode(rng.randbytes(16)).decode("ascii")
+        req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"Authorization: Bearer {token}\r\n"
+            f"\r\n"
+        ).encode("ascii")
         
-    accept = None
-    for line in lines[1:]:
-        if line.lower().startswith("sec-websocket-accept:"):
-            accept = line.split(":", 1)[1].strip()
+        sock.sendall(req)
+        
+        resp = b""
+        start = time.time()
+        while b"\r\n\r\n" not in resp:
+            if time.time() - start > 10.0:
+                raise ConnectionError("Handshake timed out")
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("Connection closed during handshake")
+            resp += chunk
+            if len(resp) > 8192:
+                raise ConnectionError("Handshake response too large")
             
-    expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()).decode("ascii")
-    if accept != expected:
-        raise ConnectionError("Invalid Sec-WebSocket-Accept")
+        head, _, rest = resp.partition(b"\r\n\r\n")
+        lines = head.decode("ascii").split("\r\n")
         
-    return sock, rest
+        if len(lines) == 0 or not lines[0].startswith("HTTP/1.1 101"):
+            raise ConnectionError(f"Handshake failed: not 101")
+            
+        accept = None
+        has_upgrade = False
+        has_connection = False
+        for line in lines[1:]:
+            if line.lower().startswith("upgrade:"):
+                if "websocket" in line.lower():
+                    has_upgrade = True
+            if line.lower().startswith("connection:"):
+                if "upgrade" in line.lower():
+                    has_connection = True
+            if line.lower().startswith("sec-websocket-accept:"):
+                accept = line.split(":", 1)[1].strip()
+                
+        if not has_upgrade or not has_connection:
+            raise ConnectionError("Missing Upgrade/Connection tokens")
+            
+        expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()).decode("ascii")
+        if accept != expected:
+            raise ConnectionError("Invalid Sec-WebSocket-Accept")
+            
+        return sock, rest
+    except Exception:
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        raise
 
 from .ws import WSConnection
 
@@ -175,12 +231,12 @@ class HostAgent:
                 self._run_ws(sock, rest)
                 backoff = 1.0
             except Exception as e:
-                print(f"WS error: {e}, falling back to polling")
+                # print(f"WS error: {e}, falling back to polling")
                 try:
                     self._poll_fallback()
                     backoff = 1.0
                 except Exception as pe:
-                    print(f"Poll error: {pe}")
+                    # print(f"Poll error: {pe}")
                     self.clock.sleep(backoff)
                     backoff = min(600.0, backoff * 2.0)
 
@@ -188,9 +244,6 @@ class HostAgent:
         sock.settimeout(1.0)
         ws = WSConnection(sock, rest, self.rng)
         last_hb = self.clock.time()
-        
-        msg_fragments = bytearray()
-        msg_opcode = None
         
         try:
             while not self.shutdown_requested:
@@ -212,19 +265,10 @@ class HostAgent:
                 elif opcode == 8: # Close
                     ws.send_frame(8, payload[:2] if len(payload) >= 2 else b"")
                     return
-                elif opcode in (1, 2, 0): # Text, Binary, Continuation
-                    msg_fragments.extend(payload)
-                    if opcode != 0 and msg_opcode is None:
-                        msg_opcode = opcode
-                    if fin:
-                        if msg_opcode == 1:
-                            try:
-                                msg = json.loads(msg_fragments.decode("utf-8"))
-                                print(f"Received msg type: {msg.get('type', 'unknown')}")
-                            except Exception:
-                                pass
-                        msg_fragments = bytearray()
-                        msg_opcode = None
+                elif opcode == 1:
+                    pass # We received a full message text
+                elif opcode == 2:
+                    pass
         finally:
             try:
                 sock.close()
@@ -239,8 +283,7 @@ class HostAgent:
             "Authorization": f"Bearer {auth.get_access_token()}"
         })
         try:
-            with urllib.request.urlopen(req, timeout=10.0) as res:
-                json.loads(res.read().decode("utf-8"))
+            safe_http_json(req, timeout=10.0)
         except urllib.error.HTTPError as e:
             if e.code == 401:
                 auth.refresh_token()

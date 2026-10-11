@@ -7,7 +7,7 @@ import urllib.error
 from agent_hub_host import auth, config
 
 class TestAuth(unittest.TestCase):
-    @patch("urllib.request.urlopen")
+    @patch("urllib.request.OpenerDirector.open")
     @patch("agent_hub_host.config.update_config")
     @patch("agent_hub_host.config.load_config")
     def test_device_flow_success(self, mock_load_config, mock_update_config, mock_urlopen):
@@ -15,6 +15,7 @@ class TestAuth(unittest.TestCase):
         
         # Mock /code
         code_resp = MagicMock()
+        code_resp.headers = {"Content-Type": "application/json"}
         code_resp.read.return_value = json.dumps({
             "device_code": "dev123",
             "user_code": "usr123",
@@ -30,6 +31,7 @@ class TestAuth(unittest.TestCase):
         pending_error = urllib.error.HTTPError("url", 400, "Bad Request", {}, pending_resp)
         
         success_resp = MagicMock()
+        success_resp.headers = {"Content-Type": "application/json"}
         success_resp.read.return_value = json.dumps({
             "access_token": "acc123",
             "refresh_token": "ref123"
@@ -41,10 +43,11 @@ class TestAuth(unittest.TestCase):
         auth.device_login("https://fake", "host", "agent-hub-host", "host", ["host_agent"])
         mock_update_config.assert_called_once_with(access_token="acc123", refresh_token="ref123", base_url="https://fake")
 
-    @patch("urllib.request.urlopen")
+    @patch("urllib.request.OpenerDirector.open")
     @patch("agent_hub_host.config.update_config")
     def test_device_flow_slowdown_and_deny(self, mock_update_config, mock_urlopen):
         code_resp = MagicMock()
+        code_resp.headers = {"Content-Type": "application/json"}
         code_resp.read.return_value = json.dumps({
             "device_code": "dev123",
             "user_code": "usr123",
@@ -67,13 +70,14 @@ class TestAuth(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Access denied by user."):
             auth.device_login("https://fake", "host", "agent-hub-host", "host", ["host_agent"])
 
-    @patch("urllib.request.urlopen")
+    @patch("urllib.request.OpenerDirector.open")
     @patch("agent_hub_host.config.load_config")
     @patch("agent_hub_host.config.update_config")
     def test_refresh_token_success(self, mock_update_config, mock_load_config, mock_urlopen):
         mock_load_config.return_value = {"refresh_token": "ref123", "base_url": "https://fake"}
         
         success_resp = MagicMock()
+        success_resp.headers = {"Content-Type": "application/json"}
         success_resp.read.return_value = json.dumps({
             "access_token": "new_acc",
             "refresh_token": "new_ref"
@@ -84,7 +88,7 @@ class TestAuth(unittest.TestCase):
         self.assertEqual(token, "new_acc")
         mock_update_config.assert_called_once_with(access_token="new_acc", refresh_token="new_ref")
 
-    @patch("urllib.request.urlopen")
+    @patch("urllib.request.OpenerDirector.open")
     @patch("agent_hub_host.config.load_config")
     @patch("agent_hub_host.auth.device_login")
     @patch("agent_hub_host.auth.get_access_token")
