@@ -3,6 +3,7 @@ import { defaultEnv, createHelpers } from './m1-focus-setup';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import worker, { Hub } from '../src/worker';
 import { getLoginCookie, createLoginCookie, createSessionCookie, validSessionSecret } from '../src/auth/session';
+import { sha256 } from '../src/auth/crypto';
 
 describe('M1 Focus: Config Boundaries', () => {
   let helpers: Awaited<ReturnType<typeof createHelpers>>;
@@ -201,24 +202,54 @@ describe('M1 Focus: Config Boundaries', () => {
         instance.env.HUB_ADMINS = 'admin@fake.local';
         instance.env.SESSION_SECRET = '01234567890123456789012345678901';
 
+        const h1 = await sha256('s1');
+        instance.sql.exec('INSERT INTO login_states (state_hash, expires_at) VALUES (?, ?)', h1, Math.floor(Date.now() / 1000) + 600);
+        
         globalThis.fetch = async (req) => {
           localFetchCount++;
-          if (req.url === 'https://cloudflare.com/oauth2/token') {
-             return new Response(JSON.stringify({ id_token: 'valid.id.token' }), { status: 200, headers: {'Content-Type': 'application/json'} });
+          const url = typeof req === 'string' ? req : (req instanceof URL ? req.href : req.url);
+          if (url.includes('/oauth2/token')) {
+             return new Response(JSON.stringify({ id_token: await helpers.signJwt({ sub: 'u1', email: 'admin@fake.local', aud: 'fake_client_id', iss: 'https://auth.fake.local', nonce: 'n1', token_use: 'id', email_verified: true, exp: Math.floor(Date.now() / 1000) + 3600 }) }), { status: 200, headers: {'Content-Type': 'application/json'} });
+          }
+          if (url.includes('jwks')) {
+             return new Response(JSON.stringify({ keys: [{...helpers.jwkPub, kid: 'test-key-1'}] }), { status: 200, headers: {'Content-Type': 'application/json'} });
           }
           return oF(req);
         };
 
         const loginCookie = await createLoginCookie(instance.env, {
-          nonce: 'n1', state: 's1', pkce_verifier: 'p1', exp: Math.floor(Date.now() / 1000) + 600, return_to: '/'
+          nonce: 'n1', state: 's1', verifier: 'p1', exp: Math.floor(Date.now() / 1000) + 600, returnTo: '/'
         });
+        
+        // Assert valid before mutation
+        const parsed = await getLoginCookie(instance.env, new Request('http://localhost', { headers: { Cookie: loginCookie } }));
+        expect(parsed).not.toBeNull();
+        expect(parsed?.verifier).toBe('p1');
+        expect(parsed?.state).toBe('s1');
+        expect(parsed?.nonce).toBe('n1');
 
-        // Mutate
+        // Positive control - must succeed
+        let cbRes1 = await instance.fetch(new Request('http://example.com/auth/callback?state=s1&code=c1', { headers: { 'Cookie': loginCookie } }));
+        expect(cbRes1.status).toBe(302);
+        expect(localFetchCount).toBeGreaterThan(0);
+        expect(instance.sql.exec('SELECT consumed FROM login_states WHERE state_hash = ?', h1).toArray()[0].consumed).toBe(1); // consumed
+        
+        // Now do negative case
+        const h2 = await sha256('s2');
+        instance.sql.exec('INSERT INTO login_states (state_hash, expires_at) VALUES (?, ?)', h2, Math.floor(Date.now() / 1000) + 600);
+        
+        const loginCookie2 = await createLoginCookie(instance.env, {
+          nonce: 'n2', state: 's2', verifier: 'p2', exp: Math.floor(Date.now() / 1000) + 600, returnTo: '/'
+        });
+        
+        // Mutate secret
         instance.env.SESSION_SECRET = '';
 
-        // It must fail or 503 instead of issuing session because the secret is empty
-        let cbRes = await instance.fetch(new Request('http://example.com/auth/callback?state=s1&code=c1', { headers: { 'Cookie': loginCookie } }));
-        expect(cbRes.status).toBeGreaterThanOrEqual(400);
+        let cbRes2 = await instance.fetch(new Request('http://example.com/auth/callback?state=s2&code=c2', { headers: { 'Cookie': loginCookie2 } }));
+        expect(cbRes2.status).toBeGreaterThanOrEqual(400);
+
+        // Prove state not consumed because secret was invalid
+        expect(instance.sql.exec('SELECT consumed FROM login_states WHERE state_hash = ?', h2).toArray()[0].consumed).toBe(0);
 
       } finally {
         instance.env.HUB_ADMINS = originalAdmins;
@@ -239,27 +270,40 @@ describe('M1 Focus: Config Boundaries', () => {
       const originalSecret = instance.env.SESSION_SECRET;
 
       try {
-        instance.env.HUB_ADMINS = '';
+        instance.env.HUB_ADMINS = 'admin@fake.local';
         instance.env.SESSION_SECRET = '01234567890123456789012345678901';
+
+        const h3 = await sha256('s3');
+        instance.sql.exec('INSERT INTO login_states (state_hash, expires_at) VALUES (?, ?)', h3, Math.floor(Date.now() / 1000) + 600);
 
         globalThis.fetch = async (req) => {
           localFetchCount++;
-          if (req.url === 'https://cloudflare.com/oauth2/token') {
-             return new Response(JSON.stringify({ id_token: await helpers.createSignedJWT({ sub: 'u1', email: 'user@fake.local', aud: 'aud', iss: 'iss' }) }), { status: 200, headers: {'Content-Type': 'application/json'} });
+          const url = typeof req === 'string' ? req : (req instanceof URL ? req.href : req.url);
+          if (url.includes('/oauth2/token')) {
+             return new Response(JSON.stringify({ id_token: await helpers.signJwt({ sub: 'u1', email: 'user@fake.local', aud: 'fake_client_id', iss: 'https://auth.fake.local', nonce: 'n3', token_use: 'id', email_verified: true, exp: Math.floor(Date.now() / 1000) + 3600 }) }), { status: 200, headers: {'Content-Type': 'application/json'} });
           }
-          if (req.url.includes('/certs')) {
-             return new Response(JSON.stringify({ keys: [helpers.jwks] }), { status: 200, headers: {'Content-Type': 'application/json'} });
+          if (url.includes('jwks')) {
+             return new Response(JSON.stringify({ keys: [{...helpers.jwkPub, kid: 'test-key-1'}] }), { status: 200, headers: {'Content-Type': 'application/json'} });
           }
           return oF(req);
         };
 
         const loginCookie = await createLoginCookie(instance.env, {
-          nonce: 'n1', state: 's2', pkce_verifier: 'p2', exp: Math.floor(Date.now() / 1000) + 600, return_to: '/'
+          nonce: 'n3', state: 's3', verifier: 'p3', exp: Math.floor(Date.now() / 1000) + 600, returnTo: '/'
         });
 
-        // It must reject if the admin list is empty or the user is not in the list (403 usually)
-        let cbRes = await instance.fetch(new Request('http://example.com/auth/callback?state=s2&code=c2', { headers: { 'Cookie': loginCookie } }));
+        // Assert valid before mutation
+        const parsed = await getLoginCookie(instance.env, new Request('http://localhost', { headers: { Cookie: loginCookie } }));
+        expect(parsed).not.toBeNull();
+        expect(parsed?.verifier).toBe('p3');
+
+        // Mutate admin
+        instance.env.HUB_ADMINS = '';
+
+        let cbRes = await instance.fetch(new Request('http://example.com/auth/callback?state=s3&code=c3', { headers: { 'Cookie': loginCookie } }));
         expect(cbRes.status).toBeGreaterThanOrEqual(400);
+
+        expect(instance.sql.exec('SELECT consumed FROM login_states WHERE state_hash = ?', h3).toArray()[0].consumed).toBe(1);
 
       } finally {
         instance.env.HUB_ADMINS = originalAdmins;

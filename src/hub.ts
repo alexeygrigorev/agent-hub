@@ -97,7 +97,8 @@ export class Hub extends DurableObject {
           state,
           nonce,
           code_challenge: codeChallenge,
-          code_challenge_method: 'S256'
+          code_challenge_method: 'S256',
+          identity_provider: 'Google'
         }).toString();
 
         return new Response(null, {

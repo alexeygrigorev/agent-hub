@@ -78,11 +78,16 @@ async function doFetch(req: Request) {
 
 describe('M1 Auth Worker Runtime', () => {
 
-  it('Login starts PKCE flow', async () => {
+  it('Login starts PKCE flow with Google provider', async () => {
     const req = new Request('http://example.com/auth/login', { redirect: 'manual' });
     const res = await doFetch(req);
     expect(res.status).toBe(302);
-    expect(res.headers.get('Location')).toContain('https://auth.fake.local/oauth2/authorize');
+    const loc = new URL(res.headers.get('Location')!);
+    expect(loc.origin + loc.pathname).toBe('https://auth.fake.local/oauth2/authorize');
+    expect(loc.searchParams.get('identity_provider')).toBe('Google');
+    expect(loc.searchParams.get('client_id')).toBeTruthy();
+    expect(loc.searchParams.get('state')).toBeTruthy();
+    expect(loc.searchParams.get('nonce')).toBeTruthy();
     expect(res.headers.get('Set-Cookie')).toContain('hub_login=');
   });
 
