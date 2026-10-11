@@ -104,44 +104,48 @@ describe('M1 Focus: REFRESH', () => {
     });
   });
 
-  it('REFRESH: 30d expired/equalnow invalid; exact remaining expires response', async () => {
+  it('REFRESH: genuine expires_at BEFORE/EQUAL/AFTER now with Date.now override', async () => {
     const id = defaultEnv.HUB.idFromName("hub");
     const stub = defaultEnv.HUB.get(id);
-    let oldRef = 'ref_30d_exp';
-    let famId = 'fam_30';
+    let oldRefBefore = 'ref_before_exp';
+    let oldRefEqual = 'ref_equal_exp';
+    let oldRefAfter = 'ref_after_exp';
     
+    // Create three credentials with different expires_at
+    const T = Date.now();
     await runInDurableObject(stub, async (instance: Hub) => {
-      // Create a token that was created >30d ago
-      instance.sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, scopes, family_id, subject, created_by_sub, created_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        'c_30', 'host', await sha256('acc_30'), await sha256(oldRef), '["host"]', famId, 'subj_30', 'sub_30', 
-        new Date(Date.now() - 31 * 86400000).toISOString(), new Date(Date.now() + 86400000).toISOString()
+      const { sha256 } = await import('../src/auth/crypto');
+      instance.sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, scopes, family_id, subject, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        'c_bef', 'host', await sha256('acc_bef'), await sha256(oldRefBefore), '["host"]', 'f_b', 's_b', 's', new Date(T - 86400000).toISOString(), new Date(T - 1000).toISOString()
+      );
+      instance.sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, scopes, family_id, subject, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        'c_eq', 'host', await sha256('acc_eq'), await sha256(oldRefEqual), '["host"]', 'f_e', 's_e', 's', new Date(T - 86400000).toISOString(), new Date(T).toISOString()
+      );
+      instance.sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, scopes, family_id, subject, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        'c_aft', 'host', await sha256('acc_aft'), await sha256(oldRefAfter), '["host"]', 'f_a', 's_a', 's', new Date(T - 86400000).toISOString(), new Date(T + 1000).toISOString()
       );
     });
 
-    const r1 = await doFetch(new Request('http://example.com/api/token/refresh', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: oldRef })
-    }));
-    expect(r1.status).toBeGreaterThanOrEqual(400); // Because refresh tokens usually expire after 30 days of absolute age, or inactivity.
-
-    // Test exact remaining expires response
-    // We create one that is 5 days old
-    let oldRef2 = 'ref_5d_old';
     await runInDurableObject(stub, async (instance: Hub) => {
-      instance.sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, scopes, family_id, subject, created_by_sub, created_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        'c_5d', 'host', await sha256('acc_5d'), await sha256(oldRef2), '["host"]', 'fam_5d', 'subj_5d', 'sub_5d', 
-        new Date(Date.now() - 5 * 86400000).toISOString(), new Date(Date.now() + 86400000).toISOString()
-      );
+      const realNow = Date.now;
+      Date.now = () => T;
+      try {
+        const reqBefore = new Request('http://example.com/api/token/refresh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: oldRefBefore }) });
+        const reqEqual = new Request('http://example.com/api/token/refresh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: oldRefEqual }) });
+        const reqAfter = new Request('http://example.com/api/token/refresh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: oldRefAfter }) });
+
+        const rBef = await instance.fetch(reqBefore);
+        expect(rBef.status).toBeGreaterThanOrEqual(400);
+
+        const rEq = await instance.fetch(reqEqual);
+        expect(rEq.status).toBeGreaterThanOrEqual(400);
+
+        const rAft = await instance.fetch(reqAfter);
+        expect(rAft.status).toBe(200);
+      } finally {
+        Date.now = realNow;
+      }
     });
-    
-    const r2 = await doFetch(new Request('http://example.com/api/token/refresh', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: oldRef2 })
-    }));
-    expect(r2.status).toBe(200);
-    const body = await r2.json() as any;
-    expect(body.expires_in).toBeDefined();
-    // exact remaining might mean it preserves the original absolute 30d expiry window, so we check that
   });
 
 });

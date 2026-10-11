@@ -80,6 +80,7 @@ export interface LoginData {
   nonce: string;
   verifier: string;
   exp: number;
+  returnTo?: string;
 }
 
 export async function createLoginCookie(env: Env, data: LoginData): Promise<string> {

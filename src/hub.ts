@@ -81,8 +81,11 @@ export class Hub extends DurableObject {
         this.sql.exec('DELETE FROM login_states WHERE expires_at <= ?', Math.floor(Date.now() / 1000));
         this.sql.exec('INSERT INTO login_states (state_hash, expires_at) VALUES (?, ?)', await sha256(state), Math.floor(Date.now() / 1000) + 600);
         
+        const returnTo = url.searchParams.get('return_to');
+        const returnToPath = returnTo && returnTo.startsWith('/device?code=') ? returnTo : undefined;
+        
         const loginCookie = await createLoginCookie(this.env, {
-          state, nonce, verifier, exp: Math.floor(Date.now() / 1000) + 600
+          state, nonce, verifier, exp: Math.floor(Date.now() / 1000) + 600, returnTo: returnToPath
         });
 
         const authUrl = new URL(`${this.env.AUTH_BASE_URL}/oauth2/authorize`);
@@ -153,7 +156,7 @@ export class Hub extends DurableObject {
         const headers = new Headers();
         headers.append('Set-Cookie', sessionCookie);
         headers.append('Set-Cookie', clearLoginCookie());
-        headers.append('Location', '/');
+        headers.append('Location', loginData.returnTo || '/');
 
         return new Response(null, { status: 302, headers });
       }
@@ -198,10 +201,16 @@ export class Hub extends DurableObject {
           }
         }
         
-        if (body.requested_scopes.includes('lease:root') || (body.client_kind === 'host' && body.requested_scopes.includes('jobs:create')) || (body.client_kind === 'agent' && body.requested_scopes.includes('host'))) return Response.json({ error: 'invalid_scope' }, { status: 400 });
+        if (body.requested_scopes.includes('lease:root') || body.requested_scopes.includes('jobs:create') || (body.client_kind === 'agent' && body.requested_scopes.includes('host'))) return Response.json({ error: 'invalid_scope' }, { status: 400 });
         
-        if (body.client_kind === 'agent' && (typeof (body.actor ?? body.name) !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(body.actor ?? body.name))) {
-          return Response.json({ error: 'invalid_request', error_description: 'Agent requires an actor' }, { status: 400 });
+        if (body.client_kind === 'agent') {
+          const proposedActor = body.actor ?? body.name;
+          if (typeof proposedActor !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(proposedActor)) {
+            return Response.json({ error: 'invalid_request', error_description: 'Agent requires an actor' }, { status: 400 });
+          }
+          if (proposedActor === 'root' || proposedActor === 'principal' || proposedActor.startsWith('role:')) {
+            return Response.json({ error: 'invalid_request', error_description: 'Privileged actor names not allowed' }, { status: 400 });
+          }
         }
 
         if (body.name.length > 128 || !body.name.trim() || (body.hostname !== undefined && (typeof body.hostname !== 'string' || body.hostname.length > 255)) || body.requested_scopes.length > 6 || new Set(body.requested_scopes).size !== body.requested_scopes.length) return Response.json({ error: 'invalid_request' }, { status: 400 });
@@ -212,15 +221,23 @@ export class Hub extends DurableObject {
         const deviceCodeHash = await sha256(deviceCode);
         const userCode = generateUserCode();
         
+        let ipCountry: string | null = null;
+        const cfCountry = (request as any).cf?.country;
+        if (typeof cfCountry === 'string' && /^[A-Z]{2}$/.test(cfCountry)) {
+          ipCountry = cfCountry;
+        } else if (cfCountry !== undefined && cfCountry !== null) {
+          ipCountry = 'Unknown';
+        }
+
         const now = new Date();
         const expiresAt = new Date(now.getTime() + 600 * 1000);
         
         const pastForFirstPoll = new Date(now.getTime() - 60000);
         this.sql.exec(`
           INSERT INTO device_pairings
-          (device_code_hash, user_code, client_kind, name, hostname, actor, requested_scopes, status, interval_s, last_poll_at, created_at, expires_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `, deviceCodeHash, userCode, body.client_kind, body.name, hostname, actor, JSON.stringify(body.requested_scopes), 'pending', 5, pastForFirstPoll.toISOString(), now.toISOString(), expiresAt.toISOString());
+          (device_code_hash, user_code, client_kind, name, hostname, ip_country, actor, requested_scopes, status, interval_s, last_poll_at, created_at, expires_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, deviceCodeHash, userCode, body.client_kind, body.name, hostname, ipCountry, actor, JSON.stringify(body.requested_scopes), 'pending', 5, pastForFirstPoll.toISOString(), now.toISOString(), expiresAt.toISOString());
 
         return Response.json({
           device_code: deviceCode,
@@ -293,7 +310,8 @@ export class Hub extends DurableObject {
         const userCode = url.searchParams.get('code');
         const session = await getSession(this.env, request);
         if (!session) {
-          return new Response(null, { status: 302, headers: { 'Location': '/auth/login' } });
+          const returnTo = userCode ? `?return_to=${encodeURIComponent('/device?code=' + userCode)}` : '';
+          return new Response(null, { status: 302, headers: { 'Location': `/auth/login${returnTo}` } });
         }
 
         if (!userCode) return new Response('<!doctype html><html><head><title>Pair a device</title></head><body><h1>Pair a device</h1><form method=GET action=/device><label>Device code <input name=code required maxlength=9 autocomplete=off></label><button>Continue</button></form></body></html>', { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
@@ -305,6 +323,7 @@ export class Hub extends DurableObject {
         const safeKind = htmlEscape(pairing.client_kind);
         const safeName = htmlEscape(pairing.name);
         const safeHostname = htmlEscape(pairing.hostname);
+        const safeCountry = pairing.ip_country ? htmlEscape(pairing.ip_country) : 'Unknown';
         const safeActor = pairing.actor ? htmlEscape(pairing.actor) : '';
         const safeScopes = htmlEscape(pairing.requested_scopes);
         const safeUserCode = htmlEscape(userCode);
@@ -318,6 +337,7 @@ export class Hub extends DurableObject {
   <p>Kind: ${safeKind}</p>
   <p>Name: ${safeName}</p>
   <p>Hostname: ${safeHostname}</p>
+  <p>Country: ${safeCountry}</p>
   ${safeActor ? `<p>Actor: ${safeActor}</p>` : ''}
   <p>Requested Scopes: ${safeScopes}</p>
   <form method="POST" action="/api/device/approve/${safeUserCode}" id="approveForm">
@@ -435,7 +455,7 @@ export class Hub extends DurableObject {
         // PRE-GENERATE values before any synchronous DB interaction to prevent partial state on await failures
         const { accessToken, refreshToken, accessHash, refreshHash: newRefreshHash } = await generateTokenPair();
         const newId = randomString(16);
-        const now = new Date().toISOString();
+        const now = new Date(Date.now()).toISOString();
 
         let errorResponse = null;
         let scopesResponse = '';
@@ -450,7 +470,7 @@ export class Hub extends DurableObject {
           // Replay or explicitly revoked! Revoke family.
           this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
           errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
-        } else if (!Number.isFinite(Date.parse(cred.expires_at)) || Date.parse(cred.expires_at) <= nowMs || Date.parse(cred.created_at) <= nowMs - 30 * 86400000) {
+        } else if (!Number.isFinite(Date.parse(cred.expires_at)) || Date.parse(cred.expires_at) <= nowMs) {
           errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
         } else {
           const res = this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', now, cred.id);

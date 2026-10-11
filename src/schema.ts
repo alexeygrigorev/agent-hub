@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS device_pairings (
   client_kind TEXT NOT NULL,
   name TEXT NOT NULL,
   hostname TEXT NOT NULL,
+  ip_country TEXT,
   actor TEXT,
   requested_scopes JSON NOT NULL,
   status TEXT NOT NULL, -- pending|approved|denied|consumed|expired

@@ -74,10 +74,11 @@ describe('M1 Focus: DEVICE', () => {
     const id = defaultEnv.HUB.idFromName("hub");
     const stub = defaultEnv.HUB.get(id);
     await runInDurableObject(stub, async (instance: Hub) => {
-      const row = instance.sql.exec('SELECT interval_s FROM device_pairings WHERE device_code_hash = ?', await crypto.subtle.digest('SHA-256', new TextEncoder().encode(device_code)).then(b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join(''))).toArray()[0] as any;
-      if (row) {
-        expect(row.interval_s).toBe(interval + 5);
-      }
+      const { sha256 } = await import('../src/auth/crypto');
+      const hash = await sha256(device_code);
+      const row = instance.sql.exec('SELECT interval_s FROM device_pairings WHERE device_code_hash = ?', hash).toArray()[0] as any;
+      expect(row).toBeDefined();
+      expect(row.interval_s).toBe(interval + 5);
     });
   });
 
