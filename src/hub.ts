@@ -1,11 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
+import { SqlStorage } from "@cloudflare/workers-types";
 import { Env } from './env';
 import { SCHEMA_SQL } from './schema';
 import { JwksCache, validateIdToken, exchangeCode } from './auth/dtc';
 import { createSessionCookie, getSession, clearSessionCookie, createLoginCookie, getLoginCookie, clearLoginCookie, verifyCsrf, configuredAdmins, validSessionSecret } from './auth/session';
 import { randomString, sha256, generateUserCode } from './auth/crypto';
 import { generateTokenPair, verifyBearerScope } from './auth/token';
-import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly, SafeSqlStorage } from './registry';
+import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly } from './registry';
 
 async function safeJson(req: Request): Promise<Record<string, any> | null> {
   if (!req.body) return null;
@@ -42,14 +43,14 @@ function htmlEscape(str: string): string {
 }
 
 export class Hub extends DurableObject {
-  sql: SafeSqlStorage;
+  sql: SqlStorage;
   env: Env;
   jwksCache: JwksCache = new JwksCache();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.env = env;
-    this.sql = ctx.storage.sql as unknown as SafeSqlStorage;
+    this.sql = ctx.storage.sql;
     this.initDb();
     
     // Restore hibernated websockets
