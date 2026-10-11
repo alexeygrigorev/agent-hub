@@ -111,16 +111,18 @@ Migration proceeds in phases as defined in the SPEC. The current Grok root and w
 Note: The actual host package is still under M0/M2 development. The provisional host contract (source pinned at `47e3a400a9c862875473dde1e1a437c15c42558b`) has been verified locally, but final M7 acceptance waits for accepted M2 + integrated full source + different-model review.
 
 ### Prerequisites
-Before installing the service, create an isolated `.local` virtual environment, install the `agent_hub_host` package, and login. No third-party tools or service installation scripts should be used.
+Before installing the service, create an isolated `.local` virtual environment, install the `agent_hub_host` package from the repository root, and login. No third-party tools or service installation scripts should be used.
+
 ```bash
-python3 -m venv ~/.local/venv
-~/.local/venv/bin/pip install ./host
-~/.local/venv/bin/hub login https://<hub-domain>
+cd ~/git/agent-hub
+python3 -m venv .local/venv
+.local/venv/bin/python -m pip install .
+.local/venv/bin/hub login https://<hub-domain>
 ```
-*Note: Wait for Alexey to approve the pending host in the Hub admin dashboard before starting the service.*
+*Note: Explicit setup-command order prepared only. Never enable the unit here.*
 
 ### Linux (Hetzner)
-Installed as a user systemd service. Ensure the `hub` executable has mode 600 or is in a private `.local` directory to restrict access.
+Installed as a user systemd service. Ensure the config file has mode `600` and resides in a private `.local` directory (with permissions `0700`) to restrict access. The `hub` executable retains executable permissions (`700` or `755` within the private parent).
 ```ini
 # ~/.config/systemd/user/agent-hub-host.service
 [Unit]
@@ -130,8 +132,8 @@ After=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/git/agent-hub
-Environment="PATH=%h/.local/venv/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=%h/.local/venv/bin/hub run
+Environment="PATH=%h/git/agent-hub/.local/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=%h/git/agent-hub/.local/venv/bin/hub run
 Restart=on-failure
 RestartSec=10
 
@@ -141,10 +143,18 @@ WantedBy=default.target
 Run: `systemctl --user daemon-reload`, `systemctl --user enable --now agent-hub-host.service`.
 
 ### Windows
-Installed as a Task Scheduler logon task with User-only ACLs (Run only when user is logged on).
+Installed as a Task Scheduler logon task with User-only ACLs (Run only when user is logged on). Actual Windows 47 ACL is PROVISIONAL/unaccepted. Plain actual Windows has NOT been executed.
+
+```cmd
+cd %USERPROFILE%\git\agent-hub
+py -3 -m venv .local\venv
+.local\venv\Scripts\python.exe -m pip install .
+.local\venv\Scripts\hub.exe login https://<hub-domain>
+```
+
 Create a Basic Task in Task Scheduler:
 - Trigger: When I log on
 - Action: Start a program
-- Program/script: `%USERPROFILE%\.local\venv\Scripts\hub.exe`
+- Program/script: `C:\Users\Alexey\git\agent-hub\.local\venv\Scripts\hub.exe`
 - Add arguments: `run`
-- Start in: `%USERPROFILE%\git\agent-hub`
+- Start in: `C:\Users\Alexey\git\agent-hub`
