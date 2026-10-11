@@ -115,6 +115,10 @@ Before installing the service, create an isolated `.local` virtual environment, 
 
 ```bash
 cd ~/git/agent-hub
+# Preflight check: Verify python3 and ensurepip are available.
+# If this fails, STOP and report to ROOT/Alexey (deployment kit pending).
+# Do NOT elevate or install OS packages.
+python3 -c "import ensurepip" || exit 1
 python3 -m venv .local/venv
 .local/venv/bin/python -m pip install .
 .local/venv/bin/hub login https://<hub-domain>
@@ -122,7 +126,7 @@ python3 -m venv .local/venv
 *Note: Explicit setup-command order prepared only. Never enable the unit here.*
 
 ### Linux (Hetzner)
-Installed as a user systemd service. Ensure the config file has mode `600` and resides in a private `.local` directory (with permissions `0700`) to restrict access. The `hub` executable retains executable permissions (`700` or `755` within the private parent).
+Installed as a user systemd service. Ensure the config file (`~/.config/agent-hub/host.json` or `$XDG_CONFIG_HOME/agent-hub/host.json`) has mode `600` and its parent directory has permissions `0700` to restrict access. The `hub` executable retains executable permissions (`700` or `755` within the private parent).
 ```ini
 # ~/.config/systemd/user/agent-hub-host.service
 [Unit]
@@ -132,7 +136,7 @@ After=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/git/agent-hub
-Environment="PATH=%h/git/agent-hub/.local/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PATH=%h/.local/bin:%h/git/agent-hub/.local/venv/bin:/usr/local/bin:/usr/bin:/bin"
 ExecStart=%h/git/agent-hub/.local/venv/bin/hub run
 Restart=on-failure
 RestartSec=10
@@ -155,6 +159,7 @@ py -3 -m venv .local\venv
 Create a Basic Task in Task Scheduler:
 - Trigger: When I log on
 - Action: Start a program
-- Program/script: `C:\Users\Alexey\git\agent-hub\.local\venv\Scripts\hub.exe`
+Resolve your actual user profile path using `echo %USERPROFILE%` (CMD) or `$env:USERPROFILE` (PowerShell). Replace `<USERPROFILE>` below with the absolute result.
+- Program/script: `<USERPROFILE>\git\agent-hub\.local\venv\Scripts\hub.exe`
 - Add arguments: `run`
-- Start in: `C:\Users\Alexey\git\agent-hub`
+- Start in: `<USERPROFILE>\git\agent-hub`
