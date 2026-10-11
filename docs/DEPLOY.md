@@ -25,6 +25,19 @@ Note: DTC Cognito clients are public with PKCE and do not require an `AUTH_CLIEN
 
 ## 3. DTC Auth App Client Configuration
 
+**Provisioned (11 Oct 2026, approved by Alexey).** The `agent-hub` client now exists in the shared DTC pool (DataTalksClub/aws-infra `78987cd`, stack output `AgentHubClientId`; DataTalksClub/auth `eef1ddf`). These are public, non-secret values:
+
+| Setting | Value |
+| --- | --- |
+| `AUTH_BASE_URL` | `https://auth.dtcdev.click` |
+| `AUTH_CLIENT_ID` | `1tplqm9l6q6545mrk0gjv6eaeh` (public PKCE client, no secret) |
+| `AUTH_ISSUER` | `https://cognito-idp.us-east-1.amazonaws.com/us-east-1_H7nJu52Bs` |
+| `AUTH_JWKS_URL` | `https://cognito-idp.us-east-1.amazonaws.com/us-east-1_H7nJu52Bs/.well-known/jwks.json` |
+| `AUTH_CALLBACK_URL` (prod) | `https://agent-hub.cloudflare-ai-agent-de9ca0.workers.dev/auth/callback` |
+| `AUTH_CALLBACK_URL` (dev) | `http://localhost:19130/auth/callback` |
+
+Registered logout URLs: `https://agent-hub.cloudflare-ai-agent-de9ca0.workers.dev/` and `http://localhost:19130/`. The production host is the `workers.dev` route of Worker `agent-hub` on the Cloudflare account subdomain `cloudflare-ai-agent-de9ca0`; renaming the Worker or moving to a custom domain requires a matching client update in both DTC repos. The proposal below is kept for reference.
+
 An app client must be created for `agent-hub` in DTC's AWS Cognito.
 Do not invoke these changes yourself. The diffs below are PROPOSED changes for the DataTalksClub repositories (`aws-infra` sandbox/auth and `auth` config/clients.json).
 
