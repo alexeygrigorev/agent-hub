@@ -5,6 +5,7 @@ import { JwksCache, validateIdToken, exchangeCode } from './auth/dtc';
 import { createSessionCookie, getSession, clearSessionCookie, createLoginCookie, getLoginCookie, clearLoginCookie, verifyCsrf, configuredAdmins, validSessionSecret } from './auth/session';
 import { randomString, sha256, generateUserCode } from './auth/crypto';
 import { generateTokenPair, verifyBearerScope } from './auth/token';
+import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly } from './registry';
 
 async function safeJson(req: Request): Promise<Record<string, any> | null> {
   if (!req.body) return null;
@@ -50,6 +51,17 @@ export class Hub extends DurableObject {
     this.env = env;
     this.sql = ctx.storage.sql;
     this.initDb();
+    
+    // Restore hibernated websockets
+    const websockets = this.ctx.getWebSockets();
+    for (const ws of websockets) {
+      try {
+        const attachment: any = ws.deserializeAttachment();
+        if (attachment && attachment.machineId) {
+          updateHeartbeatMemoryOnly(attachment.machineId);
+        }
+      } catch (e) { }
+    }
   }
 
   private initDb() {
@@ -66,6 +78,8 @@ export class Hub extends DurableObject {
     const path = url.pathname;
     
     try {
+      const registryResponse = await handleRegistryRoutes(request, path, this.sql, this.ctx, this.env);
+      if (registryResponse) return registryResponse;
       if (path === '/api/healthz') {
         if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
         return Response.json({ status: 'ok', component: 'hub-do' });
@@ -548,5 +562,17 @@ export class Hub extends DurableObject {
     } catch (e: any) {
       return Response.json({ error: 'Internal Server Error' }, { status: 500 });
     }
+  }
+
+  webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    handleWebSocketMessageRegistry(ws, message, this.sql);
+  }
+
+  webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
+    handleWebSocketCloseRegistry(ws, this.sql);
+  }
+
+  webSocketError(ws: WebSocket, error: any) {
+    handleWebSocketCloseRegistry(ws, this.sql);
   }
 }

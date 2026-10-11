@@ -9,3 +9,5 @@ __pycache__/
 # Private launcher telemetry and validation evidence
 *-telemetry.jsonl
 evidence.log
+host/*.egg-info/
+host/build/
