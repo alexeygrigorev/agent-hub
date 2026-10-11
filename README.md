@@ -1,7 +1,12 @@
 # Agent Hub
 
-A small serverless hub (Cloudflare Workers Free + one SQLite Durable Object) that coordinates Alexey's multi-agent project: it launches a headless root run every 30 minutes on a random available host through the Agent Quota Launcher, runs the daily writer job, keeps the machine registry, carries messages between agents and machines (home machines connect outbound only), tracks the health of the principal and heads, and shows a dashboard. Each host runs a small outbound host agent.
+Serverless coordination hub for Alexey's multi-agent project: 30-minute headless root runs on a random available host, the daily writer job, machine registry, message bus, health and dashboard.
 
-Status: specification; implementation in progress. See [docs/SPEC.md](docs/SPEC.md) and [AGENTS.md](AGENTS.md).
+The spec is [docs/SPEC.md](docs/SPEC.md); it is the source of truth for scope and milestones.
 
-License: MIT.
+See `AGENTS.md` for team and process rules.
+
+## License
+
+MIT
+
