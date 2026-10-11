@@ -35,7 +35,7 @@ describe('M1 Focus: JWKS', () => {
     let st = await loginAndGetState();
     let badKidToken = await helpers.signJwt({
       iss: 'https://auth.fake.local', aud: 'fake_client_id', exp: Math.floor(Date.now() / 1000) + 3600,
-      nonce: st.nonce, token_use: 'id', email: 'admin@fake.local', email_verified: true, sub: 'admin-1' }, { alg: 'RS256', kid: 'test-key-1'
+      nonce: st.nonce, token_use: 'id', email: 'admin@fake.local', email_verified: true, sub: 'admin-1'
     }, { alg: 'RS256', kid: 'UNKNOWN_KID_1' });
     
     globalThis.fetch = async (i) => {
@@ -51,7 +51,7 @@ describe('M1 Focus: JWKS', () => {
     let st2 = await loginAndGetState();
     let badKidToken2 = await helpers.signJwt({
       iss: 'https://auth.fake.local', aud: 'fake_client_id', exp: Math.floor(Date.now() / 1000) + 3600,
-      nonce: st2.nonce, token_use: 'id', email: 'admin@fake.local', email_verified: true, sub: 'admin-1' }, { alg: 'RS256', kid: 'test-key-1'
+      nonce: st2.nonce, token_use: 'id', email: 'admin@fake.local', email_verified: true, sub: 'admin-1'
     }, { alg: 'RS256', kid: 'UNKNOWN_KID_2' });
 
     globalThis.fetch = async (i) => {
@@ -90,7 +90,7 @@ describe('M1 Focus: JWKS', () => {
     let st = await loginAndGetState();
     let idt = await currentHelpers.signJwt({
       iss: 'https://auth.fake.local', aud: 'fake_client_id', exp: Math.floor(Date.now() / 1000) + 7200,
-      nonce: st.nonce, token_use: 'id', email: 'admin@fake.local', email_verified: true, sub: 'admin-1' }, { alg: 'RS256', kid: 'test-key-1'
+      nonce: st.nonce, token_use: 'id', email: 'admin@fake.local', email_verified: true, sub: 'admin-1'
     }, { alg: 'RS256', kid: 'test-key-1' });
 
     globalThis.fetch = async (i) => {
@@ -146,7 +146,7 @@ describe('M1 Focus: JWKS', () => {
     const { loginCookie, state, nonce } = await loginAndGetState();
     let idToken = await helpers.signJwt({
       iss: 'https://auth.fake.local', aud: 'fake_client_id', exp: Math.floor(Date.now() / 1000) + 3600,
-      nonce, token_use: 'id', email: 'admin@fake.local', email_verified: true, sub: 'admin-1' }, { alg: 'RS256', kid: 'test-key-1'
+      nonce, token_use: 'id', email: 'admin@fake.local', email_verified: true, sub: 'admin-1'
     });
     
     let oF = globalThis.fetch;
@@ -213,6 +213,45 @@ describe('M1 Focus: JWKS', () => {
         expect(c.refresh_hash).toBeDefined();
       }
     });
+  });
+
+  it('JWKS: Empty secret/admin allowlist fail closed on callback', async () => {
+    const { loginCookie, state, nonce } = await loginAndGetState();
+    let idToken = await helpers.signJwt({
+      iss: 'https://auth.fake.local', aud: 'fake_client_id', exp: Math.floor(Date.now() / 1000) + 3600,
+      nonce, token_use: 'id', email: 'admin@fake.local', email_verified: true, sub: 'admin-1'
+    }, { alg: 'RS256', kid: 'test-key-1' });
+
+    let oF = globalThis.fetch;
+    globalThis.fetch = async (i) => {
+      if (i.toString().includes('/oauth2/token')) return new Response(JSON.stringify({ id_token: idToken }), { headers: { 'content-type': 'application/json' } });
+      if (i.toString().includes('/.well-known/jwks.json')) return new Response(JSON.stringify({ keys: [{ ...helpers.jwkPub, kid: 'test-key-1' }] }), { headers: { 'content-type': 'application/json' } });
+      return oF(i);
+    };
+
+    const id = defaultEnv.HUB.idFromName("hub");
+    const stub = defaultEnv.HUB.get(id);
+
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const originalAdmins = instance.env.HUB_ADMINS;
+      const originalSecret = instance.env.SESSION_SECRET;
+
+      // Missing admins
+      instance.env.HUB_ADMINS = '';
+      let resNoAdmins = await instance.fetch(new Request(`http://example.com/auth/callback?code=fake&state=${state}`, { headers: { 'Cookie': loginCookie }, redirect: 'manual' }));
+      expect(resNoAdmins.status).toBeGreaterThanOrEqual(400);
+
+      // Missing secret
+      instance.env.HUB_ADMINS = originalAdmins;
+      instance.env.SESSION_SECRET = '';
+      let resNoSec = await instance.fetch(new Request(`http://example.com/auth/callback?code=fake&state=${state}`, { headers: { 'Cookie': loginCookie }, redirect: 'manual' }));
+      expect(resNoSec.status).toBeGreaterThanOrEqual(400);
+
+      // Restore
+      instance.env.SESSION_SECRET = originalSecret;
+    });
+
+    globalThis.fetch = oF;
   });
 
 });

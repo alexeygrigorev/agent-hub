@@ -79,7 +79,7 @@ export class JwksCache {
         
         let text: string;
         try {
-          text = new TextDecoder('utf-8', { fatal: true }).decode(merged);
+          text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(merged);
         } catch (e) {
           throw new Error('JWKS payload bad UTF-8');
         }
