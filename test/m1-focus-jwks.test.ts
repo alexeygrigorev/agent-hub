@@ -226,10 +226,10 @@ describe('M1 Focus: JWKS', () => {
       const origSecret = instance.env.SESSION_SECRET;
       const oF = globalThis.fetch;
 
-      // 1. Missing admins
       try {
+        // 1. Missing admins
         instance.env.HUB_ADMINS = '';
-        instance.env.SESSION_SECRET = '01234567890123456789012345678901';
+        instance.env.SESSION_SECRET = origSecret;
 
         const state1 = 's1_' + Math.random();
         const nonce1 = 'n1_' + Math.random();
@@ -250,16 +250,14 @@ describe('M1 Focus: JWKS', () => {
         };
 
         let resNoAdmins = await instance.fetch(new Request(`http://example.com/auth/callback?code=fake&state=${state1}`, { headers: { 'Cookie': loginCookie1 }, redirect: 'manual' }));
-        expect(resNoAdmins.status).toBeGreaterThanOrEqual(400);
+        expect(resNoAdmins.status).toBe(403);
         expect(instance.sql.exec('SELECT consumed FROM login_states WHERE state_hash = ?', hash1).toArray()[0].consumed).toBe(1);
-      } finally {
-        globalThis.fetch = oF;
-      }
 
-      // 2. Missing secret
-      try {
+        globalThis.fetch = oF;
+
+        // 2. Missing secret
         instance.env.HUB_ADMINS = origAdmins;
-        instance.env.SESSION_SECRET = '01234567890123456789012345678901';
+        instance.env.SESSION_SECRET = origSecret;
 
         const state2 = 's2_' + Math.random();
         const nonce2 = 'n2_' + Math.random();
@@ -282,14 +280,12 @@ describe('M1 Focus: JWKS', () => {
         };
 
         let resNoSec = await instance.fetch(new Request(`http://example.com/auth/callback?code=fake&state=${state2}`, { headers: { 'Cookie': loginCookie2 }, redirect: 'manual' }));
-        expect(resNoSec.status).toBeGreaterThanOrEqual(400);
+        expect(resNoSec.status).toBe(400);
         expect(instance.sql.exec('SELECT consumed FROM login_states WHERE state_hash = ?', hash2).toArray()[0].consumed).toBe(0);
-      } finally {
-        globalThis.fetch = oF;
-      }
 
-      // 3. Positive control
-      try {
+        globalThis.fetch = oF;
+
+        // 3. Positive control
         instance.env.HUB_ADMINS = origAdmins;
         instance.env.SESSION_SECRET = origSecret;
 
