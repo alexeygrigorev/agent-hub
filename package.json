@@ -1,0 +1,29 @@
+{
+  "name": "agent-hub",
+  "version": "1.0.0",
+  "description": "A small serverless hub (Cloudflare Workers Free + one SQLite Durable Object) that coordinates Alexey's multi-agent project: it launches a headless root run every 30 minutes on a random available host through the Agent Quota Launcher, runs the daily writer job, keeps the machine registry, carries messages between agents and machines (home machines connect outbound only), tracks the health of the principal and heads, and shows a dashboard. Each host runs a small outbound host agent.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "build": "wrangler deploy --dry-run --outdir dist"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alexeygrigorev/agent-hub.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.23.0",
+    "@cloudflare/workers-types": "^5.20261011.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.149.0"
+  }
+}
