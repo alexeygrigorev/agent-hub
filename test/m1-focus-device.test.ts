@@ -74,9 +74,9 @@ describe('M1 Focus: DEVICE', () => {
     const id = defaultEnv.HUB.idFromName("hub");
     const stub = defaultEnv.HUB.get(id);
     await runInDurableObject(stub, async (instance: Hub) => {
-      const row = instance.sql.exec('SELECT interval FROM device_pairings WHERE device_code_hash = ?', await crypto.subtle.digest('SHA-256', new TextEncoder().encode(device_code)).then(b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join(''))).toArray()[0] as any;
+      const row = instance.sql.exec('SELECT interval_s FROM device_pairings WHERE device_code_hash = ?', await crypto.subtle.digest('SHA-256', new TextEncoder().encode(device_code)).then(b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join(''))).toArray()[0] as any;
       if (row) {
-        expect(row.interval).toBe(interval + 5);
+        expect(row.interval_s).toBe(interval + 5);
       }
     });
   });

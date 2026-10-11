@@ -161,7 +161,7 @@ export class Hub extends DurableObject {
       if (path === '/auth/me') {
         if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
         const session = await getSession(this.env, request);
-        if (!session) return Response.json({ authenticated: false });
+        if (!session) return Response.json({ authenticated: false }, { status: 401 });
         return Response.json({ authenticated: true, email: session.email, csrf_token: session.csrfToken });
       }
 
@@ -215,11 +215,12 @@ export class Hub extends DurableObject {
         const now = new Date();
         const expiresAt = new Date(now.getTime() + 600 * 1000);
         
+        const pastForFirstPoll = new Date(now.getTime() - 60000);
         this.sql.exec(`
           INSERT INTO device_pairings
           (device_code_hash, user_code, client_kind, name, hostname, actor, requested_scopes, status, interval_s, last_poll_at, created_at, expires_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `, deviceCodeHash, userCode, body.client_kind, body.name, hostname, actor, JSON.stringify(body.requested_scopes), 'pending', 5, now.toISOString(), now.toISOString(), expiresAt.toISOString());
+        `, deviceCodeHash, userCode, body.client_kind, body.name, hostname, actor, JSON.stringify(body.requested_scopes), 'pending', 5, pastForFirstPoll.toISOString(), now.toISOString(), expiresAt.toISOString());
 
         return Response.json({
           device_code: deviceCode,
@@ -442,13 +443,14 @@ export class Hub extends DurableObject {
         
         this.ctx.storage.transactionSync(() => {
         const cred = this.sql.exec('SELECT * FROM credentials WHERE refresh_hash = ?', refreshHash).toArray()[0] as any;
+        const nowMs = Date.parse(now);
         if (!cred) {
           errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
         } else if (cred.revoked_at) {
           // Replay or explicitly revoked! Revoke family.
           this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
           errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
-        } else if (!Number.isFinite(Date.parse(cred.expires_at)) || Date.parse(cred.expires_at) <= Date.now()) {
+        } else if (!Number.isFinite(Date.parse(cred.expires_at)) || Date.parse(cred.expires_at) <= nowMs || Date.parse(cred.created_at) <= nowMs - 30 * 86400000) {
           errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
         } else {
           const res = this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', now, cred.id);

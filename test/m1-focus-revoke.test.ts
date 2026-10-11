@@ -27,8 +27,8 @@ describe('M1 Focus: REVOKE', () => {
   it('REVOKE: unauthenticated denied; ownedBearer revokes own credential/family; other actor/machine cannot revoke', async () => {
     const id = defaultEnv.HUB.idFromName("hub");
     const stub = defaultEnv.HUB.get(id);
-    let myAcc = 'acc_revoke_mine';
-    let otherAcc = 'acc_revoke_other';
+    let myAcc = 'hubt_acc_revoke_mine';
+    let otherAcc = 'hubt_acc_revoke_other';
     
     await runInDurableObject(stub, async (instance: Hub) => {
       instance.sql.exec(`INSERT INTO credentials (id, kind, token_hash, scopes, family_id, subject, created_by_sub, created_at, expires_at)

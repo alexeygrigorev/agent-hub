@@ -116,9 +116,9 @@ describe('M1 Focus: AUTH Quality', () => {
 
     // valid POST logout
     let resLogout = await doFetch(new Request('http://example.com/auth/logout', {
-      method: 'POST', headers: { 'Cookie': sessionCookie, 'x-csrf-token': csrfToken, 'Origin': 'http://example.com' }
+      method: 'POST', headers: { 'Cookie': sessionCookie, 'x-csrf-token': csrfToken, 'Origin': 'http://example.com' }, redirect: 'manual'
     }));
-    expect(resLogout.status).toBe(200); // or 302
+    expect([200, 302]).toContain(resLogout.status);
   });
 
 });

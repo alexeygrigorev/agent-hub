@@ -28,6 +28,8 @@ export class JwksCache {
       return this.pendingPromise;
     }
     
+    this.lastFetchAt = now; // Set immediately to enforce cooldown even on failure
+    
     this.pendingPromise = (async () => {
       try {
         const res = await fetch(env.AUTH_JWKS_URL, { headers: { accept: 'application/json' } });
