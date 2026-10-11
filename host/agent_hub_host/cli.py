@@ -5,7 +5,7 @@ from . import auth, api, system, config
 
 def cmd_login(args):
     try:
-        auth.device_login(args.base_url, "agent-hub-host", system.get_hostname(), "host")
+        auth.device_login(args.base_url, "host", "agent-hub-host", system.get_hostname(), ["host_agent"])
     except Exception as e:
         print(f"Login failed: {e}", file=sys.stderr)
         sys.exit(1)
@@ -55,9 +55,14 @@ def cmd_run(args):
     from . import api
     try:
         cfg = config.load_config()
-        if not cfg.get("base_url"):
-            print("Not logged in.", file=sys.stderr)
-            sys.exit(1)
+        if not cfg.get("access_token"):
+            base_url = cfg.get("base_url")
+            if base_url:
+                from . import system, auth
+                auth.device_login(base_url, "host", "agent-hub-host", system.get_hostname(), ["host_agent"])
+            else:
+                print("Not logged in.", file=sys.stderr)
+                sys.exit(1)
         agent = api.HostAgent()
         agent.run()
     except Exception as e:

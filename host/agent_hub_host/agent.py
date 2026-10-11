@@ -9,8 +9,13 @@ def main():
     
     cfg = config.load_config()
     if not cfg.get("access_token"):
-        print("Not logged in. Please run `hub login <base_url>` first.", file=sys.stderr)
-        sys.exit(1)
+        base_url = cfg.get("base_url")
+        if base_url:
+            from . import system, auth
+            auth.device_login(base_url, "host", "agent-hub-host", system.get_hostname(), ["host_agent"])
+        else:
+            print("Not logged in. Please run `hub login <base_url>` first.", file=sys.stderr)
+            sys.exit(1)
         
     agent = api.HostAgent()
     

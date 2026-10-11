@@ -13,15 +13,16 @@ def is_https_or_localhost(url: str) -> bool:
         return True
     return False
 
-def device_login(base_url: str, client_name: str, hostname: str, scopes: str):
+def device_login(base_url: str, client_kind: str, name: str, hostname: str, requested_scopes: list):
     if not is_https_or_localhost(base_url):
         raise ValueError("Only HTTPS URLs or localhost are permitted.")
     
     code_url = f"{base_url}/api/device/code"
     code_payload = json.dumps({
-        "client_name": client_name,
+        "client_kind": client_kind,
+        "name": name,
         "hostname": hostname,
-        "scopes": scopes,
+        "requested_scopes": requested_scopes,
     }).encode("utf-8")
     
     req = urllib.request.Request(code_url, data=code_payload, headers={"Content-Type": "application/json"})
@@ -87,33 +88,41 @@ def device_login(base_url: str, client_name: str, hostname: str, scopes: str):
             print(f"Network error, retrying... ({e})")
             continue
 
+import threading
+_refresh_lock = threading.Lock()
+
 def refresh_token():
-    cfg = config.load_config()
-    refresh = cfg.get("refresh_token")
-    base_url = cfg.get("base_url")
-    if not refresh or not base_url:
-        raise RuntimeError("No refresh token or base URL available. Please login.")
+    with _refresh_lock:
+        cfg = config.load_config()
+        refresh = cfg.get("refresh_token")
+        base_url = cfg.get("base_url")
+        if not refresh or not base_url:
+            raise RuntimeError("No refresh token or base URL available. Please login.")
+            
+        token_url = f"{base_url}/api/token/refresh"
+        token_payload = json.dumps({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh
+        }).encode("utf-8")
         
-    token_url = f"{base_url}/api/device/token"
-    token_payload = json.dumps({
-        "grant_type": "refresh_token",
-        "refresh_token": refresh
-    }).encode("utf-8")
-    
-    req = urllib.request.Request(token_url, data=token_payload, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req) as response:
-            token_res = json.loads(response.read().decode("utf-8"))
-            config.update_config(
-                access_token=token_res["access_token"],
-                refresh_token=token_res.get("refresh_token", refresh)
-            )
-            return token_res["access_token"]
-    except urllib.error.HTTPError as e:
-        config.clear_config()
-        raise RuntimeError(f"Refresh failed (code {e.code}), pairing required again.")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Network error during refresh: {e}")
+        req = urllib.request.Request(token_url, data=token_payload, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req) as response:
+                token_res = json.loads(response.read().decode("utf-8"))
+                config.update_config(
+                    access_token=token_res["access_token"],
+                    refresh_token=token_res.get("refresh_token", refresh)
+                )
+                return token_res["access_token"]
+        except urllib.error.HTTPError as e:
+            config.clear_config()
+            config.update_config(base_url=base_url)
+            from . import system
+            print(f"Refresh failed (code {e.code}), pairing required again.")
+            device_login(base_url, "host", "agent-hub-host", system.get_hostname(), ["host_agent"])
+            return get_access_token()
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Network error during refresh: {e}")
 
 def get_access_token() -> str:
     cfg = config.load_config()

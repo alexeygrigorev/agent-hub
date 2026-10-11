@@ -64,3 +64,25 @@ class TestGate(unittest.TestCase):
         res = gate.get_gate_status(MockClock(100.0))
         self.assertFalse(res["launch_allowed"])
         self.assertEqual(res["reason"], "failed")
+
+    @patch("os.path.exists")
+    @patch("subprocess.run")
+    def test_gate_75_and_strict_bool(self, mock_run, mock_exists):
+        mock_exists.return_value = True
+        mock_run.return_value.returncode = 75
+        mock_run.return_value.stdout = '{"launch_allowed": "true", "reason": "quota low"}'
+        
+        res = gate.get_gate_status(MockClock(100.0))
+        self.assertFalse(res["launch_allowed"])
+        self.assertEqual(res["reason"], "quota low")
+
+    @patch("os.path.exists")
+    @patch("subprocess.run")
+    def test_gate_malformed(self, mock_run, mock_exists):
+        mock_exists.return_value = True
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = 'invalid json'
+        
+        res = gate.get_gate_status(MockClock(100.0))
+        self.assertFalse(res["launch_allowed"])
+        self.assertEqual(res["reason"], "malformed")

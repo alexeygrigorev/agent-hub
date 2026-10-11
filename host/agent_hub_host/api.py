@@ -10,6 +10,17 @@ import time
 import urllib.request
 import urllib.error
 import urllib.parse
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+urllib.request.install_opener(urllib.request.build_opener(NoRedirectHandler()))
+
+def check_url(url: str):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != 'https' and parsed.hostname not in ('localhost', '127.0.0.1'):
+        raise ValueError('Only HTTPS URLs or localhost are permitted.')
 from . import auth, system, config
 
 class Clock:
@@ -22,45 +33,67 @@ class RNG:
 
 def register_machine(base_url: str):
     info = system.get_system_info()
+    check_url(base_url)
     url = f"{base_url}/api/machines/register"
     req = urllib.request.Request(url, data=json.dumps(info).encode("utf-8"), headers={
         "Content-Type": "application/json",
         "Authorization": f"Bearer {auth.get_access_token()}"
     })
     try:
-        with urllib.request.urlopen(req) as res:
+        with urllib.request.urlopen(req, timeout=10.0) as res:
             return json.loads(res.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code == 401:
             auth.refresh_token()
             req.add_header("Authorization", f"Bearer {auth.get_access_token()}")
-            with urllib.request.urlopen(req) as res:
+            with urllib.request.urlopen(req, timeout=10.0) as res:
                 return json.loads(res.read().decode("utf-8"))
         raise RuntimeError(f"Registration failed: {e.code}")
 
 def get_available_machines(base_url: str):
+    check_url(base_url)
     url = f"{base_url}/api/machines/available"
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {auth.get_access_token()}"
     })
     try:
-        with urllib.request.urlopen(req) as res:
+        with urllib.request.urlopen(req, timeout=10.0) as res:
             return json.loads(res.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code == 401:
             auth.refresh_token()
             req.add_header("Authorization", f"Bearer {auth.get_access_token()}")
-            with urllib.request.urlopen(req) as res:
+            with urllib.request.urlopen(req, timeout=10.0) as res:
                 return json.loads(res.read().decode("utf-8"))
         raise RuntimeError(f"Failed to get available machines: {e.code}")
 
 def get_heartbeat_payload(clock=None) -> dict:
-    import psutil
     import shutil
+    import platform
     from . import gate
     
+    mem_avail_mb = 0
+    if platform.system() == "Windows":
+        import ctypes
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong), ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong), ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong), ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong), ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            mem_avail_mb = stat.ullAvailPhys // (1024 * 1024)
+    else:
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        mem_avail_mb = int(line.split()[1]) // 1024
+                        break
+        except Exception:
+            pass
+            
     return {
-        "mem_avail_mb": psutil.virtual_memory().available // (1024 * 1024) if hasattr(psutil, "virtual_memory") else 0,
+        "type": "heartbeat",
+        "mem_avail_mb": mem_avail_mb,
         "disk_free_gb": shutil.disk_usage("/").free // (1024**3),
         "load": os.getloadavg() if hasattr(os, "getloadavg") else (0.0, 0.0, 0.0),
         "gate": gate.get_gate_status(clock),
@@ -113,55 +146,7 @@ def ws_handshake(host: str, port: int, path: str, token: str, is_secure: bool, r
         
     return sock, rest
 
-def ws_send_frame(sock, opcode: int, payload: bytes, rng: RNG):
-    mask = rng.randbytes(4)
-    masked_payload = bytearray(len(payload))
-    for i in range(len(payload)):
-        masked_payload[i] = payload[i] ^ mask[i % 4]
-        
-    header = bytearray([0x80 | opcode])
-    if len(payload) < 126:
-        header.append(0x80 | len(payload))
-    elif len(payload) < 65536:
-        header.append(0x80 | 126)
-        header.extend(struct.pack("!H", len(payload)))
-    else:
-        header.append(0x80 | 127)
-        header.extend(struct.pack("!Q", len(payload)))
-        
-    header.extend(mask)
-    sock.sendall(header + masked_payload)
-
-def ws_recv_frame(sock, rest: bytes):
-    def read_exact(n):
-        nonlocal rest
-        while len(rest) < n:
-            chunk = sock.recv(4096)
-            if not chunk:
-                raise ConnectionError("Connection closed")
-            rest += chunk
-        res = rest[:n]
-        rest = rest[n:]
-        return res
-
-    header = read_exact(2)
-    fin = (header[0] & 0x80) != 0
-    opcode = header[0] & 0x0F
-    has_mask = (header[1] & 0x80) != 0
-    length = header[1] & 0x7F
-    
-    if length == 126:
-        length = struct.unpack("!H", read_exact(2))[0]
-    elif length == 127:
-        length = struct.unpack("!Q", read_exact(8))[0]
-        
-    mask = read_exact(4) if has_mask else None
-    payload = read_exact(length)
-    
-    if mask:
-        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-        
-    return fin, opcode, payload, rest
+from .ws import WSConnection
 
 class HostAgent:
     def __init__(self, clock=None, rng=None):
@@ -201,25 +186,49 @@ class HostAgent:
 
     def _run_ws(self, sock, rest):
         sock.settimeout(1.0)
+        ws = WSConnection(sock, rest, self.rng)
         last_hb = self.clock.time()
         
-        while not self.shutdown_requested:
-            now = self.clock.time()
-            if now - last_hb >= 60.0:
-                hb = get_heartbeat_payload(self.clock)
-                ws_send_frame(sock, 1, json.dumps(hb).encode("utf-8"), self.rng)
-                last_hb = now
-                
-            try:
-                fin, opcode, payload, rest = ws_recv_frame(sock, rest)
+        msg_fragments = bytearray()
+        msg_opcode = None
+        
+        try:
+            while not self.shutdown_requested:
+                now = self.clock.time()
+                if now - last_hb >= 60.0:
+                    hb = get_heartbeat_payload(self.clock)
+                    ws.send_frame(1, json.dumps(hb).encode("utf-8"))
+                    last_hb = now
+                    
+                try:
+                    fin, opcode, payload = ws.recv_frame()
+                except socket.timeout:
+                    continue
+                    
                 if opcode == 9: # Ping
-                    ws_send_frame(sock, 10, payload, self.rng)
+                    ws.send_frame(10, payload)
+                elif opcode == 10: # Pong
+                    pass
                 elif opcode == 8: # Close
+                    ws.send_frame(8, payload[:2] if len(payload) >= 2 else b"")
                     return
-                elif opcode == 1: # Text
-                    msg = json.loads(payload.decode("utf-8"))
-                    print(f"Received msg: {msg}")
-            except socket.timeout:
+                elif opcode in (1, 2, 0): # Text, Binary, Continuation
+                    msg_fragments.extend(payload)
+                    if opcode != 0 and msg_opcode is None:
+                        msg_opcode = opcode
+                    if fin:
+                        if msg_opcode == 1:
+                            try:
+                                msg = json.loads(msg_fragments.decode("utf-8"))
+                                print(f"Received msg type: {msg.get('type', 'unknown')}")
+                            except Exception:
+                                pass
+                        msg_fragments = bytearray()
+                        msg_opcode = None
+        finally:
+            try:
+                sock.close()
+            except Exception:
                 pass
 
     def _poll_fallback(self):

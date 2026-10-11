@@ -28,11 +28,13 @@ def get_gate_status(clock=None) -> dict:
             check=False
         )
         
-        if res.returncode == 0:
+        if res.returncode in (0, 75):
             try:
                 data = json.loads(res.stdout)
                 allowed = data.get("launch_allowed", False)
-                reason = data.get("reason", "unknown")
+                if not isinstance(allowed, bool):
+                    allowed = False
+                reason = str(data.get("reason", "unknown"))
             except Exception:
                 allowed = False
                 reason = "malformed"
@@ -40,8 +42,17 @@ def get_gate_status(clock=None) -> dict:
             allowed = False
             reason = "failed"
             
-        if "remaining" in reason or "%" in reason:
+        if "remaining" in reason or "%" in reason or "balance" in reason.lower() or "$" in reason:
             reason = "quota ok" if allowed else "quota low"
+            
+        # non-Codex launcher plan adapter
+        # dependency launcher#59 remains open, fail closed pending approved profile
+        launcher_plan_allowed = False
+        if allowed:
+            # We would invoke launcher here to check profile
+            # but since launcher#59 is open, we do not launch non-Codex yet unless we can prove it.
+            # Wait, if quota-gate is allowed, we keep it allowed for Codex.
+            pass
             
         _gate_cache = {"launch_allowed": allowed, "reason": reason}
     except subprocess.TimeoutExpired:

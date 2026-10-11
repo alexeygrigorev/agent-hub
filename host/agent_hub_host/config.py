@@ -16,45 +16,67 @@ def get_config_path() -> Path:
 
 def _set_permissions(path: Path):
     if sys.platform == "win32":
-        import ctypes
-        import win32api
-        import win32security
-        import ntsecuritycon as con
-        try:
-            # Set user-only ACL
-            user, domain, type = win32security.LookupAccountName("", win32api.GetUserName())
-            sd = win32security.SECURITY_DESCRIPTOR()
-            dacl = win32security.ACL()
-            dacl.AddAccessAllowedAce(win32security.ACL_REVISION, con.FILE_ALL_ACCESS, user)
-            sd.SetSecurityDescriptorDacl(1, dacl, 0)
-            win32security.SetFileSecurity(str(path), win32security.DACL_SECURITY_INFORMATION, sd)
-        except ImportError:
-            # fallback or failclosed if required, but standard library only so win32security might not be available
-            # Let's try standard ctypes or cacls
-            import subprocess
-            res = subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{os.environ.get('USERNAME')}:F"], capture_output=True)
-            if res.returncode != 0:
-                raise RuntimeError(f"Failed to set ACL on Windows: {res.stderr.decode()}")
+        import subprocess
+        import shlex
+        # get sid via whoami
+        res_whoami = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True)
+        if res_whoami.returncode != 0:
+            raise RuntimeError("Failed to get current user SID")
+        sid = res_whoami.stdout.strip().split(',')[-1].strip('"')
+        
+        icacls_exe = "icacls"
+        # For testing, we might want to mock this if a dummy executable is in path
+        res = subprocess.run([icacls_exe, str(path), "/inheritance:r"], capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"Failed to remove inheritance: {res.stderr}")
+            
+        res = subprocess.run([icacls_exe, str(path), "/grant:r", f"*{sid}:F"], capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"Failed to grant ACL: {res.stderr}")
     else:
+        if path.is_symlink():
+            raise RuntimeError("Symlinks are not allowed for config")
         os.chmod(path, 0o600)
 
 def load_config() -> dict:
     path = get_config_path()
     if not path.exists():
         return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    if path.is_symlink():
+        raise RuntimeError("Symlinks are not allowed for config")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, dict):
+                return {}
+            return data
+    except Exception:
+        return {}
 
 def save_config(data: dict):
     path = get_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Safely create directory tree with 0o700
+    p = path.parent
+    dirs = []
+    while not p.exists():
+        dirs.append(p)
+        p = p.parent
+    for d in reversed(dirs):
+        d.mkdir(mode=0o700)
+        
+    if path.parent.is_symlink():
+        raise RuntimeError("Symlinks are not allowed for config parent")
     
     fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix="host.json.", text=True)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-    
-    _set_permissions(Path(tmp_path))
-    os.replace(tmp_path, path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        _set_permissions(Path(tmp_path))
+        os.replace(tmp_path, path)
+    except Exception:
+        os.unlink(tmp_path)
+        raise
 
 def update_config(**kwargs):
     config = load_config()

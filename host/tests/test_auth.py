@@ -38,7 +38,7 @@ class TestAuth(unittest.TestCase):
         
         mock_urlopen.side_effect = [code_resp, pending_error, success_resp]
         
-        auth.device_login("https://fake", "client", "host", "scopes")
+        auth.device_login("https://fake", "host", "agent-hub-host", "host", ["host_agent"])
         mock_update_config.assert_called_once_with(access_token="acc123", refresh_token="ref123", base_url="https://fake")
 
     @patch("urllib.request.urlopen")
@@ -65,7 +65,7 @@ class TestAuth(unittest.TestCase):
         mock_urlopen.side_effect = [code_resp, slow_error, deny_error]
         
         with self.assertRaisesRegex(RuntimeError, "Access denied by user."):
-            auth.device_login("https://fake", "client", "host", "scopes")
+            auth.device_login("https://fake", "host", "agent-hub-host", "host", ["host_agent"])
 
     @patch("urllib.request.urlopen")
     @patch("agent_hub_host.config.load_config")
@@ -86,16 +86,19 @@ class TestAuth(unittest.TestCase):
 
     @patch("urllib.request.urlopen")
     @patch("agent_hub_host.config.load_config")
+    @patch("agent_hub_host.auth.device_login")
+    @patch("agent_hub_host.auth.get_access_token")
     @patch("agent_hub_host.config.clear_config")
-    def test_refresh_token_revoked(self, mock_clear_config, mock_load_config, mock_urlopen):
+    def test_refresh_token_revoked(self, mock_clear_config, mock_get_access_token, mock_device_login, mock_load_config, mock_urlopen):
         mock_load_config.return_value = {"refresh_token": "ref123", "base_url": "https://fake"}
+        mock_get_access_token.return_value = "acc999"
         
         deny_resp = MagicMock()
         deny_resp.read.return_value = json.dumps({"error": "invalid_grant"}).encode("utf-8")
         deny_error = urllib.error.HTTPError("url", 400, "Bad Request", {}, deny_resp)
         mock_urlopen.side_effect = deny_error
         
-        with self.assertRaisesRegex(RuntimeError, "Refresh failed.*pairing required again"):
-            auth.refresh_token()
-            
+        res = auth.refresh_token()
+        self.assertEqual(res, "acc999")
         mock_clear_config.assert_called_once()
+        mock_device_login.assert_called_once()
