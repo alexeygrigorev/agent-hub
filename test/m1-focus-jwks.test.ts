@@ -4,6 +4,8 @@ import { doFetch, loginAndGetState, createHelpers, defaultEnv } from './m1-focus
 import { runInDurableObject } from 'cloudflare:test';
 import { Hub } from '../src/hub';
 import worker from '../src/worker';
+import { sha256 } from '../src/auth/crypto';
+import { createLoginCookie } from '../src/auth/session';
 
 let helpers: any;
 let originalFetch = globalThis.fetch;
@@ -216,42 +218,111 @@ describe('M1 Focus: JWKS', () => {
   });
 
   it('JWKS: Empty secret/admin allowlist fail closed on callback', async () => {
-    const { loginCookie, state, nonce } = await loginAndGetState();
-    let idToken = await helpers.signJwt({
-      iss: 'https://auth.fake.local', aud: 'fake_client_id', exp: Math.floor(Date.now() / 1000) + 3600,
-      nonce, token_use: 'id', email: 'admin@fake.local', email_verified: true, sub: 'admin-1'
-    }, { alg: 'RS256', kid: 'test-key-1' });
-
-    let oF = globalThis.fetch;
-    globalThis.fetch = async (i) => {
-      if (i.toString().includes('/oauth2/token')) return new Response(JSON.stringify({ id_token: idToken }), { headers: { 'content-type': 'application/json' } });
-      if (i.toString().includes('/.well-known/jwks.json')) return new Response(JSON.stringify({ keys: [{ ...helpers.jwkPub, kid: 'test-key-1' }] }), { headers: { 'content-type': 'application/json' } });
-      return oF(i);
-    };
-
     const id = defaultEnv.HUB.idFromName("hub");
     const stub = defaultEnv.HUB.get(id);
 
-    await runInDurableObject(stub, async (instance: Hub) => {
-      const originalAdmins = instance.env.HUB_ADMINS;
-      const originalSecret = instance.env.SESSION_SECRET;
+    await runInDurableObject(stub, async (instance) => {
+      const origAdmins = instance.env.HUB_ADMINS;
+      const origSecret = instance.env.SESSION_SECRET;
+      const oF = globalThis.fetch;
 
-      // Missing admins
-      instance.env.HUB_ADMINS = '';
-      let resNoAdmins = await instance.fetch(new Request(`http://example.com/auth/callback?code=fake&state=${state}`, { headers: { 'Cookie': loginCookie }, redirect: 'manual' }));
-      expect(resNoAdmins.status).toBeGreaterThanOrEqual(400);
+      // 1. Missing admins
+      try {
+        instance.env.HUB_ADMINS = '';
+        instance.env.SESSION_SECRET = '01234567890123456789012345678901';
 
-      // Missing secret
-      instance.env.HUB_ADMINS = originalAdmins;
-      instance.env.SESSION_SECRET = '';
-      let resNoSec = await instance.fetch(new Request(`http://example.com/auth/callback?code=fake&state=${state}`, { headers: { 'Cookie': loginCookie }, redirect: 'manual' }));
-      expect(resNoSec.status).toBeGreaterThanOrEqual(400);
+        const state1 = 's1_' + Math.random();
+        const nonce1 = 'n1_' + Math.random();
+        const hash1 = await sha256(state1);
 
-      // Restore
-      instance.env.SESSION_SECRET = originalSecret;
+        instance.sql.exec('INSERT INTO login_states (state_hash, expires_at) VALUES (?, ?)', hash1, Math.floor(Date.now() / 1000) + 600);
+        const loginCookie1 = await createLoginCookie(instance.env, { state: state1, nonce: nonce1, verifier: 'v1', exp: Math.floor(Date.now() / 1000) + 600, returnTo: '/' });
+
+        const idToken1 = await helpers.signJwt({
+          iss: 'https://auth.fake.local', aud: 'fake_client_id', exp: Math.floor(Date.now() / 1000) + 3600,
+          nonce: nonce1, token_use: 'id', email: 'admin@fake.local', email_verified: true, sub: 'admin-1'
+        }, { alg: 'RS256', kid: 'test-key-1' });
+
+        globalThis.fetch = async (i) => {
+          if (i.toString().includes('/oauth2/token')) return new Response(JSON.stringify({ id_token: idToken1 }), { headers: { 'content-type': 'application/json' } });
+          if (i.toString().includes('/.well-known/jwks.json')) return new Response(JSON.stringify({ keys: [{ ...helpers.jwkPub, kid: 'test-key-1' }] }), { headers: { 'content-type': 'application/json' } });
+          return oF(i);
+        };
+
+        let resNoAdmins = await instance.fetch(new Request(`http://example.com/auth/callback?code=fake&state=${state1}`, { headers: { 'Cookie': loginCookie1 }, redirect: 'manual' }));
+        expect(resNoAdmins.status).toBeGreaterThanOrEqual(400);
+        expect(instance.sql.exec('SELECT consumed FROM login_states WHERE state_hash = ?', hash1).toArray()[0].consumed).toBe(1);
+      } finally {
+        globalThis.fetch = oF;
+      }
+
+      // 2. Missing secret
+      try {
+        instance.env.HUB_ADMINS = origAdmins;
+        instance.env.SESSION_SECRET = '01234567890123456789012345678901';
+
+        const state2 = 's2_' + Math.random();
+        const nonce2 = 'n2_' + Math.random();
+        const hash2 = await sha256(state2);
+
+        instance.sql.exec('INSERT INTO login_states (state_hash, expires_at) VALUES (?, ?)', hash2, Math.floor(Date.now() / 1000) + 600);
+        const loginCookie2 = await createLoginCookie(instance.env, { state: state2, nonce: nonce2, verifier: 'v2', exp: Math.floor(Date.now() / 1000) + 600, returnTo: '/' });
+
+        instance.env.SESSION_SECRET = '';
+
+        const idToken2 = await helpers.signJwt({
+          iss: 'https://auth.fake.local', aud: 'fake_client_id', exp: Math.floor(Date.now() / 1000) + 3600,
+          nonce: nonce2, token_use: 'id', email: 'admin@fake.local', email_verified: true, sub: 'admin-1'
+        }, { alg: 'RS256', kid: 'test-key-1' });
+
+        globalThis.fetch = async (i) => {
+          if (i.toString().includes('/oauth2/token')) return new Response(JSON.stringify({ id_token: idToken2 }), { headers: { 'content-type': 'application/json' } });
+          if (i.toString().includes('/.well-known/jwks.json')) return new Response(JSON.stringify({ keys: [{ ...helpers.jwkPub, kid: 'test-key-1' }] }), { headers: { 'content-type': 'application/json' } });
+          return oF(i);
+        };
+
+        let resNoSec = await instance.fetch(new Request(`http://example.com/auth/callback?code=fake&state=${state2}`, { headers: { 'Cookie': loginCookie2 }, redirect: 'manual' }));
+        expect(resNoSec.status).toBeGreaterThanOrEqual(400);
+        expect(instance.sql.exec('SELECT consumed FROM login_states WHERE state_hash = ?', hash2).toArray()[0].consumed).toBe(0);
+      } finally {
+        globalThis.fetch = oF;
+      }
+
+      // 3. Positive control
+      try {
+        instance.env.HUB_ADMINS = origAdmins;
+        instance.env.SESSION_SECRET = origSecret;
+
+        const state3 = 's3_' + Math.random();
+        const nonce3 = 'n3_' + Math.random();
+        const hash3 = await sha256(state3);
+
+        instance.sql.exec('INSERT INTO login_states (state_hash, expires_at) VALUES (?, ?)', hash3, Math.floor(Date.now() / 1000) + 600);
+        const loginCookie3 = await createLoginCookie(instance.env, { state: state3, nonce: nonce3, verifier: 'v3', exp: Math.floor(Date.now() / 1000) + 600, returnTo: '/' });
+
+        const idToken3 = await helpers.signJwt({
+          iss: 'https://auth.fake.local', aud: 'fake_client_id', exp: Math.floor(Date.now() / 1000) + 3600,
+          nonce: nonce3, token_use: 'id', email: 'admin@fake.local', email_verified: true, sub: 'admin-1'
+        }, { alg: 'RS256', kid: 'test-key-1' });
+
+        let localFetchCount = 0;
+        globalThis.fetch = async (i) => {
+          localFetchCount++;
+          if (i.toString().includes('/oauth2/token')) return new Response(JSON.stringify({ id_token: idToken3 }), { headers: { 'content-type': 'application/json' } });
+          if (i.toString().includes('/.well-known/jwks.json')) return new Response(JSON.stringify({ keys: [{ ...helpers.jwkPub, kid: 'test-key-1' }] }), { headers: { 'content-type': 'application/json' } });
+          return oF(i);
+        };
+
+        let resPos = await instance.fetch(new Request(`http://example.com/auth/callback?code=fake&state=${state3}`, { headers: { 'Cookie': loginCookie3 }, redirect: 'manual' }));
+        expect(resPos.status).toBe(302);
+        expect(localFetchCount).toBeGreaterThan(0);
+        expect(instance.sql.exec('SELECT consumed FROM login_states WHERE state_hash = ?', hash3).toArray()[0].consumed).toBe(1);
+      } finally {
+        instance.env.HUB_ADMINS = origAdmins;
+        instance.env.SESSION_SECRET = origSecret;
+        globalThis.fetch = oF;
+      }
     });
-
-    globalThis.fetch = oF;
   });
 
 });
