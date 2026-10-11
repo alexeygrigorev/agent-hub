@@ -1,6 +1,7 @@
 import { Hub } from './hub';
 
 export interface Env {
+  // Type-safe DurableObjectNamespace binding for Hub Durable Object
   HUB: DurableObjectNamespace<Hub>;
   
   // Auth Config

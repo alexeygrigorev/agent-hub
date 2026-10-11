@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent_hub_host"
+version = "0.1.0"
+description = "Agent Hub Host"
+requires-python = ">=3.9"
+
+[project.scripts]
+hub = "agent_hub_host.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "host"}
+packages = ["agent_hub_host"]
