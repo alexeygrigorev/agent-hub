@@ -107,12 +107,27 @@ def refresh_token():
             )
             return token_res["access_token"]
         except urllib.error.HTTPError as e:
-            config.clear_config()
-            config.update_config(base_url=base_url)
-            from . import system
-            print(f"Refresh failed (code {e.code}), pairing required again.")
-            device_login(base_url, "host", "agent-hub-host", system.get_hostname(), ["host_agent"])
-            return get_access_token()
+            should_repair = False
+            if e.code == 401:
+                should_repair = True
+            elif e.code == 400:
+                try:
+                    body = e.read(1024 * 1024)
+                    err_res = json.loads(body.decode("utf-8"))
+                    if err_res.get("error") == "invalid_grant":
+                        should_repair = True
+                except Exception:
+                    pass
+            
+            if should_repair:
+                config.clear_config()
+                config.update_config(base_url=base_url)
+                from . import system
+                print(f"Refresh failed (code {e.code} revocation), pairing required again.")
+                device_login(base_url, "host", "agent-hub-host", system.get_hostname(), ["host_agent"])
+                return get_access_token()
+            else:
+                raise RuntimeError(f"Transient HTTP error during refresh: {e.code}")
         except urllib.error.URLError as e:
             raise RuntimeError(f"Network error during refresh: {e}")
 

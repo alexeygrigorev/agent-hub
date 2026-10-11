@@ -19,9 +19,15 @@ def _get_opener():
     return urllib.request.build_opener(NoRedirectHandler())
 
 def check_url(url: str):
+    if not isinstance(url, str):
+        raise TypeError('URL must be a string')
+    if not url:
+        raise ValueError('URL cannot be empty')
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ('http', 'https'):
         raise ValueError('Only HTTPS URLs or localhost are permitted.')
+    if not parsed.hostname:
+        raise ValueError('URL must have a hostname')
     if parsed.scheme == 'http':
         if parsed.hostname not in ('localhost', '127.0.0.1', '::1'):
             raise ValueError('Only HTTPS URLs or localhost are permitted.')
@@ -222,23 +228,35 @@ class HostAgent:
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         path = "/api/host/connect"
         
-        backoff = 1.0
+        ws_fail_count = 0
+        poll_backoff = 1.0
         
         while not self.shutdown_requested:
+            start_time = self.clock.time()
             try:
                 token = auth.get_access_token()
                 sock, rest = ws_handshake(host, port, path, token, parsed.scheme == "https", self.rng)
                 self._run_ws(sock, rest)
-                backoff = 1.0
-            except Exception as e:
-                # print(f"WS error: {e}, falling back to polling")
-                try:
-                    self._poll_fallback()
-                    backoff = 1.0
-                except Exception as pe:
-                    # print(f"Poll error: {pe}")
-                    self.clock.sleep(backoff)
-                    backoff = min(600.0, backoff * 2.0)
+            except Exception:
+                pass
+                
+            elapsed = self.clock.time() - start_time
+            if elapsed > 60.0:
+                ws_fail_count = 0
+                
+            ws_sleep = min(600.0, 1.0 * (2.0 ** ws_fail_count))
+            ws_fail_count += 1
+            
+            try:
+                self._poll_fallback()
+                poll_backoff = 1.0
+            except Exception as pe:
+                self.clock.sleep(poll_backoff)
+                poll_backoff = min(600.0, poll_backoff * 2.0)
+                
+            total_elapsed = self.clock.time() - start_time
+            if total_elapsed < ws_sleep:
+                self.clock.sleep(ws_sleep - total_elapsed)
 
     def _run_ws(self, sock, rest):
         sock.settimeout(1.0)

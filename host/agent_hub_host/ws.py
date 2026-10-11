@@ -106,6 +106,8 @@ class WSConnection:
                         self._fail(1002, "High bit of 64-bit length set")
                     self.rest = self.rest[8:]
                 
+                if self.length > 10 * 1024 * 1024 or len(self.msg_payload) + self.length > 10 * 1024 * 1024:
+                    self._fail(1009, "Message too big")
                 self.state = "MASK"
                 
             elif self.state == "MASK":
@@ -150,7 +152,7 @@ class WSConnection:
                         code = 1000
                         if len(payload) >= 2:
                             code = struct.unpack("!H", payload[:2])[0]
-                            if code < 1000 or code in (1004, 1005, 1006, 1015) or (1012 <= code <= 1014) or (code >= 5000):
+                            if code < 1000 or code in (1004, 1005, 1006, 1015) or (1016 <= code <= 2999) or (code >= 5000):
                                 self._fail(1002, "Invalid close code")
                             if len(payload) > 2:
                                 try:
