@@ -1,2 +1,0 @@
-[console_scripts]
-hub = agent_hub_host.cli:main
