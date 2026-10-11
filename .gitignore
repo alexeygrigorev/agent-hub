@@ -1,0 +1,7 @@
+node_modules/
+.dev.vars
+.wrangler/
+dist/
+.local/
+__pycache__/
+*.pyc
