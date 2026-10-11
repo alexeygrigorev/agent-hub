@@ -108,10 +108,19 @@ Migration proceeds in phases as defined in the SPEC. The current Grok root and w
 
 ## 5. Host Agent Installation
 
-Note: The actual host package is still under M0/M2 development. The module entrypoints below represent the eventual CLI structure.
+Note: The actual host package is still under M0/M2 development. The provisional host contract (source pinned at `47e3a400a9c862875473dde1e1a437c15c42558b`) has been verified locally, but final M7 acceptance waits for accepted M2 + integrated full source + different-model review.
+
+### Prerequisites
+Before installing the service, create an isolated `.local` virtual environment, install the `agent_hub_host` package, and login. No third-party tools or service installation scripts should be used.
+```bash
+python3 -m venv ~/.local/venv
+~/.local/venv/bin/pip install ./host
+~/.local/venv/bin/hub login https://<hub-domain>
+```
+*Note: Wait for Alexey to approve the pending host in the Hub admin dashboard before starting the service.*
 
 ### Linux (Hetzner)
-Installed as a user systemd service.
+Installed as a user systemd service. Ensure the `hub` executable has mode 600 or is in a private `.local` directory to restrict access.
 ```ini
 # ~/.config/systemd/user/agent-hub-host.service
 [Unit]
@@ -121,7 +130,8 @@ After=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/git/agent-hub
-ExecStart=/usr/bin/python3 -m host.cli
+Environment="PATH=%h/.local/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=%h/.local/venv/bin/hub run
 Restart=on-failure
 RestartSec=10
 
@@ -131,10 +141,10 @@ WantedBy=default.target
 Run: `systemctl --user daemon-reload`, `systemctl --user enable --now agent-hub-host.service`.
 
 ### Windows
-Installed as a Task Scheduler logon task.
+Installed as a Task Scheduler logon task with User-only ACLs (Run only when user is logged on).
 Create a Basic Task in Task Scheduler:
 - Trigger: When I log on
 - Action: Start a program
-- Program/script: `python.exe`
-- Add arguments: `-m host.cli`
-- Start in: path to the agent-hub clone.
+- Program/script: `%USERPROFILE%\.local\venv\Scripts\hub.exe`
+- Add arguments: `run`
+- Start in: `%USERPROFILE%\git\agent-hub`

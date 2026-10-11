@@ -59,16 +59,16 @@ if [ "$DRY_RUN" = true ]; then
         npm ci
     fi
     
+    mkdir -p .local
     echo "Running wrangler dry-run..."
-    npx --no-install wrangler deploy --dry-run --outdir dist 2>&1 | tee evidence.log
-    
-    # Check if wrangler actually succeeded by inspecting the exit code of npx
-    if [ ${PIPESTATUS[0]} -ne 0 ]; then
+    touch .local/evidence.log
+    chmod 600 .local/evidence.log
+    if ! npx --no-install wrangler deploy --dry-run --outdir .local/buildout 2>&1 | tee .local/evidence.log; then
         echo "Wrangler dry-run failed."
         exit 1
     fi
     
-    echo "Dry run completed locally. Evidence saved to evidence.log."
+    echo "Dry run completed locally. Evidence saved to .local/evidence.log."
     exit 0
 fi
 

@@ -58,6 +58,7 @@ class TestScripts(unittest.TestCase):
                 if [ "$1" = "--no-install" ] && [ "$2" = "wrangler" ] && [ "$3" = "deploy" ]; then
                     if [ "$4" = "--dry-run" ]; then
                         echo "Fake wrangler dry-run success"
+                        mkdir -p .local/buildout
                         exit 0
                     else
                         echo "FATAL: fake npx received deployment without --dry-run" >&2
@@ -76,9 +77,15 @@ class TestScripts(unittest.TestCase):
             result = subprocess.run([self.deploy_script, "--dry-run"], env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0)
             self.assertIn("Fake wrangler dry-run success", result.stdout)
-            self.assertTrue(os.path.exists("evidence.log"))
+            self.assertTrue(os.path.exists(".local/evidence.log"))
+            self.assertTrue(os.path.exists(".local/buildout"))
+            self.assertFalse(os.path.exists("evidence.log"))
             
-            with open("evidence.log", "r") as f:
+            # Check permissions
+            stat = os.stat(".local/evidence.log")
+            self.assertEqual(stat.st_mode & 0o777, 0o600)
+            
+            with open(".local/evidence.log", "r") as f:
                 evidence = f.read()
                 self.assertIn("Fake wrangler dry-run success", evidence)
 
