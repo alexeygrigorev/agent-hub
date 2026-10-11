@@ -252,7 +252,7 @@ Static pages, DTC login required:
 
 | Phase | Change | Retired at end of phase |
 | --- | --- | --- |
-| P0 (local) | M0–M6 built and tested locally (`wrangler dev`, miniflare). No deploy. | — |
+| P0 (local) | M0–M6 built and tested locally (`wrangler dev`, miniflare, and `wrangler deploy --dry-run`). No deploy. | — |
 | P1 deploy (after Alexey's OK) | Deploy to Workers Free. Register Hetzner host agent. Import TEAM-REGISTRY. Hub runs **shadow** root runs: `root-run` jobs in `dry_run` mode (launcher `plan` only), proving selection, leases and health against reality. Existing Grok Bot routine continues. | — |
 | P2 root cutover | Enable real root runs on Hetzner. Pause the Grok Bot 30-minute routine (root confirms with Alexey). Root runs use the hub bus; the Hetzner host agent bridges to aplexer mailboxes. | Grok Bot 30-min routine; desktop-orchestrator mailbox (after 3 days without use) |
 | P3 home machines | Install host agent on Win35 and laptop (outbound WebSocket). Move their bus traffic from :8788 to the hub. `machines.py available` reads the hub. | `agent-bus-win35-adapter.service` (:8788) + FileBus store archived; MACHINES.json becomes a seed/export |
