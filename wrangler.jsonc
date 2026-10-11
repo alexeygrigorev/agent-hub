@@ -30,6 +30,13 @@
       "*/30 * * * *"
     ]
   },
+  "vars": {
+    "AUTH_CLIENT_ID": "1tplqm9l6q6545mrk0gjv6eaeh",
+    "AUTH_ISSUER": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_H7nJu52Bs",
+    "AUTH_BASE_URL": "https://auth.dtcdev.click",
+    "AUTH_CALLBACK_URL": "https://agent-hub.cloudflare-ai-agent-de9ca0.workers.dev/auth/callback",
+    "AUTH_JWKS_URL": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_H7nJu52Bs/.well-known/jwks.json"
+  },
   "dev": {
     "port": 19130
   }

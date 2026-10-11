@@ -13,6 +13,8 @@ Before the first deployment, the following decisions must be made and approved b
 
 **NO SPENDING IS ALLOWED.** The budget is USD 5/month, and the design strictly fits the Cloudflare Workers Free plan (USD 0/month). The deployment bundle must be within the Free tier size limits (64 MiB uncompressed and no compressed size limit, as per Cloudflare changelog 2026-09-04, https://developers.cloudflare.com/changelog/post/2026-09-04-increased-worker-size-limit/). No upgrades or new keys should be made without Alexey's permission.
 
+**Note on M1 Deployment:** Root separately deployed M1 from `af3a` with public vars supplied via `wrangler deploy --var`. Without persisting these in `wrangler.jsonc`, a future plain deployment would drop them. Root owns future approved deployment; this head/worker performs source/local testing only. Admin login is incomplete because `HUB_ADMINS` is unset (never invent an admin).
+
 ## 2. Secrets List
 
 The following secrets must be prepared as a `.dev.vars` file for local development and uploaded to Cloudflare via `wrangler secret put` during deployment.
@@ -20,6 +22,8 @@ The following secrets must be prepared as a `.dev.vars` file for local developme
 
 - `SESSION_SECRET`: The session signing secret required for HMAC/encryption of the session cookies.
 - `HUB_ADMINS`: Comma-separated list of admin email addresses.
+
+**Local overrides:** For local development, `.dev.vars` overrides `AUTH_CALLBACK_URL` to a local URL, specifies `HUB_ADMINS` and `SESSION_SECRET`, and can use a fake `AUTH_ISSUER` if used. Tests use explicit miniflare fake bindings so do NOT call actual Cognito or production endpoints. No docs tests.
 
 Note: DTC Cognito clients are public with PKCE and do not require an `AUTH_CLIENT_SECRET` unless Alexey approves a confidential client.
 
