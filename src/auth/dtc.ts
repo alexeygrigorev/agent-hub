@@ -21,29 +21,103 @@ export class JwksCache {
     if (!force && this.expiresAt > now) {
       return this.keys;
     }
-    if (force && now - this.lastFetchAt < 10000) {
+    if (force && now >= this.lastFetchAt && now - this.lastFetchAt < 10000) {
       return this.keys;
     }
     if (this.pendingPromise) {
       return this.pendingPromise;
     }
     
-    this.lastFetchAt = now; // Set immediately to enforce cooldown even on failure
-    
     this.pendingPromise = (async () => {
+      const abortCtrl = new AbortController();
+      const timeout = setTimeout(() => abortCtrl.abort(), 5000);
+      let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+      
       try {
-        const res = await fetch(env.AUTH_JWKS_URL, { headers: { accept: 'application/json' } });
+        const res = await fetch(env.AUTH_JWKS_URL, { 
+          headers: { accept: 'application/json' },
+          signal: abortCtrl.signal 
+        });
         if (!res.ok) throw new Error('JWKS fetch failed');
-        const text = await res.text();
-        if (text.length > 256 * 1024) throw new Error('JWKS payload too large');
-        const data = JSON.parse(text) as { keys: Jwk[] };
-        if (!Array.isArray(data.keys) || data.keys.length > 32) throw new Error('Invalid JWKS');
-        this.keys = data.keys.filter(k => k && k.kty === 'RSA' && (!k.alg || k.alg === 'RS256') && (!k.use || k.use === 'sig') && typeof k.kid === 'string' && typeof k.n === 'string' && typeof k.e === 'string');
-        this.lastFetchAt = Date.now();
-        this.expiresAt = this.lastFetchAt + 300000; // 5 minutes
+        
+        const contentLength = res.headers.get('content-length');
+        if (contentLength && parseInt(contentLength, 10) > 256 * 1024) {
+          throw new Error('JWKS payload too large');
+        }
+
+        const contentType = res.headers.get('content-type');
+        if (!contentType || !contentType.includes('application/json')) {
+            throw new Error('JWKS content type not application/json');
+        }
+
+        if (!res.body) {
+           throw new Error('JWKS body empty');
+        }
+
+        reader = res.body.getReader();
+        const chunks: Uint8Array[] = [];
+        let totalBytes = 0;
+        
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            totalBytes += value.length;
+            if (totalBytes > 256 * 1024) {
+              throw new Error('JWKS stream exceeded 256KiB');
+            }
+            chunks.push(value);
+          }
+        }
+        
+        const merged = new Uint8Array(totalBytes);
+        let offset = 0;
+        for (const chunk of chunks) {
+          merged.set(chunk, offset);
+          offset += chunk.length;
+        }
+        
+        let text: string;
+        try {
+          text = new TextDecoder('utf-8', { fatal: true }).decode(merged);
+        } catch (e) {
+          throw new Error('JWKS payload bad UTF-8');
+        }
+        
+        let data: any;
+        try {
+          data = JSON.parse(text);
+        } catch (e) {
+          throw new Error('JWKS payload invalid JSON');
+        }
+        
+        if (!data || typeof data !== 'object' || !Array.isArray(data.keys) || data.keys.length > 32) {
+            throw new Error('Invalid JWKS');
+        }
+        
+        for (const k of data.keys) {
+            if (!k || typeof k !== 'object') throw new Error('Invalid JWKS');
+            if (k.kty !== 'RSA') throw new Error('Invalid JWKS');
+            if (k.alg && k.alg !== 'RS256') throw new Error('Invalid JWKS');
+            if (k.use && k.use !== 'sig') throw new Error('Invalid JWKS');
+            if (typeof k.kid !== 'string' || !k.kid) throw new Error('Invalid JWKS');
+            if (typeof k.n !== 'string' || typeof k.e !== 'string') throw new Error('Invalid JWKS');
+        }
+
+        this.keys = data.keys;
+        const completeNow = Date.now();
+        this.lastFetchAt = completeNow;
+        this.expiresAt = completeNow + 300000; // 5 minutes
         return this.keys;
+      } catch (err) {
+        this.lastFetchAt = Date.now();
+        throw err;
       } finally {
+        clearTimeout(timeout);
         this.pendingPromise = null;
+        if (reader) {
+          reader.cancel().catch(() => {});
+        }
       }
     })();
     return this.pendingPromise;
