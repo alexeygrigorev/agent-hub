@@ -18,6 +18,50 @@ async function seedHostCredential(sql: any, token: string, machineId: string, ho
     'cred_' + machineId, 'host', tokenHash, 'fam_' + machineId, hostname, machineId, JSON.stringify(['host']), 'admin-1', now, expires);
 }
 
+let stableHelpersPromise: Promise<any> | null = null;
+function getStableHelpers() {
+  if (!stableHelpersPromise) stableHelpersPromise = createHelpers();
+  return stableHelpersPromise;
+}
+
+async function approveDeviceStable(user_code: string, scopes: string[]) {
+  const { loginCookie, state, nonce } = await loginAndGetState();
+  const helpers = await getStableHelpers();
+  const now = Math.floor(Date.now() / 1000);
+  const idToken = await helpers.signJwt({
+    iss: 'https://auth.fake.local', aud: 'fake_client_id', exp: now + 3600,
+    nonce, token_use: 'id', email: 'admin@fake.local', email_verified: true, sub: 'admin-1'
+  });
+  
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = async (input: RequestInfo | URL) => {
+    if (input.toString().includes('/oauth2/token')) {
+      return new Response(JSON.stringify({ id_token: idToken }), { status: 200 });
+    }
+    if (input.toString().includes('/.well-known/jwks.json')) {
+      return new Response(JSON.stringify({ keys: [{ ...helpers.jwkPub, kid: 'test-key-1' }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return savedFetch(input);
+  };
+  
+  const cbRes = await doFetch(new Request(`http://example.com/auth/callback?code=fake&state=${state}`, {
+    headers: { 'Cookie': loginCookie }, redirect: 'manual'
+  }));
+  const sessionCookie = cbRes.headers.get('Set-Cookie')!;
+  globalThis.fetch = savedFetch;
+
+  const csrfReq = new Request('http://example.com/auth/me', { headers: { 'Cookie': sessionCookie } });
+  const meRes = await doFetch(csrfReq);
+  const csrfToken = ((await meRes.json()) as any).csrf_token;
+
+  const approveReq = new Request(`http://example.com/api/device/approve/${user_code}`, {
+    method: 'POST',
+    headers: { 'Cookie': sessionCookie, 'Content-Type': 'application/json', 'x-csrf-token': csrfToken },
+    body: JSON.stringify({ granted_scopes: scopes })
+  });
+  return await doFetch(approveReq);
+}
+
 describe('M2 Adverse: Registry Runtime & Persistence Cadence', () => {
   let hostToken = '';
   let machineId = '';
@@ -35,7 +79,7 @@ describe('M2 Adverse: Registry Runtime & Persistence Cadence', () => {
     const { device_code, user_code } = await initRes.json() as any;
 
     // 2. Approve device
-    const apprRes = await approveDevice(user_code, ['host']);
+    const apprRes = await approveDeviceStable(user_code, ['host']);
     const apprBody = await apprRes.json() as any;
     expect(apprRes.status).toBe(200);
     machineId = apprBody.machine_id;
@@ -421,8 +465,6 @@ describe('M2 Adverse: Registry Runtime & Persistence Cadence', () => {
   });
 });
 
-let originalFetch = globalThis.fetch;
-
 describe('M2 Focus: REGISTRY', () => {
   let hostToken = '';
   let machineId = '';
@@ -437,7 +479,7 @@ describe('M2 Focus: REGISTRY', () => {
     const { device_code, user_code } = await initRes.json() as any;
 
     // 2. Approve
-    const apprRes = await approveDevice(user_code, ['host']);
+    const apprRes = await approveDeviceStable(user_code, ['host']);
     const apprBody = await apprRes.json() as any;
     expect(apprRes.status).toBe(200);
     machineId = apprBody.machine_id;
