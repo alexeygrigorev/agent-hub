@@ -1,0 +1,140 @@
+# Agent Hub Deploy Runbook
+
+This runbook describes the deployment process for Agent Hub to the Cloudflare Workers Free plan.
+No deploy, create, or login actions should be run without explicit root and Alexey approval.
+
+## 1. Prerequisites and Decisions Needed (Root Approval)
+
+Before the first deployment, the following decisions must be made and approved by Alexey:
+- **Cloudflare Account:** Which Cloudflare account to use for deployment.
+- **Domain:** Whether to use the default `*.workers.dev` subdomain or `hub.dtcdev.click`.
+- **DTC Auth Admin:** Confirm the admin email(s) for the hub (e.g., Alexey's `@datatalks.club` address).
+- **Writer Schedule:** Confirm the writer schedule time (default 22:00 Berlin) and if the 09:00 standup check moves to the hub.
+
+**NO SPENDING IS ALLOWED.** The budget is USD 5/month, and the design strictly fits the Cloudflare Workers Free plan (USD 0/month). The deployment bundle must be within the Free tier size limits (64 MiB uncompressed and no compressed size limit, as per Cloudflare changelog 2026-09-04, https://developers.cloudflare.com/changelog/post/2026-09-04-increased-worker-size-limit/). No upgrades or new keys should be made without Alexey's permission.
+
+## 2. Secrets List
+
+The following secrets must be prepared as a `.dev.vars` file for local development and uploaded to Cloudflare via `wrangler secret put` during deployment.
+**NEVER store secrets in Git, issues, or the bus.**
+
+- `SESSION_SECRET`: The session signing secret required for HMAC/encryption of the session cookies.
+- `HUB_ADMINS`: Comma-separated list of admin email addresses.
+
+Note: DTC Cognito clients are public with PKCE and do not require an `AUTH_CLIENT_SECRET` unless Alexey approves a confidential client.
+
+## 3. DTC Auth App Client Configuration
+
+An app client must be created for `agent-hub` in DTC's AWS Cognito.
+Do not invoke these changes yourself. The diffs below are PROPOSED changes for the DataTalksClub repositories (`aws-infra` sandbox/auth and `auth` config/clients.json).
+
+### Proposed changes to `DataTalksClub/auth` (config/clients.json):
+```json
+    {
+      "name": "agent-hub",
+      "client_id": "<AGENT_HUB_CLIENT_ID_PLACEHOLDER>",
+      "callback_url": "https://<hub-host>/auth/callback",
+      "logout_url": "https://<hub-host>/"
+    }
+```
+
+### Proposed changes to `DataTalksClub/aws-infra` (sandbox/auth/template.yaml):
+Under `Resources`:
+```yaml
+  AgentHubClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: agent-hub
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [!Ref GoogleIdentityProvider]
+      CallbackURLs: [https://<hub-host>/auth/callback]
+      LogoutURLs: [https://<hub-host>/]
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+```
+Under `Outputs`:
+```yaml
+  AgentHubClientId: {Value: !Ref AgentHubClient}
+```
+
+## 4. Staged Rollout and Cutover
+
+Migration proceeds in phases as defined in the SPEC. The current Grok root and writer schedule remain active (not replaced) during P0 and P1.
+
+### Phase 0: Local Dev
+- No deploy. Run `wrangler dev` and local tests.
+
+### Phase 1: Deploy and Shadow
+- Deploy to Cloudflare Workers Free.
+- Register the Hetzner host agent.
+- The Hub runs shadow root runs (`dry_run` mode, `launcher plan` only).
+- **Rollback (P1):** Stop the Hetzner host agent service. The current Grok Bot 30-min routine remains unchanged and should NOT be stopped. No old services are mutated.
+
+### Phase 2: Root Cutover
+- Enable real root runs on Hetzner via the hub.
+- Pause the Grok Bot 30-minute routine (only after root confirms with Alexey).
+- Root runs use the hub bus, with the Hetzner host bridging aplexer mailboxes.
+- **Rollback (P2):** Resume the Grok Bot 30-minute routine. Do NOT re-enable the retired Win35 root/authority; the sole current Grok root is preserved.
+
+### Phase 3: Home Machines
+- Install host agents on Win35 and laptop.
+- Shift their bus traffic to the hub.
+- **Rollback (P3):** Restart `agent-bus-win35-adapter.service` (:8788).
+
+### Phase 4: Health and Dashboard
+- Hub health alerts replace supervision status.
+- `principal-wake` replaces `principal-ping.timer`.
+- **Rollback (P4):** Re-enable `principal-ping.timer` and `experiment-supervision` status role.
+
+### Phase 5: Writer
+- Enable writer runs from the hub schedule.
+- Explicit publication stays with the existing coordinator and must never be run or duplicated by the hub (the hub never runs `publish_daily.py --publish`).
+- **Rollback (P5):** Revert to the manual/other existing writer schedule.
+
+### Phase 6: Cleanup
+- The role authority code is archived (service is already inactive). Docs in `cloudflare-agent-git` updated (`01-overview.md#machines`, `02-root.md`, `recovery/*`).
+- **Rollback (P6):** Re-enable retired pieces. Note: do NOT re-enable the retired Win35 root/authority. Preserve the sole current Grok root.
+
+## 5. Host Agent Installation
+
+Note: The actual host package is still under M0/M2 development. The module entrypoints below represent the eventual CLI structure.
+
+### Linux (Hetzner)
+Installed as a user systemd service.
+```ini
+# ~/.config/systemd/user/agent-hub-host.service
+[Unit]
+Description=Agent Hub Host Agent
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/git/agent-hub
+ExecStart=/usr/bin/python3 -m host.cli
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+Run: `systemctl --user daemon-reload`, `systemctl --user enable --now agent-hub-host.service`.
+
+### Windows
+Installed as a Task Scheduler logon task.
+Create a Basic Task in Task Scheduler:
+- Trigger: When I log on
+- Action: Start a program
+- Program/script: `python.exe`
+- Add arguments: `-m host.cli`
+- Start in: path to the agent-hub clone.
