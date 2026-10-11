@@ -1,4 +1,8 @@
-import { SqlStorage, DurableObjectState } from "@cloudflare/workers-types";
+import { DurableObjectState } from "@cloudflare/workers-types";
+
+export interface SafeSqlStorage {
+  exec<T extends Record<string, any> = Record<string, any>>(query: string, ...bindings: any[]): { toArray(): T[], rowsWritten: number, rowsRead: number };
+}
 import { Env } from './env';
 import { verifyBearerScope } from './auth/token';
 import { getSession, verifyCsrf } from './auth/session';
@@ -83,7 +87,7 @@ export function updateHeartbeatMemoryOnly(machineId: string) {
   }
 }
 
-export function updateHeartbeat(machineId: string, rawPayload: any, sql: SqlStorage) {
+export function updateHeartbeat(machineId: string, rawPayload: any, sql: SafeSqlStorage) {
   const hb = sanitizeHeartbeat(rawPayload);
   if (!hb) return;
 
@@ -110,7 +114,7 @@ export function updateHeartbeat(machineId: string, rawPayload: any, sql: SqlStor
   }
 }
 
-export function handleWebSocketMessageRegistry(ws: WebSocket, message: string | ArrayBuffer, sql: SqlStorage) {
+export function handleWebSocketMessageRegistry(ws: WebSocket, message: string | ArrayBuffer, sql: SafeSqlStorage) {
   try {
     const attachment: any = ws.deserializeAttachment();
     if (!attachment || !attachment.machineId || !attachment.credentialId) {
@@ -140,7 +144,7 @@ export function handleWebSocketMessageRegistry(ws: WebSocket, message: string | 
   }
 }
 
-export function handleWebSocketCloseRegistry(ws: WebSocket, sql: SqlStorage) {
+export function handleWebSocketCloseRegistry(ws: WebSocket, sql: SafeSqlStorage) {
     try {
         const attachment: any = ws.deserializeAttachment();
         if (attachment && attachment.machineId) {
@@ -153,13 +157,13 @@ export function handleWebSocketCloseRegistry(ws: WebSocket, sql: SqlStorage) {
 export async function handleRegistryRoutes(
   request: Request,
   path: string,
-  sql: SqlStorage,
+  sql: SafeSqlStorage,
   ctx: DurableObjectState,
   env: Env
 ): Promise<Response | null> {
   if (path === '/api/machines/register') {
     if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
-    const cred = await verifyBearerScope(sql, request.headers.get('Authorization'), 'host', { kind: 'host' });
+    const cred = await verifyBearerScope(sql as any, request.headers.get('Authorization'), 'host', { kind: 'host' });
     if (!cred || !cred.machine_id) return Response.json({ error: 'Unauthorized' }, { status: 401 });
 
     const body = await safeJson(request);
@@ -193,7 +197,7 @@ export async function handleRegistryRoutes(
 
   if (path === '/api/machines/available') {
     if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
-    const cred = await verifyBearerScope(sql, request.headers.get('Authorization'), 'host');
+    const cred = await verifyBearerScope(sql as any, request.headers.get('Authorization'), 'host');
     if (!cred) return Response.json({ error: 'Unauthorized' }, { status: 401 });
 
     const now = Date.now();
@@ -254,7 +258,7 @@ export async function handleRegistryRoutes(
 
   if (path === '/api/host/poll') {
     if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
-    const cred = await verifyBearerScope(sql, request.headers.get('Authorization'), 'host', { kind: 'host' });
+    const cred = await verifyBearerScope(sql as any, request.headers.get('Authorization'), 'host', { kind: 'host' });
     if (!cred || !cred.machine_id) return Response.json({ error: 'Unauthorized' }, { status: 401 });
 
     const body = await safeJson(request);
@@ -268,7 +272,7 @@ export async function handleRegistryRoutes(
     if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
     if (request.headers.get('Upgrade') !== 'websocket') return Response.json({ error: 'Expected Upgrade: websocket' }, { status: 426 });
     
-    const cred = await verifyBearerScope(sql, request.headers.get('Authorization'), 'host', { kind: 'host' });
+    const cred = await verifyBearerScope(sql as any, request.headers.get('Authorization'), 'host', { kind: 'host' });
     if (!cred || !cred.machine_id) return Response.json({ error: 'Unauthorized' }, { status: 401 });
 
     const pair = new WebSocketPair();
