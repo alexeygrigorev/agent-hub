@@ -1,0 +1,123 @@
+import json
+import time
+import urllib.request
+import urllib.error
+import urllib.parse
+from . import config
+
+def is_https_or_localhost(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme == "https":
+        return True
+    if parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1"):
+        return True
+    return False
+
+def device_login(base_url: str, client_name: str, hostname: str, scopes: str):
+    if not is_https_or_localhost(base_url):
+        raise ValueError("Only HTTPS URLs or localhost are permitted.")
+    
+    code_url = f"{base_url}/api/device/code"
+    code_payload = json.dumps({
+        "client_name": client_name,
+        "hostname": hostname,
+        "scopes": scopes,
+    }).encode("utf-8")
+    
+    req = urllib.request.Request(code_url, data=code_payload, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req) as response:
+            code_res = json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error during device code request: {e}")
+    
+    device_code = code_res["device_code"]
+    user_code = code_res["user_code"]
+    verification_uri = code_res["verification_uri"]
+    interval = code_res.get("interval", 5)
+    expires_in = code_res["expires_in"]
+    
+    print(f"Please visit: {verification_uri}")
+    print(f"And enter the code: {user_code}")
+    
+    token_url = f"{base_url}/api/device/token"
+    start_time = time.time()
+    
+    while True:
+        if time.time() - start_time > expires_in:
+            raise RuntimeError("Device code expired.")
+            
+        time.sleep(interval)
+        
+        token_payload = json.dumps({
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "device_code": device_code,
+            "client_id": "host-agent"
+        }).encode("utf-8")
+        
+        treq = urllib.request.Request(token_url, data=token_payload, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(treq) as response:
+                token_res = json.loads(response.read().decode("utf-8"))
+                config.update_config(
+                    access_token=token_res["access_token"],
+                    refresh_token=token_res.get("refresh_token"),
+                    base_url=base_url
+                )
+                print("Login successful.")
+                return
+        except urllib.error.HTTPError as e:
+            if e.code == 400:
+                err_res = json.loads(e.read().decode("utf-8"))
+                err_code = err_res.get("error")
+                if err_code == "authorization_pending":
+                    continue
+                elif err_code == "slow_down":
+                    interval += 5
+                    continue
+                elif err_code == "access_denied":
+                    raise RuntimeError("Access denied by user.")
+                elif err_code == "expired_token":
+                    raise RuntimeError("Device code expired.")
+                else:
+                    raise RuntimeError(f"Token error: {err_code}")
+            else:
+                raise RuntimeError(f"HTTP error during token request: {e.code}")
+        except urllib.error.URLError as e:
+            print(f"Network error, retrying... ({e})")
+            continue
+
+def refresh_token():
+    cfg = config.load_config()
+    refresh = cfg.get("refresh_token")
+    base_url = cfg.get("base_url")
+    if not refresh or not base_url:
+        raise RuntimeError("No refresh token or base URL available. Please login.")
+        
+    token_url = f"{base_url}/api/device/token"
+    token_payload = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh
+    }).encode("utf-8")
+    
+    req = urllib.request.Request(token_url, data=token_payload, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req) as response:
+            token_res = json.loads(response.read().decode("utf-8"))
+            config.update_config(
+                access_token=token_res["access_token"],
+                refresh_token=token_res.get("refresh_token", refresh)
+            )
+            return token_res["access_token"]
+    except urllib.error.HTTPError as e:
+        config.clear_config()
+        raise RuntimeError(f"Refresh failed (code {e.code}), pairing required again.")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error during refresh: {e}")
+
+def get_access_token() -> str:
+    cfg = config.load_config()
+    token = cfg.get("access_token")
+    if not token:
+        raise RuntimeError("Not logged in.")
+    return token
