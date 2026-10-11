@@ -71,7 +71,7 @@ describe('M1 Focus: AUTH Quality', () => {
     let oF = globalThis.fetch;
     globalThis.fetch = async (i) => {
       if (i.toString().includes('/oauth2/token')) return new Response(JSON.stringify({ id_token: idTokenBadSig }));
-      if (i.toString().includes('/.well-known/jwks.json')) return new Response(JSON.stringify({ keys: [{ ...helpers.jwkPub, kid: 'test-key-1' }] }));
+      if (i.toString().includes('/.well-known/jwks.json')) return new Response(JSON.stringify({ keys: [{ ...helpers.jwkPub, kid: 'test-key-1' }] }), { headers: { 'content-type': 'application/json' } });
       return oF(i);
     };
     let res = await doFetch(new Request(`http://example.com/auth/callback?code=fake&state=${st.state}`, { headers: { 'Cookie': st.loginCookie }, redirect: 'manual' }));
@@ -91,7 +91,7 @@ describe('M1 Focus: AUTH Quality', () => {
     let oF = globalThis.fetch;
     globalThis.fetch = async (i) => {
       if (i.toString().includes('/oauth2/token')) return new Response(JSON.stringify({ id_token: idToken }));
-      if (i.toString().includes('/.well-known/jwks.json')) return new Response(JSON.stringify({ keys: [{ ...helpers.jwkPub, kid: 'test-key-1' }] }));
+      if (i.toString().includes('/.well-known/jwks.json')) return new Response(JSON.stringify({ keys: [{ ...helpers.jwkPub, kid: 'test-key-1' }] }), { headers: { 'content-type': 'application/json' } });
       return oF(i);
     };
     let cbRes = await doFetch(new Request(`http://example.com/auth/callback?code=fake&state=${st.state}`, { headers: { 'Cookie': st.loginCookie }, redirect: 'manual' }));

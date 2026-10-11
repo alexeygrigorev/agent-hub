@@ -10,7 +10,7 @@ beforeAll(async () => {
   helpers = await createHelpers();
   globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     if (input.toString().includes('/.well-known/jwks.json')) {
-      return new Response(JSON.stringify({ keys: [{ ...helpers.jwkPub, kid: 'test-key-1' }] }), { status: 200 });
+      return new Response(JSON.stringify({ keys: [{ ...helpers.jwkPub, kid: 'test-key-1' }] }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     return originalFetch(input, init);
   };
@@ -31,7 +31,7 @@ describe('M1 Focus: DEVICE', () => {
     const orig = globalThis.fetch;
     globalThis.fetch = async (i) => {
       if (i.toString().includes('/oauth2/token')) return new Response(JSON.stringify({ id_token: idToken }));
-      if (i.toString().includes('/.well-known/jwks.json')) return new Response(JSON.stringify({ keys: [{ ...helpers.jwkPub, kid: 'test-key-1' }] }));
+      if (i.toString().includes('/.well-known/jwks.json')) return new Response(JSON.stringify({ keys: [{ ...helpers.jwkPub, kid: 'test-key-1' }] }), { headers: { 'content-type': 'application/json' } });
       return orig(i);
     };
     const cbRes = await doFetch(new Request(`http://example.com/auth/callback?code=fake&state=${state}`, { headers: { 'Cookie': loginCookie }, redirect: 'manual' }));

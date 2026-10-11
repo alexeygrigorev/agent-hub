@@ -39,7 +39,7 @@ beforeAll(() => {
     const url = input.toString();
     fetchLog.push(url);
     if (url.includes('/.well-known/jwks.json')) {
-      return new Response(JSON.stringify({ keys: [{ ...jwkPub, kid: 'test-key-1' }] }), { status: 200 });
+      return new Response(JSON.stringify({ keys: [{ ...jwkPub, kid: 'test-key-1' }] }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     if (url.includes('/oauth2/token')) {
       // capture body if possible

@@ -12,7 +12,7 @@ beforeAll(async () => {
   helpers = await createHelpers();
   globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     if (input.toString().includes('/.well-known/jwks.json')) {
-      return new Response(JSON.stringify({ keys: [{ ...helpers.jwkPub, kid: 'test-key-1' }] }), { status: 200 });
+      return new Response(JSON.stringify({ keys: [{ ...helpers.jwkPub, kid: 'test-key-1' }] }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     return originalFetch(input, init);
   };

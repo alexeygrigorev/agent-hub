@@ -77,7 +77,7 @@ export async function approveDevice(user_code: string, scopes: string[]) {
       return new Response(JSON.stringify({ id_token: idToken }), { status: 200 });
     }
     if (input.toString().includes('/.well-known/jwks.json')) {
-      return new Response(JSON.stringify({ keys: [{ ...helpers.jwkPub, kid: 'test-key-1' }] }), { status: 200 });
+      return new Response(JSON.stringify({ keys: [{ ...helpers.jwkPub, kid: 'test-key-1' }] }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     return originalFetch(input);
   };
