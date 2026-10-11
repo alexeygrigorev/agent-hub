@@ -18,7 +18,7 @@ export default {
       });
     }
 
-    if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/auth/')) {
+    if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/auth/') || url.pathname.startsWith('/device')) {
       const id = env.HUB.idFromName("hub");
       const stub = env.HUB.get(id);
       return stub.fetch(request);

@@ -3,7 +3,9 @@
   "name": "agent-hub",
   "main": "src/worker.ts",
   "compatibility_date": "2024-04-05",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
   "assets": {
     "directory": "./public"
   },
@@ -18,11 +20,15 @@
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["Hub"]
+      "new_sqlite_classes": [
+        "Hub"
+      ]
     }
   ],
   "triggers": {
-    "crons": ["*/30 * * * *"]
+    "crons": [
+      "*/30 * * * *"
+    ]
   },
   "dev": {
     "port": 19130
