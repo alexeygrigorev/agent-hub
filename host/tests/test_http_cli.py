@@ -503,8 +503,51 @@ class TestHttpCliReal(unittest.TestCase):
     @classmethod
     def find_unused_port(cls):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(("127.0.0.1", 0))
             return s.getsockname()[1]
+
+    @classmethod
+    def get_available_cpus(cls, count=2) -> str:
+        try:
+            aff = sorted(os.sched_getaffinity(0))
+            if aff:
+                return ",".join(str(c) for c in aff[:count])
+        except Exception:
+            pass
+        return "0,1"
+
+    @classmethod
+    def _cleanup_proc(cls):
+        proc = getattr(cls, "proc", None)
+        if proc is not None:
+            for stream in (proc.stdout, proc.stderr, proc.stdin):
+                if stream:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+            if proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    proc.wait(timeout=3)
+                except Exception:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
+        cls.proc = None
+
+    @classmethod
+    def _cleanup_server_dir(cls):
+        server_dir = getattr(cls, "server_dir", None)
+        if server_dir and os.path.isdir(server_dir):
+            try:
+                shutil.rmtree(server_dir, ignore_errors=True)
+            except Exception:
+                pass
+        cls.server_dir = None
 
     @classmethod
     def setUpClass(cls):
@@ -514,9 +557,14 @@ class TestHttpCliReal(unittest.TestCase):
         cls.tmp_root = os.path.join(cls.repo_root, ".local", "tmp")
         os.makedirs(cls.tmp_root, exist_ok=True)
         cls.server_dir = tempfile.mkdtemp(dir=cls.tmp_root)
-        cls.port = cls.find_unused_port()
+        cls.addClassCleanup(cls._cleanup_server_dir)
+        cls.proc = None
+        cls.addClassCleanup(cls._cleanup_proc)
 
-        fixture_worker_ts = f"""
+        try:
+            cls.port = cls.find_unused_port()
+
+            fixture_worker_ts = f"""
 import worker, {{ Hub as BaseHub }} from "{cls.repo_root}/src/worker";
 
 export class FixtureHub extends BaseHub {{
@@ -549,126 +597,127 @@ export default {{
   }}
 }};
 """
-        with open(os.path.join(cls.server_dir, "fixture_worker.ts"), "w") as f:
-            f.write(fixture_worker_ts)
+            with open(os.path.join(cls.server_dir, "fixture_worker.ts"), "w") as f:
+                f.write(fixture_worker_ts)
 
-        cfg = {
-            "name": "agent-hub-fixture",
-            "main": "fixture_worker.ts",
-            "compatibility_date": "2024-04-05",
-            "compatibility_flags": ["nodejs_compat"],
-            "durable_objects": {"bindings": [{"name": "HUB", "class_name": "Hub"}]},
-            "migrations": [{"tag": "v1", "new_sqlite_classes": ["Hub"]}],
-            "vars": {
-                "AUTH_CLIENT_ID": "fake_client_id",
-                "AUTH_ISSUER": "https://auth.fake.local",
-                "AUTH_BASE_URL": "https://auth.fake.local",
-                "AUTH_CALLBACK_URL": f"http://127.0.0.1:{cls.port}/auth/callback",
-                "AUTH_JWKS_URL": "https://auth.fake.local/.well-known/jwks.json",
-                "SESSION_SECRET": "super_secret_session_key_32_chars_long_for_tests"
+            cfg = {
+                "name": "agent-hub-fixture",
+                "main": "fixture_worker.ts",
+                "compatibility_date": "2024-04-05",
+                "compatibility_flags": ["nodejs_compat"],
+                "durable_objects": {"bindings": [{"name": "HUB", "class_name": "Hub"}]},
+                "migrations": [{"tag": "v1", "new_sqlite_classes": ["Hub"]}],
+                "vars": {
+                    "AUTH_CLIENT_ID": "fake_client_id",
+                    "AUTH_ISSUER": "https://auth.fake.local",
+                    "AUTH_BASE_URL": "https://auth.fake.local",
+                    "AUTH_CALLBACK_URL": f"http://127.0.0.1:{cls.port}/auth/callback",
+                    "AUTH_JWKS_URL": "https://auth.fake.local/.well-known/jwks.json",
+                    "SESSION_SECRET": "super_secret_session_key_32_chars_long_for_tests"
+                }
             }
-        }
-        with open(os.path.join(cls.server_dir, "wrangler.jsonc"), "w") as f:
-            json.dump(cfg, f)
+            with open(os.path.join(cls.server_dir, "wrangler.jsonc"), "w") as f:
+                json.dump(cfg, f)
 
-        wrangler_js = os.path.join(cls.repo_root, "node_modules", "wrangler", "bin", "wrangler.js")
-        node_bin = shutil.which("node") or "/home/alexey/.nvm/versions/node/v24.13.1/bin/node"
-        node_dir = str(Path(node_bin).parent)
-        env = os.environ.copy()
-        current_path = env.get("PATH", "")
-        if node_dir not in current_path.split(os.pathsep):
-            env["PATH"] = f"{node_dir}:{current_path}"
-        env["TOKIO_WORKER_THREADS"] = "1"
-        env["RAYON_NUM_THREADS"] = "1"
-        env["UV_THREADPOOL_SIZE"] = "1"
-        env["NODE_OPTIONS"] = "--max-old-space-size=384"
-        env["MINIFLARE_WORKERD_V8_FLAGS"] = "--single-threaded --single-threaded-gc"
-        env["TMPDIR"] = str(cls.tmp_root)
-
-        build_dir = Path(cls.server_dir) / "bundle"
-        build = subprocess.run(
-            ["taskset", "-c", "0,1", node_bin, wrangler_js, "deploy", "--dry-run", "--config", os.path.join(cls.server_dir, "wrangler.jsonc"), "--outdir", str(build_dir)],
-            cwd=cls.server_dir, env=env, capture_output=True, text=True, timeout=30
-        )
-        if build.returncode != 0:
-            raise RuntimeError(f"Wrangler deploy --dry-run failed with code {build.returncode}: {build.stderr}")
-
-        bundles = list(build_dir.glob("*.js"))
-        if len(bundles) != 1:
-            raise RuntimeError(f"Expected 1 bundle, found: {bundles}")
-
-        worker_opts = {
-            "name": "agent-hub-fixture",
-            "scriptPath": str(bundles[0]),
-            "modules": True,
-            "compatibilityDate": "2024-04-05",
-            "compatibilityFlags": ["nodejs_compat"],
-            "bindings": cfg["vars"],
-            "durableObjects": {"HUB": {"className": "Hub", "useSQLite": True}},
-            "assets": {
-                "directory": os.path.join(cls.repo_root, "public"),
-                "binding": "ASSETS",
-                "run_worker_first": False,
-                "routerConfig": {"has_user_worker": True}
-            }
-        }
-        mf_options = {
-            "host": "127.0.0.1",
-            "port": cls.port,
-            "durableObjectsPersist": os.path.join(cls.server_dir, "state"),
-            "workers": [worker_opts]
-        }
-
-        mf_js = os.path.join(cls.server_dir, "actual-miniflare.cjs")
-        with open(mf_js, "w") as f:
-            f.write(
-                "const {Miniflare,convertV4MiniflareOptions}=require(" + json.dumps(os.path.join(cls.repo_root, "node_modules", "miniflare")) + "); "
-                "const opts=" + json.dumps(mf_options) + "; "
-                "const mf=new Miniflare(convertV4MiniflareOptions(opts)); "
-                "mf.ready.then(async u=>{console.log('ACTUAL_WORKER_READY',String(u));}).catch(e=>{console.error(e);process.exit(1);}); "
-                "process.on('SIGTERM', async()=>{await mf.dispose();process.exit(0);});"
-            )
-
-        cls.proc = subprocess.Popen(
-            ["taskset", "-c", "0,1", node_bin, str(mf_js)],
-            cwd=cls.server_dir, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=os.setsid
-        )
-        ready = False
-        for _ in range(50):
-            time.sleep(0.2)
-            try:
-                req = urllib.request.Request(f"http://127.0.0.1:{cls.port}/healthz")
-                with urllib.request.urlopen(req, timeout=1) as resp:
-                    if resp.status == 200:
-                        ready = True
+            wrangler_js = os.path.join(cls.repo_root, "node_modules", "wrangler", "bin", "wrangler.js")
+            node_bin = shutil.which("node")
+            if not node_bin or not os.path.exists(node_bin):
+                for candidate in [
+                    "/home/alexey/.nvm/versions/node/v24.13.1/bin/node",
+                    os.path.expanduser("~/.nvm/versions/node/v24.13.1/bin/node"),
+                ]:
+                    if os.path.exists(candidate):
+                        node_bin = candidate
                         break
-            except Exception:
-                pass
+            if not node_bin or not os.path.exists(node_bin):
+                raise RuntimeError("node binary not found")
 
-        if not ready:
-            cls.tearDownClass()
-            raise RuntimeError(f"Wrangler dev server failed to start on port {cls.port}")
+            node_dir = str(Path(node_bin).parent)
+            env = os.environ.copy()
+            current_path = env.get("PATH", "")
+            if node_dir not in current_path.split(os.pathsep):
+                env["PATH"] = f"{node_dir}:{current_path}"
+            env["TOKIO_WORKER_THREADS"] = "1"
+            env["RAYON_NUM_THREADS"] = "1"
+            env["UV_THREADPOOL_SIZE"] = "1"
+            env["NODE_OPTIONS"] = "--max-old-space-size=384"
+            env["MINIFLARE_WORKERD_V8_FLAGS"] = "--single-threaded --single-threaded-gc"
+            env["TMPDIR"] = str(cls.tmp_root)
 
-        cls.init_fixture_data()
+            cpu_str = cls.get_available_cpus(2)
+            build_dir = Path(cls.server_dir) / "bundle"
+            build = subprocess.run(
+                ["taskset", "-c", cpu_str, node_bin, wrangler_js, "deploy", "--dry-run", "--config", os.path.join(cls.server_dir, "wrangler.jsonc"), "--outdir", str(build_dir)],
+                cwd=cls.server_dir, env=env, capture_output=True, text=True, timeout=30
+            )
+            if build.returncode != 0:
+                raise RuntimeError(f"Wrangler deploy --dry-run failed with code {build.returncode}: {build.stderr}")
+
+            bundles = list(build_dir.glob("*.js"))
+            if len(bundles) != 1:
+                raise RuntimeError(f"Expected 1 bundle, found: {bundles}")
+
+            worker_opts = {
+                "name": "agent-hub-fixture",
+                "scriptPath": str(bundles[0]),
+                "modules": True,
+                "compatibilityDate": "2024-04-05",
+                "compatibilityFlags": ["nodejs_compat"],
+                "bindings": cfg["vars"],
+                "durableObjects": {"HUB": {"className": "Hub", "useSQLite": True}},
+                "assets": {
+                    "directory": os.path.join(cls.repo_root, "public"),
+                    "binding": "ASSETS",
+                    "run_worker_first": False,
+                    "routerConfig": {"has_user_worker": True}
+                }
+            }
+            mf_options = {
+                "host": "127.0.0.1",
+                "port": cls.port,
+                "durableObjectsPersist": os.path.join(cls.server_dir, "state"),
+                "workers": [worker_opts]
+            }
+
+            mf_js = os.path.join(cls.server_dir, "actual-miniflare.cjs")
+            with open(mf_js, "w") as f:
+                f.write(
+                    "const {Miniflare,convertV4MiniflareOptions}=require(" + json.dumps(os.path.join(cls.repo_root, "node_modules", "miniflare")) + "); "
+                    "const opts=" + json.dumps(mf_options) + "; "
+                    "const mf=new Miniflare(convertV4MiniflareOptions(opts)); "
+                    "mf.ready.then(async u=>{console.log('ACTUAL_WORKER_READY',String(u));}).catch(e=>{console.error(e);process.exit(1);}); "
+                    "process.on('SIGTERM', async()=>{await mf.dispose();process.exit(0);});"
+                )
+
+            cls.proc = subprocess.Popen(
+                ["taskset", "-c", cpu_str, node_bin, str(mf_js)],
+                cwd=cls.server_dir, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=os.setsid
+            )
+            ready = False
+            for _ in range(60):
+                time.sleep(0.25)
+                try:
+                    req = urllib.request.Request(f"http://127.0.0.1:{cls.port}/healthz")
+                    with urllib.request.urlopen(req, timeout=1) as resp:
+                        if resp.status == 200:
+                            ready = True
+                            break
+                except Exception:
+                    pass
+
+            if not ready:
+                raise RuntimeError(f"Wrangler dev server failed to start on port {cls.port}")
+
+            cls.init_fixture_data()
+        except Exception:
+            cls._cleanup_proc()
+            cls._cleanup_server_dir()
+            raise
 
     @classmethod
     def tearDownClass(cls):
-        if hasattr(cls, "proc") and cls.proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(cls.proc.pid), signal.SIGTERM)
-                cls.proc.wait(timeout=3)
-            except Exception:
-                try:
-                    os.killpg(os.getpgid(cls.proc.pid), signal.SIGKILL)
-                    cls.proc.wait(timeout=2)
-                except Exception:
-                    pass
-        if hasattr(cls, "server_dir") and os.path.isdir(cls.server_dir):
-            import shutil
-            try:
-                shutil.rmtree(cls.server_dir)
-            except Exception:
-                pass
+        cls._cleanup_proc()
+        cls._cleanup_server_dir()
 
     @classmethod
     def seed_sql(cls, sql: str, params: list | None = None) -> list:
@@ -693,11 +742,6 @@ export default {{
         cls.seed_sql("DELETE FROM agents")
         cls.seed_sql("DELETE FROM machines")
         cls.seed_sql("DELETE FROM credentials")
-        cls.seed_sql("DELETE FROM leases")
-        try:
-            cls.seed_sql("DELETE FROM jobs")
-        except Exception:
-            pass
 
         # Machines
         cls.seed_sql("INSERT INTO machines (id, name, hostname, registered_at) VALUES ('mach-A', 'Machine A', 'host-a', ?)", [now])
@@ -718,21 +762,14 @@ export default {{
             "token_read_only": ("agent", "mach-A", "worker-1", ["bus:read"]),
             "token_send_only": ("agent", "mach-A", "worker-1", ["bus:send"]),
             "token_root_job": ("job", "mach-A", "role:root", ["lease:root", "bus:send", "bus:read"]),
-            "token_stale_root_job": ("job", "mach-A", "role:root", ["lease:root", "bus:send", "bus:read"]),
         }
         for token_name, (kind, mach, actor, scopes) in creds.items():
             thash = sha256_b64url(token_name)
-            subj = "job-stale-99" if token_name == "token_stale_root_job" else ("job-root-1" if kind == "job" else (actor or mach))
+            subj = "job-root-1" if kind == "job" else (actor or mach)
             cls.seed_sql(
                 "INSERT INTO credentials (id, kind, token_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [f"cred_{token_name}", kind, thash, f"fam_{token_name}", subj, mach, actor, json.dumps(scopes), "admin-sub", now, future]
             )
-
-        # Root job & lease
-        root_hash = sha256_b64url("token_root_job")
-        cls.seed_sql("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, kind TEXT, idempotency_key TEXT UNIQUE, payload JSON, status TEXT, created_at TEXT, deadline_at TEXT, actor TEXT, claim_token_hash TEXT, holder_host_id TEXT, lease_epoch INTEGER)")
-        cls.seed_sql("INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, claim_token_hash, holder_host_id, lease_epoch) VALUES ('job-root-1', 'root-run', 'root-key-1', '{}', 'running', ?, ?, 'role:root', ?, 'mach-A', 5)", [now, future, root_hash])
-        cls.seed_sql("INSERT INTO leases (name, epoch, holder_machine_id, holder_host_id, holder_job_id, acquired_at, expires_at) VALUES ('root', 5, 'mach-A', 'mach-A', 'job-root-1', ?, ?)", [now, future])
 
     def run_cli(self, args, token="token_host_a", input_data=None, check=True):
         cmd = [sys.executable, "-m", "agent_hub_host.cli"] + args
@@ -955,7 +992,7 @@ export default {{
         self.assertEqual(msg["body"], utf8_text)
 
     def test_real_worker_unknown_addresses(self):
-        # Unknown recipient rejected with 400
+        # Unknown recipient rejected with 404 (unknown_recipient)
         res_unknown = self.run_cli([
             "send",
             "--from", "worker-1",
@@ -964,201 +1001,74 @@ export default {{
             "--body", "Hello nowhere"
         ], token="token_host_a", check=False)
         self.assertNotEqual(res_unknown.returncode, 0)
-        self.assertIn("400", res_unknown.stderr)
+        self.assertIn("404", res_unknown.stderr)
 
-    def test_real_worker_root_fencing(self):
-        try:
-            # 1. Valid root send with job token and matching epoch 5
-            res_root = self.run_cli([
-                "send",
-                "--from", "role:root",
-                "--to", "worker-1",
-                "--kind", "note",
-                "--body", "Root dispatch via CLI",
-                "--idempotency-key", "root-cli-1",
-                "--lease-epoch", "5"
-            ], token="token_root_job")
-            out_root = json.loads(res_root.stdout)
-            self.assertIn("id", out_root)
+    def test_real_worker_root_role_held_denial_and_zero_effects(self):
+        # 1. Attempt send with --from role:root is explicitly denied with 403 (missing_m4_root_authority)
+        res_from_root = self.run_cli([
+            "send",
+            "--from", "role:root",
+            "--to", "worker-1",
+            "--kind", "note",
+            "--body", "Unauthorized root dispatch attempt",
+            "--idempotency-key", "root-attempt-1"
+        ], token="token_root_job", check=False)
+        self.assertNotEqual(res_from_root.returncode, 0)
+        self.assertIn("403", res_from_root.stderr)
 
-            # 2. Stale job token on same machine mach-A fails 403 (oldjob)
-            res_stale = self.run_cli([
-                "send",
-                "--from", "role:root",
-                "--to", "worker-1",
-                "--kind", "note",
-                "--body", "Root stale dispatch",
-                "--idempotency-key", "root-cli-stale",
-                "--lease-epoch", "5"
-            ], token="token_stale_root_job", check=False)
-            self.assertNotEqual(res_stale.returncode, 0)
-            self.assertIn("403", res_stale.stderr)
+        # 2. Attempt send with host token as role:root is denied with 403
+        res_host_root = self.run_cli([
+            "send",
+            "--from", "role:root",
+            "--to", "worker-1",
+            "--kind", "note",
+            "--body", "Host cannot impersonate root",
+            "--idempotency-key", "root-attempt-2"
+        ], token="token_host_a", check=False)
+        self.assertNotEqual(res_host_root.returncode, 0)
+        self.assertIn("403", res_host_root.stderr)
 
-            # 3. Wrong epoch fails 403
-            res_bad_epoch = self.run_cli([
-                "send",
-                "--from", "role:root",
-                "--to", "worker-1",
-                "--kind", "note",
-                "--body", "Root bad epoch",
-                "--idempotency-key", "root-cli-bad-epoch",
-                "--lease-epoch", "4"
-            ], token="token_root_job", check=False)
-            self.assertNotEqual(res_bad_epoch.returncode, 0)
-            self.assertIn("403", res_bad_epoch.stderr)
+        # 3. Attempt send to recipient role:root fails (unknown recipient / denied with 404)
+        res_to_root = self.run_cli([
+            "send",
+            "--from", "worker-1",
+            "--to", "role:root",
+            "--kind", "note",
+            "--body", "Dispatch to root recipient"
+        ], token="token_host_a", check=False)
+        self.assertNotEqual(res_to_root.returncode, 0)
+        self.assertIn("404", res_to_root.stderr)
 
-            # 4. Missing epoch on role:root fails 403 (missingepoch)
-            res_missing_epoch = self.run_cli([
-                "send",
-                "--from", "role:root",
-                "--to", "worker-1",
-                "--kind", "note",
-                "--body", "Root missing epoch",
-                "--idempotency-key", "root-cli-missing-epoch"
-            ], token="token_root_job", check=False)
-            self.assertNotEqual(res_missing_epoch.returncode, 0)
-            self.assertIn("403", res_missing_epoch.stderr)
+        # 4. Attempt claim with holder role:root is explicitly denied with 403
+        res_claim_root = self.run_cli([
+            "claim",
+            "--project", "projA",
+            "--scope", "root/subsystem.ts",
+            "--holder", "role:root",
+            "--ttl-ms", "60000"
+        ], token="token_root_job", check=False)
+        self.assertNotEqual(res_claim_root.returncode, 0)
+        self.assertIn("403", res_claim_root.stderr)
 
-            # 5. Host token cannot write as root even on current host (forgedkind)
-            res_host_root = self.run_cli([
-                "send",
-                "--from", "role:root",
-                "--to", "worker-1",
-                "--kind", "note",
-                "--body", "Host cannot write as root",
-                "--idempotency-key", "root-cli-host-forged",
-                "--lease-epoch", "5"
-            ], token="token_host_a", check=False)
-            self.assertNotEqual(res_host_root.returncode, 0)
-            self.assertIn("403", res_host_root.stderr)
+        # 5. Supplying lease-epoch (0 or 5) does not grant synthetic authority; still fails 403
+        res_epoch = self.run_cli([
+            "send",
+            "--from", "role:root",
+            "--to", "worker-1",
+            "--kind", "note",
+            "--body", "Epoch cannot grant synthetic root",
+            "--idempotency-key", "root-attempt-epoch",
+            "--lease-epoch", "0"
+        ], token="token_root_job", check=False)
+        self.assertNotEqual(res_epoch.returncode, 0)
+        self.assertIn("403", res_epoch.stderr)
 
-            # 6. Epoch 0 positive root send & claims/release roundtrip
-            self.seed_sql("UPDATE leases SET epoch = 0 WHERE name = 'root'")
-            self.seed_sql("UPDATE jobs SET lease_epoch = 0 WHERE id = 'job-root-1'")
+        # 6. Verify zero side-effects in actual SQLite database
+        msg_rows = self.seed_sql("SELECT count(*) as cnt FROM messages WHERE from_actor = 'role:root' OR to_actor = 'role:root'")
+        self.assertEqual(msg_rows[0].get("cnt", 0), 0)
 
-            res_epoch0 = self.run_cli([
-                "send",
-                "--from", "role:root",
-                "--to", "worker-1",
-                "--kind", "note",
-                "--body", "Root dispatch at epoch 0",
-                "--idempotency-key", "root-cli-epoch0",
-                "--lease-epoch", "0"
-            ], token="token_root_job")
-            self.assertIn("id", json.loads(res_epoch0.stdout))
-
-            # 7. Root claim positive roundtrip with epoch 0
-            res_root_claim = self.run_cli([
-                "claim",
-                "--project", "projA",
-                "--scope", "root/subsystem.ts",
-                "--holder", "role:root",
-                "--ttl-ms", "60000",
-                "--lease-epoch", "0"
-            ], token="token_root_job")
-            claim_out = json.loads(res_root_claim.stdout)
-            self.assertIn("id", claim_out)
-            root_cid = claim_out["id"]
-
-            # Idempotent renewal returns same claim ID
-            res_root_renew = self.run_cli([
-                "claim",
-                "--project", "projA",
-                "--scope", "root/subsystem.ts",
-                "--holder", "role:root",
-                "--ttl-ms", "120000",
-                "--lease-epoch", "0"
-            ], token="token_root_job")
-            self.assertEqual(json.loads(res_root_renew.stdout)["id"], root_cid)
-
-            # Release root claim with epoch 0
-            res_root_rel = self.run_cli([
-                "release",
-                "projA:root/subsystem.ts",
-                "--lease-epoch", "0"
-            ], token="token_root_job")
-            self.assertEqual(json.loads(res_root_rel.stdout)["status"], "ok")
-
-            # 8. Negative real HTTP fence cases for root mutations
-            # a) Missing epoch on root claim -> 403
-            res_neg_noepoch = self.run_cli([
-                "claim",
-                "--project", "projA",
-                "--scope", "root/sub2.ts",
-                "--holder", "role:root",
-                "--ttl-ms", "60000"
-            ], token="token_root_job", check=False)
-            self.assertNotEqual(res_neg_noepoch.returncode, 0)
-            self.assertIn("403", res_neg_noepoch.stderr)
-
-            # b) Expired lease -> 403 (expired)
-            self.seed_sql("UPDATE leases SET expires_at = '2000-01-01T00:00:00Z' WHERE name = 'root'")
-            res_neg_exp = self.run_cli([
-                "claim",
-                "--project", "projA",
-                "--scope", "root/sub2.ts",
-                "--holder", "role:root",
-                "--ttl-ms", "60000",
-                "--lease-epoch", "0"
-            ], token="token_root_job", check=False)
-            self.assertNotEqual(res_neg_exp.returncode, 0)
-            self.assertIn("403", res_neg_exp.stderr)
-
-            # c) Released lease -> 403 (releasedlease)
-            self.seed_sql("UPDATE leases SET expires_at = '2030-01-01T00:00:00Z', released_at = '2026-01-01T01:00:00Z' WHERE name = 'root'")
-            res_neg_rel = self.run_cli([
-                "claim",
-                "--project", "projA",
-                "--scope", "root/sub2.ts",
-                "--holder", "role:root",
-                "--ttl-ms", "60000",
-                "--lease-epoch", "0"
-            ], token="token_root_job", check=False)
-            self.assertNotEqual(res_neg_rel.returncode, 0)
-            self.assertIn("403", res_neg_rel.stderr)
-
-            # d) Bad host -> 403 (badhost)
-            self.seed_sql("UPDATE leases SET released_at = NULL, holder_host_id = 'mach-C', holder_machine_id = 'mach-C' WHERE name = 'root'")
-            res_neg_host = self.run_cli([
-                "claim",
-                "--project", "projA",
-                "--scope", "root/sub2.ts",
-                "--holder", "role:root",
-                "--ttl-ms", "60000",
-                "--lease-epoch", "0"
-            ], token="token_root_job", check=False)
-            self.assertNotEqual(res_neg_host.returncode, 0)
-            self.assertIn("403", res_neg_host.stderr)
-
-            # e) Wrong hash -> 403 (wronghash)
-            self.seed_sql("UPDATE leases SET holder_host_id = 'mach-A', holder_machine_id = 'mach-A' WHERE name = 'root'")
-            self.seed_sql("UPDATE jobs SET claim_token_hash = 'invalid_hash_value' WHERE id = 'job-root-1'")
-            res_neg_hash = self.run_cli([
-                "claim",
-                "--project", "projA",
-                "--scope", "root/sub2.ts",
-                "--holder", "role:root",
-                "--ttl-ms", "60000",
-                "--lease-epoch", "0"
-            ], token="token_root_job", check=False)
-            self.assertNotEqual(res_neg_hash.returncode, 0)
-            self.assertIn("403", res_neg_hash.stderr)
-
-            # f) No job -> 403 (nojob)
-            self.seed_sql("DELETE FROM jobs WHERE id = 'job-root-1'")
-            res_neg_nojob = self.run_cli([
-                "claim",
-                "--project", "projA",
-                "--scope", "root/sub2.ts",
-                "--holder", "role:root",
-                "--ttl-ms", "60000",
-                "--lease-epoch", "0"
-            ], token="token_root_job", check=False)
-            self.assertNotEqual(res_neg_nojob.returncode, 0)
-            self.assertIn("403", res_neg_nojob.stderr)
-
-        finally:
-            self.init_fixture_data()
+        claim_rows = self.seed_sql("SELECT count(*) as cnt FROM claims WHERE holder = 'role:root'")
+        self.assertEqual(claim_rows[0].get("cnt", 0), 0)
 
     def test_real_worker_one_cli_and_bridge_fake_roundtrip(self):
         # 1. Send via CLI from worker-1 to worker-2 on real Worker
@@ -1261,6 +1171,115 @@ sys.exit(0)
         res_inbox = self.run_cli(["inbox", "--actor", "worker-1"], token="token_host_a")
         inbox_msgs = json.loads(res_inbox.stdout)
         self.assertTrue(any(m["body"] == "Fake-A processed" and m["reply_to"] == m_id for m in inbox_msgs))
+
+class TestHttpCliRealCleanupInjection(unittest.TestCase):
+    """
+    Negative cleanup injection proof verifying that early setup failures
+    (such as failed seed steps, premature healthz timeouts, or early setup assertions)
+    always close exact owned Popen child handles, close open streams,
+    and remove the temporary directory via addClassCleanup / try-finally,
+    preventing leaked processes (such as the orphaned PID 3883413 noted by head).
+    """
+
+    def test_injected_seed_failure_terminates_owned_child_and_cleans_resources(self):
+        tmp_root = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")), ".local", "tmp")
+        os.makedirs(tmp_root, exist_ok=True)
+        server_dir = tempfile.mkdtemp(dir=tmp_root)
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time, sys; sys.stdout.write('started\\n'); sys.stdout.flush(); time.sleep(60)"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            preexec_fn=os.setsid
+        )
+        child_pid = proc.pid
+        self.assertIsNone(proc.poll())
+
+        def do_cleanup():
+            if proc is not None:
+                for stream in (proc.stdout, proc.stderr, proc.stdin):
+                    if stream:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+                if proc.poll() is None:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        proc.wait(timeout=3)
+                    except Exception:
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                            proc.wait(timeout=2)
+                        except Exception:
+                            pass
+            if os.path.isdir(server_dir):
+                shutil.rmtree(server_dir, ignore_errors=True)
+
+        injected_caught = False
+        try:
+            try:
+                # Simulated failed seed step (identical to original DELETE FROM leases failure)
+                raise RuntimeError("seed_sql failed: no such table: leases")
+            except Exception:
+                do_cleanup()
+                raise
+        except RuntimeError as e:
+            injected_caught = True
+            self.assertIn("leases", str(e))
+
+        self.assertTrue(injected_caught)
+        self.assertIsNotNone(proc.poll())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(child_pid, 0)
+        self.assertTrue(proc.stdout.closed)
+        self.assertTrue(proc.stderr.closed)
+        self.assertFalse(os.path.exists(server_dir))
+
+    def test_add_class_cleanup_triggers_on_setup_class_failure(self):
+        cleaned = {"proc_killed": False, "dir_removed": False}
+        tmp_root = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")), ".local", "tmp")
+        os.makedirs(tmp_root, exist_ok=True)
+        server_dir = tempfile.mkdtemp(dir=tmp_root)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            preexec_fn=os.setsid
+        )
+        child_pid = proc.pid
+
+        class DummyFailingTest(unittest.TestCase):
+            @classmethod
+            def setUpClass(cls):
+                cls.addClassCleanup(cls._cleanup)
+                raise RuntimeError("Injected setup error during initialization")
+
+            @classmethod
+            def _cleanup(cls):
+                if proc.poll() is None:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        proc.wait(timeout=3)
+                        cleaned["proc_killed"] = True
+                    except Exception:
+                        pass
+                if os.path.isdir(server_dir):
+                    shutil.rmtree(server_dir, ignore_errors=True)
+                    cleaned["dir_removed"] = True
+
+            def test_dummy(self):
+                pass
+
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(DummyFailingTest)
+        with open(os.devnull, "w") as devnull:
+            runner = unittest.TextTestRunner(stream=devnull)
+            result = runner.run(suite)
+        self.assertEqual(len(result.errors), 1)
+        self.assertTrue(cleaned["proc_killed"])
+        self.assertTrue(cleaned["dir_removed"])
+        self.assertIsNotNone(proc.poll())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(child_pid, 0)
+        self.assertFalse(os.path.exists(server_dir))
 
 
 if __name__ == "__main__":
