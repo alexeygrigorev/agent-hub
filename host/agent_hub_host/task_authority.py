@@ -224,10 +224,18 @@ class TaskOwnershipTuple:
             raise InvalidTupleError(f"generation must be an integer >= 0; got {self.generation!r}")
 
     def digest(self) -> str:
-        return compute_sha256(
-            f"{self.task_id}:{self.revision}:{self.project_id}:{self.canonical_workspace}:"
-            f"{self.owner_bus_actor}:{self.native_owner_tag}:{self.native_session_uuid}:{self.generation}"
-        )
+        """Canonical JSON digest for exact ordered 8-tuple with version marker."""
+        return compute_sha256([
+            "task_ownership_tuple_v1",
+            self.task_id,
+            self.revision,
+            self.project_id,
+            self.canonical_workspace,
+            self.owner_bus_actor,
+            self.native_owner_tag,
+            self.native_session_uuid,
+            self.generation,
+        ])
 
 
 @dataclasses.dataclass(frozen=True)

@@ -2603,6 +2603,150 @@ class TestTaskAuthority(unittest.TestCase):
                 idempotency_key="acc-guard-no-rev-policy",
             )
 
+    def test_task_ownership_tuple_digest_collision_fix_and_json_unambiguous(self):
+        """Actual head collision fix: colon-separated format collided on adjacent colons,
+        canonical JSON ordered 8-tuple with version marker produces distinct digests."""
+        t1 = TaskOwnershipTuple(
+            task_id="task-collision",
+            revision=1,
+            project_id="project:/workspace",
+            canonical_workspace="/path",
+            owner_bus_actor=self.owner_id,
+            native_owner_tag=self.owner_tag,
+            native_session_uuid=self.session_uuid,
+            generation=0,
+        )
+        t2 = TaskOwnershipTuple(
+            task_id="task-collision",
+            revision=1,
+            project_id="project",
+            canonical_workspace="/workspace:/path",
+            owner_bus_actor=self.owner_id,
+            native_owner_tag=self.owner_tag,
+            native_session_uuid=self.session_uuid,
+            generation=0,
+        )
+
+        # Demonstrate the legacy colon format collision
+        legacy_str_1 = f"{t1.task_id}:{t1.revision}:{t1.project_id}:{t1.canonical_workspace}:{t1.owner_bus_actor}:{t1.native_owner_tag}:{t1.native_session_uuid}:{t1.generation}"
+        legacy_str_2 = f"{t2.task_id}:{t2.revision}:{t2.project_id}:{t2.canonical_workspace}:{t2.owner_bus_actor}:{t2.native_owner_tag}:{t2.native_session_uuid}:{t2.generation}"
+        self.assertEqual(legacy_str_1, legacy_str_2)
+        self.assertEqual(compute_sha256(legacy_str_1), compute_sha256(legacy_str_2))
+
+        # Under canonical JSON ordered 8-tuple, digests are distinct
+        self.assertNotEqual(t1.digest(), t2.digest())
+        expected_digest_1 = compute_sha256([
+            "task_ownership_tuple_v1",
+            t1.task_id,
+            t1.revision,
+            t1.project_id,
+            t1.canonical_workspace,
+            t1.owner_bus_actor,
+            t1.native_owner_tag,
+            t1.native_session_uuid,
+            t1.generation,
+        ])
+        self.assertEqual(t1.digest(), expected_digest_1)
+
+    def test_legacy_custody_ack_digest_mismatch_held_until_reack(self):
+        """Persisted legacy custody ACKs with old colon digests are held/mismatched and never auto-authorized."""
+        task_id = "task-legacy-ack-held"
+        expires_at = format_iso_utc(self.now_dt + datetime.timedelta(hours=1))
+        self.provider.issue_task_grant(
+            issuer_actor_id=self.issuer_id,
+            issuer_token=self.issuer_token,
+            task_id=task_id,
+            revision=1,
+            project_id=self.project_id,
+            workspace=self.workspace,
+            owner_bus_actor=self.owner_id,
+            native_owner_tag=self.owner_tag,
+            native_session_uuid=self.session_uuid,
+            generation=self.generation,
+            source_id="sha-legacy",
+            source_digest="digest-legacy",
+            expires_at=expires_at,
+        )
+
+        grant = self.store.get_latest_grant(task_id)
+        self.assertIsNotNone(grant)
+
+        # Compute legacy colon digest
+        legacy_digest = compute_sha256(
+            f"{grant.ownership.task_id}:{grant.ownership.revision}:{grant.ownership.project_id}:{grant.ownership.canonical_workspace}:"
+            f"{grant.ownership.owner_bus_actor}:{grant.ownership.native_owner_tag}:{grant.ownership.native_session_uuid}:{grant.ownership.generation}"
+        )
+
+        # Directly insert legacy custody ACK into database
+        with self.store._get_connection() as conn:
+            conn.execute(
+                "INSERT INTO custody_acks (task_id, revision, owner_actor_id, idempotency_key, tuple_digest, acked_at) "
+                "VALUES (?, ?, ?, ?, ?, ?);",
+                (task_id, 1, self.owner_id, "legacy-ack-1", legacy_digest, format_iso_utc(self.now_dt)),
+            )
+            conn.commit()
+
+        # Legacy ACK does not match new canonical digest -> held/blocked
+        res = self.provider._validate_current_grant_boundary(
+            task_id=task_id,
+            now=self.now_dt,
+            expected_revision=1,
+            require_custody_ack=True,
+            raise_on_error=False,
+        )
+        self.assertFalse(res.is_valid)
+        self.assertFalse(res.is_ready)
+        self.assertEqual(res.effective_status, "blocked")
+        self.assertEqual(res.error_type, CASConflictError)
+        self.assertIn("Custody ACK tuple mismatch", res.error_message)
+
+        # Revalidator refuses authority completely (None)
+        self.assertIsNone(self.provider.revalidate_authority(task_id, 1, self.workspace, self.now_dt))
+        # Resolver returns a blocked/protected grant (never ready / never auto-authorized)
+        resolved_grant = self.provider.resolve_authority(task_id, self.now_dt)
+        self.assertIsNotNone(resolved_grant)
+        self.assertEqual(resolved_grant.status, "blocked")
+        self.assertFalse(resolved_grant.has_owner_ack)
+        self.assertIn("Custody ACK tuple mismatch", resolved_grant.protected_reason or "")
+
+        # Demonstrate that revision 2 issued fresh with canonical ACK succeeds
+        self.provider.issue_task_grant(
+            issuer_actor_id=self.issuer_id,
+            issuer_token=self.issuer_token,
+            task_id=task_id,
+            revision=2,
+            project_id=self.project_id,
+            workspace=self.workspace,
+            owner_bus_actor=self.owner_id,
+            native_owner_tag=self.owner_tag,
+            native_session_uuid=self.session_uuid,
+            generation=self.generation,
+            source_id="sha-legacy-2",
+            source_digest="digest-legacy-2",
+            expires_at=expires_at,
+        )
+        ack_res = self.provider.record_custody_ack(
+            owner_actor_id=self.owner_id,
+            owner_token=self.owner_token,
+            task_id=task_id,
+            revision=2,
+            project_id=self.project_id,
+            workspace=self.workspace,
+            native_owner_tag=self.owner_tag,
+            native_session_uuid=self.session_uuid,
+            generation=self.generation,
+            idempotency_key="reack-canonical-rev2",
+        )
+        self.assertIsNotNone(ack_res)
+        self.assertEqual(ack_res.revision, 2)
+
+        # Now revalidation succeeds for revision 2
+        reval_grant = self.provider.revalidate_authority(task_id, 2, self.workspace, self.now_dt)
+        self.assertIsNotNone(reval_grant)
+        self.assertEqual(reval_grant.task_id, task_id)
+        self.assertEqual(reval_grant.revision, 2)
+        self.assertEqual(reval_grant.status, "ready")
+
 
 if __name__ == "__main__":
     unittest.main()
