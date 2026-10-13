@@ -7,6 +7,7 @@ import { createSessionCookie, getSession, clearSessionCookie, createLoginCookie,
 import { randomString, sha256, generateUserCode } from './auth/crypto';
 import { generateTokenPair, verifyBearerScope } from './auth/token';
 import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly } from './registry';
+import { BusService, BUS_SCHEMA_SQL, CallerContext } from './bus';
 
 async function safeJson(req: Request): Promise<Record<string, any> | null> {
   if (!req.body) return null;
@@ -46,11 +47,14 @@ export class Hub extends DurableObject {
   sql: SqlStorage;
   env: Env;
   jwksCache: JwksCache = new JwksCache();
+  private busService: BusService;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.env = env;
     this.sql = ctx.storage.sql;
+    const txSync = (this.ctx.storage as any).transactionSync ? (fn: any) => (this.ctx.storage as any).transactionSync(fn) : undefined;
+    this.busService = new BusService(this.sql, txSync);
     this.initDb();
     
     // Restore hibernated websockets
@@ -72,6 +76,12 @@ export class Hub extends DurableObject {
         this.sql.exec(trimmed);
       }
     }
+    for (const statement of BUS_SCHEMA_SQL.split(';')) {
+      const trimmed = statement.trim();
+      if (trimmed) {
+        this.sql.exec(trimmed);
+      }
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -81,6 +91,8 @@ export class Hub extends DurableObject {
     try {
       const registryResponse = await handleRegistryRoutes(request, path, this.sql, this.ctx, this.env);
       if (registryResponse) return registryResponse;
+      const busResponse = await this.handleBusRoutes(request, path);
+      if (busResponse) return busResponse;
       if (path === '/api/healthz') {
         if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
         return Response.json({ status: 'ok', component: 'hub-do' });
@@ -556,13 +568,547 @@ export class Hub extends DurableObject {
 
       if (path === '/internal/tick') {
         if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
-        return new Response("Tick processed");
+        let body: any = null;
+        try { body = await safeJson(request); } catch { }
+        const now = (body && body.now) ? new Date(body.now) : new Date();
+        const res = await this.scheduledTick(now);
+        return Response.json(res);
+      }
+
+      if (path === '/api/cron/retention') {
+        if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+        const now = Date.now();
+        const cleanup = this.busService.retentionCleanup(now, 100);
+        if (cleanup.hasMore) {
+          await this.ctx.storage.setAlarm(Date.now() + 1000);
+        }
+        const totalDeleted = (cleanup.messagesDeleted || 0) + (cleanup.claimsDeleted || 0);
+        return Response.json({ status: 'ok', deleted: totalDeleted, messagesDeleted: cleanup.messagesDeleted, claimsDeleted: cleanup.claimsDeleted, hasMore: cleanup.hasMore });
       }
 
       return new Response("Not found", { status: 404 });
     } catch (e: any) {
       return Response.json({ error: 'Internal Server Error' }, { status: 500 });
     }
+  }
+
+  async scheduledTick(overrideNow?: Date) {
+    const now = overrideNow || new Date();
+    const cleanup = this.busService.retentionCleanup(now.getTime(), 100);
+    if (cleanup.hasMore) {
+      await this.ctx.storage.setAlarm(Date.now() + 1000);
+    }
+    return { status: 'ok', retention: cleanup };
+  }
+
+  async alarm() {
+    await this.scheduledTick();
+  }
+
+  private async authenticateBusRequest(request: Request): Promise<{ caller?: CallerContext; scopes?: string[]; error?: Response }> {
+    const session = await getSession(this.env, request);
+    if (session && session.isAdmin) {
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
+        if (!verifyCsrf(request, session)) {
+          return { error: Response.json({ error: 'CSRF token missing' }, { status: 403 }) };
+        }
+      }
+      return {
+        caller: { isAdmin: true, actor: 'admin', kind: 'human' },
+        scopes: ['admin', 'bus:send', 'bus:read', 'host']
+      };
+    }
+
+    const authHeader = request.headers.get('Authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return { error: Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } }) };
+    }
+
+    const token = authHeader.substring(7).trim();
+    if (!token) {
+      return { error: Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } }) };
+    }
+
+    const tokenHash = await sha256(token);
+    const cred = this.sql.exec('SELECT * FROM credentials WHERE token_hash = ? AND revoked_at IS NULL', tokenHash).toArray()[0] as any;
+    if (!cred) {
+      return { error: Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } }) };
+    }
+
+    const expiresMs = Date.parse(cred.expires_at);
+    if (!Number.isFinite(expiresMs) || expiresMs <= Date.now()) {
+      return { error: Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } }) };
+    }
+
+    let scopes: string[] = [];
+    try {
+      scopes = typeof cred.scopes === 'string' ? JSON.parse(cred.scopes) : cred.scopes;
+    } catch {
+      return { error: Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } }) };
+    }
+
+    if (!Array.isArray(scopes)) {
+      return { error: Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } }) };
+    }
+
+    const lastUsedMs = cred.last_used_at ? Date.parse(cred.last_used_at) : 0;
+    const nowMs = Date.now();
+    if (!lastUsedMs || isNaN(lastUsedMs) || (nowMs - lastUsedMs) >= 300_000) {
+      const nowIso = new Date().toISOString();
+      this.sql.exec('UPDATE credentials SET last_used_at = ? WHERE id = ?', nowIso, cred.id);
+      cred.last_used_at = nowIso;
+    }
+
+    const caller: CallerContext = {
+      kind: cred.kind,
+      tokenId: cred.id,
+      tokenHash: cred.token_hash
+    };
+    if (cred.kind === 'host') {
+      caller.machineId = cred.machine_id;
+    } else if (cred.kind === 'agent' || cred.kind === 'job') {
+      caller.actor = cred.actor || cred.subject;
+      if (cred.machine_id) caller.machineId = cred.machine_id;
+      if (cred.kind === 'job') {
+        caller.jobId = cred.subject;
+      }
+    } else if (cred.kind === 'human') {
+      if (scopes.includes('admin')) caller.isAdmin = true;
+      caller.actor = cred.actor || cred.subject;
+    }
+
+    return { caller, scopes };
+  }
+
+  private async parseSafeBusBody(request: Request, allowedKeys: Set<string>, optional: boolean = false): Promise<{ data?: Record<string, any>; error?: Response }> {
+    if (!request.body) {
+      if (optional) return { data: {} };
+      return { error: Response.json({ error: 'missing_body' }, { status: 400 }) };
+    }
+    const reader = request.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+    try {
+      for (;;) {
+        const part = await reader.read();
+        if (part.done) break;
+        totalBytes += part.value.byteLength;
+        if (totalBytes > 16384) {
+          await reader.cancel();
+          return { error: Response.json({ error: 'body_too_large' }, { status: 413 }) };
+        }
+        chunks.push(part.value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    if (totalBytes === 0) {
+      if (optional) return { data: {} };
+      return { error: Response.json({ error: 'missing_body' }, { status: 400 }) };
+    }
+
+    const allBytes = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      allBytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+
+    let text: string;
+    try {
+      text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(allBytes);
+    } catch {
+      return { error: Response.json({ error: 'invalid_utf8' }, { status: 400 }) };
+    }
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return { error: Response.json({ error: 'invalid_json' }, { status: 400 }) };
+    }
+
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return { error: Response.json({ error: 'invalid_json_object' }, { status: 400 }) };
+    }
+
+    for (const k of Object.keys(parsed)) {
+      if (!allowedKeys.has(k)) {
+        return { error: Response.json({ error: 'unknown_fields', field: k }, { status: 400 }) };
+      }
+    }
+
+    return { data: parsed };
+  }
+
+  private async handleBusRoutes(request: Request, path: string): Promise<Response | null> {
+    if (!path.startsWith('/api/bus')) return null;
+
+    const url = new URL(request.url);
+
+    // GET /api/bus/actors
+    if (path === '/api/bus/actors') {
+      if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('admin')) {
+        return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
+      }
+      return Response.json(this.busService.getBusActors());
+    }
+
+    // GET /api/bus/messages
+    if (path === '/api/bus/messages' && request.method === 'GET') {
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('admin')) {
+        return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
+      }
+      const actor = url.searchParams.get('actor');
+      return Response.json(this.busService.getBusMessages(actor));
+    }
+
+    // POST /api/bus/send
+    if (path === '/api/bus/send') {
+      if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('admin')) {
+        return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
+      }
+
+      const allowedKeys = new Set(['from_actor', 'to_actor', 'kind', 'body', 'idempotency_key', 'thread_id', 'reply_to', 'lease_epoch']);
+      const parsed = await this.parseSafeBusBody(request, allowedKeys);
+      if (parsed.error) return parsed.error;
+      const body = parsed.data!;
+
+      if (typeof body.from_actor !== 'string' || !body.from_actor || body.from_actor.length > 128) {
+        return Response.json({ error: 'invalid_from_actor' }, { status: 400 });
+      }
+      if (typeof body.to_actor !== 'string' || !body.to_actor || body.to_actor.length > 128) {
+        return Response.json({ error: 'invalid_to_actor' }, { status: 400 });
+      }
+      if (typeof body.kind !== 'string' || !['note', 'handoff', 'reply', 'status', 'claim', 'release', 'scope_claim'].includes(body.kind)) {
+        return Response.json({ error: 'invalid_kind' }, { status: 400 });
+      }
+      if (typeof body.body !== 'string') {
+        return Response.json({ error: 'invalid_body' }, { status: 400 });
+      }
+      if (typeof body.idempotency_key !== 'string' || !body.idempotency_key || body.idempotency_key.length > 128) {
+        return Response.json({ error: 'invalid_idempotency_key' }, { status: 400 });
+      }
+      if (body.thread_id !== undefined && (typeof body.thread_id !== 'string' || body.thread_id.length > 128)) {
+        return Response.json({ error: 'invalid_thread_id' }, { status: 400 });
+      }
+      if (body.reply_to !== undefined && (typeof body.reply_to !== 'string' || body.reply_to.length > 128)) {
+        return Response.json({ error: 'invalid_reply_to' }, { status: 400 });
+      }
+      if (body.lease_epoch !== undefined && (typeof body.lease_epoch !== 'number' || !Number.isInteger(body.lease_epoch) || body.lease_epoch < 0)) {
+        return Response.json({ error: 'invalid_lease_epoch' }, { status: 403 });
+      }
+
+      try {
+        const result = this.busService.send(auth.caller!, {
+          senderActor: body.from_actor,
+          toActor: body.to_actor,
+          kind: body.kind,
+          body: body.body,
+          idempotencyKey: body.idempotency_key,
+          threadId: body.thread_id,
+          replyTo: body.reply_to,
+          leaseEpoch: body.lease_epoch,
+          now: Date.now()
+        });
+        return Response.json({ id: result.id, thread_id: result.threadId, threadId: result.threadId });
+      } catch (e: any) {
+        if (e.message === 'body_too_large') return Response.json({ error: 'body_too_large' }, { status: 413 });
+        if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
+          return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
+        }
+        if (e.message === 'conflict') return Response.json({ error: 'conflict' }, { status: 409 });
+        if (e.message === 'invalid_lease_epoch') return Response.json({ error: 'invalid_lease_epoch' }, { status: 403 });
+        if (e.message === 'unknown_recipient') return Response.json({ error: 'unknown_recipient' }, { status: 404 });
+        if (e.message === 'invalid_reply_to') return Response.json({ error: 'invalid_reply_to' }, { status: 400 });
+        return Response.json({ error: 'Internal Server Error' }, { status: 500 });
+      }
+    }
+
+    // POST /api/bus/reply
+    if (path === '/api/bus/reply') {
+      if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('admin')) {
+        return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
+      }
+
+      const allowedKeys = new Set(['from_actor', 'to_actor', 'kind', 'body', 'idempotency_key', 'thread_id', 'reply_to', 'lease_epoch']);
+      const parsed = await this.parseSafeBusBody(request, allowedKeys);
+      if (parsed.error) return parsed.error;
+      const body = parsed.data!;
+
+      if (!body.reply_to || typeof body.reply_to !== 'string' || body.reply_to.length > 128) {
+        return Response.json({ error: 'missing_reply_to' }, { status: 400 });
+      }
+      if (typeof body.from_actor !== 'string' || !body.from_actor || body.from_actor.length > 128) {
+        return Response.json({ error: 'invalid_from_actor' }, { status: 400 });
+      }
+      if (typeof body.to_actor !== 'string' || !body.to_actor || body.to_actor.length > 128) {
+        return Response.json({ error: 'invalid_to_actor' }, { status: 400 });
+      }
+      if (typeof body.kind !== 'string' || !['note', 'handoff', 'reply', 'status', 'claim', 'release', 'scope_claim'].includes(body.kind)) {
+        return Response.json({ error: 'invalid_kind' }, { status: 400 });
+      }
+      if (typeof body.body !== 'string') {
+        return Response.json({ error: 'invalid_body' }, { status: 400 });
+      }
+      if (typeof body.idempotency_key !== 'string' || !body.idempotency_key || body.idempotency_key.length > 128) {
+        return Response.json({ error: 'invalid_idempotency_key' }, { status: 400 });
+      }
+
+      try {
+        const result = this.busService.send(auth.caller!, {
+          senderActor: body.from_actor,
+          toActor: body.to_actor,
+          kind: body.kind,
+          body: body.body,
+          idempotencyKey: body.idempotency_key,
+          threadId: body.thread_id,
+          replyTo: body.reply_to,
+          leaseEpoch: body.lease_epoch,
+          now: Date.now()
+        });
+        return Response.json({ id: result.id, thread_id: result.threadId, threadId: result.threadId });
+      } catch (e: any) {
+        if (e.message === 'body_too_large') return Response.json({ error: 'body_too_large' }, { status: 413 });
+        if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
+          return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
+        }
+        if (e.message === 'conflict') return Response.json({ error: 'conflict' }, { status: 409 });
+        if (e.message === 'invalid_lease_epoch') return Response.json({ error: 'invalid_lease_epoch' }, { status: 403 });
+        if (e.message === 'invalid_reply_to') return Response.json({ error: 'invalid_reply_to' }, { status: 400 });
+        if (e.message === 'unknown_recipient') return Response.json({ error: 'unknown_recipient' }, { status: 404 });
+        return Response.json({ error: 'Internal Server Error' }, { status: 500 });
+      }
+    }
+
+    // GET /api/bus/inbox
+    if (path === '/api/bus/inbox') {
+      if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('admin')) {
+        return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
+      }
+
+      for (const k of url.searchParams.keys()) {
+        if (!['actor', 'limit', 'cursor', 'before'].includes(k)) {
+          return Response.json({ error: 'unknown_query_param', param: k }, { status: 400 });
+        }
+      }
+
+      const actor = url.searchParams.get('actor');
+      if (!actor) return Response.json({ error: 'missing_actor' }, { status: 400 });
+
+      let limit = 50;
+      if (url.searchParams.has('limit')) {
+        const rawLimit = url.searchParams.get('limit')!;
+        if (!/^\d+$/.test(rawLimit)) return Response.json({ error: 'invalid_limit' }, { status: 400 });
+        const parsed = parseInt(rawLimit, 10);
+        if (parsed < 1 || parsed > 100) return Response.json({ error: 'invalid_limit' }, { status: 400 });
+        limit = parsed;
+      }
+
+      const cursor = url.searchParams.get('cursor') || url.searchParams.get('before') || undefined;
+      if (cursor && cursor.length > 128) return Response.json({ error: 'invalid_cursor' }, { status: 400 });
+
+      try {
+        const messages = this.busService.inbox(auth.caller!, actor, limit, cursor);
+        return Response.json(messages);
+      } catch (e: any) {
+        if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
+          return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
+        }
+        return Response.json({ error: 'Internal Server Error' }, { status: 500 });
+      }
+    }
+
+    // POST & GET /api/bus/claims
+    if (path === '/api/bus/claims') {
+      if (request.method === 'POST') {
+        const auth = await this.authenticateBusRequest(request);
+        if (auth.error) return auth.error;
+        if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('admin')) {
+          return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
+        }
+
+        const allowedKeys = new Set(['project', 'scope', 'holder', 'ttl_ms', 'lease_epoch']);
+        const parsed = await this.parseSafeBusBody(request, allowedKeys);
+        if (parsed.error) return parsed.error;
+        const body = parsed.data!;
+
+        if (typeof body.project !== 'string' || !body.project || body.project.length > 64) {
+          return Response.json({ error: 'invalid_project' }, { status: 400 });
+        }
+        if (typeof body.scope !== 'string' || !body.scope || body.scope.length > 256) {
+          return Response.json({ error: 'invalid_scope' }, { status: 400 });
+        }
+        if (typeof body.holder !== 'string' || !body.holder || body.holder.length > 128) {
+          return Response.json({ error: 'invalid_holder' }, { status: 400 });
+        }
+        if (body.lease_epoch !== undefined && (typeof body.lease_epoch !== 'number' || !Number.isInteger(body.lease_epoch) || body.lease_epoch < 0)) {
+          return Response.json({ error: 'invalid_lease_epoch' }, { status: 403 });
+        }
+        let ttlMs = 3600000;
+        if (body.ttl_ms !== undefined) {
+          if (typeof body.ttl_ms !== 'number' || !Number.isInteger(body.ttl_ms) || body.ttl_ms < 1) {
+            return Response.json({ error: 'invalid_ttl' }, { status: 400 });
+          }
+          ttlMs = body.ttl_ms;
+        }
+
+        try {
+          const result = this.busService.claim(auth.caller!, body.project, body.scope, body.holder, ttlMs, Date.now(), body.lease_epoch);
+          return Response.json({ id: result.id });
+        } catch (e: any) {
+          if (e.message === 'invalid_scope') return Response.json({ error: 'invalid_scope' }, { status: 400 });
+          if (e.message === 'invalid_ttl') return Response.json({ error: 'invalid_ttl' }, { status: 400 });
+          if (e.message === 'invalid_lease_epoch') return Response.json({ error: 'invalid_lease_epoch' }, { status: 403 });
+          if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
+            return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
+          }
+          if (e.message === 'conflict') return Response.json({ error: 'conflict' }, { status: 409 });
+          return Response.json({ error: 'Internal Server Error' }, { status: 500 });
+        }
+      }
+
+      if (request.method === 'GET') {
+        const auth = await this.authenticateBusRequest(request);
+        if (auth.error) return auth.error;
+        if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('admin')) {
+          return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
+        }
+
+        const project = url.searchParams.get('project') || undefined;
+        const holder = url.searchParams.get('holder') || undefined;
+        const active = url.searchParams.get('active') !== 'false';
+
+        try {
+          const claims = this.busService.listClaims(auth.caller!, project, holder, active);
+          return Response.json(claims);
+        } catch (e: any) {
+          if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
+            return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
+          }
+          return Response.json({ error: 'Internal Server Error' }, { status: 500 });
+        }
+      }
+
+      return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, POST' } });
+    }
+
+    // POST /api/bus/claims/:target/release
+    if (path.startsWith('/api/bus/claims/') && path.endsWith('/release')) {
+      if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('admin')) {
+        return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
+      }
+
+      const encodedTarget = path.slice('/api/bus/claims/'.length, -'/release'.length);
+      const target = decodeURIComponent(encodedTarget);
+
+      const allowedKeys = new Set(['lease_epoch']);
+      const parsed = await this.parseSafeBusBody(request, allowedKeys, true);
+      if (parsed.error) return parsed.error;
+      let leaseEpoch: number | undefined;
+      if (parsed.data?.lease_epoch !== undefined) {
+        if (typeof parsed.data.lease_epoch !== 'number' || !Number.isInteger(parsed.data.lease_epoch) || parsed.data.lease_epoch < 0) {
+          return Response.json({ error: 'invalid_lease_epoch' }, { status: 403 });
+        }
+        leaseEpoch = parsed.data.lease_epoch;
+      }
+
+      try {
+        this.busService.releaseClaim(auth.caller!, target, Date.now(), leaseEpoch);
+        return Response.json({ status: 'ok' });
+      } catch (e: any) {
+        if (e.message === 'invalid_scope') return Response.json({ error: 'invalid_scope' }, { status: 400 });
+        if (e.message === 'invalid_lease_epoch') return Response.json({ error: 'invalid_lease_epoch' }, { status: 403 });
+        if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
+          return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
+        }
+        return Response.json({ error: 'Internal Server Error' }, { status: 500 });
+      }
+    }
+
+    // POST /api/bus/messages/:id/(ack|accept|complete)
+    const stageMatch = path.match(/^\/api\/bus\/messages\/([^/]+)\/(ack|accept|complete)$/);
+    if (stageMatch) {
+      if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('admin')) {
+        return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
+      }
+
+      const messageId = decodeURIComponent(stageMatch[1]);
+      const stage = stageMatch[2] as 'ack' | 'accept' | 'complete';
+
+      const allowedKeys = new Set(['lease_epoch']);
+      const parsed = await this.parseSafeBusBody(request, allowedKeys, true);
+      if (parsed.error) return parsed.error;
+      let leaseEpoch: number | undefined;
+      if (parsed.data?.lease_epoch !== undefined) {
+        if (typeof parsed.data.lease_epoch !== 'number' || !Number.isInteger(parsed.data.lease_epoch) || parsed.data.lease_epoch < 0) {
+          return Response.json({ error: 'invalid_lease_epoch' }, { status: 403 });
+        }
+        leaseEpoch = parsed.data.lease_epoch;
+      }
+
+      try {
+        if (stage === 'ack') this.busService.ack(auth.caller!, messageId, Date.now(), leaseEpoch);
+        else if (stage === 'accept') this.busService.accept(auth.caller!, messageId, Date.now(), leaseEpoch);
+        else if (stage === 'complete') this.busService.complete(auth.caller!, messageId, Date.now(), leaseEpoch);
+        return Response.json({ status: 'ok', id: messageId, stage });
+      } catch (e: any) {
+        if (e.message === 'not_found') return Response.json({ error: 'not_found' }, { status: 404 });
+        if (e.message === 'invalid_lease_epoch') return Response.json({ error: 'invalid_lease_epoch' }, { status: 403 });
+        if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
+          return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
+        }
+        if (e.message === 'invalid_stage') return Response.json({ error: 'invalid_stage' }, { status: 400 });
+        return Response.json({ error: 'Internal Server Error' }, { status: 500 });
+      }
+    }
+
+    // GET /api/bus/messages/:id
+    const showMatch = path.match(/^\/api\/bus\/messages\/([^/]+)$/);
+    if (showMatch) {
+      if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('admin')) {
+        return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
+      }
+
+      const messageId = decodeURIComponent(showMatch[1]);
+
+      try {
+        const msg = this.busService.show(auth.caller!, messageId);
+        return Response.json(msg);
+      } catch (e: any) {
+        if (e.message === 'not_found') return Response.json({ error: 'not_found' }, { status: 404 });
+        if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
+          return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
+        }
+        return Response.json({ error: 'Internal Server Error' }, { status: 500 });
+      }
+    }
+
+    return null;
   }
 
   webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
