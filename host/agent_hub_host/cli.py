@@ -84,7 +84,63 @@ def main():
     p_status = sub.add_parser("status", help="Check status")
     
     p_run = sub.add_parser("run", help="Run the host agent in the foreground")
+
+    p_send = sub.add_parser("send", help="Send a message")
+    p_send.add_argument("--from", dest="from_actor", required=True)
+    p_send.add_argument("--to", dest="to_actor", required=True)
+    p_send.add_argument("--kind", required=True)
+    p_send.add_argument("--body", required=True)
+    p_send.add_argument("--idempotency-key", default=None)
+    p_send.add_argument("--thread-id", help="Thread ID")
+    p_send.add_argument("--reply-to", help="Reply to message ID")
+    p_send.add_argument("--lease-epoch", type=int, help="Root lease epoch", default=None)
+
+    p_inbox = sub.add_parser("inbox", help="List inbox messages")
+    p_inbox.add_argument("--actor", required=True)
+    p_inbox.add_argument("--limit", type=int, default=50)
+    p_inbox.add_argument("--cursor", help="Pagination cursor")
     
+    p_show = sub.add_parser("show", help="Show message")
+    p_show.add_argument("id", help="Message ID")
+    
+    p_ack = sub.add_parser("ack", help="Ack message")
+    p_ack.add_argument("id", help="Message ID")
+    p_ack.add_argument("--lease-epoch", type=int, help="Root lease epoch", default=None)
+    
+    p_accept = sub.add_parser("accept", help="Accept message")
+    p_accept.add_argument("id", help="Message ID")
+    p_accept.add_argument("--lease-epoch", type=int, help="Root lease epoch", default=None)
+    
+    p_complete = sub.add_parser("complete", help="Complete message")
+    p_complete.add_argument("id", help="Message ID")
+    p_complete.add_argument("--lease-epoch", type=int, help="Root lease epoch", default=None)
+    
+    p_reply = sub.add_parser("reply", help="Reply to message")
+    p_reply.add_argument("--reply-to", required=True)
+    p_reply.add_argument("--from", dest="from_actor", required=True)
+    p_reply.add_argument("--to", dest="to_actor", required=True)
+    p_reply.add_argument("--kind", required=True)
+    p_reply.add_argument("--body", required=True)
+    p_reply.add_argument("--idempotency-key", default=None)
+    p_reply.add_argument("--thread-id", help="Thread ID")
+    p_reply.add_argument("--lease-epoch", type=int, help="Root lease epoch", default=None)
+    
+    p_claim = sub.add_parser("claim", help="Create a claim")
+    p_claim.add_argument("--project", required=True)
+    p_claim.add_argument("--scope", required=True)
+    p_claim.add_argument("--holder", required=True)
+    p_claim.add_argument("--ttl-ms", type=int, default=3600000)
+    p_claim.add_argument("--lease-epoch", type=int, help="Root lease epoch", default=None)
+    
+    p_release = sub.add_parser("release", help="Release a claim")
+    p_release.add_argument("id", help="Claim ID or project:scope")
+    p_release.add_argument("--lease-epoch", type=int, help="Root lease epoch", default=None)
+
+    p_claims = sub.add_parser("claims", help="List claims")
+    p_claims.add_argument("--project", help="Filter by project")
+    p_claims.add_argument("--holder", help="Filter by holder")
+    p_claims.add_argument("--all", action="store_true", help="Include released/expired claims")
+
     args = parser.parse_args()
     
     if args.cmd == "login":
@@ -96,6 +152,68 @@ def main():
         cmd_status(args)
     elif args.cmd == "run":
         cmd_run(args)
+    elif args.cmd == "send":
+        from . import bus
+        if args.body == "-":
+            raw = sys.stdin.read(16385)
+            if len(raw.encode("utf-8")) > 16384:
+                print("Error: stdin body exceeds 16 KiB limit", file=sys.stderr)
+                sys.exit(1)
+            args.body = raw
+        res = bus.send(
+            args.from_actor,
+            args.to_actor,
+            args.kind,
+            args.body,
+            idempotency_key=getattr(args, 'idempotency_key', None),
+            thread_id=getattr(args, 'thread_id', None),
+            reply_to=getattr(args, 'reply_to', None),
+            lease_epoch=getattr(args, 'lease_epoch', None)
+        )
+        print(json.dumps(res))
+    elif args.cmd == "inbox":
+        from . import bus
+        print(json.dumps(bus.inbox(args.actor, limit=getattr(args, 'limit', 50), cursor=getattr(args, 'cursor', None))))
+    elif args.cmd == "show":
+        from . import bus
+        print(json.dumps(bus.show(args.id)))
+    elif args.cmd == "ack":
+        from . import bus
+        print(json.dumps(bus.ack(args.id, lease_epoch=getattr(args, 'lease_epoch', None))))
+    elif args.cmd == "accept":
+        from . import bus
+        print(json.dumps(bus.accept(args.id, lease_epoch=getattr(args, 'lease_epoch', None))))
+    elif args.cmd == "complete":
+        from . import bus
+        print(json.dumps(bus.complete(args.id, lease_epoch=getattr(args, 'lease_epoch', None))))
+    elif args.cmd == "reply":
+        from . import bus
+        if args.body == "-":
+            raw = sys.stdin.read(16385)
+            if len(raw.encode("utf-8")) > 16384:
+                print("Error: stdin body exceeds 16 KiB limit", file=sys.stderr)
+                sys.exit(1)
+            args.body = raw
+        res = bus.reply(
+            args.reply_to,
+            args.from_actor,
+            args.to_actor,
+            args.kind,
+            args.body,
+            idempotency_key=getattr(args, 'idempotency_key', None),
+            thread_id=getattr(args, 'thread_id', None),
+            lease_epoch=getattr(args, 'lease_epoch', None)
+        )
+        print(json.dumps(res))
+    elif args.cmd == "claim":
+        from . import bus
+        print(json.dumps(bus.claim(args.project, args.scope, args.holder, args.ttl_ms, lease_epoch=getattr(args, 'lease_epoch', None))))
+    elif args.cmd == "release":
+        from . import bus
+        print(json.dumps(bus.release(args.id, lease_epoch=getattr(args, 'lease_epoch', None))))
+    elif args.cmd == "claims":
+        from . import bus
+        print(json.dumps(bus.list_claims(project=getattr(args, 'project', None), holder=getattr(args, 'holder', None), active=not getattr(args, 'all', False))))
 
 if __name__ == "__main__":
     main()
