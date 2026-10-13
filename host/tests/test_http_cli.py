@@ -1088,7 +1088,13 @@ export default {{
         self.seed_sql("UPDATE messages SET delivered_at = ?, read_at = ? WHERE id = ?", [now_ts, now_ts, m_id])
 
         # 2. Bridge setup with fake-a binary
-        from agent_hub_host.bridge import MailboxBridge, canonicalize_workspace, get_workspace_key
+        from agent_hub_host.bridge import (
+            BridgeCapabilityGap,
+            MailboxBridge,
+            canonicalize_workspace,
+            get_workspace_key,
+        )
+        from agent_hub_host.native_bridge import validate_native_send_envelope
 
         work_dir = os.path.join(self.server_dir, "work_rt")
         rt_dir = os.path.join(self.server_dir, "rt_dir")
@@ -1096,10 +1102,12 @@ export default {{
         os.makedirs(work_dir, exist_ok=True)
         canon_ws = canonicalize_workspace(work_dir)
         rec_uuid = str(uuid.uuid4())
+        service_uuid = str(uuid.uuid4())
+        service_tag = "hub-bridge"
         native_m_id = str(uuid.uuid4())
         native_rep_id = str(uuid.uuid4())
 
-        # Session in rt_dir
+        # Recipient session in rt_dir
         sdir = os.path.join(rt_dir, "sessions", rec_uuid)
         os.makedirs(sdir, exist_ok=True)
         with open(os.path.join(sdir, "session.json"), "w") as f:
@@ -1115,37 +1123,157 @@ export default {{
         fake_a = os.path.join(self.server_dir, "fake-a-rt")
         with open(fake_a, "w") as f:
             f.write(f"""#!/usr/bin/env python3
-import sys, json, os
+import sys, json, os, time
 args = sys.argv[1:]
-if not args: sys.exit(1)
+if not args:
+    sys.exit(1)
+
+ambient_sid = os.environ.get("APLEXER_SESSION_ID")
+
 if args[0] == "message":
     if args[1] == "send":
+        body = args[-1]
+        if not ambient_sid:
+            # Anonymous envelope per native aplexer contract (no session binding)
+            print(json.dumps({{
+                "schema_version": 1,
+                "id": "{native_m_id}-anon",
+                "workspace": "{canon_ws}",
+                "created_at": int(time.time()),
+                "from": {{"external": True, "workspace": "{canon_ws}"}},
+                "to": {{"tag": "worker-2", "session_id": "{rec_uuid}"}},
+                "kind": "note",
+                "body": body,
+                "delivery": "inbox"
+            }}))
+            sys.exit(0)
+
+        # Qualified authenticated envelope with own bridge service session binding
         with open("{os.path.join(mb_dir, "cursors", f"{rec_uuid}.json")}", "w") as cf:
             json.dump({{"exceptions": ["{native_m_id}"], "acked_through": None}}, cf)
-        print(json.dumps({{"id": "{native_m_id}", "to": {{"session_id": "{rec_uuid}"}}}}))
+        print(json.dumps({{
+            "schema_version": 1,
+            "id": "{native_m_id}",
+            "workspace": "{canon_ws}",
+            "created_at": int(time.time()),
+            "from": {{
+                "tag": "{service_tag}",
+                "session_id": ambient_sid,
+                "workspace": "{canon_ws}",
+                "external": False
+            }},
+            "to": {{"tag": "worker-2", "session_id": "{rec_uuid}"}},
+            "kind": "note",
+            "reply_to": None,
+            "body": body,
+            "delivery": "inbox"
+        }}))
         sys.exit(0)
     elif args[1] == "log":
         print(json.dumps([{{
+            "schema_version": 1,
             "id": "{native_rep_id}",
             "reply_to": "{native_m_id}",
-            "from": {{"session_id": "{rec_uuid}", "tag": "worker-2"}},
-            "to": {{"tag": "worker-1"}},
+            "workspace": "{canon_ws}",
+            "created_at": int(time.time()),
+            "from": {{"session_id": "{rec_uuid}", "tag": "worker-2", "workspace": "{canon_ws}", "external": False}},
+            "to": {{"tag": "{service_tag}"}},
             "kind": "reply",
-            "body": "Fake-A processed"
+            "body": "Fake-A processed",
+            "delivery": "inbox"
         }}]))
         sys.exit(0)
 sys.exit(0)
 """)
         os.chmod(fake_a, 0o755)
 
-        bridge = MailboxBridge(work_dir, aplexer_bin=fake_a, state_dir=st_dir, runtime_dir=rt_dir)
+        # 2a. Explicit negative: missing-binding / anonymous sender fails closed with BridgeCapabilityGap
+        saved_aplexer_sid = os.environ.pop("APLEXER_SESSION_ID", None)
+        try:
+            unbound_bridge = MailboxBridge(work_dir, aplexer_bin=fake_a, state_dir=st_dir, runtime_dir=rt_dir)
+            self.assertIsNone(unbound_bridge.service_binding)
+            with self.assertRaises(BridgeCapabilityGap) as ctx_gap:
+                unbound_bridge.forward_hub_to_native({
+                    "id": f"{m_id}-unbound-negative",
+                    "from_actor": "worker-1",
+                    "to_actor": "worker-2",
+                    "body": "Negative unbound forward payload",
+                    "kind": "note",
+                    "thread_id": msg_info["thread_id"],
+                })
+            self.assertIn("absent or unqualified", str(ctx_gap.exception))
+            self.assertNotIn(f"{m_id}-unbound-negative", unbound_bridge.receipts.get("hub_to_native", {}))
+            self.assertIn(f"{m_id}-unbound-negative", unbound_bridge.receipts.get("ambiguous_sends", {}))
+
+            # Additional direct envelope contract check: external:true is refused even if service binding is absent
+            with self.assertRaises(BridgeCapabilityGap) as ctx_ext:
+                validate_native_send_envelope(
+                    {
+                        "schema_version": 1,
+                        "id": f"{native_m_id}-ext-neg",
+                        "workspace": canon_ws,
+                        "from": {"external": True, "tag": service_tag, "session_id": service_uuid},
+                        "to": {"tag": "worker-2", "session_id": rec_uuid},
+                    },
+                    unbound_bridge.service_binding,
+                    canon_ws,
+                )
+            self.assertIn("absent or unqualified", str(ctx_ext.exception))
+        finally:
+            if saved_aplexer_sid is not None:
+                os.environ["APLEXER_SESSION_ID"] = saved_aplexer_sid
+
+        # 2b. Authoritative bridge service session registration (explicit fixture identity / own-session binding)
+        serv_dir = os.path.join(rt_dir, "sessions", service_uuid)
+        os.makedirs(serv_dir, exist_ok=True)
+        with open(os.path.join(serv_dir, "session.json"), "w") as f:
+            json.dump({
+                "schema_version": 1,
+                "id": service_uuid,
+                "workspace": canon_ws,
+                "tag": service_tag,
+                "engine": "hub-bridge",
+                "created_at_ms": int(time.time() * 1000) - 1000,
+                "command": ["hub-bridge-service"],
+                "cwd": canon_ws,
+            }, f)
+
+        # 2c. Qualified bridge initialization with verified service binding (OFFLINE fixture qualification)
+        bridge = MailboxBridge(
+            work_dir,
+            aplexer_bin=fake_a,
+            state_dir=st_dir,
+            runtime_dir=rt_dir,
+            service_tag=service_tag,
+            service_session_id=service_uuid,
+        )
+        self.assertIsNotNone(bridge.service_binding)
+        self.assertEqual(bridge.service_binding.tag, service_tag)
+        self.assertEqual(bridge.service_binding.session_id, service_uuid)
+
+        # Direct envelope contract check: external:true is refused even with qualified service binding
+        with self.assertRaises(BridgeCapabilityGap) as ctx_ext_bound:
+            validate_native_send_envelope(
+                {
+                    "schema_version": 1,
+                    "id": f"{native_m_id}-ext-neg-bound",
+                    "workspace": canon_ws,
+                    "from": {"external": True, "tag": service_tag, "session_id": service_uuid},
+                    "to": {"tag": "worker-2", "session_id": rec_uuid},
+                },
+                bridge.service_binding,
+                canon_ws,
+            )
+        self.assertIn("external:true", str(ctx_ext_bound.exception))
+
+        # Qualified fake positive: forwarding succeeds and returns native message ID
         fwd_id = bridge.forward_hub_to_native({
             "id": m_id,
             "from_actor": "worker-1",
             "to_actor": "worker-2",
             "body": "Bridge roundtrip payload",
             "kind": "note",
-            "thread_id": msg_info["thread_id"]
+            "thread_id": msg_info["thread_id"],
         })
         self.assertEqual(fwd_id, native_m_id)
 
