@@ -85,12 +85,18 @@ def qualify_native_service_binding(
     """
     sessions_dirs: list[str] = []
     if runtime_dir and os.path.isdir(os.path.join(runtime_dir, "sessions")):
-        sessions_dirs.append(os.path.join(runtime_dir, "sessions"))
+        s_dir = os.path.join(runtime_dir, "sessions")
+        if not os.path.islink(s_dir):
+            sessions_dirs.append(s_dir)
     if state_dir and os.path.isdir(os.path.join(state_dir, "sessions")):
-        sessions_dirs.append(os.path.join(state_dir, "sessions"))
+        s_dir = os.path.join(state_dir, "sessions")
+        if not os.path.islink(s_dir):
+            sessions_dirs.append(s_dir)
 
     if not sessions_dirs:
         return None
+
+    allowed_service_tags = [service_tag] if service_tag else ["hub-bridge", "agent-hub-bridge"]
 
     # Priority 1: Explicit service_session_id
     if service_session_id:
@@ -100,7 +106,10 @@ def qualify_native_service_binding(
             return None
 
         for sdir in sessions_dirs:
-            rec_file = os.path.join(sdir, norm_sid, "session.json")
+            entry_dir = os.path.join(sdir, norm_sid)
+            if os.path.islink(entry_dir) or not os.path.isdir(entry_dir):
+                continue
+            rec_file = os.path.join(entry_dir, "session.json")
             if os.path.isfile(rec_file) and not os.path.islink(rec_file):
                 try:
                     with open(rec_file, "r", encoding="utf-8") as f:
@@ -112,7 +121,7 @@ def qualify_native_service_binding(
                         if (
                             rec_id.lower() == norm_sid.lower()
                             and canonicalize_workspace(rec_ws) == canonical_workspace
-                            and (service_tag is None or rec_tag == service_tag)
+                            and (rec_tag in allowed_service_tags)
                             and rec_tag
                         ):
                             return NativeServiceBinding(
@@ -133,7 +142,10 @@ def qualify_native_service_binding(
         try:
             norm_sid = str(uuid.UUID(str(env_sid).strip()))
             for sdir in sessions_dirs:
-                rec_file = os.path.join(sdir, norm_sid, "session.json")
+                entry_dir = os.path.join(sdir, norm_sid)
+                if os.path.islink(entry_dir) or not os.path.isdir(entry_dir):
+                    continue
+                rec_file = os.path.join(entry_dir, "session.json")
                 if os.path.isfile(rec_file) and not os.path.islink(rec_file):
                     with open(rec_file, "r", encoding="utf-8") as f:
                         rec = json.load(f)
@@ -144,7 +156,7 @@ def qualify_native_service_binding(
                         if (
                             rec_id.lower() == norm_sid.lower()
                             and canonicalize_workspace(rec_ws) == canonical_workspace
-                            and (service_tag is None or rec_tag == service_tag)
+                            and (rec_tag in allowed_service_tags)
                             and rec_tag
                         ):
                             return NativeServiceBinding(
@@ -159,13 +171,16 @@ def qualify_native_service_binding(
             pass
 
     # Priority 3: Search authoritative sessions for dedicated bridge service tag
-    target_tags = [service_tag] if service_tag else ["hub-bridge", "agent-hub-bridge"]
+    target_tags = allowed_service_tags
     matching: list[NativeServiceBinding] = []
 
     for sdir in sessions_dirs:
         try:
             for entry in os.listdir(sdir):
-                rec_file = os.path.join(sdir, entry, "session.json")
+                entry_dir = os.path.join(sdir, entry)
+                if not os.path.isdir(entry_dir) or os.path.islink(entry_dir):
+                    continue
+                rec_file = os.path.join(entry_dir, "session.json")
                 if os.path.isfile(rec_file) and not os.path.islink(rec_file):
                     try:
                         with open(rec_file, "r", encoding="utf-8") as f:
@@ -209,10 +224,16 @@ def validate_native_send_envelope(
 ) -> None:
     """Validate response provenance of native send against qualified own bridge sender.
 
-    Refuses anonymous (from.external=true) or mismatched senders with BridgeCapabilityGap.
+    Refuses anonymous (from.external=true), absent service binding, or mismatched senders
+    with BridgeCapabilityGap.
     """
     if not isinstance(native_msg, dict):
         raise BridgeCapabilityGap("Native send output is not a valid JSON envelope dict")
+
+    if service_binding is None:
+        raise BridgeCapabilityGap(
+            "Bridge own session binding is absent or unqualified (anonymous sender); external:false is not positive authentication"
+        )
 
     # 1. Workspace check (if workspace present in envelope)
     ws = native_msg.get("workspace")
@@ -223,25 +244,37 @@ def validate_native_send_envelope(
 
     # 2. From provenance check
     msg_from = native_msg.get("from")
-    if isinstance(msg_from, dict):
-        if msg_from.get("external") is True:
-            raise BridgeCapabilityGap(
-                "Native send envelope emitted external:true (anonymous sender). "
-                "Native recipients will be unable to reply per Rust reply_target contract."
-            )
+    if not isinstance(msg_from, dict):
+        raise BridgeCapabilityGap("Native send envelope missing 'from' object")
 
-        sender_tag = msg_from.get("tag")
-        sender_sid = msg_from.get("session_id")
+    if msg_from.get("external") is True:
+        raise BridgeCapabilityGap(
+            "Native send envelope emitted external:true (anonymous sender). "
+            "Native recipients will be unable to reply per Rust reply_target contract."
+        )
 
-        if service_binding:
-            if sender_tag and sender_tag != service_binding.tag:
-                raise BridgeCapabilityGap(
-                    f"Native send envelope sender tag '{sender_tag}' does not match bridge service '{service_binding.tag}'"
-                )
-            if sender_sid and str(sender_sid).lower() != str(service_binding.session_id).lower():
-                raise BridgeCapabilityGap(
-                    f"Native send envelope sender session '{sender_sid}' does not match bridge service '{service_binding.session_id}'"
-                )
+    sender_tag = msg_from.get("tag")
+    sender_sid = msg_from.get("session_id")
+
+    if not sender_tag or not sender_sid:
+        raise BridgeCapabilityGap(
+            "Native send envelope 'from' missing tag or session_id for positive authentication"
+        )
+
+    if sender_tag != service_binding.tag:
+        raise BridgeCapabilityGap(
+            f"Native send envelope sender tag '{sender_tag}' does not match bridge service '{service_binding.tag}'"
+        )
+    if str(sender_sid).lower() != str(service_binding.session_id).lower():
+        raise BridgeCapabilityGap(
+            f"Native send envelope sender session '{sender_sid}' does not match bridge service '{service_binding.session_id}'"
+        )
+    from_ws = msg_from.get("workspace")
+    if from_ws and canonicalize_workspace(str(from_ws)) != canonical_workspace:
+        raise BridgeCapabilityGap(
+            f"Native send envelope 'from.workspace' mismatch: {from_ws} != {canonical_workspace}"
+        )
+
 
 
 def validate_native_reply_provenance(
@@ -293,13 +326,23 @@ def validate_native_reply_provenance(
     # 4. Authoritative session record verification
     sessions_dirs: list[str] = []
     if runtime_dir and os.path.isdir(os.path.join(runtime_dir, "sessions")):
-        sessions_dirs.append(os.path.join(runtime_dir, "sessions"))
+        s_dir = os.path.join(runtime_dir, "sessions")
+        if not os.path.islink(s_dir):
+            sessions_dirs.append(s_dir)
     if state_dir and os.path.isdir(os.path.join(state_dir, "sessions")):
-        sessions_dirs.append(os.path.join(state_dir, "sessions"))
+        s_dir = os.path.join(state_dir, "sessions")
+        if not os.path.islink(s_dir):
+            sessions_dirs.append(s_dir)
+
+    if not sessions_dirs:
+        return False, "authoritative sessions directory unavailable (UNKNOWN); deny reply provenance"
 
     session_verified = False
     for sdir in sessions_dirs:
-        rec_file = os.path.join(sdir, str(replier_sid), "session.json")
+        entry_dir = os.path.join(sdir, str(replier_sid))
+        if os.path.islink(entry_dir) or not os.path.isdir(entry_dir):
+            continue
+        rec_file = os.path.join(entry_dir, "session.json")
         if os.path.isfile(rec_file) and not os.path.islink(rec_file):
             try:
                 with open(rec_file, "r", encoding="utf-8") as f:
@@ -315,7 +358,7 @@ def validate_native_reply_provenance(
             except Exception:
                 pass
 
-    if sessions_dirs and not session_verified:
+    if not session_verified:
         return False, f"replier session '{replier_sid}' is not recorded in authoritative session store"
 
     # 5. Addressing check: reply must be addressed to the bridge service tag
@@ -633,6 +676,24 @@ def main():
             sys.exit(0)
 
         elif sub == "deliver":
+            deliv_id = args[2] if len(args) > 2 else ""
+            log_path = os.environ.get("APLEXER_FAKE_DELIVER_LOG")
+            behavior = os.environ.get("APLEXER_FAKE_DELIVER_BEHAVIOR")
+            if log_path:
+                try:
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(f"deliver:{deliv_id}\\n")
+                except Exception:
+                    pass
+            if behavior == "timeout":
+                time.sleep(35)
+                sys.exit(0)
+            elif behavior == "exit_1":
+                sys.stderr.write("delivery failed (exit 1)\\n")
+                sys.exit(1)
+            elif behavior == "effect_then_crash":
+                sys.stderr.write("delivery crashed after effect\\n")
+                sys.exit(1)
             sys.exit(0)
 
     sys.exit(0)
