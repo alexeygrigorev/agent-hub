@@ -614,10 +614,64 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
     expect(listRes.status).toBe(200);
   });
 
-  it('8. Bounded Resumable Retention Cleanup via Maintenance Tick', async () => {
+  it('8. Bounded Resumable Retention Cleanup via Maintenance Tick and Public Maintenance Route', async () => {
+    // 1. Negative tests on public maintenance route POST /api/cron/retention:
+    // a. anonymous (no credentials) -> 401
+    const anonRes = await doFetch(new Request('http://example.com/api/cron/retention', {
+      method: 'POST'
+    }));
+    expect(anonRes.status).toBe(401);
+
+    // b. host bearer token -> 403
+    const hostRes = await doFetch(new Request('http://example.com/api/cron/retention', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer token_host_a' }
+    }));
+    expect(hostRes.status).toBe(403);
+
+    // c. agent bearer token -> 403
+    const agentRes = await doFetch(new Request('http://example.com/api/cron/retention', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer token_agent_1' }
+    }));
+    expect(agentRes.status).toBe(403);
+
+    // d. write-only bearer token -> 403
+    const writeOnlyRes = await doFetch(new Request('http://example.com/api/cron/retention', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer token_send_only' }
+    }));
+    expect(writeOnlyRes.status).toBe(403);
+
+    // e. admin session cookie without CSRF -> 403
+    let adminCookie = '';
     await runInDurableObject(stub, async (instance: Hub) => {
-      // Seed 250 expired messages
-      const past = Date.now() - 100000;
+      adminCookie = await createSessionCookie(instance.env, {
+        sub: 'admin-1',
+        email: 'admin@fake.local',
+        isAdmin: true,
+        csrfToken: 'valid-csrf-token',
+        exp: Math.floor(Date.now() / 1000) + 3600
+      });
+    });
+    const noCsrfRes = await doFetch(new Request('http://example.com/api/cron/retention', {
+      method: 'POST',
+      headers: { 'Cookie': adminCookie }
+    }));
+    expect(noCsrfRes.status).toBe(403);
+
+    // 2. Futureclock cannot purge valid messages (caller body.now inert):
+    // Seed 1 valid message expiring in 30 days and 250 expired messages
+    const now = Date.now();
+    const past = now - 100000;
+    const future = now + 30 * 24 * 3600 * 1000;
+    await runInDurableObject(stub, async (instance: Hub) => {
+      // Valid message with future expiration
+      instance.sql.exec(
+        "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES ('valid-msg-future', 'worker-1', 'worker-2', 'note', 'th', 'valid', 'valid-key-future', ?, ?)",
+        now, future
+      );
+      // 250 expired messages
       for (let i = 0; i < 250; i++) {
         instance.sql.exec(
           "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES (?, 'worker-1', 'worker-2', 'note', 'th', 'exp', ?, ?, ?)",
@@ -626,26 +680,66 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
       }
     });
 
-    // Trigger tick which processes a bounded batch (100) and arms resume alarm
-    const tickRes = await stub.fetch(new Request('http://example.com/internal/tick', {
-      method: 'POST'
+    // Attempt future-clock injection via /internal/tick body.now
+    const tickFutureRes = await stub.fetch(new Request('http://example.com/internal/tick', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ now: '2099-01-01T00:00:00Z' })
     }));
-    expect(tickRes.status).toBe(200);
+    expect(tickFutureRes.status).toBe(200);
 
-    // Verify bounded batch deletion (exactly 100 deleted, 150 remain)
+    // Verify bounded batch deletion (exactly 100 deleted, 150 expired messages remain)
+    // AND verify valid future message was NOT purged (body.now is inert)
     await runInDurableObject(stub, async (instance: Hub) => {
+      const validMsg = instance.sql.exec("SELECT id FROM messages WHERE id = 'valid-msg-future'").toArray();
+      expect(validMsg.length).toBe(1);
+
       const count1 = instance.sql.exec("SELECT count(*) as c FROM messages WHERE id LIKE 'exp-msg-%'").toArray()[0] as any;
       expect(count1.c).toBe(150);
+    });
 
-      // Verify alarm execution processes next batch (100 deleted, 50 remain)
-      await instance.alarm();
-      const count2 = instance.sql.exec("SELECT count(*) as c FROM messages WHERE id LIKE 'exp-msg-%'").toArray()[0] as any;
-      expect(count2.c).toBe(50);
+    // 3. Cold restart proof: simulate DO reconstruction from SQLite storage
+    await runInDurableObject(stub, async (instance: Hub) => {
+      // Reconstruct fresh Hub instance pointing to identical storage
+      const coldHub = new Hub((instance as any).ctx, instance.env);
 
-      // Verify alarm execution processes final batch (50 deleted, 0 remain)
-      await instance.alarm();
-      const count3 = instance.sql.exec("SELECT count(*) as c FROM messages WHERE id LIKE 'exp-msg-%'").toArray()[0] as any;
-      expect(count3.c).toBe(0);
+      // Verify state was persisted in SQLite across cold restart
+      const countBeforeAlarm = coldHub.sql.exec("SELECT count(*) as c FROM messages WHERE id LIKE 'exp-msg-%'").toArray()[0] as any;
+      expect(countBeforeAlarm.c).toBe(150);
+
+      // Trigger alarm on coldHub to process next batch (100 deleted, 50 remain)
+      await coldHub.alarm();
+      const countAfterFirstAlarm = coldHub.sql.exec("SELECT count(*) as c FROM messages WHERE id LIKE 'exp-msg-%'").toArray()[0] as any;
+      expect(countAfterFirstAlarm.c).toBe(50);
+
+      // Trigger final alarm on coldHub (50 deleted, 0 remain)
+      await coldHub.alarm();
+      const countAfterFinalAlarm = coldHub.sql.exec("SELECT count(*) as c FROM messages WHERE id LIKE 'exp-msg-%'").toArray()[0] as any;
+      expect(countAfterFinalAlarm.c).toBe(0);
+
+      // Valid message must still remain untouched
+      const validStillThere = coldHub.sql.exec("SELECT id FROM messages WHERE id = 'valid-msg-future'").toArray();
+      expect(validStillThere.length).toBe(1);
+    });
+
+    // 4. Authorized public maintenance route with admin session + valid CSRF
+    const adminMaintainRes = await doFetch(new Request('http://example.com/api/cron/retention', {
+      method: 'POST',
+      headers: {
+        'Cookie': adminCookie,
+        'X-CSRF-Token': 'valid-csrf-token',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ now: '2099-01-01T00:00:00Z' }) // caller body.now inert
+    }));
+    expect(adminMaintainRes.status).toBe(200);
+    const maintainData = await adminMaintainRes.json() as any;
+    expect(maintainData.status).toBe('ok');
+
+    // Valid message still remains
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const validMsg = instance.sql.exec("SELECT id FROM messages WHERE id = 'valid-msg-future'").toArray();
+      expect(validMsg.length).toBe(1);
     });
   });
 
@@ -714,25 +808,136 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
     expect(badInboxRes.status).toBe(403);
   });
 
-  it('10. Actors and Messages Listing Routes', async () => {
-    // GET /api/bus/actors
-    const actorsRes = await doFetch(new Request('http://example.com/api/bus/actors', {
-      method: 'GET',
-      headers: { 'Authorization': 'Bearer token_host_a' }
-    }));
-    expect(actorsRes.status).toBe(200);
-    const actors = await actorsRes.json() as string[];
-    expect(Array.isArray(actors)).toBe(true);
-    expect(actors).toContain('projA:worker-1');
-    expect(actors).toContain('machine:mach-A');
+  it('10. Actors and Messages Listing Routes: Scoped Authorization and Negative Proofs', async () => {
+    // Seed messages across projects:
+    // Message 1: projA (worker-1 <-> worker-2)
+    // Message 2: projB/C (worker-2 <-> worker-3)
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const now = Date.now();
+      instance.sql.exec(
+        "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES ('msg-w1-w2', 'worker-1', 'worker-2', 'note', 'th1', 'hello from w1', 'idemp-w1-w2', ?, ?)",
+        now - 2000, now + 86400000
+      );
+      instance.sql.exec(
+        "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES ('msg-w2-w3', 'worker-2', 'worker-3', 'note', 'th2', 'hello from w2', 'idemp-w2-w3', ?, ?)",
+        now - 1000, now + 86400000
+      );
+    });
 
-    // GET /api/bus/messages
-    const messagesRes = await doFetch(new Request('http://example.com/api/bus/messages', {
+    // --- GET /api/bus/actors ---
+    // A. Host A listing: scoped to host project/machine actors on mach-A
+    const hostActorsRes = await doFetch(new Request('http://example.com/api/bus/actors', {
       method: 'GET',
       headers: { 'Authorization': 'Bearer token_host_a' }
     }));
-    expect(messagesRes.status).toBe(200);
-    const messages = await messagesRes.json() as any[];
-    expect(Array.isArray(messages)).toBe(true);
+    expect(hostActorsRes.status).toBe(200);
+    const hostActors = await hostActorsRes.json() as string[];
+    expect(Array.isArray(hostActors)).toBe(true);
+    expect(hostActors).toContain('projA:worker-1');
+    expect(hostActors).toContain('machine:mach-A');
+    expect(hostActors).not.toContain('projB:worker-2');
+    expect(hostActors).not.toContain('machine:mach-B');
+    expect(hostActors).not.toContain('role:root');
+
+    // B. Negative proof: Agent 1 (worker-1) cannot retrieve all actors across projects
+    const agentActorsRes = await doFetch(new Request('http://example.com/api/bus/actors', {
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer token_agent_1' }
+    }));
+    expect(agentActorsRes.status).toBe(200);
+    const agentActors = await agentActorsRes.json() as string[];
+    expect(Array.isArray(agentActors)).toBe(true);
+    expect(agentActors).toContain('projA:worker-1');
+    expect(agentActors).not.toContain('projB:worker-2'); // Cross-project actor excluded
+    expect(agentActors).not.toContain('projC:worker-3'); // Cross-project actor excluded
+    expect(agentActors).not.toContain('machine:mach-A');
+    expect(agentActors).not.toContain('machine:mach-B');
+    expect(agentActors).not.toContain('role:root');
+
+    // C. Admin listing: all actors returned, but role:root remains denied / excluded
+    let adminCookie = '';
+    await runInDurableObject(stub, async (instance: Hub) => {
+      adminCookie = await createSessionCookie(instance.env, {
+        sub: 'admin-1',
+        email: 'admin@fake.local',
+        isAdmin: true,
+        csrfToken: 'admin-csrf',
+        exp: Math.floor(Date.now() / 1000) + 3600
+      });
+    });
+    const adminActorsRes = await doFetch(new Request('http://example.com/api/bus/actors', {
+      method: 'GET',
+      headers: { 'Cookie': adminCookie }
+    }));
+    expect(adminActorsRes.status).toBe(200);
+    const adminActors = await adminActorsRes.json() as string[];
+    expect(adminActors).toContain('projA:worker-1');
+    expect(adminActors).toContain('projB:worker-2');
+    expect(adminActors).toContain('machine:mach-A');
+    expect(adminActors).toContain('machine:mach-B');
+    expect(adminActors).not.toContain('role:root'); // role:root remains denied
+
+    // --- GET /api/bus/messages ---
+    // D. Negative proof: Agent 1 cannot retrieve actor2 (worker-2) messages
+    const badAgentMsgRes = await doFetch(new Request('http://example.com/api/bus/messages?actor=worker-2', {
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer token_agent_1' }
+    }));
+    expect(badAgentMsgRes.status).toBe(403);
+
+    // E. Negative proof: Agent 1 cannot retrieve role:root messages (role:root remains denied)
+    const rootAgentMsgRes = await doFetch(new Request('http://example.com/api/bus/messages?actor=role:root', {
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer token_agent_1' }
+    }));
+    expect(rootAgentMsgRes.status).toBe(403);
+
+    // F. Negative proof: Host A cannot retrieve actor on Host B (worker-2)
+    const badHostMsgRes = await doFetch(new Request('http://example.com/api/bus/messages?actor=worker-2', {
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer token_host_a' }
+    }));
+    expect(badHostMsgRes.status).toBe(403);
+
+    // G. Derive current principal binding: Agent 1 lists messages without ?actor=
+    // Scoped strictly to worker-1, does not leak worker-2 <-> worker-3 message
+    const agentSelfMsgRes = await doFetch(new Request('http://example.com/api/bus/messages', {
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer token_agent_1' }
+    }));
+    expect(agentSelfMsgRes.status).toBe(200);
+    const agentMessages = await agentSelfMsgRes.json() as any[];
+    expect(Array.isArray(agentMessages)).toBe(true);
+    expect(agentMessages.some((m: any) => m.id === 'msg-w1-w2')).toBe(true);
+    expect(agentMessages.some((m: any) => m.id === 'msg-w2-w3')).toBe(false);
+
+    // H. Host A lists messages without ?actor=
+    // Scoped to actors hosted on mach-A, does not leak worker-2 <-> worker-3 message
+    const hostMsgRes = await doFetch(new Request('http://example.com/api/bus/messages', {
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer token_host_a' }
+    }));
+    expect(hostMsgRes.status).toBe(200);
+    const hostMessages = await hostMsgRes.json() as any[];
+    expect(Array.isArray(hostMessages)).toBe(true);
+    expect(hostMessages.some((m: any) => m.id === 'msg-w1-w2')).toBe(true);
+    expect(hostMessages.some((m: any) => m.id === 'msg-w2-w3')).toBe(false);
+
+    // I. Admin queries messages
+    const adminMsgRes = await doFetch(new Request('http://example.com/api/bus/messages', {
+      method: 'GET',
+      headers: { 'Cookie': adminCookie }
+    }));
+    expect(adminMsgRes.status).toBe(200);
+    const adminMessages = await adminMsgRes.json() as any[];
+    expect(adminMessages.some((m: any) => m.id === 'msg-w1-w2')).toBe(true);
+    expect(adminMessages.some((m: any) => m.id === 'msg-w2-w3')).toBe(true);
+
+    // J. Admin query for role:root fails closed (role:root remains denied)
+    const adminRootMsgRes = await doFetch(new Request('http://example.com/api/bus/messages?actor=role:root', {
+      method: 'GET',
+      headers: { 'Cookie': adminCookie }
+    }));
+    expect(adminRootMsgRes.status).toBe(403);
   });
 });

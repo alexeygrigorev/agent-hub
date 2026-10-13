@@ -568,22 +568,39 @@ export class Hub extends DurableObject {
 
       if (path === '/internal/tick') {
         if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
-        let body: any = null;
-        try { body = await safeJson(request); } catch { }
-        const now = (body && body.now) ? new Date(body.now) : new Date();
-        const res = await this.scheduledTick(now);
+        // caller body.now inert: ignore any caller body and strictly use internal server clock
+        const res = await this.scheduledTick();
         return Response.json(res);
       }
 
       if (path === '/api/cron/retention') {
         if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+        const session = await getSession(this.env, request);
+        if (session) {
+          if (!session.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
+          if (!verifyCsrf(request, session)) return Response.json({ error: 'CSRF token missing or invalid' }, { status: 403 });
+        } else {
+          const authHeader = request.headers.get('Authorization');
+          if (!authHeader) {
+            return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } });
+          }
+          return Response.json({ error: 'forbidden', reason: 'admin_csrf_required' }, { status: 403 });
+        }
+
+        // Caller body.now inert: strictly use internal server clock
         const now = Date.now();
         const cleanup = this.busService.retentionCleanup(now, 100);
         if (cleanup.hasMore) {
           await this.ctx.storage.setAlarm(Date.now() + 1000);
         }
         const totalDeleted = (cleanup.messagesDeleted || 0) + (cleanup.claimsDeleted || 0);
-        return Response.json({ status: 'ok', deleted: totalDeleted, messagesDeleted: cleanup.messagesDeleted, claimsDeleted: cleanup.claimsDeleted, hasMore: cleanup.hasMore });
+        return Response.json({
+          status: 'ok',
+          deleted: totalDeleted,
+          messagesDeleted: cleanup.messagesDeleted,
+          claimsDeleted: cleanup.claimsDeleted,
+          hasMore: cleanup.hasMore
+        });
       }
 
       return new Response("Not found", { status: 404 });
@@ -592,8 +609,8 @@ export class Hub extends DurableObject {
     }
   }
 
-  async scheduledTick(overrideNow?: Date) {
-    const now = overrideNow || new Date();
+  async scheduledTick() {
+    const now = new Date();
     const cleanup = this.busService.retentionCleanup(now.getTime(), 100);
     if (cleanup.hasMore) {
       await this.ctx.storage.setAlarm(Date.now() + 1000);
@@ -755,7 +772,14 @@ export class Hub extends DurableObject {
       if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('admin')) {
         return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
       }
-      return Response.json(this.busService.getBusActors());
+      try {
+        return Response.json(this.busService.getBusActors(auth.caller!));
+      } catch (e: any) {
+        if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
+          return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
+        }
+        return Response.json({ error: 'Internal Server Error' }, { status: 500 });
+      }
     }
 
     // GET /api/bus/messages
@@ -766,7 +790,17 @@ export class Hub extends DurableObject {
         return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
       }
       const actor = url.searchParams.get('actor');
-      return Response.json(this.busService.getBusMessages(actor));
+      if (actor && actor.length > 128) {
+        return Response.json({ error: 'invalid_actor' }, { status: 400 });
+      }
+      try {
+        return Response.json(this.busService.getBusMessages(auth.caller!, actor));
+      } catch (e: any) {
+        if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
+          return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
+        }
+        return Response.json({ error: 'Internal Server Error' }, { status: 500 });
+      }
     }
 
     // POST /api/bus/send

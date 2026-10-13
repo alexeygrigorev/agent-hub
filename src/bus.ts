@@ -606,16 +606,146 @@ export class BusService {
     return { messagesDeleted, claimsDeleted, hasMore };
   }
 
-  getBusActors(): string[] {
-    const agentActors = this.sql.exec('SELECT DISTINCT project || ":" || tag as actor FROM agents').toArray().map((r: any) => r.actor);
-    const machineActors = this.sql.exec('SELECT "machine:" || id as actor FROM machines').toArray().map((r: any) => r.actor);
-    return Array.from(new Set([...agentActors, ...machineActors]));
+  getBusActors(caller?: CallerContext): string[] {
+    if (!caller) {
+      const agentActors = this.sql.exec('SELECT DISTINCT project || ":" || tag as actor FROM agents WHERE role != "root"').toArray().map((r: any) => r.actor);
+      const machineActors = this.sql.exec('SELECT "machine:" || id as actor FROM machines').toArray().map((r: any) => r.actor);
+      return Array.from(new Set([...agentActors, ...machineActors])).filter(a => a !== 'role:root');
+    }
+
+    if (caller.actor === 'role:root') {
+      throw new Error("missing_m4_root_authority: root role routing has no accepted root authority in M3");
+    }
+
+    if (caller.isAdmin) {
+      const agentActors = this.sql.exec('SELECT DISTINCT project || ":" || tag as actor FROM agents WHERE role != "root"').toArray().map((r: any) => r.actor);
+      const machineActors = this.sql.exec('SELECT "machine:" || id as actor FROM machines').toArray().map((r: any) => r.actor);
+      return Array.from(new Set([...agentActors, ...machineActors])).filter(a => a !== 'role:root');
+    }
+
+    if (caller.kind === 'host' || (!caller.actor && caller.machineId)) {
+      if (!caller.machineId) throw new Error("unauthorized");
+      const agentActors = this.sql.exec(
+        'SELECT DISTINCT project || ":" || tag as actor FROM agents WHERE machine_id = ? AND role != "root"',
+        caller.machineId
+      ).toArray().map((r: any) => r.actor);
+      const machineActor = `machine:${caller.machineId}`;
+      return Array.from(new Set([...agentActors, machineActor])).filter(a => a !== 'role:root');
+    }
+
+    if (caller.actor) {
+      let regProj: string | undefined;
+      let regTag: string | undefined;
+
+      if (caller.actor.includes(':')) {
+        const [cProj, cTag] = caller.actor.split(':');
+        const rows = this.sql.exec('SELECT project, tag FROM agents WHERE project = ? AND tag = ? AND role != "root"', cProj, cTag).toArray() as any[];
+        if (rows.length === 1) {
+          regProj = rows[0].project;
+          regTag = rows[0].tag;
+        }
+      } else {
+        const rows = this.sql.exec('SELECT project, tag FROM agents WHERE tag = ? AND role != "root"', caller.actor).toArray() as any[];
+        if (rows.length === 1) {
+          regProj = rows[0].project;
+          regTag = rows[0].tag;
+        }
+      }
+
+      if (regProj && regTag) {
+        return [`${regProj}:${regTag}`, regTag];
+      }
+      return [caller.actor];
+    }
+
+    throw new Error("unauthorized");
   }
 
-  getBusMessages(actor?: string | null): any[] {
-    if (actor) {
-      return this.sql.exec('SELECT * FROM messages WHERE to_actor = ? OR from_actor = ? ORDER BY created_at DESC LIMIT 100', actor, actor).toArray();
+  getBusMessages(caller?: CallerContext, actor?: string | null): any[] {
+    const now = Date.now();
+
+    if (!caller) {
+      if (actor) {
+        return this.sql.exec('SELECT * FROM messages WHERE (to_actor = ? OR from_actor = ?) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100', actor, actor).toArray();
+      }
+      return this.sql.exec('SELECT * FROM messages WHERE to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100').toArray();
     }
-    return this.sql.exec('SELECT * FROM messages ORDER BY created_at DESC LIMIT 100').toArray();
+
+    if (actor === 'role:root' || caller.actor === 'role:root') {
+      throw new Error("missing_m4_root_authority: root role routing has no accepted root authority in M3");
+    }
+
+    if (caller.isAdmin) {
+      if (actor) {
+        return this.sql.exec(
+          'SELECT * FROM messages WHERE (to_actor = ? OR from_actor = ?) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
+          actor, actor
+        ).toArray();
+      }
+      return this.sql.exec('SELECT * FROM messages WHERE to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100').toArray();
+    }
+
+    if (caller.actor) {
+      const effectiveActor = actor || caller.actor;
+      if (!this.isAuthorizedForActor(caller, effectiveActor, now)) {
+        throw new Error("unauthorized");
+      }
+
+      let aliases = [effectiveActor];
+      if (effectiveActor.includes(':')) {
+        const [cProj, cTag] = effectiveActor.split(':');
+        const rows = this.sql.exec('SELECT project, tag FROM agents WHERE project = ? AND tag = ? AND role != "root"', cProj, cTag).toArray() as any[];
+        if (rows.length === 1) aliases.push(rows[0].tag);
+      } else {
+        const rows = this.sql.exec('SELECT project, tag FROM agents WHERE tag = ? AND role != "root"', effectiveActor).toArray() as any[];
+        if (rows.length === 1) aliases.push(`${rows[0].project}:${rows[0].tag}`);
+      }
+      aliases = Array.from(new Set(aliases));
+
+      if (aliases.length === 1) {
+        return this.sql.exec(
+          'SELECT * FROM messages WHERE (to_actor = ? OR from_actor = ?) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
+          aliases[0], aliases[0]
+        ).toArray();
+      } else {
+        return this.sql.exec(
+          'SELECT * FROM messages WHERE (to_actor IN (?, ?) OR from_actor IN (?, ?)) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
+          aliases[0], aliases[1], aliases[0], aliases[1]
+        ).toArray();
+      }
+    }
+
+    if (caller.kind === 'host' || (!caller.actor && caller.machineId)) {
+      if (!caller.machineId) throw new Error("unauthorized");
+
+      if (actor) {
+        if (!this.isAuthorizedForActor(caller, actor, now)) {
+          throw new Error("unauthorized");
+        }
+        return this.sql.exec(
+          'SELECT * FROM messages WHERE (to_actor = ? OR from_actor = ?) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
+          actor, actor
+        ).toArray();
+      }
+
+      const machineActor = `machine:${caller.machineId}`;
+      const agentRows = this.sql.exec(
+        'SELECT project, tag FROM agents WHERE machine_id = ? AND role != "root"',
+        caller.machineId
+      ).toArray() as any[];
+      const allowedActors = new Set<string>([machineActor]);
+      for (const row of agentRows) {
+        allowedActors.add(`${row.project}:${row.tag}`);
+        allowedActors.add(row.tag);
+      }
+      const allowedList = Array.from(allowedActors);
+      if (allowedList.length === 0) return [];
+
+      const placeholders = allowedList.map(() => '?').join(',');
+      const sqlQuery = `SELECT * FROM messages WHERE (to_actor IN (${placeholders}) OR from_actor IN (${placeholders})) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100`;
+      return this.sql.exec(sqlQuery, ...allowedList, ...allowedList).toArray();
+    }
+
+    throw new Error("unauthorized");
   }
 }

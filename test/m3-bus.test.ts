@@ -322,4 +322,75 @@ describe('M3 Bus Service & Schema Tests', () => {
       expect(reply.thread_id).toBe(msg.thread_id);
     });
   });
+
+  it('13: getBusActors enforces caller scoping and excludes role:root', async () => {
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const bus = new BusService(instance.sql);
+
+      // Agent caller: only own authorized actor
+      const agentActors = bus.getBusActors({ actor: 'worker-1' });
+      expect(agentActors).toContain('projA:worker-1');
+      expect(agentActors).not.toContain('projB:worker-2');
+      expect(agentActors).not.toContain('machine:machine-A');
+      expect(agentActors).not.toContain('machine:machine-B');
+      expect(agentActors).not.toContain('role:root');
+
+      // Host caller: only machine and hosted agents
+      const hostActors = bus.getBusActors({ kind: 'host', machineId: 'machine-A' });
+      expect(hostActors).toContain('machine:machine-A');
+      expect(hostActors).toContain('projA:worker-1');
+      expect(hostActors).not.toContain('projB:worker-2');
+      expect(hostActors).not.toContain('machine:machine-B');
+      expect(hostActors).not.toContain('role:root');
+
+      // Admin caller: all actors, role:root excluded
+      const adminActors = bus.getBusActors({ isAdmin: true });
+      expect(adminActors).toContain('projA:worker-1');
+      expect(adminActors).toContain('projB:worker-2');
+      expect(adminActors).toContain('machine:machine-A');
+      expect(adminActors).toContain('machine:machine-B');
+      expect(adminActors).not.toContain('role:root');
+
+      // role:root caller: fails closed
+      expect(() => bus.getBusActors({ actor: 'role:root' })).toThrow(/missing_m4_root_authority/);
+    });
+  });
+
+  it('14: getBusMessages scopes to caller, derives principal binding, and denies cross-actor access', async () => {
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const bus = new BusService(instance.sql);
+      const now = Date.now();
+
+      instance.sql.exec(
+        "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES ('m-w1-w2', 'worker-1', 'worker-2', 'note', 'th1', 'b1', 'k1', ?, ?)",
+        now - 2000, now + 86400000
+      );
+      instance.sql.exec(
+        "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES ('m-w2-w1b', 'worker-2', 'worker-1b', 'note', 'th2', 'b2', 'k2', ?, ?)",
+        now - 1000, now + 86400000
+      );
+
+      // Agent worker-1 attempting to retrieve worker-2 messages -> unauthorized
+      expect(() => bus.getBusMessages({ actor: 'worker-1' }, 'worker-2')).toThrow('unauthorized');
+
+      // Agent worker-1 attempting to retrieve role:root messages -> fails closed
+      expect(() => bus.getBusMessages({ actor: 'worker-1' }, 'role:root')).toThrow(/missing_m4_root_authority/);
+
+      // Agent worker-1 retrieving without actor param derives worker-1 principal binding
+      const w1Msgs = bus.getBusMessages({ actor: 'worker-1' });
+      expect(w1Msgs.some((m: any) => m.id === 'm-w1-w2')).toBe(true);
+      expect(w1Msgs.some((m: any) => m.id === 'm-w2-w1b')).toBe(false);
+
+      // Host machine-A retrieving actor on machine-B -> unauthorized
+      expect(() => bus.getBusMessages({ kind: 'host', machineId: 'machine-A' }, 'worker-2')).toThrow('unauthorized');
+
+      // Host machine-A retrieving without actor param returns hosted agents (both worker-1 and worker-1b)
+      const hostMsgs = bus.getBusMessages({ kind: 'host', machineId: 'machine-A' });
+      expect(hostMsgs.some((m: any) => m.id === 'm-w1-w2')).toBe(true);
+      expect(hostMsgs.some((m: any) => m.id === 'm-w2-w1b')).toBe(true);
+
+      // Admin query for role:root fails closed
+      expect(() => bus.getBusMessages({ isAdmin: true }, 'role:root')).toThrow(/missing_m4_root_authority/);
+    });
+  });
 });
