@@ -381,8 +381,7 @@ export class JobsService {
       return;
     }
 
-    const slotStart = new Date(job.created_at);
-    const candidates = this.getCandidates(slotStart, attempts);
+    const candidates = this.getCandidates(now, attempts, job.idempotency_key || job.created_at);
     if (candidates.length === 0) {
       this.sql.exec("UPDATE jobs SET status = 'no-host', finished_at = ? WHERE id = ?", now.toISOString(), job.id);
       this.addHealthEvent('job', job.id as string, 'no-host', 'no candidates available', now.toISOString());
@@ -404,25 +403,43 @@ export class JobsService {
     }
   }
 
-  private getCandidates(slotStart: Date, excludeIds: string[]): Machine[] {
+  private getCandidates(now: Date, excludeIds: string[], slotKeyOrDate?: string | Date): Machine[] {
     const machines = this.sql.exec("SELECT * FROM machines").toArray() as unknown as Machine[];
     const candidates: Machine[] = [];
-    const nowMs = slotStart.getTime();
+    const nowMs = now.getTime();
+
+    // Immutable slot key used only for idempotency/backoff
+    let currentSlotTime = nowMs;
+    if (slotKeyOrDate) {
+      if (slotKeyOrDate instanceof Date) {
+        currentSlotTime = slotKeyOrDate.getTime();
+      } else if (typeof slotKeyOrDate === 'string') {
+        if (slotKeyOrDate.startsWith('root-run:')) {
+          const parsed = new Date(slotKeyOrDate.slice('root-run:'.length)).getTime();
+          if (Number.isFinite(parsed)) currentSlotTime = parsed;
+        } else {
+          const parsed = new Date(slotKeyOrDate).getTime();
+          if (Number.isFinite(parsed)) currentSlotTime = parsed;
+        }
+      }
+    }
 
     for (const m of machines) {
       if (excludeIds.includes(m.id)) continue;
       if (m.drained || m.state === 'drained') continue;
 
       if (!m.last_checkin_at) continue;
-      const checkinAge = nowMs - new Date(m.last_checkin_at).getTime();
+      const checkinTime = new Date(m.last_checkin_at).getTime();
+      if (!Number.isFinite(checkinTime)) continue;
+      const checkinAge = nowMs - checkinTime;
       if (checkinAge > 180000 || checkinAge < 0) continue;
 
       if (!this.checkHostRootRunCapability(m)) continue;
 
       if (!m.last_heartbeat) continue;
       let hb: any;
-      try { hb = JSON.parse(m.last_heartbeat); } catch { continue; }
-      if (!hb.gate || hb.gate.launch_allowed !== true) continue;
+      try { hb = typeof m.last_heartbeat === 'string' ? JSON.parse(m.last_heartbeat) : m.last_heartbeat; } catch { continue; }
+      if (!hb || !hb.gate || hb.gate.launch_allowed !== true) continue;
 
       // ROOT_HOSTS policy check
       if (this.rootHostsPolicy && this.rootHostsPolicy.length > 0) {
@@ -444,7 +461,7 @@ export class JobsService {
           if (!isNaN(parsed)) lastSlotTime = parsed;
         }
         const cooldownSlotTime = lastSlotTime + 30 * 60000;
-        if (nowMs <= cooldownSlotTime) continue;
+        if (currentSlotTime <= cooldownSlotTime) continue;
       }
 
       candidates.push(m);
@@ -499,17 +516,43 @@ export class JobsService {
     });
   }
 
+  private getLeaseNameForJob(job: any): string {
+    if (job.kind === 'root-run') return 'root';
+    if (job.kind === 'writer-run') {
+      let date = '';
+      try {
+        const p = typeof job.payload === 'string' ? JSON.parse(job.payload) : job.payload;
+        if (p?.date) date = p.date;
+      } catch {}
+      if (!date && job.idempotency_key && job.idempotency_key.startsWith('writer-run:')) {
+        date = job.idempotency_key.slice('writer-run:'.length);
+      }
+      return date ? `writer:${date}` : `job:${job.id}`;
+    }
+    if (job.kind === 'head-recovery') {
+      let project = 'default';
+      try {
+        const p = typeof job.payload === 'string' ? JSON.parse(job.payload) : job.payload;
+        if (p?.project) project = p.project;
+      } catch {}
+      return `head:${project}`;
+    }
+    if (job.lease_name) return job.lease_name;
+    return `job:${job.id}`;
+  }
+
   async claimJob(
     jobId: string,
     hostId: string,
     hostFreshGate: boolean,
     _simNow?: Date
-  ): Promise<{ error?: string, job_token?: string, lease_epoch?: number, deadline_at?: string }> {
-    if (!hostFreshGate) return { error: 'gate_failed' };
+  ): Promise<{ error?: string, reason?: string, job_token?: string, lease_epoch?: number, deadline_at?: string }> {
+    if (!hostFreshGate) return { error: 'gate_failed', reason: 'caller_gate_false' };
 
     // Real clock trusted capture; caller simNow is inert per contract
     const now = this.now();
     const nowIso = now.toISOString();
+    const nowMs = now.getTime();
 
     const token = this.generateToken();
     const tokenHash = await sha256(token);
@@ -522,28 +565,64 @@ export class JobsService {
         result = { error: 'conflict' }; return;
       }
       const exp = parseExpiryMs(job.offer_expires_at);
-      if (exp === null || exp <= now.getTime()) {
+      if (exp === null || !Number.isFinite(exp) || exp <= nowMs) {
         result = { error: 'conflict' }; return;
       }
 
-      const deadlineMs = new Date(job.deadline_at).getTime();
-      if (now.getTime() >= deadlineMs) {
+      const deadlineMs = parseExpiryMs(job.deadline_at) ?? new Date(job.deadline_at).getTime();
+      if (!Number.isFinite(deadlineMs) || deadlineMs <= nowMs) {
         result = { error: 'conflict' }; return;
       }
 
-      // Only kind 'root-run' can claim the root lease; custom/other kinds cannot
-      const leaseName = job.kind === 'root-run' ? 'root' : `job:${jobId}`;
+      // Server revalidate current machine checkin/drain/capability/heartbeat gate in same SQL transaction
+      const host = this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any;
+      if (!host) {
+        result = { error: 'gate_failed', reason: 'host_not_found' }; return;
+      }
+      if (host.drained === 1 || host.drained === true || host.state === 'drained') {
+        result = { error: 'gate_failed', reason: 'host_drained' }; return;
+      }
+      if (job.kind === 'root-run' && !this.checkHostRootRunCapability(host)) {
+        result = { error: 'gate_failed', reason: 'host_incapable' }; return;
+      }
+
+      if (!host.last_checkin_at) {
+        result = { error: 'gate_failed', reason: 'missing_checkin' }; return;
+      }
+      const checkinTime = new Date(host.last_checkin_at).getTime();
+      if (!Number.isFinite(checkinTime)) {
+        result = { error: 'gate_failed', reason: 'nonfinite_checkin' }; return;
+      }
+      const checkinAge = nowMs - checkinTime;
+      if (checkinAge < 0 || checkinAge > 180000) {
+        result = { error: 'gate_failed', reason: checkinAge < 0 ? 'future_checkin' : 'stale_checkin' }; return;
+      }
+
+      if (!host.last_heartbeat) {
+        result = { error: 'gate_failed', reason: 'missing_heartbeat' }; return;
+      }
+      let hb: any;
+      try {
+        hb = typeof host.last_heartbeat === 'string' ? JSON.parse(host.last_heartbeat) : host.last_heartbeat;
+      } catch {
+        result = { error: 'gate_failed', reason: 'invalid_heartbeat_json' }; return;
+      }
+      if (!hb || !hb.gate || hb.gate.launch_allowed !== true) {
+        result = { error: 'gate_failed', reason: 'gate_launch_not_allowed' }; return;
+      }
+
+      const leaseName = this.getLeaseNameForJob(job);
       this.sql.exec("INSERT OR IGNORE INTO leases (name, epoch) VALUES (?, 0)", leaseName);
 
       const currentLease = this.sql.exec("SELECT * FROM leases WHERE name = ?", leaseName).toArray()[0] as any;
       if (currentLease && currentLease.holder_job_id) {
-        if (!isLeaseExpired(currentLease.expires_at, now.getTime())) {
+        if (!isLeaseExpired(currentLease.expires_at, nowMs)) {
           result = { error: 'conflict' };
           return;
         }
       }
 
-      const leaseExpiresMs = Math.min(now.getTime() + 20 * 60000, deadlineMs);
+      const leaseExpiresMs = Math.min(nowMs + 20 * 60000, deadlineMs);
       const currentEpoch = currentLease ? (currentLease.epoch ?? 0) : 0;
       const jobActor = job.kind === 'root-run' ? 'role:root' : (job.actor || 'role:worker');
 
@@ -578,7 +657,9 @@ export class JobsService {
       result = { job_token: token, lease_epoch: newEpoch, deadline_at: job.deadline_at };
     });
 
-    this.scheduleAlarm();
+    if (!result?.error) {
+      this.scheduleAlarm();
+    }
 
     return result;
   }
@@ -612,7 +693,7 @@ export class JobsService {
       ).toArray()[0] as any;
       if (!cred || (cred.revoked_at && cred.revoked_at.trim().length > 0)) return;
 
-      const leaseName = job.kind === 'root-run' ? 'root' : `job:${jobId}`;
+      const leaseName = this.getLeaseNameForJob(job);
       const lease = this.sql.exec("SELECT * FROM leases WHERE name = ?", leaseName).toArray()[0] as any;
       if (!lease || lease.epoch !== epoch || lease.holder_job_id !== jobId) return;
 
@@ -625,37 +706,8 @@ export class JobsService {
   private resolveLeaseForJob(jobId: string, job: any): any {
     const direct = this.sql.exec("SELECT * FROM leases WHERE holder_job_id = ?", jobId).toArray()[0] as any;
     if (direct) return direct;
-
-    let leaseName: string | null = null;
-    if (job.kind === 'root-run') {
-      leaseName = 'root';
-    } else if (job.kind === 'writer-run') {
-      let date = '';
-      try {
-        const p = typeof job.payload === 'string' ? JSON.parse(job.payload) : job.payload;
-        if (p?.date) date = p.date;
-      } catch {}
-      if (!date && job.idempotency_key && job.idempotency_key.startsWith('writer-run:')) {
-        date = job.idempotency_key.slice('writer-run:'.length);
-      }
-      if (date) leaseName = `writer:${date}`;
-    } else if (job.kind === 'head-recovery') {
-      let project = 'default';
-      try {
-        const p = typeof job.payload === 'string' ? JSON.parse(job.payload) : job.payload;
-        if (p?.project) project = p.project;
-      } catch {}
-      leaseName = `head:${project}`;
-    } else if (job.lease_name) {
-      leaseName = job.lease_name;
-    } else {
-      leaseName = `job:${jobId}`;
-    }
-
-    if (leaseName) {
-      return this.sql.exec("SELECT * FROM leases WHERE name = ?", leaseName).toArray()[0] as any;
-    }
-    return null;
+    const leaseName = this.getLeaseNameForJob(job);
+    return this.sql.exec("SELECT * FROM leases WHERE name = ?", leaseName).toArray()[0] as any;
   }
 
   async startJob(

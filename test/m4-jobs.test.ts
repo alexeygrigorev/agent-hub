@@ -209,8 +209,9 @@ describe('M4 Scheduler Contract and Durability Tests', () => {
       expect(job1.status).toBe('offered');
       const firstHost = job1.offer_host_id;
 
-      // 121 seconds later: offer 1 expires
+      // 121 seconds later: offer 1 expires (machines stay fresh via regular check-in)
       nowMs += 121 * 1000;
+      sql.exec("UPDATE machines SET last_checkin_at = ?", new Date(nowMs).toISOString());
       service.processAlarms();
 
       const job2 = (sql.exec("SELECT * FROM jobs WHERE id = ?", job1.id).toArray() as any[])[0];
@@ -219,6 +220,7 @@ describe('M4 Scheduler Contract and Durability Tests', () => {
 
       // 121 seconds later: offer 2 expires
       nowMs += 121 * 1000;
+      sql.exec("UPDATE machines SET last_checkin_at = ?", new Date(nowMs).toISOString());
       service.processAlarms();
 
       const job3 = (sql.exec("SELECT * FROM jobs WHERE id = ?", job1.id).toArray() as any[])[0];
@@ -599,6 +601,256 @@ describe('M4 Scheduler Contract and Durability Tests', () => {
       const lease = (sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray() as any[])[0];
       expect(lease.epoch).toBe(0);
       expect(lease.holder_job_id).toBeNull();
+    });
+  });
+
+  it('fallback new checkin: host checking in after initial slot is offered on retry at t+121s', async () => {
+    const id = (env as any).HUB.idFromName("test-fallback-new-checkin");
+    const stub = (env as any).HUB.get(id);
+
+    await (runInDurableObject as any)(stub, async (instance: any) => {
+      const sql = instance.ctx.storage.sql;
+      let nowMs = new Date('2026-10-11T12:00:00Z').getTime();
+
+      const service = new JobsService(sql, instance.ctx, {
+        now: () => new Date(nowMs),
+        getRandomValues: createRng(1200),
+      });
+
+      // host-1 registered and checked in at slot creation t=0
+      sql.exec(
+        "INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "host-initial", "hi", "hi",
+        new Date(nowMs).toISOString(), new Date(nowMs).toISOString(),
+        JSON.stringify({ gate: { launch_allowed: true, reason: "ok" } }), 0,
+        JSON.stringify({ jobs: ["root-run"] })
+      );
+
+      service.tickRootSlot(new Date(nowMs).toISOString());
+      const job1 = (sql.exec("SELECT * FROM jobs WHERE kind = 'root-run'").toArray() as any[])[0];
+      expect(job1.status).toBe('offered');
+      expect(job1.offer_host_id).toBe('host-initial');
+
+      // At t+10s: host-fallback checks in for the first time
+      const host2CheckinMs = nowMs + 10 * 1000;
+      sql.exec(
+        "INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "host-fallback", "hf", "hf",
+        new Date(host2CheckinMs).toISOString(), new Date(host2CheckinMs).toISOString(),
+        JSON.stringify({ gate: { launch_allowed: true, reason: "ok" } }), 0,
+        JSON.stringify({ jobs: ["root-run"] })
+      );
+
+      // At t+121s: offer 1 expires; tryOfferNext evaluates candidates against current server clock
+      // host-fallback has age 121s - 10s = 111s (fresh, positive age)
+      nowMs += 121 * 1000;
+      service.processAlarms();
+
+      const job2 = (sql.exec("SELECT * FROM jobs WHERE id = ?", job1.id).toArray() as any[])[0];
+      expect(job2.status).toBe('offered');
+      expect(job2.offer_host_id).toBe('host-fallback');
+    });
+  });
+
+  it('claimJob regression: server revalidation in same SQL transaction prevents unqualified mutations with exactly zero effects', async () => {
+    const id = (env as any).HUB.idFromName("test-claim-server-revalidation");
+    const stub = (env as any).HUB.get(id);
+
+    await (runInDurableObject as any)(stub, async (instance: any) => {
+      const sql = instance.ctx.storage.sql;
+      const nowMs = new Date('2026-10-11T12:00:00Z').getTime();
+
+      const service = new JobsService(sql, instance.ctx, {
+        now: () => new Date(nowMs),
+        getRandomValues: createRng(1300),
+      });
+
+      sql.exec(
+        "INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "host-gate-test", "hgt", "hgt",
+        new Date(nowMs).toISOString(), new Date(nowMs).toISOString(),
+        JSON.stringify({ gate: { launch_allowed: true, reason: "ok" } }), 0,
+        JSON.stringify({ jobs: ["root-run"] })
+      );
+
+      service.tickRootSlot(new Date(nowMs).toISOString());
+      const job = (sql.exec("SELECT * FROM jobs WHERE kind = 'root-run'").toArray() as any[])[0];
+      expect(job.status).toBe('offered');
+      expect(job.offer_host_id).toBe('host-gate-test');
+
+      const assertZeroEffects = () => {
+        const lease = (sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray() as any[])[0];
+        expect(lease?.epoch ?? 0).toBe(0);
+        expect(lease?.holder_job_id ?? null).toBeNull();
+        const currentJob = (sql.exec("SELECT * FROM jobs WHERE id = ?", job.id).toArray() as any[])[0];
+        expect(currentJob.status).toBe('offered');
+        expect(currentJob.claim_token_hash).toBeNull();
+        const creds = sql.exec("SELECT COUNT(*) as c FROM credentials WHERE subject = ?", job.id).toArray() as any[];
+        expect(creds[0].c).toBe(0);
+      };
+
+      // 1. False caller flag conservatively denies
+      const resFalseCaller = await service.claimJob(job.id, "host-gate-test", false);
+      expect(resFalseCaller.error).toBe('gate_failed');
+      assertZeroEffects();
+
+      // 2. Drained host: true caller flag cannot qualify drained host
+      sql.exec("UPDATE machines SET drained = 1 WHERE id = 'host-gate-test'");
+      const resDrained = await service.claimJob(job.id, "host-gate-test", true);
+      expect(resDrained.error).toBe('gate_failed');
+      assertZeroEffects();
+      sql.exec("UPDATE machines SET drained = 0 WHERE id = 'host-gate-test'");
+
+      // 3. Stale checkin > 180s: true caller flag cannot qualify stale host
+      sql.exec("UPDATE machines SET last_checkin_at = ? WHERE id = 'host-gate-test'", new Date(nowMs - 200000).toISOString());
+      const resStale = await service.claimJob(job.id, "host-gate-test", true);
+      expect(resStale.error).toBe('gate_failed');
+      assertZeroEffects();
+
+      // 4. Future checkin (negative age): true caller flag cannot qualify future checkin
+      sql.exec("UPDATE machines SET last_checkin_at = ? WHERE id = 'host-gate-test'", new Date(nowMs + 60000).toISOString());
+      const resFuture = await service.claimJob(job.id, "host-gate-test", true);
+      expect(resFuture.error).toBe('gate_failed');
+      assertZeroEffects();
+
+      // 5. Nonfinite checkin: true caller flag cannot qualify invalid checkin timestamp
+      sql.exec("UPDATE machines SET last_checkin_at = 'not-a-date' WHERE id = 'host-gate-test'");
+      const resNonfinite = await service.claimJob(job.id, "host-gate-test", true);
+      expect(resNonfinite.error).toBe('gate_failed');
+      assertZeroEffects();
+
+      // 6. Unsupported host: lacks root-run capability
+      sql.exec(
+        "UPDATE machines SET last_checkin_at = ?, capabilities = ? WHERE id = 'host-gate-test'",
+        new Date(nowMs).toISOString(), JSON.stringify({ jobs: ["writer-run"] })
+      );
+      const resUnsupported = await service.claimJob(job.id, "host-gate-test", true);
+      expect(resUnsupported.error).toBe('gate_failed');
+      assertZeroEffects();
+
+      // 7. Gate false in stored heartbeat
+      sql.exec(
+        "UPDATE machines SET capabilities = ?, last_heartbeat = ? WHERE id = 'host-gate-test'",
+        JSON.stringify({ jobs: ["root-run"] }),
+        JSON.stringify({ gate: { launch_allowed: false, reason: "quota exhausted" } })
+      );
+      const resGateNotAllowed = await service.claimJob(job.id, "host-gate-test", true);
+      expect(resGateNotAllowed.error).toBe('gate_failed');
+      assertZeroEffects();
+
+      // 8. Stale/expired offer cannot qualify
+      sql.exec(
+        "UPDATE machines SET last_heartbeat = ? WHERE id = 'host-gate-test'",
+        JSON.stringify({ gate: { launch_allowed: true, reason: "ok" } })
+      );
+      sql.exec("UPDATE jobs SET offer_expires_at = ? WHERE id = ?", new Date(nowMs - 1000).toISOString(), job.id);
+      const resOfferExpired = await service.claimJob(job.id, "host-gate-test", true);
+      expect(resOfferExpired.error).toBe('conflict');
+      assertZeroEffects();
+
+      // 9. Past deadline cannot qualify
+      sql.exec("UPDATE jobs SET offer_expires_at = ?, deadline_at = ? WHERE id = ?",
+        new Date(nowMs + 60000).toISOString(), new Date(nowMs - 1000).toISOString(), job.id
+      );
+      const resDeadlineExpired = await service.claimJob(job.id, "host-gate-test", true);
+      expect(resDeadlineExpired.error).toBe('conflict');
+      assertZeroEffects();
+
+      // 10. Legitimate fully qualified claim succeeds and mutates state
+      sql.exec("UPDATE jobs SET deadline_at = ? WHERE id = ?", new Date(nowMs + 25 * 60000).toISOString(), job.id);
+      const validClaim = await service.claimJob(job.id, "host-gate-test", true);
+      expect(validClaim.error).toBeUndefined();
+      expect(validClaim.lease_epoch).toBe(1);
+      expect(validClaim.job_token).toBeDefined();
+
+      const claimedLease = (sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray() as any[])[0];
+      expect(claimedLease.epoch).toBe(1);
+      expect(claimedLease.holder_job_id).toBe(job.id);
+      expect(claimedLease.holder_host_id).toBe("host-gate-test");
+
+      const claimedJob = (sql.exec("SELECT * FROM jobs WHERE id = ?", job.id).toArray() as any[])[0];
+      expect(claimedJob.status).toBe('claimed');
+      expect(claimedJob.lease_epoch).toBe(1);
+
+      const cred = (sql.exec("SELECT * FROM credentials WHERE subject = ?", job.id).toArray() as any[])[0];
+      expect(cred).toBeDefined();
+      expect(JSON.parse(cred.scopes)).toContain('lease:root');
+    });
+  });
+
+  it('lease identities: preserves correct root-run, job:<id>, writer and head lease identities', async () => {
+    const id = (env as any).HUB.idFromName("test-lease-identities");
+    const stub = (env as any).HUB.get(id);
+
+    await (runInDurableObject as any)(stub, async (instance: any) => {
+      const sql = instance.ctx.storage.sql;
+      const nowMs = new Date('2026-10-11T12:00:00Z').getTime();
+
+      const service = new JobsService(sql, instance.ctx, {
+        now: () => new Date(nowMs),
+        getRandomValues: createRng(1400),
+      });
+
+      sql.exec(
+        "INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "host-ident", "h-id", "h-id",
+        new Date(nowMs).toISOString(), new Date(nowMs).toISOString(),
+        JSON.stringify({ gate: { launch_allowed: true, reason: "ok" } }), 0,
+        JSON.stringify({ jobs: ["root-run", "writer-run", "head-recovery"] })
+      );
+
+      // 1. Root run job -> lease name 'root'
+      service.tickRootSlot(new Date(nowMs).toISOString());
+      const rootJob = (sql.exec("SELECT * FROM jobs WHERE kind = 'root-run'").toArray() as any[])[0];
+      const rootClaim = await service.claimJob(rootJob.id, "host-ident", true);
+      expect(rootClaim.error).toBeUndefined();
+      const rootLease = (sql.exec("SELECT * FROM leases WHERE holder_job_id = ?", rootJob.id).toArray() as any[])[0];
+      expect(rootLease.name).toBe('root');
+
+      // 2. Writer job -> lease name 'writer:<date>'
+      const writerJobId = "w-job-1";
+      sql.exec(
+        "INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, offer_host_id, offer_machine_id, offer_expires_at, actor) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        writerJobId, "writer-run", "writer-run:2026-10-12", JSON.stringify({ date: "2026-10-12" }),
+        "offered", new Date(nowMs).toISOString(), new Date(nowMs + 25 * 60000).toISOString(),
+        "host-ident", "host-ident", new Date(nowMs + 120000).toISOString(), "system"
+      );
+      const writerClaim = await service.claimJob(writerJobId, "host-ident", true);
+      expect(writerClaim.error).toBeUndefined();
+      const writerLease = (sql.exec("SELECT * FROM leases WHERE holder_job_id = ?", writerJobId).toArray() as any[])[0];
+      expect(writerLease.name).toBe('writer:2026-10-12');
+      const writerValid = await service.validateEpoch(writerJobId, writerClaim.job_token!, writerClaim.lease_epoch!);
+      expect(writerValid).toBe(true);
+
+      // 3. Head recovery job -> lease name 'head:<project>'
+      const headJobId = "h-job-1";
+      sql.exec(
+        "INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, offer_host_id, offer_machine_id, offer_expires_at, actor) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        headJobId, "head-recovery", "head-rec:core", JSON.stringify({ project: "core" }),
+        "offered", new Date(nowMs).toISOString(), new Date(nowMs + 25 * 60000).toISOString(),
+        "host-ident", "host-ident", new Date(nowMs + 120000).toISOString(), "role:principal"
+      );
+      const headClaim = await service.claimJob(headJobId, "host-ident", true);
+      expect(headClaim.error).toBeUndefined();
+      const headLease = (sql.exec("SELECT * FROM leases WHERE holder_job_id = ?", headJobId).toArray() as any[])[0];
+      expect(headLease.name).toBe('head:core');
+      const headValid = await service.validateEpoch(headJobId, headClaim.job_token!, headClaim.lease_epoch!);
+      expect(headValid).toBe(true);
+
+      // 4. Custom job -> lease name 'job:<id>'
+      const customJobId = "c-job-1";
+      sql.exec(
+        "INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, offer_host_id, offer_machine_id, offer_expires_at, actor) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        customJobId, "custom", "custom-1", "{}",
+        "offered", new Date(nowMs).toISOString(), new Date(nowMs + 25 * 60000).toISOString(),
+        "host-ident", "host-ident", new Date(nowMs + 120000).toISOString(), "role:worker"
+      );
+      const customClaim = await service.claimJob(customJobId, "host-ident", true);
+      expect(customClaim.error).toBeUndefined();
+      const customLease = (sql.exec("SELECT * FROM leases WHERE holder_job_id = ?", customJobId).toArray() as any[])[0];
+      expect(customLease.name).toBe(`job:${customJobId}`);
+      const customValid = await service.validateEpoch(customJobId, customClaim.job_token!, customClaim.lease_epoch!);
+      expect(customValid).toBe(true);
     });
   });
 });
