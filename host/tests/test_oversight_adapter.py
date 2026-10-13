@@ -81,13 +81,23 @@ from agent_hub_host.oversight_adapter import (
     AdapterError,
     AdapterExecutionResult,
     AdapterTransport,
+    AuthorityQualificationResult,
     AuthorityResolverProtocol,
     BindingProviderProtocol,
+    DefaultDenyDependencyCompletionVerifier,
     DefaultDenyReceiptVerifier,
+    DependencyCompletionVerifierProtocol,
+    EXACT_TUPLE_BOUNDARY_FIELDS,
     NativeGuardCheckResult,
     NativeGuardInterface,
     ObservationProviderProtocol,
     OversightAdapter,
+    QUALIFICATION_STATUS_DENIED,
+    QUALIFICATION_STATUS_HELD,
+    QUALIFICATION_STATUS_OFFLINE_REFERENCE,
+    QUALIFICATION_STATUS_QUALIFIED,
+    QUALIFICATION_STATUS_UNKNOWN,
+    REQUIRED_INDEPENDENT_PROVIDERS,
     ReceiptVerifierProtocol,
     StandardAuthorityResolver,
     TransportRouteCallbacks,
@@ -2462,11 +2472,11 @@ class TestOversightAdapter(unittest.TestCase):
     # -------------------------------------------------------------------------
 
     def test_explicit_trusted_completed_dependency_seam(self) -> None:
-        """Completed dependencies seam only allows dispatch if actual declared current inputs substantiate."""
+        """Raw completed_obligations sets cannot authorize dependencies; dependency-bearing positives assert HELD."""
         dep_grant = dataclasses.replace(self.grant, dependencies=("dep-a", "dep-b"))
         resolver = StandardAuthorityResolver(known_grants={(dep_grant.task_id, dep_grant.revision): dep_grant})
 
-        # 1. Clean positive: declared completed_obligations substantiate all dependencies
+        # 1. Legacy positive changed to assert HELD: raw completed_obligations set cannot authorize dependencies
         cb_count = 0
         def cb(req: TransportSendRequest) -> Dict[str, Any]:
             nonlocal cb_count
@@ -2489,8 +2499,10 @@ class TestOversightAdapter(unittest.TestCase):
             transport_callbacks=tb,
             completed_obligations={"dep-a", "dep-b"},
         )
-        self.assertTrue(res.dispatch_sent)
-        self.assertEqual(cb_count, 1)
+        self.assertFalse(res.dispatch_sent)
+        self.assertFalse(res.decision_made)
+        self.assertEqual(cb_count, 0)
+        self.assertIn("held", res.refusal_reason.lower())
 
         # 2. Negative: completed_obligations missing dep-b
         cb_count = 0
@@ -2504,7 +2516,9 @@ class TestOversightAdapter(unittest.TestCase):
             completed_obligations={"dep-a"},
         )
         self.assertFalse(res2.dispatch_sent)
+        self.assertFalse(res2.decision_made)
         self.assertEqual(cb_count, 0)
+        self.assertIn("held", res2.refusal_reason.lower())
 
         # 3. Negative: completed_obligations is None (safest conservative denial)
         cb_count = 0
@@ -2518,7 +2532,9 @@ class TestOversightAdapter(unittest.TestCase):
             completed_obligations=None,
         )
         self.assertFalse(res3.dispatch_sent)
+        self.assertFalse(res3.decision_made)
         self.assertEqual(cb_count, 0)
+        self.assertIn("held", res3.refusal_reason.lower())
 
     # -------------------------------------------------------------------------
     # 56. Table-driven boundary matrix of protected states across all lifecycle points
@@ -2675,6 +2691,548 @@ class TestOversightAdapter(unittest.TestCase):
             "SELECT COUNT(*) FROM adapter_receipt_digests WHERE intervention_id = ?",
             (intervention_id,),
         ).fetchone()[0], 0)
+
+    # -------------------------------------------------------------------------
+    # 57. Qualification seam and missing provider names readable
+    # -------------------------------------------------------------------------
+
+    def test_source_only_missing_provider_names_readable(self) -> None:
+        """Required independent providers and verification boundary fields have readable names and default deny."""
+        # 1. Names are readable strings
+        self.assertIsInstance(REQUIRED_INDEPENDENT_PROVIDERS, tuple)
+        self.assertEqual(len(REQUIRED_INDEPENDENT_PROVIDERS), 2)
+        self.assertIn("authenticated current task/custody/revision authority resolver", REQUIRED_INDEPENDENT_PROVIDERS)
+        self.assertIn("independent current exactbound dependency-completion verifier", REQUIRED_INDEPENDENT_PROVIDERS)
+
+        self.assertIsInstance(EXACT_TUPLE_BOUNDARY_FIELDS, tuple)
+        expected_fields = (
+            "task_id", "revision", "owner_tag", "workspace", "session_id",
+            "generation", "custody", "source_id", "source_digest", "currentness"
+        )
+        for field in expected_fields:
+            self.assertIn(field, EXACT_TUPLE_BOUNDARY_FIELDS)
+
+        # 2. Qualify authority on clean grant with StandardAuthorityResolver
+        qual = self.adapter.qualify_authority(
+            raw_task_data=self.grant,
+            authority_resolver=self.authority_resolver,
+        )
+        self.assertFalse(qual.is_qualified)
+        self.assertEqual(qual.status, QUALIFICATION_STATUS_OFFLINE_REFERENCE)
+        self.assertIn("StandardAuthorityResolver", qual.reason)
+        self.assertIn("offline reference seam only", qual.reason)
+        self.assertEqual(qual.missing_providers, REQUIRED_INDEPENDENT_PROVIDERS)
+        self.assertEqual(qual.verification_boundary, EXACT_TUPLE_BOUNDARY_FIELDS)
+        self.assertEqual(qual.dependency_status, "NOT_APPLICABLE")
+        self.assertFalse(qual.details["production_qualified"])
+
+        # 3. Qualify authority on dependency-bearing grant
+        dep_grant = dataclasses.replace(self.grant, dependencies=("dep-x",))
+        self.authority_resolver.register_grant(dep_grant)
+        qual_dep = self.adapter.qualify_authority(
+            raw_task_data=dep_grant,
+            authority_resolver=self.authority_resolver,
+        )
+        self.assertFalse(qual_dep.is_qualified)
+        self.assertEqual(qual_dep.status, QUALIFICATION_STATUS_HELD)
+        self.assertEqual(qual_dep.dependency_status, QUALIFICATION_STATUS_HELD)
+        self.assertIn("dep-x", qual_dep.reason)
+
+    # -------------------------------------------------------------------------
+    # 58. Empty or unknown semantic authority: no readiness, no send, no stage advancement
+    # -------------------------------------------------------------------------
+
+    def test_empty_or_unknown_semantic_authority_no_readiness_or_stage_advancement(self) -> None:
+        """Empty or unknown task authority produces zero decisions, zero sends, and zero ledger stage advancements."""
+        audit_count_before = self.ledger._conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
+        intv_count_before = self.ledger._conn.execute("SELECT COUNT(*) FROM interventions").fetchone()[0]
+        outbox_count_before = self.ledger._conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+
+        for unknown_input in [
+            {},
+            {"task_id": "unregistered-id", "revision": 1, "status": "ready"},
+            "plain string input",
+            None,
+        ]:
+            with self.subTest(input=unknown_input):
+                res = self.adapter.evaluate_and_dispatch(
+                    raw_task_data=unknown_input,
+                    authority_resolver=self.authority_resolver,
+                    binding_provider=self.binding_provider,
+                    observation_provider=self.observation_provider,
+                    native_guard=self.native_guard,
+                    transport_callbacks=self.transport_callbacks,
+                )
+                self.assertFalse(res.decision_made)
+                self.assertFalse(res.dispatch_sent)
+                self.assertFalse(res.dispatch_attempted)
+                self.assertIn("Authority resolution failed", res.refusal_reason or "")
+
+        # Verify zero ledger stage advancement / zero mutation
+        self.assertEqual(self.ledger._conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0], audit_count_before)
+        self.assertEqual(self.ledger._conn.execute("SELECT COUNT(*) FROM interventions").fetchone()[0], intv_count_before)
+        self.assertEqual(self.ledger._conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], outbox_count_before)
+
+    # -------------------------------------------------------------------------
+    # 59. Authenticated transport ACK or caller completion flags do not qualify readiness or dependencies
+    # -------------------------------------------------------------------------
+
+    def test_authenticated_transport_ack_or_caller_completion_flags_do_not_qualify_readiness_or_deps(self) -> None:
+        """Transport ACKs and caller flags (verified:true, completed:true, ActionOutcome) cannot qualify authority."""
+        # 1. Transport ACK payload passed as raw task data
+        ack_payload = {
+            "kind": "task_ack",
+            "sender_id": "c9a4f1f9-0368-431c-ba0d-bc46184f5ff2",
+            "recipient_id": "21efdd28-d963-49c7-a8eb-80ba42755854",
+            "body": {"stage": "scope_grant", "verified": True, "dependencies_satisfied": True},
+        }
+        res = self.adapter.evaluate_and_dispatch(
+            raw_task_data=ack_payload,
+            authority_resolver=self.authority_resolver,
+            binding_provider=self.binding_provider,
+            observation_provider=self.observation_provider,
+            native_guard=self.native_guard,
+            transport_callbacks=self.transport_callbacks,
+        )
+        self.assertFalse(res.decision_made)
+        self.assertFalse(res.dispatch_sent)
+
+        # 2. Caller claims verified:true, ActionOutcome:completed, status:ready on dependency-bearing task
+        dep_grant = dataclasses.replace(
+            self.grant,
+            dependencies=("dep-1",),
+            raw_metadata={"verified": True, "ActionOutcome": "completed", "completed": True},
+            has_owner_ack=True,
+        )
+        self.authority_resolver.register_grant(dep_grant)
+        res2 = self.adapter.evaluate_and_dispatch(
+            raw_task_data=dep_grant,
+            authority_resolver=self.authority_resolver,
+            binding_provider=self.binding_provider,
+            observation_provider=self.observation_provider,
+            native_guard=self.native_guard,
+            transport_callbacks=self.transport_callbacks,
+            completed_obligations={"dep-1"},
+        )
+        self.assertFalse(res2.decision_made)
+        self.assertFalse(res2.dispatch_sent)
+        self.assertIn("held", res2.refusal_reason.lower())
+
+    # -------------------------------------------------------------------------
+    # 60. Plain completed sets cannot unblock deps at decision, guard, pre-send, or receipt
+    # -------------------------------------------------------------------------
+
+    def test_plain_completed_sets_cannot_unblock_deps_at_decision_guard_presend_receipt(self) -> None:
+        """Plain completed_obligations sets cannot unblock dependencies at any lifecycle point."""
+        dep_grant = dataclasses.replace(self.grant, dependencies=("dep-required",))
+        self.authority_resolver.register_grant(dep_grant)
+        plain_set = {"dep-required"}
+
+        # 1. At decision: evaluate_and_dispatch refuses BEFORE recording decision (zero ledger mutation)
+        intv_count_before = self.ledger._conn.execute("SELECT COUNT(*) FROM interventions").fetchone()[0]
+        res_dec = self.adapter.evaluate_and_dispatch(
+            raw_task_data=dep_grant,
+            authority_resolver=self.authority_resolver,
+            binding_provider=self.binding_provider,
+            observation_provider=self.observation_provider,
+            native_guard=self.native_guard,
+            transport_callbacks=self.transport_callbacks,
+            completed_obligations=plain_set,
+        )
+        self.assertFalse(res_dec.decision_made)
+        self.assertFalse(res_dec.dispatch_sent)
+        self.assertEqual(self.ledger._conn.execute("SELECT COUNT(*) FROM interventions").fetchone()[0], intv_count_before)
+
+        # 2. At guard: dispatch guard authorize_dispatch denies
+        self.authority_resolver.register_grant(self.grant)
+        clean_res = self.adapter.evaluate_and_dispatch(
+            raw_task_data=self.grant,
+            authority_resolver=self.authority_resolver,
+            binding_provider=self.binding_provider,
+            observation_provider=self.observation_provider,
+            native_guard=self.native_guard,
+            transport_callbacks=self.transport_callbacks,
+        )
+        self.assertTrue(clean_res.dispatch_sent)
+        msg = clean_res.outbox_message
+
+        # Mutate resolver to add dependencies for guard revalidation
+        self.authority_resolver.register_grant(dep_grant)
+        guard = AdapterDispatchGuard(
+            ledger=self.ledger,
+            authority_resolver=self.authority_resolver,
+            binding_provider=self.binding_provider,
+            native_guard=self.native_guard,
+            transport_callbacks=self.transport_callbacks,
+            clock=self.adapter._clock,
+            completed_obligations=plain_set,
+        )
+        ok_guard, reason_guard = guard.authorize_dispatch(msg)
+        self.assertFalse(ok_guard)
+        self.assertIn("held", reason_guard.lower())
+
+        # 3. At pre-send: AdapterTransport.send raises TransportSendFailedBeforeDelivery
+        cb_called = False
+        def test_cb(req: TransportSendRequest) -> Dict[str, Any]:
+            nonlocal cb_called
+            cb_called = True
+            return {"status": "sent"}
+
+        tb = TransportRouteCallbacks(bus_send=test_cb)
+        transport = AdapterTransport(
+            ledger=self.ledger,
+            callbacks=tb,
+            authority_resolver=self.authority_resolver,
+            binding_provider=self.binding_provider,
+            clock=self.adapter._clock,
+            completed_obligations=plain_set,
+        )
+        with self.assertRaises(TransportSendFailedBeforeDelivery):
+            transport.send(
+                route=ROUTE_BUS,
+                recipient_tag=self.grant.owner_tag,
+                payload={"test": 1},
+                idempotency_key=clean_res.outbox_message.dedup_key,
+            )
+        self.assertFalse(cb_called)
+
+        # 4. At receipt: record_mailbox_read_ack, custody, action, outcome deny with SecurityBindingError
+        read_ack = MailboxReadAck(
+            message_id=clean_res.outbox_message.message_id,
+            read_at=now_iso(self.current_time),
+            reader_session_id=self.grant.session_id,
+            reader_generation=self.grant.generation,
+        )
+        with self.assertRaises(SecurityBindingError) as ctx:
+            self.adapter.record_mailbox_read_ack(
+                message_id=clean_res.outbox_message.message_id,
+                ack=read_ack,
+                expected_obligation_id=self.grant.task_id,
+                expected_revision=self.grant.revision,
+                expected_owner_tag=self.grant.owner_tag,
+                expected_workspace=self.grant.workspace,
+            )
+        self.assertIn("held", str(ctx.exception).lower())
+
+    # -------------------------------------------------------------------------
+    # 61. Stale, future, malformed, cross-tuple authority evidence refused
+    # -------------------------------------------------------------------------
+
+    def test_stale_future_malformed_cross_tuple_authority_evidence_refused(self) -> None:
+        """Authority evidence with future timestamp, stale age, or mismatched tuple fields is refused."""
+        # 1. Future timestamp
+        future_grant = dataclasses.replace(
+            self.grant,
+            issued_at="2026-10-13T13:00:00Z",  # 1 hour after self.current_time
+        )
+        resolver_future = StandardAuthorityResolver(known_grants={(future_grant.task_id, future_grant.revision): future_grant})
+        res_future = self.adapter.evaluate_and_dispatch(
+            raw_task_data=future_grant,
+            authority_resolver=resolver_future,
+            binding_provider=self.binding_provider,
+            observation_provider=self.observation_provider,
+            native_guard=self.native_guard,
+            transport_callbacks=self.transport_callbacks,
+        )
+        self.assertFalse(res_future.decision_made)
+
+        # 2. Stale timestamp (> 300s)
+        stale_grant = dataclasses.replace(
+            self.grant,
+            issued_at="2026-10-13T10:00:00Z",  # 2 hours before self.current_time
+        )
+        resolver_stale = StandardAuthorityResolver(known_grants={(stale_grant.task_id, stale_grant.revision): stale_grant})
+        res_stale = self.adapter.evaluate_and_dispatch(
+            raw_task_data=stale_grant,
+            authority_resolver=resolver_stale,
+            binding_provider=self.binding_provider,
+            observation_provider=self.observation_provider,
+            native_guard=self.native_guard,
+            transport_callbacks=self.transport_callbacks,
+        )
+        self.assertFalse(res_stale.decision_made)
+
+        # 3. Cross-session mismatch
+        mismatched_session_grant = dataclasses.replace(self.grant, session_id="other-session-id")
+        resolver_cross = StandardAuthorityResolver(known_grants={(mismatched_session_grant.task_id, mismatched_session_grant.revision): mismatched_session_grant})
+        res_cross = self.adapter.evaluate_and_dispatch(
+            raw_task_data=mismatched_session_grant,
+            authority_resolver=resolver_cross,
+            binding_provider=self.binding_provider,
+            observation_provider=self.observation_provider,
+            native_guard=self.native_guard,
+            transport_callbacks=self.transport_callbacks,
+        )
+        self.assertFalse(res_cross.dispatch_sent)
+        self.assertIn("session", res_cross.refusal_reason.lower())
+
+    # -------------------------------------------------------------------------
+    # 62. Missing dependency verifier and exceptions deny as HELD
+    # -------------------------------------------------------------------------
+
+    def test_missing_verifier_and_exceptions_deny_as_held(self) -> None:
+        """Missing dependency verifier or verifier raising exceptions fails closed as HELD."""
+        dep_grant = dataclasses.replace(self.grant, dependencies=("dep-err",))
+        self.authority_resolver.register_grant(dep_grant)
+
+        # 1. Missing verifier (None)
+        res_none = self.adapter.evaluate_and_dispatch(
+            raw_task_data=dep_grant,
+            authority_resolver=self.authority_resolver,
+            binding_provider=self.binding_provider,
+            observation_provider=self.observation_provider,
+            native_guard=self.native_guard,
+            transport_callbacks=self.transport_callbacks,
+            dependency_verifier=None,
+        )
+        self.assertFalse(res_none.decision_made)
+        self.assertIn("held", res_none.refusal_reason.lower())
+
+        # 2. Verifier raises Exception
+        class FailingVerifier(DependencyCompletionVerifierProtocol):
+            def verify_dependency_completion(self, dependency_task_id: str, expected_workspace: str, now_utc: datetime.datetime, dependency_evidence: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+                raise RuntimeError("Simulated remote dependency lookup error")
+
+        res_exc = self.adapter.evaluate_and_dispatch(
+            raw_task_data=dep_grant,
+            authority_resolver=self.authority_resolver,
+            binding_provider=self.binding_provider,
+            observation_provider=self.observation_provider,
+            native_guard=self.native_guard,
+            transport_callbacks=self.transport_callbacks,
+            dependency_verifier=FailingVerifier(),
+        )
+        self.assertFalse(res_exc.decision_made)
+        self.assertIn("exception", res_exc.refusal_reason.lower())
+
+        # 3. Verifier returns non-bool
+        class NonBoolVerifier(DependencyCompletionVerifierProtocol):
+            def verify_dependency_completion(self, dependency_task_id: str, expected_workspace: str, now_utc: datetime.datetime, dependency_evidence: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+                return ("not-a-bool", "bad return")  # type: ignore
+
+        res_bad = self.adapter.evaluate_and_dispatch(
+            raw_task_data=dep_grant,
+            authority_resolver=self.authority_resolver,
+            binding_provider=self.binding_provider,
+            observation_provider=self.observation_provider,
+            native_guard=self.native_guard,
+            transport_callbacks=self.transport_callbacks,
+            dependency_verifier=NonBoolVerifier(),
+        )
+        self.assertFalse(res_bad.decision_made)
+        self.assertIn("non-bool", res_bad.refusal_reason.lower())
+
+        # 3b. Verifier returns (False, "dep not finished")
+        class FalseVerifier(DependencyCompletionVerifierProtocol):
+            def verify_dependency_completion(self, dependency_task_id: str, expected_workspace: str, now_utc: datetime.datetime, dependency_evidence: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+                return (False, "dep not finished")
+
+        res_false = self.adapter.evaluate_and_dispatch(
+            raw_task_data=dep_grant,
+            authority_resolver=self.authority_resolver,
+            binding_provider=self.binding_provider,
+            observation_provider=self.observation_provider,
+            native_guard=self.native_guard,
+            transport_callbacks=self.transport_callbacks,
+            dependency_verifier=FalseVerifier(),
+        )
+        self.assertFalse(res_false.decision_made)
+        self.assertIn("unverified", res_false.refusal_reason.lower())
+
+        # 4. Resolver raises Exception in qualify_authority_inputs and evaluate_and_dispatch
+        class BrokenResolver(AuthorityResolverProtocol):
+            def resolve_authority(self, raw_task_data: Any, now_utc: datetime.datetime) -> Optional[TrustedAuthorityGrant]:
+                raise RuntimeError("Simulated database lock or authority failure")
+            def revalidate_authority(self, task_id: str, revision: int, workspace: str, now_utc: datetime.datetime) -> Optional[TrustedAuthorityGrant]:
+                raise RuntimeError("Simulated revalidate error")
+
+        broken_res = BrokenResolver()
+        qual_exc = self.adapter.qualify_authority_inputs(
+            raw_task_data=self.grant,
+            authority_resolver=broken_res,
+        )
+        self.assertFalse(qual_exc.is_qualified)
+        self.assertEqual(qual_exc.status, QUALIFICATION_STATUS_DENIED)
+        self.assertIn("exception", qual_exc.reason.lower())
+
+        eval_exc = self.adapter.evaluate_and_dispatch(
+            raw_task_data=self.grant,
+            authority_resolver=broken_res,
+            binding_provider=self.binding_provider,
+            observation_provider=self.observation_provider,
+            native_guard=self.native_guard,
+            transport_callbacks=self.transport_callbacks,
+        )
+        self.assertFalse(eval_exc.decision_made)
+        self.assertIn("exception", eval_exc.refusal_reason.lower())
+
+        # 5. Resolver returns malformed non-grant type
+        class MalformedResolver(AuthorityResolverProtocol):
+            def resolve_authority(self, raw_task_data: Any, now_utc: datetime.datetime) -> Any:
+                return {"task_id": "task-1", "fake": True}
+            def revalidate_authority(self, task_id: str, revision: int, workspace: str, now_utc: datetime.datetime) -> Any:
+                return {"task_id": "task-1", "fake": True}
+
+        malformed_res = MalformedResolver()
+        qual_mal = self.adapter.qualify_authority_inputs(
+            raw_task_data=self.grant,
+            authority_resolver=malformed_res,
+        )
+        self.assertFalse(qual_mal.is_qualified)
+        self.assertEqual(qual_mal.status, QUALIFICATION_STATUS_DENIED)
+        self.assertIn("invalid grant type", qual_mal.reason.lower())
+
+        eval_mal = self.adapter.evaluate_and_dispatch(
+            raw_task_data=self.grant,
+            authority_resolver=malformed_res,
+            binding_provider=self.binding_provider,
+            observation_provider=self.observation_provider,
+            native_guard=self.native_guard,
+            transport_callbacks=self.transport_callbacks,
+        )
+        self.assertFalse(eval_mal.decision_made)
+        self.assertIn("invalid grant type", eval_mal.refusal_reason.lower())
+
+    # -------------------------------------------------------------------------
+    # 63. No fabricated production positive: honest future provider hold
+    # -------------------------------------------------------------------------
+
+    def test_no_fabricated_production_positive_honest_future_provider_hold(self) -> None:
+        """Adapter honestly reports production_qualified:False and keeps dependencies HELD."""
+        default_verifier = DefaultDenyDependencyCompletionVerifier()
+        ok, reason = default_verifier.verify_dependency_completion(
+            dependency_task_id="dep-1",
+            expected_workspace=self.workspace,
+            now_utc=self.current_time,
+        )
+        self.assertFalse(ok)
+        self.assertIn("HELD", reason)
+
+        # Standard resolver explicitly declares itself as offline reference
+        self.assertTrue(StandardAuthorityResolver.is_offline_reference)
+        self.assertFalse(StandardAuthorityResolver.is_production_qualified)
+        self.assertIn("offline reference seam only", StandardAuthorityResolver.provider_name)
+
+        # Boolean verifier attempting positive CANNOT unhold dependencies in production
+        class AttemptedPositiveVerifier(DependencyCompletionVerifierProtocol):
+            def verify_dependency_completion(self, dependency_task_id: str, expected_workspace: str, now_utc: datetime.datetime, dependency_evidence: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+                return True, "Simulated positive verifier attempt"
+
+        dep_grant = dataclasses.replace(self.grant, dependencies=("dep-truthy",))
+        self.authority_resolver.register_grant(dep_grant)
+
+        # 1. evaluate_and_dispatch refuses: dependencies stay HELD with ZERO sends
+        cb_called = False
+        def dummy_cb(req: TransportSendRequest) -> Dict[str, Any]:
+            nonlocal cb_called
+            cb_called = True
+            return {"status": "sent"}
+
+        tb = TransportRouteCallbacks(bus_send=dummy_cb)
+        res = self.adapter.evaluate_and_dispatch(
+            raw_task_data=dep_grant,
+            authority_resolver=self.authority_resolver,
+            binding_provider=self.binding_provider,
+            observation_provider=self.observation_provider,
+            native_guard=self.native_guard,
+            transport_callbacks=tb,
+            dependency_verifier=AttemptedPositiveVerifier(),
+        )
+        self.assertFalse(res.dispatch_sent)
+        self.assertFalse(res.decision_made)
+        self.assertFalse(cb_called)
+        self.assertIn("held", res.refusal_reason.lower())
+
+        # 2. qualify_authority_inputs also refuses: dependency_status remains HELD
+        qual = self.adapter.qualify_authority_inputs(
+            raw_task_data=dep_grant,
+            authority_resolver=self.authority_resolver,
+            dependency_verifier=AttemptedPositiveVerifier(),
+        )
+        self.assertFalse(qual.is_qualified)
+        self.assertEqual(qual.status, QUALIFICATION_STATUS_HELD)
+        self.assertEqual(qual.dependency_status, QUALIFICATION_STATUS_HELD)
+        self.assertFalse(qual.details["production_qualified"])
+
+        # 3. Both qualify_authority and qualify_authority_inputs aliases work identically
+        qual_alias = self.adapter.qualify_authority(
+            raw_task_data=dep_grant,
+            authority_resolver=self.authority_resolver,
+            dependency_verifier=AttemptedPositiveVerifier(),
+        )
+        self.assertEqual(qual, qual_alias)
+
+    # -------------------------------------------------------------------------
+    # 64. Dependency-bearing receipts held with no false outcome
+    # -------------------------------------------------------------------------
+
+    def test_dependency_bearing_action_and_completion_receipts_held_no_false_outcome(self) -> None:
+        """When an obligation has dependencies, receipt ingress is HELD with zero false outcome in ledger."""
+        self.authority_resolver.register_grant(self.grant)
+        res = self.adapter.evaluate_and_dispatch(
+            self.grant, self.authority_resolver, self.binding_provider,
+            self.observation_provider, self.native_guard, self.transport_callbacks,
+        )
+        self.assertTrue(res.dispatch_sent)
+        intv_id = res.intervention.id
+        prior_state = self.ledger.get_intervention(intv_id).state
+
+        # Mutate grant in resolver to declare a dependency
+        dep_grant = dataclasses.replace(self.grant, dependencies=("unresolved-dep",))
+        self.authority_resolver.register_grant(dep_grant)
+
+        # Read ACK ingress attempt
+        read_ack = MailboxReadAck(
+            message_id=res.outbox_message.message_id,
+            read_at=now_iso(self.current_time),
+            reader_session_id=self.grant.session_id,
+            reader_generation=self.grant.generation,
+        )
+        with self.assertRaises(SecurityBindingError) as ctx_ack:
+            self.adapter.record_mailbox_read_ack(
+                res.outbox_message.message_id,
+                read_ack,
+                self.grant.task_id,
+                self.grant.revision,
+                self.grant.owner_tag,
+                self.grant.workspace,
+            )
+        self.assertIn("held", str(ctx_ack.exception).lower())
+        self.assertEqual(self.ledger.get_intervention(intv_id).state, prior_state)
+
+        # Action receipt ingress attempt
+        action = ActionReceipt(
+            receipt_id="act-001",
+            action_type="tool_execution",
+            timestamp=now_iso(self.current_time),
+            session_id=self.grant.session_id,
+            generation=self.grant.generation,
+            details={"cmd": "ls"},
+            obligation_id=self.grant.task_id,
+            obligation_revision=self.grant.revision,
+            owner_tag=self.grant.owner_tag,
+            workspace=self.grant.workspace,
+        )
+        with self.assertRaises(SecurityBindingError) as ctx:
+            self.adapter.record_first_action(intv_id, action)
+        self.assertIn("held", str(ctx.exception).lower())
+        self.assertEqual(self.ledger.get_intervention(intv_id).state, prior_state)
+
+        # Completion outcome ingress attempt
+        outcome = CompletionOutcome(
+            obligation_id=self.grant.task_id,
+            obligation_revision=self.grant.revision,
+            owner_tag=self.grant.owner_tag,
+            workspace=self.grant.workspace,
+            session_id=self.grant.session_id,
+            generation=self.grant.generation,
+            completed_at=now_iso(self.current_time),
+            result={"status": "ok"},
+        )
+        with self.assertRaises(SecurityBindingError) as ctx2:
+            self.adapter.record_completion_outcome(intv_id, outcome)
+        self.assertIn("held", str(ctx2.exception).lower())
+        self.assertEqual(self.ledger.get_intervention(intv_id).state, prior_state)
 
 
 if __name__ == "__main__":

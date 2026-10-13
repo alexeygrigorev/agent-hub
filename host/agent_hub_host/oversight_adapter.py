@@ -126,6 +126,33 @@ def _stage_index(state: str) -> int:
     return STAGE_ORDER.get(state, -1)
 
 
+# --- Qualification Constants and Verification Boundaries ---
+
+REQUIRED_INDEPENDENT_PROVIDERS: Tuple[str, ...] = (
+    "authenticated current task/custody/revision authority resolver",
+    "independent current exactbound dependency-completion verifier",
+)
+
+EXACT_TUPLE_BOUNDARY_FIELDS: Tuple[str, ...] = (
+    "task_id",
+    "revision",
+    "owner_tag",
+    "workspace",
+    "session_id",
+    "generation",
+    "custody",
+    "source_id",
+    "source_digest",
+    "currentness",
+)
+
+QUALIFICATION_STATUS_QUALIFIED = "QUALIFIED"
+QUALIFICATION_STATUS_HELD = "HELD"
+QUALIFICATION_STATUS_DENIED = "DENIED"
+QUALIFICATION_STATUS_UNKNOWN = "UNKNOWN"
+QUALIFICATION_STATUS_OFFLINE_REFERENCE = "OFFLINE_REFERENCE"
+
+
 # --- Strict Type and Time Helpers ---
 
 def _is_valid_int(val: Any) -> bool:
@@ -162,8 +189,10 @@ def _validate_authority_protection_and_dependencies(
     grant: Any,
     completed_obligations: Optional[Set[str]] = None,
     expected_dependencies: Optional[Sequence[str]] = None,
+    dependency_verifier: Optional[DependencyCompletionVerifierProtocol] = None,
+    now_utc: Optional[datetime.datetime] = None,
 ) -> Tuple[bool, str]:
-    """Validate that an authority grant is not protected, has ready status, and dependencies are satisfied.
+    """Validate that an authority grant is not protected, has ready status, and dependencies are qualified.
 
     Enforces:
     - Known mandatory protected reasons nonempty deny.
@@ -172,8 +201,9 @@ def _validate_authority_protection_and_dependencies(
     - Dependencies cannot be silently ignored:
       * Unmet/unknown dependencies deny.
       * Dependencies changed after initial classification deny.
-      * Non-empty dependencies deny if no fresh trusted evidence (completed_obligations is None).
-      * Explicit trusted completed-dependency seam preserved only if declared current inputs substantiate.
+      * Plain/raw completed_obligations sets cannot authorize non-empty dependencies (raw-set authority path removed).
+      * Non-empty dependencies deny/HELD unless qualified by an independent dependency-completion verifier provider.
+      * Default/missing/unknown/unqualified provider denies readiness/dependency receipt BEFORE any transport or ledger stage/digest mutation.
     """
     # 1. Protected reason check
     prot_reason = getattr(grant, "protected_reason", None)
@@ -214,11 +244,36 @@ def _validate_authority_protection_and_dependencies(
             return False, f"Authority dependencies changed after initial classification ({deps_tuple} != {exp_tuple})"
 
     if deps_tuple:
-        if completed_obligations is None:
-            return False, f"Authority has non-empty dependencies {deps_tuple} without fresh trusted evidence"
-        unsatisfied = [d for d in deps_tuple if d not in completed_obligations]
-        if unsatisfied:
-            return False, f"Authority has unsatisfied dependencies: {unsatisfied}"
+        # Non-empty dependencies fail closed: independent completion authority provider
+        # is absent on host. Plain completed sets, caller flags, and boolean verifiers
+        # cannot unhold actual dependencies.
+        if dependency_verifier is not None:
+            verifier_now = now_utc or datetime.datetime.now(datetime.timezone.utc)
+            workspace = getattr(grant, "workspace", "")
+            for d in deps_tuple:
+                try:
+                    verif_res = dependency_verifier.verify_dependency_completion(
+                        dependency_task_id=d,
+                        expected_workspace=workspace,
+                        now_utc=verifier_now,
+                    )
+                    if not isinstance(verif_res, tuple) or len(verif_res) != 2:
+                        return False, f"Dependency verifier returned invalid result for '{d}': {verif_res!r}"
+                    ok_dep, dep_reason = verif_res
+                    if not isinstance(ok_dep, bool):
+                        return False, f"Dependency verifier returned non-bool for '{d}': {ok_dep!r}"
+                    if not ok_dep:
+                        return False, f"Dependency '{d}' completion unverified (HELD): {dep_reason}"
+                except Exception as exc:
+                    return False, f"Dependency verifier exception for '{d}': {exc}"
+
+        # Production dependencies remain explicitly HELD absent an actual installed independent provider.
+        # Plain completed sets, caller flags, and boolean verifiers cannot unhold dependencies.
+        return False, (
+            f"Authority has non-empty dependencies {deps_tuple}: dependency authority is HELD "
+            f"(independent current exactbound dependency-completion verifier absent on host; "
+            f"raw completed sets, caller flags, and boolean verifiers cannot unhold dependencies)"
+        )
 
     return True, ""
 
@@ -369,6 +424,18 @@ class AdapterExecutionResult:
     receipt: Optional[Dict[str, Any]] = None
 
 
+@dataclasses.dataclass(frozen=True)
+class AuthorityQualificationResult:
+    """Read-only capability and qualification assessment of authority and dependency providers."""
+    is_qualified: bool
+    status: str  # QUALIFIED, HELD, DENIED, UNKNOWN, OFFLINE_REFERENCE
+    reason: str
+    missing_providers: Tuple[str, ...]
+    verification_boundary: Tuple[str, ...]
+    dependency_status: str  # HELD, NOT_APPLICABLE, UNQUALIFIED, UNKNOWN
+    details: Dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
 # --- Protocols ---
 
 class AuthorityResolverProtocol(Protocol):
@@ -389,6 +456,47 @@ class AuthorityResolverProtocol(Protocol):
         now_utc: datetime.datetime,
     ) -> Optional[TrustedAuthorityGrant]:
         ...
+
+
+class DependencyCompletionVerifierProtocol(Protocol):
+    """Protocol for independent current exactbound dependency-completion verifier.
+
+    Requires full exact tuple verification boundary:
+    (task_id, revision, owner_tag, workspace, session_id, generation,
+     custody, source_id, source_digest, currentness).
+
+    DO NOT implement fake positive provider.
+    Default/missing/unknown/unqualified provider denies readiness/dependency receipt
+    BEFORE any transport or ledger stage/digest mutation.
+    """
+
+    def verify_dependency_completion(
+        self,
+        dependency_task_id: str,
+        expected_workspace: str,
+        now_utc: datetime.datetime,
+        dependency_evidence: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, str]:
+        ...
+
+
+class DefaultDenyDependencyCompletionVerifier:
+    """Default dependency completion verifier that strictly fails closed as HELD.
+
+    No independent completion authority provider is installed on host.
+    """
+
+    def verify_dependency_completion(
+        self,
+        dependency_task_id: str,
+        expected_workspace: str,
+        now_utc: datetime.datetime,
+        dependency_evidence: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, str]:
+        return False, (
+            f"DefaultDenyDependencyCompletionVerifier: independent current exactbound "
+            f"dependency-completion verifier absent on host; dependency '{dependency_task_id}' remains HELD"
+        )
 
 
 class NativeGuardInterface(Protocol):
@@ -461,9 +569,14 @@ class TransportRouteCallbacks:
 class StandardAuthorityResolver:
     """Reference authority resolver resolving strictly against registered grants.
 
+    Explicitly an offline reference seam only; does not establish production trust.
     Rejects unregistered caller inputs, timezone-naive timestamps, bool/non-int
     revision/generation, empty workspaces, and unprovenanced claims.
     """
+
+    is_production_qualified: bool = False
+    is_offline_reference: bool = True
+    provider_name: str = "StandardAuthorityResolver (offline reference seam only)"
 
     def __init__(
         self,
@@ -634,6 +747,7 @@ class AdapterDispatchGuard(GuardProtocol):
         clock: Optional[Callable[[], datetime.datetime]] = None,
         completed_obligations: Optional[Set[str]] = None,
         expected_dependencies: Optional[Sequence[str]] = None,
+        dependency_verifier: Optional[DependencyCompletionVerifierProtocol] = None,
     ):
         self.ledger = ledger
         self.authority_resolver = authority_resolver
@@ -643,6 +757,7 @@ class AdapterDispatchGuard(GuardProtocol):
         self._clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
         self.completed_obligations = completed_obligations
         self.expected_dependencies = tuple(expected_dependencies) if expected_dependencies is not None else None
+        self.dependency_verifier = dependency_verifier
 
     def _now(self) -> datetime.datetime:
         dt = self._clock()
@@ -717,6 +832,8 @@ class AdapterDispatchGuard(GuardProtocol):
             grant=grant,
             completed_obligations=self.completed_obligations,
             expected_dependencies=self.expected_dependencies,
+            dependency_verifier=self.dependency_verifier,
+            now_utc=now,
         )
         if not ok:
             return False, f"Authority revalidation failed: {reason}"
@@ -811,6 +928,7 @@ class AdapterTransport(TransportProtocol):
         clock: Optional[Callable[[], datetime.datetime]] = None,
         completed_obligations: Optional[Set[str]] = None,
         expected_dependencies: Optional[Sequence[str]] = None,
+        dependency_verifier: Optional[DependencyCompletionVerifierProtocol] = None,
     ):
         self.ledger = ledger
         self.callbacks = callbacks
@@ -821,6 +939,7 @@ class AdapterTransport(TransportProtocol):
         self._clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
         self.completed_obligations = completed_obligations
         self.expected_dependencies = tuple(expected_dependencies) if expected_dependencies is not None else None
+        self.dependency_verifier = dependency_verifier
         self.last_sent_request: Optional[TransportSendRequest] = None
         self.last_receipt: Optional[Dict[str, Any]] = None
 
@@ -910,6 +1029,8 @@ class AdapterTransport(TransportProtocol):
             grant=grant,
             completed_obligations=self.completed_obligations,
             expected_dependencies=self.expected_dependencies,
+            dependency_verifier=self.dependency_verifier,
+            now_utc=now,
         )
         if not ok:
             raise TransportSendFailedBeforeDelivery(f"Pre-send authority recheck failed: {reason}")
@@ -1054,6 +1175,7 @@ class OversightAdapter:
         binding_provider: Optional[BindingProviderProtocol] = None,
         receipt_verifier: Optional[ReceiptVerifierProtocol] = None,
         clock: Optional[Callable[[], datetime.datetime]] = None,
+        dependency_verifier: Optional[DependencyCompletionVerifierProtocol] = None,
     ):
         self.ledger = ledger
         self.policy = policy or OversightPolicy()
@@ -1061,6 +1183,7 @@ class OversightAdapter:
         self.binding_provider = binding_provider
         self.receipt_verifier = receipt_verifier or DefaultDenyReceiptVerifier()
         self._clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
+        self.dependency_verifier = dependency_verifier
 
         # Initialize adapter-owned durable table for receipt digest persistence
         # Zero destructive mutation of accepted ledger tables. Qualify actual SQLite storage failure.
@@ -1088,6 +1211,157 @@ class OversightAdapter:
             dt = dt.replace(tzinfo=datetime.timezone.utc)
         return dt.astimezone(datetime.timezone.utc)
 
+    def qualify_authority_inputs(
+        self,
+        raw_task_data: Any,
+        authority_resolver: Optional[AuthorityResolverProtocol] = None,
+        dependency_verifier: Optional[DependencyCompletionVerifierProtocol] = None,
+        now_utc: Optional[datetime.datetime] = None,
+    ) -> AuthorityQualificationResult:
+        """Read-only capability and qualification assessment of authority and dependency providers.
+
+        Does not mutate ledger or send messages. Evaluates whether production trust is qualified
+        against exact tuple boundaries and required independent providers.
+        """
+        now = now_utc or self._now()
+        resolver = authority_resolver or self.authority_resolver
+        dep_verifier = dependency_verifier or self.dependency_verifier
+
+        if resolver is None:
+            return AuthorityQualificationResult(
+                is_qualified=False,
+                status=QUALIFICATION_STATUS_DENIED,
+                reason="authority_resolver is missing",
+                missing_providers=REQUIRED_INDEPENDENT_PROVIDERS,
+                verification_boundary=EXACT_TUPLE_BOUNDARY_FIELDS,
+                dependency_status=QUALIFICATION_STATUS_UNKNOWN,
+            )
+
+        try:
+            grant = resolver.resolve_authority(raw_task_data, now)
+        except Exception as exc:
+            return AuthorityQualificationResult(
+                is_qualified=False,
+                status=QUALIFICATION_STATUS_DENIED,
+                reason=f"Authority resolution exception: {exc}",
+                missing_providers=REQUIRED_INDEPENDENT_PROVIDERS,
+                verification_boundary=EXACT_TUPLE_BOUNDARY_FIELDS,
+                dependency_status=QUALIFICATION_STATUS_UNKNOWN,
+                details={"exception": str(exc)},
+            )
+
+        if grant is None:
+            return AuthorityQualificationResult(
+                is_qualified=False,
+                status=QUALIFICATION_STATUS_DENIED,
+                reason="Authority resolution failed: untrusted, unregistered, or malformed task provenance",
+                missing_providers=REQUIRED_INDEPENDENT_PROVIDERS,
+                verification_boundary=EXACT_TUPLE_BOUNDARY_FIELDS,
+                dependency_status=QUALIFICATION_STATUS_UNKNOWN,
+            )
+
+        if not isinstance(grant, TrustedAuthorityGrant):
+            return AuthorityQualificationResult(
+                is_qualified=False,
+                status=QUALIFICATION_STATUS_DENIED,
+                reason=f"Authority resolution returned invalid grant type: {type(grant).__name__}",
+                missing_providers=REQUIRED_INDEPENDENT_PROVIDERS,
+                verification_boundary=EXACT_TUPLE_BOUNDARY_FIELDS,
+                dependency_status=QUALIFICATION_STATUS_UNKNOWN,
+            )
+
+        # Check dependencies
+        deps = grant.dependencies or ()
+        if deps:
+            # Independent completion authority provider is absent on host.
+            # Dependencies remain explicitly HELD. Raw bools/caller flags cannot unhold dependencies.
+            dep_status = QUALIFICATION_STATUS_HELD
+            dep_reason = (
+                f"Authority has non-empty dependencies {deps}: dependency authority is HELD "
+                f"(independent current exactbound dependency-completion verifier absent on host; "
+                f"caller flags and boolean verifiers cannot establish semantic trust)"
+            )
+            if dep_verifier is not None:
+                for d in deps:
+                    try:
+                        v_res = dep_verifier.verify_dependency_completion(
+                            dependency_task_id=d,
+                            expected_workspace=grant.workspace,
+                            now_utc=now,
+                        )
+                        if not isinstance(v_res, tuple) or len(v_res) != 2:
+                            dep_reason = f"Dependency verifier returned invalid result for '{d}': {v_res!r}"
+                            break
+                        ok_b, r_text = v_res
+                        if not isinstance(ok_b, bool):
+                            dep_reason = f"Dependency verifier returned non-bool for '{d}': {ok_b!r}"
+                            break
+                        if not ok_b:
+                            dep_reason = f"Dependency '{d}' unverified (HELD): {r_text}"
+                            break
+                    except Exception as e:
+                        dep_reason = f"Dependency verifier exception for '{d}': {e}"
+                        break
+        else:
+            dep_status = "NOT_APPLICABLE"
+            dep_reason = "No dependencies declared"
+
+        # Production qualification assessment:
+        # StandardAuthorityResolver is explicitly offline reference only
+        is_offline_ref = getattr(resolver, "is_offline_reference", False) or isinstance(resolver, StandardAuthorityResolver)
+
+        details = {
+            "task_id": grant.task_id,
+            "revision": grant.revision,
+            "owner_tag": grant.owner_tag,
+            "workspace": grant.workspace,
+            "session_id": grant.session_id,
+            "generation": grant.generation,
+            "source_id": grant.source_id,
+            "source_digest": grant.source_digest,
+            "status": grant.status,
+            "is_principal": grant.is_principal,
+            "dependencies": grant.dependencies,
+            "is_offline_reference": is_offline_ref,
+            "production_provider_present": False,
+            "production_qualified": False,
+        }
+
+        if deps and dep_status == QUALIFICATION_STATUS_HELD:
+            return AuthorityQualificationResult(
+                is_qualified=False,
+                status=QUALIFICATION_STATUS_HELD,
+                reason=dep_reason,
+                missing_providers=REQUIRED_INDEPENDENT_PROVIDERS,
+                verification_boundary=EXACT_TUPLE_BOUNDARY_FIELDS,
+                dependency_status=dep_status,
+                details=details,
+            )
+
+        if is_offline_ref:
+            return AuthorityQualificationResult(
+                is_qualified=False,
+                status=QUALIFICATION_STATUS_OFFLINE_REFERENCE,
+                reason="StandardAuthorityResolver memory registration is offline reference seam only; production trust not established",
+                missing_providers=REQUIRED_INDEPENDENT_PROVIDERS,
+                verification_boundary=EXACT_TUPLE_BOUNDARY_FIELDS,
+                dependency_status=dep_status,
+                details=details,
+            )
+
+        return AuthorityQualificationResult(
+            is_qualified=False,
+            status=QUALIFICATION_STATUS_UNKNOWN,
+            reason="Independent authenticated task/custody authority provider absent on host",
+            missing_providers=REQUIRED_INDEPENDENT_PROVIDERS,
+            verification_boundary=EXACT_TUPLE_BOUNDARY_FIELDS,
+            dependency_status=dep_status,
+            details=details,
+        )
+
+    # Alias qualify_authority to qualify_authority_inputs
+    qualify_authority = qualify_authority_inputs
+
     def evaluate_and_dispatch(
         self,
         raw_task_data: Any,
@@ -1099,19 +1373,40 @@ class OversightAdapter:
         receipt_verifier: Optional[ReceiptVerifierProtocol] = None,
         completed_obligations: Optional[Set[str]] = None,
         recent_actions: Optional[Sequence[ActionReceipt]] = None,
+        dependency_verifier: Optional[DependencyCompletionVerifierProtocol] = None,
     ) -> AdapterExecutionResult:
         """Execute a single offline evaluation and guarded dispatch cycle."""
         now = self._now()
         self.authority_resolver = authority_resolver
         self.binding_provider = binding_provider
         verifier = receipt_verifier or self.receipt_verifier
+        dep_verifier = dependency_verifier or self.dependency_verifier
+
+        if authority_resolver is None:
+            return AdapterExecutionResult(
+                decision_made=False,
+                refusal_reason="authority_resolver is missing",
+            )
 
         # 1. Resolve explicit trusted authority grant against authoritative registration
-        grant = authority_resolver.resolve_authority(raw_task_data, now)
+        try:
+            grant = authority_resolver.resolve_authority(raw_task_data, now)
+        except Exception as exc:
+            return AdapterExecutionResult(
+                decision_made=False,
+                refusal_reason=f"Authority resolution exception: {exc}",
+            )
+
         if grant is None:
             return AdapterExecutionResult(
                 decision_made=False,
                 refusal_reason="Authority resolution failed: untrusted, unregistered, or malformed task provenance",
+            )
+
+        if not isinstance(grant, TrustedAuthorityGrant):
+            return AdapterExecutionResult(
+                decision_made=False,
+                refusal_reason=f"Authority resolution returned invalid grant type: {type(grant).__name__}",
             )
 
         if grant.protected_reason is not None and (
@@ -1120,6 +1415,22 @@ class OversightAdapter:
             return AdapterExecutionResult(
                 decision_made=False,
                 refusal_reason="Authority resolution failed: malformed protected reason",
+            )
+
+        # 2. Pre-decision fail-closed authority protection and dependency qualification
+        # Default/missing/unknown/unqualified provider denies readiness/dependency receipt
+        # BEFORE any transport or ledger stage/digest mutation.
+        ok, reason = _validate_authority_protection_and_dependencies(
+            grant=grant,
+            completed_obligations=completed_obligations,
+            expected_dependencies=None,
+            dependency_verifier=dep_verifier,
+            now_utc=now,
+        )
+        if not ok:
+            return AdapterExecutionResult(
+                decision_made=False,
+                refusal_reason=f"Authority pre-decision validation refused: {reason}",
             )
 
         obligation = grant.to_obligation()
@@ -1203,6 +1514,7 @@ class OversightAdapter:
             clock=self._clock,
             completed_obligations=completed_obligations,
             expected_dependencies=initial_deps,
+            dependency_verifier=dep_verifier,
         )
         transport = AdapterTransport(
             ledger=self.ledger,
@@ -1214,6 +1526,7 @@ class OversightAdapter:
             clock=self._clock,
             completed_obligations=completed_obligations,
             expected_dependencies=initial_deps,
+            dependency_verifier=dep_verifier,
         )
 
         # 8. Dispatch outbox message
@@ -1341,6 +1654,8 @@ class OversightAdapter:
             grant=grant,
             completed_obligations=None,
             expected_dependencies=None,
+            dependency_verifier=self.dependency_verifier,
+            now_utc=now,
         )
         if not ok:
             raise SecurityBindingError(f"Current authority failed validation on receipt ingress: {reason}")
