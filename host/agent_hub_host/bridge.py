@@ -7,6 +7,8 @@ metadata verification, and identity boundaries.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -25,6 +27,8 @@ from .native_bridge import (
     validate_native_reply_provenance,
     validate_native_send_envelope,
 )
+
+MAX_RECEIPTS_ENTRIES = 1000
 
 
 def get_authoritative_runtime_dir(explicit_runtime_dir: str | None = None) -> str:
@@ -100,7 +104,22 @@ class MailboxBridge:
             service_session_id=service_session_id,
         )
         self.receipts_file = os.path.join(self.workspace, ".local", "hub-bridge-receipts.json")
+        self.lock_file = os.path.join(self.workspace, ".local", "hub-bridge-receipts.lock")
         self.receipts = self._load_receipts()
+
+    @contextmanager
+    def _receipts_lock(self):
+        lock_dir = os.path.dirname(self.lock_file) or "."
+        os.makedirs(lock_dir, exist_ok=True)
+        fd = os.open(self.lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     def _load_receipts(self) -> dict[str, Any]:
         if os.path.exists(self.receipts_file):
@@ -113,6 +132,7 @@ class MailboxBridge:
                         data.setdefault("hub_messages", {})
                         data.setdefault("acked_hub_messages", [])
                         data.setdefault("ambiguous_sends", {})
+                        data.setdefault("delivers", {})
                         return data
             except Exception:
                 pass
@@ -122,9 +142,64 @@ class MailboxBridge:
             "hub_messages": {},
             "acked_hub_messages": [],
             "ambiguous_sends": {},
+            "delivers": {},
         }
 
+    def _prune_receipts(self) -> None:
+        """Bound existing receipt storage retention without losing active uncertain/unacked state."""
+        # 1. Bound acked_hub_messages
+        acked = self.receipts.get("acked_hub_messages", [])
+        if len(acked) > MAX_RECEIPTS_ENTRIES:
+            self.receipts["acked_hub_messages"] = acked[-MAX_RECEIPTS_ENTRIES:]
+
+        # 2. Bound completed hub_to_native, hub_messages, and delivers by pruning oldest acked messages
+        hub_to_native = self.receipts.get("hub_to_native", {})
+        if len(hub_to_native) > MAX_RECEIPTS_ENTRIES:
+            acked_set = set(self.receipts.get("acked_hub_messages", []))
+            excess = len(hub_to_native) - MAX_RECEIPTS_ENTRIES
+            pruned = 0
+            for hid in list(hub_to_native.keys()):
+                if hid in acked_set:
+                    nid = hub_to_native.pop(hid, None)
+                    if nid:
+                        self.receipts.get("hub_messages", {}).pop(nid, None)
+                        deliv = self.receipts.get("delivers", {}).get(nid)
+                        if deliv and deliv.get("status") == "delivered":
+                            self.receipts.get("delivers", {}).pop(nid, None)
+                    pruned += 1
+                    if pruned >= excess:
+                        break
+
+        # 3. Bound native_to_hub
+        native_to_hub = self.receipts.get("native_to_hub", {})
+        if len(native_to_hub) > MAX_RECEIPTS_ENTRIES:
+            excess = len(native_to_hub) - MAX_RECEIPTS_ENTRIES
+            for k in list(native_to_hub.keys())[:excess]:
+                del native_to_hub[k]
+
+    def _sync_receipts_with_lock(self) -> None:
+        if not hasattr(self, "receipts") or self.receipts is None:
+            self.receipts = self._load_receipts()
+            return
+        if not self.receipts:
+            # Explicitly cleared in memory (e.g. test isolation)
+            return
+        if os.path.exists(self.receipts_file):
+            try:
+                disk = self._load_receipts()
+                for k in ["hub_to_native", "native_to_hub", "hub_messages", "ambiguous_sends", "delivers"]:
+                    if k in self.receipts:
+                        disk[k].update(self.receipts[k])
+                    self.receipts[k] = disk[k]
+                for a in self.receipts.get("acked_hub_messages", []):
+                    if a not in disk["acked_hub_messages"]:
+                        disk["acked_hub_messages"].append(a)
+                self.receipts["acked_hub_messages"] = disk["acked_hub_messages"]
+            except Exception:
+                pass
+
     def _save_receipts(self) -> None:
+        self._prune_receipts()
         dir_path = os.path.dirname(self.receipts_file) or "."
         os.makedirs(dir_path, exist_ok=True)
         tmp_file = self.receipts_file + ".tmp"
@@ -182,16 +257,23 @@ class MailboxBridge:
         runtime_root = get_authoritative_runtime_dir(self.runtime_dir)
         sessions_dirs = []
         if runtime_root and os.path.isdir(os.path.join(runtime_root, "sessions")):
-            sessions_dirs.append(os.path.join(runtime_root, "sessions"))
+            s_dir = os.path.join(runtime_root, "sessions")
+            if not os.path.islink(s_dir):
+                sessions_dirs.append(s_dir)
         if effective_state_root and os.path.isdir(os.path.join(effective_state_root, "sessions")):
-            sessions_dirs.append(os.path.join(effective_state_root, "sessions"))
+            s_dir = os.path.join(effective_state_root, "sessions")
+            if not os.path.islink(s_dir):
+                sessions_dirs.append(s_dir)
 
         # 1. Check if previously resolved and still recorded in authoritative sessions
         recorded = hub_msg_info.get("recipient_session_id")
         if recorded and isinstance(recorded, str):
             for sdir in sessions_dirs:
-                rec_file = os.path.join(sdir, recorded, "session.json")
-                if os.path.isfile(rec_file):
+                entry_dir = os.path.join(sdir, recorded)
+                if os.path.islink(entry_dir) or not os.path.isdir(entry_dir):
+                    continue
+                rec_file = os.path.join(entry_dir, "session.json")
+                if os.path.isfile(rec_file) and not os.path.islink(rec_file):
                     try:
                         with open(rec_file, "r", encoding="utf-8") as f:
                             rec = json.load(f)
@@ -209,10 +291,10 @@ class MailboxBridge:
             try:
                 for entry in os.listdir(sdir):
                     entry_dir = os.path.join(sdir, entry)
-                    if not os.path.isdir(entry_dir):
+                    if not os.path.isdir(entry_dir) or os.path.islink(entry_dir):
                         continue
                     rec_file = os.path.join(entry_dir, "session.json")
-                    if not os.path.isfile(rec_file):
+                    if not os.path.isfile(rec_file) or os.path.islink(rec_file):
                         continue
                     try:
                         with open(rec_file, "r", encoding="utf-8") as f:
@@ -350,225 +432,306 @@ class MailboxBridge:
             raise BridgeCapabilityGap(f"Composer not empty or invalid prompt: {last_line}")
 
     def forward_hub_to_native(self, hub_msg: dict[str, Any]) -> str:
-        hub_id = hub_msg["id"]
-        if "hub_to_native" not in self.receipts:
-            self.receipts["hub_to_native"] = {}
-        if "hub_messages" not in self.receipts:
-            self.receipts["hub_messages"] = {}
-        if "native_to_hub" not in self.receipts:
-            self.receipts["native_to_hub"] = {}
-        if "acked_hub_messages" not in self.receipts:
-            self.receipts["acked_hub_messages"] = []
-        if "ambiguous_sends" not in self.receipts:
-            self.receipts["ambiguous_sends"] = {}
+        with self._receipts_lock():
+            self._sync_receipts_with_lock()
 
-        target = hub_msg["to_actor"]
-        tag = target[6:] if target.startswith("agent:") else target
-        body = hub_msg["body"]
-        kind = hub_msg.get("kind", "note")
+            hub_id = hub_msg["id"]
+            if "hub_to_native" not in self.receipts:
+                self.receipts["hub_to_native"] = {}
+            if "hub_messages" not in self.receipts:
+                self.receipts["hub_messages"] = {}
+            if "native_to_hub" not in self.receipts:
+                self.receipts["native_to_hub"] = {}
+            if "acked_hub_messages" not in self.receipts:
+                self.receipts["acked_hub_messages"] = []
+            if "ambiguous_sends" not in self.receipts:
+                self.receipts["ambiguous_sends"] = {}
+            if "delivers" not in self.receipts:
+                self.receipts["delivers"] = {}
 
-        # 1. Queue once: if already successfully queued/sent, retry with existing native ID
-        if hub_id in self.receipts["hub_to_native"]:
-            native_id = self.receipts["hub_to_native"][hub_id]
-        elif hub_id in self.receipts["ambiguous_sends"]:
-            amb = self.receipts["ambiguous_sends"][hub_id]
-            raise BridgeCapabilityGap(
-                f"Hub message {hub_id} has a prior ambiguous send (native_id={amb.get('native_id')}); "
-                f"refusing to resend to prevent duplicate native effects: {amb.get('reason')}"
-            )
-        else:
-            cmd = [self.aplexer_bin, "message", "send", "--queue", "--to", tag, "--kind", kind, "--json", body]
-            sub_env = self._get_subprocess_env()
-            if self.service_binding:
-                sub_env["APLEXER_SESSION_ID"] = str(self.service_binding.session_id)
+            target = hub_msg["to_actor"]
+            tag = target[6:] if target.startswith("agent:") else target
+            body = hub_msg["body"]
+            kind = hub_msg.get("kind", "note")
 
-            try:
-                res = subprocess.run(
-                    cmd,
-                    cwd=self.workspace,
-                    capture_output=True,
-                    text=True,
-                    timeout=180,
-                    env=sub_env,
+            # 1. Queue once: if already successfully queued/sent, retry with existing native ID
+            if hub_id in self.receipts["hub_to_native"]:
+                native_id = self.receipts["hub_to_native"][hub_id]
+            elif hub_id in self.receipts["ambiguous_sends"]:
+                amb = self.receipts["ambiguous_sends"][hub_id]
+                raise BridgeCapabilityGap(
+                    f"Hub message {hub_id} has a prior ambiguous send (native_id={amb.get('native_id')}); "
+                    f"refusing to resend to prevent duplicate native effects: {amb.get('reason')}"
                 )
-            except Exception as e:
-                raise RuntimeError(f"Native send execution failed: {e}")
+            else:
+                cmd = [self.aplexer_bin, "message", "send", "--queue", "--to", tag, "--kind", kind, "--json", body]
+                sub_env = self._get_subprocess_env()
+                if self.service_binding:
+                    sub_env["APLEXER_SESSION_ID"] = str(self.service_binding.session_id)
 
-            if res.returncode != 0:
-                raise RuntimeError(f"Native send failed (exit {res.returncode}): {res.stderr[:500]}")
+                try:
+                    res = subprocess.run(
+                        cmd,
+                        cwd=self.workspace,
+                        capture_output=True,
+                        text=True,
+                        timeout=180,
+                        env=sub_env,
+                    )
+                except Exception as e:
+                    raise RuntimeError(f"Native send execution failed: {e}")
 
-            try:
-                native_msg = json.loads(res.stdout)
-                native_id = native_msg["id"]
-            except Exception as e:
-                raise RuntimeError(f"Failed to parse native send output: {e}")
+                if res.returncode != 0:
+                    raise RuntimeError(f"Native send failed (exit {res.returncode}): {res.stderr[:500]}")
 
-            # Validate response provenance matches actual qualified own bridge sender
-            try:
-                validate_native_send_envelope(native_msg, self.service_binding, self.canonical_workspace)
-            except BridgeCapabilityGap as gap:
-                # Record ambiguous send evidence on disk so we do not erase it or resend duplicates
-                self.receipts["ambiguous_sends"][hub_id] = {
-                    "native_id": native_id,
-                    "reason": str(gap),
-                    "created_at": int(time.time()),
+                try:
+                    native_msg = json.loads(res.stdout)
+                    native_id = native_msg["id"]
+                except Exception as e:
+                    raise RuntimeError(f"Failed to parse native send output: {e}")
+
+                # If sender was resolved by native CLI and we did not have a prior binding, attempt qualification for allowed bridge tags
+                msg_from = native_msg.get("from") if isinstance(native_msg, dict) else None
+                if isinstance(msg_from, dict) and not self.service_binding and not msg_from.get("external"):
+                    sid = msg_from.get("session_id")
+                    stag = msg_from.get("tag")
+                    allowed_tags = [self.service_tag] if self.service_tag else ["hub-bridge", "agent-hub-bridge"]
+                    if sid and stag in allowed_tags:
+                        disc = qualify_native_service_binding(
+                            self.canonical_workspace,
+                            state_dir=get_authoritative_state_dir(self.state_dir),
+                            runtime_dir=get_authoritative_runtime_dir(self.runtime_dir),
+                            service_tag=stag,
+                            service_session_id=str(sid),
+                        )
+                        if disc:
+                            self.service_binding = disc
+
+                # Validate response provenance matches actual qualified own bridge sender
+                try:
+                    validate_native_send_envelope(native_msg, self.service_binding, self.canonical_workspace)
+                except BridgeCapabilityGap as gap:
+                    # Record ambiguous send evidence on disk so we do not erase it or resend duplicates
+                    self.receipts["ambiguous_sends"][hub_id] = {
+                        "native_id": native_id,
+                        "reason": str(gap),
+                        "created_at": int(time.time()),
+                    }
+                    self._save_receipts()
+                    raise
+
+                # Persist receipt envelope and nativeID atomically mode 0600 BEFORE deliver
+                self.receipts["hub_to_native"][hub_id] = native_id
+                msg_envelope_info = {
+                    "from_actor": hub_msg.get("from_actor"),  # Exact original actor
+                    "to_actor": target,
+                    "hub_id": hub_id,
+                    "thread_id": hub_msg.get("thread_id"),
+                    "kind": kind,
+                }
+                if self.service_binding:
+                    msg_envelope_info["service_tag"] = self.service_binding.tag
+                    msg_envelope_info["service_session_id"] = str(self.service_binding.session_id)
+
+                if isinstance(native_msg, dict) and isinstance(native_msg.get("to"), dict):
+                    to_sid = native_msg["to"].get("session_id")
+                    if to_sid:
+                        msg_envelope_info["recipient_session_id"] = str(to_sid)
+
+                self.receipts["hub_messages"][native_id] = msg_envelope_info
+                self._save_receipts()
+
+            # 2. Sync reply delivery with durable intent / uncertainty ledger
+            if kind == "sync_reply":
+                msg_envelope_info = self.receipts.get("hub_messages", {}).get(native_id, {})
+                deliv_state = self.receipts.get("delivers", {}).get(native_id)
+                if deliv_state:
+                    d_status = deliv_state.get("status")
+                    if d_status == "delivered":
+                        # Already successfully delivered: zero additional writes
+                        return native_id
+                    elif d_status in ("intent", "uncertain", "timeout", "failed"):
+                        # Reconcile ONLY genuine terminal delivery evidence (recipient positive cursor ACK)
+                        if self._is_native_id_positively_acked(native_id, target, msg_envelope_info):
+                            deliv_state["status"] = "delivered"
+                            deliv_state["reconciled_at"] = int(time.time())
+                            self._save_receipts()
+                            return native_id
+                        # Native popped message alone not proof of delivery; any unknown result stays held!
+                        raise BridgeCapabilityGap(
+                            f"Hub message {hub_id} (native_id={native_id}) has prior uncertain/intent delivery state ({d_status}) "
+                            f"without genuine terminal delivery evidence; refusing redelivery to prevent duplicate PTY writes"
+                        )
+
+                # Screen capture composer check: two fresh observations then immediate final check
+                self._check_idle_and_empty_composer(tag)
+                time.sleep(0.05)
+                self._check_idle_and_empty_composer(tag)
+                self._check_idle_and_empty_composer(tag)
+
+                # Record durable intent BEFORE possible effect
+                self.receipts.setdefault("delivers", {})[native_id] = {
+                    "hub_id": hub_id,
+                    "status": "intent",
+                    "attempted_at": int(time.time()),
                 }
                 self._save_receipts()
-                raise
 
-            # If sender was resolved by native CLI and we did not have a prior binding, bind now
-            msg_from = native_msg.get("from")
-            if isinstance(msg_from, dict) and not self.service_binding:
-                sid = msg_from.get("session_id")
-                stag = msg_from.get("tag")
-                if sid:
-                    disc = qualify_native_service_binding(
-                        self.canonical_workspace,
-                        state_dir=get_authoritative_state_dir(self.state_dir),
-                        runtime_dir=get_authoritative_runtime_dir(self.runtime_dir),
-                        service_tag=stag,
-                        service_session_id=str(sid),
+                sub_env = self._get_subprocess_env()
+                deliv_cmd = [self.aplexer_bin, "message", "deliver", native_id, "--workspace", self.workspace]
+                try:
+                    deliv_res = subprocess.run(
+                        deliv_cmd, cwd=self.workspace, capture_output=True, text=True, timeout=30, env=sub_env
                     )
-                    if disc:
-                        self.service_binding = disc
+                except subprocess.TimeoutExpired as e:
+                    self.receipts["delivers"][native_id]["status"] = "timeout"
+                    self.receipts["delivers"][native_id]["reason"] = f"Delivery timed out after 30s: {e}"
+                    self.receipts.setdefault("ambiguous_sends", {})[hub_id] = {
+                        "native_id": native_id,
+                        "reason": f"Delivery timed out after 30s: {e}",
+                        "created_at": int(time.time()),
+                    }
+                    self._save_receipts()
+                    raise BridgeCapabilityGap(f"Native delivery timed out; delivery state uncertain, PTY effect held: {e}")
+                except Exception as e:
+                    self.receipts["delivers"][native_id]["status"] = "uncertain"
+                    self.receipts["delivers"][native_id]["reason"] = f"Delivery execution failed: {e}"
+                    self.receipts.setdefault("ambiguous_sends", {})[hub_id] = {
+                        "native_id": native_id,
+                        "reason": f"Delivery execution failed: {e}",
+                        "created_at": int(time.time()),
+                    }
+                    self._save_receipts()
+                    raise BridgeCapabilityGap(f"Native delivery execution failed; delivery state uncertain: {e}")
 
-            # Persist receipt envelope and nativeID atomically mode 0600 BEFORE deliver
-            self.receipts["hub_to_native"][hub_id] = native_id
-            msg_envelope_info = {
-                "from_actor": hub_msg.get("from_actor"),  # Exact original actor
-                "to_actor": target,
-                "hub_id": hub_id,
-                "thread_id": hub_msg.get("thread_id"),
-                "kind": kind,
-            }
-            if self.service_binding:
-                msg_envelope_info["service_tag"] = self.service_binding.tag
-                msg_envelope_info["service_session_id"] = str(self.service_binding.session_id)
+                if deliv_res.returncode != 0:
+                    self.receipts["delivers"][native_id]["status"] = "uncertain"
+                    self.receipts["delivers"][native_id]["returncode"] = deliv_res.returncode
+                    self.receipts["delivers"][native_id]["stderr"] = deliv_res.stderr[:200]
+                    self.receipts.setdefault("ambiguous_sends", {})[hub_id] = {
+                        "native_id": native_id,
+                        "reason": f"Native delivery refused (exit {deliv_res.returncode}): {deliv_res.stderr[:200]}",
+                        "created_at": int(time.time()),
+                    }
+                    self._save_receipts()
+                    raise BridgeCapabilityGap(f"Native delivery refused: {deliv_res.stderr[:200]}")
 
-            if isinstance(native_msg, dict) and isinstance(native_msg.get("to"), dict):
-                to_sid = native_msg["to"].get("session_id")
-                if to_sid:
-                    msg_envelope_info["recipient_session_id"] = str(to_sid)
+                self.receipts["delivers"][native_id]["status"] = "delivered"
+                self.receipts["delivers"][native_id]["delivered_at"] = int(time.time())
+                self._save_receipts()
 
-            self.receipts["hub_messages"][native_id] = msg_envelope_info
-            self._save_receipts()
-
-        # Sync reply delivery: two fresh observations then immediate final check
-        if kind == "sync_reply":
-            self._check_idle_and_empty_composer(tag)
-            time.sleep(0.05)
-            self._check_idle_and_empty_composer(tag)
-            self._check_idle_and_empty_composer(tag)
-
-            sub_env = self._get_subprocess_env()
-            deliv_cmd = [self.aplexer_bin, "message", "deliver", native_id, "--workspace", self.workspace]
-            deliv_res = subprocess.run(deliv_cmd, cwd=self.workspace, capture_output=True, text=True, timeout=30, env=sub_env)
-            if deliv_res.returncode != 0:
-                raise BridgeCapabilityGap(f"Native delivery refused: {deliv_res.stderr[:200]}")
-
-        return native_id
+            return native_id
 
     def sync_native_to_hub(self) -> None:
-        if "hub_to_native" not in self.receipts:
-            self.receipts["hub_to_native"] = {}
-        if "hub_messages" not in self.receipts:
-            self.receipts["hub_messages"] = {}
-        if "native_to_hub" not in self.receipts:
-            self.receipts["native_to_hub"] = {}
-        if "acked_hub_messages" not in self.receipts:
-            self.receipts["acked_hub_messages"] = []
-        if "ambiguous_sends" not in self.receipts:
-            self.receipts["ambiguous_sends"] = {}
+        with self._receipts_lock():
+            self._sync_receipts_with_lock()
 
-        native_to_hub_map = {v: k for k, v in self.receipts["hub_to_native"].items()}
+            if "hub_to_native" not in self.receipts:
+                self.receipts["hub_to_native"] = {}
+            if "hub_messages" not in self.receipts:
+                self.receipts["hub_messages"] = {}
+            if "native_to_hub" not in self.receipts:
+                self.receipts["native_to_hub"] = {}
+            if "acked_hub_messages" not in self.receipts:
+                self.receipts["acked_hub_messages"] = []
+            if "ambiguous_sends" not in self.receipts:
+                self.receipts["ambiguous_sends"] = {}
+            if "delivers" not in self.receipts:
+                self.receipts["delivers"] = {}
 
-        # 1. Check positive ACKs for forwarded hub messages
-        for native_id, hub_id in list(native_to_hub_map.items()):
-            if hub_id in self.receipts["acked_hub_messages"]:
-                continue
+            native_to_hub_map = {v: k for k, v in self.receipts["hub_to_native"].items()}
 
-            hub_msg_info = self.receipts.get("hub_messages", {}).get(native_id, {})
-            to_actor = hub_msg_info.get("to_actor")
-            if not to_actor:
-                continue
+            # 1. Check positive ACKs for forwarded hub messages
+            for native_id, hub_id in list(native_to_hub_map.items()):
+                hub_msg_info = self.receipts.get("hub_messages", {}).get(native_id, {})
+                to_actor = hub_msg_info.get("to_actor")
+                if not to_actor:
+                    continue
 
-            if self._is_native_id_positively_acked(native_id, to_actor, hub_msg_info):
-                try:
-                    bus.ack(hub_id)
-                    self.receipts["acked_hub_messages"].append(hub_id)
-                    self._save_receipts()
-                except Exception as e:
-                    print(f"Failed to ack hub message {hub_id}: {e}", file=sys.stderr)
+                if self._is_native_id_positively_acked(native_id, to_actor, hub_msg_info):
+                    # Reconcile delivery state if present
+                    if native_id in self.receipts.get("delivers", {}):
+                        self.receipts["delivers"][native_id]["status"] = "delivered"
+                        self.receipts["delivers"][native_id]["reconciled_at"] = int(time.time())
+                        self._save_receipts()
 
-        # 2. Sync replies from read-only aplexer message log
-        cmd = [self.aplexer_bin, "message", "log", "--json", "--workspace", self.workspace]
-        sub_env = self._get_subprocess_env()
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=sub_env)
-        except Exception as e:
-            print(f"Failed to run aplexer message log: {e}", file=sys.stderr)
-            return
+                    if hub_id not in self.receipts["acked_hub_messages"]:
+                        try:
+                            bus.ack(hub_id)
+                            self.receipts["acked_hub_messages"].append(hub_id)
+                            self._save_receipts()
+                        except Exception as e:
+                            print(f"Failed to ack hub message {hub_id}: {e}", file=sys.stderr)
 
-        if res.returncode != 0:
-            print(f"Failed to run aplexer message log: {res.stderr[:200]}", file=sys.stderr)
-            return
-
-        try:
-            log_entries = json.loads(res.stdout)
-            if not isinstance(log_entries, list):
+            # 2. Sync replies from read-only aplexer message log
+            cmd = [self.aplexer_bin, "message", "log", "--json", "--workspace", self.workspace]
+            sub_env = self._get_subprocess_env()
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=sub_env)
+            except Exception as e:
+                print(f"Failed to run aplexer message log: {e}", file=sys.stderr)
                 return
-        except Exception as e:
-            print(f"Failed to parse aplexer message log: {e}", file=sys.stderr)
-            return
 
-        for msg in log_entries:
-            if not isinstance(msg, dict):
-                continue
-            native_id = msg.get("id")
-            if not native_id:
-                continue
-            if native_id in self.receipts.get("native_to_hub", {}):
-                continue
+            if res.returncode != 0:
+                print(f"Failed to run aplexer message log: {res.stderr[:200]}", file=sys.stderr)
+                return
 
-            kind = msg.get("kind", "reply")
-            reply_to = msg.get("reply_to")
+            try:
+                log_entries = json.loads(res.stdout)
+                if not isinstance(log_entries, list):
+                    return
+            except Exception as e:
+                print(f"Failed to parse aplexer message log: {e}", file=sys.stderr)
+                return
 
-            # If it's a native reply to something we forwarded
-            if reply_to and reply_to in native_to_hub_map:
-                hub_reply_to = native_to_hub_map[reply_to]
-                original = self.receipts.get("hub_messages", {}).get(reply_to, {})
-                to_actor = original.get("from_actor")
-                sender_actor = original.get("to_actor")
-                thread_id = original.get("thread_id")
-                if not to_actor or not sender_actor:
-                    print(f"Cannot bridge reply {native_id}: missing original actors", file=sys.stderr)
+            for msg in log_entries:
+                if not isinstance(msg, dict):
+                    continue
+                native_id = msg.get("id")
+                if not native_id:
+                    continue
+                if native_id in self.receipts.get("native_to_hub", {}):
                     continue
 
-                valid, reason = validate_native_reply_provenance(
-                    msg,
-                    original,
-                    self.canonical_workspace,
-                    self.service_binding,
-                    get_authoritative_state_dir(self.state_dir),
-                    get_authoritative_runtime_dir(self.runtime_dir),
-                )
-                if not valid:
-                    print(f"Skipping reply {native_id}: {reason}", file=sys.stderr)
-                    continue
+                kind = msg.get("kind", "reply")
+                reply_to = msg.get("reply_to")
 
-                body = msg.get("body", "")
-                try:
-                    res_hub = bus.reply(
-                        hub_reply_to,
-                        sender_actor,
-                        to_actor,
-                        kind,
-                        body,
-                        idempotency_key=native_id,
-                        thread_id=thread_id
+                # If it's a native reply to something we forwarded
+                if reply_to and reply_to in native_to_hub_map:
+                    hub_reply_to = native_to_hub_map[reply_to]
+                    original = self.receipts.get("hub_messages", {}).get(reply_to, {})
+                    to_actor = original.get("from_actor")
+                    sender_actor = original.get("to_actor")
+                    thread_id = original.get("thread_id")
+                    if not to_actor or not sender_actor:
+                        print(f"Cannot bridge reply {native_id}: missing original actors", file=sys.stderr)
+                        continue
+
+                    valid, reason = validate_native_reply_provenance(
+                        msg,
+                        original,
+                        self.canonical_workspace,
+                        self.service_binding,
+                        get_authoritative_state_dir(self.state_dir),
+                        get_authoritative_runtime_dir(self.runtime_dir),
                     )
-                    hub_rep_id = res_hub.get("id") if isinstance(res_hub, dict) else str(res_hub)
-                    self.receipts["native_to_hub"][native_id] = hub_rep_id
-                    self._save_receipts()
-                except Exception as e:
-                    print(f"Failed to bridge reply {native_id} to hub: {e}", file=sys.stderr)
+                    if not valid:
+                        print(f"Skipping reply {native_id}: {reason}", file=sys.stderr)
+                        continue
+
+                    body = msg.get("body", "")
+                    try:
+                        res_hub = bus.reply(
+                            hub_reply_to,
+                            sender_actor,
+                            to_actor,
+                            kind,
+                            body,
+                            idempotency_key=native_id,
+                            thread_id=thread_id
+                        )
+                        hub_rep_id = res_hub.get("id") if isinstance(res_hub, dict) else str(res_hub)
+                        self.receipts["native_to_hub"][native_id] = hub_rep_id
+                        self._save_receipts()
+                    except Exception as e:
+                        print(f"Failed to bridge reply {native_id} to hub: {e}", file=sys.stderr)
