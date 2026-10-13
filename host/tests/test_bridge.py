@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -20,6 +21,7 @@ from agent_hub_host.bridge import (
     get_authoritative_state_dir,
     get_workspace_key,
 )
+from agent_hub_host.native_bridge import validate_native_reply_provenance
 
 
 def get_test_tmp_dir() -> str:
@@ -891,6 +893,395 @@ sys.exit(0)
                 thread_id="thread-verified-7"
             )
             self.assertEqual(bridge.receipts["native_to_hub"]["native-rep-valid"], "hub-rep-456")
+
+    def test_b1_deliver_intent_recorded_before_effect(self):
+        """Durable deliver intent is written to disk before message deliver execution."""
+        td = get_test_tmp_dir()
+        work = os.path.join(td, "work")
+        state_dir = os.path.join(td, "state")
+        canonical_ws = canonicalize_workspace(work)
+        rec_uuid = str(uuid.uuid4())
+        create_authoritative_state(state_dir, canonical_ws, "agent-1", rec_uuid)
+        bridge = MailboxBridge(work, state_dir=state_dir)
+
+        native_id = "native-intent-1"
+        hub_msg = {"id": "hub-intent-1", "to_actor": "agent-1", "body": "hi", "kind": "sync_reply"}
+
+        intent_checked = []
+
+        def mock_subprocess(cmd, *args, **kwargs):
+            if "send" in cmd:
+                return MagicMock(returncode=0, stdout=json.dumps({
+                    "schema_version": 1,
+                    "id": native_id,
+                    "workspace": canonical_ws,
+                    "from": {"tag": bridge.service_binding.tag, "session_id": bridge.service_binding.session_id},
+                    "to": {"tag": "agent-1", "session_id": rec_uuid},
+                }))
+            elif "status" in cmd:
+                return MagicMock(returncode=0, stdout='{"state":"idle"}')
+            elif "capture" in cmd:
+                return MagicMock(returncode=0, stdout='prompt ❯')
+            elif "deliver" in cmd:
+                # Check disk receipts at moment of deliver invocation
+                with open(bridge.receipts_file, "r", encoding="utf-8") as f:
+                    disk_data = json.load(f)
+                deliv_entry = disk_data.get("delivers", {}).get(native_id, {})
+                intent_checked.append(deliv_entry.get("status"))
+                return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0, stdout="")
+
+        with patch("subprocess.run", side_effect=mock_subprocess):
+            bridge.forward_hub_to_native(hub_msg)
+
+        self.assertEqual(intent_checked, ["intent"])
+        self.assertEqual(bridge.receipts["delivers"][native_id]["status"], "delivered")
+
+    def test_b1_deliver_timeout_marks_uncertain_and_refuses_duplicate_pty_write_on_retry(self):
+        """Delivery timeout marks state uncertain, records ambiguous send, and retry does zero additional writes."""
+        td = get_test_tmp_dir()
+        work = os.path.join(td, "work")
+        state_dir = os.path.join(td, "state")
+        canonical_ws = canonicalize_workspace(work)
+        rec_uuid = str(uuid.uuid4())
+        create_authoritative_state(state_dir, canonical_ws, "agent-1", rec_uuid)
+        bridge = MailboxBridge(work, state_dir=state_dir)
+
+        native_id = "native-timeout-1"
+        hub_msg = {"id": "hub-timeout-1", "to_actor": "agent-1", "body": "hi", "kind": "sync_reply"}
+
+        def mock_subprocess_timeout(cmd, *args, **kwargs):
+            if "send" in cmd:
+                return MagicMock(returncode=0, stdout=json.dumps({
+                    "schema_version": 1,
+                    "id": native_id,
+                    "workspace": canonical_ws,
+                    "from": {"tag": bridge.service_binding.tag, "session_id": bridge.service_binding.session_id},
+                    "to": {"tag": "agent-1", "session_id": rec_uuid},
+                }))
+            elif "status" in cmd:
+                return MagicMock(returncode=0, stdout='{"state":"idle"}')
+            elif "capture" in cmd:
+                return MagicMock(returncode=0, stdout='prompt ❯')
+            elif "deliver" in cmd:
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=30)
+            return MagicMock(returncode=0, stdout="")
+
+        with patch("subprocess.run", side_effect=mock_subprocess_timeout):
+            with self.assertRaises(BridgeCapabilityGap) as ctx:
+                bridge.forward_hub_to_native(hub_msg)
+            self.assertIn("timed out", str(ctx.exception).lower())
+
+        self.assertEqual(bridge.receipts["delivers"][native_id]["status"], "timeout")
+        self.assertIn("hub-timeout-1", bridge.receipts["ambiguous_sends"])
+
+        # Retry forward must refuse immediately without running deliver subprocess again
+        with patch("subprocess.run") as mock_run:
+            with self.assertRaises(BridgeCapabilityGap) as ctx2:
+                bridge.forward_hub_to_native(hub_msg)
+            self.assertIn("refusing redelivery", str(ctx2.exception).lower())
+            mock_run.assert_not_called()
+
+    def test_b1_deliver_effect_then_crash_refuses_additional_write_on_restart(self):
+        """Deliver nonzero exit marks state uncertain, and restart refuses retry without duplicate write."""
+        td = get_test_tmp_dir()
+        work = os.path.join(td, "work")
+        state_dir = os.path.join(td, "state")
+        canonical_ws = canonicalize_workspace(work)
+        rec_uuid = str(uuid.uuid4())
+        create_authoritative_state(state_dir, canonical_ws, "agent-1", rec_uuid)
+        bridge = MailboxBridge(work, state_dir=state_dir)
+
+        native_id = "native-crash-1"
+        hub_msg = {"id": "hub-crash-1", "to_actor": "agent-1", "body": "hi", "kind": "sync_reply"}
+
+        def mock_subprocess_crash(cmd, *args, **kwargs):
+            if "send" in cmd:
+                return MagicMock(returncode=0, stdout=json.dumps({
+                    "schema_version": 1,
+                    "id": native_id,
+                    "workspace": canonical_ws,
+                    "from": {"tag": bridge.service_binding.tag, "session_id": bridge.service_binding.session_id},
+                    "to": {"tag": "agent-1", "session_id": rec_uuid},
+                }))
+            elif "status" in cmd:
+                return MagicMock(returncode=0, stdout='{"state":"idle"}')
+            elif "capture" in cmd:
+                return MagicMock(returncode=0, stdout='prompt ❯')
+            elif "deliver" in cmd:
+                return MagicMock(returncode=1, stderr="fatal error during PTY flush")
+            return MagicMock(returncode=0, stdout="")
+
+        with patch("subprocess.run", side_effect=mock_subprocess_crash):
+            with self.assertRaises(BridgeCapabilityGap):
+                bridge.forward_hub_to_native(hub_msg)
+
+        # Simulate restart with new MailboxBridge instance
+        bridge2 = MailboxBridge(work, state_dir=state_dir)
+        self.assertEqual(bridge2.receipts["delivers"][native_id]["status"], "uncertain")
+
+        # Retry refuses and executes zero additional writes
+        with patch("subprocess.run") as mock_run:
+            with self.assertRaises(BridgeCapabilityGap) as ctx:
+                bridge2.forward_hub_to_native(hub_msg)
+            self.assertIn("refusing redelivery", str(ctx.exception).lower())
+            mock_run.assert_not_called()
+
+    def test_b1_native_popped_message_alone_does_not_prove_delivery(self):
+        """Native popped message alone does NOT prove delivery; missing message without cursor ACK stays held."""
+        td = get_test_tmp_dir()
+        work = os.path.join(td, "work")
+        state_dir = os.path.join(td, "state")
+        canonical_ws = canonicalize_workspace(work)
+        rec_uuid = str(uuid.uuid4())
+        mailbox_dir, cursor_path = create_authoritative_state(state_dir, canonical_ws, "agent-1", rec_uuid)
+
+        bridge = MailboxBridge(work, state_dir=state_dir)
+        native_id = "native-popped-1"
+        hub_id = "hub-popped-1"
+        bridge.receipts["hub_to_native"][hub_id] = native_id
+        bridge.receipts["hub_messages"][native_id] = {
+            "from_actor": "alice",
+            "to_actor": "agent-1",
+            "hub_id": hub_id,
+            "recipient_session_id": rec_uuid,
+            "kind": "sync_reply"
+        }
+        bridge.receipts["delivers"][native_id] = {
+            "hub_id": hub_id,
+            "status": "intent",
+            "attempted_at": 1000
+        }
+        bridge._save_receipts()
+
+        # Recipient cursor exceptions is empty (no positive ACK), and native message file is absent (popped)
+        msg_file = os.path.join(mailbox_dir, "msgs", f"{native_id}.json")
+        self.assertFalse(os.path.exists(msg_file))
+
+        with patch("subprocess.run") as mock_run:
+            with self.assertRaises(BridgeCapabilityGap) as ctx:
+                bridge.forward_hub_to_native({
+                    "id": hub_id,
+                    "to_actor": "agent-1",
+                    "from_actor": "alice",
+                    "body": "msg",
+                    "kind": "sync_reply"
+                })
+            self.assertIn("prior uncertain/intent delivery state", str(ctx.exception))
+            mock_run.assert_not_called()
+
+    def test_b1_reconcile_only_genuine_terminal_delivery_evidence(self):
+        """Uncertain delivery reconciles when recipient cursor provides positive ACK; zero additional writes."""
+        td = get_test_tmp_dir()
+        work = os.path.join(td, "work")
+        state_dir = os.path.join(td, "state")
+        canonical_ws = canonicalize_workspace(work)
+        rec_uuid = str(uuid.uuid4())
+        mailbox_dir, cursor_path = create_authoritative_state(state_dir, canonical_ws, "agent-1", rec_uuid)
+
+        bridge = MailboxBridge(work, state_dir=state_dir)
+        native_id = "native-reconcile-1"
+        hub_id = "hub-reconcile-1"
+        bridge.receipts["hub_to_native"][hub_id] = native_id
+        bridge.receipts["hub_messages"][native_id] = {
+            "from_actor": "alice",
+            "to_actor": "agent-1",
+            "hub_id": hub_id,
+            "recipient_session_id": rec_uuid,
+            "kind": "sync_reply"
+        }
+        bridge.receipts["delivers"][native_id] = {
+            "hub_id": hub_id,
+            "status": "uncertain",
+            "attempted_at": 1000
+        }
+        bridge._save_receipts()
+
+        # Update recipient cursor with positive ACK for native_id
+        with open(cursor_path, "w", encoding="utf-8") as f:
+            json.dump({"exceptions": [native_id], "acked_through": None}, f)
+
+        # Retry forward reconciles to delivered without running deliver subprocess again
+        with patch("subprocess.run") as mock_run:
+            res_nid = bridge.forward_hub_to_native({
+                "id": hub_id,
+                "to_actor": "agent-1",
+                "from_actor": "alice",
+                "body": "msg",
+                "kind": "sync_reply"
+            })
+            self.assertEqual(res_nid, native_id)
+            self.assertEqual(bridge.receipts["delivers"][native_id]["status"], "delivered")
+            mock_run.assert_not_called()
+
+    def test_b1_successful_replay_does_not_redeliver(self):
+        """Replay of already delivered sync_reply does not run status, capture, or deliver again."""
+        td = get_test_tmp_dir()
+        work = os.path.join(td, "work")
+        state_dir = os.path.join(td, "state")
+        canonical_ws = canonicalize_workspace(work)
+        rec_uuid = str(uuid.uuid4())
+        create_authoritative_state(state_dir, canonical_ws, "agent-1", rec_uuid)
+        bridge = MailboxBridge(work, state_dir=state_dir)
+
+        native_id = "native-replay-ok"
+        hub_id = "hub-replay-ok"
+        bridge.receipts["hub_to_native"][hub_id] = native_id
+        bridge.receipts["hub_messages"][native_id] = {
+            "from_actor": "alice",
+            "to_actor": "agent-1",
+            "hub_id": hub_id,
+            "recipient_session_id": rec_uuid,
+            "kind": "sync_reply"
+        }
+        bridge.receipts["delivers"][native_id] = {
+            "hub_id": hub_id,
+            "status": "delivered",
+            "delivered_at": 1000
+        }
+        bridge._save_receipts()
+
+        with patch("subprocess.run") as mock_run:
+            res_id = bridge.forward_hub_to_native({
+                "id": hub_id,
+                "to_actor": "agent-1",
+                "from_actor": "alice",
+                "body": "msg",
+                "kind": "sync_reply"
+            })
+            self.assertEqual(res_id, native_id)
+            mock_run.assert_not_called()
+
+    def test_b1_receipt_storage_retention_bounded(self):
+        """Acked receipt retention is pruned to MAX_RECEIPTS_ENTRIES."""
+        td = get_test_tmp_dir()
+        work = os.path.join(td, "work")
+        bridge = MailboxBridge(work)
+
+        # Populate with 1100 acked entries
+        for i in range(1100):
+            hid = f"hub-old-{i}"
+            nid = f"native-old-{i}"
+            bridge.receipts["hub_to_native"][hid] = nid
+            bridge.receipts["hub_messages"][nid] = {"hub_id": hid}
+            bridge.receipts["acked_hub_messages"].append(hid)
+            bridge.receipts["delivers"][nid] = {"hub_id": hid, "status": "delivered"}
+
+        bridge._save_receipts()
+
+        loaded = bridge._load_receipts()
+        self.assertLessEqual(len(loaded["acked_hub_messages"]), 1000)
+        self.assertLessEqual(len(loaded["hub_to_native"]), 1000)
+
+    def test_b2_absent_binding_with_external_false_refused_and_recorded_ambiguous(self):
+        """Bridge without own qualified session binding refuses envelope with external:false into ambiguous_sends."""
+        td = get_test_tmp_dir()
+        work = os.path.join(td, "work")
+        canonical_ws = canonicalize_workspace(work)
+        # Empty state dir => qualify_native_service_binding returns None
+        bridge = MailboxBridge(work)
+        self.assertIsNone(bridge.service_binding)
+
+        hub_msg = {"id": "hub-b2-1", "to_actor": "agent-1", "body": "msg", "kind": "note"}
+
+        # Simulate CLI emitting from with external:false but tag 'alex' (not a bridge service binding)
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout=json.dumps({
+            "schema_version": 1,
+            "id": "native-b2-1",
+            "workspace": canonical_ws,
+            "from": {"tag": "alex", "session_id": str(uuid.uuid4()), "external": False},
+            "to": {"tag": "agent-1"},
+            "body": "msg"
+        }))):
+            with self.assertRaises(BridgeCapabilityGap) as ctx:
+                bridge.forward_hub_to_native(hub_msg)
+            self.assertIn("unqualified", str(ctx.exception).lower())
+
+        # Assert no positive receipt in hub_to_native
+        self.assertNotIn("hub-b2-1", bridge.receipts.get("hub_to_native", {}))
+        # Assert ambiguous send evidence recorded
+        self.assertIn("hub-b2-1", bridge.receipts.get("ambiguous_sends", {}))
+
+    def test_b2_wrong_session_in_send_envelope_refused(self):
+        """Envelope sender session mismatching bridge service binding is refused and recorded ambiguous."""
+        td = get_test_tmp_dir()
+        work = os.path.join(td, "work")
+        state_dir = os.path.join(td, "state")
+        canonical_ws = canonicalize_workspace(work)
+        rec_uuid = str(uuid.uuid4())
+        serv_uuid = str(uuid.uuid4())
+        create_authoritative_state(
+            state_dir, canonical_ws, "agent-1", rec_uuid,
+            service_session_id=serv_uuid, service_tag="hub-bridge"
+        )
+        bridge = MailboxBridge(work, state_dir=state_dir, service_session_id=serv_uuid, service_tag="hub-bridge")
+        self.assertIsNotNone(bridge.service_binding)
+
+        wrong_sid = str(uuid.uuid4())
+        hub_msg = {"id": "hub-b2-wrong-sid", "to_actor": "agent-1", "body": "msg", "kind": "note"}
+
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout=json.dumps({
+            "schema_version": 1,
+            "id": "native-b2-wrong",
+            "workspace": canonical_ws,
+            "from": {"tag": "hub-bridge", "session_id": wrong_sid, "external": False},
+            "to": {"tag": "agent-1", "session_id": rec_uuid},
+            "body": "msg"
+        }))):
+            with self.assertRaises(BridgeCapabilityGap):
+                bridge.forward_hub_to_native(hub_msg)
+
+        self.assertNotIn("hub-b2-wrong-sid", bridge.receipts.get("hub_to_native", {}))
+        self.assertIn("hub-b2-wrong-sid", bridge.receipts.get("ambiguous_sends", {}))
+
+    def test_b2_symlinked_recipient_record_rejected(self):
+        """Symlinked recipient session.json must NOT be accepted during recipient resolution."""
+        td = get_test_tmp_dir()
+        work = os.path.join(td, "work")
+        state_dir = os.path.join(td, "state")
+        canonical_ws = canonicalize_workspace(work)
+        real_sess_dir = os.path.join(td, "real-sess")
+        os.makedirs(real_sess_dir, exist_ok=True)
+        real_json = os.path.join(real_sess_dir, "session.json")
+        rec_id = str(uuid.uuid4())
+        with open(real_json, "w", encoding="utf-8") as f:
+            json.dump({
+                "schema_version": 1,
+                "id": rec_id,
+                "workspace": canonical_ws,
+                "tag": "sym-agent"
+            }, f)
+
+        # Place symlink inside state_dir/sessions/<rec_id>/session.json pointing to real_json
+        target_sdir = os.path.join(state_dir, "sessions", rec_id)
+        os.makedirs(target_sdir, exist_ok=True)
+        symlink_json = os.path.join(target_sdir, "session.json")
+        os.symlink(real_json, symlink_json)
+
+        bridge = MailboxBridge(work, state_dir=state_dir)
+        resolved = bridge._resolve_recipient_session_id("agent:sym-agent", {})
+        self.assertIsNone(resolved)
+
+    def test_tightened_reverse_provenance_empty_sessions_dirs_unknown_deny(self):
+        """Empty sessions_dirs returns UNKNOWN deny rather than failing open."""
+        td = get_test_tmp_dir()
+        work = os.path.join(td, "work")
+        canonical_ws = canonicalize_workspace(work)
+
+        reply_msg = {
+            "id": "reply-1",
+            "workspace": canonical_ws,
+            "from": {"tag": "worker", "session_id": str(uuid.uuid4())},
+            "to": {"tag": "hub-bridge"},
+            "reply_to": "orig-1"
+        }
+        original_info = {"to_actor": "agent:worker", "from_actor": "lead"}
+
+        valid, reason = validate_native_reply_provenance(
+            reply_msg, original_info, canonical_ws, None, None, None
+        )
+        self.assertFalse(valid)
+        self.assertIn("UNKNOWN", reason)
 
 
 if __name__ == "__main__":

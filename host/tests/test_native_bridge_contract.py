@@ -565,6 +565,210 @@ class TestNativeBridgeContract(unittest.TestCase):
             self.assertIn("prior ambiguous send", str(ctx.exception))
             mock_run.assert_not_called()
 
+    def test_fake_native_deliver_effect_then_timeout_zero_additional_writes_on_replay(self):
+        """Fake native deliver simulates effect then timeout: replay executes exactly zero additional PTY writes."""
+        td = get_test_tmp_dir()
+        env = setup_authoritative_test_env(td)
+        log_file = os.path.join(td, "pty_writes.log")
+
+        bridge = MailboxBridge(
+            env["work"],
+            aplexer_bin=env["fake_bin"],
+            state_dir=env["state_dir"],
+            runtime_dir=env["runtime_dir"],
+            service_session_id=env["service_id"],
+            service_tag=env["service_tag"],
+        )
+
+        hub_msg = {
+            "id": "hub-sync-timeout",
+            "to_actor": env["recip_tag"],
+            "from_actor": "lead",
+            "body": "sync work",
+            "kind": "sync_reply",
+        }
+
+        # First attempt: deliver times out (using timeout patch on subprocess.run for deliver call)
+        orig_run = subprocess.run
+        deliver_invocations = []
+
+        def timed_out_deliver_run(cmd, *args, **kwargs):
+            if "deliver" in cmd:
+                deliver_invocations.append(cmd)
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write("pty-bytes-written\n")
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=30)
+            return orig_run(cmd, *args, **kwargs)
+
+        with patch("subprocess.run", side_effect=timed_out_deliver_run):
+            with self.assertRaises(BridgeCapabilityGap) as ctx:
+                bridge.forward_hub_to_native(hub_msg)
+            self.assertIn("timed out", str(ctx.exception).lower())
+
+        self.assertEqual(len(deliver_invocations), 1)
+
+        # Retry attempt: must refuse and execute zero additional deliver/PTY writes
+        with patch("subprocess.run", side_effect=timed_out_deliver_run):
+            with self.assertRaises(BridgeCapabilityGap) as ctx2:
+                bridge.forward_hub_to_native(hub_msg)
+            self.assertIn("refusing redelivery", str(ctx2.exception).lower())
+
+        # Assert no second invocation was made
+        self.assertEqual(len(deliver_invocations), 1)
+        with open(log_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        self.assertEqual(len(lines), 1, "Expected exactly 1 PTY effect written across attempt and retry")
+
+    def test_fake_native_deliver_effect_then_crash_and_restart(self):
+        """Fake native deliver writes effect then crashes: restart executes zero additional writes."""
+        td = get_test_tmp_dir()
+        env = setup_authoritative_test_env(td)
+        log_file = os.path.join(td, "pty_writes.log")
+
+        bridge = MailboxBridge(
+            env["work"],
+            aplexer_bin=env["fake_bin"],
+            state_dir=env["state_dir"],
+            runtime_dir=env["runtime_dir"],
+            service_session_id=env["service_id"],
+            service_tag=env["service_tag"],
+        )
+
+        hub_msg = {
+            "id": "hub-sync-crash",
+            "to_actor": env["recip_tag"],
+            "from_actor": "lead",
+            "body": "sync work",
+            "kind": "sync_reply",
+        }
+
+        # Initial attempt with APLEXER_FAKE_DELIVER_BEHAVIOR="effect_then_crash"
+        with patch.dict(os.environ, {
+            "APLEXER_FAKE_DELIVER_BEHAVIOR": "effect_then_crash",
+            "APLEXER_FAKE_DELIVER_LOG": log_file
+        }):
+            with self.assertRaises(BridgeCapabilityGap):
+                bridge.forward_hub_to_native(hub_msg)
+
+        # Verify effect was recorded in log_file
+        self.assertTrue(os.path.isfile(log_file))
+        with open(log_file, "r", encoding="utf-8") as f:
+            writes_1 = f.readlines()
+        self.assertEqual(len(writes_1), 1)
+
+        # Restart with new bridge instance
+        bridge_restarted = MailboxBridge(
+            env["work"],
+            aplexer_bin=env["fake_bin"],
+            state_dir=env["state_dir"],
+            runtime_dir=env["runtime_dir"],
+            service_session_id=env["service_id"],
+            service_tag=env["service_tag"],
+        )
+
+        # Retry must refuse without adding any PTY writes
+        with patch.dict(os.environ, {
+            "APLEXER_FAKE_DELIVER_BEHAVIOR": "effect_then_crash",
+            "APLEXER_FAKE_DELIVER_LOG": log_file
+        }):
+            with self.assertRaises(BridgeCapabilityGap) as ctx:
+                bridge_restarted.forward_hub_to_native(hub_msg)
+            self.assertIn("refusing redelivery", str(ctx.exception).lower())
+
+        with open(log_file, "r", encoding="utf-8") as f:
+            writes_2 = f.readlines()
+        self.assertEqual(len(writes_2), 1, "Exactly zero additional deliver writes permitted after restart")
+
+    def test_fake_native_deliver_terminal_reconciliation(self):
+        """Uncertain deliver reconciles when recipient genuine cursor ACK appears; zero additional deliver writes."""
+        td = get_test_tmp_dir()
+        env = setup_authoritative_test_env(td)
+        log_file = os.path.join(td, "pty_writes.log")
+
+        bridge = MailboxBridge(
+            env["work"],
+            aplexer_bin=env["fake_bin"],
+            state_dir=env["state_dir"],
+            runtime_dir=env["runtime_dir"],
+            service_session_id=env["service_id"],
+            service_tag=env["service_tag"],
+        )
+
+        hub_msg = {
+            "id": "hub-reconcile-test",
+            "to_actor": env["recip_tag"],
+            "from_actor": "lead",
+            "body": "sync work",
+            "kind": "sync_reply",
+        }
+
+        with patch.dict(os.environ, {
+            "APLEXER_FAKE_DELIVER_BEHAVIOR": "effect_then_crash",
+            "APLEXER_FAKE_DELIVER_LOG": log_file
+        }):
+            with self.assertRaises(BridgeCapabilityGap):
+                bridge.forward_hub_to_native(hub_msg)
+
+        native_id = bridge.receipts["hub_to_native"]["hub-reconcile-test"]
+
+        # Recipient sends authentic ACK via fake CLI
+        ack_proc = subprocess.run(
+            [env["fake_bin"], "message", "ack", native_id],
+            cwd=env["work"],
+            capture_output=True,
+            text=True,
+            env={
+                "APLEXER_STATE_DIR": env["state_dir"],
+                "APLEXER_WORKSPACE": env["canonical_ws"],
+                "APLEXER_SESSION_ID": env["recip_id"],
+            },
+        )
+        self.assertEqual(ack_proc.returncode, 0)
+
+        # Retry forward reconciles without running deliver again
+        with patch.dict(os.environ, {
+            "APLEXER_FAKE_DELIVER_BEHAVIOR": "effect_then_crash",
+            "APLEXER_FAKE_DELIVER_LOG": log_file
+        }):
+            resolved_id = bridge.forward_hub_to_native(hub_msg)
+            self.assertEqual(resolved_id, native_id)
+            self.assertEqual(bridge.receipts["delivers"][native_id]["status"], "delivered")
+
+        with open(log_file, "r", encoding="utf-8") as f:
+            total_writes = f.readlines()
+        self.assertEqual(len(total_writes), 1, "Terminal delivery reconciled with zero additional writes")
+
+    def test_fake_native_b2_masked_or_absent_binding_refused(self):
+        """Fake native send envelope without bridge own session binding is refused into ambiguous_sends."""
+        td = get_test_tmp_dir()
+        env = setup_authoritative_test_env(td)
+
+        # Create bridge with NO service session ID or ambient binding
+        bridge = MailboxBridge(
+            env["work"],
+            aplexer_bin=env["fake_bin"],
+            state_dir=env["state_dir"],
+            runtime_dir=env["runtime_dir"],
+            service_session_id=None,
+            service_tag="custom-unbound-service",
+        )
+        self.assertIsNone(bridge.service_binding)
+
+        hub_msg = {
+            "id": "hub-b2-masked",
+            "to_actor": env["recip_tag"],
+            "from_actor": "lead",
+            "body": "unauthenticated test",
+            "kind": "note",
+        }
+
+        with self.assertRaises(BridgeCapabilityGap) as ctx:
+            bridge.forward_hub_to_native(hub_msg)
+
+        self.assertIn("unqualified", str(ctx.exception).lower())
+        self.assertNotIn("hub-b2-masked", bridge.receipts.get("hub_to_native", {}))
+        self.assertIn("hub-b2-masked", bridge.receipts.get("ambiguous_sends", {}))
+
 
 if __name__ == "__main__":
     unittest.main()
