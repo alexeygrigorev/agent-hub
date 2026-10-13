@@ -126,16 +126,19 @@ class MailboxBridge:
             try:
                 with open(self.receipts_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    if isinstance(data, dict):
-                        data.setdefault("hub_to_native", {})
-                        data.setdefault("native_to_hub", {})
-                        data.setdefault("hub_messages", {})
-                        data.setdefault("acked_hub_messages", [])
-                        data.setdefault("ambiguous_sends", {})
-                        data.setdefault("delivers", {})
-                        return data
-            except Exception:
-                pass
+            except Exception as e:
+                raise BridgeCapabilityGap(f"Receipts file {self.receipts_file} is corrupt or unreadable: {e}") from e
+            if not isinstance(data, dict):
+                raise BridgeCapabilityGap(
+                    f"Receipts file {self.receipts_file} is malformed: root must be a dict, got {type(data).__name__}"
+                )
+            data.setdefault("hub_to_native", {})
+            data.setdefault("native_to_hub", {})
+            data.setdefault("hub_messages", {})
+            data.setdefault("acked_hub_messages", [])
+            data.setdefault("ambiguous_sends", {})
+            data.setdefault("delivers", {})
+            return data
         return {
             "hub_to_native": {},
             "native_to_hub": {},
@@ -185,18 +188,15 @@ class MailboxBridge:
             # Explicitly cleared in memory (e.g. test isolation)
             return
         if os.path.exists(self.receipts_file):
-            try:
-                disk = self._load_receipts()
-                for k in ["hub_to_native", "native_to_hub", "hub_messages", "ambiguous_sends", "delivers"]:
-                    if k in self.receipts:
-                        disk[k].update(self.receipts[k])
-                    self.receipts[k] = disk[k]
-                for a in self.receipts.get("acked_hub_messages", []):
-                    if a not in disk["acked_hub_messages"]:
-                        disk["acked_hub_messages"].append(a)
-                self.receipts["acked_hub_messages"] = disk["acked_hub_messages"]
-            except Exception:
-                pass
+            disk = self._load_receipts()
+            for k in ["hub_to_native", "native_to_hub", "hub_messages", "ambiguous_sends", "delivers"]:
+                if k in self.receipts:
+                    disk[k].update(self.receipts[k])
+                self.receipts[k] = disk[k]
+            for a in self.receipts.get("acked_hub_messages", []):
+                if a not in disk["acked_hub_messages"]:
+                    disk["acked_hub_messages"].append(a)
+            self.receipts["acked_hub_messages"] = disk["acked_hub_messages"]
 
     def _save_receipts(self) -> None:
         self._prune_receipts()
@@ -459,11 +459,25 @@ class MailboxBridge:
                 native_id = self.receipts["hub_to_native"][hub_id]
             elif hub_id in self.receipts["ambiguous_sends"]:
                 amb = self.receipts["ambiguous_sends"][hub_id]
+                if not isinstance(amb, dict):
+                    raise BridgeCapabilityGap(
+                        f"Hub message {hub_id} has a malformed ambiguous send record; "
+                        f"refusing to resend to prevent duplicate native effects"
+                    )
                 raise BridgeCapabilityGap(
-                    f"Hub message {hub_id} has a prior ambiguous send (native_id={amb.get('native_id')}); "
+                    f"Hub message {hub_id} has a prior ambiguous send (status={amb.get('status', 'unknown')}, native_id={amb.get('native_id')}); "
                     f"refusing to resend to prevent duplicate native effects: {amb.get('reason')}"
                 )
             else:
+                # Persist send intent BEFORE execution and hold ambiguous execution outcomes durably
+                self.receipts.setdefault("ambiguous_sends", {})[hub_id] = {
+                    "native_id": None,
+                    "status": "intent",
+                    "reason": "Send intent recorded before execution",
+                    "created_at": int(time.time()),
+                }
+                self._save_receipts()
+
                 cmd = [self.aplexer_bin, "message", "send", "--queue", "--to", tag, "--kind", kind, "--json", body]
                 sub_env = self._get_subprocess_env()
                 if self.service_binding:
@@ -478,17 +492,55 @@ class MailboxBridge:
                         timeout=180,
                         env=sub_env,
                     )
+                except (FileNotFoundError, PermissionError) as e:
+                    # Preserve unsuccessful before-execution error distinction only with real evidence
+                    self.receipts.get("ambiguous_sends", {}).pop(hub_id, None)
+                    self._save_receipts()
+                    raise RuntimeError(f"Native send failed before execution: {e}") from e
+                except subprocess.TimeoutExpired as e:
+                    self.receipts["ambiguous_sends"][hub_id] = {
+                        "native_id": None,
+                        "status": "timeout",
+                        "reason": f"Native send timed out after 180s: {e}",
+                        "created_at": int(time.time()),
+                    }
+                    self._save_receipts()
+                    raise BridgeCapabilityGap(f"Native send timed out; send outcome uncertain: {e}") from e
                 except Exception as e:
-                    raise RuntimeError(f"Native send execution failed: {e}")
+                    self.receipts["ambiguous_sends"][hub_id] = {
+                        "native_id": None,
+                        "status": "uncertain",
+                        "reason": f"Native send execution failed: {e}",
+                        "created_at": int(time.time()),
+                    }
+                    self._save_receipts()
+                    raise BridgeCapabilityGap(f"Native send execution failed; send outcome uncertain: {e}") from e
 
                 if res.returncode != 0:
-                    raise RuntimeError(f"Native send failed (exit {res.returncode}): {res.stderr[:500]}")
+                    self.receipts["ambiguous_sends"][hub_id] = {
+                        "native_id": None,
+                        "status": "uncertain",
+                        "returncode": res.returncode,
+                        "stderr": res.stderr[:500],
+                        "reason": f"Native send failed (exit {res.returncode}): {res.stderr[:500]}",
+                        "created_at": int(time.time()),
+                    }
+                    self._save_receipts()
+                    raise BridgeCapabilityGap(f"Native send failed (exit {res.returncode}): {res.stderr[:500]}")
 
                 try:
                     native_msg = json.loads(res.stdout)
                     native_id = native_msg["id"]
                 except Exception as e:
-                    raise RuntimeError(f"Failed to parse native send output: {e}")
+                    self.receipts["ambiguous_sends"][hub_id] = {
+                        "native_id": None,
+                        "status": "uncertain",
+                        "reason": f"Failed to parse native send output: {e}",
+                        "stdout": res.stdout[:500],
+                        "created_at": int(time.time()),
+                    }
+                    self._save_receipts()
+                    raise BridgeCapabilityGap(f"Failed to parse native send output: {e}") from e
 
                 # If sender was resolved by native CLI and we did not have a prior binding, attempt qualification for allowed bridge tags
                 msg_from = native_msg.get("from") if isinstance(native_msg, dict) else None
@@ -514,6 +566,7 @@ class MailboxBridge:
                     # Record ambiguous send evidence on disk so we do not erase it or resend duplicates
                     self.receipts["ambiguous_sends"][hub_id] = {
                         "native_id": native_id,
+                        "status": "uncertain",
                         "reason": str(gap),
                         "created_at": int(time.time()),
                     }
@@ -522,6 +575,7 @@ class MailboxBridge:
 
                 # Persist receipt envelope and nativeID atomically mode 0600 BEFORE deliver
                 self.receipts["hub_to_native"][hub_id] = native_id
+                self.receipts.get("ambiguous_sends", {}).pop(hub_id, None)
                 msg_envelope_info = {
                     "from_actor": hub_msg.get("from_actor"),  # Exact original actor
                     "to_actor": target,
@@ -546,6 +600,11 @@ class MailboxBridge:
                 msg_envelope_info = self.receipts.get("hub_messages", {}).get(native_id, {})
                 deliv_state = self.receipts.get("delivers", {}).get(native_id)
                 if deliv_state:
+                    if not isinstance(deliv_state, dict):
+                        raise BridgeCapabilityGap(
+                            f"Hub message {hub_id} (native_id={native_id}) has malformed delivery state; "
+                            f"refusing redelivery to prevent duplicate PTY writes"
+                        )
                     d_status = deliv_state.get("status")
                     if d_status == "delivered":
                         # Already successfully delivered: zero additional writes
@@ -561,6 +620,12 @@ class MailboxBridge:
                         raise BridgeCapabilityGap(
                             f"Hub message {hub_id} (native_id={native_id}) has prior uncertain/intent delivery state ({d_status}) "
                             f"without genuine terminal delivery evidence; refusing redelivery to prevent duplicate PTY writes"
+                        )
+                    else:
+                        # Unknown / corrupt / version-skew delivery state must hold with zero replay; never silently reset or overwrite
+                        raise BridgeCapabilityGap(
+                            f"Hub message {hub_id} (native_id={native_id}) has unfamiliar/unknown delivery state ({d_status}); "
+                            f"refusing redelivery to prevent duplicate PTY writes"
                         )
 
                 # Screen capture composer check: two fresh observations then immediate final check

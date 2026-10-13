@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from unittest.mock import MagicMock, patch
@@ -482,7 +483,7 @@ class TestBridge(unittest.TestCase):
             self.assertEqual(mock_run.call_count, 1)
 
     def test_uncertain_outcome_no_resend(self):
-        """Failed native send raises RuntimeError and does not save receipt."""
+        """Failed native send records ambiguous send, raises BridgeCapabilityGap, and retry refuses resend."""
         td = get_test_tmp_dir()
         work = os.path.join(td, "work")
         state_dir = os.path.join(td, "state")
@@ -496,10 +497,21 @@ class TestBridge(unittest.TestCase):
 
             hub_msg = {"id": "hub-fail-1", "to_actor": "agent-1", "body": "hello", "kind": "note"}
 
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(BridgeCapabilityGap):
                 bridge.forward_hub_to_native(hub_msg)
 
             self.assertNotIn("hub-fail-1", bridge.receipts.get("hub_to_native", {}))
+            self.assertIn("hub-fail-1", bridge.receipts.get("ambiguous_sends", {}))
+            amb = bridge.receipts["ambiguous_sends"]["hub-fail-1"]
+            self.assertEqual(amb.get("status"), "uncertain")
+            self.assertEqual(amb.get("returncode"), 1)
+
+            # Retry attempt refuses to resend and makes zero additional subprocess calls
+            mock_run.reset_mock()
+            with self.assertRaises(BridgeCapabilityGap) as ctx:
+                bridge.forward_hub_to_native(hub_msg)
+            self.assertIn("prior ambiguous send", str(ctx.exception).lower())
+            mock_run.assert_not_called()
 
     def test_sync_reply_all_refusals_and_success(self):
         """Sync reply checks two status+capture observations then immediate final check."""
@@ -1282,6 +1294,332 @@ sys.exit(0)
         )
         self.assertFalse(valid)
         self.assertIn("UNKNOWN", reason)
+
+    def test_bf1_send_persists_then_timeout_zero_second_send_on_restart(self):
+        """Send persists then TimeoutExpired: restart/retry executes zero second send against fake binary."""
+        td = get_test_tmp_dir()
+        work = os.path.join(td, "work")
+        state_dir = os.path.join(td, "state")
+        os.makedirs(work, exist_ok=True)
+        canonical_ws = canonicalize_workspace(work)
+        rec_uuid = str(uuid.uuid4())
+        create_authoritative_state(state_dir, canonical_ws, "agent-1", rec_uuid)
+
+        log_file = os.path.join(td, "send_sideeffects.log")
+        fake_bin = os.path.join(td, "fake-timeout-bin")
+        with open(fake_bin, "w", encoding="utf-8") as f:
+            f.write(f'''#!/usr/bin/env python3
+import sys
+
+args = sys.argv[1:]
+if "send" in args:
+    with open("{log_file}", "a", encoding="utf-8") as f:
+        f.write("send_envelope_persisted\\n")
+    sys.exit(0)
+sys.exit(0)
+''')
+        os.chmod(fake_bin, 0o755)
+
+        bridge = MailboxBridge(work, aplexer_bin=fake_bin, state_dir=state_dir)
+        hub_msg = {"id": "hub-bf1-timeout", "to_actor": "agent-1", "body": "hello", "kind": "note"}
+
+        orig_run = subprocess.run
+        def mock_timeout_run(cmd, *args, **kwargs):
+            if "send" in cmd:
+                # Execute fake script so envelope persistence sideeffect occurs
+                orig_run(cmd, *args, **kwargs)
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=180)
+            return orig_run(cmd, *args, **kwargs)
+
+        with patch("subprocess.run", side_effect=mock_timeout_run):
+            with self.assertRaises(BridgeCapabilityGap) as ctx:
+                bridge.forward_hub_to_native(hub_msg)
+            self.assertIn("timed out", str(ctx.exception).lower())
+
+        # Verify sideeffect was recorded exactly once and ambiguous_sends is persisted
+        with open(log_file, "r", encoding="utf-8") as f:
+            lines_1 = f.readlines()
+        self.assertEqual(len(lines_1), 1)
+        self.assertIn("hub-bf1-timeout", bridge.receipts["ambiguous_sends"])
+        self.assertEqual(bridge.receipts["ambiguous_sends"]["hub-bf1-timeout"]["status"], "timeout")
+
+        # Restart with new MailboxBridge instance from disk
+        bridge_restarted = MailboxBridge(work, aplexer_bin=fake_bin, state_dir=state_dir)
+
+        # Retry forward must refuse immediately without executing fake binary again
+        with patch("subprocess.run", side_effect=mock_timeout_run):
+            with self.assertRaises(BridgeCapabilityGap) as ctx2:
+                bridge_restarted.forward_hub_to_native(hub_msg)
+            self.assertIn("prior ambiguous send", str(ctx2.exception).lower())
+
+        with open(log_file, "r", encoding="utf-8") as f:
+            lines_2 = f.readlines()
+        self.assertEqual(len(lines_2), 1, "Expected zero second send after restart")
+
+    def test_bf1_send_persists_then_nonzero_zero_second_send_on_restart(self):
+        """Send persists then nonzero exit: restart/retry executes zero second send against fake binary."""
+        td = get_test_tmp_dir()
+        work = os.path.join(td, "work")
+        state_dir = os.path.join(td, "state")
+        os.makedirs(work, exist_ok=True)
+        canonical_ws = canonicalize_workspace(work)
+        rec_uuid = str(uuid.uuid4())
+        create_authoritative_state(state_dir, canonical_ws, "agent-1", rec_uuid)
+
+        log_file = os.path.join(td, "send_nonzero_sideeffects.log")
+        fake_bin = os.path.join(td, "fake-nonzero-bin")
+        with open(fake_bin, "w", encoding="utf-8") as f:
+            f.write(f'''#!/usr/bin/env python3
+import sys
+
+args = sys.argv[1:]
+if "send" in args:
+    with open("{log_file}", "a", encoding="utf-8") as f:
+        f.write("send_envelope_persisted_then_crashed\\n")
+    sys.stderr.write("failed during response delivery\\n")
+    sys.exit(1)
+sys.exit(0)
+''')
+        os.chmod(fake_bin, 0o755)
+
+        bridge = MailboxBridge(work, aplexer_bin=fake_bin, state_dir=state_dir)
+        hub_msg = {"id": "hub-bf1-nonzero", "to_actor": "agent-1", "body": "hello", "kind": "note"}
+
+        with self.assertRaises(BridgeCapabilityGap) as ctx:
+            bridge.forward_hub_to_native(hub_msg)
+        self.assertIn("native send failed", str(ctx.exception).lower())
+
+        with open(log_file, "r", encoding="utf-8") as f:
+            lines_1 = f.readlines()
+        self.assertEqual(len(lines_1), 1)
+        self.assertIn("hub-bf1-nonzero", bridge.receipts["ambiguous_sends"])
+        self.assertEqual(bridge.receipts["ambiguous_sends"]["hub-bf1-nonzero"]["status"], "uncertain")
+        self.assertEqual(bridge.receipts["ambiguous_sends"]["hub-bf1-nonzero"]["returncode"], 1)
+
+        # Restart with new MailboxBridge instance from disk
+        bridge_restarted = MailboxBridge(work, aplexer_bin=fake_bin, state_dir=state_dir)
+
+        # Retry forward must refuse immediately without executing fake binary again
+        with self.assertRaises(BridgeCapabilityGap) as ctx2:
+            bridge_restarted.forward_hub_to_native(hub_msg)
+        self.assertIn("prior ambiguous send", str(ctx2.exception).lower())
+
+        with open(log_file, "r", encoding="utf-8") as f:
+            lines_2 = f.readlines()
+        self.assertEqual(len(lines_2), 1, "Expected zero second send after restart")
+
+    def test_bf1_send_intent_persisted_before_execution_missing_outcome_held_unknown(self):
+        """Missing send outcome (crash after intent recorded) stays held as unknown; zero send on retry."""
+        td = get_test_tmp_dir()
+        work = os.path.join(td, "work")
+        state_dir = os.path.join(td, "state")
+        canonical_ws = canonicalize_workspace(work)
+        rec_uuid = str(uuid.uuid4())
+        create_authoritative_state(state_dir, canonical_ws, "agent-1", rec_uuid)
+
+        bridge = MailboxBridge(work, state_dir=state_dir)
+        hub_msg = {"id": "hub-intent-missing", "to_actor": "agent-1", "body": "hello", "kind": "note"}
+
+        # Simulate crash: send intent recorded on disk before process completed
+        bridge.receipts["ambiguous_sends"]["hub-intent-missing"] = {
+            "native_id": None,
+            "status": "intent",
+            "reason": "Send intent recorded before execution",
+            "created_at": 1700000000,
+        }
+        bridge._save_receipts()
+
+        # Restart bridge
+        bridge_restarted = MailboxBridge(work, state_dir=state_dir)
+
+        with patch("subprocess.run") as mock_run:
+            with self.assertRaises(BridgeCapabilityGap) as ctx:
+                bridge_restarted.forward_hub_to_native(hub_msg)
+            self.assertIn("prior ambiguous send", str(ctx.exception).lower())
+            mock_run.assert_not_called()
+
+    def test_bf1_before_execution_error_distinction_preserved(self):
+        """Real evidence of before-execution failure raises RuntimeError and preserves retry capability."""
+        td = get_test_tmp_dir()
+        work = os.path.join(td, "work")
+        state_dir = os.path.join(td, "state")
+        canonical_ws = canonicalize_workspace(work)
+        rec_uuid = str(uuid.uuid4())
+        create_authoritative_state(state_dir, canonical_ws, "agent-1", rec_uuid)
+
+        # Path to non-existent executable
+        nonexistent = os.path.join(td, "no_such_binary")
+        bridge = MailboxBridge(work, aplexer_bin=nonexistent, state_dir=state_dir)
+        hub_msg = {"id": "hub-before-exec", "to_actor": "agent-1", "body": "hello", "kind": "note"}
+
+        with self.assertRaises(RuntimeError) as ctx:
+            bridge.forward_hub_to_native(hub_msg)
+        self.assertIn("failed before execution", str(ctx.exception).lower())
+        self.assertNotIn("hub-before-exec", bridge.receipts.get("ambiguous_sends", {}))
+        self.assertNotIn("hub-before-exec", bridge.receipts.get("hub_to_native", {}))
+
+    def test_bf2_deliver_unknown_status_zero_byte_attempts_and_retained_evidence(self):
+        """Unfamiliar/unknown status in delivers ledger refuses redelivery with zero attempts and retains evidence."""
+        td = get_test_tmp_dir()
+        work = os.path.join(td, "work")
+        state_dir = os.path.join(td, "state")
+        canonical_ws = canonicalize_workspace(work)
+        rec_uuid = str(uuid.uuid4())
+        create_authoritative_state(state_dir, canonical_ws, "agent-1", rec_uuid)
+
+        bridge = MailboxBridge(work, state_dir=state_dir)
+        native_id = "native-unknown-stat-1"
+        hub_id = "hub-unknown-stat-1"
+        bridge.receipts["hub_to_native"][hub_id] = native_id
+        bridge.receipts["hub_messages"][native_id] = {
+            "from_actor": "lead",
+            "to_actor": "agent-1",
+            "hub_id": hub_id,
+            "recipient_session_id": rec_uuid,
+            "kind": "sync_reply",
+        }
+        # In-progress / version-skew out-of-band status
+        bridge.receipts["delivers"][native_id] = {
+            "hub_id": hub_id,
+            "status": "in_progress",
+            "prior_evidence": "must_not_be_erased",
+            "attempted_at": 1700000000,
+        }
+        bridge._save_receipts()
+
+        hub_msg = {
+            "id": hub_id,
+            "to_actor": "agent-1",
+            "from_actor": "lead",
+            "body": "sync work",
+            "kind": "sync_reply",
+        }
+
+        with patch("subprocess.run") as mock_run:
+            with self.assertRaises(BridgeCapabilityGap) as ctx:
+                bridge.forward_hub_to_native(hub_msg)
+            self.assertIn("unfamiliar/unknown delivery state", str(ctx.exception).lower())
+            # Zero byte/deliver attempts: composer status/capture and deliver never executed
+            mock_run.assert_not_called()
+
+        # Verify prior evidence was NOT overwritten by "intent"
+        deliv = bridge.receipts["delivers"][native_id]
+        self.assertEqual(deliv["status"], "in_progress")
+        self.assertEqual(deliv["prior_evidence"], "must_not_be_erased")
+
+    def test_bf2_malformed_corrupt_receipts_failclosed_no_overwrite_no_replay(self):
+        """Malformed or corrupt receipts file fails closed immediately; zero file overwrite and zero replay."""
+        td = get_test_tmp_dir()
+        work = os.path.join(td, "work")
+        state_dir = os.path.join(td, "state")
+        os.makedirs(work, exist_ok=True)
+        canonical_ws = canonicalize_workspace(work)
+        rec_uuid = str(uuid.uuid4())
+        create_authoritative_state(state_dir, canonical_ws, "agent-1", rec_uuid)
+
+        receipts_file = os.path.join(work, ".local", "hub-bridge-receipts.json")
+        os.makedirs(os.path.dirname(receipts_file), exist_ok=True)
+        corrupt_content = b'{"hub_to_native": {"incomplete": json_syntax_error'
+        with open(receipts_file, "wb") as f:
+            f.write(corrupt_content)
+        os.chmod(receipts_file, 0o600)
+
+        initial_sha = hashlib.sha256(corrupt_content).hexdigest()
+
+        # 1. Instantiation fails closed on corrupt file
+        with self.assertRaises(BridgeCapabilityGap) as ctx:
+            MailboxBridge(work, state_dir=state_dir)
+        self.assertIn("corrupt or unreadable", str(ctx.exception).lower())
+
+        # Verify file on disk was NOT overwritten
+        with open(receipts_file, "rb") as f:
+            current_content = f.read()
+        self.assertEqual(hashlib.sha256(current_content).hexdigest(), initial_sha)
+
+        # 2. Non-dict root also fails closed
+        with open(receipts_file, "w", encoding="utf-8") as f:
+            json.dump(["not", "a", "dict"], f)
+
+        with self.assertRaises(BridgeCapabilityGap) as ctx2:
+            MailboxBridge(work, state_dir=state_dir)
+        self.assertIn("root must be a dict", str(ctx2.exception).lower())
+
+    def test_valid_once_and_restart_paths_no_liveness_regression(self):
+        """Valid send and sync_reply deliver execute once and succeed across restarts without regression."""
+        td = get_test_tmp_dir()
+        work = os.path.join(td, "work")
+        state_dir = os.path.join(td, "state")
+        canonical_ws = canonicalize_workspace(work)
+        rec_uuid = str(uuid.uuid4())
+        create_authoritative_state(state_dir, canonical_ws, "agent-1", rec_uuid)
+
+        bridge = MailboxBridge(work, state_dir=state_dir)
+
+        # 1. Note send: executes once, caches, and succeeds on restart
+        note_msg = {"id": "hub-live-note", "to_actor": "agent-1", "body": "hello note", "kind": "note"}
+        valid_send_out = json.dumps({
+            "schema_version": 1,
+            "id": "native-live-note",
+            "workspace": canonical_ws,
+            "from": {"tag": bridge.service_binding.tag, "session_id": bridge.service_binding.session_id},
+            "to": {"tag": "agent-1", "session_id": rec_uuid},
+        })
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=valid_send_out)
+            nid1 = bridge.forward_hub_to_native(note_msg)
+            self.assertEqual(nid1, "native-live-note")
+            self.assertEqual(mock_run.call_count, 1)
+
+            # In-memory replay: 0 calls
+            nid2 = bridge.forward_hub_to_native(note_msg)
+            self.assertEqual(nid2, "native-live-note")
+            self.assertEqual(mock_run.call_count, 1)
+
+        # Restart bridge
+        bridge_restarted = MailboxBridge(work, state_dir=state_dir)
+        with patch("subprocess.run") as mock_run:
+            nid3 = bridge_restarted.forward_hub_to_native(note_msg)
+            self.assertEqual(nid3, "native-live-note")
+            mock_run.assert_not_called()
+
+        # 2. Sync reply deliver: executes once, caches, and succeeds on restart
+        sync_msg = {"id": "hub-live-sync", "to_actor": "agent-1", "body": "wake", "kind": "sync_reply"}
+        valid_sync_send_out = json.dumps({
+            "schema_version": 1,
+            "id": "native-live-sync",
+            "workspace": canonical_ws,
+            "from": {"tag": bridge.service_binding.tag, "session_id": bridge.service_binding.session_id},
+            "to": {"tag": "agent-1", "session_id": rec_uuid},
+        })
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout=valid_sync_send_out),  # send
+                MagicMock(returncode=0, stdout='{"state":"idle"}'),    # obs 1 status
+                MagicMock(returncode=0, stdout='prompt ❯'),           # obs 1 capture
+                MagicMock(returncode=0, stdout='{"state":"idle"}'),    # obs 2 status
+                MagicMock(returncode=0, stdout='prompt ❯'),           # obs 2 capture
+                MagicMock(returncode=0, stdout='{"state":"idle"}'),    # final check status
+                MagicMock(returncode=0, stdout='prompt ❯'),           # final check capture
+                MagicMock(returncode=0, stdout='{"id":"native-live-sync"}'),  # deliver
+            ]
+            deliv_id = bridge.forward_hub_to_native(sync_msg)
+            self.assertEqual(deliv_id, "native-live-sync")
+
+        self.assertEqual(bridge.receipts["delivers"]["native-live-sync"]["status"], "delivered")
+
+        # In-memory and restart replay: 0 calls
+        with patch("subprocess.run") as mock_run:
+            deliv_replay = bridge.forward_hub_to_native(sync_msg)
+            self.assertEqual(deliv_replay, "native-live-sync")
+            mock_run.assert_not_called()
+
+        bridge_restarted_2 = MailboxBridge(work, state_dir=state_dir)
+        with patch("subprocess.run") as mock_run:
+            deliv_restart_replay = bridge_restarted_2.forward_hub_to_native(sync_msg)
+            self.assertEqual(deliv_restart_replay, "native-live-sync")
+            mock_run.assert_not_called()
 
 
 if __name__ == "__main__":
