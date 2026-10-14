@@ -1,5 +1,6 @@
 import { sha256, base64url } from './auth/crypto';
 import { getSession } from './auth/session';
+import { ensureRootScheduling, isRootSchedulingEnabled } from './root_scheduling';
 
 function sha256Sync(input: string): string {
   const K = new Uint32Array([
@@ -302,6 +303,7 @@ export class JobsService {
     } catch {}
 
     this.sql.exec("INSERT OR IGNORE INTO leases (name, epoch) VALUES ('root', 0)");
+    ensureRootScheduling(this.sql);
   }
 
   public setBusService(bus: any) {
@@ -435,7 +437,14 @@ export class JobsService {
       this.ctx.storage.transactionSync(() => {
         // 1. Expire offers (root-run)
         const offeredJobs = this.sql.exec("SELECT * FROM jobs WHERE kind = 'root-run' AND status = 'offered' AND offer_expires_at IS NOT NULL").toArray();
+        const rootSchedulingEnabled = isRootSchedulingEnabled(this.sql);
         for (const job of offeredJobs) {
+          // Root scheduling flag: while disabled, root-run offers are frozen (no expiry,
+          // no re-offer); only a job whose deadline has passed is closed.
+          if (!rootSchedulingEnabled) {
+            this.expireRootRunPastDeadline(job, now);
+            continue;
+          }
           const exp = parseExpiryMs(job.offer_expires_at as string);
           if (exp !== null && exp <= nowMs) {
             this.addHealthEvent('job', job.id as string, 'failed', 'offer expired', nowIso);
@@ -487,7 +496,25 @@ export class JobsService {
     });
   }
 
+  // Closes a pending/offered root-run job whose deadline has passed (status 'expired').
+  // Returns true when the job was closed. Runs inside the caller's transaction.
+  private expireRootRunPastDeadline(job: any, now: Date): boolean {
+    if (job.kind !== 'root-run') return false;
+    const deadlineMs = parseExpiryMs(job.deadline_at) ?? new Date(job.deadline_at).getTime();
+    if (Number.isFinite(deadlineMs) && deadlineMs > now.getTime()) return false;
+    const nowIso = now.toISOString();
+    this.sql.exec(
+      "UPDATE jobs SET status = 'expired', finished_at = ?, outcome_summary = ? WHERE id = ? AND status IN ('pending', 'offered')",
+      nowIso, 'deadline passed before claim', job.id
+    );
+    this.addHealthEvent('job', job.id as string, 'failed', 'deadline passed before claim', nowIso);
+    return true;
+  }
+
   private tryOfferNext(job: any, now: Date) {
+    // Root scheduling flag: while disabled, no new offers for root-run jobs.
+    // Runs inside the caller's storage transaction, so the check is race-free.
+    if (job.kind === 'root-run' && !isRootSchedulingEnabled(this.sql)) return;
     const attempts = JSON.parse(job.offer_attempts as string || '[]');
     if (attempts.length >= 3) {
       this.sql.exec("UPDATE jobs SET status = 'no-host', finished_at = ? WHERE id = ?", now.toISOString(), job.id);
@@ -501,6 +528,10 @@ export class JobsService {
       this.addHealthEvent('job', job.id as string, 'no-host', 'no candidates available', now.toISOString());
       return;
     }
+
+    // Never offer a root-run job that is already past its deadline: it could not be
+    // claimed (ghost offer, e.g. the first alarm after re-enabling a long pause).
+    if (this.expireRootRunPastDeadline(job, now)) return;
 
     const chosen = this.unbiasedSample(candidates);
     if (chosen) {
@@ -583,15 +614,23 @@ export class JobsService {
     return candidates;
   }
 
-  tickRootSlot(slotStartUtc: string) {
-    this.withClockSnapshot((now) => {
+  tickRootSlot(slotStartUtc: string): { status: string; slot: string } {
+    return this.withClockSnapshot((now) => {
       const nowIso = now.toISOString();
       const nowMs = now.getTime();
       let pendingBusError: { toActor: string; idempotencyKey: string; err: any } | null = null;
+      let tickOutcome: { status: string; slot: string } = { status: 'ok', slot: slotStartUtc };
 
       try {
         this.ctx.storage.transactionSync(() => {
         this.processAlarms();
+
+        // Root scheduling flag: a disabled tick creates no job, no offers.
+        // Lease/offer expiry processing above still runs so live roots finish normally.
+        if (!isRootSchedulingEnabled(this.sql)) {
+          tickOutcome = { status: 'disabled', slot: slotStartUtc };
+          return;
+        }
 
         const idempotencyKey = `root-run:${slotStartUtc}`;
         const existing = this.sql.exec("SELECT id FROM jobs WHERE idempotency_key = ?", idempotencyKey).toArray();
@@ -723,6 +762,7 @@ export class JobsService {
         }
         throw err;
       }
+      return tickOutcome;
     });
   }
 
@@ -772,6 +812,11 @@ export class JobsService {
         const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
         if (!job || job.status !== 'offered' || (job.offer_host_id !== hostId && job.offer_machine_id !== hostId)) {
           result = { error: 'conflict' }; return;
+        }
+        // Root scheduling flag: root-run claims (offered jobs included) are refused
+        // inside the same claim transaction, so there is no flag-check race.
+        if (job.kind === 'root-run' && !isRootSchedulingEnabled(this.sql)) {
+          result = { error: 'conflict', reason: 'root_scheduling_disabled' }; return;
         }
         const exp = parseExpiryMs(job.offer_expires_at);
         if (exp === null || !Number.isFinite(exp) || exp <= nowMs) {
@@ -973,6 +1018,11 @@ export class JobsService {
         const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
         if (!job || job.claim_token_hash !== tokenHash || job.lease_epoch !== epoch) { result = { error: 'unauthorized_or_stale' }; return; }
         if (job.status !== 'claimed') { result = { error: 'invalid_status' }; return; }
+        // Root scheduling flag gates root-run START transitions; renew/finish of an
+        // already-running root do not pass through here and keep working while disabled.
+        if (job.kind === 'root-run' && !isRootSchedulingEnabled(this.sql)) {
+          result = { error: 'root_scheduling_disabled' }; return;
+        }
 
         // Check credential validity, non-revocation, and non-expiry
         const cred = this.sql.exec(
@@ -1763,6 +1813,12 @@ export class JobsService {
       let result: any = null;
 
       this.ctx.storage.transactionSync(() => {
+        // Root scheduling flag: takeover acquires the root lease for a new root-run
+        // claim and is refused while disabled.
+        if (!isRootSchedulingEnabled(this.sql)) {
+          result = { error: 'root_scheduling_disabled', reason: 'root scheduling is disabled; takeover refused' };
+          return;
+        }
         // 1. Fetch current lease
         const currentLease = this.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
         if (!currentLease) {

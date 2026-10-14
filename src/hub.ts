@@ -9,6 +9,7 @@ import { generateTokenPair, verifyBearerScope } from './auth/token';
 import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly, updateHeartbeat } from './registry';
 import { BusService, BUS_SCHEMA_SQL, CallerContext, generateUlid } from './bus';
 import { JobsService, JOBS_SCHEMA_SQL } from './jobs';
+import { ensureRootScheduling, getRootScheduling, isRootSchedulingEnabled, setRootScheduling } from './root_scheduling';
 
 function parseEpoch(raw: any): number | null {
   if (raw === undefined || raw === null || raw === '' || typeof raw === 'boolean') return null;
@@ -392,6 +393,7 @@ export class Hub extends DurableObject {
     }
 
     this.sql.exec("INSERT OR IGNORE INTO leases (name, epoch) VALUES ('root', 0)");
+    ensureRootScheduling(this.sql);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -419,8 +421,10 @@ export class Hub extends DurableObject {
            ORDER BY created_at DESC`,
           cred.machine_id, cred.machine_id, nowIso
         ).toArray() as any[];
+        // Root scheduling flag: root-run offers are not listed while disabled.
+        const visibleRows = isRootSchedulingEnabled(this.sql) ? rows : rows.filter((r: any) => r.kind !== 'root-run');
 
-        const offers = rows.map((r: any) => ({
+        const offers = visibleRows.map((r: any) => ({
           id: r.id,
           job_id: r.id,
           kind: r.kind,
@@ -963,6 +967,59 @@ export class Hub extends DurableObject {
           claimsDeleted: cleanup.claimsDeleted,
           hasMore: cleanup.hasMore
         });
+      }
+
+      if (path === '/api/root/scheduling') {
+        if (request.method !== 'GET' && request.method !== 'PUT') {
+          return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, PUT' } });
+        }
+        const session = await getSession(this.env, request);
+        if (session && !session.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
+
+        if (request.method === 'GET') {
+          // Read: admin session, or the existing host bearer verified like /api/host/poll
+          // (host scope, kind host, unrevoked, unexpired). Identity comes only from the
+          // verified credential; nothing in the request names the host.
+          if (!session) {
+            const hostCred = await verifyBearerScope(this.sql, request.headers.get('Authorization'), 'host', { kind: 'host' });
+            if (!hostCred || !hostCred.machine_id) return Response.json({ error: 'unauthorized' }, { status: 401 });
+          }
+          const state = getRootScheduling(this.sql);
+          return Response.json({ enabled: state.enabled, updated_at: state.updated_at, server_time: new Date().toISOString() });
+        }
+
+        // Write: admin session plus session CSRF only. Bearer tokens (host/agent/job/root)
+        // carry no scheduling write authority.
+        if (!session) return Response.json({ error: 'unauthorized' }, { status: 401 });
+        if (!verifyCsrf(request, session)) return Response.json({ error: 'CSRF token missing or invalid' }, { status: 403 });
+        const body = await safeJson(request);
+        if (!body) return Response.json({ error: 'malformed_json' }, { status: 400 });
+        const bodyKeys = Object.keys(body);
+        if (bodyKeys.length !== 1 || bodyKeys[0] !== 'enabled') {
+          return Response.json({ error: 'invalid_body', reason: 'exact body {"enabled": boolean} required' }, { status: 400 });
+        }
+        if (typeof body.enabled !== 'boolean') {
+          return Response.json({ error: 'invalid_enabled', reason: 'enabled must be a boolean' }, { status: 400 });
+        }
+
+        const nowIso = new Date().toISOString();
+        const previous = getRootScheduling(this.sql);
+        const state = this.ctx.storage.transactionSync(() => {
+          const next = setRootScheduling(this.sql, body.enabled, nowIso);
+          if (next.enabled !== previous.enabled) {
+            this.sql.exec(
+              'INSERT INTO audit (actor, action, resource, target, detail, at) VALUES (?, ?, ?, ?, ?, ?)',
+              session.email || session.sub,
+              next.enabled ? 'root_scheduling_enable' : 'root_scheduling_disable',
+              'root_scheduling',
+              'root',
+              JSON.stringify({ from: previous.enabled, to: next.enabled }),
+              nowIso
+            );
+          }
+          return next;
+        });
+        return Response.json({ enabled: state.enabled, updated_at: state.updated_at, server_time: new Date().toISOString() });
       }
 
       return new Response("Not found", { status: 404 });
@@ -1636,8 +1693,10 @@ export class Hub extends DurableObject {
          ORDER BY created_at DESC`,
         hostId, hostId, nowIso
       ).toArray() as any[];
+      // Root scheduling flag: root-run offers are not listed while disabled.
+      const visibleRows = isRootSchedulingEnabled(this.sql) ? rows : rows.filter((r: any) => r.kind !== 'root-run');
 
-      const offers = rows.map(r => {
+      const offers = visibleRows.map(r => {
         let payload = r.payload;
         try { if (typeof payload === 'string') payload = JSON.parse(payload); } catch {}
         return {
@@ -2107,6 +2166,9 @@ export class Hub extends DurableObject {
         const res = await this.jobsService.startJob(jobId, jobToken, epoch, evidenceDigest, nativeSession, launcherTaskId);
         if (res.error === 'unauthorized_or_stale') {
           return Response.json({ error: 'unauthorized_or_stale' }, { status: 409 });
+        }
+        if (res.error === 'root_scheduling_disabled') {
+          return Response.json({ error: 'root_scheduling_disabled', reason: 'root scheduling is disabled' }, { status: 409 });
         }
         if (res.error === 'first_action_window_expired') {
           return Response.json({ error: 'first_action_window_expired' }, { status: 409 });
