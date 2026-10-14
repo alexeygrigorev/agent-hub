@@ -12,12 +12,14 @@ def main():
         base_url = cfg.get("base_url")
         if base_url:
             from . import system, auth
-            auth.device_login(base_url, "host", "agent-hub-host", system.get_hostname(), ["host_agent"])
+            auth.device_login(base_url, "host", "agent-hub-host", system.get_hostname(), ["host"])
         else:
             print("Not logged in. Please run `hub login <base_url>` first.", file=sys.stderr)
             sys.exit(1)
-        
-    agent = api.HostAgent()
+    base_url = cfg.get("base_url")
+    from . import jobs, system
+    dispatcher = jobs.JobDispatcher(base_url=base_url, host_id=system.get_hostname()) if base_url else None
+    agent = api.HostAgent(dispatcher=dispatcher)
     
     def handle_sigint(sig, frame):
         print("Shutdown requested...")

@@ -6,8 +6,16 @@ import { JwksCache, validateIdToken, exchangeCode } from './auth/dtc';
 import { createSessionCookie, getSession, clearSessionCookie, createLoginCookie, getLoginCookie, clearLoginCookie, verifyCsrf, configuredAdmins, validSessionSecret } from './auth/session';
 import { randomString, sha256, generateUserCode } from './auth/crypto';
 import { generateTokenPair, verifyBearerScope } from './auth/token';
-import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly } from './registry';
-import { BusService, BUS_SCHEMA_SQL, CallerContext } from './bus';
+import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly, updateHeartbeat } from './registry';
+import { BusService, BUS_SCHEMA_SQL, CallerContext, generateUlid } from './bus';
+import { JobsService, JOBS_SCHEMA_SQL } from './jobs';
+
+function parseEpoch(raw: any): number | null {
+  if (raw === undefined || raw === null || raw === '' || typeof raw === 'boolean') return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0 || !Number.isInteger(n)) return null;
+  return n;
+}
 
 async function safeJson(req: Request): Promise<Record<string, any> | null> {
   if (!req.body) return null;
@@ -47,15 +55,173 @@ export class Hub extends DurableObject {
   sql: SqlStorage;
   env: Env;
   jwksCache: JwksCache = new JwksCache();
-  private busService: BusService;
+  public busService: BusService;
+  public jobsService: JobsService;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.env = env;
     this.sql = ctx.storage.sql;
+    this.initDb();
+
     const txSync = (this.ctx.storage as any).transactionSync ? (fn: any) => (this.ctx.storage as any).transactionSync(fn) : undefined;
     this.busService = new BusService(this.sql, txSync);
-    this.initDb();
+
+    const busForJobs = Object.create(this.busService);
+    const runInTxn = (this.ctx.storage as any).transactionSync ? (fn: any) => (this.ctx.storage as any).transactionSync(fn) : (fn: any) => fn();
+    const sendRoot = (caller: any, opts: any) => {
+      return runInTxn(() => {
+        const now = opts.now ?? Date.now();
+        if (new TextEncoder().encode(opts.body).length > 16384) {
+          throw new Error("body_too_large");
+        }
+        if (opts.toActor === 'role:root') {
+          throw new Error("unknown_recipient");
+        }
+        if (!this.busService.validateRecipient(opts.toActor, now)) {
+          throw new Error("unknown_recipient");
+        }
+        const validKinds = new Set(['note', 'handoff', 'reply', 'status', 'claim', 'release']);
+        if (!opts.kind || !validKinds.has(opts.kind)) {
+          throw new Error("invalid_kind");
+        }
+        const existing = this.sql.exec(
+          'SELECT id, body, to_actor, kind, thread_id, reply_to, lease_epoch FROM messages WHERE from_actor = ? AND idempotency_key = ?',
+          opts.senderActor,
+          opts.idempotencyKey
+        ).toArray()[0] as any;
+        if (existing) {
+          const expectedReplyTo = opts.replyTo || null;
+          const expectedLeaseEpoch = opts.leaseEpoch ?? null;
+          if (
+            existing.body !== opts.body ||
+            existing.to_actor !== opts.toActor ||
+            existing.kind !== opts.kind ||
+            existing.reply_to !== expectedReplyTo ||
+            existing.lease_epoch !== expectedLeaseEpoch ||
+            (opts.threadId !== undefined && existing.thread_id !== opts.threadId)
+          ) {
+            throw new Error("conflict");
+          }
+          return { id: existing.id, threadId: existing.thread_id, thread_id: existing.thread_id };
+        }
+        let threadId = opts.threadId;
+        if (opts.replyTo) {
+          const msg = this.sql.exec('SELECT thread_id, from_actor, to_actor FROM messages WHERE id = ?', opts.replyTo).toArray()[0] as any;
+          if (!msg) throw new Error("invalid_reply_to");
+          if (msg.from_actor !== opts.toActor && msg.to_actor !== opts.toActor) throw new Error("invalid_reply_to");
+          if (msg.from_actor !== opts.senderActor && msg.to_actor !== opts.senderActor && msg.from_actor !== 'root' && msg.to_actor !== 'root') throw new Error("invalid_reply_to");
+          threadId = threadId || msg.thread_id || opts.replyTo;
+        }
+        const id = generateUlid(now);
+        threadId = threadId || id;
+        const expiresAt = now + 30 * 24 * 3600 * 1000;
+        this.sql.exec(`
+          INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, reply_to, body, idempotency_key, lease_epoch, created_at, expires_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, id, opts.senderActor, opts.toActor, opts.kind, threadId, opts.replyTo || null, opts.body, opts.idempotencyKey, opts.leaseEpoch ?? null, now, expiresAt);
+        return { id, threadId, thread_id: threadId };
+      });
+    };
+    busForJobs.send = (caller: any, opts: any) => {
+      if (opts.senderActor === 'role:root') {
+        return sendRoot(caller, opts);
+      }
+      return this.busService.send(caller, opts);
+    };
+    busForJobs.sendRootMessage = (caller: any, opts: any) => {
+      return sendRoot(caller, opts);
+    };
+
+    this.busService.getBusMessages = (caller: CallerContext, actor?: string | null, now: number = Date.now()): any[] => {
+      if (caller.isRevoked) {
+        throw new Error("unauthorized");
+      }
+
+      if (caller.actor === 'role:root' || actor === 'role:root') {
+        throw new Error("missing_m4_root_authority: root role routing has no accepted root authority in M3");
+      }
+
+      if (caller.isAdmin) {
+        if (actor) {
+          return this.sql.exec(
+            'SELECT * FROM messages WHERE (to_actor = ? OR from_actor = ?) AND to_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
+            actor, actor
+          ).toArray();
+        }
+        return this.sql.exec('SELECT * FROM messages WHERE to_actor != "role:root" ORDER BY created_at DESC LIMIT 100').toArray();
+      }
+
+      if (caller.actor) {
+        const effectiveActor = actor || caller.actor;
+        if (!this.busService.isAuthorizedForActor(caller, effectiveActor, now)) {
+          throw new Error("unauthorized");
+        }
+
+        let aliases = [effectiveActor];
+        if (effectiveActor.includes(':')) {
+          const [cProj, cTag] = effectiveActor.split(':');
+          const rows = this.sql.exec('SELECT project, tag FROM agents WHERE project = ? AND tag = ? AND role != "root"', cProj, cTag).toArray() as any[];
+          if (rows.length === 1) aliases.push(rows[0].tag);
+        } else {
+          const rows = this.sql.exec('SELECT project, tag FROM agents WHERE tag = ? AND role != "root"', effectiveActor).toArray() as any[];
+          if (rows.length === 1) aliases.push(`${rows[0].project}:${rows[0].tag}`);
+        }
+        aliases = Array.from(new Set(aliases));
+
+        if (aliases.length === 1) {
+          return this.sql.exec(
+            'SELECT * FROM messages WHERE (to_actor = ? OR from_actor = ?) AND to_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
+            aliases[0], aliases[0]
+          ).toArray();
+        } else {
+          return this.sql.exec(
+            'SELECT * FROM messages WHERE (to_actor IN (?, ?) OR from_actor IN (?, ?)) AND to_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
+            aliases[0], aliases[1], aliases[0], aliases[1]
+          ).toArray();
+        }
+      }
+
+      if (caller.kind === 'host' || (!caller.actor && caller.machineId)) {
+        if (!caller.machineId) throw new Error("unauthorized");
+
+        if (actor) {
+          if (!this.busService.isAuthorizedForActor(caller, actor, now)) {
+            throw new Error("unauthorized");
+          }
+          return this.sql.exec(
+            'SELECT * FROM messages WHERE (to_actor = ? OR from_actor = ?) AND to_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
+            actor, actor
+          ).toArray();
+        }
+
+        const machineActor = `machine:${caller.machineId}`;
+        const agentRows = this.sql.exec(
+          'SELECT project, tag FROM agents WHERE machine_id = ? AND role != "root"',
+          caller.machineId
+        ).toArray() as any[];
+        const allowedActors = new Set<string>([machineActor]);
+        for (const row of agentRows) {
+          allowedActors.add(`${row.project}:${row.tag}`);
+          allowedActors.add(row.tag);
+        }
+        const allowedList = Array.from(allowedActors);
+        if (allowedList.length === 0) return [];
+
+        const placeholders = allowedList.map(() => '?').join(',');
+        const sqlQuery = `SELECT * FROM messages WHERE (to_actor IN (${placeholders}) OR from_actor IN (${placeholders})) AND to_actor != "role:root" ORDER BY created_at DESC LIMIT 100`;
+        return this.sql.exec(sqlQuery, ...allowedList, ...allowedList).toArray();
+      }
+
+      throw new Error("unauthorized");
+    };
+
+    this.jobsService = new JobsService(this.sql, this.ctx, {
+      busService: busForJobs,
+      enableAlarms: true,
+      env: this.env,
+    });
+    this.jobsService.setBusService(busForJobs);
     
     // Restore hibernated websockets
     const websockets = this.ctx.getWebSockets();
@@ -69,19 +235,163 @@ export class Hub extends DurableObject {
     }
   }
 
-  private initDb() {
+  private ensureColumns(table: string, columns: { [col: string]: string }) {
+    const existing = new Set<string>();
+    const rows = this.sql.exec(`PRAGMA table_info(${table})`).toArray() as any[];
+    for (const row of rows) {
+      if (row.name) existing.add(row.name.toLowerCase());
+    }
+    if (existing.size === 0) return;
+    for (const [col, colType] of Object.entries(columns)) {
+      if (!existing.has(col.toLowerCase())) {
+        this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${colType}`);
+      }
+    }
+  }
+
+  public initDb() {
+    // 1. If agents exists from M3 BUS_SCHEMA_SQL (tag has no PK or project is NOT NULL):
+    // Recreate agents table to match M4 schema non-destructively
+    const agentTableInfo = this.sql.exec("PRAGMA table_info(agents)").toArray() as any[];
+    if (agentTableInfo.length > 0) {
+      const tagCol = agentTableInfo.find(c => c.name.toLowerCase() === 'tag');
+      const projCol = agentTableInfo.find(c => c.name.toLowerCase() === 'project');
+      if (tagCol && (tagCol.pk === 0 || (projCol && projCol.notnull === 1))) {
+        this.sql.exec(`
+          CREATE TABLE agents_m4 (
+            tag TEXT PRIMARY KEY,
+            project TEXT,
+            role TEXT,
+            machine_id TEXT,
+            registered_at TEXT,
+            engine TEXT,
+            session_id TEXT,
+            workspace TEXT,
+            team_id TEXT,
+            imported_from TEXT,
+            state TEXT,
+            health_state TEXT,
+            health_detail JSON,
+            detail TEXT,
+            lasthealth TEXT,
+            health_at TEXT,
+            last_seen_at TEXT,
+            last_seen TEXT,
+            updated_at TEXT,
+            pid INTEGER,
+            started_at TEXT
+          )
+        `);
+        const colNames = agentTableInfo.map(c => c.name);
+        const m4Cols = ['tag', 'project', 'role', 'machine_id', 'registered_at', 'engine', 'session_id', 'workspace', 'team_id', 'imported_from', 'state', 'health_state', 'health_detail', 'detail', 'lasthealth', 'health_at', 'last_seen_at', 'last_seen', 'updated_at', 'pid', 'started_at'];
+        const commonCols = colNames.filter(c => m4Cols.includes(c));
+        const selectCols = commonCols.join(', ');
+        this.sql.exec(`INSERT OR REPLACE INTO agents_m4 (${selectCols}) SELECT ${selectCols} FROM agents`);
+        this.sql.exec("DROP TABLE agents");
+        this.sql.exec("ALTER TABLE agents_m4 RENAME TO agents");
+        this.sql.exec("CREATE INDEX IF NOT EXISTS idx_agents_project_tag ON agents(project, tag)");
+      }
+    }
+
+    // 2. Execute SCHEMA_SQL
     for (const statement of SCHEMA_SQL.split(';')) {
       const trimmed = statement.trim();
       if (trimmed) {
         this.sql.exec(trimmed);
       }
     }
-    for (const statement of BUS_SCHEMA_SQL.split(';')) {
-      const trimmed = statement.trim();
-      if (trimmed) {
-        this.sql.exec(trimmed);
-      }
+
+    // 3. Ensure all M4 columns on existing tables (SPEC §6 and M3 migrations)
+    this.ensureColumns('agents', {
+      project: 'TEXT',
+      role: 'TEXT',
+      machine_id: 'TEXT',
+      registered_at: 'TEXT',
+      team_id: 'TEXT',
+      imported_from: 'TEXT',
+      engine: 'TEXT',
+      session_id: 'TEXT',
+      workspace: 'TEXT',
+      state: 'TEXT',
+      health_state: 'TEXT',
+      health_detail: 'JSON',
+      detail: 'TEXT',
+      lasthealth: 'TEXT',
+      health_at: 'TEXT',
+      last_seen_at: 'TEXT',
+      last_seen: 'TEXT',
+      updated_at: 'TEXT',
+      pid: 'INTEGER',
+      started_at: 'TEXT'
+    });
+
+    this.ensureColumns('machines', {
+      name: 'TEXT',
+      hostname: 'TEXT',
+      network: "TEXT DEFAULT 'home'",
+      os: "TEXT DEFAULT ''",
+      roles: "JSON DEFAULT '[]'",
+      capabilities: "JSON DEFAULT '{}'",
+      credential_id: 'TEXT',
+      registered_at: 'TEXT',
+      last_checkin_at: 'TEXT',
+      last_heartbeat: 'JSON',
+      drained: 'INTEGER DEFAULT 0',
+      notes: 'TEXT'
+    });
+
+    this.ensureColumns('jobs', {
+      deadline_at: 'TEXT',
+      actor: 'TEXT',
+      offer_host_id: 'TEXT',
+      offer_machine_id: 'TEXT',
+      offer_expires_at: 'TEXT',
+      offer_attempts: "JSON DEFAULT '[]'",
+      claim_token_hash: 'TEXT',
+      holder_host_id: 'TEXT',
+      holder_machine_id: 'TEXT',
+      started_at: 'TEXT',
+      first_action_at: 'TEXT',
+      evidence_digest: 'TEXT',
+      native_session: 'TEXT',
+      launcher_task_id: 'TEXT',
+      lease_epoch: 'INTEGER',
+      finished_at: 'TEXT',
+      outcome_summary: 'TEXT',
+      outcome_evidence: 'JSON'
+    });
+
+    this.ensureColumns('leases', {
+      holder_job_id: 'TEXT',
+      holder_machine_id: 'TEXT',
+      holder_host_id: 'TEXT',
+      holder_actor: 'TEXT',
+      epoch: 'INTEGER DEFAULT 0',
+      acquired_at: 'TEXT',
+      renewed_at: 'TEXT',
+      expires_at: 'TEXT',
+      released_at: 'TEXT',
+      release_reason: 'TEXT'
+    });
+
+    this.ensureColumns('audit', {
+      actor: 'TEXT',
+      action: 'TEXT',
+      resource: 'TEXT',
+      target: 'TEXT',
+      detail: 'TEXT',
+      at: 'TEXT'
+    });
+
+    // If audit was upgraded from SPEC §6 where ts existed instead of at:
+    const auditInfo = this.sql.exec("PRAGMA table_info(audit)").toArray() as any[];
+    const hasAt = auditInfo.some(c => c.name.toLowerCase() === 'at');
+    const hasTs = auditInfo.some(c => c.name.toLowerCase() === 'ts');
+    if (hasAt && hasTs) {
+      this.sql.exec("UPDATE audit SET at = ts WHERE at IS NULL AND ts IS NOT NULL");
     }
+
+    this.sql.exec("INSERT OR IGNORE INTO leases (name, epoch) VALUES ('root', 0)");
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -89,10 +399,48 @@ export class Hub extends DurableObject {
     const path = url.pathname;
     
     try {
+      if (path === '/api/host/poll') {
+        if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+        const cred = await verifyBearerScope(this.sql, request.headers.get('Authorization'), 'host', { kind: 'host' });
+        if (!cred || !cred.machine_id) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+
+        const body = await safeJson(request);
+        if (!body || body.type !== 'heartbeat') return Response.json({ error: 'malformed_json' }, { status: 400 });
+
+        updateHeartbeat(cred.machine_id, body, this.sql);
+
+        const nowIso = new Date().toISOString();
+        const rows = this.sql.exec(
+          `SELECT id, kind, payload, status, deadline_at, offer_host_id, offer_machine_id, offer_expires_at, created_at, actor
+           FROM jobs
+           WHERE status = 'offered'
+             AND (offer_host_id = ? OR offer_machine_id = ?)
+             AND (offer_expires_at IS NULL OR offer_expires_at > ?)
+           ORDER BY created_at DESC`,
+          cred.machine_id, cred.machine_id, nowIso
+        ).toArray() as any[];
+
+        const offers = rows.map((r: any) => ({
+          id: r.id,
+          job_id: r.id,
+          kind: r.kind,
+          payload: typeof r.payload === 'string' ? JSON.parse(r.payload || '{}') : r.payload,
+          status: r.status,
+          deadline_at: r.deadline_at,
+          offer_expires_at: r.offer_expires_at,
+          created_at: r.created_at,
+          actor: r.actor
+        }));
+
+        return Response.json({ status: 'ok', server_time: nowIso, offers });
+      }
+
       const registryResponse = await handleRegistryRoutes(request, path, this.sql, this.ctx, this.env);
       if (registryResponse) return registryResponse;
       const busResponse = await this.handleBusRoutes(request, path);
       if (busResponse) return busResponse;
+      const jobsResponse = await this.handleJobsRoutes(request, path, url);
+      if (jobsResponse) return jobsResponse;
       if (path === '/api/healthz') {
         if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
         return Response.json({ status: 'ok', component: 'hub-do' });
@@ -568,8 +916,22 @@ export class Hub extends DurableObject {
 
       if (path === '/internal/tick') {
         if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
-        // caller body.now inert: ignore any caller body and strictly use internal server clock
-        const res = await this.scheduledTick();
+        const auth = await this.authenticateBusRequest(request);
+        const body = await safeJson(request);
+        const slotOverride = (body && typeof body === 'object') ? (body.slot || body.slot_start) : undefined;
+
+        // If client provides slot override or Authorization header, strictly enforce admin authorization
+        const hasAuthHeader = Boolean(request.headers.get('Authorization'));
+        if (slotOverride || hasAuthHeader) {
+          if (auth.error || !auth.scopes?.includes('admin')) {
+            return Response.json({ error: 'unauthorized', reason: 'admin_required' }, { status: 401 });
+          }
+        }
+
+        const res = await this.scheduledTick(slotOverride);
+        if (res.status === 'refused' || res.status === 'rejected') {
+          return Response.json(res, { status: 400 });
+        }
         return Response.json(res);
       }
 
@@ -609,22 +971,102 @@ export class Hub extends DurableObject {
     }
   }
 
-  async scheduledTick() {
-    const now = new Date();
+  async scheduledTick(slotOverride?: string) {
+    const now = (this.jobsService as any).now ? (this.jobsService as any).now() : new Date();
+    // 1. Bus retention cleanup
     const cleanup = this.busService.retentionCleanup(now.getTime(), 100);
+
+    // 2. Jobs root slot tick
+    let slotDate: Date;
+    if (slotOverride) {
+      const parsed = new Date(slotOverride);
+      if (isNaN(parsed.getTime())) {
+        return { status: 'rejected', reason: 'invalid_slot_timestamp', error: 'invalid_slot_timestamp' };
+      }
+      const rawAge = now.getTime() - parsed.getTime();
+      if (rawAge >= 1500000) {
+        return { status: 'refused', reason: 'late_slot_refused', age_ms: rawAge, slot: parsed.toISOString() };
+      }
+      if (parsed.getTime() > now.getTime() + 60000) {
+        return { status: 'refused', reason: 'future_slot_refused', slot: parsed.toISOString() };
+      }
+      const slotMinute = Math.floor(parsed.getUTCMinutes() / 30) * 30;
+      slotDate = new Date(Date.UTC(
+        parsed.getUTCFullYear(),
+        parsed.getUTCMonth(),
+        parsed.getUTCDate(),
+        parsed.getUTCHours(),
+        slotMinute,
+        0,
+        0
+      ));
+    } else {
+      const slotMinute = Math.floor(now.getUTCMinutes() / 30) * 30;
+      slotDate = new Date(Date.UTC(
+        now.getUTCFullYear(),
+        now.getUTCMonth(),
+        now.getUTCDate(),
+        now.getUTCHours(),
+        slotMinute,
+        0,
+        0
+      ));
+      const age = now.getTime() - slotDate.getTime();
+      if (age >= 1500000) {
+        return { status: 'refused', reason: 'late_slot_refused', age_ms: age, slot: slotDate.toISOString() };
+      }
+    }
+
+    const slotTime = slotDate.getTime();
+    const age = now.getTime() - slotTime;
+    if (age >= 1500000) {
+      return { status: 'refused', reason: 'late_slot_refused', age_ms: age, slot: slotDate.toISOString() };
+    }
+    if (slotTime > now.getTime() + 60000) {
+      return { status: 'refused', reason: 'future_slot_refused', slot: slotDate.toISOString() };
+    }
+
+    const slotStartIso = slotDate.toISOString();
+    const tickResult = this.jobsService.tickRootSlot(slotStartIso);
+
+    // 3. Process alarms & expiry
+    const nextAlarm = this.jobsService.processAlarms();
+
+    // 4. Schedule next alarm with bounded free usage guard
     if (cleanup.hasMore) {
       await this.ctx.storage.setAlarm(Date.now() + 1000);
+    } else {
+      const nextTime = nextAlarm || this.jobsService.getAlarmTime();
+      if (nextTime) {
+        try {
+          await this.ctx.storage.setAlarm(Math.max(Date.now(), nextTime));
+        } catch {}
+      }
     }
-    return { status: 'ok', retention: cleanup };
+
+    return { status: 'ok', retention: cleanup, tick: tickResult };
   }
 
   async alarm() {
-    await this.scheduledTick();
+    const now = (this.jobsService as any).now ? (this.jobsService as any).now() : new Date();
+    const cleanup = this.busService.retentionCleanup(now.getTime(), 100);
+    const nextAlarm = this.jobsService.processAlarms();
+
+    if (cleanup.hasMore) {
+      await this.ctx.storage.setAlarm(Date.now() + 1000);
+    } else if (nextAlarm) {
+      try {
+        await this.ctx.storage.setAlarm(Math.max(Date.now(), nextAlarm));
+      } catch {}
+    }
   }
 
   private async authenticateBusRequest(request: Request): Promise<{ caller?: CallerContext; scopes?: string[]; error?: Response }> {
     const session = await getSession(this.env, request);
-    if (session && session.isAdmin) {
+    if (session) {
+      if (!session.isAdmin) {
+        return { error: Response.json({ error: 'forbidden' }, { status: 403 }) };
+      }
       if (request.method !== 'GET' && request.method !== 'HEAD') {
         if (!verifyCsrf(request, session)) {
           return { error: Response.json({ error: 'CSRF token missing' }, { status: 403 }) };
@@ -632,7 +1074,7 @@ export class Hub extends DurableObject {
       }
       return {
         caller: { isAdmin: true, actor: 'admin', kind: 'human' },
-        scopes: ['admin', 'bus:send', 'bus:read', 'host']
+        scopes: ['admin', 'bus:send', 'bus:read', 'host', 'lease:root', 'jobs:create']
       };
     }
 
@@ -1140,6 +1582,853 @@ export class Hub extends DurableObject {
         }
         return Response.json({ error: 'Internal Server Error' }, { status: 500 });
       }
+    }
+
+    return null;
+  }
+
+  public setHealthService(health: any) {
+    this.jobsService.setHealthService(health);
+  }
+
+  public getEffectiveHealth(tag: string): { state?: string } | null {
+    if ((this.jobsService as any).healthService?.getEffectiveHealth) {
+      return (this.jobsService as any).healthService.getEffectiveHealth(tag);
+    }
+    const agent = this.sql.exec("SELECT state, health_state FROM agents WHERE tag = ?", tag).toArray()[0] as any;
+    if (agent) {
+      return { state: agent.state || agent.health_state || 'unknown' };
+    }
+    return null;
+  }
+
+  private async handleJobsRoutes(request: Request, path: string, url: URL): Promise<Response | null> {
+    const isJobsPath = path.startsWith('/api/jobs');
+    const isRootPath = path.startsWith('/api/root');
+    const isHostOffers = path === '/api/host/offers';
+
+    if (!isJobsPath && !isRootPath && !isHostOffers) return null;
+
+    // 1. GET /api/jobs/offers or GET /api/host/offers
+    if (path === '/api/jobs/offers' || path === '/api/host/offers') {
+      if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (!auth.scopes?.includes('host') && !auth.scopes?.includes('admin')) {
+        return Response.json({ error: 'forbidden', reason: 'host_or_admin_scope_required' }, { status: 403 });
+      }
+
+      let hostId = auth.caller?.machineId;
+      if (auth.caller?.isAdmin && url.searchParams.get('host_id')) {
+        hostId = url.searchParams.get('host_id')!;
+      }
+      if (!hostId) {
+        return Response.json({ error: 'forbidden', reason: 'machine_binding_required' }, { status: 403 });
+      }
+
+      const nowIso = new Date().toISOString();
+      const rows = this.sql.exec(
+        `SELECT id, kind, payload, status, deadline_at, offer_host_id, offer_machine_id, offer_expires_at, created_at, actor
+         FROM jobs
+         WHERE status = 'offered'
+           AND (offer_host_id = ? OR offer_machine_id = ?)
+           AND (offer_expires_at IS NULL OR offer_expires_at > ?)
+         ORDER BY created_at DESC`,
+        hostId, hostId, nowIso
+      ).toArray() as any[];
+
+      const offers = rows.map(r => {
+        let payload = r.payload;
+        try { if (typeof payload === 'string') payload = JSON.parse(payload); } catch {}
+        return {
+          id: r.id,
+          kind: r.kind,
+          payload,
+          status: r.status,
+          deadline_at: r.deadline_at,
+          offer_host_id: r.offer_host_id,
+          offer_machine_id: r.offer_machine_id,
+          offer_expires_at: r.offer_expires_at,
+          created_at: r.created_at,
+          actor: r.actor
+        };
+      });
+
+      return Response.json({ offers });
+    }
+
+    // 2. Root endpoints (/api/root/... or /api/jobs/root/...)
+    // Root status
+    if (path === '/api/root/status' || path === '/api/jobs/root/status') {
+      if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (!auth.scopes?.includes('admin') && !auth.scopes?.includes('host') && !auth.scopes?.includes('lease:root') && !auth.scopes?.includes('jobs:create')) {
+        return Response.json({ error: 'forbidden', reason: 'insufficient_scope' }, { status: 403 });
+      }
+      return Response.json(this.jobsService.getRootStatus());
+    }
+
+    // Root takeover
+    if (path === '/api/root/takeover' || path === '/api/jobs/root/takeover') {
+      if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (!auth.scopes?.includes('host') && !auth.scopes?.includes('admin')) {
+        return Response.json({ error: 'forbidden', reason: 'host_or_admin_scope_required' }, { status: 403 });
+      }
+
+      const body = await safeJson(request);
+      if (!body) return Response.json({ error: 'malformed_json' }, { status: 400 });
+
+      let hostId = auth.caller?.machineId;
+      if (auth.caller?.isAdmin && body.host_id) {
+        hostId = body.host_id;
+      }
+      if (!hostId) {
+        return Response.json({ error: 'forbidden', reason: 'machine_binding_required' }, { status: 403 });
+      }
+
+      const candidateJobId = body.candidate_job_id;
+      if (!candidateJobId || typeof candidateJobId !== 'string') {
+        return Response.json({ error: 'invalid_candidate_job_id' }, { status: 400 });
+      }
+
+      const expectedEpoch = parseEpoch(body.expected_epoch);
+      if (expectedEpoch === null) {
+        return Response.json({ error: 'invalid_expected_epoch' }, { status: 400 });
+      }
+
+      const reason = typeof body.reason === 'string' ? body.reason : 'stale_or_hardstop';
+      const res = await this.jobsService.takeoverRoot(candidateJobId, hostId, expectedEpoch, reason);
+      if (res.error) {
+        return Response.json(res, { status: 409 });
+      }
+      return Response.json(res);
+    }
+
+    // Root verify
+    if (path === '/api/root/verify' || path === '/api/jobs/root/verify') {
+      if (request.method !== 'GET' && request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, POST' } });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+
+      // Scope check: only admin, host, or lease:root
+      if (!auth.scopes?.includes('admin') && !auth.scopes?.includes('host') && !auth.scopes?.includes('lease:root')) {
+        return Response.json({ valid: false, error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
+      }
+
+      const body = await safeJson(request) || {};
+      const jobId = body.job_id || url.searchParams.get('job_id') || auth.caller?.jobId || null;
+      const epoch = parseEpoch(body.epoch ?? url.searchParams.get('epoch'));
+      if (epoch === null) {
+        return Response.json({ valid: false, status: 'error', reason: 'invalid_epoch' }, { status: 400 });
+      }
+
+      if (auth.caller?.kind === 'job' && auth.caller?.jobId && jobId && auth.caller.jobId !== jobId) {
+        return Response.json({ valid: false, status: 'unauthorized', reason: 'job_token_mismatch' }, { status: 403 });
+      }
+
+      // Check the root lease
+      const lease = this.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
+      if (!lease || lease.epoch !== epoch) {
+        return Response.json({ valid: false, status: 'fenced', reason: 'stale_epoch', current_epoch: lease?.epoch ?? 0 }, { status: 409 });
+      }
+
+      if (!lease.expires_at || new Date(lease.expires_at).getTime() <= Date.now()) {
+        return Response.json({ valid: false, status: 'expired', reason: 'lease_expired', current_epoch: lease.epoch }, { status: 403 });
+      }
+
+      const targetJobId = jobId || lease.holder_job_id;
+      if (!targetJobId) {
+        return Response.json({ valid: false, status: 'unauthorized', reason: 'no_holder_job' }, { status: 403 });
+      }
+
+      const jobRow = this.sql.exec("SELECT status, holder_host_id, holder_machine_id, claim_token_hash FROM jobs WHERE id = ?", targetJobId).toArray()[0] as any;
+      if (!jobRow || jobRow.status !== 'running') {
+        return Response.json({
+          valid: false,
+          status: 'unauthorized',
+          reason: jobRow ? `job_not_running (status: ${jobRow.status})` : 'job_not_found',
+          current_epoch: lease.epoch
+        }, { status: 403 });
+      }
+
+      // Check if job token was revoked
+      if (jobRow.claim_token_hash) {
+        const cred = this.sql.exec("SELECT revoked_at FROM credentials WHERE token_hash = ?", jobRow.claim_token_hash).toArray()[0] as any;
+        if (!cred || (cred.revoked_at && cred.revoked_at.trim().length > 0)) {
+          return Response.json({ valid: false, status: 'unauthorized', reason: 'revoked_token', current_epoch: lease.epoch }, { status: 403 });
+        }
+      }
+
+      if (!auth.caller?.isAdmin && auth.scopes?.includes('host')) {
+        if (!auth.caller?.machineId || auth.caller.machineId !== (jobRow.holder_host_id || jobRow.holder_machine_id)) {
+          return Response.json({ valid: false, status: 'unauthorized', reason: 'host_mismatch', current_epoch: lease.epoch }, { status: 403 });
+        }
+      }
+
+      const authHeader = request.headers.get('Authorization');
+      const bearerToken = authHeader && authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : null;
+      const jobToken = body.job_token || url.searchParams.get('job_token') || bearerToken;
+
+      const isHostSupervisor = auth.scopes?.includes('host') || auth.caller?.isAdmin || false;
+      let hostId = auth.caller?.machineId;
+      if (auth.caller?.isAdmin && (body.host_id || url.searchParams.get('host_id'))) {
+        hostId = body.host_id || url.searchParams.get('host_id');
+      }
+
+      const res = await this.jobsService.verifyRootEpoch(jobId, jobToken, epoch, isHostSupervisor, hostId);
+      if (!res.valid) {
+        return Response.json(res, { status: res.status === 'fenced' ? 409 : 403 });
+      }
+      return Response.json(res);
+    }
+
+    // Root actions (singular & plural)
+    if (path === '/api/root/action' || path === '/api/root/actions' || path === '/api/jobs/root/actions') {
+      if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+
+      // Scope check: must have lease:root, host, or admin
+      if (!auth.scopes?.includes('lease:root') && !auth.scopes?.includes('admin') && !auth.scopes?.includes('host')) {
+        return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
+      }
+
+      const body = await safeJson(request);
+      if (!body) return Response.json({ error: 'malformed_json' }, { status: 400 });
+
+      const jobId = body.job_id;
+      if (!jobId || typeof jobId !== 'string') {
+        return Response.json({ error: 'missing_job_id' }, { status: 400 });
+      }
+
+      const epoch = parseEpoch(body.epoch ?? body.lease_epoch);
+      if (epoch === null) {
+        return Response.json({ error: 'invalid_epoch' }, { status: 400 });
+      }
+
+      const action = body.action;
+      if (!action || typeof action !== 'object') {
+        return Response.json({ error: 'missing_action' }, { status: 400 });
+      }
+
+
+
+      const jobRow = this.sql.exec("SELECT holder_host_id, holder_machine_id, claim_token_hash, status FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
+      if (!jobRow) {
+        return Response.json({ error: 'not_found', reason: 'job_not_found' }, { status: 404 });
+      }
+
+      const authHeader = request.headers.get('Authorization');
+      const bearerToken = authHeader && authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : null;
+      const jobTokenPlain = typeof body.job_token === 'string' && body.job_token ? body.job_token : bearerToken;
+
+      let hostId: string | null = null;
+      if (auth.caller?.isAdmin) {
+        hostId = body.host_id || auth.caller?.machineId || jobRow.holder_host_id || jobRow.holder_machine_id || '';
+      } else if (auth.scopes?.includes('host')) {
+        hostId = auth.caller?.machineId || null;
+        if (!hostId || hostId !== (jobRow.holder_host_id || jobRow.holder_machine_id)) {
+          return Response.json({ error: 'forbidden', reason: 'host_mismatch' }, { status: 403 });
+        }
+      } else if (auth.scopes?.includes('lease:root')) {
+        if (auth.caller?.jobId && auth.caller.jobId !== jobId) {
+          return Response.json({ error: 'forbidden', reason: 'job_mismatch' }, { status: 403 });
+        }
+        if (!auth.caller?.tokenHash || !jobRow.claim_token_hash || auth.caller.tokenHash !== jobRow.claim_token_hash) {
+          return Response.json({ error: 'forbidden', reason: 'token_mismatch' }, { status: 403 });
+        }
+        hostId = jobRow.holder_host_id || jobRow.holder_machine_id || '';
+      } else {
+        return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
+      }
+
+      const sessionId = typeof body.session_id === 'string' ? body.session_id : undefined;
+
+      const res = await this.jobsService.commitRootAction(jobId, hostId || '', epoch, action, sessionId, jobTokenPlain);
+      if (!res.success) {
+        const statusCode = res.status === 'fenced' ? 409 : (res.status === 'unauthorized' ? 403 : 400);
+        return Response.json(res, { status: statusCode });
+      }
+      return Response.json(res);
+    }
+
+    // Root handoff
+    if ((path === '/api/root/handoff' || path === '/api/jobs/root/handoff') && request.method === 'POST') {
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+
+      if (!auth.scopes?.includes('lease:root') && !auth.scopes?.includes('admin') && !auth.scopes?.includes('host')) {
+        return Response.json({ error: 'forbidden', reason: 'lease_root_host_or_admin_scope_required' }, { status: 403 });
+      }
+
+      const body = await safeJson(request);
+      if (!body) return Response.json({ error: 'malformed_json' }, { status: 400 });
+
+      const jobId = body.job_id;
+      if (!jobId || typeof jobId !== 'string') {
+        return Response.json({ error: 'missing_job_id' }, { status: 400 });
+      }
+
+      const epoch = parseEpoch(body.epoch ?? body.lease_epoch);
+      if (epoch === null) {
+        return Response.json({ error: 'invalid_epoch' }, { status: 400 });
+      }
+
+      const lease = this.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
+      if (!lease || lease.epoch !== epoch) {
+        return Response.json({ error: 'fenced', reason: 'stale_epoch', current_epoch: lease?.epoch ?? 0 }, { status: 409 });
+      }
+      if (!lease.holder_job_id || lease.holder_job_id !== jobId) {
+        return Response.json({ error: 'forbidden', reason: 'job_not_current_holder' }, { status: 403 });
+      }
+      if (lease.expires_at && new Date(lease.expires_at).getTime() <= Date.now()) {
+        return Response.json({ error: 'fenced', reason: 'lease_expired', current_epoch: lease.epoch }, { status: 409 });
+      }
+
+      if (!auth.caller?.isAdmin) {
+        if (auth.scopes?.includes('host')) {
+          if (!auth.caller?.machineId || auth.caller.machineId !== (lease.holder_host_id || lease.holder_machine_id)) {
+            return Response.json({ error: 'forbidden', reason: 'host_mismatch' }, { status: 403 });
+          }
+        }
+        if (auth.scopes?.includes('lease:root') || auth.caller?.kind === 'job') {
+          if (auth.caller?.jobId && auth.caller.jobId !== jobId) {
+            return Response.json({ error: 'forbidden', reason: 'job_token_mismatch' }, { status: 403 });
+          }
+        }
+      }
+
+      let hostId = auth.caller?.machineId;
+      if (auth.caller?.isAdmin && body.host_id) {
+        hostId = body.host_id;
+      }
+      if (!hostId) {
+        hostId = lease.holder_host_id || lease.holder_machine_id || '';
+      }
+
+      const summary = typeof body.summary === 'string' ? body.summary : '';
+      const evidenceRefs = Array.isArray(body.evidence_refs) ? body.evidence_refs : [];
+      const sessionId = typeof body.session_id === 'string' ? body.session_id : undefined;
+      const authHeader = request.headers.get('Authorization');
+      const bearerToken = authHeader && authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : null;
+      const callerToken = (typeof body.job_token === 'string' && body.job_token) ? body.job_token : bearerToken;
+
+      const res = await this.jobsService.postHandoffNotes(jobId, hostId || '', epoch, summary, evidenceRefs, sessionId, callerToken);
+      if (!res.success) {
+        const statusCode = res.error === 'epoch_mismatch' ? 409 : 403;
+        return Response.json(res, { status: statusCode });
+      }
+      return Response.json(res);
+    }
+
+    if ((path === '/api/root/handoff' || path === '/api/jobs/root/handoff') && request.method === 'GET') {
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (!auth.scopes?.includes('admin') && !auth.scopes?.includes('host') && !auth.scopes?.includes('lease:root') && !auth.scopes?.includes('jobs:create')) {
+        return Response.json({ error: 'forbidden', reason: 'insufficient_scope' }, { status: 403 });
+      }
+      const limitRaw = url.searchParams.get('limit');
+      let limit = 10;
+      if (limitRaw !== null) {
+        const parsed = parseInt(limitRaw, 10);
+        if (!Number.isFinite(parsed) || isNaN(parsed) || parsed.toString() !== limitRaw.trim()) {
+          return Response.json({ error: 'invalid_limit' }, { status: 400 });
+        }
+        limit = Math.max(1, Math.min(100, parsed));
+      }
+      return Response.json({ notes: this.jobsService.getHandoffNotes(limit) });
+    }
+
+    // 3. Jobs action endpoints: /api/jobs/:id/:action
+    const jobActionMatch = path.match(/^\/api\/jobs\/([^\/]+)\/([^\/]+)$/);
+    if (jobActionMatch) {
+      const [, jobId, action] = jobActionMatch;
+
+      // GET /api/jobs/:id/status
+      if (action === 'status') {
+        if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
+        const auth = await this.authenticateBusRequest(request);
+        if (auth.error) return auth.error;
+
+        const row = this.sql.exec(
+          `SELECT id, kind, idempotency_key, payload, status, created_at, deadline_at, actor,
+                  offer_host_id, offer_machine_id, offer_expires_at, offer_attempts,
+                  holder_host_id, holder_machine_id, started_at, first_action_at, evidence_digest,
+                  native_session, launcher_task_id, lease_epoch, finished_at, outcome_summary, outcome_evidence
+           FROM jobs WHERE id = ?`,
+          jobId
+        ).toArray()[0] as any;
+
+        if (!row) return Response.json({ error: 'not_found' }, { status: 404 });
+
+        const isSupervisor = auth.caller?.isAdmin || auth.scopes?.includes('admin') || auth.scopes?.includes('lease:root') || auth.scopes?.includes('jobs:create');
+        const isOfferedHost = auth.caller?.machineId && (row.offer_host_id === auth.caller.machineId || row.offer_machine_id === auth.caller.machineId || row.holder_host_id === auth.caller.machineId || row.holder_machine_id === auth.caller.machineId);
+        const isJobCaller = auth.caller?.kind === 'job' && (auth.caller.jobId === jobId || (auth.caller as any).subject === jobId);
+        if (!isSupervisor && !isOfferedHost && !isJobCaller) {
+          return Response.json({ error: 'forbidden', reason: 'scope_or_binding_mismatch' }, { status: 403 });
+        }
+
+        let payload = row.payload;
+        try { if (typeof payload === 'string') payload = JSON.parse(payload); } catch {}
+        let offerAttempts = row.offer_attempts;
+        try { if (typeof offerAttempts === 'string') offerAttempts = JSON.parse(offerAttempts); } catch {}
+        let outcomeEvidence = row.outcome_evidence;
+        try { if (typeof outcomeEvidence === 'string') outcomeEvidence = JSON.parse(outcomeEvidence); } catch {}
+
+        return Response.json({
+          job: {
+            ...row,
+            payload,
+            offer_attempts: offerAttempts,
+            outcome_evidence: outcomeEvidence
+          }
+        });
+      }
+
+      // POST /api/jobs/:id/claim
+      if (action === 'claim') {
+        if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+        const auth = await this.authenticateBusRequest(request);
+        if (auth.error) return auth.error;
+        if (!auth.scopes?.includes('host') && !auth.scopes?.includes('admin')) {
+          return Response.json({ error: 'forbidden', reason: 'host_or_admin_scope_required' }, { status: 403 });
+        }
+
+        const body = await safeJson(request) || {};
+        let hostId = auth.caller?.machineId;
+        if (auth.caller?.isAdmin && body.host_id) {
+          hostId = body.host_id;
+        }
+        if (!hostId) {
+          return Response.json({ error: 'forbidden', reason: 'machine_binding_required' }, { status: 403 });
+        }
+
+        const jobRow = this.sql.exec("SELECT kind, status, offer_host_id, offer_machine_id FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
+        if (!jobRow) {
+          return Response.json({ error: 'not_found' }, { status: 404 });
+        }
+
+        const targetHost = jobRow.offer_host_id || jobRow.offer_machine_id;
+        if (targetHost && targetHost !== hostId) {
+          return Response.json({ error: 'conflict', reason: 'offered_to_another_host' }, { status: 409 });
+        }
+        if (jobRow.status !== 'offered') {
+          return Response.json({ error: 'conflict', reason: 'not_offered' }, { status: 409 });
+        }
+
+        if (body.gate === undefined || body.gate === null) {
+          return Response.json({ error: 'gate_failed', reason: 'missing_gate' }, { status: 403 });
+        }
+
+        if (jobRow.kind === 'root-run') {
+          if (typeof body.gate === 'boolean') {
+            return Response.json({ error: 'unsupported_native_profile', reason: 'denyunsupportednative: structured gate required for root-run' }, { status: 400 });
+          }
+          const profileSupported = body.profile_supported ?? body.gate?.profile_supported;
+          const nativeRootSupported = body.native_root_supported ?? body.gate?.native_root_supported;
+          if (profileSupported === false || nativeRootSupported === false || (profileSupported !== true && nativeRootSupported !== true)) {
+            return Response.json({ error: 'unsupported_native_profile', reason: 'denyunsupportednative' }, { status: 400 });
+          }
+        }
+
+        const gate = typeof body.gate === 'boolean' ? body.gate : Boolean(body.gate?.launch_allowed);
+        const res = await this.jobsService.claimJob(jobId, hostId, gate);
+        if (res.error === 'conflict') {
+          return Response.json({ error: 'conflict' }, { status: 409 });
+        }
+        if (res.error === 'gate_failed') {
+          return Response.json({ error: 'gate_failed', reason: res.reason }, { status: 403 });
+        }
+        if (res.error) {
+          return Response.json({ error: res.error, reason: res.reason }, { status: 400 });
+        }
+        return Response.json(res);
+      }
+
+      // POST /api/jobs/:id/start
+      if (action === 'start') {
+        if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+        const auth = await this.authenticateBusRequest(request);
+        if (auth.error) return auth.error;
+
+        const body = await safeJson(request);
+        if (!body) return Response.json({ error: 'malformed_json' }, { status: 400 });
+
+        const jobRow = this.sql.exec("SELECT kind, holder_host_id, holder_machine_id, claim_token_hash FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
+        if (!jobRow) {
+          return Response.json({ error: 'not_found' }, { status: 404 });
+        }
+
+        if (jobRow.kind === 'root-run') {
+          if (body.profile_supported === false || body.native_root_supported === false) {
+            return Response.json({ error: 'unsupported_native_profile', reason: 'denyunsupportednative: native root profile unsupported' }, { status: 400 });
+          }
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        const bearerToken = authHeader && authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : '';
+        const jobToken = body.job_token || bearerToken;
+
+        if (!auth.caller?.isAdmin) {
+          if (auth.scopes?.includes('host')) {
+            if (!auth.caller?.machineId || auth.caller.machineId !== (jobRow.holder_host_id || jobRow.holder_machine_id)) {
+              return Response.json({ error: 'forbidden', reason: 'host_mismatch' }, { status: 403 });
+            }
+          }
+          if (auth.caller?.kind === 'job' && auth.caller.jobId && auth.caller.jobId !== jobId) {
+            return Response.json({ error: 'forbidden', reason: 'job_token_subject_mismatch' }, { status: 403 });
+          }
+          if (body.job_token && bearerToken && body.job_token !== bearerToken) {
+            return Response.json({ error: 'forbidden', reason: 'bearer_job_token_mismatch' }, { status: 403 });
+          }
+        }
+
+        const epoch = parseEpoch(body.epoch ?? body.lease_epoch);
+        if (epoch === null) {
+          return Response.json({ error: 'invalid_epoch' }, { status: 400 });
+        }
+
+        const evidenceDigest = body.evidence_digest || body.evidence || '';
+        const nativeSession = body.native_session || body.session_id || '';
+        const launcherTaskId = body.launcher_task_id || body.task_id || '';
+
+        if (!evidenceDigest || !nativeSession || !launcherTaskId) {
+          return Response.json({ error: 'unqualified_first_action', reason: 'evidence_digest, native_session, and launcher_task_id required' }, { status: 400 });
+        }
+        if (jobRow.kind === 'root-run') {
+          if (evidenceDigest === 'UNKNOWN' || nativeSession === 'UNKNOWN' || launcherTaskId === 'UNKNOWN') {
+            return Response.json({ error: 'unqualified_first_action', reason: 'denyunsupportednative: qualification fields cannot be UNKNOWN' }, { status: 400 });
+          }
+        }
+
+        const res = await this.jobsService.startJob(jobId, jobToken, epoch, evidenceDigest, nativeSession, launcherTaskId);
+        if (res.error === 'unauthorized_or_stale') {
+          return Response.json({ error: 'unauthorized_or_stale' }, { status: 409 });
+        }
+        if (res.error === 'first_action_window_expired') {
+          return Response.json({ error: 'first_action_window_expired' }, { status: 409 });
+        }
+        if (res.error) {
+          return Response.json({ error: res.error }, { status: 400 });
+        }
+        return Response.json({ status: 'running', job_id: jobId, epoch });
+      }
+
+      // POST /api/jobs/:id/renew
+      if (action === 'renew') {
+        if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+        const auth = await this.authenticateBusRequest(request);
+        if (auth.error) return auth.error;
+
+        const body = await safeJson(request);
+        if (!body) return Response.json({ error: 'malformed_json' }, { status: 400 });
+
+        const jobRow = this.sql.exec("SELECT holder_host_id, holder_machine_id FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
+        if (!jobRow) {
+          return Response.json({ error: 'not_found' }, { status: 404 });
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        const bearerToken = authHeader && authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : '';
+        const jobToken = body.job_token || bearerToken;
+
+        if (!auth.caller?.isAdmin) {
+          if (auth.scopes?.includes('host')) {
+            if (!auth.caller?.machineId || auth.caller.machineId !== (jobRow.holder_host_id || jobRow.holder_machine_id)) {
+              return Response.json({ error: 'forbidden', reason: 'host_mismatch' }, { status: 403 });
+            }
+          }
+          if (auth.caller?.kind === 'job' && auth.caller.jobId && auth.caller.jobId !== jobId) {
+            return Response.json({ error: 'forbidden', reason: 'job_token_subject_mismatch' }, { status: 403 });
+          }
+          if (body.job_token && bearerToken && body.job_token !== bearerToken) {
+            return Response.json({ error: 'forbidden', reason: 'bearer_job_token_mismatch' }, { status: 403 });
+          }
+        }
+
+        const epoch = parseEpoch(body.epoch ?? body.lease_epoch);
+        if (epoch === null) {
+          return Response.json({ error: 'invalid_epoch' }, { status: 400 });
+        }
+
+        const res = await this.jobsService.renewJob(jobId, jobToken, epoch);
+        if (res.error) {
+          return Response.json({ error: res.error }, { status: 409 });
+        }
+        return Response.json({ status: 'renewed', job_id: jobId, epoch });
+      }
+
+      // POST /api/jobs/:id/finish
+      if (action === 'finish') {
+        if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+        const auth = await this.authenticateBusRequest(request);
+        if (auth.error) return auth.error;
+
+        const body = await safeJson(request);
+        if (!body) return Response.json({ error: 'malformed_json' }, { status: 400 });
+
+        const jobRow = this.sql.exec("SELECT holder_host_id, holder_machine_id FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
+        if (!jobRow) {
+          return Response.json({ error: 'not_found' }, { status: 404 });
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        const bearerToken = authHeader && authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : '';
+        const jobToken = body.job_token || bearerToken;
+
+        if (!auth.caller?.isAdmin) {
+          if (auth.scopes?.includes('host')) {
+            if (!auth.caller?.machineId || auth.caller.machineId !== (jobRow.holder_host_id || jobRow.holder_machine_id)) {
+              return Response.json({ error: 'forbidden', reason: 'host_mismatch' }, { status: 403 });
+            }
+          }
+          if (auth.caller?.kind === 'job' && auth.caller.jobId && auth.caller.jobId !== jobId) {
+            return Response.json({ error: 'forbidden', reason: 'job_token_subject_mismatch' }, { status: 403 });
+          }
+          if (body.job_token && bearerToken && body.job_token !== bearerToken) {
+            return Response.json({ error: 'forbidden', reason: 'bearer_job_token_mismatch' }, { status: 403 });
+          }
+        }
+
+        const epoch = parseEpoch(body.epoch ?? body.lease_epoch);
+        if (epoch === null) {
+          return Response.json({ error: 'invalid_epoch' }, { status: 400 });
+        }
+
+        const status = body.status;
+        const summary = typeof body.summary === 'string' ? body.summary : '';
+        const evidenceRefs = Array.isArray(body.evidence_refs) ? body.evidence_refs : [];
+
+        const res = await this.jobsService.finishJob(jobId, jobToken, epoch, status, summary, evidenceRefs);
+        if (res.error === 'invalid_status') {
+          return Response.json({ error: 'invalid_status' }, { status: 400 });
+        }
+        if (res.error) {
+          return Response.json({ error: res.error }, { status: 409 });
+        }
+        return Response.json({ status: 'finished', job_id: jobId });
+      }
+
+      // POST /api/jobs/:id/decline
+      if (action === 'decline') {
+        if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+        const auth = await this.authenticateBusRequest(request);
+        if (auth.error) return auth.error;
+        if (!auth.scopes?.includes('host') && !auth.scopes?.includes('admin')) {
+          return Response.json({ error: 'forbidden', reason: 'host_or_admin_scope_required' }, { status: 403 });
+        }
+
+        const body = await safeJson(request) || {};
+        let hostId = auth.caller?.machineId;
+        if (auth.caller?.isAdmin && body.host_id) {
+          hostId = body.host_id;
+        }
+        if (!hostId) {
+          return Response.json({ error: 'forbidden', reason: 'machine_binding_required' }, { status: 403 });
+        }
+
+        const reason = typeof body.reason === 'string' ? body.reason : 'declined_by_host';
+        const res = await this.jobsService.declineJob(jobId, hostId, reason);
+        if (res.error) {
+          return Response.json({ error: res.error }, { status: 409 });
+        }
+        return Response.json({ status: 'declined', job_id: jobId });
+      }
+    }
+
+    // Match /api/jobs/:id (GET single job)
+    const singleJobMatch = path.match(/^\/api\/jobs\/([^\/]+)$/);
+    if (singleJobMatch && request.method === 'GET') {
+      const jobId = singleJobMatch[1];
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+
+      const row = this.sql.exec(
+        `SELECT id, kind, idempotency_key, payload, status, created_at, deadline_at, actor,
+                offer_host_id, offer_machine_id, offer_expires_at, offer_attempts,
+                holder_host_id, holder_machine_id, started_at, first_action_at, evidence_digest,
+                native_session, launcher_task_id, lease_epoch, finished_at, outcome_summary, outcome_evidence
+         FROM jobs WHERE id = ?`,
+        jobId
+      ).toArray()[0] as any;
+
+      if (!row) return Response.json({ error: 'not_found' }, { status: 404 });
+
+      const isSupervisor = auth.caller?.isAdmin || auth.scopes?.includes('admin') || auth.scopes?.includes('lease:root') || auth.scopes?.includes('jobs:create');
+      const isOfferedHost = auth.caller?.machineId && (row.offer_host_id === auth.caller.machineId || row.offer_machine_id === auth.caller.machineId || row.holder_host_id === auth.caller.machineId || row.holder_machine_id === auth.caller.machineId);
+      const isJobCaller = auth.caller?.kind === 'job' && (auth.caller.jobId === jobId || (auth.caller as any).subject === jobId);
+      if (!isSupervisor && !isOfferedHost && !isJobCaller) {
+        return Response.json({ error: 'forbidden', reason: 'scope_or_binding_mismatch' }, { status: 403 });
+      }
+
+      let payload = row.payload;
+      try { if (typeof payload === 'string') payload = JSON.parse(payload); } catch {}
+      let offerAttempts = row.offer_attempts;
+      try { if (typeof offerAttempts === 'string') offerAttempts = JSON.parse(offerAttempts); } catch {}
+      let outcomeEvidence = row.outcome_evidence;
+      try { if (typeof outcomeEvidence === 'string') outcomeEvidence = JSON.parse(outcomeEvidence); } catch {}
+
+      return Response.json({
+        job: {
+          ...row,
+          payload,
+          offer_attempts: offerAttempts,
+          outcome_evidence: outcomeEvidence
+        }
+      });
+    }
+
+    // GET /api/jobs (list jobs)
+    if (path === '/api/jobs' && request.method === 'GET') {
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (!auth.scopes?.includes('admin') && !auth.scopes?.includes('host') && !auth.scopes?.includes('lease:root') && !auth.scopes?.includes('jobs:create')) {
+        return Response.json({ error: 'forbidden', reason: 'insufficient_scope' }, { status: 403 });
+      }
+
+      const statusFilter = url.searchParams.get('status');
+      const kindFilter = url.searchParams.get('kind');
+      const limitRaw = url.searchParams.get('limit');
+      let limit = 50;
+      if (limitRaw !== null) {
+        const parsed = parseInt(limitRaw, 10);
+        if (!Number.isFinite(parsed) || isNaN(parsed) || parsed.toString() !== limitRaw.trim()) {
+          return Response.json({ error: 'invalid_limit' }, { status: 400 });
+        }
+        limit = Math.max(1, Math.min(100, parsed));
+      }
+
+      let query = `SELECT id, kind, idempotency_key, payload, status, created_at, deadline_at, actor,
+                          offer_host_id, offer_machine_id, offer_expires_at,
+                          holder_host_id, holder_machine_id, started_at, first_action_at, evidence_digest,
+                          native_session, launcher_task_id, lease_epoch, finished_at, outcome_summary
+                   FROM jobs WHERE 1=1`;
+      const params: any[] = [];
+
+      // Host isolation: non-admin host caller only sees jobs offered to or held by this host
+      if (!auth.caller?.isAdmin && auth.scopes?.includes('host')) {
+        const hostId = auth.caller?.machineId;
+        if (hostId) {
+          query += ' AND (offer_host_id = ? OR offer_machine_id = ? OR holder_host_id = ? OR holder_machine_id = ?)';
+          params.push(hostId, hostId, hostId, hostId);
+        } else {
+          return Response.json({ jobs: [] });
+        }
+      } else if (!auth.caller?.isAdmin && auth.scopes?.includes('lease:root')) {
+        if (auth.caller?.jobId) {
+          query += ' AND id = ?';
+          params.push(auth.caller.jobId);
+        } else {
+          return Response.json({ jobs: [] });
+        }
+      }
+
+      if (statusFilter) {
+        query += ' AND status = ?';
+        params.push(statusFilter);
+      }
+      if (kindFilter) {
+        query += ' AND kind = ?';
+        params.push(kindFilter);
+      }
+      query += ' ORDER BY created_at DESC LIMIT ?';
+      params.push(limit);
+
+      const rows = this.sql.exec(query, ...params).toArray() as any[];
+      const jobs = rows.map(r => {
+        let payload = r.payload;
+        try { if (typeof payload === 'string') payload = JSON.parse(payload); } catch {}
+        return { ...r, payload };
+      });
+
+      return Response.json({ jobs });
+    }
+
+    // POST /api/jobs (create job)
+    if (path === '/api/jobs' && request.method === 'POST') {
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (!auth.scopes?.includes('jobs:create') && !auth.scopes?.includes('admin')) {
+        return Response.json({ error: 'forbidden', reason: 'jobs:create_scope_required' }, { status: 403 });
+      }
+
+      const body = await safeJson(request);
+      if (!body) return Response.json({ error: 'malformed_json' }, { status: 400 });
+
+      const kind = body.kind;
+      if (!kind || typeof kind !== 'string') {
+        return Response.json({ error: 'missing_kind' }, { status: 400 });
+      }
+
+      // Check idempotency_key
+      if (body.idempotency_key && typeof body.idempotency_key === 'string') {
+        const existing = this.sql.exec("SELECT id FROM jobs WHERE idempotency_key = ?", body.idempotency_key).toArray()[0] as any;
+        if (existing) {
+          return Response.json({ jobId: existing.id, job_id: existing.id }, { status: 201 });
+        }
+      }
+
+      if (body.deadline_mins !== undefined) {
+        if (!Number.isFinite(body.deadline_mins) || body.deadline_mins <= 0) {
+          return Response.json({ error: 'invalid_deadline_mins' }, { status: 400 });
+        }
+      }
+      const deadlineMins = typeof body.deadline_mins === 'number' ? body.deadline_mins : 25;
+
+      const hasEpochField = ('epoch' in body) || ('lease_epoch' in body) || ('root_epoch' in body);
+      let rootEpoch: number | undefined;
+      if (hasEpochField) {
+        const epochRaw = body.epoch !== undefined ? body.epoch : (body.lease_epoch !== undefined ? body.lease_epoch : body.root_epoch);
+        const parsed = parseEpoch(epochRaw);
+        if (parsed === null) {
+          return Response.json({ error: 'invalid_epoch' }, { status: 400 });
+        }
+        rootEpoch = parsed;
+      }
+
+      if (rootEpoch !== undefined) {
+        const lease = this.sql.exec("SELECT epoch, holder_job_id FROM leases WHERE name = 'root'").toArray()[0] as any;
+        const currentEpoch = lease ? Number(lease.epoch) : 0;
+        if (rootEpoch !== currentEpoch) {
+          return Response.json({ error: 'fenced', status: 'fenced', reason: 'stale_root_epoch', current_epoch: currentEpoch }, { status: 409 });
+        }
+        if (lease?.holder_job_id) {
+          const rootJob = this.sql.exec("SELECT status FROM jobs WHERE id = ?", lease.holder_job_id).toArray()[0] as any;
+          if (rootJob && rootJob.status !== 'running') {
+            return Response.json({ error: 'unauthorized', reason: `root_job_not_running (status: ${rootJob.status})` }, { status: 403 });
+          }
+        }
+      }
+
+      // Check active root incumbent if attempting to create competing root-run job
+      if (kind === 'root-run') {
+        const incumbent = this.jobsService.evaluateRootIncumbent();
+        if (incumbent && (incumbent.is_healthy_alive || incumbent.transport_unknown)) {
+          return Response.json({ error: 'conflict', reason: 'active_root_incumbent', incumbent }, { status: 409 });
+        }
+      }
+
+      const payload = body.payload ?? {};
+      const actor = auth.caller?.actor || (auth.caller?.isAdmin ? 'role:principal' : 'system');
+      
+      const authHeader = request.headers.get('Authorization');
+      const cookieHeader = request.headers.get('Cookie') || undefined;
+      const rootTokenPlain = body.root_token || body.job_token || (authHeader && authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : undefined) || cookieHeader;
+
+      const res = await this.jobsService.createJob(kind, payload, actor, deadlineMins, rootTokenPlain, rootEpoch);
+      if (res.error) {
+        const isStale = res.error === 'stale_root_epoch' || res.error === 'fenced' || res.error === 'conflict' || res.error.includes('epoch');
+        return Response.json({ error: res.error }, { status: isStale ? 409 : 403 });
+      }
+
+      if (body.idempotency_key && typeof body.idempotency_key === 'string' && res.jobId) {
+        this.sql.exec("UPDATE jobs SET idempotency_key = ? WHERE id = ?", body.idempotency_key, res.jobId);
+      }
+
+      return Response.json({ jobId: res.jobId, job_id: res.jobId }, { status: 201 });
     }
 
     return null;

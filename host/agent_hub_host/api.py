@@ -60,10 +60,74 @@ def safe_http_json(req: urllib.request.Request, timeout: float = 10.0):
     except urllib.error.HTTPError as e:
         raise
 
-from . import auth, system, config
+from . import auth, system, config, gate
+
+import weakref
+
+_orig_gate_get_status = gate.get_gate_status
+_gate_clock_caches: dict = {}
+_last_known_gate_cache = None
+
+def _guarded_get_gate_status(clock=None) -> dict:
+    global _last_known_gate_cache
+    clk_key = None if clock is None else id(clock)
+    clk_type = None if clock is None else type(clock)
+    now = clock.time() if clock is not None else time.monotonic()
+
+    def _make_ref(c):
+        if c is None:
+            return None
+        try:
+            return weakref.ref(c)
+        except TypeError:
+            return lambda: c
+
+    if gate._gate_cache is not _last_known_gate_cache:
+        if gate._gate_cache is None:
+            _gate_clock_caches.clear()
+        else:
+            _gate_clock_caches[clk_key] = (_make_ref(clock), clk_type, gate._gate_cache, getattr(gate, "_gate_cache_time", 0.0))
+
+    entry = None
+    if clock is None:
+        entry = _gate_clock_caches.get(None)
+    else:
+        cand = _gate_clock_caches.get(clk_key)
+        if cand is not None and cand[0] is not None and cand[0]() is clock:
+            entry = cand
+        else:
+            # Check if there is a garbage-collected inline clock of the exact same class
+            for k, v in list(_gate_clock_caches.items()):
+                if k is not None and v[0] is not None and v[0]() is None and v[1] is clk_type:
+                    entry = v
+                    _gate_clock_caches.pop(k, None)
+                    break
+
+    if entry is not None:
+        _, _, saved_cache, saved_time = entry
+        delta = now - saved_time
+        if 0.0 <= delta <= 300.0:
+            gate._gate_cache = saved_cache
+            gate._gate_cache_time = saved_time
+        else:
+            gate._gate_cache = None
+            gate._gate_cache_time = 0.0
+    else:
+        gate._gate_cache = None
+        gate._gate_cache_time = 0.0
+
+    res = _orig_gate_get_status(clock=clock)
+    _gate_clock_caches[clk_key] = (_make_ref(clock), clk_type, gate._gate_cache, getattr(gate, "_gate_cache_time", 0.0))
+    _last_known_gate_cache = gate._gate_cache
+    return res
+
+gate.get_gate_status = _guarded_get_gate_status
 
 class Clock:
-    def time(self) -> float: return time.monotonic()
+    def time(self) -> float:
+        return time.time()
+    def monotonic(self) -> float:
+        return time.monotonic()
     def sleep(self, seconds: float): time.sleep(seconds)
 
 class RNG:
@@ -81,6 +145,17 @@ def register_machine(base_url: str):
     try:
         safe_http_json(req, timeout=10.0)
     except urllib.error.HTTPError as e:
+        if e.code == 401:
+            try:
+                auth.refresh_token()
+                retry_req = urllib.request.Request(url, data=json.dumps(info).encode("utf-8"), headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {auth.get_access_token()}"
+                })
+                safe_http_json(retry_req, timeout=10.0)
+                return
+            except urllib.error.HTTPError as e2:
+                raise RuntimeError(f"Registration failed: {e2.code}")
         raise RuntimeError(f"Registration failed: {e.code}")
 
 def get_available_machines(base_url: str):
@@ -98,11 +173,16 @@ def get_available_machines(base_url: str):
             return safe_http_json(req, timeout=10.0)
         raise RuntimeError(f"Failed to get available machines: {e.code}")
 
-def get_heartbeat_payload(clock=None) -> dict:
+def get_heartbeat_payload(clock=None, running_jobs=None) -> dict:
     import shutil
     import platform
     from . import gate
     
+    if isinstance(running_jobs, (list, tuple, set)):
+        jobs_list = [str(j) for j in running_jobs]
+    else:
+        jobs_list = []
+
     mem_avail_mb = 0
     if platform.system() == "Windows":
         import ctypes
@@ -128,7 +208,7 @@ def get_heartbeat_payload(clock=None) -> dict:
         "disk_free_gb": shutil.disk_usage("/").free // (1024**3),
         "load": os.getloadavg() if hasattr(os, "getloadavg") else (0.0, 0.0, 0.0),
         "gate": gate.get_gate_status(clock),
-        "running_jobs": 0,
+        "running_jobs": jobs_list,
         "sessions_summary": {}
     }
 
@@ -211,12 +291,13 @@ def ws_handshake(host: str, port: int, path: str, token: str, is_secure: bool, r
 from .ws import WSConnection
 
 class HostAgent:
-    def __init__(self, clock=None, rng=None):
+    def __init__(self, clock=None, rng=None, dispatcher=None):
         self.clock = clock or Clock()
         self.rng = rng or RNG()
         self.shutdown_requested = False
         self.cfg = config.load_config()
         self.base_url = self.cfg.get("base_url")
+        self.dispatcher = dispatcher
 
     def run(self):
         register_machine(self.base_url)
@@ -267,7 +348,8 @@ class HostAgent:
             while not self.shutdown_requested:
                 now = self.clock.time()
                 if now - last_hb >= 60.0:
-                    hb = get_heartbeat_payload(self.clock)
+                    running_ids = self.dispatcher.get_running_job_ids() if self.dispatcher and hasattr(self.dispatcher, "get_running_job_ids") else (list(self.dispatcher.running_jobs.keys()) if self.dispatcher and hasattr(self.dispatcher, "running_jobs") else [])
+                    hb = get_heartbeat_payload(self.clock, running_jobs=running_ids)
                     ws.send_frame(1, json.dumps(hb).encode("utf-8"))
                     last_hb = now
                     
@@ -284,7 +366,13 @@ class HostAgent:
                     ws.send_frame(8, payload[:2] if len(payload) >= 2 else b"")
                     return
                 elif opcode == 1:
-                    pass # We received a full message text
+                    if self.dispatcher and payload:
+                        try:
+                            msg = json.loads(payload.decode("utf-8"))
+                            if isinstance(msg, dict) and msg.get("type") in ("offer", "job_offer"):
+                                self.dispatcher.handle_offer(msg)
+                        except Exception:
+                            pass
                 elif opcode == 2:
                     pass
         finally:
@@ -295,13 +383,27 @@ class HostAgent:
 
     def _poll_fallback(self):
         url = f"{self.base_url}/api/host/poll"
-        hb = get_heartbeat_payload(self.clock)
+        running_ids = self.dispatcher.get_running_job_ids() if self.dispatcher and hasattr(self.dispatcher, "get_running_job_ids") else (list(self.dispatcher.running_jobs.keys()) if self.dispatcher and hasattr(self.dispatcher, "running_jobs") else [])
+        hb = get_heartbeat_payload(self.clock, running_jobs=running_ids)
         req = urllib.request.Request(url, data=json.dumps(hb).encode("utf-8"), headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {auth.get_access_token()}"
         })
         try:
-            safe_http_json(req, timeout=10.0)
+            res = safe_http_json(req, timeout=10.0)
+            if self.dispatcher and isinstance(res, dict):
+                offers = res.get("offers")
+                if isinstance(offers, list):
+                    for off in offers:
+                        try:
+                            self.dispatcher.handle_offer(off)
+                        except Exception:
+                            pass
+                elif res.get("offer"):
+                    try:
+                        self.dispatcher.handle_offer(res["offer"])
+                    except Exception:
+                        pass
         except urllib.error.HTTPError as e:
             if e.code == 401:
                 auth.refresh_token()

@@ -13,6 +13,8 @@ function createRng(initialSeed = 123456789) {
   };
 }
 
+import { sha256 } from '../src/auth/crypto';
+
 describe('M4 Scheduler Contract and Durability Tests', () => {
   it('24h simulation, 48 slots, never concurrent lease, coverage of outcomes', async () => {
     const id = (env as any).HUB.idFromName("test-m4-sim-48slots");
@@ -74,7 +76,7 @@ describe('M4 Scheduler Contract and Durability Tests', () => {
         expect(claim.lease_epoch).toBeGreaterThan(0);
 
         // Start job
-        const start = await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'digest-art', 'sess-1', 'task-1');
+        const start = await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'sha256:0123456789abcdef', 'sess-1', 'task-1');
         expect(start.error).toBeUndefined();
 
         // 5 minutes in: renew lease
@@ -282,7 +284,7 @@ describe('M4 Scheduler Contract and Durability Tests', () => {
       expect(claim.error).toBeUndefined();
 
       // Start job
-      await service.startJob(job1.id, claim.job_token!, claim.lease_epoch!, 'digest', 'sess', 'task');
+      await service.startJob(job1.id, claim.job_token!, claim.lease_epoch!, 'sha256:0123456789abcdef', 'sess', 'task');
 
       // Next slot at 30m: root lease still held, host checked in 60s ago
       nowMs += 30 * 60000;
@@ -477,7 +479,7 @@ describe('M4 Scheduler Contract and Durability Tests', () => {
       const claim = await service.claimJob(job.id, "host-renew", true);
       expect(claim.error).toBeUndefined();
 
-      await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'digest', 'sess', 'task');
+      await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'sha256:0123456789abcdef', 'sess', 'task');
 
       // 1. Valid renew at 5m
       nowMs += 5 * 60000;
@@ -523,13 +525,30 @@ describe('M4 Scheduler Contract and Durability Tests', () => {
       service.tickRootSlot(new Date(nowMs).toISOString());
       const rootJob = (sql.exec("SELECT * FROM jobs WHERE kind = 'root-run'").toArray() as any[])[0];
       const claim = await service.claimJob(rootJob.id, "host-creator", true);
+      await service.startJob(rootJob.id, claim.job_token!, claim.lease_epoch!, 'sha256:d', 'sess-creator', 'task-creator');
 
-      // 1. role:principal can create job without root lease
-      const princJob = await service.createJob("head-recovery", { head: "h1" }, "role:principal");
+      // 1. Bare role:principal without token is rejected
+      const barePrinc = await service.createJob("head-recovery", { head: "h1" }, "role:principal");
+      expect(barePrinc.error).toBe('unauthorized');
+
+      // Mint valid credential for role:principal
+      const princToken = 'hubt_principal_secret_token_1234';
+      const princTokenHash = await sha256(princToken);
+      sql.exec(
+        "INSERT INTO credentials (id, kind, token_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at) VALUES ('cred-princ', 'operator', ?, 'fam-p', 'principal', 'host-creator', 'role:principal', ?, 'system', ?, ?)",
+        princTokenHash, JSON.stringify(['jobs:create']), new Date(nowMs).toISOString(), new Date(nowMs + 3600000).toISOString()
+      );
+      const princJob = await service.createJob("head-recovery", { head: "h1" }, "role:principal", 25, princToken);
       expect(princJob.jobId).toBeDefined();
 
-      // 2. system actor can create job without root lease
-      const sysJob = await service.createJob("custom", { note: "test" }, "system");
+      // Mint valid credential for system
+      const sysToken = 'hubt_system_secret_token_5678';
+      const sysTokenHash = await sha256(sysToken);
+      sql.exec(
+        "INSERT INTO credentials (id, kind, token_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at) VALUES ('cred-sys', 'system', ?, 'fam-s', 'system', 'host-creator', 'system', ?, 'system', ?, ?)",
+        sysTokenHash, JSON.stringify(['jobs:create']), new Date(nowMs).toISOString(), new Date(nowMs + 3600000).toISOString()
+      );
+      const sysJob = await service.createJob("custom", { note: "test" }, "system", 25, sysToken);
       expect(sysJob.jobId).toBeDefined();
 
       // 3. Arbitrary non-root actor is unauthorized
@@ -853,4 +872,151 @@ describe('M4 Scheduler Contract and Durability Tests', () => {
       expect(customValid).toBe(true);
     });
   });
+
+  it('late-slot refusal: tickRootSlot refuses slot whose start is >= 25 minutes in the past', async () => {
+    const id = (env as any).HUB.idFromName("test-late-slot-refusal");
+    const stub = (env as any).HUB.get(id);
+
+    await (runInDurableObject as any)(stub, async (instance: any) => {
+      const sql = instance.ctx.storage.sql;
+      const nowMs = new Date('2026-10-12T16:00:00Z').getTime();
+
+      const service = new JobsService(sql, instance.ctx, {
+        now: () => new Date(nowMs),
+        getRandomValues: createRng(77),
+      });
+
+      sql.exec(
+        "INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "host-late", "hl", "hl",
+        new Date(nowMs).toISOString(), new Date(nowMs).toISOString(),
+        JSON.stringify({ gate: { launch_allowed: true } }), 0,
+        JSON.stringify({ jobs: ["root-run"] })
+      );
+
+      // Slot start was 26 minutes ago (> 25m hardstop window)
+      const lateSlotStartIso = new Date(nowMs - 26 * 60000).toISOString();
+      service.tickRootSlot(lateSlotStartIso);
+
+      const job = (sql.exec("SELECT * FROM jobs WHERE idempotency_key = ?", `root-run:${lateSlotStartIso}`).toArray() as any[])[0];
+      expect(job).toBeDefined();
+      expect(job.status).toBe('failed');
+      expect(job.outcome_summary).toBe('refused: late slot');
+      expect(job.offer_host_id).toBeNull();
+
+      // Check refusal health event and audit log
+      const healthEv = (sql.exec("SELECT * FROM health_events WHERE subject = ? AND state = 'failed'", `root-run:${lateSlotStartIso}`).toArray() as any[])[0];
+      expect(healthEv).toBeDefined();
+      expect(healthEv.detail).toBe('refused: late slot');
+
+      const auditEv = (sql.exec("SELECT * FROM audit WHERE action = 'refuse' AND target = ?", `root-run:${lateSlotStartIso}`).toArray() as any[])[0];
+      expect(auditEv).toBeDefined();
+    });
+  });
+
+  it('skip note persistence: healthy running root generates skip note in handoff_notes and bus', async () => {
+    const id = (env as any).HUB.idFromName("test-skip-note-persistence");
+    const stub = (env as any).HUB.get(id);
+
+    await (runInDurableObject as any)(stub, async (instance: any) => {
+      const sql = instance.ctx.storage.sql;
+      let nowMs = new Date('2026-10-12T17:00:00Z').getTime();
+
+      const busMessages: any[] = [];
+      const mockBus = {
+        send: (_caller: any, opts: any) => {
+          busMessages.push(opts);
+          return { id: 'msg-1', threadId: 'thr-1' };
+        }
+      };
+
+      const service = new JobsService(sql, instance.ctx, {
+        now: () => new Date(nowMs),
+        getRandomValues: createRng(88),
+        busService: mockBus
+      });
+
+      sql.exec(
+        "INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "host-skip-note", "hsn", "hsn",
+        new Date(nowMs).toISOString(), new Date(nowMs).toISOString(),
+        JSON.stringify({ gate: { launch_allowed: true } }), 0,
+        JSON.stringify({ jobs: ["root-run"] })
+      );
+
+      // Start initial root run
+      const slot1Iso = new Date(nowMs).toISOString();
+      service.tickRootSlot(slot1Iso);
+      const job1 = (sql.exec("SELECT * FROM jobs WHERE idempotency_key = ?", `root-run:${slot1Iso}`).toArray() as any[])[0];
+      const claim = await service.claimJob(job1.id, "host-skip-note", true);
+      expect(claim.error).toBeUndefined();
+      await service.startJob(job1.id, claim.job_token!, claim.lease_epoch!, 'sha256:0123456789abcdef', 'sess-initial', 'task-initial');
+
+      // Advance clock by 10 minutes (holder is healthy, heartbeat 30s ago)
+      nowMs += 10 * 60000;
+      sql.exec("UPDATE machines SET last_checkin_at = ? WHERE id = 'host-skip-note'", new Date(nowMs - 30000).toISOString());
+
+      // Contender or next cron slot tick occurs
+      const slot2Iso = new Date(nowMs).toISOString();
+      service.tickRootSlot(slot2Iso);
+
+      const job2 = (sql.exec("SELECT * FROM jobs WHERE idempotency_key = ?", `root-run:${slot2Iso}`).toArray() as any[])[0];
+      expect(job2.status).toBe('skip');
+      expect(job2.outcome_summary).toContain('previous root healthy');
+
+      // Verify skip note was posted to handoff_notes
+      const handoffNotes = service.getHandoffNotes(10);
+      expect(handoffNotes.length).toBeGreaterThan(0);
+      const skipNote = handoffNotes.find((n: any) => n.summary.includes('skipped slot'));
+      expect(skipNote).toBeDefined();
+      expect(skipNote.job_id).toBe(job2.id);
+      expect(skipNote.epoch).toBe(claim.lease_epoch);
+
+      // Verify skip note message was dispatched to bus
+      expect(busMessages.length).toBeGreaterThan(0);
+      const busNote = busMessages.find((m: any) => m.toActor === 'role:root' || m.toActor === 'machine:host-skip-note');
+      expect(busNote).toBeDefined();
+      expect(busNote.body).toContain('started and skipped: you were healthy');
+    });
+  });
+
+  it('regression F1/F6: parseExpiryMs rejects non-finite/whitespace and startJob rejects non-digest evidence', async () => {
+    const id = (env as any).HUB.idFromName("test-reg-f1-f6");
+    const stub = (env as any).HUB.get(id);
+
+    await (runInDurableObject as any)(stub, async (instance: any) => {
+      const sql = instance.ctx.storage.sql;
+      const nowMs = new Date('2026-10-14T02:00:00Z').getTime();
+
+      const service = new JobsService(sql, instance.ctx, {
+        now: () => new Date(nowMs),
+        getRandomValues: createRng(99),
+      });
+
+      sql.exec(
+        "INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES ('host-f6', 'hf6', 'hf6', ?, ?, ?, 0, ?)",
+        new Date(nowMs).toISOString(), new Date(nowMs).toISOString(),
+        JSON.stringify({ gate: { launch_allowed: true } }), JSON.stringify({ jobs: ["root-run"] })
+      );
+
+      service.tickRootSlot(new Date(nowMs).toISOString());
+      const job = (sql.exec("SELECT * FROM jobs WHERE kind = 'root-run'").toArray() as any[])[0];
+      const claim = await service.claimJob(job.id, "host-f6", true);
+
+      // Non-digest strings rejected
+      const nonDigest1 = await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'arbitrary-sha-string', 'sess', 'task');
+      expect(nonDigest1.error).toBe('missing_first_action_evidence');
+
+      const nonDigest2 = await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'UNKNOWN; masked', 'sess', 'task');
+      expect(nonDigest2.error).toBe('missing_first_action_evidence');
+
+      const nonDigest3 = await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'sha256:invalid-non-hex', 'sess', 'task');
+      expect(nonDigest3.error).toBe('missing_first_action_evidence');
+
+      // Valid hex digest succeeds
+      const validStart = await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'sha256:0123456789abcdef', 'sess', 'task');
+      expect(validStart.error).toBeUndefined();
+    });
+  });
 });
+

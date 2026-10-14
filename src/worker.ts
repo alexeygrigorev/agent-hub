@@ -30,7 +30,6 @@ export default {
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     const id = env.HUB.idFromName("hub");
     const stub = env.HUB.get(id);
-    const req = new Request("http://hub/internal/tick", { method: "POST" });
-    await stub.fetch(req);
+    await (stub as any).scheduledTick();
   }
 };

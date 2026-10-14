@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { JobsService } from '../src/jobs';
+import { BusService } from '../src/bus';
 
 function createRng(initialSeed = 987654321) {
   let seed = initialSeed;
@@ -102,7 +103,7 @@ describe('M4 Lease Semantics, Epoch CAS, and Safety Tests', () => {
       const claim = await service.claimJob(job.id, "host-stale-test", true);
       expect(claim.lease_epoch).toBe(1);
 
-      await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'digest', 'sess-stale', 'task-stale');
+      await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'sha256:0123456789abcdef', 'sess-stale', 'task-stale');
 
       // 1. verifyRootEpoch with stale epoch 0
       const verifyStale = await service.verifyRootEpoch(job.id, claim.job_token!, 0);
@@ -169,7 +170,7 @@ describe('M4 Lease Semantics, Epoch CAS, and Safety Tests', () => {
       const job = (sql.exec("SELECT * FROM jobs WHERE kind = 'root-run'").toArray() as any[])[0];
       const claim = await service.claimJob(job.id, "legit-host", true);
       expect(claim.error).toBeUndefined();
-      await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'digest', 'sess-host', 'task-host');
+      await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'sha256:0123456789abcdef', 'sess-host', 'task-host');
 
       // Register rogue host after claim
       sql.exec(
@@ -227,7 +228,7 @@ describe('M4 Lease Semantics, Epoch CAS, and Safety Tests', () => {
       const job = (sql.exec("SELECT * FROM jobs WHERE kind = 'root-run'").toArray() as any[])[0];
       const claim = await service.claimJob(job.id, "host-rev", true);
       expect(claim.error).toBeUndefined();
-      await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'digest', 'sess-rev', 'task-rev');
+      await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'sha256:0123456789abcdef', 'sess-rev', 'task-rev');
 
       // Explicitly revoke credential in credentials table
       sql.exec("UPDATE credentials SET revoked_at = ? WHERE subject = ?", new Date(nowMs).toISOString(), job.id);
@@ -248,7 +249,8 @@ describe('M4 Lease Semantics, Epoch CAS, and Safety Tests', () => {
       const actionRev = await service.commitRootAction(
         job.id, "host-rev", claim.lease_epoch!,
         { type: 'job_transition', payload: { target_job_id: 'target-rev', new_status: 'succeeded' } },
-        'sess-rev'
+        'sess-rev',
+        claim.job_token!
       );
       expect(actionRev.success).toBe(false);
       expect(actionRev.status).toBe('unauthorized');
@@ -297,7 +299,7 @@ describe('M4 Lease Semantics, Epoch CAS, and Safety Tests', () => {
       const job = (sql.exec("SELECT * FROM jobs WHERE kind = 'root-run'").toArray() as any[])[0];
       const claim = await service.claimJob(job.id, "host-exp", true);
       expect(claim.error).toBeUndefined();
-      await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'digest', 'sess-exp', 'task-exp');
+      await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'sha256:0123456789abcdef', 'sess-exp', 'task-exp');
 
       // Advance clock past 20m lease expiration (but before 25m hardstop)
       nowMs += 21 * 60000;
@@ -361,7 +363,7 @@ describe('M4 Lease Semantics, Epoch CAS, and Safety Tests', () => {
       const job = (sql.exec("SELECT * FROM jobs WHERE kind = 'root-run'").toArray() as any[])[0];
       const claim = await service.claimJob(job.id, "host-replay", true);
       expect(claim.error).toBeUndefined();
-      await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'digest', 'sess-replay', 'task-replay');
+      await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'sha256:0123456789abcdef', 'sess-replay', 'task-replay');
 
       // Seed target job
       sql.exec(
@@ -373,7 +375,8 @@ describe('M4 Lease Semantics, Epoch CAS, and Safety Tests', () => {
       const action1 = await service.commitRootAction(
         job.id, "host-replay", claim.lease_epoch!,
         { type: 'job_transition', idempotency_key: 'act-1', payload: { target_job_id: 'target-rep', new_status: 'succeeded' } },
-        'sess-replay'
+        'sess-replay',
+        claim.job_token!
       );
       expect(action1.success).toBe(true);
       expect(action1.status).toBe('committed');
@@ -387,7 +390,8 @@ describe('M4 Lease Semantics, Epoch CAS, and Safety Tests', () => {
       const action2 = await service.commitRootAction(
         job.id, "host-replay", claim.lease_epoch!,
         { type: 'job_transition', idempotency_key: 'act-1', payload: { target_job_id: 'target-rep', new_status: 'succeeded' } },
-        'sess-replay'
+        'sess-replay',
+        claim.job_token!
       );
       expect(action2.success).toBe(true);
       expect(action2.duplicate).toBe(true);
@@ -396,7 +400,8 @@ describe('M4 Lease Semantics, Epoch CAS, and Safety Tests', () => {
       const actionConflict = await service.commitRootAction(
         job.id, "host-replay", claim.lease_epoch!,
         { type: 'job_transition', idempotency_key: 'act-1', payload: { target_job_id: 'target-rep', new_status: 'failed' } },
-        'sess-replay'
+        'sess-replay',
+        claim.job_token!
       );
       expect(actionConflict.success).toBe(false);
       expect(actionConflict.status).toBe('conflict');
@@ -407,11 +412,11 @@ describe('M4 Lease Semantics, Epoch CAS, and Safety Tests', () => {
       expect(rows.length).toBe(1);
 
       // Handoff notes idempotency
-      const note1 = service.postHandoffNotes(job.id, "host-replay", claim.lease_epoch!, "initial notes", ["ref1"], "sess-replay");
+      const note1 = service.postHandoffNotes(job.id, "host-replay", claim.lease_epoch!, "initial notes", ["ref1"], "sess-replay", claim.job_token!);
       expect(note1.success).toBe(true);
       expect(note1.duplicate).toBe(false);
 
-      const note2 = service.postHandoffNotes(job.id, "host-replay", claim.lease_epoch!, "updated notes", ["ref1", "ref2"], "sess-replay");
+      const note2 = service.postHandoffNotes(job.id, "host-replay", claim.lease_epoch!, "updated notes", ["ref1", "ref2"], "sess-replay", claim.job_token!);
       expect(note2.success).toBe(true);
       expect(note2.duplicate).toBe(true);
 
@@ -458,7 +463,7 @@ describe('M4 Lease Semantics, Epoch CAS, and Safety Tests', () => {
       expect(JSON.parse(credClaimed.scopes)).toContain('lease:root');
 
       // 2. Start
-      const start = await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'sha256:evidence', 'native-sess-001', 'task-001');
+      const start = await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'sha256:0123456789abcdef', 'native-sess-001', 'task-001');
       expect(start.error).toBeUndefined();
 
       const runningJob = (sql.exec("SELECT * FROM jobs WHERE id = ?", job.id).toArray() as any[])[0];
@@ -522,7 +527,7 @@ describe('M4 Lease Semantics, Epoch CAS, and Safety Tests', () => {
       const incumbentJob = (sql.exec("SELECT * FROM jobs WHERE kind = 'root-run'").toArray() as any[])[0];
       const claim = await service.claimJob(incumbentJob.id, "host-live", true);
       expect(claim.error).toBeUndefined();
-      await service.startJob(incumbentJob.id, claim.job_token!, claim.lease_epoch!, 'ev', 'sess-live', 'task-live');
+      await service.startJob(incumbentJob.id, claim.job_token!, claim.lease_epoch!, 'sha256:0123456789abcdef', 'sess-live', 'task-live');
 
       // Register host-contender
       sql.exec(
@@ -638,6 +643,272 @@ describe('M4 Lease Semantics, Epoch CAS, and Safety Tests', () => {
       );
       const toIncapableHost = await service.takeoverRoot("job-valid-to", "host-nocaps", 0);
       expect(toIncapableHost.error).toBe('host_incapable');
+    });
+  });
+
+  it('commitRootAction bus_dispatch creates durable message in SQLite and enforces payload conflict receipt', async () => {
+    const id = (env as any).HUB.idFromName("test-bus-dispatch-action");
+    const stub = (env as any).HUB.get(id);
+
+    await (runInDurableObject as any)(stub, async (instance: any) => {
+      const sql = instance.ctx.storage.sql;
+      const nowMs = new Date('2026-10-12T19:00:00Z').getTime();
+
+      const service = new JobsService(sql, instance.ctx, {
+        now: () => new Date(nowMs),
+        getRandomValues: createRng(95),
+      });
+
+      sql.exec(
+        "INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "host-bus-act", "hba", "hba",
+        new Date(nowMs).toISOString(), new Date(nowMs).toISOString(),
+        JSON.stringify({ gate: { launch_allowed: true } }), 0,
+        JSON.stringify({ jobs: ["root-run"] })
+      );
+
+      service.tickRootSlot(new Date(nowMs).toISOString());
+      const job = (sql.exec("SELECT * FROM jobs WHERE kind = 'root-run'").toArray() as any[])[0];
+      const claim = await service.claimJob(job.id, "host-bus-act", true);
+      await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'sha256:0123456789abcdef', 'sess-bus', 'task-bus');
+
+      // Register active principal agent for recipient validation
+      sql.exec(
+        "INSERT INTO agents (tag, project, role, machine_id, engine, session_id, workspace, state, health_state, last_seen_at) VALUES ('principal', 'hub', 'principal', 'host-bus-act', 'codex', 'sess-p', '/p', 'active', 'healthy', ?)",
+        new Date(nowMs).toISOString()
+      );
+
+      // 1. Commit bus_dispatch action
+      const actionRes = await service.commitRootAction(
+        job.id, "host-bus-act", claim.lease_epoch!,
+        {
+          type: 'bus_dispatch',
+          payload: {
+            to_actor: 'role:principal',
+            kind: 'note',
+            body: 'Status report from root run epoch 1'
+          },
+          idempotency_key: 'bus-action-1'
+        },
+        'sess-bus',
+        claim.job_token!
+      );
+
+      expect(actionRes.success).toBe(true);
+      expect(actionRes.status).toBe('committed');
+      expect(actionRes.result.message_id).toBeDefined();
+
+      // Verify message is actually stored in SQLite messages table
+      const msg = (sql.exec("SELECT * FROM messages WHERE id = ?", actionRes.result.message_id).toArray() as any[])[0];
+      expect(msg).toBeDefined();
+      expect(msg.from_actor).toBe('role:root');
+      expect(msg.to_actor).toBe('role:principal');
+      expect(msg.body).toBe('Status report from root run epoch 1');
+      expect(msg.lease_epoch).toBe(claim.lease_epoch);
+
+      // Verify root_actions audit record
+      const actionRecord = (sql.exec("SELECT * FROM root_actions WHERE idempotency_key = 'bus-action-1'").toArray() as any[])[0];
+      expect(actionRecord).toBeDefined();
+      expect(actionRecord.epoch).toBe(claim.lease_epoch);
+
+      // 2. Replay with identical payload -> duplicate receipt (success=true, duplicate=true)
+      const duplicateRes = await service.commitRootAction(
+        job.id, "host-bus-act", claim.lease_epoch!,
+        {
+          type: 'bus_dispatch',
+          payload: {
+            to_actor: 'role:principal',
+            kind: 'note',
+            body: 'Status report from root run epoch 1'
+          },
+          idempotency_key: 'bus-action-1'
+        },
+        'sess-bus',
+        claim.job_token!
+      );
+      expect(duplicateRes.success).toBe(true);
+      expect(duplicateRes.duplicate).toBe(true);
+      expect(duplicateRes.result.message_id).toBe(actionRes.result.message_id);
+
+      // 3. Replay with DIFFERENT payload -> conflict receipt
+      const conflictRes = await service.commitRootAction(
+        job.id, "host-bus-act", claim.lease_epoch!,
+        {
+          type: 'bus_dispatch',
+          payload: {
+            to_actor: 'role:principal',
+            kind: 'note',
+            body: 'ALTERED payload text'
+          },
+          idempotency_key: 'bus-action-1'
+        },
+        'sess-bus',
+        claim.job_token!
+      );
+      expect(conflictRes.success).toBe(false);
+      expect(conflictRes.status).toBe('conflict');
+      expect(conflictRes.reason).toBe('payload_digest_conflict');
+
+      // 4. Revocation check: revoked job credential prevents any root action
+      sql.exec("UPDATE credentials SET revoked_at = ? WHERE subject = ?", new Date(nowMs).toISOString(), job.id);
+      const revokedRes = await service.commitRootAction(
+        job.id, "host-bus-act", claim.lease_epoch!,
+        {
+          type: 'bus_dispatch',
+          payload: {
+            to_actor: 'role:principal',
+            kind: 'note',
+            body: 'Message after revocation'
+          },
+          idempotency_key: 'bus-action-revoked'
+        },
+        'sess-bus',
+        claim.job_token!
+      );
+      expect(revokedRes.success).toBe(false);
+      expect(revokedRes.status).toBe('unauthorized');
+      expect(revokedRes.reason).toBe('revoked_token');
+    });
+  });
+
+  it('regression F1/F4: commitRootAction rejects raw stored hash bypass, dispatches via BusService with from_actor role:root, and qualifies NULL health_state', async () => {
+    const id = (env as any).HUB.idFromName("test-reg-f1-f4");
+    const stub = (env as any).HUB.get(id);
+
+    await (runInDurableObject as any)(stub, async (instance: any) => {
+      const sql = instance.ctx.storage.sql;
+      const nowMs = new Date('2026-10-14T02:10:00Z').getTime();
+
+      const bus = new BusService(sql);
+      const service = new JobsService(sql, instance.ctx, {
+        now: () => new Date(nowMs),
+        getRandomValues: createRng(101),
+        busService: bus,
+      });
+
+      sql.exec(
+        "INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES ('host-f14', 'hf14', 'hf14', ?, ?, ?, 0, ?)",
+        new Date(nowMs).toISOString(), new Date(nowMs).toISOString(),
+        JSON.stringify({ gate: { launch_allowed: true } }), JSON.stringify({ jobs: ["root-run"] })
+      );
+
+      service.tickRootSlot(new Date(nowMs).toISOString());
+      const job = (sql.exec("SELECT * FROM jobs WHERE kind = 'root-run'").toArray() as any[])[0];
+      const claim = await service.claimJob(job.id, "host-f14", true);
+      await service.startJob(job.id, claim.job_token!, claim.lease_epoch!, 'sha256:0123456789abcdef', 'sess-1', 'task-1');
+
+      // 1. Raw stored hash bypass rejected (including cancel-writer-1)
+      const storedHash = (sql.exec("SELECT claim_token_hash FROM jobs WHERE id = ?", job.id).toArray() as any[])[0].claim_token_hash;
+      const rawHashAction = await service.commitRootAction(
+        job.id, "host-f14", claim.lease_epoch!,
+        { type: 'bus_dispatch', idempotency_key: 'raw-hash-1', payload: { to_actor: 'role:principal', kind: 'note', body: 'bypass' } },
+        'sess-1',
+        storedHash
+      );
+      expect(rawHashAction.success).toBe(false);
+      expect(rawHashAction.status).toBe('unauthorized');
+
+      const rawHashCancelWriter = await service.commitRootAction(
+        job.id, "host-f14", claim.lease_epoch!,
+        { type: 'job_transition', idempotency_key: 'cancel-writer-1', payload: { target_job_id: 'any', new_status: 'cancelled' } },
+        'sess-1',
+        storedHash
+      );
+      expect(rawHashCancelWriter.success).toBe(false);
+      expect(rawHashCancelWriter.status).toBe('unauthorized');
+
+      // 2. Dispatch to non-existent role:principal fails
+      const dispatchNoPrincipal = await service.commitRootAction(
+        job.id, "host-f14", claim.lease_epoch!,
+        { type: 'bus_dispatch', idempotency_key: 'no-princ', payload: { to_actor: 'role:principal', kind: 'note', body: 'nobody home' } },
+        'sess-1',
+        claim.job_token!
+      );
+      expect(dispatchNoPrincipal.success).toBe(false);
+
+      // 3. Registered agent with state='working' and health_state=NULL is valid and visible in BusService.getBusMessages()
+      sql.exec(
+        "INSERT INTO agents (tag, project, role, machine_id, engine, session_id, workspace, state, health_state, last_seen_at) VALUES ('worker-null-hs', 'hub', 'worker', 'host-f14', 'codex', 'sw', '/w', 'working', NULL, ?)",
+        new Date(nowMs).toISOString()
+      );
+      const dispatchNullHs = await service.commitRootAction(
+        job.id, "host-f14", claim.lease_epoch!,
+        { type: 'bus_dispatch', idempotency_key: 'null-hs', payload: { to_actor: 'worker-null-hs', kind: 'note', body: 'hello worker' } },
+        'sess-1',
+        claim.job_token!
+      );
+      expect(dispatchNullHs.success).toBe(true);
+      const visible = bus.getBusMessages({ kind: 'agent', actor: 'worker-null-hs', scopes: ['bus:read'] }, 'worker-null-hs');
+      expect(visible.length).toBe(1);
+    });
+  });
+
+  it('regression F1-F4 contract: postHandoffNotes requires holder credential, tickRootSlot skip note uses unique skipJobId, and stale broken incumbent vs unknown incumbent', async () => {
+    const id = (env as any).HUB.idFromName("test-reg-f1-f2-f3-f4");
+    const stub = (env as any).HUB.get(id);
+
+    await (runInDurableObject as any)(stub, async (instance: any) => {
+      const sql = instance.ctx.storage.sql;
+      let nowMs = new Date('2026-10-14T03:00:00Z').getTime();
+
+      const service = new JobsService(sql, instance.ctx, {
+        now: () => new Date(nowMs),
+        getRandomValues: createRng(202),
+      });
+
+      sql.exec(
+        "INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES ('host-1', 'h1', 'h1', ?, ?, ?, 0, ?)",
+        new Date(nowMs).toISOString(), new Date(nowMs).toISOString(),
+        JSON.stringify({ gate: { launch_allowed: true } }), JSON.stringify({ jobs: ["root-run"] })
+      );
+
+      // Slot 1: claim and start
+      const slot1Iso = new Date(nowMs).toISOString();
+      service.tickRootSlot(slot1Iso);
+      const job1 = (sql.exec("SELECT * FROM jobs WHERE idempotency_key = ?", `root-run:${slot1Iso}`).toArray() as any[])[0];
+      const claim = await service.claimJob(job1.id, "host-1", true);
+      await service.startJob(job1.id, claim.job_token!, claim.lease_epoch!, 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'sess-1', 'task-1');
+
+      // Public getRootStatus fields alone (without holder token) cannot forge handoff notes
+      const publicStatus = service.getRootStatus();
+      const forgeAttempt = service.postHandoffNotes(
+        publicStatus.lease.holder_job_id,
+        publicStatus.lease.holder_host_id,
+        publicStatus.lease.epoch,
+        'FORGED BY PUBLIC STATUS READER WITHOUT CREDENTIAL',
+        ['evil.json'],
+        publicStatus.live_session?.session_id
+      );
+      expect(forgeAttempt.success).toBe(false);
+
+      // Advance 10m: next slot is skipped while Root is healthy
+      nowMs += 10 * 60000;
+      sql.exec("UPDATE machines SET last_checkin_at = ? WHERE id = 'host-1'", new Date(nowMs - 20000).toISOString());
+      const slot2Iso = new Date(nowMs).toISOString();
+      service.tickRootSlot(slot2Iso);
+      const job2 = (sql.exec("SELECT * FROM jobs WHERE idempotency_key = ?", `root-run:${slot2Iso}`).toArray() as any[])[0];
+      expect(job2.status).toBe('skip');
+
+      // Legitimate holder posts final handoff note with valid holder token -> does NOT collide with skip note!
+      const legitNote = service.postHandoffNotes(
+        job1.id,
+        'host-1',
+        claim.lease_epoch!,
+        'LEGITIMATE FINAL HANDOFF SUMMARY',
+        ['evidence/final.json'],
+        'sess-1',
+        claim.job_token!
+      );
+      expect(legitNote.success).toBe(true);
+      expect(legitNote.duplicate).toBe(false);
+
+      const allNotes = service.getHandoffNotes(10);
+      const skipNote = allNotes.find((n: any) => n.summary.includes('skipped slot'));
+      const holderNote = allNotes.find((n: any) => n.summary === 'LEGITIMATE FINAL HANDOFF SUMMARY');
+      expect(skipNote).toBeDefined();
+      expect(holderNote).toBeDefined();
+      expect(skipNote.job_id).toBe(job2.id);
+      expect(holderNote.job_id).toBe(job1.id);
     });
   });
 });

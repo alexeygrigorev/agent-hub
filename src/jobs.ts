@@ -1,4 +1,61 @@
-import { sha256 } from './auth/crypto';
+import { sha256, base64url } from './auth/crypto';
+import { getSession } from './auth/session';
+
+function sha256Sync(input: string): string {
+  const K = new Uint32Array([
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  ]);
+  const bytes = new TextEncoder().encode(input);
+  const bitLen = bytes.length * 8;
+  const padLen = ((bytes.length + 9 + 63) & ~63);
+  const padded = new Uint8Array(padLen);
+  padded.set(bytes);
+  padded[bytes.length] = 0x80;
+  const view = new DataView(padded.buffer);
+  view.setUint32(padLen - 8, Math.floor(bitLen / 0x100000000), false);
+  view.setUint32(padLen - 4, bitLen >>> 0, false);
+
+  let h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a;
+  let h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
+  const w = new Uint32Array(64);
+  const rotr = (x: number, n: number) => (x >>> n) | (x << (32 - n));
+
+  for (let offset = 0; offset < padLen; offset += 64) {
+    for (let i = 0; i < 16; i++) {
+      w[i] = view.getUint32(offset + i * 4, false);
+    }
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const temp1 = (h + S1 + ch + K[i] + w[i]) >>> 0;
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const temp2 = (S0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + temp1) >>> 0;
+      d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+    }
+    h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0;
+    h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + h) >>> 0;
+  }
+
+  const out = new Uint8Array(32);
+  const outView = new DataView(out.buffer);
+  [h0, h1, h2, h3, h4, h5, h6, h7].forEach((v, idx) => outView.setUint32(idx * 4, v, false));
+  return base64url(out);
+}
 
 export const JOBS_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS jobs (
@@ -145,17 +202,22 @@ export function generateUlid(
 }
 
 export function parseExpiryMs(expiresAt: string | number | null | undefined): number | null {
-  if (expiresAt === null || expiresAt === undefined || expiresAt === '') return null;
+  if (expiresAt === null || expiresAt === undefined) return null;
   if (typeof expiresAt === 'number') {
+    if (!Number.isFinite(expiresAt) || expiresAt <= 0) return null;
     return expiresAt < 1e11 ? expiresAt * 1000 : expiresAt;
   }
   const str = String(expiresAt).trim();
+  if (str.length === 0) return null;
+  if (str === 'Infinity' || str === '-Infinity' || str === 'NaN') return null;
   if (!str.includes('-') && !str.includes('T')) {
     const n = Number(str);
-    if (!isNaN(n)) return n < 1e11 ? n * 1000 : n;
+    if (Number.isFinite(n) && n > 0) return n < 1e11 ? n * 1000 : n;
+    return null;
   }
   const parsed = Date.parse(str);
-  return isNaN(parsed) ? null : parsed;
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
 }
 
 export function isLeaseExpired(expiresAt: string | number | null | undefined, nowMs: number): boolean {
@@ -179,6 +241,7 @@ export interface JobsDependencies {
   busService?: any;
   healthService?: any;
   enableAlarms?: boolean;
+  env?: any;
 }
 
 export interface Machine {
@@ -197,26 +260,46 @@ export class JobsService {
   private sql: SqlStorage;
   private ctx: DurableObjectState;
   private deps?: JobsDependencies;
+  private rawNow: () => Date;
   private now: () => Date;
   private getRandomValues: (array: Uint32Array) => Uint32Array;
   private rootHostsPolicy?: string[];
   private busService?: any;
   private healthService?: any;
+  private env?: any;
+  private clockSnapshot: Date | null = null;
 
   constructor(sql: SqlStorage, ctx: DurableObjectState, deps?: JobsDependencies) {
     this.sql = sql;
     this.ctx = ctx;
     this.deps = deps;
-    this.now = deps?.now ? deps.now : (() => new Date());
+    this.rawNow = deps?.now ? deps.now : (() => new Date());
+    this.now = () => {
+      if (this.clockSnapshot) {
+        return this.clockSnapshot;
+      }
+      return this.rawNow();
+    };
     this.getRandomValues = deps?.getRandomValues || ((arr) => crypto.getRandomValues(arr));
     this.rootHostsPolicy = deps?.rootHosts;
     this.busService = deps?.busService;
     this.healthService = deps?.healthService;
+    this.env = deps?.env;
 
     for (const statement of JOBS_SCHEMA_SQL.split(';')) {
       const trimmed = statement.trim();
       if (trimmed) this.sql.exec(trimmed);
     }
+
+    const agentCols = ['engine TEXT', 'session_id TEXT', 'workspace TEXT', 'state TEXT', 'health_state TEXT', 'detail TEXT', 'lasthealth TEXT', 'health_at TEXT', 'last_seen_at TEXT'];
+    for (const col of agentCols) {
+      try {
+        this.sql.exec(`ALTER TABLE agents ADD COLUMN ${col}`);
+      } catch {}
+    }
+    try {
+      this.sql.exec('ALTER TABLE machines ADD COLUMN state TEXT');
+    } catch {}
 
     this.sql.exec("INSERT OR IGNORE INTO leases (name, epoch) VALUES ('root', 0)");
   }
@@ -230,7 +313,31 @@ export class JobsService {
   }
 
   public setClock(now: () => Date) {
-    this.now = now;
+    this.rawNow = now;
+  }
+
+  private withClockSnapshot<T>(fn: (now: Date) => T): T {
+    if (this.clockSnapshot) {
+      return fn(this.clockSnapshot);
+    }
+    this.clockSnapshot = this.rawNow();
+    try {
+      return fn(this.clockSnapshot);
+    } finally {
+      this.clockSnapshot = null;
+    }
+  }
+
+  private async withClockSnapshotAsync<T>(fn: (now: Date) => Promise<T>): Promise<T> {
+    if (this.clockSnapshot) {
+      return await fn(this.clockSnapshot);
+    }
+    this.clockSnapshot = this.rawNow();
+    try {
+      return await fn(this.clockSnapshot);
+    } finally {
+      this.clockSnapshot = null;
+    }
   }
 
   private scheduleAlarm() {
@@ -281,7 +388,7 @@ export class JobsService {
   private generateToken(): string {
     const array = new Uint32Array(8);
     this.getRandomValues(array);
-    return Array.from(array).map(n => n.toString(16).padStart(8, '0')).join('');
+    return 'hubt_' + Array.from(array).map(n => n.toString(16).padStart(8, '0')).join('');
   }
 
   getAlarmTime(): number | null {
@@ -321,56 +428,63 @@ export class JobsService {
   }
 
   processAlarms(): number | null {
-    const now = this.now();
-    const nowMs = now.getTime();
-    const nowIso = now.toISOString();
+    return this.withClockSnapshot((now) => {
+      const nowMs = now.getTime();
+      const nowIso = now.toISOString();
 
-    this.ctx.storage.transactionSync(() => {
-      // 1. Expire offers (root-run)
-      const offeredJobs = this.sql.exec("SELECT * FROM jobs WHERE kind = 'root-run' AND status = 'offered' AND offer_expires_at IS NOT NULL").toArray();
-      for (const job of offeredJobs) {
-        const exp = parseExpiryMs(job.offer_expires_at as string);
-        if (exp !== null && exp <= nowMs) {
-          this.addHealthEvent('job', job.id as string, 'failed', 'offer expired', nowIso);
-          this.tryOfferNext(job, now);
+      this.ctx.storage.transactionSync(() => {
+        // 1. Expire offers (root-run)
+        const offeredJobs = this.sql.exec("SELECT * FROM jobs WHERE kind = 'root-run' AND status = 'offered' AND offer_expires_at IS NOT NULL").toArray();
+        for (const job of offeredJobs) {
+          const exp = parseExpiryMs(job.offer_expires_at as string);
+          if (exp !== null && exp <= nowMs) {
+            this.addHealthEvent('job', job.id as string, 'failed', 'offer expired', nowIso);
+            this.tryOfferNext(job, now);
+          }
         }
-      }
 
-      // 2. Expire leases (hard deadline or missed renew)
-      const activeLeases = this.sql.exec("SELECT * FROM leases WHERE holder_job_id IS NOT NULL").toArray();
-      for (const lease of activeLeases) {
-        if (isLeaseExpired(lease.expires_at as any, nowMs)) {
-          const jobId = lease.holder_job_id as string;
-          this.sql.exec("UPDATE jobs SET status = 'expired', finished_at = ?, outcome_summary = ? WHERE id = ?", nowIso, 'lease expired', jobId);
-          this.addHealthEvent('job', jobId, 'failed', 'lease expired', nowIso);
-          this.sql.exec("UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL", nowIso, jobId);
-          this.sql.exec(
-            "UPDATE leases SET holder_job_id = NULL, holder_host_id = NULL, holder_machine_id = NULL, expires_at = NULL, released_at = ?, release_reason = ? WHERE name = ?",
-            nowIso, 'lease expired', lease.name as string
-          );
+        // 2. Expire leases (hard deadline or missed renew)
+        const activeLeases = this.sql.exec("SELECT * FROM leases WHERE holder_job_id IS NOT NULL").toArray();
+        for (const lease of activeLeases) {
+          if (isLeaseExpired(lease.expires_at as any, nowMs)) {
+            if (lease.name === 'root') {
+              const inc = this.evaluateRootIncumbent();
+              if (inc.within_grace && inc.heartbeat_fresh && inc.is_healthy_alive) {
+                continue;
+              }
+            }
+            const jobId = lease.holder_job_id as string;
+            this.sql.exec("UPDATE jobs SET status = 'expired', finished_at = ?, outcome_summary = ? WHERE id = ?", nowIso, 'lease expired', jobId);
+            this.addHealthEvent('job', jobId, 'failed', 'lease expired', nowIso);
+            this.sql.exec("UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL", nowIso, jobId);
+            this.sql.exec(
+              "UPDATE leases SET holder_job_id = NULL, holder_host_id = NULL, holder_machine_id = NULL, expires_at = NULL, released_at = ?, release_reason = ? WHERE name = ?",
+              nowIso, 'lease expired', lease.name as string
+            );
+          }
         }
-      }
 
-      // 3. Claims awaiting first action (5 mins)
-      const noStartLeases = this.sql.exec(
-        "SELECT leases.* FROM leases JOIN jobs ON leases.holder_job_id = jobs.id WHERE jobs.started_at IS NULL AND jobs.status = 'claimed'"
-      ).toArray();
-      for (const lease of noStartLeases) {
-        const acq = parseExpiryMs(lease.acquired_at as string);
-        if (acq !== null && (acq + 5 * 60000) <= nowMs) {
-          const jobId = lease.holder_job_id as string;
-          this.sql.exec("UPDATE jobs SET status = 'failed', finished_at = ?, outcome_summary = ? WHERE id = ?", nowIso, 'no first action', jobId);
-          this.addHealthEvent('job', jobId, 'failed', 'no first action', nowIso);
-          this.sql.exec("UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL", nowIso, jobId);
-          this.sql.exec(
-            "UPDATE leases SET holder_job_id = NULL, holder_host_id = NULL, holder_machine_id = NULL, expires_at = NULL, released_at = ?, release_reason = ? WHERE name = ?",
-            nowIso, 'no first action', lease.name as string
-          );
+        // 3. Claims awaiting first action (5 mins)
+        const noStartLeases = this.sql.exec(
+          "SELECT leases.* FROM leases JOIN jobs ON leases.holder_job_id = jobs.id WHERE jobs.started_at IS NULL AND jobs.status = 'claimed'"
+        ).toArray();
+        for (const lease of noStartLeases) {
+          const acq = parseExpiryMs(lease.acquired_at as string);
+          if (acq !== null && (acq + 5 * 60000) <= nowMs) {
+            const jobId = lease.holder_job_id as string;
+            this.sql.exec("UPDATE jobs SET status = 'failed', finished_at = ?, outcome_summary = ? WHERE id = ?", nowIso, 'no first action', jobId);
+            this.addHealthEvent('job', jobId, 'failed', 'no first action', nowIso);
+            this.sql.exec("UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL", nowIso, jobId);
+            this.sql.exec(
+              "UPDATE leases SET holder_job_id = NULL, holder_host_id = NULL, holder_machine_id = NULL, expires_at = NULL, released_at = ?, release_reason = ? WHERE name = ?",
+              nowIso, 'no first action', lease.name as string
+            );
+          }
         }
-      }
+      });
+
+      return this.getAlarmTime();
     });
-
-    return this.getAlarmTime();
   }
 
   private tryOfferNext(job: any, now: Date) {
@@ -470,49 +584,145 @@ export class JobsService {
   }
 
   tickRootSlot(slotStartUtc: string) {
-    const now = this.now();
-    const nowIso = now.toISOString();
+    this.withClockSnapshot((now) => {
+      const nowIso = now.toISOString();
+      const nowMs = now.getTime();
+      let pendingBusError: { toActor: string; idempotencyKey: string; err: any } | null = null;
 
-    this.ctx.storage.transactionSync(() => {
-      this.processAlarms();
+      try {
+        this.ctx.storage.transactionSync(() => {
+        this.processAlarms();
 
-      const idempotencyKey = `root-run:${slotStartUtc}`;
-      const existing = this.sql.exec("SELECT id FROM jobs WHERE idempotency_key = ?", idempotencyKey).toArray();
-      if (existing.length > 0) return;
+        const idempotencyKey = `root-run:${slotStartUtc}`;
+        const existing = this.sql.exec("SELECT id FROM jobs WHERE idempotency_key = ?", idempotencyKey).toArray();
+        if (existing.length > 0) return;
 
-      const rootLease = this.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
-      if (rootLease && rootLease.holder_job_id) {
-        if (!isLeaseExpired(rootLease.expires_at, now.getTime())) {
-          const hostId = rootLease.holder_host_id || rootLease.holder_machine_id;
-          const host = this.sql.exec("SELECT last_checkin_at FROM machines WHERE id = ?", hostId).toArray()[0] as any;
-          if (host && host.last_checkin_at) {
-             const age = now.getTime() - new Date(host.last_checkin_at).getTime();
-             if (age <= 180000 && age >= 0) {
-                this.sql.exec("INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                  this.generateId(), 'root-run', idempotencyKey, '{}', 'skip', slotStartUtc, new Date(new Date(slotStartUtc).getTime() + 25*60000).toISOString(), 'system'
-                );
-                this.addHealthEvent('job', idempotencyKey, 'skip', 'root still running', nowIso);
-                this.logAuditEvent('system', 'skip', 'leases/root', idempotencyKey, {
-                  reason: 'root still running',
-                  holder_job_id: rootLease.holder_job_id,
-                  holder_host_id: hostId,
-                  epoch: rootLease.epoch,
-                  slot: slotStartUtc
-                }, nowIso);
-                return;
-             }
-          }
+        const slotStartMs = new Date(slotStartUtc).getTime();
+
+        // Late-slot refusal: refuse if slot start is >= 25 minutes in the past
+        if (Number.isFinite(slotStartMs) && nowMs >= slotStartMs + 25 * 60000) {
+          const jobId = this.generateId();
+          const deadlineAt = new Date(slotStartMs + 25 * 60000).toISOString();
+          this.sql.exec(
+            "INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, outcome_summary) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            jobId, 'root-run', idempotencyKey, '{}', 'failed', slotStartUtc, deadlineAt, 'system', 'refused: late slot'
+          );
+          this.addHealthEvent('job', idempotencyKey, 'failed', 'refused: late slot', nowIso);
+          this.logAuditEvent('system', 'refuse', 'jobs/root-run', idempotencyKey, {
+            reason: 'late_slot_refusal',
+            slot: slotStartUtc
+          }, nowIso);
+          return;
         }
+
+        // Active root incumbent check per spec §8.1
+        const inc = this.evaluateRootIncumbent();
+        if (inc.is_healthy_alive) {
+          const holderJobId = inc.lease?.holder_job_id || null;
+          const rootEpoch = inc.lease?.epoch ?? 0;
+          const hostId = inc.host?.id || inc.registered_root?.machine_id || inc.lease?.holder_host_id || 'unknown';
+          const checkinAgeS = inc.host?.checkin_age_s ?? 0;
+          const skipSummary = `skip: previous root healthy (heartbeat ${checkinAgeS}s old); skipped slot ${slotStartUtc}`;
+
+          const skipJobId = this.generateId();
+          this.sql.exec(
+            "INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, outcome_summary) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            skipJobId, 'root-run', idempotencyKey, '{}', 'skip', slotStartUtc, new Date(slotStartMs + 25 * 60000).toISOString(), 'system', skipSummary
+          );
+          this.addHealthEvent('job', idempotencyKey, 'skip', 'root still running', nowIso);
+          this.logAuditEvent('system', 'skip', 'leases/root', idempotencyKey, {
+            reason: 'root still running',
+            holder_job_id: holderJobId,
+            holder_host_id: hostId,
+            epoch: rootEpoch,
+            slot: slotStartUtc
+          }, nowIso);
+
+          // Record skip handoff note referencing skipped slot start UTC
+          const targetNoteJobId = skipJobId;
+          const liveJob = holderJobId ? this.sql.exec("SELECT native_session FROM jobs WHERE id = ?", holderJobId).toArray()[0] as any : null;
+          this.sql.exec(
+            "INSERT INTO handoff_notes (lease_name, job_id, host_id, session_id, epoch, summary, evidence_refs, created_at) VALUES ('root', ?, ?, ?, ?, ?, '[]', ?)",
+            targetNoteJobId, hostId || 'host-1', liveJob?.native_session || null, rootEpoch, skipSummary, nowIso
+          );
+
+          // Send skip note via bus without using denied 'role:root'
+          if (this.busService) {
+            const isRecipientValid = (r: string) => {
+              if (r === 'role:root' || r.startsWith('role:root')) return false;
+              if (typeof this.busService?.validateRecipient === 'function') {
+                return this.busService.validateRecipient(r, nowMs);
+              }
+              return true;
+            };
+
+            let toActor: string | null = null;
+            if (inc.registered_root) {
+              if (isRecipientValid(inc.registered_root.tag)) {
+                toActor = inc.registered_root.tag;
+              } else if (inc.registered_root.project && isRecipientValid(`${inc.registered_root.project}:${inc.registered_root.tag}`)) {
+                toActor = `${inc.registered_root.project}:${inc.registered_root.tag}`;
+              }
+            }
+            if (!toActor && inc.lease?.holder_actor && inc.lease.holder_actor !== 'role:root' && isRecipientValid(inc.lease.holder_actor)) {
+              toActor = inc.lease.holder_actor;
+            }
+            if (!toActor && hostId && hostId !== 'unknown' && isRecipientValid(`machine:${hostId}`)) {
+              toActor = `machine:${hostId}`;
+            }
+            if (!toActor) {
+              const rootAgent = this.sql.exec("SELECT tag, project FROM agents WHERE role = 'root' AND (state IS NULL OR state != 'retired') LIMIT 1").toArray()[0] as any;
+              if (rootAgent) {
+                if (isRecipientValid(rootAgent.tag)) {
+                  toActor = rootAgent.tag;
+                } else if (rootAgent.project && isRecipientValid(`${rootAgent.project}:${rootAgent.tag}`)) {
+                  toActor = `${rootAgent.project}:${rootAgent.tag}`;
+                }
+              }
+            }
+            if (toActor) {
+              try {
+                this.busService.send({
+                  kind: 'job',
+                  actor: 'system',
+                  jobId: holderJobId || skipJobId || undefined,
+                  scopes: ['bus:send']
+                }, {
+                  senderActor: 'system',
+                  toActor: toActor,
+                  kind: 'note',
+                  body: `- ${nowIso} slot ${slotStartUtc} started and skipped: you were healthy (hb ${checkinAgeS}s old).`,
+                  idempotencyKey: `skip-note:${slotStartUtc}:${holderJobId || toActor}`,
+                  leaseEpoch: rootEpoch,
+                  now: nowMs
+                });
+              } catch (err: any) {
+                pendingBusError = { toActor, idempotencyKey, err };
+                throw err;
+              }
+            }
+          }
+          return;
+        }
+
+        const jobId = this.generateId();
+        const deadlineAt = new Date(slotStartMs + 25 * 60000).toISOString();
+        this.sql.exec("INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          jobId, 'root-run', idempotencyKey, '{}', 'pending', nowIso, deadlineAt, 'system'
+        );
+
+        const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
+        this.tryOfferNext(job, now);
+      });
+      } catch (err: any) {
+        if (pendingBusError) {
+          this.logAuditEvent('system', 'bus_error', 'leases/root', (pendingBusError as any).idempotencyKey, {
+            error: (pendingBusError as any).err?.message || String((pendingBusError as any).err),
+            to_actor: (pendingBusError as any).toActor
+          }, nowIso);
+        }
+        throw err;
       }
-
-      const jobId = this.generateId();
-      const deadlineAt = new Date(new Date(slotStartUtc).getTime() + 25 * 60000).toISOString();
-      this.sql.exec("INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        jobId, 'root-run', idempotencyKey, '{}', 'pending', nowIso, deadlineAt, 'system'
-      );
-
-      const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
-      this.tryOfferNext(job, now);
     });
   }
 
@@ -549,158 +759,184 @@ export class JobsService {
   ): Promise<{ error?: string, reason?: string, job_token?: string, lease_epoch?: number, deadline_at?: string }> {
     if (!hostFreshGate) return { error: 'gate_failed', reason: 'caller_gate_false' };
 
-    // Real clock trusted capture; caller simNow is inert per contract
-    const now = this.now();
-    const nowIso = now.toISOString();
-    const nowMs = now.getTime();
+    return this.withClockSnapshotAsync(async (now) => {
+      const nowIso = now.toISOString();
+      const nowMs = now.getTime();
 
-    const token = this.generateToken();
-    const tokenHash = await sha256(token);
+      const token = this.generateToken();
+      const tokenHash = await sha256(token);
 
-    let result: any = null;
+      let result: any = null;
 
-    this.ctx.storage.transactionSync(() => {
-      const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
-      if (!job || job.status !== 'offered' || (job.offer_host_id !== hostId && job.offer_machine_id !== hostId)) {
-        result = { error: 'conflict' }; return;
-      }
-      const exp = parseExpiryMs(job.offer_expires_at);
-      if (exp === null || !Number.isFinite(exp) || exp <= nowMs) {
-        result = { error: 'conflict' }; return;
-      }
-
-      const deadlineMs = parseExpiryMs(job.deadline_at) ?? new Date(job.deadline_at).getTime();
-      if (!Number.isFinite(deadlineMs) || deadlineMs <= nowMs) {
-        result = { error: 'conflict' }; return;
-      }
-
-      // Server revalidate current machine checkin/drain/capability/heartbeat gate in same SQL transaction
-      const host = this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any;
-      if (!host) {
-        result = { error: 'gate_failed', reason: 'host_not_found' }; return;
-      }
-      if (host.drained === 1 || host.drained === true || host.state === 'drained') {
-        result = { error: 'gate_failed', reason: 'host_drained' }; return;
-      }
-      if (job.kind === 'root-run' && !this.checkHostRootRunCapability(host)) {
-        result = { error: 'gate_failed', reason: 'host_incapable' }; return;
-      }
-
-      if (!host.last_checkin_at) {
-        result = { error: 'gate_failed', reason: 'missing_checkin' }; return;
-      }
-      const checkinTime = new Date(host.last_checkin_at).getTime();
-      if (!Number.isFinite(checkinTime)) {
-        result = { error: 'gate_failed', reason: 'nonfinite_checkin' }; return;
-      }
-      const checkinAge = nowMs - checkinTime;
-      if (checkinAge < 0 || checkinAge > 180000) {
-        result = { error: 'gate_failed', reason: checkinAge < 0 ? 'future_checkin' : 'stale_checkin' }; return;
-      }
-
-      if (!host.last_heartbeat) {
-        result = { error: 'gate_failed', reason: 'missing_heartbeat' }; return;
-      }
-      let hb: any;
-      try {
-        hb = typeof host.last_heartbeat === 'string' ? JSON.parse(host.last_heartbeat) : host.last_heartbeat;
-      } catch {
-        result = { error: 'gate_failed', reason: 'invalid_heartbeat_json' }; return;
-      }
-      if (!hb || !hb.gate || hb.gate.launch_allowed !== true) {
-        result = { error: 'gate_failed', reason: 'gate_launch_not_allowed' }; return;
-      }
-
-      const leaseName = this.getLeaseNameForJob(job);
-      this.sql.exec("INSERT OR IGNORE INTO leases (name, epoch) VALUES (?, 0)", leaseName);
-
-      const currentLease = this.sql.exec("SELECT * FROM leases WHERE name = ?", leaseName).toArray()[0] as any;
-      if (currentLease && currentLease.holder_job_id) {
-        if (!isLeaseExpired(currentLease.expires_at, nowMs)) {
-          result = { error: 'conflict' };
-          return;
+      this.ctx.storage.transactionSync(() => {
+        const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
+        if (!job || job.status !== 'offered' || (job.offer_host_id !== hostId && job.offer_machine_id !== hostId)) {
+          result = { error: 'conflict' }; return;
         }
+        const exp = parseExpiryMs(job.offer_expires_at);
+        if (exp === null || !Number.isFinite(exp) || exp <= nowMs) {
+          result = { error: 'conflict' }; return;
+        }
+
+        const deadlineMs = parseExpiryMs(job.deadline_at) ?? new Date(job.deadline_at).getTime();
+        if (!Number.isFinite(deadlineMs) || deadlineMs <= nowMs) {
+          result = { error: 'conflict' }; return;
+        }
+
+        // Server revalidate current machine checkin/drain/capability/heartbeat gate in same SQL transaction
+        const host = this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any;
+        if (!host) {
+          result = { error: 'gate_failed', reason: 'host_not_found' }; return;
+        }
+        if (host.drained === 1 || host.drained === true || host.state === 'drained') {
+          result = { error: 'gate_failed', reason: 'host_drained' }; return;
+        }
+        if (job.kind === 'root-run' && !this.checkHostRootRunCapability(host)) {
+          result = { error: 'gate_failed', reason: 'host_incapable' }; return;
+        }
+
+        if (!host.last_checkin_at) {
+          result = { error: 'gate_failed', reason: 'missing_checkin' }; return;
+        }
+        const checkinTime = new Date(host.last_checkin_at).getTime();
+        if (!Number.isFinite(checkinTime)) {
+          result = { error: 'gate_failed', reason: 'nonfinite_checkin' }; return;
+        }
+        const checkinAge = nowMs - checkinTime;
+        if (checkinAge < 0 || checkinAge > 180000) {
+          result = { error: 'gate_failed', reason: checkinAge < 0 ? 'future_checkin' : 'stale_checkin' }; return;
+        }
+
+        if (!host.last_heartbeat) {
+          result = { error: 'gate_failed', reason: 'missing_heartbeat' }; return;
+        }
+        let hb: any;
+        try {
+          hb = typeof host.last_heartbeat === 'string' ? JSON.parse(host.last_heartbeat) : host.last_heartbeat;
+        } catch {
+          result = { error: 'gate_failed', reason: 'invalid_heartbeat_json' }; return;
+        }
+        if (!hb || !hb.gate || hb.gate.launch_allowed !== true) {
+          result = { error: 'gate_failed', reason: 'gate_launch_not_allowed' }; return;
+        }
+
+        const leaseName = this.getLeaseNameForJob(job);
+        this.sql.exec("INSERT OR IGNORE INTO leases (name, epoch) VALUES (?, 0)", leaseName);
+
+        const currentLease = this.sql.exec("SELECT * FROM leases WHERE name = ?", leaseName).toArray()[0] as any;
+        if (job.kind === 'root-run' || leaseName === 'root') {
+          const incumbent = this.evaluateRootIncumbent();
+          if (!incumbent.can_takeover) {
+            result = { error: 'conflict', reason: incumbent.takeover_denial_reason || 'root incumbent not eligible for takeover' };
+            return;
+          }
+        } else {
+          if (currentLease && currentLease.holder_job_id) {
+            if (!isLeaseExpired(currentLease.expires_at, nowMs)) {
+              result = { error: 'conflict' };
+              return;
+            }
+          }
+        }
+
+        const leaseExpiresMs = Math.min(nowMs + 20 * 60000, deadlineMs);
+        const currentEpoch = currentLease ? (currentLease.epoch ?? 0) : 0;
+        const jobActor = job.kind === 'root-run' ? 'role:root' : (job.actor || 'role:worker');
+
+        const acquire = this.sql.exec(
+          "UPDATE leases SET holder_job_id = ?, holder_host_id = ?, holder_machine_id = ?, holder_actor = ?, epoch = epoch + 1, acquired_at = ?, renewed_at = ?, expires_at = ? WHERE name = ? AND epoch = ?",
+          jobId, hostId, hostId, jobActor, nowIso, nowIso, new Date(leaseExpiresMs).toISOString(), leaseName, currentEpoch
+        );
+
+        if (acquire.rowsWritten !== 1) {
+          result = { error: 'conflict' }; return;
+        }
+
+        const updatedLease = this.sql.exec("SELECT epoch FROM leases WHERE name = ?", leaseName).toArray()[0] as any;
+        const newEpoch = updatedLease.epoch;
+
+        // Fence old incumbent job if one was held
+        const oldJobId = currentLease ? currentLease.holder_job_id : null;
+        if (oldJobId && oldJobId !== jobId) {
+          this.sql.exec(
+            "UPDATE jobs SET status = 'fenced', finished_at = ?, outcome_summary = ? WHERE id = ? AND status IN ('claimed', 'running', 'offered')",
+            nowIso, `fenced: superseded by takeover epoch ${newEpoch}`, oldJobId
+          );
+          this.sql.exec(
+            "UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL",
+            nowIso, oldJobId
+          );
+          this.addHealthEvent('job', oldJobId, 'fenced', `superseded by takeover epoch ${newEpoch}`, nowIso);
+        }
+
+        this.sql.exec(
+          "UPDATE jobs SET status = 'claimed', claim_token_hash = ?, holder_host_id = ?, holder_machine_id = ?, lease_epoch = ? WHERE id = ?",
+          tokenHash, hostId, hostId, newEpoch, jobId
+        );
+
+        // Mint scoped job credential in credentials table
+        const credId = this.generateId();
+        const jobScopes = job.kind === 'root-run'
+          ? ['lease:root', 'jobs:create', 'bus:send', 'bus:read', 'health:report']
+          : ['bus:send', 'bus:read', 'health:report'];
+
+        this.sql.exec(
+          "INSERT OR REPLACE INTO credentials (id, kind, token_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?, 'job', ?, ?, ?, ?, ?, ?, 'system', ?, ?)",
+          credId, tokenHash, credId, jobId, hostId, jobActor, JSON.stringify(jobScopes), nowIso, new Date(leaseExpiresMs).toISOString()
+        );
+
+        result = { job_token: token, lease_epoch: newEpoch, deadline_at: job.deadline_at };
+      });
+
+      if (!result?.error) {
+        this.scheduleAlarm();
       }
 
-      const leaseExpiresMs = Math.min(nowMs + 20 * 60000, deadlineMs);
-      const currentEpoch = currentLease ? (currentLease.epoch ?? 0) : 0;
-      const jobActor = job.kind === 'root-run' ? 'role:root' : (job.actor || 'role:worker');
-
-      const acquire = this.sql.exec(
-        "UPDATE leases SET holder_job_id = ?, holder_host_id = ?, holder_machine_id = ?, holder_actor = ?, epoch = epoch + 1, acquired_at = ?, renewed_at = ?, expires_at = ? WHERE name = ? AND epoch = ?",
-        jobId, hostId, hostId, jobActor, nowIso, nowIso, new Date(leaseExpiresMs).toISOString(), leaseName, currentEpoch
-      );
-
-      if (acquire.rowsWritten !== 1) {
-        result = { error: 'conflict' }; return;
-      }
-
-      const updatedLease = this.sql.exec("SELECT epoch FROM leases WHERE name = ?", leaseName).toArray()[0] as any;
-      const newEpoch = updatedLease.epoch;
-
-      this.sql.exec(
-        "UPDATE jobs SET status = 'claimed', claim_token_hash = ?, holder_host_id = ?, holder_machine_id = ?, lease_epoch = ? WHERE id = ?",
-        tokenHash, hostId, hostId, newEpoch, jobId
-      );
-
-      // Mint scoped job credential in credentials table
-      const credId = this.generateId();
-      const jobScopes = job.kind === 'root-run'
-        ? ['lease:root', 'jobs:create', 'bus:send', 'bus:read', 'health:report']
-        : ['bus:send', 'bus:read', 'health:report'];
-
-      this.sql.exec(
-        "INSERT OR REPLACE INTO credentials (id, kind, token_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?, 'job', ?, ?, ?, ?, ?, ?, 'system', ?, ?)",
-        credId, tokenHash, credId, jobId, hostId, jobActor, JSON.stringify(jobScopes), nowIso, new Date(leaseExpiresMs).toISOString()
-      );
-
-      result = { job_token: token, lease_epoch: newEpoch, deadline_at: job.deadline_at };
+      return result;
     });
-
-    if (!result?.error) {
-      this.scheduleAlarm();
-    }
-
-    return result;
   }
 
   async declineJob(jobId: string, hostId: string, reason: string): Promise<{ error?: string }> {
-    let result: any = {};
-    const now = this.now();
-    this.ctx.storage.transactionSync(() => {
-      const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
-      if (!job || job.status !== 'offered' || (job.offer_host_id !== hostId && job.offer_machine_id !== hostId)) {
-        result = { error: 'conflict' }; return;
-      }
-      this.addHealthEvent('job', jobId, 'declined', reason.substring(0, 4096), now.toISOString());
-      this.tryOfferNext(job, now);
+    return this.withClockSnapshot((now) => {
+      let result: any = {};
+      this.ctx.storage.transactionSync(() => {
+        const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
+        if (!job || job.status !== 'offered' || (job.offer_host_id !== hostId && job.offer_machine_id !== hostId)) {
+          result = { error: 'conflict' }; return;
+        }
+        this.addHealthEvent('job', jobId, 'declined', reason.substring(0, 4096), now.toISOString());
+        this.tryOfferNext(job, now);
+      });
+      this.scheduleAlarm();
+      return result;
     });
-    this.scheduleAlarm();
-    return result;
   }
 
   async validateEpoch(jobId: string, jobTokenPlain: string, epoch: number): Promise<boolean> {
     if (!jobTokenPlain || typeof jobTokenPlain !== 'string') return false;
-    const tokenHash = await sha256(jobTokenPlain);
-    let valid = false;
-    this.ctx.storage.transactionSync(() => {
-      const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
-      if (!job || job.claim_token_hash !== tokenHash || job.lease_epoch !== epoch) return;
+    return this.withClockSnapshotAsync(async (now) => {
+      const tokenHash = await sha256(jobTokenPlain);
+      let valid = false;
+      this.ctx.storage.transactionSync(() => {
+        const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
+        if (!job || job.claim_token_hash !== tokenHash || job.lease_epoch !== epoch) return;
 
-      const cred = this.sql.exec(
-        "SELECT * FROM credentials WHERE token_hash = ? AND subject = ?",
-        tokenHash, jobId
-      ).toArray()[0] as any;
-      if (!cred || (cred.revoked_at && cred.revoked_at.trim().length > 0)) return;
+        const cred = this.sql.exec(
+          "SELECT * FROM credentials WHERE token_hash = ? AND subject = ?",
+          tokenHash, jobId
+        ).toArray()[0] as any;
+        if (!cred || (cred.revoked_at && cred.revoked_at.trim().length > 0)) return;
+        const exp = parseExpiryMs(cred.expires_at);
+        if (exp === null || exp <= now.getTime()) return;
 
-      const leaseName = this.getLeaseNameForJob(job);
-      const lease = this.sql.exec("SELECT * FROM leases WHERE name = ?", leaseName).toArray()[0] as any;
-      if (!lease || lease.epoch !== epoch || lease.holder_job_id !== jobId) return;
+        const leaseName = this.getLeaseNameForJob(job);
+        const lease = this.sql.exec("SELECT * FROM leases WHERE name = ?", leaseName).toArray()[0] as any;
+        if (!lease || lease.epoch !== epoch || lease.holder_job_id !== jobId) return;
 
-      const now = this.now();
-      if (!isLeaseExpired(lease.expires_at, now.getTime())) valid = true;
+        if (!isLeaseExpired(lease.expires_at, now.getTime())) valid = true;
+      });
+      return valid;
     });
-    return valid;
   }
 
   private resolveLeaseForJob(jobId: string, job: any): any {
@@ -721,121 +957,144 @@ export class JobsService {
     if (!jobTokenPlain || typeof jobTokenPlain !== 'string') {
       return { error: 'unauthorized_or_stale' };
     }
-    if (!evidenceDigest || typeof evidenceDigest !== 'string' || evidenceDigest.trim().length === 0) {
-      return { error: 'missing_first_action_evidence' };
-    }
-    if (!nativeSession || typeof nativeSession !== 'string' || nativeSession.trim().length === 0) {
-      return { error: 'missing_native_session' };
-    }
-    if (!launcherTaskId || typeof launcherTaskId !== 'string' || launcherTaskId.trim().length === 0) {
-      return { error: 'missing_launcher_task_id' };
-    }
-    const tokenHash = await sha256(jobTokenPlain);
-    const now = this.now();
-    const nowIso = now.toISOString();
-    let result: any = {};
+    const isForbiddenPattern = (s: unknown): boolean => {
+      if (!s || typeof s !== 'string') return true;
+      const lower = s.trim().toLowerCase();
+      if (lower.length === 0) return true;
+      if (lower.includes('unknown') || lower.includes('none') || lower.includes('null') || lower.includes('undefined')) return true;
+      return false;
+    };
+    return this.withClockSnapshotAsync(async (now) => {
+      const tokenHash = await sha256(jobTokenPlain);
+      const nowIso = now.toISOString();
+      let result: any = {};
 
-    this.ctx.storage.transactionSync(() => {
-      const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
-      if (!job || job.claim_token_hash !== tokenHash || job.lease_epoch !== epoch) { result = { error: 'unauthorized_or_stale' }; return; }
-      if (job.status !== 'claimed') { result = { error: 'invalid_status' }; return; }
+      this.ctx.storage.transactionSync(() => {
+        const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
+        if (!job || job.claim_token_hash !== tokenHash || job.lease_epoch !== epoch) { result = { error: 'unauthorized_or_stale' }; return; }
+        if (job.status !== 'claimed') { result = { error: 'invalid_status' }; return; }
 
-      // Check credential validity and non-revocation
-      const cred = this.sql.exec(
-        "SELECT * FROM credentials WHERE token_hash = ? AND subject = ?",
-        tokenHash, jobId
-      ).toArray()[0] as any;
-      if (!cred || (cred.revoked_at && cred.revoked_at.trim().length > 0)) {
-        result = { error: 'unauthorized_or_stale' };
-        return;
-      }
-
-      const lease = this.resolveLeaseForJob(jobId, job);
-      if (!lease || lease.epoch !== epoch || lease.holder_job_id !== jobId || isLeaseExpired(lease.expires_at, now.getTime())) {
-        result = { error: 'unauthorized_or_stale' };
-        return;
-      }
-      if (lease.acquired_at) {
-        const acqMs = parseExpiryMs(lease.acquired_at);
-        if (acqMs !== null && (now.getTime() - acqMs) > 5 * 60000) {
-          result = { error: 'first_action_window_expired' };
+        // Check credential validity, non-revocation, and non-expiry
+        const cred = this.sql.exec(
+          "SELECT * FROM credentials WHERE token_hash = ? AND subject = ?",
+          tokenHash, jobId
+        ).toArray()[0] as any;
+        if (!cred || (cred.revoked_at && cred.revoked_at.trim().length > 0)) {
+          result = { error: 'unauthorized_or_stale' };
           return;
         }
-      }
+        const exp = parseExpiryMs(cred.expires_at);
+        if (exp === null || exp <= now.getTime()) {
+          result = { error: 'unauthorized_or_stale' };
+          return;
+        }
 
-      this.sql.exec("UPDATE jobs SET status = 'running', started_at = ?, first_action_at = ?, evidence_digest = ?, native_session = ?, launcher_task_id = ? WHERE id = ?",
-        nowIso, nowIso, evidenceDigest, nativeSession, launcherTaskId, jobId);
+        const lease = this.resolveLeaseForJob(jobId, job);
+        if (!lease || lease.epoch !== epoch || lease.holder_job_id !== jobId || isLeaseExpired(lease.expires_at, now.getTime())) {
+          result = { error: 'unauthorized_or_stale' };
+          return;
+        }
+        if (lease.acquired_at) {
+          const acqMs = parseExpiryMs(lease.acquired_at);
+          if (acqMs !== null && (now.getTime() - acqMs) > 5 * 60000) {
+            result = { error: 'first_action_window_expired' };
+            return;
+          }
+        }
 
-      if (job.kind === 'root-run') {
-        this.logAuditEvent('role:root', 'start', 'leases/root', jobId, {
-          job_id: jobId,
-          epoch,
-          host_id: job.holder_host_id || job.holder_machine_id,
-          native_session: nativeSession,
-          launcher_task_id: launcherTaskId,
-          evidence_digest: evidenceDigest
-        }, nowIso);
-        this.addHealthEvent('job', jobId, 'running', `root run started (epoch ${epoch})`, nowIso);
-      }
+        if (isForbiddenPattern(evidenceDigest) || !/^(sha256:[0-9a-fA-F]{1,64}|[0-9a-fA-F]{16,64})$/.test(String(evidenceDigest).trim())) {
+          result = { error: 'missing_first_action_evidence' };
+          return;
+        }
+        if (isForbiddenPattern(nativeSession)) {
+          result = { error: 'missing_native_session' };
+          return;
+        }
+        if (isForbiddenPattern(launcherTaskId)) {
+          result = { error: 'missing_launcher_task_id' };
+          return;
+        }
+
+        this.sql.exec("UPDATE jobs SET status = 'running', started_at = ?, first_action_at = ?, evidence_digest = ?, native_session = ?, launcher_task_id = ? WHERE id = ?",
+          nowIso, nowIso, evidenceDigest, nativeSession, launcherTaskId, jobId);
+
+        if (job.kind === 'root-run') {
+          this.logAuditEvent('role:root', 'start', 'leases/root', jobId, {
+            job_id: jobId,
+            epoch,
+            host_id: job.holder_host_id || job.holder_machine_id,
+            native_session: nativeSession,
+            launcher_task_id: launcherTaskId,
+            evidence_digest: evidenceDigest
+          }, nowIso);
+          this.addHealthEvent('job', jobId, 'running', `root run started (epoch ${epoch})`, nowIso);
+        }
+      });
+      this.scheduleAlarm();
+      return result;
     });
-    this.scheduleAlarm();
-    return result;
   }
 
   async renewJob(jobId: string, jobTokenPlain: string, epoch: number): Promise<{ error?: string }> {
     if (!jobTokenPlain || typeof jobTokenPlain !== 'string') {
       return { error: 'unauthorized_or_stale' };
     }
-    const tokenHash = await sha256(jobTokenPlain);
-    const now = this.now();
-    let result: any = {};
+    return this.withClockSnapshotAsync(async (now) => {
+      const nowMs = now.getTime();
+      const tokenHash = await sha256(jobTokenPlain);
+      let result: any = {};
 
-    this.ctx.storage.transactionSync(() => {
-      const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
-      if (!job || job.claim_token_hash !== tokenHash || job.lease_epoch !== epoch) { result = { error: 'unauthorized_or_stale' }; return; }
+      this.ctx.storage.transactionSync(() => {
+        const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
+        if (!job || job.claim_token_hash !== tokenHash || job.lease_epoch !== epoch) { result = { error: 'unauthorized_or_stale' }; return; }
 
-      const validStatuses = ['claimed', 'running'];
-      if (!validStatuses.includes(job.status)) {
-        result = { error: 'unauthorized_or_stale' }; return;
-      }
+        if (job.status !== 'running' || !job.started_at) {
+          result = { error: 'unauthorized_or_stale' }; return;
+        }
 
-      const deadlineMs = new Date(job.deadline_at).getTime();
-      if (now.getTime() >= deadlineMs) {
-        result = { error: 'deadline_exceeded' }; return;
-      }
+        const deadlineMs = parseExpiryMs(job.deadline_at) ?? new Date(job.deadline_at).getTime();
+        if (nowMs >= deadlineMs) {
+          result = { error: 'deadline_exceeded' }; return;
+        }
 
-      // Check credential validity and non-revocation
-      const cred = this.sql.exec(
-        "SELECT * FROM credentials WHERE token_hash = ? AND subject = ?",
-        tokenHash, jobId
-      ).toArray()[0] as any;
-      if (!cred || (cred.revoked_at && cred.revoked_at.trim().length > 0)) {
-        result = { error: 'unauthorized_or_stale' };
-        return;
-      }
+        // Check credential validity and non-revocation
+        const cred = this.sql.exec(
+          "SELECT * FROM credentials WHERE token_hash = ? AND subject = ?",
+          tokenHash, jobId
+        ).toArray()[0] as any;
+        if (!cred || (cred.revoked_at && cred.revoked_at.trim().length > 0)) {
+          result = { error: 'unauthorized_or_stale' };
+          return;
+        }
+        const credExpiresMs = parseExpiryMs(cred.expires_at);
+        if (credExpiresMs === null || credExpiresMs <= nowMs) {
+          result = { error: 'unauthorized_or_stale' };
+          return;
+        }
 
-      const lease = this.resolveLeaseForJob(jobId, job);
-      if (!lease || lease.epoch !== epoch || lease.holder_job_id !== jobId || isLeaseExpired(lease.expires_at, now.getTime())) {
-        result = { error: 'unauthorized_or_stale' }; return;
-      }
+        const lease = this.resolveLeaseForJob(jobId, job);
+        if (!lease || lease.epoch !== epoch || lease.holder_job_id !== jobId || isLeaseExpired(lease.expires_at, nowMs)) {
+          result = { error: 'unauthorized_or_stale' }; return;
+        }
 
-      const newExpiresMs = Math.min(now.getTime() + 20 * 60000, deadlineMs);
-      const newExpiresIso = new Date(newExpiresMs).toISOString();
+        const newExpiresMs = Math.min(nowMs + 20 * 60000, deadlineMs);
+        const newExpiresIso = new Date(newExpiresMs).toISOString();
 
-      const updateRes = this.sql.exec(
-        "UPDATE leases SET expires_at = ?, renewed_at = ? WHERE name = ? AND epoch = ? AND holder_job_id = ?",
-        newExpiresIso, now.toISOString(), lease.name, epoch, jobId
-      );
-      if (updateRes.rowsWritten !== 1) {
-        result = { error: 'unauthorized_or_stale' }; return;
-      }
+        const updateRes = this.sql.exec(
+          "UPDATE leases SET expires_at = ?, renewed_at = ? WHERE name = ? AND epoch = ? AND holder_job_id = ?",
+          newExpiresIso, now.toISOString(), lease.name, epoch, jobId
+        );
+        if (updateRes.rowsWritten !== 1) {
+          result = { error: 'unauthorized_or_stale' }; return;
+        }
 
-      // Update credential expiry
-      this.sql.exec("UPDATE credentials SET expires_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL", newExpiresIso, jobId);
+        // Update credential expiry
+        this.sql.exec("UPDATE credentials SET expires_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL", newExpiresIso, jobId);
+      });
+
+      this.scheduleAlarm();
+      return result;
     });
-
-    this.scheduleAlarm();
-    return result;
   }
 
   async finishJob(jobId: string, jobTokenPlain: string, epoch: number, status: string, summary: string, evidenceRefs: string[]): Promise<{ error?: string }> {
@@ -846,122 +1105,185 @@ export class JobsService {
     if (!jobTokenPlain || typeof jobTokenPlain !== 'string') {
       return { error: 'unauthorized_or_stale' };
     }
-    const tokenHash = await sha256(jobTokenPlain);
-    const now = this.now();
-    const nowMs = now.getTime();
-    const nowIso = now.toISOString();
-    let result: any = {};
+    return this.withClockSnapshotAsync(async (now) => {
+      const tokenHash = await sha256(jobTokenPlain);
+      const nowMs = now.getTime();
+      const nowIso = now.toISOString();
+      let result: any = {};
 
-    this.ctx.storage.transactionSync(() => {
-      const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
-      if (!job || job.claim_token_hash !== tokenHash || job.lease_epoch !== epoch) { result = { error: 'unauthorized_or_stale' }; return; }
+      this.ctx.storage.transactionSync(() => {
+        const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
+        if (!job || job.claim_token_hash !== tokenHash || job.lease_epoch !== epoch) { result = { error: 'unauthorized_or_stale' }; return; }
 
-      // Terminal status check: cannot finish an already terminal or fenced job
-      const terminalStatuses = ['succeeded', 'finished', 'failed', 'expired', 'cancelled', 'fenced'];
-      if (terminalStatuses.includes(job.status)) {
-        result = { error: 'unauthorized_or_stale' };
-        return;
-      }
+        // Terminal status check: cannot finish an already terminal or fenced job
+        const terminalStatuses = ['succeeded', 'finished', 'failed', 'expired', 'cancelled', 'fenced'];
+        if (terminalStatuses.includes(job.status)) {
+          result = { error: 'unauthorized_or_stale' };
+          return;
+        }
 
-      // Hardstop check: claimed or running job past hardstop cannot finish normally
-      if (job.deadline_at && nowMs >= new Date(job.deadline_at).getTime()) {
-        result = { error: 'unauthorized_or_stale' };
-        return;
-      }
+        // Unstarted claimed job cannot finish as succeeded or finished
+        if ((status === 'succeeded' || status === 'finished') && (job.status === 'claimed' || !job.started_at || !job.first_action_at)) {
+          result = { error: 'unauthorized_or_stale' };
+          return;
+        }
 
-      // Check credential validity and non-revocation
-      const cred = this.sql.exec(
-        "SELECT * FROM credentials WHERE token_hash = ? AND subject = ?",
-        tokenHash, jobId
-      ).toArray()[0] as any;
-      if (!cred || (cred.revoked_at && cred.revoked_at.trim().length > 0)) {
-        result = { error: 'unauthorized_or_stale' };
-        return;
-      }
+        // Hardstop check: claimed or running job past hardstop (including grace for root-run) cannot finish normally
+        const rootGraceMs = (job.kind === 'root-run') ? 120000 : 0;
+        const hardstopWithGraceMs = job.deadline_at ? (parseExpiryMs(job.deadline_at) ?? new Date(job.deadline_at).getTime()) + rootGraceMs : null;
+        if (hardstopWithGraceMs !== null && nowMs >= hardstopWithGraceMs) {
+          result = { error: 'unauthorized_or_stale' };
+          return;
+        }
 
-      const lease = this.resolveLeaseForJob(jobId, job);
-      if (!lease || lease.epoch !== epoch || lease.holder_job_id !== jobId) { result = { error: 'unauthorized_or_stale' }; return; }
-      if (isLeaseExpired(lease.expires_at, nowMs)) {
-        result = { error: 'unauthorized_or_stale' };
-        return;
-      }
-
-      const safeSummary = safeUtf8Summary(summary, 4096);
-
-      const leaseUpdate = this.sql.exec(
-        "UPDATE leases SET holder_job_id = NULL, holder_host_id = NULL, holder_machine_id = NULL, expires_at = NULL, released_at = ?, release_reason = ? WHERE name = ? AND epoch = ?",
-        nowIso, status, lease.name, epoch
-      );
-      if (leaseUpdate.rowsWritten !== 1) {
-        result = { error: 'unauthorized_or_stale' };
-        return;
-      }
-
-      this.sql.exec("UPDATE jobs SET status = ?, finished_at = ?, outcome_summary = ?, outcome_evidence = ? WHERE id = ?",
-        status, nowIso, safeSummary, JSON.stringify(evidenceRefs), jobId);
-
-      // Invalidate/revoke job credential
-      this.sql.exec("UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL", nowIso, jobId);
-
-      this.addHealthEvent('job', jobId, status, safeSummary, nowIso);
-
-      if (job.kind === 'root-run') {
-        this.logAuditEvent('role:root', 'finish', 'leases/root', jobId, {
-          job_id: jobId,
-          epoch,
-          status,
-          summary_len: safeSummary.length,
-          evidence_refs_count: (evidenceRefs || []).length
-        }, nowIso);
-      }
-    });
-
-    this.scheduleAlarm();
-
-    return result;
-  }
-
-  async createJob(kind: string, payload: any, actor: string, deadlineMins: number = 25, rootTokenPlain?: string, rootEpoch?: number): Promise<{ jobId?: string, error?: string }> {
-    const now = this.now();
-    let jobId = this.generateId();
-    const idempotencyKey = `${kind}:${jobId}`;
-    const deadlineAt = new Date(now.getTime() + deadlineMins * 60000).toISOString();
-    let result: any = {};
-    let tokenHash = rootTokenPlain ? await sha256(rootTokenPlain) : undefined;
-
-    this.ctx.storage.transactionSync(() => {
-      if (actor === 'role:root') {
-        if (!tokenHash || rootEpoch === undefined) { result = { error: 'unauthorized' }; return; }
-        const lease = this.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
-        if (!lease || lease.epoch !== rootEpoch || !lease.holder_job_id) { result = { error: 'unauthorized_or_stale' }; return; }
-        if (isLeaseExpired(lease.expires_at, now.getTime())) { result = { error: 'unauthorized_or_stale' }; return; }
-        const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", lease.holder_job_id).toArray()[0] as any;
-        if (!job || job.claim_token_hash !== tokenHash || job.status === 'expired' || job.status === 'failed') { result = { error: 'unauthorized_or_stale' }; return; }
+        // Check credential validity and non-revocation
         const cred = this.sql.exec(
           "SELECT * FROM credentials WHERE token_hash = ? AND subject = ?",
-          tokenHash, lease.holder_job_id
+          tokenHash, jobId
         ).toArray()[0] as any;
         if (!cred || (cred.revoked_at && cred.revoked_at.trim().length > 0)) {
           result = { error: 'unauthorized_or_stale' };
           return;
         }
-      } else if (actor === 'role:principal' || actor === 'principal' || actor === 'system' || actor === 'role:admin' || actor === 'admin' || actor.startsWith('role:admin') || actor.includes('@')) {
-        // Trusted callers with jobs:create scope or admin sessions are allowed without root lease
-      } else {
-        result = { error: 'unauthorized' }; return;
-      }
+        const credExpiresMs = parseExpiryMs(cred.expires_at);
+        if (credExpiresMs === null || credExpiresMs <= nowMs) {
+          result = { error: 'unauthorized_or_stale' };
+          return;
+        }
 
-      this.sql.exec("INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        jobId, kind, idempotencyKey, JSON.stringify(payload), 'pending', now.toISOString(), deadlineAt, actor);
+        const lease = this.resolveLeaseForJob(jobId, job);
+        if (!lease || lease.epoch !== epoch || lease.holder_job_id !== jobId) { result = { error: 'unauthorized_or_stale' }; return; }
+        if (isLeaseExpired(lease.expires_at, nowMs)) {
+          result = { error: 'unauthorized_or_stale' };
+          return;
+        }
 
-      const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
-      this.tryOfferNext(job, now);
-      result = { jobId };
+        const safeSummary = safeUtf8Summary(summary, 4096);
+
+        const leaseUpdate = this.sql.exec(
+          "UPDATE leases SET holder_job_id = NULL, holder_host_id = NULL, holder_machine_id = NULL, expires_at = NULL, released_at = ?, release_reason = ? WHERE name = ? AND epoch = ?",
+          nowIso, status, lease.name, epoch
+        );
+        if (leaseUpdate.rowsWritten !== 1) {
+          result = { error: 'unauthorized_or_stale' };
+          return;
+        }
+
+        this.sql.exec("UPDATE jobs SET status = ?, finished_at = ?, outcome_summary = ?, outcome_evidence = ? WHERE id = ?",
+          status, nowIso, safeSummary, JSON.stringify(evidenceRefs), jobId);
+
+        // Invalidate/revoke job credential
+        this.sql.exec("UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL", nowIso, jobId);
+
+        this.addHealthEvent('job', jobId, status, safeSummary, nowIso);
+
+        if (job.kind === 'root-run') {
+          this.logAuditEvent('role:root', 'finish', 'leases/root', jobId, {
+            job_id: jobId,
+            epoch,
+            status,
+            summary_len: safeSummary.length,
+            evidence_refs_count: (evidenceRefs || []).length
+          }, nowIso);
+        }
+      });
+
+      this.scheduleAlarm();
+
+      return result;
     });
+  }
 
-    this.scheduleAlarm();
+  async createJob(kind: string, payload: any, actor: string, deadlineMins: number = 25, rootTokenPlain?: string, rootEpoch?: number): Promise<{ jobId?: string, error?: string }> {
+    return this.withClockSnapshotAsync(async (now) => {
+      const nowMs = now.getTime();
+      let jobId = this.generateId();
+      const idempotencyKey = `${kind}:${jobId}`;
+      const deadlineAt = new Date(nowMs + deadlineMins * 60000).toISOString();
+      let result: any = {};
+      let verifiedSession: any = null;
+      if (actor !== 'role:root' && this.env && rootTokenPlain && typeof rootTokenPlain === 'string' && rootTokenPlain.includes('hub_session=')) {
+        try {
+          verifiedSession = await getSession(this.env, new Request('http://localhost', { headers: { Cookie: rootTokenPlain } }));
+        } catch {}
+      }
+      let tokenHash = (rootTokenPlain && !verifiedSession) ? await sha256(rootTokenPlain) : undefined;
 
-    return result;
+      this.ctx.storage.transactionSync(() => {
+        if (actor === 'role:root') {
+          if (!tokenHash || rootEpoch === undefined) { result = { error: 'unauthorized' }; return; }
+          const lease = this.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
+          if (!lease || lease.epoch !== rootEpoch || !lease.holder_job_id) { result = { error: 'unauthorized_or_stale' }; return; }
+          if (isLeaseExpired(lease.expires_at, nowMs)) { result = { error: 'unauthorized_or_stale' }; return; }
+          const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", lease.holder_job_id).toArray()[0] as any;
+          if (!job || job.claim_token_hash !== tokenHash || job.status !== 'running' || !job.started_at || !job.first_action_at) {
+            result = { error: 'unauthorized_or_stale' };
+            return;
+          }
+          const cred = this.sql.exec(
+            "SELECT * FROM credentials WHERE token_hash = ? AND subject = ?",
+            tokenHash, lease.holder_job_id
+          ).toArray()[0] as any;
+          if (!cred || (cred.revoked_at && cred.revoked_at.trim().length > 0)) {
+            result = { error: 'unauthorized_or_stale' };
+            return;
+          }
+          const credExpiresMs = parseExpiryMs(cred.expires_at);
+          if (credExpiresMs === null || credExpiresMs <= nowMs) {
+            result = { error: 'unauthorized_or_stale' };
+            return;
+          }
+        } else if (verifiedSession && verifiedSession.isAdmin) {
+          // Authenticated via verified HMAC admin session cookie
+        } else {
+          if (!tokenHash || !actor || typeof actor !== 'string') {
+            result = { error: 'unauthorized' };
+            return;
+          }
+          const cred = this.sql.exec(
+            "SELECT * FROM credentials WHERE token_hash = ?",
+            tokenHash
+          ).toArray()[0] as any;
+          if (!cred || (cred.revoked_at && cred.revoked_at.trim().length > 0)) {
+            result = { error: 'unauthorized' };
+            return;
+          }
+          const credExpiresMs = parseExpiryMs(cred.expires_at);
+          if (credExpiresMs === null || credExpiresMs <= nowMs) {
+            result = { error: 'unauthorized' };
+            return;
+          }
+          let scopes: any[] = [];
+          try {
+            scopes = typeof cred.scopes === 'string' ? JSON.parse(cred.scopes) : (Array.isArray(cred.scopes) ? cred.scopes : []);
+          } catch {
+            result = { error: 'unauthorized' };
+            return;
+          }
+          if (!scopes.includes('jobs:create') && !scopes.includes('admin')) {
+            result = { error: 'unauthorized' };
+            return;
+          }
+          const credIdentity = cred.actor || cred.subject;
+          const isSystemOrPrincipalCred = cred.actor === 'role:principal' || cred.actor === 'system' || (!cred.actor && (actor === 'role:principal' || actor === 'system'));
+          if (!scopes.includes('admin') && credIdentity !== actor && !isSystemOrPrincipalCred) {
+            result = { error: 'unauthorized' };
+            return;
+          }
+        }
+
+        this.sql.exec("INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          jobId, kind, idempotencyKey, JSON.stringify(payload), 'pending', now.toISOString(), deadlineAt, actor);
+
+        const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
+        this.tryOfferNext(job, now);
+        result = { jobId };
+      });
+
+      this.scheduleAlarm();
+
+      return result;
+    });
   }
 
   private checkHostRootRunCapability(machine: any): boolean {
@@ -995,7 +1317,9 @@ export class JobsService {
     heartbeat_fresh: boolean;
     within_lease: boolean;
     within_hardstop: boolean;
+    within_grace?: boolean;
     past_hardstop: boolean;
+    past_hardstop_with_grace?: boolean;
     is_healthy_alive: boolean;
     confirmed_stale: boolean;
     transport_unknown: boolean;
@@ -1056,16 +1380,40 @@ export class JobsService {
       regAgent = regAgents[0] || null;
     } catch {}
 
-    // Canonical agent state: state column takes precedence over health_state
-    let canonicalAgentState = (regAgent?.state || regAgent?.health_state || regAgent?.lasthealth || 'healthy').toLowerCase();
-    if (regAgent && this.healthService?.getEffectiveHealth) {
-      const eff = this.healthService.getEffectiveHealth(regAgent.tag);
-      if (eff && eff.state) {
-        canonicalAgentState = eff.state.toLowerCase();
+    // Canonical agent state: unknown state or health_state takes precedence over other states
+    const DEAD_STATES = new Set(['retired', 'dead', 'defunct', 'failed', 'stale', 'stopped', 'offline', 'terminal', 'broken', 'error', 'expired', 'fenced']);
+    const ALIVE_STATES = new Set(['healthy', 'active', 'working', 'idle']);
+    let canonicalAgentState: string | null = null;
+    let isExplicitDeadOrStale = false;
+    if (regAgent) {
+      const rawState = (regAgent.state || '').toLowerCase();
+      const rawHealthState = (regAgent.health_state || '').toLowerCase();
+      const rawLastHealth = (regAgent.lasthealth || '').toLowerCase();
+      isExplicitDeadOrStale = Boolean(
+        (rawState && DEAD_STATES.has(rawState) && (!rawHealthState || DEAD_STATES.has(rawHealthState))) ||
+        (!rawState && rawHealthState && DEAD_STATES.has(rawHealthState))
+      );
+      canonicalAgentState = (rawState || rawHealthState || rawLastHealth || 'unknown').toLowerCase();
+      if (rawHealthState === 'unknown' || rawState === 'unknown') {
+        canonicalAgentState = 'unknown';
+        isExplicitDeadOrStale = false;
+      }
+      if (this.healthService?.getEffectiveHealth) {
+        const eff = this.healthService.getEffectiveHealth(regAgent.tag);
+        if (eff && eff.state) {
+          const effState = eff.state.toLowerCase();
+          if (effState === 'unknown' && isExplicitDeadOrStale && (eff.detail?.inherited_from_host === 'stale' || eff.detail?.inherited_from_host === 'unavailable')) {
+            // Preserve explicit dead/stale agent observation when HealthService only reports inherited host staleness/unavailability
+          } else {
+            canonicalAgentState = effState;
+            if (effState === 'unknown') {
+              isExplicitDeadOrStale = false;
+            }
+          }
+        }
       }
     }
-    const ALIVE_STATES = new Set(['healthy', 'active', 'working', 'idle']);
-    const isAgentStateHealthy = ALIVE_STATES.has(canonicalAgentState);
+    const isAgentStateHealthy = canonicalAgentState ? ALIVE_STATES.has(canonicalAgentState) : false;
 
     const hostId = leaseRow.holder_job_id
       ? (leaseRow.holder_host_id || leaseRow.holder_machine_id || (holderJob ? holderJob.holder_host_id : null))
@@ -1082,10 +1430,13 @@ export class JobsService {
         try { hb = machine.last_heartbeat ? JSON.parse(machine.last_heartbeat) : null; } catch {}
         let checkinAgeS = null;
         if (machine.last_checkin_at) {
-          machineTransportKnown = true;
-          const ageMs = nowMs - new Date(machine.last_checkin_at).getTime();
-          checkinAgeS = Math.floor(ageMs / 1000);
-          machineCheckinFresh = (ageMs >= 0 && ageMs <= 180000);
+          const checkinMs = parseExpiryMs(machine.last_checkin_at);
+          if (checkinMs !== null && (nowMs - checkinMs >= 0)) {
+            machineTransportKnown = true;
+            const ageMs = nowMs - checkinMs;
+            checkinAgeS = Math.floor(ageMs / 1000);
+            machineCheckinFresh = (ageMs >= 0 && ageMs <= 180000);
+          }
         }
         hostRow = {
           id: machine.id,
@@ -1099,37 +1450,80 @@ export class JobsService {
       }
     }
 
-    let heartbeatFresh = false;
-    let transportUnknown = false;
+    let leaseHeartbeatFresh = false;
+    let leaseTransportUnknown = false;
 
     if (leaseRow.holder_job_id) {
       if (machineTransportKnown) {
-        heartbeatFresh = machineCheckinFresh;
-        transportUnknown = false;
+        leaseHeartbeatFresh = machineCheckinFresh;
+        leaseTransportUnknown = false;
       } else {
         // Leased root but machine has no checkin: transport unknown
-        transportUnknown = true;
-        heartbeatFresh = false;
+        leaseTransportUnknown = true;
+        leaseHeartbeatFresh = false;
       }
-    } else if (regAgent) {
-      let regFresh = false;
-      let regKnown = false;
-      if (regAgent.last_seen_at) {
-        regKnown = true;
-        const regAgeMs = nowMs - new Date(regAgent.last_seen_at).getTime();
-        regFresh = (regAgeMs >= 0 && regAgeMs <= 180000);
+    }
+
+    let regHeartbeatFresh = false;
+    let regTransportUnknown = false;
+
+    if (regAgent) {
+      const regHostId = regAgent.machine_id;
+      const regMachine = regHostId ? this.sql.exec("SELECT * FROM machines WHERE id = ?", regHostId).toArray()[0] as any : null;
+      let regMachineFresh = false;
+      let regMachineKnown = false;
+      if (regMachine && regMachine.last_checkin_at) {
+        const regCheckinMs = parseExpiryMs(regMachine.last_checkin_at);
+        if (regCheckinMs !== null && (nowMs - regCheckinMs >= 0)) {
+          regMachineKnown = true;
+          const regAgeMs = nowMs - regCheckinMs;
+          regMachineFresh = (regAgeMs >= 0 && regAgeMs <= 180000);
+        }
       }
-      if (machineTransportKnown || regKnown) {
-        transportUnknown = false;
-        heartbeatFresh = machineCheckinFresh || regFresh;
+
+      const regLastSeenMs = parseExpiryMs(regAgent.last_seen_at || regAgent.health_at);
+      const regSeenFinite = regLastSeenMs !== null && (nowMs - regLastSeenMs >= 0);
+      const regSeenFresh = regSeenFinite && (nowMs - regLastSeenMs <= 180000);
+
+      if (canonicalAgentState === 'unknown' || (regAgent.health_state && regAgent.health_state.toLowerCase() === 'unknown') || (regAgent.state && regAgent.state.toLowerCase() === 'unknown')) {
+        regTransportUnknown = true;
+        regHeartbeatFresh = false;
+      } else if (!regMachineKnown || !regSeenFinite) {
+        regTransportUnknown = true;
+        regHeartbeatFresh = false;
+      } else if (isExplicitDeadOrStale && !regSeenFresh) {
+        // Explicit dead/stale state AND finite stale last_seen_at on known machine -> confirmed stale observation
+        regTransportUnknown = false;
+        regHeartbeatFresh = false;
+      } else if (isExplicitDeadOrStale && regSeenFresh) {
+        // Contradicted observation (dead/stale state with fresh last_seen_at) -> fail closed as unknown
+        regTransportUnknown = true;
+        regHeartbeatFresh = false;
+      } else if (!regMachineFresh) {
+        // SPEC §9: Active/healthy agent inherits unknown when its host is stale
+        regTransportUnknown = true;
+        regHeartbeatFresh = false;
+      } else if (regSeenFresh) {
+        regHeartbeatFresh = true;
+        regTransportUnknown = false;
       } else {
-        transportUnknown = true;
-        heartbeatFresh = false;
+        regHeartbeatFresh = false;
+        regTransportUnknown = false;
       }
-    } else {
-      // No incumbent at all
-      transportUnknown = false;
-      heartbeatFresh = false;
+    }
+
+    let heartbeatFresh = false;
+    let transportUnknown = false;
+
+    if (leaseRow.holder_job_id && regAgent) {
+      transportUnknown = leaseTransportUnknown || regTransportUnknown;
+      heartbeatFresh = leaseHeartbeatFresh || regHeartbeatFresh;
+    } else if (leaseRow.holder_job_id) {
+      transportUnknown = leaseTransportUnknown;
+      heartbeatFresh = leaseHeartbeatFresh;
+    } else if (regAgent) {
+      transportUnknown = regTransportUnknown;
+      heartbeatFresh = regHeartbeatFresh;
     }
 
     if (!liveSession && regAgent) {
@@ -1158,52 +1552,89 @@ export class JobsService {
       !isLeaseExpired(leaseRow.expires_at, nowMs)
     );
 
+    const GRACE_MS = 2 * 60000;
+    const deadlineMs = holderJob?.deadline_at ? (parseExpiryMs(holderJob.deadline_at) ?? new Date(holderJob.deadline_at).getTime()) : null;
+    const startMs = holderJob?.started_at ? (parseExpiryMs(holderJob.started_at) ?? new Date(holderJob.started_at).getTime()) : (holderJob?.created_at ? (parseExpiryMs(holderJob.created_at) ?? new Date(holderJob.created_at).getTime()) : null);
+
+    const hardstopMs = (deadlineMs !== null && startMs !== null)
+      ? Math.min(deadlineMs, startMs + 25 * 60000)
+      : (deadlineMs !== null ? deadlineMs : (startMs !== null ? startMs + 25 * 60000 : null));
+    const hardstopWithGraceMs = hardstopMs !== null ? hardstopMs + GRACE_MS : null;
+
     const withinHardstop = Boolean(
-      holderJob &&
-      holderJob.deadline_at &&
-      nowMs < new Date(holderJob.deadline_at).getTime()
+      hardstopMs !== null && nowMs < hardstopMs
+    );
+
+    const withinGrace = Boolean(
+      hardstopMs !== null &&
+      hardstopWithGraceMs !== null &&
+      nowMs >= hardstopMs &&
+      nowMs < hardstopWithGraceMs
     );
 
     const pastHardstop = Boolean(
-      holderJob &&
-      holderJob.deadline_at &&
-      nowMs >= new Date(holderJob.deadline_at).getTime()
+      hardstopMs !== null && nowMs >= hardstopMs
     );
 
-    const isJobActive = Boolean(
+    const pastHardstopWithGrace = Boolean(
+      hardstopWithGraceMs !== null && nowMs >= hardstopWithGraceMs
+    );
+
+    let isJobActive = Boolean(
       holderJob &&
       (holderJob.status === 'claimed' || holderJob.status === 'running')
     );
+    if (holderJob && holderJob.status === 'claimed') {
+      const acquiredMs = parseExpiryMs(leaseRow.acquired_at) ?? (parseExpiryMs(holderJob.created_at) ?? nowMs);
+      if (nowMs - acquiredMs > 300_000) {
+        isJobActive = false;
+      }
+    }
 
     const isExternalHealthyAlive = Boolean(
-      !leaseRow.holder_job_id &&
       regAgent &&
-      heartbeatFresh &&
+      regHeartbeatFresh &&
       isAgentStateHealthy
     );
 
+    const isLeasedHealthyAlive = Boolean(
+      (withinLease || withinGrace) &&
+      leaseHeartbeatFresh &&
+      isJobActive
+    );
+
     const isHealthyAlive = Boolean(
-      (withinLease && withinHardstop && heartbeatFresh && isJobActive) ||
+      isLeasedHealthyAlive ||
       isExternalHealthyAlive
     );
 
     // Explicit confirmed stale policy:
     // Unknown transport is UNKNOWN, NOT proof of dead!
+    // Stale heartbeat alone while lease is still active (withinLease && isJobActive && !pastHardstop) is NOT proof of Root death!
     let confirmedStale = false;
-    if (transportUnknown) {
+    if (transportUnknown || canonicalAgentState === 'unknown') {
       confirmedStale = false;
-    } else if (leaseRow.holder_job_id) {
-      if (pastHardstop) {
-        confirmedStale = true;
-      } else if (!heartbeatFresh && (!withinLease || isLeaseExpired(leaseRow.expires_at, nowMs))) {
-        confirmedStale = true;
-      } else if (!heartbeatFresh && !isJobActive) {
+    } else if (isHealthyAlive) {
+      confirmedStale = false;
+    } else if (leaseRow.holder_job_id && withinLease && !pastHardstop) {
+      if (!isJobActive) {
         confirmedStale = true;
       } else if (!heartbeatFresh) {
-        confirmedStale = true;
+        transportUnknown = true;
+        confirmedStale = false;
       }
     } else if (regAgent) {
-      if (!heartbeatFresh || !isAgentStateHealthy) {
+      if (canonicalAgentState && DEAD_STATES.has(canonicalAgentState)) {
+        confirmedStale = true;
+      } else if (canonicalAgentState === 'unknown' || canonicalAgentState === 'unspecified') {
+        confirmedStale = false;
+      } else if (isAgentStateHealthy) {
+        confirmedStale = !heartbeatFresh && !transportUnknown;
+      } else {
+        confirmedStale = !heartbeatFresh && !transportUnknown;
+      }
+    } else if (leaseRow.holder_job_id) {
+      if (pastHardstopWithGrace || !withinLease) {
         confirmedStale = true;
       }
     }
@@ -1213,14 +1644,14 @@ export class JobsService {
     let takeoverDenialError: string | null = null;
     let takeoverDenialReason: string | null = null;
 
-    if (isHealthyAlive) {
+    if (transportUnknown || canonicalAgentState === 'unknown') {
+      canTakeover = false;
+      takeoverDenialError = 'transport_unknown';
+      takeoverDenialReason = 'incumbent root or host checkin state is unknown; unknown transport is not proof of death';
+    } else if (isHealthyAlive) {
       canTakeover = false;
       takeoverDenialError = 'incumbent_still_healthy';
       takeoverDenialReason = 'incumbent is healthy alive with fresh heartbeat and valid state';
-    } else if (transportUnknown) {
-      canTakeover = false;
-      takeoverDenialError = 'transport_unknown';
-      takeoverDenialReason = 'incumbent transport is unknown; unknown transport is not proof of death';
     } else if (leaseRow.holder_job_id || regAgent) {
       if (confirmedStale) {
         canTakeover = true;
@@ -1257,7 +1688,9 @@ export class JobsService {
       heartbeat_fresh: heartbeatFresh,
       within_lease: withinLease,
       within_hardstop: withinHardstop,
+      within_grace: withinGrace,
       past_hardstop: pastHardstop,
+      past_hardstop_with_grace: pastHardstopWithGrace,
       is_healthy_alive: isHealthyAlive,
       confirmed_stale: confirmedStale,
       transport_unknown: transportUnknown,
@@ -1278,7 +1711,9 @@ export class JobsService {
     heartbeat_fresh: boolean;
     within_lease: boolean;
     within_hardstop: boolean;
+    within_grace?: boolean;
     past_hardstop: boolean;
+    past_hardstop_with_grace?: boolean;
     is_healthy_alive: boolean;
     confirmed_stale: boolean;
     transport_unknown: boolean;
@@ -1295,7 +1730,9 @@ export class JobsService {
       heartbeat_fresh: evalResult.heartbeat_fresh,
       within_lease: evalResult.within_lease,
       within_hardstop: evalResult.within_hardstop,
+      within_grace: evalResult.within_grace,
       past_hardstop: evalResult.past_hardstop,
+      past_hardstop_with_grace: evalResult.past_hardstop_with_grace,
       is_healthy_alive: evalResult.is_healthy_alive,
       confirmed_stale: evalResult.confirmed_stale,
       transport_unknown: evalResult.transport_unknown,
@@ -1317,166 +1754,206 @@ export class JobsService {
     deadline_at?: string;
     current_epoch?: number;
   }> {
-    const now = this.now();
-    const nowIso = now.toISOString();
-    const nowMs = now.getTime();
+    return this.withClockSnapshotAsync(async (now) => {
+      const nowIso = now.toISOString();
+      const nowMs = now.getTime();
 
-    const token = this.generateToken();
-    const tokenHash = await sha256(token);
-    let result: any = null;
+      const token = this.generateToken();
+      const tokenHash = await sha256(token);
+      let result: any = null;
 
-    this.ctx.storage.transactionSync(() => {
-      // 1. Fetch current lease
-      const currentLease = this.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
-      if (!currentLease) {
-        result = { error: 'lease_not_found', reason: 'root lease does not exist' };
-        return;
-      }
-
-      // 2. Atomic CAS check on expected incumbent epoch
-      if (currentLease.epoch !== expectedEpoch) {
-        result = {
-          error: 'cas_failed',
-          reason: `expected epoch ${expectedEpoch} but current lease epoch is ${currentLease.epoch}`,
-          current_epoch: currentLease.epoch
-        };
-        return;
-      }
-
-      // 3. Verify takeover policy via shared incumbent evaluator
-      const evaluation = this.evaluateRootIncumbent();
-      if (!evaluation.can_takeover) {
-        result = {
-          error: evaluation.takeover_denial_error,
-          reason: evaluation.takeover_denial_reason,
-          current_epoch: currentLease.epoch
-        };
-        return;
-      }
-
-      // 4. Validate candidate job
-      const candidateJob = this.sql.exec("SELECT * FROM jobs WHERE id = ?", candidateJobId).toArray()[0] as any;
-      if (!candidateJob) {
-        result = { error: 'not_found', reason: `candidate job ${candidateJobId} not found` };
-        return;
-      }
-
-      if (candidateJob.kind !== 'root-run') {
-        result = { error: 'invalid_candidate_kind', reason: `candidate job must be kind root-run, got ${candidateJob.kind}` };
-        return;
-      }
-
-      const validCandidateStatuses = ['offered', 'pending'];
-      if (!validCandidateStatuses.includes(candidateJob.status)) {
-        result = { error: 'invalid_candidate_status', reason: `candidate job status is ${candidateJob.status}; must be offered or pending` };
-        return;
-      }
-
-      if (candidateJob.deadline_at && nowMs >= new Date(candidateJob.deadline_at).getTime()) {
-        result = { error: 'candidate_expired', reason: 'candidate job deadline expired' };
-        return;
-      }
-
-      if (candidateJob.status === 'offered') {
-        if (candidateJob.offer_machine_id && candidateJob.offer_machine_id !== hostId) {
-          result = { error: 'host_mismatch', reason: `candidate job offered to ${candidateJob.offer_machine_id}, not ${hostId}` };
+      this.ctx.storage.transactionSync(() => {
+        // 1. Fetch current lease
+        const currentLease = this.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
+        if (!currentLease) {
+          result = { error: 'lease_not_found', reason: 'root lease does not exist' };
           return;
         }
-        if (candidateJob.offer_expires_at) {
-          const offerExp = parseExpiryMs(candidateJob.offer_expires_at);
-          if (offerExp !== null && offerExp <= nowMs) {
-            result = { error: 'offer_expired', reason: 'candidate job offer expired' };
+
+        // 2. Atomic CAS check on expected incumbent epoch
+        if (currentLease.epoch !== expectedEpoch) {
+          result = {
+            error: 'cas_failed',
+            reason: `expected epoch ${expectedEpoch} but current lease epoch is ${currentLease.epoch}`,
+            current_epoch: currentLease.epoch
+          };
+          return;
+        }
+
+        // 3. Verify takeover policy via shared incumbent evaluator
+        const evaluation = this.evaluateRootIncumbent();
+        if (!evaluation.can_takeover) {
+          result = {
+            error: evaluation.takeover_denial_error,
+            reason: evaluation.takeover_denial_reason,
+            current_epoch: currentLease.epoch
+          };
+          return;
+        }
+
+        // 4. Validate candidate job
+        const candidateJob = this.sql.exec("SELECT * FROM jobs WHERE id = ?", candidateJobId).toArray()[0] as any;
+        if (!candidateJob) {
+          result = { error: 'not_found', reason: `candidate job ${candidateJobId} not found` };
+          return;
+        }
+
+        if (candidateJob.kind !== 'root-run') {
+          result = { error: 'invalid_candidate_kind', reason: `candidate job must be kind root-run, got ${candidateJob.kind}` };
+          return;
+        }
+
+        const validCandidateStatuses = ['offered', 'pending'];
+        if (!validCandidateStatuses.includes(candidateJob.status)) {
+          result = { error: 'invalid_candidate_status', reason: `candidate job status is ${candidateJob.status}; must be offered or pending` };
+          return;
+        }
+
+        if (candidateJob.deadline_at && nowMs >= new Date(candidateJob.deadline_at).getTime()) {
+          result = { error: 'candidate_expired', reason: 'candidate job deadline expired' };
+          return;
+        }
+
+        if (candidateJob.status === 'offered') {
+          const expectedHost = candidateJob.offer_host_id || candidateJob.offer_machine_id;
+          if (expectedHost && expectedHost !== hostId) {
+            result = { error: 'host_mismatch', reason: `candidate job offered to ${expectedHost}, not ${hostId}` };
+            return;
+          }
+          if (candidateJob.offer_expires_at) {
+            const offerExp = parseExpiryMs(candidateJob.offer_expires_at);
+            if (offerExp !== null && offerExp <= nowMs) {
+              result = { error: 'offer_expired', reason: 'candidate job offer expired' };
+              return;
+            }
+          }
+        }
+
+        // 5. Validate candidate host eligibility
+        const candidateMachine = this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any;
+        if (!candidateMachine) {
+          result = { error: 'host_not_found', reason: `candidate host ${hostId} not registered in machines` };
+          return;
+        }
+        if (candidateMachine.drained === 1 || candidateMachine.state === 'drained') {
+          result = { error: 'host_drained', reason: `candidate host ${hostId} is drained` };
+          return;
+        }
+        if (!this.checkHostRootRunCapability(candidateMachine)) {
+          result = { error: 'host_incapable', reason: `candidate host ${hostId} lacks root-run capability` };
+          return;
+        }
+
+        // Check host checkin freshness (<= 180s && >= 0)
+        if (!candidateMachine.last_checkin_at) {
+          result = { error: 'host_stale_or_offline', reason: `candidate host ${hostId} has no checkin` };
+          return;
+        }
+        const checkinAgeMs = nowMs - new Date(candidateMachine.last_checkin_at).getTime();
+        if (checkinAgeMs < 0 || checkinAgeMs > 180000) {
+          result = { error: 'host_stale', reason: `candidate host ${hostId} checkin is stale (${Math.floor(checkinAgeMs / 1000)}s old)` };
+          return;
+        }
+
+        // Check host gate launch_allowed
+        let gateAllowed = false;
+        if (candidateMachine.last_heartbeat) {
+          try {
+            const hb = typeof candidateMachine.last_heartbeat === 'string'
+              ? JSON.parse(candidateMachine.last_heartbeat)
+              : candidateMachine.last_heartbeat;
+            if (hb && hb.gate && hb.gate.launch_allowed === true) {
+              gateAllowed = true;
+            }
+          } catch {}
+        }
+        if (!gateAllowed) {
+          result = { error: 'gate_launch_disallowed', reason: `candidate host ${hostId} gate.launch_allowed is not true` };
+          return;
+        }
+
+        // Check rootHostsPolicy
+        if (this.rootHostsPolicy && this.rootHostsPolicy.length > 0) {
+          if (!this.rootHostsPolicy.includes(candidateMachine.hostname) &&
+              !this.rootHostsPolicy.includes(candidateMachine.id) &&
+              !this.rootHostsPolicy.includes(candidateMachine.name)) {
+            result = { error: 'host_not_allowed', reason: `candidate host ${hostId} not permitted by rootHosts policy` };
             return;
           }
         }
-      }
 
-      // 5. Validate candidate host eligibility
-      const candidateMachine = this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any;
-      if (!candidateMachine) {
-        result = { error: 'host_not_found', reason: `candidate host ${hostId} not registered in machines` };
-        return;
-      }
-      if (candidateMachine.drained === 1 || candidateMachine.state === 'drained') {
-        result = { error: 'host_drained', reason: `candidate host ${hostId} is drained` };
-        return;
-      }
-      if (!this.checkHostRootRunCapability(candidateMachine)) {
-        result = { error: 'host_incapable', reason: `candidate host ${hostId} lacks root-run capability` };
-        return;
-      }
+        const deadlineMs = candidateJob.deadline_at ? (parseExpiryMs(candidateJob.deadline_at) ?? new Date(candidateJob.deadline_at).getTime()) : (nowMs + 25 * 60000);
+        const newEpoch = currentLease.epoch + 1;
+        const leaseExpiresMs = Math.min(nowMs + 20 * 60000, deadlineMs);
+        const leaseExpiresIso = new Date(leaseExpiresMs).toISOString();
 
-      const newEpoch = currentLease.epoch + 1;
-      const deadlineMs = candidateJob.deadline_at ? new Date(candidateJob.deadline_at).getTime() : (nowMs + 25 * 60000);
-      const leaseExpiresMs = Math.min(nowMs + 20 * 60000, deadlineMs);
-      const leaseExpiresIso = new Date(leaseExpiresMs).toISOString();
+        // 6. Strong atomic CAS update against expectedEpoch
+        const updateLease = this.sql.exec(
+          "UPDATE leases SET holder_job_id = ?, holder_host_id = ?, holder_machine_id = ?, holder_actor = 'role:root', epoch = epoch + 1, acquired_at = ?, renewed_at = ?, expires_at = ?, release_reason = NULL, released_at = NULL WHERE name = 'root' AND epoch = ?",
+          candidateJobId, hostId, hostId, nowIso, nowIso, leaseExpiresIso, expectedEpoch
+        );
 
-      // 6. Strong atomic CAS update against expectedEpoch
-      const updateLease = this.sql.exec(
-        "UPDATE leases SET holder_job_id = ?, holder_host_id = ?, holder_machine_id = ?, holder_actor = 'role:root', epoch = epoch + 1, acquired_at = ?, renewed_at = ?, expires_at = ?, release_reason = NULL, released_at = NULL WHERE name = 'root' AND epoch = ?",
-        candidateJobId, hostId, hostId, nowIso, nowIso, leaseExpiresIso, expectedEpoch
-      );
+        if (updateLease.rowsWritten !== 1) {
+          result = {
+            error: 'cas_failed',
+            reason: 'concurrent update race; epoch changed',
+            current_epoch: currentLease.epoch
+          };
+          return;
+        }
 
-      if (updateLease.rowsWritten !== 1) {
+        // 7. Fence old incumbent job if one was held
+        const oldJobId = currentLease.holder_job_id;
+        if (oldJobId && oldJobId !== candidateJobId) {
+          this.sql.exec(
+            "UPDATE jobs SET status = 'fenced', finished_at = ?, outcome_summary = ? WHERE id = ? AND status IN ('claimed', 'running', 'offered')",
+            nowIso, `fenced: superseded by takeover epoch ${newEpoch} on host ${hostId}`, oldJobId
+          );
+          this.sql.exec(
+            "UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL",
+            nowIso, oldJobId
+          );
+          this.addHealthEvent('job', oldJobId, 'fenced', `superseded by takeover epoch ${newEpoch}`, nowIso);
+        }
+
+        // 8. Update candidate job to claimed with new epoch and token
+        this.sql.exec(
+          "UPDATE jobs SET status = 'claimed', claim_token_hash = ?, holder_host_id = ?, holder_machine_id = ?, lease_epoch = ? WHERE id = ?",
+          tokenHash, hostId, hostId, newEpoch, candidateJobId
+        );
+
+        // 9. Mint new credential for new root job
+        const credId = this.generateId();
+        const jobScopes = ['lease:root', 'jobs:create', 'bus:send', 'bus:read', 'health:report'];
+        this.sql.exec(
+          "INSERT OR REPLACE INTO credentials (id, kind, token_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?, 'job', ?, ?, ?, ?, 'role:root', ?, 'system', ?, ?)",
+          credId, tokenHash, credId, candidateJobId, hostId, JSON.stringify(jobScopes), nowIso, leaseExpiresIso
+        );
+
+        // 10. Audit event: takeover
+        this.logAuditEvent('host:' + hostId, 'takeover', 'leases/root', candidateJobId, {
+          old_job_id: oldJobId || null,
+          old_epoch: expectedEpoch,
+          new_job_id: candidateJobId,
+          new_epoch: newEpoch,
+          host_id: hostId,
+          reason: safeUtf8Summary(reason, 1024)
+        }, nowIso);
+
+        this.addHealthEvent('job', candidateJobId, 'takeover', `atomic CAS takeover succeeded: epoch ${newEpoch}`, nowIso);
+
         result = {
-          error: 'cas_failed',
-          reason: 'concurrent update race; epoch changed',
-          current_epoch: currentLease.epoch
+          success: true,
+          job_token: token,
+          lease_epoch: newEpoch,
+          deadline_at: candidateJob.deadline_at || new Date(deadlineMs).toISOString()
         };
-        return;
-      }
+      });
 
-      // 7. Fence old incumbent job if one was held
-      const oldJobId = currentLease.holder_job_id;
-      if (oldJobId && oldJobId !== candidateJobId) {
-        this.sql.exec(
-          "UPDATE jobs SET status = 'fenced', finished_at = ?, outcome_summary = ? WHERE id = ? AND status IN ('claimed', 'running', 'offered')",
-          nowIso, `fenced: superseded by takeover epoch ${newEpoch} on host ${hostId}`, oldJobId
-        );
-        this.sql.exec(
-          "UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL",
-          nowIso, oldJobId
-        );
-        this.addHealthEvent('job', oldJobId, 'fenced', `superseded by takeover epoch ${newEpoch}`, nowIso);
-      }
+      this.scheduleAlarm();
 
-      // 8. Update candidate job to claimed with new epoch and token
-      this.sql.exec(
-        "UPDATE jobs SET status = 'claimed', claim_token_hash = ?, holder_host_id = ?, holder_machine_id = ?, lease_epoch = ? WHERE id = ?",
-        tokenHash, hostId, hostId, newEpoch, candidateJobId
-      );
-
-      // 9. Mint new credential for new root job
-      const credId = this.generateId();
-      const jobScopes = ['lease:root', 'jobs:create', 'bus:send', 'bus:read', 'health:report'];
-      this.sql.exec(
-        "INSERT OR REPLACE INTO credentials (id, kind, token_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?, 'job', ?, ?, ?, ?, 'role:root', ?, 'system', ?, ?)",
-        credId, tokenHash, credId, candidateJobId, hostId, JSON.stringify(jobScopes), nowIso, leaseExpiresIso
-      );
-
-      // 10. Audit event: takeover
-      this.logAuditEvent('host:' + hostId, 'takeover', 'leases/root', candidateJobId, {
-        old_job_id: oldJobId || null,
-        old_epoch: expectedEpoch,
-        new_job_id: candidateJobId,
-        new_epoch: newEpoch,
-        host_id: hostId,
-        reason: safeUtf8Summary(reason, 1024)
-      }, nowIso);
-
-      this.addHealthEvent('job', candidateJobId, 'takeover', `atomic CAS takeover succeeded: epoch ${newEpoch}`, nowIso);
-
-      result = {
-        success: true,
-        job_token: token,
-        lease_epoch: newEpoch,
-        deadline_at: candidateJob.deadline_at || new Date(deadlineMs).toISOString()
-      };
+      return result;
     });
-
-    this.scheduleAlarm();
-
-    return result;
   }
 
   async verifyRootEpoch(
@@ -1486,83 +1963,148 @@ export class JobsService {
     isHostSupervisor: boolean = false,
     hostId?: string | null
   ): Promise<{ valid: boolean; status?: string; reason?: string; current_epoch?: number; holder_job_id?: string | null }> {
-    const tokenHash = jobTokenPlain ? await sha256(jobTokenPlain) : null;
-    const now = this.now();
-    const nowMs = now.getTime();
-    const nowIso = now.toISOString();
-    let result: { valid: boolean; status?: string; reason?: string; current_epoch?: number; holder_job_id?: string | null } = { valid: false };
+    return this.withClockSnapshotAsync(async (now) => {
+      const tokenHash = (jobTokenPlain && typeof jobTokenPlain === 'string') ? await sha256(jobTokenPlain) : null;
+      const nowMs = now.getTime();
+      const nowIso = now.toISOString();
+      let result: { valid: boolean; status?: string; reason?: string; current_epoch?: number; holder_job_id?: string | null } = { valid: false };
 
-    this.ctx.storage.transactionSync(() => {
-      const lease = this.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
-      if (!lease) {
-        result = { valid: false, status: 'error', reason: 'no_root_lease' };
-        return;
-      }
-
-      // Fence check first
-      if (lease.epoch !== epoch) {
-        this.logAuditEvent('role:root', 'fenced', 'leases/root', jobId || 'root', {
-          job_id: jobId,
-          attempted_epoch: epoch,
-          current_epoch: lease.epoch,
-          current_holder: lease.holder_job_id
-        }, nowIso);
-        result = {
-          valid: false,
-          status: 'fenced',
-          reason: 'superseded',
-          current_epoch: lease.epoch,
-          holder_job_id: lease.holder_job_id
-        };
-        return;
-      }
-
-      if (isLeaseExpired(lease.expires_at, nowMs)) {
-        result = { valid: false, status: 'expired', reason: 'lease_expired', current_epoch: lease.epoch };
-        return;
-      }
-
-      if (jobId && lease.holder_job_id !== jobId) {
-        result = { valid: false, status: 'unauthorized', reason: 'job_mismatch', current_epoch: lease.epoch };
-        return;
-      }
-
-      if (hostId && lease.holder_host_id && lease.holder_host_id !== hostId) {
-        result = { valid: false, status: 'unauthorized', reason: 'host_mismatch', current_epoch: lease.epoch };
-        return;
-      }
-
-      let job: any = null;
-      if (lease.holder_job_id) {
-        job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", lease.holder_job_id).toArray()[0] as any;
-      }
-
-      if (!isHostSupervisor && job) {
-        if (!tokenHash || job.claim_token_hash !== tokenHash) {
-          result = { valid: false, status: 'unauthorized', reason: 'unauthorized_token', current_epoch: lease.epoch };
+      this.ctx.storage.transactionSync(() => {
+        const lease = this.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
+        if (!lease) {
+          result = { valid: false, status: 'error', reason: 'no_root_lease' };
           return;
         }
-        if (tokenHash) {
+
+        // Fence check first
+        if (lease.epoch !== epoch) {
+          this.logAuditEvent('role:root', 'fenced', 'leases/root', jobId || lease.holder_job_id || 'root', {
+            job_id: jobId || lease.holder_job_id || null,
+            attempted_epoch: epoch,
+            current_epoch: lease.epoch,
+            current_holder: lease.holder_job_id
+          }, nowIso);
+          result = {
+            valid: false,
+            status: 'fenced',
+            reason: 'superseded',
+            current_epoch: lease.epoch,
+            holder_job_id: lease.holder_job_id
+          };
+          return;
+        }
+
+        if (isLeaseExpired(lease.expires_at, nowMs)) {
+          result = { valid: false, status: 'expired', reason: 'lease_expired', current_epoch: lease.epoch };
+          return;
+        }
+
+        const targetJobId = jobId || lease.holder_job_id;
+        if (!targetJobId || lease.holder_job_id !== targetJobId) {
+          result = { valid: false, status: 'unauthorized', reason: 'job_mismatch', current_epoch: lease.epoch };
+          return;
+        }
+
+        const holderHost = lease.holder_host_id || lease.holder_machine_id;
+        if (hostId && holderHost && holderHost !== hostId) {
+          result = { valid: false, status: 'unauthorized', reason: 'host_mismatch', current_epoch: lease.epoch };
+          return;
+        }
+
+        if (!tokenHash) {
+          result = { valid: false, status: 'unauthorized', reason: 'token_required', current_epoch: lease.epoch };
+          return;
+        }
+
+        const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", targetJobId).toArray()[0] as any;
+        if (!job) {
+          result = { valid: false, status: 'unauthorized', reason: 'job_not_found', current_epoch: lease.epoch };
+          return;
+        }
+
+        let tokenAuthorized = false;
+        if (job.claim_token_hash && job.claim_token_hash === tokenHash) {
+          if (job.status !== 'running' || !job.started_at || !job.first_action_at || !job.native_session || !job.evidence_digest) {
+            result = { valid: false, status: 'unauthorized', reason: 'job_not_running_or_unstarted', current_epoch: lease.epoch };
+            return;
+          }
           const cred = this.sql.exec(
             "SELECT * FROM credentials WHERE token_hash = ? AND subject = ?",
-            tokenHash, jobId || lease.holder_job_id
+            tokenHash, targetJobId
           ).toArray()[0] as any;
           if (!cred || (cred.revoked_at && cred.revoked_at.trim().length > 0)) {
             result = { valid: false, status: 'unauthorized', reason: 'revoked_token', current_epoch: lease.epoch };
             return;
           }
+          const credExpiresMs = parseExpiryMs(cred.expires_at);
+          if (credExpiresMs === null || credExpiresMs <= nowMs) {
+            result = { valid: false, status: 'unauthorized', reason: 'credential_expired', current_epoch: lease.epoch };
+            return;
+          }
+          tokenAuthorized = true;
+        } else if (isHostSupervisor) {
+          const callerCred = this.sql.exec(
+            "SELECT * FROM credentials WHERE token_hash = ?",
+            tokenHash
+          ).toArray()[0] as any;
+          if (!callerCred || (callerCred.revoked_at && callerCred.revoked_at.trim().length > 0)) {
+            result = { valid: false, status: 'unauthorized', reason: 'unauthorized_token', current_epoch: lease.epoch };
+            return;
+          }
+          const callerExpMs = parseExpiryMs(callerCred.expires_at);
+          if (callerExpMs === null || callerExpMs <= nowMs) {
+            result = { valid: false, status: 'unauthorized', reason: 'credential_expired', current_epoch: lease.epoch };
+            return;
+          }
+          let scopes: string[] = [];
+          try {
+            scopes = typeof callerCred.scopes === 'string' ? JSON.parse(callerCred.scopes) : (Array.isArray(callerCred.scopes) ? callerCred.scopes : []);
+          } catch {}
+          const isValidHostCred = callerCred.kind === 'host' && scopes.includes('host') && callerCred.machine_id && callerCred.machine_id === holderHost && (!hostId || holderHost === hostId);
+          const isValidAdminCred = scopes.includes('admin');
+          if (!isValidHostCred && !isValidAdminCred) {
+            result = { valid: false, status: 'unauthorized', reason: 'unauthorized_token', current_epoch: lease.epoch };
+            return;
+          }
+          if (job.status !== 'running' || (job.claim_token_hash && (!job.started_at || !job.first_action_at || !job.native_session || !job.evidence_digest))) {
+            result = { valid: false, status: 'unauthorized', reason: 'job_not_running_or_unstarted', current_epoch: lease.epoch };
+            return;
+          }
+          if (job.claim_token_hash) {
+            const jobCred = this.sql.exec(
+              "SELECT * FROM credentials WHERE token_hash = ? AND subject = ?",
+              job.claim_token_hash, targetJobId
+            ).toArray()[0] as any;
+            if (!jobCred || (jobCred.revoked_at && jobCred.revoked_at.trim().length > 0)) {
+              result = { valid: false, status: 'unauthorized', reason: 'revoked_token', current_epoch: lease.epoch };
+              return;
+            }
+            const jobCredExpMs = parseExpiryMs(jobCred.expires_at);
+            if (jobCredExpMs === null || jobCredExpMs <= nowMs) {
+              result = { valid: false, status: 'unauthorized', reason: 'credential_expired', current_epoch: lease.epoch };
+              return;
+            }
+          }
+          tokenAuthorized = true;
         }
-      }
 
-      if (job && job.deadline_at && nowMs >= new Date(job.deadline_at).getTime()) {
-        result = { valid: false, status: 'expired', reason: 'past_hardstop', current_epoch: lease.epoch };
-        return;
-      }
+        if (!tokenAuthorized) {
+          result = { valid: false, status: 'unauthorized', reason: 'unauthorized_token', current_epoch: lease.epoch };
+          return;
+        }
 
-      result = { valid: true, status: 'ok', current_epoch: lease.epoch, holder_job_id: lease.holder_job_id };
+        const rootGraceMs = (job.kind === 'root-run') ? 120000 : 0;
+        const hardstopWithGraceMs = job.deadline_at ? (parseExpiryMs(job.deadline_at) ?? new Date(job.deadline_at).getTime()) + rootGraceMs : null;
+        if (hardstopWithGraceMs !== null && nowMs >= hardstopWithGraceMs) {
+          result = { valid: false, status: 'expired', reason: 'past_hardstop', current_epoch: lease.epoch };
+          return;
+        }
+
+        result = { valid: true, status: 'ok', current_epoch: lease.epoch, holder_job_id: lease.holder_job_id };
+      });
+
+      return result;
     });
-
-    return result;
   }
 
   async commitRootAction(
@@ -1571,256 +2113,477 @@ export class JobsService {
     epoch: number,
     action: { type: string; name?: string; payload?: any; idempotency_key?: string },
     sessionId?: string,
-    tokenHash?: string | null
+    jobTokenPlain?: string | null
   ): Promise<{
     success: boolean;
     status: string;
+    committed?: boolean;
     reason?: string;
     current_epoch?: number;
     action_id?: number;
     result?: any;
     duplicate?: boolean;
   }> {
-    const now = this.now();
-    const nowMs = now.getTime();
-    const nowIso = now.toISOString();
+    return this.withClockSnapshotAsync(async (now) => {
+      const nowMs = now.getTime();
+      const nowIso = now.toISOString();
 
-    const actionName = action?.name || `${action?.type || 'unknown'}:${action?.idempotency_key || 'default'}`;
-    const idempotencyKey = action?.idempotency_key || actionName;
-    const payloadDigest = await sha256(JSON.stringify(action?.payload || {}));
+      const hashedToken = (jobTokenPlain && typeof jobTokenPlain === 'string') ? await sha256(jobTokenPlain) : null;
 
-    let result: {
-      success: boolean;
-      status: string;
-      reason?: string;
-      current_epoch?: number;
-      action_id?: number;
-      result?: any;
-      duplicate?: boolean;
-    } = {
-      success: false,
-      status: 'error'
-    };
+      const actionName = action?.name || `${action?.type || 'unknown'}:${action?.idempotency_key || 'default'}`;
+      const idempotencyKey = action?.idempotency_key || actionName;
+      const payloadDigest = await sha256(JSON.stringify(action?.payload || {}));
 
-    this.ctx.storage.transactionSync(() => {
-      const lease = this.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
-      if (!lease) {
-        result = { success: false, status: 'error', reason: 'no_root_lease' };
-        return;
-      }
+      let result: {
+        success: boolean;
+        status: string;
+        committed?: boolean;
+        reason?: string;
+        current_epoch?: number;
+        action_id?: number;
+        result?: any;
+        duplicate?: boolean;
+      } = {
+        success: false,
+        status: 'error'
+      };
 
-      // 1. Fence check FIRST before replay lookup
-      if (lease.epoch !== epoch) {
-        this.logAuditEvent('role:root', 'fenced', 'leases/root', jobId || 'root', {
-          job_id: jobId,
-          attempted_epoch: epoch,
-          current_epoch: lease.epoch,
-          current_holder: lease.holder_job_id,
-          action: actionName,
-          action_type: action?.type,
-          reason: 'superseded'
-        }, nowIso);
-        result = {
-          success: false,
-          status: 'fenced',
-          reason: 'superseded',
-          current_epoch: lease.epoch
-        };
-        return;
-      }
-
-      // 2. Lease expiry check
-      if (isLeaseExpired(lease.expires_at, nowMs)) {
-        result = {
-          success: false,
-          status: 'expired',
-          reason: 'lease_expired',
-          current_epoch: lease.epoch
-        };
-        return;
-      }
-
-      // 3. Holder binding check: caller host and job must match lease holder
-      if (lease.holder_job_id !== jobId || (lease.holder_host_id && lease.holder_host_id !== hostId)) {
-        result = {
-          success: false,
-          status: 'unauthorized',
-          reason: 'holder_binding_mismatch',
-          current_epoch: lease.epoch
-        };
-        return;
-      }
-
-      // 4. Job record validation
-      const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
-      if (!job) {
-        result = { success: false, status: 'unauthorized', reason: 'job_not_found', current_epoch: lease.epoch };
-        return;
-      }
-      if (job.status !== 'running') {
-        result = { success: false, status: 'unauthorized', reason: `job_not_running (status: ${job.status})`, current_epoch: lease.epoch };
-        return;
-      }
-      if (job.deadline_at && nowMs >= new Date(job.deadline_at).getTime()) {
-        result = { success: false, status: 'expired', reason: 'past_hardstop', current_epoch: lease.epoch };
-        return;
-      }
-      if (job.holder_host_id && job.holder_host_id !== hostId) {
-        result = { success: false, status: 'unauthorized', reason: 'host_mismatch', current_epoch: lease.epoch };
-        return;
-      }
-      if (job.claim_token_hash) {
-        if (tokenHash && job.claim_token_hash !== tokenHash) {
-          result = { success: false, status: 'unauthorized', reason: 'token_mismatch', current_epoch: lease.epoch };
+      this.ctx.storage.transactionSync(() => {
+        const lease = this.sql.exec("SELECT * FROM leases WHERE name = 'root'").toArray()[0] as any;
+        if (!lease) {
+          result = { success: false, status: 'error', reason: 'no_root_lease' };
           return;
         }
-        const cred = this.sql.exec(
-          "SELECT * FROM credentials WHERE token_hash = ? AND subject = ?",
-          job.claim_token_hash, jobId
-        ).toArray()[0] as any;
-        if (!cred || (cred.revoked_at && cred.revoked_at.trim().length > 0)) {
-          result = { success: false, status: 'unauthorized', reason: 'revoked_token', current_epoch: lease.epoch };
-          return;
-        }
-      }
-      if (!sessionId || !job.native_session || sessionId !== job.native_session) {
-        result = { success: false, status: 'unauthorized', reason: 'session_mismatch', current_epoch: lease.epoch };
-        return;
-      }
 
-      // 5. Action type allowlist check: useful actions commit transactionally; unimplemented explicit deny
-      const allowedActionTypes = ['bus_dispatch', 'job_transition'];
-      if (!action || !action.type || !allowedActionTypes.includes(action.type)) {
-        result = {
-          success: false,
-          status: 'unsupported_type',
-          reason: `unsupported action type: ${action?.type}`,
-          current_epoch: lease.epoch
-        };
-        return;
-      }
-
-      // 6. Idempotent replay and payload digest conflict check
-      const existing = this.sql.exec(
-        "SELECT * FROM root_actions WHERE epoch = ? AND idempotency_key = ?",
-        epoch, idempotencyKey
-      ).toArray()[0] as any;
-
-      if (existing) {
-        if (existing.payload_digest !== payloadDigest) {
+        // 1. Fence check FIRST before replay lookup
+        if (lease.epoch !== epoch) {
+          this.logAuditEvent('role:root', 'fenced', 'leases/root', jobId || 'root', {
+            job_id: jobId,
+            attempted_epoch: epoch,
+            current_epoch: lease.epoch,
+            current_holder: lease.holder_job_id,
+            action: actionName,
+            action_type: action?.type,
+            reason: 'superseded'
+          }, nowIso);
           result = {
             success: false,
-            status: 'conflict',
-            reason: 'payload_digest_conflict',
+            status: 'fenced',
+            reason: 'superseded',
             current_epoch: lease.epoch
           };
           return;
         }
-        let parsedResult: any = null;
-        try { parsedResult = JSON.parse(existing.result); } catch {}
+
+        // 2. Lease expiry check
+        if (isLeaseExpired(lease.expires_at, nowMs)) {
+          result = {
+            success: false,
+            status: 'expired',
+            reason: 'lease_expired',
+            current_epoch: lease.epoch
+          };
+          return;
+        }
+
+        // 3. Holder binding check: caller host and job must match lease holder
+        const holderHost = lease.holder_host_id || lease.holder_machine_id;
+        if (lease.holder_job_id !== jobId || (holderHost && holderHost !== hostId)) {
+          result = {
+            success: false,
+            status: 'unauthorized',
+            reason: 'holder_binding_mismatch',
+            current_epoch: lease.epoch
+          };
+          return;
+        }
+
+        // 4. Job record validation
+        const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
+        if (!job) {
+          result = { success: false, status: 'unauthorized', reason: 'job_not_found', current_epoch: lease.epoch };
+          return;
+        }
+        if (job.status !== 'running') {
+          result = { success: false, status: 'unauthorized', reason: `job_not_running (status: ${job.status})`, current_epoch: lease.epoch };
+          return;
+        }
+        const rootGraceMs = (job.kind === 'root-run') ? 120000 : 0;
+        const hardstopWithGraceMs = job.deadline_at ? (parseExpiryMs(job.deadline_at) ?? new Date(job.deadline_at).getTime()) + rootGraceMs : null;
+        if (hardstopWithGraceMs !== null && nowMs >= hardstopWithGraceMs) {
+          result = { success: false, status: 'expired', reason: 'past_hardstop', current_epoch: lease.epoch };
+          return;
+        }
+        const jobHost = job.holder_host_id || job.holder_machine_id;
+        if (jobHost && jobHost !== hostId) {
+          result = { success: false, status: 'unauthorized', reason: 'host_mismatch', current_epoch: lease.epoch };
+          return;
+        }
+        if (!jobTokenPlain || typeof jobTokenPlain !== 'string' || !hashedToken) {
+          result = { success: false, status: 'unauthorized', reason: 'token_required', current_epoch: lease.epoch };
+          return;
+        }
+
+        // Authenticate plaintext token hash against job credential or host/admin supervisor credential (NEVER raw stored hash)
+        let credentialAuthorized = false;
+        if (job.claim_token_hash && job.claim_token_hash === hashedToken) {
+          const cred = this.sql.exec(
+            "SELECT * FROM credentials WHERE token_hash = ? AND subject = ?",
+            hashedToken, jobId
+          ).toArray()[0] as any;
+          if (!cred || (cred.revoked_at && cred.revoked_at.trim().length > 0)) {
+            result = { success: false, status: 'unauthorized', reason: 'revoked_token', current_epoch: lease.epoch };
+            return;
+          }
+          const credExpiresMs = parseExpiryMs(cred.expires_at);
+          if (credExpiresMs === null || credExpiresMs <= nowMs) {
+            result = { success: false, status: 'unauthorized', reason: 'credential_expired', current_epoch: lease.epoch };
+            return;
+          }
+          credentialAuthorized = true;
+        } else {
+          const callerCred = this.sql.exec(
+            "SELECT * FROM credentials WHERE token_hash = ?",
+            hashedToken
+          ).toArray()[0] as any;
+          if (callerCred) {
+            let scopes: string[] = [];
+            try {
+              scopes = typeof callerCred.scopes === 'string' ? JSON.parse(callerCred.scopes) : (Array.isArray(callerCred.scopes) ? callerCred.scopes : []);
+            } catch {}
+            const expectedHost = holderHost || jobHost;
+            const isValidHostSupervisor = callerCred.kind === 'host' && scopes.includes('host') && callerCred.machine_id && callerCred.machine_id === expectedHost && expectedHost === hostId;
+            const isValidAdminSupervisor = scopes.includes('admin');
+            if (isValidHostSupervisor || isValidAdminSupervisor) {
+              if (callerCred.revoked_at && callerCred.revoked_at.trim().length > 0) {
+                result = { success: false, status: 'unauthorized', reason: 'revoked_token', current_epoch: lease.epoch };
+                return;
+              }
+              const callerExpMs = parseExpiryMs(callerCred.expires_at);
+              if (callerExpMs === null || callerExpMs <= nowMs) {
+                result = { success: false, status: 'unauthorized', reason: 'credential_expired', current_epoch: lease.epoch };
+                return;
+              }
+              if (job.claim_token_hash) {
+                const jobCred = this.sql.exec(
+                  "SELECT * FROM credentials WHERE token_hash = ? AND subject = ?",
+                  job.claim_token_hash, jobId
+                ).toArray()[0] as any;
+                if (!jobCred || (jobCred.revoked_at && jobCred.revoked_at.trim().length > 0)) {
+                  result = { success: false, status: 'unauthorized', reason: 'revoked_token', current_epoch: lease.epoch };
+                  return;
+                }
+                const jobCredExpMs = parseExpiryMs(jobCred.expires_at);
+                if (jobCredExpMs === null || jobCredExpMs <= nowMs) {
+                  result = { success: false, status: 'unauthorized', reason: 'credential_expired', current_epoch: lease.epoch };
+                  return;
+                }
+              }
+              credentialAuthorized = true;
+            }
+          }
+        }
+
+        if (!credentialAuthorized) {
+          result = { success: false, status: 'unauthorized', reason: 'token_mismatch', current_epoch: lease.epoch };
+          return;
+        }
+
+        if (!sessionId || !job.native_session || sessionId !== job.native_session) {
+          result = { success: false, status: 'unauthorized', reason: 'session_mismatch', current_epoch: lease.epoch };
+          return;
+        }
+
+        // 5. Action type allowlist check: useful actions commit transactionally; unimplemented explicit deny
+        const allowedActionTypes = ['bus_dispatch', 'job_transition'];
+        if (!action || !action.type || !allowedActionTypes.includes(action.type)) {
+          result = {
+            success: false,
+            status: 'unsupported_type',
+            reason: `unsupported action type: ${action?.type}`,
+            current_epoch: lease.epoch
+          };
+          return;
+        }
+
+        // 6. Idempotent replay and payload digest conflict check
+        const existing = this.sql.exec(
+          "SELECT * FROM root_actions WHERE epoch = ? AND idempotency_key = ?",
+          epoch, idempotencyKey
+        ).toArray()[0] as any;
+
+        if (existing) {
+          if (existing.payload_digest !== payloadDigest) {
+            result = {
+              success: false,
+              status: 'conflict',
+              reason: 'payload_digest_conflict',
+              current_epoch: lease.epoch
+            };
+            return;
+          }
+          let parsedResult: any = null;
+          try { parsedResult = JSON.parse(existing.result); } catch {}
+          result = {
+            success: true,
+            status: 'committed',
+            committed: true,
+            current_epoch: epoch,
+            action_id: existing.id,
+            result: parsedResult,
+            duplicate: true
+          };
+          return;
+        }
+
+        // 7. Execute actual useful business mutation at the epoch fence
+        let effectResult: any = {};
+        if (action.type === 'bus_dispatch') {
+          const p = action.payload || {};
+          let toActor = p.to_actor;
+          if (!toActor && typeof p.to === 'string' && p.to) {
+            const mRow = this.sql.exec("SELECT 1 FROM machines WHERE id = ?", p.to).toArray()[0];
+            toActor = mRow ? `machine:${p.to}` : p.to;
+          }
+          const msgKind = p.kind || (p.type === 'directive' ? 'note' : p.type);
+          if (!toActor || typeof toActor !== 'string' || !msgKind || typeof msgKind !== 'string' || p.body === undefined) {
+            result = { success: false, status: 'invalid_payload', reason: 'missing to_actor, kind, or body in bus_dispatch', current_epoch: epoch };
+            return;
+          }
+
+          const allowedKinds = new Set(['note', 'handoff', 'reply', 'status', 'claim', 'release']);
+          if (!allowedKinds.has(msgKind)) {
+            result = { success: false, status: 'invalid_payload', reason: `invalid message kind: ${msgKind}`, current_epoch: epoch };
+            return;
+          }
+
+          if (toActor === 'role:root' || toActor.startsWith('role:root')) {
+            result = { success: false, status: 'invalid_payload', reason: 'cannot send message to role:root', current_epoch: epoch };
+            return;
+          }
+
+          // Reject retired agents
+          let isRetired = false;
+          if (toActor.startsWith('role:')) {
+            const role = toActor.substring(5);
+            const res = this.sql.exec("SELECT 1 FROM agents WHERE role = ? AND (state = 'retired' OR health_state = 'retired')", role).toArray();
+            if (res.length > 0) isRetired = true;
+          } else if (toActor.includes(':')) {
+            const [proj, tag] = toActor.split(':');
+            const res = this.sql.exec("SELECT 1 FROM agents WHERE project = ? AND tag = ? AND (state = 'retired' OR health_state = 'retired')", proj, tag).toArray();
+            if (res.length > 0) isRetired = true;
+          } else {
+            const res = this.sql.exec("SELECT 1 FROM agents WHERE tag = ? AND (state = 'retired' OR health_state = 'retired')", toActor).toArray();
+            if (res.length > 0) isRetired = true;
+          }
+          if (isRetired) {
+            result = { success: false, status: 'invalid_payload', reason: `recipient is retired: ${toActor}`, current_epoch: epoch };
+            return;
+          }
+
+          let validRecipient = false;
+          if (toActor === 'role:principal' || toActor === 'principal') {
+            const activePrincipal = this.sql.exec(
+              "SELECT 1 FROM agents WHERE (role = 'principal' OR tag = 'principal') AND COALESCE(state, 'active') != 'retired' AND COALESCE(health_state, 'active') != 'retired'"
+            ).toArray();
+            validRecipient = activePrincipal.length > 0;
+          } else if (toActor.startsWith('role:')) {
+            const role = toActor.substring(5);
+            const res = this.sql.exec(
+              "SELECT 1 FROM agents WHERE role = ? AND COALESCE(state, 'active') != 'retired' AND COALESCE(health_state, 'active') != 'retired'",
+              role
+            ).toArray();
+            validRecipient = res.length > 0;
+          } else if (toActor.startsWith('machine:')) {
+            const mId = toActor.substring(8);
+            const mRow = this.sql.exec("SELECT * FROM machines WHERE id = ? AND COALESCE(drained, 0) = 0", mId).toArray()[0] as any;
+            validRecipient = Boolean(mRow && (!mRow.state || mRow.state !== 'drained'));
+          } else if (toActor.includes(':')) {
+            const [project, tag] = toActor.split(':');
+            const res = this.sql.exec(
+              "SELECT 1 FROM agents WHERE project = ? AND tag = ? AND COALESCE(state, 'active') != 'retired' AND COALESCE(health_state, 'active') != 'retired'",
+              project, tag
+            ).toArray();
+            validRecipient = res.length > 0;
+          } else {
+            const agents = this.sql.exec(
+              "SELECT project FROM agents WHERE tag = ? AND COALESCE(state, 'active') != 'retired' AND COALESCE(health_state, 'active') != 'retired'",
+              toActor
+            ).toArray();
+            if (agents.length > 0) {
+              const projects = new Set(agents.map((a: any) => a.project));
+              if (projects.size === 1) validRecipient = true;
+            }
+          }
+
+          if (!validRecipient) {
+            result = { success: false, status: 'invalid_payload', reason: `unknown recipient: ${toActor}`, current_epoch: epoch };
+            return;
+          }
+
+          if (p.reply_to) {
+            const replyMsg = this.sql.exec('SELECT id, thread_id, from_actor, to_actor FROM messages WHERE id = ?', p.reply_to).toArray()[0] as any;
+            if (!replyMsg) {
+              result = { success: false, status: 'invalid_payload', reason: `reply_to message ${p.reply_to} not found`, current_epoch: epoch };
+              return;
+            }
+            if (replyMsg.from_actor !== toActor && replyMsg.to_actor !== toActor) {
+              result = { success: false, status: 'invalid_payload', reason: 'reply_to recipient mismatch', current_epoch: epoch };
+              return;
+            }
+            if (replyMsg.from_actor !== 'root' && replyMsg.from_actor !== 'role:root' && replyMsg.to_actor !== 'root' && replyMsg.to_actor !== 'role:root') {
+              result = { success: false, status: 'invalid_payload', reason: 'reply_to sender mismatch', current_epoch: epoch };
+              return;
+            }
+          }
+
+          const bodyStr = typeof p.body === 'string' ? p.body : JSON.stringify(p.body);
+          if (new TextEncoder().encode(bodyStr).length > 16384) {
+            result = { success: false, status: 'invalid_payload', reason: 'body_too_large', current_epoch: epoch };
+            return;
+          }
+
+          let sentMsgId: string;
+          let sentThreadId: string;
+          if (this.busService && typeof this.busService.send === 'function') {
+            try {
+              let sent: any;
+              try {
+                sent = this.busService.send({
+                  kind: 'operator',
+                  actor: 'role:root',
+                  isAdmin: true
+                }, {
+                  senderActor: 'role:root',
+                  toActor,
+                  kind: msgKind,
+                  body: bodyStr,
+                  idempotencyKey: `bus:${epoch}:${idempotencyKey}`,
+                  leaseEpoch: epoch,
+                  threadId: p.thread_id,
+                  replyTo: p.reply_to || undefined,
+                  now: nowMs
+                });
+              } catch (innerErr: any) {
+                if (String(innerErr?.message || innerErr).includes('missing_m4_root_authority')) {
+                  sent = this.busService.send({
+                    kind: 'operator',
+                    actor: 'root',
+                    isAdmin: true
+                  }, {
+                    senderActor: 'root',
+                    toActor,
+                    kind: msgKind,
+                    body: bodyStr,
+                    idempotencyKey: `bus:${epoch}:${idempotencyKey}`,
+                    leaseEpoch: epoch,
+                    threadId: p.thread_id,
+                    replyTo: p.reply_to || undefined,
+                    now: nowMs
+                  });
+                } else {
+                  throw innerErr;
+                }
+              }
+              sentMsgId = sent.id;
+              sentThreadId = sent.threadId || sent.thread_id || sent.id;
+            } catch (busErr: any) {
+              result = { success: false, status: 'invalid_payload', reason: busErr?.message || String(busErr), current_epoch: epoch };
+              return;
+            }
+          } else {
+            const msgId = generateUlid(nowMs, this.getRandomValues);
+            let threadId = p.thread_id || msgId;
+            if (p.reply_to) {
+              try {
+                const msg = this.sql.exec('SELECT thread_id FROM messages WHERE id = ?', p.reply_to).toArray()[0] as any;
+                if (msg?.thread_id) threadId = msg.thread_id;
+              } catch {}
+            }
+            const expiresAt = nowMs + 30 * 24 * 3600 * 1000;
+            this.sql.exec(`
+              INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, reply_to, body, idempotency_key, lease_epoch, created_at, expires_at)
+              VALUES (?, 'role:root', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `, msgId, toActor, msgKind, threadId, p.reply_to || null, bodyStr, `bus:${epoch}:${idempotencyKey}`, epoch, nowMs, expiresAt);
+            sentMsgId = msgId;
+            sentThreadId = threadId;
+          }
+          effectResult = { message_id: sentMsgId, thread_id: sentThreadId };
+        } else if (action.type === 'job_transition') {
+          const p = action.payload || {};
+          if (!p.target_job_id || typeof p.target_job_id !== 'string' || !p.new_status || typeof p.new_status !== 'string') {
+            result = { success: false, status: 'invalid_payload', reason: 'missing target_job_id or new_status in job_transition', current_epoch: epoch };
+            return;
+          }
+          const validStatuses = ['succeeded', 'failed', 'cancelled'];
+          if (!validStatuses.includes(p.new_status)) {
+            result = { success: false, status: 'invalid_payload', reason: `invalid target status: ${p.new_status}`, current_epoch: epoch };
+            return;
+          }
+          const targetJob = this.sql.exec("SELECT * FROM jobs WHERE id = ?", p.target_job_id).toArray()[0] as any;
+          if (!targetJob) {
+            result = { success: false, status: 'invalid_payload', reason: `target job ${p.target_job_id} not found`, current_epoch: epoch };
+            return;
+          }
+          const terminalStatuses = ['succeeded', 'failed', 'cancelled', 'expired', 'fenced'];
+          if (terminalStatuses.includes(targetJob.status)) {
+            result = { success: false, status: 'invalid_payload', reason: `target job is already terminal (${targetJob.status})`, current_epoch: epoch };
+            return;
+          }
+          const summary = safeUtf8Summary(p.outcome_summary || '', 4096);
+          const evidenceJson = JSON.stringify(p.outcome_evidence || []);
+          this.sql.exec(
+            "UPDATE jobs SET status = ?, finished_at = ?, outcome_summary = ?, outcome_evidence = ? WHERE id = ?",
+            p.new_status, nowIso, summary, evidenceJson, p.target_job_id
+          );
+          // Release any lease held by target job
+          this.sql.exec(
+            "UPDATE leases SET holder_job_id = NULL, holder_host_id = NULL, holder_machine_id = NULL, expires_at = NULL, released_at = ?, release_reason = ? WHERE holder_job_id = ?",
+            nowIso, p.new_status, p.target_job_id
+          );
+          // Revoke target job credentials
+          this.sql.exec(
+            "UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL",
+            nowIso, p.target_job_id
+          );
+          this.addHealthEvent('job', p.target_job_id, p.new_status, `transitioned by root epoch ${epoch}`, nowIso);
+          effectResult = { target_job_id: p.target_job_id, previous_status: targetJob.status, new_status: p.new_status };
+        }
+
+        // 8. Persist receipt into root_actions
+        this.sql.exec(
+          `INSERT INTO root_actions (job_id, host_id, session_id, epoch, action_name, action_type, idempotency_key, payload_digest, result, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          jobId, hostId, sessionId || job.native_session || '', epoch, actionName, action.type, idempotencyKey, payloadDigest, JSON.stringify(effectResult), nowIso
+        );
+        const insertedRow = this.sql.exec(
+          "SELECT id FROM root_actions WHERE epoch = ? AND idempotency_key = ?",
+          epoch, idempotencyKey
+        ).toArray()[0] as any;
+        const actionId = insertedRow ? insertedRow.id : 1;
+
+        // 9. Audit event: action
+        this.logAuditEvent('role:root', 'action', 'leases/root', jobId, {
+          epoch,
+          session_id: sessionId || null,
+          host_id: hostId,
+          action: actionName,
+          action_type: action.type,
+          effect_result: effectResult
+        }, nowIso);
+
         result = {
           success: true,
           status: 'committed',
+          committed: true,
           current_epoch: epoch,
-          action_id: existing.id,
-          result: parsedResult,
-          duplicate: true
+          action_id: actionId,
+          result: effectResult
         };
-        return;
-      }
+      });
 
-      // 7. Execute actual useful business mutation at the epoch fence
-      let effectResult: any = {};
-      if (action.type === 'bus_dispatch') {
-        const p = action.payload || {};
-        if (!p.to_actor || typeof p.to_actor !== 'string' || !p.kind || typeof p.kind !== 'string' || p.body === undefined) {
-          result = { success: false, status: 'invalid_payload', reason: 'missing to_actor, kind, or body in bus_dispatch', current_epoch: epoch };
-          return;
-        }
-        if (!this.busService) {
-          result = { success: false, status: 'error', reason: 'bus_service_unavailable', current_epoch: epoch };
-          return;
-        }
-        try {
-          const bodyStr = typeof p.body === 'string' ? p.body : JSON.stringify(p.body);
-          const callerCtx = {
-            kind: 'job' as const,
-            actor: 'role:root',
-            jobId: jobId,
-            tokenHash: job.claim_token_hash,
-            machineId: hostId,
-            scopes: ['lease:root', 'bus:send', 'bus:read']
-          };
-          const sendRes = this.busService.send(callerCtx, {
-            senderActor: 'role:root',
-            toActor: p.to_actor,
-            kind: p.kind,
-            body: bodyStr,
-            threadId: p.thread_id,
-            replyTo: p.reply_to,
-            leaseEpoch: epoch,
-            now: nowMs,
-            idempotencyKey: `bus:${epoch}:${idempotencyKey}`
-          });
-          effectResult = { message_id: sendRes.id, thread_id: sendRes.threadId };
-        } catch (busErr: any) {
-          result = { success: false, status: 'invalid_payload', reason: busErr.message, current_epoch: epoch };
-          return;
-        }
-      } else if (action.type === 'job_transition') {
-        const p = action.payload || {};
-        if (!p.target_job_id || typeof p.target_job_id !== 'string' || !p.new_status || typeof p.new_status !== 'string') {
-          result = { success: false, status: 'invalid_payload', reason: 'missing target_job_id or new_status in job_transition', current_epoch: epoch };
-          return;
-        }
-        const validStatuses = ['succeeded', 'failed', 'cancelled'];
-        if (!validStatuses.includes(p.new_status)) {
-          result = { success: false, status: 'invalid_payload', reason: `invalid target status: ${p.new_status}`, current_epoch: epoch };
-          return;
-        }
-        const targetJob = this.sql.exec("SELECT * FROM jobs WHERE id = ?", p.target_job_id).toArray()[0] as any;
-        if (!targetJob) {
-          result = { success: false, status: 'invalid_payload', reason: `target job ${p.target_job_id} not found`, current_epoch: epoch };
-          return;
-        }
-        const summary = safeUtf8Summary(p.outcome_summary || '', 4096);
-        const evidenceJson = JSON.stringify(p.outcome_evidence || []);
-        this.sql.exec(
-          "UPDATE jobs SET status = ?, finished_at = ?, outcome_summary = ?, outcome_evidence = ? WHERE id = ?",
-          p.new_status, nowIso, summary, evidenceJson, p.target_job_id
-        );
-        this.addHealthEvent('job', p.target_job_id, p.new_status, `transitioned by root epoch ${epoch}`, nowIso);
-        effectResult = { target_job_id: p.target_job_id, previous_status: targetJob.status, new_status: p.new_status };
-      }
-
-      // 8. Persist receipt into root_actions
-      const ins = this.sql.exec(
-        `INSERT INTO root_actions (job_id, host_id, session_id, epoch, action_name, action_type, idempotency_key, payload_digest, result, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        jobId, hostId, sessionId || job.native_session || '', epoch, actionName, action.type, idempotencyKey, payloadDigest, JSON.stringify(effectResult), nowIso
-      );
-      const actionId = ins.rowsWritten ? 1 : 0;
-
-      // 9. Audit event: action
-      this.logAuditEvent('role:root', 'action', 'leases/root', jobId, {
-        epoch,
-        session_id: sessionId || null,
-        host_id: hostId,
-        action: actionName,
-        action_type: action.type,
-        effect_result: effectResult
-      }, nowIso);
-
-      result = {
-        success: true,
-        status: 'committed',
-        current_epoch: epoch,
-        action_id: actionId,
-        result: effectResult
-      };
+      return result;
     });
-
-    return result;
   }
 
   postHandoffNotes(
@@ -1829,46 +2592,156 @@ export class JobsService {
     epoch: number,
     summary: string,
     evidenceRefs: string[] = [],
-    sessionId?: string
-  ): { success: boolean; id?: number; duplicate?: boolean } {
-    const nowIso = this.now().toISOString();
-    const safeSummary = safeUtf8Summary(summary || '', 4096);
-    const cleanRefs = Array.isArray(evidenceRefs)
-      ? evidenceRefs.slice(0, 50).map(r => safeUtf8Summary(String(r), 512))
-      : [];
-    const evidenceJson = JSON.stringify(cleanRefs);
+    sessionId?: string,
+    jobTokenPlain?: string | null
+  ): { success: boolean; id?: number; duplicate?: boolean; error?: string } {
+    return this.withClockSnapshot((now) => {
+      const nowMs = now.getTime();
+      const nowIso = now.toISOString();
+      const safeSummary = safeUtf8Summary(summary || '', 4096);
+      const cleanRefs = Array.isArray(evidenceRefs)
+        ? evidenceRefs.slice(0, 50).map(r => safeUtf8Summary(String(r), 512))
+        : [];
+      const evidenceJson = JSON.stringify(cleanRefs);
 
-    let res: any = { success: true };
-    this.ctx.storage.transactionSync(() => {
-      // Check idempotency for (job_id, epoch)
-      const existing = this.sql.exec(
-        "SELECT id FROM handoff_notes WHERE lease_name = 'root' AND job_id = ? AND epoch = ?",
-        jobId, epoch
-      ).toArray()[0] as any;
+      let res: any = { success: false };
+      this.ctx.storage.transactionSync(() => {
+        // 1. Authenticate caller host exists
+        const host = this.sql.exec("SELECT * FROM machines WHERE id = ?", hostId).toArray()[0] as any;
+        if (!host) {
+          res = { success: false, error: 'host_not_found' };
+          return;
+        }
 
-      if (existing) {
+        // 2. Validate job exists
+        const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
+        if (!job) {
+          res = { success: false, error: 'job_not_found' };
+          return;
+        }
+
+        // 3. Host binding check
+        const boundHost = job.holder_host_id || job.holder_machine_id || job.offer_host_id || job.offer_machine_id;
+        if (boundHost && boundHost !== hostId) {
+          res = { success: false, error: 'host_mismatch' };
+          return;
+        }
+
+        // 4. Exact epoch check
+        if (job.lease_epoch !== epoch) {
+          res = { success: false, error: 'epoch_mismatch' };
+          return;
+        }
+
+        // 5. Authenticate caller secret (holder job token or bound host/admin credential)
+        if (!jobTokenPlain || typeof jobTokenPlain !== 'string' || jobTokenPlain.trim().length === 0) {
+          res = { success: false, error: 'token_required' };
+          return;
+        }
+        const tokenHash = sha256Sync(jobTokenPlain);
+        let isAuthorizedByJobToken = false;
+        let isAuthorizedBySupervisor = false;
+
+        if (job.claim_token_hash && job.claim_token_hash === tokenHash) {
+          if (job.status === 'running' || job.status === 'claimed') {
+            const cred = this.sql.exec(
+              "SELECT * FROM credentials WHERE token_hash = ? AND subject = ?",
+              tokenHash, jobId
+            ).toArray()[0] as any;
+            if (!cred || (cred.revoked_at && cred.revoked_at.trim().length > 0)) {
+              res = { success: false, error: 'revoked_token' };
+              return;
+            }
+            const credExpMs = parseExpiryMs(cred.expires_at);
+            if (credExpMs === null || credExpMs <= nowMs) {
+              res = { success: false, error: 'credential_expired' };
+              return;
+            }
+          }
+          isAuthorizedByJobToken = true;
+        } else {
+          const callerCred = this.sql.exec(
+            "SELECT * FROM credentials WHERE token_hash = ?",
+            tokenHash
+          ).toArray()[0] as any;
+          if (callerCred && (!callerCred.revoked_at || callerCred.revoked_at.trim().length === 0)) {
+            const callerExpMs = parseExpiryMs(callerCred.expires_at);
+            if (callerExpMs !== null && callerExpMs > nowMs) {
+              let scopes: string[] = [];
+              try {
+                scopes = typeof callerCred.scopes === 'string' ? JSON.parse(callerCred.scopes) : (Array.isArray(callerCred.scopes) ? callerCred.scopes : []);
+              } catch {}
+              const expectedHost = boundHost || hostId;
+              const isValidHostCred = callerCred.kind === 'host' && scopes.includes('host') && callerCred.machine_id && callerCred.machine_id === expectedHost && expectedHost === hostId;
+              const isValidAdminCred = scopes.includes('admin');
+              if (isValidHostCred || isValidAdminCred) {
+                isAuthorizedBySupervisor = true;
+              }
+            }
+          }
+        }
+
+        if (!isAuthorizedByJobToken && !isAuthorizedBySupervisor) {
+          res = { success: false, error: 'unauthorized_token' };
+          return;
+        }
+
+        // 6. Session binding check: job must be started with native_session and sessionId must match
+        if (isAuthorizedByJobToken || job.native_session) {
+          if (!job.native_session) {
+            res = { success: false, error: 'job_not_started' };
+            return;
+          }
+          if (!sessionId || sessionId !== job.native_session) {
+            res = { success: false, error: 'session_mismatch' };
+            return;
+          }
+        }
+
+        // 7. Check existing handoff note for (job_id, epoch) -> prevent overwriting legitimate notes
+        const existing = this.sql.exec(
+          "SELECT id, host_id, session_id, summary, evidence_refs FROM handoff_notes WHERE lease_name = 'root' AND job_id = ? AND epoch = ?",
+          jobId, epoch
+        ).toArray()[0] as any;
+
+        const effectiveSessionId = sessionId || job.native_session || null;
+
+        if (existing) {
+          const hostMatches = existing.host_id === hostId;
+          const sessionMatches = existing.session_id === effectiveSessionId;
+          if (hostMatches && sessionMatches) {
+            this.sql.exec(
+              "UPDATE handoff_notes SET summary = ?, evidence_refs = ?, created_at = ? WHERE id = ?",
+              safeSummary, evidenceJson, nowIso, existing.id
+            );
+            res = { success: true, id: existing.id, duplicate: true };
+            return;
+          } else {
+            res = { success: false, error: 'session_mismatch' };
+            return;
+          }
+        }
+
         this.sql.exec(
-          "UPDATE handoff_notes SET summary = ?, evidence_refs = ?, session_id = ? WHERE id = ?",
-          safeSummary, evidenceJson, sessionId || null, existing.id
-        );
-        res = { success: true, id: existing.id, duplicate: true };
-      } else {
-        const ins = this.sql.exec(
           "INSERT INTO handoff_notes (lease_name, job_id, host_id, session_id, epoch, summary, evidence_refs, created_at) VALUES ('root', ?, ?, ?, ?, ?, ?, ?)",
-          jobId, hostId, sessionId || null, epoch, safeSummary, evidenceJson, nowIso
+          jobId, hostId, effectiveSessionId, epoch, safeSummary, evidenceJson, nowIso
         );
-        res = { success: true, id: ins.rowsWritten ? 1 : 0, duplicate: false };
-      }
+        const inserted = this.sql.exec(
+          "SELECT id FROM handoff_notes WHERE lease_name = 'root' AND job_id = ? AND epoch = ?",
+          jobId, epoch
+        ).toArray()[0] as any;
+        res = { success: true, id: inserted ? inserted.id : 1, duplicate: false };
 
-      this.logAuditEvent('host:' + hostId, 'handoff', 'leases/root', jobId, {
-        job_id: jobId,
-        epoch,
-        summary_len: safeSummary.length,
-        refs_count: cleanRefs.length
-      }, nowIso);
+        this.logAuditEvent('host:' + hostId, 'handoff', 'leases/root', jobId, {
+          job_id: jobId,
+          epoch,
+          summary_len: safeSummary.length,
+          refs_count: cleanRefs.length
+        }, nowIso);
+      });
+
+      return res;
     });
-
-    return res;
   }
 
   getHandoffNotes(limit = 10): any[] {
