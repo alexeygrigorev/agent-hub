@@ -23,6 +23,52 @@ from urllib.parse import parse_qs, unquote, urlparse
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 
+# Fake `a` for real-Worker `hub bridge` runs: `message send` returns a qualified envelope from the
+# hub-bridge service session (optionally ACKing it in the recipient's cursor), `message log` returns
+# one reply per send for tags configured to reply. Any other verb exits 3 (never deliver/pane/keys).
+REAL_BRIDGE_FAKE_A = r'''#!/usr/bin/env python3
+import sys, json, os, uuid
+HERE = os.path.dirname(os.path.abspath(__file__))
+cfg = json.load(open(os.path.join(HERE, "cfg.json")))
+args = sys.argv[1:]
+with open(os.path.join(HERE, "calls.jsonl"), "a") as f:
+    f.write(json.dumps(args) + "\n")
+sends = os.path.join(HERE, "sends.jsonl")
+if args[:2] == ["message", "send"]:
+    tag = args[args.index("--to") + 1]
+    t = cfg["tags"][tag]
+    if args[-1] in cfg.get("refuse_bodies", []):
+        sys.exit(4)
+    nid = str(uuid.uuid4())
+    with open(sends, "a") as f:
+        f.write(json.dumps({"id": nid, "tag": tag, "body": args[-1]}) + "\n")
+    if cfg.get("auto_ack"):
+        c = json.load(open(t["cursor"]))
+        c.setdefault("exceptions", []).append(nid)
+        json.dump(c, open(t["cursor"], "w"))
+    print(json.dumps({"schema_version": 1, "id": nid, "workspace": cfg["ws"],
+        "from": {"tag": "hub-bridge", "session_id": "00000000-0000-0000-0000-000000000001", "workspace": cfg["ws"]},
+        "to": {"tag": tag, "session_id": t["rec"]}, "kind": "note", "reply_to": None, "body": args[-1], "delivery": "inbox"}))
+elif args[:2] == ["message", "log"]:
+    out = []
+    if os.path.exists(sends) and cfg.get("replies"):
+        for line in open(sends):
+            s = json.loads(line)
+            r = cfg["replies"].get(s["tag"])
+            if not r:
+                continue
+            t = cfg["tags"][s["tag"]]
+            out.append({"schema_version": 1, "id": str(uuid.uuid5(uuid.NAMESPACE_URL, "reply-" + s["id"])), "workspace": cfg["ws"],
+                "from": {"tag": s["tag"], "session_id": t["rec"], "workspace": cfg["ws"]}, "to": {"tag": "hub-bridge"},
+                "kind": r["kind"], "reply_to": s["id"], "body": r["body"] + " <" + s["body"][:30] + ">", "delivery": "inbox"})
+    print(json.dumps(out))
+else:
+    sys.exit(3)
+'''
+
+BRIDGE_SERVICE_SESSION = "00000000-0000-0000-0000-000000000001"
+
+
 def sha256_b64url(val: str) -> str:
     digest = hashlib.sha256(val.encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
@@ -843,9 +889,9 @@ export default {{
         self.assertEqual(shown["id"], m_id)
         self.assertEqual(shown["body"], "Real Worker E2E test")
 
-        # 6. Deliver & read before ACK
-        now_ts = int(time.time() * 1000)
-        self.seed_sql("UPDATE messages SET delivered_at = ?, read_at = ? WHERE id = ?", [now_ts, now_ts, m_id])
+        # 6. The recipient host's inbox and show above delivered and read it; no stage is written in SQL
+        self.assertTrue(shown["delivered_at"] and shown["read_at"])
+        self.assertIsNone(shown["acked_at"])
 
         # 7. ACK
         res_ack = self.run_cli(["ack", m_id], token="token_host_b")
@@ -1083,9 +1129,9 @@ export default {{
         msg_info = json.loads(res_send.stdout)
         m_id = msg_info["id"]
 
-        # Deliver & read in real DB
-        now_ts = int(time.time() * 1000)
-        self.seed_sql("UPDATE messages SET delivered_at = ?, read_at = ? WHERE id = ?", [now_ts, now_ts, m_id])
+        # The recipient's own host polls its inbox: delivered on the real hub, no SQL stage write
+        inbox_b = json.loads(self.run_cli(["inbox", "--actor", "worker-2"], token="token_host_b").stdout)
+        self.assertTrue(any(m["id"] == m_id and m["delivered_at"] for m in inbox_b))
 
         # 2. Bridge setup with fake-a binary
         from agent_hub_host.bridge import (
@@ -1299,6 +1345,211 @@ sys.exit(0)
         res_inbox = self.run_cli(["inbox", "--actor", "worker-1"], token="token_host_a")
         inbox_msgs = json.loads(res_inbox.stdout)
         self.assertTrue(any(m["body"] == "Fake-A processed" and m["reply_to"] == m_id for m in inbox_msgs))
+
+    # --- real `hub bridge` CLI runs: real Worker, fake `a`, every stage set by the hub itself ---------
+
+    def _bridge_host(self, name, tags, scopes=("host", "bus:send", "bus:read")):
+        """A fresh machine with agents and a host token, so a bridge run sees only this test's inbox.
+
+        Registry rows are seeded in SQL (the hub has no agent import API yet); message stages never are.
+        """
+        self.bridge_mach = f"mach-{name}"
+        self.seed_sql("INSERT INTO machines (id, name, hostname, registered_at) VALUES (?, ?, ?, ?)", [self.bridge_mach, name, name, "2026-01-01T00:00:00Z"])
+        for tag in tags:
+            self.seed_sql("INSERT INTO agents (tag, project, role, machine_id) VALUES (?, 'projE', ?, ?)", [tag, f"{tag}-role", self.bridge_mach])
+        return self._bridge_token(f"token_{name}", scopes)
+
+    def _bridge_token(self, token, scopes):
+        now, future = "2026-01-01T00:00:00Z", "2030-01-01T00:00:00Z"
+        self.seed_sql(
+            "INSERT INTO credentials (id, kind, token_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [f"cred_{token}", "host", sha256_b64url(token), f"fam_{token}", self.bridge_mach, self.bridge_mach, None, json.dumps(list(scopes)), "admin-sub", now, future])
+        return token
+
+    def _native(self, tags, auto_ack=True, replies=None):
+        from agent_hub_host.bridge import canonicalize_workspace, get_workspace_key
+        td = tempfile.mkdtemp(dir=self.server_dir)
+        self.work, self.state, self.rt = (os.path.join(td, d) for d in ("work", "state", "rt"))
+        for d in (self.work, self.state, self.rt):
+            os.makedirs(d)
+        ws = canonicalize_workspace(self.work)
+        mailbox = os.path.join(self.state, "messages", get_workspace_key(ws))
+        os.makedirs(os.path.join(mailbox, "cursors"))
+        with open(os.path.join(mailbox, "workspace.json"), "w") as f:
+            json.dump({"workspace": ws}, f)
+        cfg = {"ws": ws, "tags": {}, "auto_ack": auto_ack, "replies": replies or {}}
+        for sid, tag, engine in [(BRIDGE_SERVICE_SESSION, "hub-bridge", "hub-bridge")] + [(str(uuid.uuid4()), t, "test-engine") for t in tags]:
+            os.makedirs(os.path.join(self.rt, "sessions", sid))
+            with open(os.path.join(self.rt, "sessions", sid, "session.json"), "w") as f:
+                json.dump({"schema_version": 1, "id": sid, "workspace": ws, "tag": tag, "engine": engine,
+                           "created_at_ms": 1700000000000, "command": ["bash"], "cwd": ws}, f)
+            if tag != "hub-bridge":
+                cursor = os.path.join(mailbox, "cursors", f"{sid}.json")
+                with open(cursor, "w") as f:
+                    json.dump({"acked_through": None, "exceptions": []}, f)
+                cfg["tags"][tag] = {"rec": sid, "cursor": cursor}
+        self.fake_dir = os.path.join(td, "fake")
+        os.makedirs(self.fake_dir)
+        self.fake_a = os.path.join(self.fake_dir, "a")
+        with open(self.fake_a, "w") as f:
+            f.write(REAL_BRIDGE_FAKE_A)
+        os.chmod(self.fake_a, 0o755)
+        with open(os.path.join(self.fake_dir, "cfg.json"), "w") as f:
+            json.dump(cfg, f)
+        self.native_cfg = cfg
+
+    def _fake_lines(self, name):
+        path = os.path.join(self.fake_dir, name)
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return [json.loads(line) for line in f]
+
+    def _run_bridge(self, token, *extra):
+        env = {k: v for k, v in os.environ.items() if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
+        for k in ("HUB_JOB_TOKEN", "HUB_TOKEN", "HUB_LEASE_EPOCH"):
+            env.pop(k, None)
+        env.update({"HUB_URL": f"http://127.0.0.1:{self.port}", "HUB_TOKEN": token, "NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1",
+                    "HOME": self.server_dir, "XDG_CONFIG_HOME": os.path.join(self.server_dir, ".config"),
+                    "XDG_RUNTIME_DIR": self.rt, "APLEXER_STATE_DIR": self.state, "APLEXER_RUNTIME_DIR": self.rt,
+                    "PYTHONPATH": os.path.join(self.repo_root, "host")})
+        cmd = [sys.executable, "-m", "agent_hub_host.cli", "bridge", "--workspace", self.work, "--aplexer-bin", self.fake_a,
+               "--state-dir", self.state, "--runtime-dir", self.rt, *extra]
+        res = subprocess.run(cmd, cwd=os.path.join(self.repo_root, "host"), env=env, capture_output=True, text=True, timeout=120)
+        return res, (json.loads(res.stdout) if res.stdout.strip() else None)
+
+    def _hub(self, method, path, token, body=None):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", method=method,
+                                     data=None if body is None else json.dumps(body).encode(),
+                                     headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return r.status, json.loads(r.read() or b"null")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"null")
+
+    def _hub_send(self, to, key):
+        status, out = self._hub("POST", "/api/bus/send", "token_host_b",
+                                {"from_actor": "worker-2", "to_actor": to, "kind": "note", "body": f"body {key}", "idempotency_key": key})
+        self.assertEqual(status, 200, out)
+        return out["id"]
+
+    def _stages(self, mid):
+        # Read-only observation of the real row; stages are only ever written by the hub's own HTTP paths
+        return self.seed_sql("SELECT delivered_at, read_at, acked_at FROM messages WHERE id = ?", [mid])[0]
+
+    def _replies_to(self, mid):
+        status, inbox = self._hub("GET", "/api/bus/inbox?actor=worker-2&limit=100", "token_host_b")
+        self.assertEqual(status, 200, inbox)
+        return [m for m in inbox if m.get("reply_to") == mid]
+
+    def test_real_worker_cli_bridge_round_trip_without_sql_stage_writes(self):
+        token = self._bridge_host("e2e1", ["e1-w", "e1-p"])
+        self._native(["e1-w", "e1-p"], replies={"e1-w": {"kind": "sync_reply", "body": "done-w"}, "e1-p": {"kind": "odd-kind", "body": "done-p"}})
+        ids = {"q": self._hub_send("projE:e1-w", "e1-q"), "t": self._hub_send("e1-w", "e1-t"), "r": self._hub_send("role:e1-p-role", "e1-r")}
+        self.assertTrue(all(self._stages(m) == {"delivered_at": None, "read_at": None, "acked_at": None} for m in ids.values()))
+
+        res, out = self._run_bridge(token, "--once")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(out["cycles"][0]["errors"], [])
+        self.assertEqual(sorted(f["hub_id"] for f in out["cycles"][0]["forwarded"]), sorted(ids.values()))
+        for m in ids.values():
+            st = self._stages(m)
+            self.assertTrue(st["delivered_at"] and st["acked_at"], st)
+        self.assertEqual(sorted(s["tag"] for s in self._fake_lines("sends.jsonl")), ["e1-p", "e1-w", "e1-w"])
+        self.assertEqual({tuple(c[:2]) for c in self._fake_lines("calls.jsonl")}, {("message", "send"), ("message", "log")})
+        for key, from_actor in (("q", "projE:e1-w"), ("t", "e1-w"), ("r", "role:e1-p-role")):
+            replies = self._replies_to(ids[key])
+            self.assertEqual([(r["from_actor"], r["to_actor"], r["kind"]) for r in replies], [(from_actor, "worker-2", "reply")])
+
+        # A second run has no new native send, hub ACK or reply
+        acked = {m: self._stages(m)["acked_at"] for m in ids.values()}
+        res2, out2 = self._run_bridge(token, "--once")
+        self.assertEqual(res2.returncode, 0, res2.stderr)
+        self.assertEqual(out2["cycles"][0]["forwarded"], [])
+        self.assertEqual(len(self._fake_lines("sends.jsonl")), 3)
+        self.assertEqual({m: self._stages(m)["acked_at"] for m in ids.values()}, acked)
+        self.assertTrue(all(len(self._replies_to(m)) == 1 for m in ids.values()))
+
+    def test_real_worker_cli_bridge_hub_ack_waits_for_native_ack(self):
+        token = self._bridge_host("e2e2", ["e2-w"])
+        self._native(["e2-w"], auto_ack=False)
+        mid = self._hub_send("e2-w", "e2-a")
+        res, _ = self._run_bridge(token, "--once")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        st = self._stages(mid)
+        self.assertTrue(st["delivered_at"])
+        self.assertIsNone(st["acked_at"])
+        # The recipient ACKs natively; only then does the next run ACK on the hub
+        cursor = self.native_cfg["tags"]["e2-w"]["cursor"]
+        with open(cursor) as f:
+            data = json.load(f)
+        data["exceptions"].append(self._fake_lines("sends.jsonl")[0]["id"])
+        with open(cursor, "w") as f:
+            json.dump(data, f)
+        res2, _ = self._run_bridge(token, "--once")
+        self.assertEqual(res2.returncode, 0, res2.stderr)
+        self.assertTrue(self._stages(mid)["acked_at"])
+        self.assertEqual(len(self._fake_lines("sends.jsonl")), 1)
+
+    def test_real_worker_cli_bridge_bounded_window_never_starves_later_messages(self):
+        token = self._bridge_host("e2e3", ["e3-w"])
+        self._native(["e3-w"])
+        ids = [self._hub_send("e3-w", f"e3-{i:02d}") for i in range(13)]
+        res1, out1 = self._run_bridge(token, "--limit", "1", "--max-pages", "10")
+        self.assertEqual(res1.returncode, 1, res1.stderr)
+        self.assertEqual(len(out1["cycles"][0]["forwarded"]), 10)
+        self.assertIn("inbox window exhausted", out1["cycles"][0]["errors"][0]["error"])
+        res2, out2 = self._run_bridge(token, "--limit", "1", "--max-pages", "10")
+        self.assertEqual(res2.returncode, 0, res2.stderr)
+        self.assertEqual(len(out2["cycles"][0]["forwarded"]), 3)
+        sends = self._fake_lines("sends.jsonl")
+        self.assertEqual(len(sends), 13)
+        self.assertEqual(len({s["body"] for s in sends}), 13)
+        self.assertTrue(all(self._stages(m)["delivered_at"] and self._stages(m)["acked_at"] for m in ids))
+
+    def test_real_worker_cli_bridge_permanent_held_head_progresses_across_restarts(self):
+        token = self._bridge_host("e2e5", ["e5-w"])
+        self._native(["e5-w"])
+        cfg = dict(self.native_cfg, refuse_bodies=["body e5-held"])
+        with open(os.path.join(self.fake_dir, "cfg.json"), "w") as f:
+            json.dump(cfg, f)
+        ids = [self._hub_send("e5-w", key) for key in ("e5-held", "e5-two", "e5-three")]
+        cycles = []
+        for _ in range(3):
+            res, out = self._run_bridge(token, "--limit", "2", "--max-pages", "1")
+            self.assertEqual(res.returncode, 1, res.stderr)
+            cycles.append(out["cycles"][0])
+        self.assertTrue(all(c["held"] for c in cycles))
+        self.assertIn("inbox window exhausted", cycles[0]["errors"][0]["error"])
+        self.assertEqual(sorted(s["body"] for s in self._fake_lines("sends.jsonl")), ["body e5-three", "body e5-two"])
+        self.assertIsNone(self._stages(ids[0])["acked_at"])
+        self.assertTrue(all(self._stages(mid)["acked_at"] for mid in ids[1:]))
+        with open(os.path.join(self.work, ".local", "hub-bridge-receipts.json")) as f:
+            receipts = json.load(f)
+        self.assertIn(ids[0], receipts["inbox_pending"]["projE:e5-w"])
+        self.assertIn(ids[0], receipts["ambiguous_sends"])
+        self.assertNotIn(ids[0], receipts["hub_to_native"])
+
+    def test_real_worker_cli_bridge_hub_ack_and_reply_failures_exit_nonzero(self):
+        token = self._bridge_host("e2e4", ["e4-w"])
+        read_only = self._bridge_token("token_e2e4_ro", ("host", "bus:read"))
+        self._native(["e4-w"], replies={"e4-w": {"kind": "reply", "body": "done"}})
+        mid = self._hub_send("e4-w", "e4-a")
+        res, out = self._run_bridge(read_only, "--once")
+        self.assertEqual(res.returncode, 1, res.stderr)
+        errors = out["cycles"][0]["errors"]
+        self.assertEqual(sorted(e["error"].split(":")[0] for e in errors), ["hub ack failed", "hub reply failed"])
+        self.assertIsNone(self._stages(mid)["acked_at"])
+        self.assertEqual(self._replies_to(mid), [])
+
+        # With a send-capable token the same receipts finish the ACK and the reply once, with no second native send
+        res2, out2 = self._run_bridge(token, "--once")
+        self.assertEqual(res2.returncode, 0, res2.stderr)
+        self.assertEqual(out2["cycles"][0]["errors"], [])
+        self.assertTrue(self._stages(mid)["acked_at"])
+        self.assertEqual(len(self._replies_to(mid)), 1)
+        self.assertEqual(len(self._fake_lines("sends.jsonl")), 1)
 
 class TestHttpCliRealCleanupInjection(unittest.TestCase):
     """

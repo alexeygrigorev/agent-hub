@@ -13,7 +13,6 @@ import hashlib
 import json
 import os
 import subprocess
-import sys
 import time
 import uuid
 from typing import Any
@@ -29,6 +28,61 @@ from .native_bridge import (
 )
 
 MAX_RECEIPTS_ENTRIES = 1000
+MAX_PENDING_INBOX = 1000
+
+# Message kinds the hub accepts on /api/bus/send and /api/bus/reply (SPEC §6). A native reply
+# whose kind is outside this set is bridged back as a plain "reply" instead of being retried
+# against a 400 forever. "sync_reply" is not on the hub wire yet, so it never goes back up.
+HUB_MESSAGE_KINDS = frozenset(["note", "handoff", "reply", "status", "claim", "release"])
+
+# Prompt glyphs an idle, empty agent composer shows; box-drawing borders around it are ignored.
+PROMPT_GLYPHS = frozenset(["❯", ">", "$", "#"])
+COMPOSER_BORDER_CHARS = "│┃║|╭╮╰╯─━═ \t"
+
+_ADDRESS_SEGMENT_FORBIDDEN = set(":") | {chr(c) for c in range(0x20)} | {"\x7f"}
+
+
+def _valid_address_segment(segment: str) -> bool:
+    return bool(segment) and not any(ch in _ADDRESS_SEGMENT_FORBIDDEN or ch.isspace() for ch in segment)
+
+
+def native_tag_for_address(address: Any) -> str | None:
+    """Map a hub agent address to the native aplexer tag, or None if it has no native mailbox.
+
+    Mirrors the hub address grammar (src/bus.ts parseAddress): `tag` -> tag, `project:tag` -> tag.
+    `role:*` and `machine:*` are not native mailbox tags, and malformed addresses (empty
+    segments, more than one ':', whitespace) map to nothing rather than to a guessed tag.
+    """
+    if not isinstance(address, str) or not address or len(address) > 128:
+        return None
+    parts = address.split(":")
+    if not all(_valid_address_segment(p) for p in parts):
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) != 2 or parts[0] in ("role", "machine"):
+        return None
+    return parts[1]
+
+
+def normalize_native_kind(kind: Any) -> str:
+    """Kind to use when bridging a native message back to the hub."""
+    return kind if isinstance(kind, str) and kind in HUB_MESSAGE_KINDS else "reply"
+
+
+def composer_is_empty(last_line: str) -> bool:
+    """True only for an idle, empty prompt line (inside optional box borders).
+
+    Accepted: a bare prompt glyph, or one label token followed by the agent prompt glyph
+    ("user@host:~$ ❯"); a composer shows draft text after its glyph, never before it.
+    Refused: any text after a glyph, '>', '$' or '#' with any text (a draft such as
+    "echo hi >" is indistinguishable from a label there), and multi-word text before '❯'.
+    """
+    line = last_line.strip(COMPOSER_BORDER_CHARS)
+    if line in PROMPT_GLYPHS:
+        return True
+    tokens = line.split()
+    return len(tokens) == 2 and tokens[1] == "❯" and tokens[0] not in PROMPT_GLYPHS
 
 
 def get_authoritative_runtime_dir(explicit_runtime_dir: str | None = None) -> str:
@@ -138,6 +192,15 @@ class MailboxBridge:
             data.setdefault("acked_hub_messages", [])
             data.setdefault("ambiguous_sends", {})
             data.setdefault("delivers", {})
+            if not isinstance(data.setdefault("inbox_cursors", {}), dict):
+                raise BridgeCapabilityGap(f"Receipts file {self.receipts_file} has malformed inbox_cursors")
+            for key in ("inbox_pending", "inbox_scans"):
+                if not isinstance(data.setdefault(key, {}), dict):
+                    raise BridgeCapabilityGap(f"Receipts file {self.receipts_file} has malformed {key}")
+            for pending in data["inbox_pending"].values():
+                if (not isinstance(pending, dict) or len(pending) > MAX_PENDING_INBOX
+                        or any(not isinstance(row, dict) or row.get("id") != mid for mid, row in pending.items())):
+                    raise BridgeCapabilityGap(f"Receipts file {self.receipts_file} has malformed inbox_pending rows")
             return data
         return {
             "hub_to_native": {},
@@ -146,6 +209,7 @@ class MailboxBridge:
             "acked_hub_messages": [],
             "ambiguous_sends": {},
             "delivers": {},
+            "inbox_cursors": {},
         }
 
     def _prune_receipts(self) -> None:
@@ -197,6 +261,59 @@ class MailboxBridge:
                 if a not in disk["acked_hub_messages"]:
                     disk["acked_hub_messages"].append(a)
             self.receipts["acked_hub_messages"] = disk["acked_hub_messages"]
+            # Inbox cursors only ever move forward, whichever process wrote last
+            for address, cursor in (self.receipts.get("inbox_cursors") or {}).items():
+                if isinstance(cursor, str) and cursor > disk["inbox_cursors"].get(address, ""):
+                    disk["inbox_cursors"][address] = cursor
+            self.receipts["inbox_cursors"] = disk["inbox_cursors"]
+            for key in ("inbox_pending", "inbox_scans"):
+                self.receipts[key] = disk[key]
+
+    def inbox_cursor(self, address: str) -> str | None:
+        """Durable hub inbox cursor for `address`: every row before it is settled or durably pending."""
+        cursor = (self.receipts.get("inbox_cursors") or {}).get(address)
+        return cursor if isinstance(cursor, str) and cursor else None
+
+    def advance_inbox_cursor(self, address: str, cursor: str) -> None:
+        """Persist a later inbox cursor for `address`; an earlier or equal one is ignored."""
+        with self._receipts_lock():
+            self._sync_receipts_with_lock()
+            cursors = self.receipts.setdefault("inbox_cursors", {})
+            if cursor > cursors.get(address, ""):
+                cursors[address] = cursor
+                self._save_receipts()
+
+    def pending_inbox(self, address: str) -> dict[str, Any]:
+        with self._receipts_lock():
+            self._sync_receipts_with_lock()
+            return dict(self.receipts.get("inbox_pending", {}).get(address, {}))
+
+    def remember_inbox(self, address: str, msg: dict[str, Any]) -> None:
+        """Durably retain a row before attempting an effect or moving the scan past it."""
+        with self._receipts_lock():
+            self._sync_receipts_with_lock()
+            pending = self.receipts.setdefault("inbox_pending", {}).setdefault(address, {})
+            if msg["id"] not in pending and len(pending) >= MAX_PENDING_INBOX:
+                raise BridgeCapabilityGap("pending inbox capacity exhausted; scan held until delivery or expiry")
+            pending[msg["id"]] = dict(msg)
+            self._save_receipts()
+
+    def forget_inbox(self, address: str, hub_id: str) -> None:
+        """Remove only a legitimately settled or expired pending row."""
+        with self._receipts_lock():
+            self._sync_receipts_with_lock()
+            self.receipts.setdefault("inbox_pending", {}).setdefault(address, {}).pop(hub_id, None)
+            self._save_receipts()
+
+    def inbox_scan(self, address: str) -> str | None:
+        cursor = self.receipts.get("inbox_scans", {}).get(address)
+        return cursor if isinstance(cursor, str) and cursor else self.inbox_cursor(address)
+
+    def save_inbox_scan(self, address: str, cursor: str | None) -> None:
+        with self._receipts_lock():
+            self._sync_receipts_with_lock()
+            self.receipts.setdefault("inbox_scans", {})[address] = cursor
+            self._save_receipts()
 
     def _save_receipts(self) -> None:
         self._prune_receipts()
@@ -283,7 +400,9 @@ class MailboxBridge:
                         pass
 
         # 2. Resolve from authoritative session records
-        target_tag = (to_actor[6:] if to_actor.startswith("agent:") else to_actor).strip()
+        target_tag = hub_msg_info.get("native_tag") or native_tag_for_address(to_actor)
+        if not target_tag:
+            return None
         matching_sessions = []
         seen_ids = set()
 
@@ -427,11 +546,32 @@ class MailboxBridge:
             if l_str.startswith("? ") or "select an option" in l_str or "[y/n]" in l_str or "menu" in l_str:
                 raise BridgeCapabilityGap(f"Session in menu/prompt state: {line}")
 
-        # Composer must end with prompt character and have no draft text after it
-        if not (last_line.endswith("❯") or last_line.endswith("$") or last_line.endswith("#") or last_line.endswith(">")):
+        # Composer must be an empty prompt: no draft text after the glyph, no ambiguous text before it
+        if not composer_is_empty(last_line):
             raise BridgeCapabilityGap(f"Composer not empty or invalid prompt: {last_line}")
 
-    def forward_hub_to_native(self, hub_msg: dict[str, Any]) -> str:
+    def forward_hub_to_native(self, hub_msg: dict[str, Any], native_tag: str | None = None) -> str:
+        """Queue a hub message into the native mailbox of its recipient tag.
+
+        `native_tag` is the registered tag whose hub inbox returned the message (the hub resolves
+        tag, project:tag and unique role aliases); without it the tag comes from to_actor. A
+        to_actor that names a different native tag, or has no native mailbox, is refused before
+        any native effect.
+        """
+        mapped = native_tag_for_address(hub_msg.get("to_actor"))
+        if native_tag is None:
+            native_tag = mapped
+        elif mapped is not None and mapped != native_tag:
+            raise BridgeCapabilityGap(
+                f"Hub message {hub_msg.get('id')} is addressed to '{hub_msg.get('to_actor')}', not native tag '{native_tag}'"
+            )
+        if not native_tag or native_tag_for_address(native_tag) != native_tag:
+            raise BridgeCapabilityGap(
+                f"Hub message {hub_msg.get('id')} has no native mailbox tag for '{hub_msg.get('to_actor')}'"
+            )
+        return self._forward_hub_to_native(hub_msg, native_tag)
+
+    def _forward_hub_to_native(self, hub_msg: dict[str, Any], tag: str) -> str:
         with self._receipts_lock():
             self._sync_receipts_with_lock()
 
@@ -450,7 +590,6 @@ class MailboxBridge:
                 self.receipts["delivers"] = {}
 
             target = hub_msg["to_actor"]
-            tag = target[6:] if target.startswith("agent:") else target
             body = hub_msg["body"]
             kind = hub_msg.get("kind", "note")
 
@@ -582,6 +721,7 @@ class MailboxBridge:
                     "hub_id": hub_id,
                     "thread_id": hub_msg.get("thread_id"),
                     "kind": kind,
+                    "native_tag": tag,
                 }
                 if self.service_binding:
                     msg_envelope_info["service_tag"] = self.service_binding.tag
@@ -687,7 +827,14 @@ class MailboxBridge:
 
             return native_id
 
-    def sync_native_to_hub(self) -> None:
+    def sync_native_to_hub(self) -> dict[str, list[dict[str, Any]]]:
+        """Native recipient ACKs and replies -> hub.
+
+        Returns {"errors": [...], "held": [...]}: hub-side ack/reply failures and unreadable native
+        logs are errors the caller must surface; replies refused on provenance are held. Neither is
+        retried here as a new native effect.
+        """
+        outcome: dict[str, list[dict[str, Any]]] = {"errors": [], "held": []}
         with self._receipts_lock():
             self._sync_receipts_with_lock()
 
@@ -726,7 +873,7 @@ class MailboxBridge:
                             self.receipts["acked_hub_messages"].append(hub_id)
                             self._save_receipts()
                         except Exception as e:
-                            print(f"Failed to ack hub message {hub_id}: {e}", file=sys.stderr)
+                            outcome["errors"].append({"hub_id": hub_id, "error": f"hub ack failed: {e}"[:300]})
 
             # 2. Sync replies from read-only aplexer message log
             cmd = [self.aplexer_bin, "message", "log", "--json", "--workspace", self.workspace]
@@ -734,20 +881,21 @@ class MailboxBridge:
             try:
                 res = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=sub_env)
             except Exception as e:
-                print(f"Failed to run aplexer message log: {e}", file=sys.stderr)
-                return
+                outcome["errors"].append({"error": f"aplexer message log failed: {e}"[:300]})
+                return outcome
 
             if res.returncode != 0:
-                print(f"Failed to run aplexer message log: {res.stderr[:200]}", file=sys.stderr)
-                return
+                outcome["errors"].append({"error": f"aplexer message log failed (exit {res.returncode}): {res.stderr[:200]}"})
+                return outcome
 
             try:
                 log_entries = json.loads(res.stdout)
-                if not isinstance(log_entries, list):
-                    return
             except Exception as e:
-                print(f"Failed to parse aplexer message log: {e}", file=sys.stderr)
-                return
+                outcome["errors"].append({"error": f"aplexer message log is not JSON: {e}"[:300]})
+                return outcome
+            if not isinstance(log_entries, list):
+                outcome["errors"].append({"error": "aplexer message log is not a JSON list"})
+                return outcome
 
             for msg in log_entries:
                 if not isinstance(msg, dict):
@@ -758,7 +906,7 @@ class MailboxBridge:
                 if native_id in self.receipts.get("native_to_hub", {}):
                     continue
 
-                kind = msg.get("kind", "reply")
+                kind = normalize_native_kind(msg.get("kind", "reply"))
                 reply_to = msg.get("reply_to")
 
                 # If it's a native reply to something we forwarded
@@ -769,19 +917,25 @@ class MailboxBridge:
                     sender_actor = original.get("to_actor")
                     thread_id = original.get("thread_id")
                     if not to_actor or not sender_actor:
-                        print(f"Cannot bridge reply {native_id}: missing original actors", file=sys.stderr)
+                        outcome["errors"].append({"native_id": native_id, "error": "cannot bridge reply: missing original actors"})
                         continue
 
+                    # Provenance is checked against the exact native tag the message was queued to,
+                    # not the hub address form (project:tag or role:* are not native tags).
+                    native_tag = original.get("native_tag") or native_tag_for_address(sender_actor)
+                    if not native_tag:
+                        outcome["errors"].append({"native_id": native_id, "error": f"cannot bridge reply: no native tag for '{sender_actor}'"[:300]})
+                        continue
                     valid, reason = validate_native_reply_provenance(
                         msg,
-                        original,
+                        dict(original, to_actor=native_tag),
                         self.canonical_workspace,
                         self.service_binding,
                         get_authoritative_state_dir(self.state_dir),
                         get_authoritative_runtime_dir(self.runtime_dir),
                     )
                     if not valid:
-                        print(f"Skipping reply {native_id}: {reason}", file=sys.stderr)
+                        outcome["held"].append({"native_id": native_id, "reason": f"reply refused: {reason}"[:300]})
                         continue
 
                     body = msg.get("body", "")
@@ -799,4 +953,143 @@ class MailboxBridge:
                         self.receipts["native_to_hub"][native_id] = hub_rep_id
                         self._save_receipts()
                     except Exception as e:
-                        print(f"Failed to bridge reply {native_id} to hub: {e}", file=sys.stderr)
+                        outcome["errors"].append({"native_id": native_id, "hub_id": hub_reply_to, "error": f"hub reply failed: {e}"[:300]})
+        return outcome
+
+
+def registered_bridge_targets(actors: Any, only_tags: list[str] | None = None) -> list[tuple[str, str]]:
+    """(hub inbox address, native tag) pairs for the agents the hub registers for this credential.
+
+    `actors` is the hub's /api/bus/actors answer (agents on this host plus machine:<id>).
+    `only_tags` narrows the set; a requested tag the hub does not register is refused, so the
+    bridge never polls or writes a mailbox it was not given.
+    """
+    targets: dict[str, str] = {}
+    for address in actors if isinstance(actors, list) else []:
+        tag = native_tag_for_address(address)
+        if not tag:
+            continue
+        # Prefer the unambiguous project:tag inbox address when the hub lists both forms
+        if tag not in targets or ":" in address:
+            targets[tag] = address
+    if only_tags is not None:
+        unknown = sorted(set(only_tags) - set(targets))
+        if unknown:
+            raise BridgeCapabilityGap(f"Tags not registered on the hub for this credential: {', '.join(unknown)}")
+        targets = {t: targets[t] for t in only_tags}
+    return sorted((address, tag) for tag, address in targets.items())
+
+
+def _bridge_inbox_message(bridge: MailboxBridge, msg: dict[str, Any], tag: str, summary: dict[str, Any]) -> bool:
+    """Forward one hub inbox message; True when it is settled (hub-acked, or forwarded now or before)."""
+    hub_id = msg["id"]
+    if msg.get("acked_at") or hub_id in bridge.receipts.get("acked_hub_messages", []):
+        summary["acked_skipped"] += 1
+        return True
+    if hub_id in bridge.receipts.get("hub_to_native", {}) and msg.get("kind") != "sync_reply":
+        summary["already_forwarded"] += 1
+        return True
+    try:
+        native_id = bridge.forward_hub_to_native(msg, native_tag=tag)
+    except BridgeCapabilityGap as e:
+        summary["held"].append({"hub_id": hub_id, "tag": tag, "reason": str(e)[:300]})
+        return False
+    except Exception as e:
+        summary["errors"].append({"hub_id": hub_id, "tag": tag, "error": str(e)[:300]})
+        return False
+    summary["forwarded"].append({"hub_id": hub_id, "native_id": native_id, "tag": tag})
+    return True
+
+
+def poll_once(
+    bridge: MailboxBridge,
+    targets: list[tuple[str, str]],
+    limit: int = 50,
+    max_pages: int = 10,
+) -> dict[str, Any]:
+    """One bounded bridge cycle: hub inbox -> native mailbox for each target, then native -> hub.
+
+    Held rows are durably retained before any native effect. A separate scan continuation
+    crosses bounded windows; the inbox cursor keeps the newest-millisecond fence. At the end
+    of a scan, polling returns to that fence to catch later writes in the same millisecond.
+    Pending retries are bounded and survive restarts. Capacity exhaustion stops scanning
+    without discarding a row. Only delivery or explicit message expiry clears pending rows.
+
+    Reading marks hub delivery; only the native recipient's positive ACK authorizes hub ACK.
+    """
+    summary: dict[str, Any] = {"forwarded": [], "already_forwarded": 0, "acked_skipped": 0, "held": [], "errors": []}
+    for address, tag in targets:
+        retried = set()
+        try:
+            for hub_id, msg in bridge.pending_inbox(address).items():
+                retried.add(hub_id)
+                expiry = msg.get("expires_at")
+                if isinstance(expiry, int) and not isinstance(expiry, bool) and expiry <= int(time.time() * 1000):
+                    bridge.forget_inbox(address, hub_id)
+                elif _bridge_inbox_message(bridge, msg, tag, summary):
+                    bridge.forget_inbox(address, hub_id)
+        except Exception as e:
+            summary["errors"].append({"address": address, "error": f"pending inbox failed: {e}"[:300]})
+            continue
+        cursor = bridge.inbox_scan(address)
+        scanned: list[tuple[str, Any]] = []
+        newest = None
+        exhausted = True
+        for _ in range(max_pages):
+            try:
+                page = bus.inbox(address, limit=limit, cursor=cursor)
+                if not isinstance(page, list):
+                    raise ValueError("inbox did not return a list")
+            except Exception as e:
+                summary["errors"].append({"address": address, "error": f"inbox failed: {e}"[:300]})
+                exhausted = False
+                break
+            if not page:
+                bridge.save_inbox_scan(address, None)
+                exhausted = False
+                break
+            stopped = False
+            for msg in page:
+                if not isinstance(msg, dict) or not msg.get("id"):
+                    summary["errors"].append({"address": address, "error": "inbox row without an id"})
+                    stopped = True
+                    break
+                try:
+                    if msg["id"] not in retried:
+                        # Save before the effect, including uncertain sends; never evict held rows.
+                        bridge.remember_inbox(address, msg)
+                        if _bridge_inbox_message(bridge, msg, tag, summary):
+                            bridge.forget_inbox(address, msg["id"])
+                    created_at = msg.get("created_at")
+                    if isinstance(created_at, int) and (newest is None or created_at > newest):
+                        newest = created_at
+                    scanned.append((msg["id"], created_at))
+                    cursor = msg["id"]
+                except Exception as e:
+                    summary["errors"].append({"address": address, "error": f"pending inbox failed: {e}"[:300]})
+                    stopped = True
+                    break
+            safe = [mid for mid, ts in scanned if isinstance(ts, int) and newest is not None and ts < newest]
+            if safe:
+                bridge.advance_inbox_cursor(address, safe[-1])
+            # An interrupted page resumes after the last durably retained row.
+            bridge.save_inbox_scan(address, cursor if stopped or len(page) >= limit else None)
+            if stopped or len(page) < limit:
+                exhausted = False
+                break
+        if exhausted:
+            summary["errors"].append({
+                "address": address,
+                "error": f"inbox window exhausted: {max_pages} pages of {limit} read without reaching the end; "
+                         f"the rest is read from the durable scan next cycle",
+            })
+        pending_count = len(bridge.pending_inbox(address))
+        if pending_count:
+            summary["errors"].append({"address": address, "error": f"inbox held: {pending_count} messages retained for retry"})
+    try:
+        synced = bridge.sync_native_to_hub() or {}
+        summary["errors"].extend(synced.get("errors", []))
+        summary["held"].extend(synced.get("held", []))
+    except Exception as e:
+        summary["errors"].append({"error": f"native to hub sync failed: {e}"[:300]})
+    return summary

@@ -2,7 +2,10 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Env } from '../src/env';
 import { Hub } from '../src/hub';
-import { BusService, BUS_SCHEMA_SQL, CallerContext } from '../src/bus';
+import { BusService, BUS_SCHEMA_SQL, CallerContext, parseAddress } from '../src/bus';
+import { SCHEMA_SQL } from '../src/schema';
+import { sha256 } from '../src/auth/crypto';
+import { doFetch } from './m1-focus-setup';
 
 const defaultEnv = env as unknown as Env;
 
@@ -391,6 +394,427 @@ describe('M3 Bus Service & Schema Tests', () => {
 
       // Admin query for role:root fails closed
       expect(() => bus.getBusMessages({ isAdmin: true }, 'role:root')).toThrow(/missing_m4_root_authority/);
+    });
+  });
+});
+
+// Corrections over the real wire path (Worker -> Hub DO -> BusService -> SQLite). No test here
+// writes delivered_at/read_at/acked_at directly; expires_at is the only clock fixture set in SQL.
+describe('M3 bus corrections: recipient ACK, addresses, aliases, expiry', () => {
+  let stub: any;
+
+  async function seedCred(sql: any, id: string, token: string, kind: string, machineId: string, actor: string | null, scopes: string[]) {
+    const now = new Date().toISOString();
+    const future = new Date(Date.now() + 86400000).toISOString();
+    sql.exec(
+      "INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, machine_id, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      id, kind, await sha256(token), `fam_${id}`, actor || machineId, actor, machineId, JSON.stringify(scopes), 'admin-1', now, future
+    );
+  }
+
+  beforeEach(async () => {
+    const id = defaultEnv.HUB.idFromName("hub");
+    stub = defaultEnv.HUB.get(id);
+    await runInDurableObject(stub, async (instance: Hub) => {
+      for (const schema of [SCHEMA_SQL, BUS_SCHEMA_SQL]) {
+        for (const statement of schema.split(';')) {
+          const trimmed = statement.trim();
+          if (trimmed) {
+            try { instance.sql.exec(trimmed); } catch (e) {}
+          }
+        }
+      }
+      for (const table of ['messages', 'claims', 'agents', 'machines', 'credentials']) {
+        try { instance.sql.exec(`DELETE FROM ${table}`); } catch (e) {}
+      }
+      const now = new Date().toISOString();
+      for (const m of ['mach-A', 'mach-B']) {
+        instance.sql.exec('INSERT INTO machines (id, name, hostname, registered_at) VALUES (?, ?, ?, ?)', m, m, m, now);
+      }
+      instance.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('worker-1', 'projA', 'worker', 'mach-A')");
+      instance.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('worker-2', 'projB', 'worker', 'mach-B')");
+      instance.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('principal-1', 'projA', 'principal', 'mach-A')");
+      await seedCred(instance.sql, 'c_host_a', 'tok_host_a', 'host', 'mach-A', null, ['host', 'bus:send', 'bus:read']);
+      await seedCred(instance.sql, 'c_host_b', 'tok_host_b', 'host', 'mach-B', null, ['host', 'bus:send', 'bus:read']);
+      await seedCred(instance.sql, 'c_w1', 'tok_w1', 'agent', 'mach-A', 'worker-1', ['bus:send', 'bus:read']);
+      await seedCred(instance.sql, 'c_w2q', 'tok_w2q', 'agent', 'mach-B', 'projB:worker-2', ['bus:send', 'bus:read']);
+      await seedCred(instance.sql, 'c_p1', 'tok_p1', 'agent', 'mach-A', 'principal-1', ['bus:send', 'bus:read']);
+    });
+  });
+
+  const http = (method: string, path: string, token: string, body?: any) => doFetch(new Request(`http://example.com${path}`, {
+    method,
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  }));
+
+  const send = (token: string, from: string, to: string, key: string, body = 'hello') =>
+    http('POST', '/api/bus/send', token, { from_actor: from, to_actor: to, kind: 'note', body, idempotency_key: key });
+
+  const row = (id: string) => runInDurableObject(stub, async (instance: Hub) =>
+    instance.sql.exec('SELECT * FROM messages WHERE id = ?', id).toArray()[0] as any);
+
+  it('15: GAP-1 recipient inbox marks delivered and HTTP ACK succeeds without SQL forging', async () => {
+    const sent = await send('tok_w1', 'worker-1', 'worker-2', 'g1-key');
+    expect(sent.status).toBe(200);
+    const { id } = await sent.json() as any;
+
+    // Sender ACK and a foreign host's inbox are refused and do not mark anything
+    expect((await http('POST', `/api/bus/messages/${id}/ack`, 'tok_w1')).status).toBe(403);
+    expect((await http('GET', '/api/bus/inbox?actor=worker-2', 'tok_host_a')).status).toBe(403);
+    expect((await http('GET', `/api/bus/messages/${id}`, 'tok_w1')).status).toBe(200);
+    let r = await row(id);
+    expect(r.delivered_at).toBeNull();
+    expect(r.read_at).toBeNull();
+
+    // Before any recipient read, ACK is still out of order
+    expect((await http('POST', `/api/bus/messages/${id}/ack`, 'tok_host_b')).status).toBe(400);
+
+    // Recipient host bridge polls the inbox: message is delivered
+    const inboxRes = await http('GET', '/api/bus/inbox?actor=worker-2', 'tok_host_b');
+    expect(inboxRes.status).toBe(200);
+    const inbox = await inboxRes.json() as any[];
+    expect(inbox.map(m => m.id)).toEqual([id]);
+    expect(inbox[0].delivered_at).toBeTruthy();
+    r = await row(id);
+    expect(r.delivered_at).toBe(inbox[0].delivered_at);
+    expect(r.read_at).toBeNull();
+
+    // A second poll keeps the first delivery time
+    const again = await (await http('GET', '/api/bus/inbox?actor=worker-2', 'tok_host_b')).json() as any[];
+    expect(again[0].delivered_at).toBe(r.delivered_at);
+
+    const ack = await http('POST', `/api/bus/messages/${id}/ack`, 'tok_host_b');
+    expect(ack.status).toBe(200);
+    expect((await row(id)).acked_at).toBeTruthy();
+    expect((await http('POST', `/api/bus/messages/${id}/accept`, 'tok_host_b')).status).toBe(200);
+    expect((await http('POST', `/api/bus/messages/${id}/complete`, 'tok_host_b')).status).toBe(200);
+  });
+
+  it('16: GAP-1 recipient show marks delivered+read; sender and admin views do not', async () => {
+    const { id } = await (await send('tok_w1', 'worker-1', 'worker-2', 'g1-show')).json() as any;
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const bus = instance.busService;
+      bus.show({ isAdmin: true }, id);
+      bus.inbox({ isAdmin: true }, 'worker-2');
+      bus.show({ actor: 'worker-1' }, id);
+    });
+    let r = await row(id);
+    expect(r.delivered_at).toBeNull();
+    expect(r.read_at).toBeNull();
+
+    const shown = await http('GET', `/api/bus/messages/${id}`, 'tok_w2q');
+    expect(shown.status).toBe(200);
+    const msg = await shown.json() as any;
+    expect(msg.delivered_at).toBeTruthy();
+    expect(msg.read_at).toBeTruthy();
+    r = await row(id);
+    expect(r.read_at).toBe(msg.read_at);
+    expect((await http('POST', `/api/bus/messages/${id}/ack`, 'tok_w2q')).status).toBe(200);
+  });
+
+  it('17: GAP-4 malformed and ambiguous addresses are rejected and never stored', async () => {
+    for (const to of ['projB:worker-2:extra', 'projB:worker-2:', 'projB::worker-2', ':worker-2', 'worker-2:', ' worker-2', 'worker 2', 'role:', 'machine:', 'role:worker', 'role:root', 'role:rootx']) {
+      const res = await send('tok_w1', 'worker-1', to, `bad-${to}`);
+      expect([to, res.status]).toEqual([to, 404]);
+    }
+    const stored = await runInDurableObject(stub, async (instance: Hub) =>
+      instance.sql.exec('SELECT COUNT(*) AS n FROM messages').toArray()[0] as any);
+    expect(stored.n).toBe(0);
+
+    // Unique role resolves; machine and both agent forms stay valid
+    for (const to of ['role:principal', 'machine:mach-B', 'worker-2', 'projB:worker-2']) {
+      expect([to, (await send('tok_w1', 'worker-1', to, `ok-${to}`)).status]).toEqual([to, 200]);
+    }
+
+    // Malformed actor in inbox is refused, not matched against stored strings
+    expect((await http('GET', `/api/bus/inbox?actor=${encodeURIComponent('projB:worker-2:extra')}`, 'tok_host_b')).status).toBe(403);
+  });
+
+  it('18: GAP-4 inbox and ACK are consistent across tag, project:tag and unique role aliases', async () => {
+    const q = await (await send('tok_w1', 'worker-1', 'projB:worker-2', 'alias-q')).json() as any;
+    const t = await (await send('tok_w1', 'worker-1', 'worker-2', 'alias-t')).json() as any;
+
+    // Bare-tag inbox (host) and qualified-actor inbox (agent) see both messages
+    const viaTag = await (await http('GET', '/api/bus/inbox?actor=worker-2', 'tok_host_b')).json() as any[];
+    expect(viaTag.map(m => m.id).sort()).toEqual([q.id, t.id].sort());
+    const viaAgent = await (await http('GET', `/api/bus/inbox?actor=${encodeURIComponent('projB:worker-2')}`, 'tok_w2q')).json() as any[];
+    expect(viaAgent.map(m => m.id).sort()).toEqual([q.id, t.id].sort());
+
+    // The qualified-actor credential may ACK the bare-tag message and vice versa for the host
+    expect((await http('POST', `/api/bus/messages/${t.id}/ack`, 'tok_w2q')).status).toBe(200);
+    expect((await http('POST', `/api/bus/messages/${q.id}/ack`, 'tok_host_b')).status).toBe(200);
+
+    // role:principal is principal-1's inbox; another agent cannot read or ACK it
+    const r = await (await send('tok_w1', 'worker-1', 'role:principal', 'alias-role')).json() as any;
+    expect((await http('GET', `/api/bus/inbox?actor=${encodeURIComponent('role:principal')}`, 'tok_w1')).status).toBe(403);
+    expect((await http('POST', `/api/bus/messages/${r.id}/ack`, 'tok_w1')).status).toBe(403);
+    const p1 = await (await http('GET', '/api/bus/inbox?actor=principal-1', 'tok_p1')).json() as any[];
+    expect(p1.map(m => m.id)).toEqual([r.id]);
+    expect((await http('POST', `/api/bus/messages/${r.id}/ack`, 'tok_p1')).status).toBe(200);
+
+    // Once the role is shared it is no longer an alias of principal-1 and no longer a valid address
+    await runInDurableObject(stub, async (instance: Hub) => {
+      instance.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('principal-2', 'projB', 'principal', 'mach-B')");
+    });
+    expect((await send('tok_w1', 'worker-1', 'role:principal', 'alias-role-2')).status).toBe(404);
+    const p1After = await (await http('GET', '/api/bus/inbox?actor=principal-1', 'tok_p1')).json() as any[];
+    expect(p1After).toEqual([]);
+  });
+
+  it('19: GAP-9 expired messages are not served and their idempotency key is reusable', async () => {
+    const first = await (await send('tok_w1', 'worker-1', 'worker-2', 'exp-key', 'same body')).json() as any;
+    // Replay inside the window returns the original id
+    expect((await (await send('tok_w1', 'worker-1', 'worker-2', 'exp-key', 'same body')).json() as any).id).toBe(first.id);
+
+    await runInDurableObject(stub, async (instance: Hub) => {
+      instance.sql.exec('UPDATE messages SET expires_at = ? WHERE id = ?', Date.now() - 1, first.id);
+    });
+    expect(await (await http('GET', '/api/bus/inbox?actor=worker-2', 'tok_host_b')).json()).toEqual([]);
+    expect((await http('GET', `/api/bus/messages/${first.id}`, 'tok_host_b')).status).toBe(404);
+    expect((await http('POST', `/api/bus/messages/${first.id}/ack`, 'tok_host_b')).status).toBe(404);
+    expect((await http('POST', '/api/bus/reply', 'tok_host_b', {
+      from_actor: 'worker-2', to_actor: 'worker-1', kind: 'reply', body: 'late', idempotency_key: 'late-reply', reply_to: first.id,
+    })).status).toBe(400);
+
+    // Same key after expiry but before retention purge: a new message, same as after a purge
+    const second = await (await send('tok_w1', 'worker-1', 'worker-2', 'exp-key', 'same body')).json() as any;
+    expect(second.id).not.toBe(first.id);
+    const rows = await runInDurableObject(stub, async (instance: Hub) =>
+      instance.sql.exec("SELECT id FROM messages WHERE idempotency_key = 'exp-key'").toArray() as any[]);
+    expect(rows.map(x => x.id)).toEqual([second.id]);
+  });
+
+  it('20: retention purge boundary matches the read boundary (expires_at <= now)', async () => {
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const bus = new BusService(instance.sql);
+      const now = Date.now();
+      instance.sql.exec("INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES ('edge', 'worker-1', 'worker-2', 'note', 'th', 'b', 'edge-k', ?, ?)", now - 10, now);
+      instance.sql.exec("INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES ('live', 'worker-1', 'worker-2', 'note', 'th', 'b', 'live-k', ?, ?)", now - 10, now + 60000);
+      expect(bus.retentionCleanup(now, 100).messagesDeleted).toBe(1);
+      expect(instance.sql.exec('SELECT id FROM messages').toArray().map((m: any) => m.id)).toEqual(['live']);
+    });
+  });
+
+  it('21: parseAddress grammar and service-level role/sender checks', async () => {
+    expect(parseAddress('worker-1')).toEqual({ kind: 'tag', tag: 'worker-1' });
+    expect(parseAddress('projA:worker-1')).toEqual({ kind: 'qualified', project: 'projA', tag: 'worker-1' });
+    expect(parseAddress('role:principal')).toEqual({ kind: 'role', role: 'principal' });
+    expect(parseAddress('machine:mach-A')).toEqual({ kind: 'machine', machineId: 'mach-A' });
+    for (const bad of ['', 'a:b:c', 'a:', ':a', 'a::b', ' a', 'a\tb', 'x'.repeat(129), null, 7]) {
+      expect(parseAddress(bad)).toBeNull();
+    }
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const bus = new BusService(instance.sql);
+      expect(bus.validateRecipient('role:worker')).toBe(false); // two workers: undefined fan-out
+      expect(bus.validateRecipient('role:principal')).toBe(true);
+      expect(bus.isAuthorizedForActor({ kind: 'host', machineId: 'mach-A' }, 'role:principal')).toBe(true);
+      expect(bus.isAuthorizedForActor({ kind: 'host', machineId: 'mach-B' }, 'role:principal')).toBe(false);
+      expect(bus.isAuthorizedForActor({ kind: 'host', machineId: 'mach-A' }, 'role:worker')).toBe(false);
+      expect(bus.isAuthorizedForActor({ isAdmin: true }, 'a:b:c')).toBe(false);
+      expect(() => bus.send({ isAdmin: true }, {
+        senderActor: 'projA:worker-1:x', toActor: 'worker-2', kind: 'note', body: 'b', idempotencyKey: 'bad-sender',
+      })).toThrow('unauthorized');
+    });
+  });
+
+  it('22: Root send path keeps idempotent dedup and still refuses role:root', async () => {
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const rootBus = (instance.jobsService as any).busService;
+      const opts = { senderActor: 'role:root', toActor: 'role:principal', kind: 'note', body: 'skip', idempotencyKey: 'root-dedup', leaseEpoch: 3 };
+      const a = rootBus.sendRootMessage({ actor: 'role:root', isAdmin: true }, opts);
+      const b = rootBus.sendRootMessage({ actor: 'role:root', isAdmin: true }, opts);
+      expect(b.id).toBe(a.id);
+      expect(() => rootBus.sendRootMessage({ actor: 'role:root', isAdmin: true }, { ...opts, idempotencyKey: 'root-2', toActor: 'role:root' })).toThrow('unknown_recipient');
+      expect(() => rootBus.sendRootMessage({ actor: 'role:root', isAdmin: true }, { ...opts, idempotencyKey: 'root-3', toActor: 'p:t:x' })).toThrow('unknown_recipient');
+      expect(instance.sql.exec("SELECT COUNT(*) AS n FROM messages WHERE from_actor = 'role:root'").toArray()[0]).toEqual({ n: 1 });
+    });
+  });
+
+  const reply = (token: string, replyTo: string, from: string, to: string, key: string) =>
+    http('POST', '/api/bus/reply', token, { from_actor: from, to_actor: to, kind: 'reply', body: `re ${key}`, idempotency_key: key, reply_to: replyTo });
+
+  const count = (where: string, ...params: any[]) => runInDurableObject(stub, async (instance: Hub) =>
+    (instance.sql.exec(`SELECT COUNT(*) AS n FROM ${where}`, ...params).toArray()[0] as any).n as number);
+
+  it('23: F1 reply_to participants compare by canonical project+tag, so any alias form may reply', async () => {
+    const m = await (await send('tok_w1', 'worker-1', 'projB:worker-2', 'f1-m')).json() as any;
+    const r = await (await send('tok_w1', 'projA:worker-1', 'role:principal', 'f1-r')).json() as any;
+
+    // Recipient replies in the other alias form of itself and of the original sender
+    for (const [token, from, to, key] of [
+      ['tok_host_b', 'worker-2', 'worker-1', 'f1-a'],
+      ['tok_w2q', 'projB:worker-2', 'projA:worker-1', 'f1-b'],
+      ['tok_host_b', 'worker-2', 'projA:worker-1', 'f1-c'],
+    ]) {
+      const res = await reply(token, m.id, from, to, key);
+      expect([key, res.status]).toEqual([key, 200]);
+      expect((await res.json() as any).thread_id).toBe(m.thread_id);
+    }
+    // role:principal is principal-1's unique alias while principal-1 is the only holder
+    expect((await reply('tok_p1', r.id, 'principal-1', 'worker-1', 'f1-d')).status).toBe(200);
+    expect((await reply('tok_host_a', r.id, 'projA:principal-1', 'projA:worker-1', 'f1-e')).status).toBe(200);
+
+    // A third agent, or a reply addressed to a non-party, is still refused and stores nothing
+    expect((await reply('tok_p1', m.id, 'principal-1', 'worker-1', 'f1-x1')).status).toBe(400);
+    expect((await reply('tok_host_b', m.id, 'worker-2', 'principal-1', 'f1-x2')).status).toBe(400);
+    expect((await reply('tok_host_b', m.id, 'worker-2', 'machine:mach-A', 'f1-x3')).status).toBe(400);
+    expect(await count('messages WHERE reply_to = ?', m.id)).toBe(3);
+    expect(await count('messages WHERE reply_to = ?', r.id)).toBe(2);
+
+    // Once role:principal is shared it is no longer principal-1's alias: replying as that role fails
+    await runInDurableObject(stub, async (instance: Hub) => {
+      instance.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('principal-2', 'projB', 'principal', 'mach-B')");
+    });
+    expect((await reply('tok_w1', r.id, 'worker-1', 'role:principal', 'f1-x4')).status).toBe(404);
+    expect((await reply('tok_w1', r.id, 'worker-1', 'principal-1', 'f1-x5')).status).toBe(400);
+  });
+
+  it('24: F5 stages advance only by the recipient (no admin override) and a stage time never moves', async () => {
+    const { id } = await (await send('tok_w1', 'worker-1', 'worker-2', 'f5-key')).json() as any;
+    const admin: CallerContext = { isAdmin: true, kind: 'session' };
+    await runInDurableObject(stub, async (instance: Hub) => {
+      expect(() => instance.busService.deliver(admin, id)).toThrow('unauthorized');
+    });
+    expect((await http('GET', '/api/bus/inbox?actor=worker-2', 'tok_host_b')).status).toBe(200);
+
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const bus = instance.busService;
+      for (const stage of ['ack', 'accept', 'complete'] as const) {
+        expect(() => bus[stage](admin, id)).toThrow('unauthorized');
+        expect(() => bus[stage]({ isAdmin: true, actor: 'worker-1' }, id)).toThrow('unauthorized');
+      }
+    });
+    let r = await row(id);
+    expect([r.acked_at, r.accepted_at, r.completed_at]).toEqual([null, null, null]);
+
+    expect((await http('POST', `/api/bus/messages/${id}/ack`, 'tok_host_b')).status).toBe(200);
+    const ackedAt = (await row(id)).acked_at;
+    expect(ackedAt).toBeTruthy();
+
+    // Repeat ACK over HTTP and at a later explicit time: 200 / no-op, acked_at unchanged
+    expect((await http('POST', `/api/bus/messages/${id}/ack`, 'tok_w2q')).status).toBe(200);
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const recipient: CallerContext = { kind: 'host', machineId: 'mach-B' };
+      instance.busService.ack(recipient, id, ackedAt + 60000);
+      instance.busService.accept(recipient, id, ackedAt + 1000);
+      instance.busService.accept(recipient, id, ackedAt + 90000);
+      instance.busService.complete(recipient, id, ackedAt + 2000);
+      instance.busService.complete(recipient, id, ackedAt + 99000);
+    });
+    r = await row(id);
+    expect(r.acked_at).toBe(ackedAt);
+    expect(r.accepted_at).toBe(ackedAt + 1000);
+    expect(r.completed_at).toBe(ackedAt + 2000);
+  });
+
+  it('25: F6 root role refusal is case-insensitive and covers root-prefixed roles', async () => {
+    await runInDurableObject(stub, async (instance: Hub) => {
+      instance.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('boss-1', 'projA', 'ROOT', 'mach-A')");
+      instance.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('boss-2', 'projB', 'rootish', 'mach-B')");
+    });
+    for (const to of ['role:ROOT', 'role:Root', 'role:rootish', 'role:ROOTISH', 'ROLE:root', 'Role:Root']) {
+      expect([to, (await send('tok_w1', 'worker-1', to, `f6-${to}`)).status]).toEqual([to, 404]);
+    }
+    expect(await count('messages')).toBe(0);
+    expect((await http('GET', `/api/bus/inbox?actor=${encodeURIComponent('role:ROOT')}`, 'tok_host_a')).status).toBe(403);
+    expect((await http('GET', `/api/bus/inbox?actor=${encodeURIComponent('role:rootish')}`, 'tok_host_b')).status).toBe(403);
+    expect((await http('POST', '/api/bus/claims', 'tok_host_a', { project: 'projA', scope: 'src', holder: 'role:ROOT' })).status).toBe(403);
+    expect(await count('claims')).toBe(0);
+
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const bus = new BusService(instance.sql);
+      for (const a of ['role:ROOT', 'role:rootish', 'ROLE:root']) {
+        expect(bus.validateRecipient(a)).toBe(false);
+        expect(bus.isAuthorizedForActor({ isAdmin: true }, a)).toBe(false);
+        expect(bus.isAuthorizedForActor({ kind: 'host', machineId: 'mach-A' }, a)).toBe(false);
+        expect(bus.isAuthorizedForActor({ kind: 'host', machineId: 'mach-B' }, a)).toBe(false);
+        expect(() => bus.send({ isAdmin: true }, { senderActor: a, toActor: 'worker-2', kind: 'note', body: 'b', idempotencyKey: `s-${a}` })).toThrow(/missing_m4_root_authority/);
+        expect(() => bus.inbox({ isAdmin: true }, a)).toThrow(/missing_m4_root_authority/);
+        expect(() => bus.claim({ isAdmin: true }, 'projA', 'src', a, 60000)).toThrow(/missing_m4_root_authority/);
+        expect(() => bus.listClaims({ actor: a })).toThrow(/missing_m4_root_authority/);
+        expect(() => bus.getBusActors({ actor: a })).toThrow(/missing_m4_root_authority/);
+      }
+      // A root-role agent's own tag inbox never gains a role:* alias
+      expect(bus.inbox({ kind: 'host', machineId: 'mach-B' }, 'boss-2')).toEqual([]);
+    });
+    expect(await count('messages')).toBe(0);
+  });
+
+  it('26: F4 claim holders and caller actors follow the address grammar; nothing malformed is stored', async () => {
+    for (const holder of ['projA:worker-1:extra', 'projA:worker-1:', ':worker-1', 'projA::worker-1', 'worker-1 ', 'role:worker', 'role:principal', 'machine:mach-A', 'unknown-agent', 'projB:worker-2']) {
+      const res = await http('POST', '/api/bus/claims', 'tok_host_a', { project: 'projA', scope: 'src/bus.ts', holder });
+      expect([holder, res.status]).toEqual([holder, 403]);
+    }
+    expect(await count('claims')).toBe(0);
+
+    // The real holder is not blocked by a stored malformed twin
+    const ok = await http('POST', '/api/bus/claims', 'tok_w1', { project: 'projA', scope: 'src/bus.ts', holder: 'projA:worker-1' });
+    expect(ok.status).toBe(200);
+    const { id } = await ok.json() as any;
+
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const bus = new BusService(instance.sql);
+      const bad: CallerContext = { actor: 'projA:worker-1:x' };
+      expect(() => bus.claim(bad, 'projA', 'docs', 'worker-1', 60000)).toThrow('unauthorized');
+      expect(() => bus.claim(bad, 'projA', 'docs', 'projA:worker-1:x', 60000)).toThrow('unauthorized');
+      expect(() => bus.claim({ isAdmin: true }, 'projA', 'docs', 'projA:worker-1:x', 60000)).toThrow('unauthorized');
+      expect(() => bus.releaseClaim(bad, id)).toThrow('unauthorized');
+      expect(bus.listClaims(bad)).toEqual([]);
+      expect(() => bus.listClaims(bad, 'projA')).toThrow('unauthorized');
+      expect(bus.isAuthorizedForActor(bad, 'projA:worker-1')).toBe(false);
+      expect(bus.isAuthorizedForActor(bad, 'projA:worker-1:x')).toBe(false);
+      expect(bus.getBusActors(bad)).toEqual([]);
+    });
+    expect(await count('claims')).toBe(1);
+    expect((await http('POST', `/api/bus/claims/${id}/release`, 'tok_host_a')).status).toBe(200);
+  });
+
+  it('27: F7 duplicate tag across projects: bare tag is ambiguous, qualified forms stay separate identities', async () => {
+    await runInDurableObject(stub, async (instance: Hub) => {
+      // The Hub schema keys agents by tag; the bus schema does not, so pin the service over a no-PK table
+      instance.sql.exec('DROP TABLE IF EXISTS bus_agents_dup');
+      instance.sql.exec('CREATE TABLE bus_agents_dup (tag TEXT NOT NULL, project TEXT NOT NULL, role TEXT, machine_id TEXT, registered_at TEXT)');
+      for (const [tag, project, role, mach] of [['dup', 'projA', 'dup-a', 'mach-A'], ['dup', 'projB', 'dup-b', 'mach-B'], ['worker-1', 'projA', 'worker', 'mach-A']]) {
+        instance.sql.exec('INSERT INTO bus_agents_dup (tag, project, role, machine_id) VALUES (?, ?, ?, ?)', tag, project, role, mach);
+      }
+      const sql = { exec: (q: string, ...p: any[]) => instance.sql.exec(q.replace(/\bagents\b/g, 'bus_agents_dup'), ...p) };
+      const bus = new BusService(sql as any);
+      const a: CallerContext = { actor: 'projA:dup' };
+      const b: CallerContext = { actor: 'projB:dup' };
+
+      expect(bus.validateRecipient('dup')).toBe(false);
+      expect(bus.validateRecipient('projA:dup')).toBe(true);
+      expect(bus.validateRecipient('projB:dup')).toBe(true);
+      expect(bus.validateRecipient('role:dup-b')).toBe(true);
+      expect(bus.isAuthorizedForActor(a, 'projB:dup')).toBe(false);
+      expect(bus.isAuthorizedForActor(a, 'dup')).toBe(false);
+      expect(bus.isAuthorizedForActor(a, 'role:dup-b')).toBe(false);
+      expect(bus.isAuthorizedForActor(b, 'role:dup-b')).toBe(true);
+      expect(bus.isAuthorizedForActor({ kind: 'host', machineId: 'mach-A' }, 'projB:dup')).toBe(false);
+      expect(bus.isAuthorizedForActor({ kind: 'host', machineId: 'mach-B' }, 'projB:dup')).toBe(true);
+      expect(bus.isAuthorizedForActor({ kind: 'host', machineId: 'mach-B' }, 'dup')).toBe(false);
+
+      const w1: CallerContext = { actor: 'worker-1' };
+      expect(() => bus.send(w1, { senderActor: 'worker-1', toActor: 'dup', kind: 'note', body: 'b', idempotencyKey: 'd0' })).toThrow('unknown_recipient');
+      const m = bus.send(w1, { senderActor: 'worker-1', toActor: 'projB:dup', kind: 'note', body: 'b', idempotencyKey: 'd1' });
+      expect(() => bus.inbox(a, 'projB:dup')).toThrow('unauthorized');
+      expect(bus.inbox(a, 'projA:dup')).toEqual([]);
+      expect(bus.inbox(b, 'role:dup-b').map((x: any) => x.id)).toEqual([m.id]);
+
+      // Only projB:dup (in any of its own alias forms) may reply; projA:dup and the bare tag may not
+      expect(() => bus.send(a, { senderActor: 'projA:dup', toActor: 'worker-1', kind: 'reply', body: 'r', idempotencyKey: 'd2', replyTo: m.id })).toThrow('invalid_reply_to');
+      expect(() => bus.send(b, { senderActor: 'dup', toActor: 'worker-1', kind: 'reply', body: 'r', idempotencyKey: 'd3', replyTo: m.id })).toThrow('unauthorized');
+      expect(bus.send(b, { senderActor: 'role:dup-b', toActor: 'projA:worker-1', kind: 'reply', body: 'r', idempotencyKey: 'd4', replyTo: m.id }).thread_id).toBe(m.thread_id);
+
+      // A bare ambiguous holder is refused for agent and host callers alike
+      expect(() => bus.claim(b, 'projB', 'src', 'dup', 60000)).toThrow('unauthorized');
+      expect(() => bus.claim({ kind: 'host', machineId: 'mach-B' }, 'projB', 'src', 'dup', 60000)).toThrow('unauthorized');
+      expect(() => bus.claim(a, 'projB', 'src', 'projB:dup', 60000)).toThrow('unauthorized');
+      expect(bus.claim(b, 'projB', 'src', 'projB:dup', 60000).id).toBeTruthy();
+      expect(bus.listClaims(a)).toEqual([]);
+      expect(bus.listClaims(b).map((c: any) => c.holder)).toEqual(['projB:dup']);
+      instance.sql.exec('DROP TABLE bus_agents_dup');
     });
   });
 });

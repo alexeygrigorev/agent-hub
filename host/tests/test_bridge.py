@@ -18,9 +18,14 @@ from agent_hub_host.bridge import (
     BridgeCapabilityGap,
     MailboxBridge,
     canonicalize_workspace,
+    composer_is_empty,
     get_authoritative_runtime_dir,
     get_authoritative_state_dir,
     get_workspace_key,
+    native_tag_for_address,
+    normalize_native_kind,
+    poll_once,
+    registered_bridge_targets,
 )
 from agent_hub_host.native_bridge import validate_native_reply_provenance
 
@@ -1620,6 +1625,557 @@ sys.exit(0)
             deliv_restart_replay = bridge_restarted_2.forward_hub_to_native(sync_msg)
             self.assertEqual(deliv_restart_replay, "native-live-sync")
             mock_run.assert_not_called()
+
+
+class TestBridgeAddressingAndComposer(unittest.TestCase):
+    """GAP-10: exact hub address -> native tag mapping and a strict empty-composer check."""
+
+    def _bridge_with_state(self, tag="agent-1"):
+        td = get_test_tmp_dir()
+        work = os.path.join(td, "work")
+        state_dir = os.path.join(td, "state")
+        canonical_ws = canonicalize_workspace(work)
+        rec_uuid = str(uuid.uuid4())
+        create_authoritative_state(state_dir, canonical_ws, tag, rec_uuid)
+        bridge = MailboxBridge(work, state_dir=state_dir, runtime_dir=os.path.join(td, "runtime"))
+        send_out = json.dumps({
+            "schema_version": 1,
+            "id": "nid-1",
+            "workspace": canonical_ws,
+            "from": {"tag": bridge.service_binding.tag, "session_id": bridge.service_binding.session_id},
+            "to": {"tag": tag, "session_id": rec_uuid},
+        })
+        return bridge, send_out
+
+    def test_native_tag_for_address_exact_mapping(self):
+        self.assertEqual(native_tag_for_address("agent-1"), "agent-1")
+        self.assertEqual(native_tag_for_address("projA:agent-1"), "agent-1")
+        self.assertEqual(native_tag_for_address("agent:agent-1"), "agent-1")  # parsed as project 'agent'
+        for address in ["role:principal", "machine:m1", "projA:agent-1:x", "projA:", ":agent-1", "a::b",
+                        "", " agent-1", "agent 1", "a\tb", "x" * 129, None, 7]:
+            self.assertIsNone(native_tag_for_address(address), address)
+
+    def test_composer_is_empty_only_for_bare_prompt(self):
+        for line in ["❯", ">", "$", "#", "  ❯  ", "│ > │", "│ ❯                    │", "┃ $ ┃",
+                     "prompt ❯", "user@host:~$ ❯ "]:
+            self.assertTrue(composer_is_empty(line), line)
+        for line in ["echo hi >", "ls -la $", "draft about #", "❯ half draft", "│ > draft │", "prompt ❯ typed",
+                     "two words ❯", "❯ x ❯", "> ❯", "x >", "x $", "x #", ">>", "", "│ │", "user@host:~$", "abc❯"]:
+            self.assertFalse(composer_is_empty(line), line)
+
+    def _sync_attempt(self, bridge, send_out, status, capture):
+        hub_msg = {"id": f"sync-{uuid.uuid4()}", "to_actor": "agent-1", "body": "wake", "kind": "sync_reply"}
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout=send_out),
+                MagicMock(returncode=0, stdout=json.dumps({"state": status})),
+                MagicMock(returncode=0, stdout=capture),
+            ] + [MagicMock(returncode=0, stdout=json.dumps({"state": status})), MagicMock(returncode=0, stdout=capture)] * 2 + [
+                MagicMock(returncode=0, stdout='{"id":"nid-1"}'),
+            ]
+            try:
+                bridge.forward_hub_to_native(hub_msg)
+                delivered = True
+            except BridgeCapabilityGap:
+                delivered = False
+            deliver_calls = [c for c in mock_run.call_args_list if "deliver" in c.args[0]]
+        bridge.receipts = {}
+        return delivered, deliver_calls
+
+    def test_sync_reply_refuses_drafts_ending_in_prompt_chars_and_non_idle_states(self):
+        bridge, send_out = self._bridge_with_state()
+        for capture in ["welcome\necho hi >", "welcome\nls -la $", "welcome\nnote #", "welcome\nfix the bug ❯", "welcome\n│ > draft │"]:
+            delivered, deliver_calls = self._sync_attempt(bridge, send_out, "idle", capture)
+            self.assertFalse(delivered, capture)
+            self.assertEqual(deliver_calls, [], capture)
+        for status in ["busy", "unknown", "frozen", "waiting", "exited"]:
+            delivered, deliver_calls = self._sync_attempt(bridge, send_out, status, "welcome\n❯")
+            self.assertFalse(delivered, status)
+            self.assertEqual(deliver_calls, [], status)
+        # Idle with a bare glyph inside composer borders is the only path that types
+        delivered, deliver_calls = self._sync_attempt(bridge, send_out, "idle", "welcome\n│ > │")
+        self.assertTrue(delivered)
+        self.assertEqual(len(deliver_calls), 1)
+
+    def test_forward_refuses_addresses_without_native_mailbox_before_any_effect(self):
+        bridge, _ = self._bridge_with_state()
+        for to_actor in ["role:principal", "machine:m1", "projA:agent-1:x", "projA:", ""]:
+            with patch("subprocess.run") as mock_run:
+                with self.assertRaises(BridgeCapabilityGap):
+                    bridge.forward_hub_to_native({"id": f"h-{to_actor}", "to_actor": to_actor, "body": "b", "kind": "note"})
+                mock_run.assert_not_called()
+            self.assertNotIn(f"h-{to_actor}", bridge.receipts.get("ambiguous_sends", {}))
+        # A message whose address names another tag is refused even when polled for agent-1
+        with patch("subprocess.run") as mock_run:
+            with self.assertRaises(BridgeCapabilityGap):
+                bridge.forward_hub_to_native({"id": "h-other", "to_actor": "projA:agent-2", "body": "b", "kind": "note"}, native_tag="agent-1")
+            mock_run.assert_not_called()
+
+    def test_forward_role_alias_uses_polled_native_tag(self):
+        bridge, send_out = self._bridge_with_state()
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=send_out)
+            nid = bridge.forward_hub_to_native(
+                {"id": "h-role", "to_actor": "role:principal", "from_actor": "projB:lead", "body": "b", "kind": "note"},
+                native_tag="agent-1",
+            )
+        self.assertEqual(nid, "nid-1")
+        cmd = mock_run.call_args.args[0]
+        self.assertEqual(cmd[cmd.index("--to") + 1], "agent-1")
+        self.assertEqual(bridge.receipts["hub_messages"]["nid-1"]["native_tag"], "agent-1")
+        self.assertEqual(bridge.receipts["hub_messages"]["nid-1"]["to_actor"], "role:principal")
+
+    def test_native_kind_normalization(self):
+        for kind in ["note", "handoff", "reply", "status", "claim", "release"]:
+            self.assertEqual(normalize_native_kind(kind), kind)
+        for kind in ["sync_reply", "scope_claim", "question", "", None, 3]:
+            self.assertEqual(normalize_native_kind(kind), "reply")
+
+    def test_registered_bridge_targets(self):
+        actors = ["machine:m1", "agent-1", "projA:agent-1", "projB:agent-2", "role:principal", "bad:a:b"]
+        self.assertEqual(registered_bridge_targets(actors), [("projA:agent-1", "agent-1"), ("projB:agent-2", "agent-2")])
+        self.assertEqual(registered_bridge_targets(actors, ["agent-2"]), [("projB:agent-2", "agent-2")])
+        with self.assertRaises(BridgeCapabilityGap):
+            registered_bridge_targets(actors, ["agent-3"])
+        self.assertEqual(registered_bridge_targets({"error": "x"}), [])
+
+
+class _FakeInbox:
+    """bus.inbox with the hub's paging: rows ordered by id, only `id > cursor`, at most `limit`."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = []
+
+    def __call__(self, actor, limit=50, cursor=None):
+        self.calls.append((actor, limit, cursor))
+        rows = sorted((r for r in self.rows if cursor is None or r["id"] > cursor), key=lambda r: r["id"])
+        return [dict(r) for r in rows[:limit]]
+
+
+class TestBridgePollCursor(unittest.TestCase):
+    """F2/F3/F7: durable inbox cursor, bounded window errors, no duplicate forward, surfaced sync errors."""
+
+    def setUp(self):
+        td = get_test_tmp_dir()
+        self.work = os.path.join(td, "work")
+        self.state_dir = os.path.join(td, "state")
+        os.makedirs(self.work, exist_ok=True)
+        self.bridge = MailboxBridge(self.work, state_dir=self.state_dir)
+        self.forward_calls = []
+        self.failures = {}
+
+    def _messages(self, n, created=None):
+        created = created or [1000 + i for i in range(n)]
+        return [{"id": f"m{i:03d}", "to_actor": "projA:agent-1", "from_actor": "projB:lead", "kind": "note",
+                 "body": f"b{i}", "created_at": created[i]} for i in range(n)]
+
+    def _forward(self, msg, native_tag=None):
+        self.forward_calls.append(msg["id"])
+        error = self.failures.get(msg["id"])
+        if error:
+            raise error
+        self.bridge.receipts["hub_to_native"][msg["id"]] = f"n-{msg['id']}"
+        return f"n-{msg['id']}"
+
+    def _poll(self, inbox, limit=50, max_pages=10, synced=None):
+        with patch("agent_hub_host.bridge.bus") as mock_bus, \
+             patch.object(self.bridge, "forward_hub_to_native", side_effect=self._forward), \
+             patch.object(self.bridge, "sync_native_to_hub", return_value=synced or {"errors": [], "held": []}):
+            mock_bus.inbox.side_effect = inbox
+            return poll_once(self.bridge, [("projA:agent-1", "agent-1")], limit=limit, max_pages=max_pages)
+
+    def test_permanently_held_head_does_not_starve_third_message_across_three_cycles(self):
+        # Reviewer countercase: production poll_once, three rows, one page of two per cycle.
+        inbox = _FakeInbox(self._messages(3))
+        self.failures = {"m000": BridgeCapabilityGap("persistent refusal")}
+        cycles = [self._poll(inbox, limit=2, max_pages=1) for _ in range(3)]
+        self.assertEqual(self.forward_calls.count("m001"), 1)
+        self.assertEqual(self.forward_calls.count("m002"), 1)
+        self.assertTrue(all(c["held"] for c in cycles))
+        self.assertNotIn("m000", self.bridge.receipts["hub_to_native"])
+        self.assertNotIn("m000", self.bridge.receipts["acked_hub_messages"])
+
+    def test_acked_and_already_forwarded_messages_are_never_forwarded_again(self):
+        rows = self._messages(3)
+        rows[0]["acked_at"] = 5
+        self.bridge.receipts["hub_to_native"]["m001"] = "n-old"
+        summary = self._poll(_FakeInbox(rows))
+        self.assertEqual(self.forward_calls, ["m002"])
+        self.assertEqual((summary["acked_skipped"], summary["already_forwarded"]), (1, 1))
+        self.assertEqual([f["hub_id"] for f in summary["forwarded"]], ["m002"])
+        # Same inbox again from the start: still no second forward of any of them
+        self.bridge.receipts["inbox_cursors"] = {}
+        self.bridge._save_receipts()
+        summary = self._poll(_FakeInbox(rows))
+        self.assertEqual(self.forward_calls, ["m002"])
+        self.assertEqual((summary["acked_skipped"], summary["already_forwarded"], summary["forwarded"]), (1, 2, []))
+
+    def test_window_exhaustion_is_an_error_and_the_next_cycle_continues_from_the_cursor(self):
+        inbox = _FakeInbox(self._messages(13))
+        first = self._poll(inbox, limit=1, max_pages=10)
+        self.assertEqual(len(first["forwarded"]), 10)
+        self.assertEqual(len(first["errors"]), 1)
+        self.assertIn("inbox window exhausted", first["errors"][0]["error"])
+        self.assertEqual(self.bridge.inbox_cursor("projA:agent-1"), "m008")
+
+        second = self._poll(inbox, limit=1, max_pages=10)
+        self.assertEqual(inbox.calls[10], ("projA:agent-1", 1, "m009"))
+        self.assertEqual([f["hub_id"] for f in second["forwarded"]], ["m010", "m011", "m012"])
+        self.assertEqual((second["already_forwarded"], second["errors"]), (0, []))
+        self.assertEqual(sorted(self.forward_calls), [f"m{i:03d}" for i in range(13)])
+        self.assertEqual(self.bridge.inbox_cursor("projA:agent-1"), "m011")
+
+    def test_held_or_failed_messages_are_pending_while_the_cursor_progresses(self):
+        inbox = _FakeInbox(self._messages(5))
+        self.failures = {"m001": BridgeCapabilityGap("not idle"), "m002": RuntimeError("send failed before execution")}
+        first = self._poll(inbox)
+        self.assertEqual([f["hub_id"] for f in first["forwarded"]], ["m000", "m003", "m004"])
+        self.assertEqual([h["hub_id"] for h in first["held"]], ["m001"])
+        self.assertEqual([e["hub_id"] for e in first["errors"] if "hub_id" in e], ["m002"])
+        self.assertEqual(self.bridge.inbox_cursor("projA:agent-1"), "m003")
+        self.assertEqual(set(self.bridge.pending_inbox("projA:agent-1")), {"m001", "m002"})
+
+        self.failures = {}
+        second = self._poll(inbox)
+        self.assertEqual(inbox.calls[-1][2], "m003")
+        self.assertEqual([f["hub_id"] for f in second["forwarded"]], ["m001", "m002"])
+        self.assertEqual(second["already_forwarded"], 1)
+        self.assertEqual(self.bridge.inbox_cursor("projA:agent-1"), "m003")
+        self.assertEqual({i: self.forward_calls.count(i) for i in set(self.forward_calls)},
+                         {"m000": 1, "m001": 2, "m002": 2, "m003": 1, "m004": 1})
+
+    def test_retry_and_scan_survive_restart_and_single_row_windows(self):
+        inbox = _FakeInbox(self._messages(4, created=[7, 7, 7, 8]))
+        self.failures = {"m000": BridgeCapabilityGap("busy"), "m001": RuntimeError("unavailable")}
+        self._poll(inbox, limit=1, max_pages=1)
+        self.bridge = MailboxBridge(self.work, state_dir=self.state_dir)
+        self.assertEqual(set(self.bridge.pending_inbox("projA:agent-1")), {"m000"})
+        for _ in range(4):
+            self._poll(inbox, limit=1, max_pages=1)
+            self.bridge = MailboxBridge(self.work, state_dir=self.state_dir)
+        self.assertEqual(self.forward_calls.count("m002"), 1)
+        self.assertEqual(self.forward_calls.count("m003"), 1)
+        self.assertEqual(set(self.bridge.pending_inbox("projA:agent-1")), {"m000", "m001"})
+        self.failures = {}
+        done = self._poll(inbox)
+        self.assertEqual({f["hub_id"] for f in done["forwarded"]}, {"m000", "m001"})
+        self.assertEqual(self.bridge.pending_inbox("projA:agent-1"), {})
+        self.assertEqual(self.bridge.receipts["acked_hub_messages"], [])
+
+    def test_pending_capacity_stops_without_loss_and_expiry_releases_capacity(self):
+        inbox = _FakeInbox(self._messages(3))
+        inbox.rows[0]["expires_at"] = 2000000000000
+        self.failures = {"m000": BridgeCapabilityGap("busy"), "m001": BridgeCapabilityGap("busy")}
+        with patch("agent_hub_host.bridge.MAX_PENDING_INBOX", 1):
+            first = self._poll(inbox, limit=2, max_pages=1)
+            self.assertIn("capacity exhausted", first["errors"][0]["error"])
+            self.assertEqual(self.bridge.inbox_scan("projA:agent-1"), "m000")
+            self.assertEqual(set(self.bridge.pending_inbox("projA:agent-1")), {"m000"})
+            # Explicit expiry, never size-based eviction or successful ACK fabrication.
+            with patch("agent_hub_host.bridge.time.time", return_value=2000000001):
+                self._poll(inbox, limit=1, max_pages=1)
+            self.assertEqual(set(self.bridge.pending_inbox("projA:agent-1")), {"m001"})
+            self.assertNotIn("m000", self.bridge.receipts["hub_to_native"])
+            self.assertEqual(self.bridge.receipts["acked_hub_messages"], [])
+
+    def test_cached_pending_ack_is_not_replayed_after_native_receipt_pruning(self):
+        row = self._messages(1)[0]
+        self.bridge.remember_inbox("projA:agent-1", row)
+        self.bridge.receipts["acked_hub_messages"].append(row["id"])
+        self.bridge._save_receipts()
+        self.bridge = MailboxBridge(self.work, state_dir=self.state_dir)
+        outcome = self._poll(_FakeInbox([]))
+        self.assertEqual(self.forward_calls, [])
+        self.assertEqual(outcome["acked_skipped"], 1)
+        self.assertEqual(self.bridge.pending_inbox("projA:agent-1"), {})
+
+    def test_scan_returns_to_timestamp_fence_for_late_same_millisecond_row(self):
+        inbox = _FakeInbox(self._messages(3, created=[1, 2, 2]))
+        for _ in range(4):
+            self._poll(inbox, limit=1, max_pages=1)
+        late = dict(inbox.rows[1], id="m001a")
+        inbox.rows.append(late)
+        self._poll(inbox)
+        self.assertEqual(self.forward_calls.count("m001a"), 1)
+        self.assertEqual(self.forward_calls.count("m001"), 1)
+        self.assertEqual(self.forward_calls.count("m002"), 1)
+
+    def test_cursor_stays_below_the_newest_millisecond_and_needs_created_at(self):
+        self._poll(_FakeInbox(self._messages(3, created=[7, 7, 7])))
+        self.assertIsNone(self.bridge.inbox_cursor("projA:agent-1"))
+        rows = self._messages(2)
+        for r in rows:
+            del r["created_at"]
+        self._poll(_FakeInbox(rows))
+        self.assertIsNone(self.bridge.inbox_cursor("projA:agent-1"))
+        self._poll(_FakeInbox(self._messages(3, created=[1, 2, 2])))
+        self.assertEqual(self.bridge.inbox_cursor("projA:agent-1"), "m000")
+
+    def test_cursor_is_durable_and_only_moves_forward(self):
+        self.bridge.advance_inbox_cursor("projA:agent-1", "m005")
+        other = MailboxBridge(self.work, state_dir=self.state_dir)
+        self.assertEqual(other.inbox_cursor("projA:agent-1"), "m005")
+        other.advance_inbox_cursor("projA:agent-1", "m003")
+        self.assertEqual(other.inbox_cursor("projA:agent-1"), "m005")
+        self.assertEqual(MailboxBridge(self.work, state_dir=self.state_dir).inbox_cursor("projA:agent-1"), "m005")
+        self.bridge.advance_inbox_cursor("projB:agent-2", "m001")
+        reloaded = MailboxBridge(self.work, state_dir=self.state_dir)
+        self.assertEqual(reloaded.receipts["inbox_cursors"], {"projA:agent-1": "m005", "projB:agent-2": "m001"})
+        with open(reloaded.receipts_file, "w", encoding="utf-8") as f:
+            json.dump({"inbox_cursors": ["bad"]}, f)
+        with self.assertRaises(BridgeCapabilityGap):
+            MailboxBridge(self.work, state_dir=self.state_dir)
+
+    def test_inbox_errors_and_sync_errors_reach_the_summary(self):
+        def broken(actor, limit=50, cursor=None):
+            raise ValueError("HTTP request failed with status 500")
+        synced = {"errors": [{"hub_id": "h1", "error": "hub ack failed: 403"}], "held": [{"native_id": "x", "reason": "reply refused"}]}
+        summary = self._poll(broken, synced=synced)
+        self.assertEqual([e.get("address") or e.get("hub_id") for e in summary["errors"]], ["projA:agent-1", "h1"])
+        self.assertEqual(summary["held"], [{"native_id": "x", "reason": "reply refused"}])
+        summary = self._poll(lambda actor, limit=50, cursor=None: {"error": "x"})
+        self.assertEqual(summary["errors"], [{"address": "projA:agent-1", "error": "inbox failed: inbox did not return a list"}])
+
+    def test_sync_native_to_hub_returns_hub_ack_and_native_log_failures(self):
+        canonical_ws = canonicalize_workspace(self.work)
+        native_id = str(uuid.uuid4())
+        create_authoritative_state(self.state_dir, canonical_ws, "agent-1", str(uuid.uuid4()), exceptions=[native_id])
+        self.bridge.receipts["hub_to_native"] = {"hub-1": native_id}
+        self.bridge.receipts["hub_messages"] = {native_id: {"from_actor": "alice", "to_actor": "agent-1", "hub_id": "hub-1"}}
+        with patch("agent_hub_host.bridge.bus") as mock_bus, \
+             patch("subprocess.run", return_value=MagicMock(returncode=2, stdout="", stderr="log broke")):
+            mock_bus.ack.side_effect = ValueError("HTTP request failed with status 403")
+            outcome = self.bridge.sync_native_to_hub()
+        self.assertEqual(outcome["held"], [])
+        self.assertEqual(outcome["errors"][0], {"hub_id": "hub-1", "error": "hub ack failed: HTTP request failed with status 403"})
+        self.assertIn("aplexer message log failed (exit 2)", outcome["errors"][1]["error"])
+        self.assertNotIn("hub-1", self.bridge.receipts["acked_hub_messages"])
+        for stdout, expected in (("not json", "is not JSON"), ('{"a": 1}', "is not a JSON list")):
+            with patch("agent_hub_host.bridge.bus"), \
+                 patch("subprocess.run", return_value=MagicMock(returncode=0, stdout=stdout)):
+                self.assertIn(expected, self.bridge.sync_native_to_hub()["errors"][-1]["error"])
+
+
+class _LoopbackHub:
+    """Local mocked hub API on 127.0.0.1 with the M3 delivered-before-ACK rule and inbox paging."""
+
+    def __init__(self, actors, messages, post_status=None):
+        import http.server
+        import threading
+
+        self.actors = actors
+        self.messages = {m["id"]: dict(m, delivered_at=None, acked_at=None) for m in messages}
+        self.requests = []
+        self.post_status = post_status
+        hub = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _json(self, status, payload):
+                data = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                hub.requests.append(("GET", self.path, None, self.headers.get("Authorization")))
+                from urllib.parse import urlparse, parse_qs
+                url = urlparse(self.path)
+                if url.path == "/api/bus/actors":
+                    return self._json(200, hub.actors)
+                if url.path == "/api/bus/inbox":
+                    query = parse_qs(url.query)
+                    actor = query.get("actor", [""])[0]
+                    cursor = query.get("cursor", [""])[0]
+                    limit = int(query.get("limit", ["50"])[0])
+                    tag = actor.split(":")[-1]
+                    rows = sorted((m for m in hub.messages.values() if m["to_actor"] in (actor, tag) and m["id"] > cursor),
+                                  key=lambda m: m["id"])[:limit]
+                    for m in rows:
+                        m["delivered_at"] = m["delivered_at"] or 1
+                    return self._json(200, rows)
+                return self._json(404, {"error": "not_found"})
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"null")
+                hub.requests.append(("POST", self.path, body, self.headers.get("Authorization")))
+                if hub.post_status:
+                    return self._json(hub.post_status, {"error": "forbidden", "reason": "scope_missing"})
+                parts = self.path.strip("/").split("/")
+                if parts[:3] == ["api", "bus", "messages"] and parts[-1] == "ack":
+                    m = hub.messages.get(parts[3])
+                    if not m:
+                        return self._json(404, {"error": "not_found"})
+                    if not m["delivered_at"]:
+                        return self._json(400, {"error": "invalid_stage"})
+                    m["acked_at"] = 2
+                    return self._json(200, {"status": "ok", "id": parts[3], "stage": "ack"})
+                if self.path == "/api/bus/send":
+                    return self._json(200, {"id": "hub-reply-1", "thread_id": body.get("thread_id")})
+                return self._json(404, {"error": "not_found"})
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=10)
+
+
+class TestBridgeCliLoopback(unittest.TestCase):
+    """GAP-2: `hub bridge` CLI against fake-a and a loopback mocked hub (no real native or hub)."""
+
+    def setUp(self):
+        td = get_test_tmp_dir()
+        self.td = td
+        self.work = os.path.join(td, "work")
+        self.state_dir = os.path.join(td, "native-state")
+        self.runtime_dir = os.path.join(td, "native-runtime")
+        os.makedirs(self.work, exist_ok=True)
+        os.makedirs(self.runtime_dir, exist_ok=True)
+        canonical_ws = canonicalize_workspace(self.work)
+        self.native_msg_id = str(uuid.uuid4())
+        self.native_reply_id = str(uuid.uuid4())
+        rec_uuid = str(uuid.uuid4())
+        create_authoritative_state(self.state_dir, canonical_ws, "agent-1", rec_uuid, exceptions=[self.native_msg_id])
+        self.calls_log = os.path.join(td, "fake-a-calls.jsonl")
+        self.fake_a = os.path.join(td, "fake-a")
+        with open(self.fake_a, "w", encoding="utf-8") as f:
+            f.write(f'''#!/usr/bin/env python3
+import sys, json
+args = sys.argv[1:]
+with open({self.calls_log!r}, "a", encoding="utf-8") as log:
+    log.write(json.dumps(args) + "\\n")
+if args[:2] == ["message", "send"]:
+    print(json.dumps({{
+        "schema_version": 1, "id": "{self.native_msg_id}", "workspace": "{canonical_ws}",
+        "from": {{"tag": "hub-bridge", "session_id": "00000000-0000-0000-0000-000000000001", "workspace": "{canonical_ws}"}},
+        "to": {{"tag": args[args.index("--to") + 1], "session_id": "{rec_uuid}"}},
+        "kind": "note", "reply_to": None, "body": args[-1], "delivery": "inbox"
+    }}))
+elif args[:2] == ["message", "log"]:
+    print(json.dumps([{{
+        "schema_version": 1, "id": "{self.native_reply_id}", "workspace": "{canonical_ws}",
+        "from": {{"tag": "agent-1", "session_id": "{rec_uuid}", "workspace": "{canonical_ws}"}},
+        "to": {{"tag": "hub-bridge"}}, "kind": "sync_reply", "reply_to": "{self.native_msg_id}",
+        "body": "done by fake-a", "delivery": "inbox"
+    }}]))
+else:
+    sys.exit(3)
+''')
+        os.chmod(self.fake_a, 0o755)
+
+    def _run_cli(self, hub_url, *extra):
+        env = {k: v for k, v in os.environ.items() if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
+        env.update({
+            "HUB_URL": hub_url,
+            "HUB_TOKEN": "test-host-token",
+            "NO_PROXY": "127.0.0.1",
+            "no_proxy": "127.0.0.1",
+            "HOME": self.td,
+            "XDG_CONFIG_HOME": os.path.join(self.td, "config"),
+            "XDG_RUNTIME_DIR": self.runtime_dir,
+            "APLEXER_STATE_DIR": self.state_dir,
+            "APLEXER_RUNTIME_DIR": self.runtime_dir,
+        })
+        env.pop("HUB_JOB_TOKEN", None)
+        env.pop("HUB_LEASE_EPOCH", None)
+        host_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        cmd = [sys.executable, "-m", "agent_hub_host.cli", "bridge", "--workspace", self.work,
+               "--aplexer-bin", self.fake_a, "--state-dir", self.state_dir, "--runtime-dir", self.runtime_dir, *extra]
+        return subprocess.run(cmd, cwd=host_dir, env=env, capture_output=True, text=True, timeout=60)
+
+    def _fake_a_calls(self):
+        if not os.path.exists(self.calls_log):
+            return []
+        with open(self.calls_log, encoding="utf-8") as f:
+            return [json.loads(line) for line in f]
+
+    def test_cli_bridge_once_round_trip(self):
+        msg = {"id": "hub-1", "from_actor": "projB:lead", "to_actor": "projA:agent-1", "kind": "note",
+               "body": "do the task", "thread_id": "th-1"}
+        with _LoopbackHub(["machine:m1", "projA:agent-1"], [msg]) as hub:
+            res = self._run_cli(hub.url, "--once")
+            self.assertEqual(res.returncode, 0, res.stderr)
+            out = json.loads(res.stdout)
+            self.assertEqual(out["targets"], [{"address": "projA:agent-1", "tag": "agent-1"}])
+            self.assertEqual(out["cycles"][0]["forwarded"], [{"hub_id": "hub-1", "native_id": self.native_msg_id, "tag": "agent-1"}])
+
+            sends = [c for c in self._fake_a_calls() if c[:2] == ["message", "send"]]
+            self.assertEqual(len(sends), 1)
+            self.assertEqual(sends[0][sends[0].index("--to") + 1], "agent-1")
+            self.assertNotIn("deliver", [c[1] for c in self._fake_a_calls() if len(c) > 1])
+
+            posts = [(p, b) for m, p, b, _ in hub.requests if m == "POST"]
+            self.assertIn(("/api/bus/messages/hub-1/ack", None), posts)
+            self.assertEqual(hub.messages["hub-1"]["acked_at"], 2)
+            replies = [b for p, b in posts if p == "/api/bus/send"]
+            self.assertEqual(len(replies), 1)
+            self.assertEqual(replies[0]["from_actor"], "projA:agent-1")
+            self.assertEqual(replies[0]["to_actor"], "projB:lead")
+            self.assertEqual(replies[0]["reply_to"], "hub-1")
+            self.assertEqual(replies[0]["kind"], "reply")  # native sync_reply normalized, never sent upstream
+            self.assertEqual(replies[0]["idempotency_key"], self.native_reply_id)
+            self.assertTrue(all(auth == "Bearer test-host-token" for *_, auth in hub.requests))
+
+            # A second bounded run is a no-op: no second native send, no second reply
+            res2 = self._run_cli(hub.url, "--cycles", "1")
+            self.assertEqual(res2.returncode, 0, res2.stderr)
+            self.assertEqual(len([c for c in self._fake_a_calls() if c[:2] == ["message", "send"]]), 1)
+            self.assertEqual(len([1 for m, p, *_ in hub.requests if m == "POST" and p == "/api/bus/send"]), 1)
+
+    def test_cli_bridge_exits_nonzero_when_hub_ack_and_reply_fail(self):
+        msg = {"id": "hub-3", "from_actor": "projB:lead", "to_actor": "projA:agent-1", "kind": "note",
+               "body": "do it", "thread_id": "th-3"}
+        with _LoopbackHub(["machine:m1", "projA:agent-1"], [msg], post_status=403) as hub:
+            res = self._run_cli(hub.url, "--once")
+            self.assertEqual(res.returncode, 1, res.stderr)
+            errors = json.loads(res.stdout)["cycles"][0]["errors"]
+            self.assertEqual([e.get("hub_id") for e in errors], ["hub-3", "hub-3"])
+            self.assertIn("hub ack failed", errors[0]["error"])
+            self.assertIn("hub reply failed", errors[1]["error"])
+            self.assertEqual(errors[1]["native_id"], self.native_reply_id)
+            self.assertIsNone(hub.messages["hub-3"]["acked_at"])
+
+            # The failures are retried, not lost: the next run tries ack and reply again, with no second native send
+            posts_before = len([1 for m, *_ in hub.requests if m == "POST"])
+            hub.post_status = None
+            res2 = self._run_cli(hub.url, "--once")
+            self.assertEqual(res2.returncode, 0, res2.stderr)
+            self.assertEqual(json.loads(res2.stdout)["cycles"][0]["errors"], [])
+            self.assertEqual(hub.messages["hub-3"]["acked_at"], 2)
+            self.assertEqual(len([1 for m, *_ in hub.requests if m == "POST"]), posts_before + 2)
+            self.assertEqual(len([c for c in self._fake_a_calls() if c[:2] == ["message", "send"]]), 1)
+
+    def test_cli_bridge_refuses_unregistered_tag_and_unbounded_runs(self):
+        msg = {"id": "hub-2", "from_actor": "projB:lead", "to_actor": "projA:agent-1", "kind": "note", "body": "b"}
+        with _LoopbackHub(["machine:m1", "projA:agent-1"], [msg]) as hub:
+            res = self._run_cli(hub.url, "--tag", "agent-9")
+            self.assertEqual(res.returncode, 2)
+            self.assertIn("not registered", res.stderr)
+            for bad in (["--cycles", "0"], ["--cycles", "1001"], ["--limit", "0"], ["--max-pages", "0"], ["--max-pages", "101"]):
+                self.assertEqual(self._run_cli(hub.url, *bad).returncode, 2, bad)
+            self.assertFalse(any(p.startswith("/api/bus/inbox") for _, p, *_ in hub.requests))
+        self.assertEqual(self._fake_a_calls(), [])
+
+    def test_cli_bridge_refuses_host_without_registered_tags(self):
+        with _LoopbackHub(["machine:m1"], []) as hub:
+            res = self._run_cli(hub.url)
+            self.assertEqual(res.returncode, 2)
+            self.assertIn("no agent tags", res.stderr)
+        self.assertEqual(self._fake_a_calls(), [])
 
 
 if __name__ == "__main__":

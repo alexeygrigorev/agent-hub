@@ -69,6 +69,56 @@ def cmd_run(args):
         print(f"Agent run failed: {e}", file=sys.stderr)
         sys.exit(1)
 
+MAX_BRIDGE_CYCLES = 1000
+MAX_BRIDGE_PAGES = 100
+
+
+def cmd_bridge(args):
+    """Bounded foreground mailbox bridge (SPEC §7.5) for tags the hub registers for this credential.
+
+    Runs one cycle by default, at most --cycles cycles; it installs no service, timer or autostart.
+    Exits 1 when any cycle reports an error (inbox, native send, hub ack/reply, exhausted inbox
+    window), so automation never reads a failed bridge run as success.
+    """
+    import time
+    from . import bus
+    from .bridge import MailboxBridge, poll_once, registered_bridge_targets
+    from .native_bridge import BridgeCapabilityGap
+
+    if not 1 <= args.cycles <= MAX_BRIDGE_CYCLES:
+        print(f"Error: --cycles must be between 1 and {MAX_BRIDGE_CYCLES}", file=sys.stderr)
+        sys.exit(2)
+    if args.interval < 0 or not 1 <= args.limit <= 100 or not 1 <= args.max_pages <= MAX_BRIDGE_PAGES:
+        print(f"Error: --interval must be >= 0, --limit between 1 and 100, --max-pages between 1 and {MAX_BRIDGE_PAGES}", file=sys.stderr)
+        sys.exit(2)
+    try:
+        targets = registered_bridge_targets(bus._do_request("GET", "/api/bus/actors"), args.tag or None)
+        bridge = MailboxBridge(
+            args.workspace,
+            aplexer_bin=args.aplexer_bin,
+            state_dir=args.state_dir,
+            runtime_dir=args.runtime_dir,
+            service_tag=args.service_tag,
+            service_session_id=args.service_session_id,
+        )
+    except (BridgeCapabilityGap, ValueError) as e:
+        print(f"Bridge refused: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    if not targets:
+        print("Bridge refused: no agent tags are registered on the hub for this credential", file=sys.stderr)
+        sys.exit(2)
+
+    summaries = []
+    for cycle in range(args.cycles):
+        if cycle:
+            time.sleep(args.interval)
+        summaries.append(poll_once(bridge, targets, limit=args.limit, max_pages=args.max_pages))
+    print(json.dumps({"targets": [{"address": a, "tag": t} for a, t in targets], "cycles": summaries}))
+    if any(s["errors"] for s in summaries):
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Agent Hub CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -141,6 +191,22 @@ def main():
     p_claims.add_argument("--holder", help="Filter by holder")
     p_claims.add_argument("--all", action="store_true", help="Include released/expired claims")
 
+    p_bridge = sub.add_parser("bridge", help="Bridge hub messages to native aplexer mailboxes (bounded, foreground)")
+    p_bridge.add_argument("--workspace", required=True, help="aplexer workspace whose mailboxes are bridged")
+    p_bridge.add_argument("--tag", action="append", help="Registered tag to bridge (repeatable; default: all registered)")
+    p_bridge_runs = p_bridge.add_mutually_exclusive_group()
+    p_bridge_runs.add_argument("--once", dest="cycles", action="store_const", const=1, help="Run one cycle (default)")
+    p_bridge_runs.add_argument("--cycles", type=int, help=f"Run N cycles, 1..{MAX_BRIDGE_CYCLES}")
+    p_bridge.set_defaults(cycles=1)
+    p_bridge.add_argument("--interval", type=float, default=30.0, help="Seconds between cycles")
+    p_bridge.add_argument("--limit", type=int, default=50, help="Inbox page size per tag")
+    p_bridge.add_argument("--max-pages", type=int, default=10, help=f"Inbox pages read per tag and cycle, 1..{MAX_BRIDGE_PAGES}")
+    p_bridge.add_argument("--aplexer-bin", default="aplexer")
+    p_bridge.add_argument("--state-dir", default=None)
+    p_bridge.add_argument("--runtime-dir", default=None)
+    p_bridge.add_argument("--service-tag", default=None)
+    p_bridge.add_argument("--service-session-id", default=None)
+
     args = parser.parse_args()
     
     if args.cmd == "login":
@@ -152,6 +218,8 @@ def main():
         cmd_status(args)
     elif args.cmd == "run":
         cmd_run(args)
+    elif args.cmd == "bridge":
+        cmd_bridge(args)
     elif args.cmd == "send":
         from . import bus
         if args.body == "-":

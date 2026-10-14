@@ -94,6 +94,50 @@ CREATE INDEX IF NOT EXISTS idx_agents_tag ON agents(tag);
 CREATE INDEX IF NOT EXISTS idx_agents_project_tag ON agents(project, tag);
 `;
 
+export type BusAddress =
+  | { kind: 'tag'; tag: string }
+  | { kind: 'qualified'; project: string; tag: string }
+  | { kind: 'role'; role: string }
+  | { kind: 'machine'; machineId: string };
+
+// One address segment: non-empty, no ':' separator, no whitespace or control characters.
+const ADDRESS_SEGMENT = /^[^\s:\x00-\x1f\x7f]+$/;
+
+/**
+ * Parse a bus actor address (SPEC §6): `tag`, `project:tag`, `role:<role>` or `machine:<id>`.
+ * Anything else (empty segments, more than one ':', whitespace) is null, so a malformed address is
+ * rejected instead of being stored under a to_actor that no inbox can match.
+ */
+export function parseAddress(address: unknown): BusAddress | null {
+  if (typeof address !== 'string' || address.length === 0 || address.length > 128) return null;
+  const parts = address.split(':');
+  if (!parts.every(p => ADDRESS_SEGMENT.test(p))) return null;
+  if (parts.length === 1) return { kind: 'tag', tag: parts[0] };
+  if (parts.length !== 2) return null;
+  if (parts[0] === 'role') return { kind: 'role', role: parts[1] };
+  if (parts[0] === 'machine') return { kind: 'machine', machineId: parts[1] };
+  return { kind: 'qualified', project: parts[0], tag: parts[1] };
+}
+
+const ROOT_AUTHORITY_ERROR = "missing_m4_root_authority: root role routing has no accepted root authority in M3";
+
+/** A root role name in any letter case (`root`, `ROOT`, `rootish`): M3 has no accepted Root authority. */
+function isRootRole(role: unknown): boolean {
+  return typeof role === 'string' && /^root/i.test(role);
+}
+
+/** `role:root…` in any letter case, including the `ROLE:Root` spelling: refused, never routed. */
+export function isRootRoleAddress(address: unknown): boolean {
+  return typeof address === 'string' && /^role:root/i.test(address);
+}
+
+interface AgentIdentity {
+  tag: string;
+  project: string | null;
+  role: string | null;
+  machine_id: string | null;
+}
+
 const CROCKFORD_BASE32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 
 export function generateUlid(now: number = Date.now()): string {
@@ -135,157 +179,145 @@ export class BusService {
     this.txSync = txSync;
   }
 
+  /**
+   * Resolve an agent address to exactly one registered agent, or null when unknown or ambiguous.
+   * `role:<role>` resolves only when exactly one non-root agent holds the role: a shared role
+   * inbox has no defined fan-out or ACK semantics, so it is refused rather than guessed.
+   */
+  private resolveAgent(addr: BusAddress | null): AgentIdentity | null {
+    if (!addr) return null;
+    let rows: any[];
+    if (addr.kind === 'tag') {
+      rows = this.sql.exec('SELECT tag, project, role, machine_id FROM agents WHERE tag = ?', addr.tag).toArray();
+    } else if (addr.kind === 'qualified') {
+      rows = this.sql.exec('SELECT tag, project, role, machine_id FROM agents WHERE project = ? AND tag = ?', addr.project, addr.tag).toArray();
+    } else if (addr.kind === 'role') {
+      if (isRootRole(addr.role)) return null;
+      rows = this.sql.exec('SELECT tag, project, role, machine_id FROM agents WHERE role = ?', addr.role).toArray();
+    } else {
+      return null;
+    }
+    if (rows.length !== 1) return null;
+    const r = rows[0];
+    return { tag: r.tag, project: r.project ?? null, role: r.role ?? null, machine_id: r.machine_id ?? null };
+  }
+
+  /** The registered agent behind a `tag` or `project:tag` address; role, machine and malformed forms are null. */
+  private resolveAgentActor(actor: unknown): AgentIdentity | null {
+    const addr = parseAddress(actor);
+    if (!addr || (addr.kind !== 'tag' && addr.kind !== 'qualified')) return null;
+    return this.resolveAgent(addr);
+  }
+
+  /**
+   * Two addresses name the same participant: the same well-formed string, or aliases (tag,
+   * project:tag, unique role) of one registered agent compared by canonical project+tag.
+   * Root role addresses never match anything.
+   */
+  private sameParticipant(a: string, b: string): boolean {
+    if (isRootRoleAddress(a) || isRootRoleAddress(b)) return false;
+    if (a === b) return parseAddress(a) !== null;
+    const x = this.resolveAgent(parseAddress(a));
+    const y = this.resolveAgent(parseAddress(b));
+    return Boolean(x && y && x.tag === y.tag && x.project === y.project);
+  }
+
+  /** Every to_actor string that addresses this agent: tag, project:tag and its role when it is the unique holder. */
+  private agentAliases(agent: AgentIdentity): string[] {
+    const aliases = [agent.tag];
+    if (agent.project) aliases.push(`${agent.project}:${agent.tag}`);
+    if (agent.role && !isRootRole(agent.role)) {
+      const holder = this.resolveAgent({ kind: 'role', role: agent.role });
+      if (holder && holder.tag === agent.tag && holder.project === agent.project) aliases.push(`role:${agent.role}`);
+    }
+    return aliases;
+  }
+
+  /** Inbox aliases for an address; a well-formed address that resolves to no agent matches only itself. */
+  private recipientAliases(actor: string): string[] {
+    const addr = parseAddress(actor);
+    if (!addr) return [];
+    const agent = this.resolveAgent(addr);
+    if (!agent) return [actor];
+    return Array.from(new Set([actor, ...this.agentAliases(agent)]));
+  }
+
   public validateRecipient(actor: string, now: number = Date.now()): boolean {
-    if (actor === 'role:root' || actor.startsWith('role:root')) {
-      // M3 has no accepted root authority: fail closed rather than infer/mint Root
-      return false;
-    }
+    // M3 has no accepted root authority: fail closed rather than infer/mint Root
+    if (isRootRoleAddress(actor)) return false;
 
-    if (actor.startsWith('role:')) {
-      const role = actor.substring(5);
-      const res = this.sql.exec('SELECT 1 FROM agents WHERE role = ?', role).toArray();
+    const addr = parseAddress(actor);
+    if (!addr) return false;
+
+    if (addr.kind === 'machine') {
+      const res = this.sql.exec('SELECT 1 FROM machines WHERE id = ?', addr.machineId).toArray();
       return res.length > 0;
     }
 
-    if (actor.startsWith('machine:')) {
-      const machineId = actor.substring(8);
-      const res = this.sql.exec('SELECT 1 FROM machines WHERE id = ?', machineId).toArray();
-      return res.length > 0;
-    }
-
-    if (actor.includes(':')) {
-      const [project, tag] = actor.split(':');
-      const res = this.sql.exec('SELECT 1 FROM agents WHERE project = ? AND tag = ?', project, tag).toArray();
-      return res.length > 0;
-    }
-
-    const agents = this.sql.exec('SELECT project FROM agents WHERE tag = ?', actor).toArray();
-    if (agents.length > 0) {
-      const projects = new Set(agents.map((a: any) => a.project));
-      if (projects.size === 1) return true;
-    }
-
-    return false;
+    return this.resolveAgent(addr) !== null;
   }
 
   public isAuthorizedForActor(caller: CallerContext, actor: string, now: number = Date.now()): boolean {
     if (caller.isRevoked) return false;
 
-    // Root role routing has no accepted root authority in M3: fail closed
-    if (actor === 'role:root' || caller.actor === 'role:root') {
+    // Root role routing has no accepted root authority in M3: fail closed in any letter case
+    if (isRootRoleAddress(actor) || isRootRoleAddress(caller.actor)) {
       return false;
     }
+
+    const addr = parseAddress(actor);
+    if (!addr) return false;
 
     if (caller.isAdmin) return true;
 
-    if (caller.actor) {
-      if (caller.actor === actor) return true;
-
-      if (caller.actor.includes(':') && !actor.includes(':')) {
-        const [cProj, cTag] = caller.actor.split(':');
-        if (cTag === actor) {
-          const agents = this.sql.exec('SELECT project FROM agents WHERE tag = ?', actor).toArray();
-          if (agents.length === 1 && agents[0].project === cProj) return true;
-        }
-      } else if (!caller.actor.includes(':') && actor.includes(':')) {
-        const [aProj, aTag] = actor.split(':');
-        if (caller.actor === aTag) {
-          const agents = this.sql.exec('SELECT project FROM agents WHERE tag = ?', aTag).toArray();
-          if (agents.length === 1 && agents[0].project === aProj) return true;
-        }
-      }
-
-      return false;
-    }
+    // Aliases of one registered agent (tag, project:tag, unique role holder) are one identity;
+    // a malformed caller actor matches nothing
+    if (caller.actor) return this.sameParticipant(caller.actor, actor);
 
     if (caller.kind === 'host' || (caller.kind === undefined && !caller.actor && caller.machineId)) {
-      if (caller.machineId) {
-        if (actor === `machine:${caller.machineId}`) return true;
-        if (actor.startsWith('machine:')) return false;
-
-        if (actor.includes(':') && !actor.startsWith('role:') && !actor.startsWith('machine:')) {
-          const [project, tag] = actor.split(':');
-          const res = this.sql.exec('SELECT 1 FROM agents WHERE project = ? AND tag = ? AND machine_id = ?', project, tag, caller.machineId).toArray();
-          if (res.length > 0) return true;
-        } else if (!actor.startsWith('role:') && !actor.startsWith('machine:')) {
-          const agents = this.sql.exec('SELECT project, machine_id FROM agents WHERE tag = ?', actor).toArray();
-          if (agents.length > 0) {
-            const projects = new Set(agents.map((a: any) => a.project));
-            if (projects.size === 1 && agents.some((a: any) => a.machine_id === caller.machineId)) return true;
-          }
-        }
-
-        if (actor.startsWith('role:')) {
-          const role = actor.substring(5);
-          if (role === 'root') return false; // Fail closed for root
-          const res = this.sql.exec('SELECT 1 FROM agents WHERE role = ? AND machine_id = ?', role, caller.machineId).toArray();
-          if (res.length > 0) return true;
-        }
-      }
+      if (!caller.machineId) return false;
+      if (addr.kind === 'machine') return addr.machineId === caller.machineId;
+      const agent = this.resolveAgent(addr);
+      return Boolean(agent && agent.machine_id === caller.machineId);
     }
 
     return false;
   }
 
+  /** The recipient itself (or the host it runs on), as opposed to an admin observer. */
+  private isRecipientPrincipal(caller: CallerContext, toActor: string, now: number): boolean {
+    return this.isAuthorizedForActor({ ...caller, isAdmin: false }, toActor, now);
+  }
+
   public validateClaimProject(caller: CallerContext, project: string, holder: string, now: number = Date.now(), leaseEpoch?: number): void {
+    if (isRootRoleAddress(holder) || isRootRoleAddress(caller.actor)) {
+      throw new Error(ROOT_AUTHORITY_ERROR);
+    }
+
+    // A holder is one agent address, `tag` or `project:tag`, under the message address grammar
+    const holderAddr = parseAddress(holder);
+    if (!holderAddr || (holderAddr.kind !== 'tag' && holderAddr.kind !== 'qualified')) {
+      throw new Error("unauthorized");
+    }
+
     if (caller.isAdmin) return;
 
-    if (holder === 'role:root' || caller.actor === 'role:root') {
-      throw new Error("missing_m4_root_authority: root role routing has no accepted root authority in M3");
+    // The holder must name exactly one registered agent: a bare tag shared across projects is ambiguous
+    const holderAgent = this.resolveAgent(holderAddr);
+    if (!holderAgent || !holderAgent.project || project !== holderAgent.project) {
+      throw new Error("unauthorized");
     }
 
     if (caller.actor) {
-      let regProj: string | undefined;
-      let regTag: string | undefined;
-
-      if (caller.actor.includes(':')) {
-        const [cProj, cTag] = caller.actor.split(':');
-        const rows = this.sql.exec('SELECT project, tag FROM agents WHERE project = ? AND tag = ?', cProj, cTag).toArray() as any[];
-        if (rows.length === 1) {
-          regProj = rows[0].project;
-          regTag = rows[0].tag;
-        }
-      } else {
-        const rows = this.sql.exec('SELECT project, tag FROM agents WHERE tag = ?', caller.actor).toArray() as any[];
-        if (rows.length === 1) {
-          regProj = rows[0].project;
-          regTag = rows[0].tag;
-        }
-      }
-
-      if (!regProj || !regTag) {
-        throw new Error("unauthorized");
-      }
-
-      if (project !== regProj) {
-        throw new Error("unauthorized");
-      }
-
-      const validHolders = new Set([regTag, `${regProj}:${regTag}`]);
-      if (!validHolders.has(holder)) {
+      const agent = this.resolveAgentActor(caller.actor);
+      if (!agent || agent.tag !== holderAgent.tag || agent.project !== holderAgent.project) {
         throw new Error("unauthorized");
       }
       return;
     }
 
     if (caller.kind === 'host' || (!caller.actor && caller.machineId)) {
-      if (!caller.machineId) throw new Error("unauthorized");
-
-      let regProj: string | undefined;
-      if (holder.includes(':')) {
-        const [hProj, hTag] = holder.split(':');
-        const rows = this.sql.exec('SELECT project, tag FROM agents WHERE project = ? AND tag = ? AND machine_id = ?', hProj, hTag, caller.machineId).toArray() as any[];
-        if (rows.length === 1) {
-          regProj = rows[0].project;
-        }
-      } else {
-        const rows = this.sql.exec('SELECT project, tag FROM agents WHERE tag = ? AND machine_id = ?', holder, caller.machineId).toArray() as any[];
-        if (rows.length === 1) {
-          regProj = rows[0].project;
-        }
-      }
-
-      if (!regProj || project !== regProj) {
+      if (!caller.machineId || holderAgent.machine_id !== caller.machineId) {
         throw new Error("unauthorized");
       }
       return;
@@ -307,19 +339,30 @@ export class BusService {
         throw new Error("body_too_large");
       }
 
-      if (opts.senderActor === 'role:root') {
-        throw new Error("missing_m4_root_authority: root role routing has no accepted root authority in M3");
+      if (isRootRoleAddress(opts.senderActor)) {
+        throw new Error(ROOT_AUTHORITY_ERROR);
+      }
+
+      if (!parseAddress(opts.senderActor)) {
+        throw new Error("unauthorized");
       }
 
       if (!this.isAuthorizedForActor(caller, opts.senderActor, now) && !caller.isAdmin) {
         throw new Error("unauthorized");
       }
 
-      const existing = this.sql.exec(
-        'SELECT id, body, to_actor, kind, thread_id, reply_to, lease_epoch FROM messages WHERE from_actor = ? AND idempotency_key = ?',
+      let existing = this.sql.exec(
+        'SELECT id, body, to_actor, kind, thread_id, reply_to, lease_epoch, expires_at FROM messages WHERE from_actor = ? AND idempotency_key = ?',
         opts.senderActor,
         opts.idempotencyKey
       ).toArray()[0] as any;
+
+      // The idempotency window is the message retention window: once a message has expired it is
+      // gone for every reader, so its key is free again whether or not retention has purged the row.
+      if (existing && existing.expires_at <= now) {
+        this.sql.exec('DELETE FROM messages WHERE id = ?', existing.id);
+        existing = undefined;
+      }
 
       if (existing) {
         const expectedReplyTo = opts.replyTo || null;
@@ -337,7 +380,7 @@ export class BusService {
         return { id: existing.id, threadId: existing.thread_id, thread_id: existing.thread_id };
       }
 
-      if (opts.toActor === 'role:root') {
+      if (isRootRoleAddress(opts.toActor)) {
         throw new Error("unknown_recipient");
       }
 
@@ -347,10 +390,12 @@ export class BusService {
 
       let threadId = opts.threadId;
       if (opts.replyTo) {
-        const msg = this.sql.exec('SELECT thread_id, from_actor, to_actor FROM messages WHERE id = ?', opts.replyTo).toArray()[0] as any;
+        const msg = this.sql.exec('SELECT thread_id, from_actor, to_actor FROM messages WHERE id = ? AND expires_at > ?', opts.replyTo, now).toArray()[0] as any;
         if (!msg) throw new Error("invalid_reply_to");
-        if (msg.from_actor !== opts.toActor && msg.to_actor !== opts.toActor) throw new Error("invalid_reply_to");
-        if (msg.from_actor !== opts.senderActor && msg.to_actor !== opts.senderActor) throw new Error("invalid_reply_to");
+        // Both reply ends must be parties of the original message in any alias form of the same agent
+        const parties = [msg.from_actor, msg.to_actor];
+        if (!parties.some(p => this.sameParticipant(p, opts.toActor))) throw new Error("invalid_reply_to");
+        if (!parties.some(p => this.sameParticipant(p, opts.senderActor))) throw new Error("invalid_reply_to");
         threadId = threadId || msg.thread_id || opts.replyTo;
       }
 
@@ -367,10 +412,15 @@ export class BusService {
     });
   }
 
+  /**
+   * Recipient inbox. Matches every alias of the addressed agent (tag, project:tag, unique role),
+   * hides expired messages, and marks returned messages delivered when the caller is the recipient
+   * (or its host bridge). An admin reading someone else's inbox does not mark anything.
+   */
   inbox(caller: CallerContext, actor: string, limit: number = 50, cursor?: string): any[] {
     const now = Date.now();
-    if (actor === 'role:root') {
-      throw new Error("missing_m4_root_authority: root role routing has no accepted root authority in M3");
+    if (isRootRoleAddress(actor)) {
+      throw new Error(ROOT_AUTHORITY_ERROR);
     }
 
     if (!this.isAuthorizedForActor(caller, actor, now)) throw new Error("unauthorized");
@@ -378,38 +428,68 @@ export class BusService {
     if (limit > 100) limit = 100;
     if (limit < 1) limit = 1;
 
-    let query = 'SELECT * FROM messages WHERE to_actor = ?';
-    const params: any[] = [actor];
-    if (cursor) {
-      query += ' AND id > ?';
-      params.push(cursor);
-    }
-    query += ' ORDER BY id ASC LIMIT ?';
-    params.push(limit);
+    const aliases = this.recipientAliases(actor);
+    if (aliases.length === 0) throw new Error("unauthorized");
 
-    return this.sql.exec(query, ...params).toArray();
+    return this.runInTxn(() => {
+      let query = `SELECT * FROM messages WHERE to_actor IN (${aliases.map(() => '?').join(',')}) AND expires_at > ?`;
+      const params: any[] = [...aliases, now];
+      if (cursor) {
+        query += ' AND id > ?';
+        params.push(cursor);
+      }
+      query += ' ORDER BY id ASC LIMIT ?';
+      params.push(limit);
+
+      const rows = this.sql.exec(query, ...params).toArray() as any[];
+      if (this.isRecipientPrincipal(caller, actor, now)) {
+        for (const row of rows) {
+          if (row.delivered_at) continue;
+          this.sql.exec('UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL', now, row.id);
+          row.delivered_at = now;
+        }
+      }
+      return rows;
+    });
   }
 
+  /**
+   * Show one message to its sender or recipient. When the recipient (or its host bridge) shows it,
+   * the message is marked delivered and read; sender and admin views leave the stages untouched.
+   */
   show(caller: CallerContext, messageId: string): any {
     const now = Date.now();
-    const msg = this.sql.exec('SELECT * FROM messages WHERE id = ?', messageId).toArray()[0] as any;
-    if (!msg) throw new Error("not_found");
-    if (!caller.isAdmin && !this.isAuthorizedForActor(caller, msg.to_actor, now) && !this.isAuthorizedForActor(caller, msg.from_actor, now)) {
-      throw new Error("unauthorized");
-    }
-    return msg;
+    return this.runInTxn(() => {
+      const msg = this.sql.exec('SELECT * FROM messages WHERE id = ? AND expires_at > ?', messageId, now).toArray()[0] as any;
+      if (!msg) throw new Error("not_found");
+      if (!caller.isAdmin && !this.isAuthorizedForActor(caller, msg.to_actor, now) && !this.isAuthorizedForActor(caller, msg.from_actor, now)) {
+        throw new Error("unauthorized");
+      }
+      if (this.isRecipientPrincipal(caller, msg.to_actor, now)) {
+        if (!msg.delivered_at) {
+          this.sql.exec('UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL', now, messageId);
+          msg.delivered_at = now;
+        }
+        if (!msg.read_at) {
+          this.sql.exec('UPDATE messages SET read_at = ? WHERE id = ? AND read_at IS NULL', now, messageId);
+          msg.read_at = now;
+        }
+      }
+      return msg;
+    });
   }
 
   private updateMessageStage(caller: CallerContext, messageId: string, stage: 'delivered_at' | 'read_at' | 'acked_at' | 'accepted_at' | 'completed_at', now: number = Date.now(), leaseEpoch?: number) {
-    const msg = this.sql.exec('SELECT to_actor, delivered_at, read_at, acked_at, accepted_at, completed_at FROM messages WHERE id = ?', messageId).toArray()[0] as any;
-    if (!msg) throw new Error("not_found");
+    const msg = this.sql.exec('SELECT to_actor, delivered_at, read_at, acked_at, accepted_at, completed_at, expires_at FROM messages WHERE id = ?', messageId).toArray()[0] as any;
+    if (!msg || msg.expires_at <= Date.now()) throw new Error("not_found");
 
-    if (msg.to_actor === 'role:root' || caller.actor === 'role:root') {
-      throw new Error("missing_m4_root_authority: root role routing has no accepted root authority in M3");
+    if (isRootRoleAddress(msg.to_actor) || isRootRoleAddress(caller.actor)) {
+      throw new Error(ROOT_AUTHORITY_ERROR);
     }
 
-    // Recipient-only stage advancement
-    if (!caller.isAdmin && !this.isAuthorizedForActor(caller, msg.to_actor, now)) {
+    // SPEC M3: ACK only by the recipient. Every stage is advanced by the recipient (or the host it
+    // runs on); an admin observer has no override, so a stage time is always the recipient's own step.
+    if (!this.isRecipientPrincipal(caller, msg.to_actor, now)) {
       throw new Error("unauthorized");
     }
 
@@ -418,6 +498,7 @@ export class BusService {
     if (stage === 'accepted_at' && !msg.acked_at) throw new Error("invalid_stage");
     if (stage === 'completed_at' && !msg.accepted_at) throw new Error("invalid_stage");
 
+    // A stage time is written once; repeating a stage never moves it
     if (msg[stage]) return;
 
     this.sql.exec(`UPDATE messages SET ${stage} = ? WHERE id = ?`, now, messageId);
@@ -483,15 +564,15 @@ export class BusService {
 
     if (!claim || claim.released_at) return;
 
-    if (claim.holder === 'role:root' || caller.actor === 'role:root') {
-      throw new Error("missing_m4_root_authority: root role routing has no accepted root authority in M3");
+    if (isRootRoleAddress(claim.holder) || isRootRoleAddress(caller.actor)) {
+      throw new Error(ROOT_AUTHORITY_ERROR);
     }
 
     if (!caller.isAdmin) {
       if (caller.kind === 'host' || (!caller.actor && caller.machineId)) {
         if (!caller.machineId) throw new Error("unauthorized");
-        const rows = this.sql.exec('SELECT project FROM agents WHERE (tag = ? OR project || ":" || tag = ?) AND machine_id = ?', claim.holder, claim.holder, caller.machineId).toArray() as any[];
-        if (!rows.length || rows[0].project !== claim.project) {
+        const agent = this.resolveAgentActor(claim.holder);
+        if (!agent || agent.machine_id !== caller.machineId || agent.project !== claim.project) {
           throw new Error("unauthorized");
         }
       } else {
@@ -499,16 +580,8 @@ export class BusService {
           throw new Error("unauthorized");
         }
         if (caller.actor) {
-          let agentProj: string | undefined;
-          if (caller.actor.includes(':')) {
-            const [p, t] = caller.actor.split(':');
-            const rows = this.sql.exec('SELECT project FROM agents WHERE project = ? AND tag = ?', p, t).toArray() as any[];
-            if (rows.length === 1) agentProj = rows[0].project;
-          } else {
-            const rows = this.sql.exec('SELECT project FROM agents WHERE tag = ?', caller.actor).toArray() as any[];
-            if (rows.length === 1) agentProj = rows[0].project;
-          }
-          if (!agentProj || agentProj !== claim.project) {
+          const agent = this.resolveAgentActor(caller.actor);
+          if (!agent || !agent.project || agent.project !== claim.project) {
             throw new Error("unauthorized");
           }
         }
@@ -525,7 +598,11 @@ export class BusService {
 
     let effectiveProject = project;
 
-    if (caller && !caller.isAdmin && caller.actor !== 'role:root') {
+    if (caller && isRootRoleAddress(caller.actor)) {
+      throw new Error(ROOT_AUTHORITY_ERROR);
+    }
+
+    if (caller && !caller.isAdmin) {
       if (caller.kind === 'host' || (!caller.actor && caller.machineId)) {
         if (caller.machineId) {
           const hostProjects = this.sql.exec('SELECT DISTINCT project FROM agents WHERE machine_id = ?', caller.machineId).toArray().map((r: any) => r.project);
@@ -541,15 +618,7 @@ export class BusService {
           }
         }
       } else if (caller.actor) {
-        let agentProj: string | undefined;
-        if (caller.actor.includes(':')) {
-          const [p, t] = caller.actor.split(':');
-          const rows = this.sql.exec('SELECT project FROM agents WHERE project = ? AND tag = ?', p, t).toArray() as any[];
-          if (rows.length === 1) agentProj = rows[0].project;
-        } else {
-          const rows = this.sql.exec('SELECT project FROM agents WHERE tag = ?', caller.actor).toArray() as any[];
-          if (rows.length === 1) agentProj = rows[0].project;
-        }
+        const agentProj = this.resolveAgentActor(caller.actor)?.project || undefined;
 
         if (project) {
           if (!agentProj || project !== agentProj) {
@@ -581,7 +650,7 @@ export class BusService {
 
   retentionCleanup(now: number = Date.now(), limit: number = 100): { messagesDeleted: number; claimsDeleted: number; hasMore: boolean } {
     const expiredMessages = this.sql.exec(
-      'SELECT id FROM messages WHERE expires_at < ? LIMIT ?',
+      'SELECT id FROM messages WHERE expires_at <= ? LIMIT ?',
       now,
       limit
     ).toArray() as { id: string }[];
@@ -613,8 +682,8 @@ export class BusService {
       return Array.from(new Set([...agentActors, ...machineActors])).filter(a => a !== 'role:root');
     }
 
-    if (caller.actor === 'role:root') {
-      throw new Error("missing_m4_root_authority: root role routing has no accepted root authority in M3");
+    if (isRootRoleAddress(caller.actor)) {
+      throw new Error(ROOT_AUTHORITY_ERROR);
     }
 
     if (caller.isAdmin) {
@@ -634,28 +703,11 @@ export class BusService {
     }
 
     if (caller.actor) {
-      let regProj: string | undefined;
-      let regTag: string | undefined;
-
-      if (caller.actor.includes(':')) {
-        const [cProj, cTag] = caller.actor.split(':');
-        const rows = this.sql.exec('SELECT project, tag FROM agents WHERE project = ? AND tag = ? AND role != "root"', cProj, cTag).toArray() as any[];
-        if (rows.length === 1) {
-          regProj = rows[0].project;
-          regTag = rows[0].tag;
-        }
-      } else {
-        const rows = this.sql.exec('SELECT project, tag FROM agents WHERE tag = ? AND role != "root"', caller.actor).toArray() as any[];
-        if (rows.length === 1) {
-          regProj = rows[0].project;
-          regTag = rows[0].tag;
-        }
+      const agent = this.resolveAgentActor(caller.actor);
+      if (agent && agent.project && !isRootRole(agent.role)) {
+        return [`${agent.project}:${agent.tag}`, agent.tag];
       }
-
-      if (regProj && regTag) {
-        return [`${regProj}:${regTag}`, regTag];
-      }
-      return [caller.actor];
+      return parseAddress(caller.actor) ? [caller.actor] : [];
     }
 
     throw new Error("unauthorized");
@@ -671,8 +723,8 @@ export class BusService {
       return this.sql.exec('SELECT * FROM messages WHERE to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100').toArray();
     }
 
-    if (actor === 'role:root' || caller.actor === 'role:root') {
-      throw new Error("missing_m4_root_authority: root role routing has no accepted root authority in M3");
+    if (isRootRoleAddress(actor) || isRootRoleAddress(caller.actor)) {
+      throw new Error(ROOT_AUTHORITY_ERROR);
     }
 
     if (caller.isAdmin) {
