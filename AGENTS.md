@@ -39,3 +39,7 @@ Serverless coordination hub for Alexey's multi-agent project: 30-minute headless
 - `test/`, `host/tests/` tests
 - `scripts/` deploy kit (prepared, not run), registry import
 - `docs/` spec, deploy runbook
+
+## Model routing rule (2026-10-14)
+
+OpenCode (`oc`, `--engine opencode`) always runs Muse Spark 1.3 (`opencode-go/muse-spark-1.3-contributor`), never a GLM / Z.ai Coding Plan model. All GLM / Z.ai work goes through zcodex (`--profile zcodex`, launcher `zai` route).
