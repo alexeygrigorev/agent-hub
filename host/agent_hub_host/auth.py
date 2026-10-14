@@ -1,85 +1,89 @@
+import importlib
 import json
+import os
+import sys
 import time
 import urllib.request
 import urllib.error
 import urllib.parse
+from pathlib import Path
 from . import config
 from . import api
 
+
+def _shared_device_login():
+    """The polling loop lives in DataTalksClub/auth."""
+    try:
+        return importlib.import_module("dtc_device_login")
+    except ImportError:
+        pass
+    roots = []
+    if os.environ.get("DTC_AUTH_HOME"):
+        roots.append(Path(os.environ["DTC_AUTH_HOME"]))
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        roots.append(parent / "auth")
+        roots.append(parent.parent / "auth")
+        if parent.name == "git" or parent == Path("/"):
+            break
+    for root in roots:
+        if (root / "dtc_device_login" / "__init__.py").is_file():
+            sys.path.insert(0, str(root))
+            return importlib.import_module("dtc_device_login")
+    raise RuntimeError(
+        "Shared device login was not found. Clone DataTalksClub/auth next to this repo or set DTC_AUTH_HOME."
+    )
+
+
+def _post_device(url, body):
+    request = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"},
+    )
+    try:
+        return 200, api.safe_http_json(request)
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+        except Exception as error:
+            raise RuntimeError("Token error: malformed response") from error
+        if not isinstance(payload, dict):
+            payload = {}
+        return exc.code, payload
+
+
 def device_login(base_url: str, client_kind: str, name: str, hostname: str, requested_scopes: list):
     api.check_url(base_url)
-    
-    code_url = f"{base_url}/api/device/code"
-    code_payload = json.dumps({
-        "client_kind": client_kind,
-        "name": name,
-        "hostname": hostname,
-        "requested_scopes": requested_scopes,
-    }).encode("utf-8")
-    
-    req = urllib.request.Request(code_url, data=code_payload, headers={"Content-Type": "application/json"})
+    flow = _shared_device_login()
     try:
-        code_res = api.safe_http_json(req)
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Network error during device code request: {e}")
-    
-    device_code = code_res["device_code"]
-    user_code = code_res["user_code"]
-    verification_uri = code_res["verification_uri"]
-    interval = code_res.get("interval", 5)
-    expires_in = code_res["expires_in"]
-    
-    print(f"Please visit: {verification_uri}")
-    print(f"And enter the code: {user_code}")
-    
-    token_url = f"{base_url}/api/device/token"
-    start_time = time.time()
-    
-    while True:
-        if time.time() - start_time > expires_in:
-            raise RuntimeError("Device code expired.")
-            
-        time.sleep(interval)
-        
-        token_payload = json.dumps({
-            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-            "device_code": device_code,
-            "client_id": "host-agent"
-        }).encode("utf-8")
-        
-        treq = urllib.request.Request(token_url, data=token_payload, headers={"Content-Type": "application/json"})
-        try:
-            token_res = api.safe_http_json(treq)
-            config.update_config(
-                access_token=token_res["access_token"],
-                refresh_token=token_res.get("refresh_token"),
-                base_url=base_url
-            )
-            print("Login successful.")
-            return
-        except urllib.error.HTTPError as e:
-            if e.code == 400:
-                try:
-                    err_res = json.loads(e.read().decode("utf-8"))
-                    err_code = err_res.get("error")
-                except Exception:
-                    raise RuntimeError("Token error: malformed response")
-                if err_code == "authorization_pending":
-                    continue
-                elif err_code == "slow_down":
-                    interval += 5
-                    continue
-                elif err_code == "access_denied":
-                    raise RuntimeError("Access denied by user.")
-                elif err_code == "expired_token":
-                    raise RuntimeError("Device code expired.")
-                else:
-                    raise RuntimeError(f"Token error: {err_code}")
-            else:
-                raise RuntimeError(f"HTTP error during token request: {e.code}")
-        except urllib.error.URLError as e:
-            print(f"Network error, retrying... ({e})")
-            continue
+        token_res = flow.device_login(
+            base_url,
+            _post_device,
+            start_path="/api/device/code",
+            token_path="/api/device/token",
+            start_body={
+                "client_kind": client_kind,
+                "name": name,
+                "hostname": hostname,
+                "requested_scopes": requested_scopes,
+            },
+            transient=(urllib.error.URLError,),
+        )
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Network error during device code request: {exc}") from exc
+    except flow.DeviceLoginError as exc:
+        if exc.code == "access_denied":
+            raise RuntimeError("Access denied by user.") from None
+        if exc.code in ("expired_token", "timeout"):
+            raise RuntimeError("Device code expired.") from None
+        if exc.code == "invalid_response":
+            raise RuntimeError("The server did not offer device login.") from None
+        raise RuntimeError(str(exc)) from None
+    config.update_config(
+        access_token=token_res["access_token"],
+        refresh_token=token_res.get("refresh_token"),
+        base_url=base_url,
+    )
+    print("Login successful.")
 
 import threading
 _refresh_lock = threading.Lock()
