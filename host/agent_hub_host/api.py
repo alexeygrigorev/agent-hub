@@ -21,7 +21,7 @@ def _get_opener():
 def check_url(url: str):
     if not isinstance(url, str):
         raise TypeError('URL must be a string')
-    if not url:
+    if not url or url != url.strip() or any(c.isspace() or ord(c) < 32 for c in url):
         raise ValueError('URL cannot be empty')
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ('http', 'https'):
@@ -29,7 +29,7 @@ def check_url(url: str):
     if not parsed.hostname:
         raise ValueError('URL must have a hostname')
     if parsed.scheme == 'http':
-        if parsed.hostname not in ('localhost', '127.0.0.1', '::1'):
+        if parsed.hostname.lower() not in ('localhost', '127.0.0.1', '::1'):
             raise ValueError('Only HTTPS URLs or localhost are permitted.')
     if parsed.username or parsed.password:
         raise ValueError('Userinfo not permitted in URL.')
@@ -42,6 +42,14 @@ def check_url(url: str):
                 raise ValueError('Invalid port')
         except ValueError:
             raise ValueError('Invalid port')
+
+def canonical_origin(url: str) -> tuple:
+    check_url(url)
+    parsed = urllib.parse.urlparse(url)
+    scheme = parsed.scheme.lower()
+    host = parsed.hostname.lower()
+    port = int(parsed.port) if parsed.port is not None else (443 if scheme == 'https' else 80)
+    return (scheme, host, port)
 
 def safe_http_json(req: urllib.request.Request, timeout: float = 10.0):
     opener = _get_opener()
@@ -56,7 +64,15 @@ def safe_http_json(req: urllib.request.Request, timeout: float = 10.0):
             body = res.read(10 * 1024 * 1024 + 1)
             if len(body) > 10 * 1024 * 1024:
                 raise RuntimeError("Response too large")
-            return json.loads(body.decode("utf-8"))
+            data = json.loads(body.decode("utf-8"))
+            if isinstance(data, dict) and getattr(req, "full_url", "").rstrip("/").endswith("/api/device/token"):
+                if "machine_id" in data and data["machine_id"] is not None:
+                    config.record_authenticated_machine_binding(
+                        req.full_url,
+                        data["machine_id"],
+                        data.get("access_token"),
+                    )
+            return data
     except urllib.error.HTTPError as e:
         raise
 
@@ -134,16 +150,43 @@ class RNG:
     def random(self) -> float: return random.random()
     def randbytes(self, n: int) -> bytes: return os.urandom(n)
 
+def _persist_registration_machine_id(base_url: str, res):
+    if not isinstance(res, dict):
+        return
+    has_mid = "machine_id" in res or "id" in res
+    if not has_mid:
+        return
+    mid = res.get("machine_id") if "machine_id" in res else res.get("id")
+    if not config.is_valid_machine_id(mid):
+        raise RuntimeError("Invalid machine_id in registration response")
+    cfg = config.load_config()
+    cfg_base = cfg.get("base_url")
+    if cfg_base and canonical_origin(base_url) != canonical_origin(cfg_base):
+        raise RuntimeError("Registration origin mismatch with configured base_url")
+    existing_mid = cfg.get("machine_id")
+    if existing_mid and existing_mid != mid:
+        raise RuntimeError("Conflicting machine_id in registration response")
+    if existing_mid != mid:
+        if cfg_base:
+            config.update_config(machine_id=mid)
+        else:
+            config.update_config(base_url=base_url, machine_id=mid)
+
 def register_machine(base_url: str):
-    info = system.get_system_info()
     check_url(base_url)
-    url = f"{base_url}/api/machines/register"
+    cfg = config.load_config()
+    cfg_base = cfg.get("base_url")
+    if cfg_base and canonical_origin(base_url) != canonical_origin(cfg_base):
+        raise RuntimeError("Registration URL origin does not match configured base_url")
+    info = system.get_system_info()
+    url = f"{base_url.rstrip('/')}/api/machines/register"
     req = urllib.request.Request(url, data=json.dumps(info).encode("utf-8"), headers={
         "Content-Type": "application/json",
         "Authorization": f"Bearer {auth.get_access_token()}"
     })
     try:
-        safe_http_json(req, timeout=10.0)
+        res = safe_http_json(req, timeout=10.0)
+        _persist_registration_machine_id(base_url, res)
     except urllib.error.HTTPError as e:
         if e.code == 401:
             try:
@@ -152,7 +195,8 @@ def register_machine(base_url: str):
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {auth.get_access_token()}"
                 })
-                safe_http_json(retry_req, timeout=10.0)
+                retry_res = safe_http_json(retry_req, timeout=10.0)
+                _persist_registration_machine_id(base_url, retry_res)
                 return
             except urllib.error.HTTPError as e2:
                 raise RuntimeError(f"Registration failed: {e2.code}")
@@ -160,7 +204,11 @@ def register_machine(base_url: str):
 
 def get_available_machines(base_url: str):
     check_url(base_url)
-    url = f"{base_url}/api/machines/available"
+    cfg = config.load_config()
+    cfg_base = cfg.get("base_url")
+    if cfg_base and canonical_origin(base_url) != canonical_origin(cfg_base):
+        raise RuntimeError("Target URL origin does not match configured base_url")
+    url = f"{base_url.rstrip('/')}/api/machines/available"
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {auth.get_access_token()}"
     })
@@ -291,16 +339,57 @@ def ws_handshake(host: str, port: int, path: str, token: str, is_secure: bool, r
 from .ws import WSConnection
 
 class HostAgent:
-    def __init__(self, clock=None, rng=None, dispatcher=None):
+    def __init__(self, clock=None, rng=None, dispatcher=None, quota_collector=None):
         self.clock = clock or Clock()
         self.rng = rng or RNG()
         self.shutdown_requested = False
         self.cfg = config.load_config()
         self.base_url = self.cfg.get("base_url")
         self.dispatcher = dispatcher
+        if quota_collector is not None:
+            self.quota_collector = quota_collector
+        else:
+            from .quota_snapshot import QuotaCollector
+            self.quota_collector = QuotaCollector(clock=self.clock, base_url=None)
+
+    def _monotonic(self) -> float:
+        if hasattr(self.clock, "monotonic"):
+            return self.clock.monotonic()
+        return self.clock.time()
+
+    def _tick_quota(self):
+        if not self.quota_collector:
+            return
+        try:
+            if self.base_url is not None and hasattr(self.quota_collector, "base_url"):
+                if self.quota_collector.base_url is None:
+                    self.quota_collector.base_url = self.base_url
+            self.quota_collector.step()
+        except Exception:
+            pass
+
+    def _send_ws_heartbeat(self, ws) -> float:
+        running_ids = (
+            self.dispatcher.get_running_job_ids()
+            if self.dispatcher and hasattr(self.dispatcher, "get_running_job_ids")
+            else (
+                list(self.dispatcher.running_jobs.keys())
+                if self.dispatcher and hasattr(self.dispatcher, "running_jobs")
+                else []
+            )
+        )
+        hb = get_heartbeat_payload(self.clock, running_jobs=running_ids)
+        ws.send_frame(1, json.dumps(hb).encode("utf-8"))
+        return self._monotonic()
 
     def run(self):
+        if not self.base_url:
+            self.cfg = config.load_config()
+            self.base_url = self.cfg.get("base_url")
         register_machine(self.base_url)
+        self.cfg = config.load_config()
+        if not self.base_url:
+            self.base_url = self.cfg.get("base_url")
         
         parsed = urllib.parse.urlparse(self.base_url)
         ws_scheme = "wss" if parsed.scheme == "https" else "ws"
@@ -313,7 +402,7 @@ class HostAgent:
         poll_backoff = 1.0
         
         while not self.shutdown_requested:
-            start_time = self.clock.time()
+            start_time = self._monotonic()
             try:
                 token = auth.get_access_token()
                 sock, rest = ws_handshake(host, port, path, token, parsed.scheme == "https", self.rng)
@@ -321,7 +410,7 @@ class HostAgent:
             except Exception:
                 pass
                 
-            elapsed = self.clock.time() - start_time
+            elapsed = self._monotonic() - start_time
             if elapsed > 60.0:
                 ws_fail_count = 0
                 
@@ -335,23 +424,24 @@ class HostAgent:
                 self.clock.sleep(poll_backoff)
                 poll_backoff = min(600.0, poll_backoff * 2.0)
                 
-            total_elapsed = self.clock.time() - start_time
+            total_elapsed = self._monotonic() - start_time
             if total_elapsed < ws_sleep:
                 self.clock.sleep(ws_sleep - total_elapsed)
 
     def _run_ws(self, sock, rest):
         sock.settimeout(1.0)
         ws = WSConnection(sock, rest, self.rng)
-        last_hb = self.clock.time()
+        last_hb = self._monotonic()
         
         try:
             while not self.shutdown_requested:
-                now = self.clock.time()
-                if now - last_hb >= 60.0:
-                    running_ids = self.dispatcher.get_running_job_ids() if self.dispatcher and hasattr(self.dispatcher, "get_running_job_ids") else (list(self.dispatcher.running_jobs.keys()) if self.dispatcher and hasattr(self.dispatcher, "running_jobs") else [])
-                    hb = get_heartbeat_payload(self.clock, running_jobs=running_ids)
-                    ws.send_frame(1, json.dumps(hb).encode("utf-8"))
-                    last_hb = now
+                if self._monotonic() - last_hb >= 60.0:
+                    last_hb = self._send_ws_heartbeat(ws)
+
+                if not getattr(ws, "buf", b""):
+                    self._tick_quota()
+                    if self._monotonic() - last_hb >= 60.0:
+                        last_hb = self._send_ws_heartbeat(ws)
                     
                 try:
                     fin, opcode, payload = ws.recv_frame()
@@ -382,7 +472,11 @@ class HostAgent:
                 pass
 
     def _poll_fallback(self):
-        url = f"{self.base_url}/api/host/poll"
+        self._tick_quota()
+        target_base = self.base_url
+        if not target_base:
+            target_base = config.load_config().get("base_url")
+        url = f"{target_base}/api/host/poll"
         running_ids = self.dispatcher.get_running_job_ids() if self.dispatcher and hasattr(self.dispatcher, "get_running_job_ids") else (list(self.dispatcher.running_jobs.keys()) if self.dispatcher and hasattr(self.dispatcher, "running_jobs") else [])
         hb = get_heartbeat_payload(self.clock, running_jobs=running_ids)
         req = urllib.request.Request(url, data=json.dumps(hb).encode("utf-8"), headers={
@@ -411,3 +505,4 @@ class HostAgent:
         
         jitter = (self.rng.random() * 0.4 - 0.2) * 30.0 # 30s +- 20%
         self.clock.sleep(30.0 + jitter)
+

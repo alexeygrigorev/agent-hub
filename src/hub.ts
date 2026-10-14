@@ -10,6 +10,7 @@ import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCl
 import { BusService, BUS_SCHEMA_SQL, CallerContext, generateUlid } from './bus';
 import { JobsService, JOBS_SCHEMA_SQL } from './jobs';
 import { ensureRootScheduling, getRootScheduling, isRootSchedulingEnabled, setRootScheduling } from './root_scheduling';
+import { QuotaStore, handleQuotaRoutes } from './quota';
 
 function parseEpoch(raw: any): number | null {
   if (raw === undefined || raw === null || raw === '' || typeof raw === 'boolean') return null;
@@ -58,6 +59,7 @@ export class Hub extends DurableObject {
   jwksCache: JwksCache = new JwksCache();
   public busService: BusService;
   public jobsService: JobsService;
+  public quotaStore: QuotaStore;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -234,6 +236,8 @@ export class Hub extends DurableObject {
         }
       } catch (e) { }
     }
+
+    this.quotaStore = new QuotaStore(this.sql, this.ctx, this.env);
   }
 
   private ensureColumns(table: string, columns: { [col: string]: string }) {
@@ -445,6 +449,8 @@ export class Hub extends DurableObject {
       if (busResponse) return busResponse;
       const jobsResponse = await this.handleJobsRoutes(request, path, url);
       if (jobsResponse) return jobsResponse;
+      const quotaResponse = await handleQuotaRoutes(request, path, this.quotaStore, url);
+      if (quotaResponse) return quotaResponse;
       if (path === '/api/healthz') {
         if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
         return Response.json({ status: 'ok', component: 'hub-do' });

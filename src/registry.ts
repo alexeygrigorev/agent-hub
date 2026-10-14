@@ -188,7 +188,8 @@ export async function handleRegistryRoutes(
       WHERE id = ?
     `, hostname, os, network, rolesJson, capJson, cred.id, cred.machine_id);
 
-    return Response.json({ status: 'registered' });
+    // machine_id comes only from the presented credential, never from the body
+    return Response.json({ status: 'registered', machine_id: cred.machine_id });
   }
 
   if (path === '/api/machines/available') {
