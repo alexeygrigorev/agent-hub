@@ -143,7 +143,7 @@ jobs(id PK (ulid), kind root-run|writer-run|head-recovery|principal-wake|custom,
 offers(job_id, machine_id, offered_at, response accepted|declined|timeout, reason)   -- audit of random picks
 leases(name PK, holder_job_id, holder_machine_id, holder_actor, epoch INT, acquired_at,
             renewed_at, expires_at, released_at, release_reason)
-messages(id PK ulid, from_actor, to_actor, kind note|handoff|reply|status|claim|release, thread_id,
+messages(id PK ulid, from_actor, to_actor, kind note|handoff|reply|status|claim|release|sync_reply, thread_id,
             reply_to, body TEXT (≤16 KB), idempotency_key, lease_epoch NULL, created_at,
             delivered_at, read_at, acked_at, accepted_at, completed_at, expires_at)
             UNIQUE(from_actor, idempotency_key)
@@ -185,7 +185,7 @@ Every 60 s the host agent reads `a list --json` (and `a status <id> --json` for 
 
 ### 7.5 aplexer mailbox bridge (replaces desktop-orchestrator)
 
-For tags registered on the host, the agent bridges hub messages to the native aplexer mailbox (`a message send --to TAG`) and native replies/ACKs back to the hub, so existing agents keep using `a message …` while root and other machines use the hub. The "synchronous reply" (typing into an idle session, `04-communication.md#keeping-heads-moving`) is performed only when the hub message asks for it **and** the host sees the target at an idle, empty prompt; never into busy, menu, draft or unknown states. The bridge never sets another agent's identity.
+For tags registered on the host, the agent bridges hub messages to the native aplexer mailbox (`a message send --to TAG`) and native replies/ACKs back to the hub, so existing agents keep using `a message …` while root and other machines use the hub. The "synchronous reply" (typing into an idle session, `04-communication.md#keeping-heads-moving`) is performed only when the hub message asks for it **and** the host sees the target at an idle, empty prompt; never into busy, menu, draft or unknown states. Authenticated `/api/bus/send` and `/api/bus/reply` requests opt in explicitly with `kind: "sync_reply"` (also accepted by the existing `hub` CLI `--kind` option). Ordinary notes and replies only queue mailbox messages. A guarded request may queue its native message before refusing prompt input; refusal is not a native typing effect. Native responses of kind `sync_reply` are normalized to plain `reply`, so they never implicitly request another synchronous delivery. The bridge never sets another agent's identity.
 
 ## 8. Scheduling and leases
 

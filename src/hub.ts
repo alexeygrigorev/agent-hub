@@ -1328,7 +1328,7 @@ export class Hub extends DurableObject {
       if (typeof body.to_actor !== 'string' || !body.to_actor || body.to_actor.length > 128) {
         return Response.json({ error: 'invalid_to_actor' }, { status: 400 });
       }
-      if (typeof body.kind !== 'string' || !['note', 'handoff', 'reply', 'status', 'claim', 'release', 'scope_claim'].includes(body.kind)) {
+      if (typeof body.kind !== 'string' || !['note', 'handoff', 'reply', 'status', 'claim', 'release', 'scope_claim', 'sync_reply'].includes(body.kind)) {
         return Response.json({ error: 'invalid_kind' }, { status: 400 });
       }
       if (typeof body.body !== 'string') {
@@ -1396,7 +1396,7 @@ export class Hub extends DurableObject {
       if (typeof body.to_actor !== 'string' || !body.to_actor || body.to_actor.length > 128) {
         return Response.json({ error: 'invalid_to_actor' }, { status: 400 });
       }
-      if (typeof body.kind !== 'string' || !['note', 'handoff', 'reply', 'status', 'claim', 'release', 'scope_claim'].includes(body.kind)) {
+      if (typeof body.kind !== 'string' || !['note', 'handoff', 'reply', 'status', 'claim', 'release', 'scope_claim', 'sync_reply'].includes(body.kind)) {
         return Response.json({ error: 'invalid_kind' }, { status: 400 });
       }
       if (typeof body.body !== 'string') {

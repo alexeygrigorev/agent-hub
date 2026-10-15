@@ -25,9 +25,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 # Fake `a` for real-Worker `hub bridge` runs: `message send` returns a qualified envelope from the
 # hub-bridge service session (optionally ACKing it in the recipient's cursor), `message log` returns
-# one reply per send for tags configured to reply. Any other verb exits 3 (never deliver/pane/keys).
+# one reply per send for tags configured to reply. Sync fixtures also implement status/capture and
+# message deliver, recording simulated typing in effects.jsonl; they never touch a real PTY.
 REAL_BRIDGE_FAKE_A = r'''#!/usr/bin/env python3
-import sys, json, os, uuid
+import sys, json, os, uuid, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 cfg = json.load(open(os.path.join(HERE, "cfg.json")))
 args = sys.argv[1:]
@@ -40,15 +41,38 @@ if args[:2] == ["message", "send"]:
     if args[-1] in cfg.get("refuse_bodies", []):
         sys.exit(4)
     nid = str(uuid.uuid4())
+    kind = args[args.index("--kind") + 1]
     with open(sends, "a") as f:
-        f.write(json.dumps({"id": nid, "tag": tag, "body": args[-1]}) + "\n")
-    if cfg.get("auto_ack"):
+        f.write(json.dumps({"id": nid, "tag": tag, "kind": kind, "body": args[-1]}) + "\n")
+    if cfg.get("auto_ack") and kind != "sync_reply":
         c = json.load(open(t["cursor"]))
         c.setdefault("exceptions", []).append(nid)
         json.dump(c, open(t["cursor"], "w"))
     print(json.dumps({"schema_version": 1, "id": nid, "workspace": cfg["ws"],
         "from": {"tag": "hub-bridge", "session_id": "00000000-0000-0000-0000-000000000001", "workspace": cfg["ws"]},
-        "to": {"tag": tag, "session_id": t["rec"]}, "kind": "note", "reply_to": None, "body": args[-1], "delivery": "inbox"}))
+        "to": {"tag": tag, "session_id": t["rec"]}, "kind": kind, "reply_to": None, "body": args[-1], "delivery": "inbox"}))
+elif args[:2] == ["message", "deliver"]:
+    nid = args[2]
+    queued = next(json.loads(line) for line in open(sends) if json.loads(line)["id"] == nid)
+    with open(os.path.join(HERE, "effects.jsonl"), "a") as f:
+        f.write(json.dumps(queued) + "\n")
+    behavior = cfg.get("deliver_behavior", "success")
+    if behavior == "timeout":
+        time.sleep(35)  # production bridge's 30-second timeout, real child process
+    if behavior == "crash":
+        sys.exit(9)
+    if cfg.get("auto_ack"):
+        t = cfg["tags"][queued["tag"]]
+        c = json.load(open(t["cursor"]))
+        c.setdefault("exceptions", []).append(nid)
+        json.dump(c, open(t["cursor"], "w"))
+    print(json.dumps({"id": nid}))
+elif args[0] == "status":
+    if cfg.get("status_exit"):
+        sys.exit(cfg["status_exit"])
+    print(json.dumps({"state": cfg.get("state", "idle")}))
+elif args[0] == "capture":
+    print(cfg.get("capture", "welcome\n❯"))
 elif args[:2] == ["message", "log"]:
     out = []
     if os.path.exists(sends) and cfg.get("replies"):
@@ -1442,6 +1466,150 @@ sys.exit(0)
         status, inbox = self._hub("GET", "/api/bus/inbox?actor=worker-2&limit=100", "token_host_b")
         self.assertEqual(status, 200, inbox)
         return [m for m in inbox if m.get("reply_to") == mid]
+
+    def test_sync_reply_current_authenticated_http_send_accepts_explicit_request(self):
+        self._assert_sync_request_accepted("/api/bus/send", "sync-wire-send")
+
+    def test_sync_reply_current_authenticated_http_reply_accepts_explicit_request(self):
+        self._assert_sync_request_accepted("/api/bus/reply", "sync-wire-reply")
+
+    def _assert_sync_request_accepted(self, route, name):
+        token = self._bridge_host(name, [name])
+        parent = self._hub_send(name, name + "-parent")
+        payload = {"from_actor": name, "to_actor": "worker-2", "kind": "sync_reply", "body": "explicit request",
+                   "idempotency_key": name + "-sync", "reply_to": parent}
+        status, sent = self._hub("POST", route, token, payload)
+        self.assertEqual(status, 200, sent)
+        self.assertEqual(sent["thread_id"], self.seed_sql("SELECT thread_id FROM messages WHERE id = ?", [parent])[0]["thread_id"])
+        again = self._hub("POST", route, token, payload)
+        self.assertEqual(again, (200, sent))
+        self.assertEqual(len(self.seed_sql("SELECT id FROM messages WHERE idempotency_key = ?", [payload["idempotency_key"]])), 1)
+
+    def _configure_native(self, **updates):
+        self.native_cfg.update(updates)
+        with open(os.path.join(self.fake_dir, "cfg.json"), "w") as f:
+            json.dump(self.native_cfg, f)
+
+    def _sync_hub_request(self, tag, key, route="/api/bus/send", parent=None, **extra):
+        payload = {"from_actor": "worker-2", "to_actor": tag, "kind": "sync_reply", "body": key, "idempotency_key": key}
+        if parent:
+            payload["reply_to"] = parent
+        payload.update(extra)
+        status, out = self._hub("POST", route, "token_host_b", payload)
+        self.assertEqual(status, 200, out)
+        return out, payload
+
+    def test_sync_reply_real_worker_cli_idle_empty_delivery_once_for_both_routes(self):
+        token = self._bridge_host("sync-positive", ["sp-w"])
+        self._native(["sp-w"], replies={"sp-w": {"kind": "sync_reply", "body": "native reply"}})
+        status, parent = self._hub("POST", "/api/bus/send", token,
+            {"from_actor": "sp-w", "to_actor": "worker-2", "kind": "note", "body": "parent", "idempotency_key": "sp-parent"})
+        self.assertEqual(status, 200, parent)
+        sent=[]
+        for route, key in (("/api/bus/send", "sp-send"), ("/api/bus/reply", "sp-reply")):
+            out, payload = self._sync_hub_request("projE:sp-w", key, route, parent["id"], thread_id=parent["thread_id"])
+            sent.append(out["id"])
+            self.assertEqual(self._hub("POST", route, "token_host_b", payload), (200, out))
+            self.assertEqual(out["thread_id"], parent["thread_id"])
+            status, bad = self._hub("POST", route, "token_host_b", dict(payload, idempotency_key=key+"-bad", thread_id="wrong"))
+            self.assertEqual((status, bad), (400, {"error": "invalid_reply_to"}))
+        note = self._hub_send("sp-w", "sp-note")
+        status, ordinary = self._hub("POST", "/api/bus/reply", "token_host_b",
+            {"from_actor": "worker-2", "to_actor": "sp-w", "kind": "reply", "body": "ordinary reply", "idempotency_key": "sp-ordinary", "reply_to": parent["id"]})
+        self.assertEqual(status, 200, ordinary)
+        res, outcome = self._run_bridge(token, "--once")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(len(outcome["cycles"][0]["forwarded"]), 4)
+        self.assertEqual(sorted(e["body"] for e in self._fake_lines("effects.jsonl")), ["sp-reply", "sp-send"])
+        self.assertEqual(len(self._fake_lines("sends.jsonl")), 4)
+        for mid in sent + [note, ordinary["id"]]:
+            self.assertTrue(self._stages(mid)["acked_at"])
+            self.assertTrue(all(r["kind"] == "reply" for r in self._replies_to(mid)))
+        self.assertEqual(len([c for c in self._fake_lines("calls.jsonl") if c[0] == "status"]), 6)
+        self.assertEqual(len([c for c in self._fake_lines("calls.jsonl") if c[0] == "capture"]), 6)
+        res2, _ = self._run_bridge(token, "--once")
+        self.assertEqual(res2.returncode, 0, res2.stderr)
+        self.assertEqual(len(self._fake_lines("sends.jsonl")), 4)
+        self.assertEqual(len(self._fake_lines("effects.jsonl")), 2)
+
+    def test_sync_reply_real_worker_cli_unsafe_states_queue_without_typing_then_retry(self):
+        cases = [("busy", "❯", 0), ("unknown", "❯", 0), ("waiting", "❯", 0), ("exited", "❯", 0),
+                 ("idle", "❯ draft", 0), ("idle", "? Select an option\n❯", 0), ("idle", "", 0), ("idle", "❯", 4)]
+        for i, (state, capture, status_exit) in enumerate(cases):
+            with self.subTest(state=state, capture=capture, status_exit=status_exit):
+                tag=f"su-{i}"
+                token=self._bridge_host(f"sync-unsafe-{i}", [tag])
+                self._native([tag], auto_ack=False)
+                self._configure_native(state=state, capture=capture, status_exit=status_exit)
+                out, _ = self._sync_hub_request(tag, f"su-body-{i}")
+                res, outcome = self._run_bridge(token, "--once")
+                self.assertEqual(res.returncode, 1, res.stderr)
+                self.assertTrue(outcome["cycles"][0]["held"])
+                self.assertEqual(len(self._fake_lines("sends.jsonl")), 1)  # queue is distinct from prompt typing
+                self.assertEqual(self._fake_lines("effects.jsonl"), [])
+                self.assertFalse(any(c[:2] == ["message", "deliver"] for c in self._fake_lines("calls.jsonl")))
+                self.assertIsNone(self._stages(out["id"])["acked_at"])
+                self._configure_native(state="idle", capture="❯", status_exit=0, auto_ack=True)
+                res2, _ = self._run_bridge(token, "--once")
+                self.assertEqual(res2.returncode, 0, res2.stderr)
+                self.assertEqual(len(self._fake_lines("sends.jsonl")), 1)
+                self.assertEqual(len(self._fake_lines("effects.jsonl")), 1)
+                self.assertTrue(self._stages(out["id"])["acked_at"])
+
+    def test_sync_reply_real_worker_auth_scope_machine_recipient_and_root_guards(self):
+        token=self._bridge_host("sync-auth", ["sa-w"])
+        read_only=self._bridge_token("token_sync_auth_ro", ("host", "bus:read"))
+        payload={"from_actor": "sa-w", "to_actor": "worker-2", "kind": "sync_reply", "body": "auth", "idempotency_key": "sa-key"}
+        for route in ("/api/bus/send", "/api/bus/reply"):
+            parent=self._hub_send("sa-w", "sa-parent-"+route.rsplit("/",1)[1])
+            req=dict(payload, reply_to=parent)
+            self.assertEqual(self._hub("POST", route, "", req)[0], 401)
+            self.assertEqual(self._hub("POST", route, read_only, req)[0], 403)
+            self.assertEqual(self._hub("POST", route, "token_host_b", req)[0], 403)  # foreign machine sender
+            self.assertEqual(self._hub("POST", route, token, dict(req, to_actor="no-such-agent"))[0], 404)
+            self.assertEqual(self._hub("POST", route, token, dict(req, from_actor="role:root"))[0], 403)
+        self.assertEqual(self.seed_sql("SELECT id FROM messages WHERE idempotency_key = 'sa-key'"), [])
+        self._native(["sa-w"], auto_ack=False)
+        self._configure_native(state="busy")
+        out, _=self._sync_hub_request("sa-w", "sa-valid")
+        self.assertEqual(self._hub("GET", "/api/bus/inbox?actor=sa-w", "token_host_b")[0], 403)
+        self.assertIsNone(self._stages(out["id"])["delivered_at"])
+        res, _=self._run_bridge(token, "--once")
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertEqual(self._hub("POST", f"/api/bus/messages/{out['id']}/ack", "token_host_b")[0], 403)
+        self.assertIsNone(self._stages(out["id"])["acked_at"])
+        self.assertEqual(self._fake_lines("effects.jsonl"), [])
+
+    def test_sync_reply_real_worker_cli_effect_then_crash_restart_never_replays(self):
+        self._assert_sync_uncertain_restart("crash")
+
+    def test_sync_reply_real_worker_cli_effect_then_timeout_restart_never_replays(self):
+        self._assert_sync_uncertain_restart("timeout")
+
+    def _assert_sync_uncertain_restart(self, behavior):
+        tag="sx-"+behavior
+        token=self._bridge_host("sync-"+behavior, [tag])
+        self._native([tag], auto_ack=False)
+        self._configure_native(deliver_behavior=behavior)
+        out, _=self._sync_hub_request(tag, "sx-body-"+behavior)
+        res, outcome=self._run_bridge(token, "--once")
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertTrue(outcome["cycles"][0]["held"])
+        self.assertEqual(len(self._fake_lines("sends.jsonl")), 1)
+        self.assertEqual(len(self._fake_lines("effects.jsonl")), 1)
+        self.assertIsNone(self._stages(out["id"])["acked_at"])
+        with open(os.path.join(self.work, ".local", "hub-bridge-receipts.json")) as f:
+            receipts=json.load(f)
+        nid=receipts["hub_to_native"][out["id"]]
+        self.assertEqual(receipts["delivers"][nid]["status"], "timeout" if behavior == "timeout" else "uncertain")
+        self.assertIn(out["id"], receipts["ambiguous_sends"])
+        self._configure_native(deliver_behavior="success", auto_ack=True)
+        res2, again=self._run_bridge(token, "--once")  # fresh process, existing durable uncertainty
+        self.assertEqual(res2.returncode, 1, res2.stderr)
+        self.assertTrue(again["cycles"][0]["held"])
+        self.assertEqual(len(self._fake_lines("sends.jsonl")), 1)
+        self.assertEqual(len(self._fake_lines("effects.jsonl")), 1)
+        self.assertIsNone(self._stages(out["id"])["acked_at"])
 
     def test_real_worker_cli_bridge_round_trip_without_sql_stage_writes(self):
         token = self._bridge_host("e2e1", ["e1-w", "e1-p"])

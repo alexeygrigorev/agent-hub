@@ -32,7 +32,8 @@ MAX_PENDING_INBOX = 1000
 
 # Message kinds the hub accepts on /api/bus/send and /api/bus/reply (SPEC §6). A native reply
 # whose kind is outside this set is bridged back as a plain "reply" instead of being retried
-# against a 400 forever. "sync_reply" is not on the hub wire yet, so it never goes back up.
+# against a 400 forever. Native "sync_reply" responses stay plain replies: only an explicit
+# hub request may opt into guarded synchronous delivery, never a normalized native response.
 HUB_MESSAGE_KINDS = frozenset(["note", "handoff", "reply", "status", "claim", "release"])
 
 # Prompt glyphs an idle, empty agent composer shows; box-drawing borders around it are ignored.
