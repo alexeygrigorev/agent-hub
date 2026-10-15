@@ -27,13 +27,14 @@ function sanitizedQuota(raw: any): any {
   const windows: any = {};
   for (const [key, w] of Object.entries(raw.windows) as any) {
     if (!label(key) || !object(w, ['present', 'percent_remaining', 'reset_at', 'rolling']) || typeof w.present !== 'boolean' || (w.percent_remaining !== null && (typeof w.percent_remaining !== 'number' || !Number.isFinite(w.percent_remaining) || w.percent_remaining < 0 || w.percent_remaining > 100)) || (w.reset_at !== null && (typeof w.reset_at !== 'string' || !Number.isFinite(Date.parse(w.reset_at)))) || (w.rolling !== undefined && typeof w.rolling !== 'boolean')) return null;
+    if (!w.present && (w.percent_remaining !== null || w.reset_at !== null)) return null;
     windows[key] = { present: w.present, percent_remaining: w.percent_remaining, reset_at: w.reset_at, rolling: w.rolling === true };
   }
   if (raw.observed_at !== null && (typeof raw.observed_at !== 'string' || !Number.isFinite(Date.parse(raw.observed_at)))) return null;
   return { status: raw.status, observed_at: raw.observed_at, details, windows };
 }
 function fresh(value: any, now: number, ttl: number) {
-  const at = typeof value === 'string' ? Date.parse(value) : NaN;
+  const at = typeof value === 'string' && /T.*(?:Z|[+-]\d{2}:\d{2})$/i.test(value) ? Date.parse(value) : NaN;
   return Number.isFinite(at) && at <= now && now - at <= ttl;
 }
 async function body(request: Request): Promise<any> {
@@ -139,7 +140,7 @@ export class FleetService {
     const path = new URL(request.url).pathname; const caller = auth.caller;
     if (!caller) return response({ error: 'unauthorized' }, 401);
     const admin = !!caller.isAdmin; const host = caller.kind === 'host' && !!caller.machineId && auth.scopes?.includes('host');
-    const writer = admin || (caller.kind === 'agent' && auth.scopes?.includes('jobs:create'));
+    const writer = admin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch'));
     if (path === '/api/fleet' && request.method === 'GET') {
       if (!admin) return response({ error: 'forbidden' }, 403);
       return response({ accounts: this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray().map(a => this.accountStatus(a)), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray(),

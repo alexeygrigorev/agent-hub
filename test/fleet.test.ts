@@ -146,6 +146,9 @@ describe('generic accounts and launch placement', () => {
     const reports = { subscriptions: [{ service: 'codex', account: 'desktop-codex', plan: 'pro', quota }] };
     expect((await s.handle(request('/subscriptions', reports, 'PUT'), host('hetzner'))).status).toBe(200);
     expect((s.plan(intent({ machine: 'hetzner' })) as any).selected.account).toBe('desktop-codex');
+    quota.windows.weekly.present = false;
+    expect((await s.handle(request('/subscriptions', reports, 'PUT'), host('hetzner'))).status).toBe(400);
+    quota.windows.weekly.present = true;
     (reports.subscriptions[0] as any).token = 'forbidden';
     expect((await s.handle(request('/subscriptions', reports, 'PUT'), host('hetzner'))).status).toBe(400);
     delete (reports.subscriptions[0] as any).token;
@@ -186,7 +189,7 @@ describe('generic accounts and launch placement', () => {
     const input = intent({ machine: 'win35', parent_id: root.id });
     expect((await s.handle(request('/launches', input), admin)).status).toBe(409);
     sql.exec("UPDATE fleet_launches SET state = 'running' WHERE id = ?", root.id);
-    const foreign = { caller: { actor: 'other-agent', kind: 'agent' }, scopes: ['jobs:create'] };
+    const foreign = { caller: { actor: 'other-agent', kind: 'agent' }, scopes: ['fleet:launch'] };
     expect((await s.handle(request('/launches', input), foreign)).status).toBe(403);
     expect((await s.handle(request('/launches', input), admin)).status).toBe(201);
     sql.exec("UPDATE fleet_launches SET state = 'exited' WHERE id = ?", root.id);

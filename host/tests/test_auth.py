@@ -40,8 +40,8 @@ class TestAuth(unittest.TestCase):
         
         mock_urlopen.side_effect = [code_resp, pending_error, success_resp]
         
-        auth.device_login("https://fake", "host", "agent-hub-host", "host", ["host_agent"])
-        mock_update_config.assert_called_once_with(access_token="acc123", refresh_token="ref123", base_url="https://fake")
+        auth.device_login("https://fake", "host", "agent-hub-host", "host", auth.HOST_SCOPES)
+        mock_update_config.assert_called_once_with(access_token="acc123", refresh_token="ref123", base_url="https://fake", client_kind="host", client_name="agent-hub-host", requested_scopes=auth.HOST_SCOPES)
 
     @patch("urllib.request.OpenerDirector.open")
     @patch("agent_hub_host.config.update_config")
@@ -68,7 +68,7 @@ class TestAuth(unittest.TestCase):
         mock_urlopen.side_effect = [code_resp, slow_error, deny_error]
         
         with self.assertRaisesRegex(RuntimeError, "Access denied by user."):
-            auth.device_login("https://fake", "host", "agent-hub-host", "host", ["host_agent"])
+            auth.device_login("https://fake", "host", "agent-hub-host", "host", auth.HOST_SCOPES)
 
     @patch("urllib.request.OpenerDirector.open")
     @patch("agent_hub_host.config.load_config")

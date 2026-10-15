@@ -27,4 +27,15 @@ describe('private fleet assets', () => {
     const r = await doFetch(new Request('https://hub.test/api/fleet/accounts', { method: 'PUT', headers: { Cookie: cookie }, body: JSON.stringify({ accounts: [], routes: [] }) }));
     expect(r.status).toBe(403);
   });
+  it('offers narrow spawn scope only through agent pairing, without returning a credential before approval', async () => {
+    const start = async (kind: string, scopes: string[]) => doFetch(new Request('https://hub.test/api/device/code', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ client_kind: kind, name: 'private-coordinator', requested_scopes: scopes }) }));
+    expect((await start('host', ['host', 'bus:send', 'bus:read', 'health:report'])).status).toBe(200);
+    expect((await start('host', ['fleet:launch'])).status).toBe(400);
+    expect((await start('agent', ['jobs:create'])).status).toBe(400);
+    const response = await start('agent', ['bus:send', 'bus:read', 'fleet:launch']);
+    expect(response.status).toBe(200);
+    const code: any = await response.json(); expect(code.access_token).toBeUndefined();
+    const pending = await doFetch(new Request('https://hub.test/api/device/token', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ grant_type: 'urn:ietf:params:oauth:grant-type:device_code', device_code: code.device_code }) }));
+    const result: any = await pending.json(); expect(result.error).toBe('authorization_pending'); expect(result.access_token).toBeUndefined();
+  });
 });

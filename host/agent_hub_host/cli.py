@@ -5,7 +5,9 @@ from . import auth, api, system, config
 
 def cmd_login(args):
     try:
-        auth.device_login(args.base_url, "host", "agent-hub-host", system.get_hostname(), ["host_agent"])
+        kind = getattr(args, 'kind', 'host')
+        scopes = getattr(args, 'scope', None) or (auth.AGENT_SCOPES if kind == 'agent' else auth.HOST_SCOPES)
+        auth.device_login(args.base_url, kind, getattr(args, 'name', None) or 'agent-hub-' + kind, system.get_hostname(), scopes)
     except Exception as e:
         print(f"Login failed: {e}", file=sys.stderr)
         sys.exit(1)
@@ -59,7 +61,7 @@ def cmd_run(args):
             base_url = cfg.get("base_url")
             if base_url:
                 from . import system, auth
-                auth.device_login(base_url, "host", "agent-hub-host", system.get_hostname(), ["host_agent"])
+                auth.device_login(base_url, "host", "agent-hub-host", system.get_hostname(), auth.HOST_SCOPES)
             else:
                 print("Not logged in.", file=sys.stderr)
                 sys.exit(1)
@@ -143,6 +145,9 @@ def main():
     
     p_login = sub.add_parser("login", help="Login to Agent Hub")
     p_login.add_argument("base_url", help="Base URL of the Agent Hub")
+    p_login.add_argument('--kind', choices=['host', 'agent'], default='host')
+    p_login.add_argument('--name', help='Human-visible name of this paired host or agent')
+    p_login.add_argument('--scope', action='append', help='Requested scope; administrator approval is required')
     
     p_machines = sub.add_parser("machines", help="Machines operations")
     m_sub = p_machines.add_subparsers(dest="m_cmd", required=True)

@@ -594,12 +594,13 @@ export class Hub extends DurableObject {
           return Response.json({ error: 'Invalid payload' }, { status: 400 });
         }
         
-        const allowedScopes = ['host', 'bus:send', 'bus:read', 'health:report', 'jobs:create', 'lease:root'];
+        const allowedScopes = ['host', 'bus:send', 'bus:read', 'health:report', 'jobs:create', 'lease:root', 'fleet:launch'];
         for (const scope of body.requested_scopes) {
           if (!allowedScopes.includes(scope)) {
             return Response.json({ error: 'invalid_scope' }, { status: 400 });
           }
         }
+        if (body.client_kind === 'host' && body.requested_scopes.includes('fleet:launch')) return Response.json({ error: 'invalid_scope' }, { status: 400 });
         
         if (body.requested_scopes.includes('lease:root') || body.requested_scopes.includes('jobs:create') || (body.client_kind === 'agent' && body.requested_scopes.includes('host'))) return Response.json({ error: 'invalid_scope' }, { status: 400 });
         

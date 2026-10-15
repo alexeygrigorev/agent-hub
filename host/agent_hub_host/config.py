@@ -6,6 +6,11 @@ import stat
 from pathlib import Path
 
 def get_config_path() -> Path:
+    explicit = os.environ.get('HUB_CONFIG_FILE')
+    if explicit:
+        path = Path(explicit).expanduser()
+        if not path.is_absolute(): raise ValueError('HUB_CONFIG_FILE must be absolute')
+        return path
     if sys.platform == "win32":
         appdata = os.environ.get("APPDATA")
         if not appdata:

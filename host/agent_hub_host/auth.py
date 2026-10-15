@@ -10,6 +10,9 @@ from pathlib import Path
 from . import config
 from . import api
 
+HOST_SCOPES = ['host', 'bus:send', 'bus:read', 'health:report']
+AGENT_SCOPES = ['bus:send', 'bus:read']
+
 
 def _shared_device_login():
     """The polling loop lives in DataTalksClub/auth."""
@@ -82,6 +85,9 @@ def device_login(base_url: str, client_kind: str, name: str, hostname: str, requ
         access_token=token_res["access_token"],
         refresh_token=token_res.get("refresh_token"),
         base_url=base_url,
+        client_kind=client_kind,
+        client_name=name,
+        requested_scopes=list(requested_scopes),
     )
     print("Login successful.")
 
@@ -125,10 +131,13 @@ def refresh_token():
             
             if should_repair:
                 config.clear_config()
-                config.update_config(base_url=base_url)
+                kind = cfg.get('client_kind', 'host')
+                name = cfg.get('client_name', 'agent-hub-host')
+                scopes = cfg.get('requested_scopes', AGENT_SCOPES if kind == 'agent' else HOST_SCOPES)
+                config.update_config(base_url=base_url, client_kind=kind, client_name=name, requested_scopes=scopes)
                 from . import system
                 print(f"Refresh failed (code {e.code} revocation), pairing required again.")
-                device_login(base_url, "host", "agent-hub-host", system.get_hostname(), ["host_agent"])
+                device_login(base_url, kind, name, system.get_hostname(), scopes)
                 return get_access_token()
             else:
                 raise RuntimeError(f"Transient HTTP error during refresh: {e.code}")
