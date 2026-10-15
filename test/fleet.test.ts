@@ -30,7 +30,7 @@ function registry(shared = false) {
     { label: 'desktop-codex', provider: 'codex', max_concurrency: 1, reserve_percent: 15, enabled: true },
   ], routes: [
     { machine_id: 'hetzner', engine: 'codex', account: 'shared-codex', profile: null },
-    { machine_id: 'win35', engine: 'codex', account: shared ? 'shared-codex' : 'desktop-codex', profile: 'desktop' },
+    { machine_id: 'win35', engine: 'codex', account: shared ? 'shared-codex' : 'desktop-codex', profile: null },
   ] };
 }
 const intent = (extra = {}) => ({ workspace: 'demo', prompt: 'private test goal', idempotency_key: crypto.randomUUID(), ...extra });
@@ -139,6 +139,7 @@ describe('generic accounts and launch placement', () => {
   it('supports two accounts for one service on a machine without reusing its default quota for both', async () => fixture(async (s, sql) => {
     const config = registry();
     config.routes[1].machine_id = 'hetzner';
+    config.routes[1].profile = 'secondary' as any;
     await s.handle(request('/accounts', config, 'PUT'), admin);
     expect((s.plan(intent({ machine: 'hetzner' })) as any).selected).toBeNull();
     const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
@@ -150,9 +151,10 @@ describe('generic accounts and launch placement', () => {
     delete (reports.subscriptions[0] as any).token;
     expect((await s.handle(request('/subscriptions', reports, 'PUT'), host('win35'))).status).toBe(400);
   }));
-  it('records authenticated requester, parent, summary and native sessions without allowing host attribution spoofing', async () => fixture(async s => {
+  it('records authenticated requester, parent, summary and native sessions without allowing host attribution spoofing', async () => fixture(async (s, sql) => {
     await configure(s);
     const root: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner', summary: 'Parent task' })), admin)).json();
+    sql.exec("UPDATE fleet_launches SET state = 'running' WHERE id = ?", root.id);
     const child: any = await (await s.handle(request('/launches', intent({ machine: 'win35', parent_id: root.id, summary: 'Child task' })), admin)).json();
     expect(child.id).toBeTruthy();
     const sessions = { sessions: [{ native_id: 'native-id', tag: 'real-session', workspace: '/repo', profile: null, account: null, engine: 'codex', phase: 'running', agent_state: 'working' }] };
@@ -162,5 +164,35 @@ describe('generic accounts and launch placement', () => {
     expect(record.parent_id).toBe(root.id); expect(record.actor).toBe('test-admin'); expect(record.requester_kind).toBe('human'); expect(record.summary).toBe('Child task');
     expect(view.sessions[0].machine_id).toBe('win35'); expect(view.sessions[0].workspace).toBe('/repo');
     expect((await s.handle(request('/sessions', { ...sessions, machine_id: 'hetzner' }, 'PUT'), host('win35'))).status).toBe(400);
+  }));
+  it('requires a fresh account observation on the selected machine while keeping the other fresh machine usable', async () => fixture(async (s, sql) => {
+    await configure(s, true);
+    sql.exec("UPDATE host_quota_snapshots SET captured_at = ? WHERE host_id = 'win35'", iso(-1200001));
+    expect((s.plan(intent({ machine: 'win35' })) as any).selected).toBeNull();
+    expect((s.plan(intent({ machine: 'hetzner' })) as any).selected.machine).toBe('hetzner');
+  }));
+  it('does not attribute default quota to a named profile and clears reports on provider remapping', async () => fixture(async (s, sql) => {
+    const config = registry(); config.routes[0].profile = 'secondary' as any;
+    await s.handle(request('/accounts', config, 'PUT'), admin);
+    expect((s.plan(intent({ machine: 'hetzner' })) as any).selected).toBeNull();
+    sql.exec('INSERT INTO fleet_subscriptions VALUES (?, ?, ?, ?, ?, ?)', 'hetzner', 'shared-codex', 'codex', 'pro', iso(), '{}');
+    config.accounts[0].provider = 'claude'; config.accounts[0].reserve_percent = 0;
+    await s.handle(request('/accounts', config, 'PUT'), admin);
+    expect(sql.exec('SELECT COUNT(*) n FROM fleet_subscriptions').one().n).toBe(0);
+  }));
+  it('rejects unowned and inactive parent provenance and replays a child even after parent completion', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const root: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    const input = intent({ machine: 'win35', parent_id: root.id });
+    expect((await s.handle(request('/launches', input), admin)).status).toBe(409);
+    sql.exec("UPDATE fleet_launches SET state = 'running' WHERE id = ?", root.id);
+    const foreign = { caller: { actor: 'other-agent', kind: 'agent' }, scopes: ['jobs:create'] };
+    expect((await s.handle(request('/launches', input), foreign)).status).toBe(403);
+    expect((await s.handle(request('/launches', input), admin)).status).toBe(201);
+    sql.exec("UPDATE fleet_launches SET state = 'exited' WHERE id = ?", root.id);
+    const replay: any = await (await s.handle(request('/launches', input), admin)).json();
+    expect(replay.replay).toBe(true);
+    const staleJob = { caller: { actor: 'job-owner', kind: 'job' }, scopes: ['jobs:create'] };
+    expect((await s.handle(request('/launches', intent()), staleJob)).status).toBe(403);
   }));
 });

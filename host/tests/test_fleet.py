@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 import io
+import sys
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -80,7 +81,7 @@ class FleetTests(unittest.TestCase):
             def runner(argv, **kw):
                 calls.append((argv, kw))
                 if argv[0] == 'maintained-gate': return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
-                return {'id': 'native-session', 'workspace': tmp, 'tag': 'hub-' + offer()['id']}
+                return {'id': 'native-session', 'workspace': tmp, 'tag': 'hub-' + offer()['id'], 'engine': 'codex', 'profile': 'secondary', 'phase': 'running'}
             dispatcher = fleet.Dispatcher(cfg, lambda *a: http.append(a) or {}, runner)
             result = dispatcher.dispatch(offer(profile='secondary'))
             self.assertEqual(result['state'], 'running')
@@ -130,11 +131,11 @@ class FleetTests(unittest.TestCase):
                 calls.append(argv)
                 if argv[0] == 'maintained-gate': return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
                 if 'plan' in argv: return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol', 'account_label': 'shared-codex', 'profile': None}]}
-                if 'run' in argv: return {'receipt': {'unit_name': 'headless-unit'}}
+                if 'run' in argv: return {'receipt': {'unit_name': 'headless-unit', 'exit_code': 0}}
                 return {}
             d = fleet.Dispatcher(cfg, lambda *a: requests.append(a) or {}, runner)
             result = d.dispatch(offer(mode='headless', prompt='Goal with $(literal shell text)'))
-            self.assertEqual(result['state'], 'running'); self.assertEqual(result['native_id'], 'headless-unit')
+            self.assertEqual(result['state'], 'exited'); self.assertEqual(result['native_id'], 'headless-unit')
             self.assertIn('--backend', calls[-1]); self.assertIn('task-units', calls[-1]); self.assertNotIn('aplexer', calls[-1])
             def old_plan(argv, **kw): return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol'}]} if 'plan' in argv else runner(argv, **kw)
             d.runner = old_plan; requests.clear()
@@ -142,13 +143,21 @@ class FleetTests(unittest.TestCase):
             self.assertFalse(requests)
 
     def test_command_errors_never_echo_raw_stdout_stderr(self):
-        with patch('subprocess.run') as run:
-            run.return_value.returncode = 1
-            run.return_value.stdout = 'MUST_NOT_LEAK'
-            run.return_value.stderr = 'MUST_NOT_LEAK'
-            with self.assertRaises(RuntimeError) as caught: fleet.run_json(['probe'])
-            self.assertNotIn('MUST_NOT_LEAK', str(caught.exception))
-            self.assertNotIn('shell', run.call_args.kwargs)
+        with self.assertRaises(RuntimeError) as caught:
+            fleet.run_json([sys.executable, '-c', 'import sys;print("MUST_NOT_LEAK");sys.stderr.write("MUST_NOT_LEAK");sys.exit(1)'])
+        self.assertNotIn('MUST_NOT_LEAK', str(caught.exception))
+
+    def test_stdout_stderr_and_time_are_bounded_during_capture(self):
+        for script in ['import sys;sys.stderr.write("x"*20000);print("{}")', 'print("x"*200000)', 'import time;time.sleep(5)']:
+            with self.assertRaises(RuntimeError): fleet.run_json([sys.executable, '-c', script], timeout=.1)
+        self.assertEqual(fleet.run_json([sys.executable, '-c', 'print("{}")']), {})
+
+    def test_provider_timestamp_is_preserved_and_stale_or_future_quota_is_unknown(self):
+        for timestamp in ['2000-01-01T00:00:00Z', '2099-01-01T00:00:00Z']:
+            raw = {'codex': {'status': 'ok', 'observed_at': timestamp, 'details': {'limit_reached': False}, 'windows': {}}}
+            result = fleet.quota_metadata(raw, 'codex')
+            self.assertEqual(result['observed_at'], timestamp)
+            self.assertEqual(result['status'], 'unknown')
 
     def test_codex_plan_uses_only_readonly_account_metadata_and_closes_owned_process(self):
         proc = MagicMock()

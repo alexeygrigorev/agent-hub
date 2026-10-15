@@ -56,18 +56,31 @@ export class FleetService {
   constructor(private sql: SqlStorage, private transaction: <T>(fn: () => T) => T, private now: () => number = Date.now) {}
   init() { for (const stmt of FLEET_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt); }
 
+  private observation(account: any, route: any) {
+    const subscription: any = this.sql.exec('SELECT * FROM fleet_subscriptions WHERE machine_id = ? AND account = ?', route.machine_id, account.label).toArray()[0];
+    if (subscription) {
+      if (subscription.service !== account.provider || !fresh(subscription.observed_at, this.now(), 1200000)) return null;
+      const quota = parsed(subscription.quota_json);
+      return fresh(quota.observed_at, this.now(), 1200000) ? quota : null;
+    }
+    // A default CLI reading cannot describe a named profile or two accounts on one service.
+    if (route.profile !== null) return null;
+    const count = Number(this.sql.exec('SELECT COUNT(DISTINCT r.account) AS n FROM fleet_routes r JOIN fleet_accounts a ON r.account = a.label WHERE r.machine_id = ? AND a.provider = ?', route.machine_id, account.provider).one().n);
+    const snapshot: any = this.sql.exec('SELECT * FROM host_quota_snapshots WHERE host_id = ?', route.machine_id).toArray()[0];
+    if (count !== 1 || !snapshot || !fresh(snapshot.captured_at, this.now(), 1200000)) return null;
+    const quota = parsed(snapshot.routes_json)[account.provider];
+    if (!quota || !fresh(quota.observed_at, this.now(), 1200000)) return null;
+    return snapshot.status === 'ok' ? quota : { ...quota, status: 'unknown' };
+  }
+
   accountStatus(account: any) {
-    const routes = this.sql.exec('SELECT machine_id FROM fleet_routes WHERE account = ?', account.label).toArray();
+    const routes = this.sql.exec('SELECT machine_id, profile FROM fleet_routes WHERE account = ?', account.label).toArray();
     let remaining: number | null = null; let observed = 0; let unknown = false; let blocked = !account.enabled;
     for (const route of routes) {
-      const subscription: any = this.sql.exec('SELECT * FROM fleet_subscriptions WHERE machine_id = ? AND account = ?', route.machine_id, account.label).toArray()[0];
-      const snapshot: any = this.sql.exec('SELECT * FROM host_quota_snapshots WHERE host_id = ?', route.machine_id).toArray()[0];
-      const mappingCount = Number(this.sql.exec('SELECT COUNT(DISTINCT r.account) AS n FROM fleet_routes r JOIN fleet_accounts a ON r.account = a.label WHERE r.machine_id = ? AND a.provider = ?', route.machine_id, account.provider).one().n);
-      // A default CLI observation cannot be attributed to two accounts on the same service.
-      if (subscription ? !fresh(subscription.observed_at, this.now(), 1200000) : (!snapshot || mappingCount !== 1 || !fresh(snapshot.captured_at, this.now(), 1200000))) continue;
+      const quota = this.observation(account, route);
+      if (!quota) continue;
       observed++;
-      const quota = subscription ? parsed(subscription.quota_json) : parsed(snapshot.routes_json)[account.provider];
-      if ((!subscription && snapshot.status !== 'ok') || !quota || quota.status !== 'ok' || quota.details?.stale === true || !fresh(quota.observed_at, this.now(), 1200000)) { unknown = true; continue; }
+      if (quota.status !== 'ok' || quota.details?.stale === true) { unknown = true; continue; }
       if (quota.details?.limit_reached === true) blocked = true;
       if (quota.details?.limit_reached !== false || (account.provider === 'grok' && quota.details?.has_grok_code_access !== true)) unknown = true;
       let windows = 0;
@@ -98,6 +111,7 @@ export class FleetService {
     const request = { mode: input.mode || 'headless', machine: input.machine || null, engine: input.engine || null, workspace: input.workspace, prompt: input.prompt || '', parent_id: input.parent_id || null, summary: input.summary || (input.mode === 'interactive' ? 'Interactive session' : 'Agent task') };
     const rejected: { machine: string; engine: string; reason: string }[] = []; const candidates: any[] = [];
     const accounts = new Map(this.sql.exec('SELECT * FROM fleet_accounts').toArray().map(a => [a.label, this.accountStatus(a)]));
+    const definitions = new Map(this.sql.exec('SELECT * FROM fleet_accounts').toArray().map(a => [a.label, a]));
     for (const route of this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray() as any[]) {
       if ((request.machine && route.machine_id !== request.machine) || (request.engine && route.engine !== request.engine)) continue;
       const machine: any = this.sql.exec('SELECT * FROM machines WHERE id = ?', route.machine_id).toArray()[0];
@@ -109,6 +123,7 @@ export class FleetService {
       else if (!Number.isFinite(hb.mem_avail_mb) || hb.mem_avail_mb < 10240 + 1500 || !Number.isFinite(hb.disk_free_gb) || hb.disk_free_gb < 50.5) reason = 'resource_limit';
       else if (!Array.isArray(hb.load) || !Number.isFinite(hb.load[0]) || hb.load[0] < 0 || !Number.isFinite(caps.cpu_count) || caps.cpu_count < 1) reason = 'load_unknown';
       else if (!account || account.status !== 'ok') reason = 'account_' + (account?.status || 'unmapped');
+      else if (!this.observation(definitions.get(route.account), route)) reason = 'machine_account_quota_unknown';
       else if (account.available_slots < 1) reason = 'account_capacity';
       if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason }); continue; }
       const pending = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND state IN ${ACTIVE}`, route.machine_id).one().n);
@@ -124,7 +139,7 @@ export class FleetService {
     const path = new URL(request.url).pathname; const caller = auth.caller;
     if (!caller) return response({ error: 'unauthorized' }, 401);
     const admin = !!caller.isAdmin; const host = caller.kind === 'host' && !!caller.machineId && auth.scopes?.includes('host');
-    const writer = admin || auth.scopes?.includes('jobs:create');
+    const writer = admin || (caller.kind === 'agent' && auth.scopes?.includes('jobs:create'));
     if (path === '/api/fleet' && request.method === 'GET') {
       if (!admin) return response({ error: 'forbidden' }, 403);
       return response({ accounts: this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray().map(a => this.accountStatus(a)), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray(),
@@ -151,6 +166,7 @@ export class FleetService {
       }
       return this.transaction(() => {
         if (Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE state IN ${ACTIVE}`).one().n)) return response({ error: 'active_launches_hold_registry' }, 409);
+        this.sql.exec('DELETE FROM fleet_subscriptions');
         this.sql.exec('DELETE FROM fleet_routes'); this.sql.exec('DELETE FROM fleet_accounts');
         for (const a of data.accounts) this.sql.exec('INSERT INTO fleet_accounts VALUES (?, ?, ?, ?, ?)', a.label, a.provider, a.max_concurrency, a.reserve_percent, Number(a.enabled));
         for (const r of data.routes) this.sql.exec('INSERT INTO fleet_routes VALUES (?, ?, ?, ?)', r.machine_id, r.engine, r.account, r.profile);
@@ -166,9 +182,14 @@ export class FleetService {
         if (path.endsWith('/plan')) return response(plan);
         if (!label(input.idempotency_key)) return response({ error: 'idempotency_key_required' }, 400);
         const actor = caller.actor || caller.machineId || 'admin'; const canonical = JSON.stringify(plan.request);
-        if (plan.request.parent_id && !this.sql.exec('SELECT id FROM fleet_launches WHERE id = ?', plan.request.parent_id).toArray().length) return response({ error: 'parent_not_found' }, 400);
         const prior: any = this.sql.exec('SELECT * FROM fleet_launches WHERE actor = ? AND request_key = ?', actor, input.idempotency_key).toArray()[0];
         if (prior) return prior.request_json === canonical ? response({ id: prior.id, state: prior.state, machine: prior.machine_id, engine: prior.engine, account: prior.account, mode: prior.mode, replay: true }) : response({ error: 'idempotency_conflict' }, 409);
+        if (plan.request.parent_id) {
+          const parent: any = this.sql.exec('SELECT actor, state FROM fleet_launches WHERE id = ?', plan.request.parent_id).toArray()[0];
+          if (!parent) return response({ error: 'parent_not_found' }, 400);
+          if (parent.actor !== actor) return response({ error: 'parent_not_owned' }, 403);
+          if (!['starting', 'running'].includes(parent.state)) return response({ error: 'parent_not_active' }, 409);
+        }
         if (!plan.selected) return response({ error: 'no_eligible_route', rejected: plan.rejected }, 409);
         const id = crypto.randomUUID(); const at = new Date(this.now()).toISOString(); const selected = plan.selected;
         this.sql.exec('INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', id, actor, caller.kind || 'unknown', plan.request.parent_id, plan.request.summary, input.idempotency_key, canonical, selected.machine, selected.engine, selected.account, selected.profile, plan.request.mode, plan.request.workspace, plan.request.prompt, 'offered', at, at);
@@ -204,7 +225,7 @@ export class FleetService {
         labels.add(sub.account);
         const mapped = this.sql.exec('SELECT a.label FROM fleet_accounts a JOIN fleet_routes r ON a.label = r.account WHERE r.machine_id = ? AND a.label = ? AND a.provider = ?', caller.machineId!, sub.account, sub.service).toArray();
         const quota = sanitizedQuota(sub.quota);
-        if (!mapped.length || !quota || (quota.observed_at !== null && !fresh(quota.observed_at, this.now(), 1200000))) return response({ error: 'subscription_unmapped_or_invalid' }, 400);
+        if (!mapped.length || !quota || (quota.observed_at !== null && Date.parse(quota.observed_at) > this.now()) || (quota.status === 'ok' && !fresh(quota.observed_at, this.now(), 1200000))) return response({ error: 'subscription_unmapped_or_invalid' }, 400);
         clean.push({ ...sub, quota });
       }
       return this.transaction(() => {
@@ -224,7 +245,7 @@ export class FleetService {
           if (row.state !== 'offered') return response({ error: 'already_claimed' }, 409);
           if (!object(data, ['gate_allowed', 'observed_at', 'account', 'profile_supported']) || data.gate_allowed !== true || data.profile_supported !== true || data.account !== row.account || !fresh(data.observed_at, this.now(), 30000)) return response({ error: 'fresh_admission_required' }, 409);
           const account: any = this.sql.exec('SELECT * FROM fleet_accounts WHERE label = ?', row.account).toArray()[0];
-          if (!account || this.accountStatus(account).status !== 'ok') return response({ error: 'account_unavailable' }, 409);
+          if (!account || this.accountStatus(account).status !== 'ok' || !this.observation(account, row)) return response({ error: 'account_unavailable' }, 409);
           this.sql.exec("UPDATE fleet_launches SET state = 'starting', updated_at = ? WHERE id = ?", new Date(this.now()).toISOString(), row.id);
           return response({ ...row, state: 'starting' });
         }

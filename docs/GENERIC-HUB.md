@@ -21,7 +21,7 @@ hub plan-agent --workspace project --prompt-file goal.txt
 hub fleet
 ```
 
-Supply `--parent HUB_LAUNCH_ID` when one hub agent spawns another. Every row records the authenticated requester, requester kind, parent ID (null for a root request), time, summary, machine, engine, profile, account label and mode. Requester identity comes from authentication; the caller cannot override it. Native session reports include workspace, tag, engine, profile and state, without copying commands, environments or transcripts.
+Supply `--parent HUB_LAUNCH_ID` when one hub agent spawns another. The parent must be active and owned by the same authenticated requester; attaching an unrelated or finished parent is refused. Every row records the authenticated requester, requester kind, parent ID (null for a root request), time, summary, machine, engine, profile, account label and mode. Requester identity comes from authentication; the caller cannot override it. Native session reports include workspace, tag, engine, profile and state, without copying commands, environments or transcripts. Legacy scheduler job credentials do not grant generic spawn authority.
 
 The dashboard at `/` requires an authenticated administrator. It shows machines and their subscriptions, shared account capacity, hub agents and parent relationships, registered agents and reported aplexer sessions. It refreshes every 30 seconds. A successful queue response means offered work, not started work.
 
@@ -42,7 +42,7 @@ Upload a JSON registry through the authenticated dashboard. Account labels ident
 }
 ```
 
-Use enrolled machine IDs. Registry replacement is refused while active launches hold capacity. Codex reserves at least 15%; Grok at least 5%. Placement combines fresh machine admission, resource floors, capabilities, measured load, pending work and conservative account headroom. A shared account's slots are counted across all machines. Expired, missing or contradictory observations fail closed.
+Use enrolled machine IDs. Registry replacement is refused while active launches hold capacity and invalidates retained subscription reports. Codex reserves at least 15%; Grok at least 5%. Placement combines fresh machine admission, resource floors, capabilities, measured load, pending work and conservative account headroom. A shared account's slots are counted across all machines. The selected machine must supply fresh account evidence; a fresh report on another machine does not qualify it. Default CLI quota cannot qualify a named profile. Expired, missing or contradictory observations fail closed.
 
 ## Machine subscriptions
 
@@ -79,7 +79,7 @@ Interactive work uses native `aplexer start`, a configured engine/profile, a 150
 
 Headless work uses the maintained Quota Launcher. Configure a local `launcher` object with `argv`, `root` and `config_dir`, and per-subscription `launcher_provider` and `launcher_model`. The launcher's plan must prove the selected account label and profile, as well as provider and model. Older launcher plans without account attribution are held. No raw provider fallback is used. This is an outstanding integration requirement for launcher versions that lack those fields.
 
-Claim and effect ambiguity retain the server reservation. A starting or uncertain launch is never launched again automatically. Completion requires authenticated host reconciliation and confirmed native exit. The first increment reports running/uncertain receipts; automatic completion reconciliation remains a follow-up before unattended adoption.
+Claim and effect ambiguity retain the server reservation. A starting or uncertain launch is never launched again automatically. Completion requires authenticated host reconciliation and confirmed native exit. A synchronous launcher exit is recorded as exited/failed, not running or accepted work. A live headless receipt must verify first action. Automatic completion reconciliation remains a follow-up before unattended adoption.
 
 ## Messaging adoption
 

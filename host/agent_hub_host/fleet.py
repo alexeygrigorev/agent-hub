@@ -61,12 +61,53 @@ def load_settings(path=None):
 
 def run_json(argv, *, payload=None, cwd=None, timeout=30):
     """No shell, no provider stdout/stderr in exceptions or logs."""
-    proc = subprocess.run(argv, input=json.dumps(payload) if payload is not None else None,
-                          capture_output=True, text=True, cwd=cwd, timeout=timeout, check=False)
-    if proc.returncode != 0 or len(proc.stdout) > 131072:
-        raise RuntimeError("Local command failed or exceeded output limit")
+    import threading
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd)
+    overflow = threading.Event()
+    stdout = bytearray()
+    def drain(stream, limit, target=None):
+        size = 0
+        try:
+            while True:
+                chunk = stream.read(8192)
+                if not chunk: break
+                size += len(chunk)
+                if size > limit:
+                    overflow.set(); break
+                if target is not None: target.extend(chunk)
+        except Exception:
+            overflow.set()
+    def write():
+        try:
+            if payload is not None: proc.stdin.write(json.dumps(payload).encode('utf-8'))
+            proc.stdin.close()
+        except Exception:
+            overflow.set()
+    threads = [threading.Thread(target=drain, args=(proc.stdout, 131072, stdout), daemon=True),
+               threading.Thread(target=drain, args=(proc.stderr, 16384), daemon=True),
+               threading.Thread(target=write, daemon=True)]
+    for thread in threads: thread.start()
+    deadline = time.monotonic() + timeout
     try:
-        value = json.loads(proc.stdout)
+        while proc.poll() is None and not overflow.is_set() and time.monotonic() < deadline:
+            overflow.wait(.02)
+        if proc.poll() is None:
+            proc.kill(); proc.wait(timeout=2)
+            raise RuntimeError('Local command failed or exceeded resource limit')
+        for thread in threads: thread.join(timeout=1)
+        if proc.returncode != 0 or overflow.is_set() or any(t.is_alive() for t in threads):
+            raise RuntimeError('Local command failed or exceeded output limit')
+    finally:
+        if proc.poll() is None: proc.kill(); proc.wait(timeout=2)
+        # A descendant retaining a pipe must not make BufferedReader.close wait on its reader lock.
+        for thread, stream in zip(threads[:2], (proc.stdout, proc.stderr)):
+            if thread.is_alive():
+                try: os.close(stream.fileno())
+                except OSError: pass
+            else:
+                stream.close()
+    try:
+        value = json.loads(stdout)
     except Exception:
         raise RuntimeError("Local command returned invalid JSON") from None
     if not isinstance(value, (dict, list)):
@@ -103,7 +144,19 @@ def quota_metadata(raw, service):
         if not isinstance(present, bool):
             present = percent is not None or reset is not None
         windows[key] = {"present": present, "percent_remaining": percent, "reset_at": reset, "rolling": win.get("rolling") is True}
-    return {"status": route.get("status") if route.get("status") in {"ok", "error", "unknown"} else "unknown", "observed_at": utcnow(), "details": safe_details, "windows": windows}
+    observed_at = route.get('observed_at') or details.get('observed_at')
+    status = route.get('status') if route.get('status') in {'ok', 'error', 'unknown'} else 'unknown'
+    if observed_at is None:
+        observed_at = utcnow()
+    else:
+        try:
+            stamp = dt.datetime.fromisoformat(observed_at.replace('Z', '+00:00'))
+            if stamp.tzinfo is None: raise ValueError()
+            age = (dt.datetime.now(dt.timezone.utc) - stamp).total_seconds()
+            if not 0 <= age <= 1200: status = 'unknown'
+        except Exception:
+            observed_at = None; status = 'unknown'
+    return {"status": status, "observed_at": observed_at, "details": safe_details, "windows": windows}
 
 
 def codex_plan():
@@ -262,13 +315,18 @@ class Dispatcher:
             receipt = self.runner(argv, cwd=cwd, timeout=120)
             if mode == "interactive":
                 native_id = receipt.get("id")
-                if receipt.get("workspace") != str(workspace) or receipt.get("tag") != "hub-" + offer["id"]:
+                if receipt.get("workspace") != str(workspace) or receipt.get("tag") != "hub-" + offer["id"] or receipt.get('engine') != offer['engine'] or receipt.get('profile') != offer.get('profile') or receipt.get('phase') != 'running':
                     raise ValueError("Native receipt mismatch")
                 result = {"state": "running", "native_id": native_id}
             else:
                 details = receipt.get("receipt", {})
                 native_id = details.get("session_id") or details.get("unit_name") or details.get("worker_id")
-                result = {"state": "running", "native_id": native_id, "launcher_task_id": task_id}
+                if type(details.get('exit_code')) is int:
+                    result = {'state': 'exited' if details['exit_code'] == 0 else 'failed', 'confirmed_exit': True, 'native_id': native_id, 'launcher_task_id': task_id}
+                elif details.get('state') == 'running' and details.get('first_action_verified') is True:
+                    result = {"state": "running", "native_id": native_id, "launcher_task_id": task_id}
+                else:
+                    raise ValueError('Native lifecycle receipt is incomplete')
             if not isinstance(native_id, str) or not native_id:
                 raise ValueError("No confirmed native execution receipt")
         except Exception:
