@@ -51,7 +51,9 @@ describe('liveness states', () => {
     session(sql, 'hetzner', 'waiting', 'running', 'idle', 4000);
     session(sql, 'hetzner', 'done', 'exited', null, null);
     session(sql, 'laptop', 'remote', 'running', 'working', 10);
+    sql.exec("INSERT INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, last_activity_at) VALUES ('hetzner', 'n-sh', 'quiet-shell', 'shell', 'running', 'working', ?, '/repo', ?)", iso(30), iso(9000));
     const { subjects } = live.evaluate();
+    expect(byId(subjects, 'session', 'hetzner/quiet-shell')).toBe('working');
     expect(byId(subjects, 'session', 'hetzner/busy')).toBe('working');
     expect(byId(subjects, 'session', 'hetzner/hung')).toBe('stalled');
     expect(byId(subjects, 'session', 'hetzner/waiting')).toBe('idle');

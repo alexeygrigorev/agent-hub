@@ -90,7 +90,8 @@ export class LivenessService {
       let state: string; let detail: string;
       if (!hostKnown(s.machine_id)) { state = 'unknown'; detail = `machine ${label(s.machine_id)} is not reporting`; }
       else if (s.phase !== 'running') { state = 'exited'; detail = `phase ${s.phase}`; }
-      else if (s.agent_state === 'working' && activity !== null && activity > t.agentStallS) { state = 'stalled'; detail = `reported working but no terminal activity for ${activity}s`; }
+      // Only agent engines can stall; a quiet shell is usually a long-running command.
+      else if (s.agent_state === 'working' && s.engine && s.engine !== 'shell' && activity !== null && activity > t.agentStallS) { state = 'stalled'; detail = `reported working but no terminal activity for ${activity}s`; }
       else if (s.agent_state === 'working') { state = 'working'; detail = activity === null ? 'working' : `active ${activity}s ago`; }
       else { state = s.agent_state ? 'idle' : 'running'; detail = `${s.agent_state || 'no agent state'}${activity === null ? '' : `, active ${activity}s ago`}`; }
       subjects.push({ kind: 'session', id: `${label(s.machine_id)}/${s.tag}`, state, detail: `${detail} (${s.engine || 'shell'} in ${s.workspace})`, machine_id: s.machine_id, age_s: activity });
