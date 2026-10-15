@@ -74,6 +74,13 @@ class FleetTests(unittest.TestCase):
         cfg['subscriptions'].append(copy.deepcopy(cfg['subscriptions'][0]))
         self.assertIsNone(fleet.session_metadata(raw, cfg)[0]['account'])
 
+    def test_session_activity_is_reported_as_utc_iso_or_unknown(self):
+        cfg = settings(Path('/repo'))
+        base = {'id': 'native-session', 'tag': 'owned', 'engine': 'codex', 'profile': None, 'phase': 'running', 'workspace': '/repo', 'reported_state': 'working'}
+        self.assertEqual(fleet.session_metadata([dict(base, last_activity_ms=1792046739719)], cfg)[0]['last_activity_at'], '2026-10-15T06:45:39.719000Z')
+        for bad in [None, 'yesterday', -5, 1.5, True]:
+            self.assertIsNone(fleet.session_metadata([dict(base, last_activity_ms=bad)], cfg)[0]['last_activity_at'])
+
     def test_interactive_uses_native_session_and_profile_not_headless_command(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = settings(Path(tmp)); cfg['subscriptions'][0]['profile'] = 'secondary'

@@ -215,6 +215,16 @@ def collect_subscriptions(settings, runner=run_json):
     return reports
 
 
+def _ms_to_iso(value):
+    """aplexer reports epoch milliseconds; anything else is unknown rather than guessed."""
+    if type(value) is not int or value <= 0:
+        return None
+    try:
+        return dt.datetime.fromtimestamp(value / 1000, dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def session_metadata(raw, settings):
     sessions = raw if isinstance(raw, list) else raw.get("sessions", [])
     clean = []
@@ -223,7 +233,8 @@ def session_metadata(raw, settings):
         matches = [s for s in settings["subscriptions"] if s.get("engine", s["service"]) == engine and s.get("profile") == profile]
         clean.append({"native_id": session["id"], "tag": session["tag"], "workspace": session.get("workspace", ""), "engine": engine,
                       "profile": profile, "account": matches[0]["account_label"] if len(matches) == 1 else None,
-                      "phase": session.get("phase", "unknown"), "agent_state": session.get("reported_state")})
+                      "phase": session.get("phase", "unknown"), "agent_state": session.get("reported_state"),
+                      "last_activity_at": _ms_to_iso(session.get("last_activity_ms"))})
     return clean
 
 

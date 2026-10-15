@@ -73,6 +73,17 @@ function getFingerprint(hb: any): string {
   });
 }
 
+/**
+ * Latest check-in time for a machine. Storage is written at most every five minutes for an
+ * unchanged heartbeat, so prefer the in-memory time this Durable Object saw when it is newer.
+ */
+export function effectiveCheckin(machineId: string, persisted: unknown): string | null {
+  const stored = typeof persisted === 'string' ? Date.parse(persisted) : NaN;
+  const seen = machineState.get(machineId)?.lastSeenAt;
+  const best = Math.max(Number.isFinite(stored) ? stored : -Infinity, typeof seen === 'number' ? seen : -Infinity);
+  return Number.isFinite(best) ? new Date(best).toISOString() : null;
+}
+
 export function updateHeartbeatMemoryOnly(machineId: string) {
   const now = Date.now();
   const st = machineState.get(machineId);
