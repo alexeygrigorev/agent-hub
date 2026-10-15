@@ -34,7 +34,11 @@ coordination_path = Path("/home/alexey/git/agent-coordination")
 if coordination_path.exists() and str(coordination_path) not in sys.path:
     sys.path.insert(0, str(coordination_path))
 
-from coordination.bus import FileBus
+try:
+    from coordination.bus import FileBus
+except ImportError:  # CI and other machines have no sibling agent-coordination checkout
+    import unittest
+    raise unittest.SkipTest("agent-coordination checkout not available")
 
 from agent_hub_host.task_authority import (
     AuthorityTrustRoot,
