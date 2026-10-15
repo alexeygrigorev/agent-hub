@@ -81,6 +81,51 @@ Headless work uses the maintained Quota Launcher. Configure a local `launcher` o
 
 Claim and effect ambiguity retain the server reservation. A starting or uncertain launch is never launched again automatically. Completion requires authenticated host reconciliation and confirmed native exit. A synchronous launcher exit is recorded as exited/failed, not running or accepted work. A live headless receipt must verify first action. Automatic completion reconciliation remains a follow-up before unattended adoption.
 
+## Heartbeats, liveness and alerts
+
+The hub judges liveness from timestamps it already receives. Nothing on a host has to be screen-scraped.
+
+| Subject | Source | States |
+|---|---|---|
+| Machine | `/api/host/poll` heartbeats (the host agent or `hub fleet-host`) | `online` (≤ 3 min), `stale` (≤ 15 min), `offline`, `never`, `drained` |
+| aplexer session | `PUT /api/fleet/sessions`, including each session's last terminal activity | `working`, `idle`, `stalled` (reported working but no terminal activity for 30 min), `exited`, `unknown` (its machine is silent) |
+| Hub launch | `fleet_launches` | `stuck` (offered/starting > 10 min), `uncertain`, `missing` (interactive session vanished), `working` |
+| Agent outside aplexer | `hub heartbeat --status working --summary "..."` (agent credential with `health:report`) | the reported status, or `stale` after 15 min of silence |
+
+Thresholds are Worker vars: `HUB_MACHINE_STALE_S`, `HUB_MACHINE_OFFLINE_S`, `HUB_AGENT_STALL_S`, `HUB_HEARTBEAT_STALE_S`, `HUB_LAUNCH_STUCK_S`.
+
+One alert opens per subject when it enters `stale`, `offline`, `stalled`, `stuck`, `uncertain` or `missing`, updates in place, and resolves on recovery. New alerts are delivered as hub inbox messages from `hub` to every actor in `HUB_ALERT_TO` (comma-separated) and, if set, POSTed as JSON to the `HUB_ALERT_WEBHOOK` secret. Failed or untargeted deliveries retry every 15 minutes while the alert is open. The dashboard shows open alerts and their delivery status. `GET /api/liveness` returns the same data.
+
+## Scheduled checks
+
+Scheduled checks are the generic form of the competition's routine agent: periodic checks that take an action. A five-minute cron runs every enabled check whose interval has elapsed, at most once per interval slot. A check is configuration, never a shell command.
+
+| Kind | Fails when |
+|---|---|
+| `liveness` | any subject is in a problem state (opens per-subject alerts; seeded by default every 5 min) |
+| `quota` | an enabled account is blocked or below `params.min_percent` (default 20) |
+| `http` | an `https://` URL does not return `params.expect_status` (default 200) |
+| `inbox_backlog` | `params.actor` has unacknowledged messages older than `params.max_age_s` |
+| `routine` | never; its action runs every interval |
+
+Actions: `{"type": "alert"}` (default), `{"type": "message", "to": "<actor>", "body": "..."}`, or `{"type": "launch", "workspace": "...", "prompt": "...", "engine"?: "...", "machine"?: "..."}`, which starts a headless agent through normal placement with requester `schedule:<name>`. `{check}` and `{detail}` are substituted in bodies and prompts. Messages and launches run on failure, or always with `"on": "always"` (the default for `routine`). Names are lowercase, at most 40 characters; intervals are 5 minutes to 7 days.
+
+```json
+{"checks": [
+  {"name": "liveness", "kind": "liveness", "interval_s": 300},
+  {"name": "site", "kind": "http", "interval_s": 600, "params": {"url": "https://example.com/health"}},
+  {"name": "grok-inbox", "kind": "inbox_backlog", "interval_s": 900, "params": {"actor": "grok-bot", "max_age_s": 3600}},
+  {"name": "daily-summary", "kind": "routine", "interval_s": 86400,
+   "action": {"type": "launch", "workspace": "notes", "prompt": "Summarise yesterday's agent activity", "engine": "claude"}}
+]}
+```
+
+Upload it from the dashboard, or `PUT /api/checks`. `POST /api/checks/<name>/run` runs one now.
+
+## Signing in
+
+The dashboard and every `/api/*` route require authentication. Humans sign in with DTC OIDC (an address in `HUB_ADMINS`) on the origin registered as the Cognito callback, or anywhere with the admin token: set the Worker secret `HUB_ADMIN_TOKEN_SHA256` to the SHA-256 hex of a high-entropy token kept on your machine, then open `/auth/token`. Rotating the secret ends existing token sessions. Hosts and agents pair through the device flow and an admin approves them in the browser.
+
 ## Messaging adoption
 
 Use `hub send`, `hub inbox`, `hub reply`, `hub ack`, `hub accept`, and `hub complete` for the cross-host bus. Keep receipt, read ACK, task acceptance and completion separate. Deduplicate by durable ID and idempotency key. A host bridge maps registered native aplexer recipients without forging their identity. `hub bridge --once` runs a finite bridge cycle; verify host enrollment and the bridge's native binding first.
