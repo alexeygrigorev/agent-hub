@@ -12,4 +12,13 @@ export interface Env {
   AUTH_JWKS_URL: string;
   HUB_ADMINS: string;
   SESSION_SECRET: string;
+
+  // Liveness and alerts (optional)
+  HUB_ALERT_TO?: string;
+  HUB_ALERT_WEBHOOK?: string;
+  HUB_MACHINE_STALE_S?: string;
+  HUB_MACHINE_OFFLINE_S?: string;
+  HUB_AGENT_STALL_S?: string;
+  HUB_HEARTBEAT_STALE_S?: string;
+  HUB_LAUNCH_STUCK_S?: string;
 }
