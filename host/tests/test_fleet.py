@@ -156,7 +156,7 @@ class FleetTests(unittest.TestCase):
         for timestamp in ['2000-01-01T00:00:00Z', '2099-01-01T00:00:00Z']:
             raw = {'codex': {'status': 'ok', 'observed_at': timestamp, 'details': {'limit_reached': False}, 'windows': {}}}
             result = fleet.quota_metadata(raw, 'codex')
-            self.assertEqual(result['observed_at'], timestamp)
+            self.assertEqual(result['observed_at'], timestamp if timestamp.startswith('2000') else None)
             self.assertEqual(result['status'], 'unknown')
 
     def test_explicit_provider_and_window_errors_never_become_healthy(self):
@@ -166,6 +166,8 @@ class FleetTests(unittest.TestCase):
             result = fleet.quota_metadata({'codex': route}, 'codex')
             self.assertEqual(result['status'], 'unknown')
             self.assertNotIn('MUST_NOT_LEAK', json.dumps(result))
+        for windows in [{**base['windows'], 'contradiction': {'present': False, 'percent_remaining': 0, 'reset_at': None}}, {**{f'w{i}': {'present': False, 'percent_remaining': None, 'reset_at': None} for i in range(32)}, 'last': {'error': 'unavailable'}}]:
+            self.assertEqual(fleet.quota_metadata({'codex': dict(base, windows=windows)}, 'codex')['status'], 'unknown')
 
     def test_many_failed_probes_do_not_close_later_probe_descriptors(self):
         for _ in range(30):

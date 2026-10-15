@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -114,61 +113,25 @@ def run_json(argv, *, payload=None, cwd=None, timeout=30):
 
 
 def quota_metadata(raw, service):
-    """Whitelist only quota windows and booleans from quse; discard every other field."""
+    """Reuse the maintained quota contract; never reimplement its failure/absence semantics."""
+    from .quota_snapshot import sanitize_provider, format_iso_utc
     route = raw.get(service, raw) if isinstance(raw, dict) else {}
-    if not isinstance(route, dict):
-        route = {}
-    details = route.get("details", {})
-    if not isinstance(details, dict):
-        details = {}
-    unavailable = any('stale' in obj and obj['stale'] is not False for obj in (route, details))
-    unavailable |= any('error' in obj and obj['error'] is not None for obj in (route, details))
-    safe_details = {key: details.get(key) if isinstance(details.get(key), bool) else None for key in ("limit_reached", "has_grok_code_access", "stale")}
-    windows = {}
-    for key, win in list((route.get("windows") or {}).items())[:32] if isinstance(route.get("windows"), dict) else []:
-        if not isinstance(key, str) or not LABEL.fullmatch(key) or not isinstance(win, dict):
-            unavailable = True
-            continue
-        if ('error' in win and win['error'] is not None) or ('stale' in win and win['stale'] is not False):
-            unavailable = True
-        percent = win.get("percent_remaining")
-        percent = float(percent) if type(percent) in (int, float) and math.isfinite(percent) and 0 <= percent <= 100 else None
-        reset = win.get("reset_at")
-        if not isinstance(reset, str):
-            reset = None
-        else:
-            try:
-                stamp = dt.datetime.fromisoformat(reset.replace("Z", "+00:00"))
-                if stamp.tzinfo is None:
-                    reset = None
-            except ValueError:
-                reset = None
-        present = win.get("present")
-        if not isinstance(present, bool):
-            if 'present' in win: unavailable = True
-            present = percent is not None or reset is not None
-        if present and (percent is None or reset is None): unavailable = True
-        if 'rolling' in win and type(win['rolling']) is not bool: unavailable = True
-        windows[key] = {"present": present, "percent_remaining": percent, "reset_at": reset, "rolling": win.get("rolling") is True}
+    if not isinstance(route, dict): route = {}
+    details = route.get('details') if isinstance(route.get('details'), dict) else {}
+    now = dt.datetime.now(dt.timezone.utc)
+    clean = sanitize_provider(service, route, now)
+    status = 'ok' if clean['status'] == 'ok' else 'unknown'
     explicit_timestamp = 'observed_at' in route or 'observed_at' in details
-    observed_at = route.get('observed_at') if 'observed_at' in route else details.get('observed_at')
-    status = route.get('status') if route.get('status') in {'ok', 'error', 'unknown'} else 'unknown'
-    if unavailable:
+    observed_at = clean['observed_at'] if explicit_timestamp else format_iso_utc(now)
+    if explicit_timestamp and observed_at is None: status = 'unknown'
+    # Extra conservative handling of explicitly unknown freshness and optional stale flags.
+    if any('stale' in obj and obj['stale'] is not False for obj in (route, details)):
         status = 'unknown'
-    if observed_at is None:
-        if explicit_timestamp:
-            status = 'unknown'
-        else:
-            observed_at = utcnow()
-    else:
-        try:
-            stamp = dt.datetime.fromisoformat(observed_at.replace('Z', '+00:00'))
-            if stamp.tzinfo is None: raise ValueError()
-            age = (dt.datetime.now(dt.timezone.utc) - stamp).total_seconds()
-            if not 0 <= age <= 1200: status = 'unknown'
-        except Exception:
-            observed_at = None; status = 'unknown'
-    return {"status": status, "observed_at": observed_at, "details": safe_details, "windows": windows}
+    windows = route.get('windows')
+    if isinstance(windows, dict) and any(isinstance(w, dict) and 'stale' in w and w['stale'] is not False for w in windows.values()):
+        status = 'unknown'
+    return {'status': status, 'observed_at': observed_at, 'details': clean['details'],
+            'windows': {name: {k: w[k] for k in ('present', 'percent_remaining', 'reset_at', 'rolling')} for name, w in clean['windows'].items()}}
 
 
 def codex_plan():
