@@ -670,6 +670,53 @@ describe('M3 bus corrections: recipient ACK, addresses, aliases, expiry', () => 
     expect((await reply('tok_w1', r.id, 'worker-1', 'principal-1', 'f1-x5')).status).toBe(400);
   });
 
+  it.each(['/api/bus/send', '/api/bus/reply'])('reply thread mismatch rejects without inserting or changing stages: %s', async (path) => {
+    const parent = await (await send('tok_w1', 'worker-1', 'projB:worker-2', 'thread-parent')).json() as any;
+    const unrelated = await (await send('tok_w1', 'worker-1', 'projB:worker-2', 'thread-unrelated')).json() as any;
+    expect(unrelated.thread_id).not.toBe(parent.thread_id);
+    const before = await row(parent.id);
+    const res = await http('POST', path, 'tok_w2q', {
+      from_actor: 'projB:worker-2', to_actor: 'projA:worker-1', kind: 'reply', body: 'wrong thread',
+      idempotency_key: 'thread-mismatch', reply_to: parent.id, thread_id: unrelated.thread_id,
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'invalid_reply_to' });
+    expect(await count('messages')).toBe(2);
+    expect(await count('messages WHERE reply_to = ?', parent.id)).toBe(0);
+    expect(await row(parent.id)).toEqual(before);
+    expect(await count('messages WHERE thread_id = ?', unrelated.thread_id)).toBe(1);
+  });
+
+  it.each(['/api/bus/send', '/api/bus/reply'])('reply thread inherits, accepts exact parent thread, and preserves replay conflicts: %s', async (path) => {
+    const parent = await (await send('tok_w1', 'worker-1', 'projB:worker-2', 'thread-parent')).json() as any;
+    const unrelated = await (await send('tok_w1', 'worker-1', 'projB:worker-2', 'thread-unrelated')).json() as any;
+    const base = { from_actor: 'projB:worker-2', to_actor: 'projA:worker-1', kind: 'reply', body: 'correct thread', reply_to: parent.id };
+    for (const explicit of [false, true]) {
+      const opts = { ...base, idempotency_key: `thread-ok-${explicit}`, ...(explicit ? { thread_id: parent.thread_id } : {}) };
+      const res = await http('POST', path, 'tok_w2q', opts);
+      expect(res.status).toBe(200);
+      const created = await res.json() as any;
+      expect(created.thread_id).toBe(parent.thread_id);
+      const replay = await http('POST', path, 'tok_w2q', opts);
+      expect(replay.status).toBe(200);
+      expect(await replay.json()).toEqual(created);
+      // An altered explicit thread on an existing key retains the established conflict contract.
+      const conflict = await http('POST', path, 'tok_w2q', { ...opts, thread_id: unrelated.thread_id });
+      expect(conflict.status).toBe(409);
+      expect(await conflict.json()).toEqual({ error: 'conflict' });
+      expect((await row(created.id)).thread_id).toBe(parent.thread_id);
+      expect((await http('POST', `/api/bus/messages/${created.id}/ack`, 'tok_w2q')).status).toBe(403);
+      expect((await http('GET', '/api/bus/inbox?actor=projA:worker-1', 'tok_w1')).status).toBe(200);
+      expect((await http('POST', `/api/bus/messages/${created.id}/ack`, 'tok_w1')).status).toBe(200);
+    }
+    const unknown = await http('POST', path, 'tok_w2q', { ...base, to_actor: 'missing-agent', idempotency_key: 'thread-unknown' });
+    expect(unknown.status).toBe(404);
+    expect(await unknown.json()).toEqual({ error: 'unknown_recipient' });
+    expect(await count('messages')).toBe(4);
+    expect(await count('messages WHERE reply_to = ? AND thread_id = ?', parent.id, parent.thread_id)).toBe(2);
+    expect(await count('messages WHERE thread_id = ?', unrelated.thread_id)).toBe(1);
+  });
+
   it('24: F5 stages advance only by the recipient (no admin override) and a stage time never moves', async () => {
     const { id } = await (await send('tok_w1', 'worker-1', 'worker-2', 'f5-key')).json() as any;
     const admin: CallerContext = { isAdmin: true, kind: 'session' };

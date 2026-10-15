@@ -396,7 +396,9 @@ export class BusService {
         const parties = [msg.from_actor, msg.to_actor];
         if (!parties.some(p => this.sameParticipant(p, opts.toActor))) throw new Error("invalid_reply_to");
         if (!parties.some(p => this.sameParticipant(p, opts.senderActor))) throw new Error("invalid_reply_to");
-        threadId = threadId || msg.thread_id || opts.replyTo;
+        const parentThreadId = msg.thread_id || opts.replyTo;
+        if (threadId !== undefined && threadId !== parentThreadId) throw new Error("invalid_reply_to");
+        threadId = parentThreadId;
       }
 
       const id = generateUlid(now);
