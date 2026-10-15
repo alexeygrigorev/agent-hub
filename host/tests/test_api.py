@@ -84,3 +84,11 @@ class TestApi(unittest.TestCase):
             api.register_machine("https://fake")
         except Exception as e:
             self.assertNotIn("secret_token_123", str(e))
+
+
+class TestUserAgent(unittest.TestCase):
+    def test_requests_identify_the_client_instead_of_python_urllib(self):
+        from agent_hub_host import api
+        opener = api._get_opener()
+        self.assertIn(('User-Agent', api.USER_AGENT), opener.addheaders)
+        self.assertNotIn('Python-urllib', api.USER_AGENT)

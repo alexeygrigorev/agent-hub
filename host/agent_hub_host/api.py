@@ -15,8 +15,14 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
+# Cloudflare rejects urllib's default "Python-urllib/x.y" User-Agent (error 1010) before the
+# Worker runs, so every hub request identifies the client explicitly.
+USER_AGENT = "agent-hub-host/1"
+
 def _get_opener():
-    return urllib.request.build_opener(NoRedirectHandler())
+    opener = urllib.request.build_opener(NoRedirectHandler())
+    opener.addheaders = [("User-Agent", USER_AGENT)]
+    return opener
 
 def check_url(url: str):
     if not isinstance(url, str):
@@ -283,6 +289,7 @@ def ws_handshake(host: str, port: int, path: str, token: str, is_secure: bool, r
             f"Connection: Upgrade\r\n"
             f"Sec-WebSocket-Key: {key}\r\n"
             f"Sec-WebSocket-Version: 13\r\n"
+            f"User-Agent: {USER_AGENT}\r\n"
             f"Authorization: Bearer {token}\r\n"
             f"\r\n"
         ).encode("ascii")

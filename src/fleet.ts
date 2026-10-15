@@ -216,9 +216,20 @@ export class FleetService {
         ids.add(s.native_id);
       }
       return this.transaction(() => {
-        this.sql.exec('DELETE FROM fleet_sessions WHERE machine_id = ?', caller.machineId!);
-        for (const s of data.sessions) this.sql.exec('INSERT INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, profile, account, last_activity_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', caller.machineId!, s.native_id, s.tag, s.engine, s.phase, s.agent_state, new Date(this.now()).toISOString(), s.workspace, s.profile, s.account, s.last_activity_at ?? null);
-        return response({ status: 'reported' });
+        // Write only rows that changed: hosts report every minute and Durable Object row writes
+        // are metered. observed_at therefore means "last changed"; host freshness comes from heartbeats.
+        const fields = ['tag', 'engine', 'phase', 'agent_state', 'workspace', 'profile', 'account', 'last_activity_at'];
+        const existing = new Map((this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id = ?', caller.machineId!).toArray() as any[]).map(r => [r.native_id, r]));
+        let written = 0;
+        for (const s of data.sessions) {
+          const prior = existing.get(s.native_id); existing.delete(s.native_id);
+          const row = { ...s, last_activity_at: s.last_activity_at ?? null };
+          if (prior && fields.every(f => (prior[f] ?? null) === (row[f] ?? null))) continue;
+          this.sql.exec('INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, profile, account, last_activity_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', caller.machineId!, s.native_id, s.tag, s.engine, s.phase, s.agent_state, new Date(this.now()).toISOString(), s.workspace, s.profile, s.account, row.last_activity_at);
+          written++;
+        }
+        for (const gone of existing.keys()) { this.sql.exec('DELETE FROM fleet_sessions WHERE machine_id = ? AND native_id = ?', caller.machineId!, gone); written++; }
+        return response({ status: 'reported', written });
       });
     }
     if (path === '/api/fleet/subscriptions' && request.method === 'PUT') {

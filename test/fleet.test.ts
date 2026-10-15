@@ -154,6 +154,14 @@ describe('generic accounts and launch placement', () => {
     delete (reports.subscriptions[0] as any).token;
     expect((await s.handle(request('/subscriptions', reports, 'PUT'), host('win35'))).status).toBe(400);
   }));
+  it('writes only changed session rows and removes vanished sessions', async () => fixture(async (s, sql) => {
+    const base = { tag: 't', workspace: '/repo', profile: null, account: null, engine: 'codex', phase: 'running', agent_state: 'idle' };
+    const put = async (sessions: any[]) => (await (await s.handle(request('/sessions', { sessions }, 'PUT'), host('win35'))).json() as any).written;
+    expect(await put([{ ...base, native_id: 'a' }, { ...base, native_id: 'b', tag: 'u' }])).toBe(2);
+    expect(await put([{ ...base, native_id: 'a' }, { ...base, native_id: 'b', tag: 'u' }])).toBe(0);
+    expect(await put([{ ...base, native_id: 'a', agent_state: 'working' }])).toBe(2);
+    expect(sql.exec("SELECT native_id, agent_state FROM fleet_sessions WHERE machine_id = 'win35'").toArray()).toEqual([{ native_id: 'a', agent_state: 'working' }]);
+  }));
   it('records authenticated requester, parent, summary and native sessions without allowing host attribution spoofing', async () => fixture(async (s, sql) => {
     await configure(s);
     const root: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner', summary: 'Parent task' })), admin)).json();
