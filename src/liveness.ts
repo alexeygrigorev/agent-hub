@@ -54,7 +54,7 @@ export class LivenessService {
     for (const stmt of LIVENESS_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
   }
 
-  machineState(machine: any, now = this.now()): Subject {
+  machineState(machine: any, now = this.now(), label: string = machine.id): Subject {
     const age = ageSeconds(effectiveCheckin(machine.id, machine.last_checkin_at), now);
     let state: string;
     if (machine.drained) state = 'drained';
@@ -63,15 +63,21 @@ export class LivenessService {
     else if (age <= this.thresholds.machineOfflineS) state = 'stale';
     else state = 'offline';
     const detail = age === null ? 'no heartbeat received yet' : `last heartbeat ${age}s ago`;
-    return { kind: 'machine', id: machine.id, state, detail, machine_id: machine.id, age_s: age };
+    return { kind: 'machine', id: label, state, detail, machine_id: machine.id, age_s: age };
   }
 
   /** Every subject the hub can judge, with its current liveness state. */
   evaluate(): { thresholds: Thresholds; subjects: Subject[] } {
     const now = this.now(); const t = this.thresholds; const subjects: Subject[] = [];
     const machines = new Map<string, Subject>();
-    for (const m of this.sql.exec('SELECT id, last_checkin_at, drained FROM machines ORDER BY id').toArray() as any[]) {
-      const s = this.machineState(m, now); machines.set(m.id, s); subjects.push(s);
+    const rows = this.sql.exec('SELECT id, name, last_checkin_at, drained FROM machines ORDER BY id').toArray() as any[];
+    // Show enrolled names; fall back to the opaque id when a name is missing or shared.
+    const counts = new Map<string, number>();
+    for (const m of rows) if (m.name) counts.set(m.name, (counts.get(m.name) || 0) + 1);
+    const names = new Map<string, string>(rows.map(m => [m.id, m.name && counts.get(m.name) === 1 ? m.name : m.id]));
+    const label = (id: string) => names.get(id) || id;
+    for (const m of rows) {
+      const s = this.machineState(m, now, label(m.id)); machines.set(m.id, s); subjects.push(s);
     }
     const hostKnown = (id: string) => machines.get(id)?.state === 'online';
 
@@ -80,12 +86,12 @@ export class LivenessService {
       reported.add(s.machine_id + '/' + s.native_id);
       const activity = ageSeconds(s.last_activity_at, now);
       let state: string; let detail: string;
-      if (!hostKnown(s.machine_id)) { state = 'unknown'; detail = `machine ${s.machine_id} is not reporting`; }
+      if (!hostKnown(s.machine_id)) { state = 'unknown'; detail = `machine ${label(s.machine_id)} is not reporting`; }
       else if (s.phase !== 'running') { state = 'exited'; detail = `phase ${s.phase}`; }
       else if (s.agent_state === 'working' && activity !== null && activity > t.agentStallS) { state = 'stalled'; detail = `reported working but no terminal activity for ${activity}s`; }
       else if (s.agent_state === 'working') { state = 'working'; detail = activity === null ? 'working' : `active ${activity}s ago`; }
       else { state = s.agent_state ? 'idle' : 'running'; detail = `${s.agent_state || 'no agent state'}${activity === null ? '' : `, active ${activity}s ago`}`; }
-      subjects.push({ kind: 'session', id: `${s.machine_id}/${s.tag}`, state, detail, machine_id: s.machine_id, age_s: activity });
+      subjects.push({ kind: 'session', id: `${label(s.machine_id)}/${s.tag}`, state, detail: `${detail} (${s.engine || 'shell'} in ${s.workspace})`, machine_id: s.machine_id, age_s: activity });
     }
 
     for (const l of this.sql.exec("SELECT id, machine_id, mode, state, native_id, updated_at, summary FROM fleet_launches WHERE state IN ('offered','starting','running','uncertain') ORDER BY created_at").toArray() as any[]) {
@@ -93,7 +99,7 @@ export class LivenessService {
       let state: string; let detail: string;
       if (l.state === 'uncertain') { state = 'uncertain'; detail = 'launch outcome unknown; reconcile before retrying'; }
       else if ((l.state === 'offered' || l.state === 'starting') && age !== null && age > t.launchStuckS) { state = 'stuck'; detail = `${l.state} for ${age}s`; }
-      else if (!hostKnown(l.machine_id)) { state = 'unknown'; detail = `machine ${l.machine_id} is not reporting`; }
+      else if (!hostKnown(l.machine_id)) { state = 'unknown'; detail = `machine ${label(l.machine_id)} is not reporting`; }
       else if (l.state === 'running' && l.mode === 'interactive' && l.native_id && !this.sessionReported(l.machine_id, l.native_id, reported)) { state = 'missing'; detail = 'session no longer reported by its machine'; }
       else { state = l.state === 'running' ? 'working' : l.state; detail = `${l.state}${age === null ? '' : ` since ${age}s`}`; }
       subjects.push({ kind: 'launch', id: l.id, state, detail: `${l.summary}: ${detail}`, machine_id: l.machine_id, age_s: age });

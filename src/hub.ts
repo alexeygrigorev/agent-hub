@@ -1131,6 +1131,7 @@ export class Hub extends DurableObject {
     }
     const run = /^\/api\/checks\/([a-z0-9][a-z0-9_-]{0,63})\/run$/.exec(path);
     if (run && request.method === 'POST') {
+      await safeJson(request); // the body is unused; drain it so the runtime does not log a stream error
       if (!this.checksService.list().some(c => c.name === run[1])) return json({ error: 'not_found' }, 404);
       return json({ results: await this.runChecks(run[1]) });
     }
