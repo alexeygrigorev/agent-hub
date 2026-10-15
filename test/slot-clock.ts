@@ -14,12 +14,12 @@ export function tickSafeOffset(now = Date.now()): number {
 
 const shifted = new Set<any>();
 afterEach(async () => {
-  for (const stub of shifted) await runInDurableObject(stub, async (instance: any) => { instance.jobsService.setClock(() => new Date()); });
+  for (const stub of shifted) await (runInDurableObject as any)(stub, async (instance: any) => { instance.jobsService.setClock(() => new Date()); });
   shifted.clear();
 });
 
 export async function pinJobsClock(stub: any, offset: number = tickSafeOffset()): Promise<Date> {
-  await runInDurableObject(stub, async (instance: any) => { instance.jobsService.setClock(() => new Date(Date.now() + offset)); });
+  await (runInDurableObject as any)(stub, async (instance: any) => { instance.jobsService.setClock(() => new Date(Date.now() + offset)); });
   shifted.add(stub);
   return new Date(Date.now() + offset);
 }
