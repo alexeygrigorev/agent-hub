@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+import { pinJobsClock } from './slot-clock';
 import { runInDurableObject, env } from 'cloudflare:test';
 import { doFetch } from './m1-focus-setup';
 import { sha256 } from '../src/auth/crypto';
@@ -327,6 +328,7 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
     });
 
     // Run alarm / scheduledTick to process expirations
+    await pinJobsClock(stub);
     const resTick = await stub.fetch(new Request('http://example.com/internal/tick', {
       method: 'POST',
       headers: { 'Authorization': 'Bearer token_admin' }

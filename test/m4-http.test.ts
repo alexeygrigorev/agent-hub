@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll } from 'vitest';
+import { pinJobsClock } from './slot-clock';
 import { runInDurableObject, env } from 'cloudflare:test';
 import { doFetch } from './m1-focus-setup';
 import { sha256 } from '../src/auth/crypto';
@@ -499,7 +500,8 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
     const resGet = await stub.fetch(new Request('http://example.com/internal/tick', { method: 'GET' }));
     expect(resGet.status).toBe(405);
 
-    const validSlot = new Date(Math.floor(Date.now() / 1800000) * 1800000).toISOString();
+    const at = await pinJobsClock(stub);
+    const validSlot = new Date(Math.floor(at.getTime() / 1800000) * 1800000).toISOString();
     const resTick1 = await stub.fetch(new Request('http://example.com/internal/tick', {
       method: 'POST',
       headers: {

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { pinJobsClock } from './slot-clock';
 import { runInDurableObject } from 'cloudflare:test';
 import { doFetch, defaultEnv } from './m1-focus-setup';
 import { createSessionCookie } from '../src/auth/session';
@@ -681,6 +682,7 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
     });
 
     // Attempt future-clock injection via /internal/tick body.now
+    await pinJobsClock(stub);
     const tickFutureRes = await stub.fetch(new Request('http://example.com/internal/tick', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
