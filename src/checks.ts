@@ -9,11 +9,13 @@ import type { LivenessService } from './liveness';
 
 export const CHECKS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS hub_checks (name TEXT PRIMARY KEY, kind TEXT NOT NULL, interval_s INTEGER NOT NULL, params_json TEXT NOT NULL, action_json TEXT NOT NULL, enabled INTEGER NOT NULL, next_due_at TEXT NOT NULL, last_run_at TEXT, last_status TEXT, last_detail TEXT);
+CREATE TABLE IF NOT EXISTS hub_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS hub_check_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, at TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, action TEXT);
 `;
 
 export const CHECK_KINDS = ['liveness', 'quota', 'http', 'inbox_backlog', 'routine'] as const;
-const NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+// 40 characters keeps check-<name>-<slot> within the 64-character fleet idempotency key.
+const NAME = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 const LABEL = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 const TEXT = (v: unknown, max: number) => typeof v === 'string' && v.length <= max && !/[\x00-\x08\x0b-\x1f\x7f]/.test(v);
 const plain = (v: any, keys: string[]) => v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).every(k => keys.includes(k));
@@ -66,7 +68,11 @@ export class ChecksService {
 
   init() {
     for (const stmt of CHECKS_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
-    if (!Number(this.sql.exec('SELECT COUNT(*) AS n FROM hub_checks').one().n)) this.replace(DEFAULT_CHECKS.map(c => (validateCheck(c) as any).row));
+    // Seed defaults once; an operator who later removes every check keeps an empty list.
+    if (!this.sql.exec("SELECT 1 FROM hub_meta WHERE key = 'checks_seeded'").toArray().length) {
+      if (!Number(this.sql.exec('SELECT COUNT(*) AS n FROM hub_checks').one().n)) this.replace(DEFAULT_CHECKS.map(c => (validateCheck(c) as any).row));
+      this.sql.exec("INSERT INTO hub_meta (key, value) VALUES ('checks_seeded', ?)", new Date(this.now()).toISOString());
+    }
   }
 
   replace(rows: any[]) {

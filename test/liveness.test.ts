@@ -3,6 +3,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { LivenessService, thresholdsFrom, DEFAULT_THRESHOLDS } from '../src/liveness';
 import { FleetService } from '../src/fleet';
 import { updateHeartbeat } from '../src/registry';
+import { sha256 } from '../src/auth/crypto';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
@@ -119,6 +120,33 @@ describe('stale alerts', () => {
     opened = live.reconcileAlerts(live.evaluate().subjects);
     expect(opened).toHaveLength(1);
   }));
+
+  it('offers failed or untargeted notifications for retry after a delay', () => fixture((live, sql, clock) => {
+    machine(sql, 'hetzner', iso(300));
+    const [alert] = live.reconcileAlerts(live.evaluate().subjects);
+    live.markNotified(alert.id, 'webhook: HTTP 500');
+    expect(live.undelivered(900)).toEqual([]);
+    clock.t += 901000;
+    expect(live.undelivered(900).map((a: any) => a.id)).toEqual([alert.id]);
+    live.markNotified(alert.id, null);
+    clock.t += 901000;
+    expect(live.undelivered(900)).toEqual([]);
+  }));
+
+  it('accepts agent heartbeats only with the health:report scope', async () => {
+    const bindings = env as unknown as Env;
+    const stub = bindings.HUB.get(bindings.HUB.idFromName('heartbeat-scope-' + crypto.randomUUID()));
+    const tokens: Record<string, string> = { reader: 'reader-token-' + crypto.randomUUID(), reporter: 'reporter-token-' + crypto.randomUUID() };
+    await runInDurableObject(stub, async (hub: Hub) => {
+      for (const [name, scopes] of [['reader', ['bus:read']], ['reporter', ['bus:read', 'health:report']]] as const) {
+        hub.sql.exec('INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          name, 'agent', await sha256(tokens[name]), name, name, name, JSON.stringify(scopes), 'test', new Date().toISOString(), new Date(Date.now() + 3600000).toISOString());
+      }
+    });
+    const beat = (name: string) => stub.fetch(new Request('https://hub.test/api/heartbeat', { method: 'POST', headers: { Authorization: 'Bearer ' + tokens[name] }, body: JSON.stringify({ status: 'working' }) }));
+    expect((await beat('reader')).status).toBe(403);
+    expect((await beat('reporter')).status).toBe(200);
+  });
 
   it('requires authentication for liveness and heartbeat endpoints', async () => {
     const bindings = env as unknown as Env;

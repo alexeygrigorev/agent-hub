@@ -35,6 +35,21 @@ describe('check definitions', () => {
     expect(checks.list().map(c => [c.name, c.kind, c.interval_s, c.enabled])).toEqual([['liveness', 'liveness', 300, true]]);
   }));
 
+  it('keeps an intentionally empty configuration across restarts', () => fixture(async (checks, deps, clock, sql) => {
+    checks.replace([]);
+    new ChecksService(sql, () => clock.t).init();
+    expect(checks.list()).toEqual([]);
+  }));
+
+  it('limits names so scheduled launch keys fit the fleet idempotency key', () => {
+    expect('error' in validateCheck({ name: 'a'.repeat(41), kind: 'quota', interval_s: 300 })).toBe(true);
+    const name = 'a'.repeat(40);
+    expect('error' in validateCheck({ name, kind: 'quota', interval_s: 300 })).toBe(false);
+    const key = `check-${name}-${Math.floor(Date.parse('2030-01-01T00:00:00Z') / 300000)}`;
+    expect(key.length).toBeLessThanOrEqual(64);
+    expect(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(key)).toBe(true);
+  });
+
   it('rejects unsafe or malformed definitions', () => {
     const bad = [
       { name: 'Bad Name', kind: 'routine', interval_s: 300, action: { type: 'message', to: 'a', body: 'b' } },

@@ -167,6 +167,12 @@ export class LivenessService {
     this.sql.exec('UPDATE liveness_alerts SET notified_at = ?, notify_error = ? WHERE id = ?', new Date(this.now()).toISOString(), error, id);
   }
 
+  /** Open alerts whose notification failed (or had no target) at least `retryAfterS` ago. */
+  undelivered(retryAfterS: number) {
+    const cutoff = new Date(this.now() - retryAfterS * 1000).toISOString();
+    return this.sql.exec('SELECT * FROM liveness_alerts WHERE resolved_at IS NULL AND notify_error IS NOT NULL AND notified_at <= ? ORDER BY id LIMIT 20', cutoff).toArray();
+  }
+
   alerts(limit = 100) {
     return this.sql.exec('SELECT * FROM liveness_alerts ORDER BY resolved_at IS NOT NULL, opened_at DESC LIMIT ?', limit).toArray();
   }

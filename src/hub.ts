@@ -1106,7 +1106,7 @@ export class Hub extends DurableObject {
     if (path === '/api/heartbeat') {
       if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
       // Agents report for themselves only; a host's heartbeat travels through /api/host/poll.
-      if (caller.kind !== 'agent' || !caller.actor) return json({ error: 'forbidden' }, 403);
+      if (caller.kind !== 'agent' || !caller.actor || !auth.scopes?.includes('health:report')) return json({ error: 'forbidden' }, 403);
       const result = this.livenessService.recordHeartbeat(caller.actor, caller.machineId ?? null, await safeJson(request));
       return 'error' in result ? json(result, 400) : json({ status: 'recorded' });
     }
@@ -1129,7 +1129,7 @@ export class Hub extends DurableObject {
       this.ctx.storage.transactionSync(() => this.checksService.replace(rows));
       return json({ status: 'configured', checks: this.checksService.list() });
     }
-    const run = /^\/api\/checks\/([a-z0-9][a-z0-9_-]{0,63})\/run$/.exec(path);
+    const run = /^\/api\/checks\/([a-z0-9][a-z0-9_-]{0,39})\/run$/.exec(path);
     if (run && request.method === 'POST') {
       await safeJson(request); // the body is unused; drain it so the runtime does not log a stream error
       if (!this.checksService.list().some(c => c.name === run[1])) return json({ error: 'not_found' }, 404);
@@ -1158,7 +1158,7 @@ export class Hub extends DurableObject {
   /** Cron and manual entry point for scheduled checks. */
   async runChecks(only?: string) {
     this.livenessService.prune();
-    return this.checksService.runDue({
+    const results = await this.checksService.runDue({
       liveness: this.livenessService,
       notify: alert => this.notifyAlert(alert),
       message: async (to, body, key) => this.busService.send({ isAdmin: true, actor: 'hub', kind: 'human' }, { senderActor: 'hub', toActor: to, kind: 'note', body, idempotencyKey: 'check-' + key }).id,
@@ -1172,6 +1172,9 @@ export class Hub extends DurableObject {
       fetch: (url, init) => fetch(url, init),
       evaluateQuota: () => this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray().map(a => this.fleetService.accountStatus(a)),
     }, only);
+    // Retry alerts whose delivery failed or had no target yet, at most every 15 minutes each.
+    for (const alert of this.livenessService.undelivered(900)) await this.notifyAlert(alert);
+    return results;
   }
 
   async scheduledTick(slotOverride?: string) {
