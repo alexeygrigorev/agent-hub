@@ -18,7 +18,7 @@ class EnrollmentTests(unittest.TestCase):
         with patch.object(auth, 'device_login') as login:
             cli.cmd_login(argparse.Namespace(base_url='https://hub.example', kind='agent', name='grok-bot', scope=None))
         self.assertEqual(login.call_args.args[1:3], ('agent', 'grok-bot'))
-        self.assertEqual(set(login.call_args.args[-1]), {'bus:send', 'bus:read'})
+        self.assertEqual(set(login.call_args.args[-1]), {'bus:send', 'bus:read', 'health:report'})
         with patch.object(auth, 'device_login') as login:
             cli.cmd_login(argparse.Namespace(base_url='https://hub.example', kind='agent', name='coordinator', scope=['bus:read', 'fleet:launch']))
         self.assertEqual(login.call_args.args[-1], ['bus:read', 'fleet:launch'])
