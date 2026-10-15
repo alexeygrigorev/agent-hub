@@ -161,7 +161,7 @@ class FleetTests(unittest.TestCase):
 
     def test_explicit_provider_and_window_errors_never_become_healthy(self):
         base = {'status': 'ok', 'details': {'limit_reached': False}, 'windows': {'weekly': {'percent_remaining': 80, 'reset_at': '2099-01-01T00:00:00Z'}}}
-        cases = [dict(base, stale=True), dict(base, error='MUST_NOT_LEAK'), dict(base, details={'limit_reached': False, 'stale': True}), dict(base, windows={**base['windows'], 'five_hour': {'error': 'unavailable'}})]
+        cases = [dict(base, stale=True), dict(base, stale='true'), dict(base, stale=None), dict(base, error=''), dict(base, error='MUST_NOT_LEAK'), dict(base, details={'limit_reached': False, 'stale': True}), dict(base, windows={**base['windows'], 'five_hour': {'error': 'unavailable'}}), dict(base, windows={**base['windows'], 'five_hour': {'error': ''}}), dict(base, observed_at=None)]
         for route in cases:
             result = fleet.quota_metadata({'codex': route}, 'codex')
             self.assertEqual(result['status'], 'unknown')

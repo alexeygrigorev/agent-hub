@@ -121,13 +121,15 @@ def quota_metadata(raw, service):
     details = route.get("details", {})
     if not isinstance(details, dict):
         details = {}
-    unavailable = route.get('stale') is True or details.get('stale') is True or route.get('error') not in (None, '')
+    unavailable = any('stale' in obj and obj['stale'] is not False for obj in (route, details))
+    unavailable |= any('error' in obj and obj['error'] is not None for obj in (route, details))
     safe_details = {key: details.get(key) if isinstance(details.get(key), bool) else None for key in ("limit_reached", "has_grok_code_access", "stale")}
     windows = {}
     for key, win in list((route.get("windows") or {}).items())[:32] if isinstance(route.get("windows"), dict) else []:
-        if not LABEL.fullmatch(key) or not isinstance(win, dict):
+        if not isinstance(key, str) or not LABEL.fullmatch(key) or not isinstance(win, dict):
+            unavailable = True
             continue
-        if win.get('error') not in (None, '') or win.get('stale') is True:
+        if ('error' in win and win['error'] is not None) or ('stale' in win and win['stale'] is not False):
             unavailable = True
         percent = win.get("percent_remaining")
         percent = float(percent) if type(percent) in (int, float) and math.isfinite(percent) and 0 <= percent <= 100 else None
@@ -143,14 +145,21 @@ def quota_metadata(raw, service):
                 reset = None
         present = win.get("present")
         if not isinstance(present, bool):
+            if 'present' in win: unavailable = True
             present = percent is not None or reset is not None
+        if present and (percent is None or reset is None): unavailable = True
+        if 'rolling' in win and type(win['rolling']) is not bool: unavailable = True
         windows[key] = {"present": present, "percent_remaining": percent, "reset_at": reset, "rolling": win.get("rolling") is True}
-    observed_at = route.get('observed_at') or details.get('observed_at')
+    explicit_timestamp = 'observed_at' in route or 'observed_at' in details
+    observed_at = route.get('observed_at') if 'observed_at' in route else details.get('observed_at')
     status = route.get('status') if route.get('status') in {'ok', 'error', 'unknown'} else 'unknown'
     if unavailable:
         status = 'unknown'
     if observed_at is None:
-        observed_at = utcnow()
+        if explicit_timestamp:
+            status = 'unknown'
+        else:
+            observed_at = utcnow()
     else:
         try:
             stamp = dt.datetime.fromisoformat(observed_at.replace('Z', '+00:00'))
