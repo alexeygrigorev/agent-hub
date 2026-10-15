@@ -1,5 +1,7 @@
 # Agent Hub
 
+Generic agent-fleet hub on Cloudflare: authenticated messaging and dashboards, machine subscriptions and shared account quotas, placement of headless agents, and real interactive sessions. See [the generic hub guide](docs/GENERIC-HUB.md) for configuration, CLI commands, execution boundaries and migration. The intended production URL is `https://hub.dtcdev.click`; deployment and physical host acceptance are separate from source availability.
+
 Serverless coordination hub for Alexey's multi-agent project: 30-minute headless root runs on a random available host, the daily writer job, machine registry, message bus, health and dashboard.
 
 The spec is [docs/SPEC.md](docs/SPEC.md); it is the source of truth for scope and milestones.

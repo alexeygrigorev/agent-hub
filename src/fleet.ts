@@ -1,0 +1,241 @@
+/** Generic account registry and placement. Provider credentials never enter this service. */
+import type { SqlStorage } from '@cloudflare/workers-types';
+
+export const FLEET_SCHEMA = `
+CREATE TABLE IF NOT EXISTS fleet_accounts (label TEXT PRIMARY KEY, provider TEXT NOT NULL, max_concurrency INTEGER NOT NULL, reserve_percent REAL NOT NULL, enabled INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS fleet_routes (machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, PRIMARY KEY(machine_id, engine, account));
+CREATE TABLE IF NOT EXISTS fleet_subscriptions (machine_id TEXT NOT NULL, account TEXT NOT NULL, service TEXT NOT NULL, plan TEXT, observed_at TEXT NOT NULL, quota_json TEXT NOT NULL, PRIMARY KEY(machine_id, account));
+CREATE TABLE IF NOT EXISTS fleet_sessions (machine_id TEXT NOT NULL, native_id TEXT NOT NULL, tag TEXT NOT NULL, engine TEXT, phase TEXT NOT NULL, agent_state TEXT, observed_at TEXT NOT NULL, workspace TEXT NOT NULL, profile TEXT, account TEXT, PRIMARY KEY(machine_id, native_id));
+CREATE TABLE IF NOT EXISTS fleet_launches (id TEXT PRIMARY KEY, actor TEXT NOT NULL, requester_kind TEXT NOT NULL, parent_id TEXT, summary TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, mode TEXT NOT NULL, workspace TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL, native_id TEXT, launcher_task_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
+`;
+type Auth = { caller?: { isAdmin?: boolean; actor?: string; machineId?: string; kind?: string }; scopes?: string[]; error?: Response };
+const LABEL = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+const PROVIDERS = new Set(['codex', 'claude', 'grok', 'gemini', 'zai', 'go', 'copilot']);
+const ACTIVE = "('offered','starting','running','uncertain')";
+const HEADROOM: Record<string, number> = { codex: 15, grok: 5 };
+const HEADERS = { 'Cache-Control': 'private, no-store' };
+function response(value: unknown, status = 200) { return Response.json(value, { status, headers: HEADERS }); }
+function label(value: unknown): value is string { return typeof value === 'string' && LABEL.test(value); }
+function object(value: any, keys: string[]): boolean {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(k => keys.includes(k));
+}
+function parsed(value: any, fallback: any = {}) { try { return JSON.parse(value || '{}'); } catch { return fallback; } }
+function sanitizedQuota(raw: any): any {
+  if (!object(raw, ['status', 'observed_at', 'details', 'windows']) || !['ok', 'unknown', 'error'].includes(raw.status) || !object(raw.details, ['limit_reached', 'has_grok_code_access', 'stale']) || !object(raw.windows, Object.keys(raw.windows || {})) || Object.keys(raw.windows).length > 32) return null;
+  const details: any = {};
+  for (const [key, value] of Object.entries(raw.details)) { if (value !== null && typeof value !== 'boolean') return null; details[key] = value; }
+  const windows: any = {};
+  for (const [key, w] of Object.entries(raw.windows) as any) {
+    if (!label(key) || !object(w, ['present', 'percent_remaining', 'reset_at', 'rolling']) || typeof w.present !== 'boolean' || (w.percent_remaining !== null && (typeof w.percent_remaining !== 'number' || !Number.isFinite(w.percent_remaining) || w.percent_remaining < 0 || w.percent_remaining > 100)) || (w.reset_at !== null && (typeof w.reset_at !== 'string' || !Number.isFinite(Date.parse(w.reset_at)))) || (w.rolling !== undefined && typeof w.rolling !== 'boolean')) return null;
+    windows[key] = { present: w.present, percent_remaining: w.percent_remaining, reset_at: w.reset_at, rolling: w.rolling === true };
+  }
+  if (raw.observed_at !== null && (typeof raw.observed_at !== 'string' || !Number.isFinite(Date.parse(raw.observed_at)))) return null;
+  return { status: raw.status, observed_at: raw.observed_at, details, windows };
+}
+function fresh(value: any, now: number, ttl: number) {
+  const at = typeof value === 'string' ? Date.parse(value) : NaN;
+  return Number.isFinite(at) && at <= now && now - at <= ttl;
+}
+async function body(request: Request): Promise<any> {
+  if (!request.body) return null;
+  const reader = request.body.getReader(); let size = 0; const chunks: Uint8Array[] = [];
+  try {
+    for (;;) {
+      const part = await reader.read(); if (part.done) break;
+      size += part.value.byteLength;
+      if (size > 32768) { await reader.cancel(); return null; }
+      chunks.push(part.value);
+    }
+    const bytes = new Uint8Array(size); let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch { return null; } finally { reader.releaseLock(); }
+}
+
+export class FleetService {
+  constructor(private sql: SqlStorage, private transaction: <T>(fn: () => T) => T, private now: () => number = Date.now) {}
+  init() { for (const stmt of FLEET_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt); }
+
+  accountStatus(account: any) {
+    const routes = this.sql.exec('SELECT machine_id FROM fleet_routes WHERE account = ?', account.label).toArray();
+    let remaining: number | null = null; let observed = 0; let unknown = false; let blocked = !account.enabled;
+    for (const route of routes) {
+      const subscription: any = this.sql.exec('SELECT * FROM fleet_subscriptions WHERE machine_id = ? AND account = ?', route.machine_id, account.label).toArray()[0];
+      const snapshot: any = this.sql.exec('SELECT * FROM host_quota_snapshots WHERE host_id = ?', route.machine_id).toArray()[0];
+      const mappingCount = Number(this.sql.exec('SELECT COUNT(DISTINCT r.account) AS n FROM fleet_routes r JOIN fleet_accounts a ON r.account = a.label WHERE r.machine_id = ? AND a.provider = ?', route.machine_id, account.provider).one().n);
+      // A default CLI observation cannot be attributed to two accounts on the same service.
+      if (subscription ? !fresh(subscription.observed_at, this.now(), 1200000) : (!snapshot || mappingCount !== 1 || !fresh(snapshot.captured_at, this.now(), 1200000))) continue;
+      observed++;
+      const quota = subscription ? parsed(subscription.quota_json) : parsed(snapshot.routes_json)[account.provider];
+      if ((!subscription && snapshot.status !== 'ok') || !quota || quota.status !== 'ok' || quota.details?.stale === true || !fresh(quota.observed_at, this.now(), 1200000)) { unknown = true; continue; }
+      if (quota.details?.limit_reached === true) blocked = true;
+      if (quota.details?.limit_reached !== false || (account.provider === 'grok' && quota.details?.has_grok_code_access !== true)) unknown = true;
+      let windows = 0;
+      for (const win of Object.values(quota.windows || {}) as any[]) {
+        if (win.present === false) continue;
+        windows++;
+        if (win.present !== true || typeof win.percent_remaining !== 'number' || !Number.isFinite(win.percent_remaining) || win.percent_remaining < 0 || win.percent_remaining > 100 || !fresh(win.reset_at, this.now() + 366 * 86400000, 366 * 86400000)) { unknown = true; continue; }
+        remaining = remaining === null ? win.percent_remaining : Math.min(remaining, win.percent_remaining);
+      }
+      if (!windows) unknown = true;
+    }
+    if (remaining !== null && remaining <= account.reserve_percent) blocked = true;
+    const active = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE account = ? AND state IN ${ACTIVE}`, account.label).one().n);
+    return { label: account.label, provider: account.provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled,
+      remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || unknown || remaining === null) ? 'unknown' : 'ok', active, available_slots: Math.max(0, Number(account.max_concurrency) - active),
+      machines: routes.map(r => r.machine_id) };
+  }
+
+  plan(input: any) {
+    if (!object(input, ['mode', 'machine', 'engine', 'workspace', 'prompt', 'idempotency_key', 'parent_id', 'summary']) ||
+      !label(input.workspace) || (input.mode !== undefined && !['headless', 'interactive'].includes(input.mode)) ||
+      (input.machine !== undefined && !label(input.machine)) || (input.engine !== undefined && !label(input.engine)) ||
+      (input.mode === 'interactive' && !input.machine) ||
+      (input.parent_id !== undefined && input.parent_id !== null && (typeof input.parent_id !== 'string' || !/^[a-f0-9-]{36}$/.test(input.parent_id))) ||
+      (input.summary !== undefined && (typeof input.summary !== 'string' || input.summary.length > 240 || /[\x00-\x1f\x7f]/.test(input.summary))) ||
+      (input.prompt !== undefined && (typeof input.prompt !== 'string' || input.prompt.length > 16000)) ||
+      (input.mode !== 'interactive' && !input.prompt?.trim())) return { error: 'invalid_launch_request' };
+    const request = { mode: input.mode || 'headless', machine: input.machine || null, engine: input.engine || null, workspace: input.workspace, prompt: input.prompt || '', parent_id: input.parent_id || null, summary: input.summary || (input.mode === 'interactive' ? 'Interactive session' : 'Agent task') };
+    const rejected: { machine: string; engine: string; reason: string }[] = []; const candidates: any[] = [];
+    const accounts = new Map(this.sql.exec('SELECT * FROM fleet_accounts').toArray().map(a => [a.label, this.accountStatus(a)]));
+    for (const route of this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray() as any[]) {
+      if ((request.machine && route.machine_id !== request.machine) || (request.engine && route.engine !== request.engine)) continue;
+      const machine: any = this.sql.exec('SELECT * FROM machines WHERE id = ?', route.machine_id).toArray()[0];
+      const account = accounts.get(route.account); const caps = parsed(machine?.capabilities); const hb = parsed(machine?.last_heartbeat);
+      let reason = '';
+      if (!machine || machine.drained || !fresh(machine.last_checkin_at, this.now(), 180000)) reason = 'machine_unavailable';
+      else if (!Array.isArray(caps.engines) || !caps.engines.includes(route.engine) || !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode) || !Array.isArray(caps.workspaces) || !caps.workspaces.includes(request.workspace)) reason = 'capability_unavailable';
+      else if (hb.gate?.launch_allowed !== true || !fresh(hb.gate?.at, this.now(), 300000)) reason = 'admission_unknown';
+      else if (!Number.isFinite(hb.mem_avail_mb) || hb.mem_avail_mb < 10240 + 1500 || !Number.isFinite(hb.disk_free_gb) || hb.disk_free_gb < 50.5) reason = 'resource_limit';
+      else if (!Array.isArray(hb.load) || !Number.isFinite(hb.load[0]) || hb.load[0] < 0 || !Number.isFinite(caps.cpu_count) || caps.cpu_count < 1) reason = 'load_unknown';
+      else if (!account || account.status !== 'ok') reason = 'account_' + (account?.status || 'unmapped');
+      else if (account.available_slots < 1) reason = 'account_capacity';
+      if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason }); continue; }
+      const pending = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND state IN ${ACTIVE}`, route.machine_id).one().n);
+      const score = (account!.remaining_percent! / 100) / (1 + hb.load[0] / caps.cpu_count + pending);
+      candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile, score });
+    }
+    candidates.sort((a, b) => b.score - a.score || a.machine.localeCompare(b.machine) || a.engine.localeCompare(b.engine));
+    return { request, selected: candidates[0] || null, candidates, rejected };
+  }
+
+  async handle(request: Request, auth: Auth): Promise<Response> {
+    if (auth.error) return auth.error;
+    const path = new URL(request.url).pathname; const caller = auth.caller;
+    if (!caller) return response({ error: 'unauthorized' }, 401);
+    const admin = !!caller.isAdmin; const host = caller.kind === 'host' && !!caller.machineId && auth.scopes?.includes('host');
+    const writer = admin || auth.scopes?.includes('jobs:create');
+    if (path === '/api/fleet' && request.method === 'GET') {
+      if (!admin) return response({ error: 'forbidden' }, 403);
+      return response({ accounts: this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray().map(a => this.accountStatus(a)), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray(),
+        machines: this.sql.exec('SELECT id, name, hostname, last_checkin_at, drained FROM machines ORDER BY id').toArray(),
+        agents: this.sql.exec('SELECT tag, project, role, machine_id, engine, session_id, health_state, health_at FROM agents').toArray(),
+        sessions: this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray(),
+        subscriptions: this.sql.exec('SELECT * FROM fleet_subscriptions ORDER BY machine_id, service, account').toArray().map((s: any) => ({ machine_id: s.machine_id, account: s.account, service: s.service, plan: s.plan, observed_at: s.observed_at, stale: !fresh(s.observed_at, this.now(), 1200000), quota: parsed(s.quota_json) })),
+        launches: this.sql.exec('SELECT id, actor, requester_kind, parent_id, summary, machine_id, engine, profile, account, mode, workspace, state, native_id, launcher_task_id, created_at, updated_at FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray() });
+    }
+    if (path === '/api/fleet/accounts' && request.method === 'PUT') {
+      if (!admin) return response({ error: 'forbidden' }, 403);
+      const data = await body(request);
+      if (!object(data, ['accounts', 'routes']) || !Array.isArray(data.accounts) || !Array.isArray(data.routes) || data.accounts.length > 128 || data.routes.length > 512) return response({ error: 'invalid_registry' }, 400);
+      const labels = new Set(); const keys = new Set();
+      for (const a of data.accounts) {
+        if (!object(a, ['label', 'provider', 'max_concurrency', 'reserve_percent', 'enabled']) || !label(a.label) || !PROVIDERS.has(a.provider) || !Number.isInteger(a.max_concurrency) || a.max_concurrency < 1 || a.max_concurrency > 100 || !Number.isFinite(a.reserve_percent) || a.reserve_percent < (HEADROOM[a.provider] || 0) || a.reserve_percent > 100 || typeof a.enabled !== 'boolean' || labels.has(a.label)) return response({ error: 'invalid_account' }, 400);
+        labels.add(a.label);
+      }
+      for (const r of data.routes) {
+        if (!object(r, ['machine_id', 'engine', 'account', 'profile'])) return response({ error: 'invalid_route' }, 400);
+        const key = r.machine_id + ':' + r.engine + ':' + r.account;
+        if (!object(r, ['machine_id', 'engine', 'account', 'profile']) || !label(r.machine_id) || !label(r.engine) || !labels.has(r.account) || (r.profile !== null && !label(r.profile)) || keys.has(key) || !this.sql.exec('SELECT id FROM machines WHERE id = ?', r.machine_id).toArray().length) return response({ error: 'invalid_route' }, 400);
+        keys.add(key);
+      }
+      return this.transaction(() => {
+        if (Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE state IN ${ACTIVE}`).one().n)) return response({ error: 'active_launches_hold_registry' }, 409);
+        this.sql.exec('DELETE FROM fleet_routes'); this.sql.exec('DELETE FROM fleet_accounts');
+        for (const a of data.accounts) this.sql.exec('INSERT INTO fleet_accounts VALUES (?, ?, ?, ?, ?)', a.label, a.provider, a.max_concurrency, a.reserve_percent, Number(a.enabled));
+        for (const r of data.routes) this.sql.exec('INSERT INTO fleet_routes VALUES (?, ?, ?, ?)', r.machine_id, r.engine, r.account, r.profile);
+        return response({ status: 'configured' });
+      });
+    }
+    if (['/api/fleet/plan', '/api/fleet/launches'].includes(path) && request.method === 'POST') {
+      if (!writer) return response({ error: 'forbidden' }, 403);
+      const input = await body(request);
+      return this.transaction(() => {
+        const plan = this.plan(input);
+        if ('error' in plan) return response(plan, 400);
+        if (path.endsWith('/plan')) return response(plan);
+        if (!label(input.idempotency_key)) return response({ error: 'idempotency_key_required' }, 400);
+        const actor = caller.actor || caller.machineId || 'admin'; const canonical = JSON.stringify(plan.request);
+        if (plan.request.parent_id && !this.sql.exec('SELECT id FROM fleet_launches WHERE id = ?', plan.request.parent_id).toArray().length) return response({ error: 'parent_not_found' }, 400);
+        const prior: any = this.sql.exec('SELECT * FROM fleet_launches WHERE actor = ? AND request_key = ?', actor, input.idempotency_key).toArray()[0];
+        if (prior) return prior.request_json === canonical ? response({ id: prior.id, state: prior.state, machine: prior.machine_id, engine: prior.engine, account: prior.account, mode: prior.mode, replay: true }) : response({ error: 'idempotency_conflict' }, 409);
+        if (!plan.selected) return response({ error: 'no_eligible_route', rejected: plan.rejected }, 409);
+        const id = crypto.randomUUID(); const at = new Date(this.now()).toISOString(); const selected = plan.selected;
+        this.sql.exec('INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', id, actor, caller.kind || 'unknown', plan.request.parent_id, plan.request.summary, input.idempotency_key, canonical, selected.machine, selected.engine, selected.account, selected.profile, plan.request.mode, plan.request.workspace, plan.request.prompt, 'offered', at, at);
+        return response({ id, state: 'offered', machine: selected.machine, engine: selected.engine, account: selected.account, mode: plan.request.mode }, 201);
+      });
+    }
+    if (path === '/api/fleet/offers' && request.method === 'GET') {
+      if (!host) return response({ error: 'forbidden' }, 403);
+      return response({ offers: this.sql.exec("SELECT id, engine, account, profile, mode, workspace, prompt FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at LIMIT 20", caller.machineId!).toArray() });
+    }
+    if (path === '/api/fleet/sessions' && request.method === 'PUT') {
+      if (!host) return response({ error: 'forbidden' }, 403);
+      const data = await body(request);
+      if (!object(data, ['sessions']) || !Array.isArray(data.sessions) || data.sessions.length > 200) return response({ error: 'invalid_sessions' }, 400);
+      const ids = new Set();
+      for (const s of data.sessions) {
+        if (!object(s, ['native_id', 'tag', 'engine', 'phase', 'agent_state', 'workspace', 'profile', 'account']) || typeof s.native_id !== 'string' || !/^[a-zA-Z0-9-]{1,160}$/.test(s.native_id) || typeof s.tag !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,159}$/.test(s.tag) || (s.engine !== null && !label(s.engine)) || !label(s.phase) || (s.agent_state !== null && !label(s.agent_state)) || typeof s.workspace !== 'string' || s.workspace.length > 2048 || /[\x00-\x1f\x7f]/.test(s.workspace) || (s.profile !== null && !label(s.profile)) || (s.account !== null && !label(s.account)) || ids.has(s.native_id)) return response({ error: 'invalid_session' }, 400);
+        ids.add(s.native_id);
+      }
+      return this.transaction(() => {
+        this.sql.exec('DELETE FROM fleet_sessions WHERE machine_id = ?', caller.machineId!);
+        for (const s of data.sessions) this.sql.exec('INSERT INTO fleet_sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', caller.machineId!, s.native_id, s.tag, s.engine, s.phase, s.agent_state, new Date(this.now()).toISOString(), s.workspace, s.profile, s.account);
+        return response({ status: 'reported' });
+      });
+    }
+    if (path === '/api/fleet/subscriptions' && request.method === 'PUT') {
+      if (!host) return response({ error: 'forbidden' }, 403);
+      const data = await body(request);
+      if (!object(data, ['subscriptions']) || !Array.isArray(data.subscriptions) || data.subscriptions.length > 128) return response({ error: 'invalid_subscriptions' }, 400);
+      const clean: any[] = []; const labels = new Set();
+      for (const sub of data.subscriptions) {
+        if (!object(sub, ['service', 'account', 'plan', 'quota']) || !label(sub.account) || !PROVIDERS.has(sub.service) || (sub.plan !== null && (typeof sub.plan !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9 ._+-]{0,63}$/.test(sub.plan))) || labels.has(sub.account)) return response({ error: 'invalid_subscription' }, 400);
+        labels.add(sub.account);
+        const mapped = this.sql.exec('SELECT a.label FROM fleet_accounts a JOIN fleet_routes r ON a.label = r.account WHERE r.machine_id = ? AND a.label = ? AND a.provider = ?', caller.machineId!, sub.account, sub.service).toArray();
+        const quota = sanitizedQuota(sub.quota);
+        if (!mapped.length || !quota || (quota.observed_at !== null && !fresh(quota.observed_at, this.now(), 1200000))) return response({ error: 'subscription_unmapped_or_invalid' }, 400);
+        clean.push({ ...sub, quota });
+      }
+      return this.transaction(() => {
+        this.sql.exec('DELETE FROM fleet_subscriptions WHERE machine_id = ?', caller.machineId!);
+        for (const s of clean) this.sql.exec('INSERT INTO fleet_subscriptions VALUES (?, ?, ?, ?, ?, ?)', caller.machineId!, s.account, s.service, s.plan, new Date(this.now()).toISOString(), JSON.stringify(s.quota));
+        return response({ status: 'reported' });
+      });
+    }
+    const match = /^\/api\/fleet\/launches\/([a-f0-9-]{36})\/(claim|result)$/.exec(path);
+    if (match && request.method === 'POST') {
+      if (!host) return response({ error: 'forbidden' }, 403);
+      const data = await body(request);
+      return this.transaction(() => {
+        const row: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id = ? AND machine_id = ?', match[1], caller.machineId!).toArray()[0];
+        if (!row) return response({ error: 'not_found' }, 404);
+        if (match[2] === 'claim') {
+          if (row.state !== 'offered') return response({ error: 'already_claimed' }, 409);
+          if (!object(data, ['gate_allowed', 'observed_at', 'account', 'profile_supported']) || data.gate_allowed !== true || data.profile_supported !== true || data.account !== row.account || !fresh(data.observed_at, this.now(), 30000)) return response({ error: 'fresh_admission_required' }, 409);
+          const account: any = this.sql.exec('SELECT * FROM fleet_accounts WHERE label = ?', row.account).toArray()[0];
+          if (!account || this.accountStatus(account).status !== 'ok') return response({ error: 'account_unavailable' }, 409);
+          this.sql.exec("UPDATE fleet_launches SET state = 'starting', updated_at = ? WHERE id = ?", new Date(this.now()).toISOString(), row.id);
+          return response({ ...row, state: 'starting' });
+        }
+        if (!object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit']) || !['running', 'uncertain', 'failed', 'exited'].includes(data.state) || !['starting', 'running', 'uncertain'].includes(row.state)) return response({ error: 'invalid_transition' }, 409);
+        if (['exited', 'failed'].includes(data.state) && data.confirmed_exit !== true) return response({ error: 'confirmed_exit_required' }, 409);
+        if (data.state === 'running' && (typeof data.native_id !== 'string' || data.native_id.length < 1 || data.native_id.length > 160 || (row.mode === 'headless' && !label(data.launcher_task_id)))) return response({ error: 'native_receipt_required' }, 409);
+        if ((data.native_id !== undefined && (typeof data.native_id !== 'string' || data.native_id.length > 160)) || (data.launcher_task_id !== undefined && !label(data.launcher_task_id))) return response({ error: 'invalid_receipt' }, 400);
+        this.sql.exec('UPDATE fleet_launches SET state = ?, native_id = COALESCE(?, native_id), launcher_task_id = COALESCE(?, launcher_task_id), updated_at = ? WHERE id = ?', data.state, data.native_id || null, data.launcher_task_id || null, new Date(this.now()).toISOString(), row.id);
+        return response({ id: row.id, state: data.state });
+      });
+    }
+    return response({ error: 'not_found' }, 404);
+  }
+}

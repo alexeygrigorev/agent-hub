@@ -447,14 +447,14 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
   // Scenario 7: Initial and M2/M3 Backward Compatibility
   it('Scenario 7 (compatibility): worker healthz, DO healthz, registry and bus operate concurrently', async () => {
     // 1. Worker healthz
-    const resWorkerHealth = await doFetch(new Request('http://example.com/healthz'));
+    const resWorkerHealth = await doFetch(new Request('http://example.com/healthz', { headers: { Authorization: 'Bearer hubt_host_alpha' } }));
     expect(resWorkerHealth.status).toBe(200);
     const workerHealth = await resWorkerHealth.json() as any;
     expect(workerHealth.status).toBe('ok');
-    expect(workerHealth.component).toBe('worker');
+    expect(workerHealth.component).toBe('hub-do');
 
     // 2. Hub DO healthz
-    const resDoHealth = await doFetch(new Request('http://example.com/api/healthz'));
+    const resDoHealth = await doFetch(new Request('http://example.com/api/healthz', { headers: { Authorization: 'Bearer hubt_host_alpha' } }));
     expect(resDoHealth.status).toBe(200);
     const doHealth = await resDoHealth.json() as any;
     expect(doHealth.status).toBe('ok');

@@ -1,0 +1,96 @@
+# Agent Hub
+
+Agent Hub is a Cloudflare control plane for personal agent fleets. One Worker and one SQLite-backed Durable Object hold the registry, authenticated bus, schedules, launch intents and dashboard. Model processes run on enrolled machines through their existing native tools.
+
+The generic fleet endpoints and dashboard are a source increment. Installing a host configuration and verifying its admission adapter are separate from deploying the Worker. Unknown execution support produces a hold, not a simulated launch.
+
+## Start work
+
+```sh
+# Choose a machine and engine; headless is the default.
+hub start-agent --workspace project --prompt-file goal.txt --summary "Implement the parser" --key parser-001
+
+# Pin a headless agent to a machine. It will not fall back to another machine.
+hub start-agent --machine server --workspace project --prompt-file goal.txt --summary "Run the checks" --key checks-001
+
+# Create a real interactive terminal at an empty prompt.
+hub start-session --machine desktop --workspace project --summary "Interactive review" --key review-001
+
+# Preview placement without reserving capacity.
+hub plan-agent --workspace project --prompt-file goal.txt
+hub fleet
+```
+
+Supply `--parent HUB_LAUNCH_ID` when one hub agent spawns another. Every row records the authenticated requester, requester kind, parent ID (null for a root request), time, summary, machine, engine, profile, account label and mode. Requester identity comes from authentication; the caller cannot override it. Native session reports include workspace, tag, engine, profile and state, without copying commands, environments or transcripts.
+
+The dashboard at `/` requires an authenticated administrator. It shows machines and their subscriptions, shared account capacity, hub agents and parent relationships, registered agents and reported aplexer sessions. It refreshes every 30 seconds. A successful queue response means offered work, not started work.
+
+## Account registry
+
+Upload a JSON registry through the authenticated dashboard. Account labels identify shared provider capacity; they are not authentication tokens. A separate account uses a different label even when both accounts belong to the same service on one machine.
+
+```json
+{
+  "accounts": [
+    {"label":"shared-codex","provider":"codex","max_concurrency":1,"reserve_percent":15,"enabled":true},
+    {"label":"desktop-codex","provider":"codex","max_concurrency":1,"reserve_percent":15,"enabled":true}
+  ],
+  "routes": [
+    {"machine_id":"server","engine":"codex","account":"shared-codex","profile":null},
+    {"machine_id":"desktop","engine":"codex","account":"desktop-codex","profile":"personal"}
+  ]
+}
+```
+
+Use enrolled machine IDs. Registry replacement is refused while active launches hold capacity. Codex reserves at least 15%; Grok at least 5%. Placement combines fresh machine admission, resource floors, capabilities, measured load, pending work and conservative account headroom. A shared account's slots are counted across all machines. Expired, missing or contradictory observations fail closed.
+
+## Machine subscriptions
+
+Each machine owns `~/.config/agent-hub/subscriptions.json`, or `%APPDATA%\agent-hub\subscriptions.json` on Windows. It contains metadata and local command references. Keep provider credentials in the provider's native store.
+
+```json
+{
+  "version":1,
+  "workspaces":{"project":"/absolute/path/to/project"},
+  "subscriptions":[
+    {"service":"codex","account_label":"shared-codex","plan":"pro","engine":"codex","profile":null,"admission_argv":["/absolute/path/to/maintained-admission-adapter"]},
+    {"service":"codex","account_label":"second-codex","plan":null,"engine":"codex","profile":"secondary","quota_argv":["/absolute/path/to/secondary-quota-adapter"],"admission_argv":["/absolute/path/to/secondary-admission-adapter"]}
+  ]
+}
+```
+
+Labels and configured plans are explicit declarations. The default Claude tier can be detected through `claude auth status --json`. The default Codex tier can be detected through local app-server `account/read` with token refresh disabled. Neither probe copies email addresses, account IDs or tokens into reports. Other plans remain unknown unless their status adapter reports a recognized tier or the local configuration supplies one.
+
+Quota collection uses the existing `quse SERVICE --json` for an unambiguous default account. Multiple accounts or a non-default profile need a separate local `quota_argv`; default quota is never copied across them. The quota adapter returns the quse shape for that account. Collection whitelists booleans, remaining percentages and reset times and drops raw error bodies and credentials. Used allowance percentage is distinct from token usage or cost; unknown token usage stays unknown.
+
+```sh
+hub subscriptions --config /path/to/subscriptions.json
+hub subscriptions --config /path/to/subscriptions.json --report
+hub fleet-host --config /path/to/subscriptions.json --cycles 10 --interval 60
+```
+
+`fleet-host` is opt-in and bounded. It registers capabilities, reports heartbeats, subscriptions and native sessions, and polls its own offers. It installs no service or timer. Preserve existing supervisors until the replacement has completed physical host tests.
+
+## Host execution contract
+
+An admission adapter receives JSON on stdin with mode, engine, profile, account and workspace labels. It must run the maintained provider/resource checks and return `launch_allowed`, `profile_supported`, `account_label`, and a timezone-aware `observed_at`. The report must be no older than 30 seconds. No provider invocation or shell command comes from a hub request.
+
+Interactive work uses native `aplexer start`, a configured engine/profile, a 1500 MiB memory cap and a process limit. Its receipt must match the workspace and generated tag. Prompt injection into an existing terminal is not part of fleet launch.
+
+Headless work uses the maintained Quota Launcher. Configure a local `launcher` object with `argv`, `root` and `config_dir`, and per-subscription `launcher_provider` and `launcher_model`. The launcher's plan must prove the selected account label and profile, as well as provider and model. Older launcher plans without account attribution are held. No raw provider fallback is used. This is an outstanding integration requirement for launcher versions that lack those fields.
+
+Claim and effect ambiguity retain the server reservation. A starting or uncertain launch is never launched again automatically. Completion requires authenticated host reconciliation and confirmed native exit. The first increment reports running/uncertain receipts; automatic completion reconciliation remains a follow-up before unattended adoption.
+
+## Messaging adoption
+
+Use `hub send`, `hub inbox`, `hub reply`, `hub ack`, `hub accept`, and `hub complete` for the cross-host bus. Keep receipt, read ACK, task acceptance and completion separate. Deduplicate by durable ID and idempotency key. A host bridge maps registered native aplexer recipients without forging their identity. `hub bridge --once` runs a finite bridge cycle; verify host enrollment and the bridge's native binding first.
+
+Within a host, keep using `a message` and advisory `a work` scopes. Avoid SSH terminal typing for coordination. An inbox message does not wake a model by itself. Preserve busy prompts and human drafts; automatic wake-up and unattended cross-host execution require separate acceptance.
+
+## Migration and deployment
+
+The standalone repository is `alexeygrigorev/agent-hub`. Historical dashboard, Agent Bus, SSH coordination and role-failover sources remain available. Quota Launcher and aplexer remain execution dependencies during migration; deprecation of their old orchestration entry points does not authorize shutting them down.
+
+The existing DTC OIDC variables in `wrangler.jsonc` identify a deployment, not generic product defaults. Keep provider accounts, machine IDs, workspace paths and role mappings in local/admin configuration. Preserve Worker name `agent-hub`, DO class `Hub` and instance name `hub` when moving the domain. Renaming them can create a different data store.
+
+Deploy to `https://hub.dtcdev.click` after the DNS zone, Cloudflare access and OIDC callback are configured. Keep `assets.run_worker_first=true` so static assets cannot bypass authentication. See [DEPLOY.md](DEPLOY.md) for the exact domain cutover and rollback steps. Do not change the contest demo's deployment or storage.

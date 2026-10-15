@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent Hub</title><link rel="stylesheet" href="/fleet.css"><script src="/fleet.js" defer></script></head>
+<body>
+<header><h1>Agent Hub</h1><p>Machines, subscriptions, agents and terminal sessions</p><p id="status" role="status">Loading authenticated data…</p></header>
+<main>
+<section><h2>Account registry</h2><p>Upload a registry JSON with account labels and machine routes. Provider credentials and machine-local command configuration do not belong here.</p><form id="registry"><label>Registry JSON<input name="registry" type="file" accept="application/json,.json" required></label><button type="submit">Apply registry</button><p id="registry-result" role="status"></p></form></section>
+<section><h2>Start work</h2><form id="launch">
+<label>Mode<select name="mode"><option value="headless">Headless agent</option><option value="interactive">Interactive terminal session</option></select></label>
+<label>Machine<select name="machine" id="machines"><option value="">Choose automatically</option></select></label>
+<label>Engine<input name="engine" placeholder="Choose automatically"></label>
+<label>Workspace label<input name="workspace" required placeholder="A configured workspace"></label>
+<label>Task summary<input name="summary" maxlength="240" required></label>
+<label>Goal (headless only)<textarea name="prompt" maxlength="16000" rows="4"></textarea></label>
+<label>Parent hub agent ID (optional)<input name="parent_id"></label>
+<button type="submit">Start</button><p id="launch-result" role="status"></p>
+</form></section>
+<section><h2>Machines and subscriptions</h2><p>Shared account labels share capacity across machines. Unknown data is not zero usage.</p><div id="machine-view"></div></section>
+<section><h2>Hub agents and agent trees</h2><p>Every hub request, including headless agents outside aplexer. Offered work has not started; uncertain work requires reconciliation.</p><div id="hub-agents"></div></section>
+<section><h2>Live aplexer sessions</h2><p>Reported by each machine. Reports older than three minutes are stale.</p><div id="sessions"></div></section>
+<section><h2>Registered agents</h2><div id="registered-agents"></div></section>
+</main>
+</body></html>

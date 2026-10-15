@@ -122,6 +122,24 @@ def cmd_bridge(args):
 def main():
     parser = argparse.ArgumentParser(description="Agent Hub CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    for command in ('start-agent', 'start-session', 'plan-agent'):
+        launch = sub.add_parser(command, help='Queue a headless agent or a real interactive session')
+        launch.add_argument('--machine', required=command == 'start-session')
+        launch.add_argument('--engine')
+        launch.add_argument('--workspace', required=True, help='Configured workspace label on the selected host')
+        launch.add_argument('--prompt-file', help='UTF-8 goal file for headless work')
+        launch.add_argument('--summary', default='Agent task', help='Non-secret task summary shown on dashboard')
+        launch.add_argument('--parent', help='Parent hub launch id, omitted for a root request')
+        launch.add_argument('--key', help='Stable idempotency key for retries')
+    sub.add_parser('fleet', help='Authenticated machines, agents, sessions and account dashboard data')
+    subscriptions = sub.add_parser('subscriptions', help='Inspect safe machine subscription metadata')
+    subscriptions.add_argument('--config')
+    subscriptions.add_argument('--report', action='store_true', help='Post metadata to the hub using this host credential')
+    dispatch = sub.add_parser('fleet-host', help='Opt-in bounded host polling; no service is installed')
+    dispatch.add_argument('--config')
+    dispatch.add_argument('--cycles', type=int, default=1)
+    dispatch.add_argument('--interval', type=int, default=60)
     
     p_login = sub.add_parser("login", help="Login to Agent Hub")
     p_login.add_argument("base_url", help="Base URL of the Agent Hub")
@@ -209,7 +227,40 @@ def main():
 
     args = parser.parse_args()
     
-    if args.cmd == "login":
+    if args.cmd in ('start-agent', 'start-session', 'plan-agent', 'fleet', 'subscriptions', 'fleet-host'):
+        from . import fleet, bus
+        from pathlib import Path
+        import uuid
+        try:
+            if args.cmd == 'fleet':
+                result = bus._do_request('GET', '/api/fleet')
+            elif args.cmd in ('subscriptions', 'fleet-host'):
+                settings = fleet.load_settings(args.config)
+                if args.cmd == 'fleet-host':
+                    fleet.run_cycles(settings, args.cycles, args.interval)
+                    return
+                result = {'subscriptions': fleet.collect_subscriptions(settings)}
+                if args.report:
+                    bus._do_request('PUT', '/api/fleet/subscriptions', result)
+            else:
+                payload = {'mode': 'interactive' if args.cmd == 'start-session' else 'headless', 'workspace': args.workspace,
+                           'summary': args.summary, 'idempotency_key': args.key or str(uuid.uuid4())}
+                if args.machine: payload['machine'] = args.machine
+                if args.engine: payload['engine'] = args.engine
+                if args.parent: payload['parent_id'] = args.parent
+                if args.prompt_file:
+                    if args.cmd == 'start-session': raise ValueError('Interactive sessions start at an empty native prompt')
+                    with Path(args.prompt_file).open('r', encoding='utf-8') as source:
+                        prompt = source.read(16001)
+                    if len(prompt) > 16000: raise ValueError('Goal exceeds 16000 characters')
+                    payload['prompt'] = prompt
+                result = bus._do_request('POST', '/api/fleet/plan' if args.cmd == 'plan-agent' else '/api/fleet/launches', payload)
+            print(json.dumps(result, indent=2))
+        except Exception:
+            # Server/provider output may contain sensitive data; fail without echoing it.
+            print('Hub fleet operation failed; check authentication, local configuration and admission.', file=sys.stderr)
+            sys.exit(1)
+    elif args.cmd == "login":
         cmd_login(args)
     elif args.cmd == "machines":
         if args.m_cmd == "available":

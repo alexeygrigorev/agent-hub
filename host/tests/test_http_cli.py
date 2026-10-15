@@ -738,7 +738,7 @@ export default {{
                 "assets": {
                     "directory": os.path.join(cls.repo_root, "public"),
                     "binding": "ASSETS",
-                    "run_worker_first": False,
+                    "run_worker_first": True,
                     "routerConfig": {"has_user_worker": True}
                 }
             }
@@ -772,6 +772,10 @@ export default {{
                         if resp.status == 200:
                             ready = True
                             break
+                except urllib.error.HTTPError as error:
+                    if error.code == 401:
+                        ready = True
+                        break
                 except Exception:
                     pass
 

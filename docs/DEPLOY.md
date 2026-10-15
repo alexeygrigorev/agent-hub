@@ -1,5 +1,24 @@
 # Agent Hub Deploy Runbook
 
+## Domain cutover: hub.dtcdev.click
+
+Alexey authorized deployment of the standalone dashboard/API and the DNS/route changes on 15 October 2026. This authorization does not change the contest demo. The audit session found no usable Cloudflare token/login and could not resolve AWS credentials through the configured credential process. No cloud write was performed from that session. `dtcdev.click` currently delegates to AWS Route 53 nameservers; `hub.dtcdev.click` had no DNS answer.
+
+Execute these steps with the existing deployment account, without displaying credential values:
+
+1. Restore the existing Cloudflare authentication and DNS-account access. Run `wrangler whoami` and list the `dtcdev.click` zone to verify its status. Do not create a new account or buy a plan.
+2. Confirm that an active Cloudflare zone can serve `hub.dtcdev.click`. Workers Custom Domains require an active zone; a CNAME from Route 53 to `workers.dev` alone does not provide the hostname's TLS/routing configuration. If the zone is not active, prepare a complete existing-zone DNS inventory and a reviewed DNS migration/delegation appropriate to the existing plan. Preserve all DTC records. Do not assume that paid partial-zone setup is available.
+3. In `DataTalksClub/aws-infra/sandbox/auth/template.yaml`, append `https://hub.dtcdev.click/auth/callback` to the existing AgentHubClient callback URLs and `https://hub.dtcdev.click/` to its logout URLs. Preserve the localhost and workers.dev URLs during cutover. Update the matching `agent-hub` entry in `DataTalksClub/auth/config/clients.json`. Apply through that infrastructure's maintained deployment process.
+4. Verify the existing Worker secrets `SESSION_SECRET` and `HUB_ADMINS` are configured; list secret names only. Set missing values through existing secure provisioning, never Git, shell arguments, reports or screenshots. Admin identities must come from the existing owner configuration.
+5. Generate `.local/wrangler.hub-domain.json` from the repository's `wrangler.jsonc`, preserving Worker name `agent-hub`, binding `HUB`, class `Hub`, migration `v1` and the DO instance name `hub`. Set `main` and `assets.directory` to their absolute source paths because the generated configuration lives in `.local`. Keep `assets.binding=ASSETS` and `assets.run_worker_first=true`. Change `vars.AUTH_CALLBACK_URL` to `https://hub.dtcdev.click/auth/callback` and set `routes` to `[{"pattern":"hub.dtcdev.click","custom_domain":true}]`. Do not place secrets in this file.
+6. Run `npx --no-install wrangler deploy --dry-run --config .local/wrangler.hub-domain.json --outdir .local/buildout`. Review its bindings, migrations, route and cron behavior. The existing root, writer and supervision loops remain in custody until their separate acceptance and cutover.
+7. Run `npx --no-install wrangler deploy --config .local/wrangler.hub-domain.json`. Attach the Custom Domain only in the verified active zone. Cloudflare manages that hostname's DNS record and certificate; preserve unrelated DNS and Workers.
+8. Verify HTTPS, unauthenticated dashboard redirect, unauthenticated assets redirect and API 401/403. Check `/`, `/index.html`, `/fleet.html`, `/fleet.js`, `/fleet.css`, `/api/fleet`, `/healthz`, and `/api/healthz`. Sign in as a configured admin, verify the data and CSRF protection, and ensure a different DTC identity is denied. Pair one private host and test a private message before enabling general use.
+
+Public authentication bootstrap endpoints (login, callback and device pairing) are necessary to obtain credentials; they must not disclose dashboard, registry or agent data. The protected dashboard must not be published as a separate unguarded static site.
+
+Rollback: restore the prior standalone Worker deployment and callback configuration, and remove only the new hub hostname binding if required. Retain the DO and all messages, account labels, launch reservations and uncertain effects. Do not delete or recreate the data store, modify the contest demo or restart the retired Win35 root authority.
+
 This runbook describes the deployment process for Agent Hub to the Cloudflare Workers Free plan.
 No deploy, create, or login actions should be run without explicit root and Alexey approval.
 

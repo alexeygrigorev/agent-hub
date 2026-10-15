@@ -127,7 +127,7 @@ describe('M1 Focus: REVOKE', () => {
     let r5 = await doFetch(new Request('http://example.com/api/healthz', {
       headers: { 'Authorization': `Bearer ${targetAcc}` }
     }));
-    // well /api/healthz doesn't require auth. We use verifyBearerScope directly.
+    expect(r5.status).toBe(401);
     await runInDurableObject(stub, async (instance: Hub) => {
       const vbs = verifyBearerScope as any;
       expect(await vbs(instance.sql, 'Bearer ' + targetAcc, 'host')).toBeNull();

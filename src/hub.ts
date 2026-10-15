@@ -9,6 +9,7 @@ import { generateTokenPair, verifyBearerScope } from './auth/token';
 import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly, updateHeartbeat } from './registry';
 import { BusService, BUS_SCHEMA_SQL, CallerContext, generateUlid } from './bus';
 import { JobsService, JOBS_SCHEMA_SQL } from './jobs';
+import { FleetService } from './fleet';
 import { ensureRootScheduling, getRootScheduling, isRootSchedulingEnabled, setRootScheduling } from './root_scheduling';
 import { QuotaStore, handleQuotaRoutes } from './quota';
 
@@ -60,6 +61,7 @@ export class Hub extends DurableObject {
   public busService: BusService;
   public jobsService: JobsService;
   public quotaStore: QuotaStore;
+  public fleetService: FleetService;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -69,6 +71,8 @@ export class Hub extends DurableObject {
 
     const txSync = (this.ctx.storage as any).transactionSync ? (fn: any) => (this.ctx.storage as any).transactionSync(fn) : undefined;
     this.busService = new BusService(this.sql, txSync);
+    this.fleetService = new FleetService(this.sql, fn => this.ctx.storage.transactionSync(fn));
+    this.fleetService.init();
 
     const busForJobs = Object.create(this.busService);
     const runInTxn = (this.ctx.storage as any).transactionSync ? (fn: any) => (this.ctx.storage as any).transactionSync(fn) : (fn: any) => fn();
@@ -443,6 +447,14 @@ export class Hub extends DurableObject {
         return Response.json({ status: 'ok', server_time: nowIso, offers });
       }
 
+      if (path === '/api/fleet' || path.startsWith('/api/fleet/')) {
+        const auth = await this.authenticateBusRequest(request);
+        if (auth.caller?.isAdmin) {
+          const session = await getSession(this.env, request);
+          if (session) auth.caller.actor = 'human:' + session.sub;
+        }
+        return this.fleetService.handle(request, auth);
+      }
       const registryResponse = await handleRegistryRoutes(request, path, this.sql, this.ctx, this.env);
       if (registryResponse) return registryResponse;
       const busResponse = await this.handleBusRoutes(request, path);
@@ -452,6 +464,8 @@ export class Hub extends DurableObject {
       const quotaResponse = await handleQuotaRoutes(request, path, this.quotaStore, url);
       if (quotaResponse) return quotaResponse;
       if (path === '/api/healthz') {
+        const auth = await this.authenticateBusRequest(request);
+        if (auth.error) return auth.error;
         if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
         return Response.json({ status: 'ok', component: 'hub-do' });
       }
