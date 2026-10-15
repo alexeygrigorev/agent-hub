@@ -44,8 +44,32 @@ function render(data) {
   for (const m of data.machines) select.append(new Option(m.name || m.id, m.id));
   select.value = selected;
 }
+const PROBLEM = new Set(['stale', 'offline', 'stalled', 'stuck', 'uncertain', 'missing', 'fail', 'error']);
+function stateCell(state) { const span = document.createElement('span'); span.className = 'state ' + (PROBLEM.has(state) ? 'bad' : ['online', 'working'].includes(state) ? 'good' : 'neutral'); span.textContent = state; return span; }
+function richTable(columns, rows) {
+  const wrapper = table(columns, []); const body = wrapper.querySelector('tbody');
+  for (const row of rows) { const tr = document.createElement('tr'); for (const cell of row) { const td = document.createElement('td'); if (cell instanceof Node) td.append(cell); else td.textContent = cell ?? 'unknown'; tr.append(td); } body.append(tr); }
+  return wrapper;
+}
+const ago = s => s === null || s === undefined ? 'never' : s < 120 ? `${s}s ago` : s < 7200 ? `${Math.round(s / 60)}m ago` : `${Math.round(s / 3600)}h ago`;
+function renderWatch(live, checks) {
+  const open = live.alerts.filter(a => !a.resolved_at);
+  byId('alerts').replaceChildren(open.length ? richTable(['Subject', 'State', 'Detail', 'Opened', 'Notified'], open.map(a => [`${a.subject_kind} ${a.subject}`, stateCell(a.state), a.detail, a.opened_at, a.notify_error ? `no: ${a.notify_error}` : (a.notified_at || 'pending')])) : Object.assign(document.createElement('p'), { textContent: 'No open alerts.' }));
+  const order = { machine: 0, agent: 1, session: 2, launch: 3 };
+  const subjects = [...live.subjects].sort((a, b) => order[a.kind] - order[b.kind] || a.id.localeCompare(b.id));
+  byId('liveness').replaceChildren(richTable(['Kind', 'Subject', 'Machine', 'State', 'Last heartbeat / activity', 'Detail'], subjects.map(s => [s.kind, s.id, s.machine_id || '', stateCell(s.state), ago(s.age_s), s.detail])));
+  const runButton = name => { const b = document.createElement('button'); b.type = 'button'; b.textContent = 'Run now'; b.addEventListener('click', async () => { b.disabled = true; try { await api(`/api/checks/${encodeURIComponent(name)}/run`, 'POST', {}); await refresh(); } catch (e) { byId('checks-result').textContent = e.message; } finally { b.disabled = false; } }); return b; };
+  byId('checks').replaceChildren(richTable(['Check', 'Kind', 'Every', 'Action', 'Last run', 'Result', ''], checks.checks.map(c => [c.name + (c.enabled ? '' : ' (disabled)'), c.kind, `${Math.round(c.interval_s / 60)} min`, `${c.action.type}${c.action.on === 'always' ? ' (always)' : ' (on failure)'}${c.action.to ? ' → ' + c.action.to : ''}`, c.last_run_at || 'never', c.last_status ? stateCell(c.last_status) : 'not run', runButton(c.name)])));
+  const last = checks.runs.slice(0, 10);
+  if (last.length) byId('checks').append(richTable(['Recent run', 'Check', 'Result', 'Detail', 'Action'], last.map(r => [r.at, r.name, stateCell(r.status), r.detail, r.action || ''])));
+}
 async function refresh() {
-  try { const me = await api('/auth/me'); csrf = me.csrf_token; render(await api('/api/fleet')); byId('status').textContent = `Authenticated · updated ${new Date().toLocaleTimeString()}`; }
+  try {
+    const me = await api('/auth/me'); csrf = me.csrf_token;
+    const [fleet, live, checks] = await Promise.all([api('/api/fleet'), api('/api/liveness'), api('/api/checks')]);
+    render(fleet); renderWatch(live, checks);
+    byId('status').textContent = `Authenticated · updated ${new Date().toLocaleTimeString()}`;
+  }
   catch (e) { byId('status').textContent = e.message; }
 }
 byId('launch').addEventListener('submit', async event => {
@@ -64,6 +88,14 @@ byId('registry').addEventListener('submit', async event => {
   const button = form.querySelector('button'); button.disabled = true;
   try { await api('/api/fleet/accounts', 'PUT', JSON.parse(await file.text())); byId('registry-result').textContent = 'Account labels and routes saved.'; await refresh(); }
   catch (e) { byId('registry-result').textContent = e.message; }
+  finally { button.disabled = false; }
+});
+byId('checks-form').addEventListener('submit', async event => {
+  event.preventDefault(); const form = event.currentTarget; const file = form.elements.checks.files[0];
+  if (!file || file.size > 65536) { byId('checks-result').textContent = 'Choose a checks JSON under 64 KiB.'; return; }
+  const button = form.querySelector('button'); button.disabled = true;
+  try { await api('/api/checks', 'PUT', JSON.parse(await file.text())); byId('checks-result').textContent = 'Checks saved.'; await refresh(); }
+  catch (e) { byId('checks-result').textContent = e.message; }
   finally { button.disabled = false; }
 });
 refresh(); setInterval(refresh, 30000);

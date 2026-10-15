@@ -4,6 +4,9 @@
 <body>
 <header><h1>Agent Hub</h1><p>Machines, subscriptions, agents and terminal sessions</p><p id="status" role="status">Loading authenticated data…</p></header>
 <main>
+<section><h2>Alerts</h2><p>Opened when a machine, session, hub agent or check enters a problem state; resolved automatically on recovery.</p><div id="alerts"></div></section>
+<section><h2>Heartbeats and liveness</h2><p>Machines: online, stale, offline. Agents: working, idle, stalled (working with no terminal activity), or unknown when their machine is silent.</p><div id="liveness"></div></section>
+<section><h2>Scheduled checks</h2><p>Periodic checks that open alerts, message an inbox, or start an agent. Upload a JSON file of the form <code>{"checks": [...]}</code> to replace them.</p><div id="checks"></div><form id="checks-form"><label>Checks JSON<input name="checks" type="file" accept="application/json,.json" required></label><button type="submit">Replace checks</button><p id="checks-result" role="status"></p></form></section>
 <section><h2>Account registry</h2><p>Upload a registry JSON with account labels and machine routes. Provider credentials and machine-local command configuration do not belong here.</p><form id="registry"><label>Registry JSON<input name="registry" type="file" accept="application/json,.json" required></label><button type="submit">Apply registry</button><p id="registry-result" role="status"></p></form></section>
 <section><h2>Start work</h2><form id="launch">
 <label>Mode<select name="mode"><option value="headless">Headless agent</option><option value="interactive">Interactive terminal session</option></select></label>
