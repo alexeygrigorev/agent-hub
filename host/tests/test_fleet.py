@@ -159,6 +159,20 @@ class FleetTests(unittest.TestCase):
             self.assertEqual(result['observed_at'], timestamp)
             self.assertEqual(result['status'], 'unknown')
 
+    def test_explicit_provider_and_window_errors_never_become_healthy(self):
+        base = {'status': 'ok', 'details': {'limit_reached': False}, 'windows': {'weekly': {'percent_remaining': 80, 'reset_at': '2099-01-01T00:00:00Z'}}}
+        cases = [dict(base, stale=True), dict(base, error='MUST_NOT_LEAK'), dict(base, details={'limit_reached': False, 'stale': True}), dict(base, windows={**base['windows'], 'five_hour': {'error': 'unavailable'}})]
+        for route in cases:
+            result = fleet.quota_metadata({'codex': route}, 'codex')
+            self.assertEqual(result['status'], 'unknown')
+            self.assertNotIn('MUST_NOT_LEAK', json.dumps(result))
+
+    def test_many_failed_probes_do_not_close_later_probe_descriptors(self):
+        for _ in range(30):
+            with self.assertRaises(RuntimeError):
+                fleet.run_json([sys.executable, '-c', 'import sys;sys.stderr.write("x"*20000);print("{}")'], timeout=.03)
+            self.assertEqual(fleet.run_json([sys.executable, '-c', 'import json;print(json.dumps({"ok": True}))']), {'ok': True})
+
     def test_codex_plan_uses_only_readonly_account_metadata_and_closes_owned_process(self):
         proc = MagicMock()
         proc.stdout = io.StringIO(json.dumps({'id': 1, 'result': {}}) + '\n' + json.dumps({'id': 2, 'result': {'account': {'type': 'chatgpt', 'planType': 'pro', 'email': 'private@example.invalid', 'token': 'MUST_NOT_LEAK'}}}) + '\n')

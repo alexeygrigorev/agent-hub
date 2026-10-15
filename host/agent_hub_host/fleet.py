@@ -77,6 +77,8 @@ def run_json(argv, *, payload=None, cwd=None, timeout=30):
                 if target is not None: target.extend(chunk)
         except Exception:
             overflow.set()
+        finally:
+            stream.close()
     def write():
         try:
             if payload is not None: proc.stdin.write(json.dumps(payload).encode('utf-8'))
@@ -99,13 +101,9 @@ def run_json(argv, *, payload=None, cwd=None, timeout=30):
             raise RuntimeError('Local command failed or exceeded output limit')
     finally:
         if proc.poll() is None: proc.kill(); proc.wait(timeout=2)
-        # A descendant retaining a pipe must not make BufferedReader.close wait on its reader lock.
-        for thread, stream in zip(threads[:2], (proc.stdout, proc.stderr)):
-            if thread.is_alive():
-                try: os.close(stream.fileno())
-                except OSError: pass
-            else:
-                stream.close()
+        # Each reader owns and closes its stream after EOF. Closing its raw descriptor here
+        # races with BufferedReader cleanup and can close an unrelated later probe's descriptor.
+        for thread in threads: thread.join(timeout=1)
     try:
         value = json.loads(stdout)
     except Exception:
@@ -123,11 +121,14 @@ def quota_metadata(raw, service):
     details = route.get("details", {})
     if not isinstance(details, dict):
         details = {}
+    unavailable = route.get('stale') is True or details.get('stale') is True or route.get('error') not in (None, '')
     safe_details = {key: details.get(key) if isinstance(details.get(key), bool) else None for key in ("limit_reached", "has_grok_code_access", "stale")}
     windows = {}
     for key, win in list((route.get("windows") or {}).items())[:32] if isinstance(route.get("windows"), dict) else []:
         if not LABEL.fullmatch(key) or not isinstance(win, dict):
             continue
+        if win.get('error') not in (None, '') or win.get('stale') is True:
+            unavailable = True
         percent = win.get("percent_remaining")
         percent = float(percent) if type(percent) in (int, float) and math.isfinite(percent) and 0 <= percent <= 100 else None
         reset = win.get("reset_at")
@@ -146,6 +147,8 @@ def quota_metadata(raw, service):
         windows[key] = {"present": present, "percent_remaining": percent, "reset_at": reset, "rolling": win.get("rolling") is True}
     observed_at = route.get('observed_at') or details.get('observed_at')
     status = route.get('status') if route.get('status') in {'ok', 'error', 'unknown'} else 'unknown'
+    if unavailable:
+        status = 'unknown'
     if observed_at is None:
         observed_at = utcnow()
     else:
