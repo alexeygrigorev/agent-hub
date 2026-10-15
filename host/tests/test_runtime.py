@@ -50,6 +50,7 @@ class TestRuntime(unittest.TestCase):
         self.assertEqual(get_first_action_digest(str(f)), expected)
         self.assertEqual(get_first_action_digest(f), expected)
 
+    @unittest.skipUnless(os.path.isdir("/home/alexey/git/agent-quota-launcher/launcher"), "agent-quota-launcher checkout not available")
     def test_launcher_qualification_e537_detects_unsupported(self):
         # Point to the actual installed agent-quota-launcher on this host
         launcher_path = "/home/alexey/git/agent-quota-launcher"
