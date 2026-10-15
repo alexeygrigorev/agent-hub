@@ -1141,18 +1141,25 @@ export class Hub extends DurableObject {
   /** Deliver a newly opened alert to the configured inbox actors and optional webhook. */
   private async notifyAlert(alert: any) {
     const text = alertText(alert); const errors: string[] = [];
+    // Each target is delivered once; a retry only covers targets that have not succeeded yet.
+    const delivered = new Set(this.livenessService.deliveredTo(alert));
     const targets = typeof this.env.HUB_ALERT_TO === 'string' ? this.env.HUB_ALERT_TO.split(',').map(t => t.trim()).filter(Boolean) : [];
     for (const to of targets) {
-      try { this.busService.send({ isAdmin: true, actor: 'hub', kind: 'human' }, { senderActor: 'hub', toActor: to, kind: 'note', body: text, idempotencyKey: `alert-${alert.id}-${to}` }); }
-      catch (e: any) { errors.push(`${to}: ${String(e?.message || e).slice(0, 80)}`); }
-    }
-    if (typeof this.env.HUB_ALERT_WEBHOOK === 'string' && this.env.HUB_ALERT_WEBHOOK.startsWith('https://')) {
+      if (delivered.has('inbox:' + to)) continue;
       try {
-        const r = await fetch(this.env.HUB_ALERT_WEBHOOK, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, alert: { id: alert.id, subject_kind: alert.subject_kind, subject: alert.subject, state: alert.state, detail: alert.detail, opened_at: alert.opened_at } }), signal: AbortSignal.timeout(10000) });
-        if (!r.ok) errors.push(`webhook: HTTP ${r.status}`);
+        this.busService.send({ isAdmin: true, actor: 'hub', kind: 'human' }, { senderActor: 'hub', toActor: to, kind: 'note', body: text, idempotencyKey: `alert-${alert.id}-${to}-${Date.now()}` });
+        delivered.add('inbox:' + to);
+      } catch (e: any) { errors.push(`${to}: ${String(e?.message || e).slice(0, 80)}`); }
+    }
+    const webhook = typeof this.env.HUB_ALERT_WEBHOOK === 'string' && this.env.HUB_ALERT_WEBHOOK.startsWith('https://') ? this.env.HUB_ALERT_WEBHOOK : null;
+    if (webhook && !delivered.has('webhook')) {
+      try {
+        const r = await fetch(webhook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, alert: { id: alert.id, subject_kind: alert.subject_kind, subject: alert.subject, state: alert.state, detail: alert.detail, opened_at: alert.opened_at } }), signal: AbortSignal.timeout(10000) });
+        if (r.ok) delivered.add('webhook'); else errors.push(`webhook: HTTP ${r.status}`);
       } catch { errors.push('webhook: unreachable'); }
     }
-    this.livenessService.markNotified(alert.id, errors.length ? errors.join('; ') : (targets.length || this.env.HUB_ALERT_WEBHOOK ? null : 'no alert target configured'));
+    const anyTarget = targets.length > 0 || !!webhook;
+    this.livenessService.markNotified(alert.id, errors.length ? errors.join('; ') : (anyTarget ? null : 'no alert target configured'), [...delivered]);
   }
 
   /** Cron and manual entry point for scheduled checks. */

@@ -8,7 +8,7 @@ import { effectiveCheckin } from './registry';
 
 export const LIVENESS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS agent_heartbeats (actor TEXT PRIMARY KEY, machine_id TEXT, status TEXT NOT NULL, summary TEXT, at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS liveness_alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_kind TEXT NOT NULL, subject TEXT NOT NULL, state TEXT NOT NULL, detail TEXT NOT NULL, opened_at TEXT NOT NULL, resolved_at TEXT, notified_at TEXT, notify_error TEXT);
+CREATE TABLE IF NOT EXISTS liveness_alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_kind TEXT NOT NULL, subject TEXT NOT NULL, state TEXT NOT NULL, detail TEXT NOT NULL, opened_at TEXT NOT NULL, resolved_at TEXT, notified_at TEXT, notify_error TEXT, delivered_to TEXT NOT NULL DEFAULT '[]');
 CREATE INDEX IF NOT EXISTS liveness_alerts_open ON liveness_alerts (subject_kind, subject, resolved_at);
 `;
 
@@ -52,6 +52,8 @@ export class LivenessService {
 
   init() {
     for (const stmt of LIVENESS_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
+    const columns = this.sql.exec('PRAGMA table_info(liveness_alerts)').toArray().map((c: any) => c.name);
+    if (!columns.includes('delivered_to')) this.sql.exec("ALTER TABLE liveness_alerts ADD COLUMN delivered_to TEXT NOT NULL DEFAULT '[]'");
   }
 
   machineState(machine: any, now = this.now(), label: string = machine.id): Subject {
@@ -163,14 +165,22 @@ export class LivenessService {
     return this.sql.exec('INSERT INTO liveness_alerts (subject_kind, subject, state, detail, opened_at) VALUES (?, ?, ?, ?, ?) RETURNING *', kind, subject, problem.state, problem.detail, at).one();
   }
 
-  markNotified(id: number, error: string | null) {
-    this.sql.exec('UPDATE liveness_alerts SET notified_at = ?, notify_error = ? WHERE id = ?', new Date(this.now()).toISOString(), error, id);
+  /** Targets that already received this alert; a retry skips them. */
+  deliveredTo(alert: any): string[] {
+    try { const v = JSON.parse(alert.delivered_to || '[]'); return Array.isArray(v) ? v : []; } catch { return []; }
   }
 
-  /** Open alerts whose notification failed (or had no target) at least `retryAfterS` ago. */
+  markNotified(id: number, error: string | null, delivered: string[] = []) {
+    this.sql.exec('UPDATE liveness_alerts SET notified_at = ?, notify_error = ?, delivered_to = ? WHERE id = ?', new Date(this.now()).toISOString(), error, JSON.stringify(delivered), id);
+  }
+
+  /**
+   * Open alerts to (re)notify: delivery failed or had no target at least `retryAfterS` ago, or
+   * delivery was never attempted (for example the run was interrupted after the alert opened).
+   */
   undelivered(retryAfterS: number) {
     const cutoff = new Date(this.now() - retryAfterS * 1000).toISOString();
-    return this.sql.exec('SELECT * FROM liveness_alerts WHERE resolved_at IS NULL AND notify_error IS NOT NULL AND notified_at <= ? ORDER BY id LIMIT 20', cutoff).toArray();
+    return this.sql.exec('SELECT * FROM liveness_alerts WHERE resolved_at IS NULL AND ((notify_error IS NOT NULL AND notified_at <= ?) OR (notified_at IS NULL AND opened_at <= ?)) ORDER BY id LIMIT 20', cutoff, cutoff).toArray();
   }
 
   alerts(limit = 100) {

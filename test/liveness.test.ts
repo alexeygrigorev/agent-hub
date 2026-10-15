@@ -133,6 +133,35 @@ describe('stale alerts', () => {
     expect(live.undelivered(900)).toEqual([]);
   }));
 
+  it('retries an alert whose notification was never attempted', () => fixture((live, sql, clock) => {
+    machine(sql, 'hetzner', iso(300));
+    const [alert] = live.reconcileAlerts(live.evaluate().subjects);
+    expect(live.undelivered(900)).toEqual([]);
+    clock.t += 901000;
+    expect(live.undelivered(900).map((a: any) => a.id)).toEqual([alert.id]);
+  }));
+
+  it('delivers each target once and retries only the failed ones', async () => {
+    const bindings = env as unknown as Env;
+    const stub = bindings.HUB.get(bindings.HUB.idFromName('notify-' + crypto.randomUUID()));
+    await runInDurableObject(stub, async (hub: Hub) => {
+      hub.env = { ...hub.env, HUB_ALERT_TO: 'nobody-registered', HUB_ALERT_WEBHOOK: 'https://hooks.example/alert' } as Env;
+      const calls: string[] = []; const original = globalThis.fetch;
+      globalThis.fetch = (async (url: any) => { calls.push(String(url)); return new Response('ok'); }) as any;
+      try {
+        hub.sql.exec("INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, drained) VALUES ('m', 'm', 'm', ?, ?, 0)", new Date().toISOString(), new Date(Date.now() - 3600000).toISOString());
+        await hub.runChecks('liveness');
+        let [alert]: any[] = hub.livenessService.alerts();
+        expect(calls).toEqual(['https://hooks.example/alert']);
+        expect(alert.notify_error).toContain('nobody-registered');
+        expect(JSON.parse(alert.delivered_to)).toEqual(['webhook']);
+        hub.sql.exec('UPDATE liveness_alerts SET notified_at = ?', new Date(Date.now() - 3600000).toISOString());
+        await hub.runChecks('liveness');
+        expect(calls).toHaveLength(1);
+      } finally { globalThis.fetch = original; }
+    });
+  });
+
   it('accepts agent heartbeats only with the health:report scope', async () => {
     const bindings = env as unknown as Env;
     const stub = bindings.HUB.get(bindings.HUB.idFromName('heartbeat-scope-' + crypto.randomUUID()));
