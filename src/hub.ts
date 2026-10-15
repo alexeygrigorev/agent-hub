@@ -456,6 +456,7 @@ export class Hub extends DurableObject {
         return Response.json({ status: 'ok', server_time: nowIso, offers });
       }
 
+      if (path === '/api/agents' || path.startsWith('/api/agents/')) return this.handleAgentRegistry(request, path);
       if (path === '/api/heartbeat' || path === '/api/liveness' || path === '/api/checks' || path.startsWith('/api/checks/')) {
         return this.handleWatchRoutes(request, path);
       }
@@ -858,6 +859,10 @@ export class Hub extends DurableObject {
               }
             }
             this.sql.exec("UPDATE device_pairings SET status = 'approved', approved_by_sub = ?, granted_scopes = ?, machine_id = ? WHERE user_code = ?", session.sub, JSON.stringify(parsedGranted), machineId, userCode);
+            // A paired agent is addressable on the bus by its actor name; an existing entry is kept.
+            if (current.client_kind === 'agent' && typeof current.actor === 'string' && current.actor) {
+              this.sql.exec("INSERT INTO agents (tag, registered_at, imported_from) VALUES (?, ?, 'pairing') ON CONFLICT(tag) DO NOTHING", current.actor, new Date().toISOString());
+            }
             return Response.json({ status: 'approved', machine_id: machineId });
           });
         }
@@ -1095,6 +1100,37 @@ export class Hub extends DurableObject {
     if (diff !== 0) { this.tokenFailures.push(now); return page('That token was not accepted.', 401); }
     const cookie = await createSessionCookie(this.env, { sub: tokenAdminSubject(hash), email: TOKEN_ADMIN_EMAIL, isAdmin: true, csrfToken: randomString(32), exp: Math.floor(now / 1000) + 12 * 3600 });
     return new Response(null, { status: 303, headers: { ...headers, Location: next || '/', 'Set-Cookie': cookie } });
+  }
+
+  /**
+   * Admin registry of bus recipients. Paired agents register themselves on approval; use this for
+   * agents reached through a host bridge (for example an aplexer coordinator on a machine).
+   */
+  private async handleAgentRegistry(request: Request, path: string): Promise<Response> {
+    const auth = await this.authenticateBusRequest(request);
+    if (auth.error) return auth.error;
+    const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { 'Cache-Control': 'private, no-store' } });
+    if (!auth.caller?.isAdmin) return json({ error: 'forbidden' }, 403);
+    const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+    if (path === '/api/agents' && request.method === 'GET') return json({ agents: this.sql.exec('SELECT tag, project, role, machine_id, registered_at, imported_from FROM agents ORDER BY tag').toArray() });
+    if (path === '/api/agents' && request.method === 'POST') {
+      const b = await safeJson(request);
+      if (!b || Object.keys(b).some(k => !['tag', 'project', 'role', 'machine_id'].includes(k)) || typeof b.tag !== 'string' || !NAME.test(b.tag)) return json({ error: 'invalid_agent' }, 400);
+      for (const k of ['project', 'role', 'machine_id']) if (b[k] !== undefined && b[k] !== null && (typeof b[k] !== 'string' || !NAME.test(b[k]))) return json({ error: 'invalid_' + k }, 400);
+      if (typeof b.role === 'string' && /^root/i.test(b.role)) return json({ error: 'root_role_reserved' }, 400);
+      if (b.machine_id && !this.sql.exec('SELECT 1 FROM machines WHERE id = ?', b.machine_id).toArray().length) return json({ error: 'unknown_machine' }, 400);
+      if (this.sql.exec('SELECT 1 FROM agents WHERE tag = ?', b.tag).toArray().length) return json({ error: 'agent_exists' }, 409);
+      this.sql.exec("INSERT INTO agents (tag, project, role, machine_id, registered_at, imported_from) VALUES (?, ?, ?, ?, ?, 'admin')", b.tag, b.project ?? null, b.role ?? null, b.machine_id ?? null, new Date().toISOString());
+      return json({ status: 'registered', tag: b.tag }, 201);
+    }
+    const one = /^\/api\/agents\/([A-Za-z0-9][A-Za-z0-9._-]{0,63})$/.exec(path);
+    if (one && request.method === 'DELETE') {
+      await safeJson(request);
+      if (!this.sql.exec('SELECT 1 FROM agents WHERE tag = ?', one[1]).toArray().length) return json({ error: 'not_found' }, 404);
+      this.sql.exec('DELETE FROM agents WHERE tag = ?', one[1]);
+      return json({ status: 'removed', tag: one[1] });
+    }
+    return json({ error: 'not_found' }, 404);
   }
 
   /** Heartbeats, liveness, alerts and scheduled checks. */
