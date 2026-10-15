@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import api, auth, config
 from .guarded_root import GuardedRootBridge, IncumbentStatus, is_pid_alive, get_current_pid_namespace, WINDOW_SEC
+from . import root_dispatch as rd
 from .runtime import RuntimeManager, get_first_action_digest
 
 logger = logging.getLogger(__name__)
@@ -214,6 +215,9 @@ class JobDispatcher:
         self.runtime_mgr = runtime_mgr or RuntimeManager()
         self.clock = clock or time
         self.root_bridge = root_bridge or GuardedRootBridge(clock=self.clock)
+        if isinstance(self.runtime_mgr, RuntimeManager):
+            # Authenticated, same-origin Hub scheduling read for every new Root run.
+            self.runtime_mgr.bind_hub(self.base_url, lambda: self.token_provider(), self.host_id, self.clock)
 
         self.running_jobs: Dict[str, Dict[str, Any]] = {}
         self._renewal_failures: Dict[str, str] = {}
@@ -290,6 +294,7 @@ class JobDispatcher:
             is_mock = False
 
         # Gate check for root-run: qualification and read-only incumbent check
+        op_qualified = False
         if kind == "root-run":
             eligible, reason, report = self.runtime_mgr.can_process_root_run()
             if not eligible:
@@ -300,7 +305,13 @@ class JobDispatcher:
                     pass
                 return {"accepted": False, "reason": reason, "qualification": report}
 
-            if getattr(self.root_bridge, "is_canonical_state", False):
+            # Operational trusted dispatch: only when the runtime genuinely
+            # qualified the installed launcher/entrypoint (never for mocks).
+            op_qualified = (
+                report.get("operational_qualified") is True
+                and not is_mock
+            )
+            if getattr(self.root_bridge, "is_canonical_state", False) and not op_qualified:
                 skip_reason = "operational_root_receiver_unqualified: canonical_root_state_forbidden_while_unsupported"
                 try:
                     self.client.decline_job(self.base_url, job_id, self.host_id, token, skip_reason)
@@ -308,35 +319,52 @@ class JobDispatcher:
                     pass
                 return {"accepted": False, "reason": skip_reason}
 
-            # Check for corrupt state.json
-            is_valid, incumbent_state = self.root_bridge.is_state_valid()
-            if not is_valid:
-                skip_reason = "root_state_unknown"
-                try:
-                    self.client.decline_job(self.base_url, job_id, self.host_id, token, skip_reason)
-                except Exception:
-                    pass
-                return {"accepted": False, "reason": skip_reason}
+            if op_qualified:
+                # Script owns the canonical lock: read-only incumbent check with
+                # the script's own semantics. No lock is taken (a probe would
+                # make the timer's flock -n see a false busy holder). Unknown
+                # state (corrupt/unreadable/foreign namespace/ambiguous live
+                # identity) HOLDS: it is never treated as "no incumbent".
+                cfg = getattr(self.runtime_mgr, "config", None)
+                cst, _ = rd.canonical_incumbent_status(
+                    getattr(cfg, "canonical_state_dir", None), self.clock)
+                if cst in ("healthy", "starting", "unknown"):
+                    skip_reason = "root_state_unknown" if cst == "unknown" else "skip_healthy_incumbent"
+                    try:
+                        self.client.decline_job(self.base_url, job_id, self.host_id, token, skip_reason)
+                    except Exception:
+                        pass
+                    return {"accepted": False, "reason": skip_reason}
+            else:
+                # Check for corrupt state.json
+                is_valid, incumbent_state = self.root_bridge.is_state_valid()
+                if not is_valid:
+                    skip_reason = "root_state_unknown"
+                    try:
+                        self.client.decline_job(self.base_url, job_id, self.host_id, token, skip_reason)
+                    except Exception:
+                        pass
+                    return {"accepted": False, "reason": skip_reason}
 
-            lock_held = self.root_bridge.is_lock_held()
-            status, _ = self.root_bridge.inspect_incumbent(job_id, lock_held=lock_held)
-            if status in (IncumbentStatus.HEALTHY, IncumbentStatus.STARTING):
-                skip_reason = "skip_healthy_incumbent"
-                try:
-                    self.client.decline_job(self.base_url, job_id, self.host_id, token, skip_reason)
-                except Exception:
-                    pass
-                return {"accepted": False, "reason": skip_reason}
-            elif not lock_held and incumbent_state.get("status") is None and self.root_bridge.lock_path.exists():
-                skip_reason = "root_state_unknown"
-                try:
-                    self.client.decline_job(self.base_url, job_id, self.host_id, token, skip_reason)
-                except Exception:
-                    pass
-                return {"accepted": False, "reason": skip_reason}
+                lock_held = self.root_bridge.is_lock_held()
+                status, _ = self.root_bridge.inspect_incumbent(job_id, lock_held=lock_held)
+                if status in (IncumbentStatus.HEALTHY, IncumbentStatus.STARTING):
+                    skip_reason = "skip_healthy_incumbent"
+                    try:
+                        self.client.decline_job(self.base_url, job_id, self.host_id, token, skip_reason)
+                    except Exception:
+                        pass
+                    return {"accepted": False, "reason": skip_reason}
+                elif not lock_held and incumbent_state.get("status") is None and self.root_bridge.lock_path.exists():
+                    skip_reason = "root_state_unknown"
+                    try:
+                        self.client.decline_job(self.base_url, job_id, self.host_id, token, skip_reason)
+                    except Exception:
+                        pass
+                    return {"accepted": False, "reason": skip_reason}
 
             is_fixture = is_mock and (report.get("is_fixture_only") is True) and (report.get("operational_qualified") is False) and not getattr(self.root_bridge, "is_canonical_state", False)
-            if not is_fixture:
+            if not is_fixture and not op_qualified:
                 skip_reason = "operational_root_receiver_unqualified: real trusted receiver is not qualified (issue 59)"
                 try:
                     self.client.decline_job(self.base_url, job_id, self.host_id, token, skip_reason)
@@ -430,6 +458,7 @@ class JobDispatcher:
         job_info = {
             "job_id": job_id,
             "kind": kind,
+            "op_qualified": bool(kind == "root-run" and op_qualified),
             "job_token": job_token,
             "lease_epoch": lease_epoch,
             "deadline_at": deadline_at,
@@ -478,8 +507,10 @@ class JobDispatcher:
                 deadline_sec = 0.0
 
         acquired_root = False
+        script_owned = bool(job_info.get("op_qualified"))
+        op_qualified = script_owned
         native_session = f"session-{job_id}"
-        launcher_task_id = f"hub-{job_id}"
+        launcher_task_id = f"hub-root-{job_id}" if script_owned else f"hub-{job_id}"
         renew_thread: Optional[threading.Thread] = None
 
         def _finish_failed_with_bridge(fail_summary: str, initial_refs: Optional[List[str]] = None) -> None:
@@ -513,14 +544,20 @@ class JobDispatcher:
             )
 
         try:
-            if getattr(self.root_bridge, "is_canonical_state", False):
+            if getattr(self.root_bridge, "is_canonical_state", False) and not op_qualified:
                 self.client.finish_job(
                     self.base_url, job_id, job_token, lease_epoch,
                     "failed", "canonical_root_state_forbidden_while_unsupported", []
                 )
                 return
 
-            if kind == "root-run":
+            if kind == "root-run" and script_owned:
+                # Trusted dispatch mode: the CAG script owns the canonical
+                # root lock itself; the host never takes a second lock (the
+                # script's flock would deadlock).
+                self._run_script_owned_root(job_info, payload)
+                return
+            elif kind == "root-run":
                 if getattr(self.root_bridge, "_released", False) or stop_event.is_set():
                     return
                 # Acquire rootlock and bind native epoch with hub lease epoch
@@ -706,7 +743,7 @@ class JobDispatcher:
                 status = "failed"
                 summary = f"lease_renewal_failed: {self._renewal_failures.pop(job_id)}"
 
-            # Fencing check: never report succeeded if fenced in state.json or root bridge
+            # Fencing check: never report succeeded if fenced in the root bridge
             if acquired_root:
                 now_s = int(self.clock.time()) if hasattr(self.clock, "time") else int(time.time())
                 st_data = self.root_bridge.read_state()
@@ -763,6 +800,118 @@ class JobDispatcher:
                 self.root_bridge.release()
             with self._lock:
                 self.running_jobs.pop(job_id, None)
+
+    @staticmethod
+    def _deadline_seconds(deadline_at: Any) -> Optional[float]:
+        if deadline_at is None:
+            return None
+        try:
+            if isinstance(deadline_at, str):
+                return datetime.datetime.fromisoformat(deadline_at.replace("Z", "+00:00")).timestamp()
+            return float(deadline_at)
+        except Exception:
+            return 0.0
+
+    def _run_script_owned_root(self, job_info: Dict[str, Any], payload: Dict[str, Any]) -> None:
+        """Script-owned Root cycle (docs/ROOT-DISPATCH.md).
+
+        Order: live scheduling read -> launch the owned unit -> validated receipt of THIS run
+        -> scheduling re-read -> Hub start -> start acknowledgement to the script -> wait.
+        The Hub outcome comes from the run's own summary. Any host-side failure, lost lease
+        or deadline cancels and waits only the exact owned unit before reporting.
+        """
+        job_id = job_info["job_id"]
+        token = job_info["job_token"]
+        epoch = job_info["lease_epoch"]
+        stop_event = job_info["stop_event"]
+        deadline_sec = self._deadline_seconds(job_info.get("deadline_at"))
+
+        def finish(status: str, summary: str, refs: List[str]) -> None:
+            self.client.finish_job(self.base_url, job_id, token, epoch, status,
+                                   rd.scrub(summary, token), refs)
+
+        ok, why = self.runtime_mgr.check_scheduling(token)
+        if not ok:
+            finish("cancelled", f"not_started: {why}", [])
+            return
+        try:
+            run = self.runtime_mgr.begin_root_run(job_id, token, epoch, self.base_url, payload)
+        except Exception as e:
+            finish("failed", f"dispatch_refused: {e}", [])
+            return
+
+        renew_thread: Optional[threading.Thread] = None
+        try:
+            ev = run.wait_bootstrap(rd.BOOTSTRAP_TIMEOUT_SEC)
+            if ev is None:
+                cleanup = run.cleanup_after_exit()
+                out = run.outcome()
+                summary = out["summary"]
+                if cleanup is not None:
+                    summary = f"{summary}; cancel_verified={cleanup.get('verified')}"
+                finish(out["hub_status"], summary, out["evidence_refs"])
+                return
+
+            ok, why = self.runtime_mgr.check_scheduling(token)
+            if not ok:
+                info = run.cancel(f"scheduling: {why}")
+                finish("cancelled", f"scheduling_recheck_denied_before_start: {why}; cancel_verified={info.get('verified')}",
+                       [ev["path"]])
+                return
+
+            start_res = self.client.start_job(
+                self.base_url, job_id, token, epoch, ev["digest"],
+                f"root-{run.expected.run_id}", run.expected.task_id)
+            if start_res.get("error"):
+                info = run.cancel("hub_start_refused")
+                finish("failed", f"start_job failed: {start_res.get('error')}; cancel_verified={info.get('verified')}",
+                       [ev["path"]])
+                return
+            run.acknowledge_start(start_res)
+
+            renew_thread = threading.Thread(
+                target=self._renewal_loop, args=(job_id, token, epoch, stop_event),
+                name=f"renew-{job_id}", daemon=True)
+            renew_thread.start()
+
+            while not run.wait_done(1.0):
+                now = self.clock.time() if hasattr(self.clock, "time") else time.time()
+                if stop_event.is_set() or (deadline_sec is not None and now > deadline_sec):
+                    reason = "lease_lost" if stop_event.is_set() else "deadline_exceeded"
+                    info = run.cancel(reason)
+                    stop_event.set()
+                    finish("failed", f"{reason}: owned unit cancelled; cancel_verified={info.get('verified')}",
+                           [ev["path"]])
+                    return
+            stop_event.set()
+            # A launcher that raised, or ended without a verified clean exit, may leave the owned
+            # unit live: stop and live-verify that exact invocation before the outcome is reported.
+            cleanup = run.cleanup_after_exit()
+            out = run.outcome()
+            status, summary = out["hub_status"], out["summary"]
+            if cleanup is not None:
+                summary = f"{summary}; cancel_verified={cleanup.get('verified')}"
+            now = self.clock.time() if hasattr(self.clock, "time") else time.time()
+            if deadline_sec is not None and now > deadline_sec and status == "succeeded":
+                status, summary = "failed", "deadline_exceeded: job execution exceeded deadline_at"
+            if job_id in self._renewal_failures:
+                status = "failed"
+                summary = f"lease_renewal_failed: {self._renewal_failures.pop(job_id)}"
+            finish(status, summary, out["evidence_refs"])
+        except BaseException as e:  # noqa: BLE001 - reported to the Hub, never hidden
+            try:
+                info = run.cancel("host_failure")
+            except Exception as ce:  # noqa: BLE001
+                info = {"verified": False, "error": str(ce)}
+            logger.error("Script-owned Root run failed for %s: %s", job_id, rd.scrub(e, token))
+            try:
+                finish("failed", f"host_failure: {type(e).__name__}: {e}; cancel_verified={info.get('verified')}", [])
+            except Exception:
+                pass
+        finally:
+            stop_event.set()
+            if renew_thread is not None and renew_thread.is_alive():
+                renew_thread.join(timeout=2.0)
 
     def _renewal_loop(
         self,

@@ -1,7 +1,8 @@
 """Runtime manager and launcher capability qualification.
 
 Enforces strict launcher interface qualification for root runs and job execution:
-- Inspects maintained launcher interfaces (e537 commit, task profiles, per-job env, adapter routes).
+- Inspects maintained launcher interfaces (pinned commit, task profiles, the explicit parameters of
+  ``execute_transient_task_unit``, adapter routes) and the pinned CAG Root script.
 - Reports actual supported/unsupported/unknown status and required minimal dependency packet (issue59).
 - Hard fail-closed gate: if root-run is unsupported or Codex quota window is unavailable/<=15%,
   refuses before claim or processing. Never allows direct codex/API launch bypass.
@@ -10,6 +11,7 @@ Enforces strict launcher interface qualification for root runs and job execution
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -19,6 +21,9 @@ import subprocess
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
+
+from . import root_dispatch as rd
+from .root_dispatch import DispatchError
 
 CODEX_MIN_PERCENT: float = 15.0
 
@@ -129,13 +134,57 @@ def get_first_action_digest(
     return hashlib.sha256(content).hexdigest()
 
 
-class LauncherQualification:
-    """Inspects and qualifies the installed agent-quota-launcher interface."""
+# Adapter seams only tests inject: production RuntimeManager() passes none of them, so any one of
+# them present can never be operational (scheduling_check/quota_check are only defaulted by us).
+FIXTURE_SEAMS = ("launcher_executor", "proc_probe", "invocation_probe", "host_namespace", "unit_controller",
+                 "scheduling_check", "quota_check", "quse_provider", "clock", "launcher_repo")
 
-    def __init__(self, launcher_repo_path: Optional[str] = None):
+
+@contextlib.contextmanager
+def _inspected_launcher(path: pathlib.Path):
+    """Import ``launcher.*`` from exactly ``path``: cached modules of another checkout are
+    set aside so they cannot answer for it, and restored afterwards."""
+    with rd.LAUNCHER_IMPORT_LOCK:
+        saved = {k: v for k, v in sys.modules.items() if k == "launcher" or k.startswith("launcher.")}
+        for k in saved:
+            del sys.modules[k]
+        sys.path.insert(0, str(path))
+        try:
+            yield
+        finally:
+            try:
+                sys.path.remove(str(path))
+            except ValueError:
+                pass
+            for k in [k for k in sys.modules if k == "launcher" or k.startswith("launcher.")]:
+                del sys.modules[k]
+            sys.modules.update(saved)
+
+
+class LauncherQualification:
+    """Inspects and qualifies the installed agent-quota-launcher and CAG Root script."""
+
+    def __init__(
+        self,
+        launcher_repo_path: Optional[str] = None,
+        config: Optional[rd.TrustedRootConfig] = None,
+        cag_pins: Optional[frozenset] = None,
+        launcher_pins: Optional[frozenset] = None,
+    ):
         self.launcher_path = pathlib.Path(
             launcher_repo_path or os.path.expanduser("~/git/agent-quota-launcher")
         ).resolve()
+        self.config = config
+        self._cag_pins = cag_pins
+        self._launcher_pins = launcher_pins
+
+    @property
+    def cag_pins(self) -> frozenset:
+        return self._cag_pins if self._cag_pins is not None else rd.ACCEPTED_CAG_SCRIPT_SHA256
+
+    @property
+    def launcher_pins(self) -> frozenset:
+        return self._launcher_pins if self._launcher_pins is not None else rd.ACCEPTED_LAUNCHER_COMMITS
 
     def get_installed_sha(self) -> str:
         """Get git commit SHA of launcher repository if available."""
@@ -149,142 +198,172 @@ class LauncherQualification:
                 timeout=5.0,
                 check=True
             )
-            return res.stdout.strip()
+            sha = str(res.stdout).strip()
+            return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else "unknown"
         except Exception:
             return "unknown"
 
     def inspect_interfaces(self) -> Dict[str, Any]:
-        """Inspect launcher code interfaces for root profile and per-job env."""
+        """Inspect launcher code interfaces for the root profile, per-job env and pins."""
         report: Dict[str, Any] = {
             "launcher_repo": str(self.launcher_path),
             "installed_sha": self.get_installed_sha(),
             "root_profile_supported": False,
             "per_job_env_supported": False,
             "codex_adapter_supported": False,
+            "launcher_pin_accepted": False,
+            "cag_script_pin_accepted": False,
             "status": "UNKNOWN",
             "reasons": [],
             "dependency_packet": None
         }
 
-        # Check task profiles
         try:
-            sys_path_inserted = False
-            if str(self.launcher_path) not in sys.path:
-                sys.path.insert(0, str(self.launcher_path))
-                sys_path_inserted = True
-
-            try:
-                from launcher import task_profiles  # type: ignore
-                available_profiles = sorted(list(task_profiles.TASK_PROFILES.keys()))
-                report["available_profiles"] = available_profiles
-                if "root-run" in task_profiles.TASK_PROFILES:
-                    report["root_profile_supported"] = True
-                else:
-                    report["reasons"].append(
-                        f"root-run profile absent in launcher.task_profiles.TASK_PROFILES (available: {available_profiles})"
-                    )
-            except Exception as e:
-                report["reasons"].append(f"failed to import launcher.task_profiles: {e}")
-
-            # Check admission adapter routes
-            try:
-                from launcher import admission  # type: ignore
-                routes = getattr(admission, "ADAPTER_ROUTES", ())
-                report["adapter_routes"] = list(routes)
-                if "codex" in routes:
-                    report["codex_adapter_supported"] = True
-                else:
-                    report["reasons"].append(
-                        f"codex route absent from launcher.admission.ADAPTER_ROUTES (active: {list(routes)})"
-                    )
-            except Exception as e:
-                report["reasons"].append(f"failed to import launcher.admission: {e}")
-
-            # Check per-job env injection in cli / task_units
-            cli_py = self.launcher_path / "launcher" / "cli.py"
-            if cli_py.exists():
-                cli_content = cli_py.read_text(encoding="utf-8")
-                # Look for dynamic job env forwarding in spawn_ql_controller, excluding comments and docstrings
-                env_found = False
+            with _inspected_launcher(self.launcher_path):
                 try:
-                    import ast
-                    tree = ast.parse(cli_content)
-                    spawn_fn = None
-                    for node in ast.walk(tree):
-                        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "spawn_ql_controller":
-                            spawn_fn = node
-                            break
-                    if spawn_fn is not None:
-                        # 1. Parameter signature: require explicit job_env or env_file parameter (never generic 'env')
-                        for arg in spawn_fn.args.args + spawn_fn.args.kwonlyargs:
-                            if arg.arg in ("job_env", "env_file", "job_env_file"):
-                                env_found = True
-                                break
-                        # 2. Body inspection: require all three HUB_* keys in non-raise/non-docstring AST nodes
-                        if not env_found:
-                            found_hub_keys = set()
-                            for node in ast.walk(spawn_fn):
-                                if isinstance(node, ast.Raise):
-                                    continue
-                                if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
-                                    continue
-                                if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                                    targets = getattr(node, "targets", [getattr(node, "target", None)])
-                                    for target in targets:
-                                        if isinstance(target, ast.Subscript):
-                                            if isinstance(target.slice, ast.Constant) and target.slice.value in ("HUB_JOB_ID", "HUB_URL", "HUB_LEASE_EPOCH"):
-                                                found_hub_keys.add(target.slice.value)
-                                if isinstance(node, ast.Dict):
-                                    for k in node.keys:
-                                        if isinstance(k, ast.Constant) and k.value in ("HUB_JOB_ID", "HUB_URL", "HUB_LEASE_EPOCH"):
-                                            found_hub_keys.add(k.value)
-                            if {"HUB_JOB_ID", "HUB_URL", "HUB_LEASE_EPOCH"}.issubset(found_hub_keys):
-                                env_found = True
-                except Exception:
-                    env_found = False
+                    from launcher import task_profiles  # type: ignore
+                    available_profiles = sorted(list(task_profiles.TASK_PROFILES.keys()))
+                    report["available_profiles"] = available_profiles
+                    if rd.ROOT_PROFILE in task_profiles.TASK_PROFILES:
+                        report["root_profile_supported"] = True
+                    else:
+                        report["reasons"].append(
+                            f"root-run profile absent in launcher.task_profiles.TASK_PROFILES (available: {available_profiles})"
+                        )
+                except Exception as e:
+                    report["reasons"].append(f"failed to import launcher.task_profiles: {e}")
 
-                if env_found:
-                    report["per_job_env_supported"] = True
-                else:
-                    report["reasons"].append(
-                        "per-job environment propagation (HUB_URL, HUB_JOB_ID, HUB_LEASE_EPOCH) absent in spawn_ql_controller"
-                    )
+                try:
+                    from launcher import admission  # type: ignore
+                    routes = getattr(admission, "ADAPTER_ROUTES", ())
+                    report["adapter_routes"] = list(routes)
+                    if "codex" in routes:
+                        report["codex_adapter_supported"] = True
+                    else:
+                        report["reasons"].append(
+                            f"codex route absent from launcher.admission.ADAPTER_ROUTES (active: {list(routes)})"
+                        )
+                except Exception as e:
+                    report["reasons"].append(f"failed to import launcher.admission: {e}")
+
+            # The route the adapter really calls: explicit parameters of
+            # execute_transient_task_unit (AST of the source; docstrings/comments cannot count).
+            boundary = rd.inspect_launcher_exec_boundary(self.launcher_path)
+            report["exec_boundary"] = boundary
+            if boundary["present"] and not boundary["missing"]:
+                report["per_job_env_supported"] = True
             else:
-                report["reasons"].append(f"launcher/cli.py not found at {cli_py}")
-
-            if sys_path_inserted:
-                try:
-                    sys.path.remove(str(self.launcher_path))
-                except ValueError:
-                    pass
-
+                report["reasons"].append(
+                    "per-job environment/Root boundary absent in launcher.task_units.execute_transient_task_unit "
+                    f"(missing explicit parameters: {boundary['missing']})"
+                )
         except Exception as e:
             report["status"] = "UNKNOWN"
             report["reasons"].append(f"exception during interface inspection: {e}")
             return report
 
-        report["status"] = "UNSUPPORTED"
-        report["reasons"].append("Runtime Root execution remains UNSUPPORTED until launcher issue #59 qualification is complete.")
-        report["dependency_packet"] = {
-            "target_repo": "alexeygrigorev/agent-quota-launcher",
-            "issue_ref": "issue59",
-            "required_changes": [
-                {
-                    "component": "launcher.task_profiles",
-                    "change": "Define 'root-run' profile: timeout=1500.0, memory_mb=1500, description='Headless root run bounded cycle'"
-                },
-                {
-                    "component": "launcher.cli.spawn_ql_controller",
-                    "change": "Propagate per-job credentials and environment via secure mode 0600 job env file (never systemd-run -E or argv)"
-                },
-                {
-                    "component": "launcher.admission",
-                    "change": "Enable codex execution adapter route or support wrapped root execution with protected quota gate"
-                }
-            ]
-        }
+        # Pins: committed constants accepted by the head (empty until accepted).
+        if report["installed_sha"] != "unknown" and report["installed_sha"] in self.launcher_pins:
+            report["launcher_pin_accepted"] = True
+        else:
+            report["reasons"].append(
+                f"launcher_commit_not_pinned: {report['installed_sha']} (no accepted Quota Launcher Root commit pin)"
+            )
+
+        # Trusted configuration: the same absolute resolved paths the adapter uses.
+        entrypoint_status = "verified"
+        try:
+            cfg = self.config or rd.TrustedRootConfig.build()
+            entry = cfg.validated_entrypoint()
+            report["entrypoint"] = str(entry)
+            sha = rd.file_sha256(entry)
+            report["entrypoint_sha256"] = sha
+            if sha in self.cag_pins:
+                report["cag_script_pin_accepted"] = True
+            else:
+                report["reasons"].append(
+                    f"cag_script_not_pinned: sha256 {sha[:16]} (no accepted CAG Root script hook pin)"
+                )
+        except DispatchError as e:
+            entrypoint_status = f"unverified: {e}"
+            report["reasons"].append(f"root_entrypoint_unverified: {e}")
+        report["entrypoint_status"] = entrypoint_status
+        report["namespace_policy"] = (
+            "UNKNOWN until pinned: the trusted host PID namespace is additionally verified per run "
+            "from the receipt, state.json and live /proc"
+        )
+
+        root_route_supported = report.get("codex_adapter_supported", False) or (
+            "root-run" in report.get("adapter_routes", [])
+        )
+        if not root_route_supported:
+            report["reasons"].append(
+                "no root execution adapter route in launcher.admission.ADAPTER_ROUTES "
+                f"(active: {report.get('adapter_routes', [])}; needs codex route or root-run route)"
+            )
+
+        fully_supported = (
+            report.get("installed_sha") != "unknown"
+            and report.get("root_profile_supported") is True
+            and report.get("per_job_env_supported") is True
+            and root_route_supported
+            and entrypoint_status == "verified"
+            and report["launcher_pin_accepted"] is True
+            and report["cag_script_pin_accepted"] is True
+        )
+
+        report["dependency_packet"] = None
+        if fully_supported:
+            report["status"] = "SUPPORTED"
+        else:
+            report["status"] = "UNSUPPORTED"
+            report["dependency_packet"] = {
+                "target_repo": "alexeygrigorev/agent-quota-launcher",
+                "issue_ref": "issue59",
+                "required_changes": [
+                    {
+                        "component": "launcher.task_profiles",
+                        "change": "Define 'root-run' profile: timeout=1500.0, memory_mb=1500, description='Headless root run bounded cycle'"
+                    },
+                    {
+                        "component": "launcher.task_units.execute_transient_task_unit",
+                        "change": "Name explicit parameters profile and job_env (or job_env_file): per-job credentials via "
+                                  "a 0600 EnvironmentFile (never systemd-run -E or argv); trusted host PID namespace and "
+                                  "ReadWritePaths for the Root state dir under the root-run profile; receipt with "
+                                  "unit_name, invocation_id, exit_code, cleanup_verified"
+                    },
+                    {
+                        "component": "launcher.admission",
+                        "change": "Enable codex execution adapter route or a root-run route with protected quota gate"
+                    },
+                    {
+                        "component": "cloudflare-agent-git scripts/root/headless-root-run.sh",
+                        "change": "Honour HUB_* env: HUB_EXPECTED_RUN_ID as run id, bound state.json fields, first-action "
+                                  "receipt at HUB_FIRST_ACTION_FILE, wait for HUB_START_ACK_FILE, distinct skipped summary"
+                    },
+                    {
+                        "component": "agent-hub host pins",
+                        "change": "Add accepted launcher commit and CAG script sha256 to root_dispatch.ACCEPTED_*"
+                    },
+                ]
+            }
 
         return report
+
+
+def operational_root_profile_proof(
+    launcher_repo_path: Optional[str] = None,
+    qualification: Optional[LauncherQualification] = None,
+) -> Tuple[bool, str]:
+    """Genuine operational Root profile proof for gate.py: derived from the installed
+    launcher, the pinned CAG script and trusted paths. There is no caller-supplied input."""
+    try:
+        report = (qualification or LauncherQualification(launcher_repo_path)).inspect_interfaces()
+    except Exception as e:  # missing SDK / unreadable launcher => deny
+        return False, f"root_profile_unproven: {type(e).__name__}"
+    if report.get("status") == "SUPPORTED":
+        return True, "root_profile_proven"
+    return False, "root_profile_unproven: " + "; ".join(report.get("reasons", []))[:500]
 
 
 class RuntimeManager:
@@ -296,17 +375,57 @@ class RuntimeManager:
         quota_gate_script: Optional[str] = None,
         allow_mock_runner: bool = False,
         mock_runner: Optional[Any] = None,
+        config: Optional[rd.TrustedRootConfig] = None,
+        adapter_kwargs: Optional[Dict[str, Any]] = None,
     ):
-        self.qualification = LauncherQualification(launcher_repo_path)
+        self._config_error: Optional[str] = None
+        if config is None:
+            try:
+                config = rd.TrustedRootConfig.build()
+            except DispatchError as e:
+                self._config_error = str(e)
+        self.config = config
+        self.qualification = LauncherQualification(launcher_repo_path, config=config)
         self.quota_gate_script = pathlib.Path(
             quota_gate_script or os.path.expanduser("~/git/cloudflare-agent-git/scripts/quota-gate.py")
         ).resolve()
         self.allow_mock_runner = allow_mock_runner if type(allow_mock_runner) is bool else False
         self._mock_runner: Optional[Any] = mock_runner
+        self._adapter_kwargs: Dict[str, Any] = dict(adapter_kwargs or {})
+        self._scheduling: Optional[rd.HubSchedulingReader] = None
+        self._bound_clock_fixture = False
+        self.host_id: str = ""
 
     def set_mock_runner(self, runner: Any) -> None:
         """Configure mock runner for test isolation."""
         self._mock_runner = runner
+
+    def bind_hub(self, base_url: str, token_provider: Any, host_id: str, clock: Any = None) -> None:
+        """Bind the authenticated Hub scheduling read (same origin as the paired hub)."""
+        self.host_id = host_id
+        # A dispatcher may retain this clock after a later trusted binding. Once injected,
+        # this manager remains fixture-only; rebinding cannot restore operational authority.
+        self._bound_clock_fixture |= clock is not None and clock is not time
+        if self.config is None:
+            return
+        self._scheduling = rd.HubSchedulingReader(
+            base_url, token_provider, host_id=host_id, clock=clock,
+            cache=rd.SchedulingCache(self.config.host_state_dir),
+            canonical_state_dir=self.config.canonical_state_dir,
+        )
+
+    def check_scheduling(self, job_token: Optional[str] = None) -> Tuple[bool, str]:
+        """Live verified scheduling read. Unbound, missing, unreachable, stale or corrupt => deny."""
+        if self._scheduling is None:
+            return False, "scheduling_reader_unbound"
+        return self._scheduling.check(job_token)
+
+    def _quota_gate_present(self) -> bool:
+        """Check the CAG quota gate script exists and is readable."""
+        try:
+            return self.quota_gate_script.is_file() and os.access(self.quota_gate_script, os.R_OK)
+        except Exception:
+            return False
 
     def _has_qualified_mock_runner(self) -> bool:
         """Return True only when allow_mock_runner is strictly True and _mock_runner is a real callable (not MagicMock/Mock)."""
@@ -363,7 +482,7 @@ class RuntimeManager:
 
     def can_process_root_run(self) -> Tuple[bool, str, Dict[str, Any]]:
         """Validate all prerequisites before claiming or processing a root-run job.
-        
+
         Returns:
             Tuple of (eligible: bool, reason: str, qualification_report: dict)
         """
@@ -381,17 +500,61 @@ class RuntimeManager:
             }
             return True, "mock_runner_active", mock_report
 
+        if self._config_error:
+            report["operational_qualified"] = False
+            report["is_fixture_only"] = False
+            return False, f"operational_root_receiver_unqualified: {self._config_error}", report
+
         if report["status"] != "SUPPORTED":
             reason = f"launcher_unsupported: {'; '.join(report['reasons'])}"
             return False, reason, report
 
-        # Operational Root qualification:
-        # Real trusted receiver is NOT qualified until issue 59 is complete.
-        # Native Root must remain UNSUPPORTED before claim/start/effect.
+        if not self._quota_gate_present():
+            report["operational_qualified"] = False
+            report["is_fixture_only"] = False
+            reason = f"operational_root_receiver_unqualified: quota gate script missing or unreadable: {self.quota_gate_script}"
+            return False, reason, report
+
+        # Operational Root qualification: every concrete installed fact must
+        # verify before the trusted receiver is qualified. Any failure keeps
+        # Root forbidden before claim/start/effect (fail closed). An injected
+        # fixture executor can never be operational.
         report["operational_qualified"] = False
-        report["is_fixture_only"] = False
-        reason = "operational_root_receiver_unqualified: real trusted receiver is not qualified (issue 59)"
-        return False, reason, report
+        injected = sorted(k for k in FIXTURE_SEAMS if self._adapter_kwargs.get(k) is not None)
+        if self._bound_clock_fixture:
+            injected.append("bound_clock")
+        report["is_fixture_only"] = bool(injected)
+        if injected:
+            return False, f"operational_root_receiver_unqualified: fixture seams injected: {', '.join(injected)}", report
+        allowed, sched_reason = self.check_scheduling()
+        report["scheduling_status"] = sched_reason
+        if not allowed:
+            reason = f"operational_root_receiver_unqualified: {sched_reason}"
+            return False, reason, report
+        report["operational_qualified"] = True
+        return True, "operationally_qualified", report
+
+    def _make_adapter(self) -> rd.RootDispatchAdapter:
+        kwargs = dict(self._adapter_kwargs)
+        kwargs.setdefault("scheduling_check", self.check_scheduling)
+        kwargs.setdefault("quota_check", self.check_codex_window)
+        # Execution must use the checkout whose interfaces and pins were qualified.
+        kwargs["launcher_repo"] = str(self.qualification.launcher_path)
+        return rd.RootDispatchAdapter(config=self.config, **kwargs)
+
+    def begin_root_run(
+        self,
+        job_id: str,
+        job_token: str,
+        lease_epoch: int,
+        hub_url: str,
+        payload: Dict[str, Any],
+    ) -> rd.RootRun:
+        """Start one Root cycle for a claimed job (script-owned lock; see ROOT-DISPATCH.md)."""
+        eligible, reason, _ = self.can_process_root_run()
+        if not eligible:
+            raise RuntimeError(f"Refusing to execute root-run: {reason}. Direct codex/API bypass forbidden.")
+        return self._make_adapter().begin(job_id, job_token, lease_epoch, hub_url, self.host_id or "host")
 
     def execute_job(
         self,
@@ -400,7 +563,8 @@ class RuntimeManager:
         payload: Dict[str, Any],
         job_token: str,
         lease_epoch: int,
-        hub_url: str
+        hub_url: str,
+        start_callback: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Execute a claimed job using maintained launcher or test mock."""
         if self._has_qualified_mock_runner():
@@ -413,5 +577,16 @@ class RuntimeManager:
                 raise RuntimeError(
                     f"Refusing to execute root-run: {reason}. Direct codex/API bypass forbidden."
                 )
+            adapter = self._make_adapter()
+            return adapter.dispatch(
+                job_id=job_id,
+                job_token=job_token,
+                lease_epoch=lease_epoch,
+                hub_url=hub_url,
+                payload=payload,
+                workspace=None,
+                host_id=self.host_id or "host",
+                start_callback=start_callback,
+            )
 
         raise NotImplementedError("Real execution requires accepted launcher issue59 dependency packet.")

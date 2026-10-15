@@ -45,11 +45,19 @@ def get_gate_status(clock=None) -> dict:
         if "remaining" in reason or "%" in reason or "balance" in reason.lower() or "$" in reason:
             reason = "quota ok" if allowed else "quota low"
             
-        # Current quota-gate codex-only bool doesNOTprove actual executable profile
-        # launch_allowed and jobs capability must fail closed until maintained supported plan + resource proof
+        # The quota-gate bool is codex-only and does NOT prove an executable Root profile.
+        # launch_allowed stays denied (pending#59) unless the host's own genuine operational
+        # proof holds: installed launcher Root boundary, accepted pins, trusted entrypoint.
+        # The proof takes no caller input; a missing SDK or any exception denies.
         if allowed:
-            allowed = False
-            reason = "pending#59"
+            try:
+                from .runtime import operational_root_profile_proof
+                proven, _ = operational_root_profile_proof()
+            except Exception:
+                proven = False
+            if not proven:
+                allowed = False
+                reason = "pending#59"
             
         _gate_cache = {"launch_allowed": allowed, "reason": reason}
     except subprocess.TimeoutExpired:
