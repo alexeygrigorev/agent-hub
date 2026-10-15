@@ -10,6 +10,8 @@ import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCl
 import { BusService, BUS_SCHEMA_SQL, CallerContext, generateUlid } from './bus';
 import { JobsService, JOBS_SCHEMA_SQL } from './jobs';
 import { FleetService } from './fleet';
+import { LivenessService, thresholdsFrom, alertText } from './liveness';
+import { ChecksService, validateCheck } from './checks';
 import { ensureRootScheduling, getRootScheduling, isRootSchedulingEnabled, setRootScheduling } from './root_scheduling';
 import { QuotaStore, handleQuotaRoutes } from './quota';
 
@@ -62,6 +64,8 @@ export class Hub extends DurableObject {
   public jobsService: JobsService;
   public quotaStore: QuotaStore;
   public fleetService: FleetService;
+  public livenessService: LivenessService;
+  public checksService: ChecksService;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -73,6 +77,10 @@ export class Hub extends DurableObject {
     this.busService = new BusService(this.sql, txSync);
     this.fleetService = new FleetService(this.sql, fn => this.ctx.storage.transactionSync(fn));
     this.fleetService.init();
+    this.livenessService = new LivenessService(this.sql, thresholdsFrom(env));
+    this.livenessService.init();
+    this.checksService = new ChecksService(this.sql);
+    this.checksService.init();
 
     const busForJobs = Object.create(this.busService);
     const runInTxn = (this.ctx.storage as any).transactionSync ? (fn: any) => (this.ctx.storage as any).transactionSync(fn) : (fn: any) => fn();
@@ -447,6 +455,9 @@ export class Hub extends DurableObject {
         return Response.json({ status: 'ok', server_time: nowIso, offers });
       }
 
+      if (path === '/api/heartbeat' || path === '/api/liveness' || path === '/api/checks' || path.startsWith('/api/checks/')) {
+        return this.handleWatchRoutes(request, path);
+      }
       if (path === '/api/fleet' || path.startsWith('/api/fleet/')) {
         const auth = await this.authenticateBusRequest(request);
         if (auth.caller?.isAdmin) {
@@ -1047,6 +1058,82 @@ export class Hub extends DurableObject {
     } catch (e: any) {
       return Response.json({ error: 'Internal Server Error' }, { status: 500 });
     }
+  }
+
+  /** Heartbeats, liveness, alerts and scheduled checks. */
+  private async handleWatchRoutes(request: Request, path: string): Promise<Response> {
+    const auth = await this.authenticateBusRequest(request);
+    if (auth.error) return auth.error;
+    const caller = auth.caller!; const admin = !!caller.isAdmin;
+    const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { 'Cache-Control': 'private, no-store' } });
+    if (path === '/api/heartbeat') {
+      if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
+      // Agents report for themselves only; a host's heartbeat travels through /api/host/poll.
+      if (caller.kind !== 'agent' || !caller.actor) return json({ error: 'forbidden' }, 403);
+      const result = this.livenessService.recordHeartbeat(caller.actor, caller.machineId ?? null, await safeJson(request));
+      return 'error' in result ? json(result, 400) : json({ status: 'recorded' });
+    }
+    if (!admin) return json({ error: 'forbidden' }, 403);
+    if (path === '/api/liveness' && request.method === 'GET') {
+      const { thresholds, subjects } = this.livenessService.evaluate();
+      return json({ thresholds, subjects, alerts: this.livenessService.alerts() });
+    }
+    if (path === '/api/checks' && request.method === 'GET') return json({ checks: this.checksService.list(), runs: this.checksService.runs() });
+    if (path === '/api/checks' && request.method === 'PUT') {
+      const data = await safeJson(request);
+      if (!data || !Array.isArray(data.checks) || data.checks.length > 64 || Object.keys(data).some(k => k !== 'checks')) return json({ error: 'invalid_checks' }, 400);
+      const rows: any[] = []; const names = new Set<string>();
+      for (const c of data.checks) {
+        const v = validateCheck(c);
+        if ('error' in v) return json({ error: v.error, check: typeof c?.name === 'string' ? c.name.slice(0, 64) : null }, 400);
+        if (names.has(v.row.name)) return json({ error: 'duplicate_check', check: v.row.name }, 400);
+        names.add(v.row.name); rows.push(v.row);
+      }
+      this.ctx.storage.transactionSync(() => this.checksService.replace(rows));
+      return json({ status: 'configured', checks: this.checksService.list() });
+    }
+    const run = /^\/api\/checks\/([a-z0-9][a-z0-9_-]{0,63})\/run$/.exec(path);
+    if (run && request.method === 'POST') {
+      if (!this.checksService.list().some(c => c.name === run[1])) return json({ error: 'not_found' }, 404);
+      return json({ results: await this.runChecks(run[1]) });
+    }
+    return json({ error: 'not_found' }, 404);
+  }
+
+  /** Deliver a newly opened alert to the configured inbox actors and optional webhook. */
+  private async notifyAlert(alert: any) {
+    const text = alertText(alert); const errors: string[] = [];
+    const targets = typeof this.env.HUB_ALERT_TO === 'string' ? this.env.HUB_ALERT_TO.split(',').map(t => t.trim()).filter(Boolean) : [];
+    for (const to of targets) {
+      try { this.busService.send({ isAdmin: true, actor: 'hub', kind: 'human' }, { senderActor: 'hub', toActor: to, kind: 'note', body: text, idempotencyKey: `alert-${alert.id}-${to}` }); }
+      catch (e: any) { errors.push(`${to}: ${String(e?.message || e).slice(0, 80)}`); }
+    }
+    if (typeof this.env.HUB_ALERT_WEBHOOK === 'string' && this.env.HUB_ALERT_WEBHOOK.startsWith('https://')) {
+      try {
+        const r = await fetch(this.env.HUB_ALERT_WEBHOOK, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, alert: { id: alert.id, subject_kind: alert.subject_kind, subject: alert.subject, state: alert.state, detail: alert.detail, opened_at: alert.opened_at } }), signal: AbortSignal.timeout(10000) });
+        if (!r.ok) errors.push(`webhook: HTTP ${r.status}`);
+      } catch { errors.push('webhook: unreachable'); }
+    }
+    this.livenessService.markNotified(alert.id, errors.length ? errors.join('; ') : (targets.length || this.env.HUB_ALERT_WEBHOOK ? null : 'no alert target configured'));
+  }
+
+  /** Cron and manual entry point for scheduled checks. */
+  async runChecks(only?: string) {
+    this.livenessService.prune();
+    return this.checksService.runDue({
+      liveness: this.livenessService,
+      notify: alert => this.notifyAlert(alert),
+      message: async (to, body, key) => this.busService.send({ isAdmin: true, actor: 'hub', kind: 'human' }, { senderActor: 'hub', toActor: to, kind: 'note', body, idempotencyKey: 'check-' + key }).id,
+      launch: async (name, input, key) => {
+        const response = await this.fleetService.handle(new Request('https://hub.internal/api/fleet/launches', { method: 'POST', body: JSON.stringify({ ...input, idempotency_key: 'check-' + key }) }),
+          { caller: { isAdmin: true, actor: 'schedule:' + name, kind: 'schedule' as any }, scopes: ['admin'] });
+        const result: any = await response.json();
+        if (!response.ok) throw new Error(result.error || `launch refused (${response.status})`);
+        return `${result.id} ${result.state} on ${result.machine}`;
+      },
+      fetch: (url, init) => fetch(url, init),
+      evaluateQuota: () => this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray().map(a => this.fleetService.accountStatus(a)),
+    }, only);
   }
 
   async scheduledTick(slotOverride?: string) {

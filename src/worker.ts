@@ -44,6 +44,8 @@ export default {
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     const id = env.HUB.idFromName("hub");
     const stub = env.HUB.get(id);
-    await (stub as any).scheduledTick();
+    // The 30-minute cron keeps the existing root slot; every cron also runs due checks.
+    if (event.cron !== '*/5 * * * *') await (stub as any).scheduledTick();
+    await (stub as any).runChecks();
   }
 };
