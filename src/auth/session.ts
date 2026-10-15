@@ -5,6 +5,28 @@ export function configuredAdmins(env: Env): string[] {
   return typeof env.HUB_ADMINS === 'string' ? env.HUB_ADMINS.split(',').map(s => s.trim().toLowerCase()).filter(s => s && !s.includes('<')) : [];
 }
 
+/** Sessions created by the admin-token sign-in use this identity instead of an OIDC email. */
+export const TOKEN_ADMIN_EMAIL = 'admin-token@hub.local';
+
+/** SHA-256 hex of the admin sign-in token, or null when token sign-in is not configured. */
+export function adminTokenHash(env: Env): string | null {
+  const value = typeof env.HUB_ADMIN_TOKEN_SHA256 === 'string' ? env.HUB_ADMIN_TOKEN_SHA256.trim().toLowerCase() : '';
+  return /^[0-9a-f]{64}$/.test(value) ? value : null;
+}
+
+/** Token sessions are bound to the configured hash, so rotating the token ends them. */
+export function tokenAdminSubject(hash: string): string {
+  return 'admin-token:' + hash.slice(0, 16);
+}
+
+function sessionAdminAllowed(env: Env, data: SessionData): boolean {
+  if (data.email === TOKEN_ADMIN_EMAIL) {
+    const hash = adminTokenHash(env);
+    return !!hash && data.sub === tokenAdminSubject(hash);
+  }
+  return configuredAdmins(env).includes(data.email.toLowerCase());
+}
+
 export function validSessionSecret(env: Env): boolean {
   return typeof env.SESSION_SECRET === 'string' && env.SESSION_SECRET.length >= 32 && !env.SESSION_SECRET.includes('<');
 }
@@ -51,7 +73,7 @@ export async function getSession(env: Env, request: Request): Promise<SessionDat
   try {
     const payloadBytes = decodeBase64url(payload);
     const data = JSON.parse(new TextDecoder().decode(payloadBytes)) as SessionData;
-    if (typeof data.exp !== 'number' || !Number.isFinite(data.exp) || data.exp <= Math.floor(Date.now() / 1000) || typeof data.sub !== 'string' || !data.sub || typeof data.email !== 'string' || data.isAdmin !== true || typeof data.csrfToken !== 'string' || !data.csrfToken || !configuredAdmins(env).includes(data.email.toLowerCase())) {
+    if (typeof data.exp !== 'number' || !Number.isFinite(data.exp) || data.exp <= Math.floor(Date.now() / 1000) || typeof data.sub !== 'string' || !data.sub || typeof data.email !== 'string' || data.isAdmin !== true || typeof data.csrfToken !== 'string' || !data.csrfToken || !sessionAdminAllowed(env, data)) {
       return null;
     }
     return data;

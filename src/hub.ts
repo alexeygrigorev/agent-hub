@@ -3,7 +3,7 @@ import { SqlStorage } from "@cloudflare/workers-types";
 import { Env } from './env';
 import { SCHEMA_SQL } from './schema';
 import { JwksCache, validateIdToken, exchangeCode } from './auth/dtc';
-import { createSessionCookie, getSession, clearSessionCookie, createLoginCookie, getLoginCookie, clearLoginCookie, verifyCsrf, configuredAdmins, validSessionSecret } from './auth/session';
+import { createSessionCookie, getSession, clearSessionCookie, createLoginCookie, getLoginCookie, clearLoginCookie, verifyCsrf, configuredAdmins, validSessionSecret, adminTokenHash, tokenAdminSubject, TOKEN_ADMIN_EMAIL } from './auth/session';
 import { randomString, sha256, generateUserCode } from './auth/crypto';
 import { generateTokenPair, verifyBearerScope } from './auth/token';
 import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly, updateHeartbeat } from './registry';
@@ -417,6 +417,7 @@ export class Hub extends DurableObject {
     const path = url.pathname;
     
     try {
+      if (path === '/auth/token') return await this.tokenSignIn(request);
       if (path === '/api/host/poll') {
         if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
         const cred = await verifyBearerScope(this.sql, request.headers.get('Authorization'), 'host', { kind: 'host' });
@@ -483,6 +484,13 @@ export class Hub extends DurableObject {
 
       if (path === '/auth/login') {
         if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
+        // OIDC only works on the origin registered as the callback; elsewhere use token sign-in.
+        let oidcOrigin = ''; try { oidcOrigin = new URL(this.env.AUTH_CALLBACK_URL).origin; } catch {}
+        if (validSessionSecret(this.env) && adminTokenHash(this.env) && (configuredAdmins(this.env).length === 0 || oidcOrigin !== url.origin)) {
+          const next = url.searchParams.get('return_to');
+          const location = next && /^\/device\?code=[A-Za-z0-9-]{1,32}$/.test(next) ? '/auth/token?return_to=' + encodeURIComponent(next) : '/auth/token';
+          return new Response(null, { status: 303, headers: { Location: location, 'Cache-Control': 'private, no-store' } });
+        }
         if (!validSessionSecret(this.env) || configuredAdmins(this.env).length === 0) return Response.json({ error: 'authentication_not_configured' }, { status: 503 });
         const state = randomString(32);
         const nonce = randomString(32);
@@ -1058,6 +1066,35 @@ export class Hub extends DurableObject {
     } catch (e: any) {
       return Response.json({ error: 'Internal Server Error' }, { status: 500 });
     }
+  }
+
+  private tokenFailures: number[] = [];
+
+  /** Admin sign-in with a high-entropy token whose SHA-256 is a Worker secret. */
+  private async tokenSignIn(request: Request): Promise<Response> {
+    const headers = { 'Cache-Control': 'private, no-store', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'", 'X-Content-Type-Options': 'nosniff' };
+    const hash = adminTokenHash(this.env);
+    if (!hash || !validSessionSecret(this.env)) return Response.json({ error: 'authentication_not_configured' }, { status: 503, headers });
+    const safeNext = (value: string | null) => value && /^\/device\?code=[A-Za-z0-9-]{1,32}$/.test(value) ? value : null;
+    let next = safeNext(new URL(request.url).searchParams.get('return_to'));
+    const page = (message: string, status = 200) => new Response(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent Hub sign-in</title>
+<style>body{font-family:system-ui,sans-serif;background:#f3f5f6;color:#172735;margin:0}main{max-width:420px;margin:12vh auto;padding:24px;background:#fff;border:1px solid #d5dde1;border-radius:6px}input,button{font:inherit;padding:10px;width:100%;box-sizing:border-box;margin-top:8px}button{background:#164c65;color:#fff;border:0;border-radius:3px}p{color:#425b69}</style></head>
+<body><main><h1>Agent Hub</h1><p>${message}</p><form method="post" action="/auth/token"><input type="hidden" name="return_to" value="${next ? next.replace(/[^A-Za-z0-9\/?=-]/g, '') : ''}"><label>Admin token<input name="token" type="password" autocomplete="current-password" required></label><button type="submit">Sign in</button></form></main></body></html>`, { status, headers: { ...headers, 'Content-Type': 'text/html; charset=utf-8' } });
+    if (request.method === 'GET') return page('Sign in with the admin token kept on your machine.');
+    if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { ...headers, Allow: 'GET, POST' } });
+    const now = Date.now();
+    this.tokenFailures = this.tokenFailures.filter(t => now - t < 600000);
+    if (this.tokenFailures.length >= 10) return page('Too many failed attempts. Try again in ten minutes.', 429);
+    const raw = await request.text();
+    const fields = raw.length <= 4096 ? new URLSearchParams(raw) : new URLSearchParams();
+    const token = fields.get('token');
+    next = safeNext(fields.get('return_to')) ?? next;
+    const given = token ? [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token)))].map(b => b.toString(16).padStart(2, '0')).join('') : '';
+    let diff = given.length === hash.length ? 0 : 1;
+    for (let i = 0; i < hash.length; i++) diff |= (given.charCodeAt(i) || 0) ^ hash.charCodeAt(i);
+    if (diff !== 0) { this.tokenFailures.push(now); return page('That token was not accepted.', 401); }
+    const cookie = await createSessionCookie(this.env, { sub: tokenAdminSubject(hash), email: TOKEN_ADMIN_EMAIL, isAdmin: true, csrfToken: randomString(32), exp: Math.floor(now / 1000) + 12 * 3600 });
+    return new Response(null, { status: 303, headers: { ...headers, Location: next || '/', 'Set-Cookie': cookie } });
   }
 
   /** Heartbeats, liveness, alerts and scheduled checks. */
