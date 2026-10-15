@@ -135,6 +135,9 @@ def main():
         launch.add_argument('--parent', help='Parent hub launch id, omitted for a root request')
         launch.add_argument('--key', help='Stable idempotency key for retries')
     sub.add_parser('fleet', help='Authenticated machines, agents, sessions and account dashboard data')
+    heartbeat = sub.add_parser('heartbeat', help='Report that this agent is alive (agent credential with health:report)')
+    heartbeat.add_argument('--status', default='working', help='Short state word, for example working, idle or waiting')
+    heartbeat.add_argument('--summary', help='Non-secret one-line summary shown on the dashboard (max 240 chars)')
     subscriptions = sub.add_parser('subscriptions', help='Inspect safe machine subscription metadata')
     subscriptions.add_argument('--config')
     subscriptions.add_argument('--report', action='store_true', help='Post metadata to the hub using this host credential')
@@ -232,6 +235,16 @@ def main():
 
     args = parser.parse_args()
     
+    if args.cmd == 'heartbeat':
+        from . import bus
+        payload = {'status': args.status}
+        if args.summary: payload['summary'] = args.summary
+        try:
+            print(json.dumps(bus._do_request('POST', '/api/heartbeat', payload)))
+        except Exception:
+            print('Heartbeat failed; check the agent credential has the health:report scope.', file=sys.stderr)
+            sys.exit(1)
+        return
     if args.cmd in ('start-agent', 'start-session', 'plan-agent', 'fleet', 'subscriptions', 'fleet-host'):
         from . import fleet, bus
         from pathlib import Path

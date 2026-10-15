@@ -100,3 +100,25 @@ class TestCliIsolated(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHeartbeatCommand(unittest.TestCase):
+    def test_heartbeat_posts_status_and_summary_only(self):
+        from unittest.mock import patch
+        from agent_hub_host import cli, bus
+        calls = []
+        with patch.object(bus, '_do_request', side_effect=lambda m, p, b=None: calls.append((m, p, b)) or {'status': 'recorded'}), \
+             patch.object(sys, 'argv', ['hub', 'heartbeat', '--status', 'idle', '--summary', 'waiting for review']):
+            cli.main()
+        self.assertEqual(calls, [('POST', '/api/heartbeat', {'status': 'idle', 'summary': 'waiting for review'})])
+
+    def test_heartbeat_failure_does_not_echo_server_output(self):
+        from unittest.mock import patch
+        import io
+        from agent_hub_host import cli, bus
+        err = io.StringIO()
+        with patch.object(bus, '_do_request', side_effect=RuntimeError('MUST_NOT_LEAK')), \
+             patch.object(sys, 'argv', ['hub', 'heartbeat']), patch.object(sys, 'stderr', err):
+            with self.assertRaises(SystemExit):
+                cli.main()
+        self.assertNotIn('MUST_NOT_LEAK', err.getvalue())

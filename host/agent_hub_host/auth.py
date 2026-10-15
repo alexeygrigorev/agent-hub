@@ -11,7 +11,7 @@ from . import config
 from . import api
 
 HOST_SCOPES = ['host', 'bus:send', 'bus:read', 'health:report']
-AGENT_SCOPES = ['bus:send', 'bus:read']
+AGENT_SCOPES = ['bus:send', 'bus:read', 'health:report']
 
 
 def _shared_device_login():
