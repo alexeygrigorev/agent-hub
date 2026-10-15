@@ -962,14 +962,18 @@ def registered_bridge_targets(actors: Any, only_tags: list[str] | None = None) -
 
     `actors` is the hub's /api/bus/actors answer (agents on this host plus machine:<id>).
     `only_tags` narrows the set; a requested tag the hub does not register is refused, so the
-    bridge never polls or writes a mailbox it was not given.
+    bridge never polls or writes a mailbox it was not given. A selected native tag shared
+    by multiple qualified project addresses is refused before any bridge effects.
     """
     targets: dict[str, str] = {}
+    qualified: dict[str, set[str]] = {}
     for address in actors if isinstance(actors, list) else []:
         tag = native_tag_for_address(address)
         if not tag:
             continue
-        # Prefer the unambiguous project:tag inbox address when the hub lists both forms
+        if ":" in address:
+            qualified.setdefault(tag, set()).add(address)
+        # Prefer project:tag over its bare alias; reject cross-project collisions below.
         if tag not in targets or ":" in address:
             targets[tag] = address
     if only_tags is not None:
@@ -977,6 +981,9 @@ def registered_bridge_targets(actors: Any, only_tags: list[str] | None = None) -
         if unknown:
             raise BridgeCapabilityGap(f"Tags not registered on the hub for this credential: {', '.join(unknown)}")
         targets = {t: targets[t] for t in only_tags}
+    ambiguous = sorted(tag for tag in targets if len(qualified.get(tag, set())) > 1)
+    if ambiguous:
+        raise BridgeCapabilityGap(f"ambiguous native tags registered across projects: {', '.join(ambiguous)}")
     return sorted((address, tag) for tag, address in targets.items())
 
 

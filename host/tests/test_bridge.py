@@ -1739,6 +1739,21 @@ class TestBridgeAddressingAndComposer(unittest.TestCase):
             registered_bridge_targets(actors, ["agent-3"])
         self.assertEqual(registered_bridge_targets({"error": "x"}), [])
 
+    def test_registered_targets_aliases_duplicates_and_explicit_selection(self):
+        for actors in (["agent-1", "projA:agent-1", "projA:agent-1"],
+                       ["projA:agent-1", "agent-1", "agent-1"]):
+            self.assertEqual(registered_bridge_targets(actors), [("projA:agent-1", "agent-1")])
+        actors = ["projA:shared", "projB:shared", "shared", "projC:unique", "unique",
+                  "machine:m1", "role:principal", "bad:a:b", "bad:", None]
+        for selection in (None, ["shared"], ["shared", "unique"]):
+            with self.assertRaisesRegex(BridgeCapabilityGap, "ambiguous"):
+                registered_bridge_targets(actors, selection)
+        self.assertEqual(registered_bridge_targets(actors, ["unique"]), [("projC:unique", "unique")])
+        for unknown in ("unknown", "bad:a:b", "bad:", "machine:m1", "role:principal"):
+            with self.assertRaisesRegex(BridgeCapabilityGap, "not registered"):
+                registered_bridge_targets(actors, [unknown])
+
+
 
 class _FakeInbox:
     """bus.inbox with the hub's paging: rows ordered by id, only `id > cursor`, at most `limit`."""
@@ -2102,6 +2117,41 @@ else:
             return []
         with open(self.calls_log, encoding="utf-8") as f:
             return [json.loads(line) for line in f]
+
+    def test_cli_refuses_cross_project_native_tag_collision_before_any_effect(self):
+        for actors in (["projA:agent-1", "projB:agent-1"], ["projB:agent-1", "projA:agent-1"]):
+            for selection in ([], ["--tag", "agent-1"]):
+                with self.subTest(actors=actors, selection=selection):
+                    msg = {"id": "collision", "from_actor": "lead", "to_actor": actors[-1], "kind": "note", "body": "b"}
+                    receipt = os.path.join(self.work, ".local", "hub-bridge-receipts.json")
+                    os.makedirs(os.path.dirname(receipt), exist_ok=True)
+                    with open(receipt, "w") as f:
+                        json.dump({"hub_to_native": {}, "inbox_cursors": {}}, f)
+                    with open(receipt, "rb") as f:
+                        before = f.read()
+                    with _LoopbackHub(actors, [msg]) as hub:
+                        res = self._run_cli(hub.url, "--once", *selection)
+                        self.assertEqual(res.returncode, 2, res.stderr)
+                        self.assertIn("ambiguous", res.stderr)
+                        self.assertEqual([(m, p) for m, p, *_ in hub.requests], [("GET", "/api/bus/actors")])
+                        self.assertIsNone(hub.messages["collision"]["delivered_at"])
+                        self.assertIsNone(hub.messages["collision"]["acked_at"])
+                    self.assertEqual(self._fake_a_calls(), [])  # send, status, capture, log, deliver all absent
+                    with open(receipt, "rb") as f:
+                        self.assertEqual(f.read(), before)  # no inbox cursor or receipt write
+                    self.assertFalse(os.path.exists(os.path.join(self.work, ".local", "hub-bridge-receipts.lock")))
+
+    def test_cli_explicit_unique_tag_remains_usable_with_other_ambiguous_tags(self):
+        msg = {"id": "healthy", "from_actor": "lead", "to_actor": "projA:agent-1", "kind": "note", "body": "healthy"}
+        actors = ["projA:shared", "projB:shared", "agent-1", "projA:agent-1"]
+        with _LoopbackHub(actors, [msg]) as hub:
+            res = self._run_cli(hub.url, "--once", "--tag", "agent-1")
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(json.loads(res.stdout)["targets"], [{"address": "projA:agent-1", "tag": "agent-1"}])
+            inboxes = [p for m, p, *_ in hub.requests if p.startswith("/api/bus/inbox")]
+            self.assertTrue(inboxes)
+            self.assertTrue(all("shared" not in p for p in inboxes))
+            self.assertEqual(len([c for c in self._fake_a_calls() if c[:2] == ["message", "send"]]), 1)
 
     def test_cli_bridge_once_round_trip(self):
         msg = {"id": "hub-1", "from_actor": "projB:lead", "to_actor": "projA:agent-1", "kind": "note",
