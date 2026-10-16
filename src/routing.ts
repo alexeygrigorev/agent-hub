@@ -48,8 +48,9 @@ export class RoutingService {
       if (!['exited', 'failed'].includes(launch.state) && this.now() - Math.max(Date.parse(launch.updated_at), Date.parse(row.updated_at)) > 1800000) status = 'stuck';
     }
     const input = JSON.parse(row.request_json);
+    const access = input.access?.mode === 'read' || input.access?.mode === 'edit' || input.access?.mode === 'legacy_unspecified' ? input.access.mode : 'legacy_unspecified';
     return { id: row.id, status, queue_reason: status === 'queued' && !row.launch_id ? 'No fresh eligible capability/model route with quota and capacity.' : null, needs: input.needs, task_count: input.tasks.length, machine: launch?.machine_id ?? null,
-      runner: launch?.engine ?? null, tier: input.tier, selection: row.selection_json ? JSON.parse(row.selection_json) : null, launch_id: row.launch_id, report: redact(row.report), artifacts: [...JSON.parse(row.artifacts_json), ...this.sql.exec('SELECT name, media_type FROM routing_artifacts WHERE job_id = ?', row.id).toArray()], created_at: row.created_at, updated_at: row.updated_at };
+      runner: launch?.engine ?? null, tier: input.tier, access, selection: row.selection_json ? JSON.parse(row.selection_json) : null, launch_id: row.launch_id, report: redact(row.report), artifacts: [...JSON.parse(row.artifacts_json), ...this.sql.exec('SELECT name, media_type FROM routing_artifacts WHERE job_id = ?', row.id).toArray()], created_at: row.created_at, updated_at: row.updated_at };
   }
   /** Idempotent fleet requests preserve reservations even if the reply/link write is interrupted. */
   async dispatch(jobId?: string) {
@@ -65,6 +66,10 @@ export class RoutingService {
       const existing: any = this.sql.exec('SELECT id FROM fleet_launches WHERE actor = ? AND request_key = ?', row.actor, 'task-' + row.id).toArray()[0];
       if (existing) { this.sql.exec('UPDATE routing_jobs SET launch_id = ? WHERE id = ? AND launch_id IS NULL', existing.id, row.id); continue; }
       const input = JSON.parse(row.request_json); const candidates: any[] = [];
+      const parsed = this.fleet.admission.parseDeclaration(input.access);
+      if ('error' in parsed) continue;
+      const live = this.fleet.admission.evaluate({ kind: 'agent', actor: row.actor }, input.workspace, parsed.access, 'enqueue');
+      if (!live.ok) continue;
       for (const ad of this.sql.exec('SELECT * FROM routing_machines').toArray() as any[]) {
         const machine: any = this.sql.exec('SELECT * FROM machines WHERE id = ?', ad.machine_id).toArray()[0];
         const seen = Date.parse(effectiveCheckin(ad.machine_id, machine?.last_checkin_at) || '');
@@ -89,7 +94,7 @@ export class RoutingService {
       if (!candidates.length) continue;
       const c = candidates[0];
       this.sql.exec('UPDATE routing_jobs SET selection_json = ? WHERE id = ? AND launch_id IS NULL', JSON.stringify(c.model), row.id);
-      const response = await this.fleet.handle(new Request('https://hub.internal/api/fleet/launches', { method: 'POST', body: JSON.stringify({ workspace: input.workspace, machine: c.machine, engine: c.engine, account: c.account, prompt: c.prompt, idempotency_key: 'task-' + row.id }) }), { caller: { kind: 'agent', actor: row.actor }, scopes: ['fleet:launch'] });
+      const response = await this.fleet.handle(new Request('https://hub.internal/api/fleet/launches', { method: 'POST', body: JSON.stringify({ workspace: input.workspace, machine: c.machine, engine: c.engine, account: c.account, prompt: c.prompt, idempotency_key: 'task-' + row.id, access: parsed.access }) }), { caller: { kind: 'agent', actor: row.actor }, scopes: ['fleet:launch'] });
       if (response.ok) { const launched: any = await response.json(); this.sql.exec('UPDATE routing_jobs SET launch_id = ?, updated_at = ?, selection_json = ? WHERE id = ? AND launch_id IS NULL', launched.id, this.at(), JSON.stringify(c.model), row.id); }
     }
   }
@@ -136,18 +141,28 @@ export class RoutingService {
     if (path === '/api/tasks' && request.method === 'POST') {
       if (!admin && !client) return reply({ error: 'forbidden' }, 403);
       const input = await jsonBody(request);
-      if (!obj(input, ['prompt', 'approved_action', 'tasks', 'needs', 'preferred_runner', 'preferred_machine', 'workspace', 'idempotency_key', 'tier', 'model', 'difficulty']) || !label(input.idempotency_key) || !label(input.workspace ?? 'tasks') || (input.preferred_machine !== undefined && !label(input.preferred_machine)) || (input.preferred_runner !== undefined && !label(input.preferred_runner))) return reply({ error: 'invalid_task' }, 400);
+      if (!obj(input, ['prompt', 'approved_action', 'tasks', 'needs', 'preferred_runner', 'preferred_machine', 'workspace', 'idempotency_key', 'tier', 'model', 'difficulty', 'access']) || !label(input.idempotency_key) || !label(input.workspace ?? 'tasks') || (input.preferred_machine !== undefined && !label(input.preferred_machine)) || (input.preferred_runner !== undefined && !label(input.preferred_runner))) return reply({ error: 'invalid_task' }, 400);
       if (!taskTier(input) || (input.model !== undefined && !policy.models.some(m => [m.id, m.model].includes(input.model)))) return reply({ error: 'invalid_tier_or_model' }, 400);
       const needs = input.needs ?? [];
       const tasks = input.tasks ?? [{ prompt: input.prompt, approved_action: input.approved_action }];
       if ((input.tasks !== undefined && (input.prompt !== undefined || input.approved_action !== undefined)) || !Array.isArray(needs) || needs.length > 64 || needs.some((n: any) => typeof n !== 'string' || !CAP.test(n)) || !Array.isArray(tasks) || !tasks.length || tasks.length > 16 || tasks.some((t: any) => !obj(t, ['prompt', 'approved_action']) || typeof t.prompt !== 'string' || !t.prompt.trim() || typeof t.approved_action !== 'string' || !t.approved_action.trim()) || JSON.stringify(tasks).length > 12000) return reply({ error: 'invalid_task' }, 400);
+      const parsed = this.fleet.admission.parseDeclaration(input.access);
+      if ('error' in parsed) return reply({ error: parsed.error }, 400);
       // Exact action/prompt is retained privately for execution, never included in list/get responses.
-      const canonical = JSON.stringify({ workspace: input.workspace || 'tasks', tier: taskTier(input), model: input.model ?? null, needs: [...new Set(needs)].sort(), tasks, preferred_runner: input.preferred_runner ?? null, preferred_machine: input.preferred_machine ?? null });
-      const prior: any = this.sql.exec('SELECT * FROM routing_jobs WHERE actor = ? AND request_key = ?', actor, input.idempotency_key).toArray()[0];
-      if (prior) return prior.request_json === canonical ? reply(this.view(prior)) : reply({ error: 'idempotency_conflict' }, 409);
-      const id = crypto.randomUUID(); this.sql.exec('INSERT INTO routing_jobs (id, actor, request_key, request_json, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)', id, actor, input.idempotency_key, canonical, 'queued', this.at(), this.at());
-      await this.dispatch(id);
-      return reply(this.view(this.sql.exec('SELECT * FROM routing_jobs WHERE id = ?', id).one()), 201);
+      const workspace = input.workspace || 'tasks';
+      const canonical = JSON.stringify({ workspace, tier: taskTier(input), model: input.model ?? null, needs: [...new Set(needs)].sort(), tasks, preferred_runner: input.preferred_runner ?? null, preferred_machine: input.preferred_machine ?? null, access: parsed.access });
+      const inserted = this.transaction(() => {
+        const prior: any = this.sql.exec('SELECT * FROM routing_jobs WHERE actor = ? AND request_key = ?', actor, input.idempotency_key).toArray()[0];
+        if (prior) return { prior };
+        const admitted = this.fleet.admission.evaluate(caller, workspace, parsed.access, 'enqueue');
+        if (!admitted.ok) return { error: admitted.error, status: admitted.status };
+        const id = crypto.randomUUID(); this.sql.exec('INSERT INTO routing_jobs (id, actor, request_key, request_json, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)', id, actor, input.idempotency_key, canonical, 'queued', this.at(), this.at());
+        return { id };
+      });
+      if (inserted.prior) return inserted.prior.request_json === canonical ? reply(this.view(inserted.prior)) : reply({ error: 'idempotency_conflict' }, 409);
+      if (inserted.error) return reply({ error: inserted.error, access: parsed.access.mode }, inserted.status);
+      await this.dispatch(inserted.id);
+      return reply(this.view(this.sql.exec('SELECT * FROM routing_jobs WHERE id = ?', inserted.id).one()), 201);
     }
     if (path === '/api/tasks' && request.method === 'GET') {
       if (!admin && !client) return reply({ error: 'forbidden' }, 403);

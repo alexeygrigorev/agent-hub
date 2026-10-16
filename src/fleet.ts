@@ -1,6 +1,7 @@
 /** Generic account registry and placement. Provider credentials never enter this service. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { RoutingService } from './routing';
+import { ClaimAdmission } from './claim_admission';
 import { effectiveCheckin } from './registry';
 
 export const FLEET_SCHEMA = `
@@ -57,9 +58,14 @@ async function body(request: Request): Promise<any> {
 
 export class FleetService {
   public routing: RoutingService;
-  constructor(private sql: SqlStorage, private transaction: <T>(fn: () => T) => T, private now: () => number = Date.now) { this.routing = new RoutingService(sql, this, now, transaction); }
+  public admission: ClaimAdmission;
+  constructor(private sql: SqlStorage, private transaction: <T>(fn: () => T) => T, private now: () => number = Date.now) {
+    this.routing = new RoutingService(sql, this, now, transaction);
+    this.admission = new ClaimAdmission(sql, transaction, now);
+  }
   init() {
     this.routing.init();
+    this.admission.init();
     for (const stmt of FLEET_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
     const columns = this.sql.exec('PRAGMA table_info(fleet_sessions)').toArray().map((c: any) => c.name);
     if (!columns.includes('last_activity_at')) this.sql.exec('ALTER TABLE fleet_sessions ADD COLUMN last_activity_at TEXT');
@@ -111,7 +117,7 @@ export class FleetService {
   }
 
   plan(input: any) {
-    if (!object(input, ['mode', 'machine', 'engine', 'account', 'workspace', 'prompt', 'idempotency_key', 'parent_id', 'summary']) ||
+    if (!object(input, ['mode', 'machine', 'engine', 'account', 'workspace', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access']) ||
       !label(input.workspace) || (input.mode !== undefined && !['headless', 'interactive'].includes(input.mode)) ||
       (input.account !== undefined && !label(input.account)) || (input.machine !== undefined && !label(input.machine)) || (input.engine !== undefined && !label(input.engine)) ||
       (input.mode === 'interactive' && !input.machine) ||
@@ -167,6 +173,23 @@ export class FleetService {
         subscriptions: this.sql.exec('SELECT * FROM fleet_subscriptions ORDER BY machine_id, service, account').toArray().map((s: any) => ({ machine_id: s.machine_id, account: s.account, service: s.service, plan: s.plan, observed_at: s.observed_at, stale: !fresh(s.observed_at, this.now(), 1200000), quota: parsed(s.quota_json) })),
         launches: this.sql.exec('SELECT id, actor, requester_kind, parent_id, summary, machine_id, engine, profile, account, mode, workspace, state, native_id, launcher_task_id, created_at, updated_at FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray() });
     }
+    if (path === '/api/fleet/claim-policy' && request.method === 'GET') {
+      if (!admin) return response({ error: 'forbidden' }, 403);
+      return response({ workspaces: this.admission.listPolicy() });
+    }
+    if (path === '/api/fleet/claim-policy' && request.method === 'PUT') {
+      if (!admin) return response({ error: 'forbidden' }, 403);
+      const data = await body(request);
+      if (!object(data, ['workspaces']) || !Array.isArray(data.workspaces) || data.workspaces.length > 128) return response({ error: 'invalid_claim_policy' }, 400);
+      const names = new Set<string>();
+      const rows: { workspace: string; project: string | null; require_claim: boolean }[] = [];
+      for (const item of data.workspaces) {
+        if (!object(item, ['workspace', 'project', 'require_claim']) || !label(item.workspace) || (item.project !== null && !label(item.project)) || typeof item.require_claim !== 'boolean' || names.has(item.workspace)) return response({ error: 'invalid_claim_policy' }, 400);
+        names.add(item.workspace);
+        rows.push({ workspace: item.workspace, project: item.project, require_claim: item.require_claim });
+      }
+      return this.transaction(() => { this.admission.replacePolicy(rows); return response({ status: 'configured', workspaces: this.admission.listPolicy() }); });
+    }
     if (path === '/api/fleet/accounts' && request.method === 'PUT') {
       if (!admin) return response({ error: 'forbidden' }, 403);
       const data = await body(request);
@@ -197,21 +220,30 @@ export class FleetService {
       return this.transaction(() => {
         const plan = this.plan(input);
         if ('error' in plan) return response(plan, 400);
-        if (path.endsWith('/plan')) return response(plan);
+        const parsed = this.admission.parseDeclaration(input?.access);
+        if ('error' in parsed) return response({ error: parsed.error }, 400);
+        const bound = { ...plan.request, access: parsed.access };
+        if (path.endsWith('/plan')) {
+          const preview = this.admission.evaluate(caller, plan.request.workspace, parsed.access, 'enqueue');
+          if (!preview.ok) return response({ error: preview.error, access: parsed.access.mode }, preview.status);
+          return response({ ...plan, access: parsed.access.mode });
+        }
         if (!label(input.idempotency_key)) return response({ error: 'idempotency_key_required' }, 400);
-        const actor = caller.actor || caller.machineId || 'admin'; const canonical = JSON.stringify(plan.request);
+        const actor = caller.actor || caller.machineId || 'admin'; const canonical = JSON.stringify(bound);
         const prior: any = this.sql.exec('SELECT * FROM fleet_launches WHERE actor = ? AND request_key = ?', actor, input.idempotency_key).toArray()[0];
-        if (prior) return prior.request_json === canonical ? response({ id: prior.id, state: prior.state, machine: prior.machine_id, engine: prior.engine, account: prior.account, mode: prior.mode, replay: true }) : response({ error: 'idempotency_conflict' }, 409);
+        if (prior) return prior.request_json === canonical ? response({ id: prior.id, state: prior.state, machine: prior.machine_id, engine: prior.engine, account: prior.account, mode: prior.mode, access: JSON.parse(prior.request_json).access?.mode || 'legacy_unspecified', replay: true }) : response({ error: 'idempotency_conflict' }, 409);
         if (plan.request.parent_id) {
           const parent: any = this.sql.exec('SELECT actor, state FROM fleet_launches WHERE id = ?', plan.request.parent_id).toArray()[0];
           if (!parent) return response({ error: 'parent_not_found' }, 400);
           if (parent.actor !== actor) return response({ error: 'parent_not_owned' }, 403);
           if (!['starting', 'running'].includes(parent.state)) return response({ error: 'parent_not_active' }, 409);
         }
-        if (!plan.selected) return response({ error: 'no_eligible_route', rejected: plan.rejected }, 409);
+        const admitted = this.admission.evaluate(caller, plan.request.workspace, parsed.access, 'reserve');
+        if (!admitted.ok) return response({ error: admitted.error, access: parsed.access.mode }, admitted.status);
+        if (!plan.selected) return response({ error: 'no_eligible_route', rejected: plan.rejected, access: parsed.access.mode }, 409);
         const id = crypto.randomUUID(); const at = new Date(this.now()).toISOString(); const selected = plan.selected;
         this.sql.exec('INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', id, actor, caller.kind || 'unknown', plan.request.parent_id, plan.request.summary, input.idempotency_key, canonical, selected.machine, selected.engine, selected.account, selected.profile, plan.request.mode, plan.request.workspace, plan.request.prompt, 'offered', at, at);
-        return response({ id, state: 'offered', machine: selected.machine, engine: selected.engine, account: selected.account, mode: plan.request.mode }, 201);
+        return response({ id, state: 'offered', machine: selected.machine, engine: selected.engine, account: selected.account, mode: plan.request.mode, access: admitted.access.mode }, 201);
       });
     }
     if (path === '/api/fleet/offers' && request.method === 'GET') {
@@ -276,6 +308,13 @@ export class FleetService {
           if (!object(data, ['gate_allowed', 'observed_at', 'account', 'profile_supported']) || data.gate_allowed !== true || data.profile_supported !== true || data.account !== row.account || !fresh(data.observed_at, this.now(), 30000)) return response({ error: 'fresh_admission_required' }, 409);
           const account: any = this.sql.exec('SELECT * FROM fleet_accounts WHERE label = ?', row.account).toArray()[0];
           if (!account || this.accountStatus(account).status !== 'ok' || !this.observation(account, row)) return response({ error: 'account_unavailable' }, 409);
+          const bound = parsed(row.request_json);
+          const declared = this.admission.parseDeclaration(bound.access);
+          if ('error' in declared) return response({ error: 'claim_inactive', access: 'legacy_unspecified' }, 409);
+          if (declared.access.mode === 'edit') {
+            const admitted = this.admission.evaluate(caller, row.workspace, declared.access, 'start', { launchId: row.id });
+            if (!admitted.ok) return response({ error: admitted.error, access: declared.access.mode }, admitted.status);
+          }
           this.sql.exec("UPDATE fleet_launches SET state = 'starting', updated_at = ? WHERE id = ?", new Date(this.now()).toISOString(), row.id);
           return response({ ...row, state: 'starting' });
         }
