@@ -72,7 +72,7 @@ Single task body:
 
 For a batch replace `prompt` and `approved_action` with `tasks` (the array above). Optional fields: `preferred_runner`, `preferred_machine`, `tier`, `model`, `difficulty` (`hard`, `normal`, `concrete`). Unknown fields are rejected.
 
-Statuses: `queued`, `running`, `waiting-on-human`, `stuck`, `done`, `failed`. A placement/launch offer still counts as queued until there is a verified running receipt. Uncertain effects and starts without updates for 30 minutes appear stuck and retain capacity. Captcha/passkey is a human wait, never an automatic retry. `done`/`failed` require confirmed process exit. Completion webhooks are not enabled; poll the API or CLI.
+Statuses: `queued`, `running`, `waiting-on-human`, `stuck`, `done`, `failed`. New submissions are considered immediately; host polls scan older queued jobs in bounded rotating batches, so unavailable capabilities cannot block ready jobs behind them. A placement/launch offer still counts as queued until there is a verified running receipt. Uncertain effects and starts without updates for 30 minutes appear stuck and retain capacity. Captcha/passkey is a human wait, never an automatic retry. `done`/`failed` require confirmed process exit. Completion webhooks are not enabled; poll the API or CLI.
 
 Host result body:
 

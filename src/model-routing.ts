@@ -1,6 +1,7 @@
 import policy from '../config/model-routing.json';
 export { policy };
 export function taskTier(input: any): string | null {
+  if ((input.tier !== undefined && typeof input.tier !== 'string') || (input.difficulty !== undefined && (typeof input.difficulty !== 'string' || !Object.hasOwn(policy.rules.difficulty_tiers, input.difficulty)))) return null;
   const explicitModel = policy.models.find(m => [m.id, m.model].includes(input.model));
   const inferred = explicitModel ? Object.entries(policy.tiers).find(([, ids]) => ids.includes(explicitModel.id))?.[0] : null;
   const value = input.tier ?? inferred ?? (input.difficulty ? (policy.rules.difficulty_tiers as any)[input.difficulty] : policy.default_tier);

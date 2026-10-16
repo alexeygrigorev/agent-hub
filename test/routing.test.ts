@@ -213,3 +213,30 @@ describe('atomic final reports', () => {
     sql.exec('DROP TRIGGER fail_report');
   }));
 });
+
+describe('fair queue scanning and self-contained capability context', () => {
+  function backlog(sql: any) {
+    for (let i = 1; i <= 21; i++) {
+      const id = '00000000-0000-0000-0000-' + i.toString(16).padStart(12, '0');
+      sql.exec('INSERT INTO routing_jobs (id,actor,request_key,request_json,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?)', id, 'client-a', 'backlog-' + i, JSON.stringify({workspace:'tasks',tier:'daily',model:null,needs:['unavailable'],tasks:[{prompt:'Read only',approved_action:'Read only'}],preferred_runner:null,preferred_machine:null}), 'queued', at(-1000), at(-1000));
+    }
+  }
+  it('does not put a new eligible job behind twenty unavailable jobs', () => fixture(async (r, f, sql) => {
+    backlog(sql);
+    const job: any = await (await r.handle(req('/api/tasks', input({needs:['browser:orin','phone-sms']})), client())).json();
+    expect(job.machine).toBe('win35');
+    const prompt = sql.exec('SELECT prompt FROM fleet_launches WHERE id = ?',job.launch_id).one().prompt;
+    expect(prompt).toContain('Required capabilities and profiles: browser:orin, phone-sms');
+  }));
+  it('rotates the scan cursor so already-queued ready work cannot starve', () => fixture(async (r, f, sql) => {
+    backlog(sql); const id = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+    sql.exec('INSERT INTO routing_jobs (id,actor,request_key,request_json,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?)', id, 'client-a', 'ready', JSON.stringify({workspace:'tasks',tier:'daily',model:null,needs:[],tasks:[{prompt:'Read only',approved_action:'Read only'}],preferred_runner:null,preferred_machine:null}), 'queued', at(), at());
+    await r.dispatch(); expect(sql.exec('SELECT launch_id FROM routing_jobs WHERE id = ?', id).one().launch_id).toBeNull();
+    await r.dispatch(); expect(sql.exec('SELECT launch_id FROM routing_jobs WHERE id = ?', id).one().launch_id).toBeTruthy();
+  }));
+  it('rejects coerced tier/difficulty types and redacts prefixed secrets and non-HTTP auth URIs', () => fixture(async (r) => {
+    for (const data of [input({tier:['daily']}),input({difficulty:['normal']})]) expect((await r.handle(req('/api/tasks', data),client())).status).toBe(400);
+    const safe = redact('{"access_token":"short-access","clientSecret":"secret phrase","auth":"otpauth://totp/private?secret=ABC"}');
+    expect(safe).not.toContain('short-access'); expect(safe).not.toContain('secret phrase'); expect(safe).not.toContain('otpauth:');
+  }));
+});
