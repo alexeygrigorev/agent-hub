@@ -18,7 +18,7 @@ async function fixture(fn: (r: RoutingService, f: FleetService, sql: any) => Pro
   const stub = bindings.HUB.get(bindings.HUB.idFromName('routing-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
     const f = new FleetService(hub.sql, cb => state.storage.transactionSync(cb), () => now); f.init();
-    const r = new RoutingService(hub.sql, f, () => now); r.init();
+    const r = new RoutingService(hub.sql, f, () => now, cb => state.storage.transactionSync(cb)); r.init();
     const sql = hub.sql;
     for (const machine of ['hetzner', 'win35']) {
       sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?)', machine, machine, machine, at(), at(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: at() } }), JSON.stringify({ engines: ['zcodex'], fleet_modes: ['headless'], workspaces: ['tasks'], cpu_count: 8 }));
@@ -160,5 +160,56 @@ describe('routing recovery, capacity and private artifacts', () => {
     const artifact: any = await (await r.handle(req(path + '/screenshot'), client())).json(); expect(artifact.data_base64).toBe(image.data_base64);
     const listed: any = await (await r.handle(req('/api/tasks/' + job.id), client())).json();
     expect(listed.artifacts).toContainEqual({name:'screenshot',media_type:'image/png'}); expect(JSON.stringify(listed)).not.toContain(image.data_base64);
+  }));
+});
+
+describe('account pinning and existing native occupancy', () => {
+  it('pins the eligible model account when a richer account on the same runner is unsupported', () => fixture(async (r, f, sql) => {
+    sql.exec("INSERT INTO fleet_accounts VALUES ('richer-unsupported', 'zai', 3, 0, 1)");
+    sql.exec("INSERT INTO fleet_routes VALUES ('hetzner', 'zcodex', 'richer-unsupported', NULL)");
+    const richer = { ...quota, windows: { weekly: { present: true, percent_remaining: 95, reset_at: at(86400000) } } };
+    sql.exec("INSERT INTO fleet_subscriptions VALUES ('hetzner', 'richer-unsupported', 'zai', NULL, ?, ?)", at(), JSON.stringify(richer));
+    const job: any = await (await r.handle(req('/api/tasks', input({ preferred_machine:'hetzner' })), client())).json();
+    const launch = sql.exec('SELECT account FROM fleet_launches WHERE id = ?', job.launch_id).one();
+    expect(launch.account).toBe('shared-zai');
+  }));
+  it('counts existing unmanaged sessions against machine and account capacity', () => fixture(async (r, f, sql) => {
+    sql.exec("UPDATE routing_machines SET max_agents = 1 WHERE machine_id = 'hetzner'");
+    sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account) VALUES ('hetzner','existing','existing','zcodex','running',?,'tasks','shared-zai')", at());
+    const job: any = await (await r.handle(req('/api/tasks', input()), client())).json();
+    expect(job.machine).toBe('win35');
+    const account = f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-zai'").one());
+    expect(account.active).toBe(2);
+    sql.exec('UPDATE fleet_launches SET native_id = ? WHERE id = ?', 'existing', job.launch_id);
+    sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account) VALUES ('win35','existing','linked','zcodex','running',?,'tasks','shared-zai')", at());
+    // The linked session deduplicates on win35; hetzner's independent native process still counts.
+    expect(f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-zai'").one()).active).toBe(2);
+  }));
+});
+
+describe('atomic final reports', () => {
+  it('does not let a delayed progress report overwrite a terminal result', () => fixture(async (r, f, sql) => {
+    const job: any = await (await r.handle(req('/api/tasks', input()), client())).json();
+    sql.exec("UPDATE fleet_launches SET state = 'running' WHERE id = ?", job.launch_id);
+    const path = '/api/tasks/' + job.id + '/result';
+    let release!: () => void;
+    const stream = new ReadableStream<Uint8Array>({ start(controller) { release = () => { controller.enqueue(new TextEncoder().encode(JSON.stringify({status:'waiting-on-human',report:'Late progress',artifacts:[]}))); controller.close(); }; } });
+    const pending = r.handle(new Request('https://hub.test' + path, {method:'POST',body:stream}), host());
+    expect((await r.handle(req(path, {status:'done',report:'Completed',artifacts:[],confirmed_exit:true}), host())).status).toBe(200);
+    release(); expect((await pending).status).toBe(409);
+    const final: any = await (await r.handle(req('/api/tasks/' + job.id), client())).json(); expect(final.status).toBe('done'); expect(final.report).toBe('Completed');
+  }));
+  it('requires the task report endpoint for routed terminal exits', () => fixture(async (r, f, sql) => {
+    const job: any = await (await r.handle(req('/api/tasks', input()), client())).json();
+    sql.exec("UPDATE fleet_launches SET state = 'running' WHERE id = ?", job.launch_id);
+    expect((await f.handle(req('/api/fleet/launches/' + job.launch_id + '/result', {state:'exited',confirmed_exit:true}), host())).status).toBe(409);
+  }));
+  it('rolls back reservation release if persisting the final report fails', () => fixture(async (r, f, sql) => {
+    const job: any = await (await r.handle(req('/api/tasks', input()), client())).json();
+    sql.exec("UPDATE fleet_launches SET state = 'running' WHERE id = ?", job.launch_id);
+    sql.exec("CREATE TRIGGER fail_report BEFORE UPDATE ON routing_jobs BEGIN SELECT RAISE(ABORT, 'injected report failure'); END");
+    await expect(r.handle(req('/api/tasks/' + job.id + '/result', {status:'done',report:'Completed',artifacts:[],confirmed_exit:true}), host())).rejects.toThrow();
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?',job.launch_id).one().state).toBe('running');
+    sql.exec('DROP TRIGGER fail_report');
   }));
 });

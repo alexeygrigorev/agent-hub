@@ -92,7 +92,7 @@ python3 scripts/routing-client-token.py --url https://hub.dtcdev.click \
   --client grok-bot --output ~/.config/agent-hub/grok-bot-token
 ```
 
-The output file must not already exist. Transfer it through the existing approved private credential channel. Revoke through the DELETE endpoint if a client machine is lost. New client tokens expire after 30 days; renew by issuing a new credential and replacing the private client file. This does not grant provider credentials or create provider accounts.
+The output file must not already exist. If setup fails, an empty reserved output file is retained because remote issuance may have succeeded; revoke the named client before retrying an uncertain exchange. Transfer it through the existing approved private credential channel. Revoke through the DELETE endpoint if a client machine is lost. New client tokens expire after 30 days; renew by issuing a new credential and replacing the private client file. This does not grant provider credentials or create provider accounts.
 
 ## Host setup
 
@@ -118,7 +118,7 @@ Extend each host's private `subscriptions.json` with `capabilities` and `max_age
 
 Advertise only capabilities physically verified on that host. Hetzner normally advertises `[]`; browser profiles and phone/ADB belong on hosts where they actually work. CPU, available memory, disk, freshness and load come from the existing machine/heartbeat registry. No Windows inbound port is needed: hosts poll outbound.
 
-`hub fleet-host --config PATH --cycles 10 --interval 60` registers, heartbeats and publishes exact supported runner/model/effort/account routes before asking for offers. Capability advertisements expire after 3 minutes. Machine admission and quota evidence remain mandatory; shared account reservations span machines. Both task routing and the fleet transaction enforce the machine concurrency limit. Hetzner is preferred among eligible machines, except that explicit machine preference wins. Required browser/phone capabilities filter candidates before preference.
+`hub fleet-host --config PATH --cycles 10 --interval 60` registers, heartbeats and publishes exact supported runner/model/effort/account routes before asking for offers. Capability advertisements expire after 3 minutes. Machine admission and quota evidence remain mandatory; shared account reservations span machines. Both task routing and the fleet transaction enforce the machine concurrency limit. Existing active native sessions count toward machine and account occupancy; sessions already linked to a live hub launch are counted once. The selected account is pinned through launch creation even when several accounts share a runner. Hetzner is preferred among eligible machines, except that explicit machine preference wins. Required browser/phone capabilities filter candidates before preference.
 
 The admission adapter must prove `model_supported: true`, `model` and `effort` matching the selected model, in addition to the existing fresh account/resource/profile gate. The configured maintained launcher plan must identify the same account/profile/provider/model; missing proof holds the task. Existing older host configs continue legacy fleet polling but do not advertise routed-task execution.
 

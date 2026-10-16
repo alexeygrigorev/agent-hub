@@ -31,7 +31,7 @@ export async function jsonBody(request: Request, limit = 32768): Promise<any> {
   } catch { return null; } finally { reader.releaseLock(); }
 }
 export class RoutingService {
-  constructor(private sql: SqlStorage, private fleet: FleetService, private now = Date.now) {}
+  constructor(private sql: SqlStorage, private fleet: FleetService, private now = Date.now, private transaction: <T>(fn: () => T) => T = fn => fn()) {}
   init() {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS routing_machines (machine_id TEXT PRIMARY KEY, needs_json TEXT NOT NULL, max_agents INTEGER NOT NULL, observed_at TEXT NOT NULL, runners_json TEXT NOT NULL DEFAULT '[]')`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS routing_artifacts (job_id TEXT NOT NULL, name TEXT NOT NULL, media_type TEXT NOT NULL, data_base64 TEXT NOT NULL, PRIMARY KEY(job_id, name))`);
@@ -43,7 +43,7 @@ export class RoutingService {
     let status = row.state;
     if (!TERMINAL.includes(status) && !['waiting-on-human', 'stuck'].includes(status) && launch) {
       status = launch.state === 'exited' ? 'done' : launch.state === 'failed' ? 'failed' : launch.state === 'uncertain' ? 'stuck' : launch.state === 'running' ? 'running' : 'queued';
-      if (!['exited', 'failed'].includes(launch.state) && this.now() - Date.parse(launch.updated_at) > 1800000) status = 'stuck';
+      if (!['exited', 'failed'].includes(launch.state) && this.now() - Math.max(Date.parse(launch.updated_at), Date.parse(row.updated_at)) > 1800000) status = 'stuck';
     }
     const input = JSON.parse(row.request_json);
     return { id: row.id, status, queue_reason: status === 'queued' && !row.launch_id ? 'No fresh eligible capability/model route with quota and capacity.' : null, needs: input.needs, task_count: input.tasks.length, machine: launch?.machine_id ?? null,
@@ -73,13 +73,13 @@ export class RoutingService {
         if (!routes.length) continue;
         routes.sort((a: any, b: any) => Number(b.engine === input.preferred_runner) - Number(a.engine === input.preferred_runner) || b.score - a.score);
         const chosen = routes[0];
-        candidates.push({ ...chosen, prompt, priority: (chosen.machine === input.preferred_machine ? 100 : 0) + (/^(hetzner|rmthz)$/i.test(chosen.machine) || /^RMTHZ$/i.test(machine.hostname) ? 10 : 0) });
+        candidates.push({ ...chosen, prompt, priority: (chosen.machine === input.preferred_machine ? 100 : 0) + (chosen.engine === input.preferred_runner ? 20 : 0) + (/^(hetzner|rmthz)$/i.test(chosen.machine) || /^RMTHZ$/i.test(machine.hostname) ? 10 : 0) });
       }
       candidates.sort((a, b) => b.priority - a.priority || b.score - a.score || a.machine.localeCompare(b.machine));
       if (!candidates.length) continue;
       const c = candidates[0];
       this.sql.exec('UPDATE routing_jobs SET selection_json = ? WHERE id = ? AND launch_id IS NULL', JSON.stringify(c.model), row.id);
-      const response = await this.fleet.handle(new Request('https://hub.internal/api/fleet/launches', { method: 'POST', body: JSON.stringify({ workspace: input.workspace, machine: c.machine, engine: c.engine, prompt: c.prompt, idempotency_key: 'task-' + row.id }) }), { caller: { kind: 'agent', actor: row.actor }, scopes: ['fleet:launch'] });
+      const response = await this.fleet.handle(new Request('https://hub.internal/api/fleet/launches', { method: 'POST', body: JSON.stringify({ workspace: input.workspace, machine: c.machine, engine: c.engine, account: c.account, prompt: c.prompt, idempotency_key: 'task-' + row.id }) }), { caller: { kind: 'agent', actor: row.actor }, scopes: ['fleet:launch'] });
       if (response.ok) { const launched: any = await response.json(); this.sql.exec('UPDATE routing_jobs SET launch_id = ?, updated_at = ?, selection_json = ? WHERE id = ? AND launch_id IS NULL', launched.id, this.at(), JSON.stringify(c.model), row.id); }
     }
   }
@@ -112,6 +112,7 @@ export class RoutingService {
     const tokenMatch = /^\/api\/routing\/clients\/([A-Za-z0-9_-]{1,64})$/.exec(path);
     if (tokenMatch && ['POST', 'DELETE'].includes(request.method)) {
       if (!admin) return reply({ error: 'forbidden' }, 403);
+      await jsonBody(request); // Drain the unused bounded admin body before returning a credential.
       const actor = 'routing-client:' + tokenMatch[1];
       if (request.method === 'DELETE') { this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE actor = ?', this.at(), actor); return reply({ status: 'revoked' }); }
       const token = 'hubt_' + randomString(32); const id = crypto.randomUUID();
@@ -175,14 +176,19 @@ export class RoutingService {
         if (!host || launch?.machine_id !== caller.machineId) return reply({ error: 'forbidden' }, 403);
         const data = await jsonBody(request);
         if (!obj(data, ['status', 'report', 'artifacts', 'confirmed_exit']) || !['running', 'waiting-on-human', 'stuck', 'done', 'failed'].includes(data.status) || typeof data.report !== 'string' || data.report.length > 16000 || !Array.isArray(data.artifacts) || data.artifacts.length > 8 || data.artifacts.some((a: any) => !obj(a, ['name', 'text']) || !label(a.name) || typeof a.text !== 'string' || a.text.length > 4000)) return reply({ error: 'invalid_result' }, 400);
-        if (!['starting', 'running', 'uncertain'].includes(launch.state) || TERMINAL.includes(row.state)) return reply({ error: 'invalid_transition' }, 409);
-        if (TERMINAL.includes(data.status)) {
-          if (data.confirmed_exit !== true) return reply({ error: 'confirmed_exit_required' }, 409);
-          const closed = await this.fleet.handle(new Request('https://hub.internal/api/fleet/launches/' + row.launch_id + '/result', { method: 'POST', body: JSON.stringify({ state: data.status === 'done' ? 'exited' : 'failed', confirmed_exit: true }) }), auth);
-          if (!closed.ok) return closed;
-        }
-        this.sql.exec('UPDATE routing_jobs SET state = ?, report = ?, artifacts_json = ?, updated_at = ? WHERE id = ?', data.status, redact(data.report), JSON.stringify(data.artifacts.map((a: any) => ({ name: redact(a.name), text: redact(a.text) }))), this.at(), row.id);
-        return reply(this.view(this.sql.exec('SELECT * FROM routing_jobs WHERE id = ?', row.id).one()));
+        return this.transaction(() => {
+          // Re-read after body I/O: another report may have completed while this request waited.
+          const current: any = this.sql.exec('SELECT * FROM routing_jobs WHERE id = ?', row.id).one();
+          const execution: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id = ?', current.launch_id).one();
+          if (execution.machine_id !== caller.machineId || !['starting', 'running', 'uncertain'].includes(execution.state) || TERMINAL.includes(current.state)) return reply({ error: 'invalid_transition' }, 409);
+          if (TERMINAL.includes(data.status)) {
+            if (data.confirmed_exit !== true) return reply({ error: 'confirmed_exit_required' }, 409);
+            // The process reservation and its report commit together; a restart cannot lose the report.
+            this.sql.exec('UPDATE fleet_launches SET state = ?, updated_at = ? WHERE id = ?', data.status === 'done' ? 'exited' : 'failed', this.at(), current.launch_id);
+          }
+          this.sql.exec('UPDATE routing_jobs SET state = ?, report = ?, artifacts_json = ?, updated_at = ? WHERE id = ?', data.status, redact(data.report), JSON.stringify(data.artifacts.map((a: any) => ({ name: redact(a.name), text: redact(a.text) }))), this.at(), row.id);
+          return reply(this.view(this.sql.exec('SELECT * FROM routing_jobs WHERE id = ?', row.id).one()));
+        });
       }
     }
     return reply({ error: 'not_found' }, 404);
