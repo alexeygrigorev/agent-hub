@@ -6,6 +6,7 @@ import { BusService } from '../src/bus';
 import { claimCoversScope, normalizeScope } from '../src/claim_admission';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
+import { sha256 } from '../src/auth/crypto';
 
 const now = Date.now();
 const at = (delta = 0) => new Date(now + delta).toISOString();
@@ -27,9 +28,9 @@ describe('scope coverage helpers', () => {
   });
 });
 
-async function fleetFixture(fn: (f: FleetService, sql: any, bus: BusService) => Promise<void>) {
+async function fleetFixture(fn: (f: FleetService, sql: any, bus: BusService) => Promise<void>, stubOverride?: any) {
   const bindings = env as unknown as Env;
-  const stub = bindings.HUB.get(bindings.HUB.idFromName('claims-fleet-' + crypto.randomUUID()));
+  const stub = stubOverride ?? bindings.HUB.get(bindings.HUB.idFromName('claims-fleet-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
     const f = new FleetService(hub.sql, cb => state.storage.transactionSync(cb), () => now);
     f.init();
@@ -388,5 +389,126 @@ describe('atomic editable routing placement', () => {
     expect(f.accountStatus(sql.exec('SELECT * FROM fleet_accounts').one()).active).toBe(0);
     await r.dispatch();
     expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches').one().n).toBe(1);
+  }));
+});
+
+
+describe('claims admission through authenticated Hub HTTP routes', () => {
+  it('uses the authenticated claim holder and canonical fleet/task endpoints without accepting impersonation', async () => {
+    const bindings = env as unknown as Env;
+    const stub = bindings.HUB.get(bindings.HUB.idFromName('claims-http-' + crypto.randomUUID()));
+    const token = 'test-only-claims-holder';
+    const adminToken = 'test-only-claims-admin';
+    await fleetFixture(async (_f, sql) => {
+      sql.exec("UPDATE credentials SET token_hash = ? WHERE id = 'cred-worker-1'", await sha256(token));
+      sql.exec('INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', 'http-admin', 'human', await sha256(adminToken), 'http-admin', 'worker-1', 'worker-1', JSON.stringify(['admin', 'fleet:launch', 'bus:send', 'routing:submit']), 'test', at(), at(86400000));
+    }, stub);
+    const http = (path: string, data: any, bearer = token) => stub.fetch(new Request('https://hub.test' + path, { method: 'POST', headers: { Authorization: 'Bearer ' + bearer, 'Content-Type': 'application/json' }, body: JSON.stringify(data) }));
+    const made = await http('/api/bus/claims', { project: 'projA', scope: 'src', holder: 'worker-1', ttl_ms: 3600000 });
+    expect(made.status).toBe(200);
+    const claim: any = await made.json();
+    const input = intent({ access: editAccess(claim.id) });
+    expect((await http('/api/fleet/launches', input, adminToken)).status).toBe(403);
+    expect((await http('/api/fleet/launches', { ...input, caller: holder.caller })).status).toBe(400);
+    const offer = await http('/api/fleet/launches', input);
+    expect(offer.status).toBe(201);
+    const launch: any = await offer.json();
+    expect(launch.access).toBe('edit');
+    expect((await http('/api/fleet/launches', input)).status).toBe(200);
+    const queued = await http('/api/fleet/tasks', task({ workspace: 'demo', needs: ['unavailable'], access: editAccess(claim.id) }));
+    expect(queued.status).toBe(201);
+    const job: any = await queued.json(); expect(job.launch_id).toBeNull(); expect(job.access).toBe('edit');
+    const released = await http('/api/bus/claims/' + claim.id + '/release', {});
+    expect(released.status).toBe(200);
+    expect((await http('/api/fleet/launches', intent({ access: editAccess(claim.id) }))).status).toBe(409);
+    await runInDurableObject(stub, async (hub: Hub) => {
+      expect(hub.sql.exec('SELECT COUNT(*) AS n FROM fleet_launches').one().n).toBe(1);
+      const retained = JSON.parse(String(hub.sql.exec('SELECT request_json FROM fleet_launches').one().request_json));
+      expect(retained.edit_authority.credential_id).toBe('cred-worker-1');
+      expect(retained.edit_authority.claim.holder).toBe('worker-1');
+      expect(hub.fleetService.admission.heldReason(hub.sql.exec('SELECT * FROM fleet_launches').one())).toBe('claim_inactive');
+    });
+  });
+
+  it('denies a stored routing-only credential owning a claim on the actual HTTP boundary', async () => {
+    const bindings = env as unknown as Env;
+    const stub = bindings.HUB.get(bindings.HUB.idFromName('claims-http-routing-only-' + crypto.randomUUID()));
+    const token = 'test-only-routing-scoped';
+    let claimId = '';
+    await fleetFixture(async (_f, sql, bus) => {
+      claimId = bus.claim(holder.caller, 'projA', 'src', 'worker-1', 3600000).id;
+      sql.exec("UPDATE credentials SET token_hash = ?, scopes = '[\"routing:submit\"]' WHERE id = 'cred-worker-1'", await sha256(token));
+    }, stub);
+    const denied = await stub.fetch(new Request('https://hub.test/api/fleet/tasks', { method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify(task({ workspace: 'demo', access: editAccess(claimId) })) }));
+    expect(denied.status).toBe(403);
+    expect((await denied.json() as any).error).toBe('claim_authority_unsupported');
+    await runInDurableObject(stub, async (hub: Hub) => {
+      expect(hub.sql.exec('SELECT COUNT(*) AS n FROM routing_jobs').one().n).toBe(0);
+      expect(hub.sql.exec('SELECT COUNT(*) AS n FROM fleet_launches').one().n).toBe(0);
+    });
+  });
+});
+
+describe('scope lifecycle adoption boundaries', () => {
+  it('retains an expired/deleted claim scope while running and admits disjoint scopes', () => fleetFixture(async (f, sql, bus) => {
+    sql.exec("UPDATE agents SET project = 'projA' WHERE tag = 'worker-2'");
+    const initial = bus.claim(holder.caller, 'projA', 'src', 'worker-1', 3600000);
+    const launched: any = await (await f.handle(req('/api/fleet/launches', intent({ access: editAccess(initial.id) })), holder)).json();
+    sql.exec("UPDATE fleet_launches SET state = 'running' WHERE id = ?", launched.id);
+    sql.exec('DELETE FROM claims WHERE id = ?', initial.id);
+    const next = bus.claim(other.caller, 'projA', 'src/a.ts', 'worker-2', 3600000);
+    expect((await (await f.handle(req('/api/fleet/launches', intent({ access: editAccess(next.id) })), other)).json() as any).error).toBe('claim_conflict');
+    const disjoint = bus.claim(other.caller, 'projA', 'docs', 'worker-2', 3600000);
+    expect((await f.handle(req('/api/fleet/launches', intent({ access: editAccess(disjoint.id, 'docs/guide.md') })), other)).status).toBe(201);
+    expect(f.accountStatus(sql.exec('SELECT * FROM fleet_accounts').one()).active).toBe(2);
+  }));
+
+  it('holds old unbound edit effects rather than guessing their authority or disjointness', () => fleetFixture(async (f, sql, bus) => {
+    const initial = bus.claim(holder.caller, 'projA', 'src', 'worker-1', 3600000);
+    const launched: any = await (await f.handle(req('/api/fleet/launches', intent({ access: editAccess(initial.id) })), holder)).json();
+    const retained = JSON.parse(sql.exec('SELECT request_json FROM fleet_launches').one().request_json);
+    delete retained.edit_authority;
+    sql.exec('UPDATE fleet_launches SET request_json = ? WHERE id = ?', JSON.stringify(retained), launched.id);
+    const separate = bus.claim(holder.caller, 'projA', 'docs', 'worker-1', 3600000);
+    expect((await f.handle(req('/api/fleet/launches', intent({ access: editAccess(separate.id, 'docs/guide.md') })), holder)).status).toBe(409);
+    expect((await f.handle(req('/api/fleet/launches/' + launched.id + '/claim', nativeStart), host())).status).toBe(403);
+    expect(f.accountStatus(sql.exec('SELECT * FROM fleet_accounts').one()).active).toBe(1);
+  }));
+
+  it('checks the final reservation even if claims change immediately after a successful preview', () => fleetFixture(async (f, sql, bus) => {
+    const claim = bus.claim(holder.caller, 'projA', 'src', 'worker-1', 3600000);
+    const input = intent({ access: editAccess(claim.id) });
+    expect((await f.handle(req('/api/fleet/plan', input), holder)).status).toBe(200);
+    bus.releaseClaim(holder.caller, claim.id);
+    expect((await f.handle(req('/api/fleet/launches', input), holder)).status).toBe(409);
+    expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches').one().n).toBe(0);
+    expect(f.accountStatus(sql.exec('SELECT * FROM fleet_accounts').one()).active).toBe(0);
+  }));
+});
+
+describe('compatible retries and offer scanning', () => {
+  it('replays a pre-adoption unspecified launch without labeling it read-only', () => fleetFixture(async (f, sql) => {
+    const input = intent();
+    const first: any = await (await f.handle(req('/api/fleet/launches', input), admin)).json();
+    const retained = JSON.parse(sql.exec('SELECT request_json FROM fleet_launches').one().request_json);
+    delete retained.access;
+    sql.exec('UPDATE fleet_launches SET request_json = ? WHERE id = ?', JSON.stringify(retained), first.id);
+    const replay: any = await (await f.handle(req('/api/fleet/launches', input), admin)).json();
+    expect(replay.id).toBe(first.id); expect(replay.replay).toBe(true); expect(replay.access).toBe('legacy_unspecified');
+    expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches').one().n).toBe(1);
+  }));
+
+  it('does not let twenty held offers hide eligible work while their capacity stays reserved', () => fleetFixture(async (f, sql, bus) => {
+    sql.exec('UPDATE fleet_accounts SET max_concurrency = 30');
+    for (let i = 0; i < 20; i++) {
+      const claim = bus.claim(holder.caller, 'projA', 'dir' + i, 'worker-1', 3600000);
+      expect((await f.handle(req('/api/fleet/launches', intent({ machine: 'hetzner', access: editAccess(claim.id, 'dir' + i + '/file') })), holder)).status).toBe(201);
+    }
+    sql.exec('UPDATE claims SET expires_at = ?', now - 1);
+    sql.exec('UPDATE fleet_launches SET created_at = ?', at(-1000));
+    const valid: any = await (await f.handle(req('/api/fleet/launches', intent({ machine: 'hetzner', access: { mode: 'read' } })), holder)).json();
+    const offered: any = await (await f.handle(req('/api/fleet/offers'), host())).json();
+    expect(offered.offers.map((offer: any) => offer.id)).toEqual([valid.id]);
+    expect(f.accountStatus(sql.exec('SELECT * FROM fleet_accounts').one()).active).toBe(21);
   }));
 });

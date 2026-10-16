@@ -262,7 +262,14 @@ export class FleetService {
     if (path === '/api/fleet/offers' && request.method === 'GET') {
       if (!host) return response({ error: 'forbidden' }, 403);
       await this.routing.dispatch();
-      return response({ offers: this.routing.enrichOffers(this.sql.exec("SELECT * FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at LIMIT 20", caller.machineId!).toArray().filter((row: any) => !this.admission.heldReason(row)).map((row: any) => ({ id: row.id, engine: row.engine, account: row.account, profile: row.profile, mode: row.mode, workspace: row.workspace, prompt: row.prompt, access: parsed(row.request_json).access?.mode || 'legacy_unspecified' }))) });
+      const offers: any[] = [];
+      // Held effects keep capacity, but must not hide later eligible offers on other slots.
+      for (const row of this.sql.exec("SELECT * FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at, id", caller.machineId!)) {
+        if (this.admission.heldReason(row)) continue;
+        offers.push({ id: row.id, engine: row.engine, account: row.account, profile: row.profile, mode: row.mode, workspace: row.workspace, prompt: row.prompt, access: parsed(row.request_json).access?.mode || 'legacy_unspecified' });
+        if (offers.length === 20) break;
+      }
+      return response({ offers: this.routing.enrichOffers(offers) });
     }
     if (path === '/api/fleet/sessions' && request.method === 'PUT') {
       if (!host) return response({ error: 'forbidden' }, 403);
