@@ -1,0 +1,167 @@
+{
+  "version": 1,
+  "default_tier": "daily",
+  "aliases": {
+    "smart": "deep",
+    "hard": "deep",
+    "hard-reasoning": "deep",
+    "everyday": "daily",
+    "good": "daily",
+    "volume": "daily",
+    "concrete": "quick",
+    "no-thinking": "quick"
+  },
+  "tiers": {
+    "deep": [
+      "astra",
+      "argon",
+      "opus"
+    ],
+    "daily": [
+      "sol",
+      "sonnet",
+      "glm-flash",
+      "muse",
+      "deepseek-flash",
+      "grok"
+    ],
+    "quick": [
+      "haiku",
+      "luna"
+    ]
+  },
+  "models": [
+    {
+      "id": "astra",
+      "model": "gpt-6-astra",
+      "provider": "codex",
+      "engine": "codex",
+      "profile": null,
+      "effort": "high"
+    },
+    {
+      "id": "argon",
+      "model": "gemini-4-argon-high",
+      "provider": "gemini",
+      "engine": "antigravity",
+      "profile": null,
+      "effort": "high"
+    },
+    {
+      "id": "opus",
+      "model": "opus",
+      "provider": "claude",
+      "engine": "claude",
+      "profile": null,
+      "effort": "high"
+    },
+    {
+      "id": "sol",
+      "model": "gpt-6.1-sol",
+      "provider": "codex",
+      "engine": "codex",
+      "profile": null,
+      "effort": "high"
+    },
+    {
+      "id": "sonnet",
+      "model": "sonnet",
+      "provider": "claude",
+      "engine": "claude",
+      "profile": null,
+      "effort": "high"
+    },
+    {
+      "id": "glm-flash",
+      "model": "glm-5.3-flash",
+      "provider": "zai",
+      "engine": "codex",
+      "profile": "zcodex",
+      "effort": "high"
+    },
+    {
+      "id": "muse",
+      "model": "opencode-go/muse-spark-1.3-contributor",
+      "provider": "go",
+      "engine": "opencode",
+      "profile": null,
+      "effort": null
+    },
+    {
+      "id": "deepseek-flash",
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "provider": "go",
+      "engine": "opencode",
+      "profile": null,
+      "effort": null
+    },
+    {
+      "id": "grok",
+      "model": "grok-4.6",
+      "provider": "grok",
+      "engine": "grok",
+      "profile": null,
+      "effort": "high"
+    },
+    {
+      "id": "haiku",
+      "model": "haiku",
+      "provider": "claude",
+      "engine": "claude",
+      "profile": null,
+      "effort": null
+    },
+    {
+      "id": "luna",
+      "model": "gpt-6-luna",
+      "provider": "codex",
+      "engine": "codex",
+      "profile": null,
+      "effort": "max"
+    },
+    {
+      "id": "glm-flash",
+      "model": "glm-5.3-flash",
+      "provider": "zai",
+      "engine": "zcodex",
+      "profile": null,
+      "effort": "high"
+    },
+    {
+      "id": "argon",
+      "model": "gemini-4-argon-high",
+      "provider": "gemini",
+      "engine": "gemini",
+      "profile": null,
+      "effort": "high"
+    }
+  ],
+  "rules": {
+    "disabled_providers": [
+      "claude"
+    ],
+    "explicit_only_providers": [
+      "codex"
+    ],
+    "preferred_providers": [
+      "zai",
+      "go"
+    ],
+    "provider_preference": 1.2,
+    "reset_horizon_hours": 24,
+    "reset_urgency_factor": 2,
+    "headroom_floor": 0.05,
+    "reserve_percent": {
+      "codex": 15,
+      "grok": 5
+    },
+    "allow_paid": false,
+    "allow_cross_tier_failover": false,
+    "difficulty_tiers": {
+      "hard": "deep",
+      "normal": "daily",
+      "concrete": "quick"
+    },
+    "cost_mode": "existing-subscription-only"
+  }
+}

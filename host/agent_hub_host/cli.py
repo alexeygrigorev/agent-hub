@@ -124,6 +124,8 @@ def cmd_bridge(args):
 def main():
     parser = argparse.ArgumentParser(description="Agent Hub CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
+    from . import routing
+    routing.add_commands(sub)
 
     for command in ('start-agent', 'start-session', 'plan-agent'):
         launch = sub.add_parser(command, help='Queue a headless agent or a real interactive session')
@@ -234,6 +236,14 @@ def main():
     p_bridge.add_argument("--service-session-id", default=None)
 
     args = parser.parse_args()
+    if args.cmd in ('submit', 'jobs', 'job', 'task-result', 'routing-machines', 'model-policy', 'task-artifact', 'artifact'):
+        try:
+            print(json.dumps(routing.execute(args), indent=2))
+        except Exception:
+            print('Hub task operation failed; check inputs, authentication and host admission.', file=sys.stderr)
+            sys.exit(1)
+        return
+
     
     if args.cmd == 'heartbeat':
         from . import bus

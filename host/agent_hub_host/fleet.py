@@ -31,14 +31,14 @@ def load_settings(path=None):
     if path.stat().st_size > 65536:
         raise ValueError("Subscription configuration exceeds 64 KiB")
     data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "launcher", "aplexer_bin"} or data.get("version") != 1:
+    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "launcher", "aplexer_bin", "capabilities", "max_agents"} or data.get("version") != 1:
         raise ValueError("Invalid subscription configuration")
     subs = data.get("subscriptions")
     if not isinstance(subs, list) or len(subs) > 128:
         raise ValueError("Invalid subscriptions list")
     seen = set()
     for sub in subs:
-        if not isinstance(sub, dict) or set(sub) - {"service", "account_label", "plan", "engine", "profile", "quota_argv", "admission_argv", "launcher_provider", "launcher_model"}:
+        if not isinstance(sub, dict) or set(sub) - {"service", "account_label", "plan", "engine", "profile", "quota_argv", "admission_argv", "launcher_provider", "launcher_model", "launcher_effort"}:
             raise ValueError("Subscription accepts metadata and local command references only")
         if sub.get("service") not in SERVICES or not isinstance(sub.get("account_label"), str) or not LABEL.fullmatch(sub["account_label"]) or sub["account_label"] in seen:
             raise ValueError("Invalid or duplicate account label")
@@ -55,6 +55,12 @@ def load_settings(path=None):
     workspaces = data.get("workspaces", {})
     if not isinstance(workspaces, dict) or any(not isinstance(k, str) or not LABEL.fullmatch(k) or not isinstance(v, str) or not Path(v).is_absolute() for k, v in workspaces.items()):
         raise ValueError("Workspaces must map labels to absolute local paths")
+    needs = data.get('capabilities', [])
+    if not isinstance(needs, list) or len(needs) > 64 or any(not isinstance(n, str) or not re.fullmatch(r'[a-z0-9][a-z0-9:_-]{0,95}', n) for n in needs) or len(set(needs)) != len(needs):
+        raise ValueError('Invalid task capabilities')
+    maximum = data.get('max_agents', 1)
+    if type(maximum) is not int or not 1 <= maximum <= 100:
+        raise ValueError('Invalid machine concurrency')
     return data
 
 
@@ -254,9 +260,17 @@ class Dispatcher:
 
     def dispatch(self, offer):
         sub = self._route(offer)
-        gate = self.runner(sub["admission_argv"], payload={k: offer.get(k) for k in ["mode", "engine", "profile", "account", "workspace"]})
+        selection = offer.get('selection')
+        if offer.get('task_id'):
+            if not isinstance(offer.get('needs'), list) or not set(offer['needs']).issubset(self.settings.get('capabilities', [])):
+                raise ValueError('Required capabilities are no longer available locally')
+            if not isinstance(selection, dict) or selection.get('model') != sub.get('launcher_model') or selection.get('effort') != sub.get('launcher_effort'):
+                raise ValueError('Selected model/effort is not configured locally')
+        gate = self.runner(sub["admission_argv"], payload={k: offer.get(k) for k in ["mode", "engine", "profile", "account", "workspace", "selection"]})
         if gate.get("launch_allowed") is not True or gate.get("profile_supported") is not True or gate.get("account_label") != sub["account_label"]:
             raise ValueError("Fresh admission refused")
+        if offer.get('task_id') and (gate.get('model_supported') is not True or gate.get('model') != selection['model'] or gate.get('effort') != selection['effort']):
+            raise ValueError('Selected model/effort requires verified admission')
         at = gate.get("observed_at")
         try:
             observed = dt.datetime.fromisoformat(at.replace("Z", "+00:00"))
@@ -282,7 +296,12 @@ class Dispatcher:
             # Only the maintained launcher may run models. argv is a trusted machine-local CLI prefix.
             prefix = launcher["argv"] + ["--config-dir", launcher["config_dir"]]
             task_id = "hub-" + offer["id"]
-            payload = {"goal": offer["prompt"], "owner": "hub-fleet", "cwd": str(workspace), "timeout": 1800,
+            goal = offer["prompt"]
+            result_path = workspace / '.local' / 'hub-results' / (offer['id'] + '.json')
+            if offer.get('task_id'):
+                result_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                goal += '\nWrite a final JSON object to ' + str(result_path) + ': {"status":"done|failed|waiting-on-human|stuck","report":"sanitized final report","artifacts":[{"name":"label","text":"sanitized text"}]}. No secrets, codes, tokens or URLs. Do not write raw screenshots; keep them private locally for human review.'
+            payload = {"goal": goal, "owner": "hub-fleet", "cwd": str(workspace), "timeout": 1800,
                        "model_requirements": {"providers": [sub["launcher_provider"]], "models": [sub["launcher_model"]]},
                        "account_label": sub["account_label"], "profile": sub.get("profile")}
             self.runner(prefix + ["submit", "--id", task_id, "--key", task_id, "--payload", json.dumps(payload)], cwd=launcher["root"])
@@ -319,6 +338,23 @@ class Dispatcher:
             # Effect may have happened: hold capacity and require reconciliation.
             self.request("POST", path + "/result", {"state": "uncertain"})
             return {"id": offer["id"], "state": "uncertain"}
+        if offer.get('task_id') and result.get('confirmed_exit'):
+            from .routing import read_text
+            try:
+                if result_path.is_symlink(): raise ValueError('Refuse linked result file')
+                report = json.loads(read_text(result_path))
+                if not isinstance(report, dict) or report.get('status') not in {'done', 'failed', 'waiting-on-human', 'stuck'}:
+                    raise ValueError('Invalid final report')
+                report = {'status': report['status'], 'report': report['report'], 'artifacts': report.get('artifacts', [])}
+                if result['state'] == 'failed': report['status'] = 'failed'
+            except Exception:
+                report = {'status': 'failed', 'report': 'Agent exited without a valid structured report; inspect private local logs.', 'artifacts': []}
+            report['confirmed_exit'] = True
+            self.request('POST', '/api/fleet/tasks/' + offer['task_id'] + '/result', report)
+            if report['status'] in {'done', 'failed'}:
+                return {'id': offer['id'], 'state': report['status']}
+            # Human waits retain reservations even when the reporting process exits.
+            return {'id': offer['id'], 'state': report['status']}
         self.request("POST", path + "/result", result)
         return {"id": offer["id"], **result}
 
@@ -348,6 +384,8 @@ class Dispatcher:
         self.request("PUT", "/api/fleet/subscriptions", {"subscriptions": collect_subscriptions(self.settings, self.runner)})
         raw = self.runner([self.settings.get("aplexer_bin", "aplexer"), "list", "--json"])
         self.request("PUT", "/api/fleet/sessions", {"sessions": session_metadata(raw, self.settings)})
+        if 'capabilities' in self.settings:
+            self.request('PUT', '/api/fleet/routing/capabilities', {'needs': self.settings['capabilities'], 'max_agents': self.settings.get('max_agents', 1), 'runners': [{'engine': s.get('engine', s['service']), 'profile': s.get('profile'), 'account': s['account_label'], 'model': s['launcher_model'], 'effort': s.get('launcher_effort')} for s in self.settings['subscriptions'] if s.get('launcher_model') and s.get('admission_argv')]})
         offers = self.request("GET", "/api/fleet/offers").get("offers", [])
         results = []
         for offer in offers:

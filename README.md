@@ -8,6 +8,8 @@ The spec is [docs/SPEC.md](docs/SPEC.md); it is the source of truth for scope an
 
 See `AGENTS.md` for team and process rules.
 
+Task routing supports capability matching, batches, client-owned asynchronous jobs and configurable model tiers. See [routing API, CLI and host setup](docs/ROUTING.md).
+
 ## Root scheduling flag
 
 The hub can pause and resume root-run scheduling through a persisted flag. It is

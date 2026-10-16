@@ -1,5 +1,6 @@
 /** Generic account registry and placement. Provider credentials never enter this service. */
 import type { SqlStorage } from '@cloudflare/workers-types';
+import { RoutingService } from './routing';
 import { effectiveCheckin } from './registry';
 
 export const FLEET_SCHEMA = `
@@ -55,8 +56,10 @@ async function body(request: Request): Promise<any> {
 }
 
 export class FleetService {
-  constructor(private sql: SqlStorage, private transaction: <T>(fn: () => T) => T, private now: () => number = Date.now) {}
+  public routing: RoutingService;
+  constructor(private sql: SqlStorage, private transaction: <T>(fn: () => T) => T, private now: () => number = Date.now) { this.routing = new RoutingService(sql, this, now); }
   init() {
+    this.routing.init();
     for (const stmt of FLEET_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
     const columns = this.sql.exec('PRAGMA table_info(fleet_sessions)').toArray().map((c: any) => c.name);
     if (!columns.includes('last_activity_at')) this.sql.exec('ALTER TABLE fleet_sessions ADD COLUMN last_activity_at TEXT');
@@ -133,6 +136,10 @@ export class FleetService {
       else if (account.available_slots < 1) reason = 'account_capacity';
       if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason }); continue; }
       const pending = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND state IN ${ACTIVE}`, route.machine_id).one().n);
+      const routingInstalled = this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'routing_machines'").toArray().length;
+      const limit: any = routingInstalled ? this.sql.exec('SELECT max_agents FROM routing_machines WHERE machine_id = ?', route.machine_id).toArray()[0] : null;
+      if (limit && pending >= limit.max_agents) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'machine_capacity' }); continue; }
+
       const score = (account!.remaining_percent! / 100) / (1 + hb.load[0] / caps.cpu_count + pending);
       candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile, score });
     }
@@ -143,6 +150,7 @@ export class FleetService {
   async handle(request: Request, auth: Auth): Promise<Response> {
     if (auth.error) return auth.error;
     const path = new URL(request.url).pathname; const caller = auth.caller;
+    if (path === '/api/fleet/tasks' || path.startsWith('/api/fleet/tasks/') || path.startsWith('/api/fleet/routing/')) return this.routing.handle(request, auth);
     if (!caller) return response({ error: 'unauthorized' }, 401);
     const admin = !!caller.isAdmin; const host = caller.kind === 'host' && !!caller.machineId && auth.scopes?.includes('host');
     const writer = admin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch'));
@@ -204,7 +212,8 @@ export class FleetService {
     }
     if (path === '/api/fleet/offers' && request.method === 'GET') {
       if (!host) return response({ error: 'forbidden' }, 403);
-      return response({ offers: this.sql.exec("SELECT id, engine, account, profile, mode, workspace, prompt FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at LIMIT 20", caller.machineId!).toArray() });
+      await this.routing.dispatch();
+      return response({ offers: this.routing.enrichOffers(this.sql.exec("SELECT id, engine, account, profile, mode, workspace, prompt FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at LIMIT 20", caller.machineId!).toArray()) });
     }
     if (path === '/api/fleet/sessions' && request.method === 'PUT') {
       if (!host) return response({ error: 'forbidden' }, 403);
