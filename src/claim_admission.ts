@@ -16,8 +16,16 @@ export type AccessDeclaration = {
 };
 
 export type AdmissionPhase = 'enqueue' | 'reserve' | 'start';
+export type AdmissionCaller = Omit<CallerContext, 'kind'> & { kind?: string };
 
-export type AdmissionOk = { ok: true; access: AccessDeclaration; claim: any | null };
+/** Server-derived references only. No bearer, token hash, or caller-supplied authority. */
+export type EditAuthority = {
+  actor: string;
+  credential_id: string;
+  permission: 'fleet:launch' | 'routing:submit';
+  claim: { id: string; project: string; scope: string; holder: string; created_at: number };
+};
+export type AdmissionOk = { ok: true; access: AccessDeclaration; authority: EditAuthority | null };
 export type AdmissionErr = { ok: false; error: string; status: number };
 export type AdmissionResult = AdmissionOk | AdmissionErr;
 
@@ -27,7 +35,8 @@ function object(value: any, keys: string[]): boolean {
 
 export function normalizeScope(scope: unknown): string | null {
   if (typeof scope !== 'string' || !scope || scope.length > 256) return null;
-  if (scope.includes('..')) return null;
+  // Claims use slash-separated relative prefixes. Reject alternate host path syntax.
+  if (scope.includes('..') || scope.startsWith('/') || /[\\:\x00-\x1f\x7f]/.test(scope)) return null;
   const normalized = scope.split('/').filter(p => p && p !== '.').join('/');
   return normalized || null;
 }
@@ -41,7 +50,7 @@ export function boundAccess(access: AccessDeclaration): AccessDeclaration {
     mode: access.mode,
     claim_id: access.claim_id,
     project: access.project,
-    scopes: access.scopes,
+    scopes: [...access.scopes],
   };
 }
 
@@ -98,10 +107,6 @@ export class ClaimAdmission {
     return { access: { mode: 'edit', claim_id: body.claim_id, project: body.project ?? null, scopes } };
   }
 
-  private principal(caller: CallerContext | undefined): CallerContext {
-    return { ...(caller || {}), isAdmin: false };
-  }
-
   private fail(error: string, status: number): AdmissionErr {
     return { ok: false, error, status };
   }
@@ -114,52 +119,70 @@ export class ClaimAdmission {
     return row;
   }
 
-  launchesBoundToClaim(claimId: string, exceptId?: string): any[] {
+  private conflictingLaunches(claim: EditAuthority['claim'], exceptId?: string): any[] {
     const rows = this.sql.exec(`SELECT id, request_json, state FROM fleet_launches WHERE state IN ${ACTIVE}`).toArray() as any[];
     return rows.filter(row => {
       if (exceptId && row.id === exceptId) return false;
       try {
         const request = JSON.parse(row.request_json || '{}');
-        return request.access?.mode === 'edit' && request.access?.claim_id === claimId;
+        if (request.access?.mode !== 'edit') return false;
+        if (request.access.claim_id === claim.id) return true;
+        // Retained lifecycle facts protect old effects even after the bus lease is gone.
+        const old = request.edit_authority?.claim;
+        if (old) return old.project === claim.project && (claimCoversScope(old.scope, claim.scope) || claimCoversScope(claim.scope, old.scope));
+        // Unbound edit rows from an older version cannot safely prove disjointness.
+        return true;
       } catch {
-        return false;
+        return true;
       }
     });
   }
 
-  evaluate(caller: CallerContext | undefined, workspace: string, access: AccessDeclaration, phase: AdmissionPhase, opts: { launchId?: string } = {}): AdmissionResult {
+  evaluate(caller: AdmissionCaller | undefined, workspace: string, access: AccessDeclaration, phase: AdmissionPhase,
+    opts: { launchId?: string; authority?: EditAuthority; permission?: EditAuthority['permission'] } = {}): AdmissionResult {
     const policy = this.policy(workspace);
     if (access.mode === 'read') {
-      return { ok: true, access: boundAccess(access), claim: null };
+      return { ok: true, access: boundAccess(access), authority: null };
     }
     if (access.mode === 'legacy_unspecified') {
       if (policy.require_claim) return this.fail('claim_required', 403);
-      return { ok: true, access: boundAccess(access), claim: null };
+      return { ok: true, access: boundAccess(access), authority: null };
     }
 
     const claim = this.liveClaim(access.claim_id!);
     if (!claim) return this.fail('claim_inactive', 409);
     if (claim.inactive === 'released' || claim.inactive === 'expired') return this.fail('claim_inactive', 409);
 
-    if (policy.project && claim.project !== policy.project) return this.fail('claim_project_mismatch', 403);
+    if (!policy.project) return this.fail('claim_workspace_unconfigured', 403);
+    if (claim.project !== policy.project) return this.fail('claim_project_mismatch', 403);
     if (access.project && claim.project !== access.project) return this.fail('claim_project_mismatch', 403);
 
     for (const scope of access.scopes) {
       if (!claimCoversScope(claim.scope, scope)) return this.fail('claim_scope_mismatch', 403);
     }
 
-    if (phase === 'start') {
-      return { ok: true, access: { ...boundAccess(access), project: access.project || claim.project }, claim };
-    }
-
-    const principal = this.principal(caller);
+    if (caller?.isAdmin || caller?.kind !== 'agent' || !caller.tokenId || caller.isRevoked) return this.fail('claim_authority_unsupported', 403);
+    const principal: CallerContext = { ...caller, kind: 'agent', isAdmin: false };
     if (isRootRoleAddress(principal.actor) || isRootRoleAddress(claim.holder)) {
       return this.fail('claim_authority_unsupported', 403);
     }
-    if (!principal.actor && !(principal.kind === 'host' && principal.machineId)) {
+    if (!principal.actor) {
       return this.fail('claim_actor_ambiguous', 403);
     }
     if (!parseAddress(claim.holder)) return this.fail('claim_authority_unsupported', 403);
+
+    const credential: any = this.sql.exec('SELECT kind, actor, subject, scopes, revoked_at, expires_at FROM credentials WHERE id = ?', principal.tokenId).toArray()[0];
+    const permission = opts.authority?.permission || opts.permission || 'fleet:launch';
+    if (!['fleet:launch', 'routing:submit'].includes(permission)) return this.fail('claim_authority_unsupported', 403);
+    let scopes: string[] = [];
+    try { scopes = JSON.parse(credential?.scopes); } catch { /* fail closed below */ }
+    if (!credential || credential.kind !== 'agent' || (credential.actor || credential.subject) !== principal.actor || credential.revoked_at != null ||
+      !Number.isFinite(Date.parse(credential.expires_at)) || Date.parse(credential.expires_at) <= this.now() || !Array.isArray(scopes) ||
+      !scopes.includes('bus:send') || !scopes.includes(permission)) return this.fail('claim_authority_unsupported', 403);
+
+    const authority: EditAuthority = { actor: principal.actor, credential_id: principal.tokenId!, permission,
+      claim: { id: claim.id, project: claim.project, scope: claim.scope, holder: claim.holder, created_at: claim.created_at } };
+    if (opts.authority && JSON.stringify(opts.authority) !== JSON.stringify(authority)) return this.fail('claim_authority_changed', 409);
 
     try {
       this.bus.validateClaimProject(principal, claim.project, claim.holder, this.now());
@@ -173,9 +196,33 @@ export class ClaimAdmission {
       return this.fail('claim_holder_mismatch', 403);
     }
 
-    if (phase === 'reserve' && this.launchesBoundToClaim(claim.id, opts.launchId).length) {
+    if (phase !== 'enqueue' && this.conflictingLaunches(authority.claim, opts.launchId).length) {
       return this.fail('claim_conflict', 409);
     }
-    return { ok: true, access: { ...boundAccess(access), project: access.project || claim.project }, claim };
+    return { ok: true, access: boundAccess(access), authority };
   }
+
+  /** Inspect retained authority without dropping capacity or guessing process termination. */
+  heldReason(row: any): string | null {
+    try {
+      const request = JSON.parse(row.request_json);
+      const declared = this.parseDeclaration(request.access);
+      if ('error' in declared) return 'claim_authority_unsupported';
+      if (declared.access.mode !== 'edit') return null;
+      if (!request.edit_authority) return 'claim_authority_unsupported';
+      const authority: EditAuthority = request.edit_authority;
+      const check = this.evaluate({ kind: 'agent', actor: authority.actor, tokenId: authority.credential_id }, row.workspace, declared.access, 'start', { authority, launchId: row.id });
+      return check.ok ? null : check.error;
+    } catch { return 'claim_authority_unsupported'; }
+  }
+}
+
+/** Compare immutable client intent independently of the server-derived binding. */
+export function sameIntent(stored: string, canonical: string): boolean {
+  try {
+    const request = JSON.parse(stored);
+    delete request.edit_authority;
+    request.access ??= { mode: 'legacy_unspecified', claim_id: null, project: null, scopes: [] };
+    return JSON.stringify(request) === canonical;
+  } catch { return false; }
 }

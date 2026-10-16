@@ -1,103 +1,112 @@
 # Ownership-aware launch admission
 
-Editable fleet and routing launches consult the existing `/api/bus/claims` table inside the same Durable Object SQL transaction that reserves account and machine capacity. Claims remain the sole lock. Launch rows keep the bound claim identity in existing `request_json`; there is no parallel lock registry.
+Fleet and routing use the current `/api/bus/claims` rows in the Hub Durable Object SQL database. Final claim admission, account/machine reservation, and routed job linkage run in the same synchronous SQL transaction. There is no asynchronous gap between authorization and reservation, and no second lock table. Existing launch lifecycle facts retain references to claims and affected scopes.
 
-## Trust boundary
+## Trust boundary and adoption
 
-Admission declarations are a control-plane gate on enqueue, offer/reservation, and native `offered → starting`. They are not an OS sandbox, seccomp profile, or filesystem jail. A process that starts after a successful edit admission can still write wherever the host already allows. A `read` declaration proves only that the caller asked for read access, not that later tool use is confined.
+This is a control-plane admission gate, not an OS sandbox or a filesystem jail. The host's existing process permissions determine what a launched process can actually write. An explicit `read` declaration records caller intent; it does not prove or enforce read-only tool use. Free text never grants claims authority.
 
-## Access declaration
-
-Fleet `POST /api/fleet/launches` and routing `POST /api/tasks` accept an optional typed `access` object. Free-text prompts, summaries, and `approved_action` strings are never interpreted as authority.
-
-| `access.mode` | Meaning | Claims |
+| Declaration | Meaning | Admission |
 |---|---|---|
-| `read` | Explicit proven read-only *declaration* | Not required |
-| `edit` | Explicit editable intent | Required: live claim id + scopes the claim covers |
-| omitted or `legacy_unspecified` | Compatible legacy / unspecified | Not proven read-only |
+| `access.mode: "read"` | Caller explicitly declares read-only intent | Existing placement gates; no claim required |
+| `access.mode: "edit"` | Caller explicitly requests editable work | Current workspace mapping, credential, covering claim, and lifecycle conflict checks required |
+| Omitted, `null`, or `legacy_unspecified` | Compatible legacy/unspecified intent | Existing placement gates; refused where workspace policy requires claims |
 
-Edit body:
+Unspecified launches are never labeled read-only. Configuring claim requirements closes the unspecified entry path for that workspace; it cannot stop a dishonest caller from declaring `read` and later writing. Host sandboxing or a trusted read-only executor is a separate adoption requirement if that stronger guarantee is needed. Legacy launches and externally observed sessions have no provable edit scope, and this feature does not retrofit claims onto them.
+
+## Supported HTTP contract
+
+Canonical fleet endpoints are under `/api/fleet/`. Routing submission uses **`POST /api/fleet/tasks`**, with get/list/result under the same prefix. `/api/tasks` is the routing service's internal path; the Hub does not expose that bare prefix. No Hub route changes are needed.
+
+Both `POST /api/fleet/launches` and `POST /api/fleet/tasks` accept:
 
 ```json
 {
   "access": {
     "mode": "edit",
-    "claim_id": "<ulid from POST /api/bus/claims>",
-    "project": "projA",
-    "scopes": ["src/fleet.ts"]
+    "claim_id": "<claim ULID>",
+    "project": "demo-project",
+    "scopes": ["src/example.ts"]
   }
 }
 ```
 
-`claim_id` is required for edit. `scopes` are path prefixes using the same normalization as `/api/bus/claims` (`..` rejected; `.` and empty segments dropped). The live claim's `scope` must cover every requested path (equal or ancestor). `project`, when sent, must match the claim's project. Holder identity is taken from the claims row and the authenticated caller; client-supplied holder, actor, or secret fields are rejected as unknown keys.
+`claim_id` and one to 32 relative path prefixes are required for edit. `project` is optional, but must match when supplied. Every scope must equal or descend from the authoritative claim's scope. Paths use `/`; `.` and empty interior segments normalize away. Absolute paths, `..`, backslashes, colons, and control characters are refused. These are logical project-relative prefixes, not filesystem resolution or symlink checks.
 
-Read body: `{ "access": { "mode": "read" } }`. Claim fields are not allowed on read.
+Fleet edit requests also require a nonempty `approved_action` string (at most 12,000 characters), in addition to the normal launch fields and `idempotency_key`. Routing retains its existing required `approved_action` or batch of `{prompt, approved_action}` tasks. It binds that exact task array into the resulting private fleet request. These action strings are retained execution instructions, never authorization credentials.
 
-Responses and job views label `access` as `read`, `edit`, or `legacy_unspecified`. Unspecified work is never relabeled `read`.
+For read use `{"access":{"mode":"read"}}`. Read and unspecified declarations cannot carry claim/project/scope authority. Unknown fields such as `holder`, `caller`, `token`, or `edit_authority` are refused. Caller identity comes exclusively from Hub authentication.
 
-## Who may use a claim
+Creation/release of claims remains unchanged: `/api/bus/claims` and `/api/bus/claims/:id/release` with `bus:send`. Admission reads those authoritative rows and never acquires or renews a lease itself.
 
-Admission copies the caller and sets `isAdmin: false` before consulting bus identity. An admin session cannot spend another agent's claim. A `routing:submit`-only token cannot spend a claim unless that token's actor *is* the registered claim holder. Unknown, malformed, root-role, or ambiguous callers fail closed (`claim_actor_ambiguous`, `claim_holder_mismatch`, `claim_authority_unsupported`).
+## Credential and resource authority
 
-Creating and releasing claims is unchanged: `POST /api/bus/claims` and `POST /api/bus/claims/:id/release` with `bus:send`. Launch admission only reads current rows.
+Editable requests require an authenticated **agent credential** with:
 
-## Policy for configured workspaces
+- `bus:send`, plus `fleet:launch` for fleet submission or `routing:submit` for routing submission;
+- a current, unexpired, unrevoked stored credential matching the authenticated actor;
+- a uniquely registered claims holder in the same project, authorized by the bus's existing identity checks;
+- an admin-configured workspace-to-project association matching the current claim.
 
-Admins can require claims for named workspaces without pretending unspecified launches are read-only:
+An admin session cannot impersonate a holder. Host, job, root-role, unknown, and unsupported required identities fail closed for edit submission. A routing-only token, including one issued by `/api/fleet/routing/clients/:name`, has no claims authority even if an actor string happens to match a holder. An appropriate existing agent credential must be provisioned through the supported administration path; this feature does not upgrade credentials.
 
+The server retains the actor, nonsecret credential ID, required submit permission, and immutable claim identity (`id`, `project`, `scope`, `holder`, `created_at`) in existing private request JSON. Tokens and token hashes are never copied into launch/job metadata. Neither the host nor request JSON can substitute this binding. Revalidation resolves the original credential ID; it never falls back to another credential for the actor. Token refresh that replaces/revokes that ID therefore holds pending work until it is reconciled.
+
+## Workspace policy
+
+Admins may read/replace policy through:
+
+```text
+GET /api/fleet/claim-policy
+PUT /api/fleet/claim-policy
 ```
-GET  /api/fleet/claim-policy
-PUT  /api/fleet/claim-policy
-{ "workspaces": [{ "workspace": "demo", "project": "projA", "require_claim": true }] }
+
+Example PUT body:
+
+```json
+{
+  "workspaces": [
+    {"workspace":"demo", "project":"demo-project", "require_claim":true}
+  ]
+}
 ```
 
-`project` associates that workspace with a claims project. When `require_claim` is true, `legacy_unspecified` requests fail with `claim_required` and create no reservation. Explicit `read` remains allowed. Explicit `edit` still needs a live covering claim in that project.
+The PUT replaces the complete policy transactionally. `project` may be `null`; any edit request without a non-null mapping fails with `claim_workspace_unconfigured`. A non-null project associates that named host workspace with the claims namespace. `require_claim: true` refuses unspecified submissions and queued placement. Explicit read declarations remain compatible. Mapping changes are checked at actual placement and native start, including for already queued edit requests. Removing a mapping also prevents edit placement/start.
 
-## When the check runs
+## Transactions and retries
 
-1. **Enqueue** (routing `POST /api/tasks`): invalid edit authority is refused before a job row exists. Queuing may still precede placement.
-2. **Reserve / offer** (`POST /api/fleet/launches`, including routing dispatch): the live claim, holder, scope, project, and "no other active launch bound to this claim" check run inside the existing `transactionSync` that inserts `fleet_launches`. A failed check returns before `INSERT`, so account/machine capacity does not change.
-3. **Native start** (`POST /api/fleet/launches/:id/claim`): bound edit launches revalidate the same claim before `offered → starting`. The host does not have to be the claim holder; it may not change the bound identity.
+1. Routing enqueue validates current authority before inserting a job. It may queue work while no eligible machine is available. Fleet plan is a preview, never a reservation.
+2. Actual placement selects the existing model/account/machine candidate and re-reads policy, credential, holder, and claim state in the reservation transaction. Routing commits its selection and job-to-launch link in that same transaction. SQL failure rolls back all reservation/link effects. It does not discard an earlier valid queued job.
+3. Native `POST /api/fleet/launches/:id/claim` revalidates the bound edit authority inside the transaction that changes `offered` to `starting`. The authenticated destination host claims execution; it does not become the claims holder.
 
-A preflight `/api/fleet/plan` check is extra and is not the reservation.
+A claim released, expired, or reassigned while queued prevents any later offer. A revoked/expired credential or changed project mapping also prevents placement/start. Same-key retries with the identical retained request return the existing job/launch without acquiring effects, including when its authority has since expired. Changing action, access, scope, claim ID, or other canonical intent under the same key returns `idempotency_conflict`. A new key is a distinct request and still faces active-scope exclusion.
 
-Claim release, expiry, or reassignment while a job is queued prevents the later offer. Routing dispatch re-reads claims before calling launches; the launch transaction is authoritative.
+Dispatch preserves the existing fair queue cursor, tier policy, candidate ranking, explicit account pinning, quota reserves, unknown gates, and machine/account capacity checks. Interrupted-link recovery relinks only an existing launch whose retained action, access, and authority match the queued job; a request-key collision alone is insufficient.
 
-## Concurrency, retries, running expiry
+## Active effects and reconciliation
 
-- One live claim authorizes at most one active launch (`offered` / `starting` / `running` / `uncertain`). Same-holder retries with a new idempotency key conflict at reserve; an identical retry of the same key and bound action replays without a new reservation.
-- Changing `access`, scopes, approved action, or other canonical fields under the same key is `idempotency_conflict` (409).
-- If a claim expires or is released after a launch is already starting/running/uncertain, capacity stays reserved until a confirmed terminal result. The hub does not invent a process kill or replay uncertain effects. Operators reconcile using claims + launch metadata.
-- Failed SQL in that same transaction rolls back; there is no partial reservation.
+One claim authorizes at most one active launch. Different same-holder claim IDs do not bypass overlapping scope exclusion. Any offered/starting/running/uncertain launch with an edit binding blocks a replacement claim in the same project whose claim scope overlaps the retained scope. This remains true after release, expiry, claim retention deletion, or a different holder acquiring a replacement lease. The full original claim scope is conservatively protected until the existing launch lifecycle confirms termination.
 
-## Atomicity
+After a running claim or credential expires, the process lifecycle and capacity remain reserved. Admin fleet views and routed task views expose an `admission_hold` reason. Held offers are withheld from host polling and native start is refused. Running receipts and confirmed terminal reports continue to use the existing lifecycle protocol. The hub never invents a process kill, automatically replays an uncertain side effect, or frees capacity because a lease expired. A host-confirmed exit/failure (or routing terminal report with `confirmed_exit`) ends the lifecycle reservation. Operators must investigate outstanding effects through the existing launcher/native receipt and lifecycle protocol; there is no new force-release API. An offered launch with invalid authority remains reserved for operator reconciliation because the existing protocol has no offered-cancellation receipt.
 
-Fleet, routing, and claims already share the Hub Durable Object SQL. Admission instantiates `BusService` on that same store and runs inside the fleet `transactionSync` callback. There is no `await` inside that callback.
-
-Limits:
-
-- `BusService.claim` / `listClaims` still use `Date.now()` for their own writes. Admission expiry at reserve/start uses the fleet clock against the claims row.
-- Routing `dispatch` still `await`s `fleet.handle` to parse a JSON body. Claim + `INSERT` happen after that parse, in one transaction.
-- This worker cannot change `src/hub.ts`; it does not inject the Hub's `busService` instance. Both objects speak the same tables.
+Older edit launch rows without the new server binding are held and conservatively block new edits until reconciled. Unknown/corrupt retained authority fails closed. Read/legacy work remains explicitly outside claims scope protection.
 
 ## Errors
 
-| error | typical status | meaning |
+| Error | Status | Meaning |
 |---|---|---|
-| `invalid_access` | 400 | malformed `access` object |
-| `claim_required` | 403 | workspace policy requires a claim; request is unspecified |
-| `claim_holder_mismatch` | 403 | authenticated caller is not the claim holder |
-| `claim_actor_ambiguous` | 403 | caller identity missing or unusable |
-| `claim_scope_mismatch` | 403 | requested paths are not covered |
-| `claim_project_mismatch` | 403 | workspace/project policy does not match the claim |
-| `claim_authority_unsupported` | 403 | unknown/root/unusable required identity |
-| `claim_inactive` | 409 | missing, released, or expired claim |
-| `claim_conflict` | 409 | another active launch already bound to this claim |
-| `idempotency_conflict` | 409 | same key, different bound action/access |
+| `invalid_access` | 400 | Malformed declaration or unsupported path |
+| `approved_action_required` | 400 | Fleet edit omitted explicit action |
+| `claim_required` | 403 | Workspace policy refuses unspecified work |
+| `claim_workspace_unconfigured` | 403 | Workspace has no project association |
+| `claim_project_mismatch` | 403 | Claim mismatches workspace/declared project |
+| `claim_scope_mismatch` | 403 | Claim does not cover every requested prefix |
+| `claim_holder_mismatch` | 403 | Current registered identity cannot use this holder |
+| `claim_actor_ambiguous` | 403 | Actor is missing |
+| `claim_authority_unsupported` | 403 | Unsupported identity, invalid/revoked/expired credential, or missing permission |
+| `claim_authority_changed` | 409 | Retained claim identity changed |
+| `claim_inactive` | 409 | Claim missing, released, or expired |
+| `claim_conflict` | 409 | Another active launch retains overlapping authority |
+| `idempotency_conflict` | 409 | Same key with changed immutable request |
 
-## Adoption limits
-
-- Existing callers that omit `access` keep current placement behavior and are labeled `legacy_unspecified`.
-- Routing-only credentials do not mint claims. Editable routed work requires the submitting actor to be the registered holder of a live claim.
-- Host execution is not sandboxed by this gate.
-- Model tier policy, quota unknown/reserve gates, fair queue scanning, and uncertain-run retention are unchanged.
+There are no new resources, deployments, provider credentials, process controls, or model policy changes in this feature.

@@ -1,7 +1,7 @@
 /** Generic account registry and placement. Provider credentials never enter this service. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { RoutingService } from './routing';
-import { ClaimAdmission } from './claim_admission';
+import { ClaimAdmission, sameIntent, type EditAuthority, type AdmissionCaller } from './claim_admission';
 import { effectiveCheckin } from './registry';
 
 export const FLEET_SCHEMA = `
@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS fleet_subscriptions (machine_id TEXT NOT NULL, accoun
 CREATE TABLE IF NOT EXISTS fleet_sessions (machine_id TEXT NOT NULL, native_id TEXT NOT NULL, tag TEXT NOT NULL, engine TEXT, phase TEXT NOT NULL, agent_state TEXT, observed_at TEXT NOT NULL, workspace TEXT NOT NULL, profile TEXT, account TEXT, last_activity_at TEXT, PRIMARY KEY(machine_id, native_id));
 CREATE TABLE IF NOT EXISTS fleet_launches (id TEXT PRIMARY KEY, actor TEXT NOT NULL, requester_kind TEXT NOT NULL, parent_id TEXT, summary TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, mode TEXT NOT NULL, workspace TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL, native_id TEXT, launcher_task_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
 `;
-type Auth = { caller?: { isAdmin?: boolean; actor?: string; machineId?: string; kind?: string }; scopes?: string[]; error?: Response };
+type Auth = { caller?: AdmissionCaller; scopes?: string[]; error?: Response };
 const LABEL = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 const PROVIDERS = new Set(['codex', 'claude', 'grok', 'gemini', 'zai', 'go', 'copilot']);
 const ACTIVE = "('offered','starting','running','uncertain')";
@@ -117,16 +117,18 @@ export class FleetService {
   }
 
   plan(input: any) {
-    if (!object(input, ['mode', 'machine', 'engine', 'account', 'workspace', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access']) ||
+    if (!object(input, ['mode', 'machine', 'engine', 'account', 'workspace', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access', 'approved_action']) ||
       !label(input.workspace) || (input.mode !== undefined && !['headless', 'interactive'].includes(input.mode)) ||
       (input.account !== undefined && !label(input.account)) || (input.machine !== undefined && !label(input.machine)) || (input.engine !== undefined && !label(input.engine)) ||
       (input.mode === 'interactive' && !input.machine) ||
       (input.parent_id !== undefined && input.parent_id !== null && (typeof input.parent_id !== 'string' || !/^[a-f0-9-]{36}$/.test(input.parent_id))) ||
       (input.summary !== undefined && (typeof input.summary !== 'string' || input.summary.length > 240 || /[\x00-\x1f\x7f]/.test(input.summary))) ||
       (input.prompt !== undefined && (typeof input.prompt !== 'string' || input.prompt.length > 16000)) ||
+      (input.approved_action !== undefined && (typeof input.approved_action !== 'string' || !input.approved_action.trim() || input.approved_action.length > 12000)) ||
       (input.mode !== 'interactive' && !input.prompt?.trim())) return { error: 'invalid_launch_request' };
     const request: any = { mode: input.mode || 'headless', machine: input.machine || null, engine: input.engine || null, workspace: input.workspace, prompt: input.prompt || '', parent_id: input.parent_id || null, summary: input.summary || (input.mode === 'interactive' ? 'Interactive session' : 'Agent task') };
     if (input.account !== undefined) request.account = input.account;
+    if (input.approved_action !== undefined) request.approved_action = input.approved_action;
     const rejected: { machine: string; engine: string; reason: string }[] = []; const candidates: any[] = [];
     const accounts = new Map(this.sql.exec('SELECT * FROM fleet_accounts').toArray().map(a => [a.label, this.accountStatus(a)]));
     const definitions = new Map(this.sql.exec('SELECT * FROM fleet_accounts').toArray().map(a => [a.label, a]));
@@ -157,6 +159,42 @@ export class FleetService {
     return { request, selected: candidates[0] || null, candidates, rejected };
   }
 
+  /** All final placement gates, authority reads and capacity writes share this transaction. */
+  reserve(input: any, auth: Auth, expectedAuthority?: EditAuthority, preview = false): { value: any; status: number } {
+    const result = (value: any, status = 200) => ({ value, status });
+    const caller = auth.caller;
+    if (!caller || !(caller.isAdmin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch')))) return result({ error: 'forbidden' }, 403);
+    return this.transaction(() => {
+      const plan = this.plan(input);
+      if ('error' in plan) return result(plan, 400);
+      const parsed = this.admission.parseDeclaration(input?.access);
+      if ('error' in parsed) return result({ error: parsed.error }, 400);
+      if (parsed.access.mode === 'edit' && !input.approved_action?.trim()) return result({ error: 'approved_action_required' }, 400);
+      const bound = { ...plan.request, access: parsed.access };
+      if (preview) {
+        const preview = this.admission.evaluate(caller, plan.request.workspace, parsed.access, 'enqueue');
+        if (!preview.ok) return result({ error: preview.error, access: parsed.access.mode }, preview.status);
+        return result({ ...plan, access: parsed.access.mode });
+      }
+      if (!label(input.idempotency_key)) return result({ error: 'idempotency_key_required' }, 400);
+      const actor = caller.actor || caller.machineId || 'admin'; const canonical = JSON.stringify(bound);
+      const prior: any = this.sql.exec('SELECT * FROM fleet_launches WHERE actor = ? AND request_key = ?', actor, input.idempotency_key).toArray()[0];
+      if (prior) return sameIntent(prior.request_json, canonical) ? result({ id: prior.id, state: prior.state, machine: prior.machine_id, engine: prior.engine, account: prior.account, mode: prior.mode, access: JSON.parse(prior.request_json).access?.mode || 'legacy_unspecified', replay: true }) : result({ error: 'idempotency_conflict' }, 409);
+      if (plan.request.parent_id) {
+        const parent: any = this.sql.exec('SELECT actor, state FROM fleet_launches WHERE id = ?', plan.request.parent_id).toArray()[0];
+        if (!parent) return result({ error: 'parent_not_found' }, 400);
+        if (parent.actor !== actor) return result({ error: 'parent_not_owned' }, 403);
+        if (!['starting', 'running'].includes(parent.state)) return result({ error: 'parent_not_active' }, 409);
+      }
+      const admitted = this.admission.evaluate(caller, plan.request.workspace, parsed.access, 'reserve', { authority: expectedAuthority });
+      if (!admitted.ok) return result({ error: admitted.error, access: parsed.access.mode }, admitted.status);
+      if (!plan.selected) return result({ error: 'no_eligible_route', rejected: plan.rejected, access: parsed.access.mode }, 409);
+      const id = crypto.randomUUID(); const at = new Date(this.now()).toISOString(); const selected = plan.selected;
+      this.sql.exec('INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', id, actor, caller.kind || 'unknown', plan.request.parent_id, plan.request.summary, input.idempotency_key, JSON.stringify({ ...bound, ...(admitted.authority ? { edit_authority: admitted.authority } : {}) }), selected.machine, selected.engine, selected.account, selected.profile, plan.request.mode, plan.request.workspace, plan.request.prompt, 'offered', at, at);
+      return result({ id, state: 'offered', machine: selected.machine, engine: selected.engine, account: selected.account, mode: plan.request.mode, access: admitted.access.mode }, 201);
+    });
+  }
+
   async handle(request: Request, auth: Auth): Promise<Response> {
     if (auth.error) return auth.error;
     const path = new URL(request.url).pathname; const caller = auth.caller;
@@ -171,7 +209,7 @@ export class FleetService {
         agents: this.sql.exec('SELECT tag, project, role, machine_id, engine, session_id, health_state, health_at FROM agents').toArray(),
         sessions: this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray(),
         subscriptions: this.sql.exec('SELECT * FROM fleet_subscriptions ORDER BY machine_id, service, account').toArray().map((s: any) => ({ machine_id: s.machine_id, account: s.account, service: s.service, plan: s.plan, observed_at: s.observed_at, stale: !fresh(s.observed_at, this.now(), 1200000), quota: parsed(s.quota_json) })),
-        launches: this.sql.exec('SELECT id, actor, requester_kind, parent_id, summary, machine_id, engine, profile, account, mode, workspace, state, native_id, launcher_task_id, created_at, updated_at FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray() });
+        launches: this.sql.exec('SELECT * FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => { const { request_json, request_key, prompt, ...view } = row; return { ...view, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; }) });
     }
     if (path === '/api/fleet/claim-policy' && request.method === 'GET') {
       if (!admin) return response({ error: 'forbidden' }, 403);
@@ -217,39 +255,14 @@ export class FleetService {
     if (['/api/fleet/plan', '/api/fleet/launches'].includes(path) && request.method === 'POST') {
       if (!writer) return response({ error: 'forbidden' }, 403);
       const input = await body(request);
-      return this.transaction(() => {
-        const plan = this.plan(input);
-        if ('error' in plan) return response(plan, 400);
-        const parsed = this.admission.parseDeclaration(input?.access);
-        if ('error' in parsed) return response({ error: parsed.error }, 400);
-        const bound = { ...plan.request, access: parsed.access };
-        if (path.endsWith('/plan')) {
-          const preview = this.admission.evaluate(caller, plan.request.workspace, parsed.access, 'enqueue');
-          if (!preview.ok) return response({ error: preview.error, access: parsed.access.mode }, preview.status);
-          return response({ ...plan, access: parsed.access.mode });
-        }
-        if (!label(input.idempotency_key)) return response({ error: 'idempotency_key_required' }, 400);
-        const actor = caller.actor || caller.machineId || 'admin'; const canonical = JSON.stringify(bound);
-        const prior: any = this.sql.exec('SELECT * FROM fleet_launches WHERE actor = ? AND request_key = ?', actor, input.idempotency_key).toArray()[0];
-        if (prior) return prior.request_json === canonical ? response({ id: prior.id, state: prior.state, machine: prior.machine_id, engine: prior.engine, account: prior.account, mode: prior.mode, access: JSON.parse(prior.request_json).access?.mode || 'legacy_unspecified', replay: true }) : response({ error: 'idempotency_conflict' }, 409);
-        if (plan.request.parent_id) {
-          const parent: any = this.sql.exec('SELECT actor, state FROM fleet_launches WHERE id = ?', plan.request.parent_id).toArray()[0];
-          if (!parent) return response({ error: 'parent_not_found' }, 400);
-          if (parent.actor !== actor) return response({ error: 'parent_not_owned' }, 403);
-          if (!['starting', 'running'].includes(parent.state)) return response({ error: 'parent_not_active' }, 409);
-        }
-        const admitted = this.admission.evaluate(caller, plan.request.workspace, parsed.access, 'reserve');
-        if (!admitted.ok) return response({ error: admitted.error, access: parsed.access.mode }, admitted.status);
-        if (!plan.selected) return response({ error: 'no_eligible_route', rejected: plan.rejected, access: parsed.access.mode }, 409);
-        const id = crypto.randomUUID(); const at = new Date(this.now()).toISOString(); const selected = plan.selected;
-        this.sql.exec('INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', id, actor, caller.kind || 'unknown', plan.request.parent_id, plan.request.summary, input.idempotency_key, canonical, selected.machine, selected.engine, selected.account, selected.profile, plan.request.mode, plan.request.workspace, plan.request.prompt, 'offered', at, at);
-        return response({ id, state: 'offered', machine: selected.machine, engine: selected.engine, account: selected.account, mode: plan.request.mode, access: admitted.access.mode }, 201);
-      });
+      const reserved = this.reserve(input, auth, undefined, path.endsWith('/plan'));
+      return response(reserved.value, reserved.status);
     }
+
     if (path === '/api/fleet/offers' && request.method === 'GET') {
       if (!host) return response({ error: 'forbidden' }, 403);
       await this.routing.dispatch();
-      return response({ offers: this.routing.enrichOffers(this.sql.exec("SELECT id, engine, account, profile, mode, workspace, prompt FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at LIMIT 20", caller.machineId!).toArray()) });
+      return response({ offers: this.routing.enrichOffers(this.sql.exec("SELECT * FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at LIMIT 20", caller.machineId!).toArray().filter((row: any) => !this.admission.heldReason(row)).map((row: any) => ({ id: row.id, engine: row.engine, account: row.account, profile: row.profile, mode: row.mode, workspace: row.workspace, prompt: row.prompt, access: parsed(row.request_json).access?.mode || 'legacy_unspecified' }))) });
     }
     if (path === '/api/fleet/sessions' && request.method === 'PUT') {
       if (!host) return response({ error: 'forbidden' }, 403);
@@ -312,7 +325,8 @@ export class FleetService {
           const declared = this.admission.parseDeclaration(bound.access);
           if ('error' in declared) return response({ error: 'claim_inactive', access: 'legacy_unspecified' }, 409);
           if (declared.access.mode === 'edit') {
-            const admitted = this.admission.evaluate(caller, row.workspace, declared.access, 'start', { launchId: row.id });
+            if (!bound.edit_authority) return response({ error: 'claim_authority_unsupported' }, 403);
+            const admitted = this.admission.evaluate({ kind: 'agent', actor: bound.edit_authority?.actor, tokenId: bound.edit_authority?.credential_id }, row.workspace, declared.access, 'start', { launchId: row.id, authority: bound.edit_authority });
             if (!admitted.ok) return response({ error: admitted.error, access: declared.access.mode }, admitted.status);
           }
           this.sql.exec("UPDATE fleet_launches SET state = 'starting', updated_at = ? WHERE id = ?", new Date(this.now()).toISOString(), row.id);
