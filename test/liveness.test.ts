@@ -164,6 +164,20 @@ describe('stale alerts', () => {
     });
   });
 
+  it('delivers alerts to the grok-bot inbox by default when HUB_ALERT_TO is unset', async () => {
+    const bindings = env as unknown as Env;
+    const stub = bindings.HUB.get(bindings.HUB.idFromName('notify-default-' + crypto.randomUUID()));
+    await runInDurableObject(stub, async (hub: Hub) => {
+      delete (hub.env as any).HUB_ALERT_TO;
+      hub.sql.exec("INSERT INTO agents (tag, project, role, machine_id) VALUES ('grok-bot', NULL, NULL, NULL)");
+      hub.sql.exec("INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, drained) VALUES ('m', 'm', 'm', ?, ?, 0)", new Date().toISOString(), new Date(Date.now() - 3600000).toISOString());
+      await hub.runChecks('liveness');
+      const [alert]: any[] = hub.livenessService.alerts();
+      expect(alert.notify_error).toBeNull();
+      expect(JSON.parse(alert.delivered_to)).toEqual(['inbox:grok-bot']);
+    });
+  });
+
   it('accepts agent heartbeats only with the health:report scope', async () => {
     const bindings = env as unknown as Env;
     const stub = bindings.HUB.get(bindings.HUB.idFromName('heartbeat-scope-' + crypto.randomUUID()));

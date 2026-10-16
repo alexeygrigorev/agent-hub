@@ -1179,7 +1179,7 @@ export class Hub extends DurableObject {
     const text = alertText(alert); const errors: string[] = [];
     // Each target is delivered once; a retry only covers targets that have not succeeded yet.
     const delivered = new Set(this.livenessService.deliveredTo(alert));
-    const targets = typeof this.env.HUB_ALERT_TO === 'string' ? this.env.HUB_ALERT_TO.split(',').map(t => t.trim()).filter(Boolean) : [];
+    const targets = typeof this.env.HUB_ALERT_TO === 'string' ? this.env.HUB_ALERT_TO.split(',').map(t => t.trim()).filter(Boolean) : ['grok-bot'];
     for (const to of targets) {
       if (delivered.has('inbox:' + to)) continue;
       try {

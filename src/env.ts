@@ -16,6 +16,7 @@ export interface Env {
   HUB_ADMIN_TOKEN_SHA256?: string;
 
   // Liveness and alerts (optional)
+  // Comma-separated inbox actors for alert delivery; defaults to ['grok-bot'] when unset.
   HUB_ALERT_TO?: string;
   HUB_ALERT_WEBHOOK?: string;
   HUB_MACHINE_STALE_S?: string;
