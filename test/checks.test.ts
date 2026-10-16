@@ -16,6 +16,8 @@ async function fixture(fn: (checks: ChecksService, deps: ActionDeps & { log: any
     new FleetService(hub.sql, f => f(), () => clock.t).init();
     const liveness = new LivenessService(hub.sql, undefined, () => clock.t); liveness.init();
     const checks = new ChecksService(hub.sql, () => clock.t); checks.init();
+    // Hub construction seeds with the real clock; this fixture runs on a pinned clock.
+    hub.sql.exec('UPDATE hub_checks SET next_due_at = ?', new Date(start).toISOString());
     const log: any[] = [];
     const deps = {
       log, liveness,
