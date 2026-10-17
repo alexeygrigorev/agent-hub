@@ -298,3 +298,17 @@ never converted to tokens or money.
 Producer agreement, runtime ingestion on enrolled hosts, 24h observed
 production data, and M11 physical adoption remain separate. This source
 does not claim them.
+
+## 7. Live integration (platform-metrics-live, M9 slice 1)
+
+Worker `src/metrics.ts` enforces the contract above through the existing
+verified host scopes plus the injected live
+`SessionControlService.hostObservationAllowed` gate inside the fresh
+mutation transaction (same pattern as status observations). The register
+bound-owner exemption applies: the live bound owner keeps transport while
+a later approval is pending; takeover still denies via bound-owner
+mismatch. Refresh migrates metrics rows under the same predecessor guard
+(guarded by table existence). Dashboard repo untouched (read-only);
+the host adapter consumes operator-supplied Dashboard hourly/usage/
+features JSON (24 half-open UTC buckets) and posts sanitized snapshots
+only. No raw transcripts/tokens/money derivations leave the host.
