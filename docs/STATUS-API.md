@@ -59,6 +59,9 @@ second tracker). No raw terminal, prompt, draft or report-body reads.
 
 - identity: `id/project/status/continuation_state/version/updated_at/created_at/title`
   (title truncated; full history bodies never exported).
+- available handoff context: `current_state/next_step/owner` (truncated
+  carrying values, null when unset) so a fresh agent can continue the task
+  from one call.
 - `sessions[]`: machine/native/tag/engine/profile/phase/agent_state/workspace/
   account/observed_at/last_activity_at/linkage/launch_id/routing_job_id plus
   per-row provenance `{source, observed_at, freshness, coverage, reason}`.

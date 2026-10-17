@@ -293,8 +293,7 @@ describe('M14a authorized one-call status projection', () => {
     expect(isExpectedOffline('win35', 'DESKTOP-FP4OP26', EXPECTED_OFFLINE_UNTIL_MS + 1)).toBe(false);
   });
 
-  it('performs no writes and never exports secrets or private bodies', async () => {
-    await seedCanonicalHosts();
+  it('performs no writes and never exports secrets or private bodies', async () => {    await seedCanonicalHosts();
     const sentinel = 'SENTINEL_hubt_secret_value';
     const { task } = await createTask('demo', 'Synthetic title', 'Private body ' + sentinel + ' user_code=ABC-123 device_code_hash=deadbeef');
     await intakeOk('/tasks/' + task.id + '/events', { key: 'privaterep-' + ++seq, expected_version: 1,
@@ -573,5 +572,17 @@ describe('M14d caller-scoped durable baseline with complete POST summary', () =>
     const bad = await SELF.fetch('https://hub.test/api/status', { method: 'POST',
       headers: { Cookie: cookie, 'x-csrf-token': 'csrf', 'Content-Type': 'application/json' }, body: '{oops' });
     expect(bad.status).toBe(400);
+  });
+
+  it('carries available handoff context without history bodies', async () => {
+    const { task } = await createTask('demo', 'Context task');
+    await intakeOk('/tasks/' + task.id, { key: 'ctx-update-' + ++seq, expected_version: 1,
+      current_state: 'Synthetic state', next_step: 'Synthetic step', owner: 'demo:assistant' });
+    const data = await postOk('', {});
+    const row = data.tasks.find((t: any) => t.id === task.id);
+    expect(row.current_state).toContain('Synthetic state');
+    expect(row.next_step).toContain('Synthetic step');
+    expect(row.owner).toBe('demo:assistant');
+    expect(row.history).toBeUndefined();
   });
 });

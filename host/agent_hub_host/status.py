@@ -97,6 +97,9 @@ def render_human(data):
         lines.append('task %s [%s] %s updated=%s' % (
             escape_display(task.get('id')), escape_display(task.get('status')),
             escape_display(task.get('title')), escape_display(task.get('updated_at'))))
+        if task.get('owner') or task.get('next_step'):
+            lines.append('  owner=%s next=%s' % (
+                escape_display(task.get('owner')), escape_display(task.get('next_step'))))
         for sess in task.get('sessions', []):
             lines.append('  session %s/%s engine=%s phase=%s linkage=%s observed=%s' % (
                 escape_display(sess.get('machine_id')), escape_display(sess.get('native_id')),
