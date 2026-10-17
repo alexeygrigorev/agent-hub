@@ -263,7 +263,7 @@ def main():
         return
     if args.cmd in ('intake', 'handoff'):
         try:
-            print(json.dumps(intake.execute(args), indent=2, ensure_ascii=False))
+            print(json.dumps(intake.execute(args), indent=2, ensure_ascii=True))
         except Exception:
             print('Intake operation failed; check authentication, grants, capacity and current versions. '
                   'Retry mutations with the same key and payload after uncertain responses; '

@@ -72,6 +72,13 @@ export class IntakeService {
       for (const table of ['tasks', 'grants', 'rules', 'receipts']) {
         this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_${table} (id TEXT PRIMARY KEY, data TEXT NOT NULL)`);
       }
+      // A renamed/rebound registry identity cannot revive a former grant by moving back.
+      // These triggers affect only our grant store; credential/registry ownership is unchanged.
+      const actor = "CASE WHEN COALESCE(OLD.project,'')='' THEN OLD.tag ELSE OLD.project || ':' || OLD.tag END";
+      const revoke = (predicate: string) => `UPDATE intake_grants SET data=json_set(data,'$.revoked_at',CAST(strftime('%s','now') AS INTEGER)*1000,'$.revocation_reason','registry_binding_changed') WHERE json_extract(data,'$.revoked_at') IS NULL AND ${predicate}; UPDATE intake_meta SET revision=revision+1 WHERE id=1 AND changes()>0;`;
+      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_end_registration AFTER DELETE ON agents BEGIN ${revoke(`json_extract(data,'$.binding.actor')=(${actor})`)} END`);
+      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_end_binding AFTER UPDATE OF tag,project,machine_id ON agents WHEN OLD.tag IS NOT NEW.tag OR COALESCE(OLD.project,'')!=COALESCE(NEW.project,'') OR OLD.machine_id IS NOT NEW.machine_id BEGIN ${revoke(`json_extract(data,'$.binding.actor')=(${actor})`)} END`);
+      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_end_machine AFTER DELETE ON machines BEGIN ${revoke("json_extract(data,'$.binding.machine_id')=OLD.id")} END`);
     });
   }
   private rows(table: string): Obj[] { return this.sql.exec(`SELECT data FROM intake_${table} ORDER BY id`).toArray().map((r: any) => JSON.parse(r.data)); }
@@ -97,13 +104,15 @@ export class IntakeService {
     const caller = auth.caller!;
     if (!caller) fail('unauthorized', 401);
     if (caller.kind === 'human' && caller.isAdmin && auth.scopes?.includes('admin')) {
+      let identity = caller.actor || 'admin';
       if (caller.tokenId) {
         const c = this.sql.exec('SELECT * FROM credentials WHERE id=?', caller.tokenId).toArray()[0] as any;
         let scopes: any; try { scopes = JSON.parse(c?.scopes); } catch { fail('unauthorized', 401); }
         if (!c || c.kind !== 'human' || c.token_hash !== caller.tokenHash || c.revoked_at ||
-          !Number.isFinite(Date.parse(c.expires_at)) || Date.parse(c.expires_at) <= Date.now() || !scopes.includes('admin')) fail('unauthorized', 401);
+          !Number.isFinite(Date.parse(c.expires_at)) || Date.parse(c.expires_at) <= Date.now() || !Array.isArray(scopes) || !scopes.includes('admin') || !c.family_id) fail('unauthorized', 401);
+        identity = 'human-family:' + c.family_id;
       }
-      return { admin: true, actor: caller.actor || 'admin', identity: caller.tokenId || caller.actor || 'admin' };
+      return { admin: true, actor: caller.actor || 'admin', identity };
     }
     if (caller.kind !== 'agent' || !caller.tokenId || !caller.tokenHash) fail('forbidden', 403);
     const c = this.sql.exec('SELECT * FROM credentials WHERE id=?', caller.tokenId).toArray()[0] as any;
@@ -111,7 +120,8 @@ export class IntakeService {
     if (!binding || c.token_hash !== caller.tokenHash || binding.actor !== caller.actor) fail('forbidden', 403);
     const grants = this.rows('grants').filter(g => !g.revoked_at && g.expires_at > Date.now() && canonical(g.binding) === canonical(binding));
     if (!grants.length) fail('forbidden', 403);
-    return { admin: false, actor: binding.actor, identity: 'family:' + binding.family_id, grants };
+    return { admin: false, actor: binding.actor, identity: 'family:' + binding.family_id, grants,
+      valid_until: Math.min(Date.parse(c.expires_at), ...grants.map(g => g.expires_at)) };
   }
   private binding(c: any): Obj | null {
     if (!c || c.kind !== 'agent' || c.revoked_at || !Number.isFinite(Date.parse(c.expires_at)) || Date.parse(c.expires_at) <= Date.now()) return null;
@@ -140,13 +150,21 @@ export class IntakeService {
   }
   private continuation(task: Obj): string {
     const pending = this.unresolved(task);
-    if (pending.some(e => e.kind === 'pending_approval')) return 'approval_blocked';
-    if (task.uncertainty) return 'uncertain';
-    if (pending.some(e => e.kind === 'blocker')) return 'blocked';
+    if (task.status === 'pending_approval' || pending.some(e => e.kind === 'pending_approval')) return 'approval_blocked';
+    const pendingVoice = task.history.some((e: Obj, i: number) => e.kind === 'intake' && e.text === null &&
+      !task.history.slice(i + 1).some((later: Obj) => later.kind === 'intake' && later.transcription === 'provided' && later.source.reference === e.source.reference));
+    if (task.uncertainty || pendingVoice) return 'uncertain';
+    if (task.status === 'blocked' || pending.some(e => e.kind === 'blocker')) return 'blocked';
     if (task.status === 'in_progress') return 'active';
     return task.status === 'open' ? 'ready' : 'closed_or_waiting';
   }
-  private view(task: Obj): Obj { return { ...task, continuation_state: this.continuation(task), unresolved: this.unresolved(task), operator_rules: this.rules([task]), data_notice: DATA_NOTICE }; }
+  private taskView(task: Obj): Obj {
+    const { title, current_state, next_step, owner, uncertainty, history, ...identity } = task;
+    return { ...identity, control: { version: task.version, status: task.status, continuation_state: this.continuation(task),
+      authority: 'hub_ledger_cas', execution_evidence: 'not_verified_by_intake' },
+      payload_data: { title, current_state, next_step, owner, uncertainty, history }, unresolved: this.unresolved(task) };
+  }
+  private view(task: Obj): Obj { return { ...this.taskView(task), operator_rules: this.rules([task]), data_notice: DATA_NOTICE }; }
   private page(url: URL, items: Obj[], revision: number): Obj {
     const limit = url.searchParams.has('limit') ? integer(Number(url.searchParams.get('limit')), 1, INTAKE_LIMITS.page) : INTAKE_LIMITS.page;
     const after = url.searchParams.get('after');
@@ -167,14 +185,16 @@ export class IntakeService {
       this.operator(p); return { snapshot_version: revision, operator_rules: this.rows('rules'), data_notice: DATA_NOTICE };
     }
     if (path === '/tasks' || path === '/handoff') {
+      if (url.searchParams.has('authorization_valid_until') && Number(url.searchParams.get('authorization_valid_until')) !== (p.valid_until ?? null)) fail('stale_snapshot', 409);
+      if (!p.admin && url.searchParams.has('after') && !url.searchParams.has('authorization_valid_until')) fail('authorization_snapshot_required');
       let tasks = this.rows('tasks').filter(t => this.allowed(p, t));
       if (url.searchParams.has('project')) tasks = tasks.filter(t => t.project === url.searchParams.get('project'));
       const status = url.searchParams.get('status');
       if (status && status !== 'all' && status !== 'open' && !STATUSES.includes(status)) fail('invalid_status');
-      if (path === '/handoff' || status === 'open') tasks = tasks.filter(t => OPEN.includes(t.status) || this.unresolved(t).length > 0);
+      if (path === '/handoff' || status === 'open') tasks = tasks.filter(t => OPEN.includes(t.status) || this.unresolved(t).length > 0 || this.continuation(t) === 'uncertain');
       else if (status && status !== 'all') tasks = tasks.filter(t => t.status === status);
       const result = this.page(url, tasks, revision);
-      return { ...result, items: result.items.map((t: Obj) => ({ ...t, continuation_state: this.continuation(t), unresolved: this.unresolved(t) })), operator_rules: this.rules(tasks),
+      return { ...result, authorization_valid_until: p.valid_until ?? null, items: result.items.map((t: Obj) => this.taskView(t)), operator_rules: this.rules(tasks),
         data_notice: DATA_NOTICE, authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
         completeness: 'All authorized matching records are included across pages at snapshot_version. Restart on stale_snapshot.' };
     }
@@ -232,6 +252,7 @@ export class IntakeService {
       if (!this.allowed(p, task, true)) fail('forbidden', 403);
       this.bounded('tasks', INTAKE_LIMITS.tasks);
       task.history.push(this.event({ kind: 'intake', text: b.text, source: b.source, transcription: b.transcription }, task, p, now));
+      task.history[0].intake_key = b.key;
       this.put('tasks', task); return { task: this.view(task) };
     }
     if (path === '/grants') {
@@ -286,6 +307,7 @@ export class IntakeService {
       }
       task.history.push({ id: crypto.randomUUID(), kind: 'update', changes, actor: p.actor, captured_at: now, authority: 'untrusted_task_data' });
     }
+    task.history[task.history.length - 1].intake_key = b.key;
     task.version++; task.updated_at = now;
     if (encoded(task) > INTAKE_LIMITS.taskBytes) fail('task_capacity', 507);
     this.put('tasks', task); return { task: this.view(task) };
@@ -293,7 +315,12 @@ export class IntakeService {
   async handle(request: Request, authenticate: () => Promise<Auth>): Promise<Response> {
     const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
     try {
-      const initial = await authenticate(); if (initial.error) return json({ error: 'unauthorized_or_forbidden' }, initial.error.status);
+      const initial = await authenticate();
+      const crossOrigin = request.method === 'POST' && request.headers.has('Origin') && request.headers.get('Origin') !== new URL(request.url).origin;
+      if (initial.error || crossOrigin) {
+        try { await request.body?.cancel(); } catch { /* Body may already be cancelled. */ }
+        return json({ error: 'unauthorized_or_forbidden' }, crossOrigin ? 403 : initial.error!.status);
+      }
       if (!['GET', 'POST'].includes(request.method)) return json({ error: 'method_not_allowed' }, 405);
       const payload = request.method === 'POST' ? await body(request) : null;
       const auth = await authenticate(); if (auth.error) return json({ error: 'unauthorized_or_forbidden' }, auth.error.status);

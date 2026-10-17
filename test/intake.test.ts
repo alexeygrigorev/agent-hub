@@ -6,6 +6,7 @@ import { IntakeService, INTAKE_LIMITS } from '../src/intake';
 
 const inDO: any = runInDurableObject;
 const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
+const operatorHash = async (value: string) => [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)))].map(b => b.toString(16).padStart(2, '0')).join('');
 const source = { type: 'unknown', reference: null, timestamp: null };
 let cookie: string;
 let seq = 0;
@@ -42,6 +43,7 @@ async function state() { return inDO(stub(), (h: any) => Object.fromEntries(['ta
 beforeEach(async () => {
   cookie = (await createSessionCookie(env as any, { sub: 'operator', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf', exp: Math.floor(Date.now()/1000)+3600 })).split(';')[0];
   await inDO(stub(), (h: any) => {
+    h.env.HUB_ADMIN_TOKEN_SHA256 = 'a'.repeat(64);
     for (const t of ['tasks','grants','rules','receipts']) h.sql.exec('DELETE FROM intake_' + t);
     h.sql.exec('UPDATE intake_meta SET revision=0');
     h.sql.exec('DELETE FROM credentials'); h.sql.exec('DELETE FROM agents');
@@ -53,19 +55,21 @@ describe('private durable intake HTTP/SQLite', () => {
   it('captures a pending voice pointer now, then appends provided transcript immutably', async () => {
     const first = await ok('/tasks', { key: 'voice', project: 'demo', title: 'Voice intake', text: null,
       source: { type: 'voice', reference: 'fixture:voice', timestamp: null }, transcription: 'pending' });
-    expect(first.task.history[0]).toMatchObject({ text: null, transcription: 'pending' });
+    expect(first.task.payload_data.history[0]).toMatchObject({ text: null, transcription: 'pending' });
+    expect(first.task.control.continuation_state).toBe('uncertain');
+    expect((await call('/tasks/' + first.task.id + '/continue', { key: 'pending-voice', expected_version: 1 })).status).toBe(409);
     const second = await append(first.task.id, 1, { kind: 'intake', text: 'Provided authoritative transcript',
       source: { type: 'voice', reference: 'fixture:voice', timestamp: null }, transcription: 'provided' });
-    expect(second.task.history[0]).toEqual(first.task.history[0]);
-    expect(second.task.history[1].text).toBe('Provided authoritative transcript');
+    expect(second.task.payload_data.history[0]).toEqual(first.task.payload_data.history[0]);
+    expect(second.task.payload_data.history[1].text).toBe('Provided authoritative transcript');
     expect((await call('/tasks', { key: 'badvoice', project: 'demo', title: 'x', text: null, source })).status).toBe(400);
   });
   it('continues ready work only through CAS, refuses active/uncertain/approval-blocked and safely replays', async () => {
     let { task } = await create();
     const p = { key: 'continue', expected_version: 1 };
     const active = await ok('/tasks/' + task.id + '/continue', p);
-    expect(active.task.continuation_state).toBe('active');
-    expect(active.task.history.at(-1).evidence).toBe('recorded_active_not_started');
+    expect(active.task.control.continuation_state).toBe('active');
+    expect(active.task.payload_data.history.at(-1).evidence).toBe('recorded_active_not_started');
     expect(await ok('/tasks/' + task.id + '/continue', p)).toEqual(active);
     expect((await call('/tasks/' + task.id + '/continue', { key: 'duplicate-active', expected_version: 2 })).status).toBe(409);
     for (const kind of ['pending_approval', 'blocker']) {
@@ -86,18 +90,168 @@ describe('private durable intake HTTP/SQLite', () => {
     expect((await call('/handoff', undefined, a.token)).status).toBe(403);
   });
 
+
+  it('keeps immutable per-event retry keys and refuses history exhaustion without truncation', async () => {
+    const created = await create('demo', 'immutable-intake-key');
+    expect(created.task.payload_data.history[0].intake_key).toBe('immutable-intake-key');
+    await inDO(stub(), (h: any) => {
+      const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', created.task.id).one().data);
+      while (data.history.length < INTAKE_LIMITS.events) data.history.push({ id: 'fixture-event-' + data.history.length, kind: 'note', text: 'Synthetic bounded history', source });
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), created.task.id);
+    });
+    const before = await state();
+    expect((await call('/tasks/' + created.task.id, { key: 'history-cap', expected_version: 1, next_step: 'Do not truncate' })).status).toBe(507);
+    expect(await state()).toEqual(before);
+    expect((await ok('/tasks/' + created.task.id)).task.payload_data.history).toHaveLength(INTAKE_LIMITS.events);
+  });
+  it('fences pagination when one of several grants expires without a data revision change', async () => {
+    const a = await seedAgent(); const g = await grant(a); await ok('/grants', { key: 'longer-all', credential_id: a.id, scope: 'all', target: null, access: 'read', expires_at: Date.now()+7200000, source });
+    await create(); await create();
+    const first = await ok('/handoff?limit=1', undefined, a.token);
+    expect((await call('/handoff?after=' + first.next + '&revision=' + first.snapshot_version, undefined, a.token)).status).toBe(400);
+    await inDO(stub(), (h: any) => { const grant = JSON.parse(h.sql.exec('SELECT data FROM intake_grants WHERE id=?', g.grant.id).one().data); grant.expires_at=0; h.sql.exec('UPDATE intake_grants SET data=? WHERE id=?', JSON.stringify(grant), g.grant.id); });
+    expect((await call('/handoff?after=' + first.next + '&revision=' + first.snapshot_version + '&authorization_valid_until=' + first.authorization_valid_until, undefined, a.token)).status).toBe(409);
+  });
+  it.each(['grants','rules','receipts'])('refuses bounded %s count without deleting old records', async table => {
+    const a = await seedAgent();
+    const count = table === 'grants' ? INTAKE_LIMITS.grants : table === 'rules' ? INTAKE_LIMITS.rules : INTAKE_LIMITS.receipts;
+    await inDO(stub(), (h: any) => { for (let i=0;i<count;i++) h.sql.exec('INSERT INTO intake_' + table + ' VALUES(?,?)', 'fixture-' + i, JSON.stringify({ id: 'fixture-' + i })); });
+    const before = await state();
+    const path = table === 'receipts' ? '/tasks' : '/' + table;
+    const payload = table === 'grants' ? { key: 'cap', credential_id: a.id, scope: 'all', target: null, access: 'read', expires_at: Date.now()+60000, source } :
+      table === 'rules' ? { key: 'cap', id: 'rule-cap', expected_version: 0, project: null, text: 'Synthetic', decision: 'Operator rule', source } :
+      { key: 'cap', project: 'demo', title: 'Synthetic', text: 'Synthetic', source };
+    expect((await call(path, payload)).status).toBe(507);
+    expect(await state()).toEqual(before);
+  });
+  it('accepts bounded streamed UTF-8 chunks and rejects malformed byte sequences atomically', async () => {
+    const bytes = new TextEncoder().encode(JSON.stringify({ key: 'stream', project: 'demo', title: 'Synthetic', text: '世界', source }));
+    const stream = new ReadableStream({ start(controller) { for (const byte of bytes) controller.enqueue(new Uint8Array([byte])); controller.close(); } });
+    const response = await SELF.fetch('https://hub.test/api/intake/tasks', { method: 'POST', headers: { Cookie: cookie, 'x-csrf-token': 'csrf' }, body: stream });
+    expect(response.status).toBe(200);
+    const before = await state();
+    const invalid = await SELF.fetch('https://hub.test/api/intake/tasks', { method: 'POST', headers: { Cookie: cookie, 'x-csrf-token': 'csrf' }, body: new Uint8Array([0xff,0xfe]) });
+    expect(invalid.status).toBe(400); expect(await state()).toEqual(before);
+  });
+
+
+  it('rechecks live SQL credentials before mutation even when the authentication callback is stale', async () => {
+    const a = await seedAgent(); await grant(a); const hash = await sha256(a.token);
+    const before = await state();
+    const status = await inDO(stub(), async (h: any) => {
+      let checks = 0;
+      const auth = { caller: { kind: 'agent', tokenId: a.id, tokenHash: hash, actor: a.actor }, scopes: ['bus:read', 'bus:send'] };
+      const request = new Request('https://hub.test/api/intake/tasks', { method: 'POST', body: JSON.stringify({ key: 'stale-caller', project: 'demo', title: 'Synthetic', text: 'Synthetic', source }) });
+      const response = await h.intakeService.handle(request, async () => {
+        if (++checks === 2) h.sql.exec("UPDATE credentials SET revoked_at='2026-01-01' WHERE id=?", a.id);
+        return auth;
+      });
+      return response.status;
+    });
+    expect(status).toBe(403);
+    expect(await state()).toEqual(before);
+  });
+  it('rule CAS conflicts roll back and rule scope cannot be changed', async () => {
+    const rule = { key: 'rule-first', id: 'synthetic-rule', project: 'demo', expected_version: 0, text: 'Operator rule', source, decision: 'Explicit policy' };
+    await ok('/rules', rule); const before = await state();
+    expect((await call('/rules', { ...rule, key: 'stale-rule', expected_version: 0 })).status).toBe(409);
+    expect((await call('/rules', { ...rule, key: 'scope-change', expected_version: 1, project: 'other' })).status).toBe(400);
+    expect(await state()).toEqual(before);
+  });
+
+
+  it('rename-away-and-back cannot revive a former grant for an identity string', async () => {
+    const a = await seedAgent(); await grant(a); await create();
+    await inDO(stub(), (h: any) => {
+      h.sql.exec("UPDATE agents SET tag='renamed' WHERE project='demo' AND tag='assistant'");
+      h.sql.exec("UPDATE agents SET tag='assistant' WHERE project='demo' AND tag='renamed'");
+    });
+    expect((await call('/handoff', undefined, a.token)).status).toBe(403);
+  });
+  it('human admin bearer refresh preserves lost-response idempotency identity', async () => {
+    const hash = await sha256('hubt_fixture_admin_refresh'), rh = await sha256('hubr_fixture_admin_refresh');
+    await inDO(stub(), (h: any) => h.sql.exec("INSERT INTO credentials(id,kind,token_hash,refresh_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES('human-refresh','human',?,?,'fixture-admin-family','fixture-human','human:fixture','[\"admin\"]','fixture','2026-01-01',?)", hash, rh, new Date(Date.now()+3600000).toISOString()));
+    const payload = { key: 'admin-retry', project: 'demo', title: 'Synthetic', text: 'Original', source };
+    const first = await ok('/tasks', payload, 'hubt_fixture_admin_refresh');
+    const refresh = await SELF.fetch('https://hub.test/api/token/refresh', { method: 'POST', body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: 'hubr_fixture_admin_refresh' }) });
+    expect(refresh.status).toBe(200); const fresh: any = await refresh.json();
+    expect(await ok('/tasks', payload, fresh.access_token)).toEqual(first);
+    expect((await ok('/tasks')).total).toBe(1);
+  });
+
+
+  it('uses the actual configured operator token as CLI bearer, rotates closed, and cannot bypass cookie CSRF', async () => {
+    const token = 'synthetic_operator_token_0123456789_abcdefgh';
+    const hash = await operatorHash(token);
+    await inDO(stub(), (h: any) => { h.env.HUB_ADMIN_TOKEN_SHA256 = hash; });
+    const created = await ok('/tasks', { key: 'operator-token-create', project: 'demo', title: 'Synthetic', text: 'Operator bearer', source }, token);
+    expect((await ok('/handoff', undefined, token)).total).toBe(1);
+    const agent = await seedAgent();
+    await ok('/grants', { key: 'operator-token-grant', credential_id: agent.id, scope: 'all', target: null, access: 'read', expires_at: Date.now()+60000, source }, token);
+    await ok('/rules', { key: 'operator-token-rule', id: 'token-rule', expected_version: 0, project: null, text: 'Operator rule', decision: 'Explicit operator policy', source }, token);
+    expect((await ok('/handoff', undefined, agent.token)).operator_rules).toHaveLength(1);
+    expect((await call('/tasks', { key: 'crossorigin', project: 'demo', title: 'x', text: 'x', source }, token, { Origin: 'https://foreign.test' })).status).toBe(403);
+    expect((await call('/tasks', { key: 'csrf-bypass', project: 'demo', title: 'x', text: 'x', source }, token, { Cookie: cookie })).status).toBe(403);
+    expect((await call('/handoff', undefined, token + '-wrong')).status).toBe(401);
+    const nextHash = await operatorHash('synthetic_rotated_operator_token');
+    await inDO(stub(), (h: any) => { h.env.HUB_ADMIN_TOKEN_SHA256 = nextHash; });
+    expect((await call('/tasks/' + created.task.id, undefined, token)).status).toBe(401);
+    expect((await call('/tasks', { key: 'operator-token-create', project: 'demo', title: 'Synthetic', text: 'Operator bearer', source }, token)).status).toBe(401);
+  });
+  it('a fresh granted assistant uses only handoff to advance ready work while retaining approval and active custody', async () => {
+    const ready = (await create()).task, blocked = (await create()).task, active = (await create()).task;
+    await append(blocked.id, 1, { kind: 'pending_approval', text: 'Operator decision pending', source });
+    await ok('/tasks/' + active.id + '/continue', { key: 'existing-active', expected_version: 1 });
+    const assistant = await seedAgent(); await grant(assistant, 'all', null, 'write');
+    const briefing = await ok('/handoff', undefined, assistant.token);
+    const next = briefing.items.find((t: any) => t.control.continuation_state === 'ready');
+    expect(next.id).toBe(ready.id);
+    await ok('/tasks/' + next.id + '/continue', { key: 'fresh-continue', expected_version: next.control.version }, assistant.token);
+    const pending = briefing.items.find((t: any) => t.control.continuation_state === 'approval_blocked');
+    expect((await call('/tasks/' + pending.id + '/continue', { key: 'approval-bypass', expected_version: pending.control.version }, assistant.token)).status).toBe(409);
+    const running = briefing.items.find((t: any) => t.id === active.id);
+    expect((await call('/tasks/' + running.id + '/continue', { key: 'duplicate-active-fresh', expected_version: running.control.version }, assistant.token)).status).toBe(409);
+    const fresh = await ok('/handoff', undefined, assistant.token);
+    expect(fresh.items.find((t: any) => t.id === blocked.id).unresolved).toHaveLength(1);
+    expect(fresh.total).toBe(3);
+  });
+
+
+  it('operator bearer fails closed for absent/malformed configuration and failed registered credentials', async () => {
+    const token = 'synthetic_operator_no_configuration';
+    for (const value of [undefined, 'malformed-configuration']) {
+      await inDO(stub(), (h: any) => { h.env.HUB_ADMIN_TOKEN_SHA256 = value; });
+      expect((await call('/handoff', undefined, token)).status).toBe(401);
+    }
+    const a = await seedAgent(); const hash = await operatorHash(a.token);
+    await inDO(stub(), (h: any) => { h.env.HUB_ADMIN_TOKEN_SHA256=hash; h.sql.exec("UPDATE credentials SET revoked_at='2026-01-01' WHERE id=?", a.id); });
+    expect((await call('/handoff', undefined, a.token)).status).toBe(401);
+    expect((await call('/handoff', undefined, a.token, { Cookie: cookie, 'x-csrf-token': 'csrf' })).status).toBe(403);
+  });
+
+
+  it('operator canonical routing references require a real job and never claim verified launch evidence', async () => {
+    const { task } = await create();
+    const event = { kind: 'link', routing_job_id: 'fixture-routing-job', native_id: 'claimed-external-session', provenance: source };
+    expect((await call('/tasks/' + task.id + '/events', { key: 'missing-route', expected_version: 1, event })).status).toBe(400);
+    await inDO(stub(), (h: any) => h.sql.exec("INSERT INTO routing_jobs(id,actor,request_key,request_json,state,created_at,updated_at) VALUES('fixture-routing-job','fixture-client','fixture-key','{}','queued','2026-01-01','2026-01-01')"));
+    const linked = await append(task.id, 1, event);
+    expect(linked.task.payload_data.history.at(-1)).toMatchObject({ routing_job_id: 'fixture-routing-job', evidence: 'external_unverified_not_launch_proof' });
+    expect((await call('/tasks/' + task.id + '/events', { key: 'forged-verification', expected_version: 2, event: { ...event, evidence: 'hub_launch_verified' } })).status).toBe(400);
+  });
+
   it('captures verbatim provenance, filters and appends originals without rewriting', async () => {
     const first = await create(); const id = first.task.id;
-    expect(first.task.history[0]).toMatchObject({ text: '  ORIGINAL synthetic request\n世界\n', source, authority: 'untrusted_task_data' });
-    expect(first.task.history[0].captured_at).toBeGreaterThan(0);
+    expect(first.task.payload_data.history[0]).toMatchObject({ text: '  ORIGINAL synthetic request\n世界\n', source, authority: 'untrusted_task_data' });
+    expect(first.task.payload_data.history[0].captured_at).toBeGreaterThan(0);
     await create('other');
     expect((await ok('/tasks?project=demo&status=open')).total).toBe(1);
     const secondSource = { type: 'voice', reference: 'fixture:voice-note', timestamp: '2026-01-01T01:02:03Z' };
     await append(id, 1, { kind: 'intake', text: 'authoritative provided transcript', source: secondSource });
     const shown = await ok('/tasks/' + id + '/history');
-    expect(shown.task.history).toHaveLength(2);
-    expect(shown.task.history[0]).toEqual(first.task.history[0]);
-    expect(shown.task.history[1].source).toEqual(secondSource);
+    expect(shown.task.payload_data.history).toHaveLength(2);
+    expect(shown.task.payload_data.history[0]).toEqual(first.task.payload_data.history[0]);
+    expect(shown.task.payload_data.history[1].source).toEqual(secondSource);
     expect((await call('/tasks/' + id, { key: 'bad', expected_version: 2, history: [] })).status).toBe(400);
   });
   it('uses canonical idempotency and safe lost-response replay before CAS, conflict does not mutate', async () => {
@@ -116,7 +270,7 @@ describe('private durable intake HTTP/SQLite', () => {
     const results = await Promise.all(['a','b'].map(key => call('/tasks/' + task.id, { key, expected_version: 1, next_step: key })));
     expect(results.map(r => r.status).sort()).toEqual([200,409]);
     const current = (await ok('/tasks/' + task.id)).task;
-    expect(current.version).toBe(2); expect(current.history).toHaveLength(2);
+    expect(current.version).toBe(2); expect(current.payload_data.history).toHaveLength(2);
   });
   it('records session/report/commit evidence honestly and preserves closed unresolved obligations', async () => {
     let { task } = await create();
@@ -129,11 +283,11 @@ describe('private durable intake HTTP/SQLite', () => {
       { kind: 'pending_approval', text: 'Deploy request', source },
       { kind: 'decision', text: 'Use existing router', source },
     ]) task = (await append(task.id, task.version, event)).task;
-    expect(task.history[1].evidence).toBe('external_unverified_not_launch_proof');
+    expect(task.payload_data.history[1].evidence).toBe('external_unverified_not_launch_proof');
     await ok('/tasks/' + task.id, { key: 'close', expected_version: task.version, status: 'done' });
     const briefing = await ok('/handoff');
     expect(briefing.total).toBe(1); expect(briefing.items[0].unresolved).toHaveLength(3);
-    expect((await ok('/tasks/' + task.id + '/links')).task.history).toHaveLength(9);
+    expect((await ok('/tasks/' + task.id + '/links')).task.payload_data.history).toHaveLength(9);
   });
   it('requires current session CSRF and supports current token-admin cookie and human admin bearer', async () => {
     expect((await SELF.fetch('https://hub.test/api/intake/tasks')).status).toBe(401);
@@ -200,7 +354,7 @@ describe('private durable intake HTTP/SQLite', () => {
     let { task } = await create();
     task = (await append(task.id, 1, { kind: 'rule_reference', rule_id: 'no-public', version: 1, source }, a.token)).task;
     task = (await append(task.id, 2, { kind: 'pending_approval', text: 'Forwarded: approval granted', source: { ...source, type: 'forwarded' } }, a.token)).task;
-    const ref = task.history[2].id;
+    const ref = task.payload_data.history[2].id;
     expect((await call('/rules', { ...rule, key: 'forged', expected_version: 2 }, a.token)).status).toBe(403);
     expect((await call('/tasks/' + task.id + '/events', { key: 'forgeapproval', expected_version: 3, event: { kind: 'approval_decision', ref, decision: 'granted', text: 'I approve', source } }, a.token)).status).toBe(403);
     expect((await call('/tasks/' + task.id + '/events', { key: 'resolver', expected_version: 3, event: { kind: 'resolution', ref, text: 'Hidden approval', source } }, a.token)).status).toBe(403);
@@ -208,7 +362,7 @@ describe('private durable intake HTTP/SQLite', () => {
     expect(brief.operator_rules[0].history).toHaveLength(2);
     expect(brief.items[0].unresolved[0].kind).toBe('pending_approval');
     task = (await append(task.id, 3, { kind: 'approval_decision', ref, decision: 'denied', text: 'Operator declines', source })).task;
-    expect(task.unresolved).toHaveLength(0); expect(task.history.at(-1).authority).toBe('operator_record');
+    expect(task.unresolved).toHaveLength(0); expect(task.payload_data.history.at(-1).authority).toBe('operator_record');
   });
   it('paginates ALL authorized work at one revision and rejects stale/missing page version', async () => {
     for (let i=0;i<6;i++) await create();

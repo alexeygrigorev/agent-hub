@@ -49,6 +49,15 @@ class TestIntakeCli(unittest.TestCase):
         self.assertEqual(payload['source'], {'type': 'unknown', 'reference': None, 'timestamp': None})
         self.assertEqual(json.loads(out), {'ok': True})
 
+    def test_terminal_and_unicode_controls_are_escaped_without_rewriting_json_data(self):
+        text = 'Synthetic\x1b[2J\x9b31m\u202e\n世界'
+        with patch.object(intake, 'execute', return_value={'original': text}):
+            code, output, error = self.run_cli('handoff')
+        self.assertEqual(code, 0, error)
+        self.assertEqual(json.loads(output)['original'], text)
+        for control in ('\x1b', '\x9b', '\u202e'):
+            self.assertNotIn(control, output)
+
     def test_voice_pending_capture_never_transcribes(self):
         with patch.object(intake, 'request', return_value={}) as transport:
             code, _, error = self.run_cli('intake', 'create', '--project', 'demo', '--title', 'Voice', '--voice-pending', '--source-type', 'voice', '--source-reference', 'fixture:media', '--key', 'voice')
@@ -67,6 +76,12 @@ class TestIntakeCli(unittest.TestCase):
             with patch.object(intake, 'request') as transport:
                 self.assertEqual(self.run_cli(*args)[0], 2)
                 transport.assert_not_called()
+
+    def test_uncertainty_can_be_explicitly_cleared_with_cas(self):
+        with patch.object(intake, 'request', return_value={}) as transport:
+            code, _, error = self.run_cli('intake', 'update', 'task-1', '--version', '3', '--key', 'clear', '--clear', 'uncertainty')
+        self.assertEqual(code, 0, error)
+        self.assertIsNone(transport.call_args.args[2]['uncertainty'])
 
     def test_context_history_links_rules_grants_and_revoke_use_same_api(self):
         for command in ('show', 'context', 'history', 'links'):
@@ -120,6 +135,13 @@ class TestIntakeCli(unittest.TestCase):
         self.assertIn('revision=1', transport.call_args.args[1])
         self.assertIn('after=b', transport.call_args.args[1])
         self.assertEqual(len(result['operator_rules']), 1)
+
+    def test_handoff_carries_authorization_expiry_fence(self):
+        first, second = self.page(['a'], 'a', total=2), self.page(['b'], total=2)
+        first['authorization_valid_until'] = second['authorization_valid_until'] = 123456
+        with patch.object(intake, 'request', side_effect=[first, second]) as transport:
+            self.assertTrue(intake.handoff()['complete'])
+        self.assertIn('authorization_valid_until=123456', transport.call_args.args[1])
 
     def test_stale_snapshot_discards_partial_and_restarts_bounded(self):
         with patch.object(intake, 'request', side_effect=[self.page(['old'], 'old'), intake.StaleSnapshot(), self.page(['fresh'], total=1, revision=2)]):
@@ -178,7 +200,7 @@ class TestIntakeCli(unittest.TestCase):
         try:
             fixture = dict(os.environ, PYTHONPATH=str(ROOT/'host'), PYTHONDONTWRITEBYTECODE='1',
                            HUB_CONFIG_FILE=str(ROOT/'.local/intake/absent-fixture.json'),
-                           HUB_URL='http://127.0.0.1:' + str(server.server_port), HUB_TOKEN='hubt_synthetic_cli_fixture')
+                           HUB_URL='http://127.0.0.1:' + str(server.server_port), HUB_TOKEN='synthetic_operator_cli_fixture_0123456789')
             create = subprocess.run([sys.executable, '-m', 'agent_hub_host', 'intake', 'create', '--project', 'demo',
                                      '--title', 'Synthetic', '--text-file', '-', '--key', 'fixture-create'],
                                     input='  ORIGINAL synthetic\n世界\n', env=fixture, capture_output=True, text=True, timeout=20)
@@ -188,7 +210,7 @@ class TestIntakeCli(unittest.TestCase):
                                      env=fixture, capture_output=True, text=True, timeout=20)
             self.assertEqual(handoff.returncode, 0, handoff.stderr)
             self.assertEqual(json.loads(handoff.stdout)['total'], 2)
-            self.assertTrue(all(r[2] == 'Bearer hubt_synthetic_cli_fixture' for r in requests))
+            self.assertTrue(all(r[2] == 'Bearer synthetic_operator_cli_fixture_0123456789' for r in requests))
         finally:
             server.shutdown()
             server.server_close()

@@ -7,7 +7,7 @@ import { SCHEMA_SQL } from './schema';
 import { migrateAgentRegistry, bindAgentCredentials, credentialActor, registryAddress, AGENT_NAME } from './agent_registry';
 import { JwksCache, validateIdToken, exchangeCode } from './auth/dtc';
 import { createSessionCookie, getSession, clearSessionCookie, createLoginCookie, getLoginCookie, clearLoginCookie, verifyCsrf, configuredAdmins, validSessionSecret, adminTokenHash, tokenAdminSubject, TOKEN_ADMIN_EMAIL } from './auth/session';
-import { randomString, sha256, generateUserCode } from './auth/crypto';
+import { randomString, sha256, generateUserCode, base64url } from './auth/crypto';
 import { generateTokenPair, verifyBearerScope } from './auth/token';
 import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly, updateHeartbeat } from './registry';
 import { BusService, BUS_SCHEMA_SQL, CallerContext, generateUlid } from './bus';
@@ -321,7 +321,27 @@ export class Hub extends DurableObject {
     try {
       if (path === '/api/intake' || path.startsWith('/api/intake/')) {
         return this.intakeService.handle(request, async () => {
+          if (request.headers.has('Authorization') && request.headers.has('Cookie')) return { error: Response.json({ error: 'mixed_authority' }, { status: 403 }) };
           const auth = await this.authenticateBusRequest(request);
+          // The existing operator token can administer intake through the public CLI.
+          // Cookie requests stay on the existing session/CSRF path; no agent scope changes.
+          if (auth.error && !request.headers.has('Cookie') && validSessionSecret(this.env)) {
+            const header = request.headers.get('Authorization') || '';
+            const token = /^Bearer ([^\s]{1,4096})$/.exec(header)?.[1];
+            if (token) {
+              const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token));
+              const given = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+              // A failed registered credential never upgrades to operator authority.
+              if (this.sql.exec('SELECT id FROM credentials WHERE token_hash=?', base64url(digest)).toArray().length) return auth;
+              const configured = adminTokenHash(this.env);
+              if (configured) {
+                let difference = 0;
+                for (let i = 0; i < configured.length; i++) difference |= given.charCodeAt(i) ^ configured.charCodeAt(i);
+                if (difference === 0) return { caller: { kind: 'human' as const, isAdmin: true,
+                  actor: 'human:' + tokenAdminSubject(configured) }, scopes: ['admin'] };
+              }
+            }
+          }
           if (auth.caller?.kind === 'human' && !auth.caller.tokenId) {
             const session = await getSession(this.env, request);
             if (!session) return { error: Response.json({ error: 'unauthorized' }, { status: 401 }) };

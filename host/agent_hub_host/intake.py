@@ -77,6 +77,7 @@ def add_commands(sub):
     listing.add_argument('--project')
     listing.add_argument('--after')
     listing.add_argument('--revision', type=int)
+    listing.add_argument('--authorization-valid-until', type=int)
     listing.add_argument('--limit', type=int, default=25)
     for name in ('show', 'history', 'links', 'context'):
         command = commands.add_parser(name)
@@ -89,6 +90,7 @@ def add_commands(sub):
     update.add_argument('id')
     update.add_argument('--version', type=int, required=True)
     update.add_argument('--key', required=True)
+    update.add_argument('--clear', action='append', choices=['current_state', 'next_step', 'owner', 'uncertainty'], default=[], help='Explicitly clear a context field to unknown (repeatable)')
     for field in ('status', 'title', 'current-state', 'next-step', 'owner', 'uncertainty'):
         update.add_argument('--' + field)
     event = commands.add_parser('append', help='Append intake/note/session/report/commit/followup/blocker/decision/rule reference as JSON; approval decisions require operator')
@@ -127,6 +129,7 @@ def handoff(project=None, page_size=25):
     for _ in range(3):
         tasks, seen, revision, rules = [], set(), None, {}
         after = None
+        valid_until = None
         try:
             for _ in range(257):
                 params = {'limit': page_size}
@@ -136,11 +139,16 @@ def handoff(project=None, page_size=25):
                     params['revision'] = revision
                 if after:
                     params['after'] = after
+                if valid_until is not None:
+                    params['authorization_valid_until'] = valid_until
                 page = request('GET', BASE + '/handoff?' + urlencode(params))
                 current = page['snapshot_version']
                 if revision is not None and revision != current:
                     raise StaleSnapshot('Snapshot changed')
+                if revision is not None and valid_until != page.get('authorization_valid_until'):
+                    raise StaleSnapshot('Authorization snapshot changed')
                 revision = current
+                valid_until = page.get('authorization_valid_until')
                 for task in page['items']:
                     if task['id'] in seen:
                         raise ValueError('Duplicate snapshot item')
@@ -175,7 +183,7 @@ def execute(args):
                        'reference': args.source_reference, 'timestamp': args.source_time}})
     if command == 'list':
         params = {'status': args.status, 'limit': args.limit}
-        for field in ('project', 'after', 'revision'):
+        for field in ('project', 'after', 'revision', 'authorization_valid_until'):
             if getattr(args, field) is not None:
                 params[field] = getattr(args, field)
         return request('GET', BASE + '/tasks?' + urlencode(params))
@@ -198,5 +206,9 @@ def execute(args):
         for field in ('status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty'):
             if getattr(args, field) is not None:
                 payload[field] = getattr(args, field)
+        for field in args.clear:
+            if getattr(args, field) is not None:
+                raise ValueError('Cannot set and clear one field together')
+            payload[field] = None
         return request('POST', path, payload)
     raise ValueError('Unknown intake operation')
