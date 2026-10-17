@@ -14,11 +14,31 @@ export function authPage(title: string, lede: string, body = '', email = '', foo
 export function tokenPage(message: string, next: string | null, status: number): string {
   return authPage('Sign in to Agent Hub', 'Sign in with the admin token kept on your machine.', `${status >= 400 ? `<p class="dk-callout dk-callout--${status === 429 ? 'warning' : 'danger'}" role="alert">${escapeHtml(message)}</p>` : ''}<form method="post" action="/auth/token" class="dk-stack"><input type="hidden" name="return_to" value="${escapeHtml(next || '')}"><div><label class="dk-label" for="admin-token">Admin token</label><input class="dk-input" id="admin-token" name="token" type="password" autocomplete="current-password" required></div><div class="dk-auth-card__actions"><button class="dk-button dk-button--primary dk-button--lg" type="submit">Sign in</button></div></form>`, '', 'Keep your token private.');
 }
-export function authFailure(request: Request, error: string, status: number, extra: Record<string,string> = {}): Response {
-  if (!request.headers.get('Accept')?.includes('text/html')) return Response.json({error}, {status, headers:extra});
+export function authFailure(request: Request, error: string, status: number, extra: Record<string,string> = {}, category?: string): Response {
+  const cat = category || error;
+  const respHeaders = { ...UI_HEADERS, ...extra, 'X-Auth-Error': cat };
+  if (!request.headers.get('Accept')?.includes('text/html')) {
+    return Response.json({ error, category: cat }, { status, headers: respHeaders });
+  }
   const forbidden = status === 403, unavailable = status === 503;
-  return new Response(authPage(unavailable ? 'Sign-in unavailable' : forbidden ? 'Access not allowed' : 'Sign-in could not finish', unavailable ? 'Sign-in is not configured. Contact your hub administrator.' : forbidden ? 'This account cannot administer this hub. Sign in with an approved account.' : 'This sign-in link is invalid or expired. Start sign-in again.', `<div class="dk-auth-card__actions"><a class="dk-button dk-button--primary dk-button--lg" href="/auth/login">Try sign-in again</a></div>`), {status, headers:{...UI_HEADERS,...extra}});
+  let lede = 'This sign-in link is invalid or expired. Start sign-in again.';
+  if (unavailable) {
+    lede = 'Sign-in is not configured. Contact your hub administrator.';
+  } else if (forbidden) {
+    lede = 'This account cannot administer this hub. Sign in with an approved account.';
+  } else if (cat === 'state_already_consumed' || cat === 'state_replayed') {
+    lede = 'This sign-in link has already been used. Start sign-in again.';
+  } else if (cat === 'state_expired') {
+    lede = 'This sign-in link has expired. Start sign-in again.';
+  } else if (cat === 'missing_cookie') {
+    lede = 'Sign-in session cookie was not found or expired. Ensure cookies are enabled and try again.';
+  } else if (cat.startsWith('oauth_error:') || cat.startsWith('oauth_')) {
+    lede = `Provider returned an error: ${cat.replace(/^oauth_error:|^oauth_/, '')}. Start sign-in again.`;
+  }
+  const diagBody = `<div class="dk-auth-card__actions"><a class="dk-button dk-button--primary dk-button--lg" href="/auth/login">Try sign-in again</a></div><p class="dk-hint" id="auth-diagnostic" data-category="${escapeHtml(cat)}" style="margin-top:1.25rem;font-size:0.8125rem;color:var(--dk-text-muted,#888);">Diagnostic reference: <code>${escapeHtml(cat)}</code></p>`;
+  return new Response(authPage(unavailable ? 'Sign-in unavailable' : forbidden ? 'Access not allowed' : 'Sign-in could not finish', lede, diagBody), { status, headers: respHeaders });
 }
+
 export function deviceEntry(email: string): string {
   return authPage('Pair a device', 'Enter the code shown in your terminal, then compare the request before approving.', `<form method="get" action="/device" class="dk-stack"><div><label class="dk-label" for="device-code">Device code</label><input class="dk-input dk-code-input" id="device-code" name="code" required autocomplete="off" spellcheck="false" placeholder="XXXX-XXXX" aria-describedby="code-hint"><p class="dk-hint" id="code-hint">Use the complete code from the device you want to authorize.</p></div><div class="dk-auth-card__actions"><button class="dk-button dk-button--primary dk-button--lg">Continue</button></div></form>`, email);
 }

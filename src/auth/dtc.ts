@@ -126,45 +126,60 @@ export class JwksCache {
 
 export async function validateIdToken(env: Env, token: string, expectedNonce: string, jwksCache: JwksCache): Promise<{ sub: string, email: string, email_verified: boolean }> {
   const parts = token.split('.');
-  if (typeof token !== 'string' || token.length > 16384 || parts.length !== 3) throw new Error('Invalid token format');
+  if (typeof token !== 'string' || token.length > 16384 || parts.length !== 3) throw new Error('jwt_format_invalid');
 
-  const header = JSON.parse(new TextDecoder().decode(decodeBase64url(parts[0])));
-  const claims = JSON.parse(new TextDecoder().decode(decodeBase64url(parts[1])));
+  let header: any;
+  let claims: any;
+  try {
+    header = JSON.parse(new TextDecoder().decode(decodeBase64url(parts[0])));
+    claims = JSON.parse(new TextDecoder().decode(decodeBase64url(parts[1])));
+  } catch {
+    throw new Error('jwt_payload_invalid');
+  }
 
-  if (header.alg !== 'RS256' || typeof header.kid !== 'string' || !header.kid || header.kid.length > 256) throw new Error('Invalid alg or missing kid');
+  if (header.alg !== 'RS256' || typeof header.kid !== 'string' || !header.kid || header.kid.length > 256) throw new Error('jwt_header_invalid');
 
-  let keys = await jwksCache.getKeys(env);
+  let keys: Jwk[];
+  try {
+    keys = await jwksCache.getKeys(env);
+  } catch {
+    throw new Error('jwks_fetch_failed');
+  }
   let key = keys.find(k => k.kid === header.kid);
   if (!key) {
-    keys = await jwksCache.getKeys(env, true);
-    key = keys.find(k => k.kid === header.kid);
+    try {
+      keys = await jwksCache.getKeys(env, true);
+      key = keys.find(k => k.kid === header.kid);
+    } catch {
+      throw new Error('jwks_fetch_failed');
+    }
   }
-  if (!key) throw new Error('Signing key not found');
+  if (!key) throw new Error('signing_key_not_found');
 
   const valid = await verifyRs256(key as JsonWebKey, `${parts[0]}.${parts[1]}`, parts[2]);
-  if (!valid) throw new Error('Invalid signature');
+  if (!valid) throw new Error('jwt_signature_invalid');
 
   const now = Math.floor(Date.now() / 1000);
-  if (claims.iss !== env.AUTH_ISSUER) throw new Error('Invalid issuer');
+  if (claims.iss !== env.AUTH_ISSUER) throw new Error('jwt_issuer_mismatch');
   const aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
-  if (!aud.every((v: unknown) => typeof v === 'string') || (aud.length > 1 && claims.azp !== env.AUTH_CLIENT_ID)) throw new Error('Invalid audience');
-  if (!aud.includes(env.AUTH_CLIENT_ID)) throw new Error('Invalid audience');
-  if (typeof claims.exp !== 'number' || !Number.isFinite(claims.exp) || claims.exp <= now) throw new Error('Token expired');
-  if (claims.nonce !== expectedNonce) throw new Error('Invalid nonce');
-  if (claims.token_use !== 'id') throw new Error('Invalid token_use');
-  if (claims.email_verified !== true) throw new Error('Email not verified');
-  if (typeof claims.email !== 'string' || !claims.email) throw new Error('Missing email');
-  if (typeof claims.sub !== 'string' || !claims.sub) throw new Error('Missing sub');
+  if (!aud.every((v: unknown) => typeof v === 'string') || (aud.length > 1 && claims.azp !== env.AUTH_CLIENT_ID)) throw new Error('jwt_audience_mismatch');
+  if (!aud.includes(env.AUTH_CLIENT_ID)) throw new Error('jwt_audience_mismatch');
+  if (typeof claims.exp !== 'number' || !Number.isFinite(claims.exp) || claims.exp <= now) throw new Error('jwt_expired');
+  if (claims.nonce !== expectedNonce) throw new Error('jwt_nonce_mismatch');
+  if (claims.token_use !== 'id') throw new Error('jwt_token_use_invalid');
+  if (claims.email_verified !== true) throw new Error('jwt_email_not_verified');
+  if (typeof claims.email !== 'string' || !claims.email) throw new Error('jwt_missing_email');
+  if (typeof claims.sub !== 'string' || !claims.sub) throw new Error('jwt_missing_sub');
 
   return { sub: claims.sub, email: claims.email, email_verified: true };
 }
 
-export async function exchangeCode(env: Env, code: string, verifier: string): Promise<string> {
+export async function exchangeCode(env: Env, code: string, verifier: string, redirectUri?: string): Promise<string> {
   const params = new URLSearchParams({
     grant_type: 'authorization_code',
     client_id: env.AUTH_CLIENT_ID,
     code,
-    redirect_uri: env.AUTH_CALLBACK_URL,
+    redirect_uri: redirectUri || env.AUTH_CALLBACK_URL,
     code_verifier: verifier
   });
   const res = await fetch(`${env.AUTH_BASE_URL}/oauth2/token`, {
@@ -172,8 +187,25 @@ export async function exchangeCode(env: Env, code: string, verifier: string): Pr
     headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
     body: params.toString()
   });
-  if (!res.ok) throw new Error('Token exchange failed');
+  if (!res.ok) {
+    let errCode = '';
+    try {
+      const data = await res.json() as any;
+      if (data && typeof data.error === 'string') {
+        errCode = data.error.replace(/[^a-z0-9_-]/gi, '');
+      }
+    } catch {
+      try {
+        const text = await res.text();
+        const m = text.match(/"error"\s*:\s*"([a-zA-Z0-9_-]+)"/);
+        if (m) errCode = m[1];
+      } catch {}
+    }
+    const suffix = errCode ? `_${errCode}` : '';
+    throw new Error(`exchange_failed_${res.status}${suffix}`);
+  }
   const data = await res.json() as { id_token?: string };
-  if (!data.id_token) throw new Error('Missing id_token');
+  if (!data.id_token) throw new Error('exchange_missing_id_token');
   return data.id_token;
 }
+

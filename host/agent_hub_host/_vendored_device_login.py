@@ -78,9 +78,15 @@ def _interval(start: dict) -> float:
 
 def _prompt(prompt, text: str) -> None:
     if prompt is None:
-        print(text, end="")
+        print(text, end="", flush=True)
     else:
         prompt(text)
+        try:
+            import sys
+            sys.stdout.flush()
+        except Exception:
+            pass
+
 
 
 def device_login(

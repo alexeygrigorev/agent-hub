@@ -6,7 +6,8 @@ import { Env } from './env';
 import { SCHEMA_SQL } from './schema';
 import { migrateAgentRegistry, bindAgentCredentials, credentialActor, registryAddress, AGENT_NAME } from './agent_registry';
 import { JwksCache, validateIdToken, exchangeCode } from './auth/dtc';
-import { createSessionCookie, getSession, clearSessionCookie, createLoginCookie, getLoginCookie, clearLoginCookie, verifyCsrf, configuredAdmins, validSessionSecret, adminTokenHash, tokenAdminSubject, TOKEN_ADMIN_EMAIL, humanAdminAllowed } from './auth/session';
+import { createSessionCookie, getSession, clearSessionCookie, createLoginCookie, getLoginCookie, clearLoginCookie, clearLoginState, resolveCallbackUrl, isAllowedOidcOrigin, verifyCsrf, configuredAdmins, validSessionSecret, adminTokenHash, tokenAdminSubject, TOKEN_ADMIN_EMAIL, humanAdminAllowed } from './auth/session';
+
 import { randomString, sha256, generateUserCode, base64url } from './auth/crypto';
 import { generateTokenPair, verifyBearerScope } from './auth/token';
 import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly, updateHeartbeat } from './registry';
@@ -530,14 +531,15 @@ export class Hub extends DurableObject {
 
       if (path === '/auth/login') {
         if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
-        // OIDC only works on the origin registered as the callback; elsewhere use token sign-in.
-        let oidcOrigin = ''; try { oidcOrigin = new URL(this.env.AUTH_CALLBACK_URL).origin; } catch {}
-        if (validSessionSecret(this.env) && adminTokenHash(this.env) && (configuredAdmins(this.env).length === 0 || oidcOrigin !== url.origin)) {
+        // OIDC only works on origins registered as callbacks; elsewhere use token sign-in.
+        const forwardedHost = request.headers.get('X-Forwarded-Host');
+        const originAllowed = isAllowedOidcOrigin(this.env, url.toString(), forwardedHost);
+        if (validSessionSecret(this.env) && adminTokenHash(this.env) && (configuredAdmins(this.env).length === 0 || !originAllowed)) {
           const next = url.searchParams.get('return_to');
           const location = next && /^\/device\?code=[A-Za-z0-9-]{1,32}$/.test(next) ? '/auth/token?return_to=' + encodeURIComponent(next) : '/auth/token';
           return new Response(null, { status: 303, headers: { Location: location, 'Cache-Control': 'private, no-store' } });
         }
-        if (!validSessionSecret(this.env) || configuredAdmins(this.env).length === 0) return authFailure(request, 'authentication_not_configured', 503);
+        if (!validSessionSecret(this.env) || configuredAdmins(this.env).length === 0) return authFailure(request, 'authentication_not_configured', 503, {}, 'authentication_not_configured');
         const state = randomString(32);
         const nonce = randomString(32);
         const verifier = randomString(43);
@@ -546,16 +548,17 @@ export class Hub extends DurableObject {
         this.sql.exec('INSERT INTO login_states (state_hash, expires_at) VALUES (?, ?)', await sha256(state), Math.floor(Date.now() / 1000) + 600);
         
         const returnTo = url.searchParams.get('return_to');
-        const returnToPath = returnTo && returnTo.startsWith('/device?code=') ? returnTo : undefined;
+        const returnToPath = returnTo && returnTo.startsWith('/') && !returnTo.startsWith('//') && !returnTo.includes('\\') ? returnTo : undefined;
+        const callbackUrl = resolveCallbackUrl(this.env, url.toString(), forwardedHost);
         
         const loginCookie = await createLoginCookie(this.env, {
-          state, nonce, verifier, exp: Math.floor(Date.now() / 1000) + 600, returnTo: returnToPath
-        });
+          state, nonce, verifier, exp: Math.floor(Date.now() / 1000) + 600, returnTo: returnToPath, callbackUrl
+        }, request.headers.get('Cookie'));
 
         const authUrl = new URL(`${this.env.AUTH_BASE_URL}/oauth2/authorize`);
         authUrl.search = new URLSearchParams({
           client_id: this.env.AUTH_CLIENT_ID,
-          redirect_uri: this.env.AUTH_CALLBACK_URL,
+          redirect_uri: callbackUrl,
           response_type: 'code',
           scope: 'openid email profile',
           state,
@@ -577,27 +580,78 @@ export class Hub extends DurableObject {
       if (path === '/auth/callback') {
         if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
         const query = url.searchParams;
+        const oauthError = query.get('error');
         const code = query.get('code');
         const state = query.get('state');
-        if (!code || !state) return authFailure(request, 'Missing code or state', 400);
 
-        const loginData = await getLoginCookie(this.env, request);
+        // Check if provider returned an OAuth error directly
+        if (oauthError) {
+          const cleanErr = oauthError.replace(/[^a-z0-9_-]/gi, '');
+          const clearCookie = state ? await clearLoginState(this.env, request, state) : clearLoginCookie();
+          return authFailure(request, 'provider_error', 400, { 'Set-Cookie': clearCookie }, `oauth_${cleanErr}`);
+        }
+
+        const existingSession = await getSession(this.env, request);
+
+        if (!code || !state) {
+          if (existingSession) {
+            return new Response(null, { status: 302, headers: { 'Location': '/', 'Cache-Control': 'private, no-store' } });
+          }
+          const cat = !code && !state ? 'missing_code_and_state' : !code ? 'missing_code' : 'missing_state';
+          return authFailure(request, 'Missing code or state', 400, {}, cat);
+        }
+
+        const loginData = await getLoginCookie(this.env, request, state);
         if (!loginData || loginData.state !== state) {
-          return authFailure(request, 'Invalid state', 400);
+          if (existingSession) {
+            return new Response(null, { status: 302, headers: { 'Location': '/', 'Cache-Control': 'private, no-store' } });
+          }
+          const hasAny = await getLoginCookie(this.env, request);
+          const cat = hasAny ? 'state_mismatch' : 'missing_cookie';
+          return authFailure(request, 'Invalid state', 400, {}, cat);
         }
 
         const stateHash = await sha256(state);
+        const stateRows = this.sql.exec('SELECT consumed, expires_at FROM login_states WHERE state_hash = ?', stateHash).toArray() as any[];
+        const stateRow = stateRows[0];
         const consume = this.sql.exec('UPDATE login_states SET consumed = 1 WHERE state_hash = ? AND consumed = 0 AND expires_at > ?', stateHash, Math.floor(Date.now() / 1000));
-        if (consume.rowsWritten !== 1) return authFailure(request, 'invalid_state', 400, {'Set-Cookie':clearLoginCookie()});
+        
+        if (consume.rowsWritten !== 1) {
+          // Check if caller already has a valid authenticated session (valid sess refresh/replay recovery)
+          const existingSession = await getSession(this.env, request);
+          if (existingSession) {
+            return new Response(null, {
+              status: 302,
+              headers: {
+                'Location': loginData.returnTo || '/',
+                'Cache-Control': 'private, no-store'
+              }
+            });
+          }
+          const clearCookie = await clearLoginState(this.env, request, state);
+          let cat = 'invalid_state';
+          if (stateRow) {
+            if (stateRow.consumed === 1) cat = 'state_already_consumed';
+            else if (stateRow.expires_at <= Math.floor(Date.now() / 1000)) cat = 'state_expired';
+          } else {
+            cat = 'state_not_found';
+          }
+          return authFailure(request, 'invalid_state', 400, { 'Set-Cookie': clearCookie }, cat);
+        }
+
+        const clearCookie = await clearLoginState(this.env, request, state);
         let claims: { sub: string; email: string; email_verified: boolean };
         try {
-          const idToken = await exchangeCode(this.env, code, loginData.verifier);
+          const redirectUri = loginData.callbackUrl || resolveCallbackUrl(this.env, url.toString());
+          const idToken = await exchangeCode(this.env, code, loginData.verifier, redirectUri);
           claims = await validateIdToken(this.env, idToken, loginData.nonce, this.jwksCache);
-        } catch {
-          return authFailure(request, 'invalid_identity_token', 400, {'Set-Cookie':clearLoginCookie()});
+        } catch (err: any) {
+          const rawMsg = String(err?.message || '');
+          const cat = /^[a-z0-9_:-]+$/i.test(rawMsg) ? rawMsg : 'token_validation_failed';
+          return authFailure(request, 'invalid_identity_token', 400, { 'Set-Cookie': clearCookie }, cat);
         }
         if (!configuredAdmins(this.env).includes(claims.email.toLowerCase())) {
-          return authFailure(request, 'forbidden', 403, {'Set-Cookie':clearLoginCookie()});
+          return authFailure(request, 'forbidden', 403, { 'Set-Cookie': clearCookie }, 'forbidden_not_admin');
         }
 
         const now = new Date().toISOString();
@@ -620,7 +674,7 @@ export class Hub extends DurableObject {
 
         const headers = new Headers();
         headers.append('Set-Cookie', sessionCookie);
-        headers.append('Set-Cookie', clearLoginCookie());
+        headers.append('Set-Cookie', clearCookie);
         headers.append('Location', loginData.returnTo || '/');
 
         return new Response(null, { status: 302, headers });

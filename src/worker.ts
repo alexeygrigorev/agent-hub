@@ -8,11 +8,31 @@ export type Hub = BaseHub;
 export interface Env {
   HUB: DurableObjectNamespace<BaseHub>;
   ASSETS?: Fetcher;
+  AUTH_CALLBACK_URL?: string;
+  AUTH_CALLBACK_URLS?: string;
 }
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    // CloudFront connects using the workers.dev origin and supplies its fixed
+    // public hostname. Only configured OAuth callback origins can rewrite it,
+    // so device links, logout and CSRF checks all see the browser's origin.
+    const forwardedHost = request.headers.get('X-Forwarded-Host');
+    if (forwardedHost) {
+      const callbacks = [env.AUTH_CALLBACK_URL, ...(env.AUTH_CALLBACK_URLS || '').split(',')];
+      for (const callback of callbacks) {
+        try {
+          const candidate = new URL((callback || '').trim());
+          if (candidate.protocol === 'https:' && candidate.host === forwardedHost.trim().toLowerCase()) {
+            url.protocol = candidate.protocol;
+            url.host = candidate.host;
+            request = new Request(url, request);
+            break;
+          }
+        } catch {}
+      }
+    }
     if (url.pathname === '/healthz') {
       url.pathname = '/api/healthz';
       return env.HUB.get(env.HUB.idFromName('hub')).fetch(new Request(url, request));

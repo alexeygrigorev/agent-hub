@@ -3,6 +3,9 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+import textwrap
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -87,6 +90,56 @@ class TestVendoredLoop(unittest.TestCase):
                                  sleeper=lambda s: None, clock=self._clock())
             self.assertEqual(out, {"access_token": "a"})
 
+    def test_vendored_prompt_flushes_immediately_in_buffered_subprocess(self):
+        # Verify a buffered subprocess (PYTHONUNBUFFERED unset, default block buffering on pipe)
+        # exposes verification prompt before approval/token poll completes.
+        code = textwrap.dedent("""
+            import sys, time
+            sys.path.insert(0, sys.argv[1])
+            from agent_hub_host import _vendored_device_login as v
+            calls = {'n': 0}
+            def poster(url, body):
+                calls['n'] += 1
+                if calls['n'] == 1:
+                    return 200, {
+                        'device_code': 'dev1',
+                        'user_code': 'PIPE-TEST',
+                        'verification_uri': 'https://hub.example.com/device',
+                        'interval': 1,
+                        'expires_in': 60,
+                    }
+                time.sleep(5)
+                return 200, {'access_token': 'ok'}
+            v.device_login('https://hub.example.com', poster,
+                           start_path='/api/device/code', token_path='/api/device/token')
+        """)
+        env = {k: v for k, v in os.environ.items() if k not in ("PYTHONUNBUFFERED", "DTC_AUTH_HOME")}
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code, HOST_DIR],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            bufsize=1,
+        )
+        try:
+            t0 = time.time()
+            first_line = ""
+            while time.time() - t0 < 3.0:
+                line = proc.stdout.readline()
+                if "PIPE-TEST" in line:
+                    first_line = line
+                    break
+                if line:
+                    first_line += line
+                    if "PIPE-TEST" in first_line:
+                        break
+                time.sleep(0.05)
+            self.assertIn("PIPE-TEST", first_line, f"Prompt was not flushed immediately: got {first_line!r}")
+        finally:
+            proc.kill()
+            proc.wait()
+
     def _clock(self):
         t = [0.0]
         def clock():
@@ -96,6 +149,22 @@ class TestVendoredLoop(unittest.TestCase):
 
 
 class TestHumanLogin(unittest.TestCase):
+    def setUp(self):
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self._old_xdg = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = self._temp_dir.name
+        config.clear_config()
+        config.clear_human_config()
+
+    def tearDown(self):
+        config.clear_config()
+        config.clear_human_config()
+        if self._old_xdg is not None:
+            os.environ["XDG_CONFIG_HOME"] = self._old_xdg
+        else:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        self._temp_dir.cleanup()
+
     def test_human_login_writes_human_not_host(self):
         self.assertEqual(config.load_human_config(), {})
         self.assertEqual(config.load_host_config(), {})
@@ -147,6 +216,22 @@ class TestHumanLogin(unittest.TestCase):
 
 
 class TestHumanStatusLogout(unittest.TestCase):
+    def setUp(self):
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self._old_xdg = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = self._temp_dir.name
+        config.clear_config()
+        config.clear_human_config()
+
+    def tearDown(self):
+        config.clear_config()
+        config.clear_human_config()
+        if self._old_xdg is not None:
+            os.environ["XDG_CONFIG_HOME"] = self._old_xdg
+        else:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        self._temp_dir.cleanup()
+
     def _write_human(self, **over):
         cfg = {"base_url": "https://hub.example.com", "access_token": "h-acc",
                "refresh_token": "h-ref", "client_kind": "human",
@@ -231,6 +316,22 @@ class TestHumanStatusLogout(unittest.TestCase):
 
 
 class TestHostUntouched(unittest.TestCase):
+    def setUp(self):
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self._old_xdg = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = self._temp_dir.name
+        config.clear_config()
+        config.clear_human_config()
+
+    def tearDown(self):
+        config.clear_config()
+        config.clear_human_config()
+        if self._old_xdg is not None:
+            os.environ["XDG_CONFIG_HOME"] = self._old_xdg
+        else:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        self._temp_dir.cleanup()
+
     def test_host_device_login_writes_host_only(self):
         with patch("urllib.request.OpenerDirector.open",
                    side_effect=[_code_response(), _token_response("host-a", "host-r")]):
@@ -255,29 +356,33 @@ class TestHostUntouched(unittest.TestCase):
 
 class TestFreshCli(unittest.TestCase):
     def test_auth_status_json_not_logged_in_fresh_home(self):
-        env = os.environ.copy()
-        env["PYTHONPATH"] = HOST_DIR
-        env.pop("DTC_AUTH_HOME", None)
-        env.pop("HUB_CONFIG_FILE", None)
-        res = subprocess.run(
-            [sys.executable, "-m", "agent_hub_host", "auth", "status", "--json"],
-            capture_output=True, text=True, env=env, timeout=15,
-        )
-        self.assertEqual(res.returncode, 0)
-        self.assertEqual(json.loads(res.stdout), {"logged_in": False})
-
-    def test_cli_help_lists_auth_and_version(self):
-        env = os.environ.copy()
-        env["PYTHONPATH"] = HOST_DIR
-        env.pop("DTC_AUTH_HOME", None)
-        for argv in (["--help"], ["--version"], ["auth", "--help"],
-                     ["auth", "login", "--help"], ["auth", "status", "--help"],
-                     ["auth", "logout", "--help"]):
+        with tempfile.TemporaryDirectory() as td:
+            env = os.environ.copy()
+            env["PYTHONPATH"] = HOST_DIR
+            env["XDG_CONFIG_HOME"] = td
+            env.pop("DTC_AUTH_HOME", None)
+            env.pop("HUB_CONFIG_FILE", None)
             res = subprocess.run(
-                [sys.executable, "-m", "agent_hub_host"] + argv,
+                [sys.executable, "-m", "agent_hub_host", "auth", "status", "--json"],
                 capture_output=True, text=True, env=env, timeout=15,
             )
-            self.assertEqual(res.returncode, 0, f"{argv}: {res.stderr}")
+            self.assertEqual(res.returncode, 0)
+            self.assertEqual(json.loads(res.stdout), {"logged_in": False})
+
+    def test_cli_help_lists_auth_and_version(self):
+        with tempfile.TemporaryDirectory() as td:
+            env = os.environ.copy()
+            env["PYTHONPATH"] = HOST_DIR
+            env["XDG_CONFIG_HOME"] = td
+            env.pop("DTC_AUTH_HOME", None)
+            for argv in (["--help"], ["--version"], ["auth", "--help"],
+                         ["auth", "login", "--help"], ["auth", "status", "--help"],
+                         ["auth", "logout", "--help"]):
+                res = subprocess.run(
+                    [sys.executable, "-m", "agent_hub_host"] + argv,
+                    capture_output=True, text=True, env=env, timeout=15,
+                )
+                self.assertEqual(res.returncode, 0, f"{argv}: {res.stderr}")
 
 
 if __name__ == "__main__":
