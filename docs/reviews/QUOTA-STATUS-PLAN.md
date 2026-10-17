@@ -285,7 +285,7 @@ Inspecting `docs/QUOTA.md` (§2.3, §3, §7.3), `src/quota.ts`, `src/routing.ts`
      - Reject (`status: 'stale'`) if any applicable (`present: true`) window has a finite `reset_at` where `Date.parse(w.reset_at) <= nowMs` **and** `Date.parse(quota.observed_at) < Date.parse(w.reset_at)` (the reset boundary has passed without a post-reset observation `observed_at >= reset_at`).
      - **Apply reserve across all available applicable (`present: true`) windows**: Require `presentWindows.length >= 1`, compute `remaining = Math.min(...presentWindows.map(w => w.percent_remaining))`, and reject (`status: 'exhausted'`) if `remaining <= Math.max(0, reservePercent)` (enforcing Codex `15%` and Grok `5%` reserves across every available applicable window).
   2. Re-run `evaluateQuotaAdmission` inside `FleetService.claim()` (`POST /api/fleet/launches/:id/claim`) so a route whose quota became exhausted, stale, or unavailable while `offered` fails closed at claim admission.
-  3. Ensure engine/model preference order (Muse Spark 1.3 `opencode-go/muse-spark-1.3-contributor` and Z.ai `zcodex` / Z.ai Flash `glm-4.7-flash` / `glm-4.5-flash` for lightweight tasks) is applied **only** among routes that pass `evaluateQuotaAdmission` and qualification gates.
+  3. Ensure engine/model preference order (Muse Spark 1.3 `opencode-go/muse-spark-1.3-contributor` and Z.ai Flash `glm-5.3-flash` through the verified `zcodex` route for lightweight tasks) is applied **only** among routes that pass `evaluateQuotaAdmission` and qualification gates.
   4. **No manual quota-safety override bypass**: No manual quota override may ever bypass `exhausted`, `unknown`, `stale`, reserve (`15%` Codex, `5%` Grok), or cooldown launch safety. Only read-only human inspection (`hub quota`, `hub status`, dashboard) and holding blocked work in `queued` / `waiting-on-human` are allowed.
 - **Executable verification gate**: Add regression tests in `test/quota.test.ts`, `test/fleet.test.ts`, `test/routing.test.ts`, `host/tests/test_quota_snapshot.py`, and `host/tests/test_fleet.py` proving: (a) a Codex host with valid `seven_day` (`> 15%`) and benignly absent `five_hour`/`monthly` (`present: false, error: null`) is admitted, (b) a Codex/Z.ai/Claude host with valid `seven_day` (`80%`) but sibling `five_hour` carrying `error: "unavailable"` fails closed (`unknown`) through both `host_quota_snapshots` and `fleet_subscriptions`, (c) stale `subscription.observed_at` or passed unrefreshed `reset_at` fails closed in `dispatch()`, `modelCandidates()`, and `claim()`, and (d) no API parameter or manual flag can bypass quota reserve/exhaustion/cooldown gates.
 
@@ -462,7 +462,7 @@ This `R2` revision is authored by an independent Argon session (`platform-quota-
    - Replaced the prior report's unverified short `477bd..23` ref with verified Hub `M12a` commits `adae0fb346028c449db7ce6b5858720523ffd6a9` / `c290454e88c49c6fe863d20dd2717d58522851d0` / `bc796013d9f522d8a2e3ea050f7b264e2fabfc41`.
    - Recorded the exact subject of Hub `6bc91a1278250b374ea1d0b11acd353fae51a8cb` (`docs: correct independent review Git metadata before publication [skip ci]`).
 2. **Corrected Milestone Map Labels & Cloudflare Free-Plan Bound Claim**:
-   - Corrected `M10` (`Real Host Operations & Dogfooding`) and `M11` (`Operator Alerting & Active Remediation`) to match `docs/SPEC.md` and `6750e34bc2fdff07c84e0127c973ac46210f9e5d:docs/platform/PLAN.md` (role leases and retention belong to `M3` / `src/schema.ts`, not `M10`/`M11`).
+   - Corrected the platform PLAN milestone names: `M10` is request-to-outcome follow-through in conversations and `M11` is supported host adoption/migration. Platform retention is `M5` and configured roles/epoch-fenced effects are `M7`, as the source-only ledger in §2.4 already records. `docs/SPEC.md` uses its own milestone namespace; its labels must not be substituted for the coordinator PLAN labels.
    - Removed the overclaim that application code enforces a hard Cloudflare account billing cap, stating accurately that application code enforces payload/row/retention/alarm discipline while account-level Cloudflare billing caps are external platform controls (`AGENTS.md` USD 5/month Free-plan constraint).
 3. **Corrected Resource & Cgroup Provenance (`Section 9.2`)**:
    - Withdrew `R1`'s unverified inner cgroup path (`agent-platform-quota-status-plan-review-1776420735.scope`) and kernel `memory.current` / `memory.peak` / `pids.current` / `pids.peak` figures as **`UNKNOWN`**, retaining `R1`'s verified outer `aplexer` launch record (`/home/alexey/git/agent-coordination/.local/platform/quota-status-plan-review-start.json`) and genuine discrete guardian receipt (`.local/review/guard-receipt.json`: `exit: 0`, `sampled_peak_allocated_bytes: 643,072`, `3047` samples, `max_gap: 0.26633023750036955 s`, `elapsed: 763.918491018936 s`), and recording `R2`'s own cgroup witness separately in `.local/review/meta-r2/cgroup-witness.json`.
@@ -473,3 +473,15 @@ This `R2` revision is authored by an independent Argon session (`platform-quota-
    - **Canonical shared-pool deduplication (`Section 5 F-M13-1 / F-M13-2`, `Section 7`)**: Grounded deduplication in the existing `fleet_accounts` `(provider, label)` and `fleet_routes (machine_id, engine, account, profile)` contract without creating a second quota store or colliding arbitrary unqualified labels across providers or accounts.
    - **Verdict verification**: After re-auditing every operator requirement against `6750e34bc2fdff07c84e0127c973ac46210f9e5d:docs/platform/PLAN.md` and Hub `6bc91a1278250b374ea1d0b11acd353fae51a8cb`, the **`SCOPED ACCEPT`** verdict and the seven binding gate IDs (`M13-IG1`..`M13-IG3`, `M14-IG1`..`M14-IG4`) remain well-founded and are preserved with tightened specifications.
 
+
+
+### Head mechanical label correction (17 October 2026)
+
+The immutable Argon R2 report remains at `740876920570b1b3ec12edab58810476de4ba79c`.
+This follow-up corrects one contradictory milestone-label sentence in correction
+provenance to match the report's existing §2.4 platform ledger, and replaces the
+two obsolete Flash model names in M13-IG3 with Alexey's exact allowed
+`glm-5.3-flash` route. It grants no additional provider/model authority. The
+reviewed coordinator pin, scoped verdict, seven gate IDs, quota/privacy safety
+requirements, resource history and test claims are unchanged. No source changes
+or tests were executed for these report labels. M15 is outside this earlier pin.
