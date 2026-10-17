@@ -4,14 +4,14 @@
 #   curl -fsSL <base>/cli/install.sh | sh
 #
 # Env overrides (for tests, no Hetzner paths):
-#   HUB_BASE_URL     hub base, default https://agent-hub.cloudflare-ai-agent-de9ca0.workers.dev
+#   HUB_BASE_URL     hub base, default https://hub.dtcdev.click
 #   HUB_INSTALL_DIR  install dir, default $HOME/.local/bin (must stay under $HOME)
 #
 # Installs $HUB_INSTALL_DIR/hub (a python3 zipapp launcher). Fails atomically
 # on any error; never touches global dirs or the `aplexer` binary.
 set -eu
 
-BASE_DEFAULT="https://agent-hub.cloudflare-ai-agent-de9ca0.workers.dev"
+BASE_DEFAULT="https://hub.dtcdev.click"
 BASE="${HUB_BASE_URL:-$BASE_DEFAULT}"
 # Strip trailing slash.
 BASE="$(printf '%s' "$BASE" | sed 's#/*$##')"

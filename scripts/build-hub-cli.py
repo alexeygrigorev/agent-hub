@@ -130,7 +130,7 @@ def build(out_dir: Path, version: str):
             "version": version,
             "sha256": digest,
             "python_requires": PYTHON_REQUIRES,
-            "default_base_url": "https://agent-hub.cloudflare-ai-agent-de9ca0.workers.dev",
+            "default_base_url": "https://hub.dtcdev.click",
             "vendored_device_login": {
                 "module": "agent_hub_host._vendored_device_login",
                 "source": SHARED_SOURCE,

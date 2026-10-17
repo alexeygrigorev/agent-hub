@@ -23,7 +23,7 @@ def get_config_path() -> Path:
 
 # Baked default hub base URL for fresh human installs (overridable via
 # --url, stored base_url, HUB_URL/HUB_BASE_URL, or HUB_CONFIG_FILE).
-DEFAULT_BASE_URL = "https://agent-hub.cloudflare-ai-agent-de9ca0.workers.dev"
+DEFAULT_BASE_URL = "https://hub.dtcdev.click"
 
 
 def get_human_config_path() -> Path:
