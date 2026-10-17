@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import root_dispatch as rd
 from .root_dispatch import DispatchError
+from . import role_dispatch as rld
 
 CODEX_MIN_PERCENT: float = 15.0
 
@@ -377,6 +378,7 @@ class RuntimeManager:
         mock_runner: Optional[Any] = None,
         config: Optional[rd.TrustedRootConfig] = None,
         adapter_kwargs: Optional[Dict[str, Any]] = None,
+        role_config: Optional[rld.TrustedRoleConfig] = None,
     ):
         self._config_error: Optional[str] = None
         if config is None:
@@ -395,6 +397,13 @@ class RuntimeManager:
         self._scheduling: Optional[rd.HubSchedulingReader] = None
         self._bound_clock_fixture = False
         self.host_id: str = ""
+
+        self.role_config: rld.TrustedRoleConfig = role_config if role_config is not None else rld.TrustedRoleConfig.disabled()
+        self.role_adapter = rld.RoleDispatchAdapter(
+            config=self.role_config,
+            quota_checker=self.check_codex_window,
+            launcher_executor=self._adapter_kwargs.get("role_launcher_executor"),
+        )
 
     def set_mock_runner(self, runner: Any) -> None:
         """Configure mock runner for test isolation."""
@@ -534,6 +543,26 @@ class RuntimeManager:
         report["operational_qualified"] = True
         return True, "operationally_qualified", report
 
+    @property
+    def role_runs_dir(self) -> pathlib.Path:
+        return self.role_config.runs_dir
+
+    def can_process_role_run(self, kind: str) -> Tuple[bool, str, Dict[str, Any]]:
+        """Validate prerequisites before claiming or processing a role job."""
+        if self._has_qualified_mock_runner():
+            mock_report = {
+                "kind": kind,
+                "status": "MOCK_FIXTURE",
+                "is_fixture_only": True,
+                "operational_qualified": False,
+            }
+            return True, "mock_runner_active", mock_report
+
+        if kind not in rld.SUPPORTED_ROLE_PROFILES:
+            return False, f"unsupported_role_profile: {kind}", {"kind": kind, "supported": False}
+
+        return self.role_adapter.can_process(kind)
+
     def _make_adapter(self) -> rd.RootDispatchAdapter:
         kwargs = dict(self._adapter_kwargs)
         kwargs.setdefault("scheduling_check", self.check_scheduling)
@@ -565,6 +594,9 @@ class RuntimeManager:
         lease_epoch: int,
         hub_url: str,
         start_callback: Optional[Any] = None,
+        role_binding: Optional[Dict[str, Any]] = None,
+        stop_event: Optional[Any] = None,
+        deadline_sec: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Execute a claimed job using maintained launcher or test mock."""
         if self._has_qualified_mock_runner():
@@ -587,6 +619,26 @@ class RuntimeManager:
                 workspace=None,
                 host_id=self.host_id or "host",
                 start_callback=start_callback,
+            )
+
+        if kind in rld.SUPPORTED_ROLE_PROFILES:
+            eligible, reason, report = self.can_process_role_run(kind)
+            if not eligible:
+                raise RuntimeError(
+                    f"Refusing to execute {kind}: {reason}. Direct model/API bypass forbidden."
+                )
+            return self.role_adapter.dispatch(
+                job_id=job_id,
+                kind=kind,
+                payload=payload,
+                job_token=job_token,
+                lease_epoch=lease_epoch,
+                role_binding=role_binding or {},
+                hub_url=hub_url,
+                host_id=self.host_id or "host",
+                start_callback=start_callback,
+                stop_event=stop_event,
+                deadline_sec=deadline_sec,
             )
 
         raise NotImplementedError("Real execution requires accepted launcher issue59 dependency packet.")

@@ -63,10 +63,29 @@ def load_settings(path=None):
     if path.stat().st_size > 65536:
         raise ValueError("Subscription configuration exceeds 64 KiB")
     data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv"} or data.get("version") != 1:
+    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv", "role_consumer", "role_config"} or data.get("version") != 1:
         raise ValueError("Invalid subscription configuration")
     if "native_start_argv" in data:
         validate_native_start_argv(data["native_start_argv"])
+    if "role_consumer" in data:
+        rc = data["role_consumer"]
+        if not isinstance(rc, (bool, dict)):
+            raise ValueError("Invalid role_consumer setting")
+        if isinstance(rc, dict):
+            if set(rc) - {"enabled", "interval_sec", "profiles"}:
+                raise ValueError("Invalid role_consumer options")
+            if "enabled" in rc and not isinstance(rc["enabled"], bool):
+                raise ValueError("role_consumer.enabled must be a boolean")
+            if "interval_sec" in rc and (not isinstance(rc["interval_sec"], (int, float)) or rc["interval_sec"] <= 0):
+                raise ValueError("role_consumer.interval_sec must be positive number")
+            if "profiles" in rc and (not isinstance(rc["profiles"], list) or any(not isinstance(p, str) for p in rc["profiles"])):
+                raise ValueError("role_consumer.profiles must be a list of strings")
+    if "role_config" in data:
+        rc_cfg = data["role_config"]
+        if not isinstance(rc_cfg, (str, dict)):
+            raise ValueError("Invalid role_config setting")
+        if isinstance(rc_cfg, str) and (not rc_cfg or "\0" in rc_cfg or len(rc_cfg) > 1024):
+            raise ValueError("Invalid role_config path")
     subs = data.get("subscriptions")
     if not isinstance(subs, list) or len(subs) > 128:
         raise ValueError("Invalid subscriptions list")

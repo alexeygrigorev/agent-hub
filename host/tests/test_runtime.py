@@ -58,13 +58,12 @@ class TestRuntime(unittest.TestCase):
         report = qual.inspect_interfaces()
 
         self.assertEqual(report["status"], "UNSUPPORTED")
-        self.assertFalse(report["root_profile_supported"])
+        self.assertTrue(report["root_profile_supported"])
         self.assertFalse(report["per_job_env_supported"])
         self.assertFalse(report["codex_adapter_supported"])
 
         # Check that reasons specifically point to missing pieces
         reasons_text = " ".join(report["reasons"])
-        self.assertIn("root-run profile absent", reasons_text)
         self.assertIn("per-job environment", reasons_text)
         self.assertIn("codex route absent", reasons_text)
 

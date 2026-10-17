@@ -28,6 +28,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from . import api, auth, config
 from .guarded_root import GuardedRootBridge, IncumbentStatus, is_pid_alive, get_current_pid_namespace, WINDOW_SEC
 from . import root_dispatch as rd
+from . import role_dispatch as rld
+from .role_dispatch import SUPPORTED_ROLE_PROFILES
 from .runtime import RuntimeManager, get_first_action_digest
 
 logger = logging.getLogger(__name__)
@@ -114,6 +116,21 @@ class JobsClient:
         return self._request("POST", f"{base_url}/api/jobs/{urllib.parse.quote(job_id)}/execute",
                              data={"epoch": epoch, "generation": generation},
                              token=token, is_job_token=True)
+
+    def get_offers(
+        self,
+        base_url: str,
+        host_id: str,
+        token: str,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve job offers for this host. GET /api/jobs/offers"""
+        url = f"{base_url}/api/jobs/offers?host_id={urllib.parse.quote(host_id)}"
+        res = self._request("GET", url, token=token)
+        if isinstance(res, dict) and "offers" in res:
+            return res["offers"]
+        if isinstance(res, list):
+            return res
+        return []
 
     def decline_job(
         self,
@@ -306,7 +323,7 @@ class JobDispatcher:
                 return {"accepted": False, "reason": "invalid_role_binding"}
             # Real non-root backends are currently unsupported by RuntimeManager.
             # Inventory strings and ordinary mocks are not runtime qualification.
-            if not self._role_consumer_qualified():
+            if not self._role_consumer_qualified(kind):
                 return {"accepted": False, "reason": "HOLD: role backend unsupported (M8b)"}
 
         # Gate check for root-run: qualification and read-only incumbent check
@@ -387,6 +404,17 @@ class JobDispatcher:
                 except Exception:
                     pass
                 return {"accepted": False, "reason": skip_reason}
+        elif kind in SUPPORTED_ROLE_PROFILES:
+            if role_binding is None:
+                return {"accepted": False, "reason": "missing_role_binding"}
+            eligible, reason, report = self.runtime_mgr.can_process_role_run(kind)
+            if not eligible:
+                logger.info(f"Declining {kind} offer {job_id}: {reason}")
+                try:
+                    self.client.decline_job(self.base_url, job_id, self.host_id, token, reason)
+                except Exception:
+                    pass
+                return {"accepted": False, "reason": reason, "qualification": report}
         elif not is_mock:
             # Validate job kind capability (non-root kinds are currently unsupported under incomplete issue 59)
             reason = f"unsupported_job_kind: {kind}"
@@ -414,6 +442,8 @@ class JobDispatcher:
                     return {"accepted": False, "reason": reason, "qualification": report}
                 gate_status["profile_supported"] = True
                 gate_status["native_root_supported"] = True
+            elif kind in SUPPORTED_ROLE_PROFILES:
+                gate_status["profile_supported"] = True
         else:
             from . import gate
             gate._gate_cache = None
@@ -423,6 +453,8 @@ class JobDispatcher:
             if kind == "root-run":
                 gate_status["profile_supported"] = bool(report.get("root_profile_supported", False))
                 gate_status["native_root_supported"] = bool(report.get("operational_qualified", False))
+            elif kind in SUPPORTED_ROLE_PROFILES:
+                gate_status["profile_supported"] = bool(report.get("role_profile_supported", False))
             if not gate_status.get("launch_allowed", False):
                 reason = f"gate_refused: {gate_status.get('reason', 'gate not allowed')}"
                 try:
@@ -449,7 +481,7 @@ class JobDispatcher:
         claimed_binding = claim_res.get("role_binding")
         if role_binding is not None and (not self._valid_role_binding(claimed_binding, kind) or claimed_binding != role_binding):
             return {"accepted": False, "reason": "HOLD: claim role binding changed"}
-        if claimed_binding is not None and (not is_mock or not self._valid_role_binding(claimed_binding, kind)):
+        if claimed_binding is not None and not (self._valid_role_binding(claimed_binding, kind) and self._role_consumer_qualified(kind)):
             return {"accepted": False, "reason": "HOLD: unsupported claimed role"}
 
         if not job_token or not isinstance(job_token, str) or not job_token.strip():
@@ -573,7 +605,7 @@ class JobDispatcher:
             )
 
         try:
-            if getattr(self.root_bridge, "is_canonical_state", False) and not op_qualified:
+            if kind == "root-run" and getattr(self.root_bridge, "is_canonical_state", False) and not op_qualified:
                 self.client.finish_job(
                     self.base_url, job_id, job_token, lease_epoch,
                     "failed", "canonical_root_state_forbidden_while_unsupported", []
@@ -614,7 +646,10 @@ class JobDispatcher:
                 return
 
             # Check for pre-existing evidence file before worker start
-            runs_dir = pathlib.Path(self.root_bridge.runs_dir)
+            if role is not None and hasattr(self.runtime_mgr, "role_runs_dir"):
+                runs_dir = pathlib.Path(self.runtime_mgr.role_runs_dir)
+            else:
+                runs_dir = pathlib.Path(self.root_bridge.runs_dir)
             runs_dir.mkdir(parents=True, exist_ok=True)
             evidence_file = runs_dir / f"first-action-{job_id}.json"
 
@@ -624,7 +659,7 @@ class JobDispatcher:
                 return
 
             if role is not None:
-                if not self._valid_role_binding(role, kind) or not self._role_consumer_qualified():
+                if not self._valid_role_binding(role, kind) or not self._role_consumer_qualified(kind):
                     logger.warning("Role consumer unsupported before execution intent; HOLD %s", job_id)
                     return
                 # The server commits intent on this real job before the current
@@ -649,7 +684,8 @@ class JobDispatcher:
             def _worker_exec():
                 try:
                     res = self.runtime_mgr.execute_job(
-                        job_id, kind, payload, job_token, lease_epoch, self.base_url
+                        job_id, kind, payload, job_token, lease_epoch, self.base_url,
+                        role_binding=role, stop_event=stop_event, deadline_sec=deadline_sec,
                     )
                     exec_result["res"] = res
                 except Exception as e:
@@ -720,6 +756,11 @@ class JobDispatcher:
                     raise ValueError("mismatched or missing epoch")
                 if acquired_root and existing_data.get("run_id") != acq.get("run_id"):
                     raise ValueError("mismatched or missing run_id")
+                if role is not None:
+                    if "role" in existing_data and existing_data.get("role") != role.get("name"):
+                        raise ValueError("mismatched role name")
+                    if "generation" in existing_data and existing_data.get("generation") != role.get("generation"):
+                        raise ValueError("mismatched role generation")
                 if "utc" in existing_data:
                     utc_val = existing_data.get("utc")
                     if not isinstance(utc_val, str) or not utc_val.strip():
@@ -1005,16 +1046,39 @@ class JobDispatcher:
                     break
 
     def _valid_role_binding(self, binding: Any, kind: str) -> bool:
-        return (isinstance(binding, dict) and kind == "writer-run"
+        return (isinstance(binding, dict) and kind in SUPPORTED_ROLE_PROFILES
                 and binding.get("profile") == kind and binding.get("host_id") == self.host_id
                 and isinstance(binding.get("name"), str)
                 and re.fullmatch(r"automation:[a-z][a-z0-9-]{0,47}:[a-z][a-z0-9-]{0,47}", binding["name"]) is not None
                 and type(binding.get("generation")) is int and binding["generation"] > 0
                 and type(binding.get("ttl_seconds")) is int and 60 <= binding["ttl_seconds"] <= 1200)
 
-    def _role_consumer_qualified(self) -> bool:
-        # Only the existing explicitly enabled fake consumer is available today.
-        # Adding a real supported profile requires the independent M8b runtime gate.
-        return (isinstance(self.runtime_mgr, RuntimeManager)
-                and self.runtime_mgr._has_qualified_mock_runner()
-                and not getattr(self.root_bridge, "is_canonical_state", False))
+    def _role_consumer_qualified(self, kind: Optional[str] = None) -> bool:
+        if not isinstance(self.runtime_mgr, RuntimeManager):
+            return False
+        if self.runtime_mgr._has_qualified_mock_runner():
+            return not getattr(self.root_bridge, "is_canonical_state", False)
+        if kind is not None:
+            eligible, _, _ = self.runtime_mgr.can_process_role_run(kind)
+            return eligible
+        return any(self.runtime_mgr.can_process_role_run(k)[0] for k in SUPPORTED_ROLE_PROFILES)
+
+    def poll_and_dispatch_role_jobs(self) -> List[Dict[str, Any]]:
+        """Poll for role job offers and dispatch any claimed jobs."""
+        token = self.token_provider()
+        if not token:
+            return []
+        try:
+            offers = self.client.get_offers(self.base_url, self.host_id, token)
+        except Exception as e:
+            logger.warning("Failed to poll role job offers: %s", e)
+            return []
+        results = []
+        for offer in offers:
+            if not isinstance(offer, dict):
+                continue
+            kind = offer.get("kind")
+            if kind in SUPPORTED_ROLE_PROFILES or offer.get("role_binding") is not None:
+                res = self.handle_offer(offer)
+                results.append(res)
+        return results

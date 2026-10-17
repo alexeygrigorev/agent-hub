@@ -7,13 +7,16 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
-from . import config, fleet, session_control
+from typing import Any, Callable, Dict, List, Optional
+from . import auth, config, fleet, session_control
 from .disk_monitor import DiskMonitor
 from .host_health_monitor import HostHealthMonitor
+from .jobs import JobDispatcher
 from .metrics_producer import MetricsProducer
 from .native_sessions import qualify_sender_binding
 from .quota_snapshot import QuotaCollector
+from .role_dispatch import TrustedRoleConfig, load_role_config
+from .runtime import RuntimeManager
 from .status_runtime import StatusCollector
 
 
@@ -193,6 +196,127 @@ def maybe_start_host_health_thread(current: Optional[threading.Thread], collecto
         return current
 
 
+def get_cleanup_roots(settings: Optional[dict]) -> List[str]:
+    """Expose safe callable config for the normalhost loop cleaner.
+
+    Returns the validated cleanup_roots list from settings, or empty list if absent/invalid.
+    """
+    if not isinstance(settings, dict):
+        return []
+    roots = settings.get("cleanup_roots", [])
+    if isinstance(roots, list):
+        return [r for r in roots if isinstance(r, str) and r.startswith("/") and "\x00" not in r]
+    return []
+
+
+class RoleConsumer:
+    """Explicitly enabled role job consumer hook for session host.
+
+    Disabled by default. Single-inflight, never blocks command/quota/fleet loops.
+    No duplicate persistent daemon and no canonical root state takeover.
+    """
+
+    def __init__(
+        self,
+        config_path: Optional[str] = None,
+        role_config: Optional[TrustedRoleConfig] = None,
+        base_url: Optional[str] = None,
+        host_id: Optional[str] = None,
+        token_provider: Optional[Callable[[], str]] = None,
+        dispatcher: Optional[JobDispatcher] = None,
+        min_interval_s: float = 10.0,
+    ):
+        self.config_path = config_path
+        self.role_config = role_config
+        self.base_url = base_url
+        self.host_id = host_id
+        self.token_provider = token_provider or auth.get_access_token
+        self.dispatcher = dispatcher
+        self.min_interval_s = max(1.0, float(min_interval_s))
+        self.last_run_monotonic = 0.0
+
+    def step(self) -> Dict[str, Any]:
+        now = time.monotonic()
+        if now - self.last_run_monotonic < self.min_interval_s:
+            return {"rate_limited": True}
+        self.last_run_monotonic = now
+
+        cfg = self.role_config
+        if cfg is None and self.config_path:
+            cfg = load_role_config(self.config_path)
+        if cfg is None or not cfg.enabled:
+            return {"disabled": True}
+
+        if self.dispatcher is None:
+            if not self.base_url or not self.host_id:
+                return {"disabled": True, "reason": "missing_host_context"}
+            mgr = RuntimeManager(role_config=cfg)
+            self.dispatcher = JobDispatcher(
+                base_url=self.base_url,
+                host_id=self.host_id,
+                token_provider=self.token_provider,
+                runtime_mgr=mgr,
+            )
+        else:
+            if hasattr(self.dispatcher, "runtime_mgr") and hasattr(self.dispatcher.runtime_mgr, "role_config"):
+                self.dispatcher.runtime_mgr.role_config = cfg
+
+        try:
+            results = self.dispatcher.poll_and_dispatch_role_jobs()
+            dispatched = sum(1 for r in results if isinstance(r, dict) and r.get("accepted"))
+            errors = sum(1 for r in results if isinstance(r, dict) and not r.get("accepted"))
+            return {
+                "dispatched": dispatched,
+                "errors": errors,
+                "idle": len(results) == 0,
+            }
+        except Exception as e:
+            return {"error": type(e).__name__}
+
+
+def role_consumer_step_once(consumer: RoleConsumer) -> None:
+    """Run ONE isolated role consumption round (observer/worker thread only).
+
+    Bounded failure log only. Never raises, never touches quota or session command state.
+    """
+    try:
+        result = consumer.step()
+    except Exception as error:
+        print(json.dumps({"event": "role_consumer_error", "type": type(error).__name__}), flush=True)
+        return
+    try:
+        if not isinstance(result, dict) or result.get("rate_limited") or result.get("disabled") or result.get("idle"):
+            return
+        if result.get("error"):
+            print(json.dumps({"event": "role_consumer_error", "type": result["error"]}), flush=True)
+            return
+        print(json.dumps({
+            "event": "role_cycle",
+            "dispatched": result.get("dispatched", 0),
+            "errors": result.get("errors", 0)
+        }), flush=True)
+    except Exception as error:
+        print(json.dumps({"event": "role_consumer_error", "type": type(error).__name__}), flush=True)
+
+
+def maybe_start_role_consumer_thread(current: Optional[threading.Thread], consumer: RoleConsumer) -> Optional[threading.Thread]:
+    """Start ONE bounded role consumer thread, or skip while one is alive.
+
+    Single-inflight inside existing controller: no new daemon, timer, or controller.
+    A blocked dispatch never delays commands/quota/fleet.
+    """
+    try:
+        if current is not None and current.is_alive():
+            return current
+        thread = threading.Thread(target=role_consumer_step_once, args=(consumer,),
+                                  daemon=True, name="role-consumer")
+        thread.start()
+        return thread
+    except Exception as error:
+        print(json.dumps({"event": "role_consumer_error", "type": type(error).__name__}), flush=True)
+        return current
+
+
 def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=None):
     if interval < 1 or fleet_interval < interval:
         raise ValueError('Invalid host polling intervals')
@@ -209,9 +333,9 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         binding = qualify_sender_binding(native, str(Path.cwd().resolve()))
         # M15d narrow plumbing: surface the trusted cleanup-root allowlist
         # size (no auto-delete daemon here; tree removal is explicit CLI only).
-        roots = settings.get('cleanup_roots', [])
+        roots = get_cleanup_roots(settings)
         print(json.dumps({'event': 'host_ready', 'native_controller': binding.session_id,
-                          'cleanup_roots': len(roots) if isinstance(roots, list) else 0}), flush=True)
+                          'cleanup_roots': len(roots)}), flush=True)
         stop = threading.Event()
         previous = {}
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -251,6 +375,35 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
             config_path=str(journal / 'host-health.json'),
             machine_id=cfg['machine_id'])
         host_health_thread: Optional[threading.Thread] = None
+        # Role consumer hook (M8b Platform Role Runtime): ONE instance for the controller
+        # lifetime, disabled by default. If enabled in settings or journal roles.json,
+        # runs single-inflight inside existing supervisor loop.
+        role_consumer_cfg_path = None
+        role_consumer_cfg_obj = None
+        if "role_config" in settings:
+            rc_val = settings["role_config"]
+            if isinstance(rc_val, str):
+                role_consumer_cfg_path = rc_val
+            elif isinstance(rc_val, dict):
+                role_consumer_cfg_obj = load_role_config(rc_val)
+        if role_consumer_cfg_path is None and role_consumer_cfg_obj is None:
+            journal_roles = journal / "roles.json"
+            if journal_roles.exists():
+                role_consumer_cfg_path = str(journal_roles)
+
+        rc_setting = settings.get("role_consumer", {})
+        rc_interval = 10.0
+        if isinstance(rc_setting, dict) and "interval_sec" in rc_setting:
+            rc_interval = float(rc_setting["interval_sec"])
+
+        role_consumer = RoleConsumer(
+            config_path=role_consumer_cfg_path,
+            role_config=role_consumer_cfg_obj,
+            base_url=cfg.get("base_url"),
+            host_id=cfg.get("machine_id"),
+            min_interval_s=rc_interval,
+        )
+        role_consumer_thread: Optional[threading.Thread] = None
         next_fleet = 0
         count = 0
         try:
@@ -273,7 +426,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                         # arm the STOP-bundled owning-host tree step (never CLI
                         # paths). Invalid shapes fail that tree to uncertain;
                         # stops are unaffected.
-                        cleanup_roots=settings.get('cleanup_roots', []), settings=None))
+                        cleanup_roots=roots, settings=None))
                 except Exception as error:
                     print(json.dumps({'event': 'commands_error', 'type': type(error).__name__}), flush=True)
                 try:
@@ -281,8 +434,8 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                     snapshot = quota_collector.step()
                     if before != quota_collector.last_collect_monotonic:
                         print(json.dumps({'event': 'quota_cycle', 'reported': snapshot is not None,
-                                          'held': bool(quota_collector.last_hold),
-                                          'error': bool(quota_collector.last_error)}), flush=True)
+                                           'held': bool(quota_collector.last_hold),
+                                           'error': bool(quota_collector.last_error)}), flush=True)
                 except Exception as error:
                     print(json.dumps({'event': 'quota_error', 'type': type(error).__name__}), flush=True)
                 # Status observation never blocks commands/quota: one bounded
@@ -297,6 +450,9 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                 # Host health monitoring never blocks commands/quota: one bounded
                 # single-inflight daemon thread, skipped while alive.
                 host_health_thread = maybe_start_host_health_thread(host_health_thread, host_health_collector)
+                # Role consumption never blocks commands/quota: one bounded
+                # single-inflight daemon thread, skipped while alive.
+                role_consumer_thread = maybe_start_role_consumer_thread(role_consumer_thread, role_consumer)
                 count += 1
                 if cycles is None or count < cycles:
                     stop.wait(interval)

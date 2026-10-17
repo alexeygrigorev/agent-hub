@@ -545,9 +545,11 @@ class TestHostAgentDispatcherHook(unittest.TestCase):
         self.assertEqual(args["job_id"], "job-ws-1")
 
     @patch("agent_hub_host.api.safe_http_json")
+    @patch("agent_hub_host.auth.get_host_access_token")
     @patch("agent_hub_host.auth.get_access_token")
-    def test_poll_fallback_dispatches_offer(self, mock_tok, mock_http):
+    def test_poll_fallback_dispatches_offer(self, mock_tok, mock_host_tok, mock_http):
         mock_tok.return_value = "host_tok"
+        mock_host_tok.return_value = "host_tok"
         mock_http.return_value = {
             "status": "ok",
             "offer": {"type": "offer", "job_id": "job-poll-1", "kind": "root-run"}
