@@ -2,14 +2,14 @@
 
 - **Verdict**: **`SCOPED ACCEPT`**
 - **Reviewed Commits**:
-  - **R2 Retention Repair + Original Review Merge Pin**: `254091a9b1764638b43df58f0749a10778d62179` (`chore: record original links pings review before r2 report [skip ci]`, parents `3518a850c0fd377b6bc7894912a4fcb83b3cdbe9` and `4efa4a769755f59bb4569fdd044284d1e5451559`)
+  - **R2 Retention Repair + Original Review Merge Pin**: `254091a9b1764638b43df58f0749a10778d62179` (`Preserve pinned independent conversation composition review [skip ci]`, parents `3518a850c0fd377b6bc7894912a4fcb83b3cdbe9` and `4efa4a769755f59bb4569fdd044284d1e5451559`)
   - **Extended Final-Current-Main Composed Pin**: `aec97138afd5bccd9cd053794d85ee6dcfef548f` (`chore: compose retention repair with accepted intake main [skip ci]`, parents `254091a9b1764638b43df58f0749a10778d62179` and `bc796013d9f522d8a2e3ea050f7b264e2fabfc41`)
 - **Ancestor & Component Commits Verified**:
-  - `3518a850c0fd377b6bc7894912a4fcb83b3cdbe9` (`test(conversations): expand retention and retirement regressions [skip ci]`)
-  - `3bbb41d42fe75a78dce59342cedbdec6ff32bc94` (`fix(conversations): align archived parent and retirement predicates [skip ci]`)
-  - `be3b0184a2413adbb614dc7d83c542c0059f481b` (`chore: seed links pings r2 retention fix on current main [skip ci]`, parents `037bf039ec5ae01799a1cc863d31178a76107cdf` and `f6ec420cec3ab28fbea218dda478539b96fd4bbc`)
-  - `4efa4a769755f59bb4569fdd044284d1e5451559` (`docs(review): add independent review of M4/M5/M7 candidate f6ec420 [skip ci]`, direct parent `f6ec420cec3ab28fbea218dda478539b96fd4bbc`)
-  - `bc796013d9f522d8a2e3ea050f7b264e2fabfc41` (`docs(intake): record independent M12a intake review [skip ci]`, parent `b2b7a98d2431dfcb110e589db083cb025be52256` over `037bf039ec5ae01799a1cc863d31178a76107cdf`)
+  - `3518a850c0fd377b6bc7894912a4fcb83b3cdbe9` (`Preserve held automation bytes and verify bounded retention progress [skip ci]`)
+  - `3bbb41d42fe75a78dce59342cedbdec6ff32bc94` (`Fix actionable conversation retention selection [skip ci]`)
+  - `be3b0184a2413adbb614dc7d83c542c0059f481b` (`chore: prepare retention repair on accepted host binding main [skip ci]`, parents `037bf039ec5ae01799a1cc863d31178a76107cdf` and `f6ec420cec3ab28fbea218dda478539b96fd4bbc`)
+  - `4efa4a769755f59bb4569fdd044284d1e5451559` (`docs(reviews): revise composed M4/M5/M7 source for retention eligibility defects [skip ci]`, direct parent `f6ec420cec3ab28fbea218dda478539b96fd4bbc`)
+  - `bc796013d9f522d8a2e3ea050f7b264e2fabfc41` (`docs(review): accept M12a composed intake API CLI and handoff source [skip ci]`, parent `c290454e88c49c6fe863d20dd2717d58522851d0` over `037bf039ec5ae01799a1cc863d31178a76107cdf`)
 - **Implementer of Retention Repair (`3bbb41d` / `3518a85`)**: `platform-links-pings-r2/gpt-6` (Codex session `0e477d4f`, GPT-6 family, reasoning `high`, minor version `UNKNOWN`)
 - **Reviewer**: `platform-links-pings-r2-review/gemini-4-argon-high` (Antigravity session `95d52bae-1116-48d5-8aee-1b459650a58c`, Argon high reasoning, different model family from GPT-6 implementer)
 - **Date**: `2026-10-17`
@@ -37,7 +37,7 @@ Independent mechanical checks were executed and recorded in `<review-worktree>/.
 
 1. **R2 Source Manifest (`254091a9b1764638b43df58f0749a10778d62179`)**:
    - All `221` tracked paths and SHA-256 digests in `git ls-tree -r 254091a9b1764638b43df58f0749a10778d62179` match `<coordination-workspace>/.local/platform/combined-r2-source-manifest.json` (`0` mismatches; compact JSON SHA-256 `47797a54595ca83ad459ffb13dae37516361edf24861356936a4ff85f7b92a72`).
-   - Preserves all `209` baseline paths from `037bf039ec5ae01799a1cc863d31178a76107cdf` (including `docs/reviews/CLAIM-ADMISSION.md`, SHA-256 `9f432b315beaa2d37c3496b70108c45ba3d0194885a1c42371b0d55e103609e6`) plus `12` M4/M5/M7/R2 paths.
+   - Preserves all `209` baseline paths from `037bf039ec5ae01799a1cc863d31178a76107cdf` (including `docs/reviews/CLAIM-ADMISSION.md`, SHA-256 `bf7023ff6af7611b4cc53e6600e2da9cd78c0519f46abc9b09028fb399056828`) plus `12` M4/M5/M7/R2 paths.
    - `be3b0184a2413adbb614dc7d83c542c0059f481b` is the exact byte union of `037bf039ec5ae01799a1cc863d31178a76107cdf` and `f6ec420cec3ab28fbea218dda478539b96fd4bbc` (`0` mismatches across `219` files).
    - `git diff --name-only be3b0184a2413adbb614dc7d83c542c0059f481b..254091a9b1764638b43df58f0749a10778d62179` contains **only** the 6 expected paths:
      - `docs/CONVERSATION-LINKS.md`
@@ -54,7 +54,7 @@ Independent mechanical checks were executed and recorded in `<review-worktree>/.
    - `git diff --name-only bc796013d9f522d8a2e3ea050f7b264e2fabfc41..aec97138afd5bccd9cd053794d85ee6dcfef548f` is **only** the 14 M4/M5/M7/R2 paths from `254091a9b1764638b43df58f0749a10778d62179`, with all 13 non-`hub.ts` files (`src/conversations.ts`, `src/conversation-links.ts`, `src/conversation-automation.ts`, `src/conversation-hub.ts`, `src/jobs.ts`, `src/role_leases.ts`, `host/agent_hub_host/jobs.py`, `docs/CONVERSATION-LINKS.md`, `docs/CONVERSATION-PINGS.md`, `docs/reviews/CONVERSATION-LINKS-PINGS.md`, `test/conversation-links-pings.test.ts`, `test/conversation-links-pings-regressions.test.ts`, `test/vitest.conversation-links-pings-r2.config.ts`) 100% byte-identical to `254091a9b1764638b43df58f0749a10778d62179`.
    - Only `src/hub.ts` (`50f67c0ec73a5816bbe094b4e6c394aa4326feeb7500144ae64535560743829c`) required a three-way merge between `254091a9b1764638b43df58f0749a10778d62179` and `bc796013d9f522d8a2e3ea050f7b264e2fabfc41`.
 3. **Mechanical Note on Historical Commit Abbreviation in Prior Report**:
-   - In the immutable prior review report `docs/reviews/CONVERSATION-LINKS-PINGS.md:15`, the accepted host-binding ancestor commit was abbreviated as `85fd279`. Mechanically checking `git log` confirms the actual Git SHA in the repository ancestry is `85fdcec5e8c2fcfe0cb6d49134732b27f64e7896` (`fix: bind agent credentials and root identity to registered hosts [skip ci]`), which was reviewed in `80921a67da3ded48ce27c772619c850cfc0e34d3`.
+   - In the immutable prior review report `docs/reviews/CONVERSATION-LINKS-PINGS.md:15`, the accepted host-binding ancestor commit was abbreviated as `85fd279`. Mechanically checking `git log` confirms the actual Git SHA in the repository ancestry is `85fdcec5e8c2fcfe0cb6d49134732b27f64e7896` (`docs: distinguish registration fields from legacy binding columns [skip ci]`), which was reviewed in `80921a67da3ded48ce27c772619c850cfc0e34d3`.
 
 ---
 
@@ -141,7 +141,7 @@ All commands were executed serially on CPU core `0` (`taskset -c 0`, `UV_THREADP
 | `conversation-retention-1..3` | `aec97138` | `test/conversation-retention.test.ts` (3 batches: `8+8+4`) | `20/20 PASS` | `26.875` | `6,352,896` | `6,084,516` | `615,874,560` | `28` |
 | `checks-1..2` | `aec97138` | `test/checks.test.ts` (2 batches: `8+6`) | `14/14 PASS` | `17.270` | `3,715,072` | `3,425,405` | `629,710,848` | `28` |
 | `conversation-pings-1..6` | `aec97138` | `test/conversation-pings.test.ts` (6 batches: `8+8+8+8+8+5`) | `45/45 PASS` | `69.927` | `6,569,984` | `6,192,675` | `655,183,872` | `28` |
-| `intake-full` | `aec97138` | `test/intake.test.ts` (all 36 cases across 12 `it` blocks) | `36/36 PASS` | `20.281` | `9,240,576` | `8,782,286` | `671,031,296` | `28` |
+| `intake-full` | `aec97138` | `test/intake.test.ts` (all 36 cases) | `36/36 PASS` | `20.281` | `9,240,576` | `8,782,286` | `671,031,296` | `28` |
 | `bundle-dryrun-aec` | `aec97138` | `wrangler deploy --dry-run --outdir .local/tmp/bundle-dryrun` | `exit 0` | `4.028` | `3,268,608` | `2,796,379` | `405,733,376` | `14` |
 
 *(Note: 4 intermediate probe-fixture development iterations `adversarial-r2-probe`, `adversarial-r2-probe-v2..v5`, plus `host-intake-unittest` before adding `-s host/tests -t host`, and `intake-2` before running `intake-full` are retained in `<review-worktree>/.local/review/runs.jsonl` and `<review-worktree>/.local/review/logs/` as required by the review protocol. None were product failures.)*
@@ -207,3 +207,19 @@ All commands were executed serially on CPU core `0` (`taskset -c 0`, `UV_THREADP
 1. **Source Acceptance Scope**: Covers exact commits `254091a9b1764638b43df58f0749a10778d62179` and `aec97138afd5bccd9cd053794d85ee6dcfef548f` for normal `main` integration.
 2. **Unqualified `writer-run` Effect Backend**: Remains intentionally fail-closed (`HOLD`, `reason: "unqualified_profile_effect"`) in `host/agent_hub_host/jobs.py` until the downstream writer artifact consumer is project-qualified in its dedicated milestone.
 3. **Separate Gates**: Live Cloudflare Worker deployment/runtime verification (M8/M11), physical cross-host assignment/recovery/backfill, and MCP/adoption gates remain separate from this source acceptance.
+
+
+## 6. Head factual metadata correction
+
+The independent report is preserved unchanged at `4c7cf04bd689b81c867bd2622f2c116bede9d94a`.
+Before publication, platform mechanically checked the quoted Git metadata and
+corrected the commit subjects, the direct parent of `bc796013` (`c290454e`),
+and the SHA-256 of the preserved baseline `docs/reviews/CLAIM-ADMISSION.md`
+(`bf7023ff6af7611b4cc53e6600e2da9cd78c0519f46abc9b09028fb399056828`).
+The unsupported intake test-block count was removed; the actual Vitest report
+records 36 passing cases. No source, tests, original failure evidence or
+independent verdict changed. The reviewer session had ended before the correction
+request could be delivered; this is a head-authored factual correction, not an
+additional independent review. The accepted source pins and both 221/228-file
+source manifests remain unchanged. No source test rerun was needed for this
+report-only correction.
