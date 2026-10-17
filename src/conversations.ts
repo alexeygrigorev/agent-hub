@@ -18,6 +18,22 @@ import {
 } from './auth/session';
 import { sha256 } from './auth/crypto';
 
+// Shared by archived discovery, candidate selection and the final header guard.
+// An uncertain effect pins its parent even when only the frozen intent names it.
+const ARCHIVED_PARENT_UNBLOCKED_SQL = `
+  NOT EXISTS (SELECT 1 FROM conversation_automation_grants g WHERE g.conversation_id=c.id)
+  AND NOT EXISTS (SELECT 1 FROM conversation_automation_receipts r WHERE r.conversation_id=c.id)
+  AND NOT EXISTS (SELECT 1 FROM hub_check_slots s WHERE s.state!='done' AND (
+    json_extract(s.check_json, '$.action.conversation_id')=c.id
+    OR CASE WHEN json_valid(s.intent_json) THEN json_extract(s.intent_json, '$.conversationId') END=c.id
+  ))`;
+const ARCHIVED_PARENT_WORK_SQL = `c.archived_at IS NOT NULL AND c.archived_at<=? AND (
+  EXISTS (SELECT 1 FROM conversation_messages m WHERE m.conversation_id=c.id)
+  OR EXISTS (SELECT 1 FROM conversation_members m WHERE m.conversation_id=c.id)
+  OR EXISTS (SELECT 1 FROM conversation_links l WHERE l.conversation_id=c.id)
+  OR (${ARCHIVED_PARENT_UNBLOCKED_SQL})
+)`;
+
 export const CONVERSATIONS_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
@@ -1041,7 +1057,7 @@ export class ConversationsService {
     if (
       this.sql
         .exec(
-          'SELECT 1 FROM conversations WHERE archived_at IS NOT NULL AND archived_at <= ? LIMIT 1',
+          `SELECT 1 FROM conversations c WHERE ${ARCHIVED_PARENT_WORK_SQL} LIMIT 1`,
           archivedCutoffIso,
         )
         .toArray().length > 0
@@ -1102,7 +1118,9 @@ export class ConversationsService {
       JOIN conversations c ON c.id=g.conversation_id AND c.archived_at IS NULL
       WHERE g.id=json_extract(s.check_json, '$.action.grant_id') AND g.revoked_at IS NULL AND g.expires_at>?)`;
     const slots = this.sql.exec(`SELECT s.*, ${orphan} AS orphan FROM hub_check_slots s
-      WHERE (${orphan}) OR (s.state!='done' AND json_extract(s.check_json, '$.action.conversation_id') IS NOT NULL AND ${invalidGrant})
+      WHERE ((${orphan}) OR (s.state!='done' AND json_extract(s.check_json, '$.action.conversation_id') IS NOT NULL AND ${invalidGrant}))
+      AND NOT EXISTS (SELECT 1 FROM conversation_automation_receipts r
+        WHERE r.effect_key=('check-' || s.slot_key) AND r.request_json IS NOT s.intent_json)
       ORDER BY s.name LIMIT ?`, nowMs, limit).toArray();
     const receipts = this.sql.exec(`SELECT r.effect_key FROM conversation_automation_receipts r
       WHERE NOT EXISTS (SELECT 1 FROM hub_check_slots s WHERE ('check-' || s.slot_key)=r.effect_key AND s.state!='done')
@@ -1155,11 +1173,9 @@ export class ConversationsService {
 
         const expiredConvs = this.sql
           .exec(
-            `SELECT id
-             FROM conversations
-             WHERE archived_at IS NOT NULL AND archived_at <= ?
-             ORDER BY archived_at ASC, id ASC
-             LIMIT ?`,
+            `SELECT c.id FROM conversations c
+             WHERE ${ARCHIVED_PARENT_WORK_SQL}
+             ORDER BY c.archived_at ASC, c.id ASC LIMIT ?`,
             archivedCutoffIso,
             stepRemaining,
           )
@@ -1305,11 +1321,8 @@ export class ConversationsService {
           // Automation retires through its fair categories, never a cascading
           // delete. Keep the parent while receipts/grants or uncertain slots
           // still need it; inconsistent frozen effects must remain recoverable.
-          if (this.sql.exec(`SELECT 1 FROM conversation_automation_grants WHERE conversation_id = ?
-              UNION ALL SELECT 1 FROM conversation_automation_receipts WHERE conversation_id = ?
-              UNION ALL SELECT 1 FROM hub_check_slots WHERE state != 'done'
-                AND json_extract(check_json, '$.action.conversation_id') = ? LIMIT 1`,
-              conv.id, conv.id, conv.id).toArray().length > 0) {
+          if (this.sql.exec(`SELECT 1 FROM conversations c WHERE c.id=?
+              AND (${ARCHIVED_PARENT_UNBLOCKED_SQL})`, conv.id).toArray().length === 0) {
             continue;
           }
 
@@ -1463,7 +1476,7 @@ export class ConversationsService {
             hasWork: () =>
               this.sql
                 .exec(
-                  'SELECT 1 FROM conversations WHERE archived_at IS NOT NULL AND archived_at <= ? LIMIT 1',
+                  `SELECT 1 FROM conversations c WHERE ${ARCHIVED_PARENT_WORK_SQL} LIMIT 1`,
                   archivedCutoffIso,
                 )
                 .toArray().length > 0,
