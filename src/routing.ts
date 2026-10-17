@@ -1,6 +1,7 @@
 /** Durable client task queue layered over the existing quota-aware fleet launcher. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { modelCandidates, taskTier, policy } from './model-routing';
+import { evaluateQuotaAdmission } from './quota_admission';
 import type { FleetService } from './fleet';
 import { sha256, randomString } from './auth/crypto';
 import { effectiveCheckin } from './registry';
@@ -103,8 +104,17 @@ export class RoutingService {
         if (!plan.selected) continue;
         const routes = plan.candidates.flatMap((r: any) => {
           const account: any = this.sql.exec('SELECT provider FROM fleet_accounts WHERE label = ?', r.account).one();
-          const subscription: any = this.sql.exec('SELECT quota_json FROM fleet_subscriptions WHERE machine_id = ? AND account = ?', ad.machine_id, r.account).toArray()[0];
-          const models = modelCandidates(input, { ...r, provider: account.provider }, JSON.parse(ad.runners_json), subscription ? JSON.parse(subscription.quota_json) : null, this.now());
+          const subscription: any = this.sql.exec('SELECT quota_json, observed_at FROM fleet_subscriptions WHERE machine_id = ? AND account = ?', ad.machine_id, r.account).toArray()[0];
+          let subQuota: any = null;
+          if (subscription) {
+            try { subQuota = JSON.parse(subscription.quota_json); } catch { subQuota = null; }
+            if (subQuota) {
+              // Canonical fail-closed admission: exhausted/stale/unknown quota yields no models.
+              const adm = evaluateQuotaAdmission({ provider: account.provider, quota: subQuota, subscriptionObservedAt: subscription.observed_at ?? null, nowMs: this.now(), reserves: (((policy as any).rules as any).reserve_percent || {}) as Record<string, number> });
+              if (!adm.ok) subQuota = null;
+            }
+          }
+          const models = modelCandidates(input, { ...r, provider: account.provider }, JSON.parse(ad.runners_json), subQuota, this.now());
           return models.map(model => ({ ...r, model, score: r.score * model.weight / model.headroom }));
         });
         if (!routes.length) continue;

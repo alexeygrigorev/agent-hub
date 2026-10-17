@@ -120,7 +120,7 @@ def run_json(argv, *, payload=None, cwd=None, timeout=30):
 
 def quota_metadata(raw, service):
     """Reuse the maintained quota contract; never reimplement its failure/absence semantics."""
-    from .quota_snapshot import sanitize_provider, format_iso_utc
+    from .quota_snapshot import sanitize_provider, format_iso_utc, COLLECTOR_VERSION_REGEX
     route = raw.get(service, raw) if isinstance(raw, dict) else {}
     if not isinstance(route, dict): route = {}
     details = route.get('details') if isinstance(route.get('details'), dict) else {}
@@ -136,8 +136,13 @@ def quota_metadata(raw, service):
     windows = route.get('windows')
     if isinstance(windows, dict) and any(isinstance(w, dict) and 'stale' in w and w['stale'] is not False for w in windows.values()):
         status = 'unknown'
-    return {'status': status, 'observed_at': observed_at, 'details': clean['details'],
-            'windows': {name: {k: w[k] for k in ('present', 'percent_remaining', 'reset_at', 'rolling')} for name, w in clean['windows'].items()}}
+    window_keys = ('present', 'percent_remaining', 'reset_at', 'rolling', 'error',
+                   'credits_remaining', 'spend_used', 'spend_limit', 'unit', 'profile')
+    quota = {'status': status, 'observed_at': observed_at, 'details': clean['details'],
+             'windows': {name: {k: w.get(k) for k in window_keys} for name, w in clean['windows'].items()}}
+    collector_version = raw.get('collector_version') if isinstance(raw, dict) else None
+    quota['collector_version'] = collector_version if isinstance(collector_version, str) and COLLECTOR_VERSION_REGEX.match(collector_version) else None
+    return quota
 
 
 def codex_plan():

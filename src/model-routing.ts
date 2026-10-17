@@ -1,4 +1,5 @@
 import policy from '../config/model-routing.json';
+import { evaluateQuotaAdmission } from './quota_admission';
 export { policy };
 export function taskTier(input: any): string | null {
   if ((input.tier !== undefined && typeof input.tier !== 'string') || (input.difficulty !== undefined && (typeof input.difficulty !== 'string' || !Object.hasOwn(policy.rules.difficulty_tiers, input.difficulty)))) return null;
@@ -19,6 +20,10 @@ export function modelCandidates(input: any, route: any, advertisement: any, quot
     return m.provider === route.provider && m.engine === route.engine && m.profile === route.profile &&
       advertisement.some((a: any) => a.engine === m.engine && a.profile === m.profile && a.model === m.model && a.effort === m.effort && a.account === route.account);
   }).map(m => {
+    // Canonical fail-closed admission shared with dispatch/accountStatus/claim.
+    // Policy data (reserves, ranking, preferences) is unchanged and still owned here.
+    const admission = evaluateQuotaAdmission({ provider: m.provider, quota, subscriptionObservedAt: null, nowMs: now, reserves: ((policy.rules as any).reserve_percent || {}) as Record<string, number> });
+    if (!admission.ok) return null;
     const windows: any[] = Object.values(quota?.windows || {}).filter((w: any) => w.present !== false && Number.isFinite(w.percent_remaining));
     const remaining = Math.min(...windows.map(w => w.percent_remaining)) / 100;
     if (!Number.isFinite(remaining) || remaining <= 0 || remaining * 100 <= ((policy.rules.reserve_percent as any)[m.provider] ?? 0)) return null;

@@ -19,8 +19,14 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from . import api, auth, config
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
+COLLECTOR_VERSION = "quota_snapshot/1.1"
 ALLOWED_PROVIDERS = ("codex", "claude", "gemini", "grok", "zai", "go", "copilot")
+NATIVE_UNIT_LABELS = ("percent", "credits", "usd_cents", "requests", "tokens")
+PROFILE_LABEL_REGEX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./-]{0,63}$")
+COLLECTOR_VERSION_REGEX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+/-]{0,63}$")
+MAX_CREDITS_VALUE = 1e12
+MAX_SPEND_VALUE = 1e15
 WINDOW_NAME_REGEX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$")
 MAX_WINDOWS_PER_PROVIDER = 32
 MAX_SNAPSHOT_BYTES = 32 * 1024  # 32 KiB
@@ -83,6 +89,58 @@ def sanitize_bool(val: Any) -> Optional[bool]:
     if type(val) is bool:
         return val
     return None
+
+
+def sanitize_native_amount(val: Any, cap: float) -> Optional[float]:
+    """Validate a finite non-boolean native usage amount in [0, cap]; else None."""
+    if type(val) is bool:
+        return None
+    if isinstance(val, (int, float)):
+        if math.isnan(val) or math.isinf(val):
+            return None
+        if 0.0 <= float(val) <= cap:
+            return float(val)
+        return None
+    return None
+
+
+def sanitize_unit_label(val: Any) -> Optional[str]:
+    """Allowlisted native unit label; unknown units stay None (unknown)."""
+    if isinstance(val, str) and val in NATIVE_UNIT_LABELS:
+        return val
+    return None
+
+
+def sanitize_profile_label(val: Any) -> Optional[str]:
+    """Bounded provider profile label (e.g. Muse Spark model id); else None."""
+    if isinstance(val, str) and PROFILE_LABEL_REGEX.match(val):
+        return val
+    return None
+
+
+def extract_native_fields(raw: Any) -> Dict[str, Any]:
+    """Pass through ONLY allowlisted provider-native usage fields.
+
+    Unknown keys (tokens, cookies, emails, raw stdout, private config) are
+    dropped by allowlist extraction. Invalid native values become None
+    (unknown) without disturbing the percent path; no percentage is ever
+    converted into dollars or tokens here.
+    """
+    native: Dict[str, Any] = {
+        "credits_remaining": None,
+        "spend_used": None,
+        "spend_limit": None,
+        "unit": None,
+        "profile": None,
+    }
+    if not isinstance(raw, dict):
+        return native
+    native["credits_remaining"] = sanitize_native_amount(raw.get("credits_remaining"), MAX_CREDITS_VALUE)
+    native["spend_used"] = sanitize_native_amount(raw.get("spend_used"), MAX_SPEND_VALUE)
+    native["spend_limit"] = sanitize_native_amount(raw.get("spend_limit"), MAX_SPEND_VALUE)
+    native["unit"] = sanitize_unit_label(raw.get("unit"))
+    native["profile"] = sanitize_profile_label(raw.get("profile"))
+    return native
 
 
 def sanitize_window(
@@ -165,10 +223,17 @@ def sanitize_window(
     else:
         window_error = None
 
-    # Hub contract: an absent or errored window carries neither percent nor reset_at
+    # Hub contract: an absent or errored window carries no measurements at all.
+    # Native fields are omitted when unknown so percent-only inputs keep their
+    # exact legacy shape; non-null natives round-trip verbatim.
     if has_error or not present:
         percent_remaining = None
         reset_at = None
+    native: Dict[str, Any] = {}
+    if not has_error and present:
+        for native_key, native_val in extract_native_fields(win_data).items():
+            if native_val is not None:
+                native[native_key] = native_val
 
     return {
         "percent_remaining": percent_remaining,
@@ -176,6 +241,7 @@ def sanitize_window(
         "present": present,
         "rolling": rolling,
         "error": window_error,
+        **native,
     }, has_error
 
 
@@ -221,6 +287,19 @@ def sanitize_provider(
         limit_reached = None
 
     sanitized_details: Dict[str, Any] = {"limit_reached": limit_reached}
+    for native_key, native_val in extract_native_fields(raw_details).items():
+        if native_val is not None:
+            sanitized_details[native_key] = native_val
+    if "stale" in raw_details and type(raw_details["stale"]) is bool:
+        sanitized_details["stale"] = raw_details["stale"]
+    # Known provider backoff deadline (launcher 429 Retry-After authority, mirrored
+    # as UTC ISO). Omitted when unknown; malformed stays unknown here, the hub
+    # retains an unexpired known hold and fails closed on malformed stored values.
+    raw_cooldown = raw_details.get("cooldown_until")
+    if raw_cooldown is not None:
+        parsed_cooldown = parse_iso_utc(raw_cooldown)
+        if parsed_cooldown is not None:
+            sanitized_details["cooldown_until"] = format_iso_utc(parsed_cooldown)
     if provider_name == "grok":
         if "has_grok_code_access" in raw_details and raw_details["has_grok_code_access"] is not None:
             if type(raw_details["has_grok_code_access"]) is not bool:
@@ -338,6 +417,7 @@ def create_quota_snapshot(
     if not isinstance(raw_data, dict):
         return {
             "schema_version": SCHEMA_VERSION,
+            "collector_version": COLLECTOR_VERSION,
             "captured_at": captured_at,
             "host_id": host_id,
             "status": "error",
@@ -352,6 +432,7 @@ def create_quota_snapshot(
 
     snapshot = {
         "schema_version": SCHEMA_VERSION,
+        "collector_version": COLLECTOR_VERSION,
         "captured_at": captured_at,
         "host_id": host_id,
         "status": "ok",
