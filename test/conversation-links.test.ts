@@ -671,6 +671,51 @@ describe('M4 idempotency, cap, restart, retention', () => {
     notePeak('retention');
   });
 
+  it('tombs deleted targets and keeps links on archived non-expired parents', async () => {
+    await withHub(async hub => {
+      const csrf = 'csrf-alice-tomb';
+      const cookie = await cookieFor('alice', 'admin@fake.local', csrf);
+      const conv = await createGroup(hub, cookie, csrf, 'Tombstone', []);
+      const jobId = crypto.randomUUID();
+      insertJob(hub.sql, { id: jobId, actor: 'x', state: 'done' });
+      const attached = await hub.fetch(
+        jsonReq(`/api/conversations/${conv.id}/links`, {
+          cookie,
+          csrf,
+          body: { kind: 'outcome', ref: jobId, idempotency_key: 'tomb' },
+        }),
+      );
+      expect(attached.status).toBe(201);
+      expect((await attached.json() as any).target.complete).toBe(true);
+      hub.sql.exec('DELETE FROM routing_jobs WHERE id = ?', jobId);
+      const listed = await hub.fetch(
+        jsonReq(`/api/conversations/${conv.id}/links`, { cookie }),
+      );
+      const item = (await listed.json() as any).links[0];
+      expect(item.target.available).toBe(false);
+      expect(item.target.canonical_status).toBeNull();
+      expect(item.target.complete).toBe(false);
+
+      expect(
+        (
+          await hub.fetch(
+            jsonReq(`/api/conversations/${conv.id}/archive`, {
+              cookie,
+              csrf,
+              body: {},
+            }),
+          )
+        ).status,
+      ).toBe(200);
+      const archivedList = await hub.fetch(
+        jsonReq(`/api/conversations/${conv.id}/links`, { cookie }),
+      );
+      expect(archivedList.status).toBe(200);
+      expect((await archivedList.json() as any).links).toHaveLength(1);
+    });
+    notePeak('tombstone-archived');
+  });
+
   it('submits a routing task without a conversation_id', async () => {
     await withHub(async hub => {
       const csrf = 'csrf-alice-submit';
