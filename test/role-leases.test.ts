@@ -344,4 +344,47 @@ describe('configured roles through authenticated public HTTP and real Hub SQLite
     expect(result).toMatchObject({error:'conflict',reason:'writer_date_busy'});
     expect(result.job_token).toBeUndefined();
   });
+
+  it('supports expanded role profile sets while requiring all enabled capabilities on configured hosts', async () => {
+    const f = await fixture();
+    // Host-a and Host-b only have ['writer-run'] initially.
+    // Configuring multi-profile fails host_ineligible because hosts lack 'principal-wake'
+    const multiConfig = { ...config, profiles: ['writer-run', 'principal-wake'] };
+    expect((await f.configure(multiConfig)).data.error).toBe('host_ineligible');
+
+    // Reject duplicate profiles
+    expect((await f.configure({ ...config, profiles: ['writer-run', 'writer-run'] })).data.error).toBe('invalid_configuration');
+    // Reject empty profiles
+    expect((await f.configure({ ...config, profiles: [] })).data.error).toBe('invalid_configuration');
+    // Reject unknown profiles
+    expect((await f.configure({ ...config, profiles: ['writer-run', 'unsupported'] })).data.error).toBe('invalid_configuration');
+
+    // Grant 'principal-wake' and 'head-recovery' capabilities to host-a and host-b
+    await f.inspect((hub: any) => {
+      hub.sql.exec("UPDATE machines SET capabilities='{\"jobs\":[\"writer-run\",\"principal-wake\",\"head-recovery\"]}' WHERE id IN ('host-a','host-b')");
+    });
+
+    // Now multi-profile configuration succeeds
+    const fullConfig = { ...config, profiles: ['writer-run', 'principal-wake', 'head-recovery'] };
+    const res = await f.configure(fullConfig);
+    expect(res.data).toMatchObject({ generation: 1, epoch: 1 });
+
+    // Host can offer principal-wake job
+    const wakeRes = await f.request('/api/roles/demo/writer/jobs', {
+      generation: 1, expected_epoch: 1, idempotency_key: '2099-05-06:wake-1',
+      profile: 'principal-wake', payload: { prompt: 'wake idle principal' }
+    }, 'token-host-a');
+    expect(wakeRes.code).toBe(201);
+    expect(wakeRes.data.job_id).toBeDefined();
+
+    // Claim principal-wake job
+    const claimRes = await f.claim(wakeRes.data.job_id, 'host-a');
+    expect(claimRes.code).toBe(200);
+    expect(claimRes.data.role_binding).toMatchObject({ generation: 1, host_id: 'host-a', profile: 'principal-wake' });
+
+    // Execute intent on principal-wake job
+    const execRes = await f.execute(wakeRes.data.job_id, claimRes.data.job_token, 2, 1);
+    expect(execRes.data.execute).toBe(true);
+    expect(execRes.data.profile).toBe('principal-wake');
+  });
 });

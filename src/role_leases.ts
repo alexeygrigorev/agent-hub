@@ -2,6 +2,7 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 
 const NAME = /^[a-z][a-z0-9-]{0,47}$/;
 const RESERVED = new Set(['root', 'principal', 'role', 'host', 'job', 'human', 'system', 'admin']);
+export const SUPPORTED_ROLE_PROFILES = new Set(['writer-run', 'principal-wake', 'head-recovery']);
 export const ROLE_CAPACITY = 64;
 export const ROLE_JOB_CAPACITY = 1024;
 export const ROLE_RETENTION_MS = 3 * 86400000;
@@ -66,7 +67,8 @@ export class RoleLeases {
 
   configure(name: string, input: any, expectedGeneration: number, now: number): any {
     if (!input || Object.keys(input).some(k => !['enabled', 'profiles', 'actions', 'hosts', 'ttl_seconds'].includes(k)) ||
-        typeof input.enabled !== 'boolean' || !Array.isArray(input.profiles) || input.profiles.length !== 1 || input.profiles[0] !== 'writer-run' ||
+        typeof input.enabled !== 'boolean' || !Array.isArray(input.profiles) || input.profiles.length < 1 || input.profiles.length > SUPPORTED_ROLE_PROFILES.size ||
+        new Set(input.profiles).size !== input.profiles.length || input.profiles.some((p: any) => typeof p !== 'string' || !SUPPORTED_ROLE_PROFILES.has(p)) ||
         !Array.isArray(input.actions) || input.actions.length !== 1 || input.actions[0] !== 'execute' ||
         !Array.isArray(input.hosts) || input.hosts.length < 1 || input.hosts.length > 16 ||
         new Set(input.hosts).size !== input.hosts.length || input.hosts.some((h: any) => typeof h !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(h)) ||
@@ -83,7 +85,7 @@ export class RoleLeases {
     const bindings: Record<string, string> = {};
     for (const id of input.hosts) {
       const host: any = this.sql.exec('SELECT credential_id FROM machines WHERE id = ?', id).toArray()[0];
-      if (input.enabled && (!host || !this.host(id, host.credential_id, 'writer-run', now))) return { error: 'host_ineligible' };
+      if (input.enabled && (!host || !input.profiles.every((p: string) => this.host(id, host.credential_id, p, now)))) return { error: 'host_ineligible' };
       bindings[id] = host?.credential_id ?? '';
     }
     const generation = (old?.generation ?? 0) + 1;
@@ -105,7 +107,7 @@ export class RoleLeases {
     const hostId = job.holder_host_id || job.offer_host_id;
     if (role.bindings[hostId] !== job.role_host_credential || !this.host(hostId, job.role_host_credential, job.kind, now)) return null;
     const payload = JSON.parse(job.payload);
-    if (payload.project !== job.role_name.split(':')[1]) return null;
+    if (payload.project && payload.project !== job.role_name.split(':')[1]) return null;
     return role;
   }
 

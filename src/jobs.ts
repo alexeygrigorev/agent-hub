@@ -2,7 +2,7 @@ import { registryNameSql } from './agent_registry';
 import { sha256, base64url } from './auth/crypto';
 import { getSession } from './auth/session';
 import { ensureRootScheduling, isRootSchedulingEnabled } from './root_scheduling';
-import { RoleLeases, canonical, roleName, ROLE_JOB_CAPACITY } from './role_leases';
+import { RoleLeases, canonical, roleName, ROLE_JOB_CAPACITY, SUPPORTED_ROLE_PROFILES } from './role_leases';
 
 function sha256Sync(input: string): string {
   const K = new Uint32Array([
@@ -322,18 +322,30 @@ export class JobsService {
     if (!key || !body || Object.keys(body).some(k => !['generation','expected_epoch','idempotency_key','profile','payload'].includes(k)) ||
         !Number.isSafeInteger(body.generation) || !Number.isSafeInteger(body.expected_epoch) || body.expected_epoch < 0 ||
         typeof body.idempotency_key !== 'string' || !/^\d{4}-\d{2}-\d{2}:[A-Za-z0-9_-]{1,64}$/.test(body.idempotency_key) ||
-        body.profile !== 'writer-run' || !body.payload || Object.keys(body.payload).some(k => k !== 'date') ||
-        typeof body.payload.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(body.payload.date) ||
-        !Number.isFinite(Date.parse(body.payload.date + 'T00:00:00Z')) || new Date(body.payload.date + 'T00:00:00Z').toISOString().slice(0,10) !== body.payload.date) return { error: 'invalid_role_job' };
+        typeof body.profile !== 'string' || !SUPPORTED_ROLE_PROFILES.has(body.profile) ||
+        !body.payload || typeof body.payload !== 'object' || Array.isArray(body.payload)) return { error: 'invalid_role_job' };
+    if (body.profile === 'writer-run') {
+      if (Object.keys(body.payload).some(k => k !== 'date') ||
+          typeof body.payload.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(body.payload.date) ||
+          !Number.isFinite(Date.parse(body.payload.date + 'T00:00:00Z')) ||
+          new Date(body.payload.date + 'T00:00:00Z').toISOString().slice(0,10) !== body.payload.date) {
+        return { error: 'invalid_role_job' };
+      }
+    } else {
+      if (Object.keys(body.payload).some(k => !/^[A-Za-z0-9_-]{1,64}$/.test(k))) {
+        return { error: 'invalid_role_job' };
+      }
+    }
     return this.ctx.storage.transactionSync(() => {
       const now = this.rawNow(); const ms = now.getTime();
       const role = this.roles.get(key);
       if (!role || !role.enabled || role.generation !== body.generation || !this.roles.clock(key, ms) ||
+          !role.profiles.includes(body.profile) ||
           role.bindings[hostId] !== credentialId || !this.roles.host(hostId, credentialId, body.profile, ms)) return { error: 'role_unauthorized' };
       // Expired keys cannot execute again after bounded receipt retention.
       if (!body.idempotency_key.startsWith(now.toISOString().slice(0,10) + ':')) return { error: 'idempotency_key_expired' };
       const idempotency = `${key}:${body.idempotency_key}`;
-      const payload = canonical({ date: body.payload.date, project });
+      const payload = canonical({ ...body.payload, project });
       const existing: any = this.sql.exec('SELECT * FROM jobs WHERE idempotency_key=?', idempotency).toArray()[0];
       if (existing) return existing.role_generation === body.generation && existing.role_expected_epoch === body.expected_epoch &&
         existing.role_host_credential === credentialId && existing.offer_host_id === hostId && existing.payload === payload && existing.kind === body.profile
