@@ -252,6 +252,11 @@ export class SessionControlService {
     const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0];
     if (!row) return { ok: false as const, error: 'not_found' };
     if (!BINDABLE.has(row.state)) return { ok: false as const, error: 'binding_not_allowed' };
+    // Canonical assigned launch must exist before any native binding is
+    // accepted: Fleet owns start, so a session without a fleet_launch_id has
+    // no assigned machine/workspace/launch to reconcile. Never grant control
+    // of an arbitrary unrelated native UUID just because a host reports it.
+    if (!row.fleet_launch_id) return { ok: false as const, error: 'binding_not_allowed' };
     if (typeof binding.native_id !== 'string' || !UUID_V4.test(binding.native_id) ||
         typeof binding.tag !== 'string' || !binding.tag || binding.tag.startsWith('-') ||
         !absoluteWorkspaceOk(binding.workspace)) return { ok: false as const, error: 'invalid_binding' };
@@ -505,10 +510,13 @@ export class SessionControlService {
           }
           offers.push({
             command_id: row.id, session_id: row.session_id, kind: row.kind,
+            generation: row.generation,
             session_state: session.state, fleet_launch_id: session.fleet_launch_id ?? null,
-            // Native send/capture targets need the exact bound tag; unbound
-            // sessions (stop on offered) carry binding null + fleet correlation.
-            binding: binding ? { native_id: binding.native_id, tag: binding.tag, workspace: binding.workspace, generation: binding.generation } : null,
+            // Native send/capture targets need the exact bound tag + incarnation;
+            // unbound sessions (stop on offered) carry binding null + fleet correlation.
+            // native_created_at_ms is mandatory for host generation provenance:
+            // the receiver refuses bound offers without it rather than guessing.
+            binding: binding ? { native_id: binding.native_id, tag: binding.tag, workspace: binding.workspace, generation: binding.generation, native_created_at_ms: binding.native_created_at_ms ?? null } : null,
             native_tag: binding?.tag ?? null, workspace: requestJson.workspace ?? null,
             // Reserved for the future start adapter that consumes cwd; the hub
             // rejects non-root cwd today and never claims an executed cwd.
@@ -548,8 +556,11 @@ export class SessionControlService {
           if (row.holder_machine !== caller.machineId) return response({ error: 'claim_conflict' }, 409);
           // Same attester (journaled attempt) replays; any other attempt on
           // this machine is refused: one claim authorizes exactly one effect.
+          // The grant carries holder + generation + both expiry forms so the
+          // host receiver can feed verify_server_claim without inferring field
+          // names: expires_at (ISO, canonical) and expires_at_ms (int, host clock).
           if (row.holder_attempt === input.attempt_id) {
-            return response({ command_id: row.id, claim_token: row.claim_token, expires_at: row.claim_expires_at, attempt: row.attempts ?? 1, replay: true });
+            return response({ command_id: row.id, claim_token: row.claim_token, holder: row.holder_machine, generation: row.generation, expires_at: row.claim_expires_at, expires_at_ms: Date.parse(row.claim_expires_at), attempt: row.attempts ?? 1, replay: true });
           }
           return response({ error: 'already_claimed' }, 409);
         }
@@ -562,7 +573,7 @@ export class SessionControlService {
           caller.machineId, token, expires, input.attempt_id, attempt, this.at(), row.id);
         if (written.rowsWritten !== 1) return response({ error: 'claim_conflict' }, 409);
         this.adoptHostFamily(session.id, caller);
-        return response({ command_id: row.id, claim_token: token, expires_at: expires, attempt });
+        return response({ command_id: row.id, claim_token: token, holder: caller.machineId, generation: row.generation, expires_at: expires, expires_at_ms: Date.parse(expires), attempt });
       });
     }
 
