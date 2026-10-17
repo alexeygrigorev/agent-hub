@@ -24,6 +24,14 @@ import { credentialActor } from './agent_registry';
 import { redact } from './routing';
 import { taskTier } from './model-routing';
 import { approvalAuthorityMatches } from './host_enrollment';
+import {
+  buildLifecycleView,
+  initLifecycleTables,
+  planCleanupDryRun,
+  recordDecision,
+  recordObservation,
+  refuseCleanupApply,
+} from './session_lifecycle_registry';
 
 export const SESSION_CONTROL_SCHEMA = `
 CREATE TABLE IF NOT EXISTS session_control_sessions (id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, fleet_launch_id TEXT, machine_id TEXT, engine TEXT, mode TEXT NOT NULL, state TEXT NOT NULL, binding_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
@@ -169,6 +177,10 @@ export class SessionControlService {
     for (const [col, type] of [['owner_token_id', 'TEXT'], ['owner_family', 'TEXT'], ['holder_machine', 'TEXT'], ['claim_token', 'TEXT'], ['claim_expires_at', 'TEXT'], ['holder_attempt', 'TEXT'], ['attempts', 'INTEGER DEFAULT 0']] as const) {
       if (!commandCols.has(col)) this.sql.exec(`ALTER TABLE session_control_commands ADD COLUMN ${col} ${type}`);
     }
+    // M15c lifecycle: additive observations/decisions tables. Server-owned
+    // DDL (single authority: src/session_lifecycle.ts schema string); the
+    // host keeps no DDL copy. No ALTERs to existing tables here.
+    initLifecycleTables(this.sql);
   }
 
   private at() { return new Date(this.now()).toISOString(); }
@@ -249,12 +261,60 @@ export class SessionControlService {
     if (session.host_family && session.host_family !== family) return { ok: false, error: 'host_credential_changed' };
     return { ok: true };
   }
-
   private adoptHostFamily(sessionId: string, caller: Caller) {
     if (caller.isAdmin === true || !caller.tokenId) return;
     const family = this.presentingFamily(caller);
     if (!family) return;
     try { this.sql.exec('UPDATE session_control_sessions SET host_family = COALESCE(host_family, ?) WHERE id = ?', family, sessionId); } catch { /* bookkeeping only */ }
+  }
+
+  /** M15c: live host authority for machine-scoped observation writes (no
+   * session row involved): the machine row must still exist and the
+   * presenter must be in the machine's current credential family. */
+  private lifecycleHostOk(caller: Caller): boolean {
+    if (!caller.machineId || !caller.tokenId) return false;
+    const family = this.presentingFamily(caller);
+    if (!family) return false;
+    try {
+      const m: any = this.sql.exec(
+        'SELECT m.id, m.credential_id, c.family_id AS machine_family FROM machines m LEFT JOIN credentials c ON c.id = m.credential_id WHERE m.id = ?',
+        caller.machineId).toArray()[0];
+      if (!m) return false;
+      if (m.machine_family && m.machine_family !== family) return false;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** M15c: resolve the canonical refs for a lifecycle session key without
+   * trusting any payload field. Returns null for unknown keys. */
+  private lifecycleRefsFor(sessionKey: unknown): { session_id: string | null; fleet_launch_id: string | null } | null {
+    if (typeof sessionKey !== 'string') return null;
+    const sep = sessionKey.indexOf('/');
+    if (sep < 0) return null;
+    const machine_id = sessionKey.slice(0, sep);
+    const native_id = sessionKey.slice(sep + 1);
+    if (!machine_id || !native_id) return null;
+    try {
+      for (const sc of this.sql.exec('SELECT id, binding_json, fleet_launch_id FROM session_control_sessions WHERE machine_id = ?', machine_id).toArray() as any[]) {
+        try {
+          const binding = sc.binding_json ? JSON.parse(sc.binding_json) : null;
+          if (binding?.native_id === native_id) {
+            return { session_id: sc.id, fleet_launch_id: sc.fleet_launch_id ?? null };
+          }
+        } catch { /* corrupt binding: not this session */ }
+      }
+      const launch: any = this.sql.exec(
+        'SELECT id FROM fleet_launches WHERE machine_id = ? AND native_id = ?', machine_id, native_id).toArray()[0];
+      if (launch) return { session_id: null, fleet_launch_id: launch.id };
+      const fleet: any = this.sql.exec(
+        'SELECT machine_id FROM fleet_sessions WHERE machine_id = ? AND native_id = ?', machine_id, native_id).toArray()[0];
+      if (fleet) return { session_id: null, fleet_launch_id: null };
+    } catch {
+      return null;
+    }
+    return null;
   }
 
   private view(row: any) {
@@ -594,6 +654,24 @@ export class SessionControlService {
 
     if (path === '/api/sessions' && request.method === 'GET') {
       if (!writer) return response({ error: 'forbidden' }, 403);
+      // M15c lifecycle: additive grouped needs-action projection over the
+      // canonical stores (never a second registry). Scope is authentication,
+      // never a payload flag: non-admin callers always see their own actor.
+      if (url.searchParams.get('view') === 'lifecycle') {
+        const scopeParam = (name: string): string | null => {
+          const value = url.searchParams.get(name);
+          if (value == null || value === '') return null;
+          if (value.length > 128) return null;
+          return value;
+        };
+        const scope = admin
+          ? { owner: scopeParam('owner'), host: scopeParam('host'), task: scopeParam('task') }
+          : { owner: caller.actor ?? null, host: scopeParam('host'), task: scopeParam('task') };
+        const limit = Math.min(50, Math.max(1, Number(url.searchParams.get('limit')) || 50));
+        return response(buildLifecycleView(this.sql, scope, {
+          limit, cursor: url.searchParams.get('cursor'), now_ms: this.now(),
+        }));
+      }
       const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 50));
       const cursor = url.searchParams.get('cursor');
       const params: any[] = [];
@@ -605,6 +683,86 @@ export class SessionControlService {
       const page = rows.slice(0, limit);
       const next = rows.length > limit ? `${(page[page.length - 1] as any).created_at}|${(page[page.length - 1] as any).id}` : null;
       return response({ sessions: page.map(r => this.view(r)), next_cursor: next });
+    }
+
+    // M15c lifecycle durable seams (narrow; command auth/effect code untouched).
+    if (path === '/api/sessions/observations' && request.method === 'POST') {
+      if (!host && !admin) return response({ error: 'forbidden' }, 403);
+      const input = await body(request);
+      if (!input || typeof input !== 'object') return response({ error: 'invalid_observation' }, 400);
+      // Machine scope is authentication: a host writes only its own machine.
+      if (host && !admin && input.machine_id !== caller.machineId) {
+        return response({ error: 'not_found' }, 404);
+      }
+      return this.transaction(() => {
+        if (host && !admin && !this.lifecycleHostOk(caller)) {
+          return response({ error: 'host_credential_changed' }, 409);
+        }
+        const stored = recordObservation(this.sql, this.now(), {
+          machine_id: (input as any).machine_id,
+          native_id: (input as any).native_id,
+          observed_at: (input as any).observed_at,
+          payload: (input as any).payload ?? input,
+        });
+        if (!stored.ok) return response({ error: stored.error }, stored.status);
+        return response(stored, 201);
+      });
+    }
+
+    if (path === '/api/sessions/decisions' && request.method === 'POST') {
+      if (!writer) return response({ error: 'forbidden' }, 403);
+      // Admin privilege is never another coordinator's ownership: admins
+      // cannot record decisions for sessions they do not own (never oracle).
+      if (admin) return response({ error: 'not_found' }, 404);
+      const input = await body(request);
+      if (!input || typeof input !== 'object') return response({ error: 'invalid_decision' }, 400);
+      return this.transaction(() => {
+        if (!this.agentLive(caller)) return response({ error: 'forbidden' }, 403);
+        const key = (input as any).session_key;
+        let ownerVerified = false;
+        try {
+          const refs = this.lifecycleRefsFor(key);
+          if (refs?.session_id) {
+            const sc: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', refs.session_id).toArray()[0];
+            ownerVerified = !!sc && this.ownerOk(sc, caller) && sc.actor === caller.actor;
+          } else if (refs?.fleet_launch_id) {
+            const launch: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id = ?', refs.fleet_launch_id).toArray()[0];
+            ownerVerified = !!launch && !!caller.actor && launch.actor === caller.actor;
+          }
+        } catch {
+          ownerVerified = false;
+        }
+        const decided = recordDecision(this.sql, this.now(),
+          { actor: caller.actor, isAdmin: false }, ownerVerified, {
+            session_key: (input as any).session_key,
+            kind: (input as any).kind,
+            reason: (input as any).reason,
+            engine: (input as any).engine,
+            target: (input as any).target,
+          });
+        if (!decided.ok) return response({ error: decided.error }, decided.status);
+        return response({ decision: decided.decision }, 201);
+      });
+    }
+
+    if (path === '/api/sessions/cleanup' && request.method === 'POST') {
+      if (!writer) return response({ error: 'forbidden' }, 403);
+      const input = await body(request);
+      // --apply has no safe execution path in M15c: refuse explicitly with
+      // the exact next seam. Zero writes on every cleanup path.
+      if (input && (input as any).apply === true) {
+        const refused = refuseCleanupApply();
+        return response({ error: refused.error, detail: refused.detail, next: refused.next }, refused.status);
+      }
+      const scopeParam = (name: string): string | null => {
+        const value = url.searchParams.get(name);
+        if (value == null || value === '') return null;
+        return value.length > 128 ? null : value;
+      };
+      const scope = admin
+        ? { owner: scopeParam('owner'), host: scopeParam('host'), task: scopeParam('task') }
+        : { owner: caller.actor ?? null, host: scopeParam('host'), task: scopeParam('task') };
+      return response(planCleanupDryRun(this.sql, scope, caller.actor ?? '', this.now()));
     }
 
     const sessionMatch = /^\/api\/sessions\/([a-f0-9-]{36})(\/(send|capture|stop|commands|binding))?$/.exec(path);
