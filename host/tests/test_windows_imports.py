@@ -57,14 +57,16 @@ for args in [('conversations','bridge','--help'), ('bridge-resume','--help'), ('
         response.headers = {'Content-Type': 'application/json'}
         response.read.return_value = json.dumps(token).encode()
         response.__enter__.return_value = response
-        with patch.object(auth, '_shared_device_login', return_value=module), \
+        with patch.object(auth, '_device_flow', return_value=module), \
+             patch.object(auth, '_shared_device_login', return_value=module), \
              patch('urllib.request.OpenerDirector.open', return_value=response), \
              patch.object(config, 'load_config', return_value={}), patch.object(config, 'save_config') as save, \
              contextlib.redirect_stdout(io.StringIO()):
             auth.device_login('https://fixture.invalid', 'agent', 'fixture:worker', 'fixture-host', ['conversations:read'])
         self.assertEqual(save.call_args.args[0]['machine_id'], 'fixture-machine')
         self.assertEqual(save.call_args.args[0]['access_token'], 'fixture-only')
-        config._pending_machine_binding.clear()
+        if hasattr(config, '_pending_machine_binding'):
+            config._pending_machine_binding.clear()
 
 
 if __name__ == '__main__':

@@ -22,7 +22,7 @@ class MockRNG:
 
 class TestApi(unittest.TestCase):
     @patch("urllib.request.OpenerDirector.open")
-    @patch("agent_hub_host.auth.get_access_token")
+    @patch("agent_hub_host.auth.get_host_access_token")
     def test_register_machine(self, mock_get_token, mock_urlopen):
         mock_get_token.return_value = "acc123"
         resp = MagicMock()
@@ -64,7 +64,7 @@ class TestApi(unittest.TestCase):
         self.assertEqual(decoded, b"hello")
 
     @patch("urllib.request.OpenerDirector.open")
-    @patch("agent_hub_host.auth.get_access_token")
+    @patch("agent_hub_host.auth.get_host_access_token")
     def test_bearer_not_forwarded(self, mock_get_token, mock_urlopen):
         mock_get_token.return_value = "acc123"
         # We need to test if the custom NoRedirectHandler raises HTTPError rather than forwarding Bearer token
@@ -75,7 +75,7 @@ class TestApi(unittest.TestCase):
             handler.redirect_request(req, None, 302, "Found", None, "https://other")
 
     @patch("urllib.request.OpenerDirector.open")
-    @patch("agent_hub_host.auth.get_access_token")
+    @patch("agent_hub_host.auth.get_host_access_token")
     def test_no_token_in_exception(self, mock_get_token, mock_urlopen):
         mock_get_token.return_value = "secret_token_123"
         mock_urlopen.side_effect = Exception("Some connection error")
