@@ -195,6 +195,23 @@ function strictObservedAt(value: unknown, now: number): string {
 
 export class StatusService {
   constructor(private sql: SqlStorage, private tx: Tx, private intake: IntakeService, private now: () => number = Date.now) {}
+
+  /** Operator-only canonical check alerts; agent task grants do not grant
+   * visibility into other actors' monitoring details. No second check loop. */
+  private needsAttention(admin: boolean, measured: Obj[]): Obj[] {
+    if (!admin) return measured;
+    let rows: any[];
+    try {
+      rows = this.sql.exec("SELECT id, subject, state, detail, opened_at FROM liveness_alerts WHERE subject_kind='check' AND resolved_at IS NULL ORDER BY id DESC LIMIT 64").toArray();
+    } catch { return measured; }
+    return [...measured, ...rows.map(row => ({
+      severity: 'warn', subject: 'check:' + row.subject,
+      title: 'Scheduled check: ' + row.subject, detail: snippet(row.detail),
+      state: row.state, alert_id: row.id, opened_at: row.opened_at,
+      source: 'liveness_alerts', scope: 'hub',
+    }))];
+  }
+
   private gate?: HostObservationGate;
   private monitoringService?: MonitoringService;
 
@@ -373,7 +390,7 @@ export class StatusService {
           tasks: built.items,
           disk: diskSummary?.filesystems ?? [],
           host_health: diskSummary?.host_health ?? [],
-          needs_attention: diskSummary?.needs_attention ?? [],
+          needs_attention: this.needsAttention(!!(p as any).admin, diskSummary?.needs_attention ?? []),
           pagination: { next, total, limit },
           coverage: this.coverageDto(built.missingHosts, built.expectedOffline, built.sessionCoverage, now),
           categories: this.categoriesDto(nowIso, built.missingHosts, built.sessionCoverage, built.reportsCollected, built.probesCollected,
@@ -453,7 +470,7 @@ export class StatusService {
           tasks: built.items,
           disk: diskSummary?.filesystems ?? [],
           host_health: diskSummary?.host_health ?? [],
-          needs_attention: diskSummary?.needs_attention ?? [],
+          needs_attention: this.needsAttention(!!(p as any).admin, diskSummary?.needs_attention ?? []),
           pagination: { next: null, total: tasks.length, limit: tasks.length },
           coverage: this.coverageDto(built.missingHosts, built.expectedOffline, built.sessionCoverage, now),
           categories: this.categoriesDto(nowIso, built.missingHosts, built.sessionCoverage, built.reportsCollected, built.probesCollected,

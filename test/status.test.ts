@@ -126,6 +126,23 @@ beforeEach(async () => {
 });
 
 describe('M14a authorized one-call status projection', () => {
+  it('includes active check alerts in operator status without leaking them to task-granted agents', async () => {
+    await inDO(stub(), (h: any) => {
+      h.livenessService.setAlert('check', 'status-delivery-slo', { state: 'fail', detail: '2 pending messages exceed the configured SLO' });
+    });
+    const operator = await ok('');
+    expect(operator.needs_attention).toContainEqual(expect.objectContaining({
+      subject: 'check:status-delivery-slo', state: 'fail', source: 'liveness_alerts',
+    }));
+    const agent = await seedAgent();
+    await grant(agent);
+    const scoped = await ok('', agent.token);
+    expect(scoped.needs_attention.some((a: any) => a.subject === 'check:status-delivery-slo')).toBe(false);
+    await inDO(stub(), (h: any) => h.livenessService.setAlert('check', 'status-delivery-slo', null));
+    const recovered = await ok('');
+    expect(recovered.needs_attention.some((a: any) => a.subject === 'check:status-delivery-slo')).toBe(false);
+  });
+
   it('projects multiple tasks and hosts with partial coverage for a missing host', async () => {
     await seedCanonicalHosts();
     const first = await createTask();
