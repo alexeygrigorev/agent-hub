@@ -17,8 +17,8 @@ Serverless coordination hub for Alexey's multi-agent project: 30-minute headless
 1. Work through Agent Branches, the project's own tool (`~/git/agent-branches`, CLI `agent-branches`). Each implementer works in its own Agent Branches workspace. No git worktrees or long-lived git branches.
 2. Claim edit scope on the agents bus before editing; release when done. Claims are never written into documents.
 3. A task is done when a different-model reviewer approved the exact version and the head integrated it.
-4. Integrate by pushing accepted work straight to GitHub `main` in small focused commits (one per logical change). No pull requests. Keep Agent Branches and GitHub main in sync after every integration (fast-forward only, never force). Verify the push before reporting.
-5. Tests for real code, not for docs. Run them before reporting.
+4. Verification before every push (Alexey 2026-10-17 22:54): run the FULL test suite on Hetzner before every push (`scripts/test-full-local.sh` covering unfiltered Vitest discovery, full Python discovery with clean disposable HOME and DTC_AUTH_HOME, workflow validations, dry-run build). Investigate and report all failures honestly; required CI checks must pass with zero new regressions, and documented pre-existing debt is tracked rather than silently excluded. Never rely on focused-only tests or speculative CI runs.
+5. Batch related commits into one finished feature. Nondeploy/docs/checkpoint commits must use `[skip ci]`. Exactly ONE deploy push for the finished feature, only after required CI test suites pass on the exact final source. Normal fast-forward integration, no force pushes, no PRs. Keep Agent Branches and GitHub main in sync after every integration.
 6. Post each milestone's accepted result on the tracking issue (see the issue labelled `tracking`).
 
 ## Gates and limits

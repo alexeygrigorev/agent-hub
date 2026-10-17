@@ -303,6 +303,13 @@ class TestRoleLifecycleAndFaults(unittest.TestCase):
         self.script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         self.script.chmod(0o700)
 
+        self.quota_gate = self.base / "quota-gate.py"
+        self.quota_gate.write_text(
+            'import json, sys; json.dump({"launch_allowed": True, "reason": "ok", "windows": {}}, sys.stdout)\n',
+            encoding="utf-8",
+        )
+        self.quota_gate.chmod(0o700)
+
         self.role_cfg = TrustedRoleConfig.build(
             enabled=True,
             profiles={
@@ -325,7 +332,10 @@ class TestRoleLifecycleAndFaults(unittest.TestCase):
             state_dir=self.state_dir,
             launcher_repo=self.base,  # Explicit synthetic repository, never ~/git on CI.
         )
-        self.runtime_mgr = RuntimeManager(role_config=self.role_cfg)
+        self.runtime_mgr = RuntimeManager(
+            role_config=self.role_cfg,
+            quota_gate_script=str(self.quota_gate),
+        )
         self.client = MagicMock(spec=JobsClient)
         self.dispatcher = JobDispatcher(
             base_url="https://hub.example.com",
