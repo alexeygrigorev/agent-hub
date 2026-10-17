@@ -38,7 +38,7 @@ def load_settings(path=None):
         raise ValueError("Invalid subscriptions list")
     seen = set()
     for sub in subs:
-        if not isinstance(sub, dict) or set(sub) - {"service", "account_label", "plan", "engine", "profile", "quota_argv", "admission_argv", "launcher_provider", "launcher_model", "launcher_effort"}:
+        if not isinstance(sub, dict) or set(sub) - {"service", "account_label", "plan", "engine", "profile", "quota_argv", "admission_argv", "launcher_provider", "launcher_model", "launcher_effort", "startup_argv"}:
             raise ValueError("Subscription accepts metadata and local command references only")
         if sub.get("service") not in SERVICES or not isinstance(sub.get("account_label"), str) or not LABEL.fullmatch(sub["account_label"]) or sub["account_label"] in seen:
             raise ValueError("Invalid or duplicate account label")
@@ -351,6 +351,11 @@ class Dispatcher:
                 argv += ["--profile", offer["profile"]]
             if target_cwd != workspace:
                 argv += ["--cwd", str(target_cwd)]
+            if sub.get("startup_argv"):
+                launch = sub["startup_argv"]
+                if not isinstance(launch, list) or not launch or any(not isinstance(a, str) or "\0" in a for a in launch):
+                    raise ValueError("Invalid trusted startup argv")
+                argv += ["--"] + launch
             cwd = None
         elif mode == "headless":
             launcher = self.settings.get("launcher", {})
