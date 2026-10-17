@@ -219,6 +219,7 @@ def receive_once(
     now_ms: Optional[int] = None,
     limit: int = 20,
     sender_workspace: Optional[str] = None,
+    cleanup_roots: Optional[list] = None,
 ) -> dict[str, Any]:
     """Run ONE bounded receiver cycle: poll -> claim -> execute -> ack.
 
@@ -230,6 +231,12 @@ def receive_once(
     ``{"offers_seen", "processed", "skipped", "results"}``; per-command
     results carry the shared function outcome plus the ack submission flag.
     No daemon, no timer, no second Fleet consumer.
+
+    ``cleanup_roots`` is the HOST-config trusted worktree allowlist (never
+    caller-supplied paths): when provided, a containment-confirmed stop
+    additionally removes the session's own worktree under the same claim
+    (canonical binding workspace + discovered branch) and reports the tree
+    outcome on the stop ack. ``None`` (default) leaves stop acks tree-free.
     """
     if not isinstance(custody, CallerCustody):
         raise SessionControlError("Caller custody is required")
@@ -330,7 +337,8 @@ def receive_once(
             outcome = handle_claimed_command(command, host_claim, custody=custody,
                                              journal_dir=journal_dir, executable=executable,
                                              request=request, now_ms=now_ms,
-                                             sender_workspace=sender_workspace)
+                                             sender_workspace=sender_workspace,
+                                             cleanup_roots=cleanup_roots)
         except SessionUncertain as exc:
             skipped.append({"command_id": command_id, "reason": "uncertain_%s" % str(exc)[:200]})
             continue
@@ -340,6 +348,7 @@ def receive_once(
         processed.append({"command_id": command_id, "op": command.get("op"),
                           "state": outcome.get("state"),
                           "ack_submitted": bool((outcome.get("ack") or {}).get("submitted", False)),
+                          "tree": ((outcome.get("ack") or {}).get("payload") or {}).get("tree"),
                           "replayed": bool(outcome.get("replayed", False))})
     # Bounded FAIR reconciliation pass: sends journaled as unknown (reply not
     # yet observed, server command still claimed under its lease) are

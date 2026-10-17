@@ -834,6 +834,7 @@ def handle_claimed_command(
     request: Optional[Callable] = None,
     now_ms: Optional[int] = None,
     sender_workspace: Optional[str] = None,
+    cleanup_roots: Optional[list] = None,
 ) -> dict[str, Any]:
     """Shared server-claimed receiver (exact function the API worker wires).
 
@@ -859,6 +860,12 @@ def handle_claimed_command(
        (``outcome`` is ``delivered`` only with correlated reply proof — else the
        honest ``recorded``/``transported``/``refused``/``uncertain`` state;
        ``acknowledged`` lives in the reply-proof field, never as a bare claim).
+
+    M15d STOP-bundled tree: when ``cleanup_roots`` (HOST-config allowlist) is
+    provided, a containment-confirmed stop additionally removes the session's
+    own worktree under the same claim (canonical binding workspace +
+    discovered branch); the tree outcome rides the stop ack as data and never
+    gates the stop verdict. ``None`` (default) leaves stop acks tree-free.
 
     ``start`` is explicitly REJECTED here: Fleet already handles start once
     (see :func:`start_from_offer`); this receiver never reconsumes Fleet offers
@@ -952,7 +959,8 @@ def handle_claimed_command(
         try:
             outcome = _run_claimed_effect(
                 executable, op, command, target, custody=custody,
-                journal_dir=journal_dir, sender_workspace=sender_workspace)
+                journal_dir=journal_dir, sender_workspace=sender_workspace,
+                cleanup_roots=cleanup_roots)
         except SessionUncertain as exc:
             raise SessionUncertain(str(exc) or "Effect uncertain; reconcile") from exc
 
@@ -1006,6 +1014,12 @@ def handle_claimed_command(
             ack_payload["capture"] = text[:65536]
         if op == "stop":
             ack_payload["confirmed_exit"] = bool(outcome.get("confirmed_exit", False))
+            # STOP-bundled owning-host tree outcome (server shape-validates,
+            # persists in ack_json, and rechecks the owner at durable ack).
+            tree = outcome.get("tree")
+            if isinstance(tree, dict) and tree.get("state") in ("removed", "kept", "uncertain"):
+                ack_payload["tree"] = {"state": tree["state"],
+                                       "reason": str(tree.get("reason", ""))[:300]}
         # The ack payload and its submission state persist atomically with the
         # outcome: a lost ack response re-submits this identical payload under
         # the same claim token instead of repeating the native effect.
@@ -1026,6 +1040,59 @@ def handle_claimed_command(
         return {"op": op, **record, "ack": ack_result}
 
 
+def _run_cleanup_tree_after_stop(
+    executable: str,
+    target: NativeTarget,
+    *,
+    custody: CallerCustody,
+    journal_dir: str,
+    cleanup_roots: Any,
+    command_id: str,
+) -> dict[str, Any]:
+    """STOP-bundled owning-host tree step (same claim, same attempt, no new fence).
+
+    The caller guarantees the stop is already containment-confirmed in this
+    process. The tree is the canonical binding workspace (server offer, never
+    a caller path); the branch is discovered; roots come from HOST config.
+    Returns the ack-vocabulary outcome ``{state: removed|kept|uncertain,
+    reason}`` — the tree never raises past this point, so a kept tree cannot
+    fail the already-confirmed stop. A lost ack response re-submits the
+    identical ack (with this tree outcome) via the existing resubmit path;
+    a crash between the stop effect and this step leaves the command for
+    operator reconciliation under existing uncertain semantics (the effect is
+    never blind-repeated under the consumed claim).
+    """
+    from .session_cleanup import remove_owned_worktree
+
+    # Live-use inventory excludes terminal native phases: the just-stopped
+    # target's own exited row still references its workspace, and must not
+    # self-block its own tree. Unknown phases fail closed (treated live).
+    try:
+        rows = list_sessions(executable, include_exited=True)
+        live_paths = [p for row in rows
+                      if getattr(row, "phase", "") not in ("exited", "dead", "forgotten", "pruned")
+                      for p in (row.workspace, row.cwd)
+                      if isinstance(p, str) and p]
+    except Exception:
+        return {"state": "uncertain", "reason": "live_inventory_unavailable: native list failed; listed-only"}
+    try:
+        result = remove_owned_worktree(
+            custody=custody, journal_dir=journal_dir, machine_id=custody.machine_id,
+            native_id=target.session_id, canonical_workspace=target.workspace,
+            cleanup_roots=cleanup_roots, claim_holder=custody.machine_id,
+            stop_confirmed=True, live_paths=live_paths, command_id=command_id)
+    except SessionControlError as exc:
+        return {"state": "uncertain", "reason": str(exc)[:300]}
+    except SessionUncertain as exc:
+        return {"state": "uncertain", "reason": str(exc)[:300]}
+    state = result.get("state")
+    if state == "tree_removed":
+        return {"state": "removed", "reason": str(result.get("reason", ""))[:300]}
+    if state == "refused":
+        return {"state": "kept", "reason": str(result.get("reason", ""))[:300]}
+    return {"state": "uncertain", "reason": str(result.get("reason", ""))[:300]}
+
+
 def _run_claimed_effect(
     executable: str,
     op: str,
@@ -1035,6 +1102,7 @@ def _run_claimed_effect(
     custody: CallerCustody,
     journal_dir: str,
     sender_workspace: Optional[str] = None,
+    cleanup_roots: Optional[list] = None,
 ) -> dict[str, Any]:
     """Run one claimed native effect; returns the outcome fields for ack mapping.
 
@@ -1043,6 +1111,11 @@ def _run_claimed_effect(
     send (separate from the target), kept in the journal as
     ``original_native_message_id``. The ack ``native`` triple is always the
     exact bound target; proof carries the envelope ids separately.
+
+    ``cleanup_roots`` (HOST-config allowlist, None disables) arms the M15d
+    STOP-bundled tree step: after a containment-confirmed stop, the session's
+    own worktree is removed via :func:`_run_cleanup_tree_after_stop` under the
+    same claim. Anything else leaves the stop ack tree-free.
     """
     if op == "send":
         body = command["body"]
@@ -1101,9 +1174,21 @@ def _run_claimed_effect(
                           % cap["truncated"]}
     stopped = stop_controlled_session(executable, target, custody=custody)
     confirmed = stopped["state"] == "stopped"
-    return {"state": stopped["state"], "ack_outcome": "delivered" if confirmed else "uncertain",
-            "native_id": None, "reply_envelope_id": None, "reason": stopped["reason"],
-            "confirmed_exit": confirmed}
+    outcome: dict[str, Any] = {
+        "state": stopped["state"], "ack_outcome": "delivered" if confirmed else "uncertain",
+        "native_id": None, "reply_envelope_id": None, "reason": stopped["reason"],
+        "confirmed_exit": confirmed}
+    # M15d owning-host tree (STOP-bundled, same claim, no second controller):
+    # after a containment-confirmed stop, remove the session's own dedicated
+    # worktree derived ONLY from the canonical binding workspace + HOST-config
+    # roots + live native identity + discovered registered branch. The tree
+    # never gates the stop verdict: kept/uncertain trees ride the stop ack as
+    # data while the stop itself still reports its confirmed outcome.
+    if confirmed and cleanup_roots is not None:
+        outcome["tree"] = _run_cleanup_tree_after_stop(
+            executable, target, custody=custody, journal_dir=journal_dir,
+            cleanup_roots=cleanup_roots, command_id=str(command["command_id"]))
+    return outcome
 
 
 def handle_session_command(

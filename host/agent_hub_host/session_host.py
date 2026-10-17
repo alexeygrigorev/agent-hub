@@ -54,7 +54,12 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                     session_control.execute(SimpleNamespace(
                         sessions_cmd='host-receive', once=True, machine_id=cfg['machine_id'],
                         actor=None, credential_family=None, journal_dir=str(journal),
-                        aplexer_bin=native, limit=20, sender_workspace=binding.workspace))
+                        aplexer_bin=native, limit=20, sender_workspace=binding.workspace,
+                        # M15d narrow plumbing: HOST-config trusted cleanup roots
+                        # arm the STOP-bundled owning-host tree step (never CLI
+                        # paths). Invalid shapes fail that tree to uncertain;
+                        # stops are unaffected.
+                        cleanup_roots=settings.get('cleanup_roots', []), settings=None))
                 except Exception as error:
                     print(json.dumps({'event': 'commands_error', 'type': type(error).__name__}), flush=True)
                 try:

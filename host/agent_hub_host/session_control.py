@@ -234,6 +234,7 @@ def add_commands(sub):
     receive.add_argument('--aplexer-bin', default='aplexer', help='Native executable (default aplexer)')
     receive.add_argument('--limit', type=int, default=20, help='Max offers per cycle (1..20)')
     receive.add_argument('--sender-workspace', default=None, help='Pinned authorized native sender workspace for replyable sends (default: receiver own whoami workspace)')
+    receive.add_argument('--settings', default=None, help='Host settings file (subscriptions.json) supplying the trusted cleanup_roots allowlist for the STOP-bundled tree step (default: tree step disabled)')
     cleanup = commands.add_parser('cleanup', help='Plan finished/superseded cleanup (dry-run default; --apply enqueues real M12 stop intents)')
     cleanup.add_argument('--apply', action='store_true', help='Act: enqueue owned stops via M12 custody (server-authenticated owner only; host executes via claim/ack)')
     cleanup.add_argument('--key', default=None, help='Stable idempotency key for --apply (same key replays, never duplicates)')
@@ -442,8 +443,22 @@ def execute(args):
         from .session_receiver import receive_once
         custody = CallerCustody(actor=actor, machine_id=machine_id,
                                 credential_family=family).validated()
+        # M15d STOP-bundled tree roots come from HOST config, never CLI paths:
+        # the supervised session_host passes its loaded settings allowlist
+        # programmatically; manual runs opt in via --settings (a host settings
+        # file validated by fleet.load_settings). Absent either, stops are
+        # still executed and acked tree-free (fail closed, honestly observed).
+        cleanup_roots = getattr(args, 'cleanup_roots', None)
+        settings_path = getattr(args, 'settings', None)
+        if cleanup_roots is None and settings_path:
+            from .fleet import load_settings
+            try:
+                cleanup_roots = load_settings(settings_path).get('cleanup_roots', [])
+            except (ValueError, OSError) as exc:
+                raise ValueError('host-receive --settings unreadable: %s' % type(exc).__name__) from None
         return receive_once(custody=custody, journal_dir=journal_dir,
                             executable=getattr(args, 'aplexer_bin', 'aplexer') or 'aplexer',
                             request=request, limit=limit,
-                            sender_workspace=getattr(args, 'sender_workspace', None))
+                            sender_workspace=getattr(args, 'sender_workspace', None),
+                            cleanup_roots=cleanup_roots)
     raise ValueError('Unknown sessions command')
