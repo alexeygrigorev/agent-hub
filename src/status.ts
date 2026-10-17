@@ -695,6 +695,12 @@ export class StatusService {
               provenance: { source: 'host_' + probe.kind, observed_at: probe.observed_at,
                 freshness: freshnessOf(probe.observed_at, now, 86400000), coverage: 'partial',
                 reason: 'exact_sha_match_visible_session_probe_only' } };
+            if (probe.kind === 'probe_ci' && typeof payload.state === 'string') {
+              (c as Obj).ci_state = payload.state;
+            }
+            if (probe.kind === 'probe_deploy' && typeof payload.state === 'string') {
+              (c as Obj).deploy_state = payload.state;
+            }
           }
         }
       }

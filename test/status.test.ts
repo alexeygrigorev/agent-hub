@@ -463,9 +463,12 @@ describe('M14b slice2 machine-authenticated host observations', () => {
     expect(matched.git_ancestry).toMatchObject({ sha, ancestry: 'merged_in_main' });
     expect(matched.ci.state).toBe('passing');
     expect(matched.deploy.state).toBe('not_deployed');
+    expect(matched.ci_state).toBe('passing');
+    expect(matched.deploy_state).toBe('not_deployed');
     // A commit without probe evidence stays honestly unknown: no borrowing.
     const other = row.commits.find((c: any) => c.reference === 'b'.repeat(40));
     expect(other.deploy_state).toBe('unknown');
+    expect(other.ci_state).toBe('unknown');
     expect(other.git_ancestry).toBeUndefined();
     expect(data.categories.commits_deploys_ci.state).toBe('collected_probe_evidence');
   });

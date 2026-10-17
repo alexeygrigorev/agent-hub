@@ -130,7 +130,28 @@ def render_human(data):
         if reports:
             lines.append('  reports: %s (headline unknown, M14b)' % len(reports))
         if commits:
-            lines.append('  commits: %s (deploy/CI unknown, M14c)' % len(commits))
+            for c in commits:
+                ref = escape_display(c.get('reference', ''))
+                bounded_ref = ref[:12] if len(ref) >= 12 else ref
+                git_st = 'unknown'
+                if isinstance(c.get('git_ancestry'), dict):
+                    git_st = escape_display(c['git_ancestry'].get('ancestry') or 'unknown')
+                elif c.get('git_state'):
+                    git_st = escape_display(c['git_state'])
+
+                ci_st = 'unknown'
+                if c.get('ci_state') and c['ci_state'] != 'unknown':
+                    ci_st = escape_display(c['ci_state'])
+                elif isinstance(c.get('ci'), dict):
+                    ci_st = escape_display(c['ci'].get('state') or 'unknown')
+
+                deploy_st = 'unknown'
+                if c.get('deploy_state') and c['deploy_state'] != 'unknown':
+                    deploy_st = escape_display(c['deploy_state'])
+                elif isinstance(c.get('deploy'), dict):
+                    deploy_st = escape_display(c['deploy'].get('state') or 'unknown')
+
+                lines.append('  commit %s git=%s ci=%s deploy=%s' % (bounded_ref, git_st, ci_st, deploy_st))
     disk_fs = data.get('disk') or []
     if disk_fs:
         lines.append('disk:')

@@ -181,6 +181,31 @@ class TestStatusCli(unittest.TestCase):
         self.assertIn('host-hetzner: load=0.75, 1.10, 1.25', rendered)
         self.assertIn('mem=8.0GB/16.0GB (50.0%, 8.0GB avail) [fresh]', rendered)
 
+    def test_render_human_commits_probe_evidence_and_unknown(self):
+        dto = dict(FIXTURE_DTO)
+        dto['tasks'] = [{
+            'id': 'task-commit-test',
+            'status': 'in_progress',
+            'title': 'Commit test',
+            'updated_at': '2026-10-17T00:00:00.000Z',
+            'commits': [
+                {
+                    'reference': '4dfd635a51df10be7fe2a133477333a02f983cba',
+                    'git_ancestry': {'ancestry': 'on_main'},
+                    'ci_state': 'failing',
+                    'deploy_state': 'not_deployed',
+                },
+                {
+                    'reference': 'abc123def456',
+                    'ci_state': 'unknown',
+                    'deploy_state': 'unknown',
+                },
+            ],
+        }]
+        rendered = status.render_human(dto)
+        self.assertIn('commit 4dfd635a51df git=on_main ci=failing deploy=not_deployed', rendered)
+        self.assertIn('commit abc123def456 git=unknown ci=unknown deploy=unknown', rendered)
+
 
 if __name__ == '__main__':
     unittest.main()
