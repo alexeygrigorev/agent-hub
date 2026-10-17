@@ -77,6 +77,21 @@ class TestIntakeCli(unittest.TestCase):
                 self.assertEqual(self.run_cli(*args)[0], 2)
                 transport.assert_not_called()
 
+    def test_assign_builds_canonical_session_payload(self):
+        with patch.object(intake, 'request', return_value={}) as transport:
+            code, _, error = self.run_cli('intake', 'assign', 'task-1', '--version', '2', '--key', 'assign',
+                                          '--workspace', 'demo', '--engine', 'codex', '--tier', 'daily',
+                                          '--next-step', 'Watch binding')
+        self.assertEqual(code, 0, error)
+        self.assertEqual(transport.call_args.args[0], 'POST')
+        self.assertEqual(transport.call_args.args[1], '/api/intake/tasks/task-1/assign')
+        payload = transport.call_args.args[2]
+        self.assertEqual(payload['key'], 'assign')
+        self.assertEqual(payload['expected_version'], 2)
+        self.assertEqual(payload['session'], {'workspace': 'demo', 'engine': 'codex', 'tier': 'daily', 'mode': 'headless'})
+        self.assertEqual(payload['provenance'], {'type': 'unknown', 'reference': None, 'timestamp': None})
+        self.assertEqual(payload['next_step'], 'Watch binding')
+
     def test_uncertainty_can_be_explicitly_cleared_with_cas(self):
         with patch.object(intake, 'request', return_value={}) as transport:
             code, _, error = self.run_cli('intake', 'update', 'task-1', '--version', '3', '--key', 'clear', '--clear', 'uncertainty')

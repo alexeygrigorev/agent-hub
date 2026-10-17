@@ -98,6 +98,24 @@ def add_commands(sub):
     event.add_argument('--version', type=int, required=True)
     event.add_argument('--key', required=True)
     event.add_argument('--event-file', required=True, help='Bounded UTF-8 JSON event file, or - for stdin')
+    assign = commands.add_parser('assign', help='Assign work: create the canonical Hub session for a task and record its real id automatically')
+    assign.add_argument('id')
+    assign.add_argument('--version', type=int, required=True)
+    assign.add_argument('--key', required=True)
+    assign.add_argument('--workspace', required=True, help='Configured workspace label on the selected host')
+    assign.add_argument('--engine', help='Requested engine label (existing model tiers still decide placement)')
+    assign.add_argument('--tier', choices=['quick', 'daily', 'deep'], help='Existing model tier; unknown tiers are refused, never upgraded')
+    assign.add_argument('--machine', help='Requested machine label')
+    assign.add_argument('--cwd', help='Workspace-relative confined working directory')
+    assign_mode = assign.add_mutually_exclusive_group()
+    assign_mode.add_argument('--brief-file', help='UTF-8 goal file for headless work (max 8 KiB), or - for stdin')
+    assign_mode.add_argument('--interactive', action='store_true', help='Start at an empty native prompt')
+    assign.add_argument('--source-type', choices=['chat', 'voice', 'forwarded', 'unknown'], default='unknown')
+    assign.add_argument('--source-reference')
+    assign.add_argument('--source-time')
+    assign.add_argument('--next-step', help='Handoff next step recorded with the assignment')
+    assign.add_argument('--current-state', help='Task state description recorded with the assignment')
+    assign.add_argument('--owner', help='Ownership description recorded with the assignment')
     for name in ('rules', 'grants'):
         command = commands.add_parser(name, help='Operator only: list or submit explicit JSON mutation')
         command.add_argument('--payload-file')
@@ -199,6 +217,27 @@ def execute(args):
     payload = {'key': args.key, 'expected_version': args.version}
     if command == 'continue':
         return request('POST', path + '/continue', payload)
+    if command == 'assign':
+        session = {'workspace': args.workspace}
+        for field in ('engine', 'tier', 'machine', 'cwd'):
+            if getattr(args, field, None):
+                session[field] = getattr(args, field)
+        session['mode'] = 'interactive' if args.interactive else 'headless'
+        if args.brief_file:
+            if session['mode'] == 'interactive':
+                raise ValueError('Interactive sessions start at an empty native prompt')
+            with (sys.stdin.buffer if args.brief_file == '-' else Path(args.brief_file).open('rb')) as stream:
+                raw = stream.read(8192 + 1)
+            if len(raw) > 8192:
+                raise ValueError('Brief exceeds capacity')
+            session['brief'] = raw.decode('utf-8')
+        payload['session'] = session
+        payload['provenance'] = {'type': args.source_type, 'reference': args.source_reference,
+                                 'timestamp': args.source_time}
+        for field in ('next_step', 'current_state', 'owner'):
+            if getattr(args, field, None) is not None:
+                payload[field] = getattr(args, field)
+        return request('POST', path + '/assign', payload)
     if command == 'append':
         payload['event'] = json_file(args.event_file)
         return request('POST', path + '/events', payload)

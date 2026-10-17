@@ -20,7 +20,7 @@ async function ok(path: string, payload?: any, bearer?: string): Promise<any> {
   expect(res.status, JSON.stringify(data)).toBe(200); return data;
 }
 const create = (project = 'demo', key = 'create-' + ++seq) => ok('/tasks', { key, project, title: 'Synthetic task', text: '  ORIGINAL synthetic request\n世界\n', source });
-async function seedAgent(actor = 'demo:assistant', family = 'family-' + ++seq): Promise<any> {
+async function seedAgent(actor = 'demo:assistant', family = 'family-' + ++seq, scopes = '["bus:read","bus:send"]'): Promise<any> {
   const id = 'credential-' + ++seq, token = 'hubt_fixture_' + seq, refresh = 'hubr_fixture_' + seq;
   const hash = await sha256(token), rh = await sha256(refresh);
   await inDO(stub(), (h: any) => {
@@ -28,7 +28,7 @@ async function seedAgent(actor = 'demo:assistant', family = 'family-' + ++seq): 
     h.sql.exec("INSERT OR IGNORE INTO machines(id,name,hostname,registered_at) VALUES ('fixture-host','fixture','fixture','2026-01-01T00:00:00.000Z')");
     h.sql.exec('INSERT OR IGNORE INTO agents(tag,project,machine_id,registered_at) VALUES (?,?,?,?)', tag, project, 'fixture-host', '2026-01-01T00:00:00.000Z');
     h.sql.exec('INSERT INTO credentials(id,kind,token_hash,refresh_hash,family_id,subject,machine_id,actor,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-      id, 'agent', hash, rh, family, actor, 'fixture-host', actor, '["bus:read","bus:send"]', 'fixture-operator', '2026-01-02T00:00:00.000Z', new Date(Date.now() + 86400000).toISOString());
+      id, 'agent', hash, rh, family, actor, 'fixture-host', actor, scopes, 'fixture-operator', '2026-01-02T00:00:00.000Z', new Date(Date.now() + 86400000).toISOString());
   });
   return { id, token, refresh, family, actor };
 }
@@ -240,6 +240,66 @@ describe('private durable intake HTTP/SQLite', () => {
     expect((await call('/tasks/' + task.id + '/events', { key: 'forged-verification', expected_version: 2, event: { ...event, evidence: 'hub_launch_verified' } })).status).toBe(400);
   });
 
+  it('assigns a real Hub session through the canonical session API and projects it live in handoff', async () => {
+    const { task } = await create();
+    const payload = { key: 'assign-live', expected_version: 1,
+      session: { workspace: 'demo', engine: 'codex', mode: 'headless', brief: 'Synthetic assigned goal' },
+      provenance: source, next_step: 'Watch Hub binding' };
+    const assigned = await ok('/tasks/' + task.id + '/assign', payload);
+    const sessionId = assigned.assigned_session.hub_session_id;
+    expect(sessionId).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(assigned.assigned_session.linkage).toBe('hub_session');
+    expect(assigned.task.control.version).toBe(2);
+    expect(assigned.task.payload_data.next_step).toBe('Watch Hub binding');
+    const link = assigned.task.payload_data.history.find((e: any) => e.kind === 'link');
+    expect(link).toMatchObject({ hub_session_id: sessionId, evidence: 'external_unverified_not_launch_proof' });
+    // The same operator controls the real session through hub sessions.
+    const sessions = async () => ((await (await SELF.fetch('https://hub.test/api/sessions?limit=50',
+      { headers: { Cookie: cookie, 'x-csrf-token': 'csrf' } })).json()) as any).sessions.map((s: any) => s.id);
+    expect(await sessions()).toContain(sessionId);
+    // Handoff projects the live canonical state, never caller assertions.
+    const entry = (await ok('/handoff')).items.find((t: any) => t.id === task.id);
+    expect(entry.assigned_sessions[0]).toMatchObject({ hub_session_id: sessionId, linkage: 'hub_session' });
+    expect(typeof entry.assigned_sessions[0].state).toBe('string');
+    // A lost-response retry replays the identical response without launching again.
+    expect(await ok('/tasks/' + task.id + '/assign', payload)).toEqual(assigned);
+    expect(await sessions()).toContain(sessionId);
+    // A changed payload under the same key conflicts without mutation.
+    expect((await call('/tasks/' + task.id + '/assign', { ...payload, next_step: 'Different' })).status).toBe(409);
+    // A second assignment is refused while the first session is still live.
+    expect((await call('/tasks/' + task.id + '/assign', { ...payload, key: 'assign-second',
+      expected_version: 2, session: { workspace: 'demo' } })).status).toBe(409);
+    // A forged session identity fails closed without an oracle.
+    expect((await call('/tasks/' + task.id + '/events', { key: 'forged-link', expected_version: 2,
+      event: { kind: 'link', hub_session_id: '12345678-1234-4234-8234-123456789012', provenance: source } })).status).toBe(404);
+  });
+  it('agents assign only through their own canonical session; foreign sessions fail closed', async () => {
+    const agent = await seedAgent('demo:assistant', 'family-' + ++seq, '["bus:read","bus:send","fleet:launch"]');
+    await grant(agent, 'project', 'demo', 'write');
+    const { task } = await create();
+    const payload = { key: 'agent-assign', expected_version: 1,
+      session: { workspace: 'demo', brief: 'Synthetic agent goal' }, provenance: source };
+    const assigned = await ok('/tasks/' + task.id + '/assign', payload, agent.token);
+    const sessionId = assigned.assigned_session.hub_session_id;
+    expect(sessionId).toMatch(/^[0-9a-f-]{36}$/i);
+    // The same agent credential controls its session through hub sessions.
+    const listed = await SELF.fetch('https://hub.test/api/sessions?limit=50',
+      { headers: { Authorization: 'Bearer ' + agent.token } });
+    expect(listed.status).toBe(200);
+    expect((((await listed.json()) as any).sessions as any[]).map(s => s.id)).toContain(sessionId);
+    // An operator-owned session cannot be linked by this agent: no oracle.
+    const foreign = (await ok('/tasks', { key: 'foreign-task', project: 'demo', title: 'Synthetic', text: 'x', source })).task;
+    const foreignSession = (await ok('/tasks/' + foreign.id + '/assign', { key: 'foreign-assign',
+      expected_version: 1, session: { workspace: 'demo', brief: 'Synthetic foreign goal' }, provenance: source })).assigned_session.hub_session_id;
+    expect((await call('/tasks/' + task.id + '/events', { key: 'foreign-link', expected_version: 2,
+      event: { kind: 'link', hub_session_id: foreignSession, provenance: source } }, agent.token)).status).toBe(404);
+    // Without fleet:launch the canonical service refuses, so assignment fails.
+    const plain = await seedAgent('demo:assistant');
+    await grant(plain, 'project', 'demo', 'write');
+    const unscoped = (await ok('/tasks', { key: 'unscoped-task', project: 'demo', title: 'Synthetic', text: 'x', source })).task;
+    expect((await call('/tasks/' + unscoped.id + '/assign', { key: 'no-launch', expected_version: 1,
+      session: { workspace: 'demo' }, provenance: source }, plain.token)).status).toBe(403);
+  });
   it('captures verbatim provenance, filters and appends originals without rewriting', async () => {
     const first = await create(); const id = first.task.id;
     expect(first.task.payload_data.history[0]).toMatchObject({ text: '  ORIGINAL synthetic request\n世界\n', source, authority: 'untrusted_task_data' });

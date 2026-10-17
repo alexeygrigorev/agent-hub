@@ -65,6 +65,7 @@ hub intake links TASK_ID
 hub intake context TASK_ID
 hub intake update TASK_ID --version 1 --status blocked --next-step 'Obtain review' --key context-001
 hub intake append TASK_ID --version 2 --event-file event.json --key event-001
+hub intake assign TASK_ID --version 3 --key assign-001 --workspace example-ws --engine codex --tier daily --next-step 'Watch Hub binding' --brief-file goal.txt
 hub handoff
 hub handoff --project example --page-size 10
 ```
@@ -91,6 +92,52 @@ This transition records intent to continue; it does not launch or verify a
 session. Use `hub intake update ... --clear uncertainty` to explicitly clear a context field to unknown through CAS. `open`, `in_progress`, `blocked`, `pending_approval`, `done` and
 `cancelled` are ledger statuses. They are not routing, review or deploy states.
 
+## Assignment through the canonical Hub session
+
+`hub intake assign TASK_ID --version N --key assign-001 --workspace WS
+[--engine E] [--tier quick|daily|deep] [--machine M] [--cwd DIR]
+[--brief-file goal.txt | --interactive] [--next-step ...] [--current-state ...]
+[--owner ...]` (plus the usual `--source-type/--source-reference/--source-time`
+provenance, default `unknown`) creates the task's Hub session through the
+canonical session-control service with the caller's own credentials and records
+its real session id on the task automatically. There is no second dispatcher:
+placement stays with the existing Fleet reserve, the existing model tiers still
+decide engine/profile routing (unknown tiers are refused, never silently
+upgraded), and no session identity is invented client-side.
+
+The caller needs intake write access on the task AND session-control writer
+authority (operator, or an agent credential holding both an intake write grant
+and `fleet:launch`). The assigned session is owned by the same actor, so it
+stays controllable through the existing `hub sessions list/show/send/capture/stop`
+by the same credential; other actors see its id with a `not_visible` marker.
+
+The assignment appends a `link` event carrying `hub_session_id` (server-verified
+against the canonical session row: missing or foreign sessions fail closed) and
+optionally records `next_step`/`current_state`/`owner` handoff context in the
+same CAS-guarded, idempotent mutation. A task whose assigned session is still
+live (`queued`, `held`, `offered`, `starting`, `running`, `uncertain`) refuses a
+second assignment (`active_assignment_exists`); once the session leaves the
+active set the task accepts a fresh assignment. A lost response is retried with
+the same key and payload: the Hub session key is derived deterministically, so
+the retry replays the same session and the same link response instead of
+launching twice. Creating the session is not executing the task: link evidence
+remains `external_unverified_not_launch_proof` until the native binding
+lifecycle observes the session.
+
+Task views (`show`, `history`, `links`, `context`, `handoff`) carry an
+`assigned_sessions` projection with each linked session's live `state`,
+`machine`, `engine`, `mode`, `fleet_launch_id`, `binding` (native id, tag,
+workspace, generation) and `updated_at`, read from the canonical rows at the
+task's snapshot revision. To link a session that was started separately through
+`hub sessions start`, append a manual `link` event with `hub_session_id` (same
+ownership check, no operator requirement). Direct Fleet `routing_job_id` links
+keep working unchanged.
+
+`hub status` (M14a, `src/status.ts`) does not yet join session-control rows; it
+shows the assignment's denormalized engine/machine claim as
+`claimed_link_unverified`. Joining canonical session lifecycle into status is a
+head follow-up outside this increment's scope.
+
 ## HTTP contract
 
 All routes use `/api/intake` as a prefix, separate from existing execution jobs.
@@ -107,6 +154,7 @@ strings. Unknown mutation fields are rejected. `source` has
 | `/tasks/ID` POST | `key`, `expected_version`, and status/title/current_state/next_step/owner/uncertainty updates |
 | `/tasks/ID/events` POST | Append `event` using `key` and `expected_version` |
 | `/tasks/ID/continue` POST | CAS ready-to-active context transition using `key`, `expected_version` |
+| `/tasks/ID/assign` POST | Create the canonical Hub session (`key`, `expected_version`, `session`, `provenance`, optional handoff context) and record its real id automatically |
 | `/handoff` GET | All authorized open work, unresolved obligations and applicable operator rules, paginated |
 | `/rules` GET/POST | Operator-only complete bounded rules / versioned rule append |
 | `/grants` GET/POST | Operator-only bounded grant listing / explicit grant creation |
@@ -119,7 +167,7 @@ and capture time; immutable `intake_key` records each mutation's retry key. Supp
 | --- | --- |
 | `intake` | `text`, `source`, optional `transcription` (`provided`, `pending`, `unavailable`, `not_applicable`) |
 | `note`, `decision`, `followup`, `blocker`, `pending_approval` | `text`, `source` |
-| `link` | Nullable `native_id`, `engine`, `tier`, `host`, `hub`, `routing_job_id`; required `provenance` source |
+| `link` | Nullable `native_id`, `engine`, `tier`, `host`, `hub`, `routing_job_id`, `hub_session_id` (server-verified canonical session, same-actor/operator only); required `provenance` source |
 | `report`, `commit` | `reference`, `source` |
 | `rule_reference` | `rule_id`, `version`, `source` |
 | `resolution` | Unresolved followup/blocker event `ref`, `text`, `source` |
@@ -128,9 +176,12 @@ and capture time; immutable `intake_key` records each mutation's retry key. Supp
 Session links are always `external_unverified_not_launch_proof`; report/commit
 references are `external_unverified`. Callers cannot assert verified provenance.
 Canonical `routing_job_id` links require operator authority and an existing job;
-agent writes refuse before looking up existence. This increment cannot verify
-agent visibility through routing's separate ownership contract. A canonical
-reference still does not prove actual start. Later assignment/backfill phases
+agent writes refuse before looking up existence. `hub_session_id` links require
+the real canonical session row and the session's owning actor (or the operator);
+missing or foreign sessions fail closed, and the live `assigned_sessions`
+projection (state, machine, engine, binding) is read from those rows, never
+asserted by the caller. A canonical
+reference still does not prove actual start. Later backfill phases
 must add verified launch/inventory evidence through their own current authorities.
 
 Rule mutations use `key`, stable `id`, `expected_version` (zero initially),

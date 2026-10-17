@@ -95,7 +95,21 @@ export class Hub extends DurableObject {
     this.initDb();
 
     const txSync = (this.ctx.storage as any).transactionSync ? (fn: any) => (this.ctx.storage as any).transactionSync(fn) : undefined;
-    this.intakeService = new IntakeService(this.sql, fn => this.ctx.storage.transactionSync(fn));
+    // M12b intake assignment (narrow seam, owned by platform-intake-live):
+    // task assignment creates its Hub session through the canonical
+    // SessionControlService.handle with the caller's own auth, so placement
+    // stays with FleetService and no session identity is invented in intake.
+    // The closure resolves sessionControlService at call time (it is
+    // constructed just below); intake records only the returned real id.
+    this.intakeService = new IntakeService(this.sql, fn => this.ctx.storage.transactionSync(fn), {
+      startSession: async (input, auth) => {
+        const res = await this.sessionControlService.handle(
+          new Request('https://hub.internal/api/sessions', { method: 'POST', body: JSON.stringify(input) }), auth);
+        let body: any = null;
+        try { body = await res.json(); } catch { body = null; }
+        return { status: res.status, body };
+      },
+    });
     this.intakeService.init();
     this.statusService = new StatusService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.intakeService);
     this.busService = new BusService(this.sql, txSync);
