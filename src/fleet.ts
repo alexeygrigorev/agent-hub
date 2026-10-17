@@ -483,6 +483,11 @@ export class FleetService {
         if (data.state === 'running' && (typeof data.native_id !== 'string' || data.native_id.length < 1 || data.native_id.length > 160 || (row.mode === 'headless' && !label(data.launcher_task_id)))) return response({ error: 'native_receipt_required' }, 409);
         if ((data.native_id !== undefined && (typeof data.native_id !== 'string' || data.native_id.length > 160)) || (data.launcher_task_id !== undefined && !label(data.launcher_task_id))) return response({ error: 'invalid_receipt' }, 400);
         this.sql.exec('UPDATE fleet_launches SET state = ?, native_id = COALESCE(?, native_id), launcher_task_id = COALESCE(?, launcher_task_id), updated_at = ? WHERE id = ?', data.state, data.native_id || null, data.launcher_task_id || null, new Date(this.now()).toISOString(), row.id);
+        // An attempted start with uncertain effects is no longer an offer.
+        // Keep its reservation and missing binding, but expose the real state.
+        if (data.state === 'uncertain' && this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
+          this.sql.exec("UPDATE session_control_sessions SET state = 'uncertain', updated_at = ? WHERE fleet_launch_id = ? AND machine_id = ? AND state IN ('queued', 'held', 'offered', 'starting', 'running')", new Date(this.now()).toISOString(), row.id, caller.machineId!);
+        }
         // A confirmed terminal host result must also close its canonical Hub
         // session. Otherwise intake keeps an active assignment forever after
         // a failed start, preventing recovery despite released Fleet capacity.

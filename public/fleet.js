@@ -204,7 +204,7 @@ function renderHostHealth(health) {
     root.append(p);
     return;
   }
-  const hosts = Array.isArray(health.hosts) ? health.hosts : [];
+  const hosts = Array.isArray(health.machines) ? health.machines : [];
   if (!hosts.length) {
     const p = document.createElement('p');
     p.textContent = 'No host health reports collected yet. Enable host health monitoring on reporting hosts.';
@@ -224,7 +224,7 @@ function renderHostHealth(health) {
       healthBadge(mem.status),
       memUsage,
       memBytes,
-      ago(h.age_s)
+      ago(Number.isFinite(Date.parse(h.observed_at)) ? Math.max(0, Math.round(age(h.observed_at) / 1000)) : null)
     ]);
   }
   root.append(richTable(['Machine', 'Freshness', 'Load (1m, 5m, 15m)', 'Memory Status', 'Memory Usage', 'Used / Total (Avail)', 'Observed'], rows));

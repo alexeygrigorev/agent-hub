@@ -141,7 +141,8 @@ describe('generic accounts and launch placement', () => {
     expect((await s.handle(request(path, { state: 'failed' }), host('hetzner'))).status).toBe(409);
     expect(state('matching')).toBe('offered');
     expect((await s.handle(request(path, { state: 'uncertain' }), host('hetzner'))).status).toBe(200);
-    expect(state('matching')).toBe('offered');
+    expect(state('matching')).toBe('uncertain');
+    expect(state('foreign-host')).toBe('offered'); expect(state('other-launch')).toBe('offered');
     expect((await s.handle(request(path, { state: 'failed', confirmed_exit: true }), host('hetzner'))).status).toBe(200);
     expect(state('matching')).toBe('failed'); expect(state('foreign-host')).toBe('offered'); expect(state('other-launch')).toBe('offered');
   }));
