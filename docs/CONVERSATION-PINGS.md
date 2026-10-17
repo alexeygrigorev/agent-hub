@@ -83,8 +83,9 @@ re-reads each due row immediately before acquiring a reservation. A token and
 30-second evaluation lease fence stale evaluators; a conditional token check
 precedes dispatch and completion. While a slot is active, config replacement,
 interval changes and restart reuse its original check, result, grant version,
-rendered payload and idempotency key. Conversation keys include the persisted
-slot activation time so changing interval lengths cannot reuse an earlier key.
+rendered payload and idempotency key. New conversation keys include a random persisted generation, independent of
+wall-clock time, so interval changes and backward clocks cannot reuse an earlier
+key. Existing R2 slot keys and frozen payloads are preserved on initialization.
 A forced rerun of a finished slot returns
 its stored result until the slot's original next boundary. Ordinary configuration
 replacement preserves `next_due_at`.
@@ -96,87 +97,122 @@ transaction. Response loss, detail drift, config drift and even pruning of the
 message cannot recreate the effect: the same intent returns the original
 message ID. A mismatching intent fails. A committed receipt may be recovered
 after grant revocation because that performs no new write. Any new effect still
-requires current authority. Disabling/removing a check stops automatic retries;
-reenabling the same name retains unresolved intent rather than silently
-substituting a new configuration.
+requires current authority. Disabling/removing a check stops automatic retries.
+Until retention explicitly reconciles or cancels it, reenabling the same name
+retains its unresolved intent rather than substituting new configuration.
 
 A `conversation_message` action confirms Hub storage only. Native delivery,
 recipient reading, task acceptance and completion remain separate facts.
 Bridge delivery is unconfirmed until the existing host bridge records its own
 receipt. No successful Hub write is described as native delivery.
 
-Persistence is bounded: 1,000 grant rows, 1,000 latest-slot rows, 4,096 immutable
-conversation receipts, and the existing 1,000 run-history bound. Grants reuse
-one row per CID/check; slots reuse one row per check name. Receipts are not
-automatically deleted: at capacity new effects hold with an error. Operations
-must arrange independently reviewed receipt lifecycle/retirement before that
-capacity is exhausted; silently expiring receipt keys would permit duplicates.
-Original conversation storage limits are enforced before sequence allocation,
-and no follow-up evicts retained unread history to make room.
+Persistence keeps the original caps: 1,000 grant rows, 1,000 latest-slot rows,
+4,096 receipts, and 1,000 run-history rows. Templates and rendered bodies retain their existing character limits. New
+frozen definitions are capped at 128 KiB, results at 64 KiB, and intents at
+64 KiB of serialized UTF-8. Oversize rendering is rejected before persistence;
+new slots freeze the definition without duplicate SQL JSON/status fields.
+Existing R2 frozen rows are preserved until reconciled or retired. These payload
+caps complement the row caps; invalid large legacy configuration reports an
+error for that check while other due checks continue. Original conversation storage limits still apply
+before sequence allocation; follow-ups never evict retained unread history.
+
+## Operational retirement
+
+The latest slot is also durable write authority. A receipt may return its original
+message ID without authorizing another write. Without a receipt, the Hub requires
+an exact current non-done slot: check name, opaque effect key and serialized
+frozen intent must all match. A done, deleted or superseded slot cannot authorize
+a new effect. Missing receipts alone never permit a write. Old requests fail with
+`automation_slot_retired` after retirement, including after message pruning,
+restart, recipient/CID/grant replacement or a backward clock. This requires no
+forever-growing tombstone table and does not promote old credentials or aliases.
+
+The existing retention hook handles slots, receipts and grants as three fair
+categories alongside archived conversations, removed members and messages. The
+composed Hub shares the same outer transaction and deletion allowance with bus
+messages and claims. `automationRowsDeleted` is included in `rowsDeleted` (and
+`conversationRowsDeleted` at the Hub boundary); updates do not masquerade as
+deletions. Every category fetch is limited by its allowance. Primary/expression
+indexes serve effect-key and grant references; anti-join scans are additionally
+bounded by the unchanged 4,096/1,000 table caps. No new timer, job loop or manual
+SQL purge is required.
+
+- A non-done slot pins its receipt, even after grant revocation, expiry or parent
+  removal. Valid unresolved intent and its first payload survive cleanup and
+  restart. Retry recovers the atomic Hub receipt before reevaluation.
+- Cleanup reconciles invalid-grant slots and slots whose checks were removed.
+  An exact receipt records the original accepted Hub effect; absence of a receipt
+  closes write authority with an explicit error and no accepted effect. A receipt
+  that disagrees with its frozen intent remains held for integrity reconciliation.
+  Slot closure fences paused evaluators and delayed sends in the same transaction.
+- Once a slot is done, its receipt may retire immediately: even before a newer
+  slot exists, the old key no longer authorizes a write. Current done slots retain
+  their original next boundary, preserving interval and backward-clock fences.
+- Removed-check slots retire after reconciliation. Cleanup revokes their bound
+  grant before deleting the slot; later name reuse needs fresh owner authority.
+  A newly issued replacement grant has a distinct ID and is unaffected by an
+  old slot's revocation. Config replacement preserves live progress and retries.
+- Expired, revoked, archived-parent and parentless grants retire once unresolved
+  slots no longer reference them. Unused grants expire within their original
+  session/24-hour bound. Standalone ConversationsService initializes the same
+  slot schema and supports retirement without a scheduler configuration table.
+
+A full table still makes the affected operation HOLD with an error until the
+existing retention hook reclaims eligible rows. Unresolved valid intents are
+preserved; they can retry through the existing run route, or be fenced and
+reconciled by retention after explicit check removal, grant revocation/replacement,
+expiry or parent archive. An accepted atomic receipt is recovered before audit
+state is freed. Unknown effects are never labelled healthy or delivered. Retiring
+an automation receipt does not acknowledge, delete or alter its conversation
+message; ordinary retention controls message lifetime.
 
 ## Validation and remaining gates
 
-Validation is local against the real Worker and SQLite, with fixture humans and
-public device-flow agent issuance. It does not use live credentials, native
-inboxes, host journals or provider dispatch. Actual source checkpoint
-`c468635d9994fd1246e12b321d5206560164f92c` is retained; normal merge
-`d4affc7ad0da9c2989f81a780c657a05bd43405e` incorporates accepted backend
-`16d66d69708268ab84089447534f0439e0bfd893`. All 13 incoming backend/doc paths
-are byte-identical to that accepted version. Old M5 proposal/review artifacts
-remain unchanged. The final fixture correction pins lease tests within one
-interval; final TypeScript implementation bytes equal the source checkpoint.
+The original R2 implementation/review lineage through `0419`'s head-held task,
+`1229be7`, `c468635`, `d4affc7`, `117f240` and `6fb7b21` remains intact. The independent
+[R2 report](reviews/CONVERSATION-PINGS-R2.md) retains its scoped acceptance and
+operational-lifecycle FAIL verbatim. Retirement is a new source candidate descended
+from `6fb7b21`, first checkpoint `48b3106`, with separate review and integration gates.
 
-| Local verification | Result |
+| Local retirement verification | Result |
 | --- | --- |
-| Conversation follow-ups and checks | 57/57 (45 follow-up cases + 12 checks) |
-| Liveness, Hub, bus, M6 claim admission | 107/107 |
-| Conversations and security | 26/26 |
-| Retention and integration | 24/24 |
-| Platform and machine pairing | 35/35 |
-| Agent registry and registry R2 | 14/14 |
+| Follow-ups/checks | 59/59 (original 57 plus two byte-bound regressions) |
+| Lifecycle regressions | 21/21 |
+| Conversations/security | 26/26 |
+| Retention/integration | 25/25, including additive accounting/rollback regression |
+| Base Hub compatibility | 2/2 |
 | TypeScript `tsc --noEmit` | PASS |
-| Real Python bridge `cycle`, final captured public HTTP history, accepted backend | 4/4 |
 
-The 206 compatibility cases ran once, serially in bounded groups, because the
-shared writer, schema initialization, scheduler and Hub port touch these
-contracts. They were not repeated after the host-only accepted merge. The final
-focused group and typecheck ran against the final source and fixtures. The
-bridge contract substitutes only journal/native/member methods with memory
-fixtures: the actual automation note and original message both reach `deliver`,
-the recipient-authored control remains suppressed, and a gap advances neither
-cursor nor delivery. This is source contract evidence, not physical adoption.
-Expected injected M6 SQLite retirement-linkage diagnostics remain in the log;
-that group passed all assertions.
+The lifecycle fixture seeds 4,095 historical requests with real serialized effect
+bindings beside one actual completed receipt, then reclaims all 4,096. Another
+32 actual intervals continue with zero settled receipts, one latest slot and one
+grant; all member read watermarks remain unchanged. Tests cover exact old replay
+after pruning, response loss at three phases, cross-interval restart, grant/member/
+archive changes, orphan cap reclamation, send/cleanup races, different-CID/recipient
+regrant, backward clocks, standalone R2 initialization, archived parent completion,
+oversized rendered intent before storage, and transaction rollback with actual
+row accounting.
 
-Failures are preserved rather than relabelled: the first typecheck found three
-invalid SQL cursor `.one()` calls; they now use the cursor's supported
-`toArray()` interface. A later test fixture tried protected `hub.ctx`; it now
-uses the actual Durable Object state transaction. The initial new 40-case run
-passed 39 and timed out in the 51-conversation scan fixture, whose continuation
-caused an unhandled rejection; a bounded 20-second per-case timeout fixed that
-fixture. A final 57-case run passed 56 because its simulated 30-second crash
-crossed a real interval boundary. Pinning both lease fixtures to slot+60 seconds
-keeps the original no-duplicate assertions and makes their intended interval
-explicit. The subsequent final group passed 57/57; no source assertion or digest
-was weakened or re-pinned.
+Tests run serially on CPU 0 with single UV/V8/Go pools, an existing dependency
+symlink, `--configLoader runner`, and private workspace TMPDIR/HOME/XDG paths.
+Per-run logs and resource receipts, including failures, remain ignored. The
+combined scratch cap is 25 MiB with an 18 MiB early guard. Largest sampled scratch
+was 13,344,768 allocated / 13,255,397 apparent bytes, including root directory
+inodes; largest process-group RSS was 638,775,296 bytes with 28 tasks. No guard
+fired, installs occurred or evidence was manually deleted. One expanded lifecycle
+run failed 15/19 assertions because a zero-day pruning fixture had mutated the
+shared test service. Giving that pruner its own service restored fixture isolation;
+all assertions were preserved and the 19-case rerun passed.
 
-Per-run logs, exit codes, counts and resource receipts are retained in ignored
-evidence. Tests use CPU 0, one-thread UV/V8/Go pools, existing dependency
-symlinks, a private workspace TMPDIR and isolated HOME/XDG directories. Largest
-sampled scratch contents were 33,796,096 allocated / 33,663,424 apparent bytes;
-early measurements excluded the two root directory inodes (8 KiB observed),
-which is explicitly recorded. Later measurements include them. Even a 64 KiB
-metadata allowance leaves the peak below 33 MiB and the combined 45 MiB cap.
-Largest sampled process-group RSS was 651,788,288 bytes, with 30 tasks. No guard
-fired and no evidence was manually deleted or overwritten. No host/UI full-suite
-rerun or actual native receipt is claimed.
+The affected compatibility subset was rerun because scheduler initialization,
+write authorization and shared retention changed. R2's unrelated 206-case evidence
+remains attributed to that source; those full groups were not needlessly repeated.
+Sender/read logic and the Python/native bridge were unchanged: R2's memory bridge
+4/4 is historical evidence, not a new physical-delivery claim. No source assertion
+or digest pin was weakened. No native inbox, host journal or provider was used.
 
-Independent verification should attack watermark preservation and native bridge
-eligibility with real HTTP history; outside-admin and disabled-human cases;
-credential/membership changes between evaluation and dispatch; response loss
-with changed details/config/restart; and two overlapping due snapshots including
-a later row. Review the exact final SHA and preserve ordinary F7/M6, auth,
-retention, caps and negative assertions. Physical M5 remains unproven until the
-runtime owner demonstrates an enrolled host plus human/agent conversation,
-reconnect ordering and a durable native inbox receipt. Domain and enrollment
-remain operations dependencies.
+A different-model reviewer must accept the exact retirement SHA before head
+integration. Physical M5 still needs an enrolled host, human/agent conversation,
+reconnect ordering and a durable native inbox receipt. Source acceptance, main
+integration, live runtime and cross-host adoption are distinct. M8b, issue 102
+and M11 remain open; deployment and enrollment belong to their operations owners.

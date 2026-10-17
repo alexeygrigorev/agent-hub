@@ -1309,3 +1309,51 @@ describe('LOW malformed and unsupported schema_version fail closed', () => {
     });
   });
 });
+
+describe('M5 automation retirement shares the existing global allowance', () => {
+  it('counts actual automation deletions with bus and conversation rows and rolls authority fencing back on failure', async () => {
+    await freshHub((hub, state) => {
+      const t = 1_792_189_800_000;
+      hub.sql.exec(`INSERT INTO conversation_automation_grants VALUES
+        ('ret-g','gone','removed','human:alice',NULL,'alice',0,'approved','always',NULL)`);
+      hub.sql.exec(`INSERT INTO hub_check_slots VALUES
+        ('removed','legacy-key',0,'{"action":{"grant_id":"ret-g"}}','{"status":"pass","detail":"old"}',NULL,NULL,'done',NULL,0)`);
+      hub.sql.exec(`INSERT INTO conversation_automation_receipts VALUES ('ret-effect','{}','ret-msg','gone',0)`);
+      insertExpiredBusMessage(hub.sql, 'retirement-bus', t);
+      insertExpiredClaim(hub.sql, 'retirement-claim', t);
+      const snapshot = () => ({
+        slots: hub.sql.exec('SELECT * FROM hub_check_slots ORDER BY name').toArray(),
+        grants: hub.sql.exec('SELECT * FROM conversation_automation_grants ORDER BY id').toArray(),
+        receipts: hub.sql.exec('SELECT * FROM conversation_automation_receipts ORDER BY effect_key').toArray(),
+        base: tableCounts(hub.sql),
+        cursor: hub.sql.exec('SELECT * FROM retention_cleanup_cursor ORDER BY kind').toArray(),
+      });
+      hub.sql.exec(RETENTION_CLEANUP_CURSOR_SQL);
+      const before = snapshot();
+      hub.sql.exec(`CREATE TRIGGER abort_automation_retirement BEFORE DELETE ON conversation_automation_receipts BEGIN SELECT RAISE(ABORT, 'injected automation retirement failure'); END`);
+      expect(() => hub.busService.retentionCleanup(t, 100)).toThrow(/injected automation retirement failure/);
+      expect(snapshot()).toEqual(before);
+      hub.sql.exec('DROP TRIGGER abort_automation_retirement');
+      const automationCount = () => count(hub.sql, `SELECT
+        (SELECT count(*) FROM hub_check_slots)+(SELECT count(*) FROM conversation_automation_grants)+(SELECT count(*) FROM conversation_automation_receipts) n`);
+      const all = () => totalRows(hub.sql) + automationCount();
+      const observed = new Set<string>();
+      for (let i = 0; i < 10; i++) {
+        const prev = all();
+        const result = hub.busService.retentionCleanup(t, [1, 2, 3][i % 3]) as any;
+        const actual = prev - all();
+        const reported = result.messagesDeleted + result.claimsDeleted + result.conversationRowsDeleted;
+        expect(actual).toBe(reported); expect(actual).toBeLessThanOrEqual([1, 2, 3][i % 3]);
+        if (result.automationRowsDeleted) observed.add('automation');
+        if (result.messagesDeleted || result.claimsDeleted) observed.add('bus');
+        if (!result.hasMore) break;
+      }
+      expect(observed).toEqual(new Set(['automation', 'bus']));
+      expect(automationCount()).toBe(0);
+      expect(hub.busService.hasExpiredRows(t) || hub.conversationsService.hasExpiredRows(t)).toBe(false);
+      // Restart uses the same persisted authority and fair cursor, not a reset.
+      const restarted = new Hub(state, testEnv);
+      expect(restarted.conversationsService.hasExpiredRows(t)).toBe(false);
+    });
+  });
+});

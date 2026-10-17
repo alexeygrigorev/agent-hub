@@ -22,6 +22,10 @@ const NAME = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 const LABEL = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 const TEXT = (v: unknown, max: number) => typeof v === 'string' && v.length <= max && !/[\x00-\x08\x0b-\x1f\x7f]/.test(v);
 const plain = (v: any, keys: string[]) => v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).every(k => keys.includes(k));
+const jsonBytes = (v: unknown) => new TextEncoder().encode(JSON.stringify(v)).byteLength;
+const MAX_CHECK_BYTES = 128 * 1024;
+const MAX_RESULT_BYTES = 64 * 1024;
+const MAX_INTENT_BYTES = 64 * 1024;
 
 const safeId = (v: unknown): v is string => typeof v === 'string' && /^[A-Za-z0-9._:-]{1,128}$/.test(v);
 const canonicalTarget = (v: unknown): v is string => typeof v === 'string' && (/^human:[A-Za-z0-9._:-]{1,120}$/.test(v) || registryAddress(v) !== null);
@@ -71,7 +75,9 @@ export function validateCheck(c: any): { row: any } | { error: string } {
     if ((action.engine !== undefined && !LABEL.test(action.engine)) || (action.machine !== undefined && !LABEL.test(action.machine)) || (action.mode !== undefined && action.mode !== 'headless') || (action.summary !== undefined && !TEXT(action.summary, 240))) return { error: 'invalid_launch_action' };
   }
   if (typeof c.enabled !== 'boolean' && c.enabled !== undefined) return { error: 'invalid_enabled' };
-  return { row: { name: c.name, kind: c.kind, interval_s: c.interval_s, params, action: { on: c.kind === 'routine' ? 'always' : 'fail', ...action }, enabled: c.enabled !== false } };
+  const row = { name: c.name, kind: c.kind, interval_s: c.interval_s, params, action: { on: c.kind === 'routine' ? 'always' : 'fail', ...action }, enabled: c.enabled !== false };
+  if (jsonBytes(row) > MAX_CHECK_BYTES) return { error: 'check_too_large' };
+  return { row };
 }
 
 export const DEFAULT_CHECKS = [
@@ -137,7 +143,14 @@ export class ChecksService {
         if (!slot && Number(this.sql.exec('SELECT COUNT(*) AS n FROM hub_check_slots').one().n) >= 1000) throw new Error('check_slot_capacity');
         const n = Math.floor(now / (row.interval_s * 1000));
         const nextAt = (n + 1) * row.interval_s * 1000;
-        const check = { ...row, params: JSON.parse(row.params_json), action: JSON.parse(row.action_json) };
+        // Freeze the definition, without duplicating the SQL JSON columns or
+        // mutable status metadata. Existing R2 reservations are never rewritten.
+        const check = { name, kind: row.kind, interval_s: row.interval_s, params: JSON.parse(row.params_json), action: JSON.parse(row.action_json) };
+        if (jsonBytes(check) > MAX_CHECK_BYTES) {
+          this.sql.exec("UPDATE hub_checks SET last_status='error', last_detail='check_too_large' WHERE name=?", name);
+          results.push({ name, status: 'error', detail: 'check_too_large', action: null });
+          continue;
+        }
         this.sql.exec(`INSERT INTO hub_check_slots VALUES (?, ?, ?, ?, NULL, NULL, NULL, 'evaluating', ?, ?)
           ON CONFLICT(name) DO UPDATE SET slot_key=excluded.slot_key, next_at=excluded.next_at, check_json=excluded.check_json, result_json=NULL, intent_json=NULL, action=NULL, state='evaluating', token=excluded.token, lease_until=excluded.lease_until`,
           name, `${name}-${check.action.conversation_id ? crypto.randomUUID() : n}`, nextAt, JSON.stringify(check), token, now + 30000);
@@ -154,10 +167,17 @@ export class ChecksService {
       else {
         try { result = await this.evaluate(check, deps); }
         catch (e: unknown) { result = { status: 'error', detail: 'check failed: ' + errorText(e) }; }
+        if (jsonBytes(result) > MAX_RESULT_BYTES) result = { status: 'error', detail: 'check_result_too_large' };
         if (check.action.conversation_id && result.status !== 'error' && (check.action.on === 'always' || result.status === 'fail')) {
           intent = { actor: check.action.to, checkName: name, conversationId: check.action.conversation_id,
             grantId: check.action.grant_id, bodyTemplate: check.action.body, on: check.action.on,
             body: check.action.body.replaceAll('{detail}', result.detail).replaceAll('{check}', name), idempotencyKey: 'check-' + slot.slot_key };
+          // Enforce the existing rendered-body limit before durable intent, not
+          // only at the writer after an oversized payload has become immortal.
+          if (intent.body.length > 8000 || jsonBytes(intent) > MAX_INTENT_BYTES) {
+            result = { status: 'error', detail: 'followup_intent_too_large' };
+            intent = null;
+          }
         }
         this.sql.exec('UPDATE hub_check_slots SET result_json = ?, intent_json = ?, state = ? WHERE name = ? AND token = ?', JSON.stringify(result), intent ? JSON.stringify(intent) : null, 'dispatch', name, token);
       }

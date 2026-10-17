@@ -121,7 +121,7 @@ Actions: `{"type": "alert"}` (default), `{"type": "message", "to": "<actor>", "b
 ]}
 ```
 
-Upload it from the dashboard, or `PUT /api/checks`. `POST /api/checks/<name>/run` runs one now. A forced rerun in the same completed slot returns its stored result. Conversation message actions additionally require `conversation_id` and an expiring `grant_id` from the conversation's current human owner. Their `to` is the recipient; the reserved author is `system:conversation-checks`. Durable intent and Hub storage receipts preserve retries without acknowledging the recipient. A Hub storage receipt does not confirm native inbox delivery. No conversation check is enabled by default. See [CONVERSATION-PINGS.md](CONVERSATION-PINGS.md) for delegation, bounds and recovery.
+Upload it from the dashboard, or `PUT /api/checks`. `POST /api/checks/<name>/run` runs one now. A forced rerun in the same completed slot returns its stored result. Conversation message actions additionally require `conversation_id` and an expiring `grant_id` from the conversation's current human owner. Their `to` is the recipient; the reserved author is `system:conversation-checks`. Durable intent and Hub storage receipts preserve retries without acknowledging the recipient. The exact current slot gates new writes; existing retention reclaims settled receipts, reconciles invalid or removed slots, and retires obsolete grants within the shared deletion budget. Retired keys fail closed after pruning; new conversation intervals use opaque generations independent of wall-clock time. A Hub storage receipt does not confirm native inbox delivery. No conversation check is enabled by default. See [CONVERSATION-PINGS.md](CONVERSATION-PINGS.md) for delegation, bounds and recovery.
 
 ## Signing in
 

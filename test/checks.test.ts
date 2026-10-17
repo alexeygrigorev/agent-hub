@@ -147,3 +147,24 @@ describe('running checks', () => {
     expect(deps.log).toHaveLength(1);
   }));
 });
+
+it('rejects oversized definitions before slot storage', () => {
+  const result = validateCheck({ name: 'large', kind: 'routine', interval_s: 300, params: { url: 'x'.repeat(128 * 1024) }, action: { type: 'message', to: 'local', body: 'bounded' } });
+  expect(result).toEqual({ error: 'check_too_large' });
+});
+
+it('holds an oversized legacy definition without blocking a valid current check or freezing an oversized result', () => fixture(async (checks, deps, _clock, sql) => {
+  checks.replace([
+    row({ name: 'a-legacy', kind: 'quota', interval_s: 300 }),
+    row({ name: 'b-current', kind: 'routine', interval_s: 300, action: { type: 'message', to: 'local', body: 'current' } }),
+    row({ name: 'c-result', kind: 'quota', interval_s: 300 }),
+  ]);
+  sql.exec('UPDATE hub_checks SET params_json=? WHERE name=?', JSON.stringify({ url: 'x'.repeat(128 * 1024) }), 'a-legacy');
+  deps.evaluateQuota = () => [{ label: 'x'.repeat(70000), enabled: true, status: 'blocked' }];
+  const result = await checks.runDue(deps);
+  expect(result[0]).toMatchObject({ name: 'a-legacy', status: 'error', detail: 'check_too_large' });
+  expect(result[1]).toMatchObject({ name: 'b-current', status: 'pass', action: 'message m1' });
+  expect(result[2]).toMatchObject({ name: 'c-result', status: 'error', detail: 'check_result_too_large' });
+  expect(sql.exec("SELECT name FROM hub_check_slots WHERE name='a-legacy'").toArray()).toHaveLength(0);
+  expect(sql.exec("SELECT length(result_json) n FROM hub_check_slots WHERE name='c-result'").toArray()[0].n).toBeLessThan(1000);
+}));

@@ -1330,7 +1330,7 @@ export class ConversationsService {
             if (row.orphan) {
               this.sql.exec('DELETE FROM hub_check_slots WHERE name=?', row.name);
               remaining--; automationRowsDeleted++;
-            } else {
+            } else if (this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_checks'").toArray().length) {
               this.sql.exec('UPDATE hub_checks SET last_status=?, last_detail=? WHERE name=?', result.status, result.detail.slice(0, 1000), row.name);
             }
           } else {
