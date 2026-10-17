@@ -145,6 +145,37 @@ class TestSessionControlCli(unittest.TestCase):
             result = session_control.execute(args)
         self.assertEqual([s['id'] for s in result['sessions']], ['a'])
 
+    def test_start_prompt_inline_with_brief_boundaries(self):
+        with patch.object(session_control, 'request', return_value={}) as transport:
+            session_control.execute(self.parse('start', '--workspace', 'demo', '--prompt', 'do the thing', '--key', 'k'))
+        payload = transport.call_args.args[2]
+        self.assertEqual(payload['brief'], 'do the thing')
+        self.assertEqual(payload['mode'], 'headless')
+        # Mutually exclusive with --brief-file and --interactive.
+        with self.assertRaises(SystemExit):
+            self.parse('start', '--workspace', 'demo', '--prompt', 'x', '--brief-file', 'goal.txt')
+        with self.assertRaises(SystemExit):
+            self.parse('start', '--workspace', 'demo', '--prompt', 'x', '--interactive')
+        # Same 8 KiB UTF-8 boundaries as --brief-file, never executed locally.
+        with patch.object(session_control, 'request', return_value={}):
+            with self.assertRaises(ValueError):
+                session_control.execute(self.parse('start', '--workspace', 'demo', '--prompt', '   ', '--key', 'k'))
+            with self.assertRaises(ValueError):
+                session_control.execute(self.parse('start', '--workspace', 'demo', '--prompt', 'é' * 5000, '--key', 'k'))
+            with self.assertRaises(ValueError):
+                session_control.execute(self.parse('start', '--workspace', 'demo', '--prompt', 'x' * 8001, '--key', 'k'))
+
+    def test_start_name_stored_and_validated(self):
+        with patch.object(session_control, 'request', return_value={}) as transport:
+            session_control.execute(self.parse('start', '--workspace', 'demo', '--prompt', 'goal', '--name', 'friendly', '--key', 'k'))
+        self.assertEqual(transport.call_args.args[2]['name'], 'friendly')
+        with patch.object(session_control, 'request', return_value={}):
+            session_control.execute(self.parse('start', '--workspace', 'demo', '--interactive', '--name', 'empty-ok', '--key', 'k'))
+            with self.assertRaises(ValueError):
+                session_control.execute(self.parse('start', '--workspace', 'demo', '--name', '../escape', '--key', 'k'))
+            with self.assertRaises(ValueError):
+                session_control.execute(self.parse('start', '--workspace', 'demo', '--name', '', '--key', 'k'))
+
     def test_host_receive_requires_once_and_machine(self):
         args = self.parse('host-receive', '--once', '--machine-id', 'hetzner1')
         self.assertTrue(args.once)

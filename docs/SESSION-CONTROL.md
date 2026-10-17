@@ -74,9 +74,12 @@ UUIDs are `crypto.randomUUID()`; ids in paths match
 ### POST /api/sessions (start)
 
 Request: `key` (required idempotency label per `(actor, key)`), `workspace`
-(required label), `engine` / `machine` (optional labels, REAL fleet route
+(required: a configured label, or an explicitly allowed absolute POSIX path —
+see below), `engine` / `machine` (optional labels, REAL fleet route
 constraints), `brief` (optional headless prompt, 1..8000 chars), `mode`
-(`headless`|`interactive`, interactive starts empty), `access` (optional
+(`headless`|`interactive`, interactive starts empty), `name` (optional
+friendly name, `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`; stored in `request_json`,
+shown in list/show, never identity), `access` (optional
 claim-admission declaration passed through to fleet).
 
 `tier` resolves through the EXISTING model-routing table inside fleet plan
@@ -120,6 +123,60 @@ Behavior:
    streamed-body revoke races). Crypto token-hash prep stays async BEFORE
    the txn; all live credential/family/machine checks are synchronous
    INSIDE it — no awaited final-verifier gap.
+
+### Absolute workspace identifiers (alongside labels)
+
+A remote caller may address a workspace as an absolute POSIX path
+(`hub sessions start --workspace /absolute/repo/path --engine opencode
+--prompt "..."`). Labels keep their exact legacy meaning; paths are
+additional identifiers, never replacements.
+
+- Bounded canonical form on BOTH ends (server `src/fleet.ts` +
+  `src/session_control.ts`, host `fleet.py`): starts with `/`, at most 512
+  chars, no NUL/control chars, no backslashes, no `//`, no trailing slash,
+  no `.`/`..` segments, segments confined to `[A-Za-z0-9._-]{1,64}`.
+  Anything else is refused with 400 before any claim or native effect.
+- No arbitrary path acceptance: the path must be EXPLICITLY configured in
+  the trusted host settings (`workspaces` map, operator-owned private file)
+  AND advertised in that host's capabilities `workspaces`. The server routes
+  only exact capability matches (`capability_unavailable` otherwise, held
+  honestly); the host's `_route` refuses unmapped offers before the fleet
+  claim; host realpath/CWD confinement stays authoritative downstream.
+  No auto-clone, no disk writes, no unknown-repository fallback.
+- The claim-policy map accepts the same absolute entries (same validator),
+  so existing role fences keep working: unconfigured paths fail closed.
+- Host session reports already carry absolute native paths through the
+  existing fleet-sessions metadata (no new registry or dispatcher).
+
+### Friendly names and the Hub-name → native-tag → Hub-UUID mapping
+
+- `--name` is display only. It rides in `request_json` (no schema change),
+  is covered by start idempotency (same key + same name replays, same key +
+  different name conflicts with 409), and is projected as `name` in list and
+  show. Names are never identity or authority.
+- Exact mapping, no guessing: a Hub session started through fleet binds the
+  canonical native tag `hub-<fleet_launch_id>` (interactive dispatcher argv)
+  or `task-hub-<fleet_launch_id>` (maintained launcher aplexer backend) to
+  the exact native UUID + `native_created_at_ms` incarnation. List/show
+  expose all three (`id`, `binding.tag`, `binding.native_id`).
+- Convenience alias only: `show`/`commands` (GET) and `send`/`capture`/`stop`
+  (POST) accept an exact friendly name in place of the Hub UUID. Resolution
+  is actor-scoped (admins resolve within their own actor too), exact-match,
+  single-hit only: unknown names are `not_found` (404, never an oracle),
+  ambiguous names are `ambiguous_name` (409, refused — use the UUID), and a
+  native tag is NEVER a name (no tag-guessing, no foreign-session control,
+  never latest-wins). The host binding route stays strict Hub UUID.
+
+### Observed (non-Hub) native sessions: read-only inventory, no adoption
+
+"Can it list/send/capture sessions that psc started?" Honestly: the fleet
+inventory (`fleet_sessions` reports) shows ACTUAL native sessions, including
+ones other coordinators or Alexey started — but there is NO verified Hub
+binding for them (no fleet launch, no UUID/tag/incarnation reconciliation),
+so they are read-only observations. The hub never fakes a binding, never
+claims ownership of another coordinator's or Alexey's sessions, and control
+routes refuse them. Adoption would require a genuine Hub start (or an
+explicit, reviewed adoption flow that does not exist); it is not claimed.
 
 ### Claim / ack discipline (one-time attempt fence)
 
@@ -284,14 +341,14 @@ mount (same helper shape, narrow operator-token route scope, no global
 
 ```sh
 hub sessions list [--state running] [--limit 50]
-hub sessions start --workspace demo [--engine codex] [--machine hetzner]
-    [--cwd demo/project] [--brief-file goal.txt | --interactive] [--key k1]
+hub sessions start --workspace demo|/absolute/repo/path [--engine opencode] [--machine hetzner]
+    [--cwd demo/project] [--brief-file goal.txt | --prompt "..." | --interactive] [--name friendly] [--key k1]
     [--wait] [--timeout 300] [--interval 5]
-hub sessions send <session-id> --body-file prompt.txt [--key k2] [--wait ...]
-hub sessions capture <session-id> [--max-bytes 65536] [--key k3] [--wait ...]
-hub sessions stop <session-id> [--key k4] [--wait ...]
-hub sessions show <session-id>
-hub sessions commands <session-id>
+hub sessions send <session-id|name> --body-file prompt.txt [--key k2] [--wait ...]
+hub sessions capture <session-id|name> [--max-bytes 65536] [--screen] [--key k3] [--wait ...]
+hub sessions stop <session-id|name> [--key k4] [--wait ...]
+hub sessions show <session-id|name>
+hub sessions commands <session-id|name>
 hub sessions host-receive --once --machine-id hetzner [--actor machine:hetzner]
     [--credential-family host:hetzner] [--journal-dir ABS] [--aplexer-bin aplexer] [--limit 20]
 ```
@@ -327,7 +384,7 @@ rows, complete pagination).
 
 ## Acceptance (source only; physical gates stay with head)
 
-- Real SQLite/HTTP tests (`test/session-control.test.ts`, 26 cases):
+- Real SQLite/HTTP tests (`test/session-control.test.ts`, 30 cases):
   auth/unscoped, input validation, tier-before-placement, cwd-before-
   reservation (`unsupported_cwd`), honest hold, idempotent start/conflict,
   constraint passthrough (fleet-exact keys), fleet-400 passthrough, held
@@ -338,9 +395,19 @@ rows, complete pagination).
   expiry-to-uncertain with no re-offer, native-envelope proof (required +
   foreign/stale/self-reply/digest + cross-command replay rejection),
   stop-confirmed-exit, refused/uncertain retention, capture redaction,
-  binding-conflict on tag reuse, cursor pagination completeness, queue caps.
-- Host CLI tests (`host/tests/test_session_control.py`, 11 cases): paths,
+  binding-conflict on tag reuse, cursor pagination completeness, queue caps,
+  absolute workspace acceptance/traversal refusal, name store/projection/
+  idempotent replay, actor-scoped exact alias (ambiguous 409, foreign 404,
+  never tag-match).
+- Fleet placement (`test/fleet.test.ts`, 23 cases, incl. absolute-path
+  routing when advertised, malformed-path refusal before claim/effects,
+  unadvertised-path `capability_unavailable` with no launch row, absolute
+  claim-policy entries, full label regression).
+- Host CLI tests (`host/tests/test_session_control.py`, 15 cases): paths,
   headless/interactive, payloads, error hygiene, bounds, wait validation,
   start/send wait semantics (transport never completes), timeout + keyed
-  reconciliation, list filtering.
+  reconciliation, list filtering, `--prompt` inline goals (mutual exclusion,
+  8 KiB UTF-8/char bounds, blank refusal) and `--name` validation/passthrough.
+- Host fleet (`host/tests/test_fleet.py`, 20 cases, incl. absolute workspace
+  keys accepted/malformed refused and explicit-mapping-only routing).
 - `tsc --noEmit` clean. No test starts, reads, or stops a live agent.

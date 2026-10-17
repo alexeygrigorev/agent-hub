@@ -224,3 +224,49 @@ describe('generic accounts and launch placement', () => {
     expect((await s.handle(request('/launches', intent()), staleJob)).status).toBe(403);
   }));
 });
+
+describe('absolute workspace identifiers alongside labels', () => {
+  const ABS = '/srv/hub/demo';
+  function advertise(sql: any, workspaces: string[]) {
+    const caps = { engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces, cpu_count: 8 };
+    sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify(caps), 'hetzner');
+  }
+  it('routes an explicitly advertised absolute path and keeps labels working', async () => fixture(async (s, sql) => {
+    await configure(s);
+    advertise(sql, ['demo', ABS]);
+    const plan: any = s.plan(intent({ workspace: ABS }));
+    expect(plan.selected?.machine).toBe('hetzner');
+    const launch: any = await (await s.handle(request('/launches', intent({ workspace: ABS })), admin)).json();
+    expect(launch.machine).toBe('hetzner');
+    // Labels keep working (hetzner slot is now consumed, so demo routes to win35).
+    expect((s.plan(intent({ workspace: 'demo' })) as any).selected?.machine).toBe('win35');
+  }));
+  it('rejects malformed absolute paths before any claim or effect', async () => fixture(async (s, sql) => {
+    await configure(s);
+    advertise(sql, ['demo', ABS]);
+    for (const workspace of ['/srv/../escape', '/srv//double', '/srv/./dot', '/srv/hub/demo/', '/', '']) {
+      expect(s.plan(intent({ workspace })), workspace).toEqual({ error: 'invalid_launch_request' });
+    }
+    expect(sql.exec('SELECT COUNT(*) n FROM fleet_launches').one().n).toBe(0);
+  }));
+  it('refuses unadvertised absolute paths with no eligible route', async () => fixture(async (s, sql) => {
+    await configure(s);
+    advertise(sql, ['demo']);
+    const plan: any = s.plan(intent({ workspace: ABS }));
+    expect(plan.selected).toBeNull();
+    expect(plan.rejected[0].reason).toBe('capability_unavailable');
+    const res = await s.handle(request('/launches', intent({ workspace: ABS })), admin);
+    expect(res.status).toBe(409);
+    expect(sql.exec('SELECT COUNT(*) n FROM fleet_launches').one().n).toBe(0);
+  }));
+  it('accepts absolute paths in the claim policy alongside labels', async () => fixture(async (s) => {
+    await configure(s);
+    const policy = { workspaces: [
+      { workspace: 'demo', project: null, require_claim: false },
+      { workspace: ABS, project: null, require_claim: true },
+    ] };
+    expect((await s.handle(request('/claim-policy', policy, 'PUT'), admin)).status).toBe(200);
+    const bad = { workspaces: [{ workspace: '/srv/../escape', project: null, require_claim: true }] };
+    expect((await s.handle(request('/claim-policy', bad, 'PUT'), admin)).status).toBe(400);
+  }));
+});

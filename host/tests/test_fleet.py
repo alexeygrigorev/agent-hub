@@ -213,4 +213,41 @@ class FleetTests(unittest.TestCase):
         self.assertEqual(calls[0][2]['capabilities']['workspaces'], ['demo'])
 
 
+
+    def test_absolute_workspace_keys_allowed_and_malformed_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / 'repo'
+            target.mkdir()
+            p = Path(tmp) / 'subscriptions.json'
+            cfg = settings(target)
+            cfg['workspaces'] = {'demo': str(target), '/srv/hub/demo': str(target)}
+            p.write_text(json.dumps(cfg))
+            loaded = fleet.load_settings(p)
+            self.assertEqual(loaded['workspaces']['/srv/hub/demo'], str(target))
+            for bad_key in ['/srv/../escape', '/srv//double', '/srv/./dot',
+                            '/srv/hub/demo/', '/', '/srv/hub/de mo', '']:
+                bad = dict(cfg)
+                bad['workspaces'] = {'demo': str(target), bad_key: str(target)}
+                p.write_text(json.dumps(bad))
+                with self.assertRaises(ValueError, msg=bad_key or '<empty>'):
+                    fleet.load_settings(p)
+            # Non-absolute values still refused, labels still fine.
+            bad = dict(cfg)
+            bad['workspaces'] = {'demo': 'relative/path'}
+            p.write_text(json.dumps(bad))
+            with self.assertRaises(ValueError):
+                fleet.load_settings(p)
+
+    def test_absolute_offer_routes_only_when_explicitly_configured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            cfg = settings(target)
+            cfg['workspaces'] = {'demo': str(target), '/srv/hub/demo': str(target)}
+            route = fleet.Dispatcher(cfg)._route({**offer(), 'workspace': '/srv/hub/demo'})
+            self.assertEqual(route['account_label'], 'shared-codex')
+            with self.assertRaisesRegex(ValueError, 'not configured'):
+                fleet.Dispatcher(cfg)._route({**offer(), 'workspace': '/srv/hub/unmapped'})
+            with self.assertRaisesRegex(ValueError, 'not configured'):
+                fleet.Dispatcher(cfg)._route({**offer(), 'workspace': '/srv/../escape'})
+
 if __name__ == '__main__': unittest.main()

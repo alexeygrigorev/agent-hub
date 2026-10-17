@@ -585,3 +585,73 @@ describe('send proof validator (host-verified native reply provenance)', () => {
       .toMatchObject({ ok: false, error: 'invalid_proof_shape' });
   });
 });
+
+describe('absolute workspace identifiers and friendly names', () => {
+  const ABS = '/srv/hub/demo';
+  it('accepts an explicitly configured absolute workspace and passes it to placement', async () => {
+    const fake = fakeReserve();
+    await fixture(async (s) => {
+      const res = await s.handle(request('/api/sessions', { key: 'abs-1', workspace: ABS }), admin);
+      const data = await res.json() as any;
+      expect(res.status, JSON.stringify(data)).toBe(201);
+      expect(fake.calls[0].workspace).toBe(ABS);
+    }, fake.hook);
+  });
+  it('refuses malformed absolute workspaces before any placement effect', async () => {
+    const fake = fakeReserve();
+    await fixture(async (s) => {
+      const bad = [
+        '/srv/../escape', '/srv//double', '/srv/./dot', '/srv/hub/demo/',
+        '/', '/srv/hub/de mo', '/srv/hub/demo\x00x',
+        'relative/path', '',
+      ];
+      let i = 0;
+      for (const workspace of bad) {
+        const res = await s.handle(request('/api/sessions', { key: 'badws' + (i++), workspace }), admin);
+        expect(res.status, JSON.stringify(workspace)).toBe(400);
+      }
+      expect(fake.calls.length).toBe(0);
+    }, fake.hook);
+  });
+  it('stores the friendly name, projects it in list/show, and replays idempotently', async () => {
+    const fake = fakeReserve();
+    await fixture(async (s) => {
+      const created = await startOk(s, { workspace: 'demo', name: 'friendly' }, admin, 'name-1');
+      expect(created.name).toBe('friendly');
+      const show = await (await s.handle(request(`/api/sessions/${created.id}`, undefined, 'GET'), admin)).json() as any;
+      expect(show.name).toBe('friendly');
+      const list = await (await s.handle(request('/api/sessions', undefined, 'GET'), admin)).json() as any;
+      expect(list.sessions[0].name).toBe('friendly');
+      const replay = await (await s.handle(request('/api/sessions', { key: 'name-1', workspace: 'demo', name: 'friendly' }), admin)).json() as any;
+      expect(replay.id).toBe(created.id);
+      expect(replay.replay).toBe(true);
+      const conflict = await s.handle(request('/api/sessions', { key: 'name-1', workspace: 'demo', name: 'other' }), admin);
+      expect(conflict.status).toBe(409);
+      const bad = await s.handle(request('/api/sessions', { key: 'name-bad', workspace: 'demo', name: '../escape' }), admin);
+      expect(bad.status).toBe(400);
+    }, fake.hook);
+  });
+  it('resolves an unambiguous actor-scoped name alias and refuses ambiguous/foreign/tag lookups', async () => {
+    const fake = fakeReserve();
+    await fixture(async (s, sql) => {
+      const first = await startOk(s, { workspace: 'demo', name: 'mine' }, admin, 'alias-1');
+      // Exact match resolves show and send (after binding) by name.
+      const show = await s.handle(request('/api/sessions/mine', undefined, 'GET'), admin);
+      expect(show.status).toBe(200);
+      expect(((await show.json()) as any).id).toBe(first.id);
+      await bindHttp(s, sql, first.id);
+      const send = await s.handle(request('/api/sessions/mine/send', { key: 'alias-send', body: 'hello' }), admin);
+      expect(send.status).toBe(201);
+      // A native tag is never a name: no adoption through tag guessing.
+      expect((await s.handle(request('/api/sessions/' + canonTag(first.fleet_launch_id), undefined, 'GET'), admin)).status).toBe(404);
+      // A foreign actor's name never resolves.
+      expect((await s.handle(request('/api/sessions/mine', undefined, 'GET'), stranger)).status).toBe(404);
+      // A second same-name session makes the alias ambiguous: refused, UUID still works.
+      const second = await startOk(s, { workspace: 'demo', name: 'mine' }, admin, 'alias-2');
+      expect(second.id).not.toBe(first.id);
+      expect((await s.handle(request('/api/sessions/mine', undefined, 'GET'), admin)).status).toBe(409);
+      expect((await s.handle(request(`/api/sessions/${first.id}`, undefined, 'GET'), admin)).status).toBe(200);
+      expect((await s.handle(request('/api/sessions/mine/send', { key: 'alias-send-2', body: 'hi' }), admin)).status).toBe(409);
+    }, fake.hook);
+  });
+});
