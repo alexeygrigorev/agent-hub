@@ -212,6 +212,15 @@ def main():
                 print(json.dumps({"id": mid, "status": "delivery-uncertain", "detail": "attempt reservation exists"}))
                 sys.stderr.write("Error: delivery uncertain\n")
                 sys.exit(1)
+            elif status == "malformed-no-status":
+                print(json.dumps({"id": mid, "foo": "bar"}))
+                sys.exit(rc)
+            elif status == "non-json":
+                print("plain text not json")
+                sys.exit(rc)
+            elif status:
+                print(json.dumps({"id": mid, "status": status, "detail": f"unrecognized status {status}"}))
+                sys.exit(rc)
             else:
                 sys.stderr.write(f"unknown status {status}\n")
                 sys.exit(1)
@@ -700,3 +709,133 @@ def test_controller_restart_retains_honest_unknown_if_sender_unbound(env):
     assert reconciled is None
     loaded = json.load(open(jpath))
     assert loaded["state"] == "unknown"
+
+
+def test_deliver_recorded_rejects_unknown_status_and_malformed_json_as_uncertain(env):
+    target = seed_target(env)
+    mid = str(uuid.uuid4())
+    # Create envelope file in msgs
+    env_file = os.path.join(env["msgs"], mid + ".json")
+    with open(env_file, "w") as f:
+        json.dump({"id": mid, "workspace": target.workspace, "delivery": "inbox"}, f)
+
+    # 1. Unknown status string in JSON
+    env["monkeypatch"].setenv("FAKE_DELIVER_STATUS", "strange-status-xyz")
+    env["monkeypatch"].setenv("FAKE_DELIVER_RC", "0")
+    with pytest.raises(se.SessionUncertain) as exc1:
+        se.deliver_recorded(env["fake"], target, mid)
+    assert "unrecognized status" in str(exc1.value).lower() or "unknown status" in str(exc1.value).lower()
+
+    # 2. Malformed JSON without status field
+    env["monkeypatch"].setenv("FAKE_DELIVER_STATUS", "malformed-no-status")
+    env["monkeypatch"].setenv("FAKE_DELIVER_RC", "0")
+    with pytest.raises(se.SessionUncertain) as exc2:
+        se.deliver_recorded(env["fake"], target, mid)
+    assert "without valid status" in str(exc2.value).lower()
+
+    # 3. Non-JSON output with rc 0
+    env["monkeypatch"].setenv("FAKE_DELIVER_STATUS", "non-json")
+    env["monkeypatch"].setenv("FAKE_DELIVER_RC", "0")
+    with pytest.raises(se.SessionUncertain) as exc3:
+        se.deliver_recorded(env["fake"], target, mid)
+    assert "without valid json" in str(exc3.value).lower()
+
+
+def test_reconcile_uncertain_send_without_positive_log_does_not_retry_deliver(env):
+    target = seed_target(env)
+    cid = str(uuid.uuid4())
+    claim = make_claim(cid)
+
+    # First attempt: deliver returns delivery-uncertain
+    env["monkeypatch"].setenv("FAKE_DELIVER_STATUS", "delivery-uncertain")
+    env["monkeypatch"].setenv("FAKE_DELIVER_RC", "1")
+    cmd = {
+        "op": "send", "command_id": cid, "generation": 1,
+        "target": {"session_id": target.session_id, "tag": target.tag,
+                   "workspace": target.workspace, "created_at_ms": target.created_at_ms,
+                   "engine": target.engine},
+        "body": "do not retry blindly", "await_ack": True,
+    }
+    outcome = se.handle_claimed_command(
+        cmd, claim, custody=custody(), journal_dir=env["journal"],
+        executable=env["fake"], request=None,
+    )
+    assert outcome["state"] == "uncertain"
+    jpath = os.path.join(env["journal"], f"cmd-{cid}.json")
+    jdata = json.load(open(jpath))
+    assert jdata["delivery_state"] == "uncertain"
+
+    # Count deliver invocations via DELIVER_LOG
+    if os.path.isfile(env["deliver_log"]):
+        with open(env["deliver_log"]) as f:
+            delivers_before = len(f.readlines())
+    else:
+        delivers_before = 0
+
+    # Log shows message is in inbox (no positive proof of pane delivery)
+    reconciled = se.reconcile_pending_command(
+        journal_dir=env["journal"], command_id=cid,
+        executable=env["fake"], request=None,
+    )
+    # Must remain None (uncertain), NEVER retrying deliver_recorded blindly
+    assert reconciled is None
+    if os.path.isfile(env["deliver_log"]):
+        with open(env["deliver_log"]) as f:
+            delivers_after = len(f.readlines())
+    else:
+        delivers_after = 0
+    assert delivers_after == delivers_before, "deliver_recorded must NOT be called when delivery was uncertain"
+
+
+def test_target_terminal_matcher_requires_workspace_engine_and_created_at_ms(env):
+    target = seed_target(env)
+    cid = str(uuid.uuid4())
+    claim = make_claim(cid)
+    cmd = {
+        "op": "send", "command_id": cid, "generation": 1,
+        "target": {"session_id": target.session_id, "tag": target.tag,
+                   "workspace": target.workspace, "created_at_ms": target.created_at_ms,
+                   "engine": target.engine},
+        "body": "match test", "await_ack": True,
+    }
+    se.handle_claimed_command(
+        cmd, claim, custody=custody(), journal_dir=env["journal"],
+        executable=env["fake"], request=None,
+    )
+
+    # Mutate catalog session to have different engine and mark it exited
+    with open(env["sessions_file"], "r") as f:
+        rows = json.load(f)
+    for r in rows:
+        if r["id"] == target.session_id:
+            r["phase"] = "exited"
+            r["engine"] = "different-engine"
+    with open(env["sessions_file"], "w") as f:
+        json.dump(rows, f)
+
+    # Reconcile should NOT fail pending delivery because engine does not match
+    reconciled = se.reconcile_pending_command(
+        journal_dir=env["journal"], command_id=cid,
+        executable=env["fake"], request=None,
+    )
+    assert reconciled["state"] == "unknown"  # Not failed as refused
+    jdata = json.load(open(os.path.join(env["journal"], f"cmd-{cid}.json")))
+    assert jdata["state"] == "unknown"  # Not failed
+
+    # Now restore engine and match created_at_ms, workspace, session_id, tag
+    for r in rows:
+        if r["id"] == target.session_id:
+            r["engine"] = target.engine
+            r["created_at_ms"] = target.created_at_ms
+            r["workspace"] = target.workspace
+    with open(env["sessions_file"], "w") as f:
+        json.dump(rows, f)
+
+    # Now it matches all identity attributes and phase is exited -> fails honestly
+    reconciled2 = se.reconcile_pending_command(
+        journal_dir=env["journal"], command_id=cid,
+        executable=env["fake"], request=None,
+    )
+    assert reconciled2 is not None
+    assert reconciled2["state"] == "refused"
+    assert "terminal" in reconciled2["reason"]

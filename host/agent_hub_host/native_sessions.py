@@ -611,24 +611,11 @@ def deliver_recorded(
                 )
             if status_lower in ("delivery-uncertain", "uncertain"):
                 raise SessionUncertain(detail or "Deliver outcome uncertain; reconcile before retry")
-        # Backwards compatibility with fake test harnesses returning {"delivered": mid}
-        if "delivered" in outcome:
-            return DeliveryResult(
-                state="transported",
-                native_id=envelope_id,
-                reason="native deliver guard submitted the envelope; processing NOT proven",
-                evidence={"status": "submitted"},
-            )
+            raise SessionUncertain(detail or f"Native deliver returned unknown status: {status!r}")
+        raise SessionUncertain("Native deliver returned JSON without valid status; outcome uncertain")
 
     if proc.returncode == 0:
-        if outcome is not None:
-            return DeliveryResult(
-                state="transported",
-                native_id=envelope_id,
-                reason="native deliver guard submitted the envelope; processing NOT proven",
-                evidence={},
-            )
-        raise SessionUncertain("Native deliver returned non-JSON output; effect unknown")
+        raise SessionUncertain("Native deliver exited 0 without valid JSON output; outcome uncertain")
 
     lowered = proc.stderr.lower()
     if any(s in lowered for s in ("no session tagged", "not recorded", "no such message",

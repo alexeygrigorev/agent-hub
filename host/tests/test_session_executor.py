@@ -260,7 +260,7 @@ def main():
                 sys.stderr.write("composer busy, input box not empty\n"); sys.exit(1)
             if DELIVER_BEH == "crash":
                 sys.stderr.write("crashed after possible effect\n"); sys.exit(1)
-            print(json.dumps({"delivered": mid}))
+            print(json.dumps({"id": mid, "status": "submitted", "detail": "delivered into target pane"}))
         elif sub == "log":
             ws = opt(args, "--workspace")
             out = []

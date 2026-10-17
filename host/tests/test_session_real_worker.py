@@ -175,7 +175,7 @@ def main():
                     if m.get("workspace") == ws: out.append(m)
             print(json.dumps(out))
         elif sub == "deliver":
-            print(json.dumps({"delivered": "x"}))
+            print(json.dumps({"id": "x", "status": "submitted", "detail": "delivered into target pane"}))
         else: sys.exit(1)
     else: sys.exit(1)
 main()

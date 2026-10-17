@@ -48,6 +48,7 @@ from .native_sessions import (
     SessionControlError,
     SessionUncertain,
     body_digest,
+    canonicalize_workspace,
     capture_output as _capture,
     deliver_recorded,
     list_sessions,
@@ -736,7 +737,14 @@ def _reconcile_unknown_locked(
         target_rows = list_sessions(executable, workspace=target.workspace, include_exited=True)
     except Exception:
         target_rows = []
-    matched_target = [s for s in target_rows if s.session_id.lower() == target.session_id.lower() and s.tag == target.tag]
+    matched_target = [
+        s for s in target_rows
+        if s.session_id.lower() == target.session_id.lower()
+        and s.tag == target.tag
+        and canonicalize_workspace(s.workspace) == canonicalize_workspace(target.workspace)
+        and (target.engine is None or s.engine == target.engine)
+        and (target.created_at_ms is None or s.created_at_ms == target.created_at_ms)
+    ]
     if matched_target and matched_target[0].phase in TERMINAL_PHASES:
         reason = f"Target session is terminal (phase={matched_target[0].phase}); pending delivery failed"
         payload = {
@@ -764,84 +772,91 @@ def _reconcile_unknown_locked(
         _write_journal(journal_file, updated)
         return {"op": prior.get("op"), **updated, "ack": {"submitted": updated["ack_submitted"], "payload": payload}}
 
-    # If message was not yet transported (e.g. was held in inbox because target was not ready),
-    # reconcile exact original log before retry, or attempt deliver_recorded now.
-    if prior.get("delivery_state") in ("recorded", "refused", "uncertain"):
-        log_delivery = reconcile_delivery_from_log(executable, target.workspace, original_id)
-        if log_delivery in ("transported", "pane"):
-            prior["delivery_state"] = "transported"
-            prior["state"] = "unknown"
-            _write_journal(journal_file, prior)
-            recheck_proof = _verify(
-                executable, target, sender_binding, original_id,
-                {"correlation_id": command_id, "body_digest": body_digest})
-            if recheck_proof.state == "acknowledged" and recheck_proof.reply_envelope_id:
-                evidence = recheck_proof.evidence or {}
-                payload = _delivered_ack_payload(
-                    command_id=command_id, generation=int(prior.get("generation", 0)),
-                    target=target,
-                    original_native_message_id=original_id,
-                    reply_envelope_id=str(recheck_proof.reply_envelope_id),
-                    evidence=evidence, reason=recheck_proof.reason)
-                updated = {**prior, "state": "acknowledged",
-                           "delivery_state": "transported",
-                           "reply_envelope_id": str(recheck_proof.reply_envelope_id),
-                           "reason": str(recheck_proof.reason)[:300],
-                           "ack_payload": payload}
-                if request is not None and prior.get("rejected_reply_envelope_id") != recheck_proof.reply_envelope_id:
-                    try:
-                        request("POST", "/api/session-commands/" + command_id + "/ack",
-                                {**payload, "claim_token": prior.get("claim_token")})
-                        updated["ack_submitted"] = True
-                    except Exception:
-                        pass
-                _write_journal(journal_file, updated)
-                return {"op": prior.get("op"), **updated,
-                        "ack": {"submitted": updated.get("ack_submitted", False), "payload": payload, "reconciled": True}}
-            return {"op": prior.get("op"), **prior, "replayed": True}
-        else:
-            try:
-                del_res = deliver_recorded(executable, target, original_id)
-                if del_res.state == "transported":
-                    prior["delivery_state"] = "transported"
-                    prior["state"] = "unknown"
-                    _write_journal(journal_file, prior)
-                    recheck_proof = _verify(
-                        executable, target, sender_binding, original_id,
-                        {"correlation_id": command_id, "body_digest": body_digest})
-                    if recheck_proof.state == "acknowledged" and recheck_proof.reply_envelope_id:
-                        evidence = recheck_proof.evidence or {}
-                        payload = _delivered_ack_payload(
-                            command_id=command_id, generation=int(prior.get("generation", 0)),
-                            target=target,
-                            original_native_message_id=original_id,
-                            reply_envelope_id=str(recheck_proof.reply_envelope_id),
-                            evidence=evidence, reason=recheck_proof.reason)
-                        updated = {**prior, "state": "acknowledged",
-                                   "delivery_state": "transported",
-                                   "reply_envelope_id": str(recheck_proof.reply_envelope_id),
-                                   "reason": str(recheck_proof.reason)[:300],
-                                   "ack_payload": payload}
-                        if request is not None and prior.get("rejected_reply_envelope_id") != recheck_proof.reply_envelope_id:
-                            try:
-                                request("POST", "/api/session-commands/" + command_id + "/ack",
-                                        {**payload, "claim_token": prior.get("claim_token")})
-                                updated["ack_submitted"] = True
-                            except Exception:
-                                pass
-                        _write_journal(journal_file, updated)
-                        return {"op": prior.get("op"), **updated,
-                                "ack": {"submitted": updated.get("ack_submitted", False), "payload": payload, "reconciled": True}}
-                    return {"op": prior.get("op"), **prior, "replayed": True}
-                elif del_res.state == "refused":
-                    prior["reason"] = del_res.reason[:300]
-                    _write_journal(journal_file, prior)
-            except SessionUncertain as exc:
-                prior["delivery_state"] = "uncertain"
-                prior["reason"] = str(exc)[:300]
+    # Reconcile exact original envelope from native message log
+    log_delivery = reconcile_delivery_from_log(executable, target.workspace, original_id)
+    if log_delivery in ("transported", "pane"):
+        prior["delivery_state"] = "transported"
+        prior["state"] = "unknown"
+        _write_journal(journal_file, prior)
+        recheck_proof = _verify(
+            executable, target, sender_binding, original_id,
+            {"correlation_id": command_id, "body_digest": body_digest})
+        if recheck_proof.state == "acknowledged" and recheck_proof.reply_envelope_id:
+            evidence = recheck_proof.evidence or {}
+            payload = _delivered_ack_payload(
+                command_id=command_id, generation=int(prior.get("generation", 0)),
+                target=target,
+                original_native_message_id=original_id,
+                reply_envelope_id=str(recheck_proof.reply_envelope_id),
+                evidence=evidence, reason=recheck_proof.reason)
+            updated = {**prior, "state": "acknowledged",
+                       "delivery_state": "transported",
+                       "reply_envelope_id": str(recheck_proof.reply_envelope_id),
+                       "reason": str(recheck_proof.reason)[:300],
+                       "ack_payload": payload}
+            if request is not None and prior.get("rejected_reply_envelope_id") != recheck_proof.reply_envelope_id:
+                try:
+                    request("POST", "/api/session-commands/" + command_id + "/ack",
+                            {**payload, "claim_token": prior.get("claim_token")})
+                    updated["ack_submitted"] = True
+                except Exception:
+                    pass
+            _write_journal(journal_file, updated)
+            return {"op": prior.get("op"), **updated,
+                    "ack": {"submitted": updated.get("ack_submitted", False), "payload": payload, "reconciled": True}}
+        return {"op": prior.get("op"), **prior, "replayed": True}
+
+    # If prior delivery was uncertain: missing/unchanged inbox or unavailable log is NOT proof
+    # an uncertain PTY effect never happened. Keep uncertain until positive native submission
+    # or reply evidence; NEVER retry deliver blindly.
+    if prior.get("delivery_state") == "uncertain":
+        return None
+
+    # For recorded or refused messages where message is confirmed in inbox (log_delivery == "recorded"),
+    # we may safely attempt deliver_recorded now.
+    if prior.get("delivery_state") in ("recorded", "refused") and log_delivery == "recorded":
+        try:
+            del_res = deliver_recorded(executable, target, original_id)
+            if del_res.state == "transported":
+                prior["delivery_state"] = "transported"
+                prior["state"] = "unknown"
                 _write_journal(journal_file, prior)
-            except SessionControlError:
-                pass
+                recheck_proof = _verify(
+                    executable, target, sender_binding, original_id,
+                    {"correlation_id": command_id, "body_digest": body_digest})
+                if recheck_proof.state == "acknowledged" and recheck_proof.reply_envelope_id:
+                    evidence = recheck_proof.evidence or {}
+                    payload = _delivered_ack_payload(
+                        command_id=command_id, generation=int(prior.get("generation", 0)),
+                        target=target,
+                        original_native_message_id=original_id,
+                        reply_envelope_id=str(recheck_proof.reply_envelope_id),
+                        evidence=evidence, reason=recheck_proof.reason)
+                    updated = {**prior, "state": "acknowledged",
+                               "delivery_state": "transported",
+                               "reply_envelope_id": str(recheck_proof.reply_envelope_id),
+                               "reason": str(recheck_proof.reason)[:300],
+                               "ack_payload": payload}
+                    if request is not None and prior.get("rejected_reply_envelope_id") != recheck_proof.reply_envelope_id:
+                        try:
+                            request("POST", "/api/session-commands/" + command_id + "/ack",
+                                    {**payload, "claim_token": prior.get("claim_token")})
+                            updated["ack_submitted"] = True
+                        except Exception:
+                            pass
+                    _write_journal(journal_file, updated)
+                    return {"op": prior.get("op"), **updated,
+                            "ack": {"submitted": updated.get("ack_submitted", False), "payload": payload, "reconciled": True}}
+                return {"op": prior.get("op"), **prior, "replayed": True}
+            elif del_res.state == "refused":
+                prior["reason"] = del_res.reason[:300]
+                _write_journal(journal_file, prior)
+        except SessionUncertain as exc:
+            prior["delivery_state"] = "uncertain"
+            prior["reason"] = str(exc)[:300]
+            _write_journal(journal_file, prior)
+        except SessionControlError:
+            pass
 
     return None
 
