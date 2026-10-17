@@ -16,7 +16,8 @@ try:
  x=call('sessions','start','--machine',a.machine,'--workspace',a.workspace,'--engine',a.engine,'--interactive','--key',key,'--wait','--timeout',str(a.timeout),'--interval','1')
  session=x['id'];assert x['binding_wait']['state']=='running'
  print(json.dumps({'step':'start','session_id':session,'state':'running'}),flush=True)
- with tempfile.TemporaryDirectory(prefix='hub-smoke-') as directory:
+ scratch=hub.parent.parent/'.local'/'tmp';scratch.mkdir(parents=True,exist_ok=True,mode=0o700)
+ with tempfile.TemporaryDirectory(prefix='hub-smoke-',dir=scratch) as directory:
   body=pathlib.Path(directory)/'message.txt'
   body.write_text('Hub acceptance nonce '+key+'. Reply to this native envelope echoing correlation_id and body_digest from data.hub_session_control exactly. Print HUB_NONCE_PROCESSED '+key+'.')
   x=call('sessions','send',session,'--body-file',str(body),'--key',key+'-send','--wait','--timeout',str(a.timeout),'--interval','1')
