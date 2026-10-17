@@ -501,6 +501,20 @@ export class MonitoringService {
       .exec('SELECT * FROM disk_episodes WHERE episode_key = ?', episodeKey)
       .toArray()[0];
 
+    // Alias mounts remain visible as measurements, but share the primary
+    // filesystem's pressure episode. Retire legacy duplicates honestly.
+    if (!fs.is_primary && fs.primary_mount) {
+      if (row && row.resolved_at === null) {
+        const detail = `Duplicate mount ${fs.mount_point} shares filesystem pressure with ${fs.primary_mount}; usage remains ${fs.percent}% (${fs.status}). Track the primary mount; this is not a space recovery.`;
+        this.liveness?.setAlert('disk', `${machineId}:${fs.mount_point}`, null);
+        if (row.intake_task_id) this.resolveIntakeTask(row.intake_task_id, machineId, fs, now, detail);
+        this.sql.exec('UPDATE disk_episodes SET resolved_at = ?, last_updated_at = ?, details_json = ? WHERE episode_key = ?',
+          nowIso, nowIso, JSON.stringify({ resolution: 'mount_alias_deduplicated', primary_mount: fs.primary_mount, percent: fs.percent, status: fs.status }), episodeKey);
+        return { episode_key: episodeKey, action: 'alias_deduplicated', state: fs.status };
+      }
+      return null;
+    }
+
     const isProblem = fs.status === 'warn' || fs.status === 'critical';
 
     if (isProblem) {
@@ -756,15 +770,15 @@ export class MonitoringService {
   }
 
   /** Mark an intake task as resolved on recovery. */
-  private resolveIntakeTask(taskId: string, machineId: string, fs: DiskFilesystem, now: number): void {
+  private resolveIntakeTask(taskId: string, machineId: string, fs: DiskFilesystem, now: number, resolutionDetail?: string): void {
     if (this.intake) {
       this.intake.serviceRecordEvent(taskId, {
         status: 'done',
-        currentState: `Recovered: ${fs.mount_point} is at ${fs.percent}% (< 85%)`,
+        currentState: resolutionDetail ?? `Recovered: ${fs.mount_point} is at ${fs.percent}% (< 85%)`,
         nextStep: null,
         event: {
           kind: 'resolution',
-          text: `Recovered: ${fs.mount_point} space pressure resolved, now at ${fs.percent}% usage.`,
+          text: resolutionDetail ?? `Recovered: ${fs.mount_point} space pressure resolved, now at ${fs.percent}% usage.`,
           actor: 'hub:service:disk-monitor',
           sourceRef: `disk_monitor:${machineId}:${fs.mount_point}`,
           authority: 'operator_record',
@@ -781,7 +795,7 @@ export class MonitoringService {
       task.status = 'done';
       task.version = (task.version || 1) + 1;
       task.updated_at = now;
-      task.current_state = `Recovered: ${fs.mount_point} is at ${fs.percent}% (< 85%)`;
+      task.current_state = resolutionDetail ?? `Recovered: ${fs.mount_point} is at ${fs.percent}% (< 85%)`;
       task.next_step = null;
       task.history = task.history || [];
       if (task.history.length >= 128) {
@@ -798,7 +812,7 @@ export class MonitoringService {
         kind: 'resolution',
         actor: 'hub:service:disk-monitor',
         captured_at: now,
-        text: `Recovered: ${fs.mount_point} space pressure resolved, now at ${fs.percent}% usage.`,
+        text: resolutionDetail ?? `Recovered: ${fs.mount_point} space pressure resolved, now at ${fs.percent}% usage.`,
         authority: 'operator_record',
       });
       this.sql.exec('UPDATE intake_tasks SET data = ? WHERE id = ?', JSON.stringify(task), taskId);
@@ -1208,7 +1222,7 @@ export class MonitoringService {
           top_consumers_truncated: fs.top_consumers_truncated ?? false,
         });
 
-        if (fs.status === 'warn' || fs.status === 'critical') {
+        if ((fs.status === 'warn' || fs.status === 'critical') && (fs.is_primary || !fs.primary_mount)) {
           needsAttention.push({
             severity: fs.status,
             subject: `${m.machine_id}:${fs.mount_point}`,

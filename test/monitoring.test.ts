@@ -165,6 +165,39 @@ describe('Disk Monitoring Service', () => {
     expect(tasks.length).toBe(2);
   }));
 
+  it('deduplicates alias pressure and retires legacy duplicate tasks without claiming recovery', () => fixture(async (hub, clock) => {
+    enrollHost(hub.sql, 'host-a');
+    const auth = { kind: 'host' as const, machine_id: 'host-a', tokenId: 'cred-host-a' };
+    const sample = (alias: boolean) => new Request('https://hub.internal/api/monitoring/disk', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ machine_id: 'host-a', observed_at: new Date(clock.t).toISOString(), filesystems: [
+        { mount_point: '/data', device_id: 'same-disk', is_primary: true, total_bytes: 1000, used_bytes: 934, free_bytes: 66, percent: 93.4, status: 'warn' },
+        { mount_point: '/tmp', device_id: 'same-disk', is_primary: !alias, primary_mount: alias ? '/data' : null, total_bytes: 1000, used_bytes: 934, free_bytes: 66, percent: 93.4, status: 'warn' },
+      ] }),
+    });
+    expect((await hub.monitoringService.handleObservation(sample(false), auth)).status).toBe(200);
+    const oldAlias: any = hub.sql.exec("SELECT * FROM disk_episodes WHERE mount_point='/tmp'").toArray()[0];
+    expect(oldAlias.intake_task_id).toBeTruthy();
+    clock.t += 60000;
+    expect((await hub.monitoringService.handleObservation(sample(true), auth)).status).toBe(200);
+    const active = hub.sql.exec('SELECT * FROM disk_episodes WHERE resolved_at IS NULL').toArray() as any[];
+    expect(active.map(x => x.mount_point)).toEqual(['/data']);
+    const aliasTask: any = hub.sql.exec('SELECT data FROM intake_tasks WHERE id=?', oldAlias.intake_task_id).toArray()[0];
+    const task = JSON.parse(aliasTask.data);
+    expect(task.status).toBe('done');
+    expect(task.current_state).toContain('usage remains 93.4% (warn)');
+    expect(task.current_state).toContain('not a space recovery');
+    const summary = hub.monitoringService.getStatusSummary(clock.t);
+    expect(summary.filesystems).toHaveLength(2);
+    expect(summary.needs_attention.map((x: any) => x.subject)).toEqual(['host-a:/data']);
+    const version = task.version;
+    clock.t += 60000;
+    expect((await hub.monitoringService.handleObservation(sample(true), auth)).status).toBe(200);
+    const repeated: any = hub.sql.exec('SELECT data FROM intake_tasks WHERE id=?', oldAlias.intake_task_id).toArray()[0];
+    expect(JSON.parse(repeated.data).version).toBe(version);
+    expect(hub.sql.exec('SELECT id FROM intake_tasks').toArray()).toHaveLength(2);
+  }));
+
   it('deduplicates episodes and recovers without creating task floods', () => fixture(async (hub, clock) => {
     enrollHost(hub.sql, 'host-a');
     const auth = { kind: 'host' as const, machine_id: 'host-a', tokenId: 'cred-host-a' };
