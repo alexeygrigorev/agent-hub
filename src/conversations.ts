@@ -296,6 +296,7 @@ export interface ConversationRetentionResult {
   messagesDeleted: number;
   removedMembersDeleted: number;
   membersDeleted: number;
+  automationRowsDeleted: number;
   rowsDeleted: number;
   hasMore: boolean;
 }
@@ -963,6 +964,7 @@ export class ConversationsService {
   }
 
   public hasExpiredRows(nowMs: number = this.now()): boolean {
+    if (this.automationRetirementCandidates(nowMs, 1).some(rows => rows.length)) return true;
     const archivedCutoffIso = new Date(
       nowMs - this.limits.archivedConversationRetentionMs,
     ).toISOString();
@@ -1020,6 +1022,29 @@ export class ConversationsService {
     );
   }
 
+  /** Hard table caps bound the indexed anti-joins, including an R2 database.
+   * A receipt is pinned by an unresolved slot even if its grant/parent is gone.
+   * Standalone service use does not require a configured scheduler table. */
+  private automationRetirementCandidates(nowMs: number, limit: number): any[][] {
+    const hasChecks = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_checks'").toArray().length > 0;
+    const orphan = hasChecks ? 'NOT EXISTS (SELECT 1 FROM hub_checks c WHERE c.name=s.name)' : '0';
+    const invalidGrant = `NOT EXISTS (SELECT 1 FROM conversation_automation_grants g
+      JOIN conversations c ON c.id=g.conversation_id AND c.archived_at IS NULL
+      WHERE g.id=json_extract(s.check_json, '$.action.grant_id') AND g.revoked_at IS NULL AND g.expires_at>?)`;
+    const slots = this.sql.exec(`SELECT s.*, ${orphan} AS orphan FROM hub_check_slots s
+      WHERE (${orphan}) OR (s.state!='done' AND json_extract(s.check_json, '$.action.conversation_id') IS NOT NULL AND ${invalidGrant})
+      ORDER BY s.name LIMIT ?`, nowMs, limit).toArray();
+    const receipts = this.sql.exec(`SELECT r.effect_key FROM conversation_automation_receipts r
+      WHERE NOT EXISTS (SELECT 1 FROM hub_check_slots s WHERE ('check-' || s.slot_key)=r.effect_key AND s.state!='done')
+      ORDER BY r.effect_key LIMIT ?`, limit).toArray();
+    const grants = this.sql.exec(`SELECT g.id FROM conversation_automation_grants g
+      WHERE (g.expires_at<=? OR g.revoked_at IS NOT NULL OR NOT EXISTS
+        (SELECT 1 FROM conversations c WHERE c.id=g.conversation_id AND c.archived_at IS NULL))
+      AND NOT EXISTS (SELECT 1 FROM hub_check_slots s WHERE json_extract(s.check_json, '$.action.grant_id')=g.id AND s.state!='done')
+      ORDER BY g.id LIMIT ?`, nowMs, limit).toArray();
+    return [slots, receipts, grants];
+  }
+
   /**
    * Bounded batched retention cleanup for Free-plan storage discipline.
    * Enforces a global affected-row budget (`batchLimit`) across child messages,
@@ -1039,6 +1064,7 @@ export class ConversationsService {
       let messagesDeleted = 0;
       let removedMembersDeleted = 0;
       let membersDeleted = 0;
+      let automationRowsDeleted = 0;
       const previewRefreshIds = new Set<string>();
 
       const archivedCutoffIso = new Date(
@@ -1286,10 +1312,43 @@ export class ConversationsService {
         return remainingBefore - remaining;
       };
 
+      const retireAutomation = (category: number, budget: number): number => {
+        const before = remaining;
+        const candidates = this.automationRetirementCandidates(nowMs, Math.min(remaining, budget))[category];
+        for (const row of candidates) {
+          if (category === 0) {
+            const receipt = this.sql.exec('SELECT * FROM conversation_automation_receipts WHERE effect_key=?', 'check-' + row.slot_key).toArray()[0];
+            // An inconsistent receipt is uncertainty, never permission to discard it.
+            if (receipt && receipt.request_json !== row.intent_json) continue;
+            const grantId = JSON.parse(row.check_json).action?.grant_id;
+            if (row.orphan && grantId) this.sql.exec('UPDATE conversation_automation_grants SET revoked_at=? WHERE id=?', nowMs, grantId);
+            const result = receipt && row.result_json ? JSON.parse(row.result_json) : { status: 'error', detail: 'automation slot cancelled; no accepted Hub effect' };
+            const action = receipt ? `conversation_message ${receipt.message_id} (Hub stored; native delivery unconfirmed)` : 'automation authority retired; no accepted Hub effect';
+            // Closing the slot and recovering its receipt share this transaction.
+            // This also fences an evaluator/send that was paused before cleanup.
+            this.sql.exec("UPDATE hub_check_slots SET state='done', token=NULL, lease_until=0, result_json=?, action=? WHERE name=?", JSON.stringify(result), action, row.name);
+            if (row.orphan) {
+              this.sql.exec('DELETE FROM hub_check_slots WHERE name=?', row.name);
+              remaining--; automationRowsDeleted++;
+            } else {
+              this.sql.exec('UPDATE hub_checks SET last_status=?, last_detail=? WHERE name=?', result.status, result.detail.slice(0, 1000), row.name);
+            }
+          } else {
+            this.sql.exec(category === 1 ? 'DELETE FROM conversation_automation_receipts WHERE effect_key=?' : 'DELETE FROM conversation_automation_grants WHERE id=?', category === 1 ? row.effect_key : row.id);
+            remaining--; automationRowsDeleted++;
+          }
+        }
+        return before - remaining;
+      };
+
       runFairRetentionPass(
         this.sql,
         'conv',
         [
+          ...[0, 1, 2].map(category => ({
+            hasWork: () => this.automationRetirementCandidates(nowMs, 1)[category].length > 0,
+            spend: (budget: number) => retireAutomation(category, budget),
+          })),
           {
             hasWork: () =>
               this.sql
@@ -1329,7 +1388,7 @@ export class ConversationsService {
       }
 
       const rowsDeleted =
-        conversationsDeleted + messagesDeleted + membersDeleted;
+        conversationsDeleted + messagesDeleted + membersDeleted + automationRowsDeleted;
       const hasMore = this.hasExpiredRows(nowMs);
 
       return {
@@ -1337,6 +1396,7 @@ export class ConversationsService {
         messagesDeleted,
         removedMembersDeleted,
         membersDeleted,
+        automationRowsDeleted,
         rowsDeleted,
         hasMore,
       };
@@ -2815,6 +2875,14 @@ export class ConversationsService {
       if (receipt) {
         if (receipt.request_json !== request) throw new ConversationDomainError('idempotency_conflict', 409);
         return String(receipt.message_id);
+      }
+      // Receipt retirement is safe because absence never authorizes a write.
+      // Only the scheduler's exact current frozen intent can create an effect.
+      // Retired keys cannot become current again: new slots use random generations.
+      if (!this.sql.exec(`SELECT 1 FROM hub_check_slots
+        WHERE name = ? AND ('check-' || slot_key) = ? AND intent_json = ? AND state != 'done'`,
+        intent.checkName, intent.idempotencyKey, request).toArray().length) {
+        throw new ConversationDomainError('automation_slot_retired', 409);
       }
       if (Number(this.sql.exec('SELECT COUNT(*) AS n FROM conversation_automation_receipts').toArray()[0].n) >= 4096) throw new ConversationDomainError('automation_capacity', 409);
       const message = this.writeMessage({ conversationId: intent.conversationId, body: intent.body, idempotencyKey: intent.idempotencyKey, kind: 'note' }, () => {

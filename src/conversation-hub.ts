@@ -58,6 +58,7 @@ export class Hub extends BaseHub {
         messagesDeleted: 0,
         removedMembersDeleted: 0,
         membersDeleted: 0,
+        automationRowsDeleted: 0,
         rowsDeleted: 0,
         hasMore: false,
       };
@@ -107,6 +108,7 @@ export class Hub extends BaseHub {
             removedMembersDeleted:
               convCleanup.removedMembersDeleted + step.removedMembersDeleted,
             membersDeleted: convCleanup.membersDeleted + step.membersDeleted,
+            automationRowsDeleted: convCleanup.automationRowsDeleted + step.automationRowsDeleted,
             rowsDeleted: convCleanup.rowsDeleted + step.rowsDeleted,
             hasMore: step.hasMore,
           };
@@ -137,6 +139,7 @@ export class Hub extends BaseHub {
           removedMembersDeleted: convCleanup.removedMembersDeleted,
           conversationMembersDeleted: convCleanup.membersDeleted,
           conversationRowsDeleted: convCleanup.rowsDeleted,
+          automationRowsDeleted: convCleanup.automationRowsDeleted,
           hasMore:
             this.busService.hasExpiredRows(now) ||
             this.conversationsService.hasExpiredRows(now),

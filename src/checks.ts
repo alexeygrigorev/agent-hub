@@ -5,16 +5,16 @@
  * the normal fleet placement path. Checks are configuration, never shell commands.
  */
 import type { ConversationCheckPort, FollowUpIntent } from './conversation-automation';
+import { CHECK_SLOT_SCHEMA } from './conversation-automation';
 import { registryAddress } from './agent_registry';
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { LivenessService } from './liveness';
 
 export const CHECKS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS hub_checks (name TEXT PRIMARY KEY, kind TEXT NOT NULL, interval_s INTEGER NOT NULL, params_json TEXT NOT NULL, action_json TEXT NOT NULL, enabled INTEGER NOT NULL, next_due_at TEXT NOT NULL, last_run_at TEXT, last_status TEXT, last_detail TEXT);
-CREATE TABLE IF NOT EXISTS hub_check_slots (name TEXT PRIMARY KEY, slot_key TEXT NOT NULL, next_at INTEGER NOT NULL, check_json TEXT NOT NULL, result_json TEXT, intent_json TEXT, action TEXT, state TEXT NOT NULL, token TEXT, lease_until INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS hub_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS hub_check_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, at TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, action TEXT);
-`;
+` + CHECK_SLOT_SCHEMA;
 
 export const CHECK_KINDS = ['liveness', 'quota', 'http', 'inbox_backlog', 'conversation_backlog', 'routine'] as const;
 // 40 characters keeps check-<name>-<slot> within the 64-character fleet idempotency key.
@@ -140,7 +140,7 @@ export class ChecksService {
         const check = { ...row, params: JSON.parse(row.params_json), action: JSON.parse(row.action_json) };
         this.sql.exec(`INSERT INTO hub_check_slots VALUES (?, ?, ?, ?, NULL, NULL, NULL, 'evaluating', ?, ?)
           ON CONFLICT(name) DO UPDATE SET slot_key=excluded.slot_key, next_at=excluded.next_at, check_json=excluded.check_json, result_json=NULL, intent_json=NULL, action=NULL, state='evaluating', token=excluded.token, lease_until=excluded.lease_until`,
-          name, `${name}-${check.action.conversation_id ? now : n}`, nextAt, JSON.stringify(check), token, now + 30000);
+          name, `${name}-${check.action.conversation_id ? crypto.randomUUID() : n}`, nextAt, JSON.stringify(check), token, now + 30000);
         this.sql.exec('UPDATE hub_checks SET next_due_at = ?, last_run_at = ? WHERE name = ?', new Date(nextAt).toISOString(), at, name);
       } else {
         this.sql.exec('UPDATE hub_check_slots SET token = ?, lease_until = ? WHERE name = ? AND (token IS NULL OR lease_until <= ?)', token, now + 30000, name, now);
