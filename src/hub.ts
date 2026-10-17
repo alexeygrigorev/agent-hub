@@ -17,6 +17,7 @@ import { LivenessService, thresholdsFrom, alertText } from './liveness';
 import { ChecksService, validateCheck, type ActionDeps } from './checks';
 import { ensureRootScheduling, getRootScheduling, isRootSchedulingEnabled, setRootScheduling } from './root_scheduling';
 import { QuotaStore, handleQuotaRoutes } from './quota';
+import { SessionControlService } from './session_control';
 
 function parseEpoch(raw: any): number | null {
   if (raw === undefined || raw === null || raw === '' || typeof raw === 'boolean') return null;
@@ -79,6 +80,7 @@ export class Hub extends DurableObject {
   public jobsService: JobsService;
   public quotaStore: QuotaStore;
   public fleetService: FleetService;
+  public sessionControlService: SessionControlService;
   public livenessService: LivenessService;
   public checksService: ChecksService;
 
@@ -94,6 +96,13 @@ export class Hub extends DurableObject {
     this.busService = new BusService(this.sql, txSync);
     this.fleetService = new FleetService(this.sql, fn => this.ctx.storage.transactionSync(fn));
     this.fleetService.init();
+    // M12e session control (narrow seam, owned by platform-session-api-r2):
+    // durable start/send/capture/stop intents over the existing fleet reserve.
+    // Placement stays with FleetService; no second dispatcher or consumer here.
+    this.sessionControlService = new SessionControlService(this.sql, fn => this.ctx.storage.transactionSync(fn), Date.now, {
+      reserve: (input, auth) => this.fleetService.reserve(input, auth),
+    });
+    this.sessionControlService.init();
     this.livenessService = new LivenessService(this.sql, thresholdsFrom(env));
     this.livenessService.init();
     this.checksService = new ChecksService(this.sql);
@@ -400,6 +409,14 @@ export class Hub extends DurableObject {
           if (session) auth.caller.actor = 'human:' + session.sub;
         }
         return this.fleetService.handle(request, auth);
+      }
+      // M12e session control (narrow seam, owned by platform-session-api-r2).
+      // Auth mirrors the intake mount exactly: bus credentials first, narrow
+      // operator-token fallback for the public CLI, cookie sessions on the
+      // existing session/CSRF path. No agent scope changes.
+      if (path === '/api/sessions' || path.startsWith('/api/sessions/') ||
+          path === '/api/session-commands' || path.startsWith('/api/session-commands/')) {
+        return this.sessionControlService.handle(request, await this.sessionControlAuth(request));
       }
       const registryResponse = await handleRegistryRoutes(request, path, this.sql, this.ctx, this.env);
       if (registryResponse) return registryResponse;
@@ -1248,6 +1265,39 @@ export class Hub extends DurableObject {
         await this.ctx.storage.setAlarm(Math.max(Date.now(), nextAlarm));
       } catch {}
     }
+  }
+
+  /** M12e session control auth (narrow seam, owned by platform-session-api-r2):
+   * identical to the intake mount: mixed-authority refusal, bus credentials,
+   * narrow operator-token fallback, cookie session actor fix. */
+  private async sessionControlAuth(request: Request) {
+    if (request.headers.has('Authorization') && request.headers.has('Cookie')) return { error: Response.json({ error: 'mixed_authority' }, { status: 403 }) };
+    const auth = await this.authenticateBusRequest(request);
+    // The existing operator token can administer sessions through the public CLI.
+    // Cookie requests stay on the existing session/CSRF path; no agent scope changes.
+    if (auth.error && !request.headers.has('Cookie') && validSessionSecret(this.env)) {
+      const header = request.headers.get('Authorization') || '';
+      const token = /^Bearer ([^\s]{1,4096})$/.exec(header)?.[1];
+      if (token) {
+        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token));
+        const given = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+        // A failed registered credential never upgrades to operator authority.
+        if (this.sql.exec('SELECT id FROM credentials WHERE token_hash=?', base64url(digest)).toArray().length) return auth;
+        const configured = adminTokenHash(this.env);
+        if (configured) {
+          let difference = 0;
+          for (let i = 0; i < configured.length; i++) difference |= given.charCodeAt(i) ^ configured.charCodeAt(i);
+          if (difference === 0) return { caller: { kind: 'human' as const, isAdmin: true,
+            actor: 'human:' + tokenAdminSubject(configured) }, scopes: ['admin'] };
+        }
+      }
+    }
+    if (auth.caller?.kind === 'human' && !auth.caller.tokenId) {
+      const session = await getSession(this.env, request);
+      if (!session) return { error: Response.json({ error: 'unauthorized' }, { status: 401 }) };
+      auth.caller.actor = 'human:' + session.sub;
+    }
+    return auth;
   }
 
   private async authenticateBusRequest(request: Request): Promise<{ caller?: CallerContext; scopes?: string[]; error?: Response }> {

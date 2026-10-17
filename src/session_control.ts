@@ -1,11 +1,23 @@
 /** Hub session orchestration (M12e): durable start/send/capture/stop intents over existing fleet placement.
  *
  * Placement itself is never reimplemented here: starts delegate to the existing
- * fleet reserve through an injected hook (wired in src/hub.ts after owner ACK).
- * Without that hook the start route holds honestly instead of launching.
- * Native execution belongs to the sibling host worker; this module only tracks
- * recorded / transported / acked / refused / uncertain command states with
- * correlation + generation binding. See docs/SESSION-CONTROL.md (proposal).
+ * fleet reserve through an injected hook (the Hub wires the real
+ * `FleetService.reserve`; tests inject a synthetic hook). Without that hook the
+ * start route holds honestly instead of launching. Native execution belongs to
+ * the sibling host worker; this module only tracks durable command custody:
+ *
+ *   recorded -> transported (host poll fetch receipt; NOT execution permission)
+ *     -> claimed (atomic per-command execution fence, BEFORE any native effect)
+ *     -> acked | transported | refused | uncertain
+ *
+ * Concurrent host processes and poll retries cannot execute the same command
+ * twice: only the claim holder (machine + claim token, unexpired) may ack, an
+ * expired or lost-effect attempt becomes `uncertain` (never blindly reissued),
+ * and a transport mark alone never authorizes an effect. SEND delivery
+ * (`acked`) additionally requires a correlated receiver proof validated by
+ * `validateSendProof` — host assertion, PTY bytes, or inbox persistence alone
+ * are reported as `recorded` / `transported` / `uncertain`, never as processed.
+ * See docs/SESSION-CONTROL.md.
  */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { redact } from './routing';
@@ -18,15 +30,18 @@ CREATE TABLE IF NOT EXISTS session_control_commands (id TEXT PRIMARY KEY, sessio
 type Caller = { kind?: string; actor?: string; isAdmin?: boolean; machineId?: string; tokenId?: string };
 type Auth = { caller?: Caller; scopes?: string[]; error?: Response };
 type ReserveHook = (input: any, auth: Auth) => { value: any; status: number };
+export type SessionControlOptions = { maxPendingCommands?: number; maxSessionCommands?: number; claimTtlMs?: number };
 
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
-const UUID = /^[a-f0-9-]{36}$/;
-const TIERS = new Set(['quick', 'daily', 'deep']);
+const UUID_RE = /^[a-f0-9-]{36}$/;
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const COMMANDS = new Set(['send', 'capture', 'stop']);
-const ACK_OUTCOMES = new Set(['delivered', 'refused', 'uncertain']);
+const ACK_OUTCOMES = new Set(['delivered', 'transported', 'refused', 'uncertain']);
 const HEADERS = { 'Cache-Control': 'private, no-store' };
 const BOUND_STATES = new Set(['running']);
 const STOPPABLE = new Set(['offered', 'starting', 'running', 'uncertain']);
+const BINDABLE = new Set(['offered', 'starting', 'uncertain', 'running']);
+const CLAIMABLE = new Set(['recorded', 'transported']);
 
 const label = (x: unknown): x is string => typeof x === 'string' && LABEL.test(x);
 const response = (value: unknown, status = 200) => Response.json(value, { status, headers: HEADERS });
@@ -37,6 +52,12 @@ function cwdOk(value: unknown): value is string {
   if (typeof value !== 'string' || !value || value.length > 256) return false;
   if (value.startsWith('/') || value.includes('\\') || value.includes(':') || /[\x00-\x1f\x7f]/.test(value)) return false;
   return value.split('/').every(seg => seg.length > 0 && seg !== '.' && seg !== '..' && /^[A-Za-z0-9._-]{1,64}$/.test(seg));
+}
+
+function absoluteWorkspaceOk(value: unknown): value is string {
+  if (typeof value !== 'string' || !value || value.length > 512) return false;
+  if (!value.startsWith('/') || value.includes('\\') || /[\x00-\x1f\x7f]/.test(value)) return false;
+  return value.split('/').every(seg => seg !== '..');
 }
 
 async function body(request: Request): Promise<any> {
@@ -59,21 +80,130 @@ async function body(request: Request): Promise<any> {
   } catch { return null; } finally { reader.releaseLock(); }
 }
 
+/** Exact correlated receiver proof required before a SEND may be marked delivered.
+ *
+ * The target must echo the hub-issued correlation in a native reply/log
+ * envelope that names the exact native sender triple (UUID + tag + workspace)
+ * and the hub binding generation observed before the effect. Anything else —
+ * host assertion, PTY bytes, inbox persistence, unrelated terminal activity —
+ * must be reported as recorded / transported / uncertain instead.
+ */
+export type SendProof = {
+  reply_to: string;
+  sender_native_id: string;
+  sender_tag: string;
+  sender_workspace: string;
+  sender_generation: number;
+  envelope_id: string;
+};
+
+export type SendProofExpectation = {
+  correlation: string;
+  native_id: string;
+  tag: string;
+  workspace: string;
+  generation: number;
+};
+
+export function validateSendProof(proof: any, expected: SendProofExpectation): { ok: true } | { ok: false; error: string } {
+  const fail = (error: string) => ({ ok: false as const, error });
+  if (!proof || typeof proof !== 'object' || Array.isArray(proof)) return fail('proof_required');
+  const keys = ['reply_to', 'sender_native_id', 'sender_tag', 'sender_workspace', 'sender_generation', 'envelope_id'];
+  if (!obj(proof, keys)) return fail('invalid_proof_shape');
+  if (typeof proof.reply_to !== 'string' || typeof proof.envelope_id !== 'string' || !proof.envelope_id) return fail('invalid_proof_shape');
+  // A proof that does not echo this command's correlation is foreign or replayed.
+  if (proof.reply_to !== expected.correlation) return fail('correlation_replay');
+  if (typeof proof.sender_native_id !== 'string' || !UUID_V4.test(proof.sender_native_id) ||
+      typeof proof.sender_tag !== 'string' || !proof.sender_tag ||
+      typeof proof.sender_workspace !== 'string' || !proof.sender_workspace ||
+      !Number.isInteger(proof.sender_generation)) return fail('invalid_proof_shape');
+  if (proof.sender_native_id !== expected.native_id || proof.sender_tag !== expected.tag ||
+      proof.sender_workspace !== expected.workspace) return fail('proof_sender_mismatch');
+  if (proof.sender_generation !== expected.generation) return fail('proof_generation_stale');
+  return { ok: true };
+}
+
 export class SessionControlService {
+  private maxPending: number;
+  private maxPerSession: number;
+  private claimTtlMs: number;
   constructor(
     private sql: SqlStorage,
     private transaction: <T>(fn: () => T) => T,
     private now: () => number = Date.now,
     private hooks: { reserve?: ReserveHook } = {},
-  ) {}
+    options: SessionControlOptions = {},
+  ) {
+    this.maxPending = options.maxPendingCommands ?? 2000;
+    this.maxPerSession = options.maxSessionCommands ?? 200;
+    this.claimTtlMs = options.claimTtlMs ?? 300000;
+  }
 
   init() {
     for (const stmt of SESSION_CONTROL_SCHEMA.split(';')) {
       if (stmt.trim()) this.sql.exec(stmt);
     }
+    // Additive migration for tables created by the earlier reserve-only draft.
+    const sessionCols = new Set(this.sql.exec('PRAGMA table_info(session_control_sessions)').toArray().map((c: any) => String(c.name)));
+    for (const [col, type] of [['owner_token_id', 'TEXT'], ['owner_family', 'TEXT'], ['host_family', 'TEXT']] as const) {
+      if (!sessionCols.has(col)) this.sql.exec(`ALTER TABLE session_control_sessions ADD COLUMN ${col} ${type}`);
+    }
+    const commandCols = new Set(this.sql.exec('PRAGMA table_info(session_control_commands)').toArray().map((c: any) => String(c.name)));
+    for (const [col, type] of [['owner_token_id', 'TEXT'], ['owner_family', 'TEXT'], ['holder_machine', 'TEXT'], ['claim_token', 'TEXT'], ['claim_expires_at', 'TEXT'], ['attempts', 'INTEGER DEFAULT 0']] as const) {
+      if (!commandCols.has(col)) this.sql.exec(`ALTER TABLE session_control_commands ADD COLUMN ${col} ${type}`);
+    }
   }
 
   private at() { return new Date(this.now()).toISOString(); }
+
+  /** Current credential family of the presenting token, or null when the
+   * credential row is gone, revoked, or expired. The hub already rejected
+   * revoked/expired presenting credentials before this service runs; this is
+   * the continuity half: refresh keeps the family, delete/reregister changes it. */
+  private presentingFamily(caller: Caller): string | null {
+    if (!caller.tokenId) return null;
+    try {
+      const row: any = this.sql.exec('SELECT family_id, revoked_at, expires_at FROM credentials WHERE id = ?', caller.tokenId).toArray()[0];
+      if (!row || row.revoked_at) return null;
+      const expires = Date.parse(row.expires_at);
+      if (!Number.isFinite(expires) || expires <= this.now()) return null;
+      return typeof row.family_id === 'string' && row.family_id ? row.family_id : null;
+    } catch { return null; }
+  }
+
+  /** Fresh ownership authorization on every read/write/replay. Admins bypass;
+   * everyone else must present the owning actor with the same credential or a
+   * same-family refresh. Anything else renders as not_found (never an oracle). */
+  private ownerOk(row: { actor: string; owner_token_id?: string | null; owner_family?: string | null }, caller: Caller): boolean {
+    if (caller.isAdmin === true) return true;
+    if (!caller.actor || row.actor !== caller.actor) return false;
+    if (row.owner_token_id && caller.tokenId && row.owner_token_id === caller.tokenId) return true;
+    const family = this.presentingFamily(caller);
+    if (family && row.owner_family && family === row.owner_family) {
+      // Refresh continuity: adopt the rotated token id for future checks.
+      const table = (row as any).session_id !== undefined ? 'session_control_commands' : 'session_control_sessions';
+      try { this.sql.exec(`UPDATE ${table} SET owner_token_id = ? WHERE id = ?`, caller.tokenId, (row as any).id); } catch { /* bookkeeping only */ }
+      return true;
+    }
+    return false;
+  }
+
+  /** Host machine binding plus credential-family continuity for poll/claim/ack/binding. */
+  private hostOk(session: { machine_id?: string | null; host_family?: string | null }, caller: Caller): { ok: true } | { ok: false; error: string } {
+    if (!session.machine_id || session.machine_id !== caller.machineId) return { ok: false, error: 'not_found' };
+    if (caller.isAdmin === true) return { ok: true };
+    const family = this.presentingFamily(caller);
+    if (!family) return { ok: false, error: 'credential_changed' };
+    if (session.host_family && session.host_family !== family) return { ok: false, error: 'host_credential_changed' };
+    return { ok: true };
+  }
+
+  private adoptHostFamily(sessionId: string, caller: Caller) {
+    if (caller.isAdmin === true || !caller.tokenId) return;
+    const family = this.presentingFamily(caller);
+    if (!family) return;
+    try { this.sql.exec('UPDATE session_control_sessions SET host_family = COALESCE(host_family, ?) WHERE id = ?', family, sessionId); } catch { /* bookkeeping only */ }
+  }
 
   private view(row: any) {
     const request = parsed(row.request_json, {});
@@ -86,21 +216,58 @@ export class SessionControlService {
     };
   }
 
-  /** Server-internal binding seam for the future hub.ts wiring (post-ACK). Not an HTTP route. */
+  /** Cursor pagination over (created_at, id): complete pages, no silent truncation. */
+  private cursorClause(cursor: unknown, params: any[], desc: boolean): string {
+    if (typeof cursor !== 'string' || !cursor) return '';
+    const sep = cursor.indexOf('|');
+    if (sep < 0) return '';
+    const [at, id] = [cursor.slice(0, sep), cursor.slice(sep + 1)];
+    if (!at || !UUID_RE.test(id)) return '';
+    params.push(at, at, id);
+    const op = desc ? '<' : '>';
+    return `AND (created_at ${op} ? OR (created_at = ? AND id ${op} ?))`;
+  }
+
+  /** Server-internal binding seam (used by tests and future hub wiring after
+   * the fleet claim/result half). The HTTP binding route below is the host path. */
   recordBinding(sessionId: string, binding: { native_id: string; tag: string; workspace: string }): { ok: true; generation: number } | { ok: false; error: string } {
-    return this.transaction(() => {
-      const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0];
-      if (!row) return { ok: false as const, error: 'not_found' };
-      if (!['offered', 'starting', 'uncertain'].includes(row.state)) return { ok: false as const, error: 'binding_not_allowed' };
-      if (typeof binding.native_id !== 'string' || !binding.native_id || typeof binding.tag !== 'string' || !binding.tag ||
-          typeof binding.workspace !== 'string' || !binding.workspace) return { ok: false as const, error: 'invalid_binding' };
-      const prior = row.binding_json ? parsed(row.binding_json, null) : null;
-      if (prior && prior.native_id !== binding.native_id) return { ok: false as const, error: 'binding_conflict' };
-      const generation = (prior?.generation ?? 0) + 1;
-      this.sql.exec('UPDATE session_control_sessions SET state = ?, binding_json = ?, updated_at = ? WHERE id = ?',
-        'running', JSON.stringify({ ...binding, generation }), this.at(), sessionId);
-      return { ok: true as const, generation };
-    });
+    return this.transaction(() => this.applyBinding(sessionId, binding, null));
+  }
+
+  private applyBinding(sessionId: string, binding: { native_id: string; tag: string; workspace: string; native_created_at_ms?: number; evidence?: unknown }, reporter: string | null): { ok: true; generation: number } | { ok: false; error: string } {
+    const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0];
+    if (!row) return { ok: false as const, error: 'not_found' };
+    if (!BINDABLE.has(row.state)) return { ok: false as const, error: 'binding_not_allowed' };
+    if (typeof binding.native_id !== 'string' || !UUID_V4.test(binding.native_id) ||
+        typeof binding.tag !== 'string' || !binding.tag || binding.tag.startsWith('-') ||
+        !absoluteWorkspaceOk(binding.workspace)) return { ok: false as const, error: 'invalid_binding' };
+    if (binding.native_created_at_ms !== undefined &&
+        (!Number.isInteger(binding.native_created_at_ms) || binding.native_created_at_ms <= 0 || binding.native_created_at_ms > this.now() + 60000)) {
+      return { ok: false as const, error: 'invalid_binding' };
+    }
+    const prior = row.binding_json ? parsed(row.binding_json, null) : null;
+    // Exact UUID + tag + workspace reconciliation: a different native id is a
+    // conflict, never a silent adoption (protects tag reuse across generations).
+    if (prior && (prior.native_id !== binding.native_id || prior.tag !== binding.tag || prior.workspace !== binding.workspace)) {
+      return { ok: false as const, error: 'binding_conflict' };
+    }
+    const generation = (prior?.generation ?? 0) + 1;
+    this.sql.exec('UPDATE session_control_sessions SET state = ?, binding_json = ?, updated_at = ? WHERE id = ?',
+      'running', JSON.stringify({ native_id: binding.native_id, tag: binding.tag, workspace: binding.workspace, generation,
+        ...(binding.native_created_at_ms !== undefined ? { native_created_at_ms: binding.native_created_at_ms } : {}),
+        ...(reporter ? { reported_by: reporter } : {}), reported_at: this.at() }), this.at(), sessionId);
+    return { ok: true as const, generation };
+  }
+
+  private claimExpired(row: any): boolean {
+    if (!row.claim_expires_at) return false;
+    const at = Date.parse(row.claim_expires_at);
+    return !Number.isFinite(at) || at <= this.now();
+  }
+
+  private markUncertain(row: any, reason: string) {
+    this.sql.exec("UPDATE session_control_commands SET state = 'uncertain', ack_json = ?, updated_at = ? WHERE id = ?",
+      JSON.stringify({ outcome: 'uncertain', reason }), this.at(), row.id);
   }
 
   async handle(request: Request, auth: Auth): Promise<Response> {
@@ -121,12 +288,15 @@ export class SessionControlService {
           !label(input.key) || !label(input.workspace) ||
           (input.engine !== undefined && !label(input.engine)) ||
           (input.machine !== undefined && !label(input.machine)) ||
-          (input.tier !== undefined && !TIERS.has(input.tier)) ||
-          (input.mode !== undefined && !['headless', 'interactive'].includes(input.mode)) ||
           (input.cwd !== undefined && !cwdOk(input.cwd)) ||
+          (input.mode !== undefined && !['headless', 'interactive'].includes(input.mode)) ||
           (input.brief !== undefined && (typeof input.brief !== 'string' || !input.brief.trim() || input.brief.length > 8000))) {
         return response({ error: 'invalid_session_request' }, 400);
       }
+      // Tier has no fleet placement consumer (fleet plan keys are fixed; routing
+      // tiers select models, not launches). Reject explicitly BEFORE any effect
+      // rather than recording a hint the placement silently discards.
+      if (input.tier !== undefined) return response({ error: 'unsupported_tier', detail: 'tier has no fleet placement consumer; select engine/machine explicitly' }, 400);
       const mode = input.mode || 'headless';
       if (mode === 'interactive' && input.brief !== undefined) {
         return response({ error: 'interactive_starts_empty' }, 400);
@@ -136,7 +306,7 @@ export class SessionControlService {
       }
       const actor = caller.actor || caller.machineId || 'admin';
       const canonical = JSON.stringify({
-        engine: input.engine ?? null, tier: input.tier ?? null, machine: input.machine ?? null,
+        engine: input.engine ?? null, machine: input.machine ?? null,
         workspace: input.workspace, cwd: input.cwd ?? null, brief: input.brief ?? null,
         mode, access: input.access ?? null,
       });
@@ -144,6 +314,7 @@ export class SessionControlService {
         const prior: any = this.sql.exec(
           'SELECT * FROM session_control_sessions WHERE actor = ? AND request_key = ?', actor, input.key).toArray()[0];
         if (prior) {
+          if (!this.ownerOk(prior, caller)) return response({ error: 'not_found' }, 404);
           if (prior.request_json !== canonical) return response({ error: 'idempotency_conflict' }, 409);
           if (prior.fleet_launch_id) return response({ ...this.view(prior), replay: true });
           // A held intent may be placed once capacity/admission recovers; the fleet
@@ -154,8 +325,8 @@ export class SessionControlService {
             const id = crypto.randomUUID();
             const at = this.at();
             this.sql.exec(
-              'INSERT INTO session_control_sessions (id, actor, request_key, request_json, mode, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-              id, actor, input.key, canonical, mode, 'held', at, at);
+              'INSERT INTO session_control_sessions (id, actor, request_key, request_json, mode, state, owner_token_id, owner_family, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+              id, actor, input.key, canonical, mode, 'held', caller.tokenId ?? null, this.presentingFamily(caller), at, at);
             const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
             return response({ ...this.view(row), hold: 'no_placement_authority' }, 409);
           }
@@ -165,18 +336,26 @@ export class SessionControlService {
         const at = this.at();
         if (!prior) {
           this.sql.exec(
-            'INSERT INTO session_control_sessions (id, actor, request_key, request_json, mode, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            id, actor, input.key, canonical, mode, 'queued', at, at);
+            'INSERT INTO session_control_sessions (id, actor, request_key, request_json, mode, state, owner_token_id, owner_family, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            id, actor, input.key, canonical, mode, 'queued', caller.tokenId ?? null, this.presentingFamily(caller), at, at);
         }
+        // engine / machine / workspace / mode / prompt reach the existing fleet
+        // reserve as REAL placement constraints (exact route match + M6/M8 gates).
+        // cwd is not a fleet plan key: it is carried in the host offer payload
+        // and enforced by the host inside its configured root at start time.
         const reserved = this.hooks.reserve({
           mode, machine: input.machine, engine: input.engine, workspace: input.workspace,
           prompt: input.brief || '', access: input.access,
           idempotency_key: 'session-control-' + id,
         }, auth);
+        if (reserved.status === 400) {
+          this.sql.exec('UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE id = ?', 'refused', at, id);
+          return response(reserved.value, 400);
+        }
         if (reserved.status >= 300) {
           this.sql.exec('UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE id = ?', 'held', at, id);
           const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
-          return response({ ...this.view(row), hold: reserved.value }, 409);
+          return response({ ...this.view(row), hold: reserved.value, requested: { engine: input.engine ?? null, machine: input.machine ?? null, workspace: input.workspace } }, 409);
         }
         this.sql.exec('UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = ?, engine = ?, state = ?, updated_at = ? WHERE id = ?',
           reserved.value.id, reserved.value.machine ?? null, reserved.value.engine ?? null, reserved.value.state || 'offered', at, id);
@@ -188,25 +367,62 @@ export class SessionControlService {
     if (path === '/api/sessions' && request.method === 'GET') {
       if (!writer) return response({ error: 'forbidden' }, 403);
       const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 50));
-      const rows = admin
-        ? this.sql.exec('SELECT * FROM session_control_sessions ORDER BY created_at DESC LIMIT ?', limit).toArray()
-        : this.sql.exec('SELECT * FROM session_control_sessions WHERE actor = ? ORDER BY created_at DESC LIMIT ?', caller.actor, limit).toArray();
-      return response({ sessions: rows.map(r => this.view(r)) });
+      const cursor = url.searchParams.get('cursor');
+      const params: any[] = [];
+      const cursorSql = this.cursorClause(cursor, params, true);
+      const rows = (admin
+        ? this.sql.exec(`SELECT * FROM session_control_sessions WHERE 1 = 1 ${cursorSql} ORDER BY created_at DESC, id DESC LIMIT ?`, ...params, limit + 1).toArray()
+        : this.sql.exec(`SELECT * FROM session_control_sessions WHERE actor = ? ${cursorSql} ORDER BY created_at DESC, id DESC LIMIT ?`, caller.actor, ...params, limit + 1).toArray()
+      ).filter((r: any) => this.ownerOk(r, caller));
+      const page = rows.slice(0, limit);
+      const next = rows.length > limit ? `${(page[page.length - 1] as any).created_at}|${(page[page.length - 1] as any).id}` : null;
+      return response({ sessions: page.map(r => this.view(r)), next_cursor: next });
     }
 
-    const sessionMatch = /^\/api\/sessions\/([a-f0-9-]{36})(\/(send|capture|stop|commands))?$/.exec(path);
+    const sessionMatch = /^\/api\/sessions\/([a-f0-9-]{36})(\/(send|capture|stop|commands|binding))?$/.exec(path);
     if (sessionMatch) {
       const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionMatch[1]).toArray()[0];
-      if (!session || (!admin && session.actor !== caller.actor)) return response({ error: 'not_found' }, 404);
-      if (!sessionMatch[2] && request.method === 'GET') return response(this.view(session));
-      if (sessionMatch[3] === 'commands' && request.method === 'GET') {
-        const commands = this.sql.exec('SELECT * FROM session_control_commands WHERE session_id = ? ORDER BY created_at, id', session.id).toArray()
-          .map((c: any) => ({ ...c, payload: parsed(c.payload_json, null), ack: c.ack_json ? parsed(c.ack_json, null) : null }));
-        return response({ session_id: session.id, commands });
+      const sub = sessionMatch[3];
+      if (sub === 'binding') {
+        // Host-only native binding report: the Fleet result -> native binding
+        // reconciliation path. The fleet offer was already claimed through the
+        // existing fleet flow; this binds the exact observed native session.
+        if (request.method !== 'POST') return response({ error: 'not_found' }, 404);
+        if (!host) return response({ error: 'forbidden' }, 403);
+        if (!session) return response({ error: 'not_found' }, 404);
+        const gate = this.hostOk(session, caller);
+        if (!gate.ok) return response({ error: gate.error }, gate.error === 'not_found' ? 404 : 409);
+        const input = await body(request);
+        if (!obj(input, ['native']) || !obj(input.native || {}, ['native_id', 'tag', 'workspace', 'native_created_at_ms', 'evidence'])) {
+          return response({ error: 'invalid_binding' }, 400);
+        }
+        return this.transaction(() => {
+          const applied = this.applyBinding(session.id, input.native, caller.machineId!);
+          if (!applied.ok) {
+            return response({ error: applied.error },
+              applied.error === 'not_found' ? 404 : applied.error === 'invalid_binding' ? 400 : 409);
+          }
+          this.adoptHostFamily(session.id, caller);
+          const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0];
+          return response({ ...this.view(row), generation: applied.generation });
+        });
       }
-      if (sessionMatch[3] && request.method === 'POST') {
-        if (!writer || (!admin && session.actor !== caller.actor)) return response({ error: 'forbidden' }, 403);
-        const kind = sessionMatch[3];
+      if (!session || !this.ownerOk(session, caller)) return response({ error: 'not_found' }, 404);
+      if (!sub && request.method === 'GET') return response(this.view(session));
+      if (sub === 'commands' && request.method === 'GET') {
+        const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 50));
+        const params: any[] = [session.id];
+        const cursorSql = this.cursorClause(url.searchParams.get('cursor'), params, false);
+        const rows = this.sql.exec(`SELECT * FROM session_control_commands WHERE session_id = ? ${cursorSql} ORDER BY created_at, id LIMIT ?`, ...params, limit + 1).toArray() as any[];
+        const page = rows.slice(0, limit);
+        const next = rows.length > limit ? `${page[page.length - 1].created_at}|${page[page.length - 1].id}` : null;
+        return response({ session_id: session.id,
+          commands: page.map((c: any) => ({ ...c, payload: parsed(c.payload_json, null), ack: c.ack_json ? parsed(c.ack_json, null) : null })),
+          next_cursor: next });
+      }
+      if (sub && ['send', 'capture', 'stop'].includes(sub) && request.method === 'POST') {
+        if (!writer || !this.ownerOk(session, caller)) return response({ error: 'forbidden' }, 403);
+        const kind = sub;
         const input = await body(request);
         if (kind === 'send') {
           if (!obj(input, ['key', 'body']) || !label(input.key) ||
@@ -214,7 +430,7 @@ export class SessionControlService {
             return response({ error: 'invalid_send' }, 400);
           }
           if (!BOUND_STATES.has(session.state)) return response({ error: 'session_not_bound' }, 409);
-          return this.transaction(() => this.enqueue(session, kind, actorName(caller), input.key, { body: input.body }));
+          return this.transaction(() => this.enqueue(session, kind, actorName(caller), caller, input.key, { body: input.body }));
         }
         if (kind === 'capture') {
           if (!obj(input, ['key', 'max_bytes']) || !label(input.key) ||
@@ -222,11 +438,11 @@ export class SessionControlService {
             return response({ error: 'invalid_capture' }, 400);
           }
           if (!BOUND_STATES.has(session.state)) return response({ error: 'session_not_bound' }, 409);
-          return this.transaction(() => this.enqueue(session, kind, actorName(caller), input.key, { max_bytes: input.max_bytes ?? 65536 }));
+          return this.transaction(() => this.enqueue(session, kind, actorName(caller), caller, input.key, { max_bytes: input.max_bytes ?? 65536 }));
         }
         if (!obj(input, ['key']) || !label(input.key)) return response({ error: 'invalid_stop' }, 400);
         if (!STOPPABLE.has(session.state)) return response({ error: 'session_not_stoppable' }, 409);
-        return this.transaction(() => this.enqueue(session, kind, actorName(caller), input.key, {}));
+        return this.transaction(() => this.enqueue(session, kind, actorName(caller), caller, input.key, {}));
       }
       return response({ error: 'not_found' }, 404);
     }
@@ -235,22 +451,91 @@ export class SessionControlService {
       if (!host) return response({ error: 'forbidden' }, 403);
       return this.transaction(() => {
         const at = this.at();
+        // Expiry sweep: a claim whose lease lapsed is a lost-effect attempt.
+        // Uncertain here, never re-offered, never blindly reissued.
+        for (const stale of this.sql.exec(
+          `SELECT c.id FROM session_control_commands c JOIN session_control_sessions s ON s.id = c.session_id
+           WHERE s.machine_id = ? AND c.state = 'claimed' AND c.holder_machine = ?`, caller.machineId!, caller.machineId!).toArray() as any[]) {
+          const full: any = this.sql.exec('SELECT * FROM session_control_commands WHERE id = ?', stale.id).toArray()[0];
+          if (full && this.claimExpired(full)) this.markUncertain(full, 'claim_expired');
+        }
+        // A fetch receipt without a claim authorizes nothing: stale unclaimed
+        // fetches revert to recorded so a lost poll response self-heals. Rows
+        // already acked (ack_json set) are never resurrected.
+        const cutoff = new Date(this.now() - this.claimTtlMs).toISOString();
+        this.sql.exec(
+          `UPDATE session_control_commands SET state = 'recorded', poll_at = NULL, updated_at = ?
+           WHERE state = 'transported' AND ack_json IS NULL AND holder_machine IS NULL
+           AND poll_at IS NOT NULL AND poll_at < ?
+           AND session_id IN (SELECT id FROM session_control_sessions WHERE machine_id = ?)`,
+          at, cutoff, caller.machineId!);
         const rows = this.sql.exec(
           `SELECT c.* FROM session_control_commands c JOIN session_control_sessions s ON s.id = c.session_id
            WHERE s.machine_id = ? AND c.state = 'recorded' ORDER BY c.created_at, c.id LIMIT 20`, caller.machineId!).toArray() as any[];
         const offers = [];
         for (const row of rows) {
           const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', row.session_id).toArray()[0];
+          if (!session || session.machine_id !== caller.machineId) continue;
           const binding = session?.binding_json ? parsed(session.binding_json, null) : null;
-          if (!binding) continue;
-          this.sql.exec("UPDATE session_control_commands SET state = 'transported', poll_at = ?, updated_at = ? WHERE id = ? AND state = 'recorded'", at, at, row.id);
+          const requestJson = parsed(session.request_json, {});
+          // Fetch receipt only: marking transported never authorizes an effect.
+          if (row.state === 'recorded') {
+            this.sql.exec("UPDATE session_control_commands SET state = 'transported', poll_at = ?, updated_at = ? WHERE id = ? AND state = 'recorded'", at, at, row.id);
+          }
           offers.push({
             command_id: row.id, session_id: row.session_id, kind: row.kind,
-            native_tag: binding.tag, workspace: binding.workspace,
+            session_state: session.state, fleet_launch_id: session.fleet_launch_id ?? null,
+            // Native send/capture targets need the exact bound tag; unbound
+            // sessions (stop on offered) carry binding null + fleet correlation.
+            binding: binding ? { native_id: binding.native_id, tag: binding.tag, workspace: binding.workspace, generation: binding.generation } : null,
+            native_tag: binding?.tag ?? null, workspace: requestJson.workspace ?? null,
+            // cwd reaches the executed start: the host resolves it strictly
+            // inside its configured root and refuses traversal/escape.
+            cwd: requestJson.cwd ?? null,
             payload: parsed(row.payload_json, null), correlation: row.correlation,
           });
+          if (offers.length >= 20) break;
         }
         return response({ offers });
+      });
+    }
+
+    const claimMatch = /^\/api\/session-commands\/([a-f0-9-]{36})\/claim$/.exec(path);
+    if (claimMatch && request.method === 'POST') {
+      if (!host) return response({ error: 'forbidden' }, 403);
+      const input = await body(request);
+      if (!obj(input, ['correlation']) || typeof input.correlation !== 'string' || !input.correlation) {
+        return response({ error: 'invalid_claim' }, 400);
+      }
+      return this.transaction(() => {
+        const row: any = this.sql.exec('SELECT * FROM session_control_commands WHERE id = ?', claimMatch[1]).toArray()[0];
+        if (!row) return response({ error: 'not_found' }, 404);
+        const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', row.session_id).toArray()[0];
+        if (!session) return response({ error: 'not_found' }, 404);
+        const gate = this.hostOk(session, caller);
+        if (!gate.ok) return response({ error: gate.error }, gate.error === 'not_found' ? 404 : 409);
+        if (input.correlation !== row.correlation) return response({ error: 'correlation_mismatch' }, 409);
+        // Lost-claim reconciliation: the holder replays its own unexpired claim.
+        if (row.state === 'claimed') {
+          if (row.holder_machine === caller.machineId && !this.claimExpired(row)) {
+            return response({ command_id: row.id, claim_token: row.claim_token, expires_at: row.claim_expires_at, attempt: row.attempts ?? 1, replay: true });
+          }
+          if (this.claimExpired(row)) {
+            this.markUncertain(row, 'claim_expired');
+            return response({ error: 'claim_expired' }, 409);
+          }
+          return response({ error: 'claim_conflict' }, 409);
+        }
+        if (!CLAIMABLE.has(row.state)) return response({ error: row.state === 'uncertain' ? 'command_uncertain' : 'invalid_transition' }, 409);
+        const token = crypto.randomUUID();
+        const expires = new Date(this.now() + this.claimTtlMs).toISOString();
+        const attempt = (row.attempts ?? 0) + 1;
+        const written = this.sql.exec(
+          "UPDATE session_control_commands SET state = 'claimed', holder_machine = ?, claim_token = ?, claim_expires_at = ?, attempts = ?, updated_at = ? WHERE id = ? AND state IN ('recorded', 'transported')",
+          caller.machineId, token, expires, attempt, this.at(), row.id);
+        if (written.rowsWritten !== 1) return response({ error: 'claim_conflict' }, 409);
+        this.adoptHostFamily(session.id, caller);
+        return response({ command_id: row.id, claim_token: token, expires_at: expires, attempt });
       });
     }
 
@@ -258,8 +543,9 @@ export class SessionControlService {
     if (ackMatch && request.method === 'POST') {
       if (!host) return response({ error: 'forbidden' }, 403);
       const input = await body(request);
-      if (!obj(input, ['correlation', 'outcome', 'native', 'reason', 'capture', 'confirmed_exit']) ||
+      if (!obj(input, ['correlation', 'outcome', 'native', 'reason', 'capture', 'confirmed_exit', 'claim_token', 'proof']) ||
           typeof input.correlation !== 'string' || !ACK_OUTCOMES.has(input.outcome) ||
+          typeof input.claim_token !== 'string' || !input.claim_token ||
           !obj(input.native || {}, ['native_id', 'tag', 'workspace']) ||
           typeof input.native.native_id !== 'string' || !input.native.native_id ||
           typeof input.native.tag !== 'string' || !input.native.tag ||
@@ -270,25 +556,55 @@ export class SessionControlService {
       }
       return this.transaction(() => {
         const row: any = this.sql.exec('SELECT * FROM session_control_commands WHERE id = ?', ackMatch[1]).toArray()[0];
-        if (!row || row.state !== 'transported') return response({ error: row ? 'invalid_transition' : 'not_found' }, row ? 409 : 404);
+        if (!row) return response({ error: 'not_found' }, 404);
+        // The execution fence: only the live claim holder may report an outcome.
+        if (row.state !== 'claimed') {
+          if (row.state === 'uncertain') return response({ error: 'command_uncertain' }, 409);
+          return response({ error: 'claim_required' }, 409);
+        }
         const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', row.session_id).toArray()[0];
         if (!session || session.machine_id !== caller.machineId) return response({ error: 'not_found' }, 404);
+        const gate = this.hostOk(session, caller);
+        if (!gate.ok) return response({ error: gate.error }, gate.error === 'not_found' ? 404 : 409);
+        if (row.holder_machine !== caller.machineId || row.claim_token !== input.claim_token) {
+          return response({ error: 'claim_conflict' }, 409);
+        }
+        if (this.claimExpired(row)) {
+          // Post-effect lease expiry: the effect may have happened. Uncertain,
+          // never silently reissued or marked delivered.
+          this.markUncertain(row, 'claim_expired_before_ack');
+          return response({ error: 'claim_expired' }, 409);
+        }
         if (input.correlation !== row.correlation) return response({ error: 'correlation_mismatch' }, 409);
         const binding = session.binding_json ? parsed(session.binding_json, null) : null;
-        if (!binding || input.native.native_id !== binding.native_id || input.native.tag !== binding.tag) {
-          return response({ error: 'binding_mismatch' }, 409);
+        if (binding) {
+          if (input.native.native_id !== binding.native_id || input.native.tag !== binding.tag ||
+              input.native.workspace !== binding.workspace) {
+            return response({ error: 'binding_mismatch' }, 409);
+          }
         }
         const at = this.at();
         if (input.outcome === 'delivered' && row.kind === 'stop' && input.confirmed_exit !== true) {
           return response({ error: 'confirmed_exit_required' }, 409);
         }
-        const ack = {
-          outcome: input.outcome, native: input.native,
+        if (input.outcome === 'delivered' && row.kind === 'send') {
+          // Correlated receiver proof, not host assertion: the target echoed
+          // this command's correlation from the exact bound native sender.
+          if (!binding) return response({ error: 'session_not_bound' }, 409);
+          const proof = validateSendProof(input.proof, { correlation: row.correlation,
+            native_id: binding.native_id, tag: binding.tag, workspace: binding.workspace, generation: binding.generation ?? 0 });
+          if (!proof.ok) return response({ error: proof.error }, 409);
+        }
+        const ack: any = {
+          outcome: input.outcome, native: input.native, claim_attempt: row.attempts ?? 1,
           ...(input.reason !== undefined ? { reason: input.reason } : {}),
-          ...(input.capture !== undefined ? { capture: redact(input.capture).slice(0, 65536) } : {}),
+          ...(input.capture !== undefined ? { capture: redact(input.capture).slice(0, 65536), capture_truncated: input.capture.length >= 65536 } : {}),
           ...(input.confirmed_exit !== undefined ? { confirmed_exit: input.confirmed_exit === true } : {}),
+          ...(input.proof !== undefined ? { proof: input.proof } : {}),
         };
-        const state = input.outcome === 'delivered' ? 'acked' : input.outcome === 'refused' ? 'refused' : 'uncertain';
+        const state = input.outcome === 'delivered' ? 'acked'
+          : input.outcome === 'transported' ? 'transported'
+          : input.outcome === 'refused' ? 'refused' : 'uncertain';
         this.sql.exec('UPDATE session_control_commands SET state = ?, ack_json = ?, updated_at = ? WHERE id = ?', state, JSON.stringify(ack), at, row.id);
         if (state === 'acked' && row.kind === 'stop') {
           this.sql.exec("UPDATE session_control_sessions SET state = 'stopped', updated_at = ? WHERE id = ?", at, session.id);
@@ -300,10 +616,18 @@ export class SessionControlService {
     return response({ error: 'not_found' }, 404);
   }
 
-  private enqueue(session: any, kind: string, actor: string, key: string, payload: any) {
+  private enqueue(session: any, kind: string, actor: string, caller: Caller, key: string, payload: any) {
+    // True caps: refuse new work without evicting pending work.
+    const pending = Number(this.sql.exec(
+      "SELECT COUNT(*) AS n FROM session_control_commands WHERE state IN ('recorded', 'transported', 'claimed')").one().n);
+    if (pending >= this.maxPending) return response({ error: 'queue_full' }, 429);
+    const perSession = Number(this.sql.exec(
+      "SELECT COUNT(*) AS n FROM session_control_commands WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed')", session.id).one().n);
+    if (perSession >= this.maxPerSession) return response({ error: 'session_queue_full' }, 429);
     const prior: any = this.sql.exec(
       'SELECT * FROM session_control_commands WHERE session_id = ? AND actor = ? AND request_key = ?', session.id, actor, key).toArray()[0];
     if (prior) {
+      if (!this.ownerOk(prior, caller)) return response({ error: 'not_found' }, 404);
       if (prior.kind !== kind || JSON.stringify(parsed(prior.payload_json, null)) !== JSON.stringify(payload)) {
         return response({ error: 'idempotency_conflict' }, 409);
       }
@@ -315,8 +639,9 @@ export class SessionControlService {
     const at = this.at();
     const correlation = `cmd:${id}:gen:${generation}`;
     this.sql.exec(
-      'INSERT INTO session_control_commands (id, session_id, kind, actor, request_key, payload_json, state, generation, correlation, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      id, session.id, kind, actor, key, JSON.stringify(payload), 'recorded', generation, correlation, at, at);
+      'INSERT INTO session_control_commands (id, session_id, kind, actor, request_key, payload_json, state, generation, correlation, owner_token_id, owner_family, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      id, session.id, kind, actor, key, JSON.stringify(payload), 'recorded', generation, correlation,
+      caller.tokenId ?? null, this.presentingFamily(caller), 0, at, at);
     return response({ command_id: id, state: 'recorded' }, 201);
   }
 }

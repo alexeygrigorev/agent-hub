@@ -76,6 +76,69 @@ class TestSessionControlCli(unittest.TestCase):
         with self.assertRaises(ValueError):
             session_control.read_file(__file__, limit=10)
 
+    def test_wait_flag_validation(self):
+        args = self.parse('start', '--workspace', 'demo', '--wait', '--timeout', '10', '--interval', '2')
+        self.assertEqual(session_control.check_wait_args(args), (10.0, 2.0))
+        bad = self.parse('start', '--workspace', 'demo', '--wait', '--timeout', '0')
+        with self.assertRaises(ValueError):
+            session_control.check_wait_args(bad)
+        bad_interval = self.parse('send', 'sid', '--body-file', 'p.txt', '--wait', '--interval', '0.1')
+        with self.assertRaises(ValueError):
+            session_control.check_wait_args(bad_interval)
+
+    def test_start_wait_polls_binding_to_running(self):
+        args = self.parse('start', '--workspace', 'demo', '--key', 'k1', '--wait', '--timeout', '30', '--interval', '1')
+        views = [{'id': 's1', 'state': 'offered'}, {'id': 's1', 'state': 'running'}]
+        with patch.object(session_control, 'request', side_effect=[{'id': 's1', 'state': 'offered'}, *views]) as transport, \
+                patch.object(session_control.time, 'sleep', return_value=None):
+            result = session_control.execute(args)
+        self.assertEqual(result['client_key'], 'k1')
+        self.assertEqual(result['binding_wait']['state'], 'running')
+        self.assertEqual(transport.call_args.args[:2], ('GET', '/api/sessions/s1'))
+
+    def test_send_wait_ignores_transport_until_correlated_ack(self):
+        args = self.parse('send', 's1', '--body-file', 'p.txt', '--key', 'k2', '--wait', '--timeout', '30', '--interval', '1')
+        listing = lambda state: {'commands': [{'id': 'c1', 'state': state}]}
+        with patch.object(session_control, 'read_file', return_value='prompt'), \
+                patch.object(session_control, 'request', side_effect=[
+                    {'command_id': 'c1', 'state': 'recorded'},
+                    listing('recorded'), listing('transported'), listing('acked'),
+                ]), \
+                patch.object(session_control.time, 'sleep', return_value=None):
+            result = session_control.execute(args)
+        # Transported alone never completes the wait; only the correlated ack does.
+        self.assertEqual(result['command_wait']['state'], 'acked')
+
+    def test_wait_timeout_names_key_for_reconciliation(self):
+        args = self.parse('stop', 's1', '--key', 'k3', '--wait', '--timeout', '2', '--interval', '1')
+        with patch.object(session_control, 'request', side_effect=[
+                    {'command_id': 'c9', 'state': 'recorded'},
+                    {'id': 's1', 'state': 'offered'},
+                    {'id': 's1', 'state': 'offered'},
+                    {'id': 's1', 'state': 'offered'},
+                ]), \
+                patch.object(session_control.time, 'sleep', return_value=None), \
+                patch.object(session_control.time, 'monotonic', side_effect=[0, 0, 0, 100]):
+            with self.assertRaises(ValueError) as raised:
+                session_control.execute(args)
+        self.assertIn('timed out', str(raised.exception))
+
+    def test_lost_response_keeps_key_for_safe_retry(self):
+        args = self.parse('send', 's1', '--body-file', 'p.txt', '--key', 'k4')
+        with patch.object(session_control, 'read_file', return_value='prompt'), \
+                patch.object(session_control, 'request', side_effect=ValueError('Session HTTP request failed with status 502')):
+            with self.assertRaises(ValueError) as raised:
+                session_control.execute(args)
+        self.assertIn('k4', str(raised.exception))
+        self.assertNotIn('prompt', str(raised.exception))
+
+    def test_list_state_filters_without_echo(self):
+        args = self.parse('list', '--state', 'running')
+        payload = {'sessions': [{'id': 'a', 'state': 'running'}, {'id': 'b', 'state': 'offered'}], 'next_cursor': None}
+        with patch.object(session_control, 'request', return_value=payload):
+            result = session_control.execute(args)
+        self.assertEqual([s['id'] for s in result['sessions']], ['a'])
+
 
 if __name__ == '__main__':
     unittest.main()
