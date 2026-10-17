@@ -1,12 +1,15 @@
-"""Composed host receiver loop: offers -> claim -> execute -> ack (actual DTOs).
+"""Composed host receiver loop: offers -> claim -> execute -> ack (STUB-HUB UNIT).
 
 Uses the REAL shared receiver (session_receiver) + REAL executor
 (handle_claimed_command) + REAL native wrappers against a fake `a` binary that
-emulates ONLY the verified native contract (list/message send/log/reply/
-capture/kill; no --enter/--pane/--from). The stub hub implements the ACTUAL
-server DTOs from src/session_control.ts (offers with generation +
+emulates ONLY the verified native contract. The hub here is a STUB matching the
+ACTUAL server DTOs from src/session_control.ts (offers with generation +
 native_created_at_ms, claim with holder/generation/both expiry forms, ack with
-native target UUID + proof), not an invented pair.
+native target UUID + proof) — it checks shapes the real server checks, but it
+is NOT the server. Server agreement is proven by
+host/tests/test_session_real_worker.py (real Worker/SQLite + public CLI +
+receiver + fixture) and test/session-control-composed.test.ts (real
+Worker/SQLite routes).
 
 Covers: offer->command mapping, start rejection, missing incarnation skip,
 stable attempt_id (lost-claim safe), claim expiry (both forms), ack.native as
