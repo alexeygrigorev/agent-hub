@@ -317,7 +317,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     const busAgent = await pairAgent('m13quota-bus', ['bus:send', 'bus:read'], sessionCookie, csrfToken);
     const agentDenied = await doFetch(new Request('http://example.com/api/quota?view=fleet', { headers: { Authorization: `Bearer ${busAgent}` } }));
     expect(agentDenied.status).toBe(403);
-    const rcRes = await doFetch(new Request('http://example.com/api/routing/clients/m13quota', {
+    const rcRes = await doFetch(new Request('http://example.com/api/fleet/routing/clients/m13quota', {
       method: 'POST', headers: { Cookie: sessionCookie, 'Content-Type': 'application/json', 'x-csrf-token': csrfToken }, body: '{}',
     }));
     expect(rcRes.status).toBe(201);
