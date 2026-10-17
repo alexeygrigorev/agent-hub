@@ -258,6 +258,9 @@ class DiskMonitor:
         statvfs_fn: Optional[Callable[[str], Any]] = None,
         stat_fn: Optional[Callable[[str], Any]] = None,
         listdir_fn: Optional[Callable[[str], List[str]]] = None,
+        islink_fn: Optional[Callable[[str], bool]] = None,
+        isdir_fn: Optional[Callable[[str], bool]] = None,
+        exists_fn: Optional[Callable[[str], bool]] = None,
         time_fn: Optional[Callable[[], float]] = None,
         monotonic_fn: Optional[Callable[[], float]] = None,
     ):
@@ -269,6 +272,20 @@ class DiskMonitor:
         self.statvfs_fn = statvfs_fn or os.statvfs
         self.stat_fn = stat_fn or os.stat
         self.listdir_fn = listdir_fn or os.listdir
+        self.islink_fn = islink_fn or os.path.islink
+        self.isdir_fn = isdir_fn or os.path.isdir
+        if exists_fn is not None:
+            self.exists_fn = exists_fn
+        elif stat_fn is not None:
+            def _check_exists(p: str) -> bool:
+                try:
+                    self.stat_fn(p)
+                    return True
+                except OSError:
+                    return False
+            self.exists_fn = _check_exists
+        else:
+            self.exists_fn = os.path.exists
         self.time_fn = time_fn or time.time
         self.monotonic_fn = monotonic_fn or time.monotonic
 
@@ -399,7 +416,7 @@ class DiskMonitor:
                         if (r == mount or r.startswith(mount.rstrip("/") + "/"))
                     ]
                     for root in matching_roots:
-                        if not os.path.exists(root):
+                        if not self.exists_fn(root):
                             continue
                         try:
                             root_st = self.stat_fn(root)
@@ -416,6 +433,8 @@ class DiskMonitor:
                             timeout_s=cfg["scan_timeout_s"],
                             stat_fn=self.stat_fn,
                             listdir_fn=self.listdir_fn,
+                            islink_fn=self.islink_fn,
+                            isdir_fn=self.isdir_fn,
                             monotonic_fn=self.monotonic_fn,
                         )
                         top_consumers.extend(consumers)

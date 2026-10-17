@@ -39,6 +39,16 @@ CREATE TABLE IF NOT EXISTS disk_episodes (
   details_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_disk_episodes_open ON disk_episodes(resolved_at, machine_id);
+
+CREATE TABLE IF NOT EXISTS host_health_observations (
+  machine_id TEXT PRIMARY KEY,
+  observed_at TEXT NOT NULL,
+  observed_at_ms INTEGER NOT NULL,
+  received_at TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  reporter TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_host_health_obs ON host_health_observations(machine_id, observed_at_ms);
 `;
 
 export const DISK_LIMITS = {
@@ -127,6 +137,36 @@ export type DiskObservationPayload = {
   observed_at: string;
   filesystems: DiskFilesystem[];
   errors?: string[];
+};
+
+export type HostLoad = {
+  load1: number;
+  load5: number;
+  load15: number;
+};
+
+export type HostMemory = {
+  total_bytes: number;
+  available_bytes: number;
+  used_bytes: number;
+  percent: number;
+  status: 'ok' | 'warn' | 'critical' | 'unknown';
+  error?: string | null;
+};
+
+export type HostHealthPayload = {
+  machine_id: string;
+  observed_at: string;
+  load: HostLoad;
+  memory: HostMemory;
+};
+
+export type HostHealthSummary = {
+  machine_id: string;
+  observed_at: string;
+  freshness: 'fresh' | 'stale' | 'unavailable' | 'unknown';
+  load: HostLoad;
+  memory: HostMemory;
 };
 
 export class MonitoringService {
@@ -220,6 +260,82 @@ export class MonitoringService {
 
       const now = this.now();
       const status = this.getDiskStatus(now, machineFilter || undefined);
+      return json(status, 200);
+    } catch (e: any) {
+      const code = e?.code || 'internal_error';
+      const status = e?.status || 500;
+      return Response.json({ error: code }, { status, headers: { 'Cache-Control': 'private, no-store' } });
+    }
+  }
+
+  /** Validate and ingest a host resource health observation (load averages and memory). */
+  async handleHostHealthObservation(
+    request: Request,
+    machineAuth: StatusMachineAuth | { error: Response },
+  ): Promise<Response> {
+    const json = (data: any, status = 200) =>
+      Response.json(data, {
+        status,
+        headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' },
+      });
+
+    try {
+      if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
+      if ((machineAuth as any).error) {
+        const code = ((machineAuth as any).error as Response).status || 401;
+        return json({ error: 'unauthorized_or_forbidden' }, code);
+      }
+      const auth = machineAuth as StatusMachineAuth;
+
+      const text = await request.text();
+      if (new TextEncoder().encode(text).length > 32768) {
+        return json({ error: 'payload_too_large' }, 413);
+      }
+
+      let body: any = null;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        return json({ error: 'malformed_json' }, 400);
+      }
+
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        return json({ error: 'invalid_body' }, 400);
+      }
+
+      const validated = this.validateHostHealthPayload(body, auth);
+      const result = this.tx(() => this.recordHostHealthObservation(validated, auth));
+      return json(result, 200);
+    } catch (e: any) {
+      const code = e?.code || 'internal_error';
+      const status = e?.status || 500;
+      return Response.json({ error: code }, { status, headers: { 'Cache-Control': 'private, no-store' } });
+    }
+  }
+
+  /** Read-only GET query for host health status across all machines or for one machine. */
+  async handleHostHealthGet(request: Request, auth: any): Promise<Response> {
+    const json = (data: any, status = 200) =>
+      Response.json(data, {
+        status,
+        headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' },
+      });
+
+    try {
+      if (request.method !== 'GET') return json({ error: 'method_not_allowed' }, 405);
+      if (auth.error) {
+        const code = (auth.error as Response).status || 401;
+        return json({ error: 'unauthorized_or_forbidden' }, code);
+      }
+
+      const url = new URL(request.url);
+      const machineFilter = url.searchParams.get('machine');
+      if (machineFilter && !LABEL_RE.test(machineFilter)) {
+        return json({ error: 'invalid_machine' }, 400);
+      }
+
+      const now = this.now();
+      const status = this.getHostHealthStatus(now, machineFilter || undefined);
       return json(status, 200);
     } catch (e: any) {
       const code = e?.code || 'internal_error';
@@ -870,14 +986,163 @@ export class MonitoringService {
     };
   }
 
+  private validateHostHealthPayload(body: any, auth: StatusMachineAuth): HostHealthPayload {
+    if (typeof body.machine_id !== 'string' || !LABEL_RE.test(body.machine_id)) {
+      fail('invalid_machine_id');
+    }
+    if (auth.kind === 'host' && body.machine_id !== auth.machine_id) {
+      fail('observation_forbidden', 403);
+    }
+    if (typeof body.observed_at !== 'string' || !/Z|[+-]\d{2}:?\d{2}$/.test(body.observed_at)) {
+      fail('invalid_observed_at');
+    }
+    const observedMs = Date.parse(body.observed_at);
+    if (!Number.isFinite(observedMs)) fail('invalid_observed_at');
+    const now = this.now();
+    if (observedMs > now + 60000) fail('future_observation');
+    if (observedMs < now - 30 * 86400000) fail('stale_observation');
+
+    if (!body.load || typeof body.load !== 'object' || Array.isArray(body.load)) {
+      fail('invalid_load');
+    }
+    const load1 = Number(body.load.load1);
+    const load5 = Number(body.load.load5);
+    const load15 = Number(body.load.load15);
+    if (!Number.isFinite(load1) || load1 < 0 || !Number.isFinite(load5) || load5 < 0 || !Number.isFinite(load15) || load15 < 0) {
+      fail('invalid_load');
+    }
+
+    if (!body.memory || typeof body.memory !== 'object' || Array.isArray(body.memory)) {
+      fail('invalid_memory');
+    }
+    const totalBytes = Number(body.memory.total_bytes);
+    const availableBytes = Number(body.memory.available_bytes);
+    const usedBytes = Number(body.memory.used_bytes);
+    const percent = Number(body.memory.percent);
+    if (!Number.isFinite(totalBytes) || totalBytes < 0 || !Number.isFinite(availableBytes) || availableBytes < 0 ||
+        !Number.isFinite(usedBytes) || usedBytes < 0 || !Number.isFinite(percent) || percent < 0 || percent > 100) {
+      fail('invalid_memory');
+    }
+    const status = body.memory.status;
+    if (!['ok', 'warn', 'critical', 'unknown'].includes(status)) {
+      fail('invalid_memory_status');
+    }
+
+    return {
+      machine_id: body.machine_id,
+      observed_at: new Date(observedMs).toISOString(),
+      load: { load1, load5, load15 },
+      memory: {
+        total_bytes: Math.floor(totalBytes),
+        available_bytes: Math.floor(availableBytes),
+        used_bytes: Math.floor(usedBytes),
+        percent: Number(percent.toFixed(1)),
+        status,
+        error: typeof body.memory.error === 'string' ? body.memory.error.slice(0, 128) : null,
+      },
+    };
+  }
+
+  private recordHostHealthObservation(
+    payload: HostHealthPayload,
+    auth: StatusMachineAuth,
+  ): { ok: boolean; machine_id: string; observed_at: string } {
+    const reporter = auth.kind === 'host' ? `host:${auth.machine_id}` : `admin:${auth.actor}`;
+    const observedMs = Date.parse(payload.observed_at);
+    const nowIso = new Date(this.now()).toISOString();
+
+    this.sql.exec(
+      `INSERT INTO host_health_observations (machine_id, observed_at, observed_at_ms, received_at, payload_json, reporter)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(machine_id) DO UPDATE SET
+         observed_at = excluded.observed_at,
+         observed_at_ms = excluded.observed_at_ms,
+         received_at = excluded.received_at,
+         payload_json = excluded.payload_json,
+         reporter = excluded.reporter`,
+      payload.machine_id,
+      payload.observed_at,
+      observedMs,
+      nowIso,
+      JSON.stringify(payload),
+      reporter,
+    );
+
+    if (this.liveness) {
+      if (payload.memory.status === 'warn' || payload.memory.status === 'critical') {
+        this.liveness.setAlert('memory', payload.machine_id, {
+          state: payload.memory.status,
+          detail: `Host memory pressure on ${payload.machine_id}: ${payload.memory.percent}% used (${formatBytes(payload.memory.used_bytes)} / ${formatBytes(payload.memory.total_bytes)})`,
+        });
+      } else if (payload.memory.status === 'ok') {
+        this.liveness.setAlert('memory', payload.machine_id, null);
+      }
+    }
+
+    return {
+      ok: true,
+      machine_id: payload.machine_id,
+      observed_at: payload.observed_at,
+    };
+  }
+
+  getHostHealthStatus(
+    now: number = this.now(),
+    machineFilter?: string,
+  ): { snapshot_at: string; machines: HostHealthSummary[] } {
+    let query = 'SELECT machine_id, observed_at, observed_at_ms, payload_json FROM host_health_observations';
+    const params: any[] = [];
+    if (machineFilter) {
+      query += ' WHERE machine_id = ?';
+      params.push(machineFilter);
+    }
+    query += ' ORDER BY machine_id ASC';
+
+    let rows: any[] = [];
+    try {
+      rows = this.sql.exec(query, ...params).toArray() as any[];
+    } catch {
+      return { snapshot_at: new Date(now).toISOString(), machines: [] };
+    }
+
+    const machines: HostHealthSummary[] = [];
+    for (const r of rows) {
+      let payload: any = {};
+      try {
+        payload = JSON.parse(r.payload_json);
+      } catch {
+        continue;
+      }
+      const ageMs = now - r.observed_at_ms;
+      const freshness: 'fresh' | 'stale' | 'unavailable' =
+        ageMs <= 180000 ? 'fresh' : ageMs <= 900000 ? 'stale' : 'unavailable';
+
+      machines.push({
+        machine_id: r.machine_id,
+        observed_at: r.observed_at,
+        freshness,
+        load: payload.load ?? { load1: 0, load5: 0, load15: 0 },
+        memory: payload.memory ?? { total_bytes: 0, available_bytes: 0, used_bytes: 0, percent: 0, status: 'unknown' },
+      });
+    }
+
+    return {
+      snapshot_at: new Date(now).toISOString(),
+      machines,
+    };
+  }
+
   /** Condensed summary projection for StatusService (hub status / needs-attention). */
   getStatusSummary(now: number = this.now()): {
     filesystems: any[];
+    host_health: HostHealthSummary[];
     needs_attention: any[];
     categories_entry: any;
   } {
     const full = this.getDiskStatus(now);
+    const healthStatus = this.getHostHealthStatus(now);
     const filesystems: any[] = [];
+    const hostHealth: HostHealthSummary[] = [];
     const needsAttention: any[] = [];
 
     let hasErrors = false;
@@ -885,6 +1150,28 @@ export class MonitoringService {
     let anyUnavailable = false;
     let latestObservedMs: number | null = null;
     let latestObservedIso: string | null = null;
+
+    for (const h of healthStatus.machines || []) {
+      hostHealth.push(h);
+      if (h.freshness === 'stale') anyStale = true;
+      if (h.freshness === 'unavailable') anyUnavailable = true;
+
+      const hObservedMs = Date.parse(h.observed_at);
+      if (Number.isFinite(hObservedMs) && (latestObservedMs === null || hObservedMs > latestObservedMs)) {
+        latestObservedMs = hObservedMs;
+        latestObservedIso = h.observed_at;
+      }
+
+      if (h.memory?.status === 'warn' || h.memory?.status === 'critical') {
+        needsAttention.push({
+          severity: h.memory.status,
+          subject: `${h.machine_id}:memory`,
+          title: `Memory pressure on ${h.machine_id}`,
+          detail: `Memory is at ${h.memory.percent}% (${formatBytes(h.memory.used_bytes)} / ${formatBytes(h.memory.total_bytes)})`,
+          percent: h.memory.percent,
+        });
+      }
+    }
 
     for (const m of full.machines || []) {
       if (m.freshness === 'stale') anyStale = true;
@@ -974,6 +1261,7 @@ export class MonitoringService {
 
     return {
       filesystems,
+      host_health: hostHealth,
       needs_attention: needsAttention,
       categories_entry: {
         state,

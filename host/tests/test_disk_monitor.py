@@ -250,6 +250,8 @@ class TestDiskMonitor(unittest.TestCase):
             },
             stat_fn=mock_stat,
             statvfs_fn=mock_statvfs,
+            listdir_fn=lambda p: [],
+            isdir_fn=lambda p: False,
         )
 
         cfg = monitor.load_active_config()
@@ -321,36 +323,44 @@ class TestDiskMonitor(unittest.TestCase):
 
     def test_duplicate_device_scans_skipped_for_aliases(self):
         # Two mounts on the SAME device, both in critical status
-        def mock_stat(path):
-            return SimpleNamespace(st_dev=200, st_size=4096)
+        with tempfile.TemporaryDirectory() as td:
+            mount1 = os.path.join(td, "mount1")
+            mount2 = os.path.join(td, "mount2")
+            os.makedirs(mount1)
+            os.makedirs(mount2)
 
-        def mock_statvfs(path):
-            # 96% full (critical)
-            return SimpleNamespace(f_frsize=4096, f_blocks=1000, f_bfree=40, f_bavail=40)
+            def mock_stat(path):
+                return SimpleNamespace(st_dev=200, st_size=4096)
 
-        scan_calls = []
+            def mock_statvfs(path):
+                # 96% full (critical)
+                return SimpleNamespace(f_frsize=4096, f_blocks=1000, f_bfree=40, f_bavail=40)
 
-        def mock_listdir(path):
-            scan_calls.append(path)
-            return ["big.log"]
+            scan_calls = []
 
-        monitor = disk_monitor.DiskMonitor(
-            config={
-                "enabled": True,
-                "machine_id": "test-box",
-                "mounts": ["/data", "/data-alias"],
-                "allowed_roots": ["/data", "/data-alias"],
-            },
-            stat_fn=mock_stat,
-            statvfs_fn=mock_statvfs,
-            listdir_fn=mock_listdir,
-        )
+            def mock_listdir(path):
+                scan_calls.append(path)
+                return ["big.log"]
 
-        cfg = monitor.load_active_config()
-        payload, errors = monitor.collect(cfg)
-        self.assertEqual(len(errors), 0)
-        # /data was scanned; /data-alias has the same dev_id=200 so it must NOT trigger a second scan!
-        self.assertEqual(len(scan_calls), 1)
+            monitor = disk_monitor.DiskMonitor(
+                config={
+                    "enabled": True,
+                    "machine_id": "test-box",
+                    "mounts": [mount1, mount2],
+                    "allowed_roots": [mount1, mount2],
+                },
+                stat_fn=mock_stat,
+                statvfs_fn=mock_statvfs,
+                listdir_fn=mock_listdir,
+                isdir_fn=lambda path: False,
+                exists_fn=lambda path: True,
+            )
+
+            cfg = monitor.load_active_config()
+            payload, errors = monitor.collect(cfg)
+            self.assertEqual(len(errors), 0)
+            # mount1 was scanned; mount2 has the same dev_id=200 so it must NOT trigger a second scan!
+            self.assertEqual(len(scan_calls), 1)
 
     def test_stat_failure_reported_as_error_status(self):
         def mock_stat(path):

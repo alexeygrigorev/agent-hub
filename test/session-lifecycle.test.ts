@@ -75,8 +75,33 @@ describe('m15 synthetic lifecycle classification', () => {
     expect(first.next_cursor).not.toBeNull();
     const dto = toStatusDto(classifySession(base(), { now_ms: NOW }));
     expect(dto.session_key).toBe('synth-host/11111111-1111-4111-8111-111111111111');
-    expect(dto.flags).toBeDefined();
     expect(toHandoffDto(classifySession(base(), { now_ms: NOW })).text_as_data).toBe(true);
+  });
+
+  it('flags contradicted resting state when terminal activity occurs after reported idle/waiting state', () => {
+    // Session reported idle at 10:00:00Z, but active terminal output was recorded at 10:02:00Z (> 1000ms later)
+    const contradicted = classifySession(
+      base({
+        agent_state: 'idle',
+        observed_at: '2026-10-17T10:00:00Z',
+        last_activity_at: '2026-10-17T10:02:00Z',
+      }),
+      { now_ms: NOW },
+    );
+    expect(contradicted.flags).toContain('contradicted_resting_state');
+    expect(contradicted.reasons.some((r) => r.includes('resting state contradicted'))).toBe(true);
+    expect(contradicted.group).toBe('active');
+
+    // Normal idle where activity <= observed_at
+    const normalIdle = classifySession(
+      base({
+        agent_state: 'idle',
+        observed_at: '2026-10-17T10:05:00Z',
+        last_activity_at: '2026-10-17T10:00:00Z',
+      }),
+      { now_ms: NOW },
+    );
+    expect(normalIdle.flags).not.toContain('contradicted_resting_state');
   });
 });
 

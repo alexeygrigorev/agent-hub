@@ -205,3 +205,45 @@ To verify monitoring signals locally without touching external services:
    ```bash
    npx wrangler deploy --dry-run --outdir dist
    ```
+
+---
+
+## 6. Comprehensive Signal Cross-Mapping (Inventory to Agent Hub)
+
+Every signal from [docs/MONITORING-INVENTORY.md](MONITORING-INVENTORY.md) is cross-mapped below to its concrete coverage status in Agent Hub:
+
+| Inventory Signal | Source in Competition | Current Hub Status | Implementation Seam in Hub | Notes & Limitations |
+| :--- | :--- | :--- | :--- | :--- |
+| **Agent Bus Reachability** | `scripts/coordination/agent_bus_transport.py` | **Current Coverage** | `src/hub.ts`, `src/bus.ts` (`/api/messages`) | Native DO-backed message bus replaces ad-hoc HTTP adapter :8788. |
+| **Inbox Backlog & Staleness** | `scripts/ping/inbox-guard.py` | **Current Coverage** | `src/checks.ts` (`kind: 'inbox_backlog'`) | Evaluates pending unread messages past configured `max_age_s`. |
+| **Claims Expiry & Lease Audit** | `scripts/ping/claims-audit.py` | **Current Coverage** | Hub `leases` table + `src/leases.ts` | Linearizable SQLite lease records with epoch fencing replace FileBus claims. |
+| **Desktop Mailbox Watchdog** | `desktop-orchestrator-watchdog.sh` | **Superseded** | `host/agent_hub_host/session_host.py` | Standalone session supervisor replaced by native session host controller. |
+| **Process Liveness & Anti-Reuse** | `scripts/metrics/collect.py` (`proc()`) | **Current Coverage** | `host/agent_hub_host/native_sessions.py` | Uses `/proc/{pid}/stat` `start_ticks` to prevent PID reuse. |
+| **First-Action Execution Receipt** | `scripts/delivery/validate_backlog.py` | **Current Coverage** | Launcher scripts + `.local/first-action-*.json` | Strict verification before admitting worker session. |
+| **Unexplained Idle Over SLO** | `scripts/supervision/service.py` | **Current Coverage** | `src/session_lifecycle.ts` | Stalled/stuck classification in Hub DO lifecycle state engine. |
+| **Resting State Contradiction** | `scripts/supervision/service.py` | **Implemented 6b Port** | `src/session_lifecycle.ts` | Flags sessions reporting idle/waiting with recent activity (`contradicted_resting_state: true`), retaining active classification. |
+| **Pending Message Delivery SLO** | `scripts/supervision/service.py` | **Implemented 6b Port** | `src/checks.ts` (`kind: 'delivery_slo'`) | Detects unacknowledged active messages past SLA threshold (`max_age_s`). |
+| **Consecutive Ping Misses** | `scripts/ping/principal-ping.py` | **Superseded** | Hub Health Model (SPEC §9) | Replaced by Hub DO machine heartbeats and principal wake jobs. |
+| **Approval Modal Stalls** | `python3 -m aplexer_watch` | **Remaining Item** | Standalone Hetzner service during migration | Running via systemd `aplexer-watch.service` until host native capture integration. |
+| **Turn-End Wake Timer Audit** | `scripts/ping/wake-audit.py` | **Superseded** | Serverless DO Triggers / Cron | Hub replaces brittle turn-end wake audit with managed background alarms. |
+| **Provider Window Quota** | `scripts/quota-monitor.py` | **Current Coverage** | `src/quota.ts`, `host/agent_hub_host/quota.py` | `/api/quota` enforces fail-closed 15% reserve gate across providers. |
+| **Launcher Admission Routes** | `scripts/supervision/service.py` | **Current Coverage** | `src/model-routing.ts`, launcher gates | Enforces model quota reserve before launching workers. |
+| **Monthly Cloud Budget** | `scripts/delivery/cloud_budget.py` | **Current Coverage** | Cloudflare Workers Free Tier policy | Budget capped at $5/mo total; zero-cloud-spend architecture. |
+| **Filesystem Disk Usage** | `scripts/metrics/collect.py` | **Implemented Addendum 6** | `host/agent_hub_host/disk_monitor.py`, `src/monitoring.ts` | Multi-mount statvfs (`/`, `/home`, `/data`, `/tmp`) with 85% warn / 95% critical thresholds. |
+| **Top Space Consumers** | *Missing in competition* | **Implemented Addendum 6** | `host/agent_hub_host/disk_monitor.py` (`scan_top_consumers`) | Bounded traversal (depth, entries, time) triggered only on threshold violations. |
+| **Host Load Average** | `scripts/metrics/collect.py` | **Implemented 6b Port** | `host/agent_hub_host/host_health_monitor.py`, `src/monitoring.ts`, `src/status.ts` | Collects Linux `os.getloadavg()`, ingests to Hub DO, exposes via `/api/monitoring/health` and `/api/status`. |
+| **Host Memory (MemAvailable/total)** | `scripts/metrics/collect.py` | **Implemented 6b Port** | `host/agent_hub_host/host_health_monitor.py`, `src/monitoring.ts`, `src/status.ts` | Parses `/proc/meminfo`, evaluates memory pressure (>=85% warn, >=95% critical), surfaces in `needs_attention`. |
+| **Worker Process RSS & CPU** | `scripts/metrics/collect.py` | **Current Coverage** | `host/agent_hub_host/metrics_producer.py`, `src/metrics.ts` | Aggregates per-session utime, stime, RSS to Hub `/api/metrics`. |
+| **Cgroup Memory & Tasks Containment** | `scripts/supervision/service.py` | **Current Coverage** | Systemd user units / launcher limits | MemoryMax=1500M, TasksMax=256 enforced per agent worker unit. |
+| **Local Private Storage Guard** | `scripts/supervision/retention.py` | **Current Coverage** | `host/agent_hub_host/session_cleanup.py` | Soft 128 MiB, hard 256 MiB limits on `.local/` state directories. |
+| **Git Ancestry & Remote Drift** | `scripts/checks/status_probe.py` | **Current Coverage** | `host/agent_hub_host/status_probe.py` (`probe_git`) | Computes divergence, unmerged commits against `origin/main`. |
+| **CI Workflow Status Drift** | `scripts/checks/status_probe.py` | **Current Coverage** | `host/agent_hub_host/status_probe.py` (`probe_ci`) | Surfaces latest GitHub Actions status for current HEAD SHA. |
+| **Deployed Artifact Bundle Drift** | `scripts/checks/status_probe.py` | **Current Coverage** | `host/agent_hub_host/status_probe.py` (`probe_deploy`) | Queries active Cloudflare Workers deployment ID and bundle hash. |
+| **Task Registry Concurrency (CAS)** | `scripts/delivery/tasks_guard.py` | **Implemented Bugfix** | `src/monitoring.ts` -> `src/intake.ts` | Enforces atomic task version CAS, user history preservation, and bounded episode deduplication. |
+| **Repo Hygiene & Secret Scans** | `scripts/checks/secrets.sh` | **Current Coverage** | `scripts/ci/`, gitignore policy | Strict ban on committing secrets, private paths, or API tokens. |
+| **Metrics Collector Staleness** | `scripts/root/headless-root-run.sh` | **Implemented 6b Port** | `src/monitoring.ts`, `src/status.ts` | Evaluates observation age; marks `fresh` (<180s), `stale` (180s-900s), or `missing` (>900s). |
+| **Supervisor Status Staleness** | `supervision_watcher.sh` | **Superseded** | Hub DO Health Engine | Centralized DO heartbeat evaluations supersede brittle local watcher files. |
+| **Host Agent Check-in Stale/Dead** | `docs/SPEC.md` §9 | **Current Coverage** | `src/status.ts` (`isStaleHost`) | Host heartbeat staleness evaluated dynamically in `/api/status`. |
+| **Headless Root Heartbeat Stale** | `scripts/root/headless-root-run.sh` | **Current Coverage** | Hub root job scheduler and lease fencing | Epoch fencing and heartbeat tracking in `leases` table. |
+| **Task Failure & Error Trapping** | `scripts/delivery/validate_backlog.py` | **Current Coverage** | `src/intake.ts`, `src/status.ts` | Captures error strings, timeout codes, failure counters, and next actions. |
+

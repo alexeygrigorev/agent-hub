@@ -667,4 +667,84 @@ describe('Disk Monitoring Service', () => {
     expect(summaryUnavail.categories_entry.freshness).toBe('stale');
     expect(summaryUnavail.categories_entry.coverage).toBe('partial');
   }));
+
+  it('accepts valid host health observation and evaluates memory pressure alerts', () => fixture(async (hub, clock) => {
+    enrollHost(hub.sql, 'host-health-1');
+    const auth = { kind: 'host' as const, machine_id: 'host-health-1', tokenId: 'cred-host-health-1' };
+
+    // 1. Post normal health
+    const reqNormal = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'host-health-1',
+        observed_at: iso(10),
+        load: { load1: 0.5, load5: 0.8, load15: 1.0 },
+        memory: {
+          total_bytes: 16_000_000_000,
+          available_bytes: 8_000_000_000,
+          used_bytes: 8_000_000_000,
+          percent: 50.0,
+          status: 'ok',
+        },
+      }),
+    });
+
+    const resNormal = await hub.monitoringService.handleHostHealthObservation(reqNormal, auth);
+    expect(resNormal.status).toBe(200);
+
+    const getRes = await hub.monitoringService.handleHostHealthGet(
+      new Request('https://hub.internal/api/monitoring/health'),
+      { caller: { isAdmin: true } },
+    );
+    expect(getRes.status).toBe(200);
+    const getBody: any = await getRes.json();
+    expect(getBody.machines).toHaveLength(1);
+    expect(getBody.machines[0].machine_id).toBe('host-health-1');
+    expect(getBody.machines[0].freshness).toBe('fresh');
+    expect(getBody.machines[0].load.load1).toBe(0.5);
+    expect(getBody.machines[0].memory.percent).toBe(50.0);
+
+    // 2. Post critical memory pressure (96%) -> opens alert
+    const reqCrit = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'host-health-1',
+        observed_at: iso(5),
+        load: { load1: 4.5, load5: 3.8, load15: 2.0 },
+        memory: {
+          total_bytes: 16_000_000_000,
+          available_bytes: 640_000_000,
+          used_bytes: 15_360_000_000,
+          percent: 96.0,
+          status: 'critical',
+        },
+      }),
+    });
+
+    const resCrit = await hub.monitoringService.handleHostHealthObservation(reqCrit, auth);
+    expect(resCrit.status).toBe(200);
+
+    // Verify alert opened in liveness
+    const alerts = hub.livenessService.evaluate().subjects;
+    const summary = hub.monitoringService.getStatusSummary(clock.t);
+    expect(summary.host_health).toHaveLength(1);
+    expect(summary.host_health[0].memory.status).toBe('critical');
+    expect(summary.needs_attention.some((n: any) => n.subject === 'host-health-1:memory' && n.severity === 'critical')).toBe(true);
+
+    // 3. Reject spoofed machine_id
+    const reqSpoof = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'other-host',
+        observed_at: iso(5),
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50.0, status: 'ok' },
+      }),
+    });
+    const resSpoof = await hub.monitoringService.handleHostHealthObservation(reqSpoof, auth);
+    expect(resSpoof.status).toBe(403);
+  }));
 });

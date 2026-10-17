@@ -162,6 +162,25 @@ class TestStatusCli(unittest.TestCase):
         transport.assert_not_called()
         self.assertIn('Logged in', out)
 
+    def test_render_human_includes_host_health(self):
+        dto = dict(FIXTURE_DTO)
+        dto['host_health'] = [{
+            'machine_id': 'host-hetzner',
+            'freshness': 'fresh',
+            'load': {'load1': 0.75, 'load5': 1.10, 'load15': 1.25},
+            'memory': {
+                'total_bytes': 16 * 1024 * 1024 * 1024,
+                'used_bytes': 8 * 1024 * 1024 * 1024,
+                'available_bytes': 8 * 1024 * 1024 * 1024,
+                'percent': 50.0,
+                'status': 'ok'
+            }
+        }]
+        rendered = status.render_human(dto)
+        self.assertIn('host health:', rendered)
+        self.assertIn('host-hetzner: load=0.75, 1.10, 1.25', rendered)
+        self.assertIn('mem=8.0GB/16.0GB (50.0%, 8.0GB avail) [fresh]', rendered)
+
 
 if __name__ == '__main__':
     unittest.main()

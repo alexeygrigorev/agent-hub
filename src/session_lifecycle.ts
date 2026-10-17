@@ -166,6 +166,14 @@ function collectFlags(input: SessionInput, now: number): { flags: string[]; obli
   if (input.screen_done) flags.push('screen_done');
   if (input.terminal_evidence) flags.push(`terminal_${input.terminal_evidence}`);
   if (input.superseded_by) flags.push('superseded_marker');
+
+  const activity = input.last_activity_at ? ISO(input.last_activity_at) : null;
+  const observed = input.observed_at ? ISO(input.observed_at) : null;
+  const resting = ['idle', 'waiting'].includes((input.agent_state ?? '').toLowerCase()) || (input.phase ?? '').toLowerCase() === 'waiting';
+  if (resting && activity != null && observed != null && activity > observed + 1000 && activity <= now) {
+    flags.push('contradicted_resting_state');
+  }
+
   return { flags, obligations };
 }
 
@@ -263,6 +271,9 @@ export function classifySession(input: SessionInput, config: LifecycleConfig = {
   // Future or present-malformed activity is never fresh provenance, even with a running phase.
   const activityValid = !hasActivityRaw || (activity != null && activity <= now);
   const phase = (input.phase ?? '').toLowerCase();
+  if (flags.includes('contradicted_resting_state')) {
+    reasons.push('resting state contradicted: PTY activity after reported idle/waiting state');
+  }
   if (hasFreshObserved && activityValid && (phase === 'running' || hasFreshActivity)) {
     if (!hasFreshActivity) reasons.push('running phase with fresh observation');
     else reasons.push('fresh activity within idle threshold');

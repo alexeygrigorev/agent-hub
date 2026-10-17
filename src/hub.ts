@@ -440,6 +440,22 @@ export class Hub extends DurableObject {
         }
         return Response.json({ error: 'method_not_allowed' }, { status: 405 });
       }
+      if (path === '/api/monitoring/health' || path === '/api/monitoring/host') {
+        if (request.method === 'POST') {
+          const resolved = await this.statusObservationAuth(request);
+          if ((resolved as any).error) return (resolved as any).error;
+          return this.monitoringService.handleHostHealthObservation(request, (resolved as any).auth);
+        }
+        if (request.method === 'GET') {
+          const auth = await this.authenticateBusRequest(request);
+          if (auth.caller?.isAdmin) {
+            const session = await getSession(this.env, request);
+            if (session) auth.caller.actor = 'human:' + session.sub;
+          }
+          return this.monitoringService.handleHostHealthGet(request, auth);
+        }
+        return Response.json({ error: 'method_not_allowed' }, { status: 405 });
+      }
       if (path === '/api/status') {
         // M14d: GET stays the readonly paginated projection; POST projects
         // the COMPLETE bounded summary and advances the caller's own

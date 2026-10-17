@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS hub_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS hub_check_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, at TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, action TEXT);
 ` + CHECK_SLOT_SCHEMA;
 
-export const CHECK_KINDS = ['liveness', 'quota', 'http', 'inbox_backlog', 'conversation_backlog', 'routine'] as const;
+export const CHECK_KINDS = ['liveness', 'quota', 'http', 'inbox_backlog', 'conversation_backlog', 'delivery_slo', 'routine'] as const;
 // 40 characters keeps check-<name>-<slot> within the 64-character fleet idempotency key.
 const NAME = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 const LABEL = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
@@ -56,6 +56,10 @@ export function validateCheck(c: any): { row: any } | { error: string } {
   }
   if (c.kind === 'quota' && params.min_percent !== undefined && (typeof params.min_percent !== 'number' || params.min_percent < 0 || params.min_percent > 100)) return { error: 'invalid_min_percent' };
   if (c.kind === 'inbox_backlog' && (typeof params.actor !== 'string' || !TEXT(params.actor, 128) || !Number.isInteger(params.max_age_s) || params.max_age_s < 60)) return { error: 'invalid_backlog_params' };
+  if (c.kind === 'delivery_slo') {
+    if (params.actor !== undefined && (typeof params.actor !== 'string' || !TEXT(params.actor, 128))) return { error: 'invalid_slo_actor' };
+    if (params.max_age_s !== undefined && (!Number.isInteger(params.max_age_s) || params.max_age_s < 60 || params.max_age_s > 86400)) return { error: 'invalid_slo_max_age' };
+  }
   if (c.kind === 'conversation_backlog') {
     if (!canonicalTarget(params.actor) || !Number.isSafeInteger(params.max_age_s) || params.max_age_s < 60 || params.max_age_s > 604800) return { error: 'invalid_backlog_params' };
     if (params.conversation_id !== undefined && !safeId(params.conversation_id)) return { error: 'invalid_conversation_id' };
@@ -233,6 +237,18 @@ export class ChecksService {
         const cutoff = this.now() - p.max_age_s * 1000;
         const n = Number(this.sql.exec('SELECT COUNT(*) AS n FROM messages WHERE to_actor = ? AND acked_at IS NULL AND created_at < ? AND expires_at > ?', p.actor, cutoff, this.now()).one().n);
         return n ? { status: 'fail', detail: `${n} unacknowledged message(s) for ${p.actor} older than ${p.max_age_s}s` } : { status: 'pass', detail: `inbox of ${p.actor} is current` };
+      }
+      case 'delivery_slo': {
+        const maxAgeS = p.max_age_s ?? 300;
+        const cutoff = this.now() - maxAgeS * 1000;
+        let count = 0;
+        if (p.actor) {
+          count = Number(this.sql.exec('SELECT COUNT(*) AS n FROM messages WHERE to_actor = ? AND acked_at IS NULL AND created_at < ? AND expires_at > ?', p.actor, cutoff, this.now()).one().n);
+          return count ? { status: 'fail', detail: `${count} unacknowledged message(s) for ${p.actor} older than ${maxAgeS}s (delivery SLO violated)` } : { status: 'pass', detail: `delivery SLO met for ${p.actor} (${maxAgeS}s limit)` };
+        } else {
+          count = Number(this.sql.exec('SELECT COUNT(*) AS n FROM messages WHERE acked_at IS NULL AND created_at < ? AND expires_at > ?', cutoff, this.now()).one().n);
+          return count ? { status: 'fail', detail: `${count} unacknowledged message(s) older than ${maxAgeS}s (delivery SLO violated)` } : { status: 'pass', detail: `delivery SLO met across all inboxes (${maxAgeS}s limit)` };
+        }
       }
       case 'conversation_backlog': {
         if (!deps.conversation) return { status: 'error', detail: 'conversation_unavailable' };

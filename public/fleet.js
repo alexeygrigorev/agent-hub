@@ -188,6 +188,47 @@ function renderDisk(disk) {
   }
   root.append(richTable(['Machine', 'Mount', 'Status', 'Usage', 'Used / Total', 'Free', 'Daily Trend', 'Top Consumers'], rows));
 }
+function healthBadge(status) {
+  const span = document.createElement('span');
+  span.className = 'dk-badge ' + (status === 'critical' ? 'dk-badge--danger' : status === 'warn' ? 'dk-badge--warning' : status === 'fresh' ? 'dk-badge--success' : 'dk-badge--warning');
+  span.textContent = status || 'unknown';
+  return span;
+}
+function renderHostHealth(health) {
+  const root = byId('host-health');
+  if (!root) return;
+  root.replaceChildren();
+  if (!health || health.error) {
+    const p = document.createElement('p');
+    p.textContent = health && health.error ? `Host health unavailable: ${health.error}` : 'No host health reports yet.';
+    root.append(p);
+    return;
+  }
+  const hosts = Array.isArray(health.hosts) ? health.hosts : [];
+  if (!hosts.length) {
+    const p = document.createElement('p');
+    p.textContent = 'No host health reports collected yet. Enable host health monitoring on reporting hosts.';
+    root.append(p);
+    return;
+  }
+  const rows = [];
+  for (const h of hosts) {
+    const loadStr = h.load ? `${h.load.load1.toFixed(2)}, ${h.load.load5.toFixed(2)}, ${h.load.load15.toFixed(2)}` : 'unknown';
+    const mem = h.memory || {};
+    const memUsage = mem.percent !== undefined && mem.percent !== null ? `${mem.percent}%` : 'unknown';
+    const memBytes = `${formatBytes(mem.used_bytes)} / ${formatBytes(mem.total_bytes)} (avail ${formatBytes(mem.available_bytes)})`;
+    rows.push([
+      h.machine_id,
+      healthBadge(h.freshness),
+      loadStr,
+      healthBadge(mem.status),
+      memUsage,
+      memBytes,
+      ago(h.age_s)
+    ]);
+  }
+  root.append(richTable(['Machine', 'Freshness', 'Load (1m, 5m, 15m)', 'Memory Status', 'Memory Usage', 'Used / Total (Avail)', 'Observed'], rows));
+}
 async function refresh() {
   if (refreshing) return;
   refreshing = true; byId('fleet-refresh').disabled = true;
@@ -206,6 +247,11 @@ async function refresh() {
       renderDisk(await api('/api/monitoring/disk'));
     } catch (e) {
       renderDisk({ error: e.message });
+    }
+    try {
+      renderHostHealth(await api('/api/monitoring/health'));
+    } catch (e) {
+      renderHostHealth({ error: e.message });
     }
     byId('status').textContent = `Authenticated · updated ${new Date().toLocaleTimeString()}`;
   }

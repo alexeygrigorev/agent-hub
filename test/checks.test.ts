@@ -137,6 +137,22 @@ describe('running checks', () => {
     expect((await checks.runDue(deps))[0].status).toBe('fail');
   }));
 
+  it('detects unacknowledged messages exceeding delivery SLO', () => fixture(async (checks, deps, clock, sql) => {
+    // Insert an unacknowledged message created 400s ago (> 300s standard limit)
+    sql.exec("INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES ('slo-1', 'hub', 'agent-a', 'note', 'slo-1', 'task', 'k1', ?, ?)", start - 400000, start + 86400000);
+    checks.replace([row({ name: 'delivery-slo', kind: 'delivery_slo', interval_s: 300, params: { max_age_s: 300 } })]);
+    const res = await checks.runDue(deps);
+    expect(res[0].status).toBe('fail');
+    expect(res[0].detail).toContain('unacknowledged message(s) older than 300s (delivery SLO violated)');
+
+    // When message is acknowledged, check passes
+    sql.exec("UPDATE messages SET acked_at = ? WHERE id = 'slo-1'", start);
+    clock.t += 300000;
+    const resPass = await checks.runDue(deps);
+    expect(resPass[0].status).toBe('pass');
+    expect(resPass[0].detail).toContain('delivery SLO met');
+  }));
+
   it('the liveness check opens per-subject alerts and notifies once', () => fixture(async (checks, deps, clock, sql) => {
     sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, drained) VALUES (?, ?, ?, ?, ?, 0)', 'laptop', 'laptop', 'laptop', new Date(start).toISOString(), new Date(start - 3600000).toISOString());
     const [result] = await checks.runDue(deps);

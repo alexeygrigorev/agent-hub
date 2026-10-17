@@ -149,6 +149,26 @@ def render_human(data):
                 escape_display(fs.get('status')),
                 primary_str,
                 trend_str))
+    host_health = data.get('host_health') or []
+    if host_health:
+        lines.append('host health:')
+        for h in host_health:
+            load = h.get('load') or {}
+            mem = h.get('memory') or {}
+            total_gb = (mem.get('total_bytes') or 0) / (1024 ** 3)
+            used_gb = (mem.get('used_bytes') or 0) / (1024 ** 3)
+            avail_gb = (mem.get('available_bytes') or 0) / (1024 ** 3)
+            lines.append('  %s: load=%.2f, %.2f, %.2f mem=%.1fGB/%.1fGB (%.1f%%, %.1fGB avail) [%s]' % (
+                escape_display(h.get('machine_id')),
+                float(load.get('load1') or 0.0),
+                float(load.get('load5') or 0.0),
+                float(load.get('load15') or 0.0),
+                used_gb,
+                total_gb,
+                float(mem.get('percent') or 0.0),
+                avail_gb,
+                escape_display(h.get('freshness', 'unknown')),
+            ))
     cats = data.get('categories') or {}
     summary = data.get('summary')
     if isinstance(summary, dict):
