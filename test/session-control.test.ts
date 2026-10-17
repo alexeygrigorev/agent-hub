@@ -13,7 +13,14 @@ const unauth = { error: Response.json({ error: 'unauthorized' }, { status: 401 }
 const NATIVE_ID = '11111111-1111-4111-8111-111111111111';
 const NATIVE_WS = '/srv/hub/demo';
 const NATIVE_TAG = 'hub-tag-1';
+const NATIVE_CREATED = 1792223000000;
 const native = () => ({ native_id: NATIVE_ID, tag: NATIVE_TAG, workspace: NATIVE_WS });
+const bound = (over: any = {}) => ({ native_id: NATIVE_ID, tag: NATIVE_TAG, workspace: NATIVE_WS, native_created_at_ms: NATIVE_CREATED, ...over });
+const ATTEMPT = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
+const ATTEMPT2 = 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb';
+const goodProof = () => ({ native_message_id: 'nmsg-1', reply_to_native_id: 'nreply-1',
+  reply_digest: 'a'.repeat(64), sender_native_id: NATIVE_ID, sender_tag: NATIVE_TAG,
+  sender_workspace: NATIVE_WS, sender_generation: 1, sender_created_at_ms: NATIVE_CREATED });
 
 function request(path: string, data?: any, method = 'POST') {
   return new Request('https://hub.test' + path, { method, body: data === undefined ? undefined : JSON.stringify(data) });
@@ -53,15 +60,15 @@ async function startOk(s: SessionControlService, extra: any = {}, auth: any = ad
 }
 
 async function bindHttp(s: SessionControlService, sessionId: string, machine = 'hetzner', extra: any = {}) {
-  const res = await s.handle(request(`/api/sessions/${sessionId}/binding`, { native: { ...native(), ...extra } }), host(machine));
+  const res = await s.handle(request(`/api/sessions/${sessionId}/binding`, { native: { ...bound(), ...extra } }), host(machine));
   const data = await res.json() as any;
   expect(res.status, JSON.stringify(data)).toBe(200);
   expect(data.state).toBe('running');
   return data;
 }
 
-async function claimAs(s: SessionControlService, commandId: string, correlation: string, machine = 'hetzner') {
-  const res = await s.handle(request(`/api/session-commands/${commandId}/claim`, { correlation }), host(machine));
+async function claimAs(s: SessionControlService, commandId: string, correlation: string, machine = 'hetzner', attemptId = ATTEMPT) {
+  const res = await s.handle(request(`/api/session-commands/${commandId}/claim`, { correlation, attempt_id: attemptId }), host(machine));
   const data = await res.json() as any;
   expect(res.status, JSON.stringify(data)).toBe(200);
   return data;
@@ -82,6 +89,7 @@ describe('hub session control durable queue', () => {
       { key: 'k2', workspace: 'demo', tier: 'ultra' },
       { key: 'k2b', workspace: 'demo', tier: 'quick' }, // tier has no fleet consumer
       { key: 'k3', workspace: 'demo', cwd: '../escape' },
+      { key: 'k3b', workspace: 'demo', cwd: 'demo/project' }, // cwd has no fleet start consumer
       { key: 'k4', workspace: 'demo', cwd: '/absolute' },
       { key: 'k5', workspace: 'demo', mode: 'interactive', brief: 'inject' },
       { key: 'k6', workspace: 'demo', brief: '' },
@@ -90,6 +98,8 @@ describe('hub session control durable queue', () => {
     }
     const tiered = await s.handle(request('/api/sessions', { key: 'k2b', workspace: 'demo', tier: 'quick' }), admin);
     expect((await tiered.json() as any).error).toBe('unsupported_tier');
+    const cwd = await s.handle(request('/api/sessions', { key: 'k3b', workspace: 'demo', cwd: 'demo/project' }), admin);
+    expect((await cwd.json() as any).error).toBe('unsupported_cwd');
   }));
 
   it('rejects tier before placement and never sends it to fleet', async () => {
@@ -128,7 +138,7 @@ describe('hub session control durable queue', () => {
   it('passes engine/machine/workspace as real placement constraints, never cwd/tier', async () => {
     const fake = fakeReserve();
     await fixture(async (s) => {
-      await startOk(s, { engine: 'codex', machine: 'hetzner', cwd: 'demo/project', brief: 'goal' }, admin, 'constraints-1');
+      await startOk(s, { engine: 'codex', machine: 'hetzner', brief: 'goal' }, admin, 'constraints-1');
       expect(fake.calls.length).toBe(1);
       const sent = fake.calls[0];
       expect(sent.engine).toBe('codex');
@@ -137,6 +147,9 @@ describe('hub session control durable queue', () => {
       expect(sent.prompt).toBe('goal');
       expect(sent).not.toHaveProperty('cwd');
       expect(sent).not.toHaveProperty('tier');
+      // Non-root cwd is rejected BEFORE any reservation, not passed through.
+      expect((await s.handle(request('/api/sessions', { key: 'cwd-x', workspace: 'demo', cwd: 'demo/project' }), admin)).status).toBe(400);
+      expect(fake.calls.length).toBe(1);
     }, fake.hook);
   });
 
@@ -174,7 +187,7 @@ describe('hub session control durable queue', () => {
     const fake = fakeReserve();
     await fixture(async (s) => {
       const session: any = await startOk(s, {}, admin, 'bound-1');
-      expect(s.recordBinding(session.id, { native_id: NATIVE_ID, tag: NATIVE_TAG, workspace: NATIVE_WS })).toMatchObject({ ok: true });
+      expect(s.recordBinding(session.id, bound())).toMatchObject({ ok: true });
       const first = await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'send-1', body: 'prompt one' }), admin);
       expect(first.status).toBe(201);
       const replay = await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'send-1', body: 'prompt one' }), admin);
@@ -228,22 +241,22 @@ describe('hub session control durable queue', () => {
       // Foreign machine cannot bind; conflicting native id is never adopted.
       expect((await s.handle(request(`/api/sessions/${session.id}/binding`, { native: native() }), host('win35'))).status).toBe(404);
       const conflict = await s.handle(request(`/api/sessions/${session.id}/binding`,
-        { native: { native_id: '22222222-2222-4222-8222-222222222222', tag: NATIVE_TAG, workspace: NATIVE_WS } }), host('hetzner'));
+        { native: { native_id: '22222222-2222-4222-8222-222222222222', tag: NATIVE_TAG, workspace: NATIVE_WS, native_created_at_ms: NATIVE_CREATED } }), host('hetzner'));
       expect(conflict.status).toBe(409);
       expect((await s.handle(request(`/api/sessions/${session.id}/binding`, { native: { native_id: 'not-a-uuid', tag: NATIVE_TAG, workspace: NATIVE_WS } }), host('hetzner'))).status).toBe(400);
     }, fake.hook);
   });
 
-  it('carries cwd to host offers while fleet input stays exact', async () => {
+  it('exposes a null cwd in host offers while rejecting non-root cwd at start', async () => {
     const fake = fakeReserve();
     await fixture(async (s) => {
-      const session: any = await startOk(s, { machine: 'hetzner', cwd: 'demo/project' }, admin, 'cwd-1');
+      const session: any = await startOk(s, { machine: 'hetzner' }, admin, 'cwd-1');
       expect(fake.calls[0]).not.toHaveProperty('cwd');
       await bindHttp(s, session.id);
       await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'c1', body: 'go' }), admin);
       const offers = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any;
       expect(offers.offers.length).toBe(1);
-      expect(offers.offers[0].cwd).toBe('demo/project');
+      expect(offers.offers[0].cwd).toBe(null);
       expect(offers.offers[0].workspace).toBe('demo');
     }, fake.hook);
   });
@@ -252,7 +265,7 @@ describe('hub session control durable queue', () => {
     const fake = fakeReserve();
     await fixture(async (s) => {
       const session: any = await startOk(s, { machine: 'hetzner' }, admin, 'poll-1');
-      s.recordBinding(session.id, { native_id: NATIVE_ID, tag: NATIVE_TAG, workspace: NATIVE_WS });
+      s.recordBinding(session.id, bound());
       await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'p1', body: 'go' }), admin);
       const foreign = await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('win35'));
       expect((await foreign.json() as any).offers).toEqual([]);
@@ -276,13 +289,18 @@ describe('hub session control durable queue', () => {
       // Transport mark alone never authorizes an ack.
       expect((await s.handle(request(ackUrl, { correlation: offer.correlation, outcome: 'transported', native: native(), claim_token: 'bogus' }), host('hetzner'))).status).toBe(409);
       // Rival machine cannot claim; wrong correlation cannot claim.
-      expect((await s.handle(request(`/api/session-commands/${offer.command_id}/claim`, { correlation: offer.correlation }), host('win35'))).status).toBe(404);
-      expect((await s.handle(request(`/api/session-commands/${offer.command_id}/claim`, { correlation: 'wrong' }), host('hetzner'))).status).toBe(409);
+      expect((await s.handle(request(`/api/session-commands/${offer.command_id}/claim`, { correlation: offer.correlation, attempt_id: ATTEMPT }), host('win35'))).status).toBe(404);
+      expect((await s.handle(request(`/api/session-commands/${offer.command_id}/claim`, { correlation: 'wrong', attempt_id: ATTEMPT }), host('hetzner'))).status).toBe(409);
       const claim = await claimAs(s, offer.command_id, offer.correlation);
       expect(claim.attempt).toBe(1);
       // Same holder replays its own unexpired claim (lost-reply reconciliation).
       const replay = await claimAs(s, offer.command_id, offer.correlation);
       expect(replay.claim_token).toBe(claim.claim_token);
+      // A second attempt nonce on the same machine is refused: one claim
+      // authorizes exactly one effect, never another executor.
+      const rival = await s.handle(request(`/api/session-commands/${offer.command_id}/claim`, { correlation: offer.correlation, attempt_id: ATTEMPT2 }), host('hetzner'));
+      expect(rival.status).toBe(409);
+      expect((await rival.json() as any).error).toBe('already_claimed');
       // Wrong token cannot ack even with the right correlation.
       expect((await s.handle(request(ackUrl, { correlation: offer.correlation, outcome: 'transported', native: native(), claim_token: 'bogus' }), host('hetzner'))).status).toBe(409);
       const done = await s.handle(request(ackUrl, { correlation: offer.correlation, outcome: 'transported', native: native(), claim_token: claim.claim_token }), host('hetzner'));
@@ -305,7 +323,7 @@ describe('hub session control durable queue', () => {
         new Date(Date.now() - 1000).toISOString(), offer.command_id);
       const late = await s.handle(request(`/api/session-commands/${offer.command_id}/ack`,
         { correlation: offer.correlation, outcome: 'delivered', native: native(), claim_token: claim.claim_token,
-          proof: { reply_to: offer.correlation, sender_native_id: NATIVE_ID, sender_tag: NATIVE_TAG, sender_workspace: NATIVE_WS, sender_generation: 1, envelope_id: 'env-1' } }),
+          proof: goodProof() }),
         host('hetzner'));
       expect(late.status).toBe(409);
       expect((await late.json() as any).error).toBe('claim_expired');
@@ -317,30 +335,39 @@ describe('hub session control durable queue', () => {
     }, fake.hook);
   });
 
-  it('requires correlated receiver proof for delivered sends', async () => {
+  it('requires host-verified native reply provenance for delivered sends', async () => {
     const fake = fakeReserve();
     await fixture(async (s) => {
       const session: any = await startOk(s, { machine: 'hetzner' }, admin, 'proof-1');
       await bindHttp(s, session.id);
       await s.handle(request(`/api/sessions/${session.id}/send`, { key: 's1', body: 'go' }), admin);
+      await s.handle(request(`/api/sessions/${session.id}/send`, { key: 's2', body: 'go again' }), admin);
       const poll = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any;
-      const offer = poll.offers[0];
-      const claim = await claimAs(s, offer.command_id, offer.correlation);
-      const ackUrl = `/api/session-commands/${offer.command_id}/ack`;
-      const base = { correlation: offer.correlation, outcome: 'delivered', native: native(), claim_token: claim.claim_token };
+      const [first, second] = poll.offers;
+      const c1 = await claimAs(s, first.command_id, first.correlation);
+      const ackUrl = (id: string) => `/api/session-commands/${id}/ack`;
+      const base = { correlation: first.correlation, outcome: 'delivered', native: native(), claim_token: c1.claim_token };
       // Host assertion without proof is not delivery.
-      expect((await s.handle(request(ackUrl, base), host('hetzner'))).status).toBe(409);
-      // Foreign sender UUID fails; stale generation fails; replayed correlation fails.
-      const good = { reply_to: offer.correlation, sender_native_id: NATIVE_ID, sender_tag: NATIVE_TAG, sender_workspace: NATIVE_WS, sender_generation: 1, envelope_id: 'env-1' };
-      for (const proof of [
-        { ...good, sender_native_id: '33333333-3333-4333-8333-333333333333' },
-        { ...good, sender_generation: 0 },
-        { ...good, reply_to: 'cmd:00000000-0000-4000-8000-000000000000:gen:1' },
-        { ...good, sender_workspace: '/srv/hub/other' },
-      ]) {
-        expect((await s.handle(request(ackUrl, { ...base, proof }), host('hetzner'))).status, JSON.stringify(proof)).toBe(409);
+      expect((await s.handle(request(ackUrl(first.command_id), base), host('hetzner'))).status).toBe(409);
+      // Foreign sender UUID fails; stale generation/created_at fails; a
+      // message is never its own reply; bad digest shape fails.
+      const good = goodProof();
+      for (const [name, proof] of [
+        ['foreign', { ...good, sender_native_id: '33333333-3333-4333-8333-333333333333' }],
+        ['stale-gen', { ...good, sender_generation: 0 }],
+        ['stale-created', { ...good, sender_created_at_ms: NATIVE_CREATED - 1 }],
+        ['self-reply', { ...good, reply_to_native_id: good.native_message_id }],
+        ['bad-digest', { ...good, reply_digest: 'zz' }],
+      ] as any) {
+        expect((await s.handle(request(ackUrl(first.command_id), { ...base, proof }), host('hetzner'))).status, name).toBe(409);
       }
-      expect((await s.handle(request(ackUrl, { ...base, proof: good }), host('hetzner'))).status).toBe(200);
+      expect((await s.handle(request(ackUrl(first.command_id), { ...base, proof: good }), host('hetzner'))).status).toBe(200);
+      // The same native reply envelope never confirms a second command.
+      const c2 = await claimAs(s, second.command_id, second.correlation);
+      const replay = await s.handle(request(ackUrl(second.command_id),
+        { correlation: second.correlation, outcome: 'delivered', native: native(), claim_token: c2.claim_token, proof: good }), host('hetzner'));
+      expect(replay.status).toBe(409);
+      expect((await replay.json() as any).error).toBe('proof_replayed');
     }, fake.hook);
   });
 
@@ -403,11 +430,11 @@ describe('hub session control durable queue', () => {
     const fake = fakeReserve();
     await fixture(async (s) => {
       const session: any = await startOk(s, {}, admin, 'rebind-1');
-      expect(s.recordBinding(session.id, { native_id: NATIVE_ID, tag: NATIVE_TAG, workspace: NATIVE_WS })).toMatchObject({ ok: true });
+      expect(s.recordBinding(session.id, bound())).toMatchObject({ ok: true });
       const second: any = await startOk(s, {}, admin, 'rebind-2');
-      expect(s.recordBinding(second.id, { native_id: '22222222-2222-4222-8222-222222222222', tag: NATIVE_TAG, workspace: NATIVE_WS })).toMatchObject({ ok: true });
+      expect(s.recordBinding(second.id, bound({ native_id: '22222222-2222-4222-8222-222222222222' }))).toMatchObject({ ok: true });
       // Same session rebound to a different native id is a conflict, never silent adoption.
-      const direct = s.recordBinding(session.id, { native_id: '99999999-9999-4999-8999-999999999999', tag: NATIVE_TAG, workspace: NATIVE_WS });
+      const direct = s.recordBinding(session.id, bound({ native_id: '99999999-9999-4999-8999-999999999999' }));
       expect(direct).toMatchObject({ ok: false, error: 'binding_conflict' });
     }, fake.hook);
   });
@@ -445,21 +472,25 @@ describe('hub session control durable queue', () => {
   });
 });
 
-describe('send proof validator', () => {
-  const expected = { correlation: 'cmd:abc:gen:1', native_id: NATIVE_ID, tag: NATIVE_TAG, workspace: NATIVE_WS, generation: 1 };
-  const good = { reply_to: 'cmd:abc:gen:1', sender_native_id: NATIVE_ID, sender_tag: NATIVE_TAG, sender_workspace: NATIVE_WS, sender_generation: 1, envelope_id: 'env-1' };
-  it('accepts the exact correlated sender envelope', () => {
+describe('send proof validator (host-verified native reply provenance)', () => {
+  const expected = { native_id: NATIVE_ID, tag: NATIVE_TAG, workspace: NATIVE_WS, generation: 1, native_created_at_ms: NATIVE_CREATED };
+  const good = { native_message_id: 'nmsg-1', reply_to_native_id: 'nreply-1', reply_digest: 'b'.repeat(64),
+    sender_native_id: NATIVE_ID, sender_tag: NATIVE_TAG, sender_workspace: NATIVE_WS,
+    sender_generation: 1, sender_created_at_ms: NATIVE_CREATED };
+  it('accepts the exact native reply provenance', () => {
     expect(validateSendProof(good, expected)).toEqual({ ok: true });
   });
-  it('rejects missing, foreign, stale, and replayed proofs', () => {
+  it('rejects missing, foreign, stale, self-reply, and malformed proofs', () => {
     expect(validateSendProof(undefined, expected)).toMatchObject({ ok: false, error: 'proof_required' });
     expect(validateSendProof({ ...good, sender_native_id: '33333333-3333-4333-8333-333333333333' }, expected))
       .toMatchObject({ ok: false, error: 'proof_sender_mismatch' });
     expect(validateSendProof({ ...good, sender_generation: 0 }, expected))
       .toMatchObject({ ok: false, error: 'proof_generation_stale' });
-    expect(validateSendProof({ ...good, reply_to: 'cmd:other:gen:1' }, expected))
-      .toMatchObject({ ok: false, error: 'correlation_replay' });
-    expect(validateSendProof({ ...good, envelope_id: '' }, expected))
+    expect(validateSendProof({ ...good, sender_created_at_ms: 1 }, expected))
+      .toMatchObject({ ok: false, error: 'proof_generation_stale' });
+    expect(validateSendProof({ ...good, reply_to_native_id: good.native_message_id }, expected))
+      .toMatchObject({ ok: false, error: 'proof_reply_mismatch' });
+    expect(validateSendProof({ ...good, reply_digest: 'short' }, expected))
       .toMatchObject({ ok: false, error: 'invalid_proof_shape' });
   });
 });

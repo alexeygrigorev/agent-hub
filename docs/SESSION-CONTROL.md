@@ -75,8 +75,7 @@ UUIDs are `crypto.randomUUID()`; ids in paths match
 
 Request: `key` (required idempotency label per `(actor, key)`), `workspace`
 (required label), `engine` / `machine` (optional labels, REAL fleet route
-constraints), `cwd` (optional relative path, enforced by the host at start),
-`brief` (optional headless prompt, 1..8000 chars), `mode`
+constraints), `brief` (optional headless prompt, 1..8000 chars), `mode`
 (`headless`|`interactive`, interactive starts empty), `access` (optional
 claim-admission declaration passed through to fleet).
 
@@ -85,6 +84,14 @@ claim-admission declaration passed through to fleet).
 (`src/fleet.ts` plan keys), and inventing a tier-to-placement mapping would be
 a new provider dispatcher, which is out of scope. Select `engine`/`machine`
 explicitly instead.
+
+`cwd` is rejected with `400 unsupported_cwd` BEFORE any reservation: fleet
+plan strictly rejects unknown keys, and the host cannot retroactively change
+a launched cwd, so carrying cwd in a side table would NOT make the existing
+fleet start honor it. Launches happen at the workspace root until an actual
+existing start adapter consumes the constraint. The `cwd` field stays in host
+offers (always null today) for that future adapter; the hub never claims an
+executed cwd from the binding.
 
 Behavior:
 
@@ -99,50 +106,65 @@ Behavior:
    fleet reserve stays idempotent on its derived key, so replays and crash
    recovery cannot double-launch. Without a reserve hook the intent is held
    with `no_placement_authority`.
-4. `cwd` is NOT sent to fleet (rejected key there). It is persisted in the
-   session intent, carried in every host offer, and the host resolves it
-   strictly inside its configured root at start time, refusing
-   traversal/escape. That is how the constraint reaches the executed start.
+4. `cwd` is NOT sent to fleet (rejected key there). Non-root values are
+   rejected with `400 unsupported_cwd` before any reservation; the offer
+   field is reserved for the future start adapter that consumes it.
 
-### Claim / ack discipline (per-command fence)
+### Claim / ack discipline (one-time attempt fence)
 
 1. Host polls `offers` (marks `recorded` -> `transported` fetch receipt only).
-2. Host claims ONE command: `POST .../claim {correlation}`. Atomic
-   compare-and-swap to `claimed` with holder machine, opaque claim token,
-   expiry (default 5 min), and attempt counter. Same-holder reclaim replays
-   the token (lost-reply reconciliation); rival claims get 409; expired
-   claims become `uncertain` and are never re-offered.
+2. Host claims ONE command: `POST .../claim {correlation, attempt_id}` where
+   `attempt_id` is the host's own journaled execution-attempt nonce (one per
+   command per local mutex). The grant is atomic compare-and-swap to
+   `claimed` with holder machine, fresh unpredictable claim token, expiry
+   (default 5 min), and attempt counter. Reclaim with the SAME attempt id
+   replays the token (lost-reply reconciliation by the same attester); any
+   other attempt id on the same machine gets `409 already_claimed` and a
+   rival machine gets `409 claim_conflict` — one claim authorizes exactly
+   one effect, never another executor. Expired claims become `uncertain`
+   and are never re-offered.
 3. Host executes ONLY after the claim, re-verifying the exact binding
-   (native UUID + tag + workspace + generation) immediately before the effect.
+   (native UUID + tag + workspace + generation + native_created_at)
+   immediately before the effect.
 4. Host acks with `{correlation, outcome, native, claim_token, ...}`. Only
    the live claim holder may ack; an ack after lease expiry marks the command
    `uncertain` (the effect may have happened) and is rejected with
    `claim_expired` — never marked delivered, never reissued.
 
-### Correlated delivery proof (exact shape)
+### Correlated delivery proof (host-verified native reply provenance)
 
-SEND `delivered` requires `proof` (else `409 proof_required`); `transported`
-is the honest outcome for PTY-bytes-only delivery. The validator
-(`validateSendProof`, unit-tested positive + foreign/stale/replayed/empty
-cases) enforces:
+Deliberately NOT cryptographic target authentication: the hub cannot verify
+native envelopes server-side. The host retrieves the native log/envelope
+itself, verifies the reply references the delivered message, and attests the
+provenance below. The hub checks shape, exact sender binding, reply linkage,
+and global envelope uniqueness. A bare object echoing the public
+correlation with a non-empty id is NOT proof; absent proof keeps the command
+at recorded / transported / uncertain. SEND `delivered` requires `proof`
+(else `409 proof_required`); `transported` is the honest outcome for
+PTY-bytes-only delivery. The validator (`validateSendProof`, unit-tested)
+enforces:
 
 ```json
 proof: {
-  "reply_to": "cmd:<command_id>:gen:<generation>",
+  "native_message_id": "<original native envelope id of the delivered message>",
+  "reply_to_native_id": "<native envelope id of the target reply referencing it>",
+  "reply_digest": "<sha256 hex of the reply envelope as observed by the host>",
   "sender_native_id": "<exact native sender UUID>",
   "sender_tag": "<exact native tag>",
   "sender_workspace": "<absolute canonical native workspace>",
   "sender_generation": 1,
-  "envelope_id": "<native reply/log id referencing the correlation>"
+  "sender_created_at_ms": 1792223000000
 }
 ```
 
-Rules: `reply_to` must equal the command correlation (foreign or replayed
-correlations fail); the sender triple plus generation must equal the session
-binding (tag reuse across generations cannot leak); `envelope_id` must be
-non-empty. The sibling host worker supplies the receiver mechanism
-(reply-to vs. log scan); this validator is the shared agreement point.
-Without a receiver, hosts report `transported`/`uncertain` honestly.
+Rules: the reply envelope must differ from the message envelope; digest must
+be 64-hex; the sender triple plus generation plus `native_created_at_ms`
+must equal the session binding (binding without `native_created_at_ms` is
+rejected, so incarnation evidence is mandatory); each reply envelope
+confirms at most one command (`session_control_proofs` primary key — reuse
+is `409 proof_replayed`). The sibling host worker supplies the receiver
+mechanism (reply-to vs. log scan) and journals `attempt_id`; this shape is
+the shared agreement point.
 
 Capture output is projected on the host BEFORE upload, bounded
 (`max_bytes` 1..65536), server-redacted with the existing routing `redact`
@@ -199,8 +221,10 @@ surfaces (no silent hint).
 - `session_control_commands(id, session_id, kind, actor, request_key,
   payload_json, state, generation, correlation, poll_at, ack_json,
   owner_token_id, owner_family, holder_machine, claim_token,
-  claim_expires_at, attempts, created_at, updated_at,
+  claim_expires_at, holder_attempt, attempts, created_at, updated_at,
   UNIQUE(session_id, actor, request_key))`
+- `session_control_proofs(reply_envelope_id PRIMARY KEY, command_id,
+  session_id, created_at)` — each native reply confirms at most one command.
 
 Caps: 2000 pending commands globally, 200 per session, 20 offers per poll,
 100 rows per page with `next_cursor`; refusals are `429 queue_full` /
@@ -210,14 +234,16 @@ rows, complete pagination).
 
 ## Acceptance (source only; physical gates stay with head)
 
-- Real SQLite/HTTP tests (`test/session-control.test.ts`, 19 cases):
-  auth/unscoped, input validation, tier-before-placement, honest hold,
-  idempotent start/conflict, constraint passthrough (fleet-exact keys),
-  fleet-400 passthrough, held replay, unbound refusal, send idempotency,
-  owner isolation, refresh-family continuity vs. rebound rejection, HTTP
-  binding route (conflict/foreign/UUID-shape), cwd in offers, poll-once,
-  claim fence (rival/correlation/token), expiry-to-uncertain with no
-  re-offer, proof-required + foreign/stale/replayed proof rejection,
+- Real SQLite/HTTP tests (`test/session-control.test.ts`, 26 cases):
+  auth/unscoped, input validation, tier-before-placement, cwd-before-
+  reservation (`unsupported_cwd`), honest hold, idempotent start/conflict,
+  constraint passthrough (fleet-exact keys), fleet-400 passthrough, held
+  replay, unbound refusal, send idempotency, owner isolation,
+  refresh-family continuity vs. rebound rejection, HTTP binding route
+  (mandatory created_at, conflict/foreign/UUID-shape), null cwd in offers,
+  poll-once, one-time claim fence (rival/correlation/token/already_claimed),
+  expiry-to-uncertain with no re-offer, native-envelope proof (required +
+  foreign/stale/self-reply/digest + cross-command replay rejection),
   stop-confirmed-exit, refused/uncertain retention, capture redaction,
   binding-conflict on tag reuse, cursor pagination completeness, queue caps.
 - Host CLI tests (`host/tests/test_session_control.py`, 11 cases): paths,

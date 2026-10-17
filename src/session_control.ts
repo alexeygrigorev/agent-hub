@@ -25,6 +25,7 @@ import { redact } from './routing';
 export const SESSION_CONTROL_SCHEMA = `
 CREATE TABLE IF NOT EXISTS session_control_sessions (id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, fleet_launch_id TEXT, machine_id TEXT, engine TEXT, mode TEXT NOT NULL, state TEXT NOT NULL, binding_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
 CREATE TABLE IF NOT EXISTS session_control_commands (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, request_key TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, correlation TEXT NOT NULL, poll_at TEXT, ack_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(session_id, actor, request_key));
+CREATE TABLE IF NOT EXISTS session_control_proofs (reply_envelope_id TEXT PRIMARY KEY, command_id TEXT NOT NULL, session_id TEXT NOT NULL, created_at TEXT NOT NULL);
 `;
 
 type Caller = { kind?: string; actor?: string; isAdmin?: boolean; machineId?: string; tokenId?: string };
@@ -80,46 +81,59 @@ async function body(request: Request): Promise<any> {
   } catch { return null; } finally { reader.releaseLock(); }
 }
 
-/** Exact correlated receiver proof required before a SEND may be marked delivered.
+/** Host-verified native reply provenance required before a SEND is marked delivered.
  *
- * The target must echo the hub-issued correlation in a native reply/log
- * envelope that names the exact native sender triple (UUID + tag + workspace)
- * and the hub binding generation observed before the effect. Anything else —
- * host assertion, PTY bytes, inbox persistence, unrelated terminal activity —
- * must be reported as recorded / transported / uncertain instead.
+ * This is deliberately NOT cryptographic target authentication: the hub cannot
+ * verify native envelopes server-side. The host retrieves the native log /
+ * envelope itself, verifies the reply references the delivered message
+ * (correlation/digest), and attests the provenance below. The hub checks
+ * shape, exact sender binding (UUID + tag + workspace + generation +
+ * native_created_at), reply linkage, and global envelope uniqueness — a bare
+ * object echoing the public correlation with a non-empty id is NOT proof and
+ * any absent proof keeps the command at recorded / transported / uncertain.
  */
 export type SendProof = {
-  reply_to: string;
+  native_message_id: string;
+  reply_to_native_id: string;
+  reply_digest: string;
   sender_native_id: string;
   sender_tag: string;
   sender_workspace: string;
   sender_generation: number;
-  envelope_id: string;
+  sender_created_at_ms: number;
 };
 
 export type SendProofExpectation = {
-  correlation: string;
   native_id: string;
   tag: string;
   workspace: string;
   generation: number;
+  native_created_at_ms: number;
 };
+
+const HEX64 = /^[0-9a-f]{64}$/i;
 
 export function validateSendProof(proof: any, expected: SendProofExpectation): { ok: true } | { ok: false; error: string } {
   const fail = (error: string) => ({ ok: false as const, error });
   if (!proof || typeof proof !== 'object' || Array.isArray(proof)) return fail('proof_required');
-  const keys = ['reply_to', 'sender_native_id', 'sender_tag', 'sender_workspace', 'sender_generation', 'envelope_id'];
+  const keys = ['native_message_id', 'reply_to_native_id', 'reply_digest', 'sender_native_id',
+    'sender_tag', 'sender_workspace', 'sender_generation', 'sender_created_at_ms'];
   if (!obj(proof, keys)) return fail('invalid_proof_shape');
-  if (typeof proof.reply_to !== 'string' || typeof proof.envelope_id !== 'string' || !proof.envelope_id) return fail('invalid_proof_shape');
-  // A proof that does not echo this command's correlation is foreign or replayed.
-  if (proof.reply_to !== expected.correlation) return fail('correlation_replay');
+  if (typeof proof.native_message_id !== 'string' || !proof.native_message_id || proof.native_message_id.length > 256 ||
+      typeof proof.reply_to_native_id !== 'string' || !proof.reply_to_native_id || proof.reply_to_native_id.length > 256 ||
+      typeof proof.reply_digest !== 'string' || !HEX64.test(proof.reply_digest)) return fail('invalid_proof_shape');
+  // A message is never its own reply; the reply envelope must reference the
+  // delivered message envelope as retrieved from the native log by the host.
+  if (proof.reply_to_native_id === proof.native_message_id) return fail('proof_reply_mismatch');
   if (typeof proof.sender_native_id !== 'string' || !UUID_V4.test(proof.sender_native_id) ||
       typeof proof.sender_tag !== 'string' || !proof.sender_tag ||
       typeof proof.sender_workspace !== 'string' || !proof.sender_workspace ||
-      !Number.isInteger(proof.sender_generation)) return fail('invalid_proof_shape');
+      !Number.isInteger(proof.sender_generation) ||
+      !Number.isInteger(proof.sender_created_at_ms) || proof.sender_created_at_ms <= 0) return fail('invalid_proof_shape');
   if (proof.sender_native_id !== expected.native_id || proof.sender_tag !== expected.tag ||
       proof.sender_workspace !== expected.workspace) return fail('proof_sender_mismatch');
-  if (proof.sender_generation !== expected.generation) return fail('proof_generation_stale');
+  if (proof.sender_generation !== expected.generation ||
+      proof.sender_created_at_ms !== expected.native_created_at_ms) return fail('proof_generation_stale');
   return { ok: true };
 }
 
@@ -149,7 +163,7 @@ export class SessionControlService {
       if (!sessionCols.has(col)) this.sql.exec(`ALTER TABLE session_control_sessions ADD COLUMN ${col} ${type}`);
     }
     const commandCols = new Set(this.sql.exec('PRAGMA table_info(session_control_commands)').toArray().map((c: any) => String(c.name)));
-    for (const [col, type] of [['owner_token_id', 'TEXT'], ['owner_family', 'TEXT'], ['holder_machine', 'TEXT'], ['claim_token', 'TEXT'], ['claim_expires_at', 'TEXT'], ['attempts', 'INTEGER DEFAULT 0']] as const) {
+    for (const [col, type] of [['owner_token_id', 'TEXT'], ['owner_family', 'TEXT'], ['holder_machine', 'TEXT'], ['claim_token', 'TEXT'], ['claim_expires_at', 'TEXT'], ['holder_attempt', 'TEXT'], ['attempts', 'INTEGER DEFAULT 0']] as const) {
       if (!commandCols.has(col)) this.sql.exec(`ALTER TABLE session_control_commands ADD COLUMN ${col} ${type}`);
     }
   }
@@ -230,7 +244,7 @@ export class SessionControlService {
 
   /** Server-internal binding seam (used by tests and future hub wiring after
    * the fleet claim/result half). The HTTP binding route below is the host path. */
-  recordBinding(sessionId: string, binding: { native_id: string; tag: string; workspace: string }): { ok: true; generation: number } | { ok: false; error: string } {
+  recordBinding(sessionId: string, binding: { native_id: string; tag: string; workspace: string; native_created_at_ms: number }): { ok: true; generation: number } | { ok: false; error: string } {
     return this.transaction(() => this.applyBinding(sessionId, binding, null));
   }
 
@@ -241,8 +255,10 @@ export class SessionControlService {
     if (typeof binding.native_id !== 'string' || !UUID_V4.test(binding.native_id) ||
         typeof binding.tag !== 'string' || !binding.tag || binding.tag.startsWith('-') ||
         !absoluteWorkspaceOk(binding.workspace)) return { ok: false as const, error: 'invalid_binding' };
-    if (binding.native_created_at_ms !== undefined &&
-        (!Number.isInteger(binding.native_created_at_ms) || binding.native_created_at_ms <= 0 || binding.native_created_at_ms > this.now() + 60000)) {
+    // Native incarnation evidence is mandatory: UUID + tag + workspace +
+    // generation alone is hub-side only without the native created_at.
+    if (!Number.isInteger(binding.native_created_at_ms) || (binding.native_created_at_ms as number) <= 0 ||
+        (binding.native_created_at_ms as number) > this.now() + 60000) {
       return { ok: false as const, error: 'invalid_binding' };
     }
     const prior = row.binding_json ? parsed(row.binding_json, null) : null;
@@ -254,7 +270,7 @@ export class SessionControlService {
     const generation = (prior?.generation ?? 0) + 1;
     this.sql.exec('UPDATE session_control_sessions SET state = ?, binding_json = ?, updated_at = ? WHERE id = ?',
       'running', JSON.stringify({ native_id: binding.native_id, tag: binding.tag, workspace: binding.workspace, generation,
-        ...(binding.native_created_at_ms !== undefined ? { native_created_at_ms: binding.native_created_at_ms } : {}),
+        native_created_at_ms: binding.native_created_at_ms,
         ...(reporter ? { reported_by: reporter } : {}), reported_at: this.at() }), this.at(), sessionId);
     return { ok: true as const, generation };
   }
@@ -297,6 +313,11 @@ export class SessionControlService {
       // tiers select models, not launches). Reject explicitly BEFORE any effect
       // rather than recording a hint the placement silently discards.
       if (input.tier !== undefined) return response({ error: 'unsupported_tier', detail: 'tier has no fleet placement consumer; select engine/machine explicitly' }, 400);
+      // cwd is not consumed by the existing fleet start adapter either (fleet
+      // plan strictly rejects unknown keys, and the host cannot retroactively
+      // change a launched cwd). Any non-root cwd is rejected BEFORE the
+      // reservation; the hub never claims an executed cwd from the binding.
+      if (input.cwd !== undefined) return response({ error: 'unsupported_cwd', detail: 'cwd has no fleet start consumer yet; launch at the workspace root' }, 400);
       const mode = input.mode || 'headless';
       if (mode === 'interactive' && input.brief !== undefined) {
         return response({ error: 'interactive_starts_empty' }, 400);
@@ -341,8 +362,8 @@ export class SessionControlService {
         }
         // engine / machine / workspace / mode / prompt reach the existing fleet
         // reserve as REAL placement constraints (exact route match + M6/M8 gates).
-        // cwd is not a fleet plan key: it is carried in the host offer payload
-        // and enforced by the host inside its configured root at start time.
+        // cwd and tier are rejected above: fleet plan keys are fixed and the hub
+        // never ships a constraint the placement silently discards.
         const reserved = this.hooks.reserve({
           mode, machine: input.machine, engine: input.engine, workspace: input.workspace,
           prompt: input.brief || '', access: input.access,
@@ -489,8 +510,8 @@ export class SessionControlService {
             // sessions (stop on offered) carry binding null + fleet correlation.
             binding: binding ? { native_id: binding.native_id, tag: binding.tag, workspace: binding.workspace, generation: binding.generation } : null,
             native_tag: binding?.tag ?? null, workspace: requestJson.workspace ?? null,
-            // cwd reaches the executed start: the host resolves it strictly
-            // inside its configured root and refuses traversal/escape.
+            // Reserved for the future start adapter that consumes cwd; the hub
+            // rejects non-root cwd today and never claims an executed cwd.
             cwd: requestJson.cwd ?? null,
             payload: parsed(row.payload_json, null), correlation: row.correlation,
           });
@@ -504,7 +525,11 @@ export class SessionControlService {
     if (claimMatch && request.method === 'POST') {
       if (!host) return response({ error: 'forbidden' }, 403);
       const input = await body(request);
-      if (!obj(input, ['correlation']) || typeof input.correlation !== 'string' || !input.correlation) {
+      // attempt_id is the host's own journaled execution-attempt nonce (one per
+      // command per local mutex). It lets the SAME attester reconcile a lost
+      // claim reply without ever authorizing a SECOND executor.
+      if (!obj(input, ['correlation', 'attempt_id']) || typeof input.correlation !== 'string' || !input.correlation ||
+          typeof input.attempt_id !== 'string' || !UUID_RE.test(input.attempt_id)) {
         return response({ error: 'invalid_claim' }, 400);
       }
       return this.transaction(() => {
@@ -515,24 +540,26 @@ export class SessionControlService {
         const gate = this.hostOk(session, caller);
         if (!gate.ok) return response({ error: gate.error }, gate.error === 'not_found' ? 404 : 409);
         if (input.correlation !== row.correlation) return response({ error: 'correlation_mismatch' }, 409);
-        // Lost-claim reconciliation: the holder replays its own unexpired claim.
         if (row.state === 'claimed') {
-          if (row.holder_machine === caller.machineId && !this.claimExpired(row)) {
-            return response({ command_id: row.id, claim_token: row.claim_token, expires_at: row.claim_expires_at, attempt: row.attempts ?? 1, replay: true });
-          }
           if (this.claimExpired(row)) {
             this.markUncertain(row, 'claim_expired');
             return response({ error: 'claim_expired' }, 409);
           }
-          return response({ error: 'claim_conflict' }, 409);
+          if (row.holder_machine !== caller.machineId) return response({ error: 'claim_conflict' }, 409);
+          // Same attester (journaled attempt) replays; any other attempt on
+          // this machine is refused: one claim authorizes exactly one effect.
+          if (row.holder_attempt === input.attempt_id) {
+            return response({ command_id: row.id, claim_token: row.claim_token, expires_at: row.claim_expires_at, attempt: row.attempts ?? 1, replay: true });
+          }
+          return response({ error: 'already_claimed' }, 409);
         }
         if (!CLAIMABLE.has(row.state)) return response({ error: row.state === 'uncertain' ? 'command_uncertain' : 'invalid_transition' }, 409);
         const token = crypto.randomUUID();
         const expires = new Date(this.now() + this.claimTtlMs).toISOString();
         const attempt = (row.attempts ?? 0) + 1;
         const written = this.sql.exec(
-          "UPDATE session_control_commands SET state = 'claimed', holder_machine = ?, claim_token = ?, claim_expires_at = ?, attempts = ?, updated_at = ? WHERE id = ? AND state IN ('recorded', 'transported')",
-          caller.machineId, token, expires, attempt, this.at(), row.id);
+          "UPDATE session_control_commands SET state = 'claimed', holder_machine = ?, claim_token = ?, claim_expires_at = ?, holder_attempt = ?, attempts = ?, updated_at = ? WHERE id = ? AND state IN ('recorded', 'transported')",
+          caller.machineId, token, expires, input.attempt_id, attempt, this.at(), row.id);
         if (written.rowsWritten !== 1) return response({ error: 'claim_conflict' }, 409);
         this.adoptHostFamily(session.id, caller);
         return response({ command_id: row.id, claim_token: token, expires_at: expires, attempt });
@@ -588,15 +615,26 @@ export class SessionControlService {
           return response({ error: 'confirmed_exit_required' }, 409);
         }
         if (input.outcome === 'delivered' && row.kind === 'send') {
-          // Correlated receiver proof, not host assertion: the target echoed
-          // this command's correlation from the exact bound native sender.
-          if (!binding) return response({ error: 'session_not_bound' }, 409);
-          const proof = validateSendProof(input.proof, { correlation: row.correlation,
-            native_id: binding.native_id, tag: binding.tag, workspace: binding.workspace, generation: binding.generation ?? 0 });
+          // Host-verified native reply provenance, not host assertion: the
+          // host retrieved the native envelope itself and verified the reply
+          // references the delivered message. The hub checks shape, exact
+          // sender binding, and envelope uniqueness — never crypto identity.
+          if (!binding || binding.native_created_at_ms === undefined || binding.native_created_at_ms === null) {
+            return response({ error: 'native_proof_unavailable' }, 409);
+          }
+          const proof = validateSendProof(input.proof, { native_id: binding.native_id, tag: binding.tag,
+            workspace: binding.workspace, generation: binding.generation ?? 0,
+            native_created_at_ms: binding.native_created_at_ms });
           if (!proof.ok) return response({ error: proof.error }, 409);
+          // Each native reply envelope confirms at most one command: reuse is
+          // replay, whether foreign or duplicated.
+          const seen: any = this.sql.exec('SELECT command_id FROM session_control_proofs WHERE reply_envelope_id = ?',
+            input.proof.reply_to_native_id).toArray()[0];
+          if (seen) return response({ error: 'proof_replayed' }, 409);
         }
         const ack: any = {
           outcome: input.outcome, native: input.native, claim_attempt: row.attempts ?? 1,
+          ...(row.holder_attempt ? { holder_attempt: row.holder_attempt } : {}),
           ...(input.reason !== undefined ? { reason: input.reason } : {}),
           ...(input.capture !== undefined ? { capture: redact(input.capture).slice(0, 65536), capture_truncated: input.capture.length >= 65536 } : {}),
           ...(input.confirmed_exit !== undefined ? { confirmed_exit: input.confirmed_exit === true } : {}),
@@ -606,6 +644,10 @@ export class SessionControlService {
           : input.outcome === 'transported' ? 'transported'
           : input.outcome === 'refused' ? 'refused' : 'uncertain';
         this.sql.exec('UPDATE session_control_commands SET state = ?, ack_json = ?, updated_at = ? WHERE id = ?', state, JSON.stringify(ack), at, row.id);
+        if (state === 'acked' && row.kind === 'send' && input.proof) {
+          this.sql.exec('INSERT INTO session_control_proofs (reply_envelope_id, command_id, session_id, created_at) VALUES (?, ?, ?, ?)',
+            input.proof.reply_to_native_id, row.id, row.session_id, at);
+        }
         if (state === 'acked' && row.kind === 'stop') {
           this.sql.exec("UPDATE session_control_sessions SET state = 'stopped', updated_at = ? WHERE id = ?", at, session.id);
         }
