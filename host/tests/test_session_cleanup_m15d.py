@@ -270,7 +270,7 @@ class TestFleetAllowlistAndCli(unittest.TestCase):
         with self.assertRaises(ValueError):
             fleet.load_settings(str(path))
 
-    def test_cli_apply_posts_key_and_tree_disabled_before_mutation(self):
+    def test_cli_apply_posts_key_and_tree_observes_remote_only(self):
         root = argparse.ArgumentParser()
         sub = root.add_subparsers(dest="cmd", required=True)
         session_control.add_commands(sub)
@@ -281,24 +281,66 @@ class TestFleetAllowlistAndCli(unittest.TestCase):
         with patch.object(session_control, "request", return_value={"apply": True}) as transport:
             session_control.execute(parse("cleanup", "--apply", "--key", "op-1"))
         self.assertEqual(transport.call_args.args[2], {"apply": True, "key": "op-1"})
-        # --tree (bare or fully addressed) is refused BEFORE any POST: no
-        # client-local Git execution exists anymore.
-        with patch.object(session_control, "request") as transport:
-            with self.assertRaises(ValueError):
-                session_control.execute(parse("cleanup", "--apply", "--tree"))
-        transport.assert_not_called()
-        with patch.object(session_control, "request") as transport:
-            with self.assertRaises(ValueError):
-                session_control.execute(
-                    parse("cleanup", "--apply", "--tree", "--machine-id", "h",
-                          "--native-id", "22222222-2222-4222-8222-222222222222",
-                          "--owner", "demo:assistant", "--worktree", "/srv/wt",
-                          "--branch", "feat-x", "--journal-dir", "/srv/j",
-                          "--cleanup-root", "/srv"))
-        transport.assert_not_called()
-        # Defense in depth: the executor stub raises even if called directly.
-        with self.assertRaises(ValueError):
-            session_control._execute_cleanup_tree(parse("cleanup", "--apply", "--tree"), {})
+
+        applied = {
+            "apply": True, "dry_run": False, "operation_key": "op-1", "refused": [], "total": 1,
+            "enqueued": [{"session_key": "h/11111111-1111-4111-8111-111111111111",
+                          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                          "command_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                          "state": "recorded", "replay": False}],
+        }
+        removed = {"id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "state": "acked",
+                   "ack": {"outcome": "delivered", "confirmed_exit": True,
+                           "tree": {"state": "removed", "reason": "owned worktree removed"}}}
+
+        def fake_request(method, path, payload=None):
+            if method == "POST" and path.startswith("/api/sessions/cleanup"):
+                return dict(applied)
+            if method == "GET" and path.startswith("/api/sessions/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/commands"):
+                return {"commands": [dict(removed)], "next_cursor": None}
+            raise AssertionError((method, path))
+
+        # Bare --tree: one POST (enqueue), then read-only observation. The CLI
+        # never executes Git; the tree outcome comes from the host's stop ack.
+        with patch.object(session_control, "request", side_effect=fake_request) as transport:
+            out = session_control.execute(parse("cleanup", "--apply", "--key", "op-1", "--tree"))
+        posts = [c for c in transport.call_args_list if c.args[0] == "POST"]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(out["remote_trees"],
+                         [{"session_key": "h/11111111-1111-4111-8111-111111111111",
+                           "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                           "command_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                           "stop_state": "acked",
+                           "tree": {"state": "removed", "reason": "owned worktree removed"},
+                           "note": None}])
+        self.assertTrue(out["tree_observed"])
+
+        # Pending entries are reported honestly (never exceptions, never success).
+        pending_entry = dict(removed, state="claimed", ack=None)
+        calls = {"n": 0}
+
+        def fake_pending(method, path, payload=None):
+            if method == "POST":
+                return dict(applied)
+            calls["n"] += 1
+            return {"commands": [dict(pending_entry)], "next_cursor": None}
+
+        with patch.object(session_control, "request", side_effect=fake_pending):
+            out = session_control.execute(
+                parse("cleanup", "--apply", "--tree", "--wait", "--timeout", "1", "--interval", "1"))
+        self.assertFalse(out["tree_observed"])
+        self.assertEqual(out["remote_trees"][0]["stop_state"], "claimed")
+        self.assertIsNone(out["remote_trees"][0]["tree"])
+        self.assertIn("deadline", out["remote_trees"][0]["note"])
+        self.assertGreaterEqual(calls["n"], 1)
+
+        # The retired explicit-address scheme is gone from the parser: stale
+        # spellings fail at parse time, never as silent local execution.
+        with self.assertRaises(SystemExit):
+            parse("cleanup", "--apply", "--tree", "--machine-id", "h",
+                  "--native-id", "22222222-2222-4222-8222-222222222222",
+                  "--worktree", "/srv/wt", "--branch", "feat-x",
+                  "--journal-dir", "/srv/j", "--cleanup-root", "/srv")
 
 
 if __name__ == "__main__":

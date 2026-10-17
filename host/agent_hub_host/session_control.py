@@ -113,44 +113,88 @@ def wait_until(deadline, interval, fetch, done, label):
         time.sleep(interval)
 
 
-def _require_cleanup_tree_args(args):
-    """Fail closed BEFORE any server mutation when --tree is under-addressed.
+def _fetch_command_entry(session_id, command_id):
+    """Fetch ONE command entry (bounded cursor walk, no polling).
 
-    The tree step removes exactly ONE explicitly addressed owned worktree/
-    branch. Every address field is required; scope flags alone never address
-    a tree. Validated before POST /api/sessions/cleanup so an invalid tree
-    invocation performs zero writes.
+    Raises ValueError when the command is missing from the server listing;
+    callers reconcile via commands listing instead of blind-retrying.
     """
-    missing = [name for name in ('machine_id', 'native_id', 'owner', 'worktree', 'branch', 'journal_dir')
-               if not getattr(args, name, None)]
-    if missing:
-        raise ValueError('cleanup --apply --tree requires %s (explicit address; scope flags never address a tree)'
-                         % ', '.join('--' + n.replace('_', '-') for n in missing))
-    roots = getattr(args, 'cleanup_root', None)
-    if not roots or not isinstance(roots, list) or not all(isinstance(r, str) and r for r in roots):
-        raise ValueError('cleanup --apply --tree requires at least one --cleanup-root (trusted allowlist)')
-    journal = getattr(args, 'journal_dir', None)
-    if not isinstance(journal, str) or not os.path.isabs(journal):
-        raise ValueError('cleanup --apply --tree requires an absolute --journal-dir')
+    from urllib.parse import quote
+    cursor = None
+    for _ in range(10):
+        path = '/api/sessions/' + session_id + '/commands?limit=100'
+        if cursor:
+            path += '&cursor=' + quote(cursor, safe='')
+        listing = request('GET', path)
+        for entry in listing.get('commands', []):
+            if entry.get('id') == command_id:
+                return entry
+        cursor = listing.get('next_cursor')
+        if not cursor:
+            break
+    raise ValueError('Command missing from server listing; reconcile before retrying')
 
 
-def _execute_cleanup_tree(args, applied):
-    """Client-local --tree execution is DISABLED (fail closed, M15d blocker).
+def _observe_cleanup_trees(args, applied):
+    """Observe the OWNING-HOST tree outcomes for an --apply result (read-only).
 
-    The prior implementation ran Git on the CLI caller machine with
-    caller-supplied --owner/--worktree/--branch/--cleanup-root and synthesized
-    custody, never matching the tree path/branch to the canonical native
-    session binding. That is not remote owning-host cleanup. This stub raises
-    unconditionally (defense in depth); `execute()` refuses --tree BEFORE any
-    HTTP write. Real tree removal will run on the owning host through the
-    canonical M12 claim/effect/ack pipeline (HOST-config roots + binding
-    workspace + live native identity + registered branch).
+    The CLI never executes Git: after the server enqueues owned stops, this
+    polls each enqueued stop command's durable entry (existing commands
+    listing, bounded cursor walk) and reports its stop state plus the host's
+    `ack.tree` outcome (`removed`/`kept`/`uncertain` with the actual reason,
+    or null while the host has not reported one). With `--wait`, polls until
+    every enqueued command is terminal (shared deadline); without it, reports
+    a single pass honestly (pending stays pending). Timeouts and missing
+    entries are reported as data with reconcile notes — never exceptions,
+    never pretend success, and never a blind retry of any effect.
     """
-    raise ValueError(
-        'cleanup --tree client-local execution is disabled (fail closed): '
-        'run `hub sessions cleanup --apply` without --tree to enqueue owned stops; '
-        'the owning host removes the tree via claim/effect/ack and the outcome '
-        'is observed via show/commands')
+    enqueued = applied.get('enqueued', []) if isinstance(applied, dict) else []
+    timeout, interval = check_wait_args(args)
+    deadline = (time.monotonic() + timeout) if timeout is not None else None
+    results: list = []
+    pending = [e for e in enqueued if isinstance(e, dict) and e.get('session_id') and e.get('command_id')]
+    first_pass = True
+    while first_pass or (deadline is not None and pending and time.monotonic() < deadline):
+        first_pass = False
+        for entry in list(pending):
+            try:
+                current = _fetch_command_entry(entry['session_id'], entry['command_id'])
+            except ValueError:
+                continue  # not yet visible; retry within the deadline, else reported pending below
+            state = current.get('state')
+            if state in TERMINAL_COMMAND or deadline is None:
+                tree = (current.get('ack') or {}).get('tree') if isinstance(current.get('ack'), dict) else None
+                results.append({'session_key': entry.get('session_key'),
+                                'session_id': entry.get('session_id'),
+                                'command_id': entry.get('command_id'),
+                                'stop_state': state,
+                                'tree': tree,
+                                'note': ('host has not reported a tree outcome yet; reconcile via show/commands'
+                                         if tree is None else None)})
+                pending.remove(entry)
+        if deadline is None or not pending:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(interval, remaining))
+    for entry in pending:
+        try:
+            current = _fetch_command_entry(entry['session_id'], entry['command_id'])
+            state = current.get('state')
+            tree = (current.get('ack') or {}).get('tree') if isinstance(current.get('ack'), dict) else None
+        except ValueError:
+            state, tree = 'unknown', None
+        results.append({'session_key': entry.get('session_key'),
+                        'session_id': entry.get('session_id'),
+                        'command_id': entry.get('command_id'),
+                        'stop_state': state,
+                        'tree': tree,
+                        'note': ('observation deadline reached; re-check status with the same key, do not blind-retry'
+                                 if timeout is not None else
+                                 'not yet reported; reconcile via show/commands (add --wait to block)')})
+    complete = not pending
+    return {**applied, 'remote_trees': results, 'tree_observed': complete}
 
 
 def wait_for_session(session_id, timeout, interval, *, stopping=False):
@@ -163,28 +207,8 @@ def wait_for_session(session_id, timeout, interval, *, stopping=False):
 
 def wait_for_command(session_id, command_id, timeout, interval):
     deadline = time.monotonic() + timeout
-
-    def fetch():
-        # Bounded complete pagination: commands past the first page (e.g.
-        # command #101) live behind next_cursor; follow it instead of
-        # failing on page one. Capped pages keep the wait bounded.
-        from urllib.parse import quote
-        cursor = None
-        for _ in range(10):
-            path = '/api/sessions/' + session_id + '/commands?limit=100'
-            if cursor:
-                path += '&cursor=' + quote(cursor, safe='')
-            listing = request('GET', path)
-            for entry in listing.get('commands', []):
-                if entry.get('id') == command_id:
-                    return entry
-            cursor = listing.get('next_cursor')
-            if not cursor:
-                break
-        raise ValueError('Command missing from server listing; reconcile before retrying')
-
     return wait_until(deadline, interval,
-                     fetch,
+                     lambda: _fetch_command_entry(session_id, command_id),
                      lambda entry: entry.get('state') in TERMINAL_COMMAND,
                      'Command wait')
 
@@ -236,20 +260,10 @@ def add_commands(sub):
     receive.add_argument('--sender-workspace', default=None, help='Pinned authorized native sender workspace for replyable sends (default: receiver own whoami workspace)')
     receive.add_argument('--settings', default=None, help='Host settings file (subscriptions.json) supplying the trusted cleanup_roots allowlist for the STOP-bundled tree step (default: tree step disabled)')
     cleanup = commands.add_parser('cleanup', help='Plan finished/superseded cleanup (dry-run default; --apply enqueues real M12 stop intents)')
-    cleanup.add_argument('--apply', action='store_true', help='Act: enqueue owned stops via M12 custody (server-authenticated owner only; host executes via claim/ack)')
+    cleanup.add_argument('--apply', action='store_true', help='Act: enqueue owned stops via M12 custody (server-authenticated owner only; owning host executes via claim/ack)')
     cleanup.add_argument('--key', default=None, help='Stable idempotency key for --apply (same key replays, never duplicates)')
-    cleanup.add_argument('--tree', action='store_true', help='DISABLED fail-closed (M15d blocker): client-local tree execution refused before any HTTP; omit --tree, the owning host removes trees via claim/effect/ack')
-    cleanup.add_argument('--machine-id', default=None, help='Cleanup target machine id (with --tree; must be the presenting host)')
-    cleanup.add_argument('--native-id', default=None, help='Cleanup target native session id (with --tree)')
-    # NOTE: --owner already exists above as the scope filter; --tree reuses it
-    # as the tree-target owner (server custody decides, never JSON).
-    cleanup.add_argument('--worktree', default=None, help='Explicit owned worktree path to remove (with --tree; must sit under --cleanup-root)')
-    cleanup.add_argument('--branch', default=None, help='Explicit owned branch to delete (with --tree; must be the worktree branch)')
-    cleanup.add_argument('--journal-dir', default=None, help='Absolute journal directory for durable cleanup records (with --tree)')
-    cleanup.add_argument('--cleanup-root', action='append', default=None, help='Trusted cleanup root (repeatable; with --tree)')
-    cleanup.add_argument('--aplexer-bin', default='aplexer', help='Native executable for live-use inventory (with --tree)')
-    cleanup.add_argument('--actor', default=None, help='Local custody actor (with --tree; default machine:<machine-id>)')
-    cleanup.add_argument('--credential-family', default=None, help='Local custody family label (with --tree; server enforces the real family)')
+    cleanup.add_argument('--tree', action='store_true', help='After enqueue, observe the OWNING-HOST tree outcome remotely (read-only; the CLI never executes Git — add --wait to block until terminal)')
+    add_wait(cleanup)
     cleanup.add_argument('--limit', type=int, default=50)
     cleanup.add_argument('--owner', default=None, help='Scope to one owner (admins only; callers always see their own actor)')
     cleanup.add_argument('--host', default=None, help='Scope to one machine id')
@@ -304,23 +318,20 @@ def execute(args):
             # The owning host executes each enqueued stop through the existing
             # claim/effect/ack path with containment-confirmed exit; tree
             # removal follows on the owning host via the same pipeline
-            # (HOST-config roots + canonical binding workspace, never
-            # caller-supplied paths). Client-local --tree Git execution is
-            # DISABLED fail-closed: refuse BEFORE any HTTP write so an
-            # invalid/future tree invocation performs zero mutations.
-            # Never claim success here:
-            # the server reports enqueued commands + kept reasons.
-            if getattr(args, 'tree', False):
-                raise ValueError(
-                    'cleanup --tree client-local execution is disabled (fail closed): '
-                    'run `hub sessions cleanup --apply` without --tree to enqueue owned stops; '
-                    'the owning host removes the tree via claim/effect/ack and the outcome '
-                    'is observed via show/commands')
+            # (HOST-config roots + canonical binding workspace + live native
+            # identity + discovered branch, never caller-supplied paths).
+            # `--tree` only OBSERVES that remote outcome (read-only commands
+            # listing, bounded); this CLI never executes Git. Never claim
+            # success here: the server reports enqueued commands + kept
+            # reasons, and --tree additionally reports the remote tree
+            # outcomes below.
             body = {'apply': True}
             if getattr(args, 'key', None):
                 body['key'] = args.key
             applied = request('POST', path, body)
-            return applied
+            if not getattr(args, 'tree', False):
+                return applied
+            return _observe_cleanup_trees(args, applied)
         # Dry-run default: read-only plan, zero server mutation.
         return request('POST', path, {'dry_run': True})
     if cmd == 'observe':
