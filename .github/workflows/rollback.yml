@@ -1,0 +1,44 @@
+name: Manual Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_id:
+        description: "Exact Cloudflare Worker Version ID to restore at 100% (e.g. cf8aef89-43de-4732-a2aa-e34ce91a426d)"
+        required: true
+        type: string
+      message:
+        description: "Reason / message for rollback deployment annotation"
+        required: false
+        default: "Manual rollback via GitHub Actions"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Deploy Version at 100%
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          VERSION="${{ github.event.inputs.version_id }}"
+          MSG="${{ github.event.inputs.message }}"
+          echo "Rolling back agent-hub to version $VERSION at 100%..."
+          npx wrangler versions deploy "$VERSION@100%" --message "$MSG" --yes
+          echo "Active versions following rollback:"
+          npx wrangler versions list

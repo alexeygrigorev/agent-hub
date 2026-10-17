@@ -1,0 +1,140 @@
+name: CI / CD Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "host/**"
+      - "public/**"
+      - "scripts/**"
+      - "wrangler.jsonc"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+      - "vitest.config.ts"
+      - ".github/workflows/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "host/**"
+      - "public/**"
+      - "scripts/**"
+      - "wrangler.jsonc"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+      - "vitest.config.ts"
+      - ".github/workflows/**"
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: "Skip tests before deploying (emergency only)"
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: "Perform dry-run deploy only (wrangler deploy --dry-run)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shared device login (DataTalksClub/auth)
+        uses: actions/checkout@v4
+        with:
+          repository: DataTalksClub/auth
+          path: .deps/auth
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Validate CI/CD workflows and scripts
+        run: |
+          python3 scripts/ci/validate-workflow.py
+          python3 scripts/ci/test_ci.py
+
+      - name: Focused Worker tests (Vitest)
+        run: npx vitest run test/human-auth.test.ts test/token-auth.test.ts test/session-control.test.ts test/fleet.test.ts
+
+      - name: Build Hub CLI zipapp
+        run: python3 scripts/build-hub-cli.py --out-dir public/cli
+
+      - name: Worker dry-run build verification
+        run: npm run build
+
+      - name: Python critical regressions
+        env:
+          DTC_AUTH_HOME: ${{ github.workspace }}/.deps/auth
+        run: |
+          python -m pip install pytest
+          python -m pytest -q host/tests/test_human_auth.py host/tests/test_cli.py host/tests/test_session_control.py test/test_scripts.py
+
+  deploy:
+    needs: test
+    if: |
+      always() &&
+      (needs.test.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.skip_tests == true)) &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build Hub CLI zipapp & manifest
+        run: |
+          python3 scripts/build-hub-cli.py --out-dir public/cli
+          ls -la public/cli
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Deploy to Cloudflare Workers
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          SHORT_SHA=$(git rev-parse --short=12 HEAD)
+          FULL_SHA=$(git rev-parse HEAD)
+          if [ "${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true }}" = "true" ]; then
+            echo "Dry-run deployment requested..."
+            npx wrangler deploy --dry-run --outdir dist
+          else
+            echo "Deploying Worker agent-hub: tag=$SHORT_SHA source_commit=$FULL_SHA"
+            npx wrangler deploy --tag "$SHORT_SHA" --message "source_commit=$FULL_SHA"
+            echo "Deployment succeeded. Current active versions:"
+            npx wrangler versions list
+          fi
