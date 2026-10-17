@@ -1,4 +1,5 @@
 # M4 Conversation Links R2 Repair Review (`docs/reviews/CONVERSATION-LINKS-R2.md`)
+> Head publication note: the original Argon record remains at `fc5bd30dc7e0ee135158007bd2add1edc79e66ab`. Its historical table cell for the prior review at `1a15cb1` is corrected to absent: that report was first added in `ab3b953`. Evidence paths are now relative to the reviewer worktree. No source, test result or attributed verdict changed.
 
 **Verdict**: **SCOPED ACCEPT** (scoped strictly to the exact M4 repaired composed source commit `7b6f7ffeac48cc8fc26a357e100c03da7360d017`; all four prior `REVISE` findings `F1`–`F4` from `docs/reviews/CONVERSATION-LINKS.md` on `1a15cb1513db147cd51f970e11edf5ad3df9abf3` are resolved and independently verified via real-Worker Miniflare SQLite HTTP and storage probes; **`0` High, `0` Medium, `0` Low** open findings on `7b6f7ffeac48cc8fc26a357e100c03da7360d017`).
 
@@ -24,7 +25,7 @@ All `9` changed/added paths between `16d66d69708268ab84089447534f0439e0bfd893` a
 | --- | --- | --- | --- | --- |
 | `docs/CONVERSATION-LINKS.md` | `new` | `18016f5f762c08b8928b977bf9738ac227fd9dbaa388270ec9353c76f26eb86d` | `1e255f4dae488d8ce93dad6a9666738a6ae956ba5e9f8e3fbc85789c42326f06` | `9,217` |
 | `docs/CONVERSATIONS.md` | `38fc8d3ecbded91f06ede50ecdcbc73f49a4b8d79a715542e7063206749f33cb` | `a2c436dd7070321d8de86133c28ad6dfb07b4485aee993aee1971995cf12a8b4` | `a3048bf523a4b52496769e5da2faedfe67fe23c5e55d4b1099fa822befb585fc` | `46,205` |
-| `docs/reviews/CONVERSATION-LINKS.md` | `new` (in `ab3b953dbbad`) | `9e168c620dc3063d3a3a6686695b3634ec4ebc14f8ba2ce682136812c78d4dcf` | `9e168c620dc3063d3a3a6686695b3634ec4ebc14f8ba2ce682136812c78d4dcf` (unchanged) | `29,550` |
+| `docs/reviews/CONVERSATION-LINKS.md` | `new` (in `ab3b953dbbad`) | `absent` (first added in `ab3b953`) | `9e168c620dc3063d3a3a6686695b3634ec4ebc14f8ba2ce682136812c78d4dcf` (unchanged) | `29,550` |
 | `src/conversation-hub.ts` | `948457385592374ab455523a5727614fcff1c12661c954b707e011c8cf0e0b72` | `3c842cfbdea05c2e4c466ac4c9db41c4075b1186ad4339c90c687f7518d4f0ab` | `7a8e44ceb47dc717f088d46e3f0c620b3746ac949fc2ad8eba78fb0dd0255be8` | `6,409` |
 | `src/conversation-links.ts` | `new` | `25c129baa86791a0356f7c2436dc62a2cba3b159f7eb0c3e9f371a062320d83f` | `3574d057647e1a602e1637f5e8b2d9fb5eeebbce70c7a46d05c161569312a331` | `20,496` |
 | `src/conversations.ts` | `2448644aa7462e1a09c73890014989850242cbefd79e9cad841d4e866c6c3147` | `57197bd2adea3fb30c996256e45fbb49dbbaaec37f70fda39fab49dbc1fd45c3` | `799521abf77df9e8bc061d3f543bad6e5b32d87aeea11fc96eb5da78cc1763d2` | `126,770` |
@@ -122,7 +123,7 @@ Read-only inspection of the author's `.local/links-r2/final.json`, `progress.md`
 - Author final runs passed `27` selected tests (`8` original links + `11` new r2 links + `2` platform + `5` retention + `1` export) and `tsc --noEmit` (`0` errors) within resource bounds (`7,819,264` B allocated scratch peak).
 
 ### Independent Reviewer Serial Runs & Resource Peaks (`.local/review/runs.jsonl`)
-All reviewer runs executed serially on CPU core `0` (`taskset -c 0`), `umask 077`, `TMPDIR=/home/alexey/git/agent-hub-wt-platform-links-r2-review/.local/tmp`, `UV_THREADPOOL_SIZE=1`, `NODE_OPTIONS=--v8-pool-size=1`, `GOMAXPROCS=1`, and `--configLoader runner` with `cacheDir: '.local/tmp/vite-cache'`.
+All reviewer runs executed serially on CPU core `0` (`taskset -c 0`), `umask 077`, `TMPDIR=${REVIEWER_WORKTREE}/.local/tmp`, `UV_THREADPOOL_SIZE=1`, `NODE_OPTIONS=--v8-pool-size=1`, `GOMAXPROCS=1`, and `--configLoader runner` with `cacheDir: '.local/tmp/vite-cache'`.
 
 | Run Label | Command | Exit | Tests (Pass / Fail) | Duration (s) | Scratch Peak Alloc (B) | Scratch Peak Apparent (B) | Peak Inodes | Cgroup `memory.current` Peak (B) | Cgroup `memory.peak` (B) | Cgroup `pids` (cur / peak) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -142,7 +143,7 @@ All reviewer runs executed serially on CPU core `0` (`taskset -c 0`), `umask 077
 
 - **Tracked review report**: `docs/reviews/CONVERSATION-LINKS-R2.md`
 - **Retained prior review report**: `docs/reviews/CONVERSATION-LINKS.md`
-- **Retained reviewer private evidence (gitignored under `/home/alexey/git/agent-hub-wt-platform-links-r2-review/.local/review/`)**:
+- **Retained reviewer private evidence (gitignored under `${REVIEWER_WORKTREE}/.local/review/`)**:
   - `.local/review/adversarial.probe.test.ts`
   - `.local/review/vitest.adversarial.config.ts`
   - `.local/review/platform.config.ts`

@@ -1,4 +1,5 @@
 # M7 Role Leases R2 — Independent Review
+> Head publication note: the original Grok record remains at `04e42aa2c5d81311c580d139f04e3bddf3a793bd`. The shared dependency path is expressed relative to its worktree; source, results and the attributed verdict are unchanged.
 
 - **Verdict**: `SCOPED ACCEPT`
 - **Review line**: `Review: approved sha=275c84a39766df45c1028f04bc6f7ba8b65c3287 reviewer=platform-role-leases-r2-review/grok-4.6`
@@ -38,7 +39,7 @@ Changed vs merge-base `7fd6097` (the repair under review):
 - `docs/ROLE-LEASES.md`
 - `test/role-leases.test.ts`
 
-`275c84a` itself changes only the contract doc and tests; the SQL fence lives in parent `6a2cbd1`. The exact pin includes both. `package.json` / `package-lock.json` match the existing main-tree install. Declared untracked `node_modules` symlink to `/home/alexey/git/agent-hub/node_modules`; symlink only, no install or copy.
+`275c84a` itself changes only the contract doc and tests; the SQL fence lives in parent `6a2cbd1`. The exact pin includes both. `package.json` / `package-lock.json` match the existing main-tree install. Declared untracked `node_modules` symlink to `${SHARED_HUB_WORKTREE}/node_modules`; symlink only, no install or copy.
 
 ---
 
