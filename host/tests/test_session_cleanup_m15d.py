@@ -219,7 +219,7 @@ class TestFleetAllowlistAndCli(unittest.TestCase):
         with self.assertRaises(ValueError):
             fleet.load_settings(str(path))
 
-    def test_cli_apply_posts_key_and_tree_validates_before_mutation(self):
+    def test_cli_apply_posts_key_and_tree_disabled_before_mutation(self):
         root = argparse.ArgumentParser()
         sub = root.add_subparsers(dest="cmd", required=True)
         session_control.add_commands(sub)
@@ -230,11 +230,24 @@ class TestFleetAllowlistAndCli(unittest.TestCase):
         with patch.object(session_control, "request", return_value={"apply": True}) as transport:
             session_control.execute(parse("cleanup", "--apply", "--key", "op-1"))
         self.assertEqual(transport.call_args.args[2], {"apply": True, "key": "op-1"})
-        # --tree without an explicit address fails closed BEFORE any POST.
+        # --tree (bare or fully addressed) is refused BEFORE any POST: no
+        # client-local Git execution exists anymore.
         with patch.object(session_control, "request") as transport:
             with self.assertRaises(ValueError):
                 session_control.execute(parse("cleanup", "--apply", "--tree"))
         transport.assert_not_called()
+        with patch.object(session_control, "request") as transport:
+            with self.assertRaises(ValueError):
+                session_control.execute(
+                    parse("cleanup", "--apply", "--tree", "--machine-id", "h",
+                          "--native-id", "22222222-2222-4222-8222-222222222222",
+                          "--owner", "demo:assistant", "--worktree", "/srv/wt",
+                          "--branch", "feat-x", "--journal-dir", "/srv/j",
+                          "--cleanup-root", "/srv"))
+        transport.assert_not_called()
+        # Defense in depth: the executor stub raises even if called directly.
+        with self.assertRaises(ValueError):
+            session_control._execute_cleanup_tree(parse("cleanup", "--apply", "--tree"), {})
 
 
 if __name__ == "__main__":

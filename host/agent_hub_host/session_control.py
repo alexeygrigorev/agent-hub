@@ -135,63 +135,22 @@ def _require_cleanup_tree_args(args):
 
 
 def _execute_cleanup_tree(args, applied):
-    """Run the --tree step for ONE explicitly addressed target after enqueue.
+    """Client-local --tree execution is DISABLED (fail closed, M15d blocker).
 
-    The server already authenticated ownership and enqueued the M12 stop
-    intent (see `applied`). The tree is attempted ONLY when the addressed
-    session's stop is confirmed (`stopped`); anything else reports kept
-    (`stop_pending` / server-kept reason) with no git effect. Ownership here
-    comes from the server record (enqueued entry + confirmed session view),
-    never from JSON observation flags.
+    The prior implementation ran Git on the CLI caller machine with
+    caller-supplied --owner/--worktree/--branch/--cleanup-root and synthesized
+    custody, never matching the tree path/branch to the canonical native
+    session binding. That is not remote owning-host cleanup. This stub raises
+    unconditionally (defense in depth); `execute()` refuses --tree BEFORE any
+    HTTP write. Real tree removal will run on the owning host through the
+    canonical M12 claim/effect/ack pipeline (HOST-config roots + binding
+    workspace + live native identity + registered branch).
     """
-    from .native_sessions import SessionControlError as _NativeError
-    from .native_sessions import list_sessions as _list_sessions
-    from .session_cleanup import remove_owned_worktree
-    from .session_executor import CallerCustody
-
-    machine_id = args.machine_id
-    native_id = args.native_id
-    key = '%s/%s' % (machine_id, native_id)
-    enqueued = applied.get('enqueued', []) if isinstance(applied, dict) else []
-    match = next((e for e in enqueued if isinstance(e, dict) and e.get('session_key') == key), None)
-    if match is None:
-        kept = [r for r in (applied.get('refused', []) if isinstance(applied, dict) else [])
-                if isinstance(r, dict) and r.get('key') == key]
-        return {**applied, 'tree': {'state': 'kept', 'session_key': key,
-                                    'reason': '; '.join(sum([r.get('reasons', []) for r in kept], [])) or 'not enqueued by server; listed-only'}}
-    try:
-        view = request('GET', '/api/sessions/' + match['session_id'])
-    except ValueError as exc:
-        return {**applied, 'tree': {'state': 'kept', 'session_key': key, 'session_id': match.get('session_id'),
-                                    'reason': 'stop_pending: session view unavailable (%s); reconciled, do not blind-retry' % type(exc).__name__}}
-    if not isinstance(view, dict) or view.get('state') != 'stopped':
-        return {**applied, 'tree': {'state': 'kept', 'session_key': key, 'session_id': match.get('session_id'),
-                                    'reason': 'stop_pending: session state is %r, not stopped; reconciled, do not blind-retry'
-                                              % ((view or {}).get('state') if isinstance(view, dict) else 'unknown')}}
-    executable = getattr(args, 'aplexer_bin', None) or 'aplexer'
-    try:
-        rows = _list_sessions(executable, include_exited=True)
-        live_paths = [p for row in rows for p in (row.workspace, row.cwd) if isinstance(p, str) and p]
-    except Exception:
-        return {**applied, 'tree': {'state': 'kept', 'session_key': key, 'session_id': match.get('session_id'),
-                                    'reason': 'live_inventory_unavailable: native list failed; listed-only'}}
-    actor = getattr(args, 'actor', None) or ('machine:' + machine_id)
-    family = getattr(args, 'credential_family', None) or ('host-' + machine_id)
-    try:
-        custody = CallerCustody(actor=actor, machine_id=machine_id, credential_family=family).validated()
-    except Exception as exc:
-        return {**applied, 'tree': {'state': 'kept', 'session_key': key, 'session_id': match.get('session_id'),
-                                    'reason': 'invalid custody: %s' % str(exc)[:200]}}
-    try:
-        outcome = remove_owned_worktree(
-            custody=custody, journal_dir=args.journal_dir, machine_id=machine_id,
-            native_id=native_id, expected_owner=args.owner, worktree=args.worktree,
-            branch=args.branch, cleanup_roots=list(args.cleanup_root or []),
-            live_paths=live_paths, command_id=match.get('command_id'))
-    except _NativeError as exc:
-        return {**applied, 'tree': {'state': 'kept', 'session_key': key, 'session_id': match.get('session_id'),
-                                    'reason': str(exc)[:300]}}
-    return {**applied, 'tree': outcome}
+    raise ValueError(
+        'cleanup --tree client-local execution is disabled (fail closed): '
+        'run `hub sessions cleanup --apply` without --tree to enqueue owned stops; '
+        'the owning host removes the tree via claim/effect/ack and the outcome '
+        'is observed via show/commands')
 
 
 def wait_for_session(session_id, timeout, interval, *, stopping=False):
@@ -278,7 +237,7 @@ def add_commands(sub):
     cleanup = commands.add_parser('cleanup', help='Plan finished/superseded cleanup (dry-run default; --apply enqueues real M12 stop intents)')
     cleanup.add_argument('--apply', action='store_true', help='Act: enqueue owned stops via M12 custody (server-authenticated owner only; host executes via claim/ack)')
     cleanup.add_argument('--key', default=None, help='Stable idempotency key for --apply (same key replays, never duplicates)')
-    cleanup.add_argument('--tree', action='store_true', help='After enqueue, remove ONE explicitly addressed owned worktree/branch once its stop is confirmed (requires --machine-id/--native-id/--owner/--worktree/--branch/--journal-dir/--cleanup-root)')
+    cleanup.add_argument('--tree', action='store_true', help='DISABLED fail-closed (M15d blocker): client-local tree execution refused before any HTTP; omit --tree, the owning host removes trees via claim/effect/ack')
     cleanup.add_argument('--machine-id', default=None, help='Cleanup target machine id (with --tree; must be the presenting host)')
     cleanup.add_argument('--native-id', default=None, help='Cleanup target native session id (with --tree)')
     # NOTE: --owner already exists above as the scope filter; --tree reuses it
@@ -341,19 +300,26 @@ def execute(args):
         if getattr(args, 'apply', False):
             # M15d REAL apply: the server enqueues M12 stop intents for
             # freshly eligible OWN sessions (owner custody inside the txn).
-            # The host executes them through the existing claim/effect/ack
-            # path with containment-confirmed exit. Never claim success here:
-            # the server reports enqueued commands + kept reasons, and --tree
-            # additionally reports the worktree outcome below.
+            # The owning host executes each enqueued stop through the existing
+            # claim/effect/ack path with containment-confirmed exit; tree
+            # removal follows on the owning host via the same pipeline
+            # (HOST-config roots + canonical binding workspace, never
+            # caller-supplied paths). Client-local --tree Git execution is
+            # DISABLED fail-closed: refuse BEFORE any HTTP write so an
+            # invalid/future tree invocation performs zero mutations.
+            # Never claim success here:
+            # the server reports enqueued commands + kept reasons.
             if getattr(args, 'tree', False):
-                _require_cleanup_tree_args(args)
+                raise ValueError(
+                    'cleanup --tree client-local execution is disabled (fail closed): '
+                    'run `hub sessions cleanup --apply` without --tree to enqueue owned stops; '
+                    'the owning host removes the tree via claim/effect/ack and the outcome '
+                    'is observed via show/commands')
             body = {'apply': True}
             if getattr(args, 'key', None):
                 body['key'] = args.key
             applied = request('POST', path, body)
-            if not getattr(args, 'tree', False):
-                return applied
-            return _execute_cleanup_tree(args, applied)
+            return applied
         # Dry-run default: read-only plan, zero server mutation.
         return request('POST', path, {'dry_run': True})
     if cmd == 'observe':

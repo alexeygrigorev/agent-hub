@@ -147,11 +147,20 @@ server eligibility), not a second registry or fake apply.
   (`cleanup-<machine>-<nativehex>.json` beside the receiver journals, never
   under a cleanup root) make restart/lost-response replay terminal
   `tree_removed` outcomes and re-evaluate kept ones — never repeating an
-  unsafe deletion. CLI: `hub sessions cleanup --apply [--key KEY]` enqueues
-  stops; adding `--tree --machine-id/--native-id/--owner/--worktree/--branch/
-  --journal-dir/--cleanup-root` additionally removes the addressed tree once
-  its stop reads back `stopped`, else reports `stop_pending` with no git
-  effect. Partial results and uncertainty stay durable; every kept target
+   unsafe deletion. CLI: `hub sessions cleanup --apply [--key KEY]` enqueues
+   stops (stop-only `--apply` is the supported act path). `--tree`
+   client-local execution is DISABLED fail-closed (M15d blocker repair in
+   progress): `cleanup --apply --tree` is refused BEFORE any HTTP write, and
+   no caller-supplied path/branch/root is ever executed. Real tree removal
+   will run on the OWNING host through the canonical M12 claim/effect/ack
+   pipeline (HOST-config roots + canonical binding workspace + live native
+   identity + registered branch; CLI only requests/observes the remote
+   outcome). The `session_cleanup.py` guard set below (trusted-root
+   confinement, registered-worktree exclusivity, clean/lock/live-use checks,
+   FRESH `origin/main` ancestry, ordinary remove then `branch -d`, durable
+   per-target journals) is the guard contract the owning-host effect must
+   satisfy; until the owning-host path ships, no tree is removed by any CLI.
+   Partial results and uncertainty stay durable; every kept target
   reports its actual reason — no pretend success.
   Dry-run stays readonly (pure inputs, zero writes). Tests use only
   disposable synthetic fixture repos/processes wholly inside the owned
@@ -185,9 +194,9 @@ server eligibility), not a second registry or fake apply.
   re-evaluation; pending stops replay; kept targets carry actual reasons).
   No fake apply success exists anywhere in this slice.
 - CLI: `hub sessions` defaults to the grouped lifecycle listing +
-  `hub sessions cleanup [--apply [--key KEY] [--tree ...]]` (dry-run
-  default; `--apply` enqueues owned stops, `--tree` additionally removes the
-  explicitly addressed owned worktree/branch after confirmed stop) +
+  `hub sessions cleanup [--apply [--key KEY]]` (dry-run
+  default; `--apply` enqueues owned stops; `--tree` is DISABLED fail-closed
+  and refused before any HTTP — owning-host removal ships separately) +
   `hub sessions observe` (host observation transport). Existing
   `list/start/send/capture/stop` are preserved; no substitute `lifecycle-*`
   spelling. The TS server is the single classification/planning authority
