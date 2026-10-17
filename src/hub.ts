@@ -401,7 +401,11 @@ export class Hub extends DurableObject {
         return this.statusService.handleObservation(request, (resolved as any).auth);
       }
       if (path === '/api/status') {
-        return this.statusService.handle(request, async () => {
+        // M14d: GET stays the readonly paginated projection; POST projects
+        // the COMPLETE bounded summary and advances the caller's own
+        // baseline in the same transaction (one call total). Cookie POSTs
+        // pass the existing session CSRF via authenticateBusRequest.
+        const authenticate = async () => {
           if (request.headers.has('Authorization') && request.headers.has('Cookie')) return { error: Response.json({ error: 'mixed_authority' }, { status: 403 }) };
           const auth = await this.authenticateBusRequest(request);
           if (auth.error && !request.headers.has('Cookie') && validSessionSecret(this.env)) {
@@ -426,7 +430,9 @@ export class Hub extends DurableObject {
             auth.caller.actor = 'human:' + session.sub;
           }
           return auth;
-        });
+        };
+        if (request.method === 'POST') return this.statusService.handlePost(request, authenticate);
+        return this.statusService.handle(request, authenticate);
       }
       if (path === '/auth/token') return await this.tokenSignIn(request);
       if (path === '/api/host/poll') {

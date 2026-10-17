@@ -29,8 +29,28 @@ def build_query(args):
     return BASE + ('?' + query if query else '')
 
 
+def fetch_status_get(args):
+    """Single authenticated GET /api/status (readonly paginated projection)."""
+    return _call_status(args, 'GET', None)
+
+
+def fetch_status_post(args):
+    """Single authenticated POST /api/status: complete bounded summary plus
+    the caller's own baseline advance, one call total."""
+    return _call_status(args, 'POST', b'{}')
+
+
 def fetch_status(args):
-    """Exactly one authenticated GET /api/status per invocation."""
+    """Exactly one authenticated /api/status call per invocation. Default is
+    POST (complete summary + own baseline diff); --limit/--after stay on the
+    readonly paginated GET, which never advances the baseline."""
+    if getattr(args, 'limit', None) is not None or getattr(args, 'after', None) is not None:
+        return fetch_status_get(args)
+    return fetch_status_post(args)
+
+
+def _call_status(args, method, body):
+    """Exactly one authenticated /api/status request per invocation."""
     cfg = config.load_config()
     base = os.environ.get('HUB_URL') or os.environ.get('HUB_BASE_URL') or cfg.get('base_url')
     api.check_url(base)
@@ -39,10 +59,14 @@ def fetch_status(args):
     token = env_token or auth.get_access_token()
 
     def send(access):
+        headers = {'Authorization': 'Bearer ' + access}
+        if body is not None:
+            headers['Content-Type'] = 'application/json'
         req = urllib.request.Request(
             base.rstrip('/') + path,
-            method='GET',
-            headers={'Authorization': 'Bearer ' + access},
+            data=body,
+            method=method,
+            headers=headers,
         )
         return api.safe_http_json(req)
 
@@ -97,10 +121,23 @@ def render_human(data):
         if commits:
             lines.append('  commits: %s (deploy/CI unknown, M14c)' % len(commits))
     cats = data.get('categories') or {}
+    summary = data.get('summary')
+    if isinstance(summary, dict):
+        by_status = summary.get('by_status') or {}
+        lines.append('summary: %s tasks%s%s' % (
+            summary.get('total'),
+            ' truncated' if summary.get('truncated') else ' complete',
+            ' by_status=%s' % ','.join('%s=%s' % (escape_display(k), v) for k, v in sorted(by_status.items())) if by_status else ''))
     diff = cats.get('diff') or {}
     if diff:
-        lines.append('diff baseline: %s (%s)' % (
-            escape_display(diff.get('state')), escape_display(diff.get('reason'))))
+        if diff.get('state') in ('available', 'first_baseline'):
+            lines.append('diff baseline: %s added=%d removed=%d changed=%d%s' % (
+                escape_display(diff.get('state')),
+                len(diff.get('added') or []), len(diff.get('removed') or []), len(diff.get('changed') or []),
+                ' advanced' if diff.get('baseline_advanced') else ''))
+        else:
+            lines.append('diff baseline: %s (%s)' % (
+                escape_display(diff.get('state')), escape_display(diff.get('reason'))))
     return '\n'.join(lines) + '\n'
 
 

@@ -98,7 +98,29 @@ CREATE TABLE IF NOT EXISTS status_observations(
 CREATE INDEX IF NOT EXISTS idx_status_obs_session ON status_observations(hub_session_id, kind, observed_at);
 `;
 
+export const STATUS_BASELINE_SCHEMA = `
+CREATE TABLE IF NOT EXISTS status_baselines(
+  caller_key TEXT PRIMARY KEY,
+  snapshot_json TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
+`;
+
+/** Compact caller baseline: per-task digests only, NEVER full histories. */
+export const STATUS_BASELINE_CAP = 256;
+const STATUS_BASELINE_ROWS_CAP = 5000;
+
 export const OBSERVATION_KINDS = ['session', 'report', 'probe_git', 'probe_ci', 'probe_deploy'] as const;
+
+function fnv1aHex(input: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return ('0000000' + (hash >>> 0).toString(16)).slice(-8);
+}
 const SESSION_STATES = ['working', 'waiting', 'context_low', 'limit_hit', 'draft_pending', 'idle', 'unknown'];
 const REPORT_VERDICTS = ['done', 'attention', 'unknown'];
 const GIT_ANCESTRY = ['merged_in_main', 'not_merged', 'unknown'];
@@ -176,9 +198,11 @@ export class StatusService {
 
   /** Additive table init only (IF NOT EXISTS). Called from Hub construction. */
   init(): void {
-    for (const statement of STATUS_OBSERVATION_SCHEMA.split(';')) {
-      const trimmed = statement.trim();
-      if (trimmed) this.sql.exec(trimmed);
+    for (const schema of [STATUS_OBSERVATION_SCHEMA, STATUS_BASELINE_SCHEMA]) {
+      for (const statement of schema.split(';')) {
+        const trimmed = statement.trim();
+        if (trimmed) this.sql.exec(trimmed);
+      }
     }
   }
 
@@ -195,6 +219,123 @@ export class StatusService {
     return (this.sql.exec(query, ...params).toArray()[0] as any) ?? undefined;
   }
 
+  /** Shared view filters. POST (project+advance) rejects pagination keys:
+   * the baseline call always covers ALL matching work, never a silent page. */
+  private parseViewParams(params: URLSearchParams, forPost: boolean): { limit: number; after: string | null; project: string | null; singleTask: string | null; hostFilter: string | null; sinceMs: number | null } {
+    for (const key of params.keys()) {
+      if (!['limit', 'after', 'revision', 'project', 'task', 'host', 'since'].includes(key)) fail('unknown_param');
+    }
+    if (forPost && (params.has('limit') || params.has('after'))) fail('pagination_not_supported_on_post');
+    let limit = STATUS_LIMITS.page;
+    if (params.has('limit')) {
+      limit = Number(params.get('limit'));
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > STATUS_LIMITS.page) fail('invalid_limit');
+    }
+    const after = params.get('after');
+    if (after !== null) { if (!ID_RE.test(after)) fail('invalid_after'); }
+    const project = params.get('project');
+    if (project !== null && !ID_RE.test(project)) fail('invalid_project');
+    const singleTask = params.get('task');
+    if (singleTask !== null && !ID_RE.test(singleTask)) fail('invalid_task');
+    const hostFilter = params.get('host');
+    if (hostFilter !== null && !LABEL_RE.test(hostFilter)) fail('invalid_host');
+    return { limit, after, project, singleTask, hostFilter, sinceMs: parseSince(params.get('since')) };
+  }
+
+  private selectTasks(p: Obj, project: string | null, singleTask: string | null, sinceMs: number | null): Obj[] {
+    let tasks = this.intake.statusAuthorizedTasks(p);
+    if (project !== null) tasks = tasks.filter(t => t.project === project);
+    if (singleTask !== null) {
+      const one = this.intake.statusTaskById(p, singleTask);
+      if (!one) fail('not_found', 404);
+      tasks = [one];
+    }
+    tasks = [...tasks].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    if (sinceMs !== null) tasks = tasks.filter(t => { const tu = timeMs(t.updated_at); return tu !== null && tu >= sinceMs; });
+    return tasks;
+  }
+
+  private buildItems(p: Obj, tasks: Obj[], hostFilter: string | null, sinceMs: number | null, now: number, nowIso: string): { items: Obj[]; machines: Map<string, Obj>; missingHosts: string[]; expectedOffline: string[]; sessionCoverage: string; reportsCollected: boolean; probesCollected: boolean } {
+    const machines = new Map(this.rows('SELECT id, hostname, last_checkin_at, drained FROM machines').map(m => [m.id, m]));
+    const lifecycleBySession = this.lifecycleBySessionId(now);
+    const items = tasks.map(task => this.taskDto(task, p, machines, now, nowIso, sinceMs, hostFilter, lifecycleBySession));
+    this.attachObservations(items, now, nowIso);
+    const reportsCollected = items.some(t => (t.reports ?? []).some((r: Obj) => r.headline !== 'unknown'));
+    const probesCollected = items.some(t => (t.commits ?? []).some((c: Obj) => c.git_ancestry || c.ci || c.deploy));
+    const { missing: missingHosts, expectedOffline } = this.missingHosts(machines, now);
+    return { items, machines, missingHosts, expectedOffline,
+      sessionCoverage: missingHosts.length ? 'partial' : 'complete', reportsCollected, probesCollected };
+  }
+
+  private coverageDto(missingHosts: string[], expectedOffline: string[], sessionCoverage: string, now: number): Obj {
+    const offlineWindowActive = expectedOfflineWindowActive(now);
+    return { sessions: sessionCoverage, missing_hosts: missingHosts, expected_offline: expectedOffline,
+      expected_offline_until: offlineWindowActive ? EXPECTED_OFFLINE_UNTIL : null,
+      expected_offline_reason: offlineWindowActive && expectedOffline.length ? EXPECTED_OFFLINE_REASON : null,
+      reason: missingHosts.length ? 'one_or_more_hosts_stale_or_unreachable' : expectedOffline.length ? 'all_unexpected_hosts_fresh_expected_offline_excluded' : 'all_known_hosts_fresh' };
+  }
+
+  private categoriesDto(nowIso: string, missingHosts: string[], sessionCoverage: string, reportsCollected: boolean, probesCollected: boolean, diff: Obj): Obj {
+    return {
+      tasks_sessions: { state: missingHosts.length ? 'partial' : 'collected', source: 'intake_tasks+routing_jobs+fleet_launches+fleet_sessions+session_control_sessions+lifecycle', observed_at: nowIso, freshness: 'fresh', coverage: sessionCoverage, reason: 'canonical_hub_session_links_with_live_control_state_and_lifecycle' },
+      reports: reportsCollected
+        ? { state: 'collected_host_reported', source: 'host_observation_sanitized_headline', observed_at: nowIso, freshness: 'fresh', coverage: 'partial', reason: 'allowlisted_host_reader_headlines_only_transcripts_tokens_never_stored' }
+        : { state: 'unknown_not_collected', source: 'intake_history_report_reference_only', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'headline_collection_requires_M14b_allowlisted_host_reader', successor: 'M14b' },
+      commits_deploys_ci: probesCollected
+        ? { state: 'collected_probe_evidence', source: 'host_probe_git_ci_deploy_exact_sha', observed_at: nowIso, freshness: 'fresh', coverage: 'partial', reason: 'explicit_argv_probes_never_push_or_ci_inference_for_deploy' }
+        : { state: 'unknown_not_collected', source: 'intake_history_commit_reference_only', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'verified_git_ancestry_active_deployment_ci_adapters_require_M14c', successor: 'M14c' },
+      pending_actions: { state: 'collected_intake_only', source: 'intake_unresolved_followup_blocker_pending_approval', observed_at: nowIso, freshness: 'fresh', coverage: 'complete', reason: 'login_user_codes_withheld_in_this_cut_device_tokens_never_exported', successor: 'M14c_login_metadata' },
+      diff,
+    };
+  }
+
+  private summaryDto(tasks: Obj[], selectedTotal: number): Obj {
+    const byStatus: Record<string, number> = {};
+    for (const t of tasks) byStatus[t.status] = (byStatus[t.status] ?? 0) + 1;
+    return { total: tasks.length, by_status: byStatus, capped_at: STATUS_BASELINE_CAP,
+      truncated: selectedTotal > tasks.length };
+  }
+
+  /** Compact per-task digest for change detection. No histories, no bodies. */
+  private taskDigest(task: Obj): Obj {
+    const hubs: string[] = [];
+    for (const hub of (task.hub_sessions ?? [])) {
+      if (hub?.linkage !== 'hub_session') continue;
+      hubs.push([hub.hub_session_id, hub.state, hub.lifecycle?.group,
+        hub.host_observation?.state, hub.report_headline?.headline,
+        hub.probe_evidence?.git?.ancestry, hub.probe_evidence?.ci?.state,
+        hub.probe_evidence?.deploy?.state].map(v => v ?? '').join('|'));
+    }
+    hubs.sort();
+    return { v: task.version, u: task.updated_at, s: task.status, h: fnv1aHex(hubs.join('\n')) };
+  }
+
+  private diffSnapshots(previous: Obj | null, current: Record<string, Obj>): { state: string; added: string[]; removed: string[]; changed: Obj[] } {
+    if (!previous || typeof previous !== 'object' || !previous.tasks || typeof previous.tasks !== 'object') {
+      const added = Object.keys(current).sort().slice(0, STATUS_BASELINE_CAP);
+      return { state: 'first_baseline', added, removed: [], changed: [] };
+    }
+    const prevTasks = previous.tasks as Record<string, Obj>;
+    const added: string[] = [];
+    const removed: string[] = [];
+    const changed: Obj[] = [];
+    for (const id of Object.keys(current).sort()) {
+      const old = prevTasks[id];
+      if (!old) { if (added.length < STATUS_BASELINE_CAP) added.push(id); continue; }
+      const next = current[id];
+      const fields: string[] = [];
+      if (old.v !== next.v) fields.push('version');
+      if (old.u !== next.u) fields.push('updated_at');
+      if (old.s !== next.s) fields.push('status');
+      if (old.h !== next.h) fields.push('sessions');
+      if (fields.length && changed.length < STATUS_BASELINE_CAP) changed.push({ id, fields });
+    }
+    for (const id of Object.keys(prevTasks).sort()) {
+      if (!current[id] && removed.length < STATUS_BASELINE_CAP) removed.push(id);
+    }
+    return { state: 'available', added, removed, changed };
+  }
+
   async handle(request: Request, authenticate: () => Promise<Auth>): Promise<Response> {
     const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
     try {
@@ -206,73 +347,26 @@ export class StatusService {
       }
       return this.tx(() => {
         const p = this.intake.statusPrincipal(auth);
-        const url = new URL(request.url);
-        const params = url.searchParams;
-        for (const key of params.keys()) {
-          if (!['limit', 'after', 'revision', 'project', 'task', 'host', 'since'].includes(key)) fail('unknown_param');
-        }
-        let limit = STATUS_LIMITS.page;
-        if (params.has('limit')) {
-          limit = Number(params.get('limit'));
-          if (!Number.isSafeInteger(limit) || limit < 1 || limit > STATUS_LIMITS.page) fail('invalid_limit');
-        }
-        const after = params.get('after');
-        if (after !== null) { if (!ID_RE.test(after)) fail('invalid_after'); }
-        const project = params.get('project');
-        if (project !== null && !ID_RE.test(project)) fail('invalid_project');
-        const singleTask = params.get('task');
-        if (singleTask !== null && !ID_RE.test(singleTask)) fail('invalid_task');
-        const hostFilter = params.get('host');
-        if (hostFilter !== null && !LABEL_RE.test(hostFilter)) fail('invalid_host');
-        const sinceMs = parseSince(params.get('since'));
-        const revision = this.intake.statusRevision();
-        const now = this.now();
-        const nowIso = new Date(now).toISOString();
-
-        let tasks = this.intake.statusAuthorizedTasks(p);
-        if (project !== null) tasks = tasks.filter(t => t.project === project);
-        if (singleTask !== null) {
-          const one = this.intake.statusTaskById(p, singleTask);
-          if (!one) fail('not_found', 404);
-          tasks = [one];
-        }
-        tasks = [...tasks].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-        if (sinceMs !== null) tasks = tasks.filter(t => { const tu = timeMs(t.updated_at); return tu !== null && tu >= sinceMs; });
+        const params = new URL(request.url).searchParams;
+        const { limit, after, project, singleTask, hostFilter, sinceMs } = this.parseViewParams(params, false);
+        const tasks = this.selectTasks(p, project, singleTask, sinceMs);
         const total = tasks.length;
         const window = tasks.filter(t => !after || t.id > after).slice(0, limit + 1);
         const page = window.slice(0, limit);
         const next = window.length > limit ? page[page.length - 1].id : null;
-
-        const machines = new Map(this.rows('SELECT id, hostname, last_checkin_at, drained FROM machines').map(m => [m.id, m]));
-        const lifecycleBySession = this.lifecycleBySessionId(now);
-        const items = page.map(task => this.taskDto(task, p, machines, now, nowIso, sinceMs, hostFilter, lifecycleBySession));
-        this.attachObservations(items, now, nowIso);
-        const reportsCollected = items.some(t => (t.reports ?? []).some((r: Obj) => r.headline !== 'unknown'));
-        const probesCollected = items.some(t => (t.commits ?? []).some((c: Obj) => c.git_ancestry || c.ci || c.deploy));
-        const { missing: missingHosts, expectedOffline } = this.missingHosts(machines, now);
-        const sessionCoverage = missingHosts.length ? 'partial' : 'complete';
-        const offlineWindowActive = expectedOfflineWindowActive(now);
+        const revision = this.intake.statusRevision();
+        const now = this.now();
+        const nowIso = new Date(now).toISOString();
+        const built = this.buildItems(p, page, hostFilter, sinceMs, now, nowIso);
         return json({
           snapshot_at: nowIso,
           revision,
           authorized_scope: (p as any).admin ? 'operator_all' : 'explicit_grants_only',
-          tasks: items,
+          tasks: built.items,
           pagination: { next, total, limit },
-          coverage: { sessions: sessionCoverage, missing_hosts: missingHosts, expected_offline: expectedOffline,
-            expected_offline_until: offlineWindowActive ? EXPECTED_OFFLINE_UNTIL : null,
-            expected_offline_reason: offlineWindowActive && expectedOffline.length ? EXPECTED_OFFLINE_REASON : null,
-            reason: missingHosts.length ? 'one_or_more_hosts_stale_or_unreachable' : expectedOffline.length ? 'all_unexpected_hosts_fresh_expected_offline_excluded' : 'all_known_hosts_fresh' },
-          categories: {
-            tasks_sessions: { state: missingHosts.length ? 'partial' : 'collected', source: 'intake_tasks+routing_jobs+fleet_launches+fleet_sessions+session_control_sessions+lifecycle', observed_at: nowIso, freshness: 'fresh', coverage: sessionCoverage, reason: 'canonical_hub_session_links_with_live_control_state_and_lifecycle' },
-            reports: reportsCollected
-              ? { state: 'collected_host_reported', source: 'host_observation_sanitized_headline', observed_at: nowIso, freshness: 'fresh', coverage: 'partial', reason: 'allowlisted_host_reader_headlines_only_transcripts_tokens_never_stored' }
-              : { state: 'unknown_not_collected', source: 'intake_history_report_reference_only', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'headline_collection_requires_M14b_allowlisted_host_reader', successor: 'M14b' },
-            commits_deploys_ci: probesCollected
-              ? { state: 'collected_probe_evidence', source: 'host_probe_git_ci_deploy_exact_sha', observed_at: nowIso, freshness: 'fresh', coverage: 'partial', reason: 'explicit_argv_probes_never_push_or_ci_inference_for_deploy' }
-              : { state: 'unknown_not_collected', source: 'intake_history_commit_reference_only', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'verified_git_ancestry_active_deployment_ci_adapters_require_M14c', successor: 'M14c' },
-            pending_actions: { state: 'collected_intake_only', source: 'intake_unresolved_followup_blocker_pending_approval', observed_at: nowIso, freshness: 'fresh', coverage: 'complete', reason: 'login_user_codes_withheld_in_this_cut_device_tokens_never_exported', successor: 'M14c_login_metadata' },
-            diff: { state: 'not_available', source: 'caller_scoped_baseline_store_absent', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'M14d_durable_caller_baseline_not_yet_collected_since_filters_only', successor: 'M14d' },
-          },
+          coverage: this.coverageDto(built.missingHosts, built.expectedOffline, built.sessionCoverage, now),
+          categories: this.categoriesDto(nowIso, built.missingHosts, built.sessionCoverage, built.reportsCollected, built.probesCollected,
+            { state: 'not_available_on_get', source: 'caller_scoped_baseline_store_post_only', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'use_POST_/api/status_to_project_and_advance_caller_baseline', successor: 'M14d' }),
           data_notice: DATA_NOTICE,
         });
       });
@@ -280,6 +374,83 @@ export class StatusService {
       const code = e?.code || 'internal_error';
       const status = e?.status || 500;
       if (status === 500) return Response.json({ error: code }, { status, headers: { 'Cache-Control': 'private, no-store' } });
+      return Response.json({ error: code }, { status, headers: { 'Cache-Control': 'private, no-store' } });
+    }
+  }
+
+  /** POST /api/status: project the COMPLETE bounded summary for all
+   * authorized matching work (up to 256 tasks, never a silent first page)
+   * and advance the caller's own durable baseline in the same transaction:
+   * exactly one call total. Canonical task state is never mutated and
+   * intake_meta.revision is untouched; only status_baselines is written.
+   * Cookie callers pass the existing session CSRF (enforced by Hub auth
+   * before this handler, as for every POST). */
+  async handlePost(request: Request, authenticate: () => Promise<Auth>): Promise<Response> {
+    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
+    try {
+      if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
+      const auth = await authenticate();
+      if (auth.error) {
+        const code = (auth.error as Response).status || 401;
+        return json({ error: 'unauthorized_or_forbidden' }, code);
+      }
+      let body: any = null;
+      try {
+        const text = await request.text();
+        body = text.trim() === '' ? {} : JSON.parse(text);
+      } catch { fail('malformed_json'); }
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length) fail('invalid_body');
+      return this.tx(() => {
+        const p = this.intake.statusPrincipal(auth);
+        const params = new URL(request.url).searchParams;
+        const { project, singleTask, hostFilter, sinceMs } = this.parseViewParams(params, true);
+        const selected = this.selectTasks(p, project, singleTask, sinceMs);
+        const tasks = selected.slice(0, STATUS_BASELINE_CAP);
+        const revision = this.intake.statusRevision();
+        const now = this.now();
+        const nowIso = new Date(now).toISOString();
+        const built = this.buildItems(p, tasks, hostFilter, sinceMs, now, nowIso);
+        const snapshot: Record<string, Obj> = {};
+        for (const task of tasks) snapshot[task.id] = this.taskDigest(
+          built.items.find(t => t.id === task.id) ?? task);
+        const filterKey = [project, singleTask, hostFilter, sinceMs].map(v => v === null ? '' : String(v)).join('|');
+        const callerKey = String((p as any).identity || (p as any).actor || 'unknown') + '||' + filterKey;
+        let previous: Obj | null = null;
+        try {
+          const row = this.one('SELECT snapshot_json FROM status_baselines WHERE caller_key=?', callerKey);
+          if (row?.snapshot_json) previous = JSON.parse(row.snapshot_json);
+        } catch { previous = null; }
+        const diff = this.diffSnapshots(previous, snapshot);
+        const record = JSON.stringify({ snapshot_at: nowIso, revision, tasks: snapshot });
+        if (record.length > 1048576) fail('baseline_capacity', 507);
+        this.sql.exec('INSERT INTO status_baselines(caller_key,snapshot_json,revision,updated_at) VALUES(?,?,?,?) ON CONFLICT(caller_key) DO UPDATE SET snapshot_json=excluded.snapshot_json, revision=excluded.revision, updated_at=excluded.updated_at',
+          callerKey, record, revision, nowIso);
+        try {
+          const count = Number((this.one('SELECT COUNT(*) AS n FROM status_baselines') as any)?.n ?? 0);
+          if (count > STATUS_BASELINE_ROWS_CAP) {
+            this.sql.exec('DELETE FROM status_baselines WHERE caller_key IN (SELECT caller_key FROM status_baselines ORDER BY updated_at ASC LIMIT 500)');
+          }
+        } catch { /* capacity trim is best-effort */ }
+        const summary = this.summaryDto(tasks, selected.length);
+        return json({
+          snapshot_at: nowIso,
+          revision,
+          authorized_scope: (p as any).admin ? 'operator_all' : 'explicit_grants_only',
+          summary,
+          tasks: built.items,
+          pagination: { next: null, total: tasks.length, limit: tasks.length },
+          coverage: this.coverageDto(built.missingHosts, built.expectedOffline, built.sessionCoverage, now),
+          categories: this.categoriesDto(nowIso, built.missingHosts, built.sessionCoverage, built.reportsCollected, built.probesCollected,
+            { state: diff.state, source: 'caller_scoped_durable_baseline', observed_at: nowIso, freshness: 'fresh', coverage: 'complete',
+              reason: diff.state === 'first_baseline' ? 'first_call_baseline_recorded' : 'diff_since_caller_previous_post',
+              previous_snapshot_at: (previous as any)?.snapshot_at ?? null,
+              added: diff.added, removed: diff.removed, changed: diff.changed, baseline_advanced: true }),
+          data_notice: DATA_NOTICE,
+        });
+      });
+    } catch (e: any) {
+      const code = e?.code || 'internal_error';
+      const status = e?.status || 500;
       return Response.json({ error: code }, { status, headers: { 'Cache-Control': 'private, no-store' } });
     }
   }

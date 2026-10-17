@@ -121,6 +121,7 @@ beforeEach(async () => {
     try { h.sql.exec('DELETE FROM session_lifecycle_observations'); } catch {}
     try { h.sql.exec('DELETE FROM session_lifecycle_decisions'); } catch {}
     try { h.sql.exec('DELETE FROM status_observations'); } catch {}
+    try { h.sql.exec('DELETE FROM status_baselines'); } catch {}
   });
 });
 
@@ -148,7 +149,7 @@ describe('M14a authorized one-call status projection', () => {
     expect(withFirst.reports[0]).toMatchObject({ reference: 'reports/synthetic.md', headline: 'unknown' });
     expect(withFirst.reports[0].provenance.successor).toBe('M14b');
     expect(withFirst.commits[0]).toMatchObject({ reference: 'abc123def', deploy_state: 'unknown', ci_state: 'unknown' });
-    expect(data.categories.diff.state).toBe('not_available');
+    expect(data.categories.diff.state).toBe('not_available_on_get');
     expect(data.categories.reports.state).toBe('unknown_not_collected');
   });
 
@@ -225,12 +226,12 @@ describe('M14a authorized one-call status projection', () => {
     const { task } = await createTask();
     const all = await ok('');
     expect(all.tasks.map((t: any) => t.id)).toContain(task.id);
-    expect(all.categories.diff).toMatchObject({ state: 'not_available', successor: 'M14d' });
+    expect(all.categories.diff).toMatchObject({ state: 'not_available_on_get', successor: 'M14d' });
     const recent = await ok('?since=1d');
     expect(recent.tasks.map((t: any) => t.id)).toContain(task.id);
     const future = await ok('?since=2999-01-01T00%3A00%3A00.000Z');
     expect(future.tasks.map((t: any) => t.id)).not.toContain(task.id);
-    expect(future.categories.diff.state).toBe('not_available');
+    expect(future.categories.diff.state).toBe('not_available_on_get');
     expect((await call('?since=not-a-time')).status).toBe(400);
   });
 
@@ -468,5 +469,109 @@ describe('M14b slice2 machine-authenticated host observations', () => {
     expect(other.deploy_state).toBe('unknown');
     expect(other.git_ancestry).toBeUndefined();
     expect(data.categories.commits_deploys_ci.state).toBe('collected_probe_evidence');
+  });
+});
+
+describe('M14d caller-scoped durable baseline with complete POST summary', () => {
+  async function postCall(path: string, payload: any = {}, bearer?: string, csrf = 'csrf') {
+    return SELF.fetch('https://hub.test/api/status' + path, { method: 'POST',
+      headers: { ...(bearer ? { Authorization: 'Bearer ' + bearer } : { Cookie: cookie, 'x-csrf-token': csrf }), 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload) });
+  }
+  async function postOk(path: string, payload: any = {}, bearer?: string, csrf = 'csrf'): Promise<any> {
+    const res = await postCall(path, payload, bearer, csrf);
+    const data = await res.json();
+    expect(res.status, JSON.stringify(data)).toBe(200);
+    return data;
+  }
+  async function revisionAndTasks() {
+    return inDO(stub(), (h: any) => ({
+      revision: h.sql.exec('SELECT revision FROM intake_meta WHERE id=1').toArray()[0].revision,
+      tasks: h.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks').toArray()[0].n,
+    }));
+  }
+
+  it('returns ALL authorized tasks beyond the GET page in one projecting+advancing call', async () => {
+    const ids: string[] = [];
+    for (let i = 0; i < 27; i++) {
+      const { task } = await createTask('demo', 'Bulk task ' + i);
+      ids.push(task.id);
+    }
+    const page = await ok('');
+    expect(page.tasks.length).toBe(25);
+    expect(page.pagination.next).not.toBeNull();
+    expect(page.categories.diff.state).toBe('not_available_on_get');
+    const before = await revisionAndTasks();
+    // ONE client request: complete summary + first baseline together.
+    const first = await postOk('', {});
+    expect(first.tasks.length).toBe(27);
+    expect(first.pagination.next).toBeNull();
+    expect(first.summary).toMatchObject({ total: 27, truncated: false });
+    expect(first.summary.by_status.open).toBe(27);
+    expect(first.categories.diff).toMatchObject({ state: 'first_baseline', baseline_advanced: true });
+    expect(first.categories.diff.added.length).toBe(27);
+    expect(await revisionAndTasks()).toEqual(before);
+    // Baselines store compact digests only, never task histories or bodies.
+    const stored = await inDO(stub(), (h: any) =>
+      h.sql.exec('SELECT snapshot_json FROM status_baselines').toArray().map((r: any) => r.snapshot_json).join('\n'));
+    expect(stored).not.toContain('"history"');
+    expect(stored).not.toContain('Bulk task');
+    // Second identical call: available diff with zero changes.
+    const second = await postOk('', {});
+    expect(second.tasks.length).toBe(27);
+    expect(second.categories.diff).toMatchObject({ state: 'available', baseline_advanced: true });
+    expect(second.categories.diff.added).toEqual([]);
+    expect(second.categories.diff.removed).toEqual([]);
+    expect(second.categories.diff.changed).toEqual([]);
+    // New and changed work surfaces as a short id-only diff.
+    const { task: added } = await createTask('demo', 'Bulk newcomer');
+    await intakeOk('/tasks/' + ids[0] + '/events', { key: 'bump-' + ++seq, expected_version: 1,
+      event: { kind: 'report', reference: 'reports/bump.md', source } });
+    const third = await postOk('', {});
+    expect(third.tasks.length).toBe(28);
+    expect(third.categories.diff.added).toEqual([added.id]);
+    const changed = third.categories.diff.changed.find((c: any) => c.id === ids[0]);
+    expect(changed.fields).toContain('version');
+    expect(JSON.stringify(third.categories.diff)).not.toContain('bump.md');
+  });
+
+  it('isolates baselines and task visibility across callers', async () => {
+    const a = await seedAgent('demo:assistant-a');
+    const b = await seedAgent('other:assistant-b');
+    await grant(a, 'project', 'demo', 'read');
+    await grant(b, 'project', 'other', 'read');
+    await createTask('demo', 'Demo task');
+    await createTask('other', 'Other task');
+    const seenA = await postOk('', {}, a.token);
+    expect(seenA.tasks.map((t: any) => t.project)).toEqual(['demo']);
+    expect(seenA.categories.diff.state).toBe('first_baseline');
+    const seenB = await postOk('', {}, b.token);
+    expect(seenB.tasks.map((t: any) => t.project)).toEqual(['other']);
+    expect(seenB.categories.diff.state).toBe('first_baseline');
+    // A re-post with no changes: empty diff on A's own baseline only.
+    const againA = await postOk('', {}, a.token);
+    expect(againA.categories.diff).toMatchObject({ state: 'available' });
+    expect(againA.categories.diff.added).toEqual([]);
+    // Operator sees everything on an independent baseline.
+    const op = await postOk('', {});
+    expect(op.tasks.length).toBe(2);
+    expect(op.categories.diff.state).toBe('first_baseline');
+  });
+
+  it('rejects pagination, bad bodies and missing CSRF on POST', async () => {
+    expect((await postCall('?limit=5')).status).toBe(400);
+    expect((await postCall('?after=task-1')).status).toBe(400);
+    expect((await postCall('', { unexpected: true })).status).toBe(400);
+    expect((await postCall('', {}, undefined, 'wrong')).status).toBe(403);
+    // GET never advances a baseline: a later first POST still reports first_baseline.
+    await createTask();
+    await ok('');
+    await ok('');
+    const first = await postOk('', {});
+    expect(first.categories.diff.state).toBe('first_baseline');
+    // Malformed JSON is a clean 400, never a baseline write.
+    const bad = await SELF.fetch('https://hub.test/api/status', { method: 'POST',
+      headers: { Cookie: cookie, 'x-csrf-token': 'csrf', 'Content-Type': 'application/json' }, body: '{oops' });
+    expect(bad.status).toBe(400);
   });
 });

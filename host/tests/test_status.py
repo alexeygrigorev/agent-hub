@@ -120,6 +120,40 @@ class TestStatusCli(unittest.TestCase):
         self.assertIn('decision=resume_on_reset', out)
         self.assertIn('expected offline: win35', out)
 
+    def test_default_uses_single_post_and_limit_falls_back_to_get(self):
+        with patch.object(status, 'fetch_status_post', return_value=FIXTURE_DTO) as post, \
+             patch.object(status, 'fetch_status_get', return_value=FIXTURE_DTO) as get:
+            code, _, error = self.run_cli('status', '--since', '2h')
+        self.assertEqual(code, 0, error)
+        post.assert_called_once()
+        get.assert_not_called()
+        with patch.object(status, 'fetch_status_post', return_value=FIXTURE_DTO) as post, \
+             patch.object(status, 'fetch_status_get', return_value=FIXTURE_DTO) as get:
+            code, _, error = self.run_cli('status', '--limit', '5')
+        self.assertEqual(code, 0, error)
+        post.assert_not_called()
+        get.assert_called_once()
+        with patch.object(status, 'fetch_status_post', return_value=FIXTURE_DTO) as post, \
+             patch.object(status, 'fetch_status_get', return_value=FIXTURE_DTO) as get:
+            code, _, error = self.run_cli('status', '--after', 'task-1')
+        self.assertEqual(code, 0, error)
+        post.assert_not_called()
+        get.assert_called_once()
+
+    def test_summary_and_available_diff_rendered(self):
+        dto = dict(FIXTURE_DTO)
+        dto['summary'] = {'total': 27, 'complete': True, 'truncated': False,
+                          'by_status': {'open': 27}}
+        dto['categories'] = {'diff': {'state': 'available', 'added': ['t-new'],
+                                      'removed': [], 'changed': [{'id': 't-1'}, {'id': 't-2'}],
+                                      'baseline_advanced': True}}
+        with patch.object(status, 'fetch_status', return_value=dto):
+            code, out, error = self.run_cli('status')
+        self.assertEqual(code, 0, error)
+        self.assertIn('summary: 27 tasks complete', out)
+        self.assertIn('open=27', out)
+        self.assertIn('diff baseline: available added=1 removed=0 changed=2 advanced', out)
+
     def test_local_only_preserves_diagnostics_without_api_call(self):
         with patch.object(status, 'fetch_status') as transport, \
              patch('agent_hub_host.config.load_config', return_value={'access_token': 'x', 'base_url': 'https://hub.test'}):

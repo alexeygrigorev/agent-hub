@@ -7,8 +7,10 @@ the M15 lifecycle group/decision per bound session. M14b slice2 shipped:
 machine-authenticated host observations (session states, sanitized report
 headlines) bound to the current canonical session/machine. M14c shipped:
 explicit-argv Git ancestry / CI / active-deployment probes with exact-sha
-commit matching (no push/CI inference for deploy). M14d (durable
-caller-scoped last-call diffs) remains explicit successor work.
+commit matching (no push/CI inference for deploy). M14d shipped:
+`POST /api/status` projects the complete bounded summary for all authorized
+matching work (up to the 256-task cap, never a silent first page) and
+advances the caller's own durable baseline in the same transaction.
 
 ## Endpoint
 
@@ -155,17 +157,40 @@ allowlist fails closed (exit 2, collects nothing).
 
 `limit` 1..25 (default 25), `after` task id, `project/task/host` filters,
 `since` as `<N>m|h|d` or ISO-8601. `since` filters available timestamped rows
-only. There is no durable caller baseline yet: `categories.diff.state` is
-always `not_available` with `successor: M14d`, never a fabricated zero-change
-diff. Cursors are caller-scoped task ids; filter changes cannot leak another
-caller's rows.
+only. `categories.diff` on GET is always `not_available_on_get`
+(`use_POST_/api/status_to_project_and_advance_caller_baseline`).
+
+## Complete projection with durable caller baseline (`POST /api/status`)
+
+One authenticated `POST /api/status?project&task&host&since` (empty JSON
+body; `limit`/`after` are rejected with `pagination_not_supported_on_post`)
+returns the complete bounded summary for ALL authorized matching tasks (up
+to the 256-task intake cap): full per-task DTOs (same bounded shape as
+GET), `summary: {total, by_status, capped_at, truncated}`,
+`pagination: {next: null, ...}`, plus a short durable diff since the
+caller's previous POST, all in exactly one call total.
+
+Baselines live in the additive `status_baselines` table keyed by caller
+identity (`family:…` / `human-family:…` / actor) plus the normalized
+filter tuple, so different callers and different views never share
+baselines. Stored snapshots are compact per-task digests
+`{v, u, s, h}` (version, updated_at, status, session-digest) — full task
+histories and bodies are never copied. Diff is id-only:
+`{state: first_baseline|available, added[], removed[], changed:
+[{id, fields: [version|updated_at|status|sessions]}], baseline_advanced:
+true}` (arrays bounded at 256). Canonical task state is never mutated and
+`intake_meta.revision` is untouched; only `status_baselines` is written
+(oldest rows trimmed past 5000). Cookie callers pass the existing session
+CSRF, like every other POST.
 
 ## CLI
 
 `hub status [--since 2h] [--json] [--task ID] [--project P] [--host M]
 [--after ID] [--limit N] [--local-only]`
 
-One CLI invocation makes exactly one `GET /api/status` request using the
-existing token/device auth. `--local-only` preserves the old local-config
-diagnostic without any API call. Human output escapes terminal controls;
-`--json` prints the raw DTO.
+One CLI invocation makes exactly one `/api/status` request using the
+existing token/device auth. By default it POSTs (complete summary + own
+baseline diff); `--limit`/`--after` stay on the readonly paginated GET,
+which never advances the baseline. `--local-only` preserves the old
+local-config diagnostic without any API call. Human output escapes
+terminal controls; `--json` prints the raw DTO.
