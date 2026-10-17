@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -177,19 +178,46 @@ def collect_once(sessions: Any, allowlist: dict, machine_id: str, observed_at: s
 
 
 def submit(observations: list, base_url: str, token: str, timeout: int = 20) -> list:
-    """POST each observation to /api/status/observations. Bounded, explicit, no retries."""
+    """POST each observation to /api/status/observations. Bounded, explicit, no retries.
+
+    Transport is the maintained ``api.safe_http_json`` (no-redirect opener,
+    ``agent-hub-host/1`` UA, bounded JSON response). Errors never carry the
+    token, the request URL, or any raw response body.
+    """
+    from . import api as _api
+
+    capped = observations[:MAX_OBSERVATIONS] if isinstance(observations, list) else []
+    try:
+        _api.check_url(base_url)
+    except Exception:
+        return [{'status': None, 'error': 'invalid_base_url'} for _ in capped]
+    if not isinstance(token, str) or not token:
+        return [{'status': None, 'error': 'missing_token'} for _ in capped]
+    url = base_url.rstrip('/') + '/api/status/observations'
     results = []
-    for obs in observations[:MAX_OBSERVATIONS]:
-        body = json.dumps(obs).encode('utf-8')
-        req = urllib.request.Request(base_url.rstrip('/') + '/api/status/observations',
-                                     data=body, method='POST',
+    for obs in capped:
+        try:
+            body = json.dumps(obs).encode('utf-8')
+        except (TypeError, ValueError):
+            results.append({'status': None, 'error': 'unserializable_observation'})
+            continue
+        if len(body) > 64 * 1024:
+            results.append({'status': None, 'error': 'observation_too_large'})
+            continue
+        req = urllib.request.Request(url, data=body, method='POST',
                                      headers={'Content-Type': 'application/json',
                                               'Authorization': 'Bearer ' + token})
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                results.append({'status': resp.status, 'body': json.loads(resp.read().decode('utf-8'))})
+            data = _api.safe_http_json(req, timeout=timeout)
+            results.append({'status': 200, 'body': data})
+        except urllib.error.HTTPError as exc:
+            try:
+                code = int(exc.code)
+            except (TypeError, ValueError):
+                code = None
+            results.append({'status': code, 'error': 'http_error'})
         except Exception as exc:  # noqa: BLE001 - surfaced as data, never raised
-            results.append({'status': None, 'error': type(exc).__name__ + ': ' + str(exc)[:200]})
+            results.append({'status': None, 'error': sanitize(type(exc).__name__, 64) or 'transport_failed'})
     return results
 
 

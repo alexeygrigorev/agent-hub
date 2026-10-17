@@ -132,32 +132,55 @@ class TestStatusCollect(unittest.TestCase):
     def test_submit_posts_each_observation_without_token_leak(self):
         seen = []
 
-        class FakeResp:
-            status = 200
-
-            def read(self):
-                return b'{"ok": true}'
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-        def fake_urlopen(req, timeout=None):
+        def fake_safe(req, timeout=None):
             seen.append(req)
-            return FakeResp()
+            return {'ok': True}
 
         obs = [{'machine_id': 'm', 'native_id': 'n', 'kind': 'session',
                 'observed_at': '2026-10-17T00:00:00.000Z', 'payload': {'state': 'working'}}]
-        with patch('urllib.request.urlopen', side_effect=fake_urlopen):
-            results = status_collect.submit(obs, 'https://hub.test', 'hubt_secret_submit_token')
+        with patch('agent_hub_host.api.safe_http_json', side_effect=fake_safe):
+            with patch('urllib.request.urlopen',
+                       side_effect=AssertionError('must use api.safe_http_json, not urlopen')):
+                results = status_collect.submit(obs, 'https://hub.test', 'hubt_secret_submit_token')
         self.assertEqual(len(seen), 1)
         self.assertTrue(seen[0].full_url.endswith('/api/status/observations'))
         self.assertEqual(seen[0].get_header('Authorization'), 'Bearer hubt_secret_submit_token')
+        self.assertEqual(seen[0].get_header('Content-type'), 'application/json')
+        self.assertEqual(seen[0].get_method(), 'POST')
         sent = json.loads(seen[0].data.decode('utf-8'))
         self.assertNotIn('transcript', json.dumps(sent))
         self.assertEqual(results[0]['status'], 200)
+        self.assertEqual(results[0]['body'], {'ok': True})
+
+    def test_submit_uses_secure_transport_and_never_leaks(self):
+        import urllib.error
+        obs = [{'machine_id': 'm', 'native_id': 'n', 'kind': 'session',
+                'observed_at': '2026-10-17T00:00:00.000Z', 'payload': {'state': 'working'}}]
+        token = 'hubt_leaked_submit_token_value'
+        # HTTP error: status kept, no URL/body/token in error.
+        def fake_http(req, timeout=None):
+            import io
+            raise urllib.error.HTTPError(req.full_url, 503, 'busy',
+                                         {}, io.BytesIO(b'busy'))
+        with patch('agent_hub_host.api.safe_http_json', side_effect=fake_http):
+            results = status_collect.submit(obs, 'https://hub.test', token)
+        self.assertEqual(results[0]['status'], 503)
+        self.assertNotIn(token, json.dumps(results))
+        self.assertNotIn('hub.test', json.dumps(results))
+        # Transport failure: no token/URL/raw response in error.
+        def fake_boom(req, timeout=None):
+            raise RuntimeError('boom https://hub.test secret=' + token)
+        with patch('agent_hub_host.api.safe_http_json', side_effect=fake_boom):
+            results = status_collect.submit(obs, 'https://hub.test', token)
+        self.assertIsNone(results[0]['status'])
+        self.assertNotIn(token, json.dumps(results))
+        self.assertNotIn('hub.test', json.dumps(results))
+        self.assertNotIn('boom', json.dumps(results))
+        # Fail closed on bad URL / missing token.
+        self.assertEqual(status_collect.submit(
+            obs, 'http://evil test', token)[0]['error'], 'invalid_base_url')
+        self.assertEqual(status_collect.submit(
+            obs, 'https://hub.test', '')[0]['error'], 'missing_token')
 
 
 if __name__ == '__main__':
