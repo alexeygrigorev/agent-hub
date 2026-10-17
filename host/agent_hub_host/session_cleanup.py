@@ -1,25 +1,31 @@
-"""M15d host cleanup executor: owned Git worktree/branch removal after confirmed stop.
+"""M15d owning-host cleanup effect: owned Git worktree/branch removal after confirmed stop.
 
 Single-authority split: the TypeScript server (`src/session_control.ts` +
 `src/session_lifecycle_registry.ts`) is the ONE classifier/planner and the
 M12 command store is the ONE custody record (enqueue/claim/ack). This module
 owns ONLY the host-side worktree/branch effect guards plus a durable journal:
 
-- binding/owner shape revalidation reuses
-  :func:`agent_hub_host.session_lifecycle.validate_cleanup_target`
-  (no second classifier);
 - caller custody reuses :class:`agent_hub_host.session_executor.CallerCustody`
-  (no second custody checker);
-- confirmed native stop reuses the existing M12 claim/effect/ack path
-  (:mod:`agent_hub_host.session_receiver`, containment-confirmed
-  :func:`agent_hub_host.native_sessions.stop_session`; a missing catalog
-  entry is never exit proof, no tag-only PID kill);
+  (no second custody checker) and must equal the server claim holder machine;
+- the stop must already be containment-confirmed by the receiver's M12 stop
+  effect in the same claimed attempt (`stop_confirmed`, set only by local
+  effect code — never from network JSON; a missing catalog entry is never
+  exit proof, no tag-only PID kill);
+- the tree is derived ONLY from the canonical binding workspace (server offer
+  binding, never a caller-supplied path) confined under HOST-config trusted
+  roots, and the branch is DISCOVERED from the registered worktree list
+  (never a caller-supplied branch);
 - this module adds ONLY: trusted cleanup-root confinement, dedicated
   registered-worktree checks, clean/lock/exclusive-branch guards, live-use
   refusal, FRESH `origin/main` ancestry proof via `ls-remote` (network/unknown
   fails closed to listed-only), ordinary `git worktree remove` then
   `git branch -d` (no `--force`, no reset), and a durable per-target journal
   so restart/lost-response never repeats an unsafe deletion.
+
+There is deliberately NO owner-string comparison here: ownership is the live
+server claim (holder machine + token + generation + expiry, verified before
+the effect) plus the server's enqueue-time owner custody and durable ack-time
+actor recheck. An explicit path/owner is not authority and is never accepted.
 
 Stdlib only. All git calls are argv arrays (no shell). Private receipts and
 the owned bounded native history live OUTSIDE the removed tree (journal_dir
@@ -39,7 +45,6 @@ from typing import Any, Callable, Optional
 from . import private_fs
 from .native_sessions import SessionControlError, SessionUncertain
 from .session_executor import CallerCustody
-from .session_lifecycle import validate_cleanup_target
 
 JOURNAL_LIMIT = 64 * 1024
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
@@ -189,6 +194,36 @@ def _git_common_dir(git_bin: str, path: str, runner: Callable) -> str:
     return resolved
 
 
+def discover_registered_branch(
+    git_bin: str, realpath: str, *, runner: Callable
+) -> str:
+    """Return the ONE local branch registered for the worktree at `realpath`.
+
+    The branch is DISCOVERED from `git worktree list --porcelain`, never taken
+    from a caller: an explicit branch is not authority. Refuses unregistered
+    paths, bare repos, locked worktrees, detached HEAD, and non-local refs.
+    Exclusivity (branch checked out elsewhere, shared main checkout) stays in
+    :func:`check_registered_worktree`, which callers run next.
+    """
+    proc = runner([git_bin, "worktree", "list", "--porcelain"], realpath, GIT_TIMEOUT)
+    if proc.returncode != 0:
+        raise SessionControlError("git worktree list failed; refusing")
+    entries = _parse_worktree_list(proc.stdout or "")
+    mine = [e for e in entries if os.path.normpath(e["path"]) == realpath]
+    if not mine:
+        raise SessionControlError("not a registered git worktree; refusing")
+    if mine[0].get("bare"):
+        raise SessionControlError("Refusing bare repository worktree")
+    if mine[0].get("locked"):
+        raise SessionControlError("worktree locked; refusing")
+    ref = mine[0].get("branch")
+    if not ref:
+        raise SessionControlError("detached HEAD worktree; refusing (named branch required)")
+    if not ref.startswith("refs/heads/"):
+        raise SessionControlError("worktree branch is not a local branch; refusing")
+    return ref[len("refs/heads/"):]
+
+
 def check_registered_worktree(
     git_bin: str, realpath: str, branch: str, *, runner: Callable
 ) -> dict[str, Any]:
@@ -294,10 +329,10 @@ def remove_owned_worktree(
     journal_dir: str,
     machine_id: str,
     native_id: str,
-    expected_owner: str,
-    worktree: str,
-    branch: str,
+    canonical_workspace: str,
     cleanup_roots: Any,
+    claim_holder: str,
+    stop_confirmed: bool,
     live_paths: Any = (),
     command_id: Optional[str] = None,
     git_bin: str = "git",
@@ -305,11 +340,21 @@ def remove_owned_worktree(
 ) -> dict[str, Any]:
     """Remove ONE owned dedicated worktree + branch after confirmed stop.
 
-    Fresh guards run on EVERY call (no stale approval): binding shape via
-    :func:`validate_cleanup_target`, custody labels, root confinement,
-    registered-worktree exclusivity, clean+lunlocked, no live use, and FRESH
-    ancestry proof. Ordinary `git worktree remove` runs first, then
-    `git branch -d` only after the remove verified. No `--force`, no reset.
+    Authority (no explicit path/owner accepted): the tree is the canonical
+    binding workspace carried by the server offer (`canonical_workspace`),
+    confined under HOST-config trusted `cleanup_roots`; custody must equal
+    the server claim holder machine (`claim_holder`); the stop must already
+    be containment-confirmed by the receiver's M12 stop effect in the same
+    claimed attempt (`stop_confirmed` is True); the branch is DISCOVERED from
+    the registered worktree list. Ownership itself is the live server claim
+    plus enqueue-time owner custody and durable ack-time actor recheck —
+    there is no owner-string comparison here by design.
+
+    Fresh guards run on EVERY call (no stale approval): claim-holder match,
+    root confinement, discovered-branch registered-worktree exclusivity,
+    clean+unlocked, no live use, and FRESH ancestry proof. Ordinary
+    `git worktree remove` runs first, then `git branch -d` only after the
+    remove verified. No `--force`, no reset.
 
     Durable journal (`cleanup-<machine>-<nativehex>.json`): terminal
     `tree_removed`/`refused` outcomes replay without re-running git;
@@ -325,20 +370,14 @@ def remove_owned_worktree(
     if not isinstance(git_bin, str) or not git_bin or "\x00" in git_bin:
         raise SessionControlError("git binary is required")
     run = runner or _default_runner
-    gate = validate_cleanup_target({
-        "expected_machine_id": machine_id,
-        "expected_native_id": native_id,
-        "expected_owner": expected_owner,
-        "observed_machine_id": machine_id,
-        "observed_native_id": native_id,
-        "observed_owner": expected_owner,
-        "busy_or_draft_or_pending": False,
-        "contained": True,
-    })
-    if not gate.get("ok"):
-        raise SessionControlError("cleanup binding refused: %s" % gate.get("error", "unknown"))
     if custody.machine_id != machine_id:
         raise SessionControlError("custody machine must own the cleanup target")
+    if not isinstance(claim_holder, str) or claim_holder != machine_id:
+        raise SessionControlError("claim holder must be the owning machine; refusing")
+    if stop_confirmed is not True:
+        raise SessionControlError("stop must be containment-confirmed before any tree effect; refusing")
+    if not isinstance(canonical_workspace, str) or not canonical_workspace:
+        raise SessionControlError("canonical binding workspace is required")
     roots = canonical_roots(cleanup_roots)
     hexid = re.sub(r"[^0-9a-fA-F]", "", str(native_id or ""))[:32]
     if not hexid:
@@ -352,7 +391,7 @@ def remove_owned_worktree(
     with _lock_held(journal_file):
         prior = _read_journal(journal_file)
         if prior is not None and prior.get("state") in ("tree_removed", "refused", "uncertain"):
-            if (prior.get("worktree"), prior.get("branch")) != (worktree, branch):
+            if prior.get("workspace") != canonical_workspace:
                 raise SessionControlError("cleanup idempotency conflict (no partial mutation)")
         if prior is not None and prior.get("state") == "tree_removed":
             return {**prior, "replayed": True}
@@ -369,22 +408,23 @@ def remove_owned_worktree(
             isinstance(prior, dict)
             and prior.get("state") == "uncertain"
             and prior.get("worktree_removed") is True
-            and prior.get("worktree") == worktree
-            and prior.get("branch") == branch
+            and prior.get("workspace") == canonical_workspace
+            and isinstance(prior.get("branch"), str)
             and isinstance(prior.get("common_dir"), str)
         )
         if resume_branch_only:
             common_dir = str(prior["common_dir"])
             fresh_sha = str(prior.get("fresh_origin_main") or "unknown")
+            branch = str(prior["branch"])
 
             def _record(state: str, reason: str, **extra: Any) -> dict[str, Any]:
                 record = {
                     "op": "cleanup-tree",
                     "machine_id": machine_id,
                     "native_id": native_id,
-                    "expected_owner": expected_owner,
+                    "claim_holder": claim_holder,
                     "caller_actor": custody.actor,
-                    "worktree": worktree,
+                    "workspace": canonical_workspace,
                     "realpath": prior.get("realpath"),
                     "branch": branch,
                     "common_dir": common_dir,
@@ -414,11 +454,13 @@ def remove_owned_worktree(
                 return _record("refused", "branch delete declined: %s" % ((deleted.stderr or "").strip().splitlines() or ["git declined"])[-1][:200], worktree_removed=True)
             return _record("tree_removed", "owned worktree removed; branch deleted after fresh ancestry proof", worktree_removed=True, branch_deleted=True, reconciled=True)
         realpath: Optional[str] = None
+        branch: Optional[str] = None
         common_dir: Optional[str] = None
         fresh_sha: Optional[str] = None
         guard_error: Optional[str] = None
         try:
-            realpath = resolve_owned_worktree(worktree, roots)
+            realpath = resolve_owned_worktree(canonical_workspace, roots)
+            branch = discover_registered_branch(git_bin, realpath, runner=run)
             info = check_registered_worktree(git_bin, realpath, branch, runner=run)
             common_dir = info["common_dir"]
             check_clean(git_bin, realpath, common_dir, runner=run)
@@ -430,14 +472,14 @@ def remove_owned_worktree(
             # removed or mutated. Read-only timeouts fail closed here too
             # (listed-only); a later retry re-evaluates fresh.
             guard_error = str(exc)[:300]
-        if guard_error is not None or not realpath or not common_dir or not fresh_sha:
+        if guard_error is not None or not realpath or not branch or not common_dir or not fresh_sha:
             refused = {
                 "op": "cleanup-tree",
                 "machine_id": machine_id,
                 "native_id": native_id,
-                "expected_owner": expected_owner,
+                "claim_holder": claim_holder,
                 "caller_actor": custody.actor,
-                "worktree": worktree,
+                "workspace": canonical_workspace,
                 "realpath": realpath,
                 "branch": branch,
                 "common_dir": common_dir,
@@ -454,9 +496,9 @@ def remove_owned_worktree(
                 "op": "cleanup-tree",
                 "machine_id": machine_id,
                 "native_id": native_id,
-                "expected_owner": expected_owner,
+                "claim_holder": claim_holder,
                 "caller_actor": custody.actor,
-                "worktree": worktree,
+                "workspace": canonical_workspace,
                 "realpath": realpath,
                 "branch": branch,
                 "common_dir": common_dir,
@@ -477,8 +519,8 @@ def remove_owned_worktree(
         except SessionUncertain as exc:
             _write_journal(journal_file, {
                 "op": "cleanup-tree", "machine_id": machine_id, "native_id": native_id,
-                "expected_owner": expected_owner, "caller_actor": custody.actor,
-                "worktree": worktree, "realpath": realpath, "branch": branch,
+                "claim_holder": claim_holder, "caller_actor": custody.actor,
+                "workspace": canonical_workspace, "realpath": realpath, "branch": branch,
                 "common_dir": common_dir,
                 "fresh_origin_main": fresh_sha, "state": "uncertain",
                 "reason": "worktree remove uncertain: %s" % type(exc).__name__,
@@ -499,8 +541,8 @@ def remove_owned_worktree(
                 return _record("refused", "worktree remove declined: %s" % ((removed.stderr or "").strip().splitlines() or ["git declined"])[-1][:200])
             _write_journal(journal_file, {
                 "op": "cleanup-tree", "machine_id": machine_id, "native_id": native_id,
-                "expected_owner": expected_owner, "caller_actor": custody.actor,
-                "worktree": worktree, "realpath": realpath, "branch": branch,
+                "claim_holder": claim_holder, "caller_actor": custody.actor,
+                "workspace": canonical_workspace, "realpath": realpath, "branch": branch,
                 "common_dir": common_dir,
                 "fresh_origin_main": fresh_sha, "state": "uncertain",
                 "reason": "worktree removed; branch delete pending",

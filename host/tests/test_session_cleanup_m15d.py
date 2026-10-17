@@ -116,16 +116,16 @@ class TestTreeRemoval(unittest.TestCase):
         wt = add_merged_worktree(self.main, self.base, "wt1", "feat-x")
         out = remove_owned_worktree(
             custody=custody(), journal_dir=str(self.journal), machine_id="h",
-            native_id="22222222-2222-4222-8222-222222222222", expected_owner="demo:assistant",
-            worktree=str(wt), branch="feat-x", cleanup_roots=[str(self.base)], live_paths=[])
+            native_id="22222222-2222-4222-8222-222222222222", claim_holder="h", stop_confirmed=True,
+            canonical_workspace=str(wt), cleanup_roots=[str(self.base)], live_paths=[])
         self.assertEqual(out["state"], "tree_removed")
         self.assertFalse(wt.exists())
         listed = run_git(["branch", "--list", "feat-x"], self.main).stdout
         self.assertNotIn("feat-x", listed)
         again = remove_owned_worktree(
             custody=custody(), journal_dir=str(self.journal), machine_id="h",
-            native_id="22222222-2222-4222-8222-222222222222", expected_owner="demo:assistant",
-            worktree=str(wt), branch="feat-x", cleanup_roots=[str(self.base)], live_paths=[])
+            native_id="22222222-2222-4222-8222-222222222222", claim_holder="h", stop_confirmed=True,
+            canonical_workspace=str(wt), cleanup_roots=[str(self.base)], live_paths=[])
         self.assertEqual(again["state"], "tree_removed")
         self.assertTrue(again["replayed"])
 
@@ -134,8 +134,8 @@ class TestTreeRemoval(unittest.TestCase):
         (wt / "dirty.txt").write_text("untracked\n", encoding="utf-8")
         out = remove_owned_worktree(
             custody=custody(), journal_dir=str(self.journal), machine_id="h",
-            native_id="33333333-3333-4333-8333-333333333333", expected_owner="demo:assistant",
-            worktree=str(wt), branch="feat-x", cleanup_roots=[str(self.base)], live_paths=[])
+            native_id="33333333-3333-4333-8333-333333333333", claim_holder="h", stop_confirmed=True,
+            canonical_workspace=str(wt), cleanup_roots=[str(self.base)], live_paths=[])
         self.assertEqual(out["state"], "refused")
         self.assertIn("dirty", out["reason"])
         self.assertTrue(wt.exists())
@@ -150,8 +150,8 @@ class TestTreeRemoval(unittest.TestCase):
         run_git(["-c", "user.email=synth@example.test", "-c", "user.name=synth", "commit", "-m", "solo"], wt)
         out = remove_owned_worktree(
             custody=custody(), journal_dir=str(self.journal), machine_id="h",
-            native_id="44444444-4444-4444-8444-444444444444", expected_owner="demo:assistant",
-            worktree=str(wt), branch="feat-y", cleanup_roots=[str(self.base)], live_paths=[])
+            native_id="44444444-4444-4444-8444-444444444444", claim_holder="h", stop_confirmed=True,
+            canonical_workspace=str(wt), cleanup_roots=[str(self.base)], live_paths=[])
         self.assertEqual(out["state"], "refused")
         self.assertIn("unmerged", out["reason"])
         self.assertTrue(wt.exists())
@@ -161,8 +161,8 @@ class TestTreeRemoval(unittest.TestCase):
         run_git(["remote", "set-url", "origin", str(self.base / "missing.git")], wt)
         out = remove_owned_worktree(
             custody=custody(), journal_dir=str(self.journal), machine_id="h",
-            native_id="55555555-5555-4555-8555-555555555555", expected_owner="demo:assistant",
-            worktree=str(wt), branch="feat-x", cleanup_roots=[str(self.base)], live_paths=[])
+            native_id="55555555-5555-4555-8555-555555555555", claim_holder="h", stop_confirmed=True,
+            canonical_workspace=str(wt), cleanup_roots=[str(self.base)], live_paths=[])
         self.assertEqual(out["state"], "refused")
         self.assertIn("remote_unavailable", out["reason"])
         self.assertTrue(wt.exists())
@@ -171,14 +171,14 @@ class TestTreeRemoval(unittest.TestCase):
         wt = add_merged_worktree(self.main, self.base, "wt1", "feat-x")
         out = remove_owned_worktree(
             custody=custody(), journal_dir=str(self.journal), machine_id="h",
-            native_id="66666666-6666-4666-8666-666666666666", expected_owner="demo:assistant",
-            worktree=str(wt), branch="feat-x", cleanup_roots=[str(self.base)], live_paths=[str(wt)])
+            native_id="66666666-6666-4666-8666-666666666666", claim_holder="h", stop_confirmed=True,
+            canonical_workspace=str(wt), cleanup_roots=[str(self.base)], live_paths=[str(wt)])
         self.assertEqual(out["state"], "refused")
         self.assertIn("live session", out["reason"])
         main_out = remove_owned_worktree(
             custody=custody(), journal_dir=str(self.journal), machine_id="h",
-            native_id="77777777-7777-4777-8777-777777777777", expected_owner="demo:assistant",
-            worktree=str(self.main), branch="main", cleanup_roots=[str(self.base)], live_paths=[])
+            native_id="77777777-7777-4777-8777-777777777777", claim_holder="h", stop_confirmed=True,
+            canonical_workspace=str(self.main), cleanup_roots=[str(self.base)], live_paths=[])
         self.assertEqual(main_out["state"], "refused")
         self.assertTrue(self.main.exists())
 
@@ -192,13 +192,64 @@ class TestTreeRemoval(unittest.TestCase):
         try:
             out = remove_owned_worktree(
                 custody=custody(), journal_dir=str(self.journal), machine_id="h",
-                native_id="88888888-8888-4888-8888-888888888888", expected_owner="demo:assistant",
-                worktree=str(wt), branch="feat-x", cleanup_roots=[str(self.base)], live_paths=[])
+                native_id="88888888-8888-4888-8888-888888888888", claim_holder="h", stop_confirmed=True,
+                canonical_workspace=str(wt), cleanup_roots=[str(self.base)], live_paths=[])
             self.assertEqual(out["state"], "refused")
             self.assertIn("another worktree", out["reason"])
             self.assertTrue(wt.exists())
         finally:
             run_git(["worktree", "remove", "--force", str(wt2)], self.main)
+
+    def test_branch_discovered_from_worktree_not_caller(self):
+        wt = add_merged_worktree(self.main, self.base, "wt1", "feat-x")
+        out = remove_owned_worktree(
+            custody=custody(), journal_dir=str(self.journal), machine_id="h",
+            native_id="99999999-9999-4999-8999-999999999999", claim_holder="h", stop_confirmed=True,
+            canonical_workspace=str(wt), cleanup_roots=[str(self.base)], live_paths=[])
+        self.assertEqual(out["state"], "tree_removed")
+        self.assertEqual(out["branch"], "feat-x")
+        self.assertEqual(out["workspace"], str(wt))
+
+    def test_foreign_claim_holder_and_unconfirmed_stop_raise(self):
+        wt = add_merged_worktree(self.main, self.base, "wt1", "feat-x")
+        with self.assertRaises(SessionControlError):
+            remove_owned_worktree(
+                custody=custody(), journal_dir=str(self.journal), machine_id="h",
+                native_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", claim_holder="other", stop_confirmed=True,
+                canonical_workspace=str(wt), cleanup_roots=[str(self.base)], live_paths=[])
+        with self.assertRaises(SessionControlError):
+            remove_owned_worktree(
+                custody=custody(), journal_dir=str(self.journal), machine_id="h",
+                native_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", claim_holder="h", stop_confirmed=False,
+                canonical_workspace=str(wt), cleanup_roots=[str(self.base)], live_paths=[])
+        self.assertTrue(wt.exists())
+
+    def test_detached_head_refused(self):
+        wt = self.base / "wt1"
+        run_git(["worktree", "add", "--detach", str(wt)], self.main)
+        try:
+            out = remove_owned_worktree(
+                custody=custody(), journal_dir=str(self.journal), machine_id="h",
+                native_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", claim_holder="h", stop_confirmed=True,
+                canonical_workspace=str(wt), cleanup_roots=[str(self.base)], live_paths=[])
+            self.assertEqual(out["state"], "refused")
+            self.assertIn("detached", out["reason"])
+            self.assertTrue(wt.exists())
+        finally:
+            run_git(["worktree", "remove", "--force", str(wt)], self.main)
+
+    def test_workspace_idempotency_conflict(self):
+        wt = add_merged_worktree(self.main, self.base, "wt1", "feat-x")
+        out = remove_owned_worktree(
+            custody=custody(), journal_dir=str(self.journal), machine_id="h",
+            native_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc", claim_holder="h", stop_confirmed=True,
+            canonical_workspace=str(wt), cleanup_roots=[str(self.base)], live_paths=[])
+        self.assertEqual(out["state"], "tree_removed")
+        with self.assertRaises(SessionControlError):
+            remove_owned_worktree(
+                custody=custody(), journal_dir=str(self.journal), machine_id="h",
+                native_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc", claim_holder="h", stop_confirmed=True,
+                canonical_workspace=str(self.base / "other"), cleanup_roots=[str(self.base)], live_paths=[])
 
 
 class TestFleetAllowlistAndCli(unittest.TestCase):
