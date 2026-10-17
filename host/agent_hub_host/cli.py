@@ -138,6 +138,8 @@ def main():
     routing.add_commands(sub)
     from . import conversations
     conversations.add_commands(sub)
+    from . import intake
+    intake.add_commands(sub)
     add_bridge_resume_command(sub)
 
     for command in ('start-agent', 'start-session', 'plan-agent'):
@@ -257,6 +259,15 @@ def main():
             print('Bridge recovery HOLD: check native opt-in, acknowledgement, current authority, '
                   'existing journal and empty retained range. Preserve uncertain intents. '
                   'After an uncertain result inspect the journal; equal-target replays are refused.', file=sys.stderr)
+            sys.exit(1)
+        return
+    if args.cmd in ('intake', 'handoff'):
+        try:
+            print(json.dumps(intake.execute(args), indent=2, ensure_ascii=True))
+        except Exception:
+            print('Intake operation failed; check authentication, grants, capacity and current versions. '
+                  'Retry mutations with the same key and payload after uncertain responses; '
+                  'handoff emits only a complete consistent authorized snapshot.', file=sys.stderr)
             sys.exit(1)
         return
     if args.cmd == 'conversations':
