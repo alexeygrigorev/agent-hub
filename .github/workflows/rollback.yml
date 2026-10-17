@@ -18,6 +18,9 @@ permissions:
 
 jobs:
   rollback:
+    concurrency:
+      group: agent-hub-production
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
