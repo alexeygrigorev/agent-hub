@@ -5,6 +5,7 @@ import json
 import signal
 import threading
 import time
+import pathlib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
@@ -225,6 +226,7 @@ class RoleConsumer:
         token_provider: Optional[Callable[[], str]] = None,
         dispatcher: Optional[JobDispatcher] = None,
         min_interval_s: float = 10.0,
+        enabled: bool = False,
     ):
         self.config_path = config_path
         self.role_config = role_config
@@ -234,6 +236,8 @@ class RoleConsumer:
         self.dispatcher = dispatcher
         self.min_interval_s = max(1.0, float(min_interval_s))
         self.last_run_monotonic = 0.0
+        self.enabled = bool(enabled)
+        self._last_config_mtime: Optional[float] = None
 
     def step(self) -> Dict[str, Any]:
         now = time.monotonic()
@@ -241,9 +245,29 @@ class RoleConsumer:
             return {"rate_limited": True}
         self.last_run_monotonic = now
 
+        if not self.enabled:
+            return {"disabled": True, "reason": "role_consumer_disabled"}
+
+        # Detect on-disk trusted config changes and fence active dispatcher
+        if self.config_path:
+            p = pathlib.Path(self.config_path)
+            if p.is_file():
+                try:
+                    cur_mtime = p.stat().st_mtime
+                    if self._last_config_mtime is None or cur_mtime != self._last_config_mtime:
+                        new_cfg = load_role_config(self.config_path)
+                        if new_cfg is not None and (self.role_config is None or new_cfg.config_hash != getattr(self.role_config, "config_hash", "")):
+                            self.role_config = new_cfg
+                            if self.dispatcher and hasattr(self.dispatcher, "runtime_mgr"):
+                                self.dispatcher.runtime_mgr.role_config = self.role_config
+                        self._last_config_mtime = cur_mtime
+                except Exception:
+                    pass
+
         cfg = self.role_config
         if cfg is None and self.config_path:
             cfg = load_role_config(self.config_path)
+            self.role_config = cfg
         if cfg is None or not cfg.enabled:
             return {"disabled": True}
 
@@ -376,25 +400,31 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
             machine_id=cfg['machine_id'])
         host_health_thread: Optional[threading.Thread] = None
         # Role consumer hook (M8b Platform Role Runtime): ONE instance for the controller
-        # lifetime, disabled by default. If enabled in settings or journal roles.json,
+        # lifetime, disabled by default. If enabled in settings,
         # runs single-inflight inside existing supervisor loop.
+        rc_setting = settings.get("role_consumer", {})
+        rc_enabled = False
+        rc_interval = 10.0
+        if isinstance(rc_setting, dict):
+            rc_enabled = bool(rc_setting.get("enabled", False))
+            if "interval_sec" in rc_setting:
+                rc_interval = float(rc_setting["interval_sec"])
+        elif isinstance(rc_setting, bool):
+            rc_enabled = rc_setting
+
         role_consumer_cfg_path = None
         role_consumer_cfg_obj = None
-        if "role_config" in settings:
-            rc_val = settings["role_config"]
-            if isinstance(rc_val, str):
-                role_consumer_cfg_path = rc_val
-            elif isinstance(rc_val, dict):
-                role_consumer_cfg_obj = load_role_config(rc_val)
-        if role_consumer_cfg_path is None and role_consumer_cfg_obj is None:
-            journal_roles = journal / "roles.json"
-            if journal_roles.exists():
-                role_consumer_cfg_path = str(journal_roles)
-
-        rc_setting = settings.get("role_consumer", {})
-        rc_interval = 10.0
-        if isinstance(rc_setting, dict) and "interval_sec" in rc_setting:
-            rc_interval = float(rc_setting["interval_sec"])
+        if rc_enabled:
+            if "role_config" in settings:
+                rc_val = settings["role_config"]
+                if isinstance(rc_val, str):
+                    role_consumer_cfg_path = rc_val
+                elif isinstance(rc_val, dict):
+                    role_consumer_cfg_obj = load_role_config(rc_val)
+            if role_consumer_cfg_path is None and role_consumer_cfg_obj is None:
+                journal_roles = journal / "roles.json"
+                if journal_roles.exists():
+                    role_consumer_cfg_path = str(journal_roles)
 
         role_consumer = RoleConsumer(
             config_path=role_consumer_cfg_path,
@@ -402,6 +432,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
             base_url=cfg.get("base_url"),
             host_id=cfg.get("machine_id"),
             min_interval_s=rc_interval,
+            enabled=rc_enabled,
         )
         role_consumer_thread: Optional[threading.Thread] = None
         next_fleet = 0

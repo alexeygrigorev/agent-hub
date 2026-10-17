@@ -398,10 +398,25 @@ class RuntimeManager:
         self._bound_clock_fixture = False
         self.host_id: str = ""
 
-        self.role_config: rld.TrustedRoleConfig = role_config if role_config is not None else rld.TrustedRoleConfig.disabled()
+        self._role_config: rld.TrustedRoleConfig = role_config if role_config is not None else rld.TrustedRoleConfig.disabled()
         self.role_adapter = rld.RoleDispatchAdapter(
-            config=self.role_config,
+            config=self._role_config,
             quota_checker=self.check_codex_window,
+            launcher_backend=self._adapter_kwargs.get("role_launcher_backend"),
+            launcher_executor=self._adapter_kwargs.get("role_launcher_executor"),
+        )
+
+    @property
+    def role_config(self) -> rld.TrustedRoleConfig:
+        return self._role_config
+
+    @role_config.setter
+    def role_config(self, new_cfg: rld.TrustedRoleConfig) -> None:
+        self._role_config = new_cfg if new_cfg is not None else rld.TrustedRoleConfig.disabled()
+        self.role_adapter = rld.RoleDispatchAdapter(
+            config=self._role_config,
+            quota_checker=self.check_codex_window,
+            launcher_backend=self._adapter_kwargs.get("role_launcher_backend"),
             launcher_executor=self._adapter_kwargs.get("role_launcher_executor"),
         )
 

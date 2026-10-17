@@ -568,6 +568,10 @@ class JobDispatcher:
         launcher_task_id = f"hub-root-{job_id}" if script_owned else f"hub-{job_id}"
         renew_thread: Optional[threading.Thread] = None
         role = job_info.get("role_binding")
+        if role is not None:
+            safe_job = re.sub(r"[^a-zA-Z0-9_-]", "-", job_id)
+            launcher_task_id = f"hub-role-{kind}-{safe_job}-g{role.get('generation', 0)}-e{lease_epoch}"
+            native_session = None
         role_intent_recorded = False
 
         def _finish_failed_with_bridge(fail_summary: str, initial_refs: Optional[List[str]] = None,
@@ -761,6 +765,14 @@ class JobDispatcher:
                         raise ValueError("mismatched role name")
                     if "generation" in existing_data and existing_data.get("generation") != role.get("generation"):
                         raise ValueError("mismatched role generation")
+                    ev_sess = existing_data.get("native_session")
+                    if (
+                        not isinstance(ev_sess, str)
+                        or not rld.UUID_RE.fullmatch(ev_sess)
+                        or ev_sess == rld.NIL_UUID
+                    ):
+                        raise ValueError("invalid or missing native_session in role evidence")
+                    native_session = ev_sess
                 if "utc" in existing_data:
                     utc_val = existing_data.get("utc")
                     if not isinstance(utc_val, str) or not utc_val.strip():
@@ -820,9 +832,11 @@ class JobDispatcher:
                 evidence_refs = []
             else:
                 exec_res = exec_result.get("res", {})
-                status = exec_res.get("status", "succeeded")
+                status = exec_res.get("status", "failed" if role is not None else "succeeded")
                 summary = exec_res.get("summary", "completed")
                 evidence_refs = exec_res.get("evidence_refs", [])
+                if role is not None and status == "succeeded" and not evidence_refs:
+                    evidence_refs = [str(evidence_file)]
 
             # Stop renewal loop
             stop_event.set()
