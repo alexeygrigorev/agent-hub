@@ -121,11 +121,24 @@ def cmd_bridge(args):
         sys.exit(1)
 
 
+def add_bridge_resume_command(sub):
+    parser = sub.add_parser('bridge-resume', help='Explicitly acknowledge a missing conversation history range (local journal only)',
+                            description='HOLD is the default. Advance one existing bridge journal only across a verified empty retained-history range. Never marks missing messages delivered/read. Equal-target replays are refused; inspect the journal after an uncertain result.')
+    parser.add_argument('--enable-native', action='store_true', help='Require the same genuine own native binding as the normal conversation bridge')
+    for flag in ('actor', 'project', 'workspace', 'machine-id', 'conversation'):
+        parser.add_argument('--' + flag, required=True)
+    parser.add_argument('--resume-after-seq', type=int, required=True, help='Explicit new LOCAL cursor, greater than current cursor and at most current server last_seq')
+    parser.add_argument('--acknowledge-gap', action='store_true', help='Acknowledge that missing history cannot be delivered; retain a durable local gap audit record')
+
+
 def main():
     parser = argparse.ArgumentParser(description="Agent Hub CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
     from . import routing
     routing.add_commands(sub)
+    from . import conversations
+    conversations.add_commands(sub)
+    add_bridge_resume_command(sub)
 
     for command in ('start-agent', 'start-session', 'plan-agent'):
         launch = sub.add_parser(command, help='Queue a headless agent or a real interactive session')
@@ -236,6 +249,29 @@ def main():
     p_bridge.add_argument("--service-session-id", default=None)
 
     args = parser.parse_args()
+    if args.cmd == 'bridge-resume':
+        try:
+            from .conversation_bridge import resume_from_args
+            print(json.dumps(resume_from_args(args), indent=2))
+        except Exception:
+            print('Bridge recovery HOLD: check native opt-in, acknowledgement, current authority, '
+                  'existing journal and empty retained range. Preserve uncertain intents. '
+                  'After an uncertain result inspect the journal; equal-target replays are refused.', file=sys.stderr)
+            sys.exit(1)
+        return
+    if args.cmd == 'conversations':
+        try:
+            print(json.dumps(conversations.execute(args), indent=2))
+        except Exception:
+            # Do not echo message text, paths, tokens, or server-controlled errors.
+            if args.conversation_cmd == 'bridge':
+                from .conversation_bridge import HOLD_REASON
+                print(HOLD_REASON, file=sys.stderr)
+            else:
+                print('Conversation operation failed; check inputs, authentication and membership. '
+                      'Retry create/send with the same key and payload after uncertain results.', file=sys.stderr)
+            sys.exit(1)
+        return
     if args.cmd in ('submit', 'jobs', 'job', 'task-result', 'routing-machines', 'model-policy', 'task-artifact', 'artifact'):
         try:
             print(json.dumps(routing.execute(args), indent=2))

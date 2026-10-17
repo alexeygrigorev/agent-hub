@@ -1630,9 +1630,10 @@ sys.exit(0)
             self.assertTrue(st["delivered_at"] and st["acked_at"], st)
         self.assertEqual(sorted(s["tag"] for s in self._fake_lines("sends.jsonl")), ["e1-p", "e1-w", "e1-w"])
         self.assertEqual({tuple(c[:2]) for c in self._fake_lines("calls.jsonl")}, {("message", "send"), ("message", "log")})
-        for key, from_actor in (("q", "projE:e1-w"), ("t", "e1-w"), ("r", "role:e1-p-role")):
+        # F7 freezes canonical agent endpoints; explicit role addresses remain roles.
+        for key, from_actor in (("q", "projE:e1-w"), ("t", "projE:e1-w"), ("r", "role:e1-p-role")):
             replies = self._replies_to(ids[key])
-            self.assertEqual([(r["from_actor"], r["to_actor"], r["kind"]) for r in replies], [(from_actor, "worker-2", "reply")])
+            self.assertEqual([(r["from_actor"], r["to_actor"], r["kind"]) for r in replies], [(from_actor, "projB:worker-2", "reply")])
 
         # A second run has no new native send, hub ACK or reply
         acked = {m: self._stages(m)["acked_at"] for m in ids.values()}

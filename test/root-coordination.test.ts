@@ -546,7 +546,7 @@ describe('Root Coordination Acceptance Criteria (M4 / SPEC §8.1 / Issue 6 - Six
 
       // Seed registered root agent with running state on stale host
       sql.exec(
-        "INSERT INTO agents (tag, project, role, machine_id, engine, session_id, workspace, state, health_state) VALUES ('root-agent-stale', 'hub', 'root', 'host-stale-root', 'codex', 'sess-stale-root', '/ws', 'running', 'healthy')"
+        "INSERT INTO agents (tag, project, role, machine_id, engine, session_id, workspace, state, health_state) VALUES ('root-agent-stale', 'control', 'root', 'host-stale-root', 'codex', 'sess-stale-root', '/ws', 'running', 'healthy')"
       );
 
       // Seed expired lease at epoch 1

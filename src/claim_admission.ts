@@ -1,3 +1,4 @@
+import { credentialActor } from './agent_registry';
 /** Ownership-aware launch admission over the existing /api/bus/claims table. */
 import { BusService, parseAddress, isRootRoleAddress, type CallerContext } from './bus';
 import type { SqlStorage } from '@cloudflare/workers-types';
@@ -194,12 +195,12 @@ export class ClaimAdmission {
     }
     if (!parseAddress(claim.holder)) return this.fail('claim_authority_unsupported', 403);
 
-    const credential: any = this.sql.exec('SELECT kind, actor, subject, scopes, revoked_at, expires_at FROM credentials WHERE id = ?', principal.tokenId).toArray()[0];
+    const credential: any = this.sql.exec('SELECT kind, actor, subject, registry_actor, machine_id, scopes, revoked_at, expires_at FROM credentials WHERE id = ?', principal.tokenId).toArray()[0];
     const permission = opts.authority?.permission || opts.permission || 'fleet:launch';
     if (!['fleet:launch', 'routing:submit'].includes(permission)) return this.fail('claim_authority_unsupported', 403);
     let scopes: string[] = [];
     try { scopes = JSON.parse(credential?.scopes); } catch { /* fail closed below */ }
-    if (!credential || credential.kind !== 'agent' || (credential.actor || credential.subject) !== principal.actor || credential.revoked_at != null ||
+    if (!credential || credential.kind !== 'agent' || credentialActor(this.sql as any, credential) !== principal.actor || credential.revoked_at != null ||
       !Number.isFinite(Date.parse(credential.expires_at)) || Date.parse(credential.expires_at) <= this.now() || !Array.isArray(scopes) ||
       !scopes.includes('bus:send') || !scopes.includes(permission)) return this.fail('claim_authority_unsupported', 403);
 

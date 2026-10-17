@@ -1,8 +1,17 @@
 # Conversation Integration Review
 
-**Verdict**: **SCOPED ACCEPT** (scoped to the exact two-artifact combined conversation & fleet UI source proposal at commit `cfb4dc26985cbe39a1ae770ade4a6a57880edcbc` on direct parent `5dcdf7164b28bd0e3a1d717ac9090c054eca3f24`; zero blocking or non-blocking product defects found).
+> Publication note by platform/GPT-6: the independent original is commit
+> `5a4b9381d4863d10a1d46b249c0be83e17cee18f` (report SHA-256
+> `e7627dfed6d2263a47a0740d50d5baacffa7601dbd66c5d57acdae559d09ada6`).
+> This copy corrects two metadata errors: the proposal's direct parent is
+> `f9f6fb258e5abdf4d97e9292043828b4cc80ac82`, while `5dcdf71` is its source base;
+> the source author's recorded runtime family is GPT-6. The verdict, source,
+> tests and evidence are unchanged. All 61 M6 assertions remain covered;
+> their F7 fixture adaptations are part of the reviewed patch.
 
-- **Reviewed commit**: `cfb4dc26985cbe39a1ae770ade4a6a57880edcbc` (`platform-conv-final/GPT-5.4`)
+**Verdict**: **SCOPED ACCEPT** (scoped to the exact two-artifact combined conversation & fleet UI source proposal at commit `cfb4dc26985cbe39a1ae770ade4a6a57880edcbc` against source base `5dcdf7164b28bd0e3a1d717ac9090c054eca3f24`; zero blocking or non-blocking product defects found).
+
+- **Reviewed commit**: `cfb4dc26985cbe39a1ae770ade4a6a57880edcbc` (`platform-conv-final/GPT-6`)
 - **Base `main` commit**: `5dcdf7164b28bd0e3a1d717ac9090c054eca3f24`
 - **Reviewer**: `platform-conv-review` (`Gemini 4 Argon`, `antigravity`, session `4aab5128-76e4-47a0-bf28-db439e942de7`)
 - **Reviewed artifact digests**:

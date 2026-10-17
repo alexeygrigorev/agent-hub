@@ -1,0 +1,56 @@
+/* Conversations UI — layout only; every color, border, type and space value
+   comes from vendored dakit tokens (public/vendor/dakit). Unlayered app CSS
+   wins over dakit's cascade layers, so no !important is needed. */
+
+.conv-inner { display: flex; flex-direction: column; }
+.dk-page-header__subtitle { margin: 0; color: var(--dk-text-muted); font-size: var(--dk-text-md); }
+
+/* ---- Split: list and thread fill the viewport height ---- */
+.conv-split { flex: 1; min-height: 320px; }
+/* dakit owns detail display, including its one-pane mobile rule. */
+
+.conv-detail-head { display: flex; flex-direction: column; gap: var(--dk-space-1); padding: var(--dk-space-2) var(--dk-space-4); border-bottom: 1px solid var(--dk-border-default); background: var(--dk-bg-muted); min-width: 0; }
+.conv-detail-head__title { margin: 0; font-size: var(--dk-text-lg); font-weight: var(--dk-weight-semibold); color: var(--dk-text-heading); overflow-wrap: anywhere; }
+.conv-detail-head__meta { color: var(--dk-text-muted); font-size: var(--dk-text-sm); overflow-wrap: anywhere; }
+
+/* ---- Message list ---- */
+.conv-thread { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.conv-thread__scroll { flex: 1; min-height: 0; overflow-y: auto; padding: var(--dk-space-4); scroll-padding-block-start: var(--dk-space-4); }
+.conv-thread__top { display: flex; justify-content: center; padding: var(--dk-space-2) 0 var(--dk-space-4); }
+
+.conv-day { position: sticky; top: 0; z-index: 1; background: var(--dk-bg-surface); padding: var(--dk-space-2) 0; margin: 0; color: var(--dk-text-muted); font-size: var(--dk-text-xs); font-weight: var(--dk-weight-semibold); letter-spacing: 0.06em; text-transform: uppercase; }
+
+.msg { display: grid; grid-template-columns: 28px minmax(0, 1fr); column-gap: var(--dk-space-3); padding: var(--dk-space-2) 0; align-items: start; }
+.msg__side { display: flex; justify-content: center; padding-top: var(--dk-space-1); }
+.msg__main { display: flex; flex-direction: column; gap: var(--dk-space-1); min-width: 0; }
+.msg__meta { display: flex; align-items: baseline; gap: var(--dk-space-2); min-width: 0; }
+.msg__sender { color: var(--dk-text-heading); font-size: var(--dk-text-sm); font-weight: var(--dk-weight-semibold); overflow-wrap: anywhere; }
+.msg__time { color: var(--dk-text-faint); font-family: var(--dk-font-mono); font-size: var(--dk-text-xs); font-variant-numeric: tabular-nums; }
+.msg__body { margin: 0; color: var(--dk-text-primary); font-size: var(--dk-text-md); line-height: var(--dk-leading-normal); white-space: pre-wrap; overflow-wrap: anywhere; background: var(--dk-bg-muted); border: 1px solid var(--dk-border-default); border-radius: var(--dk-radius-md); padding: var(--dk-space-2) var(--dk-space-3); width: fit-content; max-width: 72ch; }
+.msg--self .msg__body { background: var(--dk-accent-soft); border-color: var(--dk-border-default); color: var(--dk-text-primary); }
+.msg__status { display: flex; align-items: center; gap: var(--dk-space-2); flex-wrap: wrap; }
+.msg__error { color: var(--dk-danger-text); font-size: var(--dk-text-sm); }
+
+/* ---- Composer ---- */
+.composer { display: flex; flex-direction: column; gap: var(--dk-space-1); padding: var(--dk-space-3) var(--dk-space-4) var(--dk-space-4); border-top: 1px solid var(--dk-border-default); background: var(--dk-bg-surface); }
+.composer__row { display: flex; align-items: flex-end; gap: var(--dk-space-2); }
+.composer__field { flex: 1; min-width: 0; resize: none; height: auto; min-height: var(--dk-size-control-lg); }
+.composer__send { flex: none; }
+.composer__foot { display: flex; align-items: center; gap: var(--dk-space-2); color: var(--dk-text-faint); font-size: var(--dk-text-xs); }
+.composer[aria-disabled="true"] .composer__field, .composer[aria-disabled="true"] .composer__send { opacity: 0.6; }
+
+/* ---- List states ---- */
+.conv-list-state { padding: var(--dk-space-4); }
+.conv-list-state .dk-callout { margin: 0; }
+.conv-empty-thread { flex: 1; display: grid; place-items: center; padding: var(--dk-space-6) var(--dk-space-4); }
+
+/* ---- New conversation dialog ---- */
+.conv-kind-group { display: flex; gap: var(--dk-space-4); }
+.conv-kind-option { display: flex; align-items: center; gap: var(--dk-space-2); color: var(--dk-text-primary); font-size: var(--dk-text-md); }
+.conv-identity-list { display: flex; flex-direction: column; border: 1px solid var(--dk-border-default); border-radius: var(--dk-radius-md); max-height: 240px; overflow-y: auto; }
+.conv-identity { display: flex; align-items: center; gap: var(--dk-space-3); padding: var(--dk-space-2) var(--dk-space-3); border-top: 1px solid var(--dk-border-default); color: var(--dk-text-primary); font-size: var(--dk-text-md); cursor: pointer; }
+.conv-identity:first-child { border-top: none; }
+.conv-identity:hover { background: var(--dk-bg-hover); }
+.conv-identity__kind { margin-left: auto; }
+.conv-identity--none { color: var(--dk-text-muted); cursor: default; }
+.conv-identity--none:hover { background: transparent; }

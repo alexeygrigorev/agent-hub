@@ -1,3 +1,4 @@
+import { registryNameSql } from './agent_registry';
 import { sha256, base64url } from './auth/crypto';
 import { getSession } from './auth/session';
 import { ensureRootScheduling, isRootSchedulingEnabled } from './root_scheduling';
@@ -710,7 +711,7 @@ export class JobsService {
               toActor = `machine:${hostId}`;
             }
             if (!toActor) {
-              const rootAgent = this.sql.exec("SELECT tag, project FROM agents WHERE role = 'root' AND (state IS NULL OR state != 'retired') LIMIT 1").toArray()[0] as any;
+              const rootAgent = this.sql.exec(`SELECT tag, project FROM agents WHERE role = 'root' AND (COALESCE(project,'') = '' OR ${registryNameSql('project')}) AND (state IS NULL OR state != 'retired') LIMIT 1`).toArray()[0] as any;
               if (rootAgent) {
                 if (isRecipientValid(rootAgent.tag)) {
                   toActor = rootAgent.tag;
@@ -1413,9 +1414,10 @@ export class JobsService {
       const regAgents = this.sql.exec(
         `SELECT tag, project, role, machine_id, engine, session_id, workspace, state, health_state, detail, lasthealth, health_at, last_seen_at
          FROM agents
-         WHERE (role = 'root' OR tag = 'role:root' OR tag = 'root')
+         WHERE (role = 'root' OR (COALESCE(project,'') = '' AND (tag = 'role:root' OR tag = 'root')))
            AND (state IS NULL OR state != 'retired')
            AND (health_state IS NULL OR health_state != 'retired')
+           AND (COALESCE(project,'') = '' OR ${registryNameSql('project')})
            AND tag NOT LIKE '%win35%'
            AND tag NOT LIKE '%retired%'
          ORDER BY
@@ -2483,7 +2485,8 @@ export class JobsService {
               result = { success: false, status: 'invalid_payload', reason: `reply_to message ${p.reply_to} not found`, current_epoch: epoch };
               return;
             }
-            if (replyMsg.from_actor !== toActor && replyMsg.to_actor !== toActor) {
+            const recipient = this.busService?.canonicalActor(toActor) ?? toActor;
+            if (replyMsg.from_actor !== recipient && replyMsg.to_actor !== recipient) {
               result = { success: false, status: 'invalid_payload', reason: 'reply_to recipient mismatch', current_epoch: epoch };
               return;
             }

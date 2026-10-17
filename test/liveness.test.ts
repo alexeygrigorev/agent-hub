@@ -184,6 +184,7 @@ describe('stale alerts', () => {
     const tokens: Record<string, string> = { reader: 'reader-token-' + crypto.randomUUID(), reporter: 'reporter-token-' + crypto.randomUUID() };
     await runInDurableObject(stub, async (hub: Hub) => {
       for (const [name, scopes] of [['reader', ['bus:read']], ['reporter', ['bus:read', 'health:report']]] as const) {
+        hub.sql.exec('INSERT INTO agents(tag,registered_at) VALUES (?,?)',name,new Date().toISOString());
         hub.sql.exec('INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
           name, 'agent', await sha256(tokens[name]), name, name, name, JSON.stringify(scopes), 'test', new Date().toISOString(), new Date(Date.now() + 3600000).toISOString());
       }

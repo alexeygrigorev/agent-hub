@@ -13,9 +13,9 @@ const now = Date.now();
 const at = (delta = 0) => new Date(now + delta).toISOString();
 const admin = { caller: { isAdmin: true, actor: 'test-admin', kind: 'human' as const }, scopes: ['admin'] };
 const host = (id = 'hetzner') => ({ caller: { machineId: id, kind: 'host' as const, actor: 'machine:' + id }, scopes: ['host'] });
-const holder = { caller: { actor: 'worker-1', kind: 'agent' as const, tokenId: 'cred-worker-1' }, scopes: ['fleet:launch', 'bus:send'] };
-const other = { caller: { actor: 'worker-2', kind: 'agent' as const, tokenId: 'cred-worker-2' }, scopes: ['fleet:launch', 'bus:send'] };
-const routingClient = (actor = 'client-a') => ({ caller: { actor, kind: 'agent' as const, tokenId: 'cred-' + actor }, scopes: ['routing:submit', 'bus:send'] });
+const holder = { caller: { actor: 'projA:worker-1', kind: 'agent' as const, tokenId: 'cred-worker-1' }, scopes: ['fleet:launch', 'bus:send'] };
+const other = { caller: { actor: 'projB:worker-2', kind: 'agent' as const, tokenId: 'cred-worker-2' }, scopes: ['fleet:launch', 'bus:send'] };
+const routingClient = (actor = 'client-a') => ({ caller: { actor: actor === 'client-a' ? 'tasks:client-a' : actor, kind: 'agent' as const, tokenId: 'cred-' + actor }, scopes: ['routing:submit', 'bus:send'] });
 const req = (path: string, data?: any, method = data === undefined ? 'GET' : 'POST') => new Request('https://hub.test' + path, { method, body: data === undefined ? undefined : JSON.stringify(data) });
 const quota = { status: 'ok', observed_at: at(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: at(86400000) } } };
 
@@ -75,7 +75,10 @@ async function routingFixture(fn: (r: RoutingService, f: FleetService, sql: any,
 }
 
 function credentials(sql: any, actors: string[]) {
-  for (const actor of actors) sql.exec('INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', 'cred-' + actor, 'agent', 'test-hash-' + actor, 'family-' + actor, actor, actor, JSON.stringify(['bus:send', 'fleet:launch', 'routing:submit']), 'test', at(), at(86400000));
+  for (const actor of actors) {
+    const machine = sql.exec("SELECT machine_id FROM agents WHERE tag = ? OR project || ':' || tag = ?", actor, actor).toArray()[0]?.machine_id ?? null;
+    sql.exec('INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, machine_id, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', 'cred-' + actor, 'agent', 'test-hash-' + actor, 'family-' + actor, actor, actor, machine, JSON.stringify(['bus:send', 'fleet:launch', 'routing:submit']), 'test', at(), at(86400000));
+  }
 }
 
 function intent(extra: any = {}) {
@@ -193,10 +196,10 @@ describe('fleet edit admission', () => {
 
 describe('routing edit admission and unchanged legacy routing', () => {
   it('does not offer after claim release between enqueue and placement', () => routingFixture(async (r, f, sql, bus) => {
-    const claim = bus.claim({ actor: 'client-a', kind: 'agent' as const }, 'tasks', 'src', 'client-a', 3600000, now);
+    const claim = bus.claim({ actor: 'tasks:client-a', kind: 'agent' as const }, 'tasks', 'src', 'client-a', 3600000, now);
     const queued: any = await (await r.handle(req('/api/tasks', task({ needs: ['missing-cap'], access: { mode: 'edit', claim_id: claim.id, project: 'tasks', scopes: ['src/a.ts'] } })), routingClient())).json();
     expect(queued.launch_id).toBeNull(); expect(queued.access).toBe('edit');
-    bus.releaseClaim({ actor: 'client-a', kind: 'agent' as const }, claim.id, now);
+    bus.releaseClaim({ actor: 'tasks:client-a', kind: 'agent' as const }, claim.id, now);
     sql.exec("UPDATE routing_machines SET needs_json = '[\"missing-cap\"]' WHERE machine_id = 'hetzner'");
     await r.dispatch();
     const after: any = await (await r.handle(req('/api/tasks/' + queued.id), routingClient())).json();
@@ -205,11 +208,11 @@ describe('routing edit admission and unchanged legacy routing', () => {
   }));
 
   it('rejects routing-only use of another holder claim and expires before offer', () => routingFixture(async (r, f, sql, bus) => {
-    const claim = bus.claim({ actor: 'worker-1', kind: 'agent' as const }, 'projA', 'src', 'worker-1', 3600000, now);
+    const claim = bus.claim({ actor: 'projA:worker-1', kind: 'agent' as const }, 'projA', 'src', 'worker-1', 3600000, now);
     const stolen = await r.handle(req('/api/tasks', task({ access: { mode: 'edit', claim_id: claim.id, scopes: ['src/a.ts'] } })), routingClient());
     expect(stolen.status).toBe(403);
     expect(sql.exec('SELECT COUNT(*) AS n FROM routing_jobs').one().n).toBe(0);
-    const own = bus.claim({ actor: 'client-a', kind: 'agent' as const }, 'tasks', 'src', 'client-a', 3600000, now);
+    const own = bus.claim({ actor: 'tasks:client-a', kind: 'agent' as const }, 'tasks', 'src', 'client-a', 3600000, now);
     sql.exec('UPDATE claims SET expires_at = ? WHERE id = ?', now - 1, own.id);
     expect((await r.handle(req('/api/tasks', task({ access: { mode: 'edit', claim_id: own.id, scopes: ['src/a.ts'] } })), routingClient())).status).toBe(409);
   }));
@@ -297,7 +300,10 @@ describe('retained authority and replacement claims', () => {
 
   for (const oldState of ['starting', 'running', 'uncertain']) {
     it(`blocks overlapping replacement authority while old work is ${oldState}, then permits after confirmed exit`, () => fleetFixture(async (f, sql, bus) => {
-      sql.exec("UPDATE agents SET project = 'projA' WHERE tag = 'worker-2'");
+      sql.exec("DELETE FROM credentials WHERE id = 'cred-worker-2'");
+    sql.exec("UPDATE agents SET project = 'projA' WHERE tag = 'worker-2'");
+    credentials(sql, ['worker-2']);
+    const other = { caller: { actor: 'projA:worker-2', kind: 'agent' as const, tokenId: 'cred-worker-2' }, scopes: ['fleet:launch', 'bus:send'] };
       const claim = bus.claim(holder.caller, 'projA', 'src', 'worker-1', 3600000);
       const original: any = await (await f.handle(req('/api/fleet/launches', intent({ access: editAccess(claim.id), machine: 'hetzner' })), holder)).json();
       sql.exec('UPDATE fleet_launches SET state = ? WHERE id = ?', oldState, original.id);
@@ -331,14 +337,14 @@ describe('retained authority and replacement claims', () => {
 describe('atomic editable routing placement', () => {
   for (const change of ['release', 'expiry', 'reassign', 'credential_revocation', 'policy_change']) {
     it(`does not reserve after queued ${change}`, () => routingFixture(async (r, f, sql, bus) => {
-      const claim = bus.claim({ kind: 'agent', actor: 'client-a' }, 'tasks', 'src', 'client-a', 3600000);
+      const claim = bus.claim({ kind: 'agent', actor: 'tasks:client-a' }, 'tasks', 'src', 'client-a', 3600000);
       const input = task({ needs: ['later'], access: editAccess(claim.id) });
       const queued: any = await (await r.handle(req('/api/tasks', input), routingClient())).json();
       expect(queued.launch_id).toBeNull();
       const stored = JSON.parse(sql.exec('SELECT request_json FROM routing_jobs WHERE id = ?', queued.id).one().request_json);
       expect(stored.edit_authority.credential_id).toBe('cred-client-a');
       expect(stored.tasks[0].approved_action).toBe(input.approved_action);
-      if (change === 'release') bus.releaseClaim({ kind: 'agent', actor: 'client-a' }, claim.id);
+      if (change === 'release') bus.releaseClaim({ kind: 'agent', actor: 'tasks:client-a' }, claim.id);
       if (change === 'expiry') sql.exec('UPDATE claims SET expires_at = ? WHERE id = ?', now - 1, claim.id);
       if (change === 'reassign') sql.exec("UPDATE claims SET holder = 'worker-1' WHERE id = ?", claim.id);
       if (change === 'credential_revocation') sql.exec("UPDATE credentials SET revoked_at = ? WHERE id = 'cred-client-a'", at());
@@ -354,7 +360,7 @@ describe('atomic editable routing placement', () => {
   }
 
   it('rejects a routing-only token even when its actor owns the live claim', () => routingFixture(async (r, f, sql, bus) => {
-    const claim = bus.claim({ kind: 'agent', actor: 'client-a' }, 'tasks', 'src', 'client-a', 3600000);
+    const claim = bus.claim({ kind: 'agent', actor: 'tasks:client-a' }, 'tasks', 'src', 'client-a', 3600000);
     sql.exec("UPDATE credentials SET scopes = '[\"routing:submit\"]' WHERE id = 'cred-client-a'");
     expect((await r.handle(req('/api/tasks', task({ access: editAccess(claim.id) })), routingClient())).status).toBe(403);
     expect(sql.exec('SELECT COUNT(*) AS n FROM routing_jobs').one().n).toBe(0);
@@ -362,7 +368,7 @@ describe('atomic editable routing placement', () => {
   }));
 
   it('binds immutable routing actions and claims, deduplicates and admits only one conflicting launch', () => routingFixture(async (r, f, sql, bus) => {
-    const claim = bus.claim({ kind: 'agent', actor: 'client-a' }, 'tasks', 'src', 'client-a', 3600000);
+    const claim = bus.claim({ kind: 'agent', actor: 'tasks:client-a' }, 'tasks', 'src', 'client-a', 3600000);
     const input = task({ access: editAccess(claim.id) });
     const responses = await Promise.all([r.handle(req('/api/tasks', input), routingClient()), r.handle(req('/api/tasks', task({ access: editAccess(claim.id) })), routingClient())]);
     const jobs: any[] = await Promise.all(responses.map(r => r.json()));
@@ -381,7 +387,7 @@ describe('atomic editable routing placement', () => {
   }));
 
   it('rolls back reservation, selection and link if the routing link write fails', () => routingFixture(async (r, f, sql, bus) => {
-    const claim = bus.claim({ kind: 'agent', actor: 'client-a' }, 'tasks', 'src', 'client-a', 3600000);
+    const claim = bus.claim({ kind: 'agent', actor: 'tasks:client-a' }, 'tasks', 'src', 'client-a', 3600000);
     const queued: any = await (await r.handle(req('/api/tasks', task({ needs: ['later'], access: editAccess(claim.id) })), routingClient())).json();
     sql.exec("UPDATE routing_machines SET needs_json = '[\"later\"]'");
     sql.exec("CREATE TRIGGER fail_link BEFORE UPDATE OF launch_id ON routing_jobs BEGIN SELECT RAISE(ABORT, 'injected link failure'); END");
@@ -457,7 +463,10 @@ describe('claims admission through authenticated Hub HTTP routes', () => {
 
 describe('scope lifecycle adoption boundaries', () => {
   it('retains an expired/deleted claim scope while running and admits disjoint scopes', () => fleetFixture(async (f, sql, bus) => {
+    sql.exec("DELETE FROM credentials WHERE id = 'cred-worker-2'");
     sql.exec("UPDATE agents SET project = 'projA' WHERE tag = 'worker-2'");
+    credentials(sql, ['worker-2']);
+    const other = { caller: { actor: 'projA:worker-2', kind: 'agent' as const, tokenId: 'cred-worker-2' }, scopes: ['fleet:launch', 'bus:send'] };
     const initial = bus.claim(holder.caller, 'projA', 'src', 'worker-1', 3600000);
     const launched: any = await (await f.handle(req('/api/fleet/launches', intent({ access: editAccess(initial.id) })), holder)).json();
     sql.exec("UPDATE fleet_launches SET state = 'running' WHERE id = ?", launched.id);

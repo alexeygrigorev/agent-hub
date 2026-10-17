@@ -11,6 +11,28 @@ describe('private fleet assets', () => {
       expect(r.status).toBe(303); expect(r.headers.get('Location')).toBe('/auth/login');
     }
   });
+  it('protects every conversations asset behind the session check', async () => {
+    const conversationsAssets = [
+      '/conversations.html', '/conversations.js', '/conversations.css',
+      '/vendor/dakit/split.js', '/vendor/dakit/dialogs.js'
+    ];
+    for (const path of conversationsAssets) {
+      const r = await doFetch(new Request('https://hub.test' + path, { headers: { Cookie: 'hub_session=fake' } }));
+      expect(r.status).toBe(303); expect(r.headers.get('Location')).toBe('/auth/login');
+    }
+  });
+  it('serves only the exact auth resource list before sign-in, never fleet data or kit tools', async () => {
+    for (const path of ['/auth.css','/auth.js','/vendor/dakit/device-code.js','/vendor/dakit/dakit.css','/vendor/dakit/shell.js','/vendor/dakit/fonts/inter-var.woff2','/vendor/dakit/fonts/ibm-plex-mono-400.woff2','/vendor/dakit/fonts/ibm-plex-mono-500.woff2']) {
+      const bindings = {...defaultEnv, ASSETS:{fetch:async () => new Response('static public resource')}};
+      const ctx = createExecutionContext();
+      const response = await worker.fetch(new Request('https://hub.test'+path),bindings as any,ctx);
+      await waitOnExecutionContext(ctx);
+      expect(response.status).toBe(200); expect(response.headers.get('Content-Security-Policy')).toContain("script-src 'self'");
+    }
+    for (const path of ['/vendor/dakit/check-colors.mjs','/vendor/dakit/avatar.js','/auth.html','/not-listed.css']) {
+      expect((await doFetch(new Request('https://hub.test'+path))).status).toBe(404);
+    }
+  });
   it('serves assets only after a valid admin session and sets private cache and CSP headers', async () => {
     const cookie = await createSessionCookie(defaultEnv, { sub: 'human-test', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf-test', exp: Math.floor(Date.now() / 1000) + 60 });
     let assetCalls = 0;
@@ -21,6 +43,22 @@ describe('private fleet assets', () => {
     expect(r.status).toBe(200); expect(assetCalls).toBe(1);
     expect(r.headers.get('Cache-Control')).toBe('private, no-store');
     expect(r.headers.get('Content-Security-Policy')).toContain("frame-ancestors 'none'");
+    const ctx2 = createExecutionContext();
+    const conv = await worker.fetch(new Request('https://hub.test/conversations.html', { headers: { Cookie: cookie } }), bindings as any, ctx2);
+    await waitOnExecutionContext(ctx2);
+    expect(conv.status).toBe(200); expect(assetCalls).toBe(2);
+    expect(conv.headers.get('Cache-Control')).toBe('private, no-store');
+    expect(conv.headers.get('Content-Security-Policy')).toContain("script-src 'self'");
+  });
+  it('never serves unlisted files, even with a valid session', async () => {
+    const cookie = await createSessionCookie(defaultEnv, { sub: 'human-test', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf-test', exp: Math.floor(Date.now() / 1000) + 60 });
+    for (const path of ['/.dev.vars', '/package.json', '/wrangler.toml', '/vendor/dakit/sync.mjs', '/vendor/dakit/check-borders.mjs', '/vendor/dakit/tokens.css', '/secrets.txt', '/vendor/dakit/fonts/LICENSE.md']) {
+      const bindings = { ...defaultEnv, ASSETS: { fetch: async () => new Response('should not be reached') } };
+      const ctx = createExecutionContext();
+      const r = await worker.fetch(new Request('https://hub.test' + path, { headers: { Cookie: cookie } }), bindings as any, ctx);
+      await waitOnExecutionContext(ctx);
+      expect(r.status).toBe(404);
+    }
   });
   it('requires CSRF and admin scope for account updates even with a valid browser session', async () => {
     const cookie = await createSessionCookie(defaultEnv, { sub: 'human-test', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf-test', exp: Math.floor(Date.now() / 1000) + 60 });

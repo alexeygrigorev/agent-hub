@@ -129,7 +129,7 @@ export class RoutingService {
     if (auth.error) return auth.error;
     const caller = auth.caller; if (!caller) return reply({ error: 'unauthorized' }, 401);
     const admin = caller.isAdmin === true;
-    const routingClient = caller.kind === 'agent' && auth.scopes?.includes('routing:submit');
+    const routingClient = (caller.kind === 'routing-client' || caller.kind === 'agent') && auth.scopes?.includes('routing:submit');
     // Existing fleet launch authority may submit edits only; it cannot mint or borrow claims.
     const fleetEditor = caller.kind === 'agent' && auth.scopes?.includes('bus:send') && auth.scopes?.includes('fleet:launch');
     const client = routingClient || fleetEditor;
@@ -156,7 +156,7 @@ export class RoutingService {
       if (request.method === 'DELETE') { this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE actor = ?', this.at(), actor); return reply({ status: 'revoked' }); }
       const token = 'hubt_' + randomString(32); const id = crypto.randomUUID();
       const expires = new Date(this.now() + 30 * 86400000).toISOString();
-      this.sql.exec('INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', id, 'agent', await sha256(token), id, actor, actor, JSON.stringify(['routing:submit']), caller.actor || 'admin', this.at(), expires);
+      this.sql.exec('INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', id, 'routing-client', await sha256(token), id, actor, actor, JSON.stringify(['routing:submit']), caller.actor || 'admin', this.at(), expires);
       // This credential issuance endpoint is the sole deliberate secret response; never log it.
       return reply({ token, expires_at: expires, client: tokenMatch[1] }, 201);
     }

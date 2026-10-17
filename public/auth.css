@@ -1,0 +1,7 @@
+/* Product structure; all visual roles and controls come from the pinned kit. */
+.hub-auth-nav { display: flex; flex-wrap: wrap; gap: var(--dk-gap-control); }
+.hub-permissions { display: grid; gap: var(--dk-space-2); margin: 0; padding: 0; border: 0; min-width: 0; }
+.hub-permissions .dk-check { justify-content: flex-start; }
+.hub-permissions .dk-mono { overflow-wrap: anywhere; }
+.dk-auth-card .dk-select, .dk-auth-card .dk-input { width: 100%; min-width: 0; }
+@media (max-width: 820px) { .hub-auth-nav a { display: inline-flex; align-items: center; min-height: var(--dk-size-touch); } }

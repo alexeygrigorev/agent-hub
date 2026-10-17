@@ -1,26 +1,86 @@
-<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent Hub</title><link rel="stylesheet" href="/fleet.css"><script src="/fleet.js" defer></script></head>
-<body>
-<header><h1>Agent Hub</h1><p>Machines, subscriptions, agents and terminal sessions</p><p id="status" role="status">Loading authenticated data…</p></header>
-<main>
-<section><h2>Alerts</h2><p>Opened when a machine, session, hub agent or check enters a problem state; resolved automatically on recovery.</p><div id="alerts"></div></section>
-<section><h2>Heartbeats and liveness</h2><p>Machines: online, stale, offline. Agents: working, idle, stalled (working with no terminal activity), or unknown when their machine is silent.</p><div id="liveness"></div></section>
-<section><h2>Scheduled checks</h2><p>Periodic checks that open alerts, message an inbox, or start an agent. Upload a JSON file of the form <code>{"checks": [...]}</code> to replace them.</p><div id="checks"></div><form id="checks-form"><label>Checks JSON<input name="checks" type="file" accept="application/json,.json" required></label><button type="submit">Replace checks</button><p id="checks-result" role="status"></p></form></section>
-<section><h2>Account registry</h2><p>Upload a registry JSON with account labels and machine routes. Provider credentials and machine-local command configuration do not belong here.</p><form id="registry"><label>Registry JSON<input name="registry" type="file" accept="application/json,.json" required></label><button type="submit">Apply registry</button><p id="registry-result" role="status"></p></form></section>
-<section><h2>Start work</h2><form id="launch">
-<label>Mode<select name="mode"><option value="headless">Headless agent</option><option value="interactive">Interactive terminal session</option></select></label>
-<label>Machine<select name="machine" id="machines"><option value="">Choose automatically</option></select></label>
-<label>Engine<input name="engine" placeholder="Choose automatically"></label>
-<label>Workspace label<input name="workspace" required placeholder="A configured workspace"></label>
-<label>Task summary<input name="summary" maxlength="240" required></label>
-<label>Goal (headless only)<textarea name="prompt" maxlength="16000" rows="4"></textarea></label>
-<label>Parent hub agent ID (optional)<input name="parent_id"></label>
-<button type="submit">Start</button><p id="launch-result" role="status"></p>
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Fleet · Agent Hub</title><link rel="stylesheet" href="/vendor/dakit/dakit.css"><link rel="stylesheet" href="/fleet.css"><script src="/auth.js"></script><script src="/fleet.js" defer></script></head><body>
+<div class="dk-shell" data-app="agent-hub" data-sidebar="expanded">
+  <a class="dk-skip-link" href="#main-content">Skip to content</a>
+
+  <header class="dk-topbar">
+    <button class="dk-icon-button" type="button" data-dk-drawer-toggle aria-controls="dk-sidebar" aria-expanded="false" aria-label="Open navigation">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+    </button>
+    <a class="dk-topbar__title" href="/">Agent Hub</a>
+    <div class="dk-topbar__end"></div>
+  </header>
+
+  <aside class="dk-sidebar" id="dk-sidebar" aria-label="Workspace">
+    <div class="dk-sidebar__head">
+      <a class="dk-brand" href="/"><span class="dk-brand__name">Agent Hub</span></a>
+      <button class="dk-icon-button dk-sidebar__close" type="button" data-dk-drawer-close aria-label="Close navigation">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <nav class="dk-sidebar__nav" aria-label="Primary">
+      <div class="dk-nav-group">
+        <a class="dk-nav-item" href="/conversations.html" data-dk-count-label="Conversations">
+          <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a8 8 0 0 1-8 8H5l-2 2V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8Z"/></svg>
+          <span class="dk-nav-item__label">Conversations</span>
+        </a>
+        <a class="dk-nav-item" href="/fleet.html" aria-current="page">
+          <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="7" rx="1"/><rect x="3" y="13" width="18" height="7" rx="1"/><path d="M7 8h.01M7 17h.01"/></svg>
+          <span class="dk-nav-item__label">Fleet</span>
+        </a>
+        <a class="dk-nav-item" href="/device"><svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M10 18h4"/></svg><span class="dk-nav-item__label">Pair a device</span></a>
+      </div>
+    </nav>
+    <div class="dk-sidebar__foot">
+      <button class="dk-account-trigger" type="button" data-dk-popover-trigger="dk-account-menu" aria-expanded="false" aria-controls="dk-account-menu">
+        <span class="dk-avatar dk-avatar--sm" id="account-avatar" aria-hidden="true"><span class="dk-avatar__initials">·</span></span>
+        <span class="dk-account-trigger__name" id="account-name">Signed out</span>
+        <svg class="dk-account-trigger__chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+      </button>
+      <button class="dk-icon-button dk-sidebar__toggle" type="button" data-dk-sidebar-toggle aria-controls="dk-sidebar" aria-expanded="true" aria-label="Collapse sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg>
+      </button>
+    </div>
+  </aside>
+
+  <div class="dk-scrim" data-dk-drawer-close hidden></div>
+
+<main class="dk-main" id="main-content"><div class="dk-main__inner"><header class="dk-page-header"><div class="dk-page-header__main"><h1 class="dk-page-header__title">Fleet</h1><p class="dk-page-header__subtitle">Machines, subscriptions, agents and terminal sessions</p></div></header><div class="dk-cluster"><p id="status" role="status">Loading authenticated data…</p><button class="dk-button dk-button--secondary" type="button" id="fleet-refresh">Refresh fleet</button></div>
+<section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Alerts</h2><p>Opened when a machine, session, hub agent or check enters a problem state; resolved automatically on recovery.</p><div id="alerts"></div></section>
+<section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Heartbeats and liveness</h2><p>Machines: online, stale, offline. Agents: working, idle, stalled (working with no terminal activity), or unknown when their machine is silent.</p><div id="liveness"></div></section>
+<section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Scheduled checks</h2><p>Periodic checks that open alerts, message an inbox, or start an agent. Upload a checks file to replace the current schedule.</p><div id="checks"></div><form class="fleet-form" id="checks-form"><div class="fleet-field"><label class="dk-label" for="fleet-checks">Checks JSON</label><input id="fleet-checks" class="dk-input" name="checks" type="file" accept="application/json,.json" required></div><button class="dk-button dk-button--secondary" type="submit">Replace checks</button><p id="checks-result" role="status"></p></form></section>
+<section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Account registry</h2><p>Upload a registry JSON with account labels and machine routes. Provider credentials and machine-local command configuration do not belong here.</p><form class="fleet-form" id="registry"><div class="fleet-field"><label class="dk-label" for="fleet-registry">Registry JSON</label><input id="fleet-registry" class="dk-input" name="registry" type="file" accept="application/json,.json" required></div><button class="dk-button dk-button--secondary" type="submit">Apply registry</button><p id="registry-result" role="status"></p></form></section>
+<section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Start work</h2><form class="fleet-form" id="launch">
+<div class="fleet-field"><label class="dk-label" for="fleet-mode">Mode</label><select id="fleet-mode" class="dk-select" name="mode"><option value="headless">Headless agent</option><option value="interactive">Interactive terminal session</option></select></div>
+<div class="fleet-field"><label class="dk-label" for="machines">Machine</label><select class="dk-select" name="machine" id="machines"><option value="">Choose automatically</option></select></div>
+<div class="fleet-field"><label class="dk-label" for="fleet-engine">Engine</label><input id="fleet-engine" class="dk-input" name="engine" placeholder="Choose automatically"></div>
+<div class="fleet-field"><label class="dk-label" for="fleet-workspace">Workspace label</label><input id="fleet-workspace" class="dk-input" name="workspace" required placeholder="A configured workspace"></div>
+<div class="fleet-field"><label class="dk-label" for="fleet-summary">Task summary</label><input id="fleet-summary" class="dk-input" name="summary" maxlength="240" required></div>
+<div class="fleet-field"><label class="dk-label" for="fleet-prompt">Goal (headless only)</label><textarea id="fleet-prompt" class="dk-textarea" name="prompt" maxlength="16000" rows="4"></textarea></div>
+<div class="fleet-field"><label class="dk-label" for="fleet-parent_id">Parent hub agent ID (optional)</label><input id="fleet-parent_id" class="dk-input" name="parent_id"></div>
+<button class="dk-button dk-button--primary" type="submit">Start</button><p id="launch-result" role="status"></p>
 </form></section>
-<section><h2>Machines and subscriptions</h2><p>Shared account labels share capacity across machines. Unknown data is not zero usage.</p><div id="machine-view"></div></section>
-<section><h2>Hub agents and agent trees</h2><p>Every hub request, including headless agents outside aplexer. Offered work has not started; uncertain work requires reconciliation.</p><div id="hub-agents"></div></section>
-<section><h2>Live aplexer sessions</h2><p>Reported by each machine; see Heartbeats and liveness for whether each session is working.</p><div id="sessions"></div></section>
-<section><h2>Registered agents</h2><div id="registered-agents"></div></section>
-</main>
-</body></html>
+<section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Machines and subscriptions</h2><p>Shared account labels share capacity across machines. Unknown data is not zero usage.</p><div id="machine-view"></div></section>
+<section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Hub agents and agent trees</h2><p>Every hub request, including headless agents outside aplexer. Offered work has not started; uncertain work requires reconciliation.</p><div id="hub-agents"></div></section>
+<section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Live aplexer sessions</h2><p>Reported by each machine; see Heartbeats and liveness for whether each session is working.</p><div id="sessions"></div></section>
+<section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Registered agents</h2><div id="registered-agents"></div></section>
+</div></main>
+  <div class="dk-menu dk-account-menu" id="dk-account-menu" data-dk-popover hidden>
+    <div class="dk-menu__identity">
+      <span class="dk-menu__name" id="menu-name">Signed out</span>
+      <span class="dk-menu__email" id="menu-email"></span>
+    </div>
+    <button class="dk-menu__item" type="button" role="switch" aria-checked="false" data-dk-theme-toggle>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+      Dark mode<span class="dk-switch" aria-hidden="true"></span>
+    </button>
+    <div class="dk-menu__sep" role="separator"></div>
+    <button class="dk-menu__item dk-menu__item--danger" type="button" id="sign-out">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5M21 12H9"/></svg>
+      Sign out
+    </button>
+  </div>
+
+  <div id="dk-live" class="dk-visually-hidden" aria-live="polite"></div>
+</div>
+
+<script src="/vendor/dakit/shell.js"></script></body></html>

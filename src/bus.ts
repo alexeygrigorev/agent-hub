@@ -1,3 +1,4 @@
+import { registryAddress, registryRowSql } from './agent_registry';
 export interface SqlStorageCursor {
   toArray(): any[];
   [Symbol.iterator](): IterableIterator<any>;
@@ -11,7 +12,7 @@ export interface CallerContext {
   actor?: string;
   machineId?: string;
   isAdmin?: boolean;
-  kind?: 'host' | 'agent' | 'job' | 'human' | 'session' | 'bearer';
+  kind?: 'host' | 'agent' | 'job' | 'human' | 'session' | 'bearer' | 'routing-client';
   tokenId?: string;
   tokenHash?: string;
   jobId?: string;
@@ -119,6 +120,90 @@ export function parseAddress(address: unknown): BusAddress | null {
   return { kind: 'qualified', project: parts[0], tag: parts[1] };
 }
 
+/** One bounded row per cleanup kind; next_index is 0..modulus-1. Created on demand so schema.ts stays untouched. */
+export const RETENTION_CLEANUP_CURSOR_SQL = `CREATE TABLE IF NOT EXISTS retention_cleanup_cursor (
+  kind TEXT PRIMARY KEY,
+  next_index INTEGER NOT NULL
+);`;
+
+export type RetentionFairCategory = {
+  hasWork: () => boolean;
+  spend: (budget: number) => number;
+};
+
+function readRetentionCursor(sql: SqlStorage, kind: string, modulus: number): number {
+  sql.exec(RETENTION_CLEANUP_CURSOR_SQL);
+  const row = sql
+    .exec('SELECT next_index FROM retention_cleanup_cursor WHERE kind = ?', kind)
+    .toArray()[0] as { next_index?: unknown } | undefined;
+  const n = Math.floor(Number(row?.next_index));
+  if (!Number.isFinite(n) || modulus <= 0) return 0;
+  return ((n % modulus) + modulus) % modulus;
+}
+
+function writeRetentionCursor(
+  sql: SqlStorage,
+  kind: string,
+  nextIndex: number,
+  modulus: number,
+): void {
+  sql.exec(RETENTION_CLEANUP_CURSOR_SQL);
+  const idx =
+    modulus <= 0 ? 0 : ((Math.floor(Number(nextIndex)) % modulus) + modulus) % modulus;
+  sql.exec(
+    'INSERT OR REPLACE INTO retention_cleanup_cursor (kind, next_index) VALUES (?, ?)',
+    kind,
+    idx,
+  );
+}
+
+/**
+ * Spend one affected-row budget across categories in durable round-robin order.
+ * Budget < eligible count gives 1 row to each of the first `budget` eligible categories.
+ * Budget >= eligible count equal-slices then leftover in the same rotated order.
+ * Cursor advances past the last category that actually deleted rows, with the caller's transaction.
+ */
+export function runFairRetentionPass(
+  sql: SqlStorage,
+  kind: string,
+  categories: RetentionFairCategory[],
+  totalBudget: number,
+): void {
+  const modulus = categories.length;
+  if (modulus === 0 || totalBudget <= 0) return;
+  const start = readRetentionCursor(sql, kind, modulus);
+  const rotated: Array<{ cat: RetentionFairCategory; index: number }> = [];
+  for (let i = 0; i < modulus; i++) {
+    const index = (start + i) % modulus;
+    rotated.push({ cat: categories[index], index });
+  }
+  const eligible = rotated.filter(entry => entry.cat.hasWork());
+  if (eligible.length === 0) return;
+
+  let lastDeletedIndex: number | null = null;
+  const invoke = (
+    entry: { cat: RetentionFairCategory; index: number },
+    budget: number,
+  ): void => {
+    if (budget <= 0) return;
+    if (!entry.cat.hasWork()) return;
+    const deleted = Number(entry.cat.spend(budget) ?? 0);
+    if (deleted > 0) lastDeletedIndex = entry.index;
+  };
+
+  if (totalBudget >= eligible.length) {
+    const slice = Math.max(1, Math.floor(totalBudget / eligible.length));
+    for (const entry of eligible) invoke(entry, slice);
+    for (const entry of eligible) invoke(entry, totalBudget);
+  } else {
+    for (let i = 0; i < totalBudget; i++) invoke(eligible[i], 1);
+  }
+
+  if (lastDeletedIndex !== null) {
+    writeRetentionCursor(sql, kind, lastDeletedIndex + 1, modulus);
+  }
+}
+
 const ROOT_AUTHORITY_ERROR = "missing_m4_root_authority: root role routing has no accepted root authority in M3";
 
 /** A root role name in any letter case (`root`, `ROOT`, `rootish`): M3 has no accepted Root authority. */
@@ -197,13 +282,14 @@ export class BusService {
     } else {
       return null;
     }
-    if (rows.length !== 1) return null;
+    if (rows.length !== 1 || !registryAddress(rows[0].project ? `${rows[0].project}:${rows[0].tag}` : rows[0].tag)) return null;
     const r = rows[0];
     return { tag: r.tag, project: r.project ?? null, role: r.role ?? null, machine_id: r.machine_id ?? null };
   }
 
   /** The registered agent behind a `tag` or `project:tag` address; role, machine and malformed forms are null. */
   private resolveAgentActor(actor: unknown): AgentIdentity | null {
+    if (typeof actor !== 'string' || !registryAddress(actor)) return null;
     const addr = parseAddress(actor);
     if (!addr || (addr.kind !== 'tag' && addr.kind !== 'qualified')) return null;
     return this.resolveAgent(addr);
@@ -216,16 +302,36 @@ export class BusService {
    */
   private sameParticipant(a: string, b: string): boolean {
     if (isRootRoleAddress(a) || isRootRoleAddress(b)) return false;
-    if (a === b) return parseAddress(a) !== null;
+    if (a === b) {
+      const addr = parseAddress(a);
+      if (addr?.kind === 'tag') return this.sql.exec('SELECT 1 FROM agents WHERE tag = ?', addr.tag).toArray().length <= 1;
+      return addr !== null;
+    }
     const x = this.resolveAgent(parseAddress(a));
     const y = this.resolveAgent(parseAddress(b));
     return Boolean(x && y && x.tag === y.tag && x.project === y.project);
   }
 
+  /** Stored bare endpoints belong to the projectless identity; never promote history
+   * into a project created later. Unique request aliases still resolve normally. */
+  private sameStoredParticipant(stored: string, actor: string, unbound = false): boolean {
+    if (unbound) return false;
+    const address = parseAddress(stored);
+    if (address?.kind === 'tag' && this.resolveAgentActor(stored)?.project) return false;
+    return this.sameParticipant(stored, actor);
+  }
+
+  private isAuthorizedForStoredActor(caller: CallerContext, actor: string, now: number, unbound = false): boolean {
+    if (unbound && !caller.isAdmin) return false;
+    if (caller.isAdmin) return this.isAuthorizedForActor(caller, actor, now);
+    const address = parseAddress(actor);
+    if (address?.kind === 'tag' && this.resolveAgentActor(actor)?.project) return false;
+    return this.isAuthorizedForActor(caller, actor, now);
+  }
+
   /** Every to_actor string that addresses this agent: tag, project:tag and its role when it is the unique holder. */
   private agentAliases(agent: AgentIdentity): string[] {
-    const aliases = [agent.tag];
-    if (agent.project) aliases.push(`${agent.project}:${agent.tag}`);
+    const aliases = [agent.project ? `${agent.project}:${agent.tag}` : agent.tag];
     if (agent.role && !isRootRole(agent.role)) {
       const holder = this.resolveAgent({ kind: 'role', role: agent.role });
       if (holder && holder.tag === agent.tag && holder.project === agent.project) aliases.push(`role:${agent.role}`);
@@ -239,7 +345,12 @@ export class BusService {
     if (!addr) return [];
     const agent = this.resolveAgent(addr);
     if (!agent) return [actor];
-    return Array.from(new Set([actor, ...this.agentAliases(agent)]));
+    return Array.from(new Set(this.agentAliases(agent)));
+  }
+
+  public canonicalActor(actor: string): string {
+    const agent = this.resolveAgentActor(actor);
+    return agent?.project ? `${agent.project}:${agent.tag}` : actor;
   }
 
   public validateRecipient(actor: string, now: number = Date.now()): boolean {
@@ -351,6 +462,7 @@ export class BusService {
         throw new Error("unauthorized");
       }
 
+      opts = { ...opts, senderActor: this.canonicalActor(opts.senderActor), toActor: this.canonicalActor(opts.toActor) };
       let existing = this.sql.exec(
         'SELECT id, body, to_actor, kind, thread_id, reply_to, lease_epoch, expires_at FROM messages WHERE from_actor = ? AND idempotency_key = ?',
         opts.senderActor,
@@ -390,12 +502,12 @@ export class BusService {
 
       let threadId = opts.threadId;
       if (opts.replyTo) {
-        const msg = this.sql.exec('SELECT thread_id, from_actor, to_actor FROM messages WHERE id = ? AND expires_at > ?', opts.replyTo, now).toArray()[0] as any;
+        const msg = this.sql.exec('SELECT thread_id, from_actor, to_actor, registry_unbound_from, registry_unbound_to FROM messages WHERE id = ? AND expires_at > ?', opts.replyTo, now).toArray()[0] as any;
         if (!msg) throw new Error("invalid_reply_to");
         // Both reply ends must be parties of the original message in any alias form of the same agent
-        const parties = [msg.from_actor, msg.to_actor];
-        if (!parties.some(p => this.sameParticipant(p, opts.toActor))) throw new Error("invalid_reply_to");
-        if (!parties.some(p => this.sameParticipant(p, opts.senderActor))) throw new Error("invalid_reply_to");
+        const parties = [[msg.from_actor, msg.registry_unbound_from], [msg.to_actor, msg.registry_unbound_to]];
+        if (!parties.some(([p, unbound]) => this.sameStoredParticipant(p, opts.toActor, !!unbound))) throw new Error("invalid_reply_to");
+        if (!parties.some(([p, unbound]) => this.sameStoredParticipant(p, opts.senderActor, !!unbound))) throw new Error("invalid_reply_to");
         const parentThreadId = msg.thread_id || opts.replyTo;
         if (threadId !== undefined && threadId !== parentThreadId) throw new Error("invalid_reply_to");
         threadId = parentThreadId;
@@ -434,7 +546,7 @@ export class BusService {
     if (aliases.length === 0) throw new Error("unauthorized");
 
     return this.runInTxn(() => {
-      let query = `SELECT * FROM messages WHERE to_actor IN (${aliases.map(() => '?').join(',')}) AND expires_at > ?`;
+      let query = `SELECT * FROM messages WHERE to_actor IN (${aliases.map(() => '?').join(',')}) AND expires_at > ?${caller.isAdmin ? '' : ' AND registry_unbound_to = 0'}`;
       const params: any[] = [...aliases, now];
       if (cursor) {
         query += ' AND id > ?';
@@ -464,10 +576,10 @@ export class BusService {
     return this.runInTxn(() => {
       const msg = this.sql.exec('SELECT * FROM messages WHERE id = ? AND expires_at > ?', messageId, now).toArray()[0] as any;
       if (!msg) throw new Error("not_found");
-      if (!caller.isAdmin && !this.isAuthorizedForActor(caller, msg.to_actor, now) && !this.isAuthorizedForActor(caller, msg.from_actor, now)) {
+      if (!caller.isAdmin && !this.isAuthorizedForStoredActor(caller, msg.to_actor, now, !!msg.registry_unbound_to) && !this.isAuthorizedForStoredActor(caller, msg.from_actor, now, !!msg.registry_unbound_from)) {
         throw new Error("unauthorized");
       }
-      if (this.isRecipientPrincipal(caller, msg.to_actor, now)) {
+      if (this.isAuthorizedForStoredActor({ ...caller, isAdmin: false }, msg.to_actor, now, !!msg.registry_unbound_to)) {
         if (!msg.delivered_at) {
           this.sql.exec('UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL', now, messageId);
           msg.delivered_at = now;
@@ -482,7 +594,7 @@ export class BusService {
   }
 
   private updateMessageStage(caller: CallerContext, messageId: string, stage: 'delivered_at' | 'read_at' | 'acked_at' | 'accepted_at' | 'completed_at', now: number = Date.now(), leaseEpoch?: number) {
-    const msg = this.sql.exec('SELECT to_actor, delivered_at, read_at, acked_at, accepted_at, completed_at, expires_at FROM messages WHERE id = ?', messageId).toArray()[0] as any;
+    const msg = this.sql.exec('SELECT to_actor, registry_unbound_to, delivered_at, read_at, acked_at, accepted_at, completed_at, expires_at FROM messages WHERE id = ?', messageId).toArray()[0] as any;
     if (!msg || msg.expires_at <= Date.now()) throw new Error("not_found");
 
     if (isRootRoleAddress(msg.to_actor) || isRootRoleAddress(caller.actor)) {
@@ -491,7 +603,7 @@ export class BusService {
 
     // SPEC M3: ACK only by the recipient. Every stage is advanced by the recipient (or the host it
     // runs on); an admin observer has no override, so a stage time is always the recipient's own step.
-    if (!this.isRecipientPrincipal(caller, msg.to_actor, now)) {
+    if (!this.isAuthorizedForStoredActor({ ...caller, isAdmin: false }, msg.to_actor, now, !!msg.registry_unbound_to)) {
       throw new Error("unauthorized");
     }
 
@@ -650,36 +762,107 @@ export class BusService {
     return this.sql.exec(query, ...params).toArray();
   }
 
+  hasExpiredRows(now: number = Date.now()): boolean {
+    if (
+      this.sql
+        .exec('SELECT 1 FROM messages WHERE expires_at <= ? LIMIT 1', now)
+        .toArray().length > 0
+    ) {
+      return true;
+    }
+    return (
+      this.sql
+        .exec('SELECT 1 FROM claims WHERE expires_at < ? LIMIT 1', now)
+        .toArray().length > 0
+    );
+  }
+
   retentionCleanup(now: number = Date.now(), limit: number = 100): { messagesDeleted: number; claimsDeleted: number; hasMore: boolean } {
-    const expiredMessages = this.sql.exec(
-      'SELECT id FROM messages WHERE expires_at <= ? LIMIT ?',
-      now,
-      limit
-    ).toArray() as { id: string }[];
-    let messagesDeleted = 0;
-    for (const row of expiredMessages) {
-      this.sql.exec('DELETE FROM messages WHERE id = ?', row.id);
-      messagesDeleted++;
+    const raw = Math.floor(Number(limit));
+    const budget = Number.isFinite(raw) ? Math.max(0, Math.min(500, raw)) : 100;
+    if (budget <= 0) {
+      return {
+        messagesDeleted: 0,
+        claimsDeleted: 0,
+        hasMore: this.hasExpiredRows(now),
+      };
     }
 
-    const expiredClaims = this.sql.exec(
-      'SELECT id FROM claims WHERE expires_at < ? LIMIT ?',
-      now,
-      limit
-    ).toArray() as { id: string }[];
-    let claimsDeleted = 0;
-    for (const row of expiredClaims) {
-      this.sql.exec('DELETE FROM claims WHERE id = ?', row.id);
-      claimsDeleted++;
-    }
+    this.sql.exec(RETENTION_CLEANUP_CURSOR_SQL);
+    return this.runInTxn(() => {
+      let remaining = budget;
+      let messagesDeleted = 0;
+      let claimsDeleted = 0;
 
-    const hasMore = expiredMessages.length === limit || expiredClaims.length === limit;
-    return { messagesDeleted, claimsDeleted, hasMore };
+      const deleteExpiredMessages = (stepBudget: number): number => {
+        const stepLimit = Math.min(remaining, stepBudget);
+        if (stepLimit <= 0) return 0;
+        const expiredMessages = this.sql
+          .exec(
+            'SELECT id FROM messages WHERE expires_at <= ? LIMIT ?',
+            now,
+            stepLimit,
+          )
+          .toArray() as { id: string }[];
+        for (const row of expiredMessages) {
+          this.sql.exec('DELETE FROM messages WHERE id = ?', row.id);
+          messagesDeleted++;
+          remaining--;
+        }
+        return expiredMessages.length;
+      };
+
+      const deleteExpiredClaims = (stepBudget: number): number => {
+        const stepLimit = Math.min(remaining, stepBudget);
+        if (stepLimit <= 0) return 0;
+        const expiredClaims = this.sql
+          .exec(
+            'SELECT id FROM claims WHERE expires_at < ? LIMIT ?',
+            now,
+            stepLimit,
+          )
+          .toArray() as { id: string }[];
+        for (const row of expiredClaims) {
+          this.sql.exec('DELETE FROM claims WHERE id = ?', row.id);
+          claimsDeleted++;
+          remaining--;
+        }
+        return expiredClaims.length;
+      };
+
+      runFairRetentionPass(
+        this.sql,
+        'bus',
+        [
+          {
+            hasWork: () =>
+              this.sql
+                .exec('SELECT 1 FROM messages WHERE expires_at <= ? LIMIT 1', now)
+                .toArray().length > 0,
+            spend: deleteExpiredMessages,
+          },
+          {
+            hasWork: () =>
+              this.sql
+                .exec('SELECT 1 FROM claims WHERE expires_at < ? LIMIT 1', now)
+                .toArray().length > 0,
+            spend: deleteExpiredClaims,
+          },
+        ],
+        budget,
+      );
+
+      return {
+        messagesDeleted,
+        claimsDeleted,
+        hasMore: this.hasExpiredRows(now),
+      };
+    });
   }
 
   getBusActors(caller?: CallerContext): string[] {
     if (!caller) {
-      const agentActors = this.sql.exec('SELECT DISTINCT project || ":" || tag as actor FROM agents WHERE role != "root"').toArray().map((r: any) => r.actor);
+      const agentActors = this.sql.exec(`SELECT DISTINCT CASE WHEN COALESCE(project, '') = '' THEN tag ELSE project || ':' || tag END as actor FROM agents WHERE COALESCE(role,'') != "root" AND ${registryRowSql()}`).toArray().map((r: any) => r.actor);
       const machineActors = this.sql.exec('SELECT "machine:" || id as actor FROM machines').toArray().map((r: any) => r.actor);
       return Array.from(new Set([...agentActors, ...machineActors])).filter(a => a !== 'role:root');
     }
@@ -689,7 +872,7 @@ export class BusService {
     }
 
     if (caller.isAdmin) {
-      const agentActors = this.sql.exec('SELECT DISTINCT project || ":" || tag as actor FROM agents WHERE role != "root"').toArray().map((r: any) => r.actor);
+      const agentActors = this.sql.exec(`SELECT DISTINCT CASE WHEN COALESCE(project, '') = '' THEN tag ELSE project || ':' || tag END as actor FROM agents WHERE COALESCE(role,'') != "root" AND ${registryRowSql()}`).toArray().map((r: any) => r.actor);
       const machineActors = this.sql.exec('SELECT "machine:" || id as actor FROM machines').toArray().map((r: any) => r.actor);
       return Array.from(new Set([...agentActors, ...machineActors])).filter(a => a !== 'role:root');
     }
@@ -697,7 +880,7 @@ export class BusService {
     if (caller.kind === 'host' || (!caller.actor && caller.machineId)) {
       if (!caller.machineId) throw new Error("unauthorized");
       const agentActors = this.sql.exec(
-        'SELECT DISTINCT project || ":" || tag as actor FROM agents WHERE machine_id = ? AND role != "root"',
+        `SELECT DISTINCT CASE WHEN COALESCE(project, '') = '' THEN tag ELSE project || ':' || tag END as actor FROM agents WHERE machine_id = ? AND COALESCE(role,'') != "root" AND ${registryRowSql()}`,
         caller.machineId
       ).toArray().map((r: any) => r.actor);
       const machineActor = `machine:${caller.machineId}`;
@@ -707,7 +890,7 @@ export class BusService {
     if (caller.actor) {
       const agent = this.resolveAgentActor(caller.actor);
       if (agent && agent.project && !isRootRole(agent.role)) {
-        return [`${agent.project}:${agent.tag}`, agent.tag];
+        return [`${agent.project}:${agent.tag}`];
       }
       return parseAddress(caller.actor) ? [caller.actor] : [];
     }
@@ -745,25 +928,16 @@ export class BusService {
         throw new Error("unauthorized");
       }
 
-      let aliases = [effectiveActor];
-      if (effectiveActor.includes(':')) {
-        const [cProj, cTag] = effectiveActor.split(':');
-        const rows = this.sql.exec('SELECT project, tag FROM agents WHERE project = ? AND tag = ? AND role != "root"', cProj, cTag).toArray() as any[];
-        if (rows.length === 1) aliases.push(rows[0].tag);
-      } else {
-        const rows = this.sql.exec('SELECT project, tag FROM agents WHERE tag = ? AND role != "root"', effectiveActor).toArray() as any[];
-        if (rows.length === 1) aliases.push(`${rows[0].project}:${rows[0].tag}`);
-      }
-      aliases = Array.from(new Set(aliases));
+      const aliases = [this.canonicalActor(effectiveActor)];
 
       if (aliases.length === 1) {
         return this.sql.exec(
-          'SELECT * FROM messages WHERE (to_actor = ? OR from_actor = ?) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
+          'SELECT * FROM messages WHERE ((registry_unbound_to = 0 AND to_actor = ?) OR (registry_unbound_from = 0 AND from_actor = ?)) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
           aliases[0], aliases[0]
         ).toArray();
       } else {
         return this.sql.exec(
-          'SELECT * FROM messages WHERE (to_actor IN (?, ?) OR from_actor IN (?, ?)) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
+          'SELECT * FROM messages WHERE ((registry_unbound_to = 0 AND to_actor IN (?, ?)) OR (registry_unbound_from = 0 AND from_actor IN (?, ?))) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
           aliases[0], aliases[1], aliases[0], aliases[1]
         ).toArray();
       }
@@ -776,8 +950,9 @@ export class BusService {
         if (!this.isAuthorizedForActor(caller, actor, now)) {
           throw new Error("unauthorized");
         }
+        actor = this.canonicalActor(actor);
         return this.sql.exec(
-          'SELECT * FROM messages WHERE (to_actor = ? OR from_actor = ?) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
+          'SELECT * FROM messages WHERE ((registry_unbound_to = 0 AND to_actor = ?) OR (registry_unbound_from = 0 AND from_actor = ?)) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
           actor, actor
         ).toArray();
       }
@@ -789,14 +964,14 @@ export class BusService {
       ).toArray() as any[];
       const allowedActors = new Set<string>([machineActor]);
       for (const row of agentRows) {
-        allowedActors.add(`${row.project}:${row.tag}`);
-        allowedActors.add(row.tag);
+        if (!registryAddress(row.project ? `${row.project}:${row.tag}` : row.tag)) continue;
+        allowedActors.add(row.project ? `${row.project}:${row.tag}` : row.tag);
       }
       const allowedList = Array.from(allowedActors);
       if (allowedList.length === 0) return [];
 
       const placeholders = allowedList.map(() => '?').join(',');
-      const sqlQuery = `SELECT * FROM messages WHERE (to_actor IN (${placeholders}) OR from_actor IN (${placeholders})) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100`;
+      const sqlQuery = `SELECT * FROM messages WHERE ((registry_unbound_to = 0 AND to_actor IN (${placeholders})) OR (registry_unbound_from = 0 AND from_actor IN (${placeholders}))) AND to_actor != "role:root" AND from_actor != "role:root" ORDER BY created_at DESC LIMIT 100`;
       return this.sql.exec(sqlQuery, ...allowedList, ...allowedList).toArray();
     }
 

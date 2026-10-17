@@ -674,10 +674,14 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
       const newAgent = instance.ctx.storage.sql.exec("SELECT * FROM agents WHERE tag = 'm3-agent-no-proj'").toArray()[0] as any;
       expect(newAgent.tag).toBe('m3-agent-no-proj');
 
-      // Verify agents.tag is now PRIMARY KEY
+      // Verify project-qualified uniqueness replaces the global tag PRIMARY KEY
       const agentCols = instance.ctx.storage.sql.exec("PRAGMA table_info(agents)").toArray();
       const tagCol = agentCols.find((c: any) => c.name === 'tag');
-      expect(tagCol.pk).toBeGreaterThan(0);
+      expect(tagCol.pk).toBe(0);
+      // The migrated contract permits same-tag peers, while preserving per-project uniqueness.
+      instance.ctx.storage.sql.exec("INSERT INTO agents(tag, project) VALUES ('schema-peer', 'first')");
+      instance.ctx.storage.sql.exec("INSERT INTO agents(tag, project) VALUES ('schema-peer', 'second')");
+      expect(() => instance.ctx.storage.sql.exec("INSERT INTO agents(tag, project) VALUES ('schema-peer', 'first')")).toThrow();
     });
 
     // Part B: Upgrade from SPEC §6 tables (jobs, leases, audit before M4 columns)

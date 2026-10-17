@@ -1,9 +1,12 @@
-import { Hub } from './hub';
+import { ConversationHub } from './conversation-hub';
+import type { Hub as BaseHub } from './hub';
 
-export { Hub };
+export const Hub = ConversationHub;
+// Keep existing callers typed against the inherited public Hub contract.
+export type Hub = BaseHub;
 
 export interface Env {
-  HUB: DurableObjectNamespace<Hub>;
+  HUB: DurableObjectNamespace<BaseHub>;
   ASSETS?: Fetcher;
 }
 
@@ -21,17 +24,34 @@ export default {
       return stub.fetch(request);
     }
 
-    if (!['/', '/index.html', '/fleet.html', '/fleet.js', '/fleet.css'].includes(url.pathname)) {
+    // Sign-in needs these exact immutable styles/scripts/fonts before a session exists.
+    const PUBLIC_AUTH_ASSETS = ['/auth.css', '/auth.js', '/vendor/dakit/device-code.js', '/vendor/dakit/dakit.css', '/vendor/dakit/shell.js',
+      '/vendor/dakit/fonts/inter-var.woff2', '/vendor/dakit/fonts/ibm-plex-mono-400.woff2', '/vendor/dakit/fonts/ibm-plex-mono-500.woff2'];
+    // Explicit private-asset allowlist: every asset is served only after the
+    // authenticated-session check below. No arbitrary path, credential file
+    // or vendored tool is exposed; the list covers exactly the conversations
+    // page, its app code, the shipped vendored dakit bundle files it loads,
+    // and the fonts those files reference.
+    const PRIVATE_ASSETS = [
+      '/', '/index.html',
+      '/fleet.html', '/fleet.js', '/fleet.css',
+      '/conversations.html', '/conversations.js', '/conversations.css',
+      '/vendor/dakit/dakit.css', '/vendor/dakit/shell.js', '/vendor/dakit/split.js', '/vendor/dakit/dialogs.js',
+      '/vendor/dakit/fonts/inter-var.woff2',
+      '/vendor/dakit/fonts/ibm-plex-mono-400.woff2',
+      '/vendor/dakit/fonts/ibm-plex-mono-500.woff2'
+    ];
+    if (!PRIVATE_ASSETS.includes(url.pathname) && !PUBLIC_AUTH_ASSETS.includes(url.pathname)) {
       return new Response('Not found', { status: 404 });
     }
     const stub = env.HUB.get(env.HUB.idFromName('hub'));
     const authUrl = new URL('/auth/me', request.url);
-    const auth = await stub.fetch(new Request(authUrl, { headers: request.headers }));
-    if (!auth.ok) {
+    const auth = PUBLIC_AUTH_ASSETS.includes(url.pathname) ? null : await stub.fetch(new Request(authUrl, { headers: request.headers }));
+    if (!PUBLIC_AUTH_ASSETS.includes(url.pathname) && !auth?.ok) {
       return new Response(null, { status: 303, headers: { Location: '/auth/login', 'Cache-Control': 'private, no-store' } });
     }
     if (!env.ASSETS) return new Response('Not found', { status: 404 });
-    if (url.pathname === '/' || url.pathname === '/index.html') url.pathname = '/fleet.html';
+    if (url.pathname === '/' || url.pathname === '/index.html') url.pathname = '/conversations.html';
     const asset = await env.ASSETS.fetch(new Request(url, request));
     const headers = new Headers(asset.headers);
     headers.set('Cache-Control', 'private, no-store');

@@ -828,7 +828,7 @@ describe('M4 Lease Semantics, Epoch CAS, and Safety Tests', () => {
 
       // 3. Registered agent with state='working' and health_state=NULL is valid and visible in BusService.getBusMessages()
       sql.exec(
-        "INSERT INTO agents (tag, project, role, machine_id, engine, session_id, workspace, state, health_state, last_seen_at) VALUES ('worker-null-hs', 'hub', 'worker', 'host-f14', 'codex', 'sw', '/w', 'working', NULL, ?)",
+        "INSERT INTO agents (tag, project, role, machine_id, engine, session_id, workspace, state, health_state, last_seen_at) VALUES ('worker-null-hs', 'demo', 'worker', 'host-f14', 'codex', 'sw', '/w', 'working', NULL, ?)",
         new Date(nowMs).toISOString()
       );
       const dispatchNullHs = await service.commitRootAction(

@@ -1,7 +1,9 @@
+import { UI_HEADERS, tokenPage, authFailure, deviceEntry, deviceReview, deviceResult } from './ui-pages';
 import { DurableObject } from "cloudflare:workers";
 import { SqlStorage } from "@cloudflare/workers-types";
 import { Env } from './env';
 import { SCHEMA_SQL } from './schema';
+import { migrateAgentRegistry, bindAgentCredentials, credentialActor, registryAddress, AGENT_NAME } from './agent_registry';
 import { JwksCache, validateIdToken, exchangeCode } from './auth/dtc';
 import { createSessionCookie, getSession, clearSessionCookie, createLoginCookie, getLoginCookie, clearLoginCookie, verifyCsrf, configuredAdmins, validSessionSecret, adminTokenHash, tokenAdminSubject, TOKEN_ADMIN_EMAIL } from './auth/session';
 import { randomString, sha256, generateUserCode } from './auth/crypto';
@@ -56,6 +58,17 @@ function htmlEscape(str: string): string {
   );
 }
 
+/** Agents keep exactly the existing ordinary-agent scope ceiling, even on stale pending rows. */
+function validAgentPairingScopes(granted: string, requested: string): boolean {
+  try {
+    const g = JSON.parse(granted), r = JSON.parse(requested);
+    const allowed = ['bus:read', 'bus:send', 'health:report', 'fleet:launch'];
+    return Array.isArray(g) && g.length > 0 && new Set(g).size === g.length && Array.isArray(r) &&
+      r.length > 0 && new Set(r).size === r.length && r.every(s => allowed.includes(s)) &&
+      g.every(s => allowed.includes(s) && r.includes(s));
+  } catch { return false; }
+}
+
 export class Hub extends DurableObject {
   sql: SqlStorage;
   env: Env;
@@ -86,6 +99,7 @@ export class Hub extends DurableObject {
     const runInTxn = (this.ctx.storage as any).transactionSync ? (fn: any) => (this.ctx.storage as any).transactionSync(fn) : (fn: any) => fn();
     const sendRoot = (caller: any, opts: any) => {
       return runInTxn(() => {
+        opts = { ...opts, toActor: this.busService.canonicalActor(opts.toActor) };
         const now = opts.now ?? Date.now();
         if (new TextEncoder().encode(opts.body).length > 16384) {
           throw new Error("body_too_large");
@@ -148,89 +162,6 @@ export class Hub extends DurableObject {
       return sendRoot(caller, opts);
     };
 
-    this.busService.getBusMessages = (caller: CallerContext, actor?: string | null, now: number = Date.now()): any[] => {
-      if (caller.isRevoked) {
-        throw new Error("unauthorized");
-      }
-
-      if (caller.actor === 'role:root' || actor === 'role:root') {
-        throw new Error("missing_m4_root_authority: root role routing has no accepted root authority in M3");
-      }
-
-      if (caller.isAdmin) {
-        if (actor) {
-          return this.sql.exec(
-            'SELECT * FROM messages WHERE (to_actor = ? OR from_actor = ?) AND to_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
-            actor, actor
-          ).toArray();
-        }
-        return this.sql.exec('SELECT * FROM messages WHERE to_actor != "role:root" ORDER BY created_at DESC LIMIT 100').toArray();
-      }
-
-      if (caller.actor) {
-        const effectiveActor = actor || caller.actor;
-        if (!this.busService.isAuthorizedForActor(caller, effectiveActor, now)) {
-          throw new Error("unauthorized");
-        }
-
-        let aliases = [effectiveActor];
-        if (effectiveActor.includes(':')) {
-          const [cProj, cTag] = effectiveActor.split(':');
-          const rows = this.sql.exec('SELECT project, tag FROM agents WHERE project = ? AND tag = ? AND role != "root"', cProj, cTag).toArray() as any[];
-          if (rows.length === 1) aliases.push(rows[0].tag);
-        } else {
-          const rows = this.sql.exec('SELECT project, tag FROM agents WHERE tag = ? AND role != "root"', effectiveActor).toArray() as any[];
-          if (rows.length === 1) aliases.push(`${rows[0].project}:${rows[0].tag}`);
-        }
-        aliases = Array.from(new Set(aliases));
-
-        if (aliases.length === 1) {
-          return this.sql.exec(
-            'SELECT * FROM messages WHERE (to_actor = ? OR from_actor = ?) AND to_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
-            aliases[0], aliases[0]
-          ).toArray();
-        } else {
-          return this.sql.exec(
-            'SELECT * FROM messages WHERE (to_actor IN (?, ?) OR from_actor IN (?, ?)) AND to_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
-            aliases[0], aliases[1], aliases[0], aliases[1]
-          ).toArray();
-        }
-      }
-
-      if (caller.kind === 'host' || (!caller.actor && caller.machineId)) {
-        if (!caller.machineId) throw new Error("unauthorized");
-
-        if (actor) {
-          if (!this.busService.isAuthorizedForActor(caller, actor, now)) {
-            throw new Error("unauthorized");
-          }
-          return this.sql.exec(
-            'SELECT * FROM messages WHERE (to_actor = ? OR from_actor = ?) AND to_actor != "role:root" ORDER BY created_at DESC LIMIT 100',
-            actor, actor
-          ).toArray();
-        }
-
-        const machineActor = `machine:${caller.machineId}`;
-        const agentRows = this.sql.exec(
-          'SELECT project, tag FROM agents WHERE machine_id = ? AND role != "root"',
-          caller.machineId
-        ).toArray() as any[];
-        const allowedActors = new Set<string>([machineActor]);
-        for (const row of agentRows) {
-          allowedActors.add(`${row.project}:${row.tag}`);
-          allowedActors.add(row.tag);
-        }
-        const allowedList = Array.from(allowedActors);
-        if (allowedList.length === 0) return [];
-
-        const placeholders = allowedList.map(() => '?').join(',');
-        const sqlQuery = `SELECT * FROM messages WHERE (to_actor IN (${placeholders}) OR from_actor IN (${placeholders})) AND to_actor != "role:root" ORDER BY created_at DESC LIMIT 100`;
-        return this.sql.exec(sqlQuery, ...allowedList, ...allowedList).toArray();
-      }
-
-      throw new Error("unauthorized");
-    };
-
     this.jobsService = new JobsService(this.sql, this.ctx, {
       busService: busForJobs,
       enableAlarms: true,
@@ -267,47 +198,10 @@ export class Hub extends DurableObject {
   }
 
   public initDb() {
-    // 1. If agents exists from M3 BUS_SCHEMA_SQL (tag has no PK or project is NOT NULL):
-    // Recreate agents table to match M4 schema non-destructively
-    const agentTableInfo = this.sql.exec("PRAGMA table_info(agents)").toArray() as any[];
-    if (agentTableInfo.length > 0) {
-      const tagCol = agentTableInfo.find(c => c.name.toLowerCase() === 'tag');
-      const projCol = agentTableInfo.find(c => c.name.toLowerCase() === 'project');
-      if (tagCol && (tagCol.pk === 0 || (projCol && projCol.notnull === 1))) {
-        this.sql.exec(`
-          CREATE TABLE agents_m4 (
-            tag TEXT PRIMARY KEY,
-            project TEXT,
-            role TEXT,
-            machine_id TEXT,
-            registered_at TEXT,
-            engine TEXT,
-            session_id TEXT,
-            workspace TEXT,
-            team_id TEXT,
-            imported_from TEXT,
-            state TEXT,
-            health_state TEXT,
-            health_detail JSON,
-            detail TEXT,
-            lasthealth TEXT,
-            health_at TEXT,
-            last_seen_at TEXT,
-            last_seen TEXT,
-            updated_at TEXT,
-            pid INTEGER,
-            started_at TEXT
-          )
-        `);
-        const colNames = agentTableInfo.map(c => c.name);
-        const m4Cols = ['tag', 'project', 'role', 'machine_id', 'registered_at', 'engine', 'session_id', 'workspace', 'team_id', 'imported_from', 'state', 'health_state', 'health_detail', 'detail', 'lasthealth', 'health_at', 'last_seen_at', 'last_seen', 'updated_at', 'pid', 'started_at'];
-        const commonCols = colNames.filter(c => m4Cols.includes(c));
-        const selectCols = commonCols.join(', ');
-        this.sql.exec(`INSERT OR REPLACE INTO agents_m4 (${selectCols}) SELECT ${selectCols} FROM agents`);
-        this.sql.exec("DROP TABLE agents");
-        this.sql.exec("ALTER TABLE agents_m4 RENAME TO agents");
-        this.sql.exec("CREATE INDEX IF NOT EXISTS idx_agents_project_tag ON agents(project, tag)");
-      }
+    this.ctx.storage.transactionSync(() => {
+    // Remove the global tag PK before creating/using the current schema.
+    if (this.sql.exec('PRAGMA table_info(agents)').toArray().length) {
+      migrateAgentRegistry(this.sql, fn => this.ctx.storage.transactionSync(fn));
     }
 
     // 2. Execute SCHEMA_SQL
@@ -341,6 +235,9 @@ export class Hub extends DurableObject {
       pid: 'INTEGER',
       started_at: 'TEXT'
     });
+
+    migrateAgentRegistry(this.sql, fn => this.ctx.storage.transactionSync(fn));
+    bindAgentCredentials(this.sql, fn => this.ctx.storage.transactionSync(fn));
 
     this.ensureColumns('machines', {
       name: 'TEXT',
@@ -410,6 +307,7 @@ export class Hub extends DurableObject {
 
     this.sql.exec("INSERT OR IGNORE INTO leases (name, epoch) VALUES ('root', 0)");
     ensureRootScheduling(this.sql);
+    });
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -492,7 +390,7 @@ export class Hub extends DurableObject {
           const location = next && /^\/device\?code=[A-Za-z0-9-]{1,32}$/.test(next) ? '/auth/token?return_to=' + encodeURIComponent(next) : '/auth/token';
           return new Response(null, { status: 303, headers: { Location: location, 'Cache-Control': 'private, no-store' } });
         }
-        if (!validSessionSecret(this.env) || configuredAdmins(this.env).length === 0) return Response.json({ error: 'authentication_not_configured' }, { status: 503 });
+        if (!validSessionSecret(this.env) || configuredAdmins(this.env).length === 0) return authFailure(request, 'authentication_not_configured', 503);
         const state = randomString(32);
         const nonce = randomString(32);
         const verifier = randomString(43);
@@ -534,25 +432,25 @@ export class Hub extends DurableObject {
         const query = url.searchParams;
         const code = query.get('code');
         const state = query.get('state');
-        if (!code || !state) return Response.json({ error: 'Missing code or state' }, { status: 400 });
+        if (!code || !state) return authFailure(request, 'Missing code or state', 400);
 
         const loginData = await getLoginCookie(this.env, request);
         if (!loginData || loginData.state !== state) {
-          return Response.json({ error: 'Invalid state' }, { status: 400 });
+          return authFailure(request, 'Invalid state', 400);
         }
 
         const stateHash = await sha256(state);
         const consume = this.sql.exec('UPDATE login_states SET consumed = 1 WHERE state_hash = ? AND consumed = 0 AND expires_at > ?', stateHash, Math.floor(Date.now() / 1000));
-        if (consume.rowsWritten !== 1) return Response.json({ error: 'invalid_state' }, { status: 400, headers: { 'Set-Cookie': clearLoginCookie() } });
+        if (consume.rowsWritten !== 1) return authFailure(request, 'invalid_state', 400, {'Set-Cookie':clearLoginCookie()});
         let claims: { sub: string; email: string; email_verified: boolean };
         try {
           const idToken = await exchangeCode(this.env, code, loginData.verifier);
           claims = await validateIdToken(this.env, idToken, loginData.nonce, this.jwksCache);
         } catch {
-          return Response.json({ error: 'invalid_identity_token' }, { status: 400, headers: { 'Set-Cookie': clearLoginCookie() } });
+          return authFailure(request, 'invalid_identity_token', 400, {'Set-Cookie':clearLoginCookie()});
         }
         if (!configuredAdmins(this.env).includes(claims.email.toLowerCase())) {
-          return Response.json({ error: 'forbidden' }, { status: 403, headers: { 'Set-Cookie': clearLoginCookie() } });
+          return authFailure(request, 'forbidden', 403, {'Set-Cookie':clearLoginCookie()});
         }
 
         const now = new Date().toISOString();
@@ -607,6 +505,7 @@ export class Hub extends DurableObject {
         if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
         const body = await safeJson(request);
         if (!body) return Response.json({ error: 'malformed_json' }, { status: 400 });
+        if (body.machine_id !== undefined) return Response.json({ error: 'machine_assignment_requires_admin_approval' }, { status: 400 });
         if (body.client_kind !== 'host' && body.client_kind !== 'agent') {
           return Response.json({ error: 'invalid_client_kind' }, { status: 400 });
         }
@@ -626,7 +525,7 @@ export class Hub extends DurableObject {
         
         if (body.client_kind === 'agent') {
           const proposedActor = body.actor ?? body.name;
-          if (typeof proposedActor !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(proposedActor)) {
+          if (typeof proposedActor !== 'string' || !registryAddress(proposedActor)) {
             return Response.json({ error: 'invalid_request', error_description: 'Agent requires an actor' }, { status: 400 });
           }
           if (proposedActor === 'root' || proposedActor === 'principal' || proposedActor.startsWith('role:')) {
@@ -683,7 +582,7 @@ export class Hub extends DurableObject {
 
         const now = new Date();
         const expiresAt = new Date(pairing.expires_at);
-        if (now >= expiresAt && pairing.status !== 'consumed' && pairing.status !== 'denied') {
+        if ((!Number.isFinite(expiresAt.getTime()) || now >= expiresAt) && pairing.status !== 'consumed' && pairing.status !== 'denied') {
           this.sql.exec('UPDATE device_pairings SET status = ? WHERE device_code_hash = ?', 'expired', deviceCodeHash);
           return Response.json({ error: 'expired_token' }, { status: 400 });
         }
@@ -710,19 +609,21 @@ export class Hub extends DurableObject {
           const result = this.ctx.storage.transactionSync(() => {
             const current = this.sql.exec('SELECT * FROM device_pairings WHERE device_code_hash = ?', deviceCodeHash).toArray()[0] as any;
             if (!current || current.status !== 'approved') return null;
-            if (Date.parse(current.expires_at) <= Date.now()) {
+            if (!Number.isFinite(Date.parse(current.expires_at)) || Date.parse(current.expires_at) <= Date.now()) {
               this.sql.exec("UPDATE device_pairings SET status = 'expired' WHERE device_code_hash = ?", deviceCodeHash);
               return null;
             }
+            if (current.client_kind === 'agent' && (!credentialActor(this.sql, { kind: 'agent', registry_actor: current.actor, machine_id: current.machine_id }) ||
+                !validAgentPairingScopes(current.granted_scopes, current.requested_scopes))) return null;
             const expires = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
             this.sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, credId, current.client_kind, tokens.accessHash, tokens.refreshHash, familyId, current.name, current.machine_id, current.actor, current.granted_scopes, current.approved_by_sub, new Date().toISOString(), expires);
             this.sql.exec("UPDATE device_pairings SET status = 'consumed' WHERE device_code_hash = ?", deviceCodeHash);
-            if (current.machine_id) this.sql.exec('UPDATE machines SET credential_id = ? WHERE id = ?', credId, current.machine_id);
-            return { expires, scopes: JSON.parse(current.granted_scopes) as string[] };
+            if (current.client_kind === 'host' && current.machine_id) this.sql.exec('UPDATE machines SET credential_id = ? WHERE id = ?', credId, current.machine_id);
+            return { expires, scopes: JSON.parse(current.granted_scopes) as string[], machineId: current.machine_id ?? null };
           });
           if (!result) return Response.json({ error: 'invalid_grant' }, { status: 400 });
-          return Response.json({ access_token: tokens.accessToken, refresh_token: tokens.refreshToken, token_type: 'Bearer', expires_in: Math.floor((Date.parse(result.expires) - Date.now()) / 1000), scope: result.scopes.join(' ') });
+          return Response.json({ access_token: tokens.accessToken, refresh_token: tokens.refreshToken, token_type: 'Bearer', expires_in: Math.floor((Date.parse(result.expires) - Date.now()) / 1000), scope: result.scopes.join(' '), machine_id: result.machineId });
         }
       }
 
@@ -735,71 +636,30 @@ export class Hub extends DurableObject {
           return new Response(null, { status: 302, headers: { 'Location': `/auth/login${returnTo}` } });
         }
 
-        if (!userCode) return new Response('<!doctype html><html><head><title>Pair a device</title></head><body><h1>Pair a device</h1><form method=GET action=/device><label>Device code <input name=code required maxlength=9 autocomplete=off></label><button>Continue</button></form></body></html>', { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+        if (!userCode) return new Response(deviceEntry(session.email), {headers:UI_HEADERS});
         const pairing = this.sql.exec('SELECT * FROM device_pairings WHERE user_code = ?', userCode.toUpperCase()).toArray()[0] as any;
-        if (!pairing) {
-          return new Response('Not found or expired', { status: 404 });
+        if (!pairing) return new Response(deviceResult('unknown', session.email), {status:404,headers:UI_HEADERS});
+        if (!session.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
+        const machines = this.sql.exec('SELECT id, name FROM machines WHERE registered_at IS NOT NULL ORDER BY id').toArray() as any[];
+        let address = registryAddress(pairing.actor || '');
+        if (address && !address.project) {
+          const registered = this.sql.exec('SELECT project FROM agents WHERE tag = ?', address.tag).toArray() as any[];
+          if (registered.length === 1 && registered[0].project) address = { ...address, project: registered[0].project };
         }
-
-        const safeKind = htmlEscape(pairing.client_kind);
-        const safeName = htmlEscape(pairing.name);
-        const safeHostname = htmlEscape(pairing.hostname);
-        const safeCountry = pairing.ip_country ? htmlEscape(pairing.ip_country) : 'Unknown';
-        const safeActor = pairing.actor ? htmlEscape(pairing.actor) : '';
-        const safeScopes = htmlEscape(pairing.requested_scopes);
-        const safeUserCode = htmlEscape(userCode);
-        const safeCsrf = htmlEscape(session.csrfToken);
-
-        const html = `<!DOCTYPE html>
-<html>
-<head><title>Approve Device</title></head>
-<body>
-  <h1>Approve Device</h1>
-  <p>Kind: ${safeKind}</p>
-  <p>Name: ${safeName}</p>
-  <p>Hostname: ${safeHostname}</p>
-  <p>Country: ${safeCountry}</p>
-  ${safeActor ? `<p>Actor: ${safeActor}</p>` : ''}
-  <p>Requested Scopes: ${safeScopes}</p>
-  <form method="POST" action="/api/device/approve/${safeUserCode}" id="approveForm">
-    <input type="hidden" name="csrf_token" value="${safeCsrf}">
-    ${safeKind === 'host' ? `<label>Machine ID (optional): <input type="text" name="machine_id"></label><br>` : ''}
-    <label>Granted Scopes: <input type="text" name="granted_scopes" value="${htmlEscape(typeof pairing.requested_scopes === 'string' ? pairing.requested_scopes : JSON.stringify(pairing.requested_scopes))}"></label><br>
-    <button type="button" onclick="submitApprove()">Approve</button>
-  </form>
-  <form method="POST" action="/api/device/deny/${safeUserCode}" id="denyForm">
-    <input type="hidden" name="csrf_token" value="${safeCsrf}">
-    <button type="button" onclick="submitDeny()">Deny</button>
-  </form>
-  <script>
-    async function submitApprove() {
-      const form = document.getElementById('approveForm');
-      const data = { granted_scopes: JSON.parse(form.granted_scopes.value) };
-      if (form.machine_id && form.machine_id.value) data.machine_id = form.machine_id.value;
-      const res = await fetch(form.action, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': form.csrf_token.value },
-        body: JSON.stringify(data)
-      });
-      if (res.ok) alert('Approved'); else alert('Error');
-    }
-    async function submitDeny() {
-      const form = document.getElementById('denyForm');
-      const res = await fetch(form.action, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': form.csrf_token.value },
-      });
-      if (res.ok) alert('Denied'); else alert('Error');
-    }
-  </script>
-</body>
-</html>`;
-        return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
+        const displayedActor = address ? (address.project ? `${address.project}:${address.tag}` : address.tag) : pairing.actor;
+        const registeredAgent = address ? this.sql.exec("SELECT machine_id FROM agents WHERE tag = ? AND COALESCE(project,'') = COALESCE(?,'')", address.tag, address.project).toArray()[0] as any : null;
+        const registeredMachine = registeredAgent?.machine_id || null;
+        const state = !['consumed', 'denied'].includes(pairing.status) && (!Number.isFinite(Date.parse(pairing.expires_at)) || Date.parse(pairing.expires_at) <= Date.now()) ? 'expired' : pairing.status;
+        const html = state === 'pending'
+          ? deviceReview(pairing, session.email, address, registeredMachine, machines, Date.now(), displayedActor)
+          : deviceResult(state, session.email);
+        return new Response(html, {headers:UI_HEADERS});
       }
 
       if (path.startsWith('/api/device/approve') || path.startsWith('/api/device/deny') || path.startsWith('/api/device/info')) {
         const session = await getSession(this.env, request);
         if (!session) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+        if (!session.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
 
         const parts = path.split('/');
         const action = parts[3];
@@ -821,7 +681,7 @@ export class Hub extends DurableObject {
         
         const now = new Date();
         const expiresAt = new Date(pairing.expires_at);
-        if (now >= expiresAt) {
+        if (!Number.isFinite(expiresAt.getTime()) || now >= expiresAt) {
           this.sql.exec('UPDATE device_pairings SET status = ? WHERE user_code = ?', 'expired', userCode);
           return Response.json({ error: 'Already expired' }, { status: 400 });
         }
@@ -834,7 +694,8 @@ export class Hub extends DurableObject {
         if (action === 'approve') {
           const body = await safeJson(request);
           if (!body) return Response.json({ error: 'malformed_json' }, { status: 400 });
-          const granted_scopes = body.granted_scopes || JSON.parse(pairing.requested_scopes);
+          if (Object.keys(body).some(k => !['granted_scopes', 'machine_id', 'expected_actor'].includes(k))) return Response.json({ error: 'invalid_approval' }, { status: 400 });
+          const granted_scopes = body.granted_scopes ?? JSON.parse(pairing.requested_scopes);
           const parsedGranted = granted_scopes;
           
           if (!Array.isArray(parsedGranted) || parsedGranted.length === 0) return Response.json({ error: 'invalid_scopes' }, { status: 400 });
@@ -844,12 +705,16 @@ export class Hub extends DurableObject {
           const isSubset = parsedGranted.every((s: string) => reqScopes.includes(s));
           if (!isSubset) return Response.json({ error: 'Cannot grant unrequested scopes' }, { status: 400 });
 
-          if (body.machine_id !== undefined && (typeof body.machine_id !== 'string' || body.machine_id.length > 128 || pairing.client_kind !== 'host')) return Response.json({ error: 'invalid_machine_id' }, { status: 400 });
+          if (body.machine_id !== undefined && !(body.machine_id === null && pairing.client_kind === 'agent') && (typeof body.machine_id !== 'string' || !body.machine_id || body.machine_id.length > 128)) return Response.json({ error: 'invalid_machine_id' }, { status: 400 });
           return this.ctx.storage.transactionSync(() => {
             const current = this.sql.exec('SELECT * FROM device_pairings WHERE user_code = ?', userCode).toArray()[0] as any;
-            if (!current || current.status !== 'pending' || Date.parse(current.expires_at) <= Date.now()) return Response.json({ error: 'invalid_pairing' }, { status: 409 });
+            if (!current || current.status !== 'pending' || !Number.isFinite(Date.parse(current.expires_at)) || Date.parse(current.expires_at) <= Date.now()) return Response.json({ error: 'invalid_pairing' }, { status: 409 });
+            if (['client_kind', 'name', 'actor', 'requested_scopes', 'machine_id', 'expires_at'].some(k => current[k] !== pairing[k])) return Response.json({ error: 'stale_pairing' }, { status: 409 });
+            if (current.client_kind !== 'host' && current.client_kind !== 'agent') return Response.json({ error: 'invalid_pairing' }, { status: 400 });
+            if (current.client_kind === 'agent' && !validAgentPairingScopes(JSON.stringify(parsedGranted), current.requested_scopes)) return Response.json({ error: 'invalid_scopes' }, { status: 400 });
             let machineId: string | null = null;
             if (current.client_kind === 'host') {
+              if (body.expected_actor !== undefined && body.expected_actor !== current.actor) return Response.json({ error: 'invalid_approval' }, { status: 400 });
               if (body.machine_id) {
                 if (!this.sql.exec('SELECT id FROM machines WHERE id = ?', body.machine_id).toArray()[0]) return Response.json({ error: 'invalid_machine_id' }, { status: 400 });
                 machineId = body.machine_id;
@@ -858,11 +723,28 @@ export class Hub extends DurableObject {
                 this.sql.exec('INSERT INTO machines (id, name, hostname, registered_at) VALUES (?, ?, ?, ?)', machineId, current.name, current.hostname, new Date().toISOString());
               }
             }
-            this.sql.exec("UPDATE device_pairings SET status = 'approved', approved_by_sub = ?, granted_scopes = ?, machine_id = ? WHERE user_code = ?", session.sub, JSON.stringify(parsedGranted), machineId, userCode);
             // A paired agent is addressable on the bus by its actor name; an existing entry is kept.
-            if (current.client_kind === 'agent' && typeof current.actor === 'string' && current.actor) {
-              this.sql.exec("INSERT INTO agents (tag, registered_at, imported_from) VALUES (?, ?, 'pairing') ON CONFLICT(tag) DO NOTHING", current.actor, new Date().toISOString());
+            if (current.client_kind === 'agent') {
+              if (typeof current.actor !== 'string' || !current.actor) return Response.json({ error: 'invalid_actor' }, { status: 400 });
+              const address = registryAddress(current.actor);
+              if (!address) return Response.json({ error: 'invalid_actor' }, { status: 400 });
+              const rows = this.sql.exec('SELECT project, tag FROM agents WHERE tag = ?', address.tag).toArray() as any[];
+              if (address.project && rows.some(r => !r.project)) return Response.json({ error: 'agent_exists' }, { status: 409 });
+              if (!address.project && rows.length > 1) return Response.json({ error: 'ambiguous_agent_tag' }, { status: 409 });
+              const project = address.project ?? (rows.length === 1 ? rows[0].project : null);
+              const actor = project ? `${project}:${address.tag}` : address.tag;
+              if (!registryAddress(actor)) return Response.json({ error: 'invalid_actor' }, { status: 400 });
+              if (body.expected_actor !== undefined && body.expected_actor !== actor) return Response.json({ error: 'invalid_approval' }, { status: 400 });
+              const existing = this.sql.exec("SELECT machine_id FROM agents WHERE tag = ? AND COALESCE(project,'') = COALESCE(?,'')", address.tag, project).toArray()[0] as any;
+              // Omission preserves a trusted existing assignment; explicit admin selection may fill NULL only.
+              machineId = body.machine_id !== undefined ? body.machine_id : (existing?.machine_id ?? null);
+              if (existing?.machine_id && machineId !== existing.machine_id) return Response.json({ error: 'agent_machine_conflict' }, { status: 409 });
+              if (machineId && (!project || !this.sql.exec('SELECT id FROM machines WHERE id = ? AND registered_at IS NOT NULL', machineId).toArray()[0])) return Response.json({ error: 'invalid_machine_id' }, { status: 400 });
+              this.sql.exec("INSERT INTO agents (tag, project, machine_id, registered_at, imported_from) VALUES (?, ?, ?, ?, 'pairing') ON CONFLICT DO NOTHING", address.tag, project, machineId, new Date().toISOString());
+              if (machineId && !existing?.machine_id) this.sql.exec("UPDATE agents SET machine_id = ? WHERE tag = ? AND COALESCE(project,'') = COALESCE(?,'')", machineId, address.tag, project);
+              this.sql.exec('UPDATE device_pairings SET actor = ? WHERE user_code = ?', actor, userCode);
             }
+            this.sql.exec("UPDATE device_pairings SET status = 'approved', approved_by_sub = ?, granted_scopes = ?, machine_id = ? WHERE user_code = ?", session.sub, JSON.stringify(parsedGranted), machineId, userCode);
             return Response.json({ status: 'approved', machine_id: machineId });
           });
         }
@@ -885,6 +767,7 @@ export class Hub extends DurableObject {
         let errorResponse = null;
         let scopesResponse = '';
         let expiresAtResponse = '';
+        let machineIdResponse: string | null = null;
         
         this.ctx.storage.transactionSync(() => {
         const cred = this.sql.exec('SELECT * FROM credentials WHERE refresh_hash = ?', refreshHash).toArray()[0] as any;
@@ -897,6 +780,8 @@ export class Hub extends DurableObject {
           errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
         } else if (!Number.isFinite(Date.parse(cred.expires_at)) || Date.parse(cred.expires_at) <= nowMs) {
           errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
+        } else if (cred.kind === 'agent' && !credentialActor(this.sql, cred)) {
+          errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
         } else {
           const res = this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', now, cred.id);
           if (res.rowsWritten !== 1) {
@@ -905,12 +790,13 @@ export class Hub extends DurableObject {
           } else {
             this.sql.exec(`
               INSERT INTO credentials
-              (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `, newId, cred.kind, accessHash, newRefreshHash, cred.family_id, cred.subject, cred.machine_id, cred.actor, cred.scopes, cred.created_by_sub, now, cred.expires_at);
+              (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, registry_actor)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `, newId, cred.kind, accessHash, newRefreshHash, cred.family_id, cred.subject, cred.machine_id, cred.actor, cred.scopes, cred.created_by_sub, now, cred.expires_at, cred.registry_actor ?? null);
 
             scopesResponse = JSON.parse(cred.scopes).join(' ');
             expiresAtResponse = cred.expires_at;
+            machineIdResponse = cred.machine_id ?? null;
           }
         }
 
@@ -922,7 +808,8 @@ export class Hub extends DurableObject {
           refresh_token: refreshToken,
           token_type: 'Bearer',
           expires_in: Math.max(0, Math.floor((new Date(expiresAtResponse).getTime() - new Date(now).getTime()) / 1000)),
-          scope: scopesResponse
+          scope: scopesResponse,
+          machine_id: machineIdResponse
         });
       }
 
@@ -1077,14 +964,12 @@ export class Hub extends DurableObject {
 
   /** Admin sign-in with a high-entropy token whose SHA-256 is a Worker secret. */
   private async tokenSignIn(request: Request): Promise<Response> {
-    const headers = { 'Cache-Control': 'private, no-store', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'", 'X-Content-Type-Options': 'nosniff' };
+    const headers = { 'Cache-Control': 'private, no-store', 'Content-Security-Policy': UI_HEADERS['Content-Security-Policy'], 'X-Content-Type-Options': 'nosniff' };
     const hash = adminTokenHash(this.env);
-    if (!hash || !validSessionSecret(this.env)) return Response.json({ error: 'authentication_not_configured' }, { status: 503, headers });
+    if (!hash || !validSessionSecret(this.env)) return authFailure(request, 'authentication_not_configured', 503, headers);
     const safeNext = (value: string | null) => value && /^\/device\?code=[A-Za-z0-9-]{1,32}$/.test(value) ? value : null;
     let next = safeNext(new URL(request.url).searchParams.get('return_to'));
-    const page = (message: string, status = 200) => new Response(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent Hub sign-in</title>
-<style>body{font-family:system-ui,sans-serif;background:#f3f5f6;color:#172735;margin:0}main{max-width:420px;margin:12vh auto;padding:24px;background:#fff;border:1px solid #d5dde1;border-radius:6px}input,button{font:inherit;padding:10px;width:100%;box-sizing:border-box;margin-top:8px}button{background:#164c65;color:#fff;border:0;border-radius:3px}p{color:#425b69}</style></head>
-<body><main><h1>Agent Hub</h1><p>${message}</p><form method="post" action="/auth/token"><input type="hidden" name="return_to" value="${next ? next.replace(/[^A-Za-z0-9\/?=-]/g, '') : ''}"><label>Admin token<input name="token" type="password" autocomplete="current-password" required></label><button type="submit">Sign in</button></form></main></body></html>`, { status, headers: { ...headers, 'Content-Type': 'text/html; charset=utf-8' } });
+    const page = (message: string, status = 200) => new Response(tokenPage(message, next, status), {status,headers:UI_HEADERS});
     if (request.method === 'GET') return page('Sign in with the admin token kept on your machine.');
     if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { ...headers, Allow: 'GET, POST' } });
     const now = Date.now();
@@ -1111,24 +996,41 @@ export class Hub extends DurableObject {
     if (auth.error) return auth.error;
     const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { 'Cache-Control': 'private, no-store' } });
     if (!auth.caller?.isAdmin) return json({ error: 'forbidden' }, 403);
-    const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-    if (path === '/api/agents' && request.method === 'GET') return json({ agents: this.sql.exec('SELECT tag, project, role, machine_id, registered_at, imported_from FROM agents ORDER BY tag').toArray() });
+    const NAME = AGENT_NAME;
+    if (path === '/api/agents' && request.method === 'GET') return json({ agents: this.sql.exec('SELECT tag, project, role, machine_id, registered_at, imported_from FROM agents ORDER BY tag, project').toArray() });
     if (path === '/api/agents' && request.method === 'POST') {
       const b = await safeJson(request);
       if (!b || Object.keys(b).some(k => !['tag', 'project', 'role', 'machine_id'].includes(k)) || typeof b.tag !== 'string' || !NAME.test(b.tag)) return json({ error: 'invalid_agent' }, 400);
-      for (const k of ['project', 'role', 'machine_id']) if (b[k] !== undefined && b[k] !== null && (typeof b[k] !== 'string' || !NAME.test(b[k]))) return json({ error: 'invalid_' + k }, 400);
+      for (const k of ['project', 'role', 'machine_id']) if (b[k] !== undefined && b[k] !== null && !(k === 'project' && b[k] === '') && (typeof b[k] !== 'string' || !NAME.test(b[k]))) return json({ error: 'invalid_' + k }, 400);
+      if (!registryAddress(b.project ? `${b.project}:${b.tag}` : b.tag)) return json({ error: 'invalid_project' }, 400);
       if (typeof b.role === 'string' && /^root/i.test(b.role)) return json({ error: 'root_role_reserved' }, 400);
       if (b.machine_id && !this.sql.exec('SELECT 1 FROM machines WHERE id = ?', b.machine_id).toArray().length) return json({ error: 'unknown_machine' }, 400);
-      if (this.sql.exec('SELECT 1 FROM agents WHERE tag = ?', b.tag).toArray().length) return json({ error: 'agent_exists' }, 409);
-      this.sql.exec("INSERT INTO agents (tag, project, role, machine_id, registered_at, imported_from) VALUES (?, ?, ?, ?, ?, 'admin')", b.tag, b.project ?? null, b.role ?? null, b.machine_id ?? null, new Date().toISOString());
-      return json({ status: 'registered', tag: b.tag }, 201);
+      return this.ctx.storage.transactionSync(() => {
+        const project = b.project ?? null;
+        // Unqualified legacy creation remains conservative; explicit projects permit same-tag peers.
+        const exists = project
+          ? this.sql.exec("SELECT 1 FROM agents WHERE (COALESCE(project, '') = ? OR COALESCE(project, '') = '') AND tag = ?", project, b.tag).toArray().length
+          : this.sql.exec('SELECT 1 FROM agents WHERE tag = ?', b.tag).toArray().length;
+        if (exists) return json({ error: 'agent_exists' }, 409);
+        this.sql.exec("INSERT INTO agents (tag, project, role, machine_id, registered_at, imported_from) VALUES (?, ?, ?, ?, ?, 'admin')", b.tag, project, b.role ?? null, b.machine_id ?? null, new Date().toISOString());
+        return json({ status: 'registered', tag: b.tag, project, actor: project ? `${project}:${b.tag}` : b.tag }, 201);
+      });
     }
-    const one = /^\/api\/agents\/([A-Za-z0-9][A-Za-z0-9._-]{0,63})$/.exec(path);
-    if (one && request.method === 'DELETE') {
+    if (path.startsWith('/api/agents/') && request.method === 'DELETE') {
+      let raw: string;
+      try { raw = decodeURIComponent(path.slice('/api/agents/'.length)); } catch { return json({ error: 'invalid_actor' }, 400); }
+      const address = registryAddress(raw);
+      if (!address) return json({ error: 'invalid_actor' }, 400);
       await safeJson(request);
-      if (!this.sql.exec('SELECT 1 FROM agents WHERE tag = ?', one[1]).toArray().length) return json({ error: 'not_found' }, 404);
-      this.sql.exec('DELETE FROM agents WHERE tag = ?', one[1]);
-      return json({ status: 'removed', tag: one[1] });
+      return this.ctx.storage.transactionSync(() => {
+        const rows = address.project
+          ? this.sql.exec('SELECT project, tag FROM agents WHERE project = ? AND tag = ?', address.project, address.tag).toArray() as any[]
+          : this.sql.exec('SELECT project, tag FROM agents WHERE tag = ?', address.tag).toArray() as any[];
+        if (!rows.length) return json({ error: 'not_found' }, 404);
+        if (rows.length !== 1) return json({ error: 'ambiguous_agent_tag' }, 409);
+        this.sql.exec("DELETE FROM agents WHERE COALESCE(project, '') = ? AND tag = ?", rows[0].project ?? '', address.tag);
+        return json({ status: 'removed', tag: address.tag, project: rows[0].project });
+      });
     }
     return json({ error: 'not_found' }, 404);
   }
@@ -1374,8 +1276,13 @@ export class Hub extends DurableObject {
     };
     if (cred.kind === 'host') {
       caller.machineId = cred.machine_id;
+    } else if (cred.kind === 'routing-client') {
+      if (!/^routing-client:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(cred.actor || '') ||
+        scopes.length !== 1 || scopes[0] !== 'routing:submit') return { error: Response.json({ error: 'forbidden' }, { status: 403 }) };
+      caller.actor = cred.actor;
     } else if (cred.kind === 'agent' || cred.kind === 'job') {
-      caller.actor = cred.actor || cred.subject;
+      caller.actor = cred.kind === 'agent' ? (credentialActor(this.sql, cred) ?? undefined) : (cred.actor || cred.subject);
+      if (cred.kind === 'agent' && !caller.actor) return { error: Response.json({ error: 'forbidden' }, { status: 403 }) };
       if (cred.machine_id) caller.machineId = cred.machine_id;
       if (cred.kind === 'job') {
         caller.jobId = cred.subject;
@@ -1844,7 +1751,13 @@ export class Hub extends DurableObject {
     if ((this.jobsService as any).healthService?.getEffectiveHealth) {
       return (this.jobsService as any).healthService.getEffectiveHealth(tag);
     }
-    const agent = this.sql.exec("SELECT state, health_state FROM agents WHERE tag = ?", tag).toArray()[0] as any;
+    const address = registryAddress(tag);
+    if (!address) return { state: 'unknown' };
+    const rows = address.project
+      ? this.sql.exec('SELECT state, health_state FROM agents WHERE project = ? AND tag = ?', address.project, address.tag).toArray()
+      : this.sql.exec('SELECT state, health_state FROM agents WHERE tag = ?', address.tag).toArray();
+    if (rows.length > 1) return { state: 'unknown' };
+    const agent = rows[0] as any;
     if (agent) {
       return { state: agent.state || agent.health_state || 'unknown' };
     }
@@ -2216,7 +2129,7 @@ export class Hub extends DurableObject {
         if (!row) return Response.json({ error: 'not_found' }, { status: 404 });
 
         const isSupervisor = auth.caller?.isAdmin || auth.scopes?.includes('admin') || auth.scopes?.includes('lease:root') || auth.scopes?.includes('jobs:create');
-        const isOfferedHost = auth.caller?.machineId && (row.offer_host_id === auth.caller.machineId || row.offer_machine_id === auth.caller.machineId || row.holder_host_id === auth.caller.machineId || row.holder_machine_id === auth.caller.machineId);
+        const isOfferedHost = auth.caller?.kind === 'host' && auth.scopes?.includes('host') && auth.caller.machineId && (row.offer_host_id === auth.caller.machineId || row.offer_machine_id === auth.caller.machineId || row.holder_host_id === auth.caller.machineId || row.holder_machine_id === auth.caller.machineId);
         const isJobCaller = auth.caller?.kind === 'job' && (auth.caller.jobId === jobId || (auth.caller as any).subject === jobId);
         if (!isSupervisor && !isOfferedHost && !isJobCaller) {
           return Response.json({ error: 'forbidden', reason: 'scope_or_binding_mismatch' }, { status: 403 });
@@ -2512,7 +2425,7 @@ export class Hub extends DurableObject {
       if (!row) return Response.json({ error: 'not_found' }, { status: 404 });
 
       const isSupervisor = auth.caller?.isAdmin || auth.scopes?.includes('admin') || auth.scopes?.includes('lease:root') || auth.scopes?.includes('jobs:create');
-      const isOfferedHost = auth.caller?.machineId && (row.offer_host_id === auth.caller.machineId || row.offer_machine_id === auth.caller.machineId || row.holder_host_id === auth.caller.machineId || row.holder_machine_id === auth.caller.machineId);
+      const isOfferedHost = auth.caller?.kind === 'host' && auth.scopes?.includes('host') && auth.caller.machineId && (row.offer_host_id === auth.caller.machineId || row.offer_machine_id === auth.caller.machineId || row.holder_host_id === auth.caller.machineId || row.holder_machine_id === auth.caller.machineId);
       const isJobCaller = auth.caller?.kind === 'job' && (auth.caller.jobId === jobId || (auth.caller as any).subject === jobId);
       if (!isSupervisor && !isOfferedHost && !isJobCaller) {
         return Response.json({ error: 'forbidden', reason: 'scope_or_binding_mismatch' }, { status: 403 });

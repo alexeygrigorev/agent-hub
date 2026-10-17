@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Conversations · Agent Hub</title>
+<link rel="stylesheet" href="/vendor/dakit/dakit.css">
+<link rel="stylesheet" href="/conversations.css">
+<script src="/conversations.js"></script>
+</head>
+<body>
+<div class="dk-shell" data-app="agent-hub" data-sidebar="expanded">
+  <a class="dk-skip-link" href="#main-content">Skip to content</a>
+
+  <header class="dk-topbar">
+    <button class="dk-icon-button" type="button" data-dk-drawer-toggle aria-controls="dk-sidebar" aria-expanded="false" aria-label="Open navigation">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+    </button>
+    <a class="dk-topbar__title" href="/">Agent Hub</a>
+    <div class="dk-topbar__end"></div>
+  </header>
+
+  <aside class="dk-sidebar" id="dk-sidebar" aria-label="Workspace">
+    <div class="dk-sidebar__head">
+      <a class="dk-brand" href="/"><span class="dk-brand__name">Agent Hub</span></a>
+      <button class="dk-icon-button dk-sidebar__close" type="button" data-dk-drawer-close aria-label="Close navigation">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <nav class="dk-sidebar__nav" aria-label="Primary">
+      <div class="dk-nav-group">
+        <a class="dk-nav-item" href="/conversations.html" aria-current="page" data-dk-count-label="Conversations">
+          <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a8 8 0 0 1-8 8H5l-2 2V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8Z"/></svg>
+          <span class="dk-nav-item__label">Conversations</span>
+          <span class="dk-count" id="unread-total" aria-hidden="true" hidden></span>
+        </a>
+        <a class="dk-nav-item" href="/fleet.html">
+          <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="7" rx="1"/><rect x="3" y="13" width="18" height="7" rx="1"/><path d="M7 8h.01M7 17h.01"/></svg>
+          <span class="dk-nav-item__label">Fleet</span>
+        </a>
+        <a class="dk-nav-item" href="/device"><svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M10 18h4"/></svg><span class="dk-nav-item__label">Pair a device</span></a>
+      </div>
+    </nav>
+    <div class="dk-sidebar__foot">
+      <button class="dk-account-trigger" type="button" data-dk-popover-trigger="dk-account-menu" aria-expanded="false" aria-controls="dk-account-menu">
+        <span class="dk-avatar dk-avatar--sm" id="account-avatar" aria-hidden="true"><span class="dk-avatar__initials">·</span></span>
+        <span class="dk-account-trigger__name" id="account-name">Signed out</span>
+        <svg class="dk-account-trigger__chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+      </button>
+      <button class="dk-icon-button dk-sidebar__toggle" type="button" data-dk-sidebar-toggle aria-controls="dk-sidebar" aria-expanded="true" aria-label="Collapse sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg>
+      </button>
+    </div>
+  </aside>
+
+  <div class="dk-scrim" data-dk-drawer-close hidden></div>
+
+  <main class="dk-main" id="main-content">
+    <div class="dk-main__inner dk-fill conv-inner">
+      <div class="dk-page-header" id="conv-page-header">
+        <div class="dk-page-header__main">
+          <h1 class="dk-page-header__title">Conversations</h1>
+          <p class="dk-page-header__subtitle" id="conv-state" role="status">Loading…</p>
+        </div>
+        <div class="dk-page-header__actions">
+          <button class="dk-button dk-button--secondary" type="button" id="new-conversation">New conversation</button>
+        </div>
+      </div>
+
+      <div class="dk-split conv-split" id="conv-split" data-view="list">
+        <section class="dk-split__list" aria-labelledby="conv-list-title">
+          <header class="dk-split__head">
+            <h2 class="dk-split__title" id="conv-list-title">Conversations</h2>
+            <span class="dk-split__count dk-mono" id="conv-count"></span>
+          </header>
+          <div class="dk-split__scroll" id="conv-list-scroll">
+            <div class="conv-list-state" id="conv-list-state" hidden></div>
+            <ul class="dk-split__items" id="conv-list" aria-label="Conversations"></ul>
+          </div>
+          <div class="dk-split__foot" id="conv-list-foot" hidden></div>
+        </section>
+        <section class="dk-split__detail" id="conv-detail" aria-label="Selected conversation"></section>
+      </div>
+    </div>
+  </main>
+
+  <div class="dk-menu dk-account-menu" id="dk-account-menu" data-dk-popover hidden>
+    <div class="dk-menu__identity">
+      <span class="dk-menu__name" id="menu-name">Signed out</span>
+      <span class="dk-menu__email" id="menu-email"></span>
+    </div>
+    <button class="dk-menu__item" type="button" role="switch" aria-checked="false" data-dk-theme-toggle>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+      Dark mode<span class="dk-switch" aria-hidden="true"></span>
+    </button>
+    <div class="dk-menu__sep" role="separator"></div>
+    <button class="dk-menu__item dk-menu__item--danger" type="button" id="sign-out">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5M21 12H9"/></svg>
+      Sign out
+    </button>
+  </div>
+
+  <div id="dk-live" class="dk-visually-hidden" aria-live="polite"></div>
+</div>
+
+<dialog class="dk-dialog" id="new-conversation-dialog" aria-labelledby="new-conversation-title">
+  <div class="dk-dialog__head">
+    <h2 class="dk-dialog__title" id="new-conversation-title">New conversation</h2>
+  </div>
+  <form method="dialog" id="new-conversation-form">
+    <div class="dk-dialog__body">
+      <div class="dk-stack">
+        <div role="radiogroup" aria-label="Conversation kind" class="conv-kind-group">
+          <label class="conv-kind-option"><input type="radio" name="conv-kind" value="direct" checked><span>Direct</span></label>
+          <label class="conv-kind-option"><input type="radio" name="conv-kind" value="group"><span>Group</span></label>
+        </div>
+        <div id="group-title-field" hidden>
+          <label class="dk-label" for="group-title">Group name</label>
+          <input class="dk-input" type="text" id="group-title" name="group-title" maxlength="120" autocomplete="off">
+        </div>
+        <div>
+          <label class="dk-label" for="identity-filter">People and agents</label>
+          <input class="dk-input" type="search" id="identity-filter" placeholder="Filter registered identities" aria-describedby="identity-hint">
+          <p class="dk-hint" id="identity-hint">Only identities registered with the hub can be chosen.</p>
+        </div>
+        <div class="conv-identity-list" id="identity-list" role="group" aria-label="Registered identities"></div>
+        <p class="dk-field-error" id="new-conversation-error" role="alert" hidden></p>
+      </div>
+    </div>
+    <div class="dk-dialog__foot">
+      <button class="dk-button dk-button--secondary" type="submit" value="cancel" id="new-conversation-cancel">Cancel</button>
+      <button class="dk-button dk-button--primary" type="submit" value="create" id="new-conversation-create">Create</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/vendor/dakit/shell.js"></script>
+<script src="/vendor/dakit/split.js"></script>
+<script src="/vendor/dakit/dialogs.js"></script>
+</body>
+</html>

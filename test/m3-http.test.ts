@@ -99,6 +99,41 @@ async function seedTestData(sql: any) {
   );
 }
 
+function countSql(sql: any, query: string, ...params: any[]): number {
+  try {
+    return Number((sql.exec(query, ...params).toArray()[0] as any)?.c ?? 0);
+  } catch {
+    return 0;
+  }
+}
+
+function busCategorySnapshot(sql: any, nowMs: number) {
+  let liveClaimIds: string[] = [];
+  try {
+    liveClaimIds = sql
+      .exec('SELECT id FROM claims WHERE expires_at >= ? ORDER BY id', nowMs)
+      .toArray()
+      .map((r: any) => String(r.id));
+  } catch {
+    liveClaimIds = [];
+  }
+  return {
+    messages: countSql(sql, 'SELECT COUNT(*) AS c FROM messages'),
+    expiredMessages: countSql(
+      sql,
+      'SELECT COUNT(*) AS c FROM messages WHERE expires_at <= ?',
+      nowMs,
+    ),
+    claims: countSql(sql, 'SELECT COUNT(*) AS c FROM claims'),
+    expiredClaims: countSql(
+      sql,
+      'SELECT COUNT(*) AS c FROM claims WHERE expires_at < ?',
+      nowMs,
+    ),
+    liveClaimIds,
+  };
+}
+
 describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
   let stub: any;
 
@@ -661,70 +696,219 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
     }));
     expect(noCsrfRes.status).toBe(403);
 
-    // 2. Futureclock cannot purge valid messages (caller body.now inert):
-    // Seed 1 valid message expiring in 30 days and 250 expired messages
-    const now = Date.now();
-    const past = now - 100000;
-    const future = now + 30 * 24 * 3600 * 1000;
-    await runInDurableObject(stub, async (instance: Hub) => {
-      // Valid message with future expiration
+    // Deterministic slot clocks: 01:05 is 5 minutes into the 01:00 slot (early);
+    // 01:25 is 25 minutes in (late). scheduledTick refuses late slots; alarm does not.
+    const EARLY_T = Date.parse('2026-10-17T01:05:00Z');
+    const LATE_T = Date.parse('2026-10-17T01:25:00Z');
+    const freezeJobsClock = async (target: any, when: number) => {
+      await pinJobsClock(target, 0);
+      await (runInDurableObject as any)(target, async (instance: any) => {
+        instance.jobsService.setClock(() => new Date(when));
+      });
+    };
+
+    // 2. Isolated single-category fixture: exactly 100 message deletions, 150 then 50 then 0.
+    const isoStub = defaultEnv.HUB.get(
+      defaultEnv.HUB.idFromName('m3-http-ret-iso-' + crypto.randomUUID()),
+    );
+    await runInDurableObject(isoStub, async (instance: Hub) => {
+      await seedTestData(instance.sql);
       instance.sql.exec(
-        "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES ('valid-msg-future', 'worker-1', 'worker-2', 'note', 'th', 'valid', 'valid-key-future', ?, ?)",
-        now, future
+        "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES ('iso-valid-msg-future', 'worker-1', 'worker-2', 'note', 'th', 'valid', 'iso-valid-key-future', ?, ?)",
+        EARLY_T,
+        EARLY_T + 30 * 24 * 3600 * 1000,
       );
-      // 250 expired messages
       for (let i = 0; i < 250; i++) {
         instance.sql.exec(
           "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES (?, 'worker-1', 'worker-2', 'note', 'th', 'exp', ?, ?, ?)",
-          `exp-msg-${i}`, `exp-key-${i}`, past - 1000, past
+          `iso-exp-msg-${i}`,
+          `iso-exp-key-${i}`,
+          EARLY_T - 2000,
+          EARLY_T - 1000,
         );
       }
+      const isoBefore = busCategorySnapshot(instance.sql, EARLY_T);
+      expect(isoBefore.expiredMessages).toBe(250);
+      expect(isoBefore.expiredClaims).toBe(0);
+    });
+    await freezeJobsClock(isoStub, EARLY_T);
+    const isoTickRes = await isoStub.fetch(new Request('http://example.com/internal/tick', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ now: '2099-01-01T00:00:00Z' }),
+    }));
+    expect(isoTickRes.status).toBe(200);
+    await runInDurableObject(isoStub, async (instance: Hub) => {
+      expect(
+        instance.sql.exec("SELECT id FROM messages WHERE id = 'iso-valid-msg-future'").toArray(),
+      ).toHaveLength(1);
+      const isoAfter = busCategorySnapshot(instance.sql, EARLY_T);
+      expect(isoAfter.expiredMessages).toBe(150);
+      expect(isoAfter.expiredClaims).toBe(0);
+      expect(isoAfter.liveClaimIds).toEqual([]);
+      expect(
+        countSql(instance.sql, "SELECT COUNT(*) AS c FROM messages WHERE id LIKE 'iso-exp-msg-%'"),
+      ).toBe(150);
+    });
+    await freezeJobsClock(isoStub, EARLY_T);
+    await runInDurableObject(isoStub, async (instance: Hub) => {
+      const coldHub = new Hub((instance as any).ctx, instance.env);
+      (coldHub as any).jobsService.setClock(() => new Date(EARLY_T));
+      expect(
+        countSql(coldHub.sql, "SELECT COUNT(*) AS c FROM messages WHERE id LIKE 'iso-exp-msg-%'"),
+      ).toBe(150);
+      await coldHub.alarm();
+      expect(
+        countSql(coldHub.sql, "SELECT COUNT(*) AS c FROM messages WHERE id LIKE 'iso-exp-msg-%'"),
+      ).toBe(50);
+      await coldHub.alarm();
+      expect(
+        countSql(coldHub.sql, "SELECT COUNT(*) AS c FROM messages WHERE id LIKE 'iso-exp-msg-%'"),
+      ).toBe(0);
+      expect(
+        coldHub.sql.exec("SELECT id FROM messages WHERE id = 'iso-valid-msg-future'").toArray(),
+      ).toHaveLength(1);
     });
 
-    // Attempt future-clock injection via /internal/tick body.now
-    await pinJobsClock(stub);
+    // Late-slot alarm uses the same insertion/expiry/cleanup clock (25 minutes into the slot).
+    const lateStub = defaultEnv.HUB.get(
+      defaultEnv.HUB.idFromName('m3-http-ret-late-' + crypto.randomUUID()),
+    );
+    const lateLiveClaim = 'late-genuine-live-claim';
+    await runInDurableObject(lateStub, async (instance: Hub) => {
+      await seedTestData(instance.sql);
+      instance.sql.exec(
+        "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES ('late-valid-msg', 'worker-1', 'worker-2', 'note', 'th', 'valid', 'late-valid-key', ?, ?)",
+        LATE_T,
+        LATE_T + 30 * 24 * 3600 * 1000,
+      );
+      for (let i = 0; i < 250; i++) {
+        instance.sql.exec(
+          "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES (?, 'worker-1', 'worker-2', 'note', 'th', 'exp', ?, ?, ?)",
+          `late-exp-msg-${i}`,
+          `late-exp-key-${i}`,
+          LATE_T - 2000,
+          LATE_T - 1000,
+        );
+      }
+      instance.sql.exec(
+        'INSERT INTO claims (id, project, scope, holder, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
+        lateLiveClaim,
+        'projA',
+        'src/late-live.ts',
+        'worker-1',
+        LATE_T,
+        LATE_T + 120000,
+      );
+      expect(busCategorySnapshot(instance.sql, LATE_T).expiredMessages).toBe(250);
+      expect(busCategorySnapshot(instance.sql, LATE_T).liveClaimIds).toEqual([lateLiveClaim]);
+    });
+    await freezeJobsClock(lateStub, LATE_T);
+    await runInDurableObject(lateStub, async (instance: Hub) => {
+      await instance.alarm();
+      const lateAfter = busCategorySnapshot(instance.sql, LATE_T);
+      expect(lateAfter.expiredMessages).toBe(150);
+      expect(lateAfter.liveClaimIds).toEqual([lateLiveClaim]);
+      expect(
+        instance.sql.exec('SELECT id FROM messages WHERE id = ?', 'late-valid-msg').toArray(),
+      ).toHaveLength(1);
+    });
+
+    // 3. Mixed named-hub state: unique IDs, snapshot every expired category, exact 100 total.
+    const mixPrefix = `mix-exp-msg-${crypto.randomUUID()}-`;
+    const mixValidId = `mix-valid-msg-${crypto.randomUUID()}`;
+    const genuineLiveClaim = `genuine-live-claim-${crypto.randomUUID()}`;
+    let mixBefore = {
+      expiredMessages: 0,
+      expiredClaims: 0,
+      liveClaimIds: [] as string[],
+    };
+    await freezeJobsClock(stub, EARLY_T);
+    await runInDurableObject(stub, async (instance: Hub) => {
+      instance.sql.exec(
+        "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES (?, 'worker-1', 'worker-2', 'note', 'th', 'valid', ?, ?, ?)",
+        mixValidId,
+        `mix-valid-key-${mixValidId}`,
+        EARLY_T,
+        EARLY_T + 30 * 24 * 3600 * 1000,
+      );
+      for (let i = 0; i < 250; i++) {
+        instance.sql.exec(
+          "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES (?, 'worker-1', 'worker-2', 'note', 'th', 'exp', ?, ?, ?)",
+          `${mixPrefix}${i}`,
+          `${mixPrefix}key-${i}`,
+          EARLY_T - 2000,
+          EARLY_T - 1000,
+        );
+      }
+      instance.sql.exec(
+        'INSERT INTO claims (id, project, scope, holder, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
+        genuineLiveClaim,
+        'projA',
+        `src/genuine-${genuineLiveClaim}.ts`,
+        'worker-1',
+        EARLY_T,
+        EARLY_T + 120000,
+      );
+      mixBefore = busCategorySnapshot(instance.sql, EARLY_T);
+    });
+    const mixEligible = mixBefore.expiredMessages + mixBefore.expiredClaims;
+    expect(mixEligible).toBeGreaterThanOrEqual(100);
+    expect(mixBefore.liveClaimIds).toContain(genuineLiveClaim);
     const tickFutureRes = await stub.fetch(new Request('http://example.com/internal/tick', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ now: '2099-01-01T00:00:00Z' })
     }));
     expect(tickFutureRes.status).toBe(200);
-
-    // Verify bounded batch deletion (exactly 100 deleted, 150 expired messages remain)
-    // AND verify valid future message was NOT purged (body.now is inert)
+    const tickJson = await tickFutureRes.json() as any;
     await runInDurableObject(stub, async (instance: Hub) => {
-      const validMsg = instance.sql.exec("SELECT id FROM messages WHERE id = 'valid-msg-future'").toArray();
-      expect(validMsg.length).toBe(1);
-
-      const count1 = instance.sql.exec("SELECT count(*) as c FROM messages WHERE id LIKE 'exp-msg-%'").toArray()[0] as any;
-      expect(count1.c).toBe(150);
+      expect(
+        instance.sql.exec('SELECT id FROM messages WHERE id = ?', mixValidId).toArray(),
+      ).toHaveLength(1);
+      const mixAfter = busCategorySnapshot(instance.sql, EARLY_T);
+      const deletedMessages = mixBefore.expiredMessages - mixAfter.expiredMessages;
+      const deletedClaims = mixBefore.expiredClaims - mixAfter.expiredClaims;
+      const totalDeleted = deletedMessages + deletedClaims;
+      expect(mixAfter.liveClaimIds).toEqual(mixBefore.liveClaimIds);
+      expect(mixAfter.liveClaimIds).toContain(genuineLiveClaim);
+      expect(totalDeleted).toBe(100);
+      expect(tickJson.retention.messagesDeleted + tickJson.retention.claimsDeleted).toBe(100);
+      expect(mixAfter.expiredMessages + mixAfter.expiredClaims).toBe(mixEligible - 100);
+      expect(tickJson.retention.hasMore).toBe(mixEligible - 100 > 0);
+      const mixRemain = countSql(
+        instance.sql,
+        'SELECT COUNT(*) AS c FROM messages WHERE id LIKE ?',
+        `${mixPrefix}%`,
+      );
+      expect(mixRemain).toBeGreaterThanOrEqual(0);
+      expect(mixRemain).toBeLessThanOrEqual(250);
+      expect(mixAfter.expiredMessages).toBeGreaterThanOrEqual(mixRemain);
     });
 
-    // 3. Cold restart proof: simulate DO reconstruction from SQLite storage
+    // 4. Authorized public maintenance route uses Date.now() (caller body.now inert).
+    const publicNow = Date.now();
+    const publicLiveClaim = `public-genuine-live-${crypto.randomUUID()}`;
+    let publicBefore = {
+      expiredMessages: 0,
+      expiredClaims: 0,
+      liveClaimIds: [] as string[],
+    };
     await runInDurableObject(stub, async (instance: Hub) => {
-      // Reconstruct fresh Hub instance pointing to identical storage
-      const coldHub = new Hub((instance as any).ctx, instance.env);
-
-      // Verify state was persisted in SQLite across cold restart
-      const countBeforeAlarm = coldHub.sql.exec("SELECT count(*) as c FROM messages WHERE id LIKE 'exp-msg-%'").toArray()[0] as any;
-      expect(countBeforeAlarm.c).toBe(150);
-
-      // Trigger alarm on coldHub to process next batch (100 deleted, 50 remain)
-      await coldHub.alarm();
-      const countAfterFirstAlarm = coldHub.sql.exec("SELECT count(*) as c FROM messages WHERE id LIKE 'exp-msg-%'").toArray()[0] as any;
-      expect(countAfterFirstAlarm.c).toBe(50);
-
-      // Trigger final alarm on coldHub (50 deleted, 0 remain)
-      await coldHub.alarm();
-      const countAfterFinalAlarm = coldHub.sql.exec("SELECT count(*) as c FROM messages WHERE id LIKE 'exp-msg-%'").toArray()[0] as any;
-      expect(countAfterFinalAlarm.c).toBe(0);
-
-      // Valid message must still remain untouched
-      const validStillThere = coldHub.sql.exec("SELECT id FROM messages WHERE id = 'valid-msg-future'").toArray();
-      expect(validStillThere.length).toBe(1);
+      instance.sql.exec(
+        'INSERT INTO claims (id, project, scope, holder, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
+        publicLiveClaim,
+        'projA',
+        `src/public-${publicLiveClaim}.ts`,
+        'worker-1',
+        publicNow,
+        publicNow + 120000,
+      );
+      publicBefore = busCategorySnapshot(instance.sql, publicNow);
     });
-
-    // 4. Authorized public maintenance route with admin session + valid CSRF
+    const publicEligible = publicBefore.expiredMessages + publicBefore.expiredClaims;
+    expect(publicEligible).toBeGreaterThanOrEqual(100);
+    expect(publicBefore.liveClaimIds).toContain(publicLiveClaim);
     const adminMaintainRes = await doFetch(new Request('http://example.com/api/cron/retention', {
       method: 'POST',
       headers: {
@@ -737,11 +921,22 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
     expect(adminMaintainRes.status).toBe(200);
     const maintainData = await adminMaintainRes.json() as any;
     expect(maintainData.status).toBe('ok');
-
-    // Valid message still remains
     await runInDurableObject(stub, async (instance: Hub) => {
-      const validMsg = instance.sql.exec("SELECT id FROM messages WHERE id = 'valid-msg-future'").toArray();
-      expect(validMsg.length).toBe(1);
+      expect(
+        instance.sql.exec('SELECT id FROM messages WHERE id = ?', mixValidId).toArray(),
+      ).toHaveLength(1);
+      const publicAfter = busCategorySnapshot(instance.sql, publicNow);
+      expect(publicAfter.liveClaimIds).toEqual(publicBefore.liveClaimIds);
+      expect(publicAfter.liveClaimIds).toContain(publicLiveClaim);
+      const publicDeleted =
+        publicBefore.expiredMessages -
+        publicAfter.expiredMessages +
+        (publicBefore.expiredClaims - publicAfter.expiredClaims);
+      expect(publicDeleted).toBe(100);
+      expect(
+        Number(maintainData.messagesDeleted ?? 0) + Number(maintainData.claimsDeleted ?? 0),
+      ).toBe(100);
+      expect(maintainData.hasMore).toBe(publicEligible - 100 > 0);
     });
   });
 

@@ -165,8 +165,12 @@ describe('M1 Focus: JWKS', () => {
 
     let deviceHtmlRes = await doFetch(new Request(`http://example.com/device?code=${userCode}`, { headers: { 'Cookie': appCookie } }));
     let deviceHtml = await deviceHtmlRes.text();
-    let csrfMatch = deviceHtml.match(/name="csrf_token"\s+value="([^"]+)"/);
-    let csrfToken = csrfMatch ? csrfMatch[1] : '';
+    // M2b keeps CSRF in memory, fetched from the current authenticated session.
+    const meRes = await doFetch(new Request('http://example.com/auth/me', { headers: { Cookie: appCookie } }));
+    expect(meRes.status).toBe(200);
+    const csrfToken = (await meRes.json() as any).csrf_token;
+    expect(csrfToken).toBeTruthy();
+    expect(deviceHtml).not.toContain(csrfToken);
 
     const approveRes = await doFetch(new Request(`http://example.com/api/device/approve/${userCode}`, {
       method: 'POST',
@@ -174,11 +178,13 @@ describe('M1 Focus: JWKS', () => {
       body: JSON.stringify({ granted_scopes: ['host'] })
     }));
 
+    expect(approveRes.status).toBe(200);
     const tokenRes = await doFetch(new Request('http://example.com/api/device/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ grant_type: 'urn:ietf:params:oauth:grant-type:device_code', device_code: deviceCode })
     }));
+    expect(tokenRes.status).toBe(200);
     const tokenData = await tokenRes.json() as any;
     expect(tokenData.access_token).toBeDefined();
 

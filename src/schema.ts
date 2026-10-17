@@ -161,7 +161,7 @@ CREATE TABLE IF NOT EXISTS root_actions (
 );
 
 CREATE TABLE IF NOT EXISTS agents (
-  tag TEXT PRIMARY KEY,
+  tag TEXT NOT NULL,
   project TEXT,
   role TEXT,
   machine_id TEXT,
