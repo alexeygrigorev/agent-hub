@@ -40,8 +40,11 @@ export const JOB_STUCK_AFTER_MS = 1_800_000;
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SAFE_KEY_RE = /^[A-Za-z0-9._:-]{1,128}$/;
-const JOB_TERMINAL = new Set(['done', 'failed']);
-const JOB_HELD = new Set(['waiting-on-human', 'stuck']);
+const JOB_TERMINAL = new Set(['done', 'accepted', 'failed', 'cancelled']);
+const JOB_ACTIVE = new Set(['queued', 'launched', 'running']);
+const JOB_KNOWN = new Set([...JOB_TERMINAL, ...JOB_ACTIVE,
+  'completed-awaiting-review', 'waiting-on-human', 'stuck']);
+const LAUNCH_KNOWN = new Set(['offered', 'starting', 'running', 'uncertain', 'exited', 'failed']);
 const LAUNCH_TERMINAL = new Set(['exited', 'failed']);
 
 export interface ConversationLinkLimits {
@@ -111,13 +114,14 @@ function targetUnavailable(): ConversationLinkTargetView {
 
 function jobStatusView(
   status: string,
+  kind: ConversationLinkKind,
 ): ConversationLinkTargetView {
-  const terminal = JOB_TERMINAL.has(status);
+  const terminal = JOB_TERMINAL.has(status) && (kind !== 'review' || status !== 'done');
   return {
     available: true,
-    canonical_status: status,
+    canonical_status: JOB_KNOWN.has(status) ? status : null,
     terminal,
-    complete: status === 'done',
+    complete: status === 'accepted' || (kind !== 'review' && status === 'done'),
   };
 }
 
@@ -127,7 +131,7 @@ function launchStatusView(
   const terminal = LAUNCH_TERMINAL.has(state);
   return {
     available: true,
-    canonical_status: state,
+    canonical_status: LAUNCH_KNOWN.has(state) ? state : null,
     terminal,
     complete: state === 'exited',
   };
@@ -201,6 +205,11 @@ export class ConversationLinksService {
         idempotencyKey = input.idempotencyKey;
       }
 
+      const visible = this.inspectTarget(kind, ref, principal);
+      if (!visible.row) {
+        throw new ConversationDomainError('not_found', 404);
+      }
+
       if (idempotencyKey) {
         const priorKey = this.sql
           .exec(
@@ -230,11 +239,6 @@ export class ConversationLinksService {
         .toArray()[0] as any;
       if (priorRef) {
         return this.formatLink(priorRef, principal, true);
-      }
-
-      const visible = this.inspectTarget(kind, ref, principal);
-      if (!visible.row) {
-        throw new ConversationDomainError('not_found', 404);
       }
 
       const perConv = Number(
@@ -417,12 +421,14 @@ export class ConversationLinksService {
          AND m.removed_at IS NULL
         JOIN conversations c ON c.id = l.conversation_id
         WHERE l.kind = ? AND l.ref = ?
+          AND (c.archived_at IS NULL OR c.archived_at > ?)
       `;
       const params: unknown[] = [
         principal.actor,
         principal.kind,
         kind,
         ref,
+        new Date(this.now() - this.conversations.limits.archivedConversationRetentionMs).toISOString(),
       ];
       if (cursor) {
         query +=
@@ -432,14 +438,7 @@ export class ConversationLinksService {
       query += ' ORDER BY l.created_at DESC, l.id DESC LIMIT ?';
       params.push(limit + 1);
 
-      const rows = (this.sql.exec(query, ...params).toArray() as any[]).filter(
-        row => {
-          const conv = this.sql
-            .exec('SELECT * FROM conversations WHERE id = ?', row.conversation_id)
-            .toArray()[0] as any;
-          return conv && !this.isExpiredArchived(conv);
-        },
-      );
+      const rows = this.sql.exec(query, ...params).toArray() as any[];
       const hasMore = rows.length > limit;
       const page = hasMore ? rows.slice(0, limit) : rows;
       const last = page[page.length - 1];
@@ -551,16 +550,6 @@ export class ConversationLinksService {
     }
   }
 
-  private isExpiredArchived(convRow: any): boolean {
-    if (!convRow?.archived_at) return false;
-    const archivedMs = Date.parse(String(convRow.archived_at));
-    if (!Number.isFinite(archivedMs)) return false;
-    return (
-      archivedMs <=
-      this.now() - this.conversations.limits.archivedConversationRetentionMs
-    );
-  }
-
   private isAdminHuman(principal: VerifiedConversationPrincipal): boolean {
     return principal.kind === 'human' && principal.authType === 'session';
   }
@@ -626,9 +615,8 @@ export class ConversationLinksService {
     let status = String(job.state ?? '');
     const launch = job.launch_id ? this.readLaunch(job.launch_id) : null;
     if (
-      !JOB_TERMINAL.has(status) &&
-      !JOB_HELD.has(status) &&
-      launch
+      JOB_ACTIVE.has(status) &&
+      launch && LAUNCH_KNOWN.has(String(launch.state))
     ) {
       status =
         launch.state === 'exited'
@@ -669,7 +657,7 @@ export class ConversationLinksService {
     if (!job || !this.canInspectJob(principal, job)) {
       return { row: null, view: targetUnavailable() };
     }
-    return { row: job, view: jobStatusView(this.deriveJobStatus(job)) };
+    return { row: job, view: jobStatusView(this.deriveJobStatus(job), kind) };
   }
 
   private formatLink(
