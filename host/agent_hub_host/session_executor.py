@@ -836,6 +836,94 @@ def resubmit_pending_ack(
         return None
 
 
+def reconcile_stop_command(
+    *,
+    journal_dir: str,
+    command_id: str,
+    executable: str = "aplexer",
+    request: Optional[Callable] = None,
+) -> Optional[dict[str, Any]]:
+    """Read-only reconcile of one uncertain stop against its persisted oracle.
+
+    Uses the journaled ``stop_oracle`` + ``stop_kill`` (persisted BEFORE the
+    kill result was known) and calls
+    :func:`native_sessions.reconcile_stop_oracle` — list + PID/cgroup probes
+    only, never a second kill. SAME-claim guards (UUID/tag/workspace/
+    generation) live in the oracle check; a foreign/live row stays uncertain;
+    an absent catalog alone never proves exit. On confirmed exit the journal
+    advances to stopped and a corrected ack is submitted under the SAME claim
+    token; otherwise the journal stays uncertain with no mutation.
+    """
+    from .native_sessions import reconcile_stop_oracle as _reconcile_oracle
+
+    journal_file = _journal_path(journal_dir, "cmd-" + command_id)
+    try:
+        with _lock_held(journal_file):
+            prior = _read_journal(journal_file)
+            if prior is None:
+                return None
+            if prior.get("op") != "stop" or prior.get("state") != "uncertain":
+                return None
+            oracle = prior.get("stop_oracle")
+            kill = prior.get("stop_kill") or {}
+            if not isinstance(oracle, dict) or not oracle.get("session_id"):
+                return None
+            # SAME-claim binding: the oracle must match the journaled target.
+            tgt = prior.get("target") or {}
+            try:
+                if (str(oracle.get("session_id", "")).lower()
+                        != str(tgt.get("session_id", "")).lower()
+                        or oracle.get("tag") != tgt.get("tag")
+                        or oracle.get("workspace") != tgt.get("workspace")):
+                    return None
+            except (AttributeError, TypeError):
+                return None
+            confirmed, why = _reconcile_oracle(executable, oracle, kill if isinstance(kill, dict) else {})
+            if not confirmed:
+                return None
+            updated = {**prior, "state": "stopped",
+                       "reason": str(why)[:300],
+                       "confirmed_exit": True,
+                       "reconciled_via_oracle": True}
+            ack_payload: dict[str, Any] = {
+                "correlation": _server_correlation(
+                    command_id, int(prior.get("generation", 0))),
+                "outcome": "delivered",
+                "native": {"native_id": str(tgt.get("session_id", "")),
+                           "tag": str(tgt.get("tag", "")),
+                           "workspace": str(tgt.get("workspace", ""))},
+                "reason": str(why)[:512],
+                "confirmed_exit": True,
+            }
+            # Preserve any STOP-bundled tree outcome already journaled (kept
+            # on evidence failure never flips to removed here).
+            tree = prior.get("tree")
+            if isinstance(tree, dict) and tree.get("state") in ("removed", "kept", "uncertain"):
+                ack_payload["tree"] = {"state": tree["state"],
+                                       "reason": str(tree.get("reason", ""))[:300]}
+            # Preserve evidence reference (never raw text in the ack).
+            if isinstance(prior.get("cleanup_evidence_path"), str):
+                updated["cleanup_evidence_path"] = prior["cleanup_evidence_path"]
+            ack_result: dict[str, Any] = {"submitted": False, "payload": ack_payload}
+            if request is not None:
+                try:
+                    request("POST", "/api/session-commands/" + command_id + "/ack",
+                            {**ack_payload, "claim_token": prior.get("claim_token")})
+                    ack_result = {"submitted": True, "payload": ack_payload}
+                except Exception as exc:
+                    ack_result = {"submitted": False, "payload": ack_payload,
+                                  "error": type(exc).__name__[:64]}
+            updated = {**updated, "ack_payload": ack_payload,
+                       "ack_submitted": bool(ack_result.get("submitted", False))}
+            if ack_result.get("error"):
+                updated["ack_error"] = str(ack_result["error"])[:120]
+            _write_journal(journal_file, updated)
+            return {"op": "stop", **updated,
+                    "ack": ack_result, "reconciled": True}
+    except (SessionControlError, SessionUncertain, OSError, ValueError):
+        return None
+
+
 def handle_claimed_command(
     command: dict[str, Any],
     claim: dict[str, Any],
@@ -973,14 +1061,106 @@ def handle_claimed_command(
             attempt["body_digest"] = body_digest(body)
         _write_journal(journal_file, attempt)
 
+        def _durable_failure(state: str, exc: BaseException) -> dict[str, Any]:
+            # Durable bounded private diagnostic (no stdout/capture/secrets):
+            # only the operation stage + exception type + bounded reason.
+            # Refused = pre-effect/no-mutation (replayable); uncertain =
+            # attempted mutation with unknown outcome (reconcile, no blind
+            # retry). Both ack so the server command never strands with a
+            # bare attempted:true/state:null journal.
+            err_type = type(exc).__name__[:64] or "Error"
+            reason = (str(exc) or ("Effect %s; reconcile" % state))[:300]
+            failure: dict[str, Any] = {
+                **attempt, "state": state,
+                "native_id": None,
+                "reason": reason,
+                "error_stage": op[:32],
+                "error_type": err_type,
+                "expires_at_ms": proved["expires_at_ms"],
+                "server_correlation": _server_correlation(command_id, proved["generation"]),
+            }
+            # Preserve any pre-stop evidence already durably stored before
+            # the failure (e.g. flagged-cleanup capture succeeded but the
+            # stop itself went uncertain): the file stays, the journal
+            # references it, the tree is never deleted on this path.
+            try:
+                meta_path = _journal_path(journal_dir, "cleanup-evidence-" + command_id)
+                if os.path.isfile(meta_path):
+                    failure["cleanup_evidence_path"] = meta_path
+            except (SessionControlError, OSError, ValueError):
+                pass
+            # Persist the qualified pre-stop containment oracle + kill
+            # attempt/result when the native stop carried them (uncertain
+            # after kill). Bounded private fields only (PIDs/cgroup/phase,
+            # no stdout/secrets). Enables read-only SAME-claim reconcile
+            # without a second kill; absent catalog alone never proves exit.
+            try:
+                oracle = getattr(exc, "oracle", None)
+                kill = getattr(exc, "kill", None)
+                if isinstance(oracle, dict) and oracle.get("session_id"):
+                    bounded_oracle = {
+                        k: oracle.get(k) for k in (
+                            "version", "session_id", "tag", "workspace",
+                            "created_at_ms", "engine", "phase",
+                            "worker_pid", "workload_pid", "processes",
+                            "containment_empty", "workload_cgroup",
+                            "last_activity_ms")
+                    }
+                    # Validate the oracle binds the SAME claim target before
+                    # persisting (UUID/tag/workspace must match this attempt).
+                    if (str(bounded_oracle.get("session_id", "")).lower()
+                            == target.session_id.lower()
+                            and bounded_oracle.get("tag") == target.tag
+                            and bounded_oracle.get("workspace") == target.workspace):
+                        failure["stop_oracle"] = bounded_oracle
+                        if isinstance(kill, dict):
+                            failure["stop_kill"] = {
+                                "signal": str(kill.get("signal", ""))[:16],
+                                "grace_ms": kill.get("grace_ms")
+                                if type(kill.get("grace_ms")) is int else None,
+                                "killed": bool(kill.get("killed", False)),
+                                "result": str(kill.get("result", ""))[:64],
+                            }
+            except Exception:
+                pass
+            ack_payload: dict[str, Any] = {
+                "correlation": _server_correlation(command_id, proved["generation"]),
+                "outcome": "refused" if state == "refused" else "uncertain",
+                "native": {"native_id": target.session_id,
+                           "tag": target.tag, "workspace": target.workspace},
+                "reason": reason[:512],
+            }
+            if op == "stop":
+                ack_payload["confirmed_exit"] = False
+            ack_result: dict[str, Any] = {"submitted": False, "payload": ack_payload}
+            if request is not None:
+                try:
+                    request("POST", "/api/session-commands/" + command_id + "/ack",
+                            {**ack_payload, "claim_token": proved["claim_token"]})
+                    ack_result = {"submitted": True, "payload": ack_payload}
+                except Exception as req_exc:
+                    ack_result = {"submitted": False, "payload": ack_payload,
+                                  "error": type(req_exc).__name__[:64]}
+            failure = {**failure, "ack_payload": ack_payload,
+                       "ack_submitted": bool(ack_result.get("submitted", False))}
+            if ack_result.get("error"):
+                failure["ack_error"] = str(ack_result["error"])[:120]
+            _write_journal(journal_file, failure)
+            return {"op": op, **failure, "ack": ack_result}
+
         try:
             outcome = _run_claimed_effect(
                 executable, op, command, target, custody=custody,
                 journal_dir=journal_dir, sender_workspace=sender_workspace,
                 cleanup_roots=cleanup_roots,
                 cleanup_tree_authorized=proved.get("cleanup_tree_authorized") is True)
+        except SessionControlError as exc:
+            # Read-only or pre-effect refusal (no mutation): durable refused.
+            return _durable_failure("refused", exc)
         except SessionUncertain as exc:
-            raise SessionUncertain(str(exc) or "Effect uncertain; reconcile") from exc
+            return _durable_failure("uncertain", exc)
+        except Exception as exc:  # never strand attempted:true/state:null
+            return _durable_failure("uncertain", exc)
 
         record = {**attempt, "state": outcome.get("state"),
                   "native_id": outcome.get("native_id"),
@@ -1066,6 +1246,15 @@ def handle_claimed_command(
 CLEANUP_EVIDENCE_LIMIT_BYTES = 64 * 1024
 
 
+def _evidence_raw_path(journal_dir: str, command_id: str) -> str:
+    """Private raw payload path for cleanup evidence (validated, no JSON)."""
+    if not isinstance(journal_dir, str) or not Path(journal_dir).is_absolute():
+        raise SessionControlError("journal_dir must be an absolute path")
+    if not isinstance(command_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{1,128}", command_id):
+        raise SessionControlError("Invalid command id for cleanup evidence")
+    return os.path.join(journal_dir, "cleanup-evidence-" + command_id + ".txt")
+
+
 def _preserve_cleanup_evidence(
     executable: str,
     target: NativeTarget,
@@ -1077,14 +1266,24 @@ def _preserve_cleanup_evidence(
     """Save a bounded pre-stop capture of the cleanup target (flagged cleanup ONLY).
 
     Runs a bounded tail capture (64 KiB) against the exact qualified target
-    BEFORE any native stop, and persists it as a private 0600 fsync'd journal
-    file OUTSIDE the cleanup roots (``cleanup-evidence-<command_id>.json``
-    beside the receiver journals, never under a cleanup root). The raw text
-    never leaves the host (never in the Hub ack, never in logs): callers
-    report only kept/removed with a generic reason. Returns the evidence path.
-    Raises SessionControlError/SessionUncertain when the capture itself fails —
-    callers then keep (never delete) the tree rather than claim preservation.
+    BEFORE any native stop, and persists it as TWO private 0600 fsync'd files
+    OUTSIDE the cleanup roots beside the receiver journals (never under a
+    cleanup root):
+
+    - ``cleanup-evidence-<command_id>.txt``: exact raw UTF-8 payload bytes
+      (<= 64 KiB, no JSON escaping, so full 64 KiB + ANSI expansion never
+      overflows);
+    - ``cleanup-evidence-<command_id>.json``: small bounded metadata
+      (op/command/native/hash/byte_length/truncated/raw_file, < 2 KiB).
+
+    The raw text never leaves the host (never in the Hub ack, never in logs):
+    callers report only kept/removed with a generic reason. Returns the
+    metadata path. Raises SessionControlError/SessionUncertain when the
+    capture or either write fails — callers then keep (never delete) the
+    tree rather than claim preservation.
     """
+    import hashlib as _hashlib
+
     _check_custody(custody)
     if not isinstance(command_id, str) or not command_id:
         raise SessionControlError("Command id is required for cleanup evidence")
@@ -1093,17 +1292,52 @@ def _preserve_cleanup_evidence(
     text = cap.get("text", "")
     if not isinstance(text, str):
         raise SessionControlError("Cleanup evidence capture returned no text; refusing")
-    record = {"op": "cleanup-evidence", "command_id": command_id,
-              "native_id": target.session_id, "tag": target.tag,
-              "workspace": target.workspace,
-              "byte_length": cap.get("byte_length"), "truncated": bool(cap.get("truncated", False)),
-              "text": text[:CLEANUP_EVIDENCE_LIMIT_BYTES]}
-    path = _journal_path(journal_dir, "cleanup-evidence-" + command_id)
+    # Exact byte budget on the raw UTF-8 payload (not on JSON-escaped text):
+    # the adapter already truncates to limit_bytes, but stubs/tests may return
+    # more, and multi-byte/ANSI content expands under JSON. Enforce here.
+    raw = text.encode("utf-8", "replace")
+    truncated = bool(cap.get("truncated", False))
+    if len(raw) > CLEANUP_EVIDENCE_LIMIT_BYTES:
+        raw = raw[:CLEANUP_EVIDENCE_LIMIT_BYTES]
+        # Keep valid UTF-8 after byte truncation (dangling trail -> replace).
+        text = raw.decode("utf-8", "replace")
+        raw = text.encode("utf-8")
+        # Re-enforce after re-encode (replacement char is 3 bytes).
+        if len(raw) > CLEANUP_EVIDENCE_LIMIT_BYTES:
+            raw = raw[:CLEANUP_EVIDENCE_LIMIT_BYTES]
+        truncated = True
+    byte_length = len(raw)
+    digest = _hashlib.sha256(raw).hexdigest()
+    meta_path = _journal_path(journal_dir, "cleanup-evidence-" + command_id)
+    raw_path = _evidence_raw_path(journal_dir, command_id)
     # Fail closed when the evidence file would land inside a cleanup root is
     # enforced by construction: journal_dir is never under a cleanup root
     # (receiver invariant; see session_cleanup module docstring).
-    _write_journal(path, record)
-    return path
+    try:
+        private_fs.atomic_write(raw_path, raw, CLEANUP_EVIDENCE_LIMIT_BYTES)
+    except (ValueError, OSError, PermissionError) as exc:
+        raise SessionControlError(
+            "Cleanup evidence store failed; refusing") from exc
+    record = {"op": "cleanup-evidence", "command_id": command_id,
+              "native_id": target.session_id, "tag": target.tag,
+              "workspace": target.workspace,
+              "byte_length": byte_length, "truncated": truncated,
+              "sha256": digest,
+              "raw_file": os.path.basename(raw_path),
+              "privacy_unknown": True}
+    try:
+        _write_journal(meta_path, record)
+    except (ValueError, OSError, PermissionError) as exc:
+        # Metadata must be durable too; a half-stored payload keeps the tree.
+        # Remove the raw payload best-effort (never under a cleanup root) so
+        # a later retry starts clean, then refuse.
+        try:
+            os.unlink(raw_path)
+        except OSError:
+            pass
+        raise SessionControlError(
+            "Cleanup evidence metadata store failed; refusing") from exc
+    return meta_path
 
 
 def _run_cleanup_tree_after_stop(

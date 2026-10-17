@@ -84,7 +84,8 @@ class TestCleanupEvidenceOrder(unittest.TestCase):
                 cleanup_tree_authorized=True)
         self.assertEqual(events, ["capture", "stop", "tree"])
         self.assertIn("tree", out)
-        # Durable private evidence outside the cleanup roots.
+        # Durable private evidence outside the cleanup roots (split raw+meta
+        # so full 64KiB + JSON escaping never overflows the journal bound).
         ev_path = out.get("cleanup_evidence_path")
         self.assertIsInstance(ev_path, str)
         self.assertTrue(ev_path.startswith(str(self.journal) + os.sep))
@@ -95,7 +96,19 @@ class TestCleanupEvidenceOrder(unittest.TestCase):
         with open(ev_path, encoding="utf-8") as fh:
             record = json.load(fh)
         self.assertEqual(record["command_id"], cid)
-        self.assertIn("tail-line-1", record["text"])
+        # Meta is small and carries no raw text (no Hub upload).
+        self.assertNotIn("text", record)
+        self.assertIn("sha256", record)
+        self.assertIn("raw_file", record)
+        self.assertLess(os.path.getsize(ev_path), 2048)
+        raw_path = os.path.join(str(self.journal), record["raw_file"])
+        self.assertTrue(raw_path.startswith(str(self.journal) + os.sep))
+        self.assertFalse(raw_path.startswith(str(self.roots) + os.sep))
+        self.assertTrue(os.path.isfile(raw_path))
+        self.assertEqual(stat.S_IMODE(os.stat(raw_path).st_mode), 0o600)
+        with open(raw_path, encoding="utf-8") as fh:
+            raw_text = fh.read()
+        self.assertIn("tail-line-1", raw_text)
 
     def test_capture_failure_keeps_tree_without_deletion(self):
         events = []
