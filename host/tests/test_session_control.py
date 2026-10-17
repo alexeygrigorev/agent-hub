@@ -18,6 +18,12 @@ class TestSessionControlCli(unittest.TestCase):
     def parse(self, *args):
         return parser().parse_args(['sessions', *args])
 
+    def test_stop_wait_does_not_accept_running(self):
+        with patch.object(session_control, 'request', side_effect=[{'state': 'running'}, {'state': 'stopped'}]) as fetch, patch.object(session_control.time, 'sleep'):
+            result = session_control.wait_for_session('s', 10, 1, stopping=True)
+        self.assertEqual(result['state'], 'stopped')
+        self.assertEqual(fetch.call_count, 2)
+
     def test_list_show_commands_paths(self):
         with patch.object(session_control, 'request', return_value={'sessions': []}) as transport:
             result = session_control.execute(self.parse('list', '--limit', '10'))

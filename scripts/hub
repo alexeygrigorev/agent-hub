@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+hub_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+export PYTHONPATH="$hub_root/host${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m agent_hub_host "$@"

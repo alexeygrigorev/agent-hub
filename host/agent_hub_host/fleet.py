@@ -456,7 +456,14 @@ class Dispatcher:
         self.request("PUT", "/api/fleet/sessions", {"sessions": session_metadata(raw, self.settings)})
         # Reconcile Fleet-owned starts into exact Hub session bindings after
         # reporting the observed native catalog. Retry is read-before-write.
-        pending = self.request("GET", "/api/sessions/host-bindings").get("sessions", [])
+        try:
+            pending = self.request("GET", "/api/sessions/host-bindings").get("sessions", [])
+        except ValueError as exc:
+            # Cloudflare may briefly route to the previous DO version during
+            # rollout. Continue Fleet work; reconcile bindings next cycle.
+            if "404" not in str(exc):
+                raise
+            pending = []
         rows = raw if isinstance(raw, list) else raw.get("sessions", [])
         for session in pending:
             matches = [r for r in rows if r.get("tag") == "hub-" + session["fleet_launch_id"] and r.get("engine") == session.get("engine")]
