@@ -485,6 +485,10 @@ class Dispatcher:
                 argv = list(prefix) + argv
             cwd = None
         elif mode == "headless":
+            # Provider profiles are not launcher admission profiles. This
+            # backend currently qualifies only the default provider profile.
+            if sub.get("profile") is not None:
+                raise ValueError("Headless provider profile is not qualified")
             launcher = self.settings.get("launcher", {})
             if not all(launcher.get(k) for k in ["argv", "root", "config_dir"]) or not sub.get("launcher_provider") or not sub.get("launcher_model"):
                 raise ValueError("Maintained launcher route is not configured")
@@ -498,7 +502,7 @@ class Dispatcher:
                 goal += '\nWrite a final JSON object to ' + str(result_path) + ': {"status":"done|failed|waiting-on-human|stuck","report":"sanitized final report","artifacts":[{"label":"text","text":"sanitized text"}]}. No secrets, codes, tokens or URLs. Do not write raw screenshots; keep them private for human review locally.'
             payload = {"goal": goal, "owner": "hub-fleet", "cwd": str(target_cwd), "timeout": 1800,
                        "model_requirements": {"providers": [sub["launcher_provider"]], "models": [sub["launcher_model"]]},
-                       "account_label": sub["account_label"], "profile": sub.get("profile")}
+                       "account_label": sub["account_label"], "profile": "model-task"}
             self.runner(prefix + ["submit", "--id", task_id, "--key", task_id, "--payload", json.dumps(payload), "--json"], cwd=launcher["root"])
             plan = self.runner(prefix + ["plan", "--id", task_id], cwd=launcher["root"])
             eligible = plan.get("eligible", [])

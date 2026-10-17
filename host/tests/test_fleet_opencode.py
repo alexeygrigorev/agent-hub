@@ -57,7 +57,11 @@ class FleetOpencodeTests(unittest.TestCase):
                                         'engine': 'opencode'}}
                 return {}
             d = fleet.Dispatcher(cfg, lambda *a: {}, runner)
-            result = d.dispatch(offer())
+            result = d.dispatch(offer(prompt='Implement writer-run; preserve root-run authority'))
+            submitted = next(a for a in calls if 'submit' in a)
+            payload = json.loads(submitted[submitted.index('--payload') + 1])
+            self.assertEqual(payload['profile'], 'model-task')
+            self.assertEqual(payload['goal'], 'Implement writer-run; preserve root-run authority')
             self.assertEqual(result['state'], 'running')
             self.assertEqual(result['native_id'], 'native-uuid-1')
             run_argv = calls[-1]
@@ -133,7 +137,10 @@ class FleetOpencodeTests(unittest.TestCase):
             self.assertEqual(loaded['subscriptions'][0]['account_label'],
                              'shared-go')
             self.assertEqual(loaded['launcher']['root'], '/repo/ql')
+        with self.assertRaisesRegex(ValueError, 'provider profile'):
+            fleet_launch.launcher_payload('/ws', 'brief', 'shared-go', profile='root-run')
         payload = fleet_launch.launcher_payload('/ws', 'brief $x', 'shared-go')
+        self.assertEqual(payload['profile'], 'model-task')
         self.assertEqual(payload['model_requirements'],
                          {'providers': ['opencode'],
                           'models': ['opencode-go/muse-spark-1.3-contributor']})

@@ -100,11 +100,13 @@ def opencode_offer(offer_id, workspace_label, prompt, *, engine="opencode",
 def launcher_payload(target_cwd, goal, account_label, profile=None,
                      timeout=1800):
     """Exact maintained-launcher submit payload for an opencode headless run."""
+    if profile is not None:
+        raise ValueError("Headless provider profile is not qualified")
     return {"goal": goal, "owner": "hub-fleet", "cwd": str(target_cwd),
             "timeout": timeout,
             "model_requirements": {"providers": [OPENCODE_PROVIDER],
                                    "models": [OPENCODE_MODEL]},
-            "account_label": account_label, "profile": profile}
+            "account_label": account_label, "profile": "model-task"}
 
 
 def launcher_run_argv(launcher_argv, config_dir, task_id, target_cwd,
