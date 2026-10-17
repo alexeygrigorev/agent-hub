@@ -44,10 +44,10 @@ import {
 export type DecisionKind = 'resume_on_reset' | 'reassign' | 'drop';
 export const DECISION_KINDS: ReadonlySet<string> = new Set(['resume_on_reset', 'reassign', 'drop']);
 
-/** M15d seam: native stop + Git worktree/branch removal live here next.
- * --apply refuses until the host executor (machine/native/owner
- * revalidation, containment, clean+merged worktree/branch guards) and live
- * acceptance land under head assignment. */
+/** M15d shipped: native stop is enqueued as real M12 stop intents
+ * (server custody) and executed by the host receiver (containment-confirmed);
+ * owned worktree/branch removal runs host-side under the trusted
+ * cleanup-root allowlist with clean-and-merged guards. Kept for history. */
 export const APPLY_REFUSAL_NEXT_SEAM =
   'M15d executor seam (head-assigned next): host-side machine/native/owner ' +
   'revalidation + containment + owned worktree/branch clean-and-merged ' +
@@ -536,13 +536,29 @@ export type CleanupDryRun = {
   total: number;
 };
 
-/** Readonly dry-run: pure classification + planning, zero writes. */
-export function planCleanupDryRun(
+/** Fresh eligible-target collection shared by dry-run and apply.
+ *
+ * Pure join + classification + planning over canonical stores, zero writes.
+ * The apply path re-runs this INSIDE the mutation transaction (fresh
+ * per-session re-evaluation) and then enqueues M12 stop intents through the
+ * existing session-control custody — never a second classifier or store
+ * here. Ownership in the returned candidates is TRUSTED canonical-server
+ * context only; the service still verifies the live credential/family/
+ * incarnation before any enqueue, and the host revalidates before any
+ * native effect. */
+export type CleanupApplyEligible = {
+  session_key: string;
+  state: string;
+  owner: string | null;
+  refs: LifecycleRefs;
+};
+
+export function collectCleanupEligible(
   sql: SqlStorage,
   scope: LifecycleScope,
   callerOwner: string,
   now_ms?: number,
-): CleanupDryRun {
+): { eligible: CleanupApplyEligible[]; ineligible: { key: string; reasons: string[] }[]; total: number } {
   const { inputs, refs } = buildSessionInputs(sql);
   const now = now_ms ?? Date.now();
   const scoped = inputs.filter((candidate) => {
@@ -562,8 +578,6 @@ export function planCleanupDryRun(
   });
   const plan = planCleanup(candidates, callerOwner);
   return {
-    dry_run: true,
-    apply: false,
     eligible: plan.eligible.map((entry) => ({
       session_key: entry.session_key,
       state: entry.state,
@@ -575,7 +589,25 @@ export function planCleanupDryRun(
   };
 }
 
-/** --apply has no safe execution path in M15c: refuse explicitly, no mutation. */
+/** Readonly dry-run: pure classification + planning, zero writes. */
+export function planCleanupDryRun(
+  sql: SqlStorage,
+  scope: LifecycleScope,
+  callerOwner: string,
+  now_ms?: number,
+): CleanupDryRun {
+  const collected = collectCleanupEligible(sql, scope, callerOwner, now_ms);
+  return {
+    dry_run: true,
+    apply: false,
+    eligible: collected.eligible,
+    ineligible: collected.ineligible,
+    total: collected.total,
+  };
+}
+
+/** M15c refusal seam (retired in M15d: apply now enqueues real M12 stop
+ * intents; kept exported so parallel workers importing it keep compiling). */
 export function refuseCleanupApply(): { error: string; status: number; detail: string; next: string } {
   return {
     error: 'apply_not_available',

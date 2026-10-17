@@ -26,11 +26,11 @@ import { taskTier } from './model-routing';
 import { approvalAuthorityMatches } from './host_enrollment';
 import {
   buildLifecycleView,
+  collectCleanupEligible,
   initLifecycleTables,
   planCleanupDryRun,
   recordDecision,
   recordObservation,
-  refuseCleanupApply,
 } from './session_lifecycle_registry';
 
 export const SESSION_CONTROL_SCHEMA = `
@@ -266,6 +266,19 @@ export class SessionControlService {
     const family = this.presentingFamily(caller);
     if (!family) return;
     try { this.sql.exec('UPDATE session_control_sessions SET host_family = COALESCE(host_family, ?) WHERE id = ?', family, sessionId); } catch { /* bookkeeping only */ }
+  }
+
+  /** M15d coordination contract for the parallel status worker (narrow).
+   *
+   * The status worker injects this via Hub into its status observation
+   * service to gate host observation writes; it owns src/hub.ts and must
+   * still validate host scope + canonical task/session machine itself.
+   * Uses the existing fresh host family/approval authority (no duplicate
+   * checker, no new privilege). Cleanup logic never trusts JSON ownership
+   * from host observations — this gate only authorizes transport. */
+  hostObservationAllowed(machineId: unknown, caller: Caller): boolean {
+    if (caller.kind !== 'host') return false;
+    return this.hostOk({ machine_id: machineId as string }, caller).ok;
   }
 
   /** M15c: live host authority for machine-scoped observation writes (no
@@ -748,17 +761,115 @@ export class SessionControlService {
     if (path === '/api/sessions/cleanup' && request.method === 'POST') {
       if (!writer) return response({ error: 'forbidden' }, 403);
       const input = await body(request);
-      // --apply has no safe execution path in M15c: refuse explicitly with
-      // the exact next seam. Zero writes on every cleanup path.
-      if (input && (input as any).apply === true) {
-        const refused = refuseCleanupApply();
-        return response({ error: refused.error, detail: refused.detail, next: refused.next }, refused.status);
-      }
       const scopeParam = (name: string): string | null => {
         const value = url.searchParams.get(name);
         if (value == null || value === '') return null;
         return value.length > 128 ? null : value;
       };
+      // M15d REAL apply: enqueue M12 stop intents for freshly eligible OWN
+      // sessions only. Exact authenticated current-owner credential/family/
+      // incarnation is required before any enqueue (inside the txn, after the
+      // awaited body); admin privilege is never another coordinator's
+      // ownership (admin apply is never an oracle). Human/Alexey sessions are
+      // permanently protected. Only confirmed finished/superseded with zero
+      // obligations are eligible — unknown/idle/limit alone never qualify.
+      // The host executes each enqueued stop through the existing
+      // claim/effect/ack custody with containment-confirmed exit; a missing
+      // catalog entry is never exit proof. Worktree/branch removal runs
+      // host-side afterwards under the trusted cleanup-root allowlist.
+      // Partial results and uncertainty stay durable: an already-pending
+      // stop intent replays (never duplicates), and every kept target
+      // reports its actual reason. No pretend success anywhere.
+      if (input && (input as any).apply === true) {
+        if (admin) return response({ error: 'not_found' }, 404);
+        const rawKey = (input as any).key;
+        if (rawKey !== undefined && (typeof rawKey !== 'string' || !label(rawKey))) {
+          return response({ error: 'invalid_cleanup_key' }, 400);
+        }
+        const operationKey = typeof rawKey === 'string' ? rawKey : crypto.randomUUID();
+        const scope = { owner: caller.actor ?? null, host: scopeParam('host'), task: scopeParam('task') };
+        return this.transaction(() => {
+          if (!this.agentLive(caller)) return response({ error: 'forbidden' }, 403);
+          const callerOwner = caller.actor ?? '';
+          const collected = collectCleanupEligible(this.sql, scope, callerOwner, this.now());
+          const enqueued: { session_key: string; session_id: string; command_id: string; state: string; replay: boolean }[] = [];
+          const refused = [...collected.ineligible];
+          for (const target of collected.eligible) {
+            if (target.refs.human_owned) {
+              refused.push({ key: target.session_key, reasons: ['human/Alexey session permanently protected'] });
+              continue;
+            }
+            let live: any = null;
+            let ownerVerified = false;
+            try {
+              if (target.refs.session_id) {
+                live = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', target.refs.session_id).toArray()[0] ?? null;
+                ownerVerified = !!live && this.ownerOk(live, caller) && live.actor === caller.actor;
+              } else if (target.refs.fleet_launch_id) {
+                const launch: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id = ?', target.refs.fleet_launch_id).toArray()[0];
+                ownerVerified = !!launch && !!caller.actor && launch.actor === caller.actor;
+                if (ownerVerified) {
+                  refused.push({ key: target.session_key, reasons: ['no session-control intent to stop (fleet-observed only); listed, never acted'] });
+                  continue;
+                }
+              }
+            } catch {
+              ownerVerified = false;
+              live = null;
+            }
+            if (!live || !ownerVerified) {
+              refused.push({ key: target.session_key, reasons: ['not owned by caller (admin is not ownership)'] });
+              continue;
+            }
+            const binding = live.binding_json ? parsed(live.binding_json, null) : null;
+            if (!binding || binding.native_id !== target.refs.native_id) {
+              refused.push({ key: target.session_key, reasons: ['binding_mismatch: native incarnation drifted; listed, never acted'] });
+              continue;
+            }
+            if (!STOPPABLE.has(live.state)) {
+              refused.push({ key: target.session_key, reasons: [`session_not_stoppable:${live.state}`] });
+              continue;
+            }
+            let pending: any = null;
+            try {
+              pending = this.sql.exec(
+                "SELECT * FROM session_control_commands WHERE session_id = ? AND kind = 'stop' AND state IN ('recorded','transported','claimed') ORDER BY created_at DESC LIMIT 1", live.id).toArray()[0] ?? null;
+            } catch {
+              pending = null;
+            }
+            if (pending) {
+              enqueued.push({ session_key: target.session_key, session_id: live.id, command_id: pending.id, state: pending.state, replay: true });
+              continue;
+            }
+            const pendingCount = Number(this.sql.exec(
+              "SELECT COUNT(*) AS n FROM session_control_commands WHERE state IN ('recorded', 'transported', 'claimed')").one().n);
+            if (pendingCount >= this.maxPending) {
+              refused.push({ key: target.session_key, reasons: ['queue_full: reconciled via commands listing, do not blind-retry'] });
+              continue;
+            }
+            const perSession = Number(this.sql.exec(
+              "SELECT COUNT(*) AS n FROM session_control_commands WHERE session_id = ? AND state IN ('recorded', 'transported', 'claimed')", live.id).one().n);
+            if (perSession >= this.maxPerSession) {
+              refused.push({ key: target.session_key, reasons: ['session_queue_full: reconciled via commands listing, do not blind-retry'] });
+              continue;
+            }
+            const sessionKey = `cu-${String(operationKey).slice(0, 12)}-${String(live.id).slice(0, 8)}`;
+            this.enqueue(live, 'stop', actorName(caller), caller, sessionKey, {});
+            let row: any = null;
+            try {
+              row = this.sql.exec('SELECT * FROM session_control_commands WHERE session_id = ? AND actor = ? AND request_key = ?', live.id, actorName(caller), sessionKey).toArray()[0] ?? null;
+            } catch {
+              row = null;
+            }
+            if (!row) {
+              refused.push({ key: target.session_key, reasons: ['enqueue_failed: reconciled via commands listing, do not blind-retry'] });
+              continue;
+            }
+            enqueued.push({ session_key: target.session_key, session_id: live.id, command_id: row.id, state: row.state, replay: false });
+          }
+          return response({ apply: true, dry_run: false, operation_key: operationKey, enqueued, refused, total: collected.total });
+        });
+      }
       const scope = admin
         ? { owner: scopeParam('owner'), host: scopeParam('host'), task: scopeParam('task') }
         : { owner: caller.actor ?? null, host: scopeParam('host'), task: scopeParam('task') };

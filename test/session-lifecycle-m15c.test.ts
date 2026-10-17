@@ -168,7 +168,7 @@ describe('m15c lifecycle view', () => {
     expect(entry.reasons.join(' ')).toContain('decision:resume_on_reset');
   }));
 
-  it('dry-runs cleanup without mutation and refuses --apply explicitly', async () => fixture(async (s, sql) => {
+  it('dry-runs cleanup without mutation and applies via real M12 stop intents', async () => fixture(async (s, sql) => {
     const created = await startAgentSession(s, 'm15c-done');
     await bindAgentSession(s, sql, created.id, 'launch-1');
     const key = `hetzner/${NATIVE_ID}`;
@@ -187,11 +187,15 @@ describe('m15c lifecycle view', () => {
     expect(plan.dry_run).toBe(true);
     expect(plan.eligible.map((e: any) => e.session_key)).toContain(key);
     expect(count()).toBe(before);
-    const applied = await s.handle(request('/api/sessions/cleanup', { apply: true }), agent());
-    const refused = await applied.json() as any;
-    expect(applied.status).toBe(409);
-    expect(refused.error).toBe('apply_not_available');
-    expect(refused.next).toContain('M15d');
+    // M15d REAL apply: enqueues one M12 stop intent for the eligible own
+    // session (no second store; the host executes it via claim/ack).
+    const applied = await s.handle(request('/api/sessions/cleanup', { apply: true, key: 'm15c-op' }), agent());
+    expect(applied.status, await applied.clone().text()).toBe(200);
+    const done = await applied.json() as any;
+    expect(done.apply).toBe(true);
+    expect(done.enqueued.map((e: any) => e.session_key)).toContain(key);
+    expect((sql.exec("SELECT COUNT(*) AS n FROM session_control_commands WHERE kind = 'stop'").one() as any).n).toBe(1);
+    // Only the M12 stop intent was added: no observation/decision/session rows.
     expect(count()).toBe(before);
   }));
 
