@@ -512,11 +512,34 @@ def verify_ack_via_reply(
             continue
         if not expected_digest and correlation["correlation_id"] not in body_text:
             continue
+        # Server proof needs a 64-hex reply digest computed from the OBSERVED
+        # reply envelope (host-verified provenance, not crypto target auth).
+        # Defined as sha256 hex of the reply body text (UTF-8); when the body
+        # is not text, of the canonical JSON of its data payload. The hub checks
+        # shape/binding/uniqueness only — the host performed the log retrieval
+        # and correlation verification above.
+        import hashlib
+        if isinstance(env.get("body"), str) and env.get("body"):
+            digest_src = env["body"].encode("utf-8")
+        else:
+            try:
+                digest_src = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            except (TypeError, ValueError):
+                digest_src = str(env.get("id", "")).encode("utf-8")
+        reply_digest = hashlib.sha256(digest_src).hexdigest()
+        sender_created = sender.get("created_at_ms")
         return AckResult(
             state="acknowledged",
             reply_envelope_id=str(env.get("id")),
             reason="correlated native reply verified in message log",
-            evidence={"correlation_id": correlation["correlation_id"]},
+            evidence={"correlation_id": correlation["correlation_id"],
+                      "original_envelope_id": original_envelope_id,
+                      "reply_digest": reply_digest,
+                      "sender_native_id": str(sender.get("session_id", "")),
+                      "sender_tag": str(sender.get("tag", "")),
+                      "sender_workspace": str(sender.get("workspace", "")),
+                      "sender_created_at_ms": sender_created if type(sender_created) is int else target.created_at_ms,
+                      "reply_body": body_text[:512]},
         )
     return AckResult(
         state="unknown",

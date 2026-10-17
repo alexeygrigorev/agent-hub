@@ -146,12 +146,15 @@ def _check_custody(custody: CallerCustody) -> CallerCustody:
 def verify_server_claim(claim: dict[str, Any], *, now_ms: Optional[int] = None) -> dict[str, Any]:
     """Verify a server-issued single-attempt claim BEFORE any native effect.
 
-    Required fields (head-chosen interface): ``command_id``, ``claim_token``
-    (unpredictable, >= 16 chars), ``holder``, ``generation``, ``expires_at_ms``.
-    An expired or malformed claim refuses with NO effect. A repeated claim token
-    never authorizes another execution — the journal binds the token per key.
-    Expiry uses the caller's clock only to fail closed; the server is the
-    authority on grant and revocation.
+    Required fields (head-chosen interface, server canonical): ``command_id``,
+    ``claim_token`` (unpredictable, >= 16 chars), ``holder``, ``generation``,
+    and expiry as EITHER ``expires_at_ms`` (int ms, host clock) OR
+    ``expires_at`` (ISO-8601 string, server canonical). The server returns both
+    (see src/session_control.ts claim route); the host accepts either and
+    normalizes to ``expires_at_ms``. An expired or malformed claim refuses with
+    NO effect. A repeated claim token never authorizes another execution — the
+    journal binds the token per key. Expiry uses the caller's clock only to
+    fail closed; the server is the authority on grant and revocation.
     """
     if not isinstance(claim, dict):
         raise SessionControlError("Server claim is required before any effect")
@@ -160,6 +163,16 @@ def verify_server_claim(claim: dict[str, Any], *, now_ms: Optional[int] = None) 
     holder = claim.get("holder")
     generation = claim.get("generation")
     expires_at = claim.get("expires_at_ms")
+    if expires_at is None and isinstance(claim.get("expires_at"), str):
+        try:
+            from datetime import datetime, timezone
+            text = claim["expires_at"]
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            expires_at = int(parsed.timestamp() * 1000)
+        except (ValueError, OverflowError):
+            expires_at = None
     if not isinstance(command_id, str) or not command_id or len(command_id) > 128:
         raise SessionControlError("Claim command_id is required")
     if not isinstance(token, str) or len(token) < 16 or len(token) > 256:
@@ -572,15 +585,39 @@ def handle_claimed_command(
 
         record = {**attempt, "state": outcome.get("state"),
                   "native_id": outcome.get("native_id"),
+                  "original_native_message_id": outcome.get("original_native_message_id"),
                   "reply_envelope_id": outcome.get("reply_envelope_id"),
                   "reason": str(outcome.get("reason", ""))[:300]}
         _write_journal(journal_file, record)
 
-        ack_payload = {"correlation": "cmd:%s:gen:%d" % (command_id, proved["generation"]),
-                       "outcome": outcome.get("ack_outcome", "uncertain"),
-                       "native": {"native_id": outcome.get("native_id"),
-                                  "tag": target.tag, "workspace": target.workspace},
-                       "reason": str(outcome.get("reason", ""))[:512]}
+        # CORRECTED ack.native semantics: ack.native.native_id is ALWAYS the
+        # TARGET NATIVE SESSION UUID (binding match), never an envelope id.
+        # Envelope ids travel in proof (native_message_id = original delivered
+        # envelope, reply_to_native_id = reply envelope) and in the journal.
+        ack_payload: dict[str, Any] = {
+            "correlation": "cmd:%s:gen:%d" % (command_id, proved["generation"]),
+            "outcome": outcome.get("ack_outcome", "uncertain"),
+            "native": {"native_id": target.session_id,
+                       "tag": target.tag, "workspace": target.workspace},
+            "reason": str(outcome.get("reason", ""))[:512],
+        }
+        if op == "send" and outcome.get("ack_outcome") == "delivered" and outcome.get("reply_envelope_id"):
+            evidence = outcome.get("proof_evidence") or {}
+            ack_payload["proof"] = {
+                "native_message_id": outcome.get("original_native_message_id"),
+                "reply_to_native_id": outcome.get("reply_envelope_id"),
+                "reply_digest": evidence.get("reply_digest", "0" * 64),
+                "sender_native_id": target.session_id,
+                "sender_tag": target.tag,
+                "sender_workspace": target.workspace,
+                "sender_generation": proved["generation"],
+                "sender_created_at_ms": target.created_at_ms,
+            }
+        if op == "capture" and outcome.get("ack_outcome") == "delivered":
+            text = str(outcome.get("capture_text", ""))
+            ack_payload["capture"] = text[:65536]
+        if op == "stop":
+            ack_payload["confirmed_exit"] = bool(outcome.get("confirmed_exit", False))
         ack_result: dict[str, Any] = {"submitted": False, "payload": ack_payload}
         if request is not None:
             try:
@@ -602,7 +639,14 @@ def _run_claimed_effect(
     custody: CallerCustody,
     journal_dir: str,
 ) -> dict[str, Any]:
-    """Run one claimed native effect; returns the outcome fields for ack mapping."""
+    """Run one claimed native effect; returns the outcome fields for ack mapping.
+
+    Ack semantics (CORRECTED — ack.native is the TARGET native session UUID,
+    never an envelope id): ``native_id`` below is the ORIGINAL envelope id for
+    send (separate from the target), kept in the journal as
+    ``original_native_message_id``. The ack ``native`` triple is always the
+    exact bound target; proof carries the envelope ids separately.
+    """
     if op == "send":
         body = command["body"]
         key = "cmdsend-" + str(command["command_id"])
@@ -620,14 +664,19 @@ def _run_claimed_effect(
                  "body_digest": str(sent.get("body_digest") or "")})
             if proof.state == "acknowledged":
                 reply_id = proof.reply_envelope_id
+                evidence = proof.evidence or {}
                 return {"state": "acknowledged", "ack_outcome": "delivered",
                         "native_id": sent.get("native_id"),
-                        "reply_envelope_id": reply_id, "reason": proof.reason}
+                        "original_native_message_id": sent.get("native_id"),
+                        "reply_envelope_id": reply_id, "reason": proof.reason,
+                        "proof_evidence": evidence}
             return {"state": "unknown", "ack_outcome": "uncertain",
                     "native_id": sent.get("native_id"),
+                    "original_native_message_id": sent.get("native_id"),
                     "reply_envelope_id": None, "reason": proof.reason}
         return {"state": sent.get("state", "recorded"), "ack_outcome": "uncertain",
                 "native_id": sent.get("native_id"),
+                "original_native_message_id": sent.get("native_id"),
                 "reply_envelope_id": None, "reason": sent.get("reason", "")}
     if op == "capture":
         limit = command.get("limit_bytes", 32 * 1024)
@@ -638,11 +687,14 @@ def _run_claimed_effect(
                                      limit_bytes=limit, mode=mode)
         return {"state": "captured", "ack_outcome": "delivered",
                 "native_id": None, "reply_envelope_id": None,
+                "capture_text": cap["text"], "capture_truncated": cap["truncated"],
                 "reason": "bounded private projection; privacy unknown, truncated=%s"
                           % cap["truncated"]}
     stopped = stop_controlled_session(executable, target, custody=custody)
-    return {"state": stopped["state"], "ack_outcome": "delivered",
-            "native_id": None, "reply_envelope_id": None, "reason": stopped["reason"]}
+    confirmed = stopped["state"] == "stopped"
+    return {"state": stopped["state"], "ack_outcome": "delivered" if confirmed else "uncertain",
+            "native_id": None, "reply_envelope_id": None, "reason": stopped["reason"],
+            "confirmed_exit": confirmed}
 
 
 def handle_session_command(

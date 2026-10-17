@@ -156,6 +156,15 @@ def add_commands(sub):
     show.add_argument('id')
     history = commands.add_parser('commands', help='List durable commands with recorded/transported/acked states')
     history.add_argument('id')
+    receive = commands.add_parser('host-receive', help='Bounded host receiver: poll offers, claim, execute, ack (no daemon; Fleet-owned start rejected)')
+    receive.add_argument('--once', action='store_true', required=True,
+                         help='Run exactly one bounded poll cycle and exit')
+    receive.add_argument('--machine-id', required=True, help='Enrolled host machine label (must match host credential)')
+    receive.add_argument('--actor', help='Canonical bus actor for local custody journal (default machine:<machine-id>)')
+    receive.add_argument('--credential-family', help='Local custody family label (default host:<machine-id>; server enforces the real family)')
+    receive.add_argument('--journal-dir', help='Absolute journal directory (default .local/session/host-receiver under repo cwd)')
+    receive.add_argument('--aplexer-bin', default='aplexer', help='Native executable (default aplexer)')
+    receive.add_argument('--limit', type=int, default=20, help='Max offers per cycle (1..20)')
 
 
 def execute(args):
@@ -217,4 +226,25 @@ def execute(args):
             else:
                 queued['command_wait'] = wait_for_command(args.id, queued['command_id'], timeout, interval)
         return queued
+    if cmd == 'host-receive':
+        if not getattr(args, 'once', False):
+            raise ValueError('host-receive runs one bounded cycle only; pass --once')
+        machine_id = getattr(args, 'machine_id', None)
+        if not isinstance(machine_id, str) or not machine_id:
+            raise ValueError('--machine-id is required')
+        limit = int(getattr(args, 'limit', 20) or 20)
+        if not 1 <= limit <= 20:
+            raise ValueError('--limit must be 1..20')
+        actor = getattr(args, 'actor', None) or ('machine:' + machine_id)
+        family = getattr(args, 'credential_family', None) or ('host-' + machine_id)
+        journal_dir = getattr(args, 'journal_dir', None)
+        if not journal_dir:
+            journal_dir = os.path.join(os.getcwd(), '.local', 'session', 'host-receiver')
+        from .session_executor import CallerCustody
+        from .session_receiver import receive_once
+        custody = CallerCustody(actor=actor, machine_id=machine_id,
+                                credential_family=family).validated()
+        return receive_once(custody=custody, journal_dir=journal_dir,
+                            executable=getattr(args, 'aplexer_bin', 'aplexer') or 'aplexer',
+                            request=request, limit=limit)
     raise ValueError('Unknown sessions command')
