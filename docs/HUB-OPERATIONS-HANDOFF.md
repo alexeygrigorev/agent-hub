@@ -35,8 +35,9 @@ credential, service, timer, or native-probe changes without that gate.
 - Confirm custom hostnames resolve (or record unresolved with errno only).
 - Confirm existing `workers.dev` fallback resolves via DNS; then ONE plain
   unauthenticated HTTPS GET to a public auth-gated endpoint (e.g.
-  `/api/liveness`) expecting `401`. Status code only — proves the Worker
-  serves without exposing credentials.
+  `/api/liveness`) expecting `401`. Status code alone proves the endpoint responded; it does
+  not identify the serving app, its revision, or authenticated capability.
+  Attribute app behavior only with matching response/source evidence.
 - Authenticated revision/environment/capability reads (token verify, account
   capability) only in memory, only against the verified target account/Worker,
   never with token in cmdline/stdout/history; reject redirects to foreign
@@ -64,9 +65,10 @@ credential, service, timer, or native-probe changes without that gate.
 
 ## 6. Activation gating
 
-- Head must ACK an EXACT reviewable step after independent accepted source,
-  custody, budget, and qualification proofs (e.g. "guarded vitest hub-ops 2
-  cases on pinned SHA + workers.dev GET reachability").
+- Runtime activation needs an EXACT head-ACKed step after independent source
+  acceptance, custody, budget and qualification proofs. Read-only diagnosis and
+  bounded source-review tests proceed within their already declared authority;
+  they do not require source acceptance before they can establish it.
 - User handoff authorizes continuing work; do not re-ask for generic
   confirmation. Send candidate action + evidence while continuing independent
   readonly work.
@@ -99,11 +101,14 @@ credential, service, timer, or native-probe changes without that gate.
   deployment/version IDs + created_on + GitSHA-or-UNKNOWN (never guess a
   commit from main), zone read counts + statuses, inventory counts + labels
   (hash workspaces/paths), service ActiveState/SubState/Result strings.
-- Interpret with the source, not guesses: unauthenticated 401 proves serving;
-  403 with a token means non-admin/unscoped for that route (check the route's
-  auth gate in source); token-verify failure alongside working scoped reads
-  is a scope quirk, not proof of invalidity; zone/domain READ success never
-  proves write/deploy/DNS permission. OAuth/token refresh, login flows, and
+- Interpret with the source and observed response shape. Unauthenticated 401
+  establishes an endpoint response; unexpected empty/non-JSON 403 cannot by
+  itself establish an app scope denial or invalid credential. Match app error
+  codes/content before attributing it; keep perimeter failures as unknown. A
+  token-verify failure alongside successful scoped reads does not prove
+  revocation; verify token kind and endpoint requirements separately. A zero
+  zone result is limited to the queried account and token visibility. Successful
+  zone/domain/Worker READs never prove write/deploy/DNS permission. OAuth/token refresh, login flows, and
   sign-in endpoints are credential operations — never run them under a
   readonly grant; record as blocked-with-proof + minimal next action instead.
 - Absence is evidence: unresolved DNS (with errno), zero zone results,
