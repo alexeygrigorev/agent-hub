@@ -137,15 +137,15 @@ class FleetTests(unittest.TestCase):
             def runner(argv, **kw):
                 calls.append(argv)
                 if argv[0] == 'maintained-gate': return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
-                if 'plan' in argv: return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol', 'account_label': 'shared-codex', 'profile': None}]}
+                if 'plan' in argv: return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol', 'task_fit': 1.0, 'account_label': 'shared-codex', 'profile': None}]}
                 if 'run' in argv: return {'receipt': {'unit_name': 'headless-unit', 'exit_code': 0}}
                 return {}
             d = fleet.Dispatcher(cfg, lambda *a: requests.append(a) or {}, runner)
             result = d.dispatch(offer(mode='headless', prompt='Goal with $(literal shell text)'))
             self.assertEqual(result['state'], 'exited'); self.assertEqual(result['native_id'], 'headless-unit')
             self.assertIn('--backend', calls[-1]); self.assertIn('task-units', calls[-1]); self.assertNotIn('aplexer', calls[-1])
-            def old_plan(argv, **kw): return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol'}]} if 'plan' in argv else runner(argv, **kw)
-            d.runner = old_plan; requests.clear()
+            def wrong_model_plan(argv, **kw): return {'eligible': [{'provider': 'codex', 'model': 'some-other-model', 'task_fit': 1.0}]} if 'plan' in argv else runner(argv, **kw)
+            d.runner = wrong_model_plan; requests.clear()
             with self.assertRaises(ValueError): d.dispatch(offer(mode='headless', prompt='Goal'))
             self.assertFalse(requests)
 
@@ -203,7 +203,7 @@ class FleetTests(unittest.TestCase):
             return {}
         with patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {}, 'hostname': 'test', 'os': 'test', 'network': 'home', 'roles': []}), patch('agent_hub_host.api.get_heartbeat_payload', return_value={'type': 'heartbeat'}):
             self.assertEqual(fleet.Dispatcher(cfg, request, runner).once(), [])
-        self.assertEqual([c[1] for c in calls], ['/api/machines/register', '/api/host/poll', '/api/fleet/subscriptions', '/api/fleet/sessions', '/api/fleet/offers'])
+        self.assertEqual([c[1] for c in calls], ['/api/machines/register', '/api/host/poll', '/api/fleet/subscriptions', '/api/fleet/sessions', '/api/sessions/host-bindings', '/api/fleet/offers'])
         self.assertTrue(calls[1][2]['gate']['launch_allowed'])
         self.assertEqual(calls[0][2]['capabilities']['workspaces'], ['demo'])
 

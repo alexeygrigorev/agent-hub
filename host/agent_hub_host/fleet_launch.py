@@ -18,16 +18,17 @@ OPENCODE_ARGV_PREFIX = [OPENCODE_BIN, "run", "--pure", "--auto",
 
 
 def opencode_subscription(account_label, *, engine="opencode", profile=None,
-                          admission_argv, launcher_argv, launcher_root,
-                          launcher_config_dir):
+                          admission_argv):
     """Build the exact Hub fleet subscription dict for a Muse brief.
 
-    admission_argv is the maintained fresh gate; launcher_* is the maintained
-    launcher CLI (argv prefix, checkout root, config dir). Model is pinned;
-    callers cannot substitute a paid/free alternative.
+    admission_argv is the maintained fresh gate. Model is pinned; callers
+    cannot substitute a paid/free alternative. The maintained launcher CLI
+    lives in TOP-LEVEL settings (see opencode_launcher_config /
+    opencode_settings): a nested ``launcher`` key inside a subscription is
+    rejected by fleet.load_settings, so it must never be built here.
     """
-    if not account_label or not admission_argv or not launcher_argv:
-        raise ValueError("account_label, admission_argv and launcher_argv are required")
+    if not account_label or not admission_argv:
+        raise ValueError("account_label and admission_argv are required")
     return {
         "service": "go",
         "account_label": account_label,
@@ -36,8 +37,44 @@ def opencode_subscription(account_label, *, engine="opencode", profile=None,
         "admission_argv": list(admission_argv),
         "launcher_provider": OPENCODE_PROVIDER,
         "launcher_model": OPENCODE_MODEL,
-        "launcher": {"argv": list(launcher_argv), "root": launcher_root,
-                     "config_dir": launcher_config_dir},
+    }
+
+
+def opencode_launcher_config(launcher_argv, launcher_root,
+                             launcher_config_dir):
+    """Build the exact TOP-LEVEL launcher config for a Muse brief.
+
+    The maintained launcher CLI (argv prefix, checkout root, config dir) is
+    operator configuration on settings, not per-subscription metadata; the
+    Fleet dispatcher reads settings["launcher"] for headless runs.
+    """
+    if not launcher_argv or not launcher_root or not launcher_config_dir:
+        raise ValueError("launcher_argv, launcher_root and launcher_config_dir are required")
+    return {"argv": list(launcher_argv), "root": launcher_root,
+            "config_dir": launcher_config_dir}
+
+
+def opencode_settings(workspace_label, workspace_path, account_label, *,
+                      engine="opencode", profile=None, admission_argv,
+                      launcher_argv, launcher_root, launcher_config_dir):
+    """Compose full Fleet settings for a Muse brief (passes load_settings).
+
+    Explicit honest local account mapping: Hub ``account_label`` is bound to
+    the maintained launcher's ``opencode`` provider/pinned model plus the
+    local admission gate. The maintained plan never carries Hub accounts
+    (verified live); account/profile matching happens in Fleet _route plus
+    the fresh gate, never by inventing plan evidence.
+    """
+    if not workspace_label or not workspace_path:
+        raise ValueError("workspace_label and workspace_path are required")
+    return {
+        "version": 1,
+        "workspaces": {workspace_label: str(workspace_path)},
+        "subscriptions": [opencode_subscription(
+            account_label, engine=engine, profile=profile,
+            admission_argv=admission_argv)],
+        "launcher": opencode_launcher_config(
+            launcher_argv, launcher_root, launcher_config_dir),
     }
 
 

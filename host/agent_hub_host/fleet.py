@@ -285,6 +285,55 @@ def session_metadata(raw, settings):
     return clean
 
 
+def binding_match_tags(fleet_launch_id):
+    """Exact native tags a Fleet-owned start may carry.
+
+    Interactive starts use ``hub-<id>`` (the exact Dispatcher argv tag).
+    Maintained-launcher aplexer-backend starts use ``task-hub-<id>``: the
+    launcher tags task ``hub-<id>`` through run_tag_for, which prefixes the
+    ``task-`` namespace. Both are canonical expected tags, never guesses.
+    """
+    return ("hub-" + fleet_launch_id, "task-hub-" + fleet_launch_id)
+
+
+def find_binding_row(rows, entry):
+    """Match one pending host-binding entry to its observed native row.
+
+    Binds the exact canonical server launch native_id to the actual native
+    row (UUID + engine + workspace + creation), never tag-only: when the
+    pending entry carries a canonical ``native_id`` (server seam), the row
+    id must equal it exactly; otherwise exactly one row must carry an
+    expected tag with a matching engine. Rows without a workspace or
+    without integer native creation evidence are never bound (the server
+    refuses them, and a UUID without incarnation proves nothing). Returns
+    the row dict or None when there is no exact single match.
+    """
+    if not isinstance(rows, list) or not isinstance(entry, dict):
+        return None
+    launch_id = entry.get("fleet_launch_id")
+    if not isinstance(launch_id, str) or not launch_id:
+        return None
+    expected = set(binding_match_tags(launch_id))
+    engine = entry.get("engine")
+    candidates = [r for r in rows if isinstance(r, dict) and r.get("tag") in expected and r.get("engine") == engine]
+    known = entry.get("native_id")
+    if isinstance(known, str) and known:
+        exact = [r for r in candidates if isinstance(r.get("id"), str) and r["id"].lower() == known.lower()]
+        if len(exact) != 1:
+            return None
+        candidates = exact
+    elif len(candidates) != 1:
+        return None
+    row = candidates[0]
+    if not isinstance(row.get("id"), str) or not row["id"]:
+        return None
+    if not isinstance(row.get("workspace"), str) or not row["workspace"]:
+        return None
+    if type(row.get("created_at_ms")) is not int or row["created_at_ms"] <= 0:
+        return None
+    return row
+
+
 class Dispatcher:
     """One finite poll. Claim ambiguity and effect ambiguity are never retried automatically."""
     def __init__(self, settings, request=bus._do_request, runner=run_json):
@@ -385,7 +434,27 @@ class Dispatcher:
             self.runner(prefix + ["submit", "--id", task_id, "--key", task_id, "--payload", json.dumps(payload)], cwd=launcher["root"])
             plan = self.runner(prefix + ["plan", "--id", task_id], cwd=launcher["root"])
             eligible = plan.get("eligible", [])
-            if not isinstance(eligible, list) or not eligible or any(r.get("provider") != sub["launcher_provider"] or r.get("model") != sub["launcher_model"] or r.get("account_label") != sub["account_label"] or r.get("profile") != sub.get("profile") for r in eligible):
+            # Real maintained-plan contract (verified live against the
+            # maintained CLI dry-run): entries carry provider/model/task_fit
+            # plus ranking metadata, never Hub account_label/profile. Account
+            # and profile stay bound by the exact local subscription match in
+            # _route plus the fresh admission-gate account_label below; the
+            # plan proves the maintained launcher would actually select this
+            # provider/model (known task_fit 1.0, never fabricated). Entries
+            # that do carry account_label/profile must match when present.
+            def _plan_match(r):
+                if not isinstance(r, dict):
+                    return False
+                if r.get("provider") != sub["launcher_provider"] or r.get("model") != sub["launcher_model"]:
+                    return False
+                if r.get("task_fit") != 1.0:
+                    return False
+                if "account_label" in r and r.get("account_label") != sub["account_label"]:
+                    return False
+                if "profile" in r and r.get("profile") != sub.get("profile"):
+                    return False
+                return True
+            if not isinstance(eligible, list) or not any(_plan_match(r) for r in eligible):
                 raise ValueError("Maintained launcher plan refused")
             # Smallest correct native route: opencode headless reuses the
             # maintained launcher aplexer backend (real native UUID +
@@ -415,7 +484,14 @@ class Dispatcher:
                 result = {"state": "running", "native_id": native_id}
             else:
                 details = receipt.get("receipt", {})
-                native_id = details.get("session_id") or details.get("unit_name") or details.get("worker_id")
+                if sub.get("launcher_provider") == "opencode":
+                    # Opencode binds real M12 sessions only: a genuine native
+                    # UUID is required; task-units unit_name/worker_id names
+                    # can never bind or control a session.
+                    session_id = details.get("session_id")
+                    native_id = session_id if isinstance(session_id, str) and session_id else None
+                else:
+                    native_id = details.get("session_id") or details.get("unit_name") or details.get("worker_id")
                 if type(details.get('exit_code')) is int:
                     result = {'state': 'exited' if details['exit_code'] == 0 else 'failed', 'confirmed_exit': True, 'native_id': native_id, 'launcher_task_id': task_id}
                 elif details.get('state') == 'running' and details.get('first_action_verified') is True:
@@ -486,11 +562,18 @@ class Dispatcher:
             pending = []
         rows = raw if isinstance(raw, list) else raw.get("sessions", [])
         for session in pending:
-            matches = [r for r in rows if r.get("tag") == "hub-" + session["fleet_launch_id"] and r.get("engine") == session.get("engine")]
-            if len(matches) != 1:
+            if not isinstance(session, dict):
                 continue
-            r = matches[0]
-            self.request("POST", "/api/sessions/" + session["id"] + "/binding", {"native": {"native_id": r["id"], "tag": r["tag"], "workspace": r["workspace"], "native_created_at_ms": r["created_at_ms"]}})
+            row = find_binding_row(rows, session)
+            if row is None:
+                continue
+            try:
+                self.request("POST", "/api/sessions/" + session["id"] + "/binding", {"native": {"native_id": row["id"], "tag": row["tag"], "workspace": row["workspace"], "native_created_at_ms": row["created_at_ms"]}})
+            except ValueError:
+                # A refused binding (e.g. server fleet_tag_mismatch for a
+                # launcher-backend tag before the server seam lands) must not
+                # kill the cycle; the entry stays pending for next cycle.
+                continue
         if 'capabilities' in self.settings:
             self.request('PUT', '/api/fleet/routing/capabilities', {'needs': self.settings['capabilities'], 'max_agents': self.settings.get('max_agents', 1), 'runners': [{'engine': s.get('engine', s['service']), 'profile': s.get('profile'), 'account': s['account_label'], 'model': s['launcher_model'], 'effort': s.get('launcher_effort')} for s in self.settings['subscriptions'] if s.get('launcher_model') and s.get('admission_argv')]})
         offers = self.request("GET", "/api/fleet/offers").get("offers", [])
