@@ -249,6 +249,20 @@ describe('M14a authorized one-call status projection', () => {
     expect(data.coverage.missing_hosts).toContain('host-old');
     expect(data.coverage.missing_hosts).not.toContain('win35');
     expect(data.coverage.expected_offline).toContain('win35');
+    expect(data.coverage.expected_offline_until).toBe('2026-10-31T15:23:00Z');
+    expect(typeof data.coverage.expected_offline_reason).toBe('string');
+  });
+
+  it('expires the win35 expected-offline window after 2026-10-31T15:23:00Z', async () => {
+    // Live-clock expiry is covered deterministically in test/status-window.test.ts
+    // (pure status_offline unit tests, plain Node): after the window a stale
+    // win35 must classify as an ordinary missing host, never expected forever.
+    const { isExpectedOffline, expectedOfflineWindowActive, EXPECTED_OFFLINE_UNTIL_MS } =
+      await import('../src/status_offline');
+    expect(expectedOfflineWindowActive(EXPECTED_OFFLINE_UNTIL_MS)).toBe(true);
+    expect(isExpectedOffline('win35', 'DESKTOP-FP4OP26', EXPECTED_OFFLINE_UNTIL_MS)).toBe(true);
+    expect(expectedOfflineWindowActive(EXPECTED_OFFLINE_UNTIL_MS + 1)).toBe(false);
+    expect(isExpectedOffline('win35', 'DESKTOP-FP4OP26', EXPECTED_OFFLINE_UNTIL_MS + 1)).toBe(false);
   });
 
   it('performs no writes and never exports secrets or private bodies', async () => {

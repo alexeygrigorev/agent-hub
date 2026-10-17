@@ -37,7 +37,11 @@ all linked rows, other callers see only rows whose `actor` equals their own
 id); dangling ids render `unknown_session`. A missing or stale host yields
 `partial` coverage with `missing_hosts`, never empty or healthy. `win35`
 (`DESKTOP-FP4OP26`, intentionally off ~2 weeks from 2026-10-17) is reported
-under `coverage.expected_offline`, never as an outage.
+under `coverage.expected_offline` only while the window is active
+(`coverage.expected_offline_until: 2026-10-31T15:23:00Z` with
+`coverage.expected_offline_reason`); after expiry a stale win35 returns to
+`missing_hosts` like any other host, never as an outage and never expected
+forever.
 
 ## Freshness
 
