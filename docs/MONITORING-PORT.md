@@ -17,20 +17,20 @@ Following Alexey's Addendum 6b instructions, the goal is to port all useful sign
 
 ---
 
-## 2. Explicit Duplicates and Superseded Checks
+## 2. Migration decisions and retained checks
 
-The following components and checks from `cloudflare-agent-git` are **explicitly superseded** and must **NOT** be ported into Agent Hub:
+Do not add duplicate supervisors. Retain existing monitors until the Hub observes the same targets and an actual replacement/handoff is verified. A proposed architecture does not establish supersession.
 
-| Legacy Component / Check | Source File | Reason for Superseding / Non-Port | Replacement in Agent Hub |
+| Legacy component | Source | Current decision | Hub seam or remaining work |
 | :--- | :--- | :--- | :--- |
-| **Cross-Model Review Gate** | `scripts/guards/review_gate.py` | **Explicitly cancelled by Alexey (2026-10-17)**: review gates and paperwork freezes removed to prioritize shipping tested code directly to `main`. | Small, focused commits straight to `main` with `[skip ci]`. |
-| **Autonomous Supervision Daemon** | `scripts/supervision/service.py`, `launch_supervision.sh` | Running a heavy standalone Python supervisor daemon in an aplexer session is brittle and caused cascading unresponsiveness. | Hub DO `Checks` (`src/checks.ts`) + host `session_host.py` bounded single-inflight observer threads. |
-| **Supervisor Watchdog Timers** | `supervision-watcher-1.timer`, `supervision_watcher.sh` | Brittle dual-systemd-timer arrangement polling `status.json` age. | Hub host heartbeat loop (`agent-hub-fleet-host.timer` or `session_host.py`). |
-| **Desktop Mailbox Watchdog** | `desktop-orchestrator-watchdog.sh`, `.timer` | Partial; legacy retained | Hub message bus (`/api/messages`) and native session host (`session_host.py`). | `session_host.py` supervises its own Hub controller, not the desktop orchestrator mailbox. No replacement watchdog or retirement proof. 
-| **Standalone Principal Ping** | `scripts/ping/principal-ping.py`, `.timer` | 10-minute ping loop attempting ad-hoc recovery outside central coordination. | Hub health model (§9) + scheduled principal-wake jobs. |
-| **FileBus Pre-Commit Claims** | `scripts/checks/claims.sh`, `scripts/guards/claims_check.py` | Local filesystem bus lock files blocking git commits. | Hub `leases` table with epoch fencing tokens; claims are runtime leases, never git commit blockers. |
-| **Machine Status Git Linter** | `scripts/checks/machine-status.sh` | Grepped markdown documentation to prohibit mentioning machine availability. | Replaced by live Hub `machines` registry and runtime heartbeat status. |
-| **Strict Commit Message Linter** | `scripts/checks/commit-message.sh` | Required rigid `type(scope): subject` syntax, rejecting standard git workflows. | Standard concise commit messages without gate failure. |
+| Cross-model review gate | `scripts/guards/review_gate.py` | Alexey removed this shipping gate on17October. | Focused tested main commits; no new review freeze. |
+| Autonomous supervision daemon | `scripts/supervision/service.py` | Retain current service during migration; do not launch a duplicate. | Hub checks and host observers cover some signals; full outcome/recovery coverage remains incomplete. |
+| Supervisor watchdog timers | `supervision-watcher-1.timer`, `supervision_watcher.sh` | Retain; target-specific replacement is unproved. | Hub controller heartbeat monitors its controller, not the legacy supervisor status file. |
+| Desktop mailbox watchdog | `desktop-orchestrator-watchdog.sh`, `.timer` | Retain; no equivalent live target observation is proved. | Add read-only observation before proposing a retirement/handoff. |
+| Standalone principal ping | `scripts/ping/principal-ping.py`, `.timer` | Retain; M8b principal-wake is under implementation. | Source leases and cron do not prove actual consecutive-miss recovery. |
+| FileBus pre-commit claims | `scripts/checks/claims.sh`, `scripts/guards/claims_check.py` | Do not recreate obsolete commit blockers. | Retain development edit scopes and separate Hub runtime lease fencing. |
+| Machine-status Git linter | `scripts/checks/machine-status.sh` | No runtime monitoring value; do not port the markdown gate. | Use actual enrolled-host observations and explicit expected-offline state. |
+| Strict commit-message linter | `scripts/checks/commit-message.sh` | Do not port a shipping gate. | Concise main commits under current Alexey instructions. |
 
 ---
 
