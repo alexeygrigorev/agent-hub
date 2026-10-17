@@ -6,7 +6,7 @@ Task `0414` / `platform-conv-int-0414`. Private inert proposal only. Hub source 
 
 Author session: `51db3a5a-ab14-4bbc-9be2-183be9d23eda` (`platform-conversation-integration`, engine grok). Verified `aplexer whoami` workspace `/home/alexey/git/agent-hub-wt-platform-conversation-integration`. Tracked HEAD parent `5dcdf7164b28bd0e3a1d717ac9090c054eca3f24`.
 
-Portable patch: [CONVERSATION-INTEGRATION.patch](CONVERSATION-INTEGRATION.patch), SHA-256 `4a6631a2af63fdee0ef289752dd3aee3a7e71fa116d64e03a0e65135dbc48e6d`. `git apply --check` on a fresh main archive succeeds. 76 paths (61 new, 0 deleted). Tracked `src/` `host/` `public/` `test/` `config/` in this worktree remain byte-identical to main.
+Portable patch: [CONVERSATION-INTEGRATION.patch](CONVERSATION-INTEGRATION.patch), SHA-256 `eb6706c1e4c5a5ed5cfc25c55481846f1e785da35af825994ea125103106256d`. `git apply --check` on a fresh main archive succeeds. 76 paths (61 new, 0 deleted). Tracked `src/` `host/` `public/` `test/` `config/` in this worktree remain byte-identical to main. Product `public/conversations.js` SHA-256 `208275feacfce835a27f275c4af00b6da5c8d95797f4d4cd2265421b532c97e1` matches transport `d9b4`.
 
 ## Pin status (do not treat passing tests as acceptance)
 
@@ -79,8 +79,8 @@ for path in src/conversation-hub.ts docs/CONVERSATIONS.md test/m3-http.test.ts t
   git show "$api:$path" > "$scratch/$path"
 done
 # Harness hunks in this patch: public device issuance (no SQL-seeded agent token);
-# native qualify bound to the reconstructing session; mock UI does not leak a held
-# POST into a later GET after the fixture account switches.
+# native qualify bound to the reconstructing session; mock UI waits for Ada
+# thread load before releasing a held POST (same store through the switch).
 deps=$(realpath "$(git rev-parse --git-common-dir)/../node_modules")
 ln -s "$deps" "$scratch/node_modules"
 cd "$scratch"
@@ -104,7 +104,7 @@ Transport `d9b4` is main plus 49 conversation files (42 reviewed UI/CLI/API/daki
 
 4. **Pairing vs F7.** R2 patch `3b9d5a95` applies cleanly after F7. Output hashes match the eee4 manifest (`src/hub.ts` `51a488ab…`). Pairing remains provisional until `platform-pairing-r2-review` verdict.
 
-5. **Harness.** `test/conversation-platform-worker.ts` seeds a human admin and enrolled machine; it never inserts an agent credential. `test/conversation-platform.mjs` issues the agent token through public `/api/device/code` + admin CSRF approve with `machine_id` + `/api/device/token`. Native identity is this session. Frozen 17424 journals still land at `workspace/.local/conversation-bridge-*.json` (see journal scope). `test/conversations-ui.browser.mjs` keeps every original isolation assertion. The mock POST, after a held send completes, omits the shared `messageStore` append when `state.actor` no longer matches the request actor, while still returning 201 so the client must drop the stale success. That is a fixture isolation repair, not a weakened product assertion.
+5. **Harness.** `test/conversation-platform-worker.ts` seeds a human admin and enrolled machine; it never inserts an agent credential. `test/conversation-platform.mjs` issues the agent token through public `/api/device/code` + admin CSRF approve with `machine_id` + `/api/device/token`. Native identity is this session. Frozen 17424 journals still land at `workspace/.local/conversation-bridge-*.json` (see journal scope). `test/conversations-ui.browser.mjs` keeps every original isolation assertion. The mock `messageStore` is reset between tests and is the same store through the within-case account switch, including the held POST commit. The only added wait is Ada's `.msg__body` after chrome and before `hold.release()`, so her initial history GET cannot fulfill after that commit. Product `conversations.js` is unchanged.
 
 No F7 migration/credential/namespace/M6 fix was dropped. No original assertion was weakened to combine.
 
@@ -117,7 +117,7 @@ CPU 0, `UV_THREADPOOL_SIZE=1`, `NODE_OPTIONS=--v8-pool-size=1`, `GOMAXPROCS=1`, 
 | Typecheck on ACCEPTED API `8dc` + pairing `eee4` combination | PASS |
 | Pairing/F7/claim/conversations domain on that tree | 117/117 (4 files; expected M6 retirement SQLITE_CONSTRAINT_TRIGGER noise) |
 | `test/conversation-retention.test.ts` + `test/m3-http.test.ts` | 29/29 |
-| Mock-API UI desktop/narrow/theme, original assertions | **Reproduced 28/29** on the unmodified transport mock: `old-user in-flight send success cannot attach or replay after account switch` (`#conv-detail` contained `Grace held send`, `sendLog.length===1`, outbox null, Ada chrome, bodies=3). Isolated rerun of only the two in-flight tests **passed**. After Ada chrome and before gate release the mock store still had 2 rows; after release it had 3 while the client 201 was dropped (`checkCurrent` / abort). Full-suite failure is Ada's later history GET observing the shared-store commit. **Harness-only mock repair** (no store append after actor switch; 201 still returned): **29/29** on the `8dc`+`eee4` tree. Stale-response and current-account isolation assertions retained. |
+| Mock-API UI desktop/narrow/theme, original assertions | **Old-order unmodified mock: 28/29 twice** (`#conv-detail` included `Grace held send`; `sendLog.length===1`; outbox null; Ada chrome; bodies=3). Isolated two in-flight tests on that same unmodified mock: **2/2**; diagnostic showed store 2→3 at release and DOM staying 2 (client 201 dropped). Full-suite fail is Ada's in-flight history GET fulfilling after the held POST commit (same store, slower after 15 prior tests). `resetFixtures` already replaces `messageStore` between tests. **Narrow hunk:** wait for Ada `.msg__body` before `hold.release()`; store still commits; assertions unchanged; product bytes unchanged. **Then 29/29.** |
 | Prior Worker/browser/CLI/public-token characterizing | PASS on `7c004`+`1149` combination (7 checks). Not re-run after `8dc`/`eee4`; native cycles paused. |
 | Genuine own native `cint-local-r2` | PASS on `7c004`+`1149`; journals preserved as known settled effects; further native cycles paused. |
 
@@ -138,7 +138,7 @@ SHA-256 of the private tree after reconstruction.
 | `host/agent_hub_host/conversation_bridge.py` | `7e7ebaec3148b4cb5522bdead67e171f9adbcbb8e6c0d94085813c80ee313a4e` | P3 |
 | `test/conversation-platform.mjs` | `c53cab3e19e2c7f86c72587fdb9a3d5cb80f668bd117fb7adfeb6ef450ecad33` | harness hunk |
 | `test/conversation-platform-worker.ts` | `b063ff38ed83d26445f24d34ff6ff559df77b48b4e1d35ac64109f01fb3bad5b` | harness hunk |
-| `test/conversations-ui.browser.mjs` | `8216fbde64535ede40523f50153455a68756feb26b477b09f9471104d8f40117` | harness hunk (shared-store isolation) |
+| `test/conversations-ui.browser.mjs` | `447252dec697e9ede91e43b85357f9c49072cc9528f6125f1d43543718ec53b6` | harness hunk (wait Ada thread before late 201) |
 
 ## Remaining gates
 

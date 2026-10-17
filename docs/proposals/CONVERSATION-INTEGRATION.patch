@@ -22118,10 +22118,10 @@ index 0000000..bfa1e81
 +
 diff --git a/test/conversations-ui.browser.mjs b/test/conversations-ui.browser.mjs
 new file mode 100644
-index 0000000..1ae18ac
+index 0000000..f20b0d6
 --- /dev/null
 +++ b/test/conversations-ui.browser.mjs
-@@ -0,0 +1,1021 @@
+@@ -0,0 +1,1020 @@
 +/* Browser behaviour tests for the conversations UI, using the existing
 +   Playwright installation (no package installs). Runs standalone:
 +      node test/conversations-ui.browser.mjs
@@ -22385,12 +22385,7 @@ index 0000000..1ae18ac
 +      if (state.failNextSends > 0) { state.failNextSends--; return json(route, 500, { error: 'simulated_failure' }); }
 +      const replay = state.idempotent[conversationId] && state.idempotent[conversationId][payload.idempotency_key];
 +      const created = replay || message('m-new-' + state.nextMessageSeq[conversationId], conversationId, state.nextMessageSeq[conversationId], requestActor, 'human', payload.body);
-+      // A held POST can complete after the fixture has switched accounts. The
-+      // original request still receives this 201 so the client must drop it.
-+      // The new actor's history GET must not observe the mutation through the
-+      // shared mock store (suite-coupled race: Ada GET fulfills after release).
-+      const actorSwitched = state.actor !== requestActor;
-+      if (!replay && !actorSwitched) {
++      if (!replay) {
 +        state.nextMessageSeq[conversationId] = (state.nextMessageSeq[conversationId] || 1) + 1;
 +        state.idempotent[conversationId] = state.idempotent[conversationId] || {};
 +        state.idempotent[conversationId][payload.idempotency_key] = created;
@@ -22821,6 +22816,10 @@ index 0000000..1ae18ac
 +      if (outcome === 'success') {
 +        await page.evaluate(() => window.dispatchEvent(new Event('focus')));
 +        await page.waitForFunction(() => document.getElementById('account-name').textContent === 'Ada Lovelace');
++        // Same mock store continues through the account switch. Ada's initial
++        // history GET must finish before the held Grace POST commits, or a
++        // later fulfill of that GET observes the 201 via shared history.
++        await page.waitForSelector('.msg__body');
 +      } else state.csrfFailures = 1;
 +      hold.release(); state.sendGate = null;
 +      await page.waitForFunction(() => document.getElementById('account-name').textContent === 'Ada Lovelace');
