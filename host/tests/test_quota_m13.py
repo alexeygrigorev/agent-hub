@@ -77,6 +77,22 @@ class CollectorNativeTests(unittest.TestCase):
         self.assertNotIn('secret', dumped)
         self.assertNotIn('someone@example.com', dumped)
 
+    def test_cooldown_deadline_passes_through_validated(self):
+        now = utcnow()
+        raw = {'codex': {'status': 'ok', 'error': None,
+                         'observed_at': quota_snapshot.format_iso_utc(now),
+                         'details': {'limit_reached': False,
+                                     'cooldown_until': '2026-10-17T13:00:00Z'},
+                         'windows': {'7d': {'percent_remaining': 80.0,
+                                            'reset_at': '2026-10-20T00:00:00Z',
+                                            'present': True, 'rolling': False}}}}
+        snap = quota_snapshot.create_quota_snapshot(raw, 'mach1', now)
+        self.assertEqual(snap['routes']['codex']['details']['cooldown_until'],
+                         '2026-10-17T13:00:00Z')
+        raw['codex']['details']['cooldown_until'] = 'soon'
+        snap = quota_snapshot.create_quota_snapshot(raw, 'mach1', now)
+        self.assertIsNone(snap['routes']['codex']['details']['cooldown_until'])
+
     def test_absent_window_carries_no_natives(self):
         now = utcnow()
         raw = {'codex': {'status': 'ok', 'error': None,

@@ -459,6 +459,12 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
       body: JSON.stringify({ gate_allowed: true, observed_at: isoNow(), account: 'm13-claim', profile_supported: true }),
     }));
     expect(claimRes2.status).toBe(200);
+    // Finish the launch so later registry writes are not held by an active launch.
+    const doneRes = await doFetch(new Request(`http://example.com/api/fleet/launches/${launch.id}/result`, {
+      method: 'POST', headers: authSub,
+      body: JSON.stringify({ state: 'exited', confirmed_exit: true }),
+    }));
+    expect(doneRes.status).toBe(200);
   });
 
   it('cooldown hold blocks plan and claim even with healthy percent; retention, update and expiry behave', async () => {
@@ -549,6 +555,8 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
   });
 
   it('stored quota DTOs carry no secret material', async () => {
+    const host = await pairHost('m13-privacy-host', 'm13privacy.local', sessionCookie, csrfToken);
+    expect((await quotaPost(host.accessToken, snap11(host.machineId, isoNow(-1000)))).status).toBe(200);
     const stub = (defaultEnv as any).HUB.get((defaultEnv as any).HUB.idFromName('hub'));
     await runInDurableObject(stub, async (instance: Hub) => {
       const blobs: string[] = [];
