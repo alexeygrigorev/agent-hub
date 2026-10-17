@@ -144,6 +144,8 @@ def main():
     session_control.add_commands(sub)
     from . import quota as quota_cmd
     quota_cmd.add_commands(sub)
+    from . import metrics as metrics_cmd
+    metrics_cmd.add_commands(sub)
     add_bridge_resume_command(sub)
 
     for command in ('start-agent', 'start-session', 'plan-agent'):
@@ -385,6 +387,17 @@ def main():
                 print(quota_cmd.render_text(data))
         except Exception:
             print('Hub quota operation failed; check authentication, filters and quota grants.', file=sys.stderr)
+            sys.exit(1)
+    elif args.cmd == "metrics":
+        from . import metrics as metrics_mod
+        try:
+            data = metrics_mod.execute(args)
+            if getattr(args, "metrics_cmd", None) != "get" and not getattr(args, "dry_run", False):
+                print(json.dumps(data, indent=2, sort_keys=True))
+        except SystemExit:
+            raise
+        except Exception:
+            print('Metrics operation failed; check authentication and report files. Retry post with the same key and payload after uncertain results.', file=sys.stderr)
             sys.exit(1)
     elif args.cmd == "bridge":
         cmd_bridge(args)

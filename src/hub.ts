@@ -21,6 +21,7 @@ import { ensureRootScheduling, getRootScheduling, isRootSchedulingEnabled, setRo
 import { QuotaStore, handleQuotaRoutes } from './quota';
 import { SessionControlService } from './session_control';
 import { StatusService, type StatusMachineAuth } from './status';
+import { MetricsStore, handleMetricsRoutes } from './metrics';
 
 function parseEpoch(raw: any): number | null {
   if (raw === undefined || raw === null || raw === '' || typeof raw === 'boolean') return null;
@@ -83,6 +84,7 @@ export class Hub extends DurableObject {
   public jobsService: JobsService;
   public quotaStore: QuotaStore;
   public statusService: StatusService;
+  public metricsStore: MetricsStore;
   public fleetService: FleetService;
   public sessionControlService: SessionControlService;
   public livenessService: LivenessService;
@@ -131,6 +133,16 @@ export class Hub extends DurableObject {
     {
       const sessionControl: any = this.sessionControlService as any;
       this.statusService.setObservationGate(typeof sessionControl?.hostObservationAllowed === 'function'
+        ? (machineId: unknown, caller: any) => sessionControl.hostObservationAllowed(machineId, caller)
+        : undefined);
+    }
+    // M9 metrics (narrow METRICS seam, owned by platform-metrics-live):
+    // additive MetricsStore.init DDL only; auth via existing host scopes +
+    // injected live hostObservationAllowed gate inside fresh mutation txn.
+    this.metricsStore = new MetricsStore(this.sql, this.ctx, this.env);
+    {
+      const sessionControl: any = this.sessionControlService as any;
+      this.metricsStore.setObservationGate(typeof sessionControl?.hostObservationAllowed === 'function'
         ? (machineId: unknown, caller: any) => sessionControl.hostObservationAllowed(machineId, caller)
         : undefined);
     }
@@ -504,6 +516,11 @@ export class Hub extends DurableObject {
         this.authenticateBusRequest(req)
       );
       if (quotaResponse) return quotaResponse;
+      // M9 metrics (narrow METRICS seam only): route/service/auth injection.
+      if (path === '/api/metrics') {
+        const metricsResponse = await handleMetricsRoutes(request, path, this.metricsStore, url);
+        if (metricsResponse) return metricsResponse;
+      }
       if (path === '/api/healthz') {
         const auth = await this.authenticateBusRequest(request);
         if (auth.error) return auth.error;
@@ -972,17 +989,42 @@ export class Hub extends DurableObject {
             `, newId, cred.kind, accessHash, newRefreshHash, cred.family_id, cred.subject, cred.machine_id, cred.actor, cred.scopes, cred.created_by_sub, now, cred.expires_at, cred.registry_actor ?? null, cred.approval_seq ?? null);
 
             // Host-enrollment continuity (from f20; M9 metrics-row migration
-            // omitted: those tables do not exist in this tree): atomically
-            // rotate the host machine binding only when it still belongs to
-            // the validated predecessor. Stale/foreign/rebound or
+            // guarded: those tables exist only after MetricsStore.init):
+            // atomically rotate the host machine binding only when it still
+            // belongs to the validated predecessor. Stale/foreign/rebound or
             // deleted/re-enrolled families must never overwrite a new
             // registration; a legitimate refresh keeps its binding so its
             // subsequent register calls still pass the owner CAS.
             if (cred.kind === 'host' && typeof cred.machine_id === 'string' && cred.machine_id) {
-              this.sql.exec(
+              const machineUpdate = this.sql.exec(
                 'UPDATE machines SET credential_id = ? WHERE id = ? AND credential_id = ?',
                 newId, cred.machine_id, cred.id
               );
+              // M9 metrics continuity: migrate rows bound to the validated
+              // predecessor only when the machine binding actually rotated.
+              // Stale/foreign/rebound refreshes mutate nothing.
+              if (machineUpdate.rowsWritten === 1) {
+                try {
+                  const hasLatest = this.sql.exec(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='host_metrics_latest'"
+                  ).toArray().length > 0;
+                  if (hasLatest) {
+                    this.sql.exec(
+                      'UPDATE host_metrics_latest SET credential_id = ? WHERE host_id = ? AND credential_id = ?',
+                      newId, cred.machine_id, cred.id
+                    );
+                  }
+                  const hasRetry = this.sql.exec(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='host_metrics_idempotency'"
+                  ).toArray().length > 0;
+                  if (hasRetry) {
+                    this.sql.exec(
+                      'UPDATE host_metrics_idempotency SET credential_id = ? WHERE host_id = ? AND credential_id = ?',
+                      newId, cred.machine_id, cred.id
+                    );
+                  }
+                } catch { /* metrics tables absent or migration contended: auth rotation already committed */ }
+              }
             }
 
             scopesResponse = JSON.parse(cred.scopes).join(' ');
