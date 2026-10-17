@@ -140,6 +140,8 @@ def main():
     conversations.add_commands(sub)
     from . import intake
     intake.add_commands(sub)
+    from . import quota as quota_cmd
+    quota_cmd.add_commands(sub)
     add_bridge_resume_command(sub)
 
     for command in ('start-agent', 'start-session', 'plan-agent'):
@@ -344,6 +346,17 @@ def main():
         cmd_status(args)
     elif args.cmd == "run":
         cmd_run(args)
+    elif args.cmd == "quota":
+        from . import quota as quota_cmd
+        try:
+            data = quota_cmd.execute(args)
+            if args.json:
+                print(json.dumps(data, indent=2))
+            else:
+                print(quota_cmd.render_text(data))
+        except Exception:
+            print('Hub quota operation failed; check authentication, filters and quota grants.', file=sys.stderr)
+            sys.exit(1)
     elif args.cmd == "bridge":
         cmd_bridge(args)
     elif args.cmd == "send":

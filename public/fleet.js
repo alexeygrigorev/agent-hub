@@ -49,6 +49,62 @@ function render(data) {
 }
 const PROBLEM = new Set(['stale', 'offline', 'stalled', 'stuck', 'uncertain', 'missing', 'fail', 'error']);
 function stateCell(state) { const span = document.createElement('span'); span.className = 'dk-badge ' + (PROBLEM.has(state) ? 'dk-badge--danger' : ['online', 'working'].includes(state) ? 'dk-badge--success' : 'dk-badge--neutral'); span.textContent = state; return span; }
+function quotaBadge(state) {
+  const span = document.createElement('span');
+  span.className = 'dk-badge ' + (state === 'fresh' ? 'dk-badge--success' : ['exhausted', 'unavailable', 'stale'].includes(state) ? 'dk-badge--danger' : 'dk-badge--neutral');
+  span.textContent = state || 'unknown';
+  return span;
+}
+function quotaWindowState(snap, w) {
+  if (!snap || snap.stale) return 'stale';
+  if (snap.status === 'error') return 'unavailable';
+  if (snap.status !== 'ok') return 'unknown';
+  if (w && w.error === 'unavailable') return 'unavailable';
+  if (!w || w.present !== true) return 'unknown';
+  return 'fresh';
+}
+function nativeText(w) {
+  if (!w) return 'unknown';
+  const parts = [];
+  if (w.credits_remaining !== null && w.credits_remaining !== undefined) parts.push(`${w.credits_remaining} credits`);
+  if (w.spend_used !== null && w.spend_used !== undefined) parts.push(`spent ${w.spend_used}${w.unit ? ' ' + w.unit : ''}`);
+  if (w.spend_limit !== null && w.spend_limit !== undefined) parts.push(`limit ${w.spend_limit}${w.unit ? ' ' + w.unit : ''}`);
+  if (w.profile) parts.push(`profile ${w.profile}`);
+  if (parts.length) return parts.join('; ');
+  return w.unit && w.unit !== 'percent' ? w.unit : 'percent';
+}
+function renderQuota(q) {
+  const root = byId('quota'); root.replaceChildren();
+  if (!q || q.error) {
+    const p = document.createElement('p'); p.textContent = q && q.error ? `Quota unavailable: ${q.error}` : 'Quota unavailable: no data.'; root.append(p); return;
+  }
+  const pools = Array.isArray(q.pools) ? q.pools : [];
+  root.append(richTable(['Provider', 'Account', 'State', 'Remaining', 'Observed', 'Hosts'],
+    pools.map(p => [p.provider, p.account, quotaBadge(p.state),
+      p.remaining_percent === null || p.remaining_percent === undefined ? 'unknown' : `${p.remaining_percent}%`,
+      p.observed_at || 'never',
+      Array.isArray(p.observed_by_hosts) && p.observed_by_hosts.length ? p.observed_by_hosts.join(', ') : 'no host'])));
+  const cov = q.coverage || {};
+  const cp = document.createElement('p');
+  cp.textContent = `Coverage: ${((cov.fresh || []).length)} fresh, ${((cov.stale || []).length)} stale, ${((cov.missing || []).length)} missing of ${cov.machines_total ?? '?'} machines.`;
+  root.append(cp);
+  const winRows = [];
+  for (const h of Array.isArray(q.hosts) ? q.hosts : []) {
+    const snap = h.snapshot || {};
+    const routes = snap.routes && typeof snap.routes === 'object' ? snap.routes : {};
+    for (const [provider, route] of Object.entries(routes)) {
+      const windows = route && typeof route.windows === 'object' ? route.windows : {};
+      for (const [name, w] of Object.entries(windows)) {
+        const pct = !w || w.percent_remaining === null || w.percent_remaining === undefined ? 'unknown' : `${w.percent_remaining}%`;
+        winRows.push([h.host_id, provider, name, quotaBadge(quotaWindowState(snap, w)), pct, nativeText(w), (w && w.reset_at) || 'unknown']);
+      }
+    }
+    for (const s of Array.isArray(h.subscriptions) ? h.subscriptions : []) {
+      if (s && s.stale) winRows.push([h.host_id, `${s.service} / ${s.account}`, 'subscription', quotaBadge('stale'), 'unknown', 'unknown', 'unknown']);
+    }
+  }
+  root.append(richTable(['Host', 'Provider', 'Window', 'State', 'Remaining', 'Native units', 'Reset'], winRows));
+}
 function richTable(columns, rows) {
   const wrapper = table(columns, []); const body = wrapper.querySelector('tbody'); if (rows.length) body.replaceChildren();
   for (const row of rows) { const tr = document.createElement('tr'); for (const [index, cell] of row.entries()) { const td = document.createElement('td'); td.dataset.label = columns[index]; if (cell instanceof Node) td.append(cell); else td.textContent = cell ?? 'unknown'; tr.append(td); } body.append(tr); }
@@ -75,6 +131,11 @@ async function refresh() {
     document.querySelector('.dk-avatar__initials').textContent = me.email.slice(0,1).toUpperCase();
     const [fleet, live, checks] = await Promise.all([api('/api/fleet'), api('/api/liveness'), api('/api/checks')]);
     render(fleet); renderWatch(live, checks);
+    try {
+      renderQuota(await api('/api/quota?view=fleet'));
+    } catch (e) {
+      renderQuota({ error: e.message });
+    }
     byId('status').textContent = `Authenticated · updated ${new Date().toLocaleTimeString()}`;
   }
   catch (e) { byId('status').textContent = 'Fleet could not be refreshed. Any displayed data is from the last successful update. ' + e.message; }
