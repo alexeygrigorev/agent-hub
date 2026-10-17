@@ -154,6 +154,31 @@ class FleetTests(unittest.TestCase):
             with self.assertRaises(ValueError): d.dispatch(offer(mode='headless', prompt='Goal'))
             self.assertFalse(requests)
 
+    def test_antigravity_headless_requires_native_first_action_and_uuid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = settings(Path(tmp))
+            cfg['launcher'] = {'argv': ['python3', '-m', 'launcher'], 'root': tmp, 'config_dir': str(Path(tmp) / 'config')}
+            cfg['subscriptions'][0].update(launcher_provider='antigravity', launcher_model='gemini-3.8-flash-high')
+            calls = []
+            receipt = {'session_id': 'genuine-native-uuid', 'state': 'running', 'first_action_verified': True}
+            def runner(argv, **kw):
+                calls.append(argv)
+                if argv[0] == 'maintained-gate':
+                    return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+                if 'plan' in argv:
+                    return {'eligible': [{'provider': 'antigravity', 'model': 'gemini-3.8-flash-high', 'task_fit': 1.0}]}
+                if 'run' in argv: return {'receipt': dict(receipt)}
+                return {}
+            d = fleet.Dispatcher(cfg, lambda *a: {}, runner)
+            result = d.dispatch(offer(mode='headless', prompt='Useful monitoring task'))
+            self.assertEqual(result['state'], 'running')
+            self.assertEqual(result['native_id'], 'genuine-native-uuid')
+            self.assertIn('aplexer', calls[-1])
+            receipt.pop('session_id'); receipt['unit_name'] = 'not-native'
+            self.assertEqual(d.dispatch(offer(mode='headless', prompt='Goal'))['state'], 'uncertain')
+            receipt.update(session_id='genuine-native-uuid', first_action_verified=False)
+            self.assertEqual(d.dispatch(offer(mode='headless', prompt='Goal'))['state'], 'uncertain')
+
     def test_command_errors_never_echo_raw_stdout_stderr(self):
         with self.assertRaises(RuntimeError) as caught:
             fleet.run_json([sys.executable, '-c', 'import sys;print("MUST_NOT_LEAK");sys.stderr.write("MUST_NOT_LEAK");sys.exit(1)'])

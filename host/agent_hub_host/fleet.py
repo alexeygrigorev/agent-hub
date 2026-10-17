@@ -497,12 +497,10 @@ class Dispatcher:
                 return True
             if not isinstance(eligible, list) or not any(_plan_match(r) for r in eligible):
                 raise ValueError("Maintained launcher plan refused")
-            # Smallest correct native route: opencode headless reuses the
-            # maintained launcher aplexer backend (real native UUID +
-            # first-action evidence for M12 bind/control). Task-units receipts
-            # can carry only a systemd unit_name, which cannot bind. All other
-            # providers preserve the existing task-units backend + semantics.
-            if sub.get("launcher_provider") == "opencode":
+            # OpenCode and Antigravity use the maintained native backend:
+            # real engine/UUID plus validated first action for Hub binding.
+            # Other providers retain their existing task-unit semantics.
+            if sub.get("launcher_provider") in {"opencode", "antigravity"}:
                 argv = prefix + ["run", "--backend", "aplexer",
                                  "--id", task_id, "--cwd", str(target_cwd),
                                  "--tmpdir", str(workspace / ".local" / "tmp")]
@@ -525,7 +523,7 @@ class Dispatcher:
                 result = {"state": "running", "native_id": native_id}
             else:
                 details = receipt.get("receipt", {})
-                if sub.get("launcher_provider") == "opencode":
+                if sub.get("launcher_provider") in {"opencode", "antigravity"}:
                     # Opencode binds real M12 sessions only: a genuine native
                     # UUID is required; task-units unit_name/worker_id names
                     # can never bind or control a session.
