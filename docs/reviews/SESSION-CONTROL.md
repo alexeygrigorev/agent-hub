@@ -48,16 +48,17 @@ Mechanically verified against `HEAD` (`f9417de39d7818f18cf6f4a3a8770c6a67518db0`
   - Total tracked files in `git ls-files`: `264` (`243` in manifest + `21` pre-existing `docs/proposals/*` [6] and `docs/reviews/*` [15] unchanged since `6bc91a1278250b374ea1d0b11acd353fae51a8cb`).
   - All **17** paths modified in `6bc91a1278250b374ea1d0b11acd353fae51a8cb..f9417de39d7818f18cf6f4a3a8770c6a67518db0` are present and hash-verified in the 243-entry manifest.
 
-### 2.2 Verified Git Commit Graph (`6bc91a1..f9417de`)
+### 2.2 Verified Git Commit Graph (`bc79601..f9417de`)
 
 | Commit SHA | Parents | Author / Trailer | Exact Subject |
 | :--- | :--- | :--- | :--- |
+| `bc796013d9f522d8a2e3ea050f7b264e2fabfc41` | `c290454e88c49c6fe863d20dd2717d58522851d0` | `platform-intake-review` / Gemini 4 Argon High | `docs(review): accept M12a composed intake API CLI and handoff source [skip ci]` |
 | `6bc91a1278250b374ea1d0b11acd353fae51a8cb` | `4c7cf04bd689b81c867bd2622f2c116bede9d94a` | Alexey (`platform`) | `docs: correct independent review Git metadata before publication [skip ci]` |
-| `b66796cda663a2032731a12bc8e5a9bfccd1de12` | `6bc91a1278250b374ea1d0b11acd353fae51a8cb` | `platform-session-api` / Muse Spark 1.3 | `[skip ci] M12e session control: durable hub sessions, commands, fleet start hook, CLI` |
-| `2fefbb406b05b0dd3f6d6e81225be4c1d61560e4` | `b66796cda663a2032731a12bc8e5a9bfccd1de12` | `platform-session-api-r2` / Muse Spark 1.3 | `[skip ci] M12e session control R2: claim tokens, reply proof, family continuity, --wait` |
+| `b66796cda663a2032731a12bc8e5a9bfccd1de12` | `bc796013d9f522d8a2e3ea050f7b264e2fabfc41` | `platform-session-api` / Muse Spark 1.3 | `[skip ci] M12e session control: durable queue/auth/tests + proposed contract` |
+| `2fefbb406b05b0dd3f6d6e81225be4c1d61560e4` | `b66796cda663a2032731a12bc8e5a9bfccd1de12` | `platform-session-api-r2` / Muse Spark 1.3 | `[skip ci] M12e session control: real hub/CLI wiring + claim fence + proof validator` |
 | `cd0e9d099efea884ee9e52fcbe7c0901e03d4128` | `2fefbb406b05b0dd3f6d6e81225be4c1d61560e4` | `platform-session-api-r2` / Muse Spark 1.3 | `[skip ci] M12e session control: head amendments (cwd/proof/attempt)` |
-| `36534db6a66e71fda52bde4a832c0b264e2fabfc41` | `6bc91a1278250b374ea1d0b11acd353fae51a8cb` | `platform-session-host` / Muse Spark 1.3 | `feat(host): M12e native session adapter and Fleet-routed session executor [skip ci]` |
-| `69ae9f1e9a8f4cf6e33fc205080f7ee1350ca15e` | `36534db6a66e71fda52bde4a832c0b264e2fabfc41` | `platform-session-host-r2` / Muse Spark 1.3 | `fix(host): M12e R2 critical repairs — retire enter-ACK, reply proof, claim receiver, locks [skip ci]` |
+| `36534db6a66e71fda52bde4a832c0b2683b24bd2` | `bc796013d9f522d8a2e3ea050f7b264e2fabfc41` | `platform-session-host` / Muse Spark 1.3 | `feat(host): M12e native session adapter with guarded delivery and Fleet-contract start [skip ci]` |
+| `69ae9f1e9a8f4cf6e33fc205080f7ee1350ca15e` | `36534db6a66e71fda52bde4a832c0b2683b24bd2` | `platform-session-host-r2` / Muse Spark 1.3 | `fix(host): M12e R2 critical repairs — retire enter-ACK, reply proof, claim receiver, locks [skip ci]` |
 | `d841c6456badd27c1026d74abb3cae7e26473cf5` | `6bc91a1278250b374ea1d0b11acd353fae51a8cb`, `cd0e9d099efea884ee9e52fcbe7c0901e03d4128` | Alexey | `chore: compose hub session API with accepted main [skip ci]` |
 | `d84ca875898a3aaf89ef8dabdefcf93c7f4640b6` | `d841c6456badd27c1026d74abb3cae7e26473cf5`, `69ae9f1e9a8f4cf6e33fc205080f7ee1350ca15e` | Alexey | `chore: compose native session host adapter [skip ci]` |
 | `9bb9a7777772d778c011b4c860a0947a663b2d3e` | `d84ca875898a3aaf89ef8dabdefcf93c7f4640b6` | `platform-session-compose` / Muse Spark 1.3 (`ae075e9a`) | `[skip ci] M12e compose: server claim/offers/binding contract for connected receiver` |
@@ -256,43 +257,63 @@ Even after F1–F6 are repaired, acceptance of this source candidate must **not*
 
 ---
 
-## 5. Independent Test Execution & Continuous 100ms Resource Measurements
+## 5. Independent Test Execution & Resource Measurements (`100ms` Target Sleep vs. Observed Sampling Cadence)
 
-All commands were executed sequentially on 1 pinned CPU (`taskset -c 0`) via `.local/review/run_monitored.py` with `umask 077`, `TMPDIR=/home/alexey/git/agent-hub-wt-platform-session-compose-review/.local/tmp/runs/<run_name>`, `UV_THREADPOOL_SIZE=1`, `GOMAXPROCS=1`, `NODE_OPTIONS=--v8-pool-size=1`, and a `100ms` sampling loop measuring allocated/apparent scratch bytes across `.local`, `.wrangler`, and `dist` (`16 MiB` early guard / `20 MiB` hard cap), process-tree RSS (`1500 MiB` cap), and task count (`256` cap). All disposable test caches were retired after each run with SHA-256 and byte records appended to `.local/review/retirement-manifest.json`.
+All commands were executed sequentially on 1 pinned CPU (`taskset -c 0`) via `.local/review/run_monitored.py` with `umask 077`, `TMPDIR=/home/alexey/git/agent-hub-wt-platform-session-compose-review/.local/tmp/runs/<run_name>`, `UV_THREADPOOL_SIZE=1`, `GOMAXPROCS=1`, `NODE_OPTIONS=--v8-pool-size=1`, and an in-process monitor loop measuring allocated/apparent scratch bytes across `.local`, `.wrangler`, and `dist` (`16 MiB` early guard / `20 MiB` hard cap), process-tree RSS (`1500 MiB` cap), and task count (`256` cap). All disposable test caches were retired after each run with SHA-256 and byte records appended to `.local/review/retirement-manifest.json`.
+
+- **Sampling Cadence & Peak Bound Disclosure**:
+  - `.local/review/run_monitored.py` configured a `100ms` post-sample sleep (`time.sleep(0.1)`), not a hardware/timer interrupt. Because each iteration executed a synchronous directory walk (`walk_scratch()`) and `/proc` scan (`read_proc_tree()`) while sharing single-core CPU affinity (`taskset -c 0`) with the child test runner, the **observed mean sampling interval (`elapsed_sec / samples`) ranged from `0.426s` to `1.322s` per sample** across runs.
+  - Because `.local/review/runs/*.json` recorded total `samples` and `elapsed_sec` without individual per-sample timestamps, the **maximum inter-sample interval is unknown**, and all reported peaks (`Peak Alloc`, `Peak Apparent`, `Peak RSS`, `Peak Tasks`) are **strictly the maxima over the discrete observed samples** (no finer inter-sample peak bound is claimed).
 
 ### 5.1 Author Baseline (77 Cases + `tsc`) & Compatibility Suites (64 Cases)
 
-| Run ID | Suite / Command | Exit | Cases | Elapsed (s) | Samples (100ms) | Peak Alloc (B / MiB) | Peak Apparent (B / MiB) | Post-Retire Alloc (B) | Peak RSS (MiB) | Peak Tasks |
+| Run ID | Suite / Command | Exit | Cases | Elapsed (s) | Samples (Obs. Mean Interval) | Obs. Peak Alloc (B / MiB) | Obs. Peak Apparent (B / MiB) | Post-Retire Alloc (B) | Obs. Peak RSS (MiB) | Obs. Peak Tasks |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| `01-tsc` | `./node_modules/.bin/tsc --noEmit` | `0` | typecheck | `7.107` | `10` | `65,536` (`0.06`) | `43,332` (`0.04`) | `57,344` | `265.38` | `8` |
-| `02-pytest-session-control` | `pytest -v host/tests/test_session_control.py` | `0` | `12 passed` | `11.793` | `21` | `229,376` (`0.22`) | `153,774` (`0.15`) | `139,264` | `234.31` | `1` |
-| `03-pytest-session-control-loop` | `pytest -v host/tests/test_session_control_loop.py` | `0` | `6 passed` | `16.040` | `26` | `286,720` (`0.27`) | `155,894` (`0.15`) | `192,512` | `235.02` | `1` |
-| `04-pytest-session-executor` | `pytest -v host/tests/test_session_executor.py` | `0` | `28 passed` | `37.382` | `47` | `606,208` (`0.58`) | `358,872` (`0.34`) | `360,448` | `238.78` | `3` |
-| `05-vitest-session-control` *(bad CLI flag `--poolOptions`)* | `vitest run ... --poolOptions...` | `1` | `0` *(CLI arg err)* | `1.322` | `1` | `372,736` (`0.36`) | `143,419` (`0.14`) | `143,360` | `0.00` | `1` |
-| `05b-vitest-session-control` | `vitest run --config test/vitest.session-control.config.ts --configLoader runner --maxWorkers=1 --no-file-parallelism` | `0` | `26 passed` | `25.215` | `34` | `15,310,848` (`14.60`) | `15,243,303` (`14.54`) | `151,552` | `596.01` | `28` |
-| `06-vitest-session-control-composed` | `vitest run --config test/vitest.session-control-composed.config.ts --configLoader runner --maxWorkers=1 --no-file-parallelism` | `0` | `4 passed` | `17.568` | `22` | `2,314,240` (`2.21`) | `2,254,935` (`2.15`) | `159,744` | `564.03` | `28` |
-| `07-pytest-session-real-worker` | `pytest -v host/tests/test_session_real_worker.py` | `0` | `1 passed` | `67.113` | `90` | `3,174,400` (`3.03`) | `3,026,541` (`2.89`) | `184,320` | `571.82` | `22` |
-| `08-pytest-compat` | `pytest -v host/tests/test_native_bridge_contract.py host/tests/test_intake.py` | `0` | `28 passed` (+7 subtests) | `40.389` | `80` | `1,572,864` (`1.50`) | `1,119,453` (`1.07`) | `1,208,320` | `267.72` | `3` |
-| `09-vitest-intake` | `vitest run --config test/vitest.intake.config.ts --configLoader runner --maxWorkers=1 --no-file-parallelism` | `0` | `36 passed` | `20.383` | `37` | `8,028,160` (`7.66`) | `7,679,331` (`7.32`) | `1,236,992` | `593.34` | `28` |
+| `01-tsc` | `./node_modules/.bin/tsc --noEmit` | `0` | typecheck | `7.107` | `10` (`0.711s`) | `65,536` (`0.06`) | `43,332` (`0.04`) | `57,344` | `265.38` | `8` |
+| `02-pytest-session-control` | `pytest -v host/tests/test_session_control.py` | `0` | `12 passed` | `11.793` | `21` (`0.562s`) | `229,376` (`0.22`) | `153,774` (`0.15`) | `139,264` | `234.31` | `1` |
+| `03-pytest-session-control-loop` | `pytest -v host/tests/test_session_control_loop.py` | `0` | `6 passed` | `16.040` | `26` (`0.617s`) | `286,720` (`0.27`) | `155,894` (`0.15`) | `192,512` | `235.02` | `1` |
+| `04-pytest-session-executor` | `pytest -v host/tests/test_session_executor.py` | `0` | `28 passed` | `37.382` | `47` (`0.795s`) | `606,208` (`0.58`) | `358,872` (`0.34`) | `360,448` | `238.78` | `3` |
+| `05-vitest-session-control` *(bad CLI flag `--poolOptions`)* | `vitest run ... --poolOptions...` | `1` | `0` *(CLI arg err)* | `1.322` | `1` (`1.322s`) | `372,736` (`0.36`) | `143,419` (`0.14`) | `143,360` | `0.00` | `1` |
+| `05b-vitest-session-control` | `vitest run --config test/vitest.session-control.config.ts --configLoader runner --maxWorkers=1 --no-file-parallelism` | `0` | `26 passed` | `25.215` | `34` (`0.742s`) | `15,310,848` (`14.60`) | `15,243,303` (`14.54`) | `151,552` | `596.01` | `28` |
+| `06-vitest-session-control-composed` | `vitest run --config test/vitest.session-control-composed.config.ts --configLoader runner --maxWorkers=1 --no-file-parallelism` | `0` | `4 passed` | `17.568` | `22` (`0.799s`) | `2,314,240` (`2.21`) | `2,254,935` (`2.15`) | `159,744` | `564.03` | `28` |
+| `07-pytest-session-real-worker` | `pytest -v host/tests/test_session_real_worker.py` | `0` | `1 passed` | `67.113` | `90` (`0.746s`) | `3,174,400` (`3.03`) | `3,026,541` (`2.89`) | `184,320` | `571.82` | `22` |
+| `08-pytest-compat` | `pytest -v host/tests/test_native_bridge_contract.py host/tests/test_intake.py` | `0` | `28 passed` (+7 subtests) | `40.389` | `80` (`0.505s`) | `1,572,864` (`1.50`) | `1,119,453` (`1.07`) | `1,208,320` | `267.72` | `3` |
+| `09-vitest-intake` | `vitest run --config test/vitest.intake.config.ts --configLoader runner --maxWorkers=1 --no-file-parallelism` | `0` | `36 passed` | `20.383` | `37` (`0.551s`) | `8,028,160` (`7.66`) | `7,679,331` (`7.32`) | `1,236,992` | `593.34` | `28` |
 
 ### 5.2 Novel Adversarial Defect-Reproduction Runs (12 Expected-Vulnerable Cases Across Python & Worker/SQLite)
 
 All intermediate fixture-setup iterations (`10`..`10d`, `11`..`11f`) are retained in `.local/review/runs/` without product inference from fixture errors. In the final probe suites `10e-pytest-novel-host-probes` (`6 passed`) and `11g-vitest-novel-worker-probes` (`6 passed`), **`passed` denotes an expected-vulnerable reproduction assertion confirming the presence of defects F1–F6 on `f9417de39d7818f18cf6f4a3a8770c6a67518db0` (plus the positive CSRF cross-origin denial sub-check in `probe_w3`), NOT repaired product success**:
 
-| Run ID | Suite / Command | Exit | Cases / Meaning | Elapsed (s) | Samples (100ms) | Peak Alloc (B / MiB) | Peak Apparent (B / MiB) | Post-Retire Alloc (B) | Peak RSS (MiB) | Peak Tasks |
+| Run ID | Suite / Command | Exit | Cases / Meaning | Elapsed (s) | Samples (Obs. Mean Interval) | Obs. Peak Alloc (B / MiB) | Obs. Peak Apparent (B / MiB) | Post-Retire Alloc (B) | Obs. Peak RSS (MiB) | Obs. Peak Tasks |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| `10-pytest-novel-host-probes` *(import setup)* | `pytest -v .local/review/test_novel_host_probes.py` | `2` | `0` *(invalid fixture import)* | `21.942` | `47` | `1,327,104` (`1.27`) | `952,779` (`0.91`) | `356,352` | `245.80` | `1` |
-| `10b-pytest-novel-host-probes` *(import setup)* | `pytest -v .local/review/test_novel_host_probes.py` | `2` | `0` *(invalid fixture import)* | `20.869` | `47` | `409,600` (`0.39`) | `300,060` (`0.29`) | `372,736` | `245.80` | `1` |
-| `10c-pytest-novel-host-probes` *(1a helper arg)* | `pytest -v .local/review/test_novel_host_probes.py` | `1` | `5 passed, 1 failed` *(fixture arg)* | `20.637` | `48` | `430,080` (`0.41`) | `314,854` (`0.30`) | `389,120` | `240.55` | `1` |
-| `10d-pytest-novel-host-probes` *(1a kwarg)* | `pytest -v .local/review/test_novel_host_probes.py` | `1` | `5 passed, 1 failed` *(fixture kwarg)* | `20.444` | `48` | `442,368` (`0.42`) | `322,637` (`0.31`) | `401,408` | `240.86` | `1` |
-| **`10e-pytest-novel-host-probes`** | `pytest -v .local/review/test_novel_host_probes.py` | **`0`** | **`6 passed` *(6 expected-vulnerable repros: F1, F2, F4, F6)*** | `33.822` | `55` | `483,328` (`0.46`) | `362,241` (`0.35`) | `409,600` | `240.13` | `1` |
-| `11-vitest-novel-worker-probes` *(SQL col setup)* | `vitest run --config .local/review/vitest.novel-probes.config.ts ...` | `1` | `6 failed` *(invalid fixture SQL)* | `11.202` | `20` | `1,429,504` (`1.36`) | `1,307,223` (`1.25`) | `417,792` | `563.11` | `28` |
-| `11b-vitest-novel-worker-probes` *(CSRF header)* | `vitest run --config .local/review/vitest.novel-probes.config.ts ...` | `1` | `6 failed` *(invalid fixture CSRF)* | `15.797` | `22` | `2,031,616` (`1.94`) | `1,906,121` (`1.82`) | `434,176` | `552.30` | `28` |
-| `11c-vitest-novel-worker-probes` *(start brief)* | `vitest run --config .local/review/vitest.novel-probes.config.ts ...` | `1` | `1 passed, 5 failed` *(fixture brief)* | `15.710` | `22` | `1,937,408` (`1.85`) | `1,805,646` (`1.72`) | `450,560` | `565.23` | `28` |
-| `11d-vitest-novel-worker-probes` *(fleet mode)* | `vitest run --config .local/review/vitest.novel-probes.config.ts ...` | `1` | `1 passed, 5 failed` *(fixture mode)* | `13.911` | `21` | `1,822,720` (`1.74`) | `1,685,230` (`1.61`) | `462,848` | `549.54` | `28` |
-| `11e-vitest-novel-worker-probes` *(col names)* | `vitest run --config .local/review/vitest.novel-probes.config.ts ...` | `1` | `1 passed, 5 failed` *(fixture cols)* | `14.946` | `22` | `2,248,704` (`2.14`) | `2,106,252` (`2.01`) | `475,136` | `568.08` | `28` |
-| `11f-vitest-novel-worker-probes` *(actor col)* | `vitest run --config .local/review/vitest.novel-probes.config.ts ...` | `1` | `5 passed, 1 failed` *(fixture col)* | `12.735` | `21` | `1,994,752` (`1.90`) | `1,845,565` (`1.76`) | `483,328` | `557.92` | `28` |
-| **`11g-vitest-novel-worker-probes`** | `vitest run --config .local/review/vitest.novel-probes.config.ts --configLoader runner --maxWorkers=1 --no-file-parallelism` | **`0`** | **`6 passed` *(6 expected-vulnerable repros: F1, F3, F5 + M9 seam)*** | `10.944` | `21` | `2,392,064` (`2.28`) | `2,236,519` (`2.13`) | `491,520` | `554.04` | `28` |
+| `10-pytest-novel-host-probes` *(import setup)* | `pytest -v .local/review/test_novel_host_probes.py` | `2` | `0` *(invalid fixture import)* | `21.942` | `47` (`0.467s`) | `1,327,104` (`1.27`) | `952,779` (`0.91`) | `356,352` | `245.80` | `1` |
+| `10b-pytest-novel-host-probes` *(import setup)* | `pytest -v .local/review/test_novel_host_probes.py` | `2` | `0` *(invalid fixture import)* | `20.869` | `47` (`0.444s`) | `409,600` (`0.39`) | `300,060` (`0.29`) | `372,736` | `245.80` | `1` |
+| `10c-pytest-novel-host-probes` *(1a helper arg)* | `pytest -v .local/review/test_novel_host_probes.py` | `1` | `5 passed, 1 failed` *(fixture arg)* | `20.637` | `48` (`0.430s`) | `430,080` (`0.41`) | `314,854` (`0.30`) | `389,120` | `240.55` | `1` |
+| `10d-pytest-novel-host-probes` *(1a kwarg)* | `pytest -v .local/review/test_novel_host_probes.py` | `1` | `5 passed, 1 failed` *(fixture kwarg)* | `20.444` | `48` (`0.426s`) | `442,368` (`0.42`) | `322,637` (`0.31`) | `401,408` | `240.86` | `1` |
+| **`10e-pytest-novel-host-probes`** | `pytest -v .local/review/test_novel_host_probes.py` | **`0`** | **`6 passed` *(6 expected-vulnerable repros: F1, F2, F4, F6)*** | `33.822` | `55` (`0.615s`) | `483,328` (`0.46`) | `362,241` (`0.35`) | `409,600` | `240.13` | `1` |
+| `11-vitest-novel-worker-probes` *(SQL col setup)* | `vitest run --config .local/review/vitest.novel-probes.config.ts ...` | `1` | `6 failed` *(invalid fixture SQL)* | `11.202` | `20` (`0.560s`) | `1,429,504` (`1.36`) | `1,307,223` (`1.25`) | `417,792` | `563.11` | `28` |
+| `11b-vitest-novel-worker-probes` *(CSRF header)* | `vitest run --config .local/review/vitest.novel-probes.config.ts ...` | `1` | `6 failed` *(invalid fixture CSRF)* | `15.797` | `22` (`0.718s`) | `2,031,616` (`1.94`) | `1,906,121` (`1.82`) | `434,176` | `552.30` | `28` |
+| `11c-vitest-novel-worker-probes` *(start brief)* | `vitest run --config .local/review/vitest.novel-probes.config.ts ...` | `1` | `1 passed, 5 failed` *(fixture brief)* | `15.710` | `22` (`0.714s`) | `1,937,408` (`1.85`) | `1,805,646` (`1.72`) | `450,560` | `565.23` | `28` |
+| `11d-vitest-novel-worker-probes` *(fleet mode)* | `vitest run --config .local/review/vitest.novel-probes.config.ts ...` | `1` | `1 passed, 5 failed` *(fixture mode)* | `13.911` | `21` (`0.662s`) | `1,822,720` (`1.74`) | `1,685,230` (`1.61`) | `462,848` | `549.54` | `28` |
+| `11e-vitest-novel-worker-probes` *(col names)* | `vitest run --config .local/review/vitest.novel-probes.config.ts ...` | `1` | `1 passed, 5 failed` *(fixture cols)* | `14.946` | `22` (`0.679s`) | `2,248,704` (`2.14`) | `2,106,252` (`2.01`) | `475,136` | `568.08` | `28` |
+| `11f-vitest-novel-worker-probes` *(actor col)* | `vitest run --config .local/review/vitest.novel-probes.config.ts ...` | `1` | `5 passed, 1 failed` *(fixture col)* | `12.735` | `21` (`0.606s`) | `1,994,752` (`1.90`) | `1,845,565` (`1.76`) | `483,328` | `557.92` | `28` |
+| **`11g-vitest-novel-worker-probes`** | `vitest run --config .local/review/vitest.novel-probes.config.ts --configLoader runner --maxWorkers=1 --no-file-parallelism` | **`0`** | **`6 passed` *(6 expected-vulnerable repros: F1, F3, F5 + M9 seam)*** | `10.944` | `21` (`0.521s`) | `2,392,064` (`2.28`) | `2,236,519` (`2.13`) | `491,520` | `554.04` | `28` |
 
-- **Overall Peak Scratch**: `15,310,848` bytes (`14.60 MiB` allocated) / `15,243,303` bytes (`14.54 MiB` apparent) during `05b-vitest-session-control`, strictly below the `16.00 MiB` early guard and `20.00 MiB` hard cap (`guard_aborted: false` across all runs).
-- **Overall Peak RSS / Tasks**: `596.01 MiB` RSS (limit `1500 MiB`), `28` tasks (limit `256`), `0` lingering child processes after every run.
+- **Observed Peak Scratch (Across Discrete Samples)**: `15,310,848` bytes (`14.60 MiB` allocated) / `15,243,303` bytes (`14.54 MiB` apparent) during `05b-vitest-session-control`, below the `16.00 MiB` early guard and `20.00 MiB` hard cap (`guard_aborted: false` across all runs).
+- **Observed Peak RSS / Tasks (Across Discrete Samples)**: `596.01 MiB` RSS (limit `1500 MiB`), `28` tasks (limit `256`), `0` lingering child processes after every run.
+
+---
+
+## 6. Reviewer Factual Metadata & Cadence Correction Provenance
+
+The initial independent review commit is preserved unchanged at `4d1462ca38b0cd47f153fc08b2d3fbc47cea87a9` (direct parent `f9417de39d7818f18cf6f4a3a8770c6a67518db0`). Following the `platform` draft audit note `01a14924-a618-7772-827e-5e8f97f4db22` (`/home/alexey/git/agent-coordination/.local/platform/session-review-draft-git-audit.json`), this report-only follow-up commit corrects:
+1. **§2.2 Git ancestry metadata**:
+   - `b66796cda663a2032731a12bc8e5a9bfccd1de12`: parent corrected to `bc796013d9f522d8a2e3ea050f7b264e2fabfc41` and exact subject corrected to `[skip ci] M12e session control: durable queue/auth/tests + proposed contract`.
+   - `2fefbb406b05b0dd3f6d6e81225be4c1d61560e4`: exact subject corrected to `[skip ci] M12e session control: real hub/CLI wiring + claim fence + proof validator`.
+   - `36534db6a66e71fda52bde4a832c0b2683b24bd2`: SHA corrected to the actual 40-hex commit `36534db6a66e71fda52bde4a832c0b2683b24bd2`, parent corrected to `bc796013d9f522d8a2e3ea050f7b264e2fabfc41`, and exact subject corrected to `feat(host): M12e native session adapter with guarded delivery and Fleet-contract start [skip ci]`.
+   - `69ae9f1e9a8f4cf6e33fc205080f7ee1350ca15e`: parent corrected to `36534db6a66e71fda52bde4a832c0b2683b24bd2`.
+2. **§5 resource sampling cadence disclosure**:
+   - Explicitly distinguishes the configured `100ms` post-sample target sleep (`time.sleep(0.1)`) from the observed mean sampling intervals (`0.426s`–`1.322s` under single-core `taskset -c 0`), discloses that maximum inter-sample intervals are unknown because per-sample timestamps were not persisted, and bounds all peak claims strictly to observed discrete samples.
+
+No source files, tests, run receipts (`.local/review/runs/`), or findings (`F1`–`F6`, verdict `SCOPED REVISE` on `f9417de39d7818f18cf6f4a3a8770c6a67518db0`) were modified.
+
