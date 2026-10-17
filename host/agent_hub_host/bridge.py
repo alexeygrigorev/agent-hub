@@ -8,7 +8,6 @@ metadata verification, and identity boundaries.
 from __future__ import annotations
 
 from contextlib import contextmanager
-import fcntl
 import hashlib
 import json
 import os
@@ -17,7 +16,7 @@ import time
 import uuid
 from typing import Any
 
-from . import bus
+from . import bus, private_fs
 from .native_bridge import (
     BridgeCapabilityGap,
     NativeServiceBinding,
@@ -86,6 +85,14 @@ def composer_is_empty(last_line: str) -> bool:
     return len(tokens) == 2 and tokens[1] == "❯" and tokens[0] not in PROMPT_GLYPHS
 
 
+def _absolute_native_root(value):
+    if os.name == 'nt':
+        drive, tail = os.path.splitdrive(value)
+        if len(drive) != 2 or drive[1] != ':' or not tail.startswith(('\\', '/')):
+            raise BridgeCapabilityGap('Explicit absolute local Windows native root required')
+    return os.path.abspath(value)
+
+
 def get_authoritative_runtime_dir(explicit_runtime_dir: str | None = None) -> str:
     """Resolve authoritative native runtime directory per aplexer paths.rs.
 
@@ -94,11 +101,16 @@ def get_authoritative_runtime_dir(explicit_runtime_dir: str | None = None) -> st
     Never checks workspace-local directories for runtime root.
     """
     if explicit_runtime_dir:
-        return os.path.abspath(explicit_runtime_dir)
+        return _absolute_native_root(explicit_runtime_dir)
     if os.environ.get("APLEXER_RUNTIME_DIR"):
-        return os.path.abspath(os.environ["APLEXER_RUNTIME_DIR"])
-    if os.environ.get("XDG_RUNTIME_DIR"):
+        return _absolute_native_root(os.environ["APLEXER_RUNTIME_DIR"])
+    if os.name != "nt" and os.environ.get("XDG_RUNTIME_DIR"):
         return os.path.abspath(os.path.join(os.environ["XDG_RUNTIME_DIR"], "aplexer"))
+    if os.name == 'nt':
+        base = os.environ.get('LOCALAPPDATA') or os.path.join(os.path.expanduser('~'), 'AppData', 'Local')
+        if not os.path.isabs(base):
+            raise BridgeCapabilityGap('Absolute Windows LOCALAPPDATA required')
+        return os.path.join(base, 'aplexer', 'run')
     uid = os.geteuid() if hasattr(os, "geteuid") else 1000
     return os.path.abspath(f"/tmp/aplexer-{uid}")
 
@@ -111,9 +123,14 @@ def get_authoritative_state_dir(explicit_state_dir: str | None = None) -> str:
     Never checks workspace-local directories for state root.
     """
     if explicit_state_dir:
-        return os.path.abspath(explicit_state_dir)
+        return _absolute_native_root(explicit_state_dir)
     if os.environ.get("APLEXER_STATE_DIR"):
-        return os.path.abspath(os.environ["APLEXER_STATE_DIR"])
+        return _absolute_native_root(os.environ["APLEXER_STATE_DIR"])
+    if os.name == 'nt':
+        base = os.environ.get('LOCALAPPDATA') or os.path.join(os.path.expanduser('~'), 'AppData', 'Local')
+        if not os.path.isabs(base):
+            raise BridgeCapabilityGap('Absolute Windows LOCALAPPDATA required')
+        return os.path.join(base, 'aplexer', 'state')
     if os.environ.get("XDG_STATE_HOME"):
         return os.path.abspath(os.path.join(os.environ["XDG_STATE_HOME"], "aplexer"))
     home = os.environ.get("HOME", os.path.expanduser("~"))
@@ -122,6 +139,9 @@ def get_authoritative_state_dir(explicit_state_dir: str | None = None) -> str:
 
 def canonicalize_workspace(workspace_path: str) -> str:
     """Canonicalize workspace path matching aplexer's canonical_workspace."""
+    if os.name == 'nt':
+        from .win32_fs import canonical_workspace
+        return canonical_workspace(workspace_path)
     abs_path = os.path.abspath(workspace_path)
     try:
         return os.path.realpath(abs_path)
@@ -164,23 +184,13 @@ class MailboxBridge:
 
     @contextmanager
     def _receipts_lock(self):
-        lock_dir = os.path.dirname(self.lock_file) or "."
-        os.makedirs(lock_dir, exist_ok=True)
-        fd = os.open(self.lock_file, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        with private_fs.exclusive_lock(self.lock_file):
+            yield
 
     def _load_receipts(self) -> dict[str, Any]:
-        if os.path.exists(self.receipts_file):
+        if os.path.lexists(self.receipts_file):
             try:
-                with open(self.receipts_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                data = json.loads(private_fs.read_bytes(self.receipts_file, 8 * 1024 * 1024))
             except Exception as e:
                 raise BridgeCapabilityGap(f"Receipts file {self.receipts_file} is corrupt or unreadable: {e}") from e
             if not isinstance(data, dict):
@@ -318,20 +328,9 @@ class MailboxBridge:
 
     def _save_receipts(self) -> None:
         self._prune_receipts()
-        dir_path = os.path.dirname(self.receipts_file) or "."
-        os.makedirs(dir_path, exist_ok=True)
-        tmp_file = self.receipts_file + ".tmp"
-        fd = os.open(tmp_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-        try:
-            with open(fd, "w", encoding="utf-8") as f:
-                json.dump(self.receipts, f, indent=2)
-        except Exception:
-            try:
-                os.close(fd)
-            except Exception:
-                pass
-            raise
-        os.replace(tmp_file, self.receipts_file)
+        private_fs.atomic_write(self.receipts_file,
+                                json.dumps(self.receipts, indent=2).encode('utf-8'),
+                                8 * 1024 * 1024)
 
     def _verify_mailbox_dir(self, state_root: str) -> str | None:
         """Verify and return the authoritative mailbox directory for this canonical workspace."""
