@@ -1680,7 +1680,7 @@ export class Hub extends DurableObject {
     }
     try {
       const row = this.sql.exec('SELECT email FROM users WHERE sub = ?', sub).toArray()[0] as any;
-      const currentEmail = typeof row?.email === 'string' ? row.email : storedEmail;
+      const currentEmail = typeof row?.email === 'string' ? row.email : null;
       if (typeof currentEmail !== 'string' || !currentEmail) return false;
       // Stored identity must still match the verified user row (case-insensitive).
       if (currentEmail.toLowerCase() !== storedEmail.toLowerCase()) return false;

@@ -251,6 +251,26 @@ describe('Human/operator device credentials', () => {
     }
   });
 
+  it('refuses human access and refresh when the verified Google user was deleted', async () => {
+    const first = (await (await createHumanCode('deleted-google-user')).json()) as any;
+    const sub = 'deleted-human-approver';
+    const cookie = await getAdminSession('admin@fake.local', sub);
+    const csrf = await csrfFor(cookie);
+    expect((await approveHuman(first.user_code, cookie, csrf)).status).toBe(200);
+    const tok = (await (await pollToken(first.device_code)).json()) as any;
+    expect(tok.access_token).toBeTruthy();
+    await runInDurableObject(defaultEnv.HUB.get(defaultEnv.HUB.idFromName('hub')), async (instance: Hub) => {
+      instance.sql.exec('DELETE FROM users WHERE sub = ?', sub);
+    });
+    const me = await doFetch(new Request('http://example.com/api/auth/me', { headers: { Authorization: `Bearer ${tok.access_token}` } }));
+    expect(me.status).toBe(401);
+    const refresh = await doFetch(new Request('http://example.com/api/token/refresh', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: tok.refresh_token }),
+    }));
+    expect(refresh.status).toBe(400);
+  });
+
   it('logout revokes only the caller human family and is idempotent', async () => {
     const first = (await (await createHumanCode('logout-a')).json()) as any;
     const second = (await (await createHumanCode('logout-b')).json()) as any;
