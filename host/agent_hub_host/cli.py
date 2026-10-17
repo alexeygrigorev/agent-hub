@@ -140,6 +140,8 @@ def main():
     conversations.add_commands(sub)
     from . import intake
     intake.add_commands(sub)
+    from . import session_control
+    session_control.add_commands(sub)
     add_bridge_resume_command(sub)
 
     for command in ('start-agent', 'start-session', 'plan-agent'):
@@ -281,6 +283,15 @@ def main():
             else:
                 print('Conversation operation failed; check inputs, authentication and membership. '
                       'Retry create/send with the same key and payload after uncertain results.', file=sys.stderr)
+            sys.exit(1)
+        return
+    if args.cmd == 'sessions':
+        try:
+            print(json.dumps(session_control.execute(args), indent=2, ensure_ascii=True))
+        except Exception:
+            print('Session operation failed; check authentication, grants, capacity and current versions. '
+                  'Retry mutations with the same key and payload after uncertain responses; '
+                  'recorded/transported is not delivery proof, only a correlated ack confirms.', file=sys.stderr)
             sys.exit(1)
         return
     if args.cmd in ('submit', 'jobs', 'job', 'task-result', 'routing-machines', 'model-policy', 'task-artifact', 'artifact'):
