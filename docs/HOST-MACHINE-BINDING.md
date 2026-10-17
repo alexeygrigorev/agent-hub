@@ -81,7 +81,9 @@ credential lifetime.
    Include the session's current `x-csrf-token` on mutations; device approval
    also requires the current admin session and CSRF protection. Use the existing
    approved admin workflow, with no credentials in example commands or logs.
-   The agents table has no registration `workspace` or `session_id` columns.
+   The registration API accepts `tag`, `project`, `role` and `machine_id`;
+   legacy `workspace` and `session_id` SQL columns are not registration fields
+   or proof of a genuine native binding.
 5. **Re-pair and verify new credentials.** Start the existing agent device-login
    flow on the intended host. The operator reviews the exact project-qualified
    actor, requested scopes and target machine before approving with
