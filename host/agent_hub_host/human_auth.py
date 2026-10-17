@@ -67,13 +67,14 @@ def _flow():
 
 def human_login(base_url=None, label=None):
     """Run human device login (kind human) and persist the human profile."""
-    from . import system
     base = resolve_base_url(base_url)
     api.check_url(base)
     name = (label or "").strip() or "developer-cli"
     if len(name) > 128:
         raise ValueError("Label too long (max 128)")
-    hostname = system.get_hostname()
+    # Server contract (src/hub.ts /api/device/code): human mode is exactly
+    # POST {kind:"human",label}. Identity/scopes bind at approval time;
+    # no name/hostname/requested_scopes are read for human starts.
     scopes = list(HUMAN_SCOPES)
     starting = config.load_human_config()
     exchange = config._TokenExchange(
@@ -89,11 +90,8 @@ def human_login(base_url=None, label=None):
                 start_path="/api/device/code",
                 token_path="/api/device/token",
                 start_body={
-                    "client_kind": "human",
+                    "kind": "human",
                     "label": name,
-                    "name": name,
-                    "hostname": hostname,
-                    "requested_scopes": scopes,
                 },
                 transient=(urllib.error.URLError,),
             )

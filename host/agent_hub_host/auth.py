@@ -12,10 +12,11 @@ from . import api
 
 HOST_SCOPES = ['host', 'bus:send', 'bus:read', 'health:report']
 AGENT_SCOPES = ['bus:send', 'bus:read', 'health:report']
-# Human CLI default scopes (bus + fleet launch for sessions). The server
-# allowlists these today for host/agent; the human-kind approval is a
-# server-worker followup. Admin is never grantable via device flow.
-HUMAN_SCOPES = ['bus:send', 'bus:read', 'fleet:launch']
+# Human CLI scopes. The server binds ['admin'] to human device grants at
+# approval time (approving allowlisted admin's own identity); the client
+# records the same intent locally. Admin is never grantable via the
+# host/agent device path (server rejects it there).
+HUMAN_SCOPES = ['admin']
 
 
 def _device_flow():

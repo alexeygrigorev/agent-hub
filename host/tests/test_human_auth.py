@@ -136,10 +136,14 @@ class TestHumanLogin(unittest.TestCase):
         with patch("urllib.request.OpenerDirector.open", side_effect=opener):
             with patch.object(sys, "stdout", io.StringIO()):
                 human_auth.human_login("https://hub.example.com", "grove-box")
-        self.assertEqual(bodies.get("client_kind"), "human")
+        # Exact server contract: {kind:"human",label} — no client_kind/name.
+        self.assertEqual(bodies.get("kind"), "human")
         self.assertEqual(bodies.get("label"), "grove-box")
-        self.assertEqual(bodies.get("name"), "grove-box")
-        self.assertIn("bus:send", bodies.get("requested_scopes", []))
+        self.assertNotIn("client_kind", bodies)
+        human = config.load_human_config()
+        self.assertEqual(human.get("client_kind"), "human")
+        self.assertEqual(human.get("client_name"), "grove-box")
+        self.assertEqual(human.get("requested_scopes"), ["admin"])
 
 
 class TestHumanStatusLogout(unittest.TestCase):

@@ -48,17 +48,18 @@ hub auth logout
 
 ## Server contract (server worker implements; client expects)
 
-- `POST /api/device/code` with `{client_kind: "human", label, name,
-  hostname, requested_scopes}` → `{device_code, user_code,
-  verification_uri*, expires_in, interval}`.
+- `POST /api/device/code` with `{kind: "human", label}` → `{device_code, user_code,
+  verification_uri*, expires_in, interval}`. Identity, email, actor and scopes
+  are never taken from the request; the approving allowlisted admin session
+  binds them (human grants are `admin`) at approval time.
 - `POST /api/device/token` with device grant → bearer + refresh pair.
 - `GET /api/auth/me` → safe human identity/status (no tokens).
 - `POST /api/auth/logout {}` → revokes ONLY the human credential family.
 
-Today's Worker accepts `host|agent` device kinds; the `human` kind, the two
-`/api/auth/*` routes, and the anonymous `/cli/*` asset allowlist
-(`install.sh`, `hub.pyz`, `hub.pyz.sha256`, `manifest.json`) are the
-server-worker followup. Client filenames are coordinated exactly.
+Today's Worker accepts the `human` kind, serves the two
+`/api/auth/*` routes, and allowlists the anonymous `/cli/*` assets
+(`install.sh`, `hub.pyz`, `hub.pyz.sha256`, `manifest.json`). Client filenames
+are coordinated exactly.
 
 ## Build (head before deploy)
 
