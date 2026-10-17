@@ -122,6 +122,72 @@ function renderWatch(live, checks) {
   const last = checks.runs.slice(0, 10);
   if (last.length) byId('checks').append(richTable(['Recent run', 'Check', 'Result', 'Detail', 'Action'], last.map(r => [r.at, r.name, stateCell(r.status), r.detail, r.action || ''])));
 }
+function formatBytes(bytes) {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  let b = bytes, i = 0;
+  while (b >= 1024 && i < units.length - 1) { b /= 1024; i++; }
+  return `${i === 0 ? b : b.toFixed(1)} ${units[i]}`;
+}
+function diskBadge(status) {
+  const span = document.createElement('span');
+  span.className = 'dk-badge ' + (status === 'critical' ? 'dk-badge--danger' : status === 'warn' ? 'dk-badge--warning' : 'dk-badge--success');
+  span.textContent = status || 'unknown';
+  return span;
+}
+function renderDisk(disk) {
+  const root = byId('disk-monitoring');
+  if (!root) return;
+  root.replaceChildren();
+  if (!disk || disk.error) {
+    const p = document.createElement('p');
+    p.textContent = disk && disk.error ? `Disk monitoring unavailable: ${disk.error}` : 'No disk monitoring reports yet.';
+    root.append(p);
+    return;
+  }
+  const machines = Array.isArray(disk.machines) ? disk.machines : [];
+  if (!machines.length) {
+    const p = document.createElement('p');
+    p.textContent = 'No filesystem reports collected yet. Enable disk-monitor on reporting hosts.';
+    root.append(p);
+    return;
+  }
+  const rows = [];
+  for (const m of machines) {
+    for (const fs of m.filesystems || []) {
+      let trendText = 'unknown';
+      if (fs.trend && fs.trend.growth_bytes_per_day !== null && fs.trend.growth_bytes_per_day !== undefined) {
+        const sign = fs.trend.growth_bytes_per_day >= 0 ? '+' : '';
+        trendText = `${sign}${formatBytes(fs.trend.growth_bytes_per_day)}/day (${sign}${fs.trend.growth_pct_per_day ?? 0}%/day)`;
+      } else if (fs.trend && fs.trend.state) {
+        trendText = fs.trend.state;
+      }
+      let consumersNode = '-';
+      if (Array.isArray(fs.top_consumers) && fs.top_consumers.length) {
+        const div = document.createElement('div');
+        div.className = 'disk-consumers';
+        for (const c of fs.top_consumers) {
+          const item = document.createElement('div');
+          item.textContent = `${c.path} (${formatBytes(c.size_bytes)})`;
+          div.append(item);
+        }
+        consumersNode = div;
+      }
+      const primaryInfo = fs.is_primary ? '' : ` (alias of ${fs.primary_mount || '/'})`;
+      rows.push([
+        m.machine_id,
+        `${fs.mount_point}${primaryInfo}`,
+        diskBadge(fs.status),
+        `${fs.percent}%`,
+        `${formatBytes(fs.used_bytes)} / ${formatBytes(fs.total_bytes)}`,
+        formatBytes(fs.free_bytes),
+        trendText,
+        consumersNode
+      ]);
+    }
+  }
+  root.append(richTable(['Machine', 'Mount', 'Status', 'Usage', 'Used / Total', 'Free', 'Daily Trend', 'Top Consumers'], rows));
+}
 async function refresh() {
   if (refreshing) return;
   refreshing = true; byId('fleet-refresh').disabled = true;
@@ -135,6 +201,11 @@ async function refresh() {
       renderQuota(await api('/api/quota?view=fleet'));
     } catch (e) {
       renderQuota({ error: e.message });
+    }
+    try {
+      renderDisk(await api('/api/monitoring/disk'));
+    } catch (e) {
+      renderDisk({ error: e.message });
     }
     byId('status').textContent = `Authenticated · updated ${new Date().toLocaleTimeString()}`;
   }

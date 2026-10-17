@@ -23,6 +23,7 @@ import { QuotaStore, handleQuotaRoutes } from './quota';
 import { SessionControlService } from './session_control';
 import { StatusService, type StatusMachineAuth } from './status';
 import { MetricsStore, handleMetricsRoutes } from './metrics';
+import { MonitoringService } from './monitoring';
 
 function parseEpoch(raw: any): number | null {
   if (raw === undefined || raw === null || raw === '' || typeof raw === 'boolean') return null;
@@ -90,6 +91,7 @@ export class Hub extends DurableObject {
   public sessionControlService: SessionControlService;
   public livenessService: LivenessService;
   public checksService: ChecksService;
+  public monitoringService: MonitoringService;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -151,6 +153,14 @@ export class Hub extends DurableObject {
     this.livenessService.init();
     this.checksService = new ChecksService(this.sql);
     this.checksService.init();
+    this.monitoringService = new MonitoringService(
+      this.sql,
+      fn => this.ctx.storage.transactionSync(fn),
+      this.livenessService,
+      alert => this.notifyAlert(alert),
+    );
+    this.monitoringService.init();
+    this.statusService.setMonitoringService(this.monitoringService);
 
     const busForJobs = Object.create(this.busService);
     const runInTxn = (this.ctx.storage as any).transactionSync ? (fn: any) => (this.ctx.storage as any).transactionSync(fn) : (fn: any) => fn();
@@ -412,6 +422,22 @@ export class Hub extends DurableObject {
         const resolved = await this.statusObservationAuth(request);
         if ((resolved as any).error) return (resolved as any).error;
         return this.statusService.handleObservation(request, (resolved as any).auth);
+      }
+      if (path === '/api/monitoring/disk') {
+        if (request.method === 'POST') {
+          const resolved = await this.statusObservationAuth(request);
+          if ((resolved as any).error) return (resolved as any).error;
+          return this.monitoringService.handleObservation(request, (resolved as any).auth);
+        }
+        if (request.method === 'GET') {
+          const auth = await this.authenticateBusRequest(request);
+          if (auth.caller?.isAdmin) {
+            const session = await getSession(this.env, request);
+            if (session) auth.caller.actor = 'human:' + session.sub;
+          }
+          return this.monitoringService.handleGet(request, auth);
+        }
+        return Response.json({ error: 'method_not_allowed' }, { status: 405 });
       }
       if (path === '/api/status') {
         // M14d: GET stays the readonly paginated projection; POST projects

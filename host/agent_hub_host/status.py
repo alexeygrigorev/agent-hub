@@ -93,6 +93,14 @@ def render_human(data):
     offline = (data.get('coverage') or {}).get('expected_offline') or []
     if offline:
         lines.append('expected offline: %s' % ', '.join(escape_display(h) for h in offline))
+    needs_attention = data.get('needs_attention') or []
+    if needs_attention:
+        lines.append('needs attention: %d' % len(needs_attention))
+        for item in needs_attention:
+            lines.append('  [%s] %s: %s' % (
+                escape_display(item.get('severity')),
+                escape_display(item.get('subject')),
+                escape_display(item.get('detail'))))
     for task in data.get('tasks', []):
         lines.append('task %s [%s] %s updated=%s' % (
             escape_display(task.get('id')), escape_display(task.get('status')),
@@ -123,6 +131,24 @@ def render_human(data):
             lines.append('  reports: %s (headline unknown, M14b)' % len(reports))
         if commits:
             lines.append('  commits: %s (deploy/CI unknown, M14c)' % len(commits))
+    disk_fs = data.get('disk') or []
+    if disk_fs:
+        lines.append('disk:')
+        for fs in disk_fs:
+            primary_str = '' if fs.get('is_primary', True) else ' (alias of %s)' % escape_display(fs.get('primary_mount'))
+            trend_str = ''
+            if fs.get('growth_per_day_bytes') is not None:
+                growth_gb = fs['growth_per_day_bytes'] / (1024 ** 3)
+                trend_str = ' growth=%+.1fGB/day' % growth_gb
+            elif fs.get('trend_state') and fs.get('trend_state') != 'unknown':
+                trend_str = ' trend=%s' % escape_display(fs.get('trend_state'))
+            lines.append('  %s %s: %.1f%% (%s)%s%s' % (
+                escape_display(fs.get('machine_id')),
+                escape_display(fs.get('mount_point')),
+                float(fs.get('percent') or 0.0),
+                escape_display(fs.get('status')),
+                primary_str,
+                trend_str))
     cats = data.get('categories') or {}
     summary = data.get('summary')
     if isinstance(summary, dict):

@@ -4,6 +4,7 @@
  * for each bound session. Reports/commits/diff stay honest unknowns. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { IntakeService } from './intake';
+import type { MonitoringService } from './monitoring';
 import { buildSessionInputs } from './session_lifecycle_registry';
 import { classifySession, toStatusDto } from './session_lifecycle';
 import { EXPECTED_OFFLINE_UNTIL, EXPECTED_OFFLINE_REASON, expectedOfflineWindowActive, isExpectedOffline } from './status_offline';
@@ -195,6 +196,7 @@ function strictObservedAt(value: unknown, now: number): string {
 export class StatusService {
   constructor(private sql: SqlStorage, private tx: Tx, private intake: IntakeService, private now: () => number = Date.now) {}
   private gate?: HostObservationGate;
+  private monitoringService?: MonitoringService;
 
   /** Additive table init only (IF NOT EXISTS). Called from Hub construction. */
   init(): void {
@@ -210,6 +212,10 @@ export class StatusService {
    * (or undefined while absent). Never duplicated, never trusted blindly. */
   setObservationGate(gate: HostObservationGate | undefined): void {
     this.gate = gate;
+  }
+
+  setMonitoringService(service: MonitoringService | undefined): void {
+    this.monitoringService = service;
   }
 
   private rows(query: string, ...params: any[]): Obj[] {
@@ -275,7 +281,7 @@ export class StatusService {
       reason: missingHosts.length ? 'one_or_more_hosts_stale_or_unreachable' : expectedOffline.length ? 'all_unexpected_hosts_fresh_expected_offline_excluded' : 'all_known_hosts_fresh' };
   }
 
-  private categoriesDto(nowIso: string, missingHosts: string[], sessionCoverage: string, reportsCollected: boolean, probesCollected: boolean, diff: Obj): Obj {
+  private categoriesDto(nowIso: string, missingHosts: string[], sessionCoverage: string, reportsCollected: boolean, probesCollected: boolean, diff: Obj, diskEntry?: Obj): Obj {
     return {
       tasks_sessions: { state: missingHosts.length ? 'partial' : 'collected', source: 'intake_tasks+routing_jobs+fleet_launches+fleet_sessions+session_control_sessions+lifecycle', observed_at: nowIso, freshness: 'fresh', coverage: sessionCoverage, reason: 'canonical_hub_session_links_with_live_control_state_and_lifecycle' },
       reports: reportsCollected
@@ -285,6 +291,7 @@ export class StatusService {
         ? { state: 'collected_probe_evidence', source: 'host_probe_git_ci_deploy_exact_sha', observed_at: nowIso, freshness: 'fresh', coverage: 'partial', reason: 'explicit_argv_probes_never_push_or_ci_inference_for_deploy' }
         : { state: 'unknown_not_collected', source: 'intake_history_commit_reference_only', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'verified_git_ancestry_active_deployment_ci_adapters_require_M14c', successor: 'M14c' },
       pending_actions: { state: 'collected_intake_only', source: 'intake_unresolved_followup_blocker_pending_approval', observed_at: nowIso, freshness: 'fresh', coverage: 'complete', reason: 'login_user_codes_withheld_in_this_cut_device_tokens_never_exported', successor: 'M14c_login_metadata' },
+      disk_monitoring: diskEntry ?? { state: 'unknown_not_collected', source: 'host_disk_monitor_stdlib_statvfs', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'requires_disk_monitor_collector', successor: 'Addendum6' },
       diff,
     };
   }
@@ -358,15 +365,19 @@ export class StatusService {
         const now = this.now();
         const nowIso = new Date(now).toISOString();
         const built = this.buildItems(p, page, hostFilter, sinceMs, now, nowIso);
+        const diskSummary = this.monitoringService ? this.monitoringService.getStatusSummary(now) : null;
         return json({
           snapshot_at: nowIso,
           revision,
           authorized_scope: (p as any).admin ? 'operator_all' : 'explicit_grants_only',
           tasks: built.items,
+          disk: diskSummary?.filesystems ?? [],
+          needs_attention: diskSummary?.needs_attention ?? [],
           pagination: { next, total, limit },
           coverage: this.coverageDto(built.missingHosts, built.expectedOffline, built.sessionCoverage, now),
           categories: this.categoriesDto(nowIso, built.missingHosts, built.sessionCoverage, built.reportsCollected, built.probesCollected,
-            { state: 'not_available_on_get', source: 'caller_scoped_baseline_store_post_only', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'use_POST_/api/status_to_project_and_advance_caller_baseline', successor: 'M14d' }),
+            { state: 'not_available_on_get', source: 'caller_scoped_baseline_store_post_only', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'use_POST_/api/status_to_project_and_advance_caller_baseline', successor: 'M14d' },
+            diskSummary?.categories_entry),
           data_notice: DATA_NOTICE,
         });
       });
@@ -432,19 +443,23 @@ export class StatusService {
           }
         } catch { /* capacity trim is best-effort */ }
         const summary = this.summaryDto(tasks, selected.length);
+        const diskSummary = this.monitoringService ? this.monitoringService.getStatusSummary(now) : null;
         return json({
           snapshot_at: nowIso,
           revision,
           authorized_scope: (p as any).admin ? 'operator_all' : 'explicit_grants_only',
           summary,
           tasks: built.items,
+          disk: diskSummary?.filesystems ?? [],
+          needs_attention: diskSummary?.needs_attention ?? [],
           pagination: { next: null, total: tasks.length, limit: tasks.length },
           coverage: this.coverageDto(built.missingHosts, built.expectedOffline, built.sessionCoverage, now),
           categories: this.categoriesDto(nowIso, built.missingHosts, built.sessionCoverage, built.reportsCollected, built.probesCollected,
             { state: diff.state, source: 'caller_scoped_durable_baseline', observed_at: nowIso, freshness: 'fresh', coverage: 'complete',
               reason: diff.state === 'first_baseline' ? 'first_call_baseline_recorded' : 'diff_since_caller_previous_post',
               previous_snapshot_at: (previous as any)?.snapshot_at ?? null,
-              added: diff.added, removed: diff.removed, changed: diff.changed, baseline_advanced: true }),
+              added: diff.added, removed: diff.removed, changed: diff.changed, baseline_advanced: true },
+            diskSummary?.categories_entry),
           data_notice: DATA_NOTICE,
         });
       });
