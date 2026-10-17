@@ -137,3 +137,20 @@ as either `expires_at_ms` (int) or `expires_at` (ISO) and normalizes it.
    `Dispatcher.dispatch` in `host/agent_hub_host/fleet.py`.
 5. **Independent review**: different-model review of the exact version before
    integration; head integrates.
+
+## Supervised Hetzner runtime
+
+`python -m agent_hub_host.session_host` runs Fleet reporting and session-command reception inside a genuine native Shell controller. It verifies its sender binding before effects and holds one lock per journal. Fleet report failures do not prevent capture, stop or receipt reconciliation on existing sessions.
+
+`scripts/session-host-supervisor.py` creates and monitors only its own native controller. It compares the exact UUID, tag, workspace, engine, creation time and command before stopping that controller. No persisted caller-supplied session id is adopted. The supplied user service restarts a failed supervisor and keeps credentials in a separate private configuration:
+
+```sh
+cp deploy/agent-hub-session-host.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now agent-hub-session-host.service
+systemctl --user status agent-hub-session-host.service
+```
+
+First configure the service's private credential file, subscription/workspace mappings and journal path. The service template uses the operator's `~/git/agent-hub/.local/platform-runtime` configuration. It does not use or overwrite the default host configuration. Restart the service after changing subscription settings. Starting this service must replace a previous controller using the same journal; do not run the earlier manual polling loop alongside it.
+
+A service restart stops its own controller, while target agent sessions remain independently bound in the Hub. Pending delivery attempts retain their journal and reconcile without repeating the native send; an unproven reply remains unknown. Runtime acceptance must include a real service restart and the public session smoke test, not merely an active systemd unit.
