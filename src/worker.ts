@@ -38,7 +38,7 @@ export default {
       return env.HUB.get(env.HUB.idFromName('hub')).fetch(new Request(url, request));
     }
 
-    if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/auth/') || url.pathname.startsWith('/device')) {
+    if (url.pathname === '/mcp' || url.pathname.startsWith('/oauth/') || url.pathname.startsWith('/.well-known/') || url.pathname.startsWith('/api/') || url.pathname.startsWith('/auth/') || url.pathname.startsWith('/device')) {
       const id = env.HUB.idFromName("hub");
       const stub = env.HUB.get(id);
       return stub.fetch(request);

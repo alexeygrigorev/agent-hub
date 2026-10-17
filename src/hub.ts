@@ -54,6 +54,14 @@ async function safeJson(req: Request): Promise<Record<string, any> | null> {
   finally { reader.releaseLock(); }
 }
 
+/** Only the two local consent entry points may survive bootstrap token login. */
+function safeAuthReturn(value: string | null): string | null {
+  if (!value || value.length > 4096 || /[\\\x00-\x20\x7f#]/.test(value)) return null;
+  if (/^\/device\?code=[A-Za-z0-9-]{1,32}$/.test(value)) return value;
+  if (value.startsWith('/oauth/authorize?')) return value;
+  return null;
+}
+
 function htmlEscape(str: string): string {
   return String(str).replace(/[&<>'"]/g, 
     tag => ({
@@ -579,7 +587,7 @@ export class Hub extends DurableObject {
         const originAllowed = isAllowedOidcOrigin(this.env, url.toString(), forwardedHost);
         if (validSessionSecret(this.env) && adminTokenHash(this.env) && (configuredAdmins(this.env).length === 0 || !originAllowed)) {
           const next = url.searchParams.get('return_to');
-          const location = next && /^\/device\?code=[A-Za-z0-9-]{1,32}$/.test(next) ? '/auth/token?return_to=' + encodeURIComponent(next) : '/auth/token';
+          const location = safeAuthReturn(next) ? '/auth/token?return_to=' + encodeURIComponent(next!) : '/auth/token';
           return new Response(null, { status: 303, headers: { Location: location, 'Cache-Control': 'private, no-store' } });
         }
         if (!validSessionSecret(this.env) || configuredAdmins(this.env).length === 0) return authFailure(request, 'authentication_not_configured', 503, {}, 'authentication_not_configured');
@@ -1184,112 +1192,7 @@ export class Hub extends DurableObject {
         }
       }
 
-      if (path === '/api/token/refresh') {
-        if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
-        const body = await safeJson(request);
-        if (!body || body.grant_type !== 'refresh_token' || typeof body.refresh_token !== 'string' || !body.refresh_token || body.refresh_token.length > 256) {
-          return Response.json({ error: 'invalid_request' }, { status: 400 });
-        }
-
-        const refreshHash = await sha256(body.refresh_token);
-        
-        // PRE-GENERATE values before any synchronous DB interaction to prevent partial state on await failures
-        const { accessToken, refreshToken, accessHash, refreshHash: newRefreshHash } = await generateTokenPair();
-        const newId = randomString(16);
-        const now = new Date(Date.now()).toISOString();
-
-        let errorResponse = null;
-        let scopesResponse = '';
-        let expiresAtResponse = '';
-        let machineIdResponse: string | null = null;
-        
-        this.ctx.storage.transactionSync(() => {
-        const cred = this.sql.exec('SELECT * FROM credentials WHERE refresh_hash = ?', refreshHash).toArray()[0] as any;
-        const nowMs = Date.parse(now);
-        if (!cred) {
-          errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
-        } else if (cred.revoked_at) {
-          // Replay or explicitly revoked! Revoke family.
-          this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
-          errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
-        } else if (!Number.isFinite(Date.parse(cred.expires_at)) || Date.parse(cred.expires_at) <= nowMs) {
-          errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
-        } else if (cred.kind === 'agent' && !credentialActor(this.sql, cred)) {
-          errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
-        } else if (cred.kind === 'human' && !this.isHumanRefreshAllowed(cred)) {
-          // Removed-admin, mismatched identity or non-admin human scope:
-          // revoke the family so it cannot refresh back, then fail closed.
-          this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
-          errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
-        } else {
-          const res = this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', now, cred.id);
-          if (res.rowsWritten !== 1) {
-            this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
-            errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
-          } else {
-            this.sql.exec(`
-              INSERT INTO credentials
-              (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, registry_actor, approval_seq)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `, newId, cred.kind, accessHash, newRefreshHash, cred.family_id, cred.subject, cred.machine_id, cred.actor, cred.scopes, cred.created_by_sub, now, cred.expires_at, cred.registry_actor ?? null, cred.approval_seq ?? null);
-
-            // Host-enrollment continuity (from f20; M9 metrics-row migration
-            // guarded: those tables exist only after MetricsStore.init):
-            // atomically rotate the host machine binding only when it still
-            // belongs to the validated predecessor. Stale/foreign/rebound or
-            // deleted/re-enrolled families must never overwrite a new
-            // registration; a legitimate refresh keeps its binding so its
-            // subsequent register calls still pass the owner CAS.
-            if (cred.kind === 'host' && typeof cred.machine_id === 'string' && cred.machine_id) {
-              const machineUpdate = this.sql.exec(
-                'UPDATE machines SET credential_id = ? WHERE id = ? AND credential_id = ?',
-                newId, cred.machine_id, cred.id
-              );
-              // M9 metrics continuity: migrate rows bound to the validated
-              // predecessor only when the machine binding actually rotated.
-              // Stale/foreign/rebound refreshes mutate nothing.
-              if (machineUpdate.rowsWritten === 1) {
-                try {
-                  const hasLatest = this.sql.exec(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='host_metrics_latest'"
-                  ).toArray().length > 0;
-                  if (hasLatest) {
-                    this.sql.exec(
-                      'UPDATE host_metrics_latest SET credential_id = ? WHERE host_id = ? AND credential_id = ?',
-                      newId, cred.machine_id, cred.id
-                    );
-                  }
-                  const hasRetry = this.sql.exec(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='host_metrics_idempotency'"
-                  ).toArray().length > 0;
-                  if (hasRetry) {
-                    this.sql.exec(
-                      'UPDATE host_metrics_idempotency SET credential_id = ? WHERE host_id = ? AND credential_id = ?',
-                      newId, cred.machine_id, cred.id
-                    );
-                  }
-                } catch { /* metrics tables absent or migration contended: auth rotation already committed */ }
-              }
-            }
-
-            scopesResponse = JSON.parse(cred.scopes).join(' ');
-            expiresAtResponse = cred.expires_at;
-            machineIdResponse = cred.machine_id ?? null;
-          }
-        }
-
-        });
-        if (errorResponse) return errorResponse;
-
-        return Response.json({
-          access_token: accessToken,
-          refresh_token: refreshToken,
-          token_type: 'Bearer',
-          expires_in: Math.max(0, Math.floor((new Date(expiresAtResponse).getTime() - new Date(now).getTime()) / 1000)),
-          scope: scopesResponse,
-          machine_id: machineIdResponse
-        });
-      }
+      if (path === '/api/token/refresh') return await this.refreshCredential(request);
 
       if (path === '/api/token/revoke') {
         if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
@@ -1438,6 +1341,121 @@ export class Hub extends DurableObject {
     }
   }
 
+  protected async refreshCredential(request: Request, binding?: { client: string; resource: string }): Promise<Response> {
+      if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+      const body = await safeJson(request);
+      if (!body || body.grant_type !== 'refresh_token' || typeof body.refresh_token !== 'string' || !body.refresh_token || body.refresh_token.length > 256) {
+        return Response.json({ error: 'invalid_request' }, { status: 400 });
+      }
+
+      const refreshHash = await sha256(body.refresh_token);
+
+      // PRE-GENERATE values before any synchronous DB interaction to prevent partial state on await failures
+      const { accessToken, refreshToken, accessHash, refreshHash: newRefreshHash } = await generateTokenPair();
+      const newId = randomString(16);
+      const now = new Date(Date.now()).toISOString();
+
+      let errorResponse = null;
+      let scopesResponse = '';
+      let expiresAtResponse = '';
+      let machineIdResponse: string | null = null;
+
+      this.ctx.storage.transactionSync(() => {
+      const cred = this.sql.exec('SELECT * FROM credentials WHERE refresh_hash = ?', refreshHash).toArray()[0] as any;
+      const nowMs = Date.parse(now);
+      const hasMcp = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mcp_grants'").toArray().length > 0;
+      const mcpGrant = cred && hasMcp ? this.sql.exec('SELECT * FROM mcp_grants WHERE family=?', cred.family_id).toArray()[0] as any : null;
+      // OAuth refresh is usable only through the client/resource-bound server path.
+      // This context is an internal method argument, never an HTTP header or body field.
+      if ((mcpGrant && (!binding || mcpGrant.client !== binding.client || mcpGrant.resource !== binding.resource || mcpGrant.expires <= Date.now())) || (binding && !mcpGrant)) {
+        errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
+        return;
+      }
+      if (!cred) {
+        errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
+      } else if (cred.revoked_at) {
+        // Replay or explicitly revoked! Revoke family.
+        this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
+        errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
+      } else if (!Number.isFinite(Date.parse(cred.expires_at)) || Date.parse(cred.expires_at) <= nowMs) {
+        errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
+      } else if (cred.kind === 'agent' && !credentialActor(this.sql, cred)) {
+        errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
+      } else if (cred.kind === 'human' && !this.isHumanRefreshAllowed(cred)) {
+        // Removed-admin, mismatched identity or non-admin human scope:
+        // revoke the family so it cannot refresh back, then fail closed.
+        this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
+        errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
+      } else {
+        const res = this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', now, cred.id);
+        if (res.rowsWritten !== 1) {
+          this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
+          errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
+        } else {
+          this.sql.exec(`
+            INSERT INTO credentials
+            (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, registry_actor, approval_seq)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `, newId, cred.kind, accessHash, newRefreshHash, cred.family_id, cred.subject, cred.machine_id, cred.actor, cred.scopes, cred.created_by_sub, now, cred.expires_at, cred.registry_actor ?? null, cred.approval_seq ?? null);
+
+          // Host-enrollment continuity (from f20; M9 metrics-row migration
+          // guarded: those tables exist only after MetricsStore.init):
+          // atomically rotate the host machine binding only when it still
+          // belongs to the validated predecessor. Stale/foreign/rebound or
+          // deleted/re-enrolled families must never overwrite a new
+          // registration; a legitimate refresh keeps its binding so its
+          // subsequent register calls still pass the owner CAS.
+          if (cred.kind === 'host' && typeof cred.machine_id === 'string' && cred.machine_id) {
+            const machineUpdate = this.sql.exec(
+              'UPDATE machines SET credential_id = ? WHERE id = ? AND credential_id = ?',
+              newId, cred.machine_id, cred.id
+            );
+            // M9 metrics continuity: migrate rows bound to the validated
+            // predecessor only when the machine binding actually rotated.
+            // Stale/foreign/rebound refreshes mutate nothing.
+            if (machineUpdate.rowsWritten === 1) {
+              try {
+                const hasLatest = this.sql.exec(
+                  "SELECT name FROM sqlite_master WHERE type='table' AND name='host_metrics_latest'"
+                ).toArray().length > 0;
+                if (hasLatest) {
+                  this.sql.exec(
+                    'UPDATE host_metrics_latest SET credential_id = ? WHERE host_id = ? AND credential_id = ?',
+                    newId, cred.machine_id, cred.id
+                  );
+                }
+                const hasRetry = this.sql.exec(
+                  "SELECT name FROM sqlite_master WHERE type='table' AND name='host_metrics_idempotency'"
+                ).toArray().length > 0;
+                if (hasRetry) {
+                  this.sql.exec(
+                    'UPDATE host_metrics_idempotency SET credential_id = ? WHERE host_id = ? AND credential_id = ?',
+                    newId, cred.machine_id, cred.id
+                  );
+                }
+              } catch { /* metrics tables absent or migration contended: auth rotation already committed */ }
+            }
+          }
+
+          scopesResponse = JSON.parse(cred.scopes).join(' ');
+          expiresAtResponse = cred.expires_at;
+          machineIdResponse = cred.machine_id ?? null;
+        }
+      }
+
+      });
+      if (errorResponse) return errorResponse;
+
+      return Response.json({
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        token_type: 'Bearer',
+        expires_in: Math.max(0, Math.floor((new Date(expiresAtResponse).getTime() - new Date(now).getTime()) / 1000)),
+        scope: scopesResponse,
+        machine_id: machineIdResponse
+      });
+  }
+
   private tokenFailures: number[] = [];
 
   /** Admin sign-in with a high-entropy token whose SHA-256 is a Worker secret. */
@@ -1445,7 +1463,7 @@ export class Hub extends DurableObject {
     const headers = { 'Cache-Control': 'private, no-store', 'Content-Security-Policy': UI_HEADERS['Content-Security-Policy'], 'X-Content-Type-Options': 'nosniff' };
     const hash = adminTokenHash(this.env);
     if (!hash || !validSessionSecret(this.env)) return authFailure(request, 'authentication_not_configured', 503, headers);
-    const safeNext = (value: string | null) => value && /^\/device\?code=[A-Za-z0-9-]{1,32}$/.test(value) ? value : null;
+    const safeNext = safeAuthReturn;
     let next = safeNext(new URL(request.url).searchParams.get('return_to'));
     const page = (message: string, status = 200) => new Response(tokenPage(message, next, status), {status,headers:UI_HEADERS});
     if (request.method === 'GET') return page('Sign in with the admin token kept on your machine.');
@@ -1805,7 +1823,7 @@ export class Hub extends DurableObject {
     }
   }
 
-  private async authenticateBusRequest(request: Request): Promise<{ caller?: CallerContext; scopes?: string[]; error?: Response }> {
+  protected async authenticateBusRequest(request: Request): Promise<{ caller?: CallerContext; scopes?: string[]; error?: Response }> {
     const session = await getSession(this.env, request);
     if (session) {
       if (!session.isAdmin) {

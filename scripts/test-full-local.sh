@@ -8,7 +8,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}" || exit 1
 
 mkdir -p .local/tmp || exit 1
-export TMPDIR="${REPO_ROOT}/.local/tmp"
+export TMPDIR="${TMPDIR:-${REPO_ROOT}/.local/tmp}"
 
 # Disposable HOME to ensure hermeticity against personal dotfiles / checkouts
 DISPOSABLE_HOME="$(mktemp -d -p "${TMPDIR}" home-hermetic-XXXXXX)" || exit 1

@@ -78,7 +78,7 @@ jobs:
           python3 scripts/ci/test_ci.py
 
       - name: Focused Worker tests (Vitest)
-        run: npx vitest run test/human-auth.test.ts test/token-auth.test.ts test/auth-web-repair.test.ts test/proxy-origin.test.ts test/session-control.test.ts test/fleet.test.ts test/role-leases.test.ts test/m4-jobs.test.ts test/intake.test.ts test/monitoring.test.ts test/checks.test.ts test/status.test.ts test/session-lifecycle.test.ts test/session-lifecycle-m15c.test.ts
+        run: npx vitest run test/mcp.test.ts test/human-auth.test.ts test/token-auth.test.ts test/auth-web-repair.test.ts test/proxy-origin.test.ts test/session-control.test.ts test/fleet.test.ts test/role-leases.test.ts test/m4-jobs.test.ts test/intake.test.ts test/monitoring.test.ts test/checks.test.ts test/status.test.ts test/session-lifecycle.test.ts test/session-lifecycle-m15c.test.ts
 
       - name: Build Hub CLI zipapp
         run: python3 scripts/build-hub-cli.py --out-dir public/cli

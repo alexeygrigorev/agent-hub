@@ -1,3 +1,5 @@
+import { McpOAuth } from './mcp-oauth';
+import { handleMcp } from './mcp';
 import { Hub as BaseHub } from './hub';
 import type { ActionDeps } from './checks';
 import { Env } from './env';
@@ -16,11 +18,13 @@ import type { ConversationLinksService } from './conversation-links';
  * WebSocket hibernation behavior.
  */
 export class Hub extends BaseHub {
+  public mcpOAuth: McpOAuth;
   public conversationsService: ConversationsService;
   public linksService: ConversationLinksService;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.mcpOAuth = new McpOAuth(this.sql, env, fn => this.ctx.storage.transactionSync(fn), (req, client, resource) => this.refreshCredential(req, { client, resource }));
     const storage = this.ctx.storage as DurableObjectStorage & {
       transactionSync?: <T>(fn: () => T) => T;
     };
@@ -175,6 +179,13 @@ export class Hub extends BaseHub {
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
+    if (path === '/mcp') return handleMcp(request, async req => {
+      const auth = await this.authenticateBusRequest(req);
+      if (auth.caller?.tokenId && !this.mcpOAuth.acceptsResource(auth.caller.tokenId, new URL(req.url).origin + '/mcp'))
+        return { error: Response.json({ error: 'invalid_target' }, { status: 401 }) };
+      return auth;
+    }, req => this.fetch(req));
+    if (path.startsWith('/oauth/') || path.startsWith('/.well-known/')) return this.mcpOAuth.handle(request);
 
     if (path === '/api/conversations' || path.startsWith('/api/conversations/')) {
       try {
