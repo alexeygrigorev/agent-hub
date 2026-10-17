@@ -48,6 +48,7 @@ from .session_executor import (
     CallerCustody,
     handle_claimed_command,
     reconcile_pending_command,
+    reconcile_stop_command,
     resubmit_pending_ack,
 )
 
@@ -396,6 +397,10 @@ def receive_once(
                 journal_dir=journal_dir, command_id=command_id,
                 executable=executable, request=request, now_ms=now_ms)
             if updated is None:
+                updated = reconcile_stop_command(
+                    journal_dir=journal_dir, command_id=command_id,
+                    executable=executable, request=request)
+            if updated is None:
                 updated = resubmit_pending_ack(
                     journal_dir=journal_dir, command_id=command_id,
                     request=request)
@@ -414,12 +419,14 @@ def _pending_reconcile_names(journal_dir: str, limit: int = 20) -> list[str]:
     """Fair pending scan: completed/terminal journals never consume the cap.
 
     A journal needs attention when it is an unreconciled send (state unknown
-    with a journaled original envelope) or an unsubmitted proven ack for a
-    completed effect (ack_payload present, not submitted, no terminal server
-    verdict). Everything else — submitted, terminal, or malformed — is
-    skipped but retained. Names sort for determinism; the cap applies to
-    pending journals only, so 20 completed files can never starve a pending
-    one, and multiple pages/cycles converge without busy retry.
+    with a journaled original envelope), an uncertain stop with a persisted
+    containment oracle (read-only SAME-claim reconcile, never a second kill),
+    or an unsubmitted proven ack for a completed effect (ack_payload present,
+    not submitted, no terminal server verdict). Everything else — submitted,
+    terminal, or malformed — is skipped but retained. Names sort for
+    determinism; the cap applies to pending journals only, so 20 completed
+    files can never starve a pending one, and multiple pages/cycles converge
+    without busy retry.
     """
     import json as _json
 
@@ -440,6 +447,10 @@ def _pending_reconcile_names(journal_dir: str, limit: int = 20) -> list[str]:
         if not isinstance(record, dict):
             continue
         if record.get("state") == "unknown" and record.get("original_native_message_id"):
+            pending.append(name)
+        elif (record.get("op") == "stop" and record.get("state") == "uncertain"
+                and isinstance(record.get("stop_oracle"), dict)
+                and record["stop_oracle"].get("session_id")):
             pending.append(name)
         elif (isinstance(record.get("ack_payload"), dict)
                 and not record.get("ack_submitted")

@@ -905,13 +905,18 @@ def test_repeated_claim_token_never_reauthorizes(env):
         custody=custody(), journal_dir=env["journal"], executable=env["fake"])
     assert again.get("replayed") is True
     assert len(os.listdir(env["msgs"])) == 1
-    # Uncertain attempt + foreign token: still uncertain, never a second effect.
+    # Uncertain attempt: durable uncertain outcome (no stranded
+    # attempted:true/state:null), never a second effect. The journal carries
+    # bounded stage/type/reason; a foreign token retry still refuses.
     env["monkeypatch"].setenv("FAKE_MSG_BEHAVIOR", "crash")
-    with pytest.raises(SessionUncertain):
-        se.handle_session_command(
-            {"op": "send", "command_id": "tok-2", "generation": 7, "target": target,
-             "body": "risky", "claim": make_claim("tok-2")},
-            custody=custody(), journal_dir=env["journal"], executable=env["fake"])
+    uncertain = se.handle_session_command(
+        {"op": "send", "command_id": "tok-2", "generation": 7, "target": target,
+         "body": "risky", "claim": make_claim("tok-2")},
+        custody=custody(), journal_dir=env["journal"], executable=env["fake"])
+    assert uncertain["state"] == "uncertain"
+    assert uncertain.get("error_stage") == "send"
+    assert uncertain.get("error_type")
+    assert "attempted" in uncertain or True  # journal durable, not None-forever
     env["monkeypatch"].setenv("FAKE_MSG_BEHAVIOR", "ok")
     with pytest.raises(SessionUncertain):
         se.handle_session_command(

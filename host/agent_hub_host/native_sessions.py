@@ -884,6 +884,135 @@ def _confirm_workload_exit(before: NativeSession) -> tuple[bool, str]:
     return False, "no containment/process proof available; exit unproven"
 
 
+STOP_ORACLE_VERSION = 1
+
+
+def _oracle_from_row(row: NativeSession) -> dict[str, Any]:
+    """Project the owned pre-stop containment oracle (bounded, private, no secrets).
+
+    Captures the exact bound identity (UUID/tag/workspace/generation/engine)
+    plus the owned workload liveness witnesses (PIDs, cgroup, containment
+    flag, phases). No argv, no output, no tokens. Callers persist this BEFORE
+    the kill result so a later read-only reconcile can confirm exit against
+    the SAME claim without a second kill.
+    """
+    return {
+        "version": STOP_ORACLE_VERSION,
+        "session_id": row.session_id,
+        "tag": row.tag,
+        "workspace": row.workspace,
+        "created_at_ms": row.created_at_ms,
+        "engine": row.engine,
+        "phase": row.phase,
+        "worker_pid": row.worker_pid if type(row.worker_pid) is int else None,
+        "workload_pid": row.workload_pid if type(row.workload_pid) is int else None,
+        "processes": row.processes if type(row.processes) is int else None,
+        "containment_empty": row.containment_empty if type(row.containment_empty) is bool else None,
+        "workload_cgroup": row.workload_cgroup if isinstance(row.workload_cgroup, str) else None,
+        "last_activity_ms": row.last_activity_ms if type(row.last_activity_ms) is int else None,
+    }
+
+
+def _row_from_oracle(oracle: dict[str, Any]) -> NativeSession:
+    """Rebuild the observed row from a persisted oracle (for read-only confirm)."""
+    return NativeSession(
+        session_id=str(oracle.get("session_id", "")),
+        tag=str(oracle.get("tag", "")),
+        workspace=str(oracle.get("workspace", "")),
+        engine=oracle.get("engine") if isinstance(oracle.get("engine"), str) else None,
+        phase=str(oracle.get("phase", "unknown")),
+        worker_pid=oracle.get("worker_pid") if type(oracle.get("worker_pid")) is int else None,
+        workload_pid=oracle.get("workload_pid") if type(oracle.get("workload_pid")) is int else None,
+        processes=oracle.get("processes") if type(oracle.get("processes")) is int else None,
+        containment_empty=oracle.get("containment_empty") if type(oracle.get("containment_empty")) is bool else None,
+        workload_cgroup=oracle.get("workload_cgroup") if isinstance(oracle.get("workload_cgroup"), str) else None,
+        last_activity_ms=oracle.get("last_activity_ms") if type(oracle.get("last_activity_ms")) is int else None,
+        created_at_ms=oracle.get("created_at_ms") if type(oracle.get("created_at_ms")) is int else None,
+    )
+
+
+def _uncertain_with_oracle(message: str, oracle: dict[str, Any],
+                           kill: dict[str, Any]) -> SessionUncertain:
+    """Attach the qualified pre-stop oracle + kill attempt/result (no secrets)."""
+    exc = SessionUncertain(message)
+    try:
+        setattr(exc, "oracle", dict(oracle))
+        setattr(exc, "kill", dict(kill))
+    except Exception:
+        pass
+    return exc
+
+
+def reconcile_stop_oracle(
+    executable: str,
+    oracle: dict[str, Any],
+    kill: dict[str, Any],
+) -> tuple[bool, str]:
+    """Read-only reconcile of SAME stop claim against its qualified oracle.
+
+    Never kills, never mutates: lists the catalog, binds the SAME UUID/tag/
+    workspace/generation, guards PID-reuse/foreign/session-family (a live row
+    with the same UUID but a different tag/workspace/generation is NOT our
+    proof; a live PID is NOT exit), and confirms exit ONLY via the persisted
+    oracle's containment witnesses (reaped cgroup, dead PIDs, catalog empty).
+    An absent catalog record alone is NEVER exit proof.
+    """
+    if not isinstance(oracle, dict) or not oracle.get("session_id"):
+        return False, "oracle unqualified; reconcile manually"
+    try:
+        sid = str(oracle["session_id"])
+        tag = str(oracle["tag"])
+        ws = str(oracle["workspace"])
+        gen = oracle.get("created_at_ms")
+    except (KeyError, TypeError, ValueError):
+        return False, "oracle unqualified; reconcile manually"
+    try:
+        rows = [s for s in list_sessions(executable, include_exited=True)
+                if s.session_id.lower() == sid.lower()
+                and s.tag == tag
+                and canonicalize_workspace(s.workspace) == ws]
+    except (SessionControlError, SessionUncertain, OSError):
+        # Catalog unreadable: cannot prove exit read-only; stay uncertain.
+        return False, "catalog unreadable; exit unproven"
+    if rows:
+        row = rows[0]
+        # SAME-claim guards: generation drift or engine change means the live
+        # row is a different incarnation/family — not our exit proof.
+        if type(gen) is int and row.created_at_ms != gen:
+            return False, "live row generation differs; not our exit (no re-kill)"
+        # A live non-terminal row is still running: capacity NOT released.
+        # The catalog row is authoritative while it lives — never claim
+        # stopped from PIDs/cgroup alone here (PID reuse / reaping race).
+        # Only a terminal phase (below) or an absent record with a proven
+        # oracle may confirm.
+        if row.phase not in TERMINAL_PHASES:
+            return False, "target still %s after kill; capacity NOT released (no re-kill)" % row.phase
+        # Terminal row: confirm via CURRENT witnesses, falling back to the
+        # persisted oracle's witnesses (same claim, same PIDs/cgroup).
+        confirmed, why = _confirm_workload_exit(row)
+        if confirmed:
+            return True, "terminal phase observed: %s (%s)" % (row.phase, why)
+        try:
+            before = _row_from_oracle(oracle)
+        except Exception:
+            return False, "oracle unparsable; exit unproven"
+        confirmed_o, why_o = _confirm_workload_exit(before)
+        if confirmed_o:
+            return True, "terminal row + persisted oracle confirm exit (%s)" % why_o
+        return False, "target terminal (%s) but %s; reconcile (no re-kill)" % (row.phase, why)
+    # Absent record: NEVER exit proof alone. Confirm ONLY via the persisted
+    # oracle's live witnesses (cgroup reaped / PIDs dead / containment empty
+    # observed BEFORE the kill, re-checked live now by _confirm_workload_exit).
+    try:
+        before = _row_from_oracle(oracle)
+    except Exception:
+        return False, "oracle unparsable; exit unproven"
+    confirmed, why = _confirm_workload_exit(before)
+    if confirmed:
+        return True, "native record cleaned up after kill (%s)" % why
+    return False, "native record gone after kill but %s; reconcile (no re-kill)" % why
+
+
 def stop_session(
     executable: str,
     target: NativeTarget,
@@ -898,6 +1027,11 @@ def stop_session(
     must be proven gone (reaped cgroup, dead PIDs, or catalog containment
     empty). A still-running UUID — or a vanished record with no containment
     proof — is ``uncertain``, never silently released.
+
+    Every uncertain path carries the qualified pre-stop oracle
+    (``exc.oracle``) + kill attempt/result (``exc.kill``) so a later
+    read-only :func:`reconcile_stop_oracle` can confirm the SAME claim
+    without a second kill. Absent catalog alone is never exit proof.
     """
     target = target.validated()
     if signal not in ("HUP", "TERM"):
@@ -918,12 +1052,16 @@ def stop_session(
             % (before[0].engine, target.engine)
         )
     generation = before[0].created_at_ms
+    oracle = _oracle_from_row(before[0])
+    attempt = {"signal": signal, "grace_ms": grace_ms}
     if before[0].phase in TERMINAL_PHASES:
         confirmed, why = _confirm_workload_exit(before[0])
         if confirmed:
             return StopResult(state="stopped", session_id=target.session_id,
                               reason="already terminal before kill: %s (%s)" % (before[0].phase, why))
-        raise SessionUncertain("Target terminal but workload exit unproven (%s); reconcile" % why)
+        raise _uncertain_with_oracle(
+            "Target terminal but workload exit unproven (%s); reconcile" % why,
+            oracle, {**attempt, "killed": False, "result": "no_kill_terminal_unproven"})
     proc = run_native(
         executable,
         ["kill", "--workspace", target.workspace, "--tag", target.tag,
@@ -933,7 +1071,9 @@ def stop_session(
     if proc.returncode != 0:
         # No exit proof: the session may be gone because it was forgotten/pruned
         # while running (forget claims no stop). Reconcile, never assume stopped.
-        raise SessionUncertain("Kill reported failure; target exit unproven — reconcile")
+        raise _uncertain_with_oracle(
+            "Kill reported failure; target exit unproven — reconcile",
+            oracle, {**attempt, "killed": False, "result": "kill_failed"})
     remaining = [s for s in list_sessions(executable, include_exited=True)
                    if s.session_id.lower() == target.session_id.lower()
                    and s.tag == target.tag
@@ -947,15 +1087,21 @@ def stop_session(
         if confirmed:
             return StopResult(state="stopped", session_id=target.session_id,
                               reason="native record cleaned up after kill (%s)" % why)
-        raise SessionUncertain("Native record gone after kill but %s; reconcile" % why)
+        raise _uncertain_with_oracle(
+            "Native record gone after kill but %s; reconcile" % why,
+            oracle, {**attempt, "killed": True, "result": "record_absent_unproven"})
     if generation is not None and remaining[0].created_at_ms != generation:
-        raise SessionUncertain("Native generation changed across kill; exit unproven")
+        raise _uncertain_with_oracle(
+            "Native generation changed across kill; exit unproven",
+            oracle, {**attempt, "killed": True, "result": "generation_changed"})
     if remaining[0].phase in TERMINAL_PHASES:
         confirmed, why = _confirm_workload_exit(remaining[0])
         if confirmed:
             return StopResult(state="stopped", session_id=target.session_id,
                               reason="terminal phase observed: %s (%s)" % (remaining[0].phase, why))
-        raise SessionUncertain("Target terminal (%s) but %s; reconcile" % (remaining[0].phase, why))
-    raise SessionUncertain(
-        f"Target still {remaining[0].phase} after kill; capacity NOT released"
-    )
+        raise _uncertain_with_oracle(
+            "Target terminal (%s) but %s; reconcile" % (remaining[0].phase, why),
+            oracle, {**attempt, "killed": True, "result": "terminal_unproven"})
+    raise _uncertain_with_oracle(
+        "Target still %s after kill; capacity NOT released" % remaining[0].phase,
+        oracle, {**attempt, "killed": True, "result": "still_running"})
