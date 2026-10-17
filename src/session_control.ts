@@ -653,7 +653,12 @@ export class SessionControlService {
         const page = rows.slice(0, limit);
         const next = rows.length > limit ? `${page[page.length - 1].created_at}|${page[page.length - 1].id}` : null;
         return response({ session_id: session.id,
-          commands: page.map((c: any) => ({ ...c, payload: parsed(c.payload_json, null), ack: c.ack_json ? parsed(c.ack_json, null) : null })),
+          commands: page.map((c: any) => {
+            const { claim_token, holder_attempt, owner_token_id, owner_family, ack_json, ...visible } = c;
+            const ack = ack_json ? parsed(ack_json, null) : null;
+            if (ack) { delete ack.claim_token; delete ack.holder_attempt; }
+            return { ...visible, payload: parsed(c.payload_json, null), ack };
+          }),
           next_cursor: next });
       }
       if (sub && ['send', 'capture', 'stop'].includes(sub) && request.method === 'POST') {

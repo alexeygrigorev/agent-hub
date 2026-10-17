@@ -113,11 +113,11 @@ def wait_until(deadline, interval, fetch, done, label):
         time.sleep(interval)
 
 
-def wait_for_session(session_id, timeout, interval):
+def wait_for_session(session_id, timeout, interval, *, stopping=False):
     deadline = time.monotonic() + timeout
     return wait_until(deadline, interval,
                      lambda: request('GET', '/api/sessions/' + session_id),
-                     lambda view: view.get('state') in TERMINAL_SESSION,
+                     lambda view: view.get('state') in (('stopped', 'failed', 'refused', 'held', 'uncertain') if stopping else TERMINAL_SESSION),
                      'Session wait')
 
 
@@ -273,7 +273,7 @@ def execute(args):
         timeout, interval = check_wait_args(args)
         if timeout is not None:
             if cmd == 'stop':
-                queued['stop_wait'] = wait_for_session(args.id, timeout, interval)
+                queued['stop_wait'] = wait_for_session(args.id, timeout, interval, stopping=True)
             else:
                 queued['command_wait'] = wait_for_command(args.id, queued['command_id'], timeout, interval)
         return queued
