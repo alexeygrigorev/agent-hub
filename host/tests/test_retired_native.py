@@ -380,7 +380,9 @@ class TestStopAndCleanupEndToEnd(unittest.TestCase):
         mock_list.return_value = []
         self._setup_retired_session(self.target)
 
-        with patch.dict(os.environ, {"APLEXER_STATE_DIR": str(self.state_dir)}):
+        with patch.dict(os.environ, {"APLEXER_STATE_DIR": str(self.state_dir)}), \
+                patch("agent_hub_host.retired_native.list_sessions", return_value=[]), \
+                patch("agent_hub_host.native_sessions.run_native", side_effect=AssertionError("native effect forbidden")):
             res = stop_session("aplexer", self.target)
         self.assertEqual(res.state, "stopped")
         self.assertIn("already confirmed retired: finished tombstone at 1792266525291", res.reason)
@@ -497,7 +499,7 @@ def run_git(args, cwd):
 def make_repo(base):
     origin = base / "origin.git"
     main = base / "main"
-    run_git(["init", "--bare", str(origin)], base)
+    run_git(["init", "--bare", "--initial-branch=main", str(origin)], base)
     run_git(["clone", str(origin), str(main)], base)
     run_git(["config", "user.email", "synth@example.test"], main)
     run_git(["config", "user.name", "synth"], main)
