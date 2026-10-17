@@ -13,6 +13,7 @@ import os
 import shutil
 import stat
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -130,8 +131,11 @@ class TestEvidenceByteBudget(unittest.TestCase):
                 "fake", "stop", {"command_id": cid}, tgt, custody=custody(),
                 journal_dir=str(self.journal), cleanup_roots=[str(self.roots)],
                 cleanup_tree_authorized=True)
-        self.assertEqual(events, ["stop"])
-        self.assertEqual(out["state"], "stopped")
+        # Preservation failure refuses the WHOLE effect before stop/tree:
+        # stop is called 0 times, tree is called 0 times (stop0/tree0).
+        self.assertEqual(events, [])
+        self.assertEqual(out["state"], "refused")
+        self.assertFalse(out["confirmed_exit"])
         self.assertEqual(out["tree"]["state"], "kept")
         self.assertIn("evidence_capture_failed", out["tree"]["reason"])
         self.assertNotIn("cleanup_evidence_path", out)
@@ -216,10 +220,127 @@ class TestDurableOutcomes(unittest.TestCase):
         self.assertEqual(out["error_stage"], "stop")
         self.assertIn("stop_oracle", out)
         self.assertEqual(out["stop_oracle"]["session_id"], tgt.session_id)
+        # Bounded claim stays pending WITHOUT premature terminal ACK
+        self.assertFalse(out.get("ack_submitted"))
+        self.assertEqual(out.get("ack_pending"), "awaiting_stop_oracle_reconcile")
         # No raw text, no secrets in journal.
         blob = json.dumps(out)
         self.assertNotIn("argv", blob)
         self.assertNotIn("stdout", blob)
+
+    def test_reconcile_stop_command_promotes_pending_claim_without_second_kill(self):
+        cid = str(uuid.uuid4())
+        tgt = target_for(self.work)
+        oracle = {"version": 1, "session_id": tgt.session_id, "tag": tgt.tag,
+                  "workspace": tgt.workspace, "created_at_ms": 1700000000000,
+                  "engine": None, "phase": "running",
+                  "worker_pid": 999999, "workload_pid": 999998,
+                  "processes": 2, "containment_empty": None,
+                  "workload_cgroup": "/sys/fs/cgroup/reaped-123",
+                  "last_activity_ms": 1700000000000}
+        kill = {"signal": "HUP", "grace_ms": 2000, "killed": True, "result": "still_running"}
+
+        now = int(time.time() * 1000)
+        claim = claim_for(cid)
+        claim["expires_at_ms"] = now + 60000
+        server_state = {"state": "claimed", "claim_token": claim["claim_token"]}
+        acks_received = []
+
+        def strict_request(method, path, payload):
+            if path.endswith("/ack"):
+                if server_state["state"] == "uncertain":
+                    class FakeHttpError(Exception):
+                        status = 409
+                        code = "command_uncertain"
+                    raise FakeHttpError("409 command_uncertain: cannot late-ack uncertain stop")
+                acks_received.append(payload)
+                server_state["state"] = "acked"
+                return {"command_id": cid, "state": "acked"}
+            return {"ok": True}
+
+        # 1. Initial stop fails into uncertain with oracle attached
+        def fake_effect(*a, **k):
+            exc = SessionUncertain("Target still running after kill")
+            exc.oracle = dict(oracle)
+            exc.kill = dict(kill)
+            raise exc
+
+        with patch.object(se, "_run_claimed_effect", side_effect=fake_effect):
+            out = se.handle_claimed_command(
+                {"op": "stop", "command_id": cid, "generation": 1,
+                 "target": {"session_id": tgt.session_id, "tag": tgt.tag,
+                            "workspace": tgt.workspace, "created_at_ms": 1700000000000}},
+                claim, custody=custody(), journal_dir=str(self.journal), executable="fake",
+                request=strict_request)
+
+        # Pending claim: NO premature terminal ACK was sent to the server!
+        self.assertEqual(len(acks_received), 0)
+        self.assertEqual(server_state["state"], "claimed")
+        self.assertEqual(out["state"], "uncertain")
+        self.assertEqual(out["ack_pending"], "awaiting_stop_oracle_reconcile")
+
+        # 2. Reconcile runs read-only against the oracle (no second kill!)
+        with patch("agent_hub_host.native_sessions.list_sessions", return_value=[]), \
+             patch("agent_hub_host.native_sessions._pid_dead", return_value=True), \
+             patch("agent_hub_host.native_sessions._workload_containment_gone", return_value=True), \
+             patch("agent_hub_host.native_sessions.run_native", side_effect=AssertionError("NO SECOND KILL")):
+            rec = se.reconcile_stop_command(
+                journal_dir=str(self.journal), command_id=cid,
+                executable="fake", request=strict_request, now_ms=now + 5000)
+
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["state"], "stopped")
+        self.assertTrue(rec["confirmed_exit"])
+        self.assertTrue(rec["reconciled_via_oracle"])
+        self.assertIsNone(rec["ack_pending"])
+        self.assertTrue(rec["ack_submitted"])
+        # Server received delivered ack and transitioned to acked
+        self.assertEqual(server_state["state"], "acked")
+        self.assertEqual(len(acks_received), 1)
+        self.assertEqual(acks_received[0]["outcome"], "delivered")
+        self.assertTrue(acks_received[0]["confirmed_exit"])
+        self.assertEqual(acks_received[0]["claim_token"], claim["claim_token"])
+
+    def test_reconcile_stop_command_lease_expired_honestly_uncertain(self):
+        cid = str(uuid.uuid4())
+        tgt = target_for(self.work)
+        oracle = {"version": 1, "session_id": tgt.session_id, "tag": tgt.tag,
+                  "workspace": tgt.workspace, "created_at_ms": 1700000000000,
+                  "engine": None, "phase": "running",
+                  "worker_pid": 999999, "workload_pid": 999998,
+                  "processes": 2, "containment_empty": None,
+                  "workload_cgroup": "/sys/fs/cgroup/reaped-123",
+                  "last_activity_ms": 1700000000000}
+        kill = {"signal": "HUP", "grace_ms": 2000, "killed": True, "result": "still_running"}
+
+        def fake_effect(*a, **k):
+            exc = SessionUncertain("Target still running after kill")
+            exc.oracle = dict(oracle)
+            exc.kill = dict(kill)
+            raise exc
+
+        now = int(time.time() * 1000)
+        claim = claim_for(cid)
+        claim["expires_at_ms"] = now + 10000
+
+        with patch.object(se, "_run_claimed_effect", side_effect=fake_effect):
+            se.handle_claimed_command(
+                {"op": "stop", "command_id": cid, "generation": 1,
+                 "target": {"session_id": tgt.session_id, "tag": tgt.tag,
+                            "workspace": tgt.workspace, "created_at_ms": 1700000000000}},
+                claim, custody=custody(), journal_dir=str(self.journal), executable="fake",
+                request=lambda *a: {})
+
+        # Reconcile called after lease expiration (now_ms > expires_at_ms)
+        rec = se.reconcile_stop_command(
+            journal_dir=str(self.journal), command_id=cid,
+            executable="fake", request=lambda *a: {}, now_ms=now + 50000)
+
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["state"], "uncertain")
+        self.assertTrue(rec.get("expired"))
+        self.assertIn("lease expired", rec["reason"])
+        self.assertIsNone(rec["ack_pending"])
 
 
 class TestStopOracleReconcile(unittest.TestCase):

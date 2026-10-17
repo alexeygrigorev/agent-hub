@@ -88,9 +88,9 @@ def main():
     if cmd == "list":
         print(json.dumps(load()))
     elif cmd == "start":
-        ws = opt(args, "--workspace"); tag = opt(args, "--tag")
+        ws = opt(args, "--workspace"); tag = opt(args, "--tag"); eng = opt(args, "--engine") or "shell"
         rows = load()
-        rec = {"id": str(uuid.uuid4()), "tag": tag, "workspace": ws, "engine": "shell",
+        rec = {"id": str(uuid.uuid4()), "tag": tag, "workspace": ws, "engine": eng,
                "profile": None, "phase": "running", "state": "running",
                # Real native DTO fidelity: containment_empty is the
                # stop-oracle proof field (see executor FAKE_SCRIPT note).
@@ -457,6 +457,7 @@ export default {{
                 [f"cred_{token}", kind, sha256_b64url(token), f"fam_{token}",
                  actor or mach, mach, actor, json.dumps(scopes), "test", now, future],
             )
+        cls.seed_sql("UPDATE machines SET credential_id = ? WHERE id = ?", ["cred_sess-host-token", "hetzner"])
 
     def run_cli(self, args, token, check=True):
         cmd = [sys.executable, "-m", "agent_hub_host.cli"] + args
@@ -532,7 +533,7 @@ export default {{
         # launch, and the launch is advanced to the modeled consumer report
         # (starting->running with its native receipt) that F5 reconciles.
         native = subprocess.run([self.fake_bin, "start", "--workspace", self.native_dir,
-                                 "--tag", "hub-" + launch_id, "--json"],
+                                 "--tag", "hub-" + launch_id, "--engine", "codex", "--json"],
                                 capture_output=True, text=True, timeout=20)
         self.assertEqual(native.returncode, 0, native.stderr)
         target = json.loads(native.stdout)

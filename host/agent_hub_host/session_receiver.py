@@ -399,7 +399,7 @@ def receive_once(
             if updated is None:
                 updated = reconcile_stop_command(
                     journal_dir=journal_dir, command_id=command_id,
-                    executable=executable, request=request)
+                    executable=executable, request=request, now_ms=now_ms)
             if updated is None:
                 updated = resubmit_pending_ack(
                     journal_dir=journal_dir, command_id=command_id,
@@ -450,7 +450,9 @@ def _pending_reconcile_names(journal_dir: str, limit: int = 20) -> list[str]:
             pending.append(name)
         elif (record.get("op") == "stop" and record.get("state") == "uncertain"
                 and isinstance(record.get("stop_oracle"), dict)
-                and record["stop_oracle"].get("session_id")):
+                and record["stop_oracle"].get("session_id")
+                and not record.get("ack_submitted")
+                and not str(record.get("ack_error") or "").startswith("server_terminal_")):
             pending.append(name)
         elif (isinstance(record.get("ack_payload"), dict)
                 and not record.get("ack_submitted")

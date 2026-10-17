@@ -825,8 +825,8 @@ def resubmit_pending_ack(
                 return None
             if prior.get("ack_submitted") or not isinstance(prior.get("ack_payload"), dict):
                 return None
-            if prior.get("state") == "unknown":
-                return None  # reply reconciliation owns this journal, not ack replay
+            if prior.get("state") == "unknown" or prior.get("ack_pending"):
+                return None  # reconciliation owns this journal, not ack replay
             if str(prior.get("ack_error") or "").startswith("server_terminal_"):
                 return None  # terminal verdict stays closed: no infinite 409 retry
             return _resubmit_ack_locked(
@@ -842,6 +842,7 @@ def reconcile_stop_command(
     command_id: str,
     executable: str = "aplexer",
     request: Optional[Callable] = None,
+    now_ms: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
     """Read-only reconcile of one uncertain stop against its persisted oracle.
 
@@ -878,13 +879,48 @@ def reconcile_stop_command(
                     return None
             except (AttributeError, TypeError):
                 return None
+
+            now = now_ms if type(now_ms) is int else int(time.time() * 1000)
+            expires_at_ms = prior.get("expires_at_ms")
+            # If lease has expired: honestly uncertain (no promotion, no second kill).
+            if type(expires_at_ms) is int and now >= expires_at_ms:
+                if prior.get("ack_pending"):
+                    closed = {**prior, "state": "uncertain", "ack_pending": None,
+                              "reason": ("claim_lease_expired_uncertain: lease expired at %s" % expires_at_ms)[:300]}
+                    payload = prior.get("ack_payload") or {
+                        "correlation": _server_correlation(command_id, int(prior.get("generation", 0))),
+                        "outcome": "uncertain",
+                        "native": {"native_id": str(tgt.get("session_id", "")),
+                                   "tag": str(tgt.get("tag", "")),
+                                   "workspace": str(tgt.get("workspace", ""))},
+                        "reason": closed["reason"],
+                        "confirmed_exit": False,
+                    }
+                    ack_result = {"submitted": False, "payload": payload}
+                    if request is not None:
+                        try:
+                            request("POST", "/api/session-commands/" + command_id + "/ack",
+                                    {**payload, "claim_token": prior.get("claim_token")})
+                            ack_result = {"submitted": True, "payload": payload}
+                        except Exception as req_exc:
+                            ack_result = {"submitted": False, "payload": payload,
+                                          "error": type(req_exc).__name__[:64]}
+                    closed["ack_payload"] = payload
+                    closed["ack_submitted"] = bool(ack_result.get("submitted", False))
+                    if ack_result.get("error"):
+                        closed["ack_error"] = str(ack_result["error"])[:120]
+                    _write_journal(journal_file, closed)
+                    return {"op": "stop", **closed, "ack": ack_result, "expired": True}
+                return None
+
             confirmed, why = _reconcile_oracle(executable, oracle, kill if isinstance(kill, dict) else {})
             if not confirmed:
                 return None
             updated = {**prior, "state": "stopped",
                        "reason": str(why)[:300],
                        "confirmed_exit": True,
-                       "reconciled_via_oracle": True}
+                       "reconciled_via_oracle": True,
+                       "ack_pending": None}
             ack_payload: dict[str, Any] = {
                 "correlation": _server_correlation(
                     command_id, int(prior.get("generation", 0))),
@@ -911,6 +947,17 @@ def reconcile_stop_command(
                             {**ack_payload, "claim_token": prior.get("claim_token")})
                     ack_result = {"submitted": True, "payload": ack_payload}
                 except Exception as exc:
+                    status = _request_status(exc)
+                    code = _request_code(exc) or "unknown"
+                    if status == 409 and code == "claim_expired":
+                        closed = {**prior, "state": "uncertain", "ack_pending": None,
+                                  "ack_submitted": False,
+                                  "ack_error": "server_terminal_claim_expired",
+                                  "reason": "claim_expired_on_server"}
+                        _write_journal(journal_file, closed)
+                        return {"op": "stop", **closed,
+                                "ack": {"submitted": False, "payload": ack_payload,
+                                        "terminal": "uncertain"}}
                     ack_result = {"submitted": False, "payload": ack_payload,
                                   "error": type(exc).__name__[:64]}
             updated = {**updated, "ack_payload": ack_payload,
@@ -1132,6 +1179,18 @@ def handle_claimed_command(
             }
             if op == "stop":
                 ack_payload["confirmed_exit"] = False
+            if op == "stop" and state == "uncertain" and failure.get("stop_oracle"):
+                # Oracle-backed uncertain stop: keep original claim pending for
+                # bounded read-only reconciliation. Do NOT send a premature
+                # terminal uncertain ACK to the server, which would lock the server
+                # command and prevent promotion to delivered upon oracle confirmation.
+                failure["ack_submitted"] = False
+                failure["ack_pending"] = "awaiting_stop_oracle_reconcile"
+                failure["ack_payload"] = ack_payload
+                _write_journal(journal_file, failure)
+                return {"op": op, **failure,
+                        "ack": {"submitted": False, "pending": "awaiting_stop_oracle_reconcile",
+                                "payload": ack_payload}}
             ack_result: dict[str, Any] = {"submitted": False, "payload": ack_payload}
             if request is not None:
                 try:
