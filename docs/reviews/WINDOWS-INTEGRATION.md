@@ -2,7 +2,7 @@
 
 - **Reviewed source commit**: `3888a439f9e32d5a075a7e3d23b08ae9aae8201d`
 - **Direct parent**: `a42ea0fd6daeb04a1bfc4de73478f557dcf02171`
-- **Published `main` (CFB source)**: `7929a1bc07bfea3a2b387989800cf1b0ba140984`
+- **Previously published base `main` (CFB source)**: `7929a1bc07bfea3a2b387989800cf1b0ba140984`
 - **Original immutable report commit**: `0da55c0789c3bdfa389a7253c250e0676bfd7da8` (`docs/reviews/WINDOWS-INTEGRATION.md` blob `ff14c1b12a74b452d9b2f8013ea488886cece7ab`)
 - **This auditor**: `platform-win-factual-audit` / `grok-4.6` (session `8d537279-aaa2-4d52-9963-d4fab1bbf5a3`)
 - **Prior Argon execution (not this audit)**: `platform-win-merge-review` `47b53dcb-79e7-431b-b2a7-5bb02e2cdc37` / `antigravity` / `gemini-4-argon-high` on reconstructed candidate, report `0da55c0789c3bdfa389a7253c250e0676bfd7da8`
@@ -12,6 +12,14 @@
 
 The `0da55c0789c3bdfa389a7253c250e0676bfd7da8` commit stays in Git unchanged. This file is a separate corrective audit identity on parent `3888a439f9e32d5a075a7e3d23b08ae9aae8201d`.
 
+Publication annotation by head `platform/GPT-6`: the original corrective review
+`e5133fc9cf5e71a29fbfb900aaa3b0455984f8e5` remains immutable. This publication
+normalizes retained-evidence paths to their owner-relative locations, verifies
+that `0da55c0` has 134 tracked files (its parent `d79fab0` has 133), and records
+the auditor’s final scratch measurement separately from its earlier snapshot.
+The reviewed source, verdict and test claims are unchanged. Prior-review paths
+refer to reviewer `47b53dcb`; head paths refer to its retained integration evidence.
+
 ---
 
 ## 1. What this audit reviewed
@@ -20,7 +28,7 @@ The `0da55c0789c3bdfa389a7253c250e0676bfd7da8` commit stays in Git unchanged. Th
 
 Compared read-only:
 
-- Original composed manifest `/home/alexey/git/agent-hub-wt-platform-win-merge-review/.local/review/composed-output-manifest.json` (203 paths, compact SHA-256 `5fb8eeace9f7b936e1b9043902cea3783cd0aa72decabedb51f96bef298e8804`)
+- Original composed manifest `.local/review/composed-output-manifest.json` (203 paths, compact SHA-256 `5fb8eeace9f7b936e1b9043902cea3783cd0aa72decabedb51f96bef298e8804`)
 - Original CFB input manifest `.../cfb-input-manifest.json` (199 paths, compact SHA-256 `17aab235373ff0f98cce9ff361b74333d9d3bd23bf45790d471865f3ea02223a`)
 - Git blobs at `3888a439f9e32d5a075a7e3d23b08ae9aae8201d` and `7929a1bc07bfea3a2b387989800cf1b0ba140984`
 - Proposal table in `docs/proposals/WINDOWS-INTEGRATION.md` (correct paths/hashes)
@@ -42,7 +50,7 @@ Source, tests, and proposals were not modified. Owned output is this report plus
 | CFB independent review | `5a4b9381d4863d10a1d46b249c0be83e17cee18f` | `docs/reviews/CONVERSATION-INTEGRATION.md` |
 | Standalone Windows proposal | `2de0a6c1846b110227cd1d15e99a7af6999158f5` | Patch source of `bf2` |
 | Standalone Windows review | `3d0dfadbed35812aeaacbb98f304acfecf711e91` | Prior scoped accept of the same patch |
-| Original composition report | `0da55c0789c3bdfa389a7253c250e0676bfd7da8` | Immutable; 133-file report commit on `d79fab0175fc57a0909da41d8f5d9f5ef4c0bba9` |
+| Original composition report | `0da55c0789c3bdfa389a7253c250e0676bfd7da8` | Immutable; 134 tracked files, parent `d79fab0175fc57a0909da41d8f5d9f5ef4c0bba9` has 133 |
 | `d79fab0175fc57a0909da41d8f5d9f5ef4c0bba9` | 133 tracked files | Report-era worktree; **not** the 203-file composed source |
 
 | Digest | Value | Status |
@@ -205,11 +213,11 @@ Serial, `taskset -c 0`, `umask 077`, `TMPDIR` under `.local/tmp`, `UV_THREADPOOL
 
 A first unittest invocation of `test_conversation_bridge_gap` as `host.tests.*` failed to import (`ModuleNotFoundError: test_conversation_bridge`). That was this runner's module path, not a `3888` defect. Re-run from `host/tests` passed 24/24. The failed log is retained.
 
-Scratch for `.local/audit` + `.local/tmp`: peak allocated 28672 bytes, apparent 20461 bytes, cap 20971520 bytes. A 0-byte `uv-*.lock` in `.local/tmp` was left untouched.
+Scratch for `.local/audit` + `.local/tmp`: evidence-snapshot measurement allocated 28672 bytes / apparent 20461 bytes; final auditor handoff recorded peak allocated 32768 bytes / apparent 21303 bytes, cap 20971520 bytes. A 0-byte `uv-*.lock` in `.local/tmp` was left untouched.
 
 ### 5.2 Prior `47b53dcb` execution, reused because 203 files are byte-identical
 
-Attributed to reviewer `platform-win-merge-review` `47b53dcb-79e7-431b-b2a7-5bb02e2cdc37`. Not replayed here. Paths are in `/home/alexey/git/agent-hub-wt-platform-win-merge-review/.local/review/` unless noted.
+Attributed to reviewer `platform-win-merge-review` `47b53dcb-79e7-431b-b2a7-5bb02e2cdc37`. Not replayed here. Paths are in `.local/review/` unless noted.
 
 | Check | Recorded result | Note |
 | :--- | :--- | :--- |
@@ -220,7 +228,7 @@ Attributed to reviewer `platform-win-merge-review` `47b53dcb-79e7-431b-b2a7-5bb0
 | Dakit lock + UI static | 21 locked files; 2/2 scripts PASS | `kit-*.log` |
 | Public pairing | 9/9 groups PASS | `public-pairing.log`; read-only native qualify; 0 journal writes claimed |
 | Bundle dry-run | PASS `552.38 KiB` / `105.98 KiB` gzip | `bundle.log` |
-| Own-session native POSIX + P3 | 10/10 groups; gap-first 0 mail; envelope `01a14800-8d7a-7fc0-849a-b1bd1d488509`; reply `01a14800-901f-7a01-868b-9f358abff1d0`; journal SHA-256 `8360ff91bce42ec3732efc35b9701ae6e6fcf9cd9eebf99b92d80a3b64582c87`; cursors 4 and 3; 1 delivery, 1 done reply, 1 gap, 0 pending | `native-reconciliation.json`; head read-only check `/home/alexey/git/agent-coordination/.local/platform/win-merge-review-native-reconciliation.json` |
+| Own-session native POSIX + P3 | 10/10 groups; gap-first 0 mail; envelope `01a14800-8d7a-7fc0-849a-b1bd1d488509`; reply `01a14800-901f-7a01-868b-9f358abff1d0`; journal SHA-256 `8360ff91bce42ec3732efc35b9701ae6e6fcf9cd9eebf99b92d80a3b64582c87`; cursors 4 and 3; 1 delivery, 1 done reply, 1 gap, 0 pending | `native-reconciliation.json`; head read-only check `.local/platform/win-merge-review-native-reconciliation.json` |
 
 This audit did not replay those native identities or modify those journals.
 
