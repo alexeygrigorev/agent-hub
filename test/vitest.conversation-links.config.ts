@@ -2,6 +2,7 @@ import { defineConfig } from 'vitest/config';
 import { cloudflareTest } from '@cloudflare/vitest-pool-workers';
 
 export default defineConfig({
+  cacheDir: '.local/tmp/vite-cache',
   plugins: [
     cloudflareTest({
       wrangler: { configPath: './wrangler.jsonc' },
@@ -19,7 +20,8 @@ export default defineConfig({
     }),
   ],
   test: {
-    include: ['test/conversation-links.test.ts'],
+    include: ['test/conversation-links.test.ts', 'test/conversation-links-r2.test.ts'],
     fileParallelism: false,
+    maxWorkers: 1,
   },
 });

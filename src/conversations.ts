@@ -1,3 +1,4 @@
+import { ConversationLinksService } from './conversation-links';
 import { credentialActor, validRegistryName, registryAddress } from './agent_registry';
 import {
   SqlStorage,
@@ -815,7 +816,7 @@ export class ConversationsService {
   private readonly now: () => number;
   public identityValidator: IdentityValidator;
   public limits: ConversationStorageLimits;
-  public linksHandler: ConversationLinksHandler | null = null;
+  public linksHandler: ConversationLinksService;
 
   constructor(
     sql: SqlStorage,
@@ -827,7 +828,14 @@ export class ConversationsService {
     },
   ) {
     this.sql = sql;
-    this.txSync = txSync ?? (<T>(fn: () => T): T => fn());
+    // Child link calls join this service's current transaction, including when
+    // used directly with DurableObjectStorage.transactionSync (no nested BEGIN).
+    let depth = 0;
+    this.txSync = <T>(fn: () => T): T => {
+      if (!txSync || depth > 0) return fn();
+      depth++;
+      try { return txSync(fn); } finally { depth--; }
+    };
     this.now = options?.now ?? Date.now;
     this.identityValidator =
       options?.identityValidator ?? createSqlIdentityValidator(sql);
@@ -860,6 +868,7 @@ export class ConversationsService {
         options?.limits?.archivedConversationRetentionMs ??
         DEFAULT_ARCHIVED_CONVERSATION_RETENTION_MS,
     };
+    this.linksHandler = new ConversationLinksService(sql, this, this.txSync);
   }
 
   public getNow(): number {
@@ -874,6 +883,7 @@ export class ConversationsService {
           this.sql.exec(trimmed);
         }
       }
+      this.linksHandler.init();
       for (const alterStmt of [
         'ALTER TABLE conversations ADD COLUMN retained_message_count INTEGER NOT NULL DEFAULT 0',
         'ALTER TABLE conversations ADD COLUMN retained_message_bytes INTEGER NOT NULL DEFAULT 0',
@@ -986,6 +996,11 @@ export class ConversationsService {
           remCnt,
           CONVERSATIONS_SCHEMA_VERSION,
         );
+      }
+      // A bounded fair pass reconciles pre-existing orphan links on startup.
+      // Remaining work stays visible to the ordinary retention driver.
+      if (this.linksHandler.hasExpiredRows(this.now())) {
+        this.retentionCleanup(this.now(), DEFAULT_RETENTION_BATCH_LIMIT);
       }
     });
   }
@@ -1359,6 +1374,15 @@ export class ConversationsService {
         return remainingBefore - remaining;
       };
 
+      const runOrphanLinksStep = (stepBudget: number): number => {
+        const budget = Math.min(remaining, stepBudget);
+        if (budget <= 0) return 0;
+        const step = this.linksHandler.retentionCleanup(nowMs, budget);
+        linksDeleted += step.rowsDeleted;
+        remaining -= step.rowsDeleted;
+        return step.rowsDeleted;
+      };
+
       runFairRetentionPass(
         this.sql,
         'conv',
@@ -1393,18 +1417,16 @@ export class ConversationsService {
                 .toArray().length > 0,
             spend: runMessagesStep,
           },
+          {
+            hasWork: () => this.linksHandler.hasExpiredRows(nowMs),
+            spend: runOrphanLinksStep,
+          },
         ],
         limit,
       );
 
       for (const convId of previewRefreshIds) {
         this.refreshConversationPreview(convId);
-      }
-
-      if (remaining > 0 && this.linksHandler) {
-        const orphan = this.linksHandler.retentionCleanup(nowMs, remaining);
-        linksDeleted += Number(orphan.rowsDeleted ?? 0);
-        remaining -= Number(orphan.rowsDeleted ?? 0);
       }
 
       const rowsDeleted =

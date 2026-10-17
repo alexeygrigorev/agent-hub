@@ -5,7 +5,7 @@ import {
   ConversationsService,
   authenticateConversationRequest,
 } from './conversations';
-import { ConversationLinksService } from './conversation-links';
+import type { ConversationLinksService } from './conversation-links';
 
 /**
  * Durable Object subclass extending BaseHub with the M1 `/api/conversations`
@@ -41,14 +41,8 @@ export class Hub extends BaseHub {
     };
     this.busService.txSync = txSync;
     this.conversationsService = new ConversationsService(this.sql, txSync);
-    this.linksService = new ConversationLinksService(
-      this.sql,
-      this.conversationsService,
-      txSync,
-    );
-    this.conversationsService.linksHandler = this.linksService;
+    this.linksService = this.conversationsService.linksHandler;
     this.conversationsService.init();
-    this.linksService.init();
 
     const baseRetentionCleanup = this.busService.retentionCleanup.bind(
       this.busService,
@@ -163,7 +157,6 @@ export class Hub extends BaseHub {
   override initDb(): void {
     super.initDb();
     this.conversationsService?.init();
-    this.linksService?.init();
   }
 
   override async fetch(request: Request): Promise<Response> {
