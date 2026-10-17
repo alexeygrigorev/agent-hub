@@ -134,11 +134,11 @@ class TestCleanupEvidenceOrder(unittest.TestCase):
                 "fake", "stop", {"command_id": cid}, tgt, custody=custody(),
                 journal_dir=str(self.journal), cleanup_roots=[str(self.roots)],
                 cleanup_tree_authorized=True)
-        # The stop itself still reports its confirmed outcome; the tree is
-        # kept with the capture failure (never a deletion, never a
-        # preservation claim).
-        self.assertEqual(events, ["capture", "stop"])
-        self.assertEqual(out["state"], "stopped")
+        # On preservation failure, refuse the WHOLE effect before stop/tree:
+        # stop is called 0 times (stop0), tree is called 0 times (tree0).
+        self.assertEqual(events, ["capture"])
+        self.assertEqual(out["state"], "refused")
+        self.assertFalse(out["confirmed_exit"])
         self.assertEqual(out["tree"]["state"], "kept")
         self.assertIn("evidence_capture_failed", out["tree"]["reason"])
         self.assertNotIn("cleanup_evidence_path", out)
@@ -211,6 +211,72 @@ class TestCleanupEvidenceOrder(unittest.TestCase):
             claim_for(cid, True), custody=custody(), journal_dir=str(self.journal),
             executable="fake", request=fake_request, cleanup_roots=[str(self.roots)])
         self.assertTrue(again.get("replayed"))
+
+    def test_cleanup_evidence_fsync_failure_refuses_before_stop(self):
+        events = []
+        cid = str(uuid.uuid4())
+        tgt = target_for(self.work)
+
+        def fake_capture(*a, **k):
+            events.append("capture")
+            return {"text": "hello"}
+
+        def fake_stop(exe, target, custody=None):
+            events.append("stop")
+            return {"session_id": target.session_id, "state": "stopped", "reason": "exited"}
+
+        def fake_tree(*a, **k):
+            events.append("tree")
+            return {"state": "removed"}
+
+        with patch.object(se, "capture_session_output", side_effect=fake_capture), \
+             patch.object(se.private_fs, "atomic_write", side_effect=OSError("fsync failed")), \
+             patch.object(se, "stop_controlled_session", side_effect=fake_stop), \
+             patch.object(se, "_run_cleanup_tree_after_stop", side_effect=fake_tree):
+            out = se._run_claimed_effect(
+                "fake", "stop", {"command_id": cid}, tgt, custody=custody(),
+                journal_dir=str(self.journal), cleanup_roots=[str(self.roots)],
+                cleanup_tree_authorized=True)
+        self.assertEqual(events, ["capture"])
+        self.assertEqual(out["state"], "refused")
+        self.assertFalse(out["confirmed_exit"])
+        self.assertEqual(out["tree"]["state"], "kept")
+        self.assertIn("Cleanup evidence store failed", out["reason"])
+
+    def test_cleanup_evidence_meta_write_failure_refuses_before_stop(self):
+        events = []
+        cid = str(uuid.uuid4())
+        tgt = target_for(self.work)
+
+        def fake_capture(*a, **k):
+            events.append("capture")
+            return {"text": "hello"}
+
+        def fake_write_journal(path, record):
+            if "cleanup-evidence-" in path:
+                raise OSError("metadata write failed")
+            return se._write_journal_direct(path, record) if hasattr(se, "_write_journal_direct") else None
+
+        def fake_stop(exe, target, custody=None):
+            events.append("stop")
+            return {"session_id": target.session_id, "state": "stopped", "reason": "exited"}
+
+        def fake_tree(*a, **k):
+            events.append("tree")
+            return {"state": "removed"}
+
+        with patch.object(se, "capture_session_output", side_effect=fake_capture), \
+             patch.object(se, "_write_journal", side_effect=fake_write_journal), \
+             patch.object(se, "stop_controlled_session", side_effect=fake_stop), \
+             patch.object(se, "_run_cleanup_tree_after_stop", side_effect=fake_tree):
+            out = se._run_claimed_effect(
+                "fake", "stop", {"command_id": cid}, tgt, custody=custody(),
+                journal_dir=str(self.journal), cleanup_roots=[str(self.roots)],
+                cleanup_tree_authorized=True)
+        self.assertEqual(events, ["capture"])
+        self.assertEqual(out["state"], "refused")
+        self.assertFalse(out["confirmed_exit"])
+        self.assertEqual(out["tree"]["state"], "kept")
 
 
 if __name__ == "__main__":

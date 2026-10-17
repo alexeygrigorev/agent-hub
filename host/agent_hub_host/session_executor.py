@@ -1485,8 +1485,8 @@ def _run_claimed_effect(
     if want_tree:
         # Flagged cleanup ONLY: preserve a bounded pre-stop capture to the
         # private journal BEFORE the native stop. Ordinary stops never
-        # capture here. A failed/unknown capture keeps the tree (never
-        # deletes) rather than claiming preservation.
+        # capture here. If capture/fsync/meta fails, refuse the WHOLE effect
+        # before stop/tree, returning kept tree and confirmed_exit=False.
         try:
             evidence_path = _preserve_cleanup_evidence(
                 executable, target, custody=custody, journal_dir=journal_dir,
@@ -1494,7 +1494,23 @@ def _run_claimed_effect(
         except (SessionControlError, SessionUncertain) as exc:
             evidence_error = str(exc)[:200]
         except Exception as exc:
-            evidence_error = "evidence_capture_%s" % type(exc).__name__
+            evidence_error = ("evidence_capture_%s" % type(exc).__name__)[:200]
+        if evidence_error is not None or evidence_path is None:
+            refused_reason = ("cleanup_preservation_failed_refused: %s"
+                              % (evidence_error or "unknown"))[:300]
+            return {
+                "state": "refused",
+                "ack_outcome": "refused",
+                "native_id": None,
+                "reply_envelope_id": None,
+                "reason": refused_reason,
+                "confirmed_exit": False,
+                "tree": {
+                    "state": "kept",
+                    "reason": ("evidence_capture_failed: %s; listed-only"
+                               % (evidence_error or "unknown"))[:300],
+                },
+            }
     stopped = stop_controlled_session(executable, target, custody=custody)
     confirmed = stopped["state"] == "stopped"
     outcome: dict[str, Any] = {
@@ -1514,14 +1530,9 @@ def _run_claimed_effect(
     # ride the stop ack as data while the stop itself still reports its
     # confirmed outcome. Raw evidence text never enters the ack.
     if confirmed and want_tree:
-        if evidence_error is not None or evidence_path is None:
-            outcome["tree"] = {"state": "kept",
-                               "reason": ("evidence_capture_failed: %s; listed-only"
-                                          % (evidence_error or "unknown"))[:300]}
-        else:
-            outcome["tree"] = _run_cleanup_tree_after_stop(
-                executable, target, custody=custody, journal_dir=journal_dir,
-                cleanup_roots=cleanup_roots, command_id=str(command["command_id"]))
+        outcome["tree"] = _run_cleanup_tree_after_stop(
+            executable, target, custody=custody, journal_dir=journal_dir,
+            cleanup_roots=cleanup_roots, command_id=str(command["command_id"]))
     return outcome
 
 
