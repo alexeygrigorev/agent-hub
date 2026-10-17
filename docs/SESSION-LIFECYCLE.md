@@ -147,6 +147,11 @@ server eligibility), not a second registry or fake apply.
   exposes it in the canonical offer (`cleanup_tree`) and claim
   (`cleanup_tree`, re-evaluated owner/incarnation/M15 eligibility at claim),
   and coerces ordinary-stop tree reports to kept (`not_cleanup_authorized`).
+  A stored cleanup command that fails re-evaluation at claim (owner drift,
+  incarnation drift, human-owned, active, or pending obligations) has the
+  ENTIRE claim refused (`cleanup_not_eligible`, no token, zero native
+  effect) — never downgraded to an ordinary stop. Ordinary explicitly
+  requested stops stay independently claimable.
   The branch is DISCOVERED from the registered
   worktree list (never a caller-supplied branch); custody must equal the
   server claim holder machine and the stop must already be

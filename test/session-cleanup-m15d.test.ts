@@ -323,7 +323,7 @@ describe('m15d cleanup_tree authorization (critical blocker)', () => {
     expect(row.ack.tree.reason).toContain('not_cleanup_authorized');
   }));
 
-  it('claim strips the flag when the owner drifted before claim (stop still claimable, tree never authorized)', async () => fixture(async (s, sql) => {
+  it('refuses the entire claim when the owner drifted before claim (no token, zero native effect)', async () => fixture(async (s, sql) => {
     const created = await startAgentSession(s, 'm15d-auth-3');
     await bindAgentSession(s, sql, created.id, 'launch-1');
     await finishObservation(s);
@@ -333,8 +333,28 @@ describe('m15d cleanup_tree authorization (critical blocker)', () => {
     const offer = await offerFor(s, commandId);
     expect(offer.cleanup_tree).toBe(true);
     sql.exec("UPDATE session_control_sessions SET actor = 'other:assistant' WHERE id = ?", created.id);
-    const claim = await claimAs(s, commandId, offer.correlation);
-    expect(claim.cleanup_tree).toBe(false);
+    const refused = await s.handle(request(`/api/session-commands/${commandId}/claim`, { correlation: offer.correlation, attempt_id: crypto.randomUUID() }), host('hetzner'));
+    expect(refused.status).toBe(409);
+    expect((await refused.json() as any).error).toBe('cleanup_not_eligible');
+    // The command stays unclaimed: no holder, no token, still re-offerable, never executed.
+    const row: any = sql.exec('SELECT * FROM session_control_commands WHERE id = ?', commandId).toArray()[0];
+    expect(row.state).not.toBe('claimed');
+    expect(row.holder_machine).toBeNull();
+  }));
+
+  it('refuses cleanup claims that turned human-owned or grew obligations before claim', async () => fixture(async (s, sql) => {
+    const created = await startAgentSession(s, 'm15d-auth-4');
+    await bindAgentSession(s, sql, created.id, 'launch-1');
+    await finishObservation(s);
+    const plan = await (await s.handle(request('/api/sessions/cleanup', { apply: true, key: 'op-auth-4' }), agent())).json() as any;
+    expect(plan.enqueued).toHaveLength(1);
+    const commandId = plan.enqueued[0].command_id;
+    const offer = await offerFor(s, commandId);
+    // Human drift: the launch is now human-requested.
+    sql.exec("UPDATE fleet_launches SET requester_kind = 'human', actor = 'human:alexey' WHERE id = ?", 'launch-1');
+    const humanRefused = await s.handle(request(`/api/session-commands/${commandId}/claim`, { correlation: offer.correlation, attempt_id: crypto.randomUUID() }), host('hetzner'));
+    expect(humanRefused.status).toBe(409);
+    expect((await humanRefused.json() as any).error).toBe('cleanup_not_eligible');
   }));
 });
 

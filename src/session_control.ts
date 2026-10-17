@@ -1115,6 +1115,17 @@ export class SessionControlService {
         const gate = this.hostOk(session, caller);
         if (!gate.ok) return response({ error: gate.error }, gate.error === 'not_found' ? 404 : 409);
         if (input.correlation !== row.correlation) return response({ error: 'correlation_mismatch' }, 409);
+        // Stored-cleanup fence: a cleanup --apply stop whose owner,
+        // incarnation, or M15 eligibility drifted since enqueue MUST NOT
+        // execute at all (neither tree nor native stop). Refuse the entire
+        // claim; ordinary stops are unaffected and stay claimable. This sits
+        // before the claimed-replay branch so even a replayed attempt cannot
+        // authorize a stale cleanup (the host journal already prevents a
+        // second native effect for a consumed attempt; a never-executed
+        // attempt stays unexecuted).
+        if (this.cleanupStored(row) && !this.cleanupAuthorized(row, session)) {
+          return response({ error: 'cleanup_not_eligible' }, 409);
+        }
         if (row.state === 'claimed') {
           if (this.claimExpired(row)) {
             this.markUncertain(row, 'claim_expired');
