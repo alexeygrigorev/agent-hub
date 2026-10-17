@@ -110,7 +110,10 @@ NOT freshness: old commit on a current remote stays fresh, stale local ref
 with recent commit never counts; network/parse failures fail closed to
 `unknown` with `network_unknown_fails_closed`). `ci` matches runs by exact
 `head_sha`; `deployment` matches active records naming the exact sha in the
-target environment (push/CI success never implies deployed). Every probe
+target environment (push/CI success never implies deployed). For Cloudflare
+Workers, the native `cloudflare_worker` adapter queries the Workers API
+directly over fixed HTTPS endpoints, requiring explicit `source_commit` annotations
+on positive-traffic active versions (see `docs/STATUS-DEPLOY.md`). Every probe
 payload carries its source sha (required).
 - `pending_actions[]`: intake unresolved `followup/blocker/pending_approval`
   only as `{id, type, status, actor, captured_at, text_snippet<=240, link}`.

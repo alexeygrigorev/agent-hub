@@ -156,6 +156,64 @@ class TestCollectorStep(unittest.TestCase):
         self.assertIn('session', kinds)
         self.assertIn('probe_git', kinds)
 
+    def test_cloudflare_worker_probe_integrated_in_collector_step(self):
+        sha = 'c' * 40
+        vid = '11111111-2222-3333-4444-555555555555'
+        cred_path = os.path.join(self.root, 'cf_creds.env')
+        with open(cred_path, 'w', encoding='utf-8') as f:
+            f.write('CLOUDFLARE_ACCOUNT_ID=acc1\nCLOUDFLARE_API_TOKEN=cf-token-12345678\n')
+        os.chmod(cred_path, 0o600)
+
+        extra = {
+            'repo_roots': [self.root],
+            'probes': [{
+                'id': 'cf-p1',
+                'kind': 'deployment',
+                'adapter': 'cloudflare_worker',
+                'for_native_id': 'n1',
+                'sha': sha,
+                'credentials_file': cred_path,
+                'script_name': 'agent-hub'
+            }]
+        }
+        col, _ = self.collector(['n1'], extra_al=extra)
+
+        def fake_http_transport(url, headers, timeout_s):
+            if '/deployments' in url:
+                return {
+                    'status': 200,
+                    'body': json.dumps({
+                        'success': True,
+                        'result': [{
+                            'id': 'dep-live-1',
+                            'versions': [{'version_id': vid, 'percentage': 100}]
+                        }]
+                    })
+                }
+            if f'/versions/{vid}' in url:
+                return {
+                    'status': 200,
+                    'body': json.dumps({
+                        'success': True,
+                        'result': {
+                            'annotations': {'workers/message': f'Active source_commit={sha}'}
+                        }
+                    })
+                }
+            return {'status': 404, 'body': '{"success": false}'}
+
+        col.http_transport = fake_http_transport
+        with patch('agent_hub_host.native_sessions.qualify_sender_binding',
+                   side_effect=Exception('unbound')):
+            result = col.step()
+
+        kinds = {o['kind']: o['payload'] for o in result['observations']}
+        self.assertIn('session', kinds)
+        self.assertIn('probe_deploy', kinds)
+        self.assertEqual(kinds['probe_deploy']['state'], 'deployed')
+        self.assertEqual(kinds['probe_deploy']['sha'], sha)
+        self.assertIn('dep-live-1', kinds['probe_deploy']['deployment'])
+
     def test_main_native_default_uses_adapter(self):
         import io
         from contextlib import redirect_stdout

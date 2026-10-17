@@ -206,6 +206,16 @@ class TestCiDeployment(unittest.TestCase):
         evidence = status_probe.build_deployment({'exit': 0, 'stdout': json.dumps(payload), 'stderr': ''}, SHA_A)
         self.assertEqual(evidence['state'], 'not_deployed')
 
+    def test_unrelated_note_or_history_containing_target_sha_does_not_count(self):
+        # Regression test: historical note/description mentioning target SHA
+        # must NOT cause loose matching when another commit is actually active.
+        payload = [{'id': 'dep-2', 'environment': 'production', 'state': 'active',
+                    'sha': SHA_B, 'note': f'Revert of commit {SHA_A}',
+                    'description': f'Fixes bug introduced by {SHA_A}'}]
+        evidence = status_probe.build_deployment({'exit': 0, 'stdout': json.dumps(payload), 'stderr': ''}, SHA_A)
+        self.assertEqual(evidence['state'], 'not_deployed')
+        self.assertEqual(evidence['reason'], 'no_active_deployment_names_sha')
+
 
 class TestCollectProbes(unittest.TestCase):
     def setUp(self):
@@ -268,5 +278,338 @@ class TestCollectProbes(unittest.TestCase):
         self.assertIn('sha_required', [s['reason'] for s in result['skipped']])
 
 
+class TestCloudflareCredentials(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='cf-creds-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def write_cred_file(self, content: str, mode: int = 0o600) -> str:
+        path = self.root / 'creds.env'
+        path.write_text(content, encoding='utf-8')
+        os.chmod(path, mode)
+        return str(path)
+
+    def test_valid_0600_credentials_file_succeeds(self):
+        path = self.write_cred_file(
+            '# Cloudflare credentials\n'
+            'CLOUDFLARE_ACCOUNT_ID=0123456789abcdef0123456789abcdef\n'
+            'CLOUDFLARE_API_TOKEN=cf-secret-token-12345678\n'
+            'OTHER_SECRET=do_not_load_this\n'
+        )
+        creds, err = status_probe.load_cloudflare_credentials(path)
+        self.assertIsNone(err)
+        self.assertEqual(creds, {
+            'account_id': '0123456789abcdef0123456789abcdef',
+            'api_token': 'cf-secret-token-12345678'
+        })
+        self.assertNotIn('OTHER_SECRET', creds)
+
+    def test_symlink_refused(self):
+        target = self.write_cred_file(
+            'CLOUDFLARE_ACCOUNT_ID=abc\nCLOUDFLARE_API_TOKEN=cf-secret-token-12345678\n'
+        )
+        symlink_path = self.root / 'symlink.env'
+        os.symlink(target, symlink_path)
+        creds, err = status_probe.load_cloudflare_credentials(str(symlink_path))
+        self.assertIsNone(creds)
+        self.assertEqual(err, 'credentials_file_symlink_refused')
+
+    def test_broad_permissions_refused(self):
+        for mode in (0o644, 0o660, 0o664, 0o777, 0o604):
+            path = self.write_cred_file(
+                'CLOUDFLARE_ACCOUNT_ID=abc\nCLOUDFLARE_API_TOKEN=cf-secret-token-12345678\n',
+                mode=mode
+            )
+            creds, err = status_probe.load_cloudflare_credentials(path)
+            self.assertIsNone(creds, f"mode {oct(mode)} should have been refused")
+            self.assertEqual(err, 'credentials_file_broad_permissions')
+
+    def test_wrong_owner_refused(self):
+        path = self.write_cred_file(
+            'CLOUDFLARE_ACCOUNT_ID=abc\nCLOUDFLARE_API_TOKEN=cf-secret-token-12345678\n'
+        )
+        fake_st = os.lstat(path)
+        with unittest.mock.patch('os.lstat') as mock_lstat:
+            mock_stat_res = unittest.mock.MagicMock()
+            mock_stat_res.st_mode = fake_st.st_mode
+            mock_stat_res.st_uid = os.getuid() + 999
+            mock_lstat.return_value = mock_stat_res
+            creds, err = status_probe.load_cloudflare_credentials(path)
+            self.assertIsNone(creds)
+            self.assertEqual(err, 'credentials_file_wrong_owner')
+
+    def test_non_regular_file_refused(self):
+        dir_path = self.root / 'dir_creds'
+        dir_path.mkdir()
+        creds, err = status_probe.load_cloudflare_credentials(str(dir_path))
+        self.assertIsNone(creds)
+        self.assertEqual(err, 'credentials_file_not_regular')
+
+    def test_missing_file_refused(self):
+        creds, err = status_probe.load_cloudflare_credentials(str(self.root / 'nonexistent.env'))
+        self.assertIsNone(creds)
+        self.assertEqual(err, 'credentials_file_not_found')
+
+    def test_missing_fields_refused(self):
+        path1 = self.write_cred_file('CLOUDFLARE_API_TOKEN=cf-secret-token-12345678\n')
+        creds, err = status_probe.load_cloudflare_credentials(path1)
+        self.assertIsNone(creds)
+        self.assertEqual(err, 'credentials_missing_account_id')
+
+        path2 = self.write_cred_file('CLOUDFLARE_ACCOUNT_ID=0123456789abcdef\n')
+        creds, err = status_probe.load_cloudflare_credentials(path2)
+        self.assertIsNone(creds)
+        self.assertEqual(err, 'credentials_missing_api_token')
+
+    def test_file_too_large_refused(self):
+        oversized = 'CLOUDFLARE_ACCOUNT_ID=0123456789abcdef\n' + ('# pad\n' * 15000)
+        path = self.write_cred_file(oversized)
+        creds, err = status_probe.load_cloudflare_credentials(path)
+        self.assertIsNone(creds)
+        self.assertEqual(err, 'credentials_file_too_large')
+
+
+VERSION_UUID_1 = '11111111-2222-3333-4444-555555555555'
+VERSION_UUID_2 = '66666666-7777-8888-9999-000000000000'
+
+
+class TestCloudflareWorkerDeploymentAdapter(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='cf-deploy-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.cred_path = str(self.root / 'creds.env')
+        Path(self.cred_path).write_text(
+            'CLOUDFLARE_ACCOUNT_ID=acc123\nCLOUDFLARE_API_TOKEN=cf-token-12345678\n',
+            encoding='utf-8'
+        )
+        os.chmod(self.cred_path, 0o600)
+
+    def spec(self, probes):
+        return {
+            'machine_id': 'host-cf',
+            'observed_at': NOW,
+            'repo_roots': [str(self.root)],
+            'probes': probes
+        }
+
+    def make_transport(self, deployments, versions_map=None, status_code=200, error=None):
+        versions_map = versions_map or {}
+        call_log = []
+
+        def transport(url, headers, timeout_s):
+            call_log.append({'url': url, 'headers': headers, 'timeout_s': timeout_s})
+            if error is not None:
+                raise error
+            if status_code != 200:
+                return {'status': status_code, 'body': json.dumps({'success': False, 'errors': [{'code': status_code}]})}
+            if '/deployments' in url:
+                return {'status': 200, 'body': json.dumps({'success': True, 'result': deployments})}
+            for vid, v_data in versions_map.items():
+                if f'/versions/{vid}' in url:
+                    return {'status': 200, 'body': json.dumps({'success': True, 'result': v_data})}
+            return {'status': 404, 'body': json.dumps({'success': False, 'errors': ['not_found']})}
+
+        return transport, call_log
+
+    def test_exact_active_sha_passes(self):
+        deployments = [{
+            'id': 'dep-active-1',
+            'versions': [{'version_id': VERSION_UUID_1, 'percentage': 100}]
+        }]
+        versions_map = {
+            VERSION_UUID_1: {
+                'annotations': {'workers/message': f'Release source_commit={SHA_A}'}
+            }
+        }
+        transport, calls = self.make_transport(deployments, versions_map)
+        probe = status_probe.make_cloudflare_probe('p1', 'n1', SHA_A, self.cred_path)
+        result = status_probe.collect_probes(self.spec([probe]), http_transport=transport)
+
+        self.assertEqual(len(result['observations']), 1)
+        obs = result['observations'][0]
+        self.assertEqual(obs['kind'], 'probe_deploy')
+        self.assertEqual(obs['payload']['state'], 'deployed')
+        self.assertEqual(obs['payload']['sha'], SHA_A)
+        self.assertIn(VERSION_UUID_1, obs['payload']['deployment'])
+        self.assertIn('100% traffic', obs['payload']['deployment'])
+
+    def test_old_active_new_historical_fails(self):
+        deployments = [{
+            'id': 'dep-active-2',
+            'versions': [{'version_id': VERSION_UUID_1, 'percentage': 100}]
+        }]
+        versions_map = {
+            VERSION_UUID_1: {
+                'annotations': {'workers/message': f'Release source_commit={SHA_B}'}
+            }
+        }
+        transport, _ = self.make_transport(deployments, versions_map)
+        probe = status_probe.make_cloudflare_probe('p1', 'n1', SHA_A, self.cred_path)
+        result = status_probe.collect_probes(self.spec([probe]), http_transport=transport)
+
+        self.assertEqual(len(result['observations']), 1)
+        obs = result['observations'][0]
+        self.assertEqual(obs['payload']['state'], 'not_deployed')
+        self.assertEqual(obs['payload']['sha'], SHA_A)
+
+    def test_wrong_or_missing_annotations_yields_unknown(self):
+        deployments = [{
+            'id': 'dep-active-3',
+            'versions': [{'version_id': VERSION_UUID_1, 'percentage': 100}]
+        }]
+        # Arbitrary tag or text note without source_commit=40hex does NOT prove source
+        versions_map = {
+            VERSION_UUID_1: {
+                'annotations': {
+                    'workers/message': f'Generic message mentioning {SHA_A}',
+                    'workers/tag': 'v1.2.3'
+                }
+            }
+        }
+        transport, _ = self.make_transport(deployments, versions_map)
+        probe = status_probe.make_cloudflare_probe('p1', 'n1', SHA_A, self.cred_path)
+        result = status_probe.collect_probes(self.spec([probe]), http_transport=transport)
+
+        self.assertEqual(len(result['observations']), 1)
+        obs = result['observations'][0]
+        self.assertEqual(obs['payload']['state'], 'unknown')
+
+    def test_mixed_canary_traffic_yields_unknown(self):
+        deployments = [{
+            'id': 'dep-canary',
+            'versions': [
+                {'version_id': VERSION_UUID_1, 'percentage': 90},
+                {'version_id': VERSION_UUID_2, 'percentage': 10}
+            ]
+        }]
+        versions_map = {
+            VERSION_UUID_1: {'annotations': {'workers/message': f'source_commit={SHA_A}'}},
+            VERSION_UUID_2: {'annotations': {'workers/message': f'source_commit={SHA_B}'}},
+        }
+        transport, _ = self.make_transport(deployments, versions_map)
+        probe1 = status_probe.make_cloudflare_probe('p1', 'n1', SHA_A, self.cred_path)
+        probe2 = status_probe.make_cloudflare_probe('p2', 'n2', SHA_B, self.cred_path)
+        result = status_probe.collect_probes(self.spec([probe1, probe2]), http_transport=transport)
+
+        states = [o['payload']['state'] for o in result['observations']]
+        self.assertEqual(states, ['unknown', 'unknown'])
+
+    def test_empty_or_missing_data_yields_unknown(self):
+        # Empty deployments list
+        transport, _ = self.make_transport([])
+        probe = status_probe.make_cloudflare_probe('p1', 'n1', SHA_A, self.cred_path)
+        result = status_probe.collect_probes(self.spec([probe]), http_transport=transport)
+        self.assertEqual(result['observations'][0]['payload']['state'], 'unknown')
+
+        # Invalid version id
+        dep_bad_vid = [{'id': 'd', 'versions': [{'version_id': 'bad-id', 'percentage': 100}]}]
+        transport2, _ = self.make_transport(dep_bad_vid)
+        result2 = status_probe.collect_probes(self.spec([probe]), http_transport=transport2)
+        self.assertEqual(result2['observations'][0]['payload']['state'], 'unknown')
+
+        # Invalid percentage sum
+        dep_bad_pct = [{'id': 'd', 'versions': [{'version_id': VERSION_UUID_1, 'percentage': 50}]}]
+        transport3, _ = self.make_transport(dep_bad_pct)
+        result3 = status_probe.collect_probes(self.spec([probe]), http_transport=transport3)
+        self.assertEqual(result3['observations'][0]['payload']['state'], 'unknown')
+
+    def test_http_errors_yield_unknown(self):
+        for status_code in (401, 429, 500):
+            transport, _ = self.make_transport([], status_code=status_code)
+            probe = status_probe.make_cloudflare_probe('p1', 'n1', SHA_A, self.cred_path)
+            result = status_probe.collect_probes(self.spec([probe]), http_transport=transport)
+            self.assertEqual(result['observations'][0]['payload']['state'], 'unknown',
+                             f"status {status_code} should be unknown")
+
+        # Timeout
+        transport_timeout, _ = self.make_transport([], error=TimeoutError('timed out'))
+        result_to = status_probe.collect_probes(self.spec([probe]), http_transport=transport_timeout)
+        self.assertEqual(result_to['observations'][0]['payload']['state'], 'unknown')
+
+    def test_malformed_json_and_response_bounds(self):
+        def bad_json_transport(url, headers, timeout_s):
+            return {'status': 200, 'body': '<html>error</html>'}
+
+        probe = status_probe.make_cloudflare_probe('p1', 'n1', SHA_A, self.cred_path)
+        result = status_probe.collect_probes(self.spec([probe]), http_transport=bad_json_transport)
+        self.assertEqual(result['observations'][0]['payload']['state'], 'unknown')
+
+        def oversized_transport(url, headers, timeout_s):
+            return {'status': 200, 'body': ' ' * (status_probe.MAX_CF_BODY + 10)}
+
+        result_ov = status_probe.collect_probes(self.spec([probe]), http_transport=oversized_transport)
+        self.assertEqual(result_ov['observations'][0]['payload']['state'], 'unknown')
+
+    def test_redirect_refusal(self):
+        def redirect_transport(url, headers, timeout_s):
+            return {'status': 302, 'body': ''}
+
+        probe = status_probe.make_cloudflare_probe('p1', 'n1', SHA_A, self.cred_path)
+        result = status_probe.collect_probes(self.spec([probe]), http_transport=redirect_transport)
+        self.assertEqual(result['observations'][0]['payload']['state'], 'unknown')
+
+    def test_no_secret_in_provenance_or_payload(self):
+        deployments = [{
+            'id': 'dep-active-1',
+            'versions': [{'version_id': VERSION_UUID_1, 'percentage': 100}]
+        }]
+        versions_map = {
+            VERSION_UUID_1: {
+                'annotations': {'workers/message': f'Release source_commit={SHA_A}'}
+            }
+        }
+        transport, _ = self.make_transport(deployments, versions_map)
+        probe = status_probe.make_cloudflare_probe('p1', 'n1', SHA_A, self.cred_path)
+        result = status_probe.collect_probes(self.spec([probe]), http_transport=transport)
+
+        obs = result['observations'][0]
+        # Payload keys must strictly adhere to Hub contract: state, sha, deployment
+        self.assertTrue(set(obs['payload'].keys()).issubset({'state', 'sha', 'deployment'}))
+        dumped = json.dumps(obs)
+        self.assertNotIn('cf-token-12345678', dumped)
+        self.assertNotIn(self.cred_path, dumped)
+
+    def test_snapshot_reuse_within_collection_call(self):
+        deployments = [{
+            'id': 'dep-active-1',
+            'versions': [{'version_id': VERSION_UUID_1, 'percentage': 100}]
+        }]
+        versions_map = {
+            VERSION_UUID_1: {
+                'annotations': {'workers/message': f'Release source_commit={SHA_A}'}
+            }
+        }
+        transport, call_log = self.make_transport(deployments, versions_map)
+        # Two probes for different sessions and different SHAs targeting the same script
+        probe1 = status_probe.make_cloudflare_probe('p1', 'n1', SHA_A, self.cred_path)
+        probe2 = status_probe.make_cloudflare_probe('p2', 'n2', SHA_B, self.cred_path)
+        result = status_probe.collect_probes(self.spec([probe1, probe2]), http_transport=transport)
+
+        self.assertEqual(len(result['observations']), 2)
+        self.assertEqual(result['observations'][0]['payload']['state'], 'deployed')
+        self.assertEqual(result['observations'][1]['payload']['state'], 'not_deployed')
+        # Deployments was called only once, version detail was called only once!
+        self.assertEqual(len(call_log), 2)
+
+    def test_credentials_failure_yields_unknown_deploy_observation(self):
+        # 0777 credentials file mode fails security check
+        bad_cred_path = str(self.root / 'bad_creds.env')
+        Path(bad_cred_path).write_text(
+            'CLOUDFLARE_ACCOUNT_ID=acc\nCLOUDFLARE_API_TOKEN=cf-token-12345678\n',
+            encoding='utf-8'
+        )
+        os.chmod(bad_cred_path, 0o777)
+        probe = status_probe.make_cloudflare_probe('p1', 'n1', SHA_A, bad_cred_path)
+        result = status_probe.collect_probes(self.spec([probe]))
+
+        self.assertEqual(len(result['observations']), 1)
+        obs = result['observations'][0]
+        self.assertEqual(obs['kind'], 'probe_deploy')
+        self.assertEqual(obs['payload']['state'], 'unknown')
+
+
 if __name__ == '__main__':
     unittest.main()
+

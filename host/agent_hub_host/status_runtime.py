@@ -122,6 +122,7 @@ class StatusCollector:
                  machine_id: str | None = None, min_interval_s: int = 60,
                  list_sessions_fn: Callable | None = None,
                  probe_runner: Callable | None = None,
+                 http_transport: Callable | None = None,
                  submit_fn: Callable | None = None,
                  time_fn: Callable | None = None) -> None:
         self.allowlist_path = allowlist_path
@@ -133,6 +134,7 @@ class StatusCollector:
             self.min_interval_s = 60
         self.list_sessions_fn = list_sessions_fn
         self.probe_runner = probe_runner
+        self.http_transport = http_transport
         self.submit_fn = submit_fn
         self.time_fn = time_fn or time.monotonic
         self._last_step: float | None = None
@@ -235,10 +237,18 @@ class StatusCollector:
             from .status_probe import collect_probes
             probes = allowlist.get('probes') or []
             repo_roots = allowlist.get('repo_roots') or []
-            if isinstance(probes, list) and probes and isinstance(repo_roots, list) and repo_roots:
+            if isinstance(probes, list) and probes:
+                roots = [str(r) for r in repo_roots] if isinstance(repo_roots, list) else []
                 spec = {'machine_id': machine_id, 'observed_at': observed_at,
-                        'repo_roots': [str(r) for r in repo_roots], 'probes': probes}
-                probe_result = collect_probes(spec, self.probe_runner)
+                        'repo_roots': roots, 'probes': probes}
+                for opt_k in ('credentials_file', 'cloudflare_credentials_file'):
+                    if opt_k in allowlist:
+                        spec[opt_k] = allowlist[opt_k]
+                probe_result = collect_probes(
+                    spec,
+                    runner=self.probe_runner,
+                    http_transport=getattr(self, 'http_transport', None)
+                )
                 observations = (observations + probe_result.get('observations', []))
                 skipped = (skipped + probe_result.get('skipped', []))
         except Exception as exc:  # noqa: BLE001 - isolated
