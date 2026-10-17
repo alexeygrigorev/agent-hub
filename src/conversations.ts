@@ -1,4 +1,5 @@
 import { AUTOMATION_SCHEMA, AUTOMATION_REVOKE_TRIGGER, AUTOMATION_SENDER, type BacklogQuery, type FollowUpIntent } from './conversation-automation';
+import { ConversationLinksService } from './conversation-links';
 import { credentialActor, validRegistryName, registryAddress } from './agent_registry';
 import {
   SqlStorage,
@@ -297,8 +298,49 @@ export interface ConversationRetentionResult {
   removedMembersDeleted: number;
   membersDeleted: number;
   automationRowsDeleted: number;
+  linksDeleted?: number;
   rowsDeleted: number;
   hasMore: boolean;
+}
+
+/** Child join-table handler owned by ConversationLinksService. */
+export interface ConversationLinksHandler {
+  attach(
+    auth: ConversationAuthInput,
+    conversationId: string,
+    input: { kind?: unknown; ref?: unknown; idempotencyKey?: unknown },
+  ): Record<string, unknown>;
+  list(
+    auth: ConversationAuthInput,
+    conversationId: string,
+    options?: { limit?: number; cursor?: string | null },
+  ): Record<string, unknown>;
+  getLink(
+    auth: ConversationAuthInput,
+    conversationId: string,
+    linkId: string,
+  ): Record<string, unknown>;
+  remove(
+    auth: ConversationAuthInput,
+    conversationId: string,
+    linkId: string,
+  ): Record<string, unknown>;
+  reverse(
+    auth: ConversationAuthInput,
+    options: {
+      kind?: string | null;
+      ref?: string | null;
+      limit?: number;
+      cursor?: string | null;
+    },
+  ): Record<string, unknown>;
+  hasExpiredRows(nowMs: number): boolean;
+  hasRowsForConversation(conversationId: string): boolean;
+  deleteChunkForConversation(conversationId: string, limit: number): number;
+  retentionCleanup(
+    nowMs: number,
+    limit: number,
+  ): { rowsDeleted: number; hasMore: boolean };
 }
 
 /**
@@ -776,6 +818,7 @@ export class ConversationsService {
   private readonly now: () => number;
   public identityValidator: IdentityValidator;
   public limits: ConversationStorageLimits;
+  public linksHandler: ConversationLinksService;
 
   constructor(
     sql: SqlStorage,
@@ -787,7 +830,14 @@ export class ConversationsService {
     },
   ) {
     this.sql = sql;
-    this.txSync = txSync ?? (<T>(fn: () => T): T => fn());
+    // Child link calls join this service's current transaction, including when
+    // used directly with DurableObjectStorage.transactionSync (no nested BEGIN).
+    let depth = 0;
+    this.txSync = <T>(fn: () => T): T => {
+      if (!txSync || depth > 0) return fn();
+      depth++;
+      try { return txSync(fn); } finally { depth--; }
+    };
     this.now = options?.now ?? Date.now;
     this.identityValidator =
       options?.identityValidator ?? createSqlIdentityValidator(sql);
@@ -820,6 +870,7 @@ export class ConversationsService {
         options?.limits?.archivedConversationRetentionMs ??
         DEFAULT_ARCHIVED_CONVERSATION_RETENTION_MS,
     };
+    this.linksHandler = new ConversationLinksService(sql, this, this.txSync);
   }
 
   public getNow(): number {
@@ -835,6 +886,7 @@ export class ConversationsService {
         }
       }
       this.sql.exec(AUTOMATION_REVOKE_TRIGGER);
+      this.linksHandler.init();
       for (const alterStmt of [
         'ALTER TABLE conversations ADD COLUMN retained_message_count INTEGER NOT NULL DEFAULT 0',
         'ALTER TABLE conversations ADD COLUMN retained_message_bytes INTEGER NOT NULL DEFAULT 0',
@@ -948,6 +1000,11 @@ export class ConversationsService {
           CONVERSATIONS_SCHEMA_VERSION,
         );
       }
+      // A bounded fair pass reconciles pre-existing orphan links on startup.
+      // Remaining work stays visible to the ordinary retention driver.
+      if (this.linksHandler.hasExpiredRows(this.now())) {
+        this.retentionCleanup(this.now(), DEFAULT_RETENTION_BATCH_LIMIT);
+      }
     });
   }
 
@@ -963,8 +1020,21 @@ export class ConversationsService {
     };
   }
 
+  public assertActiveMember(
+    conversationId: string,
+    principal: VerifiedConversationPrincipal,
+  ): { conversation: any; member: any } {
+    return this.requireActiveMembership(
+      conversationId,
+      principal.actor,
+      false,
+      principal.kind,
+    );
+  }
+
   public hasExpiredRows(nowMs: number = this.now()): boolean {
     if (this.automationRetirementCandidates(nowMs, 1).some(rows => rows.length)) return true;
+    if (this.linksHandler?.hasExpiredRows(nowMs)) return true;
     const archivedCutoffIso = new Date(
       nowMs - this.limits.archivedConversationRetentionMs,
     ).toISOString();
@@ -1065,6 +1135,7 @@ export class ConversationsService {
       let removedMembersDeleted = 0;
       let membersDeleted = 0;
       let automationRowsDeleted = 0;
+      let linksDeleted = 0;
       const previewRefreshIds = new Set<string>();
 
       const archivedCutoffIso = new Date(
@@ -1212,7 +1283,37 @@ export class ConversationsService {
             continue;
           }
 
-          // 1c. Terminal header deletion only after all child messages and members are purged
+          // 1c. Delete child links in indexed chunks (counted toward the same budget)
+          if (this.linksHandler && stepRemaining > 0) {
+            const linkChunk = this.linksHandler.deleteChunkForConversation(
+              conv.id,
+              stepRemaining,
+            );
+            if (linkChunk > 0) {
+              linksDeleted += linkChunk;
+              remaining -= linkChunk;
+              stepRemaining -= linkChunk;
+            }
+            if (
+              this.linksHandler.hasRowsForConversation(conv.id) ||
+              stepRemaining <= 0
+            ) {
+              continue;
+            }
+          }
+
+          // Automation retires through its fair categories, never a cascading
+          // delete. Keep the parent while receipts/grants or uncertain slots
+          // still need it; inconsistent frozen effects must remain recoverable.
+          if (this.sql.exec(`SELECT 1 FROM conversation_automation_grants WHERE conversation_id = ?
+              UNION ALL SELECT 1 FROM conversation_automation_receipts WHERE conversation_id = ?
+              UNION ALL SELECT 1 FROM hub_check_slots WHERE state != 'done'
+                AND json_extract(check_json, '$.action.conversation_id') = ? LIMIT 1`,
+              conv.id, conv.id, conv.id).toArray().length > 0) {
+            continue;
+          }
+
+          // 1d. Delete the header only after bounded child retirement completes.
           this.sql.exec('DELETE FROM conversations WHERE id = ?', conv.id);
           this.sql.exec(
             `UPDATE conversation_storage_usage
@@ -1341,6 +1442,15 @@ export class ConversationsService {
         return before - remaining;
       };
 
+      const runOrphanLinksStep = (stepBudget: number): number => {
+        const budget = Math.min(remaining, stepBudget);
+        if (budget <= 0) return 0;
+        const step = this.linksHandler.retentionCleanup(nowMs, budget);
+        linksDeleted += step.rowsDeleted;
+        remaining -= step.rowsDeleted;
+        return step.rowsDeleted;
+      };
+
       runFairRetentionPass(
         this.sql,
         'conv',
@@ -1379,6 +1489,10 @@ export class ConversationsService {
                 .toArray().length > 0,
             spend: runMessagesStep,
           },
+          {
+            hasWork: () => this.linksHandler.hasExpiredRows(nowMs),
+            spend: runOrphanLinksStep,
+          },
         ],
         limit,
       );
@@ -1388,7 +1502,7 @@ export class ConversationsService {
       }
 
       const rowsDeleted =
-        conversationsDeleted + messagesDeleted + membersDeleted + automationRowsDeleted;
+        conversationsDeleted + messagesDeleted + membersDeleted + automationRowsDeleted + linksDeleted;
       const hasMore = this.hasExpiredRows(nowMs);
 
       return {
@@ -1397,6 +1511,7 @@ export class ConversationsService {
         removedMembersDeleted,
         membersDeleted,
         automationRowsDeleted,
+        linksDeleted,
         rowsDeleted,
         hasMore,
       };
@@ -3522,6 +3637,37 @@ export class ConversationsService {
         return jsonResponse(this.listParticipants(auth));
       }
 
+      // Reverse job/launch → member conversations (must precede /:id)
+      if (path === '/api/conversations/links') {
+        if (method !== 'GET') {
+          return jsonResponse({ error: 'method_not_allowed' }, 405);
+        }
+        for (const k of url.searchParams.keys()) {
+          if (!['kind', 'ref', 'limit', 'cursor'].includes(k)) {
+            return jsonResponse({ error: 'unknown_query_param', param: k }, 400);
+          }
+        }
+        if (!this.linksHandler) {
+          return jsonResponse({ error: 'not_found' }, 404);
+        }
+        let reverseLimit = DEFAULT_PAGE_LIMIT;
+        if (url.searchParams.has('limit')) {
+          const rawLimit = url.searchParams.get('limit')!;
+          if (!/^\d+$/.test(rawLimit)) {
+            return jsonResponse({ error: 'invalid_limit' }, 400);
+          }
+          reverseLimit = parseInt(rawLimit, 10);
+        }
+        return jsonResponse(
+          this.linksHandler.reverse(auth, {
+            kind: url.searchParams.get('kind'),
+            ref: url.searchParams.get('ref'),
+            limit: reverseLimit,
+            cursor: url.searchParams.get('cursor'),
+          }),
+        );
+      }
+
       // 2. GET or POST /api/conversations
       if (path === '/api/conversations') {
         if (method === 'GET') {
@@ -3718,6 +3864,86 @@ export class ConversationsService {
         const parsed = await readBoundedJsonBody(request, true);
         if (parsed.error) return parsed.error;
         return jsonResponse(this.removeMember(auth, convId, targetActor));
+      }
+
+      // 5b. GET/POST /api/conversations/:id/links and GET/DELETE .../links/:linkId
+      const linksMatch = /^\/api\/conversations\/([^/]+)\/links$/.exec(path);
+      if (linksMatch) {
+        const convId = decodeURIComponent(linksMatch[1]);
+        if (!this.linksHandler) {
+          return jsonResponse({ error: 'not_found' }, 404);
+        }
+        if (method === 'GET') {
+          for (const k of url.searchParams.keys()) {
+            if (!['limit', 'cursor'].includes(k)) {
+              return jsonResponse(
+                { error: 'unknown_query_param', param: k },
+                400,
+              );
+            }
+          }
+          let limit = DEFAULT_PAGE_LIMIT;
+          if (url.searchParams.has('limit')) {
+            const rawLimit = url.searchParams.get('limit')!;
+            if (!/^\d+$/.test(rawLimit)) {
+              return jsonResponse({ error: 'invalid_limit' }, 400);
+            }
+            limit = parseInt(rawLimit, 10);
+          }
+          return jsonResponse(
+            this.linksHandler.list(auth, convId, {
+              limit,
+              cursor: url.searchParams.get('cursor'),
+            }),
+          );
+        }
+        if (method === 'POST') {
+          const parsed = await readBoundedJsonBody(request, false);
+          if (parsed.error) return parsed.error;
+          const body = parsed.data!;
+          const allowedKeys = new Set(['kind', 'ref', 'idempotency_key']);
+          for (const k of Object.keys(body)) {
+            if (FORBIDDEN_SENDER_FIELDS.has(k)) {
+              return jsonResponse({ error: 'sender_override_forbidden' }, 400);
+            }
+            if (!allowedKeys.has(k)) {
+              return jsonResponse({ error: 'unknown_fields', field: k }, 400);
+            }
+          }
+          const created = this.linksHandler.attach(auth, convId, {
+            kind: body.kind,
+            ref: body.ref,
+            idempotencyKey: body.idempotency_key,
+          });
+          return jsonResponse(created, created.replay ? 200 : 201);
+        }
+        return jsonResponse({ error: 'method_not_allowed' }, 405);
+      }
+
+      const linkItemMatch =
+        /^\/api\/conversations\/([^/]+)\/links\/([^/]+)$/.exec(path);
+      if (linkItemMatch) {
+        const convId = decodeURIComponent(linkItemMatch[1]);
+        const linkId = decodeURIComponent(linkItemMatch[2]);
+        if (!this.linksHandler) {
+          return jsonResponse({ error: 'not_found' }, 404);
+        }
+        if (method === 'GET') {
+          for (const k of url.searchParams.keys()) {
+            return jsonResponse({ error: 'unknown_query_param', param: k }, 400);
+          }
+          return jsonResponse(this.linksHandler.getLink(auth, convId, linkId));
+        }
+        if (method === 'DELETE') {
+          const parsed = await readBoundedJsonBody(request, true);
+          if (parsed.error) return parsed.error;
+          const body = parsed.data!;
+          for (const k of Object.keys(body)) {
+            return jsonResponse({ error: 'unknown_fields', field: k }, 400);
+          }
+          return jsonResponse(this.linksHandler.remove(auth, convId, linkId));
+        }
+        return jsonResponse({ error: 'method_not_allowed' }, 405);
       }
 
       // 6. GET or POST /api/conversations/:id/messages
