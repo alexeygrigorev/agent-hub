@@ -8,6 +8,7 @@ native adapters. See docs/SESSION-CONTROL.md (proposal, pending head ACK).
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -17,7 +18,9 @@ from . import api, auth, config
 
 MAX_REQUEST = 32768
 MAX_BRIEF = 8192
+MAX_BRIEF_CHARS = 8000
 MAX_BODY = 16384
+SESSION_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 TIERS = ('quick', 'daily', 'deep')
 WAIT_DEFAULT_TIMEOUT = 300.0
 WAIT_MAX_TIMEOUT = 600.0
@@ -80,6 +83,28 @@ def read_file(path, limit=MAX_BODY):
     if len(raw) > limit:
         raise ValueError('Input exceeds capacity')
     return raw.decode('utf-8')
+
+
+def read_prompt_text(text, limit=MAX_BRIEF):
+    """Inline `--prompt` with the same boundaries as `--brief-file`.
+
+    UTF-8, at most MAX_BRIEF bytes and MAX_BRIEF_CHARS chars, non-blank.
+    Prompts are data: never executed locally, only forwarded as the session
+    brief payload the server already handles. No shell is ever involved.
+    """
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError('Prompt must be non-empty text')
+    if len(text.encode('utf-8')) > limit or len(text) > MAX_BRIEF_CHARS:
+        raise ValueError('Prompt exceeds capacity')
+    return text
+
+
+def check_session_name(name):
+    """Friendly session name: stored with the start intent, shown in
+    list/show, never identity or authority. Exact-match alias only."""
+    if not isinstance(name, str) or not SESSION_NAME_RE.fullmatch(name):
+        raise ValueError('Session name must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}')
+    return name
 
 
 def add_wait(parser):
@@ -225,8 +250,11 @@ def add_commands(sub):
     start.add_argument('--workspace', required=True)
     start.add_argument('--tier', choices=TIERS)
     start.add_argument('--cwd')
+    start.add_argument('--name', default=None,
+                       help='Friendly session name (stored, shown in list/show; exact-match alias, never identity)')
     mode = start.add_mutually_exclusive_group()
     mode.add_argument('--brief-file', help='UTF-8 goal file for headless work (max 8 KiB)')
+    mode.add_argument('--prompt', default=None, help='Inline UTF-8 goal text for headless work (max 8 KiB; same boundaries as --brief-file)')
     mode.add_argument('--interactive', action='store_true', help='Start at an empty native prompt')
     start.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
     add_wait(start)
@@ -401,11 +429,17 @@ def execute(args):
             value = getattr(args, field, None)
             if value:
                 payload[field] = value
+        if getattr(args, 'name', None) is not None:
+            payload['name'] = check_session_name(args.name)
         payload['mode'] = 'interactive' if getattr(args, 'interactive', False) else 'headless'
         if getattr(args, 'brief_file', None):
             if payload['mode'] == 'interactive':
                 raise ValueError('Interactive sessions start at an empty native prompt')
             payload['brief'] = read_file(args.brief_file, MAX_BRIEF)
+        if getattr(args, 'prompt', None) is not None:
+            if payload['mode'] == 'interactive':
+                raise ValueError('Interactive sessions start at an empty native prompt')
+            payload['brief'] = read_prompt_text(args.prompt)
         try:
             created = request('POST', '/api/sessions', payload)
         except ValueError as exc:

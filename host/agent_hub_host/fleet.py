@@ -14,6 +14,28 @@ from . import bus
 
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 SERVICES = {"codex", "claude", "grok", "gemini", "zai", "go", "copilot"}
+WORKSPACE_SEG = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
+
+
+def absolute_workspace_ok(value):
+    """Bounded canonical absolute POSIX workspace identifier.
+
+    Mirrors the Hub server validator: no NUL/control chars, no backslashes,
+    no `//`, no trailing slash, no `.`/`..` segments, segments confined to
+    `[A-Za-z0-9._-]{1,64}`, total length capped at 512. Platform-neutral on
+    purpose (Windows stays offline; POSIX acceptance now, legacy source
+    preserved everywhere).
+    """
+    if not isinstance(value, str) or not value or len(value) > 512:
+        return False
+    if not value.startswith('/') or '\\' in value or '\x00' in value:
+        return False
+    if any(ord(c) < 32 or ord(c) == 127 for c in value):
+        return False
+    parts = value.split('/')
+    if parts[0] != '' or len(parts) < 2:
+        return False
+    return all(seg and seg not in ('.', '..') and WORKSPACE_SEG.fullmatch(seg) for seg in parts[1:])
 
 
 def utcnow():
@@ -53,8 +75,25 @@ def load_settings(path=None):
             if key in sub and (not isinstance(sub[key], list) or not sub[key] or any(not isinstance(x, str) or not x or "\0" in x for x in sub[key])):
                 raise ValueError("Local probes require an argv list")
     workspaces = data.get("workspaces", {})
-    if not isinstance(workspaces, dict) or any(not isinstance(k, str) or not LABEL.fullmatch(k) or not isinstance(v, str) or not Path(v).is_absolute() for k, v in workspaces.items()):
-        raise ValueError("Workspaces must map labels to absolute local paths")
+    # Keys are either legacy labels or explicitly allowed absolute POSIX
+    # paths (bounded canonical form, same rules as the Hub server). Every key
+    # — label or absolute — maps to an absolute local directory through this
+    # operator-configured mapping only: an offer workspace not present here is
+    # refused before any claim or native effect. Absolute keys let a remote
+    # caller address `/absolute/repo/path` directly while the host still
+    # executes only explicitly configured directories (host realpath/CWD
+    # confinement stays authoritative downstream).
+    if not isinstance(workspaces, dict):
+        raise ValueError("Workspaces must map labels or absolute paths to absolute local paths")
+    for key, value in workspaces.items():
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            raise ValueError("Workspaces must map labels or absolute paths to absolute local paths")
+        if not isinstance(key, str) or not key:
+            raise ValueError("Workspaces must map labels or absolute paths to absolute local paths")
+        if LABEL.fullmatch(key):
+            continue
+        if not absolute_workspace_ok(key):
+            raise ValueError("Workspaces must map labels or absolute paths to absolute local paths")
     needs = data.get('capabilities', [])
     if not isinstance(needs, list) or len(needs) > 64 or any(not isinstance(n, str) or not re.fullmatch(r'[a-z0-9][a-z0-9:_-]{0,95}', n) for n in needs) or len(set(needs)) != len(needs):
         raise ValueError('Invalid task capabilities')
@@ -395,10 +434,12 @@ class Dispatcher:
         except Exception:
             raise ValueError("Fresh admission timestamp required") from None
         mode = offer.get("mode")
-        # The offer workspace is a LABEL, not a path: map it through the
-        # operator-configured workspaces (label -> real local directory),
-        # exactly as _route validated above. A literal offer string must
-        # never become a filesystem path (label "demo" is not ./demo).
+        # The offer workspace is a configured identifier — a legacy label or
+        # an explicitly allowed absolute path — never a free-form path: it is
+        # mapped through the operator-configured workspaces exactly as _route
+        # validated above. A literal offer string must never become a
+        # filesystem path on its own (label "demo" is not ./demo, and an
+        # unconfigured "/abs/path" is refused before any claim or effect).
         workspace = Path(self.settings["workspaces"][offer["workspace"]]).resolve(strict=True)
         target_cwd = resolve_offer_cwd(workspace, offer.get("cwd"))
         native = self.settings.get("aplexer_bin", "aplexer")
