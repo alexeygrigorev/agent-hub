@@ -47,6 +47,7 @@ beforeEach(async () => {
     for (const t of ['tasks','grants','rules','receipts']) h.sql.exec('DELETE FROM intake_' + t);
     h.sql.exec('UPDATE intake_meta SET revision=0');
     h.sql.exec('DELETE FROM credentials'); h.sql.exec('DELETE FROM agents');
+    h.sql.exec("INSERT OR REPLACE INTO users (sub, email, is_admin, first_seen_at, last_seen_at) VALUES ('fixture', 'admin@fake.local', 1, '2026-01-01', '2026-01-01')");
   });
 });
 
@@ -180,7 +181,7 @@ describe('private durable intake HTTP/SQLite', () => {
   });
   it('human admin bearer refresh preserves lost-response idempotency identity', async () => {
     const hash = await sha256('hubt_fixture_admin_refresh'), rh = await sha256('hubr_fixture_admin_refresh');
-    await inDO(stub(), (h: any) => h.sql.exec("INSERT INTO credentials(id,kind,token_hash,refresh_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES('human-refresh','human',?,?,'fixture-admin-family','fixture-human','human:fixture','[\"admin\"]','fixture','2026-01-01',?)", hash, rh, new Date(Date.now()+3600000).toISOString()));
+    await inDO(stub(), (h: any) => h.sql.exec("INSERT INTO credentials(id,kind,token_hash,refresh_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES('human-refresh','human',?,?,'fixture-admin-family','admin@fake.local','human:fixture','[\"admin\"]','fixture','2026-01-01',?)", hash, rh, new Date(Date.now()+3600000).toISOString()));
     const payload = { key: 'admin-retry', project: 'demo', title: 'Synthetic', text: 'Original', source };
     const first = await ok('/tasks', payload, 'hubt_fixture_admin_refresh');
     const refresh = await SELF.fetch('https://hub.test/api/token/refresh', { method: 'POST', body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: 'hubr_fixture_admin_refresh' }) });
@@ -310,6 +311,112 @@ describe('private durable intake HTTP/SQLite', () => {
     expect((await call('/tasks/' + unscoped.id + '/assign', { key: 'no-launch', expected_version: 1,
       session: { workspace: 'demo' }, provenance: source }, plain.token)).status).toBe(403);
   });
+  it('carries session.parent_id to canonical session service, preserving lineage, idempotency, and failure boundaries', async () => {
+    const parentRes = await SELF.fetch('https://hub.test/api/sessions', {
+      method: 'POST',
+      headers: { Cookie: cookie, 'x-csrf-token': 'csrf' },
+      body: JSON.stringify({ key: 'parent-session-' + ++seq, workspace: 'demo', mode: 'headless', brief: 'Parent session' })
+    });
+    expect([201, 409]).toContain(parentRes.status);
+    const parentId = ((await parentRes.json()) as any).id;
+    expect(parentId).toMatch(/^[0-9a-f-]{36}$/i);
+
+    const { task } = await create();
+    const childPayload = {
+      key: 'assign-with-parent-' + ++seq,
+      expected_version: 1,
+      session: {
+        workspace: 'demo',
+        engine: 'codex',
+        mode: 'headless',
+        brief: 'Child assigned goal',
+        parent_id: parentId
+      },
+      provenance: source,
+      next_step: 'Child running'
+    };
+    const childAssigned = await ok('/tasks/' + task.id + '/assign', childPayload);
+    const childSessionId = childAssigned.assigned_session.hub_session_id;
+    expect(childSessionId).toMatch(/^[0-9a-f-]{36}$/i);
+
+    await inDO(stub(), (h: any) => {
+      const row = h.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', childSessionId).toArray()[0];
+      expect(row.parent_id).toBe(parentId);
+      expect(row.parent_source).toBe('explicit_parent');
+    });
+    const childShowRes = await SELF.fetch('https://hub.test/api/sessions/' + childSessionId, {
+      headers: { Cookie: cookie, 'x-csrf-token': 'csrf' }
+    });
+    expect(childShowRes.status).toBe(200);
+    const childShow = (await childShowRes.json()) as any;
+    expect(childShow.parent_id).toBe(parentId);
+    expect(childShow.parent_source).toBe('explicit_parent');
+
+    expect(await ok('/tasks/' + task.id + '/assign', childPayload)).toEqual(childAssigned);
+
+    const conflicting = { ...childPayload, session: { ...childPayload.session, parent_id: '11111111-2222-3333-4444-555555555555' } };
+    expect((await call('/tasks/' + task.id + '/assign', conflicting)).status).toBe(409);
+
+    const { task: taskUnknown } = await create();
+    const unknownRes = await call('/tasks/' + taskUnknown.id + '/assign', {
+      key: 'assign-unknown-parent-' + ++seq,
+      expected_version: 1,
+      session: { workspace: 'demo', parent_id: '00000000-0000-0000-0000-000000000000' },
+      provenance: source
+    });
+    expect(unknownRes.status).toBe(404);
+    expect(await unknownRes.json()).toEqual({ error: 'parent_session_not_found' });
+    const taskUnknownAfter = (await ok('/tasks/' + taskUnknown.id)).task;
+    expect(taskUnknownAfter.control.version).toBe(1);
+    expect(taskUnknownAfter.payload_data.history.some((e: any) => e.kind === 'link')).toBe(false);
+
+    await inDO(stub(), (h: any) => {
+      h.sql.exec('UPDATE session_control_sessions SET parent_id = ? WHERE id = ?', parentId, parentId);
+    });
+    const { task: taskCycle } = await create();
+    const cycleRes = await call('/tasks/' + taskCycle.id + '/assign', {
+      key: 'assign-cycle-parent-' + ++seq,
+      expected_version: 1,
+      session: { workspace: 'demo', parent_id: parentId },
+      provenance: source
+    });
+    expect(cycleRes.status).toBe(400);
+    expect(await cycleRes.json()).toEqual({ error: 'parent_cycle_detected' });
+    const taskCycleAfter = (await ok('/tasks/' + taskCycle.id)).task;
+    expect(taskCycleAfter.control.version).toBe(1);
+    expect(taskCycleAfter.payload_data.history.some((e: any) => e.kind === 'link')).toBe(false);
+
+    await inDO(stub(), (h: any) => {
+      h.sql.exec('UPDATE session_control_sessions SET parent_id = NULL WHERE id = ?', parentId);
+    });
+    const agent = await seedAgent('demo:assistant', 'family-' + ++seq, '["bus:read","bus:send","fleet:launch"]');
+    await grant(agent, 'project', 'demo', 'write');
+    const { task: taskForeign } = await create();
+    const foreignRes = await call('/tasks/' + taskForeign.id + '/assign', {
+      key: 'assign-foreign-parent-' + ++seq,
+      expected_version: 1,
+      session: { workspace: 'demo', parent_id: parentId },
+      provenance: source
+    }, agent.token);
+    expect(foreignRes.status).toBe(403);
+    expect(await foreignRes.json()).toEqual({ error: 'parent_forbidden' });
+    const taskForeignAfter = (await ok('/tasks/' + taskForeign.id)).task;
+    expect(taskForeignAfter.control.version).toBe(1);
+    expect(taskForeignAfter.payload_data.history.some((e: any) => e.kind === 'link')).toBe(false);
+
+    const { task: taskNoParent } = await create();
+    const noParentAssigned = await ok('/tasks/' + taskNoParent.id + '/assign', {
+      key: 'assign-no-parent-' + ++seq,
+      expected_version: 1,
+      session: { workspace: 'demo', mode: 'headless', brief: 'Synthetic no-parent goal' },
+      provenance: source
+    });
+    await inDO(stub(), (h: any) => {
+      const row = h.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', noParentAssigned.assigned_session.hub_session_id).toArray()[0];
+      expect(row.parent_id).toBeNull();
+      expect(row.parent_source).toBe('unknown_external');
+    });
+  });
   it('captures verbatim provenance, filters and appends originals without rewriting', async () => {
     const first = await create(); const id = first.task.id;
     expect(first.task.payload_data.history[0]).toMatchObject({ text: '  ORIGINAL synthetic request\n世界\n', source, authority: 'untrusted_task_data' });
@@ -366,7 +473,7 @@ describe('private durable intake HTTP/SQLite', () => {
     const tokenCookie = (await createSessionCookie(env as any, { sub: tokenAdminSubject('a'.repeat(64)), email: TOKEN_ADMIN_EMAIL, isAdmin: true, csrfToken: 'csrf', exp: Math.floor(Date.now()/1000)+3600 })).split(';')[0];
     expect((await call('/handoff', undefined, undefined, { Cookie: tokenCookie })).status).toBe(200);
     const hash = await sha256('hubt_fixture_human');
-    await inDO(stub(), (h: any) => h.sql.exec("INSERT INTO credentials(id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES('human','human',?,'human-family','fixture-human','human:fixture','[\"admin\"]','fixture','2026-01-01',?)", hash, new Date(Date.now()+3600000).toISOString()));
+    await inDO(stub(), (h: any) => h.sql.exec("INSERT INTO credentials(id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES('human','human',?,'human-family','admin@fake.local','human:fixture','[\"admin\"]','fixture','2026-01-01',?)", hash, new Date(Date.now()+3600000).toISOString()));
     expect((await call('/handoff', undefined, 'hubt_fixture_human')).status).toBe(200);
   });
   it('ordinary bus access is private by default; explicit project/write, task/read and all grants work', async () => {

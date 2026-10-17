@@ -107,6 +107,7 @@ def add_commands(sub):
     assign.add_argument('--tier', choices=['quick', 'daily', 'deep'], help='Existing model tier; unknown tiers are refused, never upgraded')
     assign.add_argument('--machine', help='Requested machine label')
     assign.add_argument('--cwd', help='Workspace-relative confined working directory')
+    assign.add_argument('--parent', help='Optional parent Hub session UUID')
     assign_mode = assign.add_mutually_exclusive_group()
     assign_mode.add_argument('--brief-file', help='UTF-8 goal file for headless work (max 8 KiB), or - for stdin')
     assign_mode.add_argument('--interactive', action='store_true', help='Start at an empty native prompt')
@@ -222,6 +223,8 @@ def execute(args):
         for field in ('engine', 'tier', 'machine', 'cwd'):
             if getattr(args, field, None):
                 session[field] = getattr(args, field)
+        if getattr(args, 'parent', None):
+            session['parent_id'] = args.parent
         session['mode'] = 'interactive' if args.interactive else 'headless'
         if args.brief_file:
             if session['mode'] == 'interactive':

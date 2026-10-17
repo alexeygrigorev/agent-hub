@@ -415,7 +415,7 @@ export class IntakeService {
     keys(b, ['key', 'expected_version', 'session', 'provenance', 'next_step', 'current_state', 'owner']);
     identifier(b.key);
     const session = object(b.session);
-    keys(session, ['engine', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode']);
+    keys(session, ['engine', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'parent_id']);
     if (typeof session.workspace !== 'string' || !session.workspace) fail('invalid_field');
     const provenance = source(b.provenance);
     const fingerprint = canonical({ path: '/tasks/' + taskId + '/assign', payload: b });
@@ -446,7 +446,7 @@ export class IntakeService {
     } catch { fail('assignment_failed', 502); }
     const created = started! && typeof started!.body === 'object' ? started!.body : null;
     if (!created || typeof created.id !== 'string' || !SESSION_UUID.test(created.id)) {
-      const status = started && (started.status === 400 || started.status === 403 || started.status === 409) ? started.status : 502;
+      const status = started && (started.status >= 400 && started.status < 500) ? started.status : 502;
       const error = created && typeof created.error === 'string' && created.error ? created.error : 'assignment_failed';
       return json({ error }, status);
     }

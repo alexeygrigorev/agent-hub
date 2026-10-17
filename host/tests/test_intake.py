@@ -89,8 +89,19 @@ class TestIntakeCli(unittest.TestCase):
         self.assertEqual(payload['key'], 'assign')
         self.assertEqual(payload['expected_version'], 2)
         self.assertEqual(payload['session'], {'workspace': 'demo', 'engine': 'codex', 'tier': 'daily', 'mode': 'headless'})
+        self.assertNotIn('parent_id', payload['session'])
         self.assertEqual(payload['provenance'], {'type': 'unknown', 'reference': None, 'timestamp': None})
         self.assertEqual(payload['next_step'], 'Watch binding')
+
+    def test_assign_with_parent_carries_parent_id_in_session(self):
+        with patch.object(intake, 'request', return_value={}) as transport:
+            code, _, error = self.run_cli('intake', 'assign', 'task-1', '--version', '2', '--key', 'assign-parent',
+                                          '--workspace', 'demo', '--engine', 'codex',
+                                          '--parent', 'e3f61b6c-9fda-4bcc-bf3d-cf66cb7ef363')
+        self.assertEqual(code, 0, error)
+        payload = transport.call_args.args[2]
+        self.assertEqual(payload['session']['parent_id'], 'e3f61b6c-9fda-4bcc-bf3d-cf66cb7ef363')
+        self.assertEqual(payload['session']['workspace'], 'demo')
 
     def test_uncertainty_can_be_explicitly_cleared_with_cas(self):
         with patch.object(intake, 'request', return_value={}) as transport:
