@@ -95,14 +95,23 @@ second tracker). No raw terminal, prompt, draft or report-body reads.
 Maintained probes: `host/agent_hub_host/status_probe.py` (stdlib only,
 standalone `--once --probes SPEC [--submit]`). Probe specs are explicit
 argv arrays (no shell): only allowlisted tools (`git/gh/wrangler`) and
-read-only subcommands run (`git push/fetch/pull/clone/ls-remote` refused),
-cwd must sit under allowlisted `repo_roots`, output bounded (8 KiB) and
-token-redacted, child env scrubbed of secrets, argv secrets masked in
-provenance. `git_ancestry` reports `merged_in_main` only on exit-0
-`merge-base --is-ancestor` against a FRESH `origin/main` ref (stale/missing
-refs fail closed to `unknown`); `ci` matches runs by exact `head_sha`;
-`deployment` matches active records naming the exact sha in the target
-environment. Every probe payload carries its source sha (required).
+read-only subcommands run (`git push/fetch/pull/clone` refused;
+`git ls-remote` allowed ONLY as `git ls-remote origin refs/heads/<branch>`;
+`gh api` refuses POST/PATCH/PUT/DELETE/`--method!=GET`/`-X`/`--input`;
+`gh run` allows `list/view` only, never `cancel/rerun`; `wrangler
+deployments` allows `list` only), cwd must sit under allowlisted
+`repo_roots`, output bounded IN FLIGHT (chunked drain, 8 KiB kept per
+stream, overflow kills the child, `probe_output_truncated`), token-redacted,
+child env scrubbed of secrets, argv secrets masked in provenance.
+`git_ancestry` reports `merged_in_main` only on exit-0
+`merge-base --is-ancestor` AND an exact SHA match between the local ref and
+a fresh read-only `git ls-remote origin refs/heads/main` (commit time is
+NOT freshness: old commit on a current remote stays fresh, stale local ref
+with recent commit never counts; network/parse failures fail closed to
+`unknown` with `network_unknown_fails_closed`). `ci` matches runs by exact
+`head_sha`; `deployment` matches active records naming the exact sha in the
+target environment (push/CI success never implies deployed). Every probe
+payload carries its source sha (required).
 - `pending_actions[]`: intake unresolved `followup/blocker/pending_approval`
   only as `{id, type, status, actor, captured_at, text_snippet<=240, link}`.
   Login `user_code` values are always withheld from agent/orchestrator bearers
@@ -145,16 +154,32 @@ fields stay data, never operator instructions.
 
 Maintained collector: `host/agent_hub_host/status_collect.py` (stdlib
 only, standalone `python3 -m agent_hub_host.status_collect --once
---allowlist PATH --sessions-json PATH [--submit]`). Reads only
+--allowlist PATH [--sessions-json PATH] [--submit]`, omit
+`--sessions-json` for real native collection). Reads only
 registered/linked sessions (workspace realpath under allowlisted
-`session_roots`, optional `sessions` registry) and allowlisted `reports`
+`session_roots`, optional `sessions` registry; unregistered rows are
+skipped with zero observations, never forged) and allowlisted `reports`
 entries (path under `report_roots`, bound to a collected session).
+Native default reads the ACTUAL aplexer list through
+`native_sessions.list_sessions` (existing adapter); `working/waiting/idle`
+map only on exact `agent_state`, `limit_hit/context_low` only on explicit
+True markers, otherwise `unknown` (no synthetic draft/limit/finished
+flags, never inferred from text). Runtime wiring lives in NEW
+`host/agent_hub_host/status_runtime.py`: `StatusCollector(...)` with
+`step(force=False, submit=False, prepared_sessions=None)` (explicit
+allowlist path preferred, sibling `journal/status-allowlist.json` default;
+rate-limited, isolated errors, no timer/store/classifier; configured
+`probes`+`repo_roots` run inside the same step). Transport is
+`api.safe_http_json` (no-redirect, `agent-hub-host/1` UA, bounded JSON;
+Cloudflare 1010-safe); errors never carry tokens, URLs, or raw bodies.
 Session states come only from explicit structured markers
 (`limit_exhausted/context_low/draft_pending/working/waiting/idle`,
 limit-first precedence; anything else is `unknown`, never inferred from
 text). Headlines are first-heading-only (≤240 chars, sanitized); verdicts
 are explicit config (`done/attention`, default `unknown`). Absent/invalid
-allowlist fails closed (exit 2, collects nothing).
+allowlist fails closed (exit 2, collects nothing). Tokens come from native
+secure config/env in memory only (`HUB_URL`/`HUB_TOKEN`/`HUB_JOB_TOKEN` or
+`auth.get_access_token()`); no worker production calls on submit.
 
 ## Pagination and `--since`
 

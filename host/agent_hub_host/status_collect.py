@@ -215,6 +215,10 @@ def submit(observations: list, base_url: str, token: str, timeout: int = 20) -> 
                 code = int(exc.code)
             except (TypeError, ValueError):
                 code = None
+            try:
+                exc.close()
+            except Exception:
+                pass
             results.append({'status': code, 'error': 'http_error'})
         except Exception as exc:  # noqa: BLE001 - surfaced as data, never raised
             results.append({'status': None, 'error': sanitize(type(exc).__name__, 64) or 'transport_failed'})
@@ -224,8 +228,8 @@ def submit(observations: list, base_url: str, token: str, timeout: int = 20) -> 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='status_collect', description='M14b allowlisted host status collector')
     parser.add_argument('--once', action='store_true', required=True, help='Run a single collection round')
-    parser.add_argument('--allowlist', default=None, help='Operator allowlist JSON path')
-    parser.add_argument('--sessions-json', default=None, help='Structured native session list (file or - for stdin)')
+    parser.add_argument('--allowlist', default=None, help='Operator allowlist JSON path (explicit preferred; default sibling journal/status-allowlist.json)')
+    parser.add_argument('--sessions-json', default=None, help='Prepared structured native session list (file or - for stdin). Omit for real native collection via the aplexer adapter.')
     parser.add_argument('--machine-id', default=None, help='Override machine_id (default: allowlist machine_id)')
     parser.add_argument('--submit', action='store_true', help='POST observations to the Hub intake endpoint')
     return parser
@@ -233,10 +237,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list | None = None) -> dict:
     args = build_parser().parse_args(argv)
-    allowlist_path = args.allowlist or os.environ.get('HUB_STATUS_COLLECT_ALLOWLIST') or ''
-    if not allowlist_path:
-        print('status_collect: no allowlist configured, refusing to collect', file=sys.stderr)
-        raise SystemExit(2)
+    from .status_runtime import resolve_allowlist_path
+    allowlist_path = resolve_allowlist_path(args.allowlist)
     try:
         allowlist = load_allowlist(allowlist_path)
     except (OSError, ValueError) as exc:
@@ -246,9 +248,21 @@ def main(argv: list | None = None) -> dict:
     if not machine_id:
         print('status_collect: allowlist carries no machine_id', file=sys.stderr)
         raise SystemExit(2)
+    from datetime import datetime, timezone
     if args.sessions_json in (None, ''):
-        print('status_collect: --sessions-json is required (structured native input only)', file=sys.stderr)
-        raise SystemExit(2)
+        # Real native collection (default): actual aplexer list via the
+        # existing adapter + configured probes, in one rate-limited step.
+        # No prepared input, no synthesis.
+        from .status_runtime import StatusCollector
+        collector = StatusCollector(allowlist=allowlist, machine_id=str(machine_id),
+                                    min_interval_s=0)
+        result = collector.step(force=True, submit=args.submit)
+        if args.submit and result.get('submit') is None and result.get('errors'):
+            # submit attempted inside step; errors already recorded.
+            pass
+        json.dump(result, sys.stdout, indent=2, ensure_ascii=True)
+        sys.stdout.write('\n')
+        return result
     try:
         if args.sessions_json == '-':
             sessions = json.load(sys.stdin)
@@ -258,7 +272,6 @@ def main(argv: list | None = None) -> dict:
     except (OSError, ValueError) as exc:
         print('status_collect: cannot read sessions input: %s' % exc, file=sys.stderr)
         raise SystemExit(2)
-    from datetime import datetime, timezone
     observed_at = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
     result = collect_once(sessions, allowlist, str(machine_id), observed_at)
     if args.submit:
