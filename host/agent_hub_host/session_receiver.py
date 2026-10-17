@@ -149,10 +149,15 @@ def offer_to_command(offer: dict[str, Any]) -> dict[str, Any]:
             raise SessionControlError("Native incarnation (native_created_at_ms) is required; refusing")
         target = {"session_id": binding["native_id"], "tag": binding["tag"],
                   "workspace": binding["workspace"], "created_at_ms": created}
+        if isinstance(offer.get("engine"), str) and offer["engine"]:
+            # Expected session engine from the hub offer: a live SHELL row
+            # never qualifies as a requested model engine (masquerade refuses).
+            target["engine"] = offer["engine"]
         # Validate early (UUID shape, absolute workspace) before any claim.
         NativeTarget(session_id=target["session_id"], tag=target["tag"],
                      workspace=target["workspace"],
-                     created_at_ms=target["created_at_ms"]).validated()
+                     created_at_ms=target["created_at_ms"],
+                     engine=target.get("engine")).validated()
         command: dict[str, Any] = {"op": kind, "command_id": command_id,
                                    "generation": generation, "target": target}
         if kind == "send":
@@ -210,14 +215,18 @@ def receive_once(
     request: Callable,
     now_ms: Optional[int] = None,
     limit: int = 20,
+    sender_workspace: Optional[str] = None,
 ) -> dict[str, Any]:
     """Run ONE bounded receiver cycle: poll -> claim -> execute -> ack.
 
     ``request`` is the injected hub HTTP callable ``(method, path, payload)``,
     e.g. ``session_control.request`` with the existing host credential/config
-    (fake in tests). Returns ``{"offers_seen", "processed", "skipped",
-    "results"}``; per-command results carry the shared function outcome plus
-    the ack submission flag. No daemon, no timer, no second Fleet consumer.
+    (fake in tests). ``sender_workspace`` pins the authorized native sender
+    workspace for replyable sends (service deployment); when absent, the
+    receiver's own qualified whoami workspace is the sender mailbox. Returns
+    ``{"offers_seen", "processed", "skipped", "results"}``; per-command
+    results carry the shared function outcome plus the ack submission flag.
+    No daemon, no timer, no second Fleet consumer.
     """
     if not isinstance(custody, CallerCustody):
         raise SessionControlError("Caller custody is required")
@@ -226,6 +235,9 @@ def receive_once(
         raise SessionControlError("Hub request callable is required")
     if type(limit) is not int or not 1 <= limit <= 20:
         raise SessionControlError("Receiver limit must be 1..20")
+    if sender_workspace is not None and (
+            not isinstance(sender_workspace, str) or not os.path.isabs(sender_workspace)):
+        raise SessionControlError("sender_workspace must be an absolute path")
     _ensure_journal_dir(journal_dir)
 
     try:
@@ -283,12 +295,13 @@ def receive_once(
             skipped.append({"command_id": command_id, "reason": str(exc)[:300]})
             continue
         # Genuine sender qualification BEFORE the claim/effect: a host process
-        # without a workspace-bound native sender identity would emit an
-        # anonymous envelope recipients cannot reply to, so send offers are
-        # held honestly (no claim, no journal, no effect) instead.
+        # without a bound native sender identity would emit an anonymous
+        # envelope recipients cannot reply to, so send offers are held
+        # honestly (no claim, no journal, no effect) instead. The authorized
+        # sender workspace is independent of the target workspace.
         if command.get("op") == "send":
             try:
-                qualify_sender_binding(executable, str(command["target"]["workspace"]))
+                qualify_sender_binding(executable, sender_workspace)
             except (SessionControlError, SessionUncertain) as exc:
                 skipped.append({"command_id": command_id,
                                 "reason": "native_sender_unbound_reconcile"})
@@ -313,7 +326,8 @@ def receive_once(
         try:
             outcome = handle_claimed_command(command, host_claim, custody=custody,
                                              journal_dir=journal_dir, executable=executable,
-                                             request=request, now_ms=now_ms)
+                                             request=request, now_ms=now_ms,
+                                             sender_workspace=sender_workspace)
         except SessionUncertain as exc:
             skipped.append({"command_id": command_id, "reason": "uncertain_%s" % str(exc)[:200]})
             continue
@@ -324,17 +338,19 @@ def receive_once(
                           "state": outcome.get("state"),
                           "ack_submitted": bool((outcome.get("ack") or {}).get("submitted", False)),
                           "replayed": bool(outcome.get("replayed", False))})
-    # Bounded read-only reconciliation pass: sends journaled as unknown (reply
-    # not yet observed, server command still claimed under its lease) are
+    # Bounded FAIR reconciliation pass: sends journaled as unknown (reply not
+    # yet observed, server command still claimed under its lease) are
     # re-checked WITHOUT any second native send; a delayed recipient reply
     # observed now is acked under the SAME claim token. Completed effects
     # whose ack response was lost are re-submitted identically (never
     # re-offered by the server, so the journal is the discovery path).
+    # Completed (ack_submitted) and terminal-verdict journals are filtered
+    # BEFORE the per-cycle cap so they can never starve pending work behind
+    # lexicographically smaller filenames; they are retained on disk as the
+    # durable record (never deleted to hide history).
     reconciled: list[dict[str, Any]] = []
     try:
-        pending = sorted(
-            name for name in os.listdir(journal_dir)
-            if name.startswith("cmd-") and name.endswith(".json"))[:20]
+        pending = _pending_reconcile_names(journal_dir, limit=20)
     except OSError:
         pending = []
     for name in pending:
@@ -358,3 +374,43 @@ def receive_once(
                                "reconciled": True})
     return {"offers_seen": len(offers), "processed": processed, "skipped": skipped,
             "reconciled": reconciled}
+
+
+def _pending_reconcile_names(journal_dir: str, limit: int = 20) -> list[str]:
+    """Fair pending scan: completed/terminal journals never consume the cap.
+
+    A journal needs attention when it is an unreconciled send (state unknown
+    with a journaled original envelope) or an unsubmitted proven ack for a
+    completed effect (ack_payload present, not submitted, no terminal server
+    verdict). Everything else — submitted, terminal, or malformed — is
+    skipped but retained. Names sort for determinism; the cap applies to
+    pending journals only, so 20 completed files can never starve a pending
+    one, and multiple pages/cycles converge without busy retry.
+    """
+    import json as _json
+
+    try:
+        names = sorted(
+            name for name in os.listdir(journal_dir)
+            if name.startswith("cmd-") and name.endswith(".json"))
+    except OSError:
+        return []
+    pending: list[str] = []
+    for name in names:
+        path = os.path.join(journal_dir, name)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                record = _json.load(fh)
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue  # corrupt journal: fail closed, surface via manual reconcile
+        if not isinstance(record, dict):
+            continue
+        if record.get("state") == "unknown" and record.get("original_native_message_id"):
+            pending.append(name)
+        elif (isinstance(record.get("ack_payload"), dict)
+                and not record.get("ack_submitted")
+                and not str(record.get("ack_error") or "").startswith("server_terminal_")):
+            pending.append(name)
+        if len(pending) >= limit:
+            break
+    return pending

@@ -67,6 +67,9 @@ def main():
         rows = load()
         rec = {"id": str(uuid.uuid4()), "tag": tag, "workspace": ws, "engine": "shell",
                "profile": None, "phase": "running", "state": "running",
+               # Real native DTO fidelity (see executor FAKE_SCRIPT note):
+               # containment_empty is the stop-oracle proof field.
+               "containment_empty": False,
                "created_at_ms": 1700000000000, "last_activity_ms": 1700000000000}
         rows.append(rec); save(rows)
         print(json.dumps({"id": rec["id"], "workspace": ws, "tag": tag}))
@@ -90,7 +93,9 @@ def main():
         rows = load()
         hit = [r for r in rows if r["tag"] == tag and r["workspace"] == ws]
         if not hit: sys.stderr.write("no session\n"); sys.exit(1)
-        hit[0]["phase"] = "exited"; hit[0]["state"] = "exited"; save(rows)
+        hit[0]["phase"] = "exited"; hit[0]["state"] = "exited"
+        # Reaped-cgroup proof for the stop oracle (see start-note above).
+        hit[0]["containment_empty"] = True; save(rows)
         print(json.dumps({"killed": hit[0]["id"]}))
     elif cmd == "message":
         sub = args[1]
@@ -103,12 +108,20 @@ def main():
             rows = load()
             hit = [r for r in rows if r["tag"] == to and r["workspace"] == ws]
             if not hit: sys.stderr.write("no session tagged\n"); sys.exit(1)
+            # Genuine sender = the calling process's bound session in ANY
+            # workspace (installed cross-workspace sends succeed for bound
+            # senders; live probe 2026-10-17). The sender mailbox (from's
+            # workspace) is independent of the target mailbox (ws).
             sid = os.environ.get("APLEXER_SESSION_ID", "")
             sender_rec = next((r for r in rows if str(r.get("id", "")).lower() == sid.lower() and sid
-                               and r.get("workspace") == ws and r.get("tag")), None)
-            from_obj = ({"session_id": str(sender_rec["id"]), "workspace": ws,
+                               and r.get("tag") and r.get("workspace")), None)
+            # REAL installed DTO: envelope "from" carries ONLY
+            # engine/session_id/tag/workspace (+external flag here for the
+            # anonymous case). created_at_ms NEVER appears in "from" (live
+            # probe 2026-10-17); provenance comes from the live catalog row.
+            from_obj = ({"session_id": str(sender_rec["id"]),
+                         "workspace": str(sender_rec["workspace"]),
                          "tag": str(sender_rec["tag"]), "engine": "shell",
-                         "created_at_ms": sender_rec.get("created_at_ms"),
                          "external": False} if sender_rec else {"external": True})
             mid = str(uuid.uuid4())
             env = {"schema_version": 1, "id": mid, "workspace": ws,
@@ -134,19 +147,23 @@ def main():
             if not (orig.get("from") or {}).get("tag"):
                 sys.stderr.write("Error: original message %s was sent anonymously (no sender tag)\n" % orig_id)
                 sys.exit(1)
-            ws = orig["workspace"]
+            # Installed routing (live probe 2026-10-17): a reply is filed in
+            # the ORIGINAL AUTHOR's mailbox, not the replier's workspace.
+            ws = (orig.get("from") or {}).get("workspace") or orig["workspace"]
             rows = load()
             sid = os.environ.get("APLEXER_SESSION_ID", "")
             replier = next((r for r in rows if str(r.get("id", "")).lower() == sid.lower() and sid
-                            and r.get("workspace") == ws and r.get("tag")), None)
+                            and r.get("tag") and r.get("workspace")), None)
             if replier is None:
                 sys.stderr.write("Error: reply requires calling aplexer session\n"); sys.exit(1)
             mid = str(uuid.uuid4())
             env = {"schema_version": 1, "id": mid, "workspace": ws,
                    "created_at": int(time.time()),
-                   "from": {"session_id": str(replier["id"]), "workspace": ws,
+                   # REAL installed DTO (see note above): no created_at_ms in
+                   # "from"; stale-incarnation tests mutate the envelope explicitly.
+                   "from": {"session_id": str(replier["id"]),
+                            "workspace": str(replier["workspace"]),
                             "tag": str(replier["tag"]), "engine": "shell",
-                            "created_at_ms": replier.get("created_at_ms"),
                             "external": False},
                    "to": {"tag": (orig.get("from") or {}).get("tag"),
                           "session_id": (orig.get("from") or {}).get("session_id")},
@@ -430,7 +447,7 @@ def test_f2_unbound_host_process_holds_send_without_claim_or_effect(env):
 
 def test_f2_bound_send_carries_genuine_replyable_sender(env):
     target = seed_target(env)
-    out = ns_mod.send_inbox(
+    out, _sender = ns_mod.send_inbox(
         env["fake"], target, "bound hello", {"correlation_id": "f2-c1"})
     assert out.state == "recorded" and out.native_id
     envelope = json.load(open(os.path.join(env["msgs"], out.native_id + ".json")))
@@ -467,7 +484,11 @@ def test_f2_anonymous_envelope_is_unreplyable(env):
             env["fake"], target, "nope", {"correlation_id": "f2-c2"})
 
 
-def test_f2_foreign_workspace_sender_is_unbound(env):
+def test_f2_cross_workspace_send_succeeds_with_sender_mailbox_ack(env):
+    # R2-F5 live-protocol correction: a bound sender in ANOTHER workspace is
+    # NOT unbound. Cross-workspace sends succeed; the sender mailbox (the
+    # author's own workspace) is where replies land and where ACK proof is
+    # read — never the target workspace.
     other = os.path.join(env["base"], "other-ws")
     os.makedirs(other)
     rows = json.load(open(env["sessions_file"]))
@@ -477,10 +498,36 @@ def test_f2_foreign_workspace_sender_is_unbound(env):
                  "created_at_ms": 1700000000000, "last_activity_ms": 1700000000000})
     json.dump(rows, open(env["sessions_file"], "w"))
     env["monkeypatch"].setenv("APLEXER_SESSION_ID", foreign_id)
-    target = seed_target(env)
-    with pytest.raises(SessionControlError, match="native_sender_unbound"):
-        ns_mod.send_inbox(
-            env["fake"], target, "nope", {"correlation_id": "f2-c3"})
+    target = seed_target(env)  # target lives in env["work"], sender in other
+    assert target.workspace != other
+    out, sender = ns_mod.send_inbox(
+        env["fake"], target, "cross hello", {"correlation_id": "f2-c3"})
+    assert out.state == "recorded" and out.native_id
+    assert sender.workspace == other  # genuine sender binding, not target ws
+    envelope = json.load(open(os.path.join(env["msgs"], out.native_id + ".json")))
+    assert envelope["workspace"] == target.workspace  # filed for recipient
+    assert envelope["from"]["workspace"] == other  # ...authored from sender box
+    assert envelope["from"]["session_id"] == foreign_id
+    assert "created_at_ms" not in envelope["from"]  # real DTO fidelity
+    # The recipient replies; the reply lands in the SENDER mailbox (other).
+    reply_env = dict(os.environ)
+    reply_env["APLEXER_SESSION_ID"] = target.session_id
+    digest = ns_mod.body_digest("cross hello")
+    rep = subprocess.run(
+        [env["fake"], "message", "reply", out.native_id,
+         "--data", json.dumps({"correlation_id": "f2-c3", "body_digest": digest}),
+         "--", "got cross"],
+        capture_output=True, text=True, timeout=20, env=reply_env)
+    assert rep.returncode == 0, rep.stderr
+    reply = json.loads(rep.stdout)
+    assert reply["workspace"] == other  # sender mailbox, not target ws
+    assert reply["from"]["workspace"] == target.workspace
+    # ACK proof reads the sender mailbox and the observed live incarnation.
+    proven = ns_mod.verify_ack_via_reply(
+        env["fake"], target, sender, out.native_id,
+        {"correlation_id": "f2-c3", "body_digest": digest})
+    assert proven.state == "acknowledged" and proven.reply_envelope_id
+    assert proven.evidence["sender_created_at_ms"] == 1700000000000
 
 
 # --- F4: durable effect with lost ack ----------------------------------------
@@ -627,9 +674,9 @@ def test_f6_body_fallback_reply_is_proven_without_data(env):
     target = seed_target(env)
     ns = ns_mod
     body = "prompt with body echo"
-    sent = ns.send_inbox(env["fake"], target, body, {"correlation_id": "f6-c1"})
+    sent, sender = ns.send_inbox(env["fake"], target, body, {"correlation_id": "f6-c1"})
     assert ns.verify_ack_via_reply(
-        env["fake"], target, sent.native_id,
+        env["fake"], target, sender, sent.native_id,
         {"correlation_id": "f6-c1", "body_digest": ns.body_digest(body)}).state == "unknown"
     # Standard reply WITHOUT --data: the body echoes correlation id + digest.
     digest = ns.body_digest(body)
@@ -639,7 +686,7 @@ def test_f6_body_fallback_reply_is_proven_without_data(env):
         capture_output=True, text=True, timeout=20, env=as_target(env, target))
     assert rep.returncode == 0, rep.stderr
     proven = ns.verify_ack_via_reply(
-        env["fake"], target, sent.native_id,
+        env["fake"], target, sender, sent.native_id,
         {"correlation_id": "f6-c1", "body_digest": digest})
     assert proven.state == "acknowledged" and proven.reply_envelope_id
     # The actual sender incarnation is reported, not overwritten.
@@ -650,7 +697,7 @@ def test_f6_stale_sender_incarnation_is_rejected(env):
     target = seed_target(env)
     ns = ns_mod
     body = "incarnation check"
-    sent = ns.send_inbox(env["fake"], target, body, {"correlation_id": "f6-c2"})
+    sent, sender = ns.send_inbox(env["fake"], target, body, {"correlation_id": "f6-c2"})
     digest = ns.body_digest(body)
     rep = subprocess.run(
         [env["fake"], "message", "reply", sent.native_id,
@@ -661,7 +708,7 @@ def test_f6_stale_sender_incarnation_is_rejected(env):
     reply_id = json.loads(rep.stdout)["id"]
     # Positive control first: the genuine reply proves processing.
     assert ns.verify_ack_via_reply(
-        env["fake"], target, sent.native_id,
+        env["fake"], target, sender, sent.native_id,
         {"correlation_id": "f6-c2", "body_digest": digest}).state == "acknowledged"
     # A reply carrying a DIFFERENT actual sender incarnation (same session
     # id/tag/workspace, rotated creation) is not proof from THIS binding:
@@ -671,7 +718,7 @@ def test_f6_stale_sender_incarnation_is_rejected(env):
     envelope["from"]["created_at_ms"] = 1800000000000
     json.dump(envelope, open(reply_path, "w"))
     assert ns.verify_ack_via_reply(
-        env["fake"], target, sent.native_id,
+        env["fake"], target, sender, sent.native_id,
         {"correlation_id": "f6-c2", "body_digest": digest}).state == "unknown"
 
 
@@ -679,7 +726,7 @@ def test_f6_tag_reuse_requalification_blocks_foreign_proof(env):
     target = seed_target(env)
     ns = ns_mod
     body = "tag reuse check"
-    sent = ns.send_inbox(env["fake"], target, body, {"correlation_id": "f6-c3"})
+    sent, sender = ns.send_inbox(env["fake"], target, body, {"correlation_id": "f6-c3"})
     digest = ns.body_digest(body)
     rep = subprocess.run(
         [env["fake"], "message", "reply", sent.native_id,
@@ -696,5 +743,5 @@ def test_f6_tag_reuse_requalification_blocks_foreign_proof(env):
     drifted = NativeTarget(session_id=rec["id"], tag="agent1",
                            workspace=env["work"], created_at_ms=1700000000000)
     assert ns.verify_ack_via_reply(
-        env["fake"], drifted, sent.native_id,
+        env["fake"], drifted, sender, sent.native_id,
         {"correlation_id": "f6-c3", "body_digest": digest}).state == "unknown"

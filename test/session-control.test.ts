@@ -55,6 +55,12 @@ async function fixture(fn: (s: SessionControlService, sql: any) => Promise<void>
     hub.sql.exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
       VALUES ('host-cred-1', 'host', 'hash-host-cred-1', 'refresh-host-cred-1', 'host-family-1', 'test-host', 'hetzner', NULL, '["host"]', 'test', ?, ?)`, at, far);
     hub.sql.exec(`INSERT OR IGNORE INTO machines (id, name, hostname, credential_id, registered_at) VALUES ('hetzner', 'hetzner', 'hetzner', 'host-cred-1', ?)`, at);
+    // Live agent registry incarnation for the default test caller: the outer
+    // hub auth would have rejected a dead credential before the service runs,
+    // and creation now re-verifies liveness inside the mutation txn.
+    hub.sql.exec(`INSERT OR IGNORE INTO agents (tag, project, role, machine_id, registered_at) VALUES ('assistant', 'demo', 'worker', NULL, ?)`, at);
+    hub.sql.exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, registry_actor)
+      VALUES ('cred-1', 'agent', 'hash-cred-1', 'refresh-cred-1', 'agent-family-1', 'demo-agent', NULL, 'demo:assistant', '["fleet:launch"]', 'test', ?, ?, 'demo:assistant')`, at, far);
     await fn(service, hub.sql);
   });
 }
@@ -70,13 +76,13 @@ function ensureFleetLaunch(sql: any, launchId: string, machine = 'hetzner', nati
 }
 
 /** Model the existing Fleet sessions report for one native session (the
- * authoritative native identity the F5 binding reconciles workspace/tag
- * against). Fixture setup only. */
-function reportFleetSession(sql: any, machine: string, nativeId: string, tag: string, workspace: string, phase = 'running') {
+ * authoritative native identity the F5 binding reconciles workspace/tag/
+ * engine/cwd against. Fixture setup only. */
+function reportFleetSession(sql: any, machine: string, nativeId: string, tag: string, workspace: string, phase = 'running', cwd: string | null = null) {
   const at = new Date().toISOString();
-  sql.exec(`INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, profile, account, last_activity_at)
-    VALUES (?, ?, ?, 'codex', ?, NULL, ?, ?, NULL, 'fixture-acct', NULL)`,
-    machine, nativeId, tag, phase, at, workspace);
+  sql.exec(`INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, cwd, profile, account, last_activity_at)
+    VALUES (?, ?, ?, 'codex', ?, NULL, ?, ?, ?, NULL, 'fixture-acct', NULL)`,
+    machine, nativeId, tag, phase, at, workspace, cwd);
 }
 
 async function startOk(s: SessionControlService, extra: any = {}, auth: any = admin, key = crypto.randomUUID()) {
@@ -87,10 +93,14 @@ async function startOk(s: SessionControlService, extra: any = {}, auth: any = ad
 }
 
 async function bindHttp(s: SessionControlService, sql: any, sessionId: string, machine = 'hetzner', extra: any = {}) {
-  const session: any = sql.exec('SELECT fleet_launch_id, machine_id FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0];
+  const session: any = sql.exec('SELECT fleet_launch_id, machine_id, request_json FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0];
   const launchId = session?.fleet_launch_id || 'launch-1';
   ensureFleetLaunch(sql, launchId, session?.machine_id || machine);
-  reportFleetSession(sql, session?.machine_id || machine, NATIVE_ID, canonTag(launchId), NATIVE_WS);
+  // Model a current host report: the requested cwd (when any) is present in
+  // the catalog row, so binding reconciliation can verify it.
+  let cwd: string | null = null;
+  try { cwd = JSON.parse(session?.request_json || '{}').cwd ?? null; } catch { cwd = null; }
+  reportFleetSession(sql, session?.machine_id || machine, NATIVE_ID, canonTag(launchId), NATIVE_WS, 'running', cwd);
   const res = await s.handle(request(`/api/sessions/${sessionId}/binding`, { native: { ...bound({ tag: canonTag(launchId) }), ...extra } }), host(machine));
   const data = await res.json() as any;
   expect(res.status, JSON.stringify(data)).toBe(200);
@@ -117,28 +127,38 @@ describe('hub session control durable queue', () => {
   it('validates start inputs without touching placement', async () => fixture(async (s) => {
     for (const payload of [
       { key: 'k1' }, // missing workspace
-      { key: 'k2', workspace: 'demo', tier: 'ultra' },
-      { key: 'k2b', workspace: 'demo', tier: 'quick' }, // tier has no fleet consumer
+      { key: 'k2', workspace: 'demo', tier: 'ultra' }, // unknown tier
       { key: 'k3', workspace: 'demo', cwd: '../escape' },
-      { key: 'k3b', workspace: 'demo', cwd: 'demo/project' }, // cwd has no fleet start consumer
       { key: 'k4', workspace: 'demo', cwd: '/absolute' },
       { key: 'k5', workspace: 'demo', mode: 'interactive', brief: 'inject' },
       { key: 'k6', workspace: 'demo', brief: '' },
     ]) {
       expect((await s.handle(request('/api/sessions', payload), admin)).status, JSON.stringify(payload)).toBe(400);
     }
-    const tiered = await s.handle(request('/api/sessions', { key: 'k2b', workspace: 'demo', tier: 'quick' }), admin);
-    expect((await tiered.json() as any).error).toBe('unsupported_tier');
-    const cwd = await s.handle(request('/api/sessions', { key: 'k3b', workspace: 'demo', cwd: 'demo/project' }), admin);
-    expect((await cwd.json() as any).error).toBe('unsupported_cwd');
+    // Known tiers and confined relative cwds are placement constraints, not
+    // rejections: they reach the fleet reserve (R3 D transport seam).
+    const fake = fakeReserve();
+    await fixture(async (s2) => {
+      const tiered = await s2.handle(request('/api/sessions', { key: 'k2b', workspace: 'demo', tier: 'quick' }), admin);
+      expect(tiered.status).toBe(201);
+      const cwd = await s2.handle(request('/api/sessions', { key: 'k3b', workspace: 'demo', cwd: 'demo/project' }), admin);
+      expect(cwd.status).toBe(201);
+      expect(fake.calls.length).toBe(2);
+      expect(fake.calls[0].tier).toBe('quick');
+      expect(fake.calls[1].cwd).toBe('demo/project');
+    }, fake.hook);
   }));
 
-  it('rejects tier before placement and never sends it to fleet', async () => {
+  it('sends tier through to fleet and rejects unknown tiers before placement', async () => {
     const fake = fakeReserve();
     await fixture(async (s, sql) => {
-      const res = await s.handle(request('/api/sessions', { key: 'tier-1', workspace: 'demo', tier: 'quick' }), admin);
+      const res = await s.handle(request('/api/sessions', { key: 'tier-1', workspace: 'demo', tier: 'nope' }), admin);
       expect(res.status).toBe(400);
       expect(fake.calls.length).toBe(0);
+      const ok = await s.handle(request('/api/sessions', { key: 'tier-2', workspace: 'demo', tier: 'daily' }), admin);
+      expect(ok.status).toBe(201);
+      expect(fake.calls.length).toBe(1);
+      expect(fake.calls[0].tier).toBe('daily');
     }, fake.hook);
   });
 
@@ -166,20 +186,20 @@ describe('hub session control durable queue', () => {
     }, fake.hook);
   });
 
-  it('passes engine/machine/workspace as real placement constraints, never cwd/tier', async () => {
+  it('passes engine/machine/workspace/tier/cwd as real placement constraints', async () => {
     const fake = fakeReserve();
     await fixture(async (s, sql) => {
-      await startOk(s, { engine: 'codex', machine: 'hetzner', brief: 'goal' }, admin, 'constraints-1');
+      await startOk(s, { engine: 'codex', machine: 'hetzner', brief: 'goal', tier: 'daily', cwd: 'demo/project' }, admin, 'constraints-1');
       expect(fake.calls.length).toBe(1);
       const sent = fake.calls[0];
       expect(sent.engine).toBe('codex');
       expect(sent.machine).toBe('hetzner');
       expect(sent.workspace).toBe('demo');
       expect(sent.prompt).toBe('goal');
-      expect(sent).not.toHaveProperty('cwd');
-      expect(sent).not.toHaveProperty('tier');
-      // Non-root cwd is rejected BEFORE any reservation, not passed through.
-      expect((await s.handle(request('/api/sessions', { key: 'cwd-x', workspace: 'demo', cwd: 'demo/project' }), admin)).status).toBe(400);
+      expect(sent.tier).toBe('daily');
+      expect(sent.cwd).toBe('demo/project');
+      // Malformed cwd is still rejected BEFORE any reservation.
+      expect((await s.handle(request('/api/sessions', { key: 'cwd-x', workspace: 'demo', cwd: '../escape' }), admin)).status).toBe(400);
       expect(fake.calls.length).toBe(1);
     }, fake.hook);
   });
@@ -247,8 +267,9 @@ describe('hub session control durable queue', () => {
       // Genuine registry incarnation FIRST: the agent registry binding for a
       // credential resolves at credential-insert time, so the agents row must
       // predate the credentials (enrollment order). Actor demo:assistant
-      // resolves to project demo / tag assistant.
-      sql.exec(`INSERT INTO agents (tag, project, role, machine_id, registered_at) VALUES ('assistant', 'demo', 'worker', NULL, ?)`, at);
+      // resolves to project demo / tag assistant. OR IGNORE: the shared
+      // fixture already seeds this live incarnation.
+      sql.exec(`INSERT OR IGNORE INTO agents (tag, project, role, machine_id, registered_at) VALUES ('assistant', 'demo', 'worker', NULL, ?)`, at);
       for (const [id, family] of [['cred-A', 'family-1'], ['cred-B', 'family-1'], ['cred-C', 'family-2']]) {
         sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
           VALUES (?, 'agent', ?, ?, ?, 'demo-agent', NULL, 'demo:assistant', '["fleet:launch"]', 'test', ?, ?)`,
@@ -285,17 +306,28 @@ describe('hub session control durable queue', () => {
     }, fake.hook);
   });
 
-  it('exposes a null cwd in host offers while rejecting non-root cwd at start', async () => {
+  it('carries requested cwd into host offers (null when unset)', async () => {
     const fake = fakeReserve();
     await fixture(async (s, sql) => {
-      const session: any = await startOk(s, { machine: 'hetzner' }, admin, 'cwd-1');
-      expect(fake.calls[0]).not.toHaveProperty('cwd');
+      const session: any = await startOk(s, { machine: 'hetzner', cwd: 'demo/project' }, admin, 'cwd-1');
+      expect(fake.calls[0].cwd).toBe('demo/project');
       await bindHttp(s, sql, session.id);
       await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'c1', body: 'go' }), admin);
       const offers = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any;
       expect(offers.offers.length).toBe(1);
-      expect(offers.offers[0].cwd).toBe(null);
+      expect(offers.offers[0].cwd).toBe('demo/project');
       expect(offers.offers[0].workspace).toBe('demo');
+      const plain: any = await startOk(s, { machine: 'hetzner' }, admin, 'cwd-2');
+      expect(fake.calls[1].cwd).toBe(null);
+      await bindHttp(s, sql, plain.id);
+      await s.handle(request(`/api/sessions/${plain.id}/send`, { key: 'c2', body: 'go' }), admin);
+      // The first command already transported on the earlier poll, so only
+      // the new recorded command is offered; the session row still shows both.
+      const offers2 = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any;
+      expect(offers2.offers.length).toBe(1);
+      expect(offers2.offers[0].cwd).toBe(null);
+      const cmds = await (await s.handle(request(`/api/sessions/${session.id}/commands`, undefined, 'GET'), admin)).json() as any;
+      expect(cmds.commands.length).toBe(1);
     }, fake.hook);
   });
 
@@ -349,7 +381,7 @@ describe('hub session control durable queue', () => {
     }, fake.hook);
   });
 
-  it('turns expired claims uncertain instead of reissuing', async () => {
+  it('reconciles valid late delivered proofs independent of sweep order, stays uncertain otherwise', async () => {
     const fake = fakeReserve();
     await fixture(async (s, sql) => {
       const session: any = await startOk(s, { machine: 'hetzner' }, admin, 'expiry-1');
@@ -358,20 +390,35 @@ describe('hub session control durable queue', () => {
       const poll = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any;
       const offer = poll.offers[0];
       const claim = await claimAs(s, offer.command_id, offer.correlation);
-      // Let the lease lapse, then ack: the effect may have happened.
+      // Let the lease lapse BEFORE the offers sweep marks the row uncertain,
+      // then ack with a valid delivered proof: lateReplyAck reconciles to
+      // acked (no new effect, no re-claim) instead of 409 claim_expired.
       sql.exec('UPDATE session_control_commands SET claim_expires_at = ? WHERE id = ?',
         new Date(Date.now() - 1000).toISOString(), offer.command_id);
       const late = await s.handle(request(`/api/session-commands/${offer.command_id}/ack`,
         { correlation: offer.correlation, outcome: 'delivered', native: native(), claim_token: claim.claim_token,
           proof: goodProof() }),
         host('hetzner'));
-      expect(late.status).toBe(409);
-      expect((await late.json() as any).error).toBe('claim_expired');
+      expect(late.status, JSON.stringify(await late.clone().json())).toBe(200);
       const list = await (await s.handle(request(`/api/sessions/${session.id}/commands`, undefined, 'GET'), admin)).json() as any;
-      expect(list.commands[0].state).toBe('uncertain');
-      // Uncertain commands are never re-offered for blind retry.
+      expect(list.commands[0].state).toBe('acked');
+      // Acked commands are never re-offered, and the fence never re-opens.
       const offers = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any;
       expect(offers.offers).toEqual([]);
+      expect((await s.handle(request(`/api/session-commands/${offer.command_id}/claim`,
+        { correlation: offer.correlation, attempt_id: ATTEMPT2 }), host('hetzner'))).status).toBe(409);
+      // A second send proves the negative half: proof-less expiry stays uncertain.
+      await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'e2', body: 'go again' }), admin);
+      const poll2 = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any;
+      const offer2 = poll2.offers[0];
+      const claim2 = await claimAs(s, offer2.command_id, offer2.correlation);
+      sql.exec('UPDATE session_control_commands SET claim_expires_at = ? WHERE id = ?',
+        new Date(Date.now() - 1000).toISOString(), offer2.command_id);
+      const late2 = await s.handle(request(`/api/session-commands/${offer2.command_id}/ack`,
+        { correlation: offer2.correlation, outcome: 'transported', native: native(), claim_token: claim2.claim_token }),
+        host('hetzner'));
+      expect(late2.status).toBe(409);
+      expect((await late2.json() as any).error).toBe('claim_expired');
     }, fake.hook);
   });
 

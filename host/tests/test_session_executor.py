@@ -115,6 +115,10 @@ def main():
                 f.write("start:%s:%s\n" % (ws, tag))
         rec = {"id": str(uuid.uuid4()), "tag": tag, "workspace": ws, "engine": eng,
                "profile": prof, "phase": "running", "state": "running",
+               # Real native DTO fidelity (read-only `a list --json`): the
+               # catalog carries containment_empty; the oracle confirms a
+               # stop only on proven containment, never on exit 0 alone.
+               "containment_empty": False,
                "created_at_ms": 1700000000000, "last_activity_ms": 1700000000000}
         rows.append(rec); save(rows)
         print(json.dumps({"id": rec["id"], "workspace": ws, "tag": tag, "engine": eng,
@@ -149,7 +153,11 @@ def main():
         if not hit:
             sys.stderr.write("no session\n"); sys.exit(1)
         if KILL_BEH != "still-running":
-            hit[0]["phase"] = "exited"; hit[0]["state"] = "exited"; save(rows)
+            hit[0]["phase"] = "exited"; hit[0]["state"] = "exited"
+            # The native CLI reaps the workload cgroup on kill and reports
+            # it; the stop oracle requires this proof (exit 0 alone never
+            # confirms). still-running leaves everything untouched.
+            hit[0]["containment_empty"] = True; save(rows)
         print(json.dumps({"killed": hit[0]["id"]}))
     elif cmd == "message":
         sub = args[1]
@@ -172,14 +180,19 @@ def main():
             if not hit:
                 sys.stderr.write("no session tagged %s exists\n" % to); sys.exit(1)
             # Genuine sender provenance (installed reply_target contract): the
-            # sender resolves from the calling process's bound session in this
-            # workspace; an unbound process emits an anonymous envelope that
-            # recipients cannot reply to. Sender fields are never fabricated.
+            # sender resolves from the calling process's bound session in ANY
+            # workspace (installed cross-workspace sends succeed for bound
+            # senders; live probe 2026-10-17). The sender mailbox (from's
+            # workspace) is independent of the target mailbox (ws). An
+            # unbound process emits an anonymous envelope that recipients
+            # cannot reply to. Sender fields are never fabricated, and the
+            # installed DTO carries no created_at_ms in "from".
             sid = os.environ.get("APLEXER_SESSION_ID", "")
             sender_rec = next((r for r in rows if str(r.get("id", "")).lower() == sid.lower() and sid
-                               and r.get("workspace") == ws and r.get("tag")), None)
+                               and r.get("tag") and r.get("workspace")), None)
             if sender_rec:
-                from_obj = {"session_id": str(sender_rec["id"]), "workspace": ws,
+                from_obj = {"session_id": str(sender_rec["id"]),
+                            "workspace": str(sender_rec["workspace"]),
                             "tag": str(sender_rec["tag"]), "engine": str(sender_rec.get("engine", "shell")),
                             "external": False}
             else:
@@ -216,12 +229,22 @@ def main():
             # be replied to (verbatim installed error).
             if not (orig.get("from") or {}).get("tag"):
                 sys.stderr.write("Error: original message %s was sent anonymously (no sender tag)\n" % orig_id); sys.exit(1)
+            # Installed routing (live probe 2026-10-17): a reply is filed in
+            # the ORIGINAL AUTHOR's mailbox, not the replier's workspace.
+            # The replier is the calling process's bound session (any ws).
+            author_ws = (orig.get("from") or {}).get("workspace") or orig["workspace"]
+            replier_sid = os.environ.get("APLEXER_SESSION_ID", "")
+            replier_rec = next((r for r in load() if str(r.get("id", "")).lower() == replier_sid.lower()
+                                and replier_sid and r.get("tag") and r.get("workspace")), None)
+            if replier_rec is None:
+                sys.stderr.write("Error: reply requires calling aplexer session\n"); sys.exit(1)
             mid = str(uuid.uuid4())
-            env = {"schema_version": 1, "id": mid, "workspace": orig["workspace"],
+            env = {"schema_version": 1, "id": mid, "workspace": author_ws,
                    "created_at": int(time.time()),
-                   "from": {"session_id": orig["to"]["session_id"],
-                            "workspace": orig["workspace"],
-                            "tag": orig["to"]["tag"], "engine": "shell"},
+                   "from": {"session_id": str(replier_rec["id"]),
+                            "workspace": str(replier_rec["workspace"]),
+                            "tag": str(replier_rec["tag"]),
+                            "engine": str(replier_rec.get("engine", "shell"))},
                    "to": orig["from"], "kind": "reply", "data": data, "body": body,
                    "reply_to": orig_id, "delivery": "inbox"}
             with open(os.path.join(MDIR, mid + ".json"), "w") as f:
@@ -372,8 +395,8 @@ def test_resolve_cwd_rejects_escape(env):
 def test_send_inbox_recorded_with_correlated_receipt(env):
     rec = seed_session(env)
     target = make_target(env, "agent1", rec["id"])
-    out = ns.send_inbox(env["fake"], target, "hello agent",
-                        {"correlation_id": "corr-1"})
+    out, _sender = ns.send_inbox(env["fake"], target, "hello agent",
+                                 {"correlation_id": "corr-1"})
     assert out.state == "recorded"
     assert out.native_id
     log = subprocess.run([env["fake"], "message", "log", "--workspace", env["work"], "--json"],
@@ -415,7 +438,7 @@ def test_pty_guarded_retired_holds(env):
 def test_deliver_guard_maps_without_ack(env):
     rec = seed_session(env)
     target = make_target(env, "agent1", rec["id"])
-    sent = ns.send_inbox(env["fake"], target, "hello", {"correlation_id": "d1"})
+    sent, _sender = ns.send_inbox(env["fake"], target, "hello", {"correlation_id": "d1"})
     done = ns.deliver_recorded(env["fake"], target, sent.native_id)
     assert done.state == "transported"  # submitted; processing NOT proven
     env["monkeypatch"].setenv("FAKE_DELIVER_BEHAVIOR", "refused-busy")
@@ -427,17 +450,20 @@ def test_ack_verified_via_correlated_reply(env):
     rec = seed_session(env)
     target = make_target(env, "agent1", rec["id"])
     body = "prompt for ack test"
-    sent = ns.send_inbox(env["fake"], target, body, {"correlation_id": "ack-c1"})
+    sent, sender = ns.send_inbox(env["fake"], target, body, {"correlation_id": "ack-c1"})
     corr = {"correlation_id": "ack-c1", "body_digest": ns.body_digest(body)}
     # No reply yet: honest unknown, never false confirmed.
-    assert ns.verify_ack_via_reply(env["fake"], target, sent.native_id, corr).state == "unknown"
-    # Recipient replies, threading the ORIGINAL envelope id with echo.
+    assert ns.verify_ack_via_reply(env["fake"], target, sender, sent.native_id, corr).state == "unknown"
+    # The RECIPIENT session authors its reply (installed protocol: only the
+    # recipient's own session can emit a reply attributed to it).
+    reply_env = dict(os.environ)
+    reply_env["APLEXER_SESSION_ID"] = rec["id"]
     rep = subprocess.run(
         [env["fake"], "message", "reply", sent.native_id, "done ack-c1",
          "--data", json.dumps(corr), "--json"],
-        capture_output=True, text=True, timeout=20)
+        capture_output=True, text=True, timeout=20, env=reply_env)
     assert rep.returncode == 0, rep.stderr
-    proven = ns.verify_ack_via_reply(env["fake"], target, sent.native_id, corr)
+    proven = ns.verify_ack_via_reply(env["fake"], target, sender, sent.native_id, corr)
     assert proven.state == "acknowledged" and proven.reply_envelope_id
     # Foreign reply (sender UUID mismatch) is not our proof.
     rows = json.load(open(env["sessions_file"]))
@@ -445,7 +471,7 @@ def test_ack_verified_via_correlated_reply(env):
     agent_row["id"] = str(uuid.uuid4())
     json.dump(rows, open(env["sessions_file"], "w"))
     foreign_target = make_target(env, "agent1", agent_row["id"])
-    assert ns.verify_ack_via_reply(env["fake"], foreign_target, sent.native_id,
+    assert ns.verify_ack_via_reply(env["fake"], foreign_target, sender, sent.native_id,
                                    corr).state == "unknown"
 
 

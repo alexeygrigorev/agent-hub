@@ -16,33 +16,50 @@ head-chosen endpoints. Full signature/result/proof contract for wiring:
   - `list_sessions` (read-only, optional workspace filter, minimal projection;
     verified against real `a list --json`: rows carry `id/tag/workspace/engine/
     phase|state/created_at_ms/last_activity_ms`, never env/secrets),
-  - `qualify_target` (tag→UUID+workspace+generation binding immediately before
-    an effect; stale `created_at_ms` refuses; phase is liveness only, never an
-    idle/readiness claim),
-  - `send_inbox` (`message send --to TAG`; state `recorded` at most — inbox
-    persistence is never transported/acknowledged). Before the effect the
-    caller qualifies its genuine workspace-bound sender identity
-    (`whoami --json`, no overrides): unbound or foreign-workspace senders are
-    refused with `native_sender_unbound` and no effect, because recipients
-    could never reply (installed anonymous-reply rejection). After the send,
-    the actual envelope `from` is validated against the qualified own binding
-    via the existing `native_bridge` contract; sender fields are never
-    fabricated to make fixtures replyable.
-  - `deliver_recorded` (`message deliver <envelope-id>`; explicit opt-in only;
-    maps to `transported`/`refused`, never acknowledged),
-  - `deliver_recorded` (`message deliver <envelope-id>`; explicit opt-in only;
-    maps to `transported`/`refused`, never acknowledged),
-  - `fetch_message_log` (bounded exact-workspace `message log`, read-only),
-  - `verify_ack_via_reply` (ACK ONLY on a reply envelope in the retrieved log
-    with `reply_to` = original native envelope id, `from` session/tag/workspace
-    = intended generation, correlation id + body-digest echo from structured
-    `data` OR body text, and — when the reply carries its sender creation
-    value — exact incarnation match; else `unknown`). The target is
-    re-qualified (tag reuse/incarnation drift refuses) before the log scan;
-    the actual sender creation value is reported, never overwritten.
-  - `capture_output` (bounded tail/screen; `privacy_unknown=True` always),
-  - `status_of` (read-only probe), `stop_session` (kill + verified exit with
-    UUID+tag+workspace+generation checked before AND after),
+   - `qualify_target` (tag→UUID+workspace+generation binding immediately before
+     an effect; stale `created_at_ms` refuses; expected `engine`, when given
+     by the hub offer/binding, must match the live catalog row exactly — a
+     real SHELL row never qualifies as a requested model engine; phase is
+     liveness only, never an idle/readiness claim),
+   - `send_inbox` (`message send --to TAG`; state `recorded` at most — inbox
+     persistence is never transported/acknowledged). Before the effect the
+     caller qualifies its genuine sender identity (`whoami --json`, no
+     overrides, in ANY workspace — the installed CLI routes cross-workspace
+     sends for bound senders and files replies in the author's mailbox, so
+     the old same-workspace restriction is removed; an optional service pin
+     may fix the authorized sender workspace). Unbound senders are refused
+     with `native_sender_unbound` and no effect, because recipients could
+     never reply (installed anonymous-reply rejection). After the send, the
+     actual envelope `from` is validated against the qualified own binding
+     by the local cross-workspace rule (`_validate_own_send_envelope`:
+     envelope for the recipient mailbox, `from` the sender mailbox, both
+     exact); sender fields are never fabricated to make fixtures replyable.
+     The genuine sender binding is returned alongside the delivery record so
+     reconciliation reads the correct mailbox without re-deriving identity.
+   - `deliver_recorded` (`message deliver <envelope-id>`; explicit opt-in only;
+     maps to `transported`/`refused`, never acknowledged),
+   - `fetch_message_log` (bounded `message log` for an explicit mailbox,
+     read-only),
+   - `verify_ack_via_reply` (ACK ONLY on a reply envelope in the SENDER
+     mailbox log with `reply_to` = original native envelope id, `from`
+     session/tag/workspace = intended target generation, correlation id +
+     body-digest echo from structured `data` OR body text, and — when the
+     reply carries its sender creation value — exact match against the
+     OBSERVED live catalog incarnation; else `unknown`). The target is
+     re-qualified (tag reuse/incarnation drift refuses) before the log scan;
+     the observed catalog row is the provenance witness: the real installed
+     DTO carries NO `created_at_ms` inside envelope `from` (only
+     engine/session_id/tag/workspace), so an absent value uses the observed
+     row and never falls back to an expected target value. All fixtures
+     match this DTO (fabricated `from.created_at_ms` removed as a
+     documented fixture fix; stale-incarnation tests mutate explicitly).
+   - `capture_output` (bounded tail/screen; `privacy_unknown=True` always),
+   - `status_of` (read-only probe), `stop_session` (kill + CONFIRMED exit:
+     UUID+tag+workspace+generation (+expected engine) checked before AND
+     after, AND the owned workload proven gone via reaped cgroup, dead PIDs,
+     or catalog `containment_empty` — all fields observed read-only on the
+     installed `a list --json`. A vanished record or lone kill exit 0
+     without containment proof is `uncertain`, never stopped),
   - `resolve_cwd` (workspace-root confinement; validates only — cannot move an
     already-launched cwd, see gap 4).
 - `session_executor.py` — durable intents + the existing Fleet `Dispatcher` contract:

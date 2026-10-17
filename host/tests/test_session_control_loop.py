@@ -76,6 +76,10 @@ def main():
         rows = load()
         rec = {"id": str(uuid.uuid4()), "tag": tag, "workspace": ws, "engine": "shell",
                "profile": None, "phase": "running", "state": "running",
+               # Real native DTO fidelity: containment_empty is the
+               # stop-oracle proof field (kill reaps it; exit 0 alone never
+               # confirms). See executor FAKE_SCRIPT note.
+               "containment_empty": False,
                "created_at_ms": 1700000000000, "last_activity_ms": 1700000000000}
         rows.append(rec); save(rows)
         print(json.dumps({"id": rec["id"], "workspace": ws, "tag": tag}))
@@ -99,7 +103,9 @@ def main():
         rows = load()
         hit = [r for r in rows if r["tag"] == tag and r["workspace"] == ws]
         if not hit: sys.stderr.write("no session\n"); sys.exit(1)
-        hit[0]["phase"] = "exited"; hit[0]["state"] = "exited"; save(rows)
+        hit[0]["phase"] = "exited"; hit[0]["state"] = "exited"
+        # Reaped-cgroup proof for the stop oracle (see start-note above).
+        hit[0]["containment_empty"] = True; save(rows)
         print(json.dumps({"killed": hit[0]["id"]}))
     elif cmd == "message":
         sub = args[1]

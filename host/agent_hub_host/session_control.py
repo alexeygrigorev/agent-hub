@@ -43,6 +43,22 @@ def request(method, path, payload=None):
                                      headers={'Authorization': 'Bearer ' + access, 'Content-Type': 'application/json'})
         return api.safe_http_json(req)
 
+    def failure(exc):
+        # Surface the server error code alongside the status so the receiver
+        # can classify terminal vs retryable 409s (claim_expired may heal
+        # after the sweep; proof_replayed never heals). Best-effort: an
+        # unreadable body keeps the status-only form.
+        name = ''
+        try:
+            raw = exc.read(4096) if hasattr(exc, 'read') else b''
+            data = json.loads((raw or b'').decode('utf-8', 'replace'))
+            err = data.get('error') if isinstance(data, dict) else None
+            if isinstance(err, str) and err and len(err) <= 64 and err.replace('_', '').isalnum():
+                name = ' (%s)' % err
+        except Exception:
+            name = ''
+        return ValueError('Session HTTP request failed with status %d%s' % (exc.code, name))
+
     try:
         return send(token)
     except urllib.error.HTTPError as exc:
@@ -51,8 +67,8 @@ def request(method, path, payload=None):
             try:
                 return send(auth.get_access_token())
             except urllib.error.HTTPError as retry:
-                raise ValueError('Session HTTP request failed with status %d' % retry.code) from None
-        raise ValueError('Session HTTP request failed with status %d' % exc.code) from None
+                raise failure(retry) from None
+        raise failure(exc) from None
 
 
 def read_file(path, limit=MAX_BODY):
@@ -177,6 +193,7 @@ def add_commands(sub):
     receive.add_argument('--journal-dir', help='Absolute journal directory (default .local/session/host-receiver under repo cwd)')
     receive.add_argument('--aplexer-bin', default='aplexer', help='Native executable (default aplexer)')
     receive.add_argument('--limit', type=int, default=20, help='Max offers per cycle (1..20)')
+    receive.add_argument('--sender-workspace', default=None, help='Pinned authorized native sender workspace for replyable sends (default: receiver own whoami workspace)')
 
 
 def execute(args):
@@ -280,5 +297,6 @@ def execute(args):
                                 credential_family=family).validated()
         return receive_once(custody=custody, journal_dir=journal_dir,
                             executable=getattr(args, 'aplexer_bin', 'aplexer') or 'aplexer',
-                            request=request, limit=limit)
+                            request=request, limit=limit,
+                            sender_workspace=getattr(args, 'sender_workspace', None))
     raise ValueError('Unknown sessions command')

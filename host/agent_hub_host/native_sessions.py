@@ -42,11 +42,47 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .native_bridge import (
-    BridgeCapabilityGap,
     NativeServiceBinding,
     canonicalize_workspace,
-    validate_native_send_envelope,
 )
+
+
+def _validate_own_send_envelope(envelope: Any, sender_binding: NativeServiceBinding,
+                                target: NativeTarget) -> None:
+    """Validate a persisted send envelope against the qualified own sender.
+
+    Cross-workspace contract (R2-F5, live probe 2026-10-17): the envelope is
+    addressed to the TARGET mailbox, but its ``from`` is the SENDER's own
+    identity in the SENDER mailbox — the two workspaces are independent, and
+    the shared single-workspace validator in ``native_bridge`` cannot express
+    this (that module is outside session-control scope, so the rule lives
+    here). Requirements: ``from`` present, non-anonymous, same session/tag as
+    the binding qualified BEFORE the effect, filed from the sender mailbox;
+    the envelope itself addressed to the target mailbox (or, tolerantly, our
+    own mailbox). Any violation is an unproven effect — ``SessionUncertain``
+    (reconcile), never silent acceptance and never a fabricated identity.
+    """
+    if not isinstance(envelope, dict):
+        raise SessionUncertain("native send returned no envelope object; effect unproven")
+    sender_ws = canonicalize_workspace(sender_binding.workspace)
+    target_ws = target.workspace
+    from_obj = envelope.get("from")
+    if not isinstance(from_obj, dict) or from_obj.get("external") is True:
+        raise SessionUncertain(
+            "native send persisted an unreplyable sender envelope; effect recorded "
+            "but processing can never be proven — reconcile")
+    if not from_obj.get("tag") or not from_obj.get("session_id"):
+        raise SessionUncertain("native send envelope from lacks tag/session_id; effect unproven")
+    if from_obj.get("tag") != sender_binding.tag or \
+            str(from_obj.get("session_id")).lower() != str(sender_binding.session_id).lower():
+        raise SessionUncertain("native send envelope sender mismatch; effect unproven")
+    from_ws = from_obj.get("workspace")
+    if not isinstance(from_ws, str) or not from_ws or canonicalize_workspace(from_ws) != sender_ws:
+        raise SessionUncertain("native send envelope not filed from the sender mailbox; effect unproven")
+    env_ws = envelope.get("workspace")
+    if isinstance(env_ws, str) and env_ws and \
+            canonicalize_workspace(env_ws) != target_ws and canonicalize_workspace(env_ws) != sender_ws:
+        raise SessionUncertain("native send envelope filed outside both mailboxes; effect unproven")
 
 MAX_BODY_BYTES = 16 * 1024  # bus limit, reused for prompt bodies
 MAX_CAPTURE_BYTES = 32 * 1024  # default bounded tail
@@ -75,13 +111,18 @@ class NativeTarget:
 
     ``created_at_ms`` is the native generation provenance (from ``a list`` /
     ``a status``). When provided, :func:`qualify_target` requires the live catalog
-    row to carry the same generation; a mismatch means tag reuse and refuses.
+    row to carry the same generation (tag reuse or incarnation drift refuses).
+    ``engine`` is the expected session engine (from the hub offer/binding);
+    when provided, :func:`qualify_target` requires the live catalog row to
+    report the same engine — a real SHELL session never qualifies as a
+    requested codex/antigravity model (masquerade refuses with no effect).
     """
 
     session_id: str
     tag: str
     workspace: str
     created_at_ms: Optional[int] = None
+    engine: Optional[str] = None
 
     def validated(self) -> "NativeTarget":
         try:
@@ -97,8 +138,10 @@ class NativeTarget:
             raise SessionControlError("Workspace must already be canonical (no symlinks)")
         if self.created_at_ms is not None and type(self.created_at_ms) is not int:
             raise SessionControlError("Native generation (created_at_ms) must be an int when given")
+        if self.engine is not None and (not isinstance(self.engine, str) or not self.engine or len(self.engine) > 64):
+            raise SessionControlError("Expected engine must be a non-empty label when given")
         return NativeTarget(session_id=norm, tag=self.tag, workspace=canonical,
-                            created_at_ms=self.created_at_ms)
+                            created_at_ms=self.created_at_ms, engine=self.engine)
 
 
 @dataclass(frozen=True)
@@ -114,6 +157,12 @@ class NativeSession:
     agent_state: Optional[str] = None
     last_activity_ms: Optional[int] = None
     created_at_ms: Optional[int] = None
+    cwd: Optional[str] = None
+    containment_empty: Optional[bool] = None
+    workload_cgroup: Optional[str] = None
+    worker_pid: Optional[int] = None
+    workload_pid: Optional[int] = None
+    processes: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -192,14 +241,9 @@ def resolve_cwd(workspace_roots: list[str], cwd: str) -> str:
     """Resolve requested cwd strictly inside operator-configured workspace roots.
 
     Rejects path traversal and escaping symlinks (realpath comparison). Raises
-    SessionControlError without any native effect.
-
-    Honest limitation (head-ordered): the existing Fleet strict DTO does not carry
-    ``cwd`` and the start adapter does not consume it, so this helper CANNOT
-    retroactively change an already-launched session's cwd. Until the qualified
-    existing integration is extended, the server must reject unsupported cwd/tier
-    BEFORE effects (honest hold). This function only validates a caller's requested
-    path for a future qualified start; it never claims a running session moved.
+    SessionControlError without any native effect. This validates a caller's
+    requested path for a qualified start (session/Fleet/host adapter now
+    carries cwd end to end); it never claims an already-launched session moved.
     """
     if not isinstance(cwd, str) or not cwd:
         raise SessionControlError("cwd is required")
@@ -272,6 +316,12 @@ def project_session(raw: Any) -> NativeSession:
         raise SessionControlError("Native session row missing workspace")
     last_ms = raw.get("last_activity_ms")
     created_ms = raw.get("created_at_ms")
+    worker_pid = raw.get("worker_pid")
+    workload_pid = raw.get("workload_pid")
+    processes = raw.get("processes")
+    containment = raw.get("containment_empty")
+    cgroup = raw.get("workload_cgroup")
+    cwd = raw.get("cwd")
     return NativeSession(
         session_id=sid,
         tag=tag,
@@ -282,6 +332,12 @@ def project_session(raw: Any) -> NativeSession:
         agent_state=raw.get("agent_state") if isinstance(raw.get("agent_state"), str) else None,
         last_activity_ms=last_ms if type(last_ms) is int else None,
         created_at_ms=created_ms if type(created_ms) is int else None,
+        cwd=cwd if isinstance(cwd, str) and cwd else None,
+        containment_empty=containment if type(containment) is bool else None,
+        workload_cgroup=cgroup if isinstance(cgroup, str) and cgroup else None,
+        worker_pid=worker_pid if type(worker_pid) is int else None,
+        workload_pid=workload_pid if type(workload_pid) is int else None,
+        processes=processes if type(processes) is int else None,
     )
 
 
@@ -337,6 +393,14 @@ def qualify_target(
         raise SessionControlError(
             "Native generation mismatch (stale incarnation or tag reuse); refusing"
         )
+    if target.engine is not None and row.engine != target.engine:
+        # A real SHELL (or any other) native session never qualifies as a
+        # requested model engine: exact match or no effect. Unknown catalog
+        # engine (None) is NOT a match for a qualified expectation.
+        raise SessionControlError(
+            "Native engine mismatch (reported %r, expected %r); refusing"
+            % (row.engine, target.engine)
+        )
     if live_only and row.phase in TERMINAL_PHASES:
         raise SessionControlError(f"Target session is terminal (phase={row.phase}); refusing")
     return row
@@ -344,24 +408,30 @@ def qualify_target(
 
 def qualify_sender_binding(
     executable: str,
-    workspace: str,
+    authorized_workspace: Optional[str] = None,
 ) -> NativeServiceBinding:
     """Qualify the calling process's genuine native sender identity BEFORE any send.
 
     Runs read-only ``whoami --json`` (argv only, no shell, no identity
-    override) and requires a real bound session (UUID id + non-empty tag) in
-    the EXACT canonical target workspace. An unbound process, a sender from
-    another workspace, or an anonymous/foreign envelope sender means native
-    recipients could never ``message reply`` (installed Rust ``reply_target``
-    rejects anonymous originals), so the attempt is refused here with
+    override) and requires a real bound session (UUID id + non-empty tag).
+    The observed own workspace is the sender mailbox the installed ``a``
+    routes cross-workspace replies to — it is qualified INDEPENDENTLY of any
+    target workspace (the old same-workspace restriction is removed: the
+    installed CLI delivers cross-workspace sends and files replies in the
+    author's mailbox). When ``authorized_workspace`` is given (service
+    deployment pin), the observed workspace must equal it; otherwise the
+    observed own workspace is the authorized sender workspace. An unbound
+    process or an anonymous/foreign envelope sender means native recipients
+    could never ``message reply`` (installed Rust ``reply_target`` rejects
+    anonymous originals), so the attempt is refused here with
     ``SessionControlError`` (honest capability gap, no native effect) instead
     of emitting an unreplyable envelope. The returned binding is the observed
-    own identity, used to validate the actual send envelope below — sender
-    fields are never fabricated.
+    own identity, used to validate the actual send envelope and to read the
+    correct reply mailbox below — sender fields are never fabricated.
     """
-    if not isinstance(workspace, str) or not Path(workspace).is_absolute():
-        raise SessionControlError("Workspace must be an absolute path")
-    canonical = canonicalize_workspace(workspace)
+    if authorized_workspace is not None and (
+            not isinstance(authorized_workspace, str) or not Path(authorized_workspace).is_absolute()):
+        raise SessionControlError("Authorized sender workspace must be an absolute path")
     try:
         proc = run_native(executable, ["whoami", "--json"], timeout=QUICK_TIMEOUT)
     except (SessionControlError, SessionUncertain) as exc:
@@ -391,11 +461,11 @@ def qualify_sender_binding(
         raise SessionControlError(
             "native_sender_unbound: anonymous or incomplete native sender identity; "
             "recipients could not reply")
-    if canonicalize_workspace(sender_ws) != canonical:
+    canonical = canonicalize_workspace(sender_ws)
+    if authorized_workspace is not None and canonicalize_workspace(authorized_workspace) != canonical:
         raise SessionControlError(
-            "native_sender_unbound: own native session lives in %r, not the target "
-            "workspace %r; recipients in the target workspace could not reply"
-            % (sender_ws, canonical))
+            "native_sender_unbound: own native session lives in %r, not the authorized "
+            "sender workspace %r; refusing" % (sender_ws, authorized_workspace))
     try:
         created = identity.get("created_at_ms")
         created_ms = int(created) if type(created) is int else 0
@@ -415,11 +485,15 @@ def send_inbox(
     body: str,
     correlation: dict[str, str],
     kind: str = "note",
-) -> DeliveryResult:
+    sender_workspace: Optional[str] = None,
+) -> tuple[DeliveryResult, NativeServiceBinding]:
     """Durable inbox delivery via ``message send --to TAG`` (TAG, never UUID).
 
     State ``recorded`` at most: inbox persistence alone is NOT proof the target
-    read or processed the message.
+    read or processed the message. Returns the delivery record AND the genuine
+    sender binding observed before the effect (the sender mailbox the installed
+    CLI routes cross-workspace replies to — callers must read replies there,
+    not in the target workspace).
     """
     target = target.validated()
     check_body_bound(body)
@@ -429,10 +503,11 @@ def send_inbox(
         raise SessionControlError("Correlation id is required for every send")
     if not isinstance(kind, str) or not kind or len(kind) > 64:
         raise SessionControlError("Invalid message kind")
-    # Genuine sender qualification BEFORE the effect: an unbound or
-    # foreign-workspace sender would emit an anonymous envelope recipients
-    # cannot reply to, so refuse honestly with no effect.
-    sender_binding = qualify_sender_binding(executable, target.workspace)
+    # Genuine sender qualification BEFORE the effect: an unbound sender would
+    # emit an anonymous envelope recipients cannot reply to, so refuse
+    # honestly with no effect. The sender workspace is the author's own
+    # (optionally pinned); it is independent of the target workspace.
+    sender_binding = qualify_sender_binding(executable, sender_workspace)
     qualify_target(executable, target)
     data = json.dumps({"hub_session_control": correlation}, ensure_ascii=False)
     proc = run_native(
@@ -452,24 +527,21 @@ def send_inbox(
         raise SessionUncertain("Inbox send returned no envelope id; effect unknown")
     # The envelope MUST carry our own qualified sender identity: recipients
     # can only reply to a non-anonymous sender tag (installed reply_target).
-    try:
-        validate_native_send_envelope(envelope, sender_binding, target.workspace)
-    except BridgeCapabilityGap as exc:
-        raise SessionUncertain(
-            "native send persisted an unreplyable sender envelope (%s); effect "
-            "recorded but processing can never be proven — reconcile" % exc) from exc
+    # Cross-workspace aware (see _validate_own_send_envelope): the sender
+    # mailbox is independent of the target mailbox.
+    _validate_own_send_envelope(envelope, sender_binding, target)
     # Sender provenance is the caller's own session; recipients reply per the native
     # reply_target contract. No processing claim is made here by construction.
     try:
         qualify_target(executable, target, live_only=False)
     except SessionControlError:
         pass  # post-send binding drift is reported, not hidden; envelope id stands
-    return DeliveryResult(
+    return (DeliveryResult(
         state="recorded",
         native_id=str(envelope.get("id")),
         reason="durable inbox persisted; target processing NOT proven",
         evidence={"kind": kind, "correlation_id": correlation.get("correlation_id")},
-    )
+    ), sender_binding)
 
 
 def deliver_recorded(
@@ -547,21 +619,33 @@ def fetch_message_log(
 def verify_ack_via_reply(
     executable: str,
     target: NativeTarget,
+    sender: NativeServiceBinding,
     original_envelope_id: str,
     correlation: dict[str, str],
 ) -> AckResult:
     """Verify a correlated recipient reply in the actual native message log.
 
     ``acknowledged`` requires ALL of: the reply envelope exists in the retrieved
-    log (bounded, exact workspace); its ``reply_to`` equals the ORIGINAL NATIVE
+    log (bounded, SENDER mailbox); its ``reply_to`` equals the ORIGINAL NATIVE
     message envelope id (never a hub ``cmd:`` string); its ``from`` session/tag/
-    workspace matches the intended native generation (``created_at_ms`` when
-    known); and its body/data echoes the exact correlation id and body digest.
-    Otherwise the result is ``unknown`` — an honest report, never false confirmed.
-    When the proof transport itself is unqualified (log unavailable, unknown
-    envelope shape), the result is likewise ``unknown`` with the reason recorded.
+    workspace matches the intended target generation (observed catalog
+    ``created_at_ms``); and its body/data echoes the exact correlation id and
+    body digest. Otherwise the result is ``unknown`` — an honest report, never
+    false confirmed. When the proof transport itself is unqualified (log
+    unavailable, unknown envelope shape), the result is likewise ``unknown``
+    with the reason recorded.
+
+    The mailbox read is the SENDER's (author's) workspace: the installed CLI
+    routes cross-workspace replies to the original author's mailbox, not the
+    target's. ``sender`` is the genuine binding qualified before the send
+    (never a copy, never a ``--from`` override). The observed live catalog
+    incarnation from :func:`qualify_target` is the provenance witness; an
+    absent envelope ``created_at_ms`` (the real installed DTO carries none in
+    ``from``) never falls back to an expected target value.
     """
     target = target.validated()
+    if not isinstance(sender, NativeServiceBinding) or not sender.workspace:
+        raise SessionControlError("Genuine sender binding is required for ACK proof")
     if not isinstance(original_envelope_id, str) or not original_envelope_id:
         raise SessionControlError("Original native envelope id is required for ACK proof")
     if not isinstance(correlation, dict) or not correlation.get("correlation_id"):
@@ -569,13 +653,14 @@ def verify_ack_via_reply(
     expected_digest = correlation.get("body_digest", "")
     # Exact target requalification: the tag must still resolve to this UUID +
     # incarnation (read-only list). Tag reuse or incarnation drift means a
-    # reply from the tag is no longer proof from THIS target.
+    # reply from the tag is no longer proof from THIS target. The returned
+    # live catalog row is the observed provenance witness.
     try:
-        qualify_target(executable, target, live_only=False)
+        observed = qualify_target(executable, target, live_only=False)
     except SessionControlError as exc:
         return AckResult(state="unknown", reason=f"target requalification failed: {exc}")
     try:
-        log = fetch_message_log(executable, target.workspace)
+        log = fetch_message_log(executable, sender.workspace)
     except SessionUncertain as exc:
         return AckResult(state="unknown", reason=f"proof transport unqualified: {exc}")
     except SessionControlError as exc:
@@ -583,20 +668,22 @@ def verify_ack_via_reply(
     for env in log:
         if env.get("reply_to") != original_envelope_id:
             continue
-        sender = env.get("from")
-        if not isinstance(sender, dict):
+        author = env.get("from")
+        if not isinstance(author, dict):
             continue
-        if (str(sender.get("session_id", "")).lower() != target.session_id.lower()
-                or sender.get("tag") != target.tag
-                or sender.get("workspace") != target.workspace):
+        if (str(author.get("session_id", "")).lower() != target.session_id.lower()
+                or author.get("tag") != target.tag
+                or author.get("workspace") != target.workspace):
             continue  # foreign or retargeted reply: not our proof
-        # Real reply provenance: when the reply carries its sender's native
-        # creation incarnation, it MUST match the bound target incarnation.
-        # An actual creation value is never overwritten with the expected one.
-        sender_created = sender.get("created_at_ms")
-        if type(sender_created) is int and target.created_at_ms is not None \
-                and sender_created != target.created_at_ms:
-            continue  # stale incarnation or tag reuse: not our proof
+        # Real reply provenance: when the reply carries its author's native
+        # creation incarnation, it MUST match the OBSERVED live catalog
+        # incarnation. An actual creation value is never overwritten with an
+        # expected one; an absent value uses the observed row (real installed
+        # envelopes carry no created_at_ms in ``from``).
+        author_created = author.get("created_at_ms")
+        if type(author_created) is int:
+            if observed.created_at_ms is not None and author_created != observed.created_at_ms:
+                continue  # stale incarnation or tag reuse: not our proof
         payload = env.get("data")
         body_text = env.get("body") if isinstance(env.get("body"), str) else ""
         echoed_corr = ""
@@ -634,7 +721,6 @@ def verify_ack_via_reply(
             except (TypeError, ValueError):
                 digest_src = str(env.get("id", "")).encode("utf-8")
         reply_digest = hashlib.sha256(digest_src).hexdigest()
-        sender_created = sender.get("created_at_ms")
         return AckResult(
             state="acknowledged",
             reply_envelope_id=str(env.get("id")),
@@ -642,10 +728,10 @@ def verify_ack_via_reply(
             evidence={"correlation_id": correlation["correlation_id"],
                       "original_envelope_id": original_envelope_id,
                       "reply_digest": reply_digest,
-                      "sender_native_id": str(sender.get("session_id", "")),
-                      "sender_tag": str(sender.get("tag", "")),
-                      "sender_workspace": str(sender.get("workspace", "")),
-                      "sender_created_at_ms": sender_created if type(sender_created) is int else target.created_at_ms,
+                      "sender_native_id": str(author.get("session_id", "")),
+                      "sender_tag": str(author.get("tag", "")),
+                      "sender_workspace": str(author.get("workspace", "")),
+                      "sender_created_at_ms": author_created if type(author_created) is int else observed.created_at_ms,
                       "reply_body": body_text[:512]},
         )
     return AckResult(
@@ -720,6 +806,67 @@ def status_of(
     }
 
 
+def _pid_dead(pid: Any) -> Optional[bool]:
+    """Read-only liveness probe for one PID. True = dead, False = alive,
+    None = unknown (no permission or unparsable). Never signals."""
+    if type(pid) is not int or pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    except (OSError, ValueError, OverflowError):
+        return None
+    return False
+
+
+def _workload_containment_gone(cgroup: Optional[str]) -> Optional[bool]:
+    """Read-only check that a previously observed workload cgroup path is gone.
+
+    True = path absent (contained work reaped), False = still present,
+    None = no usable path observed (unsupported). Only absolute paths under
+    /sys/fs/cgroup are consulted; anything else is unsupported, never probed.
+    """
+    if not isinstance(cgroup, str) or not cgroup:
+        return None
+    norm = os.path.normpath(cgroup)
+    if not norm.startswith("/sys/fs/cgroup/"):
+        return None
+    try:
+        return not os.path.exists(norm)
+    except (OSError, ValueError):
+        return None
+
+
+def _confirm_workload_exit(before: NativeSession) -> tuple[bool, str]:
+    """Confirm the owned workload is actually gone (stop oracle).
+
+    A missing catalog entry or a lone ``kill`` exit 0 is NOT confirmation.
+    Stopped requires at least one positive containment/process proof from the
+    observed row: the workload cgroup path reaped, every observed PID dead,
+    or the catalog itself reporting containment empty. Anything else is
+    unproven (unknown/unsupported oracle stays uncertain/held, never false
+    stopped).
+    """
+    cgroup_gone = _workload_containment_gone(before.workload_cgroup)
+    if cgroup_gone is True:
+        return True, "workload cgroup reaped after kill"
+    pids = [p for p in (before.worker_pid, before.workload_pid) if type(p) is int]
+    if pids:
+        states = [_pid_dead(p) for p in pids]
+        if all(s is True for s in states):
+            return True, "observed workload PIDs dead after kill"
+        if any(s is False for s in states):
+            return False, "observed workload PID still alive after kill"
+    if before.containment_empty is True:
+        return True, "catalog reports containment empty after kill"
+    if cgroup_gone is False:
+        return False, "workload cgroup still present after kill"
+    return False, "no containment/process proof available; exit unproven"
+
+
 def stop_session(
     executable: str,
     target: NativeTarget,
@@ -728,9 +875,12 @@ def stop_session(
 ) -> StopResult:
     """Stop ONLY the authorized exact session and confirm its native exit.
 
-    Binds UUID+workspace+tag before the effect; after ``kill``, the target UUID must
-    be absent from the catalog (records cleaned up per native contract) or in a
-    terminal phase. A still-running UUID is ``uncertain``, never silently released.
+    Binds UUID+workspace+tag (+engine when expected) before the effect; after
+    ``kill``, the target UUID must be absent from the catalog (records cleaned
+    up per native contract) or in a terminal phase, AND the owned workload
+    must be proven gone (reaped cgroup, dead PIDs, or catalog containment
+    empty). A still-running UUID — or a vanished record with no containment
+    proof — is ``uncertain``, never silently released.
     """
     target = target.validated()
     if signal not in ("HUP", "TERM"):
@@ -745,10 +895,18 @@ def stop_session(
         raise SessionControlError("Target not in native catalog (tag reuse or absent); refusing")
     if target.created_at_ms is not None and before[0].created_at_ms != target.created_at_ms:
         raise SessionControlError("Native generation mismatch before kill; refusing")
+    if target.engine is not None and before[0].engine != target.engine:
+        raise SessionControlError(
+            "Native engine mismatch (reported %r, expected %r); refusing"
+            % (before[0].engine, target.engine)
+        )
     generation = before[0].created_at_ms
     if before[0].phase in TERMINAL_PHASES:
-        return StopResult(state="stopped", session_id=target.session_id,
-                          reason=f"already terminal before kill: {before[0].phase}")
+        confirmed, why = _confirm_workload_exit(before[0])
+        if confirmed:
+            return StopResult(state="stopped", session_id=target.session_id,
+                              reason="already terminal before kill: %s (%s)" % (before[0].phase, why))
+        raise SessionUncertain("Target terminal but workload exit unproven (%s); reconcile" % why)
     proc = run_native(
         executable,
         ["kill", "--workspace", target.workspace, "--tag", target.tag,
@@ -760,20 +918,27 @@ def stop_session(
         # while running (forget claims no stop). Reconcile, never assume stopped.
         raise SessionUncertain("Kill reported failure; target exit unproven — reconcile")
     remaining = [s for s in list_sessions(executable, include_exited=True)
-                  if s.session_id.lower() == target.session_id.lower()
-                  and s.tag == target.tag
-                  and canonicalize_workspace(s.workspace) == target.workspace]
+                   if s.session_id.lower() == target.session_id.lower()
+                   and s.tag == target.tag
+                   and canonicalize_workspace(s.workspace) == target.workspace]
     if not remaining:
-        # Kill reported success AND the exact bound UUID/tag/workspace record is gone.
-        # Absence WITHOUT our kill proof (forget/prune) is never exit proof — that
-        # case refuses above, before any effect.
-        return StopResult(state="stopped", session_id=target.session_id,
-                          reason="native record cleaned up after kill")
+        # Kill reported success AND the exact bound UUID/tag/workspace record is
+        # gone. Absence WITHOUT our kill proof (forget/prune) is never exit
+        # proof — that case refuses above, before any effect. Even with our
+        # kill, absence alone is not confirmation: prove the workload gone.
+        confirmed, why = _confirm_workload_exit(before[0])
+        if confirmed:
+            return StopResult(state="stopped", session_id=target.session_id,
+                              reason="native record cleaned up after kill (%s)" % why)
+        raise SessionUncertain("Native record gone after kill but %s; reconcile" % why)
     if generation is not None and remaining[0].created_at_ms != generation:
         raise SessionUncertain("Native generation changed across kill; exit unproven")
     if remaining[0].phase in TERMINAL_PHASES:
-        return StopResult(state="stopped", session_id=target.session_id,
-                          reason=f"terminal phase observed: {remaining[0].phase}")
+        confirmed, why = _confirm_workload_exit(remaining[0])
+        if confirmed:
+            return StopResult(state="stopped", session_id=target.session_id,
+                              reason="terminal phase observed: %s (%s)" % (remaining[0].phase, why))
+        raise SessionUncertain("Target terminal (%s) but %s; reconcile" % (remaining[0].phase, why))
     raise SessionUncertain(
         f"Target still {remaining[0].phase} after kill; capacity NOT released"
     )

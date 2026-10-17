@@ -79,26 +79,30 @@ constraints), `brief` (optional headless prompt, 1..8000 chars), `mode`
 (`headless`|`interactive`, interactive starts empty), `access` (optional
 claim-admission declaration passed through to fleet).
 
-`tier` is rejected with `400 unsupported_tier` BEFORE any effect: fleet
-`plan()`/`reserve()` accept a fixed key set with no tier consumer
-(`src/fleet.ts` plan keys), and inventing a tier-to-placement mapping would be
-a new provider dispatcher, which is out of scope. Select `engine`/`machine`
-explicitly instead.
+`tier` resolves through the EXISTING model-routing table inside fleet plan
+(configured tier membership filters eligible engine/profile routes; the
+existing score order still decides — no new ranking or dispatcher). Unknown
+tiers are rejected with `400 invalid_tier`; a tier with no eligible route
+becomes an honest held session, never a silent upgrade. An explicit engine
+outside the tier simply matches nothing (`no_eligible_route`).
 
-`cwd` is rejected with `400 unsupported_cwd` BEFORE any reservation: fleet
-plan strictly rejects unknown keys, and the host cannot retroactively change
-a launched cwd, so carrying cwd in a side table would NOT make the existing
-fleet start honor it. Launches happen at the workspace root until an actual
-existing start adapter consumes the constraint. The `cwd` field stays in host
-offers (always null today) for that future adapter; the hub never claims an
-executed cwd from the binding.
+`cwd` is consumed end to end: validated here as a workspace-relative
+confined path, carried through the fleet reserve into the launch offer,
+resolved by the host against allowlisted canonical roots with symlink
+confinement (`resolve_offer_cwd`), passed to the installed
+`a start --cwd`, and verified against the actual native catalog at binding
+(`fleet_cwd_mismatch` on drift). The hub never claims an executed cwd it
+cannot see; unreported catalog cwd holds honestly. Omitted tier/cwd arrive
+at fleet plan as null (absent), never as malformed values.
 
 Behavior:
 
 1. Same-transaction idempotency replay on `(actor, key)`: identical canonical
    intent returns the original session; conflicting payload returns 409.
 2. The service calls the existing fleet `reserve` with the exact fleet key set
-   `{mode, machine, engine, workspace, prompt, idempotency_key, access}`.
+   `{mode, machine, engine, tier, workspace, cwd, prompt, idempotency_key,
+   access}` (tier/cwd are REAL placement constraints now, filtered/mapped by
+   existing policy, never silently discarded).
    Fleet client errors (400) pass through as 400 with the session marked
    `refused`; placement/admission failures (409) become an honest `held`
    session carrying the fleet reason plus the requested engine/machine.
@@ -106,9 +110,16 @@ Behavior:
    fleet reserve stays idempotent on its derived key, so replays and crash
    recovery cannot double-launch. Without a reserve hook the intent is held
    with `no_placement_authority`.
-4. `cwd` is NOT sent to fleet (rejected key there). Non-root values are
-   rejected with `400 unsupported_cwd` before any reservation; the offer
-   field is reserved for the future start adapter that consumes it.
+4. Post-body authority inside the mutation txn: after `await body(request)`,
+   creation re-verifies `agentLive` + non-null `presentingFamily` (non-admin),
+   binding re-verifies `hostOk`, and every send/capture/stop enqueue
+   re-reads the live session row AND `ownerOk` before inserting. A
+   credential revoked, expired, rebound, or re-enrolled while the body
+   streamed fails closed with no row, no NULL family stamp, and no
+   state-machine violation (`test/session-control-r3.test.ts` R3-1..R3-3:
+   streamed-body revoke races). Crypto token-hash prep stays async BEFORE
+   the txn; all live credential/family/machine checks are synchronous
+   INSIDE it — no awaited final-verifier gap.
 
 ### Claim / ack discipline (one-time attempt fence)
 
@@ -143,10 +154,16 @@ Behavior:
    immediately before the effect.
 4. Host acks with `{correlation, outcome, native, claim_token, ...}` where
    `native` is ALWAYS the target native session triple
-   (`native_id` = bound native session UUID, never an envelope id). Only
+   (`native_id` = bound native session UUID, never an envelope id).    Only
    the live claim holder may ack; an ack after lease expiry marks the command
    `uncertain` (the effect may have happened) and is rejected with
-   `claim_expired` — never marked delivered, never reissued.
+   `claim_expired` — never marked delivered, never reissued — EXCEPT a send
+   carrying a valid delivered proof on the SAME live claim, which reconciles
+   through `lateReplyAck` whether the row is already `uncertain` or still
+   `claimed` with an elapsed lease: the verdict never depends on offers-sweep
+   ordering (409s stay classified by code + command/attempt/proof: same-
+   command lost-response idempotency converges, `proof_replayed` for another
+   command is terminal and kept as a durable human-obligation fact).
    A SEND whose recipient reply has not arrived yet is NOT acked at all on
    the first cycle: the host journals the durable attempt with the original
    native envelope id and reconciles read-only (same claim token, no second
@@ -177,11 +194,16 @@ live post-start state (`starting`|`running` — `offered` is unstarted,
 Fleet consumer tag for that launch (`hub-<fleet_launch_id>`), an
 already-reported launch native id must match, AND the existing Fleet sessions
 report must already carry this exact native identity (same machine + UUID +
-tag + workspace, non-terminal phase). Binding before the Fleet consumer
-reports the native identity is refused (`fleet_native_unreported`); a
-reported tag/workspace mismatch or a terminal native phase is refused as
-well. The launch row alone never proves the tag/workspace mapping, so an
-arbitrary workspace is never adopted on a launch id plus an unreported UUID.
+tag + workspace + engine + cwd, non-terminal phase). Binding before the
+Fleet consumer reports the native identity is refused
+(`fleet_native_unreported`); a reported tag/workspace mismatch or a terminal
+native phase is refused as well. A known engine mismatch hard-rejects with
+no mutation (`fleet_engine_mismatch` — a real SHELL row never binds a
+requested model session); the requested cwd must match the reported catalog
+cwd exactly or as trailing segments (`fleet_cwd_mismatch` otherwise;
+unreported catalog cwd holds honestly). The launch row alone never proves
+the tag/workspace mapping, so an arbitrary workspace is never adopted on a
+launch id plus an unreported UUID.
 The binding workspace (absolute native path) is deliberately NOT compared to
 the Fleet workspace label — different domains (hub label vs. canonical native
 path) — so machine + tag + native id + state + the sessions report carry the

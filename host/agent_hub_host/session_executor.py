@@ -39,6 +39,7 @@ from typing import Any, Callable, Optional
 
 from . import private_fs
 from .fleet import Dispatcher
+from .native_bridge import NativeServiceBinding
 from .native_sessions import (
     MAX_BODY_BYTES,
     DeliveryResult,
@@ -54,6 +55,38 @@ from .native_sessions import (
     stop_session as _stop,
     verify_ack_via_reply,
 )
+
+
+def _sender_binding_from_record(value: Any) -> Optional[NativeServiceBinding]:
+    """Rebuild the journaled genuine sender binding (never fabricated).
+
+    Returns None when the journal predates sender capture or is malformed —
+    verification then stays honestly unknown rather than guessing a mailbox.
+    """
+    if not isinstance(value, dict):
+        return None
+    try:
+        session_id = str(value["session_id"])
+        tag = str(value["tag"])
+        workspace = str(value["workspace"])
+        created = value.get("created_at_ms")
+        engine = value.get("engine")
+        profile = value.get("profile")
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not session_id or not tag or not workspace:
+        return None
+    import uuid as _uuid
+    try:
+        _uuid.UUID(session_id)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return NativeServiceBinding(
+        session_id=session_id, tag=tag, workspace=workspace,
+        engine=str(engine) if isinstance(engine, str) and engine else "hub-host",
+        profile=str(profile) if isinstance(profile, str) else None,
+        created_at_ms=created if type(created) is int else 0,
+    )
 
 JOURNAL_LIMIT = 64 * 1024
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
@@ -194,9 +227,9 @@ def _request_status(exc: BaseException) -> Optional[int]:
     """Best-effort HTTP status extraction from request-callable failures.
 
     The production hub client raises ``ValueError('... status NNN')``; stub
-    callables in tests raise similar errors. A 409 means the server issued a
-    terminal verdict for this attempt (expired/stale/uncertain/mismatch) while
-    any other failure is transport loss with the outcome still unknown.
+    callables in tests raise similar errors. A 409 means the server refused
+    this attempt while any other failure is transport loss with the outcome
+    still unknown. Terminality additionally needs :func:`_request_code`.
     """
     import re as _re
 
@@ -208,6 +241,45 @@ def _request_status(exc: BaseException) -> Optional[int]:
             return None
     status = getattr(exc, "status", None)
     return status if type(status) is int else None
+
+
+def _request_code(exc: BaseException) -> Optional[str]:
+    """Best-effort server error-code extraction (``... status 409 (code)``).
+
+    The production client appends the server ``error`` field in parentheses;
+    test stubs follow the same convention. Returns None when unavailable.
+    """
+    import re as _re
+
+    match = _re.search(r"status \d{3} \(([A-Za-z0-9_-]{1,64})\)", str(exc))
+    if match:
+        return match.group(1)
+    code = getattr(exc, "server_code", None)
+    return code if isinstance(code, str) and code else None
+
+
+# Server 409 codes that can never heal for the journaled attempt: the claim
+# fence moved on (rival holder/token), the proof was consumed elsewhere or is
+# bound to a superseded incarnation, or the row already settled. claim_expired
+# is NOT terminal for an unknown-state send: the offers sweep (or the fixed
+# lateReplyAck path) may still accept the proof, and a later reply produces a
+# fresh proof. Unknown/absent codes are retryable for unknown-state journals
+# (one POST per distinct observed reply; see below) and terminal for
+# completed-effect resubmits (never busy-retry a finished effect).
+TERMINAL_409_CODES = frozenset({
+    "claim_conflict", "already_claimed", "correlation_mismatch",
+    "proof_replayed", "proof_sender_mismatch", "proof_generation_stale",
+    "proof_reply_mismatch", "invalid_proof_shape",
+    "binding_mismatch", "command_uncertain", "claim_required",
+    "proof_required", "native_proof_unavailable",
+    "confirmed_exit_required",
+})
+
+# Completed-effect outcomes restored when a resubmitted ack finally lands
+# (the journal must converge to the executed fact, not linger uncertain).
+_COMPLETED_BY_OUTCOME = {
+    "delivered": {"send": "acknowledged", "capture": "captured", "stop": "stopped"},
+}
 
 
 def _server_correlation(command_id: str, generation: int) -> str:
@@ -226,10 +298,11 @@ def _delivered_ack_payload(
 ) -> dict[str, Any]:
     sender_created = evidence.get("sender_created_at_ms")
     if type(sender_created) is not int:
-        # The verifier falls back to the bound target incarnation only when
-        # the reply carries no actual creation value; a real observed value
-        # is forwarded verbatim, never overwritten with the expectation.
-        sender_created = target.created_at_ms
+        # No observed incarnation anywhere (reply carries none AND the live
+        # catalog row has none): provenance is unprovable, so no proof is
+        # minted. Never fabricate the expected binding value as a witness.
+        raise SessionControlError(
+            "Native incarnation unobserved; reply proof unavailable, reconcile")
     return {
         "correlation": _server_correlation(command_id, generation),
         "outcome": "delivered",
@@ -422,6 +495,7 @@ def send_prompt(
     journal_dir: Optional[str] = None,
     reconciled: bool = False,
     wait_ack_secs: int = 10,
+    sender_workspace: Optional[str] = None,
 ) -> dict[str, Any]:
     """Idempotent inbox send with durable intent and correlated receipts.
 
@@ -471,12 +545,18 @@ def send_prompt(
                            "workspace": target.workspace,
                            "created_at_ms": target.created_at_ms}})
         correlation = {"correlation_id": corr, "idempotency_key": key, "body_digest": digest}
-        result: DeliveryResult = _send_inbox(executable, target, body, correlation)
+        result, sender_binding = _send_inbox(executable, target, body, correlation,
+                                             sender_workspace=sender_workspace)
+        sender_record = {"session_id": sender_binding.session_id, "tag": sender_binding.tag,
+                         "workspace": sender_binding.workspace, "engine": sender_binding.engine,
+                         "profile": sender_binding.profile,
+                         "created_at_ms": sender_binding.created_at_ms}
         record = {"op": "send", "key": key, "transport": transport,
                   "body_digest": digest, "attempted": True,
                   "correlation_id": corr, "state": result.state,
                   "native_id": result.native_id, "reason": result.reason,
                   "caller_actor": custody.actor, "caller_family": custody.credential_family,
+                  "sender_binding": sender_record,
                   "target": {"session_id": target.session_id, "tag": target.tag,
                              "workspace": target.workspace,
                              "created_at_ms": target.created_at_ms}}
@@ -567,9 +647,16 @@ def _reconcile_unknown_locked(
             created_at_ms=raw_target.get("created_at_ms")).validated()
     except (KeyError, TypeError, SessionControlError):
         return None
+    # Reconciliation reads the JOURNALED genuine sender mailbox (the binding
+    # observed before the send). Without it the reply is honestly unverifiable;
+    # the sender workspace is never re-derived from the target.
+    sender_binding = _sender_binding_from_record(prior.get("sender_binding"))
+    if sender_binding is None:
+        return None
     body_digest = prior.get("body_digest") or ""
     proof = _verify(
-        executable, target, str(prior.get("original_native_message_id") or ""),
+        executable, target, sender_binding,
+        str(prior.get("original_native_message_id") or ""),
         {"correlation_id": command_id, "body_digest": body_digest})
     if proof.state != "acknowledged" or not proof.reply_envelope_id:
         return None
@@ -589,20 +676,40 @@ def _reconcile_unknown_locked(
         _write_journal(journal_file, updated)
         return {"op": prior.get("op"), **updated,
                 "ack": {"submitted": False, "payload": payload}}
+    # One POST per distinct observed reply: a 409 rejection already recorded
+    # for this exact reply envelope is not re-POSTed (no busy retry); a NEW
+    # reply envelope re-arms the attempt. Transport loss leaves the journal
+    # pending for the next cycle.
+    if prior.get("rejected_reply_envelope_id") == proof.reply_envelope_id:
+        _write_journal(journal_file, {**prior, "ack_submitted": False})
+        return None
     try:
         request("POST", "/api/session-commands/" + command_id + "/ack",
                 {**payload, "claim_token": prior.get("claim_token")})
     except Exception as exc:
         if _request_status(exc) == 409:
-            updated = {**updated, "state": "uncertain",
-                       "ack_submitted": False,
-                       "ack_error": "server_terminal_%s" % type(exc).__name__}
-            _write_journal(journal_file, updated)
-            return {"op": prior.get("op"), **updated,
-                    "ack": {"submitted": False, "payload": payload,
-                            "terminal": "uncertain"}}
+            code = _request_code(exc) or "unknown"
+            if code in TERMINAL_409_CODES:
+                # Terminal for this attempt: close as uncertain with the
+                # durable human-obligation fact (never fake completed, never
+                # silently dropped). No retry: resubmit skips terminal
+                # journals and reconcile only owns unknown-state journals.
+                closed = {**updated, "state": "uncertain",
+                          "ack_submitted": False,
+                          "ack_error": "server_terminal_%s" % code}
+                _write_journal(journal_file, closed)
+                return {"op": prior.get("op"), **closed,
+                        "ack": {"submitted": False, "payload": payload,
+                                "terminal": "uncertain"}}
+            pending = {**prior, "ack_submitted": False,
+                       "ack_error": "server_retryable_%s" % code,
+                       "rejected_reply_envelope_id": str(proof.reply_envelope_id)}
+            _write_journal(journal_file, pending)
+            return None
         return None
     updated["ack_submitted"] = True
+    updated.pop("ack_error", None)
+    updated.pop("rejected_reply_envelope_id", None)
     _write_journal(journal_file, updated)
     return {"op": prior.get("op"), **updated,
             "ack": {"submitted": True, "payload": payload, "reconciled": True}}
@@ -620,8 +727,11 @@ def _resubmit_ack_locked(
 
     The native effect is never repeated: the journaled ``ack_payload`` is
     POSTed verbatim under the same claim token. Success marks the journal
-    submitted; a terminal server verdict (HTTP 409) closes it as uncertain;
-    transport loss leaves it pending for the next cycle.
+    submitted AND restores the completed local state (acknowledged/captured/
+    stopped) so server and host converge; any HTTP 409 closes a completed
+    effect as uncertain with the durable verdict (never retried, never
+    marked delivered without a server ACK); transport loss leaves it pending
+    for the next cycle.
     """
     payload = prior.get("ack_payload")
     if not isinstance(payload, dict):
@@ -633,14 +743,18 @@ def _resubmit_ack_locked(
                 {**payload, "claim_token": claim_token})
     except Exception as exc:
         if _request_status(exc) == 409:
+            code = _request_code(exc) or "unknown"
             updated = {**prior, "state": "uncertain", "ack_submitted": False,
-                       "ack_error": "server_terminal_%s" % type(exc).__name__}
+                       "ack_error": "server_terminal_%s" % code}
             _write_journal(journal_file, updated)
             return {**updated, "replayed": True,
                     "ack": {"submitted": False, "payload": payload,
                             "terminal": "uncertain"}}
         return None
-    updated = {**prior, "ack_submitted": True}
+    op = prior.get("op")
+    outcome = payload.get("outcome") if isinstance(payload, dict) else None
+    restored = _COMPLETED_BY_OUTCOME.get(outcome, {}).get(op, prior.get("state"))
+    updated = {**prior, "state": restored, "ack_submitted": True}
     updated.pop("ack_error", None)
     _write_journal(journal_file, updated)
     return {**updated, "replayed": True,
@@ -700,6 +814,8 @@ def resubmit_pending_ack(
                 return None
             if prior.get("state") == "unknown":
                 return None  # reply reconciliation owns this journal, not ack replay
+            if str(prior.get("ack_error") or "").startswith("server_terminal_"):
+                return None  # terminal verdict stays closed: no infinite 409 retry
             return _resubmit_ack_locked(
                 journal_file, prior, command_id, str(prior.get("claim_token") or ""),
                 request=request)
@@ -716,6 +832,7 @@ def handle_claimed_command(
     executable: str = "aplexer",
     request: Optional[Callable] = None,
     now_ms: Optional[int] = None,
+    sender_workspace: Optional[str] = None,
 ) -> dict[str, Any]:
     """Shared server-claimed receiver (exact function the API worker wires).
 
@@ -804,6 +921,10 @@ def handle_claimed_command(
                     and request is not None:
                 # Same attempt, effect complete, ack response lost: re-submit
                 # the IDENTICAL proven ack without repeating the native effect.
+                # A terminal server verdict stays closed: never re-POST a
+                # rejected ack (no infinite 409 loop), just replay the fact.
+                if str(prior.get("ack_error") or "").startswith("server_terminal_"):
+                    return {**prior, "replayed": True}
                 resubmitted = _resubmit_ack_locked(
                     journal_file, prior, command_id, proved["claim_token"],
                     request=request)
@@ -828,7 +949,7 @@ def handle_claimed_command(
         try:
             outcome = _run_claimed_effect(
                 executable, op, command, target, custody=custody,
-                journal_dir=journal_dir)
+                journal_dir=journal_dir, sender_workspace=sender_workspace)
         except SessionUncertain as exc:
             raise SessionUncertain(str(exc) or "Effect uncertain; reconcile") from exc
 
@@ -839,6 +960,11 @@ def handle_claimed_command(
                   "reason": str(outcome.get("reason", ""))[:300],
                   "expires_at_ms": proved["expires_at_ms"],
                   "server_correlation": _server_correlation(command_id, proved["generation"])}
+        if isinstance(outcome.get("sender_binding"), dict):
+            # Journal the genuine sender binding observed before the effect so
+            # read-only reconciliation reads the correct sender mailbox without
+            # re-deriving identity from the target.
+            record["sender_binding"] = outcome["sender_binding"]
 
         # A send whose recipient reply has not arrived yet is journaled as
         # pending WITHOUT any server ack: the command stays claimed under its
@@ -905,6 +1031,7 @@ def _run_claimed_effect(
     *,
     custody: CallerCustody,
     journal_dir: str,
+    sender_workspace: Optional[str] = None,
 ) -> dict[str, Any]:
     """Run one claimed native effect; returns the outcome fields for ack mapping.
 
@@ -919,14 +1046,23 @@ def _run_claimed_effect(
         key = "cmdsend-" + str(command["command_id"])
         sent = send_prompt(executable, target, body, custody=custody,
                            transport="inbox", correlation_id=str(command["command_id"]),
-                           idempotency_key=key, journal_dir=journal_dir)
+                           idempotency_key=key, journal_dir=journal_dir,
+                           sender_workspace=sender_workspace)
+        sender_binding = _sender_binding_from_record(sent.get("sender_binding"))
         # Inbox send proves recording only. A correlated reply, when the caller
         # asks for it AND qualified reply proof is available, is checked in the
-        # actual native log; otherwise the honest state stays recorded/unknown.
+        # SENDER's mailbox (installed cross-workspace reply routing); otherwise
+        # the honest state stays recorded/unknown.
         reply_id: Optional[str] = None
         if command.get("await_ack") is True:
+            if sender_binding is None:
+                return {"state": "unknown", "ack_outcome": "uncertain",
+                        "native_id": sent.get("native_id"),
+                        "original_native_message_id": sent.get("native_id"),
+                        "reply_envelope_id": None,
+                        "reason": "genuine sender binding unavailable; reply unverifiable"}
             proof = verify_ack_via_reply(
-                executable, target, str(sent.get("native_id") or ""),
+                executable, target, sender_binding, str(sent.get("native_id") or ""),
                 {"correlation_id": str(command["command_id"]),
                  "body_digest": str(sent.get("body_digest") or "")})
             if proof.state == "acknowledged":
@@ -936,15 +1072,18 @@ def _run_claimed_effect(
                         "native_id": sent.get("native_id"),
                         "original_native_message_id": sent.get("native_id"),
                         "reply_envelope_id": reply_id, "reason": proof.reason,
-                        "proof_evidence": evidence}
+                        "proof_evidence": evidence,
+                        "sender_binding": sent.get("sender_binding")}
             return {"state": "unknown", "ack_outcome": "uncertain",
                     "native_id": sent.get("native_id"),
                     "original_native_message_id": sent.get("native_id"),
-                    "reply_envelope_id": None, "reason": proof.reason}
+                    "reply_envelope_id": None, "reason": proof.reason,
+                    "sender_binding": sent.get("sender_binding")}
         return {"state": sent.get("state", "recorded"), "ack_outcome": "uncertain",
                 "native_id": sent.get("native_id"),
                 "original_native_message_id": sent.get("native_id"),
-                "reply_envelope_id": None, "reason": sent.get("reason", "")}
+                "reply_envelope_id": None, "reason": sent.get("reason", ""),
+                "sender_binding": sent.get("sender_binding")}
     if op == "capture":
         limit = command.get("limit_bytes", 32 * 1024)
         mode = command.get("mode", "tail")

@@ -22,6 +22,7 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { credentialActor } from './agent_registry';
 import { redact } from './routing';
+import { taskTier } from './model-routing';
 
 export const SESSION_CONTROL_SCHEMA = `
 CREATE TABLE IF NOT EXISTS session_control_sessions (id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, fleet_launch_id TEXT, machine_id TEXT, engine TEXT, mode TEXT NOT NULL, state TEXT NOT NULL, binding_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
@@ -336,7 +337,7 @@ export class SessionControlService {
     // prove the tag/workspace mapping, and an arbitrary workspace must never
     // be adopted on a launch id plus an unreported UUID.
     const reported: any = this.sql.exec(
-      'SELECT tag, workspace, phase FROM fleet_sessions WHERE machine_id = ? AND native_id = ?',
+      'SELECT tag, workspace, phase, engine, cwd FROM fleet_sessions WHERE machine_id = ? AND native_id = ?',
       row.machine_id, binding.native_id).toArray()[0];
     if (!reported) return { ok: false as const, error: 'fleet_native_unreported' };
     if (reported.tag !== binding.tag || reported.workspace !== binding.workspace) {
@@ -345,6 +346,25 @@ export class SessionControlService {
     if (reported.phase === 'exited' || reported.phase === 'dead' ||
         reported.phase === 'forgotten' || reported.phase === 'pruned') {
       return { ok: false as const, error: 'fleet_native_terminal' };
+    }
+    // Expected engine enforcement (vs canonical Fleet report AND actual
+    // native catalog, both host-reported): a known mismatch hard-rejects with
+    // no mutation — a real SHELL row never binds a requested codex session.
+    // Sessions created without an engine keep the legacy behavior.
+    if (row.engine && reported.engine !== row.engine) {
+      return { ok: false as const, error: 'fleet_engine_mismatch' };
+    }
+    // Requested cwd verification against the reported actual catalog cwd: the
+    // relative request (workspace-root-relative) must match the reported
+    // absolute path exactly or as its trailing segments. Unreported catalog
+    // cwd holds honestly — the hub never claims an executed cwd it cannot see.
+    const requestedCwd: unknown = parsed(row.request_json, {}).cwd;
+    if (typeof requestedCwd === 'string' && requestedCwd) {
+      const seen = typeof reported.cwd === 'string' ? reported.cwd : null;
+      const want = requestedCwd.replace(/\/+$/, '');
+      if (!seen || !(seen === want || seen.endsWith('/' + want))) {
+        return { ok: false as const, error: 'fleet_cwd_mismatch' };
+      }
     }
     const generation = (prior?.generation ?? 0) + 1;
     this.sql.exec('UPDATE session_control_sessions SET state = ?, binding_json = ?, updated_at = ? WHERE id = ?',
@@ -467,15 +487,23 @@ export class SessionControlService {
           (input.brief !== undefined && (typeof input.brief !== 'string' || !input.brief.trim() || input.brief.length > 8000))) {
         return response({ error: 'invalid_session_request' }, 400);
       }
-      // Tier has no fleet placement consumer (fleet plan keys are fixed; routing
-      // tiers select models, not launches). Reject explicitly BEFORE any effect
-      // rather than recording a hint the placement silently discards.
-      if (input.tier !== undefined) return response({ error: 'unsupported_tier', detail: 'tier has no fleet placement consumer; select engine/machine explicitly' }, 400);
-      // cwd is not consumed by the existing fleet start adapter either (fleet
-      // plan strictly rejects unknown keys, and the host cannot retroactively
-      // change a launched cwd). Any non-root cwd is rejected BEFORE the
-      // reservation; the hub never claims an executed cwd from the binding.
-      if (input.cwd !== undefined) return response({ error: 'unsupported_cwd', detail: 'cwd has no fleet start consumer yet; launch at the workspace root' }, 400);
+      // Tier resolves through the EXISTING model-routing table inside fleet
+      // plan (configured tier membership filters eligible engine/profile
+      // routes; the existing score order still decides). Unknown tiers are
+      // rejected here; a tier with no eligible route becomes an honest held
+      // session, never a silent upgrade.
+      if (input.tier !== undefined && taskTier({ tier: input.tier }) === null) {
+        return response({ error: 'invalid_tier', detail: 'unknown tier; use configured tiers/aliases' }, 400);
+      }
+      // cwd is consumed by the existing fleet/host start adapter: validated
+      // here as a workspace-relative confined path, carried through the fleet
+      // reserve into the launch offer, resolved by the host against
+      // allowlisted canonical roots with symlink confinement, and verified
+      // against the actual native catalog at binding. The hub never claims an
+      // executed cwd without that verification.
+      if (input.cwd !== undefined && !cwdOk(input.cwd)) {
+        return response({ error: 'invalid_cwd', detail: 'cwd must be a workspace-relative confined path' }, 400);
+      }
       const mode = input.mode || 'headless';
       if (mode === 'interactive' && input.brief !== undefined) {
         return response({ error: 'interactive_starts_empty' }, 400);
@@ -499,13 +527,23 @@ export class SessionControlService {
           // A held intent may be placed once capacity/admission recovers; the fleet
           // reserve stays idempotent on its own derived key, so this cannot double-launch.
         }
+        // Post-body liveness inside the mutation txn: a credential revoked,
+        // expired, or re-enrolled while the request body streamed must not
+        // create a session row (or stamp a NULL family). Admins bypass; every
+        // other creator needs a live agent incarnation in a live family.
+        let creatorFamily: string | null = null;
+        if (!admin) {
+          if (!this.agentLive(caller)) return response({ error: 'forbidden' }, 403);
+          creatorFamily = this.presentingFamily(caller);
+          if (!creatorFamily) return response({ error: 'forbidden' }, 403);
+        }
         if (!this.hooks.reserve) {
           if (!prior) {
             const id = crypto.randomUUID();
             const at = this.at();
             this.sql.exec(
               'INSERT INTO session_control_sessions (id, actor, request_key, request_json, mode, state, owner_token_id, owner_family, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-              id, actor, input.key, canonical, mode, 'held', caller.tokenId ?? null, this.presentingFamily(caller), at, at);
+              id, actor, input.key, canonical, mode, 'held', caller.tokenId ?? null, creatorFamily, at, at);
             const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
             return response({ ...this.view(row), hold: 'no_placement_authority' }, 409);
           }
@@ -516,17 +554,19 @@ export class SessionControlService {
         if (!prior) {
           this.sql.exec(
             'INSERT INTO session_control_sessions (id, actor, request_key, request_json, mode, state, owner_token_id, owner_family, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            id, actor, input.key, canonical, mode, 'queued', caller.tokenId ?? null, this.presentingFamily(caller), at, at);
+            id, actor, input.key, canonical, mode, 'queued', caller.tokenId ?? null, creatorFamily, at, at);
         }
-        // engine / machine / workspace / mode / prompt reach the existing fleet
-        // reserve as REAL placement constraints (exact route match + M6/M8 gates).
-        // cwd and tier are rejected above: fleet plan keys are fixed and the hub
-        // never ships a constraint the placement silently discards.
-        const reserved = this.hooks.reserve({
-          mode, machine: input.machine, engine: input.engine, workspace: input.workspace,
-          prompt: input.brief || '', access: input.access,
-          idempotency_key: 'session-control-' + id,
-        }, auth);
+      // engine / machine / tier / workspace / cwd / mode / prompt reach the
+      // existing fleet reserve as REAL placement constraints (exact route
+      // match + tier-membership filter + M6/M8 gates). Nothing is silently
+      // discarded: unknown tiers/cwds are rejected above, and a tier with no
+      // eligible route becomes an honest held session.
+      const reserved = this.hooks.reserve({
+        mode, machine: input.machine, engine: input.engine, tier: input.tier,
+        workspace: input.workspace, cwd: input.cwd ?? null,
+        prompt: input.brief || '', access: input.access,
+        idempotency_key: 'session-control-' + id,
+      }, auth);
         if (reserved.status === 400) {
           this.sql.exec('UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE id = ?', 'refused', at, id);
           return response(reserved.value, 400);
@@ -576,6 +616,13 @@ export class SessionControlService {
           return response({ error: 'invalid_binding' }, 400);
         }
         return this.transaction(() => {
+          // Post-body host authority inside the mutation txn: a host
+          // credential revoked or superseded (machine re-enrolled to a new
+          // family) while the body streamed must not bind or adopt a family.
+          // hostOk re-reads the live machine registry + presenting family; a
+          // NULL stamp is never a valid adoption.
+          const fresh = this.hostOk(session, caller);
+          if (!fresh.ok) return response({ error: fresh.error }, fresh.error === 'not_found' ? 404 : 409);
           const applied = this.applyBinding(session.id, input.native, caller.machineId!);
           if (!applied.ok) {
             return response({ error: applied.error },
@@ -603,25 +650,35 @@ export class SessionControlService {
         if (!writer || !this.ownerOk(session, caller)) return response({ error: 'forbidden' }, 403);
         const kind = sub;
         const input = await body(request);
+        // Every mutation below runs inside one synchronous transaction that
+        // re-reads the live session row AND the live caller authority after
+        // the awaited body: revocation/expiry/rebound/reenroll — or a
+        // concurrent stop/delete — during streaming fails closed with no
+        // row, no NULL family stamp, and no state-machine violation.
+        const freshEnqueue = (payload: any, allowed: Set<string>, err: string): Response => {
+          return this.transaction(() => {
+            const live: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0];
+            if (!live || !this.ownerOk(live, caller)) return response({ error: 'not_found' }, 404);
+            if (!allowed.has(live.state)) return response({ error: err }, 409);
+            return this.enqueue(live, kind, actorName(caller), caller, input.key, payload);
+          });
+        };
         if (kind === 'send') {
           if (!obj(input, ['key', 'body']) || !label(input.key) ||
               typeof input.body !== 'string' || !input.body.trim() || input.body.length > 16000) {
             return response({ error: 'invalid_send' }, 400);
           }
-          if (!BOUND_STATES.has(session.state)) return response({ error: 'session_not_bound' }, 409);
-          return this.transaction(() => this.enqueue(session, kind, actorName(caller), caller, input.key, { body: input.body }));
+          return freshEnqueue({ body: input.body }, BOUND_STATES, 'session_not_bound');
         }
         if (kind === 'capture') {
           if (!obj(input, ['key', 'max_bytes']) || !label(input.key) ||
               (input.max_bytes !== undefined && (!Number.isInteger(input.max_bytes) || input.max_bytes < 1 || input.max_bytes > 65536))) {
             return response({ error: 'invalid_capture' }, 400);
           }
-          if (!BOUND_STATES.has(session.state)) return response({ error: 'session_not_bound' }, 409);
-          return this.transaction(() => this.enqueue(session, kind, actorName(caller), caller, input.key, { max_bytes: input.max_bytes ?? 65536 }));
+          return freshEnqueue({ max_bytes: input.max_bytes ?? 65536 }, BOUND_STATES, 'session_not_bound');
         }
         if (!obj(input, ['key']) || !label(input.key)) return response({ error: 'invalid_stop' }, 400);
-        if (!STOPPABLE.has(session.state)) return response({ error: 'session_not_stoppable' }, 409);
-        return this.transaction(() => this.enqueue(session, kind, actorName(caller), caller, input.key, {}));
+        return freshEnqueue({}, STOPPABLE, 'session_not_stoppable');
       }
       return response({ error: 'not_found' }, 404);
     }
@@ -674,6 +731,9 @@ export class SessionControlService {
             command_id: row.id, session_id: row.session_id, kind: row.kind,
             generation: row.generation,
             session_state: session.state, fleet_launch_id: session.fleet_launch_id ?? null,
+            // Expected session engine for host-side masquerade refusal: the
+            // receiver qualifies the live catalog row against it.
+            engine: session.engine ?? null,
             // Native send/capture targets need the exact bound tag + incarnation;
             // unbound sessions (stop on offered) carry binding null + fleet correlation.
             // native_created_at_ms is mandatory for host generation provenance:
@@ -792,8 +852,16 @@ export class SessionControlService {
           return response({ error: 'claim_conflict' }, 409);
         }
         if (this.claimExpired(row)) {
-          // Post-effect lease expiry: the effect may have happened. Uncertain,
-          // never silently reissued or marked delivered.
+          // Post-effect lease expiry: the effect may have happened. A send
+          // carrying a valid delivered proof on the SAME live claim reconciles
+          // through lateReplyAck (no new effect, no re-claim) regardless of
+          // whether the offers sweep has marked the row uncertain yet — the
+          // verdict must not depend on sweep ordering. Anything else stays
+          // uncertain, never silently reissued or marked delivered.
+          if (row.kind === 'send' && input.outcome === 'delivered') {
+            const late = this.lateReplyAck(row, input, caller);
+            if (late) return late;
+          }
           this.markUncertain(row, 'claim_expired_before_ack');
           return response({ error: 'claim_expired' }, 409);
         }
@@ -855,6 +923,11 @@ export class SessionControlService {
   }
 
   private enqueue(session: any, kind: string, actor: string, caller: Caller, key: string, payload: any) {
+    // Post-body ownership inside the mutation txn: a credential revoked,
+    // expired, rebound, or re-enrolled while the body streamed must not
+    // enqueue or stamp a NULL family. ownerOk re-verifies the live
+    // credential/agent incarnation and owning family; admins bypass.
+    if (!this.ownerOk(session, caller)) return response({ error: 'not_found' }, 404);
     // True caps: refuse new work without evicting pending work.
     const pending = Number(this.sql.exec(
       "SELECT COUNT(*) AS n FROM session_control_commands WHERE state IN ('recorded', 'transported', 'claimed')").one().n);
