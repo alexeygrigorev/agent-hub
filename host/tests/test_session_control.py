@@ -139,6 +139,20 @@ class TestSessionControlCli(unittest.TestCase):
             result = session_control.execute(args)
         self.assertEqual([s['id'] for s in result['sessions']], ['a'])
 
+    def test_host_receive_requires_once_and_machine(self):
+        args = self.parse('host-receive', '--once', '--machine-id', 'hetzner1')
+        self.assertTrue(args.once)
+        self.assertEqual(args.machine_id, 'hetzner1')
+        self.assertEqual(args.limit, 20)
+        with patch('agent_hub_host.session_receiver.receive_once', return_value={'offers_seen': 0}) as recv:
+            result = session_control.execute(args)
+        self.assertEqual(result, {'offers_seen': 0})
+        self.assertTrue(recv.called)
+        # Bounded limit enforced.
+        bad = self.parse('host-receive', '--once', '--machine-id', 'hetzner1', '--limit', '99')
+        with self.assertRaises(ValueError):
+            session_control.execute(bad)
+
 
 if __name__ == '__main__':
     unittest.main()

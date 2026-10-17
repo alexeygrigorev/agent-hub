@@ -113,11 +113,20 @@ Behavior:
 ### Claim / ack discipline (one-time attempt fence)
 
 1. Host polls `offers` (marks `recorded` -> `transported` fetch receipt only).
+   Offers carry `command_id`, `kind`, `generation`, `correlation`, `payload`,
+   plus `binding` with `native_id` (target UUID), `tag`, `workspace`,
+   `generation`, and `native_created_at_ms` (incarnation; null means unbound).
+   The receiver maps kind/payload EXACTLY to the host function op/body/
+   NativeTarget (`send {body}` -> op send + `await_ack`; `capture {max_bytes}`
+   -> limit/mode; `stop {}` -> op stop) via `session_receiver.receive_once`
+   (`hub sessions host-receive --once`); `start` is rejected (Fleet-owned).
 2. Host claims ONE command: `POST .../claim {correlation, attempt_id}` where
    `attempt_id` is the host's own journaled execution-attempt nonce (one per
-   command per local mutex). The grant is atomic compare-and-swap to
-   `claimed` with holder machine, fresh unpredictable claim token, expiry
-   (default 5 min), and attempt counter. Reclaim with the SAME attempt id
+   command per local mutex, `recv-<command_id>.json` under flock BEFORE any
+   claim). The grant is atomic compare-and-swap to
+   `claimed` with holder machine, fresh unpredictable claim token, generation,
+   expiry (default 5 min, returned as BOTH `expires_at` ISO canonical and
+   `expires_at_ms` int for the host clock), and attempt counter. Reclaim with the SAME attempt id
    replays the token (lost-reply reconciliation by the same attester); any
    other attempt id on the same machine gets `409 already_claimed` and a
    rival machine gets `409 claim_conflict` — one claim authorizes exactly
@@ -126,7 +135,9 @@ Behavior:
 3. Host executes ONLY after the claim, re-verifying the exact binding
    (native UUID + tag + workspace + generation + native_created_at)
    immediately before the effect.
-4. Host acks with `{correlation, outcome, native, claim_token, ...}`. Only
+4. Host acks with `{correlation, outcome, native, claim_token, ...}` where
+   `native` is ALWAYS the target native session triple
+   (`native_id` = bound native session UUID, never an envelope id). Only
    the live claim holder may ack; an ack after lease expiry marks the command
    `uncertain` (the effect may have happened) and is rejected with
    `claim_expired` — never marked delivered, never reissued.
@@ -202,6 +213,8 @@ hub sessions capture <session-id> [--max-bytes 65536] [--key k3] [--wait ...]
 hub sessions stop <session-id> [--key k4] [--wait ...]
 hub sessions show <session-id>
 hub sessions commands <session-id>
+hub sessions host-receive --once --machine-id hetzner [--actor machine:hetzner]
+    [--credential-family host:hetzner] [--journal-dir ABS] [--aplexer-bin aplexer] [--limit 20]
 ```
 
 `--wait` polls boundedly to a terminal state (session: running/stopped/...;

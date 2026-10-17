@@ -68,6 +68,20 @@ records without stopping workloads).
 
 ## Exact remaining wiring / qualification gaps
 
+CORRECTED ack.native semantics (composition fix, authoritative over the
+gitignored `.local/session/HOST-R2-INTERFACE.md` working copy in the original
+host worktree): `ack.native.native_id` is ALWAYS the TARGET NATIVE SESSION
+UUID (binding match: UUID + tag + workspace), NEVER the original message
+envelope id. Envelope ids travel separately — `proof.native_message_id` is the
+original delivered native envelope id, `proof.reply_to_native_id` is the reply
+envelope id (its `reply_to` references the original envelope, never a hub
+`cmd:` string). The server validator (`validateSendProof`) and binding match
+agree on this; the old working copy describing `native_id` as the envelope id
+is WRONG and must not be inferred from old messages. The shared receiver
+(`session_receiver.receive_once` -> `handle_claimed_command`) implements the
+corrected shape; `handle_claimed_command` also accepts the server claim expiry
+as either `expires_at_ms` (int) or `expires_at` (ISO) and normalizes it.
+
 1. **Server claim/ack agreement** (head/API worker): claim issuance on
    `POST /api/session-commands/:id/claim`, ack acceptance on `.../ack` with the
    token, generation source of truth (hub counter echoed + native
