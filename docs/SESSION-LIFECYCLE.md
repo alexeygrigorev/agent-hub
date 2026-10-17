@@ -157,7 +157,13 @@ server eligibility), not a second registry or fake apply.
   server claim holder machine and the stop must already be
   containment-confirmed in the same claimed attempt (no owner-string
   self-comparison anywhere — ownership is the live claim plus enqueue-time
-  custody plus durable ack-time actor recheck). Refuses shared main/bare/root
+  custody plus durable ack-time actor recheck). For flagged cleanup ONLY,
+  the host first saves a bounded pre-stop tail capture (64 KiB) to a private
+  0600 fsync'd journal file outside the cleanup roots
+  (`cleanup-evidence-<command_id>.json`; raw text never reaches the Hub —
+  only the local path is journaled); a failed capture keeps the tree
+  (`evidence_capture_failed`, still acking the confirmed stop) rather than
+  claiming preservation. Refuses shared main/bare/root
   workspaces, symlink/realpath escape, another live session cwd/worktree use
   (terminal native phases excluded, so the target's own exited row never
   self-blocks), any dirty/index/untracked content, locks, branch checked out

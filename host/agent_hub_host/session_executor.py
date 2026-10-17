@@ -987,6 +987,11 @@ def handle_claimed_command(
                   "reason": str(outcome.get("reason", ""))[:300],
                   "expires_at_ms": proved["expires_at_ms"],
                   "server_correlation": _server_correlation(command_id, proved["generation"])}
+        if isinstance(outcome.get("cleanup_evidence_path"), str) and outcome["cleanup_evidence_path"]:
+            # Local durable evidence path only (never in the Hub ack): a lost
+            # ack re-submit replays the identical ack without re-running the
+            # effect, so the same evidence file serves every retry.
+            record["cleanup_evidence_path"] = outcome["cleanup_evidence_path"]
         if isinstance(outcome.get("sender_binding"), dict):
             # Journal the genuine sender binding observed before the effect so
             # read-only reconciliation reads the correct sender mailbox without
@@ -1054,6 +1059,49 @@ def handle_claimed_command(
             record["ack_error"] = str(ack_result["error"])[:120]
         _write_journal(journal_file, record)
         return {"op": op, **record, "ack": ack_result}
+
+
+CLEANUP_EVIDENCE_LIMIT_BYTES = 64 * 1024
+
+
+def _preserve_cleanup_evidence(
+    executable: str,
+    target: NativeTarget,
+    *,
+    custody: CallerCustody,
+    journal_dir: str,
+    command_id: str,
+) -> str:
+    """Save a bounded pre-stop capture of the cleanup target (flagged cleanup ONLY).
+
+    Runs a bounded tail capture (64 KiB) against the exact qualified target
+    BEFORE any native stop, and persists it as a private 0600 fsync'd journal
+    file OUTSIDE the cleanup roots (``cleanup-evidence-<command_id>.json``
+    beside the receiver journals, never under a cleanup root). The raw text
+    never leaves the host (never in the Hub ack, never in logs): callers
+    report only kept/removed with a generic reason. Returns the evidence path.
+    Raises SessionControlError/SessionUncertain when the capture itself fails —
+    callers then keep (never delete) the tree rather than claim preservation.
+    """
+    _check_custody(custody)
+    if not isinstance(command_id, str) or not command_id:
+        raise SessionControlError("Command id is required for cleanup evidence")
+    cap = capture_session_output(executable, target, custody=custody,
+                                 limit_bytes=CLEANUP_EVIDENCE_LIMIT_BYTES, mode="tail")
+    text = cap.get("text", "")
+    if not isinstance(text, str):
+        raise SessionControlError("Cleanup evidence capture returned no text; refusing")
+    record = {"op": "cleanup-evidence", "command_id": command_id,
+              "native_id": target.session_id, "tag": target.tag,
+              "workspace": target.workspace,
+              "byte_length": cap.get("byte_length"), "truncated": bool(cap.get("truncated", False)),
+              "text": text[:CLEANUP_EVIDENCE_LIMIT_BYTES]}
+    path = _journal_path(journal_dir, "cleanup-evidence-" + command_id)
+    # Fail closed when the evidence file would land inside a cleanup root is
+    # enforced by construction: journal_dir is never under a cleanup root
+    # (receiver invariant; see session_cleanup module docstring).
+    _write_journal(path, record)
+    return path
 
 
 def _run_cleanup_tree_after_stop(
@@ -1191,25 +1239,49 @@ def _run_claimed_effect(
                 "capture_text": cap["text"], "capture_truncated": cap["truncated"],
                 "reason": "bounded private projection; privacy unknown, truncated=%s"
                           % cap["truncated"]}
+    want_tree = cleanup_tree_authorized is True and cleanup_roots is not None
+    evidence_path: Optional[str] = None
+    evidence_error: Optional[str] = None
+    if want_tree:
+        # Flagged cleanup ONLY: preserve a bounded pre-stop capture to the
+        # private journal BEFORE the native stop. Ordinary stops never
+        # capture here. A failed/unknown capture keeps the tree (never
+        # deletes) rather than claiming preservation.
+        try:
+            evidence_path = _preserve_cleanup_evidence(
+                executable, target, custody=custody, journal_dir=journal_dir,
+                command_id=str(command["command_id"]))
+        except (SessionControlError, SessionUncertain) as exc:
+            evidence_error = str(exc)[:200]
+        except Exception as exc:
+            evidence_error = "evidence_capture_%s" % type(exc).__name__
     stopped = stop_controlled_session(executable, target, custody=custody)
     confirmed = stopped["state"] == "stopped"
     outcome: dict[str, Any] = {
         "state": stopped["state"], "ack_outcome": "delivered" if confirmed else "uncertain",
         "native_id": None, "reply_envelope_id": None, "reason": stopped["reason"],
         "confirmed_exit": confirmed}
+    if evidence_path is not None:
+        outcome["cleanup_evidence_path"] = evidence_path
     # M15d owning-host tree (STOP-bundled, same claim, no second controller):
     # after a containment-confirmed stop, remove the session's own dedicated
     # worktree derived ONLY from the canonical binding workspace + HOST-config
     # roots + live native identity + discovered registered branch, and ONLY
-    # when the server claim explicitly authorized it (cleanup_tree is True).
-    # Ordinary stops NEVER run the tree even with roots configured: roots are
-    # confinement, not target authority. The tree never gates the stop
-    # verdict: kept/uncertain trees ride the stop ack as data while the stop
-    # itself still reports its confirmed outcome.
-    if confirmed and cleanup_tree_authorized is True and cleanup_roots is not None:
-        outcome["tree"] = _run_cleanup_tree_after_stop(
-            executable, target, custody=custody, journal_dir=journal_dir,
-            cleanup_roots=cleanup_roots, command_id=str(command["command_id"]))
+    # when the server claim explicitly authorized it (cleanup_tree is True)
+    # AND pre-stop evidence was durably preserved. Ordinary stops NEVER run
+    # the tree even with roots configured: roots are confinement, not target
+    # authority. The tree never gates the stop verdict: kept/uncertain trees
+    # ride the stop ack as data while the stop itself still reports its
+    # confirmed outcome. Raw evidence text never enters the ack.
+    if confirmed and want_tree:
+        if evidence_error is not None or evidence_path is None:
+            outcome["tree"] = {"state": "kept",
+                               "reason": ("evidence_capture_failed: %s; listed-only"
+                                          % (evidence_error or "unknown"))[:300]}
+        else:
+            outcome["tree"] = _run_cleanup_tree_after_stop(
+                executable, target, custody=custody, journal_dir=journal_dir,
+                cleanup_roots=cleanup_roots, command_id=str(command["command_id"]))
     return outcome
 
 
