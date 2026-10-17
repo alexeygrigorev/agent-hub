@@ -1,11 +1,13 @@
-# M14 Status API (`GET /api/status`) and `hub status` CLI
+# M14 Status API (`GET /api/status`, `POST /api/status/observations`) and `hub status` CLI
 
 M14a shipped: one authorized read projection over existing canonical records.
 M14b slice1 shipped: canonical intake-assigned Hub sessions (`hub_session_id`
 links into `session_control_sessions`) with live SessionControl state plus
-the M15 lifecycle group/decision per bound session. M14b report-collector
-mapping, M14c (verified Git/active deployment/CI adapters) and M14d
-(durable caller-scoped last-call diffs) remain explicit successor work.
+the M15 lifecycle group/decision per bound session. M14b slice2 shipped:
+machine-authenticated host observations (session states, sanitized report
+headlines) bound to the current canonical session/machine. M14c (verified
+Git/active deployment/CI adapters) and M14d (durable caller-scoped last-call
+diffs) remain explicit successor work.
 
 ## Endpoint
 
@@ -67,8 +69,12 @@ second tracker). No raw terminal, prompt, draft or report-body reads.
   and per-row provenance `{source: session_control_canonical_row, ...}`.
 - `lifecycle_summary` per task: `{by_group: {group: count}, decisions[<=10]}`
   over visible `hub_session` links only.
-- `reports[]`: `{reference, source}` plus `headline: unknown`,
-  `verdict: unknown` with `successor: M14b`.
+- `reports[]`: `{reference, source}` plus `headline`/`verdict`: `unknown`
+  until an allowlisted host reader posts a sanitized headline observation for
+  a visible linked session (then `collected_host_reported`, coverage
+  `partial`; observations never synthesize report entries). Headlines are
+  bounded ≤240 chars, control-stripped and token-redacted server-side;
+  transcripts, tokens and screens are never stored.
 - `commits[]`: `{reference, source}` plus `deploy_state: unknown`,
   `ci_state: unknown` with `successor: M14c`. A linked commit or CI green is
   never deploy proof.
@@ -81,6 +87,36 @@ second tracker). No raw terminal, prompt, draft or report-body reads.
   with honest `unknown` for uncollected successors. `tasks_sessions.source`
   now reads
   `intake_tasks+routing_jobs+fleet_launches+fleet_sessions+session_control_sessions+lifecycle`.
+
+## Observation transport (M14b slice2)
+
+`POST /api/status/observations` — machine-authenticated host transport for
+session states (`working/waiting/context_low/limit_hit/draft_pending/idle/
+unknown`), sanitized report headlines, and probe evidence (`probe_git/
+probe_ci/probe_deploy`). Additive `status_observations` table (created in
+`StatusService.init`, `IF NOT EXISTS`); no task/session registry
+duplication, no canonical task mutation, `intake_meta.revision` untouched.
+
+Auth (resolved by Hub BEFORE the mutation transaction): a verified host
+credential (`host` scope, kind `host`) names ONLY its own machine, or an
+admin operator record (admin session + CSRF, or the operator token
+fallback). Agent/job/root bearers carry no observation authority. Inside
+the transaction the CURRENT canonical `session_control_sessions` row must
+exist and belong to the reporting machine (`hub_session_id` directly, or
+exactly one `binding_json.native_id` match for `native_id`; zero or
+ambiguous matches fail closed). The injected
+`SessionControlService.hostObservationAllowed(machineId, caller)` gate
+(existing fresh host family/approval authority) must then allow the write;
+while the helper is absent every write fails closed (`503
+observation_auth_unavailable`). JSON machine/owner flags never authorize.
+Unknown payload fields fail closed; timestamps require explicit `Z`/offset,
+reject future skew and >30d age; per-(session, kind) history is bounded to
+the latest 20 rows.
+
+Reads join the latest observation per (session, kind) onto already-visible
+`hub_sessions[]` entries only (`host_observation`, `report_headline`, each
+`host_reported: true` with `source: host_observation` provenance). Host
+fields stay data, never operator instructions.
 
 ## Pagination and `--since`
 

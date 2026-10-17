@@ -20,7 +20,7 @@ import { approvalAuthorityMatches, assignApprovalAuthority } from './host_enroll
 import { ensureRootScheduling, getRootScheduling, isRootSchedulingEnabled, setRootScheduling } from './root_scheduling';
 import { QuotaStore, handleQuotaRoutes } from './quota';
 import { SessionControlService } from './session_control';
-import { StatusService } from './status';
+import { StatusService, type StatusMachineAuth } from './status';
 
 function parseEpoch(raw: any): number | null {
   if (raw === undefined || raw === null || raw === '' || typeof raw === 'boolean') return null;
@@ -112,6 +112,7 @@ export class Hub extends DurableObject {
     });
     this.intakeService.init();
     this.statusService = new StatusService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.intakeService);
+    this.statusService.init();
     this.busService = new BusService(this.sql, txSync);
     this.fleetService = new FleetService(this.sql, fn => this.ctx.storage.transactionSync(fn));
     this.fleetService.init();
@@ -122,6 +123,17 @@ export class Hub extends DurableObject {
       reserve: (input, auth) => this.fleetService.reserve(input, auth),
     });
     this.sessionControlService.init();
+    // M14b slice2 (narrow STATUS composition): observation writes are gated
+    // by the live SessionControlService.hostObservationAllowed (existing
+    // fresh host family/approval authority, owned by the cleanup worker).
+    // Feature-detected: while the helper is absent the gate is undefined
+    // and StatusService fails every observation write closed.
+    {
+      const sessionControl: any = this.sessionControlService as any;
+      this.statusService.setObservationGate(typeof sessionControl?.hostObservationAllowed === 'function'
+        ? (machineId: unknown, caller: any) => sessionControl.hostObservationAllowed(machineId, caller)
+        : undefined);
+    }
     this.livenessService = new LivenessService(this.sql, thresholdsFrom(env));
     this.livenessService.init();
     this.checksService = new ChecksService(this.sql);
@@ -382,6 +394,11 @@ export class Hub extends DurableObject {
           }
           return auth;
         });
+      }
+      if (path === '/api/status/observations') {
+        const resolved = await this.statusObservationAuth(request);
+        if ((resolved as any).error) return (resolved as any).error;
+        return this.statusService.handleObservation(request, (resolved as any).auth);
       }
       if (path === '/api/status') {
         return this.statusService.handle(request, async () => {
@@ -1386,6 +1403,47 @@ export class Hub extends DurableObject {
   /** M12e session control auth (narrow seam, owned by platform-session-api-r2):
    * identical to the intake mount: mixed-authority refusal, bus credentials,
    * narrow operator-token fallback, cookie session actor fix. */
+  /** M14b slice2 (narrow STATUS composition): resolve observation transport
+   * authority BEFORE the mutation transaction. Host transport first: a
+   * verified host credential names ONLY its own machine (JSON machine/owner
+   * flags never authorize). Otherwise only an admin operator record: the
+   * existing admin session (CSRF enforced for this POST inside
+   * authenticateBusRequest) or the existing operator token fallback. Agent,
+   * job and root bearers carry no observation authority. */
+  private async statusObservationAuth(request: Request): Promise<{ auth: StatusMachineAuth } | { error: Response }> {
+    if (request.headers.has('Authorization') && request.headers.has('Cookie')) {
+      return { error: Response.json({ error: 'mixed_authority' }, { status: 403 }) };
+    }
+    const hostCred = await verifyBearerScope(this.sql, request.headers.get('Authorization'), 'host', { kind: 'host' });
+    if (hostCred && typeof hostCred.machine_id === 'string' && hostCred.machine_id) {
+      return { auth: { kind: 'host', machine_id: hostCred.machine_id, tokenId: hostCred.id } };
+    }
+    const auth = await this.authenticateBusRequest(request);
+    if (!auth.error && (auth.caller as any)?.isAdmin) {
+      return { auth: { kind: 'admin', actor: (auth.caller as any)?.actor || 'admin' } };
+    }
+    if (!request.headers.has('Cookie') && validSessionSecret(this.env)) {
+      const header = request.headers.get('Authorization') || '';
+      const token = /^Bearer ([^\s]{1,4096})$/.exec(header)?.[1];
+      if (token) {
+        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token));
+        const given = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+        // A registered non-admin credential never upgrades: only the
+        // configured operator token passes here.
+        if (!this.sql.exec('SELECT id FROM credentials WHERE token_hash=?', base64url(digest)).toArray().length) {
+          const configured = adminTokenHash(this.env);
+          if (configured) {
+            let difference = 0;
+            for (let i = 0; i < configured.length; i++) difference |= given.charCodeAt(i) ^ configured.charCodeAt(i);
+            if (difference === 0) return { auth: { kind: 'admin', actor: 'human:' + tokenAdminSubject(configured) } };
+          }
+        }
+      }
+    }
+    if (auth.error) return { error: auth.error };
+    return { error: Response.json({ error: 'unauthorized_or_forbidden' }, { status: 403 }) };
+  }
+
   private async sessionControlAuth(request: Request) {
     if (request.headers.has('Authorization') && request.headers.has('Cookie')) return { error: Response.json({ error: 'mixed_authority' }, { status: 403 }) };
     const auth = await this.authenticateBusRequest(request);

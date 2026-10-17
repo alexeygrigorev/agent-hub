@@ -68,6 +68,32 @@ function seedCanonicalChain(jobId: string, launchId: string, machine: string, na
   });
 }
 
+function seedHostMachine(machine: string, token: string, family = 'host-family-' + ++seq): Promise<any> {
+  return (async () => {
+    const hash = await sha256(token);
+    const id = 'host-credential-' + seq;
+    await inDO(stub(), (h: any) => {
+      const now = new Date().toISOString();
+      const future = new Date(Date.now() + 86400000).toISOString();
+      h.sql.exec('INSERT OR REPLACE INTO credentials(id,kind,token_hash,refresh_hash,family_id,subject,machine_id,actor,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+        id, 'host', hash, null, family, 'host:' + machine, machine, 'host:' + machine, '["host"]', 'fixture-operator', now, future);
+      h.sql.exec("INSERT OR REPLACE INTO machines(id,name,hostname,registered_at,last_checkin_at,drained,credential_id) VALUES (?,?,?,?,?,0,?)",
+        machine, machine, machine, now, now, id);
+    });
+    return { id, token, family, machine };
+  })();
+}
+async function obsCall(payload: any, bearer?: string, csrf = 'csrf') {
+  return SELF.fetch('https://hub.test/api/status/observations', { method: 'POST',
+    headers: { ...(bearer ? { Authorization: 'Bearer ' + bearer } : { Cookie: cookie, 'x-csrf-token': csrf }), 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload) });
+}
+async function obsOk(payload: any, bearer?: string, csrf = 'csrf'): Promise<any> {
+  const res = await obsCall(payload, bearer, csrf);
+  const data = await res.json();
+  expect(res.status, JSON.stringify(data)).toBe(200);
+  return data;
+}
 function seedHubSession(sessionId: string, actor: string, machine: string, state: string, native: string | null) {
   return inDO(stub(), (h: any) => {
     const now = new Date().toISOString();
@@ -94,6 +120,7 @@ beforeEach(async () => {
     try { h.sql.exec('DELETE FROM session_control_commands'); } catch {}
     try { h.sql.exec('DELETE FROM session_lifecycle_observations'); } catch {}
     try { h.sql.exec('DELETE FROM session_lifecycle_decisions'); } catch {}
+    try { h.sql.exec('DELETE FROM status_observations'); } catch {}
   });
 });
 
@@ -290,5 +317,122 @@ describe('M14a authorized one-call status projection', () => {
     expect(dumped).not.toContain('"device_code_hash"');
     const row = data.tasks.find((t: any) => t.id === task.id);
     expect(JSON.stringify(row)).not.toContain('Private body');
+  });
+});
+
+describe('M14b slice2 machine-authenticated host observations', () => {
+  const HUB_SESSION = '55555555-5555-4335-8335-555555555555';
+  const freshAt = () => new Date().toISOString();
+  async function seedLinkedTask(machine: string, native: string) {
+    await seedHubSession(HUB_SESSION, 'demo:assistant', machine, 'running', native);
+    const { task } = await createTask();
+    const linked = await intakeOk('/tasks/' + task.id + '/events', { key: 'hub-link-obs-' + ++seq, expected_version: 1,
+      event: { kind: 'link', hub_session_id: HUB_SESSION, provenance: source } });
+    void linked;
+    await intakeOk('/tasks/' + task.id + '/events', { key: 'rep-obs-' + ++seq, expected_version: 2,
+      event: { kind: 'report', reference: 'reports/synthetic.md', source } });
+    return task;
+  }
+
+  it('accepts host observations and surfaces sanitized host-reported fields', async () => {
+    const host = await seedHostMachine('host-obs', 'hubt_obs_fixture_token_1');
+    const task = await seedLinkedTask('host-obs', 'native-obs-1');
+    const before = await inDO(stub(), (h: any) => ({
+      revision: h.sql.exec('SELECT revision FROM intake_meta WHERE id=1').toArray()[0].revision,
+      tasks: h.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks').toArray()[0].n,
+    }));
+    const sess = await obsOk({ machine_id: 'host-obs', hub_session_id: HUB_SESSION, kind: 'session',
+      observed_at: freshAt(), payload: { state: 'limit_hit', note: 'Weekly limit exhausted' } }, host.token);
+    expect(sess).toMatchObject({ hub_session_id: HUB_SESSION, kind: 'session', host_reported: true, reporter: 'host:host-obs' });
+    const rep = await obsOk({ machine_id: 'host-obs', hub_session_id: HUB_SESSION, kind: 'report',
+      observed_at: freshAt(), payload: { headline: 'Synthetic\x1b[2J headline hubt_fixture_leaked_token_value', verdict: 'attention' } }, host.token);
+    expect(rep.kind).toBe('report');
+    const data = await ok('');
+    const row = data.tasks.find((t: any) => t.id === task.id);
+    const hub = row.hub_sessions.find((h: any) => h.hub_session_id === HUB_SESSION);
+    expect(hub.host_observation).toMatchObject({ state: 'limit_hit', host_reported: true });
+    expect(hub.host_observation.provenance.source).toBe('host_observation');
+    expect(hub.report_headline.headline).toContain('Synthetic');
+    expect(hub.report_headline.headline).not.toContain('\x1b');
+    expect(hub.report_headline.headline).not.toContain('hubt_fixture_leaked_token_value');
+    expect(row.reports[0].headline).toContain('Synthetic');
+    expect(data.categories.reports.state).toBe('collected_host_reported');
+    const after = await inDO(stub(), (h: any) => ({
+      revision: h.sql.exec('SELECT revision FROM intake_meta WHERE id=1').toArray()[0].revision,
+      tasks: h.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks').toArray()[0].n,
+    }));
+    expect(after).toEqual(before);
+    expect(JSON.stringify(data)).not.toContain('hubt_fixture_leaked_token_value');
+  });
+
+  it('resolves native_id to the current canonical session and rejects ambiguity', async () => {
+    const host = await seedHostMachine('host-native', 'hubt_obs_fixture_token_2');
+    await seedLinkedTask('host-native', 'native-resolve-1');
+    const via = await obsOk({ machine_id: 'host-native', native_id: 'native-resolve-1', kind: 'session',
+      observed_at: freshAt(), payload: { state: 'working' } }, host.token);
+    expect(via.hub_session_id).toBe(HUB_SESSION);
+    const missing = await obsCall({ machine_id: 'host-native', native_id: 'no-such-native', kind: 'session',
+      observed_at: freshAt(), payload: { state: 'working' } }, host.token);
+    expect(missing.status).toBe(404);
+    // Second canonical row bound to the same native identity: ambiguous, fail closed.
+    await inDO(stub(), (h: any) => {
+      const now = new Date().toISOString();
+      h.sql.exec('INSERT OR REPLACE INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+        '66666666-6666-4336-8336-666666666666', 'demo:assistant', 'key-dup', '{}', null, 'host-native', 'opencode', 'headless', 'running',
+        JSON.stringify({ native_id: 'native-resolve-1' }), now, now);
+    });
+    const ambiguous = await obsCall({ machine_id: 'host-native', native_id: 'native-resolve-1', kind: 'session',
+      observed_at: freshAt(), payload: { state: 'working' } }, host.token);
+    expect(ambiguous.status).toBe(409);
+  });
+
+  it('rejects forged machines, unknown sessions, bad payloads and non-host callers', async () => {
+    const host = await seedHostMachine('host-guard', 'hubt_obs_fixture_token_3');
+    await seedHostMachine('host-other', 'hubt_obs_fixture_token_4');
+    await seedLinkedTask('host-guard', 'native-guard-1');
+    const good = { machine_id: 'host-guard', hub_session_id: HUB_SESSION, kind: 'session', observed_at: freshAt(), payload: { state: 'working' } };
+    // JSON machine claim for another machine never authorizes this credential.
+    expect((await obsCall({ ...good, machine_id: 'host-other' }, host.token)).status).toBe(403);
+    // Unknown canonical session.
+    expect((await obsCall({ ...good, hub_session_id: '77777777-7777-4337-8337-777777777777' }, host.token)).status).toBe(404);
+    // Unknown fields, bad enums and bad timestamps fail closed.
+    expect((await obsCall({ ...good, payload: { state: 'working', owner: 'mallory' } }, host.token)).status).toBe(400);
+    expect((await obsCall({ ...good, payload: { state: 'hacked' } }, host.token)).status).toBe(400);
+    expect((await obsCall({ ...good, observed_at: '2030-01-01T00:00:00.000Z' }, host.token)).status).toBe(400);
+    expect((await obsCall({ ...good, observed_at: 'not-a-time' }, host.token)).status).toBe(400);
+    expect((await obsCall({ ...good, kind: 'exec' }, host.token)).status).toBe(400);
+    expect((await obsCall({ machine_id: 'host-guard', kind: 'session', observed_at: freshAt(), payload: { state: 'working' } }, host.token)).status).toBe(400);
+    // Agent credentials carry no observation authority.
+    const agent = await seedAgent('demo:assistant-obs');
+    await grant(agent);
+    expect((await obsCall(good, agent.token)).status).toBe(403);
+    expect((await obsCall(good, 'hubt_bogus')).status).toBe(401);
+  });
+
+  it('fails closed while the observation gate is absent', async () => {
+    const host = await seedHostMachine('host-gate', 'hubt_obs_fixture_token_5');
+    await seedLinkedTask('host-gate', 'native-gate-1');
+    const good = { machine_id: 'host-gate', hub_session_id: HUB_SESSION, kind: 'session', observed_at: freshAt(), payload: { state: 'working' } };
+    await inDO(stub(), (h: any) => { h.statusService.setObservationGate(undefined); });
+    try {
+      const res = await obsCall(good, host.token);
+      expect(res.status).toBe(503);
+      expect((await res.json()).error).toBe('observation_auth_unavailable');
+    } finally {
+      await inDO(stub(), (h: any) => {
+        h.statusService.setObservationGate((m: unknown, c: any) => h.sessionControlService.hostObservationAllowed(m, c));
+      });
+    }
+    expect((await obsCall(good, host.token)).status).toBe(200);
+  });
+
+  it('accepts admin operator records with CSRF and rejects without', async () => {
+    await seedHostMachine('host-admin', 'hubt_obs_fixture_token_6');
+    await seedLinkedTask('host-admin', 'native-admin-1');
+    const good = { machine_id: 'host-admin', hub_session_id: HUB_SESSION, kind: 'session', observed_at: freshAt(), payload: { state: 'waiting' } };
+    const noCsrf = await obsCall(good, undefined, 'wrong');
+    expect(noCsrf.status).toBe(403);
+    const recorded = await obsOk(good);
+    expect(recorded.reporter).toContain('operator:');
   });
 });

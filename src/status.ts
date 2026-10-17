@@ -65,8 +65,128 @@ function freshnessOf(observedAt: unknown, now: number, ttlMs: number): 'fresh' |
   return now - t <= ttlMs ? 'fresh' : 'stale';
 }
 
+/** M14b slice2: gate injected from Hub, bound to the live
+ * SessionControlService.hostObservationAllowed (existing fresh host
+ * family/approval authority). Feature-detected: Hub passes undefined while
+ * the helper is absent and every observation write fails closed. */
+export type HostObservationGate = (
+  machineId: unknown,
+  caller: { kind?: string; actor?: string; isAdmin?: boolean; machineId?: string; tokenId?: string },
+) => boolean;
+
+/** Machine-authenticated observation transport, resolved by Hub BEFORE the
+ * mutation transaction (host credential verify is async + restamps
+ * last_used_at, so it can never run inside transactionSync). */
+export type StatusMachineAuth =
+  | { kind: 'host'; machine_id: string; tokenId: string }
+  | { kind: 'admin'; actor: string };
+
+/** Dedicated additive observation table. No task/session registry
+ * duplication: rows key the CURRENT canonical session_control row and its
+ * machine; task linkage is always re-resolved at read time. */
+export const STATUS_OBSERVATION_SCHEMA = `
+CREATE TABLE IF NOT EXISTS status_observations(
+  id TEXT PRIMARY KEY,
+  machine_id TEXT NOT NULL,
+  hub_session_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  reporter TEXT NOT NULL,
+  received_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_status_obs_session ON status_observations(hub_session_id, kind, observed_at);
+`;
+
+export const OBSERVATION_KINDS = ['session', 'report', 'probe_git', 'probe_ci', 'probe_deploy'] as const;
+const SESSION_STATES = ['working', 'waiting', 'context_low', 'limit_hit', 'draft_pending', 'idle', 'unknown'];
+const REPORT_VERDICTS = ['done', 'attention', 'unknown'];
+const GIT_ANCESTRY = ['merged_in_main', 'not_merged', 'unknown'];
+const CI_STATES = ['passing', 'failing', 'unknown'];
+const DEPLOY_STATES = ['deployed', 'not_deployed', 'unknown'];
+const SHA40 = /^[0-9a-f]{40}$/i;
+const CONTROL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u202e\ufeff]/g;
+const TOKEN_RES = [/hub[tr]_[A-Za-z0-9_-]{8,}/g, /gh[pousr]_[A-Za-z0-9]{8,}/g, /AKIA[0-9A-Z]{16}/g, /xox[bpras]-[A-Za-z0-9-]+/g, /Bearer\s+[A-Za-z0-9._~+/-]+/gi];
+
+function cleanText(value: unknown, max: number): string {
+  const s = String(value ?? '').replace(CONTROL_RE, '');
+  let out = s;
+  for (const re of TOKEN_RES) { re.lastIndex = 0; out = out.replace(re, '[redacted]'); }
+  return out.length <= max ? out : out.slice(0, max);
+}
+function strictEnum(value: unknown, allowed: readonly string[], field: string): string {
+  if (typeof value !== 'string' || !allowed.includes(value)) fail('invalid_observation_' + field);
+  return value;
+}
+/** Per-kind allowlisted payload. Unknown fields fail closed; every string is
+ * sanitized (control chars stripped, token shapes redacted, bounded). Host
+ * data stays data: headlines/notes are never trusted instructions. */
+function checkObservationPayload(kind: string, raw: unknown): Obj {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) fail('invalid_observation_payload');
+  const p = raw as Obj;
+  if (kind === 'session') {
+    const keys = Object.keys(p);
+    if (!keys.includes('state') || keys.some(k => !['state', 'note'].includes(k))) fail('invalid_observation_payload');
+    return { state: strictEnum(p.state, SESSION_STATES, 'state'), ...(typeof p.note === 'string' ? { note: cleanText(p.note, 240) } : {}) };
+  }
+  if (kind === 'report') {
+    const keys = Object.keys(p);
+    if (!keys.includes('headline') || keys.some(k => !['headline', 'verdict', 'reference'].includes(k))) fail('invalid_observation_payload');
+    if (typeof p.headline !== 'string' || !p.headline.trim()) fail('invalid_observation_headline');
+    return { headline: cleanText(p.headline, 240),
+      verdict: p.verdict === undefined ? 'unknown' : strictEnum(p.verdict, REPORT_VERDICTS, 'verdict'),
+      ...(typeof p.reference === 'string' ? { reference: cleanText(p.reference, 512) } : {}) };
+  }
+  if (kind === 'probe_git') {
+    const keys = Object.keys(p);
+    if (!keys.includes('sha') || !keys.includes('ancestry') || keys.some(k => !['sha', 'ancestry', 'ref'].includes(k))) fail('invalid_observation_payload');
+    if (typeof p.sha !== 'string' || !SHA40.test(p.sha)) fail('invalid_observation_sha');
+    return { sha: p.sha.toLowerCase(), ancestry: strictEnum(p.ancestry, GIT_ANCESTRY, 'ancestry'),
+      ...(typeof p.ref === 'string' ? { ref: cleanText(p.ref, 128) } : {}) };
+  }
+  if (kind === 'probe_ci') {
+    const keys = Object.keys(p);
+    if (!keys.includes('state') || keys.some(k => !['state', 'run'].includes(k))) fail('invalid_observation_payload');
+    return { state: strictEnum(p.state, CI_STATES, 'state'),
+      ...(typeof p.run === 'string' ? { run: cleanText(p.run, 256) } : {}) };
+  }
+  if (kind === 'probe_deploy') {
+    const keys = Object.keys(p);
+    if (!keys.includes('state') || keys.some(k => !['state', 'deployment', 'sha'].includes(k))) fail('invalid_observation_payload');
+    if (p.sha !== undefined && (typeof p.sha !== 'string' || !SHA40.test(p.sha))) fail('invalid_observation_sha');
+    return { state: strictEnum(p.state, DEPLOY_STATES, 'state'),
+      ...(typeof p.deployment === 'string' ? { deployment: cleanText(p.deployment, 256) } : {}),
+      ...(typeof p.sha === 'string' ? { sha: p.sha.toLowerCase() } : {}) };
+  }
+  fail('invalid_observation_kind');
+  throw new Error('unreachable');
+}
+function strictObservedAt(value: unknown, now: number): string {
+  if (typeof value !== 'string' || !(/Z|[+-]\d{2}:?\d{2}$/.test(value))) fail('invalid_observation_time');
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) fail('invalid_observation_time');
+  if (ms > now + 60000) fail('future_observation');
+  if (ms < now - 30 * 86400000) fail('stale_observation');
+  return new Date(ms).toISOString();
+}
+
 export class StatusService {
   constructor(private sql: SqlStorage, private tx: Tx, private intake: IntakeService, private now: () => number = Date.now) {}
+  private gate?: HostObservationGate;
+
+  /** Additive table init only (IF NOT EXISTS). Called from Hub construction. */
+  init(): void {
+    for (const statement of STATUS_OBSERVATION_SCHEMA.split(';')) {
+      const trimmed = statement.trim();
+      if (trimmed) this.sql.exec(trimmed);
+    }
+  }
+
+  /** Hub injects the live SessionControlService.hostObservationAllowed here
+   * (or undefined while absent). Never duplicated, never trusted blindly. */
+  setObservationGate(gate: HostObservationGate | undefined): void {
+    this.gate = gate;
+  }
 
   private rows(query: string, ...params: any[]): Obj[] {
     return (this.sql.exec(query, ...params).toArray() as any[]).map(r => ({ ...r }));
@@ -126,6 +246,8 @@ export class StatusService {
         const machines = new Map(this.rows('SELECT id, hostname, last_checkin_at, drained FROM machines').map(m => [m.id, m]));
         const lifecycleBySession = this.lifecycleBySessionId(now);
         const items = page.map(task => this.taskDto(task, p, machines, now, nowIso, sinceMs, hostFilter, lifecycleBySession));
+        this.attachObservations(items, now, nowIso);
+        const reportsCollected = items.some(t => (t.reports ?? []).some((r: Obj) => r.headline !== 'unknown'));
         const { missing: missingHosts, expectedOffline } = this.missingHosts(machines, now);
         const sessionCoverage = missingHosts.length ? 'partial' : 'complete';
         const offlineWindowActive = expectedOfflineWindowActive(now);
@@ -141,7 +263,9 @@ export class StatusService {
             reason: missingHosts.length ? 'one_or_more_hosts_stale_or_unreachable' : expectedOffline.length ? 'all_unexpected_hosts_fresh_expected_offline_excluded' : 'all_known_hosts_fresh' },
           categories: {
             tasks_sessions: { state: missingHosts.length ? 'partial' : 'collected', source: 'intake_tasks+routing_jobs+fleet_launches+fleet_sessions+session_control_sessions+lifecycle', observed_at: nowIso, freshness: 'fresh', coverage: sessionCoverage, reason: 'canonical_hub_session_links_with_live_control_state_and_lifecycle' },
-            reports: { state: 'unknown_not_collected', source: 'intake_history_report_reference_only', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'headline_collection_requires_M14b_allowlisted_host_reader', successor: 'M14b' },
+            reports: reportsCollected
+              ? { state: 'collected_host_reported', source: 'host_observation_sanitized_headline', observed_at: nowIso, freshness: 'fresh', coverage: 'partial', reason: 'allowlisted_host_reader_headlines_only_transcripts_tokens_never_stored' }
+              : { state: 'unknown_not_collected', source: 'intake_history_report_reference_only', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'headline_collection_requires_M14b_allowlisted_host_reader', successor: 'M14b' },
             commits_deploys_ci: { state: 'unknown_not_collected', source: 'intake_history_commit_reference_only', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'verified_git_ancestry_active_deployment_ci_adapters_require_M14c', successor: 'M14c' },
             pending_actions: { state: 'collected_intake_only', source: 'intake_unresolved_followup_blocker_pending_approval', observed_at: nowIso, freshness: 'fresh', coverage: 'complete', reason: 'login_user_codes_withheld_in_this_cut_device_tokens_never_exported', successor: 'M14c_login_metadata' },
             diff: { state: 'not_available', source: 'caller_scoped_baseline_store_absent', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'M14d_durable_caller_baseline_not_yet_collected_since_filters_only', successor: 'M14d' },
@@ -154,6 +278,176 @@ export class StatusService {
       const status = e?.status || 500;
       if (status === 500) return Response.json({ error: code }, { status, headers: { 'Cache-Control': 'private, no-store' } });
       return Response.json({ error: code }, { status, headers: { 'Cache-Control': 'private, no-store' } });
+    }
+  }
+
+  /** POST /api/status/observations: machine-authenticated host transport.
+   * machineAuth is resolved by Hub BEFORE the transaction. Inside the
+   * mutation transaction we require: verified host scope AND the CURRENT
+   * canonical session_control row bound to that machine (hub_session_id
+   * directly, or exactly one binding_json.native_id match for native_id).
+   * JSON machine/owner flags never authorize: only the verified credential
+   * plus the canonical row plus the injected hostObservationAllowed gate.
+   * Host fields stay marked host_reported, never operator instructions.
+   * Canonical task state is never mutated; intake revision is untouched. */
+  async handleObservation(request: Request, machineAuth: StatusMachineAuth | { error: Response }): Promise<Response> {
+    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
+    try {
+      if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
+      if ((machineAuth as any).error) {
+        const code = ((machineAuth as any).error as Response).status || 401;
+        return json({ error: 'unauthorized_or_forbidden' }, code);
+      }
+      const auth = machineAuth as StatusMachineAuth;
+      let body: any = null;
+      try { body = await request.json(); } catch { fail('malformed_json'); }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) fail('malformed_json');
+      return this.tx(() => {
+        const now = this.now();
+        const keys = Object.keys(body);
+        const hasHub = typeof body.hub_session_id === 'string';
+        const hasNative = typeof body.native_id === 'string';
+        if ((hasHub ? 1 : 0) + (hasNative ? 1 : 0) !== 1) fail('invalid_observation_target');
+        if (keys.some(k => !['machine_id', 'hub_session_id', 'native_id', 'kind', 'observed_at', 'payload'].includes(k))) fail('invalid_observation_payload');
+        if (typeof body.machine_id !== 'string' || !LABEL_RE.test(body.machine_id)) fail('invalid_observation_machine');
+        if (typeof body.kind !== 'string' || !(OBSERVATION_KINDS as readonly string[]).includes(body.kind)) fail('invalid_observation_kind');
+        const observedAt = strictObservedAt(body.observed_at, now);
+        const payload = checkObservationPayload(body.kind, body.payload);
+        // Verified scope: a host credential only ever speaks for its own
+        // machine; JSON machine_id claims never upgrade authority.
+        if (auth.kind === 'host' && body.machine_id !== auth.machine_id) fail('observation_forbidden', 403);
+        // Canonical binding: the session row must exist NOW and belong to
+        // the reporting machine. Deleted/rebound rows bind nothing.
+        let sessionId: string;
+        if (hasHub) {
+          if (!SESSION_UUID.test(body.hub_session_id)) fail('invalid_observation_target');
+          const row = this.sessionControlRow(body.hub_session_id);
+          if (!row || row.machine_id !== body.machine_id) fail('unknown_session', 404);
+          sessionId = body.hub_session_id;
+        } else {
+          if (!body.native_id || body.native_id.length > 256) fail('invalid_observation_target');
+          sessionId = this.resolveSessionByNative(body.machine_id, body.native_id);
+        }
+        // Injected family/approval gate (fail closed while absent).
+        let reporter: string;
+        if (auth.kind === 'admin') {
+          reporter = 'operator:' + auth.actor;
+        } else {
+          if (typeof this.gate !== 'function') fail('observation_auth_unavailable', 503);
+          const allowed = this.gate(body.machine_id, { kind: 'host', machineId: auth.machine_id, tokenId: auth.tokenId });
+          if (!allowed) fail('observation_forbidden', 403);
+          reporter = 'host:' + body.machine_id;
+        }
+        const id = crypto.randomUUID();
+        const receivedAt = new Date(now).toISOString();
+        this.sql.exec('INSERT INTO status_observations(id,machine_id,hub_session_id,kind,observed_at,payload_json,reporter,received_at) VALUES(?,?,?,?,?,?,?,?)',
+          id, body.machine_id, sessionId, body.kind, observedAt, JSON.stringify(payload), reporter, receivedAt);
+        this.sql.exec(`DELETE FROM status_observations WHERE hub_session_id=? AND kind=? AND id NOT IN
+          (SELECT id FROM status_observations WHERE hub_session_id=? AND kind=? ORDER BY observed_at DESC, received_at DESC LIMIT 20)`,
+          sessionId, body.kind, sessionId, body.kind);
+        return json({ ok: true, id, hub_session_id: sessionId, kind: body.kind, observed_at: observedAt, reporter, host_reported: true });
+      });
+    } catch (e: any) {
+      const code = e?.code || 'internal_error';
+      const status = e?.status || 500;
+      return Response.json({ error: code }, { status, headers: { 'Cache-Control': 'private, no-store' } });
+    }
+  }
+
+  /** Resolve a native identity to its CURRENT canonical Hub session on one
+   * machine via binding_json.native_id. Zero or ambiguous matches fail
+   * closed without existence detail beyond the error code. */
+  private resolveSessionByNative(machineId: string, nativeId: string): string {
+    const rows = this.rows('SELECT id, binding_json FROM session_control_sessions WHERE machine_id=? LIMIT 201', machineId);
+    const matches: string[] = [];
+    for (const row of rows) {
+      try {
+        const binding = row.binding_json ? JSON.parse(row.binding_json) : null;
+        if (binding && binding.native_id === nativeId && typeof row.id === 'string') matches.push(row.id);
+      } catch { /* malformed binding never matches */ }
+    }
+    if (!matches.length) fail('unknown_session', 404);
+    if (matches.length > 1 || rows.length > 200) fail('ambiguous_binding', 409);
+    return matches[0];
+  }
+
+  /** Latest observation per (hub session, kind) for visible sessions only.
+   * Chunked IN queries; failures degrade to empty (unknown), never an error. */
+  private latestObservations(sessionIds: string[]): Map<string, Obj> {
+    const out = new Map<string, Obj>();
+    const ids = [...new Set(sessionIds)].filter(v => typeof v === 'string' && v);
+    try {
+      for (let i = 0; i < ids.length; i += 400) {
+        const chunk = ids.slice(i, i + 400);
+        const placeholders = chunk.map(() => '?').join(',');
+        for (const row of this.rows(`SELECT * FROM status_observations WHERE hub_session_id IN (${placeholders}) ORDER BY observed_at DESC, received_at DESC`, ...chunk)) {
+          const key = row.hub_session_id + '\n' + row.kind;
+          if (!out.has(key)) {
+            let payload: Obj = {};
+            try { payload = JSON.parse(row.payload_json); } catch { payload = {}; }
+            out.set(key, { ...row, payload });
+          }
+        }
+      }
+    } catch { /* pre-init or query failure: unknown observations, never a hard error */ }
+    return out;
+  }
+
+  /** Attach host-reported fields to already-authorized hub_session entries.
+   * Only sessions the caller may already see gain observations; task report
+   * headlines come from the latest visible-session report observation. */
+  private attachObservations(items: Obj[], now: number, nowIso: string): void {
+    const ids: string[] = [];
+    for (const task of items) {
+      for (const hub of (task.hub_sessions ?? [])) {
+        if (hub?.linkage === 'hub_session' && typeof hub.hub_session_id === 'string') ids.push(hub.hub_session_id);
+      }
+    }
+    if (!ids.length) return;
+    const latest = this.latestObservations(ids);
+    for (const task of items) {
+      let taskReport: Obj | null = null;
+      for (const hub of (task.hub_sessions ?? [])) {
+        if (hub?.linkage !== 'hub_session') continue;
+        const sess = latest.get(hub.hub_session_id + '\nsession');
+        hub.host_observation = sess ? {
+          state: (sess.payload as Obj).state ?? 'unknown',
+          note: (sess.payload as Obj).note ?? null,
+          observed_at: sess.observed_at,
+          reporter: sess.reporter,
+          host_reported: true,
+          provenance: { source: 'host_observation', observed_at: sess.observed_at,
+            freshness: freshnessOf(sess.observed_at, now, 180000), coverage: 'partial',
+            reason: 'machine_authenticated_host_report_not_operator_instruction' },
+        } : null;
+        const rep = latest.get(hub.hub_session_id + '\nreport');
+        hub.report_headline = rep ? {
+          headline: (rep.payload as Obj).headline ?? 'unknown',
+          verdict: (rep.payload as Obj).verdict ?? 'unknown',
+          reference: (rep.payload as Obj).reference ?? null,
+          observed_at: rep.observed_at,
+          reporter: rep.reporter,
+          host_reported: true,
+          provenance: { source: 'host_observation', observed_at: rep.observed_at,
+            freshness: freshnessOf(rep.observed_at, now, 86400000), coverage: 'partial',
+            reason: 'sanitized_headline_only_never_transcript_or_token' },
+        } : null;
+        if (rep && (!taskReport || String(rep.observed_at) > String((taskReport as Obj).observed_at))) taskReport = rep;
+      }
+      if (taskReport) {
+        const rp = (taskReport as Obj).payload as Obj;
+        // Fill headlines of existing intake references only; observations
+        // never synthesize report entries (no phantom reports).
+        for (const r of (task.reports ?? [])) {
+          if (r.headline === 'unknown') {
+            r.headline = rp.headline ?? 'unknown';
+            r.verdict = rp.verdict ?? 'unknown';
+            r.provenance = { source: 'host_observation', observed_at: (taskReport as Obj).observed_at,
+              freshness: freshnessOf((taskReport as Obj).observed_at, now, 86400000), coverage: 'partial',
+              reason: 'sanitized_headline_only_never_transcript_or_token' };
+          }
+        }
+      }
     }
   }
 
