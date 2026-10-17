@@ -7,9 +7,11 @@ write a native inbox, wake a model, or close issue 102, M8b or M11.
 ## Authority and provenance
 
 `system:conversation-checks` is an internal automation sender. It is never a human,
-agent credential, member, root role or device identity. The conversation UI shows
-this literal sender address and the `note` message kind; it has no native binding
-or human attribution. Ordinary member sends and bridge self-message suppression
+agent credential, member, root role or device identity. The API exposes
+this literal sender address, `sender_kind:system` and message kind `note`. The
+current UI uses the literal address as the sender label (no directory entry or
+special automation badge); its unused sender-kind adapter falls back to human.
+There is no human attribution or native binding for this reserved address. Ordinary member sends and bridge self-message suppression
 keep their original meaning. A scheduled write leaves every member's read cursor
 unchanged. The normal bridge can subsequently deliver the distinct-sender note
 and acknowledge it through its existing rules.
@@ -64,7 +66,7 @@ is unrelated. Prefix/interior retention gaps neither acknowledge nor erase
 remaining unread rows. Optional `params.conversation_id` restricts evaluation;
 omitting it scans only explicit grants for that exact check and target, at most
 50 conversations. Missing authority, invalid identities and larger scans produce
-an error, never a healthy result. No message action runs on an evaluation error.
+an error, never a healthy result. No conversation message action runs on an evaluation error.
 An alert-only backlog check still requires owner grants for its evaluated CIDs.
 A routine message uses the same explicit grant with `on:always`.
 
@@ -81,7 +83,9 @@ re-reads each due row immediately before acquiring a reservation. A token and
 30-second evaluation lease fence stale evaluators; a conditional token check
 precedes dispatch and completion. While a slot is active, config replacement,
 interval changes and restart reuse its original check, result, grant version,
-rendered payload and idempotency key. A forced rerun of a finished slot returns
+rendered payload and idempotency key. Conversation keys include the persisted
+slot activation time so changing interval lengths cannot reuse an earlier key.
+A forced rerun of a finished slot returns
 its stored result until the slot's original next boundary. Ordinary configuration
 replacement preserves `next_due_at`.
 
@@ -114,12 +118,58 @@ and no follow-up evicts retained unread history to make room.
 
 Validation is local against the real Worker and SQLite, with fixture humans and
 public device-flow agent issuance. It does not use live credentials, native
-inboxes, host journals or provider dispatch. The initial checks suite passed
-11/11; typecheck passed after correcting three SQL cursor calls. An initial
-40-case new suite passed 39 cases and timed out in the 51-conversation fixture;
-its still-running fixture caused an additional unhandled rejection. That run is
-retained. The scan fixture now has a bounded 20-second timeout, and a separate
-stale-evaluator fencing case was added. Final evidence is pending.
+inboxes, host journals or provider dispatch. Actual source checkpoint
+`c468635d9994fd1246e12b321d5206560164f92c` is retained; normal merge
+`d4affc7ad0da9c2989f81a780c657a05bd43405e` incorporates accepted backend
+`16d66d69708268ab84089447534f0439e0bfd893`. All 13 incoming backend/doc paths
+are byte-identical to that accepted version. Old M5 proposal/review artifacts
+remain unchanged. The final fixture correction pins lease tests within one
+interval; final TypeScript implementation bytes equal the source checkpoint.
+
+| Local verification | Result |
+| --- | --- |
+| Conversation follow-ups and checks | 57/57 (45 follow-up cases + 12 checks) |
+| Liveness, Hub, bus, M6 claim admission | 107/107 |
+| Conversations and security | 26/26 |
+| Retention and integration | 24/24 |
+| Platform and machine pairing | 35/35 |
+| Agent registry and registry R2 | 14/14 |
+| TypeScript `tsc --noEmit` | PASS |
+| Real Python bridge `cycle`, final captured public HTTP history, accepted backend | 4/4 |
+
+The 206 compatibility cases ran once, serially in bounded groups, because the
+shared writer, schema initialization, scheduler and Hub port touch these
+contracts. They were not repeated after the host-only accepted merge. The final
+focused group and typecheck ran against the final source and fixtures. The
+bridge contract substitutes only journal/native/member methods with memory
+fixtures: the actual automation note and original message both reach `deliver`,
+the recipient-authored control remains suppressed, and a gap advances neither
+cursor nor delivery. This is source contract evidence, not physical adoption.
+Expected injected M6 SQLite retirement-linkage diagnostics remain in the log;
+that group passed all assertions.
+
+Failures are preserved rather than relabelled: the first typecheck found three
+invalid SQL cursor `.one()` calls; they now use the cursor's supported
+`toArray()` interface. A later test fixture tried protected `hub.ctx`; it now
+uses the actual Durable Object state transaction. The initial new 40-case run
+passed 39 and timed out in the 51-conversation scan fixture, whose continuation
+caused an unhandled rejection; a bounded 20-second per-case timeout fixed that
+fixture. A final 57-case run passed 56 because its simulated 30-second crash
+crossed a real interval boundary. Pinning both lease fixtures to slot+60 seconds
+keeps the original no-duplicate assertions and makes their intended interval
+explicit. The subsequent final group passed 57/57; no source assertion or digest
+was weakened or re-pinned.
+
+Per-run logs, exit codes, counts and resource receipts are retained in ignored
+evidence. Tests use CPU 0, one-thread UV/V8/Go pools, existing dependency
+symlinks, a private workspace TMPDIR and isolated HOME/XDG directories. Largest
+sampled scratch contents were 33,796,096 allocated / 33,663,424 apparent bytes;
+early measurements excluded the two root directory inodes (8 KiB observed),
+which is explicitly recorded. Later measurements include them. Even a 64 KiB
+metadata allowance leaves the peak below 33 MiB and the combined 45 MiB cap.
+Largest sampled process-group RSS was 651,788,288 bytes, with 30 tasks. No guard
+fired and no evidence was manually deleted or overwritten. No host/UI full-suite
+rerun or actual native receipt is claimed.
 
 Independent verification should attack watermark preservation and native bridge
 eligibility with real HTTP history; outside-admin and disabled-human cases;

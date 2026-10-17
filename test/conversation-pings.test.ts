@@ -271,7 +271,8 @@ describe('M5 durable intent, scheduler reservations and uncertain dispatch', () 
   it('resumes a pre-intent crash after its reservation expires', async () => {
     const { cid } = await setup();
     await inside(async h => {
-      const clock = { t: Date.now() }; const checks = new ChecksService(h.sql, () => clock.t);
+      // Keep the simulated 30s crash strictly within one 300s slot.
+      const clock = { t: Math.floor(Date.now() / 300000) * 300000 + 60000 }; const checks = new ChecksService(h.sql, () => clock.t);
       let calls = 0;
       const deps: ActionDeps = { liveness: h.livenessService, notify: async () => {}, message: async () => '', launch: async () => '', evaluateQuota: () => [],
         fetch: async () => new Response(null), conversation: { evaluateBacklog: q => h.conversationsService.evaluateScheduledBacklog(q), sendFollowUp: i => { calls++; return h.conversationsService.postScheduledFollowUp(i); } } };
@@ -291,7 +292,8 @@ describe('M5 durable intent, scheduler reservations and uncertain dispatch', () 
     const { owner, cid } = await setup(); const g = await grant(cid, owner, actor, 'followup', template, 'always');
     await config(owner, [{ name: 'followup', kind: 'http', interval_s: 300, params: { url: 'https://local.invalid/' }, action: { type: 'message', to: actor, body: template, on: 'always', conversation_id: cid, grant_id: g.grant_id } }]);
     await inside(async h => {
-      const clock = { t: Date.now() }, checks = new ChecksService(h.sql, () => clock.t);
+      const clock = { t: Math.floor(Date.now() / 300000) * 300000 + 60000 }, checks = new ChecksService(h.sql, () => clock.t);
+      h.sql.exec('UPDATE hub_checks SET next_due_at=?', new Date(clock.t).toISOString());
       let enter!: () => void, release!: () => void, evaluations = 0, sends = 0;
       const entered = new Promise<void>(r => { enter = r; }), gate = new Promise<void>(r => { release = r; });
       const deps: ActionDeps = { liveness: h.livenessService, notify: async () => {}, message: async () => '', launch: async () => '', evaluateQuota: () => [],
