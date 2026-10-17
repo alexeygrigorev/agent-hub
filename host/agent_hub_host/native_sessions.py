@@ -1111,7 +1111,17 @@ def stop_session(
               and s.tag == target.tag
               and canonicalize_workspace(s.workspace) == target.workspace]
     if not before:
-        raise SessionControlError("Target not in native catalog (tag reuse or absent); refusing")
+        from .retired_native import verify_native_retirement
+        is_retired, tombstone, reason = verify_native_retirement(executable, target)
+        if is_retired and isinstance(tombstone, dict):
+            return StopResult(
+                state="stopped",
+                session_id=target.session_id,
+                reason="already confirmed retired: finished tombstone at %s (%s)" % (
+                    tombstone.get("finished_at_ms"), reason
+                ),
+            )
+        raise SessionControlError("Target not in native catalog (tag reuse or absent; %s); refusing" % reason)
     if target.created_at_ms is not None and before[0].created_at_ms != target.created_at_ms:
         raise SessionControlError("Native generation mismatch before kill; refusing")
     if target.engine is not None and before[0].engine != target.engine:

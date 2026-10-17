@@ -1504,16 +1504,36 @@ def _preserve_cleanup_evidence(
     _check_custody(custody)
     if not isinstance(command_id, str) or not command_id:
         raise SessionControlError("Command id is required for cleanup evidence")
-    cap = capture_session_output(executable, target, custody=custody,
-                                 limit_bytes=CLEANUP_EVIDENCE_LIMIT_BYTES, mode="tail")
-    text = cap.get("text", "")
-    if not isinstance(text, str):
-        raise SessionControlError("Cleanup evidence capture returned no text; refusing")
+    retired_source: Optional[str] = None
+    native_finished_at_ms: Optional[int] = None
+    try:
+        cap = capture_session_output(executable, target, custody=custody,
+                                     limit_bytes=CLEANUP_EVIDENCE_LIMIT_BYTES, mode="tail")
+        text = cap.get("text", "")
+        if not isinstance(text, str):
+            raise SessionControlError("Cleanup evidence capture returned no text; refusing")
+        raw = text.encode("utf-8", "replace")
+        truncated = bool(cap.get("truncated", False))
+    except SessionControlError as cap_exc:
+        from .retired_native import verify_native_retirement, capture_retired_history
+        is_retired, tombstone, reason = verify_native_retirement(executable, target)
+        if not is_retired or not tombstone:
+            raise SessionControlError(
+                "Cleanup evidence capture failed and native not retired: %s; %s" % (cap_exc, reason)
+            ) from cap_exc
+        raw_retired, source_path, mode, hist_reason = capture_retired_history(
+            target, limit_bytes=CLEANUP_EVIDENCE_LIMIT_BYTES
+        )
+        if raw_retired is None or len(raw_retired) == 0:
+            raise SessionControlError("authentic retired history unavailable; listed-only")
+        raw = raw_retired
+        truncated = len(raw) >= CLEANUP_EVIDENCE_LIMIT_BYTES
+        retired_source = os.path.basename(source_path) if source_path else "retired"
+        native_finished_at_ms = tombstone.get("finished_at_ms")
+
     # Exact byte budget on the raw UTF-8 payload (not on JSON-escaped text):
     # the adapter already truncates to limit_bytes, but stubs/tests may return
     # more, and multi-byte/ANSI content expands under JSON. Enforce here.
-    raw = text.encode("utf-8", "replace")
-    truncated = bool(cap.get("truncated", False))
     if len(raw) > CLEANUP_EVIDENCE_LIMIT_BYTES:
         raw = raw[:CLEANUP_EVIDENCE_LIMIT_BYTES]
         # Keep valid UTF-8 after byte truncation (dangling trail -> replace).
@@ -1541,7 +1561,12 @@ def _preserve_cleanup_evidence(
               "byte_length": byte_length, "truncated": truncated,
               "sha256": digest,
               "raw_file": os.path.basename(raw_path),
-              "privacy_unknown": True}
+              "privacy_unknown": True,
+              "evidence_observed_at_ms": int(time.time() * 1000)}
+    if native_finished_at_ms is not None:
+        record["native_finished_at_ms"] = native_finished_at_ms
+    if retired_source is not None:
+        record["retired_source"] = retired_source
     try:
         _write_journal(meta_path, record)
     except (ValueError, OSError, PermissionError) as exc:
@@ -1580,6 +1605,7 @@ def _run_cleanup_tree_after_stop(
     never blind-repeated under the consumed claim).
     """
     from .session_cleanup import remove_owned_worktree
+    from .retired_native import verify_native_retirement
 
     # Live-use inventory excludes terminal native phases: the just-stopped
     # target's own exited row still references its workspace, and must not
@@ -1592,6 +1618,18 @@ def _run_cleanup_tree_after_stop(
                       if isinstance(p, str) and p]
     except Exception:
         return {"state": "uncertain", "reason": "live_inventory_unavailable: native list failed; listed-only"}
+
+    # Target exit / retirement verification before tree:
+    target_in_rows = [r for r in rows if r.session_id.lower() == target.session_id.lower()]
+    if target_in_rows:
+        target_phase = getattr(target_in_rows[0], "phase", "")
+        if target_phase not in ("exited", "dead", "forgotten", "pruned"):
+            return {"state": "kept", "reason": f"target still active in catalog before tree (phase={target_phase}); listed-only"}
+    else:
+        # Target absent from catalog: native retirement proof required again before tree
+        is_retired, tombstone, reason = verify_native_retirement(executable, target)
+        if not is_retired:
+            return {"state": "kept", "reason": f"native retirement re-verification failed before tree ({reason}); listed-only"}
     try:
         result = remove_owned_worktree(
             custody=custody, journal_dir=journal_dir, machine_id=custody.machine_id,
@@ -1748,8 +1786,9 @@ def _run_claimed_effect(
         except Exception as exc:
             evidence_error = ("evidence_capture_%s" % type(exc).__name__)[:200]
         if evidence_error is not None or evidence_path is None:
-            refused_reason = ("cleanup_preservation_failed_refused: %s"
-                              % (evidence_error or "unknown"))[:300]
+            err_msg = evidence_error or "unknown"
+            refused_reason = ("cleanup_preservation_failed_refused: %s" % err_msg)[:300]
+            tree_reason = err_msg if err_msg.endswith("; listed-only") else f"{err_msg}; listed-only"
             return {
                 "state": "refused",
                 "ack_outcome": "refused",
@@ -1759,8 +1798,7 @@ def _run_claimed_effect(
                 "confirmed_exit": False,
                 "tree": {
                     "state": "kept",
-                    "reason": ("evidence_capture_failed: %s; listed-only"
-                               % (evidence_error or "unknown"))[:300],
+                    "reason": ("evidence_capture_failed: %s" % tree_reason)[:300],
                 },
             }
     stopped = stop_controlled_session(executable, target, custody=custody)
