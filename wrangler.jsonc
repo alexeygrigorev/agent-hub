@@ -35,11 +35,12 @@
     ]
   },
   "vars": {
-    "HUB_ADDITIONAL_ADMINS": "orin@datatalks.club",
+    "HUB_ADDITIONAL_ADMINS": "alexey@datatalks.club,orin@datatalks.club",
     "AUTH_CLIENT_ID": "1tplqm9l6q6545mrk0gjv6eaeh",
     "AUTH_ISSUER": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_H7nJu52Bs",
     "AUTH_BASE_URL": "https://auth.dtcdev.click",
-    "AUTH_CALLBACK_URL": "https://agent-hub.cloudflare-ai-agent-de9ca0.workers.dev/auth/callback",
+    "AUTH_CALLBACK_URL": "https://hub.dtcdev.click/auth/callback",
+    "AUTH_CALLBACK_URLS": "https://hub.dtcdev.click/auth/callback,https://agent-hub.cloudflare-ai-agent-de9ca0.workers.dev/auth/callback,http://localhost:19130/auth/callback",
     "AUTH_JWKS_URL": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_H7nJu52Bs/.well-known/jwks.json"
   },
   "dev": {

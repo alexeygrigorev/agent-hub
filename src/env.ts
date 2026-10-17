@@ -8,6 +8,7 @@ export interface Env {
   AUTH_BASE_URL: string;
   AUTH_CLIENT_ID: string;
   AUTH_CALLBACK_URL: string;
+  AUTH_CALLBACK_URLS?: string;
   AUTH_ISSUER: string;
   AUTH_JWKS_URL: string;
   HUB_ADMINS: string;
