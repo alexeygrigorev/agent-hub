@@ -2,7 +2,9 @@ import { Env } from '../env';
 import { signHmac, verifyHmac, base64url, decodeBase64url } from './crypto';
 
 export function configuredAdmins(env: Env): string[] {
-  return typeof env.HUB_ADMINS === 'string' ? env.HUB_ADMINS.split(',').map(s => s.trim().toLowerCase()).filter(s => s && !s.includes('<')) : [];
+  const split = (v: unknown) => typeof v === 'string' ? v.split(',').map(s => s.trim().toLowerCase()).filter(s => s && !s.includes('<')) : [];
+  // Additive allowlist: HUB_ADMINS plus HUB_ADDITIONAL_ADMINS (e.g. Orin).
+  return [...split(env.HUB_ADMINS), ...split((env as any).HUB_ADDITIONAL_ADMINS)];
 }
 
 /** Sessions created by the admin-token sign-in use this identity instead of an OIDC email. */
@@ -25,6 +27,17 @@ function sessionAdminAllowed(env: Env, data: SessionData): boolean {
     return !!hash && data.sub === tokenAdminSubject(hash);
   }
   return configuredAdmins(env).includes(data.email.toLowerCase());
+}
+
+/** Human/operator bearer allowlist: Google allowlisted email or the legacy
+ * bootstrap admin-token identity. Never trusts request-supplied fields. */
+export function humanAdminAllowed(env: Env, email: string, sub: string): boolean {
+  if (typeof email !== 'string' || typeof sub !== 'string' || !email || !sub) return false;
+  if (email === TOKEN_ADMIN_EMAIL) {
+    const hash = adminTokenHash(env);
+    return !!hash && sub === tokenAdminSubject(hash);
+  }
+  return configuredAdmins(env).includes(email.toLowerCase());
 }
 
 export function validSessionSecret(env: Env): boolean {

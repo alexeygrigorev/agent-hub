@@ -1,12 +1,12 @@
 import { IntakeService } from './intake';
-import { UI_HEADERS, tokenPage, authFailure, deviceEntry, deviceReview, deviceResult } from './ui-pages';
+import { UI_HEADERS, tokenPage, authFailure, deviceEntry, deviceReview, deviceReviewHuman, deviceResult } from './ui-pages';
 import { DurableObject } from "cloudflare:workers";
 import { SqlStorage } from "@cloudflare/workers-types";
 import { Env } from './env';
 import { SCHEMA_SQL } from './schema';
 import { migrateAgentRegistry, bindAgentCredentials, credentialActor, registryAddress, AGENT_NAME } from './agent_registry';
 import { JwksCache, validateIdToken, exchangeCode } from './auth/dtc';
-import { createSessionCookie, getSession, clearSessionCookie, createLoginCookie, getLoginCookie, clearLoginCookie, verifyCsrf, configuredAdmins, validSessionSecret, adminTokenHash, tokenAdminSubject, TOKEN_ADMIN_EMAIL } from './auth/session';
+import { createSessionCookie, getSession, clearSessionCookie, createLoginCookie, getLoginCookie, clearLoginCookie, verifyCsrf, configuredAdmins, validSessionSecret, adminTokenHash, tokenAdminSubject, TOKEN_ADMIN_EMAIL, humanAdminAllowed } from './auth/session';
 import { randomString, sha256, generateUserCode, base64url } from './auth/crypto';
 import { generateTokenPair, verifyBearerScope } from './auth/token';
 import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly, updateHeartbeat } from './registry';
@@ -633,6 +633,51 @@ export class Hub extends DurableObject {
         return Response.json({ authenticated: true, email: session.email, csrf_token: session.csrfToken });
       }
 
+      if (path === '/api/auth/me') {
+        if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) return Response.json({ error: 'unauthorized' }, { status: 401 });
+        if (request.headers.has('Cookie')) return Response.json({ error: 'mixed_authority' }, { status: 403 });
+        const token = /^Bearer ([^\s]{1,4096})$/.exec(authHeader)?.[1];
+        if (!token) return Response.json({ error: 'unauthorized' }, { status: 401 });
+        const tokenHash = await sha256(token);
+        const cred = this.sql.exec('SELECT * FROM credentials WHERE token_hash = ? AND revoked_at IS NULL', tokenHash).toArray()[0] as any;
+        if (!cred || cred.kind !== 'human') return Response.json({ error: 'unauthorized' }, { status: 401 });
+        if (!Number.isFinite(Date.parse(cred.expires_at)) || Date.parse(cred.expires_at) <= Date.now()) {
+          return Response.json({ error: 'unauthorized' }, { status: 401 });
+        }
+        let scopes: unknown;
+        try { scopes = typeof cred.scopes === 'string' ? JSON.parse(cred.scopes) : cred.scopes; } catch { return Response.json({ error: 'unauthorized' }, { status: 401 }); }
+        if (!Array.isArray(scopes) || scopes.length !== 1 || scopes[0] !== 'admin') {
+          return Response.json({ error: 'unauthorized' }, { status: 401 });
+        }
+        const actor = typeof cred.actor === 'string' ? cred.actor : '';
+        const email = typeof cred.subject === 'string' ? cred.subject : '';
+        const sub = actor.startsWith('human:') ? actor.slice('human:'.length) : '';
+        if (!sub || !email || cred.created_by_sub !== sub || !this.isHumanCredentialAllowed(sub, email)) {
+          return Response.json({ error: 'unauthorized' }, { status: 401 });
+        }
+        return Response.json({ kind: 'human', actor, email, is_admin: true, expires_at: cred.expires_at });
+      }
+
+      if (path === '/api/auth/logout') {
+        if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+        const body = await safeJson(request);
+        if (body && Object.keys(body).length !== 0) return Response.json({ error: 'invalid_request' }, { status: 400 });
+        if (request.headers.has('Cookie')) return Response.json({ error: 'mixed_authority' }, { status: 403 });
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) return Response.json({ error: 'unauthorized' }, { status: 401 });
+        const token = /^Bearer ([^\s]{1,4096})$/.exec(authHeader)?.[1];
+        if (!token) return Response.json({ error: 'unauthorized' }, { status: 401 });
+        const tokenHash = await sha256(token);
+        const cred = this.sql.exec('SELECT * FROM credentials WHERE token_hash = ?', tokenHash).toArray()[0] as any;
+        if (!cred || cred.kind !== 'human') return Response.json({ error: 'unauthorized' }, { status: 401 });
+        // Idempotent: revoking an already-revoked family still succeeds.
+        // Only the caller's own human family is touched; host/agent untouched.
+        this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', new Date().toISOString(), cred.family_id);
+        return Response.json({ status: 'revoked' });
+      }
+
       if (path === '/auth/logout') {
         if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
         const session = await getSession(this.env, request);
@@ -652,6 +697,46 @@ export class Hub extends DurableObject {
         if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
         const body = await safeJson(request);
         if (!body) return Response.json({ error: 'malformed_json' }, { status: 400 });
+        // Human/operator device mode (CLI `hub auth login`): POST {kind:"human",label}.
+        // Identity, email, actor, scopes are never taken from the request; the
+        // approving allowlisted admin session binds them at approval time.
+        if ((body as any).kind === 'human') {
+          if (body.machine_id !== undefined) return Response.json({ error: 'machine_assignment_requires_admin_approval' }, { status: 400 });
+          const rawLabel = (body as any).label;
+          let label = 'human CLI';
+          if (rawLabel !== undefined) {
+            if (typeof rawLabel !== 'string' || !rawLabel.trim() || rawLabel.length > 128) {
+              return Response.json({ error: 'invalid_request' }, { status: 400 });
+            }
+            label = rawLabel.trim();
+          }
+          const deviceCode = randomString(32);
+          const deviceCodeHash = await sha256(deviceCode);
+          const userCode = generateUserCode();
+          let ipCountry: string | null = null;
+          const cfCountry = (request as any).cf?.country;
+          if (typeof cfCountry === 'string' && /^[A-Z]{2}$/.test(cfCountry)) {
+            ipCountry = cfCountry;
+          } else if (cfCountry !== undefined && cfCountry !== null) {
+            ipCountry = 'Unknown';
+          }
+          const now = new Date();
+          const expiresAt = new Date(now.getTime() + 600 * 1000);
+          const pastForFirstPoll = new Date(now.getTime() - 60000);
+          this.sql.exec(`
+            INSERT INTO device_pairings
+            (device_code_hash, user_code, client_kind, name, hostname, ip_country, actor, requested_scopes, status, interval_s, last_poll_at, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `, deviceCodeHash, userCode, 'human', label, '', ipCountry, null, JSON.stringify(['admin']), 'pending', 5, pastForFirstPoll.toISOString(), now.toISOString(), expiresAt.toISOString());
+          return Response.json({
+            device_code: deviceCode,
+            user_code: userCode,
+            verification_uri: url.origin + '/device',
+            verification_uri_complete: url.origin + '/device?code=' + encodeURIComponent(userCode),
+            expires_in: 600,
+            interval: 5
+          });
+        }
         if (body.machine_id !== undefined) return Response.json({ error: 'machine_assignment_requires_admin_approval' }, { status: 400 });
         if (body.client_kind !== 'host' && body.client_kind !== 'agent') {
           return Response.json({ error: 'invalid_client_kind' }, { status: 400 });
@@ -800,6 +885,34 @@ export class Hub extends DurableObject {
             }
             if (current.client_kind === 'agent' && (!credentialActor(this.sql, { kind: 'agent', registry_actor: current.actor, machine_id: current.machine_id }) ||
                 !validAgentPairingScopes(current.granted_scopes, current.requested_scopes))) return null;
+            // Human/operator issuance: admin only, bound to the approving
+            // allowlisted principal. Never trusts request-supplied identity.
+            if (current.client_kind === 'human') {
+              let granted: unknown;
+              try { granted = typeof current.granted_scopes === 'string' ? JSON.parse(current.granted_scopes) : current.granted_scopes; } catch { return null; }
+              if (!Array.isArray(granted) || granted.length !== 1 || granted[0] !== 'admin') return null;
+              if (current.machine_id !== null && current.machine_id !== undefined) return null;
+              const approverSub = typeof current.approved_by_sub === 'string' ? current.approved_by_sub : '';
+              if (!approverSub) return null;
+              if (current.actor !== 'human:' + approverSub) return null;
+              let approverEmail: string | null = null;
+              if (approverSub.startsWith('admin-token:')) {
+                const hash = adminTokenHash(this.env);
+                if (!hash || tokenAdminSubject(hash) !== approverSub) return null;
+                approverEmail = TOKEN_ADMIN_EMAIL;
+              } else {
+                const userRow = this.sql.exec('SELECT email FROM users WHERE sub = ?', approverSub).toArray()[0] as any;
+                const userEmail = typeof userRow?.email === 'string' ? userRow.email : null;
+                if (!userEmail || !humanAdminAllowed(this.env, userEmail, approverSub)) return null;
+                approverEmail = userEmail;
+              }
+              const expires = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
+              const humanNow = new Date().toISOString();
+              this.sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, approval_seq)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, credId, 'human', tokens.accessHash, tokens.refreshHash, familyId, approverEmail, null, 'human:' + approverSub, JSON.stringify(['admin']), approverSub, humanNow, expires, null);
+              this.sql.exec("UPDATE device_pairings SET status = 'consumed' WHERE device_code_hash = ?", deviceCodeHash);
+              return { expires, scopes: ['admin'] as string[], machineId: null as string | null };
+            }
             const expires = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
             this.sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, approval_seq)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, credId, current.client_kind, tokens.accessHash, tokens.refreshHash, familyId, current.name, current.machine_id, current.actor, current.granted_scopes, current.approved_by_sub, new Date().toISOString(), expires, issuanceSeq);
@@ -825,6 +938,11 @@ export class Hub extends DurableObject {
         const pairing = this.sql.exec('SELECT * FROM device_pairings WHERE user_code = ?', userCode.toUpperCase()).toArray()[0] as any;
         if (!pairing) return new Response(deviceResult('unknown', session.email), {status:404,headers:UI_HEADERS});
         if (!session.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
+        const state = !['consumed', 'denied'].includes(pairing.status) && (!Number.isFinite(Date.parse(pairing.expires_at)) || Date.parse(pairing.expires_at) <= Date.now()) ? 'expired' : pairing.status;
+        if (pairing.client_kind === 'human') {
+          if (state !== 'pending') return new Response(deviceResult(state, session.email), {headers:UI_HEADERS});
+          return new Response(deviceReviewHuman(pairing, session.email, Date.now()), {headers:UI_HEADERS});
+        }
         const machines = this.sql.exec('SELECT id, name FROM machines WHERE registered_at IS NOT NULL ORDER BY id').toArray() as any[];
         let address = registryAddress(pairing.actor || '');
         if (address && !address.project) {
@@ -834,7 +952,6 @@ export class Hub extends DurableObject {
         const displayedActor = address ? (address.project ? `${address.project}:${address.tag}` : address.tag) : pairing.actor;
         const registeredAgent = address ? this.sql.exec("SELECT machine_id FROM agents WHERE tag = ? AND COALESCE(project,'') = COALESCE(?,'')", address.tag, address.project).toArray()[0] as any : null;
         const registeredMachine = registeredAgent?.machine_id || null;
-        const state = !['consumed', 'denied'].includes(pairing.status) && (!Number.isFinite(Date.parse(pairing.expires_at)) || Date.parse(pairing.expires_at) <= Date.now()) ? 'expired' : pairing.status;
         const html = state === 'pending'
           ? deviceReview(pairing, session.email, address, registeredMachine, machines, Date.now(), displayedActor)
           : deviceResult(state, session.email);
@@ -879,6 +996,32 @@ export class Hub extends DurableObject {
         if (action === 'approve') {
           const body = await safeJson(request);
           if (!body) return Response.json({ error: 'malformed_json' }, { status: 400 });
+          // Human/operator approval: bound ONLY to the approving allowlisted
+          // session. Request-supplied identity/scopes/machine are never trusted.
+          if (pairing.client_kind === 'human') {
+            if (Object.keys(body).some(k => !['granted_scopes', 'expected_actor'].includes(k))) {
+              return Response.json({ error: 'invalid_approval' }, { status: 400 });
+            }
+            if (!humanAdminAllowed(this.env, session.email, session.sub)) {
+              return Response.json({ error: 'forbidden' }, { status: 403 });
+            }
+            const granted = body.granted_scopes ?? ['admin'];
+            if (!Array.isArray(granted) || granted.length !== 1 || granted[0] !== 'admin') {
+              return Response.json({ error: 'invalid_scopes' }, { status: 400 });
+            }
+            if (body.expected_actor !== undefined && body.expected_actor !== null) {
+              return Response.json({ error: 'invalid_approval' }, { status: 400 });
+            }
+            return this.ctx.storage.transactionSync(() => {
+              const current = this.sql.exec('SELECT * FROM device_pairings WHERE user_code = ?', userCode).toArray()[0] as any;
+              if (!current || current.status !== 'pending' || !Number.isFinite(Date.parse(current.expires_at)) || Date.parse(current.expires_at) <= Date.now()) return Response.json({ error: 'invalid_pairing' }, { status: 409 });
+              if (current.client_kind !== 'human') return Response.json({ error: 'invalid_pairing' }, { status: 400 });
+              if (['name', 'requested_scopes', 'expires_at'].some(k => current[k] !== pairing[k])) return Response.json({ error: 'stale_pairing' }, { status: 409 });
+              const humanActor = 'human:' + session.sub;
+              this.sql.exec("UPDATE device_pairings SET status = 'approved', approved_by_sub = ?, granted_scopes = ?, machine_id = NULL, actor = ?, approved_seq = NULL WHERE user_code = ?", session.sub, JSON.stringify(['admin']), humanActor, userCode);
+              return Response.json({ status: 'approved', machine_id: null });
+            });
+          }
           if (Object.keys(body).some(k => !['granted_scopes', 'machine_id', 'expected_actor'].includes(k))) return Response.json({ error: 'invalid_approval' }, { status: 400 });
           const granted_scopes = body.granted_scopes ?? JSON.parse(pairing.requested_scopes);
           const parsedGranted = granted_scopes;
@@ -975,6 +1118,11 @@ export class Hub extends DurableObject {
         } else if (!Number.isFinite(Date.parse(cred.expires_at)) || Date.parse(cred.expires_at) <= nowMs) {
           errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
         } else if (cred.kind === 'agent' && !credentialActor(this.sql, cred)) {
+          errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
+        } else if (cred.kind === 'human' && !this.isHumanRefreshAllowed(cred)) {
+          // Removed-admin, mismatched identity or non-admin human scope:
+          // revoke the family so it cannot refresh back, then fail closed.
+          this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
           errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
         } else {
           const res = this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', now, cred.id);
@@ -1522,6 +1670,44 @@ export class Hub extends DurableObject {
     return auth;
   }
 
+  /** Human bearer allowlist recheck: current HUB_ADMINS (or the live
+   * bootstrap token identity) must still approve the stored approver. Uses
+   * the users table for Google emails so removal/failure closes access. */
+  private isHumanCredentialAllowed(sub: string, storedEmail: string): boolean {
+    if (!sub || !storedEmail) return false;
+    if (storedEmail === TOKEN_ADMIN_EMAIL) {
+      return humanAdminAllowed(this.env, storedEmail, sub);
+    }
+    try {
+      const row = this.sql.exec('SELECT email FROM users WHERE sub = ?', sub).toArray()[0] as any;
+      const currentEmail = typeof row?.email === 'string' ? row.email : storedEmail;
+      if (typeof currentEmail !== 'string' || !currentEmail) return false;
+      // Stored identity must still match the verified user row (case-insensitive).
+      if (currentEmail.toLowerCase() !== storedEmail.toLowerCase()) return false;
+      return humanAdminAllowed(this.env, currentEmail, sub);
+    } catch {
+      return false;
+    }
+  }
+
+  /** Refresh-time human gate: strict admin scope, stable human:<sub> actor,
+   * matching created_by_sub, and a currently allowlisted approver. */
+  private isHumanRefreshAllowed(cred: any): boolean {
+    try {
+      let scopes: unknown;
+      try { scopes = typeof cred.scopes === 'string' ? JSON.parse(cred.scopes) : cred.scopes; } catch { return false; }
+      if (!Array.isArray(scopes) || scopes.length !== 1 || scopes[0] !== 'admin') return false;
+      const actor = typeof cred.actor === 'string' ? cred.actor : '';
+      const email = typeof cred.subject === 'string' ? cred.subject : '';
+      const sub = actor.startsWith('human:') ? actor.slice('human:'.length) : '';
+      if (!sub || !email || cred.created_by_sub !== sub) return false;
+      if (cred.machine_id !== null && cred.machine_id !== undefined) return false;
+      return this.isHumanCredentialAllowed(sub, email);
+    } catch {
+      return false;
+    }
+  }
+
   private async authenticateBusRequest(request: Request): Promise<{ caller?: CallerContext; scopes?: string[]; error?: Response }> {
     const session = await getSession(this.env, request);
     if (session) {
@@ -1598,8 +1784,24 @@ export class Hub extends DurableObject {
         caller.jobId = cred.subject;
       }
     } else if (cred.kind === 'human') {
-      if (scopes.includes('admin')) caller.isAdmin = true;
-      caller.actor = cred.actor || cred.subject;
+      // Human/operator bearer: admin scope only via an approved allowlisted
+      // principal. Identity comes only from the stored credential (actor
+      // human:<approver-sub>, subject approver email); request fields never
+      // authorize. Removed-admin, revoked and expired families fail closed.
+      if (!scopes.includes('admin') || scopes.length !== 1) {
+        return { error: Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } }) };
+      }
+      const actor = typeof cred.actor === 'string' ? cred.actor : '';
+      const email = typeof cred.subject === 'string' ? cred.subject : '';
+      const sub = actor.startsWith('human:') ? actor.slice('human:'.length) : '';
+      if (!sub || !email || typeof cred.created_by_sub !== 'string' || cred.created_by_sub !== sub) {
+        return { error: Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } }) };
+      }
+      if (!this.isHumanCredentialAllowed(sub, email)) {
+        return { error: Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } }) };
+      }
+      caller.isAdmin = true;
+      caller.actor = actor;
     }
 
     return { caller, scopes };

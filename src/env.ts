@@ -11,6 +11,7 @@ export interface Env {
   AUTH_ISSUER: string;
   AUTH_JWKS_URL: string;
   HUB_ADMINS: string;
+  HUB_ADDITIONAL_ADMINS?: string;
   SESSION_SECRET: string;
   // Optional: SHA-256 hex of a high-entropy admin sign-in token (POST /auth/token)
   HUB_ADMIN_TOKEN_SHA256?: string;

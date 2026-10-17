@@ -24,6 +24,26 @@ export default {
       return stub.fetch(request);
     }
 
+    // Public CLI installer seam (server routing only; CLI worker owns artifacts).
+    // Anonymous READ ONLY for exactly these static assets; nothing else under
+    // /cli/ is exposed and no API/static private artifact is opened up.
+    if (url.pathname === '/cli/install.sh' || url.pathname === '/cli/hub.pyz' ||
+        url.pathname === '/cli/hub.pyz.sha256' || url.pathname === '/cli/manifest.json') {
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
+        return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, HEAD' } });
+      }
+      if (!env.ASSETS) return new Response('Not found', { status: 404 });
+      const asset = await env.ASSETS.fetch(new Request(url, request));
+      if (!asset.ok) return new Response('Not found', { status: 404 });
+      const headers = new Headers(asset.headers);
+      headers.set('Cache-Control', 'public, max-age=300');
+      headers.set('X-Content-Type-Options', 'nosniff');
+      return new Response(asset.body, { status: asset.status, headers });
+    }
+    if (url.pathname.startsWith('/cli/')) {
+      return new Response('Not found', { status: 404 });
+    }
+
     // Sign-in needs these exact immutable styles/scripts/fonts before a session exists.
     const PUBLIC_AUTH_ASSETS = ['/auth.css', '/auth.js', '/vendor/dakit/device-code.js', '/vendor/dakit/dakit.css', '/vendor/dakit/shell.js',
       '/vendor/dakit/fonts/inter-var.woff2', '/vendor/dakit/fonts/ibm-plex-mono-400.woff2', '/vendor/dakit/fonts/ibm-plex-mono-500.woff2'];
