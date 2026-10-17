@@ -88,6 +88,15 @@ def native_to_entry(item: Any) -> dict | None:
         return None
     entry: dict = {'native_id': str(sid), 'workspace': str(ws)}
     agent_state = get('agent_state')
+    state_at = get('agent_state_at_ms')
+    if type(state_at) is int:
+        age_ms = time.time() * 1000 - state_at
+        if age_ms > 300000 or age_ms < -60000:
+            # A fresh catalog read does not refresh an old agent hook.
+            # Preserve its provenance, but do not call stale idle/working
+            # metadata the session's current state.
+            entry['note'] = 'native_hook_state_stale; reported_at_ms=%s' % state_at
+            agent_state = None
     if isinstance(agent_state, str) and agent_state in ('working', 'waiting', 'idle'):
         entry[agent_state] = True
     for key, marker in (('limit_exhausted', 'limit_hit'), ('context_low', 'context_low')):
