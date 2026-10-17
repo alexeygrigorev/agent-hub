@@ -34,7 +34,7 @@ class CollectorNativeTests(unittest.TestCase):
         self.assertEqual(win['credits_remaining'], 12.5)
         self.assertEqual(win['unit'], 'credits')
         self.assertEqual(win['profile'], 'muse-spark-1.3')
-        self.assertIsNone(win['spend_used'])
+        self.assertIsNone(win.get('spend_used'))
 
     def test_live_quse_shape_stays_percent_only_without_synthesis(self):
         now = utcnow()
@@ -50,10 +50,10 @@ class CollectorNativeTests(unittest.TestCase):
         # Unknown extra detail keys are dropped, never converted into money.
         self.assertNotIn('max_used_percent', snap['routes']['go']['details'])
         for key in ('credits_remaining', 'spend_used', 'spend_limit', 'unit', 'profile'):
-            self.assertIsNone(win[key])
+            self.assertIsNone(win.get(key))
         details = snap['routes']['go']['details']
-        for key in ('credits_remaining', 'spend_used', 'spend_limit', 'unit', 'profile'):
-            self.assertIsNone(details[key])
+        for key in ('credits_remaining', 'spend_used', 'spend_limit', 'unit', 'profile', 'cooldown_until'):
+            self.assertIsNone(details.get(key))
 
     def test_invalid_natives_become_unknown_and_secrets_dropped(self):
         now = utcnow()
@@ -72,7 +72,7 @@ class CollectorNativeTests(unittest.TestCase):
         win = snap['routes']['codex']['windows']['7d']
         self.assertEqual(win['percent_remaining'], 80.0)
         for key in ('credits_remaining', 'spend_used', 'unit', 'profile'):
-            self.assertIsNone(win[key])
+            self.assertIsNone(win.get(key))
         dumped = json.dumps(snap)
         self.assertNotIn('secret', dumped)
         self.assertNotIn('someone@example.com', dumped)
@@ -91,7 +91,7 @@ class CollectorNativeTests(unittest.TestCase):
                          '2026-10-17T13:00:00Z')
         raw['codex']['details']['cooldown_until'] = 'soon'
         snap = quota_snapshot.create_quota_snapshot(raw, 'mach1', now)
-        self.assertIsNone(snap['routes']['codex']['details']['cooldown_until'])
+        self.assertIsNone(snap['routes']['codex']['details'].get('cooldown_until'))
 
     def test_absent_window_carries_no_natives(self):
         now = utcnow()
@@ -104,7 +104,7 @@ class CollectorNativeTests(unittest.TestCase):
         snap = quota_snapshot.create_quota_snapshot(raw, 'mach1', now)
         win = snap['routes']['codex']['windows']['5h']
         self.assertFalse(win['present'])
-        self.assertIsNone(win['credits_remaining'])
+        self.assertIsNone(win.get('credits_remaining'))
 
     def test_snapshot_size_bound_holds_with_natives(self):
         now = utcnow()

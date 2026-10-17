@@ -156,11 +156,6 @@ def sanitize_window(
             "present": False,
             "rolling": False,
             "error": "unavailable",
-            "credits_remaining": None,
-            "spend_used": None,
-            "spend_limit": None,
-            "unit": None,
-            "profile": None,
         }, True
 
     has_error = False
@@ -228,19 +223,17 @@ def sanitize_window(
     else:
         window_error = None
 
-    # Hub contract: an absent or errored window carries no measurements at all
+    # Hub contract: an absent or errored window carries no measurements at all.
+    # Native fields are omitted when unknown so percent-only inputs keep their
+    # exact legacy shape; non-null natives round-trip verbatim.
     if has_error or not present:
         percent_remaining = None
         reset_at = None
-        native = {
-            "credits_remaining": None,
-            "spend_used": None,
-            "spend_limit": None,
-            "unit": None,
-            "profile": None,
-        }
-    else:
-        native = extract_native_fields(win_data)
+    native: Dict[str, Any] = {}
+    if not has_error and present:
+        for native_key, native_val in extract_native_fields(win_data).items():
+            if native_val is not None:
+                native[native_key] = native_val
 
     return {
         "percent_remaining": percent_remaining,
@@ -294,7 +287,9 @@ def sanitize_provider(
         limit_reached = None
 
     sanitized_details: Dict[str, Any] = {"limit_reached": limit_reached}
-    sanitized_details.update(extract_native_fields(raw_details))
+    for native_key, native_val in extract_native_fields(raw_details).items():
+        if native_val is not None:
+            sanitized_details[native_key] = native_val
     if "stale" in raw_details and type(raw_details["stale"]) is bool:
         sanitized_details["stale"] = raw_details["stale"]
     # Known provider backoff deadline (launcher 429 Retry-After authority, mirrored

@@ -63,7 +63,8 @@ class TestQuotaSnapshotContract(unittest.TestCase):
             host_id="mach-1",
             current_time=datetime.datetime(2026, 10, 14, 5, 31, 0, tzinfo=datetime.timezone.utc)
         )
-        self.assertEqual(snap["schema_version"], "1.0")
+        self.assertEqual(snap["schema_version"], "1.1")
+        self.assertEqual(snap["collector_version"], quota_snapshot.COLLECTOR_VERSION)
         self.assertEqual(snap["host_id"], "mach-1")
         self.assertEqual(snap["status"], "ok")
         self.assertIsNone(snap["error"])
