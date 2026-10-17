@@ -323,6 +323,7 @@ class TestRoleLifecycleAndFaults(unittest.TestCase):
                 ),
             },
             state_dir=self.state_dir,
+            launcher_repo=self.base,  # Explicit synthetic repository, never ~/git on CI.
         )
         self.runtime_mgr = RuntimeManager(role_config=self.role_cfg)
         self.client = MagicMock(spec=JobsClient)
@@ -437,10 +438,8 @@ class TestRoleLifecycleAndFaults(unittest.TestCase):
             "deadline_at": "2099-01-01T00:00:00Z",
             "role_binding": {**self.binding, "generation": 99},
         }
-        # Isolate the post-claim generation fence; local entrypoint presence
-        # must not decide whether this synthetic test reaches that fence.
-        with patch("agent_hub_host.gate.get_gate_status", return_value={"launch_allowed": True, "profile_supported": True}), \
-                patch.object(self.dispatcher, "_role_consumer_qualified", return_value=True):
+        # The synthetic backend paths above are explicit and machine-independent.
+        with patch("agent_hub_host.gate.get_gate_status", return_value={"launch_allowed": True, "profile_supported": True}):
             result = self.dispatcher.handle_offer({
                 "id": "job-gen-mismatch",
                 "kind": "writer-run",
