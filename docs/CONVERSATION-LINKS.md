@@ -98,6 +98,8 @@ Conversation membership alone never grants access to a foreign or private job. P
 
 Link rows are children of `conversations`. Fair bus-versus-conversation cleanup is unchanged at the hub layer. Inside the conversation budget, archived-parent cleanup deletes link rows in indexed `id` chunks and counts each deleted row toward `rowsDeleted <= limit`. The conversation header is removed only after messages, members, and links are gone. Orphan links (parent already missing) are a fourth fair conversation-cleanup category, sharing that same affected-row budget with archived children, removed members, and expired messages. A zero remaining allowance deletes nothing. Link associations are not expired independently of their parent, so ordinary job state updates and restarts keep the reference.
 
+Archived-parent discovery selects only parents with deletable children or authority to delete the header, before applying the batch limit. Grants, receipts and non-done slots pin the header; a slot reference in either its check action or its frozen intent is sufficient. A held parent can still drain messages, members and links. Once those children are gone, it takes no candidate allowance or fairness turn, so later eligible parents, automation and bus cleanup continue at limits of one or two rows. `hasExpiredRows` and `hasMore` report actionable work; held uncertainty alone does not request another cleanup pass. Resolving the uncertainty makes normal reconciliation eligible again.
+
 ## Out of scope
 
 Physical host adoption (M11), ping/follow-up (M5), routing policy/tier/placement, new review engine, `review_gate.py`, deploys, and any change to routing schema.

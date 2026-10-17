@@ -1123,7 +1123,8 @@ export class ConversationsService {
         WHERE r.effect_key=('check-' || s.slot_key) AND r.request_json IS NOT s.intent_json)
       ORDER BY s.name LIMIT ?`, nowMs, limit).toArray();
     const receipts = this.sql.exec(`SELECT r.effect_key FROM conversation_automation_receipts r
-      WHERE NOT EXISTS (SELECT 1 FROM hub_check_slots s WHERE ('check-' || s.slot_key)=r.effect_key AND s.state!='done')
+      WHERE NOT EXISTS (SELECT 1 FROM hub_check_slots s WHERE ('check-' || s.slot_key)=r.effect_key
+        AND (s.state!='done' OR r.request_json IS NOT s.intent_json))
       ORDER BY r.effect_key LIMIT ?`, limit).toArray();
     const grants = this.sql.exec(`SELECT g.id FROM conversation_automation_grants g
       WHERE (g.expires_at<=? OR g.revoked_at IS NOT NULL OR NOT EXISTS

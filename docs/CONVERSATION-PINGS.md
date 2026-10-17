@@ -145,6 +145,13 @@ SQL purge is required.
   closes write authority with an explicit error and no accepted effect. A receipt
   that disagrees with its frozen intent remains held for integrity reconciliation.
   Slot closure fences paused evaluators and delayed sends in the same transaction.
+- Slot selection excludes receipt mismatches before ordering and limiting the
+  batch. The slot and mismatched receipt remain byte-for-byte intact, including
+  an orphan slot, a done slot or a null/malformed frozen intent. Held rows alone
+  do not keep `hasExpiredRows` or `hasMore` true and cannot block later eligible
+  slots or other retention categories. An archived header stays pinned by either
+  the frozen check's conversation ID or the intent's conversation ID until the
+  non-done slot is reconciled. Deletable children can drain independently.
 - Once a slot is done, its receipt may retire immediately: even before a newer
   slot exists, the old key no longer authorizes a write. Current done slots retain
   their original next boundary, preserving interval and backward-clock fences.
