@@ -312,6 +312,16 @@ export class IntakeService {
     if (encoded(task) > INTAKE_LIMITS.taskBytes) fail('task_capacity', 507);
     this.put('tasks', task); return { task: this.view(task) };
   }
+  /** Readonly status-projection helpers for M14a. No write, grant or permission semantics change. */
+  statusPrincipal(auth: Auth): Obj { return this.principal(auth); }
+  statusAuthorizedTasks(p: Obj): Obj[] { return this.rows('tasks').filter(t => this.allowed(p, t)); }
+  statusTaskById(p: Obj, id: string): Obj | undefined {
+    const task = this.get('tasks', id);
+    return task && this.allowed(p, task) ? task : undefined;
+  }
+  statusUnresolved(task: Obj): Obj[] { return this.unresolved(task); }
+  statusContinuation(task: Obj): string { return this.continuation(task); }
+  statusRevision(): number { return this.revision(); }
   async handle(request: Request, authenticate: () => Promise<Auth>): Promise<Response> {
     const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
     try {

@@ -178,8 +178,16 @@ def main():
     p_available = m_sub.add_parser("available", help="List available machines")
     p_available.add_argument("--json", action="store_true", help="Output JSON")
     
-    p_status = sub.add_parser("status", help="Check status")
-    
+    p_status = sub.add_parser("status", help="One-call authorized status (single GET /api/status)")
+    p_status.add_argument("--since", default=None, help="Filter to changes since duration (e.g. 2h) or ISO time")
+    p_status.add_argument("--json", dest="json", action="store_true", help="Output raw JSON DTO")
+    p_status.add_argument("--task", default=None, help="Single task id")
+    p_status.add_argument("--project", default=None, help="Project scope filter")
+    p_status.add_argument("--host", default=None, help="Host/machine filter")
+    p_status.add_argument("--after", default=None, help="Pagination cursor (task id)")
+    p_status.add_argument("--limit", type=int, default=None, help="Page size 1..25")
+    p_status.add_argument("--local-only", action="store_true", help="Local config diagnostics only, no API call")
+
     p_run = sub.add_parser("run", help="Run the host agent in the foreground")
 
     p_send = sub.add_parser("send", help="Send a message")
@@ -354,7 +362,17 @@ def main():
         if args.m_cmd == "available":
             cmd_machines_available(args)
     elif args.cmd == "status":
-        cmd_status(args)
+        if getattr(args, 'local_only', False):
+            cmd_status(args)
+        else:
+            from . import status as status_cmd
+            try:
+                status_cmd.execute(args)
+            except SystemExit:
+                raise
+            except Exception:
+                print('Status operation failed; check authentication, scope and filters. No native input was submitted.', file=sys.stderr)
+                sys.exit(1)
     elif args.cmd == "run":
         cmd_run(args)
     elif args.cmd == "quota":

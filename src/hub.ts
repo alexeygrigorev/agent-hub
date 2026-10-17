@@ -20,6 +20,7 @@ import { approvalAuthorityMatches, assignApprovalAuthority } from './host_enroll
 import { ensureRootScheduling, getRootScheduling, isRootSchedulingEnabled, setRootScheduling } from './root_scheduling';
 import { QuotaStore, handleQuotaRoutes } from './quota';
 import { SessionControlService } from './session_control';
+import { StatusService } from './status';
 
 function parseEpoch(raw: any): number | null {
   if (raw === undefined || raw === null || raw === '' || typeof raw === 'boolean') return null;
@@ -81,6 +82,7 @@ export class Hub extends DurableObject {
   public busService: BusService;
   public jobsService: JobsService;
   public quotaStore: QuotaStore;
+  public statusService: StatusService;
   public fleetService: FleetService;
   public sessionControlService: SessionControlService;
   public livenessService: LivenessService;
@@ -95,6 +97,7 @@ export class Hub extends DurableObject {
     const txSync = (this.ctx.storage as any).transactionSync ? (fn: any) => (this.ctx.storage as any).transactionSync(fn) : undefined;
     this.intakeService = new IntakeService(this.sql, fn => this.ctx.storage.transactionSync(fn));
     this.intakeService.init();
+    this.statusService = new StatusService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.intakeService);
     this.busService = new BusService(this.sql, txSync);
     this.fleetService = new FleetService(this.sql, fn => this.ctx.storage.transactionSync(fn));
     this.fleetService.init();
@@ -348,6 +351,34 @@ export class Hub extends DurableObject {
               const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token));
               const given = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
               // A failed registered credential never upgrades to operator authority.
+              if (this.sql.exec('SELECT id FROM credentials WHERE token_hash=?', base64url(digest)).toArray().length) return auth;
+              const configured = adminTokenHash(this.env);
+              if (configured) {
+                let difference = 0;
+                for (let i = 0; i < configured.length; i++) difference |= given.charCodeAt(i) ^ configured.charCodeAt(i);
+                if (difference === 0) return { caller: { kind: 'human' as const, isAdmin: true,
+                  actor: 'human:' + tokenAdminSubject(configured) }, scopes: ['admin'] };
+              }
+            }
+          }
+          if (auth.caller?.kind === 'human' && !auth.caller.tokenId) {
+            const session = await getSession(this.env, request);
+            if (!session) return { error: Response.json({ error: 'unauthorized' }, { status: 401 }) };
+            auth.caller.actor = 'human:' + session.sub;
+          }
+          return auth;
+        });
+      }
+      if (path === '/api/status') {
+        return this.statusService.handle(request, async () => {
+          if (request.headers.has('Authorization') && request.headers.has('Cookie')) return { error: Response.json({ error: 'mixed_authority' }, { status: 403 }) };
+          const auth = await this.authenticateBusRequest(request);
+          if (auth.error && !request.headers.has('Cookie') && validSessionSecret(this.env)) {
+            const header = request.headers.get('Authorization') || '';
+            const token = /^Bearer ([^\s]{1,4096})$/.exec(header)?.[1];
+            if (token) {
+              const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token));
+              const given = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
               if (this.sql.exec('SELECT id FROM credentials WHERE token_hash=?', base64url(digest)).toArray().length) return auth;
               const configured = adminTokenHash(this.env);
               if (configured) {
