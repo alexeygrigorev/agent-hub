@@ -99,6 +99,27 @@ class TestStatusCli(unittest.TestCase):
             self.assertNotIn(control, out)
         self.assertIn('Synthetic', out)
 
+    def test_hub_sessions_and_expected_offline_rendered(self):
+        dto = dict(FIXTURE_DTO)
+        dto['coverage'] = {'sessions': 'complete', 'missing_hosts': [],
+                           'expected_offline': ['win35']}
+        dto['tasks'] = [dict(FIXTURE_DTO['tasks'][0], **{
+            'hub_sessions': [{
+                'hub_session_id': '33333333-3333-4333-8333-333333333333',
+                'linkage': 'hub_session', 'state': 'running', 'machine': 'host-a',
+                'lifecycle': {'group': 'active', 'state': 'running',
+                              'decision': {'kind': 'resume_on_reset'}},
+            }],
+            'lifecycle_summary': {'by_group': {'active': 1}, 'decisions': []},
+        })]
+        with patch.object(status, 'fetch_status', return_value=dto):
+            code, out, error = self.run_cli('status')
+        self.assertEqual(code, 0, error)
+        self.assertIn('33333333-3333-4333-8333-333333333333', out)
+        self.assertIn('lifecycle=active/running', out)
+        self.assertIn('decision=resume_on_reset', out)
+        self.assertIn('expected offline: win35', out)
+
     def test_local_only_preserves_diagnostics_without_api_call(self):
         with patch.object(status, 'fetch_status') as transport, \
              patch('agent_hub_host.config.load_config', return_value={'access_token': 'x', 'base_url': 'https://hub.test'}):

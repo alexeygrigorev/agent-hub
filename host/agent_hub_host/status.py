@@ -66,6 +66,9 @@ def render_human(data):
     missing = (data.get('coverage') or {}).get('missing_hosts') or []
     if missing:
         lines.append('missing hosts: %s' % ', '.join(escape_display(h) for h in missing))
+    offline = (data.get('coverage') or {}).get('expected_offline') or []
+    if offline:
+        lines.append('expected offline: %s' % ', '.join(escape_display(h) for h in offline))
     for task in data.get('tasks', []):
         lines.append('task %s [%s] %s updated=%s' % (
             escape_display(task.get('id')), escape_display(task.get('status')),
@@ -75,6 +78,14 @@ def render_human(data):
                 escape_display(sess.get('machine_id')), escape_display(sess.get('native_id')),
                 escape_display(sess.get('engine')), escape_display(sess.get('phase')),
                 escape_display(sess.get('linkage')), escape_display(sess.get('observed_at'))))
+        for hub in task.get('hub_sessions', []):
+            life = hub.get('lifecycle') or {}
+            decision = life.get('decision') or {}
+            lines.append('  hub-session %s state=%s machine=%s lifecycle=%s/%s%s' % (
+                escape_display(hub.get('hub_session_id')), escape_display(hub.get('state')),
+                escape_display(hub.get('machine')),
+                escape_display(life.get('group')), escape_display(life.get('state')),
+                ' decision=%s' % escape_display(decision.get('kind')) if decision.get('kind') else ''))
         for action in task.get('pending_actions', []):
             lines.append('  pending %s by %s: %s' % (
                 escape_display(action.get('type')), escape_display(action.get('actor')),

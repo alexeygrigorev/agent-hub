@@ -68,6 +68,19 @@ function seedCanonicalChain(jobId: string, launchId: string, machine: string, na
   });
 }
 
+function seedHubSession(sessionId: string, actor: string, machine: string, state: string, native: string | null) {
+  return inDO(stub(), (h: any) => {
+    const now = new Date().toISOString();
+    h.sql.exec('INSERT OR REPLACE INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+      sessionId, actor, 'key-' + sessionId, '{}', null, machine, 'opencode', 'headless', state,
+      native ? JSON.stringify({ native_id: native }) : null, now, now);
+    if (native) {
+      h.sql.exec('INSERT OR REPLACE INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,profile,account,last_activity_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        machine, native, 'hub-tag', 'opencode', 'running', 'working', now, 'demo', null, 'default', now);
+    }
+  });
+}
+
 beforeEach(async () => {
   cookie = (await createSessionCookie(env as any, { sub: 'operator', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf', exp: Math.floor(Date.now() / 1000) + 3600 })).split(';')[0];
   await inDO(stub(), (h: any) => {
@@ -77,6 +90,10 @@ beforeEach(async () => {
     h.sql.exec('DELETE FROM credentials'); h.sql.exec('DELETE FROM agents');
     h.sql.exec('DELETE FROM routing_jobs'); h.sql.exec('DELETE FROM fleet_launches'); h.sql.exec('DELETE FROM fleet_sessions');
     h.sql.exec('DELETE FROM machines');
+    try { h.sql.exec('DELETE FROM session_control_sessions'); } catch {}
+    try { h.sql.exec('DELETE FROM session_control_commands'); } catch {}
+    try { h.sql.exec('DELETE FROM session_lifecycle_observations'); } catch {}
+    try { h.sql.exec('DELETE FROM session_lifecycle_decisions'); } catch {}
   });
 });
 
@@ -188,6 +205,50 @@ describe('M14a authorized one-call status projection', () => {
     expect(future.tasks.map((t: any) => t.id)).not.toContain(task.id);
     expect(future.categories.diff.state).toBe('not_available');
     expect((await call('?since=not-a-time')).status).toBe(400);
+  });
+
+  it('surfaces canonical hub_session links with live control state and lifecycle group', async () => {
+    await seedCanonicalHosts();
+    const sessionId = '33333333-3333-4333-8333-333333333333';
+    await seedHubSession(sessionId, 'demo:assistant', 'host-a', 'running', 'native-hub-1');
+    const { task } = await createTask();
+    await intakeOk('/tasks/' + task.id + '/events', { key: 'hub-link-' + ++seq, expected_version: 1,
+      event: { kind: 'link', hub_session_id: sessionId, provenance: source } });
+    const data = await ok('');
+    const row = data.tasks.find((t: any) => t.id === task.id);
+    expect(row.hub_sessions.length).toBe(1);
+    expect(row.hub_sessions[0]).toMatchObject({ hub_session_id: sessionId, linkage: 'hub_session', state: 'running', machine: 'host-a' });
+    expect(row.hub_sessions[0].lifecycle.group).toBe('active');
+    expect(row.hub_sessions[0].lifecycle.decision).toBeNull();
+    expect(row.lifecycle_summary.by_group.active).toBe(1);
+    expect(data.categories.tasks_sessions.source).toContain('session_control_sessions');
+  });
+
+  it('hides foreign hub sessions without leaking control state', async () => {
+    await seedCanonicalHosts();
+    const sessionId = '44444444-4444-4334-8334-444444444444';
+    await seedHubSession(sessionId, 'other:assistant', 'host-a', 'running', 'native-foreign-1');
+    const a = await seedAgent('demo:assistant-a');
+    await grant(a, 'project', 'demo', 'read');
+    const { task } = await createTask('demo', 'Synthetic task');
+    await intakeOk('/tasks/' + task.id + '/events', { key: 'hub-link-f-' + ++seq, expected_version: 1,
+      event: { kind: 'link', hub_session_id: sessionId, provenance: source } });
+    const seen = await ok('', a.token);
+    const row = seen.tasks.find((t: any) => t.id === task.id);
+    expect(row.hub_sessions.length).toBe(1);
+    expect(row.hub_sessions[0]).toMatchObject({ hub_session_id: sessionId, linkage: 'not_visible' });
+    expect(JSON.stringify(row.hub_sessions[0])).not.toContain('running');
+  });
+
+  it('treats win35 stale checkins as expected offline, not an outage', async () => {
+    await seedCanonicalHosts();
+    await inDO(stub(), (h: any) => {
+      h.sql.exec("INSERT OR IGNORE INTO machines(id,name,hostname,registered_at,last_checkin_at,drained) VALUES ('win35','win35','DESKTOP-FP4OP26','2026-01-01T00:00:00.000Z','2020-01-01T00:00:00.000Z',0)");
+    });
+    const data = await ok('');
+    expect(data.coverage.missing_hosts).toContain('host-old');
+    expect(data.coverage.missing_hosts).not.toContain('win35');
+    expect(data.coverage.expected_offline).toContain('win35');
   });
 
   it('performs no writes and never exports secrets or private bodies', async () => {

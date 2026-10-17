@@ -1,8 +1,11 @@
-# M14a Status API (`GET /api/status`) and `hub status` CLI
+# M14 Status API (`GET /api/status`) and `hub status` CLI
 
-M14a only: one authorized read projection over existing canonical records.
-M14b (native/report collectors), M14c (verified Git/active deployment/CI adapters)
-and M14d (durable caller-scoped last-call diffs) remain explicit successor work.
+M14a shipped: one authorized read projection over existing canonical records.
+M14b slice1 shipped: canonical intake-assigned Hub sessions (`hub_session_id`
+links into `session_control_sessions`) with live SessionControl state plus
+the M15 lifecycle group/decision per bound session. M14b report-collector
+mapping, M14c (verified Git/active deployment/CI adapters) and M14d
+(durable caller-scoped last-call diffs) remain explicit successor work.
 
 ## Endpoint
 
@@ -27,15 +30,21 @@ and page.
 History `link` events are `author_claim` (`claimed_link_unverified`) unless a
 `routing_jobs` row exists AND its `fleet_launches` row matches AND a
 `fleet_sessions` row matches on `(machine_id, native_id)`. Only then
-`verified_launch`. A missing or stale host yields `partial` coverage with
-`missing_hosts`, never empty or healthy.
+`verified_launch`. Hub session links (`hub_session_id`) join the canonical
+`session_control_sessions` row live at the snapshot revision: operator sees
+all linked rows, other callers see only rows whose `actor` equals their own
+(`not_visible` otherwise, id only — the link event already discloses the
+id); dangling ids render `unknown_session`. A missing or stale host yields
+`partial` coverage with `missing_hosts`, never empty or healthy. `win35`
+(`DESKTOP-FP4OP26`, intentionally off ~2 weeks from 2026-10-17) is reported
+under `coverage.expected_offline`, never as an outage.
 
 ## Freshness
 
 `fleet_sessions.observed_at` means LAST CHANGED, not last seen; it is never
 restamped with heartbeats. `phase=running` proves nothing about useful work.
-No session-lifecycle classification is applied in M14a. No raw terminal,
-prompt, draft or report-body reads.
+Hub-session lifecycle reuses the M15 registry joins + pure classifier (no
+second tracker). No raw terminal, prompt, draft or report-body reads.
 
 ## Per-task DTO
 
@@ -44,6 +53,16 @@ prompt, draft or report-body reads.
 - `sessions[]`: machine/native/tag/engine/profile/phase/agent_state/workspace/
   account/observed_at/last_activity_at/linkage/launch_id/routing_job_id plus
   per-row provenance `{source, observed_at, freshness, coverage, reason}`.
+- `hub_sessions[]` (M14b slice1): per canonical `hub_session_id` link —
+  `{hub_session_id, linkage: hub_session|not_visible|unknown_session,
+  state, machine, engine, mode, fleet_launch_id, native_id, binding,
+  updated_at}` plus `lifecycle: {session_key, group, state,
+  reasons[<=5], flags, obligations, decision}` reused from the M15 registry
+  joins + pure classifier (no second tracker; unbound intents report
+  `unknown` with reason `no_bound_native_identity_or_no_canonical_join`)
+  and per-row provenance `{source: session_control_canonical_row, ...}`.
+- `lifecycle_summary` per task: `{by_group: {group: count}, decisions[<=10]}`
+  over visible `hub_session` links only.
 - `reports[]`: `{reference, source}` plus `headline: unknown`,
   `verdict: unknown` with `successor: M14b`.
 - `commits[]`: `{reference, source}` plus `deploy_state: unknown`,
@@ -55,7 +74,9 @@ prompt, draft or report-body reads.
   in this cut; `device_code_hash`, tokens and credential hashes never appear.
 - `session_coverage` per task plus top-level `coverage` and `categories`
   (tasks_sessions / reports / commits_deploys_ci / pending_actions / diff)
-  with honest `unknown` for uncollected successors.
+  with honest `unknown` for uncollected successors. `tasks_sessions.source`
+  now reads
+  `intake_tasks+routing_jobs+fleet_launches+fleet_sessions+session_control_sessions+lifecycle`.
 
 ## Pagination and `--since`
 
