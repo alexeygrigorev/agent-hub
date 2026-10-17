@@ -216,6 +216,91 @@ class TestSessionControlCli(unittest.TestCase):
         with self.assertRaises(ValueError):
             session_control.check_session_name('dataops:batching')
 
+    def test_start_lineage_parent_and_headless_flags(self):
+        with patch.object(session_control, 'request', return_value={'id': 's-child'}) as transport:
+            session_control.execute(self.parse('start', '--workspace', 'demo', '--parent', 'parent-123', '--headless', '--key', 'k-lineage'))
+        payload = transport.call_args.args[2]
+        self.assertEqual(payload['parent_id'], 'parent-123')
+        self.assertEqual(payload['mode'], 'headless')
+
+    def test_sessions_tree_routing(self):
+        with patch.object(session_control, 'request', return_value={'tree': []}) as transport:
+            session_control.execute(self.parse('tree'))
+        self.assertEqual(transport.call_args.args[:2], ('GET', '/api/sessions/tree'))
+
+        with patch.object(session_control, 'request', return_value={'tree': []}) as transport:
+            session_control.execute(self.parse('list', '--tree'))
+        self.assertEqual(transport.call_args.args[:2], ('GET', '/api/sessions/tree'))
+
+    def test_render_table_and_tree_formatters(self):
+        sample_sessions = [
+            {
+                'id': 'uuid-1',
+                'session_type': 'aplexer',
+                'qualified_alias': 'dataops:batching',
+                'engine': 'gemini',
+                'state': 'running',
+                'workspace': '/home/alexey/git/dataops',
+                'updated_at': '2026-10-17T19:40:00.000Z'
+            },
+            {
+                'id': 'uuid-2',
+                'session_type': 'headless',
+                'qualified_alias': None,
+                'name': 'worker-1',
+                'engine': 'codex',
+                'state': 'running',
+                'workspace': '/home/alexey/git/agent-hub',
+                'updated_at': '2026-10-17T19:42:00.000Z'
+            }
+        ]
+        table = session_control.render_table(sample_sessions)
+        self.assertIn('TYPE', table)
+        self.assertIn('NAME', table)
+        self.assertIn('dataops:batching', table)
+        self.assertIn('worker-1', table)
+        self.assertIn('aplexer', table)
+        self.assertIn('headless', table)
+
+        sample_tree = {
+            'tree': [
+                {
+                    'id': 'uuid-1',
+                    'session_type': 'aplexer',
+                    'qualified_alias': 'dataops:batching',
+                    'state': 'running',
+                    'workspace': '/home/alexey/git/dataops',
+                    'children': [
+                        {
+                            'id': 'uuid-2',
+                            'session_type': 'headless',
+                            'name': 'worker-1',
+                            'state': 'running',
+                            'workspace': '/home/alexey/git/agent-hub',
+                            'children': []
+                        }
+                    ]
+                }
+            ]
+        }
+        tree = session_control.render_tree(sample_tree)
+        self.assertIn('Sessions Lineage Tree:', tree)
+        self.assertIn('[aplexer] dataops:batching (running)', tree)
+        self.assertIn('[headless] worker-1 (running)', tree)
+        self.assertIn('└── ', tree)
+
+        # render_output with --json flag returns raw data
+        args_json = self.parse('list', '--json')
+        out_json = session_control.render_output(args_json, {'sessions': sample_sessions})
+        self.assertIsInstance(out_json, dict)
+
+        # render_output without --json returns formatted string
+        args_plain = self.parse('list')
+        out_plain = session_control.render_output(args_plain, {'sessions': sample_sessions})
+        self.assertIsInstance(out_plain, str)
+        self.assertIn('dataops:batching', out_plain)
+
 
 if __name__ == '__main__':
     unittest.main()
+

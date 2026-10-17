@@ -35,7 +35,7 @@ import {
 } from './session_lifecycle_registry';
 
 export const SESSION_CONTROL_SCHEMA = `
-CREATE TABLE IF NOT EXISTS session_control_sessions (id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, fleet_launch_id TEXT, machine_id TEXT, engine TEXT, mode TEXT NOT NULL, state TEXT NOT NULL, binding_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
+CREATE TABLE IF NOT EXISTS session_control_sessions (id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, fleet_launch_id TEXT, machine_id TEXT, engine TEXT, mode TEXT NOT NULL, state TEXT NOT NULL, binding_json TEXT, parent_id TEXT, parent_source TEXT, session_type TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
 CREATE TABLE IF NOT EXISTS session_control_commands (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, request_key TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, correlation TEXT NOT NULL, poll_at TEXT, ack_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(session_id, actor, request_key));
 CREATE TABLE IF NOT EXISTS session_control_proofs (reply_envelope_id TEXT PRIMARY KEY, command_id TEXT NOT NULL, session_id TEXT NOT NULL, created_at TEXT NOT NULL);
 `;
@@ -200,7 +200,7 @@ export class SessionControlService {
     }
     // Additive migration for tables created by the earlier reserve-only draft.
     const sessionCols = new Set(this.sql.exec('PRAGMA table_info(session_control_sessions)').toArray().map((c: any) => String(c.name)));
-    for (const [col, type] of [['owner_token_id', 'TEXT'], ['owner_family', 'TEXT'], ['host_family', 'TEXT']] as const) {
+    for (const [col, type] of [['owner_token_id', 'TEXT'], ['owner_family', 'TEXT'], ['host_family', 'TEXT'], ['parent_id', 'TEXT'], ['parent_source', 'TEXT'], ['session_type', 'TEXT']] as const) {
       if (!sessionCols.has(col)) this.sql.exec(`ALTER TABLE session_control_sessions ADD COLUMN ${col} ${type}`);
     }
     const commandCols = new Set(this.sql.exec('PRAGMA table_info(session_control_commands)').toArray().map((c: any) => String(c.name)));
@@ -408,6 +408,10 @@ export class SessionControlService {
     const workspace = binding?.workspace || request?.workspace || null;
     const tag = binding?.tag || request?.tag || null;
     const qualified_alias = workspace && tag ? qualifiedNativeAlias(workspace, tag) : null;
+    const session_type = row.session_type || (row.mode === 'interactive' || row.interactive ? 'aplexer' : (isObserved ? 'aplexer' : 'headless'));
+    const parent_id = row.parent_id || null;
+    const parent_source = row.parent_source || (row.parent_id ? 'explicit_parent' : 'unknown_external');
+    const qualified_name = qualified_alias || (typeof request.name === 'string' ? request.name : row.id);
     return {
       id: row.id, state: row.state, machine: row.machine_id ?? null, engine: row.engine ?? null,
       mode: row.mode, access: request.access?.mode || 'legacy_unspecified',
@@ -421,6 +425,10 @@ export class SessionControlService {
       controllability,
       workspace,
       qualified_alias,
+      qualified_name,
+      session_type,
+      parent_id,
+      parent_source,
       created_at: row.created_at, updated_at: row.updated_at,
     };
   }
@@ -713,13 +721,14 @@ export class SessionControlService {
     if (path === '/api/sessions' && request.method === 'POST') {
       if (!writer) return response({ error: 'forbidden' }, 403);
       const input = await body(request);
-      if (!obj(input, ['key', 'engine', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name']) ||
+      if (!obj(input, ['key', 'engine', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id']) ||
           !label(input.key) || !workspaceOk(input.workspace) ||
           (input.engine !== undefined && !label(input.engine)) ||
           (input.machine !== undefined && !label(input.machine)) ||
           (input.name !== undefined && !nameOk(input.name)) ||
           (input.cwd !== undefined && !cwdOk(input.cwd)) ||
           (input.mode !== undefined && !['headless', 'interactive'].includes(input.mode)) ||
+          (input.parent_id !== undefined && (typeof input.parent_id !== 'string' || !input.parent_id.trim() || input.parent_id.length > 256)) ||
           (input.brief !== undefined && (typeof input.brief !== 'string' || !input.brief.trim() || input.brief.length > 8000))) {
         return response({ error: 'invalid_session_request' }, 400);
       }
@@ -748,12 +757,47 @@ export class SessionControlService {
         return response({ error: 'invalid_session_request' }, 400);
       }
       const actor = caller.actor || caller.machineId || 'admin';
-      const canonical = JSON.stringify({
-        engine: input.engine ?? null, machine: input.machine ?? null,
-        workspace: input.workspace, cwd: input.cwd ?? null, brief: input.brief ?? null,
-        mode, access: input.access ?? null, name: input.name ?? null,
-      });
       return this.transaction(() => {
+        let parentId: string | null = null;
+        let parentSource = 'unknown_external';
+        if (input.parent_id) {
+          const trimmedParent = input.parent_id.trim();
+          let parentRow: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', trimmedParent).toArray()[0];
+          if (!parentRow) {
+            for (const r of this.sql.exec('SELECT * FROM session_control_sessions').toArray() as any[]) {
+              const b = parsed(r.binding_json, null);
+              if (b?.native_id === trimmedParent) {
+                parentRow = r;
+                break;
+              }
+            }
+          }
+          if (!parentRow) {
+            return response({ error: 'parent_session_not_found' }, 404);
+          }
+          if (!admin && !this.ownerOk(parentRow, caller)) {
+            return response({ error: 'parent_forbidden' }, 403);
+          }
+          let curr = parentRow;
+          const visited = new Set<string>();
+          while (curr && curr.parent_id) {
+            if (visited.has(curr.parent_id)) {
+              return response({ error: 'parent_cycle_detected' }, 400);
+            }
+            visited.add(curr.parent_id);
+            curr = this.sql.exec('SELECT id, parent_id FROM session_control_sessions WHERE id = ?', curr.parent_id).toArray()[0];
+          }
+          parentId = parentRow.id;
+          parentSource = 'explicit_parent';
+        }
+        const sessionType = mode === 'interactive' ? 'aplexer' : 'headless';
+        const canonical = JSON.stringify({
+          engine: input.engine ?? null, machine: input.machine ?? null,
+          workspace: input.workspace, cwd: input.cwd ?? null, brief: input.brief ?? null,
+          mode, access: input.access ?? null, name: input.name ?? null,
+          parent_id: parentId ?? null,
+        });
+
         const prior: any = this.sql.exec(
           'SELECT * FROM session_control_sessions WHERE actor = ? AND request_key = ?', actor, input.key).toArray()[0];
         if (prior) {
@@ -778,8 +822,8 @@ export class SessionControlService {
             const id = crypto.randomUUID();
             const at = this.at();
             this.sql.exec(
-              'INSERT INTO session_control_sessions (id, actor, request_key, request_json, mode, state, owner_token_id, owner_family, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-              id, actor, input.key, canonical, mode, 'held', caller.tokenId ?? null, creatorFamily, at, at);
+              'INSERT INTO session_control_sessions (id, actor, request_key, request_json, mode, state, owner_token_id, owner_family, parent_id, parent_source, session_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+              id, actor, input.key, canonical, mode, 'held', caller.tokenId ?? null, creatorFamily, parentId, parentSource, sessionType, at, at);
             const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
             return response({ ...this.view(row), hold: 'no_placement_authority' }, 409);
           }
@@ -789,8 +833,8 @@ export class SessionControlService {
         const at = this.at();
         if (!prior) {
           this.sql.exec(
-            'INSERT INTO session_control_sessions (id, actor, request_key, request_json, mode, state, owner_token_id, owner_family, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            id, actor, input.key, canonical, mode, 'queued', caller.tokenId ?? null, creatorFamily, at, at);
+            'INSERT INTO session_control_sessions (id, actor, request_key, request_json, mode, state, owner_token_id, owner_family, parent_id, parent_source, session_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            id, actor, input.key, canonical, mode, 'queued', caller.tokenId ?? null, creatorFamily, parentId, parentSource, sessionType, at, at);
         }
       // engine / machine / tier / workspace / cwd / mode / prompt reach the
       // existing fleet reserve as REAL placement constraints (exact route
@@ -817,6 +861,30 @@ export class SessionControlService {
         const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
         return response({ ...this.view(row), replay: !!prior }, prior ? 200 : 201);
       });
+    }
+
+    if ((path === '/api/sessions/tree' || (path === '/api/sessions' && (url.searchParams.get('view') === 'tree' || url.searchParams.get('tree') === 'true'))) && request.method === 'GET') {
+      if (!writer) return response({ error: 'forbidden' }, 403);
+      const allRows = (admin
+        ? this.sql.exec('SELECT * FROM session_control_sessions ORDER BY created_at ASC, id ASC').toArray()
+        : this.sql.exec('SELECT * FROM session_control_sessions WHERE actor = ? ORDER BY created_at ASC, id ASC', caller.actor).toArray()
+      ).filter((r: any) => this.ownerOk(r, caller));
+
+      const views = allRows.map((r: any) => ({ ...this.view(r), children: [] }));
+      const map = new Map<string, any>();
+      for (const v of views) {
+        map.set(v.id, v);
+        if (v.binding?.native_id) map.set(v.binding.native_id, v);
+      }
+      const roots: any[] = [];
+      for (const v of views) {
+        if (v.parent_id && map.has(v.parent_id) && map.get(v.parent_id) !== v) {
+          map.get(v.parent_id).children.push(v);
+        } else {
+          roots.push(v);
+        }
+      }
+      return response({ tree: roots, total: views.length });
     }
 
     if (path === '/api/sessions' && request.method === 'GET') {
@@ -1634,11 +1702,15 @@ export function adoptObservedNativeSessions(
       adopted_at: isoNow,
     };
 
+    const sessionType = (s.session_type === 'headless' || s.mode === 'headless') ? 'headless' : 'aplexer';
+    const parentId = typeof s.parent_id === 'string' && s.parent_id ? s.parent_id : null;
+    const parentSource = parentId ? 'inferred' : 'unknown_external';
+
     if (!existing) {
       // Insert new adopted session
       const requestKey = 'native-' + nativeId;
       sql.exec(
-        'INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, binding_json, owner_token_id, owner_family, host_family, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, binding_json, parent_id, parent_source, session_type, owner_token_id, owner_family, host_family, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         nativeId,
         actor,
         requestKey,
@@ -1646,9 +1718,12 @@ export function adoptObservedNativeSessions(
         null,
         machineId,
         typeof s.engine === 'string' ? s.engine : null,
-        'interactive',
+        sessionType === 'headless' ? 'headless' : 'interactive',
         state,
         JSON.stringify(bindingPayload),
+        parentId,
+        parentSource,
+        sessionType,
         null,
         null,
         resolvedFamily || null,
@@ -1675,6 +1750,9 @@ export function adoptObservedNativeSessions(
           nativeId,
         );
         updated++;
+      }
+      if (parentId && !existing.parent_id) {
+        sql.exec('UPDATE session_control_sessions SET parent_id = ?, parent_source = ? WHERE id = ?', parentId, parentSource, nativeId);
       }
     }
   }

@@ -68,3 +68,31 @@ hub sessions commands dataops:batching
 # Stop an adopted session
 hub sessions stop git:crm-redesign
 ```
+
+## Session Lineage & Unified Tree (Addendum 7)
+
+1. **Unified View & Type Column**:
+   - `hub sessions list` displays a compact table with columns: `TYPE`, `NAME`, `ENGINE`, `STATE`, `WORKSPACE`, `UPDATED`.
+   - The `TYPE` column distinguishes between `aplexer` (interactive terminal session with control socket) and `headless` (automated agent task).
+   - Machine-readable output is available via `--json`.
+
+2. **Lineage Tracking (`--parent`)**:
+   - Sub-sessions and worker tasks can be started with `--parent <session_id>`:
+     ```bash
+     hub sessions start --workspace /home/alexey/git/agent-hub --name worker-1 --parent <coordinator_id> --headless --prompt "Execute worker task"
+     ```
+   - Parents must exist in the database and pass server authorization.
+   - Circular lineage is rejected with HTTP 400 `parent_cycle_detected`.
+   - External sessions without an explicit or inferable parent are marked with `parent_source: "unknown_external"`.
+
+3. **Lineage Tree View & Dashboard**:
+   - Command line: `hub sessions tree` or `hub sessions list --tree` displays the full hierarchical relationship:
+     ```
+     Sessions Lineage Tree:
+     ├── [aplexer] coordinator-1 (running) (/home/alexey/git/agent-hub)
+     │   └── [headless] worker-1 (running) (/home/alexey/git/agent-hub)
+     ├── [aplexer] dataops:batching (running) (/home/alexey/git/dataops)
+     └── [aplexer] git:crm-redesign (running) (/home/alexey/git)
+     ```
+   - Web Dashboard: A dedicated dashboard is available at `/sessions` (`/sessions.html`), featuring both list view and lineage tree views with real-time filtering.
+

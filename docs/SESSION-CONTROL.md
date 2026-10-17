@@ -433,4 +433,10 @@ Host-attested native aplexer sessions (interactive sessions, background work, ta
    - Missing native records from a host snapshot alone are NOT exit proof. Records are never deleted or prematurely marked stopped on absent polls.
 6. **Automated Cleanup Protection**:
    - Observed native sessions are permanently protected from automated cleanup scripts or scheduled stop apply passes.
+7. **Lineage Tracking & Unified Tree (Addendum 7)**:
+   - `hub sessions list` provides a compact table with columns `TYPE`, `NAME`, `ENGINE`, `STATE`, `WORKSPACE`, `UPDATED` (and `--json` for machine output).
+   - `session_type`: distinguishes `aplexer` interactive sessions from `headless` agent runs.
+   - `hub sessions start` supports `--parent <session_id>` to record verified parentage. Server enforces existence, access control, and anti-cycling checks (returns HTTP 400 `parent_cycle_detected`).
+   - Lineage hierarchy is rendered via `hub sessions tree` (or `hub sessions list --tree`) and available at `/sessions` dashboard (`/sessions.html`) with interactive filtering.
+
 

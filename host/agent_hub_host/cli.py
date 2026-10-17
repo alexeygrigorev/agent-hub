@@ -371,7 +371,12 @@ def main():
         return
     if args.cmd == 'sessions':
         try:
-            print(json.dumps(session_control.execute(args), indent=2, ensure_ascii=True))
+            result = session_control.execute(args)
+            rendered = session_control.render_output(args, result)
+            if isinstance(rendered, str):
+                print(rendered)
+            else:
+                print(json.dumps(rendered, indent=2, ensure_ascii=True))
         except Exception:
             print('Session operation failed; check authentication, grants, capacity and current versions. '
                   'Retry mutations with the same key and payload after uncertain responses; '

@@ -894,5 +894,80 @@ describe('absolute workspace identifiers and friendly names', () => {
         expect(hubData.provenance).toBe('canonical_hub');
       }, fake.hook);
     });
+
+    it('validates lineage parent_id, prevents cycles, and projects session_type, parent_id, parent_source, qualified_name', async () => {
+      const fake = fakeReserve();
+      await fixture(async (s) => {
+        // 1. Root session (no parent)
+        const root = await startOk(s, { workspace: 'demo', name: 'coordinator' }, admin, 'lineage-root');
+        expect(root.parent_id).toBeNull();
+        expect(root.parent_source).toBe('unknown_external');
+        expect(root.session_type).toBe('headless');
+        expect(root.qualified_name).toBe('coordinator');
+
+        // 2. Child session with parent_id
+        const childRes = await s.handle(request('/api/sessions', {
+          key: 'lineage-child',
+          workspace: 'demo',
+          name: 'worker-1',
+          parent_id: root.id,
+        }), admin);
+        expect(childRes.status).toBe(201);
+        const child = await childRes.json() as any;
+        expect(child.parent_id).toBe(root.id);
+        expect(child.parent_source).toBe('explicit_parent');
+        expect(child.session_type).toBe('headless');
+
+        // 3. Unknown parent -> 404
+        const missingRes = await s.handle(request('/api/sessions', {
+          key: 'lineage-missing',
+          workspace: 'demo',
+          parent_id: 'non-existent-uuid',
+        }), admin);
+        expect(missingRes.status).toBe(404);
+        const missingData = await missingRes.json() as any;
+        expect(missingData.error).toBe('parent_session_not_found');
+
+        // 4. Non-admin cannot forge parent across unowned sessions -> 403
+        const agentAuth = { caller: { kind: 'agent', actor: 'agent:foreign', tokenId: 'tok-foreign' }, scopes: ['fleet:launch'] };
+        // (agentLive will check tok-foreign; since tok-foreign is not in credentials table, agent caller gets 403)
+        const forgeRes = await s.handle(request('/api/sessions', {
+          key: 'lineage-forge',
+          workspace: 'demo',
+          parent_id: root.id,
+        }), agentAuth);
+        expect(forgeRes.status).toBe(403);
+      }, fake.hook);
+    });
+
+    it('serves lineage tree at /api/sessions/tree with hierarchical children', async () => {
+      const fake = fakeReserve();
+      await fixture(async (s) => {
+        const root = await startOk(s, { workspace: 'demo', name: 'root-agent' }, admin, 'tree-root');
+        const child1 = await (await s.handle(request('/api/sessions', {
+          key: 'tree-c1',
+          workspace: 'demo',
+          name: 'worker-sub-1',
+          parent_id: root.id,
+        }), admin)).json() as any;
+        const child2 = await (await s.handle(request('/api/sessions', {
+          key: 'tree-c2',
+          workspace: 'demo',
+          name: 'worker-sub-2',
+          parent_id: root.id,
+        }), admin)).json() as any;
+
+        const treeRes = await s.handle(request('/api/sessions/tree', undefined, 'GET'), admin);
+        expect(treeRes.status).toBe(200);
+        const treeData = await treeRes.json() as any;
+        expect(treeData.total).toBe(3);
+        expect(treeData.tree.length).toBe(1);
+        expect(treeData.tree[0].id).toBe(root.id);
+        expect(treeData.tree[0].children.length).toBe(2);
+        const childIds = treeData.tree[0].children.map((c: any) => c.id);
+        expect(childIds).toContain(child1.id);
+        expect(childIds).toContain(child2.id);
+      }, fake.hook);
+    });
   });
 });

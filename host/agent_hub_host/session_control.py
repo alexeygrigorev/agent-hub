@@ -244,6 +244,10 @@ def add_commands(sub):
     listing = commands.add_parser('list', help='List sessions visible to this credential')
     listing.add_argument('--state')
     listing.add_argument('--limit', type=int, default=50)
+    listing.add_argument('--json', action='store_true', help='Output machine-readable JSON')
+    listing.add_argument('--tree', action='store_true', help='Display session lineage tree')
+    tree = commands.add_parser('tree', help='Display session lineage tree')
+    tree.add_argument('--json', action='store_true', help='Output machine-readable JSON')
     start = commands.add_parser('start', help='Record a start intent; placement reuses existing fleet routing')
     start.add_argument('--engine')
     start.add_argument('--machine')
@@ -252,6 +256,9 @@ def add_commands(sub):
     start.add_argument('--cwd')
     start.add_argument('--name', default=None,
                        help='Friendly session name (stored, shown in list/show; exact-match alias, never identity)')
+    start.add_argument('--parent', default=None,
+                       help='Parent session id recording lineage')
+    start.add_argument('--headless', action='store_true', help='Explicitly start in headless mode')
     mode = start.add_mutually_exclusive_group()
     mode.add_argument('--brief-file', help='UTF-8 goal file for headless work (max 8 KiB)')
     mode.add_argument('--prompt', default=None, help='Inline UTF-8 goal text for headless work (max 8 KiB; same boundaries as --brief-file)')
@@ -387,6 +394,8 @@ def execute(args):
         if getattr(args, 'observed_at', None):
             body['observed_at'] = args.observed_at
         return request('POST', '/api/sessions/observations', body)
+    if cmd == 'tree' or (cmd == 'list' and getattr(args, 'tree', False)):
+        return request('GET', '/api/sessions/tree')
     if cmd == 'list':
         wanted = getattr(args, 'state', None)
         limit = int(getattr(args, 'limit', None) or 50)
@@ -431,7 +440,11 @@ def execute(args):
                 payload[field] = value
         if getattr(args, 'name', None) is not None:
             payload['name'] = check_session_name(args.name)
+        if getattr(args, 'parent', None) is not None:
+            payload['parent_id'] = args.parent
         payload['mode'] = 'interactive' if getattr(args, 'interactive', False) else 'headless'
+        if getattr(args, 'headless', False):
+            payload['mode'] = 'headless'
         if getattr(args, 'brief_file', None):
             if payload['mode'] == 'interactive':
                 raise ValueError('Interactive sessions start at an empty native prompt')
@@ -512,3 +525,76 @@ def execute(args):
                             sender_workspace=getattr(args, 'sender_workspace', None),
                             cleanup_roots=cleanup_roots)
     raise ValueError('Unknown sessions command')
+
+
+def render_table(sessions):
+    """Render a compact table for `hub sessions list` with columns:
+    TYPE, NAME, ENGINE, STATE, WORKSPACE, UPDATED.
+    """
+    if not sessions:
+        return 'No sessions found.'
+    headers = ['TYPE', 'NAME', 'ENGINE', 'STATE', 'WORKSPACE', 'UPDATED']
+    rows = []
+    for s in sessions:
+        stype = s.get('session_type') or ('aplexer' if s.get('mode') == 'interactive' else 'headless')
+        name = s.get('qualified_alias') or s.get('name') or s.get('id') or '-'
+        engine = s.get('engine') or '-'
+        state = s.get('state') or '-'
+        ws = s.get('workspace') or '-'
+        upd = (s.get('updated_at') or '')[:19].replace('T', ' ')
+        rows.append([stype, name, engine, state, ws, upd])
+
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, col in enumerate(row):
+            widths[i] = max(widths[i], len(str(col)))
+
+    fmt = '  '.join('%-' + str(w) + 's' for w in widths)
+    lines = [fmt % tuple(headers)]
+    lines.append('  '.join('-' * w for w in widths))
+    for row in rows:
+        lines.append(fmt % tuple(row))
+    return '\n'.join(lines)
+
+
+def render_tree(tree_data):
+    """Render an ASCII lineage tree for `hub sessions tree`."""
+    nodes = tree_data.get('tree', []) if isinstance(tree_data, dict) else (tree_data if isinstance(tree_data, list) else [])
+    if not nodes:
+        return 'No session hierarchy found.'
+    lines = ['Sessions Lineage Tree:']
+
+    def _format_node(node):
+        stype = node.get('session_type') or ('aplexer' if node.get('mode') == 'interactive' else 'headless')
+        name = node.get('qualified_alias') or node.get('name') or node.get('id')
+        state = node.get('state') or '-'
+        ws = node.get('workspace') or ''
+        ws_part = ' (%s)' % ws if ws else ''
+        return '[%s] %s (%s)%s' % (stype, name, state, ws_part)
+
+    def _walk(items, prefix=''):
+        for i, item in enumerate(items):
+            is_last = (i == len(items) - 1)
+            connector = '└── ' if is_last else '├── '
+            lines.append(prefix + connector + _format_node(item))
+            children = item.get('children', [])
+            if children:
+                ext = '    ' if is_last else '│   '
+                _walk(children, prefix + ext)
+
+    _walk(nodes)
+    return '\n'.join(lines)
+
+
+def render_output(args, result):
+    """Dispatch text table/tree vs raw machine JSON."""
+    if getattr(args, 'json', False):
+        return result
+    cmd = getattr(args, 'sessions_cmd', None)
+    if cmd == 'tree' or (cmd == 'list' and getattr(args, 'tree', False)):
+        return render_tree(result)
+    if cmd == 'list':
+        sessions = result.get('sessions', []) if isinstance(result, dict) else (result if isinstance(result, list) else [])
+        return render_table(sessions)
+    return result
+
