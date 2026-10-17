@@ -21,7 +21,18 @@ from . import api, auth, config
 
 SCHEMA_VERSION = "1.1"
 COLLECTOR_VERSION = "quota_snapshot/1.1"
-ALLOWED_PROVIDERS = ("codex", "claude", "gemini", "grok", "zai", "go", "copilot")
+ALLOWED_PROVIDERS = (
+    "codex",
+    # Orin's second Codex account (own CODEX_HOME, own ChatGPT token);
+    # reported by the same host collector (quse) as a separate route.
+    "codex-orin",
+    "claude",
+    "gemini",
+    "grok",
+    "zai",
+    "go",
+    "copilot",
+)
 NATIVE_UNIT_LABELS = ("percent", "credits", "usd_cents", "requests", "tokens")
 PROFILE_LABEL_REGEX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./-]{0,63}$")
 COLLECTOR_VERSION_REGEX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+/-]{0,63}$")

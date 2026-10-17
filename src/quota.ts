@@ -17,6 +17,8 @@ export const MAX_SPEND_VALUE = 1e15;
 
 export const ALLOWED_QUOTA_PROVIDERS = new Set<string>([
   "codex",
+  // Orin's second Codex account (own CODEX_HOME, own ChatGPT token).
+  "codex-orin",
   "claude",
   "gemini",
   "grok",
