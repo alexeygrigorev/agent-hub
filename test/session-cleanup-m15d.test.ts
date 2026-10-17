@@ -9,7 +9,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
-import { SessionControlService } from '../src/session_control';
+import { SessionControlService, deriveCleanupSessionKey, CLEANUP_APPLY_ALLOWED_STATES } from '../src/session_control';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
@@ -123,6 +123,59 @@ describe('m15d cleanup apply', () => {
     const fresh = await (await s.handle(request('/api/sessions/cleanup', { apply: true, key: 'op-two' }), agent())).json() as any;
     expect(fresh.enqueued[0].command_id).toBe(plan.enqueued[0].command_id);
     expect((sql.exec("SELECT COUNT(*) AS n FROM session_control_commands WHERE kind = 'stop'").one() as any).n).toBe(1);
+  }));
+
+  it('derives bounded collision-free session keys from full operation key and session ID', async () => {
+    const k1 = await deriveCleanupSessionKey('m15-cleanup-batch-alpha', 'session-1234');
+    const k2 = await deriveCleanupSessionKey('m15-cleanup-batch-beta', 'session-1234');
+    const k3 = await deriveCleanupSessionKey('m15-cleanup-batch-alpha', 'session-5678');
+    const k1Replay = await deriveCleanupSessionKey('m15-cleanup-batch-alpha', 'session-1234');
+
+    expect(k1).toMatch(/^cu-[a-zA-Z0-9_-]{40,60}$/);
+    expect(k1.length).toBeLessThanOrEqual(64);
+    expect(k1).toBe(k1Replay);
+    expect(k1).not.toBe(k2); // Common 12-char prefix does NOT collide
+    expect(k1).not.toBe(k3); // Different session ID does NOT collide
+    expect(CLEANUP_APPLY_ALLOWED_STATES.has('stopped')).toBe(true);
+  });
+
+  it('allows cleanup --apply for already-stopped sessions while ordinary stop refuses', async () => fixture(async (s, sql) => {
+    const created = await startAgentSession(s, 'm15d-already-stopped');
+    await bindAgentSession(s, sql, created.id, 'launch-1');
+    await finishObservation(s);
+
+    // Mark the canonical session stopped (e.g. naturally exited / host reported exit)
+    sql.exec("UPDATE session_control_sessions SET state = 'stopped' WHERE id = ?", created.id);
+
+    // Ordinary stop API must refuse already-stopped sessions
+    const ordStop = await s.handle(request(`/api/sessions/${created.id}/stop`, { key: 'ord-stop-1' }), agent());
+    expect(ordStop.status).toBe(409);
+    const ordBody = await ordStop.json() as any;
+    expect(ordBody.error).toBe('session_not_stoppable');
+
+    // Cleanup --apply MUST allow already-stopped sessions and enqueue a cleanup stop command
+    const cleanupRes = await s.handle(request('/api/sessions/cleanup', { apply: true, key: 'op-cleanup-stopped' }), agent());
+    expect(cleanupRes.status, await cleanupRes.clone().text()).toBe(200);
+    const cleanupPlan = await cleanupRes.json() as any;
+    expect(cleanupPlan.apply).toBe(true);
+    expect(cleanupPlan.enqueued).toHaveLength(1);
+    expect(cleanupPlan.enqueued[0].session_id).toBe(created.id);
+    expect(cleanupPlan.enqueued[0].replay).toBe(false);
+
+    // Command must have cleanup_tree authorized
+    const stopCmd = sql.exec("SELECT * FROM session_control_commands WHERE session_id = ? AND kind = 'stop'", created.id).toArray()[0] as any;
+    expect(stopCmd).toBeTruthy();
+    const payload = JSON.parse(stopCmd.payload_json);
+    expect(payload.cleanup_tree).toBe(true);
+    expect(payload.operation_key).toBe('op-cleanup-stopped');
+
+    // Exact replay of cleanup apply with same key replays same command
+    const replayRes = await s.handle(request('/api/sessions/cleanup', { apply: true, key: 'op-cleanup-stopped' }), agent());
+    expect(replayRes.status).toBe(200);
+    const replayPlan = await replayRes.json() as any;
+    expect(replayPlan.enqueued).toHaveLength(1);
+    expect(replayPlan.enqueued[0].command_id).toBe(stopCmd.id);
+    expect(replayPlan.enqueued[0].replay).toBe(true);
   }));
 
   it('refuses admin apply (never another owner) and validates keys', async () => fixture(async (s, sql) => {

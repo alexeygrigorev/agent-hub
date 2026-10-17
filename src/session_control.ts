@@ -24,6 +24,7 @@ import { credentialActor } from './agent_registry';
 import { redact } from './routing';
 import { taskTier } from './model-routing';
 import { approvalAuthorityMatches } from './host_enrollment';
+import { sha256 } from './auth/crypto';
 import {
   buildLifecycleView,
   classifyKey,
@@ -53,8 +54,14 @@ const ACK_OUTCOMES = new Set(['delivered', 'transported', 'refused', 'uncertain'
 const HEADERS = { 'Cache-Control': 'private, no-store' };
 const BOUND_STATES = new Set(['running']);
 const STOPPABLE = new Set(['offered', 'starting', 'running', 'uncertain']);
+export const CLEANUP_APPLY_ALLOWED_STATES = new Set([...STOPPABLE, 'stopped']);
 const BINDABLE = new Set(['offered', 'starting', 'uncertain', 'running']);
 const CLAIMABLE = new Set(['recorded', 'transported']);
+
+export async function deriveCleanupSessionKey(operationKey: string, sessionId: string): Promise<string> {
+  const digest = await sha256(`cu:${operationKey}:${sessionId}`);
+  return `cu-${digest}`;
+}
 
 const label = (x: unknown): x is string => typeof x === 'string' && LABEL.test(x);
 const response = (value: unknown, status = 200) => Response.json(value, { status, headers: HEADERS });
@@ -1013,9 +1020,26 @@ export class SessionControlService {
         }
         const operationKey = typeof rawKey === 'string' ? rawKey : crypto.randomUUID();
         const scope = { owner: caller.actor ?? null, host: scopeParam('host'), task: scopeParam('task') };
+        const callerOwner = caller.actor ?? '';
+        const candidateSessionIds = new Set<string>();
+        try {
+          const preEligible = collectCleanupEligible(this.sql, scope, callerOwner, this.now());
+          for (const cand of preEligible.eligible) {
+            if (cand.refs.session_id) candidateSessionIds.add(cand.refs.session_id);
+          }
+        } catch {}
+        try {
+          const ownSessions = this.sql.exec('SELECT id FROM session_control_sessions WHERE actor = ?', callerOwner).toArray() as any[];
+          for (const row of ownSessions) {
+            if (row.id) candidateSessionIds.add(String(row.id));
+          }
+        } catch {}
+        const keyMap = new Map<string, string>();
+        for (const sid of candidateSessionIds) {
+          keyMap.set(sid, await deriveCleanupSessionKey(operationKey, sid));
+        }
         return this.transaction(() => {
           if (!this.agentLive(caller)) return response({ error: 'forbidden' }, 403);
-          const callerOwner = caller.actor ?? '';
           const collected = collectCleanupEligible(this.sql, scope, callerOwner, this.now());
           const enqueued: { session_key: string; session_id: string; command_id: string; state: string; replay: boolean }[] = [];
           const refused = [...collected.ineligible];
@@ -1056,7 +1080,7 @@ export class SessionControlService {
               refused.push({ key: target.session_key, reasons: ['binding_mismatch: native incarnation drifted; listed, never acted'] });
               continue;
             }
-            if (!STOPPABLE.has(live.state)) {
+            if (!CLEANUP_APPLY_ALLOWED_STATES.has(live.state)) {
               refused.push({ key: target.session_key, reasons: [`session_not_stoppable:${live.state}`] });
               continue;
             }
@@ -1089,7 +1113,11 @@ export class SessionControlService {
               refused.push({ key: target.session_key, reasons: ['session_queue_full: reconciled via commands listing, do not blind-retry'] });
               continue;
             }
-            const sessionKey = `cu-${String(operationKey).slice(0, 12)}-${String(live.id).slice(0, 8)}`;
+            const sessionKey = keyMap.get(live.id);
+            if (!sessionKey || !sessionKey.startsWith('cu-') || sessionKey.length > 64) {
+              refused.push({ key: target.session_key, reasons: ['session_key_derivation_failed'] });
+              continue;
+            }
             // Server-owned cleanup-tree authorization: persisted ONLY here
             // (authenticated eligible cleanup --apply). Ordinary stop routes
             // enqueue fixed {} payloads and can never set this flag; the
