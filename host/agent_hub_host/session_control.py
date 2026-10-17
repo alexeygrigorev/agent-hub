@@ -235,9 +235,10 @@ def add_commands(sub):
     send.add_argument('--body-file', required=True, help='UTF-8 prompt file, or - for stdin (max 16 KiB)')
     send.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
     add_wait(send)
-    capture = commands.add_parser('capture', help='Enqueue one bounded sanitized capture on a bound session')
+    capture = commands.add_parser('capture', help='Enqueue one bounded sanitized capture on a bound session (default raw tail; --screen shows current rendered screen)')
     capture.add_argument('id')
     capture.add_argument('--max-bytes', type=int, default=65536)
+    capture.add_argument('--screen', action='store_true', help='Capture current rendered screen (plain) instead of raw tail')
     capture.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
     add_wait(capture)
     stop = commands.add_parser('stop', help='Enqueue stop; the hub releases capacity only on confirmed native exit')
@@ -421,7 +422,11 @@ def execute(args):
         if cmd == 'send':
             payload = {'key': key, 'body': read_file(args.body_file)}
         elif cmd == 'capture':
+            # Default tail wire unchanged (no mode field); --screen encodes
+            # explicit mode=screen so the server persists the projection.
             payload = {'key': key, 'max_bytes': args.max_bytes}
+            if getattr(args, 'screen', False):
+                payload['mode'] = 'screen'
         else:
             payload = {'key': key}
         try:

@@ -1010,11 +1010,23 @@ export class SessionControlService {
           return freshEnqueue({ body: input.body }, BOUND_STATES, 'session_not_bound');
         }
         if (kind === 'capture') {
-          if (!obj(input, ['key', 'max_bytes']) || !label(input.key) ||
-              (input.max_bytes !== undefined && (!Number.isInteger(input.max_bytes) || input.max_bytes < 1 || input.max_bytes > 65536))) {
+          // Screen projection: `mode` ('tail'|'screen') and `screen` bool are
+          // explicit shorthands for the same projection. Both are validated
+          // strictly before any mutation; unknown fields are refused. The
+          // stored payload always carries explicit `mode` (default 'tail') so
+          // a lost ack/replay can never change the capture projection.
+          if (!obj(input, ['key', 'max_bytes', 'mode', 'screen']) || !label(input.key) ||
+              (input.max_bytes !== undefined && (!Number.isInteger(input.max_bytes) || input.max_bytes < 1 || input.max_bytes > 65536)) ||
+              (input.mode !== undefined && input.mode !== 'tail' && input.mode !== 'screen') ||
+              (input.screen !== undefined && typeof input.screen !== 'boolean')) {
             return response({ error: 'invalid_capture' }, 400);
           }
-          return freshEnqueue({ max_bytes: input.max_bytes ?? 65536 }, BOUND_STATES, 'session_not_bound');
+          if (input.mode !== undefined && input.screen !== undefined &&
+              ((input.screen === true) !== (input.mode === 'screen'))) {
+            return response({ error: 'invalid_capture' }, 400);
+          }
+          const mode = input.mode ?? (input.screen === true ? 'screen' : 'tail');
+          return freshEnqueue({ max_bytes: input.max_bytes ?? 65536, mode }, BOUND_STATES, 'session_not_bound');
         }
         if (!obj(input, ['key']) || !label(input.key)) return response({ error: 'invalid_stop' }, 400);
         return freshEnqueue({}, STOPPABLE, 'session_not_stoppable');
@@ -1066,6 +1078,14 @@ export class SessionControlService {
           if (row.state === 'recorded') {
             this.sql.exec("UPDATE session_control_commands SET state = 'transported', poll_at = ?, updated_at = ? WHERE id = ? AND state = 'recorded'", at, at, row.id);
           }
+          const storedPayload: any = parsed(row.payload_json, null);
+          // Capture projection persistence: the stored payload always carries
+          // explicit `mode` (default 'tail' for legacy rows). The top-level
+          // `mode` mirrors it so a lost ack/replay reads the same projection
+          // from either field; other kinds carry no mode.
+          const captureMode = row.kind === 'capture'
+            ? (storedPayload?.mode === 'screen' ? 'screen' : 'tail')
+            : null;
           offers.push({
             command_id: row.id, session_id: row.session_id, kind: row.kind,
             generation: row.generation,
@@ -1088,7 +1108,8 @@ export class SessionControlService {
             // Reserved for the future start adapter that consumes cwd; the hub
             // rejects non-root cwd today and never claims an executed cwd.
             cwd: requestJson.cwd ?? null,
-            payload: parsed(row.payload_json, null), correlation: row.correlation,
+            ...(captureMode !== null ? { mode: captureMode } : {}),
+            payload: storedPayload, correlation: row.correlation,
           });
           if (offers.length >= 20) break;
         }

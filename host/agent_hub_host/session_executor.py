@@ -600,6 +600,8 @@ def capture_session_output(
     _check_custody(custody)
     if not isinstance(target, NativeTarget):
         raise SessionControlError("Exact native target binding is required")
+    if mode not in ("tail", "screen"):
+        raise SessionControlError("Capture mode must be tail|screen")
     result = _capture(executable, target, limit_bytes=limit_bytes, mode=mode)
     return {"session_id": result.session_id, "tag": result.tag, "mode": result.mode,
             "text": result.text, "truncated": result.truncated,
@@ -1230,8 +1232,12 @@ def _run_claimed_effect(
     if op == "capture":
         limit = command.get("limit_bytes", 32 * 1024)
         mode = command.get("mode", "tail")
-        if type(limit) is not int:
-            raise SessionControlError("Capture bound must be an int")
+        if type(limit) is not int or not 1 <= limit <= 65536:
+            raise SessionControlError("Capture bound must be 1..65536")
+        if mode not in ("tail", "screen"):
+            raise SessionControlError("Capture mode must be tail|screen")
+        # Exact mode to the existing native adapter (capture --screen --plain
+        # vs tail); bounded UTF-8 return, private raw semantics retained.
         cap = capture_session_output(executable, target, custody=custody,
                                      limit_bytes=limit, mode=mode)
         return {"state": "captured", "ack_outcome": "delivered",

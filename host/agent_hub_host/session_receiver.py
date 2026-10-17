@@ -6,9 +6,9 @@ second Fleet consumer). One bounded cycle (``--once``) or a bounded number of
 offers; each offer maps EXACTLY to the shared host function:
 
   server offer kind/payload -> command op/body/NativeTarget
-    send    {body}        -> op send, body, await_ack True
-    capture {max_bytes}   -> op capture, limit_bytes, mode tail
-    stop    {}            -> op stop
+    send    {body}              -> op send, body, await_ack True
+    capture {max_bytes, mode}   -> op capture, limit_bytes, mode tail|screen
+    stop    {}                  -> op stop
 
 ``start`` is REJECTED here: Fleet already handles start once (existing
 Dispatcher consumer); this receiver never polls Fleet offers or invokes start.
@@ -174,8 +174,16 @@ def offer_to_command(offer: dict[str, Any]) -> dict[str, Any]:
             limit = payload.get("max_bytes", 32 * 1024)
             if type(limit) is not int or not 1 <= limit <= 65536:
                 raise SessionControlError("Capture bound must be 1..65536")
+            # Exact projection from the stored server command (default tail
+            # for legacy rows); never guessed. Top-level offer mode mirrors
+            # the stored payload mode; payload mode is canonical.
+            raw_mode = payload.get("mode", offer.get("mode", "tail"))
+            if isinstance(payload.get("screen"), bool) and "mode" not in payload and "mode" not in offer:
+                raw_mode = "screen" if payload.get("screen") is True else "tail"
+            if raw_mode not in ("tail", "screen"):
+                raise SessionControlError("Capture mode must be tail|screen")
             command["limit_bytes"] = limit
-            command["mode"] = "tail"
+            command["mode"] = raw_mode
         return command
     # stop: binding null (offered, pre-bind) means no native target exists.
     # The receiver still claims to fence the intent, then acks refused with no
