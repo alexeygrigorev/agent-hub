@@ -37,6 +37,7 @@ class FleetOpencodeTests(unittest.TestCase):
                             'account_label': 'shared-go',
                             'observed_at': fleet.utcnow()}
                 if 'submit' in argv:
+                    self.assertIn('--json', argv)
                     return {}
                 if 'plan' in argv:
                     # Genuine maintained-CLI plan shape (verified live):

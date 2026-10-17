@@ -431,7 +431,7 @@ class Dispatcher:
             payload = {"goal": goal, "owner": "hub-fleet", "cwd": str(target_cwd), "timeout": 1800,
                        "model_requirements": {"providers": [sub["launcher_provider"]], "models": [sub["launcher_model"]]},
                        "account_label": sub["account_label"], "profile": sub.get("profile")}
-            self.runner(prefix + ["submit", "--id", task_id, "--key", task_id, "--payload", json.dumps(payload)], cwd=launcher["root"])
+            self.runner(prefix + ["submit", "--id", task_id, "--key", task_id, "--payload", json.dumps(payload), "--json"], cwd=launcher["root"])
             plan = self.runner(prefix + ["plan", "--id", task_id], cwd=launcher["root"])
             eligible = plan.get("eligible", [])
             # Real maintained-plan contract (verified live against the
