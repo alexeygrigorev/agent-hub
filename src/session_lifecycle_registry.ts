@@ -188,9 +188,12 @@ function joinedBases(sql: SqlStorage): JoinedBase[] {
 type TaskLinks = { task_refs: string[]; report_refs: string[] };
 
 /** Canonical intake links only: link events WITHOUT a routing_job_id are
- * external/unverified and never join. Report references ride the linked
- * tasks. Bounded; failures degrade to empty (never a hard error). */
-function taskLinksFor(sql: SqlStorage, native_id: string): TaskLinks {
+ * external/unverified and never join — EXCEPT links carrying a
+ * `hub_session_id` that exactly matches the joined canonical session row:
+ * intake authorizes that reference at link time (operator or session owner),
+ * so it is already an authenticated join endpoint. Report references ride
+ * the linked tasks. Bounded; failures degrade to empty (never a hard error). */
+function taskLinksFor(sql: SqlStorage, native_id: string, hub_session_id: string | null): TaskLinks {
   const task_refs: string[] = [];
   const report_refs: string[] = [];
   try {
@@ -201,6 +204,10 @@ function taskLinksFor(sql: SqlStorage, native_id: string): TaskLinks {
       let linked = false;
       for (const event of task.history) {
         if (event?.kind === 'link' && event.native_id === native_id && event.routing_job_id) {
+          linked = true;
+        }
+        if (event?.kind === 'link' && typeof event.hub_session_id === 'string' &&
+            hub_session_id && event.hub_session_id === hub_session_id) {
           linked = true;
         }
         if (event?.kind === 'report' && typeof event.reference === 'string' && event.reference) {
@@ -336,7 +343,7 @@ export function buildSessionInputs(sql: SqlStorage): { inputs: SessionInput[]; r
       obs.observation_note = stored.observation_note;
       obs.note_text_opt_in = true;
     }
-    const links = taskLinksFor(sql, base.native_id);
+    const links = taskLinksFor(sql, base.native_id, base.sc?.id ?? null);
     const input: SessionInput = {
       machine_id: base.machine_id,
       native_id: base.native_id,

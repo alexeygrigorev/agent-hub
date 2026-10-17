@@ -226,8 +226,7 @@ describe('m15c lifecycle view', () => {
     expect(scopedPlan.eligible).toEqual([]);
   }));
 
-  it('surfaces fleet-observed sessions without canonical launch with truthful unknowns', async () => fixture(async (s, sql) => {
-    const now = new Date().toISOString();
+  it('surfaces fleet-observed sessions without canonical launch with truthful unknowns', async () => fixture(async (s, sql) => {    const now = new Date().toISOString();
     sql.exec(`INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, cwd, profile, account, last_activity_at)
       VALUES ('hetzner', '44444444-4444-4444-8444-444444444444', 'stray', 'codex', 'running', NULL, ?, '/srv/stray', NULL, NULL, 'fixture-acct', NULL)`, now);
     const { data } = await lifecycle(s, admin);
@@ -237,5 +236,22 @@ describe('m15c lifecycle view', () => {
     expect(entry).toBeTruthy();
     expect(entry.refs.owner).toBeNull();
     expect(entry.refs.engine).toBe('codex');
+  }));
+
+  it('joins intake task links via canonical hub_session_id', async () => fixture(async (s, sql) => {
+    const created = await startAgentSession(s, 'm15c-linked');
+    await bindAgentSession(s, sql, created.id, 'launch-1');
+    sql.exec('INSERT OR REPLACE INTO intake_tasks (id, data) VALUES (?, ?)', 'task-1', JSON.stringify({
+      id: 'task-1',
+      history: [
+        { kind: 'link', native_id: null, hub_session_id: created.id, routing_job_id: null },
+        { kind: 'report', reference: '/synth/report.md' },
+      ],
+    }));
+    const { data } = await lifecycle(s, agent());
+    const entry = data.groups.active.find((e: any) => e.session_key === `hetzner/${NATIVE_ID}`);
+    expect(entry).toBeTruthy();
+    expect(entry.refs.task_refs).toContain('task-1');
+    expect(entry.refs.report_refs).toContain('/synth/report.md');
   }));
 });
