@@ -139,7 +139,10 @@ def run_json(argv, *, payload=None, cwd=None, timeout=30):
             proc.stdin.close()
         except Exception:
             overflow.set()
-    threads = [threading.Thread(target=drain, args=(proc.stdout, 131072, stdout), daemon=True),
+    # The native catalog includes containment and process metadata per session.
+    # Keep provider probes small while allowing the bounded 500-session catalog.
+    stdout_limit = 8 * 1024 * 1024 if list(argv[-2:]) == ["list", "--json"] else 131072
+    threads = [threading.Thread(target=drain, args=(proc.stdout, stdout_limit, stdout), daemon=True),
                threading.Thread(target=drain, args=(proc.stderr, 16384), daemon=True),
                threading.Thread(target=write, daemon=True)]
     for thread in threads: thread.start()

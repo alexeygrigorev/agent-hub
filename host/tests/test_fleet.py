@@ -189,6 +189,14 @@ class FleetTests(unittest.TestCase):
             with self.assertRaises(RuntimeError): fleet.run_json([sys.executable, '-c', script], timeout=.1)
         self.assertEqual(fleet.run_json([sys.executable, '-c', 'print("{}")']), {})
 
+    def test_verbose_native_catalog_has_separate_bounded_output_capacity(self):
+        script = 'import json;print(json.dumps([{"id":str(i),"metadata":"x"*4096} for i in range(500)]))'
+        rows = fleet.run_json([sys.executable, '-c', script, 'list', '--json'])
+        self.assertEqual(len(rows), 500)
+        self.assertEqual(rows[-1]['id'], '499')
+        with self.assertRaises(RuntimeError):
+            fleet.run_json([sys.executable, '-c', 'print("x" * (9 * 1024 * 1024))', 'list', '--json'])
+
     def test_provider_timestamp_is_preserved_and_stale_or_future_quota_is_unknown(self):
         for timestamp in ['2000-01-01T00:00:00Z', '2099-01-01T00:00:00Z']:
             raw = {'codex': {'status': 'ok', 'observed_at': timestamp, 'details': {'limit_reached': False}, 'windows': {}}}
