@@ -12,6 +12,7 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { LivenessService } from './liveness';
 import type { StatusMachineAuth } from './status';
+import type { IntakeService } from './intake';
 
 export const MONITORING_SCHEMA = `
 CREATE TABLE IF NOT EXISTS disk_observations (
@@ -102,8 +103,9 @@ export type DiskFilesystem = {
   used_bytes: number;
   free_bytes: number;
   percent: number;
-  status: 'ok' | 'warn' | 'critical';
+  status: 'ok' | 'warn' | 'critical' | 'error';
   top_consumers?: DiskTopConsumer[];
+  top_consumers_truncated?: boolean;
   error?: string | null;
 };
 
@@ -133,7 +135,8 @@ export class MonitoringService {
     private tx: <T>(fn: () => T) => T,
     private liveness?: LivenessService,
     private notifyAlertFn?: (alert: any) => Promise<void>,
-    private now: () => number = Date.now,
+    private intake?: IntakeService,
+    public now: () => number = Date.now,
   ) {}
 
   init(): void {
@@ -277,13 +280,15 @@ export class MonitoringService {
       if (!Number.isFinite(percent) || percent < 0 || percent > 100) fail('invalid_percent');
       percent = Math.round(percent * 10) / 10;
 
-      // Status derived from threshold: >=95% critical, >=85% warn, else ok
-      const computedStatus: 'ok' | 'warn' | 'critical' =
-        percent >= DISK_THRESHOLDS.criticalPercent
-          ? 'critical'
-          : percent >= DISK_THRESHOLDS.warnPercent
-            ? 'warn'
-            : 'ok';
+      // Status derived from threshold: >=95% critical, >=85% warn, else ok; error if error reported
+      let computedStatus: 'ok' | 'warn' | 'critical' | 'error' = 'ok';
+      if (raw.error || raw.status === 'error') {
+        computedStatus = 'error';
+      } else if (percent >= DISK_THRESHOLDS.criticalPercent) {
+        computedStatus = 'critical';
+      } else if (percent >= DISK_THRESHOLDS.warnPercent) {
+        computedStatus = 'warn';
+      }
 
       const topConsumers: DiskTopConsumer[] = [];
       if (Array.isArray(raw.top_consumers)) {
@@ -308,6 +313,7 @@ export class MonitoringService {
         percent,
         status: computedStatus,
         top_consumers: topConsumers,
+        top_consumers_truncated: Boolean(raw.top_consumers_truncated),
         error: raw.error ? String(raw.error).slice(0, 128) : null,
       });
     }
@@ -409,8 +415,9 @@ export class MonitoringService {
           }
         }
 
-        // Raise intake task for disk pressure
-        const taskId = this.createOrUpdateIntakeTask(null, machineId, fs, detail, now);
+        // Raise intake task for disk pressure (honest capacity refusal if limits reached)
+        const taskRes = this.createOrUpdateIntakeTask(null, machineId, fs, detail, now);
+        const taskId = taskRes.taskId;
 
         const detailsJson = JSON.stringify({
           status: fs.status,
@@ -418,6 +425,7 @@ export class MonitoringService {
           used_bytes: fs.used_bytes,
           total_bytes: fs.total_bytes,
           top_consumers: fs.top_consumers || [],
+          capacity_refused: !taskId ? (taskRes.error || 'capacity_refused') : undefined,
         });
 
         this.sql.exec(
@@ -444,16 +452,28 @@ export class MonitoringService {
 
         return { episode_key: episodeKey, action: 'opened', state: fs.status };
       } else {
-        // Existing open episode: UPDATE in-place (no task flood!)
-        if (this.liveness) {
+        // Existing open episode: update alert state if severity changed
+        const stateChanged = row.state !== fs.status;
+        const needsTaskRetry = !row.intake_task_id;
+        let taskId = row.intake_task_id;
+
+        if (needsTaskRetry) {
+          // Retry creating orphan task if capacity was previously refused
+          const retryRes = this.createOrUpdateIntakeTask(null, machineId, fs, detail, now);
+          if (retryRes.taskId) {
+            taskId = retryRes.taskId;
+          }
+        } else if (stateChanged && taskId) {
+          // Record severity escalation or de-escalation on existing task
+          this.createOrUpdateIntakeTask(taskId, machineId, fs, detail, now, row.state);
+        }
+        // If unchanged poll (stateChanged === false && !needsTaskRetry), DO NOT emit event or touch intake task
+
+        if (stateChanged && this.liveness) {
           this.liveness.setAlert('disk', `${machineId}:${fs.mount_point}`, {
             state: fs.status,
             detail,
           });
-        }
-
-        if (row.intake_task_id) {
-          this.createOrUpdateIntakeTask(row.intake_task_id, machineId, fs, detail, now);
         }
 
         const detailsJson = JSON.stringify({
@@ -462,17 +482,19 @@ export class MonitoringService {
           used_bytes: fs.used_bytes,
           total_bytes: fs.total_bytes,
           top_consumers: fs.top_consumers || [],
+          capacity_refused: !taskId ? 'capacity_refused' : undefined,
         });
 
         this.sql.exec(
-          'UPDATE disk_episodes SET state = ?, last_updated_at = ?, details_json = ? WHERE episode_key = ?',
+          'UPDATE disk_episodes SET state = ?, last_updated_at = ?, intake_task_id = ?, details_json = ? WHERE episode_key = ?',
           fs.status,
           nowIso,
+          taskId,
           detailsJson,
           episodeKey,
         );
 
-        return { episode_key: episodeKey, action: 'updated', state: fs.status };
+        return { episode_key: episodeKey, action: stateChanged ? 'severity_changed' : 'updated', state: fs.status };
       }
     } else {
       // Normal state (< 85%)
@@ -507,40 +529,84 @@ export class MonitoringService {
     fs: DiskFilesystem,
     detail: string,
     now: number,
-  ): string | null {
-    try {
-      if (existingTaskId) {
+    previousState?: string,
+  ): { taskId: string | null; error?: string } {
+    const topStr = (fs.top_consumers || [])
+      .map(c => `  - ${c.path}: ${formatBytes(c.size_bytes)}`)
+      .join('\n');
+    const text = `Disk pressure alert on host ${machineId}.\nMount: ${fs.mount_point}\nDevice: ${fs.device_id}\nUsed: ${formatBytes(fs.used_bytes)} / ${formatBytes(fs.total_bytes)} (${fs.percent}%)\nStatus: ${fs.status.toUpperCase()}\n\nTop Consumers:\n${topStr || '  (none recorded)'}`;
+
+    if (existingTaskId) {
+      if (this.intake) {
+        const res = this.intake.serviceRecordEvent(existingTaskId, {
+          currentState: detail,
+          nextStep: 'Investigate and free space on ' + fs.mount_point,
+          event: {
+            kind: 'update',
+            text: `Disk status changed from ${previousState || 'previous'} to ${fs.status}: ${fs.mount_point} is at ${fs.percent}% (${fs.status})`,
+            actor: 'hub:service:disk-monitor',
+            sourceRef: `disk_monitor:${machineId}:${fs.mount_point}`,
+            authority: 'operator_record',
+          },
+          now,
+        });
+        return { taskId: res.ok ? existingTaskId : null, error: res.ok ? undefined : res.error };
+      }
+
+      try {
         const row: any = this.sql.exec('SELECT data FROM intake_tasks WHERE id = ?', existingTaskId).toArray()[0];
         if (row) {
           const task = JSON.parse(row.data);
+          task.version = (task.version || 1) + 1;
           task.updated_at = now;
           task.current_state = detail;
           task.history = task.history || [];
+          if (task.history.length >= 128) {
+            const intake0 = task.history[0];
+            const remaining = task.history.slice(1);
+            const dropIdx = remaining.findIndex((e: any) => typeof e.actor === 'string' && e.actor.startsWith('hub:service:'));
+            if (dropIdx >= 0) {
+              remaining.splice(dropIdx, 1);
+              task.history = [intake0, ...remaining];
+            }
+          }
           task.history.push({
             id: crypto.randomUUID(),
             kind: 'update',
             actor: 'hub:service:disk-monitor',
             captured_at: now,
-            text: `Disk status update: ${fs.mount_point} is at ${fs.percent}% (${fs.status})`,
+            text: `Disk status changed from ${previousState || 'previous'} to ${fs.status}: ${fs.mount_point} is at ${fs.percent}% (${fs.status})`,
             authority: 'operator_record',
           });
-          if (task.history.length > 128) task.history = task.history.slice(-128);
           this.sql.exec('UPDATE intake_tasks SET data = ? WHERE id = ?', JSON.stringify(task), existingTaskId);
           this.sql.exec('UPDATE intake_meta SET revision = revision + 1 WHERE id = 1');
-          return existingTaskId;
+          return { taskId: existingTaskId };
         }
+      } catch (err: any) {
+        return { taskId: null, error: err?.message };
       }
+      return { taskId: null, error: 'task_not_found' };
+    }
 
-      // Check record capacity
+    if (this.intake) {
+      const res = this.intake.serviceCreateTask({
+        project: 'infrastructure',
+        title: `[Disk pressure] ${machineId}: ${fs.mount_point} (${fs.percent}%)`,
+        text,
+        currentState: detail,
+        nextStep: 'Investigate and free space on ' + fs.mount_point,
+        sourceRef: `disk_monitor:${machineId}:${fs.mount_point}`,
+        actor: 'hub:service:disk-monitor',
+        now,
+      });
+      return { taskId: res.ok ? res.taskId : null, error: res.ok ? undefined : res.error };
+    }
+
+    try {
       const count = Number((this.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks').toArray()[0] as any)?.n ?? 0);
-      if (count >= 256) return null;
+      if (count >= 256) return { taskId: null, error: 'record_capacity' };
 
       const taskId = crypto.randomUUID();
-      const topStr = (fs.top_consumers || [])
-        .map(c => `  - ${c.path}: ${formatBytes(c.size_bytes)}`)
-        .join('\n');
-      const text = `Disk pressure alert on host ${machineId}.\nMount: ${fs.mount_point}\nDevice: ${fs.device_id}\nUsed: ${formatBytes(fs.used_bytes)} / ${formatBytes(fs.total_bytes)} (${fs.percent}%)\nStatus: ${fs.status.toUpperCase()}\n\nTop Consumers:\n${topStr || '  (none recorded)'}`;
-
       const task = {
         id: taskId,
         project: 'infrastructure',
@@ -565,25 +631,52 @@ export class MonitoringService {
           },
         ],
       };
-
       this.sql.exec('INSERT INTO intake_tasks(id, data) VALUES(?, ?)', taskId, JSON.stringify(task));
       this.sql.exec('UPDATE intake_meta SET revision = revision + 1 WHERE id = 1');
-      return taskId;
-    } catch {
-      return null;
+      return { taskId };
+    } catch (err: any) {
+      return { taskId: null, error: err?.message };
     }
   }
 
   /** Mark an intake task as resolved on recovery. */
   private resolveIntakeTask(taskId: string, machineId: string, fs: DiskFilesystem, now: number): void {
+    if (this.intake) {
+      this.intake.serviceRecordEvent(taskId, {
+        status: 'done',
+        currentState: `Recovered: ${fs.mount_point} is at ${fs.percent}% (< 85%)`,
+        nextStep: null,
+        event: {
+          kind: 'resolution',
+          text: `Recovered: ${fs.mount_point} space pressure resolved, now at ${fs.percent}% usage.`,
+          actor: 'hub:service:disk-monitor',
+          sourceRef: `disk_monitor:${machineId}:${fs.mount_point}`,
+          authority: 'operator_record',
+        },
+        now,
+      });
+      return;
+    }
+
     try {
       const row: any = this.sql.exec('SELECT data FROM intake_tasks WHERE id = ?', taskId).toArray()[0];
       if (!row) return;
       const task = JSON.parse(row.data);
       task.status = 'done';
+      task.version = (task.version || 1) + 1;
       task.updated_at = now;
       task.current_state = `Recovered: ${fs.mount_point} is at ${fs.percent}% (< 85%)`;
+      task.next_step = null;
       task.history = task.history || [];
+      if (task.history.length >= 128) {
+        const intake0 = task.history[0];
+        const remaining = task.history.slice(1);
+        const dropIdx = remaining.findIndex((e: any) => typeof e.actor === 'string' && e.actor.startsWith('hub:service:'));
+        if (dropIdx >= 0) {
+          remaining.splice(dropIdx, 1);
+          task.history = [intake0, ...remaining];
+        }
+      }
       task.history.push({
         id: crypto.randomUUID(),
         kind: 'resolution',
@@ -592,7 +685,6 @@ export class MonitoringService {
         text: `Recovered: ${fs.mount_point} space pressure resolved, now at ${fs.percent}% usage.`,
         authority: 'operator_record',
       });
-      if (task.history.length > 128) task.history = task.history.slice(-128);
       this.sql.exec('UPDATE intake_tasks SET data = ? WHERE id = ?', JSON.stringify(task), taskId);
       this.sql.exec('UPDATE intake_meta SET revision = revision + 1 WHERE id = 1');
     } catch {
@@ -761,7 +853,7 @@ export class MonitoringService {
 
       const observedMs = latestRow.observed_at_ms;
       const ageMs = now - observedMs;
-      const freshness = ageMs <= 180000 ? 'fresh' : ageMs <= 900000 ? 'stale' : 'unknown';
+      const freshness = ageMs <= 180000 ? 'fresh' : ageMs <= 900000 ? 'stale' : 'unavailable';
 
       machineList.push({
         machine_id: mid,
@@ -788,8 +880,27 @@ export class MonitoringService {
     const filesystems: any[] = [];
     const needsAttention: any[] = [];
 
+    let hasErrors = false;
+    let anyStale = false;
+    let anyUnavailable = false;
+    let latestObservedMs: number | null = null;
+    let latestObservedIso: string | null = null;
+
     for (const m of full.machines || []) {
+      if (m.freshness === 'stale') anyStale = true;
+      if (m.freshness === 'unavailable') anyUnavailable = true;
+
+      const mObservedMs = Date.parse(m.observed_at);
+      if (Number.isFinite(mObservedMs) && (latestObservedMs === null || mObservedMs > latestObservedMs)) {
+        latestObservedMs = mObservedMs;
+        latestObservedIso = m.observed_at;
+      }
+
       for (const fs of m.filesystems || []) {
+        if (fs.error || fs.status === 'error') {
+          hasErrors = true;
+        }
+
         filesystems.push({
           machine_id: m.machine_id,
           mount_point: fs.mount_point,
@@ -800,10 +911,14 @@ export class MonitoringService {
           free_bytes: fs.free_bytes,
           percent: fs.percent,
           status: fs.status,
+          error: fs.error ?? null,
+          observed_at: m.observed_at,
+          freshness: m.freshness,
           growth_per_day_bytes: fs.trend?.growth_bytes_per_day ?? null,
           growth_per_day_pct: fs.trend?.growth_pct_per_day ?? null,
           trend_state: fs.trend?.state ?? 'unknown',
           top_consumers: fs.top_consumers || [],
+          top_consumers_truncated: fs.top_consumers_truncated ?? false,
         });
 
         if (fs.status === 'warn' || fs.status === 'critical') {
@@ -815,21 +930,58 @@ export class MonitoringService {
             percent: fs.percent,
             top_consumers: fs.top_consumers || [],
           });
+        } else if (fs.status === 'error' || fs.error) {
+          needsAttention.push({
+            severity: 'warn',
+            subject: `${m.machine_id}:${fs.mount_point}`,
+            title: `Disk monitor error on ${m.machine_id}: ${fs.mount_point}`,
+            detail: `Filesystem statvfs check failed: ${fs.error || 'unknown_error'}`,
+            percent: 0,
+            top_consumers: [],
+          });
         }
       }
     }
 
-    const nowIso = new Date(now).toISOString();
+    const overallFreshness = !filesystems.length
+      ? 'unknown'
+      : (anyUnavailable || anyStale)
+      ? 'stale'
+      : 'fresh';
+
+    const coverage = !filesystems.length
+      ? 'unavailable'
+      : (hasErrors || anyStale || anyUnavailable)
+      ? 'partial'
+      : 'complete';
+
+    let reason = 'linux_stdlib_statvfs_and_bounded_top_consumers';
+    if (!filesystems.length) {
+      reason = 'no_disk_observations_recorded';
+    } else if (hasErrors && (anyStale || anyUnavailable)) {
+      reason = 'filesystem_errors_reported_and_host_stale';
+    } else if (hasErrors) {
+      reason = 'one_or_more_filesystems_reported_statvfs_errors';
+    } else if (anyStale || anyUnavailable) {
+      reason = 'one_or_more_hosts_stale_or_unreachable';
+    }
+
+    const state = !filesystems.length
+      ? 'unknown_not_collected'
+      : hasErrors
+      ? 'collected_disk_monitoring_with_errors'
+      : 'collected_disk_monitoring';
+
     return {
       filesystems,
       needs_attention: needsAttention,
       categories_entry: {
-        state: filesystems.length ? 'collected_disk_monitoring' : 'unknown_not_collected',
+        state,
         source: 'host_disk_monitor_stdlib_statvfs',
-        observed_at: nowIso,
-        freshness: filesystems.length ? 'fresh' : 'unknown',
-        coverage: filesystems.length ? 'complete' : 'unavailable',
-        reason: 'linux_stdlib_statvfs_and_bounded_top_consumers',
+        observed_at: latestObservedIso,
+        freshness: overallFreshness,
+        coverage,
+        reason,
       },
     };
   }

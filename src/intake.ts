@@ -507,6 +507,142 @@ export class IntakeService {
   statusUnresolved(task: Obj): Obj[] { return this.unresolved(task); }
   statusContinuation(task: Obj): string { return this.continuation(task); }
   statusRevision(): number { return this.revision(); }
+  /** Service-owned task creation for internal system services (e.g. disk monitoring).
+   * Enforces task capacity, total storage capacity, single-record byte limit, and version/revision CAS. */
+  serviceCreateTask(input: {
+    project: string;
+    title: string;
+    text: string;
+    currentState?: string | null;
+    nextStep?: string | null;
+    sourceRef?: string;
+    actor?: string;
+    now?: number;
+  }): { ok: true; taskId: string } | { ok: false; error: string } {
+    return this.tx(() => {
+      const now = input.now ?? Date.now();
+      try {
+        this.bounded('tasks', INTAKE_LIMITS.tasks);
+        this.capacity();
+      } catch (e: any) {
+        return { ok: false, error: e?.code || 'capacity_exceeded' };
+      }
+      const taskId = crypto.randomUUID();
+      const task: Obj = {
+        id: taskId,
+        project: input.project,
+        title: str(input.title, 256),
+        status: 'open',
+        version: 1,
+        created_at: now,
+        updated_at: now,
+        current_state: input.currentState ?? null,
+        next_step: input.nextStep ?? null,
+        owner: null,
+        uncertainty: null,
+        history: [
+          {
+            id: crypto.randomUUID(),
+            kind: 'intake',
+            actor: input.actor || 'hub:service:system',
+            captured_at: now,
+            text: str(input.text, 8192),
+            source: { type: 'unknown', reference: nullable(input.sourceRef, 2048), timestamp: new Date(now).toISOString() },
+            authority: 'operator_record',
+          },
+        ],
+      };
+      if (encoded(task) > INTAKE_LIMITS.taskBytes) {
+        return { ok: false, error: 'task_capacity' };
+      }
+      this.put('tasks', task);
+      this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
+      try {
+        this.capacity();
+      } catch (e: any) {
+        this.sql.exec('DELETE FROM intake_tasks WHERE id=?', taskId);
+        return { ok: false, error: e?.code || 'storage_capacity' };
+      }
+      return { ok: true, taskId };
+    });
+  }
+
+  /** Service-owned task mutation (status change, episode severity change, resolution) for internal services.
+   * Atomically increments task.version and intake_meta revision.
+   * Preserves original intake event (history[0]) and user history.
+   * Enforces event and byte budgets. */
+  serviceRecordEvent(taskId: string, input: {
+    status?: string;
+    currentState?: string | null;
+    nextStep?: string | null;
+    event?: {
+      kind: string;
+      text: string;
+      actor?: string;
+      sourceRef?: string;
+      authority?: string;
+    };
+    now?: number;
+  }): { ok: true; task: Obj } | { ok: false; error: string } {
+    return this.tx(() => {
+      const task = this.get('tasks', taskId);
+      if (!task) return { ok: false, error: 'not_found' };
+      const now = input.now ?? Date.now();
+
+      if (input.status) {
+        if (!STATUSES.includes(input.status)) return { ok: false, error: 'invalid_status' };
+        task.status = input.status;
+      }
+      if (input.currentState !== undefined) {
+        task.current_state = input.currentState !== null ? str(input.currentState, 8192) : null;
+      }
+      if (input.nextStep !== undefined) {
+        task.next_step = input.nextStep !== null ? str(input.nextStep, 8192) : null;
+      }
+
+      if (input.event) {
+        const newEvent = {
+          id: crypto.randomUUID(),
+          kind: input.event.kind,
+          actor: input.event.actor || 'hub:service:system',
+          captured_at: now,
+          text: str(input.event.text, 8192),
+          source: { type: 'unknown', reference: nullable(input.event.sourceRef, 2048), timestamp: new Date(now).toISOString() },
+          authority: input.event.authority || 'operator_record',
+        };
+
+        task.history = task.history || [];
+        if (task.history.length >= INTAKE_LIMITS.events) {
+          const intake0 = task.history[0];
+          const remaining = task.history.slice(1);
+          const dropIdx = remaining.findIndex((e: Obj) => typeof e.actor === 'string' && e.actor.startsWith('hub:service:'));
+          if (dropIdx >= 0) {
+            remaining.splice(dropIdx, 1);
+            task.history = [intake0, ...remaining];
+          } else {
+            return { ok: false, error: 'history_capacity' };
+          }
+        }
+        task.history.push(newEvent);
+      }
+
+      task.version++;
+      task.updated_at = now;
+
+      if (encoded(task) > INTAKE_LIMITS.taskBytes) {
+        return { ok: false, error: 'task_capacity' };
+      }
+
+      this.put('tasks', task);
+      this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
+      try {
+        this.capacity();
+      } catch (e: any) {
+        return { ok: false, error: e?.code || 'storage_capacity' };
+      }
+      return { ok: true, task };
+    });
+  }
   async handle(request: Request, authenticate: () => Promise<Auth>): Promise<Response> {
     const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
     try {

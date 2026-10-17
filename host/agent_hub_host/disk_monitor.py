@@ -25,7 +25,7 @@ from . import api, auth, config
 
 CONFIG_FILENAME = "disk-monitor.json"
 DEFAULT_MIN_INTERVAL_S = 60
-MIN_INTERVAL_FLOOR_S = 10
+MIN_INTERVAL_FLOOR_S = 60
 MAX_INTERVAL_S = 3600
 DEFAULT_MOUNTS = ["/", "/home", "/data", "/tmp"]
 DEFAULT_ALLOWED_ROOTS = ["/data", "/home", "/tmp"]
@@ -37,6 +37,7 @@ DEFAULT_TOP_CONSUMERS_DEPTH = 2
 MAX_TOP_CONSUMERS_DEPTH = 4
 DEFAULT_SCAN_TIMEOUT_S = 2.0
 MAX_SCAN_TIMEOUT_S = 10.0
+DEFAULT_MAX_ENTRIES_SCANNED = 2000
 MAX_PAYLOAD_BYTES = 32 * 1024
 
 _ALLOWED_CONFIG_KEYS = frozenset({
@@ -82,41 +83,80 @@ def scan_top_consumers(
     max_depth: int = DEFAULT_TOP_CONSUMERS_DEPTH,
     limit: int = DEFAULT_TOP_CONSUMERS_LIMIT,
     timeout_s: float = DEFAULT_SCAN_TIMEOUT_S,
+    max_entries: int = DEFAULT_MAX_ENTRIES_SCANNED,
     stat_fn: Callable[[str], Any] = os.stat,
     listdir_fn: Callable[[str], List[str]] = os.listdir,
     monotonic_fn: Callable[[], float] = time.monotonic,
+    islink_fn: Optional[Callable[[str], bool]] = None,
+    isdir_fn: Optional[Callable[[str], bool]] = None,
 ) -> Tuple[List[Dict[str, Any]], bool]:
     """Bounded shallow scan for largest entries in root_path on target_dev.
 
     Strict bounds:
     - Never crosses filesystem boundaries (st_dev must match target_dev)
-    - Stops when monotonic_fn() - start >= timeout_s
-    - Depth bounded to max_depth
+    - Stops when monotonic_fn() - start >= timeout_s or scanned_count >= max_entries
+    - Never follows symlinks or symlink escapes
+    - Aggregate directory sizes instead of raw 4096 inode size
+    - Candidates kept strictly bounded in memory (never stores all scanned entries)
     - Filenames and sizes only; never opens file contents; never alters files
     """
-    entries: List[Tuple[str, int]] = []
     start_time = monotonic_fn()
     truncated = False
+    scanned_entries = 0
+    _islink = islink_fn or os.path.islink
+    _isdir = isdir_fn or os.path.isdir
 
-    def _walk(curr_path: str, curr_depth: int):
-        nonlocal truncated
-        if monotonic_fn() - start_time >= timeout_s:
+    candidates: List[Tuple[str, int]] = []
+
+    def _add_candidate(path: str, size: int) -> None:
+        if size <= 0:
+            return
+        candidates.append((path, size))
+        # Keep candidate buffer bounded in memory (never holds millions of items)
+        if len(candidates) > max(limit * 4, 100):
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            del candidates[max(limit * 2, 50):]
+
+    def _allocated_bytes(st: Any) -> int:
+        blocks = getattr(st, "st_blocks", None)
+        if blocks is not None and blocks > 0:
+            return blocks * 512
+        return getattr(st, "st_size", 0)
+
+    def _walk(curr_path: str, curr_depth: int) -> int:
+        nonlocal truncated, scanned_entries
+        if monotonic_fn() - start_time >= timeout_s or scanned_entries >= max_entries:
             truncated = True
-            return
+            return 0
         if curr_depth > max_depth:
-            return
+            return 0
 
         try:
             items = listdir_fn(curr_path)
         except (OSError, PermissionError):
-            return
+            return 0
+
+        dir_aggregate = 0
 
         for item in items:
-            if monotonic_fn() - start_time >= timeout_s:
+            if monotonic_fn() - start_time >= timeout_s or scanned_entries >= max_entries:
                 truncated = True
-                return
+                break
 
+            scanned_entries += 1
             full_path = os.path.join(curr_path, item)
+
+            # Prevent symlink escapes or loops: inspect if link
+            is_link = False
+            try:
+                is_link = _islink(full_path)
+            except (OSError, PermissionError):
+                is_link = False
+
+            if is_link:
+                # Never follow symlinks to avoid escapes or loops
+                continue
+
             try:
                 st = stat_fn(full_path)
             except (OSError, PermissionError):
@@ -126,24 +166,31 @@ def scan_top_consumers(
             if getattr(st, "st_dev", target_dev) != target_dev:
                 continue
 
-            size = getattr(st, "st_size", 0)
-            entries.append((full_path, size))
-
-            # Recurse if directory and within depth
             is_dir = False
             try:
-                is_dir = os.path.isdir(full_path)
-            except OSError:
-                pass
+                is_dir = _isdir(full_path)
+            except (OSError, PermissionError):
+                is_dir = False
 
-            if is_dir and curr_depth < max_depth:
-                _walk(full_path, curr_depth + 1)
+            if is_dir:
+                sub_bytes = 0
+                if curr_depth < max_depth:
+                    sub_bytes = _walk(full_path, curr_depth + 1)
+                alloc = max(_allocated_bytes(st), sub_bytes)
+                dir_aggregate += alloc
+                _add_candidate(full_path, alloc)
+            else:
+                alloc = _allocated_bytes(st)
+                dir_aggregate += alloc
+                _add_candidate(full_path, alloc)
+
+        return dir_aggregate
 
     _walk(root_path, 1)
 
     # Sort descending by size
-    entries.sort(key=lambda x: x[1], reverse=True)
-    top = [{"path": p, "size_bytes": sz} for p, sz in entries[:limit]]
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    top = [{"path": p, "size_bytes": sz} for p, sz in candidates[:limit]]
     return top, truncated
 
 
@@ -291,6 +338,7 @@ class DiskMonitor:
         errors: List[str] = []
         filesystems: List[Dict[str, Any]] = []
         seen_devices: Dict[int, str] = {}  # dev_id -> primary mount_point
+        scanned_devices: set[int] = set()
 
         for mount in cfg["mounts"]:
             if not isinstance(mount, str) or not mount.startswith("/"):
@@ -310,7 +358,7 @@ class DiskMonitor:
                     "used_bytes": 0,
                     "free_bytes": 0,
                     "percent": 0.0,
-                    "status": "ok",
+                    "status": "error",
                     "error": str(type(exc).__name__),
                 })
                 continue
@@ -339,39 +387,45 @@ class DiskMonitor:
                 seen_devices[dev_id] = mount
 
             top_consumers: List[Dict[str, Any]] = []
+            top_consumers_truncated = False
             # Only perform bounded top-consumers scan when threshold is crossed
+            # Avoid scanning duplicate devices across alias mounts
             if status in ("warn", "critical"):
-                # Find matching allowed roots that reside on this mount / device
-                matching_roots = [
-                    r for r in cfg["allowed_roots"]
-                    if (r == mount or r.startswith(mount.rstrip("/") + "/"))
-                ]
-                for root in matching_roots:
-                    if not os.path.exists(root):
-                        continue
-                    try:
-                        root_st = self.stat_fn(root)
-                        if getattr(root_st, "st_dev", -1) != dev_id:
+                if dev_id not in scanned_devices:
+                    scanned_devices.add(dev_id)
+                    # Find matching allowed roots that reside on this mount / device
+                    matching_roots = [
+                        r for r in cfg["allowed_roots"]
+                        if (r == mount or r.startswith(mount.rstrip("/") + "/"))
+                    ]
+                    for root in matching_roots:
+                        if not os.path.exists(root):
                             continue
-                    except OSError:
-                        continue
+                        try:
+                            root_st = self.stat_fn(root)
+                            if getattr(root_st, "st_dev", -1) != dev_id:
+                                continue
+                        except OSError:
+                            continue
 
-                    consumers, _ = scan_top_consumers(
-                        root,
-                        dev_id,
-                        max_depth=cfg["top_consumers_depth"],
-                        limit=cfg["top_consumers_limit"],
-                        timeout_s=cfg["scan_timeout_s"],
-                        stat_fn=self.stat_fn,
-                        listdir_fn=self.listdir_fn,
-                        monotonic_fn=self.monotonic_fn,
-                    )
-                    top_consumers.extend(consumers)
+                        consumers, is_trunc = scan_top_consumers(
+                            root,
+                            dev_id,
+                            max_depth=cfg["top_consumers_depth"],
+                            limit=cfg["top_consumers_limit"],
+                            timeout_s=cfg["scan_timeout_s"],
+                            stat_fn=self.stat_fn,
+                            listdir_fn=self.listdir_fn,
+                            monotonic_fn=self.monotonic_fn,
+                        )
+                        top_consumers.extend(consumers)
+                        if is_trunc:
+                            top_consumers_truncated = True
 
-                # Sort combined consumers and trim
-                if top_consumers:
-                    top_consumers.sort(key=lambda x: x["size_bytes"], reverse=True)
-                    top_consumers = top_consumers[: cfg["top_consumers_limit"]]
+                    # Sort combined consumers and trim
+                    if top_consumers:
+                        top_consumers.sort(key=lambda x: x["size_bytes"], reverse=True)
+                        top_consumers = top_consumers[: cfg["top_consumers_limit"]]
 
             fs_entry: Dict[str, Any] = {
                 "mount_point": mount,
@@ -387,6 +441,7 @@ class DiskMonitor:
                 fs_entry["primary_mount"] = primary_mount
             if top_consumers:
                 fs_entry["top_consumers"] = top_consumers
+                fs_entry["top_consumers_truncated"] = top_consumers_truncated
 
             filesystems.append(fs_entry)
 

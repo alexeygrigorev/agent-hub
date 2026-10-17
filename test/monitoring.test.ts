@@ -200,7 +200,7 @@ describe('Disk Monitoring Service', () => {
     const initialTasks = hub.sql.exec('SELECT * FROM intake_tasks').toArray();
     expect(initialTasks.length).toBe(1);
 
-    // Poll 2 (30 min later): Still high (90% warn) - MUST NOT create a second task
+    // Poll 2 (30 min later): Still high (90% warn) - MUST NOT create a second task, and MUST NOT emit duplicate event on unchanged poll
     clock.t += 1800 * 1000;
     const res2 = await hub.monitoringService.handleObservation(makeReq(90.0, 'warn', 450_000_000_000), auth);
     expect(res2.status).toBe(200);
@@ -208,17 +208,20 @@ describe('Disk Monitoring Service', () => {
     const secondPollTasks = hub.sql.exec('SELECT * FROM intake_tasks').toArray();
     expect(secondPollTasks.length).toBe(1); // Still exactly 1 task! No flood!
 
-    // Verify task history has update
+    // Verify task history has NO new event on unchanged poll
     const taskData = JSON.parse(secondPollTasks[0].data as string);
-    expect(taskData.history.length).toBe(2); // intake + update
+    expect(taskData.history.length).toBe(1); // Only original intake!
 
-    // Poll 3 (30 min later): Increases to critical (96%) - updates state on same task
+    // Poll 3 (30 min later): Increases to critical (96%) - severity changed!
     clock.t += 1800 * 1000;
     const res3 = await hub.monitoringService.handleObservation(makeReq(96.0, 'critical', 480_000_000_000), auth);
     expect(res3.status).toBe(200);
 
     const thirdPollTasks = hub.sql.exec('SELECT * FROM intake_tasks').toArray();
     expect(thirdPollTasks.length).toBe(1); // Still 1 task
+    const taskData3 = JSON.parse(thirdPollTasks[0].data as string);
+    expect(taskData3.history.length).toBe(2); // Intake + severity change event
+    expect(taskData3.history[1].text).toContain('warn to critical');
     const alertCritical = hub.livenessService.alerts().find((a: any) => a.subject === 'host-a:/data');
     expect(alertCritical?.state).toBe('critical');
 
@@ -236,6 +239,7 @@ describe('Disk Monitoring Service', () => {
     const finalTaskData = JSON.parse(finalTasks[0].data as string);
     expect(finalTaskData.status).toBe('done');
     expect(finalTaskData.current_state).toContain('Recovered');
+    expect(finalTaskData.history.length).toBe(3); // Intake + severity change + resolution
 
     // Verify episode is resolved
     const episode = hub.sql.exec('SELECT * FROM disk_episodes WHERE episode_key = "disk:host-a:/data"').toArray()[0] as any;
@@ -415,5 +419,252 @@ describe('Disk Monitoring Service', () => {
     });
     const dupRes = await hub.monitoringService.handleObservation(dupReq, auth);
     expect(dupRes.status).toBe(400);
+  }));
+
+  it('enforces canonical task CAS and preserves history across real IntakeService calls', () => fixture(async (hub, clock) => {
+    enrollHost(hub.sql, 'host-a');
+    const auth = { kind: 'host' as const, machine_id: 'host-a', tokenId: 'cred-host-a' };
+    const adminAuth = async () => ({ caller: { kind: 'human' as const, actor: 'admin', isAdmin: true }, scopes: ['admin'] });
+
+    // 1. Post disk observation triggering warn episode
+    const postObs = (percent: number, status: 'ok' | 'warn' | 'critical', usedBytes: number) =>
+      hub.monitoringService.handleObservation(
+        new Request('https://hub.internal/api/monitoring/disk', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            machine_id: 'host-a',
+            observed_at: new Date(clock.t).toISOString(),
+            filesystems: [
+              {
+                mount_point: '/data',
+                device_id: 'dev-data',
+                is_primary: true,
+                total_bytes: 500_000_000_000,
+                used_bytes: usedBytes,
+                free_bytes: 500_000_000_000 - usedBytes,
+                percent,
+                status,
+                top_consumers: [{ path: '/data/heavy', size_bytes: usedBytes / 2 }],
+              },
+            ],
+          }),
+        }),
+        auth,
+      );
+
+    await postObs(88.0, 'warn', 440_000_000_000);
+
+    const episode = hub.sql.exec('SELECT * FROM disk_episodes WHERE episode_key = "disk:host-a:/data"').toArray()[0] as any;
+    expect(episode.intake_task_id).toBeTruthy();
+    const taskId = episode.intake_task_id;
+
+    // 2. Fetch task through real IntakeService GET /api/intake/tasks/:id
+    const getReq = new Request(`https://hub.internal/api/intake/tasks/${taskId}`, { method: 'GET' });
+    const getRes = await hub.intakeService.handle(getReq, adminAuth);
+    expect(getRes.status).toBe(200);
+    const getData: any = await getRes.json();
+    const initialVersion = getData.task.control.version;
+    expect(initialVersion).toBe(1);
+    expect(getData.task.payload_data.history[0].kind).toBe('intake');
+
+    // 3. User adds a note to the task through real IntakeService
+    const noteReq = new Request(`https://hub.internal/api/intake/tasks/${taskId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        key: 'user-note-1',
+        expected_version: initialVersion,
+        current_state: 'Investigating high usage on /data',
+      }),
+    });
+    const noteRes = await hub.intakeService.handle(noteReq, adminAuth);
+    expect(noteRes.status).toBe(200);
+    const noteData: any = await noteRes.json();
+    const versionAfterNote = noteData.task.control.version;
+    expect(versionAfterNote).toBe(2);
+
+    // 4. Disk monitor observes severity change: warn -> critical!
+    clock.t += 60 * 1000;
+    await postObs(96.0, 'critical', 480_000_000_000);
+
+    // Verify task version incremented atomically by monitoring service
+    const getRes2 = await hub.intakeService.handle(getReq, adminAuth);
+    const getData2: any = await getRes2.json();
+    const versionAfterCritical = getData2.task.control.version;
+    expect(versionAfterCritical).toBe(3);
+
+    // 5. Stale update attempt using expected_version=2 (before critical escalation) MUST FAIL with 409 version_conflict
+    const staleReq = new Request(`https://hub.internal/api/intake/tasks/${taskId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        key: 'user-stale-attempt',
+        expected_version: 2, // Stale! Current version is 3
+        current_state: 'Trying to update with stale version',
+      }),
+    });
+    const staleRes = await hub.intakeService.handle(staleReq, adminAuth);
+    expect(staleRes.status).toBe(409);
+    const staleBody: any = await staleRes.json();
+    expect(staleBody.error).toBe('version_conflict');
+
+    // 6. Update with current expected_version=3 succeeds
+    const validReq = new Request(`https://hub.internal/api/intake/tasks/${taskId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        key: 'user-valid-attempt',
+        expected_version: 3,
+        current_state: 'Applied cleanup scripts to /data',
+      }),
+    });
+    const validRes = await hub.intakeService.handle(validReq, adminAuth);
+    expect(validRes.status).toBe(200);
+    const validBody: any = await validRes.json();
+    expect(validBody.task.control.version).toBe(4);
+
+    // 7. Verify history preservation: original intake event (history[0]) is preserved intact!
+    const history = validBody.task.payload_data.history;
+    expect(history[0].kind).toBe('intake');
+    expect(history[0].text).toContain('Disk pressure alert');
+  }));
+
+  it('handles honest capacity refusals and recovers orphan tasks when slots free', () => fixture(async (hub, clock) => {
+    enrollHost(hub.sql, 'host-a');
+    const auth = { kind: 'host' as const, machine_id: 'host-a', tokenId: 'cred-host-a' };
+
+    // Fill intake_tasks up to capacity (256 tasks)
+    for (let i = 0; i < 256; i++) {
+      const dummyId = `dummy-task-${i.toString().padStart(4, '0')}`;
+      hub.sql.exec(
+        'INSERT INTO intake_tasks(id, data) VALUES(?, ?)',
+        dummyId,
+        JSON.stringify({ id: dummyId, project: 'demo', title: `Dummy ${i}`, status: 'open', version: 1, created_at: clock.t, updated_at: clock.t, history: [] }),
+      );
+    }
+
+    // Post disk pressure observation with /data at 90% (warn)
+    const postObs = () =>
+      hub.monitoringService.handleObservation(
+        new Request('https://hub.internal/api/monitoring/disk', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            machine_id: 'host-a',
+            observed_at: new Date(clock.t).toISOString(),
+            filesystems: [
+              {
+                mount_point: '/data',
+                device_id: 'dev-data',
+                is_primary: true,
+                total_bytes: 500_000_000_000,
+                used_bytes: 450_000_000_000,
+                free_bytes: 50_000_000_000,
+                percent: 90.0,
+                status: 'warn',
+              },
+            ],
+          }),
+        }),
+        auth,
+      );
+
+    const res1 = await postObs();
+    expect(res1.status).toBe(200);
+
+    // Episode should be open, but intake_task_id is null due to honest capacity refusal
+    const ep1 = hub.sql.exec('SELECT * FROM disk_episodes WHERE episode_key = "disk:host-a:/data"').toArray()[0] as any;
+    expect(ep1).toBeTruthy();
+    expect(ep1.state).toBe('warn');
+    expect(ep1.intake_task_id).toBeNull();
+    expect(ep1.details_json).toContain('capacity_refused');
+
+    // Free up 1 slot in intake_tasks
+    hub.sql.exec('DELETE FROM intake_tasks WHERE id = "dummy-task-0000"');
+
+    // Next poll arrives (60s later)
+    clock.t += 60 * 1000;
+    const res2 = await postObs();
+    expect(res2.status).toBe(200);
+
+    // Episode now has a recovered intake task (no permanent orphan!)
+    const ep2 = hub.sql.exec('SELECT * FROM disk_episodes WHERE episode_key = "disk:host-a:/data"').toArray()[0] as any;
+    expect(ep2.intake_task_id).toBeTruthy();
+  }));
+
+  it('propagates actual observation timestamps, freshness, and errors in getStatusSummary', () => fixture(async (hub, clock) => {
+    enrollHost(hub.sql, 'host-a');
+    const auth = { kind: 'host' as const, machine_id: 'host-a', tokenId: 'cred-host-a' };
+
+    // 1. Missing observations (empty database)
+    const summaryEmpty = hub.monitoringService.getStatusSummary(clock.t);
+    expect(summaryEmpty.categories_entry.freshness).toBe('unknown');
+    expect(summaryEmpty.categories_entry.coverage).toBe('unavailable');
+    expect(summaryEmpty.categories_entry.observed_at).toBeNull();
+    expect(summaryEmpty.categories_entry.reason).toBe('no_disk_observations_recorded');
+
+    // 2. Post observation observed at T_obs
+    const obsTime = clock.t;
+    const res = await hub.monitoringService.handleObservation(
+      new Request('https://hub.internal/api/monitoring/disk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          machine_id: 'host-a',
+          observed_at: new Date(obsTime).toISOString(),
+          filesystems: [
+            {
+              mount_point: '/',
+              device_id: 'dev-1',
+              is_primary: true,
+              total_bytes: 100_000_000_000,
+              used_bytes: 40_000_000_000,
+              free_bytes: 60_000_000_000,
+              percent: 40.0,
+              status: 'ok',
+            },
+            {
+              mount_point: '/broken',
+              device_id: 'dev-2',
+              is_primary: true,
+              total_bytes: 0,
+              used_bytes: 0,
+              free_bytes: 0,
+              percent: 0.0,
+              status: 'error',
+              error: 'PermissionDenied',
+            },
+          ],
+        }),
+      }),
+      auth,
+    );
+    expect(res.status).toBe(200);
+
+    // Query 100s later (within 180s -> fresh)
+    clock.t += 100 * 1000;
+    const summaryFresh = hub.monitoringService.getStatusSummary(clock.t);
+    // Observed_at MUST be obsTime, NOT current clock.t
+    expect(summaryFresh.categories_entry.observed_at).toBe(new Date(obsTime).toISOString());
+    // Since /broken has error, coverage must be partial, NOT complete
+    expect(summaryFresh.categories_entry.coverage).toBe('partial');
+    expect(summaryFresh.categories_entry.freshness).toBe('fresh');
+    expect(summaryFresh.filesystems.find((f: any) => f.mount_point === '/broken')?.error).toBe('PermissionDenied');
+    // Error filesystem appears in needs_attention
+    expect(summaryFresh.needs_attention.some((n: any) => n.subject === 'host-a:/broken')).toBe(true);
+
+    // Query 500s later (age = 600s, between 180s and 900s -> stale)
+    clock.t = obsTime + 600 * 1000;
+    const summaryStale = hub.monitoringService.getStatusSummary(clock.t);
+    expect(summaryStale.categories_entry.freshness).toBe('stale');
+    expect(summaryStale.categories_entry.coverage).toBe('partial');
+    expect(summaryStale.categories_entry.reason).toContain('stale');
+
+    // Query 1200s later (age > 900s -> unavailable / stale)
+    clock.t = obsTime + 1200 * 1000;
+    const summaryUnavail = hub.monitoringService.getStatusSummary(clock.t);
+    expect(summaryUnavail.categories_entry.freshness).toBe('stale');
+    expect(summaryUnavail.categories_entry.coverage).toBe('partial');
   }));
 });

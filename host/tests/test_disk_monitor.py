@@ -96,6 +96,98 @@ class TestScanTopConsumers(unittest.TestCase):
         )
         self.assertTrue(truncated)
 
+    def test_large_directory_bounded_traversal(self):
+        items = [f"item_{i}.log" for i in range(5000)]
+
+        def mock_listdir(path):
+            if path == "/large":
+                return items
+            return []
+
+        def mock_stat(path):
+            return SimpleNamespace(st_dev=100, st_size=100, st_blocks=1)
+
+        results, truncated = disk_monitor.scan_top_consumers(
+            "/large",
+            100,
+            stat_fn=mock_stat,
+            listdir_fn=mock_listdir,
+            max_entries=300,
+            limit=10,
+        )
+        self.assertTrue(truncated)
+        self.assertLessEqual(len(results), 10)
+
+    def test_symlink_escapes_and_loops_ignored(self):
+        def mock_listdir(path):
+            if path == "/test":
+                return ["real.txt", "escape_link", "loop_link"]
+            return ["secret.txt"]
+
+        def mock_islink(path):
+            return "link" in path
+
+        def mock_isdir(path):
+            return False
+
+        def mock_stat(path):
+            if path == "/test/real.txt":
+                return SimpleNamespace(st_dev=100, st_size=5000)
+            elif "link" in path:
+                return SimpleNamespace(st_dev=100, st_size=20)
+            return SimpleNamespace(st_dev=100, st_size=999999)
+
+        results, truncated = disk_monitor.scan_top_consumers(
+            "/test",
+            100,
+            stat_fn=mock_stat,
+            listdir_fn=mock_listdir,
+            islink_fn=mock_islink,
+            isdir_fn=mock_isdir,
+            limit=5,
+        )
+        self.assertFalse(truncated)
+        paths = [r["path"] for r in results]
+        self.assertIn("/test/real.txt", paths)
+        # Should not recurse into link or report secret.txt
+        self.assertNotIn("/test/escape_link/secret.txt", paths)
+
+    def test_aggregate_directory_sizes(self):
+        def mock_listdir(path):
+            if path == "/root":
+                return ["sub_heavy", "small_file.txt"]
+            elif path == "/root/sub_heavy":
+                return ["chunk1.bin", "chunk2.bin"]
+            return []
+
+        def mock_isdir(path):
+            return path == "/root/sub_heavy"
+
+        def mock_stat(path):
+            if path == "/root/small_file.txt":
+                return SimpleNamespace(st_dev=100, st_size=1000, st_blocks=2)  # 1024 B
+            elif path == "/root/sub_heavy":
+                return SimpleNamespace(st_dev=100, st_size=4096, st_blocks=8)  # 4096 B (inode size)
+            elif path == "/root/sub_heavy/chunk1.bin":
+                return SimpleNamespace(st_dev=100, st_size=5000000, st_blocks=10000)  # 5 MB
+            elif path == "/root/sub_heavy/chunk2.bin":
+                return SimpleNamespace(st_dev=100, st_size=5000000, st_blocks=10000)  # 5 MB
+            return SimpleNamespace(st_dev=100, st_size=0, st_blocks=0)
+
+        results, truncated = disk_monitor.scan_top_consumers(
+            "/root",
+            100,
+            stat_fn=mock_stat,
+            listdir_fn=mock_listdir,
+            isdir_fn=mock_isdir,
+            max_depth=2,
+            limit=5,
+        )
+        self.assertFalse(truncated)
+        # sub_heavy should aggregate chunk1 + chunk2 (10 MB), NOT just report 4096 inode size!
+        sub_heavy = next(r for r in results if r["path"] == "/root/sub_heavy")
+        self.assertGreaterEqual(sub_heavy["size_bytes"], 10_000_000)
+
 
 class TestDiskMonitor(unittest.TestCase):
     def test_load_active_config_defaults(self):
@@ -226,6 +318,63 @@ class TestDiskMonitor(unittest.TestCase):
         self.assertFalse(res3["rate_limited"])
         self.assertTrue(res3["posted"])
         self.assertEqual(submit_mock.call_count, 2)
+
+    def test_duplicate_device_scans_skipped_for_aliases(self):
+        # Two mounts on the SAME device, both in critical status
+        def mock_stat(path):
+            return SimpleNamespace(st_dev=200, st_size=4096)
+
+        def mock_statvfs(path):
+            # 96% full (critical)
+            return SimpleNamespace(f_frsize=4096, f_blocks=1000, f_bfree=40, f_bavail=40)
+
+        scan_calls = []
+
+        def mock_listdir(path):
+            scan_calls.append(path)
+            return ["big.log"]
+
+        monitor = disk_monitor.DiskMonitor(
+            config={
+                "enabled": True,
+                "machine_id": "test-box",
+                "mounts": ["/data", "/data-alias"],
+                "allowed_roots": ["/data", "/data-alias"],
+            },
+            stat_fn=mock_stat,
+            statvfs_fn=mock_statvfs,
+            listdir_fn=mock_listdir,
+        )
+
+        cfg = monitor.load_active_config()
+        payload, errors = monitor.collect(cfg)
+        self.assertEqual(len(errors), 0)
+        # /data was scanned; /data-alias has the same dev_id=200 so it must NOT trigger a second scan!
+        self.assertEqual(len(scan_calls), 1)
+
+    def test_stat_failure_reported_as_error_status(self):
+        def mock_stat(path):
+            raise PermissionError("Access denied")
+
+        def mock_statvfs(path):
+            raise PermissionError("Access denied")
+
+        monitor = disk_monitor.DiskMonitor(
+            config={
+                "enabled": True,
+                "machine_id": "test-box",
+                "mounts": ["/restricted"],
+            },
+            stat_fn=mock_stat,
+            statvfs_fn=mock_statvfs,
+        )
+
+        cfg = monitor.load_active_config()
+        payload, errors = monitor.collect(cfg)
+        self.assertGreater(len(errors), 0)
+        fs = payload["filesystems"][0]
+        self.assertEqual(fs["status"], "error")
+        self.assertEqual(fs["error"], "PermissionError")
 
 
 class TestSessionHostDiskThread(unittest.TestCase):

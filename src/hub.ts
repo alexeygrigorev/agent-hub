@@ -158,6 +158,7 @@ export class Hub extends DurableObject {
       fn => this.ctx.storage.transactionSync(fn),
       this.livenessService,
       alert => this.notifyAlert(alert),
+      this.intakeService,
     );
     this.monitoringService.init();
     this.statusService.setMonitoringService(this.monitoringService);
