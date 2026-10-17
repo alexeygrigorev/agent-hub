@@ -219,6 +219,7 @@ class TestBridge(unittest.TestCase):
 
         spoof_dir = os.path.join(work, ".local", "cursors")
         os.makedirs(spoof_dir, exist_ok=True)
+        os.chmod(os.path.join(work, ".local"), 0o700)
         native_id = str(uuid.uuid4())
         with open(os.path.join(spoof_dir, "fake.json"), "w", encoding="utf-8") as f:
             json.dump({"exceptions": [native_id]}, f)
@@ -1523,7 +1524,7 @@ sys.exit(0)
         create_authoritative_state(state_dir, canonical_ws, "agent-1", rec_uuid)
 
         receipts_file = os.path.join(work, ".local", "hub-bridge-receipts.json")
-        os.makedirs(os.path.dirname(receipts_file), exist_ok=True)
+        os.makedirs(os.path.dirname(receipts_file), mode=0o700, exist_ok=True)
         corrupt_content = b'{"hub_to_native": {"incomplete": json_syntax_error'
         with open(receipts_file, "wb") as f:
             f.write(corrupt_content)

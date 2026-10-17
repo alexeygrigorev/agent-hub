@@ -39,14 +39,11 @@ class TestConfig(unittest.TestCase):
         loaded = config.load_config()
         self.assertEqual(loaded, {})
 
-    @patch("sys.platform", "win32")
-    @patch("subprocess.run")
-    def test_windows_acl_failure(self, mock_run):
-        mock_run.return_value.returncode = 1
-        mock_run.return_value.stderr = "access denied"
-        mock_run.return_value.stdout = r"domain\user,S-1-5-21-1234"
-        with self.assertRaisesRegex(RuntimeError, "Failed to"):
-            config._set_permissions(self.mock_get_path.return_value)
+    def test_acl_backend_failure_never_publishes_config(self):
+        with patch.object(config.private_fs, 'atomic_write', side_effect=PermissionError('ACL unavailable')):
+            with self.assertRaisesRegex(RuntimeError, 'Config save failed'):
+                config.save_config({'access_token': 'fixture-only'})
+        self.assertFalse(self.mock_get_path.return_value.exists())
 
     def test_reject_invalid_machine_id_and_origin(self):
         for bad_mid in ("", "   ", " mach-1 ", 123, False, ["m1"], "mach\n1"):

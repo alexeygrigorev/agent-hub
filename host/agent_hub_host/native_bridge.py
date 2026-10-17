@@ -33,6 +33,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from . import private_fs
+
 
 MAX_MAILBOX_STATE_BYTES = 1024 * 1024  # 1 MiB boundary for metadata files
 
@@ -55,6 +57,9 @@ class NativeServiceBinding:
 
 def canonicalize_workspace(workspace_path: str) -> str:
     """Canonicalize workspace path matching aplexer's canonical_workspace."""
+    if os.name == 'nt':
+        from .win32_fs import canonical_workspace
+        return canonical_workspace(workspace_path)
     abs_path = os.path.abspath(workspace_path)
     try:
         return os.path.realpath(abs_path)
@@ -112,8 +117,7 @@ def qualify_native_service_binding(
             rec_file = os.path.join(entry_dir, "session.json")
             if os.path.isfile(rec_file) and not os.path.islink(rec_file):
                 try:
-                    with open(rec_file, "r", encoding="utf-8") as f:
-                        rec = json.load(f)
+                    rec = json.loads(private_fs.read_bytes(rec_file, MAX_MAILBOX_STATE_BYTES, private=False))
                     if isinstance(rec, dict):
                         rec_id = str(rec.get("id", ""))
                         rec_ws = str(rec.get("workspace", ""))
@@ -147,8 +151,7 @@ def qualify_native_service_binding(
                     continue
                 rec_file = os.path.join(entry_dir, "session.json")
                 if os.path.isfile(rec_file) and not os.path.islink(rec_file):
-                    with open(rec_file, "r", encoding="utf-8") as f:
-                        rec = json.load(f)
+                    rec = json.loads(private_fs.read_bytes(rec_file, MAX_MAILBOX_STATE_BYTES, private=False))
                     if isinstance(rec, dict):
                         rec_id = str(rec.get("id", ""))
                         rec_ws = str(rec.get("workspace", ""))
@@ -183,8 +186,7 @@ def qualify_native_service_binding(
                 rec_file = os.path.join(entry_dir, "session.json")
                 if os.path.isfile(rec_file) and not os.path.islink(rec_file):
                     try:
-                        with open(rec_file, "r", encoding="utf-8") as f:
-                            rec = json.load(f)
+                        rec = json.loads(private_fs.read_bytes(rec_file, MAX_MAILBOX_STATE_BYTES, private=False))
                         if isinstance(rec, dict):
                             rec_id = str(rec.get("id", ""))
                             rec_ws = str(rec.get("workspace", ""))
@@ -345,8 +347,7 @@ def validate_native_reply_provenance(
         rec_file = os.path.join(entry_dir, "session.json")
         if os.path.isfile(rec_file) and not os.path.islink(rec_file):
             try:
-                with open(rec_file, "r", encoding="utf-8") as f:
-                    rec = json.load(f)
+                rec = json.loads(private_fs.read_bytes(rec_file, MAX_MAILBOX_STATE_BYTES, private=False))
                 if isinstance(rec, dict):
                     if (
                         str(rec.get("id", "")).lower() == str(replier_sid).lower()
@@ -381,11 +382,7 @@ def read_authoritative_cursor_safe(cursor_path: str) -> dict[str, Any] | None:
         return None
 
     try:
-        st = os.stat(cursor_path)
-        if st.st_size > MAX_MAILBOX_STATE_BYTES:
-            return None
-        with open(cursor_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = json.loads(private_fs.read_bytes(cursor_path, MAX_MAILBOX_STATE_BYTES, private=False))
         if isinstance(data, dict):
             return data
     except Exception:

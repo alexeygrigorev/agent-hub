@@ -7,17 +7,15 @@ its durable log and is NEVER blindly repeated, even when the log is empty.
 from __future__ import annotations
 
 from contextlib import contextmanager
-import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
-import stat
 import subprocess
 from datetime import datetime, timezone
 
-from . import config, conversations
+from . import config, conversations, private_fs
 from .bridge import get_authoritative_runtime_dir, get_authoritative_state_dir
 from .native_bridge import (BridgeCapabilityGap, canonicalize_workspace,
                             qualify_native_service_binding, validate_native_send_envelope)
@@ -146,21 +144,33 @@ class ConversationBridge:
 
     @contextmanager
     def journal(self, *, create=True):
-        if not create and not self.path.is_file():
-            raise BridgeCapabilityGap('Existing journal required; never reset history to recover a gap')
-        self.path.parent.mkdir(exist_ok=True, mode=0o700)
-        config._check_ancestors(self.path)
-        fd = os.open(str(self.path) + '.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self._journal(create=create):
+                yield
+        except (PermissionError, ValueError) as exc:
+            raise BridgeCapabilityGap('Unsafe bridge journal or file safety proof failed') from exc
+        except OSError as exc:
+            if exc.errno in (20, 40):  # ENOTDIR / ELOOP, no-follow path rejection
+                raise BridgeCapabilityGap('Unsafe bridge journal path') from exc
+            raise
+
+    @contextmanager
+    def _journal(self, *, create=True):
+        with private_fs.exclusive_lock(str(self.path) + '.lock'):
+            if not create:
+                try:
+                    private_fs.read_bytes(self.path, MAX_STATE)
+                except FileNotFoundError:
+                    raise BridgeCapabilityGap('Existing journal required; never reset history to recover a gap') from None
             self.binding = self.qualify()
             identity = [self.origin, self.actor, self.project, self.workspace, self.machine,
                         self.binding.session_id, self.binding.tag]
-            if self.path.exists() or self.path.is_symlink():
-                info = self.path.lstat()
-                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size > MAX_STATE:
-                    raise BridgeCapabilityGap('Unsafe bridge journal')
-                self.state = json.loads(self.path.read_text(), object_pairs_hook=strict_object,
+            try:
+                raw = private_fs.read_bytes(self.path, MAX_STATE)
+            except FileNotFoundError:
+                raw = None
+            if raw is not None:
+                self.state = json.loads(raw, object_pairs_hook=strict_object,
                                         parse_constant=reject_constant)
                 if (not isinstance(self.state, dict) or self.state.get('identity') != identity
                         or type(self.state.get('version')) is not int or self.state.get('version') != 1):
@@ -170,8 +180,6 @@ class ConversationBridge:
                 self.state = dict(version=1, identity=identity, cursors={}, deliveries={}, replies={})
                 self.save()
             yield
-        finally:
-            os.close(fd)
 
     def validate_state(self):
         """Validate evidence without rebuilding state or discarding extension fields."""
@@ -331,22 +339,7 @@ class ConversationBridge:
         raw = json.dumps(self.state, ensure_ascii=False, sort_keys=True).encode()
         if len(raw) > MAX_STATE:
             raise BridgeCapabilityGap('Journal full; retain state and reconcile before continuing')
-        tmp = str(self.path) + '.tmp'
-        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-        try:
-            with os.fdopen(fd, 'wb') as stream:
-                stream.write(raw)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(tmp, self.path)
-            directory = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-        finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
+        private_fs.atomic_write(self.path, raw, MAX_STATE)
 
     def own_envelope(self, msg):
         validate_native_send_envelope(msg, self.binding, self.workspace)
