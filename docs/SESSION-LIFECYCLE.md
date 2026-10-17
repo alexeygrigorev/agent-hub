@@ -1,9 +1,10 @@
-# M15 Session Lifecycle Registry (M15c LIVE: durable canonical API + CLI)
+# M15 Session Lifecycle Registry (M15d LIVE: real cleanup --apply)
 
 Source: Alexey Addendum 5 (`hub-intake-brief.md`). Statuses here are live:
-the durable seams below are wired, tested (HTTP/SQLite + CLI), and merged
-to main. `--apply` stays explicitly refused; the executor is M15d (next,
-head-assigned).
+the durable seams below are wired, tested (HTTP/SQLite + CLI + synthetic
+host repos), and merged to main. Dry-run stays the default and is readonly;
+`--apply` now enqueues real M12 stop intents and removes owned worktrees
+under the trusted allowlist (head runs the live throwaway acceptance).
 
 ## What exists (M15c shipped)
 
@@ -111,7 +112,7 @@ server eligibility), not a second registry or fake apply.
   quota/routing/reserves/cooldown still apply at execution time.
 - Same classified facts feed `hub status` / `hub handoff` via `toStatusDto`/`toHandoffDto`.
 
-## Cleanup safety (dry-run default)
+## Cleanup safety (dry-run default, real --apply)
 
 - `planCleanup` is pure: eligible ONLY when group is `finished_stale`, state is confirmed
   `finished`/`superseded`, caller owns the session, no pending obligations, and not human-owned.
@@ -119,14 +120,43 @@ server eligibility), not a second registry or fake apply.
 - `validateCleanupTarget` (executor seam) revalidates machine/native/owner, refuses on
   busy/draft/pending or failed containment, never does tag-only kill, never treats a missing
   record as stopped. Operations are idempotent; uncertain outcomes stay durable (no blind retry).
-- Tree/branch removal (future apply path, NOT executed here): only the owned per-session tree,
-  canonical realpath under the owned root, no symlink escape, no shared checkout, no other
-  session cwd, no extra worktree user of the branch, no git locks; clean including untracked/index;
-  no unmerged commits; HEAD entirely reachable from FRESH `origin/main` (network unavailable or
-  stale ref fails closed to listed-only). Argv arrays only, no shell interpolation. Dry-run is
-  readonly (pure inputs, no fetch mutation). In this task only disposable synthetic fixture
-  repos/processes wholly inside the owned private test `TMPDIR` may be used; real worktrees,
-  histories, and sources stay preserved.
+- M15d REAL `--apply` (`POST /api/sessions/cleanup` `{apply:true, key?}`):
+  owner-only (admin apply is never an oracle: 404), exact authenticated
+  current-owner credential/family/incarnation re-verified per session INSIDE
+  the mutation transaction (after the awaited body), admin never means
+  another coordinator owns it, human/Alexey records permanently protected.
+  Fresh eligibility is re-evaluated per session before any enqueue; each
+  eligible target becomes ONE genuine M12 stop intent (existing
+  recorded→transported→claimed→acked custody, idempotent per operation key;
+  an already-pending stop replays instead of duplicating). Fleet-observed-only
+  rows (no session-control intent), drifted bindings, and non-stoppable
+  states are kept with actual reasons. The host executes each stop through
+  the existing claim/effect/ack path with containment-confirmed exit.
+- Tree/branch removal (host, after CONFIRMED stop only):
+  `host/agent_hub_host/session_cleanup.py` removes ONLY the explicitly
+  addressed dedicated registered worktree + branch under the trusted host
+  `cleanup_roots` allowlist (explicit `cleanup_roots` in the host settings;
+  `fleet.py` validates the allowlist shape, `session_host.py` surfaces its
+  size, neither auto-deletes). Refuses shared main/bare/root workspaces,
+  symlink/realpath escape, another live session cwd/worktree use, any
+  dirty/index/untracked content, locks, branch checked out elsewhere, and
+  unmerged commits. HEAD must be entirely reachable from FRESH `origin/main`
+  (`ls-remote`, no local mutation; network/unknown fails closed to
+  listed-only). Ordinary `git worktree remove` then `git branch -d` only
+  after ancestry proof; no `--force`, no reset. Per-target durable journals
+  (`cleanup-<machine>-<nativehex>.json` beside the receiver journals, never
+  under a cleanup root) make restart/lost-response replay terminal
+  `tree_removed` outcomes and re-evaluate kept ones — never repeating an
+  unsafe deletion. CLI: `hub sessions cleanup --apply [--key KEY]` enqueues
+  stops; adding `--tree --machine-id/--native-id/--owner/--worktree/--branch/
+  --journal-dir/--cleanup-root` additionally removes the addressed tree once
+  its stop reads back `stopped`, else reports `stop_pending` with no git
+  effect. Partial results and uncertainty stay durable; every kept target
+  reports its actual reason — no pretend success.
+  Dry-run stays readonly (pure inputs, zero writes). Tests use only
+  disposable synthetic fixture repos/processes wholly inside the owned
+  private test `TMPDIR`; real worktrees, histories, and sources stay
+  preserved.
 
 ## Live contracts (M15c shipped, tested)
 
@@ -149,18 +179,21 @@ server eligibility), not a second registry or fake apply.
   Admins are never another coordinator's owner (404, never oracle).
   Decisions persist in SQLite across restarts and feed the projection.
 - `POST /api/sessions/cleanup` — dry-run default (`{dry_run:true}` or
-  empty body): pure plan over the caller's scope, ZERO writes. `{apply:true}`
-  always refuses `409 apply_not_available` with the exact M15d next seam.
+  empty body): pure plan over the caller's scope, ZERO writes. `{apply:true,
+  key?}` enqueues real M12 stop intents for freshly eligible OWN sessions
+  (owner custody inside the txn; admin apply 404s; per-session fresh
+  re-evaluation; pending stops replay; kept targets carry actual reasons).
   No fake apply success exists anywhere in this slice.
 - CLI: `hub sessions` defaults to the grouped lifecycle listing +
-  `hub sessions cleanup [--apply] [--owner/--host/--task]` (dry-run
-  default; `--apply` surfaces the server refusal) + `hub sessions observe`
-  (host observation transport). Existing `list/start/send/capture/stop`
-  are preserved; no substitute `lifecycle-*` spelling. The TS server is
-  the single classification/planning authority and the Python host owns
-  only observation/execution guards + thin transport.
+  `hub sessions cleanup [--apply [--key KEY] [--tree ...]]` (dry-run
+  default; `--apply` enqueues owned stops, `--tree` additionally removes the
+  explicitly addressed owned worktree/branch after confirmed stop) +
+  `hub sessions observe` (host observation transport). Existing
+  `list/start/send/capture/stop` are preserved; no substitute `lifecycle-*`
+  spelling. The TS server is the single classification/planning authority
+  and the Python host owns only observation/execution guards + thin transport.
 
-## Integration seams (landed M15c; M15d next)
+## Integration seams (landed M15c; M15d shipped, live acceptance next)
 
 - Canonical M12 records stay source of truth: server joins from
   `fleet_sessions` / `fleet_launches` / intake `link` /
@@ -168,14 +201,29 @@ server eligibility), not a second registry or fake apply.
   inputs for the gates. Only bound/observed native identities are keyed;
   unbound queued/held intents stay in the existing flat `list` view.
   No second DB/controller; no fake product completion.
-- M15d (NEXT, head-assigned): the `--apply` executor seam — host-side
-  machine/native/owner revalidation, containment, owned per-session
-  worktree/branch clean-and-merged guards, plus live throwaway acceptance.
-  Until then `--apply` refuses explicitly (`apply_not_available`).
+- M15d (SHIPPED, head live-throwaway acceptance next): the `--apply`
+  executor — server-side machine/native/owner revalidation + M12 stop
+  enqueue, host-side containment-confirmed stop via claim/ack, owned
+  per-session worktree/branch clean-and-merged removal under the trusted
+  allowlist, durable per-target journals. Coordination contract for the
+  parallel status worker: narrow PUBLIC
+  `SessionControlService.hostObservationAllowed(machineId, caller)` returning
+  `caller.kind==='host' && hostOk({machine_id}, caller).ok` (existing fresh
+  host family/approval authority, no duplicate checker, no new privilege);
+  the status worker owns `src/hub.ts` injection and still validates host
+  scope + canonical task/session machine itself. Cleanup logic never trusts
+  JSON ownership from host observations.
 
 ## Tests
 
 Synthetic tags/UUIDs/paths only (e.g. `synth:alpha`, `synth-host`, `/synth/ws`). Classes mirror the
 private 2026-10-17 triage (finished, superseded, idle, limit with/without reset, waiting-Alexey,
 missing worktree, active-with-pending, human-protected, foreign-owner) without private names.
-Run under the head-owned guarded runner; Vitest selections use explicit `-t` filters (≤2 cases).
+M15d adds `test/session-cleanup-m15d.test.ts` (4 HTTP/SQLite apply cases:
+real enqueue + idempotent replay, admin refusal, stranger/idle/limit/human
+kept, narrow host gate) and `host/tests/test_session_cleanup_m15d.py`
+(10 synthetic-repo cases: confinement, clean+merged removal + replay,
+dirty/unmerged/broken-remote/live-use/shared-checkout/checked-out-elsewhere
+kept, allowlist plumbing, CLI transport). Host git fixtures live wholly under
+the owned `.local/tmp`. Run under the head-owned guarded runner; Vitest
+selections use explicit `-t` filters (≤2 cases).
