@@ -7,9 +7,59 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 from . import config, fleet, session_control
 from .native_sessions import qualify_sender_binding
 from .quota_snapshot import QuotaCollector
+from .status_runtime import StatusCollector
+
+
+def status_step_once(collector) -> None:
+    """Run ONE isolated status round (call inside the observer thread only).
+
+    Bounded count/error log only; rate-limited rounds stay silent (no log
+    flood); missing allowlist yields an error count with no HTTP. Never
+    raises: every failure is recorded as a bounded error line. Never touches
+    quota or command state.
+    """
+    try:
+        result = collector.step(submit=True)
+    except Exception as error:
+        print(json.dumps({'event': 'status_error', 'type': type(error).__name__}), flush=True)
+        return
+    try:
+        if not isinstance(result, dict) or result.get('rate_limited'):
+            return
+        observations = result.get('observations')
+        skipped = result.get('skipped')
+        errors = result.get('errors')
+        print(json.dumps({'event': 'status_cycle',
+                          'observations': len(observations) if isinstance(observations, list) else 0,
+                          'skipped': len(skipped) if isinstance(skipped, list) else 0,
+                          'errors': len(errors) if isinstance(errors, list) else 0}), flush=True)
+    except Exception as error:
+        print(json.dumps({'event': 'status_error', 'type': type(error).__name__}), flush=True)
+
+
+def maybe_start_status_thread(current: Optional[threading.Thread], collector) -> Optional[threading.Thread]:
+    """Start ONE bounded daemon observer thread, or skip while one is alive.
+
+    Single-inflight inside the existing controller: no new daemon, timer, or
+    controller. A blocked collector (long probes/HTTP) never delays the
+    command poll loop; the next round is skipped until the thread exits. The
+    collector's own 60s cadence rate-limits real work. Daemon threads die
+    with the controller process (native cgroup lifecycle).
+    """
+    try:
+        if current is not None and current.is_alive():
+            return current
+        thread = threading.Thread(target=status_step_once, args=(collector,),
+                                  daemon=True, name='status-observe')
+        thread.start()
+        return thread
+    except Exception as error:
+        print(json.dumps({'event': 'status_error', 'type': type(error).__name__}), flush=True)
+        return current
 
 
 def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=None):
@@ -37,6 +87,15 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
             previous[sig] = signal.signal(sig, lambda *_: stop.set())
         dispatcher = fleet.Dispatcher(settings)
         quota_collector = QuotaCollector(base_url=cfg.get('base_url'))
+        # Status observation hook (released StatusCollector source): ONE
+        # instance for the controller lifetime, trusted allowlist path under
+        # the existing journal, this machine, 60s floor. The loop below only
+        # starts/skips the single-inflight daemon thread; the collector owns
+        # cadence, and quota/command cycles never wait for it.
+        status_collector = StatusCollector(
+            allowlist_path=str(journal / 'status-allowlist.json'),
+            machine_id=cfg['machine_id'], min_interval_s=60)
+        status_thread: Optional[threading.Thread] = None
         next_fleet = 0
         count = 0
         try:
@@ -71,6 +130,9 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                                           'error': bool(quota_collector.last_error)}), flush=True)
                 except Exception as error:
                     print(json.dumps({'event': 'quota_error', 'type': type(error).__name__}), flush=True)
+                # Status observation never blocks commands/quota: one bounded
+                # single-inflight daemon thread, skipped while alive.
+                status_thread = maybe_start_status_thread(status_thread, status_collector)
                 count += 1
                 if cycles is None or count < cycles:
                     stop.wait(interval)
