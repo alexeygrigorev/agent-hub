@@ -971,3 +971,35 @@ describe('absolute workspace identifiers and friendly names', () => {
     });
   });
 });
+
+describe('held placement recovery', () => {
+  it('retries the original legacy intent after capacity recovers without duplicating it', async () => {
+    let available = false;
+    const placed = fakeReserve();
+    await fixture(async (s, sql) => {
+      const input = { key: 'recover-held', workspace: 'demo', engine: 'codex' };
+      const held = await (await s.handle(request('/api/sessions', input), admin)).json() as any;
+      expect(held.state).toBe('held');
+      const saved = sql.exec('SELECT request_json FROM session_control_sessions WHERE id = ?', held.id).toArray()[0];
+      const legacy = JSON.parse(saved.request_json); delete legacy.parent_id;
+      sql.exec('UPDATE session_control_sessions SET request_json = ? WHERE id = ?', JSON.stringify(legacy), held.id);
+      available = true;
+      const retry = await s.handle(request(`/api/sessions/${held.id}/retry`, {}), admin);
+      const recovered = await retry.json() as any;
+      expect(recovered.id).toBe(held.id);
+      expect(recovered.state).toBe('offered');
+      expect(sql.exec('SELECT id FROM session_control_sessions').toArray()).toHaveLength(1);
+      expect(placed.calls).toHaveLength(1);
+      expect((await s.handle(request('/api/sessions', { ...input, workspace: 'changed' }), admin)).status).toBe(409);
+      expect((await s.handle(request(`/api/sessions/${held.id}/retry`, {}), admin)).status).toBe(409);
+      expect(placed.calls).toHaveLength(1);
+    }, input => available ? placed.hook(input) : { status: 409, value: { error: 'account_capacity' } });
+  });
+  it('refuses another actor and refuses payload changes', async () => {
+    await fixture(async s => {
+      const held = await (await s.handle(request('/api/sessions', { key: 'held-private', workspace: 'demo' }), admin)).json() as any;
+      expect((await s.handle(request(`/api/sessions/${held.id}/retry`, {}), stranger)).status).toBe(404);
+      expect((await s.handle(request(`/api/sessions/${held.id}/retry`, { workspace: 'other' }), admin)).status).toBe(400);
+    }, () => ({ status: 409, value: { error: 'account_capacity' } }));
+  });
+});

@@ -802,7 +802,10 @@ export class SessionControlService {
           'SELECT * FROM session_control_sessions WHERE actor = ? AND request_key = ?', actor, input.key).toArray()[0];
         if (prior) {
           if (!this.ownerOk(prior, caller)) return response({ error: 'not_found' }, 404);
-          if (prior.request_json !== canonical) return response({ error: 'idempotency_conflict' }, 409);
+          // Before lineage shipped, canonical starts omitted parent_id entirely.
+          const priorInput = parsed(prior.request_json, {});
+          if (!Object.prototype.hasOwnProperty.call(priorInput, 'parent_id')) priorInput.parent_id = null;
+          if (JSON.stringify(priorInput) !== canonical) return response({ error: 'idempotency_conflict' }, 409);
           if (prior.fleet_launch_id) return response({ ...this.view(prior), replay: true });
           // A held intent may be placed once capacity/admission recovers; the fleet
           // reserve stays idempotent on its own derived key, so this cannot double-launch.
@@ -1127,7 +1130,7 @@ export class SessionControlService {
       });
     }
 
-    const sessionMatch = /^\/api\/sessions\/([^/]{1,128})(\/(send|capture|stop|commands|binding))?$/.exec(path);
+    const sessionMatch = /^\/api\/sessions\/([^/]{1,128})(\/(send|capture|stop|commands|binding|retry))?$/.exec(path);
     if (sessionMatch) {
       const rawRef = decodeURIComponent(sessionMatch[1]);
       const sub = sessionMatch[3];
@@ -1203,6 +1206,20 @@ export class SessionControlService {
       }
       if (!session || !this.ownerOk(session, caller)) return response({ error: 'not_found' }, 404);
       if (!sub && request.method === 'GET') return response(this.view(session));
+      if (sub === 'retry' && request.method === 'POST') {
+        const input = await body(request);
+        if (!obj(input, [])) return response({ error: 'invalid_retry' }, 400);
+        // Reuse the original actor/key/payload; this cannot create a second
+        // intent or bypass the placement/admission/liveness checks below.
+        if (!writer || actorName(caller) !== session.actor) return response({ error: 'forbidden' }, 403);
+        if (session.state !== 'held' || session.fleet_launch_id) return response({ error: 'session_not_held' }, 409);
+        const original = parsed(session.request_json, {});
+        const replay = Object.fromEntries(Object.entries(original).filter(([, value]) => value !== null));
+        return this.handle(new Request('https://hub.internal/api/sessions', {
+          method: 'POST', body: JSON.stringify({ ...replay, key: session.request_key }),
+        }), auth);
+      }
+
       if (sub === 'commands' && request.method === 'GET') {
         const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 50));
         const params: any[] = [session.id];
