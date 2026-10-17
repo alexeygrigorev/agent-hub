@@ -1,8 +1,8 @@
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/docs/CONVERSATION-BRIDGE-GAPS.md b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/docs/CONVERSATION-BRIDGE-GAPS.md
+diff --git a/docs/CONVERSATION-BRIDGE-GAPS.md b/docs/CONVERSATION-BRIDGE-GAPS.md
 new file mode 100644
 index 0000000..77016cb
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/docs/CONVERSATION-BRIDGE-GAPS.md
++++ b/docs/CONVERSATION-BRIDGE-GAPS.md
 @@ -0,0 +1,51 @@
 +# Explicit conversation bridge history recovery
 +
@@ -55,11 +55,11 @@ index 0000000..77016cb
 +The `--native` variant is intentionally pinned to the original implementer's genuine UUID/tag/workspace and the head-approved `gap-local` journal paths. It refuses an existing journal; do not remove that journal or create a new project to rerun it. An independent reviewer needs their own genuine session and explicit journal-scope approval before adapting the fixture. It sends nonce-only inbox content to the caller itself, never pane input or borrowed identities. Private evidence remains under `.local/bridge-gap/` and the approved journal.
 +
 +These checks establish local source behavior. Independent exact-version review, accepted M1/F7 integration, physical multi-host verification and native idempotent-send recovery remain separate gates.
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/docs/CONVERSATION-BRIDGE.md b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/docs/CONVERSATION-BRIDGE.md
+diff --git a/docs/CONVERSATION-BRIDGE.md b/docs/CONVERSATION-BRIDGE.md
 new file mode 100644
 index 0000000..27adc9b
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/docs/CONVERSATION-BRIDGE.md
++++ b/docs/CONVERSATION-BRIDGE.md
 @@ -0,0 +1,55 @@
 +# Per-participant native conversation inbox bridge (M3b)
 +
@@ -116,11 +116,11 @@ index 0000000..27adc9b
 +`PYTHONPATH=host python3 -m unittest discover -s host/tests` runs the host suite. Bridge tests exercise independent clients with same tags in distinct projects, author/machine/native UUID mismatches, membership removal, unrelated mail and reply mapping, reconnect deduplication, uncertain native effects with and without durable envelopes, late log recovery, uncertain HTTP reply/read results, conflicting retry payloads, contiguous cursor advancement, exclusive locks, private journal modes, unsafe symlinks and inbox-only CLI arguments.
 +
 +On 2026-10-17, platform-bridge captured genuine `whoami` before effects and performed explicitly authorized nonce-only self-send and self-reply probes using the installed native CLI. The actual adapter also qualified native session records and verified structured `data` in the authoritative log. Sender and recipient UUIDs matched the genuine session and replies preserved `reply_to`; delivery was inbox-only. Raw receipts are private in `.local/native-probe/` and are not committed. These probes establish the installed self-mailbox primitive only. Full hub runtime, multiple real agent clients and cross-host acceptance remain for head-coordinated validation after integration.
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/docs/CONVERSATION-CLI.md b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/docs/CONVERSATION-CLI.md
+diff --git a/docs/CONVERSATION-CLI.md b/docs/CONVERSATION-CLI.md
 new file mode 100644
 index 0000000..4ddcb48
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/docs/CONVERSATION-CLI.md
++++ b/docs/CONVERSATION-CLI.md
 @@ -0,0 +1,100 @@
 +# Conversation CLI
 +
@@ -222,11 +222,11 @@ index 0000000..4ddcb48
 +composer, typing, or delivery injection. Acceptance needs fake-transport crash,
 +reconnect, duplicate, revocation, and leakage tests plus a head-coordinated physical
 +round trip. The M3a CLI does not establish that bridge acceptance.
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/docs/CONVERSATION-PLATFORM.md b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/docs/CONVERSATION-PLATFORM.md
+diff --git a/docs/CONVERSATION-PLATFORM.md b/docs/CONVERSATION-PLATFORM.md
 new file mode 100644
 index 0000000..515adea
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/docs/CONVERSATION-PLATFORM.md
++++ b/docs/CONVERSATION-PLATFORM.md
 @@ -0,0 +1,51 @@
 +# Local conversation transport qualification
 +
@@ -279,11 +279,11 @@ index 0000000..515adea
 +Full M1 and F7 remain unaccepted. The separate API repair owns shared bus/claim/conversation cleanup budgeting, pruned-gap unread/metadata and malformed version counters. The actual HTTP retention probe retains seq 1 and 3, reads through 1 and returns seq 3; the frozen API reports unread 2 although only one unread row remains. This is recorded as a defect, not asserted as correct. The frozen native bridge requires `msg.seq == cursor + 1` before delivery/read, so this page would HOLD with `History is not contiguous/canonical`. Native execution of that gap is not claimed. Bridge recovery needs an explicit reviewed gap/catch-up contract and durable notice, without fabricated delivery or silent skipping. No API/bridge/registry repair was applied here.
 +
 +Head must integrate independently reviewed repairs, rerun real transport against the resulting exact source, arrange distinct-model integration review and qualify physical cross-host behavior before acceptance. Exit status alone is not acceptance.
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/docs/CONVERSATION-UI.md b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/docs/CONVERSATION-UI.md
+diff --git a/docs/CONVERSATION-UI.md b/docs/CONVERSATION-UI.md
 new file mode 100644
 index 0000000..8183bb9
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/docs/CONVERSATION-UI.md
++++ b/docs/CONVERSATION-UI.md
 @@ -0,0 +1,111 @@
 +# Conversations UI
 +
@@ -396,11 +396,11 @@ index 0000000..8183bb9
 +`/fleet.html`. Conversations assets are already on the authenticated
 +private-asset allowlist in `src/worker.ts` together with the shipped
 +vendored dakit files and fonts.
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/docs/CONVERSATIONS.md b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/docs/CONVERSATIONS.md
+diff --git a/docs/CONVERSATIONS.md b/docs/CONVERSATIONS.md
 new file mode 100644
 index 0000000..5e21f73
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/docs/CONVERSATIONS.md
++++ b/docs/CONVERSATIONS.md
 @@ -0,0 +1,611 @@
 +# Agent Hub Conversations API & Integration Contract (M1)
 +
@@ -1013,10 +1013,10 @@ index 0000000..5e21f73
 +3. `conversationsService.handle(request, auth)` enforces authentication and CSRF disposition **before** reading the request body or accessing conversation rows.
 +
 +
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/host/agent_hub_host/cli.py b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/host/agent_hub_host/cli.py
+diff --git a/host/agent_hub_host/cli.py b/host/agent_hub_host/cli.py
 index 79933a1..774a551 100644
---- a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/host/agent_hub_host/cli.py
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/host/agent_hub_host/cli.py
+--- a/host/agent_hub_host/cli.py
++++ b/host/agent_hub_host/cli.py
 @@ -121,11 +121,24 @@ def cmd_bridge(args):
          sys.exit(1)
  
@@ -1072,11 +1072,11 @@ index 79933a1..774a551 100644
      if args.cmd in ('submit', 'jobs', 'job', 'task-result', 'routing-machines', 'model-policy', 'task-artifact', 'artifact'):
          try:
              print(json.dumps(routing.execute(args), indent=2))
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/host/agent_hub_host/conversation_bridge.py b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/host/agent_hub_host/conversation_bridge.py
+diff --git a/host/agent_hub_host/conversation_bridge.py b/host/agent_hub_host/conversation_bridge.py
 new file mode 100644
 index 0000000..755a128
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/host/agent_hub_host/conversation_bridge.py
++++ b/host/agent_hub_host/conversation_bridge.py
 @@ -0,0 +1,480 @@
 +"""Opt-in, foreground bridge for one genuinely bound conversation participant.
 +
@@ -1558,11 +1558,11 @@ index 0000000..755a128
 +    bridge = ConversationBridge(actor=args.actor, project=args.project, workspace=args.workspace,
 +                                machine_id=args.machine_id, conversation_ids=[args.conversation], origin=origin.rstrip('/'))
 +    return bridge.resume(args.conversation, args.resume_after_seq, acknowledge_gap=args.acknowledge_gap)
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/host/agent_hub_host/conversations.py b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/host/agent_hub_host/conversations.py
+diff --git a/host/agent_hub_host/conversations.py b/host/agent_hub_host/conversations.py
 new file mode 100644
 index 0000000..a102d44
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/host/agent_hub_host/conversations.py
++++ b/host/agent_hub_host/conversations.py
 @@ -0,0 +1,180 @@
 +"""Stdlib conversation CLI. Author identity is always resolved by the server."""
 +from pathlib import Path
@@ -1744,11 +1744,11 @@ index 0000000..a102d44
 +            auth.refresh_token()
 +            return send(auth.get_access_token())
 +        raise ValueError('Conversation HTTP request failed') from None
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/host/tests/test_conversation_bridge.py b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/host/tests/test_conversation_bridge.py
+diff --git a/host/tests/test_conversation_bridge.py b/host/tests/test_conversation_bridge.py
 new file mode 100644
 index 0000000..d9efa48
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/host/tests/test_conversation_bridge.py
++++ b/host/tests/test_conversation_bridge.py
 @@ -0,0 +1,486 @@
 +import copy
 +import json
@@ -2236,11 +2236,11 @@ index 0000000..d9efa48
 +
 +if __name__ == '__main__':
 +    unittest.main()
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/host/tests/test_conversation_bridge_gap.py b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/host/tests/test_conversation_bridge_gap.py
+diff --git a/host/tests/test_conversation_bridge_gap.py b/host/tests/test_conversation_bridge_gap.py
 new file mode 100644
 index 0000000..9b01738
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/host/tests/test_conversation_bridge_gap.py
++++ b/host/tests/test_conversation_bridge_gap.py
 @@ -0,0 +1,399 @@
 +"""Recovery tests use fake transports only here; HTTP/native evidence is separate."""
 +import copy
@@ -2641,11 +2641,11 @@ index 0000000..9b01738
 +             patch.object(cb.ConversationBridge, 'resume', return_value={}) as resume:
 +            cli.main()
 +            resume.assert_called_once_with('c1', 2, acknowledge_gap=True)
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/host/tests/test_conversations.py b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/host/tests/test_conversations.py
+diff --git a/host/tests/test_conversations.py b/host/tests/test_conversations.py
 new file mode 100644
 index 0000000..e4c87ab
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/host/tests/test_conversations.py
++++ b/host/tests/test_conversations.py
 @@ -0,0 +1,255 @@
 +import io
 +import os
@@ -2902,11 +2902,28 @@ index 0000000..e4c87ab
 +                conversations.request('POST', '/api/conversations/c1/messages', {'body': '\x01' * 16384})
 +        token.assert_not_called()
 +        self.assertEqual(self.calls, [])
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/auth.css b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/auth.css
+diff --git a/host/tests/test_http_cli.py b/host/tests/test_http_cli.py
+index c8b8bf5..f8c9c9e 100644
+--- a/host/tests/test_http_cli.py
++++ b/host/tests/test_http_cli.py
+@@ -1630,9 +1630,10 @@ sys.exit(0)
+             self.assertTrue(st["delivered_at"] and st["acked_at"], st)
+         self.assertEqual(sorted(s["tag"] for s in self._fake_lines("sends.jsonl")), ["e1-p", "e1-w", "e1-w"])
+         self.assertEqual({tuple(c[:2]) for c in self._fake_lines("calls.jsonl")}, {("message", "send"), ("message", "log")})
+-        for key, from_actor in (("q", "projE:e1-w"), ("t", "e1-w"), ("r", "role:e1-p-role")):
++        # F7 freezes canonical agent endpoints; explicit role addresses remain roles.
++        for key, from_actor in (("q", "projE:e1-w"), ("t", "projE:e1-w"), ("r", "role:e1-p-role")):
+             replies = self._replies_to(ids[key])
+-            self.assertEqual([(r["from_actor"], r["to_actor"], r["kind"]) for r in replies], [(from_actor, "worker-2", "reply")])
++            self.assertEqual([(r["from_actor"], r["to_actor"], r["kind"]) for r in replies], [(from_actor, "projB:worker-2", "reply")])
+ 
+         # A second run has no new native send, hub ACK or reply
+         acked = {m: self._stages(m)["acked_at"] for m in ids.values()}
+diff --git a/public/auth.css b/public/auth.css
 new file mode 100644
 index 0000000..de92e91
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/auth.css
++++ b/public/auth.css
 @@ -0,0 +1,7 @@
 +/* Product structure; all visual roles and controls come from the pinned kit. */
 +.hub-auth-nav { display: flex; flex-wrap: wrap; gap: var(--dk-gap-control); }
@@ -2915,11 +2932,11 @@ index 0000000..de92e91
 +.hub-permissions .dk-mono { overflow-wrap: anywhere; }
 +.dk-auth-card .dk-select, .dk-auth-card .dk-input { width: 100%; min-width: 0; }
 +@media (max-width: 820px) { .hub-auth-nav a { display: inline-flex; align-items: center; min-height: var(--dk-size-touch); } }
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/auth.js b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/auth.js
+diff --git a/public/auth.js b/public/auth.js
 new file mode 100644
 index 0000000..5c82fcc
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/auth.js
++++ b/public/auth.js
 @@ -0,0 +1,96 @@
 +/* Theme choice only is stored. Sessions, credentials and CSRF stay out of DOM/storage. */
 +try {
@@ -3017,11 +3034,11 @@ index 0000000..5c82fcc
 +  form.addEventListener('submit', event => { event.preventDefault(); decide('approve'); });
 +  deny.addEventListener('click', () => decide('deny'));
 +});
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/conversations.css b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/conversations.css
+diff --git a/public/conversations.css b/public/conversations.css
 new file mode 100644
 index 0000000..e719f8a
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/conversations.css
++++ b/public/conversations.css
 @@ -0,0 +1,56 @@
 +/* Conversations UI — layout only; every color, border, type and space value
 +   comes from vendored dakit tokens (public/vendor/dakit). Unlayered app CSS
@@ -3079,11 +3096,11 @@ index 0000000..e719f8a
 +.conv-identity__kind { margin-left: auto; }
 +.conv-identity--none { color: var(--dk-text-muted); cursor: default; }
 +.conv-identity--none:hover { background: transparent; }
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/conversations.html b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/conversations.html
+diff --git a/public/conversations.html b/public/conversations.html
 new file mode 100644
 index 0000000..8d70876
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/conversations.html
++++ b/public/conversations.html
 @@ -0,0 +1,141 @@
 +<!doctype html>
 +<html lang="en">
@@ -3226,11 +3243,11 @@ index 0000000..8d70876
 +<script src="/vendor/dakit/dialogs.js"></script>
 +</body>
 +</html>
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/conversations.js b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/conversations.js
+diff --git a/public/conversations.js b/public/conversations.js
 new file mode 100644
 index 0000000..17ffee5
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/conversations.js
++++ b/public/conversations.js
 @@ -0,0 +1,1345 @@
 +/* Conversations UI for the agent hub: list, thread, composer, retry with
 +   preserved drafts and idempotency keys, reconnect and read position.
@@ -4577,10 +4594,10 @@ index 0000000..17ffee5
 +  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
 +  else start();
 +})();
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/public/fleet.css b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/fleet.css
+diff --git a/public/fleet.css b/public/fleet.css
 index ce47814..db51fe0 100644
---- a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/public/fleet.css
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/fleet.css
+--- a/public/fleet.css
++++ b/public/fleet.css
 @@ -1 +1,24 @@
 -:root{font-family:system-ui,sans-serif;color:#172735;background:#f3f5f6}body{margin:0}header,main{max-width:1200px;margin:auto;padding:24px}h1{margin:0;font-size:32px}h2{font-size:21px}section{background:white;border:1px solid #d5dde1;padding:20px;margin-bottom:24px;border-radius:6px}form{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px}label{display:flex;flex-direction:column;gap:6px;font-size:14px}input,select,textarea,button{font:inherit;padding:10px;border:1px solid #879aa7;border-radius:3px}button{background:#164c65;color:white;cursor:pointer;align-self:end}button:disabled{opacity:.5}table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:10px;text-align:left;border-bottom:1px solid #dce3e6;overflow-wrap:break-word}th{background:#f3f5f6}.scroll{overflow-x:auto}p{color:#425b69;line-height:1.5}.machine{border-top:2px solid #adc1ca;margin-top:20px}.error{color:#98281c}#launch-result{grid-column:1/-1}code{font-size:12px}small{display:block;color:#597180}.state{display:inline-block;white-space:nowrap;padding:2px 8px;border-radius:10px;font-size:13px;font-weight:600}.state.good{background:#dcefe2;color:#1d5b33}.state.bad{background:#f8dcd7;color:#8a2416}.state.neutral{background:#e6ecef;color:#36505f}td button{padding:4px 10px;font-size:13px}#checks-form{margin-top:16px}
 +/* Fleet structure only; the official kit owns controls, type, palette and shell. */
@@ -4607,10 +4624,10 @@ index ce47814..db51fe0 100644
 +  .fleet-section td::before { content: attr(data-label); display: block; font-family: var(--dk-font-sans); font-size: var(--dk-text-sm); color: var(--dk-text-muted); }
 +  .fleet-section td:empty { display: none; }
 +}
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/public/fleet.html b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/fleet.html
+diff --git a/public/fleet.html b/public/fleet.html
 index 976081c..8741a8c 100644
---- a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/public/fleet.html
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/fleet.html
+--- a/public/fleet.html
++++ b/public/fleet.html
 @@ -1,26 +1,86 @@
 -<!doctype html>
 -<html lang="en">
@@ -4724,10 +4741,10 @@ index 976081c..8741a8c 100644
 +
 +<script src="/vendor/dakit/shell.js"></script></body></html>
 \ No newline at end of file
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/public/fleet.js b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/fleet.js
+diff --git a/public/fleet.js b/public/fleet.js
 index 5f38610..3bd6065 100644
---- a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/public/fleet.js
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/fleet.js
+--- a/public/fleet.js
++++ b/public/fleet.js
 @@ -1,6 +1,7 @@
  /* Render server data as text; never inject HTML, transcripts or credentials. */
  const byId = id => document.getElementById(id);
@@ -4816,11 +4833,11 @@ index 5f38610..3bd6065 100644
 +  } catch { byId('status').textContent = 'Sign-out could not be confirmed. Try again.'; byId('sign-out').disabled = false; }
 +});
  refresh(); setInterval(refresh, 30000);
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/avatar.js b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/avatar.js
+diff --git a/public/vendor/dakit/avatar.js b/public/vendor/dakit/avatar.js
 new file mode 100644
 index 0000000..58f3972
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/avatar.js
++++ b/public/vendor/dakit/avatar.js
 @@ -0,0 +1,91 @@
 +/* dakit 0.2.0 0e283cd */
 +// Dakit avatar: a person's initials, with their photo on top when there is one.
@@ -4913,11 +4930,11 @@ index 0000000..58f3972
 +  element.className = ["dk-avatar", SIZES.has(size) ? `dk-avatar--${size}` : "", className].filter(Boolean).join(" ");
 +  return updateAvatar(element, { name, initials, src }, doc);
 +}
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/check-borders.mjs b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/check-borders.mjs
+diff --git a/public/vendor/dakit/check-borders.mjs b/public/vendor/dakit/check-borders.mjs
 new file mode 100644
 index 0000000..1d8709c
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/check-borders.mjs
++++ b/public/vendor/dakit/check-borders.mjs
 @@ -0,0 +1,884 @@
 +#!/usr/bin/env node
 +// scripts/check-borders.mjs — Zero-dependency Node CLI to enforce border rules in dakit and consuming sites.
@@ -5803,11 +5820,11 @@ index 0000000..1d8709c
 +if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 +  runCli();
 +}
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/check-colors.mjs b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/check-colors.mjs
+diff --git a/public/vendor/dakit/check-colors.mjs b/public/vendor/dakit/check-colors.mjs
 new file mode 100644
 index 0000000..2477c83
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/check-colors.mjs
++++ b/public/vendor/dakit/check-colors.mjs
 @@ -0,0 +1,66 @@
 +#!/usr/bin/env node
 +// scripts/check-colors.mjs — Zero-dependency Node CLI that keeps raw colours out of app CSS.
@@ -5875,11 +5892,11 @@ index 0000000..2477c83
 +if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 +  runCli();
 +}
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/check-scale.mjs b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/check-scale.mjs
+diff --git a/public/vendor/dakit/check-scale.mjs b/public/vendor/dakit/check-scale.mjs
 new file mode 100644
 index 0000000..f2d53ec
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/check-scale.mjs
++++ b/public/vendor/dakit/check-scale.mjs
 @@ -0,0 +1,173 @@
 +#!/usr/bin/env node
 +// scripts/check-scale.mjs — Zero-dependency Node CLI that keeps app CSS on dakit's type and space scales.
@@ -6054,11 +6071,11 @@ index 0000000..f2d53ec
 +if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 +  runCli();
 +}
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/collection.js b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/collection.js
+diff --git a/public/vendor/dakit/collection.js b/public/vendor/dakit/collection.js
 new file mode 100644
 index 0000000..80cab12
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/collection.js
++++ b/public/vendor/dakit/collection.js
 @@ -0,0 +1,155 @@
 +/* dakit 0.2.0 0e283cd */
 +/* dakit collection header (docs/guidelines.md "Action placement"): a create
@@ -6215,11 +6232,11 @@ index 0000000..80cab12
 +    installShortcut: installShortcut,
 +  };
 +})();
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/dakit.css b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/dakit.css
+diff --git a/public/vendor/dakit/dakit.css b/public/vendor/dakit/dakit.css
 new file mode 100644
 index 0000000..1a8a742
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/dakit.css
++++ b/public/vendor/dakit/dakit.css
 @@ -0,0 +1,1934 @@
 +/* dakit 0.2.0 0e283cd */
 +@layer dk.base, dk.components;
@@ -8155,11 +8172,11 @@ index 0000000..1a8a742
 +}
 +
 +}
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/dakit.lock.json b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/dakit.lock.json
+diff --git a/public/vendor/dakit/dakit.lock.json b/public/vendor/dakit/dakit.lock.json
 new file mode 100644
 index 0000000..d0f6f77
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/dakit.lock.json
++++ b/public/vendor/dakit/dakit.lock.json
 @@ -0,0 +1,27 @@
 +{
 +  "version": "0.2.0",
@@ -8188,11 +8205,11 @@ index 0000000..d0f6f77
 +    "sync.mjs": "2c855953891335a662af170cd59e3b4143ee4a11aee8b90ed0eee46fe5f86730"
 +  }
 +}
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/device-code.js b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/device-code.js
+diff --git a/public/vendor/dakit/device-code.js b/public/vendor/dakit/device-code.js
 new file mode 100644
 index 0000000..0dad88e
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/device-code.js
++++ b/public/vendor/dakit/device-code.js
 @@ -0,0 +1,69 @@
 +/* dakit 0.2.0 0e283cd */
 +// Dakit device-login code helpers — the contract is docs/device-login.md.
@@ -8263,11 +8280,11 @@ index 0000000..0dad88e
 +  if (input.value) update();
 +  return () => input.removeEventListener("input", update);
 +}
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/dialogs.js b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/dialogs.js
+diff --git a/public/vendor/dakit/dialogs.js b/public/vendor/dakit/dialogs.js
 new file mode 100644
 index 0000000..1ac17c9
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/dialogs.js
++++ b/public/vendor/dakit/dialogs.js
 @@ -0,0 +1,238 @@
 +/* dakit 0.2.0 0e283cd */
 +// Dakit dialogs: backdrop dismissal, and load-before-open (openWhenReady).
@@ -8507,11 +8524,11 @@ index 0000000..1ac17c9
 +
 +  globalThis.dakitDialogs = { openWhenReady };
 +}
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/fonts/LICENSE.md b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/fonts/LICENSE.md
+diff --git a/public/vendor/dakit/fonts/LICENSE.md b/public/vendor/dakit/fonts/LICENSE.md
 new file mode 100644
 index 0000000..05e9cc1
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/fonts/LICENSE.md
++++ b/public/vendor/dakit/fonts/LICENSE.md
 @@ -0,0 +1,12 @@
 +# Font licenses
 +
@@ -8525,7 +8542,7 @@ index 0000000..05e9cc1
 +
 +Full license texts: https://github.com/rsms/inter/blob/master/LICENSE.txt and
 +https://github.com/IBM/plex/blob/master/LICENSE.txt.
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/fonts/ibm-plex-mono-400.woff2 b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/fonts/ibm-plex-mono-400.woff2
+diff --git a/public/vendor/dakit/fonts/ibm-plex-mono-400.woff2 b/public/vendor/dakit/fonts/ibm-plex-mono-400.woff2
 new file mode 100644
 index 0000000000000000000000000000000000000000..0804aaff92260b5359330f63e05b9ac25ccabeee
 GIT binary patch
@@ -8818,7 +8835,7 @@ CRdxsf
 literal 0
 HcmV?d00001
 
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/fonts/ibm-plex-mono-500.woff2 b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/fonts/ibm-plex-mono-500.woff2
+diff --git a/public/vendor/dakit/fonts/ibm-plex-mono-500.woff2 b/public/vendor/dakit/fonts/ibm-plex-mono-500.woff2
 new file mode 100644
 index 0000000000000000000000000000000000000000..090f82f7ec7997047324e07650865305a099969a
 GIT binary patch
@@ -9114,7 +9131,7 @@ ad};MAP-qCiD$QV&cRGZj2*AytTLJ*~+Orn`
 literal 0
 HcmV?d00001
 
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/fonts/inter-var.woff2 b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/fonts/inter-var.woff2
+diff --git a/public/vendor/dakit/fonts/inter-var.woff2 b/public/vendor/dakit/fonts/inter-var.woff2
 new file mode 100644
 index 0000000000000000000000000000000000000000..d15208de03cd1ad7c5199f0a0ce915fe841e4722
 GIT binary patch
@@ -10051,11 +10068,11 @@ ov+5Z$hJGB_FISZ`lH5O4PBqq<6^F{d-($z`vHZ{4l`jAQ04qY<P5=M^
 literal 0
 HcmV?d00001
 
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/shell.js b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/shell.js
+diff --git a/public/vendor/dakit/shell.js b/public/vendor/dakit/shell.js
 new file mode 100644
 index 0000000..944ea3e
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/shell.js
++++ b/public/vendor/dakit/shell.js
 @@ -0,0 +1,491 @@
 +/* dakit 0.2.0 0e283cd */
 +// Dakit app shell behaviour — the contract is docs/shell.md.
@@ -10548,11 +10565,11 @@ index 0000000..944ea3e
 +  initShell();
 +  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", () => initShell());
 +})();
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/split.js b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/split.js
+diff --git a/public/vendor/dakit/split.js b/public/vendor/dakit/split.js
 new file mode 100644
 index 0000000..dd1eca6
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/split.js
++++ b/public/vendor/dakit/split.js
 @@ -0,0 +1,233 @@
 +/* dakit 0.2.0 0e283cd */
 +/* dakit list–detail split (docs/list-detail.md): keyboard movement in the
@@ -10787,11 +10804,11 @@ index 0000000..dd1eca6
 +
 +  globalThis.dakitSplit = { initSplit: initSplit, show: show, reveal: reveal, setWidth: setWidth };
 +})();
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/sync.mjs b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/sync.mjs
+diff --git a/public/vendor/dakit/sync.mjs b/public/vendor/dakit/sync.mjs
 new file mode 100644
 index 0000000..ac8d943
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/sync.mjs
++++ b/public/vendor/dakit/sync.mjs
 @@ -0,0 +1,103 @@
 +#!/usr/bin/env node
 +// Zero-dependency vendoring and local drift verification.
@@ -10896,11 +10913,11 @@ index 0000000..ac8d943
 +  console.error(`${error.message}\n${usage}`);
 +  process.exitCode = 1;
 +}
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/tabs.js b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/tabs.js
+diff --git a/public/vendor/dakit/tabs.js b/public/vendor/dakit/tabs.js
 new file mode 100644
 index 0000000..2383dba
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/tabs.js
++++ b/public/vendor/dakit/tabs.js
 @@ -0,0 +1,151 @@
 +/* dakit 0.2.0 0e283cd */
 +/* dakit segmented control (docs/segmented.md): keyboard for the two
@@ -11053,11 +11070,11 @@ index 0000000..2383dba
 +
 +  globalThis.dakitTabs = { sync: syncAll, reveal: reveal };
 +})();
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/tag-input.js b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/tag-input.js
+diff --git a/public/vendor/dakit/tag-input.js b/public/vendor/dakit/tag-input.js
 new file mode 100644
 index 0000000..dab88dc
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/tag-input.js
++++ b/public/vendor/dakit/tag-input.js
 @@ -0,0 +1,413 @@
 +/* dakit 0.2.0 0e283cd */
 +/* dakit tag input (docs/tag-input.md): a multi-select combobox. The chosen
@@ -11472,11 +11489,11 @@ index 0000000..dab88dc
 +
 +  globalThis.dakitTagInput = { create: create };
 +})();
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/tokens.css b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/tokens.css
+diff --git a/public/vendor/dakit/tokens.css b/public/vendor/dakit/tokens.css
 new file mode 100644
 index 0000000..e003d97
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/tokens.css
++++ b/public/vendor/dakit/tokens.css
 @@ -0,0 +1,161 @@
 +/* dakit 0.2.0 0e283cd */
 +/* Generated by build.mjs from tokens/*.json — do not edit; edit the tokens and rebuild. */
@@ -11639,11 +11656,11 @@ index 0000000..e003d97
 +  --dk-tabs-disabled-text: #8b949e;
 +  --dk-tabs-focus: rgba(88, 166, 255, 0.55);
 +}
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/tokens.d.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/tokens.d.ts
+diff --git a/public/vendor/dakit/tokens.d.ts b/public/vendor/dakit/tokens.d.ts
 new file mode 100644
 index 0000000..b8377a1
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/tokens.d.ts
++++ b/public/vendor/dakit/tokens.d.ts
 @@ -0,0 +1,6 @@
 +/* dakit 0.2.0 0e283cd */
 +export declare const version: string;
@@ -11651,20 +11668,20 @@ index 0000000..b8377a1
 +export declare const light: Record<string, string>;
 +export declare const dark: Record<string, string>;
 +export declare const primitives: Record<string, string>;
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/tokens.global.js b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/tokens.global.js
+diff --git a/public/vendor/dakit/tokens.global.js b/public/vendor/dakit/tokens.global.js
 new file mode 100644
 index 0000000..9d05000
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/tokens.global.js
++++ b/public/vendor/dakit/tokens.global.js
 @@ -0,0 +1,3 @@
 +/* dakit 0.2.0 0e283cd */
 +// Generated by build.mjs — do not edit.
 +globalThis.dakitTokens = { version: "0.2.0", commit: "0e283cd", light: {"--dk-bg-page":"#ffffff","--dk-bg-surface":"#ffffff","--dk-bg-muted":"#f6f8fa","--dk-bg-hover":"#eef1f4","--dk-bg-raised":"#ffffff","--dk-bg-inset":"rgba(36, 41, 47, 0.06)","--dk-bg-backdrop":"rgba(15, 23, 42, 0.4)","--dk-text-primary":"#24292f","--dk-text-heading":"#0f172a","--dk-text-muted":"#57606a","--dk-text-faint":"#6e7681","--dk-text-link":"#315f8f","--dk-text-link-hover":"#244d78","--dk-text-on-accent":"#ffffff","--dk-text-on-deep":"#ffffff","--dk-border-default":"#d0d7de","--dk-border-control-hover":"#d0d7de","--dk-border-strong":"#afb8c1","--dk-accent-default":"#315f8f","--dk-accent-hover":"#244d78","--dk-accent-soft":"#edf5ff","--dk-accent-deep":"#244d78","--dk-accent-deep-hover":"#244d78","--dk-accent-deeper":"#1c3d5e","--dk-focus-ring":"rgba(49, 95, 143, 0.6)","--dk-selection":"#dde9f7","--dk-success-text":"#116329","--dk-success-bg":"#e6f6ea","--dk-warning-text":"#7a5c00","--dk-warning-bg":"#fff8c5","--dk-danger-text":"#cf222e","--dk-danger-hover":"#a40e26","--dk-danger-bg":"#fff0ee","--dk-info-text":"#315f8f","--dk-info-bg":"#edf5ff","--dk-shadow-overlay":"0 8px 24px rgba(15, 23, 42, 0.16)","--dk-spinner-size":"16px","--dk-spinner-size-lg":"24px","--dk-spinner-stroke":"2px","--dk-spinner-color":"#315f8f","--dk-spinner-track":"#d0d7de","--dk-spinner-duration":"800ms","--dk-loading-delay-busy":"150ms","--dk-loading-delay-overlay":"500ms","--dk-tabs-track":"#f6f8fa","--dk-tabs-text":"#57606a","--dk-tabs-hover":"#eef1f4","--dk-tabs-hover-text":"#24292f","--dk-tabs-selected":"#edf5ff","--dk-tabs-selected-text":"#315f8f","--dk-tabs-count":"#57606a","--dk-tabs-disabled-text":"#6e7681","--dk-tabs-focus":"rgba(49, 95, 143, 0.6)","--dk-tabs-radius":"6px","--dk-tabs-radius-item":"4px","--dk-tabs-pad":"4px","--dk-tabs-gap":"4px","--dk-tabs-height":"28px","--dk-tabs-height-sm":"24px","--dk-tabs-pad-x":"12px","--dk-tabs-pad-x-sm":"8px","--dk-gap-control":"12px","--dk-gap-block":"16px","--dk-gap-section":"24px","--dk-pad-cell":"8px 12px","--dk-pad-panel":"16px"}, dark: {"--dk-bg-page":"#0d1117","--dk-bg-surface":"#161b22","--dk-bg-muted":"#21262d","--dk-bg-hover":"#293038","--dk-bg-raised":"#32383f","--dk-bg-inset":"rgba(230, 237, 243, 0.07)","--dk-bg-backdrop":"rgba(1, 4, 9, 0.5)","--dk-text-primary":"#e6edf3","--dk-text-heading":"#f0f6fc","--dk-text-muted":"#9198a1","--dk-text-faint":"#8b949e","--dk-text-link":"#58a6ff","--dk-text-link-hover":"#79b8ff","--dk-text-on-accent":"#0d1117","--dk-text-on-deep":"#ffffff","--dk-border-default":"#30363d","--dk-border-control-hover":"#8b949e","--dk-border-strong":"#6e7681","--dk-accent-default":"#58a6ff","--dk-accent-hover":"#79b8ff","--dk-accent-soft":"rgba(88, 166, 255, 0.14)","--dk-accent-deep":"#1c3d5e","--dk-accent-deep-hover":"#244d78","--dk-accent-deeper":"#10233c","--dk-focus-ring":"rgba(88, 166, 255, 0.55)","--dk-selection":"rgba(88, 166, 255, 0.35)","--dk-success-text":"#56d364","--dk-success-bg":"rgba(46, 160, 67, 0.15)","--dk-warning-text":"#e3b341","--dk-warning-bg":"rgba(187, 128, 9, 0.15)","--dk-danger-text":"#f85149","--dk-danger-hover":"#ffa198","--dk-danger-bg":"rgba(248, 81, 73, 0.12)","--dk-info-text":"#79b8ff","--dk-info-bg":"rgba(88, 166, 255, 0.12)","--dk-shadow-overlay":"0 8px 24px rgba(1, 4, 9, 0.6)","--dk-spinner-size":"16px","--dk-spinner-size-lg":"24px","--dk-spinner-stroke":"2px","--dk-spinner-color":"#58a6ff","--dk-spinner-track":"#30363d","--dk-spinner-duration":"800ms","--dk-loading-delay-busy":"150ms","--dk-loading-delay-overlay":"500ms","--dk-tabs-track":"#21262d","--dk-tabs-text":"#9198a1","--dk-tabs-hover":"#293038","--dk-tabs-hover-text":"#e6edf3","--dk-tabs-selected":"rgba(88, 166, 255, 0.14)","--dk-tabs-selected-text":"#58a6ff","--dk-tabs-count":"#9198a1","--dk-tabs-disabled-text":"#8b949e","--dk-tabs-focus":"rgba(88, 166, 255, 0.55)","--dk-tabs-radius":"6px","--dk-tabs-radius-item":"4px","--dk-tabs-pad":"4px","--dk-tabs-gap":"4px","--dk-tabs-height":"28px","--dk-tabs-height-sm":"24px","--dk-tabs-pad-x":"12px","--dk-tabs-pad-x-sm":"8px","--dk-gap-control":"12px","--dk-gap-block":"16px","--dk-gap-section":"24px","--dk-pad-cell":"8px 12px","--dk-pad-panel":"16px"}, primitives: {"--dk-gray-0":"#ffffff","--dk-gray-50":"#f6f8fa","--dk-gray-100":"#eef1f4","--dk-gray-200":"#d0d7de","--dk-gray-300":"#afb8c1","--dk-gray-400":"#8c959f","--dk-gray-500":"#6e7681","--dk-gray-600":"#57606a","--dk-gray-700":"#424a53","--dk-gray-800":"#32383f","--dk-gray-900":"#24292f","--dk-gray-950":"#0f172a","--dk-blue-50":"#edf5ff","--dk-blue-300":"#79b8ff","--dk-blue-400":"#58a6ff","--dk-blue-500":"#315f8f","--dk-blue-600":"#244d78","--dk-blue-700":"#1c3d5e","--dk-blue-900":"#10233c","--dk-green-50":"#e1e9dd","--dk-green-300":"#aac3ae","--dk-green-400":"#49b981","--dk-green-500":"#60b98a","--dk-green-600":"#0b6745","--dk-green-700":"#074e33","--dk-amber-100":"#fff8c5","--dk-amber-400":"#d4a72c","--dk-amber-500":"#9a6700","--dk-amber-600":"#7a5c00","--dk-red-50":"#fff0ee","--dk-red-300":"#cda37f","--dk-red-500":"#cf222e","--dk-red-600":"#9c4b20","--dk-red-700":"#a40e26","--dk-font-sans":"Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif","--dk-font-mono":"'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace","--dk-text-xs":"11px","--dk-text-sm":"12px","--dk-text-md":"13px","--dk-text-body":"14px","--dk-text-lg":"16px","--dk-text-xl":"22px","--dk-text-page":"32px","--dk-leading-tight":"1.2","--dk-leading-normal":"1.5","--dk-weight-regular":"400","--dk-weight-medium":"500","--dk-weight-semibold":"600","--dk-weight-bold":"700","--dk-space-1":"4px","--dk-space-2":"8px","--dk-space-3":"12px","--dk-space-4":"16px","--dk-space-5":"20px","--dk-space-6":"24px","--dk-space-7":"32px","--dk-space-8":"40px","--dk-radius-none":"0","--dk-radius-sm":"4px","--dk-radius-md":"6px","--dk-radius-lg":"10px","--dk-radius-full":"999px","--dk-size-control-sm":"28px","--dk-size-control-md":"34px","--dk-size-control-lg":"40px","--dk-size-touch":"44px","--dk-size-sidebar":"240px","--dk-size-rail":"56px","--dk-size-topbar":"48px","--dk-size-menu":"256px","--dk-size-panel":"384px","--dk-size-split-list":"320px","--dk-size-measure":"896px","--dk-size-content-max":"1120px"} };
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/tokens.js b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/tokens.js
+diff --git a/public/vendor/dakit/tokens.js b/public/vendor/dakit/tokens.js
 new file mode 100644
 index 0000000..0c75bdd
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/public/vendor/dakit/tokens.js
++++ b/public/vendor/dakit/tokens.js
 @@ -0,0 +1,216 @@
 +/* dakit 0.2.0 0e283cd */
 +// Generated by build.mjs — do not edit.
@@ -11882,11 +11899,11 @@ index 0000000..0c75bdd
 +  "--dk-size-measure": "896px",
 +  "--dk-size-content-max": "1120px"
 +};
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/agent_registry.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/agent_registry.ts
+diff --git a/src/agent_registry.ts b/src/agent_registry.ts
 new file mode 100644
 index 0000000..62c65d5
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/agent_registry.ts
++++ b/src/agent_registry.ts
 @@ -0,0 +1,159 @@
 +import type { SqlStorage } from '@cloudflare/workers-types';
 +
@@ -12047,10 +12064,10 @@ index 0000000..62c65d5
 +  if (!address.project) return rows.length === 1 && !rows[0].project ? actor : null;
 +  return rows.some(r => r.project === address.project) ? actor : null;
 +}
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/src/bus.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/bus.ts
+diff --git a/src/bus.ts b/src/bus.ts
 index 0959ae0..afe39d1 100644
---- a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/src/bus.ts
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/bus.ts
+--- a/src/bus.ts
++++ b/src/bus.ts
 @@ -1,3 +1,4 @@
 +import { registryAddress, registryRowSql } from './agent_registry';
  export interface SqlStorageCursor {
@@ -12507,10 +12524,10 @@ index 0959ae0..afe39d1 100644
        return this.sql.exec(sqlQuery, ...allowedList, ...allowedList).toArray();
      }
  
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/src/claim_admission.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/claim_admission.ts
+diff --git a/src/claim_admission.ts b/src/claim_admission.ts
 index 1eed521..577a771 100644
---- a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/src/claim_admission.ts
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/claim_admission.ts
+--- a/src/claim_admission.ts
++++ b/src/claim_admission.ts
 @@ -1,3 +1,4 @@
 +import { credentialActor } from './agent_registry';
  /** Ownership-aware launch admission over the existing /api/bus/claims table. */
@@ -12531,11 +12548,11 @@ index 1eed521..577a771 100644
        !Number.isFinite(Date.parse(credential.expires_at)) || Date.parse(credential.expires_at) <= this.now() || !Array.isArray(scopes) ||
        !scopes.includes('bus:send') || !scopes.includes(permission)) return this.fail('claim_authority_unsupported', 403);
  
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/conversation-hub.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/conversation-hub.ts
+diff --git a/src/conversation-hub.ts b/src/conversation-hub.ts
 new file mode 100644
 index 0000000..7d7c87e
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/conversation-hub.ts
++++ b/src/conversation-hub.ts
 @@ -0,0 +1,177 @@
 +import { Hub as BaseHub } from './hub';
 +import { Env } from './env';
@@ -12714,11 +12731,11 @@ index 0000000..7d7c87e
 +}
 +
 +export { Hub as ConversationHub, BaseHub };
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/conversations.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/conversations.ts
+diff --git a/src/conversations.ts b/src/conversations.ts
 new file mode 100644
 index 0000000..666dffb
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/conversations.ts
++++ b/src/conversations.ts
 @@ -0,0 +1,3685 @@
 +import { credentialActor, validRegistryName, registryAddress } from './agent_registry';
 +import {
@@ -16405,10 +16422,10 @@ index 0000000..666dffb
 +    }
 +  }
 +}
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/src/hub.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/hub.ts
+diff --git a/src/hub.ts b/src/hub.ts
 index 51bc2d3..bcecdec 100644
---- a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/src/hub.ts
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/hub.ts
+--- a/src/hub.ts
++++ b/src/hub.ts
 @@ -1,7 +1,9 @@
 +import { UI_HEADERS, tokenPage, authFailure, deviceEntry, deviceReview, deviceResult } from './ui-pages';
  import { DurableObject } from "cloudflare:workers";
@@ -17020,10 +17037,10 @@ index 51bc2d3..bcecdec 100644
        const isJobCaller = auth.caller?.kind === 'job' && (auth.caller.jobId === jobId || (auth.caller as any).subject === jobId);
        if (!isSupervisor && !isOfferedHost && !isJobCaller) {
          return Response.json({ error: 'forbidden', reason: 'scope_or_binding_mismatch' }, { status: 403 });
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/src/jobs.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/jobs.ts
+diff --git a/src/jobs.ts b/src/jobs.ts
 index 8eb4514..e761083 100644
---- a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/src/jobs.ts
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/jobs.ts
+--- a/src/jobs.ts
++++ b/src/jobs.ts
 @@ -1,3 +1,4 @@
 +import { registryNameSql } from './agent_registry';
  import { sha256, base64url } from './auth/crypto';
@@ -17060,10 +17077,10 @@ index 8eb4514..e761083 100644
                result = { success: false, status: 'invalid_payload', reason: 'reply_to recipient mismatch', current_epoch: epoch };
                return;
              }
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/src/routing.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/routing.ts
+diff --git a/src/routing.ts b/src/routing.ts
 index a1d10e2..6432bcf 100644
---- a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/src/routing.ts
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/routing.ts
+--- a/src/routing.ts
++++ b/src/routing.ts
 @@ -129,7 +129,7 @@ export class RoutingService {
      if (auth.error) return auth.error;
      const caller = auth.caller; if (!caller) return reply({ error: 'unauthorized' }, 401);
@@ -17082,10 +17099,10 @@ index a1d10e2..6432bcf 100644
        // This credential issuance endpoint is the sole deliberate secret response; never log it.
        return reply({ token, expires_at: expires, client: tokenMatch[1] }, 201);
      }
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/src/schema.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/schema.ts
+diff --git a/src/schema.ts b/src/schema.ts
 index b0f5622..9e4405b 100644
---- a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/src/schema.ts
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/schema.ts
+--- a/src/schema.ts
++++ b/src/schema.ts
 @@ -161,7 +161,7 @@ CREATE TABLE IF NOT EXISTS root_actions (
  );
  
@@ -17095,11 +17112,11 @@ index b0f5622..9e4405b 100644
    project TEXT,
    role TEXT,
    machine_id TEXT,
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/ui-pages.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/ui-pages.ts
+diff --git a/src/ui-pages.ts b/src/ui-pages.ts
 new file mode 100644
 index 0000000..0b7a33a
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/ui-pages.ts
++++ b/src/ui-pages.ts
 @@ -0,0 +1,46 @@
 +/** Presentation only. Device decisions still use Hub's existing session/CSRF endpoints. */
 +export const escapeHtml = (value: unknown): string => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));
@@ -17147,10 +17164,10 @@ index 0000000..0b7a33a
 +  <p class="dk-callout dk-callout--warning">${pairing.client_kind === 'host' ? 'This host can report machine activity and receive host work within the selected permissions.' : 'This agent can act as the identity shown above within the selected permissions.'} Access lasts up to 30 days, or until revoked.</p>
 +  <p id="device-error" class="dk-callout" role="alert" hidden></p><div class="dk-auth-card__actions"><button class="dk-button dk-button--secondary dk-button--lg" type="button" id="device-deny">Deny</button><button class="dk-button dk-button--primary dk-button--lg" type="submit" id="device-approve">Approve</button></div><a id="device-reload" href="/device?code=${e(pairing.user_code)}" hidden>Reload the request</a></form></div><div id="device-live" class="dk-visually-hidden" aria-live="polite"></div>`, email, "Didn't start this? Deny it. Nothing is shared.", "/device?code="+pairing.user_code);
 +}
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/src/worker.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/worker.ts
+diff --git a/src/worker.ts b/src/worker.ts
 index 10dc18e..e151414 100644
---- a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/src/worker.ts
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/src/worker.ts
+--- a/src/worker.ts
++++ b/src/worker.ts
 @@ -1,9 +1,12 @@
 -import { Hub } from './hub';
 +import { ConversationHub } from './conversation-hub';
@@ -17206,10 +17223,10 @@ index 10dc18e..e151414 100644
      const asset = await env.ASSETS.fetch(new Request(url, request));
      const headers = new Headers(asset.headers);
      headers.set('Cache-Control', 'private, no-store');
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/test/claim-admission.test.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/claim-admission.test.ts
+diff --git a/test/claim-admission.test.ts b/test/claim-admission.test.ts
 index 0e66fa4..79220ba 100644
---- a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/test/claim-admission.test.ts
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/claim-admission.test.ts
+--- a/test/claim-admission.test.ts
++++ b/test/claim-admission.test.ts
 @@ -13,9 +13,9 @@ const now = Date.now();
  const at = (delta = 0) => new Date(now + delta).toISOString();
  const admin = { caller: { isAdmin: true, actor: 'test-admin', kind: 'human' as const }, scopes: ['admin'] };
@@ -17329,11 +17346,11 @@ index 0e66fa4..79220ba 100644
      const initial = bus.claim(holder.caller, 'projA', 'src', 'worker-1', 3600000);
      const launched: any = await (await f.handle(req('/api/fleet/launches', intent({ access: editAccess(initial.id) })), holder)).json();
      sql.exec("UPDATE fleet_launches SET state = 'running' WHERE id = ?", launched.id);
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-bridge-gap-worker.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-bridge-gap-worker.ts
+diff --git a/test/conversation-bridge-gap-worker.ts b/test/conversation-bridge-gap-worker.ts
 new file mode 100644
 index 0000000..be4f04c
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-bridge-gap-worker.ts
++++ b/test/conversation-bridge-gap-worker.ts
 @@ -0,0 +1,47 @@
 +// LOCAL TEST ONLY. Copied into ignored reconstruction alongside immutable d9b4cde
 +// sources. Never imported from src/ or a production Wrangler entrypoint.
@@ -17382,11 +17399,11 @@ index 0000000..be4f04c
 +    return worker.fetch(request, env, ctx);
 +  },
 +};
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-bridge-gap.mjs b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-bridge-gap.mjs
+diff --git a/test/conversation-bridge-gap.mjs b/test/conversation-bridge-gap.mjs
 new file mode 100644
 index 0000000..5a73ad4
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-bridge-gap.mjs
++++ b/test/conversation-bridge-gap.mjs
 @@ -0,0 +1,197 @@
 +// Frozen production schema/API + real local HTTP + actual Python CLI.
 +// --native additionally uses ONLY the caller's genuine, explicitly approved binding.
@@ -17585,11 +17602,11 @@ index 0000000..5a73ad4
 +  await mf.dispose();
 +}
 +console.log('PASS ' + checks.length + ' bounded local fixture checks; evidence retained privately');
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-integration.test.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-integration.test.ts
+diff --git a/test/conversation-integration.test.ts b/test/conversation-integration.test.ts
 new file mode 100644
 index 0000000..1efab17
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-integration.test.ts
++++ b/test/conversation-integration.test.ts
 @@ -0,0 +1,570 @@
 +import { describe, it, expect } from 'vitest';
 +import { env, runInDurableObject } from 'cloudflare:test';
@@ -18161,11 +18178,11 @@ index 0000000..1efab17
 +  });
 +});
 +
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-platform-worker.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-platform-worker.ts
+diff --git a/test/conversation-platform-worker.ts b/test/conversation-platform-worker.ts
 new file mode 100644
 index 0000000..6d38faf
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-platform-worker.ts
++++ b/test/conversation-platform-worker.ts
 @@ -0,0 +1,36 @@
 +// Local-only entrypoint. Never imported by src/worker.ts or production Wrangler.
 +// Seeds a human admin session and enrolled machine only. Agent tokens come from
@@ -18203,12 +18220,12 @@ index 0000000..6d38faf
 +    return worker.fetch(request, env, ctx);
 +  },
 +};
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-platform.mjs b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-platform.mjs
+diff --git a/test/conversation-platform.mjs b/test/conversation-platform.mjs
 new file mode 100644
-index 0000000..6484651
+index 0000000..9b6e07a
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-platform.mjs
-@@ -0,0 +1,246 @@
++++ b/test/conversation-platform.mjs
+@@ -0,0 +1,297 @@
 +// Real workerd HTTP + SQLite + browser + Python CLI. No API request mocks.
 +import assert from 'node:assert/strict';
 +import { createRequire } from 'node:module';
@@ -18301,7 +18318,6 @@ index 0000000..6484651
 +  const missingCsrf = await fetch(base + '/api/conversations', { method: 'POST', headers: { Cookie: fixture.cookie }, body: '{}' });
 +  assert.equal(missingCsrf.status, 403);
 +  assert.equal((await api('/healthz')).component, 'hub-do');
-+  assert.equal((await api('/api/agents')).agents.length, 1);
 +  check('real Worker auth, CSRF, inherited health/registry and private asset gate');
 +  const configFile = resolve(scratch, 'host-' + nonce + '.json');
 +  const cliEnv = { ...process.env, PYTHONPATH: resolve(root, 'host'), PYTHONDONTWRITEBYTECODE: '1', HUB_URL: '', HUB_BASE_URL: '', HUB_TOKEN: '', HUB_JOB_TOKEN: '', HUB_CONFIG_FILE: configFile };
@@ -18324,17 +18340,23 @@ index 0000000..6484651
 +  assert.equal(saved.machine_id,machineId); assert.equal(saved.client_name,actor); assert.equal(saved.client_kind,'agent');
 +  const token = saved.access_token;
 +  assert.equal(typeof token,'string'); assert.ok(token.length > 16);
++  assert.equal((await api('/api/agents')).agents.length, 1);
 +  check('actual public CLI device login + signed local human/current CSRF approval automatically persists authoritative machine binding');
++  let failedCliCount = 0;
 +  const cli = async (args, input) => {
 +    // Message text enters stdin, credentials remain in private env/config.
-+    const child = execFile('python3', ['-m', 'agent_hub_host.cli', 'conversations', ...args], { cwd: native ? nativeWorkspace : root, env: cliEnv, timeout: 30000, maxBuffer: 1024 * 1024 });
++    const child = execFile('python3', ['-m', 'agent_hub_host.cli', ...(args[0] === 'bridge-resume' ? args : ['conversations', ...args])], { cwd: native ? nativeWorkspace : root, env: cliEnv, timeout: 30000, maxBuffer: 1024 * 1024 });
 +    if (input !== undefined) child.stdin.end(input);
 +    const result = await new Promise((resolvePromise, reject) => {
 +      let stdout = '', stderr = '';
 +      child.stdout.on('data', data => { stdout += data; });
 +      child.stderr.on('data', data => { stderr += data; });
 +      child.on('error', reject);
-+      child.on('close', code => code === 0 ? resolvePromise({ stdout, stderr }) : reject(new Error('CLI failed (' + code + '): ' + stderr.slice(0, 200))));
++      child.on('close', async code => {
++        if (code === 0) { resolvePromise({stdout,stderr}); return; }
++        await writeFile(resolve(scratch,'cli-failure-'+(++failedCliCount)+'.json'),JSON.stringify({args,code,stdout,stderr}),{mode:0o600});
++        reject(new Error('CLI failed ('+code+'): '+stderr));
++      });
 +    });
 +    return JSON.parse(result.stdout);
 +  };
@@ -18399,6 +18421,59 @@ index 0000000..6484651
 +  assert.deepEqual(history.messages.map(m => m.seq), [1, 2, 3]);
 +  assert.equal((await cli(['history', cid, '--after-seq', '3'])).messages.length, 0);
 +  check('offline reconnect, reload and sequence catch-up without duplicates');
++  // Observe retention honestly through actual Worker HTTP + Python history.
++  // An interior gap must be explicit in the accepted API contract; P3 holds by default.
++  const gapConv = (await api('/api/conversations', 'POST', { kind: 'group', title: 'Gap probe', members: [actor], idempotency_key: 'gap-conv-' + nonce })).conversation.id;
++  for (let seq = 1; seq <= 3; seq++) await cli(['send',gapConv,'--body-file','-','--key','gap-'+nonce+'-'+seq], 'gap probe '+seq);
++  const lowerRead = await cli(['read', gapConv, '--seq', '1']);
++  assert.equal(lowerRead.read_seq,3,'self sends advanced server read; explicit lower read is monotonic');
++  const expired = await fetch(base + '/__local_fixture/expire', { method: 'POST', headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' }, body: JSON.stringify({ cid: gapConv, seq: 2 }) });
++  assert.equal(expired.status, 200);
++  const gapPage = await cli(['history', gapConv, '--after-seq', '1']);
++  assert.deepEqual(gapPage.messages.map(m => m.seq), [3]);
++  const gapDetail = await cli(['get', gapConv]);
++  assert.equal(gapPage.my_read_seq,3); assert.equal(gapDetail.conversation.my_read_seq,3);
++  assert.equal(gapDetail.conversation.unread_count,0);
++  evidence.retentionGap = { cursor: 1, retainedSequences: gapPage.messages.map(m => m.seq), unreadReported: gapDetail.conversation.unread_count, retainedAfterLocalCursor: gapPage.messages.length, serverReadSeq: gapPage.my_read_seq, nativeRuntimeTested: false, bridgeSourceOutcome: 'History is not contiguous/canonical; HOLD before native delivery/read' };
++  assert.ok(gapPage.retention_gap || gapPage.gaps?.length || gapPage.oldest_seq === 3);
++  check('actual Worker/CLI retention metadata exposes the gap; P3 strict handling is verified separately');
++  if (native) {
++    const journalName = 'conversation-bridge-' + createHash('sha256').update(JSON.stringify([actor,project])).digest('hex').slice(0,24) + '.json';
++    const journalPath = resolve(nativeWorkspace,'.local',journalName);
++    assert.equal(await access(journalPath).then(()=>true,()=>false),false,'fresh gap-only journal, never reuse another origin');
++    const stateBefore = {deliveries:{},replies:{}};
++    const mapping = ['--enable-native','--actor',actor,'--project',project,'--workspace',nativeWorkspace,'--machine-id',machineId,'--conversation',gapConv];
++    // All gap-probe messages are self-authored: this cannot add native mail.
++    await assert.rejects(cli(['bridge','--once',...mapping]), /Conversation bridge held/);
++    const held = JSON.parse(await readFile(journalPath,'utf8'));
++    assert.equal(held.cursors[gapConv],1,'default HOLD cannot skip interior missing seq2');
++    assert.deepEqual(held.deliveries,stateBefore.deliveries); assert.deepEqual(held.replies,stateBefore.replies);
++    const heldBytes = await readFile(journalPath);
++    await assert.rejects(cli(['bridge-resume',...mapping,'--resume-after-seq','3','--acknowledge-gap']), /Bridge recovery HOLD/);
++    assert.deepEqual(await readFile(journalPath),heldBytes);
++    const readBefore = (await cli(['get',gapConv])).conversation.my_read_seq;
++    assert.equal(readBefore,3);
++    assert.ok(held.cursors[gapConv] < readBefore,'LOCAL HOLD remains independent of advanced server read');
++    const resumed = await cli(['bridge-resume',...mapping,'--resume-after-seq','2','--acknowledge-gap']);
++    assert.equal(resumed.status,'gap_recorded'); assert.equal(resumed.server_read_advanced,false);
++    assert.equal((await cli(['get',gapConv])).conversation.my_read_seq,readBefore);
++    const auditBytes = await readFile(journalPath);
++    await assert.rejects(cli(['bridge-resume',...mapping,'--resume-after-seq','2','--acknowledge-gap']), /Bridge recovery HOLD/);
++    assert.deepEqual(await readFile(journalPath),auditBytes);
++    await cli(['bridge','--once',...mapping]); await cli(['bridge','--once',...mapping]);
++    const finalState = JSON.parse(await readFile(journalPath,'utf8'));
++    assert.equal(finalState.cursors[gapConv],3);
++    assert.equal(Object.keys(finalState.deliveries).length,0); assert.equal(Object.keys(finalState.replies).length,0);
++    assert.equal((await cli(['get',gapConv])).conversation.my_read_seq,readBefore);
++    assert.equal(finalState.gaps.length,1); assert.equal(finalState.gaps[0].missing_from_seq,2); assert.equal(finalState.gaps[0].missing_through_seq,2);
++    assert.deepEqual(finalState.deliveries,stateBefore.deliveries); assert.deepEqual(finalState.replies,stateBefore.replies);
++    assert.ok(Object.values(finalState.deliveries).every(d=>d.attempted && d.native_id));
++    assert.ok(Object.values(finalState.replies).every(r=>r.done));
++    evidence.retentionGap.nativeRuntimeTested = true;
++    evidence.nativeJournal = {basename:journalName,cursors:finalState.cursors,deliveries:Object.keys(finalState.deliveries).length,replies:Object.keys(finalState.replies).length,gaps:finalState.gaps.length,unresolved:0};
++    check('final Worker/CLI/native-bound P3 default HOLD, retained-row refusal, explicit missing-range audit, replay refusal and reconnect without extra native effects');
++  }
++
 +  if (native) {
 +    const bridgeArgs = ['bridge', '--enable-native', '--once', '--actor', actor, '--project', project, '--workspace', nativeWorkspace, '--machine-id', machineId, '--conversation', cid];
 +    await cli(bridgeArgs);
@@ -18421,6 +18496,12 @@ index 0000000..6484651
 +    assert.equal(nativeMsg.reply_to, original.id);
 +    const finalLog = JSON.parse((await exec('a', ['--json', 'message', 'log', '--workspace', nativeWorkspace])).stdout);
 +    assert.equal(finalLog.filter(m => m.kind === 'hub-conversation' && m.body === envelope.body).length, 1);
++    const journalName = 'conversation-bridge-' + createHash('sha256').update(JSON.stringify([actor,project])).digest('hex').slice(0,24) + '.json';
++    const settled = JSON.parse(await readFile(resolve(nativeWorkspace,'.local',journalName),'utf8'));
++    assert.equal(settled.cursors[cid],4); assert.equal(settled.cursors[gapConv],3);
++    assert.equal(Object.keys(settled.deliveries).length,1); assert.equal(Object.keys(settled.replies).length,1); assert.equal(settled.gaps.length,1);
++    assert.ok(Object.values(settled.deliveries).every(d=>d.attempted && d.native_id)); assert.ok(Object.values(settled.replies).every(r=>r.done));
++    evidence.nativeJournal = {basename:journalName,cursors:settled.cursors,deliveries:1,replies:1,gaps:1,unresolved:0};
 +    evidence.native = 'genuine own-session inbox/reply and restart reconciliation passed; second physical host untested';
 +    check('genuine native self-inbox, mapped reply, restart reconciliation and loop suppression');
 +  }
@@ -18432,19 +18513,6 @@ index 0000000..6484651
 +  await assert.rejects(cli(['history', cid]));
 +  await assert.rejects(cli(['send', cid, '--body-file', '-', '--key', 'stale-cli-' + nonce], 'stale denied'));
 +  check('removal immediately denies stale agent history/send/read and actual CLI requests');
-+  // Observe retention honestly through actual Worker HTTP + Python history.
-+  // An interior gap must be explicit in the accepted API contract; P3 holds by default.
-+  const gapConv = (await api('/api/conversations', 'POST', { kind: 'group', title: 'Gap probe', members: [actor], idempotency_key: 'gap-conv-' + nonce })).conversation.id;
-+  for (let seq = 1; seq <= 3; seq++) await api('/api/conversations/' + gapConv + '/messages', 'POST', { body: 'gap probe ' + seq, idempotency_key: 'gap-' + nonce + '-' + seq });
-+  await cli(['read', gapConv, '--seq', '1']);
-+  const expired = await fetch(base + '/__local_fixture/expire', { method: 'POST', headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' }, body: JSON.stringify({ cid: gapConv, seq: 2 }) });
-+  assert.equal(expired.status, 200);
-+  const gapPage = await cli(['history', gapConv, '--after-seq', '1']);
-+  assert.deepEqual(gapPage.messages.map(m => m.seq), [3]);
-+  const gapDetail = await cli(['get', gapConv]);
-+  evidence.retentionGap = { cursor: 1, retainedSequences: gapPage.messages.map(m => m.seq), unreadReported: gapDetail.conversation.unread_count, retainedUnread: gapPage.messages.length, nativeRuntimeTested: false, bridgeSourceOutcome: 'History is not contiguous/canonical; HOLD before native delivery/read' };
-+  assert.ok(gapPage.retention_gap || gapPage.gaps?.length || gapPage.oldest_seq === 3);
-+  check('actual Worker/CLI retention metadata exposes the gap; P3 strict handling is verified separately');
 +  evidence.httpConversationRequests = requests.length;
 +  evidence.messageCount = history.messages.length;
 +  await page.screenshot({ path: resolve(scratch, 'browser.png') });
@@ -18455,11 +18523,11 @@ index 0000000..6484651
 +  if (browser) await browser.close();
 +  await mf.dispose();
 +}
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-platform.test.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-platform.test.ts
+diff --git a/test/conversation-platform.test.ts b/test/conversation-platform.test.ts
 new file mode 100644
-index 0000000..b767015
+index 0000000..6380e66
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-platform.test.ts
++++ b/test/conversation-platform.test.ts
 @@ -0,0 +1,39 @@
 +import { describe, it, expect } from 'vitest';
 +import { env, runInDurableObject, SELF } from 'cloudflare:test';
@@ -18488,7 +18556,7 @@ index 0000000..b767015
 +
 +  it('routes real health/auth/bus/fleet/conversation requests and gates private assets', async () => {
 +    expect((await SELF.fetch('https://hub.test/api/conversations')).status).toBe(401);
-+    for (const path of ['/', '/conversations.js', '/vendor/dakit/dakit.css']) {
++    for (const path of ['/', '/conversations.js', '/fleet.html', '/fleet.js', '/fleet.css']) {
 +      const response = await SELF.fetch('https://hub.test' + path, { redirect: 'manual' });
 +      expect(response.status).toBe(303);
 +      expect(response.headers.get('Location')).toBe('/auth/login');
@@ -18500,11 +18568,11 @@ index 0000000..b767015
 +    }
 +  });
 +});
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-retention.test.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-retention.test.ts
+diff --git a/test/conversation-retention.test.ts b/test/conversation-retention.test.ts
 new file mode 100644
 index 0000000..ac72850
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-retention.test.ts
++++ b/test/conversation-retention.test.ts
 @@ -0,0 +1,1311 @@
 +import { describe, it, expect } from 'vitest';
 +import { env, runInDurableObject } from 'cloudflare:test';
@@ -19817,11 +19885,11 @@ index 0000000..ac72850
 +    });
 +  });
 +});
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-security.test.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-security.test.ts
+diff --git a/test/conversation-security.test.ts b/test/conversation-security.test.ts
 new file mode 100644
 index 0000000..bfa1e81
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversation-security.test.ts
++++ b/test/conversation-security.test.ts
 @@ -0,0 +1,2810 @@
 +import { describe, it, expect } from 'vitest';
 +import { env, runInDurableObject } from 'cloudflare:test';
@@ -22633,12 +22701,12 @@ index 0000000..bfa1e81
 +
 +
 +
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversations-ui.browser.mjs b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversations-ui.browser.mjs
+diff --git a/test/conversations-ui.browser.mjs b/test/conversations-ui.browser.mjs
 new file mode 100644
-index 0000000..0c2825b
+index 0000000..be5c0dc
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversations-ui.browser.mjs
-@@ -0,0 +1,1069 @@
++++ b/test/conversations-ui.browser.mjs
+@@ -0,0 +1,1071 @@
 +/* Browser behaviour tests for the conversations UI, using the existing
 +   Playwright installation (no package installs). Runs standalone:
 +      node test/conversations-ui.browser.mjs
@@ -22898,7 +22966,7 @@ index 0000000..0c2825b
 +      if (typeof payload.idempotency_key !== 'string' || !IDKEY.test(payload.idempotency_key)) return json(route, 400, { error: 'invalid_idempotency_key' });
 +      sendLog.push({ conversationId, payload, csrf: csrfHeader });
 +      if (state.sendGate) await state.sendGate.promise;
-+      if (state.csrfFailures > 0) { state.csrfFailures--; return json(route, 403, { error: 'csrf_invalid' }); }
++      if (state.csrfFailures > 0) { state.csrfFailures--; await json(route, 403, { error: 'csrf_invalid' }); state.events.push('csrf-response'); return; }
 +      if (state.denied.has(conversationId)) return json(route, 403, { error: 'forbidden', reason: 'member_removed' });
 +      if (state.failNextSends > 0) { state.failNextSends--; return json(route, 500, { error: 'simulated_failure' }); }
 +      const replay = state.idempotent[conversationId] && state.idempotent[conversationId][payload.idempotency_key];
@@ -23349,9 +23417,9 @@ index 0000000..0c2825b
 +        await page.waitForFunction(() => document.querySelectorAll('.msg__body').length === 2);
 +        assert.ok(state.events.includes('history-snapshot:human:user-456:2'));
 +      } else state.csrfFailures = 1;
-+      const responded = page.waitForResponse(r => r.request().method() === 'POST' && new URL(r.url()).pathname === '/api/conversations/c1/messages');
++      const laterHistory = state.historySnapshotGate = gate({actor:'human:user-456'});
 +      hold.release(); state.sendGate = null;
-+      await (await responded).finished();
++      await until(() => state.events.includes(outcome === 'success' ? 'post-response:' + SELF : 'csrf-response'));
 +      await page.evaluate(() => new Promise(requestAnimationFrame));
 +      await page.waitForFunction(() => document.getElementById('account-name').textContent === 'Ada Lovelace');
 +      if (outcome === 'success') {
@@ -23363,6 +23431,7 @@ index 0000000..0c2825b
 +      assert.ok(!(await page.locator('#conv-detail').textContent()).includes('Grace held send'));
 +      assert.equal(await page.evaluate(() => Object.keys(localStorage).filter((k) => k.startsWith('conv-outbox:')).some((k) => localStorage[k].includes('Grace held send'))), false);
 +      expectNoPageErrors();
++      laterHistory.release(); state.historySnapshotGate = null;
 +    });
 +  }
 +
@@ -23386,9 +23455,8 @@ index 0000000..0c2825b
 +    historyHold.release(); state.historySnapshotGate = null;
 +    await page.waitForFunction(() => document.getElementById('account-name').textContent === 'Ada Lovelace' && document.querySelectorAll('.msg__body').length === 3);
 +    assert.ok(state.events.indexOf('post-commit:' + SELF) < state.events.indexOf('history-snapshot:human:user-456:3'));
-+    const responded = page.waitForResponse(r => r.request().method() === 'POST' && new URL(r.url()).pathname === '/api/conversations/c1/messages');
 +    responseHold.release(); state.sendResponseGate = null;
-+    await (await responded).finished();
++    await until(() => state.events.includes('post-response:' + SELF));
 +    await page.evaluate(() => new Promise(requestAnimationFrame));
 +    assert.equal(await page.locator('.msg__body').count(), 3);
 +    assert.equal(await page.locator('.msg__body').filter({hasText:'Grace held send'}).count(), 1, 'authorized history row appears exactly once');
@@ -23685,6 +23753,8 @@ index 0000000..0c2825b
 +          ' threadError=' + (await page.locator('#thread-error').count() ? (await page.locator('#thread-error').textContent()).slice(0, 120) : 'none'),
 +          ' pageErrors=' + pageErrors.join(';'));
 +      } catch (e) { console.error('  debug dump failed: ' + String(e).split('\n')[0]); }
++    } finally {
++      for (const key of ['sendGate','sendResponseGate','historySnapshotGate','historyGate','participantsGate','createGate']) { state?.[key]?.release(); if (state) state[key] = null; }
 +    }
 +  }
 +}
@@ -23708,11 +23778,11 @@ index 0000000..0c2825b
 +if (!result) { console.error('BROWSER TESTS FAILED: browser never survived a full suite'); process.exit(1); }
 +console.log(`${result.passed} passed, ${result.failed} failed` + (result.failed ? `; page errors: ${result.pageErrors.concat(result.consoleErrors).join(' | ')}` : ''));
 +process.exit(result.failed ? 1 : 0);
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversations-ui.checks.mjs b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversations-ui.checks.mjs
+diff --git a/test/conversations-ui.checks.mjs b/test/conversations-ui.checks.mjs
 new file mode 100644
 index 0000000..022e3e5
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversations-ui.checks.mjs
++++ b/test/conversations-ui.checks.mjs
 @@ -0,0 +1,139 @@
 +/* Static checks for the conversations UI. Runs standalone with plain node
 +   (node test/conversations-ui.checks.mjs) and is also imported by the vitest
@@ -23853,11 +23923,11 @@ index 0000000..022e3e5
 +  }
 +  console.log('conversations-ui static checks: PASS (vendor lock, borders, colors, scale, DOM-safety, CSP hygiene, M1 contract transport)');
 +}
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversations.test.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversations.test.ts
+diff --git a/test/conversations.test.ts b/test/conversations.test.ts
 new file mode 100644
 index 0000000..9f0c80b
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/conversations.test.ts
++++ b/test/conversations.test.ts
 @@ -0,0 +1,1708 @@
 +import { describe, it, expect, beforeEach } from 'vitest';
 +import { env, runInDurableObject } from 'cloudflare:test';
@@ -25567,11 +25637,11 @@ index 0000000..9f0c80b
 +});
 +
 +
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/existing-ui-worker.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/existing-ui-worker.ts
+diff --git a/test/existing-ui-worker.ts b/test/existing-ui-worker.ts
 new file mode 100644
 index 0000000..9d13819
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/existing-ui-worker.ts
++++ b/test/existing-ui-worker.ts
 @@ -0,0 +1,29 @@
 +// Local-only entrypoint. Fixtures create a human and machines, never agent credentials.
 +import worker, {Hub as ProductionHub} from '../src/worker';
@@ -25602,11 +25672,11 @@ index 0000000..9d13819
 +    return worker.fetch(request,env,ctx);
 +  }
 +};
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/existing-ui.browser.mjs b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/existing-ui.browser.mjs
+diff --git a/test/existing-ui.browser.mjs b/test/existing-ui.browser.mjs
 new file mode 100644
 index 0000000..e7c4373
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/existing-ui.browser.mjs
++++ b/test/existing-ui.browser.mjs
 @@ -0,0 +1,94 @@
 +// Real loopback Worker + Hub + SQLite; positive responses never mocked.
 +import assert from 'node:assert/strict';
@@ -25702,11 +25772,11 @@ index 0000000..e7c4373
 + checks.push('Keyboard focus visible, real token sign-in, no credential/session/CSRF exposure in captured DOM or localStorage');assert.deepEqual(errors,[]);
 + await writeFile(resolve(out,'results.json'),JSON.stringify({checks,screenshots:shots,apiMocks:false,pageErrors:0},null,2)+'\n');for(const c of checks)console.log('PASS '+c);console.log('PASS '+shots.length+' screenshots; zero browser script errors');
 +}finally{if(browser)await browser.close();await mf.dispose();}
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/existing-ui.checks.mjs b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/existing-ui.checks.mjs
+diff --git a/test/existing-ui.checks.mjs b/test/existing-ui.checks.mjs
 new file mode 100644
 index 0000000..e252aac
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/existing-ui.checks.mjs
++++ b/test/existing-ui.checks.mjs
 @@ -0,0 +1,15 @@
 +// Verify the reviewed kit bytes and family policy, not a duplicated component implementation.
 +import assert from 'node:assert/strict';
@@ -25723,11 +25793,11 @@ index 0000000..e252aac
 +const paths=['public/fleet.css','public/fleet.html','public/auth.css','public/auth.js','public/fleet.js'].map(p=>resolve(root,p));
 +assert.deepEqual(checkColors(paths),[]);assert.deepEqual(checkBorders(paths),[]);assert.deepEqual(checkScale(paths).failures,[]);
 +console.log('PASS reviewed official dakit lock (21 files), semantic colors, neutral borders and type/space scales');
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/existing-ui.test.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/existing-ui.test.ts
+diff --git a/test/existing-ui.test.ts b/test/existing-ui.test.ts
 new file mode 100644
 index 0000000..72d65f2
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/existing-ui.test.ts
++++ b/test/existing-ui.test.ts
 @@ -0,0 +1,32 @@
 +import {describe,it,expect} from 'vitest';
 +import {env,SELF,runInDurableObject} from 'cloudflare:test';
@@ -25761,10 +25831,10 @@ index 0000000..72d65f2
 +    expect(await (await req('/device?code='+done.user_code,'GET',undefined,c)).text()).toContain('Code expired');
 +  });
 +});
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/test/fleet-assets.test.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/fleet-assets.test.ts
+diff --git a/test/fleet-assets.test.ts b/test/fleet-assets.test.ts
 index e6e0b5e..7bcac76 100644
---- a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/test/fleet-assets.test.ts
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/fleet-assets.test.ts
+--- a/test/fleet-assets.test.ts
++++ b/test/fleet-assets.test.ts
 @@ -11,6 +11,28 @@ describe('private fleet assets', () => {
        expect(r.status).toBe(303); expect(r.headers.get('Location')).toBe('/auth/login');
      }
@@ -25817,10 +25887,10 @@ index e6e0b5e..7bcac76 100644
    });
    it('requires CSRF and admin scope for account updates even with a valid browser session', async () => {
      const cookie = await createSessionCookie(defaultEnv, { sub: 'human-test', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf-test', exp: Math.floor(Date.now() / 1000) + 60 });
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/test/liveness.test.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/liveness.test.ts
+diff --git a/test/liveness.test.ts b/test/liveness.test.ts
 index 136b106..4d35e57 100644
---- a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/test/liveness.test.ts
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/liveness.test.ts
+--- a/test/liveness.test.ts
++++ b/test/liveness.test.ts
 @@ -184,6 +184,7 @@ describe('stale alerts', () => {
      const tokens: Record<string, string> = { reader: 'reader-token-' + crypto.randomUUID(), reporter: 'reporter-token-' + crypto.randomUUID() };
      await runInDurableObject(stub, async (hub: Hub) => {
@@ -25829,10 +25899,43 @@ index 136b106..4d35e57 100644
          hub.sql.exec('INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
            name, 'agent', await sha256(tokens[name]), name, name, name, JSON.stringify(scopes), 'test', new Date().toISOString(), new Date(Date.now() + 3600000).toISOString());
        }
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/test/m3-http.test.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/m3-http.test.ts
+diff --git a/test/m1-focus-jwks.test.ts b/test/m1-focus-jwks.test.ts
+index 18d738c..10ccd49 100644
+--- a/test/m1-focus-jwks.test.ts
++++ b/test/m1-focus-jwks.test.ts
+@@ -165,8 +165,12 @@ describe('M1 Focus: JWKS', () => {
+ 
+     let deviceHtmlRes = await doFetch(new Request(`http://example.com/device?code=${userCode}`, { headers: { 'Cookie': appCookie } }));
+     let deviceHtml = await deviceHtmlRes.text();
+-    let csrfMatch = deviceHtml.match(/name="csrf_token"\s+value="([^"]+)"/);
+-    let csrfToken = csrfMatch ? csrfMatch[1] : '';
++    // M2b keeps CSRF in memory, fetched from the current authenticated session.
++    const meRes = await doFetch(new Request('http://example.com/auth/me', { headers: { Cookie: appCookie } }));
++    expect(meRes.status).toBe(200);
++    const csrfToken = (await meRes.json() as any).csrf_token;
++    expect(csrfToken).toBeTruthy();
++    expect(deviceHtml).not.toContain(csrfToken);
+ 
+     const approveRes = await doFetch(new Request(`http://example.com/api/device/approve/${userCode}`, {
+       method: 'POST',
+@@ -174,11 +178,13 @@ describe('M1 Focus: JWKS', () => {
+       body: JSON.stringify({ granted_scopes: ['host'] })
+     }));
+ 
++    expect(approveRes.status).toBe(200);
+     const tokenRes = await doFetch(new Request('http://example.com/api/device/token', {
+       method: 'POST',
+       headers: { 'Content-Type': 'application/json' },
+       body: JSON.stringify({ grant_type: 'urn:ietf:params:oauth:grant-type:device_code', device_code: deviceCode })
+     }));
++    expect(tokenRes.status).toBe(200);
+     const tokenData = await tokenRes.json() as any;
+     expect(tokenData.access_token).toBeDefined();
+ 
+diff --git a/test/m3-http.test.ts b/test/m3-http.test.ts
 index cdca0f8..9c4ccfc 100644
---- a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/test/m3-http.test.ts
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/m3-http.test.ts
+--- a/test/m3-http.test.ts
++++ b/test/m3-http.test.ts
 @@ -99,6 +99,41 @@ async function seedTestData(sql: any) {
    );
  }
@@ -26166,10 +26269,10 @@ index cdca0f8..9c4ccfc 100644
      });
    });
  
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/test/m4-integration.test.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/m4-integration.test.ts
+diff --git a/test/m4-integration.test.ts b/test/m4-integration.test.ts
 index 369d536..5462044 100644
---- a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/test/m4-integration.test.ts
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/m4-integration.test.ts
+--- a/test/m4-integration.test.ts
++++ b/test/m4-integration.test.ts
 @@ -674,10 +674,14 @@ describe('M4 Six Root Scenarios & System Compatibility Integration Tests', () =>
        const newAgent = instance.ctx.storage.sql.exec("SELECT * FROM agents WHERE tag = 'm3-agent-no-proj'").toArray()[0] as any;
        expect(newAgent.tag).toBe('m3-agent-no-proj');
@@ -26187,10 +26290,10 @@ index 369d536..5462044 100644
      });
  
      // Part B: Upgrade from SPEC §6 tables (jobs, leases, audit before M4 columns)
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/test/m4-lease.test.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/m4-lease.test.ts
+diff --git a/test/m4-lease.test.ts b/test/m4-lease.test.ts
 index b60796d..681a168 100644
---- a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/test/m4-lease.test.ts
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/m4-lease.test.ts
+--- a/test/m4-lease.test.ts
++++ b/test/m4-lease.test.ts
 @@ -828,7 +828,7 @@ describe('M4 Lease Semantics, Epoch CAS, and Safety Tests', () => {
  
        // 3. Registered agent with state='working' and health_state=NULL is valid and visible in BusService.getBusMessages()
@@ -26200,11 +26303,11 @@ index b60796d..681a168 100644
          new Date(nowMs).toISOString()
        );
        const dispatchNullHs = await service.commitRootAction(
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/machine-pairing-worker.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/machine-pairing-worker.ts
+diff --git a/test/machine-pairing-worker.ts b/test/machine-pairing-worker.ts
 new file mode 100644
 index 0000000..8f25443
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/machine-pairing-worker.ts
++++ b/test/machine-pairing-worker.ts
 @@ -0,0 +1,26 @@
 +// Local-only HTTP fixture. The agent credential is always issued by public device routes.
 +import worker, { Hub as ProductionHub } from '../src/worker';
@@ -26232,12 +26335,12 @@ index 0000000..8f25443
 +  return worker.fetch(request,env,ctx);
 + }
 +};
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/machine-pairing.mjs b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/machine-pairing.mjs
+diff --git a/test/machine-pairing.mjs b/test/machine-pairing.mjs
 new file mode 100644
-index 0000000..8aea407
+index 0000000..b324485
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/machine-pairing.mjs
-@@ -0,0 +1,142 @@
++++ b/test/machine-pairing.mjs
+@@ -0,0 +1,141 @@
 +// Loopback-only public HTTP + browser + actual read-only native bridge qualification.
 +import assert from 'node:assert/strict';
 +import {build} from 'esbuild';
@@ -26285,7 +26388,6 @@ index 0000000..8aea407
 + assert.ok((await page.textContent('body')).includes('Project: pair-local / Tag: '+tag));
 + assert.equal(await page.locator('#agentMachine').getAttribute('class'),'dk-select');
 + assert.equal(await page.locator('link[rel=stylesheet]').first().getAttribute('href'),'/vendor/dakit/dakit.css');
-+ await page.getByRole('button',{name:'Continue',exact:true}).click();
 + await page.locator('#agentMachine').selectOption('pair-local-machine');
 + page.on('dialog',dialog=>dialog.accept());
 + const approved=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/device/approve/'+challenge.user_code);
@@ -26380,11 +26482,11 @@ index 0000000..8aea407
 + console.log('PASS browser pending/approved/expired/error paths use actual public responses');
 +} finally {for(const child of children)child.kill();if(browser)await browser.close();await mf.dispose();await rm(cliRoot,{recursive:true,force:true});}
 +
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/machine-pairing.test.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/machine-pairing.test.ts
+diff --git a/test/machine-pairing.test.ts b/test/machine-pairing.test.ts
 new file mode 100644
-index 0000000..0652dd5
+index 0000000..0e765dd
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/machine-pairing.test.ts
++++ b/test/machine-pairing.test.ts
 @@ -0,0 +1,242 @@
 +import { describe, it, expect, beforeEach } from 'vitest';
 +import { SELF, env, runInDurableObject } from 'cloudflare:test';
@@ -26444,7 +26546,7 @@ index 0000000..0652dd5
 +  if(change==='replace-projectless')expect((await register(null)).status).toBe(201);
 +  const p=await challenge(tag),html=await (await req('/device?code='+p.user_code,'GET',undefined,c)).text();
 +  const expected=change==='replace-project'||change==='delete-project'?'before:'+tag:tag;
-+  expect(html).toContain('expected_actor: '+JSON.stringify(expected));
++  expect(html).toContain('data-actor="'+expected+'"');
 +  expect(html).toContain('Project: '+(expected.includes(':')?'before':'(projectless)')+' / Tag: '+tag);
 +  if(change==='replace-project'||change==='delete-project')expect((await req('/api/agents/before:'+tag,'DELETE',undefined,c)).status).toBe(200);
 +  if(change==='replace-projectless')expect((await req('/api/agents/'+tag,'DELETE',undefined,c)).status).toBe(200);
@@ -26457,7 +26559,7 @@ index 0000000..0652dd5
 + it('accepts the canonical actor displayed for an unchanged bare request',async()=>{
 +  await machine();const c=await human();expect((await req('/api/agents','POST',{project:'pair',tag:'canonical',machine_id:'pair-node'},c)).status).toBe(201);
 +  const p=await challenge('canonical'),html=await (await req('/device?code='+p.user_code,'GET',undefined,c)).text();
-+  expect(html).toContain('expected_actor: "pair:canonical"');
++  expect(html).toContain('data-actor="pair:canonical"');
 +  expect((await approve(p,{expected_actor:'pair:canonical',machine_id:'pair-node'},c)).status).toBe(200);
 +  const t=await (await poll(p)).json() as any;expect(t.machine_id).toBe('pair-node');expect((await credential(t)).registry_actor).toBe('pair:canonical');
 + });
@@ -26465,7 +26567,7 @@ index 0000000..0652dd5
 +  await machine();const c=await human();
 +  if(existing)expect((await req('/api/agents','POST',{project:'pair',tag:'choice'},c)).status).toBe(201);
 +  const p=await challenge('pair:choice'),html=await (await req('/device?code='+p.user_code,'GET',undefined,c)).text();
-+  expect(html).toContain('Machine-less (native bridge unavailable)');expect(html).toContain('data.machine_id = null');
++  expect(html).toContain('Machine-less (native bridge unavailable)');expect(html).toContain('data-kind="agent" data-machine=""');
 +  if(existing==='assignment') {const concurrent=await challenge('pair:choice');expect((await approve(concurrent,{machine_id:'pair-node'},c)).status).toBe(200);}
 +  else {
 +   if(existing)expect((await req('/api/agents/pair:choice','DELETE',undefined,c)).status).toBe(200);
@@ -26487,7 +26589,7 @@ index 0000000..0652dd5
 +  await machine();await machine('other-node');const c=await human();
 +  expect((await req('/api/agents','POST',{project:'pair',tag:'swap',machine_id:'pair-node'},c)).status).toBe(201);
 +  const p=await challenge('pair:swap'),html=await (await req('/device?code='+p.user_code,'GET',undefined,c)).text();
-+  expect(html).toContain('value="pair-node" selected');expect(html).toContain('data.machine_id = "pair-node"');
++  expect(html).toContain('value="pair-node" selected');expect(html).toContain('data-kind="agent" data-machine="pair-node"');
 +  expect((await req('/api/agents/pair:swap','DELETE',undefined,c)).status).toBe(200);
 +  expect((await req('/api/agents','POST',{project:'pair',tag:'swap',machine_id:'other-node'},c)).status).toBe(201);
 +  expect((await approve(p,{expected_actor:'pair:swap',machine_id:'pair-node'},c)).status).toBe(409);
@@ -26628,20 +26730,20 @@ index 0000000..0652dd5
 +  expect((await sql("SELECT COUNT(*) n FROM credentials WHERE kind='agent' AND revoked_at IS NULL"))[0].n).toBe(1);
 + });
 +});
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/registry-f7-worker.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/registry-f7-worker.ts
+diff --git a/test/registry-f7-worker.ts b/test/registry-f7-worker.ts
 new file mode 100644
 index 0000000..6ecaa57
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/registry-f7-worker.ts
++++ b/test/registry-f7-worker.ts
 @@ -0,0 +1,3 @@
 +// Local-only composition: preserve the public default Worker, Hub export and SQL namespace.
 +export { default } from '../src/worker';
 +export { Hub } from '../src/conversation-hub';
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/registry-f7.config.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/registry-f7.config.ts
+diff --git a/test/registry-f7.config.ts b/test/registry-f7.config.ts
 new file mode 100644
 index 0000000..85a2eb1
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/registry-f7.config.ts
++++ b/test/registry-f7.config.ts
 @@ -0,0 +1,9 @@
 +import { defineConfig } from 'vitest/config';
 +import { cloudflareTest } from '@cloudflare/vitest-pool-workers';
@@ -26652,11 +26754,11 @@ index 0000000..85a2eb1
 +    HUB_ADMINS: 'admin@fake.local,another@fake.local', SESSION_SECRET: 'super_secret_session_key_32_chars_long_for_tests',
 +  } } })], test: { include: ['test/**/*.test.ts', 'test/registry-f7.local.ts'], fileParallelism: false },
 +});
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/registry-f7.local.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/registry-f7.local.ts
+diff --git a/test/registry-f7.local.ts b/test/registry-f7.local.ts
 new file mode 100644
 index 0000000..bc93d83
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/registry-f7.local.ts
++++ b/test/registry-f7.local.ts
 @@ -0,0 +1,345 @@
 +import { describe, it, expect } from 'vitest';
 +import { env, SELF, runInDurableObject, createExecutionContext, waitOnExecutionContext, createScheduledController } from 'cloudflare:test';
@@ -27003,11 +27105,11 @@ index 0000000..bc93d83
 +    });
 +  });
 +});
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/registry-r2.test.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/registry-r2.test.ts
+diff --git a/test/registry-r2.test.ts b/test/registry-r2.test.ts
 new file mode 100644
 index 0000000..ee9f080
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/registry-r2.test.ts
++++ b/test/registry-r2.test.ts
 @@ -0,0 +1,236 @@
 +import { describe, it, expect } from 'vitest';
 +import { env, SELF, runInDurableObject } from 'cloudflare:test';
@@ -27245,10 +27347,10 @@ index 0000000..ee9f080
 +    expect(protectedRows).toHaveLength(1);expect(protectedRows[0]).toMatchObject({to_actor:'pA:solo-worker',lease_epoch:1});
 +  });
 +});
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/test/root-coordination.test.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/root-coordination.test.ts
+diff --git a/test/root-coordination.test.ts b/test/root-coordination.test.ts
 index d58458d..de813a4 100644
---- a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/base/test/root-coordination.test.ts
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/root-coordination.test.ts
+--- a/test/root-coordination.test.ts
++++ b/test/root-coordination.test.ts
 @@ -546,7 +546,7 @@ describe('Root Coordination Acceptance Criteria (M4 / SPEC §8.1 / Issue 6 - Six
  
        // Seed registered root agent with running state on stale host
@@ -27258,11 +27360,11 @@ index d58458d..de813a4 100644
        );
  
        // Seed expired lease at epoch 1
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/vitest.conversation-platform.config.ts b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/vitest.conversation-platform.config.ts
+diff --git a/test/vitest.conversation-platform.config.ts b/test/vitest.conversation-platform.config.ts
 new file mode 100644
 index 0000000..31d3886
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/vitest.conversation-platform.config.ts
++++ b/test/vitest.conversation-platform.config.ts
 @@ -0,0 +1,8 @@
 +import { defineConfig } from 'vitest/config';
 +import { cloudflareTest } from '@cloudflare/vitest-pool-workers';
@@ -27272,11 +27374,11 @@ index 0000000..31d3886
 +  } } })],
 +  test: { include: ['test/conversation-platform.test.ts'], fileParallelism: false },
 +});
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/wrangler.conversation-bridge-gap.jsonc b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/wrangler.conversation-bridge-gap.jsonc
+diff --git a/test/wrangler.conversation-bridge-gap.jsonc b/test/wrangler.conversation-bridge-gap.jsonc
 new file mode 100644
 index 0000000..89d0095
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/wrangler.conversation-bridge-gap.jsonc
++++ b/test/wrangler.conversation-bridge-gap.jsonc
 @@ -0,0 +1,8 @@
 +{
 +  "name": "conversation-bridge-gap-local-test",
@@ -27286,11 +27388,11 @@ index 0000000..89d0095
 +  "durable_objects": { "bindings": [{ "name": "HUB", "class_name": "Hub" }] },
 +  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Hub"] }]
 +}
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/wrangler.conversation-platform.jsonc b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/wrangler.conversation-platform.jsonc
+diff --git a/test/wrangler.conversation-platform.jsonc b/test/wrangler.conversation-platform.jsonc
 new file mode 100644
 index 0000000..1ee12dd
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/wrangler.conversation-platform.jsonc
++++ b/test/wrangler.conversation-platform.jsonc
 @@ -0,0 +1,8 @@
 +{
 +  "name": "conversation-platform-local-test",
@@ -27300,11 +27402,11 @@ index 0000000..1ee12dd
 +  "durable_objects": { "bindings": [{ "name": "HUB", "class_name": "Hub" }] },
 +  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Hub"] }]
 +}
-diff --git a/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/wrangler.registry-f7.jsonc b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/wrangler.registry-f7.jsonc
+diff --git a/test/wrangler.registry-f7.jsonc b/test/wrangler.registry-f7.jsonc
 new file mode 100644
 index 0000000..0b4229d
 --- /dev/null
-+++ b/home/alexey/git/agent-hub-wt-platform-conv-final/.local/integration/tree/test/wrangler.registry-f7.jsonc
++++ b/test/wrangler.registry-f7.jsonc
 @@ -0,0 +1,5 @@
 +{
 +  "name": "agent-hub-registry-local", "main": "registry-f7-worker.ts", "compatibility_date": "2024-04-05", "compatibility_flags": ["nodejs_compat"],
