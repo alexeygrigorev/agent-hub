@@ -564,11 +564,10 @@ def deliver_recorded(
 
     ``message deliver <id>`` submits the ORIGINAL envelope (delivery never creates
     another one) after the native side inspects a fresh, empty prompt itself. This
-    is the only supported transport beyond durable inbox, and it is explicit
-    opt-in: without it, commands stay ``recorded``/``held``. Success maps to
-    ``transported`` — never ``acknowledged`` (only :func:`verify_ack_via_reply`
-    proves processing). No composer-idle claim is made from phase/working flags;
-    the readiness inspection belongs to the native guard, not to this caller.
+    is the supported transport beyond durable inbox. Success maps to ``transported``
+    — never ``acknowledged`` (only :func:`verify_ack_via_reply` proves processing).
+    No composer-idle claim is made from phase/working flags; the readiness inspection
+    belongs to the native guard, not to this caller.
     """
     target = target.validated()
     if not isinstance(envelope_id, str) or not envelope_id or len(envelope_id) > 128:
@@ -579,21 +578,103 @@ def deliver_recorded(
         ["message", "deliver", "--workspace", target.workspace, "--json", envelope_id],
         timeout=NATIVE_TIMEOUT,
     )
+    outcome: Optional[dict[str, Any]] = None
+    if proc.stdout.strip():
+        try:
+            parsed = json.loads(proc.stdout)
+            if isinstance(parsed, dict):
+                outcome = parsed
+        except (ValueError, TypeError):
+            outcome = None
+
+    if outcome is not None:
+        status = outcome.get("status")
+        detail = outcome.get("detail")
+        if isinstance(status, str):
+            status_lower = status.lower().strip()
+            if status_lower in ("submitted", "already-submitted", "recipient-acked"):
+                # Note: recipient-acked indicates previous native cursor ack,
+                # but correlated exact-recipient reply remains the ONLY proof of processing.
+                return DeliveryResult(
+                    state="transported",
+                    native_id=envelope_id,
+                    reason=detail or f"native deliver guard reports {status_lower}; processing NOT proven",
+                    evidence={"status": status_lower, "detail": detail},
+                )
+            if status_lower in ("not-ready", "busy", "draft", "menu", "unknown"):
+                # rc0 not-ready is not transported: readiness gate refused.
+                return DeliveryResult(
+                    state="refused",
+                    native_id=envelope_id,
+                    reason=detail or f"native deliver guard reports {status_lower}",
+                    evidence={"status": status_lower, "detail": detail},
+                )
+            if status_lower in ("delivery-uncertain", "uncertain"):
+                raise SessionUncertain(detail or "Deliver outcome uncertain; reconcile before retry")
+        # Backwards compatibility with fake test harnesses returning {"delivered": mid}
+        if "delivered" in outcome:
+            return DeliveryResult(
+                state="transported",
+                native_id=envelope_id,
+                reason="native deliver guard submitted the envelope; processing NOT proven",
+                evidence={"status": "submitted"},
+            )
+
     if proc.returncode == 0:
-        return DeliveryResult(
-            state="transported",
-            native_id=envelope_id,
-            reason="native deliver guard submitted the envelope; processing NOT proven",
-            evidence={},
-        )
+        if outcome is not None:
+            return DeliveryResult(
+                state="transported",
+                native_id=envelope_id,
+                reason="native deliver guard submitted the envelope; processing NOT proven",
+                evidence={},
+            )
+        raise SessionUncertain("Native deliver returned non-JSON output; effect unknown")
+
     lowered = proc.stderr.lower()
-    if any(s in lowered for s in ("busy", "not empty", "menu", "draft", "unknown")):
+    if any(s in lowered for s in ("no session tagged", "not recorded", "no such message",
+                                  "only the original sender or recipient may deliver",
+                                  "delivery requires")):
+        raise SessionControlError((proc.stderr.strip().splitlines() or ["deliver guard refused"])[-1][:300])
+
+    if any(s in lowered for s in ("busy", "not empty", "menu", "draft", "unknown", "not ready", "reported working")):
         return DeliveryResult(
             state="refused",
             native_id=envelope_id,
             reason=(proc.stderr.strip().splitlines() or ["deliver guard refused"])[-1][:300],
+            evidence={"status": "not-ready"},
+        )
+    if any(s in lowered for s in ("unrecognized subcommand", "not supported", "error: unrecognized")) or (not proc.stdout and not proc.stderr):
+        return DeliveryResult(
+            state="recorded",
+            native_id=envelope_id,
+            reason="native deliver guard unsupported; envelope recorded in inbox",
+            evidence={"status": "unsupported"},
         )
     raise SessionUncertain("Deliver outcome unknown; reconcile before retry")
+
+
+def reconcile_delivery_from_log(
+    executable: str,
+    target_workspace: str,
+    envelope_id: str,
+) -> Optional[str]:
+    """Retrieve message log for target workspace to inspect the delivery mode of an envelope.
+
+    Returns:
+    - 'transported' if the envelope's delivery is 'pane'
+    - 'recorded' if the envelope exists and delivery is 'inbox'
+    - None if the envelope is not found or log unavailable
+    """
+    try:
+        log = fetch_message_log(executable, target_workspace)
+        for env in log:
+            if env.get("id") == envelope_id:
+                if env.get("delivery") == "pane":
+                    return "transported"
+                return "recorded"
+    except (SessionControlError, SessionUncertain):
+        return None
+    return None
 
 
 MAX_LOG_ROWS = 200  # bounded native log retrieval per reconciliation

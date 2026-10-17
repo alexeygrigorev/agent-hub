@@ -446,7 +446,7 @@ def _pending_reconcile_names(journal_dir: str, limit: int = 20) -> list[str]:
             continue  # corrupt journal: fail closed, surface via manual reconcile
         if not isinstance(record, dict):
             continue
-        if record.get("state") == "unknown" and record.get("original_native_message_id"):
+        if record.get("state") in ("unknown", "uncertain") and record.get("original_native_message_id"):
             pending.append(name)
         elif (record.get("op") == "stop" and record.get("state") == "uncertain"
                 and isinstance(record.get("stop_oracle"), dict)
