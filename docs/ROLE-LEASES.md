@@ -23,8 +23,13 @@ The enrolled host requests an actual job offer with
 is derived from configuration. Arbitrary commands and arguments are refused.
 It then uses the existing authenticated job claim, start, renew and finish API.
 The claim is the lease acquisition CAS. Competing offers cannot both acquire
-the same epoch. Writer claims also consult current active leases for the existing
-writer-date exclusion, including both legacy and role jobs. Existing root APIs, scheduling defaults and legacy job profiles
+the same epoch. Writer claims consult current active leases and unresolved
+execution intents for the same UTC writer date, including both legacy and role
+jobs. An unresolved intent refuses a second credential even after its lease
+expires, its configuration changes, or the Hub restarts. Project, role name,
+request key and epoch do not define writer exclusion identity; legacy dated
+`writer-run:YYYY-MM-DD` keys retain that identity without a payload date.
+Existing root APIs, scheduling defaults and legacy job profiles
 retain their behavior; no Win35 root is enabled or renewed.
 
 Before any consumer effect, `POST /api/jobs/{id}/execute` with the job bearer,
@@ -32,9 +37,11 @@ epoch and generation checks current config, enrolled credential, fresh machine
 gate, deadline and lease inside the same SQL transaction as recording execution
 intent on the job. Only its first response permits execution. A duplicate or an
 uncertain response requires HOLD and reconciliation, never a blind retry.
-An unresolved intent for the same profile and canonical payload also blocks a
-replacement job with a different request key, across epochs and roles. A lease
-takeover permits different approved work; it cannot resolve an uncertain prior
+The effect transaction independently checks unresolved writer intents by UTC
+date across projects and roles, even for previously issued credentials. It
+returns `HOLD` / `previous_execution_unresolved` without recording another
+intent. Other profiles retain their canonical-payload check. A lease takeover
+permits a different writer date without deleting earlier uncertainty; it cannot resolve an uncertain prior
 physical effect. There is no endpoint that clears an uncertain intent merely to
 retry it. That reconciliation remains an M8b runtime/owner gate.
 
@@ -76,5 +83,9 @@ CSRF and namespace boundaries, competing acquisition and effect requests,
 execution intent rollback, positive claim/start/renew/finish, replay conflicts,
 expiry/takeover/reconnect/restart, credential rotation/expiry/revocation, config
 generation, host eligibility, clock rollback, bounded storage and retention.
+Writer regressions cover cross-project and same-project aliases after 121 seconds
+of expiry, reconfiguration, retained intent after restart, legacy dated keys,
+different dates, effect-time uncertainty, delayed execution after revocation,
+claim and intent transaction rollback, and lease expiry during the claim snapshot.
 The host stdlib suite exercises explicit fake effects, unsupported backends and
 lost authorization/renewal responses alongside the existing root lifecycle.

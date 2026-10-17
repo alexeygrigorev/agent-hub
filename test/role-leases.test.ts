@@ -226,16 +226,122 @@ describe('configured roles through authenticated public HTTP and real Hub SQLite
     }
   });
 
-  it('retains an unresolved effect across takeover and holds a different key for the same approved payload', async () => {
+  it('retains an unresolved effect after expiry and refuses a different key for the same approved payload', async () => {
     const f = await fixture(); await f.configure(); const id = (await f.offer()).data.job_id;
     const c = (await f.claim(id)).data; expect((await f.execute(id,c.job_token)).data.execute).toBe(true);
     await f.advance(121000);
     const next = (await f.offer('different-key','host-b',2)).data.job_id;
-    const nextClaim = (await f.claim(next,'host-b')).data;
-    expect(nextClaim.lease_epoch).toBe(3);
-    expect((await f.execute(next,nextClaim.job_token,3)).data).toMatchObject({ execute:false,status:'HOLD',reason:'previous_execution_unresolved' });
+    const nextClaim = await f.claim(next,'host-b');
+    expect(nextClaim.code).toBe(409);
+    expect(nextClaim.data).toMatchObject({ error:'conflict' });
+    expect(nextClaim.data.job_token).toBeUndefined();
+    expect(await f.inspect((hub: any) => hub.sql.exec("SELECT count(*) AS n FROM credentials WHERE kind='job' AND subject=?",next).one().n)).toBe(0);
     expect(await f.inspect((hub: any) => hub.sql.exec('SELECT role_effect FROM jobs WHERE id=?',next).one().role_effect)).toBeNull();
     expect(await f.inspect((hub: any) => hub.sql.exec('SELECT role_effect,role_finish FROM jobs WHERE id=?',id).one())).toMatchObject({ role_finish:null });
+    // No takeover occurs after a refusal. Reconfiguration explicitly revokes
+    // the original credential while retaining the unresolved effect.
+    await f.configure(config,1);
     expect((await f.execute(id,c.job_token)).code).toBe(401);
+  });
+
+  for (const target of ['other/writer','demo/alias']) {
+    it(`keeps one credential and intent for an unresolved writer date across expiry and ${target}`, async () => {
+      const f = await fixture(); await f.configure();
+      const configureTarget = (generation = 0) => f.request('/api/roles/' + target, {config,expected_generation:generation},'', 'PUT',true);
+      const offerTarget = (key: string, epoch = 1, generation = 1, date = '2099-05-06') => f.request('/api/roles/' + target + '/jobs', {
+        generation,expected_epoch:epoch,idempotency_key:'2099-05-06:' + key,profile:'writer-run',payload:{date},
+      },'token-host-b');
+      expect((await configureTarget()).code).toBe(200);
+      const id = (await f.offer()).data.job_id;
+      const c = (await f.claim(id)).data;
+      expect((await f.execute(id,c.job_token)).data.execute).toBe(true);
+      const original = await f.inspect((hub: any) => hub.sql.exec('SELECT role_effect,role_finish FROM jobs WHERE id=?',id).one());
+      await f.advance(121000);
+      // Restart with real retained SQLite; no in-memory lease or project map can fence this.
+      await f.inspect((hub: any) => { hub.jobsService = new JobsService(hub.sql,hub.ctx,{now:()=>new Date(hub._roleNow),enableAlarms:false}); });
+      for (const [key,epoch,generation] of [['after-expiry',1,1],['after-reconfigure',2,2]] as const) {
+        if (generation === 2) expect((await configureTarget(1)).data).toMatchObject({epoch:2,generation:2});
+        const offered = await offerTarget(key,epoch,generation); expect(offered.code).toBe(201);
+        const next = offered.data.job_id;
+        const denied = await f.claim(next,'host-b');
+        expect(denied.code).toBe(409); expect(denied.data.error).toBe('conflict');
+        expect(denied.data.job_token).toBeUndefined();
+        expect((await f.execute(next,c.job_token,epoch,generation)).code).toBeGreaterThanOrEqual(400);
+        expect(await f.inspect((hub: any) => hub.sql.exec('SELECT role_effect FROM jobs WHERE id=?',next).one().role_effect)).toBeNull();
+      }
+      // A legacy dated key has exactly the same identity, despite lacking payload.date.
+      await f.inspect((hub: any) => hub.sql.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,offer_host_id,offer_expires_at)
+        VALUES('legacy-later','writer-run','writer-run:2099-05-06','{}','offered',?,?,'system','host-b',?)`,
+        new Date(hub._roleNow).toISOString(),new Date(hub._roleNow+1500000).toISOString(),new Date(hub._roleNow+120000).toISOString()));
+      expect((await f.claim('legacy-later','host-b')).code).toBe(409);
+      expect(await f.inspect((hub: any) => hub.sql.exec("SELECT count(*) AS n FROM credentials WHERE kind='job' AND subject IN (SELECT id FROM jobs)").one().n)).toBe(1);
+      expect(await f.inspect((hub: any) => hub.sql.exec('SELECT count(*) AS n FROM jobs WHERE role_effect IS NOT NULL').one().n)).toBe(1);
+      expect(await f.inspect((hub: any) => hub.sql.exec('SELECT role_effect,role_finish FROM jobs WHERE id=?',id).one())).toEqual(original);
+      // A different UTC date is approved work without resolving or deleting the old intent.
+      const different = await offerTarget('different-date',2,2,'2099-05-07'); expect(different.code).toBe(201);
+      const next = different.data.job_id; const nextClaim = await f.claim(next,'host-b'); expect(nextClaim.code).toBe(200);
+      expect((await f.execute(next,nextClaim.data.job_token,3,2)).data.execute).toBe(true);
+      expect(await f.inspect((hub: any) => hub.sql.exec('SELECT role_effect,role_finish FROM jobs WHERE id=?',id).one())).toEqual(original);
+      expect((await f.execute(id,c.job_token)).code).toBe(409);
+    });
+  }
+
+  for (const legacy of [false,true]) {
+    it(`rechecks retained ${legacy ? 'legacy dated-key' : 'cross-project'} uncertainty at the effect transaction`, async () => {
+      const f = await fixture(); await f.configure(); const id = (await f.offer()).data.job_id;
+      const c = (await f.claim(id)).data;
+      // Model a previously issued job discovering retained pre-repair uncertainty
+      // after its claim. This fixture row is evidence, never a physical effect.
+      await f.inspect((hub: any) => hub.sql.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,role_name,role_effect)
+        VALUES('retained-intent','writer-run',?,?,'fenced',?,?,'system',?,'retained unresolved intent')`,
+        legacy ? 'writer-run:2099-05-06' : 'automation:other:alias:2099-05-06:old',
+        legacy ? '{}' : '{"project":"other","date":"2099-05-06"}',new Date(BASE).toISOString(),new Date(BASE+120000).toISOString(),
+        legacy ? null : 'automation:other:alias'));
+      const replies = await Promise.all([f.execute(id,c.job_token),f.execute(id,c.job_token)]);
+      for (const reply of replies) expect(reply.data).toMatchObject({execute:false,status:'HOLD',reason:'previous_execution_unresolved'});
+      expect(await f.inspect((hub: any) => hub.sql.exec('SELECT role_effect FROM jobs WHERE id=?',id).one().role_effect)).toBeNull();
+      expect(await f.inspect((hub: any) => hub.sql.exec("SELECT role_effect,role_finish FROM jobs WHERE id='retained-intent'").one())).toMatchObject({role_effect:'retained unresolved intent',role_finish:null});
+    });
+  }
+
+  it('refuses a delayed first execute after authority changes without losing earlier uncertainty', async () => {
+    const f = await fixture(); await f.configure(); const id = (await f.offer()).data.job_id;
+    const c = (await f.claim(id)).data; expect((await f.execute(id,c.job_token)).data.execute).toBe(true);
+    await f.advance(121000);
+    const next = (await f.offer('later-date','host-b',2,1,'2099-05-07')).data.job_id;
+    const nextClaim = await f.claim(next,'host-b'); expect(nextClaim.code).toBe(200);
+    expect((await f.configure(config,1)).data.generation).toBe(2);
+    expect((await f.execute(next,nextClaim.data.job_token,3)).code).toBeGreaterThanOrEqual(400);
+    expect(await f.inspect((hub: any) => hub.sql.exec('SELECT role_effect FROM jobs WHERE id=?',next).one().role_effect)).toBeNull();
+    expect(await f.inspect((hub: any) => hub.sql.exec('SELECT role_effect IS NOT NULL AS kept,role_finish FROM jobs WHERE id=?',id).one())).toMatchObject({kept:1,role_finish:null});
+  });
+
+  it('rolls back lease acquisition when credential insertion fails and can safely retry', async () => {
+    const f = await fixture(); await f.configure(); const id = (await f.offer()).data.job_id;
+    await f.inspect((hub: any) => hub.sql.exec("CREATE TRIGGER reject_role_credential BEFORE INSERT ON credentials WHEN NEW.kind='job' BEGIN SELECT RAISE(ABORT, 'injected SQL credential failure'); END"));
+    expect((await f.claim(id)).code).toBe(500);
+    expect(await f.inspect((hub: any) => hub.sql.exec("SELECT epoch,holder_job_id FROM leases WHERE name='automation:demo:writer'").one())).toMatchObject({epoch:1,holder_job_id:null});
+    expect(await f.inspect((hub: any) => hub.sql.exec('SELECT status,role_effect FROM jobs WHERE id=?',id).one())).toMatchObject({status:'offered',role_effect:null});
+    expect(await f.inspect((hub: any) => hub.sql.exec("SELECT count(*) AS n FROM credentials WHERE kind='job' AND subject IN (SELECT id FROM jobs)").one().n)).toBe(0);
+    await f.inspect((hub: any) => hub.sql.exec('DROP TRIGGER reject_role_credential'));
+    const c = await f.claim(id); expect(c.code).toBe(200);
+    expect((await f.execute(id,c.data.job_token)).data.execute).toBe(true);
+  });
+
+  it('uses the claim snapshot when a writer lease expires during credential hashing', async () => {
+    const f = await fixture(); await f.configure(); const id = (await f.offer()).data.job_id;
+    expect((await f.claim(id)).code).toBe(200);
+    await f.advance(119000);
+    const result = await f.inspect(async (hub: any) => {
+      hub.sql.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,offer_host_id,offer_expires_at)
+        VALUES('legacy-snapshot','writer-run','writer-run:2099-05-06','{}','offered',?,?,'system','host-b',?)`,
+        new Date(hub._roleNow).toISOString(),new Date(hub._roleNow+1500000).toISOString(),new Date(hub._roleNow+120000).toISOString());
+      let reads = 0;
+      hub.jobsService.setClock(() => new Date(hub._roleNow + (reads++ === 0 ? 0 : 2000)));
+      try { return await hub.jobsService.claimJob('legacy-snapshot','host-b',true,undefined,'cred-host-b'); }
+      finally { hub.jobsService.setClock(() => new Date(hub._roleNow)); }
+    });
+    expect(result).toMatchObject({error:'conflict',reason:'writer_date_busy'});
+    expect(result.job_token).toBeUndefined();
   });
 });
