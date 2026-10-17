@@ -52,6 +52,16 @@ beforeEach(async () => {
 
 describe('private durable intake HTTP/SQLite', () => {
 
+  it('records and replays new intake beyond the former 4 MiB backfill budget', async () => {
+    await inDO(stub(), (h: any) => {
+      for (let i = 0; i < 20; i++) h.sql.exec('INSERT INTO intake_receipts VALUES(?,?)', 'retained-' + i, JSON.stringify({ id: 'retained-' + i, padding: 'x'.repeat(256 * 1024) }));
+    });
+    const input = { key: 'after-backfill', project: 'demo', title: 'Keep accepting intake', text: 'Original request after retained history exceeds 4 MiB', source };
+    const first = await ok('/tasks', input);
+    expect((await ok('/tasks', input)).task.id).toBe(first.task.id);
+    expect(await inDO(stub(), (h: any) => h.sql.exec("SELECT COUNT(*) AS n FROM intake_receipts WHERE id LIKE 'retained-%'").one().n)).toBe(20);
+  });
+
   it('captures a pending voice pointer now, then appends provided transcript immutably', async () => {
     const first = await ok('/tasks', { key: 'voice', project: 'demo', title: 'Voice intake', text: null,
       source: { type: 'voice', reference: 'fixture:voice', timestamp: null }, transcription: 'pending' });
@@ -474,8 +484,18 @@ describe('private durable intake HTTP/SQLite', () => {
     before = await state(); expect((await call('/tasks', { key: 'countcap', project: 'demo', title: 'x', text: 'x', source })).status).toBe(507); expect(await state()).toEqual(before);
     await inDO(stub(), (h: any) => {
       h.sql.exec('DELETE FROM intake_tasks');
-      for (let i=0;i<8;i++) h.sql.exec('INSERT INTO intake_receipts VALUES(?,?)', 'fixture-padding-' + i, JSON.stringify({ id: 'fixture-padding-' + i, padding: 'x'.repeat(INTAKE_LIMITS.totalBytes/8) }));
+      for (let i=0;i<128;i++) h.sql.exec('INSERT INTO intake_receipts VALUES(?,?)', 'fixture-padding-' + i, JSON.stringify({ id: 'fixture-padding-' + i, padding: 'x'.repeat(INTAKE_LIMITS.totalBytes/128) }));
     });
-    before = await state(); expect((await call('/tasks', { key: 'globalcap', project: 'demo', title: 'x', text: 'x', source })).status).toBe(507); expect(await state()).toEqual(before);
+    // Hash each bounded record inside the DO instead of cloning a full
+    // 32 MiB ledger across the test transport twice to check rollback.
+    const compactState = () => inDO(stub(), async (h: any) => {
+      const receipts = [];
+      for (const { id } of h.sql.exec('SELECT id FROM intake_receipts ORDER BY id').toArray()) {
+        const { data } = h.sql.exec('SELECT data FROM intake_receipts WHERE id=?', id).one();
+        receipts.push({ id, digest: await sha256(data) });
+      }
+      return { receipts, tasks: h.sql.exec('SELECT * FROM intake_tasks ORDER BY id').toArray(), meta: h.sql.exec('SELECT * FROM intake_meta').toArray() };
+    });
+    before = await compactState(); expect((await call('/tasks', { key: 'globalcap', project: 'demo', title: 'x', text: 'x', source })).status).toBe(507); expect(await compactState()).toEqual(before);
   });
 });

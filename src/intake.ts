@@ -12,7 +12,11 @@ type Tx = <T>(fn: () => T) => T;
  * identities are never invented here. Absent outside the Hub composition. */
 export type IntakeHooks = { startSession?: (input: Obj, auth: Auth) => Promise<{ status: number; body: any }> };
 export const INTAKE_LIMITS = { request: 32768, tasks: 256, taskBytes: 131072, events: 128,
-  grants: 256, rules: 128, receipts: 8192, totalBytes: 4194304, page: 25 };
+  // Original requests and exact lost-response receipts are retained together.
+  // The former 4 MiB budget blocked real intake after the initial backfill
+  // and normal context updates. Keep an explicit 32 MiB aggregate bound;
+  // per-task, per-record, event and count limits still apply independently.
+  grants: 256, rules: 128, receipts: 8192, totalBytes: 32 * 1024 * 1024, page: 25 };
 const OPEN = ['open', 'in_progress', 'blocked', 'pending_approval'];
 const STATUSES = [...OPEN, 'done', 'cancelled'];
 /** Live Hub session states that keep a task assignment active. Anything else
