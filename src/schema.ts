@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS credentials (
   created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL,
   revoked_at TEXT,
-  last_used_at TEXT
+  last_used_at TEXT,
+  approval_seq INTEGER -- R5 R2 enrollment authority inherited at issuance and preserved across refresh, NULL is pre-migration legacy
 );
 
 CREATE TABLE IF NOT EXISTS device_pairings (
@@ -40,7 +41,8 @@ CREATE TABLE IF NOT EXISTS device_pairings (
   interval_s INTEGER NOT NULL,
   last_poll_at TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  expires_at TEXT NOT NULL
+  expires_at TEXT NOT NULL,
+  approved_seq INTEGER -- R5 R2 approval authority assigned at operator approval, NULL is pending or pre-migration
 );
 
 CREATE TABLE IF NOT EXISTS machines (
@@ -56,7 +58,8 @@ CREATE TABLE IF NOT EXISTS machines (
   last_checkin_at TEXT,
   last_heartbeat JSON,
   drained INTEGER NOT NULL DEFAULT 0,
-  notes TEXT
+  notes TEXT,
+  approval_seq INTEGER -- R5 R2 current enrollment authority for this machine, NULL is pre-migration legacy
 );
 
 CREATE TABLE IF NOT EXISTS login_states (
