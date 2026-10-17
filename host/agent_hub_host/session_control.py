@@ -150,8 +150,8 @@ def wait_for_command(session_id, command_id, timeout, interval):
 
 
 def add_commands(sub):
-    root = sub.add_parser('sessions', help='Hub session orchestration: list/start/send/capture/stop with confirmed delivery')
-    commands = root.add_subparsers(dest='sessions_cmd', required=True)
+    root = sub.add_parser('sessions', help='Hub session orchestration: grouped lifecycle listing by default; list/start/send/capture/stop/cleanup/observe')
+    commands = root.add_subparsers(dest='sessions_cmd', required=False)
     listing = commands.add_parser('list', help='List sessions visible to this credential')
     listing.add_argument('--state')
     listing.add_argument('--limit', type=int, default=50)
@@ -194,11 +194,86 @@ def add_commands(sub):
     receive.add_argument('--aplexer-bin', default='aplexer', help='Native executable (default aplexer)')
     receive.add_argument('--limit', type=int, default=20, help='Max offers per cycle (1..20)')
     receive.add_argument('--sender-workspace', default=None, help='Pinned authorized native sender workspace for replyable sends (default: receiver own whoami workspace)')
+    cleanup = commands.add_parser('cleanup', help='Plan finished/superseded cleanup (dry-run default; --apply is refused until M15d)')
+    cleanup.add_argument('--apply', action='store_true', help='Act (M15c: server refuses explicitly; M15d owns the executor seam)')
+    cleanup.add_argument('--limit', type=int, default=50)
+    cleanup.add_argument('--owner', default=None, help='Scope to one owner (admins only; callers always see their own actor)')
+    cleanup.add_argument('--host', default=None, help='Scope to one machine id')
+    cleanup.add_argument('--task', default=None, help='Scope to one intake task id')
+    observe = commands.add_parser('observe', help='Record a machine-scoped lifecycle observation (host credential only; owner flags never accepted)')
+    observe.add_argument('--machine-id', required=True, help='Observed machine id (must match the host credential)')
+    observe.add_argument('--native-id', required=True, help='Observed native session id')
+    observe.add_argument('--observed-at', default=None, help='Explicit Z or ±HH:MM timestamp (default: server time)')
+    observe.add_argument('--limit-hit', action='store_true')
+    observe.add_argument('--limit-window', default=None)
+    observe.add_argument('--limit-reset', default=None)
+    observe.add_argument('--limit-zone', default=None)
+    observe.add_argument('--awaiting-alexey', action='store_true')
+    observe.add_argument('--awaiting-alexey-at', default=None)
+    observe.add_argument('--report-written', action='store_true')
+    observe.add_argument('--report-at', default=None)
+    observe.add_argument('--screen-done', action='store_true')
+    observe.add_argument('--terminal-evidence', choices=('explicit_completion', 'supersession_record'), default=None)
+    observe.add_argument('--terminal-evidence-at', default=None)
+    observe.add_argument('--authoritative-no-pending-proof', action='store_true')
+    observe.add_argument('--pending-obligations', action='store_true')
+    observe.add_argument('--has-active-children', action='store_true')
+    observe.add_argument('--has-unsubmitted-draft', action='store_true')
+    observe.add_argument('--has-unresolved-send-stop', action='store_true')
+    observe.add_argument('--worktree-missing', action='store_true')
+    observe.add_argument('--superseded-by', default=None)
+    observe.add_argument('--note', default=None, help='Opt-in free text (bounded, redacted server-side; reason codes preferred)')
 
 
 def execute(args):
     import uuid
     cmd = getattr(args, 'sessions_cmd', None)
+    if cmd is None:
+        # Default grouped needs-action lifecycle projection (M15c). The
+        # existing `list` spelling keeps the flat session intent listing.
+        return request('GET', '/api/sessions?view=lifecycle')
+    if cmd == 'cleanup':
+        from urllib.parse import quote
+        params = []
+        limit = int(getattr(args, 'limit', None) or 50)
+        params.append('limit=%d' % max(1, min(50, limit)))
+        for flag, name in (('owner', 'owner'), ('host', 'host'), ('task', 'task')):
+            value = getattr(args, flag, None)
+            if value:
+                params.append('%s=%s' % (name, quote(str(value), safe='')))
+        path = '/api/sessions/cleanup'
+        if params:
+            path += '?' + '&'.join(params)
+        if getattr(args, 'apply', False):
+            # M15c has no safe execution path: the server refuses explicitly
+            # (apply_not_available + M15d seam). Never claim success here.
+            return request('POST', path, {'apply': True})
+        # Dry-run default: read-only plan, zero server mutation.
+        return request('POST', path, {'dry_run': True})
+    if cmd == 'observe':
+        from .session_lifecycle import build_observation_payload
+        fields = {}
+        if getattr(args, 'limit_hit', False):
+            fields['limit_hit'] = True
+        for flag, name in (('limit_window', 'limit_window'), ('limit_reset', 'limit_reset_at'),
+                           ('limit_zone', 'limit_zone'), ('awaiting_alexey_at', 'awaiting_alexey_at'),
+                           ('report_at', 'report_at'), ('terminal_evidence', 'terminal_evidence'),
+                           ('terminal_evidence_at', 'terminal_evidence_at'), ('superseded_by', 'superseded_by')):
+            value = getattr(args, flag, None)
+            if value:
+                fields[name] = value
+        for flag in ('awaiting_alexey', 'report_written', 'screen_done', 'authoritative_no_pending_proof',
+                     'pending_obligations', 'has_active_children', 'has_unsubmitted_draft',
+                     'has_unresolved_send_stop', 'worktree_missing'):
+            if getattr(args, flag, False):
+                fields[flag] = True
+        if getattr(args, 'note', None):
+            fields['observation_note'] = args.note
+        payload = build_observation_payload(fields)
+        body = {'machine_id': args.machine_id, 'native_id': args.native_id, 'payload': payload}
+        if getattr(args, 'observed_at', None):
+            body['observed_at'] = args.observed_at
+        return request('POST', '/api/sessions/observations', body)
     if cmd == 'list':
         wanted = getattr(args, 'state', None)
         limit = int(getattr(args, 'limit', None) or 50)
