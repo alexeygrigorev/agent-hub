@@ -1,18 +1,43 @@
-# M15 Session Lifecycle Registry (proposal — safe module only, integration pending head ACK)
+# M15 Session Lifecycle Registry (M15c LIVE: durable canonical API + CLI)
 
-Source: Alexey Addendum 5 (`hub-intake-brief.md`). Statuses here are design intent for the
-safe module/projection; the full hub feature (routes/CLI wiring/host execution) is NOT shipped
-until the integration seams below are ACKed, an independent different-provider review passes,
-and real host acceptance happens later.
+Source: Alexey Addendum 5 (`hub-intake-brief.md`). Statuses here are live:
+the durable seams below are wired, tested (HTTP/SQLite + CLI), and merged
+to main. `--apply` stays explicitly refused; the executor is M15d (next,
+head-assigned).
 
-## What exists in this change
+## What exists (M15c shipped)
 
-- `src/session_lifecycle.ts` — CANONICAL pure M15a projection + M15b plan/executor seam + shared DTO seam.
-- `host/agent_hub_host/session_lifecycle.py` — host-only stdlib guards + thin transport (`sanitize_observation_text`, strict `_parse_ms`, `validate_cleanup_target`, `validate_ownership_transfer`). No `classify_session` / `project_sessions` / `plan_cleanup` / DTO duplicates (M15-F6 single authority).
-- Tests (synthetic fixtures only): `test/session-lifecycle.test.ts` + NEW `test/session-lifecycle-r2.test.ts`, `host/tests/test_session_lifecycle.py` (host guards) + NEW `host/tests/test_session_lifecycle_r2.py`. Vitest pool: legacy `test/vitest.session-lifecycle.config.ts` unchanged; new `test/vitest.session-lifecycle-r2.config.ts` runs old + r2 together with isolated `.local/lifecycle-r2/vite-cache` (Argon used private existing/novel configs; Node-only Vitest is legitimate here because all covered functions are pure with no HTTP/runtime effects — real HTTP/SQLite stays OPEN M15c).
-- No edits to `src/hub.ts`, `src/schema.ts`, `src/session_control.ts` (does not exist on main yet),
-  `host/agent_hub_host/cli.py`, or any `session_control.py` (R3 candidate stays readonly in
-  `../agent-hub-wt-platform-session-r3`). No duplicate registry/controller/quota/lease store.
+- `src/session_lifecycle.ts` — CANONICAL pure M15a projection + M15b plan/executor seam + shared DTO seam (unchanged authority).
+- `src/session_lifecycle_registry.ts` (NEW) — ONE durable/server authority:
+  canonical joins (`session_control_*` + `fleet_launches`/`fleet_sessions` +
+  intake canonical links), additive observation/decision storage, grouped
+  view builder, dry-run planner, apply refusal. No second classifier.
+- `src/session_control.ts` (narrow lifecycle wiring only; command
+  auth/effect code preserved) — `init()` creates the additive
+  observations/decisions tables; `handle()` serves:
+  `GET /api/sessions?view=lifecycle`, `POST /api/sessions/observations`,
+  `POST /api/sessions/cleanup` (dry-run default; apply refused).
+- `host/agent_hub_host/session_lifecycle.py` — host-only stdlib guards +
+  thin transport (`sanitize_observation_text`, strict `_parse_ms` with
+  explicit UTC-offset range check, `validate_cleanup_target`,
+  NON-AUTHORITATIVE `validate_ownership_transfer` pre-flight,
+  allowlisted `build_observation_payload`). Host DDL copy retired: table
+  DDL authority is the server schema string only.
+- CLI (`hub sessions`, session subcommands only in
+  `host/agent_hub_host/session_control.py`): bare `hub sessions` returns
+  the grouped lifecycle projection; `hub sessions cleanup` plans dry-run
+  by default; `hub sessions observe` posts machine-scoped observations.
+  Existing `list/start/send/capture/stop` preserved, no substitute
+  `lifecycle-*` spelling.
+- Tests (synthetic fixtures only): `test/session-lifecycle-m15c.test.ts`
+  (7 HTTP/SQLite cases) + `test/vitest.session-lifecycle-m15c.config.ts`,
+  `host/tests/test_session_lifecycle_m15c.py` (10 transport/CLI cases).
+  Pre-existing suites still green: session-control 26/26, lifecycle pure
+  10/10, host lifecycle/control 25/25. `host/tests/test_session_control_loop.py`
+  cannot load in this env (pre-existing: requires pytest, not installed).
+- No edits to `src/hub.ts`, `src/schema.ts`, `src/intake.ts`,
+  `host/agent_hub_host/cli.py`, or any `session_control.py` outside the
+  `sessions` subcommands. No duplicate registry/controller/quota/lease store.
 
 ## Canonical reuse (no second tracker)
 
@@ -27,7 +52,9 @@ and real host acceptance happens later.
   `session_lifecycle_observations` + `session_lifecycle_decisions` with `IF NOT EXISTS`
   ONLY where canonical existing event data cannot represent the fact; session
   identity/provenance/control state are never duplicated.
-  Requested seam (head ACK needed): call the init beside existing fleet/intake init in `src/hub.ts`;
+  Landed M15c: `SessionControlService.init` creates the additive tables
+  beside the existing session-control schema (no ALTERs to existing
+  tables, no global-schema migration);
   no ALTERs to existing tables.
 
 ## Ownership (dedicated transfer op, not tag text)
@@ -38,7 +65,7 @@ and real host acceptance happens later.
   Epochs must be non-bool safe integers `>= 0` (TS `Number.isSafeInteger`, Python
   `isinstance(int) and not bool`); booleans/negatives/non-safe fail. Generic intake note/decision text is NEVER a transfer. `unknown`/`legacy`/blank/whitespace never applies, for `new_owner`, `current_owner`, `expected_owner`, `owner`, `callerOwner`, and `owner_provenance` (`authenticated_handoff`/`starter` only).
   `validateCleanupTarget` additionally requires exact non-empty valid `expected_machine_id` / `expected_native_id` / `expected_owner` binding (`unbound_target` / `unknown_owner_never_applies` fail closed); blank/None IDs never pass even on exact match.
-  Eligibility inputs are TRUSTED canonical-server joins/context only; payload bools/strings never authenticate (real HTTP/SQLite auth is M15c OPEN).
+  Eligibility inputs are TRUSTED canonical-server joins/context only; payload bools/strings never authenticate (real HTTP/SQLite auth landed in M15c).
 - Arbitrary JSON `owner` tags are untrusted input. Admin privilege is NOT another
   coordinator's ownership. `human`/Alexey sessions are permanently protected (never
   disabled, never transferred except a legitimate authenticated transfer of a non-human record).
@@ -101,26 +128,50 @@ server eligibility), not a second registry or fake apply.
   repos/processes wholly inside the owned private test `TMPDIR` may be used; real worktrees,
   histories, and sources stay preserved.
 
-## Proposed contracts (need head + M12 worker ACK; canonical sessions surface only)
+## Live contracts (M15c shipped, tested)
 
-- `GET /api/sessions?view=lifecycle` grouped projection (additive view param; never a second
-  `/api/lifecycle` registry); `GET /api/sessions/:id` single; `POST /api/sessions/cleanup`
-  (dry-run default; apply is OPEN M15c/d); decisions ride the existing POST decision seam
-  (durable server decisions are OPEN M15c/d).
-- CLI: `hub sessions` defaults to the grouped lifecycle listing + `hub sessions cleanup [--apply]`
-  (dry-run default). Existing `list/start/send/capture/stop` are preserved; no substitute
-  `lifecycle-*` spelling. No fake apply success is shipped; the TS server is the single
-  classification/planning authority and the Python host owns only observation/execution
-  guards + thin transport.
+- `GET /api/sessions?view=lifecycle` grouped projection (additive view
+  param; never a second `/api/lifecycle` registry). Writer auth; non-admin
+  callers are scoped to their own actor, admins may filter
+  `?owner=&host=&task=`. Each entry carries the pure DTO (`group/state/
+  reasons/flags/obligations`), `refs` (session/fleet/task/brief/report
+  references where recorded, nulls where unknown), and the latest durable
+  `decision` (limit-blocked sessions append it to reasons).
+- `POST /api/sessions/observations` — host-only machine-scoped writes
+  (host credential must match `machine_id`; live family + machine registry
+  re-verified in-txn) or admin operator records. Owner/starter/human
+  identity keys are dropped server-side; unknown fields fail closed.
+- `POST /api/sessions/decisions` — owner-only limit-block decisions
+  (`resume_on_reset`/`reassign`/`drop` with actor/time/reason; engine
+  required for resume/reassign, target required for reassign). The session
+  must currently classify `limit_blocked`, must not be human-owned, and the
+  caller must be the live owner (agent credential + family + incarnation).
+  Admins are never another coordinator's owner (404, never oracle).
+  Decisions persist in SQLite across restarts and feed the projection.
+- `POST /api/sessions/cleanup` — dry-run default (`{dry_run:true}` or
+  empty body): pure plan over the caller's scope, ZERO writes. `{apply:true}`
+  always refuses `409 apply_not_available` with the exact M15d next seam.
+  No fake apply success exists anywhere in this slice.
+- CLI: `hub sessions` defaults to the grouped lifecycle listing +
+  `hub sessions cleanup [--apply] [--owner/--host/--task]` (dry-run
+  default; `--apply` surfaces the server refusal) + `hub sessions observe`
+  (host observation transport). Existing `list/start/send/capture/stop`
+  are preserved; no substitute `lifecycle-*` spelling. The TS server is
+  the single classification/planning authority and the Python host owns
+  only observation/execution guards + thin transport.
 
-## Next integration seams (proposal; no imports or shared edits in this slice)
+## Integration seams (landed M15c; M15d next)
 
-- Canonical M12 records stay source of truth; reference READONLY primary M12 freeze
-  `../agent-hub-wt-platform-session-r3` source `1f4e3007c1d5d02217861d5d1f1812549e7186c1`
-  (not imported): server joins from `fleet_sessions` / `fleet_launches` / intake `link` /
-  `session_control_*` supply the TRUSTED owner/epoch/provenance/activity inputs for the gates above.
-  Durable SQLite decisions, `--apply` Git/worktree/process guards, and runtime acceptance are M15c/d OPEN
-  pending accepted M12 canonical integration. No second DB/controller; no fake product completion.
+- Canonical M12 records stay source of truth: server joins from
+  `fleet_sessions` / `fleet_launches` / intake `link` /
+  `session_control_*` supply the TRUSTED owner/epoch/provenance/activity
+  inputs for the gates. Only bound/observed native identities are keyed;
+  unbound queued/held intents stay in the existing flat `list` view.
+  No second DB/controller; no fake product completion.
+- M15d (NEXT, head-assigned): the `--apply` executor seam — host-side
+  machine/native/owner revalidation, containment, owned per-session
+  worktree/branch clean-and-merged guards, plus live throwaway acceptance.
+  Until then `--apply` refuses explicitly (`apply_not_available`).
 
 ## Tests
 
