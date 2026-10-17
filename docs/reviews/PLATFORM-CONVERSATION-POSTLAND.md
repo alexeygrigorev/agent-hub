@@ -5,7 +5,9 @@
 - **This auditor**: `platform-postland-factual-audit` / `grok-4.6` (session `e5aa637d-2b18-4f1f-b9ae-203ee6951eb3`)
 - **Attributed Argon source review** (distinct identity; not replaced): `platform-postland-review` / `gemini-4-argon-high` (session `4d1c2347-80d5-4c23-acfb-996868462c01`) **SCOPED ACCEPT** of exact `16d66d69708268ab84089447534f0439e0bfd893` (`Review: approved sha=16d66d69708268ab84089447534f0439e0bfd893 reviewer=platform-postland-review/gemini-4-argon-high`). Probe/manifest execution remains theirs. This file is a publication pin/API/path audit only.
 
-`c1951e2c9f6a953cf876df9e5cdacb4cbfafbb39` stays in Git unchanged. This file is a separate corrective audit on parent `16d66d69708268ab84089447534f0439e0bfd893`. It is not a replacement Argon gate, live deploy, or physical-delivery proof.
+`c1951e2c9f6a953cf876df9e5cdacb4cbfafbb39` stays in Git unchanged. The independent corrective commit `a5685edd1f066e09c73a03c008f3476f85e24acc` has parent `c1951e2c9f6a953cf876df9e5cdacb4cbfafbb39` and audits source `16d66d69708268ab84089447534f0439e0bfd893`. It is not a replacement Argon gate, live deploy, or physical-delivery proof.
+
+Publication annotation by head `platform/GPT-6`: the corrective audit’s parent is normalized above; its original commit remains immutable. The parallel-object table is an audit-input snapshot, not a live tracker. Source and attributed Argon verdict are unchanged. A separate head `tsc --noEmit` run on exact `16d66d6` completed with exit 0; receipt `agent-coordination/.local/platform/postland-head-typecheck.json`. This is new head evidence, not a retroactive Argon exit receipt.
 
 ## Correction categories (original `c195` was not accurate in these)
 
