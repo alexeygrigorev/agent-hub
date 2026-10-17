@@ -70,8 +70,23 @@ function cwdOk(value: unknown): value is string {
 function absoluteWorkspaceOk(value: unknown): value is string {
   if (typeof value !== 'string' || !value || value.length > 512) return false;
   if (!value.startsWith('/') || value.includes('\\') || /[\x00-\x1f\x7f]/.test(value)) return false;
-  return value.split('/').every(seg => seg !== '..');
+  const parts = value.split('/');
+  if (parts[0] !== '' || parts.length < 2) return false;
+  return parts.slice(1).every(seg => seg.length > 0 && seg !== '.' && seg !== '..' && /^[A-Za-z0-9._-]{1,64}$/.test(seg));
 }
+
+/** A workspace identifier is either a configured label (legacy, unchanged)
+ * or an explicitly allowed absolute POSIX path (bounded canonical form
+ * above; exact-match against host-advertised capabilities plus the trusted
+ * host settings mapping still required downstream). */
+function workspaceOk(value: unknown): value is string {
+  return label(value) || absoluteWorkspaceOk(value);
+}
+
+/** Friendly session names: stored in request_json, shown in list/view, never
+ * identity or authority. URL-safe, bounded, exact-match only. */
+const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const nameOk = (x: unknown): x is string => typeof x === 'string' && NAME_RE.test(x);
 
 async function body(request: Request): Promise<any> {
   if (!request.body) return null;
@@ -373,10 +388,41 @@ export class SessionControlService {
     return {
       id: row.id, state: row.state, machine: row.machine_id ?? null, engine: row.engine ?? null,
       mode: row.mode, access: request.access?.mode || 'legacy_unspecified',
+      // Friendly name from the stored start intent (null when unnamed). The
+      // name is display only: control routes stay Hub-UUID addressed, with an
+      // actor-scoped exact-name alias where explicitly resolved below.
+      name: typeof request.name === 'string' ? request.name : null,
       fleet_launch_id: row.fleet_launch_id ?? null,
       binding: row.binding_json ? parsed(row.binding_json, null) : null,
       created_at: row.created_at, updated_at: row.updated_at,
     };
+  }
+
+  /** Actor-scoped exact name alias (read/control convenience only).
+   *
+   * Names are not identity: resolution matches the stored start-intent name
+   * exactly within the caller's own actor scope (admins resolve within their
+   * own actor too, never across owners), and never matches native tags.
+   * Zero matches render as not_found (never an oracle); more than one
+   * renders as ambiguous_name (409, refused) — the caller must use the Hub
+   * UUID. The exact Hub UUID stays the canonical control address. */
+  private resolveSessionByName(name: string, caller: Caller): { ok: true; session: any } | { ok: false; error: string; status: number } {
+    if (!nameOk(name)) return { ok: false, error: 'not_found', status: 404 };
+    const scope = caller.actor || caller.machineId || 'admin';
+    let rows: any[];
+    try {
+      rows = this.sql.exec('SELECT * FROM session_control_sessions WHERE actor = ?', scope).toArray() as any[];
+    } catch {
+      return { ok: false, error: 'not_found', status: 404 };
+    }
+    const matches = rows.filter(r => {
+      if (!this.ownerOk(r, caller)) return false;
+      const request = parsed(r.request_json, {});
+      return request.name === name;
+    });
+    if (matches.length === 0) return { ok: false, error: 'not_found', status: 404 };
+    if (matches.length > 1) return { ok: false, error: 'ambiguous_name', status: 409 };
+    return { ok: true, session: matches[0] };
   }
 
   /** Cursor pagination over (created_at, id): complete pages, no silent truncation. */
@@ -605,10 +651,11 @@ export class SessionControlService {
     if (path === '/api/sessions' && request.method === 'POST') {
       if (!writer) return response({ error: 'forbidden' }, 403);
       const input = await body(request);
-      if (!obj(input, ['key', 'engine', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode']) ||
-          !label(input.key) || !label(input.workspace) ||
+      if (!obj(input, ['key', 'engine', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name']) ||
+          !label(input.key) || !workspaceOk(input.workspace) ||
           (input.engine !== undefined && !label(input.engine)) ||
           (input.machine !== undefined && !label(input.machine)) ||
+          (input.name !== undefined && !nameOk(input.name)) ||
           (input.cwd !== undefined && !cwdOk(input.cwd)) ||
           (input.mode !== undefined && !['headless', 'interactive'].includes(input.mode)) ||
           (input.brief !== undefined && (typeof input.brief !== 'string' || !input.brief.trim() || input.brief.length > 8000))) {
@@ -642,7 +689,7 @@ export class SessionControlService {
       const canonical = JSON.stringify({
         engine: input.engine ?? null, machine: input.machine ?? null,
         workspace: input.workspace, cwd: input.cwd ?? null, brief: input.brief ?? null,
-        mode, access: input.access ?? null,
+        mode, access: input.access ?? null, name: input.name ?? null,
       });
       return this.transaction(() => {
         const prior: any = this.sql.exec(
@@ -931,10 +978,27 @@ export class SessionControlService {
       return response(planCleanupDryRun(this.sql, scope, caller.actor ?? '', this.now()));
     }
 
-    const sessionMatch = /^\/api\/sessions\/([a-f0-9-]{36})(\/(send|capture|stop|commands|binding))?$/.exec(path);
+    const sessionMatch = /^\/api\/sessions\/([^/]{1,128})(\/(send|capture|stop|commands|binding))?$/.exec(path);
     if (sessionMatch) {
-      const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionMatch[1]).toArray()[0];
+      const rawRef = sessionMatch[1];
       const sub = sessionMatch[3];
+      let session: any = null;
+      if (UUID_RE.test(rawRef)) {
+        session = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', rawRef).toArray()[0] ?? null;
+      } else {
+        // Friendly-name alias: actor-scoped exact match only (never a native
+        // tag, never a foreign session, never latest-wins). Ambiguous names
+        // are refused with 409; unknown names render as not_found. The host
+        // binding path stays strict Hub UUID (no alias).
+        if (sub === 'binding') return response({ error: 'not_found' }, 404);
+        if ((sub === undefined && request.method !== 'GET') ||
+            (sub !== undefined && !(['send', 'capture', 'stop'].includes(sub) ? request.method === 'POST' : request.method === 'GET'))) {
+          return response({ error: 'not_found' }, 404);
+        }
+        const resolved = this.resolveSessionByName(rawRef, caller);
+        if (!resolved.ok) return response({ error: resolved.error }, resolved.status);
+        session = resolved.session;
+      }
       if (sub === 'binding') {
         // Host-only native binding report: the Fleet result -> native binding
         // reconciliation path. The fleet offer was already claimed through the

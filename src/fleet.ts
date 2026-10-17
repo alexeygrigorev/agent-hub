@@ -27,6 +27,29 @@ function disabledEngines(): Set<string> {
 const HEADERS = { 'Cache-Control': 'private, no-store' };
 function response(value: unknown, status = 200) { return Response.json(value, { status, headers: HEADERS }); }
 function label(value: unknown): value is string { return typeof value === 'string' && LABEL.test(value); }
+/** Absolute POSIX workspace identifiers, accepted ALONGSIDE existing labels.
+ *
+ * An absolute workspace is never a free-form path: it must be a bounded
+ * canonical path (no NUL/control chars, no backslashes, no `//`, no trailing
+ * slash, no `.`/`..` segments, segments confined to `[A-Za-z0-9._-]{1,64}`).
+ * Acceptance additionally requires an explicit trusted mapping on BOTH ends:
+ * the host must advertise the exact string in its capabilities `workspaces`
+ * (from its operator-configured settings) and the launch route must match a
+ * configured route. Unadvertised or unmapped paths are refused before any
+ * claim or native effect. Host realpath/CWD confinement stays authoritative. */
+const WORKSPACE_SEG = /^[A-Za-z0-9._-]{1,64}$/;
+function absoluteWorkspaceOk(value: unknown): value is string {
+  if (typeof value !== 'string' || !value || value.length > 512) return false;
+  if (!value.startsWith('/') || value.includes('\\') || /[\x00-\x1f\x7f]/.test(value)) return false;
+  const parts = value.split('/');
+  if (parts[0] !== '' || parts.length < 2) return false;
+  return parts.slice(1).every(seg => seg.length > 0 && seg !== '.' && seg !== '..' && WORKSPACE_SEG.test(seg));
+}
+/** A workspace identifier is either a configured label or an explicitly
+ * allowed absolute POSIX path. Labels keep their exact legacy meaning. */
+function workspaceOk(value: unknown): value is string {
+  return label(value) || absoluteWorkspaceOk(value);
+}
 /** Hub-side shape check for a requested working directory relative to the
  * workspace root: relative, confined (no traversal), bounded segments. The
  * host resolves it against allowlisted canonical roots with symlink
@@ -175,7 +198,7 @@ export class FleetService {
 
   plan(input: any) {
     if (!object(input, ['mode', 'machine', 'engine', 'tier', 'account', 'workspace', 'cwd', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access', 'approved_action']) ||
-      !label(input.workspace) || (input.mode !== undefined && !['headless', 'interactive'].includes(input.mode)) ||
+      !workspaceOk(input.workspace) || (input.mode !== undefined && !['headless', 'interactive'].includes(input.mode)) ||
       (input.account !== undefined && !label(input.account)) || (input.machine !== undefined && !label(input.machine)) || (input.engine !== undefined && !label(input.engine)) ||
       // Optional tier/cwd arrive as null (not just undefined) from the
       // session-control reserve handoff when the client omitted them; null
@@ -309,7 +332,7 @@ export class FleetService {
       const names = new Set<string>();
       const rows: { workspace: string; project: string | null; require_claim: boolean }[] = [];
       for (const item of data.workspaces) {
-        if (!object(item, ['workspace', 'project', 'require_claim']) || !label(item.workspace) || (item.project !== null && !label(item.project)) || typeof item.require_claim !== 'boolean' || names.has(item.workspace)) return response({ error: 'invalid_claim_policy' }, 400);
+        if (!object(item, ['workspace', 'project', 'require_claim']) || !workspaceOk(item.workspace) || (item.project !== null && !label(item.project)) || typeof item.require_claim !== 'boolean' || names.has(item.workspace)) return response({ error: 'invalid_claim_policy' }, 400);
         names.add(item.workspace);
         rows.push({ workspace: item.workspace, project: item.project, require_claim: item.require_claim });
       }
