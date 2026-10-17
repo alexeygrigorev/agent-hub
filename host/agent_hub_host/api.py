@@ -57,7 +57,9 @@ def canonical_origin(url: str) -> tuple:
     port = int(parsed.port) if parsed.port is not None else (443 if scheme == 'https' else 80)
     return (scheme, host, port)
 
-def safe_http_json(req: urllib.request.Request, timeout: float = 10.0):
+def safe_http_json(req: urllib.request.Request, timeout: float = 10.0, *, _token_exchange=None):
+    if _token_exchange is not None:
+        _token_exchange.begin(req)
     opener = _get_opener()
     try:
         with opener.open(req, timeout=timeout) as res:
@@ -71,13 +73,8 @@ def safe_http_json(req: urllib.request.Request, timeout: float = 10.0):
             if len(body) > 10 * 1024 * 1024:
                 raise RuntimeError("Response too large")
             data = json.loads(body.decode("utf-8"))
-            if isinstance(data, dict) and getattr(req, "full_url", "").rstrip("/").endswith("/api/device/token"):
-                if "machine_id" in data and data["machine_id"] is not None:
-                    config.record_authenticated_machine_binding(
-                        req.full_url,
-                        data["machine_id"],
-                        data.get("access_token"),
-                    )
+            if _token_exchange is not None:
+                _token_exchange.record(data)
             return data
     except urllib.error.HTTPError as e:
         raise

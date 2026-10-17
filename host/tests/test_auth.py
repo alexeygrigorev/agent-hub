@@ -8,7 +8,7 @@ from agent_hub_host import auth, config
 
 class TestAuth(unittest.TestCase):
     @patch("urllib.request.OpenerDirector.open")
-    @patch("agent_hub_host.config.update_config")
+    @patch("agent_hub_host.config.save_config")
     @patch("agent_hub_host.config.load_config")
     def test_device_flow_success(self, mock_load_config, mock_update_config, mock_urlopen):
         mock_load_config.return_value = {}
@@ -41,11 +41,12 @@ class TestAuth(unittest.TestCase):
         mock_urlopen.side_effect = [code_resp, pending_error, success_resp]
         
         auth.device_login("https://fake", "host", "agent-hub-host", "host", auth.HOST_SCOPES)
-        mock_update_config.assert_called_once_with(access_token="acc123", refresh_token="ref123", base_url="https://fake", client_kind="host", client_name="agent-hub-host", requested_scopes=auth.HOST_SCOPES)
+        mock_update_config.assert_called_once_with(dict(access_token="acc123", refresh_token="ref123", base_url="https://fake", client_kind="host", client_name="agent-hub-host", requested_scopes=auth.HOST_SCOPES))
 
     @patch("urllib.request.OpenerDirector.open")
-    @patch("agent_hub_host.config.update_config")
-    def test_device_flow_slowdown_and_deny(self, mock_update_config, mock_urlopen):
+    @patch("agent_hub_host.config.save_config")
+    @patch("agent_hub_host.config.load_config", return_value={})
+    def test_device_flow_slowdown_and_deny(self, mock_load_config, mock_update_config, mock_urlopen):
         code_resp = MagicMock()
         code_resp.headers = {"Content-Type": "application/json"}
         code_resp.read.return_value = json.dumps({
@@ -69,10 +70,11 @@ class TestAuth(unittest.TestCase):
         
         with self.assertRaisesRegex(RuntimeError, "Access denied by user."):
             auth.device_login("https://fake", "host", "agent-hub-host", "host", auth.HOST_SCOPES)
+        mock_update_config.assert_not_called()
 
     @patch("urllib.request.OpenerDirector.open")
     @patch("agent_hub_host.config.load_config")
-    @patch("agent_hub_host.config.update_config")
+    @patch("agent_hub_host.config.save_config")
     def test_refresh_token_success(self, mock_update_config, mock_load_config, mock_urlopen):
         mock_load_config.return_value = {"refresh_token": "ref123", "base_url": "https://fake"}
         
@@ -86,7 +88,7 @@ class TestAuth(unittest.TestCase):
         
         token = auth.refresh_token()
         self.assertEqual(token, "new_acc")
-        mock_update_config.assert_called_once_with(access_token="new_acc", refresh_token="new_ref")
+        mock_update_config.assert_called_once_with(dict(base_url="https://fake", access_token="new_acc", refresh_token="new_ref"))
 
     @patch("urllib.request.OpenerDirector.open")
     @patch("agent_hub_host.config.load_config")
@@ -104,5 +106,6 @@ class TestAuth(unittest.TestCase):
         
         res = auth.refresh_token()
         self.assertEqual(res, "acc999")
-        mock_clear_config.assert_called_once()
+        # Keep the old private config until a successful replacement is saved.
+        mock_clear_config.assert_not_called()
         mock_device_login.assert_called_once()

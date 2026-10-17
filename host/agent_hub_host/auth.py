@@ -38,11 +38,13 @@ def _shared_device_login():
     )
 
 
-def _post_device(url, body):
+def _post_device(url, body, _token_exchange=None):
     request = urllib.request.Request(
         url, data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"},
     )
     try:
+        if _token_exchange is not None and url == _token_exchange.url:
+            return 200, api.safe_http_json(request, _token_exchange=_token_exchange)
         return 200, api.safe_http_json(request)
     except urllib.error.HTTPError as exc:
         try:
@@ -56,11 +58,26 @@ def _post_device(url, body):
 
 def device_login(base_url: str, client_kind: str, name: str, hostname: str, requested_scopes: list):
     api.check_url(base_url)
+    exchange = config._TokenExchange(base_url, "/api/device/token", config.load_config())
     flow = _shared_device_login()
     try:
-        token_res = flow.device_login(
+        token_res = _run_device_login(flow, exchange, base_url, client_kind, name, hostname, requested_scopes)
+        exchange.commit(
+            token_res,
+            client_kind=client_kind,
+            client_name=name,
+            requested_scopes=list(requested_scopes),
+        )
+    finally:
+        exchange.close()
+    print("Login successful.")
+
+
+def _run_device_login(flow, exchange, base_url, client_kind, name, hostname, requested_scopes):
+    try:
+        return flow.device_login(
             base_url,
-            _post_device,
+            lambda url, body: _post_device(url, body, exchange),
             start_path="/api/device/code",
             token_path="/api/device/token",
             start_body={
@@ -80,16 +97,7 @@ def device_login(base_url: str, client_kind: str, name: str, hostname: str, requ
             raise RuntimeError("Device code expired.") from None
         if exc.code == "invalid_response":
             raise RuntimeError("The server did not offer device login.") from None
-        raise RuntimeError(str(exc)) from None
-    config.update_config(
-        access_token=token_res["access_token"],
-        refresh_token=token_res.get("refresh_token"),
-        base_url=base_url,
-        client_kind=client_kind,
-        client_name=name,
-        requested_scopes=list(requested_scopes),
-    )
-    print("Login successful.")
+        raise RuntimeError("Device login failed.") from None
 
 import threading
 _refresh_lock = threading.Lock()
@@ -102,7 +110,8 @@ def refresh_token():
         if not refresh or not base_url:
             raise RuntimeError("No refresh token or base URL available. Please login.")
             
-        token_url = f"{base_url}/api/token/refresh"
+        exchange = config._TokenExchange(base_url, "/api/token/refresh", cfg)
+        token_url = exchange.url
         token_payload = json.dumps({
             "grant_type": "refresh_token",
             "refresh_token": refresh
@@ -110,11 +119,8 @@ def refresh_token():
         
         req = urllib.request.Request(token_url, data=token_payload, headers={"Content-Type": "application/json"})
         try:
-            token_res = api.safe_http_json(req)
-            config.update_config(
-                access_token=token_res["access_token"],
-                refresh_token=token_res.get("refresh_token", refresh)
-            )
+            token_res = api.safe_http_json(req, _token_exchange=exchange)
+            exchange.commit(token_res)
             return token_res["access_token"]
         except urllib.error.HTTPError as e:
             should_repair = False
@@ -130,11 +136,9 @@ def refresh_token():
                     pass
             
             if should_repair:
-                config.clear_config()
                 kind = cfg.get('client_kind', 'host')
                 name = cfg.get('client_name', 'agent-hub-host')
                 scopes = cfg.get('requested_scopes', AGENT_SCOPES if kind == 'agent' else HOST_SCOPES)
-                config.update_config(base_url=base_url, client_kind=kind, client_name=name, requested_scopes=scopes)
                 from . import system
                 print(f"Refresh failed (code {e.code} revocation), pairing required again.")
                 device_login(base_url, kind, name, system.get_hostname(), scopes)
@@ -143,6 +147,8 @@ def refresh_token():
                 raise RuntimeError(f"Transient HTTP error during refresh: {e.code}")
         except urllib.error.URLError as e:
             raise RuntimeError(f"Network error during refresh: {e}")
+        finally:
+            exchange.close()
 
 def get_access_token() -> str:
     cfg = config.load_config()
