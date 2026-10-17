@@ -118,6 +118,19 @@ Reads join the latest observation per (session, kind) onto already-visible
 `host_reported: true` with `source: host_observation` provenance). Host
 fields stay data, never operator instructions.
 
+Maintained collector: `host/agent_hub_host/status_collect.py` (stdlib
+only, standalone `python3 -m agent_hub_host.status_collect --once
+--allowlist PATH --sessions-json PATH [--submit]`). Reads only
+registered/linked sessions (workspace realpath under allowlisted
+`session_roots`, optional `sessions` registry) and allowlisted `reports`
+entries (path under `report_roots`, bound to a collected session).
+Session states come only from explicit structured markers
+(`limit_exhausted/context_low/draft_pending/working/waiting/idle`,
+limit-first precedence; anything else is `unknown`, never inferred from
+text). Headlines are first-heading-only (≤240 chars, sanitized); verdicts
+are explicit config (`done/attention`, default `unknown`). Absent/invalid
+allowlist fails closed (exit 2, collects nothing).
+
 ## Pagination and `--since`
 
 `limit` 1..25 (default 25), `after` task id, `project/task/host` filters,
