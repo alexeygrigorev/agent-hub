@@ -3,11 +3,17 @@ import { Env } from "./env";
 import { sha256 } from "./auth/crypto";
 import { getSession } from "./auth/session";
 
-export const QUOTA_SCHEMA_version = "1.0";
+export const QUOTA_SCHEMA_version = "1.1";
+export const QUOTA_SCHEMA_VERSIONS = new Set<string>(["1.0", "1.1"]);
 export const QUOTA_MAX_BODY_BYTES = 32_768;
 export const QUOTA_STALE_MS = 1_200_000; // 1200 seconds (20 minutes) conservative boundary
 export const MAX_WINDOWS_PER_PROVIDER = 32;
 export const WINDOW_NAME_REGEX = /^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/;
+export const NATIVE_UNITS = new Set<string>(["percent", "credits", "usd_cents", "requests", "tokens"]);
+export const PROFILE_LABEL_REGEX = /^[A-Za-z0-9][A-Za-z0-9_./-]{0,63}$/;
+export const COLLECTOR_VERSION_REGEX = /^[A-Za-z0-9][A-Za-z0-9_.+/-]{0,63}$/;
+export const MAX_CREDITS_VALUE = 1e12;
+export const MAX_SPEND_VALUE = 1e15;
 
 export const ALLOWED_QUOTA_PROVIDERS = new Set<string>([
   "codex",
@@ -23,6 +29,7 @@ export const QUOTA_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS host_quota_snapshots (
   host_id TEXT PRIMARY KEY,
   schema_version TEXT NOT NULL,
+  collector_version TEXT,
   captured_at TEXT NOT NULL,
   captured_at_ms INTEGER NOT NULL,
   received_at TEXT NOT NULL,
@@ -42,6 +49,8 @@ const TOP_LEVEL_KEYS = new Set<string>([
   "routes",
 ]);
 
+const OPTIONAL_TOP_KEYS = new Set<string>(["collector_version"]);
+
 const ROUTE_KEYS = new Set<string>([
   "status",
   "error",
@@ -58,11 +67,38 @@ const WINDOW_KEYS = new Set<string>([
   "error",
 ]);
 
+// Schema 1.1 only: bounded provider-native usage fields. Unknown keys
+// (tokens, cookies, emails, raw output) are never allowlisted here.
+const OPTIONAL_WINDOW_KEYS = new Set<string>([
+  "credits_remaining",
+  "spend_used",
+  "spend_limit",
+  "unit",
+  "profile",
+]);
+
+const OPTIONAL_DETAILS_KEYS = new Set<string>([
+  "credits_remaining",
+  "spend_used",
+  "spend_limit",
+  "unit",
+  "profile",
+  "cooldown_until",
+]);
+
 const FORBIDDEN_PROTO_KEYS = new Set<string>([
   "__proto__",
   "constructor",
   "prototype",
 ]);
+
+export interface QuotaWindowNativeDTO {
+  credits_remaining: number | null;
+  spend_used: number | null;
+  spend_limit: number | null;
+  unit: "percent" | "credits" | "usd_cents" | "requests" | "tokens" | null;
+  profile: string | null;
+}
 
 export interface QuotaWindowDTO {
   percent_remaining: number | null;
@@ -70,12 +106,24 @@ export interface QuotaWindowDTO {
   present: boolean;
   rolling: boolean;
   error?: "unavailable" | null;
+  credits_remaining?: number | null;
+  spend_used?: number | null;
+  spend_limit?: number | null;
+  unit?: QuotaWindowNativeDTO["unit"];
+  profile?: string | null;
 }
 
 export interface QuotaRouteDetailsDTO {
   limit_reached: boolean | null;
   has_grok_code_access?: boolean | null;
   stale?: boolean | null;
+  credits_remaining?: number | null;
+  spend_used?: number | null;
+  spend_limit?: number | null;
+  unit?: QuotaWindowNativeDTO["unit"];
+  profile?: string | null;
+  /** Known provider backoff deadline (UTC ISO). Active holds block admission even when quota looks fine. */
+  cooldown_until?: string | null;
 }
 
 export interface QuotaRouteDTO {
@@ -87,7 +135,8 @@ export interface QuotaRouteDTO {
 }
 
 export interface QuotaSnapshotDTO {
-  schema_version: "1.0";
+  schema_version: "1.0" | "1.1";
+  collector_version?: string | null;
   captured_at: string | null;
   received_at?: string | null;
   host_id: string;
@@ -110,6 +159,101 @@ function jsonResponse(body: Record<string, any>, status: number = 200, extraHead
       ...(extraHeaders || {}),
     },
   });
+}
+
+/** Canonical caller authority injected from Hub routing (hub.ts authenticateBusRequest). */
+export interface QuotaFleetAuth {
+  caller?: {
+    kind?: string;
+    isAdmin?: boolean;
+    actor?: string;
+    machineId?: string;
+  };
+  scopes?: string[];
+  error?: Response;
+}
+
+export type CanonicalQuotaAuth = (request: Request) => Promise<QuotaFleetAuth>;
+
+/** Fleet-wide usage reads: human admins, fleet-launch agents, routing clients. Never hosts. */
+export function fleetReadGrant(caller: QuotaFleetAuth["caller"], scopes?: string[]): boolean {
+  if (!caller) return false;
+  if (caller.isAdmin === true) return true;
+  if (caller.kind === "agent" && Array.isArray(scopes) && scopes.includes("fleet:launch")) return true;
+  if (caller.kind === "routing-client" && Array.isArray(scopes) && scopes.includes("routing:submit")) return true;
+  return false;
+}
+
+function checkSessionReadIntegrity(request: Request, reqUrl: URL, csrfToken: string): Response | null {
+  const originHeader = request.headers.get("Origin");
+  if (originHeader && originHeader !== reqUrl.origin) {
+    return jsonResponse({ error: "forbidden", reason: "origin_mismatch" }, 403);
+  }
+
+  const secFetchSite = request.headers.get("Sec-Fetch-Site");
+  if (secFetchSite && secFetchSite.toLowerCase() === "cross-site") {
+    return jsonResponse({ error: "forbidden", reason: "cross_site_request_denied" }, 403);
+  }
+
+  const csrfHeader = request.headers.get("x-csrf-token");
+  if (csrfHeader !== null && csrfHeader !== csrfToken) {
+    return jsonResponse({ error: "forbidden", reason: "invalid_csrf_token" }, 403);
+  }
+  return null;
+}
+
+const FLEET_LABEL = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const FLEET_HOST_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
+
+export interface FleetQuotaFilters {
+  host_id: string | null;
+  provider: string | null;
+  engine: string | null;
+  account: string | null;
+}
+
+export function parseFleetQuotaFilters(reqUrl: URL): { ok: boolean; filters?: FleetQuotaFilters; error?: string } {
+  const pick = (name: string): string | null => {
+    const v = reqUrl.searchParams.get(name);
+    if (v === null || v === "") return null;
+    return v;
+  };
+  const filters: FleetQuotaFilters = {
+    host_id: pick("host_id"),
+    provider: pick("provider"),
+    engine: pick("engine"),
+    account: pick("account"),
+  };
+  if (filters.host_id !== null && !FLEET_HOST_ID.test(filters.host_id)) return { ok: false, error: "invalid_host_id" };
+  if (filters.provider !== null && !ALLOWED_QUOTA_PROVIDERS.has(filters.provider)) return { ok: false, error: "invalid_provider" };
+  if (filters.engine !== null && !FLEET_LABEL.test(filters.engine)) return { ok: false, error: "invalid_engine" };
+  if (filters.account !== null && !FLEET_LABEL.test(filters.account)) return { ok: false, error: "invalid_account" };
+  return { ok: true, filters };
+}
+
+function isFreshTs(value: unknown, nowMs: number, ttlMs: number): boolean {
+  if (typeof value !== "string") return false;
+  const at = Date.parse(value);
+  return Number.isFinite(at) && at <= nowMs && nowMs - at <= ttlMs;
+}
+
+function windowMinPercent(quota: any): number | null {
+  let remaining: number | null = null;
+  for (const w of Object.values((quota && quota.windows) || {}) as any[]) {
+    if (w === null || typeof w !== "object" || w.present !== true || w.error === "unavailable") continue;
+    if (typeof w.percent_remaining !== "number" || !Number.isFinite(w.percent_remaining)) continue;
+    remaining = remaining === null ? w.percent_remaining : Math.min(remaining, w.percent_remaining);
+  }
+  return remaining;
+}
+
+function observationUnavailable(quota: any): boolean {
+  if (!quota || typeof quota !== "object") return true;
+  if (quota.status !== "ok" || quota.details?.stale === true) return true;
+  for (const w of Object.values(quota.windows || {}) as any[]) {
+    if (w !== null && typeof w === "object" && w.error === "unavailable") return true;
+  }
+  return false;
 }
 
 function isPlainObject(val: unknown): val is Record<string, any> {
@@ -155,6 +299,65 @@ export function parseUtcIso(raw: unknown): { iso: string; ms: number } | null {
   }
 
   return { iso: dt.toISOString(), ms };
+}
+
+function parseNativeAmount(val: unknown, cap: number): { ok: boolean; value: number | null } {
+  if (val === null || val === undefined) return { ok: true, value: null };
+  if (typeof val === "boolean" || typeof val !== "number" || !Number.isFinite(val) || val < 0 || val > cap) {
+    return { ok: false, value: null };
+  }
+  return { ok: true, value: val };
+}
+
+function parseNativeUnit(val: unknown): { ok: boolean; value: QuotaWindowNativeDTO["unit"] } {
+  if (val === null || val === undefined) return { ok: true, value: null };
+  if (typeof val !== "string" || !NATIVE_UNITS.has(val)) return { ok: false, value: null };
+  return { ok: true, value: val as QuotaWindowNativeDTO["unit"] };
+}
+
+function parseNativeProfile(val: unknown): { ok: boolean; value: string | null } {
+  if (val === null || val === undefined) return { ok: true, value: null };
+  if (typeof val !== "string" || !PROFILE_LABEL_REGEX.test(val)) return { ok: false, value: null };
+  return { ok: true, value: val };
+}
+
+function parseNativeFields(
+  holder: Record<string, any>,
+  allowed: Set<string>
+): { ok: boolean; reason?: string; native?: QuotaWindowNativeDTO } {
+  const native: QuotaWindowNativeDTO = {
+    credits_remaining: null,
+    spend_used: null,
+    spend_limit: null,
+    unit: null,
+    profile: null,
+  };
+  if (allowed.has("credits_remaining")) {
+    const r = parseNativeAmount(holder["credits_remaining"], MAX_CREDITS_VALUE);
+    if (!r.ok) return { ok: false, reason: "invalid_credits_remaining" };
+    native.credits_remaining = r.value;
+  }
+  if (allowed.has("spend_used")) {
+    const r = parseNativeAmount(holder["spend_used"], MAX_SPEND_VALUE);
+    if (!r.ok) return { ok: false, reason: "invalid_spend_used" };
+    native.spend_used = r.value;
+  }
+  if (allowed.has("spend_limit")) {
+    const r = parseNativeAmount(holder["spend_limit"], MAX_SPEND_VALUE);
+    if (!r.ok) return { ok: false, reason: "invalid_spend_limit" };
+    native.spend_limit = r.value;
+  }
+  if (allowed.has("unit")) {
+    const r = parseNativeUnit(holder["unit"]);
+    if (!r.ok) return { ok: false, reason: "invalid_unit" };
+    native.unit = r.value;
+  }
+  if (allowed.has("profile")) {
+    const r = parseNativeProfile(holder["profile"]);
+    if (!r.ok) return { ok: false, reason: "invalid_profile" };
+    native.profile = r.value;
+  }
+  return { ok: true, native };
 }
 
 async function readBoundedJsonBody(
@@ -244,7 +447,8 @@ export interface ValidationResult {
   error?: string;
   reason?: string;
   snapshot?: {
-    schema_version: "1.0";
+    schema_version: "1.0" | "1.1";
+    collector_version: string | null;
     captured_at: string;
     captured_at_ms: number;
     host_id: string;
@@ -265,7 +469,7 @@ export function validateQuotaSnapshotPayload(
 
   const rawKeys = Object.keys(raw);
   for (const k of rawKeys) {
-    if (FORBIDDEN_PROTO_KEYS.has(k) || !TOP_LEVEL_KEYS.has(k)) {
+    if (FORBIDDEN_PROTO_KEYS.has(k) || (!TOP_LEVEL_KEYS.has(k) && !OPTIONAL_TOP_KEYS.has(k))) {
       return { ok: false, status: 400, error: "unknown_field", reason: "unexpected_top_level_key" };
     }
   }
@@ -284,8 +488,23 @@ export function validateQuotaSnapshotPayload(
     return { ok: false, status: 403, error: "forbidden", reason: "host_id_mismatch" };
   }
 
-  if (raw.schema_version !== "1.0") {
+  if (raw.schema_version !== "1.0" && raw.schema_version !== "1.1") {
     return { ok: false, status: 400, error: "invalid_schema_version" };
+  }
+  const isV11 = raw.schema_version === "1.1";
+
+  let collectorVersion: string | null = null;
+  if (Object.prototype.hasOwnProperty.call(raw, "collector_version")) {
+    if (!isV11) {
+      return { ok: false, status: 400, error: "unknown_field", reason: "collector_version_requires_1_1" };
+    }
+    const cv = (raw as Record<string, any>)["collector_version"];
+    if (cv !== null) {
+      if (typeof cv !== "string" || cv.length === 0 || cv.length > 64 || !COLLECTOR_VERSION_REGEX.test(cv)) {
+        return { ok: false, status: 400, error: "invalid_collector_version" };
+      }
+      collectorVersion = cv;
+    }
   }
 
   const capturedParsed = parseUtcIso(raw.captured_at);
@@ -368,6 +587,7 @@ export function validateQuotaSnapshotPayload(
       }
       if (dk === "limit_reached" || dk === "stale") continue;
       if (dk === "has_grok_code_access" && provider === "grok") continue;
+      if (isV11 && OPTIONAL_DETAILS_KEYS.has(dk)) continue;
       return { ok: false, status: 400, error: "unknown_details_field" };
     }
 
@@ -418,7 +638,10 @@ export function validateQuotaSnapshotPayload(
       }
 
       for (const wk of Object.keys(winVal)) {
-        if (FORBIDDEN_PROTO_KEYS.has(wk) || !WINDOW_KEYS.has(wk)) {
+        if (FORBIDDEN_PROTO_KEYS.has(wk)) {
+          return { ok: false, status: 400, error: "unknown_window_field" };
+        }
+        if (!WINDOW_KEYS.has(wk) && !(isV11 && OPTIONAL_WINDOW_KEYS.has(wk))) {
           return { ok: false, status: 400, error: "unknown_window_field" };
         }
       }
@@ -453,7 +676,16 @@ export function validateQuotaSnapshotPayload(
         resetAtIso = resetParsed.iso;
       }
 
-      if (winVal.present === false && (pct !== null || resetAtIso !== null)) {
+      let hasNativeValue = false;
+      if (isV11) {
+        for (const nk of OPTIONAL_WINDOW_KEYS) {
+          if (winVal[nk] !== null && winVal[nk] !== undefined) {
+            hasNativeValue = true;
+            break;
+          }
+        }
+      }
+      if (winVal.present === false && (pct !== null || resetAtIso !== null || hasNativeValue)) {
         return { ok: false, status: 400, error: "inconsistent_absent_window" };
       }
 
@@ -478,6 +710,13 @@ export function validateQuotaSnapshotPayload(
       };
       if (hasWinErrorProp) {
         sanitizedWin.error = winErrorVal;
+      }
+      if (isV11) {
+        const nativeRes = parseNativeFields(winVal, OPTIONAL_WINDOW_KEYS);
+        if (!nativeRes.ok) {
+          return { ok: false, status: 400, error: "invalid_window_native", reason: nativeRes.reason };
+        }
+        Object.assign(sanitizedWin, nativeRes.native);
       }
       sanitizedWindows[winName] = sanitizedWin;
     }
@@ -507,6 +746,22 @@ export function validateQuotaSnapshotPayload(
     if (detailsStale !== undefined) {
       sanitizedDetails.stale = detailsStale;
     }
+    if (isV11) {
+      const nativeRes = parseNativeFields(detailsVal, OPTIONAL_DETAILS_KEYS);
+      if (!nativeRes.ok) {
+        return { ok: false, status: 400, error: "invalid_details_native", reason: nativeRes.reason };
+      }
+      Object.assign(sanitizedDetails, nativeRes.native);
+      if (Object.prototype.hasOwnProperty.call(detailsVal, "cooldown_until") && detailsVal.cooldown_until !== null) {
+        const parsedCd = parseUtcIso(detailsVal.cooldown_until);
+        if (!parsedCd) {
+          return { ok: false, status: 400, error: "invalid_details_native", reason: "invalid_cooldown_until" };
+        }
+        sanitizedDetails.cooldown_until = parsedCd.iso;
+      } else {
+        sanitizedDetails.cooldown_until = null;
+      }
+    }
 
     sanitizedRoutes[provider] = {
       status: finalRouteStatus,
@@ -525,7 +780,8 @@ export function validateQuotaSnapshotPayload(
     ok: true,
     status: 200,
     snapshot: {
-      schema_version: "1.0",
+      schema_version: raw.schema_version,
+      collector_version: collectorVersion,
       captured_at: capturedParsed.iso,
       captured_at_ms: capturedParsed.ms,
       host_id: expectedHostId,
@@ -561,6 +817,10 @@ export class QuotaStore {
       if (trimmed) {
         this.sql.exec(trimmed);
       }
+    }
+    const cols = this.sql.exec("PRAGMA table_info(host_quota_snapshots)").toArray().map((c: any) => c.name);
+    if (!cols.includes("collector_version")) {
+      this.sql.exec("ALTER TABLE host_quota_snapshots ADD COLUMN collector_version TEXT");
     }
   }
 
@@ -703,12 +963,11 @@ export class QuotaStore {
 
     const snap = validation.snapshot;
     const receivedAtIso = new Date(nowMs).toISOString();
-    const routesJson = JSON.stringify(snap.routes);
 
     return this.runInTransaction(() => {
       const existing = this.sql
         .exec(
-          "SELECT captured_at_ms FROM host_quota_snapshots WHERE host_id = ?",
+          "SELECT captured_at_ms, routes_json FROM host_quota_snapshots WHERE host_id = ?",
           hostId
         )
         .toArray()[0] as any;
@@ -725,12 +984,35 @@ export class QuotaStore {
         };
       }
 
+      // A newer observation that omits a cooldown deadline must not erase an
+      // unexpired known hold: retain the stored deadline for that provider.
+      if (existing?.routes_json) {
+        let oldRoutes: Record<string, any> = {};
+        try {
+          oldRoutes = JSON.parse(existing.routes_json);
+        } catch {
+          oldRoutes = {};
+        }
+        for (const [provider, route] of Object.entries(snap.routes)) {
+          const newCd = route.details?.cooldown_until ?? null;
+          const oldCd = oldRoutes?.[provider]?.details?.cooldown_until ?? null;
+          if ((newCd === null || newCd === undefined) && typeof oldCd === "string") {
+            const oldMs = Date.parse(oldCd);
+            if (Number.isFinite(oldMs) && oldMs > nowMs) {
+              route.details.cooldown_until = oldCd;
+            }
+          }
+        }
+      }
+      const routesJson = JSON.stringify(snap.routes);
+
       this.sql.exec(
         `INSERT INTO host_quota_snapshots (
-          host_id, schema_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          host_id, schema_version, collector_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(host_id) DO UPDATE SET
           schema_version = excluded.schema_version,
+          collector_version = excluded.collector_version,
           captured_at = excluded.captured_at,
           captured_at_ms = excluded.captured_at_ms,
           received_at = excluded.received_at,
@@ -741,6 +1023,7 @@ export class QuotaStore {
         WHERE excluded.captured_at_ms > host_quota_snapshots.captured_at_ms`,
         hostId,
         snap.schema_version,
+        snap.collector_version,
         snap.captured_at,
         snap.captured_at_ms,
         receivedAtIso,
@@ -757,7 +1040,8 @@ export class QuotaStore {
         ok: true,
         status: 200,
         body: {
-          schema_version: "1.0",
+          schema_version: snap.schema_version,
+          ...(snap.schema_version === "1.1" ? { collector_version: snap.collector_version } : {}),
           captured_at: snap.captured_at,
           received_at: receivedAtIso,
           host_id: hostId,
@@ -826,10 +1110,12 @@ export class QuotaStore {
           error: "unavailable",
         };
       }
+      const storedVersion = row.schema_version === "1.1" ? "1.1" : "1.0";
       return {
         status: 503,
         body: {
-          schema_version: "1.0",
+          schema_version: storedVersion,
+          ...(storedVersion === "1.1" ? { collector_version: row.collector_version ?? null } : {}),
           captured_at: row.captured_at,
           received_at: row.received_at,
           host_id: row.host_id,
@@ -841,22 +1127,171 @@ export class QuotaStore {
       };
     }
 
+    {
+      const storedVersion = row.schema_version === "1.1" ? "1.1" : "1.0";
+      return {
+        status: 200,
+        body: {
+          schema_version: storedVersion,
+          ...(storedVersion === "1.1" ? { collector_version: row.collector_version ?? null } : {}),
+          captured_at: row.captured_at,
+          received_at: row.received_at,
+          host_id: row.host_id,
+          stale: false,
+          status: "ok",
+          error: null,
+          routes,
+        },
+      };
+    }
+  }
+
+  public getFleetView(
+    filters: FleetQuotaFilters,
+    nowMs: number = this.now()
+  ): { status: number; body: Record<string, any> } {
+    const accounts = (this.sql.exec("SELECT * FROM fleet_accounts ORDER BY provider, label").toArray() as any[]).filter(
+      (a) => (!filters.provider || a.provider === filters.provider) && (!filters.account || a.label === filters.account)
+    );
+    const allRoutes = this.sql.exec("SELECT * FROM fleet_routes ORDER BY machine_id, engine").toArray() as any[];
+    const machines = (this.sql.exec("SELECT id FROM machines ORDER BY id").toArray() as any[])
+      .map((m: any) => m.id)
+      .filter((id: string) => !filters.host_id || id === filters.host_id);
+
+    const pools: Record<string, any>[] = [];
+    for (const account of accounts) {
+      const routes = allRoutes.filter(
+        (r) =>
+          r.account === account.label &&
+          (!filters.engine || r.engine === filters.engine) &&
+          (!filters.host_id || r.machine_id === filters.host_id)
+      );
+      const freshObs: { machine: string; quota: any; kind: string }[] = [];
+      let hasStale = false;
+      for (const route of routes) {
+        const sub: any = this.sql
+          .exec("SELECT * FROM fleet_subscriptions WHERE machine_id = ? AND account = ?", route.machine_id, account.label)
+          .toArray()[0];
+        if (sub) {
+          let quota: any = null;
+          try {
+            quota = JSON.parse(sub.quota_json);
+          } catch {
+            quota = null;
+          }
+          if (quota && isFreshTs(sub.observed_at, nowMs, QUOTA_STALE_MS) && isFreshTs(quota.observed_at, nowMs, QUOTA_STALE_MS)) {
+            freshObs.push({ machine: route.machine_id, quota, kind: "subscription" });
+          } else {
+            hasStale = true;
+          }
+          continue;
+        }
+        // Single-account host snapshot fallback: same canonical rule as fleet observation().
+        if (route.profile !== null) {
+          hasStale = true;
+          continue;
+        }
+        const countRow: any = this.sql
+          .exec(
+            "SELECT COUNT(DISTINCT r.account) AS n FROM fleet_routes r JOIN fleet_accounts a ON r.account = a.label WHERE r.machine_id = ? AND a.provider = ?",
+            route.machine_id,
+            account.provider
+          )
+          .one();
+        const snap: any = this.sql.exec("SELECT * FROM host_quota_snapshots WHERE host_id = ?", route.machine_id).toArray()[0];
+        if (Number(countRow?.n) !== 1 || !snap || !isFreshTs(snap.captured_at, nowMs, QUOTA_STALE_MS)) {
+          hasStale = true;
+          continue;
+        }
+        let snapRoutes: any = null;
+        try {
+          snapRoutes = JSON.parse(snap.routes_json);
+        } catch {
+          snapRoutes = null;
+        }
+        const quota = snapRoutes ? snapRoutes[account.provider] : null;
+        if (quota && isFreshTs(quota.observed_at, nowMs, QUOTA_STALE_MS)) {
+          freshObs.push({ machine: route.machine_id, quota, kind: "snapshot" });
+        } else {
+          hasStale = true;
+        }
+      }
+      let state = "unknown";
+      let remaining: number | null = null;
+      let observedAt: string | null = null;
+      let collectorVersion: string | null = null;
+      if (freshObs.length) {
+        state = "fresh";
+        if (freshObs.some((o) => o.quota.details?.limit_reached === true)) {
+          state = "exhausted";
+        } else if (freshObs.some((o) => observationUnavailable(o.quota))) {
+          state = "unavailable";
+        } else {
+          for (const o of freshObs) {
+            const m = windowMinPercent(o.quota);
+            if (m !== null) remaining = remaining === null ? m : Math.min(remaining, m);
+          }
+        }
+        const times = freshObs.map((o) => o.quota.observed_at).filter((t: unknown) => typeof t === "string") as string[];
+        if (times.length) observedAt = times.sort().pop()!;
+        const cv = freshObs.map((o) => o.quota.collector_version).find((v: unknown) => typeof v === "string");
+        if (typeof cv === "string") collectorVersion = cv;
+      } else if (hasStale) {
+        state = "stale";
+      }
+      pools.push({
+        provider: account.provider,
+        account: account.label,
+        state,
+        remaining_percent: remaining,
+        observed_at: observedAt,
+        collector_version: collectorVersion,
+        observed_by_hosts: [...new Set(freshObs.map((o) => o.machine))].sort(),
+        engines: [...new Set(routes.map((r) => r.engine))].sort(),
+        profiles: [...new Set(routes.map((r) => r.profile).filter((p: unknown) => p !== null))].sort(),
+      });
+    }
+
+    const hosts: Record<string, any>[] = [];
+    const coverage = { machines_total: machines.length, fresh: [] as string[], stale: [] as string[], missing: [] as string[] };
+    for (const machineId of machines) {
+      const snap = this.getSnapshot(machineId, nowMs);
+      const body = snap.body as Record<string, any>;
+      if (filters.provider && body.routes) {
+        body.routes = Object.fromEntries(Object.entries(body.routes).filter(([p]) => p === filters.provider));
+      }
+      const subs = (this.sql.exec("SELECT * FROM fleet_subscriptions WHERE machine_id = ? ORDER BY service, account", machineId).toArray() as any[])
+        .filter((s) => (!filters.provider || s.service === filters.provider) && (!filters.account || s.account === filters.account))
+        .map((s: any) => {
+          let quota: any = null;
+          try {
+            quota = JSON.parse(s.quota_json);
+          } catch {
+            quota = null;
+          }
+          return { machine_id: s.machine_id, account: s.account, service: s.service, plan: s.plan, observed_at: s.observed_at,
+            stale: !isFreshTs(s.observed_at, nowMs, QUOTA_STALE_MS), quota };
+        });
+      hosts.push({ host_id: machineId, snapshot: body, subscriptions: subs });
+      if (snap.status === 200 && body.status === "ok") coverage.fresh.push(machineId);
+      else if (snap.status === 404) coverage.missing.push(machineId);
+      else coverage.stale.push(machineId);
+    }
+
     return {
       status: 200,
       body: {
-        schema_version: "1.0",
-        captured_at: row.captured_at,
-        received_at: row.received_at,
-        host_id: row.host_id,
-        stale: false,
-        status: "ok",
-        error: null,
-        routes,
+        schema_version: "1.1",
+        as_of: new Date(nowMs).toISOString(),
+        filters,
+        pools,
+        hosts,
+        coverage,
       },
     };
   }
 
-  public async handleRequest(request: Request, url?: URL): Promise<Response> {
+  public async handleRequest(request: Request, url?: URL, canonicalAuth?: CanonicalQuotaAuth): Promise<Response> {
     const reqUrl = url || new URL(request.url);
     const nowMs = this.now();
 
@@ -921,6 +1356,41 @@ export class QuotaStore {
     }
 
     // GET /api/quota
+    const viewFleet = reqUrl.searchParams.get("view") === "fleet";
+    if (viewFleet) {
+      const parsed = parseFleetQuotaFilters(reqUrl);
+      if (!parsed.ok || !parsed.filters) {
+        return jsonResponse({ error: parsed.error || "invalid_filter" }, 400);
+      }
+      if (request.headers.has("Authorization")) {
+        if (!canonicalAuth) {
+          return jsonResponse({ error: "unauthorized" }, 401, {
+            "WWW-Authenticate": "Bearer",
+          });
+        }
+        const auth = await canonicalAuth(request);
+        if (auth.error) return auth.error;
+        if (!fleetReadGrant(auth.caller, auth.scopes)) {
+          return jsonResponse({ error: "forbidden", reason: "fleet_view_denied" }, 403);
+        }
+        const fleetRes = this.getFleetView(parsed.filters, nowMs);
+        return jsonResponse(fleetRes.body, fleetRes.status);
+      }
+      const fleetSession = await getSession(this.env, request);
+      if (!fleetSession) {
+        return jsonResponse({ error: "unauthorized" }, 401, {
+          "WWW-Authenticate": "Bearer",
+        });
+      }
+      if (!fleetSession.isAdmin) {
+        return jsonResponse({ error: "forbidden" }, 403);
+      }
+      const fleetIntegrity = checkSessionReadIntegrity(request, reqUrl, fleetSession.csrfToken);
+      if (fleetIntegrity) return fleetIntegrity;
+      const fleetRes = this.getFleetView(parsed.filters, nowMs);
+      return jsonResponse(fleetRes.body, fleetRes.status);
+    }
+
     if (request.headers.has("Authorization")) {
       const hostAuth = await this.authenticateHostBearer(request, nowMs);
       if (hostAuth.errorResponse) return hostAuth.errorResponse;
@@ -951,20 +1421,8 @@ export class QuotaStore {
       return jsonResponse({ error: "forbidden" }, 403);
     }
 
-    const originHeader = request.headers.get("Origin");
-    if (originHeader && originHeader !== reqUrl.origin) {
-      return jsonResponse({ error: "forbidden", reason: "origin_mismatch" }, 403);
-    }
-
-    const secFetchSite = request.headers.get("Sec-Fetch-Site");
-    if (secFetchSite && secFetchSite.toLowerCase() === "cross-site") {
-      return jsonResponse({ error: "forbidden", reason: "cross_site_request_denied" }, 403);
-    }
-
-    const csrfHeader = request.headers.get("x-csrf-token");
-    if (csrfHeader !== null && csrfHeader !== session.csrfToken) {
-      return jsonResponse({ error: "forbidden", reason: "invalid_csrf_token" }, 403);
-    }
+    const integrity = checkSessionReadIntegrity(request, reqUrl, session.csrfToken);
+    if (integrity) return integrity;
 
     const requestedHostId = reqUrl.searchParams.get("host_id");
     if (
@@ -1006,8 +1464,9 @@ export async function handleQuotaRoutes(
   request: Request,
   path: string,
   quotaStore: QuotaStore,
-  url?: URL
+  url?: URL,
+  canonicalAuth?: CanonicalQuotaAuth
 ): Promise<Response | null> {
   if (path !== "/api/quota") return null;
-  return quotaStore.handleRequest(request, url);
+  return quotaStore.handleRequest(request, url, canonicalAuth);
 }
