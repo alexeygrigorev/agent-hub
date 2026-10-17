@@ -3,6 +3,8 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import { RoutingService } from './routing';
 import { ClaimAdmission, sameIntent, sameEditCaller, type EditAuthority, type AdmissionCaller } from './claim_admission';
 import { effectiveCheckin } from './registry';
+import { policy } from './model-routing';
+import { evaluateQuotaAdmission } from './quota_admission';
 
 export const FLEET_SCHEMA = `
 CREATE TABLE IF NOT EXISTS fleet_accounts (label TEXT PRIMARY KEY, provider TEXT NOT NULL, max_concurrency INTEGER NOT NULL, reserve_percent REAL NOT NULL, enabled INTEGER NOT NULL);
@@ -23,18 +25,45 @@ function object(value: any, keys: string[]): boolean {
   return value !== null && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(k => keys.includes(k));
 }
 function parsed(value: any, fallback: any = {}) { try { return JSON.parse(value || '{}'); } catch { return fallback; } }
+const NATIVE_AMOUNTS: Record<string, number> = { credits_remaining: 1e12, spend_used: 1e15, spend_limit: 1e15 };
+const NATIVE_UNITS = new Set(['percent', 'credits', 'usd_cents', 'requests', 'tokens']);
+const PROFILE_LABEL = /^[A-Za-z0-9][A-Za-z0-9_./-]{0,63}$/;
+const COLLECTOR_VERSION = /^[A-Za-z0-9][A-Za-z0-9_.+/-]{0,63}$/;
+function nativeAmount(value: any, cap: number): boolean {
+  return value === null || (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= cap);
+}
 function sanitizedQuota(raw: any): any {
-  if (!object(raw, ['status', 'observed_at', 'details', 'windows']) || !['ok', 'unknown', 'error'].includes(raw.status) || !object(raw.details, ['limit_reached', 'has_grok_code_access', 'stale']) || !object(raw.windows, Object.keys(raw.windows || {})) || Object.keys(raw.windows).length > 32) return null;
+  const topKeys = ['status', 'observed_at', 'details', 'windows'];
+  const hasCv = !!raw && typeof raw === 'object' && !Array.isArray(raw) && (raw as any).collector_version !== undefined;
+  if (!object(raw, hasCv ? [...topKeys, 'collector_version'] : topKeys) || !['ok', 'unknown', 'error'].includes(raw.status) || !object(raw.details, Object.keys(raw.details)) || !object(raw.windows, Object.keys(raw.windows || {})) || Object.keys(raw.windows).length > 32) return null;
+  if (raw.collector_version !== undefined && raw.collector_version !== null && (typeof raw.collector_version !== 'string' || !COLLECTOR_VERSION.test(raw.collector_version))) return null;
   const details: any = {};
-  for (const [key, value] of Object.entries(raw.details)) { if (value !== null && typeof value !== 'boolean') return null; details[key] = value; }
+  for (const [key, value] of Object.entries(raw.details)) {
+    if (['limit_reached', 'has_grok_code_access', 'stale'].includes(key)) {
+      if (value !== null && typeof value !== 'boolean') return null;
+    } else if (key in NATIVE_AMOUNTS) {
+      if (!nativeAmount(value, NATIVE_AMOUNTS[key])) return null;
+    } else if (key === 'unit') {
+      if (value !== null && (typeof value !== 'string' || !NATIVE_UNITS.has(value))) return null;
+    } else if (key === 'profile') {
+      if (value !== null && (typeof value !== 'string' || !PROFILE_LABEL.test(value))) return null;
+    } else return null;
+    details[key] = value;
+  }
   const windows: any = {};
   for (const [key, w] of Object.entries(raw.windows) as any) {
-    if (!label(key) || !object(w, ['present', 'percent_remaining', 'reset_at', 'rolling']) || typeof w.present !== 'boolean' || (w.percent_remaining !== null && (typeof w.percent_remaining !== 'number' || !Number.isFinite(w.percent_remaining) || w.percent_remaining < 0 || w.percent_remaining > 100)) || (w.reset_at !== null && (typeof w.reset_at !== 'string' || !Number.isFinite(Date.parse(w.reset_at)))) || (w.rolling !== undefined && typeof w.rolling !== 'boolean')) return null;
-    if (!w.present && (w.percent_remaining !== null || w.reset_at !== null)) return null;
-    windows[key] = { present: w.present, percent_remaining: w.percent_remaining, reset_at: w.reset_at, rolling: w.rolling === true };
+    if (!label(key) || !object(w, Object.keys(w)) || typeof w.present !== 'boolean' || (w.percent_remaining !== null && (typeof w.percent_remaining !== 'number' || !Number.isFinite(w.percent_remaining) || w.percent_remaining < 0 || w.percent_remaining > 100)) || (w.reset_at !== null && (typeof w.reset_at !== 'string' || !Number.isFinite(Date.parse(w.reset_at)))) || (w.rolling !== undefined && typeof w.rolling !== 'boolean') || (w.error !== undefined && w.error !== null && w.error !== 'unavailable')) return null;
+    for (const nk of Object.keys(NATIVE_AMOUNTS)) if (!nativeAmount(w[nk], NATIVE_AMOUNTS[nk])) return null;
+    if (w.unit !== undefined && w.unit !== null && (typeof w.unit !== 'string' || !NATIVE_UNITS.has(w.unit))) return null;
+    if (w.profile !== undefined && w.profile !== null && (typeof w.profile !== 'string' || !PROFILE_LABEL.test(w.profile))) return null;
+    for (const k of Object.keys(w)) if (!['present', 'percent_remaining', 'reset_at', 'rolling', 'error', ...Object.keys(NATIVE_AMOUNTS), 'unit', 'profile'].includes(k)) return null;
+    const nativesNull = w.credits_remaining == null && w.spend_used == null && w.spend_limit == null && w.unit == null && w.profile == null;
+    if (!w.present && (w.percent_remaining !== null || w.reset_at !== null || !nativesNull)) return null;
+    windows[key] = { present: w.present, percent_remaining: w.percent_remaining, reset_at: w.reset_at, rolling: w.rolling === true, error: w.error === 'unavailable' ? 'unavailable' : null,
+      credits_remaining: w.credits_remaining ?? null, spend_used: w.spend_used ?? null, spend_limit: w.spend_limit ?? null, unit: w.unit ?? null, profile: w.profile ?? null };
   }
   if (raw.observed_at !== null && (typeof raw.observed_at !== 'string' || !Number.isFinite(Date.parse(raw.observed_at)))) return null;
-  return { status: raw.status, observed_at: raw.observed_at, details, windows };
+  return { status: raw.status, observed_at: raw.observed_at, details, windows, collector_version: raw.collector_version ?? null };
 }
 function fresh(value: any, now: number, ttl: number) {
   const at = typeof value === 'string' && /T.*(?:Z|[+-]\d{2}:\d{2})$/i.test(value) ? Date.parse(value) : NaN;
@@ -76,12 +105,12 @@ export class FleetService {
     if (!columns.includes('last_activity_at')) this.sql.exec('ALTER TABLE fleet_sessions ADD COLUMN last_activity_at TEXT');
   }
 
-  private observation(account: any, route: any) {
+  private observationProvenance(account: any, route: any): { quota: any; subscriptionObservedAt: string | null } | null {
     const subscription: any = this.sql.exec('SELECT * FROM fleet_subscriptions WHERE machine_id = ? AND account = ?', route.machine_id, account.label).toArray()[0];
     if (subscription) {
       if (subscription.service !== account.provider || !fresh(subscription.observed_at, this.now(), 1200000)) return null;
       const quota = parsed(subscription.quota_json);
-      return fresh(quota.observed_at, this.now(), 1200000) ? quota : null;
+      return fresh(quota.observed_at, this.now(), 1200000) ? { quota, subscriptionObservedAt: subscription.observed_at } : null;
     }
     // A default CLI reading cannot describe a named profile or two accounts on one service.
     if (route.profile !== null) return null;
@@ -90,28 +119,31 @@ export class FleetService {
     if (count !== 1 || !snapshot || !fresh(snapshot.captured_at, this.now(), 1200000)) return null;
     const quota = parsed(snapshot.routes_json)[account.provider];
     if (!quota || !fresh(quota.observed_at, this.now(), 1200000)) return null;
-    return snapshot.status === 'ok' ? quota : { ...quota, status: 'unknown' };
+    return { quota: snapshot.status === 'ok' ? quota : { ...quota, status: 'unknown' }, subscriptionObservedAt: snapshot.captured_at };
+  }
+
+  private observation(account: any, route: any) {
+    return this.observationProvenance(account, route)?.quota ?? null;
   }
 
   accountStatus(account: any) {
     this.admission.reconcileOffers();
     const routes = this.sql.exec('SELECT machine_id, profile FROM fleet_routes WHERE account = ?', account.label).toArray();
     let remaining: number | null = null; let observed = 0; let unknown = false; let blocked = !account.enabled;
+    const reserves = (((policy as any).rules as any).reserve_percent || {}) as Record<string, number>;
     for (const route of routes) {
-      const quota = this.observation(account, route);
-      if (!quota) continue;
+      const prov = this.observationProvenance(account, route);
+      if (!prov) continue;
       observed++;
-      if (quota.status !== 'ok' || quota.details?.stale === true) { unknown = true; continue; }
-      if (quota.details?.limit_reached === true) blocked = true;
-      if (quota.details?.limit_reached !== false || (account.provider === 'grok' && quota.details?.has_grok_code_access !== true)) unknown = true;
-      let windows = 0;
-      for (const win of Object.values(quota.windows || {}) as any[]) {
-        if (win.present === false) continue;
-        windows++;
-        if (win.present !== true || typeof win.percent_remaining !== 'number' || !Number.isFinite(win.percent_remaining) || win.percent_remaining < 0 || win.percent_remaining > 100 || !fresh(win.reset_at, this.now() + 366 * 86400000, 366 * 86400000)) { unknown = true; continue; }
-        remaining = remaining === null ? win.percent_remaining : Math.min(remaining, win.percent_remaining);
+      const adm = evaluateQuotaAdmission({ provider: account.provider, quota: prov.quota, subscriptionObservedAt: prov.subscriptionObservedAt, nowMs: this.now(), reserves });
+      if (!adm.ok) {
+        if (adm.reason === 'limit_reached') blocked = true;
+        else if (adm.reason === 'reserve') {
+          if (adm.remaining !== null) remaining = remaining === null ? adm.remaining : Math.min(remaining, adm.remaining);
+        } else unknown = true;
+        continue;
       }
-      if (!windows) unknown = true;
+      remaining = remaining === null ? adm.remaining! : Math.min(remaining, adm.remaining!);
     }
     if (remaining !== null && remaining <= account.reserve_percent) blocked = true;
     const reserved = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE account = ? AND state IN ${ACTIVE}`, account.label).one().n);
@@ -340,6 +372,11 @@ export class FleetService {
           if (!object(data, ['gate_allowed', 'observed_at', 'account', 'profile_supported']) || data.gate_allowed !== true || data.profile_supported !== true || data.account !== row.account || !fresh(data.observed_at, this.now(), 30000)) return response({ error: 'fresh_admission_required' }, 409);
           const account: any = this.sql.exec('SELECT * FROM fleet_accounts WHERE label = ?', row.account).toArray()[0];
           if (!account || this.accountStatus(account).status !== 'ok' || !this.observation(account, row)) return response({ error: 'account_unavailable' }, 409);
+          // Re-verify the exact launch route quota inside the atomic claim: no manual override bypass.
+          const claimRoute: any = this.sql.exec('SELECT machine_id, profile FROM fleet_routes WHERE machine_id = ? AND account = ?', row.machine_id, row.account).toArray()[0];
+          const claimProv = claimRoute ? this.observationProvenance(account, claimRoute) : null;
+          const claimAdm = claimProv ? evaluateQuotaAdmission({ provider: account.provider, quota: claimProv.quota, subscriptionObservedAt: claimProv.subscriptionObservedAt, nowMs: this.now(), reserves: ((((policy as any).rules as any).reserve_percent || {}) as Record<string, number>) }) : null;
+          if (!claimAdm || !claimAdm.ok) return response({ error: 'quota_unavailable', reason: claimAdm ? claimAdm.reason : 'no_quota_evidence' }, 409);
           // Capacity reads reconcile other offers and time may advance during synchronous checks.
           // Never revive a row retired by that sweep; check authority again at the final write.
           const current: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id = ?', row.id).one();

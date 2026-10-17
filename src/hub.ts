@@ -409,7 +409,9 @@ export class Hub extends DurableObject {
       if (busResponse) return busResponse;
       const jobsResponse = await this.handleJobsRoutes(request, path, url);
       if (jobsResponse) return jobsResponse;
-      const quotaResponse = await handleQuotaRoutes(request, path, this.quotaStore, url);
+      const quotaResponse = await handleQuotaRoutes(request, path, this.quotaStore, url, (req) =>
+        this.authenticateBusRequest(req)
+      );
       if (quotaResponse) return quotaResponse;
       if (path === '/api/healthz') {
         const auth = await this.authenticateBusRequest(request);
