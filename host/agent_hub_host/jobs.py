@@ -108,6 +108,13 @@ class JobsClient:
             token=token
         )
 
+    def commit_role_execution(self, base_url: str, job_id: str, token: str,
+                              epoch: int, generation: int) -> Dict[str, Any]:
+        """Never retry: an uncertain response means the durable intent may exist."""
+        return self._request("POST", f"{base_url}/api/jobs/{urllib.parse.quote(job_id)}/execute",
+                             data={"epoch": epoch, "generation": generation},
+                             token=token, is_job_token=True)
+
     def decline_job(
         self,
         base_url: str,
@@ -240,6 +247,7 @@ class JobDispatcher:
 
         kind = job_data.get("kind") or offer_payload.get("kind", "custom")
         payload = job_data.get("payload") if "payload" in job_data else offer_payload.get("payload", {})
+        role_binding = job_data.get("role_binding")
         token = self.token_provider()
         if not token or not isinstance(token, str) or not token.strip():
             return {"accepted": False, "reason": "missing_host_token"}
@@ -292,6 +300,14 @@ class JobDispatcher:
             is_mock = allow_mock and callable(mock_runner) and not is_mock_magic
         if is_mock and getattr(self.root_bridge, "is_canonical_state", False):
             is_mock = False
+
+        if role_binding is not None:
+            if not self._valid_role_binding(role_binding, kind):
+                return {"accepted": False, "reason": "invalid_role_binding"}
+            # Real non-root backends are currently unsupported by RuntimeManager.
+            # Inventory strings and ordinary mocks are not runtime qualification.
+            if not self._role_consumer_qualified():
+                return {"accepted": False, "reason": "HOLD: role backend unsupported (M8b)"}
 
         # Gate check for root-run: qualification and read-only incumbent check
         op_qualified = False
@@ -430,6 +446,11 @@ class JobDispatcher:
         job_token = claim_res.get("job_token")
         lease_epoch = claim_res.get("lease_epoch")
         deadline_at = claim_res.get("deadline_at")
+        claimed_binding = claim_res.get("role_binding")
+        if role_binding is not None and (not self._valid_role_binding(claimed_binding, kind) or claimed_binding != role_binding):
+            return {"accepted": False, "reason": "HOLD: claim role binding changed"}
+        if claimed_binding is not None and (not is_mock or not self._valid_role_binding(claimed_binding, kind)):
+            return {"accepted": False, "reason": "HOLD: unsupported claimed role"}
 
         if not job_token or not isinstance(job_token, str) or not job_token.strip():
             return {"accepted": False, "reason": "malformed_claim_response: invalid job_token"}
@@ -466,6 +487,8 @@ class JobDispatcher:
             "started_wall": time.time(),
             "stop_event": threading.Event()
         }
+        if claimed_binding is not None:
+            job_info["role_binding"] = claimed_binding
         with self._lock:
             self.running_jobs[job_id] = job_info
 
@@ -512,8 +535,14 @@ class JobDispatcher:
         native_session = f"session-{job_id}"
         launcher_task_id = f"hub-root-{job_id}" if script_owned else f"hub-{job_id}"
         renew_thread: Optional[threading.Thread] = None
+        role = job_info.get("role_binding")
+        role_intent_recorded = False
 
-        def _finish_failed_with_bridge(fail_summary: str, initial_refs: Optional[List[str]] = None) -> None:
+        def _finish_failed_with_bridge(fail_summary: str, initial_refs: Optional[List[str]] = None,
+                                       known_terminal: bool = False) -> None:
+            if role is not None and role_intent_recorded and not known_terminal:
+                logger.warning("Role consumer state uncertain; retain intent and HOLD %s", job_id)
+                return
             refs = list(initial_refs) if initial_refs else []
             out_summary = fail_summary
             if acquired_root:
@@ -594,6 +623,25 @@ class JobDispatcher:
                 _finish_failed_with_bridge("pre-existing evidence file")
                 return
 
+            if role is not None:
+                if not self._valid_role_binding(role, kind) or not self._role_consumer_qualified():
+                    logger.warning("Role consumer unsupported before execution intent; HOLD %s", job_id)
+                    return
+                # The server commits intent on this real job before the current
+                # approved consumer starts. No cached/offline permission or retry.
+                try:
+                    grant = self.client.commit_role_execution(
+                        self.base_url, job_id, job_token, lease_epoch, role["generation"])
+                except Exception:
+                    logger.warning("Role execution authorization uncertain; HOLD %s", job_id)
+                    return
+                if (grant.get("execute") is not True or grant.get("epoch") != lease_epoch
+                        or grant.get("generation") != role["generation"] or grant.get("role") != role["name"]
+                        or grant.get("profile") != kind or grant.get("payload") != payload or stop_event.is_set()):
+                    logger.warning("Role execution authorization refused or uncertain; HOLD %s", job_id)
+                    return
+                role_intent_recorded = True
+
             # Execute worker in thread to ensure actual worker execution starts
             exec_result: Dict[str, Any] = {}
             exec_exc: List[Exception] = []
@@ -627,6 +675,9 @@ class JobDispatcher:
                 return
 
             if exec_exc:
+                if role is not None:
+                    logger.warning("Role consumer outcome uncertain; retain intent and HOLD %s", job_id)
+                    return
                 _finish_failed_with_bridge(f"execution_error: {exec_exc[0]}")
                 return
 
@@ -636,7 +687,7 @@ class JobDispatcher:
             # If worker finished with error or failed without producing evidence
             if not exec_thread.is_alive() and res_obj.get("status") in ("failed", "error"):
                 summary = res_obj.get("summary") or "worker execution failed"
-                _finish_failed_with_bridge(summary, res_refs)
+                _finish_failed_with_bridge(summary, res_refs, known_terminal=True)
                 return
 
             # Never self-fabricate first-action evidence or spawn a dummy sleep child in the dispatcher.
@@ -720,6 +771,9 @@ class JobDispatcher:
             # Wait for execution to finish
             exec_thread.join()
             if exec_exc:
+                if role is not None:
+                    logger.warning("Role consumer outcome uncertain; retain intent and HOLD %s", job_id)
+                    return
                 status = "failed"
                 summary = f"execution_error: {exec_exc[0]}"
                 evidence_refs = []
@@ -921,7 +975,8 @@ class JobDispatcher:
         stop_event: threading.Event
     ) -> None:
         """Periodically renew lease every 300s (5 minutes)."""
-        interval = 300.0
+        role = self.running_jobs.get(job_id, {}).get("role_binding")
+        interval = min(300.0, role["ttl_seconds"] / 3) if role else 300.0
         while not stop_event.is_set():
             if stop_event.wait(interval):
                 break
@@ -935,6 +990,9 @@ class JobDispatcher:
                     err = renew_res.get("error")
                     logger.warning(f"Lease renewal for job {job_id} failed: {err}")
                     self._renewal_failures[job_id] = err
+                    if role:
+                        stop_event.set()
+                        break
                     if err in ("unauthorized_or_stale", "deadline_exceeded"):
                         if self.root_bridge:
                             self.root_bridge.fence("lease_renewal_failed")
@@ -942,3 +1000,21 @@ class JobDispatcher:
                         break
             except Exception as e:
                 logger.warning(f"Lease renewal exception for job {job_id}: {e}")
+                if role:
+                    stop_event.set()
+                    break
+
+    def _valid_role_binding(self, binding: Any, kind: str) -> bool:
+        return (isinstance(binding, dict) and kind == "writer-run"
+                and binding.get("profile") == kind and binding.get("host_id") == self.host_id
+                and isinstance(binding.get("name"), str)
+                and re.fullmatch(r"automation:[a-z][a-z0-9-]{0,47}:[a-z][a-z0-9-]{0,47}", binding["name"]) is not None
+                and type(binding.get("generation")) is int and binding["generation"] > 0
+                and type(binding.get("ttl_seconds")) is int and 60 <= binding["ttl_seconds"] <= 1200)
+
+    def _role_consumer_qualified(self) -> bool:
+        # Only the existing explicitly enabled fake consumer is available today.
+        # Adding a real supported profile requires the independent M8b runtime gate.
+        return (isinstance(self.runtime_mgr, RuntimeManager)
+                and self.runtime_mgr._has_qualified_mock_runner()
+                and not getattr(self.root_bridge, "is_canonical_state", False))

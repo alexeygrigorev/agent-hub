@@ -11,6 +11,7 @@ import { generateTokenPair, verifyBearerScope } from './auth/token';
 import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly, updateHeartbeat } from './registry';
 import { BusService, BUS_SCHEMA_SQL, CallerContext, generateUlid } from './bus';
 import { JobsService, JOBS_SCHEMA_SQL } from './jobs';
+import { roleName } from './role_leases';
 import { FleetService } from './fleet';
 import { LivenessService, thresholdsFrom, alertText } from './liveness';
 import { ChecksService, validateCheck } from './checks';
@@ -328,7 +329,7 @@ export class Hub extends DurableObject {
 
         const nowIso = new Date().toISOString();
         const rows = this.sql.exec(
-          `SELECT id, kind, payload, status, deadline_at, offer_host_id, offer_machine_id, offer_expires_at, created_at, actor
+          `SELECT id, kind, payload, status, deadline_at, offer_host_id, offer_machine_id, offer_expires_at, created_at, actor, role_name, role_generation
            FROM jobs
            WHERE status = 'offered'
              AND (offer_host_id = ? OR offer_machine_id = ?)
@@ -348,7 +349,8 @@ export class Hub extends DurableObject {
           deadline_at: r.deadline_at,
           offer_expires_at: r.offer_expires_at,
           created_at: r.created_at,
-          actor: r.actor
+          actor: r.actor,
+          ...(r.role_name ? { role_binding: this.jobsService.roleJobBinding(r) } : {})
         }));
 
         return Response.json({ status: 'ok', server_time: nowIso, offers });
@@ -1765,6 +1767,46 @@ export class Hub extends DurableObject {
   }
 
   private async handleJobsRoutes(request: Request, path: string, url: URL): Promise<Response | null> {
+    const roleRoute = path.match(/^\/api\/roles\/([^/]+)\/([^/]+)(?:\/(jobs))?$/);
+    if (roleRoute) {
+      const [, project, name, jobs] = roleRoute;
+      const key = roleName(project, name);
+      if (!key) return Response.json({ error: 'invalid_role_name' }, { status: 400 });
+      if (!jobs) {
+        if (!['GET','PUT'].includes(request.method)) return new Response('Method Not Allowed', { status: 405 });
+        // Configuration uses the existing operator session and CSRF, never a bearer grant.
+        const session = await getSession(this.env, request);
+        if (!session?.isAdmin) return Response.json({ error: 'operator_session_required' }, { status: 403 });
+        if (request.method === 'GET') {
+          const role = this.jobsService.roles.get(key);
+          return Response.json(role ? { name: key, generation: role.generation, config: JSON.parse(role.config),
+            lease: this.sql.exec('SELECT * FROM leases WHERE name=?', key).toArray()[0] } : { name: key, configured: false });
+        }
+        if (!verifyCsrf(request, session)) return Response.json({ error: 'CSRF token missing' }, { status: 403 });
+        const body = await safeJson(request);
+        if (!body || Object.keys(body).some(k => !['config','expected_generation'].includes(k))) return Response.json({ error: 'invalid_configuration' }, { status: 400 });
+        const result = this.jobsService.configureRole(project, name, body.config, body.expected_generation);
+        return Response.json(result, { status: result.error ? 409 : 200 });
+      }
+      if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (auth.caller?.kind !== 'host' || !auth.scopes?.includes('host') || !auth.caller.machineId || !auth.caller.tokenId) return Response.json({ error: 'enrolled_host_required' }, { status: 403 });
+      const result = this.jobsService.offerRoleJob(project, name, auth.caller.machineId, auth.caller.tokenId, await safeJson(request));
+      return Response.json(result, { status: result.error ? 409 : 201 });
+    }
+    const roleExecution = path.match(/^\/api\/jobs\/([^/]+)\/execute$/);
+    if (roleExecution) {
+      if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      const body = await safeJson(request);
+      if (!body || Object.keys(body).some(k => !['epoch','generation'].includes(k)) || !Number.isSafeInteger(body.epoch) || !Number.isSafeInteger(body.generation)) return Response.json({ error: 'invalid_binding' }, { status: 400 });
+      if (auth.caller?.kind !== 'job' || auth.caller.jobId !== roleExecution[1]) return Response.json({ error: 'job_credential_required' }, { status: 403 });
+      const token = request.headers.get('Authorization')!.substring(7).trim();
+      const result = await this.jobsService.commitRoleExecution(roleExecution[1], token, body.epoch, body.generation);
+      return Response.json(result, { status: result.error ? 409 : 200 });
+    }
     const isJobsPath = path.startsWith('/api/jobs');
     const isRootPath = path.startsWith('/api/root');
     const isHostOffers = path === '/api/host/offers';
@@ -1790,7 +1832,7 @@ export class Hub extends DurableObject {
 
       const nowIso = new Date().toISOString();
       const rows = this.sql.exec(
-        `SELECT id, kind, payload, status, deadline_at, offer_host_id, offer_machine_id, offer_expires_at, created_at, actor
+        `SELECT id, kind, payload, status, deadline_at, offer_host_id, offer_machine_id, offer_expires_at, created_at, actor, role_name, role_generation
          FROM jobs
          WHERE status = 'offered'
            AND (offer_host_id = ? OR offer_machine_id = ?)
@@ -1814,7 +1856,8 @@ export class Hub extends DurableObject {
           offer_machine_id: r.offer_machine_id,
           offer_expires_at: r.offer_expires_at,
           created_at: r.created_at,
-          actor: r.actor
+          actor: r.actor,
+          ...(r.role_name ? { role_binding: this.jobsService.roleJobBinding(r) } : {})
         };
       });
 
@@ -2199,7 +2242,7 @@ export class Hub extends DurableObject {
         }
 
         const gate = typeof body.gate === 'boolean' ? body.gate : Boolean(body.gate?.launch_allowed);
-        const res = await this.jobsService.claimJob(jobId, hostId, gate);
+        const res = await this.jobsService.claimJob(jobId, hostId, gate, undefined, auth.caller?.kind === 'host' ? auth.caller.tokenId : undefined);
         if (res.error === 'conflict') {
           return Response.json({ error: 'conflict' }, { status: 409 });
         }
@@ -2398,7 +2441,7 @@ export class Hub extends DurableObject {
         }
 
         const reason = typeof body.reason === 'string' ? body.reason : 'declined_by_host';
-        const res = await this.jobsService.declineJob(jobId, hostId, reason);
+        const res = await this.jobsService.declineJob(jobId, hostId, reason, auth.caller?.kind === 'host' ? auth.caller.tokenId : undefined);
         if (res.error) {
           return Response.json({ error: res.error }, { status: 409 });
         }
