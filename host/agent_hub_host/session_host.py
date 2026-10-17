@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 from . import config, fleet, session_control
+from .metrics_producer import MetricsProducer
 from .native_sessions import qualify_sender_binding
 from .quota_snapshot import QuotaCollector
 from .status_runtime import StatusCollector
@@ -62,6 +63,48 @@ def maybe_start_status_thread(current: Optional[threading.Thread], collector) ->
         return current
 
 
+def metrics_step_once(collector) -> None:
+    """Run ONE isolated metrics production round (observer thread only).
+
+    Bounded failure-class log only; rate-limited/disabled rounds stay silent.
+    Missing config means disabled (no exporter, no HTTP). Never raises, never
+    touches quota/command state, never logs config/token/stderr/report data.
+    """
+    try:
+        result = collector.step(submit=True)
+    except Exception as error:
+        print(json.dumps({'event': 'metrics_error', 'type': type(error).__name__}), flush=True)
+        return
+    try:
+        if not isinstance(result, dict) or result.get('rate_limited') or result.get('disabled'):
+            return
+        errors = result.get('errors')
+        print(json.dumps({'event': 'metrics_cycle',
+                          'posted': bool(result.get('posted')),
+                          'errors': len(errors) if isinstance(errors, list) else 0}), flush=True)
+    except Exception as error:
+        print(json.dumps({'event': 'metrics_error', 'type': type(error).__name__}), flush=True)
+
+
+def maybe_start_metrics_thread(current: Optional[threading.Thread], collector) -> Optional[threading.Thread]:
+    """Start ONE bounded metrics observer thread, or skip while one is alive.
+
+    Same single-inflight contract as status: a blocked exporter/HTTP never
+    delays commands/quota; the collector's own >=60s cadence (default 5min)
+    rate-limits real work. No extra timer/service/dispatcher.
+    """
+    try:
+        if current is not None and current.is_alive():
+            return current
+        thread = threading.Thread(target=metrics_step_once, args=(collector,),
+                                  daemon=True, name='metrics-produce')
+        thread.start()
+        return thread
+    except Exception as error:
+        print(json.dumps({'event': 'metrics_error', 'type': type(error).__name__}), flush=True)
+        return current
+
+
 def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=None):
     if interval < 1 or fleet_interval < interval:
         raise ValueError('Invalid host polling intervals')
@@ -96,6 +139,14 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
             allowlist_path=str(journal / 'status-allowlist.json'),
             machine_id=cfg['machine_id'], min_interval_s=60)
         status_thread: Optional[threading.Thread] = None
+        # Metrics producer hook (M9 freshness): ONE instance for the controller
+        # lifetime, trusted config under the existing journal, this machine,
+        # >=60s cadence (default 5min). Missing config means disabled. The loop
+        # below only starts/skips the single-inflight daemon thread.
+        metrics_collector = MetricsProducer(
+            config_path=str(journal / 'metrics-producer.json'),
+            machine_id=cfg['machine_id'])
+        metrics_thread: Optional[threading.Thread] = None
         next_fleet = 0
         count = 0
         try:
@@ -133,6 +184,9 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                 # Status observation never blocks commands/quota: one bounded
                 # single-inflight daemon thread, skipped while alive.
                 status_thread = maybe_start_status_thread(status_thread, status_collector)
+                # Metrics production never blocks commands/quota: one bounded
+                # single-inflight daemon thread, skipped while alive.
+                metrics_thread = maybe_start_metrics_thread(metrics_thread, metrics_collector)
                 count += 1
                 if cycles is None or count < cycles:
                     stop.wait(interval)
