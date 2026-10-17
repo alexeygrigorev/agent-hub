@@ -37,11 +37,30 @@ class TestProbeArgv(unittest.TestCase):
 
     def test_mutating_and_unknown_tools_refused(self):
         for argv in (['git', 'push', 'origin', 'main'], ['git', 'fetch', 'origin'],
-                     ['git', 'ls-remote', 'origin'], ['curl', 'https://x'],
-                     ['git'], 'notalist', [], ['git', 'bisect', 'start']):
+                     ['git', 'ls-remote', 'origin'], ['git', 'ls-remote', 'origin', 'refs/heads/main', 'extra'],
+                     ['git', 'ls-remote', 'evil', 'refs/heads/main'],
+                     ['curl', 'https://x'],
+                     ['git'], 'notalist', [], ['git', 'bisect', 'start'],
+                     ['gh', 'api', 'repos/x', '--method', 'POST'],
+                     ['gh', 'api', 'repos/x', '-X', 'POST'],
+                     ['gh', 'api', 'repos/x', 'POST'],
+                     ['gh', 'run', 'cancel', '1'],
+                     ['gh', 'run', 'rerun', '1'],
+                     ['wrangler', 'deployments', 'delete']):
             clean, reason = status_probe.check_argv(argv)
             self.assertIsNone(clean, argv)
             self.assertIsInstance(reason, str)
+
+    def test_readonly_ls_remote_and_gh_list_pass(self):
+        argv, reason = status_probe.check_argv(['git', 'ls-remote', 'origin', 'refs/heads/main'])
+        self.assertIsNotNone(argv)
+        self.assertIsNone(reason)
+        for argv_ok in (['gh', 'api', 'repos/o/r/actions/runs'],
+                        ['gh', 'run', 'list', '--limit', '5'],
+                        ['wrangler', 'deployments', 'list']):
+            clean, reason = status_probe.check_argv(argv_ok)
+            self.assertIsNotNone(clean, argv_ok)
+            self.assertIsNone(reason, argv_ok)
 
     def test_argv_secrets_masked_in_provenance(self):
         masked = status_probe.masked_argv(['gh', 'api', 'x', 'hubt_leaked_secret_token'])
@@ -63,31 +82,47 @@ class TestProbeArgv(unittest.TestCase):
 
 
 class TestGitAncestry(unittest.TestCase):
-    def repo_runner(self, head_sha, main_sha, age_s, ancestor_exit):
-        return fake_runner({
+    def repo_runner(self, head_sha, local_sha, remote_sha, ancestor_exit, remote_exit=0):
+        mapping = {
             ('git', 'rev-parse', 'HEAD'): (0, head_sha + '\n'),
-            ('git', 'rev-parse', 'origin/main'): (0, main_sha + '\n'),
-            ('git', 'log', '-1', '--format=%ct', 'origin/main'): (0, str(int(__import__('time').time() - age_s)) + '\n'),
+            ('git', 'rev-parse', 'origin/main'): (0, local_sha + '\n'),
+            ('git', 'ls-remote', 'origin', 'refs/heads/main'): (remote_exit, (remote_sha + '\trefs/heads/main\n') if remote_sha else ''),
             ('git', 'merge-base', '--is-ancestor', head_sha, 'origin/main'): (ancestor_exit, ''),
-        })
+        }
+        # merge-base is called with the probe sha, not head_sha; mirror both.
+        mapping[('git', 'merge-base', '--is-ancestor', SHA_A, 'origin/main')] = (ancestor_exit, '')
+        return fake_runner(mapping)
 
     def test_merged_only_with_fresh_ref(self):
         evidence = status_probe.build_git_ancestry('/repo', SHA_A, 'origin/main', 3600,
-                                                   self.repo_runner(SHA_A, SHA_B, 60, 0))
+                                                   self.repo_runner(SHA_A, SHA_B, SHA_B, 0))
         self.assertEqual(evidence['ancestry'], 'merged_in_main')
         self.assertEqual(evidence['sha'], SHA_A)
         self.assertTrue(evidence['provenance']['ref_fresh'])
 
+    def test_old_commit_with_current_remote_stays_fresh(self):
+        # Commit-time proxy bug: an old commit on a perfectly current remote
+        # must NOT go stale. Freshness is exact SHA equality.
+        evidence = status_probe.build_git_ancestry('/repo', SHA_A, 'origin/main', 60,
+                                                   self.repo_runner(SHA_A, SHA_B, SHA_B, 0))
+        self.assertEqual(evidence['ancestry'], 'merged_in_main')
+
     def test_not_merged(self):
         evidence = status_probe.build_git_ancestry('/repo', SHA_A, 'origin/main', 3600,
-                                                   self.repo_runner(SHA_A, SHA_B, 60, 1))
+                                                   self.repo_runner(SHA_A, SHA_B, SHA_B, 1))
         self.assertEqual(evidence['ancestry'], 'not_merged')
 
     def test_stale_ref_fails_closed_to_unknown(self):
         evidence = status_probe.build_git_ancestry('/repo', SHA_A, 'origin/main', 3600,
-                                                   self.repo_runner(SHA_A, SHA_B, 7200, 0))
+                                                   self.repo_runner(SHA_A, SHA_B, SHA_A, 0))
         self.assertEqual(evidence['ancestry'], 'unknown')
         self.assertEqual(evidence['reason'], 'stale_ref_fails_closed')
+
+    def test_network_unknown_fails_closed(self):
+        evidence = status_probe.build_git_ancestry('/repo', SHA_A, 'origin/main', 3600,
+                                                   self.repo_runner(SHA_A, SHA_B, '', 0, remote_exit=128))
+        self.assertEqual(evidence['ancestry'], 'unknown')
+        self.assertEqual(evidence['reason'], 'network_unknown_fails_closed')
 
     def test_missing_ref_is_unknown_not_merged(self):
         runner = fake_runner({
@@ -120,16 +155,24 @@ class TestRealGitFixtures(unittest.TestCase):
         return proc.stdout.decode().strip()
 
     def test_real_merge_base_roundtrip(self):
+        # Local bare origin so `git ls-remote origin refs/heads/main` is a
+        # real read-only fresh-remote read without network.
+        bare = str(Path(self.tmp.name) / 'origin.git')
+        proc = subprocess.run(['git', 'init', '--bare', bare], env=self.env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode())
+        self.git('remote', 'add', 'origin', bare)
+        self.git('push', '-u', 'origin', 'main')
         head = self.git('rev-parse', 'HEAD')
         self.assertRegex(head, r'^[0-9a-f]{40}$')
-        evidence = status_probe.build_git_ancestry(self.repo, head, 'main', 3600)
+        evidence = status_probe.build_git_ancestry(self.repo, head, 'origin/main', 3600)
         self.assertEqual(evidence['ancestry'], 'merged_in_main')
         self.git('checkout', '-b', 'side')
         (Path(self.repo) / 'g.txt').write_text('two', encoding='utf-8')
         self.git('add', 'g.txt')
         self.git('commit', '-m', 'side')
         side = self.git('rev-parse', 'HEAD')
-        evidence = status_probe.build_git_ancestry(self.repo, side, 'main', 3600)
+        evidence = status_probe.build_git_ancestry(self.repo, side, 'origin/main', 3600)
         self.assertEqual(evidence['ancestry'], 'not_merged')
 
 
@@ -191,7 +234,7 @@ class TestCollectProbes(unittest.TestCase):
         runner = fake_runner({
             ('git', 'rev-parse', 'HEAD'): (0, SHA_A + '\n'),
             ('git', 'rev-parse', 'origin/main'): (0, SHA_B + '\n'),
-            ('git', 'log', '-1', '--format=%ct', 'origin/main'): (0, str(int(__import__('time').time() - 10)) + '\n'),
+            ('git', 'ls-remote', 'origin', 'refs/heads/main'): (0, SHA_B + '\trefs/heads/main\n'),
             ('git', 'merge-base', '--is-ancestor', SHA_A, 'origin/main'): (0, ''),
         })
         result = status_probe.collect_probes(self.spec([

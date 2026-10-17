@@ -39,11 +39,14 @@ MAX_PROBES = 50
 # Explicit trusted tools + read-only subcommands. Anything else is refused
 # (unknown with reason), never executed.
 ALLOWLIST = {
-    'git': {'rev-parse', 'merge-base', 'status', 'log', 'show-ref', 'branch'},
+    'git': {'rev-parse', 'merge-base', 'status', 'log', 'show-ref', 'branch', 'ls-remote'},
     'gh': {'api', 'run'},
     'wrangler': {'deployments'},
 }
-REFUSED_GIT_REMOTES = {'fetch', 'push', 'pull', 'clone', 'ls-remote'}
+REFUSED_GIT_REMOTES = {'fetch', 'push', 'pull', 'clone'}
+_GH_WRITE_TOKENS = {'post', 'patch', 'put', 'delete'}
+_GH_RUN_READONLY = {'list', 'view'}
+_LS_REMOTE_REF_RE = None  # compiled lazily to keep import light
 
 KINDS = ('git_ancestry', 'ci', 'deployment')
 
@@ -75,6 +78,46 @@ def check_argv(argv: Any) -> tuple[list | None, str | None]:
         return None, 'probe_git_remote_refused'
     if argv[1] not in ALLOWLIST[tool]:
         return None, 'probe_subcommand_not_allowlisted'
+    if tool == 'git' and argv[1] == 'ls-remote':
+        # Read-only fresh-remote read with exact args only: no fetch mutations,
+        # no extra flags, no other remotes/refs. Shape:
+        #   git ls-remote origin refs/heads/<branch>
+        if len(argv) != 4 or argv[2] != 'origin':
+            return None, 'probe_git_ls_remote_exact_args_only'
+        import re as _re
+        if not _re.fullmatch(r'refs/heads/[A-Za-z0-9._-]+', argv[3]):
+            return None, 'probe_git_ls_remote_exact_args_only'
+        return argv, None
+    if tool == 'gh' and argv[1] == 'api':
+        # gh api defaults to GET; any write method/body flag is refused so the
+        # adapter stays truly read-only.
+        lowered = [a.lower() for a in argv[2:]]
+        if any(t in _GH_WRITE_TOKENS for t in lowered):
+            return None, 'probe_gh_write_refused'
+        for i, token in enumerate(argv[2:]):
+            low = token.lower()
+            if low == '-x':
+                return None, 'probe_gh_write_refused'
+            if low.startswith('--method'):
+                value = ''
+                if '=' in token:
+                    value = token.split('=', 1)[1]
+                elif i + 1 < len(argv[2:]):
+                    value = argv[2:][i + 1]
+                if value.lower() not in ('', 'get'):
+                    return None, 'probe_gh_write_refused'
+            if low == '--input':
+                return None, 'probe_gh_write_refused'
+        return argv, None
+    if tool == 'gh' and argv[1] == 'run':
+        # Only read-only run inspection; cancel/rerun are mutations.
+        if len(argv) < 3 or argv[2] not in _GH_RUN_READONLY:
+            return None, 'probe_gh_run_write_refused'
+        return argv, None
+    if tool == 'wrangler' and argv[1] == 'deployments':
+        if len(argv) < 3 or argv[2] != 'list':
+            return None, 'probe_subcommand_not_allowlisted'
+        return argv, None
     return argv, None
 
 
@@ -93,27 +136,107 @@ def realpath_under(path: str, roots: list) -> bool:
     return False
 
 
+def _drain_bounded(pipe, limit: int) -> tuple[bytes, bool]:
+    """Read a PIPE to EOF, keeping at most limit+1 bytes in flight.
+
+    Returns (data_capped, overflow). Overflow means the child wrote more than
+    the bound; the caller kills the child and truncates. Chunked reads keep
+    memory bounded while draining (no unbounded capture before truncate).
+    """
+    chunks: list = []
+    total = 0
+    try:
+        while True:
+            data = pipe.read(4096)
+            if not data:
+                break
+            total += len(data)
+            if total > limit:
+                # Keep only up to the bound; record overflow and stop keeping.
+                keep = limit - (total - len(data))
+                if keep > 0:
+                    chunks.append(data[:keep])
+                return b''.join(chunks), True
+            chunks.append(data)
+    except (OSError, ValueError):
+        pass
+    return b''.join(chunks), False
+
+
 def run_argv(argv: list, cwd: str, timeout_s: int,
              runner: Callable | None = None) -> dict:
-    """Run one explicit argv (no shell). Returns {exit, stdout, stderr} bounded+redacted."""
+    """Run one explicit argv (no shell). Returns {exit, stdout, stderr} bounded+redacted.
+
+    Subprocess output is bounded IN FLIGHT (chunked drain, at most
+    MAX_OUTPUT bytes kept per stream); overflow kills the child. Timeout is
+    enforced (sane clamp applied by the caller, 1..120s).
+    """
     if runner is not None:
         result = runner(argv, cwd, timeout_s)
         return {'exit': int(result.get('exit', 99)),
                 'stdout': sanitize(result.get('stdout', ''), MAX_OUTPUT),
                 'stderr': sanitize(result.get('stderr', ''), MAX_OUTPUT)}
+    import threading
+
     try:
-        proc = subprocess.run(argv, cwd=cwd, timeout=timeout_s, shell=False,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              stdin=subprocess.DEVNULL, env=_scrubbed_env())
+        timeout_f = float(timeout_s)
+    except (TypeError, ValueError):
+        timeout_f = float(DEFAULT_TIMEOUT_S)
+    timeout_f = max(1.0, min(timeout_f, 120.0))
+    try:
+        proc = subprocess.Popen(argv, cwd=cwd, shell=False,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                stdin=subprocess.DEVNULL, env=_scrubbed_env())
     except FileNotFoundError:
         return {'exit': 127, 'stdout': '', 'stderr': 'tool_not_installed'}
-    except subprocess.TimeoutExpired:
-        return {'exit': 124, 'stdout': '', 'stderr': 'probe_timeout'}
     except OSError as exc:
         return {'exit': 126, 'stdout': '', 'stderr': sanitize(str(exc), 200)}
-    return {'exit': proc.returncode,
-            'stdout': sanitize(proc.stdout.decode('utf-8', errors='replace'), MAX_OUTPUT),
-            'stderr': sanitize(proc.stderr.decode('utf-8', errors='replace'), MAX_OUTPUT)}
+    out: dict = {}
+    def _read(key: str, pipe) -> None:
+        out[key] = _drain_bounded(pipe, MAX_OUTPUT)
+    threads = [threading.Thread(target=_read, args=('stdout', proc.stdout), daemon=True),
+               threading.Thread(target=_read, args=('stderr', proc.stderr), daemon=True)]
+    for thread in threads:
+        thread.start()
+    try:
+        proc.wait(timeout=timeout_f)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        for thread in threads:
+            thread.join(timeout=2)
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+        except OSError:
+            pass
+        return {'exit': 124, 'stdout': '', 'stderr': 'probe_timeout'}
+    for thread in threads:
+        thread.join(timeout=5)
+    try:
+        if proc.stdout:
+            proc.stdout.close()
+        if proc.stderr:
+            proc.stderr.close()
+    except OSError:
+        pass
+    (stdout_bytes, stdout_overflow), (stderr_bytes, stderr_overflow) = (
+        out.get('stdout', (b'', False)), out.get('stderr', (b'', False)))
+    if stdout_overflow or stderr_overflow:
+        return {'exit': proc.returncode if proc.returncode is not None else 99,
+                'stdout': sanitize(stdout_bytes.decode('utf-8', errors='replace'), MAX_OUTPUT),
+                'stderr': 'probe_output_truncated'}
+    return {'exit': proc.returncode if proc.returncode is not None else 99,
+            'stdout': sanitize(stdout_bytes.decode('utf-8', errors='replace'), MAX_OUTPUT),
+            'stderr': sanitize(stderr_bytes.decode('utf-8', errors='replace'), MAX_OUTPUT)}
 
 
 def _scrubbed_env() -> dict:
@@ -127,30 +250,72 @@ def _scrubbed_env() -> dict:
     return keep
 
 
+def _ls_remote_ref(ref: str) -> str | None:
+    """Map a local tracking ref to its ls-remote ref. None when unmappable."""
+    if not isinstance(ref, str) or not ref:
+        return None
+    if ref.startswith('refs/heads/'):
+        return ref
+    if ref.startswith('origin/'):
+        branch = ref[len('origin/'):]
+    elif '/' not in ref:
+        branch = ref
+    else:
+        return None
+    import re as _re
+    if not _re.fullmatch(r'[A-Za-z0-9._-]+', branch):
+        return None
+    return 'refs/heads/' + branch
+
+
+def _parse_sha(text: str) -> str | None:
+    token = (text or '').strip().split()[0] if (text or '').strip() else ''
+    if len(token) == 40 and all(c in '0123456789abcdefABCDEF' for c in token):
+        return token.lower()
+    return None
+
+
 def build_git_ancestry(repo: str, sha: str, ref: str, ref_max_age_s: int,
                        runner: Callable | None = None,
                        timeout_s: int = DEFAULT_TIMEOUT_S) -> dict:
-    """Local ancestry facts. merged_in_main ONLY on exit-0 is-ancestor AND a
-    fresh origin/main ref; stale/missing refs fail closed to unknown."""
+    """Local ancestry facts with FRESH remote verification (no commit-time proxy).
+
+    merged_in_main ONLY on exit-0 is-ancestor AND an exact SHA match between
+    the local ``ref`` and a fresh read-only ``git ls-remote origin
+    refs/heads/main``. A perfectly current remote with an old commit stays
+    fresh (SHA equality is freshness); a stale local ref with a recent commit
+    never counts. Network/parse failures fail closed to unknown.
+    ``ref_max_age_s`` is retained for ABI compatibility and ignored.
+    """
+    _ = ref_max_age_s
     provenance = {'tool': 'git', 'repo': repo, 'sha': sha, 'ref': ref}
     head = run_argv(['git', 'rev-parse', 'HEAD'], repo, timeout_s, runner)
     if head['exit'] != 0:
         return {'sha': sha, 'ancestry': 'unknown', 'reason': 'head_unreadable:' + head['stderr'][:120],
                 'provenance': provenance}
-    main_sha = run_argv(['git', 'rev-parse', ref], repo, timeout_s, runner)
-    if main_sha['exit'] != 0:
-        return {'sha': sha, 'ancestry': 'unknown', 'reason': 'ref_unreadable:' + main_sha['stderr'][:120],
+    local = run_argv(['git', 'rev-parse', ref], repo, timeout_s, runner)
+    if local['exit'] != 0:
+        return {'sha': sha, 'ancestry': 'unknown', 'reason': 'ref_unreadable:' + local['stderr'][:120],
                 'provenance': provenance}
-    main_sha_text = main_sha['stdout'].strip().split()[0] if main_sha['stdout'].strip() else ''
-    stamp = run_argv(['git', 'log', '-1', '--format=%ct', ref], repo, timeout_s, runner)
-    try:
-        import time
-        age = time.time() - int(stamp['stdout'].strip().split()[0])
-        fresh = 0 <= age <= ref_max_age_s
-    except (ValueError, IndexError):
-        age, fresh = None, False
-    provenance = {**provenance, 'origin_main_sha': main_sha_text,
-                  'origin_main_age_s': age, 'ref_fresh': fresh}
+    local_sha = _parse_sha(local['stdout'])
+    if not local_sha:
+        return {'sha': sha, 'ancestry': 'unknown', 'reason': 'ref_unparseable',
+                'provenance': provenance}
+    ls_ref = _ls_remote_ref(ref)
+    if not ls_ref:
+        return {'sha': sha, 'ancestry': 'unknown', 'reason': 'ref_unmappable_for_ls_remote',
+                'provenance': {**provenance, 'origin_main_sha': local_sha}}
+    remote = run_argv(['git', 'ls-remote', 'origin', ls_ref], repo, timeout_s, runner)
+    if remote['exit'] != 0:
+        return {'sha': sha, 'ancestry': 'unknown', 'reason': 'network_unknown_fails_closed',
+                'provenance': {**provenance, 'origin_main_sha': local_sha}}
+    remote_sha = _parse_sha(remote['stdout'])
+    if not remote_sha:
+        return {'sha': sha, 'ancestry': 'unknown', 'reason': 'network_unknown_fails_closed',
+                'provenance': {**provenance, 'origin_main_sha': local_sha}}
+    fresh = (local_sha == remote_sha)
+    provenance = {**provenance, 'origin_main_sha': local_sha,
+                  'remote_sha': remote_sha, 'ref_fresh': fresh}
     if not fresh:
         return {'sha': sha, 'ancestry': 'unknown', 'reason': 'stale_ref_fails_closed',
                 'provenance': provenance}
