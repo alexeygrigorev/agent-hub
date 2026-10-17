@@ -20,6 +20,38 @@ def get_config_path() -> Path:
         base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     return base / "agent-hub" / "host.json"
 
+
+# Baked default hub base URL for fresh human installs (overridable via
+# --url, stored base_url, HUB_URL/HUB_BASE_URL, or HUB_CONFIG_FILE).
+DEFAULT_BASE_URL = "https://agent-hub.cloudflare-ai-agent-de9ca0.workers.dev"
+
+
+def get_human_config_path() -> Path:
+    """Human CLI profile: ~/.config/agent-hub/cli.json, separate from host.json.
+
+    Explicit HUB_CONFIG_FILE always wins and points both profiles at one
+    file (single-file override mode; callers must then check client_kind
+    instead of assuming which profile a token belongs to).
+    """
+    explicit = os.environ.get('HUB_CONFIG_FILE')
+    if explicit:
+        path = Path(explicit).expanduser()
+        if not path.is_absolute(): raise ValueError('HUB_CONFIG_FILE must be absolute')
+        return path
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            raise RuntimeError("APPDATA environment variable not set on Windows")
+        base = Path(appdata)
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "agent-hub" / "cli.json"
+
+
+def get_host_config_path() -> Path:
+    """Legacy host profile path (same as get_config_path)."""
+    return get_config_path()
+
 import urllib.parse
 
 def is_valid_machine_id(val) -> bool:
@@ -58,7 +90,7 @@ def same_origin(url_a: str, url_b: str) -> bool:
 class _TokenExchange:
     """One local login/refresh receipt; never ambient config-update authority."""
 
-    def __init__(self, base_url, path, starting_config):
+    def __init__(self, base_url, path, starting_config, *, _load_fn=None, _save_fn=None):
         if path not in ("/api/device/token", "/api/token/refresh"):
             raise ValueError("Invalid token endpoint")
         canonical_origin(base_url)
@@ -71,6 +103,8 @@ class _TokenExchange:
         self.base_url = base_url
         self.path = path
         self.starting_config = copy.deepcopy(starting_config)
+        self._load_fn = _load_fn or load_config
+        self._save_fn = _save_fn or save_config
         self._closed = False
         self._response = self._data = None
 
@@ -111,7 +145,7 @@ class _TokenExchange:
             raise ValueError("Token exchange response mismatch")
         if set(metadata) - {"client_kind", "client_name", "requested_scopes"}:
             raise ValueError("Invalid authentication metadata")
-        if load_config() != self.starting_config:
+        if self._load_fn() != self.starting_config:
             raise ValueError("Config changed during authentication; retry login")
         cfg = copy.deepcopy(self.starting_config)
         cfg.update(metadata)
@@ -128,7 +162,7 @@ class _TokenExchange:
                 cfg.pop("machine_id", None)
             else:
                 cfg["machine_id"] = data["machine_id"]
-        save_config(cfg)
+        self._save_fn(cfg)
 
 def _validate_data(data: dict) -> dict:
     if not isinstance(data, dict):
@@ -153,8 +187,7 @@ def _validate_data(data: dict) -> dict:
         res[k] = v
     return res
 
-def load_config() -> dict:
-    path = get_config_path()
+def _load_from(path: Path) -> dict:
     if not path.exists():
         return {}
     try:
@@ -162,7 +195,8 @@ def load_config() -> dict:
     except Exception:
         return {}
 
-def save_config(data: dict):
+
+def _save_to(path: Path, data: dict):
     if not isinstance(data, dict):
         raise ValueError("Config data must be a dict")
     cleaned = {}
@@ -172,15 +206,88 @@ def save_config(data: dict):
         cleaned[k] = v
     if cleaned and _validate_data(cleaned) != cleaned:
         raise ValueError("Invalid config data")
-
-    path = get_config_path()
     try:
         private_fs.atomic_write(path, json.dumps(cleaned).encode('utf-8'), 1024 * 1024)
     except Exception:
         raise RuntimeError('Config save failed') from None
 
+
+def load_host_config() -> dict:
+    """Legacy host profile only (host.json, or HUB_CONFIG_FILE override)."""
+    return _load_from(get_host_config_path())
+
+
+def save_host_config(data: dict):
+    _save_to(get_host_config_path(), data)
+
+
+def load_human_config() -> dict:
+    """Human CLI profile only (cli.json, or HUB_CONFIG_FILE override).
+
+    Never mistakes a legacy host token for human: callers must also check
+    client_kind == "human" (see is_human_config).
+    """
+    return _load_from(get_human_config_path())
+
+
+def save_human_config(data: dict):
+    _save_to(get_human_config_path(), data)
+
+
+def clear_human_config():
+    path = get_human_config_path()
+    host_path = get_host_config_path()
+    # In single-file override mode both paths coincide: removing it would
+    # destroy the host profile too. Human logout in that mode only clears
+    # human credentials when the file actually holds a human profile; a
+    # host-kind file is left untouched and logout reports already-logged-out.
+    if path == host_path:
+        cfg = _load_from(path)
+        if not is_human_config(cfg):
+            return False
+    if path.exists():
+        path.unlink()
+    return True
+
+
+def is_human_config(cfg: dict) -> bool:
+    return (
+        isinstance(cfg, dict)
+        and cfg.get("client_kind") == "human"
+        and isinstance(cfg.get("access_token"), str)
+        and bool(cfg.get("access_token"))
+    )
+
+
+def load_config() -> dict:
+    """Active profile for normal user commands (human-first, host fallback).
+
+    - HUB_CONFIG_FILE set: single-file mode, return that file as-is
+      (legacy behavior; kind check left to callers).
+    - Else: human cli.json when it holds an access token, otherwise
+      legacy host.json. On fresh Linux after `hub auth login` only the
+      human file exists, so sessions/intake/status automatically use it.
+    - Host-only flows (hub login, host agent register/poll) must use
+      load_host_config() explicitly so a human profile never overwrites
+      or impersonates the host file.
+    """
+    if os.environ.get('HUB_CONFIG_FILE'):
+        return _load_from(get_config_path())
+    human = load_human_config()
+    if isinstance(human.get("access_token"), str) and human.get("access_token"):
+        return human
+    return load_host_config()
+
+
+def save_config(data: dict):
+    """Legacy host save (host.json, or HUB_CONFIG_FILE override). Untouched."""
+    _save_to(get_config_path(), data)
+
 def update_config(**kwargs):
-    cfg = load_config()
+    # Host-only (hub login / machine binding). Never reads the human
+    # profile: a human login must not change host pairing, and host
+    # registration must not mix human tokens into host.json.
+    cfg = load_host_config() if not os.environ.get('HUB_CONFIG_FILE') else load_config()
     updates = dict(kwargs)
     if "refresh_token" in updates and updates["refresh_token"] is None:
         updates.pop("refresh_token", None)

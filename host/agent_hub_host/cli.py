@@ -3,6 +3,19 @@ import sys
 import json
 from . import auth, api, system, config
 
+try:
+    from . import human_auth
+except ImportError:  # pragma: no cover - vendored fallback always present
+    human_auth = None
+
+HUB_VERSION = "0.1.0"
+try:
+    from . import __version__ as _pkg_version
+    HUB_VERSION = _pkg_version
+except Exception:
+    pass
+
+
 def cmd_login(args):
     try:
         kind = getattr(args, 'kind', 'host')
@@ -11,6 +24,55 @@ def cmd_login(args):
     except Exception as e:
         print(f"Login failed: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+def cmd_auth_login(args):
+    if human_auth is None:
+        print("Login failed: human auth module unavailable", file=sys.stderr)
+        sys.exit(1)
+    try:
+        human_auth.human_login(getattr(args, 'url', None), getattr(args, 'label', None))
+    except Exception as e:
+        print(f"Login failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_auth_status(args):
+    if human_auth is None:
+        print("Error checking status: human auth module unavailable", file=sys.stderr)
+        sys.exit(1)
+    try:
+        status = human_auth.human_status()
+    except Exception:
+        print("Status operation failed; check authentication and filters.", file=sys.stderr)
+        sys.exit(1)
+    if getattr(args, 'json', False):
+        print(json.dumps(status, indent=2, sort_keys=True))
+        return
+    if not status.get("logged_in"):
+        print("Status: Not logged in as human. Run `hub auth login`.")
+        sys.exit(1)
+    print("Status: Logged in as human.")
+    if status.get("base_url"):
+        print(f"Base URL: {status['base_url']}")
+    for key in ("actor", "email", "sub", "label"):
+        if status.get(key):
+            print(f"{key}: {status[key]}")
+
+
+def cmd_auth_logout(args):
+    if human_auth is None:
+        print("Logout failed: human auth module unavailable", file=sys.stderr)
+        sys.exit(1)
+    try:
+        result = human_auth.human_logout()
+    except Exception:
+        print("Logout failed; check authentication.", file=sys.stderr)
+        sys.exit(1)
+    if result.get("already"):
+        print("Already logged out (no human session). Host profile preserved.")
+    else:
+        print("Logged out. Human profile removed; host profile preserved.")
 
 def cmd_machines_available(args):
     try:
@@ -133,6 +195,7 @@ def add_bridge_resume_command(sub):
 
 def main():
     parser = argparse.ArgumentParser(description="Agent Hub CLI")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {HUB_VERSION}")
     sub = parser.add_subparsers(dest="cmd", required=True)
     from . import routing
     routing.add_commands(sub)
@@ -174,6 +237,15 @@ def main():
     p_login.add_argument('--kind', choices=['host', 'agent'], default='host')
     p_login.add_argument('--name', help='Human-visible name of this paired host or agent')
     p_login.add_argument('--scope', action='append', help='Requested scope; administrator approval is required')
+
+    p_auth = sub.add_parser("auth", help="Human Developer CLI auth (device login, status, logout)")
+    a_sub = p_auth.add_subparsers(dest="auth_cmd", required=True)
+    p_auth_login = a_sub.add_parser("login", help="Human device login (prints URL + user code)")
+    p_auth_login.add_argument("--url", default=None, help="Hub base URL (default: baked prod URL or stored human base)")
+    p_auth_login.add_argument("--label", default=None, help="Human label for this CLI (default: developer-cli)")
+    p_auth_status = a_sub.add_parser("status", help="Human auth status (safe identity, no tokens)")
+    p_auth_status.add_argument("--json", action="store_true", help="Output JSON")
+    a_sub.add_parser("logout", help="Revoke human family + remove human config (preserves host)")
     
     p_machines = sub.add_parser("machines", help="Machines operations")
     m_sub = p_machines.add_subparsers(dest="m_cmd", required=True)
@@ -360,6 +432,15 @@ def main():
             sys.exit(1)
     elif args.cmd == "login":
         cmd_login(args)
+    elif args.cmd == "auth":
+        if getattr(args, 'auth_cmd', None) == "login":
+            cmd_auth_login(args)
+        elif getattr(args, 'auth_cmd', None) == "status":
+            cmd_auth_status(args)
+        elif getattr(args, 'auth_cmd', None) == "logout":
+            cmd_auth_logout(args)
+        else:
+            parser.error("auth requires login/status/logout")
     elif args.cmd == "machines":
         if args.m_cmd == "available":
             cmd_machines_available(args)

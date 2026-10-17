@@ -153,6 +153,13 @@ class RNG:
     def random(self) -> float: return random.random()
     def randbytes(self, n: int) -> bytes: return os.urandom(n)
 
+def _host_cfg():
+    import os
+    if os.environ.get("HUB_CONFIG_FILE"):
+        return config.load_config()
+    return config.load_host_config()
+
+
 def _persist_registration_machine_id(base_url: str, res):
     if not isinstance(res, dict):
         return
@@ -162,7 +169,7 @@ def _persist_registration_machine_id(base_url: str, res):
     mid = res.get("machine_id") if "machine_id" in res else res.get("id")
     if not config.is_valid_machine_id(mid):
         raise RuntimeError("Invalid machine_id in registration response")
-    cfg = config.load_config()
+    cfg = _host_cfg()
     cfg_base = cfg.get("base_url")
     if cfg_base and canonical_origin(base_url) != canonical_origin(cfg_base):
         raise RuntimeError("Registration origin mismatch with configured base_url")
@@ -177,7 +184,7 @@ def _persist_registration_machine_id(base_url: str, res):
 
 def register_machine(base_url: str):
     check_url(base_url)
-    cfg = config.load_config()
+    cfg = _host_cfg()
     cfg_base = cfg.get("base_url")
     if cfg_base and canonical_origin(base_url) != canonical_origin(cfg_base):
         raise RuntimeError("Registration URL origin does not match configured base_url")
@@ -185,7 +192,7 @@ def register_machine(base_url: str):
     url = f"{base_url.rstrip('/')}/api/machines/register"
     req = urllib.request.Request(url, data=json.dumps(info).encode("utf-8"), headers={
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {auth.get_access_token()}"
+        "Authorization": f"Bearer {auth.get_host_access_token()}"
     })
     try:
         res = safe_http_json(req, timeout=10.0)
@@ -196,7 +203,7 @@ def register_machine(base_url: str):
                 auth.refresh_token()
                 retry_req = urllib.request.Request(url, data=json.dumps(info).encode("utf-8"), headers={
                     "Content-Type": "application/json",
-                    "Authorization": f"Bearer {auth.get_access_token()}"
+                    "Authorization": f"Bearer {auth.get_host_access_token()}"
                 })
                 retry_res = safe_http_json(retry_req, timeout=10.0)
                 _persist_registration_machine_id(base_url, retry_res)
@@ -207,20 +214,20 @@ def register_machine(base_url: str):
 
 def get_available_machines(base_url: str):
     check_url(base_url)
-    cfg = config.load_config()
+    cfg = _host_cfg()
     cfg_base = cfg.get("base_url")
     if cfg_base and canonical_origin(base_url) != canonical_origin(cfg_base):
         raise RuntimeError("Target URL origin does not match configured base_url")
     url = f"{base_url.rstrip('/')}/api/machines/available"
     req = urllib.request.Request(url, headers={
-        "Authorization": f"Bearer {auth.get_access_token()}"
+        "Authorization": f"Bearer {auth.get_host_access_token()}"
     })
     try:
         return safe_http_json(req, timeout=10.0)
     except urllib.error.HTTPError as e:
         if e.code == 401:
             auth.refresh_token()
-            req.add_header("Authorization", f"Bearer {auth.get_access_token()}")
+            req.add_header("Authorization", f"Bearer {auth.get_host_access_token()}")
             return safe_http_json(req, timeout=10.0)
         raise RuntimeError(f"Failed to get available machines: {e.code}")
 
@@ -347,7 +354,7 @@ class HostAgent:
         self.clock = clock or Clock()
         self.rng = rng or RNG()
         self.shutdown_requested = False
-        self.cfg = config.load_config()
+        self.cfg = _host_cfg()
         self.base_url = self.cfg.get("base_url")
         self.dispatcher = dispatcher
         if quota_collector is not None:
@@ -388,10 +395,10 @@ class HostAgent:
 
     def run(self):
         if not self.base_url:
-            self.cfg = config.load_config()
+            self.cfg = _host_cfg()
             self.base_url = self.cfg.get("base_url")
         register_machine(self.base_url)
-        self.cfg = config.load_config()
+        self.cfg = _host_cfg()
         if not self.base_url:
             self.base_url = self.cfg.get("base_url")
         
@@ -408,7 +415,7 @@ class HostAgent:
         while not self.shutdown_requested:
             start_time = self._monotonic()
             try:
-                token = auth.get_access_token()
+                token = auth.get_host_access_token()
                 sock, rest = ws_handshake(host, port, path, token, parsed.scheme == "https", self.rng)
                 self._run_ws(sock, rest)
             except Exception:
@@ -479,13 +486,13 @@ class HostAgent:
         self._tick_quota()
         target_base = self.base_url
         if not target_base:
-            target_base = config.load_config().get("base_url")
+            target_base = _host_cfg().get("base_url")
         url = f"{target_base}/api/host/poll"
         running_ids = self.dispatcher.get_running_job_ids() if self.dispatcher and hasattr(self.dispatcher, "get_running_job_ids") else (list(self.dispatcher.running_jobs.keys()) if self.dispatcher and hasattr(self.dispatcher, "running_jobs") else [])
         hb = get_heartbeat_payload(self.clock, running_jobs=running_ids)
         req = urllib.request.Request(url, data=json.dumps(hb).encode("utf-8"), headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {auth.get_access_token()}"
+            "Authorization": f"Bearer {auth.get_host_access_token()}"
         })
         try:
             res = safe_http_json(req, timeout=10.0)
