@@ -12,10 +12,14 @@ const unauth = { error: Response.json({ error: 'unauthorized' }, { status: 401 }
 
 const NATIVE_ID = '11111111-1111-4111-8111-111111111111';
 const NATIVE_WS = '/srv/hub/demo';
-const NATIVE_TAG = 'hub-tag-1';
+// Canonical Fleet consumer tag for a launch ('hub-<fleet_launch_id>', the
+// exact argv the existing Dispatcher starts): F5 binding reconciliation
+// requires it, so fixtures use it instead of an arbitrary label.
+const NATIVE_TAG = 'hub-launch-1';
 const NATIVE_CREATED = 1792223000000;
-const native = () => ({ native_id: NATIVE_ID, tag: NATIVE_TAG, workspace: NATIVE_WS });
+const native = (tag = NATIVE_TAG) => ({ native_id: NATIVE_ID, tag, workspace: NATIVE_WS });
 const bound = (over: any = {}) => ({ native_id: NATIVE_ID, tag: NATIVE_TAG, workspace: NATIVE_WS, native_created_at_ms: NATIVE_CREATED, ...over });
+const canonTag = (launchId: string) => 'hub-' + launchId;
 const ATTEMPT = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
 const ATTEMPT2 = 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb';
 const goodProof = () => ({ native_message_id: 'nmsg-1', reply_to_native_id: 'nreply-1',
@@ -43,13 +47,36 @@ async function fixture(fn: (s: SessionControlService, sql: any) => Promise<void>
     const service = new SessionControlService(hub.sql, (cb) => state.storage.transactionSync(cb), Date.now,
       reserve ? { reserve } : {}, options || {});
     service.init();
-    // Presenting host credential row so family continuity is exercised honestly.
+    // Presenting host credential row so family continuity is exercised honestly,
+    // plus its live machine registry row (hostOk consults machines on every
+    // host call; a deleted machine binds nothing).
     const at = new Date().toISOString();
     const far = new Date(Date.now() + 30 * 86400000).toISOString();
     hub.sql.exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
       VALUES ('host-cred-1', 'host', 'hash-host-cred-1', 'refresh-host-cred-1', 'host-family-1', 'test-host', 'hetzner', NULL, '["host"]', 'test', ?, ?)`, at, far);
+    hub.sql.exec(`INSERT OR IGNORE INTO machines (id, name, hostname, credential_id, registered_at) VALUES ('hetzner', 'hetzner', 'hetzner', 'host-cred-1', ?)`, at);
     await fn(service, hub.sql);
   });
+}
+
+/** Model the legitimate Fleet consumer report for one launch (claimed and
+ * reported running with its native receipt), which F5 binding reconciles
+ * against. Fixture setup only: the binding route under test stays real. */
+function ensureFleetLaunch(sql: any, launchId: string, machine = 'hetzner', nativeId: string | null = NATIVE_ID, launchState = 'running') {
+  const at = new Date().toISOString();
+  sql.exec(`INSERT OR REPLACE INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, launcher_task_id, created_at, updated_at)
+    VALUES (?, 'test-admin', 'human', NULL, 'fixture', ?, '{"workspace":"demo"}', ?, 'codex', 'fixture-acct', NULL, 'headless', 'demo', 'goal', ?, ?, NULL, ?, ?)`,
+    launchId, 'fleet-' + launchId, machine, launchState, nativeId, at, at);
+}
+
+/** Model the existing Fleet sessions report for one native session (the
+ * authoritative native identity the F5 binding reconciles workspace/tag
+ * against). Fixture setup only. */
+function reportFleetSession(sql: any, machine: string, nativeId: string, tag: string, workspace: string, phase = 'running') {
+  const at = new Date().toISOString();
+  sql.exec(`INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, profile, account, last_activity_at)
+    VALUES (?, ?, ?, 'codex', ?, NULL, ?, ?, NULL, 'fixture-acct', NULL)`,
+    machine, nativeId, tag, phase, at, workspace);
 }
 
 async function startOk(s: SessionControlService, extra: any = {}, auth: any = admin, key = crypto.randomUUID()) {
@@ -59,8 +86,12 @@ async function startOk(s: SessionControlService, extra: any = {}, auth: any = ad
   return data;
 }
 
-async function bindHttp(s: SessionControlService, sessionId: string, machine = 'hetzner', extra: any = {}) {
-  const res = await s.handle(request(`/api/sessions/${sessionId}/binding`, { native: { ...bound(), ...extra } }), host(machine));
+async function bindHttp(s: SessionControlService, sql: any, sessionId: string, machine = 'hetzner', extra: any = {}) {
+  const session: any = sql.exec('SELECT fleet_launch_id, machine_id FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0];
+  const launchId = session?.fleet_launch_id || 'launch-1';
+  ensureFleetLaunch(sql, launchId, session?.machine_id || machine);
+  reportFleetSession(sql, session?.machine_id || machine, NATIVE_ID, canonTag(launchId), NATIVE_WS);
+  const res = await s.handle(request(`/api/sessions/${sessionId}/binding`, { native: { ...bound({ tag: canonTag(launchId) }), ...extra } }), host(machine));
   const data = await res.json() as any;
   expect(res.status, JSON.stringify(data)).toBe(200);
   expect(data.state).toBe('running');
@@ -104,7 +135,7 @@ describe('hub session control durable queue', () => {
 
   it('rejects tier before placement and never sends it to fleet', async () => {
     const fake = fakeReserve();
-    await fixture(async (s) => {
+    await fixture(async (s, sql) => {
       const res = await s.handle(request('/api/sessions', { key: 'tier-1', workspace: 'demo', tier: 'quick' }), admin);
       expect(res.status).toBe(400);
       expect(fake.calls.length).toBe(0);
@@ -121,7 +152,7 @@ describe('hub session control durable queue', () => {
 
   it('starts through placement, replays same key, conflicts on changed intent', async () => {
     const fake = fakeReserve();
-    await fixture(async (s) => {
+    await fixture(async (s, sql) => {
       const first: any = await startOk(s, { engine: 'codex', machine: 'hetzner' }, admin, 'start-1');
       expect(first.state).toBe('offered');
       expect(first.machine).toBe('hetzner');
@@ -137,7 +168,7 @@ describe('hub session control durable queue', () => {
 
   it('passes engine/machine/workspace as real placement constraints, never cwd/tier', async () => {
     const fake = fakeReserve();
-    await fixture(async (s) => {
+    await fixture(async (s, sql) => {
       await startOk(s, { engine: 'codex', machine: 'hetzner', brief: 'goal' }, admin, 'constraints-1');
       expect(fake.calls.length).toBe(1);
       const sent = fake.calls[0];
@@ -155,7 +186,7 @@ describe('hub session control durable queue', () => {
 
   it('passes fleet client errors through instead of holding', async () => {
     const fake = fakeReserve({ error: 'invalid_launch_request', status: 400 });
-    await fixture(async (s) => {
+    await fixture(async (s, sql) => {
       const res = await s.handle(request('/api/sessions', { key: 'bad-1', workspace: 'demo' }), admin);
       expect(res.status).toBe(400);
       expect((await res.json() as any).error).toBe('invalid_launch_request');
@@ -164,7 +195,7 @@ describe('hub session control durable queue', () => {
 
   it('records held intent on placement failure without launching twice', async () => {
     const fake = fakeReserve({ error: 'no_eligible_route', rejected: [] });
-    await fixture(async (s) => {
+    await fixture(async (s, sql) => {
       const first = await s.handle(request('/api/sessions', { key: 'held-1', workspace: 'demo' }), admin);
       expect(first.status).toBe(409);
       expect((await first.json() as any).hold.error).toBe('no_eligible_route');
@@ -176,7 +207,7 @@ describe('hub session control durable queue', () => {
 
   it('refuses send/capture on unbound sessions', async () => {
     const fake = fakeReserve();
-    await fixture(async (s) => {
+    await fixture(async (s, sql) => {
       const session: any = await startOk(s, {}, admin, 'unbound-1');
       expect((await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'a', body: 'hi' }), admin)).status).toBe(409);
       expect((await s.handle(request(`/api/sessions/${session.id}/capture`, { key: 'b' }), admin)).status).toBe(409);
@@ -185,8 +216,10 @@ describe('hub session control durable queue', () => {
 
   it('enqueues send with idempotent keys and rejects conflicts', async () => {
     const fake = fakeReserve();
-    await fixture(async (s) => {
+    await fixture(async (s, sql) => {
       const session: any = await startOk(s, {}, admin, 'bound-1');
+      ensureFleetLaunch(sql, 'launch-1', 'hetzner');
+      reportFleetSession(sql, 'hetzner', NATIVE_ID, 'hub-launch-1', NATIVE_WS);
       expect(s.recordBinding(session.id, bound())).toMatchObject({ ok: true });
       const first = await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'send-1', body: 'prompt one' }), admin);
       expect(first.status).toBe(201);
@@ -200,7 +233,7 @@ describe('hub session control durable queue', () => {
 
   it('isolates sessions and commands by owner', async () => {
     const fake = fakeReserve();
-    await fixture(async (s) => {
+    await fixture(async (s, sql) => {
       const session: any = await startOk(s, {}, agent(), 'owner-1');
       expect((await s.handle(request(`/api/sessions/${session.id}`, undefined, 'GET'), stranger)).status).toBe(404);
       expect((await s.handle(request(`/api/sessions/${session.id}/commands`, undefined, 'GET'), stranger)).status).toBe(404);
@@ -211,6 +244,11 @@ describe('hub session control durable queue', () => {
     fixture(async (s, sql) => {
       const at = new Date().toISOString();
       const far = new Date(Date.now() + 30 * 86400000).toISOString();
+      // Genuine registry incarnation FIRST: the agent registry binding for a
+      // credential resolves at credential-insert time, so the agents row must
+      // predate the credentials (enrollment order). Actor demo:assistant
+      // resolves to project demo / tag assistant.
+      sql.exec(`INSERT INTO agents (tag, project, role, machine_id, registered_at) VALUES ('assistant', 'demo', 'worker', NULL, ?)`, at);
       for (const [id, family] of [['cred-A', 'family-1'], ['cred-B', 'family-1'], ['cred-C', 'family-2']]) {
         sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
           VALUES (?, 'agent', ?, ?, ?, 'demo-agent', NULL, 'demo:assistant', '["fleet:launch"]', 'test', ?, ?)`,
@@ -230,10 +268,10 @@ describe('hub session control durable queue', () => {
 
   it('binds native sessions over HTTP and reconciles fleet result to running', async () => {
     const fake = fakeReserve();
-    await fixture(async (s) => {
+    await fixture(async (s, sql) => {
       const session: any = await startOk(s, { machine: 'hetzner' }, admin, 'bind-1');
       expect(session.fleet_launch_id).toBe('launch-1');
-      const bound: any = await bindHttp(s, session.id);
+      const bound: any = await bindHttp(s, sql, session.id);
       expect(bound.generation).toBe(1);
       const view = await (await s.handle(request(`/api/sessions/${session.id}`, undefined, 'GET'), admin)).json() as any;
       expect(view.state).toBe('running');
@@ -249,10 +287,10 @@ describe('hub session control durable queue', () => {
 
   it('exposes a null cwd in host offers while rejecting non-root cwd at start', async () => {
     const fake = fakeReserve();
-    await fixture(async (s) => {
+    await fixture(async (s, sql) => {
       const session: any = await startOk(s, { machine: 'hetzner' }, admin, 'cwd-1');
       expect(fake.calls[0]).not.toHaveProperty('cwd');
-      await bindHttp(s, session.id);
+      await bindHttp(s, sql, session.id);
       await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'c1', body: 'go' }), admin);
       const offers = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any;
       expect(offers.offers.length).toBe(1);
@@ -263,8 +301,10 @@ describe('hub session control durable queue', () => {
 
   it('polls per-machine offers once and requires transport before ack', async () => {
     const fake = fakeReserve();
-    await fixture(async (s) => {
+    await fixture(async (s, sql) => {
       const session: any = await startOk(s, { machine: 'hetzner' }, admin, 'poll-1');
+      ensureFleetLaunch(sql, 'launch-1', 'hetzner');
+      reportFleetSession(sql, 'hetzner', NATIVE_ID, 'hub-launch-1', NATIVE_WS);
       s.recordBinding(session.id, bound());
       await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'p1', body: 'go' }), admin);
       const foreign = await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('win35'));
@@ -279,9 +319,9 @@ describe('hub session control durable queue', () => {
 
   it('fences execution with atomic claims: no claim, no ack; rivals conflict', async () => {
     const fake = fakeReserve();
-    await fixture(async (s) => {
+    await fixture(async (s, sql) => {
       const session: any = await startOk(s, { machine: 'hetzner' }, admin, 'claim-1');
-      await bindHttp(s, session.id);
+      await bindHttp(s, sql, session.id);
       await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'c1', body: 'go' }), admin);
       const poll = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any;
       const offer = poll.offers[0];
@@ -313,7 +353,7 @@ describe('hub session control durable queue', () => {
     const fake = fakeReserve();
     await fixture(async (s, sql) => {
       const session: any = await startOk(s, { machine: 'hetzner' }, admin, 'expiry-1');
-      await bindHttp(s, session.id);
+      await bindHttp(s, sql, session.id);
       await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'e1', body: 'go' }), admin);
       const poll = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any;
       const offer = poll.offers[0];
@@ -337,9 +377,9 @@ describe('hub session control durable queue', () => {
 
   it('requires host-verified native reply provenance for delivered sends', async () => {
     const fake = fakeReserve();
-    await fixture(async (s) => {
+    await fixture(async (s, sql) => {
       const session: any = await startOk(s, { machine: 'hetzner' }, admin, 'proof-1');
-      await bindHttp(s, session.id);
+      await bindHttp(s, sql, session.id);
       await s.handle(request(`/api/sessions/${session.id}/send`, { key: 's1', body: 'go' }), admin);
       await s.handle(request(`/api/sessions/${session.id}/send`, { key: 's2', body: 'go again' }), admin);
       const poll = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any;
@@ -373,9 +413,9 @@ describe('hub session control durable queue', () => {
 
   it('acks stop only with confirmed exit and marks the session stopped', async () => {
     const fake = fakeReserve();
-    await fixture(async (s) => {
+    await fixture(async (s, sql) => {
       const session: any = await startOk(s, { machine: 'hetzner' }, admin, 'stop-1');
-      await bindHttp(s, session.id);
+      await bindHttp(s, sql, session.id);
       await s.handle(request(`/api/sessions/${session.id}/stop`, { key: 't1' }), admin);
       const poll = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any;
       const stop = poll.offers[0];
@@ -391,9 +431,9 @@ describe('hub session control durable queue', () => {
 
   it('retains refused and uncertain commands without retry', async () => {
     const fake = fakeReserve();
-    await fixture(async (s) => {
+    await fixture(async (s, sql) => {
       const session: any = await startOk(s, { machine: 'hetzner' }, admin, 'uncertain-1');
-      await bindHttp(s, session.id);
+      await bindHttp(s, sql, session.id);
       await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'u1', body: 'go' }), admin);
       await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'u2', body: 'go' }), admin);
       const poll = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any;
@@ -411,9 +451,9 @@ describe('hub session control durable queue', () => {
 
   it('redacts capture text before storage', async () => {
     const fake = fakeReserve();
-    await fixture(async (s) => {
+    await fixture(async (s, sql) => {
       const session: any = await startOk(s, { machine: 'hetzner' }, admin, 'redact-1');
-      await bindHttp(s, session.id);
+      await bindHttp(s, sql, session.id);
       await s.handle(request(`/api/sessions/${session.id}/capture`, { key: 'c1' }), admin);
       const poll = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any;
       const cmd = poll.offers[0];
@@ -428,11 +468,15 @@ describe('hub session control durable queue', () => {
 
   it('refuses conflicting native bindings on tag reuse', async () => {
     const fake = fakeReserve();
-    await fixture(async (s) => {
+    await fixture(async (s, sql) => {
       const session: any = await startOk(s, {}, admin, 'rebind-1');
+      ensureFleetLaunch(sql, 'launch-1', 'hetzner');
+      reportFleetSession(sql, 'hetzner', NATIVE_ID, 'hub-launch-1', NATIVE_WS);
       expect(s.recordBinding(session.id, bound())).toMatchObject({ ok: true });
       const second: any = await startOk(s, {}, admin, 'rebind-2');
-      expect(s.recordBinding(second.id, bound({ native_id: '22222222-2222-4222-8222-222222222222' }))).toMatchObject({ ok: true });
+      ensureFleetLaunch(sql, 'launch-2', 'hetzner', '22222222-2222-4222-8222-222222222222');
+      reportFleetSession(sql, 'hetzner', '22222222-2222-4222-8222-222222222222', 'hub-launch-2', NATIVE_WS);
+      expect(s.recordBinding(second.id, bound({ native_id: '22222222-2222-4222-8222-222222222222', tag: 'hub-launch-2' }))).toMatchObject({ ok: true });
       // Same session rebound to a different native id is a conflict, never silent adoption.
       const direct = s.recordBinding(session.id, bound({ native_id: '99999999-9999-4999-8999-999999999999' }));
       expect(direct).toMatchObject({ ok: false, error: 'binding_conflict' });
@@ -441,7 +485,7 @@ describe('hub session control durable queue', () => {
 
   it('paginates session and command lists completely', async () => {
     const fake = fakeReserve();
-    await fixture(async (s) => {
+    await fixture(async (s, sql) => {
       for (const key of ['pg-1', 'pg-2', 'pg-3']) await startOk(s, {}, admin, key);
       const seen: string[] = [];
       let cursor: string | null = null;
@@ -460,9 +504,9 @@ describe('hub session control durable queue', () => {
 
   it('refuses new work when the queue is full without evicting pending work', async () => {
     const fake = fakeReserve();
-    await fixture(async (s) => {
+    await fixture(async (s, sql) => {
       const session: any = await startOk(s, { machine: 'hetzner' }, admin, 'cap-1');
-      await bindHttp(s, session.id);
+      await bindHttp(s, sql, session.id);
       expect((await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'q1', body: 'go' }), admin)).status).toBe(201);
       expect((await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'q2', body: 'go' }), admin)).status).toBe(429);
       const list = await (await s.handle(request(`/api/sessions/${session.id}/commands`, undefined, 'GET'), admin)).json() as any;

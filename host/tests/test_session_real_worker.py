@@ -40,6 +40,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler  # noqa: F401 (harness parity)
 
@@ -74,6 +75,16 @@ def main():
     args = [a for a in sys.argv[1:] if a != "--json"]
     if not args: sys.exit(1)
     cmd = args[0]
+    if cmd == "whoami":
+        # Genuine sender identity: the calling session record, or refusal when
+        # this process holds no bound session (models unbound host processes).
+        sid = os.environ.get("APLEXER_SESSION_ID", "")
+        for r in load():
+            if str(r.get("id", "")).lower() == sid.lower() and sid:
+                print(json.dumps(r))
+                sys.exit(0)
+        sys.stderr.write("no bound session\n")
+        sys.exit(1)
     if cmd == "list":
         print(json.dumps(load()))
     elif cmd == "start":
@@ -117,11 +128,20 @@ def main():
             rows = load()
             hit = [r for r in rows if r["tag"] == to and r["workspace"] == ws]
             if not hit: sys.stderr.write("no session tagged\n"); sys.exit(1)
+            # Genuine sender provenance (installed reply_target contract): the
+            # sender resolves from the calling process's bound session in this
+            # workspace; an unbound process emits an anonymous envelope that
+            # recipients cannot reply to. Sender fields are never fabricated.
+            sid = os.environ.get("APLEXER_SESSION_ID", "")
+            sender_rec = next((r for r in rows if str(r.get("id", "")).lower() == sid.lower() and sid
+                               and r.get("workspace") == ws and r.get("tag")), None)
+            from_obj = ({"session_id": str(sender_rec["id"]), "workspace": ws,
+                         "tag": str(sender_rec["tag"]), "engine": "shell",
+                         "external": False} if sender_rec else {"external": True})
             mid = str(uuid.uuid4())
             env = {"schema_version": 1, "id": mid, "workspace": ws,
                    "created_at": int(time.time()),
-                   "from": {"session_id": "00000000-0000-0000-0000-000000000000",
-                            "workspace": ws, "tag": "test-caller", "engine": "shell"},
+                   "from": from_obj,
                    "to": {"tag": to, "session_id": hit[0]["id"]},
                    "kind": "note", "data": data, "body": body, "reply_to": None,
                    "delivery": "inbox"}
@@ -356,8 +376,16 @@ export default {{
             # Native fixture dir (fake-a + journal), per-test tmp under server dir.
             cls.native_dir = os.path.join(cls.server_dir, "native")
             os.makedirs(cls.native_dir, exist_ok=True)
+            # Genuine host sender session for the fixture workspace (F2): the
+            # receiver's sends resolve to this bound identity (via
+            # APLEXER_SESSION_ID below), never an anonymous envelope.
+            cls.sender_id = str(uuid.uuid4())
             with open(os.path.join(cls.native_dir, "sessions.json"), "w") as f:
-                json.dump([], f)
+                json.dump([{"id": cls.sender_id, "tag": "host-sender",
+                            "workspace": cls.native_dir, "engine": "shell",
+                            "profile": None, "phase": "running", "state": "running",
+                            "created_at_ms": 1700000000000,
+                            "last_activity_ms": 1700000000000}], f)
             os.makedirs(os.path.join(cls.native_dir, "msgs"), exist_ok=True)
             fake = os.path.join(cls.native_dir, "fake-a")
             with open(fake, "w") as f:
@@ -453,6 +481,33 @@ export default {{
                 body = {"error": "http_%d" % exc.code}
             return exc.code, body
 
+    def receive_bounded(self, custody, request_mod):
+        """One bounded receiver cycle as the bound fixture sender (F2)."""
+        from agent_hub_host.session_executor import CallerCustody  # noqa: F401
+        from agent_hub_host import session_receiver as rc
+        old_url, old_tok = os.environ.get("HUB_URL"), os.environ.get("HUB_JOB_TOKEN")
+        old_sid = os.environ.get("APLEXER_SESSION_ID")
+        os.environ["HUB_URL"] = f"http://127.0.0.1:{self.port}"
+        os.environ["HUB_JOB_TOKEN"] = "sess-host-token"
+        os.environ["APLEXER_SESSION_ID"] = self.sender_id
+        try:
+            return rc.receive_once(custody=custody, journal_dir=self.journal_dir,
+                                   executable=self.fake_bin, request=request_mod,
+                                   limit=20)
+        finally:
+            if old_url is None:
+                os.environ.pop("HUB_URL", None)
+            else:
+                os.environ["HUB_URL"] = old_url
+            if old_tok is None:
+                os.environ.pop("HUB_JOB_TOKEN", None)
+            else:
+                os.environ["HUB_JOB_TOKEN"] = old_tok
+            if old_sid is None:
+                os.environ.pop("APLEXER_SESSION_ID", None)
+            else:
+                os.environ["APLEXER_SESSION_ID"] = old_sid
+
     def test_real_worker_session_loop_via_cli_and_receiver(self):
         # 1. Public CLI start (real fleet placement, no mock).
         brief_file = os.path.join(self.native_dir, "goal.txt")
@@ -466,14 +521,37 @@ export default {{
         self.assertEqual(created["state"], "offered")
         self.assertTrue(created.get("fleet_launch_id"))
         sid = created["id"]
-        # 2. Native target + host binding POST (real /binding route).
+        launch_id = created["fleet_launch_id"]
+        # 2. Native target + host binding POST (real /binding route). The
+        # native tag is the canonical Fleet consumer tag for the assigned
+        # launch, and the launch is advanced to the modeled consumer report
+        # (starting->running with its native receipt) that F5 reconciles.
         native = subprocess.run([self.fake_bin, "start", "--workspace", self.native_dir,
-                                 "--tag", "sess-target", "--json"],
+                                 "--tag", "hub-" + launch_id, "--json"],
                                 capture_output=True, text=True, timeout=20)
         self.assertEqual(native.returncode, 0, native.stderr)
         target = json.loads(native.stdout)
+        self.seed_sql("UPDATE fleet_launches SET state = 'running', native_id = ? WHERE id = ?",
+                      [target["id"], launch_id])
+        # The existing Fleet sessions report carries the canonical native
+        # identity over the REAL route (machine + UUID + tag + workspace),
+        # which F5 binding reconciles before accepting the tag/workspace.
+        import datetime as _dt
+        _now = _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        sessions_put = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/fleet/sessions",
+            data=json.dumps({"sessions": [{
+                "native_id": target["id"], "tag": "hub-" + launch_id,
+                "engine": "codex", "phase": "running", "agent_state": None,
+                "workspace": self.native_dir, "profile": None,
+                "account": "sess-codex", "last_activity_at": _now}]}).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer sess-host-token"},
+            method="PUT")
+        with urllib.request.urlopen(sessions_put, timeout=10) as resp:
+            self.assertEqual(resp.status, 200)
         code, bound = self.hub_post(f"/api/sessions/{sid}/binding",
-                                    {"native": {"native_id": target["id"], "tag": "sess-target",
+                                    {"native": {"native_id": target["id"], "tag": "hub-" + launch_id,
                                                 "workspace": self.native_dir,
                                                 "native_created_at_ms": 1700000000000}},
                                     "sess-host-token")
@@ -488,25 +566,10 @@ export default {{
                             token="sess-agent-token")
         self.assertTrue(json.loads(sent.stdout).get("command_id"))
         from agent_hub_host.session_executor import CallerCustody
-        from agent_hub_host import session_receiver as rc
         from agent_hub_host import session_control as sc
-        old_url, old_tok = os.environ.get("HUB_URL"), os.environ.get("HUB_JOB_TOKEN")
-        os.environ["HUB_URL"] = f"http://127.0.0.1:{self.port}"
-        os.environ["HUB_JOB_TOKEN"] = "sess-host-token"
-        try:
-            custody = CallerCustody(actor="machine:hetzner", machine_id="hetzner",
-                                    credential_family="host-hetzner").validated()
-            result = rc.receive_once(custody=custody, journal_dir=self.journal_dir,
-                                     executable=self.fake_bin, request=sc.request, limit=20)
-        finally:
-            if old_url is None:
-                os.environ.pop("HUB_URL", None)
-            else:
-                os.environ["HUB_URL"] = old_url
-            if old_tok is None:
-                os.environ.pop("HUB_JOB_TOKEN", None)
-            else:
-                os.environ["HUB_JOB_TOKEN"] = old_tok
+        custody = CallerCustody(actor="machine:hetzner", machine_id="hetzner",
+                                credential_family="host-hetzner").validated()
+        result = self.receive_bounded(custody, sc.request)
         self.assertGreaterEqual(result["offers_seen"], 1)
         processed = {r["command_id"]: r for r in result["processed"]}
         self.assertTrue(processed, result)
@@ -521,37 +584,12 @@ export default {{
         self.assertIn("proof", ack)
         self.assertEqual(ack["proof"]["sender_native_id"], target["id"])
         # 5. Capture + stop complete the loop through the same path.
+        from agent_hub_host import session_control as sc2
         self.run_cli(["sessions", "capture", sid, "--max-bytes", "512", "--key", "c-real-1"],
                      token="sess-agent-token")
-        os.environ["HUB_URL"] = f"http://127.0.0.1:{self.port}"
-        os.environ["HUB_JOB_TOKEN"] = "sess-host-token"
-        try:
-            rc.receive_once(custody=custody, journal_dir=self.journal_dir,
-                            executable=self.fake_bin, request=sc.request, limit=20)
-        finally:
-            if old_url is None:
-                os.environ.pop("HUB_URL", None)
-            else:
-                os.environ["HUB_URL"] = old_url
-            if old_tok is None:
-                os.environ.pop("HUB_JOB_TOKEN", None)
-            else:
-                os.environ["HUB_JOB_TOKEN"] = old_tok
+        self.receive_bounded(custody, sc2.request)
         self.run_cli(["sessions", "stop", sid, "--key", "t-real-1"], token="sess-agent-token")
-        os.environ["HUB_URL"] = f"http://127.0.0.1:{self.port}"
-        os.environ["HUB_JOB_TOKEN"] = "sess-host-token"
-        try:
-            rc.receive_once(custody=custody, journal_dir=self.journal_dir,
-                            executable=self.fake_bin, request=sc.request, limit=20)
-        finally:
-            if old_url is None:
-                os.environ.pop("HUB_URL", None)
-            else:
-                os.environ["HUB_URL"] = old_url
-            if old_tok is None:
-                os.environ.pop("HUB_JOB_TOKEN", None)
-            else:
-                os.environ["HUB_JOB_TOKEN"] = old_tok
+        self.receive_bounded(custody, sc2.request)
         view = json.loads(self.run_cli(["sessions", "show", sid], token="sess-agent-token").stdout)
         self.assertEqual(view["state"], "stopped")
 

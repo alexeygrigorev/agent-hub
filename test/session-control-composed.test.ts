@@ -23,7 +23,8 @@ const host = (id: string, tokenId = 'host-cred-1') => ({ caller: { machineId: id
 
 const NATIVE_ID = '11111111-1111-4111-8111-111111111111';
 const NATIVE_WS = '/srv/hub/demo';
-const NATIVE_TAG = 'hub-tag-1';
+// Canonical Fleet consumer tag for launch-1 (F5 requires 'hub-<fleet_launch_id>').
+const NATIVE_TAG = 'hub-launch-1';
 const NATIVE_CREATED = 1792223000000;
 const ATTEMPT = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
 const ATTEMPT2 = 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb';
@@ -56,14 +57,27 @@ async function fixture(fn: (s: SessionControlService, sql: any) => Promise<void>
     const far = new Date(Date.now() + 30 * 86400000).toISOString();
     hub.sql.exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
       VALUES ('host-cred-1', 'host', 'hash-host-cred-1', 'refresh-host-cred-1', 'host-family-1', 'test-host', 'hetzner', NULL, '["host"]', 'test', ?, ?)`, at, far);
+    hub.sql.exec(`INSERT OR IGNORE INTO machines (id, name, hostname, credential_id, registered_at) VALUES ('hetzner', 'hetzner', 'hetzner', 'host-cred-1', ?)`, at);
     await fn(service, hub.sql);
   });
 }
 
+/** Model the legitimate Fleet consumer report for launch-1 (running with its
+ * native receipt) plus the authoritative sessions report for the bound native
+ * identity. Fixture setup only; the binding route under test is real. */
+function ensureFleetLaunch(sql: any) {
+  const at = new Date().toISOString();
+  sql.exec(`INSERT OR REPLACE INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, launcher_task_id, created_at, updated_at)
+    VALUES ('launch-1', 'test-admin', 'human', NULL, 'fixture', 'fleet-launch-1', '{"workspace":"demo"}', 'hetzner', 'codex', 'fixture-acct', NULL, 'headless', 'demo', 'goal', 'running', '${NATIVE_ID}', NULL, ?, ?)`, at, at);
+  sql.exec(`INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, profile, account, last_activity_at)
+    VALUES ('hetzner', '${NATIVE_ID}', 'hub-launch-1', 'codex', 'running', NULL, ?, '${NATIVE_WS}', NULL, 'fixture-acct', NULL)`, at);
+}
+
 describe('composed session loop: start -> binding -> send/proof -> capture -> stop', () => {
-  it('runs the full connected intent chain with correlated proof', async () => fixture(async (s) => {
+  it('runs the full connected intent chain with correlated proof', async () => fixture(async (s, sql) => {
     const start = await (await s.handle(request('/api/sessions', { key: 'loop-1', workspace: 'demo', machine: 'hetzner' }), admin)).json() as any;
     expect(start.fleet_launch_id).toBe('launch-1');
+    ensureFleetLaunch(sql);
     // Binding reconciles the fleet launch: machine-bound host, exact native triple + incarnation.
     const bind = await s.handle(request(`/api/sessions/${start.id}/binding`, { native: boundNative() }), host('hetzner'));
     expect(bind.status).toBe(200);
@@ -119,6 +133,7 @@ describe('composed session loop: start -> binding -> send/proof -> capture -> st
 
   it('re-discovers transported-but-unclaimed commands after a lost GET', async () => fixture(async (s, sql) => {
     const start = await (await s.handle(request('/api/sessions', { key: 'lost-1', workspace: 'demo', machine: 'hetzner' }), admin)).json() as any;
+    ensureFleetLaunch(sql);
     await s.handle(request(`/api/sessions/${start.id}/binding`, { native: boundNative() }), host('hetzner'));
     await s.handle(request(`/api/sessions/${start.id}/send`, { key: 'l1', body: 'go' }), admin);
     const first = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any;
@@ -149,6 +164,7 @@ describe('composed session loop: start -> binding -> send/proof -> capture -> st
     sql.exec('UPDATE session_control_sessions SET fleet_launch_id = NULL WHERE id = ?', start.id);
     expect((await s.handle(request(`/api/sessions/${start.id}/binding`, { native: boundNative() }), host('hetzner'))).status).toBe(409);
     sql.exec('UPDATE session_control_sessions SET fleet_launch_id = ? WHERE id = ?', 'launch-1', start.id);
+    ensureFleetLaunch(sql);
     await s.handle(request(`/api/sessions/${start.id}/binding`, { native: boundNative() }), host('hetzner'));
     await s.handle(request(`/api/sessions/${start.id}/send`, { key: 'n1', body: 'go' }), admin);
     const offer = (await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any).offers[0];
@@ -165,8 +181,9 @@ describe('composed session loop: start -> binding -> send/proof -> capture -> st
     expect([401, 409]).toContain(late.status);
   }));
 
-  it('refuses original-message-ID confusion and proof replay across commands', async () => fixture(async (s) => {
+  it('refuses original-message-ID confusion and proof replay across commands', async () => fixture(async (s, sql) => {
     const start = await (await s.handle(request('/api/sessions', { key: 'proof-1', workspace: 'demo', machine: 'hetzner' }), admin)).json() as any;
+    ensureFleetLaunch(sql);
     await s.handle(request(`/api/sessions/${start.id}/binding`, { native: boundNative() }), host('hetzner'));
     await s.handle(request(`/api/sessions/${start.id}/send`, { key: 'p1', body: 'one' }), admin);
     await s.handle(request(`/api/sessions/${start.id}/send`, { key: 'p2', body: 'two' }), admin);

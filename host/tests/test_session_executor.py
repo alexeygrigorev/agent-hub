@@ -92,6 +92,16 @@ def main():
     if not args:
         sys.exit(1)
     cmd = args[0]
+    if cmd == "whoami":
+        # Genuine sender identity: the calling session record, or refusal when
+        # this process holds no bound session (models unbound host processes).
+        sid = os.environ.get("APLEXER_SESSION_ID", "")
+        for r in load():
+            if str(r.get("id", "")).lower() == sid.lower() and sid:
+                print(json.dumps(r))
+                sys.exit(0)
+        sys.stderr.write("no bound session\n")
+        sys.exit(1)
     if cmd == "list":
         print(json.dumps(load()))
     elif cmd == "start":
@@ -161,11 +171,23 @@ def main():
             hit = [r for r in rows if r["tag"] == to and r["workspace"] == ws]
             if not hit:
                 sys.stderr.write("no session tagged %s exists\n" % to); sys.exit(1)
+            # Genuine sender provenance (installed reply_target contract): the
+            # sender resolves from the calling process's bound session in this
+            # workspace; an unbound process emits an anonymous envelope that
+            # recipients cannot reply to. Sender fields are never fabricated.
+            sid = os.environ.get("APLEXER_SESSION_ID", "")
+            sender_rec = next((r for r in rows if str(r.get("id", "")).lower() == sid.lower() and sid
+                               and r.get("workspace") == ws and r.get("tag")), None)
+            if sender_rec:
+                from_obj = {"session_id": str(sender_rec["id"]), "workspace": ws,
+                            "tag": str(sender_rec["tag"]), "engine": str(sender_rec.get("engine", "shell")),
+                            "external": False}
+            else:
+                from_obj = {"external": True}
             mid = str(uuid.uuid4())
             env = {"schema_version": 1, "id": mid, "workspace": ws,
                    "created_at": int(time.time()),
-                   "from": {"session_id": "00000000-0000-0000-0000-000000000000",
-                            "workspace": ws, "tag": "test-caller", "engine": "shell"},
+                   "from": from_obj,
                    "to": {"tag": to, "session_id": hit[0]["id"]},
                    "kind": kind, "data": data, "body": body, "reply_to": None,
                    "delivery": "inbox"}
@@ -190,6 +212,10 @@ def main():
                         break
             if orig is None:
                 sys.stderr.write("no such message\n"); sys.exit(1)
+            # Installed Rust reply_target contract: anonymous originals cannot
+            # be replied to (verbatim installed error).
+            if not (orig.get("from") or {}).get("tag"):
+                sys.stderr.write("Error: original message %s was sent anonymously (no sender tag)\n" % orig_id); sys.exit(1)
             mid = str(uuid.uuid4())
             env = {"schema_version": 1, "id": mid, "workspace": orig["workspace"],
                    "created_at": int(time.time()),
@@ -238,8 +264,16 @@ def env(tmp_path_factory, monkeypatch):
     work = os.path.join(base, "work")
     os.makedirs(work)
     sessions_file = os.path.join(base, "sessions.json")
+    # Genuine host sender session for this fixture workspace (F2): sends from
+    # this process resolve to a bound, replyable sender identity instead of
+    # an anonymous envelope. The sender record predates every target.
+    sender_id = str(uuid.uuid4())
     with open(sessions_file, "w") as f:
-        json.dump([], f)
+        json.dump([{"id": sender_id, "tag": "host-sender", "workspace": work,
+                    "engine": "shell", "profile": None, "phase": "running",
+                    "state": "running", "created_at_ms": 1700000000000,
+                    "last_activity_ms": 1700000000000}], f)
+    monkeypatch.setenv("APLEXER_SESSION_ID", sender_id)
     msgs = os.path.join(base, "msgs")
     os.makedirs(msgs)
     fake = os.path.join(base, "fake-a")
@@ -292,10 +326,11 @@ def test_list_filters_workspace_and_projects_shapes(env):
     subprocess.run([env["fake"], "start", "--workspace", other, "--tag", "elsewhere",
                     "--engine", "go", "--json"], check=True, capture_output=True, timeout=20)
     rows = ns.list_sessions(env["fake"], workspace=env["work"])
-    assert len(rows) == 1 and rows[0].tag == "w1sess"
-    assert rows[0].engine == "go" and rows[0].phase == "running"
-    assert rows[0].created_at_ms == 1700000000000  # native generation provenance
-    assert "history_path" not in rows[0].__dict__  # projection keeps only necessary fields
+    assert {r.tag for r in rows} == {"w1sess", "host-sender"}
+    w1 = [r for r in rows if r.tag == "w1sess"][0]
+    assert w1.engine == "go" and w1.phase == "running"
+    assert w1.created_at_ms == 1700000000000  # native generation provenance
+    assert "history_path" not in w1.__dict__  # projection keeps only necessary fields
 
 
 def test_qualify_rejects_tag_reuse(env):
@@ -308,8 +343,8 @@ def test_qualify_rejects_tag_reuse(env):
     target = make_target(env, "dupe", first["id"])
     with pytest.raises(SessionControlError):
         ns.qualify_target(env["fake"], target)
-    # No effect attempted: both sessions still running.
-    assert len(json.load(open(env["sessions_file"]))) == 2
+    # No effect attempted: all three sessions (sender + both dupes) still running.
+    assert len(json.load(open(env["sessions_file"]))) == 3
 
 
 def test_qualify_rejects_stale_generation(env):
@@ -406,9 +441,10 @@ def test_ack_verified_via_correlated_reply(env):
     assert proven.state == "acknowledged" and proven.reply_envelope_id
     # Foreign reply (sender UUID mismatch) is not our proof.
     rows = json.load(open(env["sessions_file"]))
-    rows[0]["id"] = str(uuid.uuid4())
+    agent_row = next(r for r in rows if r.get("tag") == "agent1")
+    agent_row["id"] = str(uuid.uuid4())
     json.dump(rows, open(env["sessions_file"], "w"))
-    foreign_target = make_target(env, "agent1", rows[0]["id"])
+    foreign_target = make_target(env, "agent1", agent_row["id"])
     assert ns.verify_ack_via_reply(env["fake"], foreign_target, sent.native_id,
                                    corr).state == "unknown"
 
@@ -512,11 +548,13 @@ def test_stop_refuses_retargeted_tag(env):
     rec = seed_session(env, tag="victim")
     target = make_target(env, "victim", rec["id"])
     rows = json.load(open(env["sessions_file"]))
-    rows[0]["id"] = str(uuid.uuid4())  # tag now owned by someone else
+    victim_row = next(r for r in rows if r.get("tag") == "victim")
+    victim_row["id"] = str(uuid.uuid4())  # tag now owned by someone else
     json.dump(rows, open(env["sessions_file"], "w"))
     with pytest.raises(SessionControlError):
         se.stop_controlled_session(env["fake"], target, custody=custody())
-    assert json.load(open(env["sessions_file"]))[0]["phase"] == "running"  # untouched
+    victim_row = next(r for r in json.load(open(env["sessions_file"])) if r.get("tag") == "victim")
+    assert victim_row["phase"] == "running"  # untouched
 
 
 def test_stop_uncertain_when_still_running(env):
@@ -777,7 +815,7 @@ def test_claimed_send_capture_stop_round_trip(hub, env):
                                        custody=custody(),
                                        settings={"workspaces": {"wt": env["work"]}},
                                        executable=env["fake"])
-    assert listed["sessions"] and listed["sessions"][0]["tag"] == "agent1"
+    assert any(s["tag"] == "agent1" for s in listed["sessions"])
     sent = se.handle_session_command(
         {"op": "send", "command_id": "cmd-1", "generation": 7, "target": target,
          "body": "via receiver", "claim": make_claim("cmd-1")},

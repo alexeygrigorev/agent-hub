@@ -59,6 +59,16 @@ def main():
     args = [a for a in sys.argv[1:] if a != "--json"]
     if not args: sys.exit(1)
     cmd = args[0]
+    if cmd == "whoami":
+        # Genuine sender identity: the calling session record, or refusal when
+        # this process holds no bound session (models unbound host processes).
+        sid = os.environ.get("APLEXER_SESSION_ID", "")
+        for r in load():
+            if str(r.get("id", "")).lower() == sid.lower() and sid:
+                print(json.dumps(r))
+                sys.exit(0)
+        sys.stderr.write("no bound session\n")
+        sys.exit(1)
     if cmd == "list":
         print(json.dumps(load()))
     elif cmd == "start":
@@ -102,11 +112,20 @@ def main():
             rows = load()
             hit = [r for r in rows if r["tag"] == to and r["workspace"] == ws]
             if not hit: sys.stderr.write("no session tagged\n"); sys.exit(1)
+            # Genuine sender provenance (installed reply_target contract): the
+            # sender resolves from the calling process's bound session in this
+            # workspace; an unbound process emits an anonymous envelope that
+            # recipients cannot reply to. Sender fields are never fabricated.
+            sid = os.environ.get("APLEXER_SESSION_ID", "")
+            sender_rec = next((r for r in rows if str(r.get("id", "")).lower() == sid.lower() and sid
+                               and r.get("workspace") == ws and r.get("tag")), None)
+            from_obj = ({"session_id": str(sender_rec["id"]), "workspace": ws,
+                         "tag": str(sender_rec["tag"]), "engine": "shell",
+                         "external": False} if sender_rec else {"external": True})
             mid = str(uuid.uuid4())
             env = {"schema_version": 1, "id": mid, "workspace": ws,
                    "created_at": int(time.time()),
-                   "from": {"session_id": "00000000-0000-0000-0000-000000000000",
-                            "workspace": ws, "tag": "test-caller", "engine": "shell"},
+                   "from": from_obj,
                    "to": {"tag": to, "session_id": hit[0]["id"]},
                    "kind": "note", "data": data, "body": body, "reply_to": None,
                    "delivery": "inbox"}
@@ -124,6 +143,10 @@ def main():
                 with open(os.path.join(MDIR, fn)) as f: m = json.load(f)
                 if m.get("id") == orig_id: orig = m; break
             if orig is None: sys.stderr.write("no such message\n"); sys.exit(1)
+            # Installed Rust reply_target contract: anonymous originals cannot
+            # be replied to (verbatim installed error).
+            if not (orig.get("from") or {}).get("tag"):
+                sys.stderr.write("Error: original message %s was sent anonymously (no sender tag)\n" % orig_id); sys.exit(1)
             mid = str(uuid.uuid4())
             env = {"schema_version": 1, "id": mid, "workspace": orig["workspace"],
                    "created_at": int(time.time()),
@@ -156,8 +179,16 @@ def env(tmp_path_factory, monkeypatch):
     work = os.path.join(base, "work")
     os.makedirs(work)
     sessions_file = os.path.join(base, "sessions.json")
+    # Genuine host sender session for this fixture workspace (F2): sends from
+    # this process resolve to a bound, replyable sender identity instead of
+    # an anonymous envelope. The sender record predates every target.
+    sender_id = str(uuid.uuid4())
     with open(sessions_file, "w") as f:
-        json.dump([], f)
+        json.dump([{"id": sender_id, "tag": "host-sender", "workspace": work,
+                    "engine": "shell", "profile": None, "phase": "running",
+                    "state": "running", "created_at_ms": 1700000000000,
+                    "last_activity_ms": 1700000000000}], f)
+    monkeypatch.setenv("APLEXER_SESSION_ID", sender_id)
     msgs = os.path.join(base, "msgs")
     os.makedirs(msgs)
     fake = os.path.join(base, "fake-a")
@@ -261,7 +292,9 @@ def test_handle_claimed_send_proof_uses_target_uuid_not_envelope(env):
     claim = {"command_id": cid, "claim_token": "tok-" + uuid.uuid4().hex + "zz",
              "holder": "hetzner1", "generation": 1,
              "expires_at_ms": int(time.time() * 1000) + 60000}
-    # No reply yet: honest uncertain, never false confirmed.
+    # No reply yet: journaled as pending WITHOUT any server ack (F1). The
+    # command stays claimed under its lease; no terminal uncertain is posted
+    # on the 0ms check, so a delayed recipient reply stays reachable.
     sent = {"acked": []}
     outcome = se.handle_claimed_command(
         {"op": "send", "command_id": cid, "generation": 1,
@@ -270,12 +303,9 @@ def test_handle_claimed_send_proof_uses_target_uuid_not_envelope(env):
          "body": "hello target", "await_ack": True},
         claim, custody=custody(), journal_dir=env["journal"], executable=env["fake"],
         request=lambda m, p, b: sent["acked"].append((m, p, b)) or {})
-    assert outcome["ack"]["submitted"] is True
-    payload = outcome["ack"]["payload"]
-    # CORRECTED: ack.native is the target UUID, never the envelope id.
-    assert payload["native"]["native_id"] == rec["id"]
-    assert payload["outcome"] == "uncertain"
-    assert "proof" not in payload
+    assert outcome["state"] == "unknown"
+    assert outcome["ack"]["submitted"] is False
+    assert sent["acked"] == []  # no premature uncertain POST
     original_id = outcome["original_native_message_id"]
     assert original_id and original_id != rec["id"]
     # The target replies in the native log with correlation + digest echo.
@@ -288,12 +318,12 @@ def test_handle_claimed_send_proof_uses_target_uuid_not_envelope(env):
     assert proc.returncode == 0, proc.stderr
     reply = json.loads(proc.stdout)
     assert reply["reply_to"] == original_id  # reply_to references the ENVELOPE, not cmd:gen
-    # Second command with a fresh claim gets delivered with full proof.
+    assert reply["from"]["session_id"] == rec["id"]  # genuine target provenance
+    # Second command with a fresh claim starts pending too (no reply yet).
     cid2 = str(uuid.uuid4())
     claim2 = {"command_id": cid2, "claim_token": "tok-" + uuid.uuid4().hex + "zz",
               "holder": "hetzner1", "generation": 1,
               "expires_at_ms": int(time.time() * 1000) + 60000}
-    # Send a second message and reply to it (fresh envelope pair).
     outcome2 = se.handle_claimed_command(
         {"op": "send", "command_id": cid2, "generation": 1,
          "target": {"session_id": target.session_id, "tag": target.tag,
@@ -301,8 +331,8 @@ def test_handle_claimed_send_proof_uses_target_uuid_not_envelope(env):
          "body": "second %s" % cid2, "await_ack": True},
         claim2, custody=custody(), journal_dir=env["journal"], executable=env["fake"],
         request=lambda m, p, b: sent["acked"].append((m, p, b)) or {})
-    # No reply to the second envelope yet -> uncertain.
-    assert outcome2["ack"]["payload"]["outcome"] == "uncertain"
+    assert outcome2["state"] == "unknown"
+    assert outcome2["ack"]["submitted"] is False
     second_orig = outcome2["original_native_message_id"]
     digest2 = hashlib.sha256(("second %s" % cid2).encode()).hexdigest()
     proc = subprocess.run(
@@ -311,15 +341,29 @@ def test_handle_claimed_send_proof_uses_target_uuid_not_envelope(env):
          "--", "reply %s" % cid2],
         capture_output=True, text=True, timeout=20, env={**os.environ})
     assert proc.returncode == 0
-    # Re-run is a journal replay (same claim token): no second effect.
-    replay = se.handle_claimed_command(
+    reply2 = json.loads(proc.stdout)
+    # Re-run with the SAME claim token reconciles read-only: the delayed
+    # reply is observed and its delivered proof submitted with NO second send.
+    before = sorted(os.listdir(env["msgs"]))
+    reconciled = se.handle_claimed_command(
         {"op": "send", "command_id": cid2, "generation": 1,
          "target": {"session_id": target.session_id, "tag": target.tag,
                     "workspace": target.workspace, "created_at_ms": target.created_at_ms},
          "body": "second %s" % cid2, "await_ack": True},
         claim2, custody=custody(), journal_dir=env["journal"], executable=env["fake"],
-        request=lambda m, p, b: {})
-    assert replay.get("replayed") is True
+        request=lambda m, p, b: sent["acked"].append((m, p, b)) or {})
+    assert reconciled["state"] == "acknowledged"
+    assert reconciled["ack"]["submitted"] is True
+    assert sorted(os.listdir(env["msgs"])) == before  # no second native effect
+    payload = reconciled["ack"]["payload"]
+    # CORRECTED: ack.native is the target UUID, never an envelope id.
+    assert payload["native"]["native_id"] == rec["id"]
+    assert payload["outcome"] == "delivered"
+    assert payload["correlation"] == "cmd:%s:gen:1" % cid2
+    assert payload["proof"]["native_message_id"] == second_orig
+    assert payload["proof"]["reply_to_native_id"] == reply2["id"]
+    assert payload["proof"]["sender_native_id"] == rec["id"]
+    assert payload["proof"]["sender_created_at_ms"] == 1700000000000
 
 
 def test_handle_claimed_capture_and_stop_shapes(env):
@@ -394,7 +438,8 @@ def test_receive_once_bounded_cycle_with_stub_hub(env):
     result = rc.receive_once(custody=custody(), journal_dir=env["journal"],
                              executable=env["fake"], request=stub_request, limit=20)
     assert result["offers_seen"] == 3
-    # send without a reply is uncertain (honest), capture delivers, start skipped.
+    # Send without a reply stays pending (honest, no premature uncertain ack),
+    # capture delivers, start skipped.
     by_id = {r["command_id"]: r for r in result["processed"]}
     assert send_id in by_id or any(s["command_id"] == send_id for s in result["skipped"])
     assert cap_id in by_id

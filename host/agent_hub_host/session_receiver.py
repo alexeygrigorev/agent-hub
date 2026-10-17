@@ -38,8 +38,18 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from . import private_fs
-from .native_sessions import NativeTarget, SessionControlError, SessionUncertain
-from .session_executor import CallerCustody, handle_claimed_command
+from .native_sessions import (
+    NativeTarget,
+    SessionControlError,
+    SessionUncertain,
+    qualify_sender_binding,
+)
+from .session_executor import (
+    CallerCustody,
+    handle_claimed_command,
+    reconcile_pending_command,
+    resubmit_pending_ack,
+)
 
 RECV_JOURNAL_LIMIT = 64 * 1024
 UUID_RE = re.compile(r"^[a-f0-9-]{36}$", re.IGNORECASE)
@@ -272,6 +282,17 @@ def receive_once(
         except (SessionControlError, SessionUncertain) as exc:
             skipped.append({"command_id": command_id, "reason": str(exc)[:300]})
             continue
+        # Genuine sender qualification BEFORE the claim/effect: a host process
+        # without a workspace-bound native sender identity would emit an
+        # anonymous envelope recipients cannot reply to, so send offers are
+        # held honestly (no claim, no journal, no effect) instead.
+        if command.get("op") == "send":
+            try:
+                qualify_sender_binding(executable, str(command["target"]["workspace"]))
+            except (SessionControlError, SessionUncertain) as exc:
+                skipped.append({"command_id": command_id,
+                                "reason": "native_sender_unbound_reconcile"})
+                continue
         try:
             server_claim = request("POST", "/api/session-commands/" + str(command_id) + "/claim",
                                    {"correlation": correlation, "attempt_id": attempt_id})
@@ -303,4 +324,37 @@ def receive_once(
                           "state": outcome.get("state"),
                           "ack_submitted": bool((outcome.get("ack") or {}).get("submitted", False)),
                           "replayed": bool(outcome.get("replayed", False))})
-    return {"offers_seen": len(offers), "processed": processed, "skipped": skipped}
+    # Bounded read-only reconciliation pass: sends journaled as unknown (reply
+    # not yet observed, server command still claimed under its lease) are
+    # re-checked WITHOUT any second native send; a delayed recipient reply
+    # observed now is acked under the SAME claim token. Completed effects
+    # whose ack response was lost are re-submitted identically (never
+    # re-offered by the server, so the journal is the discovery path).
+    reconciled: list[dict[str, Any]] = []
+    try:
+        pending = sorted(
+            name for name in os.listdir(journal_dir)
+            if name.startswith("cmd-") and name.endswith(".json"))[:20]
+    except OSError:
+        pending = []
+    for name in pending:
+        command_id = name[len("cmd-"):-len(".json")]
+        if any(r.get("command_id") == command_id for r in processed):
+            continue
+        try:
+            updated = reconcile_pending_command(
+                journal_dir=journal_dir, command_id=command_id,
+                executable=executable, request=request, now_ms=now_ms)
+            if updated is None:
+                updated = resubmit_pending_ack(
+                    journal_dir=journal_dir, command_id=command_id,
+                    request=request)
+        except (SessionControlError, SessionUncertain, OSError, ValueError):
+            continue
+        if updated is not None:
+            reconciled.append({"command_id": command_id, "op": updated.get("op"),
+                               "state": updated.get("state"),
+                               "ack_submitted": bool((updated.get("ack") or {}).get("submitted", False)),
+                               "reconciled": True})
+    return {"offers_seen": len(offers), "processed": processed, "skipped": skipped,
+            "reconciled": reconciled}

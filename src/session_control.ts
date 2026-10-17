@@ -20,6 +20,7 @@
  * See docs/SESSION-CONTROL.md.
  */
 import type { SqlStorage } from '@cloudflare/workers-types';
+import { credentialActor } from './agent_registry';
 import { redact } from './routing';
 
 export const SESSION_CONTROL_SCHEMA = `
@@ -186,28 +187,61 @@ export class SessionControlService {
   }
 
   /** Fresh ownership authorization on every read/write/replay. Admins bypass;
-   * everyone else must present the owning actor with the same credential or a
-   * same-family refresh. Anything else renders as not_found (never an oracle). */
+   * everyone else must present the owning actor with a LIVE credential in the
+   * owning family (refresh continuity), verified inside the current
+   * transaction AFTER any awaited request body. A matching token id alone
+   * never authorizes: revoked/expired/rebound credentials fail closed, and
+   * agent callers must additionally resolve a live registry incarnation via
+   * credentialActor. Anything else renders as not_found (never an oracle). */
+  private agentLive(caller: Caller): boolean {
+    if (caller.kind !== 'agent') return true;
+    if (!caller.tokenId) return false;
+    const cred: any = this.sql.exec('SELECT * FROM credentials WHERE id = ?', caller.tokenId).toArray()[0];
+    if (!cred || cred.revoked_at) return false;
+    const expires = Date.parse(cred.expires_at);
+    if (!Number.isFinite(expires) || expires <= this.now()) return false;
+    return credentialActor(this.sql, cred) !== null;
+  }
+
   private ownerOk(row: { actor: string; owner_token_id?: string | null; owner_family?: string | null }, caller: Caller): boolean {
     if (caller.isAdmin === true) return true;
     if (!caller.actor || row.actor !== caller.actor) return false;
-    if (row.owner_token_id && caller.tokenId && row.owner_token_id === caller.tokenId) return true;
     const family = this.presentingFamily(caller);
+    if (!family) return false;
+    if (row.owner_token_id && caller.tokenId && row.owner_token_id === caller.tokenId) {
+      return this.agentLive(caller);
+    }
     if (family && row.owner_family && family === row.owner_family) {
       // Refresh continuity: adopt the rotated token id for future checks.
       const table = (row as any).session_id !== undefined ? 'session_control_commands' : 'session_control_sessions';
       try { this.sql.exec(`UPDATE ${table} SET owner_token_id = ? WHERE id = ?`, caller.tokenId, (row as any).id); } catch { /* bookkeeping only */ }
-      return true;
+      return this.agentLive(caller);
     }
     return false;
   }
 
-  /** Host machine binding plus credential-family continuity for poll/claim/ack/binding. */
+  /** Host machine binding plus credential-family continuity for poll/claim/ack/binding.
+   *
+   * Beyond the adopted session host_family, the CURRENT machine registry is
+   * consulted live on every call: the machine row must still exist (a deleted
+   * machine binds nothing), and when its enrolled credential resolves to a
+   * known family, the presenter must be in that family (a superseded pre-bind
+   * family cannot hijack the first binding; refresh rotations keep the family
+   * so genuine authority keeps working). */
   private hostOk(session: { machine_id?: string | null; host_family?: string | null }, caller: Caller): { ok: true } | { ok: false; error: string } {
     if (!session.machine_id || session.machine_id !== caller.machineId) return { ok: false, error: 'not_found' };
     if (caller.isAdmin === true) return { ok: true };
     const family = this.presentingFamily(caller);
     if (!family) return { ok: false, error: 'credential_changed' };
+    try {
+      const m: any = this.sql.exec(
+        'SELECT m.id, m.credential_id, c.family_id AS machine_family FROM machines m LEFT JOIN credentials c ON c.id = m.credential_id WHERE m.id = ?',
+        session.machine_id).toArray()[0];
+      if (!m) return { ok: false, error: 'not_found' };
+      if (m.machine_family && m.machine_family !== family) return { ok: false, error: 'host_credential_changed' };
+    } catch {
+      return { ok: false, error: 'credential_changed' };
+    }
     if (session.host_family && session.host_family !== family) return { ok: false, error: 'host_credential_changed' };
     return { ok: true };
   }
@@ -272,6 +306,46 @@ export class SessionControlService {
     if (prior && (prior.native_id !== binding.native_id || prior.tag !== binding.tag || prior.workspace !== binding.workspace)) {
       return { ok: false as const, error: 'binding_conflict' };
     }
+    // Canonical Fleet reconciliation (read-only; Fleet owns the launch
+    // lifecycle, this service never writes fleet rows). The assigned launch
+    // must exist on the session's machine in a live post-start state, the
+    // tag must be the canonical Fleet consumer tag for that launch
+    // ('hub-<fleet_launch_id>', the exact argv the existing Dispatcher
+    // starts), and an already-reported native id must match. Unstarted
+    // (offered), failed/exited/uncertain, foreign-machine, or inconsistent
+    // launches are refused. The binding workspace (absolute native path) is
+    // NOT compared to the Fleet workspace label: they live in different
+    // domains (hub label vs. canonical native path); machine + tag + native
+    // id + state carry the reconciliation instead.
+    const launch: any = this.sql.exec(
+      'SELECT id, machine_id, workspace, state, native_id FROM fleet_launches WHERE id = ?',
+      row.fleet_launch_id).toArray()[0];
+    if (!launch) return { ok: false as const, error: 'missing_fleet_launch' };
+    if (launch.machine_id !== row.machine_id) return { ok: false as const, error: 'fleet_machine_mismatch' };
+    if (launch.state !== 'starting' && launch.state !== 'running') {
+      return { ok: false as const, error: 'fleet_launch_state' };
+    }
+    if (binding.tag !== 'hub-' + launch.id) return { ok: false as const, error: 'fleet_tag_mismatch' };
+    if (launch.native_id && launch.native_id !== binding.native_id) {
+      return { ok: false as const, error: 'fleet_native_mismatch' };
+    }
+    // Authoritative native identity: the existing Fleet sessions report must
+    // already carry this exact native session (machine + UUID + tag +
+    // workspace, non-terminal phase). Binding before the Fleet consumer
+    // reports the native identity is refused — the launch row alone cannot
+    // prove the tag/workspace mapping, and an arbitrary workspace must never
+    // be adopted on a launch id plus an unreported UUID.
+    const reported: any = this.sql.exec(
+      'SELECT tag, workspace, phase FROM fleet_sessions WHERE machine_id = ? AND native_id = ?',
+      row.machine_id, binding.native_id).toArray()[0];
+    if (!reported) return { ok: false as const, error: 'fleet_native_unreported' };
+    if (reported.tag !== binding.tag || reported.workspace !== binding.workspace) {
+      return { ok: false as const, error: 'fleet_native_mismatch' };
+    }
+    if (reported.phase === 'exited' || reported.phase === 'dead' ||
+        reported.phase === 'forgotten' || reported.phase === 'pruned') {
+      return { ok: false as const, error: 'fleet_native_terminal' };
+    }
     const generation = (prior?.generation ?? 0) + 1;
     this.sql.exec('UPDATE session_control_sessions SET state = ?, binding_json = ?, updated_at = ? WHERE id = ?',
       'running', JSON.stringify({ native_id: binding.native_id, tag: binding.tag, workspace: binding.workspace, generation,
@@ -289,6 +363,85 @@ export class SessionControlService {
   private markUncertain(row: any, reason: string) {
     this.sql.exec("UPDATE session_control_commands SET state = 'uncertain', ack_json = ?, updated_at = ? WHERE id = ?",
       JSON.stringify({ outcome: 'uncertain', reason }), this.at(), row.id);
+  }
+
+  /** Late-reply reconciliation for an uncertain SEND (the single post-terminal
+   * transition). Real recipients ordinarily reply minutes after the execution
+   * lease lapses; discarding those replies would strand normal delayed
+   * delivery. This path records the proven outcome WITHOUT any new effect
+   * and WITHOUT re-opening claiming (claim on uncertain still 409s):
+   *
+   * - same command, same attempt (claim token + correlation match the fence),
+   *   same executor machine, fresh live host authority;
+   * - outcome `delivered` with a valid, still-unused reply proof against the
+   *   CURRENT binding (stale generations fail closed as usual).
+   *
+   * Capture/stop and proof-less outcomes stay terminal: without a reply
+   * proof there is nothing to reconcile. Returns the success response, or
+   * null when this ack is not an eligible late reply.
+   */
+  private lateReplyAck(row: any, input: any, caller: Caller): Response | null {
+    if (row.kind !== 'send' || input.outcome !== 'delivered') return null;
+    if (typeof input.correlation !== 'string' || input.correlation !== row.correlation) return null;
+    if (typeof input.claim_token !== 'string' || !input.claim_token ||
+        input.claim_token !== row.claim_token) return null;
+    const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', row.session_id).toArray()[0];
+    if (!session || session.machine_id !== caller.machineId) return null;
+    const gate = this.hostOk(session, caller);
+    if (!gate.ok) return null;
+    if (row.holder_machine !== caller.machineId) return null;
+    const binding = session.binding_json ? parsed(session.binding_json, null) : null;
+    if (!binding || binding.native_created_at_ms === undefined || binding.native_created_at_ms === null) return null;
+    if (input.native.native_id !== binding.native_id || input.native.tag !== binding.tag ||
+        input.native.workspace !== binding.workspace) return null;
+    const proof = validateSendProof(input.proof, { native_id: binding.native_id, tag: binding.tag,
+      workspace: binding.workspace, generation: binding.generation ?? 0,
+      native_created_at_ms: binding.native_created_at_ms });
+    if (!proof.ok) return null;
+    // Proof freshness was established by the handler's cross-state dedup
+    // before reaching this branch (same-command duplicates replay success,
+    // cross-command reuse is proof_replayed); reaching here means fresh.
+    const at = this.at();
+    const ack: any = {
+      outcome: 'delivered', native: input.native, claim_attempt: row.attempts ?? 1,
+      claim_token: input.claim_token,
+      ...(row.holder_attempt ? { holder_attempt: row.holder_attempt } : {}),
+      ...(typeof input.reason === 'string' ? { reason: input.reason } : {}),
+      proof: input.proof, late_reconciled: true,
+    };
+    this.sql.exec('UPDATE session_control_commands SET state = ?, ack_json = ?, updated_at = ? WHERE id = ?',
+      'acked', JSON.stringify(ack), at, row.id);
+    this.sql.exec('INSERT OR IGNORE INTO session_control_proofs (reply_envelope_id, command_id, session_id, created_at) VALUES (?, ?, ?, ?)',
+      input.proof.reply_to_native_id, row.id, row.session_id, at);
+    return response({ command_id: row.id, state: 'acked' });
+  }
+
+  /** Idempotent lost-ACK reconciliation: a re-submit that is byte-identical in
+   * the fields that define the recorded outcome (claim token, correlation via
+   * caller, outcome, native triple, proof envelope identity, capture bytes,
+   * confirmed exit) replays success WITHOUT repeating any native effect.
+   * Anything else keeps the existing terminal errors. */
+  private sameAck(row: any, input: any): boolean {
+    const stored = row.ack_json ? parsed(row.ack_json, null) : null;
+    if (!stored || typeof stored !== 'object') return false;
+    if (stored.claim_token !== input.claim_token || stored.outcome !== input.outcome) return false;
+    const a = stored.native || {};
+    const b = input.native || {};
+    if (a.native_id !== b.native_id || a.tag !== b.tag || a.workspace !== b.workspace) return false;
+    if ((stored.confirmed_exit === true) !== (input.confirmed_exit === true)) return false;
+    if (stored.proof || input.proof) {
+      const p = stored.proof || {};
+      const q = input.proof || {};
+      if (p.native_message_id !== q.native_message_id ||
+          p.reply_to_native_id !== q.reply_to_native_id ||
+          p.reply_digest !== q.reply_digest) return false;
+    }
+    if ((stored.capture ?? null) !== (input.capture ?? null)) {
+      // Capture bytes are server-redacted before storage, so compare against
+      // the redacted form of the resubmitted bytes.
+      if (redact(String(input.capture ?? '')).slice(0, 65536) !== (stored.capture ?? null)) return false;
+    }
+    return true;
   }
 
   async handle(request: Request, auth: Auth): Promise<Response> {
@@ -478,10 +631,14 @@ export class SessionControlService {
       return this.transaction(() => {
         const at = this.at();
         // Expiry sweep: a claim whose lease lapsed is a lost-effect attempt.
-        // Uncertain here, never re-offered, never blindly reissued.
+        // Uncertain here, never re-offered, never blindly reissued. Only the
+        // CURRENT bound family may age its own machine's claims: foreign or
+        // superseded families neither read payloads nor mutate transport here.
         for (const stale of this.sql.exec(
-          `SELECT c.id FROM session_control_commands c JOIN session_control_sessions s ON s.id = c.session_id
+          `SELECT c.id, c.claim_expires_at, s.host_family, s.machine_id FROM session_control_commands c JOIN session_control_sessions s ON s.id = c.session_id
            WHERE s.machine_id = ? AND c.state = 'claimed' AND c.holder_machine = ?`, caller.machineId!, caller.machineId!).toArray() as any[]) {
+          const session = { machine_id: stale.machine_id, host_family: stale.host_family };
+          if (!this.hostOk(session, caller).ok) continue;
           const full: any = this.sql.exec('SELECT * FROM session_control_commands WHERE id = ?', stale.id).toArray()[0];
           if (full && this.claimExpired(full)) this.markUncertain(full, 'claim_expired');
         }
@@ -502,6 +659,11 @@ export class SessionControlService {
         for (const row of rows) {
           const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', row.session_id).toArray()[0];
           if (!session || session.machine_id !== caller.machineId) continue;
+          // Host-family authorization BEFORE any payload disclosure or state
+          // mutation: a foreign or newly re-enrolled family for this machine
+          // sees nothing and transports nothing; a deleted machine offers
+          // nothing.
+          if (!this.hostOk(session, caller).ok) continue;
           const binding = session?.binding_json ? parsed(session.binding_json, null) : null;
           const requestJson = parsed(session.request_json, {});
           // Fetch receipt only: marking transported never authorizes an effect.
@@ -595,9 +757,31 @@ export class SessionControlService {
       return this.transaction(() => {
         const row: any = this.sql.exec('SELECT * FROM session_control_commands WHERE id = ?', ackMatch[1]).toArray()[0];
         if (!row) return response({ error: 'not_found' }, 404);
+        // Each native reply envelope confirms at most one command, in every
+        // state: a duplicate proof for the SAME command is idempotent success
+        // (concurrent or lost-ack re-submit, no new effect), while reuse
+        // across commands is replay.
+        if (row.kind === 'send' && input.outcome === 'delivered' && input.proof &&
+            typeof input.proof.reply_to_native_id === 'string' && input.proof.reply_to_native_id) {
+          const seen: any = this.sql.exec('SELECT command_id FROM session_control_proofs WHERE reply_envelope_id = ?',
+            input.proof.reply_to_native_id).toArray()[0];
+          if (seen) {
+            if (seen.command_id === row.id) return response({ command_id: row.id, state: 'acked' });
+            return response({ error: 'proof_replayed' }, 409);
+          }
+        }
         // The execution fence: only the live claim holder may report an outcome.
+        // A re-submit identical to the already-recorded ack (lost-ack response)
+        // replays success without any new effect; anything else on a
+        // non-claimed row keeps the existing terminal errors, except for one
+        // narrow path below: late-reply reconciliation on uncertain sends.
         if (row.state !== 'claimed') {
-          if (row.state === 'uncertain') return response({ error: 'command_uncertain' }, 409);
+          if (this.sameAck(row, input)) return response({ command_id: row.id, state: row.state });
+          if (row.state === 'uncertain') {
+            const late = this.lateReplyAck(row, input, caller);
+            if (late) return late;
+            return response({ error: 'command_uncertain' }, 409);
+          }
           return response({ error: 'claim_required' }, 409);
         }
         const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', row.session_id).toArray()[0];
@@ -637,14 +821,15 @@ export class SessionControlService {
             workspace: binding.workspace, generation: binding.generation ?? 0,
             native_created_at_ms: binding.native_created_at_ms });
           if (!proof.ok) return response({ error: proof.error }, 409);
-          // Each native reply envelope confirms at most one command: reuse is
-          // replay, whether foreign or duplicated.
-          const seen: any = this.sql.exec('SELECT command_id FROM session_control_proofs WHERE reply_envelope_id = ?',
-            input.proof.reply_to_native_id).toArray()[0];
-          if (seen) return response({ error: 'proof_replayed' }, 409);
+          // Proof uniqueness was established at the top of this handler for
+          // every state; reaching here means this reply envelope is fresh.
         }
         const ack: any = {
           outcome: input.outcome, native: input.native, claim_attempt: row.attempts ?? 1,
+          // The claim token binds this recorded outcome to exactly one
+          // authorized attempt, so an identical lost-ack re-submit is
+          // recognizable without repeating the native effect.
+          claim_token: input.claim_token,
           ...(row.holder_attempt ? { holder_attempt: row.holder_attempt } : {}),
           ...(input.reason !== undefined ? { reason: input.reason } : {}),
           ...(input.capture !== undefined ? { capture: redact(input.capture).slice(0, 65536), capture_truncated: input.capture.length >= 65536 } : {}),

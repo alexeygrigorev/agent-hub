@@ -109,10 +109,22 @@ def wait_for_command(session_id, command_id, timeout, interval):
     deadline = time.monotonic() + timeout
 
     def fetch():
-        listing = request('GET', '/api/sessions/' + session_id + '/commands?limit=100')
-        for entry in listing.get('commands', []):
-            if entry.get('id') == command_id:
-                return entry
+        # Bounded complete pagination: commands past the first page (e.g.
+        # command #101) live behind next_cursor; follow it instead of
+        # failing on page one. Capped pages keep the wait bounded.
+        from urllib.parse import quote
+        cursor = None
+        for _ in range(10):
+            path = '/api/sessions/' + session_id + '/commands?limit=100'
+            if cursor:
+                path += '&cursor=' + quote(cursor, safe='')
+            listing = request('GET', path)
+            for entry in listing.get('commands', []):
+                if entry.get('id') == command_id:
+                    return entry
+            cursor = listing.get('next_cursor')
+            if not cursor:
+                break
         raise ValueError('Command missing from server listing; reconcile before retrying')
 
     return wait_until(deadline, interval,
@@ -171,14 +183,36 @@ def execute(args):
     import uuid
     cmd = getattr(args, 'sessions_cmd', None)
     if cmd == 'list':
-        params = ''
-        if getattr(args, 'limit', None):
-            params = '?limit=%d' % int(args.limit)
-        result = request('GET', '/api/sessions' + params)
         wanted = getattr(args, 'state', None)
-        if wanted:
-            result = dict(result, sessions=[s for s in result.get('sessions', []) if s.get('state') == wanted])
-        return result
+        limit = int(getattr(args, 'limit', None) or 50)
+        if not wanted:
+            params = ''
+            if getattr(args, 'limit', None):
+                params = '?limit=%d' % limit
+            return request('GET', '/api/sessions' + params)
+        # State-filtered listing follows next_cursor (bounded, id-deduped) so
+        # filtering is complete instead of first-page-only.
+        from urllib.parse import quote
+        seen: list = []
+        known: set = set()
+        cursor = None
+        for _ in range(10):
+            path = '/api/sessions?limit=%d' % limit
+            if cursor:
+                path += '&cursor=' + quote(cursor, safe='')
+            page = request('GET', path)
+            for entry in page.get('sessions', []):
+                if entry.get('id') in known:
+                    continue
+                known.add(entry.get('id'))
+                if entry.get('state') == wanted:
+                    seen.append(entry)
+                    if len(seen) >= limit:
+                        return {'sessions': seen[:limit], 'next_cursor': None}
+            cursor = page.get('next_cursor')
+            if not cursor:
+                break
+        return {'sessions': seen[:limit], 'next_cursor': None}
     if cmd == 'show':
         return request('GET', '/api/sessions/' + args.id)
     if cmd == 'commands':

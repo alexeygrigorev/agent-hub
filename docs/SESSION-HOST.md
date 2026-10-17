@@ -20,13 +20,26 @@ head-chosen endpoints. Full signature/result/proof contract for wiring:
     an effect; stale `created_at_ms` refuses; phase is liveness only, never an
     idle/readiness claim),
   - `send_inbox` (`message send --to TAG`; state `recorded` at most — inbox
-    persistence is never transported/acknowledged),
+    persistence is never transported/acknowledged). Before the effect the
+    caller qualifies its genuine workspace-bound sender identity
+    (`whoami --json`, no overrides): unbound or foreign-workspace senders are
+    refused with `native_sender_unbound` and no effect, because recipients
+    could never reply (installed anonymous-reply rejection). After the send,
+    the actual envelope `from` is validated against the qualified own binding
+    via the existing `native_bridge` contract; sender fields are never
+    fabricated to make fixtures replyable.
+  - `deliver_recorded` (`message deliver <envelope-id>`; explicit opt-in only;
+    maps to `transported`/`refused`, never acknowledged),
   - `deliver_recorded` (`message deliver <envelope-id>`; explicit opt-in only;
     maps to `transported`/`refused`, never acknowledged),
   - `fetch_message_log` (bounded exact-workspace `message log`, read-only),
   - `verify_ack_via_reply` (ACK ONLY on a reply envelope in the retrieved log
     with `reply_to` = original native envelope id, `from` session/tag/workspace
-    = intended generation, correlation id + body-digest echo; else `unknown`),
+    = intended generation, correlation id + body-digest echo from structured
+    `data` OR body text, and — when the reply carries its sender creation
+    value — exact incarnation match; else `unknown`). The target is
+    re-qualified (tag reuse/incarnation drift refuses) before the log scan;
+    the actual sender creation value is reported, never overwritten.
   - `capture_output` (bounded tail/screen; `privacy_unknown=True` always),
   - `status_of` (read-only probe), `stop_session` (kill + verified exit with
     UUID+tag+workspace+generation checked before AND after),
@@ -43,8 +56,16 @@ head-chosen endpoints. Full signature/result/proof contract for wiring:
   - `handle_claimed_command` — THE shared receiver for API wiring: verifies the
     server claim (token strength/holder/generation/expiry) BEFORE any effect,
     holds the per-command exclusive lock, journals the attempt before the
-    effect, runs send/capture/stop for the exact target, journals the outcome,
-    and reports `.../ack` with the claim token. `start` rejected (Fleet-owned).
+    effect, runs send/capture/stop for the exact target, journals the outcome
+    AND the ack payload/submission state atomically, and reports `.../ack`
+    with the claim token. A send with no recipient reply yet is journaled
+    `unknown` with NO server ack (never premature `uncertain`); bounded
+    read-only reconciliation (`receive_once` post-cycle pass over `cmd-*`
+    journals, same claim token, no second send) submits the delivered proof
+    once the delayed reply is observed. A completed effect with a lost ack
+    response re-submits the IDENTICAL journaled ack (same token, no new
+    effect); a terminal server verdict closes the journal as `uncertain`.
+    `start` rejected (Fleet-owned).
 
 ## State model (binding on all layers)
 

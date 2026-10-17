@@ -41,7 +41,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from .native_bridge import canonicalize_workspace
+from .native_bridge import (
+    BridgeCapabilityGap,
+    NativeServiceBinding,
+    canonicalize_workspace,
+    validate_native_send_envelope,
+)
 
 MAX_BODY_BYTES = 16 * 1024  # bus limit, reused for prompt bodies
 MAX_CAPTURE_BYTES = 32 * 1024  # default bounded tail
@@ -337,6 +342,73 @@ def qualify_target(
     return row
 
 
+def qualify_sender_binding(
+    executable: str,
+    workspace: str,
+) -> NativeServiceBinding:
+    """Qualify the calling process's genuine native sender identity BEFORE any send.
+
+    Runs read-only ``whoami --json`` (argv only, no shell, no identity
+    override) and requires a real bound session (UUID id + non-empty tag) in
+    the EXACT canonical target workspace. An unbound process, a sender from
+    another workspace, or an anonymous/foreign envelope sender means native
+    recipients could never ``message reply`` (installed Rust ``reply_target``
+    rejects anonymous originals), so the attempt is refused here with
+    ``SessionControlError`` (honest capability gap, no native effect) instead
+    of emitting an unreplyable envelope. The returned binding is the observed
+    own identity, used to validate the actual send envelope below — sender
+    fields are never fabricated.
+    """
+    if not isinstance(workspace, str) or not Path(workspace).is_absolute():
+        raise SessionControlError("Workspace must be an absolute path")
+    canonical = canonicalize_workspace(workspace)
+    try:
+        proc = run_native(executable, ["whoami", "--json"], timeout=QUICK_TIMEOUT)
+    except (SessionControlError, SessionUncertain) as exc:
+        raise SessionControlError(
+            "native_sender_unbound: this host process holds no qualified native sender "
+            "identity (whoami unavailable); recipients could not reply") from exc
+    if proc.returncode != 0:
+        raise SessionControlError(
+            "native_sender_unbound: this host process holds no qualified native sender "
+            "identity (whoami refused); recipients could not reply")
+    try:
+        identity = json.loads(proc.stdout)
+    except (ValueError, TypeError) as exc:
+        raise SessionControlError(
+            "native_sender_unbound: unqualified native sender identity output") from exc
+    if not isinstance(identity, dict):
+        raise SessionControlError("native_sender_unbound: unqualified native sender identity output")
+    sender_id = identity.get("id", identity.get("session_id"))
+    sender_tag = identity.get("tag")
+    sender_ws = identity.get("workspace")
+    try:
+        norm_id = str(uuid.UUID(str(sender_id))) if sender_id else ""
+    except (ValueError, TypeError, AttributeError):
+        norm_id = ""
+    if not norm_id or not isinstance(sender_tag, str) or not sender_tag \
+            or not isinstance(sender_ws, str) or not sender_ws:
+        raise SessionControlError(
+            "native_sender_unbound: anonymous or incomplete native sender identity; "
+            "recipients could not reply")
+    if canonicalize_workspace(sender_ws) != canonical:
+        raise SessionControlError(
+            "native_sender_unbound: own native session lives in %r, not the target "
+            "workspace %r; recipients in the target workspace could not reply"
+            % (sender_ws, canonical))
+    try:
+        created = identity.get("created_at_ms")
+        created_ms = int(created) if type(created) is int else 0
+    except (TypeError, ValueError):
+        created_ms = 0
+    return NativeServiceBinding(
+        session_id=norm_id, tag=sender_tag, workspace=canonical,
+        engine=str(identity.get("engine", "hub-host")),
+        profile=identity.get("profile") if isinstance(identity.get("profile"), str) else None,
+        created_at_ms=created_ms,
+    )
+
+
 def send_inbox(
     executable: str,
     target: NativeTarget,
@@ -357,6 +429,10 @@ def send_inbox(
         raise SessionControlError("Correlation id is required for every send")
     if not isinstance(kind, str) or not kind or len(kind) > 64:
         raise SessionControlError("Invalid message kind")
+    # Genuine sender qualification BEFORE the effect: an unbound or
+    # foreign-workspace sender would emit an anonymous envelope recipients
+    # cannot reply to, so refuse honestly with no effect.
+    sender_binding = qualify_sender_binding(executable, target.workspace)
     qualify_target(executable, target)
     data = json.dumps({"hub_session_control": correlation}, ensure_ascii=False)
     proc = run_native(
@@ -374,6 +450,14 @@ def send_inbox(
     envelope = _parse_json_output(proc, "message send")
     if not isinstance(envelope, dict) or not envelope.get("id"):
         raise SessionUncertain("Inbox send returned no envelope id; effect unknown")
+    # The envelope MUST carry our own qualified sender identity: recipients
+    # can only reply to a non-anonymous sender tag (installed reply_target).
+    try:
+        validate_native_send_envelope(envelope, sender_binding, target.workspace)
+    except BridgeCapabilityGap as exc:
+        raise SessionUncertain(
+            "native send persisted an unreplyable sender envelope (%s); effect "
+            "recorded but processing can never be proven — reconcile" % exc) from exc
     # Sender provenance is the caller's own session; recipients reply per the native
     # reply_target contract. No processing claim is made here by construction.
     try:
@@ -483,6 +567,13 @@ def verify_ack_via_reply(
     if not isinstance(correlation, dict) or not correlation.get("correlation_id"):
         raise SessionControlError("Correlation id is required for ACK proof")
     expected_digest = correlation.get("body_digest", "")
+    # Exact target requalification: the tag must still resolve to this UUID +
+    # incarnation (read-only list). Tag reuse or incarnation drift means a
+    # reply from the tag is no longer proof from THIS target.
+    try:
+        qualify_target(executable, target, live_only=False)
+    except SessionControlError as exc:
+        return AckResult(state="unknown", reason=f"target requalification failed: {exc}")
     try:
         log = fetch_message_log(executable, target.workspace)
     except SessionUncertain as exc:
@@ -499,6 +590,13 @@ def verify_ack_via_reply(
                 or sender.get("tag") != target.tag
                 or sender.get("workspace") != target.workspace):
             continue  # foreign or retargeted reply: not our proof
+        # Real reply provenance: when the reply carries its sender's native
+        # creation incarnation, it MUST match the bound target incarnation.
+        # An actual creation value is never overwritten with the expected one.
+        sender_created = sender.get("created_at_ms")
+        if type(sender_created) is int and target.created_at_ms is not None \
+                and sender_created != target.created_at_ms:
+            continue  # stale incarnation or tag reuse: not our proof
         payload = env.get("data")
         body_text = env.get("body") if isinstance(env.get("body"), str) else ""
         echoed_corr = ""
@@ -506,12 +604,21 @@ def verify_ack_via_reply(
         if isinstance(payload, dict):
             echoed_corr = str(payload.get("correlation_id", ""))
             echoed_digest = str(payload.get("body_digest", ""))
-        if echoed_corr != correlation["correlation_id"]:
-            continue
-        if expected_digest and echoed_digest != expected_digest:
-            continue
-        if not expected_digest and correlation["correlation_id"] not in body_text:
-            continue
+        if echoed_corr:
+            # Structured echo path (installed reply --data contract).
+            if echoed_corr != correlation["correlation_id"]:
+                continue
+            if expected_digest and echoed_digest != expected_digest:
+                continue
+        else:
+            # Body-text fallback path (standard `message reply <id> "<text>"`
+            # without --data): the body must echo the exact correlation id and,
+            # when a digest is expected, the exact body digest. A bare id echo
+            # with no digest is NOT proof.
+            if correlation["correlation_id"] not in body_text:
+                continue
+            if expected_digest and expected_digest not in body_text:
+                continue
         # Server proof needs a 64-hex reply digest computed from the OBSERVED
         # reply envelope (host-verified provenance, not crypto target auth).
         # Defined as sha256 hex of the reply body text (UTF-8); when the body

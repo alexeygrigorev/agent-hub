@@ -113,6 +113,12 @@ Behavior:
 ### Claim / ack discipline (one-time attempt fence)
 
 1. Host polls `offers` (marks `recorded` -> `transported` fetch receipt only).
+   Offers are authorized PER SESSION before any payload disclosure or state
+   mutation: the presenting host credential must be bound to the session
+   machine, its live family must match the machine registry's current family
+   (when enrolled) and the adopted session host family. A foreign or newly
+   re-enrolled family sees nothing and transports nothing; a deleted machine
+   offers nothing. The claim-expiry sweep honors the same gate.
    Offers carry `command_id`, `kind`, `generation`, `correlation`, `payload`,
    plus `binding` with `native_id` (target UUID), `tag`, `workspace`,
    `generation`, and `native_created_at_ms` (incarnation; null means unbound).
@@ -141,6 +147,46 @@ Behavior:
    the live claim holder may ack; an ack after lease expiry marks the command
    `uncertain` (the effect may have happened) and is rejected with
    `claim_expired` — never marked delivered, never reissued.
+   A SEND whose recipient reply has not arrived yet is NOT acked at all on
+   the first cycle: the host journals the durable attempt with the original
+   native envelope id and reconciles read-only (same claim token, no second
+   send) while the lease lasts — and, once the lease has lapsed, after it:
+   a delayed delivered proof on the SAME attempt (token + correlation +
+   current binding + fresh authority) still reconciles an uncertain send to
+   `acked` with no new effect and without re-opening claiming. Proof-less
+   outcomes stay terminal. Premature `uncertain` would lock the server
+   command (`409 command_uncertain`) and strand the delayed reply.
+5. Lost ack responses are repaired by IDENTICAL re-submit, never by a new
+   effect: the host persists the ack payload and its submission state
+   atomically with the outcome and re-POSTs it verbatim under the same claim
+   token (discovered via its journal, since claimed/acked rows are never
+   re-offered). The server records the claim token in `ack_json` and replays
+   success for a byte-identical re-submit (same token/correlation/outcome/
+   native/proof/capture/exit); each native reply envelope still confirms at
+   most one command. Anything else on a finished row keeps the terminal
+   errors. A terminal server verdict (HTTP 409) on re-submit closes the
+   journal as `uncertain` without a new effect.
+
+### Binding reconciliation (Fleet-canonical)
+
+`POST /api/sessions/:id/binding` reconciles the reported native session
+against the canonical assigned Fleet launch (read-only; Fleet owns the
+launch lifecycle): the launch row must exist on the session's machine in a
+live post-start state (`starting`|`running` — `offered` is unstarted,
+`failed`/`exited`/`uncertain` are not bindable), the tag must be the exact
+Fleet consumer tag for that launch (`hub-<fleet_launch_id>`), an
+already-reported launch native id must match, AND the existing Fleet sessions
+report must already carry this exact native identity (same machine + UUID +
+tag + workspace, non-terminal phase). Binding before the Fleet consumer
+reports the native identity is refused (`fleet_native_unreported`); a
+reported tag/workspace mismatch or a terminal native phase is refused as
+well. The launch row alone never proves the tag/workspace mapping, so an
+arbitrary workspace is never adopted on a launch id plus an unreported UUID.
+The binding workspace (absolute native path) is deliberately NOT compared to
+the Fleet workspace label — different domains (hub label vs. canonical native
+path) — so machine + tag + native id + state + the sessions report carry the
+reconciliation instead, and the host still re-qualifies
+the exact target (UUID + tag + workspace + incarnation) before every effect.
 
 ### Correlated delivery proof (host-verified native reply provenance)
 
@@ -173,9 +219,12 @@ be 64-hex; the sender triple plus generation plus `native_created_at_ms`
 must equal the session binding (binding without `native_created_at_ms` is
 rejected, so incarnation evidence is mandatory); each reply envelope
 confirms at most one command (`session_control_proofs` primary key — reuse
-is `409 proof_replayed`). The sibling host worker supplies the receiver
+across commands is `409 proof_replayed`, while a duplicate proof for the
+SAME command replays success for lost-ack repair). The sibling host worker supplies the receiver
 mechanism (reply-to vs. log scan) and journals `attempt_id`; this shape is
-the shared agreement point.
+the shared agreement point. The host forwards the reply's ACTUAL sender
+creation value; the hub rejects a mismatch rather than accepting an
+overwritten expectation.
 
 Capture output is projected on the host BEFORE upload, bounded
 (`max_bytes` 1..65536), server-redacted with the existing routing `redact`
@@ -190,13 +239,21 @@ reaches `stopped`.
 ### Ownership and credentials
 
 Owner actor + credential token id + credential family are stored on every
-session/command row. Every read/write/replay/claim/ack re-authorizes: admins
-bypass; owners must present the same actor with the same credential or a
-same-family refresh (continuity adopted). Revoked/expired presenting
-credentials are rejected by the shared hub auth before this service runs;
+session/command row. Every read/write/replay/claim/ack re-authorizes against
+LIVE registry state inside the current transaction (after any awaited body):
+admins bypass; owners must present the owning actor with a live credential in
+the owning family — a matching token id alone never authorizes, and agent
+callers must additionally resolve a live registry incarnation
+(`credentialActor`). Revoked/expired presenting credentials fail closed;
+same-family refresh keeps working and adopts the rotated token id;
 delete-and-reregister (new family, same actor) renders as `not_found`, never
 an upgrade. Host endpoints additionally require the session machine to equal
-the credential machine and enforce host-family continuity once adopted.
+the credential machine, the machine row to still exist in `machines`, and —
+when the enrolled credential resolves to a known family — the presenting
+family to equal that CURRENT family (a superseded pre-bind family cannot
+hijack the first binding and lock out the enrolled machine), plus
+host-family continuity once adopted. The recorded ack carries the authorizing
+claim token so identical lost-ack re-submits are recognizable.
 Cross-origin/cookie/CSRF/mixed-auth handling is identical to the intake
 mount (same helper shape, narrow operator-token route scope, no global
 `BusAuth` changes).
@@ -219,7 +276,8 @@ hub sessions host-receive --once --machine-id hetzner [--actor machine:hetzner]
 
 `--wait` polls boundedly to a terminal state (session: running/stopped/...;
 command: acked/refused/uncertain — `transported` alone never completes the
-wait). Every mutation prints its `client_key`; after a lost response, retry
+wait), following server `next_cursor` pages (bounded, id-deduped) so commands
+past the first page and state-filtered listings are complete. Every mutation prints its `client_key`; after a lost response, retry
 with the SAME `--key` (replay vs. 409 conflict), never an unkeyed retry. No
 silent drops; HTTP 201 (queued) is never rendered as delivery. Errors never
 echo prompt text, tokens, or server-controlled bodies. `--tier` is accepted

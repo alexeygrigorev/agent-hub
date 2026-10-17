@@ -190,6 +190,65 @@ def verify_server_claim(claim: dict[str, Any], *, now_ms: Optional[int] = None) 
             "generation": generation, "expires_at_ms": expires_at}
 
 
+def _request_status(exc: BaseException) -> Optional[int]:
+    """Best-effort HTTP status extraction from request-callable failures.
+
+    The production hub client raises ``ValueError('... status NNN')``; stub
+    callables in tests raise similar errors. A 409 means the server issued a
+    terminal verdict for this attempt (expired/stale/uncertain/mismatch) while
+    any other failure is transport loss with the outcome still unknown.
+    """
+    import re as _re
+
+    match = _re.search(r"status (\d{3})", str(exc))
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    status = getattr(exc, "status", None)
+    return status if type(status) is int else None
+
+
+def _server_correlation(command_id: str, generation: int) -> str:
+    return "cmd:%s:gen:%d" % (command_id, generation)
+
+
+def _delivered_ack_payload(
+    *,
+    command_id: str,
+    generation: int,
+    target: "NativeTarget",
+    original_native_message_id: str,
+    reply_envelope_id: str,
+    evidence: dict[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    sender_created = evidence.get("sender_created_at_ms")
+    if type(sender_created) is not int:
+        # The verifier falls back to the bound target incarnation only when
+        # the reply carries no actual creation value; a real observed value
+        # is forwarded verbatim, never overwritten with the expectation.
+        sender_created = target.created_at_ms
+    return {
+        "correlation": _server_correlation(command_id, generation),
+        "outcome": "delivered",
+        "native": {"native_id": target.session_id,
+                   "tag": target.tag, "workspace": target.workspace},
+        "reason": str(reason or "")[:512],
+        "proof": {
+            "native_message_id": original_native_message_id,
+            "reply_to_native_id": reply_envelope_id,
+            "reply_digest": evidence.get("reply_digest", "0" * 64),
+            "sender_native_id": target.session_id,
+            "sender_tag": target.tag,
+            "sender_workspace": target.workspace,
+            "sender_generation": generation,
+            "sender_created_at_ms": sender_created,
+        },
+    }
+
+
 def _target_from_offer_result(offer: dict[str, Any], result: dict[str, Any],
                                workspace_path: str) -> Optional[NativeTarget]:
     native_id = result.get("native_id")
@@ -478,6 +537,176 @@ def stop_controlled_session(
     return {"session_id": result.session_id, "state": result.state, "reason": result.reason}
 
 
+def _reconcile_unknown_locked(
+    journal_file: str,
+    prior: dict[str, Any],
+    command_id: str,
+    *,
+    executable: str,
+    request: Optional[Callable],
+    now_ms: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """Read-only reconciliation of one pending send (caller holds the journal lock).
+
+    Re-runs ``verify_ack_via_reply`` against the journaled
+    ``original_native_message_id`` WITHOUT any second native send. When the
+    delayed recipient reply is now observed, its delivered proof is submitted
+    under the SAME claim token and the journal advances to acknowledged. A
+    terminal server verdict (HTTP 409: expired/stale/uncertain/mismatch)
+    closes the journal as uncertain; transport loss leaves it pending.
+    Returns the updated record, or None when still unknown.
+    """
+    from .native_sessions import NativeTarget as _NativeTarget
+    from .native_sessions import verify_ack_via_reply as _verify
+
+    raw_target = prior.get("target") or {}
+    try:
+        target = _NativeTarget(
+            session_id=raw_target["session_id"], tag=raw_target["tag"],
+            workspace=raw_target["workspace"],
+            created_at_ms=raw_target.get("created_at_ms")).validated()
+    except (KeyError, TypeError, SessionControlError):
+        return None
+    body_digest = prior.get("body_digest") or ""
+    proof = _verify(
+        executable, target, str(prior.get("original_native_message_id") or ""),
+        {"correlation_id": command_id, "body_digest": body_digest})
+    if proof.state != "acknowledged" or not proof.reply_envelope_id:
+        return None
+    evidence = proof.evidence or {}
+    payload = _delivered_ack_payload(
+        command_id=command_id, generation=int(prior.get("generation", 0)),
+        target=target,
+        original_native_message_id=str(prior.get("original_native_message_id")),
+        reply_envelope_id=str(proof.reply_envelope_id),
+        evidence=evidence, reason=proof.reason)
+    updated = {**prior, "state": "acknowledged",
+               "reply_envelope_id": str(proof.reply_envelope_id),
+               "reason": str(proof.reason)[:300],
+               "ack_payload": payload}
+    if request is None:
+        updated["ack_submitted"] = False
+        _write_journal(journal_file, updated)
+        return {"op": prior.get("op"), **updated,
+                "ack": {"submitted": False, "payload": payload}}
+    try:
+        request("POST", "/api/session-commands/" + command_id + "/ack",
+                {**payload, "claim_token": prior.get("claim_token")})
+    except Exception as exc:
+        if _request_status(exc) == 409:
+            updated = {**updated, "state": "uncertain",
+                       "ack_submitted": False,
+                       "ack_error": "server_terminal_%s" % type(exc).__name__}
+            _write_journal(journal_file, updated)
+            return {"op": prior.get("op"), **updated,
+                    "ack": {"submitted": False, "payload": payload,
+                            "terminal": "uncertain"}}
+        return None
+    updated["ack_submitted"] = True
+    _write_journal(journal_file, updated)
+    return {"op": prior.get("op"), **updated,
+            "ack": {"submitted": True, "payload": payload, "reconciled": True}}
+
+
+def _resubmit_ack_locked(
+    journal_file: str,
+    prior: dict[str, Any],
+    command_id: str,
+    claim_token: str,
+    *,
+    request: Callable,
+) -> Optional[dict[str, Any]]:
+    """Re-submit an identical proven ack (caller holds the journal lock).
+
+    The native effect is never repeated: the journaled ``ack_payload`` is
+    POSTed verbatim under the same claim token. Success marks the journal
+    submitted; a terminal server verdict (HTTP 409) closes it as uncertain;
+    transport loss leaves it pending for the next cycle.
+    """
+    payload = prior.get("ack_payload")
+    if not isinstance(payload, dict):
+        return None
+    if not isinstance(prior.get("claim_token"), str) or not prior.get("claim_token"):
+        return None  # no authorized attempt token: never submit without it
+    try:
+        request("POST", "/api/session-commands/" + command_id + "/ack",
+                {**payload, "claim_token": claim_token})
+    except Exception as exc:
+        if _request_status(exc) == 409:
+            updated = {**prior, "state": "uncertain", "ack_submitted": False,
+                       "ack_error": "server_terminal_%s" % type(exc).__name__}
+            _write_journal(journal_file, updated)
+            return {**updated, "replayed": True,
+                    "ack": {"submitted": False, "payload": payload,
+                            "terminal": "uncertain"}}
+        return None
+    updated = {**prior, "ack_submitted": True}
+    updated.pop("ack_error", None)
+    _write_journal(journal_file, updated)
+    return {**updated, "replayed": True,
+            "ack": {"submitted": True, "payload": payload, "resubmitted": True}}
+
+
+def reconcile_pending_command(
+    *,
+    journal_dir: str,
+    command_id: str,
+    executable: str = "aplexer",
+    request: Optional[Callable] = None,
+    now_ms: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """Bounded read-only reconciliation of one pending send (acquires the journal lock).
+
+    Used by the receiver's post-cycle reconcile pass and by external
+    wiring: re-runs ``verify_ack_via_reply`` against the journaled original
+    envelope WITHOUT any second native send, submitting the delivered proof
+    under the same claim token once observed. Returns the updated record, or
+    None when there is nothing (or nothing yet) to reconcile.
+    """
+    journal_file = _journal_path(journal_dir, "cmd-" + command_id)
+    try:
+        with _lock_held(journal_file):
+            prior = _read_journal(journal_file)
+            if prior is None:
+                return None
+            if prior.get("state") != "unknown" or not prior.get("original_native_message_id"):
+                return None
+            return _reconcile_unknown_locked(
+                journal_file, prior, command_id, executable=executable,
+                request=request, now_ms=now_ms)
+    except (SessionControlError, SessionUncertain, OSError):
+        return None
+
+
+def resubmit_pending_ack(
+    *,
+    journal_dir: str,
+    command_id: str,
+    request: Callable,
+) -> Optional[dict[str, Any]]:
+    """Re-submit one journaled but unsubmitted ack (acquires the journal lock).
+
+    Used by the receiver's post-cycle pass so a lost ack response is repaired
+    even when the server no longer offers the command (claimed/acked rows are
+    never re-offered). Never repeats the native effect.
+    """
+    journal_file = _journal_path(journal_dir, "cmd-" + command_id)
+    try:
+        with _lock_held(journal_file):
+            prior = _read_journal(journal_file)
+            if prior is None:
+                return None
+            if prior.get("ack_submitted") or not isinstance(prior.get("ack_payload"), dict):
+                return None
+            if prior.get("state") == "unknown":
+                return None  # reply reconciliation owns this journal, not ack replay
+            return _resubmit_ack_locked(
+                journal_file, prior, command_id, str(prior.get("claim_token") or ""),
+                request=request)
+    except (SessionControlError, SessionUncertain, OSError):
+        return None
+
+
 def handle_claimed_command(
     command: dict[str, Any],
     claim: dict[str, Any],
@@ -560,6 +789,26 @@ def handle_claimed_command(
             if prior.get("attempted") and prior.get("state") in (None, "uncertain"):
                 raise SessionUncertain(
                     "Claim already attempted with unknown outcome; reconcile, no new effect")
+            if prior.get("state") == "unknown" and prior.get("original_native_message_id"):
+                # Same attempt, reply pending: read-only reconciliation only
+                # (never a second native send). Either the delayed reply is
+                # now observed and its delivered proof is submitted, or the
+                # journal replays unchanged.
+                reconciled = _reconcile_unknown_locked(
+                    journal_file, prior, command_id, executable=executable,
+                    request=request, now_ms=now_ms)
+                if reconciled is not None:
+                    return reconciled
+                return {**prior, "replayed": True}
+            if not prior.get("ack_submitted") and isinstance(prior.get("ack_payload"), dict) \
+                    and request is not None:
+                # Same attempt, effect complete, ack response lost: re-submit
+                # the IDENTICAL proven ack without repeating the native effect.
+                resubmitted = _resubmit_ack_locked(
+                    journal_file, prior, command_id, proved["claim_token"],
+                    request=request)
+                if resubmitted is not None:
+                    return resubmitted
             return {**prior, "replayed": True}
 
         attempt = {"op": op, "command_id": command_id, "attempted": True,
@@ -587,15 +836,29 @@ def handle_claimed_command(
                   "native_id": outcome.get("native_id"),
                   "original_native_message_id": outcome.get("original_native_message_id"),
                   "reply_envelope_id": outcome.get("reply_envelope_id"),
-                  "reason": str(outcome.get("reason", ""))[:300]}
-        _write_journal(journal_file, record)
+                  "reason": str(outcome.get("reason", ""))[:300],
+                  "expires_at_ms": proved["expires_at_ms"],
+                  "server_correlation": _server_correlation(command_id, proved["generation"])}
+
+        # A send whose recipient reply has not arrived yet is journaled as
+        # pending WITHOUT any server ack: the command stays claimed under its
+        # lease while bounded read-only reconciliation watches for the delayed
+        # reply. Finalizing terminal `uncertain` on the 0ms check would lock
+        # the server command and strand the later reply, so no POST happens
+        # here by construction.
+        if outcome.get("state") == "unknown":
+            record["ack_submitted"] = False
+            record["ack_pending"] = "awaiting_recipient_reply"
+            _write_journal(journal_file, record)
+            return {"op": op, **record,
+                    "ack": {"submitted": False, "pending": "awaiting_recipient_reply"}}
 
         # CORRECTED ack.native semantics: ack.native.native_id is ALWAYS the
         # TARGET NATIVE SESSION UUID (binding match), never an envelope id.
         # Envelope ids travel in proof (native_message_id = original delivered
         # envelope, reply_to_native_id = reply envelope) and in the journal.
         ack_payload: dict[str, Any] = {
-            "correlation": "cmd:%s:gen:%d" % (command_id, proved["generation"]),
+            "correlation": _server_correlation(command_id, proved["generation"]),
             "outcome": outcome.get("ack_outcome", "uncertain"),
             "native": {"native_id": target.session_id,
                        "tag": target.tag, "workspace": target.workspace},
@@ -603,21 +866,20 @@ def handle_claimed_command(
         }
         if op == "send" and outcome.get("ack_outcome") == "delivered" and outcome.get("reply_envelope_id"):
             evidence = outcome.get("proof_evidence") or {}
-            ack_payload["proof"] = {
-                "native_message_id": outcome.get("original_native_message_id"),
-                "reply_to_native_id": outcome.get("reply_envelope_id"),
-                "reply_digest": evidence.get("reply_digest", "0" * 64),
-                "sender_native_id": target.session_id,
-                "sender_tag": target.tag,
-                "sender_workspace": target.workspace,
-                "sender_generation": proved["generation"],
-                "sender_created_at_ms": target.created_at_ms,
-            }
+            ack_payload["proof"] = _delivered_ack_payload(
+                command_id=command_id, generation=proved["generation"], target=target,
+                original_native_message_id=str(outcome.get("original_native_message_id")),
+                reply_envelope_id=str(outcome.get("reply_envelope_id")),
+                evidence=evidence, reason=str(outcome.get("reason", "")),
+            )["proof"]
         if op == "capture" and outcome.get("ack_outcome") == "delivered":
             text = str(outcome.get("capture_text", ""))
             ack_payload["capture"] = text[:65536]
         if op == "stop":
             ack_payload["confirmed_exit"] = bool(outcome.get("confirmed_exit", False))
+        # The ack payload and its submission state persist atomically with the
+        # outcome: a lost ack response re-submits this identical payload under
+        # the same claim token instead of repeating the native effect.
         ack_result: dict[str, Any] = {"submitted": False, "payload": ack_payload}
         if request is not None:
             try:
@@ -627,6 +889,11 @@ def handle_claimed_command(
             except Exception as exc:
                 ack_result = {"submitted": False, "payload": ack_payload,
                               "error": type(exc).__name__}
+        record = {**record, "ack_payload": ack_payload,
+                  "ack_submitted": bool(ack_result.get("submitted", False))}
+        if ack_result.get("error"):
+            record["ack_error"] = str(ack_result["error"])[:120]
+        _write_journal(journal_file, record)
         return {"op": op, **record, "ack": ack_result}
 
 
