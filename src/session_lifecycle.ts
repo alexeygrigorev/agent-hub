@@ -90,24 +90,49 @@ export type ClassifiedSession = {
   /** Open obligations retained for status/handoff even when grouped finished. */
   obligations: string[];
   sanitized_note: string | null;
+  /** Immutable starter / current owner / provenance retained in projection (F3).
+   * Eligibility inputs below are TRUSTED canonical-server joins/context only;
+   * payload strings never authenticate the caller (real HTTP/SQLite auth is M15c). */
+  owner: string | null;
+  owner_provenance: SessionInput['owner_provenance'];
+  starter: string | null;
+  human_owned: boolean;
 };
 
 export type LifecycleConfig = { idle_hours?: number; now_ms?: number };
 
+/** Strict timezone-aware timestamp parser (F4).
+ * Requires explicit `Z` or `±HH:MM` offset (same rule as `src/fleet.ts:40`
+ * `/T.*(?:Z|[+-]\d{2}:\d{2})$/i`). Timezone-naive / missing / unparseable
+ * returns null with no local/UTC guess, so TS and Python agree independent
+ * of OS local TZ. Callers fail closed on present-but-null and on future values. */
+const TZ_QUALIFIED = /T.*(?:Z|[+-]\d{2}:\d{2})$/i;
 const ISO = (v: unknown): number | null => {
   if (typeof v !== 'string' || !v) return null;
+  if (!TZ_QUALIFIED.test(v)) return null;
   const t = Date.parse(v);
   return Number.isFinite(t) ? t : null;
 };
 
 /** Bounded redaction for opt-in text only. Regex alone is not a privacy guarantee:
- * callers must prefer reason codes; this is a backstop, not a promise. */
+ * callers must prefer reason codes; this is a backstop, not a promise.
+ * Fix (F6): redact on a bounded window BEFORE final truncation and reject
+ * oversize freetext rather than clipping inside a credential/`[redacted]` marker. */
+const SANITIZE_MAX_LOOKAHEAD = 128;
 export function sanitizeObservationText(raw: unknown, max = 512): string | null {
   if (raw == null) return null;
   if (typeof raw !== 'string') return null;
-  let text = raw.slice(0, max);
-  text = text.replace(/[A-Za-z0-9_\-+/=]{20,}/g, '[redacted]');
-  text = text.replace(/(token|secret|password|bearer)[^\n]{0,40}/gi, '[redacted]');
+  if (raw.length > max + SANITIZE_MAX_LOOKAHEAD) return null;
+  let window = raw.slice(0, max + SANITIZE_MAX_LOOKAHEAD);
+  window = window.replace(/[A-Za-z0-9_\-+/=]{20,}/g, '[redacted]');
+  window = window.replace(/(token|secret|password|bearer)[^\n]{0,40}/gi, '[redacted]');
+  let text = window.slice(0, max);
+  const marker = '[redacted]';
+  const lastOpen = text.lastIndexOf('[');
+  if (lastOpen !== -1 && lastOpen > max - marker.length - 1) {
+    const tail = text.slice(lastOpen);
+    if (tail !== marker && marker.startsWith(tail)) text = text.slice(0, lastOpen);
+  }
   return text;
 }
 
@@ -129,7 +154,10 @@ function collectFlags(input: SessionInput, now: number): { flags: string[]; obli
     const at = input.awaiting_alexey_at ? ISO(input.awaiting_alexey_at) : null;
     flags.push(at != null && now >= at && now - at <= 24 * 3600000 ? 'waiting_alexey_fresh' : 'waiting_alexey_stale');
   }
-  if (input.limit_hit) flags.push(input.limit_reset_at && ISO(input.limit_reset_at) != null ? 'limit_known_reset' : 'limit_unknown_reset');
+  if (input.limit_hit) {
+    const reset = input.limit_reset_at ? ISO(input.limit_reset_at) : null;
+    flags.push(reset != null && reset > now ? 'limit_known_reset' : 'limit_unknown_reset');
+  }
   if (input.pending_obligations) obligations.push('pending_obligations');
   if (input.has_active_children) obligations.push('active_children');
   if (input.has_unsubmitted_draft) obligations.push('unsubmitted_draft');
@@ -149,68 +177,99 @@ export function classifySession(input: SessionInput, config: LifecycleConfig = {
   const reasons: string[] = [];
   const { flags, obligations } = collectFlags(input, now);
   const note = input.note_text_opt_in ? sanitizeObservationText(input.observation_note ?? null) : null;
+  const classifiedBase = {
+    owner: input.owner ?? null,
+    owner_provenance: input.owner_provenance ?? null,
+    starter: input.starter ?? null,
+    human_owned: Boolean(input.human_owned),
+  };
 
   if (input.worktree_missing) {
     reasons.push('worktree record present but host reports workspace absent');
-    return { session_key: key, group: 'unknown', state: 'missing_worktree_unknown', reasons, flags, obligations, sanitized_note: note };
+    return { session_key: key, group: 'unknown', state: 'missing_worktree_unknown', reasons, flags, obligations, sanitized_note: note, ...classifiedBase };
   }
   if (input.awaiting_alexey) {
     const at = input.awaiting_alexey_at ? ISO(input.awaiting_alexey_at) : null;
     if (at != null && now - at <= 24 * 3600000 && now >= at) {
       reasons.push('fresh question/approval pending for Alexey');
-      return { session_key: key, group: 'waiting_alexey', state: 'waiting_alexey', reasons, flags, obligations, sanitized_note: note };
+      return { session_key: key, group: 'waiting_alexey', state: 'waiting_alexey', reasons, flags, obligations, sanitized_note: note, ...classifiedBase };
     }
     reasons.push('stale awaiting-Alexey evidence ignored');
   }
   if (input.limit_hit) {
     const window = typeof input.limit_window === 'string' && input.limit_window ? input.limit_window : 'unknown';
+    // F4: naive/missing/unparseable/expired reset stays unknown; offset Z/±HH:MM + reset>now qualifies
+    // even when limit_zone is absent. A named limit_zone never rescues a naive timestamp here
+    // (no audited DST resolution in this slice).
     const reset = input.limit_reset_at ? ISO(input.limit_reset_at) : null;
-    reasons.push(`limit pattern matched window=${window} reset=${reset != null ? 'known' : 'unknown'}; unknown stays needs-action, never resumes from timestamp alone`);
+    const resetKnown = reset != null && reset > now;
+    reasons.push(`limit pattern matched window=${window} reset=${resetKnown ? 'known' : 'unknown'}; unknown stays needs-action, never resumes from timestamp alone`);
     return {
       session_key: key,
       group: 'limit_blocked',
-      state: reset != null ? 'limit_blocked' : 'limit_blocked_unknown_reset',
+      state: resetKnown ? 'limit_blocked' : 'limit_blocked_unknown_reset',
       reasons,
       flags,
       obligations,
       sanitized_note: note,
+      ...classifiedBase,
     };
   }
   const noObligations = !input.pending_obligations && !input.has_active_children &&
     !input.has_unsubmitted_draft && !input.has_unresolved_send_stop;
-  const activity = input.last_activity_at ? ISO(input.last_activity_at) : null;
+  const authoritative = input.authoritative_no_pending_proof === true;
+  const hasActivityRaw = typeof input.last_activity_at === 'string' && input.last_activity_at.length > 0;
+  const activity = hasActivityRaw ? ISO(input.last_activity_at) : null;
   const report = input.report_at ? ISO(input.report_at) : null;
   const terminalAt = input.terminal_evidence_at ? ISO(input.terminal_evidence_at) : null;
-  const terminalFresh = input.terminal_evidence != null && terminalAt != null && now >= terminalAt && now - terminalAt <= 24 * 3600000;
-  const reportFreshEnough = report != null && (activity == null || activity <= report);
+  const freshnessWindow = 24 * 3600000;
+  // F2: fail closed on present-malformed activity, future activity/report/terminal, and stale evidence.
+  const activityOkFor = (bound: number): boolean => {
+    if (!hasActivityRaw) return true;
+    return activity != null && activity <= now && activity <= bound;
+  };
+  const reportFresh = report != null && report <= now && now - report <= freshnessWindow && activityOkFor(report);
+  const terminalFresh = input.terminal_evidence != null && terminalAt != null && terminalAt <= now &&
+    now - terminalAt <= freshnessWindow && activityOkFor(terminalAt);
   const finishedSignals = Boolean(input.report_written && input.screen_done);
-  // Fresh explicit terminal evidence + independent authoritative no-pending proof can qualify
-  // without BOTH report and screen; neither report nor screen alone ever suffices.
-  if (input.superseded_by && noObligations && (finishedSignals || (terminalFresh && input.authoritative_no_pending_proof))) {
+  const finishedQualified = (finishedSignals && reportFresh) || terminalFresh;
+  // F1: superseded requires the SAME authoritative proof + zero obligations + fresh evidence
+  // as finished. Report/screen alone never qualifies.
+  if (input.superseded_by && noObligations && authoritative && finishedQualified) {
     reasons.push(`superseded by ${input.superseded_by} with authoritative no-pending proof`);
-    return { session_key: key, group: 'finished_stale', state: 'superseded', reasons, flags, obligations, sanitized_note: note };
+    return { session_key: key, group: 'finished_stale', state: 'superseded', reasons, flags, obligations, sanitized_note: note, ...classifiedBase };
   }
   if (input.superseded_by && !noObligations) reasons.push('superseded marker present but obligations remain');
-  if (noObligations && input.authoritative_no_pending_proof && (finishedSignals || terminalFresh) && (reportFreshEnough || terminalFresh)) {
+  if (input.superseded_by && noObligations && !authoritative) reasons.push('superseded marker present but authoritative no-pending proof missing');
+  if (input.superseded_by && noObligations && authoritative && !finishedQualified) reasons.push('superseded marker present but completion evidence stale or contradicted by newer activity');
+  if (noObligations && authoritative && finishedQualified) {
     reasons.push('terminal completion with authoritative no-pending proof and no newer activity');
-    return { session_key: key, group: 'finished_stale', state: 'finished', reasons, flags, obligations, sanitized_note: note };
+    return { session_key: key, group: 'finished_stale', state: 'finished', reasons, flags, obligations, sanitized_note: note, ...classifiedBase };
   }
-  if ((input.report_written || input.screen_done || input.terminal_evidence) && (!noObligations || (!reportFreshEnough && !terminalFresh))) {
+  if ((input.report_written || input.screen_done || input.terminal_evidence) && (!noObligations || !finishedQualified)) {
     reasons.push('report/screen/terminal alone never qualifies without authoritative no-pending proof');
   }
   const idle = hoursSince(input.last_activity_at ?? null, now);
   if (idle != null && idle >= idleHours) {
     reasons.push(`idle ${idle.toFixed(1)}h >= ${idleHours}h threshold`);
-    return { session_key: key, group: 'active', state: 'idle', reasons, flags, obligations, sanitized_note: note };
+    return { session_key: key, group: 'active', state: 'idle', reasons, flags, obligations, sanitized_note: note, ...classifiedBase };
   }
+  // F5: unknown fallback must be reachable. Active requires fresh valid observed_at AND
+  // (running phase OR fresh non-future activity). Missing/stale/future provenance or a
+  // non-running phase without fresh activity is unknown, with flags/obligations preserved.
+  const observed = input.observed_at ? ISO(input.observed_at) : null;
+  const hasFreshObserved = observed != null && observed <= now && now - observed <= freshnessWindow;
+  const hasFreshActivity = activity != null && activity <= now && now - activity < idleHours * 3600000 && now - activity >= 0;
+  // Future or present-malformed activity is never fresh provenance, even with a running phase.
+  const activityValid = !hasActivityRaw || (activity != null && activity <= now);
   const phase = (input.phase ?? '').toLowerCase();
-  if (phase === 'running' || idle == null || idle < idleHours) {
-    if (idle == null) reasons.push('no activity timestamp; treating as unknown-fresh active');
+  if (hasFreshObserved && activityValid && (phase === 'running' || hasFreshActivity)) {
+    if (!hasFreshActivity) reasons.push('running phase with fresh observation');
     else reasons.push('fresh activity within idle threshold');
-    return { session_key: key, group: 'active', state: phase || 'active', reasons, flags, obligations, sanitized_note: note };
+    return { session_key: key, group: 'active', state: phase || 'active', reasons, flags, obligations, sanitized_note: note, ...classifiedBase };
   }
   reasons.push('insufficient fresh provenance');
-  return { session_key: key, group: 'unknown', state: 'unknown', reasons, flags, obligations, sanitized_note: note };
+  return { session_key: key, group: 'unknown', state: 'unknown', reasons, flags, obligations, sanitized_note: note, ...classifiedBase };
 }
 
 const GROUP_RANK: Record<LifecycleGroup, number> = {
@@ -267,7 +326,17 @@ export type CleanupCandidate = ClassifiedSession & {
 };
 
 /** Pure cleanup plan (M15b seam). Dry-run by construction: no I/O, no fake apply.
- * Durable server decisions + apply executor + host acceptance are OPEN M15c/d. */
+ * Durable server decisions + apply executor + host acceptance are OPEN M15c/d.
+ * Inputs are TRUSTED canonical-server joins/context only; payload bools/strings
+ * never authenticate the caller. F3: blank/whitespace/unknown/legacy owner,
+ * caller, or provenance can never authorize cleanup. */
+const isBadOwnerValue = (v: unknown): boolean => {
+  if (typeof v !== 'string') return true;
+  const t = v.trim().toLowerCase();
+  return t.length === 0 || t === 'unknown' || t === 'legacy';
+};
+const isBadProvenanceValue = (v: unknown): boolean =>
+  v !== 'authenticated_handoff' && v !== 'starter';
 export function planCleanup(
   candidates: CleanupCandidate[],
   callerOwner: string,
@@ -277,9 +346,13 @@ export function planCleanup(
   for (const c of candidates) {
     const blockers: string[] = [];
     if (c.human_owned) blockers.push('human/Alexey session permanently protected');
+    if (isBadOwnerValue(callerOwner)) blockers.push('caller owner unknown/empty; cannot authorize cleanup');
     if ((c.owner ?? null) !== callerOwner) blockers.push('not owned by caller (admin is not ownership)');
-    if (c.owner == null || c.owner === 'unknown' || c.owner === 'legacy') {
-      blockers.push('unknown/legacy owner cannot authorize cleanup');
+    if (isBadOwnerValue(c.owner)) {
+      blockers.push('unknown/legacy/blank owner cannot authorize cleanup');
+    }
+    if (isBadProvenanceValue((c as { owner_provenance?: unknown }).owner_provenance)) {
+      blockers.push('unknown provenance cannot authorize cleanup');
     }
     if (c.group !== 'finished_stale') blockers.push(`group ${c.group} never eligible (idle/limit/waiting alone excluded)`);
     if (c.pending_obligations || c.obligations.length) blockers.push('pending obligations remain');
@@ -302,8 +375,19 @@ export type CleanupTargetCheck = {
   contained: boolean;
 };
 
-/** Safe executor seam gate (pure). Host validates the effect; server classifies the record. */
+/** Safe executor seam gate (pure). Host validates the effect; server classifies the record.
+ * F3: exact non-empty valid host/native/incarnation/owner binding is required;
+ * blank/whitespace/unknown/legacy expected IDs or owner fail closed. */
+const isValidBindingId = (v: unknown): boolean => {
+  if (typeof v !== 'string') return false;
+  const t = v.trim().toLowerCase();
+  return t.length > 0 && t !== 'unknown' && t !== 'legacy';
+};
 export function validateCleanupTarget(check: CleanupTargetCheck): { ok: true } | { ok: false; error: string } {
+  if (!isValidBindingId(check.expected_machine_id) || !isValidBindingId(check.expected_native_id)) {
+    return { ok: false, error: 'unbound_target' };
+  }
+  if (!isValidBindingId(check.expected_owner)) return { ok: false, error: 'unknown_owner_never_applies' };
   if (check.observed_machine_id !== check.expected_machine_id) return { ok: false, error: 'machine_mismatch' };
   if (check.observed_native_id !== check.expected_native_id) return { ok: false, error: 'incarnation_mismatch' };
   if (check.observed_owner !== check.expected_owner) return { ok: false, error: 'custodian_changed' };
@@ -325,12 +409,18 @@ export type OwnershipTransferRequest = {
 
 /** Dedicated ownership-transfer gate (pure seam). Generic intake text is NOT a transfer:
  * requires the authenticated current owner + epoch fence; starter stays immutable;
- * human protection can never be disabled; unknown owners never apply. */
+ * human protection can never be disabled; unknown owners never apply.
+ * F3: epochs must be safe non-negative integers (booleans/negatives/non-safe fail). */
 export function validateOwnershipTransfer(req: OwnershipTransferRequest): { ok: true } | { ok: false; error: string } {
   if (req.human_owned) return { ok: false, error: 'human_protected' };
-  if (!req.new_owner || req.new_owner === 'unknown' || req.new_owner === 'legacy') return { ok: false, error: 'unknown_owner_never_applies' };
+  if (isBadOwnerValue(req.new_owner)) return { ok: false, error: 'unknown_owner_never_applies' };
+  if (isBadOwnerValue(req.current_owner) || isBadOwnerValue(req.expected_owner)) {
+    return { ok: false, error: 'unknown_owner_never_applies' };
+  }
   if (req.expected_owner !== req.current_owner) return { ok: false, error: 'stale_owner' };
-  if (!Number.isInteger(req.expected_epoch) || !Number.isInteger(req.current_epoch) || req.expected_epoch !== req.current_epoch) {
+  if (!Number.isSafeInteger(req.expected_epoch) || !Number.isSafeInteger(req.current_epoch) ||
+    (req.expected_epoch as number) < 0 || (req.current_epoch as number) < 0 ||
+    req.expected_epoch !== req.current_epoch) {
     return { ok: false, error: 'epoch_fence_failed' };
   }
   if (!req.actor || req.actor !== req.current_owner) return { ok: false, error: 'only_current_owner_transfers' };
