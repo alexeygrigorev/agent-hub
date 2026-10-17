@@ -2,6 +2,7 @@ import { registryNameSql } from './agent_registry';
 import { sha256, base64url } from './auth/crypto';
 import { getSession } from './auth/session';
 import { ensureRootScheduling, isRootSchedulingEnabled } from './root_scheduling';
+import { RoleLeases, canonical, roleName, ROLE_JOB_CAPACITY } from './role_leases';
 
 function sha256Sync(input: string): string {
   const K = new Uint32Array([
@@ -259,6 +260,7 @@ export interface Machine {
 }
 
 export class JobsService {
+  public roles: RoleLeases;
   private sql: SqlStorage;
   private ctx: DurableObjectState;
   private deps?: JobsDependencies;
@@ -305,6 +307,71 @@ export class JobsService {
 
     this.sql.exec("INSERT OR IGNORE INTO leases (name, epoch) VALUES ('root', 0)");
     ensureRootScheduling(this.sql);
+    this.roles = new RoleLeases(this.sql);
+  }
+
+  configureRole(project: string, name: string, config: any, generation: number): any {
+    const key = roleName(project, name);
+    if (!key) return { error: 'invalid_role_name' };
+    return this.ctx.storage.transactionSync(() => this.roles.configure(key, config, generation, this.rawNow().getTime()));
+  }
+
+  /** An enrolled allowlisted host requests an offer; claim remains the lease acquisition CAS. */
+  offerRoleJob(project: string, name: string, hostId: string, credentialId: string, body: any): any {
+    const key = roleName(project, name);
+    if (!key || !body || Object.keys(body).some(k => !['generation','expected_epoch','idempotency_key','profile','payload'].includes(k)) ||
+        !Number.isSafeInteger(body.generation) || !Number.isSafeInteger(body.expected_epoch) || body.expected_epoch < 0 ||
+        typeof body.idempotency_key !== 'string' || !/^\d{4}-\d{2}-\d{2}:[A-Za-z0-9_-]{1,64}$/.test(body.idempotency_key) ||
+        body.profile !== 'writer-run' || !body.payload || Object.keys(body.payload).some(k => k !== 'date') ||
+        typeof body.payload.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(body.payload.date) ||
+        !Number.isFinite(Date.parse(body.payload.date + 'T00:00:00Z')) || new Date(body.payload.date + 'T00:00:00Z').toISOString().slice(0,10) !== body.payload.date) return { error: 'invalid_role_job' };
+    return this.ctx.storage.transactionSync(() => {
+      const now = this.rawNow(); const ms = now.getTime();
+      const role = this.roles.get(key);
+      if (!role || !role.enabled || role.generation !== body.generation || !this.roles.clock(key, ms) ||
+          role.bindings[hostId] !== credentialId || !this.roles.host(hostId, credentialId, body.profile, ms)) return { error: 'role_unauthorized' };
+      // Expired keys cannot execute again after bounded receipt retention.
+      if (!body.idempotency_key.startsWith(now.toISOString().slice(0,10) + ':')) return { error: 'idempotency_key_expired' };
+      const idempotency = `${key}:${body.idempotency_key}`;
+      const payload = canonical({ date: body.payload.date, project });
+      const existing: any = this.sql.exec('SELECT * FROM jobs WHERE idempotency_key=?', idempotency).toArray()[0];
+      if (existing) return existing.role_generation === body.generation && existing.role_expected_epoch === body.expected_epoch &&
+        existing.role_host_credential === credentialId && existing.offer_host_id === hostId && existing.payload === payload && existing.kind === body.profile
+        ? { job_id: existing.id, duplicate: true } : { error: 'idempotency_conflict' };
+      const lease: any = this.sql.exec('SELECT * FROM leases WHERE name=?', key).toArray()[0];
+      if (!lease || lease.epoch !== body.expected_epoch || (lease.holder_job_id && !isLeaseExpired(lease.expires_at, ms))) return { error: 'role_conflict' };
+      this.roles.prune(ms);
+      if (Number(this.sql.exec('SELECT count(*) AS n FROM jobs WHERE role_name IS NOT NULL').one().n) >= ROLE_JOB_CAPACITY) return { error: 'role_job_capacity' };
+      const id = this.generateId();
+      this.sql.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,offer_host_id,offer_machine_id,offer_expires_at,role_name,role_generation,role_host_credential,role_expected_epoch)
+        VALUES(?,?,?,?, 'offered',?,?,?,?,?,?,?,?,?,?)`, id, body.profile, idempotency, payload, now.toISOString(), new Date(ms + 25*60000).toISOString(),
+        'host:' + hostId, hostId, hostId, new Date(ms + 120000).toISOString(), key, role.generation, credentialId, lease.epoch);
+      return { job_id: id, duplicate: false };
+    });
+  }
+
+  private roleCurrent(job: any): boolean {
+    if (!job.role_name) return true;
+    const now = this.rawNow().getTime();
+    if (!this.roles.binding(job, now) || !(Date.parse(job.deadline_at) > now)) return false;
+    if (job.status === 'offered') return true;
+    const lease: any = this.sql.exec('SELECT * FROM leases WHERE name=?', job.role_name).toArray()[0];
+    const cred: any = this.sql.exec("SELECT * FROM credentials WHERE kind='job' AND subject=? AND token_hash=?", job.id, job.claim_token_hash).toArray()[0];
+    return !!lease && lease.holder_job_id === job.id && lease.epoch === job.lease_epoch && !isLeaseExpired(lease.expires_at, now) &&
+      !!cred && !cred.revoked_at && Date.parse(cred.expires_at) > now && cred.machine_id === job.holder_host_id;
+  }
+
+  /** The authorization and durable intent on the real job share the existing SQL transaction. */
+  async commitRoleExecution(jobId: string, token: string, epoch: number, generation: number): Promise<any> {
+    const hash = await sha256(token);
+    return this.ctx.storage.transactionSync(() => {
+      const job: any = this.sql.exec('SELECT * FROM jobs WHERE id=?', jobId).toArray()[0];
+      if (!job?.role_name || job.claim_token_hash !== hash || job.lease_epoch !== epoch || job.role_generation !== generation ||
+          !['claimed','running'].includes(job.status) || !this.roleCurrent(job)) return { error: 'unauthorized_or_stale' };
+      if (job.role_effect) return { execute: false, status: 'HOLD', reason: 'execution_intent_already_recorded' };
+      this.sql.exec('UPDATE jobs SET role_effect=? WHERE id=? AND role_effect IS NULL', canonical({ action: 'execute', epoch, generation, payload: job.payload }), jobId);
+      return { execute: true, status: 'intent_recorded', role: job.role_name, generation, epoch, profile: job.kind, payload: JSON.parse(job.payload) };
+    });
   }
 
   public setBusService(bus: any) {
@@ -513,6 +580,11 @@ export class JobsService {
   }
 
   private tryOfferNext(job: any, now: Date) {
+    // Role offers are explicit, host-bound requests. Never route one using root candidate policy.
+    if (job.role_name) {
+      this.sql.exec("UPDATE jobs SET status='expired',finished_at=? WHERE id=? AND status='offered'", now.toISOString(), job.id);
+      return;
+    }
     // Root scheduling flag: while disabled, no new offers for root-run jobs.
     // Runs inside the caller's storage transaction, so the check is race-free.
     if (job.kind === 'root-run' && !isRootSchedulingEnabled(this.sql)) return;
@@ -768,6 +840,7 @@ export class JobsService {
   }
 
   private getLeaseNameForJob(job: any): string {
+    if (job.role_name) return job.role_name;
     if (job.kind === 'root-run') return 'root';
     if (job.kind === 'writer-run') {
       let date = '';
@@ -796,7 +869,8 @@ export class JobsService {
     jobId: string,
     hostId: string,
     hostFreshGate: boolean,
-    _simNow?: Date
+    _simNow?: Date,
+    hostCredentialId?: string
   ): Promise<{ error?: string, reason?: string, job_token?: string, lease_epoch?: number, deadline_at?: string }> {
     if (!hostFreshGate) return { error: 'gate_failed', reason: 'caller_gate_false' };
 
@@ -813,6 +887,9 @@ export class JobsService {
         const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
         if (!job || job.status !== 'offered' || (job.offer_host_id !== hostId && job.offer_machine_id !== hostId)) {
           result = { error: 'conflict' }; return;
+        }
+        if (job.role_name && (job.role_host_credential !== hostCredentialId || !this.roleCurrent(job))) {
+          result = { error: 'gate_failed', reason: 'role_unauthorized' }; return;
         }
         // Root scheduling flag: root-run claims (offered jobs included) are refused
         // inside the same claim transaction, so there is no flag-check race.
@@ -870,6 +947,7 @@ export class JobsService {
         this.sql.exec("INSERT OR IGNORE INTO leases (name, epoch) VALUES (?, 0)", leaseName);
 
         const currentLease = this.sql.exec("SELECT * FROM leases WHERE name = ?", leaseName).toArray()[0] as any;
+        if (job.role_name && currentLease.epoch !== job.role_expected_epoch) { result = { error: 'conflict' }; return; }
         if (job.kind === 'root-run' || leaseName === 'root') {
           const incumbent = this.evaluateRootIncumbent();
           if (!incumbent.can_takeover) {
@@ -885,7 +963,8 @@ export class JobsService {
           }
         }
 
-        const leaseExpiresMs = Math.min(nowMs + 20 * 60000, deadlineMs);
+        const roleTtl = job.role_name ? this.roles.get(job.role_name).ttl_seconds * 1000 : 20 * 60000;
+        const leaseExpiresMs = Math.min(nowMs + roleTtl, deadlineMs);
         const currentEpoch = currentLease ? (currentLease.epoch ?? 0) : 0;
         const jobActor = job.kind === 'root-run' ? 'role:root' : (job.actor || 'role:worker');
 
@@ -922,7 +1001,7 @@ export class JobsService {
 
         // Mint scoped job credential in credentials table
         const credId = this.generateId();
-        const jobScopes = job.kind === 'root-run'
+        const jobScopes = job.role_name ? [] : job.kind === 'root-run'
           ? ['lease:root', 'jobs:create', 'bus:send', 'bus:read', 'health:report']
           : ['bus:send', 'bus:read', 'health:report'];
 
@@ -1018,6 +1097,9 @@ export class JobsService {
       this.ctx.storage.transactionSync(() => {
         const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
         if (!job || job.claim_token_hash !== tokenHash || job.lease_epoch !== epoch) { result = { error: 'unauthorized_or_stale' }; return; }
+        if (!this.roleCurrent(job)) { result = { error: 'unauthorized_or_stale' }; return; }
+        if (job.role_name && !job.role_effect) { result = { error: 'execution_intent_required' }; return; }
+        if (job.role_name && job.status === 'running' && job.evidence_digest === evidenceDigest && job.native_session === nativeSession && job.launcher_task_id === launcherTaskId) return;
         if (job.status !== 'claimed') { result = { error: 'invalid_status' }; return; }
         // Root scheduling flag gates root-run START transitions; renew/finish of an
         // already-running root do not pass through here and keep working while disabled.
@@ -1098,6 +1180,7 @@ export class JobsService {
       this.ctx.storage.transactionSync(() => {
         const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
         if (!job || job.claim_token_hash !== tokenHash || job.lease_epoch !== epoch) { result = { error: 'unauthorized_or_stale' }; return; }
+        if (!this.roleCurrent(job)) { result = { error: 'unauthorized_or_stale' }; return; }
 
         if (job.status !== 'running' || !job.started_at) {
           result = { error: 'unauthorized_or_stale' }; return;
@@ -1128,7 +1211,8 @@ export class JobsService {
           result = { error: 'unauthorized_or_stale' }; return;
         }
 
-        const newExpiresMs = Math.min(nowMs + 20 * 60000, deadlineMs);
+        const ttl = job.role_name ? this.roles.get(job.role_name).ttl_seconds * 1000 : 20 * 60000;
+        const newExpiresMs = Math.min(nowMs + ttl, deadlineMs);
         const newExpiresIso = new Date(newExpiresMs).toISOString();
 
         const updateRes = this.sql.exec(
@@ -1165,6 +1249,21 @@ export class JobsService {
       this.ctx.storage.transactionSync(() => {
         const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
         if (!job || job.claim_token_hash !== tokenHash || job.lease_epoch !== epoch) { result = { error: 'unauthorized_or_stale' }; return; }
+
+        if (job.role_name) {
+          const ms = this.rawNow().getTime();
+          const lease: any = this.sql.exec('SELECT * FROM leases WHERE name=?', job.role_name).toArray()[0];
+          const cred: any = this.sql.exec("SELECT * FROM credentials WHERE kind='job' AND subject=? AND token_hash=?", jobId, tokenHash).toArray()[0];
+          const receipt = canonical({ status, summary: safeUtf8Summary(summary, 4096), evidenceRefs });
+          if (!this.roles.binding(job, ms) || !lease || lease.epoch !== epoch || !cred || cred.revoked_at || !(Date.parse(cred.expires_at) > ms)) {
+            result = { error: 'unauthorized_or_stale' }; return;
+          }
+          if (job.role_finish) { result = job.role_finish === receipt ? {} : { error: 'completion_conflict' }; return; }
+          if (!this.roleCurrent(job)) { result = { error: 'unauthorized_or_stale' }; return; }
+          if (!Array.isArray(evidenceRefs) || evidenceRefs.length > 16 || evidenceRefs.some(r => typeof r !== 'string' || r.length > 256)) {
+            result = { error: 'invalid_evidence' }; return;
+          }
+        }
 
         // Terminal status check: cannot finish an already terminal or fenced job
         const terminalStatuses = ['succeeded', 'finished', 'failed', 'expired', 'cancelled', 'fenced'];
@@ -1223,8 +1322,10 @@ export class JobsService {
         this.sql.exec("UPDATE jobs SET status = ?, finished_at = ?, outcome_summary = ?, outcome_evidence = ? WHERE id = ?",
           status, nowIso, safeSummary, JSON.stringify(evidenceRefs), jobId);
 
+        if (job.role_name) this.sql.exec('UPDATE jobs SET role_finish=? WHERE id=?', canonical({ status, summary: safeSummary, evidenceRefs }), jobId);
+
         // Invalidate/revoke job credential
-        this.sql.exec("UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL", nowIso, jobId);
+        if (!job.role_name) this.sql.exec("UPDATE credentials SET revoked_at = ? WHERE subject = ? AND kind = 'job' AND revoked_at IS NULL", nowIso, jobId);
 
         this.addHealthEvent('job', jobId, status, safeSummary, nowIso);
 
