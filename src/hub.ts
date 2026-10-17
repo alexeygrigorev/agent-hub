@@ -1,3 +1,4 @@
+import { IntakeService } from './intake';
 import { UI_HEADERS, tokenPage, authFailure, deviceEntry, deviceReview, deviceResult } from './ui-pages';
 import { DurableObject } from "cloudflare:workers";
 import { SqlStorage } from "@cloudflare/workers-types";
@@ -73,6 +74,7 @@ export class Hub extends DurableObject {
   sql: SqlStorage;
   env: Env;
   jwksCache: JwksCache = new JwksCache();
+  public intakeService: IntakeService;
   public busService: BusService;
   public jobsService: JobsService;
   public quotaStore: QuotaStore;
@@ -87,6 +89,8 @@ export class Hub extends DurableObject {
     this.initDb();
 
     const txSync = (this.ctx.storage as any).transactionSync ? (fn: any) => (this.ctx.storage as any).transactionSync(fn) : undefined;
+    this.intakeService = new IntakeService(this.sql, fn => this.ctx.storage.transactionSync(fn));
+    this.intakeService.init();
     this.busService = new BusService(this.sql, txSync);
     this.fleetService = new FleetService(this.sql, fn => this.ctx.storage.transactionSync(fn));
     this.fleetService.init();
@@ -315,6 +319,17 @@ export class Hub extends DurableObject {
     const path = url.pathname;
     
     try {
+      if (path === '/api/intake' || path.startsWith('/api/intake/')) {
+        return this.intakeService.handle(request, async () => {
+          const auth = await this.authenticateBusRequest(request);
+          if (auth.caller?.kind === 'human' && !auth.caller.tokenId) {
+            const session = await getSession(this.env, request);
+            if (!session) return { error: Response.json({ error: 'unauthorized' }, { status: 401 }) };
+            auth.caller.actor = 'human:' + session.sub;
+          }
+          return auth;
+        });
+      }
       if (path === '/auth/token') return await this.tokenSignIn(request);
       if (path === '/api/host/poll') {
         if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
