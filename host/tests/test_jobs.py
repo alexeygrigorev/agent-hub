@@ -1058,5 +1058,121 @@ class TestHostAgentWiring(unittest.TestCase):
         self.assertEqual(disp.runtime_mgr.host_id, "h")
 
 
+class TestM7RoleConsumer(unittest.TestCase):
+    """Only fake effects. No provider, native worker or service is executed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.binding = {"name": "automation:demo:writer", "generation": 1,
+                        "host_id": "host-a", "profile": "writer-run", "ttl_seconds": 120}
+        self.effects = []
+        self.client = MagicMock(spec=JobsClient)
+        self.runtime = RuntimeManager(allow_mock_runner=True)
+        self.runtime.set_mock_runner(self.effect)
+        self.bridge = GuardedRootBridge(state_dir=self.tmp.name)
+        self.dispatcher = JobDispatcher("https://hub.example.com", "host-a", lambda: "host-token",
+                                        self.client, self.runtime, self.bridge)
+        self.info = {"job_id": "role-job", "kind": "writer-run", "job_token": "role-token",
+                     "lease_epoch": 2, "stop_event": threading.Event(), "role_binding": self.binding}
+        self.payload = {"date": "2099-05-06", "project": "demo"}
+        self.grant = {"execute": True, "role": self.binding["name"], "generation": 1,
+                      "epoch": 2, "profile": "writer-run", "payload": self.payload}
+
+    def effect(self, *args):
+        self.effects.append(args)
+        # Deliberate fake outcome: no claim of genuine native first action.
+        return {"status": "failed", "summary": "fake approved consumer effect"}
+
+    def test_role_intent_commits_before_fake_effect_and_duplicate_holds(self):
+        self.client.commit_role_execution.side_effect = [self.grant, {"execute": False, "status": "HOLD"}]
+        self.dispatcher._run_job_lifecycle(self.info, self.payload)
+        self.assertEqual(len(self.effects), 1)
+        self.client.commit_role_execution.assert_called_once_with("https://hub.example.com", "role-job", "role-token", 2, 1)
+        self.info["stop_event"] = threading.Event()
+        self.dispatcher._run_job_lifecycle(self.info, self.payload)
+        self.assertEqual(len(self.effects), 1)
+        self.assertEqual(self.client.finish_job.call_count, 1)
+
+    def test_authority_unreachable_retains_uncertain_intent_without_effect_or_completion(self):
+        self.client.commit_role_execution.side_effect = TimeoutError("response lost after SQL commit")
+        self.dispatcher._run_job_lifecycle(self.info, self.payload)
+        self.assertEqual(self.effects, [])
+        self.client.finish_job.assert_not_called()
+
+    def test_consumer_exception_after_grant_retains_intent_for_reconciliation(self):
+        def uncertain(*args):
+            self.effects.append(args)
+            raise TimeoutError('fake effect result unknown')
+        self.runtime.set_mock_runner(uncertain)
+        self.client.commit_role_execution.return_value = self.grant
+        self.dispatcher._run_job_lifecycle(self.info, self.payload)
+        self.assertEqual(len(self.effects), 1)
+        self.client.finish_job.assert_not_called()
+
+    def test_stale_epoch_generation_profile_or_payload_reply_never_executes(self):
+        for fields in [{"epoch": 1}, {"generation": 2}, {"role": "automation:other:writer"},
+                       {"profile": "root-run"}, {"payload": {}}, {"execute": False}]:
+            self.info["stop_event"] = threading.Event()
+            self.client.commit_role_execution.return_value = {**self.grant, **fields}
+            self.dispatcher._run_job_lifecycle(self.info, self.payload)
+        self.assertEqual(self.effects, [])
+        self.client.finish_job.assert_not_called()
+
+    def test_real_unsupported_backend_holds_before_claim_or_intent(self):
+        self.runtime.allow_mock_runner = False
+        self.runtime._mock_runner = None
+        result = self.dispatcher.handle_offer({"id": "job", "kind": "writer-run", "payload": self.payload,
+                                                "role_binding": self.binding})
+        self.assertFalse(result["accepted"])
+        self.assertIn("M8b", result["reason"])
+        self.client.claim_job.assert_not_called()
+        self.client.commit_role_execution.assert_not_called()
+
+    def test_backend_becomes_unsupported_after_claim_holds_before_intent(self):
+        self.runtime.allow_mock_runner = False
+        self.runtime._mock_runner = None
+        self.dispatcher._run_job_lifecycle(self.info, self.payload)
+        self.client.commit_role_execution.assert_not_called()
+        self.assertEqual(self.effects, [])
+        self.client.finish_job.assert_not_called()
+
+    def test_qualified_fake_offer_carries_server_binding_and_mismatched_claim_holds(self):
+        self.client.claim_job.return_value = {"job_token": "role-token", "lease_epoch": 2,
+                                              "role_binding": self.binding}
+        with patch.object(threading.Thread, "start"):
+            result = self.dispatcher.handle_offer({"id": "job", "kind": "writer-run", "payload": self.payload,
+                                                    "role_binding": self.binding})
+        self.assertTrue(result["accepted"])
+        self.assertEqual(self.dispatcher.running_jobs["job"]["role_binding"], self.binding)
+        self.client.claim_job.return_value["role_binding"] = {**self.binding, "generation": 99}
+        result = self.dispatcher.handle_offer({"id": "other", "kind": "writer-run", "payload": self.payload,
+                                                "role_binding": self.binding})
+        self.assertFalse(result["accepted"])
+        self.assertIn("binding changed", result["reason"])
+
+    def test_renewal_uncertainty_stops_role_instead_of_using_offline_freshness(self):
+        self.dispatcher.running_jobs["role-job"] = self.info
+        self.client.renew_job.side_effect = TimeoutError("partition")
+        event = MagicMock()
+        event.is_set.return_value = False
+        event.wait.return_value = False
+        self.dispatcher._renewal_loop("role-job", "role-token", 2, event)
+        event.wait.assert_called_once_with(40.0)
+        event.set.assert_called_once()
+        self.client.renew_job.assert_called_once()
+
+    @patch("agent_hub_host.api.safe_http_json")
+    def test_execution_http_request_is_bound_and_never_retries_a_lost_response(self, http):
+        client = JobsClient()
+        http.side_effect = TimeoutError("lost reply")
+        with self.assertRaises(TimeoutError):
+            client.commit_role_execution("https://hub.example.com", "job", "role-token", 2, 1)
+        self.assertEqual(http.call_count, 1)
+        req = http.call_args[0][0]
+        self.assertEqual(req.full_url, "https://hub.example.com/api/jobs/job/execute")
+        self.assertEqual(json.loads(req.data), {"epoch": 2, "generation": 1})
+
+
 if __name__ == "__main__":
     unittest.main()

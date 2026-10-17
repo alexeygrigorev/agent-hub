@@ -329,7 +329,7 @@ export class Hub extends DurableObject {
 
         const nowIso = new Date().toISOString();
         const rows = this.sql.exec(
-          `SELECT id, kind, payload, status, deadline_at, offer_host_id, offer_machine_id, offer_expires_at, created_at, actor
+          `SELECT id, kind, payload, status, deadline_at, offer_host_id, offer_machine_id, offer_expires_at, created_at, actor, role_name, role_generation
            FROM jobs
            WHERE status = 'offered'
              AND (offer_host_id = ? OR offer_machine_id = ?)
@@ -349,7 +349,8 @@ export class Hub extends DurableObject {
           deadline_at: r.deadline_at,
           offer_expires_at: r.offer_expires_at,
           created_at: r.created_at,
-          actor: r.actor
+          actor: r.actor,
+          ...(r.role_name ? { role_binding: this.jobsService.roleJobBinding(r) } : {})
         }));
 
         return Response.json({ status: 'ok', server_time: nowIso, offers });
@@ -1831,7 +1832,7 @@ export class Hub extends DurableObject {
 
       const nowIso = new Date().toISOString();
       const rows = this.sql.exec(
-        `SELECT id, kind, payload, status, deadline_at, offer_host_id, offer_machine_id, offer_expires_at, created_at, actor
+        `SELECT id, kind, payload, status, deadline_at, offer_host_id, offer_machine_id, offer_expires_at, created_at, actor, role_name, role_generation
          FROM jobs
          WHERE status = 'offered'
            AND (offer_host_id = ? OR offer_machine_id = ?)
@@ -1855,7 +1856,8 @@ export class Hub extends DurableObject {
           offer_machine_id: r.offer_machine_id,
           offer_expires_at: r.offer_expires_at,
           created_at: r.created_at,
-          actor: r.actor
+          actor: r.actor,
+          ...(r.role_name ? { role_binding: this.jobsService.roleJobBinding(r) } : {})
         };
       });
 
@@ -2439,7 +2441,7 @@ export class Hub extends DurableObject {
         }
 
         const reason = typeof body.reason === 'string' ? body.reason : 'declined_by_host';
-        const res = await this.jobsService.declineJob(jobId, hostId, reason);
+        const res = await this.jobsService.declineJob(jobId, hostId, reason, auth.caller?.kind === 'host' ? auth.caller.tokenId : undefined);
         if (res.error) {
           return Response.json({ error: res.error }, { status: 409 });
         }

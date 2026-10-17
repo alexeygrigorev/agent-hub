@@ -345,7 +345,7 @@ export class JobsService {
       const id = this.generateId();
       this.sql.exec(`INSERT INTO jobs(id,kind,idempotency_key,payload,status,created_at,deadline_at,actor,offer_host_id,offer_machine_id,offer_expires_at,role_name,role_generation,role_host_credential,role_expected_epoch)
         VALUES(?,?,?,?, 'offered',?,?,?,?,?,?,?,?,?,?)`, id, body.profile, idempotency, payload, now.toISOString(), new Date(ms + 25*60000).toISOString(),
-        'host:' + hostId, hostId, hostId, new Date(ms + 120000).toISOString(), key, role.generation, credentialId, lease.epoch);
+        'machine:' + hostId, hostId, hostId, new Date(ms + 120000).toISOString(), key, role.generation, credentialId, lease.epoch);
       return { job_id: id, duplicate: false };
     });
   }
@@ -354,11 +354,17 @@ export class JobsService {
     if (!job.role_name) return true;
     const now = this.rawNow().getTime();
     if (!this.roles.binding(job, now) || !(Date.parse(job.deadline_at) > now)) return false;
-    if (job.status === 'offered') return true;
+    if (job.status === 'offered') return Date.parse(job.offer_expires_at) > now;
     const lease: any = this.sql.exec('SELECT * FROM leases WHERE name=?', job.role_name).toArray()[0];
     const cred: any = this.sql.exec("SELECT * FROM credentials WHERE kind='job' AND subject=? AND token_hash=?", job.id, job.claim_token_hash).toArray()[0];
     return !!lease && lease.holder_job_id === job.id && lease.epoch === job.lease_epoch && !isLeaseExpired(lease.expires_at, now) &&
       !!cred && !cred.revoked_at && Date.parse(cred.expires_at) > now && cred.machine_id === job.holder_host_id;
+  }
+
+  roleJobBinding(job: any): any {
+    if (!job.role_name) return undefined;
+    return { name: job.role_name, generation: job.role_generation, host_id: job.holder_host_id || job.offer_host_id,
+      profile: job.kind, ttl_seconds: this.roles.get(job.role_name)?.ttl_seconds };
   }
 
   /** The authorization and durable intent on the real job share the existing SQL transaction. */
@@ -369,6 +375,9 @@ export class JobsService {
       if (!job?.role_name || job.claim_token_hash !== hash || job.lease_epoch !== epoch || job.role_generation !== generation ||
           !['claimed','running'].includes(job.status) || !this.roleCurrent(job)) return { error: 'unauthorized_or_stale' };
       if (job.role_effect) return { execute: false, status: 'HOLD', reason: 'execution_intent_already_recorded' };
+      const unresolved = this.sql.exec(`SELECT id FROM jobs WHERE role_name IS NOT NULL AND role_effect IS NOT NULL
+        AND role_finish IS NULL AND kind=? AND payload=? AND id!=? LIMIT 1`, job.kind, job.payload, jobId).toArray()[0];
+      if (unresolved) return { execute: false, status: 'HOLD', reason: 'previous_execution_unresolved' };
       this.sql.exec('UPDATE jobs SET role_effect=? WHERE id=? AND role_effect IS NULL', canonical({ action: 'execute', epoch, generation, payload: job.payload }), jobId);
       return { execute: true, status: 'intent_recorded', role: job.role_name, generation, epoch, profile: job.kind, payload: JSON.parse(job.payload) };
     });
@@ -871,7 +880,7 @@ export class JobsService {
     hostFreshGate: boolean,
     _simNow?: Date,
     hostCredentialId?: string
-  ): Promise<{ error?: string, reason?: string, job_token?: string, lease_epoch?: number, deadline_at?: string }> {
+  ): Promise<{ error?: string, reason?: string, job_token?: string, lease_epoch?: number, deadline_at?: string, role_binding?: any }> {
     if (!hostFreshGate) return { error: 'gate_failed', reason: 'caller_gate_false' };
 
     return this.withClockSnapshotAsync(async (now) => {
@@ -943,11 +952,25 @@ export class JobsService {
           result = { error: 'gate_failed', reason: 'gate_launch_not_allowed' }; return;
         }
 
+        // Role custody must not bypass the existing writer:<date> exclusion.
+        // Both legacy and role claims consult the same active leases, in this CAS.
+        if (job.kind === 'writer-run') {
+          const profileLease = this.getLeaseNameForJob({ ...job, role_name: null });
+          if (profileLease.startsWith('writer:')) {
+            const holders = this.sql.exec(`SELECT j.*,l.expires_at AS profile_expires_at FROM jobs j JOIN leases l ON l.holder_job_id=j.id
+              WHERE j.kind='writer-run' AND j.id!=? AND j.status IN ('claimed','running')`, jobId).toArray();
+            if (holders.some(h => this.getLeaseNameForJob({ ...h, role_name: null }) === profileLease &&
+                !isLeaseExpired(h.profile_expires_at as any, this.rawNow().getTime()))) {
+              result = { error: 'conflict', reason: 'writer_date_busy' }; return;
+            }
+          }
+        }
+
         const leaseName = this.getLeaseNameForJob(job);
         this.sql.exec("INSERT OR IGNORE INTO leases (name, epoch) VALUES (?, 0)", leaseName);
 
         const currentLease = this.sql.exec("SELECT * FROM leases WHERE name = ?", leaseName).toArray()[0] as any;
-        if (job.role_name && currentLease.epoch !== job.role_expected_epoch) { result = { error: 'conflict' }; return; }
+        if (job.role_name && (currentLease.epoch !== job.role_expected_epoch || !Number.isSafeInteger(currentLease.epoch) || currentLease.epoch >= Number.MAX_SAFE_INTEGER)) { result = { error: 'conflict' }; return; }
         if (job.kind === 'root-run' || leaseName === 'root') {
           const incumbent = this.evaluateRootIncumbent();
           if (!incumbent.can_takeover) {
@@ -1010,7 +1033,8 @@ export class JobsService {
           credId, tokenHash, credId, jobId, hostId, jobActor, JSON.stringify(jobScopes), nowIso, new Date(leaseExpiresMs).toISOString()
         );
 
-        result = { job_token: token, lease_epoch: newEpoch, deadline_at: job.deadline_at };
+        result = { job_token: token, lease_epoch: newEpoch, deadline_at: job.deadline_at,
+          ...(job.role_name ? { role_binding: this.roleJobBinding(job) } : {}) };
       });
 
       if (!result?.error) {
@@ -1021,11 +1045,12 @@ export class JobsService {
     });
   }
 
-  async declineJob(jobId: string, hostId: string, reason: string): Promise<{ error?: string }> {
+  async declineJob(jobId: string, hostId: string, reason: string, hostCredentialId?: string): Promise<{ error?: string }> {
     return this.withClockSnapshot((now) => {
       let result: any = {};
       this.ctx.storage.transactionSync(() => {
         const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
+        if (job?.role_name && (job.role_host_credential !== hostCredentialId || !this.roleCurrent(job))) { result = { error: 'unauthorized_or_stale' }; return; }
         if (!job || job.status !== 'offered' || (job.offer_host_id !== hostId && job.offer_machine_id !== hostId)) {
           result = { error: 'conflict' }; return;
         }
@@ -1045,6 +1070,7 @@ export class JobsService {
       this.ctx.storage.transactionSync(() => {
         const job = this.sql.exec("SELECT * FROM jobs WHERE id = ?", jobId).toArray()[0] as any;
         if (!job || job.claim_token_hash !== tokenHash || job.lease_epoch !== epoch) return;
+        if (!this.roleCurrent(job)) return;
 
         const cred = this.sql.exec(
           "SELECT * FROM credentials WHERE token_hash = ? AND subject = ?",

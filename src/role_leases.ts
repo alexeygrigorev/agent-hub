@@ -30,6 +30,7 @@ export class RoleLeases {
     for (const col of columns) if (!existing.has(col.split(' ')[0])) sql.exec(`ALTER TABLE jobs ADD COLUMN ${col}`);
     sql.exec('CREATE INDEX IF NOT EXISTS jobs_role_retention ON jobs(role_name, finished_at)');
     sql.exec('CREATE INDEX IF NOT EXISTS jobs_role_credential ON jobs(role_host_credential, status)');
+    sql.exec('CREATE INDEX IF NOT EXISTS jobs_role_pending_profile ON jobs(kind,payload) WHERE role_name IS NOT NULL AND role_effect IS NOT NULL AND role_finish IS NULL');
   }
 
   get(name: string): any {
@@ -73,6 +74,9 @@ export class RoleLeases {
         !Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) return { error: 'invalid_configuration' };
     const old = this.get(name);
     if ((old?.generation ?? 0) !== expectedGeneration) return { error: 'configuration_conflict' };
+    const lease: any = this.sql.exec('SELECT epoch FROM leases WHERE name=?', name).toArray()[0];
+    if ((old && (!Number.isSafeInteger(old.generation) || old.generation >= Number.MAX_SAFE_INTEGER)) ||
+        (lease && (!Number.isSafeInteger(lease.epoch) || lease.epoch >= Number.MAX_SAFE_INTEGER))) return { error: 'epoch_capacity' };
     if (old && !this.clock(name, now)) return { error: 'clock_rollback' };
     if (!old && Number(this.sql.exec('SELECT count(*) AS n FROM automation_roles').one().n) >= ROLE_CAPACITY) return { error: 'role_capacity' };
     // Snapshot the current enrolled credential, never infer custody from tags or projects.
@@ -106,6 +110,10 @@ export class RoleLeases {
   }
 
   prune(now: number) {
+    // Retire abandoned offers on bounded admission work, without a new timer.
+    this.sql.exec(`UPDATE jobs SET status='expired',finished_at=offer_expires_at
+      WHERE id IN (SELECT id FROM jobs WHERE role_name IS NOT NULL AND status='offered'
+        AND offer_expires_at<=? LIMIT 64)`, new Date(now).toISOString());
     // Pending external effects stay forever (bounded by admission capacity), even if fenced.
     const cutoff = new Date(now - ROLE_RETENTION_MS).toISOString();
     const rows = this.sql.exec("SELECT id FROM jobs WHERE role_name IS NOT NULL AND finished_at < ? AND (role_effect IS NULL OR role_finish IS NOT NULL) LIMIT 64", cutoff).toArray();
