@@ -3,6 +3,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
+import { SESSION_CONTROL_SCHEMA } from '../src/session_control';
 
 const admin = { caller: { isAdmin: true, actor: 'test-admin', kind: 'human' }, scopes: ['admin'] };
 const host = (id: string) => ({ caller: { machineId: id, kind: 'host', actor: 'machine:' + id }, scopes: ['host'] });
@@ -127,6 +128,22 @@ describe('generic accounts and launch placement', () => {
     expect((await s.handle(request(path, { state: 'exited' }), host('hetzner'))).status).toBe(409);
     expect((await s.handle(request(path, { state: 'exited', confirmed_exit: true }), host('hetzner'))).status).toBe(200);
     expect((await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).status).toBe(201);
+  }));
+  it('closes only the matching Hub assignment after a confirmed terminal host result', async () => fixture(async (s, sql) => {
+    await configure(s);
+    for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
+    const l: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    const insert = (id: string, launch: string, machine: string) => sql.exec('INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', id, 'owner', id, '{}', launch, machine, 'headless', 'offered', iso(), iso());
+    insert('matching', l.id, 'hetzner'); insert('foreign-host', l.id, 'win35'); insert('other-launch', 'other', 'hetzner');
+    const state = (id: string) => sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', id).one().state;
+    await s.handle(request('/launches/' + l.id + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+    const path = '/launches/' + l.id + '/result';
+    expect((await s.handle(request(path, { state: 'failed' }), host('hetzner'))).status).toBe(409);
+    expect(state('matching')).toBe('offered');
+    expect((await s.handle(request(path, { state: 'uncertain' }), host('hetzner'))).status).toBe(200);
+    expect(state('matching')).toBe('offered');
+    expect((await s.handle(request(path, { state: 'failed', confirmed_exit: true }), host('hetzner'))).status).toBe(200);
+    expect(state('matching')).toBe('failed'); expect(state('foreign-host')).toBe('offered'); expect(state('other-launch')).toBe('offered');
   }));
   it('limits dashboards to admins and does not return prompts or credentials', async () => fixture(async s => {
     await configure(s); await s.handle(request('/launches', intent()), admin);
