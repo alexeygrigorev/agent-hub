@@ -1,4 +1,5 @@
 import { Hub as BaseHub } from './hub';
+import type { ActionDeps } from './checks';
 import { Env } from './env';
 import { RETENTION_CLEANUP_CURSOR_SQL, runFairRetentionPass } from './bus';
 import {
@@ -147,6 +148,15 @@ export class Hub extends BaseHub {
   override initDb(): void {
     super.initDb();
     this.conversationsService?.init();
+  }
+
+  protected override extraCheckDeps(): Partial<ActionDeps> {
+    const service = this.conversationsService;
+    if (!service) return {};
+    return { conversation: {
+      evaluateBacklog: query => service.evaluateScheduledBacklog(query),
+      sendFollowUp: intent => service.postScheduledFollowUp(intent),
+    } };
   }
 
   override async fetch(request: Request): Promise<Response> {

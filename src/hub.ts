@@ -13,7 +13,7 @@ import { BusService, BUS_SCHEMA_SQL, CallerContext, generateUlid } from './bus';
 import { JobsService, JOBS_SCHEMA_SQL } from './jobs';
 import { FleetService } from './fleet';
 import { LivenessService, thresholdsFrom, alertText } from './liveness';
-import { ChecksService, validateCheck } from './checks';
+import { ChecksService, validateCheck, type ActionDeps } from './checks';
 import { ensureRootScheduling, getRootScheduling, isRootSchedulingEnabled, setRootScheduling } from './root_scheduling';
 import { QuotaStore, handleQuotaRoutes } from './quota';
 
@@ -1100,6 +1100,8 @@ export class Hub extends DurableObject {
     this.livenessService.markNotified(alert.id, errors.length ? errors.join('; ') : (anyTarget ? null : 'no alert target configured'), [...delivered]);
   }
 
+  protected extraCheckDeps(): Partial<ActionDeps> { return {}; }
+
   /** Cron and manual entry point for scheduled checks. */
   async runChecks(only?: string) {
     this.livenessService.prune();
@@ -1116,6 +1118,7 @@ export class Hub extends DurableObject {
       },
       fetch: (url, init) => fetch(url, init),
       evaluateQuota: () => this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray().map(a => this.fleetService.accountStatus(a)),
+      ...this.extraCheckDeps(),
     }, only);
     // Retry alerts whose delivery failed or had no target yet, at most every 15 minutes each.
     for (const alert of this.livenessService.undelivered(900)) await this.notifyAlert(alert);

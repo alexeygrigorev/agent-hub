@@ -106,6 +106,7 @@ Scheduled checks are the generic form of the competition's routine agent: period
 | `quota` | an enabled account is blocked or below `params.min_percent` (default 20) |
 | `http` | an `https://` URL does not return `params.expect_status` (default 200) |
 | `inbox_backlog` | `params.actor` has unacknowledged messages older than `params.max_age_s` |
+| `conversation_backlog` | retained unread rows older than `params.max_age_s` for a canonical `params.actor`, within explicit owner grants; optional `params.conversation_id` narrows the scan (see [conversation follow-ups](CONVERSATION-PINGS.md)) |
 | `routine` | never; its action runs every interval |
 
 Actions: `{"type": "alert"}` (default), `{"type": "message", "to": "<actor>", "body": "..."}`, or `{"type": "launch", "workspace": "...", "prompt": "...", "engine"?: "...", "machine"?: "..."}`, which starts a headless agent through normal placement with requester `schedule:<name>`. `{check}` and `{detail}` are substituted in bodies and prompts. Messages and launches run on failure, or always with `"on": "always"` (the default for `routine`). Names are lowercase, at most 40 characters; intervals are 5 minutes to 7 days.
@@ -120,7 +121,7 @@ Actions: `{"type": "alert"}` (default), `{"type": "message", "to": "<actor>", "b
 ]}
 ```
 
-Upload it from the dashboard, or `PUT /api/checks`. `POST /api/checks/<name>/run` runs one now.
+Upload it from the dashboard, or `PUT /api/checks`. `POST /api/checks/<name>/run` runs one now. A forced rerun in the same completed slot returns its stored result. Conversation message actions additionally require `conversation_id` and an expiring `grant_id` from the conversation's current human owner. Their `to` is the recipient; the reserved author is `system:conversation-checks`. Durable intent and Hub storage receipts preserve retries without acknowledging the recipient. A Hub storage receipt does not confirm native inbox delivery. No conversation check is enabled by default. See [CONVERSATION-PINGS.md](CONVERSATION-PINGS.md) for delegation, bounds and recovery.
 
 ## Signing in
 
