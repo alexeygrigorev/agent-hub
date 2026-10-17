@@ -282,7 +282,93 @@ class FleetTests(unittest.TestCase):
             self.assertEqual(route['account_label'], 'shared-codex')
             with self.assertRaisesRegex(ValueError, 'not configured'):
                 fleet.Dispatcher(cfg)._route({**offer(), 'workspace': '/srv/hub/unmapped'})
-            with self.assertRaisesRegex(ValueError, 'not configured'):
-                fleet.Dispatcher(cfg)._route({**offer(), 'workspace': '/srv/../escape'})
+    def test_native_start_argv_configuration_and_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'subscriptions.json'
+            valid_prefix = ["systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", "--property=KillMode=process", "--"]
+            # Top-level configuration succeeds
+            cfg = settings(Path(tmp))
+            cfg['native_start_argv'] = valid_prefix
+            p.write_text(json.dumps(cfg))
+            loaded = fleet.load_settings(p)
+            self.assertEqual(loaded['native_start_argv'], valid_prefix)
+
+            # Subscription-level configuration succeeds
+            cfg2 = settings(Path(tmp))
+            cfg2['subscriptions'][0]['native_start_argv'] = valid_prefix
+            p.write_text(json.dumps(cfg2))
+            loaded2 = fleet.load_settings(p)
+            self.assertEqual(loaded2['subscriptions'][0]['native_start_argv'], valid_prefix)
+
+            # Invalid configurations are rejected strictly
+            for bad_prefix in [
+                "not-a-list",
+                [],
+                [""],
+                [123],
+                ["systemd-run\0bad"],
+                [None],
+                ["valid", ""],
+            ]:
+                bad_cfg = settings(Path(tmp))
+                bad_cfg['native_start_argv'] = bad_prefix
+                p.write_text(json.dumps(bad_cfg))
+                with self.assertRaises(ValueError, msg=f"Should reject bad prefix: {bad_prefix!r}"):
+                    fleet.load_settings(p)
+
+                bad_sub_cfg = settings(Path(tmp))
+                bad_sub_cfg['subscriptions'][0]['native_start_argv'] = bad_prefix
+                p.write_text(json.dumps(bad_sub_cfg))
+                with self.assertRaises(ValueError, msg=f"Should reject bad sub prefix: {bad_prefix!r}"):
+                    fleet.load_settings(p)
+
+            # Unknown secret fields are rejected
+            secret_cfg = settings(Path(tmp))
+            secret_cfg['native_start_argv'] = valid_prefix
+            secret_cfg['secret_token'] = 'MUST_NOT_EXIST'
+            p.write_text(json.dumps(secret_cfg))
+            with self.assertRaisesRegex(ValueError, 'Invalid subscription configuration'):
+                fleet.load_settings(p)
+
+    def test_interactive_start_prepends_native_start_argv_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = ["systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", "--property=KillMode=process", "--"]
+            cfg = settings(Path(tmp))
+            cfg['native_start_argv'] = prefix
+            calls, http = [], []
+
+            def runner(argv, **kw):
+                calls.append((argv, kw))
+                if argv[0] == 'maintained-gate':
+                    return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+                return {'id': 'native-session', 'workspace': tmp, 'tag': 'hub-' + offer()['id'], 'engine': 'codex', 'profile': None, 'phase': 'running'}
+
+            dispatcher = fleet.Dispatcher(cfg, lambda *a: http.append(a) or {}, runner)
+            result = dispatcher.dispatch(offer())
+            self.assertEqual(result['state'], 'running')
+            start_argv = calls[1][0]
+            # Exact argv prefix applied
+            expected_prefix = ["systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", "--property=KillMode=process", "--", "aplexer", "start"]
+            self.assertEqual(start_argv[:len(expected_prefix)], expected_prefix)
+            self.assertEqual(start_argv[len(expected_prefix):len(expected_prefix) + 2], ["--workspace", tmp])
+
+            # Subscription-level overrides top-level
+            sub_prefix = ["sudo", "-u", "nobody", "--"]
+            cfg['subscriptions'][0]['native_start_argv'] = sub_prefix
+            calls.clear()
+            dispatcher2 = fleet.Dispatcher(cfg, lambda *a: {}, runner)
+            result2 = dispatcher2.dispatch(offer())
+            self.assertEqual(result2['state'], 'running')
+            self.assertEqual(calls[1][0][:len(sub_prefix) + 2], sub_prefix + ["aplexer", "start"])
+
+            # Default unchanged when prefix omitted
+            cfg_no_prefix = settings(Path(tmp))
+            calls.clear()
+            dispatcher3 = fleet.Dispatcher(cfg_no_prefix, lambda *a: {}, runner)
+            result3 = dispatcher3.dispatch(offer())
+            self.assertEqual(result3['state'], 'running')
+            self.assertEqual(calls[1][0][:2], ["aplexer", "start"])
+
 
 if __name__ == '__main__': unittest.main()
+

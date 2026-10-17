@@ -38,6 +38,16 @@ def absolute_workspace_ok(value):
     return all(seg and seg not in ('.', '..') and WORKSPACE_SEG.fullmatch(seg) for seg in parts[1:])
 
 
+def validate_native_start_argv(value: Any) -> list[str]:
+    """Optional trusted argv prefix for interactive native CLI starts (e.g. systemd-run)."""
+    if not isinstance(value, list) or not value or len(value) > 64:
+        raise ValueError("native_start_argv must be a non-empty list of at most 64 arguments")
+    for arg in value:
+        if not isinstance(arg, str) or not arg or "\0" in arg or len(arg) > 1024:
+            raise ValueError("native_start_argv elements must be non-empty strings without NUL")
+    return value
+
+
 def utcnow():
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -53,15 +63,19 @@ def load_settings(path=None):
     if path.stat().st_size > 65536:
         raise ValueError("Subscription configuration exceeds 64 KiB")
     data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots"} or data.get("version") != 1:
+    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv"} or data.get("version") != 1:
         raise ValueError("Invalid subscription configuration")
+    if "native_start_argv" in data:
+        validate_native_start_argv(data["native_start_argv"])
     subs = data.get("subscriptions")
     if not isinstance(subs, list) or len(subs) > 128:
         raise ValueError("Invalid subscriptions list")
     seen = set()
     for sub in subs:
-        if not isinstance(sub, dict) or set(sub) - {"service", "account_label", "plan", "engine", "profile", "quota_argv", "admission_argv", "launcher_provider", "launcher_model", "launcher_effort", "startup_argv"}:
+        if not isinstance(sub, dict) or set(sub) - {"service", "account_label", "plan", "engine", "profile", "quota_argv", "admission_argv", "launcher_provider", "launcher_model", "launcher_effort", "startup_argv", "native_start_argv"}:
             raise ValueError("Subscription accepts metadata and local command references only")
+        if "native_start_argv" in sub:
+            validate_native_start_argv(sub["native_start_argv"])
         if sub.get("service") not in SERVICES or not isinstance(sub.get("account_label"), str) or not LABEL.fullmatch(sub["account_label"]) or sub["account_label"] in seen:
             raise ValueError("Invalid or duplicate account label")
         seen.add(sub["account_label"])
@@ -465,6 +479,10 @@ class Dispatcher:
                 if not isinstance(launch, list) or not launch or any(not isinstance(a, str) or "\0" in a for a in launch):
                     raise ValueError("Invalid trusted startup argv")
                 argv += ["--"] + launch
+            prefix = sub.get("native_start_argv") or self.settings.get("native_start_argv")
+            if prefix is not None:
+                prefix = validate_native_start_argv(prefix)
+                argv = list(prefix) + argv
             cwd = None
         elif mode == "headless":
             launcher = self.settings.get("launcher", {})
