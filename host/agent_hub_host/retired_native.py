@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Optional
 import uuid
 
+from . import private_fs
 from .native_bridge import canonicalize_workspace
 from .native_sessions import (
     TERMINAL_PHASES,
@@ -99,9 +100,12 @@ def validate_retired_tombstone(
         raise SessionControlError(f"tombstone file exceeds size bound ({st.st_size} > {MAX_TOMBSTONE_BYTES})")
 
     try:
-        with open(tombstone_path, "r", encoding="utf-8") as f:
-            raw = f.read()
-    except (OSError, UnicodeDecodeError) as exc:
+        raw = private_fs.read_bytes(tombstone_path, MAX_TOMBSTONE_BYTES, private=False).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SessionControlError("Cannot decode tombstone file as UTF-8") from exc
+    except ValueError as exc:
+        raise SessionControlError("tombstone file exceeds size bound during read") from exc
+    except OSError as exc:
         raise SessionControlError(f"Cannot read tombstone file: {exc}") from exc
 
     try:
@@ -244,6 +248,8 @@ def capture_retired_history(
     except SessionControlError as exc:
         return None, None, None, f"invalid_target: {exc}"
 
+    if type(limit_bytes) is not int or not 1 <= limit_bytes <= DEFAULT_HISTORY_TAIL_BYTES:
+        raise SessionControlError("History tail bound must be an integer in 1..65536")
     resolved_state = resolve_aplexer_state_dir(state_dir)
     norm_uuid = str(uuid.UUID(target.session_id)).lower()
 
@@ -258,13 +264,14 @@ def capture_retired_history(
         if os.path.islink(path) or not os.path.isfile(path):
             continue
         try:
-            st = os.stat(path)
-            if st.st_size <= 0:
-                continue
-            with open(path, "rb") as f:
-                if st.st_size > limit_bytes:
-                    f.seek(st.st_size - limit_bytes)
-                data = f.read(limit_bytes)
+            with private_fs.parent(path, private=False) as anchor:
+                fd = private_fs._open(anchor, path, os.O_RDONLY, private=False)
+                with os.fdopen(fd, "rb") as f:
+                    size = os.fstat(f.fileno()).st_size
+                    if size <= 0:
+                        continue
+                    f.seek(max(0, size - limit_bytes))
+                    data = f.read(limit_bytes)
             if data:
                 return data, path, mode, "authentic_history_captured"
         except OSError:

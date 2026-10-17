@@ -608,3 +608,40 @@ class TestSyntheticWorktreeCustodyAndGuards(unittest.TestCase):
             )
         self.assertIn("custody machine must own the cleanup target", str(ctx.exception))
 
+
+
+class TestRetiredDescriptorSafety(unittest.TestCase):
+    def test_parent_symlink_cannot_supply_tombstone_or_history(self):
+        with tempfile.TemporaryDirectory(dir=str(REPO_TMP)) as temp:
+            base = Path(temp); real = base / "real"; real.mkdir()
+            target = make_target(str(base))
+            tomb = {"cause": "finished", "id": target.session_id, "tag": target.tag,
+                    "workspace": target.workspace, "finished_at_ms": target.created_at_ms + 1}
+            (real / "tombstone.json").write_text(json.dumps(tomb))
+            link = base / "link"; link.symlink_to(real, target_is_directory=True)
+            with self.assertRaises(SessionControlError):
+                validate_retired_tombstone(str(link / "tombstone.json"), target)
+            retired = base / "state" / "retired-sessions"; retired.mkdir(parents=True)
+            (real / "history.bin").write_bytes(b"must not read through parent symlink")
+            (retired / target.session_id).symlink_to(real, target_is_directory=True)
+            data, _, _, _ = capture_retired_history(target, state_dir=str(base / "state"))
+            self.assertIsNone(data)
+
+    def test_history_bound_rejects_unbounded_or_boolean_reads(self):
+        with tempfile.TemporaryDirectory(dir=str(REPO_TMP)) as temp:
+            target = make_target(temp)
+            for bad in (0, -1, True, 65537):
+                with self.subTest(bound=bad), self.assertRaises(SessionControlError):
+                    capture_retired_history(target, state_dir=temp, limit_bytes=bad)
+
+    def test_replaced_file_cannot_bypass_tombstone_read_bound(self):
+        with tempfile.TemporaryDirectory(dir=str(REPO_TMP)) as temp:
+            path = Path(temp) / "tombstone.json"; path.write_text("{}")
+            target = make_target(temp)
+            original = private_fs.read_bytes
+            def grow_before_read(file, limit, **kwargs):
+                Path(file).write_bytes(b"x" * (limit + 1))
+                return original(file, limit, **kwargs)
+            with patch.object(private_fs, "read_bytes", side_effect=grow_before_read):
+                with self.assertRaises(SessionControlError):
+                    validate_retired_tombstone(str(path), target)
