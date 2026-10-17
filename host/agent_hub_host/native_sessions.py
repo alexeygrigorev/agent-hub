@@ -163,6 +163,7 @@ class NativeSession:
     worker_pid: Optional[int] = None
     workload_pid: Optional[int] = None
     processes: Optional[int] = None
+    agent_state_at_ms: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -324,6 +325,13 @@ def project_session(raw: Any) -> NativeSession:
     if isinstance(cgroup, str) and cgroup.startswith("/user.slice/"):
         cgroup = "/sys/fs/cgroup" + cgroup
     cwd = raw.get("cwd")
+    # Installed aplexer calls its hook metadata reported_state. Keep the
+    # older agent_state spelling, without inferring state from process phase.
+    agent_state = raw.get("agent_state")
+    state_at = raw.get("agent_state_at_ms")
+    if agent_state is None:
+        agent_state = raw.get("reported_state")
+        state_at = raw.get("reported_state_at_ms")
     return NativeSession(
         session_id=sid,
         tag=tag,
@@ -331,7 +339,8 @@ def project_session(raw: Any) -> NativeSession:
         engine=raw.get("engine") if isinstance(raw.get("engine"), str) else None,
         profile=raw.get("profile") if isinstance(raw.get("profile"), str) else None,
         phase=str(raw.get("phase") or raw.get("state") or "unknown"),
-        agent_state=raw.get("agent_state") if isinstance(raw.get("agent_state"), str) else None,
+        agent_state=agent_state if isinstance(agent_state, str) else None,
+        agent_state_at_ms=state_at if type(state_at) is int and state_at >= 0 else None,
         last_activity_ms=last_ms if type(last_ms) is int else None,
         created_at_ms=created_ms if type(created_ms) is int else None,
         cwd=cwd if isinstance(cwd, str) and cwd else None,
