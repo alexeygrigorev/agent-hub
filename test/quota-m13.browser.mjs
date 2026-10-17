@@ -94,7 +94,11 @@ try {
   const capture = async name => { await page.evaluate(() => document.fonts.ready); await safe(); await page.screenshot({ path: resolve(out, name + '.png'), fullPage: true }); shots.push(name + '.png'); };
   for (const theme of ['light', 'dark']) for (const width of [1440, 390]) {
     await context.clearCookies(); await page.setViewportSize({ width, height: 900 }); await cookie(human.cookie);
-    await page.goto(base + '/fleet.html'); await page.getByText('Authenticated · updated', { exact: false }).waitFor();
+    await page.goto(base + '/fleet.html');
+    // Set the theme on the fleet origin, then reload so the shell reads it at load.
+    await page.evaluate(t => localStorage.setItem('dakit-theme', t), theme);
+    await page.reload(); await page.getByText('Authenticated · updated', { exact: false }).waitFor();
+    assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), theme);
     const quotaText = await page.locator('#quota').textContent();
     assert.ok(quotaText.includes('q-pool'), 'pool account rendered');
     assert.ok(quotaText.includes('fresh'), 'fresh state rendered');
