@@ -320,7 +320,9 @@ def project_session(raw: Any) -> NativeSession:
     workload_pid = raw.get("workload_pid")
     processes = raw.get("processes")
     containment = raw.get("containment_empty")
-    cgroup = raw.get("workload_cgroup")
+    cgroup = raw.get("containment_cgroup") if isinstance(raw.get("containment_cgroup"), str) and raw.get("containment_cgroup") else raw.get("workload_cgroup")
+    if isinstance(cgroup, str) and cgroup.startswith("/user.slice/"):
+        cgroup = "/sys/fs/cgroup" + cgroup
     cwd = raw.get("cwd")
     return NativeSession(
         session_id=sid,
@@ -835,7 +837,13 @@ def _workload_containment_gone(cgroup: Optional[str]) -> Optional[bool]:
     if not norm.startswith("/sys/fs/cgroup/"):
         return None
     try:
-        return not os.path.exists(norm)
+        if not os.path.exists(norm):
+            return True
+        procs = os.path.join(norm, "cgroup.procs")
+        if os.path.exists(procs):
+            with open(procs, "r", encoding="utf-8", errors="replace") as f:
+                return f.read().strip() == ""
+        return False
     except (OSError, ValueError):
         return None
 
@@ -851,19 +859,19 @@ def _confirm_workload_exit(before: NativeSession) -> tuple[bool, str]:
     stopped).
     """
     cgroup_gone = _workload_containment_gone(before.workload_cgroup)
+    if cgroup_gone is False:
+        return False, "workload cgroup still present after kill"
     if cgroup_gone is True:
         return True, "workload cgroup reaped after kill"
     pids = [p for p in (before.worker_pid, before.workload_pid) if type(p) is int]
     if pids:
         states = [_pid_dead(p) for p in pids]
-        if all(s is True for s in states):
-            return True, "observed workload PIDs dead after kill"
         if any(s is False for s in states):
             return False, "observed workload PID still alive after kill"
+        if all(s is True for s in states):
+            return True, "observed workload PIDs dead after kill"
     if before.containment_empty is True:
         return True, "catalog reports containment empty after kill"
-    if cgroup_gone is False:
-        return False, "workload cgroup still present after kill"
     return False, "no containment/process proof available; exit unproven"
 
 

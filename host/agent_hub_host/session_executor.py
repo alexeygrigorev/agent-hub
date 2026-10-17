@@ -644,7 +644,8 @@ def _reconcile_unknown_locked(
         target = _NativeTarget(
             session_id=raw_target["session_id"], tag=raw_target["tag"],
             workspace=raw_target["workspace"],
-            created_at_ms=raw_target.get("created_at_ms")).validated()
+            created_at_ms=raw_target.get("created_at_ms"),
+            engine=raw_target.get("engine")).validated()
     except (KeyError, TypeError, SessionControlError):
         return None
     # Reconciliation reads the JOURNALED genuine sender mailbox (the binding
@@ -889,7 +890,8 @@ def handle_claimed_command(
         target = NativeTarget(
             session_id=raw_target["session_id"], tag=raw_target["tag"],
             workspace=raw_target["workspace"],
-            created_at_ms=raw_target.get("created_at_ms")).validated()
+            created_at_ms=raw_target.get("created_at_ms"),
+            engine=raw_target.get("engine")).validated()
     except (KeyError, TypeError) as exc:
         raise SessionControlError("Exact native target binding is required") from exc
 
@@ -938,7 +940,8 @@ def handle_claimed_command(
                    "caller_actor": custody.actor, "caller_family": custody.credential_family,
                    "target": {"session_id": target.session_id, "tag": target.tag,
                               "workspace": target.workspace,
-                              "created_at_ms": target.created_at_ms}}
+                              "created_at_ms": target.created_at_ms,
+                              "engine": target.engine}}
         if op == "send":
             body = command.get("body")
             if not isinstance(body, str):

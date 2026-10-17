@@ -181,9 +181,12 @@ def offer_to_command(offer: dict[str, Any]) -> dict[str, Any]:
         target = {"session_id": binding["native_id"], "tag": binding["tag"],
                   "workspace": binding["workspace"],
                   "created_at_ms": created if type(created) is int else None}
+        if isinstance(offer.get("engine"), str) and offer["engine"]:
+            target["engine"] = offer["engine"]
         NativeTarget(session_id=target["session_id"], tag=target["tag"],
                      workspace=target["workspace"],
-                     created_at_ms=target["created_at_ms"]).validated()
+                     created_at_ms=target["created_at_ms"],
+                     engine=target.get("engine")).validated()
         return {"op": "stop", "command_id": command_id,
                 "generation": generation, "target": target}
     return {"op": "stop", "command_id": command_id,
