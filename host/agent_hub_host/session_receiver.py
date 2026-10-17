@@ -117,6 +117,10 @@ def offer_to_command(offer: dict[str, Any]) -> dict[str, Any]:
     unknown kind, start (Fleet-owned), missing binding/incarnation for
     send/capture, or malformed payload. Callers leave unclaimed offers for
     re-discovery after the transport TTL — never blind-execute.
+
+    The server-owned ``cleanup_tree`` offer flag (True only when explicitly
+    True) is carried as visibility (``cleanup_tree_offered``); it NEVER
+    authorizes a tree effect. Only the claim's re-evaluated flag authorizes.
     """
     if not isinstance(offer, dict):
         raise SessionControlError("Offer must be an object")
@@ -176,6 +180,8 @@ def offer_to_command(offer: dict[str, Any]) -> dict[str, Any]:
     # stop: binding null (offered, pre-bind) means no native target exists.
     # The receiver still claims to fence the intent, then acks refused with no
     # native effect (nothing to exit). Bound stops carry the exact target.
+    # Server-owned cleanup visibility only (never authority; the claim decides).
+    offered_cleanup = offer.get("cleanup_tree") is True
     if isinstance(binding, dict) and binding.get("native_id"):
         created = binding.get("native_created_at_ms")
         target = {"session_id": binding["native_id"], "tag": binding["tag"],
@@ -188,17 +194,22 @@ def offer_to_command(offer: dict[str, Any]) -> dict[str, Any]:
                      created_at_ms=target["created_at_ms"],
                      engine=target.get("engine")).validated()
         return {"op": "stop", "command_id": command_id,
-                "generation": generation, "target": target}
+                "generation": generation, "target": target,
+                "cleanup_tree_offered": offered_cleanup}
     return {"op": "stop", "command_id": command_id,
-            "generation": generation, "target": None}
+            "generation": generation, "target": None,
+            "cleanup_tree_offered": offered_cleanup}
 
 
 def claim_to_host_claim(server_claim: dict[str, Any], command_id: str) -> dict[str, Any]:
     """Translate the server claim DTO to the host verifier shape.
 
     Server canonical: {command_id, claim_token, holder, generation,
-    expires_at (ISO), expires_at_ms (int), attempt}. Host verifier accepts
-    either expiry form and normalizes to expires_at_ms.
+    expires_at (ISO, canonical) and expires_at_ms (int, host clock), attempt,
+    cleanup_tree (server-owned bool, re-evaluated eligibility)}. Host verifier accepts
+    either expiry form and normalizes to expires_at_ms. The cleanup flag is
+    passed through verbatim (True only when explicitly True); it is the ONLY
+    tree authorization and is never inferred from keys/paths/JSON owner proof.
     """
     if not isinstance(server_claim, dict):
         raise SessionControlError("Server claim is required")
@@ -207,7 +218,8 @@ def claim_to_host_claim(server_claim: dict[str, Any], command_id: str) -> dict[s
             "holder": server_claim.get("holder"),
             "generation": server_claim.get("generation"),
             "expires_at_ms": server_claim.get("expires_at_ms"),
-            "expires_at": server_claim.get("expires_at")}
+            "expires_at": server_claim.get("expires_at"),
+            "cleanup_tree": True if server_claim.get("cleanup_tree") is True else False}
 
 
 def receive_once(
@@ -233,10 +245,12 @@ def receive_once(
     No daemon, no timer, no second Fleet consumer.
 
     ``cleanup_roots`` is the HOST-config trusted worktree allowlist (never
-    caller-supplied paths): when provided, a containment-confirmed stop
-    additionally removes the session's own worktree under the same claim
-    (canonical binding workspace + discovered branch) and reports the tree
-    outcome on the stop ack. ``None`` (default) leaves stop acks tree-free.
+    caller-supplied paths): confinement only, never target authority. A
+    containment-confirmed stop additionally removes the session's own worktree
+    ONLY when the server claim for that exact command carries explicit
+    ``cleanup_tree is True`` (re-evaluated owner/incarnation/M15 eligibility
+    at claim). Ordinary stops NEVER run the tree even with roots configured.
+    ``None`` (default) leaves stop acks tree-free.
     """
     if not isinstance(custody, CallerCustody):
         raise SessionControlError("Caller custody is required")

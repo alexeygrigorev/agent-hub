@@ -512,10 +512,11 @@ def _seed_native_at(env, workspace, tag):
     return sid
 
 
-def _stop_with_tree(env, sid, tag, workspace, gitroot, cid):
+def _stop_with_tree(env, sid, tag, workspace, gitroot, cid, authorized=True):
     claim = {"command_id": cid, "claim_token": "tok-" + uuid.uuid4().hex + "zz",
              "holder": "hetzner1", "generation": 1,
-             "expires_at_ms": int(time.time() * 1000) + 60000}
+             "expires_at_ms": int(time.time() * 1000) + 60000,
+             "cleanup_tree": True if authorized else False}
     acked = {}
     outcome = se.handle_claimed_command(
         {"op": "stop", "command_id": cid, "generation": 1,
@@ -543,7 +544,8 @@ def test_claimed_stop_bundles_tree_removed_from_binding_workspace(env):
     # Same claim replays the journaled outcome: no second native effect.
     claim = {"command_id": cid, "claim_token": outcome["claim_token"],
              "holder": "hetzner1", "generation": 1,
-             "expires_at_ms": int(time.time() * 1000) + 60000}
+             "expires_at_ms": int(time.time() * 1000) + 60000,
+             "cleanup_tree": True}
     again = se.handle_claimed_command(
         {"op": "stop", "command_id": cid, "generation": 1,
          "target": {"session_id": sid, "tag": "tree-target", "workspace": wt,
@@ -587,6 +589,31 @@ def test_claimed_stop_without_roots_leaves_ack_tree_free(env):
     assert "tree" not in submitted["payload"]
 
 
+def test_ordinary_stop_with_roots_never_deletes_without_flag(env):
+    # Regression for the critical blocker: configured roots + ordinary stop
+    # (no server cleanup flag, cu- key prefix, or JSON owner proof) must cause
+    # ZERO git effects. The worktree and branch survive; the ack is tree-free.
+    gitroot, main = _git_layout(env["base"])
+    wt = _merged_wt(main, gitroot, "wt1", "feat-o")
+    sid = _seed_native_at(env, wt, "ordinary-target")
+    cid = str(uuid.uuid4())
+    claim = {"command_id": cid, "claim_token": "tok-" + uuid.uuid4().hex + "zz",
+             "holder": "hetzner1", "generation": 1,
+             "expires_at_ms": int(time.time() * 1000) + 60000}
+    acked = {}
+    outcome = se.handle_claimed_command(
+        {"op": "stop", "command_id": cid, "generation": 1,
+         "target": {"session_id": sid, "tag": "ordinary-target", "workspace": wt,
+                    "created_at_ms": 1700000000000}},
+        claim, custody=custody(), journal_dir=env["journal"], executable=env["fake"],
+        request=lambda m, p, b: acked.update(payload=b) or {},
+        cleanup_roots=[gitroot])
+    assert outcome["state"] == "stopped"
+    assert "tree" not in acked.get("payload", {})
+    assert os.path.exists(wt)
+    assert "feat-o" in _git(["branch", "--list", "feat-o"], main).stdout
+
+
 def test_receive_once_stop_bundles_tree_under_host_roots(env):
     gitroot, main = _git_layout(env["base"])
     wt = _merged_wt(main, gitroot, "wt1", "feat-r")
@@ -594,6 +621,44 @@ def test_receive_once_stop_bundles_tree_under_host_roots(env):
     cid = str(uuid.uuid4())
     stop_offer = offer(cid, "stop", NativeTarget(
         session_id=sid, tag="recv-target", workspace=wt, created_at_ms=1700000000000),
+        payload={})
+    # Server-owned flag exposed in the canonical offer for this eligible cleanup.
+    stop_offer["cleanup_tree"] = True
+    acked = []
+
+    def stub_request(method, path, payload):
+        if method == "GET" and path == "/api/session-commands/offers":
+            return {"offers": [stop_offer]}
+        if method == "POST" and path.endswith("/claim"):
+            return {"command_id": cid, "claim_token": "tok-" + uuid.uuid4().hex + "qq",
+                    "holder": "hetzner1", "generation": 1,
+                    "expires_at": "2030-01-01T00:00:00.000Z",
+                    "expires_at_ms": int(time.time() * 1000) + 60000, "attempt": 1,
+                    "cleanup_tree": True}
+        if method == "POST" and path.endswith("/ack"):
+            acked.append(payload)
+            return {"command_id": cid, "state": "acked"}
+        raise AssertionError((method, path))
+
+    result = rc.receive_once(custody=custody(), journal_dir=env["journal"],
+                             executable=env["fake"], request=stub_request, limit=20,
+                             cleanup_roots=[gitroot])
+    assert result["offers_seen"] == 1
+    assert result["processed"][0]["tree"]["state"] == "removed"
+    assert acked[0]["tree"]["state"] == "removed"
+    assert acked[0]["confirmed_exit"] is True
+    assert not os.path.exists(wt)
+
+
+def test_receive_once_ordinary_stop_with_roots_leaves_tree_absent(env):
+    # Ordinary stop through the full receiver loop with roots configured but
+    # no server flag: stop is still acked, tree stays absent, worktree survives.
+    gitroot, main = _git_layout(env["base"])
+    wt = _merged_wt(main, gitroot, "wt1", "feat-n")
+    sid = _seed_native_at(env, wt, "ordinary-recv")
+    cid = str(uuid.uuid4())
+    stop_offer = offer(cid, "stop", NativeTarget(
+        session_id=sid, tag="ordinary-recv", workspace=wt, created_at_ms=1700000000000),
         payload={})
     acked = []
 
@@ -614,7 +679,7 @@ def test_receive_once_stop_bundles_tree_under_host_roots(env):
                              executable=env["fake"], request=stub_request, limit=20,
                              cleanup_roots=[gitroot])
     assert result["offers_seen"] == 1
-    assert result["processed"][0]["tree"]["state"] == "removed"
-    assert acked[0]["tree"]["state"] == "removed"
-    assert acked[0]["confirmed_exit"] is True
-    assert not os.path.exists(wt)
+    assert result["processed"][0]["state"] == "stopped"
+    assert "tree" not in acked[0]
+    assert os.path.exists(wt)
+    assert "feat-n" in _git(["branch", "--list", "feat-n"], main).stdout

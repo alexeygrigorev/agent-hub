@@ -260,3 +260,80 @@ describe('m15d stop-bundled tree outcome in the stop ack', () => {
     expect(row.ack.tree.reason).toContain('ownership_changed');
   }));
 });
+
+describe('m15d cleanup_tree authorization (critical blocker)', () => {
+  const N2 = '33333333-3333-4333-8333-333333333333';
+  const W2 = '/srv/hub/other';
+  const nativeTriple = (nativeId: string = NATIVE_ID, launchId = 'launch-1', workspace: string = NATIVE_WS) =>
+    ({ native_id: nativeId, tag: canonTag(launchId), workspace });
+
+  async function offerFor(s: SessionControlService, commandId: string) {
+    const poll = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any;
+    const offer = (poll.offers as any[]).find((o: any) => o.command_id === commandId);
+    expect(offer, JSON.stringify(poll)).toBeTruthy();
+    return offer;
+  }
+
+  async function claimAs(s: SessionControlService, commandId: string, correlation: string) {
+    const res = await s.handle(request(`/api/session-commands/${commandId}/claim`, { correlation, attempt_id: crypto.randomUUID() }), host('hetzner'));
+    const data = await res.json() as any;
+    expect(res.status, JSON.stringify(data)).toBe(200);
+    return data;
+  }
+
+  it('exposes cleanup_tree true in offer+claim only for cleanup --apply stops; ordinary stops carry false', async () => fixture(async (s, sql) => {
+    const created = await startAgentSession(s, 'm15d-auth-1');
+    await bindAgentSession(s, sql, created.id, 'launch-1');
+    await finishObservation(s);
+    // Ordinary stop first: no flag anywhere.
+    const stop = await s.handle(request(`/api/sessions/${created.id}/stop`, { key: 'ordinary-1' }), agent());
+    expect(stop.status).toBe(201);
+    const stopId = ((await stop.json()) as any).command_id;
+    const ordinaryOffer = await offerFor(s, stopId);
+    expect(ordinaryOffer.cleanup_tree).toBe(false);
+    const ordinaryClaim = await claimAs(s, stopId, ordinaryOffer.correlation);
+    expect(ordinaryClaim.cleanup_tree).toBe(false);
+    // Cleanup --apply enqueues a SECOND flagged stop (never co-opts the ordinary one).
+    const plan = await (await s.handle(request('/api/sessions/cleanup', { apply: true, key: 'op-auth-1' }), agent())).json() as any;
+    expect(plan.enqueued).toHaveLength(1);
+    expect(plan.enqueued[0].command_id).not.toBe(stopId);
+    const cleanupOffer = await offerFor(s, plan.enqueued[0].command_id);
+    expect(cleanupOffer.cleanup_tree).toBe(true);
+    const cleanupClaim = await claimAs(s, plan.enqueued[0].command_id, cleanupOffer.correlation);
+    expect(cleanupClaim.cleanup_tree).toBe(true);
+  }));
+
+  it('ordinary stop ack reporting a tree is coerced to kept (never a removal)', async () => fixture(async (s, sql) => {
+    const created = await startAgentSession(s, 'm15d-auth-2');
+    await bindAgentSession(s, sql, created.id, 'launch-1');
+    const stop = await s.handle(request(`/api/sessions/${created.id}/stop`, { key: 'ordinary-2' }), agent());
+    const stopId = ((await stop.json()) as any).command_id;
+    const offer = await offerFor(s, stopId);
+    const claim = await claimAs(s, stopId, offer.correlation);
+    expect(claim.cleanup_tree).toBe(false);
+    const acked = await s.handle(request(`/api/session-commands/${stopId}/ack`, {
+      correlation: offer.correlation, outcome: 'delivered', native: nativeTriple(),
+      claim_token: claim.claim_token, confirmed_exit: true,
+      tree: { state: 'removed', reason: 'buggy host removed without authorization' },
+    }), host('hetzner'));
+    expect(acked.status).toBe(200);
+    const list = await (await s.handle(request(`/api/sessions/${created.id}/commands`, undefined, 'GET'), admin)).json() as any;
+    const row = (list.commands as any[]).find((c: any) => c.id === stopId);
+    expect(row.ack.tree.state).toBe('kept');
+    expect(row.ack.tree.reason).toContain('not_cleanup_authorized');
+  }));
+
+  it('claim strips the flag when the owner drifted before claim (stop still claimable, tree never authorized)', async () => fixture(async (s, sql) => {
+    const created = await startAgentSession(s, 'm15d-auth-3');
+    await bindAgentSession(s, sql, created.id, 'launch-1');
+    await finishObservation(s);
+    const plan = await (await s.handle(request('/api/sessions/cleanup', { apply: true, key: 'op-auth-3' }), agent())).json() as any;
+    expect(plan.enqueued).toHaveLength(1);
+    const commandId = plan.enqueued[0].command_id;
+    const offer = await offerFor(s, commandId);
+    expect(offer.cleanup_tree).toBe(true);
+    sql.exec("UPDATE session_control_sessions SET actor = 'other:assistant' WHERE id = ?", created.id);
+    const claim = await claimAs(s, commandId, offer.correlation);
+    expect(claim.cleanup_tree).toBe(false);
+  }));
+});
