@@ -31,7 +31,7 @@ const PROFILE_LABEL = /^[A-Za-z0-9][A-Za-z0-9_./-]{0,63}$/;
 const COLLECTOR_VERSION = /^[A-Za-z0-9][A-Za-z0-9_.+/-]{0,63}$/;
 const UTC_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|\+00:00)$/;
 function nativeAmount(value: any, cap: number): boolean {
-  return value === null || (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= cap);
+  return value === null || value === undefined || (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= cap);
 }
 function sanitizedQuota(raw: any): any {
   const topKeys = ['status', 'observed_at', 'details', 'windows'];
