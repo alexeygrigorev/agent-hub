@@ -1,16 +1,28 @@
 """M12e session executor tests: real stdlib subprocess + real HTTP + real SQLite.
 
 No live sessions are touched. All native effects go to a per-test fake ``a``
-binary (argv-shaped like the genuine CLI: ``list/start/send/capture/status/kill``
-plus ``message send/log``). Claim/result reporting goes through a real local HTTP
-server (stdlib ``http.server`` in a thread) backed by real SQLite, asserting host
-machine binding + credential on every request. Journals live on the real
-filesystem under this worktree's ``.local/tmp`` (never ``/tmp``).
+binary shaped like the genuine CLI's verified surface (``list/start/capture/
+status/kill`` plus ``message send/reply/deliver/log``; ``send --enter`` is NOT
+emulated — the raw PTY path is retired, see R2 correction note below).
+Claim/result/ack reporting goes through a real local HTTP server (stdlib
+``http.server`` in a thread) backed by real SQLite, asserting host machine
+binding + credential on every request. Journals live on the real filesystem
+under this worktree's ``.local/tmp`` (never ``/tmp``) and each fixture cleans
+up only its own ``sess-exec-`` directory.
+
+R2 CORRECTION (head-ordered, preserved as explanation): the predecessor asserted
+a ``send --enter`` ``working:true`` verdict means ``acknowledged``. That signal
+is NOT target-read/process proof, so ``test_send_pty_acknowledged_*`` was wrong
+and is REPLACED by ``test_pty_guarded_retired_holds``. Acknowledgement is now
+proven only by a correlated native recipient reply (``reply_to`` = original
+envelope id, sender UUID/tag/workspace match, correlation/digest echo).
 
 Covers: positive/negative/retry/host-identity/auth/limits/correlated receipts,
-idempotency conflicts, tag-reuse refusal, UUID-vs-TAG confusion, workspace escape,
-busy refusal without forced Enter, bounded capture, confirmed stop, uncertain
-adoption without duplicate starts, and held unqualified starts.
+idempotency conflicts, tag-reuse refusal, stale-generation refusal, UUID-vs-TAG
+confusion, workspace escape, deliver-guard mapping, bounded capture with explicit
+unknown privacy, confirmed stop, uncertain adoption without duplicate starts,
+held unqualified starts, server-claim verification/expiry/token-reuse, per-intent
+lock serialization across threads, and start rejection by the claimed receiver.
 """
 
 from __future__ import annotations
@@ -18,11 +30,13 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -42,10 +56,11 @@ from agent_hub_host.native_sessions import (
 REPO_TMP = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".local", "tmp"))
 
 FAKE_SCRIPT = r"""#!/usr/bin/env python3
-import json, os, sys, uuid
+import json, os, sys, time, uuid
 SFILE = os.environ["FAKE_SESSIONS"]
 MDIR = os.environ["FAKE_MSGS"]
-SEND_BEH = os.environ.get("FAKE_SEND_BEHAVIOR", "ok")
+MSG_BEH = os.environ.get("FAKE_MSG_BEHAVIOR", "ok")
+DELIVER_BEH = os.environ.get("FAKE_DELIVER_BEHAVIOR", "ok")
 KILL_BEH = os.environ.get("FAKE_KILL_BEHAVIOR", "ok")
 SLOG = os.environ.get("FAKE_START_LOG", "")
 
@@ -69,6 +84,9 @@ def opt(args, *names):
             return args[i + 1]
     return None
 
+def bare(args):
+    return [a for a in args if not a.startswith("-")]
+
 def main():
     args = [a for a in sys.argv[1:] if a != "--json"]
     if not args:
@@ -86,23 +104,11 @@ def main():
             with open(SLOG, "a") as f:
                 f.write("start:%s:%s\n" % (ws, tag))
         rec = {"id": str(uuid.uuid4()), "tag": tag, "workspace": ws, "engine": eng,
-               "profile": prof, "phase": "running", "created_at_ms": 1700000000000}
+               "profile": prof, "phase": "running", "state": "running",
+               "created_at_ms": 1700000000000, "last_activity_ms": 1700000000000}
         rows.append(rec); save(rows)
         print(json.dumps({"id": rec["id"], "workspace": ws, "tag": tag, "engine": eng,
                           "profile": prof, "phase": "running"}))
-    elif cmd == "send":
-        ws = opt(args, "--workspace"); tag = opt(args, "--tag")
-        rows = load()
-        hit = [r for r in rows if r["tag"] == tag and r["workspace"] == ws]
-        if not hit:
-            sys.stderr.write("no session\n"); sys.exit(1)
-        if SEND_BEH == "refused-busy":
-            sys.stderr.write("composer busy, input box not empty\n"); sys.exit(1)
-        if SEND_BEH == "crash":
-            sys.stderr.write("crashed after possible effect\n"); sys.exit(1)
-        if SEND_BEH == "idle3":
-            print(json.dumps({"delivery": {"ready": True, "working": False}})); sys.exit(3)
-        print(json.dumps({"delivery": {"ready": True, "working": True}}))
     elif cmd == "capture":
         ws = opt(args, "--workspace"); tag = opt(args, "--tag")
         rows = load()
@@ -123,7 +129,9 @@ def main():
         if not hit:
             sys.stderr.write("no session\n"); sys.exit(1)
         print(json.dumps({"phase": hit[0]["phase"], "state": hit[0]["phase"],
-                          "id": hit[0]["id"]}))
+                          "id": hit[0]["id"], "tag": hit[0]["tag"],
+                          "workspace": hit[0]["workspace"],
+                          "created_at_ms": hit[0].get("created_at_ms")}))
     elif cmd == "kill":
         ws = opt(args, "--workspace"); tag = opt(args, "--tag")
         rows = load()
@@ -131,16 +139,19 @@ def main():
         if not hit:
             sys.stderr.write("no session\n"); sys.exit(1)
         if KILL_BEH != "still-running":
-            hit[0]["phase"] = "exited"; save(rows)
+            hit[0]["phase"] = "exited"; hit[0]["state"] = "exited"; save(rows)
         print(json.dumps({"killed": hit[0]["id"]}))
     elif cmd == "message":
         sub = args[1]
         if sub == "send":
+            if MSG_BEH == "crash":
+                sys.stderr.write("crashed after possible effect\n"); sys.exit(1)
             rest = [a for a in args[2:] if a != "--"]
             ws = opt(rest, "--workspace"); to = opt(rest, "--to")
             kind = opt(rest, "--kind") or "note"
             data = json.loads(opt(rest, "--data") or "{}")
-            body = rest[-1] if rest and not rest[-1].startswith("-") else ""
+            tails = [a for a in rest if not a.startswith("-")]
+            body = tails[-1] if tails else ""
             try:
                 uuid.UUID(str(to))
                 sys.stderr.write("refusing UUID --to\n"); sys.exit(1)
@@ -151,12 +162,56 @@ def main():
             if not hit:
                 sys.stderr.write("no session tagged %s exists\n" % to); sys.exit(1)
             mid = str(uuid.uuid4())
-            env = {"id": mid, "workspace": ws, "to": {"tag": to, "session_id": hit[0]["id"]},
-                   "kind": kind, "data": data, "body": body, "reply_to": None}
+            env = {"schema_version": 1, "id": mid, "workspace": ws,
+                   "created_at": int(time.time()),
+                   "from": {"session_id": "00000000-0000-0000-0000-000000000000",
+                            "workspace": ws, "tag": "test-caller", "engine": "shell"},
+                   "to": {"tag": to, "session_id": hit[0]["id"]},
+                   "kind": kind, "data": data, "body": body, "reply_to": None,
+                   "delivery": "inbox"}
             os.makedirs(MDIR, exist_ok=True)
             with open(os.path.join(MDIR, mid + ".json"), "w") as f:
                 json.dump(env, f)
             print(json.dumps(env))
+        elif sub == "reply":
+            # message reply <orig-id> <text> [--data JSON]: recipient threads via reply_to.
+            rest = [a for a in args[2:] if a != "--"]
+            orig_id = opt(args, "--id") or (bare(rest)[0] if bare(rest) else None)
+            data = json.loads(opt(rest, "--data") or "{}")
+            tails = bare(rest)
+            body = tails[-1] if len(tails) > 1 else ""
+            orig = None
+            if os.path.isdir(MDIR):
+                for fn in os.listdir(MDIR):
+                    with open(os.path.join(MDIR, fn)) as f:
+                        m = json.load(f)
+                    if m.get("id") == orig_id:
+                        orig = m
+                        break
+            if orig is None:
+                sys.stderr.write("no such message\n"); sys.exit(1)
+            mid = str(uuid.uuid4())
+            env = {"schema_version": 1, "id": mid, "workspace": orig["workspace"],
+                   "created_at": int(time.time()),
+                   "from": {"session_id": orig["to"]["session_id"],
+                            "workspace": orig["workspace"],
+                            "tag": orig["to"]["tag"], "engine": "shell"},
+                   "to": orig["from"], "kind": "reply", "data": data, "body": body,
+                   "reply_to": orig_id, "delivery": "inbox"}
+            with open(os.path.join(MDIR, mid + ".json"), "w") as f:
+                json.dump(env, f)
+            print(json.dumps(env))
+        elif sub == "deliver":
+            ids = bare([a for a in args[2:] if a != "--workspace"])
+            mid = ids[-1] if ids else None
+            found = os.path.isfile(os.path.join(MDIR, (mid or "") + ".json"))
+            if not found:
+                sys.stderr.write("no such message\n"); sys.exit(1)
+            if DELIVER_BEH == "refused-busy":
+                sys.stderr.write("composer busy, input box not empty\n"); sys.exit(1)
+            if DELIVER_BEH == "crash":
+                sys.stderr.write("crashed after possible effect\n"); sys.exit(1)
+            print(json.dumps({"delivered": mid}))
         elif sub == "log":
             ws = opt(args, "--workspace")
             out = []
@@ -194,18 +249,26 @@ def env(tmp_path_factory, monkeypatch):
     journal = os.path.join(base, "journal")
     os.makedirs(journal, mode=0o700)
     start_log = os.path.join(base, "starts.log")
-    for key in ("FAKE_SEND_BEHAVIOR", "FAKE_KILL_BEHAVIOR"):
+    for key in ("FAKE_MSG_BEHAVIOR", "FAKE_DELIVER_BEHAVIOR", "FAKE_KILL_BEHAVIOR"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("FAKE_SESSIONS", sessions_file)
     monkeypatch.setenv("FAKE_MSGS", msgs)
     monkeypatch.setenv("FAKE_START_LOG", start_log)
-    return {"base": base, "work": work, "fake": fake, "journal": journal,
-            "msgs": msgs, "sessions_file": sessions_file, "start_log": start_log,
-            "monkeypatch": monkeypatch}
+    yield {"base": base, "work": work, "fake": fake, "journal": journal,
+           "msgs": msgs, "sessions_file": sessions_file, "start_log": start_log,
+           "monkeypatch": monkeypatch}
+    shutil.rmtree(base, ignore_errors=True)  # only our own sess-exec- dir
 
 
-def custody():
-    return se.CallerCustody(actor="tester", machine_id="hetzner1", credential_family="famA")
+def custody(actor="tester"):
+    return se.CallerCustody(actor=actor, machine_id="hetzner1", credential_family="famA")
+
+
+def make_claim(command_id, generation=7, expired=False):
+    now_ms = int(time.time() * 1000)
+    return {"command_id": command_id, "claim_token": "tok-" + uuid.uuid4().hex + "idx",
+            "holder": "hetzner1", "generation": generation,
+            "expires_at_ms": now_ms - 1000 if expired else now_ms + 60000}
 
 
 def make_target(env, tag, sid):
@@ -231,6 +294,7 @@ def test_list_filters_workspace_and_projects_shapes(env):
     rows = ns.list_sessions(env["fake"], workspace=env["work"])
     assert len(rows) == 1 and rows[0].tag == "w1sess"
     assert rows[0].engine == "go" and rows[0].phase == "running"
+    assert rows[0].created_at_ms == 1700000000000  # native generation provenance
     assert "history_path" not in rows[0].__dict__  # projection keeps only necessary fields
 
 
@@ -238,14 +302,25 @@ def test_qualify_rejects_tag_reuse(env):
     first = seed_session(env, tag="dupe")
     rows = json.load(open(env["sessions_file"]))
     rows.append({"id": str(uuid.uuid4()), "tag": "dupe", "workspace": env["work"],
-                 "engine": "go", "profile": None, "phase": "running",
-                 "created_at_ms": 1700000000001})
+                 "engine": "go", "profile": None, "phase": "running", "state": "running",
+                 "created_at_ms": 1700000000001, "last_activity_ms": 1700000000001})
     json.dump(rows, open(env["sessions_file"], "w"))
     target = make_target(env, "dupe", first["id"])
     with pytest.raises(SessionControlError):
         ns.qualify_target(env["fake"], target)
     # No effect attempted: both sessions still running.
     assert len(json.load(open(env["sessions_file"]))) == 2
+
+
+def test_qualify_rejects_stale_generation(env):
+    rec = seed_session(env, tag="gen1")
+    target = NativeTarget(session_id=rec["id"], tag="gen1", workspace=env["work"],
+                          created_at_ms=123456789)  # wrong generation
+    with pytest.raises(SessionControlError):
+        ns.qualify_target(env["fake"], target)
+    good = NativeTarget(session_id=rec["id"], tag="gen1", workspace=env["work"],
+                        created_at_ms=1700000000000)
+    assert ns.qualify_target(env["fake"], good).session_id == rec["id"]
 
 
 def test_resolve_cwd_rejects_escape(env):
@@ -257,7 +332,7 @@ def test_resolve_cwd_rejects_escape(env):
         ns.resolve_cwd([env["work"]], os.path.join(env["work"], "..", "escape"))
 
 
-# --- delivery -----------------------------------------------------------------
+# --- delivery (inbox only; raw PTY retired) -----------------------------------
 
 def test_send_inbox_recorded_with_correlated_receipt(env):
     rec = seed_session(env)
@@ -273,6 +348,7 @@ def test_send_inbox_recorded_with_correlated_receipt(env):
     assert envelopes[0]["id"] == out.native_id
     assert envelopes[0]["data"] == {"hub_session_control": {"correlation_id": "corr-1"}}
     assert envelopes[0]["body"] == "hello agent"
+    assert envelopes[0]["reply_to"] is None  # original envelope, not a reply
 
 
 def test_send_inbox_rejects_uuid_to_with_no_effect(env):
@@ -283,30 +359,58 @@ def test_send_inbox_rejects_uuid_to_with_no_effect(env):
     assert os.listdir(env["msgs"]) == []
 
 
-def test_send_pty_acknowledged_vs_idle_is_transported(env):
+def test_pty_guarded_retired_holds(env):
+    # R2 correction: `send --enter` working verdicts are NOT ACK proof, so the raw
+    # PTY path is retired. Requesting it holds honestly with no native effect.
     rec = seed_session(env)
     target = make_target(env, "agent1", rec["id"])
-    ok = ns.send_prompt_guarded(env["fake"], target, "do work", {"correlation_id": "k1"})
-    assert ok.state == "acknowledged"
-    env["monkeypatch"].setenv("FAKE_SEND_BEHAVIOR", "idle3")
-    idle = ns.send_prompt_guarded(env["fake"], target, "do more", {"correlation_id": "k2"})
-    assert idle.state == "transported"  # delivered-but-idle is NEVER acknowledged
+    with pytest.raises(SessionControlError):
+        se.send_prompt(env["fake"], target, "do work", custody=custody(),
+                       transport="pty-guarded", idempotency_key="retired1",
+                       journal_dir=env["journal"])
+    assert os.listdir(env["msgs"]) == []
+    assert os.listdir(env["journal"]) == []  # refused before intent: nothing journaled
+    # Inbox remains the supported transport.
+    ok = se.send_prompt(env["fake"], target, "do work", custody=custody(),
+                        transport="inbox", idempotency_key="inbox1",
+                        journal_dir=env["journal"])
+    assert ok["state"] == "recorded"
 
 
-def test_send_pty_busy_refused_without_forced_enter(env):
+def test_deliver_guard_maps_without_ack(env):
     rec = seed_session(env)
     target = make_target(env, "agent1", rec["id"])
-    env["monkeypatch"].setenv("FAKE_SEND_BEHAVIOR", "refused-busy")
-    out = ns.send_prompt_guarded(env["fake"], target, "interrupt?", {"correlation_id": "k"})
-    assert out.state == "refused"
+    sent = ns.send_inbox(env["fake"], target, "hello", {"correlation_id": "d1"})
+    done = ns.deliver_recorded(env["fake"], target, sent.native_id)
+    assert done.state == "transported"  # submitted; processing NOT proven
+    env["monkeypatch"].setenv("FAKE_DELIVER_BEHAVIOR", "refused-busy")
+    refused = ns.deliver_recorded(env["fake"], target, sent.native_id)
+    assert refused.state == "refused"
 
 
-def test_send_pty_crash_is_uncertain(env):
+def test_ack_verified_via_correlated_reply(env):
     rec = seed_session(env)
     target = make_target(env, "agent1", rec["id"])
-    env["monkeypatch"].setenv("FAKE_SEND_BEHAVIOR", "crash")
-    with pytest.raises(SessionUncertain):
-        ns.send_prompt_guarded(env["fake"], target, "risky", {"correlation_id": "k"})
+    body = "prompt for ack test"
+    sent = ns.send_inbox(env["fake"], target, body, {"correlation_id": "ack-c1"})
+    corr = {"correlation_id": "ack-c1", "body_digest": ns.body_digest(body)}
+    # No reply yet: honest unknown, never false confirmed.
+    assert ns.verify_ack_via_reply(env["fake"], target, sent.native_id, corr).state == "unknown"
+    # Recipient replies, threading the ORIGINAL envelope id with echo.
+    rep = subprocess.run(
+        [env["fake"], "message", "reply", sent.native_id, "done ack-c1",
+         "--data", json.dumps(corr), "--json"],
+        capture_output=True, text=True, timeout=20)
+    assert rep.returncode == 0, rep.stderr
+    proven = ns.verify_ack_via_reply(env["fake"], target, sent.native_id, corr)
+    assert proven.state == "acknowledged" and proven.reply_envelope_id
+    # Foreign reply (sender UUID mismatch) is not our proof.
+    rows = json.load(open(env["sessions_file"]))
+    rows[0]["id"] = str(uuid.uuid4())
+    json.dump(rows, open(env["sessions_file"], "w"))
+    foreign_target = make_target(env, "agent1", rows[0]["id"])
+    assert ns.verify_ack_via_reply(env["fake"], foreign_target, sent.native_id,
+                                   corr).state == "unknown"
 
 
 # --- executor idempotency ------------------------------------------------------
@@ -329,23 +433,48 @@ def test_executor_send_replay_and_conflict(env):
                        journal_dir=env["journal"])
 
 
-def test_executor_pty_retry_needs_reconciliation(env):
+def test_executor_inbox_retry_needs_reconciliation(env):
     rec = seed_session(env)
     target = make_target(env, "agent1", rec["id"])
-    env["monkeypatch"].setenv("FAKE_SEND_BEHAVIOR", "crash")
+    env["monkeypatch"].setenv("FAKE_MSG_BEHAVIOR", "crash")
     with pytest.raises(SessionUncertain):
         se.send_prompt(env["fake"], target, "risky", custody=custody(),
-                       transport="pty-guarded", idempotency_key="k9",
+                       transport="inbox", idempotency_key="k9",
                        journal_dir=env["journal"])
-    env["monkeypatch"].setenv("FAKE_SEND_BEHAVIOR", "ok")
+    env["monkeypatch"].setenv("FAKE_MSG_BEHAVIOR", "ok")
     with pytest.raises(SessionUncertain):  # blind resend refused
         se.send_prompt(env["fake"], target, "risky", custody=custody(),
-                       transport="pty-guarded", idempotency_key="k9",
+                       transport="inbox", idempotency_key="k9",
                        journal_dir=env["journal"])
     done = se.send_prompt(env["fake"], target, "risky", custody=custody(),
-                          transport="pty-guarded", idempotency_key="k9",
+                          transport="inbox", idempotency_key="k9",
                           journal_dir=env["journal"], reconciled=True)
-    assert done["state"] == "acknowledged"
+    assert done["state"] == "recorded"
+
+
+def test_concurrent_intent_lock_serializes(env):
+    rec = seed_session(env)
+    target = make_target(env, "agent1", rec["id"])
+    barrier = threading.Barrier(4)
+    outcomes = []
+
+    def worker():
+        try:
+            barrier.wait(timeout=10)
+            outcomes.append(se.send_prompt(
+                env["fake"], target, "same body", custody=custody(),
+                transport="inbox", idempotency_key="race1",
+                journal_dir=env["journal"]))
+        except Exception as exc:  # noqa: BLE001 — lock contention is an honest outcome
+            outcomes.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert len(os.listdir(env["msgs"])) == 1  # exactly one native effect
+    assert any(isinstance(o, dict) and o.get("state") == "recorded" for o in outcomes)
 
 
 # --- capture / stop ------------------------------------------------------------
@@ -356,6 +485,7 @@ def test_capture_bounded_truncation(env):
     small = se.capture_session_output(env["fake"], target, custody=custody(),
                                       limit_bytes=64, mode="tail")
     assert small["truncated"] is True and small["byte_length"] == 64
+    assert small["privacy_unknown"] is True  # explicit: regex alone cannot prove safe
     with pytest.raises(SessionControlError):
         se.capture_session_output(env["fake"], target, custody=custody(),
                                   limit_bytes=ns.MAX_CAPTURE_LIMIT + 1)
@@ -412,6 +542,18 @@ def test_custody_and_limits_hold_with_no_effect(env):
     assert len(os.listdir(env["journal"])) == 0
 
 
+def test_project_qualified_actor_accepted(env):
+    # Authentic canonical actors may be project-qualified (`project:tag`); the LABEL
+    # rule must not reject genuine `machine/agent:actor` forms. No privilege is
+    # derived from the text; the server enforces family/incarnation/revocation.
+    rec = seed_session(env)
+    target = make_target(env, "agent1", rec["id"])
+    out = se.send_prompt(env["fake"], target, "hello", custody=custody("proj:agent1"),
+                         transport="inbox", idempotency_key="proj1",
+                         journal_dir=env["journal"])
+    assert out["state"] == "recorded" and out["caller_actor"] == "proj:agent1"
+
+
 # --- start via Fleet contract over real HTTP + SQLite --------------------------
 
 class ClaimHandler(BaseHTTPRequestHandler):
@@ -448,6 +590,9 @@ class ClaimHandler(BaseHTTPRequestHandler):
             elif self.path.endswith("/result"):
                 con.execute("INSERT INTO results(launch, payload) VALUES(?, ?)",
                             (self.path, json.dumps(body)))
+            elif "/ack" in self.path:
+                con.execute("INSERT INTO acks(launch, payload) VALUES(?, ?)",
+                            (self.path, json.dumps(body)))
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -479,6 +624,7 @@ def hub(env):
     con = sqlite3.connect(db)
     con.execute("CREATE TABLE claims(launch TEXT, payload TEXT)")
     con.execute("CREATE TABLE results(launch TEXT, payload TEXT)")
+    con.execute("CREATE TABLE acks(launch TEXT, payload TEXT)")
     con.commit()
     con.close()
     ClaimHandler.db_path = db
@@ -500,6 +646,10 @@ def hub(env):
     yield {"request": request, "db": db, "port": server.server_address[1]}
     server.shutdown()
     thread.join(timeout=5)
+    try:
+        os.unlink(db)
+    except OSError:
+        pass
 
 
 def fleet_settings(env, gate_ok=True):
@@ -618,9 +768,9 @@ def _server_port(hub):
     return hub["port"]
 
 
-# --- receiver command function -------------------------------------------------
+# --- server-claimed receiver ---------------------------------------------------
 
-def test_handle_session_command_round_trip(hub, env):
+def test_claimed_send_capture_stop_round_trip(hub, env):
     rec = seed_session(env)
     target = {"session_id": rec["id"], "tag": "agent1", "workspace": env["work"]}
     listed = se.handle_session_command({"op": "list", "workspace": env["work"]},
@@ -629,20 +779,82 @@ def test_handle_session_command_round_trip(hub, env):
                                        executable=env["fake"])
     assert listed["sessions"] and listed["sessions"][0]["tag"] == "agent1"
     sent = se.handle_session_command(
-        {"op": "send", "target": target, "body": "via receiver",
-         "transport": "inbox", "idempotency_key": "rx1"},
-        custody=custody(), journal_dir=env["journal"], executable=env["fake"])
-    assert sent["state"] == "recorded"
+        {"op": "send", "command_id": "cmd-1", "generation": 7, "target": target,
+         "body": "via receiver", "claim": make_claim("cmd-1")},
+        custody=custody(), journal_dir=env["journal"], executable=env["fake"],
+        request=hub["request"])
+    assert sent["state"] == "recorded" and sent["ack"]["submitted"] is True
+    assert sent["native_id"]  # original envelope retained for reconciliation
     cap = se.handle_session_command(
-        {"op": "capture", "target": target, "limit_bytes": 4096},
-        custody=custody(), executable=env["fake"])
-    assert cap["byte_length"] > 0
-    stopped = se.handle_session_command({"op": "stop", "target": target},
-                                        custody=custody(), executable=env["fake"])
+        {"op": "capture", "command_id": "cmd-2", "generation": 7, "target": target,
+         "limit_bytes": 4096, "claim": make_claim("cmd-2")},
+        custody=custody(), journal_dir=env["journal"], executable=env["fake"],
+        request=hub["request"])
+    assert cap["state"] == "captured" and cap["ack"]["submitted"] is True
+    stopped = se.handle_session_command(
+        {"op": "stop", "command_id": "cmd-3", "generation": 7, "target": target,
+         "claim": make_claim("cmd-3")},
+        custody=custody(), journal_dir=env["journal"], executable=env["fake"],
+        request=hub["request"])
     assert stopped["state"] == "stopped"
+    con = sqlite3.connect(hub["db"])
+    assert con.execute("SELECT COUNT(*) FROM acks").fetchone()[0] == 3
+    con.close()
     with pytest.raises(SessionControlError):
         se.handle_session_command({"op": "launch-missiles"}, custody=custody(),
                                   executable=env["fake"])
+
+
+def test_claimed_receiver_rejects_start(env):
+    # Fleet already handles start once; the claimed receiver never reconsumes
+    # Fleet offers or invokes start.
+    with pytest.raises(SessionControlError):
+        se.handle_session_command(
+            {"op": "start", "command_id": "s1", "generation": 1,
+             "claim": make_claim("s1")},
+            custody=custody(), journal_dir=env["journal"], executable=env["fake"])
+
+
+def test_claim_expiry_refuses_without_effect(env):
+    rec = seed_session(env)
+    target = {"session_id": rec["id"], "tag": "agent1", "workspace": env["work"]}
+    with pytest.raises(SessionControlError):
+        se.handle_session_command(
+            {"op": "send", "command_id": "exp-1", "generation": 7, "target": target,
+             "body": "too late", "claim": make_claim("exp-1", expired=True)},
+            custody=custody(), journal_dir=env["journal"], executable=env["fake"])
+    assert os.listdir(env["msgs"]) == []  # no effect after expired claim
+
+
+def test_repeated_claim_token_never_reauthorizes(env):
+    rec = seed_session(env)
+    target = {"session_id": rec["id"], "tag": "agent1", "workspace": env["work"]}
+    first = se.handle_session_command(
+        {"op": "send", "command_id": "tok-1", "generation": 7, "target": target,
+         "body": "once", "claim": make_claim("tok-1")},
+        custody=custody(), journal_dir=env["journal"], executable=env["fake"])
+    assert first["state"] == "recorded"
+    # A different token for the same command replays the journal — no new effect.
+    again = se.handle_session_command(
+        {"op": "send", "command_id": "tok-1", "generation": 7, "target": target,
+         "body": "once", "claim": make_claim("tok-1")},
+        custody=custody(), journal_dir=env["journal"], executable=env["fake"])
+    assert again.get("replayed") is True
+    assert len(os.listdir(env["msgs"])) == 1
+    # Uncertain attempt + foreign token: still uncertain, never a second effect.
+    env["monkeypatch"].setenv("FAKE_MSG_BEHAVIOR", "crash")
+    with pytest.raises(SessionUncertain):
+        se.handle_session_command(
+            {"op": "send", "command_id": "tok-2", "generation": 7, "target": target,
+             "body": "risky", "claim": make_claim("tok-2")},
+            custody=custody(), journal_dir=env["journal"], executable=env["fake"])
+    env["monkeypatch"].setenv("FAKE_MSG_BEHAVIOR", "ok")
+    with pytest.raises(SessionUncertain):
+        se.handle_session_command(
+            {"op": "send", "command_id": "tok-2", "generation": 7, "target": target,
+             "body": "risky", "claim": make_claim("tok-2")},
+            custody=custody(), journal_dir=env["journal"], executable=env["fake"])
+    assert len(os.listdir(env["msgs"])) == 1  # only the first "once" envelope
 
 
 def test_status_probe_is_read_only(env):

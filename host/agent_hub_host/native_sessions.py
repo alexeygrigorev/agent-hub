@@ -1,4 +1,4 @@
-"""M12e host native session adapter: list / guarded delivery / bounded capture / confirmed stop.
+"""M12e host native session adapter: list / inbox delivery / bounded capture / confirmed stop.
 
 Genuine native protocols only (installed ``a``/``aplexer`` CLI, argv, no shell).
 Read-only with respect to all other hub source: this module wraps the native CLI and
@@ -8,16 +8,27 @@ reuses :mod:`agent_hub_host.native_bridge` workspace helpers. It never starts se
 and never claims more than the native evidence proves:
 
 - ``recorded``: durable inbox envelope persisted (``message send``). NOT delivery proof.
-- ``transported``: PTY bytes delivered (``send --enter`` exit 0 without working proof,
-  or exit 3 delivered-but-idle). NOT processing proof.
-- ``acknowledged``: native verdict carries explicit working/ACK proof correlated to this
-  request. Only then may callers treat the target as having received the prompt.
-- ``refused``: readiness/composer gate rejected the attempt; no effect was attempted.
+- ``transported``: an existing envelope submitted through the native deliver guard
+  (``message deliver`` inspects a fresh empty prompt itself). NOT processing proof.
+- ``acknowledged``: ONLY a correlated native recipient reply proves processing (see
+  :func:`verify_ack_via_reply`). It is never derived from a ``send --enter`` working
+  verdict, transcript activity, phase flags, or inbox persistence.
+- ``unknown``: the ACK proof transport is unqualified or no reply envelope matched;
+  reported honestly instead of a false confirmed.
+- ``refused``/``held``: readiness/composer gate rejected the attempt; no effect attempted.
 - ``uncertain``: the effect may have happened; reconcile from ``list``/``status``/``log``
   before any retry. Never blind-retry.
 
-Forbidden transports: ``--pane`` injection, ``--no-ack``, ``--from`` identity override,
-busy-composer input, stale-idle bypass. ``message send --to`` takes a TAG, never a UUID.
+R2 correction (head-ordered): the predecessor mapped ``send --enter --json``
+``working:true`` to ``acknowledged``. That verdict is NOT target-read/process proof,
+so the raw ``send --enter`` path is RETIRED here (no ``--pane``, no ``--no-ack``,
+no ``--enter`` anywhere in this module). Delivery is durable inbox only, with the
+native ``message deliver`` guard available as an explicit opt-in. Inbox persistence
+is never rendered as transported or acknowledged.
+
+Forbidden transports: ``send --enter``, ``--pane`` injection, ``--no-ack``,
+``--from`` identity override, busy-composer input, stale-idle bypass.
+``message send --to`` takes a TAG, never a UUID.
 """
 
 from __future__ import annotations
@@ -55,11 +66,17 @@ class SessionUncertain(Exception):
 
 @dataclass(frozen=True)
 class NativeTarget:
-    """Exact native session binding required before/after every operation."""
+    """Exact native session binding required before/after every operation.
+
+    ``created_at_ms`` is the native generation provenance (from ``a list`` /
+    ``a status``). When provided, :func:`qualify_target` requires the live catalog
+    row to carry the same generation; a mismatch means tag reuse and refuses.
+    """
 
     session_id: str
     tag: str
     workspace: str
+    created_at_ms: Optional[int] = None
 
     def validated(self) -> "NativeTarget":
         try:
@@ -73,7 +90,10 @@ class NativeTarget:
         canonical = canonicalize_workspace(self.workspace)
         if canonical != self.workspace:
             raise SessionControlError("Workspace must already be canonical (no symlinks)")
-        return NativeTarget(session_id=norm, tag=self.tag, workspace=canonical)
+        if self.created_at_ms is not None and type(self.created_at_ms) is not int:
+            raise SessionControlError("Native generation (created_at_ms) must be an int when given")
+        return NativeTarget(session_id=norm, tag=self.tag, workspace=canonical,
+                            created_at_ms=self.created_at_ms)
 
 
 @dataclass(frozen=True)
@@ -93,8 +113,25 @@ class NativeSession:
 
 @dataclass(frozen=True)
 class DeliveryResult:
-    state: str  # recorded|transported|acknowledged|refused|uncertain
+    state: str  # recorded|transported|refused|uncertain (never acknowledged here)
     native_id: Optional[str] = None
+    reason: str = ""
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class AckResult:
+    """Correlated recipient-ACK proof (or its honest absence).
+
+    ``acknowledged`` only when a reply envelope was found in the retrieved native
+    log whose ``reply_to`` equals the original envelope id, whose ``from``
+    session/tag/workspace matches the intended native generation, and whose body
+    echoes the exact correlation/digest. Anything else is ``unknown`` — never a
+    false confirmed.
+    """
+
+    state: str  # acknowledged|unknown
+    reply_envelope_id: Optional[str] = None
     reason: str = ""
     evidence: dict[str, Any] = field(default_factory=dict)
 
@@ -107,6 +144,11 @@ class CaptureResult:
     text: str
     truncated: bool
     byte_length: int
+    # Privacy is explicitly UNKNOWN: terminal output can contain secrets and a
+    # redaction regex alone cannot prove safety. This projection is private,
+    # no-store, bounded UTF-8 for the exact opt-in controlled session only.
+    # Callers must hold explicit capture authorization; never upload raw archives.
+    privacy_unknown: bool = True
 
 
 @dataclass(frozen=True)
@@ -132,11 +174,27 @@ def check_body_bound(body: str, limit: int = MAX_BODY_BYTES) -> str:
     return body
 
 
+def body_digest(body: str) -> str:
+    """Stable hex digest of the exact intended body for correlation echo checks."""
+    import hashlib
+
+    if not isinstance(body, str):
+        raise SessionControlError("Body must be text for digesting")
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
 def resolve_cwd(workspace_roots: list[str], cwd: str) -> str:
     """Resolve requested cwd strictly inside operator-configured workspace roots.
 
     Rejects path traversal and escaping symlinks (realpath comparison). Raises
     SessionControlError without any native effect.
+
+    Honest limitation (head-ordered): the existing Fleet strict DTO does not carry
+    ``cwd`` and the start adapter does not consume it, so this helper CANNOT
+    retroactively change an already-launched session's cwd. Until the qualified
+    existing integration is extended, the server must reject unsupported cwd/tier
+    BEFORE effects (honest hold). This function only validates a caller's requested
+    path for a future qualified start; it never claims a running session moved.
     """
     if not isinstance(cwd, str) or not cwd:
         raise SessionControlError("cwd is required")
@@ -165,8 +223,8 @@ def run_native(
         raise SessionControlError("Native argv must be a non-empty string list")
     if any(a.startswith("--from") for a in args):
         raise SessionControlError("Sender identity override (--from) is forbidden")
-    if "--pane" in args or "--no-ack" in args:
-        raise SessionControlError("--pane/--no-ack transports are forbidden")
+    if "--pane" in args or "--no-ack" in args or "--enter" in args:
+        raise SessionControlError("--pane/--no-ack/--enter transports are forbidden")
     try:
         proc = subprocess.run(
             [executable, *args],
@@ -249,10 +307,13 @@ def qualify_target(
     target: NativeTarget,
     live_only: bool = True,
 ) -> NativeSession:
-    """Re-qualify tag -> (UUID, workspace) immediately before an effect.
+    """Re-qualify tag -> (UUID, workspace, generation) immediately before an effect.
 
     Requires exactly one catalog row matching workspace+tag AND the expected UUID.
     Tag reuse (same tag, different UUID) or workspace drift refuses with no effect.
+    When the target carries ``created_at_ms``, the row must carry the same native
+    generation (a hub counter alone is not provenance); a stale generation refuses.
+    Never infers idleness/readiness from phase flags: phase is liveness only.
     """
     target = target.validated()
     sessions = list_sessions(executable, workspace=target.workspace, include_exited=True)
@@ -266,6 +327,10 @@ def qualify_target(
     if row.session_id.lower() != target.session_id.lower():
         raise SessionControlError(
             "Tag now resolves to a different native session (tag reuse); refusing"
+        )
+    if target.created_at_ms is not None and row.created_at_ms != target.created_at_ms:
+        raise SessionControlError(
+            "Native generation mismatch (stale incarnation or tag reuse); refusing"
         )
     if live_only and row.phase in TERMINAL_PHASES:
         raise SessionControlError(f"Target session is terminal (phase={row.phase}); refusing")
@@ -323,82 +388,140 @@ def send_inbox(
     )
 
 
-def _map_enter_verdict(proc: subprocess.CompletedProcess) -> DeliveryResult:
-    """Map ``send --enter [--json]`` outcome to honest delivery states.
-
-    Conservative by construction: exit 0 without explicit working proof is
-    ``transported``, never ``acknowledged``. Exit 3 (delivered but agent stayed idle)
-    is ``transported``. Busy/not-ready failures are ``refused`` (no retry by us).
-    Anything else is ``uncertain``.
-    """
-    stderr_tail = proc.stderr.strip().splitlines()
-    hint = stderr_tail[-1][:300] if stderr_tail else ""
-    verdict: dict[str, Any] = {}
-    if "--json" in (proc.args or []):
-        try:
-            parsed = json.loads(proc.stdout) if proc.stdout.strip() else {}
-            if isinstance(parsed, dict):
-                verdict = parsed.get("delivery", parsed) if isinstance(parsed, dict) else {}
-                if not isinstance(verdict, dict):
-                    verdict = {}
-        except ValueError:
-            verdict = {}
-    working = verdict.get("working") is True or verdict.get("acknowledged") is True
-    ready = verdict.get("ready", True)
-    if proc.returncode == 0:
-        if working:
-            return DeliveryResult(
-                state="acknowledged", reason="native verdict shows agent working",
-                evidence={"verdict": verdict},
-            )
-        return DeliveryResult(
-            state="transported",
-            reason="PTY bytes delivered; agent processing NOT proven",
-            evidence={"verdict": verdict},
-        )
-    if proc.returncode == 3:
-        return DeliveryResult(
-            state="transported",
-            reason="delivered but agent stayed idle (native exit 3); processing NOT proven",
-            evidence={"verdict": verdict},
-        )
-    lowered = (hint + " " + proc.stderr).lower()
-    if ready is False or any(
-        s in lowered for s in ("busy", "not ready", "not empty", "menu", "draft", "unknown composer")
-    ):
-        return DeliveryResult(state="refused", reason=hint or "readiness/composer gate refused")
-    return DeliveryResult(state="uncertain", reason=hint or f"native exit {proc.returncode}")
-
-
-def send_prompt_guarded(
+def deliver_recorded(
     executable: str,
     target: NativeTarget,
-    body: str,
-    correlation: dict[str, str],
-    wait_ack_secs: int = 10,
+    envelope_id: str,
 ) -> DeliveryResult:
-    """Guarded PTY prompt delivery via ``send --enter --json`` (no bypass flags).
+    """Submit one existing inbox envelope via the native deliver guard.
 
-    Refuses busy/non-empty composers; never treats idle as proof of readiness;
-    maps the native verdict conservatively (see :func:`_map_enter_verdict`).
+    ``message deliver <id>`` submits the ORIGINAL envelope (delivery never creates
+    another one) after the native side inspects a fresh, empty prompt itself. This
+    is the only supported transport beyond durable inbox, and it is explicit
+    opt-in: without it, commands stay ``recorded``/``held``. Success maps to
+    ``transported`` — never ``acknowledged`` (only :func:`verify_ack_via_reply`
+    proves processing). No composer-idle claim is made from phase/working flags;
+    the readiness inspection belongs to the native guard, not to this caller.
     """
     target = target.validated()
-    check_body_bound(body)
-    if not isinstance(correlation, dict) or not correlation.get("correlation_id"):
-        raise SessionControlError("Correlation id is required for every send")
-    if type(wait_ack_secs) is not int or not 0 <= wait_ack_secs <= 120:
-        raise SessionControlError("wait_ack_secs must be 0..120")
+    if not isinstance(envelope_id, str) or not envelope_id or len(envelope_id) > 128:
+        raise SessionControlError("Envelope id is required for deliver")
     qualify_target(executable, target)
     proc = run_native(
         executable,
-        ["send", "--workspace", target.workspace, "--tag", target.tag,
-         "--enter", "--json", "--wait-ack", str(wait_ack_secs), body],
-        timeout=NATIVE_TIMEOUT + wait_ack_secs,
+        ["message", "deliver", "--workspace", target.workspace, "--json", envelope_id],
+        timeout=NATIVE_TIMEOUT,
     )
-    result = _map_enter_verdict(proc)
-    if result.state == "uncertain":
-        raise SessionUncertain(result.reason)
-    return result
+    if proc.returncode == 0:
+        return DeliveryResult(
+            state="transported",
+            native_id=envelope_id,
+            reason="native deliver guard submitted the envelope; processing NOT proven",
+            evidence={},
+        )
+    lowered = proc.stderr.lower()
+    if any(s in lowered for s in ("busy", "not empty", "menu", "draft", "unknown")):
+        return DeliveryResult(
+            state="refused",
+            native_id=envelope_id,
+            reason=(proc.stderr.strip().splitlines() or ["deliver guard refused"])[-1][:300],
+        )
+    raise SessionUncertain("Deliver outcome unknown; reconcile before retry")
+
+
+MAX_LOG_ROWS = 200  # bounded native log retrieval per reconciliation
+
+
+def fetch_message_log(
+    executable: str,
+    workspace: str,
+    limit: int = MAX_LOG_ROWS,
+) -> list[dict[str, Any]]:
+    """Retrieve the actual native message log for the exact workspace (bounded, read-only).
+
+    Returns raw envelope dicts (newest last per native order), truncated to ``limit``
+    rows. Callers must verify envelope fields themselves; nothing here is proof.
+    """
+    if not isinstance(workspace, str) or not Path(workspace).is_absolute():
+        raise SessionControlError("Workspace must be an absolute path")
+    canonical = canonicalize_workspace(workspace)
+    if type(limit) is not int or not 1 <= limit <= MAX_LOG_ROWS:
+        raise SessionControlError(f"Log bound must be 1..{MAX_LOG_ROWS}")
+    proc = run_native(
+        executable,
+        ["message", "log", "--workspace", canonical, "--json"],
+        timeout=QUICK_TIMEOUT,
+    )
+    if proc.returncode != 0:
+        raise SessionUncertain("Native message log unavailable; reconciliation deferred")
+    rows = _parse_json_output(proc, "message log")
+    if not isinstance(rows, list):
+        raise SessionUncertain("Native message log is not an array; reconciliation deferred")
+    return [r for r in rows if isinstance(r, dict)][-limit:]
+
+
+def verify_ack_via_reply(
+    executable: str,
+    target: NativeTarget,
+    original_envelope_id: str,
+    correlation: dict[str, str],
+) -> AckResult:
+    """Verify a correlated recipient reply in the actual native message log.
+
+    ``acknowledged`` requires ALL of: the reply envelope exists in the retrieved
+    log (bounded, exact workspace); its ``reply_to`` equals the ORIGINAL NATIVE
+    message envelope id (never a hub ``cmd:`` string); its ``from`` session/tag/
+    workspace matches the intended native generation (``created_at_ms`` when
+    known); and its body/data echoes the exact correlation id and body digest.
+    Otherwise the result is ``unknown`` — an honest report, never false confirmed.
+    When the proof transport itself is unqualified (log unavailable, unknown
+    envelope shape), the result is likewise ``unknown`` with the reason recorded.
+    """
+    target = target.validated()
+    if not isinstance(original_envelope_id, str) or not original_envelope_id:
+        raise SessionControlError("Original native envelope id is required for ACK proof")
+    if not isinstance(correlation, dict) or not correlation.get("correlation_id"):
+        raise SessionControlError("Correlation id is required for ACK proof")
+    expected_digest = correlation.get("body_digest", "")
+    try:
+        log = fetch_message_log(executable, target.workspace)
+    except SessionUncertain as exc:
+        return AckResult(state="unknown", reason=f"proof transport unqualified: {exc}")
+    except SessionControlError as exc:
+        return AckResult(state="unknown", reason=f"proof transport unqualified: {exc}")
+    for env in log:
+        if env.get("reply_to") != original_envelope_id:
+            continue
+        sender = env.get("from")
+        if not isinstance(sender, dict):
+            continue
+        if (str(sender.get("session_id", "")).lower() != target.session_id.lower()
+                or sender.get("tag") != target.tag
+                or sender.get("workspace") != target.workspace):
+            continue  # foreign or retargeted reply: not our proof
+        payload = env.get("data")
+        body_text = env.get("body") if isinstance(env.get("body"), str) else ""
+        echoed_corr = ""
+        echoed_digest = ""
+        if isinstance(payload, dict):
+            echoed_corr = str(payload.get("correlation_id", ""))
+            echoed_digest = str(payload.get("body_digest", ""))
+        if echoed_corr != correlation["correlation_id"]:
+            continue
+        if expected_digest and echoed_digest != expected_digest:
+            continue
+        if not expected_digest and correlation["correlation_id"] not in body_text:
+            continue
+        return AckResult(
+            state="acknowledged",
+            reply_envelope_id=str(env.get("id")),
+            reason="correlated native reply verified in message log",
+            evidence={"correlation_id": correlation["correlation_id"]},
+        )
+    return AckResult(
+        state="unknown",
+        reason="no correlated reply envelope in retrieved native log",
+    )
 
 
 def capture_output(
@@ -490,6 +613,9 @@ def stop_session(
               and canonicalize_workspace(s.workspace) == target.workspace]
     if not before:
         raise SessionControlError("Target not in native catalog (tag reuse or absent); refusing")
+    if target.created_at_ms is not None and before[0].created_at_ms != target.created_at_ms:
+        raise SessionControlError("Native generation mismatch before kill; refusing")
+    generation = before[0].created_at_ms
     if before[0].phase in TERMINAL_PHASES:
         return StopResult(state="stopped", session_id=target.session_id,
                           reason=f"already terminal before kill: {before[0].phase}")
@@ -504,10 +630,17 @@ def stop_session(
         # while running (forget claims no stop). Reconcile, never assume stopped.
         raise SessionUncertain("Kill reported failure; target exit unproven — reconcile")
     remaining = [s for s in list_sessions(executable, include_exited=True)
-                 if s.session_id.lower() == target.session_id.lower()]
+                  if s.session_id.lower() == target.session_id.lower()
+                  and s.tag == target.tag
+                  and canonicalize_workspace(s.workspace) == target.workspace]
     if not remaining:
+        # Kill reported success AND the exact bound UUID/tag/workspace record is gone.
+        # Absence WITHOUT our kill proof (forget/prune) is never exit proof — that
+        # case refuses above, before any effect.
         return StopResult(state="stopped", session_id=target.session_id,
                           reason="native record cleaned up after kill")
+    if generation is not None and remaining[0].created_at_ms != generation:
+        raise SessionUncertain("Native generation changed across kill; exit unproven")
     if remaining[0].phase in TERMINAL_PHASES:
         return StopResult(state="stopped", session_id=target.session_id,
                           reason=f"terminal phase observed: {remaining[0].phase}")
