@@ -16,8 +16,10 @@ import { roleName } from './role_leases';
 import { FleetService } from './fleet';
 import { LivenessService, thresholdsFrom, alertText } from './liveness';
 import { ChecksService, validateCheck, type ActionDeps } from './checks';
+import { approvalAuthorityMatches, assignApprovalAuthority } from './host_enrollment';
 import { ensureRootScheduling, getRootScheduling, isRootSchedulingEnabled, setRootScheduling } from './root_scheduling';
 import { QuotaStore, handleQuotaRoutes } from './quota';
+import { SessionControlService } from './session_control';
 
 function parseEpoch(raw: any): number | null {
   if (raw === undefined || raw === null || raw === '' || typeof raw === 'boolean') return null;
@@ -80,6 +82,7 @@ export class Hub extends DurableObject {
   public jobsService: JobsService;
   public quotaStore: QuotaStore;
   public fleetService: FleetService;
+  public sessionControlService: SessionControlService;
   public livenessService: LivenessService;
   public checksService: ChecksService;
 
@@ -95,6 +98,13 @@ export class Hub extends DurableObject {
     this.busService = new BusService(this.sql, txSync);
     this.fleetService = new FleetService(this.sql, fn => this.ctx.storage.transactionSync(fn));
     this.fleetService.init();
+    // M12e session control (narrow seam, owned by platform-session-api-r2):
+    // durable start/send/capture/stop intents over the existing fleet reserve.
+    // Placement stays with FleetService; no second dispatcher or consumer here.
+    this.sessionControlService = new SessionControlService(this.sql, fn => this.ctx.storage.transactionSync(fn), Date.now, {
+      reserve: (input, auth) => this.fleetService.reserve(input, auth),
+    });
+    this.sessionControlService.init();
     this.livenessService = new LivenessService(this.sql, thresholdsFrom(env));
     this.livenessService.init();
     this.checksService = new ChecksService(this.sql);
@@ -256,8 +266,13 @@ export class Hub extends DurableObject {
       last_checkin_at: 'TEXT',
       last_heartbeat: 'JSON',
       drained: 'INTEGER DEFAULT 0',
-      notes: 'TEXT'
+      notes: 'TEXT',
+      approval_seq: 'INTEGER'
     });
+
+    // R5 R2: server-owned enrollment authority migration.
+    this.ensureColumns('device_pairings', { approved_seq: 'INTEGER' });
+    this.ensureColumns('credentials', { approval_seq: 'INTEGER' });
 
     this.ensureColumns('jobs', {
       deadline_at: 'TEXT',
@@ -402,6 +417,14 @@ export class Hub extends DurableObject {
           if (session) auth.caller.actor = 'human:' + session.sub;
         }
         return this.fleetService.handle(request, auth);
+      }
+      // M12e session control (narrow seam, owned by platform-session-api-r2).
+      // Auth mirrors the intake mount exactly: bus credentials first, narrow
+      // operator-token fallback for the public CLI, cookie sessions on the
+      // existing session/CSRF path. No agent scope changes.
+      if (path === '/api/sessions' || path.startsWith('/api/sessions/') ||
+          path === '/api/session-commands' || path.startsWith('/api/session-commands/')) {
+        return this.sessionControlService.handle(request, await this.sessionControlAuth(request));
       }
       const registryResponse = await handleRegistryRoutes(request, path, this.sql, this.ctx, this.env);
       if (registryResponse) return registryResponse;
@@ -650,11 +673,49 @@ export class Hub extends DurableObject {
               this.sql.exec("UPDATE device_pairings SET status = 'expired' WHERE device_code_hash = ?", deviceCodeHash);
               return null;
             }
+            // R5 R2: a delayed older approved grant must not displace a newer
+            // approved family, whether the machine pointer is currently bound
+            // or NULL. The pairing's approval authority must still equal the
+            // machine's current witness whenever that witness exists; a
+            // superseded witnessed grant and a legacy unwitnessed grant are
+            // both denied WITHOUT consuming the code or touching the machine
+            // binding, so no newer consent is minted and issuance retries stay
+            // idempotent. Only legacy both-NULL bootstrap (no witness anywhere)
+            // may pass without equality. A legacy grant with no verifiable
+            // witness may bootstrap an unbound machine but must never replace
+            // an already bound one. Revalidated here inside the transaction
+            // after the awaited token generation above.
+            // generateTokenPair performs only cryptographic preparation
+            // (random strings + hashes, no storage writes); every durable
+            // credential insert, code consumption and machine update below
+            // happens only after this fresh post-await validation.
+            let issuanceSeq: number | null = null;
+            if (current.client_kind === 'host' && current.machine_id) {
+              const machine = this.sql.exec('SELECT approval_seq, credential_id FROM machines WHERE id = ?', current.machine_id).toArray()[0] as any;
+              if (!machine) return null;
+              const bound = typeof machine.credential_id === 'string' && machine.credential_id !== '';
+              if (bound) {
+                if (current.approved_seq === null || current.approved_seq === undefined) return null;
+                if (machine.approval_seq === null || machine.approval_seq === undefined) return null;
+                if (current.approved_seq !== machine.approval_seq) return null;
+                issuanceSeq = current.approved_seq;
+              } else if (machine.approval_seq !== null && machine.approval_seq !== undefined) {
+                // Unbound but witnessed: only the current approval authority
+                // may bootstrap. A stale witnessed grant and a legacy
+                // unwitnessed grant are both denied here; only legacy
+                // both-NULL bootstrap falls through below.
+                if (current.approved_seq === null || current.approved_seq === undefined) return null;
+                if (current.approved_seq !== machine.approval_seq) return null;
+                issuanceSeq = current.approved_seq;
+              } else if (current.approved_seq !== null && current.approved_seq !== undefined) {
+                issuanceSeq = current.approved_seq;
+              }
+            }
             if (current.client_kind === 'agent' && (!credentialActor(this.sql, { kind: 'agent', registry_actor: current.actor, machine_id: current.machine_id }) ||
                 !validAgentPairingScopes(current.granted_scopes, current.requested_scopes))) return null;
             const expires = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
-            this.sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, credId, current.client_kind, tokens.accessHash, tokens.refreshHash, familyId, current.name, current.machine_id, current.actor, current.granted_scopes, current.approved_by_sub, new Date().toISOString(), expires);
+            this.sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, approval_seq)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, credId, current.client_kind, tokens.accessHash, tokens.refreshHash, familyId, current.name, current.machine_id, current.actor, current.granted_scopes, current.approved_by_sub, new Date().toISOString(), expires, issuanceSeq);
             this.sql.exec("UPDATE device_pairings SET status = 'consumed' WHERE device_code_hash = ?", deviceCodeHash);
             if (current.client_kind === 'host' && current.machine_id) this.sql.exec('UPDATE machines SET credential_id = ? WHERE id = ?', credId, current.machine_id);
             return { expires, scopes: JSON.parse(current.granted_scopes) as string[], machineId: current.machine_id ?? null };
@@ -781,7 +842,16 @@ export class Hub extends DurableObject {
               if (machineId && !existing?.machine_id) this.sql.exec("UPDATE agents SET machine_id = ? WHERE tag = ? AND COALESCE(project,'') = COALESCE(?,'')", machineId, address.tag, project);
               this.sql.exec('UPDATE device_pairings SET actor = ? WHERE user_code = ?', actor, userCode);
             }
-            this.sql.exec("UPDATE device_pairings SET status = 'approved', approved_by_sub = ?, granted_scopes = ?, machine_id = ? WHERE user_code = ?", session.sub, JSON.stringify(parsedGranted), machineId, userCode);
+            // R5 R2: operator approval originates stable server-owned authority.
+            // Each host approval mints a strictly increasing per-machine integer
+            // in this same transaction, independent of pairing creation order,
+            // issuance/consumption order, client body and clocks. Replay of an
+            // approved pairing returns Already processed above; no new seq.
+            let approvalSeq: number | null = null;
+            if (current.client_kind === 'host' && machineId) {
+              approvalSeq = assignApprovalAuthority(this.sql, machineId);
+            }
+            this.sql.exec("UPDATE device_pairings SET status = 'approved', approved_by_sub = ?, granted_scopes = ?, machine_id = ?, approved_seq = ? WHERE user_code = ?", session.sub, JSON.stringify(parsedGranted), machineId, approvalSeq, userCode);
             return Response.json({ status: 'approved', machine_id: machineId });
           });
         }
@@ -827,9 +897,23 @@ export class Hub extends DurableObject {
           } else {
             this.sql.exec(`
               INSERT INTO credentials
-              (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, registry_actor)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `, newId, cred.kind, accessHash, newRefreshHash, cred.family_id, cred.subject, cred.machine_id, cred.actor, cred.scopes, cred.created_by_sub, now, cred.expires_at, cred.registry_actor ?? null);
+              (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, registry_actor, approval_seq)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `, newId, cred.kind, accessHash, newRefreshHash, cred.family_id, cred.subject, cred.machine_id, cred.actor, cred.scopes, cred.created_by_sub, now, cred.expires_at, cred.registry_actor ?? null, cred.approval_seq ?? null);
+
+            // Host-enrollment continuity (from f20; M9 metrics-row migration
+            // omitted: those tables do not exist in this tree): atomically
+            // rotate the host machine binding only when it still belongs to
+            // the validated predecessor. Stale/foreign/rebound or
+            // deleted/re-enrolled families must never overwrite a new
+            // registration; a legitimate refresh keeps its binding so its
+            // subsequent register calls still pass the owner CAS.
+            if (cred.kind === 'host' && typeof cred.machine_id === 'string' && cred.machine_id) {
+              this.sql.exec(
+                'UPDATE machines SET credential_id = ? WHERE id = ? AND credential_id = ?',
+                newId, cred.machine_id, cred.id
+              );
+            }
 
             scopesResponse = JSON.parse(cred.scopes).join(' ');
             expiresAtResponse = cred.expires_at;
@@ -1250,6 +1334,39 @@ export class Hub extends DurableObject {
         await this.ctx.storage.setAlarm(Math.max(Date.now(), nextAlarm));
       } catch {}
     }
+  }
+
+  /** M12e session control auth (narrow seam, owned by platform-session-api-r2):
+   * identical to the intake mount: mixed-authority refusal, bus credentials,
+   * narrow operator-token fallback, cookie session actor fix. */
+  private async sessionControlAuth(request: Request) {
+    if (request.headers.has('Authorization') && request.headers.has('Cookie')) return { error: Response.json({ error: 'mixed_authority' }, { status: 403 }) };
+    const auth = await this.authenticateBusRequest(request);
+    // The existing operator token can administer sessions through the public CLI.
+    // Cookie requests stay on the existing session/CSRF path; no agent scope changes.
+    if (auth.error && !request.headers.has('Cookie') && validSessionSecret(this.env)) {
+      const header = request.headers.get('Authorization') || '';
+      const token = /^Bearer ([^\s]{1,4096})$/.exec(header)?.[1];
+      if (token) {
+        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token));
+        const given = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+        // A failed registered credential never upgrades to operator authority.
+        if (this.sql.exec('SELECT id FROM credentials WHERE token_hash=?', base64url(digest)).toArray().length) return auth;
+        const configured = adminTokenHash(this.env);
+        if (configured) {
+          let difference = 0;
+          for (let i = 0; i < configured.length; i++) difference |= given.charCodeAt(i) ^ configured.charCodeAt(i);
+          if (difference === 0) return { caller: { kind: 'human' as const, isAdmin: true,
+            actor: 'human:' + tokenAdminSubject(configured) }, scopes: ['admin'] };
+        }
+      }
+    }
+    if (auth.caller?.kind === 'human' && !auth.caller.tokenId) {
+      const session = await getSession(this.env, request);
+      if (!session) return { error: Response.json({ error: 'unauthorized' }, { status: 401 }) };
+      auth.caller.actor = 'human:' + session.sub;
+    }
+    return auth;
   }
 
   private async authenticateBusRequest(request: Request): Promise<{ caller?: CallerContext; scopes?: string[]; error?: Response }> {

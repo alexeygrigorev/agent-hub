@@ -2,6 +2,7 @@ import { SqlStorage, DurableObjectState } from "@cloudflare/workers-types";
 import { Env } from './env';
 import { verifyBearerScope } from './auth/token';
 import { getSession, verifyCsrf } from './auth/session';
+import { approvalAuthorityMatches } from './host_enrollment';
 
 async function safeJson(req: Request): Promise<any> {
   if (!req.body) return null;
@@ -166,8 +167,20 @@ export async function handleRegistryRoutes(
   path: string,
   sql: SqlStorage,
   ctx: Pick<DurableObjectState, 'acceptWebSocket'>,
-  env: Env
+  env: Env,
+  txn?: <T>(fn: () => T) => T
 ): Promise<Response | null> {
+  // Synchronous-after-last-await sections below never yield, so no concurrent
+  // request or Promise continuation can interleave between the final live
+  // authority read and the guarded mutation. Where the platform offers an
+  // atomic block it is used; otherwise the conditional UPDATE is the
+  // compare-and-swap and denial mutates nothing.
+  const runInTxn = <T>(fn: () => T): T => {
+    const storage = (ctx as unknown as { storage?: { transactionSync?: <U>(fn: () => U) => U } })?.storage;
+    if (txn) return txn(fn);
+    if (storage && typeof storage.transactionSync === 'function') return storage.transactionSync(fn);
+    return fn();
+  };
   if (path === '/api/machines/register') {
     if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
     const cred = await verifyBearerScope(sql, request.headers.get('Authorization'), 'host', { kind: 'host' });
@@ -193,14 +206,82 @@ export async function handleRegistryRoutes(
     const capJson = JSON.stringify(capabilities);
     if (rolesJson.length > 4096 || capJson.length > 4096) return Response.json({ error: 'payload_too_large' }, { status: 400 });
 
-    sql.exec(`
-      UPDATE machines 
-      SET hostname = ?, os = ?, network = ?, roles = ?, capabilities = ?, credential_id = ?
-      WHERE id = ?
-    `, hostname, os, network, rolesJson, capJson, cred.id, cred.machine_id);
+    // Host-enrollment authority (R5 R2 prerequisite, ported from
+    // f20b35a60af2de17c91303dd317da70b44f56174 without M9 metrics parts).
+    // Crypto preparation (verifyBearerScope's token hash) already happened
+    // asynchronously above; every live check below is SYNCHRONOUS inside the
+    // same atomic block as the mutation — no awaited re-verifier sits
+    // between the final authority read and the write, so a revocation,
+    // expiry, refresh rotation or re-enrollment racing the streamed body is
+    // honored instead of writing with stale authorization. Denial mutates
+    // nothing (no metrics/receipt side effects live on this surface).
+    const presentedId = cred.id as string;
+    return runInTxn(() => {
+      // Fresh sync storage authority: the presenting token's live row, by
+      // server-issued id (never by client body), re-read after the body.
+      const live = sql.exec('SELECT * FROM credentials WHERE id = ?', presentedId).toArray()[0] as any;
+      if (!live || live.revoked_at) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+      if (!Number.isFinite(Date.parse(live.expires_at)) || Date.parse(live.expires_at) <= Date.now()) {
+        return Response.json({ error: 'Unauthorized' }, { status: 401 });
+      }
+      if (live.kind !== 'host') return Response.json({ error: 'Unauthorized' }, { status: 401 });
+      let liveScopes: unknown;
+      try { liveScopes = typeof live.scopes === 'string' ? JSON.parse(live.scopes) : live.scopes; } catch { liveScopes = null; }
+      if (!Array.isArray(liveScopes) || !(liveScopes as unknown[]).includes('host')) {
+        return Response.json({ error: 'Unauthorized' }, { status: 401 });
+      }
+      const machineId = live.machine_id as string;
+      if (!machineId) return Response.json({ error: 'Unauthorized' }, { status: 401 });
 
-    // machine_id comes only from the presented credential, never from the body
-    return Response.json({ status: 'registered', machine_id: cred.machine_id });
+      // A superseded refresh family must not reclaim a newer machine
+      // registration. Registration may only confirm the caller's own live
+      // binding (same-credential re-registration, including the binding just
+      // established by this credential's own admin-approved device issuance)
+      // or claim an unbound machine. Takeover of a live foreign binding is
+      // the device-pairing authority's job (approve + token issuance sets the
+      // binding); the register surface never performs it. A revoked
+      // predecessor is denied even for an unbound machine; the current
+      // refresh descendant still bootstraps with its live credential.
+      const current = sql.exec('SELECT id, credential_id, approval_seq FROM machines WHERE id = ?', machineId).toArray()[0] as any;
+      if (!current) return Response.json({ error: 'unknown_machine' }, { status: 404 });
+      if (
+        typeof current.credential_id === 'string' &&
+        current.credential_id !== '' &&
+        current.credential_id !== live.id
+      ) {
+        return Response.json({ error: 'forbidden', reason: 'stale_machine_binding' }, { status: 403 });
+      }
+      // Defense in depth: the credential's enrollment authority must still
+      // match the machine's current authority for non-owners (new authority,
+      // unbound bootstrap and takeover attempts). The currently bound owner is
+      // exempt: routine re-registration continues while a later approval is
+      // still pending, until a new valid issuance actually replaces the binding
+      // (approval witness and bound owner are distinct). A delayed older
+      // approved family (or its refresh descendants) that somehow holds a live
+      // credential can never reclaim the machine. NULL on either side is
+      // pre-migration legacy or unbound bootstrap and skips the check; the
+      // binding CAS above remains the decider there.
+      const isBoundOwner = current.credential_id === live.id;
+      if (!isBoundOwner && !approvalAuthorityMatches(live.approval_seq, current.approval_seq)) {
+        return Response.json({ error: 'forbidden', reason: 'stale_machine_binding' }, { status: 403 });
+      }
+
+      const registered = sql.exec(`
+        UPDATE machines
+        SET hostname = ?, os = ?, network = ?, roles = ?, capabilities = ?, credential_id = ?
+        WHERE id = ? AND (credential_id IS NULL OR credential_id = '' OR credential_id = ?)
+      `, hostname, os, network, rolesJson, capJson, live.id, machineId, live.id);
+      if (registered.rowsWritten !== 1) {
+        const raced = sql.exec('SELECT credential_id FROM machines WHERE id = ?', machineId).toArray()[0] as any;
+        if (!raced) return Response.json({ error: 'unknown_machine' }, { status: 404 });
+        if (raced.credential_id !== live.id) {
+          return Response.json({ error: 'forbidden', reason: 'stale_machine_binding' }, { status: 403 });
+        }
+      }
+
+      // machine_id comes only from the presented credential, never from the body
+      return Response.json({ status: 'registered', machine_id: machineId });
+    });
   }
 
   if (path === '/api/machines/available') {

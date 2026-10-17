@@ -1,0 +1,302 @@
+"""Hub session orchestration client (M12e). Prompts are data; this client never executes them.
+
+Public HTTP surface only: talks to /api/sessions* and /api/session-commands/*
+with the existing token/device credentials. Native execution belongs to the
+sibling host worker; this module performs no native effects and imports no
+native adapters. See docs/SESSION-CONTROL.md (proposal, pending head ACK).
+"""
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from . import api, auth, config
+
+MAX_REQUEST = 32768
+MAX_BRIEF = 8192
+MAX_BODY = 16384
+TIERS = ('quick', 'daily', 'deep')
+WAIT_DEFAULT_TIMEOUT = 300.0
+WAIT_MAX_TIMEOUT = 600.0
+WAIT_MIN_INTERVAL = 1.0
+# Terminal command states: only these confirm an outcome. `transported` alone
+# is fetch/PTY bytes, never processing proof; waiting never treats it as done.
+TERMINAL_COMMAND = ('acked', 'refused', 'uncertain')
+TERMINAL_SESSION = ('running', 'stopped', 'failed', 'refused', 'held', 'uncertain')
+
+
+def request(method, path, payload=None):
+    cfg = config.load_config()
+    base = os.environ.get('HUB_URL') or os.environ.get('HUB_BASE_URL') or cfg.get('base_url')
+    api.check_url(base)
+    data = json.dumps(payload, ensure_ascii=False).encode('utf-8') if payload is not None else None
+    if data is not None and len(data) > MAX_REQUEST:
+        raise ValueError('Session request exceeds capacity')
+    env_token = os.environ.get('HUB_TOKEN') or os.environ.get('HUB_JOB_TOKEN')
+    token = env_token or auth.get_access_token()
+
+    def send(access):
+        req = urllib.request.Request(base.rstrip('/') + path, data=data, method=method,
+                                     headers={'Authorization': 'Bearer ' + access, 'Content-Type': 'application/json'})
+        return api.safe_http_json(req)
+
+    def failure(exc):
+        # Surface the server error code alongside the status so the receiver
+        # can classify terminal vs retryable 409s (claim_expired may heal
+        # after the sweep; proof_replayed never heals). Best-effort: an
+        # unreadable body keeps the status-only form.
+        name = ''
+        try:
+            raw = exc.read(4096) if hasattr(exc, 'read') else b''
+            data = json.loads((raw or b'').decode('utf-8', 'replace'))
+            err = data.get('error') if isinstance(data, dict) else None
+            if isinstance(err, str) and err and len(err) <= 64 and err.replace('_', '').isalnum():
+                name = ' (%s)' % err
+        except Exception:
+            name = ''
+        return ValueError('Session HTTP request failed with status %d%s' % (exc.code, name))
+
+    try:
+        return send(token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401 and not env_token:
+            auth.refresh_token()
+            try:
+                return send(auth.get_access_token())
+            except urllib.error.HTTPError as retry:
+                raise failure(retry) from None
+        raise failure(exc) from None
+
+
+def read_file(path, limit=MAX_BODY):
+    if path == '-':
+        raw = sys.stdin.buffer.read(limit + 1)
+    else:
+        with Path(path).open('rb') as stream:
+            raw = stream.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError('Input exceeds capacity')
+    return raw.decode('utf-8')
+
+
+def add_wait(parser):
+    parser.add_argument('--wait', action='store_true',
+                        help='Poll until a terminal state (bounded); never claims transport as delivery')
+    parser.add_argument('--timeout', type=float, default=WAIT_DEFAULT_TIMEOUT,
+                        help='Max seconds to wait (1..600, default 300)')
+    parser.add_argument('--interval', type=float, default=5.0,
+                        help='Seconds between polls (min 1)')
+
+
+def check_wait_args(args):
+    if getattr(args, 'wait', False):
+        timeout = float(getattr(args, 'timeout', WAIT_DEFAULT_TIMEOUT))
+        interval = float(getattr(args, 'interval', 5.0))
+        if not 1 <= timeout <= WAIT_MAX_TIMEOUT:
+            raise ValueError('Timeout must be between 1 and 600 seconds')
+        if interval < WAIT_MIN_INTERVAL:
+            raise ValueError('Interval must be at least 1 second')
+        return timeout, interval
+    return None, None
+
+
+def wait_until(deadline, interval, fetch, done, label):
+    while True:
+        result = fetch()
+        if done(result):
+            return result
+        if time.monotonic() >= deadline:
+            raise ValueError('%s timed out; re-check status with the same key, do not blind-retry' % label)
+        time.sleep(interval)
+
+
+def wait_for_session(session_id, timeout, interval):
+    deadline = time.monotonic() + timeout
+    return wait_until(deadline, interval,
+                     lambda: request('GET', '/api/sessions/' + session_id),
+                     lambda view: view.get('state') in TERMINAL_SESSION,
+                     'Session wait')
+
+
+def wait_for_command(session_id, command_id, timeout, interval):
+    deadline = time.monotonic() + timeout
+
+    def fetch():
+        # Bounded complete pagination: commands past the first page (e.g.
+        # command #101) live behind next_cursor; follow it instead of
+        # failing on page one. Capped pages keep the wait bounded.
+        from urllib.parse import quote
+        cursor = None
+        for _ in range(10):
+            path = '/api/sessions/' + session_id + '/commands?limit=100'
+            if cursor:
+                path += '&cursor=' + quote(cursor, safe='')
+            listing = request('GET', path)
+            for entry in listing.get('commands', []):
+                if entry.get('id') == command_id:
+                    return entry
+            cursor = listing.get('next_cursor')
+            if not cursor:
+                break
+        raise ValueError('Command missing from server listing; reconcile before retrying')
+
+    return wait_until(deadline, interval,
+                     fetch,
+                     lambda entry: entry.get('state') in TERMINAL_COMMAND,
+                     'Command wait')
+
+
+def add_commands(sub):
+    root = sub.add_parser('sessions', help='Hub session orchestration: list/start/send/capture/stop with confirmed delivery')
+    commands = root.add_subparsers(dest='sessions_cmd', required=True)
+    listing = commands.add_parser('list', help='List sessions visible to this credential')
+    listing.add_argument('--state')
+    listing.add_argument('--limit', type=int, default=50)
+    start = commands.add_parser('start', help='Record a start intent; placement reuses existing fleet routing')
+    start.add_argument('--engine')
+    start.add_argument('--machine')
+    start.add_argument('--workspace', required=True)
+    start.add_argument('--tier', choices=TIERS)
+    start.add_argument('--cwd')
+    mode = start.add_mutually_exclusive_group()
+    mode.add_argument('--brief-file', help='UTF-8 goal file for headless work (max 8 KiB)')
+    mode.add_argument('--interactive', action='store_true', help='Start at an empty native prompt')
+    start.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
+    add_wait(start)
+    send = commands.add_parser('send', help='Enqueue one prompt delivery on a bound session')
+    send.add_argument('id')
+    send.add_argument('--body-file', required=True, help='UTF-8 prompt file, or - for stdin (max 16 KiB)')
+    send.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
+    add_wait(send)
+    capture = commands.add_parser('capture', help='Enqueue one bounded sanitized capture on a bound session')
+    capture.add_argument('id')
+    capture.add_argument('--max-bytes', type=int, default=65536)
+    capture.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
+    add_wait(capture)
+    stop = commands.add_parser('stop', help='Enqueue stop; the hub releases capacity only on confirmed native exit')
+    stop.add_argument('id')
+    stop.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
+    add_wait(stop)
+    show = commands.add_parser('show', help='Show one session with its binding state')
+    show.add_argument('id')
+    history = commands.add_parser('commands', help='List durable commands with recorded/transported/acked states')
+    history.add_argument('id')
+    receive = commands.add_parser('host-receive', help='Bounded host receiver: poll offers, claim, execute, ack (no daemon; Fleet-owned start rejected)')
+    receive.add_argument('--once', action='store_true', required=True,
+                         help='Run exactly one bounded poll cycle and exit')
+    receive.add_argument('--machine-id', required=True, help='Enrolled host machine label (must match host credential)')
+    receive.add_argument('--actor', help='Canonical bus actor for local custody journal (default machine:<machine-id>)')
+    receive.add_argument('--credential-family', help='Local custody family label (default host:<machine-id>; server enforces the real family)')
+    receive.add_argument('--journal-dir', help='Absolute journal directory (default .local/session/host-receiver under repo cwd)')
+    receive.add_argument('--aplexer-bin', default='aplexer', help='Native executable (default aplexer)')
+    receive.add_argument('--limit', type=int, default=20, help='Max offers per cycle (1..20)')
+    receive.add_argument('--sender-workspace', default=None, help='Pinned authorized native sender workspace for replyable sends (default: receiver own whoami workspace)')
+
+
+def execute(args):
+    import uuid
+    cmd = getattr(args, 'sessions_cmd', None)
+    if cmd == 'list':
+        wanted = getattr(args, 'state', None)
+        limit = int(getattr(args, 'limit', None) or 50)
+        if not wanted:
+            params = ''
+            if getattr(args, 'limit', None):
+                params = '?limit=%d' % limit
+            return request('GET', '/api/sessions' + params)
+        # State-filtered listing follows next_cursor (bounded, id-deduped) so
+        # filtering is complete instead of first-page-only.
+        from urllib.parse import quote
+        seen: list = []
+        known: set = set()
+        cursor = None
+        for _ in range(10):
+            path = '/api/sessions?limit=%d' % limit
+            if cursor:
+                path += '&cursor=' + quote(cursor, safe='')
+            page = request('GET', path)
+            for entry in page.get('sessions', []):
+                if entry.get('id') in known:
+                    continue
+                known.add(entry.get('id'))
+                if entry.get('state') == wanted:
+                    seen.append(entry)
+                    if len(seen) >= limit:
+                        return {'sessions': seen[:limit], 'next_cursor': None}
+            cursor = page.get('next_cursor')
+            if not cursor:
+                break
+        return {'sessions': seen[:limit], 'next_cursor': None}
+    if cmd == 'show':
+        return request('GET', '/api/sessions/' + args.id)
+    if cmd == 'commands':
+        return request('GET', '/api/sessions/' + args.id + '/commands')
+    if cmd == 'start':
+        key = getattr(args, 'key', None) or str(uuid.uuid4())
+        payload = {'key': key, 'workspace': args.workspace}
+        for field in ('engine', 'machine', 'tier', 'cwd'):
+            value = getattr(args, field, None)
+            if value:
+                payload[field] = value
+        payload['mode'] = 'interactive' if getattr(args, 'interactive', False) else 'headless'
+        if getattr(args, 'brief_file', None):
+            if payload['mode'] == 'interactive':
+                raise ValueError('Interactive sessions start at an empty native prompt')
+            payload['brief'] = read_file(args.brief_file, MAX_BRIEF)
+        try:
+            created = request('POST', '/api/sessions', payload)
+        except ValueError as exc:
+            # Lost-response reconciliation: the key decides replay vs conflict,
+            # never an unkeyed retry.
+            raise ValueError('%s (reconcile with --key %s via show/commands)' % (exc, key)) from None
+        created = dict(created, client_key=key)
+        timeout, interval = check_wait_args(args)
+        if timeout is not None:
+            created['binding_wait'] = wait_for_session(created['id'], timeout, interval)
+        return created
+    if cmd in ('send', 'capture', 'stop'):
+        key = getattr(args, 'key', None) or str(uuid.uuid4())
+        if cmd == 'send':
+            payload = {'key': key, 'body': read_file(args.body_file)}
+        elif cmd == 'capture':
+            payload = {'key': key, 'max_bytes': args.max_bytes}
+        else:
+            payload = {'key': key}
+        try:
+            queued = request('POST', '/api/sessions/' + args.id + '/' + cmd, payload)
+        except ValueError as exc:
+            raise ValueError('%s (reconcile with --key %s via commands)' % (exc, key)) from None
+        queued = dict(queued, client_key=key)
+        timeout, interval = check_wait_args(args)
+        if timeout is not None:
+            if cmd == 'stop':
+                queued['stop_wait'] = wait_for_session(args.id, timeout, interval)
+            else:
+                queued['command_wait'] = wait_for_command(args.id, queued['command_id'], timeout, interval)
+        return queued
+    if cmd == 'host-receive':
+        if not getattr(args, 'once', False):
+            raise ValueError('host-receive runs one bounded cycle only; pass --once')
+        machine_id = getattr(args, 'machine_id', None)
+        if not isinstance(machine_id, str) or not machine_id:
+            raise ValueError('--machine-id is required')
+        limit = int(getattr(args, 'limit', 20) or 20)
+        if not 1 <= limit <= 20:
+            raise ValueError('--limit must be 1..20')
+        actor = getattr(args, 'actor', None) or ('machine:' + machine_id)
+        family = getattr(args, 'credential_family', None) or ('host-' + machine_id)
+        journal_dir = getattr(args, 'journal_dir', None)
+        if not journal_dir:
+            journal_dir = os.path.join(os.getcwd(), '.local', 'session', 'host-receiver')
+        from .session_executor import CallerCustody
+        from .session_receiver import receive_once
+        custody = CallerCustody(actor=actor, machine_id=machine_id,
+                                credential_family=family).validated()
+        return receive_once(custody=custody, journal_dir=journal_dir,
+                            executable=getattr(args, 'aplexer_bin', 'aplexer') or 'aplexer',
+                            request=request, limit=limit,
+                            sender_workspace=getattr(args, 'sender_workspace', None))
+    raise ValueError('Unknown sessions command')

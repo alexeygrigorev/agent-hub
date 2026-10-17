@@ -221,6 +221,31 @@ def collect_subscriptions(settings, runner=run_json):
     return reports
 
 
+def resolve_offer_cwd(workspace: Path, cwd: object) -> Path:
+    """Resolve a hub launch offer cwd against the workspace root.
+
+    ``None`` (or ``'.'``) means the workspace root itself. Anything else must
+    be a workspace-relative confined path; it is resolved with symlink
+    confinement and must stay inside the workspace root, else the offer is
+    refused with no native effect. The resolved absolute path is what reaches
+    the native start adapter and what catalog verification compares.
+    """
+    if cwd is None or cwd == '.':
+        return workspace
+    if not isinstance(cwd, str) or not cwd or len(cwd) > 256 or cwd.startswith('/') \
+            or '\\' in cwd or ':' in cwd or '\x00' in cwd:
+        raise ValueError('Offer cwd is not a workspace-relative path')
+    parts = cwd.split('/')
+    if any(not seg or seg in ('.', '..') or len(seg) > 64 or not all(c.isalnum() or c in '._-' for c in seg) for seg in parts):
+        raise ValueError('Offer cwd escapes or is malformed')
+    candidate = (workspace.joinpath(*parts)).resolve(strict=False)
+    try:
+        candidate.relative_to(workspace)
+    except ValueError:
+        raise ValueError('Offer cwd escapes the workspace root') from None
+    return candidate
+
+
 def _ms_to_iso(value):
     """aplexer reports epoch milliseconds; anything else is unknown rather than guessed."""
     if type(value) is not int or value <= 0:
@@ -240,6 +265,7 @@ def session_metadata(raw, settings):
         clean.append({"native_id": session["id"], "tag": session["tag"], "workspace": session.get("workspace", ""), "engine": engine,
                       "profile": profile, "account": matches[0]["account_label"] if len(matches) == 1 else None,
                       "phase": session.get("phase", "unknown"), "agent_state": session.get("reported_state"),
+                      "cwd": session.get("cwd") if isinstance(session.get("cwd"), str) else None,
                       "last_activity_at": _ms_to_iso(session.get("last_activity_ms"))})
     return clean
 
@@ -257,6 +283,31 @@ class Dispatcher:
         if not sub.get("admission_argv"):
             raise ValueError("Maintained fresh admission adapter is not configured")
         return sub
+
+    def _verify_native_cwd(self, native, native_id, target_cwd, receipt):
+        """Confirm the started session's actual catalog cwd (receipt then list).
+
+        The start receipt carries the effective cwd when the native CLI
+        reports it; otherwise the live catalog is scanned for the new native
+        id. Either must equal the resolved offer cwd — the hub never claims an
+        executed cwd it cannot see.
+        """
+        if not isinstance(native_id, str) or not native_id:
+            return False
+        receipt_cwd = receipt.get("cwd") if isinstance(receipt, dict) else None
+        if isinstance(receipt_cwd, str) and receipt_cwd:
+            return receipt_cwd == str(target_cwd)
+        try:
+            rows = self.runner([native, "list", "--json"])
+        except Exception:
+            return False
+        rows = rows if isinstance(rows, list) else (rows.get("sessions") if isinstance(rows, dict) else None)
+        if not isinstance(rows, list):
+            return False
+        for row in rows:
+            if isinstance(row, dict) and str(row.get("id", "")).lower() == native_id.lower():
+                return row.get("cwd") == str(target_cwd)
+        return False
 
     def dispatch(self, offer):
         sub = self._route(offer)
@@ -280,7 +331,12 @@ class Dispatcher:
         except Exception:
             raise ValueError("Fresh admission timestamp required") from None
         mode = offer.get("mode")
+        # The offer workspace is a LABEL, not a path: map it through the
+        # operator-configured workspaces (label -> real local directory),
+        # exactly as _route validated above. A literal offer string must
+        # never become a filesystem path (label "demo" is not ./demo).
         workspace = Path(self.settings["workspaces"][offer["workspace"]]).resolve(strict=True)
+        target_cwd = resolve_offer_cwd(workspace, offer.get("cwd"))
         native = self.settings.get("aplexer_bin", "aplexer")
         if mode == "interactive":
             if offer.get("prompt"):
@@ -288,6 +344,8 @@ class Dispatcher:
             argv = [native, "start", "--workspace", str(workspace), "--tag", "hub-" + offer["id"], "--engine", offer["engine"], "--memory", "1500M", "--pids", "256", "--json"]
             if offer.get("profile"):
                 argv += ["--profile", offer["profile"]]
+            if target_cwd != workspace:
+                argv += ["--cwd", str(target_cwd)]
             cwd = None
         elif mode == "headless":
             launcher = self.settings.get("launcher", {})
@@ -300,8 +358,8 @@ class Dispatcher:
             result_path = workspace / '.local' / 'hub-results' / (offer['id'] + '.json')
             if offer.get('task_id'):
                 result_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                goal += '\nWrite a final JSON object to ' + str(result_path) + ': {"status":"done|failed|waiting-on-human|stuck","report":"sanitized final report","artifacts":[{"name":"label","text":"sanitized text"}]}. No secrets, codes, tokens or URLs. Do not write raw screenshots; keep them private locally for human review.'
-            payload = {"goal": goal, "owner": "hub-fleet", "cwd": str(workspace), "timeout": 1800,
+                goal += '\nWrite a final JSON object to ' + str(result_path) + ': {"status":"done|failed|waiting-on-human|stuck","report":"sanitized final report","artifacts":[{"label":"text","text":"sanitized text"}]}. No secrets, codes, tokens or URLs. Do not write raw screenshots; keep them private for human review locally.'
+            payload = {"goal": goal, "owner": "hub-fleet", "cwd": str(target_cwd), "timeout": 1800,
                        "model_requirements": {"providers": [sub["launcher_provider"]], "models": [sub["launcher_model"]]},
                        "account_label": sub["account_label"], "profile": sub.get("profile")}
             self.runner(prefix + ["submit", "--id", task_id, "--key", task_id, "--payload", json.dumps(payload)], cwd=launcher["root"])
@@ -309,7 +367,7 @@ class Dispatcher:
             eligible = plan.get("eligible", [])
             if not isinstance(eligible, list) or not eligible or any(r.get("provider") != sub["launcher_provider"] or r.get("model") != sub["launcher_model"] or r.get("account_label") != sub["account_label"] or r.get("profile") != sub.get("profile") for r in eligible):
                 raise ValueError("Maintained launcher plan refused")
-            argv = prefix + ["run", "--backend", "task-units", "--as-controller", "--id", task_id, "--cwd", str(workspace), "--tmpdir", str(workspace / ".local" / "tmp")]
+            argv = prefix + ["run", "--backend", "task-units", "--as-controller", "--id", task_id, "--cwd", str(target_cwd), "--tmpdir", str(workspace / ".local" / "tmp")]
             cwd = launcher["root"]
         else:
             raise ValueError("Unsupported launch mode")
@@ -322,6 +380,8 @@ class Dispatcher:
                 native_id = receipt.get("id")
                 if receipt.get("workspace") != str(workspace) or receipt.get("tag") != "hub-" + offer["id"] or receipt.get('engine') != offer['engine'] or receipt.get('profile') != offer.get('profile') or receipt.get('phase') != 'running':
                     raise ValueError("Native receipt mismatch")
+                if target_cwd != workspace and not self._verify_native_cwd(native, native_id, target_cwd, receipt):
+                    raise ValueError("Native cwd mismatch")
                 result = {"state": "running", "native_id": native_id}
             else:
                 details = receipt.get("receipt", {})
