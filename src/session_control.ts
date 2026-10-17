@@ -25,6 +25,8 @@ import { redact } from './routing';
 import { taskTier } from './model-routing';
 import { approvalAuthorityMatches } from './host_enrollment';
 import { sha256 } from './auth/crypto';
+import { validateHumanCredentialRecord } from './auth/human-credential';
+import type { Env } from './env';
 import {
   buildLifecycleView,
   classifyKey,
@@ -38,13 +40,14 @@ import {
 export const SESSION_CONTROL_SCHEMA = `
 CREATE TABLE IF NOT EXISTS session_control_sessions (id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, fleet_launch_id TEXT, machine_id TEXT, engine TEXT, mode TEXT NOT NULL, state TEXT NOT NULL, binding_json TEXT, parent_id TEXT, parent_source TEXT, session_type TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
 CREATE TABLE IF NOT EXISTS session_control_commands (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, request_key TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, correlation TEXT NOT NULL, poll_at TEXT, ack_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(session_id, actor, request_key));
+CREATE TABLE IF NOT EXISTS session_control_cancellations (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_control_proofs (reply_envelope_id TEXT PRIMARY KEY, command_id TEXT NOT NULL, session_id TEXT NOT NULL, created_at TEXT NOT NULL);
 `;
 
 type Caller = { kind?: string; actor?: string; isAdmin?: boolean; machineId?: string; tokenId?: string };
 type Auth = { caller?: Caller; scopes?: string[]; error?: Response };
 type ReserveHook = (input: any, auth: Auth) => { value: any; status: number };
-export type SessionControlOptions = { maxPendingCommands?: number; maxSessionCommands?: number; claimTtlMs?: number };
+export type SessionControlOptions = { maxPendingCommands?: number; maxSessionCommands?: number; claimTtlMs?: number; env?: Env };
 
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const UUID_RE = /^[a-f0-9-]{36}$/;
@@ -194,7 +197,7 @@ export class SessionControlService {
     private transaction: <T>(fn: () => T) => T,
     private now: () => number = Date.now,
     private hooks: { reserve?: ReserveHook } = {},
-    options: SessionControlOptions = {},
+    private options: SessionControlOptions = {},
   ) {
     this.maxPending = options.maxPendingCommands ?? 2000;
     this.maxPerSession = options.maxSessionCommands ?? 200;
@@ -252,6 +255,23 @@ export class SessionControlService {
     const expires = Date.parse(cred.expires_at);
     if (!Number.isFinite(expires) || expires <= this.now()) return false;
     return credentialActor(this.sql, cred) !== null;
+  }
+
+  private cancelOwnerLive(row: any, caller: Caller): boolean {
+    if (row.actor !== actorName(caller) || !this.ownerOk(row, caller)) return false;
+    if (caller.kind === 'human') {
+      // Browser bus auth currently collapses users to actor=admin and cannot
+      // establish which human owns a legacy intent. Only a current, explicitly
+      // bound human bearer can authorize this new no-start cancellation path.
+      if (!caller.tokenId) return false;
+      const cred: any = this.sql.exec('SELECT * FROM credentials WHERE id = ?', caller.tokenId).toArray()[0];
+      return validateHumanCredentialRecord(this.sql, this.options.env, cred, this.now())?.actor === caller.actor;
+    }
+    if (caller.kind !== 'agent' || !caller.tokenId) return false;
+    const cred: any = this.sql.exec('SELECT * FROM credentials WHERE id = ?', caller.tokenId).toArray()[0];
+    const scopes = parsed(cred?.scopes, null);
+    return cred?.kind === 'agent' && !cred.revoked_at && Date.parse(cred.expires_at) > this.now() &&
+      Array.isArray(scopes) && scopes.includes('fleet:launch') && credentialActor(this.sql, cred) === caller.actor;
   }
 
   private ownerOk(row: { actor: string; owner_token_id?: string | null; owner_family?: string | null }, caller: Caller): boolean {
@@ -411,7 +431,7 @@ export class SessionControlService {
     const provenance = isObserved ? 'observed_native' : 'canonical_hub';
     const controllability = isObserved
       ? (['running', 'active', 'starting'].includes(row.state) ? 'controllable' : 'historical_read_only')
-      : 'controllable';
+      : row.state === 'cancelled' ? 'historical_read_only' : 'controllable';
     const workspace = binding?.workspace || request?.workspace || null;
     const tag = binding?.tag || request?.tag || null;
     const qualified_alias = workspace && tag ? qualifiedNativeAlias(workspace, tag) : null;
@@ -813,7 +833,7 @@ export class SessionControlService {
           const priorInput = parsed(prior.request_json, {});
           if (!Object.prototype.hasOwnProperty.call(priorInput, 'parent_id')) priorInput.parent_id = null;
           if (JSON.stringify(priorInput) !== canonical) return response({ error: 'idempotency_conflict' }, 409);
-          if (prior.fleet_launch_id) return response({ ...this.view(prior), replay: true });
+          if (prior.fleet_launch_id || prior.state === 'cancelled') return response({ ...this.view(prior), replay: true });
           // A held intent may be placed once capacity/admission recovers; the fleet
           // reserve stays idempotent on its own derived key, so this cannot double-launch.
         }
@@ -1158,7 +1178,7 @@ export class SessionControlService {
       });
     }
 
-    const sessionMatch = /^\/api\/sessions\/([^/]{1,128})(\/(send|capture|stop|commands|binding|retry))?$/.exec(path);
+    const sessionMatch = /^\/api\/sessions\/([^/]{1,128})(\/(send|capture|stop|commands|binding|retry|cancel))?$/.exec(path);
     if (sessionMatch) {
       const rawRef = decodeURIComponent(sessionMatch[1]);
       const sub = sessionMatch[3];
@@ -1180,7 +1200,7 @@ export class SessionControlService {
       } else if (rawRef.includes(':')) {
         if (sub === 'binding') return response({ error: 'not_found' }, 404);
         if ((sub === undefined && request.method !== 'GET') ||
-            (sub !== undefined && !(['send', 'capture', 'stop'].includes(sub) ? request.method === 'POST' : request.method === 'GET'))) {
+            (sub !== undefined && !(['send', 'capture', 'stop', 'cancel'].includes(sub) ? request.method === 'POST' : request.method === 'GET'))) {
           return response({ error: 'not_found' }, 404);
         }
         const resolved = this.resolveSessionByQualifiedAlias(rawRef, caller);
@@ -1193,7 +1213,7 @@ export class SessionControlService {
         // binding path stays strict Hub UUID (no alias).
         if (sub === 'binding') return response({ error: 'not_found' }, 404);
         if ((sub === undefined && request.method !== 'GET') ||
-            (sub !== undefined && !(['send', 'capture', 'stop'].includes(sub) ? request.method === 'POST' : request.method === 'GET'))) {
+            (sub !== undefined && !(['send', 'capture', 'stop', 'cancel'].includes(sub) ? request.method === 'POST' : request.method === 'GET'))) {
           return response({ error: 'not_found' }, 404);
         }
         const resolved = this.resolveSessionByName(rawRef, caller);
@@ -1234,6 +1254,36 @@ export class SessionControlService {
       }
       if (!session || !this.ownerOk(session, caller)) return response({ error: 'not_found' }, 404);
       if (!sub && request.method === 'GET') return response(this.view(session));
+      if (sub === 'cancel' && request.method === 'POST') {
+        const input = await body(request);
+        if (!obj(input, ['key']) || !label(input.key)) return response({ error: 'invalid_cancel' }, 400);
+        return this.transaction(() => {
+          // Body streaming may yield to a retry or credential revocation. Fresh
+          // state and ownership are checked in the same synchronous transaction
+          // as the receipt. Fleet reserve is synchronous in the start txn too:
+          // either placement wins and this refuses, or cancellation fences all
+          // later starts/retries before reserve can be called.
+          const live: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0];
+          if (!writer || !live || !this.cancelOwnerLive(live, caller)) {
+            return response({ error: 'not_found' }, 404);
+          }
+          const prior: any = this.sql.exec('SELECT * FROM session_control_cancellations WHERE session_id = ?', live.id).toArray()[0];
+          if (prior) {
+            if (prior.actor !== actorName(caller) || prior.request_key !== input.key) return response({ error: 'idempotency_conflict' }, 409);
+            return response({ ...this.view(live), cancellation: { key: prior.request_key, created_at: prior.created_at, effect: 'no_native_start' }, replay: true });
+          }
+          const pending = this.sql.exec('SELECT id FROM session_control_commands WHERE session_id = ? LIMIT 1', live.id).toArray();
+          const original = parsed(live.request_json, {});
+          if (live.state !== 'held' || live.fleet_launch_id || live.binding_json || pending.length || original.provenance === 'observed_native') {
+            return response({ error: 'session_not_cancellable' }, 409);
+          }
+          const at = this.at();
+          this.sql.exec('INSERT INTO session_control_cancellations (session_id, actor, request_key, created_at) VALUES (?, ?, ?, ?)', live.id, actorName(caller), input.key, at);
+          this.sql.exec('UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE id = ?', 'cancelled', at, live.id);
+          const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', live.id).toArray()[0];
+          return response({ ...this.view(row), cancellation: { key: input.key, created_at: at, effect: 'no_native_start' }, replay: false });
+        });
+      }
       if (sub === 'retry' && request.method === 'POST') {
         const input = await body(request);
         if (!obj(input, [])) return response({ error: 'invalid_retry' }, 400);

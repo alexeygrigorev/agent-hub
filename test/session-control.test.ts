@@ -1003,3 +1003,163 @@ describe('held placement recovery', () => {
     }, () => ({ status: 409, value: { error: 'account_capacity' } }));
   });
 });
+
+describe('owned held intent cancellation', () => {
+  const start = { key: 'held-cancel-start', name: 'held-fixture', workspace: 'demo', engine: 'codex', mode: 'headless', brief: 'synthetic cancellation fixture' };
+
+  it('records no-start cancellation, replays it, and fences both original start and retry', async () => {
+    const reserve = fakeReserve({ status: 409, error: 'no_capacity' });
+    await fixture(async (s, sql) => {
+      const held = await (await s.handle(request('/api/sessions', start), agent())).json() as any;
+      expect(held.state).toBe('held');
+      const path = '/api/sessions/' + held.id + '/cancel';
+      const named = '/api/sessions/held-fixture/cancel';
+      const first = await s.handle(request(named, { key: 'cancel-once' }), agent());
+      const value = await first.json() as any;
+      expect(first.status).toBe(200);
+      expect(value.state).toBe('cancelled');
+      expect(value.cancellation.effect).toBe('no_native_start');
+      expect(value.binding).toBeNull();
+      expect(value.fleet_launch_id).toBeNull();
+      const replay = await (await s.handle(request(path, { key: 'cancel-once' }), agent())).json() as any;
+      expect(replay.cancellation).toEqual(value.cancellation);
+      expect(replay.replay).toBe(true);
+      expect((await s.handle(request(path, { key: 'different' }), agent())).status).toBe(409);
+      const original = await (await s.handle(request('/api/sessions', start), agent())).json() as any;
+      expect(original.state).toBe('cancelled');
+      expect((await s.handle(request('/api/sessions/' + held.id + '/retry', {}), agent())).status).toBe(409);
+      expect(reserve.calls.length).toBe(1);
+      expect(sql.exec('SELECT id FROM session_control_commands').toArray()).toHaveLength(0);
+    }, reserve.hook);
+  });
+
+  it('refuses Fleet placement, native binding, commands, and non-held states', async () => {
+    await fixture(async (s, sql) => {
+      const held = await (await s.handle(request('/api/sessions', start), agent())).json() as any;
+      const path = '/api/sessions/' + held.id + '/cancel';
+      for (const patch of [
+        { field: 'fleet_launch_id', value: 'real-placement-id' },
+        { field: 'binding_json', value: JSON.stringify(bound()) },
+        { field: 'state', value: 'uncertain' },
+      ]) {
+        sql.exec(`UPDATE session_control_sessions SET ${patch.field} = ? WHERE id = ?`, patch.value, held.id);
+        expect((await s.handle(request(path, { key: 'cancel' }), agent())).status).toBe(409);
+        sql.exec(`UPDATE session_control_sessions SET ${patch.field} = ? WHERE id = ?`, patch.field === 'state' ? 'held' : null, held.id);
+      }
+      const at = new Date().toISOString();
+      sql.exec("INSERT INTO session_control_commands (id,session_id,kind,actor,request_key,payload_json,state,generation,correlation,created_at,updated_at) VALUES ('existing',?,'stop','demo:assistant','existing','{}','uncertain',0,'existing',?,?)", held.id, at, at);
+      expect((await s.handle(request(path, { key: 'cancel' }), agent())).status).toBe(409);
+      expect(sql.exec('SELECT * FROM session_control_cancellations').toArray()).toHaveLength(0);
+    });
+  });
+
+  it('requires the current owning actor, including for admins and replay', async () => {
+    await fixture(async (s, sql) => {
+      const held = await (await s.handle(request('/api/sessions', start), agent())).json() as any;
+      const path = '/api/sessions/' + held.id + '/cancel';
+      expect((await s.handle(request(path, { key: 'cancel' }), admin)).status).toBe(404);
+      expect((await s.handle(request(path, { key: 'cancel' }), stranger)).status).toBe(404);
+      expect((await s.handle(request(path, { key: 'cancel', native_id: NATIVE_ID }), agent())).status).toBe(400);
+      expect((await s.handle(request(path, { key: 'cancel' }), agent())).status).toBe(200);
+      sql.exec("UPDATE credentials SET revoked_at = ? WHERE id = 'cred-1'", new Date().toISOString());
+      expect((await s.handle(request(path, { key: 'cancel' }), agent())).status).toBe(404);
+    });
+  });
+
+  it('rechecks placement after a streamed cancellation body yields', async () => {
+    let capacity = false;
+    let placements = 0;
+    const reserve = () => capacity
+      ? { value: { id: 'placed-after-body-yield', state: 'offered', machine: 'hetzner', engine: 'codex' }, status: (++placements, 201) }
+      : { value: { error: 'no_capacity' }, status: 409 };
+    await fixture(async (s, sql) => {
+      const held = await (await s.handle(request('/api/sessions', start), agent())).json() as any;
+      let controller!: ReadableStreamDefaultController<Uint8Array>;
+      const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+      const cancellation = s.handle(new Request('https://hub.test/api/sessions/' + held.id + '/cancel', { method: 'POST', body: stream }), agent());
+      await Promise.resolve();
+      capacity = true;
+      expect((await s.handle(request('/api/sessions/' + held.id + '/retry', {}), agent())).status).toBe(200);
+      controller.enqueue(new TextEncoder().encode('{"key":"cancel-after-yield"}'));
+      controller.close();
+      expect((await cancellation).status).toBe(409);
+      expect(placements).toBe(1);
+      expect(sql.exec('SELECT * FROM session_control_cancellations').toArray()).toHaveLength(0);
+    }, reserve);
+  });
+
+  it('rechecks revoked credentials after a streamed cancellation body yields', async () => {
+    await fixture(async (s, sql) => {
+      const held = await (await s.handle(request('/api/sessions', start), agent())).json() as any;
+      let controller!: ReadableStreamDefaultController<Uint8Array>;
+      const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+      const cancellation = s.handle(new Request('https://hub.test/api/sessions/' + held.id + '/cancel', { method: 'POST', body: stream }), agent());
+      await Promise.resolve();
+      sql.exec("UPDATE credentials SET revoked_at = ? WHERE id = 'cred-1'", new Date().toISOString());
+      controller.enqueue(new TextEncoder().encode('{"key":"revoked-after-yield"}'));
+      controller.close();
+      expect((await cancellation).status).toBe(404);
+      expect(sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', held.id).toArray()[0].state).toBe('held');
+    });
+  });
+});
+
+
+describe('held cancellation current human bearer authority', () => {
+  const auth = { caller: { kind: 'human', isAdmin: true, actor: 'human:cancel-human', tokenId: 'human-cancel-cred' }, scopes: ['admin'] };
+  async function seed(sql: any) {
+    const now = new Date().toISOString();
+    sql.exec('INSERT INTO users (sub,email,is_admin,first_seen_at,last_seen_at) VALUES (?, ?, 1, ?, ?)', 'cancel-human', 'admin@fake.local', now, now);
+    sql.exec(`INSERT INTO credentials (id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at)
+      VALUES ('human-cancel-cred','human','human-cancel-hash','human-cancel-family','admin@fake.local','human:cancel-human','["admin"]','cancel-human',?,?)`, now, new Date(Date.now()+3600000).toISOString());
+  }
+  it('accepts a current human bearer and refuses a collapsed browser admin identity', async () => {
+    await fixture(async (s, sql) => {
+      await seed(sql);
+      const held = await (await s.handle(request('/api/sessions', {key:'human-start',workspace:'demo',mode:'interactive'}), auth)).json() as any;
+      expect((await s.handle(request('/api/sessions/'+held.id+'/cancel',{key:'human-cancel'}), auth)).status).toBe(200);
+      const browserHeld = await (await s.handle(request('/api/sessions', {key:'browser-start',workspace:'demo',mode:'interactive'}), admin)).json() as any;
+      expect((await s.handle(request('/api/sessions/'+browserHeld.id+'/cancel',{key:'browser-cancel'}), admin)).status).toBe(404);
+    }, undefined, {env: env as unknown as Env});
+  });
+  it('refuses human revocation, expiry, disabled user, changed email and removed allowlist after body streaming', async () => {
+    for (const change of ['revoke','expire','disable','email','allowlist']) {
+      const bindings = {...env, HUB_ADMINS: 'admin@fake.local'} as unknown as Env;
+      await fixture(async (s, sql) => {
+        await seed(sql);
+        const held = await (await s.handle(request('/api/sessions', {key:'human-start',workspace:'demo',mode:'interactive'}), auth)).json() as any;
+        let controller!: ReadableStreamDefaultController<Uint8Array>;
+        const stream = new ReadableStream<Uint8Array>({start(value) {controller=value;}});
+        const pending = s.handle(new Request('https://hub.test/api/sessions/'+held.id+'/cancel', {method:'POST',body:stream}), auth);
+        await Promise.resolve();
+        if (change==='revoke') sql.exec("UPDATE credentials SET revoked_at=? WHERE id='human-cancel-cred'", new Date().toISOString());
+        if (change==='expire') sql.exec("UPDATE credentials SET expires_at=? WHERE id='human-cancel-cred'", new Date(0).toISOString());
+        if (change==='disable') sql.exec("UPDATE users SET is_admin=0 WHERE sub='cancel-human'");
+        if (change==='email') sql.exec("UPDATE users SET email='changed@example.com' WHERE sub='cancel-human'");
+        if (change==='allowlist') { bindings.HUB_ADMINS=''; bindings.HUB_ADDITIONAL_ADMINS=''; }
+        controller.enqueue(new TextEncoder().encode('{"key":"human-cancel"}'));controller.close();
+        expect((await pending).status, change).toBe(404);
+        expect(sql.exec('SELECT state FROM session_control_sessions WHERE id=?', held.id).toArray()[0].state).toBe('held');
+      }, undefined, {env:bindings});
+    }
+  });
+});
+
+
+describe('held cancellation current agent binding and scope', () => {
+  it('refuses scope removal after body streaming', async () => {
+    for (const change of ['scopes']) {
+      await fixture(async (s, sql) => {
+        const held = await (await s.handle(request('/api/sessions', {key:'agent-held',workspace:'demo',mode:'interactive'}), agent())).json() as any;
+        let controller!: ReadableStreamDefaultController<Uint8Array>;
+        const stream = new ReadableStream<Uint8Array>({start(value) {controller=value;}});
+        const pending = s.handle(new Request('https://hub.test/api/sessions/'+held.id+'/cancel', {method:'POST',body:stream}), agent());
+        await Promise.resolve();
+        if (change==='scopes') sql.exec("UPDATE credentials SET scopes='[]' WHERE id='cred-1'");
+        controller.enqueue(new TextEncoder().encode('{"key":"agent-cancel"}'));controller.close();
+        expect((await pending).status,change).toBe(404);
+        expect(sql.exec('SELECT state FROM session_control_sessions WHERE id=?',held.id).toArray()[0].state).toBe('held');
+      });
+    }
+  });
+});

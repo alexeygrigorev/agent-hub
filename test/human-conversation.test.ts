@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { env, runInDurableObject } from 'cloudflare:test';
+import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { Hub, BaseHub } from '../src/conversation-hub';
 import type { Env } from '../src/env';
 import { createSessionCookie, tokenAdminSubject, TOKEN_ADMIN_EMAIL } from '../src/auth/session';
@@ -871,5 +871,30 @@ describe('Human CLI Conversation Integration (test/human-conversation.test.ts)',
       expect(redactedListData.links[0].target.available).toBe(false);
       expect(redactedListData.links[0].target.canonical_status).toBeNull();
     });
+  });
+});
+
+
+describe('Human bearer through the deployed Worker entrypoint', () => {
+  it('uses the actual bound Hub instance for current Google bearer requests', async () => {
+    const bindings = env as unknown as Env;
+    const stub = bindings.HUB.get(bindings.HUB.idFromName('hub'));
+    const token = 'entrypoint-human-bearer-' + crypto.randomUUID();
+    const sub = 'entrypoint-human-' + crypto.randomUUID();
+    await runInDurableObject(stub, async (hub: BaseHub) => {
+      const now = new Date().toISOString();
+      hub.sql.exec('INSERT INTO users (sub, email, is_admin, first_seen_at, last_seen_at) VALUES (?, ?, 1, ?, ?)',
+        sub, 'admin@fake.local', now, now);
+      await insertHumanBearerCredential(hub.sql, {
+        id: 'entrypoint-cred-' + sub, token, sub, email: 'admin@fake.local',
+      });
+    });
+    const headers = { Authorization: 'Bearer ' + token };
+    const me = await SELF.fetch('https://hub.test/api/auth/me', { headers });
+    expect(me.status, await me.text()).toBe(200);
+    const participants = await SELF.fetch('https://hub.test/api/conversations/participants', { headers });
+    const data = await participants.json() as any;
+    expect(participants.status, JSON.stringify(data)).toBe(200);
+    expect(data.self.actor).toBe('human:' + sub);
   });
 });

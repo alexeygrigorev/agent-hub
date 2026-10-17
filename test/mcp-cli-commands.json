@@ -52,6 +52,7 @@
   "run",
   "send",
   "sessions",
+  "sessions cancel",
   "sessions capture",
   "sessions cleanup",
   "sessions commands",

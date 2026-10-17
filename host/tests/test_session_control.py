@@ -18,6 +18,18 @@ class TestSessionControlCli(unittest.TestCase):
     def parse(self, *args):
         return parser().parse_args(['sessions', *args])
 
+    def test_cancel_held_intent_uses_a_stable_key_without_native_stop(self):
+        with patch.object(session_control, 'request', return_value={'state': 'cancelled'}) as transport:
+            result = session_control.execute(self.parse('cancel', 'held-fixture', '--key', 'cancel-once'))
+        self.assertEqual(result['state'], 'cancelled')
+        transport.assert_called_once_with('POST', '/api/sessions/held-fixture/cancel', {'key': 'cancel-once'})
+        with patch.object(session_control, 'request') as transport:
+            with self.assertRaises(ValueError):
+                session_control.execute(self.parse('cancel', '../other', '--key', 'cancel-once'))
+            with self.assertRaises(ValueError):
+                session_control.execute(self.parse('cancel', 'held-fixture', '--key', 'invalid/key'))
+        transport.assert_not_called()
+
     def test_stop_wait_does_not_accept_running(self):
         with patch.object(session_control, 'request', side_effect=[{'state': 'running'}, {'state': 'stopped'}]) as fetch, patch.object(session_control.time, 'sleep'):
             result = session_control.wait_for_session('s', 10, 1, stopping=True)

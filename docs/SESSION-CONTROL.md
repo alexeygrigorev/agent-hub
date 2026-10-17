@@ -500,3 +500,23 @@ independently verified and all current custody, obligation and Git guards pass.
 Its capture time, native finish time and later evidence-read time stay distinct.
 Absent or corrupt evidence still retains the worktree. This does not recover
 history for sessions that retired before any capture was archived.
+
+
+## Cancel an unused held intent
+
+`hub sessions cancel SESSION --key STABLE_KEY` cancels your own held start
+intent only when it has no Fleet reservation, native binding or commands. A
+durable `cancelled` state and `no_native_start` receipt preserve its history.
+The same key replays the receipt; a different key conflicts. Original start
+replays cannot revive it, and retry refuses it. Intake can then assign the
+unfinished task again. The owning agent or human bearer must still be authorized at commit
+time; admin access cannot cancel someone else's intent. Browser bus identities
+that collapse to `admin` cannot prove individual ownership and are refused;
+use your human device-login CLI profile.
+
+Use `sessions stop` for a session that reached Fleet or has a native binding.
+Cancellation never stops a workload, removes a worktree or proves native exit.
+
+MCP exposes the same guarded operation as `sessions_cancel` with arguments
+`{"id":"SESSION","payload":{"key":"STABLE_KEY"}}`. It re-enters ordinary
+Hub authentication and returns the API cancellation receipt.

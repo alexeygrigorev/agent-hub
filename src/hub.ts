@@ -135,7 +135,7 @@ export class Hub extends DurableObject {
     // Placement stays with FleetService; no second dispatcher or consumer here.
     this.sessionControlService = new SessionControlService(this.sql, fn => this.ctx.storage.transactionSync(fn), Date.now, {
       reserve: (input, auth) => this.fleetService.reserve(input, auth),
-    });
+    }, { env: this.env });
     this.sessionControlService.init();
     // M14b slice2 (narrow STATUS composition): observation writes are gated
     // by the live SessionControlService.hostObservationAllowed (existing
