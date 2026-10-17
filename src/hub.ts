@@ -7,6 +7,7 @@ import { SCHEMA_SQL } from './schema';
 import { migrateAgentRegistry, bindAgentCredentials, credentialActor, registryAddress, AGENT_NAME } from './agent_registry';
 import { JwksCache, validateIdToken, exchangeCode } from './auth/dtc';
 import { createSessionCookie, getSession, clearSessionCookie, createLoginCookie, getLoginCookie, clearLoginCookie, clearLoginState, resolveCallbackUrl, isAllowedOidcOrigin, verifyCsrf, configuredAdmins, validSessionSecret, adminTokenHash, tokenAdminSubject, TOKEN_ADMIN_EMAIL, humanAdminAllowed } from './auth/session';
+import { isHumanCredentialAllowed as isHumanCredentialAllowedFn, validateHumanCredentialRecord } from './auth/human-credential';
 
 import { randomString, sha256, generateUserCode, base64url } from './auth/crypto';
 import { generateTokenPair, verifyBearerScope } from './auth/token';
@@ -747,22 +748,10 @@ export class Hub extends DurableObject {
         if (!token) return Response.json({ error: 'unauthorized' }, { status: 401 });
         const tokenHash = await sha256(token);
         const cred = this.sql.exec('SELECT * FROM credentials WHERE token_hash = ? AND revoked_at IS NULL', tokenHash).toArray()[0] as any;
-        if (!cred || cred.kind !== 'human') return Response.json({ error: 'unauthorized' }, { status: 401 });
-        if (!Number.isFinite(Date.parse(cred.expires_at)) || Date.parse(cred.expires_at) <= Date.now()) {
-          return Response.json({ error: 'unauthorized' }, { status: 401 });
-        }
-        let scopes: unknown;
-        try { scopes = typeof cred.scopes === 'string' ? JSON.parse(cred.scopes) : cred.scopes; } catch { return Response.json({ error: 'unauthorized' }, { status: 401 }); }
-        if (!Array.isArray(scopes) || scopes.length !== 1 || scopes[0] !== 'admin') {
-          return Response.json({ error: 'unauthorized' }, { status: 401 });
-        }
-        const actor = typeof cred.actor === 'string' ? cred.actor : '';
-        const email = typeof cred.subject === 'string' ? cred.subject : '';
-        const sub = actor.startsWith('human:') ? actor.slice('human:'.length) : '';
-        if (!sub || !email || cred.created_by_sub !== sub || !this.isHumanCredentialAllowed(sub, email)) {
-          return Response.json({ error: 'unauthorized' }, { status: 401 });
-        }
-        return Response.json({ kind: 'human', actor, email, is_admin: true, expires_at: cred.expires_at });
+        if (!cred) return Response.json({ error: 'unauthorized' }, { status: 401 });
+        const verified = validateHumanCredentialRecord(this.sql, this.env, cred, Date.now());
+        if (!verified) return Response.json({ error: 'unauthorized' }, { status: 401 });
+        return Response.json({ kind: 'human', actor: verified.actor, email: verified.email, is_admin: true, expires_at: verified.expiresAt });
       }
 
       if (path === '/api/auth/logout') {
@@ -1788,39 +1777,14 @@ export class Hub extends DurableObject {
   /** Human bearer allowlist recheck: current HUB_ADMINS (or the live
    * bootstrap token identity) must still approve the stored approver. Uses
    * the users table for Google emails so removal/failure closes access. */
-  private isHumanCredentialAllowed(sub: string, storedEmail: string): boolean {
-    if (!sub || !storedEmail) return false;
-    if (storedEmail === TOKEN_ADMIN_EMAIL) {
-      return humanAdminAllowed(this.env, storedEmail, sub);
-    }
-    try {
-      const row = this.sql.exec('SELECT email FROM users WHERE sub = ?', sub).toArray()[0] as any;
-      const currentEmail = typeof row?.email === 'string' ? row.email : null;
-      if (typeof currentEmail !== 'string' || !currentEmail) return false;
-      // Stored identity must still match the verified user row (case-insensitive).
-      if (currentEmail.toLowerCase() !== storedEmail.toLowerCase()) return false;
-      return humanAdminAllowed(this.env, currentEmail, sub);
-    } catch {
-      return false;
-    }
+  protected isHumanCredentialAllowed(sub: string, storedEmail: string): boolean {
+    return isHumanCredentialAllowedFn(this.sql, this.env, sub, storedEmail);
   }
 
   /** Refresh-time human gate: strict admin scope, stable human:<sub> actor,
    * matching created_by_sub, and a currently allowlisted approver. */
   private isHumanRefreshAllowed(cred: any): boolean {
-    try {
-      let scopes: unknown;
-      try { scopes = typeof cred.scopes === 'string' ? JSON.parse(cred.scopes) : cred.scopes; } catch { return false; }
-      if (!Array.isArray(scopes) || scopes.length !== 1 || scopes[0] !== 'admin') return false;
-      const actor = typeof cred.actor === 'string' ? cred.actor : '';
-      const email = typeof cred.subject === 'string' ? cred.subject : '';
-      const sub = actor.startsWith('human:') ? actor.slice('human:'.length) : '';
-      if (!sub || !email || cred.created_by_sub !== sub) return false;
-      if (cred.machine_id !== null && cred.machine_id !== undefined) return false;
-      return this.isHumanCredentialAllowed(sub, email);
-    } catch {
-      return false;
-    }
+    return validateHumanCredentialRecord(this.sql, this.env, cred, Date.now()) !== null;
   }
 
   protected async authenticateBusRequest(request: Request): Promise<{ caller?: CallerContext; scopes?: string[]; error?: Response }> {
@@ -1903,20 +1867,12 @@ export class Hub extends DurableObject {
       // principal. Identity comes only from the stored credential (actor
       // human:<approver-sub>, subject approver email); request fields never
       // authorize. Removed-admin, revoked and expired families fail closed.
-      if (!scopes.includes('admin') || scopes.length !== 1) {
-        return { error: Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } }) };
-      }
-      const actor = typeof cred.actor === 'string' ? cred.actor : '';
-      const email = typeof cred.subject === 'string' ? cred.subject : '';
-      const sub = actor.startsWith('human:') ? actor.slice('human:'.length) : '';
-      if (!sub || !email || typeof cred.created_by_sub !== 'string' || cred.created_by_sub !== sub) {
-        return { error: Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } }) };
-      }
-      if (!this.isHumanCredentialAllowed(sub, email)) {
+      const verified = validateHumanCredentialRecord(this.sql, this.env, cred, Date.now());
+      if (!verified) {
         return { error: Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } }) };
       }
       caller.isAdmin = true;
-      caller.actor = actor;
+      caller.actor = verified.actor;
     }
 
     return { caller, scopes };

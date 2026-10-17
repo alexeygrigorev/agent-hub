@@ -551,7 +551,10 @@ export class ConversationLinksService {
   }
 
   private isAdminHuman(principal: VerifiedConversationPrincipal): boolean {
-    return principal.kind === 'human' && principal.authType === 'session';
+    return (
+      principal.kind === 'human' &&
+      (principal.authType === 'session' || principal.authType === 'bearer')
+    );
   }
 
   private isRoutingClient(principal: VerifiedConversationPrincipal): boolean {

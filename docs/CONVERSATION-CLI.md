@@ -7,13 +7,22 @@ current membership for every operation. There is no sender override. Use the
 existing private credential store; do not put tokens in command arguments.
 Host/job credentials cannot participate in conversations.
 
-Human participation currently uses the browser UI with verified session and CSRF
-protection. Existing device pairing issues agent/host credentials, with no genuine
-human bearer credential issuance. Human CLI authentication is unsupported here;
-this change does not export browser cookies or create another credential store.
-The command payloads are ready to use a future supported human authentication
-flow without accepting a caller-supplied identity. The client reuses the hub JSON HTTP helper, which refuses
-redirects rather than forwarding credentials to a redirect target.
+Human participation is supported through both verified browser sessions (with CSRF
+protection) and first-class verified human bearer credentials issued by the Google/device
+login flow (`kind: 'human'`). Human bearer credentials require exact `['admin']` scope,
+lack machine binding, and are bound to the authenticated user's email matching an active,
+non-disabled row in the `users` table (`is_admin = 1`) present in the configured `HUB_ADMINS` /
+`HUB_ADDITIONAL_ADMINS` allowlist. Bootstrap token admin credentials (`admin-token@hub.local`)
+are strictly pinned to the configured `HUB_ADMIN_TOKEN_SHA256` hash.
+
+All conversation operations re-validate human identity inside SQLite transactions
+(`createConversation`, `sendMessage`, `getMessages`, `markRead`, idempotency key replay,
+and conversation links). Security boundaries remain strictly separated: `authType === 'bearer'`
+never fabricates browser sessions or signed cookies; cookie mutations still require CSRF
+even if Bearer headers are present; bearer tokens cannot issue M5 automation grants
+(which require a real signed-in browser session + CSRF); and agent, host, and job tokens
+cannot promote to human or bypass principal constraints. The client reuses the hub JSON
+HTTP helper, which refuses redirects rather than forwarding credentials to a redirect target.
 
 Create and send require `--key`. Choose a unique key for each logical operation,
 and keep that key and the exact payload when retrying after a timeout,

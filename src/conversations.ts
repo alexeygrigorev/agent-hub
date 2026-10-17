@@ -17,6 +17,7 @@ import {
   TOKEN_ADMIN_EMAIL,
 } from './auth/session';
 import { sha256 } from './auth/crypto';
+import { validateHumanCredentialRecord } from './auth/human-credential';
 
 // Shared by archived discovery, candidate selection and the final header guard.
 // An uncertain effect pins its parent even when only the frozen intent names it.
@@ -256,6 +257,7 @@ export interface ConversationAuthInput {
   authType?: 'session' | 'bearer';
   csrfVerified?: boolean;
   error?: Response;
+  env?: Env;
 }
 
 export interface CreateConversationInput {
@@ -522,9 +524,9 @@ export function createSqlIdentityValidator(sql: SqlStorage): IdentityValidator {
 
         try {
           const userRow = sql
-            .exec('SELECT sub, email FROM users WHERE sub = ?', sub)
+            .exec('SELECT sub, email, is_admin FROM users WHERE sub = ?', sub)
             .toArray()[0] as any;
-          if (userRow) {
+          if (userRow && userRow.is_admin) {
             return {
               actor: canonicalHuman,
               kind: 'human',
@@ -664,6 +666,7 @@ export async function authenticateConversationRequest(
       scopes: ['bus:read', 'bus:send'],
       authType: 'session',
       csrfVerified,
+      env,
     };
   }
 
@@ -741,6 +744,45 @@ export async function authenticateConversationRequest(
     return { error: jsonResponse({ error: 'unauthorized' }, 401) };
   }
 
+  if (cred.kind === 'human') {
+    const verifiedHuman = validateHumanCredentialRecord(sql, env, cred, nowMs);
+    if (!verifiedHuman) {
+      return {
+        error: new Response(JSON.stringify({ error: 'unauthorized' }), {
+          status: 401,
+          headers: {
+            ...RESPONSE_HEADERS,
+            'Content-Type': 'application/json; charset=utf-8',
+            'WWW-Authenticate': 'Bearer',
+          },
+        }),
+      };
+    }
+
+    const lastUsedMs = cred.last_used_at ? Date.parse(cred.last_used_at) : 0;
+    if (!lastUsedMs || isNaN(lastUsedMs) || nowMs - lastUsedMs >= 300_000) {
+      const nowIso = new Date(nowMs).toISOString();
+      try {
+        sql.exec('UPDATE credentials SET last_used_at = ? WHERE id = ?', nowIso, cred.id);
+      } catch {}
+    }
+
+    return {
+      caller: {
+        kind: 'human',
+        actor: verifiedHuman.actor,
+        isAdmin: true,
+        tokenId: String(cred.id),
+        tokenHash: cred.token_hash,
+        scopes: ['admin', 'bus:read', 'bus:send'],
+      },
+      scopes: ['admin', 'bus:read', 'bus:send'],
+      authType: 'bearer',
+      csrfVerified: false,
+      env,
+    };
+  }
+
   const lastUsedMs = cred.last_used_at ? Date.parse(cred.last_used_at) : 0;
   if (!lastUsedMs || isNaN(lastUsedMs) || nowMs - lastUsedMs >= 300_000) {
     const nowIso = new Date(nowMs).toISOString();
@@ -761,7 +803,8 @@ export async function authenticateConversationRequest(
     },
     scopes,
     authType: 'bearer',
-    csrfVerified: true,
+    csrfVerified: false,
+    env,
   };
 }
 
@@ -830,6 +873,7 @@ async function readBoundedJsonBody(
 
 export class ConversationsService {
   public readonly sql: SqlStorage;
+  public readonly env?: Env;
   private readonly txSync: <T>(fn: () => T) => T;
   private readonly now: () => number;
   public identityValidator: IdentityValidator;
@@ -843,9 +887,11 @@ export class ConversationsService {
       now?: () => number;
       identityValidator?: IdentityValidator;
       limits?: Partial<ConversationStorageLimits>;
+      env?: Env;
     },
   ) {
     this.sql = sql;
+    this.env = options?.env;
     // Child link calls join this service's current transaction, including when
     // used directly with DurableObjectStorage.transactionSync (no nested BEGIN).
     let depth = 0;
@@ -1637,6 +1683,8 @@ export class ConversationsService {
     const tokenId = caller?.tokenId;
     const tokenHash = caller?.tokenHash;
 
+    const env = normalizedAuth.env ?? this.env;
+
     if (
       kind === 'host' ||
       kind === 'job' ||
@@ -1659,47 +1707,6 @@ export class ConversationsService {
         403,
         'collapsed_admin_identity_refused',
       );
-    }
-
-    // Human CallerContext (must come from a verified session, never a bearer token)
-    if (
-      kind === 'human' ||
-      kind === 'session' ||
-      (typeof rawActor === 'string' && rawActor.startsWith('human:'))
-    ) {
-      if (normalizedAuth.authType === 'bearer' || tokenId || tokenHash) {
-        throw new ConversationDomainError(
-          'forbidden',
-          403,
-          'invalid_principal_kind',
-        );
-      }
-      const parsedHuman = parseCanonicalHumanActor(rawActor);
-      if (!parsedHuman) {
-        throw new ConversationDomainError(
-          'forbidden',
-          403,
-          'collapsed_admin_identity_refused',
-        );
-      }
-      const csrfVerified = normalizedAuth.csrfVerified === true;
-      if (options?.isMutatingHttp && !csrfVerified) {
-        throw new ConversationDomainError(
-          'csrf_invalid',
-          403,
-          'csrf_token_missing_or_invalid',
-        );
-      }
-      return {
-        actor: parsedHuman.actor,
-        kind: 'human',
-        authType: 'session',
-        scopes: effectiveScopes ?? ['bus:read', 'bus:send'],
-        csrfVerified,
-        displayName: parsedHuman.actor,
-        sessionSub: parsedHuman.sub,
-        nativeBinding: null,
-      };
     }
 
     // Revalidate live bearer credential state from SQLite whenever tokenId or tokenHash is bound
@@ -1730,16 +1737,59 @@ export class ConversationsService {
         liveCred = null;
       }
 
-      if (
-        !liveCred ||
-        (liveCred.revoked_at !== null && liveCred.revoked_at !== undefined)
-      ) {
+      if (!liveCred) {
+        if (caller?.kind === 'human' || kind === 'human') {
+          throw new ConversationDomainError(
+            'forbidden',
+            403,
+            'invalid_principal_kind',
+          );
+        }
+        throw new ConversationDomainError('unauthorized', 401);
+      }
+
+      if (liveCred.revoked_at !== null && liveCred.revoked_at !== undefined) {
         throw new ConversationDomainError('unauthorized', 401);
       }
 
       const expiresMs = Date.parse(liveCred.expires_at);
       if (!Number.isFinite(expiresMs) || expiresMs <= this.now()) {
         throw new ConversationDomainError('unauthorized', 401);
+      }
+
+      if (liveCred.kind === 'human') {
+        const verifiedHuman = validateHumanCredentialRecord(
+          this.sql,
+          env,
+          liveCred,
+          this.now(),
+        );
+        if (!verifiedHuman) {
+          throw new ConversationDomainError('unauthorized', 401);
+        }
+
+        const humanScopes = ['admin', 'bus:read', 'bus:send'];
+        if (options?.requireWriteScope && !humanScopes.includes('bus:send')) {
+          throw new ConversationDomainError('forbidden', 403, 'scope_missing');
+        }
+        if (
+          options?.requireReadScope &&
+          !humanScopes.includes('bus:read') &&
+          !humanScopes.includes('bus:send')
+        ) {
+          throw new ConversationDomainError('forbidden', 403, 'scope_missing');
+        }
+
+        return {
+          actor: verifiedHuman.actor,
+          kind: 'human',
+          authType: 'bearer',
+          scopes: humanScopes,
+          csrfVerified: false,
+          displayName: verifiedHuman.email || verifiedHuman.actor,
+          tokenId: String(liveCred.id),
+          nativeBinding: null,
+        };
       }
 
       let liveScopes: string[];
@@ -1762,6 +1812,47 @@ export class ConversationsService {
       }
       rawActor = boundActor ?? undefined;
       effectiveScopes = liveScopes;
+    } else {
+      // Human CallerContext (must come from a verified session, never a bearer token)
+      if (
+        kind === 'human' ||
+        kind === 'session' ||
+        (typeof rawActor === 'string' && rawActor.startsWith('human:'))
+      ) {
+        if (normalizedAuth.authType === 'bearer') {
+          throw new ConversationDomainError(
+            'forbidden',
+            403,
+            'invalid_principal_kind',
+          );
+        }
+        const parsedHuman = parseCanonicalHumanActor(rawActor);
+        if (!parsedHuman) {
+          throw new ConversationDomainError(
+            'forbidden',
+            403,
+            'collapsed_admin_identity_refused',
+          );
+        }
+        const csrfVerified = normalizedAuth.csrfVerified === true;
+        if (options?.isMutatingHttp && !csrfVerified) {
+          throw new ConversationDomainError(
+            'csrf_invalid',
+            403,
+            'csrf_token_missing_or_invalid',
+          );
+        }
+        return {
+          actor: parsedHuman.actor,
+          kind: 'human',
+          authType: 'session',
+          scopes: effectiveScopes ?? ['bus:read', 'bus:send'],
+          csrfVerified,
+          displayName: parsedHuman.actor,
+          sessionSub: parsedHuman.sub,
+          nativeBinding: null,
+        };
+      }
     }
 
     if (!rawActor || typeof rawActor !== 'string') {

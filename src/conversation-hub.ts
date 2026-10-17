@@ -45,7 +45,9 @@ export class Hub extends BaseHub {
       }
     };
     this.busService.txSync = txSync;
-    this.conversationsService = new ConversationsService(this.sql, txSync);
+    this.conversationsService = new ConversationsService(this.sql, txSync, {
+      env: this.env,
+    });
     this.linksService = this.conversationsService.linksHandler;
     this.conversationsService.init();
 
