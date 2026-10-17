@@ -293,14 +293,13 @@ def sanitize_provider(
     if "stale" in raw_details and type(raw_details["stale"]) is bool:
         sanitized_details["stale"] = raw_details["stale"]
     # Known provider backoff deadline (launcher 429 Retry-After authority, mirrored
-    # as UTC ISO). Malformed values stay unknown here; the hub retains an
-    # unexpired known hold and fails closed on malformed stored values.
+    # as UTC ISO). Omitted when unknown; malformed stays unknown here, the hub
+    # retains an unexpired known hold and fails closed on malformed stored values.
     raw_cooldown = raw_details.get("cooldown_until")
-    if raw_cooldown is None:
-        sanitized_details["cooldown_until"] = None
-    else:
+    if raw_cooldown is not None:
         parsed_cooldown = parse_iso_utc(raw_cooldown)
-        sanitized_details["cooldown_until"] = format_iso_utc(parsed_cooldown) if parsed_cooldown is not None else None
+        if parsed_cooldown is not None:
+            sanitized_details["cooldown_until"] = format_iso_utc(parsed_cooldown)
     if provider_name == "grok":
         if "has_grok_code_access" in raw_details and raw_details["has_grok_code_access"] is not None:
             if type(raw_details["has_grok_code_access"]) is not bool:
