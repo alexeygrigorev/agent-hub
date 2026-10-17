@@ -20,7 +20,11 @@ from unittest.mock import patch
 from agent_hub_host import fleet, session_control
 from agent_hub_host.native_sessions import SessionControlError
 from agent_hub_host.session_cleanup import (
+    GIT_OUTPUT_LIMIT,
+    _parse_worktree_list,
     canonical_roots,
+    check_registered_worktree,
+    discover_registered_branch,
     remove_owned_worktree,
     resolve_owned_worktree,
 )
@@ -47,7 +51,7 @@ def make_repo(base):
     """Synthetic bare origin + main checkout with one pushed main commit."""
     origin = base / "origin.git"
     main = base / "main"
-    run_git(["init", "--bare", str(origin)], base)
+    run_git(["init", "--bare", "--initial-branch=main", str(origin)], base)
     run_git(["clone", str(origin), str(main)], base)
     run_git(["config", "user.email", "synth@example.test"], main)
     run_git(["config", "user.name", "synth"], main)
@@ -73,6 +77,52 @@ def add_merged_worktree(main, base, name, branch):
     run_git(["push", "origin", "main"], main)
     run_git(["checkout", branch], wt)
     return wt
+
+
+class TestCompleteWorktreeRegistry(unittest.TestCase):
+    @staticmethod
+    def record(path, branch, extra=""):
+        return f"worktree {path}\nHEAD {'1' * 40}\nbranch refs/heads/{branch}\n{extra}\n"
+
+    def prefix(self):
+        return "".join(self.record(f"/synthetic/other-{i}", f"other-{i}") for i in range(180))
+
+    def test_target_beyond_500_lines_is_discovered(self):
+        text = self.prefix() + self.record("/synthetic/target", "owned")
+        runner = lambda *args: subprocess.CompletedProcess(args[0], 0, text, "")
+        self.assertEqual(discover_registered_branch("git", "/synthetic/target", runner=runner), "owned")
+        self.assertEqual(len(_parse_worktree_list(text)), 181)
+
+    def test_late_locked_target_refused(self):
+        text = self.prefix() + self.record("/synthetic/target", "owned", "locked maintenance\n")
+        runner = lambda *args: subprocess.CompletedProcess(args[0], 0, text, "")
+        with self.assertRaisesRegex(SessionControlError, "locked"):
+            discover_registered_branch("git", "/synthetic/target", runner=runner)
+
+    def test_late_shared_branch_refused(self):
+        text = self.record("/synthetic/target", "owned") + self.prefix() + self.record("/synthetic/conflict", "owned")
+        runner = lambda *args: subprocess.CompletedProcess(args[0], 0, text, "")
+        with patch("agent_hub_host.session_cleanup.os.path.lexists", return_value=True), \
+             patch("agent_hub_host.session_cleanup.os.path.isdir", return_value=False):
+            with self.assertRaisesRegex(SessionControlError, "another worktree"):
+                check_registered_worktree("git", "/synthetic/target", "owned", runner=runner)
+
+    def test_oversize_and_malformed_tail_refused(self):
+        good = self.record("/synthetic/target", "owned")
+        for text in (good + "x" * GIT_OUTPUT_LIMIT, good + self.prefix() + "branch refs/heads/orphan\n",
+                     good + self.record("/synthetic/target", "duplicate"),
+                     "worktree /synthetic/incomplete\n", good + "worktree /synthetic/truncated\nHEAD invalid\n"):
+            with self.subTest(length=len(text)):
+                with self.assertRaises(SessionControlError):
+                    _parse_worktree_list(text)
+
+    def test_bare_detached_prunable_and_last_record_without_blank(self):
+        text = "worktree /synthetic/bare\nbare\n\n" + self.record("/synthetic/spaced path", "owned")
+        text += f"worktree /synthetic/detached\nHEAD {'2' * 64}\ndetached\nprunable missing location\n"
+        entries = _parse_worktree_list(text)
+        self.assertTrue(entries[0]["bare"])
+        self.assertEqual(entries[1]["path"], "/synthetic/spaced path")
+        self.assertTrue(entries[2]["detached"])
 
 
 class TestRootsConfinement(unittest.TestCase):

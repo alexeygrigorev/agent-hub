@@ -51,6 +51,7 @@ LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./-]{0,127}\Z")
 MAX_ROOTS = 16
 GIT_TIMEOUT = 30.0
+GIT_OUTPUT_LIMIT = 1024 * 1024
 
 
 def _journal_path(journal_dir: str, name: str) -> str:
@@ -149,34 +150,49 @@ def _default_runner(argv: list[str], cwd: str, timeout: float = GIT_TIMEOUT):
     except OSError as exc:
         raise SessionControlError(f"git executable failed: {type(exc).__name__}") from exc
     for stream in (proc.stdout, proc.stderr):
-        if len(stream.encode("utf-8", "replace")) > 1024 * 1024:
+        if len(stream.encode("utf-8", "replace")) > GIT_OUTPUT_LIMIT:
             raise SessionUncertain("git response exceeds bound; effect unknown")
     return proc
 
 
 def _parse_worktree_list(text: str) -> list[dict[str, Any]]:
-    """Parse `git worktree list --porcelain` into entries (deterministic, bounded)."""
+    """Parse the complete bounded registry; never use a truncated prefix as proof."""
+    if not isinstance(text, str) or len(text.encode("utf-8", "replace")) > GIT_OUTPUT_LIMIT:
+        raise SessionControlError("git worktree registry exceeds bound; refusing")
     entries: list[dict[str, Any]] = []
     current: dict[str, Any] = {}
-    for line in text.splitlines()[:500]:
-        if not line.strip():
+    paths: set[str] = set()
+    for line in [*text.splitlines(), ""]:
+        if not line:
             if current:
+                if (not current.get("bare") and
+                    (not current.get("head") or bool(current.get("branch")) == bool(current.get("detached")))):
+                    raise SessionControlError("malformed git worktree registry; refusing")
                 entries.append(current)
                 current = {}
             continue
         if line.startswith("worktree "):
             if current:
-                entries.append(current)
-                current = {}
-            current = {"path": line[len("worktree "):], "branch": None, "bare": False, "locked": False}
-        elif line.startswith("branch "):
-            current["branch"] = line[len("branch "):]
-        elif line == "bare":
-            current["bare"] = True
-        elif line == "locked" or line.startswith("locked "):
-            current["locked"] = True
-    if current:
-        entries.append(current)
+                raise SessionControlError("malformed git worktree record separator; refusing")
+            path = line[len("worktree "):]
+            if not os.path.isabs(path) or "\x00" in path or os.path.normpath(path) in paths:
+                raise SessionControlError("invalid or duplicate git worktree path; refusing")
+            paths.add(os.path.normpath(path))
+            current = {"path": path, "branch": None, "bare": False, "locked": False}
+            continue
+        if not current:
+            raise SessionControlError("git worktree field without a record; refusing")
+        key, _, value = line.partition(" ")
+        if key == "HEAD" and re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", value) and "head" not in current:
+            current["head"] = value
+        elif key == "branch" and value.startswith("refs/") and not current["branch"]:
+            current["branch"] = value
+        elif key in ("bare", "detached") and line == key and not current.get(key):
+            current[key] = True
+        elif key in ("locked", "prunable") and not current.get(key):
+            current[key] = True
+        else:
+            raise SessionControlError("malformed or unsupported git worktree field; refusing")
     return entries
 
 

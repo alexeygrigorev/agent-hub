@@ -50,7 +50,12 @@ fi
 echo "=== 5/6: Python Discovery Suite (disposable HOME, CI-matched env) ==="
 DTC_AUTH_PATH="${DTC_AUTH_HOME:-/home/alexey/git/auth}"
 PYTEST_BIN="${PYTEST_BIN:-/home/alexey/.local/bin/pytest}"
-ORIGINAL_USER_BASE="${PYTHONUSERBASE:-$(python3 -m site --user-base 2>/dev/null || echo "/home/alexey/.local")}"
+ORIGINAL_USER_BASE="${PYTHONUSERBASE:-}"
+if [ -z "${ORIGINAL_USER_BASE}" ]; then
+  # `python -m site --user-base` prints the path but exits 1 when user-site
+  # imports are disabled; appending a fallback would corrupt the path.
+  ORIGINAL_USER_BASE="$(python3 -c 'import site; print(site.getuserbase())' 2>/dev/null)" || ORIGINAL_USER_BASE="/home/alexey/.local"
+fi
 
 PYTEST_RC=0
 HOME="${DISPOSABLE_HOME}" \
