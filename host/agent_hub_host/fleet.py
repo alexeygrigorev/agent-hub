@@ -387,7 +387,17 @@ class Dispatcher:
             eligible = plan.get("eligible", [])
             if not isinstance(eligible, list) or not eligible or any(r.get("provider") != sub["launcher_provider"] or r.get("model") != sub["launcher_model"] or r.get("account_label") != sub["account_label"] or r.get("profile") != sub.get("profile") for r in eligible):
                 raise ValueError("Maintained launcher plan refused")
-            argv = prefix + ["run", "--backend", "task-units", "--as-controller", "--id", task_id, "--cwd", str(target_cwd), "--tmpdir", str(workspace / ".local" / "tmp")]
+            # Smallest correct native route: opencode headless reuses the
+            # maintained launcher aplexer backend (real native UUID +
+            # first-action evidence for M12 bind/control). Task-units receipts
+            # can carry only a systemd unit_name, which cannot bind. All other
+            # providers preserve the existing task-units backend + semantics.
+            if sub.get("launcher_provider") == "opencode":
+                argv = prefix + ["run", "--backend", "aplexer",
+                                 "--id", task_id, "--cwd", str(target_cwd),
+                                 "--tmpdir", str(workspace / ".local" / "tmp")]
+            else:
+                argv = prefix + ["run", "--backend", "task-units", "--as-controller", "--id", task_id, "--cwd", str(target_cwd), "--tmpdir", str(workspace / ".local" / "tmp")]
             cwd = launcher["root"]
         else:
             raise ValueError("Unsupported launch mode")
