@@ -78,7 +78,7 @@ jobs:
           python3 scripts/ci/test_ci.py
 
       - name: Focused Worker tests (Vitest)
-        run: npx vitest run test/human-auth.test.ts test/token-auth.test.ts test/auth-web-repair.test.ts test/proxy-origin.test.ts test/session-control.test.ts test/fleet.test.ts test/intake.test.ts test/monitoring.test.ts
+        run: npx vitest run test/human-auth.test.ts test/token-auth.test.ts test/auth-web-repair.test.ts test/proxy-origin.test.ts test/session-control.test.ts test/fleet.test.ts test/intake.test.ts test/monitoring.test.ts test/checks.test.ts test/status.test.ts test/session-lifecycle.test.ts test/session-lifecycle-m15c.test.ts
 
       - name: Build Hub CLI zipapp
         run: python3 scripts/build-hub-cli.py --out-dir public/cli
@@ -91,7 +91,7 @@ jobs:
           DTC_AUTH_HOME: ${{ github.workspace }}/.deps/auth
         run: |
           python -m pip install pytest
-          python -m pytest -q host/tests/test_human_auth.py host/tests/test_cli.py host/tests/test_session_control.py host/tests/test_intake.py host/tests/test_disk_monitor.py test/test_scripts.py
+          python -m pytest -q host/tests/test_human_auth.py host/tests/test_cli.py host/tests/test_session_control.py host/tests/test_intake.py host/tests/test_disk_monitor.py host/tests/test_host_health_monitor.py host/tests/test_status.py host/tests/test_status_probe.py host/tests/test_fleet.py host/tests/test_session_executor.py host/tests/test_session_lifecycle_m15c.py test/test_scripts.py
 
   deploy:
     concurrency:
