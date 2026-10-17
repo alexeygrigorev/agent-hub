@@ -1,0 +1,1324 @@
+diff --git a/host/agent_hub_host/bridge.py b/host/agent_hub_host/bridge.py
+--- a/host/agent_hub_host/bridge.py
++++ b/host/agent_hub_host/bridge.py
+@@ -8,7 +8,6 @@
+ from __future__ import annotations
+ 
+ from contextlib import contextmanager
+-import fcntl
+ import hashlib
+ import json
+ import os
+@@ -17,7 +16,7 @@
+ import uuid
+ from typing import Any
+ 
+-from . import bus
++from . import bus, private_fs
+ from .native_bridge import (
+     BridgeCapabilityGap,
+     NativeServiceBinding,
+@@ -86,6 +85,14 @@
+     return len(tokens) == 2 and tokens[1] == "❯" and tokens[0] not in PROMPT_GLYPHS
+ 
+ 
++def _absolute_native_root(value):
++    if os.name == 'nt':
++        drive, tail = os.path.splitdrive(value)
++        if len(drive) != 2 or drive[1] != ':' or not tail.startswith(('\\', '/')):
++            raise BridgeCapabilityGap('Explicit absolute local Windows native root required')
++    return os.path.abspath(value)
++
++
+ def get_authoritative_runtime_dir(explicit_runtime_dir: str | None = None) -> str:
+     """Resolve authoritative native runtime directory per aplexer paths.rs.
+ 
+@@ -94,11 +101,16 @@
+     Never checks workspace-local directories for runtime root.
+     """
+     if explicit_runtime_dir:
+-        return os.path.abspath(explicit_runtime_dir)
++        return _absolute_native_root(explicit_runtime_dir)
+     if os.environ.get("APLEXER_RUNTIME_DIR"):
+-        return os.path.abspath(os.environ["APLEXER_RUNTIME_DIR"])
+-    if os.environ.get("XDG_RUNTIME_DIR"):
++        return _absolute_native_root(os.environ["APLEXER_RUNTIME_DIR"])
++    if os.name != "nt" and os.environ.get("XDG_RUNTIME_DIR"):
+         return os.path.abspath(os.path.join(os.environ["XDG_RUNTIME_DIR"], "aplexer"))
++    if os.name == 'nt':
++        base = os.environ.get('LOCALAPPDATA') or os.path.join(os.path.expanduser('~'), 'AppData', 'Local')
++        if not os.path.isabs(base):
++            raise BridgeCapabilityGap('Absolute Windows LOCALAPPDATA required')
++        return os.path.join(base, 'aplexer', 'run')
+     uid = os.geteuid() if hasattr(os, "geteuid") else 1000
+     return os.path.abspath(f"/tmp/aplexer-{uid}")
+ 
+@@ -111,9 +123,14 @@
+     Never checks workspace-local directories for state root.
+     """
+     if explicit_state_dir:
+-        return os.path.abspath(explicit_state_dir)
++        return _absolute_native_root(explicit_state_dir)
+     if os.environ.get("APLEXER_STATE_DIR"):
+-        return os.path.abspath(os.environ["APLEXER_STATE_DIR"])
++        return _absolute_native_root(os.environ["APLEXER_STATE_DIR"])
++    if os.name == 'nt':
++        base = os.environ.get('LOCALAPPDATA') or os.path.join(os.path.expanduser('~'), 'AppData', 'Local')
++        if not os.path.isabs(base):
++            raise BridgeCapabilityGap('Absolute Windows LOCALAPPDATA required')
++        return os.path.join(base, 'aplexer', 'state')
+     if os.environ.get("XDG_STATE_HOME"):
+         return os.path.abspath(os.path.join(os.environ["XDG_STATE_HOME"], "aplexer"))
+     home = os.environ.get("HOME", os.path.expanduser("~"))
+@@ -122,6 +139,9 @@
+ 
+ def canonicalize_workspace(workspace_path: str) -> str:
+     """Canonicalize workspace path matching aplexer's canonical_workspace."""
++    if os.name == 'nt':
++        from .win32_fs import canonical_workspace
++        return canonical_workspace(workspace_path)
+     abs_path = os.path.abspath(workspace_path)
+     try:
+         return os.path.realpath(abs_path)
+@@ -164,23 +184,13 @@
+ 
+     @contextmanager
+     def _receipts_lock(self):
+-        lock_dir = os.path.dirname(self.lock_file) or "."
+-        os.makedirs(lock_dir, exist_ok=True)
+-        fd = os.open(self.lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+-        try:
+-            fcntl.flock(fd, fcntl.LOCK_EX)
++        with private_fs.exclusive_lock(self.lock_file):
++            yield
++
++    def _load_receipts(self) -> dict[str, Any]:
++        if os.path.lexists(self.receipts_file):
+             try:
+-                yield
+-            finally:
+-                fcntl.flock(fd, fcntl.LOCK_UN)
+-        finally:
+-            os.close(fd)
+-
+-    def _load_receipts(self) -> dict[str, Any]:
+-        if os.path.exists(self.receipts_file):
+-            try:
+-                with open(self.receipts_file, "r", encoding="utf-8") as f:
+-                    data = json.load(f)
++                data = json.loads(private_fs.read_bytes(self.receipts_file, 8 * 1024 * 1024))
+             except Exception as e:
+                 raise BridgeCapabilityGap(f"Receipts file {self.receipts_file} is corrupt or unreadable: {e}") from e
+             if not isinstance(data, dict):
+@@ -318,20 +328,9 @@
+ 
+     def _save_receipts(self) -> None:
+         self._prune_receipts()
+-        dir_path = os.path.dirname(self.receipts_file) or "."
+-        os.makedirs(dir_path, exist_ok=True)
+-        tmp_file = self.receipts_file + ".tmp"
+-        fd = os.open(tmp_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+-        try:
+-            with open(fd, "w", encoding="utf-8") as f:
+-                json.dump(self.receipts, f, indent=2)
+-        except Exception:
+-            try:
+-                os.close(fd)
+-            except Exception:
+-                pass
+-            raise
+-        os.replace(tmp_file, self.receipts_file)
++        private_fs.atomic_write(self.receipts_file,
++                                json.dumps(self.receipts, indent=2).encode('utf-8'),
++                                8 * 1024 * 1024)
+ 
+     def _verify_mailbox_dir(self, state_root: str) -> str | None:
+         """Verify and return the authoritative mailbox directory for this canonical workspace."""
+diff --git a/host/agent_hub_host/config.py b/host/agent_hub_host/config.py
+--- a/host/agent_hub_host/config.py
++++ b/host/agent_hub_host/config.py
+@@ -1,9 +1,8 @@
+ import json
+ import os
+ import sys
+-import tempfile
+-import stat
+ from pathlib import Path
++from . import private_fs
+ 
+ def get_config_path() -> Path:
+     explicit = os.environ.get('HUB_CONFIG_FILE')
+@@ -19,59 +18,6 @@
+     else:
+         base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+     return base / "agent-hub" / "host.json"
+-
+-def _is_reparse_point(path: Path) -> bool:
+-    if not path.exists():
+-        return False
+-    if path.is_symlink():
+-        return True
+-    if sys.platform == "win32":
+-        try:
+-            st = os.lstat(path)
+-            if getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+-                return True
+-        except Exception:
+-            return True # fail closed
+-    return False
+-
+-def _check_ancestors(path: Path):
+-    p = path.parent
+-    while p != p.parent:
+-        if _is_reparse_point(p):
+-            raise RuntimeError(f"Unsafe ancestor (symlink or reparse point): {p}")
+-        p = p.parent
+-
+-def _set_permissions(path: Path, is_dir: bool = False):
+-    if sys.platform == "win32":
+-        import subprocess
+-        try:
+-            res_whoami = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True, timeout=10.0)
+-            if res_whoami.returncode != 0:
+-                raise RuntimeError("Failed to get current user SID")
+-            sid = res_whoami.stdout.strip().split(',')[-1].strip('"')
+-            
+-            icacls_exe = "icacls"
+-            res = subprocess.run([icacls_exe, str(path), "/inheritance:r"], capture_output=True, text=True, timeout=10.0)
+-            if res.returncode != 0:
+-                raise RuntimeError("Failed to remove inheritance")
+-            
+-            # Remove any explicit permissions for Everyone, Users, Authenticated Users
+-            subprocess.run([icacls_exe, str(path), "/remove:g", "Everyone", "Users", "BUILTIN\\Users", "Authenticated Users"], capture_output=True, text=True, timeout=10.0)
+-            
+-            res = subprocess.run([icacls_exe, str(path), "/grant:r", f"*{sid}:(F)"], capture_output=True, text=True, timeout=10.0)
+-            if res.returncode != 0:
+-                raise RuntimeError("Failed to grant ACL")
+-        except subprocess.TimeoutExpired:
+-            raise RuntimeError("icacls timeout")
+-        except RuntimeError:
+-            raise
+-        except Exception as e:
+-            raise RuntimeError(f"ACL error: {type(e).__name__}")
+-    else:
+-        if _is_reparse_point(path):
+-            raise RuntimeError("Symlinks are not allowed")
+-        mode = 0o700 if is_dir else 0o600
+-        os.chmod(path, mode)
+ 
+ import urllib.parse
+ 
+@@ -149,18 +95,7 @@
+     if not path.exists():
+         return {}
+     try:
+-        _check_ancestors(path)
+-        if _is_reparse_point(path):
+-            return {}
+-            
+-        if sys.platform != "win32":
+-            st = os.stat(path)
+-            if st.st_mode & 0o077:
+-                return {} # unsafe permissions
+-                
+-        with open(path, "r", encoding="utf-8") as f:
+-            data = json.load(f)
+-            return _validate_data(data)
++        return _validate_data(json.loads(private_fs.read_bytes(path, 1024 * 1024)))
+     except Exception:
+         return {}
+ 
+@@ -176,36 +111,10 @@
+         raise ValueError("Invalid config data")
+ 
+     path = get_config_path()
+-    _check_ancestors(path)
+-    
+-    p = path.parent
+-    dirs = []
+-    while not p.exists():
+-        dirs.append(p)
+-        p = p.parent
+-    for d in reversed(dirs):
+-        d.mkdir(mode=0o700)
+-        _set_permissions(d, is_dir=True)
+-        
+-    # Ensure existing parent is also restricted
+-    if path.parent.exists():
+-        _set_permissions(path.parent, is_dir=True)
+-    
+-    # Directory is user-only BEFORE plaintext temporary write
+-    fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix="host.json.", text=True)
+     try:
+-        _set_permissions(Path(tmp_path), is_dir=False) # fail closed atomic storage
+-        
+-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+-            json.dump(cleaned, f)
+-            
+-        os.replace(tmp_path, path)
++        private_fs.atomic_write(path, json.dumps(cleaned).encode('utf-8'), 1024 * 1024)
+     except Exception:
+-        try:
+-            os.unlink(tmp_path)
+-        except Exception:
+-            pass
+-        raise RuntimeError("Config save failed")
++        raise RuntimeError('Config save failed') from None
+ 
+ def update_config(**kwargs):
+     cfg = load_config()
+diff --git a/host/agent_hub_host/conversation_bridge.py b/host/agent_hub_host/conversation_bridge.py
+--- a/host/agent_hub_host/conversation_bridge.py
++++ b/host/agent_hub_host/conversation_bridge.py
+@@ -7,17 +7,15 @@
+ from __future__ import annotations
+ 
+ from contextlib import contextmanager
+-import fcntl
+ import hashlib
+ import json
+ import os
+ from pathlib import Path
+ import re
+-import stat
+ import subprocess
+ from datetime import datetime, timezone
+ 
+-from . import config, conversations
++from . import config, conversations, private_fs
+ from .bridge import get_authoritative_runtime_dir, get_authoritative_state_dir
+ from .native_bridge import (BridgeCapabilityGap, canonicalize_workspace,
+                             qualify_native_service_binding, validate_native_send_envelope)
+@@ -146,21 +144,33 @@
+ 
+     @contextmanager
+     def journal(self, *, create=True):
+-        if not create and not self.path.is_file():
+-            raise BridgeCapabilityGap('Existing journal required; never reset history to recover a gap')
+-        self.path.parent.mkdir(exist_ok=True, mode=0o700)
+-        config._check_ancestors(self.path)
+-        fd = os.open(str(self.path) + '.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+         try:
+-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            with self._journal(create=create):
++                yield
++        except (PermissionError, ValueError) as exc:
++            raise BridgeCapabilityGap('Unsafe bridge journal or file safety proof failed') from exc
++        except OSError as exc:
++            if exc.errno in (20, 40):  # ENOTDIR / ELOOP, no-follow path rejection
++                raise BridgeCapabilityGap('Unsafe bridge journal path') from exc
++            raise
++
++    @contextmanager
++    def _journal(self, *, create=True):
++        with private_fs.exclusive_lock(str(self.path) + '.lock'):
++            if not create:
++                try:
++                    private_fs.read_bytes(self.path, MAX_STATE)
++                except FileNotFoundError:
++                    raise BridgeCapabilityGap('Existing journal required; never reset history to recover a gap') from None
+             self.binding = self.qualify()
+             identity = [self.origin, self.actor, self.project, self.workspace, self.machine,
+                         self.binding.session_id, self.binding.tag]
+-            if self.path.exists() or self.path.is_symlink():
+-                info = self.path.lstat()
+-                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size > MAX_STATE:
+-                    raise BridgeCapabilityGap('Unsafe bridge journal')
+-                self.state = json.loads(self.path.read_text(), object_pairs_hook=strict_object,
++            try:
++                raw = private_fs.read_bytes(self.path, MAX_STATE)
++            except FileNotFoundError:
++                raw = None
++            if raw is not None:
++                self.state = json.loads(raw, object_pairs_hook=strict_object,
+                                         parse_constant=reject_constant)
+                 if (not isinstance(self.state, dict) or self.state.get('identity') != identity
+                         or type(self.state.get('version')) is not int or self.state.get('version') != 1):
+@@ -170,8 +180,6 @@
+                 self.state = dict(version=1, identity=identity, cursors={}, deliveries={}, replies={})
+                 self.save()
+             yield
+-        finally:
+-            os.close(fd)
+ 
+     def validate_state(self):
+         """Validate evidence without rebuilding state or discarding extension fields."""
+@@ -331,22 +339,7 @@
+         raw = json.dumps(self.state, ensure_ascii=False, sort_keys=True).encode()
+         if len(raw) > MAX_STATE:
+             raise BridgeCapabilityGap('Journal full; retain state and reconcile before continuing')
+-        tmp = str(self.path) + '.tmp'
+-        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+-        try:
+-            with os.fdopen(fd, 'wb') as stream:
+-                stream.write(raw)
+-                stream.flush()
+-                os.fsync(stream.fileno())
+-            os.replace(tmp, self.path)
+-            directory = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
+-            try:
+-                os.fsync(directory)
+-            finally:
+-                os.close(directory)
+-        finally:
+-            if os.path.exists(tmp):
+-                os.unlink(tmp)
++        private_fs.atomic_write(self.path, raw, MAX_STATE)
+ 
+     def own_envelope(self, msg):
+         validate_native_send_envelope(msg, self.binding, self.workspace)
+diff --git a/host/agent_hub_host/native_bridge.py b/host/agent_hub_host/native_bridge.py
+--- a/host/agent_hub_host/native_bridge.py
++++ b/host/agent_hub_host/native_bridge.py
+@@ -33,6 +33,8 @@
+ from dataclasses import dataclass
+ from typing import Any
+ 
++from . import private_fs
++
+ 
+ MAX_MAILBOX_STATE_BYTES = 1024 * 1024  # 1 MiB boundary for metadata files
+ 
+@@ -55,6 +57,9 @@
+ 
+ def canonicalize_workspace(workspace_path: str) -> str:
+     """Canonicalize workspace path matching aplexer's canonical_workspace."""
++    if os.name == 'nt':
++        from .win32_fs import canonical_workspace
++        return canonical_workspace(workspace_path)
+     abs_path = os.path.abspath(workspace_path)
+     try:
+         return os.path.realpath(abs_path)
+@@ -112,8 +117,7 @@
+             rec_file = os.path.join(entry_dir, "session.json")
+             if os.path.isfile(rec_file) and not os.path.islink(rec_file):
+                 try:
+-                    with open(rec_file, "r", encoding="utf-8") as f:
+-                        rec = json.load(f)
++                    rec = json.loads(private_fs.read_bytes(rec_file, MAX_MAILBOX_STATE_BYTES, private=False))
+                     if isinstance(rec, dict):
+                         rec_id = str(rec.get("id", ""))
+                         rec_ws = str(rec.get("workspace", ""))
+@@ -147,8 +151,7 @@
+                     continue
+                 rec_file = os.path.join(entry_dir, "session.json")
+                 if os.path.isfile(rec_file) and not os.path.islink(rec_file):
+-                    with open(rec_file, "r", encoding="utf-8") as f:
+-                        rec = json.load(f)
++                    rec = json.loads(private_fs.read_bytes(rec_file, MAX_MAILBOX_STATE_BYTES, private=False))
+                     if isinstance(rec, dict):
+                         rec_id = str(rec.get("id", ""))
+                         rec_ws = str(rec.get("workspace", ""))
+@@ -183,8 +186,7 @@
+                 rec_file = os.path.join(entry_dir, "session.json")
+                 if os.path.isfile(rec_file) and not os.path.islink(rec_file):
+                     try:
+-                        with open(rec_file, "r", encoding="utf-8") as f:
+-                            rec = json.load(f)
++                        rec = json.loads(private_fs.read_bytes(rec_file, MAX_MAILBOX_STATE_BYTES, private=False))
+                         if isinstance(rec, dict):
+                             rec_id = str(rec.get("id", ""))
+                             rec_ws = str(rec.get("workspace", ""))
+@@ -345,8 +347,7 @@
+         rec_file = os.path.join(entry_dir, "session.json")
+         if os.path.isfile(rec_file) and not os.path.islink(rec_file):
+             try:
+-                with open(rec_file, "r", encoding="utf-8") as f:
+-                    rec = json.load(f)
++                rec = json.loads(private_fs.read_bytes(rec_file, MAX_MAILBOX_STATE_BYTES, private=False))
+                 if isinstance(rec, dict):
+                     if (
+                         str(rec.get("id", "")).lower() == str(replier_sid).lower()
+@@ -381,11 +382,7 @@
+         return None
+ 
+     try:
+-        st = os.stat(cursor_path)
+-        if st.st_size > MAX_MAILBOX_STATE_BYTES:
+-            return None
+-        with open(cursor_path, "r", encoding="utf-8") as f:
+-            data = json.load(f)
++        data = json.loads(private_fs.read_bytes(cursor_path, MAX_MAILBOX_STATE_BYTES, private=False))
+         if isinstance(data, dict):
+             return data
+     except Exception:
+diff --git a/host/agent_hub_host/private_fs.py b/host/agent_hub_host/private_fs.py
+new file mode 100644
+--- /dev/null
++++ b/host/agent_hub_host/private_fs.py
+@@ -0,0 +1,136 @@
++"""Bounded private local files; no backend fallback on failed safety proof.
++
++POSIX uses descriptor-relative no-follow operations. Windows uses pinned no-delete
++share directory handles, protected owner DACLs, NTFS and Win32 no-follow opens.
++Same-user processes/admins are trusted, as with the native session registry.
++"""
++from contextlib import contextmanager
++import os
++from pathlib import Path
++import stat
++import sys
++import uuid
++
++
++def _windows():
++    return sys.platform == 'win32'
++
++
++def _private(info, directory=False):
++    kind = stat.S_ISDIR if directory else stat.S_ISREG
++    if (not kind(info.st_mode) or info.st_uid != os.getuid()
++            or info.st_mode & 0o077 or (not directory and info.st_nlink != 1)):
++        raise PermissionError('Unsafe private file or directory')
++
++
++@contextmanager
++def parent(path, *, create=False, private=True):
++    if _windows():
++        from . import win32_fs
++        with win32_fs.parent(path, create=create, private=private, native=not private) as anchor:
++            yield anchor
++        return
++    path = Path(os.path.abspath(path))
++    fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++    try:
++        parts = path.parent.parts[1:]
++        for part in parts:
++            if create:
++                try:
++                    os.mkdir(part, 0o700, dir_fd=fd)
++                except FileExistsError:
++                    pass
++            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
++            os.close(fd)
++            fd = child
++        if private:
++            _private(os.fstat(fd), directory=True)
++        yield fd
++    finally:
++        os.close(fd)
++
++
++def _open(anchor, path, flags, *, private=True):
++    if _windows():
++        from . import win32_fs
++        return win32_fs.open_file(path, flags, private=private)
++    fd = os.open(Path(path).name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=anchor)
++    try:
++        info = os.fstat(fd)
++        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
++            raise PermissionError('Unsafe nonregular or multiply linked file')
++        if private:
++            _private(info)
++        return fd
++    except BaseException:
++        os.close(fd)
++        raise
++
++
++def read_bytes(path, limit, *, private=True):
++    with parent(path, private=private) as anchor:
++        fd = _open(anchor, path, os.O_RDONLY, private=private)
++        with os.fdopen(fd, 'rb') as stream:
++            if os.fstat(stream.fileno()).st_size > limit:
++                raise ValueError('Private file exceeds byte bound')
++            data = stream.read(limit + 1)
++            if len(data) > limit:
++                raise ValueError('Private file grew beyond byte bound')
++            return data
++
++
++def _existing(anchor, path):
++    try:
++        fd = _open(anchor, path, os.O_RDONLY)
++    except FileNotFoundError:
++        return
++    os.close(fd)
++
++
++def atomic_write(path, raw, limit):
++    if len(raw) > limit:
++        raise ValueError('Private file exceeds byte bound')
++    path = Path(path)
++    with parent(path, create=True) as anchor:
++        _existing(anchor, path)
++        # Random, exclusive staging avoids clobbering crash residue or another writer.
++        tmp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
++        fd = _open(anchor, tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
++        try:
++            with os.fdopen(fd, 'wb') as stream:
++                stream.write(raw)
++                stream.flush()
++                os.fsync(stream.fileno())
++            _existing(anchor, path)
++            if _windows():
++                from . import win32_fs
++                win32_fs.replace(tmp, path)
++            else:
++                os.replace(tmp.name, path.name, src_dir_fd=anchor, dst_dir_fd=anchor)
++                os.fsync(anchor)
++        finally:
++            try:
++                if _windows():
++                    os.unlink(tmp)
++                else:
++                    os.unlink(tmp.name, dir_fd=anchor)
++            except FileNotFoundError:
++                pass
++
++
++@contextmanager
++def exclusive_lock(path):
++    with parent(path, create=True) as anchor:
++        fd = _open(anchor, path, os.O_CREAT | os.O_RDWR)
++        try:
++            if _windows():
++                import msvcrt
++                os.lseek(fd, 0, os.SEEK_SET)
++                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
++            else:
++                import fcntl
++                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            yield
++        finally:
++            # Kernel releases the lock on close and on process death. Never unlink it.
++            os.close(fd)
+diff --git a/host/agent_hub_host/win32_fs.py b/host/agent_hub_host/win32_fs.py
+new file mode 100644
+--- /dev/null
++++ b/host/agent_hub_host/win32_fs.py
+@@ -0,0 +1,261 @@
++"""CPython 3.11+, Windows 10/11, fixed local NTFS. No shell/third-party ACL tool.
++
++Every API failure is an error. No FAT/SMB/cloud/reparse/device namespace fallback.
++This module imports on POSIX for deterministic API contract tests; only api()
++loads Windows DLLs. Handles and security descriptors always have one owner.
++"""
++from contextlib import contextmanager, ExitStack
++import ctypes as C
++import ntpath
++import os
++from pathlib import Path
++
++U32, U16, U8, PTR = C.c_uint32, C.c_uint16, C.c_ubyte, C.c_void_p
++BOOL = C.c_int
++FULL = 0x1f01ff
++READ_CONTROL = 0x20000
++REPARSE = 0x400
++DIRECTORY = 0x10
++
++
++class FileInfo(C.Structure):
++    _fields_ = [('attributes', U32), ('times', U32 * 6), ('volume', U32),
++                ('size_high', U32), ('size_low', U32), ('links', U32),
++                ('index_high', U32), ('index_low', U32)]
++
++
++class SecurityAttributes(C.Structure):
++    _fields_ = [('length', U32), ('descriptor', PTR), ('inherit', BOOL)]
++
++
++class ACL(C.Structure):
++    _fields_ = [('revision', U8), ('reserved', U8), ('size', U16),
++                ('count', U16), ('reserved2', U16)]
++
++
++class ACE(C.Structure):
++    _fields_ = [('kind', U8), ('flags', U8), ('size', U16), ('mask', U32), ('sid', U32)]
++
++
++class API:
++    def __init__(self):
++        kernel = C.WinDLL('kernel32', use_last_error=True)
++        adv = C.WinDLL('advapi32', use_last_error=True)
++        def bind(dll, name, args, result=BOOL):
++            fn = getattr(dll, name)
++            fn.argtypes, fn.restype = args, result
++            setattr(self, name, fn)
++        bind(kernel, 'CreateFileW', [C.c_wchar_p, U32, U32, PTR, U32, U32, PTR], PTR)
++        bind(kernel, 'CreateDirectoryW', [C.c_wchar_p, PTR])
++        bind(kernel, 'CloseHandle', [PTR])
++        bind(kernel, 'GetCurrentProcess', [], PTR)
++        bind(kernel, 'GetFileInformationByHandle', [PTR, C.POINTER(FileInfo)])
++        bind(kernel, 'GetFinalPathNameByHandleW', [PTR, C.c_wchar_p, U32, U32], U32)
++        bind(kernel, 'GetDriveTypeW', [C.c_wchar_p], U32)
++        bind(kernel, 'GetVolumeInformationW', [C.c_wchar_p, C.c_wchar_p, U32, PTR, PTR, PTR, C.c_wchar_p, U32])
++        bind(kernel, 'MoveFileExW', [C.c_wchar_p, C.c_wchar_p, U32])
++        bind(kernel, 'LocalFree', [PTR], PTR)
++        bind(adv, 'OpenProcessToken', [PTR, U32, C.POINTER(PTR)])
++        bind(adv, 'GetTokenInformation', [PTR, U32, PTR, U32, C.POINTER(U32)])
++        bind(adv, 'ConvertSidToStringSidW', [PTR, C.POINTER(PTR)])
++        bind(adv, 'ConvertStringSecurityDescriptorToSecurityDescriptorW', [C.c_wchar_p, U32, C.POINTER(PTR), PTR])
++        bind(adv, 'GetSecurityInfo', [PTR, U32, U32, C.POINTER(PTR), PTR, C.POINTER(PTR), PTR, C.POINTER(PTR)], U32)
++        bind(adv, 'GetSecurityDescriptorControl', [PTR, C.POINTER(U16), C.POINTER(U32)])
++        bind(adv, 'GetAce', [PTR, U32, C.POINTER(PTR)])
++        bind(adv, 'EqualSid', [PTR, PTR])
++        self.user_buffer, self.user_sid, self.sid_text = self._user()
++
++    def check(self, ok):
++        if not ok:
++            raise C.WinError(C.get_last_error())
++        return ok
++
++    def _user(self):
++        token, size = PTR(), U32()
++        self.check(self.OpenProcessToken(self.GetCurrentProcess(), 8, C.byref(token)))
++        try:
++            self.GetTokenInformation(token, 1, None, 0, C.byref(size))
++            if not 0 < size.value <= 65536:
++                raise PermissionError('Unknown token SID size')
++            buffer = C.create_string_buffer(size.value)
++            self.check(self.GetTokenInformation(token, 1, buffer, size.value, C.byref(size)))
++            sid = C.cast(buffer, C.POINTER(PTR))[0]
++            text = PTR()
++            self.check(self.ConvertSidToStringSidW(sid, C.byref(text)))
++            try:
++                return buffer, sid, C.wstring_at(text)
++            finally:
++                self.LocalFree(text)
++        finally:
++            self.CloseHandle(token)
++
++    @contextmanager
++    def security(self, directory=False):
++        sd = PTR()
++        flags = 'OICI' if directory else ''
++        self.check(self.ConvertStringSecurityDescriptorToSecurityDescriptorW(
++            f'O:{self.sid_text}D:P(A;{flags};FA;;;{self.sid_text})', 1, C.byref(sd), None))
++        try:
++            sa = SecurityAttributes(C.sizeof(SecurityAttributes), sd, 0)
++            yield sa
++        finally:
++            self.LocalFree(sd)
++
++    def private(self, handle, *, protected=True, inherited=False):
++        owner, dacl, sd = PTR(), PTR(), PTR()
++        error = self.GetSecurityInfo(handle, 1, 5, C.byref(owner), None, C.byref(dacl), None, C.byref(sd))
++        if error:
++            raise OSError(error, 'Cannot verify private ACL')
++        try:
++            control, revision = U16(), U32()
++            self.check(self.GetSecurityDescriptorControl(sd, C.byref(control), C.byref(revision)))
++            if (not owner or not dacl or not self.EqualSid(owner, self.user_sid)
++                    or (protected and not control.value & 0x1000)):
++                raise PermissionError('Private owner/protected DACL required')
++            acl = C.cast(dacl, C.POINTER(ACL)).contents
++            if acl.count != 1:
++                raise PermissionError('Exactly one owner-only full-control ACE required')
++            ptr = PTR()
++            self.check(self.GetAce(dacl, 0, C.byref(ptr)))
++            ace = C.cast(ptr, C.POINTER(ACE)).contents
++            sid = PTR(ptr.value + ACE.sid.offset)
++            if (ace.kind != 0 or ace.flags & ~(1 | 2 | (16 if inherited else 0)) or ace.mask != FULL
++                    or ace.size < ACE.sid.offset + 8 or not self.EqualSid(sid, self.user_sid)):
++                raise PermissionError('Unexpected or inherited private ACE')
++            return bool(control.value & 0x1000)
++        finally:
++            if sd:
++                self.LocalFree(sd)
++
++    def info(self, handle, directory=False):
++        info = FileInfo()
++        self.check(self.GetFileInformationByHandle(handle, C.byref(info)))
++        if info.attributes & REPARSE or bool(info.attributes & DIRECTORY) != directory:
++            raise PermissionError('Reparse point or wrong object type')
++        if not directory and info.links != 1:
++            raise PermissionError('Multiply linked private file')
++        return info
++
++    def open(self, path, access, disposition=3, directory=False, security=None):
++        # Share read/write, never delete: pin ancestors/lock inode against rename.
++        handle = self.CreateFileW(str(path), access | READ_CONTROL, 3,
++                                  C.byref(security) if security is not None else None,
++                                  disposition, 0x00200000 | (0x02000000 if directory else 0), None)
++        if handle == PTR(-1).value:
++            raise C.WinError(C.get_last_error())
++        try:
++            self.info(handle, directory)
++            return handle
++        except BaseException:
++            self.CloseHandle(handle)
++            raise
++
++
++_instance = None
++
++
++def api():
++    global _instance
++    if _instance is None:
++        _instance = API()
++    return _instance
++
++
++def local_path(path):
++    text = str(path)
++    drive, tail = ntpath.splitdrive(text)
++    if (len(drive) != 2 or drive[1] != ':' or not drive[0].isascii() or not drive[0].isalpha()
++            or not tail.startswith('\\') or '/' in text or ':' in tail or '\x00' in text):
++        raise ValueError('Explicit plain absolute local drive path required')
++    parts = tail.split('\\')[1:]
++    for part in parts:
++        if (not part or part in ('.', '..') or part.endswith((' ', '.'))
++                or any(ch in '<>"|?*' or ord(ch) < 32 for ch in part)
++                or part.split('.')[0].upper() in {'CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$', 'CLOCK$',
++                    *(f'COM{i}' for i in '¹²³'), *(f'LPT{i}' for i in '¹²³'),
++                    *(f'COM{i}' for i in range(1, 10)), *(f'LPT{i}' for i in range(1, 10))}):
++            raise ValueError('Unsafe Windows path component')
++    root = drive + '\\'
++    fs = C.create_unicode_buffer(32)
++    a = api()
++    if a.GetDriveTypeW(root) != 3:
++        raise PermissionError('Fixed local drive required')
++    a.check(a.GetVolumeInformationW(root, None, 0, None, None, None, fs, len(fs)))
++    if fs.value != 'NTFS':
++        raise PermissionError('Local NTFS proof required')
++    return root, parts
++
++
++@contextmanager
++def parent(path, *, create=False, private=True, native=False):
++    root, parts = local_path(path)
++    a = api()
++    with ExitStack() as stack:
++        current = root
++        handles = []
++        handle = a.open(current, 0, directory=True)
++        stack.callback(a.CloseHandle, handle)
++        handles.append(handle)
++        for component in parts[:-1]:
++            current = ntpath.join(current, component)
++            if create:
++                with a.security(directory=True) as sa:
++                    if not a.CreateDirectoryW(current, C.byref(sa)):
++                        error = C.get_last_error()
++                        if error != 183:  # ERROR_ALREADY_EXISTS; still verify opened object
++                            raise C.WinError(error)
++            handle = a.open(current, 0, directory=True)
++            stack.callback(a.CloseHandle, handle)
++            handles.append(handle)
++        if native:
++            # Native Rust files may inherit their sole owner ACE. Verify the
++            # complete owner-only suffix back to a protected directory while
++            # all ancestors stay pinned; never require rewriting native state.
++            for ancestor in reversed(handles):
++                if a.private(ancestor, protected=False, inherited=True):
++                    break
++            else:
++                raise PermissionError('Native registry lacks a protected owner-only root')
++        if private:
++            a.private(handle)
++        yield handle
++
++
++def open_file(path, flags, *, private=True):
++    import msvcrt
++    a = api()
++    disposition = 1 if flags & os.O_EXCL else (4 if flags & os.O_CREAT else 3)
++    access = 0x80000000
++    if flags & (os.O_WRONLY | os.O_RDWR):
++        access |= 0x40000000
++    with a.security() as sa:
++        handle = a.open(path, access, disposition, security=sa)
++    try:
++        # Native registry reads also require private ACL proof on Windows.
++        a.private(handle, protected=private, inherited=not private)
++        fd = msvcrt.open_osfhandle(handle, (flags & (os.O_WRONLY | os.O_RDWR)) | os.O_BINARY | os.O_NOINHERIT)
++    except BaseException:
++        a.CloseHandle(handle)
++        raise
++    return fd  # CRT fd now owns the handle
++
++
++def replace(source, target):
++    # Same directory, same volume. Bounded: no retry after sharing/ACL/IO uncertainty.
++    api().check(api().MoveFileExW(str(source), str(target), 1 | 8))
++
++
++def canonical_workspace(path):
++    # Native Rust uses canonicalize + strip_verbatim_prefix. Preserve actual case,
++    # never lower() or normcase() a journal identity or native workspace hash.
++    a = api()
++    with parent(ntpath.join(str(path), '__hub_path_probe__'), private=False) as handle:
++        buf = C.create_unicode_buffer(32768)
++        count = a.GetFinalPathNameByHandleW(handle, buf, len(buf), 0)
++        if not 0 < count < len(buf):
++            raise PermissionError('Cannot canonicalize native workspace')
++        text = buf.value
++        if text.startswith('\\\\?\\'):
++            text = text[4:]
++        local_path(ntpath.join(text, '__hub_path_probe__'))
++        return text
+diff --git a/host/tests/test_bridge.py b/host/tests/test_bridge.py
+--- a/host/tests/test_bridge.py
++++ b/host/tests/test_bridge.py
+@@ -219,6 +219,7 @@
+ 
+         spoof_dir = os.path.join(work, ".local", "cursors")
+         os.makedirs(spoof_dir, exist_ok=True)
++        os.chmod(os.path.join(work, ".local"), 0o700)
+         native_id = str(uuid.uuid4())
+         with open(os.path.join(spoof_dir, "fake.json"), "w", encoding="utf-8") as f:
+             json.dump({"exceptions": [native_id]}, f)
+@@ -1523,7 +1524,7 @@
+         create_authoritative_state(state_dir, canonical_ws, "agent-1", rec_uuid)
+ 
+         receipts_file = os.path.join(work, ".local", "hub-bridge-receipts.json")
+-        os.makedirs(os.path.dirname(receipts_file), exist_ok=True)
++        os.makedirs(os.path.dirname(receipts_file), mode=0o700, exist_ok=True)
+         corrupt_content = b'{"hub_to_native": {"incomplete": json_syntax_error'
+         with open(receipts_file, "wb") as f:
+             f.write(corrupt_content)
+diff --git a/host/tests/test_config.py b/host/tests/test_config.py
+--- a/host/tests/test_config.py
++++ b/host/tests/test_config.py
+@@ -39,14 +39,11 @@
+         loaded = config.load_config()
+         self.assertEqual(loaded, {})
+ 
+-    @patch("sys.platform", "win32")
+-    @patch("subprocess.run")
+-    def test_windows_acl_failure(self, mock_run):
+-        mock_run.return_value.returncode = 1
+-        mock_run.return_value.stderr = "access denied"
+-        mock_run.return_value.stdout = r"domain\user,S-1-5-21-1234"
+-        with self.assertRaisesRegex(RuntimeError, "Failed to"):
+-            config._set_permissions(self.mock_get_path.return_value)
++    def test_acl_backend_failure_never_publishes_config(self):
++        with patch.object(config.private_fs, 'atomic_write', side_effect=PermissionError('ACL unavailable')):
++            with self.assertRaisesRegex(RuntimeError, 'Config save failed'):
++                config.save_config({'access_token': 'fixture-only'})
++        self.assertFalse(self.mock_get_path.return_value.exists())
+ 
+     def test_reject_invalid_machine_id_and_origin(self):
+         for bad_mid in ("", "   ", " mach-1 ", 123, False, ["m1"], "mach\n1"):
+diff --git a/host/tests/test_private_fs.py b/host/tests/test_private_fs.py
+new file mode 100644
+--- /dev/null
++++ b/host/tests/test_private_fs.py
+@@ -0,0 +1,349 @@
++"""Portable executable smoke: stdlib unittest; fake Win32 cases are labelled simulations."""
++from contextlib import contextmanager
++import ctypes as C
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++import types
++import unittest
++from unittest.mock import patch
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from agent_hub_host import private_fs as fs, win32_fs as win
++
++
++class PrivateFileTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.root = Path(self.tmp.name)
++        # Windows temp parent is not guaranteed owner-only. Let the adapter create
++        # the private leaf with its initial protected descriptor, before any data.
++        self.path = self.root / 'private' / 'state.json'
++
++    def test_positive_roundtrip_replacement_and_bounds(self):
++        fs.atomic_write(self.path, b'{"version":1}', 1024)
++        fs.atomic_write(self.path, b'{"version":2,"extension":true}', 1024)
++        self.assertEqual(json.loads(fs.read_bytes(self.path, 1024))['version'], 2)
++        with self.assertRaises(ValueError):
++            fs.read_bytes(self.path, 2)
++        with self.assertRaises(ValueError):
++            fs.atomic_write(self.path, b'x' * 1025, 1024)
++        self.assertEqual(json.loads(fs.read_bytes(self.path, 1024))['extension'], True)
++        self.assertEqual(list(self.path.parent.glob('*.tmp')), [])
++
++    def test_real_subprocess_contention_and_process_death_release(self):
++        lock = self.path.with_suffix('.lock')
++        program = '''import sys,time
++from agent_hub_host.private_fs import exclusive_lock
++with exclusive_lock(sys.argv[1]):
++ print('locked', flush=True)
++ time.sleep(30)
++'''
++        env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]),
++                   PYTHONDONTWRITEBYTECODE='1')
++        child = subprocess.Popen([sys.executable, '-u', '-c', program, str(lock)],
++                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
++        try:
++            self.assertEqual(child.stdout.readline().strip(), 'locked')
++            with self.assertRaises(OSError):
++                with fs.exclusive_lock(lock):
++                    self.fail('second process obtained lock')
++        finally:
++            child.kill()
++            child.communicate(timeout=5)
++        with fs.exclusive_lock(lock):
++            self.assertTrue(lock.is_file())
++        # Closing/reopening must not remove a persistent lock inode.
++        with fs.exclusive_lock(lock):
++            pass
++
++    def test_hardlinks_rejected_for_reads_writes_and_locks(self):
++        fs.atomic_write(self.path, b'original', 1024)
++        alias = self.path.with_name('alias')
++        os.link(self.path, alias)
++        for operation in (lambda: fs.read_bytes(self.path, 1024),
++                          lambda: fs.atomic_write(self.path, b'changed', 1024)):
++            with self.assertRaises(OSError):
++                operation()
++        with self.assertRaises(OSError):
++            with fs.exclusive_lock(self.path):
++                self.fail('hardlink lock accepted')
++        self.assertEqual(alias.read_bytes(), b'original')
++
++    @unittest.skipUnless(os.name == 'nt', 'Actual Windows reparse evidence only')
++    def test_real_windows_reparse_refused_if_symlink_setup_supported(self):
++        fs.atomic_write(self.path, b'original', 1024)
++        link = self.root / 'junction-like-link'
++        try:
++            link.symlink_to(self.path.parent, target_is_directory=True)
++        except OSError as exc:
++            if getattr(exc, 'winerror', None) == 1314:
++                self.skipTest('OS privilege/developer mode does not allow symlink fixture')
++            raise
++        with self.assertRaises(OSError):
++            fs.read_bytes(link / self.path.name, 1024)
++        self.assertEqual(fs.read_bytes(self.path, 1024), b'original')
++
++    @unittest.skipIf(os.name == 'nt', 'POSIX mode and nofollow evidence')
++    def test_unsafe_modes_dangling_symlink_fifo_and_readonly(self):
++        fs.atomic_write(self.path, b'original', 1024)
++        os.chmod(self.path, 0o644)
++        with self.assertRaises(PermissionError):
++            fs.read_bytes(self.path, 1024)
++        os.chmod(self.path, 0o600)
++        link = self.path.with_name('link')
++        link.symlink_to('missing')
++        with self.assertRaises(OSError):
++            fs.atomic_write(link, b'x', 1024)
++        fifo = self.path.with_name('fifo')
++        os.mkfifo(fifo, 0o600)
++        with self.assertRaises(OSError):
++            fs.read_bytes(fifo, 1024)
++        os.chmod(self.path.parent, 0o500)
++        try:
++            with self.assertRaises(PermissionError):
++                fs.atomic_write(self.path, b'changed', 1024)
++        finally:
++            os.chmod(self.path.parent, 0o700)
++        self.assertEqual(self.path.read_bytes(), b'original')
++
++    @unittest.skipIf(os.name == 'nt', 'POSIX descriptor-relative race evidence')
++    def test_ancestor_symlink_and_swap_after_open_do_not_redirect(self):
++        fs.atomic_write(self.path, b'original', 1024)
++        foreign = self.root/'foreign'
++        foreign.mkdir(mode=0o700)
++        alias = self.root/'alias'
++        alias.symlink_to(self.path.parent, target_is_directory=True)
++        with self.assertRaises(OSError):
++            fs.read_bytes(alias/self.path.name, 1024)
++        real_replace = os.replace
++        def swap(source, target, **kwargs):
++            self.path.parent.rename(self.root/'moved')
++            self.path.parent.symlink_to(foreign, target_is_directory=True)
++            return real_replace(source, target, **kwargs)
++        with patch.object(fs.os, 'replace', side_effect=swap):
++            fs.atomic_write(self.path, b'anchored', 1024)
++        self.assertEqual(list(foreign.iterdir()), [])
++        self.assertEqual((self.root/'moved'/self.path.name).read_bytes(), b'anchored')
++
++    def test_replace_failure_preserves_original_without_temp_residue(self):
++        fs.atomic_write(self.path, b'original', 1024)
++        target = 'agent_hub_host.win32_fs.replace' if os.name == 'nt' else 'os.replace'
++        with patch(target, side_effect=OSError('injected replacement failure')):
++            with self.assertRaises(OSError):
++                fs.atomic_write(self.path, b'changed', 1024)
++        self.assertEqual(fs.read_bytes(self.path, 1024), b'original')
++        self.assertEqual(list(self.path.parent.glob('*.tmp')), [])
++
++
++class FakeAPI:
++    """Simulated stdlib/Win32 boundary; never physical Windows evidence."""
++    def __init__(self):
++        self.calls, self.closed = [], []
++        self.fail_private = False
++        self.fs = 'NTFS'
++        self.drive = 3
++    def GetDriveTypeW(self, root):
++        return self.drive
++    def GetVolumeInformationW(self, root, *args):
++        args[-2].value = self.fs
++        return 1
++    def check(self, value):
++        if not value:
++            raise OSError('simulated API failure')
++    def open(self, path, access, disposition=3, directory=False, security=None):
++        self.calls.append((str(path), access, disposition, directory, security is not None))
++        return 0x100000000 + len(self.calls)
++    def CloseHandle(self, handle):
++        self.closed.append(handle)
++        return 1
++    def private(self, handle, **kwargs):
++        if self.fail_private:
++            raise PermissionError('simulated unknown ACL')
++        return True
++    @contextmanager
++    def security(self, directory=False):
++        yield win.SecurityAttributes()
++    def CreateDirectoryW(self, path, security):
++        return 1
++    def MoveFileExW(self, source, target, flags):
++        self.calls.append((source, target, flags))
++        return 1
++    def GetFinalPathNameByHandleW(self, handle, buf, size, flags):
++        buf.value = '\\\\?\\C:\\Work\\Private'
++        return len(buf.value)
++
++
++class SimulatedWindowsTests(unittest.TestCase):
++    def setUp(self):
++        self.a = FakeAPI()
++        self.patcher = patch.object(win, 'api', return_value=self.a)
++        self.patcher.start()
++        self.addCleanup(self.patcher.stop)
++
++    def test_positive_ntfs_pinned_parent_and_atomic_write_through(self):
++        with win.parent(r'C:\Work\Private\journal', create=True):
++            self.assertEqual(len(self.a.calls), 3)
++            self.assertEqual(self.a.closed, [])
++        self.assertEqual(self.a.closed, [0x100000003, 0x100000002, 0x100000001])
++        win.replace(r'C:\Work\Private\tmp', r'C:\Work\Private\journal')
++        self.assertEqual(self.a.calls[-1][-1], 9)
++
++    def test_unknown_filesystem_drive_acl_and_api_fail_closed(self):
++        for fs, drive in [('FAT32', 3), ('NTFS', 4), ('', 3)]:
++            self.a.fs, self.a.drive = fs, drive
++            with self.assertRaises(PermissionError):
++                with win.parent(r'C:\Work\journal'):
++                    self.fail('unsupported filesystem accepted')
++        self.a.fs, self.a.drive, self.a.fail_private = 'NTFS', 3, True
++        with self.assertRaises(PermissionError):
++            with win.parent(r'C:\Work\journal'):
++                self.fail('unknown ACL accepted')
++        self.assertEqual(len(self.a.closed), len(self.a.calls))
++        with patch.object(self.a, 'GetVolumeInformationW', return_value=0):
++            with self.assertRaises(OSError):
++                win.local_path(r'C:\Work\journal')
++
++    def test_windows_path_spelling_is_strict_and_canonical_case_preserved(self):
++        for path in [r'C:relative', r'\relative', r'\\server\share\file', r'\\?\C:\file',
++                     r'C:\a\..\b', r'C:\a\file:stream', r'C:\a\NUL.txt',
++                     'C:\\a\\trailing. ', 'C:/a/file', 'C:\\a\\\\file']:
++            with self.subTest(path=path), self.assertRaises(ValueError):
++                win.local_path(path)
++        self.assertEqual(win.canonical_workspace(r'C:\Work\Private'), r'C:\Work\Private')
++
++    def test_open_transfers_handle_once_and_acl_failure_closes(self):
++        fake = types.SimpleNamespace(open_osfhandle=lambda h, flags: h + 99)
++        with patch.dict(sys.modules, msvcrt=fake), patch.object(os, 'O_BINARY', 0x8000, create=True), patch.object(os, 'O_NOINHERIT', 0x80, create=True):
++            fd = win.open_file(r'C:\Work\file', os.O_CREAT | os.O_EXCL | os.O_RDWR)
++            self.assertEqual(fd, 0x100000001 + 99)
++            self.assertEqual(self.a.calls[-1][2], 1)  # CREATE_NEW, not truncate
++            self.assertTrue(self.a.calls[-1][-1])  # descriptor supplied at creation
++            self.assertEqual(self.a.closed, [])
++            self.a.fail_private = True
++            with self.assertRaises(PermissionError):
++                win.open_file(r'C:\Work\file', os.O_RDONLY)
++        self.assertEqual(self.a.closed, [0x100000002])
++
++    def test_actual_info_validation_reparse_hardlink_wrong_kind(self):
++        raw = win.API.__new__(win.API)
++        raw.check = self.a.check
++        for attrs, links, directory in [(win.REPARSE, 1, False), (0, 2, False), (win.DIRECTORY, 1, False), (0, 1, True)]:
++            def info(handle, ptr):
++                item = C.cast(ptr, C.POINTER(win.FileInfo)).contents
++                item.attributes, item.links = attrs, links
++                return 1
++            raw.GetFileInformationByHandle = info
++            with self.assertRaises(PermissionError):
++                raw.info(0x100000000, directory=directory)
++        attrs, links = 0, 1
++        self.assertEqual(raw.info(0x100000000).links, 1)
++
++    def test_actual_acl_validation_positive_and_unknown_owner_ace_holds(self):
++        raw = win.API.__new__(win.API)
++        raw.check = self.a.check
++        raw.user_sid = 77
++        acl = win.ACL()
++        acl.count = 1
++        ace = win.ACE()
++        ace.size, ace.mask = 24, win.FULL
++        protected, same_owner, null_acl = True, True, False
++        frees = []
++        def security(handle, kind, fields, owner, group, dacl, sacl, sd):
++            C.cast(owner, C.POINTER(win.PTR))[0] = 77 if same_owner else 88
++            C.cast(dacl, C.POINTER(win.PTR))[0] = C.addressof(acl) if not null_acl else None
++            C.cast(sd, C.POINTER(win.PTR))[0] = 99
++            return 0
++        def control(sd, value, revision):
++            C.cast(value, C.POINTER(win.U16))[0] = 0x1000 if protected else 0
++            return 1
++        def getace(dacl, index, result):
++            C.cast(result, C.POINTER(win.PTR))[0] = C.addressof(ace)
++            return 1
++        raw.GetSecurityInfo, raw.GetSecurityDescriptorControl, raw.GetAce = security, control, getace
++        # Fake SID equality at OS boundary; production calls EqualSid on real SIDs.
++        raw.EqualSid = lambda left, right: bool(left and (getattr(left, 'value', left) in (77, C.addressof(ace) + win.ACE.sid.offset)))
++        raw.LocalFree = lambda ptr: frees.append(ptr.value)
++        raw.private(123)
++        for key, value in [('protected', False), ('same_owner', False), ('null_acl', True),
++                           ('count', 2), ('flags', 0x10), ('mask', 0x120089), ('kind', 5)]:
++            protected, same_owner, null_acl = True, True, False
++            acl.count, ace.flags, ace.mask, ace.kind = 1, 0, win.FULL, 0
++            if key == 'protected': protected = value
++            elif key == 'same_owner': same_owner = value
++            elif key == 'null_acl': null_acl = value
++            elif key == 'count': acl.count = value
++            else: setattr(ace, key, value)
++            with self.subTest(key=key), self.assertRaises(PermissionError):
++                raw.private(123)
++        self.assertEqual(frees, [99] * 8)
++        protected, same_owner, null_acl = False, True, False
++        acl.count, ace.flags, ace.mask, ace.kind = 1, 16, win.FULL, 0
++        self.assertFalse(raw.private(123, protected=False, inherited=True))
++        with self.assertRaises(PermissionError):
++            raw.private(123)
++
++
++    def test_native_inherited_acl_requires_verified_owner_suffix_to_protected_root(self):
++        checks = []
++        def inherited(handle, **kwargs):
++            checks.append(handle)
++            return handle == 0x100000002  # protected Work root, inherited Private leaf
++        with patch.object(self.a, 'private', side_effect=inherited):
++            with win.parent(r'C:\Work\Private\session.json', private=False, native=True):
++                pass
++        self.assertEqual(checks, [0x100000003, 0x100000002])
++        with patch.object(self.a, 'private', return_value=False):
++            with self.assertRaises(PermissionError):
++                with win.parent(r'C:\Work\Private\session.json', private=False, native=True):
++                    self.fail('unprotected registry accepted')
++        with patch.object(self.a, 'private', side_effect=PermissionError('foreign ancestor ACL')):
++            with self.assertRaises(PermissionError):
++                with win.parent(r'C:\Work\Private\session.json', private=False, native=True):
++                    self.fail('foreign registry ancestor accepted')
++
++    def test_actual_open_flags_pin_handle_and_cleanup_failed_type_proof(self):
++        raw = win.API.__new__(win.API)
++        calls, closed = [], []
++        def create(*args):
++            calls.append(args)
++            return 0x123456789
++        raw.CreateFileW, raw.CloseHandle = create, lambda h: closed.append(h)
++        raw.info = lambda handle, directory: None
++        self.assertEqual(raw.open('C:\\folder', 0, directory=True), 0x123456789)
++        self.assertEqual(calls[-1][2], 3)  # share read/write without delete
++        self.assertEqual(calls[-1][5], 0x00200000 | 0x02000000)
++        with patch.object(raw, 'info', side_effect=PermissionError('reparse')):
++            with self.assertRaises(PermissionError):
++                raw.open('C:\\folder', 0)
++        self.assertEqual(closed, [0x123456789])
++
++    def test_msvcrt_nonblocking_contention_and_close_on_failure(self):
++        fake = types.SimpleNamespace(LK_NBLCK=2, locking=lambda *args: None)
++        lock = Path(tempfile.gettempdir())/'simulated-lock'
++        # Only the selection/CRT contract is mocked, with real scratch file descriptors.
++        with tempfile.TemporaryFile() as stream:
++            duplicate = os.dup(stream.fileno())
++            @contextmanager
++            def parent(*args, **kwargs):
++                yield 42
++            with patch.object(fs, '_windows', return_value=True), patch.object(fs, 'parent', parent), \
++                 patch.object(fs, '_open', return_value=duplicate), patch.dict(sys.modules, msvcrt=fake):
++                def contended(fd, mode, count):
++                    self.assertEqual((mode, count), (2, 1))
++                    self.assertEqual(os.lseek(fd, 0, os.SEEK_CUR), 0)
++                    raise BlockingIOError('simulated contention')
++                fake.locking = contended
++                with self.assertRaises(BlockingIOError):
++                    with fs.exclusive_lock(lock):
++                        self.fail('contended Windows lock accepted')
++            with self.assertRaises(OSError):
++                os.fstat(duplicate)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/host/tests/test_windows_imports.py b/host/tests/test_windows_imports.py
+new file mode 100644
+--- /dev/null
++++ b/host/tests/test_windows_imports.py
+@@ -0,0 +1,71 @@
++"""Import/CLI/native-path contracts without Unix lock modules (source evidence)."""
++import contextlib
++import io
++import json
++import ntpath
++import os
++from pathlib import Path
++import subprocess
++import sys
++import types
++import unittest
++from unittest.mock import patch, MagicMock
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++
++class ImportContracts(unittest.TestCase):
++    def test_actual_conversation_and_bus_modules_import_without_fcntl(self):
++        program = '''import sys
++sys.modules['fcntl'] = None
++from agent_hub_host import cli, auth, conversations, native_bridge, bridge, conversation_bridge
++assert 'agent_hub_host.guarded_root' not in sys.modules
++for args in [('conversations','bridge','--help'), ('bridge-resume','--help'), ('login','--help')]:
++ sys.argv=['hub',*args]
++ try: cli.main()
++ except SystemExit as exc: assert exc.code == 0
++'''
++        env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
++        result = subprocess.run([sys.executable, '-c', program], env=env, capture_output=True, text=True, timeout=10)
++        self.assertEqual(result.returncode, 0, result.stderr)
++
++    def test_native_windows_roots_match_readonly_rust_contract(self):
++        from agent_hub_host import bridge
++        environment = {'LOCALAPPDATA': r'C:\Users\Owner\AppData\Local',
++                       'XDG_RUNTIME_DIR': '/wrong-unix-runtime', 'XDG_STATE_HOME': '/wrong-unix-state'}
++        fake_os = types.SimpleNamespace(name='nt', path=ntpath, environ=environment)
++        with patch.object(bridge, 'os', fake_os):
++            self.assertEqual(bridge.get_authoritative_state_dir(), r'C:\Users\Owner\AppData\Local\aplexer\state')
++            self.assertEqual(bridge.get_authoritative_runtime_dir(), r'C:\Users\Owner\AppData\Local\aplexer\run')
++            for relative in ('relative', r'C:relative', r'\root-relative'):
++                with self.assertRaises(bridge.BridgeCapabilityGap):
++                    bridge.get_authoritative_state_dir(relative)
++            environment['LOCALAPPDATA'] = 'relative'
++            with self.assertRaises(bridge.BridgeCapabilityGap):
++                bridge.get_authoritative_runtime_dir()
++
++    def test_public_login_keeps_automatic_machine_binding_no_manual_metadata(self):
++        # Client protocol simulation, not real enrollment/Worker proof.
++        from agent_hub_host import auth, api, config
++        token = {'access_token': 'fixture-only', 'machine_id': 'fixture-machine'}
++        def flow(origin, post, **kwargs):
++            status, response = post(origin + kwargs['token_path'], {'device_code': 'fixture'})
++            self.assertEqual(status, 200)
++            return response
++        module = types.SimpleNamespace(device_login=flow, DeviceLoginError=RuntimeError)
++        response = MagicMock()
++        response.headers = {'Content-Type': 'application/json'}
++        response.read.return_value = json.dumps(token).encode()
++        response.__enter__.return_value = response
++        with patch.object(auth, '_shared_device_login', return_value=module), \
++             patch('urllib.request.OpenerDirector.open', return_value=response), \
++             patch.object(config, 'load_config', return_value={}), patch.object(config, 'save_config') as save, \
++             contextlib.redirect_stdout(io.StringIO()):
++            auth.device_login('https://fixture.invalid', 'agent', 'fixture:worker', 'fixture-host', ['conversations:read'])
++        self.assertEqual(save.call_args.args[0]['machine_id'], 'fixture-machine')
++        self.assertEqual(save.call_args.args[0]['access_token'], 'fixture-only')
++        config._pending_machine_binding.clear()
++
++
++if __name__ == '__main__':
++    unittest.main()
