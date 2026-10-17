@@ -188,6 +188,11 @@ def verify_server_claim(claim: dict[str, Any], *, now_ms: Optional[int] = None) 
     NO effect. A repeated claim token never authorizes another execution — the
     journal binds the token per key. Expiry uses the caller's clock only to
     fail closed; the server is the authority on grant and revocation.
+
+    ``cleanup_tree`` (optional server-owned boolean, default False) is the
+    ONLY tree authorization: true means the server re-evaluated
+    owner/incarnation/M15 eligibility at claim time for this exact command.
+    The host never infers it from key prefixes, paths, or JSON owner proof.
     """
     if not isinstance(claim, dict):
         raise SessionControlError("Server claim is required before any effect")
@@ -219,8 +224,13 @@ def verify_server_claim(claim: dict[str, Any], *, now_ms: Optional[int] = None) 
     now = now_ms if type(now_ms) is int else int(time.time() * 1000)
     if now >= expires_at:
         raise SessionControlError("Claim expired; no effect, request a fresh attempt")
+    # Server-owned tree authorization only: explicit True from the claim.
+    # Anything else (missing/False/non-bool, key prefixes, paths, JSON owner
+    # strings) is never authorization.
+    cleanup_authorized = claim.get("cleanup_tree") is True
     return {"command_id": command_id, "claim_token": token, "holder": holder,
-            "generation": generation, "expires_at_ms": expires_at}
+            "generation": generation, "expires_at_ms": expires_at,
+            "cleanup_tree_authorized": cleanup_authorized}
 
 
 def _request_status(exc: BaseException) -> Optional[int]:
@@ -862,10 +872,14 @@ def handle_claimed_command(
        ``acknowledged`` lives in the reply-proof field, never as a bare claim).
 
     M15d STOP-bundled tree: when ``cleanup_roots`` (HOST-config allowlist) is
-    provided, a containment-confirmed stop additionally removes the session's
+    provided AND the server claim carries explicit ``cleanup_tree is True``
+    (re-evaluated owner/incarnation/M15 eligibility at claim), a
+    containment-confirmed stop additionally removes the session's
     own worktree under the same claim (canonical binding workspace +
     discovered branch); the tree outcome rides the stop ack as data and never
-    gates the stop verdict. ``None`` (default) leaves stop acks tree-free.
+    gates the stop verdict. ``None`` roots, or a claim without the explicit
+    flag (ordinary stops), leaves stop acks tree-free. Roots are confinement,
+    never target authority.
 
     ``start`` is explicitly REJECTED here: Fleet already handles start once
     (see :func:`start_from_offer`); this receiver never reconsumes Fleet offers
@@ -944,6 +958,7 @@ def handle_claimed_command(
         attempt = {"op": op, "command_id": command_id, "attempted": True,
                    "state": None, "claim_token": proved["claim_token"],
                    "holder": proved["holder"], "generation": proved["generation"],
+                   "cleanup_tree_authorized": proved.get("cleanup_tree_authorized") is True,
                    "caller_actor": custody.actor, "caller_family": custody.credential_family,
                    "target": {"session_id": target.session_id, "tag": target.tag,
                               "workspace": target.workspace,
@@ -960,7 +975,8 @@ def handle_claimed_command(
             outcome = _run_claimed_effect(
                 executable, op, command, target, custody=custody,
                 journal_dir=journal_dir, sender_workspace=sender_workspace,
-                cleanup_roots=cleanup_roots)
+                cleanup_roots=cleanup_roots,
+                cleanup_tree_authorized=proved.get("cleanup_tree_authorized") is True)
         except SessionUncertain as exc:
             raise SessionUncertain(str(exc) or "Effect uncertain; reconcile") from exc
 
@@ -1103,6 +1119,7 @@ def _run_claimed_effect(
     journal_dir: str,
     sender_workspace: Optional[str] = None,
     cleanup_roots: Optional[list] = None,
+    cleanup_tree_authorized: bool = False,
 ) -> dict[str, Any]:
     """Run one claimed native effect; returns the outcome fields for ack mapping.
 
@@ -1112,10 +1129,12 @@ def _run_claimed_effect(
     ``original_native_message_id``. The ack ``native`` triple is always the
     exact bound target; proof carries the envelope ids separately.
 
-    ``cleanup_roots`` (HOST-config allowlist, None disables) arms the M15d
-    STOP-bundled tree step: after a containment-confirmed stop, the session's
-    own worktree is removed via :func:`_run_cleanup_tree_after_stop` under the
-    same claim. Anything else leaves the stop ack tree-free.
+    ``cleanup_roots`` (HOST-config allowlist, None disables) plus explicit
+    ``cleanup_tree_authorized is True`` (server claim flag, re-evaluated
+    eligibility) arms the M15d STOP-bundled tree step: after a
+    containment-confirmed stop, the session's own worktree is removed via
+    :func:`_run_cleanup_tree_after_stop` under the same claim. Ordinary stops
+    (flag False/missing) NEVER run the tree even with roots configured.
     """
     if op == "send":
         body = command["body"]
@@ -1181,10 +1200,13 @@ def _run_claimed_effect(
     # M15d owning-host tree (STOP-bundled, same claim, no second controller):
     # after a containment-confirmed stop, remove the session's own dedicated
     # worktree derived ONLY from the canonical binding workspace + HOST-config
-    # roots + live native identity + discovered registered branch. The tree
-    # never gates the stop verdict: kept/uncertain trees ride the stop ack as
-    # data while the stop itself still reports its confirmed outcome.
-    if confirmed and cleanup_roots is not None:
+    # roots + live native identity + discovered registered branch, and ONLY
+    # when the server claim explicitly authorized it (cleanup_tree is True).
+    # Ordinary stops NEVER run the tree even with roots configured: roots are
+    # confinement, not target authority. The tree never gates the stop
+    # verdict: kept/uncertain trees ride the stop ack as data while the stop
+    # itself still reports its confirmed outcome.
+    if confirmed and cleanup_tree_authorized is True and cleanup_roots is not None:
         outcome["tree"] = _run_cleanup_tree_after_stop(
             executable, target, custody=custody, journal_dir=journal_dir,
             cleanup_roots=cleanup_roots, command_id=str(command["command_id"]))

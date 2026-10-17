@@ -26,6 +26,7 @@ import { taskTier } from './model-routing';
 import { approvalAuthorityMatches } from './host_enrollment';
 import {
   buildLifecycleView,
+  classifyKey,
   collectCleanupEligible,
   initLifecycleTables,
   planCleanupDryRun,
@@ -328,6 +329,43 @@ export class SessionControlService {
       return null;
     }
     return null;
+  }
+
+  /** Server-owned cleanup-tree marker: true ONLY when the stored command
+   * payload carries the explicit cleanup flag written by the cleanup --apply
+   * route inside the mutation txn. Ordinary stop/send/capture routes always
+   * enqueue fixed payloads without this flag, so they can never set it. The
+   * request_key prefix is caller-controlled and is NEVER read here. */
+  private cleanupStored(row: any): boolean {
+    if (!row || row.kind !== 'stop') return false;
+    const payload = row.payload_json ? parsed(row.payload_json, null) : null;
+    return !!payload && payload.cleanup_tree === true;
+  }
+
+  /** Re-evaluate M15 cleanup eligibility at claim time (before any native
+   * effect): stored flag + same owner (session.actor === command.actor) +
+   * live binding incarnation + still finished/superseded with zero obligations
+   * and not human-owned. Anything else yields false (stop still claimable,
+   * tree never authorized). No JSON owner proof is ever trusted: ownership is
+   * the live session/command rows plus the M15 canonical joins. */
+  private cleanupAuthorized(row: any, session: any): boolean {
+    if (!this.cleanupStored(row)) return false;
+    if (!session || session.actor !== row.actor) return false;
+    const binding = session.binding_json ? parsed(session.binding_json, null) : null;
+    if (!binding || typeof binding.native_id !== 'string' || !binding.native_id) return false;
+    if (!session.machine_id) return false;
+    try {
+      const live = classifyKey(this.sql, `${session.machine_id}/${binding.native_id}`, this.now());
+      if (!live) return false;
+      if (live.refs?.human_owned) return false;
+      if (live.group !== 'finished_stale') return false;
+      if (!['finished', 'superseded'].includes((live as any).state)) return false;
+      if (((live as any).obligations?.length ?? 0) > 0) return false;
+      if (live.refs?.owner !== row.actor) return false;
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private view(row: any) {
@@ -838,8 +876,14 @@ export class SessionControlService {
               pending = null;
             }
             if (pending) {
-              enqueued.push({ session_key: target.session_key, session_id: live.id, command_id: pending.id, state: pending.state, replay: true });
-              continue;
+              // Never co-opt an ordinary stop as cleanup: only a stored
+              // cleanup command replays here. An ordinary pending stop is
+              // left alone and a fresh cleanup stop is enqueued below (the
+              // host runs the tree ONLY for the flagged command).
+              if (this.cleanupStored(pending)) {
+                enqueued.push({ session_key: target.session_key, session_id: live.id, command_id: pending.id, state: pending.state, replay: true });
+                continue;
+              }
             }
             const pendingCount = Number(this.sql.exec(
               "SELECT COUNT(*) AS n FROM session_control_commands WHERE state IN ('recorded', 'transported', 'claimed')").one().n);
@@ -854,7 +898,11 @@ export class SessionControlService {
               continue;
             }
             const sessionKey = `cu-${String(operationKey).slice(0, 12)}-${String(live.id).slice(0, 8)}`;
-            this.enqueue(live, 'stop', actorName(caller), caller, sessionKey, {});
+            // Server-owned cleanup-tree authorization: persisted ONLY here
+            // (authenticated eligible cleanup --apply). Ordinary stop routes
+            // enqueue fixed {} payloads and can never set this flag; the
+            // cu- key prefix is caller-visible only and never authorizes.
+            this.enqueue(live, 'stop', actorName(caller), caller, sessionKey, { cleanup_tree: true, operation_key: operationKey });
             let row: any = null;
             try {
               row = this.sql.exec('SELECT * FROM session_control_commands WHERE session_id = ? AND actor = ? AND request_key = ?', live.id, actorName(caller), sessionKey).toArray()[0] ?? null;
@@ -1018,6 +1066,12 @@ export class SessionControlService {
             // Expected session engine for host-side masquerade refusal: the
             // receiver qualifies the live catalog row against it.
             engine: session.engine ?? null,
+            // Server-owned cleanup-tree authorization (canonical offer
+            // exposure): true ONLY for stop commands whose stored payload was
+            // written by the cleanup --apply route. Ordinary stops carry
+            // false; the key prefix is never read. The claim re-evaluates
+            // eligibility and is the fence; this offer flag is visibility.
+            cleanup_tree: this.cleanupStored(row),
             // Native send/capture targets need the exact bound tag + incarnation;
             // unbound sessions (stop on offered) carry binding null + fleet correlation.
             // native_created_at_ms is mandatory for host generation provenance:
@@ -1065,8 +1119,11 @@ export class SessionControlService {
           // The grant carries holder + generation + both expiry forms so the
           // host receiver can feed verify_server_claim without inferring field
           // names: expires_at (ISO, canonical) and expires_at_ms (int, host clock).
+          // cleanup_tree is the re-evaluated server-owned tree authorization
+          // (owner/incarnation/M15 eligibility NOW, not at enqueue); the host
+          // runs the tree ONLY when this is true plus a confirmed stop.
           if (row.holder_attempt === input.attempt_id) {
-            return response({ command_id: row.id, claim_token: row.claim_token, holder: row.holder_machine, generation: row.generation, expires_at: row.claim_expires_at, expires_at_ms: Date.parse(row.claim_expires_at), attempt: row.attempts ?? 1, replay: true });
+            return response({ command_id: row.id, claim_token: row.claim_token, holder: row.holder_machine, generation: row.generation, expires_at: row.claim_expires_at, expires_at_ms: Date.parse(row.claim_expires_at), attempt: row.attempts ?? 1, replay: true, cleanup_tree: this.cleanupAuthorized(row, session) });
           }
           return response({ error: 'already_claimed' }, 409);
         }
@@ -1079,7 +1136,7 @@ export class SessionControlService {
           caller.machineId, token, expires, input.attempt_id, attempt, this.at(), row.id);
         if (written.rowsWritten !== 1) return response({ error: 'claim_conflict' }, 409);
         this.adoptHostFamily(session.id, caller);
-        return response({ command_id: row.id, claim_token: token, holder: caller.machineId, generation: row.generation, expires_at: expires, expires_at_ms: Date.parse(expires), attempt });
+        return response({ command_id: row.id, claim_token: token, holder: caller.machineId, generation: row.generation, expires_at: expires, expires_at_ms: Date.parse(expires), attempt, cleanup_tree: this.cleanupAuthorized(row, session) });
       });
     }
 
@@ -1169,7 +1226,9 @@ export class SessionControlService {
         // existing commands listing for CLI remote-observe); the stop verdict
         // itself never depends on it. Ownership is rechecked at this durable
         // ack: a drifted session owner converts the tree to kept
-        // (ownership_changed), never a removal.
+        // (ownership_changed), never a removal. Only a stored cleanup
+        // command (cleanup --apply) may report a tree: an ordinary stop
+        // reporting one is coerced to kept (not_cleanup_authorized).
         const TREE_STATES = new Set(['removed', 'kept', 'uncertain']);
         let tree: { state: string; reason: string } | null = null;
         if (input.tree !== undefined) {
@@ -1179,7 +1238,9 @@ export class SessionControlService {
             return response({ error: 'invalid_ack' }, 400);
           }
           tree = { state: input.tree.state, reason: input.tree.reason };
-          if (session.actor !== row.actor) {
+          if (!this.cleanupStored(row)) {
+            tree = { state: 'kept', reason: `not_cleanup_authorized: ordinary stop never authorizes a tree (host reported ${input.tree.state})`.slice(0, 300) };
+          } else if (session.actor !== row.actor) {
             tree = { state: 'kept', reason: `ownership_changed: session owner drifted since enqueue; listed-only (host reported ${input.tree.state})`.slice(0, 300) };
           }
         }

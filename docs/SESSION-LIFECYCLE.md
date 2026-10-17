@@ -133,12 +133,21 @@ server eligibility), not a second registry or fake apply.
   states are kept with actual reasons. The host executes each stop through
   the existing claim/effect/ack path with containment-confirmed exit.
 - Tree/branch removal (OWNING HOST, STOP-bundled under the SAME claim, after
-  CONFIRMED stop only): `host/agent_hub_host/session_cleanup.py` removes ONLY
+  CONFIRMED stop only, and ONLY for the server-flagged cleanup command):
+  `host/agent_hub_host/session_cleanup.py` removes ONLY
   the canonical binding workspace (server offer binding — never a
   caller-supplied path) under the trusted HOST-config `cleanup_roots`
   allowlist (explicit `cleanup_roots` in the host settings; `fleet.py`
   validates the allowlist shape, `session_host.py` passes it to the receiver,
-  neither auto-deletes). The branch is DISCOVERED from the registered
+  neither auto-deletes). Roots are confinement, never target authority:
+  ordinary stops NEVER run the tree even with roots configured. The
+  server persists an explicit `cleanup_tree` authorization ONLY in the
+  cleanup `--apply` txn (ordinary stop routes enqueue fixed `{}` payloads and
+  can never set it; the `cu-` key prefix is caller-visible and never read),
+  exposes it in the canonical offer (`cleanup_tree`) and claim
+  (`cleanup_tree`, re-evaluated owner/incarnation/M15 eligibility at claim),
+  and coerces ordinary-stop tree reports to kept (`not_cleanup_authorized`).
+  The branch is DISCOVERED from the registered
   worktree list (never a caller-supplied branch); custody must equal the
   server claim holder machine and the stop must already be
   containment-confirmed in the same claimed attempt (no owner-string
