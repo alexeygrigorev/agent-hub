@@ -5,6 +5,7 @@ import {
   ConversationsService,
   authenticateConversationRequest,
 } from './conversations';
+import { ConversationLinksService } from './conversation-links';
 
 /**
  * Durable Object subclass extending BaseHub with the M1 `/api/conversations`
@@ -15,6 +16,7 @@ import {
  */
 export class Hub extends BaseHub {
   public conversationsService: ConversationsService;
+  public linksService: ConversationLinksService;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -39,7 +41,14 @@ export class Hub extends BaseHub {
     };
     this.busService.txSync = txSync;
     this.conversationsService = new ConversationsService(this.sql, txSync);
+    this.linksService = new ConversationLinksService(
+      this.sql,
+      this.conversationsService,
+      txSync,
+    );
+    this.conversationsService.linksHandler = this.linksService;
     this.conversationsService.init();
+    this.linksService.init();
 
     const baseRetentionCleanup = this.busService.retentionCleanup.bind(
       this.busService,
@@ -57,6 +66,7 @@ export class Hub extends BaseHub {
         messagesDeleted: 0,
         removedMembersDeleted: 0,
         membersDeleted: 0,
+        linksDeleted: 0,
         rowsDeleted: 0,
         hasMore: false,
       };
@@ -70,7 +80,10 @@ export class Hub extends BaseHub {
       return txSync(() => {
         let remaining = normalizedLimit;
         let busCleanup = emptyBus;
-        let convCleanup = emptyConv;
+        let convCleanup = {
+          ...emptyConv,
+          linksDeleted: 0,
+        };
 
         const takeBus = (budget: number): number => {
           if (budget <= 0 || remaining <= 0) return 0;
@@ -106,6 +119,8 @@ export class Hub extends BaseHub {
             removedMembersDeleted:
               convCleanup.removedMembersDeleted + step.removedMembersDeleted,
             membersDeleted: convCleanup.membersDeleted + step.membersDeleted,
+            linksDeleted:
+              (convCleanup.linksDeleted ?? 0) + (step.linksDeleted ?? 0),
             rowsDeleted: convCleanup.rowsDeleted + step.rowsDeleted,
             hasMore: step.hasMore,
           };
@@ -136,6 +151,7 @@ export class Hub extends BaseHub {
           removedMembersDeleted: convCleanup.removedMembersDeleted,
           conversationMembersDeleted: convCleanup.membersDeleted,
           conversationRowsDeleted: convCleanup.rowsDeleted,
+          conversationLinksDeleted: convCleanup.linksDeleted,
           hasMore:
             this.busService.hasExpiredRows(now) ||
             this.conversationsService.hasExpiredRows(now),
@@ -147,6 +163,7 @@ export class Hub extends BaseHub {
   override initDb(): void {
     super.initDb();
     this.conversationsService?.init();
+    this.linksService?.init();
   }
 
   override async fetch(request: Request): Promise<Response> {

@@ -1,6 +1,6 @@
 # Agent Hub Conversations API & Integration Contract (M1)
 
-> **Status**: Candidate domain service (`src/conversations.ts`) and HTTP route contract for Milestone M1. Production route wiring in `src/hub.ts` and `src/worker.ts` is reserved for head integration after independent review.
+> **Status**: Landed M1 domain service (`src/conversations.ts`) composed by `src/conversation-hub.ts`. M4 task/review/outcome links are a metadata-only join table owned by `src/conversation-links.ts`; see [CONVERSATION-LINKS.md](CONVERSATION-LINKS.md). Attaching a link does not submit or launch a job. Canonical status is derived from existing `routing_jobs` / `fleet_launches` rows; there is no independent review/outcome table. Membership plus target GET visibility are both required. Routing policy files stay untouched.
 
 ## 1. Overview & Architecture
 
