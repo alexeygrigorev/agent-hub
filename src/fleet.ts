@@ -357,7 +357,21 @@ export class FleetService {
       }
       return this.transaction(() => {
         this.admission.reconcileOffers();
-        if (Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE state IN ${ACTIVE}`).one().n)) return response({ error: 'active_launches_hold_registry' }, 409);
+        if (Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE state IN ${ACTIVE}`).one().n)) {
+          // Add engine routes to the same quota pool without replacing live
+          // account policy, subscriptions, routes or execution reservations.
+          const accounts = this.sql.exec('SELECT * FROM fleet_accounts').toArray() as any[];
+          const routes = this.sql.exec('SELECT * FROM fleet_routes').toArray() as any[];
+          const unchangedAccounts = accounts.length === data.accounts.length && accounts.every(a => data.accounts.some((n: any) =>
+            n.label === a.label && n.provider === a.provider && n.max_concurrency === a.max_concurrency &&
+            n.reserve_percent === a.reserve_percent && Number(n.enabled) === a.enabled));
+          const sameRoute = (a: any, b: any) => a.machine_id === b.machine_id && a.engine === b.engine && a.account === b.account && a.profile === b.profile;
+          const retainedRoutes = routes.every(r => data.routes.some((n: any) => sameRoute(r, n)));
+          const added = data.routes.filter((n: any) => !routes.some(r => sameRoute(r, n)));
+          if (!unchangedAccounts || !retainedRoutes || !added.length) return response({ error: 'active_launches_hold_registry' }, 409);
+          for (const r of added) this.sql.exec('INSERT INTO fleet_routes VALUES (?, ?, ?, ?)', r.machine_id, r.engine, r.account, r.profile);
+          return response({ status: 'configured', added_routes: added.length });
+        }
         this.sql.exec('DELETE FROM fleet_subscriptions');
         this.sql.exec('DELETE FROM fleet_routes'); this.sql.exec('DELETE FROM fleet_accounts');
         for (const a of data.accounts) this.sql.exec('INSERT INTO fleet_accounts VALUES (?, ?, ?, ?, ?)', a.label, a.provider, a.max_concurrency, a.reserve_percent, Number(a.enabled));

@@ -107,6 +107,37 @@ describe('generic accounts and launch placement', () => {
     expect((await s.handle(request('/launches', { ...input, prompt: 'changed' }), admin)).status).toBe(409);
     expect((await s.handle(request('/accounts', registry(), 'PUT'), admin)).status).toBe(409);
   }));
+  it('adds an engine route to an unchanged shared pool while preserving active state', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    const before = sql.exec('SELECT * FROM fleet_subscriptions').toArray();
+    const config = registry();
+    config.routes.push({ ...config.routes[0], engine: 'antigravity' });
+    const result = await s.handle(request('/accounts', config, 'PUT'), admin);
+    expect(result.status).toBe(200);
+    expect(await result.json()).toEqual({ status: 'configured', added_routes: 1 });
+    expect(sql.exec('SELECT * FROM fleet_subscriptions').toArray()).toEqual(before);
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('offered');
+    expect(sql.exec('SELECT COUNT(*) n FROM fleet_routes').one().n).toBe(config.routes.length);
+    const machine: any = sql.exec("SELECT capabilities FROM machines WHERE id = 'hetzner'").one();
+    const capabilities = JSON.parse(machine.capabilities); capabilities.engines.push('antigravity');
+    sql.exec("UPDATE machines SET capabilities = ? WHERE id = 'hetzner'", JSON.stringify(capabilities));
+    const plan: any = s.plan(intent({ machine: 'hetzner', engine: 'antigravity' }));
+    expect(plan.selected).toBeNull();
+    expect(plan.rejected).toContainEqual({ machine: 'hetzner', engine: 'antigravity', reason: 'account_capacity' });
+  }));
+  it('refuses policy changes or route removal even when another route is added during a launch', async () => fixture(async s => {
+    await configure(s);
+    await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin);
+    for (const change of ['capacity', 'remove', 'profile']) {
+      const config = registry();
+      config.routes.push({ ...config.routes[0], engine: 'antigravity' });
+      if (change === 'capacity') config.accounts[0].max_concurrency += 1;
+      if (change === 'remove') config.routes.splice(0, 1);
+      if (change === 'profile') config.routes[0].profile = 'changed' as any;
+      expect((await s.handle(request('/accounts', config, 'PUT'), admin)).status).toBe(409);
+    }
+  }));
   it('binds claims to authenticated host and requires fresh account admission; duplicate claims cannot run twice', async () => fixture(async s => {
     await configure(s);
     const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
