@@ -1506,6 +1506,7 @@ def _preserve_cleanup_evidence(
         raise SessionControlError("Command id is required for cleanup evidence")
     retired_source: Optional[str] = None
     native_finished_at_ms: Optional[int] = None
+    retained_capture: Optional[dict] = None
     try:
         cap = capture_session_output(executable, target, custody=custody,
                                      limit_bytes=CLEANUP_EVIDENCE_LIMIT_BYTES, mode="tail")
@@ -1524,12 +1525,20 @@ def _preserve_cleanup_evidence(
         raw_retired, source_path, mode, hist_reason = capture_retired_history(
             target, limit_bytes=CLEANUP_EVIDENCE_LIMIT_BYTES
         )
-        if raw_retired is None or len(raw_retired) == 0:
-            raise SessionControlError("authentic retired history unavailable; listed-only")
-        raw = raw_retired
-        truncated = len(raw) >= CLEANUP_EVIDENCE_LIMIT_BYTES
-        retired_source = os.path.basename(source_path) if source_path else "retired"
         native_finished_at_ms = tombstone.get("finished_at_ms")
+        if raw_retired is None or len(raw_retired) == 0:
+            from .capture_evidence import read_retained_capture
+            try:
+                raw, retained_capture = read_retained_capture(
+                    journal_dir, target, custody.machine_id, native_finished_at_ms)
+            except SessionControlError as exc:
+                raise SessionControlError("authentic retired history unavailable; listed-only") from exc
+            truncated = bool(retained_capture.get("truncated"))
+            retired_source = "commanded-capture"
+        else:
+            raw = raw_retired
+            truncated = len(raw) >= CLEANUP_EVIDENCE_LIMIT_BYTES
+            retired_source = os.path.basename(source_path) if source_path else "retired"
 
     # Exact byte budget on the raw UTF-8 payload (not on JSON-escaped text):
     # the adapter already truncates to limit_bytes, but stubs/tests may return
@@ -1567,6 +1576,10 @@ def _preserve_cleanup_evidence(
         record["native_finished_at_ms"] = native_finished_at_ms
     if retired_source is not None:
         record["retired_source"] = retired_source
+    if retained_capture is not None:
+        record["capture_command_id"] = retained_capture["command_id"]
+        record["capture_observed_at_ms"] = retained_capture["captured_at_ms"]
+        record["capture_mode"] = retained_capture["mode"]
     try:
         _write_journal(meta_path, record)
     except (ValueError, OSError, PermissionError) as exc:
@@ -1764,6 +1777,12 @@ def _run_claimed_effect(
         # vs tail); bounded UTF-8 return, private raw semantics retained.
         cap = capture_session_output(executable, target, custody=custody,
                                      limit_bytes=limit, mode=mode)
+        # Only explicit authenticated captures populate this bounded archive.
+        # Legacy unbound-incarnation captures remain readable, never archive proof.
+        if type(target.created_at_ms) is int and target.created_at_ms > 0:
+            from .capture_evidence import retain_capture
+            retain_capture(journal_dir, target, custody.machine_id,
+                           str(command.get("command_id", "")), {**cap, "mode": mode})
         return {"state": "captured", "ack_outcome": "delivered",
                 "native_id": None, "reply_envelope_id": None,
                 "capture_text": cap["text"], "capture_truncated": cap["truncated"],

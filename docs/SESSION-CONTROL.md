@@ -487,3 +487,16 @@ Host-attested native aplexer sessions (interactive sessions, background work, ta
    - Lineage hierarchy is rendered via `hub sessions tree` (or `hub sessions list --tree`) and available at `/sessions` dashboard (`/sessions.html`) with interactive filtering.
 
 
+
+## Captures retained for owned cleanup
+
+An explicit authenticated capture also stores its last successful bounded payload
+in the private host journal, outside the session worktree. The archive is keyed
+by host and exact native UUID/incarnation/tag/workspace/engine, with a command ID,
+original capture time, byte bound and SHA-256. It is not uploaded in status.
+
+Retired cleanup may use this existing capture only after native retirement is
+independently verified and all current custody, obligation and Git guards pass.
+Its capture time, native finish time and later evidence-read time stay distinct.
+Absent or corrupt evidence still retains the worktree. This does not recover
+history for sessions that retired before any capture was archived.
