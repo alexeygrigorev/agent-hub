@@ -11,3 +11,9 @@ __pycache__/
 evidence.log
 host/*.egg-info/
 host/build/
+
+# Generated Hub CLI bundle (rebuilt by head before deploy; never commit).
+# install.sh is tracked source; hub.pyz + sha + manifest are build outputs.
+public/cli/hub.pyz
+public/cli/hub.pyz.sha256
+public/cli/manifest.json
