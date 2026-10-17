@@ -558,9 +558,7 @@ class Dispatcher:
             stage = ("dispatch_headless" if mode == "headless" else "dispatch_interactive")[:32]
             reason = ("%s:%s" % (stage, err))[:120]
             try:
-                self.request("POST", path + "/result",
-                             {"state": "uncertain", "reason": reason,
-                              "stage": stage, "error": err})
+                self.request("POST", path + "/result", {"state": "uncertain"})
             except Exception:
                 pass
             return {"id": offer["id"], "state": "uncertain", "reason": reason,

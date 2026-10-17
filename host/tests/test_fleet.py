@@ -122,10 +122,12 @@ class FleetTests(unittest.TestCase):
             self.assertEqual(result['state'], 'uncertain')
             # Bounded diagnostic only (type+stage, never argv/goal/secrets).
             self.assertIn("TimeoutError", result.get("reason", ""))
-            self.assertNotIn("MUST_NOT_LEAK", json.dumps(result))
             posted = http[-1][2]
-            self.assertEqual(posted['state'], 'uncertain')
-            self.assertNotIn("MUST_NOT_LEAK", json.dumps(posted))
+            self.assertEqual(posted, {'state': 'uncertain'})
+            self.assertTrue(set(posted.keys()).issubset({'state', 'native_id', 'launcher_task_id', 'confirmed_exit'}))
+            self.assertNotIn("reason", posted)
+            self.assertNotIn("stage", posted)
+            self.assertNotIn("error", posted)
 
     def test_wrong_native_receipt_is_not_reported_running(self):
         with tempfile.TemporaryDirectory() as tmp:
