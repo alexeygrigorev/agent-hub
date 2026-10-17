@@ -1,15 +1,62 @@
 # Hub session control (M12e) — implemented contract
 
-Status: **implemented in this worktree** (`src/session_control.ts` + narrow
-`src/hub.ts` seam + `host/agent_hub_host/session_control.py` + narrow
-`host/agent_hub_host/cli.py` wiring + SQLite/HTTP tests). Interface provisional
-until the sibling host worker confirms the receiver-proof half; the proof shape
-below is the exact proposal sent to head.
+The public Hub CLI/API and Hetzner host are live. A real Antigravity session
+passed start, guarded original-envelope delivery with a correlated model reply,
+public capture, and confirmed stop on 17 October 2026. Transport alone remains
+insufficient: the send command reaches `acked` with outcome `delivered` only
+after the host verifies the recipient reply.
 
-Goal: usable `hub sessions` API + public CLI for list / start
-(engine/machine/host/cwd/brief) / send with confirmed delivery / capture /
-stop, replacing `psc`. Workers prove with synthetic/local sources only; head
-handles authorized physical qualification and independent review later.
+The accepted fixture was Hub `6e9771ef-ed17-4e40-bf4a-ba39e52075b3`,
+send command `106c16ae-26f6-4124-a533-c4c8e6c7a1d6`. Its ordinary user message
+requested a short reply; the native reply matched the original envelope and
+observed correlation/body digest. No command approval or task input was needed.
+Earlier failed attempts remain recorded; this acceptance does not establish
+M8 role execution, cross-host reconnect, or retired-worktree cleanup.
+
+## Qualified Antigravity startup
+
+Keep the quota service/account separate from the actual native engine. The
+quota service can be `gemini` while the engine is `antigravity`; all routes
+sharing that subscription must use the same account pool. Launcher `1867b85`
+records `antigravity` for new Antigravity native sessions. Existing bindings
+retain their original engine and incarnation.
+
+A trusted custom `startup_argv` replaces the native engine command. Preserve
+the configured engine's unattended permission policy in that argv; otherwise
+tool commands can wait on approval even though delivery succeeded. The qualified
+per-session Antigravity command uses `--dangerously-skip-permissions`, without
+changing global settings. Keep the host's existing resource/admission wrapper.
+
+The interactive startup runs one genuine initialization turn through
+`--prompt-interactive`, then waits. Native PreInvocation/Stop hooks report its
+real lifecycle; neither capture nor a manual state report substitutes for them.
+The initialization briefing also teaches the internal receipt protocol:
+
+> Respond READY for initialization without tools. For later native Hub messages,
+> read the received envelope by its exact native ID with `aplexer message show
+> ID --json`. If `data.hub_session_control` exists, reply to that native ID using
+> `--data` JSON containing the observed `correlation_id` and `body_digest`.
+> Keep those fields exact. The reply body is the normal response; acknowledging
+> receipt does not claim task completion. Do not read an inbox during initialization.
+
+This protocol belongs in the trusted agent startup, so human task text does not
+need to carry implementation fields. Use the actual `antigravity` engine;
+recording an `agy` process as `gemini` applies a different native readiness policy
+and can reject harmless Antigravity terminal redraws after its Stop hook.
+
+```bash
+hub sessions start --machine YOUR_MACHINE --workspace YOUR_ALLOWED_WORKSPACE \
+  --engine antigravity --interactive --name developer-task \
+  --key developer-start-001 --wait --timeout 180
+hub sessions send developer-task --body-file ./task.txt \
+  --key developer-send-001 --wait --timeout 120
+hub sessions capture developer-task --screen --key developer-capture-001 --wait
+hub sessions stop developer-task --key developer-stop-001 --wait --timeout 90
+```
+
+Keep each request key/payload when reconciling uncertain responses. Headless
+intake assignments run their brief through the maintained launcher; the example
+above starts an interactive session for subsequent send/capture/stop.
 
 ## Non-goals and holds
 
