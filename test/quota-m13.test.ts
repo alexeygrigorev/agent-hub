@@ -534,24 +534,122 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
 
   it('modelCandidates admits only eligible routes through the canonical gate', async () => {
     const t = Date.now();
-    const ad = [{ engine: 'grok', profile: null, model: 'grok-4.6', effort: 'high', account: 'm13-g' }];
-    const route = { provider: 'grok', engine: 'grok', profile: null, account: 'm13-g' };
-    const quotaFor = (pct: number | null, details: unknown = { limit_reached: false, has_grok_code_access: true }) => ({
+    // Grok is disabled by canonical model policy (no-new-Grok steering), so
+    // placement eligibility is proven on go/codex routes instead.
+    const goAd = [{ engine: 'opencode', profile: null, model: 'opencode-go/muse-spark-1.3-contributor', effort: null, account: 'm13-g' }];
+    const goRoute = { provider: 'go', engine: 'opencode', profile: null, account: 'm13-g' };
+    const quotaFor = (pct: number | null, details: unknown = { limit_reached: false }) => ({
       status: 'ok', observed_at: new Date(t - 1000).toISOString(), details,
-      windows: { '5h': { present: true, percent_remaining: pct, reset_at: new Date(t + 3600000).toISOString() } },
+      windows: { '7d': { present: true, percent_remaining: pct, reset_at: new Date(t + 3600000).toISOString() } },
     });
-    const input = { tier: 'daily' };
-    expect(modelCandidates(input, route, ad, quotaFor(80), t).length).toBeGreaterThan(0);
-    // Below the Grok 5% reserve, and with an unavailable sibling, no model is offered.
-    expect(modelCandidates(input, route, ad, quotaFor(4), t)).toEqual([]);
-    expect(modelCandidates(input, route, ad, {
-      status: 'ok', observed_at: new Date(t - 1000).toISOString(),
-      details: { limit_reached: false, has_grok_code_access: true },
+    expect(modelCandidates({ tier: 'daily' }, goRoute, goAd, quotaFor(80), t).length).toBeGreaterThan(0);
+    // Below the Codex 15% reserve, and with an unavailable sibling, no model is offered.
+    const codexAd = [{ engine: 'codex', profile: null, model: 'gpt-6.1-sol', effort: 'high', account: 'm13-c' }];
+    const codexRoute = { provider: 'codex', engine: 'codex', profile: null, account: 'm13-c' };
+    const codexInput = { tier: 'daily', preferred_runner: 'codex' };
+    expect(modelCandidates(codexInput, codexRoute, codexAd, quotaFor(10), t)).toEqual([]);
+    expect(modelCandidates(codexInput, codexRoute, codexAd, {
+      status: 'ok', observed_at: new Date(t - 1000).toISOString(), details: { limit_reached: false },
       windows: {
         '5h': { present: false, percent_remaining: null, reset_at: null, error: 'unavailable' },
         weekly: { present: true, percent_remaining: 80, reset_at: new Date(t + 3600000).toISOString() },
       },
     }, t)).toEqual([]);
+    // Disabled-provider engines offer no models even with healthy quota.
+    const grokAd = [{ engine: 'grok', profile: null, model: 'grok-4.6', effort: 'high', account: 'm13-g' }];
+    const grokRoute = { provider: 'grok', engine: 'grok', profile: null, account: 'm13-g' };
+    expect(modelCandidates({ tier: 'daily' }, grokRoute, grokAd,
+      quotaFor(80, { limit_reached: false, has_grok_code_access: true }), t)).toEqual([]);
+  });
+
+  it('disabled grok engine refuses new reserve and pre-hold claim; replay and running results preserved', async () => {
+    const host = await pairHost('m13-grokhold-host', 'm13grokhold.local', sessionCookie, csrfToken);
+    const adminHeaders = { Cookie: sessionCookie, 'Content-Type': 'application/json', 'x-csrf-token': csrfToken };
+    const stub = (defaultEnv as any).HUB.get((defaultEnv as any).HUB.idFromName('hub'));
+    await runInDurableObject(stub, async (instance: Hub) => {
+      instance.sql.exec(
+        "UPDATE machines SET last_checkin_at = ?, last_heartbeat = ?, capabilities = ? WHERE id = ?",
+        isoNow(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: isoNow() } }),
+        JSON.stringify({ engines: ['grok', 'codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 4 }), host.machineId);
+    });
+    // A differently labelled grok account is still held: the engine decides, not the label.
+    expect((await doFetch(new Request('http://example.com/api/fleet/accounts', {
+      method: 'PUT', headers: adminHeaders,
+      body: JSON.stringify({
+        accounts: [
+          { label: 'm13-grok-main', provider: 'grok', max_concurrency: 2, reserve_percent: 5, enabled: true },
+          { label: 'm13-codex-ok', provider: 'codex', max_concurrency: 2, reserve_percent: 15, enabled: true },
+        ],
+        routes: [
+          { machine_id: host.machineId, engine: 'grok', account: 'm13-grok-main', profile: null },
+          { machine_id: host.machineId, engine: 'codex', account: 'm13-codex-ok', profile: null },
+        ],
+      }),
+    }))).status).toBe(200);
+    const quota = (service: string, account: string) => ({
+      subscriptions: [{ service, account, plan: 'pro',
+        quota: { status: 'ok', observed_at: isoNow(-1000),
+          details: service === 'grok' ? { limit_reached: false, has_grok_code_access: true } : { limit_reached: false },
+          windows: { weekly: { present: true, percent_remaining: 80, reset_at: isoNow(86400000) } } } }],
+    });
+    const authSub = { Authorization: `Bearer ${host.accessToken}`, 'Content-Type': 'application/json' };
+    expect((await doFetch(new Request('http://example.com/api/fleet/subscriptions', {
+      method: 'PUT', headers: authSub, body: JSON.stringify(quota('grok', 'm13-grok-main')),
+    }))).status).toBe(200);
+    expect((await doFetch(new Request('http://example.com/api/fleet/subscriptions', {
+      method: 'PUT', headers: authSub, body: JSON.stringify(quota('codex', 'm13-codex-ok')),
+    }))).status).toBe(200);
+
+    const launchBody = (key: string, engine?: string) => ({
+      method: 'POST', headers: adminHeaders,
+      body: JSON.stringify({ workspace: 'demo', prompt: 'm13 grok hold proof', idempotency_key: key, ...(engine ? { engine } : {}) }),
+    }) as RequestInit;
+    // Direct reserve on the held engine is refused even with healthy quota.
+    const refused = await doFetch(new Request('http://example.com/api/fleet/launches', launchBody('m13-grok-1', 'grok')));
+    expect(refused.status).toBe(409);
+    expect(((await refused.json()) as any).error).toBe('provider_disabled');
+    // The allowed engine still reserves.
+    const okRes = await doFetch(new Request('http://example.com/api/fleet/launches', launchBody('m13-codex-1', 'codex')));
+    expect(okRes.status).toBe(201);
+
+    // A pre-hold grok offer (seeded as offered) cannot be claimed, but replays
+    // idempotently and a running launch still reports results (telemetry preserved).
+    const offerId = crypto.randomUUID();
+    // Byte-exact canonical bound (fleet.ts reserve: plan.request key order + access).
+    const canonicalIntent = JSON.stringify({ mode: 'headless', machine: null, engine: null, workspace: 'demo',
+      prompt: 'm13 grok hold proof', parent_id: null, summary: 'Agent task',
+      access: { mode: 'legacy_unspecified', claim_id: null, project: null, scopes: [] } });
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const at = isoNow();
+      instance.sql.exec(
+        "INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        offerId, 'human:admin-quota-m13', 'human', null, 'pre-hold grok', 'm13-grok-pre', canonicalIntent,
+        host.machineId, 'grok', 'm13-grok-main', null, 'headless', 'demo', 'pre-hold', 'offered', at, at);
+    });
+    const seededCheck: any = await runInDurableObject(stub, async (instance: Hub) =>
+      instance.sql.exec('SELECT actor, request_key, state FROM fleet_launches WHERE id = ?', offerId).one());
+    expect(seededCheck).toMatchObject({ actor: 'human:admin-quota-m13', request_key: 'm13-grok-pre', state: 'offered' });
+    const claimRes = await doFetch(new Request(`http://example.com/api/fleet/launches/${offerId}/claim`, {
+      method: 'POST', headers: authSub,
+      body: JSON.stringify({ gate_allowed: true, observed_at: isoNow(), account: 'm13-grok-main', profile_supported: true }),
+    }));
+    expect(claimRes.status).toBe(409);
+    expect(((await claimRes.json()) as any).error).toBe('provider_disabled');
+    const replayRes = await doFetch(new Request('http://example.com/api/fleet/launches', launchBody('m13-grok-pre')));
+    const replayBody = (await replayRes.json()) as any;
+    const diag: any = await runInDurableObject(stub, async (instance: Hub) =>
+      instance.sql.exec("SELECT actor, request_key, state FROM fleet_launches WHERE request_key = 'm13-grok-pre' ORDER BY created_at").toArray());
+    expect(diag.map((r: any) => r.actor)).toEqual(['human:admin-quota-m13']);
+    expect(replayRes.status).toBe(200);
+    expect(replayBody.replay).toBe(true);
+    await runInDurableObject(stub, async (instance: Hub) => {
+      instance.sql.exec("UPDATE fleet_launches SET state = 'running', native_id = ? WHERE id = ?", 'native-1', offerId);
+    });
+    const resultRes = await doFetch(new Request(`http://example.com/api/fleet/launches/${offerId}/result`, {
+      method: 'POST', headers: authSub,
+      body: JSON.stringify({ state: 'uncertain' }),
+    }));
+    expect(resultRes.status).toBe(200);
   });
 
   it('stored quota DTOs carry no secret material', async () => {

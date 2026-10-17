@@ -138,7 +138,8 @@
   ],
   "rules": {
     "disabled_providers": [
-      "claude"
+      "claude",
+      "grok"
     ],
     "explicit_only_providers": [
       "codex"

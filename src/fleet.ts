@@ -18,6 +18,12 @@ const LABEL = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 const PROVIDERS = new Set(['codex', 'claude', 'grok', 'gemini', 'zai', 'go', 'copilot']);
 const ACTIVE = "('offered','starting','running','uncertain')";
 const HEADROOM: Record<string, number> = { codex: 15, grok: 5 };
+/** Engines whose providers the canonical model policy disables. New grok sessions hold here. */
+function disabledEngines(): Set<string> {
+  const rules = ((policy as any).rules || {}) as any;
+  const disabled = new Set<string>(Array.isArray(rules.disabled_providers) ? rules.disabled_providers : []);
+  return new Set<string>((((policy as any).models || []) as any[]).filter(m => m && disabled.has(m.provider)).map(m => String(m.engine)));
+}
 const HEADERS = { 'Cache-Control': 'private, no-store' };
 function response(value: unknown, status = 200) { return Response.json(value, { status, headers: HEADERS }); }
 function label(value: unknown): value is string { return typeof value === 'string' && LABEL.test(value); }
@@ -175,6 +181,8 @@ export class FleetService {
     const definitions = new Map(this.sql.exec('SELECT * FROM fleet_accounts').toArray().map(a => [a.label, a]));
     for (const route of this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray() as any[]) {
       if ((request.account && route.account !== request.account) || (request.machine && route.machine_id !== request.machine) || (request.engine && route.engine !== request.engine)) continue;
+      // A disabled execution engine holds all new candidate planning, whatever the account label.
+      if (disabledEngines().has(route.engine)) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'provider_disabled' }); continue; }
       const machine: any = this.sql.exec('SELECT * FROM machines WHERE id = ?', route.machine_id).toArray()[0];
       const account = accounts.get(route.account); const caps = parsed(machine?.capabilities); const hb = parsed(machine?.last_heartbeat);
       let reason = '';
@@ -222,6 +230,10 @@ export class FleetService {
       const actor = caller.actor || caller.machineId || 'admin'; const canonical = JSON.stringify(bound);
       const prior: any = this.sql.exec('SELECT * FROM fleet_launches WHERE actor = ? AND request_key = ?', actor, input.idempotency_key).toArray()[0];
       if (prior) return sameIntent(prior.request_json, canonical) && sameEditCaller(prior.request_json, caller) ? result({ id: prior.id, state: prior.state, machine: prior.machine_id, engine: prior.engine, account: prior.account, mode: prior.mode, access: JSON.parse(prior.request_json).access?.mode || 'legacy_unspecified', replay: true }) : result({ error: 'idempotency_conflict' }, 409);
+      // A disabled execution engine refuses every new reservation, after valid replay.
+      if (typeof plan.request.engine === 'string' && plan.request.engine && disabledEngines().has(plan.request.engine)) {
+        return result({ error: 'provider_disabled', access: parsed.access.mode }, 409);
+      }
       if (plan.request.parent_id) {
         const parent: any = this.sql.exec('SELECT actor, state FROM fleet_launches WHERE id = ?', plan.request.parent_id).toArray()[0];
         if (!parent) return result({ error: 'parent_not_found' }, 400);
@@ -383,6 +395,8 @@ export class FleetService {
         if (!row) return response({ error: 'not_found' }, 404);
         if (match[2] === 'claim') {
           if (row.state !== 'offered') return response({ error: 'already_claimed' }, 409);
+          // Pre-hold offers on a now-disabled engine are held, never launched.
+          if (disabledEngines().has(row.engine)) return response({ error: 'provider_disabled' }, 409);
           const held = this.admission.retireInvalidOffer(row);
           if (held) return response({ error: held }, ['claim_inactive', 'claim_conflict', 'claim_authority_changed'].includes(held) ? 409 : 403);
           if (!object(data, ['gate_allowed', 'observed_at', 'account', 'profile_supported']) || data.gate_allowed !== true || data.profile_supported !== true || data.account !== row.account || !fresh(data.observed_at, this.now(), 30000)) return response({ error: 'fresh_admission_required' }, 409);
