@@ -398,7 +398,7 @@ index 0000000..8183bb9
 +vendored dakit files and fonts.
 diff --git a/docs/CONVERSATIONS.md b/docs/CONVERSATIONS.md
 new file mode 100644
-index 0000000..bf7b1ff
+index 0000000..5e21f73
 --- /dev/null
 +++ b/docs/CONVERSATIONS.md
 @@ -0,0 +1,611 @@
@@ -463,7 +463,7 @@ index 0000000..bf7b1ff
 +- **O(1) Transactional Accounting & Versioned Backfill (`F6`, `F16`)**: Global counts (`conversation_count`, `message_count`, `message_bytes`, `removed_member_count`, `schema_version`) are maintained in `conversation_storage_usage` (`singleton = 1`) alongside per-conversation counters (`retained_message_count`, `retained_message_bytes`, `removed_member_count`) on `conversations` and `body_bytes` on `conversation_messages`, avoiding full-table scans on message admission. `schema_version` must be a finite supported integer in `0..CONVERSATIONS_SCHEMA_VERSION` (`2`). Missing usage rows and versions `0`/`1` atomically backfill `conversation_messages.body_bytes`, per-conversation counters/previews, and global `conversation_storage_usage` inside `runInTxn` before any mutations or cleanup execute. Malformed values (`NaN`, non-integers, non-numeric text) and unsupported versions (`> 2`) fail closed from `init()` and never trust stored counters.
 +- **Tombstone Caps Never Block Revocation (`F10`)**: Reaching `maxRemovedMembersPerConversation` (`128`) or `maxTotalRemovedMembers` (`2,048`) never blocks an owner from revoking an active member. Inside the synchronous removal transaction, `evictRemovedMemberTombstonesForRevocation` evicts the oldest removed-member tombstone(s) (preferring non-creator tombstones first) to keep tombstone storage within the cap while immediately revoking the target member. In addition, `requireActiveMembership` returns `403 { "error": "forbidden", "reason": "member_removed" }` whenever `!member && conversation.created_by === actor`, preserving the F2 creator-replay fence even if the creator's tombstone was evicted or cleaned up.
 +- **Failed Admission Rollback & Retained Child Reply Replay (`F6`, `F12`)**: Admission checks run after idempotency replay lookup and before `last_seq` advancement inside `this.runInTxn(...)`. A rejected message never advances `last_seq`. Idempotent retries are matched against retained `(conversation_id, sender_actor, idempotency_key)` *before* resolving `reply_to` / `reply_to_seq` in `conversation_messages`, so retrying an already-stored child reply returns `200 OK` (`replay: true`) even after its parent message has expired and been pruned.
-+- **Global Affected-Row Cleanup Budget & Preview Hygiene (`F14`, `F15`)**: `BusService.retentionCleanup` consumes one shared remaining-row budget across expired bus `messages` (`expires_at <= now`) and expired bus `claims` (`expires_at < now`). `ConversationHub` then shares that same caller `limit` across bus rows and conversation rows (`conversation_messages`, `conversation_members`, archived `conversations` headers) so `messagesDeleted + claimsDeleted + conversationRowsDeleted <= limit`. A one-row-per-kind SQLite fairness cursor (`retention_cleanup_cursor`) rotates independently at each nested level (bus messages vs claims, bus vs conversation rows, and archived children vs removed-member tombstones vs ordinary expired messages) and survives Durable Object / service reconstruction. When the remaining budget is smaller than the number of eligible categories, each of the first `budget` eligible categories in rotated order receives 1 row, so `limit = 1` still makes bounded progress while other categories are replenished. When the budget covers every eligible category, equal slices run in that rotated order and leftover budget may be `0` (no forced deletion after the allowance is exhausted). `hasMore` is true when any unfinished category still has expired rows, including when the current call's allowance is zero. Inherited `Hub.prototype.scheduledTick === BaseHub.prototype.scheduledTick` and `Hub.prototype.alarm === BaseHub.prototype.alarm` are unchanged. Within `conversationsService.retentionCleanup`, `limit` bounds the **total number of SQLite rows deleted** across child messages, child members, archived conversation headers, expired removed members, and expired messages (`rowsDeleted <= limit`). Expired archived conversations (`archived_at <= cutoff`) are immediately hidden from `getConversation` (`404 not_found`), `listConversations`, `listMessages`, and mutations while their child rows are purged in indexed chunks, and each `conversations` header row is deleted only after all of its child rows are gone. Whenever expired messages are pruned from a conversation, `last_message_preview` is recomputed from the newest remaining retained message (or cleared to `null` when no retained messages remain), ensuring expired message content never lingers in conversation details or listings.
++- **Global Affected-Row Cleanup Budget & Preview Hygiene (`F14`, `F15`)**: `BusService.retentionCleanup` consumes one shared remaining-row budget across expired bus `messages` (`expires_at <= now`) and expired bus `claims` (`expires_at < now`). `ConversationHub` then shares that same caller `limit` across bus rows and conversation rows (`conversation_messages`, `conversation_members`, archived `conversations` headers) so `messagesDeleted + claimsDeleted + conversationRowsDeleted <= limit`. A one-row-per-kind SQLite fairness cursor (`retention_cleanup_cursor`) rotates independently at each nested level (bus messages vs claims, bus vs conversation rows, and archived children vs removed-member tombstones vs ordinary expired messages) and survives Durable Object / service reconstruction. `ConversationHub` runs that composed pass, nested child deletions, and every selection cursor inside one `ctx.storage.transactionSync`; child services join the open transaction rather than committing separately, so a later cursor or row abort rolls back all successful work. When the remaining budget is smaller than the number of eligible categories, each of the first `budget` eligible categories in rotated order receives 1 row, so `limit = 1` still makes bounded progress while other categories are replenished. When the budget covers every eligible category, equal slices run in that rotated order and leftover budget may be `0` (no forced deletion after the allowance is exhausted). `hasMore` is true when any unfinished category still has expired rows, including when the current call's allowance is zero. Inherited `Hub.prototype.scheduledTick === BaseHub.prototype.scheduledTick` and `Hub.prototype.alarm === BaseHub.prototype.alarm` are unchanged. Within `conversationsService.retentionCleanup`, `limit` bounds the **total number of SQLite rows deleted** across child messages, child members, archived conversation headers, expired removed members, and expired messages (`rowsDeleted <= limit`). Expired archived conversations (`archived_at <= cutoff`) are immediately hidden from `getConversation` (`404 not_found`), `listConversations`, `listMessages`, and mutations while their child rows are purged in indexed chunks, and each `conversations` header row is deleted only after all of its child rows are gone. Whenever expired messages are pruned from a conversation, `last_message_preview` is recomputed from the newest remaining retained message (or cleared to `null` when no retained messages remain), ensuring expired message content never lingers in conversation details or listings.
 +
 +---
 +
@@ -12178,10 +12178,10 @@ index 1eed521..577a771 100644
  
 diff --git a/src/conversation-hub.ts b/src/conversation-hub.ts
 new file mode 100644
-index 0000000..d83f374
+index 0000000..7d7c87e
 --- /dev/null
 +++ b/src/conversation-hub.ts
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,177 @@
 +import { Hub as BaseHub } from './hub';
 +import { Env } from './env';
 +import { RETENTION_CLEANUP_CURSOR_SQL, runFairRetentionPass } from './bus';
@@ -12202,9 +12202,26 @@ index 0000000..d83f374
 +
 +  constructor(ctx: DurableObjectState, env: Env) {
 +    super(ctx, env);
-+    const txSync = (this.ctx.storage as any).transactionSync
-+      ? <T>(fn: () => T): T => (this.ctx.storage as any).transactionSync(fn)
-+      : undefined;
++    const storage = this.ctx.storage as DurableObjectStorage & {
++      transactionSync?: <T>(fn: () => T) => T;
++    };
++    const rawTx =
++      typeof storage.transactionSync === 'function'
++        ? <T>(fn: () => T): T => storage.transactionSync!(fn)
++        : undefined;
++    // Child BusService/ConversationsService also call transactionSync. Nested
++    // BEGIN is unsupported here, so depth>0 joins the open outer transaction.
++    let txnDepth = 0;
++    const txSync = <T>(fn: () => T): T => {
++      if (!rawTx || txnDepth > 0) return fn();
++      txnDepth += 1;
++      try {
++        return rawTx(fn);
++      } finally {
++        txnDepth -= 1;
++      }
++    };
++    this.busService.txSync = txSync;
 +    this.conversationsService = new ConversationsService(this.sql, txSync);
 +    this.conversationsService.init();
 +
@@ -12234,78 +12251,80 @@ index 0000000..d83f374
 +      };
 +
 +      this.sql.exec(RETENTION_CLEANUP_CURSOR_SQL);
-+      let remaining = normalizedLimit;
-+      let busCleanup = emptyBus;
-+      let convCleanup = emptyConv;
++      return txSync(() => {
++        let remaining = normalizedLimit;
++        let busCleanup = emptyBus;
++        let convCleanup = emptyConv;
 +
-+      const takeBus = (budget: number): number => {
-+        if (budget <= 0 || remaining <= 0) return 0;
-+        if (!this.busService.hasExpiredRows(now)) return 0;
-+        const step = baseRetentionCleanup(now, Math.min(remaining, budget));
-+        const deleted =
-+          Number(step.messagesDeleted ?? 0) + Number(step.claimsDeleted ?? 0);
-+        busCleanup = {
-+          messagesDeleted:
-+            Number(busCleanup.messagesDeleted ?? 0) +
-+            Number(step.messagesDeleted ?? 0),
-+          claimsDeleted:
-+            Number(busCleanup.claimsDeleted ?? 0) +
-+            Number(step.claimsDeleted ?? 0),
-+          hasMore: step.hasMore,
++        const takeBus = (budget: number): number => {
++          if (budget <= 0 || remaining <= 0) return 0;
++          if (!this.busService.hasExpiredRows(now)) return 0;
++          const step = baseRetentionCleanup(now, Math.min(remaining, budget));
++          const deleted =
++            Number(step.messagesDeleted ?? 0) + Number(step.claimsDeleted ?? 0);
++          busCleanup = {
++            messagesDeleted:
++              Number(busCleanup.messagesDeleted ?? 0) +
++              Number(step.messagesDeleted ?? 0),
++            claimsDeleted:
++              Number(busCleanup.claimsDeleted ?? 0) +
++              Number(step.claimsDeleted ?? 0),
++            hasMore: step.hasMore,
++          };
++          remaining = Math.max(0, remaining - deleted);
++          return deleted;
 +        };
-+        remaining = Math.max(0, remaining - deleted);
-+        return deleted;
-+      };
 +
-+      const takeConv = (budget: number): number => {
-+        if (budget <= 0 || remaining <= 0) return 0;
-+        if (!this.conversationsService.hasExpiredRows(now)) return 0;
-+        const step = this.conversationsService.retentionCleanup(
-+          now,
-+          Math.min(remaining, budget),
++        const takeConv = (budget: number): number => {
++          if (budget <= 0 || remaining <= 0) return 0;
++          if (!this.conversationsService.hasExpiredRows(now)) return 0;
++          const step = this.conversationsService.retentionCleanup(
++            now,
++            Math.min(remaining, budget),
++          );
++          const deleted = Number(step.rowsDeleted ?? 0);
++          convCleanup = {
++            conversationsDeleted:
++              convCleanup.conversationsDeleted + step.conversationsDeleted,
++            messagesDeleted: convCleanup.messagesDeleted + step.messagesDeleted,
++            removedMembersDeleted:
++              convCleanup.removedMembersDeleted + step.removedMembersDeleted,
++            membersDeleted: convCleanup.membersDeleted + step.membersDeleted,
++            rowsDeleted: convCleanup.rowsDeleted + step.rowsDeleted,
++            hasMore: step.hasMore,
++          };
++          remaining = Math.max(0, remaining - deleted);
++          return deleted;
++        };
++
++        runFairRetentionPass(
++          this.sql,
++          'hub',
++          [
++            {
++              hasWork: () => this.busService.hasExpiredRows(now),
++              spend: takeBus,
++            },
++            {
++              hasWork: () => this.conversationsService.hasExpiredRows(now),
++              spend: takeConv,
++            },
++          ],
++          normalizedLimit,
 +        );
-+        const deleted = Number(step.rowsDeleted ?? 0);
-+        convCleanup = {
-+          conversationsDeleted:
-+            convCleanup.conversationsDeleted + step.conversationsDeleted,
-+          messagesDeleted: convCleanup.messagesDeleted + step.messagesDeleted,
-+          removedMembersDeleted:
-+            convCleanup.removedMembersDeleted + step.removedMembersDeleted,
-+          membersDeleted: convCleanup.membersDeleted + step.membersDeleted,
-+          rowsDeleted: convCleanup.rowsDeleted + step.rowsDeleted,
-+          hasMore: step.hasMore,
++
++        return {
++          ...busCleanup,
++          conversationsDeleted: convCleanup.conversationsDeleted,
++          conversationMessagesDeleted: convCleanup.messagesDeleted,
++          removedMembersDeleted: convCleanup.removedMembersDeleted,
++          conversationMembersDeleted: convCleanup.membersDeleted,
++          conversationRowsDeleted: convCleanup.rowsDeleted,
++          hasMore:
++            this.busService.hasExpiredRows(now) ||
++            this.conversationsService.hasExpiredRows(now),
 +        };
-+        remaining = Math.max(0, remaining - deleted);
-+        return deleted;
-+      };
-+
-+      runFairRetentionPass(
-+        this.sql,
-+        'hub',
-+        [
-+          {
-+            hasWork: () => this.busService.hasExpiredRows(now),
-+            spend: takeBus,
-+          },
-+          {
-+            hasWork: () => this.conversationsService.hasExpiredRows(now),
-+            spend: takeConv,
-+          },
-+        ],
-+        normalizedLimit,
-+      );
-+
-+      return {
-+        ...busCleanup,
-+        conversationsDeleted: convCleanup.conversationsDeleted,
-+        conversationMessagesDeleted: convCleanup.messagesDeleted,
-+        removedMembersDeleted: convCleanup.removedMembersDeleted,
-+        conversationMembersDeleted: convCleanup.membersDeleted,
-+        conversationRowsDeleted: convCleanup.rowsDeleted,
-+        hasMore:
-+          this.busService.hasExpiredRows(now) ||
-+          this.conversationsService.hasExpiredRows(now),
-+      };
++      });
 +    };
 +  }
 +
@@ -17932,17 +17951,18 @@ index 0000000..b767015
 +});
 diff --git a/test/conversation-retention.test.ts b/test/conversation-retention.test.ts
 new file mode 100644
-index 0000000..8ce7e1e
+index 0000000..ac72850
 --- /dev/null
 +++ b/test/conversation-retention.test.ts
-@@ -0,0 +1,1080 @@
+@@ -0,0 +1,1311 @@
 +import { describe, it, expect } from 'vitest';
 +import { env, runInDurableObject } from 'cloudflare:test';
 +import { Hub, BaseHub } from '../src/conversation-hub';
 +import { ConversationsService } from '../src/conversations';
-+import { BusService } from '../src/bus';
++import { BusService, RETENTION_CLEANUP_CURSOR_SQL } from '../src/bus';
 +import type { Env } from '../src/env';
 +import { sha256 } from '../src/auth/crypto';
++import { createSessionCookie } from '../src/auth/session';
 +
 +const testEnv = env as unknown as Env;
 +
@@ -18263,6 +18283,67 @@ index 0000000..8ce7e1e
 +      .toArray();
 +  }
 +
++  function fiveTableCounts(sql: any): number[] {
++    const c = tableCounts(sql);
++    return [
++      c.busMessages,
++      c.busClaims,
++      c.conversations,
++      c.convMessages,
++      c.convMembers,
++    ];
++  }
++
++  function retentionState(hub: Hub) {
++    const sql = hub.sql;
++    let leases: unknown[] = [];
++    try {
++      leases = sql
++        .exec(
++          'SELECT id, holder, expires_at FROM leases ORDER BY id',
++        )
++        .toArray();
++    } catch {
++      leases = [];
++    }
++    return {
++      tables: tableCounts(sql),
++      five: fiveTableCounts(sql),
++      cursors: cursorRows(sql),
++      usage: hub.conversationsService.getStorageUsage(),
++      members: sql
++        .exec(
++          'SELECT conversation_id, actor, role, removed_at, last_read_seq, last_read_at FROM conversation_members ORDER BY conversation_id, actor',
++        )
++        .toArray(),
++      claims: sql
++        .exec(
++          'SELECT id, project, scope, holder, expires_at FROM claims ORDER BY id',
++        )
++        .toArray(),
++      messages: sql.exec('SELECT id FROM messages ORDER BY id').toArray(),
++      convMessages: sql
++        .exec(
++          'SELECT id, conversation_id, seq, body FROM conversation_messages ORDER BY id',
++        )
++        .toArray(),
++      conversations: sql
++        .exec(
++          'SELECT id, last_seq, retained_message_count, last_message_preview FROM conversations ORDER BY id',
++        )
++        .toArray(),
++      leases,
++    };
++  }
++
++  function pinHubCursor(sql: any, nextIndex: number): void {
++    sql.exec(RETENTION_CLEANUP_CURSOR_SQL);
++    sql.exec(
++      "INSERT OR REPLACE INTO retention_cleanup_cursor (kind, next_index) VALUES ('hub', ?)",
++      nextIndex,
++    );
++  }
++
 +  it.each([1, 2, 3, 5])(
 +    'composed replenished bus messages do not starve claims or conversation rows at limit %i',
 +    async limit => {
@@ -18534,6 +18615,175 @@ index 0000000..8ce7e1e
 +      expect(
 +        hub.sql.exec('SELECT * FROM conversation_members ORDER BY actor').toArray(),
 +      ).toEqual(members);
++    });
++  });
++
++  it('hub cursor INSERT abort rolls back composed deletions, child cursors, usage, read, and lease', async () => {
++    await freshHub(async (initial, state) => {
++      let hub = initial;
++      pinRetention(hub, T);
++      insertExpiredBusMessage(hub.sql, 'hub-abort-msg', T);
++      insertExpiredClaim(hub.sql, 'hub-abort-claim', T);
++      hub.sql.exec(
++        'INSERT INTO claims (id, project, scope, holder, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
++        'hub-abort-live',
++        'proj',
++        'src/hub-abort-live.ts',
++        'holder-1',
++        T,
++        T + 120000,
++      );
++      pinHubCursor(hub.sql, 0);
++      const before = retentionState(hub);
++      expect(before.five).toEqual([1, 2, 0, 0, 0]);
++
++      hub.sql.exec(`
++        CREATE TRIGGER abort_hub_cursor BEFORE INSERT ON retention_cleanup_cursor
++        WHEN NEW.kind = 'hub'
++        BEGIN SELECT RAISE(ABORT, 'injected cursor write failure'); END;
++      `);
++      expect(() => hub.busService.retentionCleanup(T + 2, 1)).toThrow(
++        /injected cursor write failure/,
++      );
++      expect(retentionState(hub)).toEqual(before);
++      expect(
++        hub.sql.exec("SELECT id FROM claims WHERE id = 'hub-abort-live'").toArray(),
++      ).toHaveLength(1);
++
++      hub.sql.exec('DROP TRIGGER IF EXISTS abort_hub_cursor');
++      hub = new Hub(state, testEnv);
++      pinRetention(hub, T);
++      const retry = hub.busService.retentionCleanup(T + 2, 1) as any;
++      expect(
++        Number(retry.messagesDeleted ?? 0) +
++          Number(retry.claimsDeleted ?? 0) +
++          Number(retry.conversationRowsDeleted ?? 0),
++      ).toBe(1);
++      expect(retry.hasMore).toBe(true);
++      expect(
++        hub.sql.exec("SELECT id FROM claims WHERE id = 'hub-abort-live'").toArray(),
++      ).toHaveLength(1);
++
++      let claimsDeleted = Number(retry.claimsDeleted ?? 0);
++      for (let i = 0; i < 4; i++) {
++        hub = new Hub(state, testEnv);
++        pinRetention(hub, T);
++        const step = hub.busService.retentionCleanup(T + 2, 1) as any;
++        claimsDeleted += Number(step.claimsDeleted ?? 0);
++      }
++      expect(claimsDeleted).toBeGreaterThan(0);
++      expect(
++        hub.sql.exec("SELECT id FROM claims WHERE id = 'hub-abort-live'").toArray(),
++      ).toHaveLength(1);
++    });
++  });
++
++  it('conversation_messages DELETE abort rolls back earlier bus work on direct cleanup and POST /api/cron/retention', async () => {
++    await freshHub(async (initial, state) => {
++      let hub = initial;
++      pinRetention(hub, T);
++      const conv = hub.conversationsService.createConversation(humanAt(T), {
++        kind: 'group',
++        title: 'Atomic composed',
++        members: ['proj:bot'],
++      });
++      hub.conversationsService.sendMessage(humanAt(T), {
++        conversationId: conv.id,
++        body: 'expire-me',
++        idempotencyKey: 'expire-me',
++      });
++      hub.sql.exec(
++        'UPDATE conversation_members SET last_read_seq = 1, last_read_at = ? WHERE conversation_id = ?',
++        new Date(T).toISOString(),
++        conv.id,
++      );
++      insertExpiredBusMessage(hub.sql, 'del-abort-msg', T);
++      insertExpiredClaim(hub.sql, 'del-abort-claim', T);
++      hub.sql.exec(
++        'INSERT INTO claims (id, project, scope, holder, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
++        'del-abort-live',
++        'proj',
++        'src/del-abort-live.ts',
++        'holder-1',
++        T,
++        T + 120000,
++      );
++      pinHubCursor(hub.sql, 0);
++      const before = retentionState(hub);
++      expect(before.five).toEqual([1, 2, 1, 1, 2]);
++
++      hub.sql.exec(`
++        CREATE TRIGGER abort_conv_msg_delete BEFORE DELETE ON conversation_messages
++        BEGIN SELECT RAISE(ABORT, 'injected conversation message delete failure'); END;
++      `);
++      expect(() => hub.busService.retentionCleanup(T + 2, 100)).toThrow(
++        /injected conversation message delete failure/,
++      );
++      expect(retentionState(hub)).toEqual(before);
++      expect(
++        hub.sql.exec("SELECT id FROM claims WHERE id = 'del-abort-live'").toArray(),
++      ).toHaveLength(1);
++
++      const cookie = await createSessionCookie(testEnv, {
++        sub: 'alice',
++        email: 'admin@fake.local',
++        isAdmin: true,
++        csrfToken: 'csrf-ret-token',
++        exp: Math.floor(Date.now() / 1000) + 3600,
++      });
++      let httpStatus: number | null = null;
++      let httpError: string | null = null;
++      try {
++        const res = await hub.fetch(
++          new Request('http://example.com/api/cron/retention', {
++            method: 'POST',
++            headers: {
++              Cookie: cookie,
++              'X-CSRF-Token': 'csrf-ret-token',
++              'Content-Type': 'application/json',
++            },
++            body: JSON.stringify({ now: '2099-01-01T00:00:00Z' }),
++          }),
++        );
++        httpStatus = res.status;
++      } catch (err: any) {
++        httpError = String(err?.message ?? err);
++      }
++      expect(
++        httpStatus === 500 ||
++          /injected conversation message delete failure/i.test(httpError ?? ''),
++      ).toBe(true);
++      expect(retentionState(hub)).toEqual(before);
++      expect(
++        hub.sql.exec("SELECT id FROM claims WHERE id = 'del-abort-live'").toArray(),
++      ).toHaveLength(1);
++
++      hub.sql.exec('DROP TRIGGER IF EXISTS abort_conv_msg_delete');
++      hub = new Hub(state, testEnv);
++      pinRetention(hub, T);
++      const retry = hub.busService.retentionCleanup(T + 2, 100) as any;
++      const deleted =
++        Number(retry.messagesDeleted ?? 0) +
++        Number(retry.claimsDeleted ?? 0) +
++        Number(retry.conversationRowsDeleted ?? 0);
++      expect(deleted).toBeGreaterThan(0);
++      expect(deleted).toBeLessThanOrEqual(100);
++      expect(fiveTableCounts(hub.sql)[0]).toBe(0);
++      expect(
++        hub.sql.exec("SELECT id FROM claims WHERE id = 'del-abort-claim'").toArray(),
++      ).toHaveLength(0);
++      expect(
++        hub.sql.exec("SELECT id FROM claims WHERE id = 'del-abort-live'").toArray(),
++      ).toHaveLength(1);
++      expect(
++        hub.sql
++          .exec('SELECT id FROM conversation_messages WHERE conversation_id = ?', conv.id)
++          .toArray(),
++      ).toHaveLength(0);
++      expect(retry.hasMore).toBe(
++        hub.busService.hasExpiredRows(T + 2) ||
++          hub.conversationsService.hasExpiredRows(T + 2),
++      );
 +    });
 +  });
 +});
@@ -21834,10 +22084,10 @@ index 0000000..bfa1e81
 +
 diff --git a/test/conversations-ui.browser.mjs b/test/conversations-ui.browser.mjs
 new file mode 100644
-index 0000000..dfbcb26
+index 0000000..1ae18ac
 --- /dev/null
 +++ b/test/conversations-ui.browser.mjs
-@@ -0,0 +1,1016 @@
+@@ -0,0 +1,1021 @@
 +/* Browser behaviour tests for the conversations UI, using the existing
 +   Playwright installation (no package installs). Runs standalone:
 +      node test/conversations-ui.browser.mjs
@@ -22101,7 +22351,12 @@ index 0000000..dfbcb26
 +      if (state.failNextSends > 0) { state.failNextSends--; return json(route, 500, { error: 'simulated_failure' }); }
 +      const replay = state.idempotent[conversationId] && state.idempotent[conversationId][payload.idempotency_key];
 +      const created = replay || message('m-new-' + state.nextMessageSeq[conversationId], conversationId, state.nextMessageSeq[conversationId], requestActor, 'human', payload.body);
-+      if (!replay) {
++      // A held POST can complete after the fixture has switched accounts. The
++      // original request still receives this 201 so the client must drop it.
++      // The new actor's history GET must not observe the mutation through the
++      // shared mock store (suite-coupled race: Ada GET fulfills after release).
++      const actorSwitched = state.actor !== requestActor;
++      if (!replay && !actorSwitched) {
 +        state.nextMessageSeq[conversationId] = (state.nextMessageSeq[conversationId] || 1) + 1;
 +        state.idempotent[conversationId] = state.idempotent[conversationId] || {};
 +        state.idempotent[conversationId][payload.idempotency_key] = created;
@@ -24773,7 +25028,7 @@ index 136b106..4d35e57 100644
            name, 'agent', await sha256(tokens[name]), name, name, name, JSON.stringify(scopes), 'test', new Date().toISOString(), new Date(Date.now() + 3600000).toISOString());
        }
 diff --git a/test/m3-http.test.ts b/test/m3-http.test.ts
-index cdca0f8..8c78de3 100644
+index cdca0f8..9c4ccfc 100644
 --- a/test/m3-http.test.ts
 +++ b/test/m3-http.test.ts
 @@ -99,6 +99,41 @@ async function seedTestData(sql: any) {
@@ -24818,46 +25073,53 @@ index cdca0f8..8c78de3 100644
  describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
    let stub: any;
  
-@@ -661,27 +696,98 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
+@@ -661,70 +696,219 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
      }));
      expect(noCsrfRes.status).toBe(403);
  
 -    // 2. Futureclock cannot purge valid messages (caller body.now inert):
 -    // Seed 1 valid message expiring in 30 days and 250 expired messages
-+    // 2. Isolated single-category fixture: exactly 100 message deletions, 150 then 50 then 0.
-     const now = Date.now();
-     const past = now - 100000;
-     const future = now + 30 * 24 * 3600 * 1000;
+-    const now = Date.now();
+-    const past = now - 100000;
+-    const future = now + 30 * 24 * 3600 * 1000;
 -    await runInDurableObject(stub, async (instance: Hub) => {
 -      // Valid message with future expiration
++    // Deterministic slot clocks: 01:05 is 5 minutes into the 01:00 slot (early);
++    // 01:25 is 25 minutes in (late). scheduledTick refuses late slots; alarm does not.
++    const EARLY_T = Date.parse('2026-10-17T01:05:00Z');
++    const LATE_T = Date.parse('2026-10-17T01:25:00Z');
++    const freezeJobsClock = async (target: any, when: number) => {
++      await pinJobsClock(target, 0);
++      await (runInDurableObject as any)(target, async (instance: any) => {
++        instance.jobsService.setClock(() => new Date(when));
++      });
++    };
++
++    // 2. Isolated single-category fixture: exactly 100 message deletions, 150 then 50 then 0.
 +    const isoStub = defaultEnv.HUB.get(
 +      defaultEnv.HUB.idFromName('m3-http-ret-iso-' + crypto.randomUUID()),
 +    );
 +    await runInDurableObject(isoStub, async (instance: Hub) => {
 +      await seedTestData(instance.sql);
-       instance.sql.exec(
--        "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES ('valid-msg-future', 'worker-1', 'worker-2', 'note', 'th', 'valid', 'valid-key-future', ?, ?)",
--        now, future
++      instance.sql.exec(
 +        "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES ('iso-valid-msg-future', 'worker-1', 'worker-2', 'note', 'th', 'valid', 'iso-valid-key-future', ?, ?)",
-+        now,
-+        future,
-       );
--      // 250 expired messages
-       for (let i = 0; i < 250; i++) {
-         instance.sql.exec(
-           "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES (?, 'worker-1', 'worker-2', 'note', 'th', 'exp', ?, ?, ?)",
--          `exp-msg-${i}`, `exp-key-${i}`, past - 1000, past
++        EARLY_T,
++        EARLY_T + 30 * 24 * 3600 * 1000,
++      );
++      for (let i = 0; i < 250; i++) {
++        instance.sql.exec(
++          "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES (?, 'worker-1', 'worker-2', 'note', 'th', 'exp', ?, ?, ?)",
 +          `iso-exp-msg-${i}`,
 +          `iso-exp-key-${i}`,
-+          past - 1000,
-+          past,
-         );
-       }
-+      const isoBefore = busCategorySnapshot(instance.sql, now);
++          EARLY_T - 2000,
++          EARLY_T - 1000,
++        );
++      }
++      const isoBefore = busCategorySnapshot(instance.sql, EARLY_T);
 +      expect(isoBefore.expiredMessages).toBe(250);
 +      expect(isoBefore.expiredClaims).toBe(0);
 +    });
-+    await pinJobsClock(isoStub);
++    await freezeJobsClock(isoStub, EARLY_T);
 +    const isoTickRes = await isoStub.fetch(new Request('http://example.com/internal/tick', {
 +      method: 'POST',
 +      headers: { 'Content-Type': 'application/json' },
@@ -24868,7 +25130,7 @@ index cdca0f8..8c78de3 100644
 +      expect(
 +        instance.sql.exec("SELECT id FROM messages WHERE id = 'iso-valid-msg-future'").toArray(),
 +      ).toHaveLength(1);
-+      const isoAfter = busCategorySnapshot(instance.sql, now);
++      const isoAfter = busCategorySnapshot(instance.sql, EARLY_T);
 +      expect(isoAfter.expiredMessages).toBe(150);
 +      expect(isoAfter.expiredClaims).toBe(0);
 +      expect(isoAfter.liveClaimIds).toEqual([]);
@@ -24876,8 +25138,10 @@ index cdca0f8..8c78de3 100644
 +        countSql(instance.sql, "SELECT COUNT(*) AS c FROM messages WHERE id LIKE 'iso-exp-msg-%'"),
 +      ).toBe(150);
 +    });
++    await freezeJobsClock(isoStub, EARLY_T);
 +    await runInDurableObject(isoStub, async (instance: Hub) => {
 +      const coldHub = new Hub((instance as any).ctx, instance.env);
++      (coldHub as any).jobsService.setClock(() => new Date(EARLY_T));
 +      expect(
 +        countSql(coldHub.sql, "SELECT COUNT(*) AS c FROM messages WHERE id LIKE 'iso-exp-msg-%'"),
 +      ).toBe(150);
@@ -24892,41 +25156,102 @@ index cdca0f8..8c78de3 100644
 +      expect(
 +        coldHub.sql.exec("SELECT id FROM messages WHERE id = 'iso-valid-msg-future'").toArray(),
 +      ).toHaveLength(1);
++    });
++
++    // Late-slot alarm uses the same insertion/expiry/cleanup clock (25 minutes into the slot).
++    const lateStub = defaultEnv.HUB.get(
++      defaultEnv.HUB.idFromName('m3-http-ret-late-' + crypto.randomUUID()),
++    );
++    const lateLiveClaim = 'late-genuine-live-claim';
++    await runInDurableObject(lateStub, async (instance: Hub) => {
++      await seedTestData(instance.sql);
+       instance.sql.exec(
+-        "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES ('valid-msg-future', 'worker-1', 'worker-2', 'note', 'th', 'valid', 'valid-key-future', ?, ?)",
+-        now, future
++        "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES ('late-valid-msg', 'worker-1', 'worker-2', 'note', 'th', 'valid', 'late-valid-key', ?, ?)",
++        LATE_T,
++        LATE_T + 30 * 24 * 3600 * 1000,
+       );
+-      // 250 expired messages
+       for (let i = 0; i < 250; i++) {
+         instance.sql.exec(
+           "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES (?, 'worker-1', 'worker-2', 'note', 'th', 'exp', ?, ?, ?)",
+-          `exp-msg-${i}`, `exp-key-${i}`, past - 1000, past
++          `late-exp-msg-${i}`,
++          `late-exp-key-${i}`,
++          LATE_T - 2000,
++          LATE_T - 1000,
+         );
+       }
++      instance.sql.exec(
++        'INSERT INTO claims (id, project, scope, holder, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
++        lateLiveClaim,
++        'projA',
++        'src/late-live.ts',
++        'worker-1',
++        LATE_T,
++        LATE_T + 120000,
++      );
++      expect(busCategorySnapshot(instance.sql, LATE_T).expiredMessages).toBe(250);
++      expect(busCategorySnapshot(instance.sql, LATE_T).liveClaimIds).toEqual([lateLiveClaim]);
++    });
++    await freezeJobsClock(lateStub, LATE_T);
++    await runInDurableObject(lateStub, async (instance: Hub) => {
++      await instance.alarm();
++      const lateAfter = busCategorySnapshot(instance.sql, LATE_T);
++      expect(lateAfter.expiredMessages).toBe(150);
++      expect(lateAfter.liveClaimIds).toEqual([lateLiveClaim]);
++      expect(
++        instance.sql.exec('SELECT id FROM messages WHERE id = ?', 'late-valid-msg').toArray(),
++      ).toHaveLength(1);
      });
  
 -    // Attempt future-clock injection via /internal/tick body.now
+-    await pinJobsClock(stub);
 +    // 3. Mixed named-hub state: unique IDs, snapshot every expired category, exact 100 total.
 +    const mixPrefix = `mix-exp-msg-${crypto.randomUUID()}-`;
 +    const mixValidId = `mix-valid-msg-${crypto.randomUUID()}`;
++    const genuineLiveClaim = `genuine-live-claim-${crypto.randomUUID()}`;
 +    let mixBefore = {
 +      expiredMessages: 0,
 +      expiredClaims: 0,
 +      liveClaimIds: [] as string[],
 +    };
++    await freezeJobsClock(stub, EARLY_T);
 +    await runInDurableObject(stub, async (instance: Hub) => {
-+      mixBefore = busCategorySnapshot(instance.sql, now);
 +      instance.sql.exec(
 +        "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES (?, 'worker-1', 'worker-2', 'note', 'th', 'valid', ?, ?, ?)",
 +        mixValidId,
 +        `mix-valid-key-${mixValidId}`,
-+        now,
-+        future,
++        EARLY_T,
++        EARLY_T + 30 * 24 * 3600 * 1000,
 +      );
 +      for (let i = 0; i < 250; i++) {
 +        instance.sql.exec(
 +          "INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, body, idempotency_key, created_at, expires_at) VALUES (?, 'worker-1', 'worker-2', 'note', 'th', 'exp', ?, ?, ?)",
 +          `${mixPrefix}${i}`,
 +          `${mixPrefix}key-${i}`,
-+          past - 1000,
-+          past,
++          EARLY_T - 2000,
++          EARLY_T - 1000,
 +        );
 +      }
++      instance.sql.exec(
++        'INSERT INTO claims (id, project, scope, holder, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
++        genuineLiveClaim,
++        'projA',
++        `src/genuine-${genuineLiveClaim}.ts`,
++        'worker-1',
++        EARLY_T,
++        EARLY_T + 120000,
++      );
++      mixBefore = busCategorySnapshot(instance.sql, EARLY_T);
 +    });
-+    const mixEligible = mixBefore.expiredMessages + 250 + mixBefore.expiredClaims;
-     await pinJobsClock(stub);
++    const mixEligible = mixBefore.expiredMessages + mixBefore.expiredClaims;
++    expect(mixEligible).toBeGreaterThanOrEqual(100);
++    expect(mixBefore.liveClaimIds).toContain(genuineLiveClaim);
      const tickFutureRes = await stub.fetch(new Request('http://example.com/internal/tick', {
        method: 'POST',
-@@ -689,42 +795,37 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
+       headers: { 'Content-Type': 'application/json' },
        body: JSON.stringify({ now: '2099-01-01T00:00:00Z' })
      }));
      expect(tickFutureRes.status).toBe(200);
@@ -24943,12 +25268,12 @@ index cdca0f8..8c78de3 100644
 +      expect(
 +        instance.sql.exec('SELECT id FROM messages WHERE id = ?', mixValidId).toArray(),
 +      ).toHaveLength(1);
-+      const mixAfter = busCategorySnapshot(instance.sql, now);
-+      const deletedMessages = mixBefore.expiredMessages + 250 - mixAfter.expiredMessages;
++      const mixAfter = busCategorySnapshot(instance.sql, EARLY_T);
++      const deletedMessages = mixBefore.expiredMessages - mixAfter.expiredMessages;
 +      const deletedClaims = mixBefore.expiredClaims - mixAfter.expiredClaims;
 +      const totalDeleted = deletedMessages + deletedClaims;
 +      expect(mixAfter.liveClaimIds).toEqual(mixBefore.liveClaimIds);
-+      expect(mixEligible).toBeGreaterThanOrEqual(100);
++      expect(mixAfter.liveClaimIds).toContain(genuineLiveClaim);
 +      expect(totalDeleted).toBe(100);
 +      expect(tickJson.retention.messagesDeleted + tickJson.retention.claimsDeleted).toBe(100);
 +      expect(mixAfter.expiredMessages + mixAfter.expiredClaims).toBe(mixEligible - 100);
@@ -24964,8 +25289,14 @@ index cdca0f8..8c78de3 100644
      });
  
 -    // 3. Cold restart proof: simulate DO reconstruction from SQLite storage
-+    // 4. Authorized public maintenance route with admin session + valid CSRF
-+    let publicBefore = mixBefore;
++    // 4. Authorized public maintenance route uses Date.now() (caller body.now inert).
++    const publicNow = Date.now();
++    const publicLiveClaim = `public-genuine-live-${crypto.randomUUID()}`;
++    let publicBefore = {
++      expiredMessages: 0,
++      expiredClaims: 0,
++      liveClaimIds: [] as string[],
++    };
      await runInDurableObject(stub, async (instance: Hub) => {
 -      // Reconstruct fresh Hub instance pointing to identical storage
 -      const coldHub = new Hub((instance as any).ctx, instance.env);
@@ -24987,15 +25318,26 @@ index cdca0f8..8c78de3 100644
 -      // Valid message must still remain untouched
 -      const validStillThere = coldHub.sql.exec("SELECT id FROM messages WHERE id = 'valid-msg-future'").toArray();
 -      expect(validStillThere.length).toBe(1);
-+      publicBefore = busCategorySnapshot(instance.sql, now);
++      instance.sql.exec(
++        'INSERT INTO claims (id, project, scope, holder, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
++        publicLiveClaim,
++        'projA',
++        `src/public-${publicLiveClaim}.ts`,
++        'worker-1',
++        publicNow,
++        publicNow + 120000,
++      );
++      publicBefore = busCategorySnapshot(instance.sql, publicNow);
      });
 -
 -    // 4. Authorized public maintenance route with admin session + valid CSRF
 +    const publicEligible = publicBefore.expiredMessages + publicBefore.expiredClaims;
++    expect(publicEligible).toBeGreaterThanOrEqual(100);
++    expect(publicBefore.liveClaimIds).toContain(publicLiveClaim);
      const adminMaintainRes = await doFetch(new Request('http://example.com/api/cron/retention', {
        method: 'POST',
        headers: {
-@@ -737,11 +838,23 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
+@@ -737,11 +921,22 @@ describe('M3 HTTP: End-to-End Authenticated Bus Routing', () => {
      expect(adminMaintainRes.status).toBe(200);
      const maintainData = await adminMaintainRes.json() as any;
      expect(maintainData.status).toBe('ok');
@@ -25007,19 +25349,18 @@ index cdca0f8..8c78de3 100644
 +      expect(
 +        instance.sql.exec('SELECT id FROM messages WHERE id = ?', mixValidId).toArray(),
 +      ).toHaveLength(1);
-+      const publicAfter = busCategorySnapshot(instance.sql, now);
++      const publicAfter = busCategorySnapshot(instance.sql, publicNow);
 +      expect(publicAfter.liveClaimIds).toEqual(publicBefore.liveClaimIds);
++      expect(publicAfter.liveClaimIds).toContain(publicLiveClaim);
 +      const publicDeleted =
 +        publicBefore.expiredMessages -
 +        publicAfter.expiredMessages +
 +        (publicBefore.expiredClaims - publicAfter.expiredClaims);
-+      if (publicEligible >= 100) {
-+        expect(publicDeleted).toBe(100);
-+        expect(
-+          Number(maintainData.messagesDeleted ?? 0) + Number(maintainData.claimsDeleted ?? 0),
-+        ).toBe(100);
-+        expect(maintainData.hasMore).toBe(publicEligible - 100 > 0);
-+      }
++      expect(publicDeleted).toBe(100);
++      expect(
++        Number(maintainData.messagesDeleted ?? 0) + Number(maintainData.claimsDeleted ?? 0),
++      ).toBe(100);
++      expect(maintainData.hasMore).toBe(publicEligible - 100 > 0);
      });
    });
  
