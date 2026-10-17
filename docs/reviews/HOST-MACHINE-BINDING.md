@@ -126,4 +126,20 @@ Combined `.local/review` + `.local/tmp` sampled scratch peak **106496** allocate
 
 ## Head next
 
-Normal fast-forward of accepted `8ff51a1` onto hub main after this report commit. Optional narrow runbook wording for leftover agents columns. Do not treat this review as runtime or multi-host evidence.
+Source pin `8ff51a1` plus runbook wording pin `85fdcec` (appendix). Head owns canonical/private restore and main integration. Do not treat this review as runtime or multi-host evidence.
+
+## Appendix — exact `85fdcec` runbook wording (accepted)
+
+**Narrow documentation pin:** `85fdcec5e8c2fcfe0cb6d49134732b27f64e7896` (parent `8ff51a1fac456849529d2e8728eae454caf9ec75`). Author: `platform` / `codex`. This appendix preserves original report commit `b6f0f06b2e8c22ed1c7a09c823100b922726b9e7` (parent `8ff51a1`) and records a normal merge of `85fdcec`. No amend, force, source, or test edits.
+
+Review: approved sha=85fdcec5e8c2fcfe0cb6d49134732b27f64e7896 reviewer=platform-host-binding-review/grok-4.6
+
+`git diff 8ff51a1..85fdcec` is only `docs/HOST-MACHINE-BINDING.md` (+3 / −1). The replaced sentence is the Low finding at original line 84. New text:
+
+> The registration API accepts `tag`, `project`, `role` and `machine_id`;
+> legacy `workspace` and `session_id` SQL columns are not registration fields
+> or proof of a genuine native binding.
+
+That matches local `hub.ts:1003` POST whitelist and leftover `schema.ts:163-185` / `ensureColumns` columns. It does not claim the SQLite table lacks those columns. Native binding proof remains conversation/bridge qualification, not leftover SQL.
+
+The 30 focused host tests, 1 mock HTTP CLI flow, and 7 independent probes on `8ff51a1` are unchanged and were not repeated. Source files `config.py` / `api.py` / `auth.py` / tests are byte-identical to `8ff51a1`. F-POST-1 source verdict is unchanged. The Low documentation finding on `8ff51a1` is repaired at `85fdcec`. Full M1–M12+M2b remains active. No push from this reviewer.
