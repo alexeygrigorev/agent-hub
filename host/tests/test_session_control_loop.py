@@ -473,7 +473,7 @@ def _git_layout(base):
     os.makedirs(gitroot)
     origin = os.path.join(gitroot, "origin.git")
     main = os.path.join(gitroot, "main")
-    _git(["init", "--bare", origin], gitroot)
+    _git(["init", "--bare", "--initial-branch=main", origin], gitroot)
     _git(["clone", origin, main], gitroot)
     _git(["config", "user.email", "synth@example.test"], main)
     _git(["config", "user.name", "synth"], main)
