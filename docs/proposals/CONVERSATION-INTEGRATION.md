@@ -6,7 +6,7 @@ Task `0414` / `platform-conv-int-0414`. Private inert proposal only. Hub source 
 
 Author session: `51db3a5a-ab14-4bbc-9be2-183be9d23eda` (`platform-conversation-integration`, engine grok). Verified `aplexer whoami` workspace `/home/alexey/git/agent-hub-wt-platform-conversation-integration`. Tracked HEAD parent `5dcdf7164b28bd0e3a1d717ac9090c054eca3f24`.
 
-Portable patch: [CONVERSATION-INTEGRATION.patch](CONVERSATION-INTEGRATION.patch), SHA-256 `5d93a060f7aa73e5323f3a4dac40828f66774b0a4fb8886ac955e4860876c4fe`. `git apply --check` on a fresh main archive succeeds. 76 paths (61 new, 0 deleted). Tracked `src/` `host/` `public/` `test/` `config/` in this worktree remain byte-identical to main.
+Portable patch: [CONVERSATION-INTEGRATION.patch](CONVERSATION-INTEGRATION.patch), SHA-256 `4a6631a2af63fdee0ef289752dd3aee3a7e71fa116d64e03a0e65135dbc48e6d`. `git apply --check` on a fresh main archive succeeds. 76 paths (61 new, 0 deleted). Tracked `src/` `host/` `public/` `test/` `config/` in this worktree remain byte-identical to main.
 
 ## Pin status (do not treat passing tests as acceptance)
 
@@ -14,16 +14,16 @@ Portable patch: [CONVERSATION-INTEGRATION.patch](CONVERSATION-INTEGRATION.patch)
 | --- | --- | --- |
 | Hub main | `5dcdf7164b28bd0e3a1d717ac9090c054eca3f24` | accepted M6 |
 | Transport | `d9b4cde07e3718d77b2db9308cd323a5c8e003ed` | scoped Argon `8ecac25e021641781f01c18d662d130812797eac` |
-| API | `8dc9235ce246ff8316048fa837b34b53ae7a0cdd` (parent `7c004676dc9c0c6496656cb6a4bc62dbadff09ae`) | **COMMITTED repair, not accepted.** Independent `platform-api-atomicity-review` is reviewing exact `8dc`. Outer `transactionSync` wrap around composed `runFairRetentionPass` (nested depth joins the open outer txn) and m3-http slot-clock fixture. Dirty author files are not imported. |
+| API | `8dc9235ce246ff8316048fa837b34b53ae7a0cdd` (parent `7c004676dc9c0c6496656cb6a4bc62dbadff09ae`) | **scoped ACCEPT** `8ca59dc1b67d584aff724a50deef450f66a08af1` (394/394 + typecheck, excluding F7). Outer `transactionSync` wrap around composed `runFairRetentionPass` (nested depth joins the open outer txn) and m3-http slot-clock fixture. Dirty author files are not imported. |
 | F7 registry | `ddaf80d82022736da82ff11d521c6a9f92ff593e` patch SHA-256 `a3b2c2fdcc0feb6287e8d8695edd19137687ffe82967c66cc25105491e049b16` | Argon ACCEPT `426fdf7` |
 | P3 gap | `0896ebe157cc732342b17fb40a6cf6e096ef93a2` | scoped ACCEPT `f19353e8c9a900f2697f6edeb7da08691cf901e8`. Frozen 17424 contract. Default HOLD. No automatic `max(server read)`. |
-| Public pairing | `1149f65394611d05c1f55fcec4e803f105930c8d` patch SHA-256 `1a9e94ef33f25410e3e9834517bb85154cad5afbc5e94eb13e371ca9d28a6947` | **PROVISIONAL.** Independent Argon `252a3a83` reported two MEDIUM defects: public `/api/device/token` and refresh omit `machine_id` required by real hub login cfg; approval TOCTOU lets a machine-less default bind a different actor/machine after GET. This combination does not independently repair pairing semantics; a new author pin will follow. |
+| Public pairing | R2 FINAL `eee4d2f88305a6e64545c8e7b68f329a162811d1` (via `6dc1919395ca079de237b1ab3864db989972ce52`, parent `1149f65`) patch SHA-256 `3b9d5a9583d0daa4ac1ef7f1dddf603f9b9b5c7550b995a78633bef958219f10` | **PROVISIONAL.** Independent `platform-pairing-r2-review` is reviewing exact `eee4`. Closes the two MEDIUM defects reported on `1149` (token/refresh `machine_id`; approval TOCTOU). This combination does not invent further pairing semantics. |
 
-Final base must wait for independent acceptance of `8dc` (or a later repaired SHA) and a pairing pin that closes those MEDIUMs. This checkpoint keeps a faithful combination of the current committed pins so that rebase stays mechanical.
+Final base must wait for independent acceptance of pairing `eee4` (or a later repaired SHA). API `8dc` is credited only via scoped ACCEPT `8ca59dc1`. This checkpoint combines those committed pins so that rebase stays mechanical. M2b `d80` is excluded.
 
 ## Native journal scope (paused)
 
-Frozen 17424 writes `workspace/.local/conversation-bridge-<hash24>.json`. The task allowed native journals only under assigned `.local/integration` or `.local/tmp`. Existing journals are **preserved in place**; they were not deleted, reset, or resent. Native cycles stay paused until platform ACKs this scope. No retroactive compliance claim.
+Frozen 17424 writes `workspace/.local/conversation-bridge-<hash24>.json`. Prospective scope join **C-0414-JOURNAL** adds only those two journals and their empty `.lock` files to this worker's declaration (no `.tmp` present). Existing journals are **preserved in place**; they were not deleted, reset, or resent. Head read-only reconciliation matches this inventory: both journals have zero unresolved pending effects. Native cycles stay paused. No retroactive compliance claim.
 
 | Basename | Fixture | Binding | Cursor / effects |
 | --- | --- | --- | --- |
@@ -45,7 +45,7 @@ api=8dc9235ce246ff8316048fa837b34b53ae7a0cdd
 api_old=da38cb2a00c092423d0b67419b0ea45d6a09dfa9
 f7=ddaf80d82022736da82ff11d521c6a9f92ff593e
 p3=0896ebe157cc732342b17fb40a6cf6e096ef93a2
-pairing=1149f65394611d05c1f55fcec4e803f105930c8d
+pairing=eee4d2f88305a6e64545c8e7b68f329a162811d1
 scratch=.local/integration/tree
 test ! -e "$scratch"
 mkdir -p "$scratch" .local/tmp "$scratch/.local/tmp"
@@ -90,7 +90,7 @@ taskset -c 0 timeout 120 npm run typecheck
 
 Alternatively apply [CONVERSATION-INTEGRATION.patch](CONVERSATION-INTEGRATION.patch) to a fresh main archive (`git apply --check` then `git apply`). That reproduces the same private tree, including harness hunks.
 
-When an accepted API SHA lands, repeat the overlay/3-way step with that blob. When a repaired pairing pin lands, re-apply that patch in place of `1149f65`; do not locally invent pairing semantics.
+When an accepted pairing SHA lands, re-apply that patch in place of `eee4`; do not locally invent pairing semantics. API overlay stays `8dc` unless a later accepted repair pin is supplied.
 
 ## Overlaps and resolutions
 
@@ -102,7 +102,7 @@ Transport `d9b4` is main plus 49 conversation files (42 reviewed UI/CLI/API/daki
 
 3. **P3 vs transport native.** P3 final files overlay directly. Default HOLD remains. Remote read watermark cannot skip unresolved native effects.
 
-4. **Pairing vs F7.** Pairing patch applies cleanly after F7. Output hashes match the pairing manifest. Pairing remains provisional per the two MEDIUM defects above; this combination does not patch them.
+4. **Pairing vs F7.** R2 patch `3b9d5a95` applies cleanly after F7. Output hashes match the eee4 manifest (`src/hub.ts` `51a488ab…`). Pairing remains provisional until `platform-pairing-r2-review` verdict.
 
 5. **Harness.** `test/conversation-platform-worker.ts` seeds a human admin and enrolled machine; it never inserts an agent credential. `test/conversation-platform.mjs` issues the agent token through public `/api/device/code` + admin CSRF approve with `machine_id` + `/api/device/token`. Native identity is this session. Frozen 17424 journals still land at `workspace/.local/conversation-bridge-*.json` (see journal scope). `test/conversations-ui.browser.mjs` keeps every original isolation assertion. The mock POST, after a held send completes, omits the shared `messageStore` append when `state.actor` no longer matches the request actor, while still returning 201 so the client must drop the stale success. That is a fixture isolation repair, not a weakened product assertion.
 
@@ -114,11 +114,12 @@ CPU 0, `UV_THREADPOOL_SIZE=1`, `NODE_OPTIONS=--v8-pool-size=1`, `GOMAXPROCS=1`, 
 
 | Check | Result |
 | --- | --- |
-| Typecheck on `8dc` combination | PASS |
-| `test/conversation-retention.test.ts` + `test/m3-http.test.ts` on `8dc` | 29/29 (does not clear independent review of `8dc`) |
-| Mock-API UI desktop/narrow/theme, original assertions | **Reproduced 28/29** on the unmodified transport mock: `old-user in-flight send success cannot attach or replay after account switch` (`#conv-detail` contained `Grace held send`, `sendLog.length===1`, outbox null, Ada chrome, bodies=3). Isolated rerun of only the two in-flight tests **passed**. After Ada chrome and before gate release the mock store still had 2 rows; after release it had 3 while the client 201 was dropped (`checkCurrent` / abort). Full-suite failure is Ada's later history GET observing the shared-store commit. **Harness-only mock repair** (no store append after actor switch; 201 still returned): **29/29**. Stale-response and current-account isolation assertions retained. |
-| Prior Worker/browser/CLI/public-token characterizing | PASS on `7c004` combination (7 checks). Not re-run against `8dc` in this pause. |
-| Genuine own native `cint-local-r2` | PASS on `7c004` combination; journals preserved; further native cycles paused. |
+| Typecheck on ACCEPTED API `8dc` + pairing `eee4` combination | PASS |
+| Pairing/F7/claim/conversations domain on that tree | 117/117 (4 files; expected M6 retirement SQLITE_CONSTRAINT_TRIGGER noise) |
+| `test/conversation-retention.test.ts` + `test/m3-http.test.ts` | 29/29 |
+| Mock-API UI desktop/narrow/theme, original assertions | **Reproduced 28/29** on the unmodified transport mock: `old-user in-flight send success cannot attach or replay after account switch` (`#conv-detail` contained `Grace held send`, `sendLog.length===1`, outbox null, Ada chrome, bodies=3). Isolated rerun of only the two in-flight tests **passed**. After Ada chrome and before gate release the mock store still had 2 rows; after release it had 3 while the client 201 was dropped (`checkCurrent` / abort). Full-suite failure is Ada's later history GET observing the shared-store commit. **Harness-only mock repair** (no store append after actor switch; 201 still returned): **29/29** on the `8dc`+`eee4` tree. Stale-response and current-account isolation assertions retained. |
+| Prior Worker/browser/CLI/public-token characterizing | PASS on `7c004`+`1149` combination (7 checks). Not re-run after `8dc`/`eee4`; native cycles paused. |
+| Genuine own native `cint-local-r2` | PASS on `7c004`+`1149`; journals preserved as known settled effects; further native cycles paused. |
 
 ## Combined hashes for merge products
 
@@ -131,7 +132,7 @@ SHA-256 of the private tree after reconstruction.
 | `src/conversation-hub.ts` | `948457385592374ab455523a5727614fcff1c12661c954b707e011c8cf0e0b72` | API `8dc` |
 | `src/worker.ts` | `f0b067647397e4bd7f263e868787783d6b61d4bfe21d07eb3b9b1fac36ab1adc` | transport |
 | `src/agent_registry.ts` | `5aa252d73029b51f4852a7850a02cf24d4b197b4a2e235a366862f99a49c0a3e` | pairing |
-| `src/hub.ts` | `05047a9ab5393daa7aee5ea02fdb6923c41c1ed35eddc4a022197600dbb7d6b7` | pairing |
+| `src/hub.ts` | `51a488ab738710dfab00842f5714245e9acaac4574046115d37d197018b85002` | pairing eee4 |
 | `src/claim_admission.ts` | `5b6b728de08f32784f03c9a4123356b25fce2425a886a83f2be392b4e63b3dc5` | pairing |
 | `host/agent_hub_host/cli.py` | `7a5bda4887e8f93896c941bf5b220759eb1aace4dfdc1e33031c381f1eb11c32` | P3 |
 | `host/agent_hub_host/conversation_bridge.py` | `7e7ebaec3148b4cb5522bdead67e171f9adbcbb8e6c0d94085813c80ee313a4e` | P3 |
@@ -141,11 +142,10 @@ SHA-256 of the private tree after reconstruction.
 
 ## Remaining gates
 
-- Independent acceptance of API `8dc` (or a later repaired SHA); never import dirty author trees.
-- Pairing author pin that closes the two MEDIUM defects; do not repair pairing independently here.
-- Platform ACK of exact journal scopes before further native cycles; then one public-token Worker/browser/CLI/own-native route on the accepted pins.
-- Distinct-model review of this exact proposal SHA.
-- Acknowledged Hub/registry/M6/test owner leases. Desktop `97250598` F7 hunk escalation is not a handoff.
+- Independent acceptance of pairing `eee4` (or a later repaired SHA); do not invent pairing semantics here.
+- Distinct-model review of this exact proposal SHA after pairing verdict.
+- Native public-token Worker/browser/CLI/own-native route only after pairing review and further bounded head instruction. Existing journals stay preserved as known settled effects.
+- Acknowledged Hub/registry/M6/test owner leases. Desktop `97250598` F7 hunk escalation is not a handoff. No source handoff.
 - Head integration onto main; physical cross-host pairing/native; M2b/M4–M11.
 
-Request: ACK journal scopes if they may remain at the frozen 17424 worktree `.local/` path as preserved evidence, or name the allowed move that keeps every existing effect. Send accepted API and repaired pairing SHAs when committed. This worker will keep the private combination current and will not mark the result accepted from tests.
+Prospective journal scope join C-0414-JOURNAL is ACK'd: only the two named frozen-17424 journals and their empty `.lock` files (no `.tmp` present), plus the two proposal artifacts and `.local/integration` / `.local/tmp` scratch. This worker will keep the private combination current and will not mark the result accepted from tests.

@@ -16051,7 +16051,7 @@ index 0000000..666dffb
 +  }
 +}
 diff --git a/src/hub.ts b/src/hub.ts
-index 51bc2d3..0ccd2df 100644
+index 51bc2d3..6144a74 100644
 --- a/src/hub.ts
 +++ b/src/hub.ts
 @@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
@@ -16274,7 +16274,7 @@ index 51bc2d3..0ccd2df 100644
            this.sql.exec('UPDATE device_pairings SET status = ? WHERE device_code_hash = ?', 'expired', deviceCodeHash);
            return Response.json({ error: 'expired_token' }, { status: 400 });
          }
-@@ -710,15 +608,17 @@ export class Hub extends DurableObject {
+@@ -710,19 +608,21 @@ export class Hub extends DurableObject {
            const result = this.ctx.storage.transactionSync(() => {
              const current = this.sql.exec('SELECT * FROM device_pairings WHERE device_code_hash = ?', deviceCodeHash).toArray()[0] as any;
              if (!current || current.status !== 'approved') return null;
@@ -16290,11 +16290,17 @@ index 51bc2d3..0ccd2df 100644
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, credId, current.client_kind, tokens.accessHash, tokens.refreshHash, familyId, current.name, current.machine_id, current.actor, current.granted_scopes, current.approved_by_sub, new Date().toISOString(), expires);
              this.sql.exec("UPDATE device_pairings SET status = 'consumed' WHERE device_code_hash = ?", deviceCodeHash);
 -            if (current.machine_id) this.sql.exec('UPDATE machines SET credential_id = ? WHERE id = ?', credId, current.machine_id);
+-            return { expires, scopes: JSON.parse(current.granted_scopes) as string[] };
 +            if (current.client_kind === 'host' && current.machine_id) this.sql.exec('UPDATE machines SET credential_id = ? WHERE id = ?', credId, current.machine_id);
-             return { expires, scopes: JSON.parse(current.granted_scopes) as string[] };
++            return { expires, scopes: JSON.parse(current.granted_scopes) as string[], machineId: current.machine_id ?? null };
            });
            if (!result) return Response.json({ error: 'invalid_grant' }, { status: 400 });
-@@ -741,6 +641,16 @@ export class Hub extends DurableObject {
+-          return Response.json({ access_token: tokens.accessToken, refresh_token: tokens.refreshToken, token_type: 'Bearer', expires_in: Math.floor((Date.parse(result.expires) - Date.now()) / 1000), scope: result.scopes.join(' ') });
++          return Response.json({ access_token: tokens.accessToken, refresh_token: tokens.refreshToken, token_type: 'Bearer', expires_in: Math.floor((Date.parse(result.expires) - Date.now()) / 1000), scope: result.scopes.join(' '), machine_id: result.machineId });
+         }
+       }
+ 
+@@ -741,6 +641,17 @@ export class Hub extends DurableObject {
            return new Response('Not found or expired', { status: 404 });
          }
  
@@ -16305,13 +16311,14 @@ index 51bc2d3..0ccd2df 100644
 +          const registered = this.sql.exec('SELECT project FROM agents WHERE tag = ?', address.tag).toArray() as any[];
 +          if (registered.length === 1 && registered[0].project) address = { ...address, project: registered[0].project };
 +        }
++        const displayedActor = address ? (address.project ? `${address.project}:${address.tag}` : address.tag) : pairing.actor;
 +        const registeredAgent = address ? this.sql.exec("SELECT machine_id FROM agents WHERE tag = ? AND COALESCE(project,'') = COALESCE(?,'')", address.tag, address.project).toArray()[0] as any : null;
 +        const registeredMachine = registeredAgent?.machine_id || null;
 +        const machineOptions = machines.map(m => `<option value="${htmlEscape(m.id)}"${m.id === registeredMachine ? ' selected' : ''}>${htmlEscape(m.name || m.id)} (${htmlEscape(m.id)})</option>`).join('');
          const safeKind = htmlEscape(pairing.client_kind);
          const safeName = htmlEscape(pairing.name);
          const safeHostname = htmlEscape(pairing.hostname);
-@@ -752,7 +662,7 @@ export class Hub extends DurableObject {
+@@ -752,7 +663,7 @@ export class Hub extends DurableObject {
  
          const html = `<!DOCTYPE html>
  <html>
@@ -16320,7 +16327,7 @@ index 51bc2d3..0ccd2df 100644
  <body>
    <h1>Approve Device</h1>
    <p>Kind: ${safeKind}</p>
-@@ -761,6 +671,7 @@ export class Hub extends DurableObject {
+@@ -761,6 +672,7 @@ export class Hub extends DurableObject {
    <p>Country: ${safeCountry}</p>
    ${safeActor ? `<p>Actor: ${safeActor}</p>` : ''}
    <p>Requested Scopes: ${safeScopes}</p>
@@ -16328,16 +16335,18 @@ index 51bc2d3..0ccd2df 100644
    <form method="POST" action="/api/device/approve/${safeUserCode}" id="approveForm">
      <input type="hidden" name="csrf_token" value="${safeCsrf}">
      ${safeKind === 'host' ? `<label>Machine ID (optional): <input type="text" name="machine_id"></label><br>` : ''}
-@@ -774,7 +685,7 @@ export class Hub extends DurableObject {
+@@ -774,8 +686,9 @@ export class Hub extends DurableObject {
    <script>
      async function submitApprove() {
        const form = document.getElementById('approveForm');
 -      const data = { granted_scopes: JSON.parse(form.granted_scopes.value) };
-+      const data = { granted_scopes: JSON.parse(form.granted_scopes.value), expected_actor: ${JSON.stringify(pairing.actor).replace(/</g, '\u003c')} };
++      const data = { granted_scopes: JSON.parse(form.granted_scopes.value), expected_actor: ${JSON.stringify(displayedActor).replace(/</g, '\u003c')} };
        if (form.machine_id && form.machine_id.value) data.machine_id = form.machine_id.value;
++      else if (${JSON.stringify(pairing.client_kind)} === 'agent') data.machine_id = ${JSON.stringify(registeredMachine)};
        const res = await fetch(form.action, {
          method: 'POST',
-@@ -800,6 +711,7 @@ export class Hub extends DurableObject {
+         headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': form.csrf_token.value },
+@@ -800,6 +713,7 @@ export class Hub extends DurableObject {
        if (path.startsWith('/api/device/approve') || path.startsWith('/api/device/deny') || path.startsWith('/api/device/info')) {
          const session = await getSession(this.env, request);
          if (!session) return Response.json({ error: 'Unauthorized' }, { status: 401 });
@@ -16345,7 +16354,7 @@ index 51bc2d3..0ccd2df 100644
  
          const parts = path.split('/');
          const action = parts[3];
-@@ -821,7 +733,7 @@ export class Hub extends DurableObject {
+@@ -821,7 +735,7 @@ export class Hub extends DurableObject {
          
          const now = new Date();
          const expiresAt = new Date(pairing.expires_at);
@@ -16354,23 +16363,22 @@ index 51bc2d3..0ccd2df 100644
            this.sql.exec('UPDATE device_pairings SET status = ? WHERE user_code = ?', 'expired', userCode);
            return Response.json({ error: 'Already expired' }, { status: 400 });
          }
-@@ -834,7 +746,9 @@ export class Hub extends DurableObject {
+@@ -834,7 +748,8 @@ export class Hub extends DurableObject {
          if (action === 'approve') {
            const body = await safeJson(request);
            if (!body) return Response.json({ error: 'malformed_json' }, { status: 400 });
 -          const granted_scopes = body.granted_scopes || JSON.parse(pairing.requested_scopes);
-+          if (Object.keys(body).some(k => !['granted_scopes', 'machine_id', 'expected_actor'].includes(k)) ||
-+              (body.expected_actor !== undefined && body.expected_actor !== pairing.actor)) return Response.json({ error: 'invalid_approval' }, { status: 400 });
++          if (Object.keys(body).some(k => !['granted_scopes', 'machine_id', 'expected_actor'].includes(k))) return Response.json({ error: 'invalid_approval' }, { status: 400 });
 +          const granted_scopes = body.granted_scopes ?? JSON.parse(pairing.requested_scopes);
            const parsedGranted = granted_scopes;
            
            if (!Array.isArray(parsedGranted) || parsedGranted.length === 0) return Response.json({ error: 'invalid_scopes' }, { status: 400 });
-@@ -844,10 +758,13 @@ export class Hub extends DurableObject {
+@@ -844,12 +759,16 @@ export class Hub extends DurableObject {
            const isSubset = parsedGranted.every((s: string) => reqScopes.includes(s));
            if (!isSubset) return Response.json({ error: 'Cannot grant unrequested scopes' }, { status: 400 });
  
 -          if (body.machine_id !== undefined && (typeof body.machine_id !== 'string' || body.machine_id.length > 128 || pairing.client_kind !== 'host')) return Response.json({ error: 'invalid_machine_id' }, { status: 400 });
-+          if (body.machine_id !== undefined && (typeof body.machine_id !== 'string' || !body.machine_id || body.machine_id.length > 128)) return Response.json({ error: 'invalid_machine_id' }, { status: 400 });
++          if (body.machine_id !== undefined && !(body.machine_id === null && pairing.client_kind === 'agent') && (typeof body.machine_id !== 'string' || !body.machine_id || body.machine_id.length > 128)) return Response.json({ error: 'invalid_machine_id' }, { status: 400 });
            return this.ctx.storage.transactionSync(() => {
              const current = this.sql.exec('SELECT * FROM device_pairings WHERE user_code = ?', userCode).toArray()[0] as any;
 -            if (!current || current.status !== 'pending' || Date.parse(current.expires_at) <= Date.now()) return Response.json({ error: 'invalid_pairing' }, { status: 409 });
@@ -16380,8 +16388,11 @@ index 51bc2d3..0ccd2df 100644
 +            if (current.client_kind === 'agent' && !validAgentPairingScopes(JSON.stringify(parsedGranted), current.requested_scopes)) return Response.json({ error: 'invalid_scopes' }, { status: 400 });
              let machineId: string | null = null;
              if (current.client_kind === 'host') {
++              if (body.expected_actor !== undefined && body.expected_actor !== current.actor) return Response.json({ error: 'invalid_approval' }, { status: 400 });
                if (body.machine_id) {
-@@ -858,11 +775,27 @@ export class Hub extends DurableObject {
+                 if (!this.sql.exec('SELECT id FROM machines WHERE id = ?', body.machine_id).toArray()[0]) return Response.json({ error: 'invalid_machine_id' }, { status: 400 });
+                 machineId = body.machine_id;
+@@ -858,11 +777,28 @@ export class Hub extends DurableObject {
                  this.sql.exec('INSERT INTO machines (id, name, hostname, registered_at) VALUES (?, ?, ?, ?)', machineId, current.name, current.hostname, new Date().toISOString());
                }
              }
@@ -16399,9 +16410,10 @@ index 51bc2d3..0ccd2df 100644
 +              const project = address.project ?? (rows.length === 1 ? rows[0].project : null);
 +              const actor = project ? `${project}:${address.tag}` : address.tag;
 +              if (!registryAddress(actor)) return Response.json({ error: 'invalid_actor' }, { status: 400 });
++              if (body.expected_actor !== undefined && body.expected_actor !== actor) return Response.json({ error: 'invalid_approval' }, { status: 400 });
 +              const existing = this.sql.exec("SELECT machine_id FROM agents WHERE tag = ? AND COALESCE(project,'') = COALESCE(?,'')", address.tag, project).toArray()[0] as any;
 +              // Omission preserves a trusted existing assignment; explicit admin selection may fill NULL only.
-+              machineId = body.machine_id ?? existing?.machine_id ?? null;
++              machineId = body.machine_id !== undefined ? body.machine_id : (existing?.machine_id ?? null);
 +              if (existing?.machine_id && machineId !== existing.machine_id) return Response.json({ error: 'agent_machine_conflict' }, { status: 409 });
 +              if (machineId && (!project || !this.sql.exec('SELECT id FROM machines WHERE id = ? AND registered_at IS NOT NULL', machineId).toArray()[0])) return Response.json({ error: 'invalid_machine_id' }, { status: 400 });
 +              this.sql.exec("INSERT INTO agents (tag, project, machine_id, registered_at, imported_from) VALUES (?, ?, ?, ?, 'pairing') ON CONFLICT DO NOTHING", address.tag, project, machineId, new Date().toISOString());
@@ -16412,7 +16424,15 @@ index 51bc2d3..0ccd2df 100644
              return Response.json({ status: 'approved', machine_id: machineId });
            });
          }
-@@ -897,6 +830,8 @@ export class Hub extends DurableObject {
+@@ -885,6 +821,7 @@ export class Hub extends DurableObject {
+         let errorResponse = null;
+         let scopesResponse = '';
+         let expiresAtResponse = '';
++        let machineIdResponse: string | null = null;
+         
+         this.ctx.storage.transactionSync(() => {
+         const cred = this.sql.exec('SELECT * FROM credentials WHERE refresh_hash = ?', refreshHash).toArray()[0] as any;
+@@ -897,6 +834,8 @@ export class Hub extends DurableObject {
            errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
          } else if (!Number.isFinite(Date.parse(cred.expires_at)) || Date.parse(cred.expires_at) <= nowMs) {
            errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
@@ -16421,7 +16441,7 @@ index 51bc2d3..0ccd2df 100644
          } else {
            const res = this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', now, cred.id);
            if (res.rowsWritten !== 1) {
-@@ -905,9 +840,9 @@ export class Hub extends DurableObject {
+@@ -905,12 +844,13 @@ export class Hub extends DurableObject {
            } else {
              this.sql.exec(`
                INSERT INTO credentials
@@ -16434,7 +16454,21 @@ index 51bc2d3..0ccd2df 100644
  
              scopesResponse = JSON.parse(cred.scopes).join(' ');
              expiresAtResponse = cred.expires_at;
-@@ -1111,24 +1046,41 @@ export class Hub extends DurableObject {
++            machineIdResponse = cred.machine_id ?? null;
+           }
+         }
+ 
+@@ -922,7 +862,8 @@ export class Hub extends DurableObject {
+           refresh_token: refreshToken,
+           token_type: 'Bearer',
+           expires_in: Math.max(0, Math.floor((new Date(expiresAtResponse).getTime() - new Date(now).getTime()) / 1000)),
+-          scope: scopesResponse
++          scope: scopesResponse,
++          machine_id: machineIdResponse
+         });
+       }
+ 
+@@ -1111,24 +1052,41 @@ export class Hub extends DurableObject {
      if (auth.error) return auth.error;
      const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { 'Cache-Control': 'private, no-store' } });
      if (!auth.caller?.isAdmin) return json({ error: 'forbidden' }, 403);
@@ -16487,7 +16521,7 @@ index 51bc2d3..0ccd2df 100644
      }
      return json({ error: 'not_found' }, 404);
    }
-@@ -1374,8 +1326,13 @@ export class Hub extends DurableObject {
+@@ -1374,8 +1332,13 @@ export class Hub extends DurableObject {
      };
      if (cred.kind === 'host') {
        caller.machineId = cred.machine_id;
@@ -16502,7 +16536,7 @@ index 51bc2d3..0ccd2df 100644
        if (cred.machine_id) caller.machineId = cred.machine_id;
        if (cred.kind === 'job') {
          caller.jobId = cred.subject;
-@@ -1844,7 +1801,13 @@ export class Hub extends DurableObject {
+@@ -1844,7 +1807,13 @@ export class Hub extends DurableObject {
      if ((this.jobsService as any).healthService?.getEffectiveHealth) {
        return (this.jobsService as any).healthService.getEffectiveHealth(tag);
      }
@@ -16517,7 +16551,7 @@ index 51bc2d3..0ccd2df 100644
      if (agent) {
        return { state: agent.state || agent.health_state || 'unknown' };
      }
-@@ -2216,7 +2179,7 @@ export class Hub extends DurableObject {
+@@ -2216,7 +2185,7 @@ export class Hub extends DurableObject {
          if (!row) return Response.json({ error: 'not_found' }, { status: 404 });
  
          const isSupervisor = auth.caller?.isAdmin || auth.scopes?.includes('admin') || auth.scopes?.includes('lease:root') || auth.scopes?.includes('jobs:create');
@@ -16526,7 +16560,7 @@ index 51bc2d3..0ccd2df 100644
          const isJobCaller = auth.caller?.kind === 'job' && (auth.caller.jobId === jobId || (auth.caller as any).subject === jobId);
          if (!isSupervisor && !isOfferedHost && !isJobCaller) {
            return Response.json({ error: 'forbidden', reason: 'scope_or_binding_mismatch' }, { status: 403 });
-@@ -2512,7 +2475,7 @@ export class Hub extends DurableObject {
+@@ -2512,7 +2481,7 @@ export class Hub extends DurableObject {
        if (!row) return Response.json({ error: 'not_found' }, { status: 404 });
  
        const isSupervisor = auth.caller?.isAdmin || auth.scopes?.includes('admin') || auth.scopes?.includes('lease:root') || auth.scopes?.includes('jobs:create');
@@ -25400,15 +25434,18 @@ index b60796d..681a168 100644
        const dispatchNullHs = await service.commitRootAction(
 diff --git a/test/machine-pairing-worker.ts b/test/machine-pairing-worker.ts
 new file mode 100644
-index 0000000..51ffbfd
+index 0000000..8f25443
 --- /dev/null
 +++ b/test/machine-pairing-worker.ts
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,26 @@
 +// Local-only HTTP fixture. The agent credential is always issued by public device routes.
 +import worker, { Hub as ProductionHub } from '../src/worker';
 +import { createSessionCookie } from '../src/auth/session';
 +export class Hub extends ProductionHub {
-+ async pairingFixture() {
++ async pairingFixture(action?:string,code?:string) {
++  if(action==='expire') {
++   this.sql.exec("UPDATE device_pairings SET expires_at='2000-01-01T00:00:00Z' WHERE user_code=?",code!);return;
++  }
 +  const now=new Date().toISOString();
 +  this.sql.exec("INSERT INTO users(sub,email,is_admin,first_seen_at,last_seen_at) VALUES ('pair-human','admin@fake.local',1,?,?)",now,now);
 +  this.sql.exec("INSERT INTO machines(id,name,hostname,registered_at) VALUES ('pair-local-machine','Local fixture','localhost',?)",now);
@@ -25419,7 +25456,8 @@ index 0000000..51ffbfd
 + async fetch(request:Request,env:any,ctx:ExecutionContext) {
 +  if(new URL(request.url).pathname==='/__pairing_fixture') {
 +   if(request.method!=='POST'||request.headers.get('Authorization')!=='Bearer '+env.LOCAL_FIXTURE_KEY)return new Response(null,{status:404});
-+   await env.HUB.get(env.HUB.idFromName('hub')).pairingFixture();
++   const body:any=await request.json().catch(()=>({}));
++   await env.HUB.get(env.HUB.idFromName('hub')).pairingFixture(body.action,body.code);
 +   const cookie=await createSessionCookie(env,{sub:'pair-human',email:'admin@fake.local',isAdmin:true,csrfToken:env.LOCAL_FIXTURE_KEY,exp:Math.floor(Date.now()/1000)+3600});
 +   return Response.json({cookie:cookie.split(';')[0]});
 +  }
@@ -25428,17 +25466,17 @@ index 0000000..51ffbfd
 +};
 diff --git a/test/machine-pairing.mjs b/test/machine-pairing.mjs
 new file mode 100644
-index 0000000..a729920
+index 0000000..558a204
 --- /dev/null
 +++ b/test/machine-pairing.mjs
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,140 @@
 +// Loopback-only public HTTP + browser + actual read-only native bridge qualification.
 +import assert from 'node:assert/strict';
 +import {build} from 'esbuild';
 +import {Miniflare,Log,LogLevel,convertV4MiniflareOptions} from 'miniflare';
 +import {randomBytes} from 'node:crypto';
 +import {createRequire} from 'node:module';
-+import {readFile} from 'node:fs/promises';
++import {readFile,mkdir,mkdtemp,rm} from 'node:fs/promises';
 +import {resolve,extname} from 'node:path';
 +import {execFile} from 'node:child_process';
 +import {promisify} from 'node:util';
@@ -25459,6 +25497,8 @@ index 0000000..a729920
 + serviceBindings:{ASSETS:async request=>{const file=resolve(root,'public','.'+new URL(request.url).pathname);assert.ok(file.startsWith(resolve(root,'public')+'/'));try{return new Response(await readFile(file),{headers:{'Content-Type':mime[extname(file)]||'application/octet-stream'}});}catch{return new Response(null,{status:404});}}}
 +}]}));
 +let browser;
++const cliRoot=await mkdtemp(resolve(process.env.TMPDIR,'pairing-cli-'));
++const children=new Set();
 +try {
 + const base=(await mf.ready).origin;
 + const fixture=await (await fetch(base+'/__pairing_fixture',{method:'POST',headers:{Authorization:'Bearer '+key}})).json();
@@ -25482,31 +25522,100 @@ index 0000000..a729920
 + await page.getByRole('button',{name:'Approve',exact:true}).click();
 + const approval=await approved;assert.equal(approval.status(),200);assert.equal((await approval.json()).machine_id,'pair-local-machine');
 + console.log('PASS browser uses signed session, displayed project/tag, official dakit machine selector and CSRF approval');
-+ const tokenResponse=await poll();assert.equal(tokenResponse.status,200);const tokens=await tokenResponse.json();
++ const tokenResponse=await poll();assert.equal(tokenResponse.status,200);const tokens=await tokenResponse.json();assert.equal(tokens.machine_id,'pair-local-machine');
 + const request=async(token,path,method='GET',body)=>fetch(base+path,{method,headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})});
 + const participants=await (await request(tokens.access_token,'/api/conversations/participants')).json();
 + assert.equal(participants.self.actor,actor);assert.equal(participants.self.kind,'agent');
 + assert.equal(participants.participants.find(p=>p.actor===actor).machine_id,'pair-local-machine');
 + for(const path of ['/api/bus/inbox?actor=machine:pair-local-machine','/api/bus/inbox?actor=role:ops','/api/jobs'])assert.equal((await request(tokens.access_token,path)).status,403);
 + console.log('PASS public-issued agent credential authenticates exact registered machine and cannot read machine/role inboxes or jobs');
-+ if(nativeWorkspace) {
-+  const python=`import json,sys,urllib.request\nfrom agent_hub_host.conversation_bridge import ConversationBridge\nx=json.load(sys.stdin)\ndef request(method,path):\n r=urllib.request.Request(x['base']+path,method=method,headers={'Authorization':'Bearer '+x['token']})\n with urllib.request.urlopen(r,timeout=10) as res:return json.load(res)\nb=ConversationBridge(actor=x['actor'],project='pair-local',workspace=x['workspace'],machine_id='pair-local-machine',conversation_ids=['local-qualification'],origin=x['base'],request=request)\nq=b.qualify()\nassert q.session_id==x['id'] and q.tag==x['tag']\nprint('PASS actual installed native ConversationBridge.qualify with genuine own UUID/tag/workspace; no mailbox or journal writes')\n`;
-+  const child=execFile('python3',['-c',python],{cwd:nativeWorkspace,env:{...process.env,PYTHONPATH:resolve(root,'host'),PYTHONDONTWRITEBYTECODE:'1'},timeout:30000});
-+  child.stdin.end(JSON.stringify({base,token:tokens.access_token,actor,workspace:nativeWorkspace,id:own.id,tag:own.tag}));
-+  const result=await new Promise((ok,fail)=>{let out='',err='';child.stdout.on('data',d=>out+=d);child.stderr.on('data',d=>err+=d);child.on('error',fail);child.on('close',code=>code===0?ok(out):fail(new Error('Native qualification failed: '+err.slice(-500))));});console.log(result.trim());
-+ }
 + const refreshed=await fetch(base+'/api/token/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({grant_type:'refresh_token',refresh_token:tokens.refresh_token})});
-+ assert.equal(refreshed.status,200);const next=await refreshed.json();assert.equal(next.scope,'bus:read bus:send health:report');
++ assert.equal(refreshed.status,200);const next=await refreshed.json();assert.equal(next.scope,'bus:read bus:send health:report');assert.equal(next.machine_id,'pair-local-machine');
 + assert.equal((await request(tokens.access_token,'/api/conversations/participants')).status,401);
 + const current=await (await request(next.access_token,'/api/conversations/participants')).json();assert.equal(current.self.actor,actor);assert.equal(current.participants.find(p=>p.actor===actor).machine_id,'pair-local-machine');
 + console.log('PASS public refresh retains exact agent/registration/machine/scopes, old access token denied');
-+} finally {if(browser)await browser.close();await mf.dispose();}
++ // Real CLI subprocess: unmodified cli.main -> shared polling -> api.safe_http_json -> config.update_config.
++ const pyEnv=(file)=>({...process.env,HUB_CONFIG_FILE:file,HUB_URL:'',HUB_BASE_URL:'',HUB_TOKEN:'',HUB_JOB_TOKEN:'',PYTHONPATH:resolve(root,'host'),PYTHONDONTWRITEBYTECODE:'1',...(process.env.DTC_AUTH_HOME?{DTC_AUTH_HOME:process.env.DTC_AUTH_HOME}:{})});
++ async function python(script,file,extra={}) {
++  return exec('python3',['-c',script],{cwd:nativeWorkspace||root,env:{...pyEnv(file),...extra},timeout:30000});
++ }
++ async function login(suffix,mid,conflict=false) {
++  const cliActor=suffix==='bound'?actor:'pair-local:cli-'+suffix;
++  const dir=resolve(cliRoot,suffix);await mkdir(dir,{mode:0o700});const file=resolve(dir,'host.json');
++  if(conflict)await python("from agent_hub_host import config; config.update_config(machine_id='wrong-local-machine')",file);
++  const child=execFile('python3',['-u','-m','agent_hub_host.cli','login',base,'--kind','agent','--name',cliActor],{cwd:nativeWorkspace||root,env:pyEnv(file),timeout:45000});children.add(child);
++  let output='',errorOutput='';
++  const done=new Promise((ok,fail)=>{child.on('error',fail);child.on('close',code=>{children.delete(child);ok({code,output,errorOutput});});});
++  child.stderr.on('data',d=>errorOutput+=d);
++  const verification=await new Promise((ok,fail)=>{
++   const timer=setTimeout(()=>fail(new Error('CLI verification prompt missing')),15000);
++   child.stdout.on('data',d=>{output+=d;const match=output.match(/Open in a browser:\s+(http[^\s]+)/);if(match){clearTimeout(timer);ok(match[1]);}});
++   child.on('close',()=>{clearTimeout(timer);fail(new Error('CLI exited before verification prompt'));});
++  });
++  await page.goto(verification);await page.locator('#agentMachine').selectOption(mid||'');
++  const approved=page.waitForResponse(r=>new URL(r.url()).pathname.startsWith('/api/device/approve/'));
++  await page.getByRole('button',{name:'Approve',exact:true}).click();assert.equal((await approved).status(),200);
++  const result=await done;
++  if(conflict) {
++   assert.equal(result.code,1);assert.ok(result.errorOutput.includes('Conflicting machine_id for paired host config'));
++   await python("from agent_hub_host import config; c=config.load_config(); assert c['machine_id']=='wrong-local-machine' and 'access_token' not in c",file);
++   console.log('PASS real public CLI rejects conflicting preexisting machine config without overwriting it');return;
++  }
++  assert.equal(result.code,0);assert.ok(result.output.includes('Login successful.'));
++  await python(`import os
++from agent_hub_host import config,auth,conversations
++c=config.load_config()
++expected=os.environ['EXPECTED_MACHINE'] or None
++assert c.get('machine_id')==expected and c['client_kind']=='agent' and c['client_name']==os.environ['EXPECTED_ACTOR']
++s=conversations.request('GET','/api/conversations/participants')
++assert s['self']['actor']==os.environ['EXPECTED_ACTOR']
++row=next(p for p in s['participants'] if p['actor']==os.environ['EXPECTED_ACTOR'])
++assert row['machine_id']==expected
++old=c['access_token'];auth.refresh_token();c=config.load_config()
++assert c['access_token']!=old and c.get('machine_id')==expected
++assert conversations.request('GET','/api/conversations/participants')['self']['actor']==os.environ['EXPECTED_ACTOR']
++if os.environ.get('OWN_UUID'):
++ from agent_hub_host.conversation_bridge import ConversationBridge
++ # The actual public CLI config supplies the token and must satisfy execute()'s machine precondition.
++ assert c.get('machine_id')==expected and expected
++ b=ConversationBridge(actor=os.environ['EXPECTED_ACTOR'],project='pair-local',workspace=os.environ['OWN_WORKSPACE'],machine_id=expected,conversation_ids=['local-qualification'],origin=c['base_url'])
++ binding=b.qualify()
++ assert binding.session_id==os.environ['OWN_UUID'] and binding.tag==os.environ['OWN_TAG']
++ assert not b.path.exists() and not b.path.with_name(b.path.name+'.lock').exists()
++`,file,{EXPECTED_MACHINE:mid||'',EXPECTED_ACTOR:cliActor,...(suffix==='bound'&&own?{OWN_UUID:own.id,OWN_TAG:own.tag,OWN_WORKSPACE:nativeWorkspace}:{})});
++  console.log('PASS real public CLI '+suffix+' login persists authoritative binding automatically; real HTTP refresh and participants'+(suffix==='bound'&&own?'; genuine own UUID native qualify, no journal or inbox writes':''));
++ }
++ await login('bound','pair-local-machine');await login('null',null);await login('conflict','pair-local-machine',true);
++ // A displayed machine-less choice stays null even if an admin registers a machine while the page is open.
++ const stale=await (await fetch(base+'/api/device/code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client_kind:'agent',name:'pair-local:stale-ui',requested_scopes:['bus:read']})})).json();
++ await page.goto(base+'/device?code='+stale.user_code);
++ const registered=await fetch(base+'/api/agents',{method:'POST',headers:{Cookie:fixture.cookie,'Content-Type':'application/json','X-CSRF-Token':key},body:JSON.stringify({project:'pair-local',tag:'stale-ui',machine_id:'pair-local-machine'})});assert.equal(registered.status,201);
++ const dialogs=[];page.on('dialog',d=>dialogs.push(d.message()));
++ const denied=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/device/approve/'+stale.user_code);
++ await page.getByRole('button',{name:'Approve',exact:true}).click();const rejection=await denied;assert.equal(rejection.status(),409);
++ assert.equal((await rejection.json()).error,'agent_machine_conflict');await page.waitForTimeout(50);assert.equal(dialogs.at(-1),'Error');
++ console.log('PASS browser sends explicit null and truthfully reports rejection after concurrent registration');
++ const bare=await (await fetch(base+'/api/device/code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client_kind:'agent',name:'bare-ui',requested_scopes:['bus:read']})})).json();
++ await page.goto(base+'/device?code='+bare.user_code);assert.ok((await page.textContent('body')).includes('Project: (projectless) / Tag: bare-ui'));
++ assert.equal((await fetch(base+'/api/agents',{method:'POST',headers:{Cookie:fixture.cookie,'Content-Type':'application/json','X-CSRF-Token':key},body:JSON.stringify({project:'pair-local',tag:'bare-ui',machine_id:'pair-local-machine'})})).status,201);
++ const changed=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/device/approve/'+bare.user_code);
++ await page.getByRole('button',{name:'Approve',exact:true}).click();const changedResponse=await changed;assert.equal(changedResponse.status(),400);assert.equal((await changedResponse.json()).error,'invalid_approval');await page.waitForTimeout(50);assert.equal(dialogs.at(-1),'Error');
++ console.log('PASS browser rejects changed bare-tag canonical identity rather than approving the new project');
++ const expired=await (await fetch(base+'/api/device/code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client_kind:'agent',name:'pair-local:expired-ui',requested_scopes:['bus:read']})})).json();
++ await page.goto(base+'/device?code='+expired.user_code);
++ await fetch(base+'/__pairing_fixture',{method:'POST',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json'},body:JSON.stringify({action:'expire',code:expired.user_code})});
++ const expiration=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/device/approve/'+expired.user_code);
++ await page.getByRole('button',{name:'Approve',exact:true}).click();assert.equal((await expiration).status(),400);await page.waitForTimeout(50);assert.equal(dialogs.at(-1),'Error');
++ const missing=await page.goto(base+'/device?code=NOPE-NOPE');assert.equal(missing.status(),404);assert.ok((await page.textContent('body')).includes('Not found or expired'));
++ console.log('PASS browser pending/approved/expired/error paths use actual public responses');
++} finally {for(const child of children)child.kill();if(browser)await browser.close();await mf.dispose();await rm(cliRoot,{recursive:true,force:true});}
++
 diff --git a/test/machine-pairing.test.ts b/test/machine-pairing.test.ts
 new file mode 100644
-index 0000000..254f6b5
+index 0000000..ae2f519
 --- /dev/null
 +++ b/test/machine-pairing.test.ts
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,242 @@
 +import { describe, it, expect, beforeEach } from 'vitest';
 +import { SELF, env, runInDurableObject } from 'cloudflare:test';
 +import { createSessionCookie } from '../src/auth/session';
@@ -25539,21 +25648,87 @@ index 0000000..254f6b5
 +  await machine();const p=await challenge();expect((await poll(p)).status).toBe(400);
 +  const c=await human();expect((await approve(p,{machine_id:'pair-node',expected_actor:'pair:worker'},c)).status).toBe(200);
 +  const t=await (await poll(p)).json() as any;const row=await credential(t);
++  expect(t.machine_id).toBe('pair-node');
 +  expect(row).toMatchObject({kind:'agent',machine_id:'pair-node',registry_actor:'pair:worker',actor:'pair:worker'});expect(JSON.parse(row.scopes)).toEqual(scopes);
 +  const participants=await (await self(t)).json() as any;expect(participants.self.actor).toBe('pair:worker');
 +  expect(participants.participants.find((a:any)=>a.actor==='pair:worker')).toMatchObject({machine_id:'pair-node',native_binding:{project:'pair',tag:'worker',machine_id:'pair-node'}});
 +  const r=await refresh(t);expect(r.status).toBe(200);const next=await r.json() as any;
++  expect(next.machine_id).toBe('pair-node');
 +  expect(await credential(next)).toMatchObject({kind:'agent',machine_id:'pair-node',registry_actor:'pair:worker',scopes:row.scopes,expires_at:row.expires_at});
 +  expect((await self(t)).status).toBe(401);expect((await self(next)).status).toBe(200);
 +  expect((await sql("SELECT credential_id FROM machines WHERE id='pair-node'"))[0].credential_id).toBe('host-pointer');
 +  expect((await poll(p)).status).toBe(400);expect((await approve(p,{machine_id:'pair-node'},c)).status).toBe(400);
 + });
 + it('preserves machine-less qualified/projectless pairing and inherits trusted existing machine assignment',async()=>{
-+  for(const actor of ['pair:unbound','unbound']) {const t=await pair(actor,{});expect((await credential(t)).machine_id).toBeNull();expect((await self(t)).status).toBe(200);}
++  for(const actor of ['pair:unbound','unbound']) {const t=await pair(actor,{});expect(t).toHaveProperty('machine_id',null);expect((await credential(t)).machine_id).toBeNull();expect((await self(t)).status).toBe(200);const r=await refresh(t);expect(r.status).toBe(200);expect(await r.json()).toHaveProperty('machine_id',null);}
 +  await machine();const c=await human();expect((await req('/api/agents','POST',{tag:'registered',project:'pair',machine_id:'pair-node'},c)).status).toBe(201);
 +  const t=await pair('pair:registered',{});expect((await credential(t)).machine_id).toBe('pair-node');
 +  const p=await challenge('pair:registered');const html=await (await req('/device?code='+p.user_code,'GET',undefined,c)).text();
 +  expect(html).toContain('Current registered machine: pair-node');expect(html).toContain('value="pair-node" selected');
++ });
++ // Replay the values actually rendered by GET, with a real public registry mutation in between.
++ for(const change of ['register','replace-project','replace-projectless','delete-project'])it('rejects changed displayed canonical identity after '+change,async()=>{
++  await machine();const c=await human(),tag='snapshot';
++  const register=(project:string|null)=>req('/api/agents','POST',{tag,...(project?{project}:{}),...(project?{machine_id:'pair-node'}:{})},c);
++  if(change==='replace-project'||change==='delete-project')expect((await register('before')).status).toBe(201);
++  if(change==='replace-projectless')expect((await register(null)).status).toBe(201);
++  const p=await challenge(tag),html=await (await req('/device?code='+p.user_code,'GET',undefined,c)).text();
++  const expected=change==='replace-project'||change==='delete-project'?'before:'+tag:tag;
++  expect(html).toContain('expected_actor: '+JSON.stringify(expected));
++  expect(html).toContain('Project: '+(expected.includes(':')?'before':'(projectless)')+' / Tag: '+tag);
++  if(change==='replace-project'||change==='delete-project')expect((await req('/api/agents/before:'+tag,'DELETE',undefined,c)).status).toBe(200);
++  if(change==='replace-projectless')expect((await req('/api/agents/'+tag,'DELETE',undefined,c)).status).toBe(200);
++  if(change!=='delete-project')expect((await register('after')).status).toBe(201);
++  const r=await approve(p,{expected_actor:expected,machine_id:expected.includes(':')?'pair-node':null},c);
++  expect(r.status).toBe(400);expect(await r.json()).toEqual({error:'invalid_approval'});
++  expect((await sql('SELECT status,actor,machine_id FROM device_pairings WHERE user_code=?',p.user_code))[0]).toEqual({status:'pending',actor:tag,machine_id:null});
++  expect(await sql('SELECT * FROM credentials')).toHaveLength(0);
++ });
++ it('accepts the canonical actor displayed for an unchanged bare request',async()=>{
++  await machine();const c=await human();expect((await req('/api/agents','POST',{project:'pair',tag:'canonical',machine_id:'pair-node'},c)).status).toBe(201);
++  const p=await challenge('canonical'),html=await (await req('/device?code='+p.user_code,'GET',undefined,c)).text();
++  expect(html).toContain('expected_actor: "pair:canonical"');
++  expect((await approve(p,{expected_actor:'pair:canonical',machine_id:'pair-node'},c)).status).toBe(200);
++  const t=await (await poll(p)).json() as any;expect(t.machine_id).toBe('pair-node');expect((await credential(t)).registry_actor).toBe('pair:canonical');
++ });
++ for(const existing of [false,true,'assignment'])it('enforces displayed explicit NULL after concurrent machine assignment, existing='+existing,async()=>{
++  await machine();const c=await human();
++  if(existing)expect((await req('/api/agents','POST',{project:'pair',tag:'choice'},c)).status).toBe(201);
++  const p=await challenge('pair:choice'),html=await (await req('/device?code='+p.user_code,'GET',undefined,c)).text();
++  expect(html).toContain('Machine-less (native bridge unavailable)');expect(html).toContain('data.machine_id = null');
++  if(existing==='assignment') {const concurrent=await challenge('pair:choice');expect((await approve(concurrent,{machine_id:'pair-node'},c)).status).toBe(200);}
++  else {
++   if(existing)expect((await req('/api/agents/pair:choice','DELETE',undefined,c)).status).toBe(200);
++   expect((await req('/api/agents','POST',{project:'pair',tag:'choice',machine_id:'pair-node'},c)).status).toBe(201);
++  }
++  const r=await approve(p,{expected_actor:'pair:choice',machine_id:null},c);expect(r.status).toBe(409);expect(await r.json()).toEqual({error:'agent_machine_conflict'});
++  expect((await sql('SELECT status FROM device_pairings WHERE user_code=?',p.user_code))[0].status).toBe('pending');
++  expect((await sql("SELECT machine_id FROM agents WHERE project='pair' AND tag='choice'"))[0].machine_id).toBe('pair-node');
++  expect(await sql('SELECT * FROM credentials')).toHaveLength(0);
++ });
++ it('allows explicit NULL ordinary agents and rejects host NULL without side effects',async()=>{
++  const t=await pair('pair:null-choice',{expected_actor:'pair:null-choice',machine_id:null});expect(t).toHaveProperty('machine_id',null);expect((await self(t)).status).toBe(200);
++  const r=await refresh(t);expect(r.status).toBe(200);expect(await r.json()).toHaveProperty('machine_id',null);
++  const p=await challenge('host-null',{client_kind:'host',requested_scopes:['host']});
++  expect((await approve(p,{machine_id:null},await human())).status).toBe(400);expect(await sql('SELECT * FROM machines')).toHaveLength(0);
++  expect((await sql('SELECT status FROM device_pairings WHERE user_code=?',p.user_code))[0].status).toBe('pending');
++ });
++ it('retains the displayed machine after same-actor delete/re-register, refusing a new assignment',async()=>{
++  await machine();await machine('other-node');const c=await human();
++  expect((await req('/api/agents','POST',{project:'pair',tag:'swap',machine_id:'pair-node'},c)).status).toBe(201);
++  const p=await challenge('pair:swap'),html=await (await req('/device?code='+p.user_code,'GET',undefined,c)).text();
++  expect(html).toContain('value="pair-node" selected');expect(html).toContain('data.machine_id = "pair-node"');
++  expect((await req('/api/agents/pair:swap','DELETE',undefined,c)).status).toBe(200);
++  expect((await req('/api/agents','POST',{project:'pair',tag:'swap',machine_id:'other-node'},c)).status).toBe(201);
++  expect((await approve(p,{expected_actor:'pair:swap',machine_id:'pair-node'},c)).status).toBe(409);
++  expect((await sql('SELECT status FROM device_pairings WHERE user_code=?',p.user_code))[0].status).toBe('pending');
++ });
++ it('ignores caller machine assertions at token polling and refresh',async()=>{
++  await machine();const c=await human(),p=await challenge('pair:metadata');expect((await approve(p,{machine_id:'pair-node'},c)).status).toBe(200);
++  const r=await req('/api/device/token','POST',{grant_type:'urn:ietf:params:oauth:grant-type:device_code',device_code:p.device_code,machine_id:'forged'});
++  expect(r.status).toBe(200);const t=await r.json() as any;expect(t.machine_id).toBe('pair-node');
++  const rotated=await req('/api/token/refresh','POST',{grant_type:'refresh_token',refresh_token:t.refresh_token,machine_id:'forged'});
++  expect(rotated.status).toBe(200);const next=await rotated.json() as any;expect(next.machine_id).toBe('pair-node');expect((await credential(next)).machine_id).toBe('pair-node');
 + });
 + it('does not promote old machine-less credentials when an admin binds their registration',async()=>{
 +  const old=await pair('pair:upgrade',{});expect((await self(old)).status).toBe(200);
