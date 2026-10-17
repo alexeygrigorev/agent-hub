@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
-import { SessionControlService, validateSendProof } from '../src/session_control';
+import { SessionControlService, validateSendProof, adoptObservedNativeSessions } from '../src/session_control';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
@@ -653,5 +653,246 @@ describe('absolute workspace identifiers and friendly names', () => {
       expect((await s.handle(request(`/api/sessions/${first.id}`, undefined, 'GET'), admin)).status).toBe(200);
       expect((await s.handle(request('/api/sessions/mine/send', { key: 'alias-send-2', body: 'hi' }), admin)).status).toBe(409);
     }, fake.hook);
+  });
+
+  describe('observed native session adoption and qualified aliases', () => {
+    const NATIVE_DATAOPS_ID = '021d9370-9b3d-4e5a-b59b-256334c08c75';
+    const NATIVE_CRM_ID = '60d244c2-02d0-4587-a82b-e172af4cfd0d';
+    const SAMPLES = [
+      {
+        native_id: NATIVE_DATAOPS_ID,
+        tag: 'batching',
+        workspace: '/home/alexey/git/dataops',
+        engine: 'argon',
+        phase: 'running',
+        cwd: '/home/alexey/git/dataops',
+        created_at_ms: 1792257043571,
+      },
+      {
+        native_id: NATIVE_CRM_ID,
+        tag: 'crm-redesign',
+        workspace: '/home/alexey/git',
+        engine: 'codex',
+        phase: 'running',
+        cwd: '/home/alexey/git',
+        created_at_ms: 1792238491217,
+      },
+    ];
+
+    it('adopts native sessions with exact incarnation, machine, engine, and deduplicates across polls', async () => {
+      await fixture(async (s, sql) => {
+        const firstAdopt = adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+        expect(firstAdopt.adopted).toBe(2);
+        expect(firstAdopt.updated).toBe(0);
+
+        // Subsequent poll deduplicates: zero new rows, zero unnecessary writes
+        const secondAdopt = adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+        expect(secondAdopt.adopted).toBe(0);
+        expect(secondAdopt.updated).toBe(0);
+
+        // GET /api/sessions lists adopted sessions with correct projection
+        const res = await s.handle(request('/api/sessions', undefined, 'GET'), admin);
+        expect(res.status).toBe(200);
+        const data = await res.json() as any;
+        expect(data.sessions.length).toBe(2);
+
+        const dataops = data.sessions.find((r: any) => r.id === NATIVE_DATAOPS_ID);
+        expect(dataops).toBeDefined();
+        expect(dataops.provenance).toBe('observed_native');
+        expect(dataops.controllability).toBe('controllable');
+        expect(dataops.workspace).toBe('/home/alexey/git/dataops');
+        expect(dataops.qualified_alias).toBe('dataops:batching');
+        expect(dataops.engine).toBe('argon');
+        expect(dataops.machine).toBe('hetzner');
+        expect(dataops.state).toBe('running');
+        expect(dataops.created_at).toBe(new Date(1792257043571).toISOString());
+
+        const crm = data.sessions.find((r: any) => r.id === NATIVE_CRM_ID);
+        expect(crm).toBeDefined();
+        expect(crm.provenance).toBe('observed_native');
+        expect(crm.controllability).toBe('controllable');
+        expect(crm.workspace).toBe('/home/alexey/git');
+        expect(crm.qualified_alias).toBe('git:crm-redesign');
+        expect(crm.engine).toBe('codex');
+        expect(crm.machine).toBe('hetzner');
+        expect(crm.state).toBe('running');
+        expect(crm.created_at).toBe(new Date(1792238491217).toISOString());
+      });
+    });
+
+    it('resolves sessions by exact qualified alias and canonical native UUID', async () => {
+      await fixture(async (s, sql) => {
+        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+
+        // Literal colon
+        const r1 = await s.handle(request('/api/sessions/dataops:batching', undefined, 'GET'), admin);
+        expect(r1.status).toBe(200);
+        expect(((await r1.json()) as any).id).toBe(NATIVE_DATAOPS_ID);
+
+        // URL-encoded colon %3A
+        const r1Encoded = await s.handle(request('/api/sessions/dataops%3Abatching', undefined, 'GET'), admin);
+        expect(r1Encoded.status).toBe(200);
+        expect(((await r1Encoded.json()) as any).id).toBe(NATIVE_DATAOPS_ID);
+
+        // git:crm-redesign
+        const r2 = await s.handle(request('/api/sessions/git:crm-redesign', undefined, 'GET'), admin);
+        expect(r2.status).toBe(200);
+        expect(((await r2.json()) as any).id).toBe(NATIVE_CRM_ID);
+
+        // Canonical UUID lookup
+        const rUuid = await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}`, undefined, 'GET'), admin);
+        expect(rUuid.status).toBe(200);
+        expect(((await rUuid.json()) as any).id).toBe(NATIVE_DATAOPS_ID);
+
+        // Non-existent alias
+        const r404 = await s.handle(request('/api/sessions/dataops:nonexistent', undefined, 'GET'), admin);
+        expect(r404.status).toBe(404);
+      });
+    });
+
+    it('refuses collisions / reused tags with 409 ambiguous_name (no latest-wins)', async () => {
+      await fixture(async (s, sql) => {
+        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+
+        // Insert a second session with the same workspace basename and tag (e.g. historical / alternative workspace)
+        const COLLIDING_ID = '33333333-3333-4333-8333-333333333333';
+        const collidingSample = [
+          {
+            native_id: COLLIDING_ID,
+            tag: 'batching',
+            workspace: '/srv/other/dataops',
+            engine: 'argon',
+            phase: 'running',
+            created_at_ms: 1792258000000,
+          },
+        ];
+        adoptObservedNativeSessions(sql, 'hetzner', collidingSample, Date.now());
+
+        // Alias resolution refuses ambiguous name honestly
+        const res = await s.handle(request('/api/sessions/dataops:batching', undefined, 'GET'), admin);
+        expect(res.status).toBe(409);
+        expect(((await res.json()) as any).error).toBe('ambiguous_name');
+
+        // Direct canonical UUIDs still work unambiguously
+        const r1 = await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}`, undefined, 'GET'), admin);
+        expect(r1.status).toBe(200);
+        const r2 = await s.handle(request(`/api/sessions/${COLLIDING_ID}`, undefined, 'GET'), admin);
+        expect(r2.status).toBe(200);
+      });
+    });
+
+    it('enforces admin human control and denies foreign agent access with 404/403', async () => {
+      await fixture(async (s, sql) => {
+        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+
+        // Foreign agent cannot see adopted sessions in list
+        const agentList = await s.handle(request('/api/sessions', undefined, 'GET'), stranger);
+        expect(agentList.status).toBe(200);
+        expect(((await agentList.json()) as any).sessions).toEqual([]);
+
+        // Foreign agent cannot resolve by alias
+        const agentAlias = await s.handle(request('/api/sessions/dataops:batching', undefined, 'GET'), stranger);
+        expect(agentAlias.status).toBe(404);
+
+        // Foreign agent cannot resolve by UUID
+        const agentUuid = await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}`, undefined, 'GET'), stranger);
+        expect(agentUuid.status).toBe(404);
+
+        // Foreign agent cannot enqueue control commands
+        const agentSend = await s.handle(request('/api/sessions/dataops:batching/send', { key: 'ag-1', body: 'hi' }), stranger);
+        expect([403, 404]).toContain(agentSend.status);
+      });
+    });
+
+    it('allows send, capture, and stop on adopted session via qualified alias or UUID', async () => {
+      await fixture(async (s, sql) => {
+        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+
+        // Send via alias
+        const sendRes = await s.handle(request('/api/sessions/dataops:batching/send', { key: 'send-1', body: 'execute dataops' }), admin);
+        expect(sendRes.status).toBe(201);
+        const sendData = await sendRes.json() as any;
+        expect(sendData.command_id).toBeDefined();
+        expect(sendData.state).toBe('recorded');
+
+        // Capture via alias
+        const capRes = await s.handle(request('/api/sessions/dataops:batching/capture', { key: 'cap-1', max_bytes: 1024 }), admin);
+        expect(capRes.status).toBe(201);
+
+        // Host receives the offer for the adopted session
+        const offersRes = await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'));
+        expect(offersRes.status).toBe(200);
+        const offersData = await offersRes.json() as any;
+        expect(offersData.offers.length).toBeGreaterThanOrEqual(1);
+        const sendOffer = offersData.offers.find((o: any) => o.command_id === sendData.command_id);
+        expect(sendOffer).toBeDefined();
+        expect(sendOffer.binding.native_id).toBe(NATIVE_DATAOPS_ID);
+        expect(sendOffer.binding.tag).toBe('batching');
+        expect(sendOffer.binding.workspace).toBe('/home/alexey/git/dataops');
+
+        // Stop via alias
+        const stopRes = await s.handle(request('/api/sessions/dataops:batching/stop', { key: 'stop-1' }), admin);
+        expect(stopRes.status).toBe(201);
+      });
+    });
+
+    it('preserves absence honestly without deleting or stopping missing sessions', async () => {
+      await fixture(async (s, sql) => {
+        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+
+        // Next poll only reports crm-redesign (dataops is absent from host poll)
+        const nextPoll = [SAMPLES[1]];
+        adoptObservedNativeSessions(sql, 'hetzner', nextPoll, Date.now());
+
+        // dataops is NOT deleted, and NOT marked stopped (absence alone is not exit proof)
+        const show = await s.handle(request('/api/sessions/dataops:batching', undefined, 'GET'), admin);
+        expect(show.status).toBe(200);
+        const row = await show.json() as any;
+        expect(row.state).toBe('running');
+      });
+    });
+
+    it('protects observed native sessions from automated cleanup', async () => {
+      await fixture(async (s, sql) => {
+        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+
+        // Mark session as stopped in DB to test eligibility filter
+        sql.exec("UPDATE session_control_sessions SET state = 'stopped' WHERE id = ?", NATIVE_DATAOPS_ID);
+
+        // Admin apply is refused (admins cannot apply cleanup across foreign sessions)
+        const adminCleanup = await s.handle(request('/api/sessions/cleanup', { apply: true }), admin);
+        expect(adminCleanup.status).toBe(404);
+
+        // Agent apply does not enqueue observed native sessions
+        const agentCleanup = await s.handle(request('/api/sessions/cleanup', { apply: true }), agent('cred-1'));
+        expect(agentCleanup.status).toBe(200);
+        const cleanupData = await agentCleanup.json() as any;
+        expect(cleanupData.enqueued.length).toBe(0);
+
+        // The observed session is intact
+        const show = await s.handle(request('/api/sessions/dataops:batching', undefined, 'GET'), admin);
+        expect(show.status).toBe(200);
+      });
+    });
+
+    it('keeps normal Hub-started bindings untouched when adopting native catalog', async () => {
+      const fake = fakeReserve();
+      await fixture(async (s, sql) => {
+        // Start a normal Hub session
+        const hubSession = await startOk(s, { workspace: 'demo', name: 'hub-active' }, admin, 'hub-k1');
+        expect(hubSession.fleet_launch_id).toBeDefined();
+
+        // Native sessions report includes both new native session and normal sessions
+        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+
+        // Hub session retains its fleet_launch_id, name, and canonical_hub provenance
+        const checkHub = await s.handle(request(`/api/sessions/${hubSession.id}`, undefined, 'GET'), admin);
+        expect(checkHub.status).toBe(200);
+        const hubData = await checkHub.json() as any;
+        expect(hubData.fleet_launch_id).toBe(hubSession.fleet_launch_id);
+        expect(hubData.name).toBe('hub-active');
+        expect(hubData.provenance).toBe('canonical_hub');
+      }, fake.hook);
+    });
   });
 });

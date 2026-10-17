@@ -313,14 +313,20 @@ def _ms_to_iso(value):
 def session_metadata(raw, settings):
     sessions = raw if isinstance(raw, list) else raw.get("sessions", [])
     clean = []
-    for session in sessions[:200]:
+    for session in sessions:
         engine, profile = session.get("engine"), session.get("profile")
         matches = [s for s in settings["subscriptions"] if s.get("engine", s["service"]) == engine and s.get("profile") == profile]
+        created_at_ms = session.get("created_at_ms") or session.get("created_ms")
+        if isinstance(created_at_ms, str) and created_at_ms.isdigit():
+            created_at_ms = int(created_at_ms)
+        elif not isinstance(created_at_ms, int) or created_at_ms <= 0:
+            created_at_ms = None
         clean.append({"native_id": session["id"], "tag": session["tag"], "workspace": session.get("workspace", ""), "engine": engine,
                       "profile": profile, "account": matches[0]["account_label"] if len(matches) == 1 else None,
                       "phase": session.get("phase", "unknown"), "agent_state": session.get("reported_state"),
                       "cwd": session.get("cwd") if isinstance(session.get("cwd"), str) else None,
-                      "last_activity_at": _ms_to_iso(session.get("last_activity_ms"))})
+                      "last_activity_at": _ms_to_iso(session.get("last_activity_ms")),
+                      "created_at_ms": created_at_ms})
     return clean
 
 

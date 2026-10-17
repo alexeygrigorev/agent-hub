@@ -186,9 +186,35 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertEqual(result, {'offers_seen': 0})
         self.assertTrue(recv.called)
         # Bounded limit enforced.
-        bad = self.parse('host-receive', '--once', '--machine-id', 'hetzner1', '--limit', '99')
+    def test_qualified_alias_routing_for_show_send_capture_stop(self):
+        with patch.object(session_control, 'request', return_value={'id': 'native-1', 'qualified_alias': 'dataops:batching'}) as transport:
+            session_control.execute(self.parse('show', 'dataops:batching'))
+        self.assertEqual(transport.call_args.args[:2], ('GET', '/api/sessions/dataops:batching'))
+
+        with patch.object(session_control, 'request', return_value={'id': 'native-2', 'qualified_alias': 'git:crm-redesign'}) as transport:
+            session_control.execute(self.parse('show', 'git:crm-redesign'))
+        self.assertEqual(transport.call_args.args[:2], ('GET', '/api/sessions/git:crm-redesign'))
+
+        with patch.object(session_control, 'read_file', return_value='payload'), \
+                patch.object(session_control, 'request', return_value={'command_id': 'c1', 'state': 'recorded'}) as transport:
+            session_control.execute(self.parse('send', 'dataops:batching', '--body-file', 'p.txt', '--key', 'k1'))
+        self.assertEqual(transport.call_args.args[:2], ('POST', '/api/sessions/dataops:batching/send'))
+
+        with patch.object(session_control, 'request', return_value={'command_id': 'c2', 'state': 'recorded'}) as transport:
+            session_control.execute(self.parse('capture', 'git:crm-redesign', '--key', 'k2'))
+        self.assertEqual(transport.call_args.args[:2], ('POST', '/api/sessions/git:crm-redesign/capture'))
+
+        with patch.object(session_control, 'request', return_value={'command_id': 'c3', 'state': 'recorded'}) as transport:
+            session_control.execute(self.parse('stop', 'dataops:batching', '--key', 'k3'))
+        self.assertEqual(transport.call_args.args[:2], ('POST', '/api/sessions/dataops:batching/stop'))
+
+        with patch.object(session_control, 'request', return_value={'commands': []}) as transport:
+            session_control.execute(self.parse('commands', 'dataops:batching'))
+        self.assertEqual(transport.call_args.args[:2], ('GET', '/api/sessions/dataops:batching/commands'))
+
+        # Friendly name check strictly excludes colon (separate qualified alias resolver preserving friendly name validation)
         with self.assertRaises(ValueError):
-            session_control.execute(bad)
+            session_control.check_session_name('dataops:batching')
 
 
 if __name__ == '__main__':

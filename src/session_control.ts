@@ -88,6 +88,20 @@ function workspaceOk(value: unknown): value is string {
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const nameOk = (x: unknown): x is string => typeof x === 'string' && NAME_RE.test(x);
 
+export function workspaceBasename(ws: string): string {
+  if (typeof ws !== 'string' || !ws) return '';
+  const trimmed = ws.replace(/\/+$/, '');
+  const idx = trimmed.lastIndexOf('/');
+  return idx >= 0 ? trimmed.slice(idx + 1) : trimmed;
+}
+
+export function qualifiedNativeAlias(workspace: string, tag: string): string | null {
+  if (!workspace || !tag) return null;
+  const base = workspaceBasename(workspace);
+  if (!base || !tag) return null;
+  return `${base}:${tag}`;
+}
+
 async function body(request: Request): Promise<any> {
   if (!request.body) return null;
   const reader = request.body.getReader();
@@ -385,6 +399,15 @@ export class SessionControlService {
 
   private view(row: any) {
     const request = parsed(row.request_json, {});
+    const binding = row.binding_json ? parsed(row.binding_json, null) : null;
+    const isObserved = (row.actor === 'unknown' || request.provenance === 'observed_native') && !row.fleet_launch_id;
+    const provenance = isObserved ? 'observed_native' : 'canonical_hub';
+    const controllability = isObserved
+      ? (['running', 'active', 'starting'].includes(row.state) ? 'controllable' : 'historical_read_only')
+      : 'controllable';
+    const workspace = binding?.workspace || request?.workspace || null;
+    const tag = binding?.tag || request?.tag || null;
+    const qualified_alias = workspace && tag ? qualifiedNativeAlias(workspace, tag) : null;
     return {
       id: row.id, state: row.state, machine: row.machine_id ?? null, engine: row.engine ?? null,
       mode: row.mode, access: request.access?.mode || 'legacy_unspecified',
@@ -393,7 +416,11 @@ export class SessionControlService {
       // actor-scoped exact-name alias where explicitly resolved below.
       name: typeof request.name === 'string' ? request.name : null,
       fleet_launch_id: row.fleet_launch_id ?? null,
-      binding: row.binding_json ? parsed(row.binding_json, null) : null,
+      binding,
+      provenance,
+      controllability,
+      workspace,
+      qualified_alias,
       created_at: row.created_at, updated_at: row.updated_at,
     };
   }
@@ -420,6 +447,41 @@ export class SessionControlService {
       const request = parsed(r.request_json, {});
       return request.name === name;
     });
+    if (matches.length === 0) return { ok: false, error: 'not_found', status: 404 };
+    if (matches.length > 1) return { ok: false, error: 'ambiguous_name', status: 409 };
+    return { ok: true, session: matches[0] };
+  }
+
+  /** Qualified native alias (<workspace_basename>:<tag>).
+   *
+   * Exact match only; collisions / reused tags are refused honestly with
+   * 409 ambiguous_name (no latest-wins). Admins can resolve observed native
+   * sessions; foreign agent callers cannot resolve unowned sessions (fail closed
+   * with 404).
+   */
+  private resolveSessionByQualifiedAlias(alias: string, caller: Caller): { ok: true; session: any } | { ok: false; error: string; status: number } {
+    const colon = alias.indexOf(':');
+    if (colon <= 0 || colon === alias.length - 1) return { ok: false, error: 'not_found', status: 404 };
+    const base = alias.slice(0, colon);
+    const tag = alias.slice(colon + 1);
+
+    let rows: any[];
+    try {
+      rows = (this.sql.exec('SELECT * FROM session_control_sessions').toArray() as any[]).filter(r => this.ownerOk(r, caller));
+    } catch {
+      return { ok: false, error: 'not_found', status: 404 };
+    }
+
+    const matches = rows.filter(r => {
+      const binding = r.binding_json ? parsed(r.binding_json, null) : null;
+      const request = parsed(r.request_json, {});
+      const ws = binding?.workspace || request?.workspace;
+      const t = binding?.tag || request?.tag;
+      if (!ws || !t) return false;
+      const b = workspaceBasename(ws);
+      return b === base && t === tag;
+    });
+
     if (matches.length === 0) return { ok: false, error: 'not_found', status: 404 };
     if (matches.length > 1) return { ok: false, error: 'ambiguous_name', status: 409 };
     return { ok: true, session: matches[0] };
@@ -913,6 +975,11 @@ export class SessionControlService {
               refused.push({ key: target.session_key, reasons: ['not owned by caller (admin is not ownership)'] });
               continue;
             }
+            const req = parsed(live.request_json, {});
+            if (live.actor === 'unknown' || req.provenance === 'observed_native') {
+              refused.push({ key: target.session_key, reasons: ['observed_native session protected from automated cleanup'] });
+              continue;
+            }
             const binding = live.binding_json ? parsed(live.binding_json, null) : null;
             if (!binding || binding.native_id !== target.refs.native_id) {
               refused.push({ key: target.session_key, reasons: ['binding_mismatch: native incarnation drifted; listed, never acted'] });
@@ -978,13 +1045,48 @@ export class SessionControlService {
       return response(planCleanupDryRun(this.sql, scope, caller.actor ?? '', this.now()));
     }
 
+    if (path === '/api/sessions/host-adoption' && request.method === 'POST') {
+      if (!host && !admin) return response({ error: 'forbidden' }, 403);
+      const data = await body(request);
+      if (!data || typeof data !== 'object' || !Array.isArray(data.sessions)) {
+        return response({ error: 'invalid_adoption_request' }, 400);
+      }
+      const targetMachine = host ? caller.machineId! : (data.machine_id || caller.machineId);
+      if (!targetMachine) return response({ error: 'missing_machine_id' }, 400);
+      return this.transaction(() => {
+        const result = adoptObservedNativeSessions(this.sql, targetMachine, data.sessions, this.now(), this.presentingFamily(caller));
+        return response({ status: 'ok', ...result });
+      });
+    }
+
     const sessionMatch = /^\/api\/sessions\/([^/]{1,128})(\/(send|capture|stop|commands|binding))?$/.exec(path);
     if (sessionMatch) {
-      const rawRef = sessionMatch[1];
+      const rawRef = decodeURIComponent(sessionMatch[1]);
       const sub = sessionMatch[3];
       let session: any = null;
       if (UUID_RE.test(rawRef)) {
         session = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', rawRef).toArray()[0] ?? null;
+        if (!session) {
+          const rows = this.sql.exec('SELECT * FROM session_control_sessions WHERE binding_json IS NOT NULL').toArray() as any[];
+          for (const r of rows) {
+            try {
+              const b = JSON.parse(r.binding_json);
+              if (b?.native_id === rawRef) {
+                session = r;
+                break;
+              }
+            } catch {}
+          }
+        }
+      } else if (rawRef.includes(':')) {
+        if (sub === 'binding') return response({ error: 'not_found' }, 404);
+        if ((sub === undefined && request.method !== 'GET') ||
+            (sub !== undefined && !(['send', 'capture', 'stop'].includes(sub) ? request.method === 'POST' : request.method === 'GET'))) {
+          return response({ error: 'not_found' }, 404);
+        }
+        const resolved = this.resolveSessionByQualifiedAlias(rawRef, caller);
+        if (!resolved.ok) return response({ error: resolved.error }, resolved.status);
+        session = resolved.session;
       } else {
         // Friendly-name alias: actor-scoped exact match only (never a native
         // tag, never a foreign session, never latest-wins). Ambiguous names
@@ -1431,4 +1533,151 @@ export class SessionControlService {
 
 function actorName(caller: Caller): string {
   return caller.actor || caller.machineId || 'admin';
+}
+
+/** Adopt host-attested observed native sessions into canonical session control.
+ *
+ * Machine-bound credentials; unknown custody stays unknown; admin device
+ * human authorization controls observed sessions. Normal Hub-started bindings
+ * stay completely untouched. Absent records are NOT deleted or stopped.
+ */
+export function adoptObservedNativeSessions(
+  sql: SqlStorage,
+  machineId: string,
+  sessions: any[],
+  nowMs: number,
+  hostFamily?: string | null,
+): { adopted: number; updated: number } {
+  const hasTable = sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length > 0;
+  if (!hasTable || !Array.isArray(sessions) || !machineId) return { adopted: 0, updated: 0 };
+
+  let resolvedFamily = hostFamily;
+  if (!resolvedFamily) {
+    try {
+      const m: any = sql.exec('SELECT c.family_id FROM machines m LEFT JOIN credentials c ON c.id = m.credential_id WHERE m.id = ?', machineId).toArray()[0];
+      if (m?.family_id) resolvedFamily = m.family_id;
+    } catch {}
+  }
+
+  const TERMINAL_PHASES = new Set(['exited', 'dead', 'pruned', 'forgotten']);
+  let adopted = 0;
+  let updated = 0;
+  const isoNow = new Date(nowMs).toISOString();
+
+  for (const s of sessions) {
+    if (!s || typeof s !== 'object') continue;
+    const nativeId = s.native_id;
+    if (typeof nativeId !== 'string' || !UUID_RE.test(nativeId)) continue;
+    const tag = typeof s.tag === 'string' ? s.tag : '';
+    const workspace = typeof s.workspace === 'string' ? s.workspace : '';
+    if (!tag || !workspace) continue;
+
+    // Validate native createdAt field
+    let createdAtMs: number | null = null;
+    if (typeof s.created_at_ms === 'number' && Number.isInteger(s.created_at_ms) && s.created_at_ms > 0) {
+      createdAtMs = s.created_at_ms;
+    }
+
+    // Do not adopt if this native session is already bound to an active Fleet launch
+    try {
+      const hasLaunch = sql.exec('SELECT id FROM fleet_launches WHERE machine_id = ? AND native_id = ?', machineId, nativeId).toArray().length > 0;
+      if (hasLaunch) continue;
+    } catch {}
+
+    // Check if an existing Hub-started session (with fleet_launch_id) manages this native_id
+    const existing: any = sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', nativeId).toArray()[0];
+    if (existing && existing.fleet_launch_id) {
+      // Hub-started intent with exact nativeId: keep untouched
+      continue;
+    }
+
+    // Check if any Hub-started session has binding_json pointing to this nativeId
+    let hubManaged = false;
+    try {
+      for (const row of sql.exec('SELECT id, binding_json FROM session_control_sessions WHERE fleet_launch_id IS NOT NULL AND machine_id = ?', machineId).toArray() as any[]) {
+        try {
+          const b = JSON.parse(row.binding_json || '{}');
+          if (b.native_id === nativeId) {
+            hubManaged = true;
+            break;
+          }
+        } catch {}
+      }
+    } catch {}
+    if (hubManaged) continue;
+
+    const state = TERMINAL_PHASES.has(s.phase) ? 'stopped' : (s.phase === 'starting' ? 'starting' : 'running');
+    const createdAtIso = createdAtMs ? new Date(createdAtMs).toISOString() : isoNow;
+    const requestName = typeof s.name === 'string' && s.name ? s.name : null;
+    const requestOwner = typeof s.owner === 'string' && s.owner ? s.owner : null;
+    const actor = requestOwner || 'unknown';
+
+    const requestPayload = {
+      provenance: 'observed_native',
+      origin: 'aplexer',
+      workspace,
+      cwd: typeof s.cwd === 'string' ? s.cwd : null,
+      engine: typeof s.engine === 'string' ? s.engine : null,
+      tag,
+      name: requestName,
+      owner: requestOwner,
+      created_at_ms: createdAtMs,
+    };
+
+    const bindingPayload = {
+      native_id: nativeId,
+      tag,
+      workspace,
+      generation: 1,
+      native_created_at_ms: createdAtMs,
+      provenance: 'observed_native',
+      adopted_at: isoNow,
+    };
+
+    if (!existing) {
+      // Insert new adopted session
+      const requestKey = 'native-' + nativeId;
+      sql.exec(
+        'INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, binding_json, owner_token_id, owner_family, host_family, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        nativeId,
+        actor,
+        requestKey,
+        JSON.stringify(requestPayload),
+        null,
+        machineId,
+        typeof s.engine === 'string' ? s.engine : null,
+        'interactive',
+        state,
+        JSON.stringify(bindingPayload),
+        null,
+        null,
+        resolvedFamily || null,
+        createdAtIso,
+        isoNow,
+      );
+      adopted++;
+    } else {
+      // Update existing adopted session if state or phase changed
+      let shouldUpdate = false;
+      let nextState = existing.state;
+      if (TERMINAL_PHASES.has(s.phase) && existing.state !== 'stopped') {
+        nextState = 'stopped';
+        shouldUpdate = true;
+      } else if (!TERMINAL_PHASES.has(s.phase) && existing.state !== 'stopped' && existing.state !== state) {
+        nextState = state;
+        shouldUpdate = true;
+      }
+      if (shouldUpdate) {
+        sql.exec(
+          'UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE id = ?',
+          nextState,
+          isoNow,
+          nativeId,
+        );
+        updated++;
+      }
+    }
+  }
+
+  return { adopted, updated };
 }

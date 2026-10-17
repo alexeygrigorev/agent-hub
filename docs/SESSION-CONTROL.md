@@ -411,3 +411,26 @@ rows, complete pagination).
 - Host fleet (`host/tests/test_fleet.py`, 20 cases, incl. absolute workspace
   keys accepted/malformed refused and explicit-mapping-only routing).
 - `tsc --noEmit` clean. No test starts, reads, or stops a live agent.
+
+## Native session adoption & qualified aliases
+
+Host-attested native aplexer sessions (interactive sessions, background work, task sessions) are observed via the maintained host catalog pipeline (`session_metadata` -> `PUT /api/fleet/sessions` and `POST /api/sessions/host-adoption`) and adopted into the canonical session control view:
+
+1. **Exact incarnation**: Preserves native UUID (`id`), tag, workspace, integer `created_at_ms`, and engine. Machine-bound host authority ensures that only the authorized enrolled host machine can report observations or claims.
+2. **Provenance & Controllability**:
+   - `provenance`: `observed_native` (vs `canonical_hub` for Hub-started sessions).
+   - `controllability`: `controllable` for active sessions (`running`, `starting`), `historical_read_only` for stopped sessions.
+3. **Qualified Native Aliases (`<workspace_basename>:<tag>`)**:
+   - Mapped from the canonical workspace path basename and native tag (e.g. `/home/alexey/git/dataops` + `batching` -> `dataops:batching`; `/home/alexey/git` + `crm-redesign` -> `git:crm-redesign`).
+   - Exact match resolution only. Collisions or reused tags return `409 ambiguous_name` honestly without "latest wins"; callers fall back to the exact canonical native UUID.
+   - Separate resolver preserving the friendly name validation (`--name` on start continues to exclude colons).
+4. **Security & Authorization**:
+   - Adopted sessions carry `actor = 'unknown'` with null owner tokens.
+   - Admin human device credentials pass authorization and can view, send, capture, and stop adopted sessions.
+   - Foreign agent credentials fail closed (`404 not_found` / `403 forbidden`) and cannot view or control observed native sessions.
+   - Normal Hub-started sessions with `fleet_launch_id` remain completely unchanged.
+5. **Absence & Freshness**:
+   - Missing native records from a host snapshot alone are NOT exit proof. Records are never deleted or prematurely marked stopped on absent polls.
+6. **Automated Cleanup Protection**:
+   - Observed native sessions are permanently protected from automated cleanup scripts or scheduled stop apply passes.
+
