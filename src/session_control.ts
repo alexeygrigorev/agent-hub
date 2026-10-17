@@ -478,6 +478,12 @@ export class SessionControlService {
     const writer = admin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch'));
     const host = caller.kind === 'host' && !!caller.machineId && auth.scopes?.includes('host');
 
+    if (path === '/api/sessions/host-bindings' && request.method === 'GET') {
+      if (!host) return response({ error: 'forbidden' }, 403);
+      const rows = this.sql.exec("SELECT s.* FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id WHERE s.machine_id = ? AND s.binding_json IS NULL AND s.state IN ('offered','starting','uncertain') AND f.state IN ('starting','running') LIMIT 100", caller.machineId!).toArray() as any[];
+      return response({ sessions: rows.filter(row => this.hostOk(row, caller).ok).map(row => ({ id: row.id, fleet_launch_id: row.fleet_launch_id, engine: row.engine })) });
+    }
+
     if (path === '/api/sessions' && request.method === 'POST') {
       if (!writer) return response({ error: 'forbidden' }, 403);
       const input = await body(request);

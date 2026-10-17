@@ -454,6 +454,16 @@ class Dispatcher:
         self.request("PUT", "/api/fleet/subscriptions", {"subscriptions": collect_subscriptions(self.settings, self.runner)})
         raw = self.runner([self.settings.get("aplexer_bin", "aplexer"), "list", "--json"])
         self.request("PUT", "/api/fleet/sessions", {"sessions": session_metadata(raw, self.settings)})
+        # Reconcile Fleet-owned starts into exact Hub session bindings after
+        # reporting the observed native catalog. Retry is read-before-write.
+        pending = self.request("GET", "/api/sessions/host-bindings").get("sessions", [])
+        rows = raw if isinstance(raw, list) else raw.get("sessions", [])
+        for session in pending:
+            matches = [r for r in rows if r.get("tag") == "hub-" + session["fleet_launch_id"] and r.get("engine") == session.get("engine")]
+            if len(matches) != 1:
+                continue
+            r = matches[0]
+            self.request("POST", "/api/sessions/" + session["id"] + "/binding", {"native": {"native_id": r["id"], "tag": r["tag"], "workspace": r["workspace"], "native_created_at_ms": r["created_at_ms"]}})
         if 'capabilities' in self.settings:
             self.request('PUT', '/api/fleet/routing/capabilities', {'needs': self.settings['capabilities'], 'max_agents': self.settings.get('max_agents', 1), 'runners': [{'engine': s.get('engine', s['service']), 'profile': s.get('profile'), 'account': s['account_label'], 'model': s['launcher_model'], 'effort': s.get('launcher_effort')} for s in self.settings['subscriptions'] if s.get('launcher_model') and s.get('admission_argv')]})
         offers = self.request("GET", "/api/fleet/offers").get("offers", [])
