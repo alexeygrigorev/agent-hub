@@ -3,8 +3,8 @@
 Covers: strict timestamp offsets consistent with the TS parser, the
 allowlisted observation payload builder (identity keys dropped), and the
 `hub sessions` default grouped listing + `cleanup` dry-run + `observe`
-transport mapping (dry-run performs no mutation; --apply refusal surfaces
-from the server and is never rewritten into success here).
+transport mapping (dry-run performs no mutation; server --apply errors
+surface unsweetened and are never rewritten into success here).
 """
 
 import argparse
@@ -95,8 +95,8 @@ class TestSessionsDefaultAndCleanup(unittest.TestCase):
         self.assertNotIn("apply", body)
         self.assertTrue(body.get("dry_run"))
 
-    def test_cleanup_apply_refusal_surfaces_unsweetened(self):
-        refused = ValueError("Session HTTP request failed with status 409 (apply_not_available)")
+    def test_cleanup_apply_errors_surface_unsweetened(self):
+        refused = ValueError("Session HTTP request failed with status 409 (session_not_stoppable)")
 
         def fake(*args):
             raise refused
@@ -104,7 +104,7 @@ class TestSessionsDefaultAndCleanup(unittest.TestCase):
         with patch.object(session_control, "request", side_effect=fake) as transport:
             with self.assertRaises(ValueError) as ctx:
                 session_control.execute(parse("cleanup", "--apply"))
-        self.assertIn("apply_not_available", str(ctx.exception))
+        self.assertIn("session_not_stoppable", str(ctx.exception))
         self.assertEqual(transport.call_args.args[2], {"apply": True})
 
     def test_observe_builds_allowlisted_transport(self):

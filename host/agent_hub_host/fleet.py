@@ -31,7 +31,7 @@ def load_settings(path=None):
     if path.stat().st_size > 65536:
         raise ValueError("Subscription configuration exceeds 64 KiB")
     data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "launcher", "aplexer_bin", "capabilities", "max_agents"} or data.get("version") != 1:
+    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots"} or data.get("version") != 1:
         raise ValueError("Invalid subscription configuration")
     subs = data.get("subscriptions")
     if not isinstance(subs, list) or len(subs) > 128:
@@ -61,6 +61,16 @@ def load_settings(path=None):
     maximum = data.get('max_agents', 1)
     if type(maximum) is not int or not 1 <= maximum <= 100:
         raise ValueError('Invalid machine concurrency')
+    # M15d trusted cleanup-root allowlist (plumbing only): explicit absolute
+    # host paths under which owned per-session worktrees may be removed after
+    # confirmed stop. Validated strictly at use time by
+    # session_cleanup.canonical_roots; the Fleet dispatcher never reads it.
+    roots = data.get('cleanup_roots', [])
+    if not isinstance(roots, list) or len(roots) > 16 or any(
+            not isinstance(r, str) or not r or '\x00' in r or not r.startswith('/') for r in roots):
+        raise ValueError('Invalid cleanup roots allowlist')
+    if len(set(roots)) != len(roots):
+        raise ValueError('Invalid cleanup roots allowlist')
     return data
 
 

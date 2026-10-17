@@ -113,6 +113,87 @@ def wait_until(deadline, interval, fetch, done, label):
         time.sleep(interval)
 
 
+def _require_cleanup_tree_args(args):
+    """Fail closed BEFORE any server mutation when --tree is under-addressed.
+
+    The tree step removes exactly ONE explicitly addressed owned worktree/
+    branch. Every address field is required; scope flags alone never address
+    a tree. Validated before POST /api/sessions/cleanup so an invalid tree
+    invocation performs zero writes.
+    """
+    missing = [name for name in ('machine_id', 'native_id', 'owner', 'worktree', 'branch', 'journal_dir')
+               if not getattr(args, name, None)]
+    if missing:
+        raise ValueError('cleanup --apply --tree requires %s (explicit address; scope flags never address a tree)'
+                         % ', '.join('--' + n.replace('_', '-') for n in missing))
+    roots = getattr(args, 'cleanup_root', None)
+    if not roots or not isinstance(roots, list) or not all(isinstance(r, str) and r for r in roots):
+        raise ValueError('cleanup --apply --tree requires at least one --cleanup-root (trusted allowlist)')
+    journal = getattr(args, 'journal_dir', None)
+    if not isinstance(journal, str) or not os.path.isabs(journal):
+        raise ValueError('cleanup --apply --tree requires an absolute --journal-dir')
+
+
+def _execute_cleanup_tree(args, applied):
+    """Run the --tree step for ONE explicitly addressed target after enqueue.
+
+    The server already authenticated ownership and enqueued the M12 stop
+    intent (see `applied`). The tree is attempted ONLY when the addressed
+    session's stop is confirmed (`stopped`); anything else reports kept
+    (`stop_pending` / server-kept reason) with no git effect. Ownership here
+    comes from the server record (enqueued entry + confirmed session view),
+    never from JSON observation flags.
+    """
+    from .native_sessions import SessionControlError as _NativeError
+    from .native_sessions import list_sessions as _list_sessions
+    from .session_cleanup import remove_owned_worktree
+    from .session_executor import CallerCustody
+
+    machine_id = args.machine_id
+    native_id = args.native_id
+    key = '%s/%s' % (machine_id, native_id)
+    enqueued = applied.get('enqueued', []) if isinstance(applied, dict) else []
+    match = next((e for e in enqueued if isinstance(e, dict) and e.get('session_key') == key), None)
+    if match is None:
+        kept = [r for r in (applied.get('refused', []) if isinstance(applied, dict) else [])
+                if isinstance(r, dict) and r.get('key') == key]
+        return {**applied, 'tree': {'state': 'kept', 'session_key': key,
+                                    'reason': '; '.join(sum([r.get('reasons', []) for r in kept], [])) or 'not enqueued by server; listed-only'}}
+    try:
+        view = request('GET', '/api/sessions/' + match['session_id'])
+    except ValueError as exc:
+        return {**applied, 'tree': {'state': 'kept', 'session_key': key, 'session_id': match.get('session_id'),
+                                    'reason': 'stop_pending: session view unavailable (%s); reconciled, do not blind-retry' % type(exc).__name__}}
+    if not isinstance(view, dict) or view.get('state') != 'stopped':
+        return {**applied, 'tree': {'state': 'kept', 'session_key': key, 'session_id': match.get('session_id'),
+                                    'reason': 'stop_pending: session state is %r, not stopped; reconciled, do not blind-retry'
+                                              % ((view or {}).get('state') if isinstance(view, dict) else 'unknown')}}
+    executable = getattr(args, 'aplexer_bin', None) or 'aplexer'
+    try:
+        rows = _list_sessions(executable, include_exited=True)
+        live_paths = [p for row in rows for p in (row.workspace, row.cwd) if isinstance(p, str) and p]
+    except Exception:
+        return {**applied, 'tree': {'state': 'kept', 'session_key': key, 'session_id': match.get('session_id'),
+                                    'reason': 'live_inventory_unavailable: native list failed; listed-only'}}
+    actor = getattr(args, 'actor', None) or ('machine:' + machine_id)
+    family = getattr(args, 'credential_family', None) or ('host-' + machine_id)
+    try:
+        custody = CallerCustody(actor=actor, machine_id=machine_id, credential_family=family).validated()
+    except Exception as exc:
+        return {**applied, 'tree': {'state': 'kept', 'session_key': key, 'session_id': match.get('session_id'),
+                                    'reason': 'invalid custody: %s' % str(exc)[:200]}}
+    try:
+        outcome = remove_owned_worktree(
+            custody=custody, journal_dir=args.journal_dir, machine_id=machine_id,
+            native_id=native_id, expected_owner=args.owner, worktree=args.worktree,
+            branch=args.branch, cleanup_roots=list(args.cleanup_root or []),
+            live_paths=live_paths, command_id=match.get('command_id'))
+    except _NativeError as exc:
+        return {**applied, 'tree': {'state': 'kept', 'session_key': key, 'session_id': match.get('session_id'),
+                                    'reason': str(exc)[:300]}}
+    return {**applied, 'tree': outcome}
+
+
 def wait_for_session(session_id, timeout, interval, *, stopping=False):
     deadline = time.monotonic() + timeout
     return wait_until(deadline, interval,
@@ -194,8 +275,21 @@ def add_commands(sub):
     receive.add_argument('--aplexer-bin', default='aplexer', help='Native executable (default aplexer)')
     receive.add_argument('--limit', type=int, default=20, help='Max offers per cycle (1..20)')
     receive.add_argument('--sender-workspace', default=None, help='Pinned authorized native sender workspace for replyable sends (default: receiver own whoami workspace)')
-    cleanup = commands.add_parser('cleanup', help='Plan finished/superseded cleanup (dry-run default; --apply is refused until M15d)')
-    cleanup.add_argument('--apply', action='store_true', help='Act (M15c: server refuses explicitly; M15d owns the executor seam)')
+    cleanup = commands.add_parser('cleanup', help='Plan finished/superseded cleanup (dry-run default; --apply enqueues real M12 stop intents)')
+    cleanup.add_argument('--apply', action='store_true', help='Act: enqueue owned stops via M12 custody (server-authenticated owner only; host executes via claim/ack)')
+    cleanup.add_argument('--key', default=None, help='Stable idempotency key for --apply (same key replays, never duplicates)')
+    cleanup.add_argument('--tree', action='store_true', help='After enqueue, remove ONE explicitly addressed owned worktree/branch once its stop is confirmed (requires --machine-id/--native-id/--owner/--worktree/--branch/--journal-dir/--cleanup-root)')
+    cleanup.add_argument('--machine-id', default=None, help='Cleanup target machine id (with --tree; must be the presenting host)')
+    cleanup.add_argument('--native-id', default=None, help='Cleanup target native session id (with --tree)')
+    # NOTE: --owner already exists above as the scope filter; --tree reuses it
+    # as the tree-target owner (server custody decides, never JSON).
+    cleanup.add_argument('--worktree', default=None, help='Explicit owned worktree path to remove (with --tree; must sit under --cleanup-root)')
+    cleanup.add_argument('--branch', default=None, help='Explicit owned branch to delete (with --tree; must be the worktree branch)')
+    cleanup.add_argument('--journal-dir', default=None, help='Absolute journal directory for durable cleanup records (with --tree)')
+    cleanup.add_argument('--cleanup-root', action='append', default=None, help='Trusted cleanup root (repeatable; with --tree)')
+    cleanup.add_argument('--aplexer-bin', default='aplexer', help='Native executable for live-use inventory (with --tree)')
+    cleanup.add_argument('--actor', default=None, help='Local custody actor (with --tree; default machine:<machine-id>)')
+    cleanup.add_argument('--credential-family', default=None, help='Local custody family label (with --tree; server enforces the real family)')
     cleanup.add_argument('--limit', type=int, default=50)
     cleanup.add_argument('--owner', default=None, help='Scope to one owner (admins only; callers always see their own actor)')
     cleanup.add_argument('--host', default=None, help='Scope to one machine id')
@@ -245,9 +339,21 @@ def execute(args):
         if params:
             path += '?' + '&'.join(params)
         if getattr(args, 'apply', False):
-            # M15c has no safe execution path: the server refuses explicitly
-            # (apply_not_available + M15d seam). Never claim success here.
-            return request('POST', path, {'apply': True})
+            # M15d REAL apply: the server enqueues M12 stop intents for
+            # freshly eligible OWN sessions (owner custody inside the txn).
+            # The host executes them through the existing claim/effect/ack
+            # path with containment-confirmed exit. Never claim success here:
+            # the server reports enqueued commands + kept reasons, and --tree
+            # additionally reports the worktree outcome below.
+            if getattr(args, 'tree', False):
+                _require_cleanup_tree_args(args)
+            body = {'apply': True}
+            if getattr(args, 'key', None):
+                body['key'] = args.key
+            applied = request('POST', path, body)
+            if not getattr(args, 'tree', False):
+                return applied
+            return _execute_cleanup_tree(args, applied)
         # Dry-run default: read-only plan, zero server mutation.
         return request('POST', path, {'dry_run': True})
     if cmd == 'observe':

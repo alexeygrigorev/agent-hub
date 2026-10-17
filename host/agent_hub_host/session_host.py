@@ -26,7 +26,11 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         settings = fleet.load_settings(settings_path)
         native = settings.get('aplexer_bin', 'aplexer')
         binding = qualify_sender_binding(native, str(Path.cwd().resolve()))
-        print(json.dumps({'event': 'host_ready', 'native_controller': binding.session_id}), flush=True)
+        # M15d narrow plumbing: surface the trusted cleanup-root allowlist
+        # size (no auto-delete daemon here; tree removal is explicit CLI only).
+        roots = settings.get('cleanup_roots', [])
+        print(json.dumps({'event': 'host_ready', 'native_controller': binding.session_id,
+                          'cleanup_roots': len(roots) if isinstance(roots, list) else 0}), flush=True)
         stop = threading.Event()
         previous = {}
         for sig in (signal.SIGTERM, signal.SIGINT):
