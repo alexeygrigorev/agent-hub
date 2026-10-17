@@ -375,6 +375,7 @@ export class JobsService {
       if (!job?.role_name || job.claim_token_hash !== hash || job.lease_epoch !== epoch || job.role_generation !== generation ||
           !['claimed','running'].includes(job.status) || !this.roleCurrent(job)) return { error: 'unauthorized_or_stale' };
       if (job.role_effect) return { execute: false, status: 'HOLD', reason: 'execution_intent_already_recorded' };
+      if (this.hasUnresolvedWriterIntent(job)) return { execute: false, status: 'HOLD', reason: 'previous_execution_unresolved' };
       const unresolved = this.sql.exec(`SELECT id FROM jobs WHERE role_name IS NOT NULL AND role_effect IS NOT NULL
         AND role_finish IS NULL AND kind=? AND payload=? AND id!=? LIMIT 1`, job.kind, job.payload, jobId).toArray()[0];
       if (unresolved) return { execute: false, status: 'HOLD', reason: 'previous_execution_unresolved' };
@@ -874,6 +875,20 @@ export class JobsService {
     return `job:${job.id}`;
   }
 
+  /** Call within the claim/effect transaction. Uncertainty outlives lease custody. */
+  private hasUnresolvedWriterIntent(job: any): boolean {
+    if (job.kind !== 'writer-run') return false;
+    const identity = this.getLeaseNameForJob({ ...job, role_name: null });
+    if (!identity.startsWith('writer:')) return false;
+    // Match the existing writer identity, including legacy dated keys without a
+    // payload date. Project, role name, request key and epoch are not identities.
+    return !!this.sql.exec(`SELECT id FROM jobs WHERE kind='writer-run' AND id!=?
+      AND role_effect IS NOT NULL AND role_finish IS NULL
+      AND COALESCE(NULLIF(CASE WHEN json_valid(payload) THEN json_extract(payload,'$.date') END,''),
+        CASE WHEN substr(idempotency_key,1,11)='writer-run:' THEN substr(idempotency_key,12) END)=? LIMIT 1`,
+      job.id, identity.slice('writer:'.length)).toArray()[0];
+  }
+
   async claimJob(
     jobId: string,
     hostId: string,
@@ -953,14 +968,18 @@ export class JobsService {
         }
 
         // Role custody must not bypass the existing writer:<date> exclusion.
-        // Both legacy and role claims consult the same active leases, in this CAS.
+        // Both legacy and role claims consult live leases and durable uncertainty
+        // in this CAS, before acquiring custody or minting a job credential.
         if (job.kind === 'writer-run') {
+          if (this.hasUnresolvedWriterIntent(job)) {
+            result = { error: 'conflict', reason: 'writer_date_busy' }; return;
+          }
           const profileLease = this.getLeaseNameForJob({ ...job, role_name: null });
           if (profileLease.startsWith('writer:')) {
             const holders = this.sql.exec(`SELECT j.*,l.expires_at AS profile_expires_at FROM jobs j JOIN leases l ON l.holder_job_id=j.id
               WHERE j.kind='writer-run' AND j.id!=? AND j.status IN ('claimed','running')`, jobId).toArray();
             if (holders.some(h => this.getLeaseNameForJob({ ...h, role_name: null }) === profileLease &&
-                !isLeaseExpired(h.profile_expires_at as any, this.rawNow().getTime()))) {
+                !isLeaseExpired(h.profile_expires_at as any, nowMs))) {
               result = { error: 'conflict', reason: 'writer_date_busy' }; return;
             }
           }
