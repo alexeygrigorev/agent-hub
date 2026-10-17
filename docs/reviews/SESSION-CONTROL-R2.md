@@ -6,7 +6,7 @@
 - **Initial Review Commit (`HEAD~2`)**: `4d1462ca38b0cd47f153fc08b2d3fbc47cea87a9` — `docs(review): independent M12e connected session control review (SCOPED REVISE) [skip ci]`
 - **Initial Composed Implementation Commit (`HEAD~3`)**: `f9417de39d7818f18cf6f4a3a8770c6a67518db0` — `[skip ci] M12e compose: real-Worker composed loop proves server agreement`
 - **Accepted `main` Base Ancestor**: `6bc91a1278250b374ea1d0b11acd353fae51a8cb` — `docs: correct independent review Git metadata before publication [skip ci]` (first-parent ancestor via `d841c6456badd27c1026d74abb3cae7e26473cf5`)
-- **Author Identity**: `platform-session-repair` (`1f455987-a036-4ff8-8789-e8e5d845da3e`), OpenCode Go / **Muse Spark 1.3** (`opencode-go/muse-spark-1.3-contributor`)
+- **Author Identity**: `platform-session-repair` (`1f455987-7c18-4982-9e99-56a73fc9e769`), OpenCode Go / **Muse Spark 1.3** (`opencode-go/muse-spark-1.3-contributor`)
 - **Reviewer Identity (`.local/review/first-action-worker.json`)**:
   - `id`: `e0fb234a-784a-4cd4-b9e9-5c8ef76184aa`
   - `tag`: `platform-session-r2-review`
@@ -28,7 +28,7 @@ Commit `2ca4700a80af316538319da462a4c17dac17867a` delivers substantial, well-str
 However, passing the 169 source test cases is not runtime closure. Independent code inspection, **7 novel Worker + Python host adversarial probes (`W1`–`W4`, `H1`–`H3`)**, and **2 narrowly authorized genuine throwaway native shell probes (`platform-session-r2-probe-sender` `0ee0cbbc-6c27-49ab-b514-747aaf043444` and `platform-session-r2-probe-target` `c89852c8-a547-477d-88a7-e534b3b0420b`)** demonstrate that **SCOPED REVISE** is required on `2ca4700a80af316538319da462a4c17dac17867a` before acceptance:
 
 1. **R2-F1 (HIGH — Inherited Core Authority Dependency on `src/registry.ts` & `src/hub.ts`, Reproduced in `W1` & `W2`)**:
-   - Although `SessionControlService.hostOk` (`src/session_control.ts:231-247`) consults `machines.credential_id -> credentials.family_id` on every call, `2ca4700a` inherits the unpatched `POST /api/machines/register` (`src/registry.ts:171-204`) and `POST /api/device/token` (`src/hub.ts:659-681`) routes identified in the independent M9 R4 review (`docs/reviews/METRICS-R4.md`, commit `4e6b2964` on `0c9493fd`).
+   - Although `SessionControlService.hostOk` (`src/session_control.ts:231-247`) consults `machines.credential_id -> credentials.family_id` on every call, `2ca4700a` inherits the unpatched `POST /api/machines/register` (`src/registry.ts:171-204`) and `POST /api/device/token` (`src/hub.ts:659-681`) routes identified in the independent M9 R4 review (`docs/reviews/METRICS-R4.md`, commit `4e6bfc2e` on `0c779176`).
    - **Reproduced on `2ca4700a`**:
      - In **`W1`**, a superseded, unrevoked host credential family (`host-cred-1`, `host-family-1`) calls `POST /api/machines/register` after the machine was re-enrolled to `host-cred-new` (`host-family-new`). Because `src/registry.ts:196-200` unconditionally executes `UPDATE machines SET ..., credential_id = ? WHERE id = ?` with no CAS or family continuity fence, `host-cred-1` overwrites `machines.credential_id`, hijacks pre-bind `POST /api/sessions/:id/binding` (`200 OK`), adopts `host_family = 'host-family-1'`, and locks `host-cred-new` out of `/offers`, `/claim`, `/ack`, and `/binding`.
      - In **`W2`**, after newer host pairing `B` exchanges its device token, binds a session (`host_family = family_B`), and receives an enqueued command, a delayed exchange of an older approved host device code `A` via `POST /api/device/token` unconditionally overwrites `machines.credential_id` to `A` (`src/hub.ts:676`), locking `B` out of its own active bound session (`GET /api/session-commands/offers` returns `offers: []` because `m.machine_family !== family_B`).
@@ -87,9 +87,9 @@ Pre-test (`20261017T102632Z-source-verify-pre-clean`) and post-test (`20261017T1
 
 ### Changed Paths in `bd3d64196e4bccde5b1146b5ea1a17cc22d669c3..2ca4700a80af316538319da462a4c17dac17867a`
 
-15 modified existing paths (`M`) + 3 newly added repair test/config paths (`A`, bringing tracked files from `243` to `246`):
-- **Modified (`15`)**: `docs/SESSION-CONTROL.md`, `docs/SESSION-HOST.md`, `host/agent_hub_host/native_sessions.py`, `host/agent_hub_host/session_control.py`, `host/agent_hub_host/session_executor.py`, `host/agent_hub_host/session_receiver.py`, `host/tests/test_native_bridge_contract.py`, `host/tests/test_session_control.py`, `host/tests/test_session_control_loop.py`, `host/tests/test_session_executor.py`, `host/tests/test_session_real_worker.py`, `src/hub.ts`, `src/session_control.ts`, `test/session-control-composed.test.ts`, `test/session-control.test.ts`.
-- **Added (`3`)**: `host/tests/test_session_repair.py`, `test/session-control-repair.test.ts`, `vitest.session-repair.config.ts`.
+15 changed paths: 12 modified existing paths (`M`) + 3 newly added repair test/config paths (`A`, bringing the reviewed envelope from `243` to `246`):
+- **Modified (`12`)**: `docs/SESSION-CONTROL.md`, `docs/SESSION-HOST.md`, `host/agent_hub_host/native_sessions.py`, `host/agent_hub_host/session_control.py`, `host/agent_hub_host/session_executor.py`, `host/agent_hub_host/session_receiver.py`, `host/tests/test_session_control_loop.py`, `host/tests/test_session_executor.py`, `host/tests/test_session_real_worker.py`, `src/session_control.ts`, `test/session-control-composed.test.ts`, `test/session-control.test.ts`.
+- **Added (`3`)**: `host/tests/test_session_repair.py`, `test/session-control-repair.test.ts`, `test/vitest.session-control-repair.config.ts`.
 
 ---
 
@@ -437,3 +437,8 @@ M12e must not be shrunk to a synthetic fixture loop. Even after the M12e scoped 
    - End-to-end profile/account selection and native AI engine qualification (verifying real AI agent state vs throwaway `shell` processes) remain open.
 5. **M11 Physical Cross-Host Real AI Loop (`grok-botbox` -> `hetzner`) & Laptop / `win35` Enrollment**:
    - Real cross-host AI session launch, prompt delivery, reply confirmation, capture, and confirmed stop between `grok-botbox` and `hetzner` (and enrollment/validation of `laptop` and `win35`) remain open and mandatory before full runtime acceptance.
+
+
+## Head mechanical metadata correction
+
+The original Argon report remains immutable at `db3dcbccf6e4561407cac03e561caf1aeadc1620`. The head corrected the source-author UUID from its genuine launch receipt, two abbreviated M9 references, and the changed-path inventory/config filename from `git diff --name-status`. All ten ancestry table rows were mechanically checked against Git. Source, test results, findings, severity, SCOPED REVISE verdict, native observations and resource limits remain unchanged. No product tests were repeated for this metadata-only correction.
