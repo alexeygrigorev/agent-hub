@@ -4,7 +4,7 @@ import { modelCandidates, taskTier, policy } from './model-routing';
 import type { FleetService } from './fleet';
 import { sha256, randomString } from './auth/crypto';
 import { effectiveCheckin } from './registry';
-import { sameIntent, type EditAuthority } from './claim_admission';
+import { sameIntent, sameEditCaller, type EditAuthority } from './claim_admission';
 
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const label = (x: unknown): x is string => typeof x === 'string' && LABEL.test(x);
@@ -53,11 +53,14 @@ export class RoutingService {
     }
     const input = JSON.parse(row.request_json);
     const access = input.access?.mode === 'read' || input.access?.mode === 'edit' || input.access?.mode === 'legacy_unspecified' ? input.access.mode : 'legacy_unspecified';
-    return { id: row.id, status, queue_reason: status === 'queued' && !row.launch_id ? 'No fresh eligible capability/model route with quota and capacity.' : null, needs: input.needs, task_count: input.tasks.length, machine: launch?.machine_id ?? null,
-      runner: launch?.engine ?? null, tier: input.tier, access, admission_hold: launch && !['exited', 'failed'].includes(launch.state) ? this.fleet.admission.heldReason(launch) : null, selection: row.selection_json ? JSON.parse(row.selection_json) : null, launch_id: row.launch_id, report: redact(row.report), artifacts: [...JSON.parse(row.artifacts_json), ...this.sql.exec('SELECT name, media_type FROM routing_artifacts WHERE job_id = ?', row.id).toArray()], created_at: row.created_at, updated_at: row.updated_at };
+    const admissionHold = launch ? (!['exited', 'failed'].includes(launch.state) ? this.fleet.admission.heldReason(launch) : null) :
+      row.state === 'queued' ? this.fleet.admission.heldReason({ request_json: row.request_json, workspace: input.workspace }) : null;
+    return { id: row.id, status, queue_reason: status === 'queued' && !row.launch_id && !admissionHold ? 'No fresh eligible capability/model route with quota and capacity.' : null, needs: input.needs, task_count: input.tasks.length, machine: launch?.machine_id ?? null,
+      runner: launch?.engine ?? null, tier: input.tier, access, admission_hold: admissionHold, selection: row.selection_json ? JSON.parse(row.selection_json) : null, launch_id: row.launch_id, report: redact(row.report), artifacts: [...JSON.parse(row.artifacts_json), ...this.sql.exec('SELECT name, media_type FROM routing_artifacts WHERE job_id = ?', row.id).toArray()], created_at: row.created_at, updated_at: row.updated_at };
   }
   /** Idempotent fleet requests preserve reservations even if the reply/link write is interrupted. */
   async dispatch(jobId?: string) {
+    this.fleet.admission.reconcileOffers();
     let queued: any[];
     if (jobId) queued = this.sql.exec("SELECT * FROM routing_jobs WHERE id = ? AND launch_id IS NULL AND state = 'queued'", jobId).toArray();
     else {
@@ -87,7 +90,7 @@ export class RoutingService {
         }
         return;
       }
-      const live = this.fleet.admission.evaluate(principal, input.workspace, parsed.access, 'enqueue', { authority });
+      const live = this.fleet.admission.evaluate(principal, input.workspace, parsed.access, 'reserve', { authority });
       if (!live.ok) return;
       for (const ad of this.sql.exec('SELECT * FROM routing_machines').toArray() as any[]) {
         const machine: any = this.sql.exec('SELECT * FROM machines WHERE id = ?', ad.machine_id).toArray()[0];
@@ -126,7 +129,10 @@ export class RoutingService {
     if (auth.error) return auth.error;
     const caller = auth.caller; if (!caller) return reply({ error: 'unauthorized' }, 401);
     const admin = caller.isAdmin === true;
-    const client = caller.kind === 'agent' && auth.scopes?.includes('routing:submit');
+    const routingClient = caller.kind === 'agent' && auth.scopes?.includes('routing:submit');
+    // Existing fleet launch authority may submit edits only; it cannot mint or borrow claims.
+    const fleetEditor = caller.kind === 'agent' && auth.scopes?.includes('bus:send') && auth.scopes?.includes('fleet:launch');
+    const client = routingClient || fleetEditor;
     const host = caller.kind === 'host' && caller.machineId && auth.scopes?.includes('host');
     const path = new URL(request.url).pathname.replace(/^\/api\/fleet\/tasks(?=\/|$)/, '/api/tasks').replace(/^\/api\/fleet\/routing(?=\/|$)/, '/api/routing');
     if (path === '/api/routing/capabilities' && request.method === 'PUT') {
@@ -166,18 +172,20 @@ export class RoutingService {
       if ((input.tasks !== undefined && (input.prompt !== undefined || input.approved_action !== undefined)) || !Array.isArray(needs) || needs.length > 64 || needs.some((n: any) => typeof n !== 'string' || !CAP.test(n)) || !Array.isArray(tasks) || !tasks.length || tasks.length > 16 || tasks.some((t: any) => !obj(t, ['prompt', 'approved_action']) || typeof t.prompt !== 'string' || !t.prompt.trim() || typeof t.approved_action !== 'string' || !t.approved_action.trim()) || JSON.stringify(tasks).length > 12000) return reply({ error: 'invalid_task' }, 400);
       const parsed = this.fleet.admission.parseDeclaration(input.access);
       if ('error' in parsed) return reply({ error: parsed.error }, 400);
+      if (!admin && !routingClient && parsed.access.mode !== 'edit') return reply({ error: 'forbidden' }, 403);
       // Exact action/prompt is retained privately for execution, never included in list/get responses.
       const workspace = input.workspace || 'tasks';
       const canonical = JSON.stringify({ workspace, tier: taskTier(input), model: input.model ?? null, needs: [...new Set(needs)].sort(), tasks, preferred_runner: input.preferred_runner ?? null, preferred_machine: input.preferred_machine ?? null, access: parsed.access });
       const inserted = this.transaction(() => {
         const prior: any = this.sql.exec('SELECT * FROM routing_jobs WHERE actor = ? AND request_key = ?', actor, input.idempotency_key).toArray()[0];
         if (prior) return { prior };
-        const admitted = this.fleet.admission.evaluate(caller, workspace, parsed.access, 'enqueue', { permission: 'routing:submit' });
+        this.fleet.admission.reconcileOffers();
+        const admitted = this.fleet.admission.evaluate(caller, workspace, parsed.access, 'enqueue', { permission: routingClient ? 'routing:submit' : 'fleet:launch' });
         if (!admitted.ok) return { error: admitted.error, status: admitted.status };
         const id = crypto.randomUUID(); this.sql.exec('INSERT INTO routing_jobs (id, actor, request_key, request_json, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)', id, actor, input.idempotency_key, JSON.stringify({ ...JSON.parse(canonical), ...(admitted.authority ? { edit_authority: admitted.authority } : {}) }), 'queued', this.at(), this.at());
         return { id };
       });
-      if (inserted.prior) return sameIntent(inserted.prior.request_json, canonical) ? reply(this.view(inserted.prior)) : reply({ error: 'idempotency_conflict' }, 409);
+      if (inserted.prior) return sameIntent(inserted.prior.request_json, canonical) && sameEditCaller(inserted.prior.request_json, caller) ? reply(this.view(inserted.prior)) : reply({ error: 'idempotency_conflict' }, 409);
       if (inserted.error) return reply({ error: inserted.error, access: parsed.access.mode }, inserted.status);
       await this.dispatch(inserted.id);
       return reply(this.view(this.sql.exec('SELECT * FROM routing_jobs WHERE id = ?', inserted.id).one()), 201);

@@ -56,12 +56,35 @@ export function boundAccess(access: AccessDeclaration): AccessDeclaration {
 
 export class ClaimAdmission {
   public bus: BusService;
-  constructor(private sql: SqlStorage, transaction?: <T>(fn: () => T) => T, private now: () => number = Date.now) {
+  private offerCursor = '';
+  constructor(private sql: SqlStorage, private transaction: <T>(fn: () => T) => T = fn => fn(), private now: () => number = Date.now) {
     this.bus = new BusService(sql, transaction);
   }
 
   init() {
     this.sql.exec('CREATE TABLE IF NOT EXISTS fleet_claim_policy (workspace TEXT PRIMARY KEY, project TEXT, require_claim INTEGER NOT NULL)');
+  }
+
+  /** Called inside the shared transaction; only offered work has no start authorization. */
+  retireInvalidOffer(row: any): string | null {
+    if (row.state !== 'offered') return null;
+    const reason = this.heldReason(row);
+    if (!reason) return null;
+    const at = new Date(this.now()).toISOString();
+    this.sql.exec("UPDATE fleet_launches SET state = 'failed', verification_status = 'not_started', exit_reason = ?, finished_at = ?, updated_at = ? WHERE id = ? AND state = 'offered'", reason, at, at, row.id);
+    this.sql.exec("UPDATE routing_jobs SET state = 'failed', report = ?, updated_at = ? WHERE launch_id = ?", 'Not started: ' + reason, at, row.id);
+    return reason;
+  }
+
+  /** Bounded circular keyset sweep, without a second lock registry. */
+  reconcileOffers() {
+    const cursor = this.transaction(() => {
+      const rows = this.sql.exec("SELECT * FROM fleet_launches WHERE state = 'offered' AND id > ? ORDER BY id LIMIT 100", this.offerCursor).toArray() as any[];
+      if (rows.length < 100) rows.push(...this.sql.exec("SELECT * FROM fleet_launches WHERE state = 'offered' AND id <= ? ORDER BY id LIMIT ?", this.offerCursor, 100 - rows.length).toArray());
+      for (const row of rows) this.retireInvalidOffer(row);
+      return rows.at(-1)?.id || '';
+    });
+    this.offerCursor = cursor;
   }
 
   policy(workspace: string): { project: string | null; require_claim: boolean } {
@@ -196,7 +219,7 @@ export class ClaimAdmission {
       return this.fail('claim_holder_mismatch', 403);
     }
 
-    if (phase !== 'enqueue' && this.conflictingLaunches(authority.claim, opts.launchId).length) {
+    if (this.conflictingLaunches(authority.claim, opts.launchId).length) {
       return this.fail('claim_conflict', 409);
     }
     return { ok: true, access: boundAccess(access), authority };
@@ -208,10 +231,9 @@ export class ClaimAdmission {
       const request = JSON.parse(row.request_json);
       const declared = this.parseDeclaration(request.access);
       if ('error' in declared) return 'claim_authority_unsupported';
-      if (declared.access.mode !== 'edit') return null;
-      if (!request.edit_authority) return 'claim_authority_unsupported';
-      const authority: EditAuthority = request.edit_authority;
-      const check = this.evaluate({ kind: 'agent', actor: authority.actor, tokenId: authority.credential_id }, row.workspace, declared.access, 'start', { authority, launchId: row.id });
+      if (declared.access.mode === 'edit' && !request.edit_authority) return 'claim_authority_unsupported';
+      const authority: EditAuthority | undefined = request.edit_authority;
+      const check = this.evaluate(authority ? { kind: 'agent', actor: authority.actor, tokenId: authority.credential_id } : undefined, row.workspace, declared.access, 'start', { authority, launchId: row.id });
       return check.ok ? null : check.error;
     } catch { return 'claim_authority_unsupported'; }
   }
@@ -224,5 +246,14 @@ export function sameIntent(stored: string, canonical: string): boolean {
     delete request.edit_authority;
     request.access ??= { mode: 'legacy_unspecified', claim_id: null, project: null, scopes: [] };
     return JSON.stringify(request) === canonical;
+  } catch { return false; }
+}
+
+/** An exact retry cannot transfer the retained edit authority to a replacement credential. */
+export function sameEditCaller(stored: string, caller: AdmissionCaller): boolean {
+  try {
+    const request = JSON.parse(stored);
+    return request.access?.mode !== 'edit' || (!!request.edit_authority && !!caller.tokenId && !!caller.actor && !caller.isAdmin && caller.kind === 'agent' &&
+      request.edit_authority?.credential_id === caller.tokenId && request.edit_authority?.actor === caller.actor);
   } catch { return false; }
 }

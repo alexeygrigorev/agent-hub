@@ -1,7 +1,7 @@
 /** Generic account registry and placement. Provider credentials never enter this service. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { RoutingService } from './routing';
-import { ClaimAdmission, sameIntent, type EditAuthority, type AdmissionCaller } from './claim_admission';
+import { ClaimAdmission, sameIntent, sameEditCaller, type EditAuthority, type AdmissionCaller } from './claim_admission';
 import { effectiveCheckin } from './registry';
 
 export const FLEET_SCHEMA = `
@@ -67,6 +67,11 @@ export class FleetService {
     this.routing.init();
     this.admission.init();
     for (const stmt of FLEET_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
+    const launchColumns = this.sql.exec('PRAGMA table_info(fleet_launches)').toArray().map((c: any) => c.name);
+    for (const name of ['verification_status', 'exit_reason', 'finished_at']) {
+      if (!launchColumns.includes(name)) this.sql.exec(`ALTER TABLE fleet_launches ADD COLUMN ${name} TEXT`);
+    }
+    this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_offered ON fleet_launches(id) WHERE state = 'offered'");
     const columns = this.sql.exec('PRAGMA table_info(fleet_sessions)').toArray().map((c: any) => c.name);
     if (!columns.includes('last_activity_at')) this.sql.exec('ALTER TABLE fleet_sessions ADD COLUMN last_activity_at TEXT');
   }
@@ -89,6 +94,7 @@ export class FleetService {
   }
 
   accountStatus(account: any) {
+    this.admission.reconcileOffers();
     const routes = this.sql.exec('SELECT machine_id, profile FROM fleet_routes WHERE account = ?', account.label).toArray();
     let remaining: number | null = null; let observed = 0; let unknown = false; let blocked = !account.enabled;
     for (const route of routes) {
@@ -165,6 +171,7 @@ export class FleetService {
     const caller = auth.caller;
     if (!caller || !(caller.isAdmin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch')))) return result({ error: 'forbidden' }, 403);
     return this.transaction(() => {
+      this.admission.reconcileOffers();
       const plan = this.plan(input);
       if ('error' in plan) return result(plan, 400);
       const parsed = this.admission.parseDeclaration(input?.access);
@@ -179,7 +186,7 @@ export class FleetService {
       if (!label(input.idempotency_key)) return result({ error: 'idempotency_key_required' }, 400);
       const actor = caller.actor || caller.machineId || 'admin'; const canonical = JSON.stringify(bound);
       const prior: any = this.sql.exec('SELECT * FROM fleet_launches WHERE actor = ? AND request_key = ?', actor, input.idempotency_key).toArray()[0];
-      if (prior) return sameIntent(prior.request_json, canonical) ? result({ id: prior.id, state: prior.state, machine: prior.machine_id, engine: prior.engine, account: prior.account, mode: prior.mode, access: JSON.parse(prior.request_json).access?.mode || 'legacy_unspecified', replay: true }) : result({ error: 'idempotency_conflict' }, 409);
+      if (prior) return sameIntent(prior.request_json, canonical) && sameEditCaller(prior.request_json, caller) ? result({ id: prior.id, state: prior.state, machine: prior.machine_id, engine: prior.engine, account: prior.account, mode: prior.mode, access: JSON.parse(prior.request_json).access?.mode || 'legacy_unspecified', replay: true }) : result({ error: 'idempotency_conflict' }, 409);
       if (plan.request.parent_id) {
         const parent: any = this.sql.exec('SELECT actor, state FROM fleet_launches WHERE id = ?', plan.request.parent_id).toArray()[0];
         if (!parent) return result({ error: 'parent_not_found' }, 400);
@@ -244,6 +251,7 @@ export class FleetService {
         keys.add(key);
       }
       return this.transaction(() => {
+        this.admission.reconcileOffers();
         if (Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE state IN ${ACTIVE}`).one().n)) return response({ error: 'active_launches_hold_registry' }, 409);
         this.sql.exec('DELETE FROM fleet_subscriptions');
         this.sql.exec('DELETE FROM fleet_routes'); this.sql.exec('DELETE FROM fleet_accounts');
@@ -262,14 +270,16 @@ export class FleetService {
     if (path === '/api/fleet/offers' && request.method === 'GET') {
       if (!host) return response({ error: 'forbidden' }, 403);
       await this.routing.dispatch();
-      const offers: any[] = [];
-      // Held effects keep capacity, but must not hide later eligible offers on other slots.
-      for (const row of this.sql.exec("SELECT * FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at, id", caller.machineId!)) {
-        if (this.admission.heldReason(row)) continue;
-        offers.push({ id: row.id, engine: row.engine, account: row.account, profile: row.profile, mode: row.mode, workspace: row.workspace, prompt: row.prompt, access: parsed(row.request_json).access?.mode || 'legacy_unspecified' });
-        if (offers.length === 20) break;
-      }
-      return response({ offers: this.routing.enrichOffers(offers) });
+      return this.transaction(() => {
+        this.admission.reconcileOffers();
+        const offers: any[] = [];
+        for (const row of this.sql.exec("SELECT * FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at, id LIMIT 100", caller.machineId!)) {
+          if (this.admission.retireInvalidOffer(row)) continue;
+          offers.push({ id: row.id, engine: row.engine, account: row.account, profile: row.profile, mode: row.mode, workspace: row.workspace, prompt: row.prompt, access: parsed(row.request_json).access?.mode || 'legacy_unspecified' });
+          if (offers.length === 20) break;
+        }
+        return response({ offers: this.routing.enrichOffers(offers) });
+      });
     }
     if (path === '/api/fleet/sessions' && request.method === 'PUT') {
       if (!host) return response({ error: 'forbidden' }, 403);
@@ -325,18 +335,17 @@ export class FleetService {
         if (!row) return response({ error: 'not_found' }, 404);
         if (match[2] === 'claim') {
           if (row.state !== 'offered') return response({ error: 'already_claimed' }, 409);
+          const held = this.admission.retireInvalidOffer(row);
+          if (held) return response({ error: held }, ['claim_inactive', 'claim_conflict', 'claim_authority_changed'].includes(held) ? 409 : 403);
           if (!object(data, ['gate_allowed', 'observed_at', 'account', 'profile_supported']) || data.gate_allowed !== true || data.profile_supported !== true || data.account !== row.account || !fresh(data.observed_at, this.now(), 30000)) return response({ error: 'fresh_admission_required' }, 409);
           const account: any = this.sql.exec('SELECT * FROM fleet_accounts WHERE label = ?', row.account).toArray()[0];
           if (!account || this.accountStatus(account).status !== 'ok' || !this.observation(account, row)) return response({ error: 'account_unavailable' }, 409);
-          const bound = parsed(row.request_json);
-          const declared = this.admission.parseDeclaration(bound.access);
-          if ('error' in declared) return response({ error: 'claim_inactive', access: 'legacy_unspecified' }, 409);
-          if (declared.access.mode === 'edit') {
-            if (!bound.edit_authority) return response({ error: 'claim_authority_unsupported' }, 403);
-            const admitted = this.admission.evaluate({ kind: 'agent', actor: bound.edit_authority?.actor, tokenId: bound.edit_authority?.credential_id }, row.workspace, declared.access, 'start', { launchId: row.id, authority: bound.edit_authority });
-            if (!admitted.ok) return response({ error: admitted.error, access: declared.access.mode }, admitted.status);
-          }
-          this.sql.exec("UPDATE fleet_launches SET state = 'starting', updated_at = ? WHERE id = ?", new Date(this.now()).toISOString(), row.id);
+          // Capacity reads reconcile other offers and time may advance during synchronous checks.
+          // Never revive a row retired by that sweep; check authority again at the final write.
+          const current: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id = ?', row.id).one();
+          const finalHold = current.state === 'offered' ? this.admission.retireInvalidOffer(current) : current.exit_reason || 'already_claimed';
+          if (finalHold) return response({ error: finalHold }, ['claim_inactive', 'claim_conflict', 'claim_authority_changed', 'already_claimed'].includes(finalHold) ? 409 : 403);
+          this.sql.exec("UPDATE fleet_launches SET state = 'starting', updated_at = ? WHERE id = ? AND state = 'offered'", new Date(this.now()).toISOString(), row.id);
           return response({ ...row, state: 'starting' });
         }
         if (!object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit']) || !['running', 'uncertain', 'failed', 'exited'].includes(data.state) || !['starting', 'running', 'uncertain'].includes(row.state)) return response({ error: 'invalid_transition' }, 409);
