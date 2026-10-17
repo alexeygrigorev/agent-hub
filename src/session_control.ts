@@ -1087,7 +1087,7 @@ export class SessionControlService {
     if (ackMatch && request.method === 'POST') {
       if (!host) return response({ error: 'forbidden' }, 403);
       const input = await body(request);
-      if (!obj(input, ['correlation', 'outcome', 'native', 'reason', 'capture', 'confirmed_exit', 'claim_token', 'proof']) ||
+      if (!obj(input, ['correlation', 'outcome', 'native', 'reason', 'capture', 'confirmed_exit', 'claim_token', 'proof', 'tree']) ||
           typeof input.correlation !== 'string' || !ACK_OUTCOMES.has(input.outcome) ||
           typeof input.claim_token !== 'string' || !input.claim_token ||
           !obj(input.native || {}, ['native_id', 'tag', 'workspace']) ||
@@ -1161,6 +1161,28 @@ export class SessionControlService {
         if (input.outcome === 'delivered' && row.kind === 'stop' && input.confirmed_exit !== true) {
           return response({ error: 'confirmed_exit_required' }, 409);
         }
+        // M15d owning-host tree outcome (STOP-bundled): the host reports what
+        // IT did on the OWNING machine after the confirmed stop — derived from
+        // the canonical binding workspace + HOST-config roots + live native
+        // identity + discovered registered branch, never from CLI paths. The
+        // server shape-validates and persists it in ack_json (surfaced via the
+        // existing commands listing for CLI remote-observe); the stop verdict
+        // itself never depends on it. Ownership is rechecked at this durable
+        // ack: a drifted session owner converts the tree to kept
+        // (ownership_changed), never a removal.
+        const TREE_STATES = new Set(['removed', 'kept', 'uncertain']);
+        let tree: { state: string; reason: string } | null = null;
+        if (input.tree !== undefined) {
+          if (row.kind !== 'stop' || !obj(input.tree, ['state', 'reason']) ||
+              typeof input.tree.state !== 'string' || !TREE_STATES.has(input.tree.state) ||
+              typeof input.tree.reason !== 'string' || input.tree.reason.length > 300) {
+            return response({ error: 'invalid_ack' }, 400);
+          }
+          tree = { state: input.tree.state, reason: input.tree.reason };
+          if (session.actor !== row.actor) {
+            tree = { state: 'kept', reason: `ownership_changed: session owner drifted since enqueue; listed-only (host reported ${input.tree.state})`.slice(0, 300) };
+          }
+        }
         if (input.outcome === 'delivered' && row.kind === 'send') {
           // Host-verified native reply provenance, not host assertion: the
           // host retrieved the native envelope itself and verified the reply
@@ -1187,6 +1209,7 @@ export class SessionControlService {
           ...(input.capture !== undefined ? { capture: redact(input.capture).slice(0, 65536), capture_truncated: input.capture.length >= 65536 } : {}),
           ...(input.confirmed_exit !== undefined ? { confirmed_exit: input.confirmed_exit === true } : {}),
           ...(input.proof !== undefined ? { proof: input.proof } : {}),
+          ...(tree ? { tree } : {}),
         };
         const state = input.outcome === 'delivered' ? 'acked'
           : input.outcome === 'transported' ? 'transported'

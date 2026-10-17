@@ -57,8 +57,7 @@ async function fixture(fn: (s: SessionControlService, sql: any) => Promise<void>
   });
 }
 
-function ensureFleetLaunch(sql: any, launchId: string, machine = 'hetzner', nativeId: string | null = NATIVE_ID, launchState = 'running') {
-  const at = new Date().toISOString();
+function ensureFleetLaunch(sql: any, launchId: string, machine = 'hetzner', nativeId: string | null = NATIVE_ID, launchState = 'running') {  const at = new Date().toISOString();
   sql.exec(`INSERT OR REPLACE INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, launcher_task_id, created_at, updated_at)
     VALUES (?, 'demo:assistant', 'agent', NULL, 'fixture', ?, '{"workspace":"demo"}', ?, 'codex', 'fixture-acct', NULL, 'headless', 'demo', 'goal', ?, ?, NULL, ?, ?)`,
     launchId, 'fleet-' + launchId, machine, launchState, nativeId, at, at);
@@ -78,19 +77,19 @@ async function startAgentSession(s: SessionControlService, key: string) {
   return data;
 }
 
-async function bindAgentSession(s: SessionControlService, sql: any, sessionId: string, launchId: string) {
-  ensureFleetLaunch(sql, launchId);
-  reportFleetSession(sql, 'hetzner', NATIVE_ID, canonTag(launchId), NATIVE_WS);
+async function bindAgentSession(s: SessionControlService, sql: any, sessionId: string, launchId: string, nativeId: string = NATIVE_ID, workspace: string = NATIVE_WS) {
+  ensureFleetLaunch(sql, launchId, 'hetzner', nativeId);
+  reportFleetSession(sql, 'hetzner', nativeId, canonTag(launchId), workspace);
   const res = await s.handle(request(`/api/sessions/${sessionId}/binding`, {
-    native: { native_id: NATIVE_ID, tag: canonTag(launchId), workspace: NATIVE_WS, native_created_at_ms: NATIVE_CREATED },
+    native: { native_id: nativeId, tag: canonTag(launchId), workspace, native_created_at_ms: NATIVE_CREATED },
   }), host('hetzner'));
   expect(res.status).toBe(200);
 }
 
-async function finishObservation(s: SessionControlService) {
+async function finishObservation(s: SessionControlService, nativeId: string = NATIVE_ID) {
   const now = new Date().toISOString();
   const res = await s.handle(request('/api/sessions/observations', {
-    machine_id: 'hetzner', native_id: NATIVE_ID,
+    machine_id: 'hetzner', native_id: nativeId,
     payload: { report_written: true, report_at: now, screen_done: true, authoritative_no_pending_proof: true },
   }), host('hetzner'));
   expect(res.status).toBe(201);
@@ -164,5 +163,100 @@ describe('m15d cleanup apply', () => {
     expect(s.hostObservationAllowed('hetzner', { kind: 'host', machineId: 'hetzner', tokenId: 'host-cred-1' } as any)).toBe(true);
     expect(s.hostObservationAllowed('elsewhere', { kind: 'host', machineId: 'hetzner', tokenId: 'host-cred-1' } as any)).toBe(false);
     expect(s.hostObservationAllowed('hetzner', { kind: 'agent', actor: 'demo:assistant', tokenId: 'cred-1' } as any)).toBe(false);
+  }));
+});
+
+describe('m15d stop-bundled tree outcome in the stop ack', () => {
+  const N2 = '33333333-3333-4333-8333-333333333333';
+  const W2 = '/srv/hub/other';
+  const nativeTriple = (nativeId: string = NATIVE_ID, launchId = 'launch-1', workspace: string = NATIVE_WS) =>
+    ({ native_id: nativeId, tag: canonTag(launchId), workspace });
+
+  async function enqueueStop(s: SessionControlService, sql: any, key: string, opKey: string,
+      launchId = 'launch-1', nativeId: string = NATIVE_ID, workspace: string = NATIVE_WS) {
+    const created = await startAgentSession(s, key);
+    await bindAgentSession(s, sql, created.id, launchId, nativeId, workspace);
+    await finishObservation(s, nativeId);
+    const plan = await (await s.handle(request('/api/sessions/cleanup', { apply: true, key: opKey }), agent())).json() as any;
+    expect(plan.enqueued).toHaveLength(1);
+    return { sessionId: created.id, commandId: plan.enqueued[0].command_id };
+  }
+
+  async function offerFor(s: SessionControlService, commandId: string) {
+    const poll = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any;
+    const offer = (poll.offers as any[]).find((o: any) => o.command_id === commandId);
+    expect(offer, JSON.stringify(poll)).toBeTruthy();
+    return offer;
+  }
+
+  async function claimAs(s: SessionControlService, commandId: string, correlation: string) {
+    const res = await s.handle(request(`/api/session-commands/${commandId}/claim`, { correlation, attempt_id: crypto.randomUUID() }), host('hetzner'));
+    const data = await res.json() as any;
+    expect(res.status, JSON.stringify(data)).toBe(200);
+    return data;
+  }
+
+  it('persists a valid owning-host tree outcome on the stop ack and surfaces it via commands', async () => fixture(async (s, sql) => {
+    const { sessionId, commandId } = await enqueueStop(s, sql, 'm15d-tree-1', 'op-tree-1');
+    const offer = await offerFor(s, commandId);
+    const claim = await claimAs(s, commandId, offer.correlation);
+    const acked = await s.handle(request(`/api/session-commands/${commandId}/ack`, {
+      correlation: offer.correlation, outcome: 'delivered', native: nativeTriple(),
+      claim_token: claim.claim_token, confirmed_exit: true,
+      tree: { state: 'removed', reason: 'owned worktree removed; branch deleted after fresh ancestry proof' },
+    }), host('hetzner'));
+    expect(acked.status, await acked.clone().text()).toBe(200);
+    const view = await (await s.handle(request(`/api/sessions/${sessionId}`, undefined, 'GET'), admin)).json() as any;
+    expect(view.state).toBe('stopped');
+    const list = await (await s.handle(request(`/api/sessions/${sessionId}/commands`, undefined, 'GET'), admin)).json() as any;
+    const row = (list.commands as any[]).find((c: any) => c.id === commandId);
+    expect(row.ack.tree).toEqual({ state: 'removed', reason: 'owned worktree removed; branch deleted after fresh ancestry proof' });
+    expect(row.ack.claim_token).toBeUndefined();
+  }));
+
+  it('rejects tree on non-stop commands and malformed tree shapes', async () => fixture(async (s, sql) => {
+    const created = await startAgentSession(s, 'm15d-tree-2');
+    await bindAgentSession(s, sql, created.id, 'launch-1');
+    const sent = await s.handle(request(`/api/sessions/${created.id}/send`, { key: 'tree-send-1', body: 'go' }), agent());
+    expect(sent.status).toBe(201);
+    const cmdId = ((await sent.json()) as any).command_id;
+    const offer = await offerFor(s, cmdId);
+    const claim = await claimAs(s, cmdId, offer.correlation);
+    const base = { correlation: offer.correlation, outcome: 'transported', native: nativeTriple(), claim_token: claim.claim_token };
+    // Tree is stop-only.
+    expect((await s.handle(request(`/api/session-commands/${cmdId}/ack`, { ...base, tree: { state: 'kept', reason: 'x' } }), host('hetzner'))).status).toBe(400);
+    // Malformed shapes fail closed on a stop command too (distinct native identity).
+    const { commandId } = await enqueueStop(s, sql, 'm15d-tree-3', 'op-tree-3', 'launch-2', N2, W2);
+    const stopOffer = await offerFor(s, commandId);
+    const stopClaim = await claimAs(s, commandId, stopOffer.correlation);
+    const stopBase = { correlation: stopOffer.correlation, outcome: 'delivered', native: nativeTriple(N2, 'launch-2', W2), claim_token: stopClaim.claim_token, confirmed_exit: true };
+    for (const bad of [
+      { state: 'removed' }, // missing reason
+      { state: 'vaporized', reason: 'x' }, // unknown state
+      { state: 'kept', reason: 'x'.repeat(301) }, // oversize reason
+      'removed', // not an object
+    ]) {
+      expect((await s.handle(request(`/api/session-commands/${commandId}/ack`, { ...stopBase, tree: bad }), host('hetzner'))).status, JSON.stringify(bad)).toBe(400);
+    }
+    // The command is still claimable-acked afterwards: malformed tree never consumed the claim.
+    const ok = await s.handle(request(`/api/session-commands/${commandId}/ack`, { ...stopBase, tree: { state: 'kept', reason: 'dirty; listed-only' } }), host('hetzner'));
+    expect(ok.status).toBe(200);
+  }));
+
+  it('converts the tree to kept on owner drift while still acking the stop', async () => fixture(async (s, sql) => {
+    const { sessionId, commandId } = await enqueueStop(s, sql, 'm15d-tree-4', 'op-tree-4');
+    const offer = await offerFor(s, commandId);
+    const claim = await claimAs(s, commandId, offer.correlation);
+    sql.exec("UPDATE session_control_sessions SET actor = 'other:assistant' WHERE id = ?", sessionId);
+    const acked = await s.handle(request(`/api/session-commands/${commandId}/ack`, {
+      correlation: offer.correlation, outcome: 'delivered', native: nativeTriple(),
+      claim_token: claim.claim_token, confirmed_exit: true,
+      tree: { state: 'removed', reason: 'host believed it owned this' },
+    }), host('hetzner'));
+    expect(acked.status, await acked.clone().text()).toBe(200);
+    const list = await (await s.handle(request(`/api/sessions/${sessionId}/commands`, undefined, 'GET'), admin)).json() as any;
+    const row = (list.commands as any[]).find((c: any) => c.id === commandId);
+    expect(row.ack.tree.state).toBe('kept');
+    expect(row.ack.tree.reason).toContain('ownership_changed');
   }));
 });
