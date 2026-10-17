@@ -424,10 +424,14 @@ export class SessionControlService {
     // Canonical Fleet reconciliation (read-only; Fleet owns the launch
     // lifecycle, this service never writes fleet rows). The assigned launch
     // must exist on the session's machine in a live post-start state, the
-    // tag must be the canonical Fleet consumer tag for that launch
-    // ('hub-<fleet_launch_id>', the exact argv the existing Dispatcher
-    // starts), and an already-reported native id must match. Unstarted
-    // (offered), failed/exited/uncertain, foreign-machine, or inconsistent
+    // tag must be the canonical Fleet consumer tag for that launch:
+    // 'hub-<fleet_launch_id>' (interactive dispatcher argv) or the exact
+    // 'task-hub-<fleet_launch_id>' (maintained launcher aplexer backend
+    // run_tag_for('hub-<id>') for canonical headless opencode). No fuzzy
+    // matching: any other tag is refused, and the exact tag plus the
+    // launch native UUID/result, machine, engine, workspace, and incarnation
+    // checks below still bind the exact native row (never tag-only).
+    // Unstarted (offered), failed/exited/uncertain, foreign-machine, or inconsistent
     // launches are refused. The binding workspace (absolute native path) is
     // NOT compared to the Fleet workspace label: they live in different
     // domains (hub label vs. canonical native path); machine + tag + native
@@ -440,7 +444,7 @@ export class SessionControlService {
     if (launch.state !== 'starting' && launch.state !== 'running') {
       return { ok: false as const, error: 'fleet_launch_state' };
     }
-    if (binding.tag !== 'hub-' + launch.id) return { ok: false as const, error: 'fleet_tag_mismatch' };
+    if (binding.tag !== 'hub-' + launch.id && binding.tag !== 'task-hub-' + launch.id) return { ok: false as const, error: 'fleet_tag_mismatch' };
     if (launch.native_id && launch.native_id !== binding.native_id) {
       return { ok: false as const, error: 'fleet_native_mismatch' };
     }
@@ -591,8 +595,11 @@ export class SessionControlService {
 
     if (path === '/api/sessions/host-bindings' && request.method === 'GET') {
       if (!host) return response({ error: 'forbidden' }, 403);
-      const rows = this.sql.exec("SELECT s.* FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id WHERE s.machine_id = ? AND s.binding_json IS NULL AND s.state IN ('offered','starting','uncertain') AND f.state IN ('starting','running') LIMIT 100", caller.machineId!).toArray() as any[];
-      return response({ sessions: rows.filter(row => this.hostOk(row, caller).ok).map(row => ({ id: row.id, fleet_launch_id: row.fleet_launch_id, engine: row.engine })) });
+      // The canonical launch native_id rides along so fleet binds the exact
+      // native UUID row instead of tag-only (null until the fleet result
+      // reports it; fleet prefers entry.native_id when present).
+      const rows = this.sql.exec("SELECT s.*, f.native_id AS launch_native_id FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id WHERE s.machine_id = ? AND s.binding_json IS NULL AND s.state IN ('offered','starting','uncertain') AND f.state IN ('starting','running') LIMIT 100", caller.machineId!).toArray() as any[];
+      return response({ sessions: rows.filter(row => this.hostOk(row, caller).ok).map(row => ({ id: row.id, fleet_launch_id: row.fleet_launch_id, engine: row.engine, native_id: row.launch_native_id ?? null })) });
     }
 
     if (path === '/api/sessions' && request.method === 'POST') {

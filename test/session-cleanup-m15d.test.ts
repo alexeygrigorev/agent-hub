@@ -337,3 +337,43 @@ describe('m15d cleanup_tree authorization (critical blocker)', () => {
     expect(claim.cleanup_tree).toBe(false);
   }));
 });
+
+describe('muse-bind server seam (task-hub- tag + launch native_id)', () => {
+  const nativeTriple = (nativeId: string = NATIVE_ID, tag: string, workspace: string = NATIVE_WS) =>
+    ({ native_id: nativeId, tag, workspace });
+
+  it('accepts the exact task-hub-<launch.id> tag for a genuine reported native; fuzzy tags still refused', async () => fixture(async (s, sql) => {
+    const created = await startAgentSession(s, 'muse-bind-1');
+    const launchId = (created as any).fleet_launch_id as string;
+    expect(launchId).toBeTruthy();
+    const taskTag = 'task-hub-' + launchId;
+    // Genuine launcher evidence: fleet result reported the native UUID and
+    // the native catalog carries the exact task-hub tag + workspace.
+    ensureFleetLaunch(sql, launchId, 'hetzner', NATIVE_ID);
+    reportFleetSession(sql, 'hetzner', NATIVE_ID, taskTag, NATIVE_WS);
+    const ok = await s.handle(request(`/api/sessions/${created.id}/binding`, {
+      native: { native_id: NATIVE_ID, tag: taskTag, workspace: NATIVE_WS, native_created_at_ms: NATIVE_CREATED },
+    }), host('hetzner'));
+    expect(ok.status, await ok.clone().text()).toBe(200);
+    // Fuzzy/foreign tags are still refused on another session.
+    const created2 = await startAgentSession(s, 'muse-bind-2');
+    const launchId2 = (created2 as any).fleet_launch_id as string;
+    ensureFleetLaunch(sql, launchId2, 'hetzner', null);
+    const bad = await s.handle(request(`/api/sessions/${created2.id}/binding`, {
+      native: { native_id: NATIVE_ID, tag: 'task-hub-' + launchId2 + '-extra', workspace: NATIVE_WS, native_created_at_ms: NATIVE_CREATED },
+    }), host('hetzner'));
+    expect(bad.status).toBe(409);
+    expect((await bad.json() as any).error).toBe('fleet_tag_mismatch');
+  }));
+
+  it('pending host-bindings expose the canonical launch native_id for exact-UUID binding', async () => fixture(async (s, sql) => {
+    const created = await startAgentSession(s, 'muse-bind-3');
+    const launchId = (created as any).fleet_launch_id as string;
+    ensureFleetLaunch(sql, launchId, 'hetzner', NATIVE_ID);
+    const poll = await (await s.handle(request('/api/sessions/host-bindings', undefined, 'GET'), host('hetzner'))).json() as any;
+    const entry = (poll.sessions as any[]).find((e: any) => e.id === created.id);
+    expect(entry, JSON.stringify(poll)).toBeTruthy();
+    expect(entry.fleet_launch_id).toBe(launchId);
+    expect(entry.native_id).toBe(NATIVE_ID);
+  }));
+});
