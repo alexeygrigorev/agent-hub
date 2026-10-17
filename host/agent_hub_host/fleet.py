@@ -500,10 +500,23 @@ class Dispatcher:
                     raise ValueError('Native lifecycle receipt is incomplete')
             if not isinstance(native_id, str) or not native_id:
                 raise ValueError("No confirmed native execution receipt")
-        except Exception:
+        except Exception as exc:
             # Effect may have happened: hold capacity and require reconciliation.
-            self.request("POST", path + "/result", {"state": "uncertain"})
-            return {"id": offer["id"], "state": "uncertain"}
+            # Bounded private diagnostic only (type + stage, never argv/goal/
+            # tokens/stdout). Returned locally and reported as uncertain reason
+            # so real runtime start failures stay visible; server authority
+            # unchanged (still uncertain, never claimed running).
+            err = (type(exc).__name__ or "Error")[:64]
+            stage = ("dispatch_headless" if mode == "headless" else "dispatch_interactive")[:32]
+            reason = ("%s:%s" % (stage, err))[:120]
+            try:
+                self.request("POST", path + "/result",
+                             {"state": "uncertain", "reason": reason,
+                              "stage": stage, "error": err})
+            except Exception:
+                pass
+            return {"id": offer["id"], "state": "uncertain", "reason": reason,
+                    "stage": stage, "error": err}
         if offer.get('task_id') and result.get('confirmed_exit'):
             from .routing import read_text
             try:
@@ -581,8 +594,15 @@ class Dispatcher:
         for offer in offers:
             try:
                 results.append(self.dispatch(offer))
-            except Exception:
-                results.append({"id": offer.get("id"), "state": "held"})
+            except Exception as exc:
+                # Route/claim/admission refusal: no native effect. Bounded
+                # classification only (type + stage, never argv/goal/secrets)
+                # so held-offers stay distinguishable in local counts.
+                err = (type(exc).__name__ or "Error")[:64]
+                reason = ("dispatch_refused:%s" % err)[:120]
+                results.append({"id": offer.get("id"), "state": "held",
+                                "reason": reason, "stage": "dispatch_route",
+                                "error": err})
         return results
 
 
