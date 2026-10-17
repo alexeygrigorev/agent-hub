@@ -1,3 +1,4 @@
+import { AUTOMATION_SCHEMA, AUTOMATION_REVOKE_TRIGGER, AUTOMATION_SENDER, type BacklogQuery, type FollowUpIntent } from './conversation-automation';
 import { credentialActor, validRegistryName, registryAddress } from './agent_registry';
 import {
   SqlStorage,
@@ -84,7 +85,7 @@ CREATE TABLE IF NOT EXISTS conversation_storage_usage (
   removed_member_count INTEGER NOT NULL DEFAULT 0,
   schema_version INTEGER NOT NULL DEFAULT 0
 );
-`;
+` + AUTOMATION_SCHEMA;
 
 export const CONVERSATIONS_SCHEMA_VERSION = 2;
 
@@ -295,6 +296,7 @@ export interface ConversationRetentionResult {
   messagesDeleted: number;
   removedMembersDeleted: number;
   membersDeleted: number;
+  automationRowsDeleted: number;
   rowsDeleted: number;
   hasMore: boolean;
 }
@@ -832,6 +834,7 @@ export class ConversationsService {
           this.sql.exec(trimmed);
         }
       }
+      this.sql.exec(AUTOMATION_REVOKE_TRIGGER);
       for (const alterStmt of [
         'ALTER TABLE conversations ADD COLUMN retained_message_count INTEGER NOT NULL DEFAULT 0',
         'ALTER TABLE conversations ADD COLUMN retained_message_bytes INTEGER NOT NULL DEFAULT 0',
@@ -961,6 +964,7 @@ export class ConversationsService {
   }
 
   public hasExpiredRows(nowMs: number = this.now()): boolean {
+    if (this.automationRetirementCandidates(nowMs, 1).some(rows => rows.length)) return true;
     const archivedCutoffIso = new Date(
       nowMs - this.limits.archivedConversationRetentionMs,
     ).toISOString();
@@ -1018,6 +1022,29 @@ export class ConversationsService {
     );
   }
 
+  /** Hard table caps bound the indexed anti-joins, including an R2 database.
+   * A receipt is pinned by an unresolved slot even if its grant/parent is gone.
+   * Standalone service use does not require a configured scheduler table. */
+  private automationRetirementCandidates(nowMs: number, limit: number): any[][] {
+    const hasChecks = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_checks'").toArray().length > 0;
+    const orphan = hasChecks ? 'NOT EXISTS (SELECT 1 FROM hub_checks c WHERE c.name=s.name)' : '0';
+    const invalidGrant = `NOT EXISTS (SELECT 1 FROM conversation_automation_grants g
+      JOIN conversations c ON c.id=g.conversation_id AND c.archived_at IS NULL
+      WHERE g.id=json_extract(s.check_json, '$.action.grant_id') AND g.revoked_at IS NULL AND g.expires_at>?)`;
+    const slots = this.sql.exec(`SELECT s.*, ${orphan} AS orphan FROM hub_check_slots s
+      WHERE (${orphan}) OR (s.state!='done' AND json_extract(s.check_json, '$.action.conversation_id') IS NOT NULL AND ${invalidGrant})
+      ORDER BY s.name LIMIT ?`, nowMs, limit).toArray();
+    const receipts = this.sql.exec(`SELECT r.effect_key FROM conversation_automation_receipts r
+      WHERE NOT EXISTS (SELECT 1 FROM hub_check_slots s WHERE ('check-' || s.slot_key)=r.effect_key AND s.state!='done')
+      ORDER BY r.effect_key LIMIT ?`, limit).toArray();
+    const grants = this.sql.exec(`SELECT g.id FROM conversation_automation_grants g
+      WHERE (g.expires_at<=? OR g.revoked_at IS NOT NULL OR NOT EXISTS
+        (SELECT 1 FROM conversations c WHERE c.id=g.conversation_id AND c.archived_at IS NULL))
+      AND NOT EXISTS (SELECT 1 FROM hub_check_slots s WHERE json_extract(s.check_json, '$.action.grant_id')=g.id AND s.state!='done')
+      ORDER BY g.id LIMIT ?`, nowMs, limit).toArray();
+    return [slots, receipts, grants];
+  }
+
   /**
    * Bounded batched retention cleanup for Free-plan storage discipline.
    * Enforces a global affected-row budget (`batchLimit`) across child messages,
@@ -1037,6 +1064,7 @@ export class ConversationsService {
       let messagesDeleted = 0;
       let removedMembersDeleted = 0;
       let membersDeleted = 0;
+      let automationRowsDeleted = 0;
       const previewRefreshIds = new Set<string>();
 
       const archivedCutoffIso = new Date(
@@ -1284,10 +1312,43 @@ export class ConversationsService {
         return remainingBefore - remaining;
       };
 
+      const retireAutomation = (category: number, budget: number): number => {
+        const before = remaining;
+        const candidates = this.automationRetirementCandidates(nowMs, Math.min(remaining, budget))[category];
+        for (const row of candidates) {
+          if (category === 0) {
+            const receipt = this.sql.exec('SELECT * FROM conversation_automation_receipts WHERE effect_key=?', 'check-' + row.slot_key).toArray()[0];
+            // An inconsistent receipt is uncertainty, never permission to discard it.
+            if (receipt && receipt.request_json !== row.intent_json) continue;
+            const grantId = JSON.parse(row.check_json).action?.grant_id;
+            if (row.orphan && grantId) this.sql.exec('UPDATE conversation_automation_grants SET revoked_at=? WHERE id=?', nowMs, grantId);
+            const result = receipt && row.result_json ? JSON.parse(row.result_json) : { status: 'error', detail: 'automation slot cancelled; no accepted Hub effect' };
+            const action = receipt ? `conversation_message ${receipt.message_id} (Hub stored; native delivery unconfirmed)` : 'automation authority retired; no accepted Hub effect';
+            // Closing the slot and recovering its receipt share this transaction.
+            // This also fences an evaluator/send that was paused before cleanup.
+            this.sql.exec("UPDATE hub_check_slots SET state='done', token=NULL, lease_until=0, result_json=?, action=? WHERE name=?", JSON.stringify(result), action, row.name);
+            if (row.orphan) {
+              this.sql.exec('DELETE FROM hub_check_slots WHERE name=?', row.name);
+              remaining--; automationRowsDeleted++;
+            } else if (this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_checks'").toArray().length) {
+              this.sql.exec('UPDATE hub_checks SET last_status=?, last_detail=? WHERE name=?', result.status, result.detail.slice(0, 1000), row.name);
+            }
+          } else {
+            this.sql.exec(category === 1 ? 'DELETE FROM conversation_automation_receipts WHERE effect_key=?' : 'DELETE FROM conversation_automation_grants WHERE id=?', category === 1 ? row.effect_key : row.id);
+            remaining--; automationRowsDeleted++;
+          }
+        }
+        return before - remaining;
+      };
+
       runFairRetentionPass(
         this.sql,
         'conv',
         [
+          ...[0, 1, 2].map(category => ({
+            hasWork: () => this.automationRetirementCandidates(nowMs, 1)[category].length > 0,
+            spend: (budget: number) => retireAutomation(category, budget),
+          })),
           {
             hasWork: () =>
               this.sql
@@ -1327,7 +1388,7 @@ export class ConversationsService {
       }
 
       const rowsDeleted =
-        conversationsDeleted + messagesDeleted + membersDeleted;
+        conversationsDeleted + messagesDeleted + membersDeleted + automationRowsDeleted;
       const hasMore = this.hasExpiredRows(nowMs);
 
       return {
@@ -1335,6 +1396,7 @@ export class ConversationsService {
         messagesDeleted,
         removedMembersDeleted,
         membersDeleted,
+        automationRowsDeleted,
         rowsDeleted,
         hasMore,
       };
@@ -2712,9 +2774,145 @@ export class ConversationsService {
     });
   }
 
+  /** An explicit, bounded delegation from a currently signed-in human owner. */
+  public configureAutomation(auth: ConversationAuthInput, cid: string, input: Record<string, unknown>, revoke = false) {
+    return this.runInTxn(() => {
+      // CallerContext alone is deliberately insufficient to issue delegation.
+      if (!auth.session || auth.authType !== 'session' || auth.csrfVerified !== true) {
+        throw new ConversationDomainError('forbidden', 403);
+      }
+      const owner = this.verifyPrincipal(auth, { requireWriteScope: true, isMutatingHttp: true });
+      const { conversation } = this.requireActiveMembership(cid, owner.actor, true, 'human');
+      const user = this.sql.exec('SELECT is_admin FROM users WHERE sub = ?', owner.sessionSub!).toArray()[0];
+      if (!user?.is_admin || conversation.archived_at) throw new ConversationDomainError('forbidden', 403);
+      const keys = revoke ? ['check'] : ['check', 'target_actor', 'body', 'on', 'expires_at'];
+      if (Object.keys(input).some(k => !keys.includes(k)) || typeof input.check !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,39}$/.test(input.check)) {
+        throw new ConversationDomainError('invalid_automation', 400);
+      }
+      if (revoke) {
+        this.sql.exec('UPDATE conversation_automation_grants SET revoked_at = ? WHERE conversation_id = ? AND check_name = ?', this.now(), cid, input.check);
+        return { revoked: true };
+      }
+      if (typeof input.target_actor !== 'string' || typeof input.body !== 'string' || !input.body.trim() || input.body.length > 4000 || /[\x00-\x08\x0b-\x1f\x7f]/.test(input.body) || !['fail', 'always'].includes(String(input.on))) {
+        throw new ConversationDomainError('invalid_automation', 400);
+      }
+      const expires = input.expires_at;
+      if (typeof expires !== 'number' || !Number.isSafeInteger(expires) || expires <= this.now() || expires > Math.min(auth.session.exp * 1000, this.now() + 86400000)) {
+        throw new ConversationDomainError('invalid_automation_expiry', 400);
+      }
+      // Resolve at issuance, requiring exact canonical equality. Never promote a bare
+      // project alias later, and never use this credential as the automation sender.
+      const { member } = this.requireActiveMembership(cid, input.target_actor);
+      let credentialId: string | null = null;
+      if (member.kind === 'human') {
+        this.validateAutomationTarget(input.target_actor, null);
+      } else if (member.kind === 'agent' && registryAddress(input.target_actor)) {
+        const credentials = this.sql.exec("SELECT id FROM credentials WHERE kind = 'agent' AND registry_actor = ? AND revoked_at IS NULL AND expires_at > ? ORDER BY created_at DESC, id LIMIT 51", input.target_actor, this.nowIso()).toArray();
+        if (credentials.length > 50) throw new ConversationDomainError('automation_scan_limit', 409);
+        for (const credential of credentials) {
+          try { this.validateAutomationTarget(input.target_actor, String(credential.id)); credentialId = String(credential.id); break; }
+          catch { /* Try only live, exactly bound read credentials; no caller is synthesized. */ }
+        }
+        if (!credentialId) throw new ConversationDomainError('automation_target_unavailable', 403);
+      } else throw new ConversationDomainError('automation_target_unavailable', 403);
+      const prior = this.sql.exec('SELECT id FROM conversation_automation_grants WHERE conversation_id = ? AND check_name = ?', cid, input.check).toArray()[0];
+      if (!prior && Number(this.sql.exec('SELECT COUNT(*) AS n FROM conversation_automation_grants').toArray()[0].n) >= 1000) throw new ConversationDomainError('automation_capacity', 409);
+      const id = generateUlid(this.now());
+      this.sql.exec(`INSERT INTO conversation_automation_grants (id, conversation_id, check_name, target_actor, target_credential_id, owner_sub, expires_at, body_template, action_on)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(conversation_id, check_name) DO UPDATE SET
+        id=excluded.id, target_actor=excluded.target_actor, target_credential_id=excluded.target_credential_id,
+        owner_sub=excluded.owner_sub, expires_at=excluded.expires_at, body_template=excluded.body_template, action_on=excluded.action_on, revoked_at=NULL`,
+        id, cid, input.check, input.target_actor, credentialId, owner.sessionSub!, expires, input.body, input.on as string);
+      return { grant_id: id, sender_actor: AUTOMATION_SENDER, expires_at: expires };
+    });
+  }
+
+  private validateAutomationTarget(actor: string, credentialId: string | null): void {
+    if (actor.startsWith('human:') && !credentialId) {
+      const sub = parseCanonicalHumanActor(actor)?.sub;
+      if (!sub || !this.sql.exec('SELECT 1 FROM users WHERE sub = ? AND is_admin = 1', sub).toArray().length) throw new ConversationDomainError('automation_target_unavailable', 403);
+      return;
+    }
+    if (!credentialId || !registryAddress(actor)) throw new ConversationDomainError('automation_target_unavailable', 403);
+    const principal = this.verifyPrincipal({ caller: { tokenId: credentialId, kind: 'agent' }, authType: 'bearer' }, { requireReadScope: true });
+    if (principal.actor !== actor || principal.kind !== 'agent') throw new ConversationDomainError('automation_target_unavailable', 403);
+  }
+
+  private validateAutomationGrant(grant: any): any {
+    if (!grant || grant.revoked_at != null || Number(grant.expires_at) <= this.now()) throw new ConversationDomainError('automation_grant_unavailable', 403);
+    const ownerActor = formatHumanActorFromSub(grant.owner_sub);
+    if (!ownerActor || !this.sql.exec('SELECT 1 FROM users WHERE sub = ? AND is_admin = 1', grant.owner_sub).toArray().length) throw new ConversationDomainError('automation_owner_unavailable', 403);
+    const { conversation } = this.requireActiveMembership(grant.conversation_id, ownerActor, true, 'human');
+    if (conversation.archived_at) throw new ConversationDomainError('conversation_archived', 409);
+    this.validateAutomationTarget(grant.target_actor, grant.target_credential_id);
+    this.requireActiveMembership(grant.conversation_id, grant.target_actor, false, grant.target_credential_id ? 'agent' : 'human');
+    return conversation;
+  }
+
+  public evaluateScheduledBacklog(query: BacklogQuery): { status: 'pass' | 'fail' | 'error'; detail: string } {
+    return this.runInTxn(() => {
+      const grants = this.sql.exec(`SELECT * FROM conversation_automation_grants WHERE check_name = ? AND target_actor = ? ${query.conversationId ? 'AND conversation_id = ?' : ''} LIMIT 51`,
+        ...[query.checkName, query.actor, ...(query.conversationId ? [query.conversationId] : [])]).toArray() as any[];
+      if (!grants.length || grants.length > 50) throw new ConversationDomainError('automation_grant_unavailable', 403);
+      let overdue = 0;
+      for (const grant of grants) {
+        this.validateAutomationGrant(grant);
+        overdue += Number(this.sql.exec(`SELECT COUNT(*) AS n FROM conversation_messages msg JOIN conversation_members m ON m.conversation_id = msg.conversation_id AND m.actor = ?
+          WHERE msg.conversation_id = ? AND msg.seq > m.last_read_seq AND msg.sender_actor != ? AND msg.created_at < ?`,
+          query.actor, grant.conversation_id, query.actor, new Date(this.now() - query.maxAgeS * 1000).toISOString()).toArray()[0].n);
+      }
+      return { status: overdue ? 'fail' : 'pass', detail: `${overdue} overdue retained unread message(s) in ${grants.length} authorized conversation(s)` };
+    });
+  }
+
+  /** Records a Hub storage receipt atomically with the message; never a native delivery receipt. */
+  public postScheduledFollowUp(intent: FollowUpIntent): string {
+    return this.runInTxn(() => {
+      const request = JSON.stringify(intent);
+      // A committed receipt can be recovered after revocation/retention without
+      // authorizing a new effect or returning message contents to an HTTP caller.
+      const receipt = this.sql.exec('SELECT * FROM conversation_automation_receipts WHERE effect_key = ?', intent.idempotencyKey).toArray()[0];
+      if (receipt) {
+        if (receipt.request_json !== request) throw new ConversationDomainError('idempotency_conflict', 409);
+        return String(receipt.message_id);
+      }
+      // Receipt retirement is safe because absence never authorizes a write.
+      // Only the scheduler's exact current frozen intent can create an effect.
+      // Retired keys cannot become current again: new slots use random generations.
+      if (!this.sql.exec(`SELECT 1 FROM hub_check_slots
+        WHERE name = ? AND ('check-' || slot_key) = ? AND intent_json = ? AND state != 'done'`,
+        intent.checkName, intent.idempotencyKey, request).toArray().length) {
+        throw new ConversationDomainError('automation_slot_retired', 409);
+      }
+      if (Number(this.sql.exec('SELECT COUNT(*) AS n FROM conversation_automation_receipts').toArray()[0].n) >= 4096) throw new ConversationDomainError('automation_capacity', 409);
+      const message = this.writeMessage({ conversationId: intent.conversationId, body: intent.body, idempotencyKey: intent.idempotencyKey, kind: 'note' }, () => {
+        const grant = this.sql.exec('SELECT * FROM conversation_automation_grants WHERE id = ?', intent.grantId).toArray()[0] as any;
+        if (!grant || grant.conversation_id !== intent.conversationId || grant.check_name !== intent.checkName || grant.target_actor !== intent.actor || grant.body_template !== intent.bodyTemplate || grant.action_on !== intent.on) throw new ConversationDomainError('automation_grant_mismatch', 403);
+        const conversation = this.validateAutomationGrant(grant);
+        if (intent.body.length > 8000) throw new ConversationDomainError('body_too_large', 413);
+        return { principal: { actor: AUTOMATION_SENDER, kind: 'system' }, conversation };
+      });
+      this.sql.exec('INSERT INTO conversation_automation_receipts VALUES (?, ?, ?, ?, ?)', intent.idempotencyKey, request, message.id, intent.conversationId, this.now());
+      return String(message.id);
+    });
+  }
+
   public sendMessage(
     auth: ConversationAuthInput | CallerContext,
     input: SendConversationMessageInput,
+  ): Record<string, any> {
+    return this.writeMessage(input, () => {
+      const principal = this.verifyPrincipal(auth, { requireWriteScope: true });
+      const { conversation } = this.requireActiveMembership(input.conversationId, principal.actor, false, principal.kind);
+      return { principal, conversation };
+    });
+  }
+
+  // Only the ordinary verified-member entry point and the grant-checked automation
+  // entry point can reach this writer. No caller-supplied sender override exists.
+  private writeMessage(
+    input: SendConversationMessageInput,
+    authorize: () => { principal: { actor: string; kind: 'human' | 'agent' | 'system' }; conversation: any },
   ): Record<string, any> {
     if (typeof input.body !== 'string') {
       throw new ConversationDomainError('invalid_body', 400);
@@ -2769,13 +2967,7 @@ export class ConversationsService {
     }
 
     return this.runInTxn(() => {
-      const principal = this.verifyPrincipal(auth, { requireWriteScope: true });
-      const { conversation } = this.requireActiveMembership(
-        input.conversationId,
-        principal.actor,
-        false,
-        principal.kind,
-      );
+      const { principal, conversation } = authorize();
 
       if (conversation.archived_at) {
         throw new ConversationDomainError('conversation_archived', 409);
@@ -3423,6 +3615,15 @@ export class ConversationsService {
         }
 
         return jsonResponse({ error: 'method_not_allowed' }, 405);
+      }
+
+      const automationMatch = /^\/api\/conversations\/([^/]+)\/automation$/.exec(path);
+      if (automationMatch) {
+        const cid = decodeURIComponent(automationMatch[1]);
+        if (method !== 'PUT' && method !== 'DELETE') return jsonResponse({ error: 'method_not_allowed' }, 405);
+        const parsed = await readBoundedJsonBody(request, false);
+        if (parsed.error) return parsed.error;
+        return jsonResponse(this.configureAutomation(auth, cid, parsed.data!, method === 'DELETE'));
       }
 
       // 3. /api/conversations/:id

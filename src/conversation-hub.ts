@@ -1,4 +1,5 @@
 import { Hub as BaseHub } from './hub';
+import type { ActionDeps } from './checks';
 import { Env } from './env';
 import { RETENTION_CLEANUP_CURSOR_SQL, runFairRetentionPass } from './bus';
 import {
@@ -57,6 +58,7 @@ export class Hub extends BaseHub {
         messagesDeleted: 0,
         removedMembersDeleted: 0,
         membersDeleted: 0,
+        automationRowsDeleted: 0,
         rowsDeleted: 0,
         hasMore: false,
       };
@@ -106,6 +108,7 @@ export class Hub extends BaseHub {
             removedMembersDeleted:
               convCleanup.removedMembersDeleted + step.removedMembersDeleted,
             membersDeleted: convCleanup.membersDeleted + step.membersDeleted,
+            automationRowsDeleted: convCleanup.automationRowsDeleted + step.automationRowsDeleted,
             rowsDeleted: convCleanup.rowsDeleted + step.rowsDeleted,
             hasMore: step.hasMore,
           };
@@ -136,6 +139,7 @@ export class Hub extends BaseHub {
           removedMembersDeleted: convCleanup.removedMembersDeleted,
           conversationMembersDeleted: convCleanup.membersDeleted,
           conversationRowsDeleted: convCleanup.rowsDeleted,
+          automationRowsDeleted: convCleanup.automationRowsDeleted,
           hasMore:
             this.busService.hasExpiredRows(now) ||
             this.conversationsService.hasExpiredRows(now),
@@ -147,6 +151,15 @@ export class Hub extends BaseHub {
   override initDb(): void {
     super.initDb();
     this.conversationsService?.init();
+  }
+
+  protected override extraCheckDeps(): Partial<ActionDeps> {
+    const service = this.conversationsService;
+    if (!service) return {};
+    return { conversation: {
+      evaluateBacklog: query => service.evaluateScheduledBacklog(query),
+      sendFollowUp: intent => service.postScheduledFollowUp(intent),
+    } };
   }
 
   override async fetch(request: Request): Promise<Response> {

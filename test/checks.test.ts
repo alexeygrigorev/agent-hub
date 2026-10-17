@@ -19,7 +19,7 @@ async function fixture(fn: (checks: ChecksService, deps: ActionDeps & { log: any
     // Hub construction seeds with the real clock; this fixture runs on a pinned clock.
     hub.sql.exec('UPDATE hub_checks SET next_due_at = ?', new Date(start).toISOString());
     const log: any[] = [];
-    const deps = {
+    const deps: ActionDeps & { log: any[] } = {
       log, liveness,
       notify: async (alert: any) => { log.push(['notify', alert.subject_kind, alert.subject, alert.state]); },
       message: async (to: string, body: string, key: string) => { log.push(['message', to, body, key]); return 'm1'; },
@@ -50,6 +50,17 @@ describe('check definitions', () => {
     const key = `check-${name}-${Math.floor(Date.parse('2030-01-01T00:00:00Z') / 300000)}`;
     expect(key.length).toBeLessThanOrEqual(64);
     expect(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(key)).toBe(true);
+  });
+
+  it('validates bounded canonical backlog and explicit conversation delegation fields', () => {
+    const valid = { name: 'followup', kind: 'conversation_backlog', interval_s: 300, params: { actor: 'example:worker', max_age_s: 3600, conversation_id: 'CID' }, action: { type: 'message', to: 'example:worker', body: '{detail}', conversation_id: 'CID', grant_id: 'GRANT' } };
+    expect('row' in validateCheck(valid)).toBe(true);
+    for (const max_age_s of [0, 59, 1.5, 604801, Infinity]) expect('error' in validateCheck({ ...valid, params: { ...valid.params, max_age_s } })).toBe(true);
+    for (const actor of ['role:root', 'system:checks', 'root', 'human:', 'worker\n']) expect('error' in validateCheck({ ...valid, params: { ...valid.params, actor } })).toBe(true);
+    expect('error' in validateCheck({ ...valid, action: { ...valid.action, grant_id: undefined } })).toBe(true);
+    expect('error' in validateCheck({ ...valid, action: { ...valid.action, to: 'other:worker' } })).toBe(true);
+    expect('error' in validateCheck({ ...valid, action: { ...valid.action, conversation_id: 'OTHER' } })).toBe(true);
+    expect('error' in validateCheck({ ...valid, action: { ...valid.action, sender: 'human:owner' } })).toBe(true);
   });
 
   it('rejects unsafe or malformed definitions', () => {
@@ -136,3 +147,24 @@ describe('running checks', () => {
     expect(deps.log).toHaveLength(1);
   }));
 });
+
+it('rejects oversized definitions before slot storage', () => {
+  const result = validateCheck({ name: 'large', kind: 'routine', interval_s: 300, params: { url: 'x'.repeat(128 * 1024) }, action: { type: 'message', to: 'local', body: 'bounded' } });
+  expect(result).toEqual({ error: 'check_too_large' });
+});
+
+it('holds an oversized legacy definition without blocking a valid current check or freezing an oversized result', () => fixture(async (checks, deps, _clock, sql) => {
+  checks.replace([
+    row({ name: 'a-legacy', kind: 'quota', interval_s: 300 }),
+    row({ name: 'b-current', kind: 'routine', interval_s: 300, action: { type: 'message', to: 'local', body: 'current' } }),
+    row({ name: 'c-result', kind: 'quota', interval_s: 300 }),
+  ]);
+  sql.exec('UPDATE hub_checks SET params_json=? WHERE name=?', JSON.stringify({ url: 'x'.repeat(128 * 1024) }), 'a-legacy');
+  deps.evaluateQuota = () => [{ label: 'x'.repeat(70000), enabled: true, status: 'blocked' }];
+  const result = await checks.runDue(deps);
+  expect(result[0]).toMatchObject({ name: 'a-legacy', status: 'error', detail: 'check_too_large' });
+  expect(result[1]).toMatchObject({ name: 'b-current', status: 'pass', action: 'message m1' });
+  expect(result[2]).toMatchObject({ name: 'c-result', status: 'error', detail: 'check_result_too_large' });
+  expect(sql.exec("SELECT name FROM hub_check_slots WHERE name='a-legacy'").toArray()).toHaveLength(0);
+  expect(sql.exec("SELECT length(result_json) n FROM hub_check_slots WHERE name='c-result'").toArray()[0].n).toBeLessThan(1000);
+}));
