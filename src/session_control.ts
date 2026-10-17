@@ -23,6 +23,7 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import { credentialActor } from './agent_registry';
 import { redact } from './routing';
 import { taskTier } from './model-routing';
+import { approvalAuthorityMatches } from './host_enrollment';
 
 export const SESSION_CONTROL_SCHEMA = `
 CREATE TABLE IF NOT EXISTS session_control_sessions (id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, fleet_launch_id TEXT, machine_id TEXT, engine TEXT, mode TEXT NOT NULL, state TEXT NOT NULL, binding_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
@@ -236,9 +237,11 @@ export class SessionControlService {
     if (!family) return { ok: false, error: 'credential_changed' };
     try {
       const m: any = this.sql.exec(
-        'SELECT m.id, m.credential_id, c.family_id AS machine_family FROM machines m LEFT JOIN credentials c ON c.id = m.credential_id WHERE m.id = ?',
+        'SELECT m.id, m.credential_id, m.approval_seq, c.family_id AS machine_family FROM machines m LEFT JOIN credentials c ON c.id = m.credential_id WHERE m.id = ?',
         session.machine_id).toArray()[0];
       if (!m) return { ok: false, error: 'not_found' };
+      const credential: any = this.sql.exec('SELECT approval_seq FROM credentials WHERE id = ?', caller.tokenId!).toArray()[0];
+      if (!m.credential_id || !credential || !approvalAuthorityMatches(credential.approval_seq, m.approval_seq)) return { ok: false, error: 'host_credential_changed' };
       if (m.machine_family && m.machine_family !== family) return { ok: false, error: 'host_credential_changed' };
     } catch {
       return { ok: false, error: 'credential_changed' };
@@ -621,7 +624,8 @@ export class SessionControlService {
           // family) while the body streamed must not bind or adopt a family.
           // hostOk re-reads the live machine registry + presenting family; a
           // NULL stamp is never a valid adoption.
-          const fresh = this.hostOk(session, caller);
+          const current: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0];
+          const fresh = this.hostOk(current || {}, caller);
           if (!fresh.ok) return response({ error: fresh.error }, fresh.error === 'not_found' ? 404 : 409);
           const applied = this.applyBinding(session.id, input.native, caller.machineId!);
           if (!applied.ok) {
@@ -817,6 +821,10 @@ export class SessionControlService {
       return this.transaction(() => {
         const row: any = this.sql.exec('SELECT * FROM session_control_commands WHERE id = ?', ackMatch[1]).toArray()[0];
         if (!row) return response({ error: 'not_found' }, 404);
+        const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', row.session_id).toArray()[0];
+        if (!session || session.machine_id !== caller.machineId) return response({ error: 'not_found' }, 404);
+        const gate = this.hostOk(session, caller);
+        if (!gate.ok) return response({ error: gate.error }, gate.error === 'not_found' ? 404 : 409);
         // Each native reply envelope confirms at most one command, in every
         // state: a duplicate proof for the SAME command is idempotent success
         // (concurrent or lost-ack re-submit, no new effect), while reuse
@@ -844,10 +852,6 @@ export class SessionControlService {
           }
           return response({ error: 'claim_required' }, 409);
         }
-        const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', row.session_id).toArray()[0];
-        if (!session || session.machine_id !== caller.machineId) return response({ error: 'not_found' }, 404);
-        const gate = this.hostOk(session, caller);
-        if (!gate.ok) return response({ error: gate.error }, gate.error === 'not_found' ? 404 : 409);
         if (row.holder_machine !== caller.machineId || row.claim_token !== input.claim_token) {
           return response({ error: 'claim_conflict' }, 409);
         }

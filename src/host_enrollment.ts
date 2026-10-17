@@ -19,7 +19,7 @@ export function approvalAuthorityMatches(
   credentialSeq: unknown,
   machineSeq: unknown
 ): boolean {
-  if (credentialSeq === null || credentialSeq === undefined) return true;
+  if (credentialSeq === null || credentialSeq === undefined) return machineSeq === null || machineSeq === undefined;
   if (machineSeq === null || machineSeq === undefined) return true;
   return credentialSeq === machineSeq;
 }
