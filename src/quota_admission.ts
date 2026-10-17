@@ -64,6 +64,13 @@ export function evaluateQuotaAdmission(input: QuotaAdmissionInput): QuotaAdmissi
     return fail(quota.details.limit_reached === true ? "limit_reached" : "malformed");
   }
   if (quota.details.stale === true) return fail("route_stale");
+  // A known active provider backoff hold blocks admission even when quota looks fine.
+  // Expiry alone never promotes stale/unknown quota: freshness was already enforced above.
+  const cooldownUntil = (quota.details as Record<string, any>).cooldown_until;
+  if (cooldownUntil !== null && cooldownUntil !== undefined) {
+    if (typeof cooldownUntil !== "string" || !Number.isFinite(Date.parse(cooldownUntil))) return fail("malformed");
+    if (Date.parse(cooldownUntil) > nowMs) return fail("cooldown_active");
+  }
   if (provider === "grok" && quota.details.has_grok_code_access !== true) return fail("grok_entitlement");
   if (!isRecord(quota.windows)) return fail("malformed");
 

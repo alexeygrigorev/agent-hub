@@ -419,7 +419,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
         accounts: [{ label: 'm13-claim', provider: 'codex', max_concurrency: 2, reserve_percent: 15, enabled: true }],
         routes: [{ machine_id: host.machineId, engine: 'codex', account: 'm13-claim', profile: null }],
       }),
-    })).status).toBe(200);
+    }))).status).toBe(200);
 
     const quota = (limit: boolean, pct = 80) => ({
       subscriptions: [{ service: 'codex', account: 'm13-claim', plan: 'pro',
@@ -427,5 +427,137 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
           windows: { weekly: { present: true, percent_remaining: pct, reset_at: isoNow(86400000) } } } }],
     });
     const authSub = { Authorization: `Bearer ${host.accessToken}`, 'Content-Type': 'application/json' };
-    expect((await doFetch(new Request('http://exa
-...[truncated 1587 chars]
+    const putSub = (body: unknown) => doFetch(new Request('http://example.com/api/fleet/subscriptions', {
+      method: 'PUT', headers: authSub, body: JSON.stringify(body),
+    }));
+    expect((await putSub(quota(false))).status).toBe(200);
+
+    const launchBody = (key: string) => ({
+      method: 'POST', headers: adminHeaders,
+      body: JSON.stringify({ workspace: 'demo', prompt: 'm13 claim proof', idempotency_key: key }),
+    });
+    const launchRes = await doFetch(new Request('http://example.com/api/fleet/launches', launchBody('m13-claim-1') as RequestInit));
+    expect(launchRes.status).toBe(201);
+    const launch = (await launchRes.json()) as any;
+
+    // Exhaust the engine: plan refuses and the atomic claim re-check refuses too.
+    expect((await putSub(quota(true))).status).toBe(200);
+    const planned = (await (await doFetch(new Request('http://example.com/api/fleet/plan', launchBody('m13-claim-2') as RequestInit))).json()) as any;
+    expect(planned.selected).toBeFalsy();
+    const claimRes = await doFetch(new Request(`http://example.com/api/fleet/launches/${launch.id}/claim`, {
+      method: 'POST', headers: authSub,
+      body: JSON.stringify({ gate_allowed: true, observed_at: isoNow(), account: 'm13-claim', profile_supported: true }),
+    }));
+    expect(claimRes.status).toBe(409);
+
+    // Fresh post-exhaustion evidence recovers both plan and claim.
+    expect((await putSub(quota(false))).status).toBe(200);
+    const planned2 = (await (await doFetch(new Request('http://example.com/api/fleet/plan', launchBody('m13-claim-3') as RequestInit))).json()) as any;
+    expect(planned2.selected).toBeTruthy();
+    const claimRes2 = await doFetch(new Request(`http://example.com/api/fleet/launches/${launch.id}/claim`, {
+      method: 'POST', headers: authSub,
+      body: JSON.stringify({ gate_allowed: true, observed_at: isoNow(), account: 'm13-claim', profile_supported: true }),
+    }));
+    expect(claimRes2.status).toBe(200);
+  });
+
+  it('cooldown hold blocks plan and claim even with healthy percent; retention, update and expiry behave', async () => {
+    const t = Date.now();
+    const held = (cd: string | null) => ({
+      provider: 'codex',
+      quota: { status: 'ok', observed_at: new Date(t - 1000).toISOString(),
+        details: { limit_reached: false, cooldown_until: cd },
+        windows: { weekly: { present: true, percent_remaining: 80, reset_at: new Date(t + 3600000).toISOString() } } },
+      subscriptionObservedAt: new Date(t - 1000).toISOString(), nowMs: t, reserves: { codex: 15, grok: 5 },
+    });
+    expect(evaluateQuotaAdmission(held(new Date(t + 60000).toISOString())).reason).toBe('cooldown_active');
+    expect(evaluateQuotaAdmission(held(new Date(t - 1000).toISOString())).reason).toBe('eligible');
+    expect(evaluateQuotaAdmission(held(null)).reason).toBe('eligible');
+    expect(evaluateQuotaAdmission(held('soon')).reason).toBe('malformed');
+
+    const host = await pairHost('m13-hold-host', 'm13hold.local', sessionCookie, csrfToken);
+    const adminHeaders = { Cookie: sessionCookie, 'Content-Type': 'application/json', 'x-csrf-token': csrfToken };
+    const stub = (defaultEnv as any).HUB.get((defaultEnv as any).HUB.idFromName('hub'));
+    await runInDurableObject(stub, async (instance: Hub) => {
+      instance.sql.exec(
+        "UPDATE machines SET last_checkin_at = ?, last_heartbeat = ?, capabilities = ? WHERE id = ?",
+        isoNow(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: isoNow() } }),
+        JSON.stringify({ engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 4 }), host.machineId);
+    });
+    expect((await doFetch(new Request('http://example.com/api/fleet/accounts', {
+      method: 'PUT', headers: adminHeaders,
+      body: JSON.stringify({
+        accounts: [{ label: 'm13-hold', provider: 'codex', max_concurrency: 2, reserve_percent: 15, enabled: true }],
+        routes: [{ machine_id: host.machineId, engine: 'codex', account: 'm13-hold', profile: null }],
+      }),
+    }))).status).toBe(200);
+
+    const subWith = (details: unknown) => ({
+      subscriptions: [{ service: 'codex', account: 'm13-hold', plan: 'pro',
+        quota: { status: 'ok', observed_at: isoNow(-1000), details,
+          windows: { weekly: { present: true, percent_remaining: 80, reset_at: isoNow(86400000) } } } }],
+    });
+    const authSub = { Authorization: `Bearer ${host.accessToken}`, 'Content-Type': 'application/json' };
+    const putSub = (body: unknown) => doFetch(new Request('http://example.com/api/fleet/subscriptions', {
+      method: 'PUT', headers: authSub, body: JSON.stringify(body),
+    }));
+    const planNow = async (key: string) => (await (await doFetch(new Request('http://example.com/api/fleet/plan', {
+      method: 'POST', headers: adminHeaders, body: JSON.stringify({ workspace: 'demo', prompt: 'm13 hold proof', idempotency_key: key }),
+    }))).json()) as any;
+
+    // Known active hold blocks even with a healthy 80%.
+    expect((await putSub(subWith({ limit_reached: false, cooldown_until: isoNow(60000) }))).status).toBe(200);
+    expect((await planNow('m13-hold-1')).selected).toBeFalsy();
+
+    // A later report that omits the field must not erase the unexpired hold.
+    expect((await putSub(subWith({ limit_reached: false }))).status).toBe(200);
+    const stored: any = await runInDurableObject(stub, async (instance: Hub) =>
+      JSON.parse((instance.sql.exec('SELECT quota_json FROM fleet_subscriptions WHERE machine_id = ? AND account = ?', host.machineId, 'm13-hold').one() as any).quota_json));
+    expect(typeof stored.details.cooldown_until).toBe('string');
+    expect((await planNow('m13-hold-2')).selected).toBeFalsy();
+
+    // An updated deadline is honored; an expired deadline with fresh percent recovers.
+    expect((await putSub(subWith({ limit_reached: false, cooldown_until: isoNow(120000) }))).status).toBe(200);
+    expect((await planNow('m13-hold-3')).selected).toBeFalsy();
+    expect((await putSub(subWith({ limit_reached: false, cooldown_until: isoNow(-1000) }))).status).toBe(200);
+    expect((await planNow('m13-hold-4')).selected).toBeTruthy();
+
+    // Malformed deadlines never enter storage.
+    expect((await putSub(subWith({ limit_reached: false, cooldown_until: 'soon' }))).status).toBe(400);
+  });
+
+  it('modelCandidates admits only eligible routes through the canonical gate', async () => {
+    const t = Date.now();
+    const ad = [{ engine: 'grok', profile: null, model: 'grok-4.6', effort: 'high', account: 'm13-g' }];
+    const route = { provider: 'grok', engine: 'grok', profile: null, account: 'm13-g' };
+    const quotaFor = (pct: number | null, details: unknown = { limit_reached: false, has_grok_code_access: true }) => ({
+      status: 'ok', observed_at: new Date(t - 1000).toISOString(), details,
+      windows: { '5h': { present: true, percent_remaining: pct, reset_at: new Date(t + 3600000).toISOString() } },
+    });
+    const input = { tier: 'daily' };
+    expect(modelCandidates(input, route, ad, quotaFor(80), t).length).toBeGreaterThan(0);
+    // Below the Grok 5% reserve, and with an unavailable sibling, no model is offered.
+    expect(modelCandidates(input, route, ad, quotaFor(4), t)).toEqual([]);
+    expect(modelCandidates(input, route, ad, {
+      status: 'ok', observed_at: new Date(t - 1000).toISOString(),
+      details: { limit_reached: false, has_grok_code_access: true },
+      windows: {
+        '5h': { present: false, percent_remaining: null, reset_at: null, error: 'unavailable' },
+        weekly: { present: true, percent_remaining: 80, reset_at: new Date(t + 3600000).toISOString() },
+      },
+    }, t)).toEqual([]);
+  });
+
+  it('stored quota DTOs carry no secret material', async () => {
+    const stub = (defaultEnv as any).HUB.get((defaultEnv as any).HUB.idFromName('hub'));
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const blobs: string[] = [];
+      for (const row of instance.sql.exec('SELECT routes_json FROM host_quota_snapshots').toArray() as any[]) blobs.push(row.routes_json);
+      for (const row of instance.sql.exec('SELECT quota_json FROM fleet_subscriptions').toArray() as any[]) blobs.push(row.quota_json);
+      expect(blobs.length).toBeGreaterThan(0);
+      for (const blob of blobs) {
+        expect(blob).not.toMatch(/access_token|refresh_token|cookie|email|secret|bearer|authorization|account_id|organization_id|raw_output/i);
+      }
+    });
+  });
+});

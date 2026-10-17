@@ -29,6 +29,7 @@ const NATIVE_AMOUNTS: Record<string, number> = { credits_remaining: 1e12, spend_
 const NATIVE_UNITS = new Set(['percent', 'credits', 'usd_cents', 'requests', 'tokens']);
 const PROFILE_LABEL = /^[A-Za-z0-9][A-Za-z0-9_./-]{0,63}$/;
 const COLLECTOR_VERSION = /^[A-Za-z0-9][A-Za-z0-9_.+/-]{0,63}$/;
+const UTC_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|\+00:00)$/;
 function nativeAmount(value: any, cap: number): boolean {
   return value === null || (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= cap);
 }
@@ -47,6 +48,8 @@ function sanitizedQuota(raw: any): any {
       if (value !== null && (typeof value !== 'string' || !NATIVE_UNITS.has(value))) return null;
     } else if (key === 'profile') {
       if (value !== null && (typeof value !== 'string' || !PROFILE_LABEL.test(value))) return null;
+    } else if (key === 'cooldown_until') {
+      if (value !== null && (typeof value !== 'string' || value.length > 64 || !UTC_ISO.test(value) || !Number.isFinite(Date.parse(value)))) return null;
     } else return null;
     details[key] = value;
   }
@@ -353,8 +356,21 @@ export class FleetService {
         clean.push({ ...sub, quota });
       }
       return this.transaction(() => {
+        const prior = new Map((this.sql.exec('SELECT account, quota_json FROM fleet_subscriptions WHERE machine_id = ?', caller.machineId!).toArray() as any[]).map(r => [r.account, r.quota_json]));
         this.sql.exec('DELETE FROM fleet_subscriptions WHERE machine_id = ?', caller.machineId!);
-        for (const s of clean) this.sql.exec('INSERT INTO fleet_subscriptions VALUES (?, ?, ?, ?, ?, ?)', caller.machineId!, s.account, s.service, s.plan, new Date(this.now()).toISOString(), JSON.stringify(s.quota));
+        for (const s of clean) {
+          // A newer report that omits a cooldown deadline must not erase an unexpired known hold.
+          if (s.quota.details?.cooldown_until == null) {
+            try {
+              const oldQ = JSON.parse(prior.get(s.account) || 'null');
+              const oldCd = oldQ?.details?.cooldown_until;
+              if (typeof oldCd === 'string' && Number.isFinite(Date.parse(oldCd)) && Date.parse(oldCd) > this.now()) {
+                s.quota.details.cooldown_until = oldCd;
+              }
+            } catch { /* keep the field absent */ }
+          }
+          this.sql.exec('INSERT INTO fleet_subscriptions VALUES (?, ?, ?, ?, ?, ?)', caller.machineId!, s.account, s.service, s.plan, new Date(this.now()).toISOString(), JSON.stringify(s.quota));
+        }
         return response({ status: 'reported' });
       });
     }

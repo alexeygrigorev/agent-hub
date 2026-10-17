@@ -83,6 +83,7 @@ const OPTIONAL_DETAILS_KEYS = new Set<string>([
   "spend_limit",
   "unit",
   "profile",
+  "cooldown_until",
 ]);
 
 const FORBIDDEN_PROTO_KEYS = new Set<string>([
@@ -121,6 +122,8 @@ export interface QuotaRouteDetailsDTO {
   spend_limit?: number | null;
   unit?: QuotaWindowNativeDTO["unit"];
   profile?: string | null;
+  /** Known provider backoff deadline (UTC ISO). Active holds block admission even when quota looks fine. */
+  cooldown_until?: string | null;
 }
 
 export interface QuotaRouteDTO {
@@ -749,6 +752,15 @@ export function validateQuotaSnapshotPayload(
         return { ok: false, status: 400, error: "invalid_details_native", reason: nativeRes.reason };
       }
       Object.assign(sanitizedDetails, nativeRes.native);
+      if (Object.prototype.hasOwnProperty.call(detailsVal, "cooldown_until") && detailsVal.cooldown_until !== null) {
+        const parsedCd = parseUtcIso(detailsVal.cooldown_until);
+        if (!parsedCd) {
+          return { ok: false, status: 400, error: "invalid_details_native", reason: "invalid_cooldown_until" };
+        }
+        sanitizedDetails.cooldown_until = parsedCd.iso;
+      } else {
+        sanitizedDetails.cooldown_until = null;
+      }
     }
 
     sanitizedRoutes[provider] = {
@@ -951,12 +963,11 @@ export class QuotaStore {
 
     const snap = validation.snapshot;
     const receivedAtIso = new Date(nowMs).toISOString();
-    const routesJson = JSON.stringify(snap.routes);
 
     return this.runInTransaction(() => {
       const existing = this.sql
         .exec(
-          "SELECT captured_at_ms FROM host_quota_snapshots WHERE host_id = ?",
+          "SELECT captured_at_ms, routes_json FROM host_quota_snapshots WHERE host_id = ?",
           hostId
         )
         .toArray()[0] as any;
@@ -972,6 +983,28 @@ export class QuotaStore {
           },
         };
       }
+
+      // A newer observation that omits a cooldown deadline must not erase an
+      // unexpired known hold: retain the stored deadline for that provider.
+      if (existing?.routes_json) {
+        let oldRoutes: Record<string, any> = {};
+        try {
+          oldRoutes = JSON.parse(existing.routes_json);
+        } catch {
+          oldRoutes = {};
+        }
+        for (const [provider, route] of Object.entries(snap.routes)) {
+          const newCd = route.details?.cooldown_until ?? null;
+          const oldCd = oldRoutes?.[provider]?.details?.cooldown_until ?? null;
+          if ((newCd === null || newCd === undefined) && typeof oldCd === "string") {
+            const oldMs = Date.parse(oldCd);
+            if (Number.isFinite(oldMs) && oldMs > nowMs) {
+              route.details.cooldown_until = oldCd;
+            }
+          }
+        }
+      }
+      const routesJson = JSON.stringify(snap.routes);
 
       this.sql.exec(
         `INSERT INTO host_quota_snapshots (

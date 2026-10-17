@@ -52,16 +52,30 @@ exhausted/stale/unknown quota. No second quota store: single
 
 `evaluateQuotaAdmission({provider, quota, subscriptionObservedAt, nowMs,
 reserves})` is the single gate used by `accountStatus`, `plan`, `dispatch`
-(model shortlist filter) and `claim` (re-checked atomically before effect).
+(model shortlist filter), `modelCandidates` (approved one-line hook; policy,
+ranking and preferences unchanged) and `claim` (re-checked atomically before
+effect).
 Reserves come from `config/model-routing.json rules.reserve_percent`
 (Codex 15, Grok 5) applied to **every** available applicable window.
 Fail-closed on: stale/future/malformed observation times, `status !== "ok"`,
 `limit_reached !== false`, missing Grok code entitlement, any
 `error: "unavailable"` window, malformed numbers/dates, reset passed without a
-post-reset observation, and zero available windows. Benign absence of an
+post-reset observation, zero available windows, and a known active provider
+backoff hold (`details.cooldown_until` in the future, mirroring the maintained
+launcher's 429 Retry-After `cooldown_until` authority). Benign absence of an
 optional unsupported window (`present: false`, nulls, no error) is ignored.
 Model preference (Muse Spark 1.3, Z.ai `glm-5.3-flash`) applies only among
 eligible routes; exhaustion gates are never overridden by any manual flag.
+
+Cooldown holds (`details.cooldown_until`, schema 1.1, bounded UTC ISO) mirror
+the maintained launcher/provider-capacity 429 authority without duplicating it:
+no second table or controller exists. A newer report that omits the field never
+erases an unexpired stored hold (retained in the existing snapshot and
+subscription rows); updates extend it; expiry plus fresh percent recovers.
+Coverage limitation, stated explicitly: installed `quse` emits no cooldown
+field today, so live holds arrive only when a host collector observes a real
+provider backoff; the contract, retention and gating are proven by fixtures,
+and no deadline is ever invented.
 
 ## CLI and UI
 
