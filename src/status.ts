@@ -146,17 +146,17 @@ function checkObservationPayload(kind: string, raw: unknown): Obj {
   }
   if (kind === 'probe_ci') {
     const keys = Object.keys(p);
-    if (!keys.includes('state') || keys.some(k => !['state', 'run'].includes(k))) fail('invalid_observation_payload');
-    return { state: strictEnum(p.state, CI_STATES, 'state'),
+    if (!keys.includes('state') || !keys.includes('sha') || keys.some(k => !['state', 'run', 'sha'].includes(k))) fail('invalid_observation_payload');
+    if (typeof p.sha !== 'string' || !SHA40.test(p.sha)) fail('invalid_observation_sha');
+    return { state: strictEnum(p.state, CI_STATES, 'state'), sha: p.sha.toLowerCase(),
       ...(typeof p.run === 'string' ? { run: cleanText(p.run, 256) } : {}) };
   }
   if (kind === 'probe_deploy') {
     const keys = Object.keys(p);
-    if (!keys.includes('state') || keys.some(k => !['state', 'deployment', 'sha'].includes(k))) fail('invalid_observation_payload');
-    if (p.sha !== undefined && (typeof p.sha !== 'string' || !SHA40.test(p.sha))) fail('invalid_observation_sha');
-    return { state: strictEnum(p.state, DEPLOY_STATES, 'state'),
-      ...(typeof p.deployment === 'string' ? { deployment: cleanText(p.deployment, 256) } : {}),
-      ...(typeof p.sha === 'string' ? { sha: p.sha.toLowerCase() } : {}) };
+    if (!keys.includes('state') || !keys.includes('sha') || keys.some(k => !['state', 'deployment', 'sha'].includes(k))) fail('invalid_observation_payload');
+    if (typeof p.sha !== 'string' || !SHA40.test(p.sha)) fail('invalid_observation_sha');
+    return { state: strictEnum(p.state, DEPLOY_STATES, 'state'), sha: p.sha.toLowerCase(),
+      ...(typeof p.deployment === 'string' ? { deployment: cleanText(p.deployment, 256) } : {}) };
   }
   fail('invalid_observation_kind');
   throw new Error('unreachable');
@@ -248,6 +248,7 @@ export class StatusService {
         const items = page.map(task => this.taskDto(task, p, machines, now, nowIso, sinceMs, hostFilter, lifecycleBySession));
         this.attachObservations(items, now, nowIso);
         const reportsCollected = items.some(t => (t.reports ?? []).some((r: Obj) => r.headline !== 'unknown'));
+        const probesCollected = items.some(t => (t.commits ?? []).some((c: Obj) => c.git_ancestry || c.ci || c.deploy));
         const { missing: missingHosts, expectedOffline } = this.missingHosts(machines, now);
         const sessionCoverage = missingHosts.length ? 'partial' : 'complete';
         const offlineWindowActive = expectedOfflineWindowActive(now);
@@ -266,7 +267,9 @@ export class StatusService {
             reports: reportsCollected
               ? { state: 'collected_host_reported', source: 'host_observation_sanitized_headline', observed_at: nowIso, freshness: 'fresh', coverage: 'partial', reason: 'allowlisted_host_reader_headlines_only_transcripts_tokens_never_stored' }
               : { state: 'unknown_not_collected', source: 'intake_history_report_reference_only', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'headline_collection_requires_M14b_allowlisted_host_reader', successor: 'M14b' },
-            commits_deploys_ci: { state: 'unknown_not_collected', source: 'intake_history_commit_reference_only', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'verified_git_ancestry_active_deployment_ci_adapters_require_M14c', successor: 'M14c' },
+            commits_deploys_ci: probesCollected
+              ? { state: 'collected_probe_evidence', source: 'host_probe_git_ci_deploy_exact_sha', observed_at: nowIso, freshness: 'fresh', coverage: 'partial', reason: 'explicit_argv_probes_never_push_or_ci_inference_for_deploy' }
+              : { state: 'unknown_not_collected', source: 'intake_history_commit_reference_only', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'verified_git_ancestry_active_deployment_ci_adapters_require_M14c', successor: 'M14c' },
             pending_actions: { state: 'collected_intake_only', source: 'intake_unresolved_followup_blocker_pending_approval', observed_at: nowIso, freshness: 'fresh', coverage: 'complete', reason: 'login_user_codes_withheld_in_this_cut_device_tokens_never_exported', successor: 'M14c_login_metadata' },
             diff: { state: 'not_available', source: 'caller_scoped_baseline_store_absent', observed_at: nowIso, freshness: 'unknown', coverage: 'unavailable', reason: 'M14d_durable_caller_baseline_not_yet_collected_since_filters_only', successor: 'M14d' },
           },
@@ -407,6 +410,7 @@ export class StatusService {
     const latest = this.latestObservations(ids);
     for (const task of items) {
       let taskReport: Obj | null = null;
+      const taskProbes: Obj[] = [];
       for (const hub of (task.hub_sessions ?? [])) {
         if (hub?.linkage !== 'hub_session') continue;
         const sess = latest.get(hub.hub_session_id + '\nsession');
@@ -433,6 +437,35 @@ export class StatusService {
             reason: 'sanitized_headline_only_never_transcript_or_token' },
         } : null;
         if (rep && (!taskReport || String(rep.observed_at) > String((taskReport as Obj).observed_at))) taskReport = rep;
+        // Probe evidence rides on the visible session only; commit linkage
+        // below matches by exact sha (never push/CI-success inference).
+        const probes: Obj = {};
+        for (const kind of ['probe_git', 'probe_ci', 'probe_deploy']) {
+          const row = latest.get(hub.hub_session_id + '\n' + kind);
+          if (row) { probes[kind] = row; taskProbes.push(row); }
+        }
+        hub.probe_evidence = Object.keys(probes).length ? {
+          git: probes.probe_git ? { sha: (probes.probe_git.payload as Obj).sha ?? null,
+            ancestry: (probes.probe_git.payload as Obj).ancestry ?? 'unknown',
+            ref: (probes.probe_git.payload as Obj).ref ?? null,
+            observed_at: probes.probe_git.observed_at, host_reported: true,
+            provenance: { source: 'host_probe_git', observed_at: probes.probe_git.observed_at,
+              freshness: freshnessOf(probes.probe_git.observed_at, now, 86400000), coverage: 'partial',
+              reason: 'explicit_argv_ancestry_stale_refs_fail_closed' } } : null,
+          ci: probes.probe_ci ? { state: (probes.probe_ci.payload as Obj).state ?? 'unknown',
+            run: (probes.probe_ci.payload as Obj).run ?? null,
+            observed_at: probes.probe_ci.observed_at, host_reported: true,
+            provenance: { source: 'host_probe_ci', observed_at: probes.probe_ci.observed_at,
+              freshness: freshnessOf(probes.probe_ci.observed_at, now, 86400000), coverage: 'partial',
+              reason: 'exact_sha_run_only_never_deploy_proof' } } : null,
+          deploy: probes.probe_deploy ? { state: (probes.probe_deploy.payload as Obj).state ?? 'unknown',
+            deployment: (probes.probe_deploy.payload as Obj).deployment ?? null,
+            sha: (probes.probe_deploy.payload as Obj).sha ?? null,
+            observed_at: probes.probe_deploy.observed_at, host_reported: true,
+            provenance: { source: 'host_probe_deploy', observed_at: probes.probe_deploy.observed_at,
+              freshness: freshnessOf(probes.probe_deploy.observed_at, now, 86400000), coverage: 'partial',
+              reason: 'active_deployment_record_only_never_push_or_ci_inference' } } : null,
+        } : null;
       }
       if (taskReport) {
         const rp = (taskReport as Obj).payload as Obj;
@@ -445,6 +478,35 @@ export class StatusService {
             r.provenance = { source: 'host_observation', observed_at: (taskReport as Obj).observed_at,
               freshness: freshnessOf((taskReport as Obj).observed_at, now, 86400000), coverage: 'partial',
               reason: 'sanitized_headline_only_never_transcript_or_token' };
+          }
+        }
+      }
+      // Commit evidence by exact sha match against this task's visible
+      // session probes only. A linked commit or CI green is still never
+      // deploy proof without an active-deployment record naming the sha.
+      if (taskProbes.length && Array.isArray(task.commits)) {
+        const bySha = new Map<string, Obj[]>();
+        for (const probe of taskProbes) {
+          const sha = typeof (probe.payload as Obj).sha === 'string' ? ((probe.payload as Obj).sha as string).toLowerCase() : null;
+          if (sha && /^[0-9a-f]{40}$/.test(sha)) {
+            const list = bySha.get(sha) ?? [];
+            list.push(probe);
+            bySha.set(sha, list);
+          }
+        }
+        for (const c of task.commits) {
+          if (typeof c.reference !== 'string' || !/^[0-9a-f]{7,40}$/i.test(c.reference)) continue;
+          const ref = c.reference.toLowerCase();
+          const sha = [...bySha.keys()].find(s => s.startsWith(ref));
+          if (!sha) continue;
+          for (const probe of bySha.get(sha)!) {
+            const key = probe.kind === 'probe_git' ? 'git_ancestry' : probe.kind === 'probe_ci' ? 'ci' : 'deploy';
+            if ((c as Obj)[key]) continue;
+            const payload = probe.payload as Obj;
+            (c as Obj)[key] = { ...payload, observed_at: probe.observed_at, host_reported: true,
+              provenance: { source: 'host_' + probe.kind, observed_at: probe.observed_at,
+                freshness: freshnessOf(probe.observed_at, now, 86400000), coverage: 'partial',
+                reason: 'exact_sha_match_visible_session_probe_only' } };
           }
         }
       }

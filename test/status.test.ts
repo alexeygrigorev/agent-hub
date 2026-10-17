@@ -417,7 +417,7 @@ describe('M14b slice2 machine-authenticated host observations', () => {
     try {
       const res = await obsCall(good, host.token);
       expect(res.status).toBe(503);
-      expect((await res.json()).error).toBe('observation_auth_unavailable');
+      expect(((await res.json()) as any).error).toBe('observation_auth_unavailable');
     } finally {
       await inDO(stub(), (h: any) => {
         h.statusService.setObservationGate((m: unknown, c: any) => h.sessionControlService.hostObservationAllowed(m, c));
@@ -434,5 +434,39 @@ describe('M14b slice2 machine-authenticated host observations', () => {
     expect(noCsrf.status).toBe(403);
     const recorded = await obsOk(good);
     expect(recorded.reporter).toContain('operator:');
+  });
+
+  it('surfaces exact-sha probe evidence on sessions and commits without inference', async () => {
+    const host = await seedHostMachine('host-probe', 'hubt_obs_fixture_token_7');
+    const sha = 'a'.repeat(40);
+    await seedHubSession(HUB_SESSION, 'demo:assistant', 'host-probe', 'running', 'native-probe-1');
+    const { task } = await createTask();
+    await intakeOk('/tasks/' + task.id + '/events', { key: 'hub-link-probe-' + ++seq, expected_version: 1,
+      event: { kind: 'link', hub_session_id: HUB_SESSION, provenance: source } });
+    await intakeOk('/tasks/' + task.id + '/events', { key: 'commit-probe-' + ++seq, expected_version: 2,
+      event: { kind: 'commit', reference: sha, source } });
+    await intakeOk('/tasks/' + task.id + '/events', { key: 'commit-other-' + ++seq, expected_version: 3,
+      event: { kind: 'commit', reference: 'b'.repeat(40), source } });
+    await obsOk({ machine_id: 'host-probe', hub_session_id: HUB_SESSION, kind: 'probe_git',
+      observed_at: freshAt(), payload: { sha, ancestry: 'merged_in_main', ref: 'origin/main' } }, host.token);
+    await obsOk({ machine_id: 'host-probe', hub_session_id: HUB_SESSION, kind: 'probe_ci',
+      observed_at: freshAt(), payload: { state: 'passing', run: 'https://ci.test/r/1', sha } }, host.token);
+    await obsOk({ machine_id: 'host-probe', hub_session_id: HUB_SESSION, kind: 'probe_deploy',
+      observed_at: freshAt(), payload: { state: 'not_deployed', sha } }, host.token);
+    const data = await ok('');
+    const row = data.tasks.find((t: any) => t.id === task.id);
+    const hub = row.hub_sessions.find((h: any) => h.hub_session_id === HUB_SESSION);
+    expect(hub.probe_evidence.git).toMatchObject({ sha, ancestry: 'merged_in_main' });
+    expect(hub.probe_evidence.ci).toMatchObject({ state: 'passing' });
+    expect(hub.probe_evidence.deploy).toMatchObject({ state: 'not_deployed' });
+    const matched = row.commits.find((c: any) => c.reference === sha);
+    expect(matched.git_ancestry).toMatchObject({ sha, ancestry: 'merged_in_main' });
+    expect(matched.ci.state).toBe('passing');
+    expect(matched.deploy.state).toBe('not_deployed');
+    // A commit without probe evidence stays honestly unknown: no borrowing.
+    const other = row.commits.find((c: any) => c.reference === 'b'.repeat(40));
+    expect(other.deploy_state).toBe('unknown');
+    expect(other.git_ancestry).toBeUndefined();
+    expect(data.categories.commits_deploys_ci.state).toBe('collected_probe_evidence');
   });
 });

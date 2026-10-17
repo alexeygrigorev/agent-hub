@@ -5,9 +5,10 @@ M14b slice1 shipped: canonical intake-assigned Hub sessions (`hub_session_id`
 links into `session_control_sessions`) with live SessionControl state plus
 the M15 lifecycle group/decision per bound session. M14b slice2 shipped:
 machine-authenticated host observations (session states, sanitized report
-headlines) bound to the current canonical session/machine. M14c (verified
-Git/active deployment/CI adapters) and M14d (durable caller-scoped last-call
-diffs) remain explicit successor work.
+headlines) bound to the current canonical session/machine. M14c shipped:
+explicit-argv Git ancestry / CI / active-deployment probes with exact-sha
+commit matching (no push/CI inference for deploy). M14d (durable
+caller-scoped last-call diffs) remains explicit successor work.
 
 ## Endpoint
 
@@ -76,8 +77,27 @@ second tracker). No raw terminal, prompt, draft or report-body reads.
   bounded ≤240 chars, control-stripped and token-redacted server-side;
   transcripts, tokens and screens are never stored.
 - `commits[]`: `{reference, source}` plus `deploy_state: unknown`,
-  `ci_state: unknown` with `successor: M14c`. A linked commit or CI green is
-  never deploy proof.
+  `ci_state: unknown` until an exact-sha probe matches: `git_ancestry`
+  (`{sha, ancestry: merged_in_main/not_merged/unknown}`),
+  `ci` (`{state: passing/failing/unknown, run}`),
+  `deploy` (`{state: deployed/not_deployed/unknown, deployment, sha}`),
+  each with `source: host_probe_*` provenance. A linked commit or CI green
+  is never deploy proof: `deployed` requires an explicit active-deployment
+  record naming the exact sha. Unmatched commits stay `unknown` (no
+  borrowing across shas). `categories.commits_deploys_ci` reflects
+  collection (`collected_probe_evidence`, coverage `partial`).
+
+Maintained probes: `host/agent_hub_host/status_probe.py` (stdlib only,
+standalone `--once --probes SPEC [--submit]`). Probe specs are explicit
+argv arrays (no shell): only allowlisted tools (`git/gh/wrangler`) and
+read-only subcommands run (`git push/fetch/pull/clone/ls-remote` refused),
+cwd must sit under allowlisted `repo_roots`, output bounded (8 KiB) and
+token-redacted, child env scrubbed of secrets, argv secrets masked in
+provenance. `git_ancestry` reports `merged_in_main` only on exit-0
+`merge-base --is-ancestor` against a FRESH `origin/main` ref (stale/missing
+refs fail closed to `unknown`); `ci` matches runs by exact `head_sha`;
+`deployment` matches active records naming the exact sha in the target
+environment. Every probe payload carries its source sha (required).
 - `pending_actions[]`: intake unresolved `followup/blocker/pending_approval`
   only as `{id, type, status, actor, captured_at, text_snippet<=240, link}`.
   Login `user_code` values are always withheld from agent/orchestrator bearers
