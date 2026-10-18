@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import uuid
 import subprocess
 import time
@@ -545,6 +546,12 @@ class Dispatcher:
                 raise ValueError('Required capabilities are no longer available locally')
             if not isinstance(selection, dict) or selection.get('model') != sub.get('launcher_model') or selection.get('effort') != sub.get('launcher_effort'):
                 raise ValueError('Selected model/effort is not configured locally')
+        offer_id = offer.get("id")
+        if not isinstance(offer_id, str) or not LABEL.fullmatch(offer_id):
+            raise ValueError("Invalid offer id")
+        if offer.get("task_id") is not None:
+            if not isinstance(offer["task_id"], str) or not LABEL.fullmatch(offer["task_id"]):
+                raise ValueError("Invalid task id")
         gate = self.runner(sub["admission_argv"], payload={k: offer.get(k) for k in ["mode", "engine", "profile", "account", "workspace", "selection"]})
         if gate.get("launch_allowed") is not True or gate.get("profile_supported") is not True or gate.get("account_label") != sub["account_label"]:
             raise ValueError("Fresh admission refused")
@@ -571,7 +578,7 @@ class Dispatcher:
         if mode == "interactive":
             if offer.get("prompt"):
                 raise ValueError("Interactive task injection is unsupported; start an empty native session")
-            argv = [native, "start", "--workspace", str(workspace), "--tag", "hub-" + offer["id"], "--engine", offer["engine"], "--memory", "1500M", "--pids", "256", "--json"]
+            argv = [native, "start", "--workspace", str(workspace), "--tag", "hub-" + offer_id, "--engine", offer["engine"], "--memory", "1500M", "--pids", "256", "--json"]
             if offer.get("profile"):
                 argv += ["--profile", offer["profile"]]
             if target_cwd != workspace:
@@ -596,19 +603,32 @@ class Dispatcher:
                 raise ValueError("Maintained launcher route is not configured")
             # Only the maintained launcher may run models. argv is a trusted machine-local CLI prefix.
             prefix = launcher["argv"] + ["--config-dir", launcher["config_dir"]]
-            task_id = "hub-" + offer["id"]
+            task_id = "hub-" + offer_id
             goal = offer["prompt"]
-            result_path = workspace / '.local' / 'hub-results' / (offer['id'] + '.json')
-            if offer.get('task_id'):
-                result_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                goal += '\nWrite a final JSON object to ' + str(result_path) + ': {"status":"done|failed|waiting-on-human|stuck","report":"sanitized final report","artifacts":[{"label":"text","text":"sanitized text"}]}. No secrets, codes, tokens or URLs. Do not write raw screenshots; keep them private for human review locally.'
+            curr = workspace
+            for seg in (".local", "hub-results"):
+                curr = curr / seg
+                if curr.is_symlink():
+                    raise ValueError(f"Refuse symlinked ancestor directory: {curr}")
+                if not curr.exists():
+                    curr.mkdir(mode=0o700, exist_ok=True)
+                    os.chmod(curr, 0o700)
+                st = os.lstat(curr)
+                if not stat.S_ISDIR(st.st_mode) or curr.is_symlink():
+                    raise ValueError(f"Ancestor directory is not a regular directory: {curr}")
+            os.chmod(curr, 0o700)
+            result_path = curr / (offer_id + ".json")
+            if result_path.is_symlink():
+                raise ValueError(f"Refuse symlinked result leaf: {result_path}")
+            try:
+                result_path.relative_to(workspace)
+            except ValueError:
+                raise ValueError("Result path escapes workspace root")
+            goal += '\nWrite a final JSON object to ' + str(result_path) + ': {"status":"done|failed|waiting-on-human|stuck","report":"sanitized final report","artifacts":[{"label":"text","text":"sanitized text"}]}. No secrets, codes, tokens or URLs. Do not write raw screenshots; keep them private for human review locally.'
             payload = {"goal": goal, "owner": "hub-fleet", "cwd": str(target_cwd), "timeout": 1800,
                        "model_requirements": {"providers": [sub["launcher_provider"]], "models": [sub["launcher_model"]]},
                        "account_label": sub["account_label"], "profile": "model-task"}
-            submit_argv = prefix + ["submit", "--id", task_id, "--key", task_id]
-            if offer.get('task_id'):
-                submit_argv += ["--paths", str(result_path)]
-            submit_argv += ["--payload", json.dumps(payload), "--json"]
+            submit_argv = prefix + ["submit", "--id", task_id, "--key", task_id, "--paths", str(result_path), "--payload", json.dumps(payload), "--json"]
             self.runner(submit_argv, cwd=launcher["root"])
             plan = self.runner(prefix + ["plan", "--id", task_id], cwd=launcher["root"])
             eligible = plan.get("eligible", [])
@@ -646,14 +666,14 @@ class Dispatcher:
             cwd = launcher["root"]
         else:
             raise ValueError("Unsupported launch mode")
-        path = "/api/fleet/launches/" + offer["id"]
+        path = "/api/fleet/launches/" + offer_id
         # An uncertain response here leaves the server reservation intact and performs no native effect.
         self.request("POST", path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": sub["account_label"]})
         try:
             receipt = self.runner(argv, cwd=cwd, timeout=120)
             if mode == "interactive":
                 native_id = receipt.get("id")
-                if receipt.get("workspace") != str(workspace) or receipt.get("tag") != "hub-" + offer["id"] or receipt.get('engine') != offer['engine'] or receipt.get('profile') != offer.get('profile') or receipt.get('phase') != 'running':
+                if receipt.get("workspace") != str(workspace) or receipt.get("tag") != "hub-" + offer_id or receipt.get('engine') != offer['engine'] or receipt.get('profile') != offer.get('profile') or receipt.get('phase') != 'running':
                     raise ValueError("Native receipt mismatch")
                 if target_cwd != workspace and not self._verify_native_cwd(native, native_id, target_cwd, receipt):
                     raise ValueError("Native cwd mismatch")
@@ -701,12 +721,22 @@ class Dispatcher:
                 self.request("POST", path + "/result", {"state": "uncertain"})
             except Exception:
                 pass
-            return {"id": offer["id"], "state": "uncertain", "reason": reason,
+            return {"id": offer_id, "state": "uncertain", "reason": reason,
                     "stage": stage, "error": err}
         if offer.get('task_id') and result.get('confirmed_exit'):
             from .routing import read_text
             try:
-                if result_path.is_symlink(): raise ValueError('Refuse linked result file')
+                curr = workspace
+                for seg in ('.local', 'hub-results'):
+                    curr = curr / seg
+                    if curr.is_symlink():
+                        raise ValueError('Refuse linked ancestor directory')
+                if result_path.is_symlink():
+                    raise ValueError('Refuse linked result file')
+                try:
+                    result_path.relative_to(workspace)
+                except ValueError:
+                    raise ValueError('Result path escapes workspace')
                 report = json.loads(read_text(result_path))
                 if not isinstance(report, dict) or report.get('status') not in {'done', 'failed', 'waiting-on-human', 'stuck'}:
                     raise ValueError('Invalid final report')
@@ -717,11 +747,11 @@ class Dispatcher:
             report['confirmed_exit'] = True
             self.request('POST', '/api/fleet/tasks/' + offer['task_id'] + '/result', report)
             if report['status'] in {'done', 'failed'}:
-                return {'id': offer['id'], 'state': report['status']}
+                return {'id': offer_id, 'state': report['status']}
             # Human waits retain reservations even when the reporting process exits.
-            return {'id': offer['id'], 'state': report['status']}
+            return {'id': offer_id, 'state': report['status']}
         self.request("POST", path + "/result", result)
-        return {"id": offer["id"], **result}
+        return {"id": offer_id, **result}
 
     def once(self):
         from . import api, system

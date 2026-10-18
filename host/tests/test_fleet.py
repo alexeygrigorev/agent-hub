@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import io
 import os
+import stat
 import sys
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -550,7 +551,7 @@ class FleetTests(unittest.TestCase):
                 d.once()
                 self.assertNotIn('jobs', calls[-6][2]['capabilities'])
 
-    def test_headless_task_assigned_submit_registers_exact_result_path_and_standalone_omits_paths(self):
+    def test_headless_submit_registers_exact_result_path_for_normal_and_legacy_offers_while_interactive_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = settings(Path(tmp)); cfg['capabilities'] = []
             cfg['launcher'] = {'argv': ['python3', '-m', 'launcher'], 'root': tmp, 'config_dir': str(Path(tmp) / 'config')}
@@ -569,39 +570,169 @@ class FleetTests(unittest.TestCase):
 
             d = fleet.Dispatcher(cfg, lambda *a: requests.append(a) or {}, runner)
 
-            # 1. Intake-assigned headless task registers exact unique absolute result path
-            assigned_offer = offer(mode='headless', task_id='task-intake-999', prompt='Structured review task',
-                                   needs=[], selection={'model': 'gpt-6-sol', 'effort': 'high'})
-            result_file = Path(tmp) / '.local' / 'hub-results' / (assigned_offer['id'] + '.json')
-            result_file.parent.mkdir(parents=True, exist_ok=True)
-            result_file.write_text(json.dumps({'status': 'done', 'report': 'Task finished successfully', 'artifacts': []}), encoding='utf-8')
+            # 1. ACTUAL normal headless offer WITHOUT task_id (canonical session/intake case)
+            normal_offer = offer(mode='headless', task_id=None, prompt='Normal intake task')
+            normal_result_file = Path(tmp) / '.local' / 'hub-results' / (normal_offer['id'] + '.json')
 
-            result = d.dispatch(assigned_offer)
-            self.assertEqual(result['state'], 'done')
+            result_normal = d.dispatch(normal_offer)
+            self.assertEqual(result_normal['state'], 'exited')
+            self.assertTrue(result_normal['confirmed_exit'])
+            self.assertEqual(result_normal['launcher_task_id'], f"hub-{normal_offer['id']}")
 
             submit_call = next(c for c in calls if 'submit' in c)
             self.assertIn('--paths', submit_call)
             registered_path = submit_call[submit_call.index('--paths') + 1]
 
-            # Precisely correct unique absolute owned result path
-            self.assertEqual(registered_path, str(result_file))
+            # Precisely correct unique absolute owned result leaf
+            self.assertEqual(registered_path, str(normal_result_file))
             self.assertTrue(Path(registered_path).is_absolute())
-            self.assertTrue(registered_path.endswith(f"{assigned_offer['id']}.json"))
+            self.assertTrue(registered_path.endswith(f"{normal_offer['id']}.json"))
             # Must NOT be broad directory or foreign path
             self.assertNotEqual(registered_path, str(tmp))
             self.assertNotEqual(registered_path, str(Path(tmp) / '.local'))
-            self.assertNotEqual(registered_path, str(result_file.parent))
+            self.assertNotEqual(registered_path, str(normal_result_file.parent))
             self.assertTrue(Path(registered_path).is_relative_to(Path(tmp)))
-            self.assertTrue(result_file.parent.is_dir())
+            self.assertTrue(normal_result_file.parent.is_dir())
+            self.assertEqual(stat.S_IMODE(normal_result_file.parent.stat().st_mode), 0o700)
 
-            # 2. Standalone headless route has NO --paths in submit argv
+            # Assert prompt instruction includes exact structured result file path
+            payload_str = submit_call[submit_call.index('--payload') + 1]
+            payload = json.loads(payload_str)
+            self.assertIn(f"Write a final JSON object to {normal_result_file}:", payload['goal'])
+
+            # 2. Legacy task_id-present offer route
             calls.clear()
             requests.clear()
-            standalone_offer = offer(mode='headless', task_id=None, prompt='Standalone monitoring task')
-            result2 = d.dispatch(standalone_offer)
-            self.assertEqual(result2['state'], 'exited')
-            submit_call2 = next(c for c in calls if 'submit' in c)
-            self.assertNotIn('--paths', submit_call2)
+            legacy_offer = offer(mode='headless', task_id='task-intake-999', prompt='Legacy review task',
+                                 needs=[], selection={'model': 'gpt-6-sol', 'effort': 'high'})
+            legacy_result_file = Path(tmp) / '.local' / 'hub-results' / (legacy_offer['id'] + '.json')
+
+            def legacy_runner(argv, **kw):
+                calls.append(argv)
+                if argv[0] == 'maintained-gate':
+                    return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow(),
+                            'model_supported': True, 'model': 'gpt-6-sol', 'effort': 'high'}
+                if 'plan' in argv:
+                    return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol', 'task_fit': 1.0, 'account_label': 'shared-codex', 'profile': None}]}
+                if 'run' in argv:
+                    legacy_result_file.write_text(json.dumps({'status': 'done', 'report': 'Finished legacy task', 'artifacts': []}), encoding='utf-8')
+                    return {'receipt': {'unit_name': 'headless-unit', 'exit_code': 0}}
+                return {}
+
+            d_legacy = fleet.Dispatcher(cfg, lambda *a: requests.append(a) or {}, legacy_runner)
+            result_legacy = d_legacy.dispatch(legacy_offer)
+            self.assertEqual(result_legacy['state'], 'done')
+            submit_call_legacy = next(c for c in calls if 'submit' in c)
+            self.assertIn('--paths', submit_call_legacy)
+            self.assertEqual(submit_call_legacy[submit_call_legacy.index('--paths') + 1], str(legacy_result_file))
+            task_posts = [r for r in requests if r[1] == f"/api/fleet/tasks/{legacy_offer['task_id']}/result"]
+            self.assertEqual(len(task_posts), 1)
+            self.assertEqual(task_posts[0][2]['status'], 'done')
+
+            # 3. Interactive route unchanged (no launcher submit, no --paths, no result file)
+            calls.clear()
+            requests.clear()
+            interactive_offer = offer(mode='interactive', prompt='')
+            def interactive_runner(argv, **kw):
+                calls.append(argv)
+                if argv[0] == 'maintained-gate':
+                    return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+                if argv[0] == 'aplexer' and argv[1] == 'start':
+                    return {'id': 'native-1', 'workspace': str(Path(tmp).resolve()), 'tag': f"hub-{interactive_offer['id']}",
+                            'engine': 'codex', 'profile': None, 'phase': 'running'}
+                return {}
+
+            d_interactive = fleet.Dispatcher(cfg, lambda *a: requests.append(a) or {}, interactive_runner)
+            result_interactive = d_interactive.dispatch(interactive_offer)
+            self.assertEqual(result_interactive['state'], 'running')
+            self.assertFalse(any('submit' in c for c in calls))
+
+    def test_headless_prelaunch_path_confinement_and_symlink_refusal_without_outside_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = Path(tmp) / 'outside'
+            outside.mkdir()
+            ws = Path(tmp) / 'ws'
+            ws.mkdir()
+
+            cfg = settings(ws); cfg['capabilities'] = []
+            cfg['launcher'] = {'argv': ['python3', '-m', 'launcher'], 'root': str(ws), 'config_dir': str(ws / 'config')}
+            cfg['subscriptions'][0].update(launcher_provider='codex', launcher_model='gpt-6-sol', launcher_effort='high')
+
+            calls = []
+            def runner(argv, **kw):
+                calls.append(argv)
+                if argv[0] == 'maintained-gate':
+                    return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+                return {}
+
+            d = fleet.Dispatcher(cfg, lambda *a: {}, runner)
+
+            # Case 1: .local ancestor is a symlink pointing outside
+            (ws / '.local').symlink_to(outside)
+            normal_offer = offer(mode='headless', prompt='Normal task')
+            with self.assertRaisesRegex(ValueError, 'Refuse symlinked ancestor directory'):
+                d.dispatch(normal_offer)
+            # Verify no files or directories created inside outside directory
+            self.assertEqual(list(outside.iterdir()), [])
+            (ws / '.local').unlink()
+
+            # Case 2: hub-results ancestor is a symlink pointing outside
+            (ws / '.local').mkdir(mode=0o700)
+            (ws / '.local' / 'hub-results').symlink_to(outside)
+            with self.assertRaisesRegex(ValueError, 'Refuse symlinked ancestor directory'):
+                d.dispatch(normal_offer)
+            self.assertEqual(list(outside.iterdir()), [])
+            (ws / '.local' / 'hub-results').unlink()
+
+            # Case 3: result leaf is pre-existing symlink pointing to an outside file
+            (ws / '.local' / 'hub-results').mkdir(mode=0o700)
+            target_outside_file = outside / 'secret.json'
+            leaf_symlink = ws / '.local' / 'hub-results' / (normal_offer['id'] + '.json')
+            leaf_symlink.symlink_to(target_outside_file)
+            with self.assertRaisesRegex(ValueError, 'Refuse symlinked result leaf'):
+                d.dispatch(normal_offer)
+            self.assertFalse(target_outside_file.exists())
+            leaf_symlink.unlink()
+
+            # Case 4: Offer identity traversal / lookalike validation
+            for bad_id in [
+                '../../etc/passwd',
+                '../escape',
+                'evil/slash',
+                '.hidden',
+                '',
+                'a' * 65,
+                '-bad-start',
+                '_bad-start',
+                'bad$char',
+                'bad char',
+            ]:
+                with self.subTest(bad_id=bad_id):
+                    bad_offer = offer(mode='headless', id=bad_id, prompt='Test bad id')
+                    with self.assertRaises(ValueError):
+                        d.dispatch(bad_offer)
+            self.assertEqual(list(outside.iterdir()), [])
+
+            # Case 5: Idempotent contract: multiple dispatches re-use directory cleanly with mode 0o700
+            runner_calls = []
+            def ok_runner(argv, **kw):
+                runner_calls.append(argv)
+                if argv[0] == 'maintained-gate':
+                    return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+                if 'plan' in argv:
+                    return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol', 'task_fit': 1.0, 'account_label': 'shared-codex', 'profile': None}]}
+                if 'run' in argv:
+                    return {'receipt': {'unit_name': 'headless-unit', 'exit_code': 0}}
+                return {}
+
+            d_ok = fleet.Dispatcher(cfg, lambda *a: {}, ok_runner)
+            res1 = d_ok.dispatch(offer(mode='headless', id='first-task-1', prompt='First run'))
+            self.assertEqual(res1['state'], 'exited')
+            self.assertEqual(stat.S_IMODE((ws / '.local' / 'hub-results').stat().st_mode), 0o700)
+
+            res2 = d_ok.dispatch(offer(mode='headless', id='second-task-2', prompt='Second run'))
+            self.assertEqual(res2['state'], 'exited')
+            self.assertEqual(stat.S_IMODE((ws / '.local' / 'hub-results').stat().st_mode), 0o700)
 
     def test_task_assigned_empty_or_malformed_report_refuses_successful_result(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -634,22 +765,21 @@ class FleetTests(unittest.TestCase):
                         if 'plan' in argv:
                             return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol', 'task_fit': 1.0, 'account_label': 'shared-codex', 'profile': None}]}
                         if 'run' in argv:
+                            # Workload writes the result file during execution
+                            if is_symlink:
+                                target = Path(tmp) / 'real_result.json'
+                                target.write_text(file_content, encoding='utf-8')
+                                result_file.symlink_to(target)
+                            elif file_content is not None:
+                                result_file.write_text(file_content, encoding='utf-8')
                             return {'receipt': {'unit_name': 'headless-unit', 'exit_code': process_exit_code}}
                         return {}
 
                     d = fleet.Dispatcher(cfg, lambda *a: requests.append(a) or {}, runner)
 
-                    # Prepare result file
+                    # Ensure clean slate before dispatch
                     if result_file.is_symlink() or result_file.exists():
                         result_file.unlink()
-                    result_file.parent.mkdir(parents=True, exist_ok=True)
-
-                    if is_symlink:
-                        target = Path(tmp) / 'real_result.json'
-                        target.write_text(file_content, encoding='utf-8')
-                        result_file.symlink_to(target)
-                    elif file_content is not None:
-                        result_file.write_text(file_content, encoding='utf-8')
 
                     res = d.dispatch(assigned_offer)
                     self.assertEqual(res['state'], expected_status)
@@ -689,11 +819,12 @@ class FleetTests(unittest.TestCase):
             result_file.parent.mkdir(parents=True, exist_ok=True)
 
             task_id = f"hub-{offer_id}"
+            # Model ACTUAL normal headless Hub offer WITHOUT task_id
             payload = {
                 "owner": "hub-fleet",
                 "cwd": str(ws),
                 "timeout": 1800,
-                "goal": "Test goal",
+                "goal": f"Normal intake task\nWrite a final JSON object to {result_file}: ...",
                 "model_requirements": {"providers": ["antigravity"], "models": ["gemini-3.8-flash-high"]},
                 "account_label": "shared-antigravity",
                 "profile": "model-task",
