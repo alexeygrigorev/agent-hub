@@ -277,7 +277,7 @@ class TestRoleDispatchRecovery(unittest.TestCase):
         """Worker role interrupted after startACK is safely reattached by restarted dispatcher without duplicate claim or effect."""
         job_id = "job-worker-recover-101"
         client = ControlledMockJobsClient()
-        dummy_proc = self._make_dummy_worker_process()
+        dummy_proc = None
         try:
             native_sid = "55555555-5555-4555-8555-555555555555"
             task_id = f"hub-role-writer-run-{job_id}-g1-e1"
@@ -293,8 +293,7 @@ class TestRoleDispatchRecovery(unittest.TestCase):
                 runtime_mgr=runtime_mgr,
             )
 
-            cg_list = rld.read_proc_cgroups(dummy_proc.pid)
-            cgroup_path = cg_list[0][2] if cg_list else "/test.scope"
+            cgroup_path = "/test.scope"
             # Set up maintained store binding in mock backend
             binding_record = {
                 "session_id": native_sid,
@@ -302,7 +301,7 @@ class TestRoleDispatchRecovery(unittest.TestCase):
                 "workspace": str(self.workspace.resolve()),
                 "engine": "antigravity",
                 "created_at_ms": int(time.time() * 1000) - 2000,
-                "workload_pid": dummy_proc.pid,
+                "workload_pid": None,
                 "worker_pid": 999998,
                 "workload_cgroup": cgroup_path,
                 "containment_empty": False,
@@ -322,7 +321,7 @@ class TestRoleDispatchRecovery(unittest.TestCase):
                 "epoch": 1,
                 "role_name": f"automation:test:{job_id}",
                 "generation": 1,
-                "pid": dummy_proc.pid,
+                "pid": None,
                 "native_session": native_sid,
                 "stage": "first_action",
                 "utc": "2026-10-18T08:00:00Z",
@@ -332,6 +331,14 @@ class TestRoleDispatchRecovery(unittest.TestCase):
             worker_interrupt_event = threading.Event()
 
             def mock_backend_run(task_id, cwd, tmpdir=None, timeout_sec=1800.0):
+                nonlocal dummy_proc
+                # Start the fixture workload at the actual execution boundary so
+                # strict PID provenance is independent of setup duration.
+                dummy_proc = self._make_dummy_worker_process()
+                groups = rld.read_proc_cgroups(dummy_proc.pid)
+                binding_record.update(workload_pid=dummy_proc.pid,
+                                      workload_cgroup=groups[0][2] if groups else "/test.scope")
+                fa_data["pid"] = dummy_proc.pid
                 run_dir.mkdir(parents=True, exist_ok=True)
                 first_action_file.write_text(json.dumps(fa_data), encoding="utf-8")
                 # Block until dispatcher d1 is interrupted/stopped
@@ -458,8 +465,9 @@ class TestRoleDispatchRecovery(unittest.TestCase):
             self.assertFalse(custody_file.exists())
             self.assertFalse((runs_dir / f"active-role-{job_id}.json").exists())
         finally:
-            dummy_proc.kill()
-            dummy_proc.wait()
+            if dummy_proc is not None:
+                dummy_proc.kill()
+                dummy_proc.wait()
 
     def test_interrupted_reviewer_recovery_after_start_ack(self):
         """Reviewer role (head-recovery) interrupted after startACK is safely recovered by restarted dispatcher."""
