@@ -1310,6 +1310,11 @@ class RoleRun:
 
         goal = (
             f"Role execution for {self.kind} ({self.role_name}, generation {self.role_generation}, epoch {self.lease_epoch}).\n\n"
+            "Worker rules: after genuine first-action proof, read the applicable AGENTS.md and check your native inbox. "
+            "Never post to public channels or groups, publish secrets, purchase services, or change global installations. "
+            "Preserve other agents' work, services, histories and worktrees. Do not launch unrelated sessions, control "
+            "foreign sessions, or edit unrelated source without separate authorization. Keep reports and outcome "
+            "artifacts within the configured workspace or trusted run directory.\n\n"
             f"Job parameters: {json.dumps(clean_payload)}\n\n"
             f"TRUSTED BOOTSTRAP PROTOCOL:\n"
             f"1. Role Bootstrap: write genuine role first-action evidence JSON to {self.first_action_file} with schema:\n"
