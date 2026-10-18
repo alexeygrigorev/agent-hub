@@ -567,17 +567,17 @@ export class StatusService {
    * machine via binding_json.native_id. Zero or ambiguous matches fail
    * closed without existence detail beyond the error code. */
   private resolveSessionByNative(machineId: string, nativeId: string): string {
-    const rows = this.rows('SELECT id, binding_json FROM session_control_sessions WHERE machine_id=? LIMIT 201', machineId);
-    const matches: string[] = [];
-    for (const row of rows) {
-      try {
-        const binding = row.binding_json ? JSON.parse(row.binding_json) : null;
-        if (binding && binding.native_id === nativeId && typeof row.id === 'string') matches.push(row.id);
-      } catch { /* malformed binding never matches */ }
-    }
+    // Bound the matching result, not the machine's unrelated session history.
+    // CASE keeps malformed historical JSON from breaking a valid observation.
+    const matches = this.rows(`SELECT id FROM session_control_sessions
+      WHERE machine_id=? AND
+        CASE WHEN json_valid(binding_json) THEN
+          CASE WHEN json_type(binding_json, '$.native_id') = 'text'
+            THEN json_extract(binding_json, '$.native_id') END END = ?
+      LIMIT 2`, machineId, nativeId);
     if (!matches.length) fail('unknown_session', 404);
-    if (matches.length > 1 || rows.length > 200) fail('ambiguous_binding', 409);
-    return matches[0];
+    if (matches.length > 1) fail('ambiguous_binding', 409);
+    return matches[0].id;
   }
 
   /** Latest observation per (hub session, kind) for visible sessions only.

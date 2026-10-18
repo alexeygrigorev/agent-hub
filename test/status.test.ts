@@ -403,6 +403,38 @@ describe('M14b slice2 machine-authenticated host observations', () => {
     expect(ambiguous.status).toBe(409);
   });
 
+  it('resolves a unique native binding beyond 200 machine sessions while retaining duplicate and machine checks', async () => {
+    const host = await seedHostMachine('host-many', 'hubt_obs_fixture_many');
+    await seedLinkedTask('host-many', 'native-many-target');
+    await inDO(stub(), (h: any) => {
+      const now = new Date().toISOString();
+      const insert = (id: string, machine: string, binding: string | null) => h.sql.exec(
+        'INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+        id, 'demo:assistant', 'many-' + id, '{}', null, machine, 'opencode', 'headless', 'stopped', binding, now, now);
+      for (let i = 0; i < 240; i++) {
+        insert('many-' + i, 'host-many', i === 0 ? '{malformed' : i === 1 ? null : JSON.stringify({ native_id: 'unrelated-' + i }));
+      }
+      insert('foreign-many', 'another-machine', JSON.stringify({ native_id: 'native-many-target' }));
+      insert('array-many', 'host-many', JSON.stringify({ native_id: ['array-native'] }));
+      insert('number-many', 'host-many', JSON.stringify({ native_id: 12345 }));
+      // Place the only valid target after the unrelated history in row order.
+      h.sql.exec('UPDATE session_control_sessions SET binding_json=? WHERE id=?',
+        JSON.stringify({ native_id: 'old-many-target' }), HUB_SESSION);
+      insert('77777777-7777-4777-8777-777777777777', 'host-many', JSON.stringify({ native_id: 'native-many-target' }));
+    });
+    const body = { machine_id: 'host-many', native_id: 'native-many-target', kind: 'session',
+      observed_at: freshAt(), payload: { state: 'working' } };
+    expect((await obsOk(body, host.token)).hub_session_id).toBe('77777777-7777-4777-8777-777777777777');
+    expect((await obsCall({ ...body, native_id: 'absent-many' }, host.token)).status).toBe(404);
+    expect((await obsCall({ ...body, native_id: '["array-native"]' }, host.token)).status).toBe(404);
+    expect((await obsCall({ ...body, native_id: '12345' }, host.token)).status).toBe(404);
+    await inDO(stub(), (h: any) => {
+      h.sql.exec('UPDATE session_control_sessions SET binding_json=? WHERE id=?',
+        JSON.stringify({ native_id: 'native-many-target' }), HUB_SESSION);
+    });
+    expect((await obsCall(body, host.token)).status).toBe(409);
+  });
+
   it('rejects forged machines, unknown sessions, bad payloads and non-host callers', async () => {
     const host = await seedHostMachine('host-guard', 'hubt_obs_fixture_token_3');
     await seedHostMachine('host-other', 'hubt_obs_fixture_token_4');
