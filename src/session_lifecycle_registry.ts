@@ -66,6 +66,7 @@ export type LifecycleRefs = {
   starter: string | null;
   owner: string | null;
   human_owned: boolean;
+  protected_session: boolean;
   task_refs: string[];
   report_refs: string[];
   has_brief: boolean;
@@ -324,6 +325,11 @@ function checkObservationPayload(input: any): { ok: true; stored: Record<string,
  * from canonical rows; observations supply host-verified flags only. */
 export function buildSessionInputs(sql: SqlStorage): { inputs: SessionInput[]; refs: Map<string, LifecycleRefs> } {
   const observations = observationsByKey(sql);
+  const protectedSessions = new Set<string>();
+  let protectionKnown = true;
+  try {
+    for (const row of sql.exec('SELECT session_id FROM session_control_protections').toArray() as any[]) protectedSessions.add(row.session_id);
+  } catch { protectionKnown = false; }
   const inputs: SessionInput[] = [];
   const refs = new Map<string, LifecycleRefs>();
   for (const base of joinedBases(sql)) {
@@ -334,6 +340,32 @@ export function buildSessionInputs(sql: SqlStorage): { inputs: SessionInput[]; r
       null;
     const requesterKind: string | null = base.launch?.requester_kind ?? null;
     const human_owned = isHumanStarter(starter, requesterKind);
+    // Human creation alone does not make a worker a human workload. Only
+    // positively corroborated, Hub-managed headless work may cross this
+    // boundary; interactive, observed, contradictory and legacy rows stay
+    // protected. Neither observations nor caller-supplied labels can clear it.
+    const binding = parsed(base.sc?.binding_json, null);
+    let creator: any = null;
+    if (base.sc?.owner_token_id) {
+      try { creator = sql.exec('SELECT kind, actor, subject, created_by_sub, family_id FROM credentials WHERE id = ?', base.sc.owner_token_id).toArray()[0]; } catch {}
+    }
+    const humanCreatorKnown = creator?.kind === 'human' && creator.actor === base.sc?.actor &&
+      creator.actor?.startsWith('human:') && creator.created_by_sub === creator.actor.slice(6) &&
+      typeof creator.subject === 'string' && !!creator.subject && typeof creator.family_id === 'string' && !!creator.family_id &&
+      (!base.sc?.owner_family || base.sc.owner_family === creator.family_id);
+    const humanHeadlessWorker = !!base.sc && !!base.launch &&
+      humanCreatorKnown &&
+      base.sc.mode === 'headless' && base.sc.session_type === 'headless' &&
+      request.provenance !== 'observed_native' && base.launch.mode === 'headless' &&
+      base.launch.requester_kind === 'human' && base.launch.actor === base.sc.actor &&
+      starter === base.sc.actor && base.sc.fleet_launch_id === base.launch.id &&
+      base.launch.machine_id === base.sc.machine_id && base.launch.native_id === base.native_id &&
+      binding?.native_id === base.native_id && typeof binding.workspace === 'string' && !!binding.workspace &&
+      Number.isFinite(binding.native_created_at_ms) && binding.native_created_at_ms > 0 &&
+      (!base.fleet?.workspace || base.fleet.workspace === binding.workspace) &&
+      (!base.fleet?.tag || base.fleet.tag === binding.tag);
+    const protected_session = !protectionKnown || protectedSessions.has(base.sc?.id) ||
+      (human_owned && !humanHeadlessWorker);
     const stored = base.key ? parsed(observations.get(base.key)?.payload_json, {}) ?? {} : {};
     const obs: Record<string, unknown> = {};
     for (const key of [...BOOL_FLAGS, ...TEXT_FLAGS]) {
@@ -374,6 +406,7 @@ export function buildSessionInputs(sql: SqlStorage): { inputs: SessionInput[]; r
       starter,
       owner: starter,
       human_owned,
+      protected_session,
       task_refs: links.task_refs,
       report_refs: links.report_refs,
       has_brief: typeof request.brief === 'string' || typeof base.launch?.prompt === 'string',
@@ -573,6 +606,7 @@ export function collectCleanupEligible(
       ...classified,
       owner: candidate.owner ?? null,
       human_owned: Boolean(candidate.human_owned),
+      protected_session: refs.get(classified.session_key)?.protected_session ?? true,
       pending_obligations: classified.obligations.length > 0,
     };
   });

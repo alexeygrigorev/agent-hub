@@ -59,6 +59,7 @@
   "sessions host-receive",
   "sessions list",
   "sessions observe",
+  "sessions protect",
   "sessions send",
   "sessions show",
   "sessions start",

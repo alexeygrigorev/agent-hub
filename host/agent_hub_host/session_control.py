@@ -283,6 +283,9 @@ def add_commands(sub):
     cancel = commands.add_parser('cancel', help='Cancel an owned held intent that never reached Fleet; does not stop native sessions')
     cancel.add_argument('id')
     cancel.add_argument('--key', required=True, help='Stable cancellation key, reused exactly after a lost response')
+    protect = commands.add_parser('protect', help='Permanently protect an owned session from automated cleanup; never stops it')
+    protect.add_argument('id')
+    protect.add_argument('--key', required=True, help='Stable protection key; this operation has no unprotect counterpart')
     show = commands.add_parser('show', help='Show one session with its binding state')
     show.add_argument('id')
     history = commands.add_parser('commands', help='List durable commands with recorded/transported/acked states')
@@ -467,13 +470,13 @@ def execute(args):
         if timeout is not None:
             created['binding_wait'] = wait_for_session(created['id'], timeout, interval)
         return created
-    if cmd == 'cancel':
+    if cmd in ('cancel', 'protect'):
         from urllib.parse import quote
         if not isinstance(args.id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', args.id):
             raise ValueError('Invalid session id or name')
         if not isinstance(args.key, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', args.key):
-            raise ValueError('Invalid cancellation key')
-        return request('POST', '/api/sessions/' + quote(args.id, safe='') + '/cancel', {'key': args.key})
+            raise ValueError('Invalid protection key' if cmd == 'protect' else 'Invalid cancellation key')
+        return request('POST', '/api/sessions/' + quote(args.id, safe='') + '/' + cmd, {'key': args.key})
     if cmd in ('send', 'capture', 'stop'):
         key = getattr(args, 'key', None) or str(uuid.uuid4())
         if cmd == 'send':

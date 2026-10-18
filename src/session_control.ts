@@ -41,6 +41,7 @@ export const SESSION_CONTROL_SCHEMA = `
 CREATE TABLE IF NOT EXISTS session_control_sessions (id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, fleet_launch_id TEXT, machine_id TEXT, engine TEXT, mode TEXT NOT NULL, state TEXT NOT NULL, binding_json TEXT, parent_id TEXT, parent_source TEXT, session_type TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
 CREATE TABLE IF NOT EXISTS session_control_commands (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, request_key TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, correlation TEXT NOT NULL, poll_at TEXT, ack_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(session_id, actor, request_key));
 CREATE TABLE IF NOT EXISTS session_control_cancellations (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_control_protections (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_control_proofs (reply_envelope_id TEXT PRIMARY KEY, command_id TEXT NOT NULL, session_id TEXT NOT NULL, created_at TEXT NOT NULL);
 `;
 
@@ -274,6 +275,60 @@ export class SessionControlService {
       Array.isArray(scopes) && scopes.includes('fleet:launch') && credentialActor(this.sql, cred) === caller.actor;
   }
 
+  /** Cleanup authority never inherits the general admin bypass. A current
+   * credential family and immutable creator provenance identify custody. */
+  private cleanupCredential(cred: any): { cred: any; actor: string; family: string; sub?: string; email?: string } | null {
+    if (!cred || typeof cred.family_id !== 'string' || !cred.family_id) return null;
+    if (cred.kind === 'human') {
+      const human = validateHumanCredentialRecord(this.sql, this.options.env, cred, this.now());
+      return human ? { cred, actor: human.actor, family: cred.family_id, sub: human.sub, email: human.email } : null;
+    }
+    if (cred.kind !== 'agent' || cred.revoked_at || !(Date.parse(cred.expires_at) > this.now())) return null;
+    const scopes = parsed(cred.scopes, null);
+    const actor = credentialActor(this.sql, cred);
+    return actor && Array.isArray(scopes) && scopes.includes('fleet:launch')
+      ? { cred, actor, family: cred.family_id } : null;
+  }
+
+  private cleanupOwnerCredential(session: any, live: NonNullable<ReturnType<SessionControlService['cleanupCredential']>>): boolean {
+    if (!session || session.actor !== live.actor) return false;
+    if (live.cred.kind === 'agent') {
+      return session.owner_family ? session.owner_family === live.family : session.owner_token_id === live.cred.id;
+    }
+    if (!session.owner_token_id) return false;
+    const creator: any = this.sql.exec('SELECT * FROM credentials WHERE id = ?', session.owner_token_id).toArray()[0];
+    // The original token may be revoked by ordinary refresh. Its immutable
+    // provenance remains evidence; the CURRENT family member is validated
+    // independently above. Missing or contradictory provenance fails closed.
+    return !!creator && creator.kind === 'human' && creator.actor === session.actor &&
+      creator.created_by_sub === live.sub && typeof creator.subject === 'string' &&
+      creator.subject.toLowerCase() === live.email?.toLowerCase() &&
+      creator.family_id === live.family && (!session.owner_family || session.owner_family === live.family);
+  }
+
+  private cleanupOwnerOk(session: any, caller: Caller): boolean {
+    if (!caller.tokenId || !caller.actor || session?.actor !== caller.actor) return false;
+    const cred: any = this.sql.exec('SELECT * FROM credentials WHERE id = ?', caller.tokenId).toArray()[0];
+    const live = this.cleanupCredential(cred);
+    return !!live && live.actor === caller.actor && live.cred.kind === caller.kind && this.cleanupOwnerCredential(session, live);
+  }
+
+  private cleanupCallerLive(caller: Caller): boolean {
+    if (!caller.tokenId) return false;
+    const cred: any = this.sql.exec('SELECT * FROM credentials WHERE id = ?', caller.tokenId).toArray()[0];
+    const live = this.cleanupCredential(cred);
+    return !!live && live.actor === caller.actor && cred.kind === caller.kind;
+  }
+
+  private cleanupCommandOwnerLive(row: any, session: any): boolean {
+    if (!row.owner_family || row.actor !== session?.actor) return false;
+    for (const cred of this.sql.exec('SELECT * FROM credentials WHERE family_id = ?', row.owner_family).toArray() as any[]) {
+      const live = this.cleanupCredential(cred);
+      if (live && live.actor === row.actor && this.cleanupOwnerCredential(session, live)) return true;
+    }
+    return false;
+  }
+
   private ownerOk(row: { actor: string; owner_token_id?: string | null; owner_family?: string | null }, caller: Caller): boolean {
     if (caller.isAdmin === true) return true;
     if (!caller.actor || row.actor !== caller.actor) return false;
@@ -407,13 +462,14 @@ export class SessionControlService {
   private cleanupAuthorized(row: any, session: any): boolean {
     if (!this.cleanupStored(row)) return false;
     if (!session || session.actor !== row.actor) return false;
+    if (!this.cleanupCommandOwnerLive(row, session)) return false;
     const binding = session.binding_json ? parsed(session.binding_json, null) : null;
     if (!binding || typeof binding.native_id !== 'string' || !binding.native_id) return false;
     if (!session.machine_id) return false;
     try {
       const live = classifyKey(this.sql, `${session.machine_id}/${binding.native_id}`, this.now());
       if (!live) return false;
-      if (live.refs?.human_owned) return false;
+      if (live.refs?.protected_session) return false;
       if (live.group !== 'finished_stale') return false;
       if (!['finished', 'superseded'].includes((live as any).state)) return false;
       if (((live as any).obligations?.length ?? 0) > 0) return false;
@@ -426,6 +482,7 @@ export class SessionControlService {
 
   private view(row: any) {
     const request = parsed(row.request_json, {});
+    const protection: any = this.sql.exec('SELECT request_key, created_at FROM session_control_protections WHERE session_id = ?', row.id).toArray()[0];
     const binding = row.binding_json ? parsed(row.binding_json, null) : null;
     const isObserved = (row.actor === 'unknown' || request.provenance === 'observed_native') && !row.fleet_launch_id;
     const provenance = isObserved ? 'observed_native' : 'canonical_hub';
@@ -447,6 +504,7 @@ export class SessionControlService {
       // actor-scoped exact-name alias where explicitly resolved below.
       name: typeof request.name === 'string' ? request.name : null,
       fleet_launch_id: row.fleet_launch_id ?? null,
+      cleanup_protection: protection ? { key: protection.request_key, created_at: protection.created_at, permanent: true } : null,
       binding,
       provenance,
       controllability,
@@ -842,7 +900,11 @@ export class SessionControlService {
         // create a session row (or stamp a NULL family). Admins bypass; every
         // other creator needs a live agent incarnation in a live family.
         let creatorFamily: string | null = null;
-        if (!admin) {
+        if (admin && caller.kind === 'human' && caller.tokenId) {
+          if (!this.cleanupCallerLive(caller)) return response({ error: 'forbidden' }, 403);
+          creatorFamily = this.presentingFamily(caller);
+          if (!creatorFamily) return response({ error: 'forbidden' }, 403);
+        } else if (!admin) {
           if (!this.agentLive(caller)) return response({ error: 'forbidden' }, 403);
           creatorFamily = this.presentingFamily(caller);
           if (!creatorFamily) return response({ error: 'forbidden' }, 403);
@@ -1033,7 +1095,7 @@ export class SessionControlService {
       // stop intent replays (never duplicates), and every kept target
       // reports its actual reason. No pretend success anywhere.
       if (input && (input as any).apply === true) {
-        if (admin) return response({ error: 'not_found' }, 404);
+        if (admin && !caller.tokenId) return response({ error: 'not_found' }, 404);
         const rawKey = (input as any).key;
         if (rawKey !== undefined && (typeof rawKey !== 'string' || !label(rawKey))) {
           return response({ error: 'invalid_cleanup_key' }, 400);
@@ -1059,12 +1121,12 @@ export class SessionControlService {
           keyMap.set(sid, await deriveCleanupSessionKey(operationKey, sid));
         }
         return this.transaction(() => {
-          if (!this.agentLive(caller)) return response({ error: 'forbidden' }, 403);
+          if (!this.cleanupCallerLive(caller)) return response({ error: 'forbidden' }, 403);
           const collected = collectCleanupEligible(this.sql, scope, callerOwner, this.now());
           const enqueued: { session_key: string; session_id: string; command_id: string; state: string; replay: boolean }[] = [];
           const refused = [...collected.ineligible];
           for (const target of collected.eligible) {
-            if (target.refs.human_owned) {
+            if (target.refs.protected_session) {
               refused.push({ key: target.session_key, reasons: ['human/Alexey session permanently protected'] });
               continue;
             }
@@ -1073,7 +1135,7 @@ export class SessionControlService {
             try {
               if (target.refs.session_id) {
                 live = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', target.refs.session_id).toArray()[0] ?? null;
-                ownerVerified = !!live && this.ownerOk(live, caller) && live.actor === caller.actor;
+                ownerVerified = !!live && this.cleanupOwnerOk(live, caller);
               } else if (target.refs.fleet_launch_id) {
                 const launch: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id = ?', target.refs.fleet_launch_id).toArray()[0];
                 ownerVerified = !!launch && !!caller.actor && launch.actor === caller.actor;
@@ -1161,7 +1223,16 @@ export class SessionControlService {
       const scope = admin
         ? { owner: scopeParam('owner'), host: scopeParam('host'), task: scopeParam('task') }
         : { owner: caller.actor ?? null, host: scopeParam('host'), task: scopeParam('task') };
-      return response(planCleanupDryRun(this.sql, scope, caller.actor ?? '', this.now()));
+      return this.transaction(() => {
+        const plan = planCleanupDryRun(this.sql, scope, caller.actor ?? '', this.now());
+        plan.eligible = plan.eligible.filter(target => {
+          const row: any = target.refs.session_id ? this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', target.refs.session_id).toArray()[0] : null;
+          if (row && this.cleanupOwnerOk(row, caller)) return true;
+          plan.ineligible.push({ key: target.session_key, reasons: ['not owned by current credential family'] });
+          return false;
+        });
+        return response(plan);
+      });
     }
 
     if (path === '/api/sessions/host-adoption' && request.method === 'POST') {
@@ -1178,7 +1249,7 @@ export class SessionControlService {
       });
     }
 
-    const sessionMatch = /^\/api\/sessions\/([^/]{1,128})(\/(send|capture|stop|commands|binding|retry|cancel))?$/.exec(path);
+    const sessionMatch = /^\/api\/sessions\/([^/]{1,128})(\/(send|capture|stop|commands|binding|retry|cancel|protect))?$/.exec(path);
     if (sessionMatch) {
       const rawRef = decodeURIComponent(sessionMatch[1]);
       const sub = sessionMatch[3];
@@ -1200,7 +1271,7 @@ export class SessionControlService {
       } else if (rawRef.includes(':')) {
         if (sub === 'binding') return response({ error: 'not_found' }, 404);
         if ((sub === undefined && request.method !== 'GET') ||
-            (sub !== undefined && !(['send', 'capture', 'stop', 'cancel'].includes(sub) ? request.method === 'POST' : request.method === 'GET'))) {
+            (sub !== undefined && !(['send', 'capture', 'stop', 'cancel', 'protect'].includes(sub) ? request.method === 'POST' : request.method === 'GET'))) {
           return response({ error: 'not_found' }, 404);
         }
         const resolved = this.resolveSessionByQualifiedAlias(rawRef, caller);
@@ -1213,7 +1284,7 @@ export class SessionControlService {
         // binding path stays strict Hub UUID (no alias).
         if (sub === 'binding') return response({ error: 'not_found' }, 404);
         if ((sub === undefined && request.method !== 'GET') ||
-            (sub !== undefined && !(['send', 'capture', 'stop', 'cancel'].includes(sub) ? request.method === 'POST' : request.method === 'GET'))) {
+            (sub !== undefined && !(['send', 'capture', 'stop', 'cancel', 'protect'].includes(sub) ? request.method === 'POST' : request.method === 'GET'))) {
           return response({ error: 'not_found' }, 404);
         }
         const resolved = this.resolveSessionByName(rawRef, caller);
@@ -1254,6 +1325,21 @@ export class SessionControlService {
       }
       if (!session || !this.ownerOk(session, caller)) return response({ error: 'not_found' }, 404);
       if (!sub && request.method === 'GET') return response(this.view(session));
+      if (sub === 'protect' && request.method === 'POST') {
+        const input = await body(request);
+        if (!obj(input, ['key']) || !label(input.key)) return response({ error: 'invalid_protection' }, 400);
+        return this.transaction(() => {
+          const live: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0];
+          if (!writer || !live || !this.cleanupOwnerOk(live, caller)) return response({ error: 'not_found' }, 404);
+          const prior: any = this.sql.exec('SELECT * FROM session_control_protections WHERE session_id = ?', live.id).toArray()[0];
+          if (prior) {
+            if (prior.actor !== caller.actor || prior.request_key !== input.key) return response({ error: 'idempotency_conflict' }, 409);
+            return response({ ...this.view(live), replay: true });
+          }
+          this.sql.exec('INSERT INTO session_control_protections (session_id, actor, request_key, created_at) VALUES (?, ?, ?, ?)', live.id, caller.actor!, input.key, this.at());
+          return response({ ...this.view(live), replay: false });
+        });
+      }
       if (sub === 'cancel' && request.method === 'POST') {
         const input = await body(request);
         if (!obj(input, ['key']) || !label(input.key)) return response({ error: 'invalid_cancel' }, 400);
@@ -1610,6 +1696,11 @@ export class SessionControlService {
             tree = { state: 'kept', reason: `not_cleanup_authorized: ordinary stop never authorizes a tree (host reported ${input.tree.state})`.slice(0, 300) };
           } else if (session.actor !== row.actor) {
             tree = { state: 'kept', reason: `ownership_changed: session owner drifted since enqueue; listed-only (host reported ${input.tree.state})`.slice(0, 300) };
+          } else if (!this.cleanupAuthorized(row, session)) {
+            // Revocation/protection after a claim cannot undo an effect.
+            // Preserve uncertainty if a host reports removal after authority
+            // changed; never label that report a confirmed authorized cleanup.
+            tree = { state: input.tree.state === 'removed' ? 'uncertain' : 'kept', reason: `cleanup_authority_changed: host reported ${input.tree.state}` };
           }
         }
         if (input.outcome === 'delivered' && row.kind === 'send') {

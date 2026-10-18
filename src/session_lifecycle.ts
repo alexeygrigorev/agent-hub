@@ -333,6 +333,9 @@ export function projectSessions(
 export type CleanupCandidate = ClassifiedSession & {
   owner: string | null;
   human_owned: boolean;
+  /** Canonical workload protection, separate from the creator's identity.
+   * Absent for legacy callers, which retain human-owned protection. */
+  protected_session?: boolean;
   pending_obligations: boolean;
 };
 
@@ -356,7 +359,7 @@ export function planCleanup(
   const ineligible: { key: string; reasons: string[] }[] = [];
   for (const c of candidates) {
     const blockers: string[] = [];
-    if (c.human_owned) blockers.push('human/Alexey session permanently protected');
+    if (c.protected_session ?? c.human_owned) blockers.push('human/Alexey session permanently protected');
     if (isBadOwnerValue(callerOwner)) blockers.push('caller owner unknown/empty; cannot authorize cleanup');
     if ((c.owner ?? null) !== callerOwner) blockers.push('not owned by caller (admin is not ownership)');
     if (isBadOwnerValue(c.owner)) {

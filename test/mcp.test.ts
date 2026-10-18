@@ -117,6 +117,22 @@ describe('Hub MCP protocol and parity', () => {
     expect(JSON.parse(second.result.content[0].text).data.replay).toBe(true);
     expect(publicTools().find(t => t.name==='sessions_cancel')?.annotations.destructiveHint).toBe(true);
   });
+  it('protects an owned session through the real MCP route with a durable replay', async () => {
+    const id = crypto.randomUUID();
+    await inHub(h => {
+      const now = new Date().toISOString();
+      h.sql.exec(`INSERT INTO session_control_sessions (id,actor,request_key,request_json,mode,state,owner_token_id,created_at,updated_at)
+        VALUES (?,?,'mcp-protect-fixture','{"workspace":"mcp-fixture"}','interactive','held','mcp-test-human',?,?)`,id,'human:'+sub,now,now);
+    });
+    const params = {name:'sessions_protect',arguments:{id,payload:{key:'mcp-protect-once'}}};
+    const first:any = await(await rpc('tools/call',params)).json();
+    expect(first.result.isError).toBe(false);
+    const receipt=JSON.parse(first.result.content[0].text).data.cleanup_protection;
+    expect(receipt.permanent).toBe(true);
+    const replay:any=await(await rpc('tools/call',params)).json();
+    expect(JSON.parse(replay.result.content[0].text).data.cleanup_protection).toEqual(receipt);
+    expect(JSON.parse(replay.result.content[0].text).data.replay).toBe(true);
+  });
   it('legacy launch tools retain their CLI mode semantics', async () => {
     const r = toolRequest(origin, 'start_session', { payload: { workspace: 'x', machine: 'm' } }, 'Bearer x');
     expect((await r.json() as any).mode).toBe('interactive');

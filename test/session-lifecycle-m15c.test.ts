@@ -35,12 +35,13 @@ function fakeReserve() {
   } };
 }
 
-async function fixture(fn: (s: SessionControlService, sql: any) => Promise<void>) {
+async function fixture(fn: (s: SessionControlService, sql: any, serviceEnv: Env) => Promise<void>) {
   const bindings = env as unknown as Env;
   const stub = bindings.HUB.get(bindings.HUB.idFromName('session-lifecycle-m15c-' + crypto.randomUUID()));
   await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
     const reserve = fakeReserve();
-    const service = new SessionControlService(hub.sql, (cb) => state.storage.transactionSync(cb), Date.now, { reserve: reserve.hook });
+    const serviceEnv = { ...bindings, HUB_ADMINS: 'admin@fake.local' } as Env;
+    const service = new SessionControlService(hub.sql, (cb) => state.storage.transactionSync(cb), Date.now, { reserve: reserve.hook }, { env: serviceEnv });
     service.init();
     const at = new Date().toISOString();
     const far = new Date(Date.now() + 30 * 86400000).toISOString();
@@ -53,7 +54,7 @@ async function fixture(fn: (s: SessionControlService, sql: any) => Promise<void>
     hub.sql.exec(`INSERT OR IGNORE INTO agents (tag, project, role, machine_id, registered_at) VALUES ('assistant', 'other', 'worker', NULL, ?)`, at);
     hub.sql.exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, registry_actor)
       VALUES ('cred-2', 'agent', 'hash-cred-2', 'refresh-cred-2', 'agent-family-2', 'other-agent', NULL, 'other:assistant', '["fleet:launch"]', 'test', ?, ?, 'other:assistant')`, at, far);
-    await fn(service, hub.sql);
+    await fn(service, hub.sql, serviceEnv);
   });
 }
 
@@ -92,6 +93,134 @@ async function lifecycle(s: SessionControlService, auth: any, query = '') {
   const data = await res.json() as any;
   return { res, data };
 }
+
+const human = (tokenId = 'cleanup-human-1') => ({ caller: { kind: 'human', isAdmin: true, actor: 'human:cleanup-owner', tokenId }, scopes: ['admin'] });
+function seedHuman(sql: any, id = 'cleanup-human-1', family = 'cleanup-human-family') {
+  const at = new Date().toISOString();
+  sql.exec('INSERT OR IGNORE INTO users (sub,email,is_admin,first_seen_at,last_seen_at) VALUES (?,?,1,?,?)', 'cleanup-owner', 'admin@fake.local', at, at);
+  sql.exec(`INSERT INTO credentials (id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at)
+    VALUES (?,'human',?,?,'admin@fake.local','human:cleanup-owner','["admin"]','cleanup-owner',?,?)`, id, 'hash-'+id, family, at, new Date(Date.now()+3600000).toISOString());
+}
+async function humanWorker(s: SessionControlService, sql: any, mode = 'headless') {
+  seedHuman(sql);
+  const res = await s.handle(request('/api/sessions', {key:'human-worker',workspace:'demo',mode,name:'owned-human-worker'}), human());
+  expect(res.status, await res.clone().text()).toBe(201);
+  const created = await res.json() as any;
+  ensureFleetLaunch(sql, 'launch-1');
+  sql.exec("UPDATE fleet_launches SET actor='human:cleanup-owner', requester_kind='human' WHERE id='launch-1'");
+  reportFleetSession(sql, 'hetzner', NATIVE_ID, canonTag('launch-1'), NATIVE_WS);
+  expect((await s.handle(request(`/api/sessions/${created.id}/binding`, {native:{native_id:NATIVE_ID,tag:canonTag('launch-1'),workspace:NATIVE_WS,native_created_at_ms:NATIVE_CREATED}}), host('hetzner'))).status).toBe(200);
+  const at = new Date().toISOString();
+  expect((await s.handle(request('/api/sessions/observations', {machine_id:'hetzner',native_id:NATIVE_ID,payload:{report_written:true,report_at:at,screen_done:true,authoritative_no_pending_proof:true}}),host('hetzner'))).status).toBe(201);
+  return created;
+}
+async function humanPlan(s: SessionControlService, auth = human()) {
+  return (await s.handle(request('/api/sessions/cleanup',{dry_run:true}),auth)).json() as Promise<any>;
+}
+
+describe('human worker cleanup custody and explicit protection', () => {
+  it('distinguishes a human creator from a protected human workload and stamps exact-family commands', async () => fixture(async (s,sql) => {
+    const created = await humanWorker(s,sql);
+    const original: any = sql.exec('SELECT * FROM session_control_sessions WHERE id=?',created.id).toArray()[0];
+    expect(original.owner_family).toBe('cleanup-human-family');
+    const plan = await humanPlan(s);
+    expect(plan.eligible).toHaveLength(1);
+    expect(plan.eligible[0].refs.human_owned).toBe(true);
+    expect(plan.eligible[0].refs.protected_session).toBe(false);
+    const applied: any = await (await s.handle(request('/api/sessions/cleanup',{apply:true,key:'human-cleanup'}),human())).json();
+    expect(applied.enqueued).toHaveLength(1);
+    const command: any = sql.exec('SELECT * FROM session_control_commands WHERE id=?',applied.enqueued[0].command_id).toArray()[0];
+    expect(command.owner_family).toBe('cleanup-human-family');
+    const claim = await s.handle(request(`/api/session-commands/${command.id}/claim`,{correlation:command.correlation,attempt_id:crypto.randomUUID()}),host('hetzner'));
+    expect(claim.status,await claim.clone().text()).toBe(200);
+    expect((await claim.json() as any).cleanup_tree).toBe(true);
+  }));
+
+  it('refuses the same actor from another family and retains immutable creator provenance across refresh', async () => fixture(async (s,sql) => {
+    const created = await humanWorker(s,sql);
+    seedHuman(sql,'cleanup-other-family','different-family');
+    expect((await humanPlan(s,human('cleanup-other-family'))).eligible).toEqual([]);
+    const refused: any = await (await s.handle(request('/api/sessions/cleanup',{apply:true,key:'foreign-family'}),human('cleanup-other-family'))).json();
+    expect(refused.enqueued).toEqual([]);
+    seedHuman(sql,'cleanup-rotated');
+    sql.exec('UPDATE credentials SET revoked_at=? WHERE id=?',new Date().toISOString(),'cleanup-human-1');
+    // A pre-family-column session still has independently verifiable creator provenance.
+    sql.exec('UPDATE session_control_sessions SET owner_family=NULL WHERE id=?',created.id);
+    expect((await humanPlan(s,human('cleanup-rotated'))).eligible).toHaveLength(1);
+    expect(sql.exec('SELECT owner_token_id FROM session_control_sessions WHERE id=?',created.id).toArray()[0].owner_token_id).toBe('cleanup-human-1');
+    const applied:any = await(await s.handle(request('/api/sessions/cleanup',{apply:true,key:'refreshed-family'}),human('cleanup-rotated'))).json();
+    const command:any = sql.exec('SELECT * FROM session_control_commands WHERE id=?',applied.enqueued[0].command_id).toArray()[0];
+    const claimed = await s.handle(request(`/api/session-commands/${command.id}/claim`,{correlation:command.correlation,attempt_id:crypto.randomUUID()}),host('hetzner'));
+    expect(claimed.status,await claimed.clone().text()).toBe(200);
+    expect((await claimed.json()as any).cleanup_tree).toBe(true);
+    sql.exec('DELETE FROM credentials WHERE id=?','cleanup-human-1');
+    expect((await humanPlan(s,human('cleanup-rotated'))).eligible).toEqual([]);
+  }));
+
+  it('keeps interactive and contradictory headless workloads protected', async () => {
+    for (const change of ['interactive','fleet-mode','native-id','session-type']) await fixture(async (s,sql) => {
+      const created = await humanWorker(s,sql,change==='interactive'?'interactive':'headless');
+      if(change==='fleet-mode')sql.exec("UPDATE fleet_launches SET mode='interactive' WHERE id='launch-1'");
+      if(change==='native-id')sql.exec("UPDATE fleet_launches SET native_id='another-native' WHERE id='launch-1'");
+      if(change==='session-type')sql.exec('UPDATE session_control_sessions SET session_type=NULL WHERE id=?',created.id);
+      expect((await humanPlan(s)).eligible).toEqual([]);
+    });
+  });
+
+  it('protects by actual name, replays the receipt and never accepts an observation downgrade', async () => fixture(async (s,sql) => {
+    const created = await humanWorker(s,sql);
+    const first = await s.handle(request('/api/sessions/owned-human-worker/protect',{key:'alexey-protected'}),human());
+    expect(first.status).toBe(200);
+    const protection = (await first.json() as any).cleanup_protection;
+    expect(protection.permanent).toBe(true);
+    const replay: any = await (await s.handle(request(`/api/sessions/${created.id}/protect`,{key:'alexey-protected'}),human())).json();
+    expect(replay.replay).toBe(true);expect(replay.cleanup_protection).toEqual(protection);
+    expect((await s.handle(request(`/api/sessions/${created.id}/protect`,{key:'other-key'}),human())).status).toBe(409);
+    expect((await s.handle(request('/api/sessions/observations',{machine_id:'hetzner',native_id:NATIVE_ID,payload:{protected_session:false}}),host('hetzner'))).status).toBe(400);
+    expect((await s.handle(request(`/api/sessions/${created.id}/protect`,{key:'unprotect',protected:false}),human())).status).toBe(400);
+    expect((await humanPlan(s)).eligible).toEqual([]);
+  }));
+
+  it('rechecks current human authority after body streaming and again before a host claim', async () => {
+    for(const change of ['revoke','expire','disable','allowlist'])await fixture(async(s,sql,serviceEnv)=>{
+      await humanWorker(s,sql);
+      const mutate=()=>{
+        if(change==='revoke')sql.exec("UPDATE credentials SET revoked_at=? WHERE id='cleanup-human-1'",new Date().toISOString());
+        if(change==='expire')sql.exec("UPDATE credentials SET expires_at=? WHERE id='cleanup-human-1'",new Date(0).toISOString());
+        if(change==='disable')sql.exec("UPDATE users SET is_admin=0 WHERE sub='cleanup-owner'");
+        if(change==='allowlist')serviceEnv.HUB_ADMINS='other@fake.local';
+      };
+      let controller!: ReadableStreamDefaultController<Uint8Array>;
+      const stream=new ReadableStream<Uint8Array>({start(c){controller=c;}});
+      const pending=s.handle(new Request('https://hub.test/api/sessions/cleanup',{method:'POST',body:stream,duplex:'half'} as RequestInit),human());
+      await Promise.resolve();mutate();controller.enqueue(new TextEncoder().encode('{"apply":true,"key":"streamed"}'));controller.close();
+      expect((await pending).status).toBe(403);
+      expect(sql.exec('SELECT COUNT(*) AS n FROM session_control_commands').one().n).toBe(0);
+    });
+    await fixture(async(s,sql)=>{
+      await humanWorker(s,sql);
+      const applied: any=await(await s.handle(request('/api/sessions/cleanup',{apply:true,key:'revoke-before-claim'}),human())).json();
+      const command:any=sql.exec('SELECT * FROM session_control_commands WHERE id=?',applied.enqueued[0].command_id).toArray()[0];
+      sql.exec("UPDATE credentials SET revoked_at=? WHERE id='cleanup-human-1'",new Date().toISOString());
+      const claim=await s.handle(request(`/api/session-commands/${command.id}/claim`,{correlation:command.correlation,attempt_id:crypto.randomUUID()}),host('hetzner'));
+      expect(claim.status).toBe(409);
+      expect((await claim.json()as any).error).toBe('cleanup_not_eligible');
+    });
+  });
+
+  it('records uncertainty rather than an authorized removal if protection changes after claim', async()=>fixture(async(s,sql)=>{
+    const created=await humanWorker(s,sql);
+    const applied:any=await(await s.handle(request('/api/sessions/cleanup',{apply:true,key:'claimed-then-protected'}),human())).json();
+    const command:any=sql.exec('SELECT * FROM session_control_commands WHERE id=?',applied.enqueued[0].command_id).toArray()[0];
+    const claimed:any=await(await s.handle(request(`/api/session-commands/${command.id}/claim`,{correlation:command.correlation,attempt_id:crypto.randomUUID()}),host('hetzner'))).json();
+    expect(claimed.cleanup_tree).toBe(true);
+    expect((await s.handle(request(`/api/sessions/${created.id}/protect`,{key:'protected-after-claim'}),human())).status).toBe(200);
+    const ack=await s.handle(request(`/api/session-commands/${command.id}/ack`,{correlation:command.correlation,claim_token:claimed.claim_token,outcome:'delivered',confirmed_exit:true,native:{native_id:NATIVE_ID,tag:canonTag('launch-1'),workspace:NATIVE_WS},tree:{state:'removed',reason:'host-reported'}}),host('hetzner'));
+    expect(ack.status,await ack.clone().text()).toBe(200);
+    const stored=JSON.parse(sql.exec('SELECT ack_json FROM session_control_commands WHERE id=?',command.id).toArray()[0].ack_json);
+    expect(stored.tree.state).toBe('uncertain');expect(stored.tree.reason).toContain('authority_changed');
+  }));
+});
 
 describe('m15c lifecycle view', () => {
   it('requires writer auth and scopes non-admin callers to their own actor', async () => fixture(async (s) => {

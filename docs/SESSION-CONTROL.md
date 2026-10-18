@@ -520,3 +520,11 @@ Cancellation never stops a workload, removes a worktree or proves native exit.
 MCP exposes the same guarded operation as `sessions_cancel` with arguments
 `{"id":"SESSION","payload":{"key":"STABLE_KEY"}}`. It re-enters ordinary
 Hub authentication and returns the API cancellation receipt.
+
+### Protecting sessions and cleaning up human-created workers
+
+`hub sessions protect ID_OR_NAME --key KEY` permanently protects an owned session from automated cleanup. The same key replays its receipt; another key conflicts. There is no unprotect operation. MCP `sessions_protect` uses the same API. Protection never sends a prompt or stops a session. A host observation cannot clear it.
+
+A human-created headless worker may be eligible for cleanup when its canonical Hub intent, headless Fleet launch, exact native binding and original human credential provenance agree. Human ownership remains visible separately from workload protection. Interactive, observed, explicitly protected, contradictory and unknown human workloads stay protected. Completion, no pending obligations, containment, retention and clean/merged Git checks still apply.
+
+Cleanup requires a current credential from the creator's exact family, including after ordinary refresh. A different family with the same human actor has no cleanup authority. Older rows may recover family identity only from their immutable creator credential; missing provenance fails closed. Browser-only admin authority cannot establish individual family custody. The host claim repeats credential-family and protection checks. If authority changes after a claim and a host reports removal, the durable outcome records uncertainty rather than an authorized cleanup.
