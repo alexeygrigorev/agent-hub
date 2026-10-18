@@ -807,33 +807,40 @@ class TestRoleRealBackendAdapter(unittest.TestCase):
         )
         self.assertTrue(run.job_tmp_dir.resolve().is_relative_to(self.workspace.resolve() / ".local" / "tmp"))
 
-        # Launcher check_resources integration:
-        # Check that run.job_tmp_dir passes check_resources path guard under repo_root/.local/tmp,
-        # while passing run_dir/tmp fails because run_dir is not under workspace/.local/tmp.
-        import sys
-        if "/home/alexey/git/agent-quota-launcher" not in sys.path:
-            sys.path.insert(0, "/home/alexey/git/agent-quota-launcher")
-        from launcher.resources import check_resources
-        # Valid path under repo_root/.local/tmp
-        check_resources(
-            requested_memory_mb=100,
-            requested_cwd=str(self.workspace),
-            requested_tmpdir=str(run.job_tmp_dir),
-            repo_root=str(self.workspace),
-            ignore_ram=True,
-        )
-        # Invalid path outside repo_root/.local/tmp (the old buggy run_dir/tmp)
-        bad_tmp = self.state_dir / "runs" / run.job_id / "tmp"
-        bad_tmp.mkdir(parents=True, exist_ok=True)
-        with self.assertRaises(ValueError) as ctx:
+        # Cross-project integration is optional on CI, where this separate
+        # maintained checkout is absent. Keep the owned-path unit assertions
+        # above portable and report this subtest explicitly when unavailable.
+        launcher_root = pathlib.Path("/home/alexey/git/agent-quota-launcher")
+        with self.subTest(integration="maintained Launcher resource guard"):
+            if not (launcher_root / "launcher" / "resources.py").is_file():
+                self.skipTest("maintained Launcher checkout unavailable for cross-project integration")
+            import sys
+            original_path = list(sys.path)
+            # Never leave the Launcher's generic tests package ahead of the
+            # Hub fixtures: the required CI subset runs test_jobs afterwards.
+            with patch.object(sys, "path", [str(launcher_root), *sys.path]):
+                from launcher.resources import check_resources
+            self.assertEqual(sys.path, original_path)
+            # Valid path under repo_root/.local/tmp
             check_resources(
                 requested_memory_mb=100,
                 requested_cwd=str(self.workspace),
-                requested_tmpdir=str(bad_tmp),
+                requested_tmpdir=str(run.job_tmp_dir),
                 repo_root=str(self.workspace),
                 ignore_ram=True,
             )
-        self.assertIn("must resolve under owned", str(ctx.exception).lower())
+            # Invalid path outside repo_root/.local/tmp (the old buggy run_dir/tmp)
+            bad_tmp = self.state_dir / "runs" / run.job_id / "tmp"
+            bad_tmp.mkdir(parents=True, exist_ok=True)
+            with self.assertRaises(ValueError) as ctx:
+                check_resources(
+                    requested_memory_mb=100,
+                    requested_cwd=str(self.workspace),
+                    requested_tmpdir=str(bad_tmp),
+                    repo_root=str(self.workspace),
+                    ignore_ram=True,
+                )
+            self.assertIn("must resolve under owned", str(ctx.exception).lower())
 
     # 12. Role bootstrap goal, payload, and scrubbed tokens
     def test_bootstrap_goal_and_payload_composition(self):

@@ -169,3 +169,17 @@ Commands intentionally kept outside tools: `login`, `auth login/logout` manage t
 Run `TMPDIR="$HOME/tmp-root" scripts/test-full-local.sh` on Hetzner before a push. New protocol, OAuth, authorization and CLI parity tests are in `test/mcp.test.ts` and `test/test_mcp_parity.py`; the required deployment CI includes the MCP tests. The Worker uses stateless JSON responses (MCP versions 2025-03-26, 2025-06-18 and 2025-11-25); standalone SSE/GET is intentionally unsupported (405), and every call requires its bearer. Requests are bounded to 32 KiB. No `Mcp-Session-Id` persistence or second scheduler is required.
 
 `scripts/test-mcp-live.py` is an opt-in real HTTPS MCP client: it uses a private token file, verifies initialize/list/call, and optionally drives a newly created headless session through start, send, capture and stop with durable acknowledgement checks. It never targets a pre-existing session. Run it only with available quota and explicit lifecycle-test authorization; use a private evidence directory. The ordinary GitHub main CI deploys the same Hub Worker after its required checks pass.
+
+For real lifecycle tests, pass an **exact host-configured workspace and canonical Hub engine**. A local aplexer alias is not automatically a Hub route. For example, Hetzner currently maps local `flash` to Antigravity; use `--engine antigravity --workspace /home/alexey/git/agent-hub` when that route has capacity. `capability_unavailable` can mean an unknown workspace label. A configured absolute workspace path can be used directly. `account_unknown` (including failed quota authentication), `account_capacity`, stale machine records and unqualified execution backends continue to hold launches. Refresh the plan and quota rather than increasing limits or controlling another session.
+
+To verify both clients against **one new session**, build the CLI and run the opt-in driver:
+
+```bash
+python3 scripts/build-hub-cli.py --out-dir public/cli
+TMPDIR="$HOME/tmp-root" python3 scripts/test-session-clients-live.py \
+  --cli public/cli/hub.pyz --token-file /private/oauth-token.json \
+  --workspace /home/alexey/git/agent-hub --engine antigravity \
+  --evidence /private/session-clients-proof.json --lifecycle
+```
+
+The driver uses the same human bearer, submits keyed operations through both interfaces, and checks they refer to the same session and commands. It requires a genuine bound native UUID, the correlated reply digest, a nonempty capture from that UUID, and acknowledged stop plus stopped state through both clients. Credentials and capture output remain in private evidence. Native ZAI control additionally requires the maintained Launcher version that injects first-action validation and declares `--engine zcodex`; its operator-configured route must use the real ZAI account/model and fresh admission evidence. Task-unit identifiers never qualify as native session bindings.

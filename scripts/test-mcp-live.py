@@ -6,6 +6,7 @@ or use a private file containing the raw bearer. Evidence is private JSON;
 this driver only sends to/stops the session it creates in this invocation.
 """
 import argparse
+import hashlib
 import json
 import os
 import stat
@@ -62,9 +63,9 @@ def main():
     p.add_argument('--token-file', required=True)
     p.add_argument('--evidence', required=True)
     p.add_argument('--lifecycle', action='store_true', help='Explicitly authorize creation/send/capture/stop of one new test session')
-    p.add_argument('--workspace', default='agent-hub')
+    p.add_argument('--workspace', required=True, help='An exact workspace identifier advertised by the selected host')
     p.add_argument('--machine')
-    p.add_argument('--engine', default='codex', help='Never grok; must be allowed by existing host admission')
+    p.add_argument('--engine', required=True, help='Canonical Hub engine, not an unregistered local aplexer alias; never grok')
     p.add_argument('--timeout', type=int, default=600)
     args = p.parse_args()
     if args.engine.lower() == 'grok':
@@ -142,11 +143,19 @@ def main():
             if done.get('state') != 'acked':
                 raise RuntimeError('Command %s was not acknowledged: %s' % (kind, done.get('state')))
             return done
-        command('send', {'body': 'Hub MCP test follow-up. Reply MCP_SEND_OK. Do not edit files or take any other action.'})
+        sent = command('send', {'body': 'Hub MCP test follow-up. Reply MCP_SEND_OK. Do not edit files or take any other action.'})
         captured = command('capture', {'max_bytes': 16384})
-        capture_text = captured.get('ack', {}).get('capture')
-        if not isinstance(capture_text, str) or 'MCP_SEND_OK' not in capture_text:
-            raise RuntimeError('Capture lacks test marker; evidence cannot prove actual output')
+        # Streamed tool events can scroll the reply out of a bounded tail.
+        # Processing is proven by the exact correlated native reply, not by
+        # incidental text (which could also appear in the original prompt).
+        expected_reply = hashlib.sha256(b'MCP_SEND_OK').hexdigest()
+        if sent.get('ack', {}).get('proof', {}).get('reply_digest') != expected_reply:
+            raise RuntimeError('Native correlated reply does not match the test response')
+        capture_ack = captured.get('ack', {})
+        capture_text = capture_ack.get('capture')
+        if (not isinstance(capture_text, str) or not capture_text.strip()
+                or capture_ack.get('native', {}).get('native_id') != bound.get('binding', {}).get('native_id')):
+            raise RuntimeError('Capture lacks output from the exact bound native session')
         command('stop')
         stopped = wait_for(show, lambda s: s.get('state') == 'stopped', args.timeout)
         evidence['final'] = stopped

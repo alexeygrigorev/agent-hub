@@ -181,6 +181,50 @@ class FleetTests(unittest.TestCase):
             receipt.update(session_id='genuine-native-uuid', first_action_verified=False)
             self.assertEqual(d.dispatch(offer(mode='headless', prompt='Goal'))['state'], 'uncertain')
 
+    def test_zai_headless_native_backend_binds_exact_zcodex_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = settings(Path(tmp))
+            cfg['launcher'] = {'argv': ['python3', '-m', 'launcher'], 'root': tmp, 'config_dir': str(Path(tmp) / 'config')}
+            cfg['subscriptions'][0].update(engine='zcodex', launcher_provider='zai', launcher_model='glm-5.3-flash')
+            calls = []
+            receipt = {'session_id': 'c420fcbe-36bc-4235-8bc7-224691d0bb65', 'state': 'running', 'first_action_verified': True,
+                       'engine': 'zcodex', 'workspace': tmp, 'tag': 'task-hub-' + offer()['id']}
+            def runner(argv, **kw):
+                calls.append(argv)
+                if argv[0] == 'maintained-gate':
+                    return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+                if 'plan' in argv:
+                    return {'eligible': [{'provider': 'zai', 'model': 'glm-5.3-flash', 'task_fit': 1.0}]}
+                if 'run' in argv: return {'receipt': dict(receipt)}
+                return {}
+            d = fleet.Dispatcher(cfg, lambda *a: {}, runner)
+            request = offer(engine='zcodex', mode='headless', prompt='Owned lifecycle test')
+            result = d.dispatch(request)
+            self.assertEqual(result['state'], 'running')
+            self.assertEqual(result['native_id'], receipt['session_id'])
+            self.assertIn('aplexer', calls[-1])
+            self.assertNotIn('task-units', calls[-1])
+            # Launcher --cwd is its owned workspace/evidence root; payload.cwd
+            # independently selects the confined child's working directory.
+            nested = Path(tmp) / 'nested'
+            nested.mkdir()
+            self.assertEqual(d.dispatch(dict(request, cwd='nested'))['state'], 'running')
+            run_argv = calls[-1]
+            self.assertEqual(run_argv[run_argv.index('--cwd') + 1], tmp)
+            self.assertEqual(run_argv[run_argv.index('--tmpdir') + 1], str(Path(tmp) / '.local' / 'tmp'))
+            submitted = next(c for c in reversed(calls) if 'submit' in c)
+            self.assertEqual(json.loads(submitted[submitted.index('--payload') + 1])['cwd'], str(nested))
+            valid = dict(receipt)
+            for field, bad in [('session_id', 'unit-name'), ('session_id', 'c420fcbe-36bc-1235-8bc7-224691d0bb65'), ('session_id', None), ('engine', 'shell'),
+                               ('workspace', '/other'), ('tag', 'other'), ('first_action_verified', False)]:
+                with self.subTest(field=field, bad=bad):
+                    receipt.clear(); receipt.update(valid); receipt[field] = bad
+                    self.assertEqual(d.dispatch(request)['state'], 'uncertain')
+            receipt.clear(); receipt.update(valid)
+            cfg['subscriptions'][0]['profile'] = 'unqualified'
+            with self.assertRaises(ValueError):
+                d.dispatch(dict(request, profile='unqualified'))
+
     def test_command_errors_never_echo_raw_stdout_stderr(self):
         with self.assertRaises(RuntimeError) as caught:
             fleet.run_json([sys.executable, '-c', 'import sys;print("MUST_NOT_LEAK");sys.stderr.write("MUST_NOT_LEAK");sys.exit(1)'])

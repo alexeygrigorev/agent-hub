@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import uuid
 import subprocess
 import time
 from typing import Any
@@ -550,9 +551,9 @@ class Dispatcher:
             # OpenCode and Antigravity use the maintained native backend:
             # real engine/UUID plus validated first action for Hub binding.
             # Other providers retain their existing task-unit semantics.
-            if sub.get("launcher_provider") in {"opencode", "antigravity"}:
+            if sub.get("launcher_provider") in {"opencode", "antigravity", "zai"}:
                 argv = prefix + ["run", "--backend", "aplexer",
-                                 "--id", task_id, "--cwd", str(target_cwd),
+                                 "--id", task_id, "--cwd", str(workspace),
                                  "--tmpdir", str(workspace / ".local" / "tmp")]
             else:
                 argv = prefix + ["run", "--backend", "task-units", "--as-controller", "--id", task_id, "--cwd", str(target_cwd), "--tmpdir", str(workspace / ".local" / "tmp")]
@@ -573,7 +574,7 @@ class Dispatcher:
                 result = {"state": "running", "native_id": native_id}
             else:
                 details = receipt.get("receipt", {})
-                if sub.get("launcher_provider") in {"opencode", "antigravity"}:
+                if sub.get("launcher_provider") in {"opencode", "antigravity", "zai"}:
                     # Opencode binds real M12 sessions only: a genuine native
                     # UUID is required; task-units unit_name/worker_id names
                     # can never bind or control a session.
@@ -581,6 +582,18 @@ class Dispatcher:
                     native_id = session_id if isinstance(session_id, str) and session_id else None
                 else:
                     native_id = details.get("session_id") or details.get("unit_name") or details.get("worker_id")
+                if sub.get("launcher_provider") == "zai":
+                    # ZAI session control requires a real native ZCodex
+                    # identity, never a task-unit identifier or SHELL label.
+                    try:
+                        if str(uuid.UUID(native_id)) != native_id.lower() or uuid.UUID(native_id).version != 4:
+                            raise ValueError("Noncanonical native UUID")
+                    except (ValueError, TypeError, AttributeError):
+                        raise ValueError("Native ZCodex UUID required") from None
+                    if (details.get("engine") != "zcodex" or offer.get("engine") != "zcodex"
+                            or details.get("workspace") != str(workspace)
+                            or details.get("tag") != "task-" + task_id):
+                        raise ValueError("Native ZCodex receipt mismatch")
                 if type(details.get('exit_code')) is int:
                     result = {'state': 'exited' if details['exit_code'] == 0 else 'failed', 'confirmed_exit': True, 'native_id': native_id, 'launcher_task_id': task_id}
                 elif details.get('state') == 'running' and details.get('first_action_verified') is True:
