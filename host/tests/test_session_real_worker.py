@@ -46,6 +46,18 @@ from http.server import BaseHTTPRequestHandler  # noqa: F401 (harness parity)
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from real_worker_harness import (
+    RealWorkerHarness,
+    WorkerProcessHandle,
+    WorkerStartupError,
+    build_fixture_worker_ts,
+    build_miniflare_script,
+    build_wrangler_config,
+    find_available_port,
+    get_available_cpus,
+    resolve_node_binary,
+)
+
 REPO_TMP = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".local", "tmp"))
 
 # Fake `a`: verified native surface only, + LABELED fixture auto-reply.
@@ -189,23 +201,21 @@ def sha256_b64url(val: str) -> str:
 class TestSessionRealWorker(unittest.TestCase):
     @classmethod
     def find_unused_port(cls):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", 0))
-            return s.getsockname()[1]
+        return find_available_port()
 
     @classmethod
     def get_available_cpus(cls, count=2) -> str:
-        try:
-            aff = sorted(os.sched_getaffinity(0))
-            if aff:
-                return ",".join(str(c) for c in aff[:count])
-        except Exception:
-            pass
-        return "0,1"
+        return get_available_cpus(count)
 
     @classmethod
     def _cleanup_proc(cls):
+        handle = getattr(cls, "handle", None)
+        if handle is not None:
+            try:
+                handle.cleanup()
+            except Exception:
+                pass
+            cls.handle = None
         proc = getattr(cls, "proc", None)
         if proc is not None:
             for stream in (proc.stdout, proc.stderr, proc.stdin):
@@ -245,138 +255,63 @@ class TestSessionRealWorker(unittest.TestCase):
         os.makedirs(cls.tmp_root, exist_ok=True)
         cls.server_dir = tempfile.mkdtemp(dir=cls.tmp_root, prefix="sess-real-")
         cls.addClassCleanup(cls._cleanup_server_dir)
+        cls.handle = None
         cls.proc = None
         cls.addClassCleanup(cls._cleanup_proc)
         try:
-            cls.port = cls.find_unused_port()
-            fixture_worker_ts = f"""
-import worker, {{ Hub as BaseHub }} from "{cls.repo_root}/src/worker";
-export class FixtureHub extends BaseHub {{
-  override async fetch(request: Request): Promise<Response> {{
-    const url = new URL(request.url);
-    if (url.pathname === "/__fixture__/seed_sql" && request.method === "POST") {{
-      const data = await request.json() as {{ sql: string, params?: any[] }};
-      try {{
-        const rows = this.sql.exec(data.sql, ...(data.params || [])).toArray();
-        return Response.json({{ ok: true, rows }});
-      }} catch (err: any) {{
-        return Response.json({{ error: String(err?.message || err) }}, {{ status: 400 }});
-      }}
-    }}
-    return super.fetch(request);
-  }}
-}}
-export {{ FixtureHub as Hub }};
-export default {{
-  async fetch(request: Request, env: any, ctx: any) {{
-    const url = new URL(request.url);
-    if (url.pathname === "/__fixture__/seed_sql") {{
-      const id = env.HUB.idFromName("hub");
-      const stub = env.HUB.get(id);
-      return stub.fetch(request);
-    }}
-    return worker.fetch(request, env, ctx);
-  }}
-}};
-"""
+            fixture_worker_ts = build_fixture_worker_ts(cls.repo_root)
             with open(os.path.join(cls.server_dir, "fixture_worker.ts"), "w") as f:
                 f.write(fixture_worker_ts)
-            cfg = {
-                "name": "agent-hub-fixture",
-                "main": "fixture_worker.ts",
-                "compatibility_date": "2024-04-05",
-                "compatibility_flags": ["nodejs_compat"],
-                "durable_objects": {"bindings": [{"name": "HUB", "class_name": "Hub"}]},
-                "migrations": [{"tag": "v1", "new_sqlite_classes": ["Hub"]}],
-                "vars": {
-                    "AUTH_CLIENT_ID": "fake_client_id",
-                    "AUTH_ISSUER": "https://auth.fake.local",
-                    "AUTH_BASE_URL": "https://auth.fake.local",
-                    "AUTH_CALLBACK_URL": f"http://127.0.0.1:{cls.port}/auth/callback",
-                    "AUTH_JWKS_URL": "https://auth.fake.local/.well-known/jwks.json",
-                    "SESSION_SECRET": "super_secret_session_key_32_chars_long_for_tests",
-                },
-            }
+
+            cfg = build_wrangler_config(port=8787, main_ts="fixture_worker.ts")
             with open(os.path.join(cls.server_dir, "wrangler.jsonc"), "w") as f:
                 json.dump(cfg, f)
-            wrangler_js = os.path.join(cls.repo_root, "node_modules", "wrangler", "bin", "wrangler.js")
-            node_bin = shutil.which("node")
-            if not node_bin or not os.path.exists(node_bin):
-                for candidate in ["/home/alexey/.nvm/versions/node/v24.13.1/bin/node"]:
-                    if os.path.exists(candidate):
-                        node_bin = candidate
-                        break
-            if not node_bin or not os.path.exists(node_bin):
-                raise RuntimeError("node binary not found")
+
+            node_bin = resolve_node_binary()
             node_dir = str(Path(node_bin).parent)
             env = os.environ.copy()
-            if node_dir not in env.get("PATH", "").split(os.pathsep):
-                env["PATH"] = f"{node_dir}:{env.get('PATH', '')}"
+            current_path = env.get("PATH", "")
+            if node_dir not in current_path.split(os.pathsep):
+                env["PATH"] = f"{node_dir}:{current_path}"
             env["TOKIO_WORKER_THREADS"] = "1"
             env["RAYON_NUM_THREADS"] = "1"
             env["UV_THREADPOOL_SIZE"] = "1"
             env["NODE_OPTIONS"] = "--max-old-space-size=384"
             env["MINIFLARE_WORKERD_V8_FLAGS"] = "--single-threaded --single-threaded-gc"
             env["TMPDIR"] = str(cls.tmp_root)
-            cpu_str = cls.get_available_cpus(2)
+            cpu_str = get_available_cpus(2)
+
+            cls.harness = RealWorkerHarness(
+                repo_root=cls.repo_root,
+                server_dir=cls.server_dir,
+                tmp_root=cls.tmp_root,
+                readiness_timeout=35.0,
+                poll_interval=0.2,
+                http_timeout=1.0,
+                max_startup_attempts=2,
+            )
+
             build_dir = Path(cls.server_dir) / "bundle"
-            build = subprocess.run(
-                ["taskset", "-c", cpu_str, node_bin, wrangler_js, "deploy", "--dry-run",
-                 "--config", os.path.join(cls.server_dir, "wrangler.jsonc"),
-                 "--outdir", str(build_dir)],
-                cwd=cls.server_dir, env=env, capture_output=True, text=True, timeout=60,
+            bundle_path = cls.harness.build_worker(
+                config_path=os.path.join(cls.server_dir, "wrangler.jsonc"),
+                out_dir=str(build_dir),
+                env=env,
+                cpu_str=cpu_str,
+                node_bin=node_bin,
             )
-            if build.returncode != 0:
-                raise RuntimeError(f"Wrangler build failed: {build.stderr[-2000:]}")
-            bundles = list(build_dir.glob("*.js"))
-            if len(bundles) != 1:
-                raise RuntimeError(f"Expected 1 bundle, found: {bundles}")
-            worker_opts = {
-                "name": "agent-hub-fixture",
-                "scriptPath": str(bundles[0]),
-                "modules": True,
-                "compatibilityDate": "2024-04-05",
-                "compatibilityFlags": ["nodejs_compat"],
-                "bindings": cfg["vars"],
-                "durableObjects": {"HUB": {"className": "Hub", "useSQLite": True}},
-                "assets": {"directory": os.path.join(cls.repo_root, "public"),
-                           "binding": "ASSETS", "run_worker_first": True,
-                           "routerConfig": {"has_user_worker": True}},
-            }
-            mf_options = {"host": "127.0.0.1", "port": cls.port,
-                          "durableObjectsPersist": os.path.join(cls.server_dir, "state"),
-                          "workers": [worker_opts]}
-            mf_js = os.path.join(cls.server_dir, "actual-miniflare.cjs")
-            with open(mf_js, "w") as f:
-                f.write(
-                    "const {Miniflare,convertV4MiniflareOptions}=require("
-                    + json.dumps(os.path.join(cls.repo_root, "node_modules", "miniflare")) + "); "
-                    + "const opts=" + json.dumps(mf_options) + "; "
-                    + "const mf=new Miniflare(convertV4MiniflareOptions(opts)); "
-                    + "mf.ready.then(async u=>{console.log('ACTUAL_WORKER_READY',String(u));}).catch(e=>{console.error(e);process.exit(1);}); "
-                    + "process.on('SIGTERM', async()=>{await mf.dispose();process.exit(0);});"
-                )
-            cls.proc = subprocess.Popen(
-                ["taskset", "-c", cpu_str, node_bin, str(mf_js)],
-                cwd=cls.server_dir, env=env,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=os.setsid,
-            )
-            ready = False
-            for _ in range(80):
-                time.sleep(0.25)
-                try:
-                    req = urllib.request.Request(f"http://127.0.0.1:{cls.port}/healthz")
-                    with urllib.request.urlopen(req, timeout=1):
-                        ready = True
-                        break
-                except urllib.error.HTTPError as error:
-                    if error.code == 401:
-                        ready = True
-                        break
-                except Exception:
-                    pass
-            if not ready:
-                raise RuntimeError("Real Worker failed to start")
+
+            def launch_worker(port: int, log_name: str) -> WorkerProcessHandle:
+                mf_js = os.path.join(cls.server_dir, f"miniflare-{port}.cjs")
+                script = build_miniflare_script(cls.repo_root, cls.server_dir, str(bundle_path), port)
+                with open(mf_js, "w") as f:
+                    f.write(script)
+                cmd = ["taskset", "-c", cpu_str, node_bin, str(mf_js)]
+                return cls.harness.launch_command(cmd, port=port, env=env, log_name=log_name)
+
+            cls.handle = cls.harness.start_with_retry(launch_worker)
+            cls.proc = cls.handle.proc
+            cls.port = cls.handle.port
+
             cls.init_fixture_data()
             # Native fixture dir (fake-a + journal), per-test tmp under server dir.
             cls.native_dir = os.path.join(cls.server_dir, "native")
