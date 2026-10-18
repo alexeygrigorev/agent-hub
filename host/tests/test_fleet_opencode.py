@@ -61,7 +61,11 @@ class FleetOpencodeTests(unittest.TestCase):
             submitted = next(a for a in calls if 'submit' in a)
             payload = json.loads(submitted[submitted.index('--payload') + 1])
             self.assertEqual(payload['profile'], 'model-task')
-            self.assertEqual(payload['goal'], 'Implement writer-run; preserve root-run authority')
+            brief = 'Implement writer-run; preserve root-run authority'
+            result_path = Path(tmp) / '.local' / 'hub-results' / (offer()['id'] + '.json')
+            self.assertTrue(payload['goal'].startswith(brief + '\n'))
+            self.assertIn('Write a final JSON object to ' + str(result_path), payload['goal'])
+            self.assertEqual(submitted[submitted.index('--paths') + 1], str(result_path))
             self.assertEqual(result['state'], 'running')
             self.assertEqual(result['native_id'], 'native-uuid-1')
             run_argv = calls[-1]
