@@ -2097,6 +2097,12 @@ class TestRoleDispatchRecovery(unittest.TestCase):
     def test_terminal_reconciliation_unstarted_v18_style(self):
         job_id = "job-unstarted-v18-001"
         d, client, runs_dir, run_dir, active_idx = self._unstarted_terminal_fixture(job_id)
+        client.job_statuses[job_id]["job"].pop("role_effect")
+        held = d.recover_active_role_jobs()
+        self.assertEqual(held[0]["reason"], "missing_server_execution_state")
+        self.assertEqual(client.reconciliations, [])
+        self.assertTrue(active_idx.exists())
+        client.job_statuses[job_id]["job"]["role_effect"] = None
         recovered = d.recover_active_role_jobs()
         self.assertEqual(len(recovered), 1)
         rec = recovered[0]
@@ -2105,7 +2111,7 @@ class TestRoleDispatchRecovery(unittest.TestCase):
         self.assertEqual(rec.get("outcome"), "failed")
         self.assertEqual(rec.get("terminal_case"), "unstarted")
 
-        # Active pointer unlinked only after validated ACK
+        # Original active pointer archived only after validated ACK
         self.assertFalse(active_idx.exists())
 
         # Custody file preserved and updated with terminal_reconciled

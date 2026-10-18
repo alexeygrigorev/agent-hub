@@ -2745,7 +2745,7 @@ export class Hub extends DurableObject {
           `SELECT id, kind, idempotency_key, payload, status, created_at, deadline_at, actor,
                   offer_host_id, offer_machine_id, offer_expires_at, offer_attempts,
                   holder_host_id, holder_machine_id, started_at, first_action_at, evidence_digest,
-                  native_session, launcher_task_id, lease_epoch, finished_at, outcome_summary, outcome_evidence
+                  native_session, launcher_task_id, lease_epoch, finished_at, outcome_summary, outcome_evidence, role_effect
            FROM jobs WHERE id = ?`,
           jobId
         ).toArray()[0] as any;

@@ -428,6 +428,9 @@ describe('configured roles through authenticated public HTTP and real Hub SQLite
 
     // Cleanup authority does not depend on launch quota/admission being available.
     await f.inspect((hub: any) => hub.sql.exec("UPDATE machines SET last_heartbeat=? WHERE id='host-a'", JSON.stringify({ gate: { launch_allowed: false } })));
+    const terminalStatus = await f.request(`/api/jobs/${v18Id}/status`);
+    expect(Object.prototype.hasOwnProperty.call(terminalStatus.data.job, 'role_effect')).toBe(true);
+    expect(terminalStatus.data.job.role_effect).toBeNull();
     // Reconcile terminal unstarted
     const v18Rec = await f.request(`/api/jobs/${v18Id}/reconcile`, {
       epoch: 2,

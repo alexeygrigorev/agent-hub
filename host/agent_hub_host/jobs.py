@@ -1950,6 +1950,9 @@ class JobDispatcher:
             # Attempt supported terminal role reconciliation (M8)
             reconcile_fn = getattr(self.client, "reconcile_terminal_job", None) if reconcile_expiry else None
             if callable(reconcile_fn):
+                # Omitted DTO fields are unknown, never authoritative no-effect proof.
+                if "role_effect" not in server_job:
+                    return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": "missing_server_execution_state"}
                 start_ack_file = run_dir / f"start-ack-{job_id}.json"
                 first_action_file = run_dir / f"first-action-{job_id}.json"
                 is_unstarted = (
