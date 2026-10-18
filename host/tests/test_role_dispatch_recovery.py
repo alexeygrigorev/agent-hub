@@ -173,10 +173,26 @@ class ControlledMockJobsClient:
         })
         return {"status": "finished", "job_id": job_id}
 
+    def get_job_status(self, base_url, job_id, token):
+        for f in self.finishes:
+            if f["job_id"] == job_id:
+                return {
+                    "job": {
+                        "id": job_id,
+                        "status": f["status"],
+                        "lease_epoch": f["epoch"],
+                        "outcome_summary": f["summary"],
+                    }
+                }
+        return {"error": "not_found"}
+
+
 
 class TestRoleDispatchRecovery(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir=str(pathlib.Path(".local/tmp").resolve()))
+        tmp_parent = pathlib.Path(".local/tmp").resolve()
+        tmp_parent.mkdir(parents=True, exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(dir=str(tmp_parent))
         self.base = pathlib.Path(self.tmp.name)
         self.state_dir = self.base / "roles"
         self.state_dir.mkdir(parents=True)
@@ -577,9 +593,11 @@ class TestRoleDispatchRecovery(unittest.TestCase):
         self.assertEqual(len(stopped_targets), 1)
         self.assertEqual(stopped_targets[0].session_id, native_sid)
 
-        # Durable uncertain proof recorded
+        # Durable uncertain proof recorded and custody proof retained on disk
         uncertain_file = run_dir / f"outcome-uncertain-{job_id}.json"
+        custody_file = run_dir / f"custody-{job_id}.json"
         self.assertTrue(uncertain_file.exists())
+        self.assertTrue(custody_file.exists(), "Custody proof MUST be preserved on disk upon stale fence")
         proof = json.loads(uncertain_file.read_text(encoding="utf-8"))
         self.assertEqual(proof.get("status"), "uncertain")
         self.assertEqual(proof.get("phase"), "stale_generation_fenced")
@@ -731,10 +749,184 @@ class TestRoleDispatchRecovery(unittest.TestCase):
         self.assertEqual(recovered[0]["status"], "HOLD")
         self.assertEqual(recovered[0]["reason"], "uncorroborated_native_identity")
 
-        # Outcome-uncertain proof written
+        # Outcome-uncertain proof written and CUSTODY RETAINED
         uncertain_file = run_dir / f"outcome-uncertain-{job_id}.json"
+        custody_file = run_dir / f"custody-{job_id}.json"
         self.assertTrue(uncertain_file.exists())
+        self.assertTrue(custody_file.exists(), "Custody proof MUST be preserved on disk upon uncorroborated native identity")
         self.assertEqual(len(client.finishes), 0)
+
+    def test_recovery_finish_refusal_retains_custody_and_holds(self):
+        """When Hub finish_job refuses completion, recovery does NOT drop credentials/custody and returns HOLD."""
+        job_id = "job-finish-refused-405"
+        client = ControlledMockJobsClient()
+        # Mock finish_job returning refusal error
+        client.finish_job = MagicMock(return_value={"error": "synthetic_finish_refused"})
+        runtime_mgr = RuntimeManager(role_config=self.role_cfg)
+        host_id = "test-host-recover"
+
+        runs_dir = self.role_cfg.runs_dir
+        run_dir = runs_dir / f"principal-wake-{job_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.chmod(0o700)
+
+        task_id = f"hub-role-principal-wake-{job_id}-g1-e1"
+        binding_record = {
+            "session_id": "88888888-8888-4888-8888-888888888888",
+            "tag": f"task-{task_id}",
+            "workspace": str(self.workspace.resolve()),
+            "engine": "antigravity",
+            "created_at_ms": 1792000000000,
+        }
+        backend = runtime_mgr.role_adapter.launcher_backend
+        backend.get_task_binding = MagicMock(return_value=binding_record)
+        backend.is_session_alive = MagicMock(return_value=(False, {"phase": "exited"}))
+
+        save_role_custody(
+            runs_dir=runs_dir,
+            run_dir=run_dir,
+            job_id=job_id,
+            data={
+                "job_id": job_id,
+                "kind": "principal-wake",
+                "role_binding": {
+                    "name": f"automation:test:{job_id}",
+                    "generation": 1,
+                    "host_id": host_id,
+                    "profile": "principal-wake",
+                    "ttl_seconds": 300,
+                },
+                "lease_epoch": 1,
+                "job_token": f"tok-{job_id}",
+                "deadline_at": time.time() + 600.0,
+                "payload": {},
+                "base_url": "https://hub.dtcdev.click",
+                "host_id": host_id,
+                "task_id": task_id,
+                "phase": "running",
+                "claimed_at": time.time() - 30.0,
+            },
+        )
+
+        (run_dir / f"start-ack-{job_id}.json").write_text(json.dumps({
+            "status": "started",
+            "job_id": job_id,
+            "epoch": 1,
+        }), encoding="utf-8")
+
+        (run_dir / f"outcome-{job_id}.json").write_text(json.dumps({
+            "status": "succeeded",
+            "summary": "wake checks finished",
+            "evidence_refs": ["/tmp/report.json"],
+        }), encoding="utf-8")
+
+        d = JobDispatcher(
+            base_url="https://hub.dtcdev.click",
+            host_id=host_id,
+            token_provider=lambda: "host-token-123",
+            client=client,
+            runtime_mgr=runtime_mgr,
+        )
+
+        recovered = d.recover_active_role_jobs()
+        self.assertEqual(len(recovered), 1)
+        self.assertFalse(recovered[0]["recovered"])
+        self.assertEqual(recovered[0]["status"], "HOLD")
+        self.assertIn("finish_refused", recovered[0]["reason"])
+
+        # CUSTODY MUST NOT BE DROPPED!
+        custody_file = run_dir / f"custody-{job_id}.json"
+        self.assertTrue(custody_file.exists(), "Custody MUST be preserved on finish refusal")
+        custody_data = json.loads(custody_file.read_text(encoding="utf-8"))
+        self.assertEqual(custody_data.get("phase"), "finish_refused")
+        self.assertEqual(custody_data.get("finish_error"), "synthetic_finish_refused")
+        # Credentials preserved
+        self.assertEqual(custody_data.get("job_token"), f"tok-{job_id}")
+
+    def test_recovery_finish_network_error_retains_custody_and_holds(self):
+        """When Hub finish_job raises connection error / lost reply, recovery retains custody and holds."""
+        job_id = "job-finish-neterr-406"
+        client = ControlledMockJobsClient()
+        client.finish_job = MagicMock(side_effect=ConnectionResetError("lost connection during finish reply"))
+        runtime_mgr = RuntimeManager(role_config=self.role_cfg)
+        host_id = "test-host-recover"
+
+        runs_dir = self.role_cfg.runs_dir
+        run_dir = runs_dir / f"principal-wake-{job_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.chmod(0o700)
+
+        task_id = f"hub-role-principal-wake-{job_id}-g1-e1"
+        binding_record = {
+            "session_id": "99999999-9999-4999-8999-999999999999",
+            "tag": f"task-{task_id}",
+            "workspace": str(self.workspace.resolve()),
+            "engine": "antigravity",
+            "created_at_ms": 1792000000000,
+        }
+        backend = runtime_mgr.role_adapter.launcher_backend
+        backend.get_task_binding = MagicMock(return_value=binding_record)
+        backend.is_session_alive = MagicMock(return_value=(False, {"phase": "exited"}))
+
+        save_role_custody(
+            runs_dir=runs_dir,
+            run_dir=run_dir,
+            job_id=job_id,
+            data={
+                "job_id": job_id,
+                "kind": "principal-wake",
+                "role_binding": {
+                    "name": f"automation:test:{job_id}",
+                    "generation": 1,
+                    "host_id": host_id,
+                    "profile": "principal-wake",
+                    "ttl_seconds": 300,
+                },
+                "lease_epoch": 1,
+                "job_token": f"tok-{job_id}",
+                "deadline_at": time.time() + 600.0,
+                "payload": {},
+                "base_url": "https://hub.dtcdev.click",
+                "host_id": host_id,
+                "task_id": task_id,
+                "phase": "running",
+                "claimed_at": time.time() - 30.0,
+            },
+        )
+
+        (run_dir / f"start-ack-{job_id}.json").write_text(json.dumps({
+            "status": "started",
+            "job_id": job_id,
+            "epoch": 1,
+        }), encoding="utf-8")
+
+        (run_dir / f"outcome-{job_id}.json").write_text(json.dumps({
+            "status": "succeeded",
+            "summary": "wake checks finished",
+            "evidence_refs": ["/tmp/report.json"],
+        }), encoding="utf-8")
+
+        d = JobDispatcher(
+            base_url="https://hub.dtcdev.click",
+            host_id=host_id,
+            token_provider=lambda: "host-token-123",
+            client=client,
+            runtime_mgr=runtime_mgr,
+        )
+
+        recovered = d.recover_active_role_jobs()
+        self.assertEqual(len(recovered), 1)
+        self.assertFalse(recovered[0]["recovered"])
+        self.assertEqual(recovered[0]["status"], "HOLD")
+        self.assertIn("finish_error", recovered[0]["reason"])
+
+        # CUSTODY MUST NOT BE DROPPED!
+        custody_file = run_dir / f"custody-{job_id}.json"
+        self.assertTrue(custody_file.exists(), "Custody MUST be preserved on finish network error")
+        custody_data = json.loads(custody_file.read_text(encoding="utf-8"))
+        self.assertEqual(custody_data.get("phase"), "finish_error")
+        self.assertIn("lost connection", custody_data.get("finish_error"))
+        self.assertEqual(custody_data.get("job_token"), f"tok-{job_id}")
 
     def test_durable_custody_permissions_and_bounded_safety(self):
         """Custody files must have mode 0600, reject symlinks and oversized files boundedly."""
@@ -836,6 +1028,175 @@ class TestRoleDispatchRecovery(unittest.TestCase):
         recovered = d.recover_active_role_jobs()
         self.assertEqual(recovered, [])
 
+    def test_recovery_lost_finish_reply_reconciled_via_server_status(self):
+        """When Hub finish_job network reply is lost, but Hub recorded finished, recovery reconciles status."""
+        job_id = "job-finish-reconcile-808"
+        client = ControlledMockJobsClient()
+        # Mock finish_job throwing connection error
+        client.finish_job = MagicMock(side_effect=ConnectionResetError("lost connection"))
+        # But get_job_status reports that the server actually received and processed the finish!
+        client.get_job_status = MagicMock(return_value={
+            "job": {
+                "id": job_id,
+                "status": "succeeded",
+                "lease_epoch": 1,
+                "native_session": "88888888-8888-4888-8888-888888888888",
+            }
+        })
+        runtime_mgr = RuntimeManager(role_config=self.role_cfg)
+        host_id = "test-host-recover"
+
+        runs_dir = self.role_cfg.runs_dir
+        run_dir = runs_dir / f"principal-wake-{job_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.chmod(0o700)
+
+        task_id = f"hub-role-principal-wake-{job_id}-g1-e1"
+        binding_record = {
+            "session_id": "88888888-8888-4888-8888-888888888888",
+            "tag": f"task-{task_id}",
+            "workspace": str(self.workspace.resolve()),
+            "engine": "antigravity",
+            "created_at_ms": 1792000000000,
+        }
+        backend = runtime_mgr.role_adapter.launcher_backend
+        backend.get_task_binding = MagicMock(return_value=binding_record)
+        backend.is_session_alive = MagicMock(return_value=(False, {"phase": "exited"}))
+
+        save_role_custody(
+            runs_dir=runs_dir,
+            run_dir=run_dir,
+            job_id=job_id,
+            data={
+                "job_id": job_id,
+                "kind": "principal-wake",
+                "role_binding": {
+                    "name": f"automation:test:{job_id}",
+                    "generation": 1,
+                    "host_id": host_id,
+                    "profile": "principal-wake",
+                    "ttl_seconds": 300,
+                },
+                "lease_epoch": 1,
+                "job_token": f"tok-{job_id}",
+                "deadline_at": time.time() + 600.0,
+                "payload": {},
+                "base_url": "https://hub.dtcdev.click",
+                "host_id": host_id,
+                "task_id": task_id,
+                "phase": "running",
+                "claimed_at": time.time() - 30.0,
+            },
+        )
+
+        (run_dir / f"start-ack-{job_id}.json").write_text(json.dumps({
+            "status": "started",
+            "job_id": job_id,
+            "epoch": 1,
+        }), encoding="utf-8")
+
+        (run_dir / f"outcome-{job_id}.json").write_text(json.dumps({
+            "status": "succeeded",
+            "summary": "wake checks finished",
+            "evidence_refs": ["/tmp/report.json"],
+        }), encoding="utf-8")
+
+        d = JobDispatcher(
+            base_url="https://hub.dtcdev.click",
+            host_id=host_id,
+            token_provider=lambda: "host-token-123",
+            client=client,
+            runtime_mgr=runtime_mgr,
+        )
+
+        recovered = d.recover_active_role_jobs()
+        self.assertEqual(len(recovered), 1)
+        self.assertTrue(recovered[0]["recovered"])
+        self.assertEqual(recovered[0]["status"], "finished")
+
+        # Custody must be cleanly deleted because finish was semantically reconciled
+        custody_file = run_dir / f"custody-{job_id}.json"
+        self.assertFalse(custody_file.exists())
+        self.assertFalse((runs_dir / f"active-role-{job_id}.json").exists())
+
+    def test_recovery_stale_renew_reconciled_when_already_finished_on_server(self):
+        """When renew_job returns unauthorized_or_stale because server finished and released lease, status reconciles."""
+        job_id = "job-stale-reconcile-909"
+        client = ControlledMockJobsClient()
+        client.stale_generation = True
+        # Server reports job is already finished!
+        client.get_job_status = MagicMock(return_value={
+            "job": {
+                "id": job_id,
+                "status": "finished",
+                "lease_epoch": 1,
+            }
+        })
+        runtime_mgr = RuntimeManager(role_config=self.role_cfg)
+        host_id = "test-host-recover"
+
+        runs_dir = self.role_cfg.runs_dir
+        run_dir = runs_dir / f"writer-run-{job_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.chmod(0o700)
+
+        task_id = f"hub-role-writer-run-{job_id}-g1-e1"
+        binding_record = {
+            "session_id": "77777777-7777-4777-8777-777777777777",
+            "tag": f"task-{task_id}",
+            "workspace": str(self.workspace.resolve()),
+            "engine": "antigravity",
+            "created_at_ms": 1792000000000,
+        }
+        backend = runtime_mgr.role_adapter.launcher_backend
+        backend.get_task_binding = MagicMock(return_value=binding_record)
+
+        save_role_custody(
+            runs_dir=runs_dir,
+            run_dir=run_dir,
+            job_id=job_id,
+            data={
+                "job_id": job_id,
+                "kind": "writer-run",
+                "role_binding": {
+                    "name": f"automation:test:{job_id}",
+                    "generation": 1,
+                    "host_id": host_id,
+                    "profile": "writer-run",
+                    "ttl_seconds": 300,
+                },
+                "lease_epoch": 1,
+                "job_token": f"tok-{job_id}",
+                "deadline_at": time.time() + 600.0,
+                "payload": {},
+                "base_url": "https://hub.dtcdev.click",
+                "host_id": host_id,
+                "task_id": task_id,
+                "phase": "running",
+                "claimed_at": time.time() - 30.0,
+            },
+        )
+
+        d = JobDispatcher(
+            base_url="https://hub.dtcdev.click",
+            host_id=host_id,
+            token_provider=lambda: "host-token-123",
+            client=client,
+            runtime_mgr=runtime_mgr,
+        )
+
+        recovered = d.recover_active_role_jobs()
+        self.assertEqual(len(recovered), 1)
+        self.assertTrue(recovered[0]["recovered"])
+        self.assertEqual(recovered[0]["status"], "finished")
+        self.assertTrue(recovered[0].get("reconciled"))
+
+        # Custody must be cleanly deleted because finish was semantically reconciled
+        custody_file = run_dir / f"custody-{job_id}.json"
+        self.assertFalse(custody_file.exists())
+        self.assertFalse((runs_dir / f"active-role-{job_id}.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
+

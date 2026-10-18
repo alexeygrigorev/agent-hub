@@ -218,6 +218,17 @@ class JobsClient:
             is_job_token=True
         )
 
+    def get_job_status(
+        self,
+        base_url: str,
+        job_id: str,
+        token: str,
+    ) -> Dict[str, Any]:
+        """Retrieve authoritative status of a job from the Hub. GET /api/jobs/{id}/status"""
+        url = f"{base_url}/api/jobs/{urllib.parse.quote(job_id)}/status"
+        return self._request("GET", url, token=token)
+
+
 
 def write_role_uncertain_proof(
     runs_dir: pathlib.Path,
@@ -1182,6 +1193,7 @@ class JobDispatcher:
                     evidence_refs = [str(evidence_file)]
 
             # Stop renewal loop
+            was_stopped_externally = stop_event.is_set()
             stop_event.set()
 
             # Check deadline_at
@@ -1234,6 +1246,10 @@ class JobDispatcher:
                 status = "failed"
                 summary = f"lease_renewal_failed: {fail_err}"
 
+            if role is not None and was_stopped_externally:
+                logger.warning("Dispatcher stopped or cancelled for role job %s; aborting lifecycle without finish_job", job_id)
+                return
+
             # Fencing check: never report succeeded if fenced in the root bridge
             if acquired_root:
                 now_s = int(self.clock.time()) if hasattr(self.clock, "time") else int(time.time())
@@ -1278,15 +1294,51 @@ class JobDispatcher:
             hub_status = status
             if hub_status not in ("succeeded", "finished", "failed", "cancelled"):
                 hub_status = "failed"
-            self.client.finish_job(
-                self.base_url, job_id, job_token, lease_epoch,
-                hub_status, summary, evidence_refs
+            finish_error = None
+            try:
+                finish_res = self.client.finish_job(
+                    self.base_url, job_id, job_token, lease_epoch,
+                    hub_status, summary, evidence_refs
+                )
+            except Exception as e:
+                finish_error = str(e)
+                finish_res = {"error": f"finish_error: {e}"}
+
+            is_semantic_finish = (
+                isinstance(finish_res, dict)
+                and finish_res.get("status") == "finished"
+                and (finish_res.get("job_id") == job_id or "job_id" not in finish_res)
             )
-            if role is not None:
+
+            if not is_semantic_finish and role is not None:
                 try:
-                    rld.remove_role_custody(runs_dir, run_dir_path, job_id)
-                except Exception:
-                    pass
+                    host_token = self.token_provider()
+                    st_res = self.client.get_job_status(self.base_url, job_id, token=host_token)
+                    if isinstance(st_res, dict) and "job" in st_res:
+                        s_job = st_res["job"]
+                        if s_job.get("status") in ("succeeded", "finished"):
+                            is_semantic_finish = True
+                            logger.info("Job lifecycle finish for %s reconciled via server status (%s)", job_id, s_job.get("status"))
+                except Exception as e:
+                    logger.warning("Failed to query job status for reconciliation of %s: %s", job_id, e)
+
+            if role is not None:
+                if is_semantic_finish:
+                    try:
+                        rld.remove_role_custody(runs_dir, run_dir_path, job_id)
+                    except Exception:
+                        pass
+                else:
+                    err_reason = finish_error or (finish_res.get("error") if isinstance(finish_res, dict) else "finish_refused")
+                    phase = "finish_error" if finish_error else "finish_refused"
+                    try:
+                        rld.update_role_custody(runs_dir, run_dir_path, job_id, {
+                            "phase": phase,
+                            "finish_error": err_reason,
+                        })
+                    except Exception:
+                        pass
+
 
         finally:
             stop_event.set()
@@ -1606,6 +1658,28 @@ class JobDispatcher:
 
         if renew_res.get("error") == "unauthorized_or_stale":
             logger.warning("Stale generation or lost lease detected on recovery for %s: %s", job_id, renew_res.get("error"))
+            # Before assuming fence, check if job was already finished on the server (e.g. earlier finish reply lost)
+            server_job = None
+            try:
+                host_token = self.token_provider()
+                status_res = self.client.get_job_status(self.base_url, job_id, token=host_token)
+                if isinstance(status_res, dict) and "job" in status_res:
+                    server_job = status_res["job"]
+            except Exception as e:
+                logger.warning("Could not query server job status for %s: %s", job_id, e)
+
+            if isinstance(server_job, dict) and server_job.get("status") in ("succeeded", "finished"):
+                # Reconciled! Job was actually finished on server and lease was released.
+                logger.info("Interrupted job %s was already finished on server (%s); reconciling", job_id, server_job.get("status"))
+                rld.remove_role_custody(runs_dir, run_dir, job_id)
+                return {
+                    "job_id": job_id,
+                    "recovered": True,
+                    "status": "finished",
+                    "outcome": server_job.get("status"),
+                    "reconciled": True,
+                }
+
             target = self._corroborate_native_target(job_id, kind, role, lease_epoch, run_dir)
             if target is not None:
                 self._stop_native_target_safely(target)
@@ -1620,7 +1694,6 @@ class JobDispatcher:
                 cause="renew_job returned unauthorized_or_stale (generation advanced or lease lost)",
                 is_prelaunch_refusal=False,
             )
-            rld.remove_role_custody(runs_dir, run_dir, job_id)
             return {"job_id": job_id, "recovered": False, "status": "fenced", "reason": "stale_generation_or_lost_lease"}
 
         if renew_res.get("error") == "deadline_exceeded":
@@ -1638,7 +1711,6 @@ class JobDispatcher:
                 cause="lease renewal rejected: deadline_exceeded",
                 is_prelaunch_refusal=False,
             )
-            rld.remove_role_custody(runs_dir, run_dir, job_id)
             return {"job_id": job_id, "recovered": False, "status": "fenced", "reason": "deadline_exceeded"}
 
         if renew_res.get("error"):
@@ -1676,7 +1748,6 @@ class JobDispatcher:
                 cause="missing or uncorroborated native binding on recovery",
                 is_prelaunch_refusal=False,
             )
-            rld.remove_role_custody(runs_dir, run_dir, job_id)
             return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": "uncorroborated_native_identity"}
 
         target = rld.NativeTarget(
@@ -1716,7 +1787,6 @@ class JobDispatcher:
                             cause=f"start_job failed on recovery: {start_res.get('error')}",
                             is_prelaunch_refusal=False,
                         )
-                        rld.remove_role_custody(runs_dir, run_dir, job_id)
                         return {"job_id": job_id, "recovered": False, "status": "failed", "reason": start_res.get("error")}
                     run.acknowledge_start(start_res)
 
@@ -1757,12 +1827,46 @@ class JobDispatcher:
             if status == "succeeded" and not refs:
                 refs = [str(run.first_action_file)]
 
-            self.client.finish_job(
-                self.base_url, job_id, job_token, lease_epoch,
-                status, summary, refs
+            finish_error = None
+            try:
+                finish_res = self.client.finish_job(
+                    self.base_url, job_id, job_token, lease_epoch,
+                    status, summary, refs
+                )
+            except Exception as e:
+                finish_error = str(e)
+                finish_res = {"error": f"finish_error: {e}"}
+
+            is_semantic_finish = (
+                isinstance(finish_res, dict)
+                and finish_res.get("status") == "finished"
+                and (finish_res.get("job_id") == job_id or "job_id" not in finish_res)
             )
-            rld.remove_role_custody(runs_dir, run_dir, job_id)
-            return {"job_id": job_id, "recovered": True, "status": "finished", "outcome": status}
+
+            if not is_semantic_finish:
+                try:
+                    host_token = self.token_provider()
+                    st_res = self.client.get_job_status(self.base_url, job_id, token=host_token)
+                    if isinstance(st_res, dict) and "job" in st_res:
+                        s_job = st_res["job"]
+                        if s_job.get("status") in ("succeeded", "finished"):
+                            is_semantic_finish = True
+                            logger.info("finish_job for %s reconciled via server status (%s)", job_id, s_job.get("status"))
+                except Exception as e:
+                    logger.warning("Failed to query job status for reconciliation of %s: %s", job_id, e)
+
+            if is_semantic_finish:
+                rld.remove_role_custody(runs_dir, run_dir, job_id)
+                return {"job_id": job_id, "recovered": True, "status": "finished", "outcome": status}
+            else:
+                err_reason = finish_error or (finish_res.get("error") if isinstance(finish_res, dict) else "finish_refused")
+                phase = "finish_error" if finish_error else "finish_refused"
+                logger.warning("finish_job refused on recovery for %s: %s; HOLD and preserve custody", job_id, err_reason)
+                rld.update_role_custody(runs_dir, run_dir, job_id, {
+                    "phase": phase,
+                    "finish_error": err_reason,
+                })
+                return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": f"{phase}: {err_reason}"}
 
     def _monitor_reattached_job(
         self,
@@ -1805,7 +1909,6 @@ class JobDispatcher:
                         cause=f"{reason}: owned unit cancelled; cancel_verified={info.get('verified')}",
                         is_prelaunch_refusal=False,
                     )
-                    rld.remove_role_custody(runs_dir, run_dir, job_id)
                     return
 
             stop_event.set()
@@ -1821,11 +1924,44 @@ class JobDispatcher:
             if status == "succeeded" and not refs:
                 refs = [str(run.first_action_file)]
 
-            self.client.finish_job(
-                self.base_url, job_id, job_token, lease_epoch,
-                status, summary, refs
+            finish_error = None
+            try:
+                finish_res = self.client.finish_job(
+                    self.base_url, job_id, job_token, lease_epoch,
+                    status, summary, refs
+                )
+            except Exception as e:
+                finish_error = str(e)
+                finish_res = {"error": f"finish_error: {e}"}
+
+            is_semantic_finish = (
+                isinstance(finish_res, dict)
+                and finish_res.get("status") == "finished"
+                and (finish_res.get("job_id") == job_id or "job_id" not in finish_res)
             )
-            rld.remove_role_custody(runs_dir, run_dir, job_id)
+
+            if not is_semantic_finish:
+                try:
+                    host_token = self.token_provider()
+                    st_res = self.client.get_job_status(self.base_url, job_id, token=host_token)
+                    if isinstance(st_res, dict) and "job" in st_res:
+                        s_job = st_res["job"]
+                        if s_job.get("status") in ("succeeded", "finished"):
+                            is_semantic_finish = True
+                            logger.info("Reattached job monitor for %s reconciled via server status (%s)", job_id, s_job.get("status"))
+                except Exception as e:
+                    logger.warning("Failed to query job status for reconciliation of %s: %s", job_id, e)
+
+            if is_semantic_finish:
+                rld.remove_role_custody(runs_dir, run_dir, job_id)
+            else:
+                err_reason = finish_error or (finish_res.get("error") if isinstance(finish_res, dict) else "finish_refused")
+                phase = "finish_error" if finish_error else "finish_refused"
+                logger.warning("Reattached job monitor finish_job refused for %s: %s; HOLD", job_id, err_reason)
+                rld.update_role_custody(runs_dir, run_dir, job_id, {
+                    "phase": phase,
+                    "finish_error": err_reason,
+                })
         except Exception as e:
             logger.error("Reattached job monitor failed for %s: %s", job_id, e)
             write_role_uncertain_proof(
@@ -1840,7 +1976,6 @@ class JobDispatcher:
                 is_prelaunch_refusal=False,
                 exc=e,
             )
-            rld.remove_role_custody(runs_dir, run_dir, job_id)
         finally:
             stop_event.set()
             if renew_thread is not None and renew_thread.is_alive():

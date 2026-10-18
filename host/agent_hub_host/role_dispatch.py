@@ -333,15 +333,42 @@ def update_role_custody(
     updates: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
     """Update fields in the durable private custody file atomically."""
+    runs_d = pathlib.Path(runs_dir)
     run_d = pathlib.Path(run_dir)
     custody_file = run_d / f"custody-{job_id}.json"
+    index_file = runs_d / f"active-role-{job_id}.json"
+
     existing, _, _ = safe_read_bounded_json(custody_file)
     if not existing or not isinstance(existing, dict):
         existing = {}
     existing.update(updates)
     existing["updated_at"] = time.time()
-    save_role_custody(runs_dir, run_dir, job_id, existing)
+
+    ensure_private_dir(run_d)
+    write_private_json(custody_file, existing)
+
+    terminal_phases = (
+        "uncertain",
+        "stale_generation_fenced",
+        "deadline_exceeded",
+        "cancelled",
+        "finish_refused",
+    )
+    if existing.get("phase") in terminal_phases:
+        if index_file.exists():
+            try:
+                index_file.unlink()
+            except OSError:
+                pass
+    else:
+        if index_file.exists():
+            try:
+                write_private_json(index_file, existing)
+            except Exception as e:
+                logger.warning("Failed to update index custody file: %s", e)
+
     return existing
+
 
 
 def remove_role_custody(

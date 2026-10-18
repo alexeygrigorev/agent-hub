@@ -85,7 +85,9 @@ if __name__ == "__main__":
 
 class TestRoleJobAdmissionRepair(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir=str(pathlib.Path(".local/tmp").resolve()))
+        tmp_parent = pathlib.Path(".local/tmp").resolve()
+        tmp_parent.mkdir(parents=True, exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(dir=str(tmp_parent))
         self.base = pathlib.Path(self.tmp.name)
         self.state_dir = self.base / "roles"
         self.state_dir.mkdir(parents=True)
