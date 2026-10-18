@@ -2155,7 +2155,7 @@ class TestRoleDispatchRecovery(unittest.TestCase):
         self.assertEqual(active_idx.read_bytes(), before)
         self.assertEqual(list(run_dir.glob("settled-active-*")), [])
 
-    def test_terminal_reconciliation_executed_v17_style_corroborated(self):
+    def test_terminal_reconciliation_executed_server_bound_retirement(self):
         """Executed job with corroborated native target reconciles to failed terminal receipt."""
         job_id = "job-executed-v17-002"
         client = ControlledMockJobsClient()
@@ -2242,8 +2242,12 @@ class TestRoleDispatchRecovery(unittest.TestCase):
         client.retirement_marker = {"native_id": native_sid, "tag": f"task-{task_id}", "workspace": str(self.workspace),
                                     "engine": "antigravity", "created_at_ms": 1000, "generation": 1,
                                     "cause": "finished", "finished_at_ms": 2000}
+        # Executable discovery is part of the fixture, independent of the host installation.
+        actual_which = jobs.shutil.which
+        def native_lookup(name, *args, **kwargs):
+            return "/fixture/aplexer" if name == "aplexer" else actual_which(name, *args, **kwargs)
         # Local maintained positive retirement and full server association are both required.
-        with patch("agent_hub_host.jobs.verify_native_retirement", return_value=(True, {"finished_at_ms": 2000}, "retired_tombstone_verified")), patch.object(JobDispatcher, "_corroborate_native_target", return_value=NativeTarget(
+        with patch("agent_hub_host.jobs.shutil.which", side_effect=native_lookup), patch("agent_hub_host.jobs.verify_native_retirement", return_value=(True, {"finished_at_ms": 2000}, "retired_tombstone_verified")) as retirement, patch.object(JobDispatcher, "_corroborate_native_target", return_value=NativeTarget(
             session_id=native_sid,
             tag=f"task-{task_id}",
             workspace=str(self.workspace), created_at_ms=1000, engine="antigravity",
@@ -2255,6 +2259,13 @@ class TestRoleDispatchRecovery(unittest.TestCase):
             self.assertTrue(active_idx.exists())
             self.assertEqual(client.reconciliations, [])
             client.job_statuses[job_id]["job"] = qualified
+            # Missing native tooling must HOLD even if a positive verifier mock is present.
+            with patch("agent_hub_host.jobs.shutil.which", side_effect=lambda name, *a, **kw: None if name == "aplexer" else actual_which(name, *a, **kw)):
+                missing_native = d.recover_active_role_jobs()
+            self.assertEqual(missing_native[0].get("reason"), "native_retirement_unproved")
+            self.assertTrue(active_idx.exists())
+            self.assertEqual(client.reconciliations, [])
+            retirement.assert_not_called()
             recovered = d.recover_active_role_jobs()
             self.assertEqual(len(recovered), 1)
             rec = recovered[0]
