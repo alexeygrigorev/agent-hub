@@ -392,6 +392,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
             settings,
             role_config=role_cfg_obj,
             role_config_path=role_cfg_path,
+            journal_dir=str(journal),
         )
         quota_collector = QuotaCollector(base_url=cfg.get('base_url'))
         # Status observation hook (released StatusCollector source): ONE

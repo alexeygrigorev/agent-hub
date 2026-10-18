@@ -117,3 +117,18 @@ class SessionHostTests(unittest.TestCase):
                 self.assertIsNone(rc_kw.get('config_path'))
                 self.assertIsNone(rc_kw.get('role_config'))
                 self.assertFalse(rc_kw.get('enabled'))
+
+    def test_session_host_passes_journal_dir_to_dispatcher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(session_host.config, 'load_config', return_value={'machine_id': 'test-machine', 'access_token': 'synthetic'}), \
+                 patch.object(session_host.fleet, 'load_settings', return_value={}), \
+                 patch.object(session_host, 'qualify_sender_binding', return_value=SimpleNamespace(session_id='test-native', workspace=str(pathlib.Path.cwd()))), \
+                 patch.object(session_host.fleet, 'Dispatcher') as dispatcher, \
+                 patch.object(session_host, 'RoleConsumer'), \
+                 patch.object(session_host.session_control, 'execute'):
+                session_host.run('synthetic-settings', directory, cycles=1)
+
+                dispatcher.assert_called_once()
+                call_kw = dispatcher.call_args.kwargs
+                self.assertEqual(call_kw.get('journal_dir'), directory)
+

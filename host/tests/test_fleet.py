@@ -909,6 +909,378 @@ class FleetTests(unittest.TestCase):
             accepted_task = store.get_task(task_id)
             self.assertEqual(accepted_task["state"], "accepted")
 
+    def test_normal_headless_positive_retirement_reconciles_and_settles_fleet_result_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / 'ws'
+            ws.mkdir()
+            cfg = settings(ws); cfg['capabilities'] = []
+            cfg['launcher'] = {'argv': ['python3', '-m', 'launcher'], 'root': str(ws), 'config_dir': str(ws / 'config')}
+            cfg['subscriptions'][0].update(launcher_provider='codex', launcher_model='gpt-6-sol', launcher_effort='high')
+            native_id = "2ac89cc7-2810-44c2-bab6-34e41633b1e5"
+            offer_id = "38bb1d42-d697-435e-a537-f8a93ac6cf3e"
+            task_id = f"hub-{offer_id}"
+
+            requests = []
+            def request(method, path, body=None):
+                requests.append((method, path, body))
+                if method == "GET" and path == "/api/fleet/offers":
+                    return {"offers": []}
+                if method == "POST" and path == "/api/machines/register":
+                    return {}
+                if method == "POST" and path == "/api/host/poll":
+                    return {}
+                if method == "PUT" and "/api/fleet/" in path:
+                    return {}
+                if method == "GET" and path == "/api/sessions/host-bindings":
+                    return {"sessions": []}
+                if method == "POST" and path == f"/api/fleet/launches/{offer_id}/claim":
+                    return {"id": offer_id, "state": "starting"}
+                if method == "POST" and path == f"/api/fleet/launches/{offer_id}/result":
+                    return {"id": offer_id, "state": body.get("state")}
+                return {}
+
+            calls = []
+            def runner(argv, **kw):
+                calls.append(argv)
+                if argv[0] == 'maintained-gate':
+                    return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+                if 'plan' in argv:
+                    return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol', 'task_fit': 1.0}]}
+                if 'run' in argv:
+                    return {'receipt': {'session_id': native_id, 'state': 'running', 'first_action_verified': True,
+                                        'tag': f"task-{task_id}", 'workspace': str(ws.resolve()), 'engine': 'codex',
+                                        'created_at_ms': 1792330666399}}
+                if 'reconcile' in argv:
+                    return {'task_id': task_id, 'state': 'completed-awaiting-review', 'resources_reserved': False,
+                            'reconciled_action': 'completed-awaiting-review', 'result_evidence_count': 1}
+                if argv[-2:] == ['list', '--json']:
+                    return []
+                return {}
+
+            d = fleet.Dispatcher(cfg, request, runner, journal_dir=str(Path(tmp) / 'journal'))
+            normal_offer = offer(mode='headless', id=offer_id, prompt='Test normal task')
+            disp_res = d.dispatch(normal_offer)
+            self.assertEqual(disp_res['state'], 'running')
+            self.assertEqual(disp_res['native_id'], native_id)
+
+            # Pre-retirement: reconcile returns no terminal settlement while workload is alive
+            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(False, None, "target_still_active")):
+                pre_reconciled = d.reconcile_launches()
+                self.assertEqual(pre_reconciled, [])
+                self.assertFalse(any(path.endswith('/result') and body.get('confirmed_exit') for m, path, body in requests))
+
+            # Post positive retirement: verify_native_retirement returns True
+            tombstone = {"cause": "finished", "id": native_id, "tag": f"task-{task_id}",
+                         "workspace": str(ws.resolve()), "finished_at_ms": 1792330700000}
+            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, tombstone, "retired_tombstone_verified")):
+                reconciled = d.reconcile_launches()
+                self.assertEqual(len(reconciled), 1)
+                self.assertEqual(reconciled[0]['id'], offer_id)
+                self.assertEqual(reconciled[0]['state'], 'exited')
+                self.assertTrue(reconciled[0]['reconciled'])
+
+            # Verify terminal result posted to own-host fleet result endpoint
+            terminal_post = next(r for r in requests if r[1] == f"/api/fleet/launches/{offer_id}/result" and r[2].get('confirmed_exit'))
+            self.assertEqual(terminal_post[2]['state'], 'exited')
+            self.assertEqual(terminal_post[2]['native_id'], native_id)
+            self.assertEqual(terminal_post[2]['launcher_task_id'], task_id)
+            self.assertTrue(terminal_post[2]['confirmed_exit'])
+
+            # Verify launcher reconcile was called
+            self.assertTrue(any('reconcile' in c and task_id in c for c in calls))
+
+            # Sub-round: second reconcile pass is idempotent, zero duplicate calls
+            calls_before = len(calls)
+            requests_before = len(requests)
+            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, tombstone, "retired_tombstone_verified")):
+                second_reconciled = d.reconcile_launches()
+                self.assertEqual(second_reconciled, [])
+            self.assertEqual(len(calls), calls_before)
+            self.assertEqual(len(requests), requests_before)
+
+    def test_normal_headless_restart_resumes_pending_observation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / 'ws'
+            ws.mkdir()
+            journal = Path(tmp) / 'journal'
+            journal.mkdir()
+            cfg = settings(ws); cfg['capabilities'] = []
+            cfg['launcher'] = {'argv': ['python3', '-m', 'launcher'], 'root': str(ws), 'config_dir': str(ws / 'config')}
+            cfg['subscriptions'][0].update(launcher_provider='codex', launcher_model='gpt-6-sol', launcher_effort='high')
+            native_id = "2ac89cc7-2810-44c2-bab6-34e41633b1e5"
+            offer_id = "38bb1d42-d697-435e-a537-f8a93ac6cf3e"
+            task_id = f"hub-{offer_id}"
+
+            requests = []
+            def request(method, path, body=None):
+                requests.append((method, path, body))
+                if method == "POST" and path == f"/api/fleet/launches/{offer_id}/claim":
+                    return {"id": offer_id, "state": "starting"}
+                if method == "POST" and path == f"/api/fleet/launches/{offer_id}/result":
+                    return {"id": offer_id, "state": body.get("state")}
+                return {}
+
+            def runner(argv, **kw):
+                if argv[0] == 'maintained-gate':
+                    return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+                if 'plan' in argv:
+                    return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol', 'task_fit': 1.0}]}
+                if 'run' in argv:
+                    return {'receipt': {'session_id': native_id, 'state': 'running', 'first_action_verified': True,
+                                        'tag': f"task-{task_id}", 'workspace': str(ws.resolve()), 'engine': 'codex',
+                                        'created_at_ms': 1792330666399}}
+                if 'reconcile' in argv:
+                    return {'task_id': task_id, 'state': 'completed-awaiting-review', 'resources_reserved': False}
+                return {}
+
+            # Dispatch with first Dispatcher instance
+            d1 = fleet.Dispatcher(cfg, request, runner, journal_dir=str(journal))
+            d1.dispatch(offer(mode='headless', id=offer_id, prompt='Test task'))
+
+            # Check journal file exists on disk
+            j_file = journal / 'fleet-launches' / f"{offer_id}.json"
+            self.assertTrue(j_file.is_file())
+            j_data = json.loads(j_file.read_text(encoding='utf-8'))
+            self.assertEqual(j_data['state'], 'running')
+            self.assertFalse(j_data['settled'])
+            self.assertEqual(j_data['native_id'], native_id)
+            self.assertEqual(j_data['incarnation'], 1792330666399)
+
+            # Host restart: instantiate brand new Dispatcher with same journal
+            d2 = fleet.Dispatcher(cfg, request, runner, journal_dir=str(journal))
+            self.assertIn(offer_id, d2._active_launches)
+            self.assertEqual(d2._active_launches[offer_id]['native_id'], native_id)
+
+            # Reconcile on d2 after restart
+            tombstone = {"cause": "finished", "id": native_id, "tag": f"task-{task_id}",
+                         "workspace": str(ws.resolve()), "finished_at_ms": 1792330700000}
+            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, tombstone, "retired_tombstone_verified")):
+                reconciled = d2.reconcile_launches()
+                self.assertEqual(len(reconciled), 1)
+                self.assertEqual(reconciled[0]['state'], 'exited')
+
+            # Journal on disk updated to settled
+            j_data_after = json.loads(j_file.read_text(encoding='utf-8'))
+            self.assertTrue(j_data_after['settled'])
+            self.assertEqual(j_data_after['state'], 'exited')
+
+    def test_normal_headless_lost_response_retry_recovers_idempotently(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / 'ws'
+            ws.mkdir()
+            journal = Path(tmp) / 'journal'
+            journal.mkdir()
+            cfg = settings(ws); cfg['capabilities'] = []
+            cfg['launcher'] = {'argv': ['python3', '-m', 'launcher'], 'root': str(ws), 'config_dir': str(ws / 'config')}
+            cfg['subscriptions'][0].update(launcher_provider='codex', launcher_model='gpt-6-sol', launcher_effort='high')
+            native_id = "2ac89cc7-2810-44c2-bab6-34e41633b1e5"
+            offer_id = "38bb1d42-d697-435e-a537-f8a93ac6cf3e"
+            task_id = f"hub-{offer_id}"
+
+            fail_post = [True]
+            requests = []
+            def request(method, path, body=None):
+                requests.append((method, path, body))
+                if method == "POST" and path == f"/api/fleet/launches/{offer_id}/claim":
+                    return {"id": offer_id, "state": "starting"}
+                if method == "POST" and path == f"/api/fleet/launches/{offer_id}/result":
+                    if body.get('confirmed_exit') and fail_post[0]:
+                        fail_post[0] = False
+                        raise ConnectionResetError("network lost response")
+                    if body.get('confirmed_exit') and not fail_post[0]:
+                        # Server responds 409 invalid_transition because it already processed it
+                        raise ValueError("409 invalid_transition")
+                    return {"id": offer_id, "state": body.get("state")}
+                return {}
+
+            run_calls = []
+            def runner(argv, **kw):
+                if 'run' in argv:
+                    run_calls.append(argv)
+                    return {'receipt': {'session_id': native_id, 'state': 'running', 'first_action_verified': True,
+                                        'tag': f"task-{task_id}", 'workspace': str(ws.resolve()), 'engine': 'codex',
+                                        'created_at_ms': 1792330666399}}
+                if argv[0] == 'maintained-gate':
+                    return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+                if 'plan' in argv:
+                    return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol', 'task_fit': 1.0}]}
+                if 'reconcile' in argv:
+                    return {'task_id': task_id, 'state': 'completed-awaiting-review', 'resources_reserved': False}
+                return {}
+
+            d = fleet.Dispatcher(cfg, request, runner, journal_dir=str(journal))
+            d.dispatch(offer(mode='headless', id=offer_id, prompt='Test task'))
+            self.assertEqual(len(run_calls), 1)
+
+            tombstone = {"cause": "finished", "id": native_id, "tag": f"task-{task_id}",
+                         "workspace": str(ws.resolve()), "finished_at_ms": 1792330700000}
+            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, tombstone, "retired_tombstone_verified")):
+                # First attempt: connection reset
+                first_attempt = d.reconcile_launches()
+                self.assertEqual(first_attempt, [])
+                self.assertFalse(d._active_launches[offer_id]['settled'])
+
+                # Second attempt (retry): recovers from 409 invalid_transition
+                second_attempt = d.reconcile_launches()
+                self.assertEqual(len(second_attempt), 1)
+                self.assertTrue(second_attempt[0]['reconciled'])
+                self.assertTrue(d._active_launches[offer_id]['settled'])
+
+            # No duplicate model starts!
+            self.assertEqual(len(run_calls), 1)
+
+    def test_normal_headless_unsettled_cases_preserve_reservation_and_refuse_terminal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / 'ws'
+            ws.mkdir()
+            cfg = settings(ws); cfg['capabilities'] = []
+            cfg['launcher'] = {'argv': ['python3', '-m', 'launcher'], 'root': str(ws), 'config_dir': str(ws / 'config')}
+            cfg['subscriptions'][0].update(launcher_provider='codex', launcher_model='gpt-6-sol', launcher_effort='high')
+            native_id = "2ac89cc7-2810-44c2-bab6-34e41633b1e5"
+            offer_id = "38bb1d42-d697-435e-a537-f8a93ac6cf3e"
+            task_id = f"hub-{offer_id}"
+
+            requests = []
+            def request(method, path, body=None):
+                requests.append((method, path, body))
+                if method == "POST" and path == f"/api/fleet/launches/{offer_id}/claim":
+                    return {"id": offer_id, "state": "starting"}
+                if method == "POST" and path == f"/api/fleet/launches/{offer_id}/result":
+                    return {"id": offer_id, "state": body.get("state")}
+                return {}
+
+            reconcile_calls = []
+            def runner(argv, **kw):
+                if argv[0] == 'maintained-gate':
+                    return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+                if 'plan' in argv:
+                    return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol', 'task_fit': 1.0}]}
+                if 'run' in argv:
+                    return {'receipt': {'session_id': native_id, 'state': 'running', 'first_action_verified': True,
+                                        'tag': f"task-{task_id}", 'workspace': str(ws.resolve()), 'engine': 'codex',
+                                        'created_at_ms': 1792330666399}}
+                if 'reconcile' in argv:
+                    reconcile_calls.append(argv)
+                    return {'task_id': task_id, 'state': 'completed-awaiting-review', 'resources_reserved': False}
+                return {}
+
+            d = fleet.Dispatcher(cfg, request, runner)
+            d.dispatch(offer(mode='headless', id=offer_id, prompt='Test task'))
+
+            # Case A: Live workload in catalog
+            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(False, None, "target_still_active_in_catalog: phase=running")):
+                self.assertEqual(d.reconcile_launches(), [])
+            self.assertEqual(reconcile_calls, [])
+
+            # Case B: Tombstone absent / unknown
+            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(False, None, "retired_tombstone_absent: /path/to/tombstone.json")):
+                self.assertEqual(d.reconcile_launches(), [])
+            self.assertEqual(reconcile_calls, [])
+
+            # Case C: Catalog error / offline API
+            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(False, None, "live_catalog_query_failed: timeout")):
+                self.assertEqual(d.reconcile_launches(), [])
+            self.assertEqual(reconcile_calls, [])
+
+            # Case D: Wrong incarnation in record
+            d._active_launches[offer_id]['incarnation'] = -1
+            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, {}, "retired_tombstone_verified")):
+                self.assertEqual(d.reconcile_launches(), [])
+            self.assertEqual(reconcile_calls, [])
+            d._active_launches[offer_id]['incarnation'] = 1792330666399
+
+            # Case E: Launcher reports resources still reserved
+            def runner_busy(argv, **kw):
+                if 'reconcile' in argv:
+                    reconcile_calls.append(argv)
+                    return {'task_id': task_id, 'state': 'running', 'resources_reserved': True}
+                return runner(argv, **kw)
+            d.runner = runner_busy
+            tombstone = {"cause": "finished", "id": native_id, "tag": f"task-{task_id}",
+                         "workspace": str(ws.resolve()), "finished_at_ms": 1792330700000}
+            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, tombstone, "retired_tombstone_verified")):
+                self.assertEqual(d.reconcile_launches(), [])
+            self.assertFalse(any(r[1].endswith('/result') and r[2].get('confirmed_exit') for r in requests))
+
+    def test_normal_headless_failed_evidence_settles_failed_without_business_acceptance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / 'ws'
+            ws.mkdir()
+            cfg = settings(ws); cfg['capabilities'] = []
+            cfg['launcher'] = {'argv': ['python3', '-m', 'launcher'], 'root': str(ws), 'config_dir': str(ws / 'config')}
+            cfg['subscriptions'][0].update(launcher_provider='codex', launcher_model='gpt-6-sol', launcher_effort='high')
+            native_id = "2ac89cc7-2810-44c2-bab6-34e41633b1e5"
+            offer_id = "38bb1d42-d697-435e-a537-f8a93ac6cf3e"
+            task_id = f"hub-{offer_id}"
+
+            requests = []
+            def request(method, path, body=None):
+                requests.append((method, path, body))
+                if method == "POST" and path == f"/api/fleet/launches/{offer_id}/claim":
+                    return {"id": offer_id, "state": "starting"}
+                if method == "POST" and path == f"/api/fleet/launches/{offer_id}/result":
+                    return {"id": offer_id, "state": body.get("state")}
+                return {}
+
+            launcher_cmds = []
+            def runner(argv, **kw):
+                launcher_cmds.append(argv)
+                if argv[0] == 'maintained-gate':
+                    return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+                if 'plan' in argv:
+                    return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol', 'task_fit': 1.0}]}
+                if 'run' in argv:
+                    return {'receipt': {'session_id': native_id, 'state': 'running', 'first_action_verified': True,
+                                        'tag': f"task-{task_id}", 'workspace': str(ws.resolve()), 'engine': 'codex',
+                                        'created_at_ms': 1792330666399}}
+                if 'reconcile' in argv:
+                    # Native died with no evidence -> launcher transitions to failed
+                    return {'task_id': task_id, 'state': 'failed', 'resources_reserved': False,
+                            'reconciled_action': 'failed', 'result_evidence_count': 0}
+                return {}
+
+            d = fleet.Dispatcher(cfg, request, runner)
+            d.dispatch(offer(mode='headless', id=offer_id, prompt='Test task'))
+
+            tombstone = {"cause": "finished", "id": native_id, "tag": f"task-{task_id}",
+                         "workspace": str(ws.resolve()), "finished_at_ms": 1792330700000}
+            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, tombstone, "retired_tombstone_verified")):
+                reconciled = d.reconcile_launches()
+                self.assertEqual(len(reconciled), 1)
+                self.assertEqual(reconciled[0]['state'], 'failed')
+
+            terminal_post = next(r for r in requests if r[1] == f"/api/fleet/launches/{offer_id}/result" and r[2].get('confirmed_exit'))
+            self.assertEqual(terminal_post[2]['state'], 'failed')
+
+            # Strictly verify launcher accept was NEVER invoked
+            self.assertFalse(any('accept' in c for c in launcher_cmds))
+            # Strictly verify no task result was posted to /api/fleet/tasks
+            self.assertFalse(any('/api/fleet/tasks' in r[1] for r in requests))
+
+    def test_normal_headless_journal_fails_closed_on_corrupt_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / 'journal'
+            launches_dir = journal / 'fleet-launches'
+            launches_dir.mkdir(parents=True)
+
+            # Corrupt file 1: invalid json
+            (launches_dir / 'corrupt1.json').write_text("{broken json", encoding='utf-8')
+            # Corrupt file 2: empty file
+            (launches_dir / 'empty.json').write_text("", encoding='utf-8')
+            # Corrupt file 3: not a dict
+            (launches_dir / 'notdict.json').write_text('["list"]', encoding='utf-8')
+            # Corrupt file 4: missing required 5-field tuple keys
+            (launches_dir / 'missing_keys.json').write_text('{"state": "running", "offer_id": "bad"}', encoding='utf-8')
+            # Symlink pointing to valid file outside
+            target = Path(tmp) / 'outside.json'
+            target.write_text('{"offer_id": "outside", "state": "running"}', encoding='utf-8')
+            (launches_dir / 'symlink.json').symlink_to(target)
+
+            cfg = settings(Path(tmp))
+            # Must load cleanly without raising and with zero active launches loaded
+            d = fleet.Dispatcher(cfg, lambda *a: {}, lambda *a, **kw: {}, journal_dir=str(journal))
+            self.assertEqual(d._active_launches, {})
+
 
 if __name__ == '__main__': unittest.main()
 

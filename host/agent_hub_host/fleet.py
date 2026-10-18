@@ -10,9 +10,10 @@ import stat
 import uuid
 import subprocess
 import time
-from typing import Any
+from typing import Any, Optional
 
 from . import bus
+from .retired_native import verify_native_retirement
 
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 SERVICES = {"codex", "claude", "grok", "gemini", "zai", "go", "copilot"}
@@ -419,10 +420,244 @@ def find_binding_row(rows, entry):
 
 class Dispatcher:
     """One finite poll. Claim ambiguity and effect ambiguity are never retried automatically."""
-    def __init__(self, settings, request=bus._do_request, runner=run_json, role_config=None, role_config_path=None):
+    def __init__(self, settings, request=bus._do_request, runner=run_json, role_config=None, role_config_path=None, journal_dir=None):
         self.settings, self.request, self.runner = settings, request, runner
         self.role_config = role_config
         self.role_config_path = role_config_path
+        self.journal_dir = journal_dir or settings.get("journal_dir")
+        self._active_launches: dict[str, dict[str, Any]] = {}
+        if self.journal_dir:
+            self._load_pending_launches_from_journal()
+
+    def _journal_launches_dir(self) -> Optional[Path]:
+        if not self.journal_dir:
+            return None
+        p = Path(self.journal_dir) / "fleet-launches"
+        p.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return p
+
+    def _persist_launch_record(self, record: dict[str, Any]) -> None:
+        jdir = self._journal_launches_dir()
+        if not jdir:
+            return
+        offer_id = record.get("offer_id")
+        if not isinstance(offer_id, str) or not LABEL.fullmatch(offer_id):
+            return
+        entry_file = jdir / f"{offer_id}.json"
+        raw = json.dumps(record, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        from . import private_fs
+        private_fs.atomic_write(str(entry_file), raw, 65536)
+
+    def _load_pending_launches_from_journal(self) -> None:
+        jdir = self._journal_launches_dir()
+        if not jdir or not jdir.is_dir():
+            return
+        from .native_sessions import NativeTarget, SessionControlError
+        from . import private_fs
+        for entry in sorted(jdir.iterdir()):
+            if entry.is_symlink() or not entry.is_file() or not entry.name.endswith(".json"):
+                continue
+            try:
+                if entry.stat().st_size > 65536 or entry.stat().st_size <= 0:
+                    continue
+                raw = private_fs.read_bytes(str(entry), 65536, private=True).decode("utf-8")
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    continue
+                if data.get("settled") is True:
+                    continue
+                if data.get("state") != "running":
+                    continue
+                offer_id = data.get("offer_id")
+                task_id = data.get("task_id")
+                native_id = data.get("native_id")
+                tag = data.get("tag")
+                workspace = data.get("workspace")
+                engine = data.get("engine")
+                incarnation = data.get("incarnation")
+                if not (isinstance(offer_id, str) and LABEL.fullmatch(offer_id)):
+                    continue
+                if not (isinstance(task_id, str) and LABEL.fullmatch(task_id)):
+                    continue
+                if not (isinstance(native_id, str) and native_id):
+                    continue
+                if not (isinstance(tag, str) and tag):
+                    continue
+                if not (isinstance(workspace, str) and Path(workspace).is_absolute()):
+                    continue
+                if not (isinstance(engine, str) and engine):
+                    continue
+                if type(incarnation) is not int or incarnation <= 0:
+                    continue
+                NativeTarget(
+                    session_id=native_id, tag=tag, workspace=workspace,
+                    created_at_ms=incarnation, engine=engine
+                ).validated()
+                self._active_launches[offer_id] = data
+            except Exception:
+                continue
+
+    def _record_running_launch(self, offer_id, task_id, workspace, engine, account, native_id, result_path, details):
+        from .native_sessions import NativeTarget, SessionControlError
+        from . import private_fs
+
+        try:
+            norm_uuid = str(uuid.UUID(str(native_id))).lower()
+        except (ValueError, TypeError, AttributeError):
+            return
+
+        tag = details.get("tag")
+        expected_tag = f"task-{task_id}" if not task_id.startswith("task-") else task_id
+        if not tag or not isinstance(tag, str):
+            tag = expected_tag
+
+        incarnation = details.get("created_at_ms") or details.get("incarnation")
+        if type(incarnation) is not int or incarnation <= 0:
+            start_path = workspace / ".local" / f"launch-{task_id}-start.json"
+            if not start_path.is_symlink() and start_path.is_file():
+                try:
+                    if 0 < start_path.stat().st_size <= 65536:
+                        raw = private_fs.read_bytes(str(start_path), 65536, private=False).decode("utf-8")
+                        s_doc = json.loads(raw)
+                        if isinstance(s_doc, dict):
+                            s_data = s_doc.get("wrapper_start_json") if isinstance(s_doc.get("wrapper_start_json"), dict) else s_doc
+                            cand_inc = s_data.get("created_at_ms")
+                            if type(cand_inc) is int and cand_inc > 0:
+                                incarnation = cand_inc
+                            if not details.get("tag") and s_data.get("tag"):
+                                tag = s_data["tag"]
+                except Exception:
+                    pass
+
+        if type(incarnation) is not int or incarnation <= 0:
+            return
+
+        try:
+            target = NativeTarget(
+                session_id=norm_uuid,
+                tag=tag,
+                workspace=str(workspace.resolve(strict=True)),
+                created_at_ms=incarnation,
+                engine=engine,
+            ).validated()
+        except (SessionControlError, ValueError, OSError):
+            return
+
+        record = {
+            "offer_id": offer_id,
+            "task_id": task_id,
+            "mode": "headless",
+            "workspace": target.workspace,
+            "engine": target.engine,
+            "account": account,
+            "native_id": target.session_id,
+            "tag": target.tag,
+            "incarnation": target.created_at_ms,
+            "result_path": str(result_path),
+            "state": "running",
+            "settled": False,
+            "dispatched_at": utcnow(),
+        }
+        self._active_launches[offer_id] = record
+        self._persist_launch_record(record)
+
+    def reconcile_launches(self) -> list[dict[str, Any]]:
+        """Reconcile pending owned headless launches via verified positive retirement,
+        Launcher reconcile, and own-host Fleet confirmed-exit result.
+        """
+        reconciled = []
+        if not self._active_launches:
+            return reconciled
+
+        from .native_sessions import NativeTarget, SessionControlError
+
+        native = self.settings.get("aplexer_bin", "aplexer")
+        state_dir = self.settings.get("aplexer_state_dir")
+        launcher = self.settings.get("launcher", {})
+        has_launcher = all(launcher.get(k) for k in ["argv", "root", "config_dir"])
+
+        for offer_id, record in list(self._active_launches.items()):
+            if record.get("settled") is True:
+                continue
+
+            # 1. Corroborate exact 5-field native tuple
+            incarnation = record.get("incarnation")
+            if not isinstance(incarnation, int) or incarnation <= 0:
+                continue
+            engine = record.get("engine")
+            if not isinstance(engine, str) or not engine:
+                continue
+
+            try:
+                target = NativeTarget(
+                    session_id=record["native_id"],
+                    tag=record["tag"],
+                    workspace=record["workspace"],
+                    created_at_ms=incarnation,
+                    engine=engine,
+                ).validated()
+            except (SessionControlError, KeyError, ValueError, TypeError):
+                continue
+
+            # 2. Positive retirement verification
+            try:
+                is_retired, tombstone, detail = verify_native_retirement(native, target, state_dir=state_dir)
+            except Exception:
+                continue
+
+            if not is_retired:
+                continue
+
+            # 3. Maintained Launcher reconcile
+            if not has_launcher:
+                continue
+
+            prefix = launcher["argv"] + ["--config-dir", launcher["config_dir"]]
+            task_id = record["task_id"]
+            reconcile_argv = prefix + ["reconcile", "--id", task_id, "--json"]
+            try:
+                reconcile_out = self.runner(reconcile_argv, cwd=launcher["root"])
+            except Exception:
+                continue
+
+            if not isinstance(reconcile_out, dict):
+                continue
+
+            reconciled_state = reconcile_out.get("state")
+            resources_reserved = reconcile_out.get("resources_reserved")
+
+            # Physical resources must be released; state must be completed-awaiting-review or failed
+            if resources_reserved is True or reconciled_state not in ("completed-awaiting-review", "failed"):
+                continue
+
+            # 4. Own-host Fleet terminal result
+            fleet_state = "exited" if reconciled_state == "completed-awaiting-review" else "failed"
+            result_payload = {
+                "state": fleet_state,
+                "confirmed_exit": True,
+                "native_id": record["native_id"],
+                "launcher_task_id": task_id,
+            }
+            path = f"/api/fleet/launches/{offer_id}/result"
+            try:
+                self.request("POST", path, result_payload)
+                record["settled"] = True
+                record["state"] = fleet_state
+                record["settled_at"] = utcnow()
+                self._persist_launch_record(record)
+                reconciled.append({"id": offer_id, "state": fleet_state, "reconciled": True})
+            except Exception as exc:
+                err_str = str(exc)
+                if "invalid_transition" in err_str:
+                    record["settled"] = True
+                    record["state"] = fleet_state
+                    record["settled_at"] = utcnow()
+                    self._persist_launch_record(record)
+                    reconciled.append({"id": offer_id, "state": fleet_state, "reconciled": True, "recovered": True})
+                else:
+                    pass
+
+        return reconciled
 
     def _derive_qualified_role_jobs(self) -> list[str]:
         """Derive only enabled real qualified supported role profiles via RuntimeManager.
@@ -708,6 +943,17 @@ class Dispatcher:
                     raise ValueError('Native lifecycle receipt is incomplete')
             if not isinstance(native_id, str) or not native_id:
                 raise ValueError("No confirmed native execution receipt")
+            if mode == "headless" and not offer.get("task_id") and result.get("state") == "running":
+                self._record_running_launch(
+                    offer_id=offer_id,
+                    task_id=task_id,
+                    workspace=workspace,
+                    engine=offer.get("engine") or sub.get("engine") or sub.get("service"),
+                    account=sub.get("account_label"),
+                    native_id=native_id,
+                    result_path=result_path,
+                    details=details,
+                )
         except Exception as exc:
             # Effect may have happened: hold capacity and require reconciliation.
             # Bounded private diagnostic only (type + stage, never argv/goal/
@@ -810,8 +1056,9 @@ class Dispatcher:
                 continue
         if 'capabilities' in self.settings:
             self.request('PUT', '/api/fleet/routing/capabilities', {'needs': self.settings['capabilities'], 'max_agents': self.settings.get('max_agents', 1), 'runners': [{'engine': s.get('engine', s['service']), 'profile': s.get('profile'), 'account': s['account_label'], 'model': s['launcher_model'], 'effort': s.get('launcher_effort')} for s in self.settings['subscriptions'] if s.get('launcher_model') and s.get('admission_argv')]})
+        reconciled = self.reconcile_launches()
         offers = self.request("GET", "/api/fleet/offers").get("offers", [])
-        results = []
+        results = list(reconciled)
         for offer in offers:
             try:
                 results.append(self.dispatch(offer))
