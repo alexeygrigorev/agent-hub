@@ -104,6 +104,7 @@ class ControlledMockJobsClient:
         self.declines: List[Dict[str, Any]] = []
         self.executes: List[Dict[str, Any]] = []
         self.offers: List[Dict[str, Any]] = []
+        self.reconciliations: List[Dict[str, Any]] = []
         self.payloads: Dict[str, Any] = {}
         self.job_statuses: Dict[str, Any] = {}
         self.stale_generation = False
@@ -212,6 +213,42 @@ class ControlledMockJobsClient:
                     }
                 }
         return {"error": "not_found"}
+
+    def reconcile_terminal_job(self, base_url, job_id, token, data):
+        self.reconciliations.append({
+            "job_id": job_id,
+            "token": token,
+            "data": data,
+        })
+        if getattr(self, "reconcile_override", None):
+            return self.reconcile_override(job_id, token, data)
+        if self.stale_generation:
+            return {"error": "generation_mismatch", "status_code": 409}
+        epoch = data.get("epoch", 1)
+        generation = data.get("generation", 1)
+        terminal_case = data.get("terminal_case", "unstarted")
+        return {
+            "reconciled": True,
+            "status": "reconciled",
+            "job_id": job_id,
+            "epoch": epoch,
+            "generation": generation,
+            "outcome": "failed",
+            "terminal_case": terminal_case,
+            "receipt": {
+                "epoch": epoch,
+                "generation": generation,
+                "job_id": job_id,
+                "outcome": "failed",
+                "reconciled": True,
+                "status": "failed",
+                "summary": data.get("summary", "terminal reconciliation"),
+                "evidenceRefs": [],
+                "original_status": self.job_statuses.get(job_id, {}).get("job", {}).get("status"),
+                "terminal_case": terminal_case,
+                **({"native_session": data["native_session"], "native_retirement": self.retirement_marker} if terminal_case == "executed" else {}),
+            }
+        }
 
 
 
@@ -1990,6 +2027,488 @@ class TestRoleDispatchRecovery(unittest.TestCase):
         finally:
             dummy_proc.terminate()
             dummy_proc.wait()
+
+    def _unstarted_terminal_fixture(self, job_id):
+        client = ControlledMockJobsClient()
+        runs_dir = self.role_cfg.runs_dir
+        run_dir = runs_dir / f"writer-run-{job_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        host_id = "test-host-recover"
+
+        # Custody created at claim, but no execution intent, start, or native session recorded
+        save_role_custody(
+            runs_dir=runs_dir,
+            run_dir=run_dir,
+            job_id=job_id,
+            data={
+                "job_id": job_id,
+                "kind": "writer-run",
+                "role_binding": {
+                    "name": f"automation:test:{job_id}",
+                    "generation": 1,
+                    "host_id": host_id,
+                    "profile": "writer-run",
+                    "ttl_seconds": 300,
+                },
+                "lease_epoch": 1,
+                "job_token": f"tok-{job_id}",
+                "deadline_at": time.time() - 10.0,
+                "payload": {"date": "2026-10-18"},
+                "base_url": "https://hub.dtcdev.click",
+                "host_id": host_id,
+                "task_id": f"hub-role-writer-run-{job_id}-g1-e1",
+                "phase": "claimed",
+                "claimed_at": time.time() - 30.0,
+            },
+        )
+
+        active_idx = runs_dir / f"active-role-{job_id}.json"
+        self.assertTrue(active_idx.exists())
+
+        # Server confirms expired with role_effect = None, started_at = None
+        client.deadline_exceeded = True
+        client.job_statuses[job_id] = {
+            "job": {
+                "id": job_id,
+                "status": "expired",
+                "lease_epoch": 1,
+                "holder_host_id": host_id,
+                "kind": "writer-run",
+                "role_name": f"automation:test:{job_id}",
+                "role_generation": 1,
+                "role_effect": None,
+                "started_at": None,
+                "first_action_at": None,
+                "native_session": None,
+            }
+        }
+
+        runtime_mgr = RuntimeManager(role_config=self.role_cfg)
+        d = JobDispatcher(
+            base_url="https://hub.dtcdev.click",
+            host_id=host_id,
+            token_provider=lambda: "host-token-123",
+            client=client,
+            runtime_mgr=runtime_mgr,
+        )
+
+        return d, client, runs_dir, run_dir, active_idx
+
+    def test_terminal_reconciliation_unstarted_v18_style(self):
+        job_id = "job-unstarted-v18-001"
+        d, client, runs_dir, run_dir, active_idx = self._unstarted_terminal_fixture(job_id)
+        recovered = d.recover_active_role_jobs()
+        self.assertEqual(len(recovered), 1)
+        rec = recovered[0]
+        self.assertTrue(rec.get("recovered"))
+        self.assertEqual(rec.get("status"), "reconciled")
+        self.assertEqual(rec.get("outcome"), "failed")
+        self.assertEqual(rec.get("terminal_case"), "unstarted")
+
+        # Active pointer unlinked only after validated ACK
+        self.assertFalse(active_idx.exists())
+
+        # Custody file preserved and updated with terminal_reconciled
+        custody_file = run_dir / f"custody-{job_id}.json"
+        self.assertTrue(custody_file.exists())
+        custody, _, _ = rld.safe_read_bounded_json(custody_file)
+        self.assertEqual(custody.get("phase"), "terminal_reconciled")
+        self.assertTrue(custody.get("reconciled"))
+        self.assertEqual(custody.get("reconciled_outcome"), "failed")
+
+        # Second recovery run skips already-reconciled custody
+        recovered_second = d.recover_active_role_jobs()
+        self.assertEqual(len(recovered_second), 0)
+
+    def test_terminal_reconciliation_archive_retry_preserves_original_and_durable_ack(self):
+        job_id = "job-terminal-archive-retry"
+        d, client, runs_dir, run_dir, active_idx = self._unstarted_terminal_fixture(job_id)
+        before = active_idx.read_bytes()
+        with patch("agent_hub_host.jobs.os.rename", side_effect=PermissionError("archive unavailable")):
+            held = d.recover_active_role_jobs()
+        self.assertEqual(held[0]["reason"], "terminal_archive_pending")
+        self.assertEqual(active_idx.read_bytes(), before)
+        self.assertEqual(len(client.reconciliations), 1)
+        self.assertEqual(d.recover_active_role_jobs(), [])
+        self.assertEqual(len(client.reconciliations), 1, "local archive retry must not repeat server request")
+        self.assertFalse(active_idx.exists())
+        archives = list(run_dir.glob(f"settled-active-{job_id}-*.json"))
+        self.assertEqual(len(archives), 1)
+        self.assertEqual(archives[0].read_bytes(), before)
+
+    def test_terminal_reconciliation_refuses_incomplete_ack_without_archiving(self):
+        job_id = "job-terminal-missing-receipt"
+        d, client, runs_dir, run_dir, active_idx = self._unstarted_terminal_fixture(job_id)
+        before = active_idx.read_bytes()
+        client.reconcile_override = lambda jid, tok, data: {
+            "status": "reconciled", "reconciled": True, "job_id": jid,
+            "epoch": 1, "generation": 1, "terminal_case": "unstarted", "outcome": "failed"
+        }
+        held = d.recover_active_role_jobs()
+        self.assertEqual(held[0]["reason"], "uncorrelated_reconciliation_ack")
+        self.assertEqual(active_idx.read_bytes(), before)
+        self.assertEqual(list(run_dir.glob("settled-active-*")), [])
+
+    def test_terminal_reconciliation_executed_v17_style_corroborated(self):
+        """Executed job with corroborated native target reconciles to failed terminal receipt."""
+        job_id = "job-executed-v17-002"
+        client = ControlledMockJobsClient()
+        runs_dir = self.role_cfg.runs_dir
+        run_dir = runs_dir / f"writer-run-{job_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        host_id = "test-host-recover"
+        native_sid = "60bbfd26-6666-4666-8666-666666666666"
+        task_id = f"hub-role-writer-run-{job_id}-g1-e1"
+
+        # Native session record in mock store
+        binding_record = {
+            "session_id": native_sid,
+            "tag": f"task-{task_id}",
+            "workspace": str(self.workspace),
+            "generation": 1,
+            "launcher_task_id": task_id,
+        }
+        (self.role_cfg.state_dir / "native-sessions.json").write_text(
+            json.dumps({"sessions": {native_sid: binding_record}}), encoding="utf-8"
+        )
+
+        # First action and start ack exist locally
+        (run_dir / f"first-action-{job_id}.json").write_text("{}", encoding="utf-8")
+        (run_dir / f"start-ack-{job_id}.json").write_text("{}", encoding="utf-8")
+
+        save_role_custody(
+            runs_dir=runs_dir,
+            run_dir=run_dir,
+            job_id=job_id,
+            data={
+                "job_id": job_id,
+                "kind": "writer-run",
+                "role_binding": {
+                    "name": f"automation:test:{job_id}",
+                    "generation": 1,
+                    "host_id": host_id,
+                    "profile": "writer-run",
+                    "ttl_seconds": 300,
+                },
+                "lease_epoch": 1,
+                "job_token": f"tok-{job_id}",
+                "deadline_at": time.time() - 10.0,
+                "payload": {"date": "2026-10-18"},
+                "base_url": "https://hub.dtcdev.click",
+                "host_id": host_id,
+                "task_id": task_id,
+                "phase": "running",
+                "native_session": native_sid,
+                "claimed_at": time.time() - 30.0,
+            },
+        )
+
+        active_idx = runs_dir / f"active-role-{job_id}.json"
+        self.assertTrue(active_idx.exists())
+
+        # Server confirmed expired with role_effect present but native_session NULL (V17 shape)
+        client.deadline_exceeded = True
+        client.job_statuses[job_id] = {
+            "job": {
+                "id": job_id,
+                "status": "expired",
+                "lease_epoch": 1,
+                "holder_host_id": host_id,
+                "kind": "writer-run",
+                "role_name": f"automation:test:{job_id}",
+                "role_generation": 1,
+                "role_effect": json.dumps({"action": "execute", "epoch": 1, "generation": 1}),
+                "started_at": "2026-10-18T08:00:00Z",
+                "first_action_at": "2026-10-18T08:00:00Z",
+                "native_session": native_sid,
+            }
+        }
+
+        runtime_mgr = RuntimeManager(role_config=self.role_cfg)
+        d = JobDispatcher(
+            base_url="https://hub.dtcdev.click",
+            host_id=host_id,
+            token_provider=lambda: "host-token-123",
+            client=client,
+            runtime_mgr=runtime_mgr,
+        )
+
+        client.retirement_marker = {"native_id": native_sid, "tag": f"task-{task_id}", "workspace": str(self.workspace),
+                                    "engine": "antigravity", "created_at_ms": 1000, "generation": 1,
+                                    "cause": "finished", "finished_at_ms": 2000}
+        # Local maintained positive retirement and full server association are both required.
+        with patch("agent_hub_host.jobs.verify_native_retirement", return_value=(True, {"finished_at_ms": 2000}, "retired_tombstone_verified")), patch.object(JobDispatcher, "_corroborate_native_target", return_value=NativeTarget(
+            session_id=native_sid,
+            tag=f"task-{task_id}",
+            workspace=str(self.workspace), created_at_ms=1000, engine="antigravity",
+        )):
+            qualified = dict(client.job_statuses[job_id]["job"])
+            client.job_statuses[job_id]["job"].update(native_session=None, started_at=None, first_action_at=None)
+            held = d.recover_active_role_jobs()
+            self.assertEqual(held[0].get("reason"), "missing_server_native_association")
+            self.assertTrue(active_idx.exists())
+            self.assertEqual(client.reconciliations, [])
+            client.job_statuses[job_id]["job"] = qualified
+            recovered = d.recover_active_role_jobs()
+            self.assertEqual(len(recovered), 1)
+            rec = recovered[0]
+            self.assertTrue(rec.get("recovered"))
+            self.assertEqual(rec.get("status"), "reconciled")
+            self.assertEqual(rec.get("outcome"), "failed")
+            self.assertEqual(rec.get("terminal_case"), "executed")
+
+            # Active index unlinked
+            self.assertFalse(active_idx.exists())
+            archives = list(run_dir.glob(f"settled-active-{job_id}-*.json"))
+            self.assertEqual(len(archives), 1)
+            original, _, _ = rld.safe_read_bounded_json(archives[0])
+            self.assertEqual(original.get("phase"), "running")
+
+            # Reconcile called with native_session
+            self.assertEqual(len(client.reconciliations), 1)
+            self.assertEqual(client.reconciliations[0]["data"].get("terminal_case"), "executed")
+            self.assertEqual(client.reconciliations[0]["data"].get("native_session"), native_sid)
+
+    def test_terminal_reconciliation_holds_on_running_process(self):
+        """Executed job with alive running physical process fails closed (HOLD) without reconciling."""
+        job_id = "job-running-proc-003"
+        client = ControlledMockJobsClient()
+        runs_dir = self.role_cfg.runs_dir
+        run_dir = runs_dir / f"writer-run-{job_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        host_id = "test-host-recover"
+        native_sid = "77777777-7777-4777-8777-777777777777"
+        task_id = f"hub-role-writer-run-{job_id}-g1-e1"
+
+        dummy_proc = self._make_dummy_worker_process()
+        try:
+            (run_dir / f"first-action-{job_id}.json").write_text("{}", encoding="utf-8")
+            save_role_custody(
+                runs_dir=runs_dir,
+                run_dir=run_dir,
+                job_id=job_id,
+                data={
+                    "job_id": job_id,
+                    "kind": "writer-run",
+                    "role_binding": {
+                        "name": f"automation:test:{job_id}",
+                        "generation": 1,
+                        "host_id": host_id,
+                        "profile": "writer-run",
+                        "ttl_seconds": 300,
+                    },
+                    "lease_epoch": 1,
+                    "job_token": f"tok-{job_id}",
+                    "deadline_at": time.time() - 10.0,
+                    "payload": {"date": "2026-10-18"},
+                    "base_url": "https://hub.dtcdev.click",
+                    "host_id": host_id,
+                    "task_id": task_id,
+                    "phase": "running",
+                    "native_session": native_sid,
+                    "claimed_at": time.time() - 30.0,
+                },
+            )
+
+            client.deadline_exceeded = True
+            client.job_statuses[job_id] = {
+                "job": {
+                    "id": job_id,
+                    "status": "expired",
+                    "lease_epoch": 1,
+                    "holder_host_id": host_id,
+                    "kind": "writer-run",
+                    "role_name": f"automation:test:{job_id}",
+                    "role_generation": 1,
+                    "role_effect": "{}",
+                    "started_at": "2026-10-18T08:00:00Z", "first_action_at": "2026-10-18T08:00:00Z",
+                    "native_session": native_sid,
+                }
+            }
+
+            runtime_mgr = RuntimeManager(role_config=self.role_cfg)
+            d = JobDispatcher(
+                base_url="https://hub.dtcdev.click",
+                host_id=host_id,
+                token_provider=lambda: "host-token-123",
+                client=client,
+                runtime_mgr=runtime_mgr,
+            )
+
+            target = NativeTarget(
+                session_id=native_sid,
+                tag=f"task-{task_id}",
+                workspace=str(self.workspace), created_at_ms=1000, engine="antigravity",
+            )
+
+            with patch.object(JobDispatcher, "_corroborate_native_target", return_value=target), \
+                 patch("agent_hub_host.jobs.verify_native_retirement", return_value=(False, None, "target_still_active")),                  patch.object(JobDispatcher, "_stop_native_target_safely", side_effect=AssertionError("passive reconciliation must not stop")):
+                recovered = d.recover_active_role_jobs()
+                self.assertEqual(len(recovered), 1)
+                self.assertEqual(recovered[0].get("status"), "HOLD")
+                self.assertEqual(recovered[0].get("reason"), "native_retirement_unproved")
+                # Active index remains preserved
+                self.assertTrue((runs_dir / f"active-role-{job_id}.json").exists())
+                # Reconcile was NEVER called
+                self.assertEqual(len(client.reconciliations), 0)
+        finally:
+            dummy_proc.terminate()
+            dummy_proc.wait()
+
+    def test_terminal_reconciliation_rejects_uncorrelated_or_generic_server_ack(self):
+        """SDK rejects generic or mismatched server ACK; custody preserved without archiving."""
+        job_id = "job-uncorrelated-ack-004"
+        client = ControlledMockJobsClient()
+        runs_dir = self.role_cfg.runs_dir
+        run_dir = runs_dir / f"writer-run-{job_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        host_id = "test-host-recover"
+
+        save_role_custody(
+            runs_dir=runs_dir,
+            run_dir=run_dir,
+            job_id=job_id,
+            data={
+                "job_id": job_id,
+                "kind": "writer-run",
+                "role_binding": {
+                    "name": f"automation:test:{job_id}",
+                    "generation": 1,
+                    "host_id": host_id,
+                    "profile": "writer-run",
+                    "ttl_seconds": 300,
+                },
+                "lease_epoch": 1,
+                "job_token": f"tok-{job_id}",
+                "deadline_at": time.time() - 10.0,
+                "payload": {},
+                "base_url": "https://hub.dtcdev.click",
+                "host_id": host_id,
+                "task_id": f"hub-role-writer-run-{job_id}-g1-e1",
+                "phase": "claimed",
+                "claimed_at": time.time() - 30.0,
+            },
+        )
+
+        client.deadline_exceeded = True
+        client.job_statuses[job_id] = {
+            "job": {
+                "id": job_id,
+                "status": "expired",
+                "lease_epoch": 1,
+                "holder_host_id": host_id,
+                "kind": "writer-run",
+                "role_name": f"automation:test:{job_id}",
+                "role_generation": 1,
+                "role_effect": None,
+                "started_at": None,
+                "first_action_at": None,
+                "native_session": None,
+            }
+        }
+
+        # Override reconcile response to return wrong job_id (or generic success)
+        client.reconcile_override = lambda jid, tok, d: {
+            "reconciled": True,
+            "job_id": "wrong-job-id",
+            "epoch": 1,
+            "generation": 1,
+            "outcome": "succeeded",  # business success forbidden
+        }
+
+        runtime_mgr = RuntimeManager(role_config=self.role_cfg)
+        d = JobDispatcher(
+            base_url="https://hub.dtcdev.click",
+            host_id=host_id,
+            token_provider=lambda: "host-token-123",
+            client=client,
+            runtime_mgr=runtime_mgr,
+        )
+
+        recovered = d.recover_active_role_jobs()
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].get("status"), "HOLD")
+        self.assertEqual(recovered[0].get("reason"), "uncorrelated_reconciliation_ack")
+        # Active pointer NOT unlinked
+        self.assertTrue((runs_dir / f"active-role-{job_id}.json").exists())
+        # Custody NOT marked reconciled
+        custody, _, _ = rld.safe_read_bounded_json(run_dir / f"custody-{job_id}.json")
+        self.assertFalse(custody.get("reconciled", False))
+
+    def test_terminal_reconciliation_holds_on_server_hold_or_missing_marker(self):
+        """When server returns HOLD (e.g. missing retirement marker), client preserves custody."""
+        job_id = "job-missing-marker-005"
+        client = ControlledMockJobsClient()
+        runs_dir = self.role_cfg.runs_dir
+        run_dir = runs_dir / f"writer-run-{job_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        host_id = "test-host-recover"
+
+        save_role_custody(
+            runs_dir=runs_dir,
+            run_dir=run_dir,
+            job_id=job_id,
+            data={
+                "job_id": job_id,
+                "kind": "writer-run",
+                "role_binding": {
+                    "name": f"automation:test:{job_id}",
+                    "generation": 1,
+                    "host_id": host_id,
+                    "profile": "writer-run",
+                    "ttl_seconds": 300,
+                },
+                "lease_epoch": 1,
+                "job_token": f"tok-{job_id}",
+                "deadline_at": time.time() - 10.0,
+                "payload": {},
+                "base_url": "https://hub.dtcdev.click",
+                "host_id": host_id,
+                "task_id": f"hub-role-writer-run-{job_id}-g1-e1",
+                "phase": "claimed",
+                "claimed_at": time.time() - 30.0,
+            },
+        )
+
+        client.deadline_exceeded = True
+        client.job_statuses[job_id] = {
+            "job": {
+                "id": job_id,
+                "status": "expired",
+                "lease_epoch": 1,
+                "holder_host_id": host_id,
+                "kind": "writer-run",
+                "role_name": f"automation:test:{job_id}",
+                "role_generation": 1,
+                "role_effect": None,
+                "started_at": None,
+                "first_action_at": None,
+                "native_session": None,
+            }
+        }
+
+        # Server returns HOLD due to missing retirement marker
+        client.reconcile_override = lambda jid, tok, d: {
+            "status": "HOLD",
+            "reconciled": False,
+            "reason": "retirement_marker_missing",
+        }
+
+        runtime_mgr = RuntimeManager(role_config=self.role_cfg)
+        d = JobDispatcher(
+            base_url="https://hub.dtcdev.click",
+            host_id=host_id,
+            token_provider=lambda: "host-token-123",
+            client=client,
+            runtime_mgr=runtime_mgr,
+        )
+
+        recovered = d.recover_active_role_jobs()
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].get("status"), "HOLD")
+        self.assertEqual(recovered[0].get("reason"), "server_reconciliation_hold: retirement_marker_missing")
+        # Active pointer remains preserved
+        self.assertTrue((runs_dir / f"active-role-{job_id}.json").exists())
 
 
 if __name__ == "__main__":

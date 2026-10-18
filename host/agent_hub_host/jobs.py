@@ -16,6 +16,8 @@ import logging
 import os
 import pathlib
 import re
+import shutil
+import uuid
 import subprocess
 import sys
 import threading
@@ -31,6 +33,7 @@ from . import root_dispatch as rd
 from . import role_dispatch as rld
 from .role_dispatch import SUPPORTED_ROLE_PROFILES
 from .runtime import RuntimeManager, get_first_action_digest
+from .retired_native import verify_native_retirement
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +64,15 @@ class JobsClient:
             return api.safe_http_json(req, timeout=self.timeout)
         except urllib.error.HTTPError as e:
             if e.code == 409:
+                try:
+                    err_body = e.read().decode("utf-8")
+                    parsed = json.loads(err_body)
+                    if isinstance(parsed, dict):
+                        parsed.setdefault("error", "conflict")
+                        parsed["status_code"] = 409
+                        return parsed
+                except Exception:
+                    pass
                 return {"error": "conflict", "status_code": 409}
             if e.code == 401:
                 if is_job_token:
@@ -227,6 +239,23 @@ class JobsClient:
         """Retrieve authoritative status of a job from the Hub. GET /api/jobs/{id}/status"""
         url = f"{base_url}/api/jobs/{urllib.parse.quote(job_id)}/status"
         return self._request("GET", url, token=token)
+
+    def reconcile_terminal_job(
+        self,
+        base_url: str,
+        job_id: str,
+        token: str,
+        data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Reconcile a terminal role job (M8). POST /api/jobs/{id}/reconcile"""
+        url = f"{base_url}/api/jobs/{urllib.parse.quote(job_id)}/reconcile"
+        return self._request(
+            "POST",
+            url,
+            data=data,
+            token=token,
+            is_job_token=False
+        )
 
 
 
@@ -1655,6 +1684,58 @@ class JobDispatcher:
                 results.append(rec)
         return results
 
+    @staticmethod
+    def _terminal_ack_matches(reply, job_id, epoch, generation, terminal_case, server_status, target=None, tombstone=None):
+        if type(epoch) is not int or epoch <= 0 or type(generation) is not int or generation <= 0:
+            return False
+        if not isinstance(reply, dict) or reply.get("reconciled") is not True or reply.get("status") != "reconciled":
+            return False
+        receipt = reply.get("receipt")
+        if not isinstance(receipt, dict):
+            return False
+        for value in (reply, receipt):
+            if (value.get("job_id") != job_id or type(value.get("epoch")) is not int or value.get("epoch") != epoch
+                    or type(value.get("generation")) is not int or value.get("generation") != generation
+                    or value.get("outcome") != "failed" or value.get("terminal_case") != terminal_case):
+                return False
+        if (receipt.get("reconciled") is not True or receipt.get("status") != "failed"
+                or receipt.get("original_status") != server_status
+                or receipt.get("summary") != "Terminal role reconciliation after authoritative expiry or fence"
+                or receipt.get("evidenceRefs") != []):
+            return False
+        if terminal_case == "executed":
+            marker = receipt.get("native_retirement")
+            if not target or not isinstance(marker, dict) or not isinstance(tombstone, dict):
+                return False
+            expected = {"native_id": target.session_id, "tag": target.tag, "workspace": target.workspace,
+                        "engine": target.engine, "created_at_ms": target.created_at_ms,
+                        "cause": "finished", "finished_at_ms": tombstone.get("finished_at_ms")}
+            if receipt.get("native_session") != target.session_id or any(marker.get(k) != v for k, v in expected.items()):
+                return False
+            if any(type(marker.get(key)) is not int or marker[key] <= 0 for key in ("generation", "created_at_ms", "finished_at_ms")):
+                return False
+        elif receipt.get("native_session") is not None or receipt.get("native_retirement") is not None:
+            return False
+        return True
+
+    @staticmethod
+    def _archive_terminal_pointer(runs_dir, run_dir, job_id, custody):
+        # Preserve the original active record as a private archive, never unlink it.
+        active = runs_dir / f"active-role-{job_id}.json"
+        if not os.path.lexists(active):
+            return None
+        current, _, _ = rld.safe_read_bounded_json(active, max_bytes=65536)
+        if (not isinstance(current, dict) or current.get("job_id") != job_id
+                or current.get("lease_epoch") != custody.get("lease_epoch")
+                or current.get("role_binding") != custody.get("role_binding")):
+            raise ValueError("active_pointer_changed")
+        rld.ensure_private_dir(run_dir)
+        archive = run_dir / f"settled-active-{job_id}-{uuid.uuid4().hex}.json"
+        if os.path.lexists(archive):
+            raise ValueError("archive_conflict")
+        os.rename(active, archive)
+        return str(archive)
+
     def _recover_one_role_job(self, state_file: pathlib.Path, runs_dir: pathlib.Path) -> Optional[Dict[str, Any]]:
         try:
             custody, _, _ = rld.safe_read_bounded_json(state_file, max_bytes=65536)
@@ -1688,6 +1769,37 @@ class JobDispatcher:
             return None
 
         run_dir = runs_dir / f"{kind}-{job_id}"
+        if not isinstance(job_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", job_id):
+            return None
+        # Resume local archival after a durably correlated ACK; never repeat an effect.
+        try:
+            stored, _, _ = rld.safe_read_bounded_json(run_dir / f"custody-{job_id}.json", max_bytes=65536)
+        except Exception:
+            stored = None
+        if (isinstance(stored, dict) and stored.get("reconciled") is True
+                and stored.get("job_id") == job_id and stored.get("lease_epoch") == lease_epoch
+                and stored.get("role_binding") == role and stored.get("host_id") == host_id):
+            receipt = stored.get("reconciliation_receipt")
+            target = None
+            tombstone = None
+            if isinstance(receipt, dict) and receipt.get("terminal_case") == "executed":
+                marker = receipt.get("native_retirement")
+                if isinstance(marker, dict) and marker.get("tag") == "task-" + str(stored.get("task_id")):
+                    target = rld.NativeTarget(session_id=marker.get("native_id"), tag=marker.get("tag"),
+                                              workspace=marker.get("workspace"), engine=marker.get("engine"),
+                                              created_at_ms=marker.get("created_at_ms"))
+                    tombstone = {"finished_at_ms": marker.get("finished_at_ms")}
+            reply = {**(receipt if isinstance(receipt, dict) else {}), "status": "reconciled", "receipt": receipt}
+            if (not isinstance(receipt, dict) or receipt.get("original_status") not in ("expired", "fenced", "failed", "cancelled")
+                    or not self._terminal_ack_matches(reply, job_id, lease_epoch, role.get("generation"),
+                                                      receipt.get("terminal_case"), receipt.get("original_status"), target, tombstone)):
+                return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": "invalid_stored_reconciliation_receipt"}
+            try:
+                self._archive_terminal_pointer(runs_dir, run_dir, job_id, stored)
+            except Exception:
+                return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": "terminal_archive_pending"}
+            return None
+
         uncertain_file = run_dir / f"outcome-uncertain-{job_id}.json"
         if uncertain_file.exists() or custody.get("phase") == "uncertain":
             idx = runs_dir / f"active-role-{job_id}.json"
@@ -1823,7 +1935,10 @@ class JobDispatcher:
 
             # Confirmed fence: stop ONLY corroborated exact owned native
             target = self._corroborate_native_target(job_id, kind, role, lease_epoch, run_dir)
-            if target is not None:
+            # Preserve existing authoritative generation-fence containment. The new
+            # expiry reconciliation path is passive and never substitutes for it.
+            reconcile_expiry = is_deadline_exceeded and not is_stale_epoch and callable(getattr(self.client, "reconcile_terminal_job", None))
+            if target is not None and not reconcile_expiry:
                 self._stop_native_target_safely(target)
 
             phase = "deadline_exceeded" if is_deadline_exceeded else "stale_generation_fenced"
@@ -1831,6 +1946,123 @@ class JobDispatcher:
                 f"renew_job returned {renew_err} (status_code={status_code}): "
                 f"authoritative server status confirmed {server_status} (epoch={server_epoch}, generation advanced or lease lost)"
             )
+
+            # Attempt supported terminal role reconciliation (M8)
+            reconcile_fn = getattr(self.client, "reconcile_terminal_job", None) if reconcile_expiry else None
+            if callable(reconcile_fn):
+                start_ack_file = run_dir / f"start-ack-{job_id}.json"
+                first_action_file = run_dir / f"first-action-{job_id}.json"
+                is_unstarted = (
+                    not start_ack_file.exists()
+                    and not first_action_file.exists()
+                    and not (run_dir / f"outcome-uncertain-{job_id}.json").exists()
+                    and not custody.get("native_session")
+                    and not custody.get("execution_receipt")
+                    and custody.get("phase") not in ("uncertain", "executed", "running")
+                    and not server_job.get("started_at")
+                    and not server_job.get("first_action_at")
+                    and not server_job.get("native_session")
+                    and server_job.get("role_effect") is None
+                )
+
+                terminal_case = None
+                reconcile_payload = {
+                    "epoch": lease_epoch,
+                    "generation": role.get("generation"),
+                    "summary": "Terminal role reconciliation after authoritative expiry or fence",
+                }
+
+                tombstone = None
+                can_reconcile = False
+                if is_unstarted:
+                    terminal_case = "unstarted"
+                    reconcile_payload["terminal_case"] = "unstarted"
+                    can_reconcile = True
+                else:
+                    # Executed case: require corroborated native target and verified stopped physical process
+                    if target is not None:
+                        if (server_job.get("native_session") != target.session_id or not server_job.get("started_at")
+                                or not server_job.get("first_action_at")):
+                            return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": "missing_server_native_association"}
+                        if type(target.created_at_ms) is not int or target.created_at_ms <= 0 or not target.engine:
+                            return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": "incomplete_native_identity"}
+                        executable = shutil.which("aplexer")
+                        try:
+                            retired, tombstone, _ = verify_native_retirement(executable, target) if executable else (False, None, "missing_native_cli")
+                        except Exception:
+                            retired, tombstone = False, None
+                        if not retired or not isinstance(tombstone, dict):
+                            return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": "native_retirement_unproved"}
+                        terminal_case = "executed"
+                        reconcile_payload["terminal_case"] = "executed"
+                        reconcile_payload["native_session"] = target.session_id
+                        can_reconcile = True
+                    else:
+                        # Cannot corroborate native target on executed job: fail-closed HOLD
+                        logger.warning("Cannot corroborate native target for executed job %s; HOLD and preserve custody", job_id)
+                        return {
+                            "job_id": job_id,
+                            "recovered": False,
+                            "status": "HOLD",
+                            "reason": "uncorroborated_native_target",
+                        }
+
+                if can_reconcile:
+                    host_token = self.token_provider()
+                    try:
+                        rec_res = reconcile_fn(self.base_url, job_id, host_token, reconcile_payload)
+                    except Exception as e:
+                        logger.warning("reconcile_terminal_job transport failure for %s: %s", job_id, type(e).__name__)
+                        rec_res = {"error": "transport_failure"}
+
+                    if isinstance(rec_res, dict) and rec_res.get("reconciled") is True:
+                        # Strict SDK correlation checks: exact job_id, epoch, generation
+                        if self._terminal_ack_matches(rec_res, job_id, lease_epoch, role.get("generation"),
+                                                      terminal_case, server_status, target, tombstone):
+                            custody["prior_phase"] = custody.get("phase")
+                            custody["reconciled"] = True
+                            custody["phase"] = "terminal_reconciled"
+                            custody["reconciled_outcome"] = "failed"
+                            custody["reconciled_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                            custody["reconciliation_receipt"] = rec_res["receipt"]
+                            try:
+                                # Persist ACK first; the archive preserves the original active bytes.
+                                rld.write_private_json(run_dir / f"custody-{job_id}.json", custody)
+                                archive = self._archive_terminal_pointer(runs_dir, run_dir, job_id, custody)
+                                if archive:
+                                    custody["active_pointer_archive"] = archive
+                                    rld.write_private_json(run_dir / f"custody-{job_id}.json", custody)
+                            except Exception:
+                                return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": "terminal_archive_pending"}
+
+                            logger.info("Terminal role job %s reconciled on server as %s (%s)", job_id, rec_res.get("outcome"), terminal_case)
+                            return {
+                                "job_id": job_id,
+                                "recovered": True,
+                                "status": "reconciled",
+                                "outcome": rec_res.get("outcome", "failed"),
+                                "reconciled": True,
+                                "terminal_case": terminal_case,
+                            }
+                        else:
+                            logger.warning("Server reconciliation ACK rejected due to correlation mismatch for %s", job_id)
+                            # SDK wrong-job/generic ACK rejection: do not archive custody or mark reconciled
+                            return {
+                                "job_id": job_id,
+                                "recovered": False,
+                                "status": "HOLD",
+                                "reason": "uncorrelated_reconciliation_ack",
+                            }
+                    elif isinstance(rec_res, dict) and rec_res.get("status") == "HOLD":
+                        logger.warning("Server returned HOLD for terminal reconciliation of %s: %s", job_id, rec_res.get("reason"))
+                        return {
+                            "job_id": job_id,
+                            "recovered": False,
+                            "status": "HOLD",
+                            "reason": f"server_reconciliation_hold: {rec_res.get('reason')}",
+                        }
+                    return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": "terminal_reconciliation_refused"}
+
             write_role_uncertain_proof(
                 runs_dir=runs_dir,
                 run_dir=run_dir,

@@ -28,6 +28,8 @@ async function fixture() {
         kind,kind,await sha256('token-' + kind),kind,kind,kind === 'routing-client' ? 'routing-client:test' : 'ordinary',
         kind === 'routing-client' ? '["routing:submit"]' : '["host","admin","jobs:create"]',new Date(BASE).toISOString(),'2100-01-01T00:00:00Z');
     }
+    hub.sql.exec("UPDATE credentials SET approval_seq=1 WHERE kind='host'");
+    hub.sql.exec('UPDATE machines SET approval_seq=1');
     return createSessionCookie(hub.env, { sub: 'admin', email: 'admin@fake.local', isAdmin: true, csrfToken: 'roles-csrf', exp: Math.floor(Date.now()/1000)+3600 });
   });
   const request = async (path: string, body?: any, token = 'token-host-a', method = body === undefined ? 'GET' : 'POST', session = false, csrf = true) => {
@@ -386,5 +388,281 @@ describe('configured roles through authenticated public HTTP and real Hub SQLite
     const execRes = await f.execute(wakeRes.data.job_id, claimRes.data.job_token, 2, 1);
     expect(execRes.data.execute).toBe(true);
     expect(execRes.data.profile).toBe('principal-wake');
+  });
+
+  it('refuses nonterminal and successful jobs even after their lease expires', async () => {
+    for (const status of ['claimed', 'running', 'succeeded', 'finished']) {
+      const f = await fixture(); await f.configure();
+      const id = (await f.offer('terminal-status-' + status)).data.job_id;
+      await f.claim(id);
+      await f.inspect((hub: any) => {
+        hub.sql.exec('UPDATE jobs SET status=? WHERE id=?', status, id);
+        hub.sql.exec("UPDATE leases SET expires_at=? WHERE name='automation:demo:writer'",
+          new Date(hub._roleNow - 1000).toISOString());
+      });
+      const result = await f.request(`/api/jobs/${id}/reconcile`, {
+        epoch: 2, generation: 1, terminal_case: 'unstarted'
+      });
+      expect(result.code, status).toBe(409);
+      expect(result.data.error, status).toBe('job_not_terminal');
+      expect(await f.inspect((hub: any) => hub.sql.exec('SELECT role_finish FROM jobs WHERE id=?', id).one().role_finish), status).toBeNull();
+    }
+  });
+
+  it('reconciles terminal unstarted V18-style and executed V17-style role jobs with server marker, rejecting business success and conflicting replay', async () => {
+    const f = await fixture();
+    await f.configure();
+
+    // 1. V18-style: claimed, unstarted, terminal expired without native or execution intent
+    const v18Offer = await f.offer('v18-offer');
+    expect(v18Offer.code).toBe(201);
+    const v18Id = v18Offer.data.job_id;
+    const v18Claim = (await f.claim(v18Id)).data;
+    expect(v18Claim.lease_epoch).toBe(2);
+
+    // Job expires without start or execution intent
+    await f.inspect((hub: any) => {
+      hub.sql.exec("UPDATE jobs SET status = 'expired', deadline_at = ? WHERE id = ?", new Date(hub._roleNow - 1000).toISOString(), v18Id);
+      hub.sql.exec("UPDATE leases SET expires_at = ? WHERE name = 'automation:demo:writer'", new Date(hub._roleNow - 1000).toISOString());
+    });
+
+    // Cleanup authority does not depend on launch quota/admission being available.
+    await f.inspect((hub: any) => hub.sql.exec("UPDATE machines SET last_heartbeat=? WHERE id='host-a'", JSON.stringify({ gate: { launch_allowed: false } })));
+    // Reconcile terminal unstarted
+    const v18Rec = await f.request(`/api/jobs/${v18Id}/reconcile`, {
+      epoch: 2,
+      generation: 1,
+      terminal_case: 'unstarted',
+      summary: 'settled terminal unstarted'
+    }, 'token-host-a');
+    expect(v18Rec.code).toBe(200);
+    expect(v18Rec.data).toMatchObject({
+      reconciled: true,
+      status: 'reconciled',
+      job_id: v18Id,
+      epoch: 2,
+      generation: 1,
+      outcome: 'failed',
+      terminal_case: 'unstarted'
+    });
+
+    // Verify DB state: original expired status retained, never business success; role_finish has failed outcome
+    const v18Db = await f.inspect((hub: any) => ({
+      job: hub.sql.exec('SELECT status, role_effect, role_finish FROM jobs WHERE id = ?', v18Id).one(),
+      audit: hub.sql.exec("SELECT action, actor, target FROM audit WHERE action = 'reconcile' AND target = ?", v18Id).one()
+    }));
+    expect(v18Db.job.status).toBe('expired');
+    expect(v18Db.job.role_effect).toBeNull();
+    expect(JSON.parse(v18Db.job.role_finish)).toMatchObject({ status: 'failed', outcome: 'failed', terminal_case: 'unstarted' });
+    expect(v18Db.audit).toMatchObject({ action: 'reconcile', actor: 'host:host-a', target: v18Id });
+
+    // Exact idempotent replay returns replay: true
+    const v18Replay = await f.request(`/api/jobs/${v18Id}/reconcile`, {
+      epoch: 2,
+      generation: 1,
+      terminal_case: 'unstarted',
+      summary: 'settled terminal unstarted'
+    }, 'token-host-a');
+    expect(v18Replay.code).toBe(200);
+    expect(v18Replay.data.replay).toBe(true);
+
+    // Conflicting replay returns 409
+    const v18Conflict = await f.request(`/api/jobs/${v18Id}/reconcile`, {
+      epoch: 2,
+      generation: 1,
+      terminal_case: 'unstarted',
+      summary: 'conflicting summary'
+    }, 'token-host-a');
+    expect(v18Conflict.code).toBe(409);
+    expect(v18Conflict.data.error).toBe('reconciliation_conflict');
+
+    await f.inspect((hub: any) => hub.sql.exec("UPDATE machines SET last_heartbeat=? WHERE id='host-a'", JSON.stringify({ gate: { launch_allowed: true } })));
+
+    // 2. Fully acknowledged executed job (actual unacknowledged V17 must remain HOLD).
+    const v17Offer = await f.offer('v17-offer', 'host-a', 2);
+    expect(v17Offer.code).toBe(201);
+    const v17Id = v17Offer.data.job_id;
+    const v17Claim = (await f.claim(v17Id)).data;
+    const v17Exec = await f.execute(v17Id, v17Claim.job_token, 3, 1);
+    expect(v17Exec.data.execute).toBe(true);
+
+    // A fully server-acknowledged role later reaches physical retirement.
+    const nativeSid = '60bbfd26-6666-4666-8666-666666666666';
+    const canonicalTag = `task-hub-role-writer-run-${v17Id}-g1-e3`;
+    expect((await f.request(`/api/jobs/${v17Id}/start`, { epoch: 3, evidence_digest: 'sha256:0123456789abcdef', native_session: nativeSid, launcher_task_id: canonicalTag.slice(5) }, v17Claim.job_token)).code).toBe(200);
+    await f.advance(20000);
+    await f.inspect((hub: any) => {
+      // Preserve the acknowledged native association while expiring the job.
+      hub.sql.exec("UPDATE jobs SET status = 'expired', deadline_at = ? WHERE id = ?", new Date(hub._roleNow - 1000).toISOString(), v17Id);
+      hub.sql.exec("UPDATE leases SET expires_at = ? WHERE name = 'automation:demo:writer'", new Date(hub._roleNow - 1000).toISOString());
+      const bindingJson = JSON.stringify({
+        provenance: 'observed_native',
+        native_id: nativeSid,
+        tag: canonicalTag,
+        workspace: '/test/workspace',
+        native_created_at_ms: BASE,
+        generation: 1,
+        retirement: {
+          native_id: nativeSid,
+          tag: canonicalTag,
+          workspace: '/test/workspace',
+          engine: 'writer-run',
+          generation: 1,
+          cause: 'finished',
+          created_at_ms: BASE,
+          finished_at_ms: BASE + 10000,
+          retired_at: new Date(BASE + 10000).toISOString()
+        }
+      });
+      hub.sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
+        VALUES (?, 'host-a', 'req-v17', '{}', 'host-a', 'writer-run', 'task', 'stopped', ?, ?, ?)`,
+        nativeSid, bindingJson, new Date(BASE).toISOString(), new Date(BASE + 10000).toISOString());
+    });
+
+    // Attempting unstarted on executed job fails closed
+    const invalidUnstarted = await f.request(`/api/jobs/${v17Id}/reconcile`, {
+      epoch: 3,
+      generation: 1,
+      terminal_case: 'unstarted'
+    }, 'token-host-a');
+    expect(invalidUnstarted.code).toBe(409);
+    expect(invalidUnstarted.data.error).toBe('execution_intent_recorded');
+
+    // Reconcile executed V17 with posthoc correlation tuple
+    const v17Rec = await f.request(`/api/jobs/${v17Id}/reconcile`, {
+      epoch: 3,
+      generation: 1,
+      terminal_case: 'executed',
+      native_session: nativeSid,
+      summary: 'settled terminal executed'
+    }, 'token-host-a');
+    expect(v17Rec.code).toBe(200);
+    expect(v17Rec.data).toMatchObject({
+      reconciled: true,
+      status: 'reconciled',
+      job_id: v17Id,
+      epoch: 3,
+      generation: 1,
+      outcome: 'failed',
+      terminal_case: 'executed'
+    });
+
+    // DB state: status remains expired, role_effect preserved, null started_at preserved (no fabrication)
+    const v17Db = await f.inspect((hub: any) => hub.sql.exec('SELECT status, role_effect, role_finish, started_at, native_session FROM jobs WHERE id = ?', v17Id).one());
+    expect(v17Db.status).toBe('expired');
+    expect(v17Db.role_effect).not.toBeNull();
+    expect(v17Db.started_at).not.toBeNull();
+    expect(v17Db.native_session).toBe(nativeSid);
+    expect(JSON.parse(v17Db.role_finish)).toMatchObject({ status: 'failed', outcome: 'failed', terminal_case: 'executed', native_session: nativeSid });
+
+    // Now that V17 fence is discharged, next job with same payload/date can execute
+    const nextOffer = await f.offer('v17-next', 'host-a', 3);
+    expect(nextOffer.code).toBe(201);
+    const nextClaim = (await f.claim(nextOffer.data.job_id)).data;
+    const nextExec = await f.execute(nextOffer.data.job_id, nextClaim.job_token, 4, 1);
+    expect(nextExec.data.execute).toBe(true);
+  });
+
+  it('refuses reconciliation on wrong host, epoch/generation mismatch, revocation race, and malformed marker while preserving active leases', async () => {
+    const f = await fixture();
+    await f.configure();
+
+    const offered = await f.offer('guard-test');
+    const id = offered.data.job_id;
+    const claim = (await f.claim(id)).data;
+
+    // Reject non-terminal job reconciliation
+    const activeReconcile = await f.request(`/api/jobs/${id}/reconcile`, { epoch: 2, generation: 1, terminal_case: 'unstarted' }, 'token-host-a');
+    expect(activeReconcile.code).toBe(409);
+    expect(activeReconcile.data.error).toBe('job_not_terminal');
+
+    // Mark expired
+    await f.inspect((hub: any) => hub.sql.exec("UPDATE jobs SET status = 'expired' WHERE id = ?", id));
+
+    // Reject unauthorized callers (agents, jobs, foreign hosts, wrong host)
+    for (const token of ['token-agent', 'token-job', 'token-foreign', 'token-host-b']) {
+      const res = await f.request(`/api/jobs/${id}/reconcile`, { epoch: 2, generation: 1, terminal_case: 'unstarted' }, token);
+      expect(res.code).toBe(403);
+    }
+
+    const mixed = await f.stub.fetch(new Request(`https://hub.test/api/jobs/${id}/reconcile`, { method: 'POST', headers: { Authorization: 'Bearer token-host-a', Cookie: 'irrelevant=1', 'Content-Type': 'application/json' }, body: JSON.stringify({ epoch: 2, generation: 1, terminal_case: 'unstarted' }) }));
+    expect(mixed.status).toBe(403);
+    expect(await mixed.json()).toMatchObject({ error: 'mixed_authority' });
+
+    // Reject epoch and generation mismatch
+    expect((await f.request(`/api/jobs/${id}/reconcile`, { epoch: 99, generation: 1, terminal_case: 'unstarted' }, 'token-host-a')).code).toBe(409);
+    expect((await f.request(`/api/jobs/${id}/reconcile`, { epoch: 2, generation: 99, terminal_case: 'unstarted' }, 'token-host-a')).code).toBe(409);
+
+    // Re-read credential authority inside the mutation, even if entry authentication passed.
+    const raced = await f.inspect((hub: any) => hub.jobsService.reconcileTerminalJob(id, 'host-a', 'cred-host-a', { epoch: 2, generation: 1, terminal_case: 'unstarted' }, () => {
+      hub.sql.exec("UPDATE credentials SET scopes='[]' WHERE id='cred-host-a'");
+      return true;
+    }));
+    expect(raced).toMatchObject({ error: 'unauthorized_or_stale', status_code: 403 });
+    await f.inspect((hub: any) => hub.sql.exec("UPDATE credentials SET scopes='[\"host\"]' WHERE id='cred-host-a'"));
+
+    // Strict input rejects aliases and malformed or unstarted native claims.
+    for (const extra of [{ lease_epoch: 2 }, { native_session: 42 }, { native_session: 'caller-guessed-session' }]) {
+      expect((await f.request(`/api/jobs/${id}/reconcile`, { epoch: 2, generation: 1, terminal_case: 'unstarted', ...extra }, 'token-host-a')).code).toBe(400);
+    }
+
+    // Marker negative tests for executed case
+    const nativeSid = '99999999-9999-4999-8999-999999999999';
+    const canonicalTag = `task-hub-role-writer-run-${id}-g1-e2`;
+
+    // Actual V17 shape: local execution cannot backfill absent server start evidence.
+    await f.inspect((hub: any) => hub.sql.exec("UPDATE jobs SET role_effect='execute' WHERE id=?", id));
+    const unbound = await f.request(`/api/jobs/${id}/reconcile`, { epoch: 2, generation: 1, terminal_case: 'executed', native_session: nativeSid }, 'token-host-a');
+    expect(unbound.code).toBe(409);
+    expect(unbound.data).toMatchObject({ status: 'HOLD', reason: 'missing_native_session' });
+    expect(await f.inspect((hub: any) => hub.sql.exec('SELECT native_session, first_action_at, role_finish FROM jobs WHERE id=?', id).one())).toMatchObject({ native_session: null, first_action_at: null, role_finish: null });
+
+    // A separately acknowledged executed record reaches the marker checks.
+    await f.inspect((hub: any) => hub.sql.exec('UPDATE jobs SET native_session=?, launcher_task_id=?, started_at=?, first_action_at=? WHERE id=?', nativeSid, canonicalTag.slice(5), new Date(BASE).toISOString(), new Date(BASE).toISOString(), id));
+    // 1. Missing marker
+    await f.inspect((hub: any) => {
+      hub.sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
+        VALUES (?, 'host-a', 'req-neg', '{}', 'host-a', 'writer-run', 'task', 'stopped', ?, ?, ?)`,
+        nativeSid, JSON.stringify({ provenance: 'observed_native', native_id: nativeSid, tag: canonicalTag, workspace: '/test/ws', native_created_at_ms: BASE, generation: 1 }),
+        new Date(BASE).toISOString(), new Date(BASE + 1000).toISOString());
+    });
+    const missingMarker = await f.request(`/api/jobs/${id}/reconcile`, { epoch: 2, generation: 1, terminal_case: 'executed', native_session: nativeSid }, 'token-host-a');
+    expect(missingMarker.code).toBe(409);
+    expect(missingMarker.data).toMatchObject({ status: 'HOLD', reason: 'retirement_marker_missing' });
+
+    // 2. Physical state not stopped (e.g. still running)
+    await f.inspect((hub: any) => hub.sql.exec("UPDATE session_control_sessions SET state = 'running' WHERE id = ?", nativeSid));
+    const runningState = await f.request(`/api/jobs/${id}/reconcile`, { epoch: 2, generation: 1, terminal_case: 'executed', native_session: nativeSid }, 'token-host-a');
+    expect(runningState.code).toBe(409);
+    expect(runningState.data).toMatchObject({ status: 'HOLD', reason: 'session_not_stopped' });
+
+    // 3. Mismatched tag in marker
+    await f.inspect((hub: any) => {
+      hub.sql.exec("UPDATE session_control_sessions SET state = 'stopped', binding_json = ? WHERE id = ?",
+        JSON.stringify({
+          provenance: 'observed_native', native_id: nativeSid, tag: 'task-wrong-tag', workspace: '/test/ws', native_created_at_ms: BASE, generation: 1,
+          retirement: { native_id: nativeSid, tag: 'task-wrong-tag', workspace: '/test/ws', engine: 'writer-run', generation: 1, cause: 'finished', created_at_ms: BASE, finished_at_ms: BASE + 5000 }
+        }), nativeSid);
+    });
+    const wrongTag = await f.request(`/api/jobs/${id}/reconcile`, { epoch: 2, generation: 1, terminal_case: 'executed', native_session: nativeSid }, 'token-host-a');
+    expect(wrongTag.code).toBe(409);
+    expect(wrongTag.data).toMatchObject({ status: 'HOLD', reason: 'binding_mismatch' });
+
+    // Host credential revocation fails closed
+    await f.inspect((hub: any) => hub.sql.exec("UPDATE credentials SET revoked_at = ? WHERE id = 'cred-host-a'", new Date(hub._roleNow).toISOString()));
+    const revoked = await f.request(`/api/jobs/${id}/reconcile`, { epoch: 2, generation: 1, terminal_case: 'unstarted' }, 'token-host-a');
+    expect([401, 403]).toContain(revoked.code);
+
+    // Machine revocation inside mutation transaction fails closed with 403
+    await f.inspect((hub: any) => {
+      hub.sql.exec("UPDATE credentials SET revoked_at = NULL WHERE id = 'cred-host-a'");
+      hub.sql.exec("UPDATE machines SET state = 'revoked' WHERE id = 'host-a'");
+    });
+    const machineRevoked = await f.request(`/api/jobs/${id}/reconcile`, { epoch: 2, generation: 1, terminal_case: 'unstarted' }, 'token-host-a');
+    expect(machineRevoked.code).toBe(403);
+
+    // Verify root lease and leases table completely untouched
+    const rootLease = await f.inspect((hub: any) => hub.sql.exec("SELECT * FROM leases WHERE name = 'root'").one());
+    expect(rootLease).toMatchObject({ name: 'root', epoch: 0, holder_job_id: null });
   });
 });

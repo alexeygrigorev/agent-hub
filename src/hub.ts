@@ -3003,6 +3003,36 @@ export class Hub extends DurableObject {
         return Response.json({ status: 'finished', job_id: jobId });
       }
 
+      // POST /api/jobs/:id/reconcile
+      if (action === 'reconcile') {
+        if (request.headers.has('Authorization') && request.headers.has('Cookie')) return Response.json({ error: 'mixed_authority' }, { status: 403 });
+        if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+        const auth = await this.authenticateBusRequest(request);
+        if (auth.error) return auth.error;
+
+        // Fresh verified approved host-family authority for owning machine/job is mandatory;
+        // expired job credentials, agents, caller booleans and actor-prefix claims never authorize.
+        if (auth.caller?.kind !== 'host' || !auth.scopes?.includes('host') || !auth.caller.machineId || !auth.caller.tokenId) {
+          return Response.json({ error: 'forbidden', reason: 'enrolled_host_required' }, { status: 403 });
+        }
+
+        const body = await safeJson(request);
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          return Response.json({ error: 'invalid_reconciliation' }, { status: 400 });
+        }
+
+        const res = await this.jobsService.reconcileTerminalJob(jobId, auth.caller.machineId, auth.caller.tokenId, body,
+          () => this.sessionControlService.hostObservationAllowed(auth.caller!.machineId, { kind: 'host', machineId: auth.caller!.machineId, tokenId: auth.caller!.tokenId }));
+        if (res.error) {
+          const code = res.status_code || (res.error === 'not_found' ? 404 : (res.error === 'unauthorized_or_stale' || res.error === 'role_unauthorized' ? 403 : 409));
+          return Response.json(res, { status: code });
+        }
+        if (res.status === 'HOLD' || res.reconciled === false) {
+          return Response.json(res, { status: res.status_code || 409 });
+        }
+        return Response.json(res, { status: 200 });
+      }
+
       // POST /api/jobs/:id/decline
       if (action === 'decline') {
         if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });

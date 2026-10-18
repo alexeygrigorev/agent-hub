@@ -223,6 +223,13 @@ export function parseExpiryMs(expiresAt: string | number | null | undefined): nu
   return parsed;
 }
 
+export function parseEpoch(raw: any): number | null {
+  if (raw === undefined || raw === null) return null;
+  const n = typeof raw === 'number' ? raw : parseInt(String(raw), 10);
+  if (!Number.isFinite(n) || isNaN(n) || n < 0 || !Number.isInteger(n)) return null;
+  return n;
+}
+
 export function isLeaseExpired(expiresAt: string | number | null | undefined, nowMs: number): boolean {
   const exp = parseExpiryMs(expiresAt);
   if (exp === null) return true;
@@ -1400,6 +1407,259 @@ export class JobsService {
       this.scheduleAlarm();
 
       return result;
+    });
+  }
+
+  async reconcileTerminalJob(
+    jobId: string,
+    callerHostId: string,
+    callerTokenId: string,
+    body: any,
+    currentHostAuthority?: () => boolean
+  ): Promise<{
+    error?: string;
+    status_code?: number;
+    status?: string;
+    reconciled?: boolean;
+    job_id?: string;
+    epoch?: number;
+    generation?: number;
+    outcome?: string;
+    terminal_case?: string;
+    receipt?: any;
+    replay?: boolean;
+    reason?: string;
+  }> {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return { error: 'invalid_reconciliation', status_code: 400 };
+    }
+    if (Object.keys(body).some(key => !['epoch', 'generation', 'terminal_case', 'native_session', 'summary', 'evidence_refs'].includes(key)) ||
+        (body.summary !== undefined && typeof body.summary !== 'string') ||
+        (body.native_session !== undefined && (typeof body.native_session !== 'string' || body.native_session.length === 0 || body.native_session.length > 256)) ||
+        (body.evidence_refs !== undefined && (!Array.isArray(body.evidence_refs) || body.evidence_refs.length > 16 ||
+          body.evidence_refs.some((ref: any) => typeof ref !== 'string' || ref.length > 256)))) {
+      return { error: 'invalid_reconciliation', status_code: 400 };
+    }
+    const epoch = typeof body.epoch === 'number' && Number.isSafeInteger(body.epoch) && body.epoch > 0 ? body.epoch : null;
+    if (epoch === null) {
+      return { error: 'invalid_epoch', status_code: 400 };
+    }
+    const generation = typeof body.generation === 'number' && Number.isSafeInteger(body.generation) && body.generation > 0 ? body.generation : null;
+    if (generation === null) {
+      return { error: 'invalid_generation', status_code: 400 };
+    }
+
+    return this.withClockSnapshot((now) => {
+      const nowMs = now.getTime();
+      const nowIso = now.toISOString();
+
+      return this.ctx.storage.transactionSync(() => {
+        // Reuse the existing current host-family/approval gate after reading the body.
+        if (typeof currentHostAuthority !== 'function' || !currentHostAuthority()) {
+          return { error: 'unauthorized_or_stale', status_code: 403 };
+        }
+        const cred: any = this.sql.exec('SELECT * FROM credentials WHERE id=?', callerTokenId).toArray()[0];
+        const machine: any = this.sql.exec('SELECT * FROM machines WHERE id=?', callerHostId).toArray()[0];
+        let scopes: any;
+        try { scopes = JSON.parse(cred?.scopes); } catch { scopes = null; }
+        if (!cred || cred.kind !== 'host' || cred.revoked_at || !(Date.parse(cred.expires_at) > nowMs) ||
+            cred.machine_id !== callerHostId || !Array.isArray(scopes) || !scopes.includes('host') || scopes.includes('admin') ||
+            !machine?.registered_at || machine.drained || ['disabled', 'revoked', 'drained', 'dead'].includes(machine.state)) {
+          return { error: 'unauthorized_or_stale', status_code: 403 };
+        }
+
+        // 5. Job lookup
+        const job: any = this.sql.exec('SELECT * FROM jobs WHERE id = ?', jobId).toArray()[0];
+        if (!job) {
+          return { error: 'not_found', status_code: 404 };
+        }
+
+        // 6. Owning machine verification
+        const jobOwningHost = job.holder_host_id || job.holder_machine_id || job.offer_host_id || job.offer_machine_id;
+        if (!jobOwningHost || jobOwningHost !== callerHostId) {
+          return { error: 'unauthorized_or_stale', status_code: 403 };
+        }
+
+        // 7. Role configuration check: role must exist, be enabled, and current role generation must match
+        if (!job.role_name) {
+          return { error: 'invalid_role_job', status_code: 400 };
+        }
+        const role = this.roles.get(job.role_name);
+        if (!role || !role.enabled) {
+          return { error: 'role_unauthorized', status_code: 403 };
+        }
+        if (role.generation !== job.role_generation) {
+          return { error: 'generation_mismatch', status_code: 409 };
+        }
+        // Current role config must still authorize same owning host
+        if (role.bindings[callerHostId] !== job.role_host_credential ||
+            machine.credential_id !== job.role_host_credential || !role.profiles.includes(job.kind)) {
+          return { error: 'role_unauthorized', status_code: 403 };
+        }
+
+        // 8. Expected epoch and generation correlation
+        if (epoch !== job.lease_epoch) {
+          return { error: 'epoch_mismatch', status_code: 409 };
+        }
+        if (generation !== job.role_generation) {
+          return { error: 'generation_mismatch', status_code: 409 };
+        }
+
+        // Lease loss is not a terminal job status; successful history is never reconciled as failure.
+        if (!['expired', 'fenced', 'failed', 'cancelled'].includes(job.status)) {
+          return { error: 'job_not_terminal', status_code: 409 };
+        }
+
+        // Determine terminal case: 'unstarted' vs 'executed'
+        let terminalCase = body.terminal_case;
+        if (!terminalCase) {
+          if (job.role_effect === null && job.started_at === null && job.first_action_at === null && job.native_session === null) {
+            terminalCase = 'unstarted';
+          } else {
+            terminalCase = 'executed';
+          }
+        }
+        if (terminalCase !== 'unstarted' && terminalCase !== 'executed') {
+          return { error: 'invalid_reconciliation', status_code: 400 };
+        }
+
+        // 10. Validate terminal case prerequisites
+        let targetSessionId: string | null = null;
+        let nativeRetirement: any = null;
+        if (terminalCase === 'unstarted') {
+          if (body.native_session !== undefined) return { error: 'invalid_reconciliation', status_code: 400 };
+          if (job.role_effect !== null || job.started_at !== null || job.first_action_at !== null || job.native_session !== null) {
+            return { error: 'execution_intent_recorded', status_code: 409 };
+          }
+        } else {
+          // Executed case: require real existing full native binding and maintained positive same-incarnation finished proof
+          targetSessionId = typeof job.native_session === 'string' && job.native_session.length > 0 &&
+            typeof job.launcher_task_id === 'string' && job.launcher_task_id.length > 0 &&
+            job.started_at && job.first_action_at ? job.native_session : null;
+          if (!targetSessionId) {
+            return { status: 'HOLD', reconciled: false, reason: 'missing_native_session', status_code: 409 };
+          }
+          if (job.native_session && body.native_session && body.native_session !== job.native_session) {
+            return { status: 'HOLD', reconciled: false, reason: 'native_session_mismatch', status_code: 409 };
+          }
+
+          const sessions = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', targetSessionId).toArray() as any[];
+          if (sessions.length !== 1) {
+            return { status: 'HOLD', reconciled: false, reason: 'session_not_unique', status_code: 409 };
+          }
+          const session = sessions[0];
+          const jobHost = job.holder_host_id || job.holder_machine_id || job.offer_host_id || job.offer_machine_id;
+          if (session.machine_id !== callerHostId || session.machine_id !== jobHost) {
+            return { status: 'HOLD', reconciled: false, reason: 'machine_mismatch', status_code: 409 };
+          }
+          if (session.state !== 'stopped') {
+            return { status: 'HOLD', reconciled: false, reason: 'session_not_stopped', status_code: 409 };
+          }
+
+          let binding: any;
+          try {
+            binding = JSON.parse(session.binding_json);
+          } catch {
+            binding = null;
+          }
+          if (!binding || typeof binding !== 'object' || binding.provenance !== 'observed_native') {
+            return { status: 'HOLD', reconciled: false, reason: 'binding_not_imported', status_code: 409 };
+          }
+
+          const expectedTag = 'task-' + job.launcher_task_id;
+          if (binding.tag !== expectedTag || binding.native_id !== session.id) {
+            return { status: 'HOLD', reconciled: false, reason: 'binding_mismatch', status_code: 409 };
+          }
+
+          const marker = binding.retirement;
+          if (!marker || typeof marker !== 'object') {
+            return { status: 'HOLD', reconciled: false, reason: 'retirement_marker_missing', status_code: 409 };
+          }
+
+          // Session binding generation is independent of role generation (normally binding 1 vs role N)
+          if (
+            marker.native_id !== session.id ||
+            marker.native_id !== binding.native_id ||
+            marker.tag !== expectedTag ||
+            marker.tag !== binding.tag ||
+            marker.workspace !== binding.workspace ||
+            typeof marker.workspace !== 'string' ||
+            marker.workspace.length === 0 ||
+            marker.engine !== session.engine ||
+            typeof marker.engine !== 'string' ||
+            marker.engine.length === 0 ||
+            marker.created_at_ms !== binding.native_created_at_ms ||
+            !Number.isSafeInteger(marker.created_at_ms) ||
+            marker.created_at_ms <= 0 ||
+            marker.generation !== binding.generation ||
+            !Number.isSafeInteger(marker.generation) || marker.generation <= 0 ||
+            marker.cause !== 'finished' ||
+            !Number.isSafeInteger(marker.finished_at_ms) ||
+            marker.finished_at_ms < marker.created_at_ms || marker.finished_at_ms > nowMs
+          ) {
+            return { status: 'HOLD', reconciled: false, reason: 'retirement_marker_invalid', status_code: 409 };
+          }
+          nativeRetirement = {
+            native_id: marker.native_id, tag: marker.tag, workspace: marker.workspace, engine: marker.engine,
+            created_at_ms: marker.created_at_ms, generation: marker.generation,
+            cause: marker.cause, finished_at_ms: marker.finished_at_ms
+          };
+        }
+
+        // 11. Construct exact canonical failed/inconclusive reconciliation receipt
+        const summary = safeUtf8Summary(body.summary || `terminal reconciliation: ${terminalCase}`, 4096);
+        const evidenceRefs = body.evidence_refs || [];
+        const receiptObj = {
+          epoch: job.lease_epoch,
+          evidenceRefs,
+          generation: job.role_generation,
+          job_id: jobId,
+          outcome: 'failed',
+          original_status: job.status,
+          reconciled: true,
+          status: 'failed',
+          summary,
+          terminal_case: terminalCase,
+          ...(terminalCase === 'executed' && targetSessionId ? { native_session: targetSessionId, native_retirement: nativeRetirement } : {})
+        };
+        const receipt = canonical(receiptObj);
+
+        // 12. Idempotency / conflict check
+        if (job.role_finish) {
+          if (job.role_finish === receipt) {
+            return {
+              reconciled: true,
+              status: 'reconciled',
+              job_id: jobId,
+              epoch: job.lease_epoch,
+              generation: job.role_generation,
+              outcome: 'failed',
+              terminal_case: terminalCase,
+              receipt: receiptObj,
+              replay: true
+            };
+          }
+          return { error: 'reconciliation_conflict', status_code: 409 };
+        }
+
+        // 13. Persist role_finish without overwriting original expired/fenced job status or effect
+        this.sql.exec('UPDATE jobs SET role_finish = ? WHERE id = ?', receipt, jobId);
+
+        // 14. Audit and health event
+        this.logAuditEvent('host:' + callerHostId, 'reconcile', 'jobs/' + job.kind, jobId, receiptObj, nowIso);
+        this.addHealthEvent('job', jobId, job.status, `role job reconciled as terminal failed (${terminalCase})`, nowIso);
+
+        return {
+          reconciled: true,
+          status: 'reconciled',
+          job_id: jobId,
+          epoch: job.lease_epoch,
+          generation: job.role_generation,
+          outcome: 'failed',
+          terminal_case: terminalCase,
+          receipt: receiptObj
+        };
+      });
     });
   }
 
