@@ -65,16 +65,16 @@ The Hetzner host actively maintains the following user-level timers and services
 | **Resting State Contradiction** | `scripts/supervision/service.py` (`check_resting_state_contradicted()`) | 60s | `last_activity_ms > reported_state_at_ms + 1000` (PTY activity after reported idle state) | Live | `src/session_lifecycle.ts` (contradicted resting state logic). |
 | **Pending Message Delivery SLO** | `scripts/supervision/service.py` (`check_pending_slo()`) | 60s | Pending message age >= 300s (5m) for standard agents, 1800s (30m) for Claude principal | Live | Hub message dispatch tracking & retry limits. |
 | **Consecutive Ping Misses** | `scripts/ping/principal-ping.py` | 10 min timer | Ping timeout 300s; 3 consecutive misses (`PING_MISS_THRESHOLD=3`) triggers recovery; stuck threshold 900s | Live | Hub health model (§9) replaces with principal wake jobs and host heartbeats. |
-| **Approval Modal Stalls** | `aplexer-watch` (`aplexer_watch`) | 30 min timer | Compares screen terminal hashes; auto-Enters sessions stuck on confirmation modals | Live | `host/agent_hub_host/session_host.py` / `aplexer-watch.service`. |
+| **Approval Modal Stalls** | `aplexer-watch` (`aplexer_watch`) | 30 min timer | Compares screen terminal hashes; detects confirmation modals for operator notification (auto-Enter / keystroke injection is strictly not authorized) | Live | `host/agent_hub_host/session_host.py` / `aplexer-watch.service` (notification only; automated composer input forbidden). |
 | **Turn-End Wake Timer Audit** | `scripts/ping/wake-audit.py`, `turn-end-check.py` | 15 min check, turn hooks | Every waiting session must have an armed wake <= 30 min (`MAX_INTERVAL_S=1800`); 3 strikes escalate | Live | Hub scheduled triggers / timer jobs. |
 
 ### 3.3 Quota & Budget Monitoring
 
 | Signal / Dimension | Source Location (`cloudflare-agent-git`) | Cadence / Interval | Threshold / Condition | Live vs Research | Hub Existing Seam & Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Provider Window Quota** | `scripts/quota-monitor.py`, `scripts/quota-gate.py` | 60s | Calls `quse codex --json` (45s timeout); requires `limit_reached=False` and min window > 15% reserve | Live | Hub `/api/quota` snapshot endpoint (`src/quota.ts`, `host/agent_hub_host/quota.py`). |
+| **Provider Window Quota** | `scripts/quota-monitor.py`, `scripts/quota-gate.py` | 60s | Calls `quse codex --json` (45s timeout); requires `limit_reached=False` and min window > 15% reserve (legacy Root/Codex gate; not global provider admission) | Live | Hub `/api/quota` snapshot endpoint (`src/quota.ts`, `host/agent_hub_host/quota.py`). Provider-specific routing; legacy Root gate is not global admission. |
 | **Launcher Admission Routes** | `scripts/supervision/service.py`, launcher ranking | Per task submission | Requires explicit `model_requirements`; Gemini / GLM admitted if remaining quota > 18% / 42% | Live | `src/model-routing.ts` candidate selection and quota evaluation. |
-| **Monthly Cloud Budget** | `scripts/delivery/cloud_budget.py` | Batch audit / on change | Month-to-date aggregate cloud spend <= $5.00 USD; fails closed if service costs unknown | Live | Built-in Free plan constraint; Hub operates within Cloudflare Free tier. |
+| **Monthly Cloud Budget** | `scripts/delivery/cloud_budget.py` | Batch audit / on change | Month-to-date aggregate cloud spend <= $5.00 USD; fails closed if service costs unknown | Live | Ingestion & assessment seam in `host/agent_hub_host/host_health_monitor.py` and `src/monitoring.ts`. Free-tier design is not an aggregate-spend monitor; unknown credentials remain strictly unknown, includes base plans. Exact scaled decimal arithmetic prevents float imprecision; stale host, stale source, or rolled-over period recomputes status to unknown and flags needs_attention while preserving genuine over_budget. |
 
 ### 3.4 Containment, RAM, Host Load & Disk Space
 
@@ -85,7 +85,7 @@ The Hetzner host actively maintains the following user-level timers and services
 | **Host Load Average** | `scripts/metrics/collect.py` | 60s | Reads `os.getloadavg()` (1m, 5m, 15m load) | Live | Projected in `/api/metrics` payload. |
 | **Worker Process RSS & CPU** | `scripts/metrics/collect.py` (`proc()`) | 60s | Reads CPU utime/stime and RSS pages from `/proc/{pid}/stat` | Live | Hub metrics producer and host session monitoring. |
 | **Cgroup Memory & Tasks Containment** | `scripts/supervision/service.py`, systemd units | Continuous systemd enforcement | `MemoryMax<=1500M`, `TasksMax<=100` (or 256) per transient unit | Live | Launcher transient units and aplexer session containment cgroups. |
-| **Local Private Storage Guard** | `scripts/supervision/retention.py` | Per write / event cycle | Soft limit 128 MiB (`SOFT_BYTES`), hard limit 256 MiB (`HARD_BYTES`); gzip archives events > 4 MiB | Live | Hub `.local/` state rotation; host journal limits. |
+| **Local Private Storage Guard** | `scripts/supervision/retention.py` | Per write / event cycle | Soft limit 128 MiB (`SOFT_BYTES`), hard limit 256 MiB (`HARD_BYTES`); warnings without destructive wipes | Live | Bounded metadata size observation in `host/agent_hub_host/host_health_monitor.py` and `src/monitoring.ts`. Both subdirectories and regular files count against max_entries to bound empty-tree traversal; truncated scans or access errors report state=warn (never healthy ok). Histories and worktrees are protected; automatic deletion/log rotation is forbidden. |
 
 ### 3.5 Source, Deployed & CI Drift
 

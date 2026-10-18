@@ -308,16 +308,17 @@ class TestRoleDispatchRecovery(unittest.TestCase):
             backend = runtime_mgr.role_adapter.launcher_backend
             backend.get_task_binding = MagicMock(return_value=binding_record)
 
+            worker_interrupt_event = threading.Event()
+
             def mock_backend_run(task_id, cwd, tmpdir=None, timeout_sec=1800.0):
                 run_dir.mkdir(parents=True, exist_ok=True)
                 first_action_file.write_text(json.dumps(fa_data), encoding="utf-8")
-                for _ in range(50):
-                    if start_ack_file.exists():
-                        break
-                    time.sleep(0.05)
+                # Block until dispatcher d1 is interrupted/stopped
+                worker_interrupt_event.wait(timeout=10.0)
                 return 0, {"mode": "test"}, ""
 
             backend.run = MagicMock(side_effect=mock_backend_run)
+            backend.stop_session = MagicMock(return_value=(True, "stopped", {}))
 
             # Session is alive initially
             backend.is_session_alive = MagicMock(return_value=(True, {"phase": "running"}))
@@ -360,9 +361,15 @@ class TestRoleDispatchRecovery(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(mode), 0o600)
 
             # SIMULATE INTERRUPTION: previous dispatcher process crashed/died
-            # Native process dummy_proc is still alive in background
+            # 1. Signal stop_event to d1 running job so d1 knows it was stopped externally
             if job_id in d1.running_jobs:
                 d1.running_jobs[job_id]["stop_event"].set()
+            # 2. Release the mock backend runner so exec_thread completes
+            worker_interrupt_event.set()
+            # 3. Deterministically wait for all d1 worker/renewal/runner threads to terminate
+            for t in threading.enumerate():
+                if t.name in (f"job-runner-{job_id}", f"renew-{job_id}", f"role-worker-{job_id}"):
+                    t.join(timeout=5.0)
             d1.running_jobs.clear()
             del d1
 
@@ -406,11 +413,20 @@ class TestRoleDispatchRecovery(unittest.TestCase):
             # Workload is now no longer alive
             backend2.is_session_alive = MagicMock(return_value=(False, {"phase": "exited"}))
 
-            # Allow d2 monitor thread to finalize
-            for _ in range(50):
+            # Allow d2 monitor thread to finalize and join it deterministically before custody checks
+            recovery_thread = None
+            for _ in range(100):
+                if recovery_thread is None:
+                    for t in threading.enumerate():
+                        if t.name == f"job-recovery-{job_id}":
+                            recovery_thread = t
+                            break
                 if len(client.finishes) >= 1:
                     break
                 time.sleep(0.05)
+
+            if recovery_thread is not None and recovery_thread.is_alive():
+                recovery_thread.join(timeout=5.0)
 
             self.assertEqual(len(client.finishes), 1)
             self.assertEqual(client.finishes[0]["job_id"], job_id)

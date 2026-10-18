@@ -10,10 +10,12 @@ from agent_hub_host import host_health_monitor
 from agent_hub_host.host_health_monitor import (
     HostHealthMonitor,
     check_worker_status,
+    collect_cloud_budget,
     collect_host_health,
     collect_load_averages,
     collect_memory_stats,
     collect_service_status,
+    collect_storage_hygiene,
     collect_supervisor_services,
     read_status_file,
     verify_service_source,
@@ -586,7 +588,299 @@ class TestHostHealthMonitor(unittest.TestCase):
         self.assertLessEqual(age, 600.0, f"Expected real supervisor to be fresh <=600s, got age {age}s")
         self.assertIsNone(reason)
 
+    def test_collect_cloud_budget_missing_evidence(self):
+        # Missing billing credentials fail closed as unknown with explicit unconfigured provenance; never assumed free
+        res = collect_cloud_budget(None)
+        self.assertEqual(res["budget_status"], "unknown")
+        self.assertEqual(res["reason"], "missing_billing_credentials")
+        self.assertFalse(res["coverage_complete"])
+        self.assertIsNone(res["known_month_to_date_usd"])
+        self.assertEqual(res["provenance"], "unconfigured_missing_billing_credentials")
+        self.assertIn("cloudflare", res["unknown_services"])
+
+    def test_collect_cloud_budget_within_budget(self):
+        now = 1792287000.0
+        obs_iso = datetime.fromtimestamp(now - 120.0, tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        evidence = {
+            "complete_account_coverage": True,
+            "observed_at": obs_iso,
+            "services": [
+                {"service": "cloudflare", "month_to_date_usd": "2.50"},
+                {"service": "aws_bedrock", "month_to_date_usd": "1.25"},
+            ],
+            "provenance": "cloud_billing_api_read",
+        }
+        res = collect_cloud_budget(evidence, now=now)
+        self.assertEqual(res["budget_status"], "known_within_budget")
+        self.assertEqual(res["known_month_to_date_usd"], "3.75")
+        self.assertTrue(res["coverage_complete"])
+        self.assertEqual(res["reason"], "complete_coverage_within_budget")
+        self.assertEqual(res["provenance"], "cloud_billing_api_read")
+        self.assertEqual(res["observed_at"], obs_iso)
+        self.assertEqual(res["source_age_s"], 120.0)
+        self.assertEqual(res["billing_period"], obs_iso[:7])
+
+    def test_collect_cloud_budget_config_flag_alone_cannot_establish_billing(self):
+        # A boolean complete_account_coverage=True config flag alone without source timestamp fails as unknown
+        evidence = {
+            "complete_account_coverage": True,
+            "services": [
+                {"service": "cloudflare", "month_to_date_usd": "2.50"},
+            ],
+        }
+        res = collect_cloud_budget(evidence)
+        self.assertEqual(res["budget_status"], "unknown")
+        self.assertFalse(res["coverage_complete"])
+        self.assertEqual(res["reason"], "missing_source_observation_time")
+
+    def test_collect_cloud_budget_stale_source_observation(self):
+        # Source observation older than 30 days is rejected as stale
+        now = 1792287000.0
+        stale_epoch = now - (31 * 86400.0)
+        stale_iso = datetime.fromtimestamp(stale_epoch, tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        evidence = {
+            "complete_account_coverage": True,
+            "observed_at": stale_iso,
+            "services": [
+                {"service": "cloudflare", "month_to_date_usd": "2.50"},
+            ],
+        }
+        res = collect_cloud_budget(evidence, now=now)
+        self.assertEqual(res["budget_status"], "unknown")
+        self.assertFalse(res["coverage_complete"])
+        self.assertEqual(res["reason"], "stale_source_observation")
+
+    def test_collect_cloud_budget_over_budget(self):
+        evidence = {
+            "complete_account_coverage": True,
+            "services": [
+                {"service": "cloudflare", "month_to_date_usd": "5.50"},
+            ],
+        }
+        res = collect_cloud_budget(evidence)
+        self.assertEqual(res["budget_status"], "over_budget")
+        self.assertEqual(res["known_month_to_date_usd"], "5.50")
+        self.assertEqual(res["reason"], "known_spend_exceeds_budget")
+
+    def test_collect_cloud_budget_incomplete_coverage(self):
+        evidence = {
+            "complete_account_coverage": False,
+            "services": [
+                {"service": "cloudflare", "month_to_date_usd": "1.00"},
+                {"service": "aws_bedrock", "month_to_date_usd": None},
+            ],
+        }
+        res = collect_cloud_budget(evidence)
+        self.assertEqual(res["budget_status"], "unknown")
+        self.assertEqual(res["reason"], "incomplete_billing_coverage")
+        self.assertIn("aws_bedrock", res["unknown_services"])
+
+    def test_collect_cloud_budget_negative_validation(self):
+        # Reject booleans
+        res_bool = collect_cloud_budget({"services": [{"service": "cf", "month_to_date_usd": True}]})
+        self.assertEqual(res_bool["budget_status"], "unknown")
+        self.assertEqual(res_bool["reason"], "invalid_amount_type")
+
+        # Reject negative amounts
+        res_neg = collect_cloud_budget({"services": [{"service": "cf", "month_to_date_usd": "-0.50"}]})
+        self.assertEqual(res_neg["budget_status"], "unknown")
+        self.assertEqual(res_neg["reason"], "non_finite_or_negative_amount")
+
+        # Reject duplicate service names
+        res_dup = collect_cloud_budget({
+            "services": [
+                {"service": "cf", "month_to_date_usd": "1.00"},
+                {"service": "cf", "month_to_date_usd": "2.00"},
+            ]
+        })
+        self.assertEqual(res_dup["budget_status"], "unknown")
+        self.assertEqual(res_dup["reason"], "duplicate_or_empty_service_name")
+
+        # Reject array / object budget cap
+        res_cap_arr = collect_cloud_budget({"budget_cap_usd": [5], "services": []})
+        self.assertEqual(res_cap_arr["budget_status"], "unknown")
+        self.assertEqual(res_cap_arr["reason"], "invalid_budget_cap_type")
+
+        # Reject array / object month_to_date_usd
+        res_amt_arr = collect_cloud_budget({"services": [{"service": "cf", "month_to_date_usd": [5]}]})
+        self.assertEqual(res_amt_arr["budget_status"], "unknown")
+        self.assertEqual(res_amt_arr["reason"], "invalid_amount_type")
+
+    def test_collect_cloud_budget_prior_billing_period_and_expected_services(self):
+        now_ts = 1792287000.0 # 2026-10-18...
+        now_iso = datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+        # Prior billing period (2026-09) must fail closed as unknown with prior_billing_period
+        ev_prior = {
+            "complete_account_coverage": True,
+            "billing_period": "2026-09",
+            "observed_at": now_iso,
+            "services": [{"service": "cloudflare", "month_to_date_usd": "2.00"}],
+        }
+        res_prior = collect_cloud_budget(ev_prior, now=now_ts)
+        self.assertEqual(res_prior["budget_status"], "unknown")
+        self.assertEqual(res_prior["reason"], "prior_billing_period")
+        self.assertFalse(res_prior["coverage_complete"])
+
+        # Missing expected service must fail closed as unknown with missing_expected_services
+        ev_exp = {
+            "complete_account_coverage": True,
+            "expected_services": ["cloudflare", "aws_bedrock"],
+            "observed_at": now_iso,
+            "services": [{"service": "cloudflare", "month_to_date_usd": "2.00"}],
+        }
+        res_exp = collect_cloud_budget(ev_exp, now=now_ts)
+        self.assertEqual(res_exp["budget_status"], "unknown")
+        self.assertEqual(res_exp["reason"], "missing_expected_services")
+        self.assertIn("aws_bedrock", res_exp["unknown_services"])
+        self.assertFalse(res_exp["coverage_complete"])
+
+    def test_collect_storage_hygiene_bounded_observation(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_file = os.path.join(tmp_dir, "test.log")
+            with open(test_file, "wb") as f:
+                f.write(b"x" * 1024)
+
+            # Normal observation within limits
+            res = collect_storage_hygiene([tmp_dir], soft_bytes=2048, hard_bytes=4096)
+            self.assertEqual(len(res), 1)
+            self.assertEqual(res[0]["used_bytes"], 1024)
+            self.assertEqual(res[0]["state"], "ok")
+            self.assertIn("preserve all archives", res[0]["policy"])
+
+            # Soft limit warning (threshold lower than 1024)
+            res_warn = collect_storage_hygiene([tmp_dir], soft_bytes=512, hard_bytes=2048)
+            self.assertEqual(res_warn[0]["state"], "warn")
+
+            # Missing path handling
+            res_missing = collect_storage_hygiene([os.path.join(tmp_dir, "nonexistent")])
+            self.assertEqual(res_missing[0]["state"], "missing")
+            self.assertEqual(res_missing[0]["error"], "path_not_found")
+
+    def test_collect_storage_hygiene_symlink_root_rejected(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            real_dir = os.path.join(tmp_dir, "real")
+            os.makedirs(real_dir)
+            symlink_dir = os.path.join(tmp_dir, "symlink")
+            os.symlink(real_dir, symlink_dir)
+
+            res = collect_storage_hygiene([symlink_dir])
+            self.assertEqual(res[0]["state"], "warn")
+            self.assertEqual(res[0]["error"], "symlink_storage_root_rejected")
+
+    def test_collect_storage_hygiene_symlink_ancestor_rejected(self):
+        """Storage root with a symlink ancestor anywhere in the path is rejected."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            real_dir = os.path.join(tmp_dir, "real", ".local")
+            os.makedirs(real_dir)
+            with open(os.path.join(real_dir, "data.bin"), "wb") as f:
+                f.write(b"y" * 512)
+
+            alias_dir = os.path.join(tmp_dir, "alias")
+            os.symlink(os.path.join(tmp_dir, "real"), alias_dir)
+            symlink_ancestor_path = os.path.join(alias_dir, ".local")
+
+            res = collect_storage_hygiene([symlink_ancestor_path])
+            self.assertEqual(len(res), 1)
+            self.assertEqual(res[0]["state"], "warn")
+            self.assertEqual(res[0]["error"], "symlink_storage_root_rejected")
+            self.assertEqual(res[0]["used_bytes"], 0)
+
+    def test_collect_storage_hygiene_ancestor_swap_race_rejected(self):
+        """Ancestor swapped with symlink after creation is rejected via descriptor-relative O_NOFOLLOW."""
+        import tempfile
+        import shutil
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_dir = os.path.join(tmp_dir, "base")
+            os.makedirs(os.path.join(base_dir, "parent", ".local"))
+
+            target_outside = os.path.join(tmp_dir, "outside")
+            os.makedirs(os.path.join(target_outside, ".local"))
+
+            # Swap parent with symlink to outside
+            shutil.rmtree(os.path.join(base_dir, "parent"))
+            os.symlink(target_outside, os.path.join(base_dir, "parent"))
+
+            test_path = os.path.join(base_dir, "parent", ".local")
+            res = collect_storage_hygiene([test_path])
+            self.assertEqual(len(res), 1)
+            self.assertEqual(res[0]["state"], "warn")
+            self.assertEqual(res[0]["error"], "symlink_storage_root_rejected")
+            self.assertEqual(res[0]["used_bytes"], 0)
+
+    def test_collect_storage_hygiene_empty_directories_truncated(self):
+        """Four empty directories with max_entries=1 must trigger scan_truncated=True and state='warn'."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            for i in range(4):
+                os.makedirs(os.path.join(tmp_dir, f"subdir_{i}"))
+
+            res = collect_storage_hygiene([tmp_dir], max_entries=1)
+            self.assertEqual(len(res), 1)
+            self.assertEqual(res[0]["state"], "warn")
+            self.assertTrue(res[0].get("truncated"))
+
+    def test_collect_cloud_budget_decimal_string_pattern_validation(self):
+        """Decimal string format rejects scientific notation or malformed decimal representations."""
+        # Reject scientific notation in budget cap
+        res_sci_cap = collect_cloud_budget({"budget_cap_usd": "1e3", "services": []})
+        self.assertEqual(res_sci_cap["budget_status"], "unknown")
+        self.assertEqual(res_sci_cap["reason"], "invalid_budget_cap_value")
+
+        # Reject scientific notation in service amount
+        res_sci_amt = collect_cloud_budget({
+            "services": [{"service": "cf", "month_to_date_usd": "1e2"}]
+        })
+        self.assertEqual(res_sci_amt["budget_status"], "unknown")
+        self.assertEqual(res_sci_amt["reason"], "invalid_amount_value")
+
+    def test_host_health_monitor_step_wires_budget_and_storage(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            submit_mock = MagicMock()
+            now_iso = "2026-10-18T00:00:00.000Z"
+            budget_ev = {
+                "complete_account_coverage": True,
+                "observed_at": now_iso,
+                "services": [{"service": "cloudflare", "month_to_date_usd": "2.00"}],
+            }
+            monitor = HostHealthMonitor(
+                config={"enabled": True, "machine_id": "hetzner"},
+                submit_fn=submit_mock,
+                budget_evidence=budget_ev,
+                storage_paths=[tmp_dir],
+            )
+            res = monitor.step(submit=True)
+            self.assertTrue(res["posted"])
+            payload = submit_mock.call_args[0][0]
+            self.assertIn("budget", payload)
+            self.assertEqual(payload["budget"]["budget_status"], "known_within_budget")
+            self.assertIn("storage", payload)
+            self.assertEqual(len(payload["storage"]), 1)
+            self.assertEqual(payload["storage"][0]["path"], os.path.abspath(tmp_dir))
+
+    def test_host_health_monitor_step_unconfigured_budget_projects_explicit_unknown(self):
+        # Default missing billing config in host collector projects explicit unknown with unconfigured provenance
+        submit_mock = MagicMock()
+        monitor = HostHealthMonitor(
+            config={"enabled": True, "machine_id": "hetzner"},
+            submit_fn=submit_mock,
+            budget_evidence=None,
+        )
+        res = monitor.step(submit=True)
+        self.assertTrue(res["posted"])
+        payload = submit_mock.call_args[0][0]
+        self.assertIn("budget", payload)
+        self.assertEqual(payload["budget"]["budget_status"], "unknown")
+        self.assertEqual(payload["budget"]["reason"], "missing_billing_credentials")
+        self.assertEqual(payload["budget"]["provenance"], "unconfigured_missing_billing_credentials")
+        self.assertIsNone(payload["budget"]["known_month_to_date_usd"])
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

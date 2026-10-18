@@ -13,6 +13,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import re
 import selectors
 import stat
 import subprocess
@@ -21,6 +22,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -33,6 +35,11 @@ MAX_INTERVAL_S = 3600
 DEFAULT_WARN_PERCENT = 85.0
 DEFAULT_CRITICAL_PERCENT = 95.0
 MAX_PAYLOAD_BYTES = 32 * 1024
+
+DEFAULT_BUDGET_CAP_USD = Decimal("5.00")
+DEFAULT_STORAGE_SOFT_BYTES = 128 * 1024 * 1024  # 128 MiB
+DEFAULT_STORAGE_HARD_BYTES = 256 * 1024 * 1024  # 256 MiB
+MAX_STORAGE_SCAN_ENTRIES = 5000
 
 DEFAULT_HETZNER_SERVICES: Tuple[Dict[str, Any], ...] = (
     {
@@ -47,6 +54,7 @@ DEFAULT_HETZNER_MACHINE_IDS = frozenset({"hetzner", "DEFLf4-rahKf9wE4TQAZfA"})
 SUPERVISOR_STALE_THRESHOLD_S = 600.0
 MAX_STATUS_FILE_BYTES = 256 * 1024
 MAX_APLEXER_OUTPUT_BYTES = 64 * 1024
+DECIMAL_STRING_PATTERN = re.compile(r"^\d{1,14}(\.\d{1,18})?$")
 
 _ALLOWED_CONFIG_KEYS = frozenset({
     "enabled",
@@ -56,6 +64,10 @@ _ALLOWED_CONFIG_KEYS = frozenset({
     "critical_threshold_percent",
     "endpoint",
     "services",
+    "budget",
+    "storage_paths",
+    "storage_soft_bytes",
+    "storage_hard_bytes",
 })
 
 
@@ -708,6 +720,632 @@ def collect_supervisor_services(
     return results
 
 
+def collect_cloud_budget(
+    evidence: Optional[Dict[str, Any]] = None,
+    *,
+    budget_cap_usd: Decimal = DEFAULT_BUDGET_CAP_USD,
+    provenance: Optional[str] = None,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Read-only aggregate cloud budget observation.
+
+    Missing authentic billing credentials remain unknown with explicit
+    coverage and provenance. Never invents spend or assumes missing accounts are free.
+    """
+    now_ts = now if now is not None else time.time()
+
+    if evidence is None or not isinstance(evidence, dict):
+        return {
+            "budget_cap_usd": str(budget_cap_usd),
+            "known_month_to_date_usd": None,
+            "coverage_complete": False,
+            "unknown_services": ["cloudflare", "hetzner"],
+            "budget_status": "unknown",
+            "reason": "missing_billing_credentials",
+            "provenance": provenance or "unconfigured_missing_billing_credentials",
+            "observed_at": None,
+            "billing_period": None,
+            "source_age_s": None,
+        }
+
+    raw_cap = evidence.get("budget_cap_usd")
+    if raw_cap is not None:
+        if isinstance(raw_cap, (bool, list, dict)):
+            return {
+                "budget_cap_usd": "5.00",
+                "known_month_to_date_usd": None,
+                "coverage_complete": False,
+                "unknown_services": [],
+                "budget_status": "unknown",
+                "reason": "invalid_budget_cap_type",
+                "provenance": provenance or evidence.get("provenance", "evidence_payload"),
+                "observed_at": None,
+                "billing_period": None,
+                "source_age_s": None,
+            }
+        val_cap_str = str(raw_cap).strip()
+        if not val_cap_str:
+            return {
+                "budget_cap_usd": "5.00",
+                "known_month_to_date_usd": None,
+                "coverage_complete": False,
+                "unknown_services": [],
+                "budget_status": "unknown",
+                "reason": "empty_budget_cap_value",
+                "provenance": provenance or evidence.get("provenance", "evidence_payload"),
+                "observed_at": None,
+                "billing_period": None,
+                "source_age_s": None,
+            }
+        clean_cap_digits = val_cap_str[1:] if val_cap_str.startswith("-") else val_cap_str
+        if not DECIMAL_STRING_PATTERN.match(clean_cap_digits):
+            return {
+                "budget_cap_usd": "5.00",
+                "known_month_to_date_usd": None,
+                "coverage_complete": False,
+                "unknown_services": [],
+                "budget_status": "unknown",
+                "reason": "invalid_budget_cap_value",
+                "provenance": provenance or evidence.get("provenance", "evidence_payload"),
+                "observed_at": None,
+                "billing_period": None,
+                "source_age_s": None,
+            }
+        try:
+            budget_cap_usd = Decimal(val_cap_str)
+        except (InvalidOperation, TypeError, ValueError):
+            return {
+                "budget_cap_usd": "5.00",
+                "known_month_to_date_usd": None,
+                "coverage_complete": False,
+                "unknown_services": [],
+                "budget_status": "unknown",
+                "reason": "invalid_budget_cap_value",
+                "provenance": provenance or evidence.get("provenance", "evidence_payload"),
+                "observed_at": None,
+                "billing_period": None,
+                "source_age_s": None,
+            }
+        if not budget_cap_usd.is_finite() or budget_cap_usd <= 0:
+            return {
+                "budget_cap_usd": "5.00",
+                "known_month_to_date_usd": None,
+                "coverage_complete": False,
+                "unknown_services": [],
+                "budget_status": "unknown",
+                "reason": "non_finite_or_non_positive_cap",
+                "provenance": provenance or evidence.get("provenance", "evidence_payload"),
+                "observed_at": None,
+                "billing_period": None,
+                "source_age_s": None,
+            }
+
+    raw_observed_at = evidence.get("observed_at")
+    observed_at_iso: Optional[str] = None
+    source_age_s: Optional[float] = None
+    if raw_observed_at is not None:
+        try:
+            if isinstance(raw_observed_at, (int, float)):
+                obs_epoch = float(raw_observed_at)
+                dt = datetime.fromtimestamp(obs_epoch, tz=timezone.utc)
+                observed_at_iso = dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            elif isinstance(raw_observed_at, str):
+                s = raw_observed_at.strip()
+                if s.endswith("Z"):
+                    s = s[:-1] + "+00:00"
+                dt = datetime.fromisoformat(s)
+                obs_epoch = dt.timestamp()
+                observed_at_iso = dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            else:
+                obs_epoch = None
+        except Exception:
+            obs_epoch = None
+
+        if obs_epoch is None:
+            return {
+                "budget_cap_usd": str(budget_cap_usd),
+                "known_month_to_date_usd": None,
+                "coverage_complete": False,
+                "unknown_services": [],
+                "budget_status": "unknown",
+                "reason": "invalid_source_observation_time",
+                "provenance": provenance or evidence.get("provenance", "evidence_payload"),
+                "observed_at": None,
+                "billing_period": None,
+                "source_age_s": None,
+            }
+        if obs_epoch > now_ts + 60.0:
+            return {
+                "budget_cap_usd": str(budget_cap_usd),
+                "known_month_to_date_usd": None,
+                "coverage_complete": False,
+                "unknown_services": [],
+                "budget_status": "unknown",
+                "reason": "future_source_observation_time",
+                "provenance": provenance or evidence.get("provenance", "evidence_payload"),
+                "observed_at": observed_at_iso,
+                "billing_period": None,
+                "source_age_s": None,
+            }
+        source_age_s = max(0.0, round(now_ts - obs_epoch, 1))
+
+    billing_period = evidence.get("billing_period")
+    if billing_period is not None:
+        billing_period = str(billing_period).strip()
+    elif observed_at_iso is not None:
+        billing_period = observed_at_iso[:7]
+
+    raw_services = evidence.get("services")
+    if not isinstance(raw_services, list):
+        return {
+            "budget_cap_usd": str(budget_cap_usd),
+            "known_month_to_date_usd": None,
+            "coverage_complete": False,
+            "unknown_services": [],
+            "budget_status": "unknown",
+            "reason": "invalid_services_payload",
+            "provenance": provenance or evidence.get("provenance", "evidence_payload"),
+            "observed_at": observed_at_iso,
+            "billing_period": billing_period,
+            "source_age_s": source_age_s,
+        }
+
+    known = Decimal("0")
+    has_known = False
+    unknown_services: List[str] = []
+    seen_services = set()
+    sanitized_services: List[Dict[str, Any]] = []
+
+    for item in raw_services:
+        if not isinstance(item, dict):
+            return {
+                "budget_cap_usd": str(budget_cap_usd),
+                "known_month_to_date_usd": None,
+                "coverage_complete": False,
+                "unknown_services": [],
+                "budget_status": "unknown",
+                "reason": "invalid_service_entry",
+                "provenance": provenance or evidence.get("provenance", "evidence_payload"),
+                "observed_at": observed_at_iso,
+                "billing_period": billing_period,
+                "source_age_s": source_age_s,
+            }
+        svc_name = str(item.get("service", "")).strip()
+        if not svc_name or svc_name in seen_services:
+            return {
+                "budget_cap_usd": str(budget_cap_usd),
+                "known_month_to_date_usd": None,
+                "coverage_complete": False,
+                "unknown_services": [],
+                "budget_status": "unknown",
+                "reason": "duplicate_or_empty_service_name",
+                "provenance": provenance or evidence.get("provenance", "evidence_payload"),
+                "observed_at": observed_at_iso,
+                "billing_period": billing_period,
+                "source_age_s": source_age_s,
+            }
+        seen_services.add(svc_name)
+
+        val = item.get("month_to_date_usd")
+        if val is None:
+            unknown_services.append(svc_name)
+            sanitized_services.append({"service": svc_name, "month_to_date_usd": None})
+            continue
+
+        if isinstance(val, (bool, list, dict)):
+            return {
+                "budget_cap_usd": str(budget_cap_usd),
+                "known_month_to_date_usd": None,
+                "coverage_complete": False,
+                "unknown_services": [],
+                "budget_status": "unknown",
+                "reason": "invalid_amount_type",
+                "provenance": provenance or evidence.get("provenance", "evidence_payload"),
+                "observed_at": observed_at_iso,
+                "billing_period": billing_period,
+                "source_age_s": source_age_s,
+            }
+
+        val_str = str(val).strip()
+        if not val_str:
+            return {
+                "budget_cap_usd": str(budget_cap_usd),
+                "known_month_to_date_usd": None,
+                "coverage_complete": False,
+                "unknown_services": [],
+                "budget_status": "unknown",
+                "reason": "empty_amount_value",
+                "provenance": provenance or evidence.get("provenance", "evidence_payload"),
+                "observed_at": observed_at_iso,
+                "billing_period": billing_period,
+                "source_age_s": source_age_s,
+            }
+        clean_val_digits = val_str[1:] if val_str.startswith("-") else val_str
+        if not DECIMAL_STRING_PATTERN.match(clean_val_digits):
+            return {
+                "budget_cap_usd": str(budget_cap_usd),
+                "known_month_to_date_usd": None,
+                "coverage_complete": False,
+                "unknown_services": [],
+                "budget_status": "unknown",
+                "reason": "invalid_amount_value",
+                "provenance": provenance or evidence.get("provenance", "evidence_payload"),
+                "observed_at": observed_at_iso,
+                "billing_period": billing_period,
+                "source_age_s": source_age_s,
+            }
+
+        try:
+            amount = Decimal(val_str)
+        except (InvalidOperation, TypeError, ValueError):
+            return {
+                "budget_cap_usd": str(budget_cap_usd),
+                "known_month_to_date_usd": None,
+                "coverage_complete": False,
+                "unknown_services": [],
+                "budget_status": "unknown",
+                "reason": "invalid_amount_value",
+                "provenance": provenance or evidence.get("provenance", "evidence_payload"),
+                "observed_at": observed_at_iso,
+                "billing_period": billing_period,
+                "source_age_s": source_age_s,
+            }
+
+        if not amount.is_finite() or amount < 0:
+            return {
+                "budget_cap_usd": str(budget_cap_usd),
+                "known_month_to_date_usd": None,
+                "coverage_complete": False,
+                "unknown_services": [],
+                "budget_status": "unknown",
+                "reason": "non_finite_or_negative_amount",
+                "provenance": provenance or evidence.get("provenance", "evidence_payload"),
+                "observed_at": observed_at_iso,
+                "billing_period": billing_period,
+                "source_age_s": source_age_s,
+            }
+
+        known += amount
+        has_known = True
+        sanitized_services.append({"service": svc_name, "month_to_date_usd": str(amount)})
+
+    # Coverage verification: a boolean complete_account_coverage=True config flag
+    # MUST NOT establish current real billing by itself.
+    expected_services = evidence.get("expected_services")
+    expected_missing = []
+    if isinstance(expected_services, list):
+        for exp in expected_services:
+            exp_str = str(exp).strip()
+            if exp_str and exp_str not in seen_services:
+                expected_missing.append(exp_str)
+
+    current_month = datetime.fromtimestamp(now_ts, timezone.utc).strftime("%Y-%m")
+    is_period_mismatch = billing_period is not None and billing_period != current_month
+    is_prior_period = billing_period is not None and billing_period < current_month
+    is_stale_source = source_age_s is not None and source_age_s > 30 * 86400.0
+
+    complete = (
+        evidence.get("complete_account_coverage") is True
+        and bool(raw_services)
+        and not unknown_services
+        and not expected_missing
+        and has_known
+        and observed_at_iso is not None
+        and not is_stale_source
+        and not is_period_mismatch
+    )
+
+    if has_known and known > budget_cap_usd:
+        budget_status = "over_budget"
+        reason = "known_spend_exceeds_budget"
+    elif complete:
+        budget_status = "known_within_budget"
+        reason = "complete_coverage_within_budget"
+    else:
+        budget_status = "unknown"
+        if expected_missing:
+            reason = "missing_expected_services"
+        elif unknown_services:
+            reason = "incomplete_billing_coverage"
+        elif is_stale_source:
+            reason = "stale_source_observation"
+        elif is_prior_period:
+            reason = "prior_billing_period"
+        elif is_period_mismatch:
+            reason = "billing_period_mismatch"
+        elif observed_at_iso is None:
+            reason = "missing_source_observation_time"
+        else:
+            reason = "missing_coverage_attestation"
+
+    return {
+        "budget_cap_usd": str(budget_cap_usd),
+        "known_month_to_date_usd": str(known) if has_known else None,
+        "coverage_complete": complete,
+        "unknown_services": sorted(list(set(unknown_services + expected_missing))),
+        "budget_status": budget_status,
+        "reason": reason,
+        "provenance": provenance or evidence.get("provenance", "evidence_payload"),
+        "observed_at": observed_at_iso,
+        "billing_period": billing_period,
+        "source_age_s": source_age_s,
+        "services": sanitized_services,
+    }
+
+
+def collect_storage_hygiene(
+    paths: Optional[List[str]] = None,
+    *,
+    soft_bytes: int = DEFAULT_STORAGE_SOFT_BYTES,
+    hard_bytes: int = DEFAULT_STORAGE_HARD_BYTES,
+    max_entries: int = MAX_STORAGE_SCAN_ENTRIES,
+    expected_uid: Optional[int] = None,
+    stat_fn: Callable[[str], Any] = os.stat,
+    walk_fn: Any = None,
+) -> List[Dict[str, Any]]:
+    """Bounded, non-destructive metadata observation of private directory storage.
+
+    Never reads file contents, tokens, or private payload data.
+    Never performs automated deletion or log rotation.
+    Thresholds trigger warnings; they do not silently pause execution.
+    Protects against symlink leaf and ancestor traversal using descriptor-relative
+    pinned handles and O_NOFOLLOW.
+    """
+    target_paths = paths if paths is not None else [os.path.join(os.getcwd(), ".local")]
+    results: List[Dict[str, Any]] = []
+    target_uid = os.getuid() if expected_uid is None else expected_uid
+
+    for raw_path in target_paths:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        clean_path = os.path.abspath(raw_path)
+        if not os.path.exists(clean_path):
+            results.append({
+                "path": clean_path,
+                "used_bytes": 0,
+                "soft_bytes": soft_bytes,
+                "hard_bytes": hard_bytes,
+                "state": "missing",
+                "policy": "preserve all archives and unresolved evidence; no automatic deletion",
+                "error": "path_not_found",
+            })
+            continue
+
+        p_obj = Path(clean_path)
+
+        # 1. Static ancestor hierarchy symlink check
+        curr = p_obj
+        has_symlink_ancestor = False
+        while curr != curr.parent:
+            if os.path.islink(str(curr)):
+                has_symlink_ancestor = True
+                break
+            curr = curr.parent
+
+        if has_symlink_ancestor:
+            results.append({
+                "path": clean_path,
+                "used_bytes": 0,
+                "soft_bytes": soft_bytes,
+                "hard_bytes": hard_bytes,
+                "state": "warn",
+                "policy": "preserve all archives and unresolved evidence; no automatic deletion",
+                "error": "symlink_storage_root_rejected",
+            })
+            continue
+
+        # 2. Pinned directory FD chain open with O_NOFOLLOW (POSIX)
+        target_fd: Optional[int] = None
+        if hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY"):
+            try:
+                curr_fd = os.open(p_obj.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    for part in p_obj.parts[1:]:
+                        next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=curr_fd)
+                        os.close(curr_fd)
+                        curr_fd = next_fd
+                    target_fd = curr_fd
+                except OSError as exc:
+                    os.close(curr_fd)
+                    import errno
+                    err_code = (
+                        "symlink_storage_root_rejected"
+                        if exc.errno in (errno.ELOOP, errno.ENOTDIR)
+                        else f"open_dir_error:{exc.errno}"
+                    )
+                    results.append({
+                        "path": clean_path,
+                        "used_bytes": 0,
+                        "soft_bytes": soft_bytes,
+                        "hard_bytes": hard_bytes,
+                        "state": "warn",
+                        "policy": "preserve all archives and unresolved evidence; no automatic deletion",
+                        "error": err_code,
+                    })
+                    continue
+            except Exception as exc:
+                results.append({
+                    "path": clean_path,
+                    "used_bytes": 0,
+                    "soft_bytes": soft_bytes,
+                    "hard_bytes": hard_bytes,
+                    "state": "warn",
+                    "policy": "preserve all archives and unresolved evidence; no automatic deletion",
+                    "error": f"open_dir_error:{type(exc).__name__}",
+                })
+                continue
+
+        # 3. Verify root ownership
+        try:
+            if target_fd is not None:
+                st_root = os.fstat(target_fd)
+            else:
+                st_root = stat_fn(clean_path)
+            if expected_uid is not None and st_root.st_uid != target_uid:
+                if target_fd is not None:
+                    os.close(target_fd)
+                results.append({
+                    "path": clean_path,
+                    "used_bytes": 0,
+                    "soft_bytes": soft_bytes,
+                    "hard_bytes": hard_bytes,
+                    "state": "warn",
+                    "policy": "preserve all archives and unresolved evidence; no automatic deletion",
+                    "error": "ownership_mismatch",
+                })
+                continue
+        except Exception as exc:
+            if target_fd is not None:
+                os.close(target_fd)
+            results.append({
+                "path": clean_path,
+                "used_bytes": 0,
+                "soft_bytes": soft_bytes,
+                "hard_bytes": hard_bytes,
+                "state": "warn",
+                "policy": "preserve all archives and unresolved evidence; no automatic deletion",
+                "error": f"stat_error:{type(exc).__name__}",
+            })
+            continue
+
+        # 4. Traversal with pinned directory descriptors
+        total_size = 0
+        entry_count = 0
+        scan_truncated = False
+        scan_error: Optional[str] = None
+
+        try:
+            if walk_fn is not None and walk_fn is not os.walk:
+                # Custom walk function passed in tests
+                for root, dirs, files in walk_fn(clean_path, followlinks=False):
+                    pruned_dirs = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+                    for d in pruned_dirs:
+                        entry_count += 1
+                        if entry_count > max_entries:
+                            scan_truncated = True
+                            break
+                    dirs[:] = pruned_dirs
+                    if scan_truncated:
+                        break
+                    for fname in files:
+                        entry_count += 1
+                        if entry_count > max_entries:
+                            scan_truncated = True
+                            break
+                        fpath = os.path.join(root, fname)
+                        if os.path.islink(fpath):
+                            continue
+                        try:
+                            st = stat_fn(fpath)
+                            if expected_uid is not None and st.st_uid != target_uid:
+                                continue
+                            if stat.S_ISREG(st.st_mode):
+                                total_size += st.st_size
+                        except (OSError, PermissionError):
+                            pass
+                    if scan_truncated:
+                        break
+            elif target_fd is not None and hasattr(os, "fwalk"):
+                # Pinned descriptor traversal using os.fwalk
+                for root, dirs, files, dirfd in os.fwalk(dir_fd=target_fd, follow_symlinks=False):
+                    pruned_dirs = []
+                    for d in dirs:
+                        try:
+                            st_sub = os.stat(d, dir_fd=dirfd, follow_symlinks=False)
+                            if stat.S_ISLNK(st_sub.st_mode):
+                                continue
+                            if expected_uid is not None and st_sub.st_uid != target_uid:
+                                continue
+                            entry_count += 1
+                            if entry_count > max_entries:
+                                scan_truncated = True
+                                break
+                            pruned_dirs.append(d)
+                        except (OSError, PermissionError):
+                            continue
+                    dirs[:] = pruned_dirs
+                    if scan_truncated:
+                        break
+
+                    for fname in files:
+                        entry_count += 1
+                        if entry_count > max_entries:
+                            scan_truncated = True
+                            break
+                        try:
+                            st = os.stat(fname, dir_fd=dirfd, follow_symlinks=False)
+                            if stat.S_ISLNK(st.st_mode):
+                                continue
+                            if expected_uid is not None and st.st_uid != target_uid:
+                                continue
+                            if stat.S_ISREG(st.st_mode):
+                                total_size += st.st_size
+                        except (OSError, PermissionError):
+                            pass
+                    if scan_truncated:
+                        break
+            else:
+                for root, dirs, files in os.walk(clean_path, followlinks=False):
+                    pruned_dirs = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+                    for d in pruned_dirs:
+                        entry_count += 1
+                        if entry_count > max_entries:
+                            scan_truncated = True
+                            break
+                    dirs[:] = pruned_dirs
+                    if scan_truncated:
+                        break
+                    for fname in files:
+                        entry_count += 1
+                        if entry_count > max_entries:
+                            scan_truncated = True
+                            break
+                        fpath = os.path.join(root, fname)
+                        if os.path.islink(fpath):
+                            continue
+                        try:
+                            st = stat_fn(fpath)
+                            if expected_uid is not None and st.st_uid != target_uid:
+                                continue
+                            if stat.S_ISREG(st.st_mode):
+                                total_size += st.st_size
+                        except (OSError, PermissionError):
+                            pass
+                    if scan_truncated:
+                        break
+        except Exception as exc:
+            scan_error = f"scan_error:{type(exc).__name__}"
+        finally:
+            if target_fd is not None:
+                os.close(target_fd)
+
+        if scan_truncated or scan_error:
+            state = "warn"
+        elif total_size >= hard_bytes:
+            state = "warn"
+        elif total_size >= soft_bytes:
+            state = "warn"
+        else:
+            state = "ok"
+
+        entry_result: Dict[str, Any] = {
+            "path": clean_path,
+            "used_bytes": total_size,
+            "soft_bytes": soft_bytes,
+            "hard_bytes": hard_bytes,
+            "state": state,
+            "policy": "preserve all archives and unresolved evidence; no automatic deletion",
+        }
+        if scan_truncated:
+            entry_result["truncated"] = True
+        if scan_error:
+            entry_result["error"] = scan_error
+
+        results.append(entry_result)
+
+    return results
+
+
 def collect_host_health(
     machine_id: str,
     *,
@@ -718,8 +1356,10 @@ def collect_host_health(
     open_fn: Callable[..., Any] = open,
     time_fn: Callable[[], str] = utc_now_iso,
     services: Optional[List[Dict[str, Any]]] = None,
+    budget: Optional[Dict[str, Any]] = None,
+    storage: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Collect complete host health snapshot (load averages + memory + services)."""
+    """Collect complete host health snapshot (load averages + memory + services + budget + storage)."""
     load = collect_load_averages(getloadavg_fn)
     memory = collect_memory_stats(
         meminfo_path=meminfo_path,
@@ -736,6 +1376,10 @@ def collect_host_health(
     }
     if services is not None:
         payload["services"] = services
+    if budget is not None:
+        payload["budget"] = budget
+    if storage is not None:
+        payload["storage"] = storage
 
     return payload
 
@@ -811,6 +1455,10 @@ class HostHealthMonitor:
         aplexer_bin: str = "aplexer",
         allow_symlinks: bool = False,
         expected_uid: Optional[int] = None,
+        budget_evidence: Optional[Dict[str, Any]] = None,
+        storage_paths: Optional[List[str]] = None,
+        storage_soft_bytes: Optional[int] = None,
+        storage_hard_bytes: Optional[int] = None,
     ):
         self._config_path = config_path or resolve_config_path()
         self._config_override = config
@@ -827,6 +1475,10 @@ class HostHealthMonitor:
         self._aplexer_bin = aplexer_bin
         self._allow_symlinks = allow_symlinks
         self._expected_uid = expected_uid
+        self._budget_evidence = budget_evidence
+        self._storage_paths = storage_paths
+        self._storage_soft_bytes = storage_soft_bytes
+        self._storage_hard_bytes = storage_hard_bytes
 
         self._last_run_monotonic = 0.0
         self._last_result: Optional[Dict[str, Any]] = None
@@ -908,6 +1560,23 @@ class HostHealthMonitor:
             open_fn=self._open_fn,
         )
 
+        budget_cfg = self._budget_evidence if self._budget_evidence is not None else cfg.get("budget")
+        budget_payload = collect_cloud_budget(budget_cfg, now=now_epoch)
+
+        storage_paths = self._storage_paths if self._storage_paths is not None else cfg.get("storage_paths")
+        storage_soft = self._storage_soft_bytes or cfg.get("storage_soft_bytes", DEFAULT_STORAGE_SOFT_BYTES)
+        storage_hard = self._storage_hard_bytes or cfg.get("storage_hard_bytes", DEFAULT_STORAGE_HARD_BYTES)
+        storage_payload = (
+            collect_storage_hygiene(
+                paths=storage_paths,
+                soft_bytes=storage_soft,
+                hard_bytes=storage_hard,
+                expected_uid=self._expected_uid,
+            )
+            if (storage_paths is not None or "storage_paths" in cfg)
+            else None
+        )
+
         try:
             payload = collect_host_health(
                 machine_id=machine_id,
@@ -917,6 +1586,8 @@ class HostHealthMonitor:
                 critical_percent=critical_percent,
                 open_fn=self._open_fn,
                 services=services_list if services_list else None,
+                budget=budget_payload,
+                storage=storage_payload,
             )
         except Exception as e:
             return {"disabled": False, "rate_limited": False, "posted": False, "errors": [f"collection_error:{type(e).__name__}"]}

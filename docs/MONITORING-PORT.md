@@ -72,7 +72,7 @@ These signals directly prevent service outages, disk exhaustion, runaway token e
    - **Target Seam**: `src/checks.ts` (`kind: 'quota'`), `host/agent_hub_host/quota.py`
    - **Requirements**:
      - Check provider remaining quota percentage before scheduling or launching sessions.
-     - Maintain strict fail-closed 15% reserve threshold (`percent_remaining > 15`).
+     - Enforce provider-specific reserve thresholds (e.g. Gemini 18%, GLM 42%, Codex 15%); the legacy Root-only 15% quota gate must not become global provider admission across all models.
 
 5. **Single-Instance Root Run & Task Leases**
    - **Target Seam**: Hub `leases` table + `host/agent_hub_host/guarded_root.py`
@@ -114,10 +114,11 @@ These signals provide operational clarity into host workload, execution progress
      - Collect active Cloudflare Workers deployment ID and bundle hash (`wrangler deployments`).
 
 5. **Storage Retention & Private State Containment**
-   - **Target Seam**: `host/agent_hub_host/session_cleanup.py`
+   - **Target Seam**: `host/agent_hub_host/host_health_monitor.py`, `src/monitoring.ts`
    - **Requirements**:
-     - Enforce soft limit (128 MiB) and hard limit (256 MiB) on `.local/` state directories.
-     - Automatically rotate and gzip compress operational logs when exceeding 4 MiB.
+     - Bounded metadata/size observation of `.local/` state directories.
+     - Enforce soft limit (128 MiB) and hard limit (256 MiB) warning states without destructive wiping.
+     - Automatic operational log rotation/compression is NOT an authorized adoption default. Treat existing histories, worktrees, unknown ownership and busy/draft panes as protected. No automatic cleanup, truncation, or unverified compression without explicit operator instruction.
 
 ---
 
@@ -139,10 +140,11 @@ These signals provide historical analysis and telemetry without blocking product
      - Reject recursive directory scans; report missing or out-of-scope paths.
 
 3. **Approval Modal Stall Detection (`aplexer-watch`)**
-   - **Target Seam**: `host/agent_hub_host/session_host.py`
+   - **Target Seam**: `host/agent_hub_host/session_host.py` / `aplexer-watch.service`
    - **Requirements**:
-     - Periodically capture terminal screens for interactive sessions.
-     - Detect repeated modal prompts (e.g. approval dialogs) and notify or auto-enter if configured.
+     - Periodically capture terminal screens/hashes for interactive sessions.
+     - Detect repeated modal prompts (e.g. approval dialogs) for operator notifications only.
+     - Auto-enter or automated composer submission is strictly prohibited.
 
 ---
 
@@ -226,18 +228,18 @@ Every signal from [docs/MONITORING-INVENTORY.md](MONITORING-INVENTORY.md) is cro
 | **Resting State Contradiction** | `scripts/supervision/service.py` | **Implemented 6b Port** | `src/session_lifecycle.ts` | Flags sessions reporting idle/waiting with recent activity (`contradicted_resting_state: true`), retaining active classification. |
 | **Pending Message Delivery SLO** | `scripts/supervision/service.py` | Active; actual failure detected | `src/checks.ts` (`kind: 'delivery_slo'`) | platform-delivery-slo is enabled on the existing cron with inherited300s limit; real manual run found2 overdue messages and opened a private alert. Real idle-model guarded delivery acceptance remains pending. |
 | **Consecutive Ping Misses** | `scripts/ping/principal-ping.py` | Partial; legacy retained | Hub Health Model (SPEC §9) | Machine heartbeats exist; principal-wake execution/recovery remains M8b work. No replacement proof for the legacy consecutive-miss monitor. |
-| **Approval Modal Stalls** | `python3 -m aplexer_watch` | **Remaining Item** | Standalone Hetzner service during migration | Running via systemd `aplexer-watch.service` until host native capture integration. |
+| **Approval Modal Stalls** | `python3 -m aplexer_watch` | **Remaining Item (Observation Only)** | `aplexer-watch.service` (legacy retained) | Passive terminal screen hash diff observation for operator alerts. Auto-enter/composer injection strictly forbidden. |
 | **Turn-End Wake Timer Audit** | `scripts/ping/wake-audit.py` | Partial; legacy retained | Serverless DO Triggers / Cron | Worker cron exists, but no current turn-end wake-obligation audit or installed principal-wake backend is proved. |
-| **Provider Window Quota** | `scripts/quota-monitor.py` | **Current Coverage** | `src/quota.ts`, `host/agent_hub_host/quota.py` | `/api/quota` enforces fail-closed 15% reserve gate across providers. |
+| **Provider Window Quota** | `scripts/quota-monitor.py` | **Current Coverage** | `src/quota.ts`, `host/agent_hub_host/quota.py` | `/api/quota` evaluates provider remaining quota with provider-specific routes. Legacy Root-only 15% gate must not become global provider admission. |
 | **Launcher Admission Routes** | `scripts/supervision/service.py` | **Current Coverage** | `src/model-routing.ts`, launcher gates | Enforces model quota reserve before launching workers. |
-| **Monthly Cloud Budget** | `scripts/delivery/cloud_budget.py` | Policy only; collection missing | Cloudflare Workers Free Tier policy | The USD5/month boundary is a policy. Free-tier architecture is not measured account usage, monthly cost, or preventive-budget monitoring. |
+| **Monthly Cloud Budget** | `scripts/delivery/cloud_budget.py` | **Implemented Smallest Stream** | `host/agent_hub_host/host_health_monitor.py`, `src/monitoring.ts` | Evaluates aggregate known service spend/limits/freshness/provenance against USD5.00 cap. Missing billing credentials remain unknown (fail-closed); includes configured base plan; Free-plan design or quota percentage is not monetary spend. Exact decimal arithmetic (BigInt 18 decimals in TypeScript, Decimal with decimal pattern validation in Python) prevents binary float imprecision; stale host (>300s), stale source (>30d), or rolled-over period recomputes status to unknown and triggers needs_attention warnings while preserving genuine over_budget. |
 | **Filesystem Disk Usage** | `scripts/metrics/collect.py` | **Implemented Addendum 6** | `host/agent_hub_host/disk_monitor.py`, `src/monitoring.ts` | Multi-mount statvfs (`/`, `/home`, `/data`, `/tmp`) with 85% warn / 95% critical thresholds. |
 | **Top Space Consumers** | *Missing in competition* | **Implemented Addendum 6** | `host/agent_hub_host/disk_monitor.py` (`scan_top_consumers`) | Bounded traversal (depth, entries, time) triggered only on threshold violations. |
 | **Host Load Average** | `scripts/metrics/collect.py` | **Implemented 6b Port** | `host/agent_hub_host/host_health_monitor.py`, `src/monitoring.ts`, `src/status.ts` | Collects Linux `os.getloadavg()`, ingests to Hub DO, exposes via `/api/monitoring/health` and `/api/status`. |
 | **Host Memory (MemAvailable/total)** | `scripts/metrics/collect.py` | **Implemented 6b Port** | `host/agent_hub_host/host_health_monitor.py`, `src/monitoring.ts`, `src/status.ts` | Parses `/proc/meminfo`, evaluates memory pressure (>=85% warn, >=95% critical), surfaces in `needs_attention`. |
 | **Worker Process RSS & CPU** | `scripts/metrics/collect.py` | **Current Coverage** | `host/agent_hub_host/metrics_producer.py`, `src/metrics.ts` | Aggregates per-session utime, stime, RSS to Hub `/api/metrics`. |
 | **Cgroup Memory & Tasks Containment** | `scripts/supervision/service.py` | **Current Coverage** | Systemd user units / launcher limits | MemoryMax=1500M, TasksMax=256 enforced per agent worker unit. |
-| **Local Private Storage Guard** | `scripts/supervision/retention.py` | Missing automatic size guard | `host/agent_hub_host/session_cleanup.py` | `session_cleanup.py` confines cleanup paths and preserves evidence; it does not implement the claimed128/256MiB storage-size guard. Existing retention monitoring remains needed. |
+| **Local Private Storage Guard** | `scripts/supervision/retention.py` | **Implemented Smallest Stream** | `host/agent_hub_host/host_health_monitor.py`, `src/monitoring.ts` | Bounded metadata size observation of .local/ reporting soft (128 MiB) and hard (256 MiB) states. Both subdirectories and regular files count against max_entries to bound empty-tree traversal; truncated scans or access errors report state=warn (never healthy ok). Automatic destructive log rotation/deletion is forbidden; histories and worktrees are protected. |
 | **Git Ancestry & Remote Drift** | `scripts/checks/status_probe.py` | Partial; configured probes active | `host/agent_hub_host/status_probe.py` (`probe_git`) | Exact configured SHA/ref ancestry probes run for allowlisted Hub sessions. They do not collect every repository or prove remote-ref freshness/divergence generally. |
 | **CI Workflow Status Drift** | `scripts/checks/status_probe.py` | **Current Coverage** | `host/agent_hub_host/status_probe.py` (`probe_ci`) | Surfaces latest GitHub Actions status for current HEAD SHA. |
 | **Deployed Artifact Bundle Drift** | `scripts/checks/status_probe.py` | Partial; active deployment proved | `host/agent_hub_host/status_probe.py` (`probe_deploy`) | Authenticated Cloudflare deployment/version annotations match exact source SHA. No artifact bundle hash is collected; control-plane deployment and actual DO request rollover are separately verified. |

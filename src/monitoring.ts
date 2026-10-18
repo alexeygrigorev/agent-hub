@@ -100,6 +100,51 @@ function cleanPath(value: unknown): string {
   return s;
 }
 
+const DECIMAL_SCALE_EXP = 18;
+const DECIMAL_SCALE = 10n ** 18n;
+
+export type ScaledDecimal = {
+  scaled: bigint;
+  str: string;
+};
+
+export function parseStrictDecimal(val: unknown, errorCode: string): ScaledDecimal {
+  let s: string;
+  if (typeof val === 'number') {
+    if (!Number.isFinite(val) || val < 0) fail(errorCode);
+    s = val.toString();
+    if (s.includes('e') || s.includes('E')) fail(errorCode);
+  } else if (typeof val === 'string') {
+    s = val.trim();
+  } else {
+    fail(errorCode);
+  }
+  // Strict bounded decimal grammar: 1 to 14 digits integer part, optional 1 to 18 digits fractional part
+  if (!s || !/^\d{1,14}(\.\d{1,18})?$/.test(s)) {
+    fail(errorCode);
+  }
+  const [intPart, fracPart = ''] = s.split('.');
+  const fracPadded = fracPart.padEnd(DECIMAL_SCALE_EXP, '0');
+  const scaled = BigInt(intPart) * DECIMAL_SCALE + BigInt(fracPadded);
+  return { scaled, str: s };
+}
+
+export function parseStrictPositiveDecimal(val: unknown, errorCode: string): ScaledDecimal {
+  const dec = parseStrictDecimal(val, errorCode);
+  if (dec.scaled <= 0n) fail(errorCode);
+  return dec;
+}
+
+export function formatScaledDecimal(scaled: bigint, originalStr?: string): string {
+  if (scaled === 0n) return '0.00';
+  const intPart = scaled / DECIMAL_SCALE;
+  const rem = scaled % DECIMAL_SCALE;
+  if (rem === 0n) return `${intPart}.00`;
+  let fracPart = rem.toString().padStart(DECIMAL_SCALE_EXP, '0').replace(/0+$/, '');
+  if (fracPart.length < 2) fracPart = fracPart.padEnd(2, '0');
+  return `${intPart}.${fracPart}`;
+}
+
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
@@ -177,12 +222,44 @@ export type SupervisorServiceStatus = {
   reason: string;
 };
 
+export type CloudBudgetServiceEntry = {
+  service: string;
+  month_to_date_usd: string | null;
+};
+
+export type CloudBudgetStatus = {
+  budget_cap_usd: string;
+  known_month_to_date_usd: string | null;
+  coverage_complete: boolean;
+  unknown_services: string[];
+  budget_status: 'known_within_budget' | 'over_budget' | 'unknown';
+  reason: string;
+  provenance?: string;
+  observed_at?: string | null;
+  billing_period?: string | null;
+  source_age_s?: number | null;
+  services?: CloudBudgetServiceEntry[];
+};
+
+export type StorageHygieneStatus = {
+  path: string;
+  used_bytes: number;
+  soft_bytes: number;
+  hard_bytes: number;
+  state: 'ok' | 'warn' | 'missing';
+  policy?: string;
+  truncated?: boolean;
+  error?: string | null;
+};
+
 export type HostHealthPayload = {
   machine_id: string;
   observed_at: string;
   load: HostLoad;
   memory: HostMemory;
   services?: SupervisorServiceStatus[];
+  budget?: CloudBudgetStatus;
+  storage?: StorageHygieneStatus[];
 };
 
 export type HostHealthSummary = {
@@ -192,6 +269,8 @@ export type HostHealthSummary = {
   load: HostLoad;
   memory: HostMemory;
   services?: SupervisorServiceStatus[];
+  budget?: CloudBudgetStatus;
+  storage?: StorageHygieneStatus[];
 };
 
 export class MonitoringService {
@@ -1187,6 +1266,183 @@ export class MonitoringService {
       });
     }
 
+    let budget: CloudBudgetStatus | undefined = undefined;
+    if (body.budget && typeof body.budget === 'object' && !Array.isArray(body.budget)) {
+      const rawBudget = body.budget;
+      let budgetCapDec: ScaledDecimal = { scaled: 5n * DECIMAL_SCALE, str: '5.00' };
+      if (rawBudget.budget_cap_usd !== undefined && rawBudget.budget_cap_usd !== null) {
+        budgetCapDec = parseStrictPositiveDecimal(rawBudget.budget_cap_usd, 'invalid_budget_cap');
+      }
+      const budgetCapUsd = formatScaledDecimal(budgetCapDec.scaled, budgetCapDec.str);
+
+      if (rawBudget.coverage_complete !== undefined && typeof rawBudget.coverage_complete !== 'boolean') {
+        fail('invalid_budget_coverage_complete');
+      }
+
+      let budgetObservedAt: string | null = null;
+      let budgetSourceAgeS: number | null = null;
+      if (rawBudget.observed_at !== undefined && rawBudget.observed_at !== null) {
+        if (typeof rawBudget.observed_at !== 'string') fail('invalid_budget_source_time');
+        const obsMs = Date.parse(rawBudget.observed_at);
+        if (!Number.isFinite(obsMs)) fail('invalid_budget_source_time');
+        if (obsMs > observedMs + 60000) fail('future_budget_source_time');
+        budgetObservedAt = new Date(obsMs).toISOString();
+        budgetSourceAgeS = Math.max(0, Math.round(((observedMs - obsMs) / 1000) * 10) / 10);
+      }
+
+      const hostReportPeriod = new Date(observedMs).toISOString().slice(0, 7);
+      let billingPeriod: string | null = null;
+      if (typeof rawBudget.billing_period === 'string') {
+        billingPeriod = rawBudget.billing_period.replace(CONTROL_RE, '').trim().slice(0, 32);
+      } else if (budgetObservedAt) {
+        billingPeriod = budgetObservedAt.slice(0, 7);
+      }
+
+      const services: CloudBudgetServiceEntry[] = [];
+      const unknownServices: string[] = [];
+      let knownScaled = 0n;
+      let hasKnown = false;
+      const seenServiceNames = new Set<string>();
+
+      if (Array.isArray(rawBudget.services)) {
+        if (rawBudget.services.length > 32) fail('invalid_budget_services_count');
+        for (const item of rawBudget.services) {
+          if (!item || typeof item !== 'object' || Array.isArray(item)) fail('invalid_budget_service_entry');
+          const svcName = String(item.service ?? '').replace(CONTROL_RE, '').trim();
+          if (!svcName || !LABEL_RE.test(svcName)) fail('invalid_budget_service_name');
+          if (seenServiceNames.has(svcName)) fail('duplicate_budget_service_name');
+          seenServiceNames.add(svcName);
+
+          if (item.month_to_date_usd === null || item.month_to_date_usd === undefined) {
+            unknownServices.push(svcName);
+            services.push({ service: svcName, month_to_date_usd: null });
+            continue;
+          }
+
+          const amtDec = parseStrictDecimal(item.month_to_date_usd, 'invalid_budget_amount');
+          knownScaled += amtDec.scaled;
+          hasKnown = true;
+          services.push({ service: svcName, month_to_date_usd: formatScaledDecimal(amtDec.scaled, amtDec.str) });
+        }
+      }
+
+      const expectedMissing: string[] = [];
+      if (Array.isArray(rawBudget.expected_services)) {
+        for (const exp of rawBudget.expected_services) {
+          const expName = String(exp ?? '').replace(CONTROL_RE, '').trim();
+          if (expName && !seenServiceNames.has(expName)) {
+            expectedMissing.push(expName);
+            seenServiceNames.add(expName);
+          }
+        }
+      }
+      for (const m of expectedMissing) {
+        unknownServices.push(m);
+      }
+
+      if (Array.isArray(rawBudget.unknown_services)) {
+        for (const u of rawBudget.unknown_services) {
+          const uName = String(u ?? '').replace(CONTROL_RE, '').trim();
+          if (uName && !seenServiceNames.has(uName)) {
+            unknownServices.push(uName);
+            seenServiceNames.add(uName);
+          }
+        }
+      }
+
+      // Independent server derivation of budget status (never trust arbitrary status):
+      const isStaleSource = budgetSourceAgeS !== null && budgetSourceAgeS > 30 * 86400;
+      const isPriorPeriod = billingPeriod !== null && billingPeriod < hostReportPeriod;
+      const isPeriodMismatch = billingPeriod !== null && billingPeriod !== hostReportPeriod;
+
+      const coverageComplete =
+        rawBudget.coverage_complete === true &&
+        services.length > 0 &&
+        unknownServices.length === 0 &&
+        expectedMissing.length === 0 &&
+        hasKnown &&
+        budgetObservedAt !== null &&
+        !isStaleSource &&
+        !isPeriodMismatch;
+
+      let derivedStatus: 'known_within_budget' | 'over_budget' | 'unknown' = 'unknown';
+      let derivedReason = 'missing_billing_credentials';
+
+      if (hasKnown && knownScaled > budgetCapDec.scaled) {
+        derivedStatus = 'over_budget';
+        derivedReason = 'known_spend_exceeds_budget';
+      } else if (coverageComplete) {
+        derivedStatus = 'known_within_budget';
+        derivedReason = 'complete_coverage_within_budget';
+      } else {
+        derivedStatus = 'unknown';
+        if (expectedMissing.length) {
+          derivedReason = 'missing_expected_services';
+        } else if (unknownServices.length) {
+          derivedReason = 'incomplete_billing_coverage';
+        } else if (isStaleSource) {
+          derivedReason = 'stale_source_observation';
+        } else if (isPriorPeriod) {
+          derivedReason = 'prior_billing_period';
+        } else if (isPeriodMismatch) {
+          derivedReason = 'billing_period_mismatch';
+        } else if (!budgetObservedAt) {
+          derivedReason = 'missing_source_observation_time';
+        } else {
+          derivedReason = 'missing_coverage_attestation';
+        }
+      }
+
+      budget = {
+        budget_cap_usd: budgetCapUsd,
+        known_month_to_date_usd: hasKnown ? formatScaledDecimal(knownScaled) : null,
+        coverage_complete: coverageComplete,
+        unknown_services: unknownServices,
+        budget_status: derivedStatus,
+        reason: derivedReason,
+        provenance: typeof rawBudget.provenance === 'string' ? rawBudget.provenance.slice(0, 128) : 'host_collector',
+        observed_at: budgetObservedAt,
+        billing_period: billingPeriod,
+        source_age_s: budgetSourceAgeS,
+        services: services.length ? services : undefined,
+      };
+    }
+
+    let storage: StorageHygieneStatus[] | undefined = undefined;
+    if (Array.isArray(body.storage)) {
+      if (body.storage.length > 16) fail('invalid_storage_entries_count');
+      storage = [];
+      for (const entry of body.storage) {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) fail('invalid_storage_entry');
+        const path = cleanPath(entry.path);
+        const usedBytes = Number(entry.used_bytes);
+        if (!Number.isSafeInteger(usedBytes) || usedBytes < 0) fail('invalid_storage_used_bytes');
+        const softBytes = Number(entry.soft_bytes ?? 128 * 1024 * 1024);
+        const hardBytes = Number(entry.hard_bytes ?? 256 * 1024 * 1024);
+        if (!Number.isSafeInteger(softBytes) || softBytes <= 0 || !Number.isSafeInteger(hardBytes) || hardBytes < softBytes) {
+          fail('invalid_storage_thresholds');
+        }
+
+        let state: 'ok' | 'warn' | 'missing' = 'ok';
+        if (entry.state === 'missing' || entry.error === 'path_not_found') {
+          state = 'missing';
+        } else if (entry.error || entry.truncated || usedBytes >= softBytes) {
+          state = 'warn';
+        }
+
+        storage.push({
+          path,
+          used_bytes: usedBytes,
+          soft_bytes: softBytes,
+          hard_bytes: hardBytes,
+          state,
+          policy: 'preserve all archives and unresolved evidence; no automatic deletion',
+          truncated: Boolean(entry.truncated),
+          error: typeof entry.error === 'string' ? entry.error.slice(0, 128) : null,
+        });
+      }
+    }
+
     return {
       machine_id: body.machine_id,
       observed_at: new Date(observedMs).toISOString(),
@@ -1200,6 +1456,8 @@ export class MonitoringService {
         error: typeof body.memory.error === 'string' ? body.memory.error.slice(0, 128) : null,
       },
       services,
+      budget,
+      storage,
     };
   }
 
@@ -1236,6 +1494,40 @@ export class MonitoringService {
         });
       } else if (payload.memory.status === 'ok') {
         this.liveness.setAlert('memory', payload.machine_id, null);
+      }
+
+      if (payload.budget) {
+        if (payload.budget.budget_status === 'over_budget') {
+          this.liveness.setAlert('budget', payload.machine_id, {
+            state: 'critical',
+            detail: `Cloud budget exceeded on ${payload.machine_id}: $${payload.budget.known_month_to_date_usd} / $${payload.budget.budget_cap_usd} USD`,
+          });
+        } else if (payload.budget.budget_status === 'unknown') {
+          this.liveness.setAlert('budget', payload.machine_id, {
+            state: 'warn',
+            detail: `Cloud budget unknown on ${payload.machine_id}: missing billing credentials (${payload.budget.reason})`,
+          });
+        } else if (payload.budget.budget_status === 'known_within_budget') {
+          this.liveness.setAlert('budget', payload.machine_id, null);
+        }
+      }
+
+      if (payload.storage && payload.storage.length) {
+        const warnEntry = payload.storage.find(s => s.state === 'warn');
+        if (warnEntry) {
+          let detail = `Storage soft limit exceeded on ${payload.machine_id}: ${warnEntry.path} at ${formatBytes(warnEntry.used_bytes)}`;
+          if (warnEntry.truncated) {
+            detail = `Storage scan truncated on ${payload.machine_id}: ${warnEntry.path}`;
+          } else if (warnEntry.error) {
+            detail = `Storage scan error on ${payload.machine_id}: ${warnEntry.path}: ${warnEntry.error}`;
+          }
+          this.liveness.setAlert('storage', payload.machine_id, {
+            state: 'warn',
+            detail,
+          });
+        } else {
+          this.liveness.setAlert('storage', payload.machine_id, null);
+        }
       }
     }
 
@@ -1450,6 +1742,45 @@ export class MonitoringService {
         });
       }
 
+      let projectedBudget = payload.budget;
+      if (projectedBudget) {
+        let budgetAge = projectedBudget.source_age_s;
+        if (budgetAge !== null && typeof budgetAge === 'number') {
+          budgetAge = Math.round((budgetAge + elapsedS) * 10) / 10;
+        }
+        let budgetStatus = projectedBudget.budget_status;
+        let budgetReason = projectedBudget.reason;
+        let coverageComplete = projectedBudget.coverage_complete;
+
+        const currentPeriod = new Date(now).toISOString().slice(0, 7);
+        const isPeriodRolledOver = projectedBudget.billing_period && projectedBudget.billing_period < currentPeriod;
+        const isStaleSource = budgetAge !== null && budgetAge > 30 * 86400;
+
+        if (budgetStatus !== 'over_budget') {
+          if (freshness !== 'fresh') {
+            budgetStatus = 'unknown';
+            coverageComplete = false;
+            budgetReason = 'host_observation_stale';
+          } else if (isStaleSource) {
+            budgetStatus = 'unknown';
+            coverageComplete = false;
+            budgetReason = 'stale_source_observation';
+          } else if (isPeriodRolledOver) {
+            budgetStatus = 'unknown';
+            coverageComplete = false;
+            budgetReason = 'prior_billing_period';
+          }
+        }
+
+        projectedBudget = {
+          ...projectedBudget,
+          budget_status: budgetStatus,
+          coverage_complete: coverageComplete,
+          source_age_s: budgetAge,
+          reason: budgetReason,
+        };
+      }
+
       machines.push({
         machine_id: r.machine_id,
         observed_at: r.observed_at,
@@ -1457,6 +1788,8 @@ export class MonitoringService {
         load: payload.load ?? { load1: 0, load5: 0, load15: 0 },
         memory: payload.memory ?? { total_bytes: 0, available_bytes: 0, used_bytes: 0, percent: 0, status: 'unknown' },
         services: projectedServices,
+        budget: projectedBudget,
+        storage: payload.storage,
       });
     }
 
@@ -1504,6 +1837,52 @@ export class MonitoringService {
           detail: `Memory is at ${h.memory.percent}% (${formatBytes(h.memory.used_bytes)} / ${formatBytes(h.memory.total_bytes)})`,
           percent: h.memory.percent,
         });
+      }
+
+      if (h.budget) {
+        if (h.budget.budget_status === 'over_budget') {
+          needsAttention.push({
+            severity: 'critical',
+            subject: `${h.machine_id}:budget`,
+            title: `Cloud budget exceeded on ${h.machine_id}`,
+            detail: `Known spend $${h.budget.known_month_to_date_usd} exceeds $${h.budget.budget_cap_usd} USD cap`,
+            budget_status: h.budget.budget_status,
+            known_month_to_date_usd: h.budget.known_month_to_date_usd,
+            budget_cap_usd: h.budget.budget_cap_usd,
+          });
+        } else if (h.budget.budget_status === 'unknown') {
+          needsAttention.push({
+            severity: 'warn',
+            subject: `${h.machine_id}:budget`,
+            title: `Cloud budget status unknown on ${h.machine_id}`,
+            detail: `Missing billing credentials or incomplete coverage (${h.budget.reason})`,
+            budget_status: h.budget.budget_status,
+            reason: h.budget.reason,
+            unknown_services: h.budget.unknown_services,
+          });
+        }
+      }
+
+      if (h.storage && h.storage.length) {
+        for (const st of h.storage) {
+          if (st.state === 'warn') {
+            let detail = `${st.path} usage ${formatBytes(st.used_bytes)} exceeds soft threshold ${formatBytes(st.soft_bytes)}`;
+            if (st.truncated) {
+              detail = `Storage scan truncated for ${st.path}`;
+            } else if (st.error) {
+              detail = `Storage scan error for ${st.path}: ${st.error}`;
+            }
+            needsAttention.push({
+              severity: 'warn',
+              subject: `${h.machine_id}:storage:${st.path}`,
+              title: `Storage soft limit warning on ${h.machine_id}`,
+              detail,
+              path: st.path,
+              used_bytes: st.used_bytes,
+              soft_bytes: st.soft_bytes,
+            });
+          }
+        }
       }
 
       for (const svc of h.services || []) {

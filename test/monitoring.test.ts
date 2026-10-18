@@ -1328,5 +1328,614 @@ describe('Disk Monitoring Service', () => {
     alerts = hub.livenessService.alerts();
     expect(alerts.some((a: any) => a.subject_kind === 'supervisor' && a.subject === 'hetzner:supervision' && a.resolved_at === null)).toBe(false);
   }));
+
+  it('accepts host health observation with cloud budget, independently verifies status, and projects into status/liveness', () => fixture(async (hub, clock) => {
+    enrollHost(hub.sql, 'hetzner');
+    const auth = { kind: 'host' as const, machine_id: 'hetzner', tokenId: 'cred-hetzner' };
+
+    // 1. Post observation with spend exceeding $5.00 cap. Client claims known_within_budget.
+    // Server must reject false client status and independently derive over_budget.
+    const reqOver = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: new Date(clock.t).toISOString(),
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        budget: {
+          budget_cap_usd: '5.00',
+          known_month_to_date_usd: '6.20',
+          coverage_complete: true,
+          unknown_services: [],
+          budget_status: 'known_within_budget', // Falsified client status
+          reason: 'spoofed_ok',
+          services: [
+            { service: 'cloudflare', month_to_date_usd: '1.20' },
+            { service: 'hetzner', month_to_date_usd: '5.00' },
+          ],
+        },
+      }),
+    });
+    const resOver = await hub.monitoringService.handleHostHealthObservation(reqOver, auth);
+    expect(resOver.status).toBe(200);
+
+    // Verify projection in getHostHealthStatus
+    const healthStatus1 = hub.monitoringService.getHostHealthStatus(clock.t);
+    const host1 = healthStatus1.machines.find(m => m.machine_id === 'hetzner');
+    expect(host1?.budget).toBeDefined();
+    expect(host1!.budget!.budget_status).toBe('over_budget');
+    expect(host1!.budget!.reason).toBe('known_spend_exceeds_budget');
+    expect(host1!.budget!.known_month_to_date_usd).toBe('6.20');
+
+    // Verify critical liveness alert
+    const alerts1 = hub.livenessService.alerts();
+    const budgetAlert1 = alerts1.find((a: any) => a.subject_kind === 'budget' && a.subject === 'hetzner' && a.resolved_at === null);
+    expect(budgetAlert1).toBeDefined();
+    expect(budgetAlert1!.state).toBe('critical');
+
+    // Verify critical needs_attention item in getStatusSummary
+    const summary1 = hub.monitoringService.getStatusSummary(clock.t);
+    const attentionBudget1 = summary1.needs_attention.find((n: any) => n.subject === 'hetzner:budget');
+    expect(attentionBudget1).toBeDefined();
+    expect(attentionBudget1.severity).toBe('critical');
+    expect(attentionBudget1.budget_status).toBe('over_budget');
+
+    // 2. Post updated observation within budget cap with authentic source observation time
+    const reqWithin = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: new Date(clock.t).toISOString(),
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        budget: {
+          budget_cap_usd: '5.00',
+          observed_at: new Date(clock.t - 30000).toISOString(),
+          billing_period: '2026-10',
+          coverage_complete: true,
+          unknown_services: [],
+          services: [
+            { service: 'cloudflare', month_to_date_usd: '0.00' },
+            { service: 'hetzner', month_to_date_usd: '2.50' },
+          ],
+        },
+      }),
+    });
+    const resWithin = await hub.monitoringService.handleHostHealthObservation(reqWithin, auth);
+    expect(resWithin.status).toBe(200);
+
+    const healthStatus2 = hub.monitoringService.getHostHealthStatus(clock.t);
+    const host2 = healthStatus2.machines.find(m => m.machine_id === 'hetzner');
+    expect(host2!.budget!.budget_status).toBe('known_within_budget');
+    expect(host2!.budget!.known_month_to_date_usd).toBe('2.50');
+    expect(host2!.budget!.observed_at).toBeDefined();
+    expect(host2!.budget!.billing_period).toBe('2026-10');
+    expect(host2!.budget!.source_age_s).toBeGreaterThanOrEqual(30.0);
+
+    // Liveness alert should now be cleared
+    const alerts2 = hub.livenessService.alerts();
+    const budgetAlert2 = alerts2.find((a: any) => a.subject_kind === 'budget' && a.subject === 'hetzner' && a.resolved_at === null);
+    expect(budgetAlert2).toBeUndefined();
+
+    // needs_attention should have no budget entry
+    const summary2 = hub.monitoringService.getStatusSummary(clock.t);
+    expect(summary2.needs_attention.some((n: any) => n.subject === 'hetzner:budget')).toBe(false);
+
+    // 2b. Config flag alone without source observation time CANNOT establish known_within_budget!
+    const reqNoSourceTime = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: new Date(clock.t).toISOString(),
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        budget: {
+          budget_cap_usd: '5.00',
+          coverage_complete: true,
+          unknown_services: [],
+          services: [
+            { service: 'cloudflare', month_to_date_usd: '0.00' },
+            { service: 'hetzner', month_to_date_usd: '2.50' },
+          ],
+        },
+      }),
+    });
+    const resNoSourceTime = await hub.monitoringService.handleHostHealthObservation(reqNoSourceTime, auth);
+    expect(resNoSourceTime.status).toBe(200);
+    const healthStatusNoTime = hub.monitoringService.getHostHealthStatus(clock.t);
+    const hostNoTime = healthStatusNoTime.machines.find(m => m.machine_id === 'hetzner');
+    expect(hostNoTime!.budget!.budget_status).toBe('unknown');
+    expect(hostNoTime!.budget!.reason).toBe('missing_source_observation_time');
+
+    // 2c. Stale source observation (>30 days) is rejected as unknown
+    const staleSourceIso = new Date(clock.t - 31 * 86400 * 1000).toISOString();
+    const reqStaleSource = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: new Date(clock.t).toISOString(),
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        budget: {
+          budget_cap_usd: '5.00',
+          observed_at: staleSourceIso,
+          coverage_complete: true,
+          unknown_services: [],
+          services: [
+            { service: 'cloudflare', month_to_date_usd: '0.00' },
+            { service: 'hetzner', month_to_date_usd: '2.50' },
+          ],
+        },
+      }),
+    });
+    const resStaleSource = await hub.monitoringService.handleHostHealthObservation(reqStaleSource, auth);
+    expect(resStaleSource.status).toBe(200);
+    const healthStatusStale = hub.monitoringService.getHostHealthStatus(clock.t);
+    const hostStale = healthStatusStale.machines.find(m => m.machine_id === 'hetzner');
+    expect(hostStale!.budget!.budget_status).toBe('unknown');
+    expect(hostStale!.budget!.reason).toBe('stale_source_observation');
+
+    // 3. Post observation with missing billing credentials / incomplete coverage
+    const reqUnknown = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: new Date(clock.t).toISOString(),
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        budget: {
+          budget_cap_usd: '5.00',
+          coverage_complete: false,
+          unknown_services: ['aws_cognito'],
+          services: [
+            { service: 'cloudflare', month_to_date_usd: '0.00' },
+          ],
+        },
+      }),
+    });
+    const resUnknown = await hub.monitoringService.handleHostHealthObservation(reqUnknown, auth);
+    expect(resUnknown.status).toBe(200);
+
+    const healthStatus3 = hub.monitoringService.getHostHealthStatus(clock.t);
+    const host3 = healthStatus3.machines.find(m => m.machine_id === 'hetzner');
+    expect(host3!.budget!.budget_status).toBe('unknown');
+    expect(host3!.budget!.reason).toBe('incomplete_billing_coverage');
+
+    // Liveness alert is warn
+    const alerts3 = hub.livenessService.alerts();
+    const budgetAlert3 = alerts3.find((a: any) => a.subject_kind === 'budget' && a.subject === 'hetzner' && a.resolved_at === null);
+    expect(budgetAlert3).toBeDefined();
+    expect(budgetAlert3!.state).toBe('warn');
+
+    // needs_attention has warn entry
+    const summary3 = hub.monitoringService.getStatusSummary(clock.t);
+    const attentionBudget3 = summary3.needs_attention.find((n: any) => n.subject === 'hetzner:budget');
+    expect(attentionBudget3).toBeDefined();
+    expect(attentionBudget3.severity).toBe('warn');
+  }));
+
+  it('rejects invalid cloud budget payloads and enforces validation bounds', () => fixture(async (hub, clock) => {
+    enrollHost(hub.sql, 'hetzner');
+    const auth = { kind: 'host' as const, machine_id: 'hetzner', tokenId: 'cred-hetzner' };
+
+    const postBudget = async (budgetObj: any) => {
+      return hub.monitoringService.handleHostHealthObservation(
+        new Request('https://hub.internal/api/monitoring/health', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            machine_id: 'hetzner',
+            observed_at: new Date(clock.t).toISOString(),
+            load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+            memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+            budget: budgetObj,
+          }),
+        }),
+        auth,
+      );
+    };
+
+    // Rejects boolean amount
+    const resBool = await postBudget({
+      budget_cap_usd: '5.00',
+      services: [{ service: 'cloudflare', month_to_date_usd: true }],
+    });
+    expect(resBool.status).toBe(400);
+
+    // Rejects negative amount
+    const resNeg = await postBudget({
+      budget_cap_usd: '5.00',
+      services: [{ service: 'cloudflare', month_to_date_usd: -5.0 }],
+    });
+    expect(resNeg.status).toBe(400);
+
+    // Rejects duplicate service names
+    const resDup = await postBudget({
+      budget_cap_usd: '5.00',
+      services: [
+        { service: 'hetzner', month_to_date_usd: '1.00' },
+        { service: 'hetzner', month_to_date_usd: '2.00' },
+      ],
+    });
+    expect(resDup.status).toBe(400);
+
+    // Rejects invalid service name
+    const resBadName = await postBudget({
+      budget_cap_usd: '5.00',
+      services: [{ service: 'bad name with spaces!', month_to_date_usd: '1.00' }],
+    });
+    expect(resBadName.status).toBe(400);
+
+    // Rejects non-numeric budget cap
+    const resBadCap = await postBudget({
+      budget_cap_usd: 'not-a-number',
+      services: [{ service: 'cloudflare', month_to_date_usd: '0.00' }],
+    });
+    expect(resBadCap.status).toBe(400);
+
+    // Rejects array budget cap ([] and [5])
+    const resArrayCapEmpty = await postBudget({
+      budget_cap_usd: [],
+      services: [{ service: 'cloudflare', month_to_date_usd: '0.00' }],
+    });
+    expect(resArrayCapEmpty.status).toBe(400);
+
+    const resArrayCapNum = await postBudget({
+      budget_cap_usd: [5],
+      services: [{ service: 'cloudflare', month_to_date_usd: '0.00' }],
+    });
+    expect(resArrayCapNum.status).toBe(400);
+
+    // Rejects array month_to_date_usd ([] and [5])
+    const resArrayAmtEmpty = await postBudget({
+      budget_cap_usd: '5.00',
+      services: [{ service: 'cloudflare', month_to_date_usd: [] }],
+    });
+    expect(resArrayAmtEmpty.status).toBe(400);
+
+    const resArrayAmtNum = await postBudget({
+      budget_cap_usd: '5.00',
+      services: [{ service: 'cloudflare', month_to_date_usd: [5] }],
+    });
+    expect(resArrayAmtNum.status).toBe(400);
+
+    // Rejects string coverage_complete ('false')
+    const resStringCoverage = await postBudget({
+      budget_cap_usd: '5.00',
+      coverage_complete: 'false',
+      services: [{ service: 'cloudflare', month_to_date_usd: '1.00' }],
+    });
+    expect(resStringCoverage.status).toBe(400);
+  }));
+
+  it('rejects prior billing period and incomplete expected services from claiming within-budget status', () => fixture(async (hub, clock) => {
+    enrollHost(hub.sql, 'hetzner');
+    const auth = { kind: 'host' as const, machine_id: 'hetzner', tokenId: 'cred-hetzner' };
+    const nowIso = new Date(clock.t).toISOString(); // 2026-10-18...
+
+    // Prior billing period (2026-09) must fail closed as unknown with prior_billing_period
+    const reqPrior = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: nowIso,
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        budget: {
+          budget_cap_usd: '5.00',
+          coverage_complete: true,
+          billing_period: '2026-09',
+          observed_at: nowIso,
+          services: [{ service: 'cloudflare', month_to_date_usd: '2.00' }],
+        },
+      }),
+    });
+    const resPrior = await hub.monitoringService.handleHostHealthObservation(reqPrior, auth);
+    expect(resPrior.status).toBe(200);
+
+    const getRes = await hub.monitoringService.handleHostHealthGet(
+      new Request('https://hub.internal/api/monitoring/health?machine_id=hetzner'),
+      auth,
+    );
+    const bodyPrior: any = await getRes.json();
+    const machine = bodyPrior.machines[0];
+    expect(machine.budget.budget_status).toBe('unknown');
+    expect(machine.budget.reason).toBe('prior_billing_period');
+    expect(machine.budget.coverage_complete).toBe(false);
+
+    // Missing expected service must fail closed as unknown with missing_expected_services
+    const reqMissingExp = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: nowIso,
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        budget: {
+          budget_cap_usd: '5.00',
+          coverage_complete: true,
+          expected_services: ['cloudflare', 'hetzner_cloud'],
+          observed_at: nowIso,
+          services: [{ service: 'cloudflare', month_to_date_usd: '2.00' }],
+        },
+      }),
+    });
+    const resMissingExp = await hub.monitoringService.handleHostHealthObservation(reqMissingExp, auth);
+    expect(resMissingExp.status).toBe(200);
+
+    const getResExp = await hub.monitoringService.handleHostHealthGet(
+      new Request('https://hub.internal/api/monitoring/health?machine_id=hetzner'),
+      auth,
+    );
+    const bodyExp: any = await getResExp.json();
+    const machineExp = bodyExp.machines[0];
+    expect(machineExp.budget.budget_status).toBe('unknown');
+    expect(machineExp.budget.reason).toBe('missing_expected_services');
+    expect(machineExp.budget.unknown_services).toContain('hetzner_cloud');
+    expect(machineExp.budget.coverage_complete).toBe(false);
+  }));
+
+  it('accepts storage hygiene observations, alerts on soft threshold, and recovers cleanly', () => fixture(async (hub, clock) => {
+    enrollHost(hub.sql, 'hetzner');
+    const auth = { kind: 'host' as const, machine_id: 'hetzner', tokenId: 'cred-hetzner' };
+
+    // 1. Post storage observation exceeding soft limit (150 MiB >= 128 MiB)
+    const reqWarn = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: new Date(clock.t).toISOString(),
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        storage: [
+          {
+            path: '/home/alexey/git/agent-hub/.local',
+            used_bytes: 157_286_400, // 150 MiB
+            soft_bytes: 134_217_728, // 128 MiB
+            hard_bytes: 268_435_456, // 256 MiB
+            state: 'warn',
+          },
+        ],
+      }),
+    });
+    const resWarn = await hub.monitoringService.handleHostHealthObservation(reqWarn, auth);
+    expect(resWarn.status).toBe(200);
+
+    // Check host health projection
+    const healthStatus1 = hub.monitoringService.getHostHealthStatus(clock.t);
+    const host1 = healthStatus1.machines.find(m => m.machine_id === 'hetzner');
+    expect(host1?.storage).toHaveLength(1);
+    expect(host1!.storage![0].state).toBe('warn');
+    expect(host1!.storage![0].policy).toBe('preserve all archives and unresolved evidence; no automatic deletion');
+
+    // Check liveness alert
+    const alerts1 = hub.livenessService.alerts();
+    const storageAlert1 = alerts1.find((a: any) => a.subject_kind === 'storage' && a.subject === 'hetzner' && a.resolved_at === null);
+    expect(storageAlert1).toBeDefined();
+    expect(storageAlert1!.state).toBe('warn');
+
+    // Check getStatusSummary
+    const summary1 = hub.monitoringService.getStatusSummary(clock.t);
+    const attentionStorage1 = summary1.needs_attention.find((n: any) => n.subject === 'hetzner:storage:/home/alexey/git/agent-hub/.local');
+    expect(attentionStorage1).toBeDefined();
+    expect(attentionStorage1.severity).toBe('warn');
+
+    // 2. Post storage observation under soft threshold (recovery)
+    const reqOk = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: new Date(clock.t).toISOString(),
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        storage: [
+          {
+            path: '/home/alexey/git/agent-hub/.local',
+            used_bytes: 52_428_800, // 50 MiB
+            soft_bytes: 134_217_728,
+            hard_bytes: 268_435_456,
+            state: 'ok',
+          },
+        ],
+      }),
+    });
+    const resOk = await hub.monitoringService.handleHostHealthObservation(reqOk, auth);
+    expect(resOk.status).toBe(200);
+
+    // Storage alert cleared
+    const alerts2 = hub.livenessService.alerts();
+    const storageAlert2 = alerts2.find((a: any) => a.subject_kind === 'storage' && a.subject === 'hetzner' && a.resolved_at === null);
+    expect(storageAlert2).toBeUndefined();
+
+    // needs_attention has no storage item
+    const summary2 = hub.monitoringService.getStatusSummary(clock.t);
+    expect(summary2.needs_attention.some((n: any) => n.subject.startsWith('hetzner:storage'))).toBe(false);
+
+    // 3. Validation bounds: inverted thresholds hard_bytes < soft_bytes fails with 400
+    const reqInverted = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: new Date(clock.t).toISOString(),
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        storage: [
+          {
+            path: '/home/alexey/git/agent-hub/.local',
+            used_bytes: 100,
+            soft_bytes: 500,
+            hard_bytes: 200, // Invalid: hard < soft!
+          },
+        ],
+      }),
+    });
+    const resInverted = await hub.monitoringService.handleHostHealthObservation(reqInverted, auth);
+    expect(resInverted.status).toBe(400);
+
+    // Negative used_bytes fails with 400
+    const reqNegative = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: new Date(clock.t).toISOString(),
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        storage: [
+          {
+            path: '/home/alexey/git/agent-hub/.local',
+            used_bytes: -1,
+            soft_bytes: 100,
+            hard_bytes: 200,
+          },
+        ],
+      }),
+    });
+    const resNegative = await hub.monitoringService.handleHostHealthObservation(reqNegative, auth);
+    expect(resNegative.status).toBe(400);
+  }));
+
+  it('evaluates exact decimal arithmetic, clock-advanced budget recomputation, and storage scan truncation alerts', () => fixture(async (hub, clock) => {
+    enrollHost(hub.sql, 'hetzner');
+    const auth = { kind: 'host' as const, machine_id: 'hetzner', tokenId: 'cred-hetzner' };
+
+    // 1. Exact decimal comparison: 0.10 + 0.20 against cap 0.30 is exactly equal, NOT over budget
+    const reqExact = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: new Date(clock.t).toISOString(),
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        budget: {
+          budget_cap_usd: '0.30',
+          observed_at: new Date(clock.t).toISOString(),
+          billing_period: '2026-10',
+          coverage_complete: true,
+          services: [
+            { service: 'service_a', month_to_date_usd: '0.10' },
+            { service: 'service_b', month_to_date_usd: '0.20' },
+          ],
+        },
+      }),
+    });
+    const resExact = await hub.monitoringService.handleHostHealthObservation(reqExact, auth);
+    expect(resExact.status).toBe(200);
+    const healthExact = hub.monitoringService.getHostHealthStatus(clock.t);
+    const hostExact = healthExact.machines.find(m => m.machine_id === 'hetzner');
+    expect(hostExact!.budget!.budget_status).toBe('known_within_budget');
+    expect(hostExact!.budget!.known_month_to_date_usd).toBe('0.30');
+
+    // 1b. Exact decimal comparison: 5.0000000000000001 against cap 5.00 is over_budget
+    const reqMicroOver = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: new Date(clock.t).toISOString(),
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        budget: {
+          budget_cap_usd: '5.00',
+          observed_at: new Date(clock.t).toISOString(),
+          billing_period: '2026-10',
+          coverage_complete: true,
+          services: [
+            { service: 'service_a', month_to_date_usd: '5.0000000000000001' },
+          ],
+        },
+      }),
+    });
+    const resMicroOver = await hub.monitoringService.handleHostHealthObservation(reqMicroOver, auth);
+    expect(resMicroOver.status).toBe(200);
+    const healthMicroOver = hub.monitoringService.getHostHealthStatus(clock.t);
+    const hostMicroOver = healthMicroOver.machines.find(m => m.machine_id === 'hetzner');
+    expect(hostMicroOver!.budget!.budget_status).toBe('over_budget');
+    expect(hostMicroOver!.budget!.reason).toBe('known_spend_exceeds_budget');
+
+    // 2. Projected budget recomputation when advancing clock:
+    // First post a fresh within_budget observation
+    const reqFresh = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: new Date(clock.t).toISOString(),
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        budget: {
+          budget_cap_usd: '5.00',
+          observed_at: new Date(clock.t).toISOString(),
+          billing_period: '2026-10',
+          coverage_complete: true,
+          services: [
+            { service: 'cloudflare', month_to_date_usd: '2.00' },
+          ],
+        },
+      }),
+    });
+    await hub.monitoringService.handleHostHealthObservation(reqFresh, auth);
+    const healthBefore = hub.monitoringService.getHostHealthStatus(clock.t);
+    expect(healthBefore.machines[0].budget!.budget_status).toBe('known_within_budget');
+
+    // Advance clock past freshness threshold (301 seconds)
+    clock.t += 301 * 1000;
+    const healthAfter = hub.monitoringService.getHostHealthStatus(clock.t);
+    const hostAfter = healthAfter.machines[0];
+    expect(hostAfter.freshness).toBe('stale');
+    expect(hostAfter.budget!.budget_status).toBe('unknown');
+    expect(hostAfter.budget!.reason).toBe('host_observation_stale');
+    expect(hostAfter.budget!.coverage_complete).toBe(false);
+
+    // needs_attention reflects this
+    const summaryAfter = hub.monitoringService.getStatusSummary(clock.t);
+    expect(summaryAfter.needs_attention.some((n: any) => n.subject === 'hetzner:budget')).toBe(true);
+
+    // 3. Storage hygiene truncation alert
+    const reqTruncated = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: new Date(clock.t).toISOString(),
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        storage: [
+          {
+            path: '/home/alexey/git/agent-hub/.local',
+            used_bytes: 1024,
+            soft_bytes: 10000,
+            hard_bytes: 20000,
+            state: 'warn',
+            truncated: true,
+          },
+        ],
+      }),
+    });
+    const resTruncated = await hub.monitoringService.handleHostHealthObservation(reqTruncated, auth);
+    expect(resTruncated.status).toBe(200);
+
+    const alertsTruncated = hub.livenessService.alerts();
+    const storageAlert = alertsTruncated.find((a: any) => a.subject_kind === 'storage' && a.subject === 'hetzner' && a.resolved_at === null);
+    expect(storageAlert).toBeDefined();
+    expect(storageAlert!.detail).toContain('Storage scan truncated on hetzner');
+
+    const summaryTruncated = hub.monitoringService.getStatusSummary(clock.t);
+    const storageAttention = summaryTruncated.needs_attention.find((n: any) => n.subject.startsWith('hetzner:storage'));
+    expect(storageAttention).toBeDefined();
+    expect(storageAttention!.detail).toContain('Storage scan truncated');
+  }));
 });
+
 
