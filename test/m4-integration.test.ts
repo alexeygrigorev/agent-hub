@@ -29,6 +29,7 @@ async function resetAndSeedIntegrationDb(sql: any) {
 
   sql.exec("INSERT OR IGNORE INTO leases (name, epoch) VALUES ('root', 0)");
 
+  try { sql.exec('DELETE FROM users'); } catch (e) {}
   try { sql.exec('DELETE FROM jobs'); } catch (e) {}
   try { sql.exec('DELETE FROM offers'); } catch (e) {}
   try { sql.exec('DELETE FROM audit'); } catch (e) {}
@@ -42,6 +43,11 @@ async function resetAndSeedIntegrationDb(sql: any) {
 
   const now = new Date().toISOString();
   const future = new Date(Date.now() + 86400000).toISOString();
+
+  sql.exec(
+    "INSERT OR REPLACE INTO users (sub, email, is_admin, first_seen_at, last_seen_at) VALUES (?, ?, 1, ?, ?)",
+    'admin-1', 'admin@fake.local', now, now
+  );
 
   // Seed two capable machines
   sql.exec(
@@ -85,8 +91,8 @@ async function resetAndSeedIntegrationDb(sql: any) {
   // Admin Credential
   const tokenAdmin = await sha256('token_admin');
   sql.exec(
-    "INSERT INTO credentials (id, kind, token_hash, family_id, subject, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    'cred_admin', 'human', tokenAdmin, 'fam_admin', 'admin@example.com', JSON.stringify(['admin', 'jobs:create', 'bus:read', 'bus:send']), 'admin-1', now, future
+    "INSERT INTO credentials (id, kind, token_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    'cred_admin', 'human', tokenAdmin, 'fam_admin', 'admin@fake.local', null, 'human:admin-1', JSON.stringify(['admin']), 'admin-1', now, future
   );
 }
 

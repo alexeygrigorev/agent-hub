@@ -31,6 +31,7 @@ async function seedTestDb(sql: any) {
 
   sql.exec("INSERT OR IGNORE INTO leases (name, epoch) VALUES ('root', 0)");
 
+  try { sql.exec('DELETE FROM users'); } catch (e) {}
   try { sql.exec('DELETE FROM jobs'); } catch (e) {}
   try { sql.exec('DELETE FROM offers'); } catch (e) {}
   try { sql.exec('DELETE FROM audit'); } catch (e) {}
@@ -42,6 +43,11 @@ async function seedTestDb(sql: any) {
 
   const now = new Date().toISOString();
   const future = new Date(Date.now() + 86400000).toISOString();
+
+  sql.exec(
+    "INSERT OR REPLACE INTO users (sub, email, is_admin, first_seen_at, last_seen_at) VALUES (?, ?, 1, ?, ?)",
+    'admin-1', 'admin@fake.local', now, now
+  );
 
   // Seed two capable machines
   sql.exec(
@@ -91,8 +97,8 @@ async function seedTestDb(sql: any) {
   // Admin credential
   const tokenAdmin = await sha256('token_admin');
   sql.exec(
-    "INSERT INTO credentials (id, kind, token_hash, family_id, subject, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    'cred_admin', 'human', tokenAdmin, 'fam_admin', 'admin@example.com', JSON.stringify(['admin', 'jobs:create', 'bus:read', 'bus:send']), 'admin-1', now, future
+    "INSERT INTO credentials (id, kind, token_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    'cred_admin', 'human', tokenAdmin, 'fam_admin', 'admin@fake.local', null, 'human:admin-1', JSON.stringify(['admin']), 'admin-1', now, future
   );
 
   // Normal agent without host scope
@@ -378,6 +384,19 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
   });
 
   it('job listing and single status do not leak tokens', async () => {
+    const id = (env as any).HUB.idFromName("hub");
+    const stub = (env as any).HUB.get(id);
+    await (runInDurableObject as any)(stub, async (instance: any) => {
+      const now = new Date().toISOString();
+      const future = new Date(Date.now() + 600000).toISOString();
+      instance.ctx.storage.sql.exec(
+        `INSERT INTO jobs (id, kind, idempotency_key, payload, status, created_at, deadline_at, actor, offer_host_id, offer_machine_id, offer_expires_at, claim_token_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        'job-redaction-1', 'root-run', 'root-run:redaction-1', JSON.stringify({}), 'offered', now, future, 'role:root',
+        'host-beta', 'host-beta', future, 'fixture-private-claim-hash'
+      );
+    });
+
     const resList = await doFetch(new Request('http://example.com/api/jobs?limit=10', {
       headers: { 'Authorization': 'Bearer token_admin' }
     }));
@@ -388,7 +407,7 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
       expect(j.claim_token_hash).toBeUndefined();
     }
 
-    const resSingle = await doFetch(new Request('http://example.com/api/jobs/job-lifecycle-1/status', {
+    const resSingle = await doFetch(new Request('http://example.com/api/jobs/job-redaction-1/status', {
       headers: { 'Authorization': 'Bearer token_admin' }
     }));
     expect(resSingle.status).toBe(200);
