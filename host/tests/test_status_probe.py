@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import unittest
 import unittest.mock
+import urllib.error
 from pathlib import Path
 from agent_hub_host import status_probe
 
@@ -610,6 +611,375 @@ class TestCloudflareWorkerDeploymentAdapter(unittest.TestCase):
         self.assertEqual(obs['payload']['state'], 'unknown')
 
 
+class TestCliArtifactIntegrityProbe(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix='hub-cli-probe-test-'))
+        self.addCleanup(lambda: shutil.rmtree(self.root, ignore_errors=True))
+        self.cred_path = str(self.root / 'cloudflare.env')
+        Path(self.cred_path).write_text(
+            'CLOUDFLARE_ACCOUNT_ID=test-acc-123\nCLOUDFLARE_API_TOKEN=cf-tok-test-456789\n',
+            encoding='utf-8'
+        )
+        os.chmod(self.cred_path, 0o600)
+
+    def spec(self, probes):
+        return {
+            'machine_id': 'test-machine-1',
+            'observed_at': NOW,
+            'repo_roots': [str(self.root)],
+            'probes': probes
+        }
+
+    def make_cli_transport(self, manifest_content, archive_bytes, status_code=200, error=None):
+        call_log = []
+        def transport(url, headers, timeout_s):
+            call_log.append({'url': url, 'headers': headers, 'timeout_s': timeout_s})
+            if error is not None:
+                raise error
+            if status_code != 200:
+                return {'status': status_code, 'body': b'error'}
+            if url.endswith('/cli/manifest.json'):
+                if isinstance(manifest_content, (bytes, str)):
+                    return {'status': 200, 'body': manifest_content}
+                return {'status': 200, 'body': json.dumps(manifest_content).encode('utf-8')}
+            if url.endswith('/cli/hub.pyz'):
+                return {'status': 200, 'body': archive_bytes}
+            return {'status': 404, 'body': b'not_found'}
+        return transport, call_log
+
+    def test_cli_archive_integrity_success(self):
+        archive_bytes = b'#!/usr/bin/env python3\nfake zip data for hub'
+        import hashlib
+        archive_sha = hashlib.sha256(archive_bytes).hexdigest()
+        manifest = {
+            'name': 'hub',
+            'version': '0.1.0',
+            'built_from_commit': SHA_A,
+            'sha256': archive_sha
+        }
+        transport, calls = self.make_cli_transport(manifest, archive_bytes)
+        probe = status_probe.make_cli_archive_probe('p-cli-1', 'n1', SHA_A)
+        result = status_probe.collect_probes(self.spec([probe]), http_transport=transport)
+
+        self.assertEqual(len(result['observations']), 1)
+        obs = result['observations'][0]
+        self.assertEqual(obs['kind'], 'probe_deploy')
+        self.assertEqual(obs['payload']['state'], 'deployed')
+        self.assertEqual(obs['payload']['sha'], SHA_A)
+        self.assertIn('CLI archive integrity verified', obs['payload']['deployment'])
+        self.assertIn('not proof of Worker JS bundle', obs['payload']['deployment'])
+        self.assertEqual(len(calls), 2)
+
+    def test_cli_archive_exact_live_verified_values(self):
+        live_commit = "1d9b011016a249b9792eee0531a9a956da110430"
+        live_sha256 = "4682d29ecb7d8770f0978692af0f86a849bc0ba5a38f4345840b5bc3e710a64f"
+        import unittest.mock
+        manifest = {
+            'name': 'hub',
+            'version': '0.1.0',
+            'built_from_commit': live_commit,
+            'sha256': live_sha256
+        }
+        raw_bytes = b'hub-pyz-exact-bytes'
+        with unittest.mock.patch('hashlib.sha256') as mock_sha:
+            mock_inst = unittest.mock.MagicMock()
+            mock_inst.hexdigest.return_value = live_sha256
+            mock_sha.return_value = mock_inst
+
+            transport, _ = self.make_cli_transport(manifest, raw_bytes)
+            probe = status_probe.make_cli_archive_probe('p-live-1', 'n1', live_commit)
+            result = status_probe.collect_probes(self.spec([probe]), http_transport=transport)
+
+        self.assertEqual(len(result['observations']), 1)
+        obs = result['observations'][0]
+        self.assertEqual(obs['payload']['state'], 'deployed')
+        self.assertEqual(obs['payload']['sha'], live_commit)
+        self.assertIn('CLI archive integrity verified', obs['payload']['deployment'])
+        self.assertIn(live_sha256[:16], obs['payload']['deployment'])
+        self.assertIn('not proof of Worker JS bundle', obs['payload']['deployment'])
+
+    def test_cli_archive_manifest_source_mismatch_yields_not_deployed(self):
+        archive_bytes = b'content'
+        import hashlib
+        archive_sha = hashlib.sha256(archive_bytes).hexdigest()
+        manifest = {
+            'name': 'hub',
+            'built_from_commit': SHA_B,
+            'sha256': archive_sha
+        }
+        transport, _ = self.make_cli_transport(manifest, archive_bytes)
+        probe = status_probe.make_cli_archive_probe('p-mismatch-1', 'n1', SHA_A)
+        result = status_probe.collect_probes(self.spec([probe]), http_transport=transport)
+
+        self.assertEqual(len(result['observations']), 1)
+        obs = result['observations'][0]
+        self.assertEqual(obs['payload']['state'], 'not_deployed')
+        self.assertEqual(obs['payload']['sha'], SHA_A)
+        self.assertIn('!= expected', obs['payload']['deployment'])
+        self.assertIn('not proof of Worker JS bundle', obs['payload']['deployment'])
+
+    def test_cli_archive_hash_mismatch_yields_not_deployed(self):
+        archive_bytes = b'corrupted or altered content'
+        manifest = {
+            'name': 'hub',
+            'built_from_commit': SHA_A,
+            'sha256': '0' * 64
+        }
+        transport, _ = self.make_cli_transport(manifest, archive_bytes)
+        probe = status_probe.make_cli_archive_probe('p-corrupt-1', 'n1', SHA_A)
+        result = status_probe.collect_probes(self.spec([probe]), http_transport=transport)
+
+        self.assertEqual(len(result['observations']), 1)
+        obs = result['observations'][0]
+        self.assertEqual(obs['payload']['state'], 'not_deployed')
+        self.assertEqual(obs['payload']['sha'], SHA_A)
+        self.assertIn('CLI archive integrity mismatch', obs['payload']['deployment'])
+        self.assertIn('not proof of Worker JS bundle', obs['payload']['deployment'])
+
+    def test_cli_archive_missing_or_malformed_json_and_sha_yields_unknown(self):
+        transport1, _ = self.make_cli_transport(b'{malformed json', b'content')
+        probe = status_probe.make_cli_archive_probe('p-badjson', 'n1', SHA_A)
+        res1 = status_probe.collect_probes(self.spec([probe]), http_transport=transport1)
+        self.assertEqual(res1['observations'][0]['payload']['state'], 'unknown')
+        self.assertIn('manifest_unparseable', res1['observations'][0]['payload']['deployment'])
+
+        transport2, _ = self.make_cli_transport({'sha256': 'a' * 64}, b'content')
+        res2 = status_probe.collect_probes(self.spec([probe]), http_transport=transport2)
+        self.assertEqual(res2['observations'][0]['payload']['state'], 'unknown')
+        self.assertIn('manifest_missing_or_invalid_built_from_commit', res2['observations'][0]['payload']['deployment'])
+
+        transport3, _ = self.make_cli_transport({'built_from_commit': SHA_A, 'sha256': 'not64hex'}, b'content')
+        res3 = status_probe.collect_probes(self.spec([probe]), http_transport=transport3)
+        self.assertEqual(res3['observations'][0]['payload']['state'], 'unknown')
+        self.assertIn('manifest_missing_or_invalid_sha256', res3['observations'][0]['payload']['deployment'])
+
+    def test_cli_archive_oversize_streams_yields_unknown(self):
+        oversize_manifest = b' ' * (status_probe.MAX_MANIFEST_BYTES + 10)
+        transport_m, _ = self.make_cli_transport(oversize_manifest, b'content')
+        probe = status_probe.make_cli_archive_probe('p-ov-m', 'n1', SHA_A)
+        res_m = status_probe.collect_probes(self.spec([probe]), http_transport=transport_m)
+        self.assertEqual(res_m['observations'][0]['payload']['state'], 'unknown')
+        self.assertIn('manifest_response_bounds_exceeded', res_m['observations'][0]['payload']['deployment'])
+
+        manifest = {'built_from_commit': SHA_A, 'sha256': 'a' * 64}
+        oversize_archive = b' ' * (status_probe.MAX_CLI_ARCHIVE_BYTES + 10)
+        transport_a, _ = self.make_cli_transport(manifest, oversize_archive)
+        res_a = status_probe.collect_probes(self.spec([probe]), http_transport=transport_a)
+        self.assertEqual(res_a['observations'][0]['payload']['state'], 'unknown')
+        self.assertIn('archive_response_bounds_exceeded', res_a['observations'][0]['payload']['deployment'])
+
+    def test_cli_archive_timeout_and_network_error_yields_unknown(self):
+        transport_to, _ = self.make_cli_transport({}, b'', error=TimeoutError('timed out'))
+        probe = status_probe.make_cli_archive_probe('p-to', 'n1', SHA_A)
+        res_to = status_probe.collect_probes(self.spec([probe]), http_transport=transport_to)
+        self.assertEqual(res_to['observations'][0]['payload']['state'], 'unknown')
+        self.assertIn('manifest_timeout', res_to['observations'][0]['payload']['deployment'])
+
+        transport_err, _ = self.make_cli_transport({}, b'', status_code=500)
+        res_err = status_probe.collect_probes(self.spec([probe]), http_transport=transport_err)
+        self.assertEqual(res_err['observations'][0]['payload']['state'], 'unknown')
+        self.assertIn('manifest_http_500', res_err['observations'][0]['payload']['deployment'])
+
+        transport_net, _ = self.make_cli_transport({}, b'', error=urllib.error.URLError('connection refused'))
+        res_net = status_probe.collect_probes(self.spec([probe]), http_transport=transport_net)
+        self.assertEqual(res_net['observations'][0]['payload']['state'], 'unknown')
+        self.assertIn('manifest_network_error', res_net['observations'][0]['payload']['deployment'])
+
+    def test_cli_archive_wrong_origin_and_redirects(self):
+        for bad_url in ('https://evil.com', 'http://hub.dtcdev.click', 'https://127.0.0.1',
+                        'https://localhost', 'https://169.254.169.254', 'file:///etc/passwd',
+                        'https://user:pass@hub.dtcdev.click', 'https://hub.dtcdev.click?token=secret',
+                        'https://hub.dtcdev.click:8443'):
+            canon, err = status_probe.validate_trusted_cli_origin(bad_url)
+            self.assertIsNone(canon, bad_url)
+            self.assertIsNotNone(err, bad_url)
+
+        probe = status_probe.make_cli_archive_probe('p-untrusted', 'n1', SHA_A, base_url='https://evil.com')
+        res = status_probe.collect_probes(self.spec([probe]))
+        self.assertEqual(res['observations'][0]['payload']['state'], 'unknown')
+        self.assertIn('untrusted_origin', res['observations'][0]['payload']['deployment'])
+
+        for r_code in (301, 302, 307):
+            transport_red, _ = self.make_cli_transport({}, b'', status_code=r_code)
+            res_red = status_probe.collect_probes(self.spec([probe]), http_transport=transport_red)
+            self.assertEqual(res_red['observations'][0]['payload']['state'], 'unknown')
+
+    def test_cloudflare_worker_probe_missing_optin_preserves_behavior(self):
+        deployments = [{'id': 'dep-cf-1', 'versions': [{'version_id': VERSION_UUID_1, 'percentage': 100}]}]
+        versions_map = {VERSION_UUID_1: {'annotations': {'workers/message': f'Release source_commit={SHA_A}'}}}
+        call_log = []
+        def cf_only_transport(url, headers, timeout_s):
+            call_log.append(url)
+            if '/deployments' in url:
+                return {'status': 200, 'body': json.dumps({'success': True, 'result': deployments})}
+            if f'/versions/{VERSION_UUID_1}' in url:
+                return {'status': 200, 'body': json.dumps({'success': True, 'result': versions_map[VERSION_UUID_1]})}
+            return {'status': 404, 'body': b'not_found'}
+
+        probe = status_probe.make_cloudflare_probe('p1', 'n1', SHA_A, self.cred_path, verify_cli_archive=False)
+        result = status_probe.collect_probes(self.spec([probe]), http_transport=cf_only_transport)
+
+        self.assertEqual(len(result['observations']), 1)
+        obs = result['observations'][0]
+        self.assertEqual(obs['payload']['state'], 'deployed')
+        self.assertIn('100% traffic', obs['payload']['deployment'])
+        self.assertNotIn('CLI archive', obs['payload']['deployment'])
+        self.assertFalse(any('/cli/' in u for u in call_log))
+
+    def test_cloudflare_worker_probe_optin_combined_verification(self):
+        deployments = [{'id': 'dep-cf-2', 'versions': [{'version_id': VERSION_UUID_1, 'percentage': 100}]}]
+        versions_map = {VERSION_UUID_1: {'annotations': {'workers/message': f'Release source_commit={SHA_A}'}}}
+        archive_bytes = b'valid hub archive bytes'
+        import hashlib
+        archive_sha = hashlib.sha256(archive_bytes).hexdigest()
+        manifest = {'built_from_commit': SHA_A, 'sha256': archive_sha}
+
+        def full_transport(url, headers, timeout_s):
+            if '/deployments' in url:
+                return {'status': 200, 'body': json.dumps({'success': True, 'result': deployments})}
+            if f'/versions/{VERSION_UUID_1}' in url:
+                return {'status': 200, 'body': json.dumps({'success': True, 'result': versions_map[VERSION_UUID_1]})}
+            if url.endswith('/cli/manifest.json'):
+                return {'status': 200, 'body': json.dumps(manifest)}
+            if url.endswith('/cli/hub.pyz'):
+                return {'status': 200, 'body': archive_bytes}
+            return {'status': 404, 'body': b'not_found'}
+
+        probe_optin = status_probe.make_cloudflare_probe('p-optin', 'n1', SHA_A, self.cred_path, verify_cli_archive=True)
+        res = status_probe.collect_probes(self.spec([probe_optin]), http_transport=full_transport)
+        self.assertEqual(res['observations'][0]['payload']['state'], 'deployed')
+        self.assertIn('Worker control plane deployed', res['observations'][0]['payload']['deployment'])
+        self.assertIn('CLI archive integrity verified', res['observations'][0]['payload']['deployment'])
+        self.assertIn('not proof of Worker JS bundle', res['observations'][0]['payload']['deployment'])
+
+        def mismatch_transport(url, headers, timeout_s):
+            if '/deployments' in url:
+                return {'status': 200, 'body': json.dumps({'success': True, 'result': deployments})}
+            if f'/versions/{VERSION_UUID_1}' in url:
+                return {'status': 200, 'body': json.dumps({'success': True, 'result': versions_map[VERSION_UUID_1]})}
+            if url.endswith('/cli/manifest.json'):
+                return {'status': 200, 'body': json.dumps({'built_from_commit': SHA_A, 'sha256': '0' * 64})}
+            if url.endswith('/cli/hub.pyz'):
+                return {'status': 200, 'body': archive_bytes}
+            return {'status': 404, 'body': b'not_found'}
+
+        res_mm = status_probe.collect_probes(self.spec([probe_optin]), http_transport=mismatch_transport)
+        self.assertEqual(res_mm['observations'][0]['payload']['state'], 'not_deployed')
+        self.assertIn('CLI archive integrity mismatch', res_mm['observations'][0]['payload']['deployment'])
+
+        def timeout_transport(url, headers, timeout_s):
+            if '/deployments' in url:
+                return {'status': 200, 'body': json.dumps({'success': True, 'result': deployments})}
+            if f'/versions/{VERSION_UUID_1}' in url:
+                return {'status': 200, 'body': json.dumps({'success': True, 'result': versions_map[VERSION_UUID_1]})}
+            if '/cli/' in url:
+                raise TimeoutError('timed out')
+            return {'status': 404, 'body': b'not_found'}
+
+        res_to = status_probe.collect_probes(self.spec([probe_optin]), http_transport=timeout_transport)
+        self.assertEqual(res_to['observations'][0]['payload']['state'], 'unknown')
+        self.assertIn('CLI archive integrity unknown', res_to['observations'][0]['payload']['deployment'])
+
+    def test_cli_archive_snapshot_caching_within_round(self):
+        archive_bytes = b'archive data'
+        import hashlib
+        archive_sha = hashlib.sha256(archive_bytes).hexdigest()
+        manifest = {'built_from_commit': SHA_A, 'sha256': archive_sha}
+        transport, call_log = self.make_cli_transport(manifest, archive_bytes)
+
+        p1 = status_probe.make_cli_archive_probe('p1', 'n1', SHA_A)
+        p2 = status_probe.make_cli_archive_probe('p2', 'n2', SHA_A)
+        result = status_probe.collect_probes(self.spec([p1, p2]), http_transport=transport)
+
+        self.assertEqual(len(result['observations']), 2)
+        self.assertEqual(result['observations'][0]['payload']['state'], 'deployed')
+        self.assertEqual(result['observations'][1]['payload']['state'], 'deployed')
+        self.assertEqual(len(call_log), 2)
+
+
+class TestCliArchiveReadBoundaries(unittest.TestCase):
+    def test_base_origin_rejects_non_root_path(self):
+        for path in ('/foreign/path', '/cli/manifest.json', '/a/../cli'):
+            with self.subTest(path=path):
+                origin, reason = status_probe.validate_trusted_cli_origin(
+                    'https://hub.dtcdev.click' + path)
+                self.assertIsNone(origin)
+                self.assertEqual(reason, 'base_url_path_rejected')
+
+    def test_direct_asset_fetch_refuses_port_before_transport(self):
+        transport = unittest.mock.Mock()
+        body, reason = status_probe.fetch_cli_asset(
+            'https://hub.dtcdev.click:444/cli/hub.pyz', 16, 1, transport)
+        self.assertIsNone(body)
+        self.assertEqual(reason, 'untrusted_port')
+        transport.assert_not_called()
+
+    def response(self, chunks):
+        response = unittest.mock.MagicMock()
+        response.getcode.return_value = 200
+        response.read1.side_effect = chunks
+        opener = unittest.mock.MagicMock()
+        opener.open.return_value.__enter__.return_value = response
+        return response, opener
+
+    def test_real_reader_rejects_oversize_stream(self):
+        response, opener = self.response([b'12345'])
+        with unittest.mock.patch.object(status_probe.urllib.request,
+                                       'build_opener', return_value=opener):
+            body, reason = status_probe.fetch_cli_asset(
+                'https://hub.dtcdev.click/cli/hub.pyz', 4, 1)
+        self.assertIsNone(body)
+        self.assertEqual(reason, 'response_bounds_exceeded')
+        response.read1.assert_called_once_with(5)
+        response.read.assert_not_called()
+
+    def test_real_reader_deadline_stops_slow_nonempty_stream(self):
+        response, opener = self.response([b'x'])
+        with unittest.mock.patch.object(status_probe.urllib.request,
+                                       'build_opener', return_value=opener), \
+                unittest.mock.patch('time.monotonic', side_effect=[0, .1, 1.1]):
+            body, reason = status_probe.fetch_cli_asset(
+                'https://hub.dtcdev.click/cli/hub.pyz', 100, 1)
+        self.assertIsNone(body)
+        self.assertEqual(reason, 'timeout')
+        response.read1.assert_called_once()
+        response.read.assert_not_called()
+
+    def test_real_reader_success_is_bounded_without_credentials(self):
+        response, opener = self.response([b'abc', b''])
+        with unittest.mock.patch.object(status_probe.urllib.request,
+                                       'build_opener', return_value=opener):
+            body, reason = status_probe.fetch_cli_asset(
+                'https://hub.dtcdev.click/cli/hub.pyz', 16, 1)
+        self.assertEqual(body, b'abc')
+        self.assertIsNone(reason)
+        request = opener.open.call_args.args[0]
+        self.assertNotIn('Authorization', dict(request.header_items()))
+        self.assertLessEqual(max(call.args[0] for call in response.read1.call_args_list), 17)
+
+    def test_long_control_plane_label_preserves_cli_evidence_and_scope(self):
+        probe = status_probe.make_cloudflare_probe(
+            'long-label', 'local-fixture', SHA_A, '/unused-fixture', verify_cli_archive=True)
+        spec = {'machine_id': 'local-fixture', 'observed_at': NOW,
+                'repo_roots': [], 'probes': [probe]}
+        cli = {'success': True, 'built_from_commit': SHA_A,
+               'manifest_sha256': 'b' * 64, 'actual_archive_sha256': 'b' * 64}
+        with unittest.mock.patch.object(status_probe, 'load_cloudflare_credentials',
+                                        return_value=({'account_id': 'local', 'api_token': 'local-fixture'}, None)), \
+                unittest.mock.patch.object(status_probe, 'fetch_cloudflare_deployment_snapshot',
+                                           return_value={'success': True}), \
+                unittest.mock.patch.object(status_probe, 'evaluate_cloudflare_deployment',
+                                           return_value={'state': 'deployed', 'sha': SHA_A,
+                                                         'deployment': 'X' * 240}), \
+                unittest.mock.patch.object(status_probe, 'fetch_cli_artifact_snapshot', return_value=cli):
+            result = status_probe.collect_probes(spec)
+        payload = result['observations'][0]['payload']
+        self.assertEqual(payload['state'], 'deployed')
+        self.assertLessEqual(len(payload['deployment']), 256)
+        self.assertIn('Worker control plane deployed', payload['deployment'])
+        self.assertIn('CLI archive integrity verified', payload['deployment'])
+        self.assertIn('not proof of Worker JS bundle', payload['deployment'])
+
+
 if __name__ == '__main__':
     unittest.main()
-

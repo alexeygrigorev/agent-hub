@@ -42,6 +42,13 @@ MAX_PROBES = 50
 CF_API_BASE = 'https://api.cloudflare.com/client/v4/'
 MAX_CF_BODY = 1024 * 1024
 MAX_CREDENTIAL_READ = 65536
+DEFAULT_BASE_URL = 'https://hub.dtcdev.click'
+TRUSTED_HUB_HOSTS = {
+    'hub.dtcdev.click',
+    'agent-hub.cloudflare-ai-agent-de9ca0.workers.dev',
+}
+MAX_MANIFEST_BYTES = 65536
+MAX_CLI_ARCHIVE_BYTES = 8 * 1024 * 1024
 
 # Explicit trusted tools + read-only subcommands. Anything else is refused
 # (unknown with reason), never executed.
@@ -769,6 +776,316 @@ def evaluate_cloudflare_deployment(
     }
 
 
+def validate_trusted_cli_origin(base_url: Any) -> tuple[str | None, str | None]:
+    """Validate base_url against strict trusted Hub HTTPS origin allowlist.
+    Returns (canonical_origin, None) or (None, failure_reason).
+    """
+    if not isinstance(base_url, str) or not base_url.strip():
+        return None, 'invalid_base_url'
+    stripped = base_url.strip()
+    if any(c.isspace() or ord(c) < 32 for c in stripped):
+        return None, 'invalid_base_url'
+    import urllib.parse
+    try:
+        parsed = urllib.parse.urlsplit(stripped)
+    except Exception:
+        return None, 'invalid_base_url'
+    if parsed.scheme != 'https':
+        return None, 'trusted_origin_https_required'
+    if parsed.username or parsed.password:
+        return None, 'credentials_in_url_rejected'
+    if parsed.query:
+        return None, 'query_string_in_url_rejected'
+    if parsed.fragment:
+        return None, 'fragment_in_url_rejected'
+    if parsed.path not in ('', '/'):
+        return None, 'base_url_path_rejected'
+    try:
+        port = parsed.port
+    except ValueError:
+        return None, 'invalid_port'
+    if port is not None and port != 443:
+        return None, 'untrusted_port'
+    host = (parsed.hostname or '').lower()
+    if not host or host not in TRUSTED_HUB_HOSTS:
+        return None, 'untrusted_origin'
+    return f"https://{host}", None
+
+
+def fetch_cli_asset(url: str, max_bytes: int, timeout_s: float,
+                    http_transport: Callable | None = None) -> tuple[bytes | None, str | None]:
+    """Fetch fixed CLI endpoint with no redirects, bounded size, and sanitized error labels.
+    Returns (raw_bytes, None) or (None, failure_reason).
+    """
+    import urllib.parse
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except Exception:
+        return None, 'invalid_cli_url'
+    if parsed.scheme != 'https':
+        return None, 'trusted_origin_https_required'
+    if parsed.username or parsed.password:
+        return None, 'credentials_in_url_rejected'
+    if parsed.query:
+        return None, 'query_string_in_url_rejected'
+    if parsed.fragment:
+        return None, 'fragment_in_url_rejected'
+    try:
+        port = parsed.port
+    except ValueError:
+        return None, 'invalid_port'
+    if port is not None and port != 443:
+        return None, 'untrusted_port'
+    host = (parsed.hostname or '').lower()
+    if host not in TRUSTED_HUB_HOSTS:
+        return None, 'untrusted_origin'
+    if parsed.path not in ('/cli/manifest.json', '/cli/hub.pyz'):
+        return None, 'invalid_cli_endpoint'
+
+    headers = {
+        'User-Agent': 'agent-hub-host/1',
+        'Accept': 'application/json' if parsed.path.endswith('.json') else 'application/octet-stream',
+    }
+    timeout_s = max(1.0, min(float(timeout_s), 120.0))
+
+    if http_transport is not None:
+        try:
+            resp = http_transport(url, headers, timeout_s)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (301, 302, 303, 307, 308):
+                return None, 'redirect_refused'
+            return None, f'http_{exc.code}'
+        except (TimeoutError, urllib.error.URLError) as exc:
+            if isinstance(getattr(exc, 'reason', None), TimeoutError) or isinstance(exc, TimeoutError):
+                return None, 'timeout'
+            return None, 'network_error'
+        except Exception as exc:
+            if 'redirect' in type(exc).__name__.lower() or 'redirect' in str(exc).lower():
+                return None, 'redirect_refused'
+            return None, 'network_error'
+
+        if isinstance(resp, dict):
+            status = resp.get('status', 200)
+            if status in (301, 302, 303, 307, 308):
+                return None, 'redirect_refused'
+            if status != 200:
+                return None, f'http_{status}'
+            body = resp.get('body', b'')
+            if isinstance(body, str):
+                body = body.encode('utf-8')
+            elif isinstance(body, (dict, list)):
+                body = json.dumps(body).encode('utf-8')
+            if not isinstance(body, bytes):
+                return None, 'response_unparseable'
+            if len(body) > max_bytes:
+                return None, 'response_bounds_exceeded'
+            return body, None
+        return None, 'response_unparseable'
+
+    opener = urllib.request.build_opener(DisallowRedirectHandler)
+    req = urllib.request.Request(url, headers=headers, method='GET')
+    try:
+        with opener.open(req, timeout=timeout_s) as res:
+            code = res.getcode()
+            if code != 200:
+                return None, f'http_{code}'
+            import time
+            deadline = time.monotonic() + timeout_s
+            reader = getattr(res, 'read1', None)
+            if not callable(reader):
+                return None, 'response_unparseable'
+            chunks = []
+            total = 0
+            while True:
+                # read1 performs at most one underlying read: slow streams
+                # cannot keep a large buffered read alive indefinitely.
+                if time.monotonic() >= deadline:
+                    return None, 'timeout'
+                chunk = reader(min(65536, max_bytes - total + 1))
+                if time.monotonic() >= deadline:
+                    return None, 'timeout'
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    return None, 'response_bounds_exceeded'
+                chunks.append(chunk)
+            return b''.join(chunks), None
+    except urllib.error.HTTPError as exc:
+        if exc.code in (301, 302, 303, 307, 308):
+            return None, 'redirect_refused'
+        return None, f'http_{exc.code}'
+    except (TimeoutError, urllib.error.URLError) as exc:
+        if isinstance(getattr(exc, 'reason', None), TimeoutError) or isinstance(exc, TimeoutError):
+            return None, 'timeout'
+        return None, 'network_error'
+    except OSError:
+        return None, 'network_error'
+
+
+def fetch_cli_artifact_snapshot(
+    base_url: str = DEFAULT_BASE_URL,
+    timeout_s: float = 15.0,
+    http_transport: Callable | None = None
+) -> dict:
+    """Fetch CLI manifest and archive from trusted Hub origin; compute SHA256 of actual bytes.
+    Returns:
+      {'success': True, 'built_from_commit': str, 'manifest_sha256': str,
+       'actual_archive_sha256': str, 'archive_bytes_length': int, 'base_url': str, 'manifest': dict}
+      or
+      {'success': False, 'reason': str}
+    """
+    origin, val_err = validate_trusted_cli_origin(base_url)
+    if val_err is not None:
+        return {'success': False, 'reason': val_err}
+
+    timeout_f = max(1.0, min(float(timeout_s), 120.0))
+    manifest_url = f"{origin}/cli/manifest.json"
+    manifest_raw, m_err = fetch_cli_asset(manifest_url, MAX_MANIFEST_BYTES, timeout_f, http_transport)
+    if m_err is not None:
+        return {'success': False, 'reason': f'manifest_{m_err}'}
+
+    try:
+        manifest_data = json.loads(manifest_raw.decode('utf-8'))
+    except Exception:
+        return {'success': False, 'reason': 'manifest_unparseable'}
+    if not isinstance(manifest_data, dict):
+        return {'success': False, 'reason': 'manifest_invalid_format'}
+
+    built_from = manifest_data.get('built_from_commit')
+    if not isinstance(built_from, str) or not re.fullmatch(r'[0-9a-fA-F]{40}', built_from):
+        return {'success': False, 'reason': 'manifest_missing_or_invalid_built_from_commit'}
+    manifest_sha = manifest_data.get('sha256')
+    if not isinstance(manifest_sha, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', manifest_sha):
+        return {'success': False, 'reason': 'manifest_missing_or_invalid_sha256'}
+
+    archive_url = f"{origin}/cli/hub.pyz"
+    archive_raw, a_err = fetch_cli_asset(archive_url, MAX_CLI_ARCHIVE_BYTES, timeout_f, http_transport)
+    if a_err is not None:
+        return {'success': False, 'reason': f'archive_{a_err}'}
+
+    import hashlib
+    actual_archive_sha = hashlib.sha256(archive_raw).hexdigest().lower()
+
+    return {
+        'success': True,
+        'base_url': origin,
+        'built_from_commit': built_from.lower(),
+        'manifest_sha256': manifest_sha.lower(),
+        'actual_archive_sha256': actual_archive_sha,
+        'archive_bytes_length': len(archive_raw),
+        'manifest': {
+            'name': manifest_data.get('name'),
+            'version': manifest_data.get('version'),
+            'built_from_commit': built_from.lower(),
+            'sha256': manifest_sha.lower(),
+        }
+    }
+
+
+def evaluate_cli_archive_integrity(
+    snapshot: dict,
+    sha: str,
+    base_url: str = DEFAULT_BASE_URL
+) -> dict:
+    """Evaluate requested SHA against CLI artifact manifest and computed archive bytes SHA256.
+    Precisely labels CLI archive integrity; never asserts Worker JS bundle proof.
+    Returns:
+      {'state': 'deployed' | 'not_deployed' | 'unknown', 'sha': sha,
+       'deployment': compact_ref, 'reason': ..., 'provenance': ...}
+    """
+    clean_sha = _parse_sha(sha)
+    provenance = {
+        'tool': 'cli_archive',
+        'sha': clean_sha or str(sha),
+        'base_url': base_url
+    }
+    if not clean_sha:
+        return {
+            'state': 'unknown',
+            'sha': str(sha),
+            'reason': 'sha_required',
+            'provenance': provenance
+        }
+
+    if not snapshot.get('success'):
+        reason = str(snapshot.get('reason') or 'cli_snapshot_failed')
+        summary = f"CLI archive integrity unknown ({reason})"
+        return {
+            'state': 'unknown',
+            'sha': clean_sha,
+            'reason': reason,
+            'deployment': sanitize(summary, 256),
+            'provenance': provenance
+        }
+
+    built_from = snapshot.get('built_from_commit', '')
+    manifest_sha = snapshot.get('manifest_sha256', '')
+    actual_sha = snapshot.get('actual_archive_sha256', '')
+
+    # Check 1: Archive byte integrity against manifest SHA256
+    if actual_sha != manifest_sha:
+        summary = (f"CLI archive integrity mismatch (expected sha256:{manifest_sha[:16]}..., "
+                   f"actual:{actual_sha[:16]}...); not proof of Worker JS bundle")
+        return {
+            'state': 'not_deployed',
+            'sha': clean_sha,
+            'reason': 'archive_sha256_mismatch',
+            'deployment': sanitize(summary, 256),
+            'built_from_commit': built_from,
+            'manifest_sha256': manifest_sha,
+            'actual_sha256': actual_sha,
+            'provenance': provenance
+        }
+
+    # Check 2: Manifest built_from_commit matches expected commit SHA
+    if built_from != clean_sha:
+        summary = (f"CLI archive built from {built_from[:16]}... != expected {clean_sha[:16]}... "
+                   f"(sha256:{actual_sha[:16]}...); not proof of Worker JS bundle")
+        return {
+            'state': 'not_deployed',
+            'sha': clean_sha,
+            'reason': 'manifest_source_mismatch',
+            'deployment': sanitize(summary, 256),
+            'built_from_commit': built_from,
+            'manifest_sha256': manifest_sha,
+            'actual_sha256': actual_sha,
+            'provenance': provenance
+        }
+
+    # Success: exact byte hash matched manifest, and built_from_commit matched expected SHA
+    summary = (f"CLI archive integrity verified (sha256:{actual_sha[:16]}..., "
+               f"built_from:{built_from[:16]}...); not proof of Worker JS bundle")
+    return {
+        'state': 'deployed',
+        'sha': clean_sha,
+        'deployment': sanitize(summary, 256),
+        'built_from_commit': built_from,
+        'manifest_sha256': manifest_sha,
+        'actual_sha256': actual_sha,
+        'provenance': provenance
+    }
+
+
+def make_cli_archive_probe(
+    probe_id: str,
+    for_native_id: str,
+    sha: str,
+    base_url: str = DEFAULT_BASE_URL,
+    timeout_s: int = 15,
+) -> dict:
+    """Read-only helper to construct a valid CLI artifact integrity deployment probe entry."""
+    return {
+        'id': probe_id,
+        'kind': 'deployment',
+        'adapter': 'cli_archive',
+        'for_native_id': for_native_id,
+        'sha': sha,
+        'base_url': base_url,
+        'timeout_s': timeout_s,
+    }
+
+
 def make_cloudflare_probe(
     probe_id: str,
     for_native_id: str,
@@ -778,6 +1095,8 @@ def make_cloudflare_probe(
     environment: str = 'production',
     cwd: str | None = None,
     timeout_s: int = 15,
+    verify_cli_archive: bool = False,
+    cli_base_url: str | None = None,
 ) -> dict:
     """Read-only helper to construct a valid Cloudflare Worker deployment probe entry."""
     entry = {
@@ -793,6 +1112,10 @@ def make_cloudflare_probe(
     }
     if cwd is not None:
         entry['cwd'] = cwd
+    if verify_cli_archive:
+        entry['verify_cli_archive'] = True
+    if cli_base_url is not None:
+        entry['cli_base_url'] = cli_base_url
     return entry
 
 
@@ -814,6 +1137,7 @@ def collect_probes(spec: dict, runner: Callable | None = None,
         http_transport = spec['http_transport']
 
     cf_snapshots: dict[tuple[str, str, str], dict] = {}
+    cli_snapshots: dict[str, dict] = {}
 
     for probe in probes[:MAX_PROBES]:
         if not isinstance(probe, dict):
@@ -883,9 +1207,101 @@ def collect_probes(spec: dict, runner: Callable | None = None,
                 environment=env,
                 script_name=script_name
             )
+
+            if probe.get('verify_cli_archive'):
+                cli_url_raw = (probe.get('cli_base_url') or probe.get('base_url')
+                               or spec.get('cli_base_url') or spec.get('base_url')
+                               or DEFAULT_BASE_URL)
+                canonical_base, val_err = validate_trusted_cli_origin(cli_url_raw)
+                if val_err is not None:
+                    cli_snap = {'success': False, 'reason': val_err}
+                    canonical_key = str(cli_url_raw)
+                else:
+                    canonical_key = canonical_base
+                    if canonical_key not in cli_snapshots:
+                        cli_snapshots[canonical_key] = fetch_cli_artifact_snapshot(
+                            base_url=canonical_key,
+                            timeout_s=float(timeout_s),
+                            http_transport=http_transport
+                        )
+                    cli_snap = cli_snapshots[canonical_key]
+                cli_evidence = evaluate_cli_archive_integrity(
+                    snapshot=cli_snap,
+                    sha=sha.lower(),
+                    base_url=canonical_key
+                )
+
+                cf_state = evidence['state']
+                cli_state = cli_evidence['state']
+
+                if cf_state == 'deployed':
+                    final_state = cli_state
+                elif cf_state == 'not_deployed':
+                    final_state = 'not_deployed'
+                else:
+                    final_state = 'unknown'
+                # The stored contract caps labels at256 bytes. Put CLI evidence
+                # and its scope limit before potentially long control-plane IDs.
+                dep_label = (f"Worker control plane {cf_state}; "
+                             f"{cli_evidence.get('deployment', '')} | "
+                             f"{evidence.get('deployment', '')}")
+
+                payload = {'state': final_state, 'sha': sha.lower()}
+                if dep_label.strip():
+                    payload['deployment'] = sanitize(dep_label, 256)
+                observations.append({
+                    'machine_id': machine_id,
+                    'native_id': native_id,
+                    'kind': 'probe_deploy',
+                    'observed_at': observed_at,
+                    'payload': payload
+                })
+                continue
+
             payload = {'state': evidence['state'], 'sha': sha.lower()}
             if evidence.get('deployment'):
                 payload['deployment'] = evidence['deployment']
+            observations.append({
+                'machine_id': machine_id,
+                'native_id': native_id,
+                'kind': 'probe_deploy',
+                'observed_at': observed_at,
+                'payload': payload
+            })
+            continue
+
+        if kind == 'deployment' and adapter in ('cli_archive', 'cli_artifact'):
+            sha = str(probe.get('sha') or '')
+            if len(sha) != 40 or not all(c in '0123456789abcdefABCDEF' for c in sha):
+                skipped.append({'id': pid, 'reason': 'sha_required'})
+                continue
+            if cwd is not None and not realpath_under(str(cwd), repo_roots):
+                skipped.append({'id': pid, 'reason': 'cwd_outside_allowlist'})
+                continue
+            cli_url_raw = (probe.get('cli_base_url') or probe.get('base_url')
+                           or spec.get('cli_base_url') or spec.get('base_url')
+                           or DEFAULT_BASE_URL)
+            canonical_base, val_err = validate_trusted_cli_origin(cli_url_raw)
+            if val_err is not None:
+                cli_snap = {'success': False, 'reason': val_err}
+                canonical_key = str(cli_url_raw)
+            else:
+                canonical_key = canonical_base
+                if canonical_key not in cli_snapshots:
+                    cli_snapshots[canonical_key] = fetch_cli_artifact_snapshot(
+                        base_url=canonical_key,
+                        timeout_s=float(timeout_s),
+                        http_transport=http_transport
+                    )
+                cli_snap = cli_snapshots[canonical_key]
+            cli_evidence = evaluate_cli_archive_integrity(
+                snapshot=cli_snap,
+                sha=sha.lower(),
+                base_url=canonical_key
+            )
+            payload = {'state': cli_evidence['state'], 'sha': sha.lower()}
+            if cli_evidence.get('deployment'):
+                payload['deployment'] = cli_evidence['deployment']
             observations.append({
                 'machine_id': machine_id,
                 'native_id': native_id,
