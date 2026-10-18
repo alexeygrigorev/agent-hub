@@ -43,13 +43,25 @@ export interface ObligationItem {
   late_reconciled: boolean;
   answered_at?: number | null;
   proceeded_at?: number | null;
+  source?: Record<string, unknown> | null;
+}
+
+export interface FollowThroughTargetView {
+  available: boolean;
+  canonical_status: string | null;
+  terminal?: boolean;
+  complete?: boolean;
+  title?: string;
+  project?: string;
 }
 
 export interface FollowThroughView {
+  id?: string;
   link_id?: string;
   conversation_id: string;
   kind: string;
   ref: string;
+  target?: FollowThroughTargetView;
   facts: {
     owner_acceptance: FollowThroughFact;
     first_action: FollowThroughFact;
@@ -156,6 +168,7 @@ export class ConversationFollowThroughService {
     link: { id?: string; conversation_id: string; kind: string; ref: string },
     targetRow: any | null,
     _principal?: VerifiedConversationPrincipal,
+    targetView?: FollowThroughTargetView,
   ): FollowThroughView {
     const nowMs = this.now();
     const kind = link.kind;
@@ -232,11 +245,54 @@ export class ConversationFollowThroughService {
       acceptedOutcome.state === 'refused' ||
       acceptedOutcome.observation?.verdict === 'rejected';
 
+    let target = targetView;
+    if (!target) {
+      if (targetRow) {
+        if (kind === 'intake_task') {
+          const status = String(targetRow.status ?? 'open');
+          target = {
+            available: true,
+            canonical_status: status,
+            terminal: status === 'done' || status === 'cancelled',
+            complete: status === 'done',
+          };
+        } else if (kind === 'fleet_launch') {
+          const state = String(targetRow.state ?? 'unknown');
+          target = {
+            available: true,
+            canonical_status: state,
+            terminal: ['exited', 'failed', 'cancelled'].includes(state),
+            complete: state === 'exited',
+          };
+        } else {
+          const status = String(targetRow.status ?? 'open');
+          target = {
+            available: true,
+            canonical_status: status,
+            terminal:
+              ['accepted', 'failed', 'cancelled'].includes(status) ||
+              (status === 'done' && kind !== 'review'),
+            complete:
+              status === 'accepted' || (kind !== 'review' && status === 'done'),
+          };
+        }
+      } else {
+        target = {
+          available: false,
+          canonical_status: null,
+          terminal: false,
+          complete: false,
+        };
+      }
+    }
+
     return {
+      id: link.id,
       link_id: link.id,
       conversation_id: link.conversation_id,
       kind,
       ref: link.ref,
+      target,
       facts: {
         owner_acceptance: ownerAcceptance,
         first_action: firstAction,
@@ -555,10 +611,20 @@ export class ConversationFollowThroughService {
         let status: ObligationItem['status'] = 'open';
         let answeredAt: number | null = null;
         let proceededAt: number | null = null;
+
+        for (const resp of responses) {
+          if (resp?.response_type === 'proceed') {
+            const t = Number(resp.captured_at ?? resp.created_at);
+            if (Number.isFinite(t)) proceededAt = t;
+          }
+          if (resp?.response_type === 'answer') {
+            const t = Number(resp.captured_at ?? resp.created_at);
+            if (Number.isFinite(t)) answeredAt = t;
+          }
+        }
+
         if (latestResp) {
           status = latestResp.resulting_status || (latestResp.response_type === 'proceed' ? 'proceeded' : 'answered');
-          if (latestResp.response_type === 'answer') answeredAt = Number(latestResp.captured_at || nowMs);
-          if (latestResp.response_type === 'proceed') proceededAt = Number(latestResp.captured_at || nowMs);
         }
         const isOverdue = status === 'open' && Number(e.deadline) <= nowMs;
         if (isOverdue) hasOverdue = true;
@@ -566,7 +632,7 @@ export class ConversationFollowThroughService {
           id,
           text_hash: e.text_hash || sha256Sync(e.text || '').slice(0, 16),
           text: String(e.text || ''),
-          asked_at: Number(e.asked_at || e.captured_at || nowMs),
+          asked_at: Number(e.asked_at ?? e.captured_at ?? e.created_at ?? 0),
           deadline: Number(e.deadline),
           wait_s: Number(e.wait_s || 1200),
           default_action: String(e.default_action || ''),
@@ -575,6 +641,7 @@ export class ConversationFollowThroughService {
           late_reconciled: status === 'answered-after-proceeding',
           answered_at: answeredAt,
           proceeded_at: proceededAt,
+          source: e.source ?? null,
         });
       } else if (
         ['followup', 'blocker', 'pending_approval'].includes(e?.kind) &&
@@ -588,13 +655,16 @@ export class ConversationFollowThroughService {
           id,
           text_hash: e.text_hash || sha256Sync(e.text || '').slice(0, 16),
           text: String(e.text || ''),
-          asked_at: Number(e.captured_at || nowMs),
+          asked_at: Number(e.captured_at ?? e.created_at ?? 0),
           deadline: deadline ?? 0,
           wait_s: e.wait_s ? Number(e.wait_s) : 0,
           default_action: e.default_action ? String(e.default_action) : '',
           status: 'open',
           overdue: isOverdue,
           late_reconciled: false,
+          answered_at: null,
+          proceeded_at: null,
+          source: e.source ?? null,
         });
       }
     }

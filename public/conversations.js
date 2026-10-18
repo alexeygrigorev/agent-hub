@@ -149,6 +149,8 @@
     state.createFingerprint = null;
     var dialog = byId('new-conversation-dialog');
     if (dialog.open) dialog.close();
+    var newBtn = byId('new-conversation');
+    if (newBtn) newBtn.disabled = !actor || !state.participantsLoaded;
     byId('new-conversation-form').reset();
     byId('identity-list').replaceChildren();
     /* Clear old pending rows and unsent text before rendering new chrome. */
@@ -419,6 +421,8 @@
       if (participant.actor !== state.selfActor) state.participants.push(participant);
     }
     state.participantsLoaded = true;
+    var newBtn = byId('new-conversation');
+    if (newBtn) newBtn.disabled = !state.selfActor;
   }
 
   /* ---- shared formatting ---- */
@@ -978,10 +982,11 @@
     top.append(el('span', 'dk-badge', kindName));
     top.append(el('span', 'conv-ft-item__ref', item.ref));
 
-    if (!item.target || !item.target.available) {
+    var target = item.target || (item.follow_through && item.follow_through.target);
+    if (!target || !target.available) {
       top.append(el('span', 'dk-badge dk-badge--warning', 'Opaque ACL / unavailable'));
     } else {
-      top.append(el('span', 'dk-badge dk-badge--info', item.target.canonical_status || 'available'));
+      top.append(el('span', 'dk-badge dk-badge--info', target.canonical_status || 'available'));
     }
 
     var summary = (item.follow_through && item.follow_through.summary) || item.summary || {};
@@ -997,14 +1002,15 @@
       top.append(el('span', 'dk-badge', 'In progress'));
     }
 
-    if (item.id) {
+    var linkId = item.id || item.link_id;
+    if (linkId) {
       var actBox = el('div', 'conv-ft-item__actions');
       var removeBtn = el('button', 'dk-button dk-button--sm dk-button--secondary', 'Remove');
       removeBtn.type = 'button';
       removeBtn.addEventListener('click', async function () {
         removeBtn.disabled = true;
         try {
-          await api(CONV_API.link(convId, item.id), { method: 'DELETE' });
+          await api(CONV_API.link(convId, linkId), { method: 'DELETE' });
           if (state.followThrough[convId]) delete state.followThrough[convId];
           loadFollowThrough(convId);
         } catch (err) {
@@ -1381,7 +1387,10 @@
     var filter = byId('identity-filter');
     var errorBox = byId('new-conversation-error');
 
+    if (button) button.disabled = !state.selfActor || !state.participantsLoaded;
+
     button.addEventListener('click', async function () {
+      if (button.disabled || !state.selfActor || !state.participantsLoaded) return;
       errorBox.hidden = true;
       errorBox.textContent = '';
       form.reset();

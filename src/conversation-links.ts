@@ -752,6 +752,7 @@ export class ConversationLinksService {
       row,
       inspected.row,
       principal,
+      target,
     );
     return {
       id: row.id,
@@ -790,7 +791,12 @@ export class ConversationLinksService {
         if (!inspected.row) {
           throw new ConversationDomainError('not_found', 404);
         }
-        return this.followThrough.deriveLinkFacts(row, inspected.row, principal) as any;
+        return this.followThrough.deriveLinkFacts(
+          row,
+          inspected.row,
+          principal,
+          inspected.view,
+        ) as any;
       }
 
       const rows = this.sql
@@ -804,7 +810,12 @@ export class ConversationLinksService {
         .map(row => {
           const inspected = this.inspectTarget(row.kind, String(row.ref), principal);
           return inspected.row
-            ? this.followThrough.deriveLinkFacts(row, inspected.row, principal)
+            ? this.followThrough.deriveLinkFacts(
+                row,
+                inspected.row,
+                principal,
+                inspected.view,
+              )
             : null;
         })
         .filter(Boolean);

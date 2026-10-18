@@ -1028,36 +1028,78 @@ async function runSuite(page) {
     }
   });
 
+  await test('initial new-conversation button is guarded until verified self and participants', async () => {
+    await freshPage();
+    const hold = state.participantsGate = gate();
+    await page.goto(base + '/');
+    const button = page.locator('#new-conversation');
+    assert.equal(await button.isDisabled(), true, 'new-conversation button disabled before hydration');
+    await button.click({ force: true });
+    assert.equal(await page.locator('#new-conversation-dialog').isVisible(), false, 'dialog remains closed');
+    hold.release();
+    state.participantsGate = null;
+    await page.waitForFunction(() => !document.getElementById('new-conversation').disabled);
+    assert.equal(await button.isDisabled(), false, 'new-conversation button enabled after hydration');
+    await button.click();
+    await page.waitForSelector('#new-conversation-dialog[open]');
+    assert.equal(await page.locator('#new-conversation-dialog').isVisible(), true, 'dialog opens after hydration');
+    await page.click('#new-conversation-cancel');
+    expectNoPageErrors();
+  });
+
   await test('follow-through renders linked task authority facts and attaches new links', async () => {
     await freshPage();
     state.followThroughStore = {
       c2: [
         {
           id: 'link-c2-1',
+          link_id: 'link-c2-1',
           conversation_id: 'c2',
           kind: 'intake_task',
           ref: 'task-1234-uuid',
           target: { available: true, canonical_status: 'in_progress', terminal: false, complete: false },
-          follow_through: {
-            facts: {
-              owner_acceptance: { state: 'known', source_identity: SELF, authority: 'canonical_owner_acceptance' },
-              first_action: { state: 'known', source_identity: 'host-a', authority: 'canonical_job_first_action' },
-              due_obligation: { state: 'open', source_identity: null, authority: 'canonical_ask_ledger' },
-              independent_review: { state: 'known', source_identity: 'projA:reviewer-1', authority: 'canonical_independent_review', observation: { source_sha: 'a'.repeat(40) } },
-              accepted_outcome: { state: 'unknown', source_identity: null, authority: 'none' },
-              human_delivery: { state: 'unknown', source_identity: null, authority: 'none' }
-            },
-            summary: { ready: true, complete: false, blocked: false }
-          }
+          facts: {
+            owner_acceptance: { fact_type: 'owner_acceptance', state: 'known', source_identity: SELF, authority: 'canonical_owner_acceptance', observation: { verdict: 'accepted' }, revision: 1 },
+            first_action: { fact_type: 'first_action', state: 'known', source_identity: 'host-a', authority: 'canonical_job_first_action', observation: { action_type: 'start' }, revision: 1 },
+            due_obligation: { fact_type: 'due_obligation', state: 'open', source_identity: 'ob-1', authority: 'canonical_ask_ledger', observation: { total: 1, open: 1, overdue: false, default_choice: 'proceed', items: [] }, revision: 1 },
+            independent_review: { fact_type: 'independent_review', state: 'known', source_identity: 'projA:reviewer-1', authority: 'canonical_independent_review', observation: { verdict: 'approved', source_sha: 'a'.repeat(40), review_id: 'rev-1' }, revision: 1 },
+            accepted_outcome: { fact_type: 'accepted_outcome', state: 'known', source_identity: SELF, authority: 'canonical_accepted_outcome', observation: { verdict: 'accepted', source_sha: 'a'.repeat(40), review_ref: 'rev-1' }, revision: 1 },
+            human_delivery: { fact_type: 'human_delivery', state: 'known', source_identity: SELF, authority: 'canonical_human_delivery', observation: { recipient: SELF }, revision: 1 }
+          },
+          overdue_obligation: false,
+          summary: { ready: true, complete: true, blocked: false }
+        },
+        {
+          id: 'link-c2-2',
+          link_id: 'link-c2-2',
+          conversation_id: 'c2',
+          kind: 'intake_task',
+          ref: 'task-revoked-uuid',
+          target: { available: false, canonical_status: null, terminal: false, complete: false },
+          facts: {
+            owner_acceptance: { fact_type: 'owner_acceptance', state: 'unknown', source_identity: null, authority: 'none', observation: null, revision: null },
+            first_action: { fact_type: 'first_action', state: 'unknown', source_identity: null, authority: 'none', observation: null, revision: null },
+            due_obligation: { fact_type: 'due_obligation', state: 'unknown', source_identity: null, authority: 'none', observation: null, revision: null },
+            independent_review: { fact_type: 'independent_review', state: 'unknown', source_identity: null, authority: 'none', observation: null, revision: null },
+            accepted_outcome: { fact_type: 'accepted_outcome', state: 'unknown', source_identity: null, authority: 'none', observation: null, revision: null },
+            human_delivery: { fact_type: 'human_delivery', state: 'unknown', source_identity: null, authority: 'none', observation: null, revision: null }
+          },
+          overdue_obligation: false,
+          summary: { ready: false, complete: false, blocked: false }
         }
       ]
     };
     await page.goto(base + '/conversations.html?conversation=c2');
     await page.waitForSelector('.conv-ft-item');
     assert.equal(await page.locator('.conv-ft__title').textContent(), 'Follow-through & Linked Tasks');
-    assert.equal(await page.locator('.conv-ft-item').count(), 1);
-    assert.equal(await page.locator('.conv-ft-item__ref').textContent(), 'task-1234-uuid');
-    const gridText = await page.locator('.conv-ft-grid').textContent();
+    assert.equal(await page.locator('.conv-ft-item').count(), 2);
+    assert.equal(await page.locator('.conv-ft-item').nth(0).locator('.conv-ft-item__ref').textContent(), 'task-1234-uuid');
+    const firstBadges = await page.locator('.conv-ft-item').nth(0).locator('.dk-badge').allTextContents();
+    assert.ok(firstBadges.includes('in_progress'), 'authorized link shows canonical status');
+    assert.ok(firstBadges.includes('Complete'), 'complete badge shown');
+    assert.ok(!firstBadges.includes('Opaque ACL / unavailable'), 'authorized link never displays unavailable');
+    const secondBadges = await page.locator('.conv-ft-item').nth(1).locator('.dk-badge').allTextContents();
+    const gridText = await page.locator('.conv-ft-item').nth(0).locator('.conv-ft-grid').textContent();
     assert.ok(gridText.includes('Owner Acceptance'));
     assert.ok(gridText.includes('Accepted'));
     assert.ok(gridText.includes('Recorded'));

@@ -1258,4 +1258,301 @@ describe('M10 conversation follow-through authority and canonical links', () => 
       ).toThrow();
     });
   });
+
+  it('DTO-to-UI route contract joins authoritative target metadata and preserves grant revocation (room 200, links empty, task 403)', async () => {
+    await withHub(async (hub) => {
+      const csrf = 'csrf-alice';
+      const cookie = await cookieFor('alice', 'admin@fake.local', csrf);
+
+      // 1. Worker agent token
+      const workerToken = await seedAgentToken(hub.sql, {
+        id: 'tok-dto-w1',
+        token: 'token-dto-worker-1',
+        actor: 'projA:worker-1',
+        machineId: 'machine-A',
+        scopes: ['bus:read', 'bus:send'],
+      });
+
+      // 2. Create intake task
+      const createResp = await hub.fetch(
+        jsonReq('/api/intake/tasks', {
+          cookie,
+          csrf,
+          body: {
+            key: 'auth-dto-task-1',
+            project: 'projA',
+            title: 'DTO test task',
+            text: 'Detailed task description',
+            source: validSource,
+          },
+        }),
+      );
+      expect(createResp.status).toBe(200);
+      const taskRes = (await createResp.json()) as any;
+      const taskId = taskRes.task.id;
+
+      // 3. Create conversation with worker as member
+      const convResp = await hub.fetch(
+        jsonReq('/api/conversations', {
+          cookie,
+          csrf,
+          body: {
+            kind: 'group',
+            title: 'DTO group',
+            members: ['projA:worker-1'],
+            idempotency_key: 'idemp-dto-1',
+          },
+        }),
+      );
+      expect(convResp.status).toBe(201);
+      const conv = (await convResp.json()) as any;
+
+      // 4. Link task to conversation
+      const linkResp = await hub.fetch(
+        jsonReq(`/api/conversations/${conv.id}/links`, {
+          cookie,
+          csrf,
+          body: {
+            kind: 'intake_task',
+            ref: taskId,
+            idempotency_key: 'idemp-dto-link-1',
+          },
+        }),
+      );
+      expect(linkResp.status).toBe(201);
+      const linkData = (await linkResp.json()) as any;
+
+      // 5. Issue intake grant to worker-1 for project projA
+      const grantResp = await hub.fetch(
+        jsonReq('/api/intake/grants', {
+          cookie,
+          csrf,
+          body: {
+            key: 'grant-dto-w1',
+            credential_id: 'tok-dto-w1',
+            scope: 'project',
+            target: 'projA',
+            access: 'read',
+            expires_at: Date.now() + 3600000,
+            source: validSource,
+          },
+        }),
+      );
+      expect(grantResp.status).toBe(200);
+      const grantData = (await grantResp.json()) as any;
+
+      // 6. Worker-1 fetches follow-through: authoritative target metadata is present!
+      const ftResp = await hub.fetch(
+        jsonReq(`/api/conversations/${conv.id}/follow-through`, { token: workerToken }),
+      );
+      expect(ftResp.status).toBe(200);
+      const ft = (await ftResp.json()) as any;
+      expect(ft.links).toHaveLength(1);
+      expect(ft.links[0].id).toBe(linkData.id);
+      expect(ft.links[0].link_id).toBe(linkData.id);
+      expect(ft.links[0].target).toBeDefined();
+      expect(ft.links[0].target.available).toBe(true);
+      expect(ft.links[0].target.canonical_status).toBe('open');
+
+      // 7. Now revoke worker-1's intake grant
+      const revokeResp = await hub.fetch(
+        jsonReq(`/api/intake/grants/${grantData.grant.id}/revoke`, {
+          cookie,
+          csrf,
+          body: {
+            key: 'revoke-dto-w1',
+            source: validSource,
+          },
+        }),
+      );
+      expect(revokeResp.status).toBe(200);
+
+      // 8. Recheck actual grant revocation case:
+      // (a) Room remains 200
+      const roomResp = await hub.fetch(
+        jsonReq(`/api/conversations/${conv.id}`, { token: workerToken }),
+      );
+      expect(roomResp.status).toBe(200);
+
+      // (b) Follow-through returns 200 with links empty (no leaking target)
+      const ftRevokedResp = await hub.fetch(
+        jsonReq(`/api/conversations/${conv.id}/follow-through`, { token: workerToken }),
+      );
+      expect(ftRevokedResp.status).toBe(200);
+      const ftRevoked = (await ftRevokedResp.json()) as any;
+      expect(ftRevoked.links).toEqual([]);
+      expect(ftRevoked.follow_through).toEqual([]);
+
+      // (c) Direct task fetch returns 403 Forbidden!
+      const taskResp = await hub.fetch(
+        jsonReq(`/api/intake/tasks/${taskId}`, { token: workerToken }),
+      );
+      expect(taskResp.status).toBe(403);
+    });
+  });
+
+  it('preserves proceed and answer capture times independently for answered-after-proceeding obligations (real probe shape)', async () => {
+    await withHub(async (hub) => {
+      const csrf = 'csrf-alice';
+      const cookie = await cookieFor('alice', 'admin@fake.local', csrf);
+
+      // Create intake task
+      const createResp = await hub.fetch(
+        jsonReq('/api/intake/tasks', {
+          cookie,
+          csrf,
+          body: {
+            key: 'probe-task-20261018',
+            project: 'projA',
+            title: 'Probe test task',
+            text: 'Probe task description',
+            source: validSource,
+          },
+        }),
+      );
+      expect(createResp.status).toBe(200);
+      const taskRes = (await createResp.json()) as any;
+      const taskId = taskRes.task.id;
+
+      // Create conversation and link
+      const convResp = await hub.fetch(
+        jsonReq('/api/conversations', {
+          cookie,
+          csrf,
+          body: {
+            kind: 'direct',
+            title: 'Probe direct',
+            members: ['worker-1'],
+            idempotency_key: 'idemp-probe-conv-1',
+          },
+        }),
+      );
+      const conv = (await convResp.json()) as any;
+
+      await hub.fetch(
+        jsonReq(`/api/conversations/${conv.id}/links`, {
+          cookie,
+          csrf,
+          body: {
+            kind: 'intake_task',
+            ref: taskId,
+            idempotency_key: 'idemp-probe-link-1',
+          },
+        }),
+      );
+
+      const pastDeadline = Date.now() - 5000;
+      const chatSource = {
+        type: 'chat',
+        reference: `hub://conversations/${conv.id}/messages/01M5727DZ4R7Z4231K0P9T543W`,
+        timestamp: '2026-10-18T08:32:06.116Z',
+      };
+
+      // 1. Post canonical obligation (server assigns asked_at and captured_at)
+      const obResp = await hub.fetch(
+        jsonReq(`/api/intake/tasks/${taskId}/events`, {
+          cookie,
+          csrf,
+          body: {
+            key: 'm10-live-owner-obligation-20261018-v1',
+            expected_version: 1,
+            event: {
+              kind: 'obligation',
+              obligation_id: 'm10-live-owner-probe-20261018',
+              text: 'Please confirm ownership of task081ec421 using your own signed agent identity...',
+              default_action: 'hold_reversible_decision',
+              wait_s: 30,
+              deadline: pastDeadline,
+              source: chatSource,
+            },
+          },
+        }),
+      );
+      expect(obResp.status).toBe(200);
+
+      // 2. Post coordinator hold event (proceed at/after deadline)
+      const holdResp = await hub.fetch(
+        jsonReq(`/api/intake/tasks/${taskId}/events`, {
+          cookie,
+          csrf,
+          body: {
+            key: 'm10-live-owner-explicit-hold-20261018-v1',
+            expected_version: 2,
+            event: {
+              kind: 'obligation_response',
+              ref: 'm10-live-owner-probe-20261018',
+              response_type: 'proceed',
+              text: 'The explicit deadline passed. Apply only the recorded reversible HOLD...',
+              source: validSource,
+            },
+          },
+        }),
+      );
+      expect(holdResp.status).toBe(200);
+
+      // Verify intermediate proceeded state has proceeded_at and no answered_at
+      const ftHoldResp = await hub.fetch(
+        jsonReq(`/api/conversations/${conv.id}/follow-through`, { cookie }),
+      );
+      const ftHold = (await ftHoldResp.json()) as any;
+      const holdItem = ftHold.links[0].facts.due_obligation.observation.items[0];
+      expect(holdItem.status).toBe('proceeded');
+      expect(typeof holdItem.proceeded_at).toBe('number');
+      expect(holdItem.proceeded_at).toBeGreaterThan(0);
+      expect(holdItem.answered_at).toBeNull();
+      expect(typeof holdItem.asked_at).toBe('number');
+      expect(holdItem.asked_at).toBeGreaterThan(0);
+      expect(holdItem.deadline).toBe(pastDeadline);
+      expect(holdItem.wait_s).toBe(30);
+      expect(holdItem.default_action).toBe('hold_reversible_decision');
+      expect(holdItem.source).toEqual(chatSource);
+
+      const capturedHoldTime = holdItem.proceeded_at;
+
+      // 3. Post late answer event
+      const answerResp = await hub.fetch(
+        jsonReq(`/api/intake/tasks/${taskId}/events`, {
+          cookie,
+          csrf,
+          body: {
+            key: 'm10-live-obligation-answer-20261018-v1',
+            expected_version: 3,
+            event: {
+              kind: 'obligation_response',
+              ref: 'm10-live-owner-probe-20261018',
+              response_type: 'answer',
+              text: 'Confirmed ownership and live readiness for task 081ec421 under genuine native session...',
+              source: {
+                type: 'chat',
+                reference: `hub://conversations/${conv.id}/messages/01M572E2WVNV0NZK1X8R9E0343`,
+                timestamp: '2026-10-18T08:35:44.155Z',
+              },
+            },
+          },
+        }),
+      );
+      expect(answerResp.status).toBe(200);
+
+      // 4. Follow-through verification: both proceed and answer times survive late answer!
+      const ftFinalResp = await hub.fetch(
+        jsonReq(`/api/conversations/${conv.id}/follow-through`, { cookie }),
+      );
+      const ftFinal = (await ftFinalResp.json()) as any;
+      const finalFact = ftFinal.links[0].facts.due_obligation;
+      expect(finalFact.state).toBe('answered');
+      expect(finalFact.observation.items).toHaveLength(1);
+
+      const finalItem = finalFact.observation.items[0];
+      expect(finalItem.status).toBe('answered-after-proceeding');
+      expect(finalItem.late_reconciled).toBe(true);
+      expect(finalItem.proceeded_at).toBe(capturedHoldTime);
+      expect(typeof finalItem.answered_at).toBe('number');
+      expect(finalItem.answered_at).toBeGreaterThanOrEqual(capturedHoldTime);
+      expect(finalItem.asked_at).toBe(holdItem.asked_at);
+      expect(finalItem.deadline).toBe(pastDeadline);
+      expect(finalItem.wait_s).toBe(30);
+      expect(finalItem.default_action).toBe('hold_reversible_decision');
+      expect(finalItem.source).toEqual(chatSource);
+    });
+  });
 });
