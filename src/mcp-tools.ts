@@ -60,7 +60,8 @@ tool('checks_write', 'PUT', '/api/checks', 'Operator-only scheduled checks confi
 tool('checks_run', 'POST', '/api/checks/{id}/run', 'DESTRUCTIVE: run an existing check and its configured actions.');
 for (const action of ['archive', 'unarchive']) tool(`conversations_${action}`, 'POST', `/api/conversations/{id}/${action}`, `Conversation ${action}; existing member permissions apply.`);
 tool('conversations_links_search', 'GET', '/api/conversations/links', 'Find linked conversations using the existing web API query.');
-tool('conversations_links', 'GET', '/api/conversations/{id}/links', 'List linked task, session and artifact references.');
+tool('conversations_links', 'GET', '/api/conversations/{id}/links', 'List linked task, session and artifact references.', ['conversations links']);
+tool('conversations_follow_through', 'GET', '/api/conversations/{id}/follow-through', 'Read typed conversation follow-through authority facts and obligations.', ['conversations follow-through']);
 tool('conversations_link_show', 'GET', '/api/conversations/{id}/links/{link_id}', 'Read one authorized link reference.');
 tool('conversations_link_create', 'POST', '/api/conversations/{id}/links', 'Attach a link using payload kind, ref and idempotency_key.');
 tool('conversations_link_remove', 'DELETE', '/api/conversations/{id}/links/{link_id}', 'Remove a conversation link with existing membership/ownership checks.');

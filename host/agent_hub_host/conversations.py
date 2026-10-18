@@ -72,6 +72,17 @@ def add_commands(sub):
     bridge.add_argument('--workspace', help='Explicit canonical local workspace for this project')
     bridge.add_argument('--machine-id', help='Must match existing authenticated host config')
     bridge.add_argument('--conversation', action='append', default=[])
+    links = commands.add_parser('links', help='Inspect or manage canonical conversation links')
+    links.add_argument('id')
+    links.add_argument('--attach-kind', choices=['intake_task', 'fleet_job', 'routing_job'], help='Kind of target to link')
+    links.add_argument('--attach-ref', help='Target identifier (intake task UUID or job ID)')
+    links.add_argument('--key', help='Idempotency retry key for attaching link')
+    links.add_argument('--remove', help='Link ID to remove')
+    links.add_argument('--search-kind', choices=['intake_task', 'fleet_job', 'routing_job'], help='Filter by target kind')
+    links.add_argument('--search-ref', help='Filter by target ref')
+    follow = commands.add_parser('follow-through', help='Read typed conversation follow-through authority facts and obligations')
+    follow.add_argument('id')
+    follow.add_argument('--link', help='Optional link ID to focus follow-through facts')
 
 
 def execute(args):
@@ -130,6 +141,28 @@ def execute(args):
         return request('POST', path + '/messages', payload)
     if command == 'read':
         return request('POST', path + '/read', {'seq': valid_seq(args.seq)})
+    if command == 'links':
+        if args.attach_kind is not None or args.attach_ref is not None:
+            if not (args.attach_kind and args.attach_ref):
+                raise ValueError('Both --attach-kind and --attach-ref are required to attach a link')
+            payload = {'kind': args.attach_kind, 'ref': args.attach_ref}
+            if args.key:
+                valid_key(args.key)
+                payload['idempotency_key'] = args.key
+            return request('POST', path + '/links', payload)
+        if args.remove is not None:
+            return request('DELETE', path + '/links/' + quote(args.remove, safe=''))
+        params = {}
+        if args.search_kind is not None:
+            params['target_kind'] = args.search_kind
+        if args.search_ref is not None:
+            params['target_ref'] = args.search_ref
+        query = ('?' + urlencode(params)) if params else ''
+        return request('GET', path + '/links' + query)
+    if command == 'follow-through':
+        if args.link:
+            return request('GET', path + '/links/' + quote(args.link, safe='') + '/follow-through')
+        return request('GET', path + '/follow-through')
     raise ValueError('Unknown conversation operation')
 
 

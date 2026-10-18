@@ -54,3 +54,20 @@
 .conv-identity__kind { margin-left: auto; }
 .conv-identity--none { color: var(--dk-text-muted); cursor: default; }
 .conv-identity--none:hover { background: transparent; }
+
+/* ---- Follow-through & Linked Tasks ---- */
+.conv-ft { display: flex; flex-direction: column; gap: var(--dk-space-2); padding: var(--dk-space-2) var(--dk-space-4); border-bottom: 1px solid var(--dk-border-default); background: var(--dk-bg-surface); }
+.conv-ft__head { display: flex; align-items: center; justify-content: space-between; gap: var(--dk-space-2); }
+.conv-ft__title { margin: 0; font-size: var(--dk-text-sm); font-weight: var(--dk-weight-semibold); color: var(--dk-text-heading); }
+.conv-ft__empty { margin: 0; color: var(--dk-text-muted); font-size: var(--dk-text-xs); }
+.conv-ft__form { display: flex; align-items: center; gap: var(--dk-space-2); flex-wrap: wrap; padding: var(--dk-space-2); background: var(--dk-bg-muted); border-radius: var(--dk-radius-md); }
+.conv-ft-list { display: flex; flex-direction: column; gap: var(--dk-space-2); }
+.conv-ft-item { display: flex; flex-direction: column; gap: var(--dk-space-2); padding: var(--dk-space-2) var(--dk-space-3); border: 1px solid var(--dk-border-default); border-radius: var(--dk-radius-md); background: var(--dk-bg-muted); }
+.conv-ft-item__top { display: flex; align-items: center; gap: var(--dk-space-2); flex-wrap: wrap; }
+.conv-ft-item__ref { font-family: var(--dk-font-mono); font-size: var(--dk-text-xs); color: var(--dk-text-muted); }
+.conv-ft-item__actions { margin-left: auto; }
+.conv-ft-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: var(--dk-space-2); }
+.conv-ft-fact { display: flex; flex-direction: column; gap: var(--dk-space-1); padding: var(--dk-space-1) var(--dk-space-2); background: var(--dk-bg-surface); border: 1px solid var(--dk-border-default); border-radius: var(--dk-radius-sm); font-size: var(--dk-text-xs); }
+.conv-ft-fact__title { font-weight: var(--dk-weight-semibold); color: var(--dk-text-heading); }
+.conv-ft-fact__source { color: var(--dk-text-muted); overflow-wrap: anywhere; }
+.conv-ft-fact__detail { font-family: var(--dk-font-mono); color: var(--dk-text-faint); overflow-wrap: anywhere; }

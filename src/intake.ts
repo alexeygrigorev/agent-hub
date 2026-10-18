@@ -2,6 +2,7 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { CallerContext } from './bus';
 import { credentialActor, registryAddress } from './agent_registry';
+import { sha256Sync } from './conversation-followthrough';
 
 type Auth = { caller?: CallerContext; scopes?: string[]; error?: Response };
 type Obj = Record<string, any>;
@@ -79,7 +80,7 @@ async function body(request: Request): Promise<Obj> {
 }
 
 export class IntakeService {
-  constructor(public sql: SqlStorage, private tx: Tx, private hooks: IntakeHooks = {}) {}
+  constructor(public sql: SqlStorage, private tx: Tx = <T>(fn: () => T) => fn(), private hooks: IntakeHooks = {}) {}
   init() {
     this.tx(() => {
       this.sql.exec('CREATE TABLE IF NOT EXISTS intake_meta (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL)');
@@ -127,7 +128,7 @@ export class IntakeService {
           !Number.isFinite(Date.parse(c.expires_at)) || Date.parse(c.expires_at) <= Date.now() || !Array.isArray(scopes) || !scopes.includes('admin') || !c.family_id) fail('unauthorized', 401);
         identity = 'human-family:' + c.family_id;
       }
-      return { admin: true, actor: caller.actor || 'admin', identity };
+      return { admin: true, actor: caller.actor || 'admin', identity, caller };
     }
     if (caller.kind !== 'agent' || !caller.tokenId || !caller.tokenHash) fail('forbidden', 403);
     const c = this.sql.exec('SELECT * FROM credentials WHERE id=?', caller.tokenId).toArray()[0] as any;
@@ -135,7 +136,7 @@ export class IntakeService {
     if (!binding || c.token_hash !== caller.tokenHash || binding.actor !== caller.actor) fail('forbidden', 403);
     const grants = this.rows('grants').filter(g => !g.revoked_at && g.expires_at > Date.now() && canonical(g.binding) === canonical(binding));
     if (!grants.length) fail('forbidden', 403);
-    return { admin: false, actor: binding.actor, identity: 'family:' + binding.family_id, grants,
+    return { admin: false, actor: binding.actor, identity: 'family:' + binding.family_id, grants, caller,
       valid_until: Math.min(Date.parse(c.expires_at), ...grants.map(g => g.expires_at)) };
   }
   private binding(c: any): Obj | null {
@@ -153,6 +154,25 @@ export class IntakeService {
   private allowed(p: Obj, task: Obj, write = false): boolean {
     return p.admin || p.grants.some((g: Obj) => (!write || g.access === 'write') &&
       (g.scope === 'all' || (g.scope === 'project' && g.target === task.project) || (g.scope === 'task' && g.target === task.id)));
+  }
+  public resolvePrincipal(auth: Auth): Obj {
+    return this.principal(auth);
+  }
+  public isTaskAllowed(p: Obj, task: Obj, write = false): boolean {
+    return this.allowed(p, task, write);
+  }
+  public getAuthorizedTask(taskId: string, auth: Auth): Obj | null {
+    try {
+      const p = this.principal(auth);
+      const task = this.get('tasks', taskId);
+      if (!task || !this.allowed(p, task)) return null;
+      return task;
+    } catch {
+      return null;
+    }
+  }
+  public getTaskById(taskId: string): Obj | null {
+    return this.get('tasks', taskId) ?? null;
   }
   private operator(p: Obj) { if (!p.admin) fail('operator_required', 403); }
   private expected(b: Obj, version: number) { if (integer(b.expected_version) !== version) fail('version_conflict', 409); }
@@ -311,9 +331,214 @@ export class IntakeService {
         this.operator(p); if (ref.kind !== 'pending_approval' || !['granted', 'denied', 'withdrawn'].includes(raw.decision)) fail('invalid_approval_decision');
       } else if (ref.kind === 'pending_approval') fail('operator_required', 403);
       fields = { ref: identifier(raw.ref), text: str(raw.text), source: source(raw.source), ...(kind === 'approval_decision' ? { decision: raw.decision } : {}) };
+    } else if (kind === 'owner_acceptance') {
+      keys(raw, ['kind', 'text', 'source', 'verdict']);
+      if (!task.owner) {
+        if (p.actor === task.history[0]?.actor || p.admin) {
+          task.owner = p.actor;
+        } else {
+          fail('owner_acceptance_requires_owner', 403);
+        }
+      } else if (task.owner !== p.actor) {
+        fail('owner_acceptance_requires_owner', 403);
+      }
+      const verdict = raw.verdict ? str(raw.verdict, 32) : 'accepted';
+      if (!['accepted', 'refused'].includes(verdict)) fail('invalid_verdict');
+      fields = { text: str(raw.text), verdict, source: source(raw.source) };
+    } else if (kind === 'first_action' || kind === 'work_action') {
+      keys(raw, ['kind', 'action_type', 'text', 'source', 'evidence_digest', 'native_session', 'host_id']);
+      const isOwner = task.owner && task.owner === p.actor;
+      const isAssigned = task.history.some((e: Obj) => e.kind === 'assignment' && e.assignee === p.actor);
+      if (!p.admin && !isOwner && !isAssigned) fail('forbidden', 403);
+      const action_type = raw.action_type ? str(raw.action_type, 64) : 'work_action';
+      const text = str(raw.text);
+      let evidence_digest: string | null = null;
+      if (raw.evidence_digest) {
+        const dig = str(raw.evidence_digest, 64).toLowerCase();
+        if (!/^[0-9a-f]{64}$/.test(dig)) fail('invalid_evidence_digest');
+        evidence_digest = dig;
+      }
+      const native_session = raw.native_session ? str(raw.native_session, 128) : null;
+      const host_id = raw.host_id ? str(raw.host_id, 128) : null;
+      fields = {
+        action_type,
+        text,
+        evidence_digest,
+        native_session,
+        host_id,
+        source: source(raw.source),
+      };
+    } else if (kind === 'independent_review') {
+      keys(raw, ['kind', 'source_sha', 'verdict', 'text', 'source', 'reviewer']);
+      const source_sha = str(raw.source_sha, 64).toLowerCase();
+      if (!/^[0-9a-f]{40}$/.test(source_sha)) fail('invalid_source_sha');
+      const verdict = str(raw.verdict, 32);
+      if (!['approved', 'changes_requested', 'rejected'].includes(verdict)) fail('invalid_verdict');
+
+      const contributors = new Set<string>();
+      if (Array.isArray(task.history)) {
+        for (const item of task.history) {
+          if (item.kind === 'commit' && item.actor) contributors.add(item.actor);
+          if (item.kind === 'report' && item.actor) contributors.add(item.actor);
+          if ((item.kind === 'work_action' || item.kind === 'first_action') && item.actor) contributors.add(item.actor);
+          if (item.kind === 'assignment' && item.assignee) contributors.add(item.assignee);
+        }
+      }
+      if (typeof task.owner === 'string' && task.owner.trim()) {
+        contributors.add(task.owner.trim());
+      }
+      const claimedReviewer = raw.reviewer ? str(raw.reviewer, 128) : p.actor;
+      if (contributors.has(claimedReviewer) || contributors.has(p.actor)) {
+        fail('reviewer_not_independent', 403);
+      }
+      if (raw.reviewer && raw.reviewer !== p.actor) {
+        fail('reviewer_mismatch', 403);
+      }
+      fields = {
+        reviewer: claimedReviewer,
+        source_sha,
+        verdict,
+        text: nullable(raw.text, 8192),
+        source: source(raw.source),
+      };
+    } else if (kind === 'accepted_outcome') {
+      keys(raw, ['kind', 'outcome_ref', 'source_sha', 'review_ref', 'verdict', 'text', 'source']);
+      this.operator(p);
+      const verdict = str(raw.verdict, 32);
+      if (!['accepted', 'rejected'].includes(verdict)) fail('invalid_verdict');
+      const outcome_ref = str(raw.outcome_ref, 2048);
+      const source_sha = str(raw.source_sha, 64).toLowerCase();
+      if (!/^[0-9a-f]{40}$/.test(source_sha)) fail('invalid_source_sha');
+      const review_ref = str(raw.review_ref, 128);
+
+      const reviewEvent = task.history.find((e: Obj) =>
+        e.kind === 'independent_review' && e.id === review_ref
+      );
+      if (!reviewEvent) fail('missing_independent_review', 409);
+      if (reviewEvent.verdict !== 'approved') fail('review_not_approved', 409);
+      if (reviewEvent.source_sha !== source_sha) fail('source_sha_mismatch', 409);
+
+      const reviewIndex = task.history.indexOf(reviewEvent);
+      for (let j = reviewIndex + 1; j < task.history.length; j++) {
+        const later = task.history[j];
+        if (later.kind === 'commit' && later.reference && later.reference.toLowerCase() !== source_sha) {
+          fail('stale_reviewed_source', 409);
+        }
+        if (later.kind === 'independent_review' && later.verdict !== 'approved') {
+          fail('stale_reviewed_source', 409);
+        }
+      }
+
+      fields = {
+        outcome_ref,
+        source_sha,
+        review_ref: reviewEvent.id,
+        verdict,
+        text: nullable(raw.text, 8192),
+        source: source(raw.source),
+      };
+    } else if (kind === 'human_delivery') {
+      keys(raw, ['kind', 'recipient', 'text', 'source', 'outcome_ref', 'source_sha']);
+      if (p.caller?.kind !== 'human' || !p.caller.actor.startsWith('human:')) fail('human_delivery_requires_human', 403);
+      const recipient = p.caller.actor;
+      if (raw.recipient && raw.recipient !== recipient) fail('recipient_mismatch', 403);
+
+      const acceptedOutcome = task.history.slice().reverse().find((e: Obj) => e.kind === 'accepted_outcome' && e.verdict === 'accepted');
+      if (!acceptedOutcome) fail('no_accepted_outcome', 409);
+      if (raw.source_sha && raw.source_sha.toLowerCase() !== acceptedOutcome.source_sha.toLowerCase()) {
+        fail('stale_outcome_source', 409);
+      }
+      if (raw.outcome_ref && raw.outcome_ref !== acceptedOutcome.outcome_ref) {
+        fail('outcome_ref_mismatch', 409);
+      }
+
+      const outcomeIndex = task.history.lastIndexOf(acceptedOutcome);
+      for (let j = outcomeIndex + 1; j < task.history.length; j++) {
+        const later = task.history[j];
+        if (later.kind === 'commit' && later.reference && later.reference.toLowerCase() !== acceptedOutcome.source_sha.toLowerCase()) {
+          fail('stale_outcome_source', 409);
+        }
+      }
+
+      fields = {
+        recipient,
+        delivered_by: p.caller.actor,
+        accepted_outcome_id: acceptedOutcome.id,
+        source_sha: acceptedOutcome.source_sha,
+        outcome_ref: acceptedOutcome.outcome_ref,
+        task_version: task.version,
+        text: str(raw.text, 8192),
+        source: source(raw.source),
+      };
+    } else if (kind === 'obligation') {
+      keys(raw, ['kind', 'obligation_id', 'text', 'default_action', 'wait_s', 'deadline', 'source']);
+      const obligationId = identifier(raw.obligation_id || crypto.randomUUID());
+      if (task.history.some((e: Obj) => e.kind === 'obligation' && e.obligation_id === obligationId)) {
+        fail('duplicate_obligation_id', 409);
+      }
+      const text = str(raw.text);
+      const text_hash = sha256Sync(text).slice(0, 16);
+      const default_action = str(raw.default_action, 2048);
+      const ALLOWED_REVERSIBLE_ACTIONS = ['proceed', 'proceed_with_reversible_default', 'hold_reversible_decision', 'rollback_to_last_checkpoint', 'reversible_fallback'];
+      if (!ALLOWED_REVERSIBLE_ACTIONS.includes(default_action)) {
+        fail('invalid_reversible_default_action');
+      }
+      const wait = raw.wait_s ? integer(raw.wait_s, 1, 86400 * 30) : 1200;
+      const deadline = raw.deadline ? integer(raw.deadline) : now + wait * 1000;
+      fields = {
+        obligation_id: obligationId,
+        text,
+        text_hash,
+        default_action,
+        wait_s: wait,
+        asked_at: now,
+        deadline,
+        source: source(raw.source),
+      };
+    } else if (kind === 'obligation_response') {
+      keys(raw, ['kind', 'ref', 'response_type', 'text', 'source']);
+      const ref = task.history.find((e: Obj) => e.obligation_id === raw.ref || e.id === raw.ref);
+      if (!ref) fail('unknown_obligation');
+      const responseType = str(raw.response_type, 32);
+      if (!['answer', 'proceed'].includes(responseType)) fail('invalid_response_type');
+      const refId = ref.obligation_id || ref.id;
+      const priorResponses = task.history.filter((e: Obj) => e.kind === 'obligation_response' && e.ref === refId);
+      const hasAnswer = priorResponses.some((e: Obj) => e.response_type === 'answer');
+      const hasProceeded = priorResponses.some((e: Obj) => e.response_type === 'proceed');
+
+      if (responseType === 'proceed') {
+        if (hasProceeded) fail('obligation_already_proceeded', 409);
+        if (hasAnswer) fail('obligation_already_answered', 409);
+        if (now < Number(ref.deadline)) fail('cannot_proceed_before_deadline', 409);
+      } else if (responseType === 'answer') {
+        if (hasAnswer) fail('obligation_already_answered', 409);
+      }
+
+      const newStatus = responseType === 'proceed'
+        ? 'proceeded'
+        : hasProceeded
+          ? 'answered-after-proceeding'
+          : 'answered';
+
+      fields = {
+        ref: refId,
+        response_type: responseType,
+        resulting_status: newStatus,
+        text: str(raw.text),
+        source: source(raw.source),
+      };
     } else return fail('invalid_event_kind');
-    return { ...fields, kind, id: crypto.randomUUID(), actor: p.actor, captured_at: now,
-      authority: kind === 'approval_decision' ? 'operator_record' : 'untrusted_task_data' };
+    const authority =
+      kind === 'approval_decision' ? 'operator_record' :
+      kind === 'owner_acceptance' ? 'canonical_owner_acceptance' :
+      (kind === 'first_action' || kind === 'work_action') ? 'canonical_hub_action_receipt' :
+      kind === 'independent_review' ? 'canonical_independent_review' :
+      kind === 'accepted_outcome' ? 'canonical_accepted_outcome' :
+      kind === 'human_delivery' ? 'human_delivery_receipt' :
+      kind === 'obligation' ? 'canonical_obligation' :
+      kind === 'obligation_response' ? 'canonical_obligation_response' :
+      'untrusted_task_data';
+    return { ...fields, kind, id: crypto.randomUUID(), actor: p.actor, captured_at: now, authority };
   }
   private write(path: string, b: Obj, p: Obj): Obj {
     const now = Date.now();

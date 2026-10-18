@@ -30,6 +30,9 @@
     conversation: function (id) { return '/api/conversations/' + encodeURIComponent(id); },
     messages: function (id) { return '/api/conversations/' + encodeURIComponent(id) + '/messages'; },
     read: function (id) { return '/api/conversations/' + encodeURIComponent(id) + '/read'; },
+    followThrough: function (id) { return '/api/conversations/' + encodeURIComponent(id) + '/follow-through'; },
+    links: function (id) { return '/api/conversations/' + encodeURIComponent(id) + '/links'; },
+    link: function (id, linkId) { return '/api/conversations/' + encodeURIComponent(id) + '/links/' + encodeURIComponent(linkId); },
     historyLimit: 50
   };
   var LIST_POLL_MS = 30000;
@@ -60,7 +63,8 @@
     createFingerprint: null,
     signedOut: false,
     authGeneration: 0,
-    routeGeneration: 0
+    routeGeneration: 0,
+    followThrough: {}
   };
 
   function byId(id) { return document.getElementById(id); }
@@ -132,6 +136,7 @@
     state.selfActor = actor;
     state.outbox = {};
     state.threads = {};
+    state.followThrough = {};
     state.details = {};
     state.detailErrors = {};
     state.conversations = [];
@@ -817,9 +822,11 @@
     errorBox.id = 'thread-error';
     errorBox.hidden = true;
     detail.append(errorBox);
+    detail.append(followThroughNode(id));
     detail.append(threadNode(id));
     detail.append(composerNode(conversation));
     if (threadState(id).forbidden) setThreadError(threadState(id).error || 'You do not have access to this conversation.');
+    loadFollowThrough(id);
   }
 
   function detailHead(id, conversation) {
@@ -838,6 +845,253 @@
       : [];
     head.append(el('p', 'conv-detail-head__meta', members.length ? 'Members: ' + members.join(', ') : 'Members are not available yet.'));
     return head;
+  }
+
+  async function loadFollowThrough(id) {
+    if (!id || !state.selfActor) return;
+    var ctx = context(true);
+    try {
+      var data = await api(CONV_API.followThrough(id), { routeBound: true, context: ctx });
+      checkCurrent(ctx);
+      var links = (data && (data.follow_through || data.links)) || [];
+      state.followThrough[id] = { loaded: true, error: null, links: links };
+      renderFollowThrough(id);
+    } catch (err) {
+      if (!current(ctx) || (err && err.kind === 'stale')) return;
+      state.followThrough[id] = { loaded: true, error: null, links: [] };
+      renderFollowThrough(id);
+    }
+  }
+
+  function renderFollowThrough(id) {
+    if (id !== state.currentId) return;
+    var body = byId('conv-ft-body');
+    if (!body) return;
+    renderFollowThroughContent(body, id);
+  }
+
+  function followThroughNode(id) {
+    var wrap = el('section', 'conv-ft');
+    wrap.id = 'conv-ft';
+    wrap.setAttribute('aria-label', 'Follow-through and Linked Tasks');
+
+    var head = el('div', 'conv-ft__head');
+    head.append(el('h3', 'conv-ft__title', 'Follow-through & Linked Tasks'));
+
+    var attachBtn = el('button', 'dk-button dk-button--sm dk-button--secondary', 'Attach link');
+    attachBtn.type = 'button';
+    head.append(attachBtn);
+    wrap.append(head);
+
+    var formBox = el('div', 'conv-ft__form');
+    formBox.hidden = true;
+
+    var kindSelect = el('select', 'dk-select');
+    var opt1 = el('option', null, 'Intake Task');
+    opt1.value = 'intake_task';
+    var opt2 = el('option', null, 'Routing Job');
+    opt2.value = 'routing_job';
+    var opt3 = el('option', null, 'Fleet Job');
+    opt3.value = 'fleet_job';
+    kindSelect.append(opt1, opt2, opt3);
+
+    var refInput = el('input', 'dk-input');
+    refInput.type = 'text';
+    refInput.placeholder = 'Task UUID or Job ID';
+    refInput.setAttribute('aria-label', 'Target reference identifier');
+
+    var submitBtn = el('button', 'dk-button dk-button--sm', 'Attach');
+    submitBtn.type = 'button';
+
+    formBox.append(kindSelect, refInput, submitBtn);
+    wrap.append(formBox);
+
+    var formOpen = false;
+    attachBtn.addEventListener('click', function () {
+      formOpen = !formOpen;
+      formBox.hidden = !formOpen;
+      attachBtn.textContent = formOpen ? 'Cancel' : 'Attach link';
+      if (formOpen) refInput.focus();
+    });
+
+    submitBtn.addEventListener('click', async function () {
+      var refVal = refInput.value.trim();
+      if (!refVal) return;
+      submitBtn.disabled = true;
+      try {
+        await api(CONV_API.links(id), {
+          method: 'POST',
+          body: {
+            kind: kindSelect.value,
+            ref: refVal,
+            idempotency_key: 'link-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)
+          }
+        });
+        refInput.value = '';
+        formOpen = false;
+        formBox.hidden = true;
+        attachBtn.textContent = 'Attach link';
+        if (state.followThrough[id]) delete state.followThrough[id];
+        loadFollowThrough(id);
+      } catch (err) {
+        announce(err && err.message ? err.message : 'Failed to attach link');
+      } finally {
+        submitBtn.disabled = false;
+      }
+    });
+
+    var body = el('div', 'conv-ft__body');
+    body.id = 'conv-ft-body';
+    wrap.append(body);
+    renderFollowThroughContent(body, id);
+    return wrap;
+  }
+
+  function renderFollowThroughContent(container, id) {
+    container.replaceChildren();
+    var ft = state.followThrough[id];
+    if (!ft) {
+      container.append(el('p', 'conv-ft__empty', 'Loading follow-through facts…'));
+      return;
+    }
+    if (ft.error) {
+      container.append(el('p', 'conv-ft__empty', ft.error));
+      return;
+    }
+    if (!ft.links || ft.links.length === 0) {
+      container.append(el('p', 'conv-ft__empty', 'No linked tasks or jobs attached to this conversation.'));
+      return;
+    }
+
+    var list = el('div', 'conv-ft-list');
+    for (var i = 0; i < ft.links.length; i++) {
+      list.append(linkCardNode(id, ft.links[i]));
+    }
+    container.append(list);
+  }
+
+  function linkCardNode(convId, item) {
+    var card = el('div', 'conv-ft-item');
+
+    var top = el('div', 'conv-ft-item__top');
+    var kindName = item.kind === 'intake_task' ? 'Intake Task' : (item.kind === 'routing_job' ? 'Routing Job' : item.kind);
+    top.append(el('span', 'dk-badge', kindName));
+    top.append(el('span', 'conv-ft-item__ref', item.ref));
+
+    if (!item.target || !item.target.available) {
+      top.append(el('span', 'dk-badge dk-badge--warning', 'Opaque ACL / unavailable'));
+    } else {
+      top.append(el('span', 'dk-badge dk-badge--info', item.target.canonical_status || 'available'));
+    }
+
+    var summary = (item.follow_through && item.follow_through.summary) || item.summary || {};
+    if (summary.complete) {
+      top.append(el('span', 'dk-badge dk-badge--success', 'Complete'));
+    } else if (summary.blocked) {
+      top.append(el('span', 'dk-badge dk-badge--danger', 'Blocked'));
+    } else if (item.overdue_obligation || (item.follow_through && item.follow_through.overdue_obligation)) {
+      top.append(el('span', 'dk-badge dk-badge--warning', 'Overdue obligation'));
+    } else if (summary.ready) {
+      top.append(el('span', 'dk-badge dk-badge--info', 'Ready'));
+    } else {
+      top.append(el('span', 'dk-badge', 'In progress'));
+    }
+
+    if (item.id) {
+      var actBox = el('div', 'conv-ft-item__actions');
+      var removeBtn = el('button', 'dk-button dk-button--sm dk-button--secondary', 'Remove');
+      removeBtn.type = 'button';
+      removeBtn.addEventListener('click', async function () {
+        removeBtn.disabled = true;
+        try {
+          await api(CONV_API.link(convId, item.id), { method: 'DELETE' });
+          if (state.followThrough[convId]) delete state.followThrough[convId];
+          loadFollowThrough(convId);
+        } catch (err) {
+          announce(err && err.message ? err.message : 'Failed to remove link');
+          removeBtn.disabled = false;
+        }
+      });
+      actBox.append(removeBtn);
+      top.append(actBox);
+    }
+    card.append(top);
+
+    var facts = (item.follow_through && item.follow_through.facts) || item.facts;
+    if (facts) {
+      var grid = el('div', 'conv-ft-grid');
+
+      grid.append(factItemNode('Owner Acceptance', facts.owner_acceptance, function (f) {
+        return f.state === 'known' ? 'Accepted' : (f.state === 'refused' ? 'Refused' : 'Unknown');
+      }));
+
+      grid.append(factItemNode('First Action', facts.first_action, function (f) {
+        return f.state === 'known' ? 'Recorded' : 'Pending';
+      }));
+
+      grid.append(factItemNode('Due Obligations', facts.due_obligation, function (f) {
+        if (f.state === 'overdue') return 'Overdue';
+        if (f.state === 'open') return 'Open';
+        if (f.state === 'answered' || f.state === 'proceeded') return 'Answered';
+        return f.state || 'None';
+      }));
+
+      grid.append(factItemNode('Independent Review', facts.independent_review, function (f) {
+        if (f.state === 'known') return 'Approved';
+        if (f.state === 'refused') return 'Changes Requested';
+        return 'Pending';
+      }));
+
+      grid.append(factItemNode('Accepted Outcome', facts.accepted_outcome, function (f) {
+        if (f.state === 'known') return 'Accepted';
+        if (f.state === 'refused') return 'Rejected';
+        return 'Pending';
+      }));
+
+      grid.append(factItemNode('Human Delivery', facts.human_delivery, function (f) {
+        return f.state === 'known' ? 'Delivered' : 'Pending';
+      }));
+
+      card.append(grid);
+    }
+
+    return card;
+  }
+
+  function factItemNode(title, fact, labelFn) {
+    var node = el('div', 'conv-ft-fact');
+    node.append(el('div', 'conv-ft-fact__title', title));
+
+    if (!fact) {
+      node.append(el('span', 'dk-badge', 'Unknown'));
+      return node;
+    }
+
+    var stateName = fact.state || 'unknown';
+    var variant = '';
+    if (stateName === 'known' || stateName === 'answered' || stateName === 'proceeded') variant = 'success';
+    else if (stateName === 'open' || stateName === 'overdue-reconciled') variant = 'warning';
+    else if (stateName === 'refused' || stateName === 'overdue') variant = 'danger';
+
+    var label = labelFn ? labelFn(fact) : stateName;
+    node.append(el('span', 'dk-badge' + (variant ? ' dk-badge--' + variant : ''), label));
+
+    if (fact.source_identity) {
+      node.append(el('span', 'conv-ft-fact__source', fact.source_identity));
+    }
+    if (fact.authority && fact.authority !== 'none') {
+      node.append(el('span', 'conv-ft-fact__detail', fact.authority));
+    }
+    if (fact.observation) {
+      if (fact.observation.source_sha) {
+        node.append(el('span', 'conv-ft-fact__detail', 'SHA: ' + String(fact.observation.source_sha).slice(0, 8)));
+      } else if (fact.observation.outcome_ref) {
+        node.append(el('span', 'conv-ft-fact__detail', String(fact.observation.outcome_ref).slice(0, 16)));
+      } else if (fact.observation.first_action_at) {
+        node.append(el('span', 'conv-ft-fact__detail', String(fact.observation.first_action_at).slice(11, 19)));
+      }
+    }
+    return node;
   }
 
   function threadNode(id) {

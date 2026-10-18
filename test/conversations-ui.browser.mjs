@@ -122,6 +122,7 @@ function resetFixtures() {
     failNextSends: 0,
     nextMessageSeq: { c1: 3, 'c-new': 1 },
     messageStore: { c1: C1_MESSAGES.slice(), c2: c2History(), 'c-empty': [], 'c-new': [] },
+    followThroughStore: {},
     idempotent: {}       // conversationId -> key -> message (replay)
   };
   sendLog = []; createLog = []; readLog = []; messagesLog = []; apiRequestCount = 0;
@@ -328,6 +329,62 @@ async function mockApi(route) {
     const detail = detailsPayload()[conversationId];
     if (!detail) return notFound(route, path);
     return route.fulfill({ json: detail });
+  }
+
+  const followThroughMatch = path.match(/^\/api\/conversations\/([^/]+)\/follow-through$/);
+  if (followThroughMatch && method === 'GET') {
+    const conversationId = followThroughMatch[1];
+    if (state.denied.has(conversationId)) return json(route, 403, { error: 'forbidden', reason: 'not_a_member' });
+    const links = state.followThroughStore[conversationId] || [];
+    return route.fulfill({ json: { conversation_id: conversationId, links, follow_through: links } });
+  }
+
+  const linksMatch = path.match(/^\/api\/conversations\/([^/]+)\/links$/);
+  if (linksMatch) {
+    const conversationId = linksMatch[1];
+    if (state.denied.has(conversationId)) return json(route, 403, { error: 'forbidden', reason: 'not_a_member' });
+    if (method === 'GET') {
+      const links = state.followThroughStore[conversationId] || [];
+      return route.fulfill({ json: { conversation_id: conversationId, links } });
+    }
+    if (method === 'POST') {
+      if (!csrfOk) return json(route, 403, { error: 'csrf_invalid' });
+      const payload = postBody();
+      if (!payload || !payload.kind || !payload.ref) return json(route, 400, { error: 'malformed_json' });
+      const newLink = {
+        id: 'link-' + Date.now(),
+        conversation_id: conversationId,
+        kind: payload.kind,
+        ref: payload.ref,
+        target: { available: true, canonical_status: 'open', terminal: false, complete: false },
+        follow_through: {
+          facts: {
+            owner_acceptance: { state: 'known', source_identity: SELF, authority: 'canonical_owner_acceptance' },
+            first_action: { state: 'known', source_identity: 'host-a', authority: 'canonical_job_first_action' },
+            due_obligation: { state: 'open', source_identity: null, authority: 'canonical_ask_ledger' },
+            independent_review: { state: 'unknown', source_identity: null, authority: 'none' },
+            accepted_outcome: { state: 'unknown', source_identity: null, authority: 'none' },
+            human_delivery: { state: 'unknown', source_identity: null, authority: 'none' }
+          },
+          summary: { ready: true, complete: false, blocked: false }
+        }
+      };
+      if (!state.followThroughStore[conversationId]) state.followThroughStore[conversationId] = [];
+      state.followThroughStore[conversationId].push(newLink);
+      return json(route, 201, newLink);
+    }
+  }
+
+  const linkItemMatch = path.match(/^\/api\/conversations\/([^/]+)\/links\/([^/]+)$/);
+  if (linkItemMatch && method === 'DELETE') {
+    const conversationId = linkItemMatch[1];
+    const linkId = linkItemMatch[2];
+    if (state.denied.has(conversationId)) return json(route, 403, { error: 'forbidden', reason: 'not_a_member' });
+    if (!csrfOk) return json(route, 403, { error: 'csrf_invalid' });
+    if (state.followThroughStore[conversationId]) {
+      state.followThroughStore[conversationId] = state.followThroughStore[conversationId].filter(l => l.id !== linkId);
+    }
+    return json(route, 200, { ok: true, removed: linkId });
   }
 
   return notFound(route, path);
@@ -969,6 +1026,42 @@ async function runSuite(page) {
       assert.equal(box.width, 16); assert.equal(box.height, 16);
       expectNoPageErrors();
     }
+  });
+
+  await test('follow-through renders linked task authority facts and attaches new links', async () => {
+    await freshPage();
+    state.followThroughStore = {
+      c2: [
+        {
+          id: 'link-c2-1',
+          conversation_id: 'c2',
+          kind: 'intake_task',
+          ref: 'task-1234-uuid',
+          target: { available: true, canonical_status: 'in_progress', terminal: false, complete: false },
+          follow_through: {
+            facts: {
+              owner_acceptance: { state: 'known', source_identity: SELF, authority: 'canonical_owner_acceptance' },
+              first_action: { state: 'known', source_identity: 'host-a', authority: 'canonical_job_first_action' },
+              due_obligation: { state: 'open', source_identity: null, authority: 'canonical_ask_ledger' },
+              independent_review: { state: 'known', source_identity: 'projA:reviewer-1', authority: 'canonical_independent_review', observation: { source_sha: 'a'.repeat(40) } },
+              accepted_outcome: { state: 'unknown', source_identity: null, authority: 'none' },
+              human_delivery: { state: 'unknown', source_identity: null, authority: 'none' }
+            },
+            summary: { ready: true, complete: false, blocked: false }
+          }
+        }
+      ]
+    };
+    await page.goto(base + '/conversations.html?conversation=c2');
+    await page.waitForSelector('.conv-ft-item');
+    assert.equal(await page.locator('.conv-ft__title').textContent(), 'Follow-through & Linked Tasks');
+    assert.equal(await page.locator('.conv-ft-item').count(), 1);
+    assert.equal(await page.locator('.conv-ft-item__ref').textContent(), 'task-1234-uuid');
+    const gridText = await page.locator('.conv-ft-grid').textContent();
+    assert.ok(gridText.includes('Owner Acceptance'));
+    assert.ok(gridText.includes('Accepted'));
+    assert.ok(gridText.includes('Recorded'));
+    expectNoPageErrors();
   });
 
   await test('screenshots: four theme/viewport screens plus scenario states', async () => {

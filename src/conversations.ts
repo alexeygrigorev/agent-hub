@@ -232,11 +232,13 @@ export interface VerifiedConversationPrincipal {
   actor: string;
   kind: 'human' | 'agent';
   authType: 'session' | 'bearer';
+  isAdmin?: boolean;
   scopes: string[];
   csrfVerified: boolean;
   displayName?: string;
   sessionSub?: string;
   tokenId?: string;
+  tokenHash?: string;
   nativeBinding?: NativeAgentBinding | null;
 }
 
@@ -661,9 +663,9 @@ export async function authenticateConversationRequest(
         actor: humanActor,
         kind: 'human',
         isAdmin: true,
-        scopes: ['bus:read', 'bus:send'],
+        scopes: ['admin', 'bus:read', 'bus:send'],
       },
-      scopes: ['bus:read', 'bus:send'],
+      scopes: ['admin', 'bus:read', 'bus:send'],
       authType: 'session',
       csrfVerified,
       env,
@@ -1668,7 +1670,8 @@ export class ConversationsService {
         actor: humanActor,
         kind: 'human',
         authType: 'session',
-        scopes: ['bus:read', 'bus:send'],
+        isAdmin: true,
+        scopes: ['admin', 'bus:read', 'bus:send'],
         csrfVerified,
         displayName: session.email || humanActor,
         sessionSub: session.sub,
@@ -1710,8 +1713,8 @@ export class ConversationsService {
     }
 
     // Revalidate live bearer credential state from SQLite whenever tokenId or tokenHash is bound
+    let liveCred: any = null;
     if (tokenId || tokenHash) {
-      let liveCred: any = null;
       try {
         if (tokenId && tokenHash) {
           liveCred = this.sql
@@ -1784,10 +1787,12 @@ export class ConversationsService {
           actor: verifiedHuman.actor,
           kind: 'human',
           authType: 'bearer',
+          isAdmin: true,
           scopes: humanScopes,
           csrfVerified: false,
           displayName: verifiedHuman.email || verifiedHuman.actor,
           tokenId: String(liveCred.id),
+          tokenHash: liveCred.token_hash ?? tokenHash,
           nativeBinding: null,
         };
       }
@@ -1953,6 +1958,7 @@ export class ConversationsService {
       csrfVerified: true,
       displayName: validatedAgent.display_name,
       tokenId,
+      tokenHash: liveCred?.token_hash ?? tokenHash,
       nativeBinding: validatedAgent.native_binding ?? null,
     };
   }
@@ -3075,13 +3081,35 @@ export class ConversationsService {
         ...[query.checkName, query.actor, ...(query.conversationId ? [query.conversationId] : [])]).toArray() as any[];
       if (!grants.length || grants.length > 50) throw new ConversationDomainError('automation_grant_unavailable', 403);
       let overdue = 0;
+      let overdueObligations = 0;
       for (const grant of grants) {
         this.validateAutomationGrant(grant);
-        overdue += Number(this.sql.exec(`SELECT COUNT(*) AS n FROM conversation_messages msg JOIN conversation_members m ON m.conversation_id = msg.conversation_id AND m.actor = ?
+        const msgOverdue = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM conversation_messages msg JOIN conversation_members m ON m.conversation_id = msg.conversation_id AND m.actor = ?
           WHERE msg.conversation_id = ? AND msg.seq > m.last_read_seq AND msg.sender_actor != ? AND msg.created_at < ?`,
           query.actor, grant.conversation_id, query.actor, new Date(this.now() - query.maxAgeS * 1000).toISOString()).toArray()[0].n);
+        overdue += msgOverdue;
+        if (this.linksHandler?.followThrough) {
+          try {
+            const obCount = this.linksHandler.followThrough.countOverdueObligationsForConversation(
+              grant.conversation_id,
+              this.now(),
+              grant.target_actor,
+              grant.target_credential_id,
+            );
+            overdueObligations += obCount;
+            overdue += obCount;
+          } catch (err: any) {
+            if (err?.message === 'target_authority_unavailable') {
+              return { status: 'error', detail: 'target_authority_unavailable' };
+            }
+            throw err;
+          }
+        }
       }
-      return { status: overdue ? 'fail' : 'pass', detail: `${overdue} overdue retained unread message(s) in ${grants.length} authorized conversation(s)` };
+      const detail = overdueObligations > 0
+        ? `${overdue} overdue backlog item(s) (${overdueObligations} obligation(s)) in ${grants.length} authorized conversation(s)`
+        : `${overdue} overdue retained unread message(s) in ${grants.length} authorized conversation(s)`;
+      return { status: overdue ? 'fail' : 'pass', detail };
     });
   }
 
@@ -4047,6 +4075,35 @@ export class ConversationsService {
             return jsonResponse({ error: 'unknown_fields', field: k }, 400);
           }
           return jsonResponse(this.linksHandler.remove(auth, convId, linkId));
+        }
+        return jsonResponse({ error: 'method_not_allowed' }, 405);
+      }
+
+      const followThroughMatch =
+        /^\/api\/conversations\/([^/]+)\/follow-through$/.exec(path);
+      if (followThroughMatch) {
+        const convId = decodeURIComponent(followThroughMatch[1]);
+        if (!this.linksHandler) {
+          return jsonResponse({ error: 'not_found' }, 404);
+        }
+        if (method === 'GET') {
+          return jsonResponse(this.linksHandler.getFollowThrough(auth, convId));
+        }
+        return jsonResponse({ error: 'method_not_allowed' }, 405);
+      }
+
+      const linkFollowThroughMatch =
+        /^\/api\/conversations\/([^/]+)\/links\/([^/]+)\/follow-through$/.exec(path);
+      if (linkFollowThroughMatch) {
+        const convId = decodeURIComponent(linkFollowThroughMatch[1]);
+        const linkId = decodeURIComponent(linkFollowThroughMatch[2]);
+        if (!this.linksHandler) {
+          return jsonResponse({ error: 'not_found' }, 404);
+        }
+        if (method === 'GET') {
+          return jsonResponse(
+            this.linksHandler.getFollowThrough(auth, convId, linkId),
+          );
         }
         return jsonResponse({ error: 'method_not_allowed' }, 405);
       }

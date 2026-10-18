@@ -73,3 +73,47 @@ export function deviceReview(pairing: any, email: string, address: {project:stri
   <p class="dk-callout dk-callout--warning">${pairing.client_kind === 'host' ? 'This host can report machine activity and receive host work within the selected permissions.' : 'This agent can act as the identity shown above within the selected permissions.'} Access lasts up to 30 days, or until revoked.</p>
   <p id="device-error" class="dk-callout" role="alert" hidden></p><div class="dk-auth-card__actions"><button class="dk-button dk-button--secondary dk-button--lg" type="button" id="device-deny">Deny</button><button class="dk-button dk-button--primary dk-button--lg" type="submit" id="device-approve">Approve</button></div><a id="device-reload" href="/device?code=${e(pairing.user_code)}" hidden>Reload the request</a></form></div><div id="device-live" class="dk-visually-hidden" aria-live="polite"></div>`, email, "Didn't start this? Deny it. Nothing is shared.", "/device?code="+pairing.user_code);
 }
+
+export function conversationFollowThroughView(followThrough: any): string {
+  const e = escapeHtml;
+  if (!followThrough || !followThrough.facts) return '';
+  const facts = followThrough.facts;
+  const overdue = !!followThrough.overdue_obligation;
+  const factKeys = [
+    ['Owner Acceptance', facts.owner_acceptance],
+    ['First Action', facts.first_action],
+    ['Due Obligation', facts.due_obligation],
+    ['Independent Review', facts.independent_review],
+    ['Accepted Outcome', facts.accepted_outcome],
+    ['Human Delivery', facts.human_delivery],
+  ] as const;
+
+  const factRows = factKeys.map(([label, fact]) => {
+    if (!fact) return '';
+    const state = fact.state || 'unknown';
+    const stateBadgeClass =
+      state === 'known' ? 'dk-badge--success' :
+      state === 'refused' ? 'dk-badge--danger' :
+      'dk-badge--warning';
+    const authority = fact.authority || 'none';
+    const sourceId = fact.source_identity || 'unknown';
+    return `<div class="dk-card" style="margin-bottom:0.5rem;padding:0.75rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <strong>${e(label)}</strong>
+        <span class="dk-badge ${stateBadgeClass}">${e(state)}</span>
+      </div>
+      <div class="dk-hint" style="margin-top:0.25rem;">
+        Authority: <code>${e(authority)}</code> | Source: <span class="dk-mono">${e(sourceId)}</span>
+      </div>
+      ${fact.observation ? `<pre class="dk-mono" style="margin-top:0.25rem;font-size:0.75rem;">${e(JSON.stringify(fact.observation, null, 2))}</pre>` : ''}
+    </div>`;
+  }).join('');
+
+  return `<div class="dk-stack" style="margin-top:1rem;">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <h3 style="margin:0;">Follow-Through Authority Facts</h3>
+      ${overdue ? '<span class="dk-badge dk-badge--danger">Overdue Obligation</span>' : ''}
+    </div>
+    <div class="dk-stack">${factRows}</div>
+  </div>`;
+}

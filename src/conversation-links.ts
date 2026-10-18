@@ -1,4 +1,6 @@
-import { generateUlid, type SqlStorage } from './bus';
+import { generateUlid, type SqlStorage, type CallerContext } from './bus';
+import { IntakeService } from './intake';
+import { ConversationFollowThroughService } from './conversation-followthrough';
 import {
   ConversationDomainError,
   ConversationsService,
@@ -31,6 +33,7 @@ export const LINK_KINDS = [
   'fleet_launch',
   'review',
   'outcome',
+  'intake_task',
 ] as const;
 export type ConversationLinkKind = (typeof LINK_KINDS)[number];
 
@@ -66,8 +69,17 @@ function isLinkKind(value: unknown): value is ConversationLinkKind {
   );
 }
 
-function requireUuid(ref: unknown): string {
-  if (typeof ref !== 'string' || !UUID_RE.test(ref)) {
+function requireRef(kind: ConversationLinkKind, ref: unknown): string {
+  if (typeof ref !== 'string') {
+    throw new ConversationDomainError('invalid_ref', 400);
+  }
+  if (kind === 'intake_task') {
+    if (!UUID_RE.test(ref) && !SAFE_KEY_RE.test(ref)) {
+      throw new ConversationDomainError('invalid_ref', 400);
+    }
+    return ref;
+  }
+  if (!UUID_RE.test(ref)) {
     throw new ConversationDomainError('invalid_ref', 400);
   }
   return ref;
@@ -116,7 +128,9 @@ function jobStatusView(
   status: string,
   kind: ConversationLinkKind,
 ): ConversationLinkTargetView {
-  const terminal = JOB_TERMINAL.has(status) && (kind !== 'review' || status !== 'done');
+  const terminal =
+    ['accepted', 'failed', 'cancelled'].includes(status) ||
+    (status === 'done' && kind !== 'review');
   return {
     available: true,
     canonical_status: JOB_KNOWN.has(status) ? status : null,
@@ -137,6 +151,18 @@ function launchStatusView(
   };
 }
 
+function intakeTaskStatusView(task: any): ConversationLinkTargetView {
+  const status = String(task.status ?? 'open');
+  const terminal = status === 'done' || status === 'cancelled';
+  const complete = status === 'done';
+  return {
+    available: true,
+    canonical_status: status,
+    terminal,
+    complete,
+  };
+}
+
 /**
  * Join-table service for M4 conversation ↔ canonical job/launch references.
  * Owns `conversation_links`. Inspects `routing_jobs` / `fleet_launches` read-only.
@@ -147,6 +173,7 @@ export class ConversationLinksService {
   private readonly conversations: ConversationsService;
   private readonly now: () => number;
   public limits: ConversationLinkLimits;
+  public readonly followThrough: ConversationFollowThroughService;
 
   constructor(
     sql: SqlStorage,
@@ -167,6 +194,11 @@ export class ConversationLinksService {
         DEFAULT_MAX_LINKS_PER_CONVERSATION,
       maxTotalLinks: options?.limits?.maxTotalLinks ?? DEFAULT_MAX_TOTAL_LINKS,
     };
+    this.followThrough = new ConversationFollowThroughService(
+      this.sql,
+      this.now,
+      (sql: any) => new IntakeService(sql),
+    );
   }
 
   public init(): void {
@@ -193,7 +225,7 @@ export class ConversationLinksService {
         throw new ConversationDomainError('invalid_kind', 400);
       }
       const kind = input.kind;
-      const ref = requireUuid(input.ref);
+      const ref = requireRef(kind, input.ref);
       let idempotencyKey: string | null = null;
       if (input.idempotencyKey !== undefined && input.idempotencyKey !== null) {
         if (
@@ -398,7 +430,7 @@ export class ConversationLinksService {
       throw new ConversationDomainError('invalid_kind', 400);
     }
     const kind = options.kind;
-    const ref = requireUuid(options.ref);
+    const ref = requireRef(kind, options.ref);
     const limit = parseLimit(options.limit);
     const cursor = parseCursor(options.cursor ?? null);
 
@@ -644,6 +676,44 @@ export class ConversationLinksService {
     return status;
   }
 
+  private readIntakeTask(id: string): any | null {
+    try {
+      const row: any = this.sql
+        .exec('SELECT data FROM intake_tasks WHERE id = ?', id)
+        .toArray()[0];
+      return row?.data ? JSON.parse(row.data) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private canInspectIntakeTask(
+    principal: VerifiedConversationPrincipal,
+    task: any,
+  ): boolean {
+    if (!task) return false;
+    const intake = new IntakeService(this.sql as any);
+    const isAdmin = Boolean(
+      principal.isAdmin ||
+      (principal.kind === 'human' && (principal.scopes.includes('admin') || principal.authType === 'session')),
+    );
+    const scopes = isAdmin && !principal.scopes.includes('admin') ? [...principal.scopes, 'admin'] : principal.scopes;
+    const caller: CallerContext = {
+      actor: principal.actor,
+      kind: principal.kind,
+      isAdmin,
+      scopes,
+      tokenId: principal.tokenId,
+      tokenHash: principal.tokenHash,
+    };
+    try {
+      const p = intake.resolvePrincipal({ caller, scopes });
+      return intake.isTaskAllowed(p, task, false);
+    } catch {
+      return false;
+    }
+  }
+
   private inspectTarget(
     kind: ConversationLinkKind,
     ref: string,
@@ -655,6 +725,13 @@ export class ConversationLinksService {
         return { row: null, view: targetUnavailable() };
       }
       return { row: launch, view: launchStatusView(String(launch.state)) };
+    }
+    if (kind === 'intake_task') {
+      const task = this.readIntakeTask(ref);
+      if (!task || !this.canInspectIntakeTask(principal, task)) {
+        return { row: null, view: targetUnavailable() };
+      }
+      return { row: task, view: intakeTaskStatusView(task) };
     }
     const job = this.readJob(ref);
     if (!job || !this.canInspectJob(principal, job)) {
@@ -671,6 +748,11 @@ export class ConversationLinksService {
     const kind = row.kind as ConversationLinkKind;
     const inspected = this.inspectTarget(kind, String(row.ref), principal);
     const target = inspected.row ? inspected.view : targetUnavailable();
+    const followThrough = this.followThrough.deriveLinkFacts(
+      row,
+      inspected.row,
+      principal,
+    );
     return {
       id: row.id,
       conversation_id: row.conversation_id,
@@ -680,6 +762,58 @@ export class ConversationLinksService {
       created_by: row.created_by,
       replay,
       target,
+      follow_through: followThrough,
     };
+  }
+
+  public getFollowThrough(
+    auth: ConversationAuthInput,
+    conversationId: string,
+    linkId?: string,
+  ): Record<string, unknown> {
+    return this.txSync(() => {
+      const principal = this.conversations.verifyPrincipal(auth, {
+        requireReadScope: true,
+      });
+      this.conversations.assertActiveMember(conversationId, principal);
+      if (linkId) {
+        this.requireLinkId(linkId);
+        const row = this.sql
+          .exec(
+            'SELECT * FROM conversation_links WHERE id = ? AND conversation_id = ?',
+            linkId,
+            conversationId,
+          )
+          .toArray()[0] as any;
+        if (!row) throw new ConversationDomainError('not_found', 404);
+        const inspected = this.inspectTarget(row.kind, String(row.ref), principal);
+        if (!inspected.row) {
+          throw new ConversationDomainError('not_found', 404);
+        }
+        return this.followThrough.deriveLinkFacts(row, inspected.row, principal) as any;
+      }
+
+      const rows = this.sql
+        .exec(
+          'SELECT * FROM conversation_links WHERE conversation_id = ? ORDER BY created_at DESC',
+          conversationId,
+        )
+        .toArray() as any[];
+
+      const items = rows
+        .map(row => {
+          const inspected = this.inspectTarget(row.kind, String(row.ref), principal);
+          return inspected.row
+            ? this.followThrough.deriveLinkFacts(row, inspected.row, principal)
+            : null;
+        })
+        .filter(Boolean);
+
+      return {
+        conversation_id: conversationId,
+        links: items,
+        follow_through: items,
+      };
+    });
   }
 }
