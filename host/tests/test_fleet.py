@@ -667,8 +667,11 @@ class FleetTests(unittest.TestCase):
     @unittest.skipUnless(os.path.isdir("/home/alexey/git/agent-quota-launcher/launcher"), "agent-quota-launcher checkout not available")
     def test_isolated_launcher_store_and_reconcile_contract_with_result_path(self):
         import sys
-        if "/home/alexey/git/agent-quota-launcher" not in sys.path:
-            sys.path.insert(0, "/home/alexey/git/agent-quota-launcher")
+        launcher_repo = Path("/home/alexey/git/agent-quota-launcher")
+        if not (launcher_repo / "launcher" / "store.py").is_file():
+            self.skipTest("Optional Launcher checkout is unavailable")
+        if str(launcher_repo) not in sys.path:
+            sys.path.insert(0, str(launcher_repo))
         from launcher.store import Store
         from launcher.cli import _result_evidence, reconcile, accept
         import argparse
