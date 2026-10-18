@@ -8,7 +8,7 @@ import json
 import re
 import urllib.parse
 
-ALLOWED_PROVIDERS = ("codex", "claude", "gemini", "grok", "zai", "go", "copilot")
+ALLOWED_PROVIDERS = ("codex", "codex-orin", "claude", "gemini", "grok", "zai", "go", "copilot")
 LABEL_REGEX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 HOST_ID_REGEX = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 

@@ -17,9 +17,9 @@ CREATE TABLE IF NOT EXISTS fleet_launches (id TEXT PRIMARY KEY, actor TEXT NOT N
 `;
 type Auth = { caller?: AdmissionCaller; scopes?: string[]; error?: Response };
 const LABEL = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
-const PROVIDERS = new Set(['codex', 'claude', 'grok', 'gemini', 'zai', 'go', 'copilot']);
+const PROVIDERS = new Set(['codex', 'codex-orin', 'claude', 'grok', 'gemini', 'zai', 'go', 'copilot']);
 const ACTIVE = "('offered','starting','running','uncertain')";
-const HEADROOM: Record<string, number> = { codex: 15, grok: 5 };
+const HEADROOM: Record<string, number> = { codex: 15, 'codex-orin': 15, grok: 5 };
 /** Engines whose providers the canonical model policy disables. New grok sessions hold here. */
 function disabledEngines(): Set<string> {
   const rules = ((policy as any).rules || {}) as any;
@@ -155,16 +155,19 @@ export class FleetService {
     if (subscription) {
       if (subscription.service !== account.provider || !fresh(subscription.observed_at, this.now(), 1200000)) return null;
       const quota = parsed(subscription.quota_json);
-      return fresh(quota.observed_at, this.now(), 1200000) ? { quota, subscriptionObservedAt: subscription.observed_at } : null;
+      const quotaObs = quota?.observed_at || subscription.observed_at;
+      return fresh(quotaObs, this.now(), 1200000) ? { quota: quota?.observed_at ? quota : { ...quota, observed_at: quotaObs }, subscriptionObservedAt: subscription.observed_at } : null;
     }
     // A default CLI reading cannot describe a named profile or two accounts on one service.
-    if (route.profile !== null) return null;
+    if (route.profile !== null && route.profile !== account.provider) return null;
     const count = Number(this.sql.exec('SELECT COUNT(DISTINCT r.account) AS n FROM fleet_routes r JOIN fleet_accounts a ON r.account = a.label WHERE r.machine_id = ? AND a.provider = ?', route.machine_id, account.provider).one().n);
     const snapshot: any = this.sql.exec('SELECT * FROM host_quota_snapshots WHERE host_id = ?', route.machine_id).toArray()[0];
     if (count !== 1 || !snapshot || !fresh(snapshot.captured_at, this.now(), 1200000)) return null;
     const quota = parsed(snapshot.routes_json)[account.provider];
-    if (!quota || !fresh(quota.observed_at, this.now(), 1200000)) return null;
-    return { quota: snapshot.status === 'ok' ? quota : { ...quota, status: 'unknown' }, subscriptionObservedAt: snapshot.captured_at };
+    const obsTs = quota?.observed_at || snapshot.captured_at;
+    if (!quota || !fresh(obsTs, this.now(), 1200000)) return null;
+    const quotaWithTs = quota.observed_at ? quota : { ...quota, observed_at: obsTs };
+    return { quota: snapshot.status === 'ok' ? quotaWithTs : { ...quotaWithTs, status: 'unknown' }, subscriptionObservedAt: snapshot.captured_at };
   }
 
   private observation(account: any, route: any) {

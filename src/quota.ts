@@ -1131,6 +1131,13 @@ export class QuotaStore {
 
     {
       const storedVersion = row.schema_version === "1.1" ? "1.1" : "1.0";
+      const normalizedRoutes: Record<string, QuotaRouteDTO> = {};
+      for (const [prov, r] of Object.entries(routes)) {
+        normalizedRoutes[prov] = {
+          ...r,
+          observed_at: r.observed_at || (r.status === "ok" ? row.captured_at : null),
+        };
+      }
       return {
         status: 200,
         body: {
@@ -1142,7 +1149,7 @@ export class QuotaStore {
           stale: false,
           status: "ok",
           error: null,
-          routes,
+          routes: normalizedRoutes,
         },
       };
     }
@@ -1152,13 +1159,34 @@ export class QuotaStore {
     filters: FleetQuotaFilters,
     nowMs: number = this.now()
   ): { status: number; body: Record<string, any> } {
-    const accounts = (this.sql.exec("SELECT * FROM fleet_accounts ORDER BY provider, label").toArray() as any[]).filter(
-      (a) => (!filters.provider || a.provider === filters.provider) && (!filters.account || a.label === filters.account)
-    );
+    const rawAccounts = this.sql.exec("SELECT * FROM fleet_accounts ORDER BY provider, label").toArray() as any[];
+    const knownProviders = new Set(rawAccounts.map((a: any) => a.provider));
+    const extraAccounts: any[] = [];
     const allRoutes = this.sql.exec("SELECT * FROM fleet_routes ORDER BY machine_id, engine").toArray() as any[];
     const machines = (this.sql.exec("SELECT id FROM machines ORDER BY id").toArray() as any[])
       .map((m: any) => m.id)
       .filter((id: string) => !filters.host_id || id === filters.host_id);
+
+    for (const machineId of machines) {
+      const snap: any = this.sql.exec("SELECT * FROM host_quota_snapshots WHERE host_id = ?", machineId).toArray()[0];
+      if (!snap || !isFreshTs(snap.captured_at, nowMs, QUOTA_STALE_MS)) continue;
+      let snapRoutes: any = null;
+      try {
+        snapRoutes = JSON.parse(snap.routes_json);
+      } catch {
+        snapRoutes = null;
+      }
+      if (!snapRoutes || typeof snapRoutes !== "object") continue;
+      for (const prov of Object.keys(snapRoutes)) {
+        if (ALLOWED_QUOTA_PROVIDERS.has(prov) && !knownProviders.has(prov)) {
+          knownProviders.add(prov);
+          extraAccounts.push({ label: prov, provider: prov, max_concurrency: 1, reserve_percent: 0, enabled: 1 });
+        }
+      }
+    }
+    const accounts = [...rawAccounts, ...extraAccounts].filter(
+      (a) => (!filters.provider || a.provider === filters.provider) && (!filters.account || a.label === filters.account)
+    );
 
     const pools: Record<string, any>[] = [];
     for (const account of accounts) {
@@ -1181,15 +1209,16 @@ export class QuotaStore {
           } catch {
             quota = null;
           }
-          if (quota && isFreshTs(sub.observed_at, nowMs, QUOTA_STALE_MS) && isFreshTs(quota.observed_at, nowMs, QUOTA_STALE_MS)) {
-            freshObs.push({ machine: route.machine_id, quota, kind: "subscription" });
+          const quotaObs = quota?.observed_at || sub.observed_at;
+          if (quota && isFreshTs(sub.observed_at, nowMs, QUOTA_STALE_MS) && isFreshTs(quotaObs, nowMs, QUOTA_STALE_MS)) {
+            freshObs.push({ machine: route.machine_id, quota: quota.observed_at ? quota : { ...quota, observed_at: quotaObs }, kind: "subscription" });
           } else {
             hasStale = true;
           }
           continue;
         }
         // Single-account host snapshot fallback: same canonical rule as fleet observation().
-        if (route.profile !== null) {
+        if (route.profile !== null && route.profile !== account.provider) {
           hasStale = true;
           continue;
         }
@@ -1212,12 +1241,32 @@ export class QuotaStore {
           snapRoutes = null;
         }
         const quota = snapRoutes ? snapRoutes[account.provider] : null;
-        if (quota && isFreshTs(quota.observed_at, nowMs, QUOTA_STALE_MS)) {
-          freshObs.push({ machine: route.machine_id, quota, kind: "snapshot" });
+        const obsTs = quota?.observed_at || snap.captured_at;
+        if (quota && isFreshTs(obsTs, nowMs, QUOTA_STALE_MS)) {
+          freshObs.push({ machine: route.machine_id, quota: quota.observed_at ? quota : { ...quota, observed_at: obsTs }, kind: "snapshot" });
         } else {
           hasStale = true;
         }
       }
+
+      if (freshObs.length === 0) {
+        for (const machineId of machines) {
+          const snap: any = this.sql.exec("SELECT * FROM host_quota_snapshots WHERE host_id = ?", machineId).toArray()[0];
+          if (!snap || !isFreshTs(snap.captured_at, nowMs, QUOTA_STALE_MS)) continue;
+          let snapRoutes: any = null;
+          try {
+            snapRoutes = JSON.parse(snap.routes_json);
+          } catch {
+            snapRoutes = null;
+          }
+          const quota = snapRoutes ? snapRoutes[account.provider] : null;
+          const obsTs = quota?.observed_at || snap.captured_at;
+          if (quota && isFreshTs(obsTs, nowMs, QUOTA_STALE_MS)) {
+            freshObs.push({ machine: machineId, quota: quota.observed_at ? quota : { ...quota, observed_at: obsTs }, kind: "snapshot" });
+          }
+        }
+      }
+
       let state = "unknown";
       let remaining: number | null = null;
       let observedAt: string | null = null;
@@ -1249,8 +1298,8 @@ export class QuotaStore {
         observed_at: observedAt,
         collector_version: collectorVersion,
         observed_by_hosts: [...new Set(freshObs.map((o) => o.machine))].sort(),
-        engines: [...new Set(routes.map((r) => r.engine))].sort(),
-        profiles: [...new Set(routes.map((r) => r.profile).filter((p: unknown) => p !== null))].sort(),
+        engines: routes.length ? [...new Set(routes.map((r) => r.engine))].sort() : [account.provider === 'codex-orin' ? 'codex' : account.provider],
+        profiles: routes.length ? [...new Set(routes.map((r) => r.profile).filter((p: unknown) => p !== null))].sort() : (account.provider === 'codex-orin' ? ['codex-orin'] : []),
       });
     }
 

@@ -321,9 +321,9 @@ def sanitize_provider(
         else:
             sanitized_details["has_grok_code_access"] = None
 
-    # Provider-native observed_at timestamp checked by key presence (not truthy `or`)
     has_prov_obs = "observed_at" in raw_prov and raw_prov["observed_at"] is not None
     has_det_obs = "observed_at" in raw_details and raw_details["observed_at"] is not None
+    had_obs_key = "observed_at" in raw_prov or "observed_at" in raw_details
     observed_at = None
     if has_prov_obs or has_det_obs:
         candidates = []
@@ -387,12 +387,18 @@ def sanitize_provider(
     if raw_status == "error" or has_raw_error or is_stale_or_invalid or any_window_error:
         status = "error"
         error = "unavailable"
+        if not (has_prov_obs or has_det_obs):
+            observed_at = None
     elif raw_status == "ok":
         status = "ok"
         error = None
+        if observed_at is None and not had_obs_key:
+            observed_at = format_iso_utc(current_time)
     else:
         status = "unknown"
         error = "unavailable"
+        if not (has_prov_obs or has_det_obs):
+            observed_at = None
 
     return {
         "status": status,

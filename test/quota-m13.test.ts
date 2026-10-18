@@ -325,6 +325,25 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     const rcOk = await doFetch(new Request('http://example.com/api/quota?view=fleet', { headers: { Authorization: `Bearer ${rcToken}` } }));
     expect(rcOk.status).toBe(200);
 
+    // Verify auto-discovery of codex-orin and snapshot fallback in fleet view
+    const snapOrin = snap11(hostA.machineId, isoNow(-1000));
+    (snapOrin.routes as any)['codex-orin'] = {
+      status: 'ok',
+      error: null,
+      observed_at: null,
+      details: { limit_reached: false },
+      windows: {
+        '7d': { percent_remaining: 99.0, reset_at: isoNow(86400000), present: true, rolling: false },
+      },
+    };
+    expect((await quotaPost(hostA.accessToken, snapOrin)).status).toBe(200);
+    const fleetWithOrin = (await (await doFetch(new Request('http://example.com/api/quota?view=fleet', { headers: { Cookie: sessionCookie } }))).json()) as any;
+    const orinPool = fleetWithOrin.pools.find((p: any) => p.provider === 'codex-orin');
+    expect(orinPool).toBeDefined();
+    expect(orinPool.state).toBe('fresh');
+    expect(orinPool.remaining_percent).toBe(99.0);
+    expect(orinPool.observed_by_hosts).toContain(hostA.machineId);
+
     // Revoked credentials lose the grant.
     const stub = (defaultEnv as any).HUB.get((defaultEnv as any).HUB.idFromName('hub'));
     await runInDurableObject(stub, async (instance: Hub) => {
@@ -616,7 +635,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     // idempotently and a running launch still reports results (telemetry preserved).
     const offerId = crypto.randomUUID();
     // Byte-exact canonical bound (fleet.ts reserve: plan.request key order + access).
-    const canonicalIntent = JSON.stringify({ mode: 'headless', machine: null, engine: null, workspace: 'demo',
+    const canonicalIntent = JSON.stringify({ mode: 'headless', machine: null, engine: null, workspace: 'demo', cwd: null,
       prompt: 'm13 grok hold proof', parent_id: null, summary: 'Agent task',
       access: { mode: 'legacy_unspecified', claim_id: null, project: null, scopes: [] } });
     await runInDurableObject(stub, async (instance: Hub) => {

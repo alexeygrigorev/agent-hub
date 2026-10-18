@@ -178,6 +178,18 @@ class QuotaCliTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             quota_cli.fetch_quota(provider='openai')
 
+    def test_execute_accepts_codex_orin_provider(self):
+        calls = []
+        import agent_hub_host.bus as bus
+        real = bus._do_request
+        bus._do_request = lambda method, path: calls.append((method, path)) or {'pools': []}
+        try:
+            quota_cli.fetch_quota(provider='codex-orin')
+        finally:
+            bus._do_request = real
+        self.assertEqual(len(calls), 1)
+        self.assertIn('provider=codex-orin', calls[0][1])
+
     def test_render_text_never_zero_fills_unknown(self):
         text = quota_cli.render_text({'pools': [
             {'provider': 'codex', 'account': 'main', 'state': 'unknown',

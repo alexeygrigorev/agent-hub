@@ -482,7 +482,8 @@ class TestHostAgentQuotaIntegration(unittest.TestCase):
 
     def test_host_agent_ws_heartbeat_not_starved_and_no_reconnect_duplicate(self):
         clock = MonotonicMockClock(start_time=1000.0, start_mono=500.0)
-        with patch("agent_hub_host.config.load_config", return_value={}):
+        with patch("agent_hub_host.config.load_config", return_value={}), \
+             patch("agent_hub_host.config.load_host_config", return_value={}):
             agent = api.HostAgent(clock=clock)
             self.assertIsNone(agent.base_url)
             self.assertIsNone(agent.quota_collector.base_url)
@@ -803,6 +804,39 @@ class TestHubAbsentWindowConsistency(unittest.TestCase):
                                 self.assertEqual(out["error"], "unavailable")
                             if present is False and pct is not None:
                                 self.assertTrue(has_error)
+
+
+    def test_observed_at_defaults_to_snapshot_time_when_omitted_by_tool(self):
+        now = datetime.datetime(2026, 10, 18, 20, 0, 0, tzinfo=datetime.timezone.utc)
+        raw = {
+            "codex": {
+                "status": "ok",
+                "windows": {"7d": {"percent_remaining": 68.0, "reset_at": "2026-10-25T00:00:00Z"}},
+            },
+            "codex-orin": {
+                "status": "ok",
+                "windows": {"7d": {"percent_remaining": 99.0, "reset_at": "2026-10-25T00:00:00Z"}},
+            },
+            "go": {
+                "status": "error",
+                "error": "HTTP 401",
+                "windows": {},
+            },
+        }
+        snap = quota_snapshot.create_quota_snapshot(raw, host_id="mach-1", current_time=now)
+        codex = snap["routes"]["codex"]
+        self.assertEqual(codex["status"], "ok")
+        self.assertEqual(codex["observed_at"], "2026-10-18T20:00:00Z")
+        self.assertEqual(codex["windows"]["7d"]["percent_remaining"], 68.0)
+
+        orin = snap["routes"]["codex-orin"]
+        self.assertEqual(orin["status"], "ok")
+        self.assertEqual(orin["observed_at"], "2026-10-18T20:00:00Z")
+        self.assertEqual(orin["windows"]["7d"]["percent_remaining"], 99.0)
+
+        go = snap["routes"]["go"]
+        self.assertEqual(go["status"], "error")
+        self.assertIsNone(go["observed_at"])
 
 
 if __name__ == "__main__":

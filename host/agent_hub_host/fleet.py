@@ -16,7 +16,7 @@ from . import bus
 from .retired_native import verify_native_retirement
 
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
-SERVICES = {"codex", "claude", "grok", "gemini", "zai", "go", "copilot"}
+SERVICES = {"codex", "codex-orin", "claude", "grok", "gemini", "zai", "go", "copilot"}
 WORKSPACE_SEG = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 
 
@@ -206,17 +206,22 @@ def run_json(argv, *, payload=None, cwd=None, timeout=30):
     return value
 
 
-def quota_metadata(raw, service):
+def quota_metadata(raw, service, profile=None):
     """Reuse the maintained quota contract; never reimplement its failure/absence semantics."""
     from .quota_snapshot import sanitize_provider, format_iso_utc, COLLECTOR_VERSION_REGEX
-    route = raw.get(service, raw) if isinstance(raw, dict) else {}
+    lookup = profile if (isinstance(raw, dict) and profile and profile in raw) else service
+    route = raw.get(lookup, raw.get(service, raw)) if isinstance(raw, dict) else {}
     if not isinstance(route, dict): route = {}
     details = route.get('details') if isinstance(route.get('details'), dict) else {}
     now = dt.datetime.now(dt.timezone.utc)
     clean = sanitize_provider(service, route, now)
     status = 'ok' if clean['status'] == 'ok' else 'unknown'
     explicit_timestamp = 'observed_at' in route or 'observed_at' in details
-    observed_at = clean['observed_at'] if explicit_timestamp else format_iso_utc(now)
+    if explicit_timestamp and (route.get('observed_at') is None and details.get('observed_at') is None):
+        status = 'unknown'
+        observed_at = None
+    else:
+        observed_at = clean['observed_at'] if explicit_timestamp else format_iso_utc(now)
     if explicit_timestamp and observed_at is None: status = 'unknown'
     # Extra conservative handling of explicitly unknown freshness and optional stale flags.
     if any('stale' in obj and obj['stale'] is not False for obj in (route, details)):
@@ -285,6 +290,7 @@ def collect_subscriptions(settings, runner=run_json):
     for sub in subscriptions:
         service = sub["service"]
         raw = {}
+        profile = sub.get("profile")
         # quse itself uses existing native authentication. We never open credential files.
         command = sub.get("quota_argv") or (["quse", service, "--json"] if counts[service] == 1 and sub.get("profile") is None else None)
         if command:
@@ -310,7 +316,7 @@ def collect_subscriptions(settings, runner=run_json):
             value = details.get("subscription") if isinstance(details, dict) else None
             if value in {"free", "pro", "max", "team", "enterprise", "SuperGrok", "SuperGrokPlus", "SuperGrokHeavy"}:
                 plan = value
-        reports.append({"service": service, "account": sub["account_label"], "plan": plan, "quota": quota_metadata(raw, service)})
+        reports.append({"service": service, "account": sub["account_label"], "plan": plan, "quota": quota_metadata(raw, service, profile=profile)})
     return reports
 
 
