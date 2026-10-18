@@ -300,6 +300,7 @@ class TestRoleDispatchRecovery(unittest.TestCase):
                 "workspace": str(self.workspace.resolve()),
                 "engine": "antigravity",
                 "created_at_ms": 1792000000000,
+                "workload_pid": dummy_proc.pid,
             }
             backend = runtime_mgr.role_adapter.launcher_backend
             backend.get_task_binding = MagicMock(return_value=binding_record)
@@ -331,6 +332,7 @@ class TestRoleDispatchRecovery(unittest.TestCase):
                 "workspace": str(self.workspace.resolve()),
                 "engine": "antigravity",
                 "created_at_ms": 1792000000000,
+                "workload_pid": dummy_proc.pid,
             }
             backend = runtime_mgr.role_adapter.launcher_backend
             backend.get_task_binding = MagicMock(return_value=binding_record)
@@ -1876,6 +1878,117 @@ class TestRoleDispatchRecovery(unittest.TestCase):
         self.assertEqual(len(client.claims), 0)
         self.assertEqual(len(client.starts), 0)
         self.assertEqual(len(client.executes), 0)
+
+    def test_recovery_refuses_supervisor_pid_and_leaves_start_ack_absent(self):
+        """Recovery refuses first-action with supervisor PID; start_job is never called and start_ack_file remains absent."""
+        client = ControlledMockJobsClient()
+        runtime_mgr = RuntimeManager(role_config=self.role_cfg)
+        host_id = "host-recovery-sup"
+        job_id = "job-sup-pid-refuse-99"
+        native_sid = "88888888-8888-4888-8888-888888888899"
+        task_id = f"hub-role-writer-run-{job_id}-g1-e1"
+
+        dummy_proc = subprocess.Popen(["sleep", "60"])
+        try:
+            supervisor_pid = dummy_proc.pid
+            workload_pid = dummy_proc.pid + 1000
+
+            binding_record = {
+                "session_id": native_sid,
+                "tag": f"task-{task_id}",
+                "workspace": str(self.workspace.resolve()),
+                "engine": "antigravity",
+                "created_at_ms": 1792000000000,
+                "worker_pid": supervisor_pid,
+                "workload_pid": workload_pid,
+                "phase": "running",
+                "containment_empty": False,
+            }
+            backend = runtime_mgr.role_adapter.launcher_backend
+            backend.get_task_binding = MagicMock(return_value=binding_record)
+            backend.is_session_alive = MagicMock(return_value=(True, {"phase": "running"}))
+            backend.stop_session = MagicMock(return_value=(True, "stopped", {}))
+
+            runs_dir = self.role_cfg.runs_dir
+            run_dir = runs_dir / f"writer-run-{job_id}"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            run_dir.chmod(0o700)
+
+            # First-action evidence with supervisor PID (counterexample)
+            fa_file = run_dir / f"first-action-{job_id}.json"
+            fa_file.write_text(json.dumps({
+                "job_id": job_id,
+                "epoch": 1,
+                "role_name": f"automation:test:{job_id}",
+                "generation": 1,
+                "pid": supervisor_pid,  # supervisor PID, NOT workload PID!
+                "native_session": native_sid,
+                "stage": "first_action",
+                "utc": "2026-10-18T08:00:00Z",
+                "isolation_kind": "native_cgroup",
+            }), encoding="utf-8")
+
+            start_ack_file = run_dir / f"start-ack-{job_id}.json"
+
+            save_role_custody(
+                runs_dir=runs_dir,
+                run_dir=run_dir,
+                job_id=job_id,
+                data={
+                    "job_id": job_id,
+                    "kind": "writer-run",
+                    "role_binding": {
+                        "name": f"automation:test:{job_id}",
+                        "generation": 1,
+                        "host_id": host_id,
+                        "profile": "writer-run",
+                        "ttl_seconds": 300,
+                    },
+                    "lease_epoch": 1,
+                    "job_token": f"tok-{job_id}",
+                    "deadline_at": time.time() + 600.0,
+                    "payload": {},
+                    "base_url": "https://hub.dtcdev.click",
+                    "host_id": host_id,
+                    "task_id": task_id,
+                    "phase": "running",
+                    "claimed_at": time.time() - 30.0,
+                },
+            )
+
+            client.job_statuses[job_id] = {
+                "job": {
+                    "id": job_id,
+                    "status": "running",
+                    "lease_epoch": 1,
+                    "holder_host_id": host_id,
+                    "kind": "writer-run",
+                    "role_binding": {
+                        "name": f"automation:test:{job_id}",
+                        "generation": 1,
+                        "host_id": host_id,
+                        "profile": "writer-run",
+                        "ttl_seconds": 300,
+                    },
+                }
+            }
+
+            d = JobDispatcher(
+                base_url="https://hub.dtcdev.click",
+                host_id=host_id,
+                token_provider=lambda: "host-token-123",
+                client=client,
+                runtime_mgr=runtime_mgr,
+            )
+
+            recovered = d.recover_active_role_jobs()
+            # Recovery did NOT call start_job on server because supervisor PID was refused
+            self.assertEqual(len(client.starts), 0)
+            # start_ack_file was NEVER created
+            self.assertFalse(start_ack_file.exists())
+        finally:
+            dummy_proc.terminate()
+            dummy_proc.wait()
 
 
 if __name__ == "__main__":

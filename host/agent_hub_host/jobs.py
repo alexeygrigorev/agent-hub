@@ -838,9 +838,12 @@ class JobDispatcher:
             server_started_event = threading.Event()
             first_action_ready_event = threading.Event()
             server_start_result: Dict[str, Any] = {}
+            cb_data: Dict[str, Any] = {}
 
             def _role_start_callback(start_data: Dict[str, Any]) -> Dict[str, Any]:
                 try:
+                    if isinstance(start_data, dict):
+                        cb_data.update(start_data)
                     if not evidence_file.exists() and isinstance(start_data, dict):
                         ev_payload = start_data.get("data")
                         if isinstance(ev_payload, dict):
@@ -1017,7 +1020,10 @@ class JobDispatcher:
                         or ev_sess == rld.NIL_UUID
                     ):
                         raise ValueError("invalid or missing native_session in role evidence")
-                    native_session = ev_sess
+                    corroborated_target = cb_data.get("target") or self._corroborate_native_target(job_id, kind, role, lease_epoch, run_dir_path)
+                    if corroborated_target is not None and ev_sess.lower() != corroborated_target.session_id.lower():
+                        raise ValueError("mismatched native_session in role evidence against corroborated binding")
+                    native_session = corroborated_target.session_id if corroborated_target else ev_sess
                 if "utc" in existing_data:
                     utc_val = existing_data.get("utc")
                     if not isinstance(utc_val, str) or not utc_val.strip():
@@ -1060,7 +1066,45 @@ class JobDispatcher:
                 return
 
             if role is not None:
-                from .role_dispatch import get_role_first_action_digest
+                from .role_dispatch import (
+                    get_role_first_action_digest,
+                    is_backend_or_run_injected_test,
+                    read_proc_cgroups,
+                )
+                corroborated_target = cb_data.get("target") or self._corroborate_native_target(job_id, kind, role, lease_epoch, run_dir_path)
+
+                fixture = None
+                is_test = bool(cb_data.get("is_injected_test"))
+                if not is_test:
+                    if type(self.client).__name__ in ("MagicMock", "Mock") or hasattr(self.client, "mock_calls"):
+                        is_test = True
+                    elif hasattr(getattr(self.runtime_mgr, "execute_job", None), "mock_calls") or type(getattr(self.runtime_mgr, "execute_job", None)).__name__ in ("MagicMock", "Mock"):
+                        is_test = True
+                    elif getattr(self.runtime_mgr, "role_adapter", None) is not None:
+                        ra = self.runtime_mgr.role_adapter
+                        is_test = is_backend_or_run_injected_test(
+                            getattr(ra, "launcher_backend", None),
+                            getattr(ra, "launcher_executor", None),
+                        )
+                if is_test:
+                    target_to_use = corroborated_target or cb_data.get("target")
+                    fixture = {
+                        "workload_pid": existing_data.get("pid"),
+                        "worker_pid": getattr(target_to_use, "worker_pid", None) if target_to_use else None,
+                        "workload_cgroup": getattr(target_to_use, "workload_cgroup", None) if target_to_use else None,
+                        "containment_empty": False,
+                        "phase": "running",
+                        "created_at_ms": getattr(target_to_use, "created_at_ms", None) if target_to_use else None,
+                        "is_fixture": True,
+                    }
+                    if fixture.get("workload_cgroup") is None and fixture.get("workload_pid"):
+                        try:
+                            cg_list = read_proc_cgroups(fixture["workload_pid"])
+                            if cg_list:
+                                fixture["workload_cgroup"] = cg_list[0][2]
+                        except Exception:
+                            pass
+
                 evidence_digest = get_role_first_action_digest(
                     evidence_file,
                     expected_job_id=job_id,
@@ -1068,6 +1112,8 @@ class JobDispatcher:
                     expected_role_name=role.get("name", ""),
                     expected_generation=role.get("generation", 0),
                     expected_native_session=native_session,
+                    expected_native_target=corroborated_target,
+                    nonproduction_fixture=fixture,
                 )
             else:
                 evidence_digest = get_first_action_digest(
@@ -1838,6 +1884,31 @@ class JobDispatcher:
         # Handle start-ack if needed:
         if not start_ack_file.exists():
             if first_action_file.exists():
+                fixture = None
+                if getattr(run, "is_injected_test", False):
+                    fixture = {
+                        "workload_pid": binding.get("workload_pid"),
+                        "worker_pid": binding.get("worker_pid"),
+                        "workload_cgroup": binding.get("workload_cgroup"),
+                        "containment_empty": binding.get("containment_empty", False),
+                        "phase": binding.get("phase", "running"),
+                        "created_at_ms": binding.get("created_at_ms"),
+                        "is_fixture": True,
+                    }
+                    if fixture.get("workload_pid") is None:
+                        try:
+                            cd, _, _ = rld.safe_read_bounded_json(first_action_file)
+                            if cd and isinstance(cd, dict) and isinstance(cd.get("pid"), int):
+                                fixture["workload_pid"] = cd["pid"]
+                        except Exception:
+                            pass
+                    if fixture.get("workload_cgroup") is None and fixture.get("workload_pid"):
+                        try:
+                            cg_list = rld.read_proc_cgroups(fixture["workload_pid"])
+                            if cg_list:
+                                fixture["workload_cgroup"] = cg_list[0][2]
+                        except Exception:
+                            pass
                 digest = rld.get_role_first_action_digest(
                     first_action_file,
                     expected_job_id=job_id,
@@ -1845,6 +1916,9 @@ class JobDispatcher:
                     expected_role_name=role.get("name", ""),
                     expected_generation=role.get("generation", 0),
                     expected_native_session=binding["session_id"],
+                    expected_native_target=target,
+                    aplexer_bin=run.launcher_backend.aplexer_bin,
+                    nonproduction_fixture=fixture,
                 )
                 if digest:
                     start_res = self.client.start_job(

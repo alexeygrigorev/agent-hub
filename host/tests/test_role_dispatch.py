@@ -35,6 +35,7 @@ from agent_hub_host.role_dispatch import (
     TrustedRoleConfig,
     ensure_workspace_tmp_dir,
     get_role_first_action_digest,
+    read_proc_cgroups,
     safe_read_bounded_json,
     scrub,
     scrub_dict,
@@ -867,6 +868,9 @@ class TestRoleRealBackendAdapter(unittest.TestCase):
         self.assertIn(str(run.start_ack_file), goal)
         self.assertIn(str(run.outcome_file), goal)
         self.assertIn('"stage": "first_action"', goal)
+        self.assertIn('"pid": <workload_pid>', goal)
+        self.assertIn("workload_pid", goal)
+        self.assertNotIn("<worker_pid>", goal)
         self.assertIn("Start Acknowledgement Barrier:", goal)
         self.assertIn("CRITICAL: do NOT execute any business effects before the Hub start acknowledgement", goal)
         self.assertIn("Outcome Artifact:", goal)
@@ -1167,7 +1171,8 @@ class TestRoleRealBackendAdapter(unittest.TestCase):
         proc = subprocess.Popen(["sleep", "5"])
         try:
             pid = proc.pid
-            # Honest native_cgroup schema: verified native_session + live pid, no fake namespace
+            # Honest native_cgroup schema:
+            # 1. Uncorroborated synthetic UUID without live aplexer session returns None
             native_ev = {
                 "pid": pid,
                 "job_id": "job-iso-1",
@@ -1186,8 +1191,75 @@ class TestRoleRealBackendAdapter(unittest.TestCase):
                 expected_role_name="writer",
                 expected_generation=1,
             )
-            self.assertIsNotNone(digest)
-            self.assertEqual(len(digest), 64)
+            self.assertIsNone(digest)
+
+            # 2. With a valid disposable test fixture:
+            # Valid workload PID matching workload_pid and cgroup is accepted
+            cg_list = read_proc_cgroups(pid)
+            cgroup_path = cg_list[0][2] if cg_list else "/test.scope"
+            valid_fixture = {
+                "workload_pid": pid,
+                "worker_pid": 999998,
+                "workload_cgroup": cgroup_path,
+                "phase": "running",
+                "containment_empty": False,
+                "created_at_ms": int(time.time() * 1000) - 1000,
+                "is_fixture": True,
+            }
+            digest_valid = get_role_first_action_digest(
+                json.dumps(native_ev),
+                expected_job_id="job-iso-1",
+                expected_epoch=1,
+                expected_role_name="writer",
+                expected_generation=1,
+                nonproduction_fixture=valid_fixture,
+            )
+            self.assertIsNotNone(digest_valid)
+            self.assertEqual(len(digest_valid), 64)
+
+            # 3. Supervisor PID is refused even with correct session binding
+            sup_fixture = dict(valid_fixture, worker_pid=pid)
+            self.assertIsNone(get_role_first_action_digest(
+                json.dumps(native_ev),
+                expected_job_id="job-iso-1",
+                expected_epoch=1,
+                expected_role_name="writer",
+                expected_generation=1,
+                nonproduction_fixture=sup_fixture,
+            ))
+
+            # 4. Outside arbitrary PID is refused
+            outside_fixture = dict(valid_fixture, workload_pid=pid + 100000)
+            self.assertIsNone(get_role_first_action_digest(
+                json.dumps(native_ev),
+                expected_job_id="job-iso-1",
+                expected_epoch=1,
+                expected_role_name="writer",
+                expected_generation=1,
+                nonproduction_fixture=outside_fixture,
+            ))
+
+            # 5. Wrong / non-matching cgroup is refused
+            wrong_cg_fixture = dict(valid_fixture, workload_cgroup="/completely/different.scope")
+            self.assertIsNone(get_role_first_action_digest(
+                json.dumps(native_ev),
+                expected_job_id="job-iso-1",
+                expected_epoch=1,
+                expected_role_name="writer",
+                expected_generation=1,
+                nonproduction_fixture=wrong_cg_fixture,
+            ))
+
+            # 6. Dead PID is refused
+            dead_ev = dict(native_ev, pid=999999)
+            self.assertIsNone(get_role_first_action_digest(
+                json.dumps(dead_ev),
+                expected_job_id="job-iso-1",
+                expected_epoch=1,
+                expected_role_name="writer",
+                expected_generation=1,
+                nonproduction_fixture=valid_fixture,
+            ))
 
             # Fabricated private PID namespace matching host init namespace is rejected
             try:
