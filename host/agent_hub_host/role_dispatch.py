@@ -37,6 +37,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import private_fs
 from . import native_sessions as ns
+from .guarded_root import get_pid_starttime_ticks
 from .native_sessions import NativeTarget, SessionControlError, SessionUncertain, StopResult, canonicalize_workspace
 
 logger = logging.getLogger(__name__)
@@ -1290,91 +1291,157 @@ def read_proc_cgroups(pid: int) -> Optional[List[Tuple[str, str, str]]]:
 def get_proc_state(pid: int) -> Optional[str]:
     """Inspect /proc/<pid>/status to determine process state (e.g. 'R', 'S', 'Z', 'X').
 
-    Returns None if unreadable.
+    Returns state string or None if unreadable.
     """
     if type(pid) is not int or pid <= 1:
         return None
     try:
         status_file = pathlib.Path(f"/proc/{pid}/status")
-        if not status_file.exists():
-            return None
-        with open(status_file, "r", encoding="utf-8", errors="replace") as f:
-            for _ in range(30):
-                line = f.readline()
-                if not line:
-                    break
-                if line.startswith("State:"):
-                    parts = line.split(":", 1)
-                    if len(parts) == 2:
-                        return parts[1].strip()
+        if status_file.exists():
+            with open(status_file, "r", encoding="utf-8", errors="replace") as f:
+                for _ in range(30):
+                    line = f.readline()
+                    if not line:
+                        break
+                    if line.startswith("State:"):
+                        parts = line.split(":", 1)
+                        if len(parts) == 2:
+                            val = parts[1].strip()
+                            if val:
+                                return val
+        # Fallback to /proc/<pid>/stat field 3 if status was unreadable or missing State line
+        stat_file = pathlib.Path(f"/proc/{pid}/stat")
+        if stat_file.exists():
+            content = stat_file.read_text(encoding="utf-8", errors="replace")
+            rparen = content.rfind(")")
+            if rparen != -1:
+                rest = content[rparen + 2:].split()
+                if rest:
+                    return rest[0].upper()
         return None
     except (OSError, PermissionError):
         return None
+
+
+def get_system_boot_time() -> Optional[int]:
+    """Read authoritative system boot time (btime) in epoch seconds from /proc/stat."""
+    try:
+        with open("/proc/stat", "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        return int(parts[1])
+    except (OSError, PermissionError):
+        pass
+    return None
+
+
+def get_clock_ticks_per_sec() -> int:
+    """Return system clock ticks per second (SC_CLK_TCK), default 100."""
+    try:
+        hz = os.sysconf(os.sysconf_names.get("SC_CLK_TCK", "SC_CLK_TCK"))
+        if isinstance(hz, int) and hz > 0:
+            return hz
+    except Exception:
+        pass
+    return 100
 
 
 def get_proc_start_time(pid: int) -> Optional[float]:
-    """Inspect start provenance of /proc/<pid> via its inode creation/mtime.
+    """Inspect start provenance of PID via /proc/<pid>/stat start-ticks and btime.
 
-    Returns None if unreadable.
+    Returns authoritative epoch time in seconds with subsecond precision, or None if unreadable.
+    Inode mtime is NOT supported process birth proof.
     """
     if type(pid) is not int or pid <= 1:
         return None
-    try:
-        proc_dir = pathlib.Path(f"/proc/{pid}")
-        if not proc_dir.exists():
-            return None
-        st = os.stat(proc_dir)
-        return float(st.st_mtime)
-    except (OSError, PermissionError):
+    ticks = get_pid_starttime_ticks(pid)
+    if ticks is None:
         return None
+    btime = get_system_boot_time()
+    if btime is None:
+        return None
+    clk_tck = get_clock_ticks_per_sec()
+    return float(btime) + (float(ticks) / float(clk_tck))
 
 
-def normalize_cgroup_path(raw_path: str) -> str:
-    """Normalize cgroup path by stripping /sys/fs/cgroup prefix and redundant slashes."""
-    p = str(raw_path).strip()
+def normalize_cgroup_path(raw_path: Any) -> Optional[str]:
+    """Normalize cgroup path by stripping /sys/fs/cgroup prefix and redundant slashes.
+
+    Fails closed (returns None) on empty, blank, root ('/'), and path traversal ('..').
+    """
+    if not isinstance(raw_path, str):
+        return None
+    p = raw_path.strip()
+    if not p:
+        return None
     if p.startswith("/sys/fs/cgroup"):
         p = p[len("/sys/fs/cgroup"):]
-    if not p.startswith("/"):
-        p = "/" + p
-    return p.rstrip("/")
+    segments = [s for s in p.split("/") if s]
+    if not segments:
+        return None  # empty or root cgroup ('/')
+    if any(s == ".." or s == "." for s in segments):
+        return None  # path traversal or relative dot rejected
+    return "/" + "/".join(segments)
 
 
 def is_pid_in_cgroup(
     pid: int,
     expected_cgroup: str,
     proc_cgroups: Optional[List[Tuple[str, str, str]]] = None,
+    cgroup_procs_pids: Optional[Union[Set[int], List[int]]] = None,
 ) -> bool:
-    """Verify that PID belongs to the specified cgroup using /proc/<pid>/cgroup and cgroup.procs."""
-    if not expected_cgroup or type(pid) is not int or pid <= 1:
+    """Verify that PID belongs to the specified cgroup using exact paths and corroboration.
+
+    Invariants:
+    1. Both expected_cgroup and /proc/<pid>/cgroup path must normalize to valid, non-root paths.
+    2. Path comparison requires exact equality (no suffix or ancestor lookalike matching).
+    3. /proc/<pid>/cgroup must be readable and contain the exact expected cgroup.
+    4. If /sys/fs/cgroup/<expected>/cgroup.procs is present (or cgroup_procs_pids provided),
+       it must be readable and corroborate that PID is contained; contradictions fail closed.
+    """
+    if type(pid) is not int or pid <= 1:
         return False
     norm_expected = normalize_cgroup_path(expected_cgroup)
-    if not norm_expected or norm_expected == "/":
+    if not norm_expected:
         return False
 
-    # 1. Inspect /proc/<pid>/cgroup
+    # 1. Inspect /proc/<pid>/cgroup - must match exact normalized path
     entries = proc_cgroups if proc_cgroups is not None else read_proc_cgroups(pid)
-    matched_proc = False
-    if entries:
-        for _hier, _ctrl, cpath in entries:
-            norm_cpath = normalize_cgroup_path(cpath)
-            if norm_cpath == norm_expected or norm_cpath.endswith(norm_expected) or norm_expected.endswith(norm_cpath):
-                matched_proc = True
-                break
+    if not entries:
+        return False
 
-    # 2. Corroborate via /sys/fs/cgroup/<norm_expected>/cgroup.procs if available
+    matched_proc = False
+    for _hier, _ctrl, cpath in entries:
+        norm_cpath = normalize_cgroup_path(cpath)
+        if norm_cpath and norm_cpath == norm_expected:
+            matched_proc = True
+            break
+
+    if not matched_proc:
+        return False
+
+    # 2. Corroborate via cgroup_procs_pids if provided
+    if cgroup_procs_pids is not None:
+        try:
+            if pid not in cgroup_procs_pids:
+                return False
+        except Exception:
+            return False
+
+    # 3. Corroborate via /sys/fs/cgroup/<norm_expected>/cgroup.procs if file exists
     procs_path = pathlib.Path("/sys/fs/cgroup") / norm_expected.lstrip("/") / "cgroup.procs"
     if procs_path.is_file():
         try:
             pids_text = procs_path.read_text(encoding="utf-8", errors="replace")
             contained_pids = {int(p.strip()) for p in pids_text.splitlines() if p.strip().isdigit()}
-            if pid in contained_pids:
-                return True
-            # If cgroup.procs is readable and pid is explicitly absent, reject even if /proc matched
-            return False
+            if pid not in contained_pids:
+                return False
         except (OSError, PermissionError):
-            pass
+            return False
 
-    return matched_proc
+    return True
 
 
 def inspect_native_workload_status(
@@ -1388,15 +1455,31 @@ def inspect_native_workload_status(
     Fails closed if the session is absent, ambiguous, terminal, uncontained, or inconsistent.
     """
     CONFIRMED_TERMINAL_PHASES = {"exited", "stopped", "killed", "failed", "dead", "pruned"}
+    ACTIVE_PHASES = {"running", "working", "idle", "starting"}
 
     if target is not None:
         try:
             target = target.validated()
             row = ns.qualify_target(aplexer_bin, target, live_only=False)
             st = ns.status_of(aplexer_bin, target)
-            phase = str(st.get("phase") or row.phase).lower()
-            if phase in CONFIRMED_TERMINAL_PHASES:
+            phase = str(st.get("phase") or row.phase or "").lower()
+            if phase in CONFIRMED_TERMINAL_PHASES or phase not in ACTIVE_PHASES:
                 return None
+            if row.containment_empty is not False:
+                return None
+            norm_cg = normalize_cgroup_path(row.workload_cgroup)
+            if not norm_cg:
+                return None
+            if type(row.workload_pid) is not int or row.workload_pid <= 1:
+                return None
+            if type(row.worker_pid) is not int or row.worker_pid <= 1:
+                return None
+            if row.workload_pid == row.worker_pid:
+                return None
+
+            start_ticks = get_pid_starttime_ticks(row.workload_pid)
+            start_time = get_proc_start_time(row.workload_pid)
+
             return {
                 "session_id": row.session_id,
                 "tag": row.tag,
@@ -1406,9 +1489,11 @@ def inspect_native_workload_status(
                 "phase": phase,
                 "worker_pid": row.worker_pid,
                 "workload_pid": row.workload_pid,
-                "workload_cgroup": normalize_cgroup_path(row.workload_cgroup) if row.workload_cgroup else None,
+                "workload_cgroup": norm_cg,
                 "containment_cgroup": row.workload_cgroup,
                 "containment_empty": row.containment_empty,
+                "start_ticks": start_ticks,
+                "proc_start_time": start_time,
             }
         except Exception:
             return None
@@ -1420,9 +1505,24 @@ def inspect_native_workload_status(
             if len(matches) != 1:
                 return None
             s = matches[0]
-            phase = s.phase.lower()
-            if phase in CONFIRMED_TERMINAL_PHASES:
+            phase = str(s.phase or "").lower()
+            if phase in CONFIRMED_TERMINAL_PHASES or phase not in ACTIVE_PHASES:
                 return None
+            if s.containment_empty is not False:
+                return None
+            norm_cg = normalize_cgroup_path(s.workload_cgroup)
+            if not norm_cg:
+                return None
+            if type(s.workload_pid) is not int or s.workload_pid <= 1:
+                return None
+            if type(s.worker_pid) is not int or s.worker_pid <= 1:
+                return None
+            if s.workload_pid == s.worker_pid:
+                return None
+
+            start_ticks = get_pid_starttime_ticks(s.workload_pid)
+            start_time = get_proc_start_time(s.workload_pid)
+
             return {
                 "session_id": s.session_id,
                 "tag": s.tag,
@@ -1432,9 +1532,11 @@ def inspect_native_workload_status(
                 "phase": phase,
                 "worker_pid": s.worker_pid,
                 "workload_pid": s.workload_pid,
-                "workload_cgroup": normalize_cgroup_path(s.workload_cgroup) if s.workload_cgroup else None,
+                "workload_cgroup": norm_cg,
                 "containment_cgroup": s.workload_cgroup,
                 "containment_empty": s.containment_empty,
+                "start_ticks": start_ticks,
+                "proc_start_time": start_time,
             }
         except Exception:
             return None
@@ -1449,59 +1551,136 @@ def validate_native_workload_pid(
 ) -> Tuple[bool, str]:
     """Validate first-action PID against corroborated native workload status and /proc/cgroup identity.
 
-    Invariants:
-    1. Rejects supervisor PID (worker_pid).
-    2. Requires match against corroborated native workload PID (workload_pid).
-    3. Rejects dead or zombie PIDs (validates os.kill(pid, 0) and /proc/<pid>/status state).
-    4. Validates actual /proc/<pid>/cgroup matches the corroborated workload_cgroup.
-    5. Rejects empty containment or terminal phase.
-    6. Validates start provenance against session created_at_ms and run start time.
+    Strict security invariants (fail closed):
+    1. Caller / system PID rejection: PID > 1, != os.getpid(), != os.getppid(), != 65534.
+    2. OS liveness: os.kill(pid, 0) must succeed.
+    3. Process state: /proc/<pid>/status state must be readable and an active state ('R', 'S', 'D').
+       Unreadable state, zombie ('Z'), dead ('X'), or stopped ('T'/'t') fails closed.
+    4. Start provenance:
+       - Starttime ticks from /proc/<pid>/stat must be readable and match expected_ticks (if known).
+       - Authoritative process start time must be readable via boot-time + ticks / HZ.
+       - Session created_at_ms must be valid and known.
+       - Process start time must not predate session creation or run start (within explicit 1s clock resolution).
+       - Process start time must not be in the future.
+    5. Workload identity:
+       - workload_pid must be present, valid int > 1.
+       - worker_pid must be present, valid int > 1.
+       - workload_pid must be distinct from worker_pid.
+       - pid_val must match workload_pid exactly.
+       - pid_val must NOT match worker_pid.
+    6. Active phase & nonempty containment:
+       - phase must be a known active phase ('running', 'working', 'idle', 'starting').
+       - Terminal phases ('exited', 'stopped', 'killed', 'failed', 'dead', 'pruned') or unknown fail closed.
+       - containment_empty must be explicitly False (boolean). Missing, None, or True fail closed.
+    7. Cgroup containment:
+       - workload_cgroup must normalize to a valid non-root, non-blank path without traversal ('..').
+       - PID cgroup membership in /proc/<pid>/cgroup must match exact normalized workload_cgroup.
+       - Suffix-only, prefix-only, and ancestor lookalikes are strictly rejected.
+       - If /sys/fs/cgroup/<workload_cgroup>/cgroup.procs exists or cgroup_procs_pids provided,
+         it must corroborate PID membership; contradictions and unreadable files fail closed.
     """
+    if not isinstance(workload_info, dict):
+        return False, "missing_or_invalid_workload_info"
+
+    # 1. Caller / system PID check
     if type(pid_val) is not int or pid_val <= 1 or pid_val == os.getpid() or pid_val == os.getppid() or pid_val == 65534:
         return False, "invalid_or_caller_pid"
 
-    # Liveness check
+    # 2. OS liveness check
     try:
         os.kill(pid_val, 0)
     except OSError:
         return False, "dead_pid"
 
-    # Zombie check
-    state = get_proc_state(pid_val)
-    if state and state.upper().startswith(("Z", "X")):
+    # 3. Process state check: must be readable and active ('R', 'S', 'D')
+    state = workload_info.get("proc_state") if (workload_info.get("is_fixture") and workload_info.get("proc_state") is not None) else get_proc_state(pid_val)
+    if state is None:
+        return False, "unreadable_proc_state"
+    state_token = state.split()[0].upper()
+    if state_token in ("Z", "X"):
         return False, f"zombie_or_dead_state_{state}"
+    if state_token in ("T", "t"):
+        return False, f"stopped_state_{state}"
+    if state_token not in ("R", "S", "D"):
+        return False, f"non_active_proc_state_{state}"
 
-    # Containment empty check
-    if workload_info.get("containment_empty") is True:
-        return False, "containment_empty"
+    # 4. Containment empty check: must be strictly False (boolean)
+    containment_empty = workload_info.get("containment_empty")
+    if containment_empty is not False:
+        if containment_empty is True:
+            return False, "containment_empty"
+        return False, "missing_or_unknown_containment_empty"
 
-    # Phase check
-    phase = str(workload_info.get("phase") or "").lower()
-    if phase in {"exited", "stopped", "killed", "failed", "dead", "pruned"}:
-        return False, f"terminal_phase_{phase}"
+    # 5. Phase check: must be a known active phase
+    phase = workload_info.get("phase")
+    if not isinstance(phase, str) or not phase.strip():
+        return False, "missing_phase"
+    phase_lower = phase.strip().lower()
+    CONFIRMED_TERMINAL_PHASES = {"exited", "stopped", "killed", "failed", "dead", "pruned"}
+    ACTIVE_PHASES = {"running", "working", "idle", "starting"}
+    if phase_lower in CONFIRMED_TERMINAL_PHASES:
+        return False, f"terminal_phase_{phase_lower}"
+    if phase_lower not in ACTIVE_PHASES:
+        return False, f"non_active_phase_{phase_lower}"
 
-    # Reject supervisor PID
+    # 6. Worker (supervisor) PID check
     worker_pid = workload_info.get("worker_pid")
-    if worker_pid is not None and pid_val == worker_pid:
+    if worker_pid is None or type(worker_pid) is not int or worker_pid <= 1:
+        return False, "missing_trusted_worker_pid"
+    if pid_val == worker_pid:
         return False, "refused_supervisor_pid"
 
-    # Require match with workload PID
+    # 7. Workload PID check
     workload_pid = workload_info.get("workload_pid")
-    if workload_pid is not None and pid_val != workload_pid:
+    if workload_pid is None or type(workload_pid) is not int or workload_pid <= 1:
+        return False, "missing_trusted_workload_pid"
+    if workload_pid == worker_pid:
+        return False, "workload_pid_matches_supervisor"
+    if pid_val != workload_pid:
         return False, f"mismatched_workload_pid (expected {workload_pid}, got {pid_val})"
 
-    # Cgroup containment check
-    workload_cgroup = workload_info.get("workload_cgroup") or workload_info.get("containment_cgroup")
-    if not workload_cgroup:
-        if workload_info.get("is_fixture"):
-            cg = read_proc_cgroups(pid_val)
-            if cg:
-                workload_cgroup = cg[0][2]
-        if not workload_cgroup:
-            return False, "missing_workload_cgroup"
+    # 8. Start ticks and PID reuse check
+    current_ticks = get_pid_starttime_ticks(pid_val)
+    if current_ticks is None and workload_info.get("is_fixture"):
+        current_ticks = workload_info.get("proc_start_ticks")
+    if current_ticks is None:
+        return False, "unreadable_proc_start_ticks"
 
-    proc_cgroup_content = workload_info.get("proc_cgroup_content")
+    expected_ticks = workload_info.get("start_ticks") or workload_info.get("pid_start_ticks")
+    if expected_ticks is not None and current_ticks != expected_ticks:
+        return False, f"pid_start_ticks_mismatch ({expected_ticks} vs {current_ticks})"
+
+    # 9. Start provenance check (epoch time)
+    proc_start = workload_info.get("proc_start_time")
+    if proc_start is None:
+        proc_start = get_proc_start_time(pid_val)
+    if proc_start is None:
+        return False, "unreadable_proc_start_time"
+
+    created_ms = workload_info.get("created_at_ms") or workload_info.get("incarnation")
+    if created_ms is None or type(created_ms) is not int or created_ms <= 0:
+        return False, "missing_or_invalid_session_created_at_ms"
+    sess_start = created_ms / 1000.0
+
+    # Clock precision: kernel btime has 1s resolution, so allow at most 1.0s difference
+    if proc_start < sess_start - 1.0:
+        return False, f"stale_pid_started_before_session ({proc_start} < {sess_start})"
+    if started_wall is not None and proc_start < started_wall - 1.0:
+        return False, f"stale_pid_started_before_run ({proc_start} < {started_wall})"
+    if proc_start > time.time() + 2.0:
+        return False, f"future_pid_start_time ({proc_start} > {time.time()})"
+
+    # 10. Cgroup containment check
+    workload_cgroup = workload_info.get("workload_cgroup") or workload_info.get("containment_cgroup")
+    if not workload_cgroup or not isinstance(workload_cgroup, str):
+        return False, "missing_workload_cgroup"
+
+    norm_expected_cgroup = normalize_cgroup_path(workload_cgroup)
+    if not norm_expected_cgroup:
+        return False, f"invalid_workload_cgroup ({workload_cgroup})"
+
     proc_cgroups = None
+    proc_cgroup_content = workload_info.get("proc_cgroup_content")
     if isinstance(proc_cgroup_content, str):
         proc_cgroups = []
         for line in proc_cgroup_content.splitlines():
@@ -1509,21 +1688,14 @@ def validate_native_workload_pid(
             if len(parts) == 3:
                 proc_cgroups.append((parts[0], parts[1], parts[2]))
 
-    if not is_pid_in_cgroup(pid_val, str(workload_cgroup), proc_cgroups=proc_cgroups):
+    cgroup_procs_pids = workload_info.get("cgroup_procs_pids")
+    if not is_pid_in_cgroup(
+        pid_val,
+        norm_expected_cgroup,
+        proc_cgroups=proc_cgroups,
+        cgroup_procs_pids=cgroup_procs_pids,
+    ):
         return False, f"pid_not_in_workload_cgroup ({workload_cgroup})"
-
-    # Start provenance
-    proc_start = workload_info.get("proc_start_time")
-    if proc_start is None:
-        proc_start = get_proc_start_time(pid_val)
-    if proc_start is not None:
-        created_ms = workload_info.get("created_at_ms") or workload_info.get("incarnation")
-        if type(created_ms) is int and created_ms > 0:
-            sess_start = created_ms / 1000.0
-            if proc_start < sess_start - 5.0:
-                return False, f"stale_pid_started_before_session ({proc_start} < {sess_start})"
-        if started_wall is not None and proc_start < started_wall - 15.0:
-            return False, f"stale_pid_started_before_run ({proc_start} < {started_wall})"
 
     return True, "ok"
 
@@ -1589,9 +1761,12 @@ def get_role_first_action_digest(
     except OSError:
         return None
 
-    # Check that PID is not in zombie or dead state
+    # Check that PID is in a readable and active state
     state = get_proc_state(pid_val)
-    if state and state.upper().startswith(("Z", "X")):
+    if state is None:
+        return None
+    state_token = state.split()[0].upper()
+    if state_token in ("Z", "X", "T", "t") or state_token not in ("R", "S", "D"):
         return None
 
     if data.get("job_id") != expected_job_id:
@@ -1677,28 +1852,17 @@ def is_backend_or_run_injected_test(
     backend: Optional[Any] = None,
     launcher_executor: Optional[Callable] = None,
 ) -> bool:
-    """Detect whether this execution is an injected test / mock fixture.
+    """Detect whether this execution is an explicitly injected test / mock fixture.
 
-    Never let test conveniences weaken actual production qualification.
+    Explicit injected fixture tests are nonproduction only.
+    No automatic mock or type-name bypass is permitted in production.
     """
     if launcher_executor is not None:
         return True
     if backend is None:
         return False
-    if type(backend).__name__ in ("MagicMock", "Mock"):
+    if getattr(backend, "is_fixture_only", False) or getattr(backend, "_is_fixture_only", False):
         return True
-    if (
-        getattr(backend, "_is_mock", False)
-        or getattr(backend, "is_fixture_only", False)
-        or getattr(backend, "is_mock", False)
-    ):
-        return True
-    # Check if any methods on backend are mocked (e.g. MagicMock attached to methods)
-    for attr in ("get_task_binding", "run", "submit", "plan", "stop_session", "is_session_alive"):
-        fn = getattr(backend, attr, None)
-        if fn is not None:
-            if type(fn).__name__ in ("MagicMock", "Mock") or hasattr(fn, "mock_calls"):
-                return True
     return False
 
 
@@ -2157,6 +2321,8 @@ class RoleRun:
         3. If no authoritative maintained binding exists, first-action evidence is REFUSED.
         4. When binding is known, first-action native_session MUST match the corroborated binding.
         """
+        if self.is_injected_test:
+            timeout = min(timeout, 3.0)
         deadline = self._current_time() + timeout
 
         while self._current_time() < deadline:
@@ -2193,8 +2359,9 @@ class RoleRun:
                 for target_fa in candidates:
                     if target_fa.exists():
                         fixture = None
+                        binding_rec = self.corroborate_maintained_binding() or {}
+                        fixture = None
                         if self.is_injected_test:
-                            binding_rec = self.corroborate_maintained_binding() or {}
                             fixture = {
                                 "workload_pid": binding_rec.get("workload_pid"),
                                 "worker_pid": binding_rec.get("worker_pid"),
@@ -2204,20 +2371,6 @@ class RoleRun:
                                 "created_at_ms": self.created_at_ms,
                                 "is_fixture": True,
                             }
-                            if fixture.get("workload_pid") is None:
-                                try:
-                                    cd, _, _ = safe_read_bounded_json(target_fa)
-                                    if cd and isinstance(cd, dict) and isinstance(cd.get("pid"), int):
-                                        fixture["workload_pid"] = cd["pid"]
-                                except Exception:
-                                    pass
-                            if fixture.get("workload_cgroup") is None and fixture.get("workload_pid"):
-                                try:
-                                    cg_list = read_proc_cgroups(fixture["workload_pid"])
-                                    if cg_list:
-                                        fixture["workload_cgroup"] = cg_list[0][2]
-                                except Exception:
-                                    pass
 
                         digest = get_role_first_action_digest(
                             target_fa,
@@ -2249,6 +2402,11 @@ class RoleRun:
                                     "workspace": self.native_workspace or native_target.workspace,
                                     "engine": self.native_engine or native_target.engine,
                                     "created_at_ms": self.created_at_ms,
+                                    "workload_pid": binding_rec.get("workload_pid"),
+                                    "worker_pid": binding_rec.get("worker_pid"),
+                                    "workload_cgroup": binding_rec.get("workload_cgroup"),
+                                    "containment_empty": binding_rec.get("containment_empty", False),
+                                    "phase": binding_rec.get("phase", "running"),
                                 },
                                 "target": native_target,
                                 "is_injected_test": self.is_injected_test,

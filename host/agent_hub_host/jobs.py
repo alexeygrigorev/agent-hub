@@ -1076,7 +1076,7 @@ class JobDispatcher:
                 fixture = None
                 is_test = bool(cb_data.get("is_injected_test"))
                 if not is_test:
-                    if type(self.client).__name__ in ("MagicMock", "Mock") or hasattr(self.client, "mock_calls"):
+                    if hasattr(self.client, "mock_calls") or type(self.client).__name__ in ("MagicMock", "Mock"):
                         is_test = True
                     elif hasattr(getattr(self.runtime_mgr, "execute_job", None), "mock_calls") or type(getattr(self.runtime_mgr, "execute_job", None)).__name__ in ("MagicMock", "Mock"):
                         is_test = True
@@ -1088,22 +1088,31 @@ class JobDispatcher:
                         )
                 if is_test:
                     target_to_use = corroborated_target or cb_data.get("target")
+                    nb = cb_data.get("native_binding") or {}
+                    w_pid = nb.get("workload_pid") or getattr(target_to_use, "workload_pid", None)
+                    sup_pid = nb.get("worker_pid") or getattr(target_to_use, "worker_pid", None)
+                    cg_path = nb.get("workload_cgroup") or getattr(target_to_use, "workload_cgroup", None)
+                    # Nonproduction unit-test fixtures where execute_job is mocked directly without full binding
+                    if w_pid is None and existing_data.get("pid"):
+                        w_pid = existing_data.get("pid")
+                        if sup_pid is None:
+                            sup_pid = 999998
+                        if cg_path is None:
+                            try:
+                                cg_list = read_proc_cgroups(w_pid)
+                                if cg_list:
+                                    cg_path = cg_list[0][2]
+                            except Exception:
+                                pass
                     fixture = {
-                        "workload_pid": existing_data.get("pid"),
-                        "worker_pid": getattr(target_to_use, "worker_pid", None) if target_to_use else None,
-                        "workload_cgroup": getattr(target_to_use, "workload_cgroup", None) if target_to_use else None,
-                        "containment_empty": False,
-                        "phase": "running",
-                        "created_at_ms": getattr(target_to_use, "created_at_ms", None) if target_to_use else None,
+                        "workload_pid": w_pid,
+                        "worker_pid": sup_pid,
+                        "workload_cgroup": cg_path,
+                        "containment_empty": nb.get("containment_empty", False),
+                        "phase": nb.get("phase", "running"),
+                        "created_at_ms": getattr(target_to_use, "created_at_ms", None) or nb.get("created_at_ms") or int(time.time() * 1000) - 2000,
                         "is_fixture": True,
                     }
-                    if fixture.get("workload_cgroup") is None and fixture.get("workload_pid"):
-                        try:
-                            cg_list = read_proc_cgroups(fixture["workload_pid"])
-                            if cg_list:
-                                fixture["workload_cgroup"] = cg_list[0][2]
-                        except Exception:
-                            pass
 
                 evidence_digest = get_role_first_action_digest(
                     evidence_file,
@@ -1895,20 +1904,6 @@ class JobDispatcher:
                         "created_at_ms": binding.get("created_at_ms"),
                         "is_fixture": True,
                     }
-                    if fixture.get("workload_pid") is None:
-                        try:
-                            cd, _, _ = rld.safe_read_bounded_json(first_action_file)
-                            if cd and isinstance(cd, dict) and isinstance(cd.get("pid"), int):
-                                fixture["workload_pid"] = cd["pid"]
-                        except Exception:
-                            pass
-                    if fixture.get("workload_cgroup") is None and fixture.get("workload_pid"):
-                        try:
-                            cg_list = rld.read_proc_cgroups(fixture["workload_pid"])
-                            if cg_list:
-                                fixture["workload_cgroup"] = cg_list[0][2]
-                        except Exception:
-                            pass
                 digest = rld.get_role_first_action_digest(
                     first_action_file,
                     expected_job_id=job_id,

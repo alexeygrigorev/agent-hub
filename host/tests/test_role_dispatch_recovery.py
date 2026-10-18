@@ -293,20 +293,24 @@ class TestRoleDispatchRecovery(unittest.TestCase):
                 runtime_mgr=runtime_mgr,
             )
 
+            cg_list = rld.read_proc_cgroups(dummy_proc.pid)
+            cgroup_path = cg_list[0][2] if cg_list else "/test.scope"
             # Set up maintained store binding in mock backend
             binding_record = {
                 "session_id": native_sid,
                 "tag": f"task-{task_id}",
                 "workspace": str(self.workspace.resolve()),
                 "engine": "antigravity",
-                "created_at_ms": 1792000000000,
+                "created_at_ms": int(time.time() * 1000) - 2000,
                 "workload_pid": dummy_proc.pid,
+                "worker_pid": 999998,
+                "workload_cgroup": cgroup_path,
+                "containment_empty": False,
+                "phase": "running",
             }
             backend = runtime_mgr.role_adapter.launcher_backend
+            backend.is_fixture_only = True
             backend.get_task_binding = MagicMock(return_value=binding_record)
-
-            # Session is alive initially
-            backend.is_session_alive = MagicMock(return_value=(True, {"phase": "running"}))
 
             runs_dir = d1._get_role_runs_dir()
             run_dir = runs_dir / f"writer-run-{job_id}"
@@ -324,18 +328,6 @@ class TestRoleDispatchRecovery(unittest.TestCase):
                 "utc": "2026-10-18T08:00:00Z",
                 "isolation_kind": "native_cgroup",
             }
-
-            # Set up maintained store binding in mock backend
-            binding_record = {
-                "session_id": native_sid,
-                "tag": f"task-{task_id}",
-                "workspace": str(self.workspace.resolve()),
-                "engine": "antigravity",
-                "created_at_ms": 1792000000000,
-                "workload_pid": dummy_proc.pid,
-            }
-            backend = runtime_mgr.role_adapter.launcher_backend
-            backend.get_task_binding = MagicMock(return_value=binding_record)
 
             worker_interrupt_event = threading.Event()
 
@@ -1905,6 +1897,7 @@ class TestRoleDispatchRecovery(unittest.TestCase):
                 "containment_empty": False,
             }
             backend = runtime_mgr.role_adapter.launcher_backend
+            backend.is_fixture_only = True
             backend.get_task_binding = MagicMock(return_value=binding_record)
             backend.is_session_alive = MagicMock(return_value=(True, {"phase": "running"}))
             backend.stop_session = MagicMock(return_value=(True, "stopped", {}))

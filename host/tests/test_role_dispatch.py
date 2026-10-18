@@ -34,12 +34,20 @@ from agent_hub_host.role_dispatch import (
     RoleRun,
     TrustedRoleConfig,
     ensure_workspace_tmp_dir,
+    get_clock_ticks_per_sec,
+    get_pid_starttime_ticks,
+    get_proc_start_time,
+    get_proc_state,
     get_role_first_action_digest,
+    get_system_boot_time,
+    is_pid_in_cgroup,
+    normalize_cgroup_path,
     read_proc_cgroups,
     safe_read_bounded_json,
     scrub,
     scrub_dict,
     validate_entrypoint,
+    validate_native_workload_pid,
 )
 from agent_hub_host.runtime import RuntimeManager
 
@@ -1451,13 +1459,21 @@ class TestRoleRealBackendAdapter(unittest.TestCase):
                     time.sleep(0.02)
                 return {"status": "failed", "business_executed": False}
 
+            cg_list = read_proc_cgroups(proc.pid)
+            cgroup_path = cg_list[0][2] if cg_list else "/test.scope"
+            mock_backend.is_fixture_only = True
             mock_backend.get_task_binding.return_value = {
                 "native_id": sess_id,
                 "session_id": sess_id,
                 "tag": "task-hub-role-writer-run-job-refused-v-g2-e3",
                 "workspace": str(self.workspace),
                 "engine": "antigravity",
-                "created_at_ms": 1729200000000,
+                "created_at_ms": int(time.time() * 1000) - 2000,
+                "workload_pid": proc.pid,
+                "worker_pid": 999998,
+                "workload_cgroup": cgroup_path,
+                "containment_empty": False,
+                "phase": "running",
             }
 
             adapter = RoleDispatchAdapter(
@@ -1549,13 +1565,21 @@ class TestRoleRealBackendAdapter(unittest.TestCase):
 
             controlled_executor.cancel_verified = False
 
+            cg_list = read_proc_cgroups(proc.pid)
+            cgroup_path = cg_list[0][2] if cg_list else "/test.scope"
+            mock_backend.is_fixture_only = True
             mock_backend.get_task_binding.return_value = {
                 "native_id": sess_id,
                 "session_id": sess_id,
                 "tag": "task-hub-role-writer-run-job-refused-u-g2-e3",
                 "workspace": str(self.workspace),
                 "engine": "antigravity",
-                "created_at_ms": 1729200000000,
+                "created_at_ms": int(time.time() * 1000) - 2000,
+                "workload_pid": proc.pid,
+                "worker_pid": 999998,
+                "workload_cgroup": cgroup_path,
+                "containment_empty": False,
+                "phase": "running",
             }
 
             adapter = RoleDispatchAdapter(
@@ -1626,6 +1650,9 @@ class TestRoleRealBackendAdapter(unittest.TestCase):
                 }), encoding="utf-8")
                 return {"status": "failed"}
 
+            cg_list = read_proc_cgroups(proc.pid)
+            cgroup_path = cg_list[0][2] if cg_list else "/test.scope"
+            mock_backend.is_fixture_only = True
             for case_idx, bad_callback in enumerate([
                 lambda ev: None,                                        # None reply
                 lambda ev: {"status": "unknown"},                      # bad status shape
@@ -1639,7 +1666,12 @@ class TestRoleRealBackendAdapter(unittest.TestCase):
                     "tag": f"task-hub-role-writer-run-{job_id}-g2-e3",
                     "workspace": str(self.workspace),
                     "engine": "antigravity",
-                    "created_at_ms": 1729200000000,
+                    "created_at_ms": int(time.time() * 1000) - 2000,
+                    "workload_pid": proc.pid,
+                    "worker_pid": 999998,
+                    "workload_cgroup": cgroup_path,
+                    "containment_empty": False,
+                    "phase": "running",
                 }
                 adapter = RoleDispatchAdapter(
                     config=self.role_cfg,
@@ -1718,13 +1750,21 @@ class TestRoleRealBackendAdapter(unittest.TestCase):
                 return {"status": "failed", "error": "ack_timeout"}
 
             job_id = "job-started-success"
+            cg_list = read_proc_cgroups(proc.pid)
+            cgroup_path = cg_list[0][2] if cg_list else "/test.scope"
+            mock_backend.is_fixture_only = True
             mock_backend.get_task_binding.return_value = {
                 "native_id": sess_id,
                 "session_id": sess_id,
                 "tag": f"task-hub-role-writer-run-{job_id}-g2-e3",
                 "workspace": str(self.workspace),
                 "engine": "antigravity",
-                "created_at_ms": 1729200000000,
+                "created_at_ms": int(time.time() * 1000) - 2000,
+                "workload_pid": proc.pid,
+                "worker_pid": 999998,
+                "workload_cgroup": cgroup_path,
+                "containment_empty": False,
+                "phase": "running",
             }
 
             adapter = RoleDispatchAdapter(
@@ -1954,6 +1994,280 @@ class TestRoleQualificationProvenance(unittest.TestCase):
         self.assertFalse(rep["is_fixture_only"])
         self.assertTrue(rep["plan_admitted"])
         self.assertEqual(rep["chosen"], {"provider": "antigravity", "model": "gemini-3.1-pro-high"})
+
+
+class TestStrictWorkloadPIDContainmentAndProvenance(unittest.TestCase):
+    """Meaningful focused tests for M8 workload PID strictness defects.
+
+    Verifies:
+    1. Valid exact live workload accepted with OS start provenance, start-ticks, and cgroup corroboration.
+    2. Counterexample 1 refused: unreadable process state and start provenance (None, dead, zombie, unreadable).
+    3. Counterexample 2 refused: missing trusted workload_pid, phase, and containment_empty.
+    4. Counterexample 3 refused: suffix-only cgroup, ancestor cgroup, traversal, blank/root cgroup.
+    5. Contradictory cgroup membership refused: discrepancy between /proc/<pid>/cgroup and cgroup.procs.
+    6. PID reuse / start-ticks swap refused: start-ticks mismatch, stale start time, future start time.
+    7. RoleRun prestart handshake refuses invalid receipt and never generates start_ack_file.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=str(pathlib.Path(".local/tmp").resolve()))
+        self.base = pathlib.Path(self.tmp.name)
+        self.workspace = self.base / "workspace"
+        self.workspace.mkdir(parents=True)
+        self.proc = subprocess.Popen(["sleep", "60"])
+
+        cg_list = read_proc_cgroups(self.proc.pid)
+        self.cgroup_path = cg_list[0][2] if cg_list else "/test.scope"
+        self.start_ticks = get_pid_starttime_ticks(self.proc.pid)
+        self.proc_start_time = get_proc_start_time(self.proc.pid)
+
+        self.valid_workload_info = {
+            "workload_pid": self.proc.pid,
+            "worker_pid": 999998,
+            "workload_cgroup": self.cgroup_path,
+            "containment_empty": False,
+            "phase": "running",
+            "created_at_ms": int(time.time() * 1000) - 2000,
+            "start_ticks": self.start_ticks,
+            "proc_start_time": self.proc_start_time,
+            "cgroup_procs_pids": [self.proc.pid],
+        }
+
+    def tearDown(self):
+        try:
+            self.proc.kill()
+            self.proc.wait()
+        except OSError:
+            pass
+        self.tmp.cleanup()
+
+    def test_valid_exact_live_workload_accepted(self):
+        """Live workload with corroborated start ticks, OS provenance, active state and exact cgroup passes."""
+        valid, why = validate_native_workload_pid(
+            self.proc.pid,
+            self.valid_workload_info,
+            started_wall=time.time() - 3.0,
+        )
+        self.assertTrue(valid, f"Expected valid workload, got refusal: {why}")
+        self.assertEqual(why, "ok")
+
+    def test_refuses_counterexample_1_unreadable_state_and_start_provenance(self):
+        """Counterexample 1: unreadable process state and start provenance fail closed."""
+        # 1. Unreadable process state
+        with patch("agent_hub_host.role_dispatch.get_proc_state", return_value=None):
+            valid, why = validate_native_workload_pid(self.proc.pid, self.valid_workload_info)
+            self.assertFalse(valid)
+            self.assertEqual(why, "unreadable_proc_state")
+
+        # 2. Dead / zombie / stopped process states
+        for dead_state in ("Z (zombie)", "X (dead)", "T (stopped)", "t (tracing stop)"):
+            with patch("agent_hub_host.role_dispatch.get_proc_state", return_value=dead_state):
+                valid, why = validate_native_workload_pid(self.proc.pid, self.valid_workload_info)
+                self.assertFalse(valid)
+                self.assertTrue(
+                    any(k in why for k in ("zombie", "dead", "inactive", "stopped")),
+                    f"Expected dead/inactive state refusal, got: {why}",
+                )
+
+        # 3. Missing/unreadable start provenance (proc_start_time None)
+        info_no_start = dict(self.valid_workload_info)
+        info_no_start.pop("proc_start_time", None)
+        with patch("agent_hub_host.role_dispatch.get_proc_start_time", return_value=None):
+            valid, why = validate_native_workload_pid(self.proc.pid, info_no_start)
+            self.assertFalse(valid)
+            self.assertEqual(why, "unreadable_proc_start_time")
+
+    def test_refuses_counterexample_2_missing_trusted_workload_pid_phase_and_containment(self):
+        """Counterexample 2: missing trusted workload_pid, phase, and containment_empty fail closed."""
+        # 1. Missing workload_pid
+        info = dict(self.valid_workload_info)
+        info.pop("workload_pid")
+        valid, why = validate_native_workload_pid(self.proc.pid, info)
+        self.assertFalse(valid)
+        self.assertEqual(why, "missing_trusted_workload_pid")
+
+        # 2. Missing worker_pid (supervisor)
+        info = dict(self.valid_workload_info)
+        info.pop("worker_pid")
+        valid, why = validate_native_workload_pid(self.proc.pid, info)
+        self.assertFalse(valid)
+        self.assertEqual(why, "missing_trusted_worker_pid")
+
+        # 3. Workload PID equals supervisor PID
+        info = dict(self.valid_workload_info, worker_pid=self.proc.pid)
+        valid, why = validate_native_workload_pid(self.proc.pid, info)
+        self.assertFalse(valid)
+        self.assertEqual(why, "refused_supervisor_pid")
+
+        # 4. Missing phase
+        info = dict(self.valid_workload_info)
+        info.pop("phase")
+        valid, why = validate_native_workload_pid(self.proc.pid, info)
+        self.assertFalse(valid)
+        self.assertEqual(why, "missing_phase")
+
+        # 5. Inactive / terminal phases
+        for bad_phase in ("exited", "failed", "unknown", "stopped", "terminated", "crashed"):
+            info = dict(self.valid_workload_info, phase=bad_phase)
+            valid, why = validate_native_workload_pid(self.proc.pid, info)
+            self.assertFalse(valid)
+            self.assertTrue(
+                any(k in why for k in ("terminal_phase", "unknown_phase", "inactive_phase", "non_active_phase")),
+                f"Expected inactive phase refusal, got: {why}",
+            )
+
+        # 6. Missing containment_empty or containment_empty is True
+        info = dict(self.valid_workload_info)
+        info.pop("containment_empty")
+        valid, why = validate_native_workload_pid(self.proc.pid, info)
+        self.assertFalse(valid)
+        self.assertEqual(why, "missing_or_unknown_containment_empty")
+
+        info = dict(self.valid_workload_info, containment_empty=True)
+        valid, why = validate_native_workload_pid(self.proc.pid, info)
+        self.assertFalse(valid)
+        self.assertEqual(why, "containment_empty")
+
+    def test_refuses_counterexample_3_suffix_only_and_ancestor_and_traversal_cgroups(self):
+        """Counterexample 3: suffix-only matches, ancestor scopes, traversals, and blank/root fail closed."""
+        # 1. Suffix-only cgroup match is rejected
+        suffix_scope = "/scope" if not self.cgroup_path.endswith("/scope") else "/different.scope"
+        self.assertFalse(is_pid_in_cgroup(self.proc.pid, suffix_scope))
+        info = dict(self.valid_workload_info, workload_cgroup=suffix_scope)
+        valid, why = validate_native_workload_pid(self.proc.pid, info)
+        self.assertFalse(valid)
+        self.assertIn("pid_not_in_workload_cgroup", why)
+
+        # 2. Ancestor cgroup match is rejected (e.g. /user.slice)
+        ancestor_scope = "/user.slice"
+        if normalize_cgroup_path(self.cgroup_path) != ancestor_scope:
+            self.assertFalse(is_pid_in_cgroup(self.proc.pid, ancestor_scope))
+            info = dict(self.valid_workload_info, workload_cgroup=ancestor_scope)
+            valid, why = validate_native_workload_pid(self.proc.pid, info)
+            self.assertFalse(valid)
+            self.assertIn("pid_not_in_workload_cgroup", why)
+
+        # 3. Path traversal attempts are rejected
+        self.assertIsNone(normalize_cgroup_path("/../test.scope"))
+        self.assertIsNone(normalize_cgroup_path("/user.slice/../../test.scope"))
+        info = dict(self.valid_workload_info, workload_cgroup="/../test.scope")
+        valid, why = validate_native_workload_pid(self.proc.pid, info)
+        self.assertFalse(valid)
+        self.assertIn("invalid_workload_cgroup", why)
+
+        # 4. Root or empty/blank cgroups are rejected
+        for bad_cg in ("", "   ", "/", "/sys/fs/cgroup", "/sys/fs/cgroup/"):
+            self.assertIsNone(normalize_cgroup_path(bad_cg))
+            info = dict(self.valid_workload_info, workload_cgroup=bad_cg)
+            valid, why = validate_native_workload_pid(self.proc.pid, info)
+            self.assertFalse(valid)
+            self.assertTrue(
+                any(k in why for k in ("invalid_workload_cgroup", "missing_workload_cgroup")),
+                f"Expected cgroup refusal for {bad_cg!r}, got: {why}",
+            )
+
+    def test_refuses_pid_cgroup_discrepancy_and_unreadable_membership(self):
+        """Proc-vs-cgroup discrepancy between /proc/<pid>/cgroup and cgroup.procs fails closed."""
+        # /proc/<pid>/cgroup matches workload_cgroup, but cgroup.procs does not contain pid
+        info = dict(self.valid_workload_info, cgroup_procs_pids=[999997, 999998])
+        valid, why = validate_native_workload_pid(self.proc.pid, info)
+        self.assertFalse(valid)
+        self.assertIn("pid_not_in_workload_cgroup", why)
+
+    def test_refuses_pid_reuse_and_start_ticks_mismatch(self):
+        """Start-ticks mismatch (PID reuse), stale start time, and future start time fail closed."""
+        # 1. start_ticks mismatch indicates PID reuse
+        if self.start_ticks is not None:
+            info = dict(self.valid_workload_info, start_ticks=self.start_ticks + 500)
+            valid, why = validate_native_workload_pid(self.proc.pid, info)
+            self.assertFalse(valid)
+            self.assertIn("pid_start_ticks_mismatch", why)
+
+        # 2. Stale PID started before native session
+        info = dict(self.valid_workload_info, proc_start_time=100.0, created_at_ms=200000)
+        valid, why = validate_native_workload_pid(self.proc.pid, info)
+        self.assertFalse(valid)
+        self.assertIn("stale_pid_started_before_session", why)
+
+        # 3. Future start time (> time.time() + 2.0)
+        info = dict(self.valid_workload_info, proc_start_time=time.time() + 50.0)
+        valid, why = validate_native_workload_pid(self.proc.pid, info)
+        self.assertFalse(valid)
+        self.assertIn("future_pid_start_time", why)
+
+    def test_role_run_prestart_refuses_invalid_receipt_and_never_acks(self):
+        """RoleRun prestart handshake refuses invalid first-action evidence and never creates start_ack_file."""
+        cfg = TrustedRoleConfig.build(
+            enabled=True,
+            profiles={
+                "writer-run": RoleProfileConfig(
+                    profile="writer-run",
+                    enabled=True,
+                    workspace=self.workspace,
+                    launcher_provider="antigravity",
+                ),
+            },
+            state_dir=self.base / "roles",
+            launcher_repo=self.base / "launcher-repo",
+        )
+        run = RoleRun(
+            job_id="job-prestart-refuse",
+            job_token="tok-1",
+            lease_epoch=1,
+            role_binding={
+                "name": "automation:demo:writer",
+                "generation": 1,
+                "role_type": "writer",
+                "profile": "writer-run",
+            },
+            kind="writer-run",
+            payload={},
+            hub_url="https://hub.example.com",
+            host_id="host-1",
+            config=cfg,
+            launcher_executor=lambda ctx: {"status": "ok"},
+        )
+        run.native_session = "11111111-2222-3333-4444-555555555555"
+        run.is_injected_test = True
+        run.native_tag = "task-hub-role-writer-run-job-prestart-refuse-g1-e1"
+        run.native_workspace = str(self.workspace)
+        run.native_engine = "antigravity"
+        run.created_at_ms = int(time.time() * 1000) - 2000
+
+        # Write invalid first-action file (supervisor PID used instead of workload PID)
+        fa_data = {
+            "job_id": "job-prestart-refuse",
+            "epoch": 1,
+            "role_name": "automation:demo:writer",
+            "generation": 1,
+            "stage": "first_action",
+            "pid": 999998,  # Matches worker_pid (supervisor)
+            "native_session": "11111111-2222-3333-4444-555555555555",
+            "utc": "2026-10-18T00:00:00Z",
+            "isolation_kind": "native_cgroup",
+        }
+        run.first_action_file.parent.mkdir(parents=True, exist_ok=True)
+        run.first_action_file.write_text(json.dumps(fa_data), encoding="utf-8")
+
+        # Corroborated binding specifies worker_pid = 999998, workload_pid = self.proc.pid
+        run.corroborate_maintained_binding = lambda: {
+            "native_id": "11111111-2222-3333-4444-555555555555",
+            "session_id": "11111111-2222-3333-4444-555555555555",
+            "tag": "task-hub-role-writer-run-job-prestart-refuse-g1-e1",
+            "workspace": str(self.workspace),
+            "engine": "antigravity",
+            "created_at_ms": int(time.time() * 1000) - 2000,
+            "workload_pid": self.proc.pid,
+            "worker_pid": 999998,
+            "workload_cgroup": self.cgroup_path,
+            "containment_empty": False,
+            "phase": "running",
+        }
+
+        # wait_bootstrap must refuse the invalid evidence within fast timeout and never ack
+        res = run.wait_bootstrap(timeout=0.2)
+        self.assertIsNone(res)
+        self.assertFalse(run.start_ack_file.exists())
 
 
 if __name__ == "__main__":
