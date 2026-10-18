@@ -876,4 +876,457 @@ describe('Disk Monitoring Service', () => {
     const resSpoof = await hub.monitoringService.handleHostHealthObservation(reqSpoof, auth);
     expect(resSpoof.status).toBe(403);
   }));
+
+  it('manages supervisor service health episodes, deduplication, attention and real recovery', () => fixture(async (hub, clock) => {
+    enrollHost(hub.sql, 'hetzner');
+    const auth = { kind: 'host' as const, machine_id: 'hetzner', tokenId: 'cred-hetzner' };
+
+    // 1. Post healthy supervisor status -> no alert
+    const reqHealthy = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: iso(10),
+        load: { load1: 0.8, load5: 1.2, load15: 1.0 },
+        memory: { total_bytes: 16_000_000_000, available_bytes: 10_000_000_000, used_bytes: 6_000_000_000, percent: 37.5, status: 'ok' },
+        services: [
+          {
+            service_id: 'supervision',
+            worker: 'alive',
+            status_file_age_s: 42.0,
+            observed_at: iso(10),
+            reason: 'ok',
+          },
+        ],
+      }),
+    });
+    const resHealthy = await hub.monitoringService.handleHostHealthObservation(reqHealthy, auth);
+    expect(resHealthy.status).toBe(200);
+
+    let summary = hub.monitoringService.getStatusSummary(clock.t);
+    expect(summary.host_health).toHaveLength(1);
+    expect(summary.host_health[0].services).toHaveLength(1);
+    expect(summary.host_health[0].services![0].worker).toBe('alive');
+    expect(summary.host_health[0].services![0].status_file_age_s).toBe(52.0);
+    expect(summary.needs_attention).toHaveLength(0);
+
+    // Verify GET /api/monitoring/health returns services projection
+    const getRes = await hub.monitoringService.handleHostHealthGet(
+      new Request('https://hub.internal/api/monitoring/health'),
+      { caller: { isAdmin: true } },
+    );
+    expect(getRes.status).toBe(200);
+    const getData: any = await getRes.json();
+    expect(getData.machines[0].services).toBeDefined();
+    expect(getData.machines[0].services[0].service_id).toBe('supervision');
+    expect(getData.machines[0].services[0].worker).toBe('alive');
+
+    // 2. Post stale supervisor status (age 650s > 600s threshold) -> opens single attention episode
+    const reqStale = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: iso(8),
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 16_000_000_000, available_bytes: 10_000_000_000, used_bytes: 6_000_000_000, percent: 37.5, status: 'ok' },
+        services: [
+          {
+            service_id: 'supervision',
+            worker: 'alive',
+            status_file_age_s: 650.0,
+            observed_at: iso(8),
+            reason: 'stale_status_file',
+          },
+        ],
+      }),
+    });
+    const resStale = await hub.monitoringService.handleHostHealthObservation(reqStale, auth);
+    expect(resStale.status).toBe(200);
+
+    // Check alert opened
+    const alerts = hub.livenessService.alerts();
+    expect(alerts.some((a: any) => a.subject_kind === 'supervisor' && a.subject === 'hetzner:supervision' && a.state === 'stale')).toBe(true);
+
+    // Check episode row created in supervisor_episodes
+    const episodes = hub.sql.exec("SELECT * FROM supervisor_episodes WHERE episode_key = 'supervisor:hetzner:supervision'").toArray() as any[];
+    expect(episodes).toHaveLength(1);
+    expect(episodes[0].state).toBe('stale');
+    expect(episodes[0].resolved_at).toBeNull();
+
+    // Check needs_attention contains item
+    summary = hub.monitoringService.getStatusSummary(clock.t);
+    expect(summary.needs_attention.some((n: any) => n.subject === 'hetzner:supervision' && n.severity === 'warn')).toBe(true);
+
+    // 3. Repeated poll with same stale status -> deduplicated, does NOT create duplicate episode
+    const reqStale2 = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: iso(6),
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 16_000_000_000, available_bytes: 10_000_000_000, used_bytes: 6_000_000_000, percent: 37.5, status: 'ok' },
+        services: [
+          {
+            service_id: 'supervision',
+            worker: 'alive',
+            status_file_age_s: 660.0,
+            observed_at: iso(6),
+            reason: 'stale_status_file',
+          },
+        ],
+      }),
+    });
+    await hub.monitoringService.handleHostHealthObservation(reqStale2, auth);
+    const episodesAfter = hub.sql.exec("SELECT * FROM supervisor_episodes WHERE episode_key = 'supervisor:hetzner:supervision'").toArray() as any[];
+    expect(episodesAfter).toHaveLength(1);
+
+    // 4. Worker broken -> escalates state to broken/critical
+    const reqBroken = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: iso(4),
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 16_000_000_000, available_bytes: 10_000_000_000, used_bytes: 6_000_000_000, percent: 37.5, status: 'ok' },
+        services: [
+          {
+            service_id: 'supervision',
+            worker: 'broken',
+            status_file_age_s: 670.0,
+            observed_at: iso(4),
+            reason: 'worker_broken',
+          },
+        ],
+      }),
+    });
+    await hub.monitoringService.handleHostHealthObservation(reqBroken, auth);
+    summary = hub.monitoringService.getStatusSummary(clock.t);
+    expect(summary.needs_attention.some((n: any) => n.subject === 'hetzner:supervision' && n.severity === 'critical')).toBe(true);
+
+    // 5. Recovery -> resolves episode, clears alert, removes from needs_attention
+    const reqRecovered = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: iso(2),
+        load: { load1: 0.5, load5: 0.8, load15: 0.9 },
+        memory: { total_bytes: 16_000_000_000, available_bytes: 10_000_000_000, used_bytes: 6_000_000_000, percent: 37.5, status: 'ok' },
+        services: [
+          {
+            service_id: 'supervision',
+            worker: 'alive',
+            status_file_age_s: 15.0,
+            observed_at: iso(2),
+            reason: 'ok',
+          },
+        ],
+      }),
+    });
+    const resRecovered = await hub.monitoringService.handleHostHealthObservation(reqRecovered, auth);
+    expect(resRecovered.status).toBe(200);
+
+    const episodesResolved = hub.sql.exec("SELECT * FROM supervisor_episodes WHERE episode_key = 'supervisor:hetzner:supervision'").toArray() as any[];
+    expect(episodesResolved).toHaveLength(1);
+    expect(episodesResolved[0].resolved_at).not.toBeNull();
+
+    // Alert cleared in liveness
+    const alertsRecovered = hub.livenessService.alerts();
+    expect(alertsRecovered.some((a: any) => a.subject_kind === 'supervisor' && a.subject === 'hetzner:supervision' && a.resolved_at === null)).toBe(false);
+
+    // needs_attention cleared
+    summary = hub.monitoringService.getStatusSummary(clock.t);
+    expect(summary.needs_attention.some((n: any) => n.subject === 'hetzner:supervision')).toBe(false);
+  }));
+
+  it('rejects invalid supervisor service payloads and handles missing/future data honestly', () => fixture(async (hub, clock) => {
+    enrollHost(hub.sql, 'hetzner');
+    const auth = { kind: 'host' as const, machine_id: 'hetzner', tokenId: 'cred-hetzner' };
+
+    // 1. Invalid worker state (not alive/broken/unknown)
+    const reqBadWorker = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: iso(5),
+        load: { load1: 1, load5: 1, load15: 1 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        services: [{ service_id: 'supervision', worker: 'running' }],
+      }),
+    });
+    const resBadWorker = await hub.monitoringService.handleHostHealthObservation(reqBadWorker, auth);
+    expect(resBadWorker.status).toBe(400);
+
+    // 2. Missing/null status file age is accepted honestly (never healthy zero) and opens alert
+    const reqMissing = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: iso(5),
+        load: { load1: 1, load5: 1, load15: 1 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        services: [
+          {
+            service_id: 'supervision',
+            worker: 'unknown',
+            status_file_age_s: null,
+            observed_at: null,
+            reason: 'missing_status_file',
+          },
+        ],
+      }),
+    });
+    const resMissing = await hub.monitoringService.handleHostHealthObservation(reqMissing, auth);
+    expect(resMissing.status).toBe(200);
+
+    const summary = hub.monitoringService.getStatusSummary(clock.t);
+    expect(summary.host_health[0].services![0].status_file_age_s).toBeNull();
+    expect(summary.needs_attention.some((n: any) => n.subject === 'hetzner:supervision')).toBe(true);
+
+    // 3. Backward compatibility: win35 offline or payload without services causes no alert
+    enrollHost(hub.sql, 'win35');
+    const authWin = { kind: 'host' as const, machine_id: 'win35', tokenId: 'cred-win35' };
+    const reqWin = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'win35',
+        observed_at: iso(5),
+        load: { load1: 0.1, load5: 0.1, load15: 0.1 },
+        memory: { total_bytes: 8000, available_bytes: 4000, used_bytes: 4000, percent: 50, status: 'ok' },
+      }),
+    });
+    const resWin = await hub.monitoringService.handleHostHealthObservation(reqWin, authWin);
+    expect(resWin.status).toBe(200);
+
+    const summaryWin = hub.monitoringService.getStatusSummary(clock.t);
+    expect(summaryWin.needs_attention.some((n: any) => n.subject.startsWith('win35'))).toBe(false);
+  }));
+
+  it('rejects duplicate service_id, validates future timestamps, and derives effective source age on stale host checkin', () => fixture(async (hub, clock) => {
+    enrollHost(hub.sql, 'hetzner');
+    const auth = { kind: 'host' as const, machine_id: 'hetzner', tokenId: 'cred-hetzner' };
+
+    // 1. Rejection of duplicate service_id (prevents hiding failures with duplicate entries)
+    const reqDup = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: iso(5),
+        load: { load1: 1, load5: 1, load15: 1 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        services: [
+          { service_id: 'supervision', worker: 'alive', status_file_age_s: 10, observed_at: iso(5), reason: 'ok' },
+          { service_id: 'supervision', worker: 'broken', status_file_age_s: 10, observed_at: iso(5), reason: 'worker_broken' },
+        ],
+      }),
+    });
+    const resDup = await hub.monitoringService.handleHostHealthObservation(reqDup, auth);
+    expect(resDup.status).toBe(400);
+    const dupBody = (await resDup.json()) as any;
+    expect(dupBody.error).toBe('duplicate_service_id');
+
+    // 2. Future service observed_at (> now + 60s) is degraded to unknown / future_observation_timestamp
+    const futureIso = new Date(clock.t + 120000).toISOString();
+    const reqFuture = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: iso(2),
+        load: { load1: 1, load5: 1, load15: 1 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        services: [
+          { service_id: 'supervision', worker: 'alive', status_file_age_s: 10, observed_at: futureIso, reason: 'ok' },
+        ],
+      }),
+    });
+    const resFuture = await hub.monitoringService.handleHostHealthObservation(reqFuture, auth);
+    expect(resFuture.status).toBe(200);
+
+    const summaryFuture = hub.monitoringService.getStatusSummary(clock.t);
+    const svcFuture = summaryFuture.host_health[0].services![0];
+    expect(svcFuture.worker).toBe('unknown');
+    expect(svcFuture.status_file_age_s).toBeNull();
+    expect(svcFuture.reason).toBe('future_observation_timestamp');
+    expect(summaryFuture.needs_attention.some((n: any) => n.subject === 'hetzner:supervision')).toBe(true);
+
+    // 3. Invented healthy state with null timestamp (age 0, 1, or 60) is degraded to unknown / missing_observation_timestamp
+    const reqZero = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: iso(2),
+        load: { load1: 1, load5: 1, load15: 1 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        services: [
+          { service_id: 'supervision', worker: 'alive', status_file_age_s: 1.0, observed_at: null, reason: 'ok' },
+        ],
+      }),
+    });
+    const resZero = await hub.monitoringService.handleHostHealthObservation(reqZero, auth);
+    expect(resZero.status).toBe(200);
+
+    const summaryZero = hub.monitoringService.getStatusSummary(clock.t);
+    const svcZero = summaryZero.host_health[0].services![0];
+    expect(svcZero.worker).toBe('unknown');
+    expect(svcZero.reason).toBe('missing_observation_timestamp');
+
+    // 4. Old source timestamp + reported age 0 on fresh host report:
+    // Derives conservative source age from (now - source_observed_at), flagging stale_status_file
+    const oldSourceIso = new Date(clock.t - 700000).toISOString(); // 700s old source
+    const reqOldSource = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: iso(0), // fresh host report right now
+        load: { load1: 1, load5: 1, load15: 1 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        services: [
+          { service_id: 'supervision', worker: 'alive', status_file_age_s: 0.0, observed_at: oldSourceIso, reason: 'ok' },
+        ],
+      }),
+    });
+    const resOldSource = await hub.monitoringService.handleHostHealthObservation(reqOldSource, auth);
+    expect(resOldSource.status).toBe(200);
+
+    const summaryOldSource = hub.monitoringService.getStatusSummary(clock.t);
+    const svcOldSource = summaryOldSource.host_health[0].services![0];
+    expect(svcOldSource.status_file_age_s).toBeGreaterThanOrEqual(700.0);
+    expect(svcOldSource.reason).toBe('stale_status_file');
+    expect(summaryOldSource.needs_attention.some((n: any) => n.subject === 'hetzner:supervision')).toBe(true);
+
+    // 5. Stale host check-in: effective age increases with elapsed time since observation
+    // Record a healthy observation 15 minutes ago (900 seconds)
+    const pastObsIso = new Date(clock.t - 900000).toISOString();
+    const reqPast = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: pastObsIso,
+        load: { load1: 1, load5: 1, load15: 1 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        services: [
+          { service_id: 'supervision', worker: 'alive', status_file_age_s: 10.0, observed_at: pastObsIso, reason: 'ok' },
+        ],
+      }),
+    });
+    const resPast = await hub.monitoringService.handleHostHealthObservation(reqPast, auth);
+    expect(resPast.status).toBe(200);
+
+    // Current query at clock.t (900s elapsed since host observation):
+    const healthStatus = hub.monitoringService.getHostHealthStatus(clock.t);
+    const hostHetzner = healthStatus.machines.find(m => m.machine_id === 'hetzner');
+    expect(hostHetzner).toBeDefined();
+    expect(hostHetzner!.freshness).toBe('stale');
+
+    // Effective service age = 10.0 + 900 = 910s (> 600s threshold)
+    const svcHetzner = hostHetzner!.services![0];
+    expect(svcHetzner.status_file_age_s).toBe(910.0);
+    expect(svcHetzner.reason).toBe('stale_status_file');
+
+    // Appears in needs_attention because supervisor is stale
+    const summaryStale = hub.monitoringService.getStatusSummary(clock.t);
+    expect(summaryStale.needs_attention.some((n: any) => n.subject === 'hetzner:supervision')).toBe(true);
+  }));
+
+  it('does not resolve durable supervisor episode on delayed healthy report and resolves only on genuine fresh report', () => fixture(async (hub, clock) => {
+    enrollHost(hub.sql, 'hetzner');
+    const auth = { kind: 'host' as const, machine_id: 'hetzner', tokenId: 'cred-hetzner' };
+
+    // 1. Create broken episode (worker: broken) -> opens alert and episode
+    const reqBroken = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: new Date(clock.t).toISOString(),
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        services: [
+          { service_id: 'supervision', worker: 'broken', status_file_age_s: 10.0, observed_at: new Date(clock.t).toISOString(), reason: 'worker_broken' },
+        ],
+      }),
+    });
+    const resBroken = await hub.monitoringService.handleHostHealthObservation(reqBroken, auth);
+    expect(resBroken.status).toBe(200);
+
+    const episodesBroken = hub.sql.exec("SELECT * FROM supervisor_episodes WHERE episode_key = 'supervisor:hetzner:supervision'").toArray() as any[];
+    expect(episodesBroken).toHaveLength(1);
+    expect(episodesBroken[0].state).toBe('broken');
+    expect(episodesBroken[0].resolved_at).toBeNull();
+    let alerts = hub.livenessService.alerts();
+    expect(alerts.some((a: any) => a.subject_kind === 'supervisor' && a.subject === 'hetzner:supervision' && a.state === 'broken' && a.resolved_at === null)).toBe(true);
+
+    // 2. Post delayed "healthy" report: outer report is >600s old (e.g. 700s old) with equally old source timestamp, reported age 0, worker alive, reason ok
+    const delayedObsIso = new Date(clock.t - 700000).toISOString();
+    const reqDelayed = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: delayedObsIso,
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        services: [
+          { service_id: 'supervision', worker: 'alive', status_file_age_s: 0.0, observed_at: delayedObsIso, reason: 'ok' },
+        ],
+      }),
+    });
+    const resDelayed = await hub.monitoringService.handleHostHealthObservation(reqDelayed, auth);
+    expect(resDelayed.status).toBe(200);
+
+    // Persisted episode and alert MUST remain open! State transitions to stale.
+    const episodesAfterDelayed = hub.sql.exec("SELECT * FROM supervisor_episodes WHERE episode_key = 'supervisor:hetzner:supervision'").toArray() as any[];
+    expect(episodesAfterDelayed).toHaveLength(1);
+    expect(episodesAfterDelayed[0].resolved_at).toBeNull();
+    expect(episodesAfterDelayed[0].state).toBe('stale');
+
+    alerts = hub.livenessService.alerts();
+    expect(alerts.some((a: any) => a.subject_kind === 'supervisor' && a.subject === 'hetzner:supervision' && a.resolved_at === null)).toBe(true);
+
+    // Status GET projects stale
+    const healthStatus = hub.monitoringService.getHostHealthStatus(clock.t);
+    const hostHetzner = healthStatus.machines.find(m => m.machine_id === 'hetzner');
+    expect(hostHetzner!.freshness).toBe('stale');
+    expect(hostHetzner!.services![0].reason).toBe('stale_status_file');
+    expect(hostHetzner!.services![0].status_file_age_s).toBeGreaterThanOrEqual(700.0);
+
+    // 3. Genuine fresh healthy report arrives (fresh outer, fresh source, worker alive, reason ok)
+    const freshObsIso = new Date(clock.t).toISOString();
+    const reqFresh = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'hetzner',
+        observed_at: freshObsIso,
+        load: { load1: 1.0, load5: 1.0, load15: 1.0 },
+        memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+        services: [
+          { service_id: 'supervision', worker: 'alive', status_file_age_s: 10.0, observed_at: freshObsIso, reason: 'ok' },
+        ],
+      }),
+    });
+    const resFresh = await hub.monitoringService.handleHostHealthObservation(reqFresh, auth);
+    expect(resFresh.status).toBe(200);
+
+    // Resolves once!
+    const episodesResolved = hub.sql.exec("SELECT * FROM supervisor_episodes WHERE episode_key = 'supervisor:hetzner:supervision'").toArray() as any[];
+    expect(episodesResolved).toHaveLength(1);
+    expect(episodesResolved[0].resolved_at).not.toBeNull();
+
+    alerts = hub.livenessService.alerts();
+    expect(alerts.some((a: any) => a.subject_kind === 'supervisor' && a.subject === 'hetzner:supervision' && a.resolved_at === null)).toBe(false);
+  }));
 });
+

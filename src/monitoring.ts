@@ -49,6 +49,19 @@ CREATE TABLE IF NOT EXISTS host_health_observations (
   reporter TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_host_health_obs ON host_health_observations(machine_id, observed_at_ms);
+
+CREATE TABLE IF NOT EXISTS supervisor_episodes (
+  episode_key TEXT PRIMARY KEY,
+  machine_id TEXT NOT NULL,
+  service_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  opened_at TEXT NOT NULL,
+  last_updated_at TEXT NOT NULL,
+  resolved_at TEXT,
+  alert_id INTEGER,
+  details_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_supervisor_episodes_open ON supervisor_episodes(resolved_at, machine_id);
 `;
 
 export const DISK_LIMITS = {
@@ -154,11 +167,22 @@ export type HostMemory = {
   error?: string | null;
 };
 
+export type SupervisorServiceStatus = {
+  service_id: string;
+  worker: 'alive' | 'broken' | 'unknown';
+  worker_state?: 'alive' | 'broken' | 'unknown';
+  status_file_age_s: number | null;
+  observed_at: string | null;
+  observation_time?: string | null;
+  reason: string;
+};
+
 export type HostHealthPayload = {
   machine_id: string;
   observed_at: string;
   load: HostLoad;
   memory: HostMemory;
+  services?: SupervisorServiceStatus[];
 };
 
 export type HostHealthSummary = {
@@ -167,6 +191,7 @@ export type HostHealthSummary = {
   freshness: 'fresh' | 'stale' | 'unavailable' | 'unknown';
   load: HostLoad;
   memory: HostMemory;
+  services?: SupervisorServiceStatus[];
 };
 
 export class MonitoringService {
@@ -1064,6 +1089,104 @@ export class MonitoringService {
       fail('invalid_memory_status');
     }
 
+    const services: SupervisorServiceStatus[] = [];
+    const rawServices = Array.isArray(body.services)
+      ? body.services
+      : body.supervision && typeof body.supervision === 'object' && !Array.isArray(body.supervision)
+      ? [body.supervision]
+      : [];
+
+    if (rawServices.length > 16) {
+      fail('invalid_services_count');
+    }
+
+    const seenServiceIds = new Set<string>();
+
+    for (const raw of rawServices) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        fail('invalid_service_entry');
+      }
+      const serviceId = String(raw.service_id ?? raw.id ?? '').replace(CONTROL_RE, '').trim();
+      if (!serviceId || !LABEL_RE.test(serviceId)) {
+        fail('invalid_service_id');
+      }
+      if (seenServiceIds.has(serviceId)) {
+        fail('duplicate_service_id');
+      }
+      seenServiceIds.add(serviceId);
+
+      const workerRaw = String(raw.worker ?? raw.worker_state ?? '').trim().toLowerCase();
+      if (!['alive', 'broken', 'unknown'].includes(workerRaw)) {
+        fail('invalid_worker_state');
+      }
+      let worker = workerRaw as 'alive' | 'broken' | 'unknown';
+
+      let statusFileAgeS: number | null = null;
+      if (raw.status_file_age_s !== null && raw.status_file_age_s !== undefined) {
+        const num = Number(raw.status_file_age_s);
+        if (!Number.isFinite(num) || num < 0) {
+          fail('invalid_status_file_age');
+        }
+        statusFileAgeS = Math.round(num * 10) / 10;
+      }
+
+      let observedAtStr: string | null = null;
+      let sourceObsMs: number | null = null;
+      const rawObs = raw.observed_at ?? raw.observation_time;
+      if (typeof rawObs === 'string' && rawObs.trim()) {
+        const obsTrim = rawObs.trim();
+        const obsMs = Date.parse(obsTrim);
+        if (Number.isFinite(obsMs)) {
+          sourceObsMs = obsMs;
+          if (obsMs > now + 60000) {
+            // Future observation timestamp: degrade to unknown and flag reason
+            worker = 'unknown';
+            observedAtStr = new Date(obsMs).toISOString();
+            statusFileAgeS = null;
+          } else {
+            observedAtStr = new Date(obsMs).toISOString();
+          }
+        }
+      }
+
+      const rawReason = String(raw.reason ?? 'unknown').replace(CONTROL_RE, '').trim();
+      let reason = rawReason.slice(0, 64) || 'unknown';
+
+      // 1. Require valid source timestamp for ANY healthy state:
+      // Missing observed_at cannot be healthy (prevents false recovery with null + age 1, age 60, etc.)
+      if (observedAtStr === null) {
+        if (worker === 'alive') worker = 'unknown';
+        if (reason === 'ok') reason = 'missing_observation_timestamp';
+      }
+
+      // 2. Conservative source age derivation from source timestamp:
+      // At observation time, source age must be at least (observedMs - sourceObsMs).
+      // Contradictory old source (e.g. old observed_at + reported age 0) cannot stay healthy on fresh host reports!
+      if (sourceObsMs !== null && observedAtStr !== null && sourceObsMs <= observedMs + 60000) {
+        const timestampDerivedAgeS = Math.max(0, Math.floor((observedMs - sourceObsMs) / 1000));
+        if (statusFileAgeS === null) {
+          statusFileAgeS = Math.round(timestampDerivedAgeS * 10) / 10;
+        } else {
+          statusFileAgeS = Math.round(Math.max(statusFileAgeS, timestampDerivedAgeS) * 10) / 10;
+        }
+        if (statusFileAgeS > 600 && reason === 'ok') {
+          reason = 'stale_status_file';
+        }
+      } else if (observedAtStr && Date.parse(observedAtStr) > now + 60000) {
+        reason = 'future_observation_timestamp';
+      }
+
+      services.push({
+        service_id: serviceId,
+        worker,
+        worker_state: worker,
+        status_file_age_s: statusFileAgeS,
+        observed_at: observedAtStr,
+        observation_time: observedAtStr,
+        reason,
+      });
+    }
+
     return {
       machine_id: body.machine_id,
       observed_at: new Date(observedMs).toISOString(),
@@ -1076,6 +1199,7 @@ export class MonitoringService {
         status,
         error: typeof body.memory.error === 'string' ? body.memory.error.slice(0, 128) : null,
       },
+      services,
     };
   }
 
@@ -1115,11 +1239,149 @@ export class MonitoringService {
       }
     }
 
+    if (payload.services && payload.services.length) {
+      for (const svc of payload.services) {
+        this.reconcileSupervisorEpisode(payload.machine_id, svc, this.now(), observedMs);
+      }
+    }
+
     return {
       ok: true,
       machine_id: payload.machine_id,
       observed_at: payload.observed_at,
     };
+  }
+
+  /** Deduplicated supervisor service episode management and alerts. */
+  private reconcileSupervisorEpisode(
+    machineId: string,
+    svc: SupervisorServiceStatus,
+    now: number,
+    outerObservedAtMs?: number,
+  ): any | null {
+    const episodeKey = `supervisor:${machineId}:${svc.service_id}`;
+    const nowIso = new Date(now).toISOString();
+    const row: any = this.sql
+      .exec('SELECT * FROM supervisor_episodes WHERE episode_key = ?', episodeKey)
+      .toArray()[0];
+
+    const outerObsMs = outerObservedAtMs ?? now;
+    const outerAgeMs = Math.max(0, now - outerObsMs);
+    const isOuterFresh = outerAgeMs <= 180000;
+    const elapsedS = Math.max(0, Math.floor(outerAgeMs / 1000));
+
+    const effectiveAgeAtNowS =
+      svc.status_file_age_s !== null && typeof svc.status_file_age_s === 'number'
+        ? Math.round((svc.status_file_age_s + elapsedS) * 10) / 10
+        : null;
+
+    const isProblem =
+      !isOuterFresh ||
+      svc.worker !== 'alive' ||
+      effectiveAgeAtNowS === null ||
+      effectiveAgeAtNowS > 600 ||
+      svc.reason !== 'ok';
+
+    if (isProblem) {
+      const problemState =
+        svc.worker === 'broken'
+          ? 'broken'
+          : (effectiveAgeAtNowS !== null && effectiveAgeAtNowS > 600) || !isOuterFresh
+          ? 'stale'
+          : 'unknown';
+
+      const effectiveReason =
+        svc.reason !== 'ok'
+          ? svc.reason
+          : effectiveAgeAtNowS !== null && effectiveAgeAtNowS > 600
+          ? 'stale_status_file'
+          : !isOuterFresh
+          ? 'host_observation_stale'
+          : 'unknown';
+
+      const detail = `Supervisor ${svc.service_id} on ${machineId}: worker is ${svc.worker}, status age ${effectiveAgeAtNowS !== null ? effectiveAgeAtNowS + 's' : 'unknown'} (${effectiveReason})`;
+
+      if (!row || row.resolved_at !== null) {
+        let alertId: number | null = null;
+        if (this.liveness) {
+          const alert = this.liveness.setAlert('supervisor', `${machineId}:${svc.service_id}`, {
+            state: problemState,
+            detail,
+          });
+          if (alert && typeof alert.id === 'number') {
+            alertId = alert.id;
+            if (this.notifyAlertFn) {
+              this.notifyAlertFn(alert).catch(() => {});
+            }
+          }
+        }
+
+        const detailsJson = JSON.stringify({
+          worker: svc.worker,
+          status_file_age_s: effectiveAgeAtNowS,
+          observed_at: svc.observed_at,
+          reason: effectiveReason,
+        });
+
+        this.sql.exec(
+          `INSERT INTO supervisor_episodes (episode_key, machine_id, service_id, state, opened_at, last_updated_at, resolved_at, alert_id, details_json)
+           VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
+           ON CONFLICT(episode_key) DO UPDATE SET
+             state = excluded.state,
+             opened_at = excluded.opened_at,
+             last_updated_at = excluded.last_updated_at,
+             resolved_at = NULL,
+             alert_id = excluded.alert_id,
+             details_json = excluded.details_json`,
+          episodeKey,
+          machineId,
+          svc.service_id,
+          problemState,
+          nowIso,
+          nowIso,
+          alertId,
+          detailsJson,
+        );
+
+        return { episode_key: episodeKey, action: 'opened', state: problemState };
+      } else {
+        const stateChanged = row.state !== problemState;
+        if (stateChanged && this.liveness) {
+          this.liveness.setAlert('supervisor', `${machineId}:${svc.service_id}`, {
+            state: problemState,
+            detail,
+          });
+        }
+        const detailsJson = JSON.stringify({
+          worker: svc.worker,
+          status_file_age_s: effectiveAgeAtNowS,
+          observed_at: svc.observed_at,
+          reason: effectiveReason,
+        });
+        this.sql.exec(
+          'UPDATE supervisor_episodes SET state = ?, last_updated_at = ?, details_json = ? WHERE episode_key = ?',
+          problemState,
+          nowIso,
+          detailsJson,
+          episodeKey,
+        );
+        return { episode_key: episodeKey, action: stateChanged ? 'state_changed' : 'updated', state: problemState };
+      }
+    } else {
+      if (row && row.resolved_at === null) {
+        if (this.liveness) {
+          this.liveness.setAlert('supervisor', `${machineId}:${svc.service_id}`, null);
+        }
+        this.sql.exec(
+          'UPDATE supervisor_episodes SET resolved_at = ?, last_updated_at = ? WHERE episode_key = ?',
+          nowIso,
+          nowIso,
+          episodeKey,
+        );
+        return { episode_key: episodeKey, action: 'resolved', state: 'ok' };
+      }
+    }
+    return null;
   }
 
   getHostHealthStatus(
@@ -1153,12 +1415,48 @@ export class MonitoringService {
       const freshness: 'fresh' | 'stale' | 'unavailable' =
         ageMs <= 180000 ? 'fresh' : ageMs <= 900000 ? 'stale' : 'unavailable';
 
+      const elapsedS = Math.max(0, Math.floor(ageMs / 1000));
+      const projectedServices: SupervisorServiceStatus[] = [];
+
+      for (const svc of (payload.services ?? [])) {
+        let statusFileAgeS = svc.status_file_age_s;
+        let worker = svc.worker;
+        let reason = svc.reason;
+
+        if (statusFileAgeS !== null && typeof statusFileAgeS === 'number') {
+          // Derive effective source age from elapsed time since host observation
+          const effectiveAge = Math.round((statusFileAgeS + elapsedS) * 10) / 10;
+          statusFileAgeS = effectiveAge;
+          if (effectiveAge > 600 && reason === 'ok') {
+            reason = 'stale_status_file';
+          }
+        }
+
+        if (freshness !== 'fresh') {
+          if (reason === 'ok') {
+            reason = 'host_observation_stale';
+          }
+          if (freshness === 'unavailable' && worker === 'alive') {
+            worker = 'unknown';
+          }
+        }
+
+        projectedServices.push({
+          ...svc,
+          worker,
+          worker_state: worker,
+          status_file_age_s: statusFileAgeS,
+          reason,
+        });
+      }
+
       machines.push({
         machine_id: r.machine_id,
         observed_at: r.observed_at,
         freshness,
         load: payload.load ?? { load1: 0, load5: 0, load15: 0 },
         memory: payload.memory ?? { total_bytes: 0, available_bytes: 0, used_bytes: 0, percent: 0, status: 'unknown' },
+        services: projectedServices,
       });
     }
 
@@ -1206,6 +1504,41 @@ export class MonitoringService {
           detail: `Memory is at ${h.memory.percent}% (${formatBytes(h.memory.used_bytes)} / ${formatBytes(h.memory.total_bytes)})`,
           percent: h.memory.percent,
         });
+      }
+
+      for (const svc of h.services || []) {
+        const isProblem =
+          svc.worker !== 'alive' ||
+          svc.status_file_age_s === null ||
+          svc.status_file_age_s > 600 ||
+          svc.reason !== 'ok' ||
+          h.freshness !== 'fresh';
+        if (isProblem) {
+          const reason =
+            svc.reason !== 'ok'
+              ? svc.reason
+              : svc.status_file_age_s === null
+              ? 'missing_status_file'
+              : svc.status_file_age_s > 600
+              ? 'stale_status_file'
+              : h.freshness !== 'fresh'
+              ? 'host_observation_stale'
+              : 'unknown';
+          const worker =
+            h.freshness === 'unavailable' && svc.worker === 'alive'
+              ? 'unknown'
+              : svc.worker;
+          needsAttention.push({
+            severity: worker === 'broken' ? 'critical' : 'warn',
+            subject: `${h.machine_id}:${svc.service_id}`,
+            title: `Supervisor issue on ${h.machine_id}: ${svc.service_id}`,
+            detail: `Worker ${worker}, status age ${svc.status_file_age_s !== null ? svc.status_file_age_s + 's' : 'unknown'} (${reason})`,
+            service_id: svc.service_id,
+            worker,
+            status_file_age_s: svc.status_file_age_s,
+            reason,
+          });
+        }
       }
     }
 
