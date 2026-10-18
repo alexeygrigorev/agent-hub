@@ -1218,6 +1218,7 @@ class RoleRun:
         self._thread: Optional[threading.Thread] = None
         self._started = False
         self._cancelled = False
+        self._cancel_count = 0
         self._cancel_reason: Optional[str] = None
         self._start_time = time.time()
         self._exec_result: Dict[str, Any] = {}
@@ -1627,8 +1628,20 @@ class RoleRun:
 
         return None
 
-    def acknowledge_start(self, start_receipt: Dict[str, Any]) -> None:
-        """Write start acknowledgement file to unblock business execution."""
+    def acknowledge_start(self, start_receipt: Any) -> None:
+        """Write start acknowledgement file to unblock business execution.
+
+        Defensive verification: rejects invalid, non-started, or error receipts before writing.
+        """
+        if getattr(self, "_cancelled", False):
+            raise DispatchError("cannot_acknowledge_start: role run is already cancelled")
+        if not isinstance(start_receipt, dict):
+            raise DispatchError(f"invalid_start_receipt: expected dict, got {type(start_receipt).__name__}")
+        if start_receipt.get("status") != "started":
+            raise DispatchError(f"invalid_start_receipt_status: status must be 'started', got {start_receipt.get('status')!r}")
+        if start_receipt.get("error"):
+            raise DispatchError(f"start_receipt_contains_error: {start_receipt.get('error')}")
+
         write_private_json(self.start_ack_file, {
             "status": "started",
             "job_id": self.job_id,
@@ -1714,6 +1727,7 @@ class RoleRun:
 
     def cancel(self, reason: str) -> Dict[str, Any]:
         """Cancel and dispose the running role unit cleanly with containment verification."""
+        self._cancel_count += 1
         self._cancelled = True
         self._cancel_reason = reason
         verified = False
@@ -1728,7 +1742,18 @@ class RoleRun:
         if self.launcher_executor is not None:
             if self._thread is not None and self._thread.is_alive():
                 self._thread.join(timeout=2.0)
-            return {"verified": True, "reason": reason, "detail": {"injected_executor": True}}
+            verified_injected = True
+            if hasattr(self.launcher_executor, "cancel_verified"):
+                verified_injected = bool(getattr(self.launcher_executor, "cancel_verified"))
+            elif isinstance(self._exec_result, dict) and "cancel_verified" in self._exec_result:
+                verified_injected = bool(self._exec_result.get("cancel_verified"))
+            elif self._thread is not None and self._thread.is_alive():
+                verified_injected = False
+            return {
+                "verified": verified_injected,
+                "reason": reason,
+                "detail": {"injected_executor": True, "verified": verified_injected},
+            }
 
         # 2. Definite prelaunch refusal / no-effect path with recorded evidence
         if getattr(self, "_prelaunch_refusal", False):
@@ -1923,28 +1948,77 @@ class RoleDispatchAdapter:
         deadline_sec: Optional[float] = None,
     ) -> Dict[str, Any]:
         """High-level dispatch of one role job."""
+        if start_callback is None or not callable(start_callback):
+            raise DispatchError("missing_or_invalid_start_callback: callable start_callback is required before begin")
+
         run = self.begin(job_id, job_token, lease_epoch, role_binding, kind, payload, hub_url, host_id)
 
         ev = run.wait_bootstrap(BOOTSTRAP_TIMEOUT_SEC)
         if ev is None:
-            run.cancel("bootstrap_failed_or_timeout")
-            out = run.outcome()
-            return {"status": "failed", "summary": out["summary"], "evidence_refs": []}
+            cancel_res = run.cancel("bootstrap_failed_or_timeout")
+            if cancel_res.get("verified"):
+                out = run.outcome()
+                return {"status": "failed", "summary": out["summary"], "evidence_refs": []}
+            raise DispatchError(
+                f"bootstrap_failed_containment_unverified: timeout or missing evidence; containment: {cancel_res.get('detail')}"
+            )
 
-        if start_callback:
+        start_reply = None
+        cb_exc: Optional[Exception] = None
+        try:
             start_reply = start_callback(ev)
-            run.acknowledge_start(start_reply or {"status": "started", "acknowledged_by": "callback"})
-        else:
-            run.acknowledge_start({"status": "started", "acknowledged_by": "dispatcher"})
+        except Exception as e:
+            cb_exc = e
+
+        is_valid_started = (
+            cb_exc is None
+            and isinstance(start_reply, dict)
+            and start_reply.get("status") == "started"
+            and not start_reply.get("error")
+        )
+
+        if not is_valid_started:
+            if cb_exc is not None:
+                cancel_reason = f"start_callback_exception: {cb_exc}"
+            elif not isinstance(start_reply, dict):
+                cancel_reason = f"server_start_invalid_receipt_type: {type(start_reply).__name__}"
+            elif start_reply.get("error"):
+                cancel_reason = f"server_start_refused: {start_reply.get('error')}"
+            else:
+                cancel_reason = f"server_start_refused: status={start_reply.get('status')!r}"
+
+            cancel_res = run.cancel(cancel_reason)
+            if cancel_res.get("verified"):
+                out = run.outcome()
+                ev_refs = [ev["path"]] if isinstance(ev, dict) and "path" in ev else []
+                summary = out.get("summary") or f"start_rejected: {cancel_reason}"
+                return {
+                    "status": "failed",
+                    "summary": summary,
+                    "evidence_refs": ev_refs,
+                }
+            raise DispatchError(
+                f"server_start_failed_containment_unverified: {cancel_reason}; containment: {cancel_res.get('detail')}"
+            )
+
+        run.acknowledge_start(start_reply)
 
         event = stop_event or threading.Event()
         while not run.wait_done(0.5):
             now = time.time()
             if event.is_set():
-                run.cancel("lease_lost_or_authority_changed")
+                cancel_res = run.cancel("lease_lost_or_authority_changed")
+                if not cancel_res.get("verified"):
+                    raise DispatchError(
+                        f"authority_lost_containment_unverified; containment: {cancel_res.get('detail')}"
+                    )
                 return {"status": "failed", "summary": "role authority lost or cancelled", "evidence_refs": [ev["path"]]}
             if deadline_sec is not None and now > deadline_sec:
-                run.cancel("deadline_exceeded")
+                cancel_res = run.cancel("deadline_exceeded")
+                if not cancel_res.get("verified"):
+                    raise DispatchError(
+                        f"deadline_exceeded_containment_unverified; containment: {cancel_res.get('detail')}"
+                    )
                 return {"status": "failed", "summary": "deadline_exceeded: execution timed out", "evidence_refs": [ev["path"]]}
 
         out = run.outcome()

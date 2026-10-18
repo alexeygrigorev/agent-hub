@@ -1250,5 +1250,456 @@ class TestRoleRealBackendAdapter(unittest.TestCase):
             self.assertEqual(info_ex.get("phase"), "exited")
 
 
+    # 18. Start callback required before begin
+    def test_dispatch_rejects_missing_or_noncallable_start_callback_before_begin(self):
+        adapter = RoleDispatchAdapter(config=self.role_cfg)
+        with self.assertRaises(DispatchError) as ctx_none:
+            adapter.dispatch(
+                job_id="job-no-cb",
+                kind="writer-run",
+                payload={"date": "2026-10-18"},
+                job_token="tok-1",
+                lease_epoch=1,
+                role_binding=self.binding,
+                hub_url="https://hub.example.com",
+                host_id="host-test",
+                start_callback=None,
+            )
+        self.assertIn("missing_or_invalid_start_callback", str(ctx_none.exception))
+
+        with self.assertRaises(DispatchError) as ctx_non_callable:
+            adapter.dispatch(
+                job_id="job-bad-cb",
+                kind="writer-run",
+                payload={"date": "2026-10-18"},
+                job_token="tok-2",
+                lease_epoch=1,
+                role_binding=self.binding,
+                hub_url="https://hub.example.com",
+                host_id="host-test",
+                start_callback="not-callable",
+            )
+        self.assertIn("missing_or_invalid_start_callback", str(ctx_non_callable.exception))
+
+    # 19. Defense: acknowledge_start itself rejects invalid, non-started, or error receipts
+    def test_acknowledge_start_defensive_validation(self):
+        run = RoleRun(
+            job_id="job-ack-defense",
+            job_token="tok-ack",
+            lease_epoch=1,
+            role_binding=self.binding,
+            kind="writer-run",
+            payload={"date": "2026-10-18"},
+            hub_url="https://hub.example.com",
+            host_id="host-test",
+            config=self.role_cfg,
+        )
+        self.assertFalse(run.start_ack_file.exists())
+
+        # Non-dict
+        with self.assertRaises(DispatchError) as ctx1:
+            run.acknowledge_start(None)
+        self.assertIn("invalid_start_receipt", str(ctx1.exception))
+        self.assertFalse(run.start_ack_file.exists())
+
+        with self.assertRaises(DispatchError) as ctx1b:
+            run.acknowledge_start("started")
+        self.assertIn("invalid_start_receipt", str(ctx1b.exception))
+        self.assertFalse(run.start_ack_file.exists())
+
+        # Refused status
+        with self.assertRaises(DispatchError) as ctx2:
+            run.acknowledge_start({"status": "refused", "error": "timeout"})
+        self.assertIn("invalid_start_receipt_status", str(ctx2.exception))
+        self.assertFalse(run.start_ack_file.exists())
+
+        # Error field present
+        with self.assertRaises(DispatchError) as ctx3:
+            run.acknowledge_start({"status": "started", "error": "server_rejected"})
+        self.assertIn("start_receipt_contains_error", str(ctx3.exception))
+        self.assertFalse(run.start_ack_file.exists())
+
+        # Cancelled run rejects
+        run._cancelled = True
+        with self.assertRaises(DispatchError) as ctx4:
+            run.acknowledge_start({"status": "started"})
+        self.assertIn("cannot_acknowledge_start", str(ctx4.exception))
+        self.assertFalse(run.start_ack_file.exists())
+
+        # Valid start receipt writes start_ack_file
+        run._cancelled = False
+        run.acknowledge_start({"status": "started", "acknowledged_by": "hub"})
+        self.assertTrue(run.start_ack_file.exists())
+        data, _, _ = safe_read_bounded_json(run.start_ack_file)
+        self.assertIsNotNone(data)
+        self.assertEqual(data.get("status"), "started")
+        self.assertEqual(data.get("receipt", {}).get("status"), "started")
+
+    # 20. Controlled executor: refused callback with verified cancellation never creates ack, never executes business, cancels once
+    def test_controlled_executor_refused_start_verified_cancel_never_acks_and_cancels_once(self):
+        sess_id = "99999999-9999-9999-9999-999999999999"
+        mock_backend = MagicMock(spec=LauncherBackend)
+        mock_backend.plan.return_value = {"mode": "dry-run", "chosen": "antigravity"}
+        mock_backend.submit.return_value = {"task_id": "task-test", "state": "queued"}
+        mock_backend.stop_session.return_value = (True, "stopped_session", {"state": "exited"})
+
+        proc = subprocess.Popen(["sleep", "60"])
+        business_executed = []
+        ack_file_existed = []
+
+        try:
+            def controlled_executor(ctx):
+                # 1. Write first action
+                fa_path = pathlib.Path(ctx["first_action_file"])
+                ack_path = pathlib.Path(ctx["start_ack_file"])
+                fa_path.parent.mkdir(parents=True, exist_ok=True)
+                fa_path.write_text(json.dumps({
+                    "pid": proc.pid,
+                    "job_id": ctx["job_id"],
+                    "epoch": 3,
+                    "role_name": "automation:demo:writer",
+                    "generation": 2,
+                    "stage": "first_action",
+                    "native_session": sess_id,
+                    "utc": "2026-10-18T00:00:00Z",
+                    "isolation_kind": "native_cgroup",
+                }), encoding="utf-8")
+
+                # 2. Start barrier: wait for start_ack_file
+                start_w = time.time()
+                while time.time() - start_w < 1.0:
+                    if ack_path.exists():
+                        ack_file_existed.append(True)
+                        data, _, _ = safe_read_bounded_json(ack_path)
+                        if data and data.get("status") == "started":
+                            business_executed.append(True)
+                            out_p = pathlib.Path(ctx["outcome_file"])
+                            out_p.write_text(json.dumps({"status": "succeeded", "summary": "business done"}), encoding="utf-8")
+                            return {"status": "succeeded"}
+                    time.sleep(0.02)
+                return {"status": "failed", "business_executed": False}
+
+            mock_backend.get_task_binding.return_value = {
+                "native_id": sess_id,
+                "session_id": sess_id,
+                "tag": "task-hub-role-writer-run-job-refused-v-g2-e3",
+                "workspace": str(self.workspace),
+                "engine": "antigravity",
+                "created_at_ms": 1729200000000,
+            }
+
+            adapter = RoleDispatchAdapter(
+                config=self.role_cfg,
+                launcher_backend=mock_backend,
+                launcher_executor=controlled_executor,
+            )
+
+            # Refused server start callback
+            def start_callback(ev):
+                return {"status": "refused", "error": "server_start_timeout"}
+
+            # Track cancel on run
+            original_begin = adapter.begin
+            captured_run = []
+            def track_begin(*args, **kwargs):
+                r = original_begin(*args, **kwargs)
+                captured_run.append(r)
+                return r
+            adapter.begin = track_begin
+
+            res = adapter.dispatch(
+                job_id="job-refused-v",
+                kind="writer-run",
+                payload={"date": "2026-10-18"},
+                job_token="tok-refused",
+                lease_epoch=3,
+                role_binding=self.binding,
+                hub_url="https://hub.example.com",
+                host_id="host-test",
+                start_callback=start_callback,
+            )
+
+            # Result is honest failed
+            self.assertEqual(res["status"], "failed")
+            self.assertIn("server_start_refused", res["summary"])
+
+            # start_ack_file NEVER existed and does not exist
+            self.assertEqual(len(ack_file_existed), 0)
+            self.assertFalse(captured_run[0].start_ack_file.exists())
+
+            # Business logic NEVER executed
+            self.assertEqual(len(business_executed), 0)
+
+            # Cancelled exactly ONCE
+            self.assertEqual(captured_run[0]._cancel_count, 1)
+        finally:
+            proc.kill()
+            proc.wait()
+
+    # 21. Controlled executor: refused callback with unverified cancellation raises DispatchError for HOLD
+    def test_controlled_executor_refused_start_unverified_cancel_raises_dispatch_error_for_hold(self):
+        sess_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        mock_backend = MagicMock(spec=LauncherBackend)
+        mock_backend.plan.return_value = {"mode": "dry-run", "chosen": "antigravity"}
+        mock_backend.submit.return_value = {"task_id": "task-test", "state": "queued"}
+        # Unverified containment stop
+        mock_backend.stop_session.return_value = (False, "uncertain_containment", {"uncertain": True})
+
+        proc = subprocess.Popen(["sleep", "60"])
+        business_executed = []
+        ack_file_existed = []
+
+        try:
+            def controlled_executor(ctx):
+                fa_path = pathlib.Path(ctx["first_action_file"])
+                ack_path = pathlib.Path(ctx["start_ack_file"])
+                fa_path.parent.mkdir(parents=True, exist_ok=True)
+                fa_path.write_text(json.dumps({
+                    "pid": proc.pid,
+                    "job_id": ctx["job_id"],
+                    "epoch": 3,
+                    "role_name": "automation:demo:writer",
+                    "generation": 2,
+                    "stage": "first_action",
+                    "native_session": sess_id,
+                    "utc": "2026-10-18T00:00:00Z",
+                    "isolation_kind": "native_cgroup",
+                }), encoding="utf-8")
+
+                start_w = time.time()
+                while time.time() - start_w < 1.0:
+                    if ack_path.exists():
+                        ack_file_existed.append(True)
+                        business_executed.append(True)
+                        return {"status": "succeeded"}
+                    time.sleep(0.02)
+                return {"status": "failed", "cancel_verified": False}
+
+            controlled_executor.cancel_verified = False
+
+            mock_backend.get_task_binding.return_value = {
+                "native_id": sess_id,
+                "session_id": sess_id,
+                "tag": "task-hub-role-writer-run-job-refused-u-g2-e3",
+                "workspace": str(self.workspace),
+                "engine": "antigravity",
+                "created_at_ms": 1729200000000,
+            }
+
+            adapter = RoleDispatchAdapter(
+                config=self.role_cfg,
+                launcher_backend=mock_backend,
+                launcher_executor=controlled_executor,
+            )
+
+            original_begin = adapter.begin
+            captured_run = []
+            def track_begin(*args, **kwargs):
+                r = original_begin(*args, **kwargs)
+                captured_run.append(r)
+                return r
+            adapter.begin = track_begin
+
+            with self.assertRaises(DispatchError) as ctx_err:
+                adapter.dispatch(
+                    job_id="job-refused-u",
+                    kind="writer-run",
+                    payload={"date": "2026-10-18"},
+                    job_token="tok-refused-u",
+                    lease_epoch=3,
+                    role_binding=self.binding,
+                    hub_url="https://hub.example.com",
+                    host_id="host-test",
+                    start_callback=lambda ev: {"status": "refused", "error": "host_refusal"},
+                )
+
+            self.assertIn("server_start_failed_containment_unverified", str(ctx_err.exception))
+
+            # Never created ack
+            self.assertEqual(len(ack_file_existed), 0)
+            self.assertFalse(captured_run[0].start_ack_file.exists())
+
+            # Never executed business
+            self.assertEqual(len(business_executed), 0)
+
+            # Cancelled once
+            self.assertEqual(captured_run[0]._cancel_count, 1)
+        finally:
+            proc.kill()
+            proc.wait()
+
+    # 22. Controlled executor: start_callback None, bad shape, or exception never creates ack and cancels once
+    def test_controlled_executor_callback_none_badshape_exception_handling(self):
+        sess_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        mock_backend = MagicMock(spec=LauncherBackend)
+        mock_backend.plan.return_value = {"mode": "dry-run", "chosen": "antigravity"}
+        mock_backend.submit.return_value = {"task_id": "task-test", "state": "queued"}
+        mock_backend.stop_session.return_value = (True, "stopped_session", {"state": "exited"})
+
+        proc = subprocess.Popen(["sleep", "60"])
+        try:
+            def controlled_executor(ctx):
+                fa_path = pathlib.Path(ctx["first_action_file"])
+                fa_path.parent.mkdir(parents=True, exist_ok=True)
+                fa_path.write_text(json.dumps({
+                    "pid": proc.pid,
+                    "job_id": ctx["job_id"],
+                    "epoch": 3,
+                    "role_name": "automation:demo:writer",
+                    "generation": 2,
+                    "stage": "first_action",
+                    "native_session": sess_id,
+                    "utc": "2026-10-18T00:00:00Z",
+                    "isolation_kind": "native_cgroup",
+                }), encoding="utf-8")
+                return {"status": "failed"}
+
+            for case_idx, bad_callback in enumerate([
+                lambda ev: None,                                        # None reply
+                lambda ev: {"status": "unknown"},                      # bad status shape
+                lambda ev: "started",                                  # non-dict shape
+                lambda ev: (_ for _ in ()).throw(RuntimeError("net")),  # exception
+            ]):
+                job_id = f"job-badcb-{case_idx}"
+                mock_backend.get_task_binding.return_value = {
+                    "native_id": sess_id,
+                    "session_id": sess_id,
+                    "tag": f"task-hub-role-writer-run-{job_id}-g2-e3",
+                    "workspace": str(self.workspace),
+                    "engine": "antigravity",
+                    "created_at_ms": 1729200000000,
+                }
+                adapter = RoleDispatchAdapter(
+                    config=self.role_cfg,
+                    launcher_backend=mock_backend,
+                    launcher_executor=controlled_executor,
+                )
+
+                captured_run = []
+                orig_begin = adapter.begin
+                def track_b(*args, **kwargs):
+                    r = orig_begin(*args, **kwargs)
+                    captured_run.append(r)
+                    return r
+                adapter.begin = track_b
+
+                res = adapter.dispatch(
+                    job_id=job_id,
+                    kind="writer-run",
+                    payload={"date": "2026-10-18"},
+                    job_token=f"tok-{case_idx}",
+                    lease_epoch=3,
+                    role_binding=self.binding,
+                    hub_url="https://hub.example.com",
+                    host_id="host-test",
+                    start_callback=bad_callback,
+                )
+                self.assertEqual(res["status"], "failed")
+                self.assertFalse(captured_run[0].start_ack_file.exists())
+                self.assertEqual(captured_run[0]._cancel_count, 1)
+        finally:
+            proc.kill()
+            proc.wait()
+
+    # 23. Controlled executor: explicit started callback writes real ack and executes business
+    def test_controlled_executor_explicit_started_writes_real_ack_and_executes_business(self):
+        sess_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        mock_backend = MagicMock(spec=LauncherBackend)
+        mock_backend.plan.return_value = {"mode": "dry-run", "chosen": "antigravity"}
+        mock_backend.submit.return_value = {"task_id": "task-test", "state": "queued"}
+
+        proc = subprocess.Popen(["sleep", "60"])
+        business_executed = []
+
+        try:
+            def controlled_executor(ctx):
+                fa_path = pathlib.Path(ctx["first_action_file"])
+                ack_path = pathlib.Path(ctx["start_ack_file"])
+                out_path = pathlib.Path(ctx["outcome_file"])
+                fa_path.parent.mkdir(parents=True, exist_ok=True)
+                fa_path.write_text(json.dumps({
+                    "pid": proc.pid,
+                    "job_id": ctx["job_id"],
+                    "epoch": 3,
+                    "role_name": "automation:demo:writer",
+                    "generation": 2,
+                    "stage": "first_action",
+                    "native_session": sess_id,
+                    "utc": "2026-10-18T00:00:00Z",
+                    "isolation_kind": "native_cgroup",
+                }), encoding="utf-8")
+
+                # Wait for start barrier
+                deadline = time.time() + 2.0
+                while time.time() < deadline:
+                    if ack_path.exists():
+                        data, _, _ = safe_read_bounded_json(ack_path)
+                        if data and data.get("status") == "started":
+                            business_executed.append(True)
+                            out_path.write_text(json.dumps({
+                                "status": "succeeded",
+                                "summary": "article drafted after real start acknowledgement",
+                                "evidence_refs": [str(out_path)],
+                            }), encoding="utf-8")
+                            return {"status": "succeeded"}
+                    time.sleep(0.02)
+                return {"status": "failed", "error": "ack_timeout"}
+
+            job_id = "job-started-success"
+            mock_backend.get_task_binding.return_value = {
+                "native_id": sess_id,
+                "session_id": sess_id,
+                "tag": f"task-hub-role-writer-run-{job_id}-g2-e3",
+                "workspace": str(self.workspace),
+                "engine": "antigravity",
+                "created_at_ms": 1729200000000,
+            }
+
+            adapter = RoleDispatchAdapter(
+                config=self.role_cfg,
+                launcher_backend=mock_backend,
+                launcher_executor=controlled_executor,
+            )
+
+            captured_run = []
+            orig_begin = adapter.begin
+            def track_b(*args, **kwargs):
+                r = orig_begin(*args, **kwargs)
+                captured_run.append(r)
+                return r
+            adapter.begin = track_b
+
+            res = adapter.dispatch(
+                job_id=job_id,
+                kind="writer-run",
+                payload={"date": "2026-10-18"},
+                job_token="tok-success",
+                lease_epoch=3,
+                role_binding=self.binding,
+                hub_url="https://hub.example.com",
+                host_id="host-test",
+                start_callback=lambda ev: {"status": "started", "acknowledged_by": "hub_server"},
+            )
+
+            # Successfully completed
+            self.assertEqual(res["status"], "succeeded")
+            self.assertIn("article drafted after real start acknowledgement", res["summary"])
+
+            # Real start_ack_file exists
+            self.assertTrue(captured_run[0].start_ack_file.exists())
+            ack_data, _, _ = safe_read_bounded_json(captured_run[0].start_ack_file)
+            self.assertEqual(ack_data.get("status"), "started")
+            self.assertEqual(ack_data.get("receipt", {}).get("status"), "started")
+
+            # Business logic executed
+            self.assertEqual(len(business_executed), 1)
+
+            # cancel was NOT called
+            self.assertEqual(captured_run[0]._cancel_count, 0)
+        finally:
+            proc.kill()
+            proc.wait()
+
+
 if __name__ == "__main__":
     unittest.main()
