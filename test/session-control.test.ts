@@ -969,6 +969,338 @@ describe('absolute workspace identifiers and friendly names', () => {
         expect(childIds).toContain(child2.id);
       }, fake.hook);
     });
+
+    it('provides machine-scoped imported bindings read endpoint with pagination', async () => {
+      await fixture(async (s, sql) => {
+        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+
+        // Unauthenticated call rejected
+        expect((await s.handle(request('/api/sessions/host-bindings?kind=imported', undefined, 'GET'), unauth)).status).toBe(401);
+        // Non-host caller rejected
+        expect((await s.handle(request('/api/sessions/host-bindings?kind=imported', undefined, 'GET'), stranger)).status).toBe(403);
+
+        // Host on machine 'hetzner' reads imported bindings
+        const res = await s.handle(request('/api/sessions/host-bindings?kind=imported', undefined, 'GET'), host('hetzner'));
+        expect(res.status).toBe(200);
+        const data = await res.json() as any;
+        expect(data.sessions.length).toBe(2);
+        expect(data.sessions.map((x: any) => x.id).sort()).toEqual([NATIVE_CRM_ID, NATIVE_DATAOPS_ID].sort());
+        const d0 = data.sessions.find((x: any) => x.id === NATIVE_DATAOPS_ID);
+        expect(d0.binding.native_id).toBe(NATIVE_DATAOPS_ID);
+        expect(d0.binding.tag).toBe('batching');
+        expect(d0.binding.workspace).toBe('/home/alexey/git/dataops');
+        expect(d0.binding.native_created_at_ms).toBe(1792257043571);
+        expect(d0.binding.provenance).toBe('observed_native');
+        expect(d0.engine).toBe('argon');
+
+        // Host on foreign machine 'win35' sees 0 sessions (no cross-machine leak)
+        const at = new Date().toISOString();
+        const far = new Date(Date.now() + 30 * 86400000).toISOString();
+        sql.exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
+          VALUES ('host-cred-win35', 'host', 'hash-win35', 'refresh-win35', 'host-family-win35', 'test-win35', 'win35', NULL, '["host"]', 'test', ?, ?)`, at, far);
+        sql.exec(`INSERT OR IGNORE INTO machines (id, name, hostname, credential_id, registered_at) VALUES ('win35', 'win35', 'win35', 'host-cred-win35', ?)`, at);
+
+        const foreignRes = await s.handle(request('/api/sessions/host-bindings?kind=imported', undefined, 'GET'), host('win35', 'host-cred-win35'));
+        expect(foreignRes.status).toBe(200);
+        expect((await foreignRes.json() as any).sessions).toEqual([]);
+
+        // Default GET /api/sessions/host-bindings returns pending fleet starts in sessions only (no imported array)
+        const defaultRes = await s.handle(request('/api/sessions/host-bindings', undefined, 'GET'), host('hetzner'));
+        expect(defaultRes.status).toBe(200);
+        const defaultData = await defaultRes.json() as any;
+        expect(defaultData.sessions).toEqual([]); // No pending fleet starts
+        expect(defaultData.imported).toBeUndefined();
+
+        // Bounded pagination: limit=1
+        const page1Res = await s.handle(request('/api/sessions/host-bindings?kind=imported&limit=1', undefined, 'GET'), host('hetzner'));
+        const page1 = await page1Res.json() as any;
+        expect(page1.sessions.length).toBe(1);
+        expect(page1.next_cursor).toBeTruthy();
+
+        const page2Res = await s.handle(request(`/api/sessions/host-bindings?kind=imported&limit=1&cursor=${encodeURIComponent(page1.next_cursor)}`, undefined, 'GET'), host('hetzner'));
+        const page2 = await page2Res.json() as any;
+        expect(page2.sessions.length).toBe(1);
+        expect(page2.sessions[0].id).not.toBe(page1.sessions[0].id);
+      });
+    });
+
+    it('positively retires imported session from exact authentic tombstone evidence and replays idempotently', async () => {
+      await fixture(async (s, sql) => {
+        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+
+        // Verify initial state
+        const initial = await (await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}`, undefined, 'GET'), admin)).json() as any;
+        expect(initial.state).toBe('running');
+        expect(initial.controllability).toBe('controllable');
+
+        const validPayload = {
+          native: {
+            native_id: NATIVE_DATAOPS_ID,
+            tag: 'batching',
+            workspace: '/home/alexey/git/dataops',
+            created_at_ms: 1792257043571,
+            engine: 'argon',
+          },
+          generation: 1,
+          finished_at_ms: 1792257100000,
+          cause: 'finished',
+          state: 'stopped',
+        };
+
+        // 1. Foreign machine caller rejected with 404 (not_found: machine isolation)
+        const at = new Date().toISOString();
+        const far = new Date(Date.now() + 30 * 86400000).toISOString();
+        sql.exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
+          VALUES ('host-cred-win35', 'host', 'hash-win35', 'refresh-win35', 'host-family-win35', 'test-win35', 'win35', NULL, '["host"]', 'test', ?, ?)`, at, far);
+        sql.exec(`INSERT OR IGNORE INTO machines (id, name, hostname, credential_id, registered_at) VALUES ('win35', 'win35', 'win35', 'host-cred-win35', ?)`, at);
+
+        const foreignRetire = await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, validPayload), host('win35', 'host-cred-win35'));
+        expect(foreignRetire.status).toBe(404);
+
+        // Admin caller rejected with 403 (host kind only, no admin fallback)
+        const adminRetire = await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, validPayload), admin);
+        expect(adminRetire.status).toBe(403);
+
+        // Removed aliases return 404
+        expect((await s.handle(request('/api/sessions/host-imported-bindings', undefined, 'GET'), host('hetzner'))).status).toBe(404);
+        expect((await s.handle(request('/api/sessions/retirement', validPayload), host('hetzner'))).status).toBe(404);
+        expect((await s.handle(request('/api/sessions/host-retirement', validPayload), host('hetzner'))).status).toBe(404);
+        expect((await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/terminal`, validPayload), host('hetzner'))).status).toBe(404);
+        expect((await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/result`, validPayload), host('hetzner'))).status).toBe(404);
+
+        // 2. Mismatched tuple checks:
+        // Wrong tag -> 409
+        expect((await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, { ...validPayload, native: { ...validPayload.native, tag: 'wrong-tag' } }), host('hetzner'))).status).toBe(409);
+        // Wrong workspace -> 409
+        expect((await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, { ...validPayload, native: { ...validPayload.native, workspace: '/wrong/path' } }), host('hetzner'))).status).toBe(409);
+        // Wrong incarnation (created_at_ms) -> 409
+        expect((await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, { ...validPayload, native: { ...validPayload.native, created_at_ms: 9999999 } }), host('hetzner'))).status).toBe(409);
+        // Wrong engine -> 409
+        expect((await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, { ...validPayload, native: { ...validPayload.native, engine: 'codex' } }), host('hetzner'))).status).toBe(409);
+        // Wrong generation -> 409
+        expect((await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, { ...validPayload, generation: 2 }), host('hetzner'))).status).toBe(409);
+
+        // 3. Evidence / timestamp validation:
+        // Cause is not finished -> 400
+        expect((await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, { ...validPayload, cause: 'killed' }), host('hetzner'))).status).toBe(400);
+        // Finished predates creation -> 400
+        expect((await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, { ...validPayload, finished_at_ms: 1792257000000 }), host('hetzner'))).status).toBe(400);
+        // Unknown extra field -> 400
+        expect((await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, { ...validPayload, unexpected_extra: true }), host('hetzner'))).status).toBe(400);
+        expect((await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, { ...validPayload, tombstone: {} }), host('hetzner'))).status).toBe(400);
+
+        // State remains running after all negative attempts
+        const stillRunning = await (await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}`, undefined, 'GET'), admin)).json() as any;
+        expect(stillRunning.state).toBe('running');
+
+        // 4. Valid positive retirement succeeds
+        const retireRes = await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, validPayload), host('hetzner'));
+        expect(retireRes.status).toBe(200);
+        const retireData = await retireRes.json() as any;
+        expect(retireData.id).toBe(NATIVE_DATAOPS_ID);
+        expect(retireData.state).toBe('stopped');
+        expect(retireData.replay).toBe(false);
+
+        // Session in database is now stopped and historical_read_only
+        const stopped = await (await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}`, undefined, 'GET'), admin)).json() as any;
+        expect(stopped.state).toBe('stopped');
+        expect(stopped.controllability).toBe('historical_read_only');
+
+        // 5. Idempotent replay: sending the exact same retirement payload again returns 200 with replay: true
+        const replayRes = await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, validPayload), host('hetzner'));
+        expect(replayRes.status).toBe(200);
+        const replayData = await replayRes.json() as any;
+        expect(replayData.id).toBe(NATIVE_DATAOPS_ID);
+        expect(replayData.state).toBe('stopped');
+        expect(replayData.replay).toBe(true);
+
+        // Conflicting replays with altered timestamp or cause are refused with 409
+        const conflictTimeRes = await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, { ...validPayload, finished_at_ms: validPayload.finished_at_ms + 5000 }), host('hetzner'));
+        expect(conflictTimeRes.status).toBe(409);
+        expect((await conflictTimeRes.json() as any).error).toBe('retirement_conflict');
+
+        const conflictGenRes = await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, { ...validPayload, generation: 2 }), host('hetzner'));
+        expect(conflictGenRes.status).toBe(409);
+
+        // Session does not appear in subsequent GET host-bindings?kind=imported (since it is stopped)
+        const updatedList = await (await s.handle(request('/api/sessions/host-bindings?kind=imported', undefined, 'GET'), host('hetzner'))).json() as any;
+        expect(updatedList.sessions.map((x: any) => x.id)).toEqual([NATIVE_CRM_ID]);
+      });
+    });
+
+    it('rechecks binding, generation, and host authority inside mutation txn after streamed body yields', async () => {
+      await fixture(async (s, sql) => {
+        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+
+        const validPayload = {
+          native: {
+            native_id: NATIVE_DATAOPS_ID,
+            tag: 'batching',
+            workspace: '/home/alexey/git/dataops',
+            created_at_ms: 1792257043571,
+            engine: 'argon',
+          },
+          generation: 1,
+          finished_at_ms: 1792257100000,
+          cause: 'finished',
+          state: 'stopped',
+        };
+
+        // Case A: Generation mutated while body streamed
+        let controller1!: ReadableStreamDefaultController<Uint8Array>;
+        const stream1 = new ReadableStream<Uint8Array>({ start(v) { controller1 = v; } });
+        const pending1 = s.handle(new Request(`https://hub.test/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, {
+          method: 'POST',
+          body: stream1,
+        }), host('hetzner'));
+
+        await Promise.resolve();
+        // Mutate stored generation in database before body resolves
+        const currentB = JSON.parse(sql.exec('SELECT binding_json FROM session_control_sessions WHERE id = ?', NATIVE_DATAOPS_ID).toArray()[0].binding_json);
+        currentB.generation = 2;
+        sql.exec('UPDATE session_control_sessions SET binding_json = ? WHERE id = ?', JSON.stringify(currentB), NATIVE_DATAOPS_ID);
+
+        controller1.enqueue(new TextEncoder().encode(JSON.stringify(validPayload)));
+        controller1.close();
+
+        const res1 = await pending1;
+        expect(res1.status).toBe(409);
+        expect((await res1.json() as any).error).toBe('generation_mismatch');
+
+        // Replacement / live session stays running
+        const row1 = sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', NATIVE_DATAOPS_ID).toArray()[0];
+        expect(row1.state).toBe('running');
+
+        // Case B: Host credential revoked while body streamed
+        currentB.generation = 1;
+        sql.exec('UPDATE session_control_sessions SET binding_json = ? WHERE id = ?', JSON.stringify(currentB), NATIVE_DATAOPS_ID);
+
+        let controller2!: ReadableStreamDefaultController<Uint8Array>;
+        const stream2 = new ReadableStream<Uint8Array>({ start(v) { controller2 = v; } });
+        const pending2 = s.handle(new Request(`https://hub.test/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, {
+          method: 'POST',
+          body: stream2,
+        }), host('hetzner'));
+
+        await Promise.resolve();
+        // Revoke host credential
+        sql.exec("UPDATE credentials SET revoked_at = ? WHERE id = 'host-cred-1'", new Date().toISOString());
+
+        controller2.enqueue(new TextEncoder().encode(JSON.stringify(validPayload)));
+        controller2.close();
+
+        const res2 = await pending2;
+        expect(res2.status).toBe(409);
+        expect((await res2.json() as any).error).toBe('credential_changed');
+
+        // Session stays live
+        const row2 = sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', NATIVE_DATAOPS_ID).toArray()[0];
+        expect(row2.state).toBe('running');
+      });
+    });
+
+    it('computes pagination continuation across raw rows even when a page is filtered empty', async () => {
+      await fixture(async (s, sql) => {
+        // Create 3 sessions on hetzner:
+        // Session 1: valid observed_native
+        // Session 2: invalid binding (incomplete, non-observed_native provenance)
+        // Session 3: valid observed_native
+        const at = new Date(1792257000000).toISOString();
+        const id1 = '00000000-0000-4000-8000-000000000001';
+        const id2 = '00000000-0000-4000-8000-000000000002';
+        const id3 = '00000000-0000-4000-8000-000000000003';
+
+        sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
+          VALUES (?, 'unknown', 'k1', '{}', 'hetzner', 'codex', 'headless', 'running', ?, '2026-10-18T10:00:00.000Z', '2026-10-18T10:00:00.000Z')`,
+          id1, JSON.stringify({ native_id: id1, tag: 't1', workspace: '/ws/1', native_created_at_ms: 1000, generation: 1, provenance: 'observed_native' }));
+
+        // Incomplete/non-observed row that will be filtered out by hostOk or provenance
+        sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
+          VALUES (?, 'unknown', 'k2', '{}', 'hetzner', 'codex', 'headless', 'running', ?, '2026-10-18T10:00:01.000Z', '2026-10-18T10:00:01.000Z')`,
+          id2, JSON.stringify({ native_id: id2, tag: 't2', workspace: '/ws/2', provenance: 'unsupported_external' }));
+
+        sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
+          VALUES (?, 'unknown', 'k3', '{}', 'hetzner', 'codex', 'headless', 'running', ?, '2026-10-18T10:00:02.000Z', '2026-10-18T10:00:02.000Z')`,
+          id3, JSON.stringify({ native_id: id3, tag: 't3', workspace: '/ws/3', native_created_at_ms: 3000, generation: 1, provenance: 'observed_native' }));
+
+        // Limit=1: Page 1 returns Session 1 with cursor pointing to Session 1
+        const p1 = await (await s.handle(request('/api/sessions/host-bindings?kind=imported&limit=1', undefined, 'GET'), host('hetzner'))).json() as any;
+        expect(p1.sessions.length).toBe(1);
+        expect(p1.sessions[0].id).toBe(id1);
+        expect(p1.next_cursor).toBeTruthy();
+
+        // Page 2: with cursor=p1.next_cursor & limit=1. Raw scanned row is id2, which is filtered out.
+        // Sessions array is empty, BUT next_cursor is returned!
+        const p2 = await (await s.handle(request(`/api/sessions/host-bindings?kind=imported&limit=1&cursor=${encodeURIComponent(p1.next_cursor)}`, undefined, 'GET'), host('hetzner'))).json() as any;
+        expect(p2.sessions.length).toBe(0);
+        expect(p2.next_cursor).toBeTruthy();
+
+        // Page 3: with cursor=p2.next_cursor & limit=1. Returns Session 3!
+        const p3 = await (await s.handle(request(`/api/sessions/host-bindings?kind=imported&limit=1&cursor=${encodeURIComponent(p2.next_cursor)}`, undefined, 'GET'), host('hetzner'))).json() as any;
+        expect(p3.sessions.length).toBe(1);
+        expect(p3.sessions[0].id).toBe(id3);
+      });
+    });
+
+    it('rejects incomplete stored bindings and protects legacy unknown sessions', async () => {
+      await fixture(async (s, sql) => {
+        const id = '00000000-0000-4000-8000-000000000099';
+        // Incomplete stored binding: missing generation and native_created_at_ms
+        sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
+          VALUES (?, 'unknown', 'legacy-key', '{}', 'hetzner', 'codex', 'headless', 'running', ?, '2026-10-18T10:00:00.000Z', '2026-10-18T10:00:00.000Z')`,
+          id, JSON.stringify({ native_id: id, tag: 'legacy', workspace: '/legacy', provenance: 'observed_native' }));
+
+        // Not returned in GET imported host-bindings
+        const list = await (await s.handle(request('/api/sessions/host-bindings?kind=imported', undefined, 'GET'), host('hetzner'))).json() as any;
+        expect(list.sessions.map((x: any) => x.id)).not.toContain(id);
+
+        // POST retirement returns 409 stored_binding_incomplete
+        const payload = {
+          native: { native_id: id, tag: 'legacy', workspace: '/legacy', created_at_ms: 1000, engine: 'codex' },
+          generation: 1,
+          finished_at_ms: 2000,
+          cause: 'finished',
+          state: 'stopped',
+        };
+        const res = await s.handle(request(`/api/sessions/${id}/retirement`, payload), host('hetzner'));
+        expect(res.status).toBe(409);
+        expect((await res.json() as any).error).toBe('stored_binding_incomplete');
+
+        // Session remains untouched
+        const row = sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', id).toArray()[0];
+        expect(row.state).toBe('running');
+      });
+    });
+
+    it('refuses to retire Hub-started sessions through the imported retirement route', async () => {
+      const fake = fakeReserve();
+      await fixture(async (s, sql) => {
+        const session: any = await startOk(s, { machine: 'hetzner' }, admin, 'hub-started-1');
+        await bindHttp(s, sql, session.id);
+
+        const hubPayload = {
+          native: {
+            native_id: NATIVE_ID,
+            tag: canonTag('launch-1'),
+            workspace: NATIVE_WS,
+            created_at_ms: NATIVE_CREATED,
+            engine: 'codex',
+          },
+          generation: 1,
+          finished_at_ms: NATIVE_CREATED + 50000,
+          cause: 'finished',
+          state: 'stopped',
+        };
+
+        const res = await s.handle(request(`/api/sessions/${session.id}/retirement`, hubPayload), host('hetzner'));
+        expect(res.status).toBe(409);
+        expect((await res.json() as any).error).toBe('session_not_imported');
+
+        // Hub session state is untouched
+        const view = await (await s.handle(request(`/api/sessions/${session.id}`, undefined, 'GET'), admin)).json() as any;
+        expect(view.state).toBe('running');
+      }, fake.hook);
+    });
   });
 });
 

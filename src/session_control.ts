@@ -797,11 +797,62 @@ export class SessionControlService {
 
     if (path === '/api/sessions/host-bindings' && request.method === 'GET') {
       if (!host) return response({ error: 'forbidden' }, 403);
-      // The canonical launch native_id rides along so fleet binds the exact
-      // native UUID row instead of tag-only (null until the fleet result
-      // reports it; fleet prefers entry.native_id when present).
+
+      if (url.searchParams.get('kind') === 'imported') {
+        const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 100));
+        const cursor = url.searchParams.get('cursor');
+        const params: any[] = [caller.machineId!];
+        const cursorSql = this.cursorClause(cursor, params, false);
+        const rawRows = this.sql.exec(
+          `SELECT * FROM session_control_sessions WHERE machine_id = ? AND fleet_launch_id IS NULL AND binding_json IS NOT NULL AND state IN ('running', 'starting') ${cursorSql} ORDER BY created_at, id LIMIT ?`,
+          ...params, limit + 1
+        ).toArray() as any[];
+
+        const hasMore = rawRows.length > limit;
+        const rawPage = hasMore ? rawRows.slice(0, limit) : rawRows;
+        const nextCursor = hasMore ? `${rawPage[rawPage.length - 1].created_at}|${rawPage[rawPage.length - 1].id}` : null;
+
+        const imported: any[] = [];
+        for (const row of rawPage) {
+          if (!this.hostOk(row, caller).ok) continue;
+          const b = parsed(row.binding_json, null);
+          if (!b || typeof b !== 'object') continue;
+          if (b.provenance !== 'observed_native') continue;
+          if (typeof b.native_id !== 'string' || !UUID_RE.test(b.native_id) || b.native_id !== row.id) continue;
+          if (typeof b.tag !== 'string' || !b.tag) continue;
+          if (typeof b.workspace !== 'string' || !b.workspace) continue;
+          if (typeof b.generation !== 'number' || !Number.isInteger(b.generation) || b.generation <= 0) continue;
+          if (typeof b.native_created_at_ms !== 'number' || !Number.isInteger(b.native_created_at_ms) || b.native_created_at_ms <= 0) continue;
+          const engine = row.engine || b.engine;
+          if (typeof engine !== 'string' || !engine) continue;
+
+          imported.push({
+            id: row.id,
+            engine: engine,
+            state: row.state,
+            session_type: row.session_type,
+            machine: row.machine_id,
+            mode: row.mode,
+            binding: {
+              native_id: b.native_id,
+              tag: b.tag,
+              workspace: b.workspace,
+              generation: b.generation,
+              native_created_at_ms: b.native_created_at_ms,
+              provenance: b.provenance,
+              adopted_at: b.adopted_at ?? row.created_at,
+            },
+          });
+        }
+
+        return response({ sessions: imported, next_cursor: nextCursor });
+      }
+
+      // Default GET /api/sessions/host-bindings: pending Fleet starts only
       const rows = this.sql.exec("SELECT s.*, f.native_id AS launch_native_id FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id WHERE s.machine_id = ? AND s.binding_json IS NULL AND s.state IN ('offered','starting','uncertain') AND f.state IN ('starting','running') LIMIT 100", caller.machineId!).toArray() as any[];
-      return response({ sessions: rows.filter(row => this.hostOk(row, caller).ok).map(row => ({ id: row.id, fleet_launch_id: row.fleet_launch_id, engine: row.engine, native_id: row.launch_native_id ?? null })) });
+      return response({
+        sessions: rows.filter(row => this.hostOk(row, caller).ok).map(row => ({ id: row.id, fleet_launch_id: row.fleet_launch_id, engine: row.engine, native_id: row.launch_native_id ?? null })),
+      });
     }
 
     if (path === '/api/sessions' && request.method === 'POST') {
@@ -1250,7 +1301,7 @@ export class SessionControlService {
       });
     }
 
-    const sessionMatch = /^\/api\/sessions\/([^/]{1,128})(\/(send|capture|stop|commands|binding|retry|cancel|protect))?$/.exec(path);
+    const sessionMatch = /^\/api\/sessions\/([^/]{1,128})(\/(send|capture|stop|commands|binding|retry|cancel|protect|retirement))?$/.exec(path);
     if (sessionMatch) {
       const rawRef = decodeURIComponent(sessionMatch[1]);
       const sub = sessionMatch[3];
@@ -1270,7 +1321,7 @@ export class SessionControlService {
           }
         }
       } else if (rawRef.includes(':')) {
-        if (sub === 'binding') return response({ error: 'not_found' }, 404);
+        if (sub === 'binding' || sub === 'retirement') return response({ error: 'not_found' }, 404);
         if ((sub === undefined && request.method !== 'GET') ||
             (sub !== undefined && !(['send', 'capture', 'stop', 'cancel', 'protect'].includes(sub) ? request.method === 'POST' : request.method === 'GET'))) {
           return response({ error: 'not_found' }, 404);
@@ -1283,7 +1334,7 @@ export class SessionControlService {
         // tag, never a foreign session, never latest-wins). Ambiguous names
         // are refused with 409; unknown names render as not_found. The host
         // binding path stays strict Hub UUID (no alias).
-        if (sub === 'binding') return response({ error: 'not_found' }, 404);
+        if (sub === 'binding' || sub === 'retirement') return response({ error: 'not_found' }, 404);
         if ((sub === undefined && request.method !== 'GET') ||
             (sub !== undefined && !(['send', 'capture', 'stop', 'cancel', 'protect'].includes(sub) ? request.method === 'POST' : request.method === 'GET'))) {
           return response({ error: 'not_found' }, 404);
@@ -1322,6 +1373,193 @@ export class SessionControlService {
           this.adoptHostFamily(session.id, caller);
           const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0];
           return response({ ...this.view(row), generation: applied.generation });
+        });
+      }
+      if (sub === 'retirement') {
+        if (request.method !== 'POST') return response({ error: 'not_found' }, 404);
+        // Retirement principal must be authenticated host kind+hostscope+ownmachine, using existing authoritative hostOk family/approval policy; no separate admin-only fallback.
+        if (!host || caller.kind !== 'host' || !caller.machineId) return response({ error: 'forbidden' }, 403);
+        if (!session) return response({ error: 'not_found' }, 404);
+        if (session.machine_id !== caller.machineId) return response({ error: 'not_found' }, 404);
+        const gate = this.hostOk(session, caller);
+        if (!gate.ok) return response({ error: gate.error }, gate.error === 'not_found' ? 404 : 409);
+
+        // Do not settle Hub-started rows here; normal observer owns those.
+        if (session.fleet_launch_id) return response({ error: 'session_not_imported' }, 409);
+        const currentBinding = parsed(session.binding_json, null);
+        if (!currentBinding || typeof currentBinding !== 'object' || currentBinding.provenance !== 'observed_native') {
+          return response({ error: 'session_not_imported' }, 409);
+        }
+
+        // Require KNOWN complete stored binding and supplied full tuple/generation:
+        // known integerpositive creation/incarnation and generation, nonempty engine, exact comparisons.
+        if (typeof currentBinding.native_id !== 'string' || !UUID_RE.test(currentBinding.native_id) || currentBinding.native_id !== session.id ||
+            typeof currentBinding.tag !== 'string' || !currentBinding.tag ||
+            typeof currentBinding.workspace !== 'string' || !currentBinding.workspace ||
+            typeof currentBinding.native_created_at_ms !== 'number' || !Number.isSafeInteger(currentBinding.native_created_at_ms) || currentBinding.native_created_at_ms <= 0 ||
+            typeof currentBinding.generation !== 'number' || !Number.isSafeInteger(currentBinding.generation) || currentBinding.generation <= 0 ||
+            (typeof session.engine !== 'string' || !session.engine)) {
+          return response({ error: 'stored_binding_incomplete' }, 409);
+        }
+
+        const input = await body(request);
+        if (!input || typeof input !== 'object' || Array.isArray(input)) {
+          return response({ error: 'invalid_retirement' }, 400);
+        }
+
+        // Canonical payload exactly native{native_id,tag,workspace,created_at_ms,engine}, generation, finished_at_ms, cause:'finished', state:'stopped'. Reject unsupported/unknown/missing fields.
+        const requiredTopKeys = ['cause', 'finished_at_ms', 'generation', 'native', 'state'];
+        const inputKeys = Object.keys(input);
+        if (inputKeys.length !== requiredTopKeys.length || !requiredTopKeys.every(k => k in input)) {
+          return response({ error: 'invalid_retirement' }, 400);
+        }
+
+        if (!input.native || typeof input.native !== 'object' || Array.isArray(input.native)) {
+          return response({ error: 'invalid_retirement' }, 400);
+        }
+        const requiredNativeKeys = ['created_at_ms', 'engine', 'native_id', 'tag', 'workspace'];
+        const nativeKeys = Object.keys(input.native);
+        if (nativeKeys.length !== requiredNativeKeys.length || !requiredNativeKeys.every(k => k in input.native)) {
+          return response({ error: 'invalid_retirement' }, 400);
+        }
+
+        if (typeof input.native.native_id !== 'string' || !UUID_RE.test(input.native.native_id) || input.native.native_id !== rawRef) {
+          return response({ error: 'native_id_mismatch' }, 409);
+        }
+        if (input.native.native_id !== session.id || input.native.native_id !== currentBinding.native_id) {
+          return response({ error: 'native_id_mismatch' }, 409);
+        }
+        if (typeof input.native.tag !== 'string' || !input.native.tag || input.native.tag !== currentBinding.tag) {
+          return response({ error: 'tag_mismatch' }, 409);
+        }
+        if (typeof input.native.workspace !== 'string' || !input.native.workspace || input.native.workspace !== currentBinding.workspace) {
+          return response({ error: 'workspace_mismatch' }, 409);
+        }
+        if (typeof input.native.created_at_ms !== 'number' || !Number.isSafeInteger(input.native.created_at_ms) || input.native.created_at_ms <= 0) {
+          return response({ error: 'invalid_creation_timestamp' }, 400);
+        }
+        if (input.native.created_at_ms !== currentBinding.native_created_at_ms) {
+          return response({ error: 'created_at_mismatch' }, 409);
+        }
+        if (typeof input.native.engine !== 'string' || !input.native.engine || input.native.engine !== session.engine) {
+          return response({ error: 'engine_mismatch' }, 409);
+        }
+
+        if (typeof input.generation !== 'number' || !Number.isSafeInteger(input.generation) || input.generation <= 0) {
+          return response({ error: 'invalid_generation' }, 400);
+        }
+        if (input.generation !== currentBinding.generation) {
+          return response({ error: 'generation_mismatch' }, 409);
+        }
+
+        if (input.cause !== 'finished') {
+          return response({ error: 'invalid_retirement_cause' }, 400);
+        }
+
+        if (typeof input.finished_at_ms !== 'number' || !Number.isSafeInteger(input.finished_at_ms) || input.finished_at_ms <= 0) {
+          return response({ error: 'invalid_finished_timestamp' }, 400);
+        }
+        if (input.finished_at_ms < input.native.created_at_ms) {
+          return response({ error: 'finished_predates_creation' }, 400);
+        }
+        if (input.finished_at_ms > this.now() + 60000) {
+          return response({ error: 'future_finished_timestamp' }, 400);
+        }
+
+        if (input.state !== 'stopped') {
+          return response({ error: 'invalid_state' }, 400);
+        }
+
+        return this.transaction(() => {
+          const live: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0];
+          if (!live) return response({ error: 'not_found' }, 404);
+          if (live.machine_id !== caller.machineId) return response({ error: 'not_found' }, 404);
+          const fresh = this.hostOk(live, caller);
+          if (!fresh.ok) return response({ error: fresh.error }, fresh.error === 'not_found' ? 404 : 409);
+          if (live.fleet_launch_id) return response({ error: 'session_not_imported' }, 409);
+
+          const liveBinding = parsed(live.binding_json, null);
+          if (!liveBinding || typeof liveBinding !== 'object' || liveBinding.provenance !== 'observed_native') {
+            return response({ error: 'session_not_imported' }, 409);
+          }
+
+          if (typeof liveBinding.native_id !== 'string' || !UUID_RE.test(liveBinding.native_id) || liveBinding.native_id !== live.id ||
+              typeof liveBinding.tag !== 'string' || !liveBinding.tag ||
+              typeof liveBinding.workspace !== 'string' || !liveBinding.workspace ||
+              typeof liveBinding.native_created_at_ms !== 'number' || !Number.isSafeInteger(liveBinding.native_created_at_ms) || liveBinding.native_created_at_ms <= 0 ||
+              typeof liveBinding.generation !== 'number' || !Number.isSafeInteger(liveBinding.generation) || liveBinding.generation <= 0 ||
+              (typeof live.engine !== 'string' || !live.engine)) {
+            return response({ error: 'stored_binding_incomplete' }, 409);
+          }
+
+          // In same synchronous effect transaction revalidate CURRENT machine/family/imported provenance/fleet absence/full identity/generation and allowed physical state before any terminal write
+          if (input.native.native_id !== live.id || input.native.native_id !== liveBinding.native_id) {
+            return response({ error: 'native_id_mismatch' }, 409);
+          }
+          if (input.native.tag !== liveBinding.tag) {
+            return response({ error: 'tag_mismatch' }, 409);
+          }
+          if (input.native.workspace !== liveBinding.workspace) {
+            return response({ error: 'workspace_mismatch' }, 409);
+          }
+          if (input.native.created_at_ms !== liveBinding.native_created_at_ms) {
+            return response({ error: 'created_at_mismatch' }, 409);
+          }
+          if (input.native.engine !== live.engine) {
+            return response({ error: 'engine_mismatch' }, 409);
+          }
+          if (input.generation !== liveBinding.generation) {
+            return response({ error: 'generation_mismatch' }, 409);
+          }
+
+          // Replays exact/idempotent, no repeated controls/effects.
+          // Persist bounded retirement marker in existing binding metadata so only SAME tuple/gen/cause/finishedtimestamp replays idempotently, and a conflicting replay does not claim success or overwrite terminal history.
+          if (live.state === 'stopped') {
+            const marker = liveBinding.retirement;
+            if (!marker || typeof marker !== 'object') {
+              return response({ error: 'retirement_conflict' }, 409);
+            }
+            const sameReplay =
+              marker.native_id === input.native.native_id &&
+              marker.tag === input.native.tag &&
+              marker.workspace === input.native.workspace &&
+              marker.created_at_ms === input.native.created_at_ms &&
+              marker.engine === input.native.engine &&
+              marker.generation === input.generation &&
+              marker.cause === input.cause &&
+              marker.finished_at_ms === input.finished_at_ms;
+            if (!sameReplay) {
+              return response({ error: 'retirement_conflict' }, 409);
+            }
+            return response({ ...this.view(live), id: live.id, state: 'stopped', replay: true });
+          }
+
+          if (!STOPPABLE.has(live.state)) {
+            return response({ error: 'session_not_stoppable' }, 409);
+          }
+
+          const at = new Date(this.now()).toISOString();
+          const updatedBinding = {
+            ...liveBinding,
+            retirement: {
+              native_id: input.native.native_id,
+              tag: input.native.tag,
+              workspace: input.native.workspace,
+              created_at_ms: input.native.created_at_ms,
+              engine: input.native.engine,
+              generation: input.generation,
+              cause: input.cause,
+              finished_at_ms: input.finished_at_ms,
+              retired_at: at,
+            },
+          };
+
+          this.sql.exec(
+            "UPDATE session_control_sessions SET state = 'stopped', binding_json = ?, updated_at = ? WHERE id = ?",
+            JSON.stringify(updatedBinding), at, live.id
+          );
+          const updatedRow: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', live.id).toArray()[0];
+          return response({ ...this.view(updatedRow), id: live.id, state: 'stopped', replay: false });
         });
       }
       if (!session || !this.ownerOk(session, caller)) return response({ error: 'not_found' }, 404);

@@ -289,7 +289,7 @@ class FleetTests(unittest.TestCase):
             return {}
         with patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {}, 'hostname': 'test', 'os': 'test', 'network': 'home', 'roles': []}), patch('agent_hub_host.api.get_heartbeat_payload', return_value={'type': 'heartbeat'}):
             self.assertEqual(fleet.Dispatcher(cfg, request, runner).once(), [])
-        self.assertEqual([c[1] for c in calls], ['/api/machines/register', '/api/host/poll', '/api/fleet/subscriptions', '/api/fleet/sessions', '/api/sessions/host-bindings', '/api/fleet/offers'])
+        self.assertEqual([c[1] for c in calls], ['/api/machines/register', '/api/host/poll', '/api/fleet/subscriptions', '/api/fleet/sessions', '/api/sessions/host-bindings', '/api/sessions/host-bindings?kind=imported', '/api/fleet/offers'])
         self.assertTrue(calls[1][2]['gate']['launch_allowed'])
         self.assertEqual(calls[0][2]['capabilities']['workspaces'], ['demo'])
 
@@ -540,7 +540,7 @@ class FleetTests(unittest.TestCase):
                  patch('agent_hub_host.runtime.RuntimeManager.can_process_role_run', return_value=(True, 'role_qualified', mock_report)):
                 d = fleet.Dispatcher(cfg, request, runner, role_config_path=str(roles_path))
                 d.once()
-                self.assertEqual(calls[-6][2]['capabilities']['jobs'], ['principal-wake'])
+                self.assertEqual(calls[0][2]['capabilities']['jobs'], ['principal-wake'])
 
             # Now disable the config on disk
             roles_path.write_text(json.dumps({"version": 1, "enabled": False, "profiles": {}}))
@@ -549,7 +549,7 @@ class FleetTests(unittest.TestCase):
             with patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {'jobs': ['stale-wake']}, 'hostname': 'test', 'os': 'test', 'network': 'home', 'roles': []}), \
                  patch('agent_hub_host.api.get_heartbeat_payload', return_value={'type': 'heartbeat'}):
                 d.once()
-                self.assertNotIn('jobs', calls[-6][2]['capabilities'])
+                self.assertNotIn('jobs', calls[0][2]['capabilities'])
 
     def test_headless_submit_registers_exact_result_path_for_normal_and_legacy_offers_while_interactive_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1346,6 +1346,542 @@ class FleetTests(unittest.TestCase):
                 self.assertEqual(restored._active_launches, {})
                 self.assertTrue(path.exists())
 
+    def test_imported_session_positive_retirement_settles_stopped_and_replays_safely(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            ws.mkdir()
+            cfg = settings(ws)
+            native_id = "2d7bc739-3162-4fb9-9c39-691a1b328726"
+            tag = "task-hub-role-head-recovery-01M57V53RB1XM8RZ0R4GWK2P7W-g3-e15"
+            incarnation = 1792338485058
+            ws_path = str(ws.resolve())
+
+            imported_session = {
+                "id": native_id,
+                "engine": "antigravity",
+                "state": "running",
+                "session_type": "aplexer",
+                "binding": {
+                    "native_id": native_id,
+                    "tag": tag,
+                    "workspace": ws_path,
+                    "generation": 1,
+                    "native_created_at_ms": incarnation,
+                    "provenance": "observed_native",
+                    "adopted_at": "2026-10-18T15:48:32.883Z",
+                },
+            }
+
+            requests = []
+            def request(method, path, body=None):
+                requests.append((method, path, body))
+                if method == "GET" and path == "/api/sessions/host-bindings?kind=imported":
+                    return {"sessions": [imported_session], "next_cursor": None}
+                if method == "POST" and path == f"/api/sessions/{native_id}/retirement":
+                    return {"id": native_id, "state": "stopped", "replay": False}
+                return {}
+
+            commands = []
+            def runner(argv, **kw):
+                commands.append(argv)
+                return {}
+
+            d = fleet.Dispatcher(cfg, request, runner)
+
+            tombstone = {
+                "cause": "finished",
+                "id": native_id,
+                "tag": tag,
+                "workspace": ws_path,
+                "finished_at_ms": 1792338699929,
+            }
+
+            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, tombstone, "retired_tombstone_verified")) as mock_verify:
+                reconciled = d.reconcile_imported_sessions()
+                self.assertEqual(len(reconciled), 1)
+                self.assertEqual(reconciled[0], {"id": native_id, "state": "stopped", "reconciled": True})
+
+                # Verify mock_verify was called with the exact 5-field NativeTarget
+                mock_verify.assert_called_once()
+                target_arg = mock_verify.call_args[0][1]
+                self.assertEqual(target_arg.session_id, native_id)
+                self.assertEqual(target_arg.tag, tag)
+                self.assertEqual(target_arg.workspace, ws_path)
+                self.assertEqual(target_arg.created_at_ms, incarnation)
+                self.assertEqual(target_arg.engine, "antigravity")
+
+            # Check terminal POST payload sent to Hub
+            terminal_post = next(r for r in requests if r[1] == f"/api/sessions/{native_id}/retirement")
+            self.assertEqual(terminal_post[0], "POST")
+            self.assertEqual(terminal_post[2]["native"]["native_id"], native_id)
+            self.assertEqual(terminal_post[2]["native"]["tag"], tag)
+            self.assertEqual(terminal_post[2]["native"]["workspace"], ws_path)
+            self.assertEqual(terminal_post[2]["native"]["created_at_ms"], incarnation)
+            self.assertEqual(terminal_post[2]["native"]["engine"], "antigravity")
+            self.assertEqual(terminal_post[2]["finished_at_ms"], 1792338699929)
+            self.assertEqual(terminal_post[2]["cause"], "finished")
+            self.assertEqual(terminal_post[2]["state"], "stopped")
+            self.assertEqual(terminal_post[2]["generation"], 1)
+
+            # Replay idempotency: server returns replay: True on second report
+            def request_replay(method, path, body=None):
+                if method == "GET" and path == "/api/sessions/host-bindings?kind=imported":
+                    return {"sessions": [imported_session], "next_cursor": None}
+                if method == "POST" and path == f"/api/sessions/{native_id}/retirement":
+                    return {"id": native_id, "state": "stopped", "replay": True}
+                return {}
+
+            d.request = request_replay
+            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, tombstone, "retired_tombstone_verified")):
+                second = d.reconcile_imported_sessions()
+                self.assertEqual(len(second), 1)
+                self.assertEqual(second[0]["state"], "stopped")
+
+            # Verify launcher reconcile / task accept was NEVER invoked
+            self.assertFalse(any("accept" in x or "reconcile" in x for x in commands))
+
+    def test_imported_session_negative_cases_preserve_custody_and_never_settle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            ws.mkdir()
+            cfg = settings(ws)
+            native_id = "2d7bc739-3162-4fb9-9c39-691a1b328726"
+            tag = "task-hub-role-head-recovery-01M57V53RB1XM8RZ0R4GWK2P7W-g3-e15"
+            incarnation = 1792338485058
+            ws_path = str(ws.resolve())
+
+            base_session = {
+                "id": native_id,
+                "engine": "antigravity",
+                "state": "running",
+                "binding": {
+                    "native_id": native_id,
+                    "tag": tag,
+                    "workspace": ws_path,
+                    "generation": 1,
+                    "native_created_at_ms": incarnation,
+                    "provenance": "observed_native",
+                },
+            }
+
+            cases = [
+                ("live_workload", False, None, "target_still_active_in_catalog: phase=running"),
+                ("tombstone_absent", False, None, "retired_tombstone_absent: /path/to/tombstone.json"),
+                ("catalog_error", False, None, "live_catalog_query_failed: timeout"),
+                ("tag_reused", False, None, "tag_reused_by_active_session: session_id=other phase=running"),
+            ]
+
+            for case_name, is_ret, tomb, detail in cases:
+                with self.subTest(case=case_name):
+                    d = fleet.Dispatcher(cfg, lambda m, p, b=None: {"sessions": [base_session]})
+                    with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(is_ret, tomb, detail)):
+                        res = d.reconcile_imported_sessions()
+                        self.assertEqual(res, [])
+
+            # Tuple mismatch cases (should be skipped before verify_native_retirement)
+            mismatch_cases = [
+                ("wrong_incarnation", {**base_session, "binding": {**base_session["binding"], "native_created_at_ms": -5}}),
+                ("relative_workspace", {**base_session, "binding": {**base_session["binding"], "workspace": "relative/path"}}),
+                ("missing_tag", {**base_session, "binding": {**base_session["binding"], "tag": ""}}),
+                ("foreign_provenance", {**base_session, "binding": {**base_session["binding"], "provenance": "fleet_launch"}}),
+            ]
+
+            for case_name, sess in mismatch_cases:
+                with self.subTest(mismatch=case_name):
+                    d = fleet.Dispatcher(cfg, lambda m, p, b=None: {"sessions": [sess]})
+                    with patch("agent_hub_host.fleet.verify_native_retirement") as mock_v:
+                        res = d.reconcile_imported_sessions()
+                        self.assertEqual(res, [])
+                        mock_v.assert_not_called()
+
+            # Server error on terminal post preserves state and does not settle
+            tombstone = {"cause": "finished", "id": native_id, "tag": tag, "workspace": ws_path, "finished_at_ms": 1792338699929}
+            def request_fail(m, p, b=None):
+                if m == "GET": return {"sessions": [base_session], "next_cursor": None}
+                raise RuntimeError("500 internal server error")
+            d = fleet.Dispatcher(cfg, request_fail)
+            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, tombstone, "retired_tombstone_verified")):
+                self.assertEqual(d.reconcile_imported_sessions(), [])
+
+    def test_imported_session_bootstrap_and_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            ws.mkdir()
+            cfg = settings(ws)
+            native_id = "021d9370-9b3d-4e5a-b59b-256334c08c75"
+            tag = "batching"
+            ws_path = str(ws.resolve())
+            incarnation = 1792257043571
+
+            imported_session = {
+                "id": native_id,
+                "engine": "argon",
+                "state": "running",
+                "binding": {
+                    "native_id": native_id,
+                    "tag": tag,
+                    "workspace": ws_path,
+                    "generation": 1,
+                    "native_created_at_ms": incarnation,
+                    "provenance": "observed_native",
+                },
+            }
+
+            requests = []
+            def request(method, path, body=None):
+                requests.append((method, path, body))
+                if method == "GET":
+                    return {"sessions": [imported_session], "next_cursor": None}
+                if method == "POST":
+                    return {"id": native_id, "state": "stopped"}
+                return {}
+
+            # Fresh host start with empty active launches
+            d = fleet.Dispatcher(cfg, request, lambda *a, **kw: {})
+            self.assertEqual(d._active_launches, {})
+
+            tombstone = {"cause": "finished", "id": native_id, "tag": tag, "workspace": ws_path, "finished_at_ms": 1792257100000}
+            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, tombstone, "retired_tombstone_verified")):
+                reconciled = d.reconcile_imported_sessions()
+                self.assertEqual(len(reconciled), 1)
+                self.assertEqual(reconciled[0]["id"], native_id)
+                self.assertEqual(reconciled[0]["state"], "stopped")
+
+    def test_dispatcher_once_full_cycle_settles_imported_sessions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            ws.mkdir()
+            cfg = settings(ws)
+            native_id = "2d7bc739-3162-4fb9-9c39-691a1b328726"
+            tag = "task-hub-role-head-recovery-01M57V53RB1XM8RZ0R4GWK2P7W-g3-e15"
+            incarnation = 1792338485058
+            ws_path = str(ws.resolve())
+
+            imported_session = {
+                "id": native_id,
+                "engine": "antigravity",
+                "state": "running",
+                "session_type": "aplexer",
+                "binding": {
+                    "native_id": native_id,
+                    "tag": tag,
+                    "workspace": ws_path,
+                    "generation": 1,
+                    "native_created_at_ms": incarnation,
+                    "provenance": "observed_native",
+                    "adopted_at": "2026-10-18T15:48:32.883Z",
+                },
+            }
+
+            requests = []
+            def request(method, path, body=None):
+                requests.append((method, path, body))
+                if method == "GET" and path == "/api/sessions/host-bindings":
+                    return {"sessions": []}
+                if method == "GET" and path == "/api/sessions/host-bindings?kind=imported":
+                    return {"sessions": [imported_session], "next_cursor": None}
+                if method == "POST" and path == f"/api/sessions/{native_id}/retirement":
+                    return {"id": native_id, "state": "stopped"}
+                return {"offers": []}
+
+            def runner(argv, **kw):
+                if argv[0] == "maintained-gate":
+                    return {"launch_allowed": True, "profile_supported": True, "account_label": "shared-codex", "observed_at": fleet.utcnow()}
+                if argv[0] == "aplexer":
+                    return []
+                return {}
+
+            tombstone = {"cause": "finished", "id": native_id, "tag": tag, "workspace": ws_path, "finished_at_ms": 1792338699929}
+            with patch("agent_hub_host.system.get_system_info", return_value={"capabilities": {}, "hostname": "test", "os": "test", "network": "home", "roles": []}), \
+                 patch("agent_hub_host.api.get_heartbeat_payload", return_value={"type": "heartbeat"}), \
+                 patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, tombstone, "retired_tombstone_verified")):
+                d = fleet.Dispatcher(cfg, request, runner)
+                results = d.once()
+                self.assertEqual(len(results), 1)
+                self.assertEqual(results[0]["id"], native_id)
+                self.assertEqual(results[0]["state"], "stopped")
+                self.assertTrue(results[0]["reconciled"])
+
+            self.assertTrue(any(r[1] == f"/api/sessions/{native_id}/retirement" for r in requests))
+
+    def test_imported_session_correlated_ack_boundaries(self):
+        """Correlated ACK boundary: report reconciled ONLY when ack.id equals exact target UUID
+        AND state == 'stopped'. Replay true alone, wrong id, missing id, or wrong state is NOT ACK.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            ws.mkdir()
+            cfg = settings(ws)
+            native_id = "2d7bc739-3162-4fb9-9c39-691a1b328726"
+            tag = "task-hub-role-head-recovery-01M57V53RB1XM8RZ0R4GWK2P7W-g3-e15"
+            ws_path = str(ws.resolve())
+            incarnation = 1792338485058
+
+            imported_session = {
+                "id": native_id,
+                "engine": "antigravity",
+                "state": "running",
+                "binding": {
+                    "native_id": native_id,
+                    "tag": tag,
+                    "workspace": ws_path,
+                    "generation": 1,
+                    "native_created_at_ms": incarnation,
+                    "provenance": "observed_native",
+                },
+            }
+
+            tombstone = {
+                "cause": "finished",
+                "id": native_id,
+                "tag": tag,
+                "workspace": ws_path,
+                "finished_at_ms": 1792338699929,
+            }
+
+            # Boundary probes:
+            cases = [
+                ("unrelated_replay", {"replay": True}, False),
+                ("wrong_id_stopped", {"id": "00000000-0000-0000-0000-000000000000", "state": "stopped"}, False),
+                ("missing_id_stopped", {"state": "stopped"}, False),
+                ("correct_id_wrong_state", {"id": native_id, "state": "running"}, False),
+                ("empty_dict", {}, False),
+                ("positive_control_new", {"id": native_id, "state": "stopped", "replay": False}, True),
+                ("positive_control_replay", {"id": native_id, "state": "stopped", "replay": True}, True),
+            ]
+
+            for case_name, ack_response, expect_reconciled in cases:
+                with self.subTest(case=case_name):
+                    def request(method, path, body=None):
+                        if method == "GET":
+                            return {"sessions": [imported_session], "next_cursor": None}
+                        if method == "POST":
+                            return ack_response
+                        return {}
+
+                    d = fleet.Dispatcher(cfg, request, lambda *a, **kw: {})
+                    with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, tombstone, "retired_tombstone_verified")):
+                        reconciled = d.reconcile_imported_sessions()
+                        if expect_reconciled:
+                            self.assertEqual(len(reconciled), 1)
+                            self.assertEqual(reconciled[0]["id"], native_id)
+                            self.assertEqual(reconciled[0]["state"], "stopped")
+                        else:
+                            self.assertEqual(reconciled, [])
+
+    def test_imported_session_fair_pagination_across_cycles_and_restart(self):
+        """Fair bounded pagination: host queries canonical imported GET, respects next_cursor
+        even when page is empty/live-only, persists cursor to journal_dir, resumes across restart,
+        and wraps around when list completes. Invalid cursor fails safely.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            ws.mkdir()
+            jdir = Path(tmp) / "journal"
+            jdir.mkdir(mode=0o700)
+            cfg = settings(ws)
+            cfg["journal_dir"] = str(jdir)
+
+            native_id = "2d7bc739-3162-4fb9-9c39-691a1b328726"
+            tag = "task-hub-role-head-recovery-01M57V53RB1XM8RZ0R4GWK2P7W-g3-e15"
+            ws_path = str(ws.resolve())
+            incarnation = 1792338485058
+
+            live_session_1 = {
+                "id": "11111111-1111-1111-1111-111111111111",
+                "engine": "antigravity",
+                "state": "running",
+                "binding": {
+                    "native_id": "11111111-1111-1111-1111-111111111111",
+                    "tag": "tag-1",
+                    "workspace": ws_path,
+                    "generation": 1,
+                    "native_created_at_ms": incarnation,
+                    "provenance": "observed_native",
+                },
+            }
+            finished_session_2 = {
+                "id": native_id,
+                "engine": "antigravity",
+                "state": "running",
+                "binding": {
+                    "native_id": native_id,
+                    "tag": tag,
+                    "workspace": ws_path,
+                    "generation": 1,
+                    "native_created_at_ms": incarnation,
+                    "provenance": "observed_native",
+                },
+            }
+
+            tombstone_finished = {
+                "cause": "finished",
+                "id": native_id,
+                "tag": tag,
+                "workspace": ws_path,
+                "finished_at_ms": 1792338699929,
+            }
+
+            requests = []
+            def request(method, path, body=None):
+                requests.append((method, path, body))
+                if method == "GET":
+                    if path == "/api/sessions/host-bindings?kind=imported":
+                        # Page 1: all live, next_cursor points to cur_2
+                        return {"sessions": [live_session_1], "next_cursor": "cur_2"}
+                    if "cursor=cur_2" in path:
+                        # Page 2: empty/live-filtered page, next_cursor points to cur_3
+                        return {"sessions": [], "next_cursor": "cur_3"}
+                    if "cursor=cur_3" in path:
+                        # Page 3: finished session, next_cursor is None (end)
+                        return {"sessions": [finished_session_2], "next_cursor": None}
+                if method == "POST":
+                    return {"id": native_id, "state": "stopped"}
+                return {}
+
+            def mock_verify(native_bin, target, state_dir=None):
+                if target.session_id == native_id:
+                    return (True, tombstone_finished, "verified")
+                return (False, None, "still_running")
+
+            # Cycle 1: Page 1 fetched, live only -> reconciled empty, cursor 'cur_2' saved to disk
+            d1 = fleet.Dispatcher(cfg, request, lambda *a, **kw: {})
+            with patch("agent_hub_host.fleet.verify_native_retirement", side_effect=mock_verify):
+                res1 = d1.reconcile_imported_sessions()
+                self.assertEqual(res1, [])
+                self.assertEqual(d1._get_imported_cursor(), "cur_2")
+                # Verify cursor persisted to journal_dir
+                cursor_file = jdir / "imported-cursor.json"
+                self.assertTrue(cursor_file.is_file())
+                self.assertIn("cur_2", cursor_file.read_text())
+
+            # Cycle 2: Page 2 fetched with cursor=cur_2 -> empty page, next_cursor 'cur_3' saved
+            with patch("agent_hub_host.fleet.verify_native_retirement", side_effect=mock_verify):
+                res2 = d1.reconcile_imported_sessions()
+                self.assertEqual(res2, [])
+                self.assertEqual(d1._get_imported_cursor(), "cur_3")
+
+            # Cycle 3 (Restart): Process restarts! New Dispatcher instance loaded from cfg
+            d2 = fleet.Dispatcher(cfg, request, lambda *a, **kw: {})
+            self.assertEqual(d2._get_imported_cursor(), "cur_3")
+            with patch("agent_hub_host.fleet.verify_native_retirement", side_effect=mock_verify):
+                res3 = d2.reconcile_imported_sessions()
+                self.assertEqual(len(res3), 1)
+                self.assertEqual(res3[0]["id"], native_id)
+                # Next cursor was None -> wrapped to None!
+                self.assertIsNone(d2._get_imported_cursor())
+
+            # Cycle 4: Wrapping around to beginning (no cursor in path)
+            requests.clear()
+            with patch("agent_hub_host.fleet.verify_native_retirement", side_effect=mock_verify):
+                d2.reconcile_imported_sessions()
+                self.assertEqual(requests[0][1], "/api/sessions/host-bindings?kind=imported")
+
+            # Fault boundary: Corrupted cursor file fails safely without crashing
+            cursor_file.write_text("invalid json {{{")
+            d3 = fleet.Dispatcher(cfg, request, lambda *a, **kw: {})
+            self.assertIsNone(d3._get_imported_cursor())
+
+    def test_imported_session_incomplete_stored_binding_rejected(self):
+        """Reject malformed / incomplete imported sessions without attempting retirement."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            ws.mkdir()
+            cfg = settings(ws)
+            ws_path = str(ws.resolve())
+
+            base = {
+                "id": "2d7bc739-3162-4fb9-9c39-691a1b328726",
+                "engine": "antigravity",
+                "state": "running",
+                "binding": {
+                    "native_id": "2d7bc739-3162-4fb9-9c39-691a1b328726",
+                    "tag": "my-tag",
+                    "workspace": ws_path,
+                    "generation": 1,
+                    "native_created_at_ms": 1792338485058,
+                    "provenance": "observed_native",
+                },
+            }
+
+            incomplete_cases = [
+                ("missing_engine", {**base, "engine": "", "binding": {**base["binding"], "engine": ""}}),
+                ("zero_creation", {**base, "binding": {**base["binding"], "native_created_at_ms": 0}}),
+                ("negative_generation", {**base, "binding": {**base["binding"], "generation": -1}}),
+                ("non_uuid_id", {**base, "id": "not-a-uuid", "binding": {**base["binding"], "native_id": "not-a-uuid"}}),
+                ("non_observed_native", {**base, "binding": {**base["binding"], "provenance": "something_else"}}),
+                ("missing_workspace", {**base, "binding": {**base["binding"], "workspace": ""}}),
+            ]
+
+            for name, sess in incomplete_cases:
+                with self.subTest(case=name):
+                    d = fleet.Dispatcher(cfg, lambda m, p, b=None: {"sessions": [sess]})
+                    with patch("agent_hub_host.fleet.verify_native_retirement") as mock_v:
+                        self.assertEqual(d.reconcile_imported_sessions(), [])
+                        mock_v.assert_not_called()
+
+
+class ImportedCursorPrivateBoundaryTests(unittest.TestCase):
+    def test_refused_private_write_cannot_fall_back_to_predictable_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            journal = root / 'journal'
+            journal.mkdir(mode=0o700)
+            original = root / 'original'
+            protected = root / 'protected-fixture'
+            original.write_text('{}')
+            protected.write_text('sentinel')
+            cursor = journal / 'imported-cursor.json'
+            cursor.symlink_to(original)
+            (journal / f'imported-cursor.json.{os.getpid()}.tmp').symlink_to(protected)
+            dispatcher = fleet.Dispatcher({}, journal_dir=str(journal))
+            dispatcher._set_imported_cursor('page2')
+            self.assertEqual(protected.read_text(), 'sentinel')
+            self.assertTrue(cursor.is_symlink())
+            self.assertEqual(original.read_text(), '{}')
+
+    def test_refused_symlink_read_cannot_supply_network_cursor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            journal = root / 'journal'
+            journal.mkdir(mode=0o700)
+            foreign = root / 'private-fixture'
+            foreign.write_text(json.dumps({'cursor': 'private-value-must-not-leave'}))
+            (journal / 'imported-cursor.json').symlink_to(foreign)
+            paths = []
+            def request(method, path, payload=None):
+                paths.append(path)
+                return {'sessions': [], 'next_cursor': None}
+            dispatcher = fleet.Dispatcher({}, request=request, journal_dir=str(journal))
+            self.assertEqual(dispatcher.reconcile_imported_sessions(), [])
+            self.assertEqual(paths, ['/api/sessions/host-bindings?kind=imported'])
+            self.assertIn('private-value-must-not-leave', foreign.read_text())
+
+    def test_private_cursor_read_is_byte_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'imported-cursor.json'
+            p.write_text(json.dumps({'cursor': 'x' * 8192}))
+            p.chmod(0o600)
+            dispatcher = fleet.Dispatcher({}, journal_dir=tmp)
+            self.assertIsNone(dispatcher._get_imported_cursor())
+
+    def test_malformed_page_cannot_reset_or_advance_existing_cursor(self):
+        for reply in ({'error': 'unexpected'}, {'sessions': [], 'next_cursor': 12},
+                      {'sessions': 'not-an-array', 'next_cursor': 'page3'}):
+            with self.subTest(reply=reply):
+                dispatcher = fleet.Dispatcher({}, request=lambda *args: reply)
+                dispatcher._set_imported_cursor('page2')
+                self.assertEqual(dispatcher.reconcile_imported_sessions(), [])
+                self.assertEqual(dispatcher._get_imported_cursor(), 'page2')
+
+    def test_explicit_end_cursor_persists_without_unsafe_unlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dispatcher = fleet.Dispatcher({}, journal_dir=tmp)
+            dispatcher._set_imported_cursor('page2')
+            self.assertEqual(fleet.Dispatcher({}, journal_dir=tmp)._get_imported_cursor(), 'page2')
+            dispatcher._set_imported_cursor(None)
+            self.assertIsNone(fleet.Dispatcher({}, journal_dir=tmp)._get_imported_cursor())
+            self.assertEqual(json.loads((Path(tmp) / 'imported-cursor.json').read_text()), {'cursor': None})
+
 
 if __name__ == '__main__': unittest.main()
-

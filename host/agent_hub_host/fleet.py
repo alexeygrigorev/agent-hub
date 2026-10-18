@@ -425,9 +425,46 @@ class Dispatcher:
         self.role_config = role_config
         self.role_config_path = role_config_path
         self.journal_dir = journal_dir or settings.get("journal_dir")
+        self._imported_sessions_cursor: Optional[str] = None
         self._active_launches: dict[str, dict[str, Any]] = {}
         if self.journal_dir:
             self._load_pending_launches_from_journal()
+
+    @staticmethod
+    def _valid_imported_cursor(cursor) -> bool:
+        return (isinstance(cursor, str) and bool(cursor)
+                and len(cursor.encode("utf-8")) <= 512
+                and not any(ord(c) < 32 or ord(c) == 127 for c in cursor))
+
+    def _get_imported_cursor(self) -> Optional[str]:
+        if self.journal_dir:
+            from . import private_fs
+            try:
+                raw = private_fs.read_bytes(Path(self.journal_dir) / "imported-cursor.json", 4096)
+                data = json.loads(raw.decode("utf-8"))
+                cursor = data.get("cursor") if isinstance(data, dict) else None
+                return cursor if self._valid_imported_cursor(cursor) else None
+            except FileNotFoundError:
+                pass
+            except Exception:
+                # Refused, oversized or malformed files never supply a cursor.
+                return None
+        cursor = getattr(self, "_imported_sessions_cursor", None)
+        return cursor if self._valid_imported_cursor(cursor) else None
+
+    def _set_imported_cursor(self, cursor: Optional[str]) -> None:
+        if cursor is not None and not self._valid_imported_cursor(cursor):
+            raise ValueError("Invalid imported cursor")
+        self._imported_sessions_cursor = cursor
+        if self.journal_dir:
+            from . import private_fs
+            try:
+                raw = json.dumps({"cursor": cursor}).encode("utf-8")
+                private_fs.atomic_write(Path(self.journal_dir) / "imported-cursor.json", raw, 4096)
+            except Exception:
+                # Keep safe instance progress; retry after restart is idempotent.
+                # A private-file refusal must never trigger a weaker writer.
+                pass
 
     def _journal_launches_dir(self) -> Optional[Path]:
         if not self.journal_dir:
@@ -661,6 +698,133 @@ class Dispatcher:
                 reconciled.append({"id": offer_id, "state": fleet_state, "reconciled": True})
             except Exception:
                 # Retain pending observation until the server explicitly acknowledges it.
+                continue
+
+        return reconciled
+
+    def reconcile_imported_sessions(self, imported_bindings: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
+        """Reconcile active imported/observed-native sessions via verified positive retirement
+        tombstones and own-host session retirement reporting.
+        """
+        reconciled = []
+        if imported_bindings is None:
+            cursor = self._get_imported_cursor()
+            path = "/api/sessions/host-bindings?kind=imported"
+            if cursor:
+                import urllib.parse
+                path += f"&cursor={urllib.parse.quote(cursor)}"
+            try:
+                res = self.request("GET", path)
+                if not isinstance(res, dict) or "next_cursor" not in res:
+                    return reconciled
+                sessions = res.get("sessions")
+                next_cursor = res.get("next_cursor")
+                if (not isinstance(sessions, list) or len(sessions) > 100
+                        or (next_cursor is not None and not self._valid_imported_cursor(next_cursor))):
+                    return reconciled
+                imported_bindings = sessions
+                self._set_imported_cursor(next_cursor)
+            except Exception:
+                # Unknown/error preserves pending, invalidcursorstate fails safely without terminal inference
+                return reconciled
+
+        if not isinstance(imported_bindings, list) or not imported_bindings:
+            return reconciled
+
+        from .native_sessions import NativeTarget, SessionControlError
+
+        native = self.settings.get("aplexer_bin", "aplexer")
+        state_dir = self.settings.get("aplexer_state_dir")
+
+        for item in imported_bindings:
+            if not isinstance(item, dict):
+                continue
+
+            binding = item.get("binding")
+            if not isinstance(binding, dict):
+                continue
+
+            if binding.get("provenance") != "observed_native":
+                continue
+
+            native_id = binding.get("native_id")
+            if item.get("id") != native_id:
+                continue
+            tag = binding.get("tag")
+            workspace = binding.get("workspace")
+            incarnation = binding.get("native_created_at_ms")
+            generation = binding.get("generation")
+            engine = item.get("engine") or binding.get("engine")
+
+            if not isinstance(native_id, str) or not native_id:
+                continue
+            if not isinstance(tag, str) or not tag:
+                continue
+            if not isinstance(workspace, str) or not workspace:
+                continue
+            if type(incarnation) is not int or incarnation <= 0:
+                continue
+            if type(generation) is not int or generation <= 0:
+                continue
+            if not isinstance(engine, str) or not engine:
+                continue
+
+            # 1. Corroborate exact 5-field native tuple
+            try:
+                target = NativeTarget(
+                    session_id=native_id,
+                    tag=tag,
+                    workspace=workspace,
+                    created_at_ms=incarnation,
+                    engine=engine,
+                ).validated()
+            except (SessionControlError, ValueError, TypeError, KeyError):
+                continue
+
+            # 2. Positive retirement verification via authentic tombstone
+            try:
+                is_retired, tombstone, detail = verify_native_retirement(
+                    native, target, state_dir=state_dir
+                )
+            except Exception:
+                continue
+
+            if not is_retired or not isinstance(tombstone, dict):
+                continue
+
+            cause = tombstone.get("cause")
+            finished_at_ms = tombstone.get("finished_at_ms")
+            if cause != "finished" or type(finished_at_ms) is not int or finished_at_ms <= 0:
+                continue
+
+            # 3. Report terminal positive retirement to Hub
+            payload = {
+                "native": {
+                    "native_id": target.session_id,
+                    "tag": target.tag,
+                    "workspace": target.workspace,
+                    "created_at_ms": target.created_at_ms,
+                    "engine": target.engine,
+                },
+                "generation": generation,
+                "finished_at_ms": finished_at_ms,
+                "cause": "finished",
+                "state": "stopped",
+            }
+            path = f"/api/sessions/{target.session_id}/retirement"
+            try:
+                ack = self.request("POST", path, payload)
+                if isinstance(ack, dict):
+                    ack_id = ack.get("id")
+                    if ack_id == target.session_id and ack.get("state") == "stopped":
+                        reconciled.append({
+                            "id": target.session_id,
+                            "state": "stopped",
+                            "reconciled": True,
+                        })
+            except Exception:
+                # Retain pending observation on transport/server failure;
+                # reconcile next cycle.
                 continue
 
         return reconciled
@@ -1063,8 +1227,9 @@ class Dispatcher:
         if 'capabilities' in self.settings:
             self.request('PUT', '/api/fleet/routing/capabilities', {'needs': self.settings['capabilities'], 'max_agents': self.settings.get('max_agents', 1), 'runners': [{'engine': s.get('engine', s['service']), 'profile': s.get('profile'), 'account': s['account_label'], 'model': s['launcher_model'], 'effort': s.get('launcher_effort')} for s in self.settings['subscriptions'] if s.get('launcher_model') and s.get('admission_argv')]})
         reconciled = self.reconcile_launches()
+        imported_reconciled = self.reconcile_imported_sessions()
         offers = self.request("GET", "/api/fleet/offers").get("offers", [])
-        results = list(reconciled)
+        results = list(reconciled) + list(imported_reconciled)
         for offer in offers:
             try:
                 results.append(self.dispatch(offer))

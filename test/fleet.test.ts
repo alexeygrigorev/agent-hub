@@ -327,3 +327,81 @@ describe('absolute workspace identifiers alongside labels', () => {
     expect((await s.handle(request('/claim-policy', bad, 'PUT'), admin)).status).toBe(400);
   }));
 });
+
+describe('imported session lifecycle and non-resurrection in fleet catalog', () => {
+  it('prevents late live-catalog snapshots from resurrecting stopped same-incarnation sessions while allowing new UUID tag reuse', async () => fixture(async (s, sql) => {
+    for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
+
+    const NATIVE_ID_1 = '2d7bc739-3162-4fb9-9c39-691a1b328726';
+    const NATIVE_ID_2 = '55555555-5555-4555-8555-555555555555';
+    const TAG = 'task-hub-role-head-recovery';
+    const WS = '/home/alexey/git/agent-hub';
+    const INCARNATION = 1792338485058;
+
+    // 1. Initial live catalog report
+    const live1 = {
+      native_id: NATIVE_ID_1,
+      tag: TAG,
+      engine: 'antigravity',
+      phase: 'running',
+      agent_state: 'working',
+      workspace: WS,
+      cwd: WS,
+      profile: null,
+      account: null,
+      last_activity_at: iso(),
+      created_at_ms: INCARNATION,
+    };
+    const rep1 = await s.handle(request('/sessions', { sessions: [live1] }, 'PUT'), host('hetzner'));
+    expect(rep1.status).toBe(200);
+
+    // Verified present in fleet_sessions and session_control_sessions (state=running)
+    const row1 = sql.exec('SELECT * FROM fleet_sessions WHERE native_id = ?', NATIVE_ID_1).toArray()[0];
+    expect(row1).toBeDefined();
+    expect(row1.phase).toBe('running');
+
+    const sc1 = sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', NATIVE_ID_1).toArray()[0];
+    expect(sc1).toBeDefined();
+    expect(sc1.state).toBe('running');
+
+    // 2. Canonical positive retirement stops the session
+    sql.exec("UPDATE session_control_sessions SET state = 'stopped', updated_at = ? WHERE id = ?", iso(), NATIVE_ID_1);
+
+    // 3. Late live-catalog snapshot arrives reporting the SAME session/incarnation still running
+    const lateRep = await s.handle(request('/sessions', { sessions: [live1] }, 'PUT'), host('hetzner'));
+    expect(lateRep.status).toBe(200);
+
+    // Same incarnation CANNOT resurrect:
+    // Pruned from fleet_sessions and state remains stopped in session_control_sessions
+    const fleetCheck = sql.exec('SELECT * FROM fleet_sessions WHERE native_id = ?', NATIVE_ID_1).toArray();
+    expect(fleetCheck.length).toBe(0);
+
+    const scCheck = sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', NATIVE_ID_1).toArray()[0];
+    expect(scCheck.state).toBe('stopped');
+
+    // 4. New UUID tag reuse: new session with same tag but new UUID is accepted normally
+    const live2 = {
+      native_id: NATIVE_ID_2,
+      tag: TAG,
+      engine: 'antigravity',
+      phase: 'running',
+      agent_state: 'working',
+      workspace: WS,
+      cwd: WS,
+      profile: null,
+      account: null,
+      last_activity_at: iso(),
+      created_at_ms: INCARNATION + 100000,
+    };
+    const rep2 = await s.handle(request('/sessions', { sessions: [live2] }, 'PUT'), host('hetzner'));
+    expect(rep2.status).toBe(200);
+
+    const row2 = sql.exec('SELECT * FROM fleet_sessions WHERE native_id = ?', NATIVE_ID_2).toArray()[0];
+    expect(row2).toBeDefined();
+    expect(row2.phase).toBe('running');
+
+    const sc2 = sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', NATIVE_ID_2).toArray()[0];
+    expect(sc2).toBeDefined();
+    expect(sc2.state).toBe('running');
+  }));
+});

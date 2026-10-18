@@ -418,8 +418,35 @@ export class FleetService {
         // are metered. observed_at therefore means "last changed"; host freshness comes from heartbeats.
         const fields = ['tag', 'engine', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms'];
         const existing = new Map((this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id = ?', caller.machineId!).toArray() as any[]).map(r => [r.native_id, r]));
+
+        // Stopped same-incarnation native sessions cannot resurrect from late live-catalog snapshots:
+        // do not insert or resurrect in fleet_sessions or adoptObservedNativeSessions if already canonically stopped for the same incarnation.
+        const stoppedSessions = new Map<string, number | null>();
+        try {
+          const stoppedRows = this.sql.exec(
+            "SELECT id, binding_json FROM session_control_sessions WHERE machine_id = ? AND state = 'stopped'",
+            caller.machineId!
+          ).toArray() as any[];
+          for (const r of stoppedRows) {
+            try {
+              const b = JSON.parse(r.binding_json || '{}');
+              stoppedSessions.set(r.id, b.native_created_at_ms ?? null);
+            } catch {
+              stoppedSessions.set(r.id, null);
+            }
+          }
+        } catch {}
+
         let written = 0;
+        const cleanSessions: any[] = [];
         for (const s of data.sessions) {
+          if (stoppedSessions.has(s.native_id)) {
+            const stoppedCreated = stoppedSessions.get(s.native_id);
+            if (stoppedCreated === null || stoppedCreated === undefined || s.created_at_ms === null || s.created_at_ms === undefined || s.created_at_ms <= stoppedCreated) {
+              continue;
+            }
+          }
+          cleanSessions.push(s);
           const prior = existing.get(s.native_id); existing.delete(s.native_id);
           const row = { ...s, last_activity_at: s.last_activity_at ?? null, cwd: s.cwd ?? null, created_at_ms: s.created_at_ms ?? null };
           if (prior && fields.every(f => (prior[f] ?? null) === (row[f] ?? null))) continue;
@@ -427,7 +454,7 @@ export class FleetService {
           written++;
         }
         for (const gone of existing.keys()) { this.sql.exec('DELETE FROM fleet_sessions WHERE machine_id = ? AND native_id = ?', caller.machineId!, gone); written++; }
-        adoptObservedNativeSessions(this.sql, caller.machineId!, data.sessions, this.now());
+        adoptObservedNativeSessions(this.sql, caller.machineId!, cleanSessions, this.now());
         return response({ status: 'reported', written });
       });
     }
