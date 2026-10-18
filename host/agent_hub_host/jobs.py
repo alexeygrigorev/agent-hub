@@ -219,6 +219,56 @@ class JobsClient:
         )
 
 
+def write_role_uncertain_proof(
+    runs_dir: pathlib.Path,
+    run_dir: Optional[pathlib.Path],
+    job_id: str,
+    role: Optional[Dict[str, Any]],
+    kind: str,
+    lease_epoch: int,
+    phase: str,
+    cause: str,
+    is_prelaunch_refusal: bool = False,
+    exc: Optional[Exception] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> pathlib.Path:
+    """Record safe, scrubbed durable cause/phase proof for an uncertain role outcome."""
+    proof_data = {
+        "job_id": job_id,
+        "role_name": role.get("name") if role else None,
+        "profile": kind,
+        "lease_epoch": lease_epoch,
+        "generation": role.get("generation") if role else None,
+        "phase": phase,
+        "status": "uncertain",
+        "uncertain": True,
+        "prelaunch_refusal": bool(is_prelaunch_refusal),
+        "ambiguous_launch": not bool(is_prelaunch_refusal),
+        "cause": cause,
+        "error_type": type(exc).__name__ if exc else None,
+        "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    if extra:
+        proof_data["details"] = extra
+
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = runs_dir / f"outcome-uncertain-{job_id}.json"
+    try:
+        rld.write_private_json(summary_path, proof_data)
+    except Exception as e:
+        logger.warning("Failed to write runs_dir outcome-uncertain proof: %s", e)
+
+    if run_dir is not None:
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            run_path = run_dir / f"outcome-uncertain-{job_id}.json"
+            rld.write_private_json(run_path, proof_data)
+        except Exception as e:
+            logger.warning("Failed to write run_dir outcome-uncertain proof: %s", e)
+
+    return summary_path
+
+
 class JobDispatcher:
     """Coordinates job offer evaluation, claiming, execution, and renewals."""
 
@@ -600,9 +650,29 @@ class JobDispatcher:
         role_intent_recorded = False
 
         def _finish_failed_with_bridge(fail_summary: str, initial_refs: Optional[List[str]] = None,
-                                       known_terminal: bool = False) -> None:
+                                       known_terminal: bool = False,
+                                       phase: str = "unknown",
+                                       is_prelaunch_refusal: bool = False,
+                                       exc: Optional[Exception] = None) -> None:
             if role is not None and role_intent_recorded and not known_terminal:
-                logger.warning("Role consumer state uncertain; retain intent and HOLD %s", job_id)
+                scrubbed_cause = rld.scrub(fail_summary, job_token)
+                run_dir_path = (runs_dir / f"{kind}-{job_id}") if role is not None else None
+                write_role_uncertain_proof(
+                    runs_dir=runs_dir,
+                    run_dir=run_dir_path,
+                    job_id=job_id,
+                    role=role,
+                    kind=kind,
+                    lease_epoch=lease_epoch,
+                    phase=phase,
+                    cause=scrubbed_cause,
+                    is_prelaunch_refusal=is_prelaunch_refusal,
+                    exc=exc,
+                )
+                logger.warning(
+                    "Role consumer state uncertain (phase=%s, prelaunch_refusal=%s): %s; retain intent and HOLD %s",
+                    phase, is_prelaunch_refusal, scrubbed_cause, job_id,
+                )
                 return
             refs = list(initial_refs) if initial_refs else []
             out_summary = fail_summary
@@ -711,6 +781,7 @@ class JobDispatcher:
             exec_exc: List[Exception] = []
 
             server_started_event = threading.Event()
+            first_action_ready_event = threading.Event()
             server_start_result: Dict[str, Any] = {}
 
             def _role_start_callback(start_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -722,6 +793,7 @@ class JobDispatcher:
                                 json.dump(ev_payload, f)
                 except Exception:
                     pass
+                first_action_ready_event.set()
                 server_started_event.wait(timeout=15.0)
                 if server_start_result.get("status") == "started":
                     return {
@@ -755,23 +827,62 @@ class JobDispatcher:
             )
             exec_thread.start()
 
-            # Poll for worker-produced evidence_file while worker is running
-            poll_deadline = time.time() + 10.0
-            while time.time() < poll_deadline and exec_thread.is_alive():
+            # Poll for worker-produced evidence_file while worker is running.
+            # Role jobs wait for actual bootstrap window (BOOTSTRAP_TIMEOUT_SEC = 120s), bounded by deadline.
+            def _get_clk_time() -> float:
+                if hasattr(self.clock, "time") and callable(self.clock.time):
+                    return self.clock.time()
+                if callable(self.clock):
+                    return self.clock()
+                return time.time()
+
+            bootstrap_window = rld.BOOTSTRAP_TIMEOUT_SEC if role is not None else 10.0
+            poll_deadline = _get_clk_time() + bootstrap_window
+            if deadline_sec is not None:
+                poll_deadline = min(poll_deadline, deadline_sec)
+
+            while _get_clk_time() < poll_deadline and exec_thread.is_alive():
                 if evidence_file.exists():
                     break
                 if stop_event.is_set():
                     break
-                exec_thread.join(timeout=0.005)
+                first_action_ready_event.wait(timeout=0.02)
+                if evidence_file.exists():
+                    break
+                exec_thread.join(timeout=0.01)
 
             if acquired_root and getattr(self.root_bridge, "_released", False):
                 return
 
+            run_dir_path = (runs_dir / f"{kind}-{job_id}") if role is not None else None
+
             if exec_exc:
+                exc = exec_exc[0]
                 if role is not None:
-                    logger.warning("Role consumer outcome uncertain; retain intent and HOLD %s", job_id)
+                    # Definite prelaunch refusal ONLY on witnessed preflight checks with absence of launch attempt
+                    # Never guess prelaunch from exception text substrings
+                    is_prelaunch = bool(getattr(exc, "prelaunch_refusal", False))
+                    phase = "preflight" if is_prelaunch else "execution_error"
+                    err_msg = str(exc)
+                    cause = rld.scrub(err_msg, job_token)
+                    write_role_uncertain_proof(
+                        runs_dir=runs_dir,
+                        run_dir=run_dir_path,
+                        job_id=job_id,
+                        role=role,
+                        kind=kind,
+                        lease_epoch=lease_epoch,
+                        phase=phase,
+                        cause=cause,
+                        is_prelaunch_refusal=is_prelaunch,
+                        exc=exc,
+                    )
+                    logger.warning(
+                        "Role consumer outcome uncertain (phase=%s, prelaunch_refusal=%s): %s; retain intent and HOLD %s",
+                        phase, is_prelaunch, cause, job_id,
+                    )
                     return
-                _finish_failed_with_bridge(f"execution_error: {exec_exc[0]}")
+                _finish_failed_with_bridge(f"execution_error: {exc}")
                 return
 
             res_obj = exec_result.get("res") or {}
@@ -786,6 +897,25 @@ class JobDispatcher:
             # Never self-fabricate first-action evidence or spawn a dummy sleep child in the dispatcher.
             if not evidence_file.exists():
                 logger.error(f"No genuine first-action evidence produced for job {job_id}")
+                if role is not None:
+                    phase = "bootstrap_timeout"
+                    cause = "no first action evidence produced within bootstrap window"
+                    write_role_uncertain_proof(
+                        runs_dir=runs_dir,
+                        run_dir=run_dir_path,
+                        job_id=job_id,
+                        role=role,
+                        kind=kind,
+                        lease_epoch=lease_epoch,
+                        phase=phase,
+                        cause=cause,
+                        is_prelaunch_refusal=False,
+                    )
+                    logger.warning(
+                        "Role consumer outcome uncertain (phase=%s, prelaunch_refusal=False): %s; retain intent and HOLD %s",
+                        phase, cause, job_id,
+                    )
+                    return
                 _finish_failed_with_bridge("no first action evidence", res_refs)
                 return
 
@@ -793,7 +923,14 @@ class JobDispatcher:
             try:
                 if evidence_file.stat().st_mtime < job_start_wall - 0.05:
                     raise ValueError("stale evidence file created before job start")
-                existing_data = json.loads(evidence_file.read_text(encoding="utf-8"))
+                for _ in range(5):
+                    try:
+                        existing_data = json.loads(evidence_file.read_text(encoding="utf-8"))
+                        break
+                    except (json.JSONDecodeError, OSError):
+                        time.sleep(0.02)
+                else:
+                    existing_data = json.loads(evidence_file.read_text(encoding="utf-8"))
                 if not isinstance(existing_data, dict):
                     raise ValueError("non-dict evidence")
                 ex_pid = existing_data.get("pid")
@@ -844,6 +981,26 @@ class JobDispatcher:
                 server_start_result["status"] = "failed"
                 server_start_result["error"] = str(e)
                 server_started_event.set()
+                if role is not None:
+                    phase = "custody_validation"
+                    cause = rld.scrub(f"first-action custody failed: {e}", job_token)
+                    write_role_uncertain_proof(
+                        runs_dir=runs_dir,
+                        run_dir=run_dir_path,
+                        job_id=job_id,
+                        role=role,
+                        kind=kind,
+                        lease_epoch=lease_epoch,
+                        phase=phase,
+                        cause=cause,
+                        is_prelaunch_refusal=False,
+                        exc=e,
+                    )
+                    logger.warning(
+                        "Role consumer outcome uncertain (phase=%s, prelaunch_refusal=False): %s; retain intent and HOLD %s",
+                        phase, cause, job_id,
+                    )
+                    return
                 _finish_failed_with_bridge(f"first-action custody failed: {e}", res_refs)
                 return
 
@@ -869,6 +1026,25 @@ class JobDispatcher:
                 server_start_result["status"] = "failed"
                 server_start_result["error"] = "no_first_action_digest"
                 server_started_event.set()
+                if role is not None:
+                    phase = "evidence_digest"
+                    cause = "no first action digest"
+                    write_role_uncertain_proof(
+                        runs_dir=runs_dir,
+                        run_dir=run_dir_path,
+                        job_id=job_id,
+                        role=role,
+                        kind=kind,
+                        lease_epoch=lease_epoch,
+                        phase=phase,
+                        cause=cause,
+                        is_prelaunch_refusal=False,
+                    )
+                    logger.warning(
+                        "Role consumer outcome uncertain (phase=%s, prelaunch_refusal=False): %s; retain intent and HOLD %s",
+                        phase, cause, job_id,
+                    )
+                    return
                 _finish_failed_with_bridge("no first action digest", res_refs)
                 return
 
@@ -882,6 +1058,25 @@ class JobDispatcher:
                 server_start_result["status"] = "failed"
                 server_start_result["error"] = start_res.get("error")
                 server_started_event.set()
+                if role is not None:
+                    phase = "server_start"
+                    cause = rld.scrub(f"start_job failed: {start_res.get('error')}", job_token)
+                    write_role_uncertain_proof(
+                        runs_dir=runs_dir,
+                        run_dir=run_dir_path,
+                        job_id=job_id,
+                        role=role,
+                        kind=kind,
+                        lease_epoch=lease_epoch,
+                        phase=phase,
+                        cause=cause,
+                        is_prelaunch_refusal=False,
+                    )
+                    logger.warning(
+                        "Role consumer outcome uncertain (phase=%s, prelaunch_refusal=False): %s; retain intent and HOLD %s",
+                        phase, cause, job_id,
+                    )
+                    return
                 _finish_failed_with_bridge(f"start_job failed: {start_res.get('error')}", res_refs)
                 return
 
@@ -892,7 +1087,7 @@ class JobDispatcher:
             # Start periodic renewal loop in background
             renew_thread = threading.Thread(
                 target=self._renewal_loop,
-                args=(job_id, job_token, lease_epoch, stop_event),
+                args=(job_id, job_token, lease_epoch, stop_event, role),
                 name=f"renew-{job_id}",
                 daemon=True
             )
@@ -901,11 +1096,29 @@ class JobDispatcher:
             # Wait for execution to finish
             exec_thread.join()
             if exec_exc:
+                exc = exec_exc[0]
                 if role is not None:
-                    logger.warning("Role consumer outcome uncertain; retain intent and HOLD %s", job_id)
+                    phase = "execution_error"
+                    cause = rld.scrub(f"execution_error: {exc}", job_token)
+                    write_role_uncertain_proof(
+                        runs_dir=runs_dir,
+                        run_dir=run_dir_path,
+                        job_id=job_id,
+                        role=role,
+                        kind=kind,
+                        lease_epoch=lease_epoch,
+                        phase=phase,
+                        cause=cause,
+                        is_prelaunch_refusal=False,
+                        exc=exc,
+                    )
+                    logger.warning(
+                        "Role consumer outcome uncertain (phase=%s, prelaunch_refusal=False): %s; retain intent and HOLD %s",
+                        phase, cause, job_id,
+                    )
                     return
                 status = "failed"
-                summary = f"execution_error: {exec_exc[0]}"
+                summary = f"execution_error: {exc}"
                 evidence_refs = []
             else:
                 exec_res = exec_result.get("res", {})
@@ -921,13 +1134,52 @@ class JobDispatcher:
             # Check deadline_at
             clk_now = self.clock.time() if hasattr(self.clock, "time") else (self.clock() if callable(self.clock) else time.time())
             if deadline_sec is not None and clk_now > deadline_sec:
+                if role is not None:
+                    phase = "deadline_exceeded"
+                    cause = f"deadline_exceeded: job execution exceeded deadline_at ({deadline_sec})"
+                    write_role_uncertain_proof(
+                        runs_dir=runs_dir,
+                        run_dir=run_dir_path,
+                        job_id=job_id,
+                        role=role,
+                        kind=kind,
+                        lease_epoch=lease_epoch,
+                        phase=phase,
+                        cause=cause,
+                        is_prelaunch_refusal=False,
+                    )
+                    logger.warning(
+                        "Role consumer outcome uncertain (phase=%s, prelaunch_refusal=False): %s; retain intent and HOLD %s",
+                        phase, cause, job_id,
+                    )
+                    return
                 status = "failed"
                 summary = "deadline_exceeded: job execution exceeded deadline_at"
 
             # Check renewal failures (for both root and non-root jobs)
             if job_id in self._renewal_failures:
+                fail_err = self._renewal_failures.pop(job_id)
+                if role is not None:
+                    phase = "lease_renewal_failed"
+                    cause = rld.scrub(f"lease_renewal_failed: {fail_err}", job_token)
+                    write_role_uncertain_proof(
+                        runs_dir=runs_dir,
+                        run_dir=run_dir_path,
+                        job_id=job_id,
+                        role=role,
+                        kind=kind,
+                        lease_epoch=lease_epoch,
+                        phase=phase,
+                        cause=cause,
+                        is_prelaunch_refusal=False,
+                    )
+                    logger.warning(
+                        "Role consumer outcome uncertain (phase=%s, prelaunch_refusal=False): %s; retain intent and HOLD %s",
+                        phase, cause, job_id,
+                    )
+                    return
                 status = "failed"
-                summary = f"lease_renewal_failed: {self._renewal_failures.pop(job_id)}"
+                summary = f"lease_renewal_failed: {fail_err}"
 
             # Fencing check: never report succeeded if fenced in the root bridge
             if acquired_root:
@@ -1104,11 +1356,15 @@ class JobDispatcher:
         job_id: str,
         job_token: str,
         epoch: int,
-        stop_event: threading.Event
+        stop_event: threading.Event,
+        role: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Periodically renew lease every 300s (5 minutes)."""
-        role = self.running_jobs.get(job_id, {}).get("role_binding")
-        interval = min(300.0, role["ttl_seconds"] / 3) if role else 300.0
+        if role is None:
+            role = self.running_jobs.get(job_id, {}).get("role_binding")
+        interval = getattr(self, "renewal_interval_sec", None)
+        if interval is None:
+            interval = min(300.0, role["ttl_seconds"] / 3) if role else 300.0
         while not stop_event.is_set():
             if stop_event.wait(interval):
                 break
@@ -1132,6 +1388,7 @@ class JobDispatcher:
                         break
             except Exception as e:
                 logger.warning(f"Lease renewal exception for job {job_id}: {e}")
+                self._renewal_failures[job_id] = str(e)
                 if role:
                     stop_event.set()
                     break

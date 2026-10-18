@@ -379,6 +379,7 @@ class RuntimeManager:
         config: Optional[rd.TrustedRootConfig] = None,
         adapter_kwargs: Optional[Dict[str, Any]] = None,
         role_config: Optional[rld.TrustedRoleConfig] = None,
+        clock: Optional[Any] = None,
     ):
         self._config_error: Optional[str] = None
         if config is None:
@@ -398,12 +399,17 @@ class RuntimeManager:
         self._bound_clock_fixture = False
         self.host_id: str = ""
 
+        constructor_clock = clock or self._adapter_kwargs.get("clock")
+        self.clock = constructor_clock or time
+        if constructor_clock is not None and constructor_clock is not time:
+            self._bound_clock_fixture = True
         self._role_config: rld.TrustedRoleConfig = role_config if role_config is not None else rld.TrustedRoleConfig.disabled()
         self.role_adapter = rld.RoleDispatchAdapter(
             config=self._role_config,
             quota_checker=self._adapter_kwargs.get("role_quota_checker"),
             launcher_backend=self._adapter_kwargs.get("role_launcher_backend"),
             launcher_executor=self._adapter_kwargs.get("role_launcher_executor"),
+            clock=self.clock,
         )
 
     @property
@@ -418,6 +424,7 @@ class RuntimeManager:
             quota_checker=self._adapter_kwargs.get("role_quota_checker"),
             launcher_backend=self._adapter_kwargs.get("role_launcher_backend"),
             launcher_executor=self._adapter_kwargs.get("role_launcher_executor"),
+            clock=getattr(self, "clock", time),
         )
 
     def set_mock_runner(self, runner: Any) -> None:
@@ -430,10 +437,15 @@ class RuntimeManager:
         # A dispatcher may retain this clock after a later trusted binding. Once injected,
         # this manager remains fixture-only; rebinding cannot restore operational authority.
         self._bound_clock_fixture |= clock is not None and clock is not time
+        if clock is not None:
+            if not self._bound_clock_fixture or (clock is not time):
+                self.clock = clock
+                if hasattr(self, "role_adapter") and self.role_adapter is not None:
+                    self.role_adapter.clock = clock
         if self.config is None:
             return
         self._scheduling = rd.HubSchedulingReader(
-            base_url, token_provider, host_id=host_id, clock=clock,
+            base_url, token_provider, host_id=host_id, clock=self.clock,
             cache=rd.SchedulingCache(self.config.host_state_dir),
             canonical_state_dir=self.config.canonical_state_dir,
         )
@@ -575,6 +587,12 @@ class RuntimeManager:
 
         if kind not in rld.SUPPORTED_ROLE_PROFILES:
             return False, f"unsupported_role_profile: {kind}", {"kind": kind, "supported": False}
+
+        if self._bound_clock_fixture or (getattr(self, "clock", time) is not time):
+            ok, reason, report = self.role_adapter.can_process(kind)
+            report["is_fixture_only"] = True
+            report["operational_qualified"] = False
+            return False, "role_unqualified: clock_fixture_injected", report
 
         return self.role_adapter.can_process(kind)
 

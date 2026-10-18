@@ -74,6 +74,10 @@ ROLE_NAME_RE = re.compile(r"^automation:[a-z][a-z0-9-]{0,47}:[a-z][a-z0-9-]{0,47
 class DispatchError(RuntimeError):
     """Raised when trusted Role dispatch is refused or fails. Never hidden."""
 
+    def __init__(self, message: str, prelaunch_refusal: bool = False):
+        super().__init__(message)
+        self.prelaunch_refusal = prelaunch_refusal
+
 
 def scrub(text: Any, *secrets: Optional[str]) -> str:
     out = str(text)
@@ -106,11 +110,11 @@ def _is_within(child: pathlib.Path, parent: pathlib.Path) -> bool:
 def ensure_private_dir(path: pathlib.Path) -> pathlib.Path:
     path = pathlib.Path(path)
     if path.is_symlink():
-        raise DispatchError(f"private_dir_is_symlink: {path}")
+        raise DispatchError(f"private_dir_is_symlink: {path}", prelaunch_refusal=True)
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     st = os.lstat(path)
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
-        raise DispatchError(f"private_dir_not_owned_directory: {path}")
+        raise DispatchError(f"private_dir_not_owned_directory: {path}", prelaunch_refusal=True)
     if st.st_mode & 0o077:
         os.chmod(path, 0o700)
     return path
@@ -127,17 +131,17 @@ def ensure_workspace_tmp_dir(workspace: pathlib.Path | str, task_id: str) -> pat
     """
     ws = pathlib.Path(workspace).resolve()
     if ws == pathlib.Path("/tmp") or ws.parts[:2] in (("/", "tmp"), ("/", "var", "tmp")):
-        raise DispatchError(f"workspace_in_tmp_rejected: {ws}")
+        raise DispatchError(f"workspace_in_tmp_rejected: {ws}", prelaunch_refusal=True)
 
     owned_root = (ws / ".local" / "tmp").resolve()
     if owned_root == pathlib.Path("/tmp") or owned_root.parts[:2] in (("/", "tmp"), ("/", "var", "tmp")):
-        raise DispatchError(f"tmpdir_in_tmp_rejected: {owned_root}")
+        raise DispatchError(f"tmpdir_in_tmp_rejected: {owned_root}", prelaunch_refusal=True)
 
     curr = ws
     for part in [".local", "tmp"]:
         curr = curr / part
         if curr.is_symlink():
-            raise DispatchError(f"tmpdir_symlink_rejected: {curr}")
+            raise DispatchError(f"tmpdir_symlink_rejected: {curr}", prelaunch_refusal=True)
         just_created = False
         if not curr.exists():
             curr.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -145,9 +149,9 @@ def ensure_workspace_tmp_dir(workspace: pathlib.Path | str, task_id: str) -> pat
             just_created = True
         st = os.lstat(curr)
         if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
-            raise DispatchError(f"tmpdir_not_owned_directory: {curr}")
+            raise DispatchError(f"tmpdir_not_owned_directory: {curr}", prelaunch_refusal=True)
         if not just_created and (st.st_mode & 0o077):
-            raise DispatchError(f"tmpdir_unqualified_permissions: {curr} has group/other access {oct(st.st_mode)}; require 0o700")
+            raise DispatchError(f"tmpdir_unqualified_permissions: {curr} has group/other access {oct(st.st_mode)}; require 0o700", prelaunch_refusal=True)
 
     if ".." in task_id or "/" in task_id or "\\" in task_id:
         raise ValueError(f"invalid_task_id: {task_id}")
@@ -155,12 +159,12 @@ def ensure_workspace_tmp_dir(workspace: pathlib.Path | str, task_id: str) -> pat
     safe_task = re.sub(r"[^a-zA-Z0-9_-]", "-", task_id)
     unresolved_job_dir = owned_root / safe_task
     if unresolved_job_dir.is_symlink():
-        raise DispatchError(f"tmpdir_job_dir_is_symlink: {unresolved_job_dir}")
+        raise DispatchError(f"tmpdir_job_dir_is_symlink: {unresolved_job_dir}", prelaunch_refusal=True)
     job_dir = unresolved_job_dir.resolve()
     if not job_dir.is_relative_to(owned_root):
-        raise DispatchError(f"tmpdir_escape_rejected: {job_dir} outside {owned_root}")
+        raise DispatchError(f"tmpdir_escape_rejected: {job_dir} outside {owned_root}", prelaunch_refusal=True)
     if job_dir.is_symlink():
-        raise DispatchError(f"tmpdir_job_dir_is_symlink: {job_dir}")
+        raise DispatchError(f"tmpdir_job_dir_is_symlink: {job_dir}", prelaunch_refusal=True)
     just_created_job = False
     if not job_dir.exists():
         job_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -168,10 +172,69 @@ def ensure_workspace_tmp_dir(workspace: pathlib.Path | str, task_id: str) -> pat
         just_created_job = True
     st = os.lstat(job_dir)
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
-        raise DispatchError(f"tmpdir_job_dir_not_owned: {job_dir}")
+        raise DispatchError(f"tmpdir_job_dir_not_owned: {job_dir}", prelaunch_refusal=True)
     if not just_created_job and (st.st_mode & 0o077):
-        raise DispatchError(f"tmpdir_unqualified_permissions: {job_dir} has group/other access {oct(st.st_mode)}; require 0o700")
+        raise DispatchError(f"tmpdir_unqualified_permissions: {job_dir} has group/other access {oct(st.st_mode)}; require 0o700", prelaunch_refusal=True)
     return job_dir
+
+
+def check_workspace_tmp_readiness(workspace: pathlib.Path | str) -> Tuple[bool, str]:
+    """Inspect private workspace readiness for a role run without mutating permissions.
+
+    Verifies that the workspace and its .local and .local/tmp directories (if they exist)
+    meet the 0o700 ownership and permission requirements, are not symlinks, and are not
+    located in /tmp. If subdirectories do not exist yet, verifies that parent directories
+    are writable by current user so they can be created privately.
+
+    NEVER modifies permissions or creates directories during qualification.
+    """
+    try:
+        raw = expand_trusted_path(workspace)
+        if not raw.startswith("/"):
+            return False, f"workspace_not_absolute: {raw}"
+        if ".." in pathlib.PurePosixPath(raw).parts:
+            return False, f"workspace_contains_dotdot: {raw}"
+        ws = pathlib.Path(raw).resolve()
+        if str(ws) != os.path.normpath(raw):
+            return False, f"workspace_symlink_or_unresolved: {raw} -> {ws}"
+
+        if ws == pathlib.Path("/tmp") or ws.parts[:2] in (("/", "tmp"), ("/", "var", "tmp")):
+            return False, f"workspace_in_tmp_rejected: {ws}"
+
+        if not ws.exists():
+            return False, f"workspace_not_found: {ws}"
+
+        st_ws = os.lstat(ws)
+        if not stat.S_ISDIR(st_ws.st_mode):
+            return False, f"workspace_not_directory: {ws}"
+        if st_ws.st_uid != os.getuid():
+            return False, f"workspace_not_owned_by_current_user: {ws} (uid={st_ws.st_uid} != {os.getuid()})"
+
+        owned_root = (ws / ".local" / "tmp").resolve()
+        if owned_root == pathlib.Path("/tmp") or owned_root.parts[:2] in (("/", "tmp"), ("/", "var", "tmp")):
+            return False, f"tmpdir_in_tmp_rejected: {owned_root}"
+
+        curr = ws
+        for part in [".local", "tmp"]:
+            curr = curr / part
+            if curr.is_symlink():
+                return False, f"tmpdir_symlink_rejected: {curr}"
+            if curr.exists():
+                st = os.lstat(curr)
+                if not stat.S_ISDIR(st.st_mode):
+                    return False, f"tmpdir_not_owned_directory: {curr}"
+                if st.st_uid != os.getuid():
+                    return False, f"tmpdir_not_owned_directory: {curr} (uid={st.st_uid} != {os.getuid()})"
+                if st.st_mode & 0o077:
+                    return False, f"tmpdir_unqualified_permissions: {curr} has group/other access {oct(st.st_mode)}; require 0o700"
+            else:
+                parent = curr.parent
+                if not os.access(parent, os.W_OK | os.X_OK):
+                    return False, f"tmpdir_parent_not_writable: {parent}"
+                break
+        return True, "workspace_tmp_ready"
+    except Exception as e:
+        return False, f"workspace_tmp_check_failed: {e}"
 
 
 def scrub_dict(d: Dict[str, Any], *secrets: Optional[str]) -> Dict[str, Any]:
@@ -242,42 +305,42 @@ def safe_read_bounded_json(
 def validate_entrypoint(script_path: str | os.PathLike) -> pathlib.Path:
     raw = expand_trusted_path(script_path)
     if not raw.startswith("/"):
-        raise DispatchError(f"entrypoint_not_absolute: {raw}")
+        raise DispatchError(f"entrypoint_not_absolute: {raw}", prelaunch_refusal=True)
     if ".." in pathlib.PurePosixPath(raw).parts:
-        raise DispatchError(f"entrypoint_contains_dotdot: {raw}")
+        raise DispatchError(f"entrypoint_contains_dotdot: {raw}", prelaunch_refusal=True)
     p = _resolve(raw)
     if str(p) != os.path.normpath(raw):
-        raise DispatchError(f"entrypoint_symlink_or_unresolved: {raw} -> {p}")
+        raise DispatchError(f"entrypoint_symlink_or_unresolved: {raw} -> {p}", prelaunch_refusal=True)
     try:
         st = os.lstat(p)
     except OSError as e:
-        raise DispatchError(f"entrypoint_unreadable: {p}: {e}")
+        raise DispatchError(f"entrypoint_unreadable: {p}: {e}", prelaunch_refusal=True)
     if not stat.S_ISREG(st.st_mode):
-        raise DispatchError(f"entrypoint_not_regular_file: {p}")
+        raise DispatchError(f"entrypoint_not_regular_file: {p}", prelaunch_refusal=True)
     if not os.access(p, os.X_OK):
-        raise DispatchError(f"entrypoint_not_executable: {p}")
+        raise DispatchError(f"entrypoint_not_executable: {p}", prelaunch_refusal=True)
     if st.st_uid not in (os.getuid(), 0):
-        raise DispatchError(f"entrypoint_wrong_owner: {p} owned by {st.st_uid}")
+        raise DispatchError(f"entrypoint_wrong_owner: {p} owned by {st.st_uid}", prelaunch_refusal=True)
     if st.st_mode & 0o002:
-        raise DispatchError(f"entrypoint_world_writable: {p}")
+        raise DispatchError(f"entrypoint_world_writable: {p}", prelaunch_refusal=True)
     return p
 
 
 def validate_workspace(workspace_path: str | os.PathLike) -> pathlib.Path:
     raw = expand_trusted_path(workspace_path)
     if not raw.startswith("/"):
-        raise DispatchError(f"workspace_not_absolute: {raw}")
+        raise DispatchError(f"workspace_not_absolute: {raw}", prelaunch_refusal=True)
     if ".." in pathlib.PurePosixPath(raw).parts:
-        raise DispatchError(f"workspace_contains_dotdot: {raw}")
+        raise DispatchError(f"workspace_contains_dotdot: {raw}", prelaunch_refusal=True)
     p = _resolve(raw)
     if str(p) != os.path.normpath(raw):
-        raise DispatchError(f"workspace_symlink_or_unresolved: {raw} -> {p}")
+        raise DispatchError(f"workspace_symlink_or_unresolved: {raw} -> {p}", prelaunch_refusal=True)
     try:
         st = os.lstat(p)
     except OSError as e:
-        raise DispatchError(f"workspace_unreadable: {p}: {e}")
+        raise DispatchError(f"workspace_unreadable: {p}: {e}", prelaunch_refusal=True)
     if not stat.S_ISDIR(st.st_mode):
-        raise DispatchError(f"workspace_not_directory: {p}")
+        raise DispatchError(f"workspace_not_directory: {p}", prelaunch_refusal=True)
     return p
 
 
@@ -993,6 +1056,17 @@ class RoleQualification:
             except DispatchError as e:
                 report["reasons"].append(f"workspace_invalid: {e}")
                 return report
+            ready_ok, ready_msg = check_workspace_tmp_readiness(p_cfg.workspace)
+            if not ready_ok:
+                report["reasons"].append(ready_msg)
+                return report
+        else:
+            state_runs_dir = self.config.runs_dir
+            if state_runs_dir.parent.exists():
+                ready_ok, ready_msg = check_workspace_tmp_readiness(state_runs_dir.parent)
+                if not ready_ok:
+                    report["reasons"].append(ready_msg)
+                    return report
 
         # Provider and model allowlists
         provider = p_cfg.launcher_provider
@@ -1108,7 +1182,16 @@ def get_role_first_action_digest(
     data: Optional[Dict[str, Any]] = None
     raw_bytes: Optional[bytes] = None
 
-    if isinstance(evidence_path_or_content, (os.PathLike, str)) and pathlib.Path(evidence_path_or_content).exists():
+    is_path = False
+    if isinstance(evidence_path_or_content, os.PathLike):
+        is_path = pathlib.Path(evidence_path_or_content).exists()
+    elif isinstance(evidence_path_or_content, str) and not evidence_path_or_content.strip().startswith("{") and len(evidence_path_or_content) < 4096:
+        try:
+            is_path = pathlib.Path(evidence_path_or_content).exists()
+        except OSError:
+            is_path = False
+
+    if is_path:
         data, digest, raw_bytes = safe_read_bounded_json(
             evidence_path_or_content,
             max_bytes=MAX_EVIDENCE_BYTES,
@@ -1215,6 +1298,7 @@ class RoleRun:
         config: TrustedRoleConfig,
         launcher_backend: Optional[LauncherBackend] = None,
         launcher_executor: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        clock: Optional[Any] = None,
     ):
         self.job_id = job_id
         self.job_token = job_token
@@ -1227,6 +1311,7 @@ class RoleRun:
         self.hub_url = hub_url
         self.host_id = host_id
         self.config = config
+        self.clock = clock or time
         self.launcher_backend = launcher_backend or LauncherBackend(
             launcher_repo=config.launcher_repo,
             config_dir=config.launcher_config_dir,
@@ -1268,11 +1353,18 @@ class RoleRun:
         self._cancelled = False
         self._cancel_count = 0
         self._cancel_reason: Optional[str] = None
-        self._start_time = time.time()
+        self._start_time = self._current_time()
         self._exec_result: Dict[str, Any] = {}
         self._exec_exception: Optional[Exception] = None
         self._prelaunch_refusal = False
         self._prelaunch_reason: Optional[str] = None
+
+    def _current_time(self) -> float:
+        if hasattr(self.clock, "time") and callable(self.clock.time):
+            return self.clock.time()
+        if callable(self.clock):
+            return self.clock()
+        return time.time()
 
     def _check_is_prelaunch_refusal(self, rc: int, stdout: str) -> bool:
         """Verify whether an execution error was a definite prelaunch refusal with real recorded evidence."""
@@ -1616,9 +1708,9 @@ class RoleRun:
         3. If no authoritative maintained binding exists, first-action evidence is REFUSED.
         4. When binding is known, first-action native_session MUST match the corroborated binding.
         """
-        deadline = time.time() + timeout
+        deadline = self._current_time() + timeout
 
-        while time.time() < deadline:
+        while self._current_time() < deadline:
             if self._cancelled:
                 return None
 
@@ -1934,8 +2026,10 @@ class RoleDispatchAdapter:
         quota_checker: Optional[Callable[[], Tuple[bool, str]]] = None,
         launcher_backend: Optional[LauncherBackend] = None,
         launcher_executor: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        clock: Optional[Any] = None,
     ):
         self.config = config or TrustedRoleConfig.disabled()
+        self.clock = clock or time
         self.launcher_backend = launcher_backend or LauncherBackend(
             launcher_repo=self.config.launcher_repo,
             config_dir=self.config.launcher_config_dir,
@@ -1948,11 +2042,25 @@ class RoleDispatchAdapter:
         )
         self.launcher_executor = launcher_executor
 
+    def _current_time(self) -> float:
+        if hasattr(self.clock, "time") and callable(self.clock.time):
+            return self.clock.time()
+        if callable(self.clock):
+            return self.clock()
+        return time.time()
+
     def can_process(self, kind: str) -> Tuple[bool, str, Dict[str, Any]]:
         report = self.qualification.inspect_profile(kind)
-        if self.launcher_executor is not None:
+        is_clock_fixture = self.clock is not None and self.clock is not time
+        if self.launcher_executor is not None or is_clock_fixture:
             report["is_fixture_only"] = True
             report["operational_qualified"] = False
+        if is_clock_fixture:
+            reasons = list(report.get("reasons", []))
+            reasons.append("clock_fixture_injected: non-default clock cannot be operationally qualified")
+            report["reasons"] = reasons
+            report["supported"] = False
+            return False, "role_unqualified: clock_fixture_injected", report
         if report["supported"]:
             return True, "role_qualified", report
         reasons = "; ".join(report.get("reasons", [])) or "unsupported"
@@ -1971,7 +2079,7 @@ class RoleDispatchAdapter:
     ) -> RoleRun:
         ok, reason, _ = self.can_process(kind)
         if not ok:
-            raise DispatchError(f"Refusing to execute {kind}: {reason}. Direct model/API bypass forbidden.")
+            raise DispatchError(f"Refusing to execute {kind}: {reason}. Direct model/API bypass forbidden.", prelaunch_refusal=True)
 
         run = RoleRun(
             job_id=job_id,
@@ -1985,6 +2093,7 @@ class RoleDispatchAdapter:
             config=self.config,
             launcher_backend=self.launcher_backend,
             launcher_executor=self.launcher_executor,
+            clock=self.clock,
         )
         run.start()
         return run
@@ -2005,18 +2114,26 @@ class RoleDispatchAdapter:
     ) -> Dict[str, Any]:
         """High-level dispatch of one role job."""
         if start_callback is None or not callable(start_callback):
-            raise DispatchError("missing_or_invalid_start_callback: callable start_callback is required before begin")
+            raise DispatchError("missing_or_invalid_start_callback: callable start_callback is required before begin", prelaunch_refusal=True)
 
         run = self.begin(job_id, job_token, lease_epoch, role_binding, kind, payload, hub_url, host_id)
 
         ev = run.wait_bootstrap(BOOTSTRAP_TIMEOUT_SEC)
         if ev is None:
             cancel_res = run.cancel("bootstrap_failed_or_timeout")
+            is_prelaunch = bool(getattr(run, "_prelaunch_refusal", False))
             if cancel_res.get("verified"):
                 out = run.outcome()
-                return {"status": "failed", "summary": out["summary"], "evidence_refs": []}
+                return {
+                    "status": "failed",
+                    "summary": out["summary"],
+                    "evidence_refs": [],
+                    "prelaunch_refusal": is_prelaunch,
+                    "phase": "prelaunch_refusal" if is_prelaunch else "bootstrap_timeout",
+                }
             raise DispatchError(
-                f"bootstrap_failed_containment_unverified: timeout or missing evidence; containment: {cancel_res.get('detail')}"
+                f"bootstrap_failed_containment_unverified: timeout or missing evidence; containment: {cancel_res.get('detail')}",
+                prelaunch_refusal=False,
             )
 
         start_reply = None
@@ -2052,30 +2169,47 @@ class RoleDispatchAdapter:
                     "status": "failed",
                     "summary": summary,
                     "evidence_refs": ev_refs,
+                    "prelaunch_refusal": False,
+                    "phase": "server_start_refused",
                 }
             raise DispatchError(
-                f"server_start_failed_containment_unverified: {cancel_reason}; containment: {cancel_res.get('detail')}"
+                f"server_start_failed_containment_unverified: {cancel_reason}; containment: {cancel_res.get('detail')}",
+                prelaunch_refusal=False,
             )
 
         run.acknowledge_start(start_reply)
 
         event = stop_event or threading.Event()
-        while not run.wait_done(0.5):
-            now = time.time()
+        while not run.wait_done(0.01):
+            now = self._current_time()
             if event.is_set():
                 cancel_res = run.cancel("lease_lost_or_authority_changed")
                 if not cancel_res.get("verified"):
                     raise DispatchError(
-                        f"authority_lost_containment_unverified; containment: {cancel_res.get('detail')}"
+                        f"authority_lost_containment_unverified; containment: {cancel_res.get('detail')}",
+                        prelaunch_refusal=False,
                     )
-                return {"status": "failed", "summary": "role authority lost or cancelled", "evidence_refs": [ev["path"]]}
+                return {
+                    "status": "failed",
+                    "summary": "role authority lost or cancelled",
+                    "evidence_refs": [ev["path"]],
+                    "prelaunch_refusal": False,
+                    "phase": "authority_lost",
+                }
             if deadline_sec is not None and now > deadline_sec:
                 cancel_res = run.cancel("deadline_exceeded")
                 if not cancel_res.get("verified"):
                     raise DispatchError(
-                        f"deadline_exceeded_containment_unverified; containment: {cancel_res.get('detail')}"
+                        f"deadline_exceeded_containment_unverified; containment: {cancel_res.get('detail')}",
+                        prelaunch_refusal=False,
                     )
-                return {"status": "failed", "summary": "deadline_exceeded: execution timed out", "evidence_refs": [ev["path"]]}
+                return {
+                    "status": "failed",
+                    "summary": "deadline_exceeded: execution timed out",
+                    "evidence_refs": [ev["path"]],
+                    "prelaunch_refusal": False,
+                    "phase": "deadline_exceeded",
+                }
 
         out = run.outcome()
         return {
