@@ -25,6 +25,7 @@ Verifies:
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import pathlib
@@ -35,6 +36,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
@@ -103,6 +105,7 @@ class ControlledMockJobsClient:
         self.executes: List[Dict[str, Any]] = []
         self.offers: List[Dict[str, Any]] = []
         self.payloads: Dict[str, Any] = {}
+        self.job_statuses: Dict[str, Any] = {}
         self.stale_generation = False
         self.deadline_exceeded = False
 
@@ -158,7 +161,7 @@ class ControlledMockJobsClient:
     def renew_job(self, base_url, job_id, job_token, epoch):
         self.renews.append({"job_id": job_id, "epoch": epoch})
         if self.stale_generation:
-            return {"error": "unauthorized_or_stale"}
+            return {"error": "unauthorized", "status_code": 401}
         if self.deadline_exceeded:
             return {"error": "deadline_exceeded"}
         return {"status": "renewed", "job_id": job_id, "epoch": epoch}
@@ -174,6 +177,30 @@ class ControlledMockJobsClient:
         return {"status": "finished", "job_id": job_id}
 
     def get_job_status(self, base_url, job_id, token):
+        if job_id in self.job_statuses:
+            return self.job_statuses[job_id]
+        if self.stale_generation:
+            return {
+                "job": {
+                    "id": job_id,
+                    "status": "fenced",
+                    "lease_epoch": 1,
+                    "holder_host_id": "test-host-recover",
+                    "kind": "writer-run",
+                    "outcome_summary": "fenced: superseded by takeover",
+                }
+            }
+        if self.deadline_exceeded:
+            return {
+                "job": {
+                    "id": job_id,
+                    "status": "expired",
+                    "lease_epoch": 1,
+                    "holder_host_id": "test-host-recover",
+                    "kind": "writer-run",
+                    "outcome_summary": "lease expired",
+                }
+            }
         for f in self.finishes:
             if f["job_id"] == job_id:
                 return {
@@ -617,7 +644,7 @@ class TestRoleDispatchRecovery(unittest.TestCase):
         proof = json.loads(uncertain_file.read_text(encoding="utf-8"))
         self.assertEqual(proof.get("status"), "uncertain")
         self.assertEqual(proof.get("phase"), "stale_generation_fenced")
-        self.assertIn("unauthorized_or_stale", proof.get("cause"))
+        self.assertTrue("unauthorized" in proof.get("cause") or "fenced" in proof.get("cause"))
 
         # Never reported finished to server
         self.assertEqual(len(client.finishes), 0)
@@ -1146,6 +1173,8 @@ class TestRoleDispatchRecovery(unittest.TestCase):
                 "id": job_id,
                 "status": "finished",
                 "lease_epoch": 1,
+                "holder_host_id": "test-host-recover",
+                "kind": "writer-run",
             }
         })
         runtime_mgr = RuntimeManager(role_config=self.role_cfg)
@@ -1211,6 +1240,637 @@ class TestRoleDispatchRecovery(unittest.TestCase):
         custody_file = run_dir / f"custody-{job_id}.json"
         self.assertFalse(custody_file.exists())
         self.assertFalse((runs_dir / f"active-role-{job_id}.json").exists())
+
+    def test_incomplete_authoritative_binding_preserves_custody(self):
+        """A terminal label without the real status DTO binding cannot stop work."""
+        job_id = "job-incomplete-authority"
+        host_id = "test-host-recover"
+        runs_dir = self.role_cfg.runs_dir
+        run_dir = runs_dir / f"writer-run-{job_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.chmod(0o700)
+        role = {"name": f"automation:test:{job_id}", "generation": 1,
+                "host_id": host_id, "profile": "writer-run", "ttl_seconds": 300}
+        save_role_custody(runs_dir=runs_dir, run_dir=run_dir, job_id=job_id, data={
+            "job_id": job_id, "kind": "writer-run", "role_binding": role,
+            "lease_epoch": 1, "job_token": "synthetic-job-token",
+            "deadline_at": time.time() + 600, "payload": {}, "host_id": host_id,
+            "phase": "running",
+        })
+        custody = run_dir / f"custody-{job_id}.json"
+        client = ControlledMockJobsClient()
+        client.renew_job = MagicMock(return_value={"error": "unauthorized", "status_code": 401})
+        d = JobDispatcher("https://hub.dtcdev.click", host_id,
+                          token_provider=lambda: "synthetic-host-token", client=client,
+                          runtime_mgr=RuntimeManager(role_config=self.role_cfg))
+        complete = {"id": job_id, "kind": "writer-run", "holder_host_id": host_id,
+                    "lease_epoch": 1, "status": "fenced"}
+        for field, value in (("kind", None), ("holder_host_id", None),
+                             ("lease_epoch", None), ("lease_epoch", True), ("lease_epoch", 0)):
+            with self.subTest(field=field, value=value):
+                client.get_job_status = MagicMock(return_value={"job": {**complete, field: value}})
+                with patch.object(d, "_corroborate_native_target") as corroborate, \
+                     patch.object(d, "_stop_native_target_safely") as stop:
+                    result = d._recover_one_role_job(custody, runs_dir)
+                self.assertEqual(result["status"], "HOLD")
+                corroborate.assert_not_called()
+                stop.assert_not_called()
+                self.assertTrue(custody.exists())
+                self.assertTrue((runs_dir / f"active-role-{job_id}.json").exists())
+
+    def test_actual_jobs_client_http401_normalization_fences_recovery(self):
+        """Actual JobsClient normalizes HTTP401 to unauthorized dict; recovery queries authoritative status and fences work."""
+        job_id = "job-actual-401-fence-1"
+        client = JobsClient(timeout=5.0)
+
+        runtime_mgr = RuntimeManager(role_config=self.role_cfg)
+        host_id = "test-host-recover"
+        native_sid = "77777777-7777-4777-8777-777777777777"
+        task_id = f"hub-role-writer-run-{job_id}-g1-e1"
+
+        binding_record = {
+            "session_id": native_sid,
+            "tag": f"task-{task_id}",
+            "workspace": str(self.workspace.resolve()),
+            "engine": "antigravity",
+            "created_at_ms": 1792000000000,
+        }
+        backend = runtime_mgr.role_adapter.launcher_backend
+        backend.get_task_binding = MagicMock(return_value=binding_record)
+        stopped_targets = []
+        backend.stop_session = MagicMock(side_effect=lambda target: (stopped_targets.append(target), (True, "stopped", {}))[1])
+
+        runs_dir = self.role_cfg.runs_dir
+        run_dir = runs_dir / f"writer-run-{job_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.chmod(0o700)
+
+        save_role_custody(
+            runs_dir=runs_dir,
+            run_dir=run_dir,
+            job_id=job_id,
+            data={
+                "job_id": job_id,
+                "kind": "writer-run",
+                "role_binding": {
+                    "name": f"automation:test:{job_id}",
+                    "generation": 1,
+                    "host_id": host_id,
+                    "profile": "writer-run",
+                    "ttl_seconds": 300,
+                },
+                "lease_epoch": 1,
+                "job_token": f"tok-{job_id}",
+                "deadline_at": time.time() + 600.0,
+                "payload": {},
+                "base_url": "https://hub.dtcdev.click",
+                "host_id": host_id,
+                "task_id": task_id,
+                "phase": "running",
+                "claimed_at": time.time() - 30.0,
+            },
+        )
+
+        def mock_safe_http_json(req, timeout=None):
+            url = req.full_url
+            if "renew" in url:
+                # Exercise actual JobsClient._request normalization when safe_http_json raises HTTPError 401
+                raise urllib.error.HTTPError(url, 401, "Unauthorized", {}, io.BytesIO(b'{"error": "unauthorized"}'))
+            if "status" in url:
+                return {
+                    "job": {
+                        "id": job_id,
+                        "status": "fenced",
+                        "lease_epoch": 1,
+                        "holder_host_id": host_id,
+                        "kind": "writer-run",
+                        "outcome_summary": "fenced: superseded by takeover",
+                    }
+                }
+            return {}
+
+        with patch("agent_hub_host.jobs.api.safe_http_json", side_effect=mock_safe_http_json):
+            # Verify actual JobsClient returns normalized 401 response
+            norm_res = client.renew_job("https://hub.dtcdev.click", job_id, f"tok-{job_id}", 1)
+            self.assertEqual(norm_res, {"error": "unauthorized", "status_code": 401})
+
+            d = JobDispatcher(
+                base_url="https://hub.dtcdev.click",
+                host_id=host_id,
+                token_provider=lambda: "host-token-123",
+                client=client,
+                runtime_mgr=runtime_mgr,
+            )
+
+            recovered = d.recover_active_role_jobs()
+            self.assertEqual(len(recovered), 1)
+            self.assertFalse(recovered[0]["recovered"])
+            self.assertEqual(recovered[0]["status"], "fenced")
+            self.assertEqual(recovered[0]["reason"], "stale_generation_or_lost_lease")
+
+            # Corroborated exact owned native target was stopped
+            self.assertEqual(len(stopped_targets), 1)
+            self.assertEqual(stopped_targets[0].session_id, native_sid)
+
+            # Custody proof preserved on disk
+            self.assertTrue((run_dir / f"custody-{job_id}.json").exists())
+            uncertain_file = run_dir / f"outcome-uncertain-{job_id}.json"
+            self.assertTrue(uncertain_file.exists())
+            proof = json.loads(uncertain_file.read_text(encoding="utf-8"))
+            self.assertEqual(proof.get("status"), "uncertain")
+            self.assertEqual(proof.get("phase"), "stale_generation_fenced")
+
+    def test_actual_jobs_client_http409_normalization_fences_recovery(self):
+        """Actual JobsClient normalizes HTTP409 to conflict dict; recovery queries authoritative status and fences work."""
+        job_id = "job-actual-409-fence-2"
+        client = JobsClient(timeout=5.0)
+
+        runtime_mgr = RuntimeManager(role_config=self.role_cfg)
+        host_id = "test-host-recover"
+        native_sid = "77777777-7777-4777-8777-777777777778"
+        task_id = f"hub-role-writer-run-{job_id}-g1-e1"
+
+        binding_record = {
+            "session_id": native_sid,
+            "tag": f"task-{task_id}",
+            "workspace": str(self.workspace.resolve()),
+            "engine": "antigravity",
+            "created_at_ms": 1792000000000,
+        }
+        backend = runtime_mgr.role_adapter.launcher_backend
+        backend.get_task_binding = MagicMock(return_value=binding_record)
+        stopped_targets = []
+        backend.stop_session = MagicMock(side_effect=lambda target: (stopped_targets.append(target), (True, "stopped", {}))[1])
+
+        runs_dir = self.role_cfg.runs_dir
+        run_dir = runs_dir / f"writer-run-{job_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.chmod(0o700)
+
+        save_role_custody(
+            runs_dir=runs_dir,
+            run_dir=run_dir,
+            job_id=job_id,
+            data={
+                "job_id": job_id,
+                "kind": "writer-run",
+                "role_binding": {
+                    "name": f"automation:test:{job_id}",
+                    "generation": 1,
+                    "host_id": host_id,
+                    "profile": "writer-run",
+                    "ttl_seconds": 300,
+                },
+                "lease_epoch": 1,
+                "job_token": f"tok-{job_id}",
+                "deadline_at": time.time() + 600.0,
+                "payload": {},
+                "base_url": "https://hub.dtcdev.click",
+                "host_id": host_id,
+                "task_id": task_id,
+                "phase": "running",
+                "claimed_at": time.time() - 30.0,
+            },
+        )
+
+        def mock_safe_http_json_409(req, timeout=None):
+            url = req.full_url
+            if "renew" in url:
+                raise urllib.error.HTTPError(url, 409, "Conflict", {}, io.BytesIO(b'{"error": "conflict"}'))
+            if "status" in url:
+                return {
+                    "job": {
+                        "id": job_id,
+                        "status": "fenced",
+                        "lease_epoch": 1,
+                        "holder_host_id": host_id,
+                        "kind": "writer-run",
+                        "outcome_summary": "fenced: superseded by takeover",
+                    }
+                }
+            return {}
+
+        with patch("agent_hub_host.jobs.api.safe_http_json", side_effect=mock_safe_http_json_409):
+            norm_res = client.renew_job("https://hub.dtcdev.click", job_id, f"tok-{job_id}", 1)
+            self.assertEqual(norm_res, {"error": "conflict", "status_code": 409})
+
+            d = JobDispatcher(
+                base_url="https://hub.dtcdev.click",
+                host_id=host_id,
+                token_provider=lambda: "host-token-123",
+                client=client,
+                runtime_mgr=runtime_mgr,
+            )
+
+            recovered = d.recover_active_role_jobs()
+            self.assertEqual(len(recovered), 1)
+            self.assertFalse(recovered[0]["recovered"])
+            self.assertEqual(recovered[0]["status"], "fenced")
+            self.assertEqual(len(stopped_targets), 1)
+            self.assertTrue((run_dir / f"custody-{job_id}.json").exists())
+
+    def test_network_status_failure_negative_retains_custody_no_stop(self):
+        """When renewal fails with 401 but authoritative status is unreachable/offline, recovery returns HOLD with no stop and custody retained."""
+        job_id = "job-neterr-status-3"
+        client = ControlledMockJobsClient()
+        client.stale_generation = True  # renew returns 401
+        # Server status lookup raises network failure!
+        client.get_job_status = MagicMock(side_effect=urllib.error.URLError("connection refused"))
+
+        runtime_mgr = RuntimeManager(role_config=self.role_cfg)
+        host_id = "test-host-recover"
+        native_sid = "77777777-7777-4777-8777-777777777779"
+        task_id = f"hub-role-writer-run-{job_id}-g1-e1"
+
+        binding_record = {
+            "session_id": native_sid,
+            "tag": f"task-{task_id}",
+            "workspace": str(self.workspace.resolve()),
+            "engine": "antigravity",
+            "created_at_ms": 1792000000000,
+        }
+        backend = runtime_mgr.role_adapter.launcher_backend
+        backend.get_task_binding = MagicMock(return_value=binding_record)
+        stopped_targets = []
+        backend.stop_session = MagicMock(side_effect=lambda target: (stopped_targets.append(target), (True, "stopped", {}))[1])
+
+        runs_dir = self.role_cfg.runs_dir
+        run_dir = runs_dir / f"writer-run-{job_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.chmod(0o700)
+
+        save_role_custody(
+            runs_dir=runs_dir,
+            run_dir=run_dir,
+            job_id=job_id,
+            data={
+                "job_id": job_id,
+                "kind": "writer-run",
+                "role_binding": {
+                    "name": f"automation:test:{job_id}",
+                    "generation": 1,
+                    "host_id": host_id,
+                    "profile": "writer-run",
+                    "ttl_seconds": 300,
+                },
+                "lease_epoch": 1,
+                "job_token": f"tok-{job_id}",
+                "deadline_at": time.time() + 600.0,
+                "payload": {},
+                "base_url": "https://hub.dtcdev.click",
+                "host_id": host_id,
+                "task_id": task_id,
+                "phase": "running",
+                "claimed_at": time.time() - 30.0,
+            },
+        )
+
+        d = JobDispatcher(
+            base_url="https://hub.dtcdev.click",
+            host_id=host_id,
+            token_provider=lambda: "host-token-123",
+            client=client,
+            runtime_mgr=runtime_mgr,
+        )
+
+        recovered = d.recover_active_role_jobs()
+        self.assertEqual(len(recovered), 1)
+        self.assertFalse(recovered[0]["recovered"])
+        self.assertEqual(recovered[0]["status"], "HOLD")
+        self.assertEqual(recovered[0]["reason"], "authoritative_status_unavailable")
+
+        # Native process MUST NOT be stopped when status is unavailable!
+        self.assertEqual(len(stopped_targets), 0)
+
+        # Custody proof MUST be retained on disk
+        self.assertTrue((run_dir / f"custody-{job_id}.json").exists())
+        self.assertTrue((runs_dir / f"active-role-{job_id}.json").exists())
+
+        # No uncertain proof written so recovery can retry cleanly
+        self.assertFalse((run_dir / f"outcome-uncertain-{job_id}.json").exists())
+
+    def test_authoritative_status_still_running_negative_retains_custody_no_stop(self):
+        """When renewal returns 401 but authoritative server status confirms job is still running, HOLD with no stop and no duplicate launch."""
+        job_id = "job-still-running-4"
+        client = ControlledMockJobsClient()
+        client.stale_generation = True  # renew returns 401
+        # Authoritative status says job is actually still running on server!
+        client.get_job_status = MagicMock(return_value={
+            "job": {
+                "id": job_id,
+                "status": "running",
+                "lease_epoch": 1,
+                "holder_host_id": "test-host-recover",
+                "kind": "writer-run",
+            }
+        })
+
+        runtime_mgr = RuntimeManager(role_config=self.role_cfg)
+        host_id = "test-host-recover"
+        native_sid = "77777777-7777-4777-8777-777777777780"
+        task_id = f"hub-role-writer-run-{job_id}-g1-e1"
+
+        binding_record = {
+            "session_id": native_sid,
+            "tag": f"task-{task_id}",
+            "workspace": str(self.workspace.resolve()),
+            "engine": "antigravity",
+            "created_at_ms": 1792000000000,
+        }
+        backend = runtime_mgr.role_adapter.launcher_backend
+        backend.get_task_binding = MagicMock(return_value=binding_record)
+        stopped_targets = []
+        backend.stop_session = MagicMock(side_effect=lambda target: (stopped_targets.append(target), (True, "stopped", {}))[1])
+
+        runs_dir = self.role_cfg.runs_dir
+        run_dir = runs_dir / f"writer-run-{job_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.chmod(0o700)
+
+        save_role_custody(
+            runs_dir=runs_dir,
+            run_dir=run_dir,
+            job_id=job_id,
+            data={
+                "job_id": job_id,
+                "kind": "writer-run",
+                "role_binding": {
+                    "name": f"automation:test:{job_id}",
+                    "generation": 1,
+                    "host_id": host_id,
+                    "profile": "writer-run",
+                    "ttl_seconds": 300,
+                },
+                "lease_epoch": 1,
+                "job_token": f"tok-{job_id}",
+                "deadline_at": time.time() + 600.0,
+                "payload": {},
+                "base_url": "https://hub.dtcdev.click",
+                "host_id": host_id,
+                "task_id": task_id,
+                "phase": "running",
+                "claimed_at": time.time() - 30.0,
+            },
+        )
+
+        d = JobDispatcher(
+            base_url="https://hub.dtcdev.click",
+            host_id=host_id,
+            token_provider=lambda: "host-token-123",
+            client=client,
+            runtime_mgr=runtime_mgr,
+        )
+
+        recovered = d.recover_active_role_jobs()
+        self.assertEqual(len(recovered), 1)
+        self.assertFalse(recovered[0]["recovered"])
+        self.assertEqual(recovered[0]["status"], "HOLD")
+        self.assertEqual(recovered[0]["reason"], "job_still_running")
+
+        # Native process MUST NOT be stopped!
+        self.assertEqual(len(stopped_targets), 0)
+
+        # Custody proof retained on disk
+        self.assertTrue((run_dir / f"custody-{job_id}.json").exists())
+        self.assertTrue((runs_dir / f"active-role-{job_id}.json").exists())
+
+        # No duplicate claim or start issued
+        self.assertEqual(len(client.claims), 0)
+        self.assertEqual(len(client.starts), 0)
+
+    def test_already_finished_reconciles_failed_outcome_without_stale_success(self):
+        """When renew returns 401 but server status is failed, recovery reconciles outcome as failed without reporting success."""
+        job_id = "job-server-failed-reconcile-5"
+        client = ControlledMockJobsClient()
+        client.stale_generation = True
+        client.get_job_status = MagicMock(return_value={
+            "job": {
+                "id": job_id,
+                "status": "failed",
+                "lease_epoch": 1,
+                "holder_host_id": "test-host-recover",
+                "kind": "writer-run",
+            }
+        })
+
+        runtime_mgr = RuntimeManager(role_config=self.role_cfg)
+        host_id = "test-host-recover"
+        task_id = f"hub-role-writer-run-{job_id}-g1-e1"
+
+        runs_dir = self.role_cfg.runs_dir
+        run_dir = runs_dir / f"writer-run-{job_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.chmod(0o700)
+
+        save_role_custody(
+            runs_dir=runs_dir,
+            run_dir=run_dir,
+            job_id=job_id,
+            data={
+                "job_id": job_id,
+                "kind": "writer-run",
+                "role_binding": {
+                    "name": f"automation:test:{job_id}",
+                    "generation": 1,
+                    "host_id": host_id,
+                    "profile": "writer-run",
+                    "ttl_seconds": 300,
+                },
+                "lease_epoch": 1,
+                "job_token": f"tok-{job_id}",
+                "deadline_at": time.time() + 600.0,
+                "payload": {},
+                "base_url": "https://hub.dtcdev.click",
+                "host_id": host_id,
+                "task_id": task_id,
+                "phase": "running",
+                "claimed_at": time.time() - 30.0,
+            },
+        )
+
+        d = JobDispatcher(
+            base_url="https://hub.dtcdev.click",
+            host_id=host_id,
+            token_provider=lambda: "host-token-123",
+            client=client,
+            runtime_mgr=runtime_mgr,
+        )
+
+        recovered = d.recover_active_role_jobs()
+        self.assertEqual(len(recovered), 1)
+        self.assertTrue(recovered[0]["recovered"])
+        self.assertEqual(recovered[0]["status"], "finished")
+        self.assertEqual(recovered[0]["outcome"], "failed")
+        self.assertTrue(recovered[0].get("reconciled"))
+
+        # Custody cleanly removed
+        self.assertFalse((run_dir / f"custody-{job_id}.json").exists())
+        self.assertFalse((runs_dir / f"active-role-{job_id}.json").exists())
+
+    def test_mismatched_authoritative_identity_refusal(self):
+        """Authoritative status with mismatched job id, host, or role binding causes recovery to HOLD, preserving custody without stopping native work."""
+        job_id = "job-mismatch-test-6"
+        host_id = "test-host-recover"
+        native_sid = "77777777-7777-4777-8777-777777777781"
+        task_id = f"hub-role-writer-run-{job_id}-g1-e1"
+
+        runs_dir = self.role_cfg.runs_dir
+        run_dir = runs_dir / f"writer-run-{job_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.chmod(0o700)
+
+        custody_data = {
+            "job_id": job_id,
+            "kind": "writer-run",
+            "role_binding": {
+                "name": f"automation:test:{job_id}",
+                "generation": 1,
+                "host_id": host_id,
+                "profile": "writer-run",
+                "ttl_seconds": 300,
+            },
+            "lease_epoch": 1,
+            "job_token": f"tok-{job_id}",
+            "deadline_at": time.time() + 600.0,
+            "payload": {},
+            "base_url": "https://hub.dtcdev.click",
+            "host_id": host_id,
+            "task_id": task_id,
+            "phase": "running",
+            "claimed_at": time.time() - 30.0,
+        }
+
+        # Subtest 1: Mismatched host binding
+        runtime_mgr = RuntimeManager(role_config=self.role_cfg)
+        backend = runtime_mgr.role_adapter.launcher_backend
+        backend.get_task_binding = MagicMock(return_value={
+            "session_id": native_sid,
+            "tag": f"task-{task_id}",
+            "workspace": str(self.workspace.resolve()),
+            "engine": "antigravity",
+            "created_at_ms": 1792000000000,
+        })
+        stopped_targets = []
+        backend.stop_session = MagicMock(side_effect=lambda target: (stopped_targets.append(target), (True, "stopped", {}))[1])
+
+        save_role_custody(runs_dir=runs_dir, run_dir=run_dir, job_id=job_id, data=custody_data)
+
+        client = ControlledMockJobsClient()
+        client.stale_generation = True
+        client.get_job_status = MagicMock(return_value={
+            "job": {
+                "id": job_id,
+                "status": "fenced",
+                "lease_epoch": 1,
+                "holder_host_id": "different-host-999",  # Mismatch!
+                "kind": "writer-run",
+            }
+        })
+
+        d = JobDispatcher(
+            base_url="https://hub.dtcdev.click",
+            host_id=host_id,
+            token_provider=lambda: "host-token-123",
+            client=client,
+            runtime_mgr=runtime_mgr,
+        )
+
+        recovered = d.recover_active_role_jobs()
+        self.assertEqual(len(recovered), 1)
+        self.assertFalse(recovered[0]["recovered"])
+        self.assertEqual(recovered[0]["status"], "HOLD")
+        self.assertEqual(recovered[0]["reason"], "authoritative_identity_mismatch")
+        self.assertEqual(len(stopped_targets), 0)
+        self.assertTrue((run_dir / f"custody-{job_id}.json").exists())
+
+        # Subtest 2: Mismatched role binding name
+        client.get_job_status = MagicMock(return_value={
+            "job": {
+                "id": job_id,
+                "status": "fenced",
+                "lease_epoch": 1,
+                "holder_host_id": host_id,
+                "kind": "writer-run",
+                "role_name": "automation:different:role",  # Mismatch!
+            }
+        })
+        recovered = d.recover_active_role_jobs()
+        self.assertEqual(len(recovered), 1)
+        self.assertFalse(recovered[0]["recovered"])
+        self.assertEqual(recovered[0]["status"], "HOLD")
+        self.assertEqual(recovered[0]["reason"], "authoritative_identity_mismatch")
+        self.assertEqual(len(stopped_targets), 0)
+        self.assertTrue((run_dir / f"custody-{job_id}.json").exists())
+
+    def test_no_duplicate_claim_or_start_during_recovery(self):
+        """Recovery across all execution paths never invokes claim_job or start_job."""
+        job_id = "job-no-dup-claim-7"
+        client = ControlledMockJobsClient()
+        client.stale_generation = True
+
+        runtime_mgr = RuntimeManager(role_config=self.role_cfg)
+        host_id = "test-host-recover"
+        native_sid = "77777777-7777-4777-8777-777777777782"
+        task_id = f"hub-role-writer-run-{job_id}-g1-e1"
+
+        binding_record = {
+            "session_id": native_sid,
+            "tag": f"task-{task_id}",
+            "workspace": str(self.workspace.resolve()),
+            "engine": "antigravity",
+            "created_at_ms": 1792000000000,
+        }
+        backend = runtime_mgr.role_adapter.launcher_backend
+        backend.get_task_binding = MagicMock(return_value=binding_record)
+        backend.stop_session = MagicMock(return_value=(True, "stopped", {}))
+
+        runs_dir = self.role_cfg.runs_dir
+        run_dir = runs_dir / f"writer-run-{job_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.chmod(0o700)
+
+        save_role_custody(
+            runs_dir=runs_dir,
+            run_dir=run_dir,
+            job_id=job_id,
+            data={
+                "job_id": job_id,
+                "kind": "writer-run",
+                "role_binding": {
+                    "name": f"automation:test:{job_id}",
+                    "generation": 1,
+                    "host_id": host_id,
+                    "profile": "writer-run",
+                    "ttl_seconds": 300,
+                },
+                "lease_epoch": 1,
+                "job_token": f"tok-{job_id}",
+                "deadline_at": time.time() + 600.0,
+                "payload": {},
+                "base_url": "https://hub.dtcdev.click",
+                "host_id": host_id,
+                "task_id": task_id,
+                "phase": "running",
+                "claimed_at": time.time() - 30.0,
+            },
+        )
+
+        d = JobDispatcher(
+            base_url="https://hub.dtcdev.click",
+            host_id=host_id,
+            token_provider=lambda: "host-token-123",
+            client=client,
+            runtime_mgr=runtime_mgr,
+        )
+
+        recovered = d.recover_active_role_jobs()
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["status"], "fenced")
+
+        # Strictly assert zero duplicate claims, zero duplicate starts, zero commits
+        self.assertEqual(len(client.claims), 0)
+        self.assertEqual(len(client.starts), 0)
+        self.assertEqual(len(client.executes), 0)
 
 
 if __name__ == "__main__":

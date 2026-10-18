@@ -1656,33 +1656,126 @@ class JobDispatcher:
             logger.warning("Lease renewal probe exception during recovery of %s: %s", job_id, e)
             return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": f"network_error: {e}"}
 
-        if renew_res.get("error") == "unauthorized_or_stale":
-            logger.warning("Stale generation or lost lease detected on recovery for %s: %s", job_id, renew_res.get("error"))
-            # Before assuming fence, check if job was already finished on the server (e.g. earlier finish reply lost)
+        if renew_res.get("error"):
+            renew_err = renew_res.get("error")
+            status_code = renew_res.get("status_code")
+            logger.warning(
+                "Lease renewal probe returned error during recovery of %s: %s (status_code=%s)",
+                job_id,
+                renew_err,
+                status_code,
+            )
+
+            # HTTP401 alone is NOT proof of generation fence or permission to stop.
+            # Query exact job using own current host credential.
             server_job = None
             try:
                 host_token = self.token_provider()
                 status_res = self.client.get_job_status(self.base_url, job_id, token=host_token)
-                if isinstance(status_res, dict) and "job" in status_res:
+                if isinstance(status_res, dict) and isinstance(status_res.get("job"), dict):
                     server_job = status_res["job"]
+                elif isinstance(status_res, dict) and status_res.get("error"):
+                    logger.warning("Authoritative job status lookup for %s returned error: %s", job_id, status_res.get("error"))
             except Exception as e:
-                logger.warning("Could not query server job status for %s: %s", job_id, e)
+                logger.warning("Could not query authoritative server job status for %s: %s", job_id, e)
 
-            if isinstance(server_job, dict) and server_job.get("status") in ("succeeded", "finished"):
-                # Reconciled! Job was actually finished on server and lease was released.
-                logger.info("Interrupted job %s was already finished on server (%s); reconciling", job_id, server_job.get("status"))
+            # If authoritative status unavailable/offline/unknown, HOLD and preserve custody (no stop, no duplicate launch)
+            if not isinstance(server_job, dict):
+                logger.warning("Authoritative job status for %s unavailable, offline, or unknown; HOLD and preserve custody", job_id)
+                return {
+                    "job_id": job_id,
+                    "recovered": False,
+                    "status": "HOLD",
+                    "reason": "authoritative_status_unavailable",
+                }
+
+            # Validate same job / host / role binding / current epoch as appropriate
+            auth_id = server_job.get("id")
+            if auth_id != job_id:
+                logger.warning("Authoritative job id mismatch for %s (server reported %s); HOLD and preserve custody", job_id, auth_id)
+                return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": "authoritative_identity_mismatch"}
+
+            auth_kind = server_job.get("kind")
+            if auth_kind != kind:
+                logger.warning("Authoritative job kind mismatch for %s (expected %s, got %s); HOLD and preserve custody", job_id, kind, auth_kind)
+                return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": "authoritative_identity_mismatch"}
+
+            holder_host = server_job.get("holder_host_id") or server_job.get("holder_machine_id")
+            expected_host = self.host_id
+            # Custody exists only after claim; the real status DTO carries the
+            # holder and epoch even after fencing. Missing fields are not proof.
+            server_epoch = server_job.get("lease_epoch")
+            if holder_host != expected_host or type(server_epoch) is not int or server_epoch < lease_epoch:
+                return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": "authoritative_identity_mismatch"}
+
+            if isinstance(role, dict) and role.get("name"):
+                server_role_name = server_job.get("role_name")
+                if not server_role_name and isinstance(server_job.get("role_binding"), dict):
+                    server_role_name = server_job["role_binding"].get("name")
+                if server_role_name and server_role_name != role.get("name"):
+                    logger.warning("Authoritative role mismatch for %s (%s != %s); HOLD and preserve custody", job_id, server_role_name, role.get("name"))
+                    return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": "authoritative_identity_mismatch"}
+
+            server_status = server_job.get("status")
+
+            # If still running, HOLD and preserve custody (no stop, no duplicate launch/claim/execute/start)
+            if server_status in ("running", "claimed", "offered"):
+                logger.warning("Authoritative status for %s is still %s; renewal failed but job active; HOLD and preserve custody", job_id, server_status)
+                return {
+                    "job_id": job_id,
+                    "recovered": False,
+                    "status": "HOLD",
+                    "reason": f"job_still_{server_status}",
+                }
+
+            # Confirmed already finished: reconcile semantic outcome without stale success; preserve unknown exit/resource proof
+            if server_status in ("succeeded", "finished", "failed"):
+                if server_epoch != lease_epoch:
+                    return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": "authoritative_identity_mismatch"}
+                # The authenticated job status is the canonical semantic result.
+                # Reading a model-writable pathname here would add an unbounded,
+                # symlink-following read and let local output override that result.
+                reconciled_outcome = server_status
+
+                logger.info("Interrupted job %s was already finished on server (%s); reconciling outcome as %s", job_id, server_status, reconciled_outcome)
                 rld.remove_role_custody(runs_dir, run_dir, job_id)
                 return {
                     "job_id": job_id,
                     "recovered": True,
                     "status": "finished",
-                    "outcome": server_job.get("status"),
+                    "outcome": reconciled_outcome,
                     "reconciled": True,
                 }
 
+            # Confirmed fenced/cancelled/expired or provably stale lease
+            server_epoch = server_job.get("lease_epoch")
+            is_stale_epoch = server_epoch > lease_epoch
+            is_deadline_exceeded = (server_status == "deadline_exceeded" or renew_err == "deadline_exceeded")
+            is_fenced_or_dead = (
+                server_status in ("fenced", "cancelled", "expired")
+                or is_stale_epoch
+                or is_deadline_exceeded
+            )
+
+            if not is_fenced_or_dead:
+                logger.warning("Authoritative status for %s is unknown (%s); HOLD and preserve custody", job_id, server_status)
+                return {
+                    "job_id": job_id,
+                    "recovered": False,
+                    "status": "HOLD",
+                    "reason": f"unknown_authoritative_status_{server_status}",
+                }
+
+            # Confirmed fence: stop ONLY corroborated exact owned native
             target = self._corroborate_native_target(job_id, kind, role, lease_epoch, run_dir)
             if target is not None:
                 self._stop_native_target_safely(target)
+
+            phase = "deadline_exceeded" if is_deadline_exceeded else "stale_generation_fenced"
+            cause = (
+                f"renew_job returned {renew_err} (status_code={status_code}): "
+                f"authoritative server status confirmed {server_status} (epoch={server_epoch}, generation advanced or lease lost)"
+            )
             write_role_uncertain_proof(
                 runs_dir=runs_dir,
                 run_dir=run_dir,
@@ -1690,32 +1783,16 @@ class JobDispatcher:
                 role=role,
                 kind=kind,
                 lease_epoch=lease_epoch,
-                phase="stale_generation_fenced",
-                cause="renew_job returned unauthorized_or_stale (generation advanced or lease lost)",
+                phase=phase,
+                cause=cause,
                 is_prelaunch_refusal=False,
             )
-            return {"job_id": job_id, "recovered": False, "status": "fenced", "reason": "stale_generation_or_lost_lease"}
-
-        if renew_res.get("error") == "deadline_exceeded":
-            target = self._corroborate_native_target(job_id, kind, role, lease_epoch, run_dir)
-            if target is not None:
-                self._stop_native_target_safely(target)
-            write_role_uncertain_proof(
-                runs_dir=runs_dir,
-                run_dir=run_dir,
-                job_id=job_id,
-                role=role,
-                kind=kind,
-                lease_epoch=lease_epoch,
-                phase="deadline_exceeded",
-                cause="lease renewal rejected: deadline_exceeded",
-                is_prelaunch_refusal=False,
-            )
-            return {"job_id": job_id, "recovered": False, "status": "fenced", "reason": "deadline_exceeded"}
-
-        if renew_res.get("error"):
-            logger.warning("Lease renewal returned error for %s: %s; HOLD", job_id, renew_res.get("error"))
-            return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": f"lease_error: {renew_res.get('error')}"}
+            return {
+                "job_id": job_id,
+                "recovered": False,
+                "status": "fenced",
+                "reason": "deadline_exceeded" if is_deadline_exceeded else "stale_generation_or_lost_lease",
+            }
 
         # 3. Server lease is confirmed active!
         start_ack_file = run_dir / f"start-ack-{job_id}.json"
