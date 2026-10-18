@@ -579,7 +579,10 @@ class TestMissingSdkAndErrors(unittest.TestCase):
 
 class TestRuntimeRoleQuotaDecoupling(unittest.TestCase):
     def setUp(self):
-        self.tmp_dir = tempfile.mkdtemp(prefix="test_role_quota_")
+        repo_root = pathlib.Path(__file__).resolve().parent.parent.parent
+        project_tmp = repo_root / ".local" / "tmp"
+        project_tmp.mkdir(parents=True, exist_ok=True)
+        self.tmp_dir = tempfile.mkdtemp(prefix="test_role_quota_", dir=str(project_tmp))
         self.work_dir = pathlib.Path(self.tmp_dir)
         self.state_dir = self.work_dir / "roles"
         self.state_dir.mkdir(parents=True)
