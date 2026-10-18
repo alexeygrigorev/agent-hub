@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 import io
+import os
 import sys
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -548,6 +549,219 @@ class FleetTests(unittest.TestCase):
                  patch('agent_hub_host.api.get_heartbeat_payload', return_value={'type': 'heartbeat'}):
                 d.once()
                 self.assertNotIn('jobs', calls[-6][2]['capabilities'])
+
+    def test_headless_task_assigned_submit_registers_exact_result_path_and_standalone_omits_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = settings(Path(tmp)); cfg['capabilities'] = []
+            cfg['launcher'] = {'argv': ['python3', '-m', 'launcher'], 'root': tmp, 'config_dir': str(Path(tmp) / 'config')}
+            cfg['subscriptions'][0].update(launcher_provider='codex', launcher_model='gpt-6-sol', launcher_effort='high')
+            calls, requests = [], []
+            def runner(argv, **kw):
+                calls.append(argv)
+                if argv[0] == 'maintained-gate':
+                    return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow(),
+                            'model_supported': True, 'model': 'gpt-6-sol', 'effort': 'high'}
+                if 'plan' in argv:
+                    return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol', 'task_fit': 1.0, 'account_label': 'shared-codex', 'profile': None}]}
+                if 'run' in argv:
+                    return {'receipt': {'unit_name': 'headless-unit', 'exit_code': 0}}
+                return {}
+
+            d = fleet.Dispatcher(cfg, lambda *a: requests.append(a) or {}, runner)
+
+            # 1. Intake-assigned headless task registers exact unique absolute result path
+            assigned_offer = offer(mode='headless', task_id='task-intake-999', prompt='Structured review task',
+                                   needs=[], selection={'model': 'gpt-6-sol', 'effort': 'high'})
+            result_file = Path(tmp) / '.local' / 'hub-results' / (assigned_offer['id'] + '.json')
+            result_file.parent.mkdir(parents=True, exist_ok=True)
+            result_file.write_text(json.dumps({'status': 'done', 'report': 'Task finished successfully', 'artifacts': []}), encoding='utf-8')
+
+            result = d.dispatch(assigned_offer)
+            self.assertEqual(result['state'], 'done')
+
+            submit_call = next(c for c in calls if 'submit' in c)
+            self.assertIn('--paths', submit_call)
+            registered_path = submit_call[submit_call.index('--paths') + 1]
+
+            # Precisely correct unique absolute owned result path
+            self.assertEqual(registered_path, str(result_file))
+            self.assertTrue(Path(registered_path).is_absolute())
+            self.assertTrue(registered_path.endswith(f"{assigned_offer['id']}.json"))
+            # Must NOT be broad directory or foreign path
+            self.assertNotEqual(registered_path, str(tmp))
+            self.assertNotEqual(registered_path, str(Path(tmp) / '.local'))
+            self.assertNotEqual(registered_path, str(result_file.parent))
+            self.assertTrue(Path(registered_path).is_relative_to(Path(tmp)))
+            self.assertTrue(result_file.parent.is_dir())
+
+            # 2. Standalone headless route has NO --paths in submit argv
+            calls.clear()
+            requests.clear()
+            standalone_offer = offer(mode='headless', task_id=None, prompt='Standalone monitoring task')
+            result2 = d.dispatch(standalone_offer)
+            self.assertEqual(result2['state'], 'exited')
+            submit_call2 = next(c for c in calls if 'submit' in c)
+            self.assertNotIn('--paths', submit_call2)
+
+    def test_task_assigned_empty_or_malformed_report_refuses_successful_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = settings(Path(tmp)); cfg['capabilities'] = []
+            cfg['launcher'] = {'argv': ['python3', '-m', 'launcher'], 'root': tmp, 'config_dir': str(Path(tmp) / 'config')}
+            cfg['subscriptions'][0].update(launcher_provider='codex', launcher_model='gpt-6-sol', launcher_effort='high')
+
+            assigned_offer = offer(mode='headless', task_id='task-intake-abc', prompt='Do task',
+                                   needs=[], selection={'model': 'gpt-6-sol', 'effort': 'high'})
+            result_file = Path(tmp) / '.local' / 'hub-results' / (assigned_offer['id'] + '.json')
+
+            for case_name, file_content, process_exit_code, expected_status, is_symlink in [
+                ("empty_file", "", 0, "failed", False),
+                ("malformed_json", "not valid json {", 0, "failed", False),
+                ("missing_status", json.dumps({"report": "missing status field"}), 0, "failed", False),
+                ("invalid_status_enum", json.dumps({"status": "unknown-status", "report": "bad status"}), 0, "failed", False),
+                ("oversized_file", json.dumps({"status": "done", "report": "x" * 25000}), 0, "failed", False),
+                ("process_failed_exit", json.dumps({"status": "done", "report": "claimed success"}), 1, "failed", False),
+                ("missing_file", None, 0, "failed", False),
+                ("symlink_refusal", json.dumps({"status": "done", "report": "via symlink"}), 0, "failed", True),
+                ("genuine_success", json.dumps({"status": "done", "report": "valid report", "artifacts": [{"label": "out", "text": "log"}]}), 0, "done", False),
+                ("waiting_on_human", json.dumps({"status": "waiting-on-human", "report": "need input", "artifacts": []}), 0, "waiting-on-human", False),
+            ]:
+                with self.subTest(case=case_name):
+                    requests = []
+                    def runner(argv, **kw):
+                        if argv[0] == 'maintained-gate':
+                            return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow(),
+                                    'model_supported': True, 'model': 'gpt-6-sol', 'effort': 'high'}
+                        if 'plan' in argv:
+                            return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol', 'task_fit': 1.0, 'account_label': 'shared-codex', 'profile': None}]}
+                        if 'run' in argv:
+                            return {'receipt': {'unit_name': 'headless-unit', 'exit_code': process_exit_code}}
+                        return {}
+
+                    d = fleet.Dispatcher(cfg, lambda *a: requests.append(a) or {}, runner)
+
+                    # Prepare result file
+                    if result_file.is_symlink() or result_file.exists():
+                        result_file.unlink()
+                    result_file.parent.mkdir(parents=True, exist_ok=True)
+
+                    if is_symlink:
+                        target = Path(tmp) / 'real_result.json'
+                        target.write_text(file_content, encoding='utf-8')
+                        result_file.symlink_to(target)
+                    elif file_content is not None:
+                        result_file.write_text(file_content, encoding='utf-8')
+
+                    res = d.dispatch(assigned_offer)
+                    self.assertEqual(res['state'], expected_status)
+                    task_result_posts = [r for r in requests if r[1] == f"/api/fleet/tasks/{assigned_offer['task_id']}/result"]
+                    self.assertEqual(len(task_result_posts), 1)
+                    posted_body = task_result_posts[0][2]
+                    self.assertEqual(posted_body['status'], expected_status)
+                    self.assertTrue(posted_body['confirmed_exit'])
+                    if expected_status == 'done':
+                        self.assertEqual(posted_body['report'], 'valid report')
+                        self.assertEqual(posted_body['artifacts'], [{"label": "out", "text": "log"}])
+                    elif expected_status == 'failed' and case_name != "process_failed_exit":
+                        self.assertIn('without a valid structured report', posted_body['report'])
+
+    @unittest.skipUnless(os.path.isdir("/home/alexey/git/agent-quota-launcher/launcher"), "agent-quota-launcher checkout not available")
+    def test_isolated_launcher_store_and_reconcile_contract_with_result_path(self):
+        import sys
+        if "/home/alexey/git/agent-quota-launcher" not in sys.path:
+            sys.path.insert(0, "/home/alexey/git/agent-quota-launcher")
+        from launcher.store import Store
+        from launcher.cli import _result_evidence, reconcile, accept
+        import argparse
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "launcher_config"
+            config_dir.mkdir(parents=True)
+            db_path = str(config_dir / "state.db")
+            store = Store(db_path)
+
+            ws = Path(tmp) / "workspace"
+            ws.mkdir()
+            offer_id = "550e8400-e29b-41d4-a716-446655440000"
+            result_file = ws / ".local" / "hub-results" / f"{offer_id}.json"
+            result_file.parent.mkdir(parents=True, exist_ok=True)
+
+            task_id = f"hub-{offer_id}"
+            payload = {
+                "owner": "hub-fleet",
+                "cwd": str(ws),
+                "timeout": 1800,
+                "goal": "Test goal",
+                "model_requirements": {"providers": ["antigravity"], "models": ["gemini-3.8-flash-high"]},
+                "account_label": "shared-antigravity",
+                "profile": "model-task",
+            }
+
+            # Case 1: Submit with NO paths (the pre-repair defect)
+            defect_task_id = f"hub-defect-{offer_id}"
+            store.submit_task(defect_task_id, defect_task_id, payload, paths=[])
+            self.assertEqual(store.get_task_paths(defect_task_id), [])
+            # Result file exists on disk
+            result_file.write_text(json.dumps({"status": "done", "report": "ok"}), encoding="utf-8")
+            # Evidence count is 0 because owned_paths is empty!
+            self.assertEqual(_result_evidence(store, defect_task_id), [])
+
+            # Case 2: Submit with repaired exact result path
+            store.submit_task(task_id, task_id, payload, paths=[str(result_file)])
+            registered_paths = store.get_task_paths(task_id)
+            self.assertEqual(registered_paths, [str(result_file.resolve())])
+
+            # Evidence exists when file is present and non-empty
+            evidence = _result_evidence(store, task_id)
+            self.assertEqual(evidence, [str(result_file.resolve())])
+
+            # Evidence is empty if file is empty
+            result_file.write_text("", encoding="utf-8")
+            self.assertEqual(_result_evidence(store, task_id), [])
+
+            # Restore non-empty file
+            result_file.write_text(json.dumps({"status": "done", "report": "ok"}), encoding="utf-8")
+            self.assertEqual(_result_evidence(store, task_id), [str(result_file.resolve())])
+
+            # Transition task to running with a simulated native binding
+            store.transition_task(task_id, "running", ("queued",), reason="started")
+            native_id = "00000000-0000-4000-8000-000000000001"
+            from launcher.tags import run_tag_for
+            store.record_native_binding(
+                task_id,
+                native_id=native_id,
+                tag=run_tag_for(task_id),
+                workspace=str(ws),
+                engine="antigravity",
+                incarnation=1792323159000,
+            )
+
+            # Test reconcile transitions to completed-awaiting-review
+            import contextlib
+            with patch("launcher.native_lifecycle.probe_native_lifecycle", return_value=("retired-finished", "matching finished tombstone verified")):
+                reconcile_args = argparse.Namespace(
+                    id=task_id,
+                    config_dir=config_dir,
+                    reviewer="test-reconcile",
+                    json=True,
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = reconcile(reconcile_args)
+                self.assertEqual(rc, 0)
+                reconciled_task = store.get_task(task_id)
+                self.assertEqual(reconciled_task["state"], "completed-awaiting-review")
+
+            # Test accept succeeds with --no-refill
+            accept_args = argparse.Namespace(
+                id=task_id,
+                config_dir=config_dir,
+                reviewer="root",
+                refill=False,
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                accept_rc = accept(accept_args)
+            self.assertEqual(accept_rc, 0)
+            accepted_task = store.get_task(task_id)
+            self.assertEqual(accepted_task["state"], "accepted")
 
 
 if __name__ == '__main__': unittest.main()
