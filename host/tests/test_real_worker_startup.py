@@ -452,6 +452,58 @@ with socketserver.TCPServer(("127.0.0.1", {port}), Handler) as httpd:
             handle.cleanup()
             self.assertFalse(handle.is_alive())
 
+    def test_caller_cleanup_proc_surfaces_cleanup_failure_and_preserves_setup_exc(self):
+        """Caller teardown (_cleanup_proc) surfaces handle.cleanup errors via try/finally
+        without masking already-raised setup/test exceptions.
+        """
+        import sys
+        from tests.test_session_real_worker import TestSessionRealWorker
+
+        class FailingHandle:
+            def __init__(self):
+                self.cleaned_up = False
+
+            def cleanup(self):
+                self.cleaned_up = True
+                raise RuntimeError("Process group 9999 still has living processes")
+
+        class DummyCase(TestSessionRealWorker):
+            handle = None
+            proc = None
+
+        # Case 1: Teardown without prior active exception surfaces cleanup error
+        # and guarantees references are cleared.
+        h1 = FailingHandle()
+        DummyCase.handle = h1
+        DummyCase.proc = None
+        with self.assertRaisesRegex(RuntimeError, "still has living processes"):
+            DummyCase._cleanup_proc()
+        self.assertTrue(h1.cleaned_up)
+        self.assertIsNone(DummyCase.handle)
+        self.assertIsNone(DummyCase.proc)
+
+        # Case 2: Teardown when an exception is already in-flight (setup failure)
+        # preserves original setup exception and does not mask it, while still
+        # running cleanup and clearing references in finally.
+        h2 = FailingHandle()
+        DummyCase.handle = h2
+        DummyCase.proc = None
+        caught = None
+        try:
+            try:
+                raise ValueError("Worker startup failed in setUpClass")
+            except Exception:
+                DummyCase._cleanup_proc()
+                raise
+        except Exception as e:
+            caught = e
+
+        self.assertIsInstance(caught, ValueError)
+        self.assertEqual(str(caught), "Worker startup failed in setUpClass")
+        self.assertTrue(h2.cleaned_up)
+        self.assertIsNone(DummyCase.handle)
+        self.assertIsNone(DummyCase.proc)
+
 
 if __name__ == "__main__":
     unittest.main()

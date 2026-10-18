@@ -210,31 +210,38 @@ class TestSessionRealWorker(unittest.TestCase):
     @classmethod
     def _cleanup_proc(cls):
         handle = getattr(cls, "handle", None)
-        if handle is not None:
-            try:
-                handle.cleanup()
-            except Exception:
-                pass
-            cls.handle = None
         proc = getattr(cls, "proc", None)
-        if proc is not None:
-            for stream in (proc.stdout, proc.stderr, proc.stdin):
-                if stream:
-                    try:
-                        stream.close()
-                    except Exception:
-                        pass
-            if proc.poll() is None:
+        cleanup_exc = None
+        try:
+            if handle is not None:
                 try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                    proc.wait(timeout=3)
-                except Exception:
+                    handle.cleanup()
+                except Exception as e:
+                    cleanup_exc = e
+            elif proc is not None:
+                if proc.poll() is None:
                     try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                        proc.wait(timeout=2)
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        proc.wait(timeout=3)
                     except Exception:
-                        pass
-        cls.proc = None
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                            proc.wait(timeout=2)
+                        except Exception:
+                            pass
+        finally:
+            if proc is not None:
+                for stream in (proc.stdout, proc.stderr, proc.stdin):
+                    if stream:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+            cls.handle = None
+            cls.proc = None
+
+        if cleanup_exc is not None and sys.exc_info()[0] is None:
+            raise cleanup_exc
 
     @classmethod
     def _cleanup_server_dir(cls):
