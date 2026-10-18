@@ -685,10 +685,38 @@ class JobDispatcher:
             exec_result: Dict[str, Any] = {}
             exec_exc: List[Exception] = []
 
+            server_started_event = threading.Event()
+            server_start_result: Dict[str, Any] = {}
+
+            def _role_start_callback(start_data: Dict[str, Any]) -> Dict[str, Any]:
+                try:
+                    if not evidence_file.exists() and isinstance(start_data, dict):
+                        ev_payload = start_data.get("data")
+                        if isinstance(ev_payload, dict):
+                            with open(evidence_file, "w", encoding="utf-8") as f:
+                                json.dump(ev_payload, f)
+                except Exception:
+                    pass
+                server_started_event.wait(timeout=15.0)
+                if server_start_result.get("status") == "started":
+                    return {
+                        "status": "started",
+                        "acknowledged_by": "hub_server",
+                        "server_start": server_start_result.get("start_res", {}),
+                        "job_id": job_id,
+                        "epoch": lease_epoch,
+                        "generation": role.get("generation") if role else None,
+                    }
+                return {
+                    "status": "refused",
+                    "error": server_start_result.get("error", "server_start_timeout_or_failed"),
+                }
+
             def _worker_exec():
                 try:
                     res = self.runtime_mgr.execute_job(
                         job_id, kind, payload, job_token, lease_epoch, self.base_url,
+                        start_callback=_role_start_callback if role is not None else None,
                         role_binding=role, stop_event=stop_event, deadline_sec=deadline_sec,
                     )
                     exec_result["res"] = res
@@ -788,17 +816,34 @@ class JobDispatcher:
                     raise ValueError("dead pid in evidence")
             except Exception as e:
                 logger.error(f"First-action custody validation failed for {job_id}: {e}")
+                server_start_result["status"] = "failed"
+                server_start_result["error"] = str(e)
+                server_started_event.set()
                 _finish_failed_with_bridge(f"first-action custody failed: {e}", res_refs)
                 return
 
-            evidence_digest = get_first_action_digest(
-                evidence_file,
-                expected_job_id=job_id,
-                expected_run_id=acq.get("run_id") if acquired_root else None,
-                expected_epoch=lease_epoch
-            )
+            if role is not None:
+                from .role_dispatch import get_role_first_action_digest
+                evidence_digest = get_role_first_action_digest(
+                    evidence_file,
+                    expected_job_id=job_id,
+                    expected_epoch=lease_epoch,
+                    expected_role_name=role.get("name", ""),
+                    expected_generation=role.get("generation", 0),
+                    expected_native_session=native_session,
+                )
+            else:
+                evidence_digest = get_first_action_digest(
+                    evidence_file,
+                    expected_job_id=job_id,
+                    expected_run_id=acq.get("run_id") if acquired_root else None,
+                    expected_epoch=lease_epoch
+                )
             if not evidence_digest:
                 logger.error(f"Failed to compute first-action digest for {job_id}")
+                server_start_result["status"] = "failed"
+                server_start_result["error"] = "no_first_action_digest"
+                server_started_event.set()
                 _finish_failed_with_bridge("no first action digest", res_refs)
                 return
 
@@ -809,8 +854,15 @@ class JobDispatcher:
             )
             if start_res.get("error"):
                 logger.error(f"Failed to signal job start for {job_id}: {start_res.get('error')}")
+                server_start_result["status"] = "failed"
+                server_start_result["error"] = start_res.get("error")
+                server_started_event.set()
                 _finish_failed_with_bridge(f"start_job failed: {start_res.get('error')}", res_refs)
                 return
+
+            server_start_result["status"] = "started"
+            server_start_result["start_res"] = start_res
+            server_started_event.set()
 
             # Start periodic renewal loop in background
             renew_thread = threading.Thread(

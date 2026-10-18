@@ -33,9 +33,12 @@ from agent_hub_host.role_dispatch import (
     RoleQualification,
     RoleRun,
     TrustedRoleConfig,
+    ensure_workspace_tmp_dir,
     get_role_first_action_digest,
     safe_read_bounded_json,
     scrub,
+    scrub_dict,
+    validate_entrypoint,
 )
 from agent_hub_host.runtime import RuntimeManager
 
@@ -775,6 +778,469 @@ class TestRoleRealBackendAdapter(unittest.TestCase):
         )
         self.assertNotEqual(run1.task_id, run2.task_id)
         self.assertNotEqual(run1.idempotency_key, run2.idempotency_key)
+
+    # 11. TMPDIR containment and Launcher check_resources integration
+    def test_job_tmpdir_containment_and_resource_check(self):
+        # ensure_workspace_tmp_dir creates owned 0700 dir under workspace/.local/tmp
+        job_tmp = ensure_workspace_tmp_dir(self.workspace, "job-tmp-test")
+        self.assertTrue(job_tmp.is_dir())
+        self.assertTrue(job_tmp.resolve().is_relative_to(self.workspace.resolve() / ".local" / "tmp"))
+        st = job_tmp.stat()
+        self.assertEqual(stat.S_IMODE(st.st_mode), 0o700)
+        self.assertEqual(st.st_uid, os.getuid())
+
+        # Escape via traversal/symlink is rejected
+        with self.assertRaises(ValueError):
+            ensure_workspace_tmp_dir(self.workspace, "../../../escape")
+
+        # RoleRun assigns job_tmp_dir inside workspace .local/tmp
+        run = RoleRun(
+            job_id="job-tmp-check",
+            job_token="secret-123",
+            lease_epoch=1,
+            role_binding=self.binding,
+            kind="writer-run",
+            payload={"date": "2026-10-18"},
+            hub_url="https://hub.example.com",
+            host_id="host-test",
+            config=self.role_cfg,
+        )
+        self.assertTrue(run.job_tmp_dir.resolve().is_relative_to(self.workspace.resolve() / ".local" / "tmp"))
+
+        # Launcher check_resources integration:
+        # Check that run.job_tmp_dir passes check_resources path guard under repo_root/.local/tmp,
+        # while passing run_dir/tmp fails because run_dir is not under workspace/.local/tmp.
+        import sys
+        if "/home/alexey/git/agent-quota-launcher" not in sys.path:
+            sys.path.insert(0, "/home/alexey/git/agent-quota-launcher")
+        from launcher.resources import check_resources
+        # Valid path under repo_root/.local/tmp
+        check_resources(
+            requested_memory_mb=100,
+            requested_cwd=str(self.workspace),
+            requested_tmpdir=str(run.job_tmp_dir),
+            repo_root=str(self.workspace),
+            ignore_ram=True,
+        )
+        # Invalid path outside repo_root/.local/tmp (the old buggy run_dir/tmp)
+        bad_tmp = self.state_dir / "runs" / run.job_id / "tmp"
+        bad_tmp.mkdir(parents=True, exist_ok=True)
+        with self.assertRaises(ValueError) as ctx:
+            check_resources(
+                requested_memory_mb=100,
+                requested_cwd=str(self.workspace),
+                requested_tmpdir=str(bad_tmp),
+                repo_root=str(self.workspace),
+                ignore_ram=True,
+            )
+        self.assertIn("must resolve under owned", str(ctx.exception).lower())
+
+    # 12. Role bootstrap goal, payload, and scrubbed tokens
+    def test_bootstrap_goal_and_payload_composition(self):
+        run = RoleRun(
+            job_id="job-boot-1",
+            job_token="sensitive-job-secret-token",
+            lease_epoch=2,
+            role_binding=self.binding,
+            kind="writer-run",
+            payload={"date": "2026-10-18", "auth": "sensitive-job-secret-token"},
+            hub_url="https://hub.example.com",
+            host_id="host-test",
+            config=self.role_cfg,
+        )
+        goal = run._build_goal()
+
+        # Secret token must NOT appear in goal
+        self.assertNotIn("sensitive-job-secret-token", goal)
+        self.assertIn("[redacted]", goal)
+
+        # 4-stage bootstrap protocol is explicitly specified in goal
+        self.assertIn("TRUSTED BOOTSTRAP PROTOCOL:", goal)
+        self.assertIn(str(run.first_action_file), goal)
+        self.assertIn(str(run.start_ack_file), goal)
+        self.assertIn(str(run.outcome_file), goal)
+        self.assertIn('"stage": "first_action"', goal)
+        self.assertIn("Start Acknowledgement Barrier:", goal)
+        self.assertIn("CRITICAL: do NOT execute any business effects before the Hub start acknowledgement", goal)
+        self.assertIn("Outcome Artifact:", goal)
+
+        # Verify all supported profiles produce concrete execution actions
+        for kind in ("writer-run", "principal-wake", "head-recovery"):
+            p_run = RoleRun(
+                job_id=f"job-{kind}",
+                job_token="token",
+                lease_epoch=1,
+                role_binding={**self.binding, "profile": kind},
+                kind=kind,
+                payload={},
+                hub_url="https://hub.example.com",
+                host_id="host-test",
+                config=self.role_cfg,
+            )
+            p_goal = p_run._build_goal()
+            self.assertIn(f"Execute {kind}", p_goal)
+
+        # Configured entrypoint execution
+        entry_script = self.workspace / "custom_job.sh"
+        entry_script.write_text("#!/bin/sh\necho test\n", encoding="utf-8")
+        entry_script.chmod(0o700)
+
+        entry_cfg = TrustedRoleConfig.build(
+            enabled=True,
+            profiles={
+                "writer-run": RoleProfileConfig(
+                    profile="writer-run",
+                    enabled=True,
+                    workspace=self.workspace,
+                    launcher_provider="antigravity",
+                    launcher_model="gemini-3.1-pro-high",
+                    entrypoint=entry_script,
+                ),
+            },
+            state_dir=self.state_dir,
+            launcher_repo=self.launcher_repo,
+            allowed_workspaces=[self.workspace],
+            allowed_models=["gemini-3.1-pro-high"],
+            allowed_accounts=["antigravity"],
+        )
+        entry_run = RoleRun(
+            job_id="job-entry",
+            job_token="token",
+            lease_epoch=1,
+            role_binding={**self.binding, "profile": "writer-run"},
+            kind="writer-run",
+            payload={"key": "val"},
+            hub_url="https://hub.example.com",
+            host_id="host-test",
+            config=entry_cfg,
+        )
+        entry_goal = entry_run._build_goal()
+        self.assertIn(f"Execute configured entrypoint: {entry_script.resolve()}", entry_goal)
+
+        # Invalid entrypoint is refused
+        with self.assertRaises(DispatchError):
+            validate_entrypoint("relative/path.sh")
+        with self.assertRaises(DispatchError):
+            validate_entrypoint(f"{self.workspace}/../escape.sh")
+        non_exec = self.workspace / "not_exec.sh"
+        non_exec.write_text("#!/bin/sh\n", encoding="utf-8")
+        non_exec.chmod(0o600)
+        with self.assertRaises(DispatchError):
+            validate_entrypoint(non_exec)
+
+        # Maintained submit call passes paths including bootstrap files
+        mock_backend = MagicMock(spec=LauncherBackend)
+        mock_backend.submit.return_value = {"task_id": run.task_id, "state": "queued"}
+        mock_backend.run.return_value = (0, {"state": "running"}, "")
+        run.launcher_backend = mock_backend
+        run.start()
+        mock_backend.submit.assert_called_once()
+        _, kwargs = mock_backend.submit.call_args
+        paths = kwargs.get("paths")
+        self.assertIn(str(run.first_action_file), paths)
+        self.assertIn(str(run.start_ack_file), paths)
+        self.assertIn(str(run.outcome_file), paths)
+
+    # 13. Lifecycle: workload liveness vs caller thread exit
+    def test_lifecycle_native_workload_vs_caller_thread(self):
+        mock_backend = MagicMock(spec=LauncherBackend)
+        mock_backend.submit.return_value = {"task_id": "job-life", "state": "queued"}
+        mock_backend.get_task_binding.side_effect = lambda tid: {
+            "session_id": "55555555-5555-5555-5555-555555555555",
+            "tag": f"task-{tid}",
+            "workspace": str(self.workspace),
+            "engine": "antigravity",
+            "created_at_ms": 123456789,
+        }
+        mock_backend.run.return_value = (
+            0,
+            {
+                "state": "running",
+                "first_action_verified": True,
+                "session_id": "55555555-5555-5555-5555-555555555555",
+                "tag": "task-hub-role-writer-run",
+                "workspace": str(self.workspace),
+                "engine": "antigravity",
+            },
+            "",
+        )
+        # Session is alive initially
+        mock_backend.is_session_alive.return_value = (True, "active")
+
+        run = RoleRun(
+            job_id="job-life",
+            job_token="token",
+            lease_epoch=1,
+            role_binding=self.binding,
+            kind="writer-run",
+            payload={"date": "2026-10-18"},
+            hub_url="https://hub.example.com",
+            host_id="host-test",
+            config=self.role_cfg,
+            launcher_backend=mock_backend,
+        )
+        run.start()
+        # Give launcher thread a moment to finish run()
+        time.sleep(0.05)
+        self.assertFalse(run._thread.is_alive())
+
+        # Workload is still running in background, no outcome file yet:
+        # wait_done must return False (does NOT return True just because caller thread ended!)
+        done = run.wait_done(timeout=0.05)
+        self.assertFalse(done)
+
+        # Worker writes verified outcome artifact
+        run.outcome_file.write_text(json.dumps({
+            "status": "succeeded",
+            "summary": "Completed writer-run successfully",
+            "evidence_refs": ["ref-1"],
+        }), encoding="utf-8")
+
+        # Now wait_done returns True and status is succeeded
+        done = run.wait_done(timeout=0.1)
+        self.assertTrue(done)
+        self.assertEqual(run.outcome().get("status"), "succeeded")
+
+        # Case: workload exits WITHOUT writing outcome file -> outcome_artifact_missing failure
+        run2 = RoleRun(
+            job_id="job-life-fail",
+            job_token="token",
+            lease_epoch=1,
+            role_binding=self.binding,
+            kind="writer-run",
+            payload={"date": "2026-10-18"},
+            hub_url="https://hub.example.com",
+            host_id="host-test",
+            config=self.role_cfg,
+            launcher_backend=mock_backend,
+        )
+        run2.start()
+        time.sleep(0.05)
+        # Workload exits in background
+        mock_backend.is_session_alive.return_value = (False, "exited")
+        done = run2.wait_done(timeout=0.1)
+        self.assertTrue(done)
+        self.assertEqual(run2.outcome().get("status"), "failed")
+        self.assertIn("missing_or_invalid_outcome_artifact", run2.outcome().get("summary", ""))
+
+    # 14. Cancellation containment verification
+    def test_cancellation_containment_verification(self):
+        mock_backend = MagicMock(spec=LauncherBackend)
+
+        # Case A: Caller thread finished, receipt was running, but native session was not bound
+        mock_backend.submit.return_value = {"task_id": "job-cancel-unbound", "state": "queued"}
+        mock_backend.get_task_binding.return_value = None
+        mock_backend.run.return_value = (0, {"state": "running"}, "")
+        run = RoleRun(
+            job_id="job-cancel-unbound",
+            job_token="token",
+            lease_epoch=1,
+            role_binding=self.binding,
+            kind="writer-run",
+            payload={"date": "2026-10-18"},
+            hub_url="https://hub.example.com",
+            host_id="host-test",
+            config=self.role_cfg,
+            launcher_backend=mock_backend,
+        )
+        run.start()
+        time.sleep(0.05)
+        self.assertIsNone(run.native_session)
+
+        # Cancel fails closed because containment cannot be proven
+        res = run.cancel(reason="test revocation")
+        self.assertFalse(res["verified"])
+        self.assertIn("unbound_native_session", str(res.get("detail", {})))
+
+        # Case B: Prelaunch refusal (e.g. check_resources failed before child process started)
+        mock_backend_refusal = MagicMock(spec=LauncherBackend)
+        mock_backend_refusal.submit.return_value = {"task_id": "job-cancel-refusal", "state": "queued"}
+        mock_backend_refusal.run.return_value = (
+            1,
+            {"state": "failed", "outcome": "resource-check-failed"},
+            "ResourceCheckFailed: tmpdir must resolve under owned .local/tmp",
+        )
+        run_refusal = RoleRun(
+            job_id="job-cancel-refusal",
+            job_token="token",
+            lease_epoch=1,
+            role_binding=self.binding,
+            kind="writer-run",
+            payload={"date": "2026-10-18"},
+            hub_url="https://hub.example.com",
+            host_id="host-test",
+            config=self.role_cfg,
+            launcher_backend=mock_backend_refusal,
+        )
+        run_refusal.start()
+        time.sleep(0.05)
+        self.assertTrue(getattr(run_refusal, "_prelaunch_refusal", False))
+
+        # Prelaunch refusal is safely verified without native stop
+        res_ref = run_refusal.cancel(reason="prelaunch cancel")
+        self.assertTrue(res_ref["verified"])
+        self.assertTrue(res_ref["detail"].get("prelaunch_refusal"))
+
+        # Case C: Bound native session verified stop
+        mock_backend_bound = MagicMock(spec=LauncherBackend)
+        mock_backend_bound.submit.return_value = {"task_id": "job-cancel-bound", "state": "queued"}
+        mock_backend_bound.get_task_binding.side_effect = lambda tid: {
+            "session_id": "66666666-6666-6666-6666-666666666666",
+            "tag": f"task-{tid}",
+            "workspace": str(self.workspace),
+            "engine": "antigravity",
+            "created_at_ms": 123456789,
+        }
+        mock_backend_bound.run.return_value = (
+            0,
+            {
+                "state": "running",
+                "session_id": "66666666-6666-6666-6666-666666666666",
+                "tag": "task-hub-role-writer-run",
+                "workspace": str(self.workspace),
+                "engine": "antigravity",
+            },
+            "",
+        )
+        mock_backend_bound.stop_session.return_value = (True, "stopped_session", {"state": "exited"})
+        run_bound = RoleRun(
+            job_id="job-cancel-bound",
+            job_token="token",
+            lease_epoch=1,
+            role_binding=self.binding,
+            kind="writer-run",
+            payload={"date": "2026-10-18"},
+            hub_url="https://hub.example.com",
+            host_id="host-test",
+            config=self.role_cfg,
+            launcher_backend=mock_backend_bound,
+        )
+        run_bound.start()
+        time.sleep(0.05)
+
+        res_bound = run_bound.cancel(reason="revoked")
+        self.assertTrue(res_bound["verified"])
+        mock_backend_bound.stop_session.assert_called_once()
+
+    # 15. TMPDIR permissions fail closed and intra-root symlink rejection
+    def test_ensure_workspace_tmp_dir_permissions_fail_closed_and_intra_root_symlink(self):
+        # 1. Unqualified permissions on existing directory fail closed
+        bad_perm_ws = self.base / "bad_perm_ws"
+        bad_perm_ws.mkdir(parents=True)
+        bad_tmp = bad_perm_ws / ".local" / "tmp"
+        bad_tmp.mkdir(parents=True, mode=0o777)
+        # Explicitly chmod because umask might reduce 0777
+        os.chmod(bad_tmp, 0o777)
+        with self.assertRaises(DispatchError) as ctx:
+            ensure_workspace_tmp_dir(bad_perm_ws, "task-1")
+        self.assertIn("tmpdir_unqualified_permissions", str(ctx.exception))
+
+        # 2. Intra-root symlink on task_dir is rejected before resolve
+        good_ws = self.base / "good_ws"
+        good_ws.mkdir(parents=True)
+        os.chmod(good_ws, 0o700)
+        local_dir = good_ws / ".local"
+        local_dir.mkdir(parents=True, mode=0o700)
+        os.chmod(local_dir, 0o700)
+        owned_tmp = local_dir / "tmp"
+        owned_tmp.mkdir(parents=True, mode=0o700)
+        os.chmod(owned_tmp, 0o700)
+        real_target = owned_tmp / "real-dir"
+        real_target.mkdir(mode=0o700)
+        os.chmod(real_target, 0o700)
+        symlink_task = owned_tmp / "sym-task"
+        symlink_task.symlink_to(real_target)
+
+        with self.assertRaises(DispatchError) as ctx_sym:
+            ensure_workspace_tmp_dir(good_ws, "sym-task")
+        self.assertIn("tmpdir_job_dir_is_symlink", str(ctx_sym.exception))
+
+    # 16. Honest native_cgroup isolation and fabricated namespace rejection
+    def test_honest_isolation_schema_and_fabricated_namespace_rejection(self):
+        proc = subprocess.Popen(["sleep", "5"])
+        try:
+            pid = proc.pid
+            # Honest native_cgroup schema: verified native_session + live pid, no fake namespace
+            native_ev = {
+                "pid": pid,
+                "job_id": "job-iso-1",
+                "epoch": 1,
+                "role_name": "writer",
+                "generation": 1,
+                "stage": "first_action",
+                "native_session": "77777777-7777-7777-7777-777777777777",
+                "utc": "2026-10-18T00:00:00Z",
+                "isolation_kind": "native_cgroup",
+            }
+            digest = get_role_first_action_digest(
+                json.dumps(native_ev),
+                expected_job_id="job-iso-1",
+                expected_epoch=1,
+                expected_role_name="writer",
+                expected_generation=1,
+            )
+            self.assertIsNotNone(digest)
+            self.assertEqual(len(digest), 64)
+
+            # Fabricated private PID namespace matching host init namespace is rejected
+            try:
+                host_init_ns = os.readlink("/proc/1/ns/pid")
+                fabricated_ev = {
+                    "pid": pid,
+                    "job_id": "job-iso-2",
+                    "epoch": 1,
+                    "role_name": "writer",
+                    "generation": 1,
+                    "stage": "first_action",
+                    "native_session": "77777777-7777-7777-7777-777777777777",
+                    "utc": "2026-10-18T00:00:00Z",
+                    "isolation_kind": "private_pid_namespace",
+                    "private_pid_namespace": host_init_ns,
+                    "numeric_proc_entries": [pid],
+                }
+                digest_fab = get_role_first_action_digest(
+                    json.dumps(fabricated_ev),
+                    expected_job_id="job-iso-2",
+                    expected_epoch=1,
+                    expected_role_name="writer",
+                    expected_generation=1,
+                )
+                self.assertIsNone(digest_fab)
+            except OSError:
+                pass  # If /proc/1/ns/pid is unreadable in test container
+        finally:
+            proc.terminate()
+            proc.wait()
+
+    # 17. is_session_alive: pruned/forgotten is uncertain, confirmed terminal requires exit proof
+    def test_is_session_alive_uncertain_on_pruned_and_confirmed_on_tombstone(self):
+        backend = LauncherBackend(launcher_repo=self.launcher_repo, config_dir=self.state_dir)
+        target = role_dispatch.NativeTarget(
+            session_id="88888888-8888-8888-8888-888888888888",
+            tag="task-test",
+            workspace=str(self.workspace),
+            created_at_ms=1000,
+            engine="antigravity",
+        )
+
+        with patch("agent_hub_host.native_sessions.status_of") as mock_status:
+            # "pruned" without exit info does NOT prove death: returns alive=True, uncertain=True
+            mock_status.return_value = {"phase": "pruned", "exit_info": None}
+            alive, info = backend.is_session_alive(target)
+            self.assertTrue(alive)
+            self.assertTrue(info.get("uncertain"))
+
+            # "forgotten" without exit info does NOT prove death
+            mock_status.return_value = {"phase": "forgotten", "exit_info": None}
+            alive_f, info_f = backend.is_session_alive(target)
+            self.assertTrue(alive_f)
+            self.assertTrue(info_f.get("uncertain"))
+
+            # Confirmed terminal phase "exited" with exit_info proves death
+            mock_status.return_value = {"phase": "exited", "exit_info": {"code": 0}, "state": "exited"}
+            alive_ex, info_ex = backend.is_session_alive(target)
+            self.assertFalse(alive_ex)
+            self.assertEqual(info_ex.get("phase"), "exited")
 
 
 if __name__ == "__main__":

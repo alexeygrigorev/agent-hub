@@ -116,6 +116,86 @@ def ensure_private_dir(path: pathlib.Path) -> pathlib.Path:
     return path
 
 
+def ensure_workspace_tmp_dir(workspace: pathlib.Path | str, task_id: str) -> pathlib.Path:
+    """Create a trusted private per-job/epoch temporary directory beneath workspace/.local/tmp.
+
+    Invariants:
+    1. Must resolve strictly under owned <workspace>/.local/tmp.
+    2. Rejects /tmp, /var/tmp, or any symlink escape.
+    3. Owned by current UID with mode 0o700.
+    4. Conflation with canonical root state is rejected.
+    """
+    ws = pathlib.Path(workspace).resolve()
+    if ws == pathlib.Path("/tmp") or ws.parts[:2] in (("/", "tmp"), ("/", "var", "tmp")):
+        raise DispatchError(f"workspace_in_tmp_rejected: {ws}")
+
+    owned_root = (ws / ".local" / "tmp").resolve()
+    if owned_root == pathlib.Path("/tmp") or owned_root.parts[:2] in (("/", "tmp"), ("/", "var", "tmp")):
+        raise DispatchError(f"tmpdir_in_tmp_rejected: {owned_root}")
+
+    curr = ws
+    for part in [".local", "tmp"]:
+        curr = curr / part
+        if curr.is_symlink():
+            raise DispatchError(f"tmpdir_symlink_rejected: {curr}")
+        just_created = False
+        if not curr.exists():
+            curr.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(curr, 0o700)
+            just_created = True
+        st = os.lstat(curr)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            raise DispatchError(f"tmpdir_not_owned_directory: {curr}")
+        if not just_created and (st.st_mode & 0o077):
+            raise DispatchError(f"tmpdir_unqualified_permissions: {curr} has group/other access {oct(st.st_mode)}; require 0o700")
+
+    if ".." in task_id or "/" in task_id or "\\" in task_id:
+        raise ValueError(f"invalid_task_id: {task_id}")
+
+    safe_task = re.sub(r"[^a-zA-Z0-9_-]", "-", task_id)
+    unresolved_job_dir = owned_root / safe_task
+    if unresolved_job_dir.is_symlink():
+        raise DispatchError(f"tmpdir_job_dir_is_symlink: {unresolved_job_dir}")
+    job_dir = unresolved_job_dir.resolve()
+    if not job_dir.is_relative_to(owned_root):
+        raise DispatchError(f"tmpdir_escape_rejected: {job_dir} outside {owned_root}")
+    if job_dir.is_symlink():
+        raise DispatchError(f"tmpdir_job_dir_is_symlink: {job_dir}")
+    just_created_job = False
+    if not job_dir.exists():
+        job_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(job_dir, 0o700)
+        just_created_job = True
+    st = os.lstat(job_dir)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise DispatchError(f"tmpdir_job_dir_not_owned: {job_dir}")
+    if not just_created_job and (st.st_mode & 0o077):
+        raise DispatchError(f"tmpdir_unqualified_permissions: {job_dir} has group/other access {oct(st.st_mode)}; require 0o700")
+    return job_dir
+
+
+def scrub_dict(d: Dict[str, Any], *secrets: Optional[str]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        k_lower = str(k).lower()
+        if any(sec in k_lower for sec in ("token", "secret", "password", "bearer", "credential")):
+            out[k] = "[redacted]"
+            continue
+        if isinstance(v, str):
+            out[k] = scrub(v, *secrets)
+        elif isinstance(v, dict):
+            out[k] = scrub_dict(v, *secrets)
+        elif isinstance(v, list):
+            out[k] = [
+                scrub_dict(x, *secrets) if isinstance(x, dict) else (scrub(x, *secrets) if isinstance(x, str) else x)
+                for x in v
+            ]
+        else:
+            out[k] = v
+    return out
+
+
+
 def write_private_json(path: pathlib.Path, data: Dict[str, Any]) -> None:
     path = pathlib.Path(path)
     if path.is_symlink():
@@ -722,6 +802,7 @@ class LauncherBackend:
                 env=env,
             )
             out, err = proc.communicate(timeout=timeout_sec)
+            combined_out = (out or "") + (f"\n{err}" if err else "")
             receipt = {}
             for line in out.splitlines():
                 line = line.strip()
@@ -733,9 +814,65 @@ class LauncherBackend:
                             break
                     except Exception:
                         pass
-            return proc.returncode, receipt, out
+            return proc.returncode, receipt, combined_out
         except Exception as e:
             return 1, {}, str(e)
+
+    def is_session_alive(self, target: Union[NativeTarget, str]) -> Tuple[bool, Dict[str, Any]]:
+        """Check if native target workload is actively running."""
+        native_target: Optional[NativeTarget] = None
+        if isinstance(target, str):
+            try:
+                candidates = [s for s in ns.list_sessions(self.aplexer_bin, include_exited=True)
+                              if s.session_id.lower() == target.lower()]
+                if candidates:
+                    native_target = NativeTarget(
+                        session_id=target,
+                        tag=candidates[0].tag,
+                        workspace=canonicalize_workspace(candidates[0].workspace),
+                        created_at_ms=candidates[0].created_at_ms,
+                        engine=candidates[0].engine,
+                    )
+            except Exception:
+                pass
+        elif isinstance(target, NativeTarget):
+            native_target = target
+
+        CONFIRMED_TERMINAL_PHASES = {"exited", "stopped", "killed", "failed"}
+
+        if native_target is not None:
+            try:
+                st = ns.status_of(self.aplexer_bin, native_target)
+                phase = str(st.get("phase") or "").lower()
+                if phase in CONFIRMED_TERMINAL_PHASES and (st.get("exit_info") is not None or st.get("state") == "exited"):
+                    return False, st
+                if phase in {"running", "working", "launching"}:
+                    return True, st
+            except Exception:
+                pass
+
+            try:
+                from .retired_native import verify_native_retirement
+                retired, tomb, _ = verify_native_retirement(self.aplexer_bin, native_target)
+                if retired and isinstance(tomb, dict):
+                    return False, {"retired": True, "tombstone": tomb}
+            except Exception:
+                pass
+
+        try:
+            sess_id = target.session_id if isinstance(target, NativeTarget) else str(target)
+            sessions = ns.list_sessions(self.aplexer_bin, include_exited=True)
+            for s in sessions:
+                if s.session_id.lower() == sess_id.lower():
+                    phase = s.phase.lower()
+                    if phase in CONFIRMED_TERMINAL_PHASES and getattr(s, "exit_code", None) is not None:
+                        return False, {"phase": s.phase, "session_id": s.session_id}
+                    if phase in {"running", "working", "launching"}:
+                        return True, {"phase": s.phase, "session_id": s.session_id}
+        except Exception:
+            pass
+
+        return True, {"uncertain": True}
 
     def stop_session(
         self,
@@ -986,12 +1123,29 @@ def get_role_first_action_digest(
     except Exception:
         return None
 
-    ns_val = data.get("private_pid_namespace")
-    if not isinstance(ns_val, str) or not re.match(r"^pid:\[[0-9]+\]$", ns_val) or ns_val == "pid:[unknown]":
-        return None
+    isolation_kind = data.get("isolation_kind")
+    if isolation_kind == "native_cgroup":
+        # Honest native cgroup containment: verified native session UUID and live worker PID.
+        # Does NOT pretend to have an unshared private PID namespace.
+        pass
+    elif isolation_kind in ("private_pid_namespace", None):
+        # Legacy/script-owned unshared private PID namespace
+        ns_val = data.get("private_pid_namespace")
+        if not isinstance(ns_val, str) or not re.match(r"^pid:\[[0-9]+\]$", ns_val) or ns_val == "pid:[unknown]":
+            return None
 
-    procs = data.get("numeric_proc_entries")
-    if not isinstance(procs, list) or not all(type(x) is int and x > 0 for x in procs) or pid_val not in procs:
+        # Reject fabricated private namespace claims that match the host init namespace
+        try:
+            host_ns = os.readlink("/proc/1/ns/pid")
+            if ns_val == host_ns:
+                return None
+        except Exception:
+            pass
+
+        procs = data.get("numeric_proc_entries")
+        if not isinstance(procs, list) or not all(type(x) is int and x > 0 for x in procs) or pid_val not in procs:
+            return None
+    else:
         return None
 
     return hashlib.sha256(raw_bytes).hexdigest()
@@ -1059,13 +1213,116 @@ class RoleRun:
             if self.profile_cfg.workspace
             else self.run_dir
         )
+        self.job_tmp_dir = ensure_workspace_tmp_dir(self.task_workspace, self.task_id)
 
         self._thread: Optional[threading.Thread] = None
+        self._started = False
         self._cancelled = False
         self._cancel_reason: Optional[str] = None
         self._start_time = time.time()
         self._exec_result: Dict[str, Any] = {}
         self._exec_exception: Optional[Exception] = None
+        self._prelaunch_refusal = False
+        self._prelaunch_reason: Optional[str] = None
+
+    def _check_is_prelaunch_refusal(self, rc: int, stdout: str) -> bool:
+        """Verify whether an execution error was a definite prelaunch refusal with real recorded evidence."""
+        if rc == 0:
+            return False
+
+        # If a start record was written, native start was attempted: NOT prelaunch refusal!
+        start_rec = self.task_workspace / ".local" / f"launch-{self.task_id}-start.json"
+        if start_rec.exists() or (self.run_dir / ".local" / f"launch-{self.task_id}-start.json").exists():
+            return False
+
+        rec_path = self.task_workspace / ".local" / f"launch-{self.task_id}.json"
+        if not rec_path.exists():
+            rec_path = self.run_dir / ".local" / f"launch-{self.task_id}.json"
+
+        if rec_path.exists():
+            try:
+                rec, _, _ = safe_read_bounded_json(rec_path)
+                if rec and isinstance(rec, dict):
+                    if rec.get("session_id") or rec.get("observed_tag"):
+                        return False
+                    if rec.get("outcome") in {
+                        "no-valid-route",
+                        "no-selectable-candidate",
+                        "root-execution-denied",
+                        "resource-check-failed",
+                        "admission-rejected",
+                        "unsubmitted",
+                    }:
+                        return True
+            except Exception:
+                pass
+
+        # 1. Maintained Launcher store query
+        store_status = self.launcher_backend.get_task_status(self.task_id)
+        if store_status and isinstance(store_status, dict):
+            if store_status.get("state") == "rejected":
+                return True
+
+        # 2. Execution result receipt from backend.run
+        if self._exec_result and isinstance(self._exec_result, dict):
+            rec = self._exec_result.get("receipt", {})
+            if isinstance(rec, dict):
+                if rec.get("session_id") or rec.get("observed_tag"):
+                    return False
+                if rec.get("state") == "rejected" or rec.get("outcome") in {
+                    "no-valid-route",
+                    "no-selectable-candidate",
+                    "root-execution-denied",
+                    "resource-check-failed",
+                    "admission-rejected",
+                    "unsubmitted",
+                }:
+                    return True
+
+        return False
+
+    def _build_goal(self) -> str:
+        """Construct trusted role prompt with two-stage bootstrap, ack protocol, and outcome."""
+        clean_payload = scrub_dict(self.payload, self.job_token)
+
+        if self.profile_cfg.entrypoint is not None:
+            entry = validate_entrypoint(self.profile_cfg.entrypoint)
+            profile_action = f"Execute configured entrypoint: {entry} with job parameters: {json.dumps(clean_payload)}."
+        elif self.kind == "writer-run":
+            target_date = clean_payload.get("date", datetime.date.today().isoformat())
+            profile_action = (
+                f"Execute writer-run role for date {target_date}: "
+                f"inspect recent activity, git commits and reports; draft or update the daily writer summary."
+            )
+        elif self.kind == "principal-wake":
+            profile_action = (
+                "Execute principal-wake role: inspect pending tasks, check coordination mailboxes, "
+                "verify active worktree state and report coordination status."
+            )
+        elif self.kind == "head-recovery":
+            profile_action = (
+                "Execute head-recovery role: inspect head session liveness, verify lease integrity, "
+                "perform non-destructive recovery checks and report supervision status."
+            )
+        else:
+            profile_action = f"Execute role {self.kind} with parameters {json.dumps(clean_payload)}."
+
+        goal = (
+            f"Role execution for {self.kind} ({self.role_name}, generation {self.role_generation}, epoch {self.lease_epoch}).\n\n"
+            f"Job parameters: {json.dumps(clean_payload)}\n\n"
+            f"TRUSTED BOOTSTRAP PROTOCOL:\n"
+            f"1. Role Bootstrap: write genuine role first-action evidence JSON to {self.first_action_file} with schema:\n"
+            f'{{"job_id": "{self.job_id}", "epoch": {self.lease_epoch}, "role_name": "{self.role_name}", '
+            f'"generation": {self.role_generation}, "stage": "first_action", "pid": <worker_pid>, '
+            f'"native_session": "<aplexer_session_uuid>", "utc": "<iso_timestamp>", '
+            f'"isolation_kind": "native_cgroup"}}\n\n'
+            f"2. Start Acknowledgement Barrier: CRITICAL: do NOT execute any business effects before the Hub start acknowledgement "
+            f"is written to {self.start_ack_file}. Wait until {self.start_ack_file} exists and contains status 'started'.\n\n"
+            f"3. Workload Execution: after start acknowledgement is confirmed, {profile_action}\n\n"
+            f"4. Outcome Artifact: write verified execution outcome JSON to {self.outcome_file}:\n"
+            f'{{"status": "succeeded", "summary": "...", "evidence_refs": [...]}}\n'
+        )
+        return goal
 
     def start(self) -> None:
         """Launch role execution through maintained Launcher CLI."""
@@ -1076,6 +1333,10 @@ class RoleRun:
             raise DispatchError(f"pre_existing_evidence_conflict: outcome file already exists for {self.job_id}")
 
         self._start_time = time.time()
+        self._started = True
+
+        if self.profile_cfg.entrypoint is not None:
+            validate_entrypoint(self.profile_cfg.entrypoint)
 
         if self.launcher_executor is not None:
             def _run_injected():
@@ -1098,13 +1359,9 @@ class RoleRun:
             return
 
         # Maintained Launcher CLI pipeline
+        goal = self._build_goal()
         launcher_payload = {
-            "goal": (
-                f"Role execution for {self.kind} ({self.role_name}, generation {self.role_generation}, epoch {self.lease_epoch}).\n"
-                f"Job parameters: {json.dumps(self.payload)}\n"
-                f"Complete the task and write execution outcome JSON to {self.outcome_file}:\n"
-                '{"status": "succeeded", "summary": "...", "evidence_refs": [...]}\n'
-            ),
+            "goal": goal,
             "owner": f"hub-role-{self.kind}",
             "cwd": str(self.task_workspace),
             "timeout": self.profile_cfg.timeout_sec,
@@ -1113,14 +1370,32 @@ class RoleRun:
                 "providers": [self.profile_cfg.launcher_provider],
                 "models": [self.profile_cfg.launcher_model] if self.profile_cfg.launcher_model else [],
             },
+            "role_first_action_path": str(self.first_action_file),
+            "role_first_action_file": str(self.first_action_file),
+            "start_ack_path": str(self.start_ack_file),
+            "start_ack_file": str(self.start_ack_file),
+            "outcome_path": str(self.outcome_file),
+            "outcome_file": str(self.outcome_file),
+            "paths": [
+                str(self.first_action_file),
+                str(self.start_ack_file),
+                str(self.outcome_file),
+            ],
         }
+        if self.profile_cfg.entrypoint is not None:
+            launcher_payload["entrypoint"] = str(self.profile_cfg.entrypoint)
+            launcher_payload["entrypoint_path"] = str(self.profile_cfg.entrypoint)
 
         # Idempotent task submit
         sub_res = self.launcher_backend.submit(
             self.task_id,
             self.idempotency_key,
             launcher_payload,
-            paths=[str(self.outcome_file)],
+            paths=[
+                str(self.first_action_file),
+                str(self.start_ack_file),
+                str(self.outcome_file),
+            ],
         )
         if sub_res.get("error"):
             logger.warning(f"Launcher submit reported error: {sub_res.get('error')}")
@@ -1130,10 +1405,13 @@ class RoleRun:
                 rc, receipt, stdout = self.launcher_backend.run(
                     self.task_id,
                     cwd=str(self.task_workspace),
-                    tmpdir=str(self.run_dir / "tmp"),
+                    tmpdir=str(self.job_tmp_dir),
                     timeout_sec=self.profile_cfg.timeout_sec,
                 )
                 self._exec_result = {"rc": rc, "receipt": receipt, "stdout": stdout}
+                if rc != 0 and self._check_is_prelaunch_refusal(rc, stdout):
+                    self._prelaunch_refusal = True
+                    self._prelaunch_reason = stdout[:400] if stdout else "launcher_refusal"
             except Exception as e:
                 self._exec_exception = e
 
@@ -1304,7 +1582,13 @@ class RoleRun:
             # 2. Check for verified first-action file ONLY IF native_session is corroborated!
             # If native_session is still None, DO NOT accept first action file!
             if self.native_session is not None:
-                for target_fa in (self.first_action_file, self.dispatcher_first_action_file):
+                candidates = [
+                    self.first_action_file,
+                    self.dispatcher_first_action_file,
+                    self.task_workspace / ".local" / f"role-first-action-{self.job_id}.json",
+                    self.task_workspace / ".local" / f"first-action-{self.job_id}.json",
+                ]
+                for target_fa in candidates:
                     if target_fa.exists():
                         digest = get_role_first_action_digest(
                             target_fa,
@@ -1317,6 +1601,11 @@ class RoleRun:
                         )
                         if digest:
                             data, _, _ = safe_read_bounded_json(target_fa)
+                            if not self.dispatcher_first_action_file.exists() and data:
+                                try:
+                                    write_private_json(self.dispatcher_first_action_file, data)
+                                except Exception:
+                                    pass
                             return {
                                 "digest": digest,
                                 "path": str(target_fa),
@@ -1325,11 +1614,16 @@ class RoleRun:
                             }
 
             if self._thread and not self._thread.is_alive():
-                # If thread has exited and native_session was never bound, fail closed immediately
-                if self.native_session is None:
+                # If caller thread finished with a prelaunch refusal, stop waiting
+                if getattr(self, "_prelaunch_refusal", False):
                     break
+                # If thread has exited and native_session was never bound, fail closed
+                if self.native_session is None:
+                    binding = self.corroborate_maintained_binding()
+                    if not binding:
+                        break
 
-            time.sleep(0.02)
+            time.sleep(0.05)
 
         return None
 
@@ -1344,42 +1638,147 @@ class RoleRun:
         })
 
     def wait_done(self, timeout: float = 1.0) -> bool:
-        """Check if execution is completed."""
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
-            return not self._thread.is_alive()
-        return True
+        """Check if execution is completed.
+
+        Follows actual bound native workload plus durable outcome state,
+        never transport-caller thread completion alone.
+        """
+        # Injected executor path (unit tests)
+        if self.launcher_executor is not None:
+            if self._thread is not None:
+                self._thread.join(timeout=timeout)
+                return not self._thread.is_alive()
+            return True
+
+        # Definite prelaunch refusal path
+        if getattr(self, "_prelaunch_refusal", False):
+            return True
+
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            # 1. Durable outcome state
+            if self.outcome_file.exists():
+                data, _, _ = safe_read_bounded_json(self.outcome_file, max_bytes=MAX_OUTCOME_BYTES)
+                if data and isinstance(data, dict) and "status" in data:
+                    return True
+
+            # 2. Check transport caller thread
+            if self._thread is not None and self._thread.is_alive():
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    self._thread.join(timeout=min(0.2, remaining))
+                    continue
+                return False
+
+            if getattr(self, "_prelaunch_refusal", False):
+                return True
+
+            # 3. Check bound native workload
+            if self.native_session is None:
+                binding = self.corroborate_maintained_binding()
+                if binding:
+                    self.native_session = binding["session_id"]
+                    self.native_tag = binding["tag"]
+                    self.native_workspace = binding["workspace"]
+                    self.native_engine = binding["engine"]
+                    self.created_at_ms = binding["created_at_ms"]
+                    self.native_incarnation = binding["created_at_ms"]
+
+            if self.native_session is not None:
+                target = NativeTarget(
+                    session_id=self.native_session,
+                    tag=self.native_tag or f"task-{self.task_id}",
+                    workspace=self.native_workspace or canonicalize_workspace(str(self.task_workspace)),
+                    created_at_ms=self.created_at_ms,
+                    engine=self.native_engine or self.engine,
+                )
+                alive, _ = self.launcher_backend.is_session_alive(target)
+                if not alive:
+                    # Native workload has terminated
+                    return True
+                # Workload is still alive
+                if self.outcome_file.exists():
+                    data, _, _ = safe_read_bounded_json(self.outcome_file, max_bytes=MAX_OUTCOME_BYTES)
+                    if data and isinstance(data, dict) and "status" in data:
+                        return True
+            else:
+                # Caller thread finished, but native_session is uncorroborated
+                # and no prelaunch refusal proven: unknown stays unknown/held!
+                return False
+
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+
+        return False
 
     def cancel(self, reason: str) -> Dict[str, Any]:
         """Cancel and dispose the running role unit cleanly with containment verification."""
         self._cancelled = True
         self._cancel_reason = reason
-        verified = True
+        verified = False
         stop_detail: Dict[str, Any] = {}
 
-        # 1. Stop native containment via exact NativeTarget binding
+        # 0. Unstarted run with no native session and no active caller thread has no spawned workload
+        is_thread_active = self._thread is not None and self._thread.is_alive()
+        if not getattr(self, "_started", False) and not self.native_session and not is_thread_active:
+            return {"verified": True, "reason": reason, "detail": {"not_started": True}}
+
+        # 1. Injected test executor
+        if self.launcher_executor is not None:
+            if self._thread is not None and self._thread.is_alive():
+                self._thread.join(timeout=2.0)
+            return {"verified": True, "reason": reason, "detail": {"injected_executor": True}}
+
+        # 2. Definite prelaunch refusal / no-effect path with recorded evidence
+        if getattr(self, "_prelaunch_refusal", False):
+            return {
+                "verified": True,
+                "reason": reason,
+                "detail": {
+                    "prelaunch_refusal": True,
+                    "refusal_reason": getattr(self, "_prelaunch_reason", "prelaunch_refusal"),
+                },
+            }
+
+        # 3. Stop native containment via exact NativeTarget binding
+        if self.native_session is None:
+            binding = self.corroborate_maintained_binding()
+            if binding:
+                self.native_session = binding["session_id"]
+                self.native_tag = binding["tag"]
+                self.native_workspace = binding["workspace"]
+                self.native_engine = binding["engine"]
+                self.created_at_ms = binding["created_at_ms"]
+                self.native_incarnation = binding["created_at_ms"]
+
         if self.native_session:
             target = NativeTarget(
                 session_id=self.native_session,
-                tag=self.native_tag or self.task_id,
+                tag=self.native_tag or f"task-{self.task_id}",
                 workspace=self.native_workspace or canonicalize_workspace(str(self.task_workspace)),
                 created_at_ms=self.created_at_ms,
                 engine=self.native_engine or self.engine,
             )
             stopped, stop_msg, stop_detail = self.launcher_backend.stop_session(target)
-            if not stopped:
+            if stopped:
+                verified = True
+            else:
                 verified = False
-        elif self._thread is not None and self._thread.is_alive():
-            # Process was launched but native session was never corroborated:
-            # cannot prove containment stop without native binding!
+        else:
+            # Native session is unbound / uncertain:
+            # We cannot establish containment stop without native binding!
             verified = False
-            stop_detail = {"error": "unbound_native_session: cannot prove containment stop without native binding"}
+            stop_detail = {
+                "error": "unbound_native_session: native workload was launched or uncertain, but native session binding is uncorroborated; containment unproven"
+            }
 
-        # 2. Stop launcher caller thread
+        # 4. Stop launcher caller thread if still alive
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=2.0)
             if self._thread.is_alive():
                 verified = False
+                stop_detail["thread_alive"] = True
 
         return {"verified": verified, "reason": reason, "detail": stop_detail}
 
@@ -1389,7 +1788,15 @@ class RoleRun:
             return {
                 "status": "failed",
                 "hub_status": "failed",
-                "summary": f"cancelled: {self._cancel_reason}",
+                "summary": scrub(f"cancelled: {self._cancel_reason}", self.job_token),
+                "evidence_refs": [],
+            }
+
+        if getattr(self, "_prelaunch_refusal", False):
+            return {
+                "status": "failed",
+                "hub_status": "failed",
+                "summary": scrub(f"prelaunch_refusal: {getattr(self, '_prelaunch_reason', 'prelaunch failure')}", self.job_token),
                 "evidence_refs": [],
             }
 
@@ -1397,7 +1804,7 @@ class RoleRun:
             return {
                 "status": "failed",
                 "hub_status": "failed",
-                "summary": f"execution_error: {self._exec_exception}",
+                "summary": scrub(f"execution_error: {self._exec_exception}", self.job_token),
                 "evidence_refs": [],
             }
 
@@ -1526,7 +1933,9 @@ class RoleDispatchAdapter:
 
         if start_callback:
             start_reply = start_callback(ev)
-            run.acknowledge_start(start_reply or {})
+            run.acknowledge_start(start_reply or {"status": "started", "acknowledged_by": "callback"})
+        else:
+            run.acknowledge_start({"status": "started", "acknowledged_by": "dispatcher"})
 
         event = stop_event or threading.Event()
         while not run.wait_done(0.5):
