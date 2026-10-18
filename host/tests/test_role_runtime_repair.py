@@ -488,6 +488,8 @@ class TestBoundedBootstrapHandshake(unittest.TestCase):
         }
 
         clock = StepControlledClock(1000.0)
+        publish_late_evidence = threading.Event()
+        late_evidence_written = threading.Event()
         runtime_mgr = RuntimeManager(role_config=self.role_cfg)
         dispatcher = JobDispatcher(
             base_url=self.base_url,
@@ -506,10 +508,11 @@ class TestBoundedBootstrapHandshake(unittest.TestCase):
 
             def mock_execute(*args, **kwargs):
                 # Wait until dispatcher has entered the polling loop
-                clock.polling_entered.wait(timeout=2.0)
+                self.assertTrue(clock.polling_entered.wait(timeout=5.0))
                 # Advance controlled clock past the 10s bound (to 15s) while evidence is still absent
                 clock.advance(15.0)
-                time.sleep(0.05)
+                # Let the dispatcher record the timeout before publishing late evidence.
+                self.assertTrue(publish_late_evidence.wait(timeout=5.0))
                 # Write evidence only after the 10s bound has expired
                 ev = {
                     "job_id": job_id,
@@ -525,9 +528,7 @@ class TestBoundedBootstrapHandshake(unittest.TestCase):
                     "isolation_kind": "native_cgroup",
                 }
                 fa_path.write_text(json.dumps(ev), encoding="utf-8")
-                cb = kwargs.get("start_callback")
-                if cb:
-                    cb({"data": ev})
+                late_evidence_written.set()
                 return {"status": "ok"}
 
             with patch.object(runtime_mgr, "execute_job", side_effect=mock_execute):
@@ -544,7 +545,12 @@ class TestBoundedBootstrapHandshake(unittest.TestCase):
                         "stop_event": threading.Event(),
                         "role_binding": self._valid_binding("principal-wake"),
                     }
-                    dispatcher._run_job_lifecycle(job_info, {})
+                    try:
+                        dispatcher._run_job_lifecycle(job_info, {})
+                    finally:
+                        publish_late_evidence.set()
+                        self.assertTrue(late_evidence_written.wait(timeout=5.0))
+                    self.assertTrue(fa_path.exists())
 
             proof_path = self.role_cfg.runs_dir / f"outcome-uncertain-{job_id}.json"
             self.assertTrue(proof_path.exists(), "Under old 10s bound, delayed evidence must record uncertain proof")
