@@ -26,6 +26,7 @@ import { taskTier } from './model-routing';
 import { approvalAuthorityMatches } from './host_enrollment';
 import { sha256 } from './auth/crypto';
 import { validateHumanCredentialRecord } from './auth/human-credential';
+import { isValidMachineId } from './machine-id';
 import type { Env } from './env';
 import {
   buildLifecycleView,
@@ -809,7 +810,7 @@ export class SessionControlService {
       if (!obj(input, ['key', 'engine', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id']) ||
           !label(input.key) || !workspaceOk(input.workspace) ||
           (input.engine !== undefined && !label(input.engine)) ||
-          (input.machine !== undefined && !label(input.machine)) ||
+          (input.machine !== undefined && !isValidMachineId(input.machine)) ||
           (input.name !== undefined && !nameOk(input.name)) ||
           (input.cwd !== undefined && !cwdOk(input.cwd)) ||
           (input.mode !== undefined && !['headless', 'interactive'].includes(input.mode)) ||

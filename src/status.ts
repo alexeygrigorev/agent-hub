@@ -8,6 +8,7 @@ import type { MonitoringService } from './monitoring';
 import { buildSessionInputs } from './session_lifecycle_registry';
 import { classifySession, toStatusDto } from './session_lifecycle';
 import { EXPECTED_OFFLINE_UNTIL, EXPECTED_OFFLINE_REASON, expectedOfflineWindowActive, isExpectedOffline } from './status_offline';
+import { isValidMachineId } from './machine-id';
 
 type Auth = { caller?: any; scopes?: string[]; error?: Response };
 type Obj = Record<string, any>;
@@ -261,7 +262,7 @@ export class StatusService {
     const singleTask = params.get('task');
     if (singleTask !== null && !ID_RE.test(singleTask)) fail('invalid_task');
     const hostFilter = params.get('host');
-    if (hostFilter !== null && !LABEL_RE.test(hostFilter)) fail('invalid_host');
+    if (hostFilter !== null && !isValidMachineId(hostFilter)) fail('invalid_host');
     return { limit, after, project, singleTask, hostFilter, sinceMs: parseSince(params.get('since')) };
   }
 
@@ -517,7 +518,7 @@ export class StatusService {
         const hasNative = typeof body.native_id === 'string';
         if ((hasHub ? 1 : 0) + (hasNative ? 1 : 0) !== 1) fail('invalid_observation_target');
         if (keys.some(k => !['machine_id', 'hub_session_id', 'native_id', 'kind', 'observed_at', 'payload'].includes(k))) fail('invalid_observation_payload');
-        if (typeof body.machine_id !== 'string' || !LABEL_RE.test(body.machine_id)) fail('invalid_observation_machine');
+        if (typeof body.machine_id !== 'string' || !isValidMachineId(body.machine_id)) fail('invalid_observation_machine');
         if (typeof body.kind !== 'string' || !(OBSERVATION_KINDS as readonly string[]).includes(body.kind)) fail('invalid_observation_kind');
         const observedAt = strictObservedAt(body.observed_at, now);
         const payload = checkObservationPayload(body.kind, body.payload);

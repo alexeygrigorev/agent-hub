@@ -13,6 +13,7 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import type { LivenessService } from './liveness';
 import type { StatusMachineAuth } from './status';
 import type { IntakeService } from './intake';
+import { isValidMachineId } from './machine-id';
 
 export const MONITORING_SCHEMA = `
 CREATE TABLE IF NOT EXISTS disk_observations (
@@ -358,7 +359,7 @@ export class MonitoringService {
 
       const url = new URL(request.url);
       const machineFilter = url.searchParams.get('machine');
-      if (machineFilter && !LABEL_RE.test(machineFilter)) {
+      if (machineFilter && !isValidMachineId(machineFilter)) {
         return json({ error: 'invalid_machine' }, 400);
       }
 
@@ -434,7 +435,7 @@ export class MonitoringService {
 
       const url = new URL(request.url);
       const machineFilter = url.searchParams.get('machine');
-      if (machineFilter && !LABEL_RE.test(machineFilter)) {
+      if (machineFilter && !isValidMachineId(machineFilter)) {
         return json({ error: 'invalid_machine' }, 400);
       }
 
@@ -450,7 +451,7 @@ export class MonitoringService {
 
   /** Validate incoming payload against strict schema and caller authority. */
   private validatePayload(body: any, auth: StatusMachineAuth): DiskObservationPayload {
-    if (typeof body.machine_id !== 'string' || !LABEL_RE.test(body.machine_id)) {
+    if (typeof body.machine_id !== 'string' || !isValidMachineId(body.machine_id)) {
       fail('invalid_machine_id');
     }
 
@@ -1127,7 +1128,7 @@ export class MonitoringService {
   }
 
   private validateHostHealthPayload(body: any, auth: StatusMachineAuth): HostHealthPayload {
-    if (typeof body.machine_id !== 'string' || !LABEL_RE.test(body.machine_id)) {
+    if (typeof body.machine_id !== 'string' || !isValidMachineId(body.machine_id)) {
       fail('invalid_machine_id');
     }
     if (auth.kind === 'host' && body.machine_id !== auth.machine_id) {

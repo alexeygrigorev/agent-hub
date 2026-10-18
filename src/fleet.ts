@@ -6,6 +6,7 @@ import { effectiveCheckin } from './registry';
 import { taskTier, policy } from './model-routing';
 import { evaluateQuotaAdmission } from './quota_admission';
 import { adoptObservedNativeSessions } from './session_control';
+import { isValidMachineId } from './machine-id';
 
 export const FLEET_SCHEMA = `
 CREATE TABLE IF NOT EXISTS fleet_accounts (label TEXT PRIMARY KEY, provider TEXT NOT NULL, max_concurrency INTEGER NOT NULL, reserve_percent REAL NOT NULL, enabled INTEGER NOT NULL);
@@ -201,7 +202,7 @@ export class FleetService {
   plan(input: any) {
     if (!object(input, ['mode', 'machine', 'engine', 'tier', 'account', 'workspace', 'cwd', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access', 'approved_action']) ||
       !workspaceOk(input.workspace) || (input.mode !== undefined && !['headless', 'interactive'].includes(input.mode)) ||
-      (input.account !== undefined && !label(input.account)) || (input.machine !== undefined && !label(input.machine)) || (input.engine !== undefined && !label(input.engine)) ||
+      (input.account !== undefined && !label(input.account)) || (input.machine !== undefined && !isValidMachineId(input.machine)) || (input.engine !== undefined && !label(input.engine)) ||
       // Optional tier/cwd arrive as null (not just undefined) from the
       // session-control reserve handoff when the client omitted them; null
       // means absent, never a malformed value.
@@ -352,7 +353,7 @@ export class FleetService {
       for (const r of data.routes) {
         if (!object(r, ['machine_id', 'engine', 'account', 'profile'])) return response({ error: 'invalid_route' }, 400);
         const key = r.machine_id + ':' + r.engine + ':' + r.account;
-        if (!object(r, ['machine_id', 'engine', 'account', 'profile']) || !label(r.machine_id) || !label(r.engine) || !labels.has(r.account) || (r.profile !== null && !label(r.profile)) || keys.has(key) || !this.sql.exec('SELECT id FROM machines WHERE id = ?', r.machine_id).toArray().length) return response({ error: 'invalid_route' }, 400);
+        if (!object(r, ['machine_id', 'engine', 'account', 'profile']) || !isValidMachineId(r.machine_id) || !label(r.engine) || !labels.has(r.account) || (r.profile !== null && !label(r.profile)) || keys.has(key) || !this.sql.exec('SELECT id FROM machines WHERE id = ?', r.machine_id).toArray().length) return response({ error: 'invalid_route' }, 400);
         keys.add(key);
       }
       return this.transaction(() => {
