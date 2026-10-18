@@ -33,9 +33,11 @@ describe('M1 Focus: Config Boundaries', () => {
       await runInDurableObject(stub, async (instance: Hub) => {
         const originalAdmins = instance.env.HUB_ADMINS;
         const originalSecret = instance.env.SESSION_SECRET;
+        const originalAdditionalAdmins = (instance.env as any).HUB_ADDITIONAL_ADMINS;
 
         // Valid setup first
         instance.env.HUB_ADMINS = 'admin@fake.local';
+        (instance.env as any).HUB_ADDITIONAL_ADMINS = '';
         instance.env.SESSION_SECRET = '01234567890123456789012345678901';
 
         const validSession = await createSessionCookie(instance.env, {
@@ -48,6 +50,7 @@ describe('M1 Focus: Config Boundaries', () => {
         try {
           // Mutate env
           instance.env.HUB_ADMINS = admins as any;
+          (instance.env as any).HUB_ADDITIONAL_ADMINS = admins === undefined ? undefined : '';
           instance.env.SESSION_SECRET = secret as any;
 
           globalThis.fetch = async (req) => {
@@ -59,6 +62,7 @@ describe('M1 Focus: Config Boundaries', () => {
 
         } finally {
           instance.env.HUB_ADMINS = originalAdmins;
+          (instance.env as any).HUB_ADDITIONAL_ADMINS = originalAdditionalAdmins;
           instance.env.SESSION_SECRET = originalSecret;
           globalThis.fetch = oF;
         }
