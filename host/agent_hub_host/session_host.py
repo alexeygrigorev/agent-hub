@@ -364,7 +364,32 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         previous = {}
         for sig in (signal.SIGTERM, signal.SIGINT):
             previous[sig] = signal.signal(sig, lambda *_: stop.set())
-        dispatcher = fleet.Dispatcher(settings)
+        # Resolve trusted role_config independently from consumer_enabled.
+        # Explicit settings["role_config"] (path, dict, or TrustedRoleConfig)
+        # or defaults to journal / "roles.json" if present.
+        role_cfg_path = None
+        role_cfg_obj = None
+        if "role_config" in settings:
+            rc_val = settings["role_config"]
+            if isinstance(rc_val, str):
+                role_cfg_path = rc_val
+            elif isinstance(rc_val, dict):
+                try:
+                    role_cfg_obj = load_role_config(rc_val)
+                except Exception:
+                    role_cfg_obj = None
+            elif isinstance(rc_val, TrustedRoleConfig):
+                role_cfg_obj = rc_val
+        else:
+            journal_roles = journal / "roles.json"
+            if journal_roles.exists():
+                role_cfg_path = str(journal_roles)
+
+        dispatcher = fleet.Dispatcher(
+            settings,
+            role_config=role_cfg_obj,
+            role_config_path=role_cfg_path,
+        )
         quota_collector = QuotaCollector(base_url=cfg.get('base_url'))
         # Status observation hook (released StatusCollector source): ONE
         # instance for the controller lifetime, trusted allowlist path under
@@ -412,23 +437,9 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         elif isinstance(rc_setting, bool):
             rc_enabled = rc_setting
 
-        role_consumer_cfg_path = None
-        role_consumer_cfg_obj = None
-        if rc_enabled:
-            if "role_config" in settings:
-                rc_val = settings["role_config"]
-                if isinstance(rc_val, str):
-                    role_consumer_cfg_path = rc_val
-                elif isinstance(rc_val, dict):
-                    role_consumer_cfg_obj = load_role_config(rc_val)
-            if role_consumer_cfg_path is None and role_consumer_cfg_obj is None:
-                journal_roles = journal / "roles.json"
-                if journal_roles.exists():
-                    role_consumer_cfg_path = str(journal_roles)
-
         role_consumer = RoleConsumer(
-            config_path=role_consumer_cfg_path,
-            role_config=role_consumer_cfg_obj,
+            config_path=role_cfg_path,
+            role_config=role_cfg_obj,
             base_url=cfg.get("base_url"),
             host_id=cfg.get("machine_id"),
             min_interval_s=rc_interval,

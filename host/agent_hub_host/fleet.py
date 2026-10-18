@@ -418,8 +418,90 @@ def find_binding_row(rows, entry):
 
 class Dispatcher:
     """One finite poll. Claim ambiguity and effect ambiguity are never retried automatically."""
-    def __init__(self, settings, request=bus._do_request, runner=run_json):
+    def __init__(self, settings, request=bus._do_request, runner=run_json, role_config=None, role_config_path=None):
         self.settings, self.request, self.runner = settings, request, runner
+        self.role_config = role_config
+        self.role_config_path = role_config_path
+
+    def _derive_qualified_role_jobs(self) -> list[str]:
+        """Derive only enabled real qualified supported role profiles via RuntimeManager.
+
+        Rejects fixture/mock reports and arbitrary configured jobs text. Missing,
+        disabled, or broken config or failed qualification returns empty list so any
+        stale capability is removed on actual registration.
+        """
+        from .role_dispatch import load_role_config, SUPPORTED_ROLE_PROFILES, TrustedRoleConfig
+        from .runtime import RuntimeManager
+
+        cfg = None
+        path = self.role_config_path or (self.settings.get("role_config") if isinstance(self.settings.get("role_config"), str) else None)
+        if path:
+            try:
+                cfg = load_role_config(path)
+            except Exception:
+                cfg = None
+        elif self.role_config is not None:
+            if isinstance(self.role_config, TrustedRoleConfig):
+                cfg = self.role_config
+            elif isinstance(self.role_config, dict):
+                try:
+                    cfg = load_role_config(self.role_config)
+                except Exception:
+                    cfg = None
+            elif isinstance(self.role_config, str):
+                try:
+                    cfg = load_role_config(self.role_config)
+                except Exception:
+                    cfg = None
+        elif "role_config" in self.settings:
+            rc_val = self.settings["role_config"]
+            if isinstance(rc_val, TrustedRoleConfig):
+                cfg = rc_val
+            elif isinstance(rc_val, dict):
+                try:
+                    cfg = load_role_config(rc_val)
+                except Exception:
+                    cfg = None
+
+        if cfg is None or not getattr(cfg, "enabled", False):
+            return []
+
+        profiles = getattr(cfg, "profiles", {})
+        if not isinstance(profiles, dict) or not profiles:
+            return []
+
+        qualified = []
+        try:
+            mgr = RuntimeManager(role_config=cfg)
+        except Exception:
+            return []
+
+        for kind in sorted(SUPPORTED_ROLE_PROFILES):
+            p_cfg = profiles.get(kind)
+            if not p_cfg or not getattr(p_cfg, "enabled", False):
+                continue
+            try:
+                ok, reason, report = mgr.can_process_role_run(kind)
+            except Exception:
+                continue
+
+            if not ok:
+                continue
+            # Hard rejection of fixture/mock reports
+            if reason != "role_qualified" or "mock" in str(reason).lower() or "fixture" in str(reason).lower():
+                continue
+            if not isinstance(report, dict):
+                continue
+            if report.get("is_fixture_only") is True or report.get("status") == "MOCK_FIXTURE":
+                continue
+            if report.get("operational_qualified") is False:
+                continue
+            if report.get("supported") is not True or report.get("config_enabled") is not True:
+                continue
+
+            qualified.append(kind)
+
+        return sorted(qualified)
 
     def _route(self, offer):
         matches = [s for s in self.settings["subscriptions"] if s["account_label"] == offer.get("account") and s.get("engine", s["service"]) == offer.get("engine") and s.get("profile") == offer.get("profile")]
@@ -644,6 +726,11 @@ class Dispatcher:
         caps.update(engines=sorted({s.get('engine', s['service']) for s in self.settings['subscriptions']}),
                     workspaces=sorted(self.settings.get('workspaces', {})), cpu_count=os.cpu_count())
         caps['fleet_modes'] = ['interactive'] + (['headless'] if self.settings.get('launcher') else [])
+        qualified_jobs = self._derive_qualified_role_jobs()
+        if qualified_jobs:
+            caps['jobs'] = qualified_jobs
+        else:
+            caps.pop('jobs', None)
         self.request('POST', '/api/machines/register', info)
         hb = api.get_heartbeat_payload()
         allowed = False

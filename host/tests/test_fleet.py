@@ -413,6 +413,142 @@ class FleetTests(unittest.TestCase):
             self.assertEqual(result3['state'], 'running')
             self.assertEqual(calls[1][0][:2], ["aplexer", "start"])
 
+    def test_registration_derives_qualified_role_jobs_from_trusted_config(self):
+        cfg = settings(Path('/repo'))
+        calls = []
+        def request(method, path, body=None):
+            calls.append((method, path, body))
+            return {'offers': []}
+        def runner(argv, **kw):
+            if argv[0] == 'maintained-gate': return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+            if argv[0] == 'aplexer': return []
+            return {}
+
+        role_cfg = {
+            "version": 1,
+            "enabled": True,
+            "profiles": {
+                "principal-wake": {
+                    "enabled": True,
+                    "launcher_provider": "antigravity",
+                    "launcher_model": "gemini-3.8-flash-high",
+                },
+                "writer-run": {
+                    "enabled": False,
+                }
+            }
+        }
+
+        mock_report = {
+            "kind": "principal-wake",
+            "supported": True,
+            "reasons": [],
+            "config_enabled": True
+        }
+
+        with patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {}, 'hostname': 'test', 'os': 'test', 'network': 'home', 'roles': []}), \
+             patch('agent_hub_host.api.get_heartbeat_payload', return_value={'type': 'heartbeat'}), \
+             patch('agent_hub_host.runtime.RuntimeManager.can_process_role_run', return_value=(True, 'role_qualified', mock_report)):
+            d = fleet.Dispatcher(cfg, request, runner, role_config=role_cfg)
+            d.once()
+
+        self.assertEqual(calls[0][1], '/api/machines/register')
+        self.assertEqual(calls[0][2]['capabilities']['jobs'], ['principal-wake'])
+
+    def test_registration_rejects_mock_or_fixture_reports_and_purges_stale_jobs(self):
+        cfg = settings(Path('/repo'))
+        calls = []
+        def request(method, path, body=None):
+            calls.append((method, path, body))
+            return {'offers': []}
+        def runner(argv, **kw):
+            if argv[0] == 'maintained-gate': return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+            if argv[0] == 'aplexer': return []
+            return {}
+
+        role_cfg = {
+            "version": 1,
+            "enabled": True,
+            "profiles": {
+                "principal-wake": {"enabled": True},
+            }
+        }
+
+        mock_fixture_report = {
+            "kind": "principal-wake",
+            "status": "MOCK_FIXTURE",
+            "is_fixture_only": True,
+            "operational_qualified": False,
+        }
+
+        with patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {'jobs': ['stale-job']}, 'hostname': 'test', 'os': 'test', 'network': 'home', 'roles': []}), \
+             patch('agent_hub_host.api.get_heartbeat_payload', return_value={'type': 'heartbeat'}), \
+             patch('agent_hub_host.runtime.RuntimeManager.can_process_role_run', return_value=(True, 'mock_runner_active', mock_fixture_report)):
+            d = fleet.Dispatcher(cfg, request, runner, role_config=role_cfg)
+            d.once()
+
+        self.assertEqual(calls[0][1], '/api/machines/register')
+        self.assertNotIn('jobs', calls[0][2]['capabilities'])
+
+    def test_registration_rejects_arbitrary_configured_jobs_text(self):
+        cfg = settings(Path('/repo'))
+        cfg['capabilities'] = ['arbitrary-needs']
+        calls = []
+        def request(method, path, body=None):
+            calls.append((method, path, body))
+            return {'offers': []}
+        def runner(argv, **kw):
+            if argv[0] == 'maintained-gate': return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+            if argv[0] == 'aplexer': return []
+            return {}
+
+        # Pre-existing jobs in system_info capabilities must be stripped and not published
+        with patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {'jobs': ['fake-job-text']}, 'hostname': 'test', 'os': 'test', 'network': 'home', 'roles': []}), \
+             patch('agent_hub_host.api.get_heartbeat_payload', return_value={'type': 'heartbeat'}):
+            d = fleet.Dispatcher(cfg, request, runner)
+            d.once()
+
+        self.assertEqual(calls[0][1], '/api/machines/register')
+        self.assertNotIn('jobs', calls[0][2]['capabilities'])
+
+    def test_registration_purges_stale_capability_when_config_becomes_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            roles_path = Path(tmp) / 'roles.json'
+            roles_path.write_text(json.dumps({
+                "version": 1,
+                "enabled": True,
+                "profiles": {
+                    "principal-wake": {"enabled": True},
+                }
+            }))
+            cfg = settings(Path(tmp))
+            calls = []
+            def request(method, path, body=None):
+                calls.append((method, path, body))
+                return {'offers': []}
+            def runner(argv, **kw):
+                if argv[0] == 'maintained-gate': return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+                if argv[0] == 'aplexer': return []
+                return {}
+
+            mock_report = {"kind": "principal-wake", "supported": True, "reasons": [], "config_enabled": True}
+
+            with patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {}, 'hostname': 'test', 'os': 'test', 'network': 'home', 'roles': []}), \
+                 patch('agent_hub_host.api.get_heartbeat_payload', return_value={'type': 'heartbeat'}), \
+                 patch('agent_hub_host.runtime.RuntimeManager.can_process_role_run', return_value=(True, 'role_qualified', mock_report)):
+                d = fleet.Dispatcher(cfg, request, runner, role_config_path=str(roles_path))
+                d.once()
+                self.assertEqual(calls[-6][2]['capabilities']['jobs'], ['principal-wake'])
+
+            # Now disable the config on disk
+            roles_path.write_text(json.dumps({"version": 1, "enabled": False, "profiles": {}}))
+            calls.clear()
+
+            with patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {'jobs': ['stale-wake']}, 'hostname': 'test', 'os': 'test', 'network': 'home', 'roles': []}), \
+                 patch('agent_hub_host.api.get_heartbeat_payload', return_value={'type': 'heartbeat'}):
+                d.once()
+                self.assertNotIn('jobs', calls[-6][2]['capabilities'])
+
 
 if __name__ == '__main__': unittest.main()
 
