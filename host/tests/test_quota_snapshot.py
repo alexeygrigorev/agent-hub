@@ -475,7 +475,7 @@ class TestHostAgentQuotaIntegration(unittest.TestCase):
 
         # Check that step is called during _poll_fallback
         with patch("agent_hub_host.api.safe_http_json", return_value={"status": "ok"}), \
-             patch("agent_hub_host.auth.get_access_token", return_value="tok"):
+             patch("agent_hub_host.auth.get_host_access_token", return_value="tok"):
             agent.base_url = "https://hub"
             agent._poll_fallback()
             mock_collector.step.assert_called_once()

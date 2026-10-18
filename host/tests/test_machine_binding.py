@@ -34,8 +34,8 @@ class TestMachineBinding(unittest.TestCase):
         self.path = Path(self.tmp.name) / "config" / "host.json"
         self.addCleanup(patch.stopall)
         patch.object(config, "get_config_path", return_value=self.path).start()
-        # Reuse the real shared polling loop without sleeping or printing codes.
-        flow = auth._shared_device_login()
+        # Reuse the real device polling loop without sleeping or printing codes.
+        flow = auth._device_flow()
         real_login = flow.device_login
         patch.object(flow, "device_login", side_effect=lambda *a, **kw: real_login(
             *a, **kw, sleeper=lambda _: None, prompt=lambda _: None)).start()
@@ -264,7 +264,7 @@ class TestMachineBinding(unittest.TestCase):
 
     def test_mocked_or_cached_success_without_transport_receipt_is_refused(self):
         before = self.path.read_bytes()
-        with patch.object(auth._shared_device_login(), "device_login", return_value=self.payload(None)):
+        with patch.object(auth._device_flow(), "device_login", return_value=self.payload(None)):
             with self.assertRaisesRegex(ValueError, "response mismatch"):
                 auth.device_login(self.old["base_url"], "agent", "project:worker", "fixture", [])
         with patch.object(api, "safe_http_json", return_value=self.payload("new-machine")):

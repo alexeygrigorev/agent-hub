@@ -173,14 +173,27 @@ class TestRegistryImport(unittest.TestCase):
             if os.path.exists(token_path):
                 os.remove(token_path)
 
-    def test_real_registry_parsing_without_leaking(self):
-        """Verifies importer runs successfully against real TEAM-REGISTRY.json if present."""
-        real_file = "/home/alexey/git/cloudflare-agent-git/coordination/TEAM-REGISTRY.json"
-        if not os.path.exists(real_file):
-            self.skipTest("Real TEAM-REGISTRY.json not present on host")
-
-        with open(real_file, "r") as f:
-            data = json.load(f)
+    def test_representative_registry_parsing_without_leaking(self):
+        """Exercise the real parser on a fixed large registry without host-file dependencies."""
+        data = {
+            "teams": [
+                {
+                    "id": f"team-{i}",
+                    "project": "agent-hub",
+                    "host": "h1",
+                    "agents": [
+                        {
+                            "tag": f"agent-{i}-{j}",
+                            "role": "worker" if j > 0 else "head",
+                            "workspace": f"/tmp/w{i}_{j}",
+                            "session_id": f"s-{i}-{j}",
+                        }
+                        for j in range(10)
+                    ],
+                }
+                for i in range(21)
+            ]
+        }
 
         agents = itr.flatten_registry(data)
         self.assertGreater(len(agents), 200)
