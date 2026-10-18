@@ -160,6 +160,31 @@ describe('generic accounts and launch placement', () => {
     expect((await s.handle(request(path, { state: 'exited', confirmed_exit: true }), host('hetzner'))).status).toBe(200);
     expect((await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).status).toBe(201);
   }));
+  for (const terminal of ['exited', 'failed'] as const) {
+    it(`replays the identical ${terminal} headless receipt without effects and refuses mismatched receipts`, async () => fixture(async (s, sql) => {
+      await configure(s);
+      const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner', mode: 'headless', prompt: 'owned task' })), admin)).json();
+      await s.handle(request('/launches/' + launch.id + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+      const path = '/launches/' + launch.id + '/result';
+      const receipt = { state: terminal, native_id: 'owned-native', launcher_task_id: 'hub-' + launch.id, confirmed_exit: true };
+      expect((await s.handle(request(path, { ...receipt, state: 'running' }), host('hetzner'))).status).toBe(200);
+      expect((await s.handle(request(path, receipt), host('hetzner'))).status).toBe(200);
+      sql.exec('UPDATE fleet_launches SET updated_at = ? WHERE id = ?', '2020-01-01T00:00:00.000Z', launch.id);
+      const before = sql.exec('SELECT state, native_id, launcher_task_id, updated_at FROM fleet_launches WHERE id = ?', launch.id).one();
+      const replay = await s.handle(request(path, receipt), host('hetzner'));
+      expect(replay.status).toBe(200);
+      expect(await replay.json()).toEqual({ id: launch.id, state: terminal, replay: true });
+      for (const wrong of [
+        { ...receipt, native_id: 'foreign-native' },
+        { ...receipt, launcher_task_id: 'hub-other' },
+        { ...receipt, confirmed_exit: false },
+        { ...receipt, state: terminal === 'exited' ? 'failed' : 'exited' },
+        { ...receipt, unexpected: true },
+      ]) expect((await s.handle(request(path, wrong), host('hetzner'))).status).toBe(409);
+      expect((await s.handle(request(path, receipt), host('win35'))).status).toBe(404);
+      expect(sql.exec('SELECT state, native_id, launcher_task_id, updated_at FROM fleet_launches WHERE id = ?', launch.id).one()).toEqual(before);
+    }));
+  }
   it('closes only the matching Hub assignment after a confirmed terminal host result', async () => fixture(async (s, sql) => {
     await configure(s);
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);

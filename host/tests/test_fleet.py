@@ -951,7 +951,7 @@ class FleetTests(unittest.TestCase):
                                         'tag': f"task-{task_id}", 'workspace': str(ws.resolve()), 'engine': 'codex',
                                         'created_at_ms': 1792330666399}}
                 if 'reconcile' in argv:
-                    return {'task_id': task_id, 'state': 'completed-awaiting-review', 'resources_reserved': False,
+                    return {'task_id': task_id, 'native_id': native_id, 'state': 'completed-awaiting-review', 'resources_reserved': False,
                             'reconciled_action': 'completed-awaiting-review', 'result_evidence_count': 1}
                 if argv[-2:] == ['list', '--json']:
                     return []
@@ -1030,7 +1030,7 @@ class FleetTests(unittest.TestCase):
                                         'tag': f"task-{task_id}", 'workspace': str(ws.resolve()), 'engine': 'codex',
                                         'created_at_ms': 1792330666399}}
                 if 'reconcile' in argv:
-                    return {'task_id': task_id, 'state': 'completed-awaiting-review', 'resources_reserved': False}
+                    return {'task_id': task_id, 'native_id': native_id, 'state': 'completed-awaiting-review', 'resources_reserved': False}
                 return {}
 
             # Dispatch with first Dispatcher instance
@@ -1088,8 +1088,8 @@ class FleetTests(unittest.TestCase):
                         fail_post[0] = False
                         raise ConnectionResetError("network lost response")
                     if body.get('confirmed_exit') and not fail_post[0]:
-                        # Server responds 409 invalid_transition because it already processed it
-                        raise ValueError("409 invalid_transition")
+                        # Exact committed terminal receipt is acknowledged idempotently.
+                        return {"id": offer_id, "state": body["state"], "replay": True}
                     return {"id": offer_id, "state": body.get("state")}
                 return {}
 
@@ -1105,7 +1105,7 @@ class FleetTests(unittest.TestCase):
                 if 'plan' in argv:
                     return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol', 'task_fit': 1.0}]}
                 if 'reconcile' in argv:
-                    return {'task_id': task_id, 'state': 'completed-awaiting-review', 'resources_reserved': False}
+                    return {'task_id': task_id, 'native_id': native_id, 'state': 'completed-awaiting-review', 'resources_reserved': False}
                 return {}
 
             d = fleet.Dispatcher(cfg, request, runner, journal_dir=str(journal))
@@ -1120,7 +1120,7 @@ class FleetTests(unittest.TestCase):
                 self.assertEqual(first_attempt, [])
                 self.assertFalse(d._active_launches[offer_id]['settled'])
 
-                # Second attempt (retry): recovers from 409 invalid_transition
+                # Second attempt receives an explicit acknowledgement of the committed receipt
                 second_attempt = d.reconcile_launches()
                 self.assertEqual(len(second_attempt), 1)
                 self.assertTrue(second_attempt[0]['reconciled'])
@@ -1161,7 +1161,7 @@ class FleetTests(unittest.TestCase):
                                         'created_at_ms': 1792330666399}}
                 if 'reconcile' in argv:
                     reconcile_calls.append(argv)
-                    return {'task_id': task_id, 'state': 'completed-awaiting-review', 'resources_reserved': False}
+                    return {'task_id': task_id, 'native_id': native_id, 'state': 'completed-awaiting-review', 'resources_reserved': False}
                 return {}
 
             d = fleet.Dispatcher(cfg, request, runner)
@@ -1193,7 +1193,7 @@ class FleetTests(unittest.TestCase):
             def runner_busy(argv, **kw):
                 if 'reconcile' in argv:
                     reconcile_calls.append(argv)
-                    return {'task_id': task_id, 'state': 'running', 'resources_reserved': True}
+                    return {'task_id': task_id, 'native_id': native_id, 'state': 'running', 'resources_reserved': True}
                 return runner(argv, **kw)
             d.runner = runner_busy
             tombstone = {"cause": "finished", "id": native_id, "tag": f"task-{task_id}",
@@ -1235,7 +1235,7 @@ class FleetTests(unittest.TestCase):
                                         'created_at_ms': 1792330666399}}
                 if 'reconcile' in argv:
                     # Native died with no evidence -> launcher transitions to failed
-                    return {'task_id': task_id, 'state': 'failed', 'resources_reserved': False,
+                    return {'task_id': task_id, 'native_id': native_id, 'state': 'failed', 'resources_reserved': False,
                             'reconciled_action': 'failed', 'result_evidence_count': 0}
                 return {}
 
@@ -1280,6 +1280,71 @@ class FleetTests(unittest.TestCase):
             # Must load cleanly without raising and with zero active launches loaded
             d = fleet.Dispatcher(cfg, lambda *a: {}, lambda *a, **kw: {}, journal_dir=str(journal))
             self.assertEqual(d._active_launches, {})
+
+
+    def test_normal_headless_requires_exact_release_identity_and_terminal_ack(self):
+        cases = ["valid", "accepted", "missing_release", "truthy_release", "foreign_native", "missing_native", "transition_error", "wrong_ack", "empty_ack"]
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                ws = Path(tmp) / "ws"
+                ws.mkdir()
+                cfg = settings(ws)
+                cfg["launcher"] = {"argv": ["maintained-launcher"], "root": str(ws), "config_dir": str(ws / "config")}
+                offer_id = "38bb1d42-d697-435e-a537-f8a93ac6cf3e"
+                task_id = "hub-" + offer_id
+                native_id = "2ac89cc7-2810-44c2-bab6-34e41633b1e5"
+                output = {"task_id": task_id, "native_id": native_id, "state": "accepted" if case == "accepted" else "completed-awaiting-review", "resources_reserved": False}
+                if case == "missing_release":
+                    output.pop("resources_reserved")
+                if case == "truthy_release":
+                    output["resources_reserved"] = "false"
+                if case == "foreign_native":
+                    output["native_id"] = "72df443d-e9b1-4bfe-b025-3454f9f09e93"
+                if case == "missing_native":
+                    output.pop("native_id")
+                calls = []
+                def request(method, path, body=None):
+                    calls.append((method, path, body))
+                    if case == "transition_error":
+                        raise RuntimeError("409 invalid_transition")
+                    if case == "wrong_ack":
+                        return {"id": "other", "state": "exited"}
+                    if case == "empty_ack":
+                        return {}
+                    return {"id": offer_id, "state": "exited"}
+                commands = []
+                def runner(argv, **kw):
+                    commands.append(argv)
+                    return output
+                d = fleet.Dispatcher(cfg, request, runner, journal_dir=str(Path(tmp) / "journal"))
+                d._record_running_launch(offer_id, task_id, ws, "codex", "shared-codex", native_id, ws / "result.json", {"tag": "task-" + task_id, "created_at_ms": 1792330666399})
+                self.assertIn(offer_id, d._active_launches)
+                with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, {}, "retired_tombstone_verified")):
+                    settled = d.reconcile_launches()
+                accepted = case in {"valid", "accepted"}
+                self.assertEqual(bool(settled), accepted)
+                self.assertIs(d._active_launches[offer_id]["settled"], accepted)
+                if case in {"missing_release", "truthy_release", "foreign_native", "missing_native"}:
+                    self.assertEqual(calls, [])
+                self.assertFalse(any("accept" in x or "reject" in x or "run" in x for x in commands))
+
+    def test_normal_headless_restart_rejects_uncoupled_journal_identity(self):
+        for field, value in [("task_id", "foreign-task"), ("tag", "foreign-tag"), ("mode", "interactive")]:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                ws = Path(tmp) / "ws"
+                ws.mkdir()
+                cfg = settings(ws)
+                journal = Path(tmp) / "journal"
+                offer_id = "38bb1d42-d697-435e-a537-f8a93ac6cf3e"
+                d = fleet.Dispatcher(cfg, lambda *a: {}, lambda *a, **kw: {}, journal_dir=str(journal))
+                d._record_running_launch(offer_id, "hub-" + offer_id, ws, "codex", "shared-codex", "2ac89cc7-2810-44c2-bab6-34e41633b1e5", ws / "result.json", {"tag": "task-hub-" + offer_id, "created_at_ms": 1792330666399})
+                path = journal / "fleet-launches" / (offer_id + ".json")
+                data = json.loads(path.read_text())
+                data[field] = value
+                path.write_text(json.dumps(data))
+                restored = fleet.Dispatcher(cfg, lambda *a: {}, lambda *a, **kw: {}, journal_dir=str(journal))
+                self.assertEqual(restored._active_launches, {})
+                self.assertTrue(path.exists())
 
 
 if __name__ == '__main__': unittest.main()

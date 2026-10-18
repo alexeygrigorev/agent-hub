@@ -479,6 +479,9 @@ class Dispatcher:
                     continue
                 if not (isinstance(task_id, str) and LABEL.fullmatch(task_id)):
                     continue
+                if (data.get("mode") != "headless" or task_id != f"hub-{offer_id}"
+                        or tag != f"task-{task_id}" or entry.name != f"{offer_id}.json"):
+                    continue
                 if not (isinstance(native_id, str) and native_id):
                     continue
                 if not (isinstance(tag, str) and tag):
@@ -579,6 +582,10 @@ class Dispatcher:
         for offer_id, record in list(self._active_launches.items()):
             if record.get("settled") is True:
                 continue
+            if (record.get("mode") != "headless" or record.get("offer_id") != offer_id
+                    or record.get("task_id") != f"hub-{offer_id}"
+                    or record.get("tag") != f"task-hub-{offer_id}"):
+                continue
 
             # 1. Corroborate exact 5-field native tuple
             incarnation = record.get("incarnation")
@@ -626,12 +633,14 @@ class Dispatcher:
             reconciled_state = reconcile_out.get("state")
             resources_reserved = reconcile_out.get("resources_reserved")
 
-            # Physical resources must be released; state must be completed-awaiting-review or failed
-            if resources_reserved is True or reconciled_state not in ("completed-awaiting-review", "failed"):
+            # Require confirmed physical release of the same native execution.
+            if (resources_reserved is not False
+                    or reconcile_out.get("native_id") != record["native_id"]
+                    or reconciled_state not in ("completed-awaiting-review", "accepted", "failed")):
                 continue
 
             # 4. Own-host Fleet terminal result
-            fleet_state = "exited" if reconciled_state == "completed-awaiting-review" else "failed"
+            fleet_state = "failed" if reconciled_state == "failed" else "exited"
             result_payload = {
                 "state": fleet_state,
                 "confirmed_exit": True,
@@ -640,22 +649,19 @@ class Dispatcher:
             }
             path = f"/api/fleet/launches/{offer_id}/result"
             try:
-                self.request("POST", path, result_payload)
+                acknowledgement = self.request("POST", path, result_payload)
+                if (not isinstance(acknowledgement, dict)
+                        or acknowledgement.get("id") != offer_id
+                        or acknowledgement.get("state") != fleet_state):
+                    continue
                 record["settled"] = True
                 record["state"] = fleet_state
                 record["settled_at"] = utcnow()
                 self._persist_launch_record(record)
                 reconciled.append({"id": offer_id, "state": fleet_state, "reconciled": True})
-            except Exception as exc:
-                err_str = str(exc)
-                if "invalid_transition" in err_str:
-                    record["settled"] = True
-                    record["state"] = fleet_state
-                    record["settled_at"] = utcnow()
-                    self._persist_launch_record(record)
-                    reconciled.append({"id": offer_id, "state": fleet_state, "reconciled": True, "recovered": True})
-                else:
-                    pass
+            except Exception:
+                # Retain pending observation until the server explicitly acknowledges it.
+                continue
 
         return reconciled
 

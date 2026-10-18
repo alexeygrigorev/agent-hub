@@ -492,6 +492,16 @@ export class FleetService {
           this.sql.exec("UPDATE fleet_launches SET state = 'starting', updated_at = ? WHERE id = ? AND state = 'offered'", new Date(this.now()).toISOString(), row.id);
           return response({ ...row, state: 'starting' });
         }
+        // Replay an identical committed normal-headless terminal receipt without effects.
+        if (row.mode === 'headless' && ['exited', 'failed'].includes(row.state) &&
+            object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit']) &&
+            data.state === row.state && data.confirmed_exit === true &&
+            typeof data.native_id === 'string' && data.native_id.length > 0 && data.native_id.length <= 160 &&
+            data.native_id === row.native_id && label(data.launcher_task_id) &&
+            data.launcher_task_id === row.launcher_task_id &&
+            !this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) {
+          return response({ id: row.id, state: row.state, replay: true });
+        }
         if (!object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit']) || !['running', 'uncertain', 'failed', 'exited'].includes(data.state) || !['starting', 'running', 'uncertain'].includes(row.state)) return response({ error: 'invalid_transition' }, 409);
         if (['exited', 'failed'].includes(data.state) && this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) return response({ error: 'task_report_required' }, 409);
         if (['exited', 'failed'].includes(data.state) && data.confirmed_exit !== true) return response({ error: 'confirmed_exit_required' }, 409);
