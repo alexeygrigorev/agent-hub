@@ -288,9 +288,11 @@ class RoleConsumer:
         try:
             results = self.dispatcher.poll_and_dispatch_role_jobs()
             dispatched = sum(1 for r in results if isinstance(r, dict) and r.get("accepted"))
-            errors = sum(1 for r in results if isinstance(r, dict) and not r.get("accepted"))
+            recovered = sum(1 for r in results if isinstance(r, dict) and r.get("recovered"))
+            errors = sum(1 for r in results if isinstance(r, dict) and not r.get("accepted") and not r.get("recovered"))
             return {
                 "dispatched": dispatched,
+                "recovered": recovered,
                 "errors": errors,
                 "idle": len(results) == 0,
             }
@@ -317,6 +319,7 @@ def role_consumer_step_once(consumer: RoleConsumer) -> None:
         print(json.dumps({
             "event": "role_cycle",
             "dispatched": result.get("dispatched", 0),
+            "recovered": result.get("recovered", 0),
             "errors": result.get("errors", 0)
         }), flush=True)
     except Exception as error:

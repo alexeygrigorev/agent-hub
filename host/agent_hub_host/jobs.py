@@ -258,6 +258,13 @@ def write_role_uncertain_proof(
     except Exception as e:
         logger.warning("Failed to write runs_dir outcome-uncertain proof: %s", e)
 
+    active_idx = runs_dir / f"active-role-{job_id}.json"
+    if active_idx.exists():
+        try:
+            active_idx.unlink()
+        except OSError:
+            pass
+
     if run_dir is not None:
         try:
             run_dir.mkdir(parents=True, exist_ok=True)
@@ -265,6 +272,10 @@ def write_role_uncertain_proof(
             rld.write_private_json(run_path, proof_data)
         except Exception as e:
             logger.warning("Failed to write run_dir outcome-uncertain proof: %s", e)
+        try:
+            rld.update_role_custody(runs_dir, run_dir, job_id, {"phase": "uncertain", "cause": cause, "status": "uncertain"})
+        except Exception:
+            pass
 
     return summary_path
 
@@ -596,6 +607,32 @@ class JobDispatcher:
         }
         if claimed_binding is not None:
             job_info["role_binding"] = claimed_binding
+            try:
+                runs_dir = self._get_role_runs_dir()
+                run_dir = runs_dir / f"{kind}-{job_id}"
+                safe_job = re.sub(r"[^a-zA-Z0-9_-]", "-", job_id)
+                task_id = f"hub-role-{kind}-{safe_job}-g{claimed_binding.get('generation', 0)}-e{lease_epoch}"
+                rld.save_role_custody(
+                    runs_dir=runs_dir,
+                    run_dir=run_dir,
+                    job_id=job_id,
+                    data={
+                        "job_id": job_id,
+                        "kind": kind,
+                        "role_binding": claimed_binding,
+                        "lease_epoch": lease_epoch,
+                        "job_token": job_token,
+                        "deadline_at": deadline_at,
+                        "payload": payload,
+                        "base_url": self.base_url,
+                        "host_id": self.host_id,
+                        "task_id": task_id,
+                        "phase": "claimed",
+                        "claimed_at": time.time(),
+                    },
+                )
+            except Exception as e:
+                logger.warning("Failed to save initial role custody for %s: %s", job_id, e)
         with self._lock:
             self.running_jobs[job_id] = job_info
 
@@ -647,6 +684,9 @@ class JobDispatcher:
             safe_job = re.sub(r"[^a-zA-Z0-9_-]", "-", job_id)
             launcher_task_id = f"hub-role-{kind}-{safe_job}-g{role.get('generation', 0)}-e{lease_epoch}"
             native_session = None
+            runs_dir = self._get_role_runs_dir()
+            run_dir_path = runs_dir / f"{kind}-{job_id}"
+            rld.ensure_private_dir(run_dir_path)
         role_intent_recorded = False
 
         def _finish_failed_with_bridge(fail_summary: str, initial_refs: Optional[List[str]] = None,
@@ -745,8 +785,8 @@ class JobDispatcher:
                 return
 
             # Check for pre-existing evidence file before worker start
-            if role is not None and hasattr(self.runtime_mgr, "role_runs_dir"):
-                runs_dir = pathlib.Path(self.runtime_mgr.role_runs_dir)
+            if role is not None:
+                runs_dir = self._get_role_runs_dir()
             else:
                 runs_dir = pathlib.Path(self.root_bridge.runs_dir)
             runs_dir.mkdir(parents=True, exist_ok=True)
@@ -775,6 +815,10 @@ class JobDispatcher:
                     logger.warning("Role execution authorization refused or uncertain; HOLD %s", job_id)
                     return
                 role_intent_recorded = True
+                try:
+                    rld.update_role_custody(runs_dir, run_dir_path, job_id, {"phase": "intent_committed"})
+                except Exception:
+                    pass
 
             # Execute worker in thread to ensure actual worker execution starts
             exec_result: Dict[str, Any] = {}
@@ -1083,6 +1127,15 @@ class JobDispatcher:
             server_start_result["status"] = "started"
             server_start_result["start_res"] = start_res
             server_started_event.set()
+            if role is not None:
+                try:
+                    rld.update_role_custody(runs_dir, run_dir_path, job_id, {
+                        "phase": "running",
+                        "native_session": native_session,
+                        "evidence_digest": evidence_digest,
+                    })
+                except Exception:
+                    pass
 
             # Start periodic renewal loop in background
             renew_thread = threading.Thread(
@@ -1229,6 +1282,11 @@ class JobDispatcher:
                 self.base_url, job_id, job_token, lease_epoch,
                 hub_status, summary, evidence_refs
             )
+            if role is not None:
+                try:
+                    rld.remove_role_custody(runs_dir, run_dir_path, job_id)
+                except Exception:
+                    pass
 
         finally:
             stop_event.set()
@@ -1411,17 +1469,398 @@ class JobDispatcher:
             return eligible
         return any(self.runtime_mgr.can_process_role_run(k)[0] for k in SUPPORTED_ROLE_PROFILES)
 
+    def _get_role_runs_dir(self) -> pathlib.Path:
+        if hasattr(self.runtime_mgr, "role_runs_dir"):
+            p = pathlib.Path(self.runtime_mgr.role_runs_dir)
+        elif hasattr(self.runtime_mgr, "role_adapter") and hasattr(self.runtime_mgr.role_adapter, "config") and hasattr(self.runtime_mgr.role_adapter.config, "runs_dir"):
+            p = pathlib.Path(self.runtime_mgr.role_adapter.config.runs_dir)
+        else:
+            p = pathlib.Path(getattr(self.root_bridge, "runs_dir", ".local/roles"))
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def _corroborate_native_target(
+        self,
+        job_id: str,
+        kind: str,
+        role: Dict[str, Any],
+        lease_epoch: int,
+        run_dir: pathlib.Path,
+    ) -> Optional[rld.NativeTarget]:
+        safe_job = re.sub(r"[^a-zA-Z0-9_-]", "-", job_id)
+        generation = int(role.get("generation", 0))
+        task_id = f"hub-role-{kind}-{safe_job}-g{generation}-e{lease_epoch}"
+        if hasattr(self.runtime_mgr, "role_adapter"):
+            adapter = self.runtime_mgr.role_adapter
+            run = rld.RoleRun(
+                job_id=job_id,
+                job_token="temporary",
+                lease_epoch=lease_epoch,
+                role_binding=role,
+                kind=kind,
+                payload={},
+                hub_url=self.base_url,
+                host_id=self.host_id,
+                config=adapter.config,
+                launcher_backend=adapter.launcher_backend,
+                clock=self.clock,
+                reattach=True,
+            )
+            binding = run.corroborate_maintained_binding()
+            if binding:
+                return rld.NativeTarget(
+                    session_id=binding["session_id"],
+                    tag=binding["tag"],
+                    workspace=binding["workspace"],
+                    created_at_ms=binding["created_at_ms"],
+                    engine=binding["engine"],
+                )
+        return None
+
+    def _stop_native_target_safely(self, target: rld.NativeTarget) -> bool:
+        try:
+            if hasattr(self.runtime_mgr, "role_adapter"):
+                backend = self.runtime_mgr.role_adapter.launcher_backend
+                res = backend.stop_session(target)
+                if isinstance(res, tuple):
+                    return bool(res[0])
+                return bool(res)
+        except Exception as e:
+            logger.warning("Failed to stop native target %s: %s", target.session_id, e)
+        return False
+
+    def recover_active_role_jobs(self) -> List[Dict[str, Any]]:
+        """Discover and reattach to interrupted role jobs."""
+        runs_dir = self._get_role_runs_dir()
+        active_files = list(runs_dir.glob("active-role-*.json"))
+        for sub in runs_dir.iterdir():
+            if sub.is_dir() and any(sub.name.startswith(f"{p}-") for p in SUPPORTED_ROLE_PROFILES):
+                for cfile in sub.glob("custody-*.json"):
+                    jid = cfile.name[len("custody-"):-len(".json")]
+                    idx = runs_dir / f"active-role-{jid}.json"
+                    if not idx.exists() and not (sub / f"outcome-uncertain-{jid}.json").exists():
+                        active_files.append(cfile)
+
+        results = []
+        for afile in set(active_files):
+            rec = self._recover_one_role_job(afile, runs_dir)
+            if rec is not None:
+                results.append(rec)
+        return results
+
+    def _recover_one_role_job(self, state_file: pathlib.Path, runs_dir: pathlib.Path) -> Optional[Dict[str, Any]]:
+        try:
+            custody, _, _ = rld.safe_read_bounded_json(state_file, max_bytes=65536)
+        except Exception as e:
+            logger.warning("Failed to read role custody %s: %s", state_file, e)
+            return None
+
+        if not custody or not isinstance(custody, dict):
+            return None
+
+        job_id = custody.get("job_id")
+        kind = custody.get("kind")
+        job_token = custody.get("job_token")
+        lease_epoch = custody.get("lease_epoch")
+        role = custody.get("role_binding")
+        deadline_at = custody.get("deadline_at")
+        payload = custody.get("payload", {})
+        host_id = custody.get("host_id") or (role.get("host_id") if isinstance(role, dict) else None)
+
+        if not job_id or not kind or not job_token or not lease_epoch or not role:
+            return None
+
+        with self._lock:
+            if job_id in self.running_jobs:
+                return None
+
+        if host_id != self.host_id:
+            return None
+
+        if kind not in SUPPORTED_ROLE_PROFILES:
+            return None
+
+        run_dir = runs_dir / f"{kind}-{job_id}"
+        uncertain_file = run_dir / f"outcome-uncertain-{job_id}.json"
+        if uncertain_file.exists() or custody.get("phase") == "uncertain":
+            idx = runs_dir / f"active-role-{job_id}.json"
+            if idx.exists():
+                try: idx.unlink()
+                except OSError: pass
+            return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": "already_uncertain"}
+
+        # 1. Runtime qualification check
+        if not hasattr(self.runtime_mgr, "can_process_role_run"):
+            return None
+        eligible, reason, report = self.runtime_mgr.can_process_role_run(kind)
+        if not eligible:
+            logger.warning("Recovery cannot process role %s (%s): %s", job_id, kind, reason)
+            return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": f"unqualified: {reason}"}
+
+        # 2. Probe server with renew_job to verify lease validity and detect stale generation
+        try:
+            renew_res = self.client.renew_job(self.base_url, job_id, job_token, lease_epoch)
+        except Exception as e:
+            logger.warning("Lease renewal probe exception during recovery of %s: %s", job_id, e)
+            return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": f"network_error: {e}"}
+
+        if renew_res.get("error") == "unauthorized_or_stale":
+            logger.warning("Stale generation or lost lease detected on recovery for %s: %s", job_id, renew_res.get("error"))
+            target = self._corroborate_native_target(job_id, kind, role, lease_epoch, run_dir)
+            if target is not None:
+                self._stop_native_target_safely(target)
+            write_role_uncertain_proof(
+                runs_dir=runs_dir,
+                run_dir=run_dir,
+                job_id=job_id,
+                role=role,
+                kind=kind,
+                lease_epoch=lease_epoch,
+                phase="stale_generation_fenced",
+                cause="renew_job returned unauthorized_or_stale (generation advanced or lease lost)",
+                is_prelaunch_refusal=False,
+            )
+            rld.remove_role_custody(runs_dir, run_dir, job_id)
+            return {"job_id": job_id, "recovered": False, "status": "fenced", "reason": "stale_generation_or_lost_lease"}
+
+        if renew_res.get("error") == "deadline_exceeded":
+            target = self._corroborate_native_target(job_id, kind, role, lease_epoch, run_dir)
+            if target is not None:
+                self._stop_native_target_safely(target)
+            write_role_uncertain_proof(
+                runs_dir=runs_dir,
+                run_dir=run_dir,
+                job_id=job_id,
+                role=role,
+                kind=kind,
+                lease_epoch=lease_epoch,
+                phase="deadline_exceeded",
+                cause="lease renewal rejected: deadline_exceeded",
+                is_prelaunch_refusal=False,
+            )
+            rld.remove_role_custody(runs_dir, run_dir, job_id)
+            return {"job_id": job_id, "recovered": False, "status": "fenced", "reason": "deadline_exceeded"}
+
+        if renew_res.get("error"):
+            logger.warning("Lease renewal returned error for %s: %s; HOLD", job_id, renew_res.get("error"))
+            return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": f"lease_error: {renew_res.get('error')}"}
+
+        # 3. Server lease is confirmed active!
+        start_ack_file = run_dir / f"start-ack-{job_id}.json"
+        first_action_file = run_dir / f"first-action-{job_id}.json"
+        outcome_file = run_dir / f"outcome-{job_id}.json"
+
+        # Reattach RoleRun
+        run = self.runtime_mgr.reattach_role_run(
+            job_id=job_id,
+            kind=kind,
+            payload=payload,
+            job_token=job_token,
+            lease_epoch=lease_epoch,
+            role_binding=role,
+            hub_url=self.base_url,
+            host_id=self.host_id,
+        )
+
+        binding = run.corroborate_maintained_binding()
+        if not binding:
+            logger.error("Interrupted job %s cannot corroborate native binding; HOLD uncertain", job_id)
+            write_role_uncertain_proof(
+                runs_dir=runs_dir,
+                run_dir=run_dir,
+                job_id=job_id,
+                role=role,
+                kind=kind,
+                lease_epoch=lease_epoch,
+                phase="uncorroborated_native_identity",
+                cause="missing or uncorroborated native binding on recovery",
+                is_prelaunch_refusal=False,
+            )
+            rld.remove_role_custody(runs_dir, run_dir, job_id)
+            return {"job_id": job_id, "recovered": False, "status": "HOLD", "reason": "uncorroborated_native_identity"}
+
+        target = rld.NativeTarget(
+            session_id=binding["session_id"],
+            tag=binding["tag"],
+            workspace=binding["workspace"],
+            created_at_ms=binding["created_at_ms"],
+            engine=binding["engine"],
+        )
+
+        # Handle start-ack if needed:
+        if not start_ack_file.exists():
+            if first_action_file.exists():
+                digest = rld.get_role_first_action_digest(
+                    first_action_file,
+                    expected_job_id=job_id,
+                    expected_epoch=lease_epoch,
+                    expected_role_name=role.get("name", ""),
+                    expected_generation=role.get("generation", 0),
+                    expected_native_session=binding["session_id"],
+                )
+                if digest:
+                    start_res = self.client.start_job(
+                        self.base_url, job_id, job_token, lease_epoch,
+                        digest, binding["session_id"], run.task_id
+                    )
+                    if start_res.get("error"):
+                        run.cancel("recovery_server_start_refused")
+                        write_role_uncertain_proof(
+                            runs_dir=runs_dir,
+                            run_dir=run_dir,
+                            job_id=job_id,
+                            role=role,
+                            kind=kind,
+                            lease_epoch=lease_epoch,
+                            phase="server_start",
+                            cause=f"start_job failed on recovery: {start_res.get('error')}",
+                            is_prelaunch_refusal=False,
+                        )
+                        rld.remove_role_custody(runs_dir, run_dir, job_id)
+                        return {"job_id": job_id, "recovered": False, "status": "failed", "reason": start_res.get("error")}
+                    run.acknowledge_start(start_res)
+
+        alive, _ = run.launcher_backend.is_session_alive(target)
+        if alive:
+            logger.info("Reattaching to alive native session %s for job %s", binding["session_id"], job_id)
+            stop_event = threading.Event()
+            job_info = {
+                "job_id": job_id,
+                "kind": kind,
+                "op_qualified": False,
+                "job_token": job_token,
+                "lease_epoch": lease_epoch,
+                "deadline_at": deadline_at,
+                "started_at": self.clock.time(),
+                "started_wall": time.time(),
+                "stop_event": stop_event,
+                "role_binding": role,
+                "reattached": True,
+            }
+            with self._lock:
+                self.running_jobs[job_id] = job_info
+
+            recovery_thread = threading.Thread(
+                target=self._monitor_reattached_job,
+                args=(job_info, run, runs_dir, run_dir, payload),
+                name=f"job-recovery-{job_id}",
+                daemon=True,
+            )
+            recovery_thread.start()
+            return {"job_id": job_id, "recovered": True, "status": "running", "reattached": True}
+        else:
+            logger.info("Workload for job %s has already terminated; finalizing outcome", job_id)
+            out = run.outcome()
+            status = out["hub_status"]
+            summary = out["summary"]
+            refs = out["evidence_refs"]
+            if status == "succeeded" and not refs:
+                refs = [str(run.first_action_file)]
+
+            self.client.finish_job(
+                self.base_url, job_id, job_token, lease_epoch,
+                status, summary, refs
+            )
+            rld.remove_role_custody(runs_dir, run_dir, job_id)
+            return {"job_id": job_id, "recovered": True, "status": "finished", "outcome": status}
+
+    def _monitor_reattached_job(
+        self,
+        job_info: Dict[str, Any],
+        run: rld.RoleRun,
+        runs_dir: pathlib.Path,
+        run_dir: pathlib.Path,
+        payload: Dict[str, Any],
+    ) -> None:
+        job_id = job_info["job_id"]
+        job_token = job_info["job_token"]
+        lease_epoch = job_info["lease_epoch"]
+        stop_event = job_info["stop_event"]
+        role = job_info["role_binding"]
+        deadline_sec = self._deadline_seconds(job_info.get("deadline_at"))
+
+        renew_thread = threading.Thread(
+            target=self._renewal_loop,
+            args=(job_id, job_token, lease_epoch, stop_event, role),
+            name=f"renew-{job_id}",
+            daemon=True,
+        )
+        renew_thread.start()
+
+        try:
+            while not run.wait_done(1.0):
+                now = self.clock.time() if hasattr(self.clock, "time") else time.time()
+                if stop_event.is_set() or (deadline_sec is not None and now > deadline_sec):
+                    reason = "lease_lost" if stop_event.is_set() else "deadline_exceeded"
+                    info = run.cancel(reason)
+                    stop_event.set()
+                    write_role_uncertain_proof(
+                        runs_dir=runs_dir,
+                        run_dir=run_dir,
+                        job_id=job_id,
+                        role=role,
+                        kind=job_info["kind"],
+                        lease_epoch=lease_epoch,
+                        phase="cancelled",
+                        cause=f"{reason}: owned unit cancelled; cancel_verified={info.get('verified')}",
+                        is_prelaunch_refusal=False,
+                    )
+                    rld.remove_role_custody(runs_dir, run_dir, job_id)
+                    return
+
+            stop_event.set()
+            out = run.outcome()
+            status, summary = out["hub_status"], out["summary"]
+            now = self.clock.time() if hasattr(self.clock, "time") else time.time()
+            if deadline_sec is not None and now > deadline_sec and status == "succeeded":
+                status, summary = "failed", "deadline_exceeded: job execution exceeded deadline_at"
+            if job_id in self._renewal_failures:
+                status = "failed"
+                summary = f"lease_renewal_failed: {self._renewal_failures.pop(job_id)}"
+            refs = out["evidence_refs"]
+            if status == "succeeded" and not refs:
+                refs = [str(run.first_action_file)]
+
+            self.client.finish_job(
+                self.base_url, job_id, job_token, lease_epoch,
+                status, summary, refs
+            )
+            rld.remove_role_custody(runs_dir, run_dir, job_id)
+        except Exception as e:
+            logger.error("Reattached job monitor failed for %s: %s", job_id, e)
+            write_role_uncertain_proof(
+                runs_dir=runs_dir,
+                run_dir=run_dir,
+                job_id=job_id,
+                role=role,
+                kind=job_info["kind"],
+                lease_epoch=lease_epoch,
+                phase="monitor_error",
+                cause=str(e),
+                is_prelaunch_refusal=False,
+                exc=e,
+            )
+            rld.remove_role_custody(runs_dir, run_dir, job_id)
+        finally:
+            stop_event.set()
+            if renew_thread is not None and renew_thread.is_alive():
+                renew_thread.join(timeout=2.0)
+            with self._lock:
+                self.running_jobs.pop(job_id, None)
+
     def poll_and_dispatch_role_jobs(self) -> List[Dict[str, Any]]:
         """Poll for role job offers and dispatch any claimed jobs."""
+        recovered = self.recover_active_role_jobs()
+
         token = self.token_provider()
         if not token:
-            return []
+            return recovered
         try:
             offers = self.client.get_offers(self.base_url, self.host_id, token)
         except Exception as e:
             logger.warning("Failed to poll role job offers: %s", e)
-            return []
-        results = []
+            return recovered
+        results = list(recovered)
         for offer in offers:
             if not isinstance(offer, dict):
                 continue

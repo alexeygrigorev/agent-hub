@@ -427,6 +427,12 @@ class RuntimeManager:
             clock=getattr(self, "clock", time),
         )
 
+    @property
+    def role_runs_dir(self) -> pathlib.Path:
+        if self.role_adapter:
+            return self.role_adapter.role_runs_dir
+        return pathlib.Path(".local/runs/roles").resolve()
+
     def set_mock_runner(self, runner: Any) -> None:
         """Configure mock runner for test isolation."""
         self._mock_runner = runner
@@ -675,3 +681,28 @@ class RuntimeManager:
             )
 
         raise NotImplementedError("Real execution requires accepted launcher issue59 dependency packet.")
+
+    def reattach_role_run(
+        self,
+        job_id: str,
+        kind: str,
+        payload: Dict[str, Any],
+        job_token: str,
+        lease_epoch: int,
+        role_binding: Dict[str, Any],
+        hub_url: str,
+        host_id: str,
+    ) -> rld.RoleRun:
+        if kind not in rld.SUPPORTED_ROLE_PROFILES:
+            raise ValueError(f"unsupported_role_kind: {kind}")
+        return self.role_adapter.reattach(
+            job_id=job_id,
+            kind=kind,
+            payload=payload,
+            job_token=job_token,
+            lease_epoch=lease_epoch,
+            role_binding=role_binding,
+            hub_url=hub_url,
+            host_id=host_id,
+        )
+

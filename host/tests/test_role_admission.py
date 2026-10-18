@@ -151,6 +151,11 @@ class TestRoleJobAdmissionRepair(unittest.TestCase):
         )
 
     def tearDown(self):
+        for job_info in list(self.dispatcher.running_jobs.values()):
+            ev = job_info.get("stop_event")
+            if ev and hasattr(ev, "set"):
+                ev.set()
+        self.dispatcher.running_jobs.clear()
         self.tmp.cleanup()
 
     def _valid_binding(self, kind: str, generation: int = 2) -> dict:
@@ -172,7 +177,8 @@ class TestRoleJobAdmissionRepair(unittest.TestCase):
             "role_binding": self._valid_binding("principal-wake"),
         }
 
-        with patch("agent_hub_host.gate.get_gate_status") as mock_root_gate:
+        with patch("agent_hub_host.gate.get_gate_status") as mock_root_gate, \
+             patch.object(threading.Thread, "start"):
             res = self.dispatcher.handle_offer({
                 "id": "job-wake-001",
                 "kind": "principal-wake",
@@ -203,7 +209,8 @@ class TestRoleJobAdmissionRepair(unittest.TestCase):
                     "deadline_at": "2099-01-01T00:00:00Z",
                     "role_binding": binding,
                 }
-                with patch("agent_hub_host.gate.get_gate_status") as mock_gate:
+                with patch("agent_hub_host.gate.get_gate_status") as mock_gate, \
+                     patch.object(threading.Thread, "start"):
                     res = self.dispatcher.handle_offer({
                         "id": f"job-{kind}-01",
                         "kind": kind,

@@ -302,6 +302,72 @@ def safe_read_bounded_json(
         return None, None, None
 
 
+def save_role_custody(
+    runs_dir: pathlib.Path | str,
+    run_dir: pathlib.Path | str,
+    job_id: str,
+    data: Dict[str, Any],
+) -> pathlib.Path:
+    """Save durable private custody file for an active role run. Mode 0o600."""
+    runs_d = pathlib.Path(runs_dir)
+    run_d = pathlib.Path(run_dir)
+    ensure_private_dir(runs_d)
+    ensure_private_dir(run_d)
+
+    custody_file = run_d / f"custody-{job_id}.json"
+    index_file = runs_d / f"active-role-{job_id}.json"
+
+    write_private_json(custody_file, data)
+    try:
+        write_private_json(index_file, data)
+    except Exception as e:
+        logger.warning("Failed to write index custody file: %s", e)
+
+    return custody_file
+
+
+def update_role_custody(
+    runs_dir: pathlib.Path | str,
+    run_dir: pathlib.Path | str,
+    job_id: str,
+    updates: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Update fields in the durable private custody file atomically."""
+    run_d = pathlib.Path(run_dir)
+    custody_file = run_d / f"custody-{job_id}.json"
+    existing, _, _ = safe_read_bounded_json(custody_file)
+    if not existing or not isinstance(existing, dict):
+        existing = {}
+    existing.update(updates)
+    existing["updated_at"] = time.time()
+    save_role_custody(runs_dir, run_dir, job_id, existing)
+    return existing
+
+
+def remove_role_custody(
+    runs_dir: pathlib.Path | str,
+    run_dir: pathlib.Path | str,
+    job_id: str,
+) -> None:
+    """Remove active role custody record after terminal resolution."""
+    runs_d = pathlib.Path(runs_dir)
+    run_d = pathlib.Path(run_dir)
+
+    index_file = runs_d / f"active-role-{job_id}.json"
+    if index_file.exists():
+        try:
+            index_file.unlink()
+        except OSError:
+            pass
+
+    custody_file = run_d / f"custody-{job_id}.json"
+    if custody_file.exists():
+        try:
+            custody_file.unlink()
+        except OSError:
+            pass
+
+
 def validate_entrypoint(script_path: str | os.PathLike) -> pathlib.Path:
     raw = expand_trusted_path(script_path)
     if not raw.startswith("/"):
@@ -1299,6 +1365,7 @@ class RoleRun:
         launcher_backend: Optional[LauncherBackend] = None,
         launcher_executor: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         clock: Optional[Any] = None,
+        reattach: bool = False,
     ):
         self.job_id = job_id
         self.job_token = job_token
@@ -1349,7 +1416,8 @@ class RoleRun:
         self.job_tmp_dir = ensure_workspace_tmp_dir(self.task_workspace, self.task_id)
 
         self._thread: Optional[threading.Thread] = None
-        self._started = False
+        self.reattach = bool(reattach)
+        self._started = self.reattach
         self._cancelled = False
         self._cancel_count = 0
         self._cancel_reason: Optional[str] = None
@@ -1358,6 +1426,16 @@ class RoleRun:
         self._exec_exception: Optional[Exception] = None
         self._prelaunch_refusal = False
         self._prelaunch_reason: Optional[str] = None
+
+        if self.reattach:
+            binding = self.corroborate_maintained_binding()
+            if binding:
+                self.native_session = binding["session_id"]
+                self.native_tag = binding["tag"]
+                self.native_workspace = binding["workspace"]
+                self.native_engine = binding["engine"]
+                self.created_at_ms = binding["created_at_ms"]
+                self.native_incarnation = binding["created_at_ms"]
 
     def _current_time(self) -> float:
         if hasattr(self.clock, "time") and callable(self.clock.time):
@@ -1472,6 +1550,9 @@ class RoleRun:
 
     def start(self) -> None:
         """Launch role execution through maintained Launcher CLI."""
+        if getattr(self, "reattach", False):
+            return
+
         # Durable conflict detection: pre-existing evidence is NEVER unlinked
         if self.first_action_file.exists() or self.dispatcher_first_action_file.exists():
             raise DispatchError(f"pre_existing_evidence_conflict: first-action evidence already exists for {self.job_id}")
@@ -1803,9 +1884,13 @@ class RoleRun:
         """
         # Injected executor path (unit tests)
         if self.launcher_executor is not None:
+            if self.outcome_file.exists():
+                return True
             if self._thread is not None:
                 self._thread.join(timeout=timeout)
                 return not self._thread.is_alive()
+            if getattr(self, "reattach", False):
+                return self.outcome_file.exists()
             return True
 
         # Definite prelaunch refusal path
@@ -2042,6 +2127,10 @@ class RoleDispatchAdapter:
         )
         self.launcher_executor = launcher_executor
 
+    @property
+    def role_runs_dir(self) -> pathlib.Path:
+        return self.config.runs_dir
+
     def _current_time(self) -> float:
         if hasattr(self.clock, "time") and callable(self.clock.time):
             return self.clock.time()
@@ -2096,6 +2185,34 @@ class RoleDispatchAdapter:
             clock=self.clock,
         )
         run.start()
+        return run
+
+    def reattach(
+        self,
+        job_id: str,
+        kind: str,
+        payload: Dict[str, Any],
+        job_token: str,
+        lease_epoch: int,
+        role_binding: Dict[str, Any],
+        hub_url: str,
+        host_id: str,
+    ) -> RoleRun:
+        run = RoleRun(
+            job_id=job_id,
+            job_token=job_token,
+            lease_epoch=lease_epoch,
+            role_binding=role_binding,
+            kind=kind,
+            payload=payload,
+            hub_url=hub_url,
+            host_id=host_id,
+            config=self.config,
+            launcher_backend=self.launcher_backend,
+            launcher_executor=self.launcher_executor,
+            clock=self.clock,
+            reattach=True,
+        )
         return run
 
     def dispatch(
