@@ -444,6 +444,33 @@ class JobDispatcher:
                 gate_status["native_root_supported"] = True
             elif kind in SUPPORTED_ROLE_PROFILES:
                 gate_status["profile_supported"] = True
+        elif kind in SUPPORTED_ROLE_PROFILES:
+            # Genuine role admission: evaluate fresh role qualification without Root-only Codex gate
+            op_qualified = bool(
+                isinstance(report, dict)
+                and report.get("supported") is True
+                and report.get("operational_qualified") is True
+                and not report.get("is_fixture_only", False)
+            )
+            if op_qualified:
+                gate_status = {
+                    "launch_allowed": True,
+                    "reason": "role_qualified",
+                    "profile_supported": True,
+                    "role": kind,
+                    "chosen": report.get("chosen"),
+                }
+            else:
+                skip_reason = (
+                    f"role_unqualified: fixture_only_qualification_rejected: {kind}"
+                    if report.get("is_fixture_only")
+                    else f"role_unqualified: operational_qualification_required: {kind}"
+                )
+                try:
+                    self.client.decline_job(self.base_url, job_id, self.host_id, token, skip_reason)
+                except Exception:
+                    pass
+                return {"accepted": False, "reason": skip_reason, "qualification": report}
         else:
             from . import gate
             gate._gate_cache = None
@@ -453,8 +480,6 @@ class JobDispatcher:
             if kind == "root-run":
                 gate_status["profile_supported"] = bool(report.get("root_profile_supported", False))
                 gate_status["native_root_supported"] = bool(report.get("operational_qualified", False))
-            elif kind in SUPPORTED_ROLE_PROFILES:
-                gate_status["profile_supported"] = bool(report.get("role_profile_supported", False))
             if not gate_status.get("launch_allowed", False):
                 reason = f"gate_refused: {gate_status.get('reason', 'gate not allowed')}"
                 try:

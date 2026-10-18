@@ -401,7 +401,7 @@ class RuntimeManager:
         self._role_config: rld.TrustedRoleConfig = role_config if role_config is not None else rld.TrustedRoleConfig.disabled()
         self.role_adapter = rld.RoleDispatchAdapter(
             config=self._role_config,
-            quota_checker=self.check_codex_window,
+            quota_checker=self._adapter_kwargs.get("role_quota_checker"),
             launcher_backend=self._adapter_kwargs.get("role_launcher_backend"),
             launcher_executor=self._adapter_kwargs.get("role_launcher_executor"),
         )
@@ -415,7 +415,7 @@ class RuntimeManager:
         self._role_config = new_cfg if new_cfg is not None else rld.TrustedRoleConfig.disabled()
         self.role_adapter = rld.RoleDispatchAdapter(
             config=self._role_config,
-            quota_checker=self.check_codex_window,
+            quota_checker=self._adapter_kwargs.get("role_quota_checker"),
             launcher_backend=self._adapter_kwargs.get("role_launcher_backend"),
             launcher_executor=self._adapter_kwargs.get("role_launcher_executor"),
         )

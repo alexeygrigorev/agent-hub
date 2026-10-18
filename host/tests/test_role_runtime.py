@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from agent_hub_host import fleet, session_host
+from agent_hub_host.guarded_root import GuardedRootBridge
 from agent_hub_host.jobs import JobDispatcher, JobsClient, SUPPORTED_ROLE_PROFILES
 from agent_hub_host.role_dispatch import (
     DispatchError,
@@ -310,6 +311,14 @@ class TestRoleLifecycleAndFaults(unittest.TestCase):
         )
         self.quota_gate.chmod(0o700)
 
+        self.launcher_pkg = self.base / "launcher"
+        self.launcher_pkg.mkdir(parents=True, exist_ok=True)
+        (self.launcher_pkg / "__init__.py").write_text("", encoding="utf-8")
+        (self.launcher_pkg / "__main__.py").write_text(
+            'import json, sys; json.dump({"mode": "dry-run", "chosen": {"provider": "synthetic", "model": "synth-1"}}, sys.stdout)\n',
+            encoding="utf-8",
+        )
+
         self.role_cfg = TrustedRoleConfig.build(
             enabled=True,
             profiles={
@@ -448,14 +457,23 @@ class TestRoleLifecycleAndFaults(unittest.TestCase):
             "deadline_at": "2099-01-01T00:00:00Z",
             "role_binding": {**self.binding, "generation": 99},
         }
-        # The synthetic backend paths above are explicit and machine-independent.
-        with patch("agent_hub_host.gate.get_gate_status", return_value={"launch_allowed": True, "profile_supported": True}):
-            result = self.dispatcher.handle_offer({
-                "id": "job-gen-mismatch",
-                "kind": "writer-run",
-                "payload": {"date": "2026-10-17"},
-                "role_binding": self.binding,
-            })
+        # Explicit fixture RuntimeManager with qualified mock runner and noncanonical bridge
+        rt = RuntimeManager(role_config=self.role_cfg, allow_mock_runner=True)
+        rt.set_mock_runner(lambda *a, **kw: {"status": "succeeded"})
+        disp = JobDispatcher(
+            base_url="https://hub.example.com",
+            host_id="host-test",
+            token_provider=lambda: "test-token",
+            client=self.client,
+            runtime_mgr=rt,
+            root_bridge=GuardedRootBridge(state_dir=str(self.state_dir)),
+        )
+        result = disp.handle_offer({
+            "id": "job-gen-mismatch",
+            "kind": "writer-run",
+            "payload": {"date": "2026-10-17"},
+            "role_binding": self.binding,
+        })
         self.assertFalse(result["accepted"])
         self.assertIn("binding changed", result["reason"])
         self.client.claim_job.assert_called_once()

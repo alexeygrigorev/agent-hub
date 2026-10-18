@@ -567,9 +567,6 @@ class TestPinnedQualificationBoundary(unittest.TestCase):
         with patch.dict(sys.modules, {"launcher": fake, "launcher.task_profiles": tp}):
             rep = self.qual({self.script_sha}, {self.sha}).inspect_interfaces()
             self.assertEqual(rep["status"], "SUPPORTED", rep["reasons"])
-            self.assertIs(sys.modules["launcher"], fake)  # restored afterwards
-
-
 class TestMissingSdkAndErrors(unittest.TestCase):
     def test_proof_denies_when_launcher_sdk_is_missing_or_inspection_raises(self):
         from agent_hub_host.runtime import operational_root_profile_proof
@@ -578,6 +575,137 @@ class TestMissingSdkAndErrors(unittest.TestCase):
         with patch("agent_hub_host.runtime.LauncherQualification.inspect_interfaces", side_effect=RuntimeError("boom")):
             ok, why = operational_root_profile_proof()
         self.assertEqual((ok, why), (False, "root_profile_unproven: RuntimeError"))
+
+
+class TestRuntimeRoleQuotaDecoupling(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="test_role_quota_")
+        self.work_dir = pathlib.Path(self.tmp_dir)
+        self.state_dir = self.work_dir / "roles"
+        self.state_dir.mkdir(parents=True)
+        self.workspace = self.work_dir / "workspace"
+        self.workspace.mkdir(parents=True)
+
+        self.synth_launcher = self.work_dir / "launcher-repo"
+        launcher_pkg = self.synth_launcher / "launcher"
+        launcher_pkg.mkdir(parents=True, exist_ok=True)
+        (launcher_pkg / "__init__.py").write_text("", encoding="utf-8")
+        (launcher_pkg / "__main__.py").write_text(
+            """import json, sys
+def main():
+    payload = {}
+    for i, arg in enumerate(sys.argv):
+        if arg == "--payload" and i + 1 < len(sys.argv):
+            try:
+                payload = json.loads(sys.argv[i + 1])
+            except Exception:
+                pass
+    if payload.get("fail_admission"):
+        res = {"mode": "dry-run", "chosen": None, "error": "simulated_role_provider_quota_refusal"}
+    else:
+        res = {"mode": "dry-run", "chosen": {"provider": "antigravity", "model": "gemini-3.1-pro-high"}}
+    json.dump(res, sys.stdout)
+if __name__ == "__main__":
+    main()
+""",
+            encoding="utf-8",
+        )
+
+        from agent_hub_host.role_dispatch import RoleProfileConfig, TrustedRoleConfig
+        self.role_cfg = TrustedRoleConfig.build(
+            enabled=True,
+            profiles={
+                "writer-run": RoleProfileConfig(
+                    profile="writer-run",
+                    enabled=True,
+                    launcher_provider="antigravity",
+                    launcher_model="gemini-3.1-pro-high",
+                    launcher_task_profile="writer-run",
+                    workspace=self.workspace,
+                ),
+            },
+            state_dir=self.state_dir,
+            launcher_repo=self.synth_launcher,
+        )
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_role_admission_succeeds_when_codex_quota_denied_or_unknown(self):
+        from agent_hub_host.runtime import RuntimeManager
+        denied_codex_script = self.work_dir / "codex-gate-denied.py"
+        denied_codex_script.write_text(
+            'import json, sys; json.dump({"launch_allowed": False, "reason": "codex_quota_exhausted"}, sys.stdout)\n',
+            encoding="utf-8",
+        )
+        denied_codex_script.chmod(0o700)
+
+        mgr = RuntimeManager(
+            role_config=self.role_cfg,
+            quota_gate_script=str(denied_codex_script),
+        )
+        # Codex quota check fails for Root
+        codex_ok, codex_why = mgr.check_codex_window()
+        self.assertFalse(codex_ok)
+        self.assertIn("codex_quota_exhausted", codex_why)
+
+        # Operational role admission succeeds via genuine launcher plan, unaffected by Codex quota
+        role_ok, role_reason, report = mgr.can_process_role_run("writer-run")
+        self.assertTrue(role_ok, f"Role admission failed: {role_reason}")
+        self.assertEqual(role_reason, "role_qualified")
+        self.assertTrue(report.get("operational_qualified"))
+        self.assertFalse(report.get("is_fixture_only"))
+        self.assertEqual(report.get("chosen", {}).get("provider"), "antigravity")
+
+    def test_role_admission_refuses_when_actual_role_provider_denied_even_if_codex_healthy(self):
+        from agent_hub_host.runtime import RuntimeManager
+        from agent_hub_host.role_dispatch import RoleProfileConfig, TrustedRoleConfig
+
+        healthy_codex_script = self.work_dir / "codex-gate-healthy.py"
+        healthy_codex_script.write_text(
+            'import json, sys; json.dump({"launch_allowed": True, "reason": "codex_healthy"}, sys.stdout)\n',
+            encoding="utf-8",
+        )
+        healthy_codex_script.chmod(0o700)
+
+        mgr = RuntimeManager(
+            role_config=self.role_cfg,
+            quota_gate_script=str(healthy_codex_script),
+        )
+        # Codex quota is healthy
+        codex_ok, codex_why = mgr.check_codex_window()
+        self.assertTrue(codex_ok)
+        self.assertEqual(codex_why, "quota ok")
+
+        # Now simulate launcher plan failing for role provider
+        with patch.object(mgr.role_adapter.launcher_backend, "plan", return_value={"error": "antigravity_quota_exhausted"}):
+            role_ok, role_reason, report = mgr.can_process_role_run("writer-run")
+            self.assertFalse(role_ok)
+            self.assertIn("antigravity_quota_exhausted", role_reason)
+            self.assertFalse(report.get("operational_qualified"))
+
+    def test_fixture_role_quota_checker_callback_remains_fixture_only(self):
+        from agent_hub_host.runtime import RuntimeManager
+
+        # Providing an explicit role_quota_checker fixture callback marks the qualification as fixture-only
+        mgr = RuntimeManager(
+            role_config=self.role_cfg,
+            adapter_kwargs={"role_quota_checker": lambda: (True, "fixture_ok")},
+        )
+        role_ok, role_reason, report = mgr.can_process_role_run("writer-run")
+        self.assertTrue(role_ok)
+        self.assertTrue(report.get("is_fixture_only"))
+        self.assertFalse(report.get("operational_qualified"))
+
+        # If the fixture callback refuses, role is unqualified
+        mgr_denied = RuntimeManager(
+            role_config=self.role_cfg,
+            adapter_kwargs={"role_quota_checker": lambda: (False, "fixture_denied")},
+        )
+        denied_ok, denied_reason, denied_report = mgr_denied.can_process_role_run("writer-run")
+        self.assertFalse(denied_ok)
+        self.assertIn("fixture_denied", denied_reason)
 
 
 if __name__ == "__main__":

@@ -1701,5 +1701,188 @@ class TestRoleRealBackendAdapter(unittest.TestCase):
             proc.wait()
 
 
+class TestRoleQualificationProvenance(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=str(pathlib.Path(".local/tmp").resolve()))
+        self.base = pathlib.Path(self.tmp.name)
+        self.state_dir = self.base / "roles"
+        self.state_dir.mkdir(parents=True)
+        self.workspace = self.base / "workspace"
+        self.workspace.mkdir(parents=True)
+        self.launcher_repo = self.base / "launcher-repo"
+        (self.launcher_repo / "launcher").mkdir(parents=True)
+        (self.launcher_repo / "launcher" / "__init__.py").write_text("", encoding="utf-8")
+
+        self.role_cfg = TrustedRoleConfig.build(
+            enabled=True,
+            profiles={
+                "writer-run": RoleProfileConfig(
+                    profile="writer-run",
+                    enabled=True,
+                    workspace=self.workspace,
+                    launcher_provider="antigravity",
+                    launcher_model="gemini-3.1-pro-high",
+                    launcher_task_profile="model-task",
+                ),
+            },
+            state_dir=self.state_dir,
+            launcher_repo=self.launcher_repo,
+            allowed_workspaces=[self.workspace],
+            allowed_models=["gemini-3.1-pro-high"],
+            allowed_accounts=["antigravity"],
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_bare_injected_quota_checker_without_launcher_plan_is_fixture_only(self):
+        empty_repo = self.base / "empty-repo"
+        empty_repo.mkdir()
+        cfg = TrustedRoleConfig.build(
+            enabled=True,
+            profiles={
+                "writer-run": RoleProfileConfig(
+                    profile="writer-run",
+                    enabled=True,
+                    workspace=self.workspace,
+                    launcher_provider="antigravity",
+                ),
+            },
+            state_dir=self.state_dir,
+            launcher_repo=empty_repo,
+        )
+        qual = RoleQualification(
+            config=cfg,
+            quota_checker=lambda: (True, "ok"),
+        )
+        rep = qual.inspect_profile("writer-run")
+        self.assertTrue(rep["supported"])
+        self.assertTrue(rep["is_fixture_only"])
+        self.assertFalse(rep["operational_qualified"])
+        self.assertFalse(rep["plan_ran"])
+
+    def test_mock_backend_is_fixture_only(self):
+        mock_backend = MagicMock(spec=LauncherBackend)
+        mock_backend.plan.return_value = {
+            "mode": "dry-run",
+            "chosen": "antigravity",
+            "eligible": [{"provider": "antigravity", "model": "gemini-3.1-pro-high"}],
+        }
+        qual = RoleQualification(
+            config=self.role_cfg,
+            backend=mock_backend,
+        )
+        rep = qual.inspect_profile("writer-run")
+        self.assertTrue(rep["supported"])
+        self.assertTrue(rep["is_fixture_only"])
+        self.assertFalse(rep["operational_qualified"])
+        self.assertTrue(rep["plan_admitted"])
+
+    def test_route_mismatch_rejected(self):
+        mock_backend = MagicMock(spec=LauncherBackend)
+        mock_backend.plan.return_value = {
+            "mode": "dry-run",
+            "chosen": {"provider": "zai", "model": "glm-4"},
+        }
+        qual = RoleQualification(
+            config=self.role_cfg,
+            backend=mock_backend,
+        )
+        rep = qual.inspect_profile("writer-run")
+        self.assertFalse(rep["supported"])
+        self.assertIn("route_mismatch", "; ".join(rep["reasons"]))
+
+    def test_model_mismatch_rejected(self):
+        mock_backend = MagicMock(spec=LauncherBackend)
+        mock_backend.plan.return_value = {
+            "mode": "dry-run",
+            "chosen": {"provider": "antigravity", "model": "wrong-model"},
+        }
+        qual = RoleQualification(
+            config=self.role_cfg,
+            backend=mock_backend,
+        )
+        rep = qual.inspect_profile("writer-run")
+        self.assertFalse(rep["supported"])
+        self.assertIn("model_mismatch", "; ".join(rep["reasons"]))
+
+    def test_malformed_chosen_route_rejected(self):
+        mock_backend = MagicMock(spec=LauncherBackend)
+        mock_backend.plan.return_value = {
+            "mode": "dry-run",
+            "chosen": 12345,
+        }
+        qual = RoleQualification(
+            config=self.role_cfg,
+            backend=mock_backend,
+        )
+        rep = qual.inspect_profile("writer-run")
+        self.assertFalse(rep["supported"])
+        self.assertIn("malformed_chosen_route", "; ".join(rep["reasons"]))
+
+    def test_plan_error_or_rejection_rejected(self):
+        mock_backend = MagicMock(spec=LauncherBackend)
+        mock_backend.plan.return_value = {
+            "mode": "dry-run",
+            "chosen": None,
+            "error": "all_models_over_quota",
+        }
+        qual = RoleQualification(
+            config=self.role_cfg,
+            backend=mock_backend,
+        )
+        rep = qual.inspect_profile("writer-run")
+        self.assertFalse(rep["supported"])
+        self.assertIn("all_models_over_quota", "; ".join(rep["reasons"]))
+
+    def test_adapter_injected_launcher_executor_is_fixture_only(self):
+        adapter = RoleDispatchAdapter(
+            config=self.role_cfg,
+            quota_checker=lambda: (True, "ok"),
+            launcher_executor=lambda p: {"status": "ok"},
+        )
+        ok, reason, rep = adapter.can_process("writer-run")
+        self.assertTrue(rep["is_fixture_only"])
+        self.assertFalse(rep["operational_qualified"])
+
+    def test_genuine_launcher_backend_plan_is_operational_qualified(self):
+        synth_repo = self.base / "synth-launcher"
+        (synth_repo / "launcher").mkdir(parents=True)
+        (synth_repo / "launcher" / "__init__.py").write_text("", encoding="utf-8")
+        main_py = (
+            "import json, sys\n"
+            "res = {'mode': 'dry-run', 'chosen': {'provider': 'antigravity', 'model': 'gemini-3.1-pro-high'}}\n"
+            "json.dump(res, sys.stdout)\n"
+        )
+        (synth_repo / "launcher" / "__main__.py").write_text(main_py, encoding="utf-8")
+
+        cfg = TrustedRoleConfig.build(
+            enabled=True,
+            profiles={
+                "writer-run": RoleProfileConfig(
+                    profile="writer-run",
+                    enabled=True,
+                    workspace=self.workspace,
+                    launcher_provider="antigravity",
+                    launcher_model="gemini-3.1-pro-high",
+                    launcher_task_profile="model-task",
+                ),
+            },
+            state_dir=self.state_dir,
+            launcher_repo=synth_repo,
+            allowed_workspaces=[self.workspace],
+            allowed_models=["gemini-3.1-pro-high"],
+            allowed_accounts=["antigravity"],
+        )
+        backend = LauncherBackend(launcher_repo=synth_repo, config_dir=self.state_dir)
+        qual = RoleQualification(config=cfg, backend=backend)
+        rep = qual.inspect_profile("writer-run")
+        self.assertTrue(rep["supported"])
+        self.assertTrue(rep["operational_qualified"])
+        self.assertFalse(rep["is_fixture_only"])
+        self.assertTrue(rep["plan_admitted"])
+        self.assertEqual(rep["chosen"], {"provider": "antigravity", "model": "gemini-3.1-pro-high"})
+
+
 if __name__ == "__main__":
     unittest.main()

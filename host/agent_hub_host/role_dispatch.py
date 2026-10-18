@@ -1020,7 +1020,16 @@ class RoleQualification:
 
         # Maintained plan admission check
         plan_ran = False
-        if self.backend and (self.config.launcher_repo / "launcher").is_dir():
+        plan_admitted = False
+        has_launcher_dir = (self.config.launcher_repo / "launcher").is_dir()
+        is_real_backend = (
+            self.backend is not None
+            and type(self.backend) is LauncherBackend
+            and not hasattr(self.backend, "_mock_return_value")
+            and not hasattr(self.backend, "assert_called")
+        )
+
+        if self.backend and has_launcher_dir:
             plan_payload = {
                 "goal": f"qualification probe for {kind}",
                 "owner": f"hub-role-{kind}",
@@ -1034,14 +1043,53 @@ class RoleQualification:
             }
             plan_res = self.backend.plan(plan_payload)
             plan_ran = True
-            if plan_res.get("chosen") is None or plan_res.get("error"):
-                why = plan_res.get("error") or str(plan_res.get("rejections", {}))
+            if not isinstance(plan_res, dict) or plan_res.get("chosen") is None or plan_res.get("error"):
+                why = plan_res.get("error") if isinstance(plan_res, dict) else "invalid_plan_response"
+                if isinstance(plan_res, dict) and not why:
+                    why = str(plan_res.get("rejections", {}))
                 report["reasons"].append(f"launcher_admission_refused: {why}")
                 return report
+
+            chosen = plan_res.get("chosen")
+            if isinstance(chosen, str):
+                chosen_provider = chosen
+                chosen_model = None
+            elif isinstance(chosen, dict):
+                chosen_provider = chosen.get("provider") or chosen.get("account")
+                chosen_model = chosen.get("model")
+            else:
+                report["reasons"].append("launcher_admission_refused: malformed_chosen_route")
+                return report
+
+            if chosen_provider != provider:
+                report["reasons"].append(
+                    f"launcher_admission_refused: route_mismatch: chosen provider {chosen_provider} != configured {provider}"
+                )
+                return report
+
+            if p_cfg.launcher_model and chosen_model and chosen_model != p_cfg.launcher_model:
+                report["reasons"].append(
+                    f"launcher_admission_refused: model_mismatch: chosen model {chosen_model} != configured {p_cfg.launcher_model}"
+                )
+                return report
+
+            plan_admitted = True
+            report["chosen"] = chosen
+
+        report["plan_ran"] = plan_ran
+        report["plan_admitted"] = plan_admitted
 
         if not has_quota_evidence and not plan_ran:
             report["reasons"].append("no_provider_qualification_available: quota_checker or launcher plan required")
             return report
+
+        # Operational qualification requires a genuine LauncherBackend plan from an installed launcher repo
+        if plan_admitted and is_real_backend and has_launcher_dir and self.quota_checker is None:
+            report["operational_qualified"] = True
+            report["is_fixture_only"] = False
+        else:
+            report["operational_qualified"] = False
+            report["is_fixture_only"] = True
 
         report["supported"] = True
         return report
@@ -1902,6 +1950,9 @@ class RoleDispatchAdapter:
 
     def can_process(self, kind: str) -> Tuple[bool, str, Dict[str, Any]]:
         report = self.qualification.inspect_profile(kind)
+        if self.launcher_executor is not None:
+            report["is_fixture_only"] = True
+            report["operational_qualified"] = False
         if report["supported"]:
             return True, "role_qualified", report
         reasons = "; ".join(report.get("reasons", [])) or "unsupported"
