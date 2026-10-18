@@ -797,6 +797,18 @@ class FleetTests(unittest.TestCase):
     @unittest.skipUnless(os.path.isdir("/home/alexey/git/agent-quota-launcher/launcher"), "agent-quota-launcher checkout not available")
     def test_isolated_launcher_store_and_reconcile_contract_with_result_path(self):
         import sys
+        # Keep the optional checkout and its top-level `tests` package out of
+        # the host suite's interpreter. Only this real contract runs in the child.
+        if os.environ.get("HUB_TEST_LAUNCHER_CONTRACT_CHILD") != "1":
+            import subprocess
+            env = dict(os.environ, HUB_TEST_LAUNCHER_CONTRACT_CHILD="1")
+            child = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()),
+                 "FleetTests.test_isolated_launcher_store_and_reconcile_contract_with_result_path"],
+                env=env, capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
+            return
         launcher_repo = Path("/home/alexey/git/agent-quota-launcher")
         if not (launcher_repo / "launcher" / "store.py").is_file():
             self.skipTest("Optional Launcher checkout is unavailable")
