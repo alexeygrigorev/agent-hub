@@ -1266,9 +1266,14 @@ class TestRoleDispatchRecovery(unittest.TestCase):
         complete = {"id": job_id, "kind": "writer-run", "holder_host_id": host_id,
                     "lease_epoch": 1, "status": "fenced"}
         for field, value in (("kind", None), ("holder_host_id", None),
-                             ("lease_epoch", None), ("lease_epoch", True), ("lease_epoch", 0)):
+                             ("lease_epoch", None), ("lease_epoch", True), ("lease_epoch", 0),
+                             ("status", "unknown")):
             with self.subTest(field=field, value=value):
                 client.get_job_status = MagicMock(return_value={"job": {**complete, field: value}})
+                client.renew_job = MagicMock(return_value={
+                    "error": "deadline_exceeded" if field == "status" else "unauthorized",
+                    "status_code": 401,
+                })
                 with patch.object(d, "_corroborate_native_target") as corroborate, \
                      patch.object(d, "_stop_native_target_safely") as stop:
                     result = d._recover_one_role_job(custody, runs_dir)

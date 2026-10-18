@@ -1750,7 +1750,7 @@ class JobDispatcher:
             # Confirmed fenced/cancelled/expired or provably stale lease
             server_epoch = server_job.get("lease_epoch")
             is_stale_epoch = server_epoch > lease_epoch
-            is_deadline_exceeded = (server_status == "deadline_exceeded" or renew_err == "deadline_exceeded")
+            is_deadline_exceeded = server_status in ("expired", "deadline_exceeded")
             is_fenced_or_dead = (
                 server_status in ("fenced", "cancelled", "expired")
                 or is_stale_epoch
