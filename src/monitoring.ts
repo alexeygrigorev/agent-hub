@@ -391,10 +391,10 @@ export class MonitoringService {
       if (!Number.isSafeInteger(total) || total < 0) fail('invalid_total_bytes');
       if (!Number.isSafeInteger(used) || used < 0) fail('invalid_used_bytes');
       if (!Number.isSafeInteger(free) || free < 0) fail('invalid_free_bytes');
-
-      let percent = typeof raw.percent === 'number' ? raw.percent : total > 0 ? (used / total) * 100 : 0;
+      const totalForPct = used + free;
+      let percent = typeof raw.percent === 'number' ? raw.percent : totalForPct > 0 ? (used / totalForPct) * 100 : 0;
       if (!Number.isFinite(percent) || percent < 0 || percent > 100) fail('invalid_percent');
-      percent = Math.round(percent * 10) / 10;
+      percent = Math.min(100, Math.max(0, Math.round(percent * 10) / 10));
 
       // Status derived from threshold: >=95% critical, >=85% warn, else ok; error if error reported
       let computedStatus: 'ok' | 'warn' | 'critical' | 'error' = 'ok';
@@ -887,17 +887,30 @@ export class MonitoringService {
         } catch {}
       }
 
-      if (samples.length < 2) {
+      // Clip one-off drops (e.g. cleanup drops):
+      // Locate the latest drop where used_bytes decreased.
+      // Measurements prior to a cleanup drop belong to the pre-cleanup regime
+      // and cannot be used to extrapolate future growth.
+      let lastDropIdx = -1;
+      for (let i = 1; i < samples.length; i++) {
+        if (samples[i].usedBytes < samples[i - 1].usedBytes) {
+          lastDropIdx = i;
+        }
+      }
+
+      const effectiveSamples = lastDropIdx >= 0 ? samples.slice(lastDropIdx) : samples;
+
+      if (effectiveSamples.length < 2) {
         return {
           state: 'insufficient_history',
           growth_bytes_per_day: null,
           growth_pct_per_day: null,
-          reason: 'insufficient_samples',
+          reason: lastDropIdx >= 0 ? 'insufficient_history_after_drop' : 'insufficient_samples',
         };
       }
 
-      const oldest = samples[0];
-      const latest = samples[samples.length - 1];
+      const oldest = effectiveSamples[0];
+      const latest = effectiveSamples[effectiveSamples.length - 1];
       const spanMs = latest.timeMs - oldest.timeMs;
 
       if (spanMs < DISK_LIMITS.minTrendWindowMs) {
@@ -922,11 +935,20 @@ export class MonitoringService {
       const deltaBytes = latest.usedBytes - oldest.usedBytes;
       const deltaPct = latest.percent - oldest.percent;
 
+      if (deltaBytes < 0) {
+        return {
+          state: 'insufficient_history',
+          growth_bytes_per_day: null,
+          growth_pct_per_day: null,
+          reason: 'negative_trend_after_drop',
+        };
+      }
+
       return {
         state: 'calculated',
         growth_bytes_per_day: Math.round(deltaBytes / days),
         growth_pct_per_day: Math.round((deltaPct / days) * 100) / 100,
-        sample_count: samples.length,
+        sample_count: effectiveSamples.length,
         window_hours: Math.round((spanMs / 3600000) * 10) / 10,
       };
     } catch {

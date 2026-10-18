@@ -338,6 +338,102 @@ describe('Disk Monitoring Service', () => {
     expect(fs.trend.growth_bytes_per_day).toBeNull();
   }));
 
+  it('computes percent like df using used/(used+avail) when percent omitted', () => fixture(async (hub, clock) => {
+    enrollHost(hub.sql, 'host-a');
+    const auth = { kind: 'host' as const, machine_id: 'host-a', tokenId: 'cred-host-a' };
+    // 100 GB total, 80 GB used, 15 GB avail (5 GB reserved for root).
+    // Like df: used / (used + avail) = 80 / 95 = 84.2%, NOT used / total (80%).
+    const req = new Request('https://hub.internal/api/monitoring/disk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: 'host-a',
+        observed_at: new Date(clock.t).toISOString(),
+        filesystems: [
+          {
+            mount_point: '/',
+            device_id: 'dev-root',
+            is_primary: true,
+            total_bytes: 100 * 1024 * 1024 * 1024,
+            used_bytes: 80 * 1024 * 1024 * 1024,
+            free_bytes: 15 * 1024 * 1024 * 1024, // avail
+          },
+        ],
+      }),
+    });
+    const res = await hub.monitoringService.handleObservation(req, auth);
+    expect(res.status).toBe(200);
+    const status = hub.monitoringService.getDiskStatus(clock.t);
+    expect(status.machines[0].filesystems[0].percent).toBe(84.2);
+  }));
+
+  it('clips one-off cleanup drops and reports insufficient_history instead of bogus negative trend', () => fixture(async (hub, clock) => {
+    enrollHost(hub.sql, 'host-a');
+    const auth = { kind: 'host' as const, machine_id: 'host-a', tokenId: 'cred-host-a' };
+    const totalBytes = 1000 * 1024 * 1024 * 1024; // 1000 GB
+
+    const postSample = async (usedGB: number) => {
+      const usedBytes = usedGB * 1024 * 1024 * 1024;
+      const freeBytes = totalBytes - usedBytes;
+      const percent = Math.round((usedBytes / totalBytes) * 1000) / 10;
+      const req = new Request('https://hub.internal/api/monitoring/disk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          machine_id: 'host-a',
+          observed_at: new Date(clock.t).toISOString(),
+          filesystems: [
+            {
+              mount_point: '/data',
+              device_id: 'dev-data',
+              is_primary: true,
+              total_bytes: totalBytes,
+              used_bytes: usedBytes,
+              free_bytes: freeBytes,
+              percent,
+              status: 'ok',
+            },
+          ],
+        }),
+      });
+      return hub.monitoringService.handleObservation(req, auth);
+    };
+
+    // Initial reading: 1000 GB used
+    await postSample(1000);
+
+    // 1 hour later: cleanup dropped usage from 1000 GB to 960 GB (-40 GB drop)
+    clock.t += 3600 * 1000;
+    await postSample(960);
+
+    // Should NOT report -960 GB/day or -972.7 GB/day; must report insufficient_history honestly!
+    let status = hub.monitoringService.getDiskStatus(clock.t);
+    let fs = status.machines[0].filesystems[0];
+    expect(fs.trend.state).toBe('insufficient_history');
+    expect(fs.trend.growth_bytes_per_day).toBeNull();
+
+    // 30 minutes later: usage grows slightly from 960 GB to 960.5 GB (+0.5 GB in 30 min)
+    // Post-cleanup span is 30m (< 1h minimum window) -> still insufficient_history
+    clock.t += 1800 * 1000;
+    await postSample(960.5);
+    status = hub.monitoringService.getDiskStatus(clock.t);
+    fs = status.machines[0].filesystems[0];
+    expect(fs.trend.state).toBe('insufficient_history');
+    expect(fs.trend.growth_bytes_per_day).toBeNull();
+
+    // 1.5 hours later (2 hours after cleanup drop): usage reaches 962 GB (+2 GB in 2h = +24 GB/day)
+    // Post-cleanup span is 2h (>= 1h minimum window). The -40 GB cleanup drop is clipped out!
+    clock.t += 5400 * 1000;
+    await postSample(962);
+    status = hub.monitoringService.getDiskStatus(clock.t);
+    fs = status.machines[0].filesystems[0];
+    expect(fs.trend.state).toBe('calculated');
+    expect(fs.trend.growth_bytes_per_day).toBeGreaterThan(0);
+    // Calculated over post-drop window (2h): +2 GB / (2/24 days) = 24 GB/day
+    const expectedPerDay = Math.round((2 * 1024 * 1024 * 1024) / (2 / 24));
+    expect(fs.trend.growth_bytes_per_day).toBe(expectedPerDay);
+  }));
+
   it('projects disk monitoring and needs_attention into StatusService /api/status output', () => fixture(async (hub, clock) => {
     enrollHost(hub.sql, 'host-a');
     const auth = { kind: 'host' as const, machine_id: 'host-a', tokenId: 'cred-host-a' };

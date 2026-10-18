@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -76,6 +77,8 @@ def build(out_dir: Path, version: str):
     if not HOST_PKG.is_dir():
         raise SystemExit(f"Missing package dir {HOST_PKG}")
     out_dir.mkdir(parents=True, exist_ok=True)
+    sha = git_sha()
+    build_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     tmp_base = REPO / ".local" / "tmp"
     tmp_base.mkdir(parents=True, exist_ok=True)
     import tempfile
@@ -83,6 +86,10 @@ def build(out_dir: Path, version: str):
     try:
         pkg_dst = staging / "agent_hub_host"
         shutil.copytree(HOST_PKG, pkg_dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        (pkg_dst / "_build_info.py").write_text(
+            f'"""Build information stamped during zipapp creation."""\nBUILD_COMMIT = "{sha}"\nBUILD_DATE = "{build_date}"\n',
+            encoding="utf-8",
+        )
         (staging / "__main__.py").write_text(
             "from agent_hub_host.cli import main\nif __name__ == '__main__':\n    main()\n",
             encoding="utf-8",
@@ -137,7 +144,8 @@ def build(out_dir: Path, version: str):
                 "commit": SHARED_COMMIT,
                 "protocol": "POST /api/device/code + POST /api/device/token (hub paths)",
             },
-            "built_from_commit": git_sha(),
+            "built_from_commit": sha,
+            "build_date": build_date,
             "files": ["install.sh", "hub.pyz", "hub.pyz.sha256", "manifest.json"],
         }
         manifest_path = out_dir / "manifest.json"

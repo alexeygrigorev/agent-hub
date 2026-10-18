@@ -384,7 +384,8 @@ class DiskMonitor:
             total = getattr(vfs, "f_blocks", 0) * getattr(vfs, "f_frsize", 0)
             free = getattr(vfs, "f_bavail", 0) * getattr(vfs, "f_frsize", 0)
             used = max(0, total - (getattr(vfs, "f_bfree", 0) * getattr(vfs, "f_frsize", 0)))
-            percent = round((used / total) * 100.0, 1) if total > 0 else 0.0
+            denom = used + free
+            percent = min(100.0, max(0.0, round((used / denom) * 100.0, 1))) if denom > 0 else 0.0
 
             # Threshold check
             if percent >= cfg["critical_threshold_percent"]:

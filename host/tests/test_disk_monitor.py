@@ -280,6 +280,33 @@ class TestDiskMonitor(unittest.TestCase):
         self.assertEqual(tmp_fs["status"], "warn")
         self.assertEqual(tmp_fs["percent"], 88.0)
 
+    def test_percent_computed_like_df_with_reserved_blocks(self):
+        # 100 blocks total, 20 blocks free (5 reserved for root, 15 avail to user)
+        # used = 100 - 20 = 80 blocks.
+        # df computes: used / (used + avail) = 80 / (80 + 15) = 80 / 95 = 84.2%
+        # (while used / total would have reported 80.0%)
+        def mock_stat(path):
+            return SimpleNamespace(st_dev=100, st_size=4096)
+
+        def mock_statvfs(path):
+            return SimpleNamespace(f_frsize=4096, f_blocks=100, f_bfree=20, f_bavail=15)
+
+        monitor = disk_monitor.DiskMonitor(
+            config={
+                "enabled": True,
+                "machine_id": "test-box",
+                "mounts": ["/"],
+            },
+            stat_fn=mock_stat,
+            statvfs_fn=mock_statvfs,
+        )
+
+        cfg = monitor.load_active_config()
+        payload, errors = monitor.collect(cfg)
+        self.assertEqual(len(errors), 0)
+        fs = payload["filesystems"][0]
+        self.assertEqual(fs["percent"], 84.2)
+
     def test_step_rate_limiting_and_submit(self):
         submit_mock = MagicMock()
         mono_time = [100.0, 110.0, 200.0]

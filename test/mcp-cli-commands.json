@@ -72,5 +72,6 @@
   "submit",
   "subscriptions",
   "task-artifact",
-  "task-result"
+  "task-result",
+  "update"
 ]

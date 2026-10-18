@@ -6,20 +6,30 @@ no privileged install. Python >= 3.9 stdlib only.
 ## One-line install
 
 ```sh
-curl -fsSL https://agent-hub.cloudflare-ai-agent-de9ca0.workers.dev/cli/install.sh | sh
+curl -fsSL https://hub.dtcdev.click/cli/install.sh | sh
 ```
 
 - Installs user-local `$HOME/.local/bin/hub` (override with `HUB_INSTALL_DIR`
   for tests; must stay under `$HOME`, never global, never overwrites `aplexer`).
 - Verifies `python3 >= 3.9`, checks the `hub.pyz.sha256` manifest, fails
   atomically, prints `PATH` fixup when needed.
-- Base URL override: `HUB_BASE_URL=https://... sh` (default is baked to the
-  production Worker above).
+- Base URL override: `HUB_BASE_URL=https://... sh` (default is
+  `https://hub.dtcdev.click`).
+
+## Update
+
+```sh
+hub update [--check] [--force]
+```
+
+- Checks the server's published CLI manifest (`/cli/manifest.json`), compares the
+  build commit, verifies the SHA256 checksum, and atomically replaces the local binary.
+- Use `--check` to detect whether the local CLI is stale without downloading.
 
 ## Human device login
 
 ```sh
-hub auth login [--url https://agent-hub.cloudflare-ai-agent-de9ca0.workers.dev] [--label my-box]
+hub auth login [--url https://hub.dtcdev.click] [--label my-box]
 hub auth status [--json]
 hub auth logout
 ```

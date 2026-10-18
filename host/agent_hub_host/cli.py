@@ -1,6 +1,7 @@
 import argparse
-import sys
 import json
+import os
+import sys
 from . import auth, api, system, config
 
 try:
@@ -14,6 +15,147 @@ try:
     HUB_VERSION = _pkg_version
 except Exception:
     pass
+
+
+def get_build_info() -> dict:
+    try:
+        from . import _build_info
+        commit = getattr(_build_info, "BUILD_COMMIT", "dev")
+        date = getattr(_build_info, "BUILD_DATE", "dev")
+    except Exception:
+        commit = "dev"
+        date = "dev"
+    if commit == "dev":
+        try:
+            import subprocess
+            out = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=2,
+            )
+            sha = out.stdout.strip()
+            if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha):
+                commit = sha
+        except Exception:
+            pass
+    if date == "dev":
+        try:
+            from datetime import datetime, timezone
+            date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return {
+        "version": HUB_VERSION,
+        "commit": commit,
+        "build_date": date,
+    }
+
+
+def format_version() -> str:
+    info = get_build_info()
+    commit_str = info["commit"][:12] if info["commit"] != "dev" else "dev"
+    return f"{info['version']} ({commit_str}, {info['build_date']})"
+
+
+def cmd_update(args):
+    import hashlib
+    import urllib.request
+    from pathlib import Path
+
+    clean_base = (
+        getattr(args, "url", None)
+        or os.environ.get("HUB_URL")
+        or os.environ.get("HUB_BASE_URL")
+        or config.load_config().get("base_url")
+        or config.DEFAULT_BASE_URL
+    ).rstrip("/")
+    api.check_url(clean_base)
+    manifest_url = f"{clean_base}/cli/manifest.json"
+
+    try:
+        req = urllib.request.Request(manifest_url, headers={"User-Agent": "hub-cli"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status != 200:
+                print(f"Failed to fetch CLI manifest from {manifest_url} (HTTP {resp.status})", file=sys.stderr)
+                sys.exit(1)
+            manifest = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        print(f"Failed to check for updates from {manifest_url}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    curr_info = get_build_info()
+    curr_commit = curr_info.get("commit", "unknown")
+    server_commit = manifest.get("built_from_commit", "")
+    server_version = manifest.get("version", "0.1.0")
+    server_sha256 = manifest.get("sha256", "")
+
+    is_up_to_date = (
+        curr_commit != "dev"
+        and server_commit
+        and curr_commit.lower() == server_commit.lower()
+    )
+
+    if getattr(args, "check", False):
+        if is_up_to_date:
+            print(f"hub is up to date: {curr_info['version']} ({curr_commit[:12]})")
+            return
+        else:
+            print(f"Warning: hub CLI is stale! Current: {format_version()}, Server: {server_version} ({server_commit[:12]}). Run 'hub update' to update.")
+            return
+
+    if is_up_to_date and not getattr(args, "force", False):
+        print(f"hub is already up to date ({format_version()}). Use --force to reinstall.")
+        return
+
+    pyz_url = f"{clean_base}/cli/hub.pyz"
+    print(f"Downloading hub CLI from {pyz_url}...")
+    try:
+        req = urllib.request.Request(pyz_url, headers={"User-Agent": "hub-cli"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            if resp.status != 200:
+                print(f"Download failed: {pyz_url} returned HTTP {resp.status}", file=sys.stderr)
+                sys.exit(1)
+            data = resp.read()
+    except Exception as exc:
+        print(f"Download failed from {pyz_url}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if not data:
+        print("Downloaded file is empty", file=sys.stderr)
+        sys.exit(1)
+
+    actual_sha256 = hashlib.sha256(data).hexdigest()
+    if server_sha256 and actual_sha256.lower() != server_sha256.lower():
+        print(f"Checksum mismatch: expected {server_sha256}, got {actual_sha256}", file=sys.stderr)
+        sys.exit(1)
+
+    install_dir_arg = getattr(args, "install_dir", None)
+    if install_dir_arg:
+        install_dir = Path(install_dir_arg).expanduser()
+        target_path = install_dir / "hub"
+    else:
+        prog = Path(sys.argv[0]).resolve()
+        if prog.is_file() and prog.name == "hub" and os.access(prog.parent, os.W_OK):
+            target_path = prog
+            install_dir = prog.parent
+        else:
+            install_dir = Path.home() / ".local" / "bin"
+            target_path = install_dir / "hub"
+
+    install_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.parent / f".hub.tmp.{os.getpid()}"
+    try:
+        tmp_path.write_bytes(data)
+        os.chmod(tmp_path, 0o755)
+        os.replace(tmp_path, target_path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+    print(f"Updated hub at {target_path} to {server_version} ({server_commit[:12]})")
+
 
 
 def cmd_login(args):
@@ -195,8 +337,13 @@ def add_bridge_resume_command(sub):
 
 def main():
     parser = argparse.ArgumentParser(description="Agent Hub CLI")
-    parser.add_argument("--version", action="version", version=f"%(prog)s {HUB_VERSION}")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {format_version()}")
     sub = parser.add_subparsers(dest="cmd", required=True)
+    p_update = sub.add_parser("update", help="Update hub CLI to the latest deployed version or check staleness")
+    p_update.add_argument("--url", default=None, help="Hub base URL (default: loaded from config or https://hub.dtcdev.click)")
+    p_update.add_argument("--check", action="store_true", help="Check for updates without installing")
+    p_update.add_argument("--force", action="store_true", help="Force update/reinstall even if already at latest commit")
+    p_update.add_argument("--install-dir", default=None, help="Directory to install the updated hub binary (default: current executable location or ~/.local/bin)")
     from . import routing
     routing.add_commands(sub)
     from . import conversations
@@ -337,6 +484,9 @@ def main():
     p_bridge.add_argument("--service-session-id", default=None)
 
     args = parser.parse_args()
+    if args.cmd == 'update':
+        cmd_update(args)
+        return
     if args.cmd == 'bridge-resume':
         try:
             from .conversation_bridge import resume_from_args

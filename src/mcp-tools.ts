@@ -85,6 +85,7 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'conversations bridge': 'Local native conversation bridge, no second remote dispatcher.',
   'task-artifact': 'Local reviewed PNG upload can exceed the bounded MCP request size; use assigned-host hub task-artifact. Download is exposed as artifact.',
   'metrics post': 'Local dashboard report projection reads host files; hosts publish it and the metrics tool reads authorized reports.',
+  'update': 'Local-only CLI zipapp updater; downloads and verifies the current release for local installation.',
 };
 export function publicTools() {
   return routes.map(r => {
