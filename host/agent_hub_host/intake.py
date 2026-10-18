@@ -120,6 +120,12 @@ def add_commands(sub):
     for name in ('rules', 'grants'):
         command = commands.add_parser(name, help='Operator only: list or submit explicit JSON mutation')
         command.add_argument('--payload-file')
+    grantees = commands.add_parser('grantees', help='Operator only: discover active grantable agent credential metadata for an actor')
+    grantees.add_argument('--actor', required=True, help='Explicit canonical agent actor (e.g. project:tag or tag)')
+    grantees.add_argument('--family', help='Optional explicit family selection')
+    grantees.add_argument('--limit', type=int, default=25)
+    grantees.add_argument('--after')
+    grantees.add_argument('--revision', type=int)
     revoke = commands.add_parser('revoke', help='Operator only: revoke an intake grant, preserving its history')
     revoke.add_argument('id')
     revoke.add_argument('--payload-file', required=True)
@@ -206,6 +212,16 @@ def execute(args):
             if getattr(args, field) is not None:
                 params[field] = getattr(args, field)
         return request('GET', BASE + '/tasks?' + urlencode(params))
+    if command == 'grantees':
+        if not getattr(args, 'actor', None) or not args.actor.strip():
+            raise ValueError('Actor required')
+        params = {'actor': args.actor.strip(), 'limit': args.limit}
+        if getattr(args, 'family', None):
+            params['family_id'] = args.family.strip()
+        for field in ('after', 'revision'):
+            if getattr(args, field, None) is not None:
+                params[field] = getattr(args, field)
+        return request('GET', BASE + '/grantees?' + urlencode(params))
     if command in ('rules', 'grants'):
         return request('POST' if args.payload_file else 'GET', BASE + '/' + command,
                        json_file(args.payload_file) if args.payload_file else None)

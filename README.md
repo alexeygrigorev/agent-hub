@@ -155,7 +155,7 @@ Results contain the original API HTTP `status` and `data` as JSON text; API fail
 | `send/reply/inbox/show/ack/accept/complete` | `bus_send/reply/inbox/show/ack/accept/complete` |
 | `claim/claims/release` | `claims_create/list/release` |
 | `submit`, `routing-machines`, `model-policy`, `jobs/job/task-result/artifact` | `tasks_submit`, `routing_machines`, `model_policy`, `jobs_list/show`, `task_result`, `artifact` |
-| `intake create/list/show/history/links/context/continue/update/append/assign/rules/grants/revoke` | corresponding `intake_*` tools; `intake_rules_write` and `intake_grants_write` perform explicit operator mutations |
+| `intake create/list/show/history/links/context/continue/update/append/assign/rules/grants/grantees/revoke` | corresponding `intake_*` tools; `intake_rules_write` and `intake_grants_write` perform explicit operator mutations |
 | `handoff` | `handoff_page`: revision-pinned pages; follow `next` with the same `revision` and `authorization_valid_until`. A page is explicitly incomplete; the CLI's bounded full-snapshot aggregation is client-side. Restart the entire snapshot on HTTP 409. |
 | `conversations list/participants/create/get/members/history/send/read` | corresponding `conversations_*` tools; use `conversations_members_add/remove` for membership writes |
 | Conversation web actions | `conversations_archive/unarchive`, `conversations_links_search/links/link_show/link_create/link_remove`, `conversations_automation/automation_remove` |

@@ -103,6 +103,22 @@ class TestIntakeCli(unittest.TestCase):
         self.assertEqual(payload['session']['parent_id'], 'e3f61b6c-9fda-4bcc-bf3d-cf66cb7ef363')
         self.assertEqual(payload['session']['workspace'], 'demo')
 
+    def test_grantees_builds_operator_query_url(self):
+        with patch.object(intake, 'request', return_value={'items': []}) as transport:
+            code, out, error = self.run_cli('intake', 'grantees', '--actor', 'demo:assistant')
+            self.assertEqual(code, 0, error)
+            self.assertEqual(transport.call_args.args, ('GET', '/api/intake/grantees?actor=demo%3Aassistant&limit=25'))
+            self.assertEqual(json.loads(out), {'items': []})
+        with patch.object(intake, 'request', return_value={'items': []}) as transport:
+            code, out, error = self.run_cli('intake', 'grantees', '--actor', 'demo:assistant', '--family', 'fam-1',
+                                            '--limit', '10', '--after', 'cred-1', '--revision', '2')
+            self.assertEqual(code, 0, error)
+            self.assertEqual(transport.call_args.args, ('GET', '/api/intake/grantees?actor=demo%3Aassistant&limit=10&family_id=fam-1&after=cred-1&revision=2'))
+        with patch.object(intake, 'request') as transport:
+            code, _, _ = self.run_cli('intake', 'grantees')
+            self.assertEqual(code, 2)
+            transport.assert_not_called()
+
     def test_uncertainty_can_be_explicitly_cleared_with_cas(self):
         with patch.object(intake, 'request', return_value={}) as transport:
             code, _, error = self.run_cli('intake', 'update', 'task-1', '--version', '3', '--key', 'clear', '--clear', 'uncertainty')

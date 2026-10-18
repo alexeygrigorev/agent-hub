@@ -489,6 +489,183 @@ describe('private durable intake HTTP/SQLite', () => {
     await append(task.id, 1, { kind: 'note', text: 'Assistant follow-through', source }, a.token);
     await grant(a, 'all', null, 'read'); expect((await ok('/handoff', undefined, a.token)).total).toBe(2);
   });
+  it('discovers active grantees for operator and excludes revoked/expired/unbound credentials', async () => {
+    const a = await seedAgent('demo:assistant');
+    const b = await seedAgent('demo:assistant');
+    const c = await seedAgent('other:worker');
+
+    const res = await ok('/grantees?actor=demo:assistant');
+    expect(res.actor).toBe('demo:assistant');
+    expect(res.total).toBe(2);
+    expect(res.items.map((i: any) => i.credential_id).sort()).toEqual([a.id, b.id].sort());
+
+    const item = res.items[0];
+    expect(item).toHaveProperty('credential_id');
+    expect(item).toHaveProperty('actor', 'demo:assistant');
+    expect(item).toHaveProperty('family_id');
+    expect(item).toHaveProperty('project', 'demo');
+    expect(item).toHaveProperty('machine_id', 'fixture-host');
+    expect(item).toHaveProperty('scopes');
+    expect(item).toHaveProperty('created_at');
+    expect(item).toHaveProperty('expires_at');
+    expect(item).toHaveProperty('registered_at');
+    expect(item).toHaveProperty('incarnation');
+    expect(item).not.toHaveProperty('token_hash');
+    expect(item).not.toHaveProperty('refresh_hash');
+    expect(item).not.toHaveProperty('token');
+    expect(item).not.toHaveProperty('secret');
+
+    expect((await call('/grantees?actor=demo:assistant', undefined, a.token)).status).toBe(403);
+
+    const unauth = await SELF.fetch('https://hub.test/api/intake/grantees?actor=demo:assistant');
+    expect([401, 403]).toContain(unauth.status);
+
+    expect((await call('/grantees')).status).toBe(400);
+    expect((await call('/grantees?actor=')).status).toBe(400);
+    expect((await call('/grantees?actor=bad%20actor')).status).toBe(400);
+
+    await inDO(stub(), (h: any) => {
+      h.sql.exec("UPDATE credentials SET revoked_at='2026-01-01' WHERE id=?", b.id);
+    });
+    const afterRevoke = await ok('/grantees?actor=demo:assistant');
+    expect(afterRevoke.total).toBe(1);
+    expect(afterRevoke.items[0].credential_id).toBe(a.id);
+
+    await inDO(stub(), (h: any) => {
+      h.sql.exec("UPDATE credentials SET expires_at='2020-01-01' WHERE id=?", a.id);
+    });
+    const afterExpire = await ok('/grantees?actor=demo:assistant');
+    expect(afterExpire.total).toBe(0);
+    expect(afterExpire.items).toEqual([]);
+
+    const specialId = '_cred-special-' + ++seq;
+    await inDO(stub(), async (h: any) => {
+      const hash = await sha256('token-special');
+      const rh = await sha256('refresh-special');
+      h.sql.exec('INSERT INTO credentials(id,kind,token_hash,refresh_hash,family_id,subject,machine_id,actor,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+        specialId, 'agent', hash, rh, 'family-special', 'demo:assistant', 'fixture-host', 'demo:assistant', '["bus:read"]', 'fixture-operator', '2026-01-02T00:00:00.000Z', new Date(Date.now() + 86400000).toISOString());
+    });
+    const specialGrant = await ok('/grants', { key: 'grant-special', credential_id: specialId, scope: 'project', target: 'demo', access: 'read', expires_at: Date.now() + 3600000, source });
+    expect(specialGrant.grant.actor).toBe('demo:assistant');
+    const allGrants = await ok('/grants');
+    expect(allGrants.items.find((x: any) => x.id === specialGrant.grant.id).credential_id).toBe(specialId);
+  });
+  it('discovers active grantees for operator, ignoring expired-row noise', async () => {
+    const activeAgent = await seedAgent('demo:assistant', 'family-active');
+    await inDO(stub(), async (h: any) => {
+      for (let i = 0; i < 30; i++) {
+        const hash = await sha256('token-expired-' + i);
+        const rh = await sha256('refresh-expired-' + i);
+        h.sql.exec('INSERT INTO credentials(id,kind,token_hash,refresh_hash,family_id,subject,machine_id,actor,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+          'expired-cred-' + i, 'agent', hash, rh, 'family-expired-' + i, 'demo:assistant', 'fixture-host', 'demo:assistant', '["bus:read"]', 'fixture-operator',
+          '2026-01-10T00:00:00.000Z', '2020-01-01T00:00:00.000Z');
+      }
+    });
+    const res = await ok('/grantees?actor=demo:assistant');
+    expect(res.total).toBe(1);
+    expect(res.items).toHaveLength(1);
+    expect(res.items[0].credential_id).toBe(activeAgent.id);
+    expect(res.items[0].family_id).toBe('family-active');
+  });
+  it('rejects over-capacity active families with 507 record_capacity', async () => {
+    await inDO(stub(), async (h: any) => {
+      h.sql.exec("INSERT OR IGNORE INTO machines(id,name,hostname,registered_at) VALUES ('fixture-host','fixture','fixture','2026-01-01T00:00:00.000Z')");
+      h.sql.exec("INSERT OR IGNORE INTO agents(tag,project,machine_id,registered_at) VALUES ('cap-assistant','demo','fixture-host','2026-01-01T00:00:00.000Z')");
+      for (let i = 0; i < INTAKE_LIMITS.grants + 1; i++) {
+        const hash = await sha256('token-cap-' + i);
+        const rh = await sha256('refresh-cap-' + i);
+        h.sql.exec('INSERT INTO credentials(id,kind,token_hash,refresh_hash,family_id,subject,machine_id,registry_actor,actor,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+          'cap-cred-' + i, 'agent', hash, rh, 'family-cap-' + i, 'demo:cap-assistant', 'fixture-host', 'demo:cap-assistant', 'demo:cap-assistant', '["bus:read"]', 'fixture-operator',
+          '2026-01-02T00:00:00.000Z', new Date(Date.now() + 86400000).toISOString());
+      }
+    });
+    const res = await call('/grantees?actor=demo:cap-assistant');
+    expect(res.status).toBe(507);
+  });
+  it('rejects candidate overflow from many valid rows within the same family with 507 record_capacity', async () => {
+    await inDO(stub(), async (h: any) => {
+      h.sql.exec("INSERT OR IGNORE INTO machines(id,name,hostname,registered_at) VALUES ('fixture-host','fixture','fixture','2026-01-01T00:00:00.000Z')");
+      h.sql.exec("INSERT OR IGNORE INTO agents(tag,project,machine_id,registered_at) VALUES ('samefam-assistant','demo','fixture-host','2026-01-01T00:00:00.000Z')");
+      for (let i = 0; i < INTAKE_LIMITS.grants + 1; i++) {
+        const hash = await sha256('token-samefam-' + i);
+        const rh = await sha256('refresh-samefam-' + i);
+        h.sql.exec('INSERT INTO credentials(id,kind,token_hash,refresh_hash,family_id,subject,machine_id,registry_actor,actor,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+          'samefam-cred-' + i, 'agent', hash, rh, 'family-same', 'demo:samefam-assistant', 'fixture-host', 'demo:samefam-assistant', 'demo:samefam-assistant', '["bus:read"]', 'fixture-operator',
+          '2026-01-02T00:00:00.000Z', new Date(Date.now() + 86400000).toISOString());
+      }
+    });
+    const res = await call('/grantees?actor=demo:samefam-assistant');
+    expect(res.status).toBe(507);
+
+    const resFamily = await call('/grantees?actor=demo:samefam-assistant&family=family-same');
+    expect(resFamily.status).toBe(507);
+
+    const resOther = await ok('/grantees?actor=demo:samefam-assistant&family=other-family');
+    expect(resOther.total).toBe(0);
+    expect(resOther.items).toEqual([]);
+  });
+  it('discovers active grantees with migrated registry_actor or bare legacy bindings', async () => {
+    const hash1 = await sha256('token-migrated-1');
+    const rh1 = await sha256('refresh-migrated-1');
+    const hash2 = await sha256('token-migrated-2');
+    const rh2 = await sha256('refresh-migrated-2');
+    await inDO(stub(), (h: any) => {
+      h.sql.exec("INSERT OR IGNORE INTO machines(id,name,hostname,registered_at) VALUES ('fixture-host','fixture','fixture','2026-01-01T00:00:00.000Z')");
+      h.sql.exec("INSERT OR IGNORE INTO agents(tag,project,machine_id,registered_at) VALUES ('migworker','demo','fixture-host','2026-01-01T00:00:00.000Z')");
+      h.sql.exec('INSERT INTO credentials(id,kind,token_hash,refresh_hash,family_id,subject,machine_id,registry_actor,actor,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        'cred-migrated-1', 'agent', hash1, rh1, 'family-mig-1', 'demo:migworker', 'fixture-host', 'demo:migworker', 'demo:migworker', '["bus:read"]', 'fixture-operator', '2026-01-02T00:00:00.000Z', new Date(Date.now() + 86400000).toISOString());
+      h.sql.exec('INSERT INTO credentials(id,kind,token_hash,refresh_hash,family_id,subject,machine_id,registry_actor,actor,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        'cred-migrated-2', 'agent', hash2, rh2, 'family-mig-2', 'migworker', 'fixture-host', 'demo:migworker', 'migworker', '["bus:read"]', 'fixture-operator', '2026-01-02T00:00:00.000Z', new Date(Date.now() + 86400000).toISOString());
+    });
+    const res = await ok('/grantees?actor=demo:migworker');
+    expect(res.total).toBe(2);
+    const ids = res.items.map((i: any) => i.credential_id).sort();
+    expect(ids).toEqual(['cred-migrated-1', 'cred-migrated-2'].sort());
+  });
+  it('denies grantee discovery to already-granted agents, hosts, and jobs', async () => {
+    const a = await seedAgent();
+    await grant(a);
+    expect((await call('/grantees?actor=demo:assistant', undefined, a.token)).status).toBe(403);
+
+    const hostToken = 'hubh_fixture_host';
+    const hostHash = await sha256(hostToken);
+    await inDO(stub(), (h: any) => {
+      h.sql.exec('INSERT INTO credentials(id,kind,token_hash,family_id,subject,machine_id,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+        'cred-host', 'host', hostHash, 'family-host', 'fixture-host', 'fixture-host', '["fleet:host"]', 'operator', '2026-01-01T00:00:00.000Z', new Date(Date.now() + 86400000).toISOString());
+    });
+    expect((await call('/grantees?actor=demo:assistant', undefined, hostToken)).status).toBe(403);
+
+    const jobToken = 'hubj_fixture_job';
+    const jobHash = await sha256(jobToken);
+    await inDO(stub(), (h: any) => {
+      h.sql.exec('INSERT INTO credentials(id,kind,token_hash,family_id,subject,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)',
+        'cred-job', 'job', jobHash, 'family-job', 'fixture-job', '["job"]', 'operator', '2026-01-01T00:00:00.000Z', new Date(Date.now() + 86400000).toISOString());
+    });
+    expect((await call('/grantees?actor=demo:assistant', undefined, jobToken)).status).toBe(403);
+  });
+  it('supports explicit family selection and honest cursor pagination across >25 active families', async () => {
+    for (let i = 0; i < 30; i++) {
+      await seedAgent('demo:assistant', 'fam-paged-' + String(i).padStart(2, '0'));
+    }
+    const single = await ok('/grantees?actor=demo:assistant&family=fam-paged-05');
+    expect(single.total).toBe(1);
+    expect(single.items[0].family_id).toBe('fam-paged-05');
+    expect(single.family_id).toBe('fam-paged-05');
+
+    const nonexistent = await ok('/grantees?actor=demo:assistant&family=nonexistent');
+    expect(nonexistent.total).toBe(0);
+    expect(nonexistent.items).toHaveLength(0);
+
+    const page1 = await ok('/grantees?actor=demo:assistant&limit=25');
+    expect(page1.total).toBe(30);
+    expect(page1.items).toHaveLength(25);
+    expect(page1.next).toBeTruthy();
+
+    const page2 = await ok('/grantees?actor=demo:assistant&limit=25&after=' + page1.next + '&revision=' + page1.snapshot_version);
+    expect(page2.total).toBe(30);
+    expect(page2.items).toHaveLength(5);
+    expect(page2.next).toBeNull();
+  });
   it('fresh grant revocation hides historical receipts and each subsequent snapshot page', async () => {
     const a = await seedAgent(); const g = await grant(a);
     const payload = { key: 'agent-created', project: 'demo', title: 'Synthetic', text: 'Data', source };

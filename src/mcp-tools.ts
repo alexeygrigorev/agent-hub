@@ -49,6 +49,7 @@ for (const group of ['rules', 'grants']) {
   tool(`intake_${group}_write`, 'POST', `/api/intake/${group}`, `Operator-only ${group} mutation; payload matches web API.`);
 }
 tool('intake_revoke', 'POST', '/api/intake/grants/{id}/revoke', 'Revoke a grant, preserving history.', ['intake revoke']);
+tool('intake_grantees', 'GET', '/api/intake/grantees', 'Operator only: discover active grantable agent credential metadata for an actor: query actor.', ['intake grantees']);
 tool('handoff_page', 'GET', '/api/intake/handoff', 'One snapshot-pinned handoff page. Follow next with revision and authorization_valid_until; never treat a page as a complete handoff.', ['handoff']);
 for (const [name, path] of [['list', ''], ['participants', '/participants'], ['get', '/{id}'], ['members', '/{id}/members'], ['history', '/{id}/messages']] as const)
   tool(`conversations_${name}`, 'GET', '/api/conversations' + path, 'Read authorized conversations; query matches CLI filters/pagination.', [`conversations ${name}`]);

@@ -66,6 +66,7 @@ hub intake context TASK_ID
 hub intake update TASK_ID --version 1 --status blocked --next-step 'Obtain review' --key context-001
 hub intake append TASK_ID --version 2 --event-file event.json --key event-001
 hub intake assign TASK_ID --version 3 --key assign-001 --workspace example-ws --engine codex --tier daily --next-step 'Watch Hub binding' --brief-file goal.txt
+hub intake grantees --actor example:assistant
 hub handoff
 hub handoff --project example --page-size 10
 ```
@@ -157,6 +158,7 @@ strings. Unknown mutation fields are rejected. `source` has
 | `/tasks/ID/assign` POST | Create the canonical Hub session (`key`, `expected_version`, `session`, `provenance`, optional handoff context) and record its real id automatically |
 | `/handoff` GET | All authorized open work, unresolved obligations and applicable operator rules, paginated |
 | `/rules` GET/POST | Operator-only complete bounded rules / versioned rule append |
+| `/grantees` GET | Operator-only active grantable agent credential metadata for an actor (`?actor=ACTOR[&family=FAMILY][&limit=N][&after=ID][&revision=REV]`) |
 | `/grants` GET/POST | Operator-only bounded grant listing / explicit grant creation |
 | `/grants/ID/revoke` POST | Operator-only durable revocation with `key`, `source` |
 
@@ -189,7 +191,7 @@ nullable `project`, `text`, `source`, and explicit `decision`. Scope is immutabl
 all amendments append history. Grant creation uses `key`, `credential_id`,
 `scope` (`task`, `project`, `all`), nullable `target` (null for all), `access`
 (`read`, `write`), integer epoch-millisecond `expires_at`, and `source`.
-The operator can use `hub intake rules|grants --payload-file FILE` or
+The operator can use `hub intake grantees --actor ACTOR [--family FAMILY] [--limit N] [--after ID] [--revision REV]` to discover active grantable agent credential metadata for an actor, `hub intake rules|grants --payload-file FILE` or
 `hub intake revoke ID --payload-file FILE`; omit payload-file to list rules/grants.
 
 ## Complete handoff and concurrent work

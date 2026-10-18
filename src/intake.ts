@@ -45,6 +45,10 @@ function identifier(value: any): string {
   if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) fail('invalid_identifier');
   return value;
 }
+function credentialId(value: any): string {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-][A-Za-z0-9._:-]{0,127}$/.test(value)) fail('invalid_identifier');
+  return value;
+}
 function integer(value: any, min = 0, max = Number.MAX_SAFE_INTEGER): number {
   if (!Number.isSafeInteger(value) || value < min || value > max) fail('invalid_integer');
   return value;
@@ -248,7 +252,7 @@ export class IntakeService {
   private page(url: URL, items: Obj[], revision: number): Obj {
     const limit = url.searchParams.has('limit') ? integer(Number(url.searchParams.get('limit')), 1, INTAKE_LIMITS.page) : INTAKE_LIMITS.page;
     const after = url.searchParams.get('after');
-    if (after) identifier(after);
+    if (after) credentialId(after);
     if (after && !url.searchParams.has('revision')) fail('revision_required');
     if (url.searchParams.has('revision') && integer(Number(url.searchParams.get('revision'))) !== revision) fail('stale_snapshot', 409);
     const remaining = items.filter(t => !after || t.id > after);
@@ -260,6 +264,77 @@ export class IntakeService {
     if (path === '/grants') {
       this.operator(p);
       return { snapshot_version: revision, items: this.rows('grants').map(({ binding, ...g }) => ({ ...g, actor: binding.actor, family_id: binding.family_id })) };
+    }
+    if (path === '/grantees') {
+      this.operator(p);
+      const actorParam = url.searchParams.get('actor');
+      if (!actorParam || typeof actorParam !== 'string' || !actorParam.trim() || actorParam.length > 128) {
+        fail('invalid_actor', 400);
+      }
+      const addr = registryAddress(actorParam);
+      if (!addr) fail('invalid_actor', 400);
+
+      const familyParam = url.searchParams.get('family_id') || url.searchParams.get('family');
+      if (familyParam !== null && (typeof familyParam !== 'string' || !familyParam.trim() || familyParam.length > 128)) {
+        fail('invalid_family', 400);
+      }
+
+      const nowIso = new Date().toISOString();
+      let query = `SELECT id, kind, family_id, machine_id, scopes, created_at, expires_at, revoked_at, registry_actor, actor, subject
+         FROM credentials
+         WHERE kind = 'agent'
+           AND revoked_at IS NULL
+           AND expires_at > ?
+           AND (registry_actor = ? OR actor = ? OR subject = ? OR (COALESCE(registry_actor, '') = '' AND (actor = ? OR subject = ?)))`;
+      const queryParams: any[] = [nowIso, actorParam, actorParam, actorParam, addr.tag, addr.tag];
+      if (familyParam) {
+        query += ` AND family_id = ?`;
+        queryParams.push(familyParam.trim());
+      }
+      const scanLimit = INTAKE_LIMITS.grants + 1;
+      query += ` ORDER BY created_at DESC LIMIT ?`;
+      queryParams.push(scanLimit);
+
+      const rows = this.sql.exec(query, ...queryParams).toArray() as any[];
+      if (rows.length > INTAKE_LIMITS.grants) {
+        fail('record_capacity', 507);
+      }
+
+      const families = new Map<string, Obj>();
+      for (const c of rows) {
+        const binding = this.binding(c);
+        if (!binding || binding.actor !== actorParam) continue;
+        if (familyParam && binding.family_id !== familyParam.trim()) continue;
+        let scopes: string[] = [];
+        try { scopes = JSON.parse(c.scopes); } catch { continue; }
+        if (!families.has(binding.family_id)) {
+          families.set(binding.family_id, {
+            id: c.id,
+            credential_id: c.id,
+            actor: binding.actor,
+            family_id: binding.family_id,
+            project: binding.project ?? null,
+            machine_id: binding.machine_id ?? null,
+            scopes,
+            created_at: c.created_at,
+            expires_at: c.expires_at,
+            registered_at: binding.registered_at,
+            incarnation: binding.incarnation,
+          });
+        }
+      }
+
+      if (families.size > INTAKE_LIMITS.grants) {
+        fail('record_capacity', 507);
+      }
+
+      const allItems = Array.from(families.values()).sort((a, b) => a.id.localeCompare(b.id));
+      const paged = this.page(url, allItems, revision);
+      return {
+        ...paged,
+        actor: actorParam,
+        ...(familyParam ? { family_id: familyParam.trim() } : {}),
+      };
     }
     if (path === '/rules') {
       this.operator(p); return { snapshot_version: revision, operator_rules: this.rows('rules'), data_notice: DATA_NOTICE };
@@ -555,7 +630,7 @@ export class IntakeService {
     }
     if (path === '/grants') {
       this.operator(p); keys(b, ['key', 'credential_id', 'scope', 'target', 'access', 'expires_at', 'source']);
-      const c = this.sql.exec('SELECT * FROM credentials WHERE id=?', identifier(b.credential_id)).toArray()[0] as any;
+      const c = this.sql.exec('SELECT * FROM credentials WHERE id=?', credentialId(b.credential_id)).toArray()[0] as any;
       const binding = this.binding(c); if (!binding) fail('invalid_grantee');
       if (!['all', 'project', 'task'].includes(b.scope) || !['read', 'write'].includes(b.access)) fail('invalid_grant');
       const target = b.scope === 'all' ? null : identifier(b.target);
