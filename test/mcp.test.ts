@@ -234,8 +234,19 @@ describe('OAuth discovery, DCR, consent, PKCE and credential lifecycle', () => {
     const { params } = await authorization();
     const r = await doFetch(new Request(origin + '/oauth/authorize?' + new URLSearchParams(params), { headers: { Cookie: cookie } }));
     expect(r.status).toBe(200);
-    expect(await r.text()).toContain('test &lt;client&gt;');
+    const html = await r.text();
+    expect(html).toContain('test &lt;client&gt;');
+    // dakit auth shell (not plain HTML)
+    expect(html).toContain('/vendor/dakit/dakit.css');
+    expect(html).toContain('dk-auth-page');
+    expect(html).toContain('Allow connection');
     expect((await form('/oauth/authorize', { ...params, csrf: 'wrong', decision: 'allow' }, { Cookie: cookie, Origin: origin })).status).toBe(403);
+    // Cross-origin Origin must still fail even with a valid CSRF token.
+    expect((await form('/oauth/authorize', { ...params, csrf, decision: 'allow' }, { Cookie: cookie, Origin: 'https://evil.test' })).status).toBe(403);
+    // Missing Origin (common for same-site form POSTs / Cursor) must succeed with valid CSRF.
+    const allowedNoOrigin = await form('/oauth/authorize', { ...params, csrf, decision: 'allow' }, { Cookie: cookie });
+    expect(allowedNoOrigin.status).toBe(303);
+    expect(new URL(allowedNoOrigin.headers.get('Location')!).searchParams.get('code')).toBeTruthy();
     const denied = await form('/oauth/authorize', { ...params, csrf, decision: 'deny' }, { Cookie: cookie, Origin: origin });
     expect(new URL(denied.headers.get('Location')!).searchParams.get('error')).toBe('access_denied');
   });

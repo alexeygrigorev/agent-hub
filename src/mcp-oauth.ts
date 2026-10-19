@@ -3,6 +3,7 @@ import { getSession, humanAdminAllowed } from './auth/session';
 import { randomString, sha256 } from './auth/crypto';
 import { generateTokenPair } from './auth/token';
 import { boundedText, json, NO_STORE } from './mcp';
+import { mcpConnectPage, UI_HEADERS } from './ui-pages';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS mcp_clients (id TEXT PRIMARY KEY, metadata TEXT NOT NULL, expires INTEGER NOT NULL);
@@ -116,10 +117,23 @@ export class McpOAuth {
     if (request.method === 'GET') {
       const fields = ['client_id', 'redirect_uri', 'response_type', 'code_challenge', 'code_challenge_method', 'resource', 'scope', 'state'];
       const hidden = fields.map(k => `<input type="hidden" name="${k}" value="${esc(params.get(k) || '')}">`).join('');
-      const html = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Connect Agent Hub</title><body><main><h1>Connect Agent Hub</h1><p>Signed in as ${esc(session.email)}.</p><p>Allow <strong>${esc(client.client_name)}</strong> (${esc(new URL(redirect).origin)}) to use your Hub administrator permissions?</p><p>This includes reading machines, sessions, captures, quota and tasks, starting sessions, sending prompts and stopping sessions. Only approve clients you trust.</p><form method="post" action="/oauth/authorize">${hidden}<input type="hidden" name="csrf" value="${esc(session.csrfToken)}"><button name="decision" value="allow">Allow connection</button><button name="decision" value="deny">Deny</button></form></main></body></html>`;
-      return new Response(html, { headers: { ...NO_STORE, 'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'", 'Referrer-Policy': 'no-referrer' } });
+      // Same dakit auth shell as device pairing / token sign-in (not plain HTML).
+      const html = mcpConnectPage({
+        email: session.email,
+        clientName: client.client_name,
+        redirectOrigin: new URL(redirect).origin,
+        hiddenFields: hidden,
+        csrfToken: session.csrfToken,
+      });
+      return new Response(html, { headers: { ...NO_STORE, ...UI_HEADERS } });
     }
-    if (request.headers.get('Origin') !== url.origin || params.get('csrf') !== session.csrfToken) return json({ error: 'invalid_csrf' }, 403);
+    // Align with verifyCsrf: missing Origin is allowed for same-site form POSTs
+    // (Cursor / some browsers omit it). Reject only a present mismatched Origin,
+    // then require the session CSRF double-submit token from the consent form.
+    const originHeader = request.headers.get('Origin');
+    if ((originHeader && originHeader !== url.origin) || params.get('csrf') !== session.csrfToken) {
+      return json({ error: 'invalid_csrf' }, 403);
+    }
     const target = new URL(redirect);
     if (params.has('state')) target.searchParams.set('state', params.get('state')!);
     if (params.get('decision') !== 'allow') target.searchParams.set('error', 'access_denied');
