@@ -628,7 +628,7 @@ def main():
         from . import metrics as metrics_mod
         try:
             data = metrics_mod.execute(args)
-            if getattr(args, "metrics_cmd", None) != "get" and not getattr(args, "dry_run", False):
+            if not getattr(args, "dry_run", False):
                 print(json.dumps(data, indent=2, sort_keys=True))
         except SystemExit:
             raise
