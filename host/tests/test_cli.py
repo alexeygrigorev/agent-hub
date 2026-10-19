@@ -136,6 +136,49 @@ class TestCliUpdate(unittest.TestCase):
         self.assertIn('mode 700', error.getvalue())
         self.assertNotIn('Not logged in', error.getvalue())
 
+    @unittest.skipIf(sys.platform == 'win32', 'POSIX symlinks')
+    def test_auth_status_surfaces_config_permission_error_on_symlink_paths(self):
+        import io
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from agent_hub_host import cli, config
+        tmp_dir = Path(__file__).resolve().parents[2] / '.local/tmp'
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=tmp_dir) as folder:
+            root = Path(folder)
+            target = root / 'target.json'
+            target.write_text('{"client_kind":"human","access_token":"synthetic-fixture"}')
+            target.chmod(0o600)
+
+            # File symlink
+            file_link = root / 'cli.json'
+            file_link.symlink_to(target)
+
+            # Dangling file symlink
+            dangling_file = root / 'dangling.json'
+            dangling_file.symlink_to(root / 'nonexistent.json')
+
+            # Parent symlink
+            parent_link = root / 'linkdir'
+            parent_link.symlink_to(root)
+
+            # Dangling parent symlink
+            dangling_parent = root / 'dangling_dir'
+            dangling_parent.symlink_to(root / 'nonexistent_dir')
+
+            for path in (file_link, dangling_file, parent_link / 'cli.json', dangling_parent / 'cli.json'):
+                with self.subTest(path=str(path)):
+                    out, err = io.StringIO(), io.StringIO()
+                    with patch.object(config, 'get_human_config_path', return_value=path), \
+                         patch('sys.argv', ['hub', 'auth', 'status']), \
+                         patch('sys.stdout', out), patch('sys.stderr', err):
+                        with self.assertRaises(SystemExit) as cm:
+                            cli.main()
+                        self.assertEqual(cm.exception.code, 1)
+                        self.assertIn('Unsafe Hub profile', err.getvalue())
+                        self.assertNotIn('Not logged in', out.getvalue())
+
     def test_update_defaults_to_custom_domain_despite_legacy_profile(self):
         import argparse
         import io

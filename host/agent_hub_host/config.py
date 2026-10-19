@@ -1,3 +1,4 @@
+import errno
 import json
 import copy
 import os
@@ -191,18 +192,50 @@ class ConfigPermissionError(PermissionError):
     """Safe diagnostic; never includes profile contents or arbitrary OS text."""
 
 
+def _has_symlink(path: Path) -> bool:
+    is_junction = getattr(os.path, 'isjunction', lambda _: False)
+    try:
+        curr = Path(os.path.abspath(path))
+        while True:
+            if os.path.islink(curr) or is_junction(curr):
+                return True
+            parent = curr.parent
+            if parent == curr:
+                break
+            curr = parent
+    except OSError:
+        return True
+    return False
+
+
 def _load_from(path: Path) -> dict:
+    if _has_symlink(path):
+        raise ConfigPermissionError(
+            'Unsafe Hub profile permissions. On POSIX, the profile directory must be owned '
+            'by your user with mode 700 and the profile file with mode 600. '
+            'For the default profile run: chmod 700 ~/.config/agent-hub; '
+            'chmod 600 ~/.config/agent-hub/cli.json (or host.json). '
+            'Symlinks and multiply linked files are refused.')
     if not path.exists():
         return {}
     try:
         return _validate_data(json.loads(private_fs.read_bytes(path, 1024 * 1024)))
-    except PermissionError:
+    except (PermissionError, NotADirectoryError):
         raise ConfigPermissionError(
             'Unsafe Hub profile permissions. On POSIX, the profile directory must be owned '
             'by your user with mode 700 and the profile file with mode 600. '
             'For the default profile run: chmod 700 ~/.config/agent-hub; '
             'chmod 600 ~/.config/agent-hub/cli.json (or host.json). '
             'Symlinks and multiply linked files are refused.') from None
+    except OSError as exc:
+        if getattr(exc, 'errno', None) in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
+            raise ConfigPermissionError(
+                'Unsafe Hub profile permissions. On POSIX, the profile directory must be owned '
+                'by your user with mode 700 and the profile file with mode 600. '
+                'For the default profile run: chmod 700 ~/.config/agent-hub; '
+                'chmod 600 ~/.config/agent-hub/cli.json (or host.json). '
+                'Symlinks and multiply linked files are refused.') from None
+        return {}
     except Exception:
         return {}
 

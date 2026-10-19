@@ -34,6 +34,61 @@ class TestConfig(unittest.TestCase):
         os.chmod(path, 0o600)
         self.assertEqual(config._load_from(path)['access_token'], 'private-fixture')
 
+    @unittest.skipIf(sys.platform == 'win32', 'POSIX symlinks')
+    def test_symlink_profile_and_ancestors_refuse_loading_and_surface_permission_error(self):
+        root = Path(self.tmpdir.name)
+        real_dir = root / "real_dir"
+        real_dir.mkdir(mode=0o700)
+        real_file = real_dir / "cli.json"
+        real_file.write_text('{"access_token": "fixture-token", "client_kind": "human"}')
+        real_file.chmod(0o600)
+
+        # 1. Profile file is a symlink to a valid profile
+        file_link = real_dir / "link.json"
+        file_link.symlink_to(real_file)
+        with self.assertRaises(config.ConfigPermissionError) as caught:
+            config._load_from(file_link)
+        self.assertIn("Unsafe Hub profile", str(caught.exception))
+        self.assertIn("Symlinks and multiply linked files are refused", str(caught.exception))
+
+        # 2. Profile file is a dangling symlink
+        dangling_file = real_dir / "dangling.json"
+        dangling_file.symlink_to(real_dir / "nonexistent.json")
+        with self.assertRaises(config.ConfigPermissionError) as caught:
+            config._load_from(dangling_file)
+        self.assertIn("Unsafe Hub profile", str(caught.exception))
+
+        # 3. Parent directory is a symlink to a valid directory
+        link_dir = root / "link_dir"
+        link_dir.symlink_to(real_dir)
+        with self.assertRaises(config.ConfigPermissionError) as caught:
+            config._load_from(link_dir / "cli.json")
+        self.assertIn("Unsafe Hub profile", str(caught.exception))
+
+        # 4. Parent directory is a dangling symlink
+        dangling_dir = root / "dangling_dir"
+        dangling_dir.symlink_to(root / "nonexistent_dir")
+        with self.assertRaises(config.ConfigPermissionError) as caught:
+            config._load_from(dangling_dir / "cli.json")
+        self.assertIn("Unsafe Hub profile", str(caught.exception))
+
+        # 5. Grandparent directory is a symlink
+        grandchild = link_dir / "sub"
+        grandchild.mkdir(mode=0o700)
+        (grandchild / "cli.json").write_text('{"access_token": "fixture-token"}')
+        (grandchild / "cli.json").chmod(0o600)
+        with self.assertRaises(config.ConfigPermissionError) as caught:
+            config._load_from(grandchild / "cli.json")
+        self.assertIn("Unsafe Hub profile", str(caught.exception))
+
+        # 6. Grandparent directory is a dangling symlink
+        with self.assertRaises(config.ConfigPermissionError) as caught:
+            config._load_from(dangling_dir / "sub" / "cli.json")
+        self.assertIn("Unsafe Hub profile", str(caught.exception))
+
+        # 7. Non-existent file in a normal directory does not raise ConfigPermissionError
+        self.assertEqual(config._load_from(real_dir / "absent.json"), {})
+
     def test_save_and_load(self):
         data = {"access_token": "foo"}
         config.save_config(data)

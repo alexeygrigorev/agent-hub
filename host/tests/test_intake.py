@@ -118,8 +118,64 @@ class TestIntakeCli(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('outcome unknown', error)
         self.assertIn('recover-fixture', error)
+        self.assertIn('attempted version: 7', error)
         self.assertNotIn('private-error', error)
         self.assertEqual(transport.call_count, 2)
+
+    def test_update_uncertain_post_responses_retain_recovery_key_and_version(self):
+        for kind in ('truncated', 'invalid_json', 'bad_content_type'):
+            writes = []
+            class Handler(BaseHTTPRequestHandler):
+                def log_message(self, *args):
+                    pass
+                def do_GET(self):
+                    body = b'{"task":{"control":{"version":7}}}'
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                def do_POST(self):
+                    writes.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+                    if kind == 'truncated':
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'application/json')
+                        self.send_header('Content-Length', '100')
+                        self.end_headers()
+                        self.wfile.write(b'{"task":')
+                        self.close_connection = True
+                    elif kind == 'invalid_json':
+                        raw = b'{"task": corrupt json'
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'application/json')
+                        self.send_header('Content-Length', str(len(raw)))
+                        self.end_headers()
+                        self.wfile.write(raw)
+                    elif kind == 'bad_content_type':
+                        raw = b'<html>Gateway Error</html>'
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'text/html')
+                        self.send_header('Content-Length', str(len(raw)))
+                        self.end_headers()
+                        self.wfile.write(raw)
+            server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with patch.object(intake.config, 'load_config', return_value={'base_url': f'http://127.0.0.1:{server.server_port}'}), \
+                     patch.dict(os.environ, {'HUB_TOKEN': 'synthetic-fixture', 'HUB_URL': '', 'HUB_BASE_URL': ''}):
+                    code, out, err = self.run_cli('intake', 'update', 'fixture-task', '--owner', 'fixture-owner')
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
+            with self.subTest(kind=kind):
+                self.assertEqual(code, 1)
+                self.assertEqual(len(writes), 1, f'{kind} should not auto-retry')
+                self.assertTrue(writes[0]['key'].startswith('update-'))
+                self.assertIn(writes[0]['key'], err, f'{kind} must preserve generated recovery key')
+                self.assertIn('attempted version: 7', err, f'{kind} must preserve attempted version')
+                self.assertIn('outcome unknown', err)
 
     def test_http_error_diagnostics_allow_only_safe_codes(self):
         for raw, expected in ((b'{"error":"version_conflict"}', 'version_conflict'),

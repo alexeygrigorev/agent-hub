@@ -1,4 +1,5 @@
 """Private durable task context. Task text is data; this client never executes it."""
+import http.client
 import json
 import os
 import uuid
@@ -303,6 +304,8 @@ def execute(args):
             except IntakeHTTPError as exc:
                 if not automatic or exc.status != 409 or exc.code != 'version_conflict' or attempt == 2:
                     raise
-            except (OSError, TimeoutError):
-                raise IntakeTransportError(f'Intake update outcome unknown; inspect the task before retrying. Retry key: {key}') from None
+            except (OSError, TimeoutError, http.client.HTTPException, json.JSONDecodeError, UnicodeDecodeError, RuntimeError):
+                attempted = payload.get('expected_version')
+                version_info = f'; attempted version: {attempted}' if attempted is not None else ''
+                raise IntakeTransportError(f'Intake update outcome unknown; inspect the task before retrying. Retry key: {key}{version_info}') from None
     raise ValueError('Unknown intake operation')
