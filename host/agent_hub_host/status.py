@@ -82,6 +82,36 @@ def _call_status(args, method, body):
         raise ValueError('Status HTTP request failed') from None
 
 
+def _render_hub_evidence(hub):
+    lines = []
+    report = hub.get('report_headline')
+    if isinstance(report, dict):
+        provenance = report.get('provenance') or {}
+        lines.append('    report: %s verdict=%s observed=%s freshness=%s' % (
+            escape_display(report.get('headline') or 'unknown'),
+            escape_display(report.get('verdict') or 'unknown'),
+            escape_display(report.get('observed_at') or 'unknown'),
+            escape_display(provenance.get('freshness') or 'unknown')))
+    probes = hub.get('probe_evidence') or {}
+    for category, fields in (
+        ('git', ('sha', 'ancestry')),
+        ('ci', ('state', 'run')),
+        ('deploy', ('sha', 'state')),
+    ):
+        probe = probes.get(category)
+        if not isinstance(probe, dict):
+            continue
+        provenance = probe.get('provenance') or {}
+        parts = ['%s=%s' % (field, escape_display(probe.get(field) or 'unknown'))
+                 for field in fields]
+        parts.extend([
+            'observed=%s' % escape_display(probe.get('observed_at') or 'unknown'),
+            'freshness=%s' % escape_display(provenance.get('freshness') or 'unknown'),
+        ])
+        lines.append('    %s %s' % (category, ' '.join(parts)))
+    return lines
+
+
 def render_human(data):
     lines = []
     lines.append('snapshot: %s revision=%s coverage=%s' % (
@@ -121,6 +151,7 @@ def render_human(data):
                 escape_display(hub.get('machine')),
                 escape_display(life.get('group')), escape_display(life.get('state')),
                 ' decision=%s' % escape_display(decision.get('kind')) if decision.get('kind') else ''))
+            lines.extend(_render_hub_evidence(hub))
         for action in task.get('pending_actions', []):
             lines.append('  pending %s by %s: %s' % (
                 escape_display(action.get('type')), escape_display(action.get('actor')),
@@ -128,7 +159,7 @@ def render_human(data):
         reports = task.get('reports', [])
         commits = task.get('commits', [])
         if reports:
-            lines.append('  reports: %s (headline unknown, M14b)' % len(reports))
+            lines.append('  report references: %s' % len(reports))
         if commits:
             for c in commits:
                 ref = escape_display(c.get('reference', ''))

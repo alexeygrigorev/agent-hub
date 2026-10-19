@@ -181,6 +181,57 @@ class TestStatusCli(unittest.TestCase):
         self.assertIn('host-hetzner: load=0.75, 1.10, 1.25', rendered)
         self.assertIn('mem=8.0GB/16.0GB (50.0%, 8.0GB avail) [fresh]', rendered)
 
+    def test_render_human_shows_canonical_reports_and_exact_probe_facts(self):
+        dto = dict(FIXTURE_DTO)
+        observed = '2026-10-19T01:38:08.858Z'
+        sha = 'a' * 40
+        dto['tasks'] = [{
+            'reports': [{'reference': 'retained-reference'}],
+            'commits': [{'reference': 'bbbbbbbbbbbb', 'ci_state': 'unknown',
+                         'deploy_state': 'unknown'}],
+            'hub_sessions': [{
+                'hub_session_id': 'canonical-session',
+                'report_headline': {
+                    'headline': 'Registry review\x1b\u202e', 'verdict': 'REVISE',
+                    'observed_at': observed, 'provenance': {'freshness': 'fresh'},
+                    'body': 'private report body must not be rendered',
+                },
+                'probe_evidence': {
+                    'git': {'sha': sha, 'ancestry': 'merged_in_main',
+                            'observed_at': observed, 'provenance': {'freshness': 'fresh'}},
+                    'ci': {'state': 'passing', 'run': 'https://example.test/run/42',
+                           'observed_at': observed, 'provenance': {'freshness': 'fresh'}},
+                    'deploy': {'sha': sha, 'state': 'deployed',
+                               'observed_at': observed, 'provenance': {'freshness': 'fresh'}},
+                },
+            }],
+        }]
+        rendered = status.render_human(dto)
+        self.assertIn('report: Registry review verdict=REVISE', rendered)
+        self.assertIn('git sha=%s ancestry=merged_in_main' % sha, rendered)
+        self.assertIn('ci state=passing run=https://example.test/run/42', rendered)
+        self.assertIn('deploy sha=%s state=deployed' % sha, rendered)
+        self.assertIn('observed=%s freshness=fresh' % observed, rendered)
+        self.assertIn('report references: 1', rendered)
+        self.assertIn('commit bbbbbbbbbbbb git=unknown ci=unknown deploy=unknown', rendered)
+        self.assertNotIn('private report body', rendered)
+        self.assertNotIn('\x1b', rendered)
+        self.assertNotIn('\u202e', rendered)
+
+    def test_render_human_preserves_unknown_and_stale_canonical_evidence(self):
+        dto = dict(FIXTURE_DTO)
+        dto['tasks'] = [{'hub_sessions': [{
+            'report_headline': {'headline': 'PASS appears only in the heading', 'verdict': None},
+            'probe_evidence': {'git': {'provenance': {'freshness': 'stale'}},
+                               'ci': {}, 'deploy': None},
+        }]}]
+        rendered = status.render_human(dto)
+        self.assertIn('report: PASS appears only in the heading verdict=unknown', rendered)
+        self.assertIn('git sha=unknown ancestry=unknown observed=unknown freshness=stale', rendered)
+        self.assertIn('ci state=unknown run=unknown observed=unknown freshness=unknown', rendered)
+        self.assertNotIn('state=passing', rendered)
+        self.assertNotIn('state=deployed', rendered)
+
     def test_render_human_commits_probe_evidence_and_unknown(self):
         dto = dict(FIXTURE_DTO)
         dto['tasks'] = [{
