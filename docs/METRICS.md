@@ -17,8 +17,11 @@ Write (`POST /api/metrics`) requires a current enrolled **host** bearer
 (`credentials.kind = host`, scope `host`, not revoked, not expired). The
 Durable Object binds provenance from that credential: `host_id` is
 `credentials.machine_id`, which must equal the live `machines.id` whose
-`credential_id` is this credential. JSON `host_id`, spoof headers, and
-query `host_id` cannot select another machine. After the body and digest
+`credential_id` is this credential. JSON `host_id`, client spoof headers
+(`X-Host-Id`, `X-Machine-Id`), and query `host_id` cannot select another
+machine. Proxy-injected `X-Forwarded-Host` (Cloudflare) is ignored for this
+check so admin cookie GETs work in production; host binding still comes only
+from the enrolled host bearer. After the body and digest
 are awaited, the same credential kind, scopes, expiry, revocation, and
 machine binding are revalidated with a fresh clock inside the durable
 write. A check that only ran before the body is not sufficient.

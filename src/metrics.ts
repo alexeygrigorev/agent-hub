@@ -1315,7 +1315,11 @@ export class MetricsStore {
         headers: { ...PRIVATE_NO_STORE_HEADERS, Allow: "GET, POST" },
       });
     }
-    if (request.headers.has("x-host-id") || request.headers.has("x-machine-id") || request.headers.has("x-forwarded-host")) {
+    // Client-forged host identity headers are always denied. Do not treat
+    // X-Forwarded-Host as spoof: Cloudflare injects it on every browser request,
+    // and denying it blocked admin cookie Metrics GETs (Access denied on
+    // hub.dtcdev.click). Host binding still comes only from the bearer credential.
+    if (request.headers.has("x-host-id") || request.headers.has("x-machine-id")) {
       return jsonResponse({ error: "forbidden", reason: "header_spoof_denied" }, 403);
     }
 

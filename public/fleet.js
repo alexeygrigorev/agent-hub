@@ -74,7 +74,7 @@ function nativeText(w) {
   return w.unit && w.unit !== 'percent' ? w.unit : 'percent';
 }
 function renderQuota(q) {
-  const root = byId('quota'); root.replaceChildren();
+  const root = byId('quota-panel'); root.replaceChildren();
   if (!q || q.error) {
     const p = document.createElement('p'); p.textContent = q && q.error ? `Quota unavailable: ${q.error}` : 'Quota unavailable: no data.'; root.append(p); return;
   }

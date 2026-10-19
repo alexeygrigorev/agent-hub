@@ -17,13 +17,56 @@
 .scroll { max-width: 100%; overflow-x: auto; }
 .dk-table td { overflow-wrap: anywhere; }
 
+.sessions-cards { display: none; gap: var(--dk-space-3); }
+.sessions-card-item { padding: var(--dk-pad-panel); min-width: 0; gap: var(--dk-space-2); }
+.sessions-card-item__badges { display: flex; flex-wrap: wrap; align-items: center; gap: var(--dk-space-2); }
+.sessions-card-item__name {
+  font-family: var(--dk-font-mono);
+  font-size: var(--dk-text-sm);
+  font-weight: var(--dk-weight-semibold);
+  color: var(--dk-text-heading);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.sessions-card-item__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--dk-space-1) var(--dk-space-3);
+  color: var(--dk-text-muted);
+  font-size: var(--dk-text-xs);
+  min-width: 0;
+}
+.sessions-card-item__meta > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 100%;
+}
+.sessions-truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 28ch;
+  display: inline-block;
+  vertical-align: bottom;
+}
+.tree-item .code-pill,
+.tree-item .meta-dim {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 100%;
+}
+
 @media (max-width: 820px) {
   .sessions-controls { flex-direction: column; align-items: stretch; }
   .sessions-filter-wrap { max-width: 100%; }
-  .sessions-card .dk-table, .sessions-card tbody, .sessions-card tr, .sessions-card td { display: block; width: 100%; }
-  .sessions-card thead { display: none; }
-  .sessions-card td { border: 0; padding: var(--dk-space-1) var(--dk-space-3); }
-  .sessions-card tr { padding-block: var(--dk-space-3); border-bottom: 1px solid var(--dk-border-default); }
-  .sessions-card td::before { content: attr(data-label); display: block; font-family: var(--dk-font-sans); font-size: var(--dk-text-sm); color: var(--dk-text-muted); }
-  .sessions-card td:empty { display: none; }
+  .sessions-table-wrap { display: none; }
+  .sessions-cards { display: grid; }
+  .sessions-truncate { max-width: 100%; }
 }

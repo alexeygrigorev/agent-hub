@@ -1356,12 +1356,9 @@ export class QuotaStore {
       });
     }
 
-    // Reject any host-spoofing headers unconditionally
-    if (
-      request.headers.has("x-host-id") ||
-      request.headers.has("x-machine-id") ||
-      request.headers.has("x-forwarded-host")
-    ) {
+    // Client-forged host identity headers are always denied. Do not treat
+    // X-Forwarded-Host as spoof (Cloudflare injects it; same policy as Metrics).
+    if (request.headers.has("x-host-id") || request.headers.has("x-machine-id")) {
       return jsonResponse(
         { error: "forbidden", reason: "header_spoof_denied" },
         403

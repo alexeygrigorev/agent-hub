@@ -469,6 +469,32 @@ describe('M9 metrics receiver', () => {
     ).toBe(403);
   });
 
+  it('admin Metrics GET allows Cloudflare X-Forwarded-Host and still denies X-Host-Id spoof', async () => {
+    const { sessionCookie, csrfToken } = await getAdminSessionAndCsrf();
+    const listed = await doFetch(
+      new Request('http://example.com/api/metrics?limit=8', {
+        headers: {
+          Cookie: sessionCookie,
+          'x-csrf-token': csrfToken,
+          'X-Forwarded-Host': 'example.com',
+        },
+      })
+    );
+    expect(listed.status).toBe(200);
+    const hostId = await doFetch(
+      new Request('http://example.com/api/metrics?limit=8', {
+        headers: {
+          Cookie: sessionCookie,
+          'x-csrf-token': csrfToken,
+          'X-Host-Id': 'forged',
+        },
+      })
+    );
+    expect(hostId.status).toBe(403);
+    const hostBody = (await hostId.json()) as { reason?: string };
+    expect(hostBody.reason).toBe('header_spoof_denied');
+  });
+
   it('keeps the metrics page on official dakit shell classes', async () => {
     const { sessionCookie } = await getAdminSessionAndCsrf();
     const page = await doFetch(

@@ -40,6 +40,60 @@ function stateBadge(state) {
   return span;
 }
 
+function truncateAttr(el, value) {
+  const text = value == null || value === '' ? '-' : String(value);
+  el.textContent = text;
+  el.title = text;
+  el.classList.add('sessions-truncate');
+  return el;
+}
+
+function renderSessionCards(filtered, emptyMessage) {
+  const cards = document.createElement('div');
+  cards.className = 'sessions-cards';
+  cards.setAttribute('aria-label', 'Sessions');
+  if (!filtered.length) {
+    const p = document.createElement('p');
+    p.className = 'dk-muted';
+    p.textContent = emptyMessage;
+    cards.append(p);
+    return cards;
+  }
+  for (const s of filtered) {
+    const card = document.createElement('article');
+    card.className = 'dk-card dk-stack sessions-card-item';
+
+    const badges = document.createElement('div');
+    badges.className = 'sessions-card-item__badges';
+    badges.append(typeBadge(s.session_type), stateBadge(s.state));
+    card.append(badges);
+
+    const name = document.createElement('div');
+    name.className = 'sessions-card-item__name';
+    const nameText = s.qualified_alias || s.name || s.id || '-';
+    name.textContent = nameText;
+    name.title = nameText;
+    card.append(name);
+
+    const meta = document.createElement('div');
+    meta.className = 'sessions-card-item__meta';
+    const engine = document.createElement('span');
+    engine.className = 'dk-mono';
+    truncateAttr(engine, s.engine || '-');
+    meta.append(engine);
+    const ws = document.createElement('span');
+    truncateAttr(ws, s.workspace || '-');
+    meta.append(ws);
+    const updated = document.createElement('span');
+    updated.textContent = (s.updated_at || '').slice(0, 19).replace('T', ' ') || '-';
+    meta.append(updated);
+    card.append(meta);
+
+    cards.append(card);
+  }
+  return cards;
+}
+
 function renderTable(sessions, filter = '') {
   const container = byId('sessions-table-container');
   container.replaceChildren();
@@ -55,9 +109,12 @@ function renderTable(sessions, filter = '') {
     return name.includes(query) || engine.includes(query) || state.includes(query) || ws.includes(query) || type.includes(query);
   });
 
+  const emptyMessage = sessions.length === 0 ? 'No sessions reported.' : 'No sessions match filter.';
+  container.append(renderSessionCards(filtered, emptyMessage));
+
   const columns = ['Type', 'Name / Alias', 'Engine', 'State', 'Workspace', 'Parent', 'Updated'];
   const wrapper = document.createElement('div');
-  wrapper.className = 'scroll';
+  wrapper.className = 'scroll sessions-table-wrap';
   const table = document.createElement('table');
   table.className = 'dk-table';
 
@@ -84,8 +141,10 @@ function renderTable(sessions, filter = '') {
     const tdName = document.createElement('td');
     tdName.dataset.label = 'Name / Alias';
     const nameSpan = document.createElement('span');
-    nameSpan.className = 'code-pill';
-    nameSpan.textContent = s.qualified_alias || s.name || s.id;
+    nameSpan.className = 'code-pill sessions-truncate';
+    const nameText = s.qualified_alias || s.name || s.id;
+    nameSpan.textContent = nameText;
+    nameSpan.title = nameText;
     tdName.append(nameSpan);
     tr.append(tdName);
 
@@ -102,7 +161,12 @@ function renderTable(sessions, filter = '') {
     const tdWs = document.createElement('td');
     tdWs.dataset.label = 'Workspace';
     tdWs.className = 'meta-dim';
-    tdWs.textContent = s.workspace || '-';
+    const wsSpan = document.createElement('span');
+    wsSpan.className = 'sessions-truncate';
+    const wsText = s.workspace || '-';
+    wsSpan.textContent = wsText;
+    wsSpan.title = wsText;
+    tdWs.append(wsSpan);
     tr.append(tdWs);
 
     const tdParent = document.createElement('td');
@@ -124,7 +188,7 @@ function renderTable(sessions, filter = '') {
     const tr = document.createElement('tr');
     const td = document.createElement('td');
     td.colSpan = columns.length;
-    td.textContent = sessions.length === 0 ? 'No sessions reported.' : 'No sessions match filter.';
+    td.textContent = emptyMessage;
     tr.append(td);
     tbody.append(tr);
   }
@@ -171,8 +235,10 @@ function renderTree(treeData, filter = '') {
     item.append(typeBadge(node.session_type));
 
     const nameSpan = document.createElement('span');
-    nameSpan.className = 'code-pill';
-    nameSpan.textContent = node.qualified_alias || node.name || node.id;
+    nameSpan.className = 'code-pill sessions-truncate';
+    const nameText = node.qualified_alias || node.name || node.id;
+    nameSpan.textContent = nameText;
+    nameSpan.title = nameText;
     item.append(nameSpan);
 
     item.append(stateBadge(node.state));
@@ -186,8 +252,9 @@ function renderTree(treeData, filter = '') {
 
     if (node.workspace) {
       const wsSpan = document.createElement('span');
-      wsSpan.className = 'meta-dim';
+      wsSpan.className = 'meta-dim sessions-truncate';
       wsSpan.textContent = node.workspace;
+      wsSpan.title = node.workspace;
       item.append(wsSpan);
     }
 
