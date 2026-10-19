@@ -279,6 +279,72 @@ class TestStatusCli(unittest.TestCase):
         self.assertIn('commit 4dfd635a51df git=on_main ci=failing deploy=not_deployed', rendered)
         self.assertIn('commit abc123def456 git=unknown ci=unknown deploy=unknown', rendered)
 
+    def test_render_human_shows_task_current_and_continuation_state(self):
+        dto = dict(FIXTURE_DTO)
+        dto['tasks'] = [{
+            'id': 'task-context-1',
+            'status': 'in_progress',
+            'title': 'Handoff test',
+            'updated_at': '2026-10-19T08:00:00.000Z',
+            'current_state': 'Running full tests\x1b[2J\u202e',
+            'continuation_state': 'active',
+            'owner': 'demo:assistant',
+            'next_step': 'Ship increment',
+        }]
+        rendered = status.render_human(dto)
+        self.assertIn('owner=demo:assistant next=Ship increment', rendered)
+        self.assertIn('current-state: Running full tests', rendered)
+        self.assertIn('continuation: active', rendered)
+        self.assertNotIn('\x1b', rendered)
+        self.assertNotIn('\u202e', rendered)
+
+    def test_render_human_shows_task_report_references_with_evidence(self):
+        dto = dict(FIXTURE_DTO)
+        observed = '2026-10-19T08:30:00.000Z'
+        dto['tasks'] = [{
+            'id': 'task-reports-1',
+            'status': 'open',
+            'title': 'Report test',
+            'updated_at': '2026-10-19T08:00:00.000Z',
+            'reports': [
+                {
+                    'reference': '~/tmp/agent-reports/hub-0800.md',
+                    'headline': 'Agent Hub Report — 08:00 Increment\x1b\u202e',
+                    'verdict': 'PASS',
+                    'provenance': {'observed_at': observed, 'freshness': 'fresh'},
+                },
+                {
+                    'reference': '~/tmp/agent-reports/stale-report.md',
+                    'headline': None,
+                    'verdict': None,
+                    'provenance': {'freshness': 'stale'},
+                },
+            ],
+        }]
+        rendered = status.render_human(dto)
+        self.assertIn('report references: 2', rendered)
+        self.assertIn('report-ref: ~/tmp/agent-reports/hub-0800.md headline=Agent Hub Report — 08:00 Increment verdict=PASS observed=%s freshness=fresh' % observed, rendered)
+        self.assertIn('report-ref: ~/tmp/agent-reports/stale-report.md headline=unknown verdict=unknown observed=unknown freshness=stale', rendered)
+        self.assertNotIn('\x1b', rendered)
+        self.assertNotIn('\u202e', rendered)
+
+    def test_render_human_omits_absent_task_context(self):
+        dto = dict(FIXTURE_DTO)
+        dto['tasks'] = [{
+            'id': 'task-empty-context',
+            'status': 'open',
+            'title': 'Empty context task',
+            'updated_at': '2026-10-19T08:00:00.000Z',
+            'current_state': None,
+            'continuation_state': None,
+            'reports': [],
+        }]
+        rendered = status.render_human(dto)
+        self.assertNotIn('current-state:', rendered)
+        self.assertNotIn('continuation:', rendered)
+        self.assertNotIn('report references:', rendered)
+        self.assertNotIn('report-ref:', rendered)
+
 
 if __name__ == '__main__':
     unittest.main()

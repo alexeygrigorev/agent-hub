@@ -149,6 +149,10 @@ def render_human(data):
         if task.get('owner') or task.get('next_step'):
             lines.append('  owner=%s next=%s' % (
                 escape_display(task.get('owner')), escape_display(task.get('next_step'))))
+        if task.get('current_state'):
+            lines.append('  current-state: %s' % escape_display(task.get('current_state')))
+        if task.get('continuation_state'):
+            lines.append('  continuation: %s' % escape_display(task.get('continuation_state')))
         for sess in task.get('sessions', []):
             lines.append('  session %s/%s engine=%s phase=%s linkage=%s observed=%s' % (
                 escape_display(sess.get('machine_id')), escape_display(sess.get('native_id')),
@@ -171,6 +175,16 @@ def render_human(data):
         commits = task.get('commits', [])
         if reports:
             lines.append('  report references: %s' % len(reports))
+            for r in reports:
+                ref = escape_display(r.get('reference') or 'unknown')
+                prov = r.get('provenance') or {}
+                lines.append('    report-ref: %s headline=%s verdict=%s observed=%s freshness=%s' % (
+                    ref,
+                    escape_display(r.get('headline') or 'unknown'),
+                    escape_display(r.get('verdict') or 'unknown'),
+                    escape_display(prov.get('observed_at') or r.get('observed_at') or 'unknown'),
+                    escape_display(prov.get('freshness') or 'unknown'),
+                ))
         if commits:
             for c in commits:
                 ref = escape_display(c.get('reference', ''))
