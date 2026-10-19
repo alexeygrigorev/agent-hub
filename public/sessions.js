@@ -2,7 +2,9 @@
 const byId = id => document.getElementById(id);
 let activeTab = 'list';
 let cachedSessions = [];
-let cachedTree = [];
+let cachedTree = { tree: [] };
+let csrf = null;
+let loading = false;
 
 async function api(path) {
   const r = await fetch(path, { credentials: 'same-origin', cache: 'no-store' });
@@ -19,7 +21,9 @@ async function api(path) {
 function typeBadge(type) {
   const span = document.createElement('span');
   const t = type || 'aplexer';
-  span.className = `type-badge type-badge--${t === 'headless' ? 'headless' : 'aplexer'}`;
+  span.className = t === 'headless'
+    ? 'dk-chip dk-mono type-badge type-badge--headless'
+    : 'dk-badge dk-badge--info dk-mono type-badge type-badge--aplexer';
   span.textContent = t;
   return span;
 }
@@ -28,8 +32,9 @@ function stateBadge(state) {
   const span = document.createElement('span');
   const s = state || 'unknown';
   let color = 'dk-badge--neutral';
-  if (['running', 'active'].includes(s)) color = 'dk-badge--success';
-  else if (['failed', 'refused', 'stopped'].includes(s)) color = 'dk-badge--danger';
+  if (['running', 'active', 'working'].includes(s)) color = 'dk-badge--success';
+  else if (['stale', 'stalled', 'uncertain', 'offered'].includes(s)) color = 'dk-badge--warning';
+  else if (['failed', 'refused', 'stopped', 'offline', 'error'].includes(s)) color = 'dk-badge--danger';
   span.className = `dk-badge ${color}`;
   span.textContent = s;
   return span;
@@ -119,7 +124,7 @@ function renderTable(sessions, filter = '') {
     const tr = document.createElement('tr');
     const td = document.createElement('td');
     td.colSpan = columns.length;
-    td.textContent = sessions.length === 0 ? 'No sessions found.' : 'No sessions match filter.';
+    td.textContent = sessions.length === 0 ? 'No sessions reported.' : 'No sessions match filter.';
     tr.append(td);
     tbody.append(tr);
   }
@@ -133,10 +138,11 @@ function renderTree(treeData, filter = '') {
   const container = byId('sessions-tree-container');
   container.replaceChildren();
 
-  const roots = treeData.tree || [];
+  const roots = (treeData && Array.isArray(treeData.tree)) ? treeData.tree : [];
   if (!roots.length) {
     const p = document.createElement('p');
-    p.textContent = 'No session hierarchy found.';
+    p.className = 'dk-muted';
+    p.textContent = 'No session hierarchy reported.';
     container.append(p);
     return;
   }
@@ -173,8 +179,8 @@ function renderTree(treeData, filter = '') {
 
     if (node.engine) {
       const engSpan = document.createElement('span');
-      engSpan.className = 'meta-dim';
-      engSpan.textContent = `[${node.engine}]`;
+      engSpan.className = 'meta-dim dk-mono';
+      engSpan.textContent = node.engine;
       item.append(engSpan);
     }
 
@@ -212,13 +218,38 @@ function renderTree(treeData, filter = '') {
     const el = createNodeEl(root);
     if (el) ul.append(el);
   }
+  if (!ul.children.length) {
+    const p = document.createElement('p');
+    p.className = 'dk-muted';
+    p.textContent = 'No sessions match filter.';
+    container.append(p);
+    return;
+  }
   container.append(ul);
 }
 
 async function loadData() {
+  if (loading) return;
+  loading = true;
   const status = byId('status');
+  const refreshBtn = byId('sessions-refresh');
+  if (refreshBtn) refreshBtn.disabled = true;
   status.textContent = 'Loading sessions…';
   try {
+    try {
+      const me = await api('/auth/me');
+      if (me && me.email) {
+        csrf = me.csrf_token || null;
+        for (const id of ['account-name', 'menu-name', 'menu-email']) {
+          const el = byId(id);
+          if (el) el.textContent = me.email;
+        }
+        const initials = document.querySelector('.dk-avatar__initials');
+        if (initials) initials.textContent = me.email.slice(0, 1).toUpperCase();
+      }
+    } catch (e) {
+      if (e && e.message === 'Sign-in required') return;
+    }
     const [sessionsData, treeData] = await Promise.all([
       api('/api/sessions?limit=100'),
       api('/api/sessions/tree')
@@ -226,10 +257,13 @@ async function loadData() {
     cachedSessions = sessionsData.sessions || [];
     cachedTree = treeData || { tree: [] };
     updateView();
-    status.textContent = `${cachedSessions.length} session${cachedSessions.length === 1 ? '' : 's'}`;
+    status.textContent = `Authenticated · ${cachedSessions.length} session${cachedSessions.length === 1 ? '' : 's'}`;
   } catch (err) {
-    status.textContent = 'Error loading sessions';
-    console.error(err);
+    status.textContent = 'Sessions could not be refreshed.';
+    updateView();
+  } finally {
+    loading = false;
+    if (refreshBtn) refreshBtn.disabled = false;
   }
 }
 
@@ -249,12 +283,11 @@ function setupEvents() {
   const treeSec = byId('tree-section');
   const filterInput = byId('sessions-filter');
   const refreshBtn = byId('sessions-refresh');
+  const signOut = byId('sign-out');
 
   listBtn?.addEventListener('click', () => {
     activeTab = 'list';
-    listBtn.classList.add('is-active');
     listBtn.setAttribute('aria-selected', 'true');
-    treeBtn.classList.remove('is-active');
     treeBtn.setAttribute('aria-selected', 'false');
     listSec.hidden = false;
     treeSec.hidden = true;
@@ -263,9 +296,7 @@ function setupEvents() {
 
   treeBtn?.addEventListener('click', () => {
     activeTab = 'tree';
-    treeBtn.classList.add('is-active');
     treeBtn.setAttribute('aria-selected', 'true');
-    listBtn.classList.remove('is-active');
     listBtn.setAttribute('aria-selected', 'false');
     listSec.hidden = true;
     treeSec.hidden = false;
@@ -278,6 +309,23 @@ function setupEvents() {
 
   refreshBtn?.addEventListener('click', () => {
     loadData();
+  });
+
+  signOut?.addEventListener('click', async () => {
+    signOut.disabled = true;
+    try {
+      if (!csrf) {
+        const me = await api('/auth/me');
+        csrf = me.csrf_token;
+      }
+      const res = await fetch('/auth/logout', { method: 'POST', credentials: 'same-origin', redirect: 'manual', headers: { 'X-CSRF-Token': csrf } });
+      if (res.type !== 'opaqueredirect' && !res.ok) throw new Error('Sign-out failed');
+      csrf = null;
+      location.assign('/auth/login');
+    } catch {
+      byId('status').textContent = 'Sign-out could not be confirmed. Try again.';
+      signOut.disabled = false;
+    }
   });
 }
 

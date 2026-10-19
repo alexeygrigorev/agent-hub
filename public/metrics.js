@@ -412,5 +412,17 @@ byId('metrics-host-more').addEventListener('click', () => {
   }).catch((e) => applyError(e && e.code));
 });
 const signOut = byId('sign-out');
-if (signOut) signOut.addEventListener('click', () => { location.assign('/auth/logout'); });
+if (signOut) signOut.addEventListener('click', async () => {
+  signOut.disabled = true;
+  try {
+    const me = await api('/auth/me');
+    const response = await fetch('/auth/logout', { method: 'POST', credentials: 'same-origin', redirect: 'manual', headers: { 'X-CSRF-Token': me.csrf_token } });
+    if (response.type !== 'opaqueredirect' && !response.ok) throw Error('Sign-out failed');
+    csrf = null;
+    location.assign('/auth/login');
+  } catch {
+    byId('status').textContent = 'Sign-out could not be confirmed. Try again.';
+    signOut.disabled = false;
+  }
+});
 refresh();

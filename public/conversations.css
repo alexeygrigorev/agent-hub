@@ -15,7 +15,7 @@
 
 /* ---- Message list ---- */
 .conv-thread { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.conv-thread__scroll { flex: 1; min-height: 0; overflow-y: auto; padding: var(--dk-space-4); scroll-padding-block-start: var(--dk-space-4); }
+.conv-thread__scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 0 var(--dk-space-4) var(--dk-space-4); scroll-padding-block-start: var(--dk-space-4); }
 .conv-thread__top { display: flex; justify-content: center; padding: var(--dk-space-2) 0 var(--dk-space-4); }
 
 .conv-day { position: sticky; top: 0; z-index: 1; background: var(--dk-bg-surface); padding: var(--dk-space-2) 0; margin: 0; color: var(--dk-text-muted); font-size: var(--dk-text-xs); font-weight: var(--dk-weight-semibold); letter-spacing: 0.06em; text-transform: uppercase; }

@@ -9,7 +9,7 @@ export const UI_HEADERS = {
 };
 export function authPage(title: string, lede: string, body = '', email = '', foot = '', returnTo = ''): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>${escapeHtml(title)} · Agent Hub</title><link rel="stylesheet" href="/vendor/dakit/dakit.css"><link rel="stylesheet" href="/auth.css"><script src="/auth.js"></script></head>
-<body class="dk-auth-page"><header class="dk-auth-page__bar"><a class="dk-auth-page__brand" href="/">Agent Hub</a><div class="dk-auth-page__identity" role="status">${escapeHtml(email)}${email ? ` <a href="/auth/login${returnTo ? '?return_to='+encodeURIComponent(returnTo) : ''}">Switch account</a>` : ''}</div></header><main class="dk-auth-page__main"><section class="dk-auth-card" aria-labelledby="auth-title"><header class="dk-auth-card__head"><h1 class="dk-auth-card__title" id="auth-title" tabindex="-1">${escapeHtml(title)}</h1><p class="dk-auth-card__lede">${escapeHtml(lede)}</p></header>${body}<footer class="dk-auth-card__foot">${foot}<nav class="hub-auth-nav" aria-label="Agent Hub"><a href="/conversations.html">Conversations</a><a href="/fleet.html">Fleet</a><a href="/metrics.html">Metrics</a><a href="/device">Pair a device</a></nav></footer></section></main><script src="/vendor/dakit/shell.js"></script></body></html>`;
+<body class="dk-auth-page"><header class="dk-auth-page__bar"><a class="dk-auth-page__brand" href="/">Agent Hub</a><div class="dk-auth-page__identity" role="status">${escapeHtml(email)}${email ? ` <a href="/auth/login${returnTo ? '?return_to='+encodeURIComponent(returnTo) : ''}">Switch account</a>` : ''}</div></header><main class="dk-auth-page__main"><section class="dk-auth-card" aria-labelledby="auth-title"><header class="dk-auth-card__head"><h1 class="dk-auth-card__title" id="auth-title" tabindex="-1">${escapeHtml(title)}</h1><p class="dk-auth-card__lede">${escapeHtml(lede)}</p></header>${body}<footer class="dk-auth-card__foot">${foot}<nav class="hub-auth-nav" aria-label="Agent Hub"><a href="/conversations.html">Conversations</a><a href="/fleet.html">Fleet</a><a href="/sessions.html">Sessions</a><a href="/metrics.html">Metrics</a><a href="/device">Pair a device</a></nav></footer></section></main><script src="/vendor/dakit/shell.js"></script></body></html>`;
 }
 export function tokenPage(message: string, next: string | null, status: number): string {
   return authPage('Sign in to Agent Hub', 'Sign in with the admin token kept on your machine.', `${status >= 400 ? `<p class="dk-callout dk-callout--${status === 429 ? 'warning' : 'danger'}" role="alert">${escapeHtml(message)}</p>` : ''}<form method="post" action="/auth/token" class="dk-stack"><input type="hidden" name="return_to" value="${escapeHtml(next || '')}"><div><label class="dk-label" for="admin-token">Admin token</label><input class="dk-input" id="admin-token" name="token" type="password" autocomplete="current-password" required></div><div class="dk-auth-card__actions"><button class="dk-button dk-button--primary dk-button--lg" type="submit">Sign in</button></div></form>`, '', 'Keep your token private.');
@@ -35,7 +35,7 @@ export function authFailure(request: Request, error: string, status: number, ext
   } else if (cat.startsWith('oauth_error:') || cat.startsWith('oauth_')) {
     lede = `Provider returned an error: ${cat.replace(/^oauth_error:|^oauth_/, '')}. Start sign-in again.`;
   }
-  const diagBody = `<div class="dk-auth-card__actions"><a class="dk-button dk-button--primary dk-button--lg" href="/auth/login">Try sign-in again</a></div><p class="dk-hint" id="auth-diagnostic" data-category="${escapeHtml(cat)}" style="margin-top:1.25rem;font-size:0.8125rem;color:var(--dk-text-muted,#888);">Diagnostic reference: <code>${escapeHtml(cat)}</code></p>`;
+  const diagBody = `<div class="dk-auth-card__actions"><a class="dk-button dk-button--primary dk-button--lg" href="/auth/login">Try sign-in again</a></div><p class="dk-hint" id="auth-diagnostic" data-category="${escapeHtml(cat)}">Diagnostic reference: <code>${escapeHtml(cat)}</code></p>`;
   return new Response(authPage(unavailable ? 'Sign-in unavailable' : forbidden ? 'Access not allowed' : 'Sign-in could not finish', lede, diagBody), { status, headers: respHeaders });
 }
 
@@ -97,21 +97,21 @@ export function conversationFollowThroughView(followThrough: any): string {
       'dk-badge--warning';
     const authority = fact.authority || 'none';
     const sourceId = fact.source_identity || 'unknown';
-    return `<div class="dk-card" style="margin-bottom:0.5rem;padding:0.75rem;">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
+    return `<div class="dk-card dk-stack dk-stack--tight">
+      <div class="dk-section-header">
         <strong>${e(label)}</strong>
         <span class="dk-badge ${stateBadgeClass}">${e(state)}</span>
       </div>
-      <div class="dk-hint" style="margin-top:0.25rem;">
+      <div class="dk-hint">
         Authority: <code>${e(authority)}</code> | Source: <span class="dk-mono">${e(sourceId)}</span>
       </div>
-      ${fact.observation ? `<pre class="dk-mono" style="margin-top:0.25rem;font-size:0.75rem;">${e(JSON.stringify(fact.observation, null, 2))}</pre>` : ''}
+      ${fact.observation ? `<div class="dk-code-block"><pre class="dk-mono"><code>${e(JSON.stringify(fact.observation, null, 2))}</code></pre></div>` : ''}
     </div>`;
   }).join('');
 
-  return `<div class="dk-stack" style="margin-top:1rem;">
-    <div style="display:flex;justify-content:space-between;align-items:center;">
-      <h3 style="margin:0;">Follow-Through Authority Facts</h3>
+  return `<div class="dk-stack">
+    <div class="dk-section-header">
+      <h3 class="dk-section-header__title">Follow-Through Authority Facts</h3>
       ${overdue ? '<span class="dk-badge dk-badge--danger">Overdue Obligation</span>' : ''}
     </div>
     <div class="dk-stack">${factRows}</div>

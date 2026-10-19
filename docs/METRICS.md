@@ -284,11 +284,14 @@ state when it disappeared. When the listing comes back empty while a
 host was selected, the selector keeps that preserved unavailable option
 selected (no silent switch to another host or to `No hosts`); an initial
 empty state with no prior selection still renders empty. Detail and
-refresh commits are fenced by request generation and current selection
-across all awaited and catch paths: a delayed superseded response (or its
-error) is ignored once the selection moved on, and a selection made
-during refresh survives it. Auth, loading, empty, stale, unknown, access
-denied, expiry, and service failure are distinct. Known cache-read,
+paged-list refresh commits are fenced by request/refresh generation and the
+live current selection across every awaited page, overlapping refresh, page
+failure, and late detail success/error: host options are reconciled with the
+selection at commit (never a stale value from refresh start), a stale page
+error never clears a newer selection's data/status, and the final detail
+refetch routes to the live host. Auth, loading, empty, stale, unknown, access
+denied, expiry, and service failure are distinct. A failed list refresh may
+leave truthful list metadata separate without clearing the current detail. Known cache-read,
 cache-creation, reasoning, and noncache-input counts are shown separately
 from coverage fractions. Reasoning is never added to output. Quota is
 never converted to tokens or money.

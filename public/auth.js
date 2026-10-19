@@ -23,6 +23,46 @@ addEventListener('DOMContentLoaded', () => {
     }
   }).catch(() => { /* Normal GET code entry remains usable if module loading fails. */ });
 
+  if (document.documentElement.dataset.hubPage === 'overview') {
+    const status = document.getElementById('status');
+    const signOut = document.getElementById('sign-out');
+    let csrf = null;
+    fetch('/auth/me', { credentials: 'same-origin', cache: 'no-store' })
+      .then(r => (r.ok ? r.json() : null))
+      .then(me => {
+        if (!me || !me.email) {
+          if (status) status.textContent = 'Ready · sign in to access live hub data';
+          return;
+        }
+        csrf = me.csrf_token || null;
+        for (const id of ['account-name', 'menu-name', 'menu-email']) {
+          const el = document.getElementById(id);
+          if (el) el.textContent = me.email;
+        }
+        const initials = document.querySelector('.dk-avatar__initials');
+        if (initials) initials.textContent = me.email.slice(0, 1).toUpperCase();
+        if (status) status.textContent = `Authenticated as ${me.email}`;
+      })
+      .catch(() => {
+        if (status) status.textContent = 'Workspace directory ready';
+      });
+    signOut?.addEventListener('click', async () => {
+      signOut.disabled = true;
+      try {
+        if (!csrf) {
+          const me = await fetch('/auth/me', { credentials: 'same-origin', cache: 'no-store' });
+          if (me.ok) csrf = (await me.json()).csrf_token;
+        }
+        const res = await fetch('/auth/logout', { method: 'POST', credentials: 'same-origin', redirect: 'manual', headers: csrf ? { 'X-CSRF-Token': csrf } : {} });
+        if (res.type !== 'opaqueredirect' && !res.ok) throw Error('Sign-out failed');
+        location.assign('/auth/login');
+      } catch {
+        if (status) status.textContent = 'Sign-out could not be confirmed. Try again.';
+        signOut.disabled = false;
+      }
+    });
+  }
+
   const review = document.getElementById('device-review');
   if (!review) return;
   const confirm = document.getElementById('device-confirm');

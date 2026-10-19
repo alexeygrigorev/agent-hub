@@ -10,6 +10,12 @@ const root=resolve(import.meta.dirname,'..'),vendor=resolve(root,'public/vendor/
 const lock=JSON.parse(await readFile(resolve(vendor,'dakit.lock.json'),'utf8'));
 assert.equal(lock.version,'0.2.0');assert.equal(lock.commit,'0e283cd');
 for(const [path,hash] of Object.entries(lock.files))assert.equal(createHash('sha256').update(await readFile(resolve(vendor,path))).digest('hex'),hash,'Reviewed kit drift: '+path);
-const paths=['public/fleet.css','public/fleet.html','public/auth.css','public/auth.js','public/fleet.js'].map(p=>resolve(root,p));
+const paths=[
+  'public/index.html',
+  'public/fleet.css','public/fleet.html','public/fleet.js',
+  'public/metrics.css','public/metrics.html','public/metrics.js',
+  'public/sessions.css','public/sessions.html','public/sessions.js',
+  'public/auth.css','public/auth.js'
+].map(p=>resolve(root,p));
 assert.deepEqual(checkColors(paths),[]);assert.deepEqual(checkBorders(paths),[]);assert.deepEqual(checkScale(paths).failures,[]);
 console.log('PASS reviewed official dakit lock (21 files), semantic colors, neutral borders and type/space scales');

@@ -1,19 +1,16 @@
-/* Sessions and lineage dashboard styles */
+/* Sessions and lineage structure only; the official kit owns controls, type, palette and shell. */
 .sessions-card { padding: var(--dk-pad-panel); min-width: 0; }
-.sessions-section-title { font-size: var(--dk-text-lg); font-weight: var(--dk-weight-semibold); margin-bottom: var(--dk-space-2); }
-.sessions-controls { align-items: center; gap: var(--dk-gap-block); margin-bottom: var(--dk-space-4); }
+.sessions-section-title { font-size: var(--dk-text-lg); font-weight: var(--dk-weight-semibold); }
+.sessions-controls { align-items: center; gap: var(--dk-gap-control); }
 .sessions-filter-wrap { flex: 1; min-width: 200px; max-width: 360px; }
-.sessions-controls .is-active { background-color: var(--dk-bg-surface-raised, #24292e); color: var(--dk-text-primary, #fff); }
 
-.type-badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 4px; font-size: var(--dk-text-xs); font-family: var(--dk-font-mono); font-weight: var(--dk-weight-medium); }
-.type-badge--aplexer { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); }
-.type-badge--headless { background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); }
+.type-badge { font-family: var(--dk-font-mono); }
 
 .tree-view { list-style: none; padding-left: 0; margin: 0; font-family: var(--dk-font-sans); }
 .tree-node { position: relative; margin-block: var(--dk-space-2); }
-.tree-item { display: flex; align-items: center; gap: var(--dk-space-2); padding: var(--dk-space-2) var(--dk-space-3); border-radius: var(--dk-radius-sm); background: var(--dk-bg-surface-raised, rgba(255,255,255,0.03)); border: 1px solid var(--dk-border-subtle, rgba(255,255,255,0.08)); }
-.tree-item:hover { border-color: var(--dk-border-default, rgba(255,255,255,0.2)); }
-.tree-children { list-style: none; padding-left: var(--dk-space-6); margin-top: var(--dk-space-2); border-left: 2px dashed var(--dk-border-subtle, rgba(255,255,255,0.15)); }
+.tree-item { display: flex; flex-wrap: wrap; align-items: center; gap: var(--dk-space-2); padding: var(--dk-space-2) var(--dk-space-3); border-radius: var(--dk-radius-md); background: var(--dk-bg-muted); border: 1px solid var(--dk-border-default); }
+.tree-item:hover { background: var(--dk-bg-hover); border-color: var(--dk-border-control-hover); }
+.tree-children { list-style: none; padding-left: var(--dk-space-5); margin-top: var(--dk-space-2); border-left: 1px solid var(--dk-border-default); }
 
 .code-pill { font-family: var(--dk-font-mono); font-size: var(--dk-text-sm); font-weight: var(--dk-weight-semibold); }
 .meta-dim { color: var(--dk-text-muted); font-size: var(--dk-text-xs); }

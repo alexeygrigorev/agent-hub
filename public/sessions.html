@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Sessions & Lineage · Agent Hub</title>
+  <title>Sessions &amp; Lineage · Agent Hub</title>
   <link rel="stylesheet" href="/vendor/dakit/dakit.css">
   <link rel="stylesheet" href="/sessions.css">
   <script src="/auth.js"></script>
@@ -23,7 +23,7 @@
 
   <aside class="dk-sidebar" id="dk-sidebar" aria-label="Workspace">
     <div class="dk-sidebar__head">
-      <a class="dk-brand" href="/"><span class="dk-brand__name">Agent Hub</span></a>
+      <a class="dk-brand" href="/"><span class="dk-brand__tile" aria-hidden="true">AH</span><span class="dk-brand__name">Agent Hub</span></a>
       <button class="dk-icon-button dk-sidebar__close" type="button" data-dk-drawer-close aria-label="Close navigation">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
       </button>
@@ -40,7 +40,11 @@
         </a>
         <a class="dk-nav-item" href="/sessions.html" aria-current="page">
           <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-          <span class="dk-nav-item__label">Sessions & Lineage</span>
+          <span class="dk-nav-item__label">Sessions &amp; Lineage</span>
+        </a>
+        <a class="dk-nav-item" href="/metrics.html">
+          <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19V9M10 19V5M16 19v-6M22 19V3"/></svg>
+          <span class="dk-nav-item__label">Metrics</span>
         </a>
         <a class="dk-nav-item" href="/device">
           <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M10 18h4"/></svg>
@@ -66,21 +70,21 @@
     <div class="dk-main__inner">
       <header class="dk-page-header">
         <div class="dk-page-header__main">
-          <h1 class="dk-page-header__title">Sessions & Lineage</h1>
+          <h1 class="dk-page-header__title">Sessions &amp; Lineage</h1>
           <p class="dk-page-header__subtitle">All host native and headless sessions, unified lineage, and control</p>
         </div>
       </header>
 
       <div class="dk-cluster sessions-controls">
-        <div class="dk-button-group" role="tablist" aria-label="Session View">
-          <button class="dk-button dk-button--secondary is-active" id="view-list-btn" type="button" role="tab" aria-selected="true">List View</button>
-          <button class="dk-button dk-button--secondary" id="view-tree-btn" type="button" role="tab" aria-selected="false">Lineage Tree</button>
+        <div class="dk-tabs" role="tablist" aria-label="Session View">
+          <button class="dk-tab" id="view-list-btn" type="button" role="tab" aria-selected="true" aria-controls="list-section">List View</button>
+          <button class="dk-tab" id="view-tree-btn" type="button" role="tab" aria-selected="false" aria-controls="tree-section">Lineage Tree</button>
         </div>
         <div class="sessions-filter-wrap">
           <input type="search" id="sessions-filter" class="dk-input" placeholder="Filter by name, alias, engine, state…" aria-label="Filter sessions">
         </div>
         <button class="dk-button dk-button--secondary" type="button" id="sessions-refresh">Refresh</button>
-        <span id="status" role="status" class="dk-text-muted">Loading sessions…</span>
+        <span id="status" role="status" class="dk-muted">Loading sessions…</span>
       </div>
 
       <section class="dk-card dk-stack sessions-card" id="list-section">
@@ -90,11 +94,30 @@
 
       <section class="dk-card dk-stack sessions-card" id="tree-section" hidden>
         <h2 class="sessions-section-title">Session Lineage Tree</h2>
-        <p class="dk-text-muted">Parent-child hierarchy (Developer &gt; Coordinator &gt; Workers). Sessions started outside the hub show external origin.</p>
+        <p class="dk-muted">Parent-child hierarchy (Developer &gt; Coordinator &gt; Workers). Sessions started outside the hub show external origin.</p>
         <div id="sessions-tree-container"></div>
       </section>
     </div>
   </main>
+
+  <div class="dk-menu dk-account-menu" id="dk-account-menu" data-dk-popover hidden>
+    <div class="dk-menu__identity">
+      <span class="dk-menu__name" id="menu-name">Signed out</span>
+      <span class="dk-menu__email" id="menu-email"></span>
+    </div>
+    <button class="dk-menu__item" type="button" role="switch" aria-checked="false" data-dk-theme-toggle>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+      Dark mode<span class="dk-switch" aria-hidden="true"></span>
+    </button>
+    <div class="dk-menu__sep" role="separator"></div>
+    <button class="dk-menu__item dk-menu__item--danger" type="button" id="sign-out">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5M21 12H9"/></svg>
+      Sign out
+    </button>
+  </div>
+
+  <div id="dk-live" class="dk-visually-hidden" aria-live="polite"></div>
 </div>
+<script src="/vendor/dakit/shell.js"></script>
 </body>
 </html>

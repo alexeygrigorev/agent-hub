@@ -93,7 +93,7 @@ export default {
       return new Response(null, { status: 303, headers: { Location: '/auth/login', 'Cache-Control': 'private, no-store' } });
     }
     if (!env.ASSETS) return new Response('Not found', { status: 404 });
-    if (url.pathname === '/' || url.pathname === '/index.html') url.pathname = '/conversations.html';
+    if (url.pathname === '/') url.pathname = '/conversations.html';
     if (url.pathname === '/metrics') url.pathname = '/metrics.html';
     if (url.pathname === '/sessions') url.pathname = '/sessions.html';
     const asset = await env.ASSETS.fetch(new Request(url, request));
