@@ -65,7 +65,6 @@ def cmd_update(args):
         getattr(args, "url", None)
         or os.environ.get("HUB_URL")
         or os.environ.get("HUB_BASE_URL")
-        or config.load_config().get("base_url")
         or config.DEFAULT_BASE_URL
     ).rstrip("/")
     api.check_url(clean_base)
@@ -185,6 +184,9 @@ def cmd_auth_status(args):
         sys.exit(1)
     try:
         status = human_auth.human_status()
+    except config.ConfigPermissionError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
     except Exception:
         print("Status operation failed; check authentication and filters.", file=sys.stderr)
         sys.exit(1)
@@ -340,7 +342,7 @@ def main():
     parser.add_argument("--version", action="version", version=f"%(prog)s {format_version()}")
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_update = sub.add_parser("update", help="Update hub CLI to the latest deployed version or check staleness")
-    p_update.add_argument("--url", default=None, help="Hub base URL (default: loaded from config or https://hub.dtcdev.click)")
+    p_update.add_argument("--url", default=None, help="Release URL (default: HUB_URL/HUB_BASE_URL or https://hub.dtcdev.click; ignores stored profile URL)")
     p_update.add_argument("--check", action="store_true", help="Check for updates without installing")
     p_update.add_argument("--force", action="store_true", help="Force update/reinstall even if already at latest commit")
     p_update.add_argument("--install-dir", default=None, help="Directory to install the updated hub binary (default: current executable location or ~/.local/bin)")
@@ -500,6 +502,9 @@ def main():
     if args.cmd in ('intake', 'handoff'):
         try:
             print(json.dumps(intake.execute(args), indent=2, ensure_ascii=True))
+        except (intake.IntakeHTTPError, intake.IntakeTransportError, config.ConfigPermissionError) as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
         except Exception:
             print('Intake operation failed; check authentication, grants, capacity and current versions. '
                   'Retry mutations with the same key and payload after uncertain responses; '

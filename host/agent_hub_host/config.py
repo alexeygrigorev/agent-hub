@@ -187,11 +187,22 @@ def _validate_data(data: dict) -> dict:
         res[k] = v
     return res
 
+class ConfigPermissionError(PermissionError):
+    """Safe diagnostic; never includes profile contents or arbitrary OS text."""
+
+
 def _load_from(path: Path) -> dict:
     if not path.exists():
         return {}
     try:
         return _validate_data(json.loads(private_fs.read_bytes(path, 1024 * 1024)))
+    except PermissionError:
+        raise ConfigPermissionError(
+            'Unsafe Hub profile permissions. On POSIX, the profile directory must be owned '
+            'by your user with mode 700 and the profile file with mode 600. '
+            'For the default profile run: chmod 700 ~/.config/agent-hub; '
+            'chmod 600 ~/.config/agent-hub/cli.json (or host.json). '
+            'Symlinks and multiply linked files are refused.') from None
     except Exception:
         return {}
 

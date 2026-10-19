@@ -251,6 +251,18 @@ describe('private durable intake HTTP/SQLite', () => {
     expect((await call('/tasks/' + task.id + '/events', { key: 'forged-verification', expected_version: 2, event: { ...event, evidence: 'hub_launch_verified' } })).status).toBe(400);
   });
 
+  it('accepts concise notes and session aliases without relaxing link checks', async () => {
+    const { task } = await create();
+    const note = await append(task.id, 1, { kind: 'note', text: 'Concise note' });
+    expect(note.task.payload_data.history.at(-1)).toMatchObject({ kind: 'note', text: 'Concise note', source });
+    const linked = await append(task.id, 2, { kind: 'session', native_id: 'fixture-native' });
+    expect(linked.task.payload_data.history.at(-1)).toMatchObject({ kind: 'link', native_id: 'fixture-native', provenance: source, evidence: 'external_unverified_not_launch_proof' });
+    expect((await call('/tasks/' + task.id + '/events', { key: 'unknown-session', expected_version: 3,
+      event: { kind: 'session', hub_session_id: '12345678-1234-4234-8234-123456789012' } })).status).toBe(404);
+    expect((await call('/tasks/' + task.id + '/events', { key: 'invalid-source', expected_version: 3,
+      event: { kind: 'note', text: 'Invalid', source: null } })).status).toBe(400);
+  });
+
   it('assigns a real Hub session through the canonical session API and projects it live in handoff', async () => {
     const { task } = await create();
     const payload = { key: 'assign-live', expected_version: 1,
@@ -260,6 +272,11 @@ describe('private durable intake HTTP/SQLite', () => {
     const sessionId = assigned.assigned_session.hub_session_id;
     expect(sessionId).toMatch(/^[0-9a-f-]{36}$/i);
     expect(assigned.assigned_session.linkage).toBe('hub_session');
+    expect(assigned.assigned_session.state).toBe('held');
+    expect(assigned.hold).toBeTruthy();
+    expect(assigned.assigned_session.hold).toEqual(assigned.hold);
+    const heldRead = await ok('/tasks/' + task.id);
+    expect(heldRead.task.assigned_sessions[0].hold).toEqual(assigned.hold);
     expect(assigned.task.control.version).toBe(2);
     expect(assigned.task.payload_data.next_step).toBe('Watch Hub binding');
     const link = assigned.task.payload_data.history.find((e: any) => e.kind === 'link');

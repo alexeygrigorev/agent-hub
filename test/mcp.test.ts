@@ -3,7 +3,7 @@ import { runInDurableObject } from 'cloudflare:test';
 import { defaultEnv, doFetch } from './m1-focus-setup';
 import { createSessionCookie } from '../src/auth/session';
 import { sha256 } from '../src/auth/crypto';
-import { CLI_EXCLUSIONS, MCP_ROUTES, publicTools, toolRequest } from '../src/mcp-tools';
+import { CLI_EXCLUSIONS, MCP_ROUTES, publicTools, toolRequest, dispatchToolRequest } from '../src/mcp-tools';
 import cliCommands from './mcp-cli-commands.json';
 
 const origin = 'http://example.com';
@@ -51,6 +51,54 @@ beforeAll(async () => {
   cookie = (await createSessionCookie(defaultEnv, { sub, email: 'admin@fake.local', isAdmin: true, csrfToken: csrf, exp: Math.floor(Date.now() / 1000) + 3600 })).split(';')[0];
 });
 describe('Hub MCP protocol and parity', () => {
+  it('updates intake with optional key/version and preserves concise append and held diagnostics', async () => {
+    const invoke = async (name: string, args: any) => {
+      const response: any = await (await rpc('tools/call', { name, arguments: args })).json();
+      return JSON.parse(response.result.content[0].text);
+    };
+    const created = await invoke('intake_create', { payload: { key: 'mcp-convenience-create', project: 'demo', title: 'Fixture', text: 'Fixture', source: { type: 'unknown' } } });
+    const id = created.data.task.id;
+    const updated = await invoke('intake_update', { id, payload: { owner: 'fixture-owner' } });
+    expect(updated.status).toBe(200);
+    expect(updated.data.task.control.version).toBe(2);
+    expect(updated.data.task.payload_data.owner).toBe('fixture-owner');
+    const stale = await invoke('intake_update', { id, payload: { expected_version: 1, owner: 'stale-owner' } });
+    expect(stale).toMatchObject({ status: 409, data: { error: 'version_conflict' } });
+    expect((await invoke('intake_append', { id, payload: { key: 'mcp-note', expected_version: 2, event: { kind: 'note', text: 'Fixture' } } })).status).toBe(200);
+    expect((await invoke('intake_append', { id, payload: { key: 'mcp-session', expected_version: 3, event: { kind: 'session', native_id: 'fixture-native' } } })).status).toBe(200);
+    const held = await invoke('intake_assign', { id, payload: { key: 'mcp-assign', expected_version: 4, session: { workspace: 'demo', engine: 'codex', mode: 'headless', brief: 'Synthetic fixture goal' }, provenance: { type: 'unknown' } } });
+    expect(held.status, JSON.stringify(held.data)).toBe(200);
+    expect(held.data.assigned_session.state).toBe('held');
+    expect(held.data.hold).toBeTruthy();
+    expect(held.data.assigned_session.hold).toEqual(held.data.hold);
+  });
+  it('retries only CAS conflicts with a stable key and bounded attempts', async () => {
+    for (const code of ['version_conflict', 'idempotency_conflict']) {
+      const writes: any[] = [];
+      let reads = 0;
+      const response = await dispatchToolRequest(toolRequest(origin, 'intake_update', { id: 'fixture', payload: { owner: 'fixture' } }, 'Bearer fixture'), 'intake_update', async r => {
+        expect(r.headers.get('Authorization')).toBe('Bearer fixture');
+        if (r.method === 'GET') return Response.json({ task: { control: { version: ++reads } } });
+        writes.push(await r.json());
+        return Response.json({ error: code }, { status: 409 });
+      });
+      expect(response.status).toBe(409);
+      expect(writes.length).toBe(code === 'version_conflict' ? 3 : 1);
+      expect(new Set(writes.map(w => w.key)).size).toBe(1);
+      expect(writes.map(w => w.expected_version)).toEqual(code === 'version_conflict' ? [1, 2, 3] : [1]);
+    }
+  });
+  it('retains the generated key and original version on an uncertain update without retry', async () => {
+    let writes = 0;
+    const response = await dispatchToolRequest(toolRequest(origin, 'intake_update', { id: 'fixture', payload: { owner: 'fixture' } }, 'Bearer fixture'), 'intake_update', async r => {
+      if (r.method === 'GET') return Response.json({ task: { control: { version: 7 } } });
+      writes++;
+      throw new Error('private diagnostic');
+    });
+    expect(response.status).toBe(502);
+    expect(await response.json()).toMatchObject({ error: 'intake_update_outcome_unknown', key: expect.stringMatching(/^update-/), expected_version: 7 });
+    expect(writes).toBe(1);
+  });
   it('requires bearer auth with protected-resource discovery', async () => {
     const r = await rpc('tools/list', undefined, 'invalid');
     expect(r.status).toBe(401);

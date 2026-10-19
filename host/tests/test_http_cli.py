@@ -375,6 +375,8 @@ class TestHttpCliMock(unittest.TestCase):
     def test_mode_0600_config(self):
         mode = stat.S_IMODE(os.stat(self.config_file).st_mode)
         self.assertEqual(mode, 0o600)
+        if sys.platform != 'win32':
+            self.assertEqual(stat.S_IMODE(os.stat(self.config_dir).st_mode), 0o700)
 
     def test_cli_full_flow(self):
         # 1. hub send

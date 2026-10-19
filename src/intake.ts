@@ -226,6 +226,7 @@ export class IntakeService {
       let binding: Obj | null = null;
       try { binding = row.binding_json ? JSON.parse(row.binding_json) : null; } catch { binding = null; }
       out.push({ hub_session_id: e.hub_session_id, state: row.state, machine: row.machine_id ?? null,
+        ...(row.state === 'held' ? { hold: e.assignment_hold ?? 'placement_pending' } : {}),
         engine: row.engine ?? null, mode: row.mode ?? null, fleet_launch_id: row.fleet_launch_id ?? null,
         binding, updated_at: row.updated_at ?? null, linkage: 'hub_session' });
     }
@@ -361,6 +362,12 @@ export class IntakeService {
     return { snapshot_version: revision, task: this.view(task, p) };
   }
   private event(raw: Obj, task: Obj, p: Obj, now: number): Obj {
+    // Session is the public spelling of an external session link. Keep the
+    // existing canonical link validation and ownership checks.
+    if (raw.kind === 'session') raw = { ...raw, kind: 'link' };
+    if (['note', 'decision', 'followup', 'blocker', 'pending_approval'].includes(raw.kind) && raw.source === undefined)
+      raw = { ...raw, source: { type: 'unknown' } };
+    if (raw.kind === 'link' && raw.provenance === undefined) raw = { ...raw, provenance: { type: 'unknown' } };
     const kind = raw.kind; let fields: Obj;
     if (kind === 'intake') {
       keys(raw, ['kind', 'text', 'source', 'transcription']);
@@ -776,6 +783,7 @@ export class IntakeService {
         host: typeof row.machine_id === 'string' ? row.machine_id : null, hub: null,
         provenance, routing_job_id: null, hub_session_id: created.id }, task, fresh, now);
       link.intake_key = b.key;
+      if (created.state === 'held' && created.hold !== undefined) link.assignment_hold = created.hold;
       task.history.push(link);
       const changes: Obj = {};
       for (const field of ['current_state', 'next_step', 'owner']) if (field in b) {
@@ -792,6 +800,7 @@ export class IntakeService {
       const assigned = this.assignedSessions(task, fresh).find(s => s.hub_session_id === created.id) ??
         { hub_session_id: created.id, linkage: 'hub_session' };
       const response = { task: this.view(task, fresh), assigned_session: assigned,
+        ...(created.state === 'held' ? { hold: created.hold ?? 'placement_pending', requested: created.requested } : {}),
         snapshot_version: this.revision() + 1, data_notice: DATA_NOTICE };
       this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
       this.put('receipts', { id, fingerprint, response }); this.capacity();

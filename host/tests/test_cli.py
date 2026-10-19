@@ -123,6 +123,36 @@ class TestCliUpdate(unittest.TestCase):
         self.assertTrue(v_str.startswith("0.1.0 ("))
         self.assertTrue(v_str.endswith(")"))
 
+    def test_auth_status_explains_unsafe_profile_permissions(self):
+        import argparse
+        import io
+        from unittest.mock import patch
+        from agent_hub_host import cli, config
+        error = io.StringIO()
+        with patch.object(cli.human_auth, 'human_status', side_effect=config.ConfigPermissionError('Profile must use mode 700')), \
+             patch('sys.stderr', error):
+            with self.assertRaises(SystemExit):
+                cli.cmd_auth_status(argparse.Namespace(json=False))
+        self.assertIn('mode 700', error.getvalue())
+        self.assertNotIn('Not logged in', error.getvalue())
+
+    def test_update_defaults_to_custom_domain_despite_legacy_profile(self):
+        import argparse
+        import io
+        from unittest.mock import patch, MagicMock
+        from agent_hub_host import cli
+        response = MagicMock()
+        response.status = 200
+        response.read.return_value = b'{"built_from_commit":"fixture"}'
+        response.__enter__.return_value = response
+        for explicit, expected in ((None, 'https://hub.dtcdev.click'), ('https://hub.test', 'https://hub.test')):
+            with patch.dict(os.environ, {'HUB_URL': '', 'HUB_BASE_URL': ''}), \
+                 patch.object(cli.config, 'load_config', return_value={'base_url': 'https://old.workers.dev'}) as profile, \
+                 patch('urllib.request.urlopen', return_value=response) as http, patch('sys.stdout', io.StringIO()):
+                cli.cmd_update(argparse.Namespace(url=explicit, check=True, force=False))
+                self.assertEqual(http.call_args.args[0].full_url, expected + '/cli/manifest.json')
+                profile.assert_not_called()
+
     def test_update_check_up_to_date(self):
         import io
         from unittest.mock import patch, MagicMock

@@ -63,6 +63,7 @@ hub intake show TASK_ID
 hub intake history TASK_ID
 hub intake links TASK_ID
 hub intake context TASK_ID
+hub intake update TASK_ID --owner example:assistant --next-step 'Obtain review'
 hub intake update TASK_ID --version 1 --status blocked --next-step 'Obtain review' --key context-001
 hub intake append TASK_ID --version 2 --event-file event.json --key event-001
 hub intake assign TASK_ID --version 3 --key assign-001 --workspace example-ws --engine codex --tier daily --next-step 'Watch Hub binding' --brief-file goal.txt
@@ -79,11 +80,23 @@ of text. It records null text and pending transcription immediately. Append a
 provided transcript later as another intake event referencing the media; the
 original capture stays unchanged. No transcription service is invoked.
 
-Every mutation requires a stable `key`; task changes require `expected_version`
-(`--version` in the CLI). After a lost response, retry the exact key and payload.
+The HTTP API requires a stable `key`; task changes require `expected_version`
+(`--version` in the CLI). For `hub intake update` and MCP `intake_update`, the
+key is generated when omitted. An omitted version is fetched before updating;
+only version conflicts retry, with at most three attempts and the same key.
+An explicit version makes one write attempt. Uncertain write outcomes are never
+automatically retried; the error includes the recovery key. Inspect task history
+before retrying, then retry the exact key, version and payload.
 A replay returns the original response even if the task has advanced since.
 Use a fresh show/context read to get current state. Different payload with the
 same key conflicts. A stale revision conflicts without partial writes.
+
+Append concise notes as `{"kind":"note","text":"Context"}`; an omitted source
+is recorded as unknown. `session` is an alias for the existing `link` event:
+`{"kind":"session","native_id":"external-session"}` records an unverified
+reference, while `hub_session_id` requires a real session visible to the caller.
+An omitted link provenance is unknown. Assignment responses preserve placement
+hold reasons in `hold` and `assigned_session.hold`; a held session has not started.
 
 `hub intake continue TASK_ID --version N --key continuation-001` records a
 ready-to-active transition through CAS. It refuses active, uncertain, blocked,

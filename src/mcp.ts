@@ -1,4 +1,4 @@
-import { publicTools, toolRequest } from './mcp-tools';
+import { publicTools, toolRequest, dispatchToolRequest } from './mcp-tools';
 
 export const MCP_VERSIONS = ['2025-03-26', '2025-06-18', '2025-11-25'];
 export const NO_STORE = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' };
@@ -67,7 +67,7 @@ export async function handleMcp(request: Request, authenticate: (r: Request) => 
   try { apiRequest = toolRequest(url.origin, rpc.params.name, rpc.params.arguments ?? {}, request.headers.get('Authorization')!); }
   catch (e: any) { return error(-32602, e.message); }
   try {
-    const response = await dispatch(apiRequest);
+    const response = await dispatchToolRequest(apiRequest, rpc.params.name, dispatch);
     // API data stays data; retain the exact API status/error and pagination DTO.
     const text = await response.text();
     let data: unknown;

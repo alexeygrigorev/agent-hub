@@ -1,6 +1,7 @@
 """Private durable task context. Task text is data; this client never executes it."""
 import json
 import os
+import uuid
 import sys
 import urllib.error
 import urllib.request
@@ -15,6 +16,33 @@ MAX_REQUEST = 32768
 
 class StaleSnapshot(ValueError):
     pass
+
+
+class IntakeHTTPError(ValueError):
+    def __init__(self, status, code='request_failed', key=None):
+        self.status, self.code = status, code
+        super().__init__(f'Intake HTTP {status}: {code}' + (f'; retry key: {key}' if key else ''))
+
+
+class IntakeTransportError(ValueError):
+    pass
+
+
+def http_error(exc, method, payload):
+    if exc.code == 409 and method == 'GET':
+        return StaleSnapshot('Snapshot changed')
+    # Never echo arbitrary error bodies, tokens, URLs or terminal controls.
+    allowed = {'version_conflict', 'idempotency_conflict', 'invalid_event_kind', 'invalid_object',
+               'invalid_field', 'unknown_field', 'invalid_source', 'not_found', 'forbidden',
+               'invalid_status', 'empty_update', 'active_assignment_exists', 'history_capacity',
+               'task_capacity', 'assignment_unavailable', 'invalid_identifier', 'unauthorized'}
+    try:
+        body = json.loads(exc.read(4097))
+        code = body.get('error') if isinstance(body, dict) else None
+    except Exception:
+        code = None
+    return IntakeHTTPError(exc.code, code if code in allowed else 'request_failed',
+                           payload.get('key') if payload else None)
 
 
 def request(method, path, payload=None):
@@ -40,12 +68,8 @@ def request(method, path, payload=None):
             try:
                 return send(auth.get_access_token())
             except urllib.error.HTTPError as retry:
-                if retry.code == 409 and method == 'GET':
-                    raise StaleSnapshot('Snapshot changed') from None
-                raise ValueError('Intake HTTP request failed') from None
-        if exc.code == 409 and method == 'GET':
-            raise StaleSnapshot('Snapshot changed') from None
-        raise ValueError('Intake HTTP request failed') from None
+                raise http_error(retry, method, payload) from None
+        raise http_error(exc, method, payload) from None
 
 
 def read_file(path):
@@ -88,8 +112,8 @@ def add_commands(sub):
     start.add_argument('--key', required=True)
     update = commands.add_parser('update', help='CAS status/context update; cannot imply execution, acceptance or approval')
     update.add_argument('id')
-    update.add_argument('--version', type=int, required=True)
-    update.add_argument('--key', required=True)
+    update.add_argument('--version', type=int, help='Explicit CAS version; otherwise fetch and retry version conflicts up to three times')
+    update.add_argument('--key', help='Stable retry key; generated automatically when omitted')
     update.add_argument('--clear', action='append', choices=['current_state', 'next_step', 'owner', 'uncertainty'], default=[], help='Explicitly clear a context field to unknown (repeatable)')
     for field in ('status', 'title', 'current-state', 'next-step', 'owner', 'uncertainty'):
         update.add_argument('--' + field)
@@ -230,8 +254,9 @@ def execute(args):
         return request('GET', path + ('' if command == 'show' else '/' + command))
     if command == 'revoke':
         return request('POST', BASE + '/grants/' + safe_id(args.id) + '/revoke', json_file(args.payload_file))
-    valid_key(args.key)
-    payload = {'key': args.key, 'expected_version': args.version}
+    key = args.key or ('update-' + uuid.uuid4().hex if command == 'update' else None)
+    valid_key(key)
+    payload = {'key': key, 'expected_version': args.version}
     if command == 'continue':
         return request('POST', path + '/continue', payload)
     if command == 'assign':
@@ -268,5 +293,16 @@ def execute(args):
             if getattr(args, field) is not None:
                 raise ValueError('Cannot set and clear one field together')
             payload[field] = None
-        return request('POST', path, payload)
+        automatic = args.version is None
+        for attempt in range(3):
+            if automatic:
+                current = request('GET', path)
+                payload['expected_version'] = current['task']['control']['version']
+            try:
+                return request('POST', path, dict(payload))
+            except IntakeHTTPError as exc:
+                if not automatic or exc.status != 409 or exc.code != 'version_conflict' or attempt == 2:
+                    raise
+            except (OSError, TimeoutError):
+                raise IntakeTransportError(f'Intake update outcome unknown; inspect the task before retrying. Retry key: {key}') from None
     raise ValueError('Unknown intake operation')

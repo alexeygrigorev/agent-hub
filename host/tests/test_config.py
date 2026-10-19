@@ -19,6 +19,21 @@ class TestConfig(unittest.TestCase):
         self.patcher.stop()
         self.tmpdir.cleanup()
 
+    @unittest.skipIf(sys.platform == 'win32', 'POSIX modes')
+    def test_unsafe_profile_permissions_are_actionable_and_never_loaded(self):
+        config.save_config({'access_token': 'private-fixture'})
+        path = self.mock_get_path.return_value
+        for directory_mode, file_mode in ((0o755, 0o600), (0o700, 0o644)):
+            os.chmod(path.parent, directory_mode)
+            os.chmod(path, file_mode)
+            with self.assertRaises(config.ConfigPermissionError) as caught:
+                config._load_from(path)
+            self.assertIn('700', str(caught.exception))
+            self.assertIn('600', str(caught.exception))
+            self.assertNotIn('private-fixture', str(caught.exception))
+        os.chmod(path, 0o600)
+        self.assertEqual(config._load_from(path)['access_token'], 'private-fixture')
+
     def test_save_and_load(self):
         data = {"access_token": "foo"}
         config.save_config(data)

@@ -43,7 +43,7 @@ tool('artifact', 'GET', '/api/fleet/tasks/{id}/artifacts/{name}', 'Fetch a sanit
 tool('intake_create', 'POST', '/api/intake/tasks', 'File verbatim task: payload key, project, title, text, transcription, source {type,reference,timestamp}.', ['intake create']);
 tool('intake_list', 'GET', '/api/intake/tasks', 'One revision-pinned page: query status, project, after, revision, authorization_valid_until, limit.', ['intake list']);
 for (const action of ['show', 'history', 'links', 'context']) tool(`intake_${action}`, 'GET', `/api/intake/tasks/{id}${action === 'show' ? '' : '/' + action}`, `Read task ${action}.`, [`intake ${action}`]);
-for (const action of ['continue', 'update', 'append', 'assign']) tool(`intake_${action}`, 'POST', `/api/intake/tasks/{id}${action === 'update' ? '' : '/'}${action === 'append' ? 'events' : action === 'update' ? '' : action}`, `Task ${action}: same payload as CLI, including key and expected_version. Assign queues a real Hub session.`, [`intake ${action}`]);
+for (const action of ['continue', 'update', 'append', 'assign']) tool(`intake_${action}`, 'POST', `/api/intake/tasks/{id}${action === 'update' ? '' : '/'}${action === 'append' ? 'events' : action === 'update' ? '' : action}`, `Task ${action}: same payload as CLI. ${action === 'update' ? 'key is generated if omitted; omitted expected_version is fetched with bounded CAS retry. Explicit versions never retry.' : 'Requires key and expected_version.'} Append accepts note {text, optional source} or session {native_id or hub_session_id, optional provenance}; session references keep link ownership checks. Assign queues a real Hub session and returns placement hold reasons.`, [`intake ${action}`]);
 for (const group of ['rules', 'grants']) {
   tool(`intake_${group}`, 'GET', `/api/intake/${group}`, `List operator ${group}.`, [`intake ${group}`]);
   tool(`intake_${group}_write`, 'POST', `/api/intake/${group}`, `Operator-only ${group} mutation; payload matches web API.`);
@@ -129,4 +129,33 @@ export function toolRequest(origin: string, name: string, args: unknown, authori
   }
   return new Request(url, { method: route.method, headers: { Authorization: authorization, 'Content-Type': 'application/json' },
     ...(route.method !== 'GET' ? { body: JSON.stringify(payload) } : {}) });
+}
+
+/** Convenience for intake updates; all reads/writes use ordinary API auth/CAS. */
+export async function dispatchToolRequest(request: Request, name: string, dispatch: (r: Request) => Promise<Response>): Promise<Response> {
+  if (name !== 'intake_update') return dispatch(request);
+  const payload = await request.json() as Record<string, any>;
+  if (payload.key === undefined) payload.key = 'update-' + crypto.randomUUID();
+  const automatic = payload.expected_version === undefined;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (automatic) {
+      const current = await dispatch(new Request(request.url, { headers: request.headers }));
+      if (!current.ok) return current;
+      const data = await current.json() as any;
+      payload.expected_version = data.task.control.version;
+    }
+    let response: Response;
+    try {
+      response = await dispatch(new Request(request.url, {
+        method: 'POST', headers: request.headers, body: JSON.stringify(payload),
+      }));
+    } catch {
+      return Response.json({ error: 'intake_update_outcome_unknown',
+        key: payload.key, expected_version: payload.expected_version }, { status: 502 });
+    }
+    if (!automatic || response.status !== 409 || attempt === 2) return response;
+    const data = await response.clone().json() as any;
+    if (data.error !== 'version_conflict') return response;
+  }
+  throw new Error('unreachable');
 }

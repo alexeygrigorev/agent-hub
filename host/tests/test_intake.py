@@ -72,10 +72,67 @@ class TestIntakeCli(unittest.TestCase):
             self.assertEqual(transport.call_args.args[2], {'key': 'retry', 'expected_version': 3, 'status': 'blocked', 'next_step': 'Review'})
             self.assertEqual(self.run_cli('intake', 'continue', 'task-1', '--version', '3', '--key', 'start')[0], 0)
             self.assertEqual(transport.call_args.args, ('POST', '/api/intake/tasks/task-1/continue', {'key': 'start', 'expected_version': 3}))
-        for args in [('intake', 'update', 'task-1', '--key', 'x'), ('intake', 'append', 'task-1', '--version', '1')]:
+        for args in [('intake', 'append', 'task-1', '--version', '1')]:
             with patch.object(intake, 'request') as transport:
                 self.assertEqual(self.run_cli(*args)[0], 2)
                 transport.assert_not_called()
+
+    def test_update_auto_version_retries_only_cas_with_one_generated_key(self):
+        calls = []
+        def send(method, path, payload=None):
+            calls.append((method, path, payload))
+            if method == 'GET':
+                return {'task': {'control': {'version': len(calls)}}}
+            if len(calls) == 2:
+                raise intake.IntakeHTTPError(409, 'version_conflict')
+            return {'ok': True}
+        with patch.object(intake, 'request', side_effect=send):
+            code, output, error = self.run_cli('intake', 'update', 'task-1', '--owner', 'demo')
+        self.assertEqual(code, 0, error)
+        writes = [c[2] for c in calls if c[0] == 'POST']
+        self.assertEqual([p['expected_version'] for p in writes], [1, 3])
+        self.assertEqual(writes[0]['key'], writes[1]['key'])
+        self.assertTrue(writes[0]['key'].startswith('update-'))
+
+    def test_auto_update_conflicts_are_bounded_and_explicit_versions_never_retry(self):
+        for explicit, expected_calls in ((False, 6), (True, 1)):
+            def send(method, path, payload=None):
+                if method == 'GET':
+                    return {'task': {'control': {'version': 1}}}
+                raise intake.IntakeHTTPError(409, 'version_conflict')
+            arguments = ['intake', 'update', 'task-1', '--status', 'blocked']
+            if explicit:
+                arguments += ['--version', '1']
+            with patch.object(intake, 'request', side_effect=send) as transport:
+                self.assertEqual(self.run_cli(*arguments)[0], 1)
+            self.assertEqual(transport.call_count, expected_calls)
+        with patch.object(intake, 'request', side_effect=[{'task': {'control': {'version': 1}}},
+                          intake.IntakeHTTPError(409, 'idempotency_conflict')]) as transport:
+            self.assertEqual(self.run_cli('intake', 'update', 'task-1', '--owner', 'demo')[0], 1)
+            self.assertEqual(transport.call_count, 2)
+
+    def test_update_uncertain_transport_exposes_safe_recovery_key_without_retry(self):
+        with patch.object(intake, 'request', side_effect=[{'task': {'control': {'version': 7}}},
+                          urllib.error.URLError('private-error')]) as transport:
+            code, output, error = self.run_cli('intake', 'update', 'task-1', '--key', 'recover-fixture', '--owner', 'demo')
+        self.assertEqual(code, 1)
+        self.assertIn('outcome unknown', error)
+        self.assertIn('recover-fixture', error)
+        self.assertNotIn('private-error', error)
+        self.assertEqual(transport.call_count, 2)
+
+    def test_http_error_diagnostics_allow_only_safe_codes(self):
+        for raw, expected in ((b'{"error":"version_conflict"}', 'version_conflict'),
+                              (b'{"error":"private-token"}', 'request_failed')):
+            exc = urllib.error.HTTPError('https://fixture.test', 409, 'private', {}, io.BytesIO(raw))
+            result = intake.http_error(exc, 'POST', {'key': 'fixture-retry'})
+            self.assertEqual(result.code, expected)
+            with patch.object(intake, 'execute', side_effect=result):
+                code, _, error = self.run_cli('intake', 'list')
+            self.assertEqual(code, 1)
+            self.assertIn(expected, error)
+            self.assertIn('fixture-retry', error)
+            self.assertNotIn('private-token', error)
 
     def test_assign_builds_canonical_session_payload(self):
         with patch.object(intake, 'request', return_value={}) as transport:
