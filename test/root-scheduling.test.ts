@@ -102,10 +102,14 @@ async function seedBase(sql: any) {
     "INSERT INTO credentials (id, kind, token_hash, family_id, subject, machine_id, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     'cred_host_beta', 'host', tokenHostBeta, 'fam_beta', 'host-beta', 'host-beta', JSON.stringify(['host']), 'admin-1', now, future
   );
+  sql.exec(
+    "INSERT OR REPLACE INTO users (sub, email, is_admin, first_seen_at, last_seen_at) VALUES ('admin-1', 'admin@fake.local', 1, ?, ?)",
+    now, now
+  );
   const tokenAdmin = await sha256('token_admin');
   sql.exec(
-    "INSERT INTO credentials (id, kind, token_hash, family_id, subject, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    'cred_admin', 'human', tokenAdmin, 'fam_admin', 'admin@fake.local', JSON.stringify(['admin', 'jobs:create', 'bus:read', 'bus:send']), 'admin-1', now, future
+    "INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    'cred_admin', 'human', tokenAdmin, 'fam_admin', 'admin@fake.local', 'human:admin-1', JSON.stringify(['admin']), 'admin-1', now, future
   );
 }
 

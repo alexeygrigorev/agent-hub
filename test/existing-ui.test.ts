@@ -10,7 +10,7 @@ describe('existing UI real routes',()=>{
   it('renders recoverable OIDC errors for browsers while retaining JSON for API clients',async()=>{
     const response=await req('/auth/callback');expect(response.status).toBe(400);expect(response.headers.get('Content-Type')).toContain('text/html');
     expect(await response.text()).toContain('Sign-in could not finish');
-    const api=await SELF.fetch('https://hub.test/auth/callback');expect(api.status).toBe(400);expect(await api.json()).toEqual({error:'Missing code or state'});
+    const api=await SELF.fetch('https://hub.test/auth/callback');expect(api.status).toBe(400);expect(await api.json()).toEqual({error:'Missing code or state',category:'missing_code_and_state'});
   });
   it('preserves anonymous return-to and shows code entry, unknown, denied, expired and completed states',async()=>{
     const c=await human(),p=await challenge();

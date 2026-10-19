@@ -242,6 +242,27 @@ describe('host-enrollment authority prerequisite (R3, session/registry surfaces)
       const offers: any = await (await s.handle(hubRequest('/api/session-commands/offers', undefined, 'GET'),
         { caller: { machineId: 'hetzner', kind: 'host', actor: 'machine:hetzner', tokenId: credB2.id }, scopes: ['host'] })).json();
       expect(offers.offers.length).toBe(1);
+
+      // Negative checks: revoked or expired bound B is denied even while bound
+      hub.sql.exec('UPDATE credentials SET revoked_at = ? WHERE id = ?', at, credB2.id);
+      const bindRevoked = await s.handle(
+        hubRequest(`/api/sessions/${created.id}/binding`, { native: { native_id: NATIVE_ID, tag, workspace: NATIVE_WS, native_created_at_ms: NATIVE_CREATED } }),
+        { caller: { machineId: 'hetzner', kind: 'host', actor: 'machine:hetzner', tokenId: credB2.id }, scopes: ['host'] },
+      );
+      expect(bindRevoked.status).toBe(409);
+      const revokedOffers: any = await (await s.handle(hubRequest('/api/session-commands/offers', undefined, 'GET'),
+        { caller: { machineId: 'hetzner', kind: 'host', actor: 'machine:hetzner', tokenId: credB2.id }, scopes: ['host'] })).json();
+      expect(revokedOffers.offers.length).toBe(0);
+
+      hub.sql.exec('UPDATE credentials SET revoked_at = NULL, expires_at = ? WHERE id = ?', new Date(Date.now() - 1000).toISOString(), credB2.id);
+      const bindExpired = await s.handle(
+        hubRequest(`/api/sessions/${created.id}/binding`, { native: { native_id: NATIVE_ID, tag, workspace: NATIVE_WS, native_created_at_ms: NATIVE_CREATED } }),
+        { caller: { machineId: 'hetzner', kind: 'host', actor: 'machine:hetzner', tokenId: credB2.id }, scopes: ['host'] },
+      );
+      expect(bindExpired.status).toBe(409);
+      const expiredOffers: any = await (await s.handle(hubRequest('/api/session-commands/offers', undefined, 'GET'),
+        { caller: { machineId: 'hetzner', kind: 'host', actor: 'machine:hetzner', tokenId: credB2.id }, scopes: ['host'] })).json();
+      expect(expiredOffers.offers.length).toBe(0);
     });
   });
 

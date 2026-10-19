@@ -411,7 +411,8 @@ describe('claims admission through authenticated Hub HTTP routes', () => {
     const adminToken = 'test-only-claims-admin';
     await fleetFixture(async (_f, sql) => {
       sql.exec("UPDATE credentials SET token_hash = ? WHERE id = 'cred-worker-1'", await sha256(token));
-      sql.exec('INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', 'http-admin', 'human', await sha256(adminToken), 'http-admin', 'worker-1', 'worker-1', JSON.stringify(['admin', 'fleet:launch', 'bus:send', 'routing:submit']), 'test', at(), at(86400000));
+      sql.exec("INSERT OR REPLACE INTO users (sub, email, is_admin, first_seen_at, last_seen_at) VALUES ('http-admin', 'admin@fake.local', 1, ?, ?)", at(), at());
+      sql.exec('INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', 'http-admin', 'human', await sha256(adminToken), 'http-admin', 'admin@fake.local', 'human:http-admin', JSON.stringify(['admin']), 'http-admin', at(), at(86400000));
     }, stub);
     const http = (path: string, data: any, bearer = token) => stub.fetch(new Request('https://hub.test' + path, { method: 'POST', headers: { Authorization: 'Bearer ' + bearer, 'Content-Type': 'application/json' }, body: JSON.stringify(data) }));
     const made = await http('/api/bus/claims', { project: 'projA', scope: 'src', holder: 'worker-1', ttl_ms: 3600000 });

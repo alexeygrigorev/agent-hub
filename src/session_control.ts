@@ -366,7 +366,9 @@ export class SessionControlService {
         session.machine_id).toArray()[0];
       if (!m) return { ok: false, error: 'not_found' };
       const credential: any = this.sql.exec('SELECT approval_seq FROM credentials WHERE id = ?', caller.tokenId!).toArray()[0];
-      if (!m.credential_id || !credential || !approvalAuthorityMatches(credential.approval_seq, m.approval_seq)) return { ok: false, error: 'host_credential_changed' };
+      if (!m.credential_id || !credential) return { ok: false, error: 'host_credential_changed' };
+      const isBoundOwner = m.credential_id === caller.tokenId;
+      if (!isBoundOwner && !approvalAuthorityMatches(credential.approval_seq, m.approval_seq)) return { ok: false, error: 'host_credential_changed' };
       if (m.machine_family && m.machine_family !== family) return { ok: false, error: 'host_credential_changed' };
     } catch {
       return { ok: false, error: 'credential_changed' };

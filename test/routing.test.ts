@@ -106,7 +106,8 @@ describe('authenticated fleet task HTTP integration', () => {
     const token = 'hubt_' + crypto.randomUUID();
     await runInDurableObject(stub, async (hub: Hub) => {
       const id = crypto.randomUUID();
-      hub.sql.exec('INSERT INTO credentials (id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?)', id, 'human', await sha256(token), id, 'admin-test', 'admin-test', '["admin"]', 'test', at(), at(86400000));
+      hub.sql.exec("INSERT OR REPLACE INTO users (sub, email, is_admin, first_seen_at, last_seen_at) VALUES ('admin-test', 'admin@fake.local', 1, ?, ?)", at(), at());
+      hub.sql.exec('INSERT INTO credentials (id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?)', id, 'human', await sha256(token), id, 'admin@fake.local', 'human:admin-test', '["admin"]', 'admin-test', at(), at(86400000));
     });
     const name = 'http-' + crypto.randomUUID();
     const adminRequest = (method: string, path: string, data?: any) => new Request('https://hub.test' + path, { method, headers: { Authorization: 'Bearer ' + token }, body: data === undefined ? undefined : JSON.stringify(data) });
