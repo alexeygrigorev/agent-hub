@@ -85,16 +85,18 @@ def read_file(path, limit=MAX_BODY):
     return raw.decode('utf-8')
 
 
-def read_prompt_text(text, limit=MAX_BRIEF):
-    """Inline `--prompt` with the same boundaries as `--brief-file`.
+def read_prompt_text(text, limit=MAX_BRIEF, max_chars=None):
+    """Inline `--prompt` with the same boundaries as the corresponding file input.
 
-    UTF-8, at most MAX_BRIEF bytes and MAX_BRIEF_CHARS chars, non-blank.
-    Prompts are data: never executed locally, only forwarded as the session
-    brief payload the server already handles. No shell is ever involved.
+    UTF-8, at most limit bytes (and max_chars chars when set), non-blank.
+    Prompts are data: never executed locally, only forwarded as payload the
+    server already handles. No shell is ever involved.
     """
     if not isinstance(text, str) or not text.strip():
         raise ValueError('Prompt must be non-empty text')
-    if len(text.encode('utf-8')) > limit or len(text) > MAX_BRIEF_CHARS:
+    if max_chars is None and limit == MAX_BRIEF:
+        max_chars = MAX_BRIEF_CHARS
+    if len(text.encode('utf-8')) > limit or (max_chars is not None and len(text) > max_chars):
         raise ValueError('Prompt exceeds capacity')
     return text
 
@@ -267,7 +269,10 @@ def add_commands(sub):
     add_wait(start)
     send = commands.add_parser('send', help='Enqueue one prompt delivery on a bound session')
     send.add_argument('id')
-    send.add_argument('--body-file', required=True, help='UTF-8 prompt file, or - for stdin (max 16 KiB)')
+    body_src = send.add_mutually_exclusive_group(required=True)
+    body_src.add_argument('--body-file', help='UTF-8 prompt file, or - for stdin (max 16 KiB)')
+    body_src.add_argument('--prompt', default=None,
+                          help='Inline UTF-8 prompt text (max 16 KiB; same boundaries as --body-file)')
     send.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
     add_wait(send)
     capture = commands.add_parser('capture', help='Enqueue one bounded sanitized capture on a bound session (default raw tail; --screen shows current rendered screen)')
@@ -480,7 +485,15 @@ def execute(args):
     if cmd in ('send', 'capture', 'stop'):
         key = getattr(args, 'key', None) or str(uuid.uuid4())
         if cmd == 'send':
-            payload = {'key': key, 'body': read_file(args.body_file)}
+            if getattr(args, 'prompt', None) is not None and getattr(args, 'body_file', None):
+                raise ValueError('Cannot specify both --body-file and --prompt')
+            if getattr(args, 'prompt', None) is not None:
+                body = read_prompt_text(args.prompt, limit=MAX_BODY)
+            elif getattr(args, 'body_file', None):
+                body = read_file(args.body_file)
+            else:
+                raise ValueError('Either --body-file or --prompt is required')
+            payload = {'key': key, 'body': body}
         elif cmd == 'capture':
             # Default tail wire unchanged (no mode field); --screen encodes
             # explicit mode=screen so the server persists the projection.

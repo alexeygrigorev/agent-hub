@@ -189,6 +189,47 @@ class TestSessionControlCli(unittest.TestCase):
             with self.assertRaises(ValueError):
                 session_control.execute(self.parse('start', '--workspace', 'demo', '--prompt', 'x' * 8001, '--key', 'k'))
 
+    def test_send_prompt_inline_with_body_boundaries(self):
+        with patch.object(session_control, 'request', return_value={'command_id': 'c1'}) as transport:
+            result = session_control.execute(self.parse('send', 'sid', '--prompt', 'do inline work', '--key', 'k'))
+        self.assertEqual(transport.call_args.args[:2], ('POST', '/api/sessions/sid/send'))
+        self.assertEqual(transport.call_args.args[2], {'key': 'k', 'body': 'do inline work'})
+        self.assertEqual(result['command_id'], 'c1')
+        self.assertEqual(result['client_key'], 'k')
+
+        # Mutually exclusive with --body-file; one required.
+        with self.assertRaises(SystemExit):
+            self.parse('send', 'sid', '--prompt', 'x', '--body-file', 'p.txt')
+        with self.assertRaises(SystemExit):
+            self.parse('send', 'sid')
+
+        # Same 16 KiB UTF-8 boundaries as --body-file, non-empty, never executed locally.
+        with patch.object(session_control, 'request', return_value={}):
+            with self.assertRaises(ValueError):
+                session_control.execute(self.parse('send', 'sid', '--prompt', '   ', '--key', 'k'))
+            with self.assertRaises(ValueError):
+                session_control.execute(self.parse('send', 'sid', '--prompt', '', '--key', 'k'))
+            with self.assertRaises(ValueError):
+                session_control.execute(self.parse('send', 'sid', '--prompt', 'é' * 9000, '--key', 'k'))
+            with self.assertRaises(ValueError):
+                session_control.execute(self.parse('send', 'sid', '--prompt', 'x' * (session_control.MAX_BODY + 1), '--key', 'k'))
+
+        # Exact boundary: max 16 KiB UTF-8 is accepted.
+        with patch.object(session_control, 'request', return_value={}) as transport:
+            session_control.execute(self.parse('send', 'sid', '--prompt', 'x' * session_control.MAX_BODY, '--key', 'k'))
+        self.assertEqual(transport.call_args.args[2]['body'], 'x' * session_control.MAX_BODY)
+
+        # Direct execution check: mutual exclusion and required body source.
+        conflicting = self.parse('send', 'sid', '--body-file', 'p.txt', '--key', 'k')
+        conflicting.prompt = 'conflict'
+        with self.assertRaises(ValueError):
+            session_control.execute(conflicting)
+        missing = self.parse('send', 'sid', '--body-file', 'p.txt', '--key', 'k')
+        missing.body_file = None
+        missing.prompt = None
+        with self.assertRaises(ValueError):
+            session_control.execute(missing)
+
     def test_start_name_stored_and_validated(self):
         with patch.object(session_control, 'request', return_value={}) as transport:
             session_control.execute(self.parse('start', '--workspace', 'demo', '--prompt', 'goal', '--name', 'friendly', '--key', 'k'))
