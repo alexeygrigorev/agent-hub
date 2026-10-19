@@ -191,6 +191,10 @@ class TestStatusCli(unittest.TestCase):
                          'deploy_state': 'unknown'}],
             'hub_sessions': [{
                 'hub_session_id': 'canonical-session',
+                'host_observation': {
+                    'state': 'agentworking', 'note': 'Running tests\x1b\u202e',
+                    'observed_at': observed, 'provenance': {'freshness': 'fresh'},
+                },
                 'report_headline': {
                     'headline': 'Registry review\x1b\u202e', 'verdict': 'REVISE',
                     'observed_at': observed, 'provenance': {'freshness': 'fresh'},
@@ -207,6 +211,7 @@ class TestStatusCli(unittest.TestCase):
             }],
         }]
         rendered = status.render_human(dto)
+        self.assertIn('host-observation: state=agentworking note=Running tests observed=%s freshness=fresh' % observed, rendered)
         self.assertIn('report: Registry review verdict=REVISE', rendered)
         self.assertIn('git sha=%s ancestry=merged_in_main' % sha, rendered)
         self.assertIn('ci state=passing run=https://example.test/run/42', rendered)
@@ -221,16 +226,33 @@ class TestStatusCli(unittest.TestCase):
     def test_render_human_preserves_unknown_and_stale_canonical_evidence(self):
         dto = dict(FIXTURE_DTO)
         dto['tasks'] = [{'hub_sessions': [{
+            'host_observation': {'state': None, 'note': None, 'observed_at': None, 'provenance': {'freshness': 'stale'}},
             'report_headline': {'headline': 'PASS appears only in the heading', 'verdict': None},
             'probe_evidence': {'git': {'provenance': {'freshness': 'stale'}},
                                'ci': {}, 'deploy': None},
         }]}]
         rendered = status.render_human(dto)
+        self.assertIn('host-observation: state=unknown observed=unknown freshness=stale', rendered)
+        self.assertNotIn('note=', rendered)
         self.assertIn('report: PASS appears only in the heading verdict=unknown', rendered)
         self.assertIn('git sha=unknown ancestry=unknown observed=unknown freshness=stale', rendered)
         self.assertIn('ci state=unknown run=unknown observed=unknown freshness=unknown', rendered)
         self.assertNotIn('state=passing', rendered)
         self.assertNotIn('state=deployed', rendered)
+
+    def test_render_human_shows_host_observation_without_note(self):
+        dto = dict(FIXTURE_DTO)
+        observed = '2026-10-19T01:38:08.858Z'
+        dto['tasks'] = [{'hub_sessions': [{
+            'host_observation': {
+                'state': 'limit_hit',
+                'observed_at': observed,
+                'provenance': {'freshness': 'fresh'},
+            },
+        }]}]
+        rendered = status.render_human(dto)
+        self.assertIn('host-observation: state=limit_hit observed=%s freshness=fresh' % observed, rendered)
+        self.assertNotIn('note=', rendered)
 
     def test_render_human_commits_probe_evidence_and_unknown(self):
         dto = dict(FIXTURE_DTO)

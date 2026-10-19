@@ -84,6 +84,17 @@ def _call_status(args, method, body):
 
 def _render_hub_evidence(hub):
     lines = []
+    obs = hub.get('host_observation')
+    if isinstance(obs, dict):
+        provenance = obs.get('provenance') or {}
+        parts = ['state=%s' % escape_display(obs.get('state') or 'unknown')]
+        if obs.get('note'):
+            parts.append('note=%s' % escape_display(obs.get('note')))
+        parts.extend([
+            'observed=%s' % escape_display(obs.get('observed_at') or 'unknown'),
+            'freshness=%s' % escape_display(provenance.get('freshness') or 'unknown'),
+        ])
+        lines.append('    host-observation: %s' % ' '.join(parts))
     report = hub.get('report_headline')
     if isinstance(report, dict):
         provenance = report.get('provenance') or {}
