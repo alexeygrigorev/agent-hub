@@ -247,8 +247,24 @@ describe('OAuth discovery, DCR, consent, PKCE and credential lifecycle', () => {
     const allowedNoOrigin = await form('/oauth/authorize', { ...params, csrf, decision: 'allow' }, { Cookie: cookie });
     expect(allowedNoOrigin.status).toBe(303);
     expect(new URL(allowedNoOrigin.headers.get('Location')!).searchParams.get('code')).toBeTruthy();
+    // Opaque Origin "null" (Chromium under no-referrer / some mobile WebViews) must succeed with valid CSRF.
+    const allowedNullOrigin = await form('/oauth/authorize', { ...params, csrf, decision: 'allow' }, { Cookie: cookie, Origin: 'null' });
+    expect(allowedNullOrigin.status).toBe(303);
+    expect(new URL(allowedNullOrigin.headers.get('Location')!).searchParams.get('code')).toBeTruthy();
+    // Consent page must not use Referrer-Policy: no-referrer (that forces Origin: null on Allow).
+    expect(r.headers.get('Referrer-Policy')).toBe('same-origin');
+    expect(r.headers.get('Content-Security-Policy') || '').toContain("form-action 'self' https: http:");
     const denied = await form('/oauth/authorize', { ...params, csrf, decision: 'deny' }, { Cookie: cookie, Origin: origin });
     expect(new URL(denied.headers.get('Location')!).searchParams.get('error')).toBe('access_denied');
+  });
+  it('sets same-origin Referrer-Policy and http(s) form-action on consent', async () => {
+    const { params } = await authorization();
+    const page = await doFetch(new Request(origin + '/oauth/authorize?' + new URLSearchParams(params), { headers: { Cookie: cookie } }));
+    expect(page.status).toBe(200);
+    expect(page.headers.get('Referrer-Policy')).toBe('same-origin');
+    const csp = page.headers.get('Content-Security-Policy') || '';
+    expect(csp).toContain("form-action 'self' https: http:");
+    expect(csp).not.toContain('no-referrer');
   });
   it('preserves OAuth return_to through bootstrap admin-token sign-in', async () => {
     const token = 'mcp-bootstrap-private-fixture';

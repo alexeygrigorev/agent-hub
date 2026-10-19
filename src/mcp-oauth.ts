@@ -3,7 +3,7 @@ import { getSession, humanAdminAllowed } from './auth/session';
 import { randomString, sha256 } from './auth/crypto';
 import { generateTokenPair } from './auth/token';
 import { boundedText, json, NO_STORE } from './mcp';
-import { mcpConnectPage, UI_HEADERS } from './ui-pages';
+import { mcpConnectPage, mcpConsentHeaders } from './ui-pages';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS mcp_clients (id TEXT PRIMARY KEY, metadata TEXT NOT NULL, expires INTEGER NOT NULL);
@@ -125,13 +125,15 @@ export class McpOAuth {
         hiddenFields: hidden,
         csrfToken: session.csrfToken,
       });
-      return new Response(html, { headers: { ...NO_STORE, ...UI_HEADERS } });
+      return new Response(html, { headers: { ...NO_STORE, ...mcpConsentHeaders(redirect) } });
     }
-    // Align with verifyCsrf: missing Origin is allowed for same-site form POSTs
-    // (Cursor / some browsers omit it). Reject only a present mismatched Origin,
-    // then require the session CSRF double-submit token from the consent form.
+    // CSRF: require the consent form token. Origin may be missing (some same-site
+    // POSTs) or the literal "null" (Chromium/Safari when Referrer-Policy was
+    // no-referrer, and some Cursor/mobile WebViews). Reject only a real
+    // cross-site Origin that does not match this request's public origin.
     const originHeader = request.headers.get('Origin');
-    if ((originHeader && originHeader !== url.origin) || params.get('csrf') !== session.csrfToken) {
+    const originOk = !originHeader || originHeader === 'null' || originHeader === url.origin;
+    if (!originOk || params.get('csrf') !== session.csrfToken) {
       return json({ error: 'invalid_csrf' }, 403);
     }
     const target = new URL(redirect);

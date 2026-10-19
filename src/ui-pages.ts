@@ -4,9 +4,26 @@ export const UI_HEADERS = {
   'Cache-Control': 'private, no-store',
   'Content-Type': 'text/html; charset=utf-8',
   'X-Content-Type-Options': 'nosniff',
-  'Referrer-Policy': 'no-referrer',
+  // same-origin (not no-referrer): Chromium/Safari send Origin: null on same-origin
+  // form POSTs when Referrer-Policy is no-referrer, which broke MCP Allow CSRF.
+  'Referrer-Policy': 'same-origin',
   'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
 };
+
+/** Consent CSP: allow form redirect chains that end on custom MCP callback schemes (cursor://). */
+export function mcpConsentHeaders(redirectUri: string): Record<string, string> {
+  let formAction = "'self' https: http:";
+  try {
+    const scheme = new URL(redirectUri).protocol.replace(/:$/, '').toLowerCase();
+    if (scheme && !['https', 'http'].includes(scheme) && /^[a-z][a-z0-9+.-]*$/.test(scheme)) {
+      formAction += ` ${scheme}:`;
+    }
+  } catch {}
+  return {
+    ...UI_HEADERS,
+    'Content-Security-Policy': `default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`,
+  };
+}
 export function authPage(title: string, lede: string, body = '', email = '', foot = '', returnTo = ''): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>${escapeHtml(title)} · Agent Hub</title><link rel="stylesheet" href="/vendor/dakit/dakit.css"><link rel="stylesheet" href="/auth.css"><script src="/auth.js"></script></head>
 <body class="dk-auth-page"><header class="dk-auth-page__bar"><a class="dk-auth-page__brand" href="/">Agent Hub</a><div class="dk-auth-page__identity" role="status">${escapeHtml(email)}${email ? ` <a href="/auth/login${returnTo ? '?return_to='+encodeURIComponent(returnTo) : ''}">Switch account</a>` : ''}</div></header><main class="dk-auth-page__main"><section class="dk-auth-card" aria-labelledby="auth-title"><header class="dk-auth-card__head"><h1 class="dk-auth-card__title" id="auth-title" tabindex="-1">${escapeHtml(title)}</h1><p class="dk-auth-card__lede">${escapeHtml(lede)}</p></header>${body}<footer class="dk-auth-card__foot">${foot}<nav class="hub-auth-nav" aria-label="Agent Hub"><a href="/conversations.html">Conversations</a><a href="/fleet.html">Fleet</a><a href="/sessions.html">Sessions</a><a href="/metrics.html">Metrics</a><a href="/device">Pair a device</a></nav></footer></section></main><script src="/vendor/dakit/shell.js"></script></body></html>`;
@@ -29,7 +46,7 @@ export function mcpConnectPage(input: {
 <dt>Signed in as</dt><dd class="dk-mono">${e(input.email)}</dd>
 </dl>
 <p class="dk-hint">This grants Hub administrator permissions: reading machines, sessions, captures, quota and tasks; starting sessions; sending prompts; and stopping sessions.</p>
-<form method="post" action="/oauth/authorize" class="dk-stack">${input.hiddenFields}<input type="hidden" name="csrf" value="${e(input.csrfToken)}">
+<form id="mcp-oauth-consent" method="post" action="/oauth/authorize" class="dk-stack">${input.hiddenFields}<input type="hidden" name="csrf" value="${e(input.csrfToken)}">
 <div class="dk-auth-card__actions">
 <button class="dk-button dk-button--secondary dk-button--lg" name="decision" value="deny" type="submit">Deny</button>
 <button class="dk-button dk-button--primary dk-button--lg" name="decision" value="allow" type="submit">Allow connection</button>
