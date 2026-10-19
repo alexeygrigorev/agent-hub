@@ -345,6 +345,129 @@ class TestStatusCli(unittest.TestCase):
         self.assertNotIn('report references:', rendered)
         self.assertNotIn('report-ref:', rendered)
 
+    def test_render_human_shows_session_agent_state_and_freshness(self):
+        dto = dict(FIXTURE_DTO)
+        observed = '2026-10-19T09:00:00.000Z'
+        dto['tasks'] = [{
+            'id': 'task-agent-state-1',
+            'status': 'in_progress',
+            'title': 'Agent state test',
+            'updated_at': observed,
+            'sessions': [
+                {
+                    'machine_id': 'hetzner',
+                    'native_id': 'native-working',
+                    'engine': 'opencode',
+                    'phase': 'running',
+                    'agent_state': 'working\x1b\u202e',
+                    'linkage': 'verified_launch',
+                    'observed_at': observed,
+                    'provenance': {'freshness': 'fresh'},
+                },
+                {
+                    'machine_id': 'hetzner',
+                    'native_id': 'native-idle',
+                    'engine': 'codex',
+                    'phase': 'running',
+                    'agent_state': 'idle',
+                    'linkage': 'unlinked_observation',
+                    'observed_at': observed,
+                    'provenance': {'freshness': 'stale'},
+                },
+            ],
+        }]
+        rendered = status.render_human(dto)
+        self.assertIn('session hetzner/native-working engine=opencode phase=running agent=working linkage=verified_launch observed=%s freshness=fresh' % observed, rendered)
+        self.assertIn('session hetzner/native-idle engine=codex phase=running agent=idle linkage=unlinked_observation observed=%s freshness=stale' % observed, rendered)
+        self.assertNotIn('\x1b', rendered)
+        self.assertNotIn('\u202e', rendered)
+
+    def test_render_human_shows_task_partial_session_coverage(self):
+        dto = dict(FIXTURE_DTO)
+        dto['tasks'] = [{
+            'id': 'task-cov-1',
+            'status': 'open',
+            'title': 'Coverage test',
+            'updated_at': '2026-10-19T09:00:00.000Z',
+            'session_coverage': {
+                'coverage': 'partial',
+                'missing_hosts': ['win35\x1b', 'host-backup\u202e'],
+                'reason': 'linked_host_missing_or_stale',
+            },
+        }]
+        rendered = status.render_human(dto)
+        self.assertIn('session-coverage: partial missing=win35, host-backup', rendered)
+        self.assertNotIn('\x1b', rendered)
+        self.assertNotIn('\u202e', rendered)
+
+    def test_render_human_shows_hub_session_decision_reason(self):
+        dto = dict(FIXTURE_DTO)
+        dto['tasks'] = [{
+            'id': 'task-decision-1',
+            'status': 'in_progress',
+            'title': 'Decision reason test',
+            'updated_at': '2026-10-19T09:00:00.000Z',
+            'hub_sessions': [{
+                'hub_session_id': '44444444-4444-4444-8444-444444444444',
+                'linkage': 'hub_session',
+                'state': 'running',
+                'machine': 'hetzner',
+                'lifecycle': {
+                    'group': 'active',
+                    'state': 'running',
+                    'decision': {
+                        'kind': 'reap\x1b',
+                        'reason': 'heartbeat_expired\u202e',
+                    },
+                },
+            }],
+        }]
+        rendered = status.render_human(dto)
+        self.assertIn('hub-session 44444444-4444-4444-8444-444444444444 state=running machine=hetzner lifecycle=active/running decision=reap reason=heartbeat_expired', rendered)
+        self.assertNotIn('\x1b', rendered)
+        self.assertNotIn('\u202e', rendered)
+
+    def test_render_human_omits_absent_session_diagnostics(self):
+        dto = dict(FIXTURE_DTO)
+        dto['tasks'] = [{
+            'id': 'task-clean-session',
+            'status': 'open',
+            'title': 'Clean session task',
+            'updated_at': '2026-10-19T09:00:00.000Z',
+            'sessions': [{
+                'machine_id': 'hetzner',
+                'native_id': 'native-bare',
+                'engine': 'codex',
+                'phase': 'running',
+                'agent_state': None,
+                'linkage': 'verified_launch',
+                'observed_at': '2026-10-19T09:00:00.000Z',
+                'provenance': {},
+            }],
+            'session_coverage': {
+                'coverage': 'complete',
+                'missing_hosts': [],
+            },
+            'hub_sessions': [{
+                'hub_session_id': '55555555-5555-4555-8555-555555555555',
+                'linkage': 'hub_session',
+                'state': 'running',
+                'machine': 'hetzner',
+                'lifecycle': {
+                    'group': 'active',
+                    'state': 'running',
+                    'decision': {},
+                },
+            }],
+        }]
+        rendered = status.render_human(dto)
+        self.assertIn('session hetzner/native-bare engine=codex phase=running linkage=verified_launch observed=2026-10-19T09:00:00.000Z', rendered)
+        self.assertNotIn('agent=', rendered)
+        self.assertNotIn('freshness=', rendered)
+        self.assertNotIn('session-coverage:', rendered)
+        self.assertNotIn('decision=', rendered)
+        self.assertNotIn('reason=', rendered)
+
 
 if __name__ == '__main__':
     unittest.main()

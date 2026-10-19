@@ -154,18 +154,42 @@ def render_human(data):
         if task.get('continuation_state'):
             lines.append('  continuation: %s' % escape_display(task.get('continuation_state')))
         for sess in task.get('sessions', []):
-            lines.append('  session %s/%s engine=%s phase=%s linkage=%s observed=%s' % (
-                escape_display(sess.get('machine_id')), escape_display(sess.get('native_id')),
-                escape_display(sess.get('engine')), escape_display(sess.get('phase')),
-                escape_display(sess.get('linkage')), escape_display(sess.get('observed_at'))))
+            parts = [
+                'session %s/%s' % (escape_display(sess.get('machine_id')), escape_display(sess.get('native_id'))),
+                'engine=%s' % escape_display(sess.get('engine')),
+                'phase=%s' % escape_display(sess.get('phase')),
+            ]
+            if sess.get('agent_state'):
+                parts.append('agent=%s' % escape_display(sess.get('agent_state')))
+            parts.extend([
+                'linkage=%s' % escape_display(sess.get('linkage')),
+                'observed=%s' % escape_display(sess.get('observed_at')),
+            ])
+            prov = sess.get('provenance') or {}
+            if prov.get('freshness'):
+                parts.append('freshness=%s' % escape_display(prov.get('freshness')))
+            lines.append('  %s' % ' '.join(parts))
+        sess_cov = task.get('session_coverage')
+        if isinstance(sess_cov, dict) and sess_cov.get('coverage') == 'partial':
+            missing = sess_cov.get('missing_hosts') or []
+            parts = ['session-coverage: partial']
+            if missing:
+                parts.append('missing=%s' % ', '.join(escape_display(h) for h in missing))
+            lines.append('  %s' % ' '.join(parts))
         for hub in task.get('hub_sessions', []):
             life = hub.get('lifecycle') or {}
             decision = life.get('decision') or {}
+            decision_parts = []
+            if decision.get('kind'):
+                decision_parts.append('decision=%s' % escape_display(decision.get('kind')))
+                if decision.get('reason'):
+                    decision_parts.append('reason=%s' % escape_display(decision.get('reason')))
+            decision_str = (' ' + ' '.join(decision_parts)) if decision_parts else ''
             lines.append('  hub-session %s state=%s machine=%s lifecycle=%s/%s%s' % (
                 escape_display(hub.get('hub_session_id')), escape_display(hub.get('state')),
                 escape_display(hub.get('machine')),
                 escape_display(life.get('group')), escape_display(life.get('state')),
-                ' decision=%s' % escape_display(decision.get('kind')) if decision.get('kind') else ''))
+                decision_str))
             lines.extend(_render_hub_evidence(hub))
         for action in task.get('pending_actions', []):
             lines.append('  pending %s by %s: %s' % (
