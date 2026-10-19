@@ -146,6 +146,7 @@ try {
   const requests = [];
   page.on('request', req => { if (new URL(req.url()).pathname.startsWith('/api/conversations')) requests.push({ path: new URL(req.url()).pathname, method: req.method() }); });
   await page.goto(base + '/');
+  await page.getByRole('link', { name: 'Open conversations', exact: true }).click();
   await page.locator('#new-conversation').click();
   await page.locator('input[name="conv-kind"][value="group"]').check();
   await page.locator('#group-title').fill('Local transport ' + nonce);

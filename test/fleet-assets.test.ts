@@ -36,17 +36,20 @@ describe('private fleet assets', () => {
   it('serves assets only after a valid admin session and sets private cache and CSP headers', async () => {
     const cookie = await createSessionCookie(defaultEnv, { sub: 'human-test', email: 'admin@fake.local', isAdmin: true, csrfToken: 'csrf-test', exp: Math.floor(Date.now() / 1000) + 60 });
     let assetCalls = 0;
-    const bindings = { ...defaultEnv, ASSETS: { fetch: async () => { assetCalls++; return new Response('private dashboard'); } } };
+    const requestedPaths: string[] = [];
+    const bindings = { ...defaultEnv, ASSETS: { fetch: async (req: Request) => { assetCalls++; requestedPaths.push(new URL(req.url).pathname); return new Response('private dashboard'); } } };
     const ctx = createExecutionContext();
     const r = await worker.fetch(new Request('https://hub.test/', { headers: { Cookie: cookie } }), bindings as any, ctx);
     await waitOnExecutionContext(ctx);
     expect(r.status).toBe(200); expect(assetCalls).toBe(1);
+    expect(requestedPaths[0]).toBe('/index.html');
     expect(r.headers.get('Cache-Control')).toBe('private, no-store');
     expect(r.headers.get('Content-Security-Policy')).toContain("frame-ancestors 'none'");
     const ctx2 = createExecutionContext();
     const conv = await worker.fetch(new Request('https://hub.test/conversations.html', { headers: { Cookie: cookie } }), bindings as any, ctx2);
     await waitOnExecutionContext(ctx2);
     expect(conv.status).toBe(200); expect(assetCalls).toBe(2);
+    expect(requestedPaths[1]).toBe('/conversations.html');
     expect(conv.headers.get('Cache-Control')).toBe('private, no-store');
     expect(conv.headers.get('Content-Security-Policy')).toContain("script-src 'self'");
   });
