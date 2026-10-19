@@ -9,6 +9,7 @@
     <a class="dk-topbar__title" href="/">Agent Hub</a>
     <div class="dk-topbar__end">
       <nav class="hub-topbar-links" aria-label="Quick links">
+        <a class="hub-topbar-link" href="/sessions.html">Sessions</a>
         <a class="hub-topbar-link" href="/fleet.html#quota" aria-current="page">Usage</a>
         <a class="hub-topbar-link" href="/metrics.html">Metrics</a>
       </nav>
@@ -38,7 +39,7 @@
         </a>
         <a class="dk-nav-item" href="/metrics.html">
           <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19V9M10 19V5M16 19v-6M22 19V3"/></svg>
-          <span class="dk-nav-item__label">Metrics</span>
+          <span class="dk-nav-item__label">Metrics &amp; Usage</span>
         </a>
         <a class="dk-nav-item" href="/device"><svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M10 18h4"/></svg><span class="dk-nav-item__label">Pair a device</span></a>
       </div>
@@ -57,13 +58,15 @@
 
   <div class="dk-scrim" data-dk-drawer-close hidden></div>
 
-<main class="dk-main" id="main-content"><div class="dk-main__inner"><header class="dk-page-header"><div class="dk-page-header__main"><h1 class="dk-page-header__title">Fleet</h1><p class="dk-page-header__subtitle">Machines, subscriptions, agents and terminal sessions</p></div></header><div class="dk-cluster"><p id="status" role="status">Loading authenticated data…</p><button class="dk-button dk-button--secondary" type="button" id="fleet-refresh">Refresh fleet</button></div>
+<main class="dk-main" id="main-content"><div class="dk-main__inner"><header class="dk-page-header"><div class="dk-page-header__main"><h1 class="dk-page-header__title">Fleet &amp; Usage</h1><p class="dk-page-header__subtitle">Provider quota usage, enrolled machines, subscriptions, agents and terminal sessions</p></div></header><div class="dk-cluster"><p id="status" role="status">Loading authenticated data…</p><button class="dk-button dk-button--secondary" type="button" id="fleet-refresh">Refresh fleet</button></div>
+<nav class="hub-section-nav" aria-label="Fleet sections"><a class="hub-section-link" href="#quota">Usage / Quota</a><a class="hub-section-link" href="#machine-view">Machines</a><a class="hub-section-link" href="#sessions">Sessions</a><a class="hub-section-link" href="#alerts">Alerts</a><a class="hub-section-link" href="#host-health">Health &amp; Disk</a><a class="hub-section-link" href="#launch">Start work</a><a class="hub-section-link" href="/metrics.html#usage">24h Token Metrics</a></nav>
+<section id="quota" class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Usage / Quota</h2><p>Provider-native usage per shared account pool and per host: fresh, stale, exhausted, unavailable or unknown. A passed reset alone never implies recovered capacity.</p><div id="quota-panel"></div></section>
 <section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Alerts</h2><p>Opened when a machine, session, hub agent or check enters a problem state; resolved automatically on recovery.</p><div id="alerts"></div></section>
-<section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Disk space monitoring</h2><p>Filesystem usage, thresholds (&ge;85% warn, &ge;95% critical), top space consumers, and daily growth trends.</p><div id="disk-monitoring"></div></section>
+<section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Machines and subscriptions</h2><p>Shared account labels share capacity across machines. Unknown data is not zero usage.</p><div id="machine-view"></div></section>
+<section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Live aplexer sessions</h2><p>Reported by each machine; see Heartbeats and liveness for whether each session is working.</p><div id="sessions"></div></section>
 <section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Host health and resource utilization</h2><p>CPU load averages (1m, 5m, 15m), memory utilization (used, available, total), and observation freshness.</p><div id="host-health"></div></section>
+<section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Disk space monitoring</h2><p>Filesystem usage, thresholds (&ge;85% warn, &ge;95% critical), top space consumers, and daily growth trends.</p><div id="disk-monitoring"></div></section>
 <section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Heartbeats and liveness</h2><p>Machines: online, stale, offline. Agents: working, idle, stalled (working with no terminal activity), or unknown when their machine is silent.</p><div id="liveness"></div></section>
-<section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Scheduled checks</h2><p>Periodic checks that open alerts, message an inbox, or start an agent. Upload a checks file to replace the current schedule.</p><div id="checks"></div><form class="fleet-form" id="checks-form"><div class="fleet-field"><label class="dk-label" for="fleet-checks">Checks JSON</label><input id="fleet-checks" class="dk-input" name="checks" type="file" accept="application/json,.json" required></div><button class="dk-button dk-button--secondary" type="submit">Replace checks</button><p id="checks-result" role="status"></p></form></section>
-<section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Account registry</h2><p>Upload a registry JSON with account labels and machine routes. Provider credentials and machine-local command configuration do not belong here.</p><form class="fleet-form" id="registry"><div class="fleet-field"><label class="dk-label" for="fleet-registry">Registry JSON</label><input id="fleet-registry" class="dk-input" name="registry" type="file" accept="application/json,.json" required></div><button class="dk-button dk-button--secondary" type="submit">Apply registry</button><p id="registry-result" role="status"></p></form></section>
 <section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Start work</h2><form class="fleet-form" id="launch">
 <div class="fleet-field"><label class="dk-label" for="fleet-mode">Mode</label><select id="fleet-mode" class="dk-select" name="mode"><option value="headless">Headless agent</option><option value="interactive">Interactive terminal session</option></select></div>
 <div class="fleet-field"><label class="dk-label" for="machines">Machine</label><select class="dk-select" name="machine" id="machines"><option value="">Choose automatically</option></select></div>
@@ -74,11 +77,10 @@
 <div class="fleet-field"><label class="dk-label" for="fleet-parent_id">Parent hub agent ID (optional)</label><input id="fleet-parent_id" class="dk-input" name="parent_id"></div>
 <button class="dk-button dk-button--primary" type="submit">Start</button><p id="launch-result" role="status"></p>
 </form></section>
-<section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Machines and subscriptions</h2><p>Shared account labels share capacity across machines. Unknown data is not zero usage.</p><div id="machine-view"></div></section>
-<section id="quota" class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Usage / Quota</h2><p>Provider-native usage per shared account pool and per host: fresh, stale, exhausted, unavailable or unknown. A passed reset alone never implies recovered capacity.</p><div id="quota-panel"></div></section>
 <section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Hub agents and agent trees</h2><p>Every hub request, including headless agents outside aplexer. Offered work has not started; uncertain work requires reconciliation.</p><div id="hub-agents"></div></section>
-<section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Live aplexer sessions</h2><p>Reported by each machine; see Heartbeats and liveness for whether each session is working.</p><div id="sessions"></div></section>
 <section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Registered agents</h2><div id="registered-agents"></div></section>
+<section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Scheduled checks</h2><p>Periodic checks that open alerts, message an inbox, or start an agent. Upload a checks file to replace the current schedule.</p><div id="checks"></div><form class="fleet-form" id="checks-form"><div class="fleet-field"><label class="dk-label" for="fleet-checks">Checks JSON</label><input id="fleet-checks" class="dk-input" name="checks" type="file" accept="application/json,.json" required></div><button class="dk-button dk-button--secondary" type="submit">Replace checks</button><p id="checks-result" role="status"></p></form></section>
+<section class="dk-card dk-stack fleet-section"><h2 class="fleet-section-title">Account registry</h2><p>Upload a registry JSON with account labels and machine routes. Provider credentials and machine-local command configuration do not belong here.</p><form class="fleet-form" id="registry"><div class="fleet-field"><label class="dk-label" for="fleet-registry">Registry JSON</label><input id="fleet-registry" class="dk-input" name="registry" type="file" accept="application/json,.json" required></div><button class="dk-button dk-button--secondary" type="submit">Apply registry</button><p id="registry-result" role="status"></p></form></section>
 </div></main>
   <div class="dk-menu dk-account-menu" id="dk-account-menu" data-dk-popover hidden>
     <div class="dk-menu__identity">

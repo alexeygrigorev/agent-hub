@@ -10,11 +10,12 @@
 .scroll { max-width: 100%; }
 .dk-table td { overflow-wrap: anywhere; }
 @media (max-width: 820px) {
+  .metrics-section { padding: var(--dk-space-3); }
   .metrics-host-picker .dk-select { width: 100%; }
   .metrics-section .dk-table, .metrics-section tbody, .metrics-section tr, .metrics-section td { display: block; width: 100%; }
   .metrics-section thead { display: none; }
   .metrics-section td { border: 0; padding: var(--dk-space-1) var(--dk-space-3); }
-  .metrics-section tr { padding-block: var(--dk-space-3); border-bottom: 1px solid var(--dk-border-default); }
-  .metrics-section td::before { content: attr(data-label); display: block; font-family: var(--dk-font-sans); font-size: var(--dk-text-sm); color: var(--dk-text-muted); }
+  .metrics-section tr { padding-block: var(--dk-space-2); margin-bottom: var(--dk-space-2); border: 1px solid var(--dk-border-default); border-radius: var(--dk-radius-md); background: var(--dk-bg-muted); }
+  .metrics-section td::before { content: attr(data-label); display: block; font-family: var(--dk-font-sans); font-size: var(--dk-text-xs); color: var(--dk-text-muted); }
   .metrics-section td:empty { display: none; }
 }

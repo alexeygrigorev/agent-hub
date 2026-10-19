@@ -1,7 +1,8 @@
 import { SqlStorage, DurableObjectState } from "@cloudflare/workers-types";
 import { Env } from "./env";
 import { sha256 } from "./auth/crypto";
-import { getSession, verifyCsrf } from "./auth/session";
+import { getSession, verifyCsrf, allowedCallbackUrls, adminTokenHash, validSessionSecret } from "./auth/session";
+import { validateHumanCredentialRecord } from "./auth/human-credential";
 
 export const METRICS_SCHEMA_VERSION = "1.0";
 export const METRICS_MAX_BODY_BYTES = 32_768;
@@ -1315,11 +1316,26 @@ export class MetricsStore {
         headers: { ...PRIVATE_NO_STORE_HEADERS, Allow: "GET, POST" },
       });
     }
-    // Client-forged host identity headers are always denied. Do not treat
-    // X-Forwarded-Host as spoof: Cloudflare injects it on every browser request,
-    // and denying it blocked admin cookie Metrics GETs (Access denied on
-    // hub.dtcdev.click). Host binding still comes only from the bearer credential.
-    if (request.headers.has("x-host-id") || request.headers.has("x-machine-id")) {
+    // Client-forged host identity headers are always denied. Allow proxy
+    // X-Forwarded-Host only when it matches the request host or a configured
+    // OIDC callback origin; reject spoofed host IDs or multi-host values.
+    const fwdHost = request.headers.get("x-forwarded-host");
+    let spoofedForwardedHost = false;
+    if (fwdHost !== null) {
+      const cleanFwd = fwdHost.trim().toLowerCase();
+      if (!cleanFwd || cleanFwd.includes(",")) {
+        spoofedForwardedHost = true;
+      } else if (cleanFwd !== reqUrl.host.toLowerCase()) {
+        spoofedForwardedHost = !allowedCallbackUrls(this.env).some((candidate) => {
+          try {
+            return new URL(candidate).host.toLowerCase() === cleanFwd;
+          } catch {
+            return false;
+          }
+        });
+      }
+    }
+    if (request.headers.has("x-host-id") || request.headers.has("x-machine-id") || spoofedForwardedHost) {
       return jsonResponse({ error: "forbidden", reason: "header_spoof_denied" }, 403);
     }
 
@@ -1360,53 +1376,84 @@ export class MetricsStore {
       return jsonResponse(putRes.body, putRes.status);
     }
 
+    let adminBearerAuthorized = false;
     if (request.headers.has("Authorization")) {
-      const hostAuth = await this.authenticateHostBearer(request, nowMs);
-      if (hostAuth.errorResponse) return hostAuth.errorResponse;
-      const hostId = hostAuth.machineId!;
-      const readNow = this.now();
-      const reauth = this.authorizeCurrentHostCredential(hostAuth.credId!, hostId, readNow);
-      if (!reauth.ok) {
-        this.retireCallerBinding(hostId, hostAuth.credId!, readNow);
-        return jsonResponse({ error: reauth.error, reason: reauth.reason }, reauth.status);
+      if (request.headers.has("Cookie")) {
+        return jsonResponse({ error: "forbidden", reason: "mixed_authority" }, 403);
       }
-      if (typeof this.gate === "function") {
-        if (!this.gateAllows(hostId, hostAuth.credId!, readNow)) {
+      const authHeader = request.headers.get("Authorization") || "";
+      const token = authHeader.startsWith("Bearer ") ? authHeader.substring(7).trim() : "";
+      if (token && /^hubt_[A-Za-z0-9_-]+$/.test(token)) {
+        const tokenHash = await sha256(token);
+        const cred = this.sql.exec("SELECT * FROM credentials WHERE token_hash = ?", tokenHash).toArray()[0] as any;
+        if (cred && cred.kind === "human") {
+          const verifiedHuman = validateHumanCredentialRecord(this.sql as any, this.env, cred, nowMs);
+          if (!verifiedHuman) {
+            return jsonResponse({ error: "unauthorized" }, 401);
+          }
+          adminBearerAuthorized = true;
+        }
+      } else if (token && validSessionSecret(this.env)) {
+        const configured = adminTokenHash(this.env);
+        if (configured) {
+          const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+          const given = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+          let difference = given.length === configured.length ? 0 : 1;
+          for (let i = 0; i < configured.length; i++) difference |= (given.charCodeAt(i) || 0) ^ configured.charCodeAt(i);
+          if (difference === 0) adminBearerAuthorized = true;
+        }
+      }
+
+      if (!adminBearerAuthorized) {
+        const hostAuth = await this.authenticateHostBearer(request, nowMs);
+        if (hostAuth.errorResponse) return hostAuth.errorResponse;
+        const hostId = hostAuth.machineId!;
+        const readNow = this.now();
+        const reauth = this.authorizeCurrentHostCredential(hostAuth.credId!, hostId, readNow);
+        if (!reauth.ok) {
           this.retireCallerBinding(hostId, hostAuth.credId!, readNow);
-          return jsonResponse({ error: "forbidden", reason: "host_observation_denied" }, 403);
+          return jsonResponse({ error: reauth.error, reason: reauth.reason }, reauth.status);
         }
-      } else {
-        this.retireCallerBinding(hostId, hostAuth.credId!, readNow);
-        return jsonResponse({ error: "observation_auth_unavailable", reason: "gate_missing" }, 503);
-      }
-      if (reqUrl.searchParams.has("host_id")) {
-        const requested = reqUrl.searchParams.get("host_id");
-        if (!requested || requested !== hostId) {
-          return jsonResponse({ error: "forbidden", reason: "cross_machine_read_denied" }, 403);
+        if (typeof this.gate === "function") {
+          if (!this.gateAllows(hostId, hostAuth.credId!, readNow)) {
+            this.retireCallerBinding(hostId, hostAuth.credId!, readNow);
+            return jsonResponse({ error: "forbidden", reason: "host_observation_denied" }, 403);
+          }
+        } else {
+          this.retireCallerBinding(hostId, hostAuth.credId!, readNow);
+          return jsonResponse({ error: "observation_auth_unavailable", reason: "gate_missing" }, 503);
         }
+        if (reqUrl.searchParams.has("host_id")) {
+          const requested = reqUrl.searchParams.get("host_id");
+          if (!requested || requested !== hostId) {
+            return jsonResponse({ error: "forbidden", reason: "cross_machine_read_denied" }, 403);
+          }
+        }
+        const getRes = this.getSnapshot(hostId, readNow);
+        return jsonResponse(getRes.body, getRes.status);
       }
-      const getRes = this.getSnapshot(hostId, readNow);
-      return jsonResponse(getRes.body, getRes.status);
     }
 
-    const session = await getSession(this.env, request);
-    if (!session) return jsonResponse({ error: "unauthorized" }, 401);
-    if (!session.isAdmin) return jsonResponse({ error: "forbidden" }, 403);
-    const originHeader = request.headers.get("Origin");
-    if (originHeader && originHeader !== reqUrl.origin) {
-      return jsonResponse({ error: "forbidden", reason: "origin_mismatch" }, 403);
-    }
-    const secFetchSite = request.headers.get("Sec-Fetch-Site");
-    if (secFetchSite && secFetchSite.toLowerCase() === "cross-site") {
-      return jsonResponse({ error: "forbidden", reason: "cross_site_request_denied" }, 403);
-    }
-    if (!verifyCsrf(request, session)) {
-      const csrfHeader = request.headers.get("x-csrf-token");
-      if (csrfHeader !== null && csrfHeader !== session.csrfToken) {
-        return jsonResponse({ error: "forbidden", reason: "invalid_csrf_token" }, 403);
+    if (!adminBearerAuthorized) {
+      const session = await getSession(this.env, request);
+      if (!session) return jsonResponse({ error: "unauthorized" }, 401);
+      if (!session.isAdmin) return jsonResponse({ error: "forbidden" }, 403);
+      const originHeader = request.headers.get("Origin");
+      if (originHeader && originHeader !== "null" && originHeader !== reqUrl.origin) {
+        return jsonResponse({ error: "forbidden", reason: "origin_mismatch" }, 403);
       }
-      if (request.method !== "GET" && request.method !== "HEAD") {
-        return jsonResponse({ error: "forbidden", reason: "invalid_csrf_token" }, 403);
+      const secFetchSite = request.headers.get("Sec-Fetch-Site");
+      if (secFetchSite && secFetchSite.toLowerCase() === "cross-site") {
+        return jsonResponse({ error: "forbidden", reason: "cross_site_request_denied" }, 403);
+      }
+      if (!verifyCsrf(request, session)) {
+        const csrfHeader = request.headers.get("x-csrf-token");
+        if (csrfHeader !== null && csrfHeader !== session.csrfToken) {
+          return jsonResponse({ error: "forbidden", reason: "invalid_csrf_token" }, 403);
+        }
+        if (request.method !== "GET" && request.method !== "HEAD") {
+          return jsonResponse({ error: "forbidden", reason: "invalid_csrf_token" }, 403);
+        }
       }
     }
 

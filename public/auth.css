@@ -12,7 +12,7 @@
 .hub-overview-card__foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--dk-space-2); padding-top: var(--dk-space-2); border-top: 1px solid var(--dk-border-default); }
 @media (max-width: 820px) { .hub-auth-nav a { display: inline-flex; align-items: center; min-height: var(--dk-size-touch); } }
 
-/* Sticky mobile topbar quick links (Usage + Metrics) — visible without opening the drawer. */
+/* Sticky mobile topbar quick links (Sessions + Usage + Metrics) — visible without opening the drawer. */
 .hub-topbar-links {
   display: none;
   align-items: center;
@@ -34,6 +34,43 @@
 }
 .hub-topbar-link:hover { background: var(--dk-bg-hover); color: var(--dk-text-heading); }
 .hub-topbar-link[aria-current="page"] { color: var(--dk-text-heading); background: var(--dk-bg-muted); }
+
+/* Section quick-jump pill bar for Fleet and Metrics */
+.hub-section-nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--dk-space-2);
+}
+.hub-section-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--dk-size-control-sm);
+  padding: 0 var(--dk-space-3);
+  border-radius: var(--dk-radius-pill);
+  border: 1px solid var(--dk-border-default);
+  background: var(--dk-bg-surface);
+  color: var(--dk-text-primary);
+  font-size: var(--dk-text-xs);
+  font-weight: var(--dk-weight-medium);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.hub-section-link:hover {
+  background: var(--dk-bg-hover);
+  border-color: var(--dk-border-control-hover);
+  color: var(--dk-text-heading);
+}
+.hub-overview-card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--dk-space-2);
+}
+
 @media (max-width: 820px) {
   .hub-topbar-links { display: flex; }
+  .hub-section-link { min-height: var(--dk-size-touch); }
+  .dk-page-header { flex-direction: column; align-items: stretch; gap: var(--dk-space-2); }
+  .dk-page-header__actions { width: 100%; }
 }

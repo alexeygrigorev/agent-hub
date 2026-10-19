@@ -85,6 +85,7 @@ export default {
       '/fleet.html', '/fleet.js', '/fleet.css',
       '/conversations.html', '/conversations.js', '/conversations.css',
       '/metrics', '/metrics.html', '/metrics.js', '/metrics.css',
+      '/usage', '/usage.html',
       '/sessions', '/sessions.html', '/sessions.js', '/sessions.css',
       '/vendor/dakit/dakit.css', '/vendor/dakit/shell.js', '/vendor/dakit/split.js', '/vendor/dakit/dialogs.js',
       '/vendor/dakit/fonts/inter-var.woff2',
@@ -102,7 +103,7 @@ export default {
     }
     if (!env.ASSETS) return new Response('Not found', { status: 404 });
     if (url.pathname === '/') url.pathname = '/index.html';
-    if (url.pathname === '/metrics') url.pathname = '/metrics.html';
+    if (url.pathname === '/metrics' || url.pathname === '/usage' || url.pathname === '/usage.html') url.pathname = '/metrics.html';
     if (url.pathname === '/sessions') url.pathname = '/sessions.html';
     const asset = await env.ASSETS.fetch(new Request(url, request));
     const headers = new Headers(asset.headers);

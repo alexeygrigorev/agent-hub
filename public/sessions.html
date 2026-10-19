@@ -20,6 +20,7 @@
     <a class="dk-topbar__title" href="/">Agent Hub</a>
     <div class="dk-topbar__end">
       <nav class="hub-topbar-links" aria-label="Quick links">
+        <a class="hub-topbar-link" href="/sessions.html" aria-current="page">Sessions</a>
         <a class="hub-topbar-link" href="/fleet.html#quota">Usage</a>
         <a class="hub-topbar-link" href="/metrics.html">Metrics</a>
       </nav>
@@ -49,7 +50,7 @@
         </a>
         <a class="dk-nav-item" href="/metrics.html">
           <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19V9M10 19V5M16 19v-6M22 19V3"/></svg>
-          <span class="dk-nav-item__label">Metrics</span>
+          <span class="dk-nav-item__label">Metrics &amp; Usage</span>
         </a>
         <a class="dk-nav-item" href="/device">
           <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M10 18h4"/></svg>
@@ -101,6 +102,44 @@
         <h2 class="sessions-section-title">Session Lineage Tree</h2>
         <p class="dk-muted">Parent-child hierarchy (Developer &gt; Coordinator &gt; Workers). Sessions started outside the hub show external origin.</p>
         <div id="sessions-tree-container"></div>
+      </section>
+
+      <section class="dk-card dk-stack sessions-card session-detail" id="session-detail-section" aria-label="Session detail" hidden>
+        <div class="session-detail__bar">
+          <button class="dk-button dk-button--secondary dk-button--sm" type="button" id="session-detail-back">&larr; Back to sessions</button>
+          <div class="session-detail__actions">
+            <button class="dk-button dk-button--secondary dk-button--sm" type="button" id="session-detail-refresh">Refresh</button>
+            <button class="dk-button dk-button--secondary dk-button--sm" type="button" id="session-capture-tail-btn">Capture log</button>
+            <button class="dk-button dk-button--secondary dk-button--sm" type="button" id="session-capture-screen-btn">Capture screen</button>
+            <button class="dk-button dk-button--danger dk-button--sm" type="button" id="session-stop-btn">Stop session</button>
+          </div>
+        </div>
+        <div class="session-detail__head">
+          <h2 class="sessions-section-title session-detail__title" id="session-detail-title">Session</h2>
+          <div class="sessions-card-item__badges" id="session-detail-badges"></div>
+        </div>
+        <p id="session-action-status" role="status" class="dk-muted"></p>
+        <div class="session-detail__meta" id="session-detail-meta"></div>
+        <div class="dk-stack">
+          <div class="session-detail__subhead">
+            <h3 class="session-detail__subtitle">Terminal / Log Output</h3>
+            <span class="meta-dim" id="session-terminal-meta"></span>
+          </div>
+          <pre class="session-terminal-pre" id="session-terminal-output">Select a session or tap Capture log to view terminal output.</pre>
+        </div>
+        <form class="dk-stack session-send-form" id="session-send-form">
+          <label class="dk-field">
+            <span class="dk-field__label">Send message / instruction</span>
+            <textarea class="dk-textarea" id="session-send-input" rows="3" placeholder="Type a prompt or instruction for this session…"></textarea>
+          </label>
+          <div class="session-send-form__foot">
+            <button class="dk-button dk-button--primary" type="submit" id="session-send-btn">Send to session</button>
+          </div>
+        </form>
+        <div class="dk-stack">
+          <h3 class="session-detail__subtitle">Recent Commands</h3>
+          <div id="session-detail-commands"></div>
+        </div>
       </section>
     </div>
   </main>

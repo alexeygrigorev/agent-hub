@@ -8,6 +8,7 @@
     <a class="dk-topbar__title" href="/">Agent Hub</a>
     <div class="dk-topbar__end">
       <nav class="hub-topbar-links" aria-label="Quick links">
+        <a class="hub-topbar-link" href="/sessions.html">Sessions</a>
         <a class="hub-topbar-link" href="/fleet.html#quota">Usage</a>
         <a class="hub-topbar-link" href="/metrics.html" aria-current="page">Metrics</a>
       </nav>
@@ -36,7 +37,7 @@
         </a>
         <a class="dk-nav-item" href="/metrics.html" aria-current="page">
           <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19V9M10 19V5M16 19v-6M22 19V3"/></svg>
-          <span class="dk-nav-item__label">Metrics</span>
+          <span class="dk-nav-item__label">Metrics &amp; Usage</span>
         </a>
         <a class="dk-nav-item" href="/device"><svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M10 18h4"/></svg><span class="dk-nav-item__label">Pair a device</span></a>
       </div>
@@ -54,8 +55,9 @@
   </aside>
   <div class="dk-scrim" data-dk-drawer-close hidden></div>
   <main class="dk-main" id="main-content"><div class="dk-main__inner">
-    <header class="dk-page-header"><div class="dk-page-header__main"><h1 class="dk-page-header__title">Metrics</h1><p class="dk-page-header__subtitle">Sanitized 24-hour utilization, usage, and accepted outcomes. Unknown is not zero.</p></div></header>
+    <header class="dk-page-header"><div class="dk-page-header__main"><h1 class="dk-page-header__title">Metrics &amp; Usage</h1><p class="dk-page-header__subtitle">Sanitized 24-hour utilization, usage, and accepted outcomes. Unknown is not zero.</p></div></header>
     <div class="dk-cluster"><p id="status" role="status">Loading authenticated data…</p><button class="dk-button dk-button--secondary" type="button" id="metrics-refresh">Refresh</button></div>
+    <nav class="hub-section-nav" aria-label="Metrics sections"><a class="hub-section-link" href="#usage">Token Usage</a><a class="hub-section-link" href="#coverage">Coverage</a><a class="hub-section-link" href="#buckets">24h Buckets</a><a class="hub-section-link" href="#accepted">Outcomes</a><a class="hub-section-link" href="/fleet.html#quota">Live Quota / Usage</a></nav>
     <div class="dk-cluster metrics-host-picker">
       <label class="dk-label" for="metrics-host">Host</label>
       <select id="metrics-host" class="dk-select" aria-label="Selected host"></select>
@@ -63,9 +65,9 @@
     </div>
     <p id="metrics-host-id" class="metrics-host-id"></p>
     <section class="dk-card dk-stack metrics-section"><h2 class="metrics-section-title">Coverage</h2><p>Producer coverage for utilization, usage, and accepted outcomes. Partial means unknown, not a filled zero.</p><div id="coverage"></div></section>
-    <section class="dk-card dk-stack metrics-section"><h2 class="metrics-section-title">24 hourly UTC buckets</h2><p>Exact window [as_of − 24h, as_of). Empty or unknown buckets stay unknown.</p><div id="buckets"></div></section>
     <section class="dk-card dk-stack metrics-section"><h2 class="metrics-section-title">Usage known vs unknown</h2><p>Token totals are proven counts. Missing cache or reasoning stays unknown and is never inferred from quota.</p><div id="usage"></div></section>
     <section class="dk-card dk-stack metrics-section"><h2 class="metrics-section-title">Accepted outcomes</h2><p>Accepted outcomes are distinct from task, commit, and review counts.</p><div id="accepted"></div></section>
+    <section class="dk-card dk-stack metrics-section"><h2 class="metrics-section-title">24 hourly UTC buckets</h2><p>Exact window [as_of − 24h, as_of). Empty or unknown buckets stay unknown.</p><div id="buckets"></div></section>
   </div></main>
   <div class="dk-menu dk-account-menu" id="dk-account-menu" data-dk-popover hidden>
     <div class="dk-menu__identity">

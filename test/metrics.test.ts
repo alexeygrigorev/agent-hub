@@ -469,7 +469,7 @@ describe('M9 metrics receiver', () => {
     ).toBe(403);
   });
 
-  it('admin Metrics GET allows Cloudflare X-Forwarded-Host and still denies X-Host-Id spoof', async () => {
+  it('admin Metrics GET allows Cloudflare X-Forwarded-Host, supports human admin Bearer, and denies header spoofs', async () => {
     const { sessionCookie, csrfToken } = await getAdminSessionAndCsrf();
     const listed = await doFetch(
       new Request('http://example.com/api/metrics?limit=8', {
@@ -481,6 +481,19 @@ describe('M9 metrics receiver', () => {
       })
     );
     expect(listed.status).toBe(200);
+    const stub = defaultEnv.HUB.get(defaultEnv.HUB.idFromName('hub'));
+    const spoofedFwdHost = await stub.fetch(
+      new Request('http://example.com/api/metrics?limit=8', {
+        headers: {
+          Cookie: sessionCookie,
+          'x-csrf-token': csrfToken,
+          'X-Forwarded-Host': 'forged-host',
+        },
+      })
+    );
+    expect(spoofedFwdHost.status).toBe(403);
+    const spoofedFwdBody = (await spoofedFwdHost.json()) as { reason?: string };
+    expect(spoofedFwdBody.reason).toBe('header_spoof_denied');
     const hostId = await doFetch(
       new Request('http://example.com/api/metrics?limit=8', {
         headers: {
@@ -493,6 +506,32 @@ describe('M9 metrics receiver', () => {
     expect(hostId.status).toBe(403);
     const hostBody = (await hostId.json()) as { reason?: string };
     expect(hostBody.reason).toBe('header_spoof_denied');
+
+    const humanTok = 'hubt_humanmetricsadmin1';
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const now = new Date(Date.now() + 86400000).toISOString();
+      instance.sql.exec(
+        `INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, scopes, created_by_sub, created_at, expires_at)
+         VALUES (?, 'human', ?, 'fam-human-metrics', 'admin@fake.local', 'human:admin-metrics-test', ?, 'admin-metrics-test', ?, ?)`,
+        'cred-human-metrics',
+        await sha256(humanTok),
+        JSON.stringify(['admin']),
+        now,
+        now
+      );
+    });
+    const bearerListed = await doFetch(
+      new Request('http://example.com/api/metrics?limit=8', {
+        headers: { Authorization: `Bearer ${humanTok}` },
+      })
+    );
+    expect(bearerListed.status).toBe(200);
+
+    const usagePage = await doFetch(
+      new Request('http://example.com/usage', { headers: { Cookie: sessionCookie }, redirect: 'manual' })
+    );
+    expect(usagePage.status).toBe(200);
+    expect(await usagePage.text()).toContain('24 hourly UTC buckets');
   });
 
   it('keeps the metrics page on official dakit shell classes', async () => {

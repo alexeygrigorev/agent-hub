@@ -19,6 +19,7 @@
     <a class="dk-topbar__title" href="/">Agent Hub</a>
     <div class="dk-topbar__end">
       <nav class="hub-topbar-links" aria-label="Quick links">
+        <a class="hub-topbar-link" href="/sessions.html">Sessions</a>
         <a class="hub-topbar-link" href="/fleet.html#quota">Usage</a>
         <a class="hub-topbar-link" href="/metrics.html">Metrics</a>
       </nav>
@@ -48,7 +49,7 @@
         </a>
         <a class="dk-nav-item" href="/metrics.html">
           <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19V9M10 19V5M16 19v-6M22 19V3"/></svg>
-          <span class="dk-nav-item__label">Metrics</span>
+          <span class="dk-nav-item__label">Metrics &amp; Usage</span>
         </a>
         <a class="dk-nav-item" href="/device">
           <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M10 18h4"/></svg>
@@ -78,7 +79,8 @@
           <p class="dk-page-header__subtitle">Coordination, fleet health, session lineage, and sanitized 24-hour metrics</p>
         </div>
         <div class="dk-page-header__actions">
-          <a class="dk-button dk-button--secondary" href="/device">Pair a device</a>
+          <a class="dk-button dk-button--secondary" href="/fleet.html#quota">Usage &amp; Quota</a>
+          <a class="dk-button dk-button--secondary" href="/metrics.html">24h Metrics</a>
           <a class="dk-button dk-button--primary" href="/conversations.html">Open conversations</a>
         </div>
       </header>
@@ -105,14 +107,17 @@
         <article class="dk-card dk-stack hub-overview-card">
           <div class="dk-stack dk-stack--tight">
             <div class="hub-overview-card__head">
-              <h2 class="hub-overview-card__title">Fleet</h2>
+              <h2 class="hub-overview-card__title">Fleet / Usage</h2>
               <span class="dk-chip dk-mono">Operations</span>
             </div>
             <p class="hub-overview-card__desc">Enrolled machines, shared account pools, provider quota windows, liveness heartbeats, disk and host health monitoring, and headless or interactive launches.</p>
           </div>
           <div class="hub-overview-card__foot">
             <span class="dk-muted dk-mono">/fleet.html</span>
-            <a class="dk-button dk-button--secondary dk-button--sm" href="/fleet.html">Open</a>
+            <div class="hub-overview-card__actions">
+              <a class="dk-button dk-button--secondary dk-button--sm" href="/fleet.html#quota">Usage</a>
+              <a class="dk-button dk-button--secondary dk-button--sm" href="/fleet.html">Open</a>
+            </div>
           </div>
         </article>
 
@@ -133,14 +138,17 @@
         <article class="dk-card dk-stack hub-overview-card">
           <div class="dk-stack dk-stack--tight">
             <div class="hub-overview-card__head">
-              <h2 class="hub-overview-card__title">Metrics</h2>
+              <h2 class="hub-overview-card__title">Metrics &amp; Usage</h2>
               <span class="dk-chip dk-mono">24h UTC</span>
             </div>
             <p class="hub-overview-card__desc">Sanitized 24-hour utilization buckets, proven token usage vs unknown coverage, and accepted outcomes per host. Unknown is never filled as zero.</p>
           </div>
           <div class="hub-overview-card__foot">
             <span class="dk-muted dk-mono">/metrics.html</span>
-            <a class="dk-button dk-button--secondary dk-button--sm" href="/metrics.html">Open</a>
+            <div class="hub-overview-card__actions">
+              <a class="dk-button dk-button--secondary dk-button--sm" href="/metrics.html#usage">Token Usage</a>
+              <a class="dk-button dk-button--secondary dk-button--sm" href="/metrics.html">Open</a>
+            </div>
           </div>
         </article>
 

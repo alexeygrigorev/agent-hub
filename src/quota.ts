@@ -1,7 +1,7 @@
 import { SqlStorage, DurableObjectState } from "@cloudflare/workers-types";
 import { Env } from "./env";
 import { sha256 } from "./auth/crypto";
-import { getSession } from "./auth/session";
+import { getSession, allowedCallbackUrls } from "./auth/session";
 
 export const QUOTA_SCHEMA_version = "1.1";
 export const QUOTA_SCHEMA_VERSIONS = new Set<string>(["1.0", "1.1"]);
@@ -1356,9 +1356,26 @@ export class QuotaStore {
       });
     }
 
-    // Client-forged host identity headers are always denied. Do not treat
-    // X-Forwarded-Host as spoof (Cloudflare injects it; same policy as Metrics).
-    if (request.headers.has("x-host-id") || request.headers.has("x-machine-id")) {
+    // Client-forged host identity headers are always denied. Allow proxy
+    // X-Forwarded-Host only when it matches the request host or a configured
+    // OIDC callback origin; reject spoofed host IDs or multi-host values.
+    const fwdHost = request.headers.get("x-forwarded-host");
+    let spoofedForwardedHost = false;
+    if (fwdHost !== null) {
+      const cleanFwd = fwdHost.trim().toLowerCase();
+      if (!cleanFwd || cleanFwd.includes(",")) {
+        spoofedForwardedHost = true;
+      } else if (cleanFwd !== reqUrl.host.toLowerCase()) {
+        spoofedForwardedHost = !allowedCallbackUrls(this.env).some((candidate) => {
+          try {
+            return new URL(candidate).host.toLowerCase() === cleanFwd;
+          } catch {
+            return false;
+          }
+        });
+      }
+    }
+    if (request.headers.has("x-host-id") || request.headers.has("x-machine-id") || spoofedForwardedHost) {
       return jsonResponse(
         { error: "forbidden", reason: "header_spoof_denied" },
         403

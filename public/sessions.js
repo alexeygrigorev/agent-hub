@@ -3,19 +3,46 @@ const byId = id => document.getElementById(id);
 let activeTab = 'list';
 let cachedSessions = [];
 let cachedTree = { tree: [] };
+let selectedSessionId = null;
+let detailPollTimer = null;
+const autoCapturedSessions = new Set();
 let csrf = null;
 let loading = false;
 
-async function api(path) {
-  const r = await fetch(path, { credentials: 'same-origin', cache: 'no-store' });
+async function api(path, method = 'GET', data) {
+  const headers = {};
+  if (data !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    if (csrf) headers['X-CSRF-Token'] = csrf;
+  }
+  const r = await fetch(path, {
+    method,
+    headers,
+    credentials: 'same-origin',
+    cache: 'no-store',
+    body: data === undefined ? undefined : JSON.stringify(data)
+  });
   if (r.status === 401) {
+    csrf = null;
     location.assign('/auth/login');
     throw new Error('Sign-in required');
   }
   if (!r.ok) {
-    throw new Error(`API request failed (${r.status})`);
+    let errText = `API request failed (${r.status})`;
+    try {
+      const errBody = await r.json();
+      if (errBody && errBody.error) errText = `${errBody.error} (${r.status})`;
+    } catch {}
+    throw new Error(errText);
   }
   return r.json();
+}
+
+function reqKey(prefix) {
+  const rand = (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function')
+    ? globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 20)
+    : `${Date.now()}${Math.floor(Math.random() * 1e6)}`;
+  return `${prefix}-${rand}`;
 }
 
 function typeBadge(type) {
@@ -32,20 +59,56 @@ function stateBadge(state) {
   const span = document.createElement('span');
   const s = state || 'unknown';
   let color = 'dk-badge--neutral';
-  if (['running', 'active', 'working'].includes(s)) color = 'dk-badge--success';
-  else if (['stale', 'stalled', 'uncertain', 'offered'].includes(s)) color = 'dk-badge--warning';
-  else if (['failed', 'refused', 'stopped', 'offline', 'error'].includes(s)) color = 'dk-badge--danger';
+  if (['running', 'active', 'working', 'acked', 'delivered'].includes(s)) color = 'dk-badge--success';
+  else if (['stale', 'stalled', 'uncertain', 'offered', 'starting', 'recorded', 'transported', 'claimed', 'held'].includes(s)) color = 'dk-badge--warning';
+  else if (['failed', 'refused', 'stopped', 'offline', 'error', 'cancelled'].includes(s)) color = 'dk-badge--danger';
   span.className = `dk-badge ${color}`;
   span.textContent = s;
   return span;
 }
 
-function truncateAttr(el, value) {
-  const text = value == null || value === '' ? '-' : String(value);
-  el.textContent = text;
-  el.title = text;
+function compactWorkspace(value) {
+  if (value == null || value === '') return '-';
+  const text = String(value);
+  const parts = text.split('/').filter(Boolean);
+  if (parts.length > 2) {
+    return '…/' + parts.slice(-2).join('/');
+  }
+  return text;
+}
+
+function compactUpdated(value) {
+  const clean = (value || '').slice(0, 19).replace('T', ' ');
+  if (!clean) return '-';
+  return clean.length >= 16 ? clean.slice(5, 16) : clean;
+}
+
+function truncateAttr(el, displayValue, fullValue) {
+  const shown = displayValue == null || displayValue === '' ? '-' : String(displayValue);
+  const full = fullValue == null || fullValue === '' ? shown : String(fullValue);
+  el.textContent = shown;
+  el.title = full;
   el.classList.add('sessions-truncate');
   return el;
+}
+
+function bindSessionTap(el, sessionId, labelText) {
+  if (!sessionId) return;
+  el.tabIndex = 0;
+  el.setAttribute('role', 'button');
+  el.dataset.sessionId = sessionId;
+  el.setAttribute('aria-label', `Open session ${labelText || sessionId}`);
+  el.addEventListener('click', e => {
+    e.stopPropagation();
+    openSessionDetail(sessionId);
+  });
+  el.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      e.stopPropagation();
+      openSessionDetail(sessionId);
+    }
+  });
 }
 
 function renderSessionCards(filtered, emptyMessage) {
@@ -62,18 +125,27 @@ function renderSessionCards(filtered, emptyMessage) {
   for (const s of filtered) {
     const card = document.createElement('article');
     card.className = 'dk-card dk-stack sessions-card-item';
+    const nameText = s.qualified_alias || s.name || s.id || '-';
+    bindSessionTap(card, s.id, nameText);
 
-    const badges = document.createElement('div');
-    badges.className = 'sessions-card-item__badges';
-    badges.append(typeBadge(s.session_type), stateBadge(s.state));
-    card.append(badges);
+    const head = document.createElement('div');
+    head.className = 'sessions-card-item__head';
 
     const name = document.createElement('div');
     name.className = 'sessions-card-item__name';
-    const nameText = s.qualified_alias || s.name || s.id || '-';
     name.textContent = nameText;
     name.title = nameText;
-    card.append(name);
+    head.append(name);
+
+    const badges = document.createElement('div');
+    badges.className = 'sessions-card-item__badges';
+    const chev = document.createElement('span');
+    chev.className = 'sessions-card-item__chev';
+    chev.setAttribute('aria-hidden', 'true');
+    chev.textContent = '›';
+    badges.append(stateBadge(s.state), typeBadge(s.session_type), chev);
+    head.append(badges);
+    card.append(head);
 
     const meta = document.createElement('div');
     meta.className = 'sessions-card-item__meta';
@@ -82,10 +154,17 @@ function renderSessionCards(filtered, emptyMessage) {
     truncateAttr(engine, s.engine || '-');
     meta.append(engine);
     const ws = document.createElement('span');
-    truncateAttr(ws, s.workspace || '-');
+    truncateAttr(ws, compactWorkspace(s.workspace), s.workspace || '-');
     meta.append(ws);
+    if (s.parent_id) {
+      const parent = document.createElement('span');
+      truncateAttr(parent, `↳ ${s.parent_id}`, s.parent_id);
+      meta.append(parent);
+    }
     const updated = document.createElement('span');
-    updated.textContent = (s.updated_at || '').slice(0, 19).replace('T', ' ') || '-';
+    const fullUpdated = (s.updated_at || '').slice(0, 19).replace('T', ' ') || '-';
+    updated.textContent = compactUpdated(s.updated_at);
+    updated.title = fullUpdated;
     meta.append(updated);
     card.append(meta);
 
@@ -132,6 +211,9 @@ function renderTable(sessions, filter = '') {
   const tbody = document.createElement('tbody');
   for (const s of filtered) {
     const tr = document.createElement('tr');
+    tr.className = 'sessions-row';
+    const nameText = s.qualified_alias || s.name || s.id;
+    bindSessionTap(tr, s.id, nameText);
 
     const tdType = document.createElement('td');
     tdType.dataset.label = 'Type';
@@ -142,7 +224,6 @@ function renderTable(sessions, filter = '') {
     tdName.dataset.label = 'Name / Alias';
     const nameSpan = document.createElement('span');
     nameSpan.className = 'code-pill sessions-truncate';
-    const nameText = s.qualified_alias || s.name || s.id;
     nameSpan.textContent = nameText;
     nameSpan.title = nameText;
     tdName.append(nameSpan);
@@ -164,7 +245,7 @@ function renderTable(sessions, filter = '') {
     const wsSpan = document.createElement('span');
     wsSpan.className = 'sessions-truncate';
     const wsText = s.workspace || '-';
-    wsSpan.textContent = wsText;
+    wsSpan.textContent = compactWorkspace(wsText);
     wsSpan.title = wsText;
     tdWs.append(wsSpan);
     tr.append(tdWs);
@@ -231,12 +312,13 @@ function renderTree(treeData, filter = '') {
 
     const item = document.createElement('div');
     item.className = 'tree-item';
+    const nameText = node.qualified_alias || node.name || node.id;
+    bindSessionTap(item, node.id, nameText);
 
     item.append(typeBadge(node.session_type));
 
     const nameSpan = document.createElement('span');
     nameSpan.className = 'code-pill sessions-truncate';
-    const nameText = node.qualified_alias || node.name || node.id;
     nameSpan.textContent = nameText;
     nameSpan.title = nameText;
     item.append(nameSpan);
@@ -253,10 +335,16 @@ function renderTree(treeData, filter = '') {
     if (node.workspace) {
       const wsSpan = document.createElement('span');
       wsSpan.className = 'meta-dim sessions-truncate';
-      wsSpan.textContent = node.workspace;
+      wsSpan.textContent = compactWorkspace(node.workspace);
       wsSpan.title = node.workspace;
       item.append(wsSpan);
     }
+
+    const chev = document.createElement('span');
+    chev.className = 'sessions-card-item__chev';
+    chev.setAttribute('aria-hidden', 'true');
+    chev.textContent = '›';
+    item.append(chev);
 
     li.append(item);
 
@@ -295,6 +383,314 @@ function renderTree(treeData, filter = '') {
   container.append(ul);
 }
 
+function findCachedSession(sessionId) {
+  const match = s => s && (s.id === sessionId || s.qualified_alias === sessionId || s.name === sessionId || (s.binding && (s.binding.native_id === sessionId || s.binding.tag === sessionId)));
+  const fromList = cachedSessions.find(match);
+  if (fromList) return fromList;
+  function walk(nodes) {
+    for (const n of nodes || []) {
+      if (match(n)) return n;
+      const found = walk(n.children);
+      if (found) return found;
+    }
+    return null;
+  }
+  return walk(cachedTree.tree);
+}
+
+function addMetaItem(container, label, value, onClick) {
+  const item = document.createElement('div');
+  item.className = 'session-meta-item';
+  const lbl = document.createElement('span');
+  lbl.className = 'session-meta-item__label';
+  lbl.textContent = label;
+  item.append(lbl);
+  if (typeof onClick === 'function') {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'session-meta-link';
+    btn.textContent = value || '-';
+    btn.addEventListener('click', onClick);
+    item.append(btn);
+  } else {
+    const val = document.createElement('span');
+    val.className = 'session-meta-item__value';
+    val.textContent = value || '-';
+    item.append(val);
+  }
+  container.append(item);
+}
+
+function renderSessionDetail(session, commands = []) {
+  const titleEl = byId('session-detail-title');
+  const badgesEl = byId('session-detail-badges');
+  const metaEl = byId('session-detail-meta');
+  const termOutEl = byId('session-terminal-output');
+  const termMetaEl = byId('session-terminal-meta');
+  const cmdsEl = byId('session-detail-commands');
+  const stopBtn = byId('session-stop-btn');
+  const capTailBtn = byId('session-capture-tail-btn');
+  const capScreenBtn = byId('session-capture-screen-btn');
+  const sendBtn = byId('session-send-btn');
+  const sendInput = byId('session-send-input');
+
+  const displayTitle = session.qualified_alias || session.name || session.id || 'Session';
+  if (titleEl) titleEl.textContent = displayTitle;
+  if (badgesEl) {
+    badgesEl.replaceChildren(stateBadge(session.state), typeBadge(session.session_type));
+  }
+
+  const isRunning = session.state === 'running';
+  const isStoppable = ['offered', 'starting', 'running', 'uncertain'].includes(session.state);
+  if (capTailBtn) capTailBtn.disabled = !isRunning;
+  if (capScreenBtn) capScreenBtn.disabled = !isRunning;
+  if (sendBtn) sendBtn.disabled = !isRunning;
+  if (sendInput) sendInput.disabled = !isRunning;
+  if (stopBtn) stopBtn.disabled = !isStoppable;
+
+  if (metaEl) {
+    metaEl.replaceChildren();
+    addMetaItem(metaEl, 'Session ID', session.id);
+    addMetaItem(metaEl, 'Alias / Name', session.qualified_alias || session.name || '-');
+    addMetaItem(metaEl, 'Engine / Mode', `${session.engine || '-'} · ${session.mode || session.session_type || '-'}`);
+    addMetaItem(metaEl, 'Machine', session.machine || '-');
+    addMetaItem(metaEl, 'Workspace', session.workspace || '-');
+    if (session.parent_id) {
+      const parentLabel = `${session.parent_id}${session.parent_source === 'explicit_parent' ? '' : ' (inferred)'}`;
+      addMetaItem(metaEl, 'Parent Session', parentLabel, () => openSessionDetail(session.parent_id));
+    } else {
+      addMetaItem(metaEl, 'Parent Session', 'external / root');
+    }
+    if (session.binding && (session.binding.tag || session.binding.native_id)) {
+      addMetaItem(metaEl, 'Native Binding', `${session.binding.tag || '-'} (${session.binding.native_id || '-'})`);
+    }
+    addMetaItem(metaEl, 'Updated', (session.updated_at || '').slice(0, 19).replace('T', ' ') || '-');
+  }
+
+  const sortedCommands = [...commands].sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+  const latestCaptureWithOutput = sortedCommands.find(c => c.kind === 'capture' && c.ack && typeof c.ack.capture === 'string');
+  const pendingCapture = sortedCommands.find(c => c.kind === 'capture' && ['recorded', 'transported', 'claimed'].includes(c.state));
+
+  if (termOutEl) {
+    if (latestCaptureWithOutput) {
+      termOutEl.textContent = latestCaptureWithOutput.ack.capture || '(empty output)';
+      if (termMetaEl) {
+        const ts = (latestCaptureWithOutput.updated_at || latestCaptureWithOutput.created_at || '').slice(0, 19).replace('T', ' ');
+        termMetaEl.textContent = pendingCapture
+          ? `Refreshing (${pendingCapture.state}) · Last capture ${ts}`
+          : `Captured ${ts}`;
+      }
+    } else if (pendingCapture) {
+      termOutEl.textContent = `Capture command queued (${pendingCapture.state}) — waiting for host agent to report terminal output…`;
+      if (termMetaEl) termMetaEl.textContent = `State: ${pendingCapture.state}`;
+    } else if (isRunning) {
+      termOutEl.textContent = 'No terminal capture recorded yet. Tap "Capture log" or "Capture screen" above to fetch live output from the host.';
+      if (termMetaEl) termMetaEl.textContent = 'Ready to capture';
+    } else {
+      termOutEl.textContent = `Session is ${session.state || 'not running'} and has no recorded terminal capture.`;
+      if (termMetaEl) termMetaEl.textContent = '';
+    }
+  }
+
+  if (cmdsEl) {
+    cmdsEl.replaceChildren();
+    if (!sortedCommands.length) {
+      const p = document.createElement('p');
+      p.className = 'dk-muted';
+      p.textContent = 'No commands sent to this session yet.';
+      cmdsEl.append(p);
+    } else {
+      const list = document.createElement('div');
+      list.className = 'session-commands-list';
+      for (const c of sortedCommands.slice(0, 15)) {
+        const item = document.createElement('div');
+        item.className = 'session-command-card';
+        const left = document.createElement('div');
+        left.className = 'sessions-card-item__badges';
+        const kindSpan = document.createElement('span');
+        kindSpan.className = 'code-pill';
+        kindSpan.textContent = c.kind;
+        left.append(kindSpan, stateBadge(c.state));
+        if (c.kind === 'send' && c.payload && c.payload.body) {
+          const bodyPreview = document.createElement('span');
+          bodyPreview.className = 'meta-dim sessions-truncate';
+          bodyPreview.textContent = c.payload.body;
+          bodyPreview.title = c.payload.body;
+          left.append(bodyPreview);
+        } else if (c.kind === 'capture' && c.payload && c.payload.mode) {
+          const modeSpan = document.createElement('span');
+          modeSpan.className = 'meta-dim dk-mono';
+          modeSpan.textContent = c.payload.mode;
+          left.append(modeSpan);
+        }
+        const right = document.createElement('span');
+        right.className = 'meta-dim';
+        const reason = c.ack && c.ack.reason ? `${c.ack.reason} · ` : '';
+        right.textContent = `${reason}${(c.updated_at || c.created_at || '').slice(0, 19).replace('T', ' ')}`;
+        item.append(left, right);
+        list.append(item);
+      }
+      cmdsEl.append(list);
+    }
+  }
+}
+
+async function refreshSessionDetail(sessionId) {
+  if (!sessionId || selectedSessionId !== sessionId) return;
+  const actionStatus = byId('session-action-status');
+  try {
+    const [sessionData, cmdData] = await Promise.all([
+      api(`/api/sessions/${encodeURIComponent(sessionId)}`),
+      api(`/api/sessions/${encodeURIComponent(sessionId)}/commands?limit=50`).catch(() => ({ commands: [] }))
+    ]);
+    if (selectedSessionId !== sessionId) return;
+    const cmds = (cmdData && Array.isArray(cmdData.commands)) ? cmdData.commands : [];
+    renderSessionDetail(sessionData, cmds);
+
+    const hasPending = cmds.some(c => ['recorded', 'transported', 'claimed'].includes(c.state));
+    if (detailPollTimer) {
+      clearTimeout(detailPollTimer);
+      detailPollTimer = null;
+    }
+    if (hasPending) {
+      detailPollTimer = setTimeout(() => refreshSessionDetail(sessionId), 2000);
+    } else if (sessionData.state === 'running' && csrf && !cmds.some(c => c.kind === 'capture') && !autoCapturedSessions.has(sessionData.id)) {
+      autoCapturedSessions.add(sessionData.id);
+      requestCapture('tail', true);
+    }
+  } catch (err) {
+    if (actionStatus) actionStatus.textContent = `Could not load session details: ${err.message || 'error'}`;
+  }
+}
+
+function openSessionDetail(sessionId, pushHistory = true) {
+  if (!sessionId) return;
+  selectedSessionId = sessionId;
+  if (detailPollTimer) {
+    clearTimeout(detailPollTimer);
+    detailPollTimer = null;
+  }
+  const listSec = byId('list-section');
+  const treeSec = byId('tree-section');
+  const detailSec = byId('session-detail-section');
+  if (listSec) listSec.hidden = true;
+  if (treeSec) treeSec.hidden = true;
+  if (detailSec) detailSec.hidden = false;
+
+  if (pushHistory) {
+    const url = new URL(location.href);
+    url.searchParams.set('session', sessionId);
+    history.pushState({ sessionId }, '', url.pathname + url.search);
+  }
+
+  const actionStatus = byId('session-action-status');
+  if (actionStatus) actionStatus.textContent = 'Loading session details…';
+
+  const cached = findCachedSession(sessionId);
+  if (cached) {
+    renderSessionDetail(cached, []);
+  }
+  window.scrollTo({ top: 0, behavior: 'instant' });
+  refreshSessionDetail(sessionId).then(() => {
+    if (actionStatus && actionStatus.textContent === 'Loading session details…') {
+      actionStatus.textContent = '';
+    }
+  });
+}
+
+function closeSessionDetail(pushHistory = true) {
+  selectedSessionId = null;
+  if (detailPollTimer) {
+    clearTimeout(detailPollTimer);
+    detailPollTimer = null;
+  }
+  const listSec = byId('list-section');
+  const treeSec = byId('tree-section');
+  const detailSec = byId('session-detail-section');
+  if (detailSec) detailSec.hidden = true;
+  if (listSec) listSec.hidden = activeTab !== 'list';
+  if (treeSec) treeSec.hidden = activeTab !== 'tree';
+
+  if (pushHistory) {
+    const url = new URL(location.href);
+    url.searchParams.delete('session');
+    history.pushState({}, '', url.pathname + url.search);
+  }
+  updateView();
+}
+
+async function requestCapture(mode = 'tail', silent = false) {
+  if (!selectedSessionId) return;
+  const actionStatus = byId('session-action-status');
+  if (!silent && actionStatus) actionStatus.textContent = `Requesting ${mode} capture…`;
+  try {
+    if (!csrf) {
+      const me = await api('/auth/me');
+      csrf = me.csrf_token || null;
+    }
+    const res = await api(`/api/sessions/${encodeURIComponent(selectedSessionId)}/capture`, 'POST', {
+      key: reqKey('cap'),
+      mode,
+      max_bytes: 65536
+    });
+    if (!silent && actionStatus) actionStatus.textContent = `Capture requested (${res.state || 'recorded'}).`;
+    await refreshSessionDetail(selectedSessionId);
+  } catch (err) {
+    if (!silent && actionStatus) actionStatus.textContent = `Capture failed: ${err.message}`;
+  }
+}
+
+async function requestStop() {
+  if (!selectedSessionId) return;
+  const actionStatus = byId('session-action-status');
+  if (actionStatus) actionStatus.textContent = 'Sending stop command…';
+  try {
+    if (!csrf) {
+      const me = await api('/auth/me');
+      csrf = me.csrf_token || null;
+    }
+    const res = await api(`/api/sessions/${encodeURIComponent(selectedSessionId)}/stop`, 'POST', {
+      key: reqKey('stop')
+    });
+    if (actionStatus) actionStatus.textContent = `Stop command queued (${res.state || 'recorded'}).`;
+    await Promise.all([refreshSessionDetail(selectedSessionId), loadData()]);
+  } catch (err) {
+    if (actionStatus) actionStatus.textContent = `Stop failed: ${err.message}`;
+  }
+}
+
+async function requestSend(e) {
+  e.preventDefault();
+  if (!selectedSessionId) return;
+  const input = byId('session-send-input');
+  const btn = byId('session-send-btn');
+  const actionStatus = byId('session-action-status');
+  const body = (input?.value || '').trim();
+  if (!body) {
+    if (actionStatus) actionStatus.textContent = 'Enter a message before sending.';
+    return;
+  }
+  if (btn) btn.disabled = true;
+  if (actionStatus) actionStatus.textContent = 'Sending message to session…';
+  try {
+    if (!csrf) {
+      const me = await api('/auth/me');
+      csrf = me.csrf_token || null;
+    }
+    const res = await api(`/api/sessions/${encodeURIComponent(selectedSessionId)}/send`, 'POST', {
+      key: reqKey('send'),
+      body
+    });
+    if (input) input.value = '';
+    if (actionStatus) actionStatus.textContent = `Message queued (${res.state || 'recorded'}).`;
+    await refreshSessionDetail(selectedSessionId);
+  } catch (err) {
+    if (actionStatus) actionStatus.textContent = `Send failed: ${err.message}`;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function loadData() {
   if (loading) return;
   loading = true;
@@ -324,6 +720,9 @@ async function loadData() {
     cachedSessions = sessionsData.sessions || [];
     cachedTree = treeData || { tree: [] };
     updateView();
+    if (selectedSessionId) {
+      await refreshSessionDetail(selectedSessionId);
+    }
     status.textContent = `Authenticated · ${cachedSessions.length} session${cachedSessions.length === 1 ? '' : 's'}`;
   } catch (err) {
     status.textContent = 'Sessions could not be refreshed.';
@@ -348,6 +747,7 @@ function setupEvents() {
   const treeBtn = byId('view-tree-btn');
   const listSec = byId('list-section');
   const treeSec = byId('tree-section');
+  const detailSec = byId('session-detail-section');
   const filterInput = byId('sessions-filter');
   const refreshBtn = byId('sessions-refresh');
   const signOut = byId('sign-out');
@@ -356,26 +756,68 @@ function setupEvents() {
     activeTab = 'list';
     listBtn.setAttribute('aria-selected', 'true');
     treeBtn.setAttribute('aria-selected', 'false');
-    listSec.hidden = false;
-    treeSec.hidden = true;
-    updateView();
+    if (selectedSessionId) {
+      closeSessionDetail();
+    } else {
+      listSec.hidden = false;
+      treeSec.hidden = true;
+      if (detailSec) detailSec.hidden = true;
+      updateView();
+    }
   });
 
   treeBtn?.addEventListener('click', () => {
     activeTab = 'tree';
     treeBtn.setAttribute('aria-selected', 'true');
     listBtn.setAttribute('aria-selected', 'false');
-    listSec.hidden = true;
-    treeSec.hidden = false;
-    updateView();
+    if (selectedSessionId) {
+      closeSessionDetail();
+    } else {
+      listSec.hidden = true;
+      treeSec.hidden = false;
+      if (detailSec) detailSec.hidden = true;
+      updateView();
+    }
   });
 
   filterInput?.addEventListener('input', () => {
-    updateView();
+    if (selectedSessionId) closeSessionDetail();
+    else updateView();
   });
 
   refreshBtn?.addEventListener('click', () => {
     loadData();
+  });
+
+  byId('session-detail-back')?.addEventListener('click', () => {
+    closeSessionDetail();
+  });
+
+  byId('session-detail-refresh')?.addEventListener('click', () => {
+    if (selectedSessionId) refreshSessionDetail(selectedSessionId);
+  });
+
+  byId('session-capture-tail-btn')?.addEventListener('click', () => {
+    requestCapture('tail', false);
+  });
+
+  byId('session-capture-screen-btn')?.addEventListener('click', () => {
+    requestCapture('screen', false);
+  });
+
+  byId('session-stop-btn')?.addEventListener('click', () => {
+    requestStop();
+  });
+
+  byId('session-send-form')?.addEventListener('submit', requestSend);
+
+  window.addEventListener('popstate', () => {
+    const sid = new URLSearchParams(location.search).get('session');
+    if (sid) {
+      openSessionDetail(sid, false);
+    } else if (selectedSessionId) {
+      closeSessionDetail(false);
+    }
   });
 
   signOut?.addEventListener('click', async () => {
@@ -398,5 +840,9 @@ function setupEvents() {
 
 document.addEventListener('DOMContentLoaded', () => {
   setupEvents();
+  const initialSession = new URLSearchParams(location.search).get('session');
+  if (initialSession) {
+    openSessionDetail(initialSession, false);
+  }
   loadData();
 });
