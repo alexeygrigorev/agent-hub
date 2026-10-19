@@ -33,6 +33,14 @@ export default {
         } catch {}
       }
     }
+    // CloudFront supplies X-Forwarded-Host for the public hub host. Metrics and
+    // quota reject that header as client spoofing, so strip it after the edge
+    // has applied an allowlisted origin rewrite (or declined one).
+    if (request.headers.has('X-Forwarded-Host')) {
+      const headers = new Headers(request.headers);
+      headers.delete('X-Forwarded-Host');
+      request = new Request(request, { headers });
+    }
     if (url.pathname === '/healthz') {
       url.pathname = '/api/healthz';
       return env.HUB.get(env.HUB.idFromName('hub')).fetch(new Request(url, request));

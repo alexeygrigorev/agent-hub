@@ -19,14 +19,18 @@ describe('registered public proxy origin', () => {
     return { response: await response.json() as any, observed };
   }
   it('preserves the public origin and POST body across the CloudFront hop', async () => {
-    const { response } = await forward('hub.dtcdev.click');
+    const { response, observed } = await forward('hub.dtcdev.click');
     expect(response.origin).toBe('https://hub.dtcdev.click');
     expect(response.csrfOrigin).toBe(response.origin);
     expect(response.body).toEqual({ kind: 'human' });
+    // Metrics/quota treat X-Forwarded-Host as spoofing; edge must strip it.
+    expect(observed.headers.has('X-Forwarded-Host')).toBe(false);
   });
   it('ignores unregistered and ambiguous forwarded hosts', async () => {
     for (const host of ['attacker.invalid', 'hub.dtcdev.click,attacker.invalid']) {
-      expect((await forward(host)).response.origin).toBe('https://alias.workers.dev');
+      const { response, observed } = await forward(host);
+      expect(response.origin).toBe('https://alias.workers.dev');
+      expect(observed.headers.has('X-Forwarded-Host')).toBe(false);
     }
   });
 });
