@@ -63,7 +63,7 @@ class TestSessionControlCli(unittest.TestCase):
     def test_start_headless_brief_and_interactive_empty(self):
         with patch.object(session_control, 'read_file', return_value='synthetic goal'), \
                 patch.object(session_control, 'request', return_value={}) as transport:
-            session_control.execute(self.parse('start', '--workspace', 'demo', '--engine', 'codex', '--brief-file', 'goal.txt', '--key', 'k'))
+            session_control.execute(self.parse('start', '--workspace', 'demo', '--engine', 'codex', '--reason', 'codex required for test', '--brief-file', 'goal.txt', '--key', 'k'))
         payload = transport.call_args.args[2]
         self.assertEqual(payload['brief'], 'synthetic goal')
         self.assertEqual(payload['mode'], 'headless')
@@ -364,6 +364,45 @@ class TestSessionControlCli(unittest.TestCase):
         out_plain = session_control.render_output(args_plain, {'sessions': sample_sessions})
         self.assertIsInstance(out_plain, str)
         self.assertIn('dataops:batching', out_plain)
+
+    def test_start_engine_override_reason_required(self):
+        args = self.parse('start', '--workspace', 'demo', '--engine', 'codex', '--key', 'k')
+        with self.assertRaises(ValueError) as ctx:
+            session_control.execute(args)
+        self.assertIn('Engine override requires an explanation', str(ctx.exception))
+
+    def test_dedicated_override_requires_engine_and_reason(self):
+        with self.assertRaises(SystemExit):
+            self.parse('override', '--workspace', 'demo', '--reason', 'some reason')
+
+        with self.assertRaises(SystemExit):
+            self.parse('override', '--workspace', 'demo', '--engine', 'codex')
+
+        with patch.object(session_control, 'request', return_value={}) as transport:
+            session_control.execute(self.parse('override', '--workspace', 'demo', '--engine', 'codex', '--reason', 'need codex', '--key', 'k'))
+        payload = transport.call_args.args[2]
+        self.assertEqual(payload['engine'], 'codex')
+        self.assertEqual(payload['engine_override_reason'], 'need codex')
+
+    def test_list_state_filtering_waiting_and_idle(self):
+        raw_sessions = [
+            {'id': 's1', 'state': 'running', 'agent_state': 'running', 'waiting_confirmation': False},
+            {'id': 's2', 'state': 'running', 'agent_state': 'waiting', 'waiting_confirmation': True},
+            {'id': 's3', 'state': 'running', 'agent_state': 'idle', 'waiting_confirmation': False},
+            {'id': 's4', 'state': 'stopped', 'agent_state': None, 'waiting_confirmation': False},
+        ]
+        with patch.object(session_control, 'request', return_value={'sessions': raw_sessions}):
+            w_res = session_control.execute(self.parse('list', '--state', 'waiting'))
+            self.assertEqual(len(w_res['sessions']), 1)
+            self.assertEqual(w_res['sessions'][0]['id'], 's2')
+
+            wc_res = session_control.execute(self.parse('list', '--state', 'waiting-confirmation'))
+            self.assertEqual(len(wc_res['sessions']), 1)
+            self.assertEqual(wc_res['sessions'][0]['id'], 's2')
+
+            idle_res = session_control.execute(self.parse('list', '--state', 'idle'))
+            self.assertEqual(len(idle_res['sessions']), 2)
+            self.assertEqual({s['id'] for s in idle_res['sessions']}, {'s2', 's3'})
 
 
 if __name__ == '__main__':

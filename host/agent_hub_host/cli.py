@@ -363,7 +363,9 @@ def main():
     for command in ('start-agent', 'start-session', 'plan-agent'):
         launch = sub.add_parser(command, help='Queue a headless agent or a real interactive session')
         launch.add_argument('--machine', required=command == 'start-session')
-        launch.add_argument('--engine')
+        launch.add_argument('--engine', help='Engine override (requires --reason; default start is policy-driven)')
+        launch.add_argument('--reason', help='Required explanation why this specific model/engine must be chosen')
+        launch.add_argument('--tier', choices=['quick', 'daily', 'deep'], help='Routing policy tier (default auto)')
         launch.add_argument('--workspace', required=True, help='Configured workspace label on the selected host')
         launch.add_argument('--prompt-file', help='UTF-8 goal file for headless work')
         launch.add_argument('--summary', default='Agent task', help='Non-secret task summary shown on dashboard')
@@ -576,7 +578,14 @@ def main():
                 payload = {'mode': 'interactive' if args.cmd == 'start-session' else 'headless', 'workspace': args.workspace,
                            'summary': args.summary, 'idempotency_key': args.key or str(uuid.uuid4())}
                 if args.machine: payload['machine'] = args.machine
-                if args.engine: payload['engine'] = args.engine
+                if getattr(args, 'tier', None): payload['tier'] = args.tier
+                if getattr(args, 'engine', None):
+                    reason = getattr(args, 'reason', None)
+                    if not reason or not reason.strip():
+                        print('Engine override requires an explanation why this specific model/engine must be chosen (use --reason). Casual use should prefer auto/policy without --engine.', file=sys.stderr)
+                        sys.exit(2)
+                    payload['engine'] = args.engine
+                    payload['engine_override_reason'] = reason.strip()
                 if args.parent: payload['parent_id'] = args.parent
                 if args.prompt_file:
                     if args.cmd == 'start-session': raise ValueError('Interactive sessions start at an empty native prompt')

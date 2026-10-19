@@ -314,6 +314,83 @@ export class StatusService {
     };
   }
 
+  private computeAgentCounts(now: number): { running: number; idle: number; waiting: number; waiting_confirmation: number } {
+    let running = 0;
+    let idle = 0;
+    let waiting = 0;
+    let waiting_confirmation = 0;
+    try {
+      const fleetSessions = this.rows(`
+        SELECT s.machine_id, s.native_id, s.tag, s.engine, s.phase, s.agent_state,
+               c.session_type, c.state AS control_state
+        FROM fleet_sessions s
+        LEFT JOIN session_control_sessions c ON (c.machine_id = s.machine_id AND
+          CASE WHEN json_valid(c.binding_json) THEN
+            CASE WHEN json_type(c.binding_json, '$.native_id') = 'text'
+              THEN json_extract(c.binding_json, '$.native_id') END END = s.native_id)
+        WHERE s.phase IN ('starting', 'running')
+          AND s.tag NOT LIKE 'ping-%'
+          AND s.tag NOT LIKE 'probe-%'
+          AND (s.engine IS NULL OR s.engine != 'probe')
+          AND (c.session_type IS NULL OR c.session_type != 'probe')
+      `);
+
+      const obsMap = new Map<string, any>();
+      try {
+        const obsRows = this.rows('SELECT machine_id, native_id, payload_json FROM session_lifecycle_observations');
+        for (const r of obsRows) {
+          try {
+            const p = JSON.parse(r.payload_json);
+            obsMap.set(`${r.machine_id}/${r.native_id}`, p);
+          } catch {}
+        }
+      } catch {}
+
+      for (const s of fleetSessions) {
+        const obs = obsMap.get(`${s.machine_id}/${s.native_id}`) || {};
+        const isWaitingConf = Boolean(obs.waiting_confirmation || (obs.awaiting_alexey && !obs.awaiting_question));
+        const isWaitingAsk = Boolean(obs.awaiting_alexey || obs.waiting_input || obs.waiting_question);
+        const isWaiting = Boolean(isWaitingConf || isWaitingAsk || s.agent_state === 'waiting' || s.phase === 'waiting');
+        const isIdle = Boolean(s.agent_state === 'idle' || isWaiting);
+
+        if (isWaitingConf) {
+          waiting_confirmation++;
+        }
+        if (isWaiting) {
+          waiting++;
+          idle++;
+        } else if (isIdle) {
+          idle++;
+        } else {
+          running++;
+        }
+      }
+
+      // Standalone session_control_sessions not bound to fleet_sessions
+      const controlSessions = this.rows(`
+        SELECT c.id, c.session_type, c.state, c.engine
+        FROM session_control_sessions c
+        WHERE c.state IN ('starting', 'running')
+          AND (c.session_type IS NULL OR c.session_type != 'probe')
+          AND (c.engine IS NULL OR c.engine != 'probe')
+          AND c.id NOT IN (
+            SELECT COALESCE(c2.id, '')
+            FROM session_control_sessions c2
+            JOIN fleet_sessions s ON (c2.machine_id = s.machine_id AND
+              CASE WHEN json_valid(c2.binding_json) THEN
+                CASE WHEN json_type(c2.binding_json, '$.native_id') = 'text'
+                  THEN json_extract(c2.binding_json, '$.native_id') END END = s.native_id)
+          )
+      `);
+      for (const _ of controlSessions) {
+        running++;
+      }
+    } catch {
+      // Degrade gracefully if tables don't exist yet
+    }
+    return { running, idle, waiting, waiting_confirmation };
+  }
+
   private summaryDto(tasks: Obj[], selectedTotal: number): Obj {
     const byStatus: Record<string, number> = {};
     for (const t of tasks) byStatus[t.status] = (byStatus[t.status] ?? 0) + 1;
@@ -384,10 +461,12 @@ export class StatusService {
         const nowIso = new Date(now).toISOString();
         const built = this.buildItems(p, page, hostFilter, sinceMs, now, nowIso);
         const diskSummary = this.monitoringService ? this.monitoringService.getStatusSummary(now) : null;
+        const agentCounts = this.computeAgentCounts(now);
         return json({
           snapshot_at: nowIso,
           revision,
           authorized_scope: (p as any).admin ? 'operator_all' : 'explicit_grants_only',
+          agents: agentCounts,
           tasks: built.items,
           disk: diskSummary?.filesystems ?? [],
           host_health: diskSummary?.host_health ?? [],
@@ -461,13 +540,18 @@ export class StatusService {
             this.sql.exec('DELETE FROM status_baselines WHERE caller_key IN (SELECT caller_key FROM status_baselines ORDER BY updated_at ASC LIMIT 500)');
           }
         } catch { /* capacity trim is best-effort */ }
-        const summary = this.summaryDto(tasks, selected.length);
+        const agentCounts = this.computeAgentCounts(now);
+        const summary = {
+          ...this.summaryDto(tasks, selected.length),
+          agents: agentCounts,
+        };
         const diskSummary = this.monitoringService ? this.monitoringService.getStatusSummary(now) : null;
         return json({
           snapshot_at: nowIso,
           revision,
           authorized_scope: (p as any).admin ? 'operator_all' : 'explicit_grants_only',
           summary,
+          agents: agentCounts,
           tasks: built.items,
           disk: diskSummary?.filesystems ?? [],
           host_health: diskSummary?.host_health ?? [],

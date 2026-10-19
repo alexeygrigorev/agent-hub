@@ -16,7 +16,7 @@ for (const [name, mode] of [['start_agent', 'headless'], ['start_session', 'inte
 }
 tool('sessions_list', 'GET', '/api/sessions', 'List sessions; query view=lifecycle gives grouped lifecycle; state, limit, cursor filter.', ['sessions', 'sessions list']);
 tool('sessions_tree', 'GET', '/api/sessions/tree', 'Session requester/parent tree.', ['sessions tree']);
-tool('sessions_start', 'POST', '/api/sessions', 'Queue a session. payload: workspace, engine, machine, mode (headless/interactive), brief, name, parent_id, key. Admission and quotas remain enforced.', ['sessions start']);
+tool('sessions_start', 'POST', '/api/sessions', 'Queue a session. payload: workspace, engine, machine, mode (headless/interactive), brief, name, parent_id, key. Admission and quotas remain enforced.', ['sessions start', 'sessions override', 'sessions engine-override']);
 tool('sessions_show', 'GET', '/api/sessions/{id}', 'Session binding and observed state.', ['sessions show']);
 tool('sessions_commands', 'GET', '/api/sessions/{id}/commands', 'Read command results; recorded/transported is not acknowledged execution.', ['sessions commands']);
 for (const action of ['send', 'capture', 'stop']) tool(`sessions_${action}`, 'POST', `/api/sessions/{id}/${action}`,

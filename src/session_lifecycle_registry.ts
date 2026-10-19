@@ -262,6 +262,8 @@ function decisionsByKey(sql: SqlStorage): Map<string, LifecycleDecision[]> {
  * flags are deliberately absent: JSON never authenticates ownership. */
 const OBSERVABLE_FLAGS = new Set([
   'awaiting_alexey', 'awaiting_alexey_at',
+  'waiting_confirmation', 'waiting_confirmation_at',
+  'waiting_input', 'waiting_input_at',
   'limit_hit', 'limit_window', 'limit_reset_at', 'limit_zone',
   'report_written', 'report_at', 'screen_done',
   'terminal_evidence', 'terminal_evidence_at',
@@ -272,14 +274,16 @@ const OBSERVABLE_FLAGS = new Set([
 ]);
 
 const BOOL_FLAGS = new Set([
-  'awaiting_alexey', 'limit_hit', 'report_written', 'screen_done',
+  'awaiting_alexey', 'waiting_confirmation', 'waiting_input',
+  'limit_hit', 'report_written', 'screen_done',
   'authoritative_no_pending_proof', 'pending_obligations',
   'has_active_children', 'has_unsubmitted_draft',
   'has_unresolved_send_stop', 'worktree_missing',
 ]);
 
 const TEXT_FLAGS = new Set([
-  'awaiting_alexey_at', 'limit_window', 'limit_reset_at', 'limit_zone',
+  'awaiting_alexey_at', 'waiting_confirmation_at', 'waiting_input_at',
+  'limit_window', 'limit_reset_at', 'limit_zone',
   'report_at', 'terminal_evidence', 'terminal_evidence_at', 'superseded_by',
 ]);
 

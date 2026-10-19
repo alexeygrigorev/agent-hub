@@ -702,11 +702,40 @@ class Dispatcher:
                 record["settled_at"] = utcnow()
                 self._persist_launch_record(record)
                 reconciled.append({"id": offer_id, "state": fleet_state, "reconciled": True})
+                if record.get("workspace"):
+                    self._maybe_cleanup_worktree(Path(record["workspace"]), record.get("native_id"))
             except Exception:
                 # Retain pending observation until the server explicitly acknowledges it.
                 continue
 
         return reconciled
+
+    def _maybe_cleanup_worktree(self, workspace: Path, native_id: Optional[str] = None):
+        """Attempt safe auto-cleanup of finished headless worktree if configured in cleanup_roots."""
+        cleanup_roots = self.settings.get("cleanup_roots")
+        if not cleanup_roots or not isinstance(cleanup_roots, list):
+            return
+        try:
+            ws_str = str(workspace.resolve())
+            from .session_cleanup import remove_owned_worktree
+            from .session_executor import CallerCustody
+            machine_id = self.settings.get("machine_id", "local")
+            custody = CallerCustody(actor=machine_id, machine_id=machine_id, credential_family=f"host-{machine_id}")
+            journal_dir = self.settings.get("journal_dir") or str(Path.home() / ".local" / "agent-hub" / "journal")
+            Path(journal_dir).mkdir(parents=True, exist_ok=True)
+            remove_owned_worktree(
+                custody=custody,
+                journal_dir=journal_dir,
+                machine_id=machine_id,
+                native_id=native_id or "headless-task",
+                canonical_workspace=ws_str,
+                cleanup_roots=cleanup_roots,
+                claim_holder=machine_id,
+                stop_confirmed=True,
+            )
+        except Exception:
+            # Cleanup is best-effort and must not break the reporting flow
+            pass
 
     def reconcile_imported_sessions(self, imported_bindings: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
         """Reconcile active imported/observed-native sessions via verified positive retirement
@@ -1169,10 +1198,13 @@ class Dispatcher:
             report['confirmed_exit'] = True
             self.request('POST', '/api/fleet/tasks/' + offer['task_id'] + '/result', report)
             if report['status'] in {'done', 'failed'}:
+                self._maybe_cleanup_worktree(workspace, native_id)
                 return {'id': offer_id, 'state': report['status']}
             # Human waits retain reservations even when the reporting process exits.
             return {'id': offer_id, 'state': report['status']}
         self.request("POST", path + "/result", result)
+        if result.get('state') in {'exited', 'failed'}:
+            self._maybe_cleanup_worktree(workspace, native_id)
         return {"id": offer_id, **result}
 
     def once(self):

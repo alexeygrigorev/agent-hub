@@ -278,6 +278,10 @@ byId('launch').addEventListener('submit', async event => {
   event.preventDefault(); const form = event.currentTarget; const fields = new FormData(form);
   const input = Object.fromEntries([...fields].filter(([, value]) => value !== ''));
   if (input.mode === 'interactive' && (!input.machine || input.prompt)) { byId('launch-result').textContent = 'Choose a machine and leave the goal empty for an interactive session.'; return; }
+  if (input.engine && (!input.engine_override_reason || !input.engine_override_reason.trim())) {
+    byId('launch-result').textContent = 'Engine override requires an explanation why this specific model/engine must be chosen.';
+    return;
+  }
   form.dataset.key ||= crypto.randomUUID(); input.idempotency_key = form.dataset.key;
   const button = form.querySelector('button'); button.disabled = true;
   try { const result = await api('/api/fleet/launches', 'POST', input); byId('launch-result').textContent = `${result.id}: ${result.state} on ${result.machine} (${result.engine}, ${result.account}).`; delete form.dataset.key; await refresh(); }

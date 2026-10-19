@@ -60,7 +60,7 @@ function stateBadge(state) {
   const s = state || 'unknown';
   let color = 'dk-badge--neutral';
   if (['running', 'active', 'working', 'acked', 'delivered'].includes(s)) color = 'dk-badge--success';
-  else if (['stale', 'stalled', 'uncertain', 'offered', 'starting', 'recorded', 'transported', 'claimed', 'held'].includes(s)) color = 'dk-badge--warning';
+  else if (['stale', 'stalled', 'uncertain', 'offered', 'starting', 'recorded', 'transported', 'claimed', 'held', 'waiting', 'waiting-confirmation', 'waiting_confirmation', 'waiting-idle', 'idle'].includes(s)) color = 'dk-badge--warning';
   else if (['failed', 'refused', 'stopped', 'offline', 'error', 'cancelled'].includes(s)) color = 'dk-badge--danger';
   span.className = `dk-badge ${color}`;
   span.textContent = s;
@@ -143,7 +143,8 @@ function renderSessionCards(filtered, emptyMessage) {
     chev.className = 'sessions-card-item__chev';
     chev.setAttribute('aria-hidden', 'true');
     chev.textContent = '›';
-    badges.append(stateBadge(s.state), typeBadge(s.session_type), chev);
+    const displayState = (s.waiting_confirmation || s.agent_state === 'waiting') ? 'waiting-confirmation' : (s.agent_state === 'idle' && s.state === 'running' ? 'idle' : s.state);
+    badges.append(stateBadge(displayState), typeBadge(s.session_type), chev);
     head.append(badges);
     card.append(head);
 
@@ -182,7 +183,10 @@ function renderTable(sessions, filter = '') {
     if (!query) return true;
     const name = (s.qualified_alias || s.name || s.id || '').toLowerCase();
     const engine = (s.engine || '').toLowerCase();
-    const state = (s.state || '').toLowerCase();
+    const rawState = (s.state || '').toLowerCase();
+    const isWait = Boolean(s.waiting_confirmation || s.agent_state === 'waiting');
+    const isIdle = Boolean(s.agent_state === 'idle' || isWait);
+    const state = `${rawState} ${isWait ? 'waiting waiting-confirmation waiting_confirmation' : ''} ${isIdle ? 'idle waiting-idle' : ''}`.toLowerCase();
     const ws = (s.workspace || '').toLowerCase();
     const type = (s.session_type || '').toLowerCase();
     return name.includes(query) || engine.includes(query) || state.includes(query) || ws.includes(query) || type.includes(query);
@@ -236,7 +240,8 @@ function renderTable(sessions, filter = '') {
 
     const tdState = document.createElement('td');
     tdState.dataset.label = 'State';
-    tdState.append(stateBadge(s.state));
+    const displayState = (s.waiting_confirmation || s.agent_state === 'waiting') ? 'waiting-confirmation' : (s.agent_state === 'idle' && s.state === 'running' ? 'idle' : s.state);
+    tdState.append(stateBadge(displayState));
     tr.append(tdState);
 
     const tdWs = document.createElement('td');

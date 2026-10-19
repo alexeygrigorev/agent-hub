@@ -250,11 +250,12 @@ def add_commands(sub):
     listing.add_argument('--tree', action='store_true', help='Display session lineage tree')
     tree = commands.add_parser('tree', help='Display session lineage tree')
     tree.add_argument('--json', action='store_true', help='Output machine-readable JSON')
-    start = commands.add_parser('start', help='Record a start intent; placement reuses existing fleet routing')
-    start.add_argument('--engine')
+    start = commands.add_parser('start', help='Record a start intent using auto/policy routing (default). Casual use should prefer auto/policy.')
+    start.add_argument('--engine', help='Engine override (operators only; requires --reason explaining why)')
+    start.add_argument('--reason', default=None, help='Explanation why this specific model/engine must be chosen (required when --engine is specified)')
     start.add_argument('--machine')
     start.add_argument('--workspace', required=True)
-    start.add_argument('--tier', choices=TIERS)
+    start.add_argument('--tier', choices=TIERS, help='deep/daily/quick task tier for policy routing')
     start.add_argument('--cwd')
     start.add_argument('--name', default=None,
                        help='Friendly session name (stored, shown in list/show; exact-match alias, never identity)')
@@ -267,6 +268,22 @@ def add_commands(sub):
     mode.add_argument('--interactive', action='store_true', help='Start at an empty native prompt')
     start.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
     add_wait(start)
+    override = commands.add_parser('override', aliases=['engine-override'], help='Dedicated command for engine override. REQUIRES --engine and --reason.')
+    override.add_argument('--engine', required=True, help='Specific model/engine to run')
+    override.add_argument('--reason', required=True, help='Explanation why this specific model/engine must be chosen')
+    override.add_argument('--machine')
+    override.add_argument('--workspace', required=True)
+    override.add_argument('--tier', choices=TIERS)
+    override.add_argument('--cwd')
+    override.add_argument('--name', default=None, help='Friendly session name')
+    override.add_argument('--parent', default=None, help='Parent session id recording lineage')
+    override.add_argument('--headless', action='store_true', help='Explicitly start in headless mode')
+    override_mode = override.add_mutually_exclusive_group()
+    override_mode.add_argument('--brief-file', help='UTF-8 goal file for headless work (max 8 KiB)')
+    override_mode.add_argument('--prompt', default=None, help='Inline UTF-8 goal text for headless work (max 8 KiB)')
+    override_mode.add_argument('--interactive', action='store_true', help='Start at an empty native prompt')
+    override.add_argument('--key', help='Stable idempotency key')
+    add_wait(override)
     send = commands.add_parser('send', help='Enqueue one prompt delivery on a bound session')
     send.add_argument('id')
     body_src = send.add_mutually_exclusive_group(required=True)
@@ -338,6 +355,37 @@ def add_commands(sub):
     observe.add_argument('--worktree-missing', action='store_true')
     observe.add_argument('--superseded-by', default=None)
     observe.add_argument('--note', default=None, help='Opt-in free text (bounded, redacted server-side; reason codes preferred)')
+
+def match_session_state(entry: dict, wanted: str) -> bool:
+    """Classify session state for filtering, treating confirmation/question waiting as waiting-idle."""
+    entry_state = entry.get('state')
+    agent_state = entry.get('agent_state')
+    is_waiting_confirmation = bool(
+        agent_state in ('waiting-confirmation', 'waiting_confirmation')
+        or entry_state in ('waiting-confirmation', 'waiting_confirmation')
+        or entry.get('waiting_confirmation') is True
+    )
+    is_waiting = bool(
+        is_waiting_confirmation
+        or agent_state in ('waiting', 'waiting-input', 'waiting_input')
+        or entry_state in ('waiting', 'waiting-input', 'waiting_input', 'waiting_alexey')
+        or entry.get('waiting_input') is True
+    )
+    is_idle = bool(
+        agent_state == 'idle'
+        or entry_state == 'idle'
+        or entry.get('idle') is True
+        or is_waiting
+    )
+    if wanted in ('waiting-confirmation', 'waiting_confirmation'):
+        return is_waiting_confirmation
+    if wanted in ('waiting', 'waiting-idle', 'waiting-input', 'waiting_input'):
+        return is_waiting
+    if wanted == 'idle':
+        return is_idle
+    if wanted in ('running', 'active', 'working'):
+        return bool(entry_state in ('running', 'active') and not is_waiting and agent_state != 'idle')
+    return entry_state == wanted
 
 
 def execute(args):
@@ -430,7 +478,7 @@ def execute(args):
                 if entry.get('id') in known:
                     continue
                 known.add(entry.get('id'))
-                if entry.get('state') == wanted:
+                if match_session_state(entry, wanted):
                     seen.append(entry)
                     if len(seen) >= limit:
                         return {'sessions': seen[:limit], 'next_cursor': None}
@@ -442,13 +490,25 @@ def execute(args):
         return request('GET', '/api/sessions/' + args.id)
     if cmd == 'commands':
         return request('GET', '/api/sessions/' + args.id + '/commands')
-    if cmd == 'start':
+    if cmd in ('start', 'override', 'engine-override'):
+        engine = getattr(args, 'engine', None)
+        reason = getattr(args, 'reason', None)
+        if cmd in ('override', 'engine-override'):
+            if not engine:
+                raise ValueError('--engine is required for dedicated engine override command')
+            if not reason or not reason.strip():
+                raise ValueError('Dedicated engine override requires an explanation why this specific model/engine must be chosen (use --reason)')
+        elif cmd == 'start' and engine:
+            if not reason or not reason.strip():
+                raise ValueError('Engine override requires an explanation why this specific model/engine must be chosen (use --reason). Casual use should prefer auto/policy without --engine.')
         key = getattr(args, 'key', None) or str(uuid.uuid4())
         payload = {'key': key, 'workspace': args.workspace}
         for field in ('engine', 'machine', 'tier', 'cwd'):
             value = getattr(args, field, None)
             if value:
                 payload[field] = value
+        if reason and reason.strip():
+            payload['engine_override_reason'] = reason.strip()
         if getattr(args, 'name', None) is not None:
             payload['name'] = check_session_name(args.name)
         if getattr(args, 'parent', None) is not None:
@@ -566,6 +626,10 @@ def render_table(sessions):
         name = s.get('qualified_alias') or s.get('name') or s.get('id') or '-'
         engine = s.get('engine') or '-'
         state = s.get('state') or '-'
+        if s.get('waiting_confirmation') or s.get('agent_state') == 'waiting':
+            state = 'waiting-conf'
+        elif s.get('agent_state') == 'idle' and state == 'running':
+            state = 'idle'
         ws = s.get('workspace') or '-'
         upd = (s.get('updated_at') or '')[:19].replace('T', ' ')
         rows.append([stype, name, engine, state, ws, upd])

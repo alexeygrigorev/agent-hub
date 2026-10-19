@@ -300,6 +300,14 @@ def render_human(data):
             ))
     cats = data.get('categories') or {}
     summary = data.get('summary')
+    agents = data.get('agents') or (summary.get('agents') if isinstance(summary, dict) else None)
+    if isinstance(agents, dict):
+        lines.append('agents: running=%d idle=%d waiting=%d (waiting-confirmation=%d)' % (
+            int(agents.get('running') or 0),
+            int(agents.get('idle') or 0),
+            int(agents.get('waiting') or 0),
+            int(agents.get('waiting_confirmation') or 0),
+        ))
     if isinstance(summary, dict):
         by_status = summary.get('by_status') or {}
         lines.append('summary: %s tasks%s%s' % (

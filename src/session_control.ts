@@ -860,9 +860,10 @@ export class SessionControlService {
     if (path === '/api/sessions' && request.method === 'POST') {
       if (!writer) return response({ error: 'forbidden' }, 403);
       const input = await body(request);
-      if (!obj(input, ['key', 'engine', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id']) ||
+      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id']) ||
           !label(input.key) || !workspaceOk(input.workspace) ||
           (input.engine !== undefined && !label(input.engine)) ||
+          (input.engine_override_reason !== undefined && (typeof input.engine_override_reason !== 'string' || input.engine_override_reason.length > 500)) ||
           (input.machine !== undefined && !isValidMachineId(input.machine)) ||
           (input.name !== undefined && !nameOk(input.name)) ||
           (input.cwd !== undefined && !cwdOk(input.cwd)) ||

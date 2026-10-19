@@ -462,7 +462,8 @@ class TestSessionRealWorker(unittest.TestCase):
         with open(brief_file, "w") as f:
             f.write("real loop goal")
         start = self.run_cli(["sessions", "start", "--workspace", "demo",
-                              "--engine", "codex", "--machine", "hetzner",
+                              "--engine", "codex", "--reason", "codex required for real loop test",
+                              "--machine", "hetzner",
                               "--brief-file", brief_file,
                               "--key", "real-loop-1"], token="sess-agent-token")
         created = json.loads(start.stdout)

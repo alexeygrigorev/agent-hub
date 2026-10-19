@@ -246,6 +246,9 @@ export class RoutingService {
             if (data.confirmed_exit !== true) return reply({ error: 'confirmed_exit_required' }, 409);
             // The process reservation and its report commit together; a restart cannot lose the report.
             this.sql.exec('UPDATE fleet_launches SET state = ?, updated_at = ? WHERE id = ?', data.status === 'done' ? 'exited' : 'failed', this.at(), current.launch_id);
+            if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
+              this.sql.exec("UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE fleet_launch_id = ? AND state IN ('queued', 'held', 'offered', 'starting', 'running', 'uncertain')", data.status === 'done' ? 'stopped' : 'failed', this.at(), current.launch_id);
+            }
           }
           this.sql.exec('UPDATE routing_jobs SET state = ?, report = ?, artifacts_json = ?, updated_at = ? WHERE id = ?', data.status, redact(data.report), JSON.stringify(data.artifacts.map((a: any) => ({ name: redact(a.name), text: redact(a.text) }))), this.at(), row.id);
           return reply(this.view(this.sql.exec('SELECT * FROM routing_jobs WHERE id = ?', row.id).one()));
