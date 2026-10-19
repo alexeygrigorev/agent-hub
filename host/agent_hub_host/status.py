@@ -161,6 +161,10 @@ def render_human(data):
             ]
             if sess.get('agent_state'):
                 parts.append('agent=%s' % escape_display(sess.get('agent_state')))
+            if sess.get('tag'):
+                parts.append('tag=%s' % escape_display(sess.get('tag')))
+            if sess.get('workspace'):
+                parts.append('workspace=%s' % escape_display(sess.get('workspace')))
             parts.extend([
                 'linkage=%s' % escape_display(sess.get('linkage')),
                 'observed=%s' % escape_display(sess.get('observed_at')),
@@ -185,11 +189,24 @@ def render_human(data):
                 if decision.get('reason'):
                     decision_parts.append('reason=%s' % escape_display(decision.get('reason')))
             decision_str = (' ' + ' '.join(decision_parts)) if decision_parts else ''
-            lines.append('  hub-session %s state=%s machine=%s lifecycle=%s/%s%s' % (
+            flags = life.get('flags') or []
+            flags_str = (' flags=%s' % ','.join(escape_display(f) for f in flags)) if flags else ''
+            binding = hub.get('binding') or {}
+            binding_parts = []
+            tag = binding.get('tag') or hub.get('tag')
+            if tag:
+                binding_parts.append('tag=%s' % escape_display(tag))
+            workspace = binding.get('workspace') or hub.get('workspace')
+            if workspace:
+                binding_parts.append('workspace=%s' % escape_display(workspace))
+            binding_str = (' ' + ' '.join(binding_parts)) if binding_parts else ''
+            lines.append('  hub-session %s state=%s machine=%s lifecycle=%s/%s%s%s%s' % (
                 escape_display(hub.get('hub_session_id')), escape_display(hub.get('state')),
                 escape_display(hub.get('machine')),
                 escape_display(life.get('group')), escape_display(life.get('state')),
-                decision_str))
+                flags_str,
+                decision_str,
+                binding_str))
             lines.extend(_render_hub_evidence(hub))
         for action in task.get('pending_actions', []):
             lines.append('  pending %s by %s: %s' % (
@@ -235,8 +252,19 @@ def render_human(data):
     disk_fs = data.get('disk') or []
     if disk_fs:
         lines.append('disk:')
+        primary_by_dev = {}
         for fs in disk_fs:
-            primary_str = '' if fs.get('is_primary', True) else ' (alias of %s)' % escape_display(fs.get('primary_mount'))
+            dev = fs.get('device_id')
+            if dev is not None and fs.get('is_primary', True) and fs.get('mount_point'):
+                primary_by_dev[(fs.get('machine_id'), str(dev))] = fs.get('mount_point')
+        for fs in disk_fs:
+            is_pri = fs.get('is_primary', True)
+            if is_pri:
+                primary_str = ''
+            else:
+                dev = fs.get('device_id')
+                pm = fs.get('primary_mount') or (primary_by_dev.get((fs.get('machine_id'), str(dev))) if dev is not None else None)
+                primary_str = (' (alias of %s)' % escape_display(pm)) if pm else ' (alias)'
             trend_str = ''
             if fs.get('growth_per_day_bytes') is not None:
                 growth_gb = fs['growth_per_day_bytes'] / (1024 ** 3)

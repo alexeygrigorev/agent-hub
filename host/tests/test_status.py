@@ -467,6 +467,150 @@ class TestStatusCli(unittest.TestCase):
         self.assertNotIn('session-coverage:', rendered)
         self.assertNotIn('decision=', rendered)
         self.assertNotIn('reason=', rendered)
+        self.assertNotIn('tag=', rendered)
+        self.assertNotIn('workspace=', rendered)
+        self.assertNotIn('flags=', rendered)
+
+    def test_render_human_shows_session_and_hub_session_worktree_tag_flags(self):
+        dto = dict(FIXTURE_DTO)
+        observed = '2026-10-19T10:00:00.000Z'
+        dto['tasks'] = [{
+            'id': 'task-worktree-1',
+            'status': 'in_progress',
+            'title': 'Worktree honesty test',
+            'updated_at': observed,
+            'sessions': [{
+                'machine_id': 'hetzner',
+                'native_id': 'native-1',
+                'engine': 'codex',
+                'phase': 'running',
+                'tag': 'push-hub-1400',
+                'workspace': '/home/alexey/git/worktrees/push-1400/agent-hub',
+                'linkage': 'verified_launch',
+                'observed_at': observed,
+                'provenance': {'freshness': 'fresh'},
+            }],
+            'hub_sessions': [{
+                'hub_session_id': '66666666-6666-4666-8666-666666666666',
+                'linkage': 'hub_session',
+                'state': 'running',
+                'machine': 'hetzner',
+                'binding': {
+                    'tag': 'platform',
+                    'workspace': '/home/alexey/git/agent-coordination',
+                },
+                'lifecycle': {
+                    'group': 'active',
+                    'state': 'running',
+                    'flags': ['worktree_missing'],
+                    'decision': {'kind': 'reap', 'reason': 'worktree_vanished'},
+                },
+            }],
+        }]
+        rendered = status.render_human(dto)
+        self.assertIn('session hetzner/native-1 engine=codex phase=running tag=push-hub-1400 workspace=/home/alexey/git/worktrees/push-1400/agent-hub linkage=verified_launch', rendered)
+        self.assertIn('hub-session 66666666-6666-4666-8666-666666666666 state=running machine=hetzner lifecycle=active/running flags=worktree_missing decision=reap reason=worktree_vanished tag=platform workspace=/home/alexey/git/agent-coordination', rendered)
+
+    def test_render_human_resolves_disk_aliases_and_handles_missing_primary(self):
+        dto = dict(FIXTURE_DTO)
+        dto['disk'] = [
+            {
+                'machine_id': 'host-hetzner',
+                'mount_point': '/',
+                'device_id': '66307',
+                'is_primary': True,
+                'percent': 70.0,
+                'status': 'ok',
+            },
+            {
+                'machine_id': 'host-hetzner',
+                'mount_point': '/home',
+                'device_id': '66307',
+                'is_primary': False,
+                'percent': 70.0,
+                'status': 'ok',
+            },
+            {
+                'machine_id': 'host-hetzner',
+                'mount_point': '/data',
+                'device_id': '66308',
+                'is_primary': True,
+                'percent': 60.0,
+                'status': 'ok',
+            },
+            {
+                'machine_id': 'host-hetzner',
+                'mount_point': '/tmp',
+                'device_id': '66308',
+                'is_primary': False,
+                'percent': 60.0,
+                'status': 'ok',
+            },
+            {
+                'machine_id': 'host-hetzner',
+                'mount_point': '/var/explicit',
+                'device_id': '99999',
+                'is_primary': False,
+                'primary_mount': '/custom/base',
+                'percent': 45.0,
+                'status': 'ok',
+            },
+            {
+                'machine_id': 'host-hetzner',
+                'mount_point': '/mnt/orphan',
+                'device_id': '88888',
+                'is_primary': False,
+                'percent': 20.0,
+                'status': 'ok',
+            },
+        ]
+        rendered = status.render_human(dto)
+        self.assertIn('host-hetzner /: 70.0% (ok)', rendered)
+        self.assertIn('host-hetzner /home: 70.0% (ok) (alias of /)', rendered)
+        self.assertIn('host-hetzner /data: 60.0% (ok)', rendered)
+        self.assertIn('host-hetzner /tmp: 60.0% (ok) (alias of /data)', rendered)
+        self.assertIn('host-hetzner /var/explicit: 45.0% (ok) (alias of /custom/base)', rendered)
+        self.assertIn('host-hetzner /mnt/orphan: 20.0% (ok) (alias)', rendered)
+        self.assertNotIn('(alias of )', rendered)
+
+    def test_render_human_escapes_workspace_tag_and_flags(self):
+        dto = dict(FIXTURE_DTO)
+        dto['tasks'] = [{
+            'id': 'task-ctrl-chars',
+            'status': 'open',
+            'title': 'Control char test',
+            'updated_at': '2026-10-19T10:00:00.000Z',
+            'sessions': [{
+                'machine_id': 'hetzner',
+                'native_id': 'native-1',
+                'engine': 'codex',
+                'phase': 'running',
+                'tag': 'tag\x1b\u202e',
+                'workspace': '/path/to\x1b/worktree\u202e',
+                'linkage': 'verified_launch',
+            }],
+            'hub_sessions': [{
+                'hub_session_id': '77777777-7777-4777-8777-777777777777',
+                'linkage': 'hub_session',
+                'state': 'running',
+                'machine': 'hetzner',
+                'binding': {
+                    'tag': 'hubtag\x1b',
+                    'workspace': '/hub/ws\u202e',
+                },
+                'lifecycle': {
+                    'group': 'active',
+                    'state': 'running',
+                    'flags': ['flag\x1b1', 'flag2\u202e'],
+                },
+            }],
+        }]
+        rendered = status.render_human(dto)
+        self.assertNotIn('\x1b', rendered)
+        self.assertNotIn('\u202e', rendered)
+        self.assertIn('tag=tag workspace=/path/to/worktree', rendered)
+        self.assertIn('flags=flag1,flag2', rendered)
+        self.assertIn('tag=hubtag workspace=/hub/ws', rendered)
 
 
 if __name__ == '__main__':
