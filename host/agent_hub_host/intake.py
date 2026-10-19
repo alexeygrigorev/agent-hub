@@ -36,7 +36,8 @@ def http_error(exc, method, payload):
     allowed = {'version_conflict', 'idempotency_conflict', 'invalid_event_kind', 'invalid_object',
                'invalid_field', 'unknown_field', 'invalid_source', 'not_found', 'forbidden',
                'invalid_status', 'empty_update', 'active_assignment_exists', 'history_capacity',
-               'task_capacity', 'assignment_unavailable', 'invalid_identifier', 'unauthorized'}
+               'task_capacity', 'assignment_unavailable', 'invalid_identifier', 'unauthorized',
+               'record_capacity', 'storage_capacity', 'request_capacity', 'record_byte_capacity'}
     try:
         body = json.loads(exc.read(4097))
         code = body.get('error') if isinstance(body, dict) else None

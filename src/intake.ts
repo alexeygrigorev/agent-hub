@@ -119,6 +119,24 @@ export class IntakeService {
     if (bytes > INTAKE_LIMITS.totalBytes) fail('storage_capacity', 507);
   }
   private bounded(table: string, max: number) { if (this.rows(table).length >= max) fail('record_capacity', 507); }
+  /** Terminal tasks and stale replay receipts are pruned lazily on writes so
+   * closed work cannot permanently consume record or storage capacity.
+   * Retention is 14 days; at most 64 deletes per pass; each delete bumps the
+   * snapshot revision so listers observe the change. */
+  private prune(now: number) {
+    const cutoff = now - 14 * 86400000;
+    const dead: Array<[string, string]> = [];
+    for (const t of this.rows('tasks')) {
+      if ((t.status === 'done' || t.status === 'cancelled') && (t.updated_at ?? 0) < cutoff) dead.push(['tasks', t.id]);
+    }
+    for (const r of this.rows('receipts')) {
+      if ((r.captured_at ?? 0) < cutoff) dead.push(['receipts', r.id]);
+    }
+    for (const [table, id] of dead.slice(0, 64)) {
+      this.sql.exec(`DELETE FROM intake_${table} WHERE id=?`, id);
+      this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
+    }
+  }
   /** Fresh credential, binding and grant checks run in the same synchronous transaction as the effect. */
   private principal(auth: Auth): Obj {
     const caller = auth.caller!;
@@ -630,6 +648,7 @@ export class IntakeService {
       const task: Obj = { id: crypto.randomUUID(), project, title: str(b.title, 256), status: 'open', version: 1,
         created_at: now, updated_at: now, current_state: null, next_step: null, owner: null, uncertainty: null, history: [] };
       if (!this.allowed(p, task, true)) fail('forbidden', 403);
+      this.prune(now);
       this.bounded('tasks', INTAKE_LIMITS.tasks);
       task.history.push(this.event({ kind: 'intake', text: b.text, source: b.source, transcription: b.transcription }, task, p, now));
       task.history[0].intake_key = b.key;
@@ -831,6 +850,7 @@ export class IntakeService {
     return this.tx(() => {
       const now = input.now ?? Date.now();
       try {
+        this.prune(now);
         this.bounded('tasks', INTAKE_LIMITS.tasks);
         this.capacity();
       } catch (e: any) {
@@ -987,7 +1007,7 @@ export class IntakeService {
         this.bounded('receipts', INTAKE_LIMITS.receipts);
         const response = { ...this.write(path, payload, p), snapshot_version: this.revision() + 1, data_notice: DATA_NOTICE };
         this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
-        this.put('receipts', { id, fingerprint, response }); this.capacity();
+        this.put('receipts', { id, fingerprint, response, captured_at: Date.now() }); this.capacity();
         return json(response);
       });
     } catch (e) { return json({ error: e instanceof IntakeError ? e.code : 'internal_error' }, e instanceof IntakeError ? e.status : 500); }

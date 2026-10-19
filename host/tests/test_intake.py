@@ -190,6 +190,18 @@ class TestIntakeCli(unittest.TestCase):
             self.assertIn('fixture-retry', error)
             self.assertNotIn('private-token', error)
 
+    def test_http_error_passes_capacity_codes_through_on_507(self):
+        for raw, expected in ((b'{"error":"record_capacity"}', 'record_capacity'),
+                              (b'{"error":"storage_capacity"}', 'storage_capacity'),
+                              (b'{"error":"request_capacity"}', 'request_capacity'),
+                              (b'{"error":"record_byte_capacity"}', 'record_byte_capacity')):
+            exc = urllib.error.HTTPError('https://fixture.test', 507, 'private', {}, io.BytesIO(raw))
+            result = intake.http_error(exc, 'POST', {'key': 'fixture-retry'})
+            self.assertEqual(result.status, 507)
+            self.assertEqual(result.code, expected)
+        unknown = urllib.error.HTTPError('https://fixture.test', 507, 'private', {}, io.BytesIO(b'{"error":"unknown_code"}'))
+        self.assertEqual(intake.http_error(unknown, 'POST', None).code, 'request_failed')
+
     def test_assign_builds_canonical_session_payload(self):
         with patch.object(intake, 'request', return_value={}) as transport:
             code, _, error = self.run_cli('intake', 'assign', 'task-1', '--version', '2', '--key', 'assign',

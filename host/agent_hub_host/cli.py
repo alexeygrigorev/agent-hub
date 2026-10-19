@@ -534,6 +534,10 @@ def main():
                 print(rendered)
             else:
                 print(json.dumps(rendered, indent=2, ensure_ascii=True))
+        except ValueError as exc:
+            print(str(exc) or 'Session operation failed; check authentication, grants, capacity and current versions.',
+                  file=sys.stderr)
+            sys.exit(1)
         except Exception:
             print('Session operation failed; check authentication, grants, capacity and current versions. '
                   'Retry mutations with the same key and payload after uncertain responses; '
