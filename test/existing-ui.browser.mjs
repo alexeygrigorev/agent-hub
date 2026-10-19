@@ -59,7 +59,8 @@ try{
   const host=await challenge('host');await review(host);await page.getByLabel('Machine ID (optional)',{exact:true}).fill('ui-other');await capture(`device-host-${width}-${theme}`);
   const raced=await challenge();await review(raced);await decision(raced,'deny');await page.getByRole('button',{name:'Approve',exact:true}).click();await page.locator('#device-error').waitFor();await capture(`device-stale-error-${width}-${theme}`);
   const network=await challenge();await review(network);await context.setOffline(true);await page.getByRole('button',{name:'Approve',exact:true}).click();await page.locator('#device-error').waitFor();await capture(`device-network-error-${width}-${theme}`);await context.setOffline(false);
-  await page.goto(base+'/auth/callback');await page.getByRole('heading',{name:'Sign-in could not finish',exact:true}).waitFor();await capture(`signin-callback-error-${width}-${theme}`);
+  await page.goto(base+'/auth/callback');await page.waitForURL(base+'/');
+  await context.clearCookies();await page.goto(base+'/auth/callback');await page.getByRole('heading',{name:'Sign-in could not finish',exact:true}).waitFor();await capture(`signin-callback-error-${width}-${theme}`);await cookie(human.cookie);
   const denied=await challenge();await review(denied);await page.getByRole('button',{name:'Deny',exact:true}).click();await page.getByRole('heading',{name:'Request denied',exact:true}).waitFor();await capture(`device-denied-${width}-${theme}`);
   const expired=await challenge();await decision(expired,'approve');await fixture('expire',expired.user_code);await page.goto(base+'/device?code='+expired.user_code);await page.getByRole('heading',{name:'Code expired',exact:true}).waitFor();await capture(`device-expired-${width}-${theme}`);
   await page.goto(base+'/device?code=NO-SUCH-CODE');await page.getByRole('heading',{name:'Code not found',exact:true}).waitFor();await capture(`device-unknown-${width}-${theme}`);

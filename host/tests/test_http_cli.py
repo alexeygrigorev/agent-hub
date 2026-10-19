@@ -334,6 +334,7 @@ class TestHttpCliMock(unittest.TestCase):
         xdg_config_dir = os.path.join(self.temp_dir.name, ".config")
         self.config_dir = os.path.join(xdg_config_dir, "agent-hub")
         os.makedirs(self.config_dir, exist_ok=True)
+        os.chmod(self.config_dir, stat.S_IRWXU)
         self.config_file = os.path.join(self.config_dir, "host.json")
         
         cfg_data = {
