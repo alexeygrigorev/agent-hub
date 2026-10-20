@@ -768,8 +768,39 @@ def execute():
         _, binary, _ = PACKAGES[b['provider']]
         command = engine_argv(b, dest)
         env = engine_environment(b, home, dest)
-        argv = command + b['args'] + sys.argv[2:]
-        is_diagnostic = b['args'] + sys.argv[2:] in (["--version"], ["-v"], ["--help"], ["-h"])
+        extra_argv = list(sys.argv[2:])
+        if b.get('provider') == 'go' and extra_argv and extra_argv[0] == 'run':
+            pinned_model = None
+            args_copy = list(b.get('args') or [])
+            for flag in ('--model', '-m'):
+                if flag in args_copy:
+                    idx = args_copy.index(flag)
+                    if idx + 1 < len(args_copy):
+                        pinned_model = args_copy[idx + 1]
+                    del args_copy[idx:idx + 2]
+                    break
+            run_cmd = [extra_argv[0]]
+            for flag in ('--model', '-m'):
+                if flag in extra_argv[1:]:
+                    idx = extra_argv[1:].index(flag) + 1
+                    if idx + 1 < len(extra_argv):
+                        req_model = extra_argv[idx + 1]
+                        if pinned_model and req_model != pinned_model:
+                            raise ValueError(f"Provider 'go' pinned model mismatch: {req_model} != {pinned_model}")
+            if pinned_model:
+                run_cmd.extend(['--model', pinned_model])
+            run_cmd.extend(args_copy)
+            i = 1
+            while i < len(extra_argv):
+                if extra_argv[i] in ('--model', '-m') and pinned_model:
+                    i += 2
+                    continue
+                run_cmd.append(extra_argv[i])
+                i += 1
+            argv = command + run_cmd
+        else:
+            argv = command + b['args'] + extra_argv
+        is_diagnostic = b['args'] + extra_argv in (["--version"], ["-v"], ["--help"], ["-h"])
         if b['provider'] == 'codex' and not is_diagnostic:
             allowed, reason = check_codex_quota_gate(env)
             if not allowed:

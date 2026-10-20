@@ -290,6 +290,62 @@ class TestWindowsProvisioningPortability(unittest.TestCase):
             self.assertEqual(waiting_events[0]['url'], test_url)
             self.assertTrue(backend.closed_console)
 
+    def test_provisioning_execute_go_run_subcommand_ordering_and_model_validation(self):
+        rev = '11111111-2222-3333-4444-555555555555'
+        bundle = {
+            'label': 'managed-go',
+            'provider': 'go',
+            'version': '1.19.3',
+            'args': ['--model', 'opencode-go/muse-spark-1.3-contributor'],
+            'revision': rev,
+            'files': {},
+            'env': {},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chmod(tmp, 0o700)
+            dest = Path(tmp) / f'managed-go-{rev}'
+            dest.mkdir(parents=True, mode=0o700)
+            p.write_json(dest / 'bundle.json', bundle)
+            (dest / 'home').mkdir(mode=0o700)
+            state = [{'label': 'managed-go', 'provider': 'go', 'revision': rev}]
+            p.write_json(Path(tmp) / 'state.json', state)
+
+            executed_argv = []
+            def fake_execve(cmd, argv, env):
+                executed_argv.append(list(argv))
+
+            with patch.dict(os.environ, {'AGENT_HUB_MANAGED_DIR': str(tmp)}), \
+                 patch('agent_hub_host.provisioning.engine_argv', return_value=['/usr/bin/opencode']), \
+                 patch('os.execve', side_effect=fake_execve):
+                # 1. Standard task run
+                with patch('sys.argv', ['provisioning', 'managed-go', 'run', '--standalone', '--auto', 'my task goal']):
+                    p.execute()
+                self.assertEqual(executed_argv[-1], [
+                    '/usr/bin/opencode', 'run', '--model', 'opencode-go/muse-spark-1.3-contributor',
+                    '--standalone', '--auto', 'my task goal'
+                ])
+
+                # 2. Matching model argument should not duplicate
+                with patch('sys.argv', ['provisioning', 'managed-go', 'run', '--standalone', '--model', 'opencode-go/muse-spark-1.3-contributor', 'goal']):
+                    p.execute()
+                self.assertEqual(executed_argv[-1], [
+                    '/usr/bin/opencode', 'run', '--model', 'opencode-go/muse-spark-1.3-contributor',
+                    '--standalone', 'goal'
+                ])
+
+                # 3. Mismatched model must fail closed
+                with patch('sys.argv', ['provisioning', 'managed-go', 'run', '--model', 'glm-4-air', 'goal']):
+                    with self.assertRaises(ValueError) as cm:
+                        p.execute()
+                    self.assertIn('pinned model mismatch', str(cm.exception))
+
+                # 4. Diagnostic/version command preserves original ordering
+                with patch('sys.argv', ['provisioning', 'managed-go', '--version']):
+                    p.execute()
+                self.assertEqual(executed_argv[-1], [
+                    '/usr/bin/opencode', '--model', 'opencode-go/muse-spark-1.3-contributor', '--version'
+                ])
+
     @unittest.skipUnless(PWSH_BIN and os.path.isfile(PWSH_BIN) and os.access(PWSH_BIN, os.X_OK), "Portable pwsh not available")
     def test_pwsh_install_script_execution_and_checksum_verification(self):
         with tempfile.TemporaryDirectory() as tmp:
