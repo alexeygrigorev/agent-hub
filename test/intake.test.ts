@@ -808,9 +808,18 @@ describe('private durable intake HTTP/SQLite', () => {
     expect(created.task.id).toBeTruthy();
     expect(await inDO(stub(), (h: any) => h.sql.exec("SELECT COUNT(*) AS n FROM intake_tasks WHERE id LIKE 'fixture-%'").one().n)).toBe(INTAKE_LIMITS.tasks - 64);
   });
-  it('never prunes freshly closed tasks to admit new work', async () => {
+  it('prunes terminal tasks after their one-day retention while keeping day-fresh closed work', async () => {
     await inDO(stub(), (h: any) => {
-      for (let i = 0; i < INTAKE_LIMITS.tasks; i++) h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-' + i, JSON.stringify({ id: 'fixture-' + i, project: 'demo', status: 'done', updated_at: Date.now(), history: [] }));
+      h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-aged', JSON.stringify({ id: 'fixture-aged', project: 'demo', status: 'done', updated_at: Date.now() - 25 * 3600000, history: [] }));
+      h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-fresh', JSON.stringify({ id: 'fixture-fresh', project: 'demo', status: 'cancelled', updated_at: Date.now() - 23 * 3600000, history: [] }));
+    });
+    await ok('/tasks', { key: 'retention-boundary', project: 'demo', title: 'Synthetic', text: 'Synthetic', source });
+    expect(await inDO(stub(), (h: any) => h.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks WHERE id=?', 'fixture-aged').one().n)).toBe(0);
+    expect(await inDO(stub(), (h: any) => h.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks WHERE id=?', 'fixture-fresh').one().n)).toBe(1);
+  });
+  it('never prunes terminal tasks within retention to admit new work', async () => {
+    await inDO(stub(), (h: any) => {
+      for (let i = 0; i < INTAKE_LIMITS.tasks; i++) h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-' + i, JSON.stringify({ id: 'fixture-' + i, project: 'demo', status: 'done', updated_at: Date.now() - 23 * 3600000, history: [] }));
     });
     const before = await state();
     expect((await call('/tasks', { key: 'cap-still', project: 'demo', title: 'Synthetic', text: 'Synthetic', source })).status).toBe(507);

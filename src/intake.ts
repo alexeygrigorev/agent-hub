@@ -121,16 +121,17 @@ export class IntakeService {
   private bounded(table: string, max: number) { if (this.rows(table).length >= max) fail('record_capacity', 507); }
   /** Terminal tasks and stale replay receipts are pruned lazily on writes so
    * closed work cannot permanently consume record or storage capacity.
-   * Retention is 14 days; at most 64 deletes per pass; each delete bumps the
-   * snapshot revision so listers observe the change. */
+   * Terminal tasks retain one day (a two-day burst of closed work once filled
+   * the record cap and wedged all intake), replay receipts 14 days; at most
+   * 64 deletes per pass; each delete bumps the snapshot revision so listers
+   * observe the change. */
   private prune(now: number) {
-    const cutoff = now - 14 * 86400000;
     const dead: Array<[string, string]> = [];
     for (const t of this.rows('tasks')) {
-      if ((t.status === 'done' || t.status === 'cancelled') && (t.updated_at ?? 0) < cutoff) dead.push(['tasks', t.id]);
+      if ((t.status === 'done' || t.status === 'cancelled') && (t.updated_at ?? 0) < now - 86400000) dead.push(['tasks', t.id]);
     }
     for (const r of this.rows('receipts')) {
-      if ((r.captured_at ?? 0) < cutoff) dead.push(['receipts', r.id]);
+      if ((r.captured_at ?? 0) < now - 14 * 86400000) dead.push(['receipts', r.id]);
     }
     for (const [table, id] of dead.slice(0, 64)) {
       this.sql.exec(`DELETE FROM intake_${table} WHERE id=?`, id);
@@ -648,7 +649,6 @@ export class IntakeService {
       const task: Obj = { id: crypto.randomUUID(), project, title: str(b.title, 256), status: 'open', version: 1,
         created_at: now, updated_at: now, current_state: null, next_step: null, owner: null, uncertainty: null, history: [] };
       if (!this.allowed(p, task, true)) fail('forbidden', 403);
-      this.prune(now);
       this.bounded('tasks', INTAKE_LIMITS.tasks);
       task.history.push(this.event({ kind: 'intake', text: b.text, source: b.source, transcription: b.transcription }, task, p, now));
       task.history[0].intake_key = b.key;
@@ -1004,6 +1004,9 @@ export class IntakeService {
           if (previous.fingerprint !== fingerprint) fail('idempotency_conflict', 409);
           return json(previous.response);
         }
+        // Prune before any capacity check: a full receipts table must not
+        // wedge every write forever, closed tasks must yield to fresh intake.
+        this.prune(Date.now());
         this.bounded('receipts', INTAKE_LIMITS.receipts);
         const response = { ...this.write(path, payload, p), snapshot_version: this.revision() + 1, data_notice: DATA_NOTICE };
         this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
