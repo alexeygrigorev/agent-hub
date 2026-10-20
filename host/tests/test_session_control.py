@@ -102,6 +102,22 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertNotIn('secret', str(raised.exception))
         self.assertNotIn('boom', str(raised.exception))
 
+    def test_hold_payload_surfaces_code_and_held_session(self):
+        import os
+        import urllib.error
+        body = json.dumps({'id': 'held-session-1', 'state': 'held',
+                           'hold': {'error': 'no_eligible_route'}}).encode('utf-8')
+        failure = urllib.error.HTTPError('https://hub.test/api/sessions', 409, 'held', {}, io.BytesIO(body))
+        with patch.object(session_control.config, 'load_config', return_value={'base_url': 'https://hub.test'}), \
+                patch.dict(os.environ, {'HUB_TOKEN': 'fixture-env-token'}), \
+                patch.object(session_control.api, 'safe_http_json', side_effect=failure):
+            with self.assertRaises(ValueError) as raised:
+                session_control.request('POST', '/api/sessions', {'key': 'k'})
+        message = str(raised.exception)
+        self.assertIn('status 409', message)
+        self.assertIn('no_eligible_route', message)
+        self.assertIn('held-session-1', message)
+
     def test_inputs_are_bounded(self):
         with self.assertRaises(ValueError):
             session_control.read_file(__file__, limit=10)

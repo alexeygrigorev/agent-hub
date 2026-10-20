@@ -950,6 +950,24 @@ export class SessionControlService {
           // A held intent may be placed once capacity/admission recovers; the fleet
           // reserve stays idempotent on its own derived key, so this cannot double-launch.
         }
+        // Held-row hygiene in the same mutation txn: an unplaced held row is a parked
+        // intent, not a session, so retries with fresh keys must not pile it up
+        // unbounded. Supersede this actor's older unplaced holds for the same
+        // workspace+name and expire unplaced holds past 48h. Rows that already
+        // placed (fleet_launch_id or binding) are never touched, and the intent
+        // currently being placed (prior) is excluded so a same-key retry can
+        // still re-reserve.
+        const hygieneAt = this.at();
+        const staleBefore = new Date(Date.parse(hygieneAt) - 48 * 3600000).toISOString();
+        this.sql.exec(
+          `UPDATE session_control_sessions SET state = 'cancelled', updated_at = ?
+           WHERE actor = ? AND state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL AND id <> ?
+             AND json_extract(request_json, '$.workspace') = ? AND json_extract(request_json, '$.name') = ?`,
+          hygieneAt, actor, prior?.id ?? '', input.workspace, input.name ?? null);
+        this.sql.exec(
+          `UPDATE session_control_sessions SET state = 'cancelled', updated_at = ?
+           WHERE actor = ? AND state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL AND id <> ? AND created_at < ?`,
+          hygieneAt, actor, prior?.id ?? '', staleBefore);
         // Post-body liveness inside the mutation txn: a credential revoked,
         // expired, or re-enrolled while the request body streamed must not
         // create a session row (or stamp a NULL family). Admins bypass; every

@@ -225,6 +225,28 @@ describe('hub session control durable queue', () => {
     }, fake.hook);
   });
 
+  it('supersedes and expires stale unplaced holds so retries cannot pile up junk', async () => {
+    const fake = fakeReserve({ error: 'no_eligible_route', rejected: [] });
+    await fixture(async (s, sql) => {
+      const first = await s.handle(request('/api/sessions', { key: 'junk-1', workspace: 'demo', name: 'probe-a' }), admin);
+      expect(first.status).toBe(409);
+      const second = await s.handle(request('/api/sessions', { key: 'junk-2', workspace: 'demo', name: 'probe-a' }), admin);
+      expect(second.status).toBe(409);
+      // An aged unplaced hold for the same actor expires even under a different name.
+      const old = Date.now() - 49 * 3600000;
+      sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, mode, state, owner_token_id, owner_family, parent_id, parent_source, session_type, created_at, updated_at)
+        VALUES ('junk-aged', 'test-admin', 'junk-aged', '{"workspace":"demo","name":"aged"}', 'headless', 'held', NULL, NULL, NULL, 'unknown_external', 'headless', ?, ?)`, old, old);
+      const third = await s.handle(request('/api/sessions', { key: 'junk-3', workspace: 'demo', name: 'probe-a' }), admin);
+      expect(third.status).toBe(409);
+      const state = (key: string) => sql.exec('SELECT state FROM session_control_sessions WHERE request_key = ?', key).toArray()[0]?.state;
+      expect(state('junk-1')).toBe('cancelled');
+      expect(state('junk-2')).toBe('cancelled');
+      expect(state('junk-aged')).toBe('cancelled');
+      // The newest intent stays held (and replayable); nothing placed is touched.
+      expect(sql.exec("SELECT COUNT(*) AS n FROM session_control_sessions WHERE state = 'held' AND actor = 'test-admin'").toArray()[0].n).toBe(1);
+    }, fake.hook);
+  });
+
   it('refuses send/capture on unbound sessions', async () => {
     const fake = fakeReserve();
     await fixture(async (s, sql) => {

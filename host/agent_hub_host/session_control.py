@@ -47,17 +47,23 @@ def request(method, path, payload=None):
         return api.safe_http_json(req)
 
     def failure(exc):
-        # Surface the server error code alongside the status so the receiver
-        # can classify terminal vs retryable 409s (claim_expired may heal
-        # after the sweep; proof_replayed never heals). Best-effort: an
-        # unreadable body keeps the status-only form.
+        # Surface the server error code (top-level or inside a 409 hold
+        # payload) plus the held session id, so the receiver can classify
+        # terminal vs retryable failures (claim_expired may heal after the
+        # sweep; proof_replayed never heals) without a follow-up call.
+        # Best-effort: an unreadable body keeps the status-only form.
         name = ''
         try:
             raw = exc.read(4096) if hasattr(exc, 'read') else b''
             data = json.loads((raw or b'').decode('utf-8', 'replace'))
+            hold = data.get('hold') if isinstance(data, dict) else None
             err = data.get('error') if isinstance(data, dict) else None
+            if (not isinstance(err, str) or not err) and isinstance(hold, dict):
+                err = hold.get('error')
             if isinstance(err, str) and err and len(err) <= 64 and err.replace('_', '').isalnum():
                 name = ' (%s)' % err
+            if isinstance(hold, dict) and isinstance(data.get('id'), str) and data.get('id'):
+                name += ' held session %s state %s' % (data['id'], data.get('state'))
         except Exception:
             name = ''
         return ValueError('Session HTTP request failed with status %d%s' % (exc.code, name))
