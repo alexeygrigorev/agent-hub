@@ -625,7 +625,8 @@ export class Hub extends DurableObject {
           nonce,
           code_challenge: codeChallenge,
           code_challenge_method: 'S256',
-          identity_provider: 'Google'
+          identity_provider: 'Google',
+          prompt: 'select_account'
         }).toString();
 
         return new Response(null, {
@@ -644,11 +645,16 @@ export class Hub extends DurableObject {
         const code = query.get('code');
         const state = query.get('state');
 
+        const loginData = state ? await getLoginCookie(this.env, request, state) : null;
+
         // Check if provider returned an OAuth error directly
         if (oauthError) {
           const cleanErr = oauthError.replace(/[^a-z0-9_-]/gi, '');
           const clearCookie = state ? await clearLoginState(this.env, request, state) : clearLoginCookie();
-          return authFailure(request, 'provider_error', 400, { 'Set-Cookie': clearCookie }, `oauth_${cleanErr}`);
+          // Classify only the known guard rejection. Never render arbitrary provider text.
+          const workspaceDenied = oauthError === 'invalid_request' &&
+            (query.get('error_description') || '').includes('Sign-in is restricted to a verified account in the approved Workspace domain');
+          return authFailure(request, 'provider_error', 400, { 'Set-Cookie': clearCookie }, workspaceDenied ? 'workspace_account_required' : `oauth_${cleanErr}`, loginData?.returnTo);
         }
 
         const existingSession = await getSession(this.env, request);
@@ -658,17 +664,16 @@ export class Hub extends DurableObject {
             return new Response(null, { status: 302, headers: { 'Location': '/', 'Cache-Control': 'private, no-store' } });
           }
           const cat = !code && !state ? 'missing_code_and_state' : !code ? 'missing_code' : 'missing_state';
-          return authFailure(request, 'Missing code or state', 400, {}, cat);
+          return authFailure(request, 'Missing code or state', 400, {}, cat, loginData?.returnTo);
         }
 
-        const loginData = await getLoginCookie(this.env, request, state);
         if (!loginData || loginData.state !== state) {
           if (existingSession) {
             return new Response(null, { status: 302, headers: { 'Location': '/', 'Cache-Control': 'private, no-store' } });
           }
           const hasAny = await getLoginCookie(this.env, request);
           const cat = hasAny ? 'state_mismatch' : 'missing_cookie';
-          return authFailure(request, 'Invalid state', 400, {}, cat);
+          return authFailure(request, 'Invalid state', 400, {}, cat, loginData?.returnTo);
         }
 
         const stateHash = await sha256(state);
@@ -696,7 +701,7 @@ export class Hub extends DurableObject {
           } else {
             cat = 'state_not_found';
           }
-          return authFailure(request, 'invalid_state', 400, { 'Set-Cookie': clearCookie }, cat);
+          return authFailure(request, 'invalid_state', 400, { 'Set-Cookie': clearCookie }, cat, loginData.returnTo);
         }
 
         const clearCookie = await clearLoginState(this.env, request, state);
@@ -708,10 +713,10 @@ export class Hub extends DurableObject {
         } catch (err: any) {
           const rawMsg = String(err?.message || '');
           const cat = /^[a-z0-9_:-]+$/i.test(rawMsg) ? rawMsg : 'token_validation_failed';
-          return authFailure(request, 'invalid_identity_token', 400, { 'Set-Cookie': clearCookie }, cat);
+          return authFailure(request, 'invalid_identity_token', 400, { 'Set-Cookie': clearCookie }, cat, loginData.returnTo);
         }
         if (!configuredAdmins(this.env).includes(claims.email.toLowerCase())) {
-          return authFailure(request, 'forbidden', 403, { 'Set-Cookie': clearCookie }, 'forbidden_not_admin');
+          return authFailure(request, 'forbidden', 403, { 'Set-Cookie': clearCookie }, 'forbidden_not_admin', loginData.returnTo);
         }
 
         const now = new Date().toISOString();

@@ -19,6 +19,56 @@ afterAll(() => {
 
 describe('Web Auth Repair & Robustness', () => {
 
+  it('retries a Workspace rejection with fresh state and the signed device destination', async () => {
+    const returnTo = '/device?code=ABCD-EFGH';
+    const start = await doFetch(new Request('http://example.com/auth/login?return_to=' + encodeURIComponent(returnTo), { redirect: 'manual' }));
+    const cookie = start.headers.get('Set-Cookie')!.split(';')[0];
+    const state = new URL(start.headers.get('Location')!).searchParams.get('state')!;
+    const query = new URLSearchParams({ error: 'invalid_request', state,
+      error_description: 'PreSignUp failed with error Sign-in is restricted to a verified account in the approved Workspace domain. <script>private</script>' });
+    const failure = await doFetch(new Request('http://example.com/auth/callback?' + query, {
+      headers: { Cookie: cookie, Accept: 'text/html' },
+    }));
+    expect(failure.status).toBe(400);
+    expect(failure.headers.get('X-Auth-Error')).toBe('workspace_account_required');
+    const html = await failure.text();
+    expect(html).toContain('verified @datatalks.club account');
+    expect(html).not.toContain('private</script>');
+    expect(html).not.toContain('<nav');
+    const retry = html.match(/href="([^" ]+)">Try sign-in again/)![1].replaceAll('&amp;', '&');
+    expect(retry).toBe('/auth/login?return_to=' + encodeURIComponent(returnTo));
+    const again = await doFetch(new Request('http://example.com' + retry, {
+      headers: { Cookie: failure.headers.get('Set-Cookie')!.split(';')[0] }, redirect: 'manual',
+    }));
+    const next = new URL(again.headers.get('Location')!);
+    expect(again.status).toBe(302);
+    expect(next.searchParams.get('state')).not.toBe(state);
+    expect(next.searchParams.get('prompt')).toBe('select_account');
+    const freshCookie = again.headers.get('Set-Cookie')!.split(';')[0];
+    const { getLoginCookie } = await import('../src/auth/session');
+    const data = await getLoginCookie(defaultEnv, new Request('http://example.com', { headers: { Cookie: freshCookie } }), next.searchParams.get('state')!);
+    expect(data?.returnTo).toBe(returnTo);
+  });
+
+  it('ignores unsigned provider return paths and raw error details', async () => {
+    const query = new URLSearchParams({ error: 'invalid_request', return_to: '//evil.example', error_description: 'private-provider-detail' });
+    const failure = await doFetch(new Request('http://example.com/auth/callback?' + query, { headers: { Accept: 'text/html' } }));
+    const html = await failure.text();
+    expect(html).toContain('href="/auth/login">Try sign-in again');
+    expect(html).not.toContain('evil.example');
+    expect(html).not.toContain('private-provider-detail');
+    expect(html).not.toContain('<nav');
+  });
+
+  it('keeps device entry, review and results free of dashboard navigation', async () => {
+    const { deviceEntry, deviceResult, deviceReview } = await import('../src/ui-pages');
+    const pairing = {user_code:'ABCD-EFGH', client_kind:'host', requested_scopes:'[]', expires_at:new Date(Date.now()+600000).toISOString()};
+    for (const page of [deviceEntry(''), deviceEntry('admin@fake.local'), deviceResult('expired', ''), deviceReview(pairing, 'admin@fake.local', null, null, [], Date.now(), null)]) {
+      expect(page).not.toContain('<nav');
+      expect(page).not.toContain('/conversations.html');
+    }
+  });
+
   it('concurrent logins in separate tabs retain both states in LoginJar and allow both callbacks to succeed', async () => {
     // Tab 1 initiates login with return_to
     const req1 = new Request('http://example.com/auth/login?return_to=/tab1', { redirect: 'manual' });
