@@ -33,6 +33,16 @@ async function fixture(fn: (r: RoutingService, f: FleetService, sql: any) => Pro
   });
 }
 describe('capability task routing', () => {
+  it('dispatches with central account quota when every machine subscription is missing', () => fixture(async (r, f, sql) => {
+    sql.exec('DELETE FROM fleet_subscriptions');
+    sql.exec('INSERT INTO server_quota_snapshots VALUES (?, ?, ?, ?)', 'shared-zai', 'zai', at(), JSON.stringify(quota));
+    const response = await r.handle(req('/api/tasks', input()), client());
+    expect(response.status).toBe(201);
+    const job: any = await response.json();
+    expect(job.machine).toBe('hetzner');
+    expect(job.selection.model).toBe('glm-5.3-flash');
+  }));
+
   it('prefers Hetzner for daily work and preserves approved actions in private launch', () => fixture(async (r, f, sql) => {
     const response = await r.handle(req('/api/tasks', input()), client()); expect(response.status).toBe(201);
     const job: any = await response.json(); expect(job.machine).toBe('hetzner'); expect(job.tier).toBe('daily'); expect(job.selection.model).toBe('glm-5.3-flash');

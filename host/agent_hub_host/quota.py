@@ -19,6 +19,7 @@ def add_commands(sub):
     parser.add_argument("--provider", default=None, choices=list(ALLOWED_PROVIDERS))
     parser.add_argument("--engine", default=None, help="Limit to one engine label")
     parser.add_argument("--account", default=None, help="Limit to one account label")
+    parser.add_argument("--admin-token-file", default=None, help="Use an existing private Hub operator token for this read")
     parser.add_argument("--json", action="store_true", help="Emit raw JSON instead of text")
 
 
@@ -34,7 +35,7 @@ def _host_id(value):
     return value
 
 
-def fetch_quota(host=None, provider=None, engine=None, account=None):
+def fetch_quota(host=None, provider=None, engine=None, account=None, admin_token_file=None):
     """GET /api/quota?view=fleet with optional filters via the stored credential."""
     from . import bus
     params = {"view": "fleet"}
@@ -48,11 +49,21 @@ def fetch_quota(host=None, provider=None, engine=None, account=None):
         params["engine"] = _label(engine, "engine")
     if account is not None:
         params["account"] = _label(account, "account")
-    return bus._do_request("GET", "/api/quota?" + urllib.parse.urlencode(params))
+    path = "/api/quota?" + urllib.parse.urlencode(params)
+    if admin_token_file is not None:
+        from . import config, quota_server
+        base = config.load_config().get('base_url') or config.DEFAULT_BASE_URL
+        opener, _ = quota_server.admin_opener(base.rstrip('/'), admin_token_file)
+        with opener.open(base.rstrip('/') + path, timeout=20) as response:
+            return json.loads(response.read(1024 * 1024))
+    return bus._do_request("GET", path)
 
 
 def execute(args):
-    return fetch_quota(host=args.host, provider=args.provider, engine=args.engine, account=args.account)
+    kwargs = dict(host=args.host, provider=args.provider, engine=args.engine, account=args.account)
+    if getattr(args, 'admin_token_file', None) is not None:
+        kwargs['admin_token_file'] = args.admin_token_file
+    return fetch_quota(**kwargs)
 
 
 def render_text(data):
@@ -71,7 +82,12 @@ def render_text(data):
             left, pool.get("observed_at") or "never",
             ", ".join(pool.get("observed_by_hosts") or []) or "no host"))
     coverage = data.get("coverage") if isinstance(data.get("coverage"), dict) else {}
-    if coverage:
+    account_coverage = data.get("account_coverage")
+    if isinstance(account_coverage, dict):
+        lines.append("accounts: %s fresh, %s stale, %s unavailable of %s (server probes; machine reports are fallback)" % (
+            len(account_coverage.get("fresh") or []), len(account_coverage.get("stale") or []),
+            len(account_coverage.get("unavailable") or []), account_coverage.get("total")))
+    elif coverage:
         lines.append("coverage: %s fresh, %s stale, %s missing of %s machines" % (
             len(coverage.get("fresh") or []), len(coverage.get("stale") or []),
             len(coverage.get("missing") or []), coverage.get("machines_total")))

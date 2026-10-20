@@ -1,4 +1,49 @@
-# Host Quota Snapshot API (`QUOTA-HUB-SPEC-20261014`)
+# Account Quota and Host Snapshot API
+
+## Primary collection: Hub server
+
+Provider accounts are probed by the Hub backend on Hetzner through the maintained
+`quse` adapters. `agent-hub-quota-server.timer` runs independently of the fleet
+host agent, enrolled machine availability and PocketShell, every five minutes.
+The Worker stores only sanitized observations, never provider credentials.
+
+Install the `host/agent_hub_host` package in
+`~/.local/lib/agent-hub-quota-server/host/agent_hub_host`, and install the service
+and timer from `deploy/`. Configure `~/.config/agent-hub/quota-server.json` with
+`base_url`, `admin_token_file` (the existing private Hub bootstrap token), `quse`
+(the absolute maintained executable), and `accounts` (a list of `{account,
+provider}` mappings). Account labels must match the fleet registry. The timer
+uses server-local provider authentication; it does not obtain credentials from
+machines or clients. Configure any Go key override in the service environment;
+otherwise the maintained probe reads the server's OpenCode auth store.
+Centrally provisioned account labels are also discovered automatically from
+`managed-engines/state.json` (relative to the host config directory). The bounded
+`hub engines quota` adapter provides isolated account observations. Optional
+`managed_state_file` and `managed_quota_argv` select the installed managed catalog
+and CLI location; adding an account requires no separate collector mapping. No paid
+fallback, credit purchase or account creation is part of collection.
+
+`POST /api/quota/server` requires an admin session and CSRF token. The bounded
+32 KiB body is `{captured_at, accounts:[{account, provider, quota}]}`. Each quota
+uses the same sanitized schema 1.1 route DTO documented below. The whole batch
+is validated before storage. Duplicate accounts, mismatched providers, private
+fields, future measurements and replayed/older snapshots are refused. Failed
+probes explicitly replace previous success with unavailable evidence.
+
+The latest row per account lives in `server_quota_snapshots`. Fresh server
+observations take precedence in both fleet quota views and route admission,
+including failures that must hold dispatch. After 20 minutes they expire; fresh
+machine observations may then be used as an explicitly labeled fallback.
+Existing provider reserve, entitlement, reset and local launch gates still apply.
+`GET /api/quota?view=fleet` reports `source`, `windows` and `account_coverage`;
+the CLI and Usage dashboard count accounts independently of machine coverage.
+The legacy `coverage` and `hosts` fields remain diagnostic data. Operators who
+already have the private bootstrap credential can read with
+`hub quota --admin-token-file ~/.config/agent-hub/admin-token`, without issuing a
+new credential or changing any machine's login profile.
+
+## Fallback collection: host snapshots
+
 
 Status: Founder-authorized specification ([Issue #12](https://github.com/alexeygrigorev/agent-hub/issues/12)).
 Implementation scope: Hub server (`src/quota.ts`, `src/hub.ts`) and host collector (`host/agent_hub_host/`). Downstream consumer adapters (`agent-quota-launcher` and `cloudflare-agent-git/scripts/quota-gate.py`) remain owned by their respective delivery coordinators.

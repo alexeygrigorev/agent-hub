@@ -104,15 +104,14 @@ export class RoutingService {
         if (!plan.selected) continue;
         const routes = plan.candidates.flatMap((r: any) => {
           const account: any = this.sql.exec('SELECT provider FROM fleet_accounts WHERE label = ?', r.account).one();
-          const subscription: any = this.sql.exec('SELECT quota_json, observed_at FROM fleet_subscriptions WHERE machine_id = ? AND account = ?', ad.machine_id, r.account).toArray()[0];
-          let subQuota: any = null;
-          if (subscription) {
-            try { subQuota = JSON.parse(subscription.quota_json); } catch { subQuota = null; }
-            if (subQuota) {
-              // Canonical fail-closed admission: exhausted/stale/unknown quota yields no models.
-              const adm = evaluateQuotaAdmission({ provider: account.provider, quota: subQuota, subscriptionObservedAt: subscription.observed_at ?? null, nowMs: this.now(), reserves: (((policy as any).rules as any).reserve_percent || {}) as Record<string, number> });
-              if (!adm.ok) subQuota = null;
-            }
+          const observation = this.fleet.observationProvenance({ ...account, label: r.account },
+            { machine_id: ad.machine_id, profile: r.profile });
+          let subQuota = observation?.quota ?? null;
+          if (subQuota) {
+            const adm = evaluateQuotaAdmission({ provider: account.provider, quota: subQuota,
+              subscriptionObservedAt: observation!.subscriptionObservedAt, nowMs: this.now(),
+              reserves: (((policy as any).rules as any).reserve_percent || {}) as Record<string, number> });
+            if (!adm.ok) subQuota = null;
           }
           const models = modelCandidates(input, { ...r, provider: account.provider }, JSON.parse(ad.runners_json), subQuota, this.now());
           return models.map(model => ({ ...r, model, score: r.score * model.weight / model.headroom }));

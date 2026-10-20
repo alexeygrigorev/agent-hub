@@ -4,6 +4,7 @@ import { RoutingService } from './routing';
 import { ClaimAdmission, sameIntent, sameEditCaller, type EditAuthority, type AdmissionCaller } from './claim_admission';
 import { effectiveCheckin } from './registry';
 import { taskTier, policy } from './model-routing';
+import { QUOTA_SCHEMA_SQL, QUOTA_STALE_MS } from './quota';
 import { evaluateQuotaAdmission } from './quota_admission';
 import { adoptObservedNativeSessions } from './session_control';
 import { isValidMachineId } from './machine-id';
@@ -136,6 +137,7 @@ export class FleetService {
     this.admission = new ClaimAdmission(sql, transaction, now);
   }
   init() {
+    for (const stmt of QUOTA_SCHEMA_SQL.split(';')) if (stmt.trim()) this.sql.exec(stmt);
     this.routing.init();
     this.admission.init();
     for (const stmt of FLEET_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
@@ -150,7 +152,14 @@ export class FleetService {
     if (!columns.includes('created_at_ms')) this.sql.exec('ALTER TABLE fleet_sessions ADD COLUMN created_at_ms INTEGER');
   }
 
-  private observationProvenance(account: any, route: any): { quota: any; subscriptionObservedAt: string | null } | null {
+  public observationProvenance(account: any, route: any): { quota: any; subscriptionObservedAt: string | null } | null {
+    const central: any = this.sql.exec('SELECT * FROM server_quota_snapshots WHERE account = ? AND provider = ?', account.label, account.provider).toArray()[0];
+    if (central && fresh(central.captured_at, this.now(), QUOTA_STALE_MS - 1)) {
+      const quota = parsed(central.quota_json);
+      if (!quota.observed_at || fresh(quota.observed_at, this.now(), QUOTA_STALE_MS - 1)) {
+        return { quota, subscriptionObservedAt: central.captured_at };
+      }
+    }
     const subscription: any = this.sql.exec('SELECT * FROM fleet_subscriptions WHERE machine_id = ? AND account = ?', route.machine_id, account.label).toArray()[0];
     if (subscription) {
       if (subscription.service !== account.provider || !fresh(subscription.observed_at, this.now(), 1200000)) return null;
@@ -366,13 +375,14 @@ export class FleetService {
           // account policy, subscriptions, routes or execution reservations.
           const accounts = this.sql.exec('SELECT * FROM fleet_accounts').toArray() as any[];
           const routes = this.sql.exec('SELECT * FROM fleet_routes').toArray() as any[];
-          const unchangedAccounts = accounts.length === data.accounts.length && accounts.every(a => data.accounts.some((n: any) =>
+          const unchangedAccounts = accounts.every(a => data.accounts.some((n: any) =>
             n.label === a.label && n.provider === a.provider && n.max_concurrency === a.max_concurrency &&
             n.reserve_percent === a.reserve_percent && Number(n.enabled) === a.enabled));
           const sameRoute = (a: any, b: any) => a.machine_id === b.machine_id && a.engine === b.engine && a.account === b.account && a.profile === b.profile;
           const retainedRoutes = routes.every(r => data.routes.some((n: any) => sameRoute(r, n)));
           const added = data.routes.filter((n: any) => !routes.some(r => sameRoute(r, n)));
-          if (!unchangedAccounts || !retainedRoutes || !added.length) return response({ error: 'active_launches_hold_registry' }, 409);
+          if (!unchangedAccounts || !retainedRoutes || (!added.length && accounts.length === data.accounts.length)) return response({ error: 'active_launches_hold_registry' }, 409);
+          for (const a of data.accounts) if (!accounts.some(old => old.label === a.label)) this.sql.exec('INSERT INTO fleet_accounts VALUES (?, ?, ?, ?, ?)', a.label, a.provider, a.max_concurrency, a.reserve_percent, Number(a.enabled));
           for (const r of added) this.sql.exec('INSERT INTO fleet_routes VALUES (?, ?, ?, ?)', r.machine_id, r.engine, r.account, r.profile);
           return response({ status: 'configured', added_routes: added.length });
         }

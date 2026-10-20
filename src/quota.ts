@@ -1,7 +1,7 @@
 import { SqlStorage, DurableObjectState } from "@cloudflare/workers-types";
 import { Env } from "./env";
 import { sha256 } from "./auth/crypto";
-import { getSession, allowedCallbackUrls } from "./auth/session";
+import { getSession, allowedCallbackUrls, verifyCsrf } from "./auth/session";
 
 export const QUOTA_SCHEMA_version = "1.1";
 export const QUOTA_SCHEMA_VERSIONS = new Set<string>(["1.0", "1.1"]);
@@ -28,6 +28,7 @@ export const ALLOWED_QUOTA_PROVIDERS = new Set<string>([
 ]);
 
 export const QUOTA_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS server_quota_snapshots (account TEXT PRIMARY KEY, provider TEXT NOT NULL, captured_at TEXT NOT NULL, quota_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS host_quota_snapshots (
   host_id TEXT PRIMARY KEY,
   schema_version TEXT NOT NULL,
@@ -255,7 +256,7 @@ function observationUnavailable(quota: any): boolean {
   for (const w of Object.values(quota.windows || {}) as any[]) {
     if (w !== null && typeof w === "object" && w.error === "unavailable") return true;
   }
-  return false;
+  return windowMinPercent(quota) === null;
 }
 
 function isPlainObject(val: unknown): val is Record<string, any> {
@@ -1160,6 +1161,10 @@ export class QuotaStore {
     nowMs: number = this.now()
   ): { status: number; body: Record<string, any> } {
     const rawAccounts = this.sql.exec("SELECT * FROM fleet_accounts ORDER BY provider, label").toArray() as any[];
+    const serverRows = this.sql.exec("SELECT * FROM server_quota_snapshots ORDER BY account").toArray() as any[];
+    for (const row of serverRows) {
+      if (!rawAccounts.some(a => a.label === row.account)) rawAccounts.push({ label: row.account, provider: row.provider });
+    }
     const knownProviders = new Set(rawAccounts.map((a: any) => a.provider));
     const extraAccounts: any[] = [];
     const allRoutes = this.sql.exec("SELECT * FROM fleet_routes ORDER BY machine_id, engine").toArray() as any[];
@@ -1267,6 +1272,17 @@ export class QuotaStore {
         }
       }
 
+      const central = serverRows.find(r => r.account === account.label && r.provider === account.provider);
+      let source = "machine-fallback";
+      if (central) {
+        let quota: any = null;
+        try { quota = JSON.parse(central.quota_json); } catch { /* unavailable */ }
+        if (quota && isFreshTs(central.captured_at, nowMs, QUOTA_STALE_MS) &&
+            (!quota.observed_at || isFreshTs(quota.observed_at, nowMs, QUOTA_STALE_MS))) {
+          freshObs.splice(0, freshObs.length, { machine: "hub-server", quota, kind: "server" });
+          source = "server";
+        } else hasStale = true;
+      }
       let state = "unknown";
       let remaining: number | null = null;
       let observedAt: string | null = null;
@@ -1294,6 +1310,8 @@ export class QuotaStore {
         provider: account.provider,
         account: account.label,
         state,
+        source,
+        windows: freshObs[0]?.quota.windows || {},
         remaining_percent: remaining,
         observed_at: observedAt,
         collector_version: collectorVersion,
@@ -1338,8 +1356,56 @@ export class QuotaStore {
         pools,
         hosts,
         coverage,
+        account_coverage: { total: pools.length,
+          fresh: pools.filter(p => p.state === "fresh" || p.state === "exhausted").map(p => p.account),
+          stale: pools.filter(p => p.state === "stale").map(p => p.account),
+          unavailable: pools.filter(p => p.state === "unavailable" || p.state === "unknown").map(p => p.account) },
       },
     };
+  }
+
+  /** Central account observations: no machine identity or host enrollment involved. */
+  public async putServerSnapshot(request: Request): Promise<Response> {
+    const session = await getSession(this.env, request);
+    if (!session?.isAdmin) return jsonResponse({ error: "forbidden" }, 403);
+    if (!verifyCsrf(request, session)) return jsonResponse({ error: "csrf_required" }, 403);
+    if (request.method !== "POST") return jsonResponse({ error: "method_not_allowed" }, 405);
+    const body = await readBoundedJsonBody(request, QUOTA_MAX_BODY_BYTES);
+    if (body.errorStatus) return jsonResponse({ error: body.errorCode || "invalid_body" }, body.errorStatus);
+    const data = body.data;
+    if (!data || Object.keys(data).some(k => !["captured_at", "accounts"].includes(k)) ||
+        !Array.isArray(data.accounts) || !data.accounts.length || data.accounts.length > 32) {
+      return jsonResponse({ error: "invalid_accounts" }, 400);
+    }
+    const rows: { account: string; provider: string; quota: QuotaRouteDTO }[] = [];
+    const seen = new Set<string>();
+    for (const row of data.accounts) {
+      if (!isPlainObject(row) || Object.keys(row).some(k => !["account", "provider", "quota"].includes(k)) ||
+          typeof row.account !== "string" || !FLEET_LABEL.test(row.account) || seen.has(row.account)) {
+        return jsonResponse({ error: "invalid_account" }, 400);
+      }
+      seen.add(row.account);
+      const valid = validateQuotaSnapshotPayload({ schema_version: "1.1", collector_version: "hub-server/1.0",
+        captured_at: data.captured_at, host_id: "hub-server", status: "ok", error: null,
+        routes: { [row.provider]: row.quota } }, "hub-server", this.now());
+      if (!valid.ok || !ALLOWED_QUOTA_PROVIDERS.has(row.provider)) return jsonResponse({ error: "invalid_quota" }, 400);
+      const old: any = this.sql.exec("SELECT captured_at, quota_json FROM server_quota_snapshots WHERE account = ?", row.account).toArray()[0];
+      if (old && Date.parse(old.captured_at) >= valid.snapshot!.captured_at_ms) return jsonResponse({ error: "older_snapshot" }, 409);
+      const definition: any = this.sql.exec("SELECT provider FROM fleet_accounts WHERE label = ?", row.account).toArray()[0];
+      if (definition && definition.provider !== row.provider) return jsonResponse({ error: "provider_mismatch" }, 400);
+      const quota = valid.snapshot!.routes[row.provider];
+      if (old && quota.details.cooldown_until == null) {
+        const deadline = JSON.parse(old.quota_json)?.details?.cooldown_until;
+        if (typeof deadline === "string" && Date.parse(deadline) > this.now()) quota.details.cooldown_until = deadline;
+      }
+      rows.push({ account: row.account, provider: row.provider, quota });
+    }
+    if (!this.ctx) return jsonResponse({ error: "storage_unavailable" }, 503);
+    this.ctx.storage.transactionSync(() => {
+      for (const row of rows) this.sql.exec("INSERT OR REPLACE INTO server_quota_snapshots VALUES (?, ?, ?, ?)",
+        row.account, row.provider, data.captured_at, JSON.stringify(row.quota));
+    });
+    return jsonResponse({ status: "stored", accounts: rows.length });
   }
 
   public async handleRequest(request: Request, url?: URL, canonicalAuth?: CanonicalQuotaAuth): Promise<Response> {
@@ -1532,6 +1598,7 @@ export async function handleQuotaRoutes(
   url?: URL,
   canonicalAuth?: CanonicalQuotaAuth
 ): Promise<Response | null> {
+  if (path === "/api/quota/server") return quotaStore.putServerSnapshot(request);
   if (path !== "/api/quota") return null;
   return quotaStore.handleRequest(request, url, canonicalAuth);
 }

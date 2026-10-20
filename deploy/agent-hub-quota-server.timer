@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Hub account quota independently of fleet machines
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=5min
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

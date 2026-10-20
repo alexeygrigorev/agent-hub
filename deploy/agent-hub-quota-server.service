@@ -1,0 +1,15 @@
+[Unit]
+Description=Agent Hub server-side provider account quota probes
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/lib/agent-hub-quota-server
+Environment=PYTHONPATH=host
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 -m agent_hub_host.quota_server --config %h/.config/agent-hub/quota-server.json
+UMask=0077
+TimeoutStartSec=90
+MemoryMax=256M
+TasksMax=64
+NoNewPrivileges=true

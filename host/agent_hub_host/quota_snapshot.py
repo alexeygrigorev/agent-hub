@@ -523,12 +523,16 @@ def _read_stream_capped(
 
 
 def execute_quse(
-    quse_cmd: str = "quse",
+    quse_cmd: Union[str, List[str]] = "quse",
     timeout: float = 30.0,
     max_bytes: int = MAX_RAW_STDOUT_BYTES,
     runner: Optional[Callable[..., Any]] = None
 ) -> Dict[str, Any]:
-    """Execute bounded quse subprocess without shell, unbounded buffering, or raw output logging."""
+    """Execute bounded quse (or a trusted JSON adapter argv) without a shell."""
+    if not isinstance(quse_cmd, str):
+        if (not isinstance(quse_cmd, list) or not 1 <= len(quse_cmd) <= 32 or
+                any(not isinstance(a, str) or not a or len(a) > 4096 or "\0" in a for a in quse_cmd)):
+            raise ValueError("Invalid JSON adapter argv")
     if type(timeout) is bool or not isinstance(timeout, (int, float)) or math.isnan(timeout) or math.isinf(timeout) or timeout <= 0:
         raise ValueError("timeout must be a positive number")
     effective_timeout = min(float(timeout), 30.0)
@@ -563,7 +567,7 @@ def execute_quse(
     stderr_state = {"overflow": False}
     try:
         proc = subprocess.Popen(
-            [quse_cmd, "--json"],
+            [quse_cmd, "--json"] if isinstance(quse_cmd, str) else quse_cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

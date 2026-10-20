@@ -95,16 +95,22 @@ function renderQuota(q) {
     const p = document.createElement('p'); p.textContent = q && q.error ? `Quota unavailable: ${q.error}` : 'Quota unavailable: no data.'; root.append(p); return;
   }
   const pools = Array.isArray(q.pools) ? q.pools : [];
-  root.append(richTable(['Provider', 'Account', 'State', 'Remaining', 'Observed', 'Hosts'],
+  root.append(richTable(['Provider', 'Account', 'State', 'Remaining', 'Observed', 'Source'],
     pools.map(p => [p.provider, p.account, quotaBadge(p.state),
       p.remaining_percent === null || p.remaining_percent === undefined ? 'unknown' : `${p.remaining_percent}%`,
       p.observed_at || 'never',
-      Array.isArray(p.observed_by_hosts) && p.observed_by_hosts.length ? p.observed_by_hosts.join(', ') : 'no host'])));
-  const cov = q.coverage || {};
+      p.source === 'server' ? 'Hub server' : `Machine fallback: ${(p.observed_by_hosts || []).join(', ') || 'unavailable'}`])));
+  const cov = q.account_coverage || {};
   const cp = document.createElement('p');
-  cp.textContent = `Coverage: ${((cov.fresh || []).length)} fresh, ${((cov.stale || []).length)} stale, ${((cov.missing || []).length)} missing of ${cov.machines_total ?? '?'} machines.`;
+  cp.textContent = `Coverage: ${((cov.fresh || []).length)} fresh, ${((cov.stale || []).length)} stale, ${((cov.unavailable || []).length)} unavailable of ${cov.total ?? '?'} accounts. Hub server probes are primary; machine reports are fallback.`;
   root.append(cp);
   const winRows = [];
+  for (const p of pools.filter(p => p.source === 'server')) {
+    for (const [name, w] of Object.entries(p.windows || {})) {
+      winRows.push(['Hub server', `${p.provider} / ${p.account}`, name, quotaBadge(p.state),
+        w.present && w.percent_remaining != null ? `${w.percent_remaining}%` : 'unknown', nativeText(w), w.reset_at || 'unknown']);
+    }
+  }
   for (const h of Array.isArray(q.hosts) ? q.hosts : []) {
     const snap = h.snapshot || {};
     const routes = snap.routes && typeof snap.routes === 'object' ? snap.routes : {};
