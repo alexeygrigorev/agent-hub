@@ -187,7 +187,8 @@ def run_json(argv, *, payload=None, cwd=None, timeout=30):
             overflow.set()
     # The native catalog includes containment and process metadata per session.
     # Keep provider probes small while allowing the bounded 500-session catalog.
-    stdout_limit = 8 * 1024 * 1024 if list(argv[-2:]) == ["list", "--json"] else 131072
+    is_catalog = list(argv[-2:]) == ["list", "--json"] or list(argv[-3:]) == ["list", "--all", "--json"]
+    stdout_limit = 8 * 1024 * 1024 if is_catalog else 131072
     threads = [threading.Thread(target=drain, args=(proc.stdout, stdout_limit, stdout), daemon=True),
                threading.Thread(target=drain, args=(proc.stderr, 16384), daemon=True),
                threading.Thread(target=write, daemon=True)]
