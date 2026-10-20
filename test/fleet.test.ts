@@ -205,6 +205,28 @@ describe('generic accounts and launch placement', () => {
     expect((await s.handle(request(path, { state: 'exited', confirmed_exit: true }), host('hetzner'))).status).toBe(200);
     expect((await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).status).toBe(201);
   }));
+  it('ignores sessions on stale offline machines when computing shared account capacity', async () => fixture(async (s, sql) => {
+    await configure(s, true);
+    // Both machines share shared-codex; win35 goes stale (legacy hetzner).
+    sql.exec("UPDATE machines SET last_checkin_at = ? WHERE id = 'win35'", iso(-3600000));
+    sql.exec("INSERT INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, profile, account) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      'win35', 'stale-native', 'stale-tag', 'codex', 'running', null, iso(), 'demo', null, 'shared-codex');
+    // Stale win35 session must not block the live hetzner route.
+    const plan: any = s.plan(intent({ machine: 'hetzner' }));
+    expect(plan.selected).toBeTruthy();
+    expect(plan.selected.machine).toBe('hetzner');
+  }));
+  it('expires stale uncertain reservations without killing live running capacity', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const first: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    await s.handle(request('/launches/' + first.id + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+    expect((await s.handle(request('/launches/' + first.id + '/result', { state: 'uncertain' }), host('hetzner'))).status).toBe(200);
+    // Second launch blocked while the uncertain reservation is fresh.
+    expect((await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).status).toBe(409);
+    // A 3-day-old uncertain hold never confirmed a native start; it must not block forever.
+    sql.exec("UPDATE fleet_launches SET updated_at = ? WHERE id = ?", iso(-3 * 86400000), first.id);
+    expect((await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).status).toBe(201);
+  }));
   for (const terminal of ['exited', 'failed'] as const) {
     it(`replays the identical ${terminal} headless receipt without effects and refuses mismatched receipts`, async () => fixture(async (s, sql) => {
       await configure(s);

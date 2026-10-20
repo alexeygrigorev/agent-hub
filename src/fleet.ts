@@ -204,8 +204,27 @@ export class FleetService {
       remaining = remaining === null ? adm.remaining! : Math.min(remaining, adm.remaining!);
     }
     if (remaining !== null && remaining <= account.reserve_percent) blocked = true;
-    const reserved = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE account = ? AND state IN ${ACTIVE}`, account.label).one().n);
-    const observedSessions = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown') AND NOT EXISTS (SELECT 1 FROM fleet_launches l WHERE l.machine_id = s.machine_id AND l.native_id = s.native_id AND l.state IN ${ACTIVE})`, account.label).one().n);
+    // Capacity counts only live machines (Hetzner urgent live, legacy stale):
+    // sessions and reservations on drained or stale-checkin machines must not
+    // block the shared pool for the live host. Stale offered/starting/uncertain
+    // reservations (no update for 48h) never had a confirmed native start and
+    // must not hold quota forever; running launches may be long-lived and stay.
+    const liveIds = new Set<string>();
+    try {
+      for (const m of this.sql.exec('SELECT id, last_checkin_at, drained FROM machines').toArray() as any[]) {
+        if (m.drained) continue;
+        if (!fresh(effectiveCheckin(m.id, m.last_checkin_at), this.now(), 180000)) continue;
+        liveIds.add(String(m.id));
+      }
+    } catch { /* fail closed below when the live set is empty */ }
+    const liveList = [...liveIds];
+    const staleCutoff = new Date(this.now() - 48 * 3600000).toISOString();
+    const reserved = liveList.length
+      ? Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE account = ? AND state IN ${ACTIVE} AND machine_id IN (${liveList.map(() => '?').join(',')}) AND (state = 'running' OR updated_at > ?)`, account.label, ...liveList, staleCutoff).one().n)
+      : 0;
+    const observedSessions = liveList.length
+      ? Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown') AND s.machine_id IN (${liveList.map(() => '?').join(',')}) AND NOT EXISTS (SELECT 1 FROM fleet_launches l WHERE l.machine_id = s.machine_id AND l.native_id = s.native_id AND l.state IN ${ACTIVE})`, account.label, ...liveList).one().n)
+      : 0;
     const active = reserved + observedSessions;
     return { label: account.label, provider: account.provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled,
       remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || unknown || remaining === null) ? 'unknown' : 'ok', active, available_slots: Math.max(0, Number(account.max_concurrency) - active),
