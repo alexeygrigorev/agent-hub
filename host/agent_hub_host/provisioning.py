@@ -1,7 +1,9 @@
 """Managed engine installation. No credentials in argv, profile TOML, logs or receipts."""
 from __future__ import annotations
 import contextlib
+import datetime as dt
 import json
+import math
 import os
 import platform
 from pathlib import Path
@@ -32,6 +34,9 @@ END = '# END HUB MANAGED ENGINES\n'
 
 
 def root():
+    explicit = os.environ.get('AGENT_HUB_MANAGED_DIR') or os.environ.get('HUB_MANAGED_DIR')
+    if explicit:
+        return Path(explicit).resolve()
     return config.get_host_config_path().parent / 'managed-engines'
 
 
@@ -92,10 +97,12 @@ def profile_path():
     return Path(os.environ.get('APLEXER_CONFIG', Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'aplexer' / 'config.toml'))
 
 
-def module_command(handler, label):
+def module_command(handler, label, managed_dir=None):
     prefix = ''
     if Path(sys.argv[0]).is_file() and zipfile.is_zipfile(sys.argv[0]):
         prefix = 'import sys; sys.path.insert(0, ' + repr(str(Path(sys.argv[0]).resolve())) + '); '
+    m_dir = str(managed_dir or root())
+    prefix += 'import os; os.environ.setdefault("AGENT_HUB_MANAGED_DIR", ' + repr(m_dir) + '); '
     return [sys.executable, '-c', prefix + 'from agent_hub_host.provisioning import ' + handler + '; ' + handler + '()', label]
 
 
@@ -479,15 +486,77 @@ def tick():
         return {'status': 'held', 'reason': 'managed_engine_sync_failed'}
 
 
+def launcher_metadata(provider, bundle=None):
+    args = (bundle or {}).get('args') or []
+    model = None
+    effort = None
+    if '--model' in args:
+        idx = args.index('--model')
+        if idx + 1 < len(args):
+            model = args[idx + 1]
+    if '--effort' in args:
+        idx = args.index('--effort')
+        if idx + 1 < len(args):
+            effort = args[idx + 1]
+    if provider == 'go':
+        return {
+            'launcher_provider': 'opencode',
+            'launcher_model': model or 'opencode-go/muse-spark-1.3-contributor',
+            'launcher_effort': effort,
+        }
+    elif provider == 'zai':
+        return {
+            'launcher_provider': 'zai',
+            'launcher_model': model or 'glm-5.3-flash',
+            'launcher_effort': effort or 'high',
+        }
+    elif provider == 'codex':
+        return {
+            'launcher_provider': 'codex',
+            'launcher_model': model or 'gpt-6.1-sol',
+            'launcher_effort': effort or 'high',
+        }
+    elif provider == 'claude':
+        return {
+            'launcher_provider': 'claude',
+            'launcher_model': model or 'sonnet',
+            'launcher_effort': effort or 'high',
+        }
+    elif provider == 'gemini':
+        return {
+            'launcher_provider': 'gemini',
+            'launcher_model': model or 'gemini-4-argon-high',
+            'launcher_effort': effort or 'high',
+        }
+    return {}
+
+
 def managed_subscriptions():
     state = read_json(root() / 'state.json', [])
-    return [{'service': b['provider'], 'account_label': b['label'], 'engine': PACKAGES[b['provider']][2], 'profile': 'hub-' + b['label'],
-             'admission_argv': module_command('admission', b['label'])} for b in state]
+    subs = []
+    for b in state:
+        bundle = None
+        try:
+            dest = root() / (b['label'] + '-' + b['revision'])
+            bundle = read_json(dest / 'bundle.json')
+        except Exception:
+            pass
+        meta = launcher_metadata(b['provider'], bundle)
+        sub = {
+            'service': b['provider'],
+            'account_label': b['label'],
+            'engine': PACKAGES[b['provider']][2],
+            'profile': 'hub-' + b['label'],
+            'admission_argv': module_command('admission', b['label']),
+        }
+        sub.update(meta)
+        subs.append(sub)
+    return subs
 
 
 def engine_environment(bundle, home, dest=None):
     dest = dest or Path(home).parent
-    env = {k: v for k, v in os.environ.items() if k not in ENV and k not in ('HUB_TOKEN', 'HUB_JOB_TOKEN')}
+    env = {k: v for k, v in os.environ.items() if k not in ENV and k not in ('HUB_TOKEN', 'HUB_JOB_TOKEN', 'HUB_CONFIG_FILE', 'AGENT_HUB_MANAGED_DIR', 'HUB_MANAGED_DIR')}
     env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / '.config'), XDG_DATA_HOME=str(home / '.local' / 'share'), XDG_STATE_HOME=str(home / '.local' / 'state'), CODEX_HOME=str(home / '.codex'), CLAUDE_CONFIG_DIR=str(home / '.claude'))
     if bundle.get('provider') == 'zai':
         env['CODEX_HOME'] = str(home / '.zcodex')
@@ -531,6 +600,74 @@ def quotas():
     return {'accounts': accounts}
 
 
+def check_codex_quota_gate(env):
+    """Enforce the mandatory >=15% weekly quota gate for OpenAI Codex before execution.
+
+    Fails closed with machine-safe reason codes; never leaks raw stdout/stderr.
+    """
+    try:
+        proc = subprocess.run(['quse', 'codex', '--json'], env=env, capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0 and not proc.stdout:
+            return False, 'quota_unavailable'
+        text = proc.stdout.lstrip()
+        idx = text.find('{')
+        if idx == -1:
+            return False, 'quota_unavailable'
+        data = json.loads(text[idx:])
+        codex_data = data.get('codex')
+        if not isinstance(codex_data, dict) or codex_data.get('status') != 'ok':
+            return False, 'quota_unavailable'
+        details = codex_data.get('details')
+        if not isinstance(details, dict) or details.get('limit_reached') is not False:
+            return False, 'quota_unavailable'
+        windows = codex_data.get('windows')
+        if not isinstance(windows, dict):
+            return False, 'quota_unavailable'
+
+        now = dt.datetime.now(dt.timezone.utc)
+        min_remaining = None
+        has_weekly = False
+
+        for win_name, win in windows.items():
+            if not isinstance(win, dict) or win.get('present') is False:
+                continue
+            if (win_name in ('5h', 'monthly')
+                    and win.get('percent_remaining') is None
+                    and win.get('reset_at') is None):
+                continue  # not applicable window for this plan
+
+            if win_name in ('7d', 'weekly'):
+                has_weekly = True
+
+            perc = win.get('percent_remaining')
+            if perc is None or isinstance(perc, bool) or not isinstance(perc, (int, float)) or not math.isfinite(perc):
+                return False, 'quota_unavailable'
+            reset_at = win.get('reset_at')
+            if not isinstance(reset_at, str):
+                return False, 'quota_unavailable'
+            try:
+                reset_text = reset_at[:-1] + '+00:00' if reset_at.endswith('Z') else reset_at
+                reset_dt = dt.datetime.fromisoformat(reset_text)
+                if reset_dt.tzinfo is None:
+                    return False, 'quota_unavailable'
+                if reset_dt <= now:
+                    return False, 'stale_window_evidence'
+            except Exception:
+                return False, 'quota_unavailable'
+
+            val = float(perc)
+            if min_remaining is None or val < min_remaining:
+                min_remaining = val
+
+        if not has_weekly or min_remaining is None:
+            return False, 'quota_unavailable'
+        if min_remaining <= 15.0:
+            return False, 'codex_reserve_15_percent_required'
+        return True, 'ok'
+    except Exception:
+        return False, 'quota_check_failed'
+
+
 def execute():
     label = sys.argv[1]
     if not LABEL.fullmatch(label):
@@ -548,15 +685,73 @@ def execute():
         command = engine_argv(b, dest)
         env = engine_environment(b, home, dest)
         argv = command + b['args'] + sys.argv[2:]
+        is_diagnostic = any(a in ('--version', '-v', '--help', '-h') for a in argv)
+        if b['provider'] == 'codex' and not is_diagnostic:
+            allowed, reason = check_codex_quota_gate(env)
+            if not allowed:
+                print(json.dumps({'provider': 'codex', 'launch_allowed': False, 'reason': reason}), file=sys.stderr)
+                sys.exit(75)
+        for var in ('HUB_CONFIG_FILE', 'HUB_TOKEN', 'HUB_JOB_TOKEN', 'AGENT_HUB_MANAGED_DIR', 'HUB_MANAGED_DIR'):
+            env.pop(var, None)
         os.execve(command[0], argv, env)
 
 
 def admission():
     label = sys.argv[1]
+    payload = {}
+    try:
+        if not sys.stdin.isatty():
+            raw_in = sys.stdin.read()
+            if raw_in and raw_in.strip():
+                payload = json.loads(raw_in)
+    except Exception:
+        payload = {}
     try:
         result = host_request('POST', '/api/engines/admission', {'label': label})
     except Exception:
         result = {'launch_allowed': False, 'profile_supported': False, 'account_label': label}
+
+    bundle = None
+    try:
+        with lock():
+            state = read_json(root() / 'state.json', [])
+            record = next((b for b in state if b['label'] == label), None)
+            if record:
+                dest = root() / (label + '-' + record['revision'])
+                bundle = read_json(dest / 'bundle.json')
+    except Exception:
+        pass
+
+    if bundle is None and result.get('launch_allowed'):
+        result['launch_allowed'] = False
+        result['profile_supported'] = False
+        result['reason'] = 'local_bundle_missing'
+
+    if isinstance(payload, dict) and bundle:
+        offered_profile = payload.get('profile')
+        expected_profile = 'hub-' + label
+        if offered_profile is not None and offered_profile != expected_profile:
+            result['launch_allowed'] = False
+            result['profile_supported'] = False
+            result['reason'] = 'profile_mismatch'
+        offered_account = payload.get('account')
+        if offered_account is not None and offered_account != label:
+            result['launch_allowed'] = False
+            result['reason'] = 'account_mismatch'
+        selection = payload.get('selection')
+        meta = launcher_metadata(bundle['provider'], bundle)
+        if isinstance(selection, dict):
+            sel_model = selection.get('model')
+            sel_effort = selection.get('effort')
+            if sel_model == meta.get('launcher_model') and sel_effort == meta.get('launcher_effort'):
+                result['model_supported'] = True
+                result['model'] = sel_model
+                result['effort'] = sel_effort
+            else:
+                result['model_supported'] = False
+                result['launch_allowed'] = False
+                result['reason'] = 'model_mismatch'
+
     print(json.dumps(result))
 
 
@@ -679,3 +874,18 @@ def command(args):
     if not args.file and args.provider == 'gemini':
         bundle['auth_method'] = 'machine-login'
     return bus._do_request('PUT', '/api/engines/' + bundle['label'], bundle)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) > 1 and sys.argv[1] in ('execute', 'admission', 'sync', 'quotas'):
+        handler_name = sys.argv[1]
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+        if handler_name == 'execute':
+            execute()
+        elif handler_name == 'admission':
+            admission()
+        elif handler_name == 'sync':
+            print(json.dumps(sync()))
+        elif handler_name == 'quotas':
+            print(json.dumps(quotas()))
+

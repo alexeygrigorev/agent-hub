@@ -98,15 +98,32 @@ def opencode_offer(offer_id, workspace_label, prompt, *, engine="opencode",
 
 
 def launcher_payload(target_cwd, goal, account_label, profile=None,
-                     timeout=1800):
-    """Exact maintained-launcher submit payload for an opencode headless run."""
+                     timeout=1800, model=OPENCODE_MODEL, provider=OPENCODE_PROVIDER):
+    """Exact maintained-launcher submit payload for a headless run."""
+    if not account_label or not isinstance(account_label, str):
+        raise ValueError("account_label is required")
+    from .provisioning import LABEL, root
+    payload = {
+        "goal": goal,
+        "owner": "hub-fleet",
+        "cwd": str(target_cwd),
+        "timeout": timeout,
+        "model_requirements": {
+            "providers": [provider],
+            "models": [model],
+        },
+        "account_label": account_label,
+        "profile": "model-task",
+    }
     if profile is not None:
-        raise ValueError("Headless provider profile is not qualified")
-    return {"goal": goal, "owner": "hub-fleet", "cwd": str(target_cwd),
-            "timeout": timeout,
-            "model_requirements": {"providers": [OPENCODE_PROVIDER],
-                                   "models": [OPENCODE_MODEL]},
-            "account_label": account_label, "profile": "model-task"}
+        if not isinstance(profile, str) or not LABEL.fullmatch(profile):
+            raise ValueError("Invalid profile label")
+        if profile != f"hub-{account_label}":
+            raise ValueError("Headless provider profile is not qualified")
+        payload["account_profile"] = profile
+        payload["provider_profile"] = profile
+        payload["managed_dir"] = str(root())
+    return payload
 
 
 def launcher_run_argv(launcher_argv, config_dir, task_id, target_cwd,
@@ -122,7 +139,7 @@ def launcher_run_argv(launcher_argv, config_dir, task_id, target_cwd,
                      "--tmpdir", str(Path(workspace) / ".local" / "tmp")]
 
 
-def validate_native_receipt(receipt):
+def validate_native_receipt(receipt, expected_engine="opencode", expected_profile=None):
     """Validate a launcher aplexer-backend JSON receipt (no fakes).
 
     Returns the native UUID string. Raises ValueError on anything incomplete.
@@ -135,6 +152,8 @@ def validate_native_receipt(receipt):
         raise ValueError("Native lifecycle receipt is incomplete")
     if details.get("first_action_verified") is not True:
         raise ValueError("Native lifecycle receipt is incomplete")
-    if details.get("engine") != "opencode":
-        raise ValueError("Native engine receipt mismatch (must be opencode)")
+    if expected_engine and details.get("engine") != expected_engine:
+        raise ValueError(f"Native engine receipt mismatch (must be {expected_engine})")
+    if expected_profile is not None and details.get("profile") != expected_profile:
+        raise ValueError(f"Native profile receipt mismatch (must be {expected_profile})")
     return native_id

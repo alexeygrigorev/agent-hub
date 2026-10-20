@@ -556,7 +556,7 @@ class Dispatcher:
             except Exception:
                 continue
 
-    def _record_running_launch(self, offer_id, task_id, workspace, engine, account, native_id, result_path, details):
+    def _record_running_launch(self, offer_id, task_id, workspace, engine, account, native_id, result_path, details, profile=None):
         from .native_sessions import NativeTarget, SessionControlError
         from . import private_fs
 
@@ -609,6 +609,7 @@ class Dispatcher:
             "workspace": target.workspace,
             "engine": target.engine,
             "account": account,
+            "profile": profile,
             "native_id": target.session_id,
             "tag": target.tag,
             "incarnation": target.created_at_ms,
@@ -1047,13 +1048,17 @@ class Dispatcher:
                 argv = list(prefix) + argv
             cwd = None
         elif mode == "headless":
-            # Provider profiles are not launcher admission profiles. This
-            # backend currently qualifies only the default provider profile.
-            if sub.get("profile") is not None:
-                raise ValueError("Headless provider profile is not qualified")
+            profile = sub.get("profile")
+            if profile is not None:
+                if not isinstance(profile, str) or not LABEL.fullmatch(profile):
+                    raise ValueError("Invalid provider profile")
+                if not (profile == f"hub-{sub.get('account_label')}" or (hasattr(self, "_managed_labels") and sub.get("account_label") in self._managed_labels)):
+                    raise ValueError("Headless provider profile is not qualified")
             launcher = self.settings.get("launcher", {})
             if not all(launcher.get(k) for k in ["argv", "root", "config_dir"]) or not sub.get("launcher_provider") or not sub.get("launcher_model"):
                 raise ValueError("Maintained launcher route is not configured")
+            if sub.get("launcher_provider") not in {"opencode", "antigravity", "zai", "codex"}:
+                raise ValueError(f"Launcher provider {sub.get('launcher_provider')!r} is not supported for headless execution")
             # Only the maintained launcher may run models. argv is a trusted machine-local CLI prefix.
             prefix = launcher["argv"] + ["--config-dir", launcher["config_dir"]]
             task_id = "hub-" + offer_id
@@ -1081,6 +1086,11 @@ class Dispatcher:
             payload = {"goal": goal, "owner": "hub-fleet", "cwd": str(target_cwd), "timeout": 1800,
                        "model_requirements": {"providers": [sub["launcher_provider"]], "models": [sub["launcher_model"]]},
                        "account_label": sub["account_label"], "profile": "model-task"}
+            if profile is not None:
+                payload["account_profile"] = profile
+                payload["provider_profile"] = profile
+                from . import provisioning
+                payload["managed_dir"] = str(provisioning.root())
             submit_argv = prefix + ["submit", "--id", task_id, "--key", task_id, "--paths", str(result_path), "--payload", json.dumps(payload), "--json"]
             self.runner(submit_argv, cwd=launcher["root"])
             plan = self.runner(prefix + ["plan", "--id", task_id], cwd=launcher["root"])
@@ -1107,10 +1117,10 @@ class Dispatcher:
                 return True
             if not isinstance(eligible, list) or not any(_plan_match(r) for r in eligible):
                 raise ValueError("Maintained launcher plan refused")
-            # OpenCode and Antigravity use the maintained native backend:
+            # OpenCode, Antigravity, ZAI, and named-profile Codex use the maintained native backend:
             # real engine/UUID plus validated first action for Hub binding.
-            # Other providers retain their existing task-unit semantics.
-            if sub.get("launcher_provider") in {"opencode", "antigravity", "zai"}:
+            # Other unprofiled providers retain their existing task-unit semantics.
+            if sub.get("launcher_provider") in {"opencode", "antigravity", "zai"} or (sub.get("launcher_provider") == "codex" and sub.get("profile") is not None):
                 argv = prefix + ["run", "--backend", "aplexer",
                                  "--id", task_id, "--cwd", str(workspace),
                                  "--tmpdir", str(workspace / ".local" / "tmp")]
@@ -1133,9 +1143,9 @@ class Dispatcher:
                 result = {"state": "running", "native_id": native_id}
             else:
                 details = receipt.get("receipt", {})
-                if sub.get("launcher_provider") in {"opencode", "antigravity", "zai"}:
-                    # Opencode binds real M12 sessions only: a genuine native
-                    # UUID is required; task-units unit_name/worker_id names
+                if sub.get("launcher_provider") in {"opencode", "antigravity", "zai"} or (sub.get("launcher_provider") == "codex" and sub.get("profile") is not None):
+                    # Opencode, Antigravity, ZAI, and named-profile Codex bind real M12 sessions only:
+                    # a genuine native UUID is required; task-units unit_name/worker_id names
                     # can never bind or control a session.
                     session_id = details.get("session_id")
                     native_id = session_id if isinstance(session_id, str) and session_id else None
@@ -1153,6 +1163,25 @@ class Dispatcher:
                             or details.get("workspace") != str(workspace)
                             or details.get("tag") != "task-" + task_id):
                         raise ValueError("Native ZCodex receipt mismatch")
+                if sub.get("launcher_provider") == "codex" and sub.get("profile") is not None:
+                    try:
+                        if str(uuid.UUID(native_id)) != native_id.lower() or uuid.UUID(native_id).version != 4:
+                            raise ValueError("Noncanonical native UUID")
+                    except (ValueError, TypeError, AttributeError):
+                        raise ValueError("Native Codex UUID required") from None
+                    if (details.get("engine") != "codex" or offer.get("engine") != "codex"
+                            or details.get("workspace") != str(workspace)
+                            or details.get("tag") != "task-" + task_id):
+                        raise ValueError("Native Codex receipt mismatch")
+                if sub.get("profile") is not None:
+                    rec_profile = details.get("profile")
+                    if not rec_profile or rec_profile != sub["profile"]:
+                        raise ValueError("Native profile receipt mismatch")
+                if "account_label" in details:
+                    if details.get("account_label") != sub["account_label"]:
+                        raise ValueError("Native account receipt mismatch")
+                elif sub.get("profile") is not None:
+                    raise ValueError("Native account receipt mismatch")
                 if type(details.get('exit_code')) is int:
                     result = {'state': 'exited' if details['exit_code'] == 0 else 'failed', 'confirmed_exit': True, 'native_id': native_id, 'launcher_task_id': task_id}
                 elif details.get('state') == 'running' and details.get('first_action_verified') is True:
@@ -1171,6 +1200,7 @@ class Dispatcher:
                     native_id=native_id,
                     result_path=result_path,
                     details=details,
+                    profile=offer.get("profile") or sub.get("profile"),
                 )
         except Exception as exc:
             # Effect may have happened: hold capacity and require reconciliation.

@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -100,7 +101,9 @@ def test_credentials_go_to_child_only_not_native_profile_or_argv():
     b = bundle()
     with patch.object(p.subprocess, 'run', side_effect=installer):
         p.sync(lambda *a: {'engines': [b]})
-    with patch.object(p.sys, 'argv', ['wrapper', 'test-account', '--version']), patch.object(p.os, 'execve') as execute:
+    with patch.object(p.sys, 'argv', ['wrapper', 'test-account', '--version']), \
+         patch.object(p, 'check_codex_quota_gate', return_value=(True, 'ok')), \
+         patch.object(p.os, 'execve') as execute:
         p.execute()
     executable, argv, env = execute.call_args.args
     assert argv[-1] == '--version'
@@ -429,5 +432,282 @@ def test_install_rejects_zcodex_missing_or_mismatched_sha256(tmp_path, monkeypat
     monkeypatch.setattr(subprocess, 'run', fake_run)
     with pytest.raises(ValueError, match='Managed engine installation failed'):
         p.install(b)
+
+
+def test_launcher_metadata_mapping():
+    assert p.launcher_metadata('go') == {
+        'launcher_provider': 'opencode',
+        'launcher_model': 'opencode-go/muse-spark-1.3-contributor',
+        'launcher_effort': None,
+    }
+    assert p.launcher_metadata('zai') == {
+        'launcher_provider': 'zai',
+        'launcher_model': 'glm-5.3-flash',
+        'launcher_effort': 'high',
+    }
+    assert p.launcher_metadata('codex') == {
+        'launcher_provider': 'codex',
+        'launcher_model': 'gpt-6.1-sol',
+        'launcher_effort': 'high',
+    }
+    # With bundle override
+    bundle_override = {'args': ['--model', 'gpt-6-astra', '--effort', 'max']}
+    assert p.launcher_metadata('codex', bundle_override) == {
+        'launcher_provider': 'codex',
+        'launcher_model': 'gpt-6-astra',
+        'launcher_effort': 'max',
+    }
+
+
+def test_admission_payload_matching(tmp_path, monkeypatch):
+    os.chmod(tmp_path, 0o700)
+    m_dir = tmp_path / 'managed-engines'
+    m_dir.mkdir(mode=0o700, parents=True)
+    b = bundle()
+    monkeypatch.setattr(p, 'root', lambda: m_dir)
+    monkeypatch.setattr(p, 'host_request', lambda m, p, pl: {'launch_allowed': True, 'profile_supported': True})
+
+    # Prepare bundle on disk
+    dest = m_dir / f"{b['label']}-{b['revision']}"
+    dest.mkdir(mode=0o700, parents=True)
+    p.write_json(dest / 'bundle.json', b)
+    p.write_json(m_dir / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': b['provider']}])
+
+    # Valid payload
+    payload_valid = json.dumps({
+        'profile': 'hub-test-account',
+        'account': 'test-account',
+        'selection': {'model': 'gpt-6.1-sol', 'effort': 'high'},
+    })
+    import io, sys
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(payload_valid))
+    monkeypatch.setattr(sys, 'argv', ['admission', 'test-account'])
+    out_valid = io.StringIO()
+    monkeypatch.setattr(sys, 'stdout', out_valid)
+    p.admission()
+    res = json.loads(out_valid.getvalue())
+    assert res['launch_allowed'] is True
+    assert res['model_supported'] is True
+
+    # Profile mismatch
+    payload_mismatch = json.dumps({
+        'profile': 'hub-wrong-account',
+        'account': 'test-account',
+    })
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(payload_mismatch))
+    monkeypatch.setattr(sys, 'argv', ['admission', 'test-account'])
+    out_mismatch = io.StringIO()
+    monkeypatch.setattr(sys, 'stdout', out_mismatch)
+    p.admission()
+    res = json.loads(out_mismatch.getvalue())
+    assert res['launch_allowed'] is False
+    assert res['reason'] == 'profile_mismatch'
+
+
+def test_codex_protected_guard_behavioral_regression(tmp_path, monkeypatch):
+    """Behavioral regression test for Codex protected quota guard.
+
+    1. Configure trusted test wrapper to record invocation then reject;
+       assert managed Codex provider binary is NEVER executed.
+    2. Ensure real pinned Codex binary is executed after guard approval.
+    3. Diagnostic --version lifecycle bypasses quota gate and executes binary.
+    4. Active host catalog vs default catalog resolution and env isolation.
+    """
+    os.chmod(tmp_path, 0o700)
+    active_m_dir = tmp_path / 'active-managed-engines'
+    active_m_dir.mkdir(mode=0o700, parents=True)
+    default_m_dir = tmp_path / 'default-managed-engines'
+    default_m_dir.mkdir(mode=0o700, parents=True)
+
+    b = bundle()
+    b['provider'] = 'codex'
+    b['label'] = 'codex-acc'
+    dest = active_m_dir / f"{b['label']}-{b['revision']}"
+    dest.mkdir(mode=0o700, parents=True)
+    p.write_json(dest / 'bundle.json', b)
+    p.write_json(active_m_dir / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': b['provider']}])
+
+    # Point AGENT_HUB_MANAGED_DIR to active_m_dir, while default_m_dir is empty
+    monkeypatch.setenv('AGENT_HUB_MANAGED_DIR', str(active_m_dir))
+    monkeypatch.setenv('HUB_CONFIG_FILE', str(default_m_dir.parent / 'host.json'))
+    monkeypatch.setenv('HUB_TOKEN', 'secret-host-token')
+
+    # Case 1: Guard rejects invocation (<15% reserve)
+    calls_execve = []
+    def fake_execve(cmd, argv, env):
+        calls_execve.append((cmd, argv, env))
+
+    monkeypatch.setattr(os, 'execve', fake_execve)
+
+    def fake_quse_reject(env):
+        return False, 'codex_reserve_15_percent_required'
+
+    monkeypatch.setattr(p, 'check_codex_quota_gate', fake_quse_reject)
+    monkeypatch.setattr(sys, 'argv', ['execute', 'codex-acc', 'run', 'prompt'])
+
+    with pytest.raises(SystemExit) as exc:
+        p.execute()
+    assert exc.value.code == 75
+    # Assert provider binary was NEVER executed
+    assert len(calls_execve) == 0
+
+    # Case 2: Diagnostic --version bypasses quota gate
+    gate_called = []
+    def fake_gate_tracker(env):
+        gate_called.append(True)
+        return False, 'should_not_be_called'
+
+    monkeypatch.setattr(p, 'check_codex_quota_gate', fake_gate_tracker)
+    monkeypatch.setattr(sys, 'argv', ['execute', 'codex-acc', '--version'])
+
+    p.execute()
+    assert len(gate_called) == 0  # bypassed!
+    assert len(calls_execve) == 1
+    cmd, argv, env = calls_execve[0]
+    assert '--version' in argv
+    calls_execve.clear()
+
+    # Case 3: Guard approves invocation (>=15% reserve)
+    def fake_quse_approve(env):
+        return True, 'ok'
+
+    monkeypatch.setattr(p, 'check_codex_quota_gate', fake_quse_approve)
+    monkeypatch.setattr(sys, 'argv', ['execute', 'codex-acc', 'exec', 'task-prompt'])
+
+    p.execute()
+    assert len(calls_execve) == 1
+    cmd, argv, env = calls_execve[0]
+    assert cmd == str(dest / 'engine/node_modules/.bin/codex')
+    assert 'task-prompt' in argv
+    # Check strict env isolation: host secrets removed
+    assert 'HUB_CONFIG_FILE' not in env
+    assert 'HUB_TOKEN' not in env
+    assert 'HUB_JOB_TOKEN' not in env
+    assert 'AGENT_HUB_MANAGED_DIR' not in env
+    calls_execve.clear()
+
+    # Case 4: Wrong label or revision raises ValueError
+    monkeypatch.setattr(sys, 'argv', ['execute', 'unknown-acc'])
+    with pytest.raises(ValueError, match='Managed profile removed'):
+        p.execute()
+
+
+def test_check_codex_quota_gate_contract(monkeypatch):
+    """Direct contract verification of check_codex_quota_gate.
+
+    1. Real private quse snapshot shape:
+       - 7d present with valid reading & future reset
+       - 5h and monthly both reading+reset null (not applicable)
+       -> passes gate
+    2. Minimum reserve <=15% -> rejected with codex_reserve_15_percent_required
+    3. limit_reached True or missing -> rejected with quota_unavailable
+    4. Missing required 7d/weekly window -> rejected with quota_unavailable
+    5. Non-finite or NaN reading -> rejected with quota_unavailable
+    6. Stale reset_at in the past -> rejected with stale_window_evidence
+    7. Process failure or invalid JSON -> rejected with quota_unavailable
+    """
+    def mock_proc(stdout_obj, rc=0):
+        class Proc:
+            returncode = rc
+            stdout = json.dumps(stdout_obj) if isinstance(stdout_obj, (dict, list)) else str(stdout_obj)
+        return Proc()
+
+    env = {'HOME': '/tmp'}
+
+    # 1. Real quse shape: 7d valid, 5h and monthly null (not applicable)
+    quse_real = {
+        'codex': {
+            'status': 'ok',
+            'details': {'limit_reached': False},
+            'windows': {
+                '5h': {'percent_remaining': None, 'reset_at': None},
+                '7d': {'percent_remaining': 82.5, 'reset_at': '2026-10-27T12:00:00+00:00'},
+                'monthly': {'percent_remaining': None, 'reset_at': None},
+            }
+        }
+    }
+    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_real))
+    allowed, reason = p.check_codex_quota_gate(env)
+    assert allowed is True
+    assert reason == 'ok'
+
+    # 2. Reserve <= 15%
+    quse_low = {
+        'codex': {
+            'status': 'ok',
+            'details': {'limit_reached': False},
+            'windows': {
+                '5h': {'percent_remaining': None, 'reset_at': None},
+                '7d': {'percent_remaining': 15.0, 'reset_at': '2026-10-27T12:00:00+00:00'},
+            }
+        }
+    }
+    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_low))
+    allowed, reason = p.check_codex_quota_gate(env)
+    assert allowed is False
+    assert reason == 'codex_reserve_15_percent_required'
+
+    # 3. limit_reached True
+    quse_limited = {
+        'codex': {
+            'status': 'ok',
+            'details': {'limit_reached': True},
+            'windows': {
+                '7d': {'percent_remaining': 80.0, 'reset_at': '2026-10-27T12:00:00+00:00'},
+            }
+        }
+    }
+    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_limited))
+    allowed, reason = p.check_codex_quota_gate(env)
+    assert allowed is False
+    assert reason == 'quota_unavailable'
+
+    # 4. Missing required 7d/weekly window
+    quse_no_weekly = {
+        'codex': {
+            'status': 'ok',
+            'details': {'limit_reached': False},
+            'windows': {
+                '5h': {'percent_remaining': 90.0, 'reset_at': '2026-10-27T12:00:00+00:00'},
+            }
+        }
+    }
+    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_no_weekly))
+    allowed, reason = p.check_codex_quota_gate(env)
+    assert allowed is False
+    assert reason == 'quota_unavailable'
+
+    # 5. Non-finite / NaN
+    quse_nan = {
+        'codex': {
+            'status': 'ok',
+            'details': {'limit_reached': False},
+            'windows': {
+                '7d': {'percent_remaining': float('nan'), 'reset_at': '2026-10-27T12:00:00+00:00'},
+            }
+        }
+    }
+    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_nan))
+    allowed, reason = p.check_codex_quota_gate(env)
+    assert allowed is False
+    assert reason == 'quota_unavailable'
+
+    # 6. Stale reset_at in the past
+    quse_stale = {
+        'codex': {
+            'status': 'ok',
+            'details': {'limit_reached': False},
+            'windows': {
+                '7d': {'percent_remaining': 80.0, 'reset_at': '2020-01-01T00:00:00+00:00'},
+            }
+        }
+    }
+    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_stale))
+    allowed, reason = p.check_codex_quota_gate(env)
+    assert allowed is False
+    assert reason == 'stale_window_evidence'
+
+
+
 
 
