@@ -49,7 +49,9 @@ fi
 
 echo "=== 5/6: Python Discovery Suite (disposable HOME, CI-matched env) ==="
 DTC_AUTH_PATH="${DTC_AUTH_HOME:-/home/alexey/git/auth}"
-PYTEST_BIN="${PYTEST_BIN:-/home/alexey/.local/bin/pytest}"
+# Resolve the published native client from uv.lock; pytest is a test-only overlay.
+uv sync --frozen || exit 1
+UV_BIN="$(command -v uv)"
 ORIGINAL_USER_BASE="${PYTHONUSERBASE:-}"
 if [ -z "${ORIGINAL_USER_BASE}" ]; then
   # `python -m site --user-base` prints the path but exits 1 when user-site
@@ -62,7 +64,7 @@ HOME="${DISPOSABLE_HOME}" \
 PYTHONUSERBASE="${ORIGINAL_USER_BASE}" \
 DTC_AUTH_HOME="${DTC_AUTH_PATH}" \
 PYTHONPATH="host:host/tests" \
-"${PYTEST_BIN}" -q || PYTEST_RC=$?
+"${UV_BIN}" run --frozen --with pytest python -m pytest -q || PYTEST_RC=$?
 
 if [ "${PYTEST_RC}" -ne 0 ]; then
   echo "FAIL: Python discovery suite exited with code ${PYTEST_RC}"

@@ -1,0 +1,27 @@
+version = 1
+revision = 3
+requires-python = ">=3.11"
+
+[options]
+exclude-newer = "2026-10-20T00:00:00Z"
+
+[[package]]
+name = "agent-hub-host"
+version = "0.2.0"
+source = { editable = "." }
+dependencies = [
+    { name = "aplexer-client" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "aplexer-client", specifier = "==0.1.19" }]
+
+[[package]]
+name = "aplexer-client"
+version = "0.1.19"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6d/1c/d4c5b8fbc3d2f14b92069cc409a2b793781d96c8c0ba1df6e5b91c193e24/aplexer_client-0.1.19-cp311-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:c779d87d5d6c8ae28c254a0bb5da369a3b1581bec34d737e28f6682e08857746", size = 1407260, upload-time = "2026-10-18T09:40:06.787Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/84/c06a61492bd47bdaf3ff124f5a5498726496ed8397339a3d20abcb97dddd/aplexer_client-0.1.19-cp311-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:73bd646c4c4c51773a3c159888bd38e71dd171be311ca58f9f19f3702f9aa504", size = 1448221, upload-time = "2026-10-18T09:40:08.44Z" },
+    { url = "https://files.pythonhosted.org/packages/3e/c8/64f9f1261ab5f7126d61540526fea1622cdf1ee6c7ccdf1367c16d47e9c8/aplexer_client-0.1.19-cp311-abi3-win_amd64.whl", hash = "sha256:a01d07d98f9a60e6e023eabb6a7efe69b1081ea1f74e1a7356ae70baeb476566", size = 1248315, upload-time = "2026-10-18T09:40:09.793Z" },
+]

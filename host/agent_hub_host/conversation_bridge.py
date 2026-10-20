@@ -57,13 +57,18 @@ def segment(value):
 
 
 class NativeMailbox:
-    """Installed CLI only; ambient genuine binding is never replaced or supplied."""
+    """Client catalog + native mailbox CLI; preserve ambient genuine binding."""
     def __init__(self, executable='aplexer'):
         self.executable = executable
 
     def call(self, *args):
-        result = subprocess.run([self.executable, '--json', *args], capture_output=True,
-                                text=True, timeout=30, check=True)
+        from .aplexer_client import client_call
+        result = client_call(self.executable, [*args, '--json'])
+        if result is None:
+            result = subprocess.run([self.executable, '--json', *args], capture_output=True,
+                                    text=True, timeout=30, check=True)
+        elif result.returncode:
+            raise BridgeCapabilityGap('Native client operation failed')
         if len(result.stdout.encode()) > 16 * 1024 * 1024:
             raise BridgeCapabilityGap('Native response exceeds bridge bound')
         return json.loads(result.stdout)

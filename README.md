@@ -185,3 +185,53 @@ TMPDIR="$HOME/tmp-root" python3 scripts/test-session-clients-live.py \
 ```
 
 The driver uses the same human bearer, submits keyed operations through both interfaces, and checks they refer to the same session and commands. It requires a genuine bound native UUID, the correlated reply digest, a nonempty capture from that UUID, and acknowledged stop plus stopped state through both clients. Credentials and capture output remain in private evidence. Native ZAI control additionally requires the maintained Launcher version that injects first-action validation and declares `--engine zcodex`; its operator-configured route must use the real ZAI account/model and fresh admission evidence. Task-unit identifiers never qualify as native session bindings.
+
+### Aplexer Python client and experimental overrides
+
+The host package (0.2+) requires Python 3.11+ and uses the published
+[`aplexer-client`](https://pypi.org/project/aplexer-client/) package, imported as
+`from aplexer import Client`. The PyPI package named `aplexer` distributes the CLI
+binary separately. Install the production dependency versions with uv:
+
+```bash
+uv sync --frozen
+uv run --frozen hub --help
+```
+
+Use uv's temporary dependency overlay for a local experimental client, without
+editing `pyproject.toml` or `uv.lock`:
+
+```bash
+uv run --frozen --with ~/git/aplexer/python hub --help
+# Editable source (native Rust changes still require rebuilding the extension):
+uv run --frozen --with-editable ~/git/aplexer/python hub --help
+# Or a prebuilt wheel matching this machine's Python/platform:
+uv run --frozen --with /absolute/path/aplexer_client-0.1.19-cp311-abi3-manylinux_2_28_x86_64.whl hub --help
+```
+
+The session-host supervisor propagates its own Python interpreter to its native
+host child, so start the supervisor using the uv environment too.
+
+The same prefix works for host modules, e.g. `uv run --frozen --with
+~/git/aplexer/python python -m agent_hub_host.session_host ...`. Source installs
+require Rust and maturin's build prerequisites; wheels avoid a local Rust build.
+Dropping `--with` restores the locked published client on the next invocation.
+`uv run --frozen --with ~/git/aplexer/python python -c 'import aplexer;
+print(aplexer.__file__)'` shows which client is active.
+
+Core session listing, status, bounded history capture, stop and unwrapped Fleet
+starts use the Client API. Hub's identity/generation checks and quota launcher
+admission still apply. Mailbox operations (`message send/log/deliver`, `whoami`),
+the mailbox bridge's paired status/rendered screen readiness check and starts wrapped in `native_start_argv` (for example
+`systemd-run`) retain the native CLI because the Client does not expose these
+protocols, CLI readiness enrichment or process wrappers. The bounded streaming
+health probe also retains its CLI timeout/output enforcement. An explicit `aplexer_bin` path also retains that
+binary transport, independently of the Python client override. There is no CLI
+retry after a Client error; callers must reconcile uncertain effects.
+
+The portable CLI zipapp keeps its native CLI transport when the Python client
+is absent, so clean-machine installers and host bootstrap keep working. To use
+the Client API from the zipapp, run it under `uv run --no-project --with
+aplexer-client==0.1.19 python /path/to/hub.pyz ...`, or use the uv project install
+above. This release changes host/CLI code only; it requires updating the host
+package/environment, with no Worker deployment.

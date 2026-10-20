@@ -161,6 +161,14 @@ def load_settings(path=None):
 
 def run_json(argv, *, payload=None, cwd=None, timeout=30):
     """No shell, no provider stdout/stderr in exceptions or logs."""
+    from .aplexer_client import client_call
+    native = client_call(argv[0], argv[1:]) if payload is None else None
+    if native is not None:
+        if native.returncode:
+            raise RuntimeError("Native client operation failed; reconcile effects")
+        if len(native.stdout.encode("utf-8")) > 8 * 1024 * 1024:
+            raise RuntimeError("Native client response exceeds bound; reconcile effects")
+        return json.loads(native.stdout)
     import threading
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd)
     overflow = threading.Event()

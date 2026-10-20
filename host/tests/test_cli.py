@@ -130,7 +130,8 @@ class TestCliIsolated(unittest.TestCase):
             timeout=10,
         )
         self.assertEqual(res.returncode, 0)
-        self.assertIn("0.1.0", res.stdout)
+        from agent_hub_host import __version__
+        self.assertIn(__version__, res.stdout)
         self.assertIn("(", res.stdout)
         self.assertIn(")", res.stdout)
 
@@ -139,7 +140,8 @@ class TestCliUpdate(unittest.TestCase):
     def test_version_formatting(self):
         from agent_hub_host import cli, session_control
         v_str = cli.format_version()
-        self.assertTrue(v_str.startswith("0.1.0 ("))
+        from agent_hub_host import __version__
+        self.assertTrue(v_str.startswith(__version__ + " ("))
         self.assertTrue(v_str.endswith(")"))
 
     def test_auth_status_explains_unsafe_profile_permissions(self):

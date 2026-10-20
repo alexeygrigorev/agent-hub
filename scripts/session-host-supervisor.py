@@ -6,6 +6,7 @@ import os
 import pathlib
 import signal
 import subprocess
+import sys
 import threading
 import uuid
 
@@ -39,7 +40,7 @@ def main():
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
-    command = ['/usr/bin/python3', '-u', '-m', 'agent_hub_host.session_host',
+    command = [sys.executable, '-u', '-m', 'agent_hub_host.session_host',
                '--config', str(pathlib.Path(args.config).resolve(strict=True)),
                '--journal-dir', str(journal)]
     tag = 'hub-controller-' + uuid.uuid4().hex[:12]

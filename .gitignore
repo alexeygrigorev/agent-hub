@@ -17,3 +17,6 @@ host/build/
 public/cli/hub.pyz
 public/cli/hub.pyz.sha256
 public/cli/manifest.json
+
+# uv project environment
+.venv/

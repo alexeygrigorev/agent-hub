@@ -1,7 +1,8 @@
 """M12e host native session adapter: list / inbox delivery / bounded capture / confirmed stop.
 
-Genuine native protocols only (installed ``a``/``aplexer`` CLI, argv, no shell).
-Read-only with respect to all other hub source: this module wraps the native CLI and
+Genuine native protocols only (Python Client for core session operations;
+installed ``a``/``aplexer`` for CLI-only protocols, argv, no shell).
+Read-only with respect to all other hub source: this module wraps native transports and
 reuses :mod:`agent_hub_host.native_bridge` workspace helpers. It never starts sessions
 (start is owned by :mod:`agent_hub_host.session_executor` through the existing Fleet
 ``Dispatcher`` contract), never touches live sessions except the exact qualified target,
@@ -275,6 +276,13 @@ def run_native(
         raise SessionControlError("Sender identity override (--from) is forbidden")
     if "--pane" in args or "--no-ack" in args or "--enter" in args:
         raise SessionControlError("--pane/--no-ack/--enter transports are forbidden")
+    from .aplexer_client import client_call
+    native = client_call(executable, args)
+    if native is not None:
+        for stream in (native.stdout, native.stderr):
+            if len(stream.encode("utf-8", "replace")) > MAX_NATIVE_OUTPUT:
+                raise SessionUncertain("Native response exceeds bound; effect unknown")
+        return native
     try:
         proc = subprocess.run(
             [executable, *args],
