@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Engine accounts · Agent Hub</title><link rel="stylesheet" href="/vendor/dakit/dakit.css"><link rel="stylesheet" href="/engines.css"><script src="/engines.js" defer></script></head>
+<body><main class="engine-page"><p><a href="/fleet.html">← Fleet</a></p><h1>Engine accounts</h1>
+<p>Add an account once from the CLI. Its engine and profile appear on connected machines automatically.</p>
+<p><code>hub engines add --provider codex --label personal --auth-file ~/.codex/auth.json</code></p>
+<p><code>hub engines add --provider gemini --label google</code> installs Gemini everywhere; authorize each machine below through native Google sign-in.</p>
+<p id="status" role="status">Loading…</p><div id="accounts"></div><h2>Machine sign-ins</h2><div id="logins"></div>
+<p>Google authorization codes stay private and expire shortly. Complete the provider's consent yourself.</p></main></body></html>

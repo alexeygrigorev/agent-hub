@@ -380,6 +380,8 @@ class HostAgent:
             pass
 
     def _send_ws_heartbeat(self, ws) -> float:
+        from . import provisioning
+        provisioning.tick()
         running_ids = (
             self.dispatcher.get_running_job_ids()
             if self.dispatcher and hasattr(self.dispatcher, "get_running_job_ids")
@@ -398,6 +400,8 @@ class HostAgent:
             self.cfg = _host_cfg()
             self.base_url = self.cfg.get("base_url")
         register_machine(self.base_url)
+        from . import provisioning
+        provisioning.tick()
         self.cfg = _host_cfg()
         if not self.base_url:
             self.base_url = self.cfg.get("base_url")
@@ -483,6 +487,8 @@ class HostAgent:
                 pass
 
     def _poll_fallback(self):
+        from . import provisioning
+        provisioning.tick()
         self._tick_quota()
         target_base = self.base_url
         if not target_base:

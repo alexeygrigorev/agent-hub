@@ -62,10 +62,14 @@ def subscriptions_path():
 
 def load_settings(path=None):
     """Explicit non-secret machine configuration, including several accounts per service."""
+    default_path = path is None
     path = Path(path) if path else subscriptions_path()
-    if path.stat().st_size > 65536:
-        raise ValueError("Subscription configuration exceeds 64 KiB")
-    data = json.loads(path.read_text(encoding="utf-8"))
+    if default_path and not path.exists():
+        data = {'version': 1, 'subscriptions': [], 'workspaces': {'home': str(Path.home())}}
+    else:
+        if path.stat().st_size > 65536:
+            raise ValueError("Subscription configuration exceeds 64 KiB")
+        data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv", "role_consumer", "role_config"} or data.get("version") != 1:
         raise ValueError("Invalid subscription configuration")
     if "native_start_argv" in data:
@@ -146,6 +150,12 @@ def load_settings(path=None):
         raise ValueError('Invalid cleanup roots allowlist')
     if len(set(roots)) != len(roots):
         raise ValueError('Invalid cleanup roots allowlist')
+    from .provisioning import managed_subscriptions
+    managed = managed_subscriptions()
+    existing = {s['account_label'] for s in data['subscriptions']}
+    if any(s['account_label'] in existing for s in managed):
+        raise ValueError('Managed and local account labels collide')
+    data['subscriptions'].extend(managed)
     return data
 
 
@@ -428,6 +438,8 @@ class Dispatcher:
     """One finite poll. Claim ambiguity and effect ambiguity are never retried automatically."""
     def __init__(self, settings, request=bus._do_request, runner=run_json, role_config=None, role_config_path=None, journal_dir=None):
         self.settings, self.request, self.runner = settings, request, runner
+        from .provisioning import managed_subscriptions
+        self._managed_labels = {s['account_label'] for s in managed_subscriptions()}
         self.role_config = role_config
         self.role_config_path = role_config_path
         self.journal_dir = journal_dir or settings.get("journal_dir")
@@ -1208,6 +1220,11 @@ class Dispatcher:
         return {"id": offer_id, **result}
 
     def once(self):
+        from . import provisioning
+        provisioning.tick()
+        managed = provisioning.managed_subscriptions()
+        self.settings['subscriptions'] = [s for s in self.settings['subscriptions'] if s['account_label'] not in self._managed_labels] + managed
+        self._managed_labels = {s['account_label'] for s in managed}
         from . import api, system
         info = system.get_system_info()
         caps = info['capabilities']

@@ -83,6 +83,7 @@ export default {
     const PRIVATE_ASSETS = [
       '/', '/index.html',
       '/fleet.html', '/fleet.js', '/fleet.css',
+      '/engines.html', '/engines.js', '/engines.css',
       '/conversations.html', '/conversations.js', '/conversations.css',
       '/metrics', '/metrics.html', '/metrics.js', '/metrics.css',
       '/usage', '/usage.html',

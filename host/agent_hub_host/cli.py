@@ -358,10 +358,13 @@ def main():
     quota_cmd.add_commands(sub)
     from . import metrics as metrics_cmd
     metrics_cmd.add_commands(sub)
+    from . import provisioning
+    provisioning.add_commands(sub)
     add_bridge_resume_command(sub)
 
     for command in ('start-agent', 'start-session', 'plan-agent'):
         launch = sub.add_parser(command, help='Queue a headless agent or a real interactive session')
+        launch.add_argument('--account', help='Exact central account/profile label (shared quota across machines)')
         launch.add_argument('--machine', required=command == 'start-session')
         launch.add_argument('--engine', help='Engine override (requires --reason; default start is policy-driven)')
         launch.add_argument('--reason', help='Required explanation why this specific model/engine must be chosen')
@@ -488,6 +491,13 @@ def main():
     p_bridge.add_argument("--service-session-id", default=None)
 
     args = parser.parse_args()
+    if args.cmd == 'engines':
+        try:
+            print(json.dumps(provisioning.command(args)))
+        except Exception:
+            print('Hub engine operation failed; check authentication, bundle permissions and host prerequisites.', file=sys.stderr)
+            sys.exit(1)
+        return
     if args.cmd == 'update':
         cmd_update(args)
         return
@@ -582,6 +592,7 @@ def main():
                 payload = {'mode': 'interactive' if args.cmd == 'start-session' else 'headless', 'workspace': args.workspace,
                            'summary': args.summary, 'idempotency_key': args.key or str(uuid.uuid4())}
                 if args.machine: payload['machine'] = args.machine
+                if args.account: payload['account'] = args.account
                 if getattr(args, 'tier', None): payload['tier'] = args.tier
                 if getattr(args, 'engine', None):
                     reason = getattr(args, 'reason', None)

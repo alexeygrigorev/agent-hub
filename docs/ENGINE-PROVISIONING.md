@@ -1,0 +1,248 @@
+# Add an engine account once
+
+The Hub stores managed engine accounts centrally. On the next heartbeat (normally
+60 seconds), every enrolled machine running the current Hub host component installs
+the pinned engine and a native `hub-<label>` aplexer profile. New machines receive
+the same accounts. Removing an account withdraws its Hub routes immediately and
+removes its profiles, engine files and delivered credentials on each machine's next
+successful heartbeat. Offline machines reconcile when they reconnect.
+
+## Machine prerequisites and installation
+
+Linux machines need Python 3.9+, Node.js 22+ with npm, and a working `aplexer` binary
+on PATH. Install the host under the same OS user that runs aplexer:
+
+```bash
+curl -fsSL https://hub.dtcdev.click/cli/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+hub login https://hub.dtcdev.click --kind host
+# Approve the displayed pairing once in the Hub browser UI.
+hub run
+```
+
+Keep `hub run` running with the machine's existing service manager. There is no
+new timer or service installed by account addition. Existing hosts must upgrade
+their Hub component (`hub update`) and restart their Hub host process once to load
+this feature. Source-package installations can instead use the existing documented
+virtual environment installation in [DEPLOY.md](DEPLOY.md).
+
+The host daemon syncs at startup and each heartbeat. `hub engines sync` forces an
+immediate sync using the host credential, even when a human CLI profile is also
+logged in. Machine enrollment authorizes that machine to receive **all** managed
+bundles: enroll only trusted machines. Revoking a machine stops subsequent secret
+delivery; it cannot erase credentials from an offline machine or recall credentials
+already held by running processes. Revoke provider credentials separately if needed.
+
+## Add or update an account
+
+Authenticate the operator CLI once with `hub auth login`. Import an existing
+native account in one command (its auth file must be private):
+
+```bash
+hub engines add --provider codex --label work-codex --auth-file "$HOME/.codex/auth.json"
+```
+
+Use `--config-file` to include the native config, or `--version` to select another
+exact engine version. `go` accepts the same native-file import; Claude uses `--token-file` and Gemini uses machine login as described below.
+For custom environment authentication or several config files, prepare a private JSON
+file in a directory with mode 0700; the file must be mode 0600. For a Codex account,
+the bundle has this shape (replace the synthetic value locally):
+
+```json
+{
+  "label": "work-codex",
+  "provider": "codex",
+  "version": "0.163.0",
+  "files": {".codex/auth.json": "<contents of your account's auth.json>"},
+  "env": {},
+  "args": []
+}
+```
+
+A local Python command can build the private bundle without displaying credentials:
+
+```bash
+mkdir -p -m 700 "$HOME/.config/agent-hub/import"
+python3 - <<'PY'
+import json, os
+from pathlib import Path
+account = Path.home() / '.codex/auth.json'
+target = Path.home() / '.config/agent-hub/import/work-codex.json'
+payload = {'label': 'work-codex', 'provider': 'codex', 'version': '0.163.0',
+           'files': {'.codex/auth.json': account.read_text()}, 'env': {}, 'args': []}
+fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, 'w') as out:
+    json.dump(payload, out)
+PY
+hub engines add --file "$HOME/.config/agent-hub/import/work-codex.json"
+```
+
+The add command is the only account-add operation. Re-running it rotates the entire bundle
+and causes each machine to replace its installation. `hub engines list` shows
+public metadata and acknowledged installation revisions, never credentials.
+
+Supported npm engines: `codex` (`@openai/codex`), `claude`
+(`@anthropic-ai/claude-code`), `gemini` (`@google/gemini-cli`), and `go`
+(`opencode-ai`). Versions must be exact semver; arbitrary packages and install
+scripts are refused. Provider config and auth files belong in `files`, with paths
+relative to the account's isolated HOME. Environment authentication is also supported
+via the bounded provider-specific names in `env`; do not put secrets in `args`.
+OpenCode `args` must be exactly
+`["--model", "opencode-go/muse-spark-1.3-contributor"]` (an optional final `--version` is accepted for diagnostic-only starts).
+
+Z.ai's required zcodex/ZCode runtime has no supported npm distribution in this
+installer; automatic installation of that engine is not qualified. Existing local
+Z.ai profiles are preserved. Windows provisioning has not been accepted; the Docker
+acceptance test covers Linux only.
+
+Once installed, a local session uses `aplexer start --profile hub-work-codex`.
+Existing Hub interactive placement uses the registered engine/account/profile
+route and the configured workspace mapping. The server quota collector discovers managed accounts with `hub engines quota`,
+which probes each isolated account and returns only sanitized metadata. Quota and resource admission still
+apply; installation does not prove model access or grant quota. Named-profile
+headless execution retains the existing launcher's hold until that adapter is
+qualified. This feature does not bypass that hold.
+
+## Remove
+
+```bash
+hub engines remove work-codex
+hub engines list
+```
+
+Only managed account data is removed. Existing native profiles outside the
+`# BEGIN HUB MANAGED ENGINES` block, unrelated sessions and local accounts are
+preserved. A managed-name collision fails closed. Removal does not terminate
+already-running sessions.
+
+## Credential handling
+
+Bundles use AES-256-GCM with random nonces and label/revision authenticated data.
+The key is derived with HKDF-SHA256 from the existing Worker `SESSION_SECRET`,
+with a separate provisioning context. SQLite stores ciphertext, never plaintext
+bundles. Rotating `SESSION_SECRET` requires re-adding the managed bundles; retain
+the old key securely for recovery until replacement is complete.
+
+Only current approved host credential families can fetch decrypted bundles over
+the existing HTTPS transport. Human listing and fleet/UI data contain no bundles.
+Host files use no-follow checks, owner-only directories and atomic mode-0600 writes.
+Engine installs run without credentials or install scripts. Native profile commands
+contain only public labels and the wrapper path; credentials enter only the engine
+child environment or its isolated HOME. No provider stdout/stderr is copied into
+installation errors. Engine credentials never enter aplexer profile TOML.
+
+## Automated Docker acceptance
+
+On Linux with Docker, npm dependencies installed, and a real compatible aplexer
+binary on PATH:
+
+```bash
+npm ci
+scripts/test-provisioning-docker.sh
+```
+
+`APLEXER_BINARY=/absolute/path/to/aplexer` selects an alternate binary. The script
+runs a local-only Worker fixture on exclusive loopback port 19487 and a clean,
+unprivileged Node/Python container with 1500 MiB memory and 256 tasks. The only
+copied host executable is aplexer; no host HOME, credentials or config is mounted.
+The container installs Hub via `/cli/install.sh`, uses real device enrollment and
+host registration, then keeps the installed machine daemon running. It centrally
+adds an engine, waits for automatic installation, starts a real aplexer session
+executing the installed Codex `--version`, removes the bundle, waits for automatic
+withdrawal and verifies credential deletion and start refusal. This proves native
+installation/start/removal without making a model request or spending credits.
+It does not claim a paid model inference completed. All credentials are synthetic.
+The script also verifies actual Claude, OpenCode and Gemini version sessions, including direct native-package binary selection with npm scripts disabled. The test fixture is separate from the production Worker entrypoint.
+
+## Provider authentication findings (20 October 2026)
+
+This feature is for the same subscription owner using their own trusted machines.
+It does not lend an account to another person or pool accounts to bypass limits.
+
+- **Codex:** [official authentication docs](https://learn.chatgpt.com/docs/auth#fallback-authenticate-locally-and-copy-your-auth-cache)
+  explicitly document copying the auth cache to a headless machine, including
+  Docker. Use the native private-file import. Device authentication is preferred
+  for a fresh login but is not stated as mandatory per machine.
+- **Claude Code:** [official authentication docs](https://code.claude.com/docs/en/authentication#generate-a-long-lived-token)
+  document `claude setup-token` for subscription-backed scripts/CI. Use that
+  portable token via a private file and `--token-file`; the convenience import
+  does not copy the refreshable `.credentials.json` cache.
+  [Consumer terms](https://www.anthropic.com/legal/consumer-terms) prohibit making
+  credentials or the account available to another person. Same-owner native CLI
+  automation uses the documented token mechanism; no third-party inference client
+  is substituted.
+- **Gemini:** [official authentication docs](https://geminicli.com/docs/get-started/authentication/)
+  document Google sign-in and a local cache, and separately support API keys.
+  [Terms and privacy guidance](https://geminicli.com/docs/resources/tos-privacy/)
+  require supported clients for Google subscription access. No express cache-copy
+  permission or separate-login mandate was found. The conservative choice here
+  is native login on each machine, with a Hub consent relay. No Google OAuth
+  cache is distributed and no subscription is converted to API billing. The
+  [official CLI source](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/code_assist/oauth2.ts)
+  implements a manual browser-link/authorization-code flow; this is not a
+  device-code protocol and the UI labels it accurately.
+- **OpenCode Go:** [official Go docs](https://opencode.ai/v2/docs/console/go/)
+  use an API key and restrict Go workspaces to one member.
+  [Terms](https://opencode.ai/legal/terms-of-service) restrict use to the owner's
+  internal use and prohibit multi-account circumvention. An existing owner's Go
+  key can be delivered to their native OpenCode clients; no purchase, extra
+  member or separate device subscription is created. This is an inference from
+  the documented portable-key mechanism, not an express multi-device guarantee.
+- **Z.ai/ZCode:** [official configuration docs](https://zcode.z.ai/en/docs/configuration)
+  describe Coding Plan account login and API-key connections. Automatic zcodex
+  runtime distribution and native account-login relay are not qualified here.
+  Existing Z.ai routes remain under their installed launcher. No GLM route is
+  substituted through OpenCode.
+
+For Gemini, run `hub engines add --provider gemini --label my-google`, then open
+[Engine accounts](https://hub.dtcdev.click/engines.html). Choose **Sign in with
+Google** for each installed machine, open the native provider link, complete
+consent and submit the returned authorization code. Hub encrypts that short-lived
+code for only the target machine; the host's native CLI exchanges it. Provider
+tokens stay on that machine. The login PTY has no disk transcript and never receives
+a model prompt. Successful login enables its route on the next heartbeat.
+
+The native-login relay is Linux-only and has bounded five-minute login processes.
+Its protocol and UI are tested with synthetic consent; no real Google consent is
+claimed. Existing per-provider credential expiry or provider revocation can require
+renewal. The current slice does not centralize Codex refresh-token rotations; if a
+copied cache stops refreshing, re-import its current cache once.
+
+## Multiple profiles and the same launch everywhere
+
+Each managed label is an account, with its own HOME, credential files, aplexer
+profile and shared Hub concurrency/quota pool. Add two Codex accounts under two
+labels; no default HOME or default account alias is used by either wrapper.
+
+```bash
+hub engines add --provider codex --label personal --auth-file "$HOME/.codex/auth.json"
+hub engines add --provider codex --label work --auth-file "$HOME/.codex-work/auth.json"
+hub start-session --machine MACHINE_A --workspace home --account personal
+hub start-session --machine MACHINE_B --workspace home --account work
+```
+
+The remote start commands use the existing Fleet host consumer and its trusted
+workspace mapping. Account pinning prevents selection of the other account.
+Every host uses the central engine/version/arguments definition through its
+`hub-<label>` profile. The Docker test exercises the same managed wrapper/profile,
+with `--version` as its central diagnostic arguments and no model call. This does
+not qualify named-profile headless adapters, or install a second Fleet consumer.
+
+For Claude subscription setup, run `claude setup-token` once with its native
+browser consent, save the printed token privately without putting it in shell
+history, then:
+
+```bash
+hub engines add --provider claude --label my-claude --token-file /private/token-file
+```
+
+Browser consent relay check (requires Playwright available through
+`PLAYWRIGHT_PACKAGE`, defaulting to the existing local tooling):
+
+```bash
+node test/provisioning-ui.browser.mjs
+```
+
+The test uses a real local Worker and SQLite with a synthetic native consent link.
+It covers machine login requests, the Google link, private code submission and the
+resulting state, and writes a screenshot under gitignored `.local/ui-evidence/`.

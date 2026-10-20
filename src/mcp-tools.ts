@@ -75,6 +75,11 @@ tool('monitoring_health', 'GET', '/api/monitoring/health', 'Authorized host heal
 tool('accounts_write', 'PUT', '/api/fleet/accounts', 'Operator-only account registry update.');
 export const MCP_ROUTES = routes;
 export const CLI_EXCLUSIONS: Record<string, string> = {
+  'engines add': 'Operator credential import reads private native files; never expose provider credentials through model tools.',
+  'engines list': 'Operator credential-management inventory is inspected through the CLI or dedicated account UI.',
+  'engines remove': 'Operator credential withdrawal stays in the explicit credential-management CLI/UI workflow.',
+  'engines sync': 'Local enrolled-host engine installation; no second remote executor.',
+  'engines quota': 'Local private-account probes for the server collector; model tools read sanitized server quota instead.',
   'login': 'Host/agent pairing is performed outside model tools using hub login and explicit device approval; never return credentials in tool output.',
   'auth login': 'Use MCP OAuth/DCR/PKCE or hub auth login outside tools; no credential disclosure.',
   'auth logout': 'Use OAuth revocation or hub auth logout outside tools; revoking the current connection is transport account management.',

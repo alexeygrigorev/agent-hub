@@ -16,6 +16,7 @@ import { BusService, BUS_SCHEMA_SQL, CallerContext, generateUlid } from './bus';
 import { JobsService, JOBS_SCHEMA_SQL } from './jobs';
 import { roleName } from './role_leases';
 import { FleetService } from './fleet';
+import { ProvisioningService } from './provisioning';
 import { LivenessService, thresholdsFrom, alertText } from './liveness';
 import { ChecksService, validateCheck, type ActionDeps } from './checks';
 import { approvalAuthorityMatches, assignApprovalAuthority } from './host_enrollment';
@@ -97,6 +98,7 @@ export class Hub extends DurableObject {
   public statusService: StatusService;
   public metricsStore: MetricsStore;
   public fleetService: FleetService;
+  public provisioningService: ProvisioningService;
   public sessionControlService: SessionControlService;
   public livenessService: LivenessService;
   public checksService: ChecksService;
@@ -137,6 +139,9 @@ export class Hub extends DurableObject {
       reserve: (input, auth) => this.fleetService.reserve(input, auth),
     }, { env: this.env });
     this.sessionControlService.init();
+    this.provisioningService = new ProvisioningService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.env, this.fleetService,
+      (machine, caller) => this.sessionControlService.hostObservationAllowed(machine, caller));
+    this.provisioningService.init();
     // M14b slice2 (narrow STATUS composition): observation writes are gated
     // by the live SessionControlService.hostObservationAllowed (existing
     // fresh host family/approval authority, owned by the cleanup worker).
@@ -542,6 +547,9 @@ export class Hub extends DurableObject {
       if (path === '/api/agents' || path.startsWith('/api/agents/')) return this.handleAgentRegistry(request, path);
       if (path === '/api/heartbeat' || path === '/api/liveness' || path === '/api/checks' || path.startsWith('/api/checks/')) {
         return this.handleWatchRoutes(request, path);
+      }
+      if (path === '/api/engines' || path.startsWith('/api/engines/')) {
+        return this.provisioningService.handle(request, await this.authenticateBusRequest(request));
       }
       if (path === '/api/fleet' || path.startsWith('/api/fleet/')) {
         const auth = await this.authenticateBusRequest(request);
