@@ -230,6 +230,66 @@ class TestWindowsProvisioningPortability(unittest.TestCase):
             self.assertEqual(waiting_events[0]['url'], test_url)
             self.assertTrue(pipe.closed)
 
+    def test_engine_login_windows_conpty_process_reader_and_url_extraction(self):
+        from agent_hub_host import win_console
+        item = {'id': 'login-test-conpty'}
+        bundle = {'label': 'test-gemini', 'provider': 'gemini'}
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            home = dest / 'home'
+            home.mkdir(parents=True)
+
+            class FakeBackend:
+                def __init__(self, data):
+                    self.data = list(data)
+                    self.pid = 9999
+                    self.terminated = False
+                    self.closed_console = False
+                    self.closed_handles = False
+                def resume(self):
+                    pass
+                def read(self, n=4096):
+                    if self.data:
+                        return self.data.pop(0)
+                    return b''
+                def write(self, data):
+                    return len(data)
+                def close_input(self):
+                    pass
+                def poll(self):
+                    return 0 if stop.is_set() else None
+                def wait(self, timeout=None):
+                    return 0
+                def terminate(self):
+                    self.terminated = True
+                def close_console(self):
+                    self.closed_console = True
+                def close_handles(self):
+                    self.closed_handles = True
+
+            test_url = "https://accounts.google.com/o/oauth2/auth?client_id=test_conpty&response_type=code"
+            backend = FakeBackend([b"Please authorize at: ", test_url.encode(), b"\r\nEnter code:\r\n"])
+            proc = win_console.ConsoleProcess(['fake.exe'], env={'A': 'B'}, cwd=str(home), _backend=backend)
+
+            stop = threading.Event()
+            posted = []
+            def fake_request(method, path, data=None):
+                posted.append((method, path, data))
+                if data and data.get('status') == 'waiting':
+                    stop.set()
+                return {}
+
+            with patch('agent_hub_host.win_console.ConsoleProcess', return_value=proc), \
+                 patch.object(p, 'engine_argv', return_value=['fake-gemini.exe']), \
+                 patch.object(p, 'read_json', return_value={}), \
+                 patch.object(p, 'write_json'):
+                engine_login._run(item, bundle, dest, fake_request, stop, is_windows=True)
+
+            waiting_events = [data for m, p_path, data in posted if data and data.get('status') == 'waiting']
+            self.assertTrue(len(waiting_events) >= 1)
+            self.assertEqual(waiting_events[0]['url'], test_url)
+            self.assertTrue(backend.closed_console)
+
     @unittest.skipUnless(PWSH_BIN and os.path.isfile(PWSH_BIN) and os.access(PWSH_BIN, os.X_OK), "Portable pwsh not available")
     def test_pwsh_install_script_execution_and_checksum_verification(self):
         with tempfile.TemporaryDirectory() as tmp:

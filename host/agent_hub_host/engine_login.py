@@ -59,12 +59,13 @@ def _run(item, bundle, dest, request, stop, is_windows=None):
             os.close(slave)
             slave = None
         else:
-            # Native Windows memory-only safe transport.
-            # NOTE: Official @google/gemini-cli interactive OAuth consent requires a pseudo-console (ConPTY).
-            # When standard pipes are passed without a TTY, the Node CLI exits with code 41 (non-interactive auth error).
-            # Physical win35 acceptance requires ConPTY/console driver or non-interactive consent.
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, env=env, cwd=home)
+            # Native Windows memory-only safe transport via ConPTY pseudoconsole.
+            from . import win_console
+            try:
+                proc = win_console.ConsoleProcess(cmd, env=env, cwd=str(home))
+            except Exception:
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, env=env, cwd=home)
             reader_buf = []
             reader_lock = threading.Lock()
 
@@ -73,8 +74,10 @@ def _run(item, bundle, dest, request, stop, is_windows=None):
                     try:
                         if hasattr(proc.stdout, 'read1'):
                             chunk = proc.stdout.read1(1024)
-                        else:
+                        elif hasattr(proc.stdout, 'fileno'):
                             chunk = os.read(proc.stdout.fileno(), 1024)
+                        else:
+                            break
                         if not chunk:
                             break
                         with reader_lock:
@@ -147,22 +150,30 @@ def _run(item, bundle, dest, request, stop, is_windows=None):
         try: request('POST', path, {'status': 'failed'})
         except Exception: pass
     finally:
-        if proc is not None and proc.poll() is None:
-            if hasattr(os, 'killpg'):
-                try: os.killpg(proc.pid, signal.SIGTERM); proc.wait(timeout=1)
-                except Exception:
-                    try: os.killpg(proc.pid, signal.SIGKILL); proc.wait(timeout=1)
-                    except Exception: pass
-            else:
+        if proc is not None:
+            if hasattr(proc, 'close') and callable(proc.close):
+                try: proc.close()
+                except Exception: pass
+            elif is_posix and proc.poll() is None:
+                if hasattr(os, 'killpg'):
+                    try: os.killpg(proc.pid, signal.SIGTERM); proc.wait(timeout=1)
+                    except Exception:
+                        try: os.killpg(proc.pid, signal.SIGKILL); proc.wait(timeout=1)
+                        except Exception: pass
+                else:
+                    try: proc.terminate(); proc.wait(timeout=1)
+                    except Exception:
+                        try: proc.kill(); proc.wait(timeout=1)
+                        except Exception: pass
+            elif not is_posix and proc.poll() is None:
                 try: proc.terminate(); proc.wait(timeout=1)
                 except Exception:
                     try: proc.kill(); proc.wait(timeout=1)
                     except Exception: pass
-        if proc is not None:
-            if proc.stdout is not None:
+            if getattr(proc, 'stdout', None) is not None:
                 try: proc.stdout.close()
                 except Exception: pass
-            if proc.stdin is not None:
+            if getattr(proc, 'stdin', None) is not None:
                 try: proc.stdin.close()
                 except Exception: pass
         if reader_thread is not None:
