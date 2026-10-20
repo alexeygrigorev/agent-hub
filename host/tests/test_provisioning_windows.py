@@ -346,6 +346,78 @@ class TestWindowsProvisioningPortability(unittest.TestCase):
                     '/usr/bin/opencode', '--model', 'opencode-go/muse-spark-1.3-contributor', '--version'
                 ])
 
+    def test_sync_isolates_unsupported_bundle_failure_and_publishes_valid_profiles(self):
+        rev_codex = '22222222-2222-2222-2222-222222222222'
+        rev_zai = '33333333-3333-3333-3333-333333333333'
+        codex_bundle = {
+            'label': 'codex-valid',
+            'provider': 'codex',
+            'version': '1.0.0',
+            'revision': rev_codex,
+            'args': ['--model', 'gpt-4o'],
+            'files': {},
+            'env': {},
+        }
+        zai_bundle = {
+            'label': 'zai-unsupported',
+            'provider': 'zai',
+            'version': '1.0.0',
+            'revision': rev_zai,
+            'args': ['--model', 'glm-4'],
+            'files': {},
+            'env': {},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chmod(tmp, 0o700)
+            mock_cfg = Path(tmp) / 'config.toml'
+            mock_cfg.write_text('operator data\n')
+            calls = []
+            def fake_request(method, path, data=None):
+                calls.append((method, path, data))
+                if method == 'GET':
+                    return {'engines': [codex_bundle, zai_bundle]}
+                return {}
+
+            def fake_install(bundle):
+                if bundle['provider'] == 'zai':
+                    raise ValueError('ZCode runtime missing (/opt/ZCode/resources/glm/zcode.cjs)')
+                dest = Path(tmp) / f"{bundle['label']}-{bundle['revision']}"
+                dest.mkdir(parents=True, mode=0o700)
+                (dest / 'home').mkdir(mode=0o700)
+                p.write_json(dest / 'bundle.json', bundle)
+
+            with patch.dict(os.environ, {'AGENT_HUB_MANAGED_DIR': str(tmp)}), \
+                 patch('agent_hub_host.provisioning.profile_path', return_value=mock_cfg), \
+                 patch('agent_hub_host.provisioning.install', side_effect=fake_install):
+                res = p.sync(fake_request)
+
+            self.assertEqual(res['status'], 'synced')
+            self.assertIn('hub-codex-valid', res['profiles'])
+            self.assertNotIn('hub-zai-unsupported', res['profiles'])
+            self.assertEqual(res.get('failed_labels'), ['zai-unsupported'])
+
+            # Verify only codex is published to aplexer/operator config
+            cfg_text = mock_cfg.read_text()
+            self.assertIn('hub-codex-valid', cfg_text)
+            self.assertNotIn('hub-zai-unsupported', cfg_text)
+
+            # Verify state.json only contains codex
+            state = p.read_json(Path(tmp) / 'state.json', [])
+            self.assertEqual([s['label'] for s in state], ['codex-valid'])
+
+            # Verify ACK only sent for codex
+            ack_paths = [path for m, path, d in calls if m == 'POST']
+            self.assertIn('/api/engines/codex-valid', ack_paths)
+            self.assertNotIn('/api/engines/zai-unsupported', ack_paths)
+
+            # Test subsequent sync removal of codex cleanly cleans up
+            with patch.dict(os.environ, {'AGENT_HUB_MANAGED_DIR': str(tmp)}), \
+                 patch('agent_hub_host.provisioning.profile_path', return_value=mock_cfg):
+                res_empty = p.sync(lambda m, p_path: {'engines': []})
+            self.assertEqual(res_empty['profiles'], [])
+            self.assertNotIn('hub-codex-valid', mock_cfg.read_text())
+
     @unittest.skipUnless(PWSH_BIN and os.path.isfile(PWSH_BIN) and os.access(PWSH_BIN, os.X_OK), "Portable pwsh not available")
     def test_pwsh_install_script_execution_and_checksum_verification(self):
         with tempfile.TemporaryDirectory() as tmp:

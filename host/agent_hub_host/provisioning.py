@@ -515,16 +515,27 @@ def sync(request=None):
                     raise PermissionError('Unsafe managed directory')
                 shutil.rmtree(entry)
         write_json(root() / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': b['provider']} for b in retained])
+        installed_bundles = []
+        failed_bundles = []
         for b in bundles:
-            install(b)
-        profiles(bundles)
-        write_json(root() / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': b['provider']} for b in bundles])
-        for b in bundles:
+            try:
+                install(b)
+                installed_bundles.append(b)
+            except Exception:
+                failed_bundles.append(b)
+        if bundles and not installed_bundles:
+            raise ValueError('Managed engine installation failed')
+        profiles(installed_bundles)
+        write_json(root() / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': b['provider']} for b in installed_bundles])
+        for b in installed_bundles:
             authenticated = b['provider'] != 'gemini' or (root() / (b['label'] + '-' + b['revision']) / 'home/.gemini/oauth_creds.json').is_file()
             request('POST', '/api/engines/' + b['label'], {'revision': b['revision'], 'authenticated': authenticated})
         from . import engine_login
-        engine_login.tick(response.get('logins', []), bundles, request)
-    return {'status': 'synced', 'profiles': ['hub-' + b['label'] for b in bundles]}
+        engine_login.tick(response.get('logins', []), installed_bundles, request)
+    result = {'status': 'synced', 'profiles': ['hub-' + b['label'] for b in installed_bundles]}
+    if failed_bundles:
+        result['failed_labels'] = [b['label'] for b in failed_bundles]
+    return result
 
 
 def host_request(method, path, payload=None):
