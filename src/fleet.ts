@@ -4,7 +4,7 @@ import { RoutingService } from './routing';
 import { ClaimAdmission, sameIntent, sameEditCaller, type EditAuthority, type AdmissionCaller } from './claim_admission';
 import { effectiveCheckin } from './registry';
 import { taskTier, policy } from './model-routing';
-import { QUOTA_SCHEMA_SQL, QUOTA_STALE_MS } from './quota';
+import { QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, ensureTbmQuotaSchema } from './quota';
 import { evaluateQuotaAdmission } from './quota_admission';
 import { adoptObservedNativeSessions } from './session_control';
 import { isValidMachineId } from './machine-id';
@@ -138,6 +138,7 @@ export class FleetService {
   }
   init() {
     for (const stmt of QUOTA_SCHEMA_SQL.split(';')) if (stmt.trim()) this.sql.exec(stmt);
+    ensureTbmQuotaSchema(this.sql);
     this.routing.init();
     this.admission.init();
     for (const stmt of FLEET_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);

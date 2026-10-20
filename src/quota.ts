@@ -43,6 +43,97 @@ CREATE TABLE IF NOT EXISTS host_quota_snapshots (
 );
 `;
 
+export const TBM_QUOTA_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS tbm_quota_pools (
+    pool_id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    account TEXT NOT NULL DEFAULT 'default',
+    total_capacity_tokens INTEGER NOT NULL,
+    remaining_tokens INTEGER NOT NULL,
+    headroom_percentage REAL NOT NULL,
+    reset_at_ms INTEGER NOT NULL,
+    hard_floor_percent REAL NOT NULL DEFAULT 5.0,
+    soft_reserve_percent REAL NOT NULL DEFAULT 20.0,
+    convexity_exponent REAL NOT NULL DEFAULT 1.5,
+    current_burn_rate_tpm REAL NOT NULL DEFAULT 0.0,
+    target_burn_rate_tpm REAL NOT NULL DEFAULT 0.0,
+    pacing_ratio REAL NOT NULL DEFAULT 1.0,
+    kill_switch_active INTEGER NOT NULL DEFAULT 0,
+    kill_switch_reason TEXT,
+    kill_switch_updated_at TEXT,
+    last_updated_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tbm_banked_tranches (
+    tranche_id TEXT PRIMARY KEY,
+    pool_id TEXT NOT NULL REFERENCES tbm_quota_pools(pool_id),
+    provider TEXT NOT NULL,
+    label TEXT,
+    allocated_tokens INTEGER NOT NULL,
+    remaining_tokens INTEGER NOT NULL,
+    granted_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER NOT NULL,
+    status TEXT CHECK(status IN ('active', 'exhausted', 'expired')) NOT NULL DEFAULT 'active',
+    banked_burn_rate_tpm REAL NOT NULL DEFAULT 0.0,
+    target_banked_burn_rate_tpm REAL NOT NULL DEFAULT 0.0,
+    expired_unused_tokens INTEGER NOT NULL DEFAULT 0,
+    updated_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tbm_reward_events (
+    event_id TEXT PRIMARY KEY,
+    timestamp_ms INTEGER NOT NULL,
+    pool_id TEXT NOT NULL,
+    intake_task_id TEXT NOT NULL,
+    active_mode TEXT CHECK(active_mode IN ('high', 'super-think', 'mini-swarm')) NOT NULL,
+    swarm_concurrency INTEGER NOT NULL DEFAULT 1,
+    useful_work_reward REAL NOT NULL,
+    pacing_error_penalty REAL NOT NULL,
+    floor_breach_penalty REAL NOT NULL,
+    engine_mix_penalty REAL NOT NULL,
+    waste_at_reset_penalty REAL NOT NULL,
+    banked_waste_penalty REAL NOT NULL,
+    net_reward REAL NOT NULL,
+    token_efficiency_eta REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tbm_metrics_rollup (
+    rollup_id TEXT PRIMARY KEY,
+    window_type TEXT CHECK(window_type IN ('1m', '10m', '1h', 'reset_window', '24h')) NOT NULL,
+    start_time_ms INTEGER NOT NULL,
+    end_time_ms INTEGER NOT NULL,
+    pool_id TEXT NOT NULL,
+    avg_burn_rate_vs_target REAL NOT NULL,
+    leftover_quota_at_reset INTEGER NOT NULL DEFAULT 0,
+    soft_floor_breach_count INTEGER NOT NULL DEFAULT 0,
+    hard_floor_breach_count INTEGER NOT NULL DEFAULT 0,
+    total_tokens_burned INTEGER NOT NULL,
+    useful_work_units REAL NOT NULL,
+    token_efficiency_eta REAL NOT NULL,
+    idle_wasted_quota INTEGER NOT NULL DEFAULT 0,
+    engine_mix_free_share REAL NOT NULL,
+    engine_mix_paid_share REAL NOT NULL,
+    engine_mix_grok_share REAL NOT NULL,
+    admission_rejection_rate REAL NOT NULL,
+    no_eligible_route_rate REAL NOT NULL,
+    avg_time_to_outcome_seconds REAL NOT NULL,
+    banked_tokens_burned INTEGER NOT NULL DEFAULT 0,
+    banked_tokens_expired_unused INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_pool_provider ON tbm_quota_pools(provider);
+CREATE INDEX IF NOT EXISTS idx_banked_edf ON tbm_banked_tranches(status, expires_at_ms ASC);
+CREATE INDEX IF NOT EXISTS idx_reward_timestamp ON tbm_reward_events(timestamp_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_reward_intake ON tbm_reward_events(intake_task_id);
+CREATE INDEX IF NOT EXISTS idx_rollup_query ON tbm_metrics_rollup(pool_id, window_type, end_time_ms DESC);
+`;
+
+/** Idempotent TBM migration: safe on fresh and already-migrated DBs. */
+export function ensureTbmQuotaSchema(sql: SqlStorage): void {
+  for (const statement of TBM_QUOTA_SCHEMA_SQL.split(";")) {
+    const trimmed = statement.trim();
+    if (trimmed) {
+      sql.exec(trimmed);
+    }
+  }
+}
+
 const TOP_LEVEL_KEYS = new Set<string>([
   "schema_version",
   "captured_at",
@@ -821,6 +912,7 @@ export class QuotaStore {
         this.sql.exec(trimmed);
       }
     }
+    ensureTbmQuotaSchema(this.sql);
     const cols = this.sql.exec("PRAGMA table_info(host_quota_snapshots)").toArray().map((c: any) => c.name);
     if (!cols.includes("collector_version")) {
       this.sql.exec("ALTER TABLE host_quota_snapshots ADD COLUMN collector_version TEXT");
