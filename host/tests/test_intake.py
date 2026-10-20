@@ -77,6 +77,18 @@ class TestIntakeCli(unittest.TestCase):
                 self.assertEqual(self.run_cli(*args)[0], 2)
                 transport.assert_not_called()
 
+    def test_append_preserves_event_text_and_optional_source(self):
+        for event in ({'kind': 'note', 'text': 'И в этом случае тоже'},
+                      {'kind': 'note', 'text': 'И в этом случае тоже',
+                       'source': {'type': 'chat', 'reference': 't753u', 'timestamp': '2026-10-20T13:26:00+02:00'}}):
+            with self.subTest(event=event), patch('sys.stdin', io.TextIOWrapper(io.BytesIO(json.dumps(event).encode()), encoding='utf-8')), \
+                 patch.object(intake, 'request', return_value={}) as transport:
+                code, _, error = self.run_cli('intake', 'append', 'task-1', '--version', '1',
+                                              '--key', 'append-note', '--event-file', '-')
+                self.assertEqual(code, 0, error)
+                self.assertEqual(transport.call_args.args, ('POST', '/api/intake/tasks/task-1/events',
+                                 {'key': 'append-note', 'expected_version': 1, 'event': event}))
+
     def test_update_auto_version_retries_only_cas_with_one_generated_key(self):
         calls = []
         def send(method, path, payload=None):

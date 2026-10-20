@@ -251,6 +251,40 @@ describe('private durable intake HTTP/SQLite', () => {
     expect((await call('/tasks/' + task.id + '/events', { key: 'forged-verification', expected_version: 2, event: { ...event, evidence: 'hub_launch_verified' } })).status).toBe(400);
   });
 
+  it('accepts the documented note envelope with provenance, replay and CAS guards', async () => {
+    const { task } = await create();
+    const path = '/tasks/' + task.id + '/events';
+    const origin = { type: 'chat', reference: 't753u', timestamp: '2026-10-20T13:26:00+02:00' };
+    const payload = { key: 'note-envelope', expected_version: 1, note: { text: 'И в этом случае тоже', source: origin } };
+    const first = await ok(path, payload);
+    expect(first.task.control.version).toBe(2);
+    expect(first.task.payload_data.history.at(-1)).toMatchObject({ kind: 'note', text: payload.note.text, source: origin });
+    expect(await ok(path, payload)).toEqual(first);
+    expect((await call(path, { ...payload, note: { text: 'Changed' } })).status).toBe(409);
+    expect((await call(path, { ...payload, key: 'stale-note' })).status).toBe(409);
+    const second = await ok(path, { key: 'note-no-source', expected_version: 2, note: { text: 'No source' } });
+    expect(second.task.payload_data.history.at(-1)).toMatchObject({ kind: 'note', source });
+    expect(second.task.control.version).toBe(3);
+    for (const [extra, field] of [
+      [{ typo: {} }, 'typo'],
+      [{ note: { text: 'Invalid', typo: true } }, 'typo'],
+      [{ note: { text: 'Invalid', source: { type: 'chat', typo: true } } }, 'typo'],
+      [{ note: { text: 'Invalid', kind: 'approval_decision' } }, 'kind'],
+    ] as const) {
+      const response = await call(path, { key: 'bad-note', expected_version: 3, ...extra });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: 'unknown_field', field });
+    }
+    for (const note of [null, [], {}, { text: '' }, { text: 'Invalid', source: null }]) {
+      expect((await call(path, { key: 'invalid-note', expected_version: 3, note })).status).toBe(400);
+    }
+    const ambiguous = await call(path, { key: 'ambiguous-note', expected_version: 3,
+      note: { text: 'Note' }, event: { kind: 'note', text: 'Other' } });
+    expect(ambiguous.status).toBe(400);
+    expect(await ambiguous.json()).toEqual({ error: 'invalid_field', field: 'note' });
+    expect((await ok('/tasks/' + task.id)).task.control.version).toBe(3);
+  });
+
   it('accepts concise notes and session aliases without relaxing link checks', async () => {
     const { task } = await create();
     const note = await append(task.id, 1, { kind: 'note', text: 'Concise note' });

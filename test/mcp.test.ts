@@ -72,6 +72,24 @@ describe('Hub MCP protocol and parity', () => {
     expect(held.data.hold).toBeTruthy();
     expect(held.data.assigned_session.hold).toEqual(held.data.hold);
   });
+  it('appends the advertised note payload with and without source and reports unknown fields', async () => {
+    const invoke = async (name: string, args: any) => {
+      const response: any = await (await rpc('tools/call', { name, arguments: args })).json();
+      return JSON.parse(response.result.content[0].text);
+    };
+    const created = await invoke('intake_create', { payload: { key: 'mcp-note-create', project: 'demo', title: 'Fixture', text: 'Fixture', source: { type: 'unknown' } } });
+    const id = created.data.task.id;
+    const source = { type: 'chat', reference: 't753u', timestamp: '2026-10-20T13:26:00+02:00' };
+    for (const [index, note] of [{ text: 'И в этом случае тоже', source }, { text: 'No source' }].entries()) {
+      const result = await invoke('intake_append', { id, payload: { key: 'mcp-envelope-' + index, expected_version: index + 1, note } });
+      expect(result.status).toBe(200);
+      expect(result.data.task.payload_data.history.at(-1)).toMatchObject({ kind: 'note', text: note.text,
+        source: index === 0 ? source : { type: 'unknown', reference: null, timestamp: null } });
+    }
+    expect(await invoke('intake_append', { id, payload: { key: 'mcp-unknown', expected_version: 3, notes: { text: 'Typo' } } }))
+      .toMatchObject({ status: 400, data: { error: 'unknown_field', field: 'notes' } });
+  });
+
   it('retries only CAS conflicts with a stable key and bounded attempts', async () => {
     for (const code of ['version_conflict', 'idempotency_conflict']) {
       const writes: any[] = [];
