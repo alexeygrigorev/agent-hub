@@ -626,6 +626,7 @@ def engine_environment(bundle, home, dest=None):
         APPDATA=str(home / 'AppData' / 'Roaming'),
         LOCALAPPDATA=str(home / 'AppData' / 'Local'),
         XDG_CONFIG_HOME=str(home / '.config'),
+        XDG_CACHE_HOME=str(home / '.cache'),
         XDG_DATA_HOME=str(home / '.local' / 'share'),
         XDG_STATE_HOME=str(home / '.local' / 'state'),
         CODEX_HOME=str(home / '.codex'),
