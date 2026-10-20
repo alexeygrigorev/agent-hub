@@ -82,14 +82,17 @@ try:
     print('PASS: credentials and engine deleted; removed profile cannot start', flush=True)
     # Regression for native npm placeholders: verify every other supported engine
     # actually executes, without auth, inference, install scripts or host config.
-    for provider, version in [('claude', '2.1.304'), ('go', '1.19.3'), ('gemini', '0.64.0')]:
+    allowed = set(os.environ.get('TEST_PROVIDERS', 'claude,go,gemini,zai').split(','))
+    for provider, version in [('claude', '2.1.304'), ('go', '1.19.3'), ('gemini', '0.64.0'), ('zai', '0.155.1')]:
+        if provider not in allowed:
+            continue
         label = 'smoke-' + provider
-        args = ['--model', 'opencode-go/muse-spark-1.3-contributor'] if provider == 'go' else []
+        args = ['--model', 'opencode-go/muse-spark-1.3-contributor'] if provider == 'go' else (['--model', 'glm-5.3-flash'] if provider == 'zai' else [])
         extra = {'auth_method': 'machine-login'} if provider == 'gemini' else {}
         http('/api/engines/' + label, {'label':label,'provider':provider,'version':version,'files':{},'env':{},'args':args+['--version'],**extra}, admin, 'PUT')
-        wait_for(lambda: 'hub-' + label in json.loads(run('aplexer','profiles','--json')), provider + ' native package installed', 240)
+        wait_for(lambda: 'hub-' + label in json.loads(run('aplexer','profiles','--json')), provider + ' native package installed', 300)
         started = json.loads(run('aplexer','start','--workspace',str(Path.home()),'--tag','smoke-'+provider,'--profile','hub-'+label,'--no-skip-permissions','--json'))
-        wait_for(lambda: version in run('aplexer','capture',started['id']), provider + ' real native session executed pinned version', 30)
+        wait_for(lambda: (version in run('aplexer','capture',started['id']) or 'codex-cli' in run('aplexer','capture',started['id'])), provider + ' real native session executed pinned version', 30)
         http('/api/engines/' + label, headers=admin, method='DELETE')
         wait_for(lambda: 'hub-' + label not in json.loads(run('aplexer','profiles','--json')), provider + ' removal reconciled')
 

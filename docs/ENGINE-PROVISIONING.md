@@ -43,7 +43,12 @@ hub engines add --provider codex --label work-codex --auth-file "$HOME/.codex/au
 ```
 
 Use `--config-file` to include the native config, or `--version` to select another
-exact engine version. `go` accepts the same native-file import; Claude uses `--token-file` and Gemini uses machine login as described below.
+exact engine version. `go` and `zai` accept the same native-file import (`zai` also accepts `--token-file`); Claude uses `--token-file` and Gemini uses machine login as described below:
+
+```bash
+hub engines add --provider zai --label my-zai --token-file /private/zai-token
+hub engines add --provider zai --label work-zai --auth-file "$HOME/.zcode/v2/credentials.json"
+```
 For custom environment authentication or several config files, prepare a private JSON
 file in a directory with mode 0700; the file must be mode 0600. For a Codex account,
 the bundle has this shape (replace the synthetic value locally):
@@ -90,10 +95,14 @@ via the bounded provider-specific names in `env`; do not put secrets in `args`.
 OpenCode `args` must be exactly
 `["--model", "opencode-go/muse-spark-1.3-contributor"]` (an optional final `--version` is accepted for diagnostic-only starts).
 
-Z.ai's required zcodex/ZCode runtime has no supported npm distribution in this
-installer; automatic installation of that engine is not qualified. Existing local
-Z.ai profiles are preserved. Windows provisioning has not been accepted; the Docker
-acceptance test covers Linux only.
+Z.ai is centrally managed using the native `zcodex` engine (`alexeygrigorev/codex-zcode`).
+On hosts with the native binary and `/opt/ZCode/resources/glm/zcode.cjs` runtime,
+an isolated executable wrapper and account environment (`CODEX_HOME` and `ZCODE_HOME`)
+are installed under `hub-<label>`. Clean hosts without pre-installed zcodex automatically
+fetch the exact pinned release artifact. If the required ZCode JS runtime is missing,
+installation fails closed and holds until runtime prerequisites are satisfied.
+Multiple Z.ai labels on one machine coexist safely with independent credential stores.
+Windows provisioning has not been accepted; the Docker acceptance test covers Linux only.
 
 Once installed, a local session uses `aplexer start --profile hub-work-codex`.
 Existing Hub interactive placement uses the registered engine/account/profile
@@ -189,10 +198,13 @@ It does not lend an account to another person or pool accounts to bypass limits.
   member or separate device subscription is created. This is an inference from
   the documented portable-key mechanism, not an express multi-device guarantee.
 - **Z.ai/ZCode:** [official configuration docs](https://zcode.z.ai/en/docs/configuration)
-  describe Coding Plan account login and API-key connections. Automatic zcodex
-  runtime distribution and native account-login relay are not qualified here.
-  Existing Z.ai routes remain under their installed launcher. No GLM route is
-  substituted through OpenCode.
+  describe Coding Plan account login and API-key connections. Central accounts
+  are distributed to eligible hosts running the native zcodex/ZCode runtime wrapper.
+  Importing via `--token-file` or `--auth-file` creates isolated native configuration
+  and `quse zai` quota monitoring without synthesizing OAuth/JWT tokens. Several
+  labels on one host coexist as distinct `hub-<label>` profiles with isolated
+  `CODEX_HOME` and `ZCODE_HOME`. GLM models route strictly through `zcodex` and are
+  refused on OpenCode.
 
 For Gemini, run `hub engines add --provider gemini --label my-google`, then open
 [Engine accounts](https://hub.dtcdev.click/engines.html). Choose **Sign in with

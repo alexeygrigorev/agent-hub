@@ -10,8 +10,9 @@ export const PACKAGES: Record<string, { pkg: string; bin: string; engine: string
   claude: { pkg: '@anthropic-ai/claude-code', bin: 'claude', engine: 'claude' },
   gemini: { pkg: '@google/gemini-cli', bin: 'gemini', engine: 'gemini' },
   go: { pkg: 'opencode-ai', bin: 'opencode', engine: 'opencode' },
+  zai: { pkg: 'zcodex', bin: 'zcodex', engine: 'codex' },
 };
-const ENV = new Set(['OPENAI_API_KEY', 'OPENAI_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENCODE_API_KEY']);
+const ENV = new Set(['OPENAI_API_KEY', 'OPENAI_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENCODE_API_KEY', 'ZAI_API_KEY', 'ZAI_BASE_URL', 'ZAI_TOKEN']);
 const headers = { 'Cache-Control': 'private, no-store', 'Pragma': 'no-cache' };
 const reply = (data: unknown, status = 200) => Response.json(data, { status, headers });
 const object = (v: any) => v && typeof v === 'object' && !Array.isArray(v);
@@ -25,7 +26,9 @@ export function validBundle(v: any): boolean {
   if (Object.entries(v.env).some(([k, val]) => !ENV.has(k) || typeof val !== 'string' || val.length > 8000 || val.includes('\0'))) return false;
   return Array.isArray(v.args) && v.args.length <= 32 && v.args.every((x: any) => typeof x === 'string' && x.length < 1024 && !x.includes('\0')) &&
     // OpenCode is exclusively the subscribed Muse route; GLM belongs to zcodex.
-    (v.provider !== 'go' || [JSON.stringify(['--model', 'opencode-go/muse-spark-1.3-contributor']), JSON.stringify(['--model', 'opencode-go/muse-spark-1.3-contributor', '--version'])].includes(JSON.stringify(v.args)));
+    (v.provider !== 'go' || [JSON.stringify(['--model', 'opencode-go/muse-spark-1.3-contributor']), JSON.stringify(['--model', 'opencode-go/muse-spark-1.3-contributor', '--version'])].includes(JSON.stringify(v.args))) &&
+    // Z.ai routes through native zcodex and never routes OpenCode Muse models.
+    (v.provider !== 'zai' || !v.args.some((a: string) => a.includes('opencode-go') || a.includes('muse')));
 }
 
 export class ProvisioningService {

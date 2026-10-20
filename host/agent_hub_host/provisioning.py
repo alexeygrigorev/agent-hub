@@ -22,9 +22,11 @@ PACKAGES = {
     'claude': ('@anthropic-ai/claude-code', 'claude', 'claude'),
     'gemini': ('@google/gemini-cli', 'gemini', 'gemini'),
     'go': ('opencode-ai', 'opencode', 'opencode'),
+    'zai': ('codex-zcode', 'zcodex', 'codex'),
 }
 ENV = {'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN',
-       'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENCODE_API_KEY'}
+       'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENCODE_API_KEY',
+       'ZAI_API_KEY', 'ZAI_BASE_URL', 'ZAI_TOKEN'}
 BEGIN = '# BEGIN HUB MANAGED ENGINES\n'
 END = '# END HUB MANAGED ENGINES\n'
 
@@ -82,6 +84,8 @@ def validate(bundle):
         raise ValueError('Invalid engine arguments')
     if bundle['provider'] == 'go' and args not in (['--model', 'opencode-go/muse-spark-1.3-contributor'], ['--model', 'opencode-go/muse-spark-1.3-contributor', '--version']):
         raise ValueError('OpenCode requires subscribed Muse')
+    if bundle['provider'] == 'zai' and any('muse' in a.lower() or 'opencode-go' in a.lower() for a in args):
+        raise ValueError('Z.ai cannot route OpenCode Muse')
 
 
 def profile_path():
@@ -138,9 +142,144 @@ def profiles(bundles):
     private_fs.atomic_write(path, (text.rstrip() + '\n\n' + block + END).encode(), 262144)
 
 
+def _copy_runtime_resources(src_res_dir, dst_res_dir):
+    dst_res_dir.mkdir(parents=True, exist_ok=True)
+    for name in ('glm', 'tools', 'model-providers', 'config'):
+        src_entry = src_res_dir / name
+        if src_entry.is_dir():
+            dst_entry = dst_res_dir / name
+            if dst_entry.is_dir():
+                shutil.rmtree(dst_entry)
+            shutil.copytree(src_entry, dst_entry)
+
+
+def parse_deb_manifest(manifest_text):
+    match = re.search(r'-\s*url:\s*(https?://[^\s]+\.deb)\s*\n\s*sha512:\s*([A-Za-z0-9+/=]+)', manifest_text)
+    if not match:
+        match = re.search(r'-\s*sha512:\s*([A-Za-z0-9+/=]+)\s*\n\s*url:\s*(https?://[^\s]+\.deb)', manifest_text)
+        if match:
+            deb_url, sha512 = match.group(2).strip(), match.group(1).strip()
+        else:
+            return None, None
+    else:
+        deb_url, sha512 = match.group(1).strip(), match.group(2).strip()
+    try:
+        import base64
+        decoded = base64.b64decode(sha512, validate=True)
+        if len(decoded) != 64:
+            return deb_url, None
+    except Exception:
+        return deb_url, None
+    return deb_url, sha512
+
+
+def locate_zcode_runtime(dest=None):
+    override = os.environ.get('ZCODE_CJS')
+    if override:
+        cand = Path(override)
+        if cand.is_file() and os.access(cand, os.R_OK):
+            return cand
+    candidates = []
+    if dest:
+        candidates.append(dest / 'engine/runtime/glm/zcode.cjs')
+        candidates.append(dest / 'engine/runtime/zcode.cjs')
+    candidates.extend([
+        Path('/opt/ZCode/resources/glm/zcode.cjs'),
+        root() / 'zcode-runtime/glm/zcode.cjs',
+        root() / 'zcode-runtime/zcode.cjs',
+        Path.home() / '.local/share/zcode/zcode.cjs',
+    ])
+    for cand in candidates:
+        if cand.is_file() and os.access(cand, os.R_OK):
+            return cand
+    return None
+
+
+def ensure_zcode_runtime(dest=None):
+    runtime = locate_zcode_runtime(dest)
+    if runtime:
+        if dest and not runtime.resolve().is_relative_to(dest.resolve()):
+            src_res = runtime.parent.parent if runtime.parent.name == 'glm' else runtime.parent
+            if src_res.is_dir():
+                _copy_runtime_resources(src_res, dest / 'engine/runtime')
+                local_cjs = dest / 'engine/runtime/glm/zcode.cjs'
+                if local_cjs.is_file():
+                    return local_cjs
+        return runtime
+
+    system = sys.platform
+    cpu = platform.machine().lower()
+    if system != 'linux' or cpu not in ('x86_64', 'amd64', 'aarch64', 'arm64'):
+        raise ValueError('Automatic ZCode runtime distribution unsupported on this platform')
+    platform_name = 'linux-aarch64' if cpu in ('aarch64', 'arm64') else 'linux-x86_64'
+    manifest_url = f'https://zcode.z.ai/api/v1/releases/electron/manifest?platform={platform_name}&channel=1'
+    runtime_dir = root() / 'zcode-runtime'
+    tmp_dir = dest / 'engine/tmp-zcode' if dest else root() / 'tmp-zcode'
+    try:
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = tmp_dir / 'manifest.json'
+        subprocess.run(['curl', '-fSL', manifest_url, '-o', str(manifest_path)],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=True)
+        manifest_text = manifest_path.read_text()
+        deb_url, sha512_expected = parse_deb_manifest(manifest_text)
+        if not deb_url:
+            raise ValueError('ZCode deb asset not found in release manifest')
+        if not sha512_expected:
+            raise ValueError('ZCode deb release manifest missing valid SHA-512 checksum')
+        deb_path = root() / 'zcode-cache' / f'zcode-latest-{platform_name}.deb'
+        with private_fs.parent(deb_path, create=True):
+            pass
+        if not deb_path.is_file():
+            subprocess.run(['curl', '-fSL', deb_url, '-o', str(deb_path)],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300, check=True)
+        import base64, hashlib
+        expected_hex = base64.b64decode(sha512_expected.strip()).hex()
+        with open(deb_path, 'rb') as f:
+            actual_hex = hashlib.sha512(f.read()).hexdigest()
+        if actual_hex != expected_hex:
+            raise ValueError('Official ZCode deb SHA-512 mismatch')
+        tmp_unpack = tmp_dir / 'unpack'
+        tmp_unpack.mkdir(parents=True, exist_ok=True)
+        subprocess.run(['dpkg-deb', '-x', str(deb_path), str(tmp_unpack)],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
+        src_res = tmp_unpack / 'opt/ZCode/resources'
+        if not (src_res / 'glm/zcode.cjs').is_file():
+            raise ValueError('Extracted deb missing zcode.cjs')
+        _copy_runtime_resources(src_res, runtime_dir)
+        if dest:
+            _copy_runtime_resources(src_res, dest / 'engine/runtime')
+        return locate_zcode_runtime(dest)
+    except Exception:
+        raise ValueError('ZCode runtime missing (/opt/ZCode/resources/glm/zcode.cjs)') from None
+    finally:
+        if tmp_dir.is_dir():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def locate_native_zcodex(bundle=None):
+    override = os.environ.get('ZCODEX_BIN')
+    if override and Path(override).is_file() and os.access(override, os.X_OK):
+        return Path(override)
+    which_bin = shutil.which('zcodex')
+    if which_bin:
+        return Path(which_bin)
+    for cand in (Path.home() / '.local/bin/zcodex', Path('/usr/local/bin/zcodex'), Path('/usr/bin/zcodex')):
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
 def executable_path(bundle, dest):
     """Use packaged native binaries directly; never run npm lifecycle scripts/stubs."""
     _, binary, _ = PACKAGES[bundle['provider']]
+    if bundle['provider'] == 'zai':
+        wrapper = dest / 'engine/bin/zcodex'
+        if wrapper.is_file() and os.access(wrapper, os.X_OK):
+            return wrapper
+        native = locate_native_zcodex(bundle)
+        if native and Path(native).is_file():
+            return Path(native)
+        raise ValueError('Native zcodex binary missing')
     modules = dest / 'engine/node_modules'
     if bundle['provider'] in ('claude', 'go'):
         system = {'linux': 'linux', 'darwin': 'darwin', 'win32': 'win32'}.get(sys.platform)
@@ -196,15 +335,80 @@ def install(bundle):
         pass
     clean_env = {k: v for k, v in os.environ.items() if k in ('PATH', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR')}
     clean_env.update(HOME=str(dest), npm_config_cache=str(root() / 'npm-cache'))
-    try:
-        subprocess.run(['npm', 'install', '--prefix', str(dest / 'engine'), '--ignore-scripts', '--no-audit', '--no-fund', '--', pkg + '@' + bundle['version']],
-                       env=clean_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300, check=True)
-    except (subprocess.SubprocessError, OSError):
-        raise ValueError('Managed engine installation failed') from None
+    if bundle['provider'] == 'zai':
+        wrapper = dest / 'engine/bin/zcodex'
+        with private_fs.parent(wrapper, create=True):
+            pass
+        native = locate_native_zcodex(bundle)
+        if native and Path(native).is_file():
+            script = '#!/bin/sh\nexec "' + str(native) + '" "$@"\n'
+            private_fs.atomic_write(wrapper, script.encode(), 4096)
+            os.chmod(wrapper, 0o700)
+        else:
+            system = sys.platform
+            cpu = platform.machine().lower()
+            if system != 'linux' or cpu not in ('x86_64', 'amd64', 'aarch64', 'arm64'):
+                raise ValueError('Native zcodex platform unsupported')
+            arch = 'amd64' if cpu in ('x86_64', 'amd64') else 'arm64'
+            asset = f'zcodex-linux-{arch}.tar.zst'
+            version = bundle['version']
+            tag = f'zcode-3.14.5-codex-{version}' if not version.startswith('zcode-') else version
+            url = f'https://github.com/alexeygrigorev/codex-zcode/releases/download/{tag}/{asset}'
+            cache_file = root() / 'zcodex-cache' / asset
+            tmp_download = dest / 'engine/tmp-zcodex'
+            try:
+                tmp_download.mkdir(parents=True, exist_ok=True)
+                target_tar = cache_file if cache_file.is_file() else tmp_download / asset
+                sums_url = f'https://github.com/alexeygrigorev/codex-zcode/releases/download/{tag}/SHA256SUMS'
+                sums_file = tmp_download / 'SHA256SUMS'
+                subprocess.run(['curl', '-fSL', sums_url, '-o', str(sums_file)],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=True)
+                expected_sha = None
+                for line in sums_file.read_text().splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].strip().lstrip('*') == asset:
+                        expected_sha = parts[0].strip()
+                        break
+                    elif asset in line and len(parts) >= 1:
+                        expected_sha = parts[0].strip()
+                        break
+                if not expected_sha or len(expected_sha) != 64 or not all(c in '0123456789abcdefABCDEF' for c in expected_sha):
+                    raise ValueError(f'Missing or malformed SHA256 checksum for {asset}')
+                if not target_tar.is_file():
+                    subprocess.run(['curl', '-fSL', url, '-o', str(target_tar)],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
+                import hashlib
+                with open(target_tar, 'rb') as f:
+                    actual_sha = hashlib.sha256(f.read()).hexdigest()
+                if actual_sha.lower() != expected_sha.lower():
+                    raise ValueError(f'Checksum mismatch for {asset}')
+                subprocess.run(['tar', '--zstd', '-xf', str(target_tar), '-C', str(tmp_download)],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=True)
+                extracted = tmp_download / f'zcodex-linux-{arch}'
+                if not extracted.is_file():
+                    extracted = tmp_download / 'zcodex'
+                if not extracted.is_file():
+                    raise ValueError('Release asset does not contain zcodex binary')
+                shutil.move(str(extracted), str(wrapper))
+                os.chmod(wrapper, 0o700)
+            except (subprocess.SubprocessError, OSError, ValueError):
+                raise ValueError('Managed engine installation failed') from None
+            finally:
+                if tmp_download.is_dir():
+                    shutil.rmtree(tmp_download, ignore_errors=True)
+        runtime = ensure_zcode_runtime(dest)
+        if not runtime:
+            raise ValueError('ZCode runtime missing (/opt/ZCode/resources/glm/zcode.cjs)')
+    else:
+        try:
+            subprocess.run(['npm', 'install', '--prefix', str(dest / 'engine'), '--ignore-scripts', '--no-audit', '--no-fund', '--', pkg + '@' + bundle['version']],
+                           env=clean_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300, check=True)
+        except (subprocess.SubprocessError, OSError):
+            raise ValueError('Managed engine installation failed') from None
     executable = executable_path(bundle, dest)
     if not executable.is_file():
         raise ValueError('Managed engine binary missing')
-    if bundle['provider'] in ('claude', 'go'):
+    if bundle['provider'] in ('claude', 'go', 'zai'):
         try:
             subprocess.run(engine_argv(bundle, dest) + ['--version'], env=clean_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=True)
         except (subprocess.SubprocessError, OSError):
@@ -281,9 +485,24 @@ def managed_subscriptions():
              'admission_argv': module_command('admission', b['label'])} for b in state]
 
 
-def engine_environment(bundle, home):
+def engine_environment(bundle, home, dest=None):
+    dest = dest or Path(home).parent
     env = {k: v for k, v in os.environ.items() if k not in ENV and k not in ('HUB_TOKEN', 'HUB_JOB_TOKEN')}
     env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / '.config'), XDG_DATA_HOME=str(home / '.local' / 'share'), XDG_STATE_HOME=str(home / '.local' / 'state'), CODEX_HOME=str(home / '.codex'), CLAUDE_CONFIG_DIR=str(home / '.claude'))
+    if bundle.get('provider') == 'zai':
+        env['CODEX_HOME'] = str(home / '.zcodex')
+        env['ZCODE_HOME'] = str(home / '.zcode')
+        node = shutil.which('node')
+        if not node:
+            for cand in ('/usr/bin/node', '/usr/local/bin/node'):
+                if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                    node = cand
+                    break
+        if node:
+            env['ZCODE_NODE'] = node
+        runtime = locate_zcode_runtime(dest)
+        if runtime:
+            env['ZCODE_CJS'] = str(runtime)
     env.update(bundle['env'])
     return env
 
@@ -301,7 +520,7 @@ def quotas():
                 b = read_json(dest / 'bundle.json')
                 validate(b)
                 with tempfile.TemporaryFile(dir=root()) as output:
-                    result = subprocess.run(['quse', b['provider'], '--json'], env=engine_environment(b, dest / 'home'),
+                    result = subprocess.run(['quse', b['provider'], '--json'], env=engine_environment(b, dest / 'home', dest),
                         stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.DEVNULL, timeout=30)
                     if result.returncode == 0 and output.tell() <= 131072:
                         output.seek(0)
@@ -327,7 +546,7 @@ def execute():
         home = dest / 'home'
         _, binary, _ = PACKAGES[b['provider']]
         command = engine_argv(b, dest)
-        env = engine_environment(b, home)
+        env = engine_environment(b, home, dest)
         argv = command + b['args'] + sys.argv[2:]
         os.execve(command[0], argv, env)
 
@@ -379,7 +598,8 @@ def command(args):
         paths = {'codex': ('.codex/auth.json', '.codex/config.toml', '0.163.0'),
                  'claude': ('.claude/.credentials.json', '.claude/settings.json', '2.1.304'),
                  'gemini': ('.gemini/oauth_creds.json', '.gemini/settings.json', '0.64.0'),
-                 'go': ('.local/share/opencode/auth.json', '.config/opencode/opencode.json', '1.19.3')}
+                 'go': ('.local/share/opencode/auth.json', '.config/opencode/opencode.json', '1.19.3'),
+                 'zai': ('.zcode/v2/credentials.json', '.zcodex/config.toml', '0.155.1')}
         auth_path, config_path, version = paths[args.provider]
         env = {}
         if args.provider == 'gemini':
@@ -394,19 +614,66 @@ def command(args):
                 raise ValueError('Invalid subscription token file')
             env['CLAUDE_CODE_OAUTH_TOKEN'] = token
             files = {}
+        elif args.provider == 'zai':
+            files = {}
+            if getattr(args, 'token_file', None):
+                token = private_fs.read_bytes(Path(args.token_file).expanduser().absolute(), 8000).decode().strip()
+                if not token or any(c.isspace() for c in token):
+                    raise ValueError('Invalid subscription token file')
+                env['ZAI_API_KEY'] = token
+                files['.config/goz/config.json'] = json.dumps({'zai_token': token, 'zai_base_url': 'https://api.z.ai/api/anthropic'})
+                files['.zcodex/config.toml'] = 'model = "glm-5.3-flash"\nmodel_provider = "zcode"\n\n[model_providers.zcode]\nname = "zcode"\nbase_url = "https://api.z.ai/api/anthropic"\nwire_api = "zcode"\n'
+            elif args.auth_file:
+                raw_auth = private_fs.read_bytes(Path(args.auth_file).expanduser().absolute(), 32768).decode()
+                try:
+                    auth_json = json.loads(raw_auth)
+                except Exception:
+                    token = raw_auth.strip()
+                    if not token or any(c.isspace() for c in token):
+                        raise ValueError('Invalid auth file content')
+                    env['ZAI_API_KEY'] = token
+                    files['.config/goz/config.json'] = json.dumps({'zai_token': token, 'zai_base_url': 'https://api.z.ai/api/anthropic'})
+                    files['.zcodex/config.toml'] = 'model = "glm-5.3-flash"\nmodel_provider = "zcode"\n\n[model_providers.zcode]\nname = "zcode"\nbase_url = "https://api.z.ai/api/anthropic"\nwire_api = "zcode"\n'
+                else:
+                    if isinstance(auth_json, dict):
+                        if 'oauth:zai:access_token' in auth_json or 'zcodejwttoken' in auth_json:
+                            files['.zcode/v2/credentials.json'] = raw_auth
+                            tok = auth_json.get('oauth:zai:access_token') or auth_json.get('zcodejwttoken')
+                            if tok and isinstance(tok, str):
+                                env['ZAI_API_KEY'] = tok
+                                files['.config/goz/config.json'] = json.dumps({'zai_token': tok, 'zai_base_url': 'https://api.z.ai/api/anthropic'})
+                        elif 'zai_token' in auth_json:
+                            files['.config/goz/config.json'] = raw_auth
+                            tok = auth_json.get('zai_token')
+                            if tok and isinstance(tok, str):
+                                env['ZAI_API_KEY'] = tok
+                        elif 'zai-coding-plan' in auth_json and isinstance(auth_json['zai-coding-plan'], dict):
+                            files['.local/share/opencode/auth.json'] = json.dumps({'zai-coding-plan': auth_json['zai-coding-plan']})
+                            tok = auth_json['zai-coding-plan'].get('key')
+                            if tok and isinstance(tok, str):
+                                env['ZAI_API_KEY'] = tok
+                                files['.config/goz/config.json'] = json.dumps({'zai_token': tok, 'zai_base_url': 'https://api.z.ai/api/anthropic'})
+                        else:
+                            raise ValueError('Native file has no Z.ai credential')
+                        files['.zcodex/config.toml'] = 'model = "glm-5.3-flash"\nmodel_provider = "zcode"\n\n[model_providers.zcode]\nname = "zcode"\nbase_url = "https://api.z.ai/api/anthropic"\nwire_api = "zcode"\n'
+                    else:
+                        raise ValueError('Invalid auth file format')
+            else:
+                raise ValueError('Native import requires auth-file or token-file')
         else:
             if getattr(args, 'token_file', None) or not args.auth_file:
                 raise ValueError('Native import requires auth-file')
             files = {auth_path: private_fs.read_bytes(Path(args.auth_file).expanduser().absolute(), 16000).decode()}
-        if args.provider == 'go':
-            native_auth = json.loads(files[auth_path])
-            if not isinstance(native_auth, dict) or 'opencode-go' not in native_auth:
-                raise ValueError('Native file has no OpenCode Go credential')
-            files[auth_path] = json.dumps({'opencode-go': native_auth['opencode-go']})
+            if args.provider == 'go':
+                native_auth = json.loads(files[auth_path])
+                if not isinstance(native_auth, dict) or 'opencode-go' not in native_auth:
+                    raise ValueError('Native file has no OpenCode Go credential')
+                files[auth_path] = json.dumps({'opencode-go': native_auth['opencode-go']})
         if args.config_file:
             files[config_path] = private_fs.read_bytes(Path(args.config_file).expanduser().absolute(), 16000).decode()
+        default_args = ['--model', 'opencode-go/muse-spark-1.3-contributor'] if args.provider == 'go' else (['--model', 'glm-5.3-flash'] if args.provider == 'zai' else [])
         bundle = {'label': args.label, 'provider': args.provider, 'version': args.version or version, 'files': files,
-                  'env': env, 'args': ['--model', 'opencode-go/muse-spark-1.3-contributor'] if args.provider == 'go' else []}
+                  'env': env, 'args': default_args}
     if not isinstance(bundle, dict) or not LABEL.fullmatch(bundle.get('label', '')):
         raise ValueError('Invalid managed bundle')
     if not args.file and args.provider == 'gemini':

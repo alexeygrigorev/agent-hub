@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -216,3 +217,217 @@ def test_go_host_and_server_accept_same_diagnostic_arguments():
     b['args']=['--model','glm-5.3','--version']
     with pytest.raises(ValueError):
         p.validate(b)
+
+
+def test_zai_import_via_token_file(tmp_path):
+    from types import SimpleNamespace
+    d = tmp_path / 'private'; d.mkdir(mode=0o700)
+    token = d / 'zai-token'; token.write_text('synthetic-zai-token\n'); token.chmod(0o600)
+    args = SimpleNamespace(engines_cmd='add', file=None, provider='zai', label='my-zai', auth_file=None,
+                           token_file=str(token), config_file=None, version=None)
+    with patch.object(p.bus, '_do_request', return_value={'status': 'configured'}) as request:
+        p.command(args)
+    payload = request.call_args.args[2]
+    assert payload['provider'] == 'zai'
+    assert payload['version'] == '0.155.1'
+    assert payload['env'] == {'ZAI_API_KEY': 'synthetic-zai-token'}
+    assert payload['args'] == ['--model', 'glm-5.3-flash']
+    assert '.config/goz/config.json' in payload['files']
+    assert '.zcodex/config.toml' in payload['files']
+    assert '.zcode/v2/credentials.json' not in payload['files']
+
+
+def test_zai_import_via_credentials_auth_file(tmp_path):
+    from types import SimpleNamespace
+    d = tmp_path / 'private'; d.mkdir(mode=0o700)
+    auth = d / 'credentials.json'
+    auth.write_text(json.dumps({'oauth:zai:access_token': 'auth-file-token', 'zcodejwttoken': 'jwt-token'}))
+    auth.chmod(0o600)
+    args = SimpleNamespace(engines_cmd='add', file=None, provider='zai', label='my-zai', auth_file=str(auth),
+                           token_file=None, config_file=None, version=None)
+    with patch.object(p.bus, '_do_request', return_value={'status': 'configured'}) as request:
+        p.command(args)
+    payload = request.call_args.args[2]
+    assert payload['provider'] == 'zai'
+    assert payload['env'] == {'ZAI_API_KEY': 'auth-file-token'}
+    assert payload['args'] == ['--model', 'glm-5.3-flash']
+    assert '.zcode/v2/credentials.json' in payload['files']
+
+
+def test_zai_installation_with_native_binary_and_execution(tmp_path):
+    b = {'label': 'zai-account', 'provider': 'zai', 'version': '0.155.1',
+         'revision': '33333333-3333-4333-8333-333333333333',
+         'files': {'.zcode/v2/credentials.json': '{"token":"zai-secret"}'},
+         'env': {'ZAI_API_KEY': 'zai-secret'},
+         'args': ['--model', 'glm-5.3-flash']}
+    fake_zcodex = tmp_path / 'fake-zcodex'
+    fake_zcodex.write_text('#!/bin/sh\nif [ "$1" = "--version" ]; then echo "codex-cli 0.0.0"; exit 0; fi\nexit 0\n')
+    fake_zcodex.chmod(0o700)
+    fake_runtime = tmp_path / 'zcode.cjs'
+    fake_runtime.write_text('// fake runtime\n')
+
+    with patch.object(p, 'locate_native_zcodex', return_value=fake_zcodex), \
+         patch.object(p, 'locate_zcode_runtime', return_value=fake_runtime):
+        assert p.sync(lambda method, path, payload=None: {'engines': [b]} if method == 'GET' else {'status': 'installed'})['profiles'] == ['hub-zai-account']
+
+    config_text = p.profile_path().read_text()
+    assert '[profiles.hub-zai-account]' in config_text
+    assert 'engine = "codex"' in config_text
+
+    cred = next(p.root().glob('zai-account-*/home/.zcode/v2/credentials.json'))
+    assert cred.stat().st_mode & 0o777 == 0o600
+
+    with patch.object(p.sys, 'argv', ['wrapper', 'zai-account', '--version']), patch.object(p.os, 'execve') as execute:
+        p.execute()
+    executable, argv, env = execute.call_args.args
+    assert argv[-1] == '--version'
+    assert '--model' in argv and 'glm-5.3-flash' in argv
+    assert env['ZAI_API_KEY'] == 'zai-secret'
+    assert env['CODEX_HOME'].endswith('/home/.zcodex')
+    assert env['ZCODE_HOME'].endswith('/home/.zcode')
+
+
+def test_zai_installation_fails_closed_when_runtime_missing(tmp_path):
+    b = {'label': 'zai-account', 'provider': 'zai', 'version': '0.155.1',
+         'revision': '77777777-7777-7777-8777-777777777777',
+         'files': {'.config/goz/config.json': '{}'},
+         'env': {'ZAI_API_KEY': 'zai-secret'},
+         'args': ['--model', 'glm-5.3-flash']}
+    fake_zcodex = tmp_path / 'fake-zcodex'
+    fake_zcodex.write_text('#!/bin/sh\nexit 0\n')
+    fake_zcodex.chmod(0o700)
+
+    with patch.object(p, 'locate_native_zcodex', return_value=fake_zcodex), \
+         patch.object(p, 'ensure_zcode_runtime', return_value=None):
+        with pytest.raises(ValueError, match='ZCode runtime missing'):
+            p.sync(lambda method, path, payload=None: {'engines': [b]} if method == 'GET' else {'status': 'installed'})
+
+
+def test_zai_multiple_labels_coexist_on_one_machine(tmp_path):
+    b1 = {'label': 'zai-personal', 'provider': 'zai', 'version': '0.155.1',
+          'revision': '44444444-4444-4444-8444-444444444444',
+          'files': {'.zcode/v2/credentials.json': 'personal-marker'},
+          'env': {'ZAI_API_KEY': 'personal-key'},
+          'args': ['--model', 'glm-5.3-flash']}
+    b2 = {'label': 'zai-work', 'provider': 'zai', 'version': '0.155.1',
+          'revision': '55555555-5555-4555-8555-555555555555',
+          'files': {'.zcode/v2/credentials.json': 'work-marker'},
+          'env': {'ZAI_API_KEY': 'work-key'},
+          'args': ['--model', 'glm-5.3-flash']}
+    fake_zcodex = tmp_path / 'fake-zcodex'
+    fake_zcodex.write_text('#!/bin/sh\nexit 0\n')
+    fake_zcodex.chmod(0o700)
+    fake_runtime = tmp_path / 'zcode.cjs'
+    fake_runtime.write_text('// fake runtime\n')
+
+    with patch.object(p, 'locate_native_zcodex', return_value=fake_zcodex), \
+         patch.object(p, 'locate_zcode_runtime', return_value=fake_runtime):
+        result = p.sync(lambda method, path, payload=None: {'engines': [b1, b2]} if method == 'GET' else {'status': 'installed'})
+        assert sorted(result['profiles']) == ['hub-zai-personal', 'hub-zai-work']
+
+    config_text = p.profile_path().read_text()
+    assert '[profiles.hub-zai-personal]' in config_text
+    assert '[profiles.hub-zai-work]' in config_text
+
+    subs = p.managed_subscriptions()
+    labels = {s['account_label'] for s in subs}
+    assert labels == {'zai-personal', 'zai-work'}
+    assert all(s['service'] == 'zai' and s['engine'] == 'codex' for s in subs)
+
+
+def test_zai_rejection_of_opencode_muse_model():
+    b = {'label': 'bad-zai', 'provider': 'zai', 'version': '0.155.1',
+         'revision': '66666666-6666-4666-8666-666666666666',
+         'files': {}, 'env': {},
+         'args': ['--model', 'opencode-go/muse-spark-1.3-contributor']}
+    with pytest.raises(ValueError, match='Z.ai cannot route OpenCode Muse'):
+        p.validate(b)
+
+
+def test_real_clean_install_diagnostic_on_hetzner(tmp_path, monkeypatch):
+    """Real clean install check requiring genuine local zcodex binary and genuine ZCode runtime."""
+    real_zcodex = Path('/home/alexey/.local/bin/zcodex')
+    real_runtime = Path('/opt/ZCode/resources/glm/zcode.cjs')
+    if not real_zcodex.is_file() or not real_runtime.is_file():
+        pytest.skip('Native zcodex or /opt/ZCode runtime not installed on this host')
+
+    b = {'label': 'diag-zai', 'provider': 'zai', 'version': '0.155.1',
+         'revision': '88888888-8888-4888-8888-888888888888',
+         'files': {'.config/goz/config.json': '{"zai_token":"diag-token"}'},
+         'env': {'ZAI_API_KEY': 'diag-token'},
+         'args': ['--model', 'glm-5.3-flash']}
+
+    monkeypatch.setattr(p, 'root', lambda: tmp_path / 'managed-engines')
+    monkeypatch.setenv('APLEXER_CONFIG', str(tmp_path / 'aplexer' / 'config.toml'))
+
+    res = p.sync(lambda method, path, payload=None: {'engines': [b]} if method == 'GET' else {'status': 'installed'})
+    assert res['profiles'] == ['hub-diag-zai']
+
+    wrapper = tmp_path / 'managed-engines' / f"diag-zai-{b['revision']}" / 'engine/bin/zcodex'
+    assert wrapper.is_file() and os.access(wrapper, os.X_OK)
+
+    import subprocess
+    proc = subprocess.run([str(wrapper), '--version'], capture_output=True, text=True, timeout=15)
+    assert proc.returncode == 0
+    assert 'codex-cli' in proc.stdout
+
+
+def test_parse_deb_manifest_rejects_missing_or_malformed_checksum():
+    # Missing checksum
+    no_sha = "files:\n  - url: https://cdn.example.com/zcode.deb\n"
+    url, sha = p.parse_deb_manifest(no_sha)
+    assert url is None and sha is None
+
+    # Invalid base64 checksum length
+    bad_len = "files:\n  - url: https://cdn.example.com/zcode.deb\n    sha512: dG9vc2hvcnQ=\n"
+    url, sha = p.parse_deb_manifest(bad_len)
+    assert url == "https://cdn.example.com/zcode.deb" and sha is None
+
+    # Valid base64 sha512 (64 bytes = 88 base64 chars)
+    import base64
+    valid_b64 = base64.b64encode(b"a" * 64).decode()
+    good = f"files:\n  - url: https://cdn.example.com/zcode.deb\n    sha512: {valid_b64}\n"
+    url, sha = p.parse_deb_manifest(good)
+    assert url == "https://cdn.example.com/zcode.deb" and sha == valid_b64
+
+
+def test_ensure_zcode_runtime_rejects_missing_manifest_checksum(tmp_path, monkeypatch):
+    monkeypatch.setattr(p, 'locate_zcode_runtime', lambda dest=None: None)
+    # Mock curl to write a manifest without sha512
+    def fake_run(cmd, *args, **kwargs):
+        if 'manifest' in str(cmd):
+            for i, arg in enumerate(cmd):
+                if arg == '-o':
+                    Path(cmd[i+1]).write_text("files:\n  - url: https://cdn.example.com/zcode.deb\n")
+                    return subprocess.CompletedProcess(cmd, 0)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+    with pytest.raises(ValueError, match='ZCode runtime missing'):
+        p.ensure_zcode_runtime(tmp_path)
+
+
+def test_install_rejects_zcodex_missing_or_mismatched_sha256(tmp_path, monkeypatch):
+    b = {'label': 'zai-bad-sha', 'provider': 'zai', 'version': '0.155.1',
+         'revision': '99999999-9999-4999-8999-999999999999',
+         'files': {}, 'env': {'ZAI_API_KEY': 'tok'},
+         'args': ['--model', 'glm-5.3-flash']}
+
+    monkeypatch.setattr(p, 'locate_native_zcodex', lambda bundle=None: None)
+    monkeypatch.setattr(p, 'root', lambda: tmp_path / 'managed-engines')
+
+    # Mock curl to return SHA256SUMS with no matching hash or bad length
+    def fake_run(cmd, *args, **kwargs):
+        cmd_str = ' '.join(str(c) for c in cmd)
+        if 'SHA256SUMS' in cmd_str:
+            for i, arg in enumerate(cmd):
+                if arg == '-o':
+                    Path(cmd[i+1]).write_text("1234not64chars zcodex-linux-amd64.tar.zst\n")
+                    return subprocess.CompletedProcess(cmd, 0)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+    with pytest.raises(ValueError, match='Managed engine installation failed'):
+        p.install(b)
+
+

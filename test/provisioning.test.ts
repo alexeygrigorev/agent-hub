@@ -97,3 +97,46 @@ it('keeps Gemini login local, relays only native consent link and encrypts submi
   await s.handle(req('/test-account','POST',{revision:a.revision,authenticated:true}),host);
   expect(sql.exec('SELECT * FROM fleet_routes').toArray()).toHaveLength(1);
 }));
+
+it('provisions central Z.ai accounts, isolates zcodex routes and supports multiple labels on one host', async () => fixture(async (s, sql) => {
+  const zaiBundle1 = {
+    label: 'zai-personal',
+    provider: 'zai',
+    version: '0.2.0',
+    files: { '.zcode/v2/credentials.json': 'personal-zai-marker' },
+    env: { ZAI_API_KEY: 'personal-key' },
+    args: ['--model', 'glm-5.3-flash'],
+  };
+  const zaiBundle2 = {
+    label: 'zai-work',
+    provider: 'zai',
+    version: '0.2.0',
+    files: { '.zcode/v2/credentials.json': 'work-zai-marker' },
+    env: { ZAI_API_KEY: 'work-key' },
+    args: ['--model', 'glm-5.3-flash'],
+  };
+  const badZai = { ...zaiBundle1, args: ['--model', 'opencode-go/muse-spark-1.3-contributor'] };
+  expect((await s.handle(req('/zai-personal', 'PUT', badZai), admin)).status).toBe(400);
+
+  const a: any = await (await s.handle(req('/zai-personal', 'PUT', zaiBundle1), admin)).json();
+  const b: any = await (await s.handle(req('/zai-work', 'PUT', zaiBundle2), admin)).json();
+
+  const accounts = sql.exec("SELECT * FROM fleet_accounts WHERE provider='zai' ORDER BY label").toArray();
+  expect(accounts).toEqual([
+    { label: 'zai-personal', provider: 'zai', max_concurrency: 1, reserve_percent: 0, enabled: 1 },
+    { label: 'zai-work', provider: 'zai', max_concurrency: 1, reserve_percent: 0, enabled: 1 },
+  ]);
+
+  const sync: any = await (await s.handle(req('/sync'), host)).json();
+  expect(sync.engines.find((e: any) => e.label === 'zai-personal').files['.zcode/v2/credentials.json']).toBe('personal-zai-marker');
+  expect(sync.engines.find((e: any) => e.label === 'zai-work').files['.zcode/v2/credentials.json']).toBe('work-zai-marker');
+
+  await s.handle(req('/zai-personal', 'POST', { revision: a.revision }), host);
+  await s.handle(req('/zai-work', 'POST', { revision: b.revision }), host);
+
+  const routes = sql.exec("SELECT * FROM fleet_routes WHERE engine='codex' AND account LIKE 'zai-%' ORDER BY account").toArray();
+  expect(routes).toEqual([
+    { machine_id: 'test-machine', engine: 'codex', account: 'zai-personal', profile: 'hub-zai-personal' },
+    { machine_id: 'test-machine', engine: 'codex', account: 'zai-work', profile: 'hub-zai-work' },
+  ]);
+}));
