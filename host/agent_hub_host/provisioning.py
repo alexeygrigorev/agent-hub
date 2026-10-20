@@ -602,7 +602,7 @@ def launcher_metadata(provider, bundle=None):
     elif provider == 'gemini':
         return {
             'launcher_provider': 'gemini',
-            'launcher_model': model or 'gemini-4-argon-high',
+            'launcher_model': model or 'gemini-2.5-pro',
             'launcher_effort': effort or 'high',
         }
     return {}
@@ -662,6 +662,16 @@ def engine_environment(bundle, home, dest=None):
         if runtime:
             env['ZCODE_CJS'] = str(runtime)
     env.update(bundle.get('env') or {})
+    if bundle.get('provider') == 'claude':
+        for k in (
+            'CLAUDE_CODE_USE_BEDROCK',
+            'CLAUDE_CODE_USE_VERTEX',
+            'CLAUDE_CODE_USE_FOUNDRY',
+            'ANTHROPIC_API_KEY',
+            'ANTHROPIC_AUTH_TOKEN',
+            'ANTHROPIC_CUSTOM_HEADERS',
+        ):
+            env.pop(k, None)
     return env
 
 
@@ -669,6 +679,12 @@ def probe_native_gemini_quota(bundle, dest, model=None):
     """Authoritative native Google Code Assist quota probe using native_google_quota."""
     from . import native_google_quota
     return native_google_quota.probe(bundle, dest, model=model)
+
+
+def probe_native_claude_quota(bundle, dest, model=None):
+    """Authoritative native Claude quota probe using native_claude_quota."""
+    from . import native_claude_quota
+    return native_claude_quota.probe(bundle, dest, model=model)
 
 
 def quotas():
@@ -686,6 +702,9 @@ def quotas():
                 if b.get('provider') == 'gemini':
                     from . import native_google_quota
                     raw = native_google_quota.probe(b, dest)
+                elif b.get('provider') == 'claude':
+                    from . import native_claude_quota
+                    raw = native_claude_quota.probe(b, dest)
                 else:
                     with tempfile.TemporaryFile(dir=root()) as output:
                         result = subprocess.run(['quse', b['provider'], '--json'], env=engine_environment(b, dest / 'home', dest),

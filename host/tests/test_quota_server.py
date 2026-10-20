@@ -60,3 +60,25 @@ class ServerQuotaTests(unittest.TestCase):
                 return {}
             payload = quota_server.collect_accounts(settings, runner=broken)
             self.assertEqual(payload['accounts'][1]['quota']['status'], 'error')
+
+    def test_managed_claude_account_discovery_and_sanitization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'state.json'
+            state.write_text(json.dumps([{'label': 'my-claude', 'provider': 'claude', 'revision': 'rev-opaque'}]))
+            def runner(argv, **kwargs):
+                if isinstance(argv, str):
+                    return {}
+                self.assertEqual(argv, ['hub', 'engines', 'quota'])
+                return {'accounts': [{'account': 'my-claude', 'provider': 'claude', 'quota': {
+                    'status': 'ok', 'details': {'limit_reached': False, 'token': 'must-not-leak'},
+                    'windows': {'5h': {'percent_remaining': 75.0, 'reset_at': '2030-01-01T05:00:00Z'},
+                                '7d': {'percent_remaining': 85.0, 'reset_at': '2030-01-07T00:00:00Z'}}}}]}
+            settings = {'accounts': [{'provider': 'codex', 'account': 'main'}], 'managed_state_file': str(state)}
+            payload = quota_server.collect_accounts(settings, runner=runner)
+            claude_row = payload['accounts'][1]
+            self.assertEqual(claude_row['account'], 'my-claude')
+            self.assertEqual(claude_row['provider'], 'claude')
+            self.assertEqual(claude_row['quota']['status'], 'ok')
+            self.assertEqual(claude_row['quota']['windows']['5h']['percent_remaining'], 75.0)
+            self.assertEqual(claude_row['quota']['windows']['7d']['percent_remaining'], 85.0)
+            self.assertNotIn('must-not-leak', json.dumps(payload))

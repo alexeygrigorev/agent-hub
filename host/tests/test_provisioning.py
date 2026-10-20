@@ -146,6 +146,34 @@ def test_managed_quota_unknown_on_probe_failure_without_stale_success():
     assert 'synthetic-private-marker' not in json.dumps(result)
 
 
+def test_claude_uses_native_claude_quota():
+    claude_bundle = {**bundle(), 'provider': 'claude', 'version': '2.1.304', 'files': {}, 'env': {'CLAUDE_CODE_OAUTH_TOKEN': 'token-synthetic'}}
+    def claude_installer(argv, **kwargs):
+        if '--version' in argv:
+            return subprocess.CompletedProcess(argv, 0)
+        prefix = Path(argv[argv.index('--prefix') + 1])
+        package = prefix / 'node_modules' / '@anthropic-ai' / 'claude-code-linux-x64'
+        package.mkdir(parents=True, exist_ok=True)
+        (package / 'package.json').write_text(json.dumps({'version': '2.1.304'}))
+        binary = package / 'claude'
+        binary.write_text('#!/bin/sh\nexit 0\n')
+        binary.chmod(0o700)
+        return subprocess.CompletedProcess(argv, 0)
+    with patch.object(p.subprocess, 'run', side_effect=claude_installer):
+        p.sync(lambda *a: {'engines': [claude_bundle]})
+    with patch('agent_hub_host.native_claude_quota.probe', return_value={'claude': {
+        'status': 'ok',
+        'details': {'limit_reached': False, 'source': 'native_claude_oauth_usage'},
+        'windows': {'5h': {'percent_remaining': 80.0, 'reset_at': '2030-01-01T00:00:00Z'},
+                    '7d': {'percent_remaining': 90.0, 'reset_at': '2030-01-05T00:00:00Z'}},
+    }}):
+        result = p.quotas()
+    assert result['accounts'][0]['provider'] == 'claude'
+    assert result['accounts'][0]['quota']['status'] == 'ok'
+    assert result['accounts'][0]['quota']['windows']['5h']['percent_remaining'] == 80.0
+    assert result['accounts'][0]['quota']['windows']['7d']['percent_remaining'] == 90.0
+
+
 def test_gemini_uses_native_machine_login_and_rejects_cache_copy():
     b = {**bundle(), 'provider': 'gemini', 'auth_method': 'machine-login', 'files': {}, 'env': {}}
     p.validate(b)
@@ -719,6 +747,63 @@ def test_check_codex_quota_gate_contract(monkeypatch):
     allowed, reason = p.check_codex_quota_gate(env)
     assert allowed is False
     assert reason == 'stale_window_evidence'
+
+
+def test_gemini_launcher_metadata_defaults_to_native_gemini_2_5_pro():
+    meta = p.launcher_metadata('gemini', {'args': []})
+    assert meta['launcher_provider'] == 'gemini'
+    assert meta['launcher_model'] == 'gemini-2.5-pro'
+
+
+def test_claude_engine_environment_clears_ambient_cloud_and_api_keys(tmp_path, monkeypatch):
+    monkeypatch.setenv('CLAUDE_CODE_USE_BEDROCK', '1')
+    monkeypatch.setenv('CLAUDE_CODE_USE_VERTEX', '1')
+    monkeypatch.setenv('CLAUDE_CODE_USE_FOUNDRY', '1')
+    monkeypatch.setenv('ANTHROPIC_API_KEY', 'sk-ant-ambient')
+    monkeypatch.setenv('ANTHROPIC_AUTH_TOKEN', 'token-ambient')
+    monkeypatch.setenv('ANTHROPIC_CUSTOM_HEADERS', 'h1')
+
+    b = {
+        'provider': 'claude',
+        'env': {'CLAUDE_CODE_OAUTH_TOKEN': 'exact-portable-token'},
+    }
+    env = p.engine_environment(b, tmp_path / 'home', dest=tmp_path)
+    assert env['CLAUDE_CODE_OAUTH_TOKEN'] == 'exact-portable-token'
+    assert 'CLAUDE_CODE_USE_BEDROCK' not in env
+    assert 'CLAUDE_CODE_USE_VERTEX' not in env
+    assert 'CLAUDE_CODE_USE_FOUNDRY' not in env
+    assert 'ANTHROPIC_API_KEY' not in env
+    assert 'ANTHROPIC_AUTH_TOKEN' not in env
+    assert 'ANTHROPIC_CUSTOM_HEADERS' not in env
+
+
+def test_claude_uses_native_claude_quota(tmp_path, monkeypatch):
+    tmp_path.chmod(0o700)
+    root_dir = tmp_path / 'managed'
+    root_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: root_dir)
+    b = bundle()
+    b['provider'] = 'claude'
+    b['env'] = {'CLAUDE_CODE_OAUTH_TOKEN': 'tok-c'}
+    state = [{'label': b['label'], 'revision': b['revision'], 'provider': 'claude'}]
+    p.write_json(root_dir / 'state.json', state)
+    inst_dir = root_dir / f"{b['label']}-{b['revision']}"
+    inst_dir.mkdir(mode=0o700)
+    p.write_json(inst_dir / 'bundle.json', b)
+
+    mock_res = {
+        'claude': {
+            'status': 'ok',
+            'details': {'limit_reached': False, 'source': 'native_claude_oauth_usage'},
+            'windows': {'5h': {'percent_remaining': 80.0, 'reset_at': '2030-01-01T00:00:00Z'}},
+        }
+    }
+    with patch('agent_hub_host.native_claude_quota.probe', return_value=mock_res) as mock_probe:
+        res = p.quotas()
+        assert len(res['accounts']) == 1
+        assert res['accounts'][0]['provider'] == 'claude'
+        assert mock_probe.called
+
 
 
 
