@@ -378,7 +378,7 @@ def session_metadata(raw, settings):
             created_at_ms = None
         clean.append({"native_id": session["id"], "tag": session["tag"], "workspace": session.get("workspace", ""), "engine": engine,
                       "profile": profile, "account": matches[0]["account_label"] if len(matches) == 1 else None,
-                      "phase": session.get("phase", "unknown"), "agent_state": session.get("reported_state"),
+                      "phase": session.get("state") or session.get("phase", "unknown"), "agent_state": session.get("reported_state"),
                       "cwd": session.get("cwd") if isinstance(session.get("cwd"), str) else None,
                       "last_activity_at": _ms_to_iso(session.get("last_activity_ms")),
                       "created_at_ms": created_at_ms})
@@ -1253,7 +1253,7 @@ class Dispatcher:
         hb['gate'] = {'launch_allowed': allowed, 'reason': 'fleet local admission' if allowed else 'fleet admission unavailable', 'at': utcnow()}
         self.request('POST', '/api/host/poll', hb)
         self.request("PUT", "/api/fleet/subscriptions", {"subscriptions": collect_subscriptions(self.settings, self.runner)})
-        raw = self.runner([self.settings.get("aplexer_bin", "aplexer"), "list", "--json"])
+        raw = self.runner([self.settings.get("aplexer_bin", "aplexer"), "list", "--all", "--json"])
         self.request("PUT", "/api/fleet/sessions", {"sessions": session_metadata(raw, self.settings)})
         # Reconcile Fleet-owned starts into exact Hub session bindings after
         # reporting the observed native catalog. Retry is read-before-write.

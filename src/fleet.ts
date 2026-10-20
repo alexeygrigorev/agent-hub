@@ -204,7 +204,7 @@ export class FleetService {
     }
     if (remaining !== null && remaining <= account.reserve_percent) blocked = true;
     const reserved = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE account = ? AND state IN ${ACTIVE}`, account.label).one().n);
-    const observedSessions = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running') AND NOT EXISTS (SELECT 1 FROM fleet_launches l WHERE l.machine_id = s.machine_id AND l.native_id = s.native_id AND l.state IN ${ACTIVE})`, account.label).one().n);
+    const observedSessions = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown') AND NOT EXISTS (SELECT 1 FROM fleet_launches l WHERE l.machine_id = s.machine_id AND l.native_id = s.native_id AND l.state IN ${ACTIVE})`, account.label).one().n);
     const active = reserved + observedSessions;
     return { label: account.label, provider: account.provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled,
       remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || unknown || remaining === null) ? 'unknown' : 'ok', active, available_slots: Math.max(0, Number(account.max_concurrency) - active),
@@ -231,16 +231,12 @@ export class FleetService {
     // whose (engine, profile) pair is a configured member of the tier, while
     // the existing score order still decides placement. An explicit engine
     // outside the tier simply matches nothing (honest no_eligible_route).
-    let tierPairs: Set<string> | null = null;
-    if (input.tier !== undefined) {
+    let tierModels: typeof policy.models | null = null;
+    if (input.tier != null) {
       const tier = taskTier({ tier: input.tier });
       if (!tier) return { error: 'invalid_launch_request' };
       const members: string[] = (policy.tiers as any)[tier] || [];
-      tierPairs = new Set(
-        policy.models
-          .filter(m => members.includes(m.id))
-          .map(m => m.engine + '|' + (m.profile ?? '')),
-      );
+      tierModels = policy.models.filter(m => members.includes(m.id));
     }
     const request: any = { mode: input.mode || 'headless', machine: input.machine || null, engine: input.engine || null, workspace: input.workspace, cwd: input.cwd ?? null, prompt: input.prompt || '', parent_id: input.parent_id || null, summary: input.summary || (input.mode === 'interactive' ? 'Interactive session' : 'Agent task') };
     if (input.account !== undefined) request.account = input.account;
@@ -251,7 +247,17 @@ export class FleetService {
     const definitions = new Map(this.sql.exec('SELECT * FROM fleet_accounts').toArray().map(a => [a.label, a]));
     for (const route of this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray() as any[]) {
       if ((request.account && route.account !== request.account) || (request.machine && route.machine_id !== request.machine) || (request.engine && route.engine !== request.engine)) continue;
-      if (tierPairs && !tierPairs.has(route.engine + '|' + (route.profile ?? ''))) continue;
+      if (tierModels) {
+        const provider = definitions.get(route.account)?.provider;
+        // Named profiles share policy membership with their registered provider,
+        // never merely with an executable (Z.ai also uses the Codex engine).
+        const family = provider === 'codex-orin' ? 'codex' : provider;
+        if (!tierModels.some(m => m.engine === route.engine && m.provider === family &&
+            (m.profile === route.profile || (m.profile === null && route.profile !== null)))) {
+          rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'tier_unavailable' });
+          continue;
+        }
+      }
       // A disabled execution engine holds all new candidate planning, whatever the account label.
       if (disabledEngines().has(route.engine)) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'provider_disabled' }); continue; }
       const machine: any = this.sql.exec('SELECT * FROM machines WHERE id = ?', route.machine_id).toArray()[0];
@@ -269,7 +275,7 @@ export class FleetService {
       const pending = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND state IN ${ACTIVE}`, route.machine_id).one().n);
       const routingInstalled = this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'routing_machines'").toArray().length;
       const limit: any = routingInstalled ? this.sql.exec('SELECT max_agents FROM routing_machines WHERE machine_id = ?', route.machine_id).toArray()[0] : null;
-      const observedSessions = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.machine_id = ? AND s.phase IN ('starting','running') AND NOT EXISTS (SELECT 1 FROM fleet_launches l WHERE l.machine_id = s.machine_id AND l.native_id = s.native_id AND l.state IN ${ACTIVE})`, route.machine_id).one().n);
+      const observedSessions = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.machine_id = ? AND s.phase IN ('starting','running','broken','unknown') AND NOT EXISTS (SELECT 1 FROM fleet_launches l WHERE l.machine_id = s.machine_id AND l.native_id = s.native_id AND l.state IN ${ACTIVE})`, route.machine_id).one().n);
       if (limit && pending + observedSessions >= limit.max_agents) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'machine_capacity' }); continue; }
 
       const score = (account!.remaining_percent! / 100) / (1 + hb.load[0] / caps.cpu_count + pending);
@@ -467,6 +473,22 @@ export class FleetService {
           written++;
         }
         for (const gone of existing.keys()) { this.sql.exec('DELETE FROM fleet_sessions WHERE machine_id = ? AND native_id = ?', caller.machineId!, gone); written++; }
+        // Terminal catalog evidence settles interactive launches only when it
+        // matches the bound native incarnation. Absence is never exit proof;
+        // headless launches retain the maintained launcher's result contract.
+        for (const native of cleanSessions) {
+          if (!['exited', 'dead'].includes(native.phase) || !native.created_at_ms) continue;
+          const managed = this.sql.exec("SELECT * FROM session_control_sessions WHERE machine_id = ? AND mode = 'interactive' AND fleet_launch_id IS NOT NULL AND binding_json IS NOT NULL", caller.machineId!).toArray() as any[];
+          for (const session of managed) {
+            const binding = parsed(session.binding_json);
+            if (binding.native_id !== native.native_id || binding.tag !== native.tag ||
+                binding.workspace !== native.workspace || binding.native_created_at_ms !== native.created_at_ms ||
+                session.engine !== native.engine) continue;
+            const at = new Date(this.now()).toISOString();
+            this.sql.exec("UPDATE fleet_launches SET state = 'exited', finished_at = ?, updated_at = ?, verification_status = 'verified' WHERE id = ? AND machine_id = ? AND native_id = ? AND mode = 'interactive' AND state IN ('starting','running','uncertain')", at, at, session.fleet_launch_id, caller.machineId!, native.native_id);
+            this.sql.exec("UPDATE session_control_sessions SET state = 'stopped', updated_at = ? WHERE id = ? AND state IN ('starting','running','uncertain')", at, session.id);
+          }
+        }
         adoptObservedNativeSessions(this.sql, caller.machineId!, cleanSessions, this.now());
         return response({ status: 'reported', written });
       });

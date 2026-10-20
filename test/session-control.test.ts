@@ -701,6 +701,14 @@ describe('absolute workspace identifiers and friendly names', () => {
       },
     ];
 
+    it('projects a broken worker as uncertain and never as a confirmed stop', async () => {
+      await fixture(async (s, sql) => {
+        adoptObservedNativeSessions(sql, 'hetzner', [{ ...SAMPLES[0], phase: 'broken' }], Date.now());
+        const row = sql.exec('SELECT state FROM session_control_sessions WHERE id=?', SAMPLES[0].native_id).one();
+        expect(row.state).toBe('uncertain');
+      });
+    });
+
     it('adopts native sessions with exact incarnation, machine, engine, and deduplicates across polls', async () => {
       await fixture(async (s, sql) => {
         const firstAdopt = adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());

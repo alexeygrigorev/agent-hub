@@ -579,7 +579,7 @@ def main():
         import uuid
         try:
             if args.cmd == 'fleet':
-                result = bus._do_request('GET', '/api/fleet')
+                result = session_control.request('GET', '/api/fleet')
             elif args.cmd in ('subscriptions', 'fleet-host'):
                 settings = fleet.load_settings(args.config)
                 if args.cmd == 'fleet-host':
@@ -603,13 +603,33 @@ def main():
                     payload['engine_override_reason'] = reason.strip()
                 if args.parent: payload['parent_id'] = args.parent
                 if args.prompt_file:
-                    if args.cmd == 'start-session': raise ValueError('Interactive sessions start at an empty native prompt')
                     with Path(args.prompt_file).open('r', encoding='utf-8') as source:
                         prompt = source.read(16001)
                     if len(prompt) > 16000: raise ValueError('Goal exceeds 16000 characters')
                     payload['prompt'] = prompt
-                result = bus._do_request('POST', '/api/fleet/plan' if args.cmd == 'plan-agent' else '/api/fleet/launches', payload)
+                if args.cmd == 'start-session':
+                    # Interactive starts bind an empty terminal first. Deliver the
+                    # uploaded prompt through the normal correlated command path.
+                    prompt = payload.pop('prompt', None)
+                    start = {k: v for k, v in payload.items() if k not in ('summary', 'idempotency_key', 'account')}
+                    if args.account:
+                        raise ValueError('start-session uses policy routing; omit --account')
+                    start['key'] = payload['idempotency_key']
+                    result = session_control.request('POST', '/api/sessions', start)
+                    if prompt is not None:
+                        bound = session_control.wait_for_session(result['id'], 300, 5)
+                        result['binding_wait'] = bound
+                        if bound.get('state') != 'running':
+                            raise ValueError('Interactive session did not become running; inspect sessions show before retrying')
+                        sent = session_control.request('POST', '/api/sessions/' + result['id'] + '/send',
+                                                       {'key': payload['idempotency_key'], 'body': prompt})
+                        result['prompt_command'] = sent
+                else:
+                    result = session_control.request('POST', '/api/fleet/plan' if args.cmd == 'plan-agent' else '/api/fleet/launches', payload)
             print(json.dumps(result, indent=2))
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
         except Exception:
             # Server/provider output may contain sensitive data; fail without echoing it.
             print('Hub fleet operation failed; check authentication, local configuration and admission.', file=sys.stderr)

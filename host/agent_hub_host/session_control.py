@@ -62,6 +62,13 @@ def request(method, path, payload=None):
                 err = hold.get('error')
             if isinstance(err, str) and err and len(err) <= 64 and err.replace('_', '').isalnum():
                 name = ' (%s)' % err
+            rejection = hold if isinstance(hold, dict) else data
+            if isinstance(rejection, dict) and isinstance(rejection.get('rejected'), list):
+                reasons = sorted({r['reason'] for r in rejection['rejected'][:100]
+                                  if isinstance(r, dict) and isinstance(r.get('reason'), str)
+                                  and re.fullmatch(r'[a-z][a-z_]{0,63}', r['reason'])})
+                if reasons:
+                    name += ' routes: ' + ', '.join(reasons)
             if isinstance(hold, dict) and isinstance(data.get('id'), str) and data.get('id'):
                 name += ' held session %s state %s' % (data['id'], data.get('state'))
         except Exception:
@@ -304,6 +311,9 @@ def add_commands(sub):
     capture.add_argument('--screen', action='store_true', help='Capture current rendered screen (plain) instead of raw tail')
     capture.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
     add_wait(capture)
+    capture.set_defaults(wait=True)
+    capture.add_argument('--no-wait', dest='wait', action='store_false',
+                         help='Return the queued command receipt without waiting for capture output')
     stop = commands.add_parser('stop', help='Enqueue stop; the hub releases capacity only on confirmed native exit')
     stop.add_argument('id')
     stop.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')

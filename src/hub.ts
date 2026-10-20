@@ -552,7 +552,7 @@ export class Hub extends DurableObject {
         return this.provisioningService.handle(request, await this.authenticateBusRequest(request));
       }
       if (path === '/api/fleet' || path.startsWith('/api/fleet/')) {
-        const auth = await this.authenticateBusRequest(request);
+        const auth = await this.sessionControlAuth(request);
         if (auth.caller?.isAdmin) {
           const session = await getSession(this.env, request);
           if (session) auth.caller.actor = 'human:' + session.sub;

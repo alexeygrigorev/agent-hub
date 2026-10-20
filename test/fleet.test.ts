@@ -45,6 +45,51 @@ describe('generic accounts and launch placement', () => {
     const stub = bindings.HUB.get(bindings.HUB.idFromName('hub'));
     expect((await stub.fetch(request('', undefined, 'GET'))).status).toBe(401);
   });
+  it('accepts the configured operator bearer for fleet and rejects mixed authority', async () => {
+    const bindings = env as unknown as Env;
+    const stub = bindings.HUB.get(bindings.HUB.idFromName('fleet-operator-' + crypto.randomUUID()));
+    const token = 'synthetic_operator_fleet_token_0123456789';
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token));
+    const hash = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+    await runInDurableObject(stub, async (hub: Hub) => { hub.env.HUB_ADMIN_TOKEN_SHA256 = hash; });
+    const call = (headers: Record<string, string>) => stub.fetch(new Request('https://hub.test/api/fleet', { headers }));
+    expect((await call({ Authorization: 'Bearer ' + token })).status).toBe(200);
+    expect((await call({ Authorization: 'Bearer invalid' })).status).toBe(401);
+    expect((await call({ Authorization: 'Bearer ' + token, Cookie: 'hub_session=invalid' })).status).toBe(403);
+  });
+  it('routes named provider profiles within their tier without treating Z.ai as Astra', async () => fixture(async (s, sql) => {
+    const data = registry();
+    data.routes[0].profile = 'secondary' as any;
+    await s.handle(request('/accounts', data, 'PUT'), admin);
+    const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
+    await s.handle(request('/subscriptions', { subscriptions: [{ service: 'codex', account: 'shared-codex', plan: 'pro', quota }] }, 'PUT'), host('hetzner'));
+    expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).selected?.profile).toBe('secondary');
+    sql.exec("UPDATE fleet_accounts SET provider='zai' WHERE label='shared-codex'");
+    expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).selected).toBeNull();
+    expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'tier_unavailable' });
+  }));
+  it('treats a null tier from session control as an omitted tier', async () => fixture(async (s) => {
+    await configure(s);
+    expect(s.plan(intent({ tier: null })).selected).toBeTruthy();
+  }));
+  it('settles only a matching terminal interactive incarnation, preserving live and headless launches', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const launch = await (await s.handle(request('/launches', intent({ mode: 'interactive', machine: 'hetzner' })), admin)).json() as any;
+    const nativeId = crypto.randomUUID();
+    sql.exec("UPDATE fleet_launches SET state='running', native_id=? WHERE id=?", nativeId, launch.id);
+    const binding = { native_id: nativeId, tag: 'hub-' + launch.id, workspace: '/demo', native_created_at_ms: now };
+    sql.exec("INSERT INTO session_control_sessions (id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+      crypto.randomUUID(), 'test-admin', 'terminal-test', '{}', launch.id, 'hetzner', 'codex', 'interactive', 'running', JSON.stringify(binding), iso(), iso());
+    const row = { native_id: nativeId, tag: binding.tag, workspace: binding.workspace, engine: 'codex', phase: 'exited', agent_state: null, profile: null, account: 'shared-codex', created_at_ms: now + 1 };
+    const report = (sessions: any[]) => s.handle(request('/sessions', { sessions }, 'PUT'), host('hetzner'));
+    expect((await report([row])).status).toBe(200);
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?', launch.id).one().state).toBe('running');
+    expect((await report([])).status).toBe(200);
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?', launch.id).one().state).toBe('running');
+    expect((await report([{ ...row, created_at_ms: now }])).status).toBe(200);
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?', launch.id).one().state).toBe('exited');
+    expect(sql.exec('SELECT state FROM session_control_sessions WHERE fleet_launch_id=?', launch.id).one().state).toBe('stopped');
+  }));
   it('rejects credential-shaped registry fields and non-admin writes without storing them', async () => fixture(async (s, sql) => {
     const data: any = registry(); data.accounts[0].token = 'forbidden';
     expect((await s.handle(request('/accounts', data, 'PUT'), admin)).status).toBe(400);

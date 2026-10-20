@@ -54,7 +54,7 @@ class TestCaptureScreenCli(unittest.TestCase):
 
     def test_screen_encodes_exact_payload(self):
         with patch.object(session_control, 'request', return_value={}) as transport:
-            session_control.execute(self.parse('capture', 'sid', '--max-bytes', '1024',
+            session_control.execute(self.parse('capture', 'sid', '--no-wait', '--max-bytes', '1024',
                                                '--screen', '--key', 'k'))
         self.assertEqual(transport.call_args.args[:2], ('POST', '/api/sessions/sid/capture'))
         self.assertEqual(transport.call_args.args[2],
@@ -62,7 +62,7 @@ class TestCaptureScreenCli(unittest.TestCase):
 
     def test_default_tail_wire_unchanged(self):
         with patch.object(session_control, 'request', return_value={}) as transport:
-            session_control.execute(self.parse('capture', 'sid', '--max-bytes', '1024',
+            session_control.execute(self.parse('capture', 'sid', '--no-wait', '--max-bytes', '1024',
                                                '--key', 'k'))
         self.assertEqual(transport.call_args.args[2], {'key': 'k', 'max_bytes': 1024})
 

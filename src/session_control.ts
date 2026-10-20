@@ -2120,7 +2120,7 @@ export function adoptObservedNativeSessions(
     } catch {}
     if (hubManaged) continue;
 
-    const state = TERMINAL_PHASES.has(s.phase) ? 'stopped' : (s.phase === 'starting' ? 'starting' : 'running');
+    const state = TERMINAL_PHASES.has(s.phase) ? 'stopped' : (s.phase === 'starting' ? 'starting' : s.phase === 'running' ? 'running' : 'uncertain');
     const createdAtIso = createdAtMs ? new Date(createdAtMs).toISOString() : isoNow;
     const requestName = typeof s.name === 'string' && s.name ? s.name : null;
     const requestOwner = typeof s.owner === 'string' && s.owner ? s.owner : null;

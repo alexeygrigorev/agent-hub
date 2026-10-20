@@ -84,11 +84,33 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertEqual(transport.call_args.args[:2], ('POST', '/api/sessions/sid/send'))
         self.assertEqual(transport.call_args.args[2], {'key': 'k', 'body': 'prompt'})
         with patch.object(session_control, 'request', return_value={}) as transport:
-            session_control.execute(self.parse('capture', 'sid', '--max-bytes', '1024', '--key', 'k'))
+            session_control.execute(self.parse('capture', 'sid', '--no-wait', '--max-bytes', '1024', '--key', 'k'))
         self.assertEqual(transport.call_args.args[2], {'key': 'k', 'max_bytes': 1024})
         with patch.object(session_control, 'request', return_value={}) as transport:
             session_control.execute(self.parse('stop', 'sid', '--key', 'k'))
         self.assertEqual(transport.call_args.args[:2], ('POST', '/api/sessions/sid/stop'))
+
+    def test_capture_waits_for_correlated_output_by_default(self):
+        with patch.object(session_control, 'request', return_value={'command_id': 'c1'}) as transport, \
+                patch.object(session_control, 'wait_for_command', return_value={'state': 'acked', 'ack': {'output': 'screen'}}) as wait:
+            result = session_control.execute(self.parse('capture', 'sid', '--screen', '--key', 'k'))
+        wait.assert_called_once_with('sid', 'c1', 300.0, 5.0)
+        self.assertEqual(result['command_wait']['ack']['output'], 'screen')
+
+    def test_route_rejections_are_bounded_codes_without_provider_details(self):
+        import os
+        import urllib.error
+        payload = {'error': 'no_eligible_route', 'rejected': [
+            {'reason': 'capability_unavailable'}, {'reason': 'account_capacity'},
+            {'reason': 'private error with secret'}, {'reason': 'account_capacity'}]}
+        failure = urllib.error.HTTPError('https://hub.test/api/fleet/launches', 409, 'held', {}, io.BytesIO(json.dumps(payload).encode()))
+        with patch.object(session_control.config, 'load_config', return_value={'base_url': 'https://hub.test'}), \
+                patch.dict(os.environ, {'HUB_TOKEN': 'fixture-env-token'}), \
+                patch.object(session_control.api, 'safe_http_json', side_effect=failure):
+            with self.assertRaises(ValueError) as raised:
+                session_control.request('POST', '/api/fleet/launches', {})
+        self.assertIn('account_capacity, capability_unavailable', str(raised.exception))
+        self.assertNotIn('private', str(raised.exception))
 
     def test_request_errors_hide_server_bodies(self):
         import os
@@ -282,7 +304,7 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertEqual(transport.call_args.args[:2], ('POST', '/api/sessions/dataops:batching/send'))
 
         with patch.object(session_control, 'request', return_value={'command_id': 'c2', 'state': 'recorded'}) as transport:
-            session_control.execute(self.parse('capture', 'git:crm-redesign', '--key', 'k2'))
+            session_control.execute(self.parse('capture', 'git:crm-redesign', '--no-wait', '--key', 'k2'))
         self.assertEqual(transport.call_args.args[:2], ('POST', '/api/sessions/git:crm-redesign/capture'))
 
         with patch.object(session_control, 'request', return_value={'command_id': 'c3', 'state': 'recorded'}) as transport:

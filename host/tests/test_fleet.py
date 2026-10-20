@@ -24,6 +24,11 @@ def offer(**kw):
 
 
 class FleetTests(unittest.TestCase):
+    def test_session_metadata_uses_live_liveness_over_persisted_phase(self):
+        raw = [{'id': 'id', 'tag': 'tag', 'workspace': '/repo', 'engine': 'codex',
+                'phase': 'running', 'state': 'broken', 'worker_alive': False}]
+        self.assertEqual(fleet.session_metadata(raw, settings(Path('/repo')))[0]['phase'], 'broken')
+
     def test_multi_account_config_and_secret_fields_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / 'subscriptions.json'

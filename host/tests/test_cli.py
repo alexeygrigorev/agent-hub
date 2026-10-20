@@ -7,6 +7,25 @@ import unittest
 HOST_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 class TestCliIsolated(unittest.TestCase):
+    def test_interactive_prompt_is_sent_after_binding(self):
+        from agent_hub_host import cli, session_control
+        from unittest.mock import patch, mock_open
+        from contextlib import redirect_stdout
+        import io
+        calls = []
+        def request(method, path, payload=None):
+            calls.append((method, path, payload))
+            return {'id': 'owned-session'} if path == '/api/sessions' else {'command_id': 'prompt-command'}
+        with patch.object(sys, 'argv', ['hub', 'start-session', '--machine', 'machine', '--workspace', 'home', '--tier', 'deep', '--prompt-file', 'goal', '--key', 'same-key']), \
+                patch('pathlib.Path.open', mock_open(read_data='throwaway goal')), \
+                patch.object(session_control, 'request', side_effect=request), \
+                patch.object(session_control, 'wait_for_session', return_value={'state': 'running'}), \
+                redirect_stdout(io.StringIO()):
+            cli.main()
+        self.assertEqual(calls[0][2]['mode'], 'interactive')
+        self.assertNotIn('prompt', calls[0][2])
+        self.assertEqual(calls[1], ('POST', '/api/sessions/owned-session/send', {'key': 'same-key', 'body': 'throwaway goal'}))
+
     def test_cli_main_help_isolated_subprocess(self):
         env = os.environ.copy()
         env["PYTHONPATH"] = HOST_DIR
@@ -118,7 +137,7 @@ class TestCliIsolated(unittest.TestCase):
 
 class TestCliUpdate(unittest.TestCase):
     def test_version_formatting(self):
-        from agent_hub_host import cli
+        from agent_hub_host import cli, session_control
         v_str = cli.format_version()
         self.assertTrue(v_str.startswith("0.1.0 ("))
         self.assertTrue(v_str.endswith(")"))
@@ -183,7 +202,7 @@ class TestCliUpdate(unittest.TestCase):
         import argparse
         import io
         from unittest.mock import patch, MagicMock
-        from agent_hub_host import cli
+        from agent_hub_host import cli, session_control
         response = MagicMock()
         response.status = 200
         response.read.return_value = b'{"built_from_commit":"fixture"}'
@@ -199,7 +218,7 @@ class TestCliUpdate(unittest.TestCase):
     def test_update_check_up_to_date(self):
         import io
         from unittest.mock import patch, MagicMock
-        from agent_hub_host import cli
+        from agent_hub_host import cli, session_control
 
         info = cli.get_build_info()
         manifest_data = {
@@ -222,7 +241,7 @@ class TestCliUpdate(unittest.TestCase):
     def test_update_check_warns_when_stale(self):
         import io
         from unittest.mock import patch, MagicMock
-        from agent_hub_host import cli
+        from agent_hub_host import cli, session_control
 
         manifest_data = {
             "version": "0.1.0",
@@ -248,7 +267,7 @@ class TestCliUpdate(unittest.TestCase):
         import tempfile
         from pathlib import Path
         from unittest.mock import patch, MagicMock
-        from agent_hub_host import cli
+        from agent_hub_host import cli, session_control
 
         dummy_binary = b"#!/usr/bin/env python3\nprint('hello')\n"
         digest = hashlib.sha256(dummy_binary).hexdigest()
@@ -285,7 +304,7 @@ class TestCliUpdate(unittest.TestCase):
         import tempfile
         from pathlib import Path
         from unittest.mock import patch, MagicMock
-        from agent_hub_host import cli
+        from agent_hub_host import cli, session_control
 
         dummy_binary = b"#!/usr/bin/env python3\nprint('hello')\n"
         manifest_data = {

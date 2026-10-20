@@ -534,7 +534,7 @@ class TestSessionRealWorker(unittest.TestCase):
         self.assertEqual(ack["proof"]["sender_native_id"], target["id"])
         # 5. Capture + stop complete the loop through the same path.
         from agent_hub_host import session_control as sc2
-        self.run_cli(["sessions", "capture", sid, "--max-bytes", "512", "--key", "c-real-1"],
+        self.run_cli(["sessions", "capture", sid, "--no-wait", "--max-bytes", "512", "--key", "c-real-1"],
                      token="sess-agent-token")
         self.receive_bounded(custody, sc2.request)
         self.run_cli(["sessions", "stop", sid, "--key", "t-real-1"], token="sess-agent-token")
