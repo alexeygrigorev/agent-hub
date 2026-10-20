@@ -621,6 +621,7 @@ def engine_environment(bundle, home, dest=None):
     env = {k: v for k, v in os.environ.items() if k not in ENV and k not in ('HUB_TOKEN', 'HUB_JOB_TOKEN', 'HUB_CONFIG_FILE', 'AGENT_HUB_MANAGED_DIR', 'HUB_MANAGED_DIR')}
     env.update(
         HOME=str(home),
+        GEMINI_CLI_HOME=str(home),
         USERPROFILE=str(home),
         APPDATA=str(home / 'AppData' / 'Roaming'),
         LOCALAPPDATA=str(home / 'AppData' / 'Local'),
@@ -648,35 +649,10 @@ def engine_environment(bundle, home, dest=None):
     return env
 
 
-def probe_native_gemini_quota(home):
-    """Authoritative native Gemini quota probe reading .gemini/oauth_creds.json without invoking AGY."""
-    creds_path = Path(home) / '.gemini' / 'oauth_creds.json'
-    if not creds_path.is_file():
-        return {}
-    try:
-        data = json.loads(creds_path.read_text(encoding='utf-8'))
-        if not data.get('access_token') and not data.get('refresh_token'):
-            return {}
-        expiry = data.get('expiry_date') or data.get('expires_at')
-        reset_at = None
-        if expiry:
-            if isinstance(expiry, (int, float)):
-                reset_at = datetime.fromtimestamp(expiry / 1000.0, timezone.utc).isoformat()
-            elif isinstance(expiry, str):
-                reset_at = expiry
-        return {
-            'gemini': {
-                'status': 'ok',
-                'windows': {
-                    'primary': {
-                        'percent_remaining': 100.0,
-                        'reset_at': reset_at or (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
-                    }
-                }
-            }
-        }
-    except Exception:
-        return {}
+def probe_native_gemini_quota(bundle, dest, model=None):
+    """Authoritative native Google Code Assist quota probe using native_google_quota."""
+    from . import native_google_quota
+    return native_google_quota.probe(bundle, dest, model=model)
 
 
 def quotas():
@@ -692,7 +668,8 @@ def quotas():
                 b = read_json(dest / 'bundle.json')
                 validate(b)
                 if b.get('provider') == 'gemini':
-                    raw = probe_native_gemini_quota(dest / 'home')
+                    from . import native_google_quota
+                    raw = native_google_quota.probe(b, dest)
                 else:
                     with tempfile.TemporaryFile(dir=root()) as output:
                         result = subprocess.run(['quse', b['provider'], '--json'], env=engine_environment(b, dest / 'home', dest),
