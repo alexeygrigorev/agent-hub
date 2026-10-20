@@ -41,9 +41,31 @@ export default {
       headers.delete('X-Forwarded-Host');
       request = new Request(request, { headers });
     }
-    if (url.pathname === '/healthz') {
+    // Constant edge liveness only: no authentication, storage or upstream calls.
+    // Readiness remains authenticated and exercises the existing Hub path.
+    if (url.pathname === '/livez') {
+      const headers = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' };
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
+        return new Response(null, { status: 405, headers: { ...headers, Allow: 'GET, HEAD' } });
+      }
+      return new Response(request.method === 'HEAD' ? null : JSON.stringify({ status: 'ok', component: 'hub-worker' }), {
+        headers: { ...headers, 'Content-Type': 'application/json' },
+      });
+    }
+    if (url.pathname === '/healthz' || url.pathname === '/api/healthz') {
       url.pathname = '/api/healthz';
-      return env.HUB.get(env.HUB.idFromName('hub')).fetch(new Request(url, request));
+      try {
+        const response = await env.HUB.get(env.HUB.idFromName('hub')).fetch(new Request(url, request));
+        const headers = new Headers(response.headers);
+        headers.set('Cache-Control', 'no-store');
+        return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+      } catch {
+        // No automatic replay: a reset is unavailable, never evidence of health.
+        // Do not expose platform exception details or private configuration.
+        return Response.json({ status: 'unavailable', component: 'hub-do' }, {
+          status: 503, headers: { 'Cache-Control': 'no-store', 'Retry-After': '5' },
+        });
+      }
     }
 
     if (url.pathname === '/mcp' || url.pathname.startsWith('/oauth/') || url.pathname.startsWith('/.well-known/') || url.pathname.startsWith('/api/') || url.pathname.startsWith('/auth/') || url.pathname.startsWith('/device')) {
