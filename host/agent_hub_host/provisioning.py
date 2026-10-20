@@ -517,13 +517,17 @@ def sync(request=None):
         write_json(root() / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': b['provider']} for b in retained])
         installed_bundles = []
         failed_bundles = []
+        last_error = None
         for b in bundles:
             try:
                 install(b)
                 installed_bundles.append(b)
-            except Exception:
+            except Exception as e:
                 failed_bundles.append(b)
+                last_error = e
         if bundles and not installed_bundles:
+            if len(bundles) == 1 and last_error:
+                raise last_error
             raise ValueError('Managed engine installation failed')
         profiles(installed_bundles)
         write_json(root() / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': b['provider']} for b in installed_bundles])
