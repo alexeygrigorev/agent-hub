@@ -29,6 +29,21 @@ for args in [('conversations','bridge','--help'), ('bridge-resume','--help'), ('
         result = subprocess.run([sys.executable, '-c', program], env=env, capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_session_host_and_jobs_import_without_fcntl(self):
+        program = '''import sys
+sys.modules['fcntl'] = None
+from agent_hub_host import session_host, jobs, guarded_root, provisioning, engine_login
+bridge = guarded_root.GuardedRootBridge('/tmp/dummy.lock')
+try:
+    bridge.acquire(non_blocking=True)
+    assert False, "Should have raised fail-closed"
+except RuntimeError as exc:
+    assert "not supported on Windows" in str(exc)
+'''
+        env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+        result = subprocess.run([sys.executable, '-c', program], env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_native_windows_roots_match_readonly_rust_contract(self):
         from agent_hub_host import bridge
         environment = {'LOCALAPPDATA': r'C:\Users\Owner\AppData\Local',

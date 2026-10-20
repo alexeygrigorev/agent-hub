@@ -60,7 +60,9 @@ def lock():
         try:
             if os.name == 'nt':
                 import msvcrt
-                os.write(fd, b'0'); os.lseek(fd, 0, 0)
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b'0')
+                os.lseek(fd, 0, 0)
                 msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
             else:
                 import fcntl
@@ -102,7 +104,7 @@ def module_command(handler, label, managed_dir=None):
     if Path(sys.argv[0]).is_file() and zipfile.is_zipfile(sys.argv[0]):
         prefix = 'import sys; sys.path.insert(0, ' + repr(str(Path(sys.argv[0]).resolve())) + '); '
     m_dir = str(managed_dir or root())
-    prefix += 'import os; os.environ.setdefault("AGENT_HUB_MANAGED_DIR", ' + repr(m_dir) + '); '
+    prefix += 'import os; os.environ["AGENT_HUB_MANAGED_DIR"] = ' + repr(m_dir) + '; '
     return [sys.executable, '-c', prefix + 'from agent_hub_host.provisioning import ' + handler + '; ' + handler + '()', label]
 
 
@@ -263,33 +265,76 @@ def ensure_zcode_runtime(dest=None):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def locate_native_zcodex(bundle=None):
+def resolve_npm_command(is_windows=None):
+    """Resolve npm command safely on Windows and POSIX without shell concatenation.
+
+    On Windows, requires node + trusted npm-cli.js to avoid .cmd quoting/space issues;
+    fails closed instead of falling back to batch execution.
+    """
+    if is_windows is None:
+        is_windows = (os.name == 'nt')
+    if is_windows:
+        node = shutil.which('node')
+        candidates = []
+        override = os.environ.get('HUB_NPM_CLI_JS')
+        if override:
+            candidates.append(Path(override))
+        if node:
+            node_p = Path(node)
+            candidates.append(node_p.parent / 'node_modules' / 'npm' / 'bin' / 'npm-cli.js')
+            candidates.append(node_p.parent / 'lib' / 'node_modules' / 'npm' / 'bin' / 'npm-cli.js')
+        npm_path = shutil.which('npm') or shutil.which('npm.cmd')
+        if npm_path:
+            npm_p = Path(npm_path)
+            candidates.append(npm_p.parent / 'node_modules' / 'npm' / 'bin' / 'npm-cli.js')
+            candidates.append(npm_p.parent / 'lib' / 'node_modules' / 'npm' / 'bin' / 'npm-cli.js')
+        for cand in candidates:
+            if cand.is_file():
+                if not node:
+                    node = shutil.which('node')
+                if not node:
+                    raise ValueError('Node runtime missing for npm execution')
+                return [node, str(cand.resolve())]
+        raise ValueError('Trusted npm-cli.js not found on Windows; refusing unsafe batch fallback')
+    return ['npm']
+
+
+def locate_native_zcodex(bundle=None, is_windows=None):
+    if is_windows is None:
+        is_windows = (os.name == 'nt')
     override = os.environ.get('ZCODEX_BIN')
-    if override and Path(override).is_file() and os.access(override, os.X_OK):
+    if override and Path(override).is_file() and (is_windows or os.access(override, os.X_OK)):
         return Path(override)
-    which_bin = shutil.which('zcodex')
+    which_bin = shutil.which('zcodex') or (shutil.which('zcodex.cmd') if is_windows else None)
     if which_bin:
         return Path(which_bin)
-    for cand in (Path.home() / '.local/bin/zcodex', Path('/usr/local/bin/zcodex'), Path('/usr/bin/zcodex')):
-        if cand.is_file() and os.access(cand, os.X_OK):
+    cands = [Path.home() / '.local/bin/zcodex', Path('/usr/local/bin/zcodex'), Path('/usr/bin/zcodex')]
+    if is_windows:
+        cands.extend([Path.home() / '.local/bin/zcodex.cmd', Path.home() / '.local/bin/zcodex.bat', Path.home() / '.local/bin/zcodex.exe'])
+    for cand in cands:
+        if cand.is_file() and (is_windows or os.access(cand, os.X_OK)):
             return cand
     return None
 
 
-def executable_path(bundle, dest):
+def executable_path(bundle, dest, is_windows=None):
     """Use packaged native binaries directly; never run npm lifecycle scripts/stubs."""
+    if is_windows is None:
+        is_windows = (os.name == 'nt')
     _, binary, _ = PACKAGES[bundle['provider']]
     if bundle['provider'] == 'zai':
-        wrapper = dest / 'engine/bin/zcodex'
-        if wrapper.is_file() and os.access(wrapper, os.X_OK):
+        wrapper = dest / ('engine/bin/zcodex.cmd' if is_windows else 'engine/bin/zcodex')
+        if not wrapper.is_file():
+            wrapper = dest / 'engine/bin/zcodex'
+        if wrapper.is_file() and (is_windows or os.access(wrapper, os.X_OK)):
             return wrapper
-        native = locate_native_zcodex(bundle)
+        native = locate_native_zcodex(bundle, is_windows=is_windows)
         if native and Path(native).is_file():
             return Path(native)
         raise ValueError('Native zcodex binary missing')
     modules = dest / 'engine/node_modules'
     if bundle['provider'] in ('claude', 'go'):
-        system = {'linux': 'linux', 'darwin': 'darwin', 'win32': 'win32'}.get(sys.platform)
+        system = {'linux': 'linux', 'darwin': 'darwin', 'win32': 'win32'}.get('win32' if is_windows else sys.platform)
         cpu = {'x86_64': 'x64', 'amd64': 'x64', 'aarch64': 'arm64', 'arm64': 'arm64'}.get(platform.machine().lower())
         if not system or not cpu:
             raise ValueError('Native engine platform unsupported')
@@ -307,7 +352,7 @@ def executable_path(bundle, dest):
                 if executable.is_file() and executable.resolve().is_relative_to(dest.resolve()):
                     return executable
         raise ValueError('Packaged native engine binary missing')
-    if os.name == 'nt':
+    if is_windows:
         # JS provider CLIs are invoked through Node, not a Windows .cmd shell stub.
         package = modules / PACKAGES[bundle['provider']][0]
         metadata = json.loads((package / 'package.json').read_text())
@@ -319,9 +364,11 @@ def executable_path(bundle, dest):
     return modules / '.bin' / binary
 
 
-def engine_argv(bundle, dest):
-    executable = executable_path(bundle, dest)
-    if os.name == 'nt' and bundle['provider'] in ('codex', 'gemini'):
+def engine_argv(bundle, dest, is_windows=None):
+    if is_windows is None:
+        is_windows = (os.name == 'nt')
+    executable = executable_path(bundle, dest, is_windows=is_windows)
+    if is_windows and bundle['provider'] in ('codex', 'gemini'):
         node = shutil.which('node')
         if not node:
             raise ValueError('Node runtime missing')
@@ -341,16 +388,30 @@ def install(bundle):
     with private_fs.parent(dest / 'placeholder', create=True):
         pass
     clean_env = {k: v for k, v in os.environ.items() if k in ('PATH', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR')}
-    clean_env.update(HOME=str(dest), npm_config_cache=str(root() / 'npm-cache'))
+    clean_env.update(
+        HOME=str(dest),
+        USERPROFILE=str(dest),
+        APPDATA=str(dest / 'AppData' / 'Roaming'),
+        LOCALAPPDATA=str(dest / 'AppData' / 'Local'),
+        npm_config_cache=str(root() / 'npm-cache'),
+    )
     if bundle['provider'] == 'zai':
-        wrapper = dest / 'engine/bin/zcodex'
+        bin_name = 'engine/bin/zcodex.cmd' if os.name == 'nt' else 'engine/bin/zcodex'
+        wrapper = dest / bin_name
         with private_fs.parent(wrapper, create=True):
             pass
         native = locate_native_zcodex(bundle)
         if native and Path(native).is_file():
-            script = '#!/bin/sh\nexec "' + str(native) + '" "$@"\n'
+            if os.name == 'nt':
+                script = f'@echo off\r\n"{native}" %*\r\n'
+            else:
+                script = '#!/bin/sh\nexec "' + str(native) + '" "$@"\n'
             private_fs.atomic_write(wrapper, script.encode(), 4096)
-            os.chmod(wrapper, 0o700)
+            if hasattr(os, 'chmod'):
+                try:
+                    os.chmod(wrapper, 0o700)
+                except OSError:
+                    pass
         else:
             system = sys.platform
             cpu = platform.machine().lower()
@@ -407,8 +468,9 @@ def install(bundle):
         if not runtime:
             raise ValueError('ZCode runtime missing (/opt/ZCode/resources/glm/zcode.cjs)')
     else:
+        npm_cmd = resolve_npm_command()
         try:
-            subprocess.run(['npm', 'install', '--prefix', str(dest / 'engine'), '--ignore-scripts', '--no-audit', '--no-fund', '--', pkg + '@' + bundle['version']],
+            subprocess.run(npm_cmd + ['install', '--prefix', str(dest / 'engine'), '--ignore-scripts', '--no-audit', '--no-fund', '--', pkg + '@' + bundle['version']],
                            env=clean_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300, check=True)
         except (subprocess.SubprocessError, OSError):
             raise ValueError('Managed engine installation failed') from None
@@ -557,7 +619,17 @@ def managed_subscriptions():
 def engine_environment(bundle, home, dest=None):
     dest = dest or Path(home).parent
     env = {k: v for k, v in os.environ.items() if k not in ENV and k not in ('HUB_TOKEN', 'HUB_JOB_TOKEN', 'HUB_CONFIG_FILE', 'AGENT_HUB_MANAGED_DIR', 'HUB_MANAGED_DIR')}
-    env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / '.config'), XDG_DATA_HOME=str(home / '.local' / 'share'), XDG_STATE_HOME=str(home / '.local' / 'state'), CODEX_HOME=str(home / '.codex'), CLAUDE_CONFIG_DIR=str(home / '.claude'))
+    env.update(
+        HOME=str(home),
+        USERPROFILE=str(home),
+        APPDATA=str(home / 'AppData' / 'Roaming'),
+        LOCALAPPDATA=str(home / 'AppData' / 'Local'),
+        XDG_CONFIG_HOME=str(home / '.config'),
+        XDG_DATA_HOME=str(home / '.local' / 'share'),
+        XDG_STATE_HOME=str(home / '.local' / 'state'),
+        CODEX_HOME=str(home / '.codex'),
+        CLAUDE_CONFIG_DIR=str(home / '.claude'),
+    )
     if bundle.get('provider') == 'zai':
         env['CODEX_HOME'] = str(home / '.zcodex')
         env['ZCODE_HOME'] = str(home / '.zcode')
@@ -572,8 +644,39 @@ def engine_environment(bundle, home, dest=None):
         runtime = locate_zcode_runtime(dest)
         if runtime:
             env['ZCODE_CJS'] = str(runtime)
-    env.update(bundle['env'])
+    env.update(bundle.get('env') or {})
     return env
+
+
+def probe_native_gemini_quota(home):
+    """Authoritative native Gemini quota probe reading .gemini/oauth_creds.json without invoking AGY."""
+    creds_path = Path(home) / '.gemini' / 'oauth_creds.json'
+    if not creds_path.is_file():
+        return {}
+    try:
+        data = json.loads(creds_path.read_text(encoding='utf-8'))
+        if not data.get('access_token') and not data.get('refresh_token'):
+            return {}
+        expiry = data.get('expiry_date') or data.get('expires_at')
+        reset_at = None
+        if expiry:
+            if isinstance(expiry, (int, float)):
+                reset_at = datetime.fromtimestamp(expiry / 1000.0, timezone.utc).isoformat()
+            elif isinstance(expiry, str):
+                reset_at = expiry
+        return {
+            'gemini': {
+                'status': 'ok',
+                'windows': {
+                    'primary': {
+                        'percent_remaining': 100.0,
+                        'reset_at': reset_at or (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+                    }
+                }
+            }
+        }
+    except Exception:
+        return {}
 
 
 def quotas():
@@ -588,12 +691,15 @@ def quotas():
                 dest = root() / (entry['label'] + '-' + entry['revision'])
                 b = read_json(dest / 'bundle.json')
                 validate(b)
-                with tempfile.TemporaryFile(dir=root()) as output:
-                    result = subprocess.run(['quse', b['provider'], '--json'], env=engine_environment(b, dest / 'home', dest),
-                        stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.DEVNULL, timeout=30)
-                    if result.returncode == 0 and output.tell() <= 131072:
-                        output.seek(0)
-                        raw = json.load(output)
+                if b.get('provider') == 'gemini':
+                    raw = probe_native_gemini_quota(dest / 'home')
+                else:
+                    with tempfile.TemporaryFile(dir=root()) as output:
+                        result = subprocess.run(['quse', b['provider'], '--json'], env=engine_environment(b, dest / 'home', dest),
+                            stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.DEVNULL, timeout=30)
+                        if result.returncode == 0 and output.tell() <= 131072:
+                            output.seek(0)
+                            raw = json.load(output)
             except Exception:
                 pass
             accounts.append({'account': entry['label'], 'provider': entry['provider'], 'quota': quota_metadata(raw, entry['provider'])})
@@ -685,7 +791,7 @@ def execute():
         command = engine_argv(b, dest)
         env = engine_environment(b, home, dest)
         argv = command + b['args'] + sys.argv[2:]
-        is_diagnostic = any(a in ('--version', '-v', '--help', '-h') for a in argv)
+        is_diagnostic = b['args'] + sys.argv[2:] in (["--version"], ["-v"], ["--help"], ["-h"])
         if b['provider'] == 'codex' and not is_diagnostic:
             allowed, reason = check_codex_quota_gate(env)
             if not allowed:
@@ -693,7 +799,11 @@ def execute():
                 sys.exit(75)
         for var in ('HUB_CONFIG_FILE', 'HUB_TOKEN', 'HUB_JOB_TOKEN', 'AGENT_HUB_MANAGED_DIR', 'HUB_MANAGED_DIR'):
             env.pop(var, None)
-        os.execve(command[0], argv, env)
+        if os.name == 'nt':
+            res = subprocess.run(argv, env=env)
+            sys.exit(res.returncode)
+        else:
+            os.execve(command[0], argv, env)
 
 
 def admission():

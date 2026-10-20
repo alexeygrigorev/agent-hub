@@ -79,12 +79,36 @@ function cwdOk(value: unknown): value is string {
   return value.split('/').every(seg => seg.length > 0 && seg !== '.' && seg !== '..' && /^[A-Za-z0-9._-]{1,64}$/.test(seg));
 }
 
+const WINDOWS_RESERVED = new Set([
+  'CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$', 'CLOCK$',
+  'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
+  'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9',
+]);
+
 function absoluteWorkspaceOk(value: unknown): value is string {
   if (typeof value !== 'string' || !value || value.length > 512) return false;
-  if (!value.startsWith('/') || value.includes('\\') || /[\x00-\x1f\x7f]/.test(value)) return false;
-  const parts = value.split('/');
-  if (parts[0] !== '' || parts.length < 2) return false;
-  return parts.slice(1).every(seg => seg.length > 0 && seg !== '.' && seg !== '..' && /^[A-Za-z0-9._-]{1,64}$/.test(seg));
+  if (/[\x00-\x1f\x7f]/.test(value)) return false;
+  if (value.startsWith('/')) {
+    if (value.includes('\\')) return false;
+    const parts = value.split('/');
+    if (parts[0] !== '' || parts.length < 2) return false;
+    return parts.slice(1).every(seg => seg.length > 0 && seg !== '.' && seg !== '..' && /^[A-Za-z0-9._-]{1,64}$/.test(seg));
+  }
+  if (/^[A-Za-z]:[\\/]/.test(value)) {
+    if (value.includes('\\\\') || value.includes('//') || value.includes('\\/') || value.includes('/\\')) return false;
+    if (value.endsWith('\\') || value.endsWith('/')) return false;
+    const tail = value.slice(3);
+    if (!tail) return false;
+    const parts = tail.split(/[\\/]/);
+    for (const seg of parts) {
+      if (!seg || seg === '.' || seg === '..' || seg.endsWith(' ') || seg.endsWith('.')) return false;
+      if (/[\x00-\x1f\x7f<>"|?*:]/.test(seg)) return false;
+      const base = seg.split('.')[0].toUpperCase();
+      if (WINDOWS_RESERVED.has(base)) return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 /** A workspace identifier is either a configured label (legacy, unchanged)

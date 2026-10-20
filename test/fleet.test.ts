@@ -368,10 +368,24 @@ describe('absolute workspace identifiers alongside labels', () => {
   it('rejects malformed absolute paths before any claim or effect', async () => fixture(async (s, sql) => {
     await configure(s);
     advertise(sql, ['demo', ABS]);
-    for (const workspace of ['/srv/../escape', '/srv//double', '/srv/./dot', '/srv/hub/demo/', '/', '']) {
+    for (const workspace of [
+      '/srv/../escape', '/srv//double', '/srv/./dot', '/srv/hub/demo/', '/', '',
+      'C:\\workspaces\\..\\escape', 'C:\\\\workspaces', 'C:\\workspaces\\',
+      '\\\\.\\COM1', 'C:\\workspaces\\CON', 'C:\\workspaces\\trailing ', 'C:\\workspaces\\trailing.'
+    ]) {
       expect(s.plan(intent({ workspace })), workspace).toEqual({ error: 'invalid_launch_request' });
     }
     expect(sql.exec('SELECT COUNT(*) n FROM fleet_launches').one().n).toBe(0);
+  }));
+  it('routes an explicitly advertised Windows absolute path', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const WIN_ABS = 'C:\\workspaces\\my repo';
+    const caps = { engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo', WIN_ABS], cpu_count: 8 };
+    sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify(caps), 'win35');
+    const plan: any = s.plan(intent({ workspace: WIN_ABS }));
+    expect(plan.selected?.machine).toBe('win35');
+    const launch: any = await (await s.handle(request('/launches', intent({ workspace: WIN_ABS })), admin)).json();
+    expect(launch.machine).toBe('win35');
   }));
   it('refuses unadvertised absolute paths with no eligible route', async () => fixture(async (s, sql) => {
     await configure(s);

@@ -21,24 +21,46 @@ WORKSPACE_SEG = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 
 
 def absolute_workspace_ok(value):
-    """Bounded canonical absolute POSIX workspace identifier.
+    """Bounded canonical absolute POSIX or Windows workspace identifier.
 
-    Mirrors the Hub server validator: no NUL/control chars, no backslashes,
-    no `//`, no trailing slash, no `.`/`..` segments, segments confined to
-    `[A-Za-z0-9._-]{1,64}`, total length capped at 512. Platform-neutral on
-    purpose (Windows stays offline; POSIX acceptance now, legacy source
-    preserved everywhere).
+    Mirrors the Hub server validator: no NUL/control chars, no `//`, no
+    trailing slash, no `.`/`..` segments, total length capped at 512.
+    POSIX paths start with `/` and confine segments to `[A-Za-z0-9._-]{1,64}`.
+    Windows paths start with a drive letter (e.g. `C:\\`), allow spaces in
+    directory names, and forbid invalid/reserved Windows characters.
     """
     if not isinstance(value, str) or not value or len(value) > 512:
         return False
-    if not value.startswith('/') or '\\' in value or '\x00' in value:
+    if '\x00' in value or any(ord(c) < 32 or ord(c) == 127 for c in value):
         return False
-    if any(ord(c) < 32 or ord(c) == 127 for c in value):
-        return False
-    parts = value.split('/')
-    if parts[0] != '' or len(parts) < 2:
-        return False
-    return all(seg and seg not in ('.', '..') and WORKSPACE_SEG.fullmatch(seg) for seg in parts[1:])
+    if value.startswith('/'):
+        if '\\' in value:
+            return False
+        parts = value.split('/')
+        if parts[0] != '' or len(parts) < 2:
+            return False
+        return all(seg and seg not in ('.', '..') and WORKSPACE_SEG.fullmatch(seg) for seg in parts[1:])
+    # Windows drive path: C:\path or C:/path
+    if len(value) >= 3 and value[1] == ':' and value[0].isascii() and value[0].isalpha() and value[2] in ('\\', '/'):
+        if any(rep in value for rep in ('\\\\', '//', '\\/', '/\\')):
+            return False
+        if value.endswith(('\\', '/')):
+            return False
+        tail = value[3:]
+        if not tail:
+            return False
+        parts = re.split(r'[\\/]', tail)
+        for seg in parts:
+            if not seg or seg in ('.', '..') or seg.endswith((' ', '.')):
+                return False
+            if any(ch in '<>"|?*:' or ord(ch) < 32 for ch in seg):
+                return False
+            base = seg.split('.')[0].upper()
+            if base in {'CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$', 'CLOCK$',
+                        *(f'COM{i}' for i in range(1, 10)), *(f'LPT{i}' for i in range(1, 10))}:
+                return False
+        return True
+    return False
 
 
 def validate_native_start_argv(value: Any) -> list[str]:
@@ -146,7 +168,7 @@ def load_settings(path=None):
     # session_cleanup.canonical_roots; the Fleet dispatcher never reads it.
     roots = data.get('cleanup_roots', [])
     if not isinstance(roots, list) or len(roots) > 16 or any(
-            not isinstance(r, str) or not r or '\x00' in r or not r.startswith('/') for r in roots):
+            not isinstance(r, str) or not r or '\x00' in r or not (r.startswith('/') or (len(r) >= 3 and r[1] == ':' and r[0].isascii() and r[0].isalpha() and r[2] in ('\\', '/'))) for r in roots):
         raise ValueError('Invalid cleanup roots allowlist')
     if len(set(roots)) != len(roots):
         raise ValueError('Invalid cleanup roots allowlist')
@@ -1065,7 +1087,7 @@ class Dispatcher:
             launcher = self.settings.get("launcher", {})
             if not all(launcher.get(k) for k in ["argv", "root", "config_dir"]) or not sub.get("launcher_provider") or not sub.get("launcher_model"):
                 raise ValueError("Maintained launcher route is not configured")
-            if sub.get("launcher_provider") not in {"opencode", "antigravity", "zai", "codex"}:
+            if sub.get("launcher_provider") not in {"opencode", "antigravity", "zai", "codex", "gemini"}:
                 raise ValueError(f"Launcher provider {sub.get('launcher_provider')!r} is not supported for headless execution")
             # Only the maintained launcher may run models. argv is a trusted machine-local CLI prefix.
             prefix = launcher["argv"] + ["--config-dir", launcher["config_dir"]]
@@ -1125,10 +1147,10 @@ class Dispatcher:
                 return True
             if not isinstance(eligible, list) or not any(_plan_match(r) for r in eligible):
                 raise ValueError("Maintained launcher plan refused")
-            # OpenCode, Antigravity, ZAI, and named-profile Codex use the maintained native backend:
+            # OpenCode, Antigravity, ZAI, Gemini, and named-profile Codex use the maintained native backend:
             # real engine/UUID plus validated first action for Hub binding.
             # Other unprofiled providers retain their existing task-unit semantics.
-            if sub.get("launcher_provider") in {"opencode", "antigravity", "zai"} or (sub.get("launcher_provider") == "codex" and sub.get("profile") is not None):
+            if sub.get("launcher_provider") in {"opencode", "antigravity", "zai", "gemini"} or (sub.get("launcher_provider") == "codex" and sub.get("profile") is not None):
                 argv = prefix + ["run", "--backend", "aplexer",
                                  "--id", task_id, "--cwd", str(workspace),
                                  "--tmpdir", str(workspace / ".local" / "tmp")]
@@ -1151,8 +1173,8 @@ class Dispatcher:
                 result = {"state": "running", "native_id": native_id}
             else:
                 details = receipt.get("receipt", {})
-                if sub.get("launcher_provider") in {"opencode", "antigravity", "zai"} or (sub.get("launcher_provider") == "codex" and sub.get("profile") is not None):
-                    # Opencode, Antigravity, ZAI, and named-profile Codex bind real M12 sessions only:
+                if sub.get("launcher_provider") in {"opencode", "antigravity", "zai", "gemini"} or (sub.get("launcher_provider") == "codex" and sub.get("profile") is not None):
+                    # Opencode, Antigravity, ZAI, Gemini, and named-profile Codex bind real M12 sessions only:
                     # a genuine native UUID is required; task-units unit_name/worker_id names
                     # can never bind or control a session.
                     session_id = details.get("session_id")
@@ -1167,10 +1189,21 @@ class Dispatcher:
                             raise ValueError("Noncanonical native UUID")
                     except (ValueError, TypeError, AttributeError):
                         raise ValueError("Native ZCodex UUID required") from None
-                    if (details.get("engine") != "zcodex" or offer.get("engine") != "zcodex"
+                    expected_zai_engine = "codex" if sub.get("profile") is not None else "zcodex"
+                    if (details.get("engine") != expected_zai_engine or offer.get("engine") != expected_zai_engine
                             or details.get("workspace") != str(workspace)
                             or details.get("tag") != "task-" + task_id):
                         raise ValueError("Native ZCodex receipt mismatch")
+                if sub.get("launcher_provider") == "gemini":
+                    try:
+                        if str(uuid.UUID(native_id)) != native_id.lower() or uuid.UUID(native_id).version != 4:
+                            raise ValueError("Noncanonical native UUID")
+                    except (ValueError, TypeError, AttributeError):
+                        raise ValueError("Native Gemini UUID required") from None
+                    if (details.get("engine") != "gemini" or offer.get("engine") != "gemini"
+                            or details.get("workspace") != str(workspace)
+                            or details.get("tag") != "task-" + task_id):
+                        raise ValueError("Native Gemini receipt mismatch")
                 if sub.get("launcher_provider") == "codex" and sub.get("profile") is not None:
                     try:
                         if str(uuid.UUID(native_id)) != native_id.lower() or uuid.UUID(native_id).version != 4:

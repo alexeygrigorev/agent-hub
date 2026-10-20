@@ -13,7 +13,10 @@ Maintains strict compatibility with ~/.local/state/headless-root/root.lock and s
 from __future__ import annotations
 
 import datetime
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import json
 import os
 import pathlib
@@ -182,6 +185,8 @@ class GuardedRootBridge:
         if self._owned and self._lock_fd is not None:
             return True
         if not self.lock_path.exists():
+            return False
+        if fcntl is None:
             return False
         try:
             probe_fd = os.open(str(self.lock_path), os.O_RDONLY)
@@ -499,6 +504,9 @@ class GuardedRootBridge:
         new_run_id = f"{ts_str}-{os.getpid()}-{GuardedRootBridge._run_seq}"
 
         fd = os.open(str(self.lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        if fcntl is None:
+            os.close(fd)
+            raise RuntimeError("Guarded root bridge is not supported on Windows (requires POSIX fcntl)")
         flags = fcntl.LOCK_EX
         if non_blocking:
             flags |= fcntl.LOCK_NB
@@ -551,6 +559,8 @@ class GuardedRootBridge:
             deadline = self.clock.time() + 30.0
             while self.clock.time() < deadline:
                 try:
+                    if fcntl is None:
+                        raise RuntimeError("Guarded root lock requires fcntl")
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     locked = True
                     break
@@ -705,10 +715,11 @@ class GuardedRootBridge:
             except Exception:
                 pass
         if self._lock_fd is not None:
-            try:
-                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-            except Exception:
-                pass
+            if fcntl is not None:
+                try:
+                    fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                except Exception:
+                    pass
             try:
                 os.close(self._lock_fd)
             except Exception:
@@ -908,10 +919,11 @@ class GuardedRootBridge:
                 self._supervisor_proc = None
 
         if self._lock_fd is not None:
-            try:
-                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-            except Exception:
-                pass
+            if fcntl is not None:
+                try:
+                    fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                except Exception:
+                    pass
             try:
                 os.close(self._lock_fd)
             except Exception:

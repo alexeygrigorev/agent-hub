@@ -3,6 +3,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 from urllib.parse import urlparse
@@ -22,11 +23,9 @@ def login_url(text):
     return None
 
 
-def _run(item, bundle, dest, request, stop):
+def _run(item, bundle, dest, request, stop, is_windows=None):
     from . import provisioning as p
-    import pty
-    import select
-    master = slave = proc = None
+    master = slave = proc = reader_thread = None
     path = '/api/engines/logins/' + item['id']
     try:
         home = dest / 'home'
@@ -38,11 +37,55 @@ def _run(item, bundle, dest, request, stop):
         p.write_json(settings, settings_data)
         env = p.engine_environment(bundle, home)
         env.update(NO_BROWSER='true', TERM='xterm-256color')
-        master, slave = pty.openpty()
-        proc = subprocess.Popen([str(dest / 'engine/node_modules/.bin/gemini')], stdin=slave, stdout=slave,
-                                stderr=subprocess.DEVNULL, env=env, cwd=home, start_new_session=True)
-        os.close(slave); slave = None
-        tail = ''; last_url = None; submitted = False; last_poll = 0; deadline = time.monotonic() + 300
+        cmd = p.engine_argv(bundle, dest)
+        if bundle.get('provider') == 'gemini':
+            cmd = list(cmd) + ['--skip-trust']
+        if is_windows is None:
+            is_windows = (os.name == 'nt')
+        is_posix = not is_windows
+
+        tail = ''
+        last_url = None
+        submitted = False
+        last_poll = 0
+        deadline = time.monotonic() + 300
+
+        if is_posix:
+            import pty
+            import select
+            master, slave = pty.openpty()
+            proc = subprocess.Popen(cmd, stdin=slave, stdout=slave,
+                                    stderr=subprocess.DEVNULL, env=env, cwd=home, start_new_session=True)
+            os.close(slave)
+            slave = None
+        else:
+            # Native Windows memory-only safe transport.
+            # NOTE: Official @google/gemini-cli interactive OAuth consent requires a pseudo-console (ConPTY).
+            # When standard pipes are passed without a TTY, the Node CLI exits with code 41 (non-interactive auth error).
+            # Physical win35 acceptance requires ConPTY/console driver or non-interactive consent.
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, env=env, cwd=home)
+            reader_buf = []
+            reader_lock = threading.Lock()
+
+            def _stdout_reader():
+                while not stop.is_set():
+                    try:
+                        if hasattr(proc.stdout, 'read1'):
+                            chunk = proc.stdout.read1(1024)
+                        else:
+                            chunk = os.read(proc.stdout.fileno(), 1024)
+                        if not chunk:
+                            break
+                        with reader_lock:
+                            if len(reader_buf) < 16:
+                                reader_buf.append(chunk)
+                    except Exception:
+                        break
+
+            reader_thread = threading.Thread(target=_stdout_reader, daemon=True, name='gemini-login-reader')
+            reader_thread.start()
+
         while time.monotonic() < deadline and not stop.is_set():
             if (home / '.gemini/oauth_creds.json').is_file():
                 # No model prompt is ever sent. Stop the login-only native CLI on success.
@@ -50,32 +93,52 @@ def _run(item, bundle, dest, request, stop):
                 with p.private_fs.parent(credential) as anchor:
                     fd = p.private_fs._open(anchor, credential, os.O_RDONLY, private=False)
                     try:
-                        if os.fstat(fd).st_uid != os.getuid():
+                        if sys.platform != 'win32' and os.fstat(fd).st_uid != os.getuid():
                             raise PermissionError('Unowned native credential')
-                        os.fchmod(fd, 0o600)
+                        if sys.platform != 'win32':
+                            os.fchmod(fd, 0o600)
                     finally:
                         os.close(fd)
                 request('POST', path, {'status': 'authenticated'})
                 return
             if proc.poll() is not None:
                 break
-            ready, _, _ = select.select([master], [], [], .2)
-            if ready:
-                try: chunk = os.read(master, 8192)
-                except OSError: break
-                tail = (tail + chunk.decode(errors='replace'))[-16384:]
+            if is_posix:
+                ready, _, _ = select.select([master], [], [], .2)
+                if ready:
+                    try:
+                        chunk = os.read(master, 8192)
+                    except OSError:
+                        break
+                    tail = (tail + chunk.decode(errors='replace'))[-16384:]
+                    url = login_url(tail)
+                    if url and url != last_url:
+                        request('POST', path, {'status': 'waiting', 'url': url})
+                        last_url = url
+            else:
+                time.sleep(0.2)
+                with reader_lock:
+                    if reader_buf:
+                        raw = b''.join(reader_buf)
+                        reader_buf.clear()
+                        tail = (tail + raw.decode(errors='replace'))[-16384:]
                 url = login_url(tail)
                 if url and url != last_url:
                     request('POST', path, {'status': 'waiting', 'url': url})
                     last_url = url
+
             if time.monotonic() - last_poll >= 2:
                 status = request('GET', path)
                 if status.get('status') in ('cancelled', 'expired'):
                     return
                 code = status.get('code')
-                # Never type into a model prompt: only this newly spawned login PTY.
+                # Never type into a model prompt: only this newly spawned login PTY/pipe.
                 if code and not submitted and 'authorization code' in tail.lower():
-                    os.write(master, code.encode() + b'\r')
+                    if is_posix:
+                        os.write(master, code.encode() + b'\r')
+                    else:
+                        proc.stdin.write(code.encode() + b'\r\n')
+                        proc.stdin.flush()
                     submitted = True
                     tail = ''
                 last_poll = time.monotonic()
@@ -85,10 +148,26 @@ def _run(item, bundle, dest, request, stop):
         except Exception: pass
     finally:
         if proc is not None and proc.poll() is None:
-            try: os.killpg(proc.pid, signal.SIGTERM); proc.wait(timeout=3)
-            except Exception:
-                try: os.killpg(proc.pid, signal.SIGKILL); proc.wait(timeout=3)
+            if hasattr(os, 'killpg'):
+                try: os.killpg(proc.pid, signal.SIGTERM); proc.wait(timeout=1)
+                except Exception:
+                    try: os.killpg(proc.pid, signal.SIGKILL); proc.wait(timeout=1)
+                    except Exception: pass
+            else:
+                try: proc.terminate(); proc.wait(timeout=1)
+                except Exception:
+                    try: proc.kill(); proc.wait(timeout=1)
+                    except Exception: pass
+        if proc is not None:
+            if proc.stdout is not None:
+                try: proc.stdout.close()
                 except Exception: pass
+            if proc.stdin is not None:
+                try: proc.stdin.close()
+                except Exception: pass
+        if reader_thread is not None:
+            try: reader_thread.join(timeout=1.0)
+            except Exception: pass
         for fd in (master, slave):
             if fd is not None:
                 try: os.close(fd)
@@ -97,10 +176,12 @@ def _run(item, bundle, dest, request, stop):
             _active.pop(item['id'], None)
 
 
-def tick(items, bundles, request):
+def tick(items, bundles, request, is_windows=None):
     from . import provisioning as p
     by_label = {b['label']: b for b in bundles}
-    if os.name != 'posix':
+    if is_windows is None:
+        is_windows = (os.name == 'nt')
+    if not is_windows and os.name != 'posix':
         return
     for item in items:
         if item.get('status') not in ('requested', 'waiting', 'submitted'):
@@ -113,7 +194,7 @@ def tick(items, bundles, request):
                 continue
             dest = p.root() / (b['label'] + '-' + b['revision'])
             stop = threading.Event()
-            thread = threading.Thread(target=_run, args=(item, b, dest, request, stop), daemon=True, name='hub-native-login')
+            thread = threading.Thread(target=_run, args=(item, b, dest, request, stop, is_windows), daemon=True, name='hub-native-login')
             _active[item['id']] = {'thread': thread, 'stop': stop, 'label': b['label'], 'revision': b['revision']}
             thread.start()
 

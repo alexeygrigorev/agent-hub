@@ -1,6 +1,9 @@
 """Foreground Fleet/command host; runs only inside its real native controller session."""
 import argparse
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import json
 import signal
 import threading
@@ -354,7 +357,15 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
     journal.mkdir(parents=True, exist_ok=True, mode=0o700)
     # One controller per journal; a supervisor restart cannot duplicate effects.
     with (journal / 'host.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if fcntl is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            import msvcrt
+            if os.fstat(lock.fileno()).st_size == 0:
+                lock.write('0')
+                lock.flush()
+            os.lseek(lock.fileno(), 0, os.SEEK_SET)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
         settings = fleet.load_settings(settings_path)
         native = settings.get('aplexer_bin', 'aplexer')
         binding = qualify_sender_binding(native, str(Path.cwd().resolve()))

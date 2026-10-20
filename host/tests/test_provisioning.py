@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import subprocess
 import sys
@@ -567,6 +568,14 @@ def test_codex_protected_guard_behavioral_regression(tmp_path, monkeypatch):
     assert '--version' in argv
     calls_execve.clear()
 
+    # A task argument that resembles a diagnostic flag must still be gated.
+    monkeypatch.setattr(sys, 'argv', ['execute', 'codex-acc', 'exec', '--help'])
+    with pytest.raises(SystemExit) as exc:
+        p.execute()
+    assert exc.value.code == 75
+    assert len(gate_called) == 1
+    assert not calls_execve
+
     # Case 3: Guard approves invocation (>=15% reserve)
     def fake_quse_approve(env):
         return True, 'ok'
@@ -612,6 +621,10 @@ def test_check_codex_quota_gate_contract(monkeypatch):
             stdout = json.dumps(stdout_obj) if isinstance(stdout_obj, (dict, list)) else str(stdout_obj)
         return Proc()
 
+    now = datetime.now(timezone.utc)
+    future_reset = (now + timedelta(days=7)).isoformat()
+    stale_reset = (now - timedelta(days=1)).isoformat()
+
     env = {'HOME': '/tmp'}
 
     # 1. Real quse shape: 7d valid, 5h and monthly null (not applicable)
@@ -621,7 +634,7 @@ def test_check_codex_quota_gate_contract(monkeypatch):
             'details': {'limit_reached': False},
             'windows': {
                 '5h': {'percent_remaining': None, 'reset_at': None},
-                '7d': {'percent_remaining': 82.5, 'reset_at': '2026-10-27T12:00:00+00:00'},
+                '7d': {'percent_remaining': 82.5, 'reset_at': future_reset},
                 'monthly': {'percent_remaining': None, 'reset_at': None},
             }
         }
@@ -638,7 +651,7 @@ def test_check_codex_quota_gate_contract(monkeypatch):
             'details': {'limit_reached': False},
             'windows': {
                 '5h': {'percent_remaining': None, 'reset_at': None},
-                '7d': {'percent_remaining': 15.0, 'reset_at': '2026-10-27T12:00:00+00:00'},
+                '7d': {'percent_remaining': 15.0, 'reset_at': future_reset},
             }
         }
     }
@@ -653,7 +666,7 @@ def test_check_codex_quota_gate_contract(monkeypatch):
             'status': 'ok',
             'details': {'limit_reached': True},
             'windows': {
-                '7d': {'percent_remaining': 80.0, 'reset_at': '2026-10-27T12:00:00+00:00'},
+                '7d': {'percent_remaining': 80.0, 'reset_at': future_reset},
             }
         }
     }
@@ -668,7 +681,7 @@ def test_check_codex_quota_gate_contract(monkeypatch):
             'status': 'ok',
             'details': {'limit_reached': False},
             'windows': {
-                '5h': {'percent_remaining': 90.0, 'reset_at': '2026-10-27T12:00:00+00:00'},
+                '5h': {'percent_remaining': 90.0, 'reset_at': future_reset},
             }
         }
     }
@@ -683,7 +696,7 @@ def test_check_codex_quota_gate_contract(monkeypatch):
             'status': 'ok',
             'details': {'limit_reached': False},
             'windows': {
-                '7d': {'percent_remaining': float('nan'), 'reset_at': '2026-10-27T12:00:00+00:00'},
+                '7d': {'percent_remaining': float('nan'), 'reset_at': future_reset},
             }
         }
     }
@@ -698,7 +711,7 @@ def test_check_codex_quota_gate_contract(monkeypatch):
             'status': 'ok',
             'details': {'limit_reached': False},
             'windows': {
-                '7d': {'percent_remaining': 80.0, 'reset_at': '2020-01-01T00:00:00+00:00'},
+                '7d': {'percent_remaining': 80.0, 'reset_at': stale_reset},
             }
         }
     }

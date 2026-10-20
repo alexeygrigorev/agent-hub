@@ -77,7 +77,7 @@ export default {
     // Public CLI installer seam (server routing only; CLI worker owns artifacts).
     // Anonymous READ ONLY for exactly these static assets; nothing else under
     // /cli/ is exposed and no API/static private artifact is opened up.
-    if (url.pathname === '/cli/install.sh' || url.pathname === '/cli/hub.pyz' ||
+    if (url.pathname === '/cli/install.sh' || url.pathname === '/cli/install.ps1' || url.pathname === '/cli/hub.pyz' ||
         url.pathname === '/cli/hub.pyz.sha256' || url.pathname === '/cli/manifest.json') {
       if (request.method !== 'GET' && request.method !== 'HEAD') {
         return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, HEAD' } });

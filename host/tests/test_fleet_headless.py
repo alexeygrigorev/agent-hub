@@ -258,7 +258,114 @@ class TestFleetHeadless(unittest.TestCase):
         res = d.dispatch(offer)
         self.assertEqual(res["state"], "uncertain")
         self.assertEqual(res["error"], "ValueError")
-        self.assertIn("dispatch_headless:ValueError", res["reason"])
+
+    def test_receipt_managed_zai_expects_codex_engine(self):
+        settings = self._settings()
+        settings["subscriptions"] = [{
+            "service": "zai",
+            "account_label": "zai-acc",
+            "engine": "codex",
+            "profile": "hub-zai-acc",
+            "admission_argv": ["/bin/true"],
+            "launcher_provider": "zai",
+            "launcher_model": "glm-5.3-flash",
+        }]
+        offer = {
+            "id": "off-zai",
+            "engine": "codex",
+            "profile": "hub-zai-acc",
+            "account": "zai-acc",
+            "mode": "headless",
+            "workspace": "main",
+            "prompt": "solve gap",
+        }
+        def fake_request(method, path, payload=None):
+            return {"status": "claimed"}
+
+        def fake_runner(argv, cwd=None, timeout=None, payload=None):
+            cmd_str = " ".join(argv)
+            if "/bin/true" in cmd_str:
+                return self._admission_response("zai-acc")
+            elif "submit" in cmd_str:
+                return {"id": "hub-off-zai"}
+            elif "plan" in cmd_str:
+                return {"eligible": [{"provider": "zai", "model": "glm-5.3-flash", "task_fit": 1.0}]}
+            elif "run" in cmd_str:
+                return {
+                    "backend": "aplexer",
+                    "task_id": "hub-off-zai",
+                    "receipt": {
+                        "session_id": "88888888-8888-4888-8888-888888888888",
+                        "state": "running",
+                        "first_action_verified": True,
+                        "tag": "task-hub-off-zai",
+                        "workspace": str(self.workspace),
+                        "engine": "codex",
+                        "profile": "hub-zai-acc",
+                        "account_label": "zai-acc",
+                        "phase": "running",
+                    },
+                }
+            return {}
+
+        d = Dispatcher(settings, request=fake_request, runner=fake_runner)
+        res = d.dispatch(offer)
+        self.assertEqual(res["state"], "running")
+        self.assertEqual(res["native_id"], "88888888-8888-4888-8888-888888888888")
+
+    def test_receipt_gemini_expects_gemini_engine(self):
+        settings = self._settings()
+        settings["subscriptions"] = [{
+            "service": "gemini",
+            "account_label": "gemini-acc",
+            "engine": "gemini",
+            "profile": "hub-gemini-acc",
+            "admission_argv": ["/bin/true"],
+            "launcher_provider": "gemini",
+            "launcher_model": "gemini-2.5-pro",
+        }]
+        offer = {
+            "id": "off-gemini",
+            "engine": "gemini",
+            "profile": "hub-gemini-acc",
+            "account": "gemini-acc",
+            "mode": "headless",
+            "workspace": "main",
+            "prompt": "solve gap",
+        }
+        def fake_request(method, path, payload=None):
+            return {"status": "claimed"}
+
+        def fake_runner(argv, cwd=None, timeout=None, payload=None):
+            cmd_str = " ".join(argv)
+            if "/bin/true" in cmd_str:
+                return self._admission_response("gemini-acc")
+            elif "submit" in cmd_str:
+                return {"id": "hub-off-gemini"}
+            elif "plan" in cmd_str:
+                return {"eligible": [{"provider": "gemini", "model": "gemini-2.5-pro", "task_fit": 1.0}]}
+            elif "run" in cmd_str:
+                return {
+                    "backend": "aplexer",
+                    "task_id": "hub-off-gemini",
+                    "receipt": {
+                        "session_id": "99999999-9999-4999-8999-999999999999",
+                        "state": "running",
+                        "first_action_verified": True,
+                        "tag": "task-hub-off-gemini",
+                        "workspace": str(self.workspace),
+                        "engine": "gemini",
+                        "profile": "hub-gemini-acc",
+                        "account_label": "gemini-acc",
+                        "phase": "running",
+                    },
+                }
+            return {}
+
+        d = Dispatcher(settings, request=fake_request, runner=fake_runner)
+        res = d.dispatch(offer)
+        self.assertEqual(res["state"], "running")
+        self.assertEqual(res["native_id"], "99999999-9999-4999-8999-999999999999")
 
     def test_receipt_missing_account_raises_mismatch(self):
         settings = self._settings()

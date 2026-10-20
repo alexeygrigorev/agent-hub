@@ -335,14 +335,14 @@ describe('Human/operator device credentials', () => {
     expect((((await tok.json()) as any).scope)).toBe('host');
   });
 
-  it('installer seam exposes only the four exact assets, anonymous read-only', async () => {
+  it('installer seam exposes only the five exact assets, anonymous read-only', async () => {
     const post = await doFetch(new Request('http://example.com/cli/install.sh', { method: 'POST' }));
     expect(post.status).toBe(405);
     const evil = await doFetch(new Request('http://example.com/cli/secret.env'));
     expect(evil.status).toBe(404);
     // Exact assets exist as routes (ASSETS may be absent in test, so 404 means
     // routed but not found, not an auth redirect or broad exposure).
-    for (const asset of ['/cli/install.sh', '/cli/hub.pyz', '/cli/hub.pyz.sha256', '/cli/manifest.json']) {
+    for (const asset of ['/cli/install.sh', '/cli/install.ps1', '/cli/hub.pyz', '/cli/hub.pyz.sha256', '/cli/manifest.json']) {
       const res = await doFetch(new Request(`http://example.com${asset}`));
       expect([200, 404]).toContain(res.status);
       expect(res.status).not.toBe(401);
