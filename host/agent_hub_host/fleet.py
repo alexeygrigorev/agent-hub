@@ -1330,14 +1330,18 @@ class Dispatcher:
         # Native work-claim bridge (Phase 1): mirror redacted local `a work`
         # declarations and `work.*` mailbox events into Hub claims/messages so
         # operators see native work in activity views. Best-effort only: a
-        # bridge failure must never fail the host poll cycle.
+        # bridge failure must never fail the host poll cycle. The live catalog
+        # fetched above is reused so the bridge adds no extra `a list` call.
         try:
             from . import workclaim
+            rows = raw if isinstance(raw, list) else (raw.get("sessions") if isinstance(raw, dict) else None)
+            list_rows = {r["id"]: r for r in rows if isinstance(r, dict) and isinstance(r.get("id"), str) and r["id"]} if isinstance(rows, list) else None
             workclaim_summary = workclaim.sync_once(
                 self.request,
                 settings=self.settings,
                 runner=self.runner,
                 journal_dir=self.journal_dir,
+                list_rows=list_rows,
             )
         except Exception as exc:
             workclaim_summary = {"ok": False, "error": (type(exc).__name__ or "Error")[:64]}

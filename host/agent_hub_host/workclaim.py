@@ -802,6 +802,7 @@ def sync_once(
     machine_id: Optional[str] = None,
     journal_dir: Optional[str] = None,
     now_ms: Optional[int] = None,
+    list_rows: Optional[dict[str, dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """One best-effort native work-claim sync cycle. Never raises.
 
@@ -824,7 +825,7 @@ def sync_once(
                 host_machine = "local"
         moment = now_ms if isinstance(now_ms, int) and now_ms > 0 else int(time.time() * 1000)
         canonicals = canonical_workspaces_from_settings(settings)
-        rows = _list_rows(runner or subprocess_runner, binary)
+        rows = list_rows if isinstance(list_rows, dict) else _list_rows(runner or subprocess_runner, binary)
         declarations = scan_declarations(resolved_state, rows, host_machine)
         cursors = load_cursors(journal_dir if journal_dir is not None else settings.get("journal_dir"))
         envelopes, new_cursors, scan_stats = scan_work_messages(resolved_state, canonicals, cursors)
