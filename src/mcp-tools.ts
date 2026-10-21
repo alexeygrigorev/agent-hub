@@ -89,6 +89,7 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'subscriptions': 'Local subscription collection/reporting requires host files and host identity; safe reported subscriptions are in fleet.',
   'bridge': 'Local native mailbox bridge; existing hosts own it.',
   'bridge-resume': 'Local journal acknowledgement, no server API.',
+  'workclaim-sync': 'Local native work-claim bridge; existing hosts own it.',
   'sessions host-receive': 'Local native executor, no second remote dispatcher.',
   'conversations bridge': 'Local native conversation bridge, no second remote dispatcher.',
   'task-artifact': 'Local reviewed PNG upload can exceed the bounded MCP request size; use assigned-host hub task-artifact. Download is exposed as artifact.',

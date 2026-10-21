@@ -84,5 +84,6 @@
   "subscriptions",
   "task-artifact",
   "task-result",
-  "update"
+  "update",
+  "workclaim-sync"
 ]

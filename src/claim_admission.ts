@@ -64,6 +64,32 @@ export class ClaimAdmission {
 
   init() {
     this.sql.exec('CREATE TABLE IF NOT EXISTS fleet_claim_policy (workspace TEXT PRIMARY KEY, project TEXT, require_claim INTEGER NOT NULL)');
+    this.seedWorkClaimPolicy();
+  }
+
+  /**
+   * Phase 1 work-claim seed: map well-known primary checkouts to Hub
+   * projects so `GET /api/bus/activity?workspace=<path>` resolves without
+   * operator configuration. Seed-once (only when the table is empty) with
+   * `require_claim = 0`: seeding is visibility-only and must never change
+   * launch admission. Operator `PUT /api/fleet/claim-policy` rows always win
+   * afterwards; deletions are respected until the table is fully empty.
+   */
+  seedWorkClaimPolicy() {
+    const seeds: Array<{ workspace: string; project: string }> = [
+      { workspace: '/home/alexey/git/agent-hub', project: 'agent-hub' },
+      { workspace: '/home/alexey/git/aplexer', project: 'aplexer' },
+    ];
+    try {
+      const count = (this.sql.exec('SELECT COUNT(*) AS n FROM fleet_claim_policy').toArray()[0] as any)?.n;
+      if (typeof count === 'number' && count > 0) return;
+      for (const row of seeds) {
+        this.sql.exec('INSERT OR IGNORE INTO fleet_claim_policy VALUES (?, ?, ?)', row.workspace, row.project, 0);
+      }
+    } catch {
+      // A missing table (fresh DO before init) fails closed: init() creates
+      // it first, and admission treats unknown workspaces as unmapped.
+    }
   }
 
   /** Called inside the shared transaction; only offered work has no start authorization. */

@@ -13,6 +13,14 @@ import { randomString, sha256, generateUserCode, base64url } from './auth/crypto
 import { generateTokenPair, verifyBearerScope } from './auth/token';
 import { handleRegistryRoutes, handleWebSocketMessageRegistry, handleWebSocketCloseRegistry, updateHeartbeatMemoryOnly, updateHeartbeat } from './registry';
 import { BusService, BUS_SCHEMA_SQL, CallerContext, generateUlid } from './bus';
+import {
+  formatNativeActor,
+  isWorkMessageKind,
+  redactClaimData,
+  redactForBus,
+  taskIdFromWorkKey,
+  validateWorkClaimData,
+} from './work_claim';
 import { JobsService, JOBS_SCHEMA_SQL } from './jobs';
 import { roleName } from './role_leases';
 import { FleetService } from './fleet';
@@ -382,6 +390,18 @@ export class Hub extends DurableObject {
       target: 'TEXT',
       detail: 'TEXT',
       at: 'TEXT'
+    });
+
+    // Work-claim protocol (Phase 1): host-attested native aplexer rows share
+    // the existing claims table so activity/admission see them. Nullable so
+    // legacy Hub rows keep working; NULL mode/source means a Hub-native edit.
+    this.ensureColumns('claims', {
+      work_key: 'TEXT',
+      claim_mode: 'TEXT',
+      claim_source: 'TEXT',
+      worktree: 'TEXT',
+      session_state: 'TEXT',
+      native_claim_id: 'TEXT'
     });
 
     // If audit was upgraded from SPEC §6 where ts existed instead of at:
@@ -1891,7 +1911,7 @@ export class Hub extends DurableObject {
     return { caller, scopes };
   }
 
-  private async parseSafeBusBody(request: Request, allowedKeys: Set<string>, optional: boolean = false): Promise<{ data?: Record<string, any>; error?: Response }> {
+  private async parseSafeBusBody(request: Request, allowedKeys: Set<string>, optional: boolean = false, maxBytes: number = 16384): Promise<{ data?: Record<string, any>; error?: Response }> {
     if (!request.body) {
       if (optional) return { data: {} };
       return { error: Response.json({ error: 'missing_body' }, { status: 400 }) };
@@ -1904,7 +1924,7 @@ export class Hub extends DurableObject {
         const part = await reader.read();
         if (part.done) break;
         totalBytes += part.value.byteLength;
-        if (totalBytes > 16384) {
+        if (totalBytes > maxBytes) {
           await reader.cancel();
           return { error: Response.json({ error: 'body_too_large' }, { status: 413 }) };
         }
@@ -2162,6 +2182,195 @@ export class Hub extends DurableObject {
       }
     }
 
+    // POST /api/bus/native-sync — host-attested bridge for native aplexer work.
+    // The host daemon observes local `a work join` declarations and `work.*`
+    // mailbox envelopes (which cannot hold Hub tokens) and mirrors redacted
+    // state here with its host credential. Callers are host (bound to their
+    // own machine_id) or admin. Synthetic actors use the design-recommended
+    // `native:<machine>:<tag>[<short>]` form; no agents row is required.
+    if (path === '/api/bus/native-sync') {
+      if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      const caller = auth.caller!;
+      const isHost = caller.kind === 'host' && !!caller.machineId;
+      if (!caller.isAdmin && !isHost) {
+        return Response.json({ error: 'forbidden', reason: 'host_or_admin_only' }, { status: 403 });
+      }
+      if (!auth.scopes?.includes('bus:send') && !auth.scopes?.includes('admin')) {
+        return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
+      }
+
+      const parsed = await this.parseSafeBusBody(request, new Set(['claims', 'messages']), true, 131072);
+      if (parsed.error) return parsed.error;
+      const body = parsed.data!;
+      const claimItems = body.claims === undefined ? [] : body.claims;
+      const messageItems = body.messages === undefined ? [] : body.messages;
+      if (!Array.isArray(claimItems) || !Array.isArray(messageItems) ||
+          claimItems.length > 64 || messageItems.length > 64) {
+        return Response.json({ error: 'invalid_native_sync' }, { status: 400 });
+      }
+
+      const now = Date.now();
+      const errors: Array<{ index: number; kind: string; reason: string }> = [];
+      let syncedClaims = 0;
+      let releasedClaims = 0;
+      let syncedMessages = 0;
+      let dedupedMessages = 0;
+      const projectLabel = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+      const actorSeg = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+      const holderActor = (holder: any): string | null => {
+        if (!holder || typeof holder !== 'object') return null;
+        const { machine_id, tag, session_id } = holder;
+        if (typeof machine_id !== 'string' || typeof tag !== 'string' || typeof session_id !== 'string') return null;
+        if (!actorSeg.test(machine_id) || !actorSeg.test(tag)) return null;
+        // A host attests only its own machine's sessions; admins may relay any.
+        if (isHost && machine_id !== caller.machineId) return null;
+        return formatNativeActor(machine_id, tag, session_id);
+      };
+
+      for (let i = 0; i < claimItems.length; i++) {
+        const item = claimItems[i];
+        if (!item || typeof item !== 'object' || Array.isArray(item)) {
+          errors.push({ index: i, kind: 'claim', reason: 'item_must_be_object' });
+          continue;
+        }
+        const data = (item as any).data;
+        const invalid = validateWorkClaimData(data);
+        if (invalid) {
+          errors.push({ index: i, kind: 'claim', reason: `invalid_claim_data:${invalid}`.slice(0, 120) });
+          continue;
+        }
+        if (!projectLabel.test(data.project)) {
+          errors.push({ index: i, kind: 'claim', reason: 'invalid_project' });
+          continue;
+        }
+        const actor = holderActor(data.holder);
+        if (!actor) {
+          errors.push({ index: i, kind: 'claim', reason: 'invalid_holder_machine' });
+          continue;
+        }
+        const clean = redactClaimData(data);
+        const remaining = (item as any).remaining_ttl_ms;
+        const ttlMs = typeof remaining === 'number' && Number.isFinite(remaining) && remaining >= 0
+          ? Math.min(Math.floor(remaining), clean.lease_ttl_sec * 1000)
+          : clean.lease_ttl_sec * 1000;
+        const expiresAt = now + ttlMs;
+        const sessionState = (item as any).session_state;
+        const stateValue = sessionState === 'stale' || sessionState === 'exited' ? sessionState : 'running';
+        const scopes: string[] = Array.isArray(clean.scopes) && clean.scopes.length > 0 ? clean.scopes : ['*'];
+        const event = clean.event as string;
+
+        if (event === 'complete' || event === 'abandon') {
+          const live = this.sql.exec(
+            "SELECT id FROM claims WHERE native_claim_id = ? AND claim_source = 'native' AND released_at IS NULL",
+            clean.claim_id,
+          ).toArray() as any[];
+          for (const row of live) {
+            this.sql.exec('UPDATE claims SET released_at = ? WHERE id = ?', now, row.id);
+            releasedClaims++;
+          }
+          continue;
+        }
+
+        // Upsert per scope with stable row ids: refresh live rows, insert
+        // missing scopes, drop live scopes the declaration no longer holds.
+        const live = this.sql.exec(
+          "SELECT id, scope FROM claims WHERE native_claim_id = ? AND claim_source = 'native' AND released_at IS NULL",
+          clean.claim_id,
+        ).toArray() as any[];
+        const liveByScope = new Map(live.map((r: any) => [r.scope, r.id]));
+        const wantScopes = new Set(scopes);
+        for (const [scope, id] of liveByScope) {
+          if (!wantScopes.has(scope)) {
+            this.sql.exec('UPDATE claims SET released_at = ? WHERE id = ?', now, id);
+            releasedClaims++;
+          }
+        }
+        for (const scope of wantScopes) {
+          const redactedScope = String(redactForBus(scope));
+          const existingId = liveByScope.get(scope);
+          if (existingId) {
+            this.sql.exec(
+              'UPDATE claims SET project = ?, holder = ?, expires_at = ?, work_key = ?, claim_mode = ?, worktree = ?, session_state = ? WHERE id = ?',
+              clean.project, actor, expiresAt, clean.work_key, clean.mode,
+              typeof clean.worktree === 'string' ? clean.worktree : null, stateValue, existingId,
+            );
+          } else {
+            this.sql.exec(
+              "INSERT INTO claims (id, project, scope, holder, created_at, expires_at, released_at, work_key, claim_mode, claim_source, worktree, session_state, native_claim_id) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 'native', ?, ?, ?)",
+              generateUlid(now), clean.project, redactedScope, actor, now, expiresAt,
+              clean.work_key, clean.mode,
+              typeof clean.worktree === 'string' ? String(redactForBus(clean.worktree)) : null,
+              stateValue, clean.claim_id,
+            );
+          }
+          syncedClaims++;
+        }
+      }
+
+      for (let i = 0; i < messageItems.length; i++) {
+        const item = messageItems[i];
+        if (!item || typeof item !== 'object' || Array.isArray(item)) {
+          errors.push({ index: i, kind: 'message', reason: 'item_must_be_object' });
+          continue;
+        }
+        const m = item as any;
+        if (typeof m.native_id !== 'string' || !m.native_id || m.native_id.length > 64 || /[\x00-\x1f\x7f\s]/.test(m.native_id)) {
+          errors.push({ index: i, kind: 'message', reason: 'invalid_native_id' });
+          continue;
+        }
+        if (!isWorkMessageKind(m.kind)) {
+          errors.push({ index: i, kind: 'message', reason: 'invalid_kind' });
+          continue;
+        }
+        if (typeof m.project !== 'string' || !projectLabel.test(m.project)) {
+          errors.push({ index: i, kind: 'message', reason: 'invalid_project' });
+          continue;
+        }
+        const actor = holderActor(m.from);
+        if (!actor) {
+          errors.push({ index: i, kind: 'message', reason: 'invalid_from_machine' });
+          continue;
+        }
+        if (typeof m.body !== 'string' || !m.body || m.body.length > 4000) {
+          errors.push({ index: i, kind: 'message', reason: 'invalid_body' });
+          continue;
+        }
+        const toActor = `project:${m.project}`;
+        const idempotencyKey = `aplexer-msg:${m.native_id}`;
+        const existing = this.sql.exec(
+          'SELECT id FROM messages WHERE from_actor = ? AND idempotency_key = ?',
+          actor, idempotencyKey,
+        ).toArray()[0] as any;
+        if (existing) {
+          dedupedMessages++;
+          continue;
+        }
+        let createdAt = now;
+        if (typeof m.created_at_ms === 'number' && Number.isFinite(m.created_at_ms) && m.created_at_ms > 0 && m.created_at_ms <= now + 60000) {
+          createdAt = Math.floor(m.created_at_ms);
+        }
+        const id = generateUlid(createdAt);
+        this.sql.exec(
+          'INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, reply_to, body, idempotency_key, lease_epoch, created_at, expires_at) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, NULL, ?, ?)',
+          id, actor, toActor, m.kind, id, String(redactForBus(m.body)).slice(0, 2000),
+          idempotencyKey, createdAt, createdAt + 30 * 24 * 3600 * 1000,
+        );
+        syncedMessages++;
+      }
+
+      return Response.json({
+        status: 'ok',
+        synced_claims: syncedClaims,
+        released_claims: releasedClaims,
+        synced_messages: syncedMessages,
+        deduped_messages: dedupedMessages,
+        errors: errors.slice(0, 20),
+      });
+    }
+
     // POST & GET /api/bus/claims
     if (path === '/api/bus/claims') {
       if (request.method === 'POST') {
@@ -2302,11 +2511,39 @@ export class Hub extends DurableObject {
         // explanatory notice) rather than caller-global or hub-global rows
         // under a workspace heading. Pass ?project= explicitly to scope.
         const unmappedWorkspace = Boolean(workspace && !project && !claimPolicy?.project);
-        const claims = unmappedWorkspace
+        const rawClaims = unmappedWorkspace
           ? []
           : this.busService.listClaims(auth.caller!, effectiveProject, holder, activeOnly);
+        // Presentation enrichment (additive): native bridged rows carry the
+        // work_key/mode/source the host attested; legacy Hub rows default to
+        // a Hub-native edit. task_id links task:<uuid> keys to intake.
+        const nowMs = Date.now();
+        const claims = rawClaims.map((c: any) => ({
+          ...c,
+          source: c.claim_source || 'hub',
+          mode: c.claim_mode || 'edit',
+          task_id: taskIdFromWorkKey(c.work_key),
+          stale: typeof c.expires_at === 'number' ? c.expires_at <= nowMs : false,
+        }));
         const messageActor = actor || holder || undefined;
-        const messages = this.busService.getBusMessages(auth.caller!, messageActor).slice(0, limit);
+        const scopedMessages = this.busService.getBusMessages(auth.caller!, messageActor);
+        // Bridged native work.* envelopes are addressed to project:<project>
+        // (no Hub agents row exists for them), so the scoped inbox query
+        // above cannot match them: merge them explicitly whenever the scope
+        // resolves to a project. Content is redacted coordination data.
+        let messages = scopedMessages;
+        if (effectiveProject && !unmappedWorkspace) {
+          try {
+            const nativeRows = this.sql.exec(
+              'SELECT * FROM messages WHERE to_actor = ? AND expires_at > ? ORDER BY created_at DESC LIMIT ?',
+              `project:${effectiveProject}`, nowMs, limit,
+            ).toArray() as any[];
+            const seen = new Set(scopedMessages.map((r: any) => r.id));
+            messages = [...scopedMessages, ...nativeRows.filter((r: any) => !seen.has(r.id))]
+              .sort((a: any, b: any) => (b.created_at || 0) - (a.created_at || 0));
+          } catch { messages = scopedMessages; }
+        }
+        messages = messages.slice(0, limit);
         const activeClaims = claims.filter((c: any) => !c.released_at);
         const notice = unmappedWorkspace
           ? 'no claim policy maps this workspace to a Hub project — claims are not scoped to it; pass ?project= explicitly or configure fleet claim policy'

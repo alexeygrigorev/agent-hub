@@ -214,7 +214,13 @@ CREATE TABLE IF NOT EXISTS claims (
   holder TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL,
-  released_at INTEGER
+  released_at INTEGER,
+  work_key TEXT,
+  claim_mode TEXT,
+  claim_source TEXT,
+  worktree TEXT,
+  session_state TEXT,
+  native_claim_id TEXT
 );
 `;
 

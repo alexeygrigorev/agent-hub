@@ -80,7 +80,13 @@ CREATE TABLE IF NOT EXISTS claims (
   holder TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL,
-  released_at INTEGER
+  released_at INTEGER,
+  work_key TEXT,
+  claim_mode TEXT,
+  claim_source TEXT,
+  worktree TEXT,
+  session_state TEXT,
+  native_claim_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_claims_project ON claims(project);
 
@@ -639,8 +645,11 @@ export class BusService {
 
     const expiresAt = effectiveNow + ttlMs;
 
-    const activeClaims = this.sql.exec('SELECT id, holder, scope FROM claims WHERE project = ? AND released_at IS NULL AND expires_at > ?', project, effectiveNow).toArray() as any[];
+    const activeClaims = this.sql.exec('SELECT id, holder, scope, claim_mode FROM claims WHERE project = ? AND released_at IS NULL AND expires_at > ?', project, effectiveNow).toArray() as any[];
     for (const active of activeClaims) {
+      // Read-only observers never block or get blocked (protocol edge case 9):
+      // only exclusive (edit/coord/legacy Hub) rows participate in admission.
+      if (active.claim_mode === 'read' || active.claim_mode === 'review') continue;
       const aScope = active.scope;
       if (aScope === scope || scope.startsWith(aScope + '/') || aScope.startsWith(scope + '/')) {
         if (active.holder !== holder) {
@@ -707,7 +716,7 @@ export class BusService {
 
   listClaims(caller?: CallerContext, project?: string, holder?: string, activeOnly: boolean = true): any[] {
     const now = Date.now();
-    let query = 'SELECT id, project, scope, holder, created_at, expires_at, released_at FROM claims WHERE 1=1';
+    let query = 'SELECT id, project, scope, holder, created_at, expires_at, released_at, work_key, claim_mode, claim_source, worktree, session_state, native_claim_id FROM claims WHERE 1=1';
     const params: any[] = [];
 
     let effectiveProject = project;
