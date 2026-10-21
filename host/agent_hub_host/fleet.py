@@ -1327,6 +1327,20 @@ class Dispatcher:
         self.request("PUT", "/api/fleet/subscriptions", {"subscriptions": collect_subscriptions(self.settings, self.runner)})
         raw = self.runner([self.settings.get("aplexer_bin", "aplexer"), "list", "--all", "--json"])
         self.request("PUT", "/api/fleet/sessions", {"sessions": session_metadata(raw, self.settings)})
+        # Native work-claim bridge (Phase 1): mirror redacted local `a work`
+        # declarations and `work.*` mailbox events into Hub claims/messages so
+        # operators see native work in activity views. Best-effort only: a
+        # bridge failure must never fail the host poll cycle.
+        try:
+            from . import workclaim
+            workclaim_summary = workclaim.sync_once(
+                self.request,
+                settings=self.settings,
+                runner=self.runner,
+                journal_dir=self.journal_dir,
+            )
+        except Exception as exc:
+            workclaim_summary = {"ok": False, "error": (type(exc).__name__ or "Error")[:64]}
         # Reconcile Fleet-owned starts into exact Hub session bindings after
         # reporting the observed native catalog. Retry is read-before-write.
         try:
@@ -1357,6 +1371,7 @@ class Dispatcher:
         imported_reconciled = self.reconcile_imported_sessions()
         offers = self.request("GET", "/api/fleet/offers").get("offers", [])
         results = list(reconciled) + list(imported_reconciled)
+        results.append({"id": "workclaim-sync", **workclaim_summary})
         for offer in offers:
             try:
                 results.append(self.dispatch(offer))

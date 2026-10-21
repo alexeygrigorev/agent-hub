@@ -294,8 +294,17 @@ class FleetTests(unittest.TestCase):
             if argv[0] == 'maintained-gate': return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
             if argv[0] == 'aplexer': return []
             return {}
-        with patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {}, 'hostname': 'test', 'os': 'test', 'network': 'home', 'roles': []}), patch('agent_hub_host.api.get_heartbeat_payload', return_value={'type': 'heartbeat'}):
-            self.assertEqual(fleet.Dispatcher(cfg, request, runner).once(), [])
+        with tempfile.TemporaryDirectory() as tmp:
+            # Hermetic native state: the work-claim bridge must scan an empty
+            # sessions dir here, find nothing to sync, and POST nothing.
+            cfg['aplexer_state_dir'] = tmp
+            with patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {}, 'hostname': 'test', 'os': 'test', 'network': 'home', 'roles': []}), patch('agent_hub_host.api.get_heartbeat_payload', return_value={'type': 'heartbeat'}):
+                results = fleet.Dispatcher(cfg, request, runner).once()
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]['id'], 'workclaim-sync')
+            self.assertTrue(results[0]['ok'])
+            self.assertEqual(results[0]['claims'], 0)
+            self.assertEqual(results[0]['messages'], 0)
         self.assertEqual([c[1] for c in calls], ['/api/machines/register', '/api/host/poll', '/api/fleet/subscriptions', '/api/fleet/sessions', '/api/sessions/host-bindings', '/api/sessions/host-bindings?kind=imported', '/api/fleet/offers'])
         self.assertTrue(calls[1][2]['gate']['launch_allowed'])
         self.assertEqual(calls[0][2]['capabilities']['workspaces'], ['demo'])
@@ -1603,11 +1612,18 @@ class FleetTests(unittest.TestCase):
                  patch("agent_hub_host.api.get_heartbeat_payload", return_value={"type": "heartbeat"}), \
                  patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, tombstone, "retired_tombstone_verified")):
                 d = fleet.Dispatcher(cfg, request, runner)
-                results = d.once()
-                self.assertEqual(len(results), 1)
-                self.assertEqual(results[0]["id"], native_id)
-                self.assertEqual(results[0]["state"], "stopped")
-                self.assertTrue(results[0]["reconciled"])
+                # Hermetic native state for the appended work-claim summary.
+                with tempfile.TemporaryDirectory() as statedir:
+                    d.settings["aplexer_state_dir"] = statedir
+                    results = d.once()
+                reconciled = [r for r in results if r.get("id") != "workclaim-sync"]
+                bridge = [r for r in results if r.get("id") == "workclaim-sync"]
+                self.assertEqual(len(reconciled), 1)
+                self.assertEqual(reconciled[0]["id"], native_id)
+                self.assertEqual(reconciled[0]["state"], "stopped")
+                self.assertTrue(reconciled[0]["reconciled"])
+                self.assertEqual(len(bridge), 1)
+                self.assertTrue(bridge[0]["ok"])
 
             self.assertTrue(any(r[1] == f"/api/sessions/{native_id}/retirement" for r in requests))
 

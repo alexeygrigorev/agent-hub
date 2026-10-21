@@ -498,6 +498,12 @@ def main():
     p_bridge.add_argument("--service-tag", default=None)
     p_bridge.add_argument("--service-session-id", default=None)
 
+    p_workclaim = sub.add_parser("workclaim-sync", help="Mirror local aplexer work declarations and work.* events into Hub (one cycle)")
+    p_workclaim.add_argument("--aplexer-bin", default="aplexer")
+    p_workclaim.add_argument("--state-dir", default=None)
+    p_workclaim.add_argument("--machine-id", default=None, help="Attested machine id (default: configured machine_id)")
+    p_workclaim.add_argument("--dry-run", action="store_true", help="Scan and redact without POSTing to Hub")
+
     args = parser.parse_args()
     if args.cmd == 'engines':
         try:
@@ -759,6 +765,36 @@ def main():
     elif args.cmd == "activity":
         from . import bus
         print(json.dumps(bus.activity(workspace=getattr(args, 'workspace', None), project=getattr(args, 'project', None), holder=getattr(args, 'holder', None), actor=getattr(args, 'actor', None), limit=getattr(args, 'limit', 20), active=not getattr(args, 'all', False))))
+    elif args.cmd == "workclaim-sync":
+        from . import bus, workclaim
+        from .fleet import load_settings
+        try:
+            settings = load_settings()
+        except Exception:
+            settings = {"workspaces": {}, "subscriptions": [], "capabilities": [], "max_agents": 1}
+        if getattr(args, "dry_run", False):
+            import time
+            from .bridge import get_authoritative_state_dir
+            try:
+                state_dir = args.state_dir or settings.get("aplexer_state_dir") or get_authoritative_state_dir(None)
+            except Exception:
+                state_dir = args.state_dir
+            canonicals = workclaim.canonical_workspaces_from_settings(settings)
+            rows = workclaim._list_rows(workclaim.subprocess_runner, getattr(args, "aplexer_bin", "aplexer"))
+            declarations = workclaim.scan_declarations(state_dir, rows, getattr(args, "machine_id", None) or settings.get("machine_id", ""))
+            envelopes, _cursors, scan_stats = workclaim.scan_work_messages(state_dir, canonicals, {})
+            moment = int(time.time() * 1000)
+            machine = getattr(args, "machine_id", None) or settings.get("machine_id", "") or "local"
+            claim_items, claim_stats = workclaim.build_claim_items(declarations, canonicals, machine, moment)
+            message_items, message_stats = workclaim.build_message_items(envelopes, machine)
+            print(json.dumps({"dry_run": True, "claims": claim_items, "messages": message_items,
+                              "declaration_stats": claim_stats, "envelope_stats": {**scan_stats, "invalid": message_stats.get("invalid", 0)}}))
+        else:
+            print(json.dumps(workclaim.sync_once(
+                bus._do_request, settings=settings, runner=None,
+                aplexer_bin=getattr(args, "aplexer_bin", "aplexer"),
+                state_dir=getattr(args, "state_dir", None),
+                machine_id=getattr(args, "machine_id", None))))
 
 if __name__ == "__main__":
     main()

@@ -156,3 +156,15 @@ def activity(workspace=None, project=None, holder=None, actor=None, limit=20, ac
     if params:
         path += "?" + "&".join(params)
     return _do_request("GET", path)
+
+def native_sync(claims, messages):
+    """Host-attested mirror of native aplexer work into Hub claims/messages.
+
+    `claims` are {data: hub.work-claim.v1, remaining_ttl_ms?, session_state?}
+    items; `messages` are redacted work.* envelope items. The server
+    re-validates, re-redacts and upserts idempotently. Host credential only."""
+    if not isinstance(claims, list) or not isinstance(messages, list):
+        raise ValueError("native_sync requires claims and messages lists")
+    if len(claims) > 64 or len(messages) > 64:
+        raise ValueError("native_sync batch exceeds 64 claims or 64 messages")
+    return _do_request("POST", "/api/bus/native-sync", {"claims": claims, "messages": messages})
