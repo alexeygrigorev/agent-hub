@@ -561,6 +561,13 @@ function activityRow(kind, main, meta) {
   return item;
 }
 
+function shortWorkKey(workKey) {
+  if (!workKey || typeof workKey !== 'string') return '';
+  const task = /^task:([0-9a-fA-F]{8})[0-9a-fA-F-]*$/.exec(workKey);
+  if (task) return `task:${task[1]}`;
+  return workKey.length > 44 ? `${workKey.slice(0, 41)}…` : workKey;
+}
+
 function renderSessionActivity(container, data) {
   container.replaceChildren();
   const claims = Array.isArray(data.claims) ? data.claims : [];
@@ -572,14 +579,30 @@ function renderSessionActivity(container, data) {
     container.append(p);
     return;
   }
+  // "Someone is already on this" banner: any live exclusive declaration.
+  const activeEdits = claims.filter(c => !c.released_at && !c.stale && c.mode !== 'read' && c.mode !== 'review');
+  if (activeEdits.length) {
+    const banner = document.createElement('p');
+    banner.className = 'dk-muted';
+    const holders = [...new Set(activeEdits.map(c => c.holder || 'unknown'))].slice(0, 3).join(', ');
+    banner.textContent = `Already in progress: ${activeEdits.length} active edit declaration${activeEdits.length === 1 ? '' : 's'} (${holders}). Read the rows before starting overlapping work.`;
+    container.append(banner);
+  }
   const list = document.createElement('div');
   list.className = 'session-commands-list';
   for (const c of claims.slice(0, 20)) {
-    const scope = c.released_at ? `${c.scope} (released)` : c.scope;
+    const scope = c.released_at ? `${c.scope} (released)` : c.stale ? `${c.scope} (stale)` : c.scope;
     const expires = c.expires_at
       ? new Date(typeof c.expires_at === 'number' ? c.expires_at : Date.parse(c.expires_at)).toISOString().slice(0, 19).replace('T', ' ')
       : '-';
-    list.append(activityRow('claim', `${c.holder || '-'} · ${c.project || '-'}:${scope}`, `expires ${expires}`));
+    const source = c.source === 'native' ? 'native' : 'hub';
+    const mode = c.mode || 'edit';
+    const key = shortWorkKey(c.work_key);
+    const main = `${c.holder || '-'} · ${c.project || '-'}:${scope}${key ? ` · ${key}` : ''}${c.worktree ? ` @ ${c.worktree}` : ''}`;
+    const row = activityRow(`${source} ${mode}`, main, `expires ${expires}`);
+    if (c.work_key) row.title = c.work_key;
+    if (c.task_id) row.dataset.taskId = c.task_id;
+    list.append(row);
   }
   for (const m of messages.slice(0, 20)) {
     const body = String(m.body || '').slice(0, 140);

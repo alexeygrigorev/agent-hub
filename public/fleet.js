@@ -230,16 +230,31 @@ function renderActivity(data) {
   notice.textContent = data.notice || '';
   root.append(notice);
   const claims = Array.isArray(data.claims) ? data.claims : [];
+  const activeEdits = claims.filter(c => !c.released_at && !c.stale && c.mode !== 'read' && c.mode !== 'review');
+  if (activeEdits.length) {
+    const banner = document.createElement('p');
+    const holders = [...new Set(activeEdits.map(c => c.holder || 'unknown'))].slice(0, 3).join(', ');
+    banner.textContent = `Already in progress: ${activeEdits.length} active edit declaration${activeEdits.length === 1 ? '' : 's'} (${holders}) — check before starting overlapping work.`;
+    root.append(banner);
+  }
   const fmtTs = v => {
     if (v === null || v === undefined) return 'unknown';
     const ms = typeof v === 'number' ? v : Date.parse(v);
     if (!Number.isFinite(ms)) return String(v);
     return new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
   };
-  root.append(richTable(['Project', 'Scope', 'Holder', 'Expires'], claims.slice(0, 20).map(c => [
+  const shortKey = k => {
+    if (!k || typeof k !== 'string') return '—';
+    const task = /^task:([0-9a-fA-F]{8})[0-9a-fA-F-]*$/.exec(k);
+    if (task) return `task:${task[1]}`;
+    return k.length > 40 ? `${k.slice(0, 37)}…` : k;
+  };
+  root.append(richTable(['Project', 'Scope', 'Holder', 'Source', 'Work key', 'Expires'], claims.slice(0, 20).map(c => [
     c.project || 'unknown',
-    `${c.scope || 'unknown'}${c.released_at ? ' (released)' : ''}`,
+    `${c.scope || 'unknown'}${c.released_at ? ' (released)' : c.stale ? ' (stale)' : ''}${c.mode && c.mode !== 'edit' ? ` [${c.mode}]` : ''}`,
     c.holder || 'unknown',
+    c.source || 'hub',
+    shortKey(c.work_key),
     fmtTs(c.expires_at)
   ])));
   const messages = Array.isArray(data.recent_messages) ? data.recent_messages : [];

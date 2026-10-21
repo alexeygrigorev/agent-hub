@@ -1,12 +1,13 @@
 # Work activity: seeing who is already on a task
 
-Read-only visibility slice. It shows what already exists — active Hub work
-declarations (`claims` table) and recent Hub bus traffic (`messages` table) —
-so an operator can see that someone is already working on a task or workspace
-before starting overlapping work (for example, a second CI fix on the same
-task). It creates no store, writes nothing, and defines no agent MUST rules:
-the full claim/messaging protocol (leases, TTL policy, where agents must
-write) is owned by a separate design document when it lands.
+Read-only visibility slice. It shows active Hub work declarations (`claims`
+table, including host-bridged native `aplexer` rows with `source: native`)
+and recent Hub bus traffic (`messages` table, including mirrored `work.*`
+envelopes addressed to `project:<project>`) — so an operator can see that
+someone is already working on a task or workspace before starting
+overlapping work (for example, a second CI fix on the same task). The
+write side (what workers MUST declare, canonical mailbox rule, redaction)
+is [docs/WORK-CLAIM.md](docs/WORK-CLAIM.md).
 
 ## Operator recipe
 
