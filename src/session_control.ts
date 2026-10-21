@@ -884,7 +884,7 @@ export class SessionControlService {
     if (path === '/api/sessions' && request.method === 'POST') {
       if (!writer) return response({ error: 'forbidden' }, 403);
       const input = await body(request);
-      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id']) ||
+      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id']) ||
           !label(input.key) || !workspaceOk(input.workspace) ||
           (input.engine !== undefined && !label(input.engine)) ||
           (input.engine_override_reason !== undefined && (typeof input.engine_override_reason !== 'string' || input.engine_override_reason.length > 500)) ||
@@ -893,6 +893,7 @@ export class SessionControlService {
           (input.cwd !== undefined && !cwdOk(input.cwd)) ||
           (input.mode !== undefined && !['headless', 'interactive'].includes(input.mode)) ||
           (input.parent_id !== undefined && (typeof input.parent_id !== 'string' || !input.parent_id.trim() || input.parent_id.length > 256)) ||
+          (input.intake_task_id !== undefined && (typeof input.intake_task_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.intake_task_id))) ||
           (input.brief !== undefined && (typeof input.brief !== 'string' || !input.brief.trim() || input.brief.length > 8000))) {
         return response({ error: 'invalid_session_request' }, 400);
       }
@@ -959,7 +960,7 @@ export class SessionControlService {
           engine: input.engine ?? null, machine: input.machine ?? null,
           workspace: input.workspace, cwd: input.cwd ?? null, brief: input.brief ?? null,
           mode, access: input.access ?? null, name: input.name ?? null,
-          parent_id: parentId ?? null,
+          parent_id: parentId ?? null, intake_task_id: input.intake_task_id ?? null,
         });
 
         const prior: any = this.sql.exec(
@@ -969,10 +970,29 @@ export class SessionControlService {
           // Before lineage shipped, canonical starts omitted parent_id entirely.
           const priorInput = parsed(prior.request_json, {});
           if (!Object.prototype.hasOwnProperty.call(priorInput, 'parent_id')) priorInput.parent_id = null;
-          if (JSON.stringify(priorInput) !== canonical) return response({ error: 'idempotency_conflict' }, 409);
+          if (!Object.prototype.hasOwnProperty.call(priorInput, 'intake_task_id')) priorInput.intake_task_id = null;
+          // Order-insensitive idempotency: legacy rows may carry the same
+          // fields in a different key order (e.g. backfilled defaults).
+          const norm = (o: any) => JSON.stringify(o, Object.keys(o).sort());
+          if (norm(priorInput) !== norm(parsed(canonical, {}))) return response({ error: 'idempotency_conflict' }, 409);
           if (prior.fleet_launch_id || prior.state === 'cancelled') return response({ ...this.view(prior), replay: true });
           // A held intent may be placed once capacity/admission recovers; the fleet
           // reserve stays idempotent on its own derived key, so this cannot double-launch.
+        }
+        // Start gate (server-side, before any Fleet placement or session row):
+        // a start linked to an intake task requires non-empty acceptance
+        // criteria on that task. Missing or whitespace-only values fail closed
+        // with acceptance_criteria_required; an unknown task id fails closed
+        // with unknown_intake_task. Starts without intake_task_id are
+        // unlinked and unaffected — link intake-backed work explicitly.
+        if (input.intake_task_id) {
+          let ac: unknown;
+          try {
+            const row: any = this.sql.exec('SELECT data FROM intake_tasks WHERE id = ?', input.intake_task_id).toArray()[0];
+            ac = row ? JSON.parse(row.data).acceptance_criteria : undefined;
+          } catch { return response({ error: 'unknown_intake_task' }, 404); }
+          if (ac === undefined) return response({ error: 'unknown_intake_task' }, 404);
+          if (typeof ac !== 'string' || !ac.trim()) return response({ error: 'acceptance_criteria_required' }, 400);
         }
         // Held-row hygiene in the same mutation txn: an unplaced held row is a parked
         // intent, not a session, so retries with fresh keys must not pile it up
