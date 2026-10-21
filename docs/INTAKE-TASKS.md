@@ -57,7 +57,7 @@ same existing token/device login and credential configuration. The existing
 dependency, global binary or local STATE file is needed.
 
 ```sh
-hub intake create --project example --title 'Review request' --text-file request.txt --key capture-001
+hub intake create --project example --title 'Review request' --text-file request.txt --key capture-001 --acceptance-criteria 'Review posted; two findings max'
 hub intake list --status open --project example
 hub intake show TASK_ID
 hub intake history TASK_ID
@@ -65,6 +65,7 @@ hub intake links TASK_ID
 hub intake context TASK_ID
 hub intake update TASK_ID --owner example:assistant --next-step 'Obtain review'
 hub intake update TASK_ID --version 1 --status blocked --next-step 'Obtain review' --key context-001
+hub intake update TASK_ID --acceptance-criteria 'Done means X; verified by Y' --key ac-001
 hub intake append TASK_ID --version 2 --event-file event.json --key event-001
 hub intake assign TASK_ID --version 3 --key assign-001 --workspace example-ws --engine codex --tier daily --next-step 'Watch Hub binding' --brief-file goal.txt
 hub intake grantees --actor example:assistant
@@ -151,6 +152,28 @@ keep working unchanged.
 shows the assignment's denormalized engine/machine claim as
 `claimed_link_unverified`. Joining canonical session lifecycle into status is a
 head follow-up outside this increment's scope.
+
+## Acceptance criteria gate (start/assign)
+
+A task is handed to an agent only with non-empty acceptance criteria. The
+first-class `acceptance_criteria` field (nullable, max 8 KiB) is set at create
+(`--acceptance-criteria` / `--acceptance-criteria-file`) or later through a
+CAS update (`--acceptance-criteria`, `--clear acceptance_criteria`), and is
+projected in every task view (`payload_data.acceptance_criteria`).
+
+- `POST /tasks/ID/assign` fails closed with `400 acceptance_criteria_required`
+  when the task's criteria are missing or whitespace-only. The check runs
+  server-side before any Fleet placement/session row, and is re-checked after
+  the start round-trip.
+- `POST /api/sessions` with `intake_task_id` (CLI `hub sessions start
+  --intake-task ID`) runs the same server-side gate before placement: empty
+  criteria → `400 acceptance_criteria_required`, unknown task id → `404
+  unknown_intake_task`. `hub intake assign` passes the task id through, so the
+  canonical start path is covered by both gates.
+- Starts without `intake_task_id` are unlinked and unaffected: link
+  intake-backed work explicitly via `assign` or `--intake-task`.
+- This is start acceptance (what "done" means before work begins), not
+  `owner_acceptance` (completion acceptance recorded after work).
 
 ## HTTP contract
 

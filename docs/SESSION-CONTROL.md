@@ -127,7 +127,12 @@ constraints), `brief` (optional headless prompt, 1..8000 chars), `mode`
 (`headless`|`interactive`, interactive starts empty), `name` (optional
 friendly name, `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`; stored in `request_json`,
 shown in list/show, never identity), `access` (optional
-claim-admission declaration passed through to fleet).
+claim-admission declaration passed through to fleet), `intake_task_id`
+(optional linked intake task id; when present the start is refused with `400
+acceptance_criteria_required` if that task's acceptance criteria are missing
+or whitespace-only, or `404 unknown_intake_task` for an unknown id — checked
+server-side before any Fleet placement or session row; part of start
+idempotency. Starts without it are unlinked and unaffected).
 
 `tier` resolves through the EXISTING model-routing table inside fleet plan
 (configured tier membership filters eligible engine/profile routes; the
@@ -390,7 +395,7 @@ mount (same helper shape, narrow operator-token route scope, no global
 hub sessions list [--state running] [--limit 50]
 hub sessions start --workspace demo|/absolute/repo/path [--engine opencode] [--machine hetzner]
     [--cwd demo/project] [--brief-file goal.txt | --prompt "..." | --interactive] [--name friendly] [--key k1]
-    [--wait] [--timeout 300] [--interval 5]
+    [--intake-task TASK_ID] [--wait] [--timeout 300] [--interval 5]
 hub sessions send <session-id|name> --body-file prompt.txt [--key k2] [--wait ...]
 hub sessions capture <session-id|name> [--max-bytes 65536] [--screen] [--key k3] [--wait ...]
 hub sessions stop <session-id|name> [--key k4] [--wait ...]
