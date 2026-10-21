@@ -19,7 +19,8 @@ async function ok(path: string, payload?: any, bearer?: string): Promise<any> {
   const res = await call(path, payload, bearer); const data = await res.json();
   expect(res.status, JSON.stringify(data)).toBe(200); return data;
 }
-const create = (project = 'demo', key = 'create-' + ++seq) => ok('/tasks', { key, project, title: 'Synthetic task', text: '  ORIGINAL synthetic request\n世界\n', source });
+const create = (project = 'demo', key = 'create-' + ++seq) => ok('/tasks', { key, project, title: 'Synthetic task', text: '  ORIGINAL synthetic request\n世界\n', source,
+  acceptance_criteria: 'Synthetic acceptance criteria: review posted with findings addressed.' });
 async function seedAgent(actor = 'demo:assistant', family = 'family-' + ++seq, scopes = '["bus:read","bus:send"]'): Promise<any> {
   const id = 'credential-' + ++seq, token = 'hubt_fixture_' + seq, refresh = 'hubr_fixture_' + seq;
   const hash = await sha256(token), rh = await sha256(refresh);
@@ -350,7 +351,8 @@ describe('private durable intake HTTP/SQLite', () => {
     expect(listed.status).toBe(200);
     expect((((await listed.json()) as any).sessions as any[]).map(s => s.id)).toContain(sessionId);
     // An operator-owned session cannot be linked by this agent: no oracle.
-    const foreign = (await ok('/tasks', { key: 'foreign-task', project: 'demo', title: 'Synthetic', text: 'x', source })).task;
+    const foreign = (await ok('/tasks', { key: 'foreign-task', project: 'demo', title: 'Synthetic', text: 'x', source,
+      acceptance_criteria: 'Synthetic acceptance criteria.' })).task;
     const foreignSession = (await ok('/tasks/' + foreign.id + '/assign', { key: 'foreign-assign',
       expected_version: 1, session: { workspace: 'demo', brief: 'Synthetic foreign goal' }, provenance: source })).assigned_session.hub_session_id;
     expect((await call('/tasks/' + task.id + '/events', { key: 'foreign-link', expected_version: 2,
@@ -358,7 +360,8 @@ describe('private durable intake HTTP/SQLite', () => {
     // Without fleet:launch the canonical service refuses, so assignment fails.
     const plain = await seedAgent('demo:assistant');
     await grant(plain, 'project', 'demo', 'write');
-    const unscoped = (await ok('/tasks', { key: 'unscoped-task', project: 'demo', title: 'Synthetic', text: 'x', source })).task;
+    const unscoped = (await ok('/tasks', { key: 'unscoped-task', project: 'demo', title: 'Synthetic', text: 'x', source,
+      acceptance_criteria: 'Synthetic acceptance criteria.' })).task;
     expect((await call('/tasks/' + unscoped.id + '/assign', { key: 'no-launch', expected_version: 1,
       session: { workspace: 'demo' }, provenance: source }, plain.token)).status).toBe(403);
   });

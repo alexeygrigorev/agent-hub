@@ -56,7 +56,8 @@ describe('Hub MCP protocol and parity', () => {
       const response: any = await (await rpc('tools/call', { name, arguments: args })).json();
       return JSON.parse(response.result.content[0].text);
     };
-    const created = await invoke('intake_create', { payload: { key: 'mcp-convenience-create', project: 'demo', title: 'Fixture', text: 'Fixture', source: { type: 'unknown' } } });
+    const created = await invoke('intake_create', { payload: { key: 'mcp-convenience-create', project: 'demo', title: 'Fixture', text: 'Fixture', source: { type: 'unknown' },
+      acceptance_criteria: 'Synthetic MCP acceptance criteria.' } });
     const id = created.data.task.id;
     const updated = await invoke('intake_update', { id, payload: { owner: 'fixture-owner' } });
     expect(updated.status).toBe(200);

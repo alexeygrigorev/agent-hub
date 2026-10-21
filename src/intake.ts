@@ -55,6 +55,19 @@ function integer(value: any, min = 0, max = Number.MAX_SAFE_INTEGER): number {
   return value;
 }
 function nullable(value: any, max = 512): string | null { return value == null ? null : str(value, max); }
+/** First-class start gate input: nullable bounded text. Whitespace-only is
+ * stored as-is; the start/assign gate (acceptance_criteria_required) refuses
+ * missing or whitespace-only values at placement time. */
+const AC_MAX = 8192;
+function acNullable(value: any): string | null {
+  if (value == null) return null;
+  if (typeof value !== 'string' || new TextEncoder().encode(value).length > AC_MAX) fail('invalid_field');
+  return value;
+}
+/** Server-trusted start gate: non-empty (non-whitespace) acceptance criteria. */
+function hasAcceptanceCriteria(task: Obj): boolean {
+  return typeof task.acceptance_criteria === 'string' && task.acceptance_criteria.trim().length > 0;
+}
 function canonical(value: any): string {
   if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
   if (value && typeof value === 'object') return '{' + Object.keys(value).sort().map(k => JSON.stringify(k) + ':' + canonical(value[k])).join(',') + '}';
@@ -263,10 +276,10 @@ export class IntakeService {
     return task.status === 'open' ? 'ready' : 'closed_or_waiting';
   }
   private taskView(task: Obj, p: Obj): Obj {
-    const { title, current_state, next_step, owner, uncertainty, history, ...identity } = task;
+    const { title, current_state, next_step, owner, uncertainty, acceptance_criteria, history, ...identity } = task;
     return { ...identity, control: { version: task.version, status: task.status, continuation_state: this.continuation(task),
       authority: 'hub_ledger_cas', execution_evidence: 'not_verified_by_intake' },
-      payload_data: { title, current_state, next_step, owner, uncertainty, history }, unresolved: this.unresolved(task),
+      payload_data: { title, current_state, next_step, owner, uncertainty, acceptance_criteria: acceptance_criteria ?? null, history }, unresolved: this.unresolved(task),
       assigned_sessions: this.assignedSessions(task, p) };
   }
   private view(task: Obj, p: Obj): Obj { return { ...this.taskView(task, p), operator_rules: this.rules([task]), data_notice: DATA_NOTICE }; }
@@ -645,10 +658,11 @@ export class IntakeService {
   private write(path: string, b: Obj, p: Obj): Obj {
     const now = Date.now();
     if (path === '/tasks') {
-      keys(b, ['key', 'project', 'title', 'text', 'source', 'transcription']);
+      keys(b, ['key', 'project', 'title', 'text', 'source', 'transcription', 'acceptance_criteria']);
       const project = identifier(b.project);
       const task: Obj = { id: crypto.randomUUID(), project, title: str(b.title, 256), status: 'open', version: 1,
-        created_at: now, updated_at: now, current_state: null, next_step: null, owner: null, uncertainty: null, history: [] };
+        created_at: now, updated_at: now, current_state: null, next_step: null, owner: null, uncertainty: null,
+        acceptance_criteria: acNullable(b.acceptance_criteria), history: [] };
       if (!this.allowed(p, task, true)) fail('forbidden', 403);
       this.bounded('tasks', INTAKE_LIMITS.tasks);
       task.history.push(this.event({ kind: 'intake', text: b.text, source: b.source, transcription: b.transcription }, task, p, now));
@@ -706,12 +720,14 @@ export class IntakeService {
       }
       task.history.push(this.event(event, task, p, now));
     } else {
-      keys(b, ['key', 'expected_version', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty']);
-      if (!['status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty'].some(k => k in b)) fail('empty_update');
+      keys(b, ['key', 'expected_version', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria']);
+      if (!['status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria'].some(k => k in b)) fail('empty_update');
       const changes: Obj = {};
-      for (const field of ['status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty']) if (field in b) {
+      for (const field of ['status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria']) if (field in b) {
         if (field === 'status' && !STATUSES.includes(b[field])) fail('invalid_status');
-        task[field] = field === 'status' ? b[field] : nullable(b[field], field === 'title' ? 256 : 8192);
+        task[field] = field === 'status' ? b[field]
+          : field === 'acceptance_criteria' ? acNullable(b[field])
+          : nullable(b[field], field === 'title' ? 256 : 8192);
         changes[field] = task[field];
       }
       task.history.push({ id: crypto.randomUUID(), kind: 'update', changes, actor: p.actor, captured_at: now, authority: 'untrusted_task_data' });
@@ -768,6 +784,10 @@ export class IntakeService {
       }
       this.expected(b, task.version);
       if (task.history.length >= INTAKE_LIMITS.events) fail('history_capacity', 507);
+      // Start gate (server-side, before any Fleet placement): a task is
+      // handed to an agent only with non-empty acceptance criteria. Missing
+      // or whitespace-only values fail closed with acceptance_criteria_required.
+      if (!hasAcceptanceCriteria(task)) fail('acceptance_criteria_required', 400);
       if (this.activeAssignment(task)) fail('active_assignment_exists', 409);
       return { p };
     });
@@ -778,7 +798,9 @@ export class IntakeService {
     const sessionKey = 'ia-' + [...new Uint8Array(digest)].map(x => x.toString(16).padStart(2, '0')).join('').slice(0, 24);
     let started: { status: number; body: any };
     try {
-      started = await this.hooks.startSession({ ...session, key: sessionKey }, auth);
+      // The linked intake task id travels with the start so the canonical
+      // session-control gate re-checks the same AC server-side before placement.
+      started = await this.hooks.startSession({ ...session, key: sessionKey, intake_task_id: taskId }, auth);
     } catch { fail('assignment_failed', 502); }
     const created = started! && typeof started!.body === 'object' ? started!.body : null;
     if (!created || typeof created.id !== 'string' || !SESSION_UUID.test(created.id)) {
@@ -799,6 +821,8 @@ export class IntakeService {
       }
       this.expected(b, task.version);
       if (task.history.length + 2 > INTAKE_LIMITS.events) fail('history_capacity', 507);
+      // Re-check after the start round-trip: AC cleared mid-flight still fails closed.
+      if (!hasAcceptanceCriteria(task)) fail('acceptance_criteria_required', 400);
       const active = this.activeAssignment(task);
       if (active && active !== created.id) fail('active_assignment_exists', 409);
       // The created (or deterministically replayed) session must still be
