@@ -184,6 +184,9 @@ def cycle(workspace, rows, pending, request=None):
         return {}
 
     cfg = settings(Path(workspace))
+    # Hermetic native state for the work-claim bridge: the directory does not
+    # exist, so scans find nothing and the cycle POSTs nothing.
+    cfg["aplexer_state_dir"] = str(Path(workspace) / "aplexer-state")
     with patch('agent_hub_host.system.get_system_info',
                return_value={'capabilities': {}}), \
          patch('agent_hub_host.api.get_heartbeat_payload',
@@ -214,7 +217,12 @@ class FleetBindingTests(unittest.TestCase):
             pending = [{'id': SID, 'fleet_launch_id': LID,
                         'engine': 'opencode'}]
             results, calls = cycle(tmp, [row], pending)
-            self.assertEqual(results, [])
+            # The appended work-claim bridge summary is the new cycle
+            # contract; binding assertions apply to the launch results.
+            bridge = [r for r in results if r.get('id') == 'workclaim-sync']
+            self.assertEqual(len(bridge), 1)
+            self.assertTrue(bridge[0]['ok'])
+            self.assertEqual([r for r in results if r.get('id') != 'workclaim-sync'], [])
             bindings = [c for c in calls if c[1].endswith('/binding')]
             self.assertEqual(len(bindings), 1)
             method, path, body = bindings[0]
@@ -284,7 +292,8 @@ class FleetBindingTests(unittest.TestCase):
                 return {}
 
             results, _ = cycle(tmp, [row], pending, request=refusing)
-            self.assertEqual(results, [])
+            self.assertEqual([r for r in results if r.get('id') != 'workclaim-sync'], [])
+            self.assertEqual(len([r for r in results if r.get('id') == 'workclaim-sync']), 1)
             self.assertTrue(any(c[1] == '/api/fleet/offers' for c in calls))
 
 
