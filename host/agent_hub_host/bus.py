@@ -134,3 +134,25 @@ def list_claims(project=None, holder=None, active=True):
     if params:
         path += "?" + "&".join(params)
     return _do_request("GET", path)
+
+def activity(workspace=None, project=None, holder=None, actor=None, limit=20, active=True):
+    """Read-only work-activity visibility: active claims plus recent bus
+    messages for a workspace, project, holder or actor. Shows whether someone
+    is already on this before starting overlapping work. No writes, no claims."""
+    path = "/api/bus/activity"
+    params = []
+    if workspace:
+        params.append(f"workspace={urllib.parse.quote(workspace, safe='')}")
+    if project:
+        params.append(f"project={urllib.parse.quote(project, safe='')}")
+    if holder:
+        params.append(f"holder={urllib.parse.quote(holder, safe='')}")
+    if actor:
+        params.append(f"actor={urllib.parse.quote(actor, safe='')}")
+    if limit is not None:
+        params.append(f"limit={int(limit)}")
+    if not active:
+        params.append("all=true")
+    if params:
+        path += "?" + "&".join(params)
+    return _do_request("GET", path)

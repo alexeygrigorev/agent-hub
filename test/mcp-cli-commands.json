@@ -1,6 +1,7 @@
 [
   "accept",
   "ack",
+  "activity",
   "artifact",
   "auth login",
   "auth logout",

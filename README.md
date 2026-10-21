@@ -154,7 +154,7 @@ Results contain the original API HTTP `status` and `data` as JSON text; API fail
 | `status`, `machines available`, `fleet`, `quota`, `auth status`, `heartbeat` | `status`, `machines_available`, `fleet`, `quota`, `auth_status`, `heartbeat` |
 | `start-agent`, `start-session`, `plan-agent` | `start_agent`, `start_session`, `plan_agent` (legacy fleet API) |
 | `sessions`, `sessions list/tree/start/show/commands/send/capture/stop/cleanup/observe` | `sessions_list/tree/start/show/commands/send/capture/stop/cleanup/observe` |
-| `send/reply/inbox/show/ack/accept/complete` | `bus_send/reply/inbox/show/ack/accept/complete` |
+| `send/reply/inbox/show/ack/accept/complete/activity` | `bus_send/reply/inbox/show/ack/accept/complete`, `bus_activity` (read-only work-activity visibility; see [docs/WORK-ACTIVITY.md](docs/WORK-ACTIVITY.md)) |
 | `claim/claims/release` | `claims_create/list/release` |
 | `submit`, `routing-machines`, `model-policy`, `jobs/job/task-result/artifact` | `tasks_submit`, `routing_machines`, `model_policy`, `jobs_list/show`, `task_result`, `artifact` |
 | `intake create/list/show/history/links/context/continue/update/append/assign/rules/grants/grantees/revoke` | corresponding `intake_*` tools; `intake_rules_write` and `intake_grants_write` perform explicit operator mutations |

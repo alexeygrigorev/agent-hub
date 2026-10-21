@@ -540,6 +540,88 @@ function renderSessionDetail(session, commands = []) {
   }
 }
 
+function activityRow(kind, main, meta) {
+  const item = document.createElement('div');
+  item.className = 'session-command-card';
+  const left = document.createElement('div');
+  left.className = 'sessions-card-item__badges';
+  const kindSpan = document.createElement('span');
+  kindSpan.className = 'code-pill';
+  kindSpan.textContent = kind;
+  left.append(kindSpan);
+  const mainSpan = document.createElement('span');
+  mainSpan.className = 'meta-dim sessions-truncate';
+  mainSpan.textContent = main;
+  mainSpan.title = main;
+  left.append(mainSpan);
+  const right = document.createElement('span');
+  right.className = 'meta-dim';
+  right.textContent = meta;
+  item.append(left, right);
+  return item;
+}
+
+function renderSessionActivity(container, data) {
+  container.replaceChildren();
+  const claims = Array.isArray(data.claims) ? data.claims : [];
+  const messages = Array.isArray(data.recent_messages) ? data.recent_messages : [];
+  if (!claims.length && !messages.length) {
+    const p = document.createElement('p');
+    p.className = 'dk-muted';
+    p.textContent = 'No active work declarations or recent bus messages in scope.';
+    container.append(p);
+    return;
+  }
+  const list = document.createElement('div');
+  list.className = 'session-commands-list';
+  for (const c of claims.slice(0, 20)) {
+    const scope = c.released_at ? `${c.scope} (released)` : c.scope;
+    const expires = c.expires_at
+      ? new Date(typeof c.expires_at === 'number' ? c.expires_at : Date.parse(c.expires_at)).toISOString().slice(0, 19).replace('T', ' ')
+      : '-';
+    list.append(activityRow('claim', `${c.holder || '-'} · ${c.project || '-'}:${scope}`, `expires ${expires}`));
+  }
+  for (const m of messages.slice(0, 20)) {
+    const body = String(m.body || '').slice(0, 140);
+    const created = m.created_at
+      ? new Date(typeof m.created_at === 'number' ? m.created_at : Date.parse(m.created_at)).toISOString().slice(0, 19).replace('T', ' ')
+      : '-';
+    list.append(activityRow(m.kind || 'message', `${m.from_actor || '-'} → ${m.to_actor || '-'}: ${body}`, created));
+  }
+  container.append(list);
+}
+
+async function refreshSessionActivity(session) {
+  const container = byId('session-detail-activity');
+  const notice = byId('session-activity-notice');
+  const meta = byId('session-activity-meta');
+  if (!container || !notice) return;
+  const sessionId = session && session.id;
+  if (!session || !session.workspace) {
+    notice.textContent = 'This session reports no workspace; use Fleet work activity or hub activity for hub-wide declarations.';
+    container.replaceChildren();
+    if (meta) meta.textContent = '';
+    return;
+  }
+  notice.textContent = 'Loading work activity…';
+  try {
+    const data = await api(`/api/bus/activity?workspace=${encodeURIComponent(session.workspace)}&limit=10`);
+    if (selectedSessionId !== sessionId) return;
+    notice.textContent = (data && data.notice) || '';
+    if (meta) {
+      meta.textContent = data && data.project
+        ? `claim project: ${data.project}`
+        : 'no claim project mapped to this workspace';
+    }
+    renderSessionActivity(container, data || {});
+  } catch (err) {
+    if (selectedSessionId !== sessionId) return;
+    notice.textContent = `Work activity could not be loaded: ${(err && err.message) || 'error'}`;
+    container.replaceChildren();
+    if (meta) meta.textContent = '';
+  }
+}
+
 async function refreshSessionDetail(sessionId) {
   if (!sessionId || selectedSessionId !== sessionId) return;
   const actionStatus = byId('session-action-status');
@@ -551,6 +633,7 @@ async function refreshSessionDetail(sessionId) {
     if (selectedSessionId !== sessionId) return;
     const cmds = (cmdData && Array.isArray(cmdData.commands)) ? cmdData.commands : [];
     renderSessionDetail(sessionData, cmds);
+    refreshSessionActivity(sessionData).catch(() => {});
 
     const hasPending = cmds.some(c => ['recorded', 'transported', 'claimed'].includes(c.state));
     if (detailPollTimer) {

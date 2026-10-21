@@ -31,6 +31,7 @@ tool('bus_inbox', 'GET', '/api/bus/inbox', 'Inbox query: actor, limit, cursor.',
 tool('bus_show', 'GET', '/api/bus/messages/{id}', 'Read a message.', ['show']);
 for (const stage of ['ack', 'accept', 'complete']) tool(`bus_${stage}`, 'POST', `/api/bus/messages/{id}/${stage}`, `Explicitly ${stage} a message; optional payload lease_epoch.`, [stage]);
 tool('claims_list', 'GET', '/api/bus/claims', 'Claims query: project, holder, all.', ['claims']);
+tool('bus_activity', 'GET', '/api/bus/activity', 'Work-activity visibility: active claims plus recent bus messages for a workspace, project, holder or actor. Query: workspace, project, holder, actor, limit, all. Read-only; shows whether someone is already on this before starting overlapping work.', ['activity']);
 tool('claims_create', 'POST', '/api/bus/claims', 'Claim a scope using project, scope, holder, ttl_ms, lease_epoch.', ['claim']);
 tool('claims_release', 'POST', '/api/bus/claims/{id}/release', 'Release a claim; id may be project:scope (encoded as one segment).', ['release']);
 tool('tasks_submit', 'POST', '/api/fleet/tasks', 'Submit authorized work; payload prompt, approved_action, needs, workspace, idempotency_key and routing preferences, or tasks batch.', ['submit']);

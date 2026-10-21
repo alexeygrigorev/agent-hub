@@ -474,6 +474,14 @@ def main():
     p_claims.add_argument("--holder", help="Filter by holder")
     p_claims.add_argument("--all", action="store_true", help="Include released/expired claims")
 
+    p_activity = sub.add_parser("activity", help="Show active work declarations and recent bus messages (who is already on this)")
+    p_activity.add_argument("--workspace", help="Workspace to check (resolved to a claim project via claim policy)")
+    p_activity.add_argument("--project", help="Filter by claim project")
+    p_activity.add_argument("--holder", help="Filter by claim holder")
+    p_activity.add_argument("--actor", help="Filter recent bus messages by actor")
+    p_activity.add_argument("--limit", type=int, default=20, help="Recent bus messages to include (1-100)")
+    p_activity.add_argument("--all", action="store_true", help="Include released/expired claims")
+
     p_bridge = sub.add_parser("bridge", help="Bridge hub messages to native aplexer mailboxes (bounded, foreground)")
     p_bridge.add_argument("--workspace", required=True, help="aplexer workspace whose mailboxes are bridged")
     p_bridge.add_argument("--tag", action="append", help="Registered tag to bridge (repeatable; default: all registered)")
@@ -748,6 +756,9 @@ def main():
     elif args.cmd == "claims":
         from . import bus
         print(json.dumps(bus.list_claims(project=getattr(args, 'project', None), holder=getattr(args, 'holder', None), active=not getattr(args, 'all', False))))
+    elif args.cmd == "activity":
+        from . import bus
+        print(json.dumps(bus.activity(workspace=getattr(args, 'workspace', None), project=getattr(args, 'project', None), holder=getattr(args, 'holder', None), actor=getattr(args, 'actor', None), limit=getattr(args, 'limit', 20), active=not getattr(args, 'all', False))))
 
 if __name__ == "__main__":
     main()

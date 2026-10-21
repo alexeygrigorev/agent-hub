@@ -2236,6 +2236,101 @@ export class Hub extends DurableObject {
       return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, POST' } });
     }
 
+    // GET /api/bus/activity — read-only "who is already on this" aggregation.
+    // No new store and no new protocol: active claims come from the existing
+    // claims table (via BusService.listClaims) and recent traffic from the
+    // existing messages table (via BusService.getBusMessages). A workspace is
+    // resolved to a claim project through the existing fleet_claim_policy
+    // table (workspace -> project); nothing is invented when no row matches.
+    if (path === '/api/bus/activity') {
+      if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('admin')) {
+        return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
+      }
+
+      for (const k of url.searchParams.keys()) {
+        if (!['workspace', 'project', 'holder', 'actor', 'limit', 'all'].includes(k)) {
+          return Response.json({ error: 'unknown_query_param', param: k }, { status: 400 });
+        }
+      }
+
+      const workspace = url.searchParams.get('workspace') || undefined;
+      if (workspace && (workspace.length > 2048 || /[\x00-\x1f\x7f]/.test(workspace))) {
+        return Response.json({ error: 'invalid_workspace' }, { status: 400 });
+      }
+      let project = url.searchParams.get('project') || undefined;
+      if (project && (project.length > 64 || !project.trim())) {
+        return Response.json({ error: 'invalid_project' }, { status: 400 });
+      }
+      const holder = url.searchParams.get('holder') || undefined;
+      if (holder && holder.length > 128) {
+        return Response.json({ error: 'invalid_holder' }, { status: 400 });
+      }
+      const actor = url.searchParams.get('actor') || undefined;
+      if (actor && actor.length > 128) {
+        return Response.json({ error: 'invalid_actor' }, { status: 400 });
+      }
+      let limit = 20;
+      if (url.searchParams.has('limit')) {
+        const rawLimit = url.searchParams.get('limit')!;
+        if (!/^\d+$/.test(rawLimit)) return Response.json({ error: 'invalid_limit' }, { status: 400 });
+        const parsed = parseInt(rawLimit, 10);
+        if (parsed < 1 || parsed > 100) return Response.json({ error: 'invalid_limit' }, { status: 400 });
+        limit = parsed;
+      }
+      const activeOnly = url.searchParams.get('all') !== 'true';
+
+      try {
+        // Workspace -> project through the existing claim-admission policy.
+        // An explicit ?project= wins; a workspace with no policy row simply
+        // yields no project-scoped claims (never a guessed mapping).
+        let claimPolicy: { project: string | null; require_claim: boolean } | null = null;
+        if (workspace) {
+          try {
+            const row: any = this.sql.exec(
+              'SELECT project, require_claim FROM fleet_claim_policy WHERE workspace = ?', workspace,
+            ).toArray()[0];
+            if (row) claimPolicy = { project: row.project ?? null, require_claim: !!row.require_claim };
+          } catch { claimPolicy = null; }
+        }
+        const effectiveProject = project ?? claimPolicy?.project ?? undefined;
+
+        // A workspace query that resolves to no Hub project cannot scope
+        // claims to that workspace: return an empty claim set (with an
+        // explanatory notice) rather than caller-global or hub-global rows
+        // under a workspace heading. Pass ?project= explicitly to scope.
+        const unmappedWorkspace = Boolean(workspace && !project && !claimPolicy?.project);
+        const claims = unmappedWorkspace
+          ? []
+          : this.busService.listClaims(auth.caller!, effectiveProject, holder, activeOnly);
+        const messageActor = actor || holder || undefined;
+        const messages = this.busService.getBusMessages(auth.caller!, messageActor).slice(0, limit);
+        const activeClaims = claims.filter((c: any) => !c.released_at);
+        const notice = unmappedWorkspace
+          ? 'no claim policy maps this workspace to a Hub project — claims are not scoped to it; pass ?project= explicitly or configure fleet claim policy'
+          : activeClaims.length === 0 && messages.length === 0
+            ? 'no active work declarations or recent bus activity in scope'
+            : `${activeClaims.length} active work declaration${activeClaims.length === 1 ? '' : 's'}, ` +
+              `${messages.length} recent bus message${messages.length === 1 ? '' : 's'} in scope — ` +
+              'someone may already be on this; read the rows before starting overlapping work';
+        return Response.json({
+          workspace: workspace ?? null,
+          project: effectiveProject ?? null,
+          claim_policy: claimPolicy,
+          claims,
+          recent_messages: messages,
+          notice,
+        });
+      } catch (e: any) {
+        if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
+          return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
+        }
+        return Response.json({ error: 'Internal Server Error' }, { status: 500 });
+      }
+    }
+
     // POST /api/bus/claims/:target/release
     if (path.startsWith('/api/bus/claims/') && path.endsWith('/release')) {
       if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });

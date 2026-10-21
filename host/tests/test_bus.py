@@ -148,5 +148,30 @@ class TestBus(unittest.TestCase):
             cli.main()
             mock_do_request.assert_called_once()
 
+    @patch('agent_hub_host.bus._do_request')
+    def test_bus_activity(self, mock_do_req):
+        mock_do_req.return_value = {"claims": [], "recent_messages": [], "notice": "none"}
+        res = bus.activity(workspace="/repo", limit=10)
+        self.assertEqual(res["notice"], "none")
+        mock_do_req.assert_called_once()
+        method, called_path = mock_do_req.call_args[0][0], mock_do_req.call_args[0][1]
+        self.assertEqual(method, "GET")
+        self.assertTrue(called_path.startswith("/api/bus/activity?"), called_path)
+        self.assertIn("workspace=%2Frepo", called_path)
+        self.assertIn("limit=10", called_path)
+
+    @patch('agent_hub_host.bus._do_request')
+    def test_cli_activity(self, mock_do_request):
+        from agent_hub_host import cli
+        mock_do_request.return_value = {"claims": [], "recent_messages": [], "notice": "none"}
+        sys_argv = ["cli.py", "activity", "--project", "testproj", "--limit", "5"]
+        with patch.object(sys, 'argv', sys_argv):
+            cli.main()
+            mock_do_request.assert_called_once()
+            called_path = mock_do_request.call_args[0][1]
+            self.assertIn("/api/bus/activity?", called_path)
+            self.assertIn("project=testproj", called_path)
+            self.assertIn("limit=5", called_path)
+
 if __name__ == "__main__":
     unittest.main()

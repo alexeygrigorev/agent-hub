@@ -216,6 +216,41 @@ function healthBadge(status) {
   span.textContent = status || 'unknown';
   return span;
 }
+function renderActivity(data) {
+  const root = byId('work-activity-panel');
+  if (!root) return;
+  root.replaceChildren();
+  if (!data || data.error) {
+    const p = document.createElement('p');
+    p.textContent = data && data.error ? `Work activity unavailable: ${data.error}` : 'No work activity reported yet.';
+    root.append(p);
+    return;
+  }
+  const notice = document.createElement('p');
+  notice.textContent = data.notice || '';
+  root.append(notice);
+  const claims = Array.isArray(data.claims) ? data.claims : [];
+  const fmtTs = v => {
+    if (v === null || v === undefined) return 'unknown';
+    const ms = typeof v === 'number' ? v : Date.parse(v);
+    if (!Number.isFinite(ms)) return String(v);
+    return new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
+  };
+  root.append(richTable(['Project', 'Scope', 'Holder', 'Expires'], claims.slice(0, 20).map(c => [
+    c.project || 'unknown',
+    `${c.scope || 'unknown'}${c.released_at ? ' (released)' : ''}`,
+    c.holder || 'unknown',
+    fmtTs(c.expires_at)
+  ])));
+  const messages = Array.isArray(data.recent_messages) ? data.recent_messages : [];
+  root.append(richTable(['From', 'To', 'Kind', 'Body', 'Created'], messages.slice(0, 10).map(m => [
+    m.from_actor || 'unknown',
+    m.to_actor || 'unknown',
+    m.kind || 'unknown',
+    String(m.body || '').slice(0, 120),
+    fmtTs(m.created_at)
+  ])));
+}
 function renderHostHealth(health) {
   const root = byId('host-health');
   if (!root) return;
@@ -274,6 +309,11 @@ async function refresh() {
       renderHostHealth(await api('/api/monitoring/health'));
     } catch (e) {
       renderHostHealth({ error: e.message });
+    }
+    try {
+      renderActivity(await api('/api/bus/activity?limit=10'));
+    } catch (e) {
+      renderActivity({ error: e.message });
     }
     byId('status').textContent = `Authenticated · updated ${new Date().toLocaleTimeString()}`;
   }
