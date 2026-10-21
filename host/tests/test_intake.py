@@ -240,6 +240,32 @@ class TestIntakeCli(unittest.TestCase):
         self.assertEqual(payload['session']['parent_id'], 'e3f61b6c-9fda-4bcc-bf3d-cf66cb7ef363')
         self.assertEqual(payload['session']['workspace'], 'demo')
 
+    def test_create_and_update_carry_acceptance_criteria(self):
+        with patch.object(intake, 'read_file', return_value='  synthetic\n世界\n'), \
+                patch.object(intake, 'request', return_value={}) as transport:
+            code, _, error = self.run_cli('intake', 'create', '--project', 'demo', '--title', 'Synthetic',
+                                          '--text-file', '-', '--key', 'capture-ac',
+                                          '--acceptance-criteria', 'Review posted; findings addressed.')
+        self.assertEqual(code, 0, error)
+        self.assertEqual(transport.call_args.args[2]['acceptance_criteria'], 'Review posted; findings addressed.')
+        with patch.object(intake, 'request', return_value={}) as transport:
+            code, _, error = self.run_cli('intake', 'update', 'task-1', '--version', '2', '--key', 'update-ac',
+                                          '--acceptance-criteria', 'Done means X.')
+        self.assertEqual(code, 0, error)
+        self.assertEqual(transport.call_args.args[2]['acceptance_criteria'], 'Done means X.')
+        with patch.object(intake, 'request', return_value={}) as transport:
+            code, _, error = self.run_cli('intake', 'update', 'task-1', '--version', '2', '--key', 'clear-ac',
+                                          '--clear', 'acceptance_criteria')
+        self.assertEqual(code, 0, error)
+        self.assertIsNone(transport.call_args.args[2]['acceptance_criteria'])
+
+    def test_acceptance_criteria_gate_error_code_survives_transport(self):
+        raw = b'{"error":"acceptance_criteria_required"}'
+        exc = urllib.error.HTTPError('https://fixture.test', 400, 'private', {}, io.BytesIO(raw))
+        result = intake.http_error(exc, 'POST', {'key': 'fixture-retry'})
+        self.assertEqual(result.status, 400)
+        self.assertEqual(result.code, 'acceptance_criteria_required')
+
     def test_grantees_builds_operator_query_url(self):
         with patch.object(intake, 'request', return_value={'items': []}) as transport:
             code, out, error = self.run_cli('intake', 'grantees', '--actor', 'demo:assistant')

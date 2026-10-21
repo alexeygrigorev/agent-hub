@@ -37,6 +37,7 @@ def http_error(exc, method, payload):
                'invalid_field', 'unknown_field', 'invalid_source', 'not_found', 'forbidden',
                'invalid_status', 'empty_update', 'active_assignment_exists', 'history_capacity',
                'task_capacity', 'assignment_unavailable', 'invalid_identifier', 'unauthorized',
+               'acceptance_criteria_required', 'unknown_intake_task',
                'record_capacity', 'storage_capacity', 'request_capacity', 'record_byte_capacity'}
     try:
         body = json.loads(exc.read(4097))
@@ -97,6 +98,10 @@ def add_commands(sub):
     create.add_argument('--source-type', choices=['chat', 'voice', 'forwarded', 'unknown'], default='unknown')
     create.add_argument('--source-reference')
     create.add_argument('--source-time')
+    create.add_argument('--acceptance-criteria', default=None,
+                        help='Acceptance criteria text (max 8 KiB); required non-empty before assign/start')
+    create.add_argument('--acceptance-criteria-file', default=None,
+                        help='Read acceptance criteria from a UTF-8 file, or - for stdin (max 8 KiB)')
     create.add_argument('--key', required=True)
     listing = commands.add_parser('list', help='One explicit revision-pinned page')
     listing.add_argument('--status', default='open')
@@ -116,8 +121,8 @@ def add_commands(sub):
     update.add_argument('id')
     update.add_argument('--version', type=int, help='Explicit CAS version; otherwise fetch and retry version conflicts up to three times')
     update.add_argument('--key', help='Stable retry key; generated automatically when omitted')
-    update.add_argument('--clear', action='append', choices=['current_state', 'next_step', 'owner', 'uncertainty'], default=[], help='Explicitly clear a context field to unknown (repeatable)')
-    for field in ('status', 'title', 'current-state', 'next-step', 'owner', 'uncertainty'):
+    update.add_argument('--clear', action='append', choices=['current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria'], default=[], help='Explicitly clear a context field to unknown (repeatable)')
+    for field in ('status', 'title', 'current-state', 'next-step', 'owner', 'uncertainty', 'acceptance-criteria'):
         update.add_argument('--' + field)
     event = commands.add_parser('append', help='Append intake/note/session/report/commit/followup/blocker/decision/rule reference as JSON; approval decisions require operator')
     event.add_argument('id')
@@ -228,10 +233,21 @@ def execute(args):
     command = args.intake_cmd
     if command == 'create':
         valid_key(args.key)
-        return request('POST', BASE + '/tasks', {'key': args.key, 'project': args.project, 'title': args.title,
+        criteria = getattr(args, 'acceptance_criteria', None)
+        criteria_file = getattr(args, 'acceptance_criteria_file', None)
+        if criteria is not None and criteria_file is not None:
+            raise ValueError('Cannot specify both --acceptance-criteria and --acceptance-criteria-file')
+        if criteria_file is not None:
+            criteria = read_file(criteria_file, 8192)
+        if criteria is not None and len(criteria.encode('utf-8')) > 8192:
+            raise ValueError('Acceptance criteria exceed capacity')
+        body = {'key': args.key, 'project': args.project, 'title': args.title,
                        'text': None if args.voice_pending else read_file(args.text_file),
                        'transcription': 'pending' if args.voice_pending else ('provided' if args.source_type == 'voice' else 'not_applicable'), 'source': {'type': args.source_type,
-                       'reference': args.source_reference, 'timestamp': args.source_time}})
+                       'reference': args.source_reference, 'timestamp': args.source_time}}
+        if criteria is not None:
+            body['acceptance_criteria'] = criteria
+        return request('POST', BASE + '/tasks', body)
     if command == 'list':
         params = {'status': args.status, 'limit': args.limit}
         for field in ('project', 'after', 'revision', 'authorization_valid_until'):
@@ -288,8 +304,10 @@ def execute(args):
         payload['event'] = json_file(args.event_file)
         return request('POST', path + '/events', payload)
     if command == 'update':
-        for field in ('status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty'):
-            if getattr(args, field) is not None:
+        for field in ('status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria'):
+            if getattr(args, field, None) is not None:
+                if field == 'acceptance_criteria' and len(args.acceptance_criteria.encode('utf-8')) > 8192:
+                    raise ValueError('Acceptance criteria exceed capacity')
                 payload[field] = getattr(args, field)
         for field in args.clear:
             if getattr(args, field) is not None:

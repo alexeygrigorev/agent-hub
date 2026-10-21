@@ -274,6 +274,8 @@ def add_commands(sub):
                        help='Friendly session name (stored, shown in list/show; exact-match alias, never identity)')
     start.add_argument('--parent', default=None,
                        help='Parent session id recording lineage')
+    start.add_argument('--intake-task', default=None,
+                       help='Linked intake task id; the start is refused when that task has empty acceptance criteria')
     start.add_argument('--headless', action='store_true', help='Explicitly start in headless mode')
     mode = start.add_mutually_exclusive_group()
     mode.add_argument('--brief-file', help='UTF-8 goal file for headless work (max 8 KiB)')
@@ -290,6 +292,7 @@ def add_commands(sub):
     override.add_argument('--cwd')
     override.add_argument('--name', default=None, help='Friendly session name')
     override.add_argument('--parent', default=None, help='Parent session id recording lineage')
+    override.add_argument('--intake-task', default=None, help='Linked intake task id; refused when that task has empty acceptance criteria')
     override.add_argument('--headless', action='store_true', help='Explicitly start in headless mode')
     override_mode = override.add_mutually_exclusive_group()
     override_mode.add_argument('--brief-file', help='UTF-8 goal file for headless work (max 8 KiB)')
@@ -523,6 +526,8 @@ def execute(args):
             value = getattr(args, field, None)
             if value:
                 payload[field] = value
+        if getattr(args, 'intake_task', None):
+            payload['intake_task_id'] = args.intake_task
         if reason and reason.strip():
             payload['engine_override_reason'] = reason.strip()
         if getattr(args, 'name', None) is not None:
