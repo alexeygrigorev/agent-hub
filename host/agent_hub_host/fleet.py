@@ -1113,10 +1113,16 @@ class Dispatcher:
             except ValueError:
                 raise ValueError("Result path escapes workspace root")
             goal += '\nWrite a final JSON object to ' + str(result_path) + ': {"status":"done|failed|waiting-on-human|stuck","report":"sanitized final report","artifacts":[{"label":"text","text":"sanitized text"}]}. No secrets, codes, tokens or URLs. Do not write raw screenshots; keep them private for human review locally.'
+            # Launcher named-profile admission requires BOTH account_label and
+            # account_profile. Unprofiled native engines (antigravity/opencode)
+            # must omit account_label; a bare account_label makes every provider
+            # reject with "Named profile requires both account_label and
+            # account_profile", leaving Hub launches stuck in offered forever.
             payload = {"goal": goal, "owner": "hub-fleet", "cwd": str(target_cwd), "timeout": 1800,
                        "model_requirements": {"providers": [sub["launcher_provider"]], "models": [sub["launcher_model"]]},
-                       "account_label": sub["account_label"], "profile": "model-task"}
+                       "profile": "model-task"}
             if profile is not None:
+                payload["account_label"] = sub["account_label"]
                 payload["account_profile"] = profile
                 payload["provider_profile"] = profile
                 from . import provisioning
