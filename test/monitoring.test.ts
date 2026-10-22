@@ -3,6 +3,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 import { formatBytes, DISK_THRESHOLDS } from '../src/monitoring';
+import { INTAKE_LIMITS } from '../src/intake';
 
 const now = Date.parse('2026-10-17T18:00:00Z');
 const iso = (secondsAgo: number) => new Date(now - secondsAgo * 1000).toISOString();
@@ -663,8 +664,8 @@ describe('Disk Monitoring Service', () => {
     enrollHost(hub.sql, 'host-a');
     const auth = { kind: 'host' as const, machine_id: 'host-a', tokenId: 'cred-host-a' };
 
-    // Fill intake_tasks up to capacity (256 tasks)
-    for (let i = 0; i < 256; i++) {
+    // Fill intake_tasks up to capacity (INTAKE_LIMITS.tasks)
+    for (let i = 0; i < INTAKE_LIMITS.tasks; i++) {
       const dummyId = `dummy-task-${i.toString().padStart(4, '0')}`;
       hub.sql.exec(
         'INSERT INTO intake_tasks(id, data) VALUES(?, ?)',
