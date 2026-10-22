@@ -23,6 +23,8 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import { credentialActor } from './agent_registry';
 import { redact } from './routing';
 import { taskTier } from './model-routing';
+import { engineProvider, evaluateTbmAdmission, type TbmPoolRow } from './quota_admission';
+import { ensureTbmQuotaSchema } from './quota';
 import { approvalAuthorityMatches } from './host_enrollment';
 import { sha256 } from './auth/crypto';
 import { validateHumanCredentialRecord } from './auth/human-credential';
@@ -250,6 +252,18 @@ export class SessionControlService {
   }
 
   private at() { return new Date(this.now()).toISOString(); }
+
+  /** TBM admission over tbm_quota_pools; any read failure fails closed. Cycle length defaults to 7d until pacing (Phase 3) stores it. */
+  private tbmGate(engine: string | undefined) {
+    try {
+      ensureTbmQuotaSchema(this.sql);
+      const pools = this.sql.exec(
+        'SELECT pool_id, provider, total_capacity_tokens, remaining_tokens, reset_at_ms, convexity_exponent, kill_switch_active, kill_switch_reason, last_updated_ms FROM tbm_quota_pools').toArray() as unknown as TbmPoolRow[];
+      return evaluateTbmAdmission({ pools, provider: engine ? engineProvider(engine) : null, nowMs: this.now(), cycleMs: 7 * 86400000 });
+    } catch {
+      return { ok: false as const, reason: 'malformed_pool' as const, pool_id: null, detail: 'tbm_read_failed' };
+    }
+  }
 
   /** Current credential family of the presenting token, or null when the
    * credential row is gone, revoked, or expired. The hub already rejected
@@ -985,14 +999,32 @@ export class SessionControlService {
         // with acceptance_criteria_required; an unknown task id fails closed
         // with unknown_intake_task. Starts without intake_task_id are
         // unlinked and unaffected — link intake-backed work explicitly.
+        // TBM Phase 2: every non-interactive (headless) start must be linked to
+        // an open intake task; interactive sessions are never gated.
+        if (mode !== 'interactive' && !input.intake_task_id) {
+          return response({ error: 'intake_task_id_required' }, 400);
+        }
         if (input.intake_task_id) {
           let ac: unknown;
+          let taskStatus: unknown;
           try {
             const row: any = this.sql.exec('SELECT data FROM intake_tasks WHERE id = ?', input.intake_task_id).toArray()[0];
-            ac = row ? JSON.parse(row.data).acceptance_criteria : undefined;
+            const data = row ? JSON.parse(row.data) : undefined;
+            ac = data ? data.acceptance_criteria : undefined;
+            taskStatus = data?.status;
           } catch { return response({ error: 'unknown_intake_task' }, 404); }
           if (ac === undefined) return response({ error: 'unknown_intake_task' }, 404);
+          if (taskStatus === 'done' || taskStatus === 'cancelled') return response({ error: 'intake_task_closed' }, 409);
           if (typeof ac !== 'string' || !ac.trim()) return response({ error: 'acceptance_criteria_required' }, 400);
+        }
+        // TBM Phase 2: kill-switch + hard floor + dynamic soft reserve for
+        // autonomous starts (fail closed; interactive starts unaffected).
+        if (mode !== 'interactive') {
+          const gate = this.tbmGate(input.engine);
+          if (!gate.ok) {
+            const status = gate.reason === 'kill_switch_active' ? 423 : 409;
+            return response({ error: 'tbm_admission_denied', reason: gate.reason, pool_id: gate.pool_id, detail: gate.detail ?? null }, status);
+          }
         }
         // Held-row hygiene in the same mutation txn: an unplaced held row is a parked
         // intent, not a session, so retries with fresh keys must not pile it up

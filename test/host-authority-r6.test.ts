@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { seedFixtureIntake, withFixtureIntake } from './tbm-fixture';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { SessionControlService } from '../src/session_control';
 import { sha256 } from '../src/auth/crypto';
@@ -23,7 +24,7 @@ function hubRequest(path: string, data?: any, method = 'POST', headers?: Record<
   return new Request('https://hub.test' + path, {
     method,
     headers: { 'Content-Type': 'application/json', ...(headers || {}) },
-    body: data === undefined ? undefined : JSON.stringify(data),
+    body: data === undefined ? undefined : JSON.stringify(withFixtureIntake(path, data, method)),
   });
 }
 
@@ -141,6 +142,7 @@ describe('host-enrollment authority prerequisite (R3, session/registry surfaces)
     await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
       const s = new SessionControlService(hub.sql, (cb) => state.storage.transactionSync(cb), Date.now, { reserve: fakeReserve() });
       s.init();
+      seedFixtureIntake(hub.sql);
       const at = new Date().toISOString();
       const far = new Date(Date.now() + 30 * 86400000).toISOString();
       const oldToken = 'hubt_old_host_token_1111111111111111';
@@ -177,6 +179,7 @@ describe('host-enrollment authority prerequisite (R3, session/registry surfaces)
     await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
       const s = new SessionControlService(hub.sql, (cb) => state.storage.transactionSync(cb), Date.now, { reserve: fakeReserve() });
       s.init();
+      seedFixtureIntake(hub.sql);
       const headers = await adminCookieHeader(bindings as unknown as Env);
       const at = new Date().toISOString();
       hub.sql.exec(`INSERT INTO machines (id, name, hostname, registered_at) VALUES ('hetzner', 'hetzner', 'hetzner', ?)`, at);
@@ -214,6 +217,7 @@ describe('host-enrollment authority prerequisite (R3, session/registry surfaces)
     await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
       const s = new SessionControlService(hub.sql, (cb) => state.storage.transactionSync(cb), Date.now, { reserve: fakeReserve() });
       s.init();
+      seedFixtureIntake(hub.sql);
       const headers = await adminCookieHeader(bindings as unknown as Env);
       const at = new Date().toISOString();
       hub.sql.exec(`INSERT INTO machines (id, name, hostname, registered_at) VALUES ('hetzner', 'hetzner', 'hetzner', ?)`, at);
@@ -421,6 +425,7 @@ describe('host-enrollment authority prerequisite (R3, session/registry surfaces)
     await runInDurableObject(stub, async (hub: Hub, state: DurableObjectState) => {
       const s = new SessionControlService(hub.sql, (cb) => state.storage.transactionSync(cb), Date.now, { reserve: fakeReserve() });
       s.init();
+      seedFixtureIntake(hub.sql);
       const headers = await adminCookieHeader(bindings as unknown as Env);
       const at = new Date().toISOString();
       hub.sql.exec(`INSERT INTO machines (id, name, hostname, registered_at) VALUES ('hetzner', 'hetzner', 'hetzner', ?)`, at);

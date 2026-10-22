@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { seedFixtureIntake, withFixtureIntake } from './tbm-fixture';
 import { env, runInDurableObject } from 'cloudflare:test';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
@@ -35,7 +36,7 @@ const nativeTarget = () => ({ native_id: NATIVE_ID, tag: NATIVE_TAG, workspace: 
 const boundNative = () => ({ native_id: NATIVE_ID, tag: NATIVE_TAG, workspace: NATIVE_WS, native_created_at_ms: NATIVE_CREATED });
 
 function request(path: string, data?: any, method = 'POST') {
-  return new Request('https://hub.test' + path, { method, body: data === undefined ? undefined : JSON.stringify(data) });
+  return new Request('https://hub.test' + path, { method, body: data === undefined ? undefined : JSON.stringify(withFixtureIntake(path, data, method)) });
 }
 
 function fakeReserve() {
@@ -53,6 +54,7 @@ async function fixture(fn: (s: SessionControlService, sql: any) => Promise<void>
     const fake = fakeReserve();
     const service = new SessionControlService(hub.sql, (cb) => state.storage.transactionSync(cb), Date.now, { reserve: fake.hook });
     service.init();
+    seedFixtureIntake(hub.sql);
     const at = new Date().toISOString();
     const far = new Date(Date.now() + 30 * 86400000).toISOString();
     hub.sql.exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)

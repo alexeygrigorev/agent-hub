@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { FIXTURE_INTAKE_ID, seedFixtureIntake } from './tbm-fixture';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { isValidMachineId, MACHINE_ID_REGEX } from '../src/machine-id';
 import { FleetService } from '../src/fleet';
@@ -228,6 +229,7 @@ describe('Machine-ID Boundary Validation', () => {
       const stub = bindings.HUB.get(bindings.HUB.idFromName('sc-mid-' + crypto.randomUUID()));
       await runInDurableObject(stub, async (hub: Hub) => {
         hub.sessionControlService.init();
+        seedFixtureIntake(hub.sql);
         await fn(hub.sessionControlService, hub);
       });
     }
@@ -242,6 +244,7 @@ describe('Machine-ID Boundary Validation', () => {
           workspace: 'demo',
           brief: 'session on dash host',
           machine: '-dash-host',
+          intake_task_id: FIXTURE_INTAKE_ID,
         }),
       });
       const resDash = await sc.handle(reqDash, writerAuth);
@@ -257,6 +260,7 @@ describe('Machine-ID Boundary Validation', () => {
           workspace: 'demo',
           brief: 'session on under host',
           machine: '_under_host',
+          intake_task_id: FIXTURE_INTAKE_ID,
         }),
       });
       const resUnder = await sc.handle(reqUnder, writerAuth);

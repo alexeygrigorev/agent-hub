@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { FIXTURE_INTAKE_ID, seedFixtureIntake } from './tbm-fixture';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { SessionControlService } from '../src/session_control';
 import type { Hub } from '../src/hub';
@@ -28,6 +29,7 @@ async function fixture(fn: (s: SessionControlService, sql: any) => Promise<void>
     const fake = fakeReserve();
     const service = new SessionControlService(hub.sql, (cb) => state.storage.transactionSync(cb), Date.now, { reserve: fake.hook });
     service.init();
+    seedFixtureIntake(hub.sql);
     const at = new Date().toISOString();
     const far = new Date(Date.now() + 30 * 86400000).toISOString();
     hub.sql.exec(`INSERT OR IGNORE INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at)
@@ -67,7 +69,7 @@ function streamRequest(sql: any, path: string, payload: any, mutate: () => void)
 describe('hub session control R3: post-body authority inside the mutation txn', () => {
   it('R3-1 host revoked mid-body cannot bind or adopt a family', async () => fixture(async (s, sql) => {
     const created = await (await s.handle(new Request('https://hub.test/api/sessions',
-      { method: 'POST', body: JSON.stringify({ key: 'r3-b1', workspace: 'demo' }) }), agent())).json() as any;
+      { method: 'POST', body: JSON.stringify({ key: 'r3-b1', workspace: 'demo', intake_task_id: FIXTURE_INTAKE_ID }) }), agent())).json() as any;
     const sessionId = created.id;
     const launchId = created.fleet_launch_id;
     const at = new Date().toISOString();
@@ -90,7 +92,7 @@ describe('hub session control R3: post-body authority inside the mutation txn', 
 
   it('R3-2 owner revoked mid-body enqueues nothing and stamps no NULL family', async () => fixture(async (s, sql) => {
     const created = await (await s.handle(new Request('https://hub.test/api/sessions',
-      { method: 'POST', body: JSON.stringify({ key: 'r3-s1', workspace: 'demo' }) }), agent())).json() as any;
+      { method: 'POST', body: JSON.stringify({ key: 'r3-s1', workspace: 'demo', intake_task_id: FIXTURE_INTAKE_ID }) }), agent())).json() as any;
     const sessionId = created.id;
     const launchId = created.fleet_launch_id;
     const at = new Date().toISOString();
@@ -113,7 +115,7 @@ describe('hub session control R3: post-body authority inside the mutation txn', 
 
   it('R3-3 creator revoked mid-body creates no session row', async () => fixture(async (s, sql) => {
     const res = await s.handle(streamRequest(sql, '/api/sessions',
-      { key: 'r3-c1', workspace: 'demo' },
+      { key: 'r3-c1', workspace: 'demo', intake_task_id: FIXTURE_INTAKE_ID },
       () => { sql.exec(`UPDATE credentials SET revoked_at = ? WHERE id = 'cred-1'`, new Date().toISOString()); }), agent());
     expect(res.status).toBe(403);
     const rows: any[] = sql.exec('SELECT id FROM session_control_sessions WHERE request_key = ?', 'r3-c1').toArray() as any[];

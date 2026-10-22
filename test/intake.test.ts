@@ -366,10 +366,11 @@ describe('private durable intake HTTP/SQLite', () => {
       session: { workspace: 'demo' }, provenance: source }, plain.token)).status).toBe(403);
   });
   it('carries session.parent_id to canonical session service, preserving lineage, idempotency, and failure boundaries', async () => {
+    const parentTask = (await create()).task;
     const parentRes = await SELF.fetch('https://hub.test/api/sessions', {
       method: 'POST',
       headers: { Cookie: cookie, 'x-csrf-token': 'csrf' },
-      body: JSON.stringify({ key: 'parent-session-' + ++seq, workspace: 'demo', mode: 'headless', brief: 'Parent session' })
+      body: JSON.stringify({ key: 'parent-session-' + ++seq, workspace: 'demo', mode: 'headless', brief: 'Parent session', intake_task_id: parentTask.id })
     });
     expect([201, 409]).toContain(parentRes.status);
     const parentId = ((await parentRes.json()) as any).id;

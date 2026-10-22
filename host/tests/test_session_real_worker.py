@@ -320,6 +320,10 @@ class TestSessionRealWorker(unittest.TestCase):
             cls.port = cls.handle.port
 
             cls.init_fixture_data()
+            # TBM Phase 2: headless starts require an open intake task.
+            cls.seed_sql("INSERT OR REPLACE INTO intake_tasks (id, data) VALUES (?, ?)",
+                         ["fixture-intake", json.dumps({"id": "fixture-intake", "project": "demo", "status": "open",
+                                                        "acceptance_criteria": "Synthetic fixture criteria.", "history": []})])
             # Native fixture dir (fake-a + journal), per-test tmp under server dir.
             cls.native_dir = os.path.join(cls.server_dir, "native")
             os.makedirs(cls.native_dir, exist_ok=True)
@@ -465,6 +469,7 @@ class TestSessionRealWorker(unittest.TestCase):
                               "--engine", "codex", "--reason", "codex required for real loop test",
                               "--machine", "hetzner",
                               "--brief-file", brief_file,
+                              "--intake-task", "fixture-intake",
                               "--key", "real-loop-1"], token="sess-agent-token")
         created = json.loads(start.stdout)
         self.assertEqual(created["state"], "offered")

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { seedFixtureIntake, withFixtureIntake } from './tbm-fixture';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { SessionControlService, validateSendProof, adoptObservedNativeSessions } from '../src/session_control';
 import type { Hub } from '../src/hub';
@@ -27,7 +28,7 @@ const goodProof = () => ({ native_message_id: 'nmsg-1', reply_to_native_id: 'nre
   sender_workspace: NATIVE_WS, sender_generation: 1, sender_created_at_ms: NATIVE_CREATED });
 
 function request(path: string, data?: any, method = 'POST') {
-  return new Request('https://hub.test' + path, { method, body: data === undefined ? undefined : JSON.stringify(data) });
+  return new Request('https://hub.test' + path, { method, body: data === undefined ? undefined : JSON.stringify(withFixtureIntake(path, data, method)) });
 }
 
 /** Synthetic placement only: never starts a live agent. */
@@ -47,6 +48,7 @@ async function fixture(fn: (s: SessionControlService, sql: any) => Promise<void>
     const service = new SessionControlService(hub.sql, (cb) => state.storage.transactionSync(cb), Date.now,
       reserve ? { reserve } : {}, options || {});
     service.init();
+    seedFixtureIntake(hub.sql);
     // Presenting host credential row so family continuity is exercised honestly,
     // plus its live machine registry row (hostOk consults machines on every
     // host call; a deleted machine binds nothing).

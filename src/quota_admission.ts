@@ -108,3 +108,117 @@ export function evaluateQuotaAdmission(input: QuotaAdmissionInput): QuotaAdmissi
   if (!available || remaining === null) return fail("no_available_window");
   return { ok: true, reason: "eligible", remaining };
 }
+
+/* ------------------------------------------------------------------ */
+/* TBM Phase 2: floors + kill-switch for autonomous (non-interactive)   */
+/* admission. Pure functions over tbm_quota_pools rows; fail closed.    */
+/* ------------------------------------------------------------------ */
+
+/** Fleet-wide kill-switch is stored as a tbm_quota_pools row with this pool_id. */
+export const TBM_FLEET_POOL_ID = "*";
+export const TBM_HARD_FLOOR_FRACTION = 0.05;
+export const TBM_HARD_FLOOR_MIN_TOKENS = 50_000;
+export const TBM_SOFT_INIT_FRACTION = 0.2;
+export const TBM_SOFT_INIT_MIN_TOKENS = 200_000;
+export const TBM_DEFAULT_KAPPA = 1.5;
+
+/** Engine -> quota provider (matches config/model-routing.json). */
+const ENGINE_PROVIDER: Record<string, string> = {
+  claude: "claude", codex: "codex", grok: "grok", gemini: "gemini", antigravity: "gemini",
+  opencode: "go", zcodex: "zai",
+};
+export function engineProvider(engine: string): string | null {
+  return ENGINE_PROVIDER[engine] ?? null;
+}
+
+export interface TbmPoolRow {
+  pool_id: string;
+  provider: string;
+  total_capacity_tokens: number;
+  remaining_tokens: number;
+  reset_at_ms: number;
+  convexity_exponent?: number | null;
+  kill_switch_active: number;
+  kill_switch_reason?: string | null;
+  last_updated_ms?: number | null;
+}
+
+/** R_hard = max(5% of Q_total, 50k tokens). */
+export function tbmHardFloor(totalTokens: number): number {
+  return Math.max(totalTokens * TBM_HARD_FLOOR_FRACTION, TBM_HARD_FLOOR_MIN_TOKENS);
+}
+
+/**
+ * R_soft(t) = R_hard + (R_soft_init - R_hard) * ((T_reset - t) / T_cycle)^kappa.
+ * The cycle length is not stored in tbm_quota_pools, so `cycleMs` is supplied by
+ * the caller; when the window is unknown the reserve stays at R_soft_init
+ * (conservative). Clamped to [R_hard, R_soft_init].
+ */
+export function tbmSoftReserve(totalTokens: number, nowMs: number, resetAtMs: number, cycleMs: number | null, kappa = TBM_DEFAULT_KAPPA): number {
+  const hard = tbmHardFloor(totalTokens);
+  const init = Math.max(hard, Math.max(totalTokens * TBM_SOFT_INIT_FRACTION, TBM_SOFT_INIT_MIN_TOKENS));
+  if (cycleMs === null || !(cycleMs > 0) || !Number.isFinite(resetAtMs)) return init;
+  const k = Number.isFinite(kappa) && kappa > 0 ? kappa : TBM_DEFAULT_KAPPA;
+  const frac = Math.min(1, Math.max(0, (resetAtMs - nowMs) / cycleMs));
+  return hard + (init - hard) * Math.pow(frac, k);
+}
+
+export type TbmAdmissionReason =
+  | "ok" | "kill_switch_active" | "hard_floor" | "soft_reserve" | "malformed_pool";
+
+export interface TbmAdmissionResult {
+  ok: boolean;
+  reason: TbmAdmissionReason;
+  pool_id: string | null;
+  detail?: string;
+  r_hard?: number;
+  r_soft?: number;
+  remaining?: number;
+}
+
+export interface TbmAdmissionInput {
+  /** Rows from tbm_quota_pools (all pools; the evaluator picks the relevant ones). */
+  pools: TbmPoolRow[];
+  /** Provider the session will burn, when known (explicit engine); null = unknown. */
+  provider: string | null;
+  nowMs: number;
+  /** Assumed provider cycle length for R_soft decay; null keeps R_soft at its initial level. */
+  cycleMs?: number | null;
+}
+
+function finiteNonNeg(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0;
+}
+
+/**
+ * Autonomous admission: kill-switch (fleet pool "*" or the provider's pools),
+ * then hard floor, then dynamic soft reserve. Floors are checked only for
+ * pools of the target provider; with no known provider only kill-switches apply
+ * (the router enforces floors per route in a later phase). Malformed rows fail closed.
+ */
+export function evaluateTbmAdmission(input: TbmAdmissionInput): TbmAdmissionResult {
+  const { pools, provider, nowMs } = input;
+  const cycleMs = input.cycleMs ?? null;
+  for (const p of pools) {
+    if (p.kill_switch_active !== 0 && p.kill_switch_active !== 1) {
+      return { ok: false, reason: "malformed_pool", pool_id: p.pool_id, detail: "kill_switch_active" };
+    }
+    const scoped = p.pool_id === TBM_FLEET_POOL_ID || (provider !== null && p.provider === provider);
+    if (scoped && p.kill_switch_active === 1) {
+      return { ok: false, reason: "kill_switch_active", pool_id: p.pool_id, detail: p.kill_switch_reason ?? undefined };
+    }
+  }
+  if (provider === null) return { ok: true, reason: "ok", pool_id: null };
+  for (const p of pools) {
+    if (p.pool_id === TBM_FLEET_POOL_ID || p.provider !== provider) continue;
+    if (!finiteNonNeg(p.total_capacity_tokens) || !finiteNonNeg(p.remaining_tokens) || p.total_capacity_tokens <= 0) {
+      return { ok: false, reason: "malformed_pool", pool_id: p.pool_id, detail: "capacity" };
+    }
+    const hard = tbmHardFloor(p.total_capacity_tokens);
+    const soft = tbmSoftReserve(p.total_capacity_tokens, nowMs, p.reset_at_ms, cycleMs, p.convexity_exponent ?? TBM_DEFAULT_KAPPA);
+    const base = { pool_id: p.pool_id, r_hard: hard, r_soft: soft, remaining: p.remaining_tokens };
+    if (p.remaining_tokens <= hard) return { ok: false, reason: "hard_floor", ...base };
+    if (p.remaining_tokens <= soft) return { ok: false, reason: "soft_reserve", ...base };
+  }
+  return { ok: true, reason: "ok", pool_id: null };
+}

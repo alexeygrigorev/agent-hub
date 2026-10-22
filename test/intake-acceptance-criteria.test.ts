@@ -89,7 +89,8 @@ describe('intake acceptance-criteria start gate', () => {
     expect([201, 409], JSON.stringify(linkedFull.data)).toContain(linkedFull.status);
     expect(linkedFull.data.error ?? null).not.toBe('acceptance_criteria_required');
     const unlinked = await sessionsCall({ key: 'ac-start-' + ++seq, workspace: 'demo', brief: 'Synthetic direct goal' });
-    expect([201, 409], JSON.stringify(unlinked.data)).toContain(unlinked.status);
+    expect(unlinked.status, JSON.stringify(unlinked.data)).toBe(400);
+    expect(unlinked.data.error).toBe('intake_task_id_required');
     const unknown = await sessionsCall({ key: 'ac-start-' + ++seq, workspace: 'demo', brief: 'Synthetic direct goal', intake_task_id: 'missing-task' });
     expect(unknown.status, JSON.stringify(unknown.data)).toBe(404);
     expect(unknown.data.error).toBe('unknown_intake_task');

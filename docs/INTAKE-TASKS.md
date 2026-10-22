@@ -170,8 +170,20 @@ projected in every task view (`payload_data.acceptance_criteria`).
   criteria → `400 acceptance_criteria_required`, unknown task id → `404
   unknown_intake_task`. `hub intake assign` passes the task id through, so the
   canonical start path is covered by both gates.
-- Starts without `intake_task_id` are unlinked and unaffected: link
-  intake-backed work explicitly via `assign` or `--intake-task`.
+- TBM Phase 2 (admission): every non-interactive (`mode` headless, the
+  default) start MUST carry `intake_task_id`; otherwise `400
+  intake_task_id_required`. A `done`/`cancelled` task → `409
+  intake_task_closed`. Interactive starts are never gated.
+- Autonomous starts also pass the TBM quota gate over `tbm_quota_pools`
+  (`src/quota_admission.ts`, `evaluateTbmAdmission`): an active kill-switch on
+  the fleet pool (`pool_id = '*'`) or on the target engine's provider → `423
+  tbm_admission_denied` (`reason: kill_switch_active`); with an explicit
+  `engine`, remaining tokens at or below `R_hard = max(5% total, 50k)` → `409
+  hard_floor`, at or below `R_soft(t)` (convex decay to `R_hard`, kappa from the
+  pool row, 7d cycle assumed until pacing stores it) → `409 soft_reserve`.
+  Without an engine only kill-switches apply (per-route floors arrive with the
+  Phase 3 router). Malformed pool rows fail closed. Interactive sessions are
+  unaffected.
 - This is start acceptance (what "done" means before work begins), not
   `owner_acceptance` (completion acceptance recorded after work).
 
