@@ -30,13 +30,16 @@ function disabledEngines(): Set<string> {
 /** Reject reasons that mean "no free slot right now" (transient capacity). */
 const CAPACITY_REASONS = new Set(['account_capacity', 'machine_capacity']);
 /** Incidental per-route reasons that may accompany capacity but never queue alone
- * (stale/drained check-ins, policy-disabled engines). */
-const INCIDENTAL_REASONS = new Set(['machine_unavailable', 'provider_disabled']);
+ * (stale/drained check-ins, policy-disabled engines, engines no live host
+ * advertises anymore — e.g. registry routes for engines the current host
+ * release stopped running). */
+const INCIDENTAL_REASONS = new Set(['machine_unavailable', 'provider_disabled', 'engine_unavailable']);
 /** Capacity-only placement failure: every rejected route reports transient
  * capacity (account/machine), optionally alongside incidental stale/disabled
- * routes — but incidentals alone never queue. Any other class (capability,
- * admission, resources, quota evidence, tier) stays a hard reject with its
- * slug visible. */
+ * routes (drained/stale check-ins, policy-disabled engines, registry routes
+ * for engines no live host advertises) — but incidentals alone never queue.
+ * Any other class (workspace/mode capability, admission, resources, quota
+ * evidence, tier) stays a hard reject with its slug visible. */
 export function isCapacityOnlyHold(rejected: unknown): rejected is { machine: string; engine: string; reason: string }[] {
   if (!Array.isArray(rejected) || rejected.length === 0) return false;
   let capacity = false;
@@ -325,6 +328,19 @@ export class FleetService {
     const rejected: { machine: string; engine: string; reason: string }[] = []; const candidates: any[] = [];
     const accounts = new Map(this.sql.exec('SELECT * FROM fleet_accounts').toArray().map(a => [a.label, this.accountStatus(a)]));
     const definitions = new Map(this.sql.exec('SELECT * FROM fleet_accounts').toArray().map(a => [a.label, a]));
+    // Engines advertised by at least one live (non-drained, fresh-checkin)
+    // host. A registry route for an engine no live host runs anymore is
+    // stale registry debt, not a workspace/mode defect: it must not block
+    // capacity queueing for the engines the live fleet actually runs.
+    const liveEngines = new Set<string>();
+    try {
+      for (const m of this.sql.exec('SELECT id, last_checkin_at, drained, capabilities FROM machines').toArray() as any[]) {
+        if (m.drained) continue;
+        if (!fresh(effectiveCheckin(m.id, m.last_checkin_at), this.now(), 180000)) continue;
+        const engines = parsed(m.capabilities)?.engines;
+        if (Array.isArray(engines)) for (const e of engines) if (typeof e === 'string') liveEngines.add(e);
+      }
+    } catch { /* fail closed below: empty set keeps capability_unavailable */ }
     for (const route of this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray() as any[]) {
       if ((request.account && route.account !== request.account) || (request.machine && route.machine_id !== request.machine) || (request.engine && !overrideModels.length && route.engine !== request.engine)) continue;
       if (overrideModels.length) {
@@ -350,7 +366,14 @@ export class FleetService {
       const account = accounts.get(route.account); const caps = parsed(machine?.capabilities); const hb = parsed(machine?.last_heartbeat);
       let reason = '';
       if (!machine || machine.drained || !fresh(effectiveCheckin(machine.id, machine.last_checkin_at), this.now(), 180000)) reason = 'machine_unavailable';
-      else if (!Array.isArray(caps.engines) || !caps.engines.includes(route.engine) || !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode) || !workspaceCapable(caps.workspaces, request.workspace)) reason = 'capability_unavailable';
+      else if (!Array.isArray(caps.engines) || !caps.engines.includes(route.engine) || !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode) || !workspaceCapable(caps.workspaces, request.workspace)) {
+        const engineMissing = !Array.isArray(caps.engines) || !caps.engines.includes(route.engine);
+        // A route for an engine no live host advertises anymore is stale
+        // registry debt, not a workspace/mode defect — but only when the live
+        // fleet actually advertises engines. When nothing live advertises
+        // anything (broken/empty registration), keep capability_unavailable.
+        reason = (engineMissing && liveEngines.size > 0 && !liveEngines.has(route.engine)) ? 'engine_unavailable' : 'capability_unavailable';
+      }
       else if (hb.gate?.launch_allowed !== true || !fresh(hb.gate?.at, this.now(), 300000)) reason = 'admission_unknown';
       else if (!Number.isFinite(hb.mem_avail_mb) || hb.mem_avail_mb < 10240 + 1500 || !Number.isFinite(hb.disk_free_gb) || hb.disk_free_gb < 50.5) reason = 'resource_limit';
       else if (!Array.isArray(hb.load) || !Number.isFinite(hb.load[0]) || hb.load[0] < 0 || !Number.isFinite(caps.cpu_count) || caps.cpu_count < 1) reason = 'load_unknown';

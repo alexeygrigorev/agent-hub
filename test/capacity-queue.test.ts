@@ -93,6 +93,13 @@ describe('capacity-only classifier', () => {
     ])).toBe(true);
     expect(isCapacityOnlyHold([{ machine: 'w', engine: 'codex', reason: 'machine_unavailable' }])).toBe(false);
     expect(isCapacityOnlyHold([{ machine: 'h', engine: 'codex', reason: 'provider_disabled' }])).toBe(false);
+    expect(isCapacityOnlyHold([{ machine: 'h', engine: 'gemini', reason: 'engine_unavailable' }])).toBe(false);
+    expect(isCapacityOnlyHold([
+      { machine: 'h', engine: 'codex', reason: 'account_capacity' },
+      { machine: 'h', engine: 'gemini', reason: 'engine_unavailable' },
+      { machine: 'w', engine: 'codex', reason: 'machine_unavailable' },
+      { machine: 'x', engine: 'grok', reason: 'provider_disabled' },
+    ])).toBe(true);
     for (const reason of ['capability_unavailable', 'admission_unknown', 'resource_limit', 'load_unknown', 'tier_unavailable', 'account_blocked', 'account_unknown', 'machine_account_quota_unknown']) {
       expect(isCapacityOnlyHold([
         { machine: 'h', engine: 'codex', reason: 'account_capacity' },
@@ -165,6 +172,28 @@ describe('fleet reserve capacity queue', () => {
     expect(alone.status).toBe(409);
     expect(((await alone.json()) as any).rejected).toEqual([{ machine: 'win35', engine: 'codex', reason: 'machine_unavailable' }]);
     expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches WHERE request_key = ?', 'incidental-alone').one().n).toBe(0);
+  }));
+
+  it('marks engines no live host advertises as engine_unavailable and queues them with capacity', () => fleetFixture(async (f, sql) => {
+    const withStale = registry();
+    withStale.routes.push({ machine_id: 'hetzner', engine: 'gemini', account: 'shared-codex', profile: null });
+    expect((await f.handle(fleetReq('/accounts', withStale, 'PUT'), admin)).status).toBe(200);
+    // Fill both live codex slots so every advertised engine is capacity-blocked.
+    for (const [machine, key] of [['hetzner', 'stale-first'], ['win35', 'stale-second']] as const) {
+      const placed: any = await (await f.handle(fleetReq('/launches', intent({ machine, idempotency_key: key })), admin)).json();
+      expect(placed.state).toBe('offered');
+    }
+    const res = await f.handle(fleetReq('/launches', intent({ idempotency_key: 'stale-queue' })), admin);
+    expect(res.status).toBe(202);
+    const body: any = await res.json();
+    expect(body.state).toBe('queued');
+    expect(body.rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'account_capacity' });
+    expect(body.rejected).toContainEqual({ machine: 'hetzner', engine: 'gemini', reason: 'engine_unavailable' });
+    expect(body.rejected.some((r: any) => r.reason === 'capability_unavailable')).toBe(false);
+    // A stale engine alone (no capacity in the mix) still hard-rejects.
+    const alone = await f.handle(fleetReq('/launches', intent({ engine: 'gemini', idempotency_key: 'stale-alone' })), admin);
+    expect(alone.status).toBe(409);
+    expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches WHERE request_key = ?', 'stale-alone').one().n).toBe(0);
   }));
 });
 
