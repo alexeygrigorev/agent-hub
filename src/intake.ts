@@ -12,6 +12,7 @@ type Tx = <T>(fn: () => T) => T;
  * the caller's own auth, so placement is never duplicated and session
  * identities are never invented here. Absent outside the Hub composition. */
 export type IntakeHooks = { startSession?: (input: Obj, auth: Auth) => Promise<{ status: number; body: any }> };
+/** Raised 256→512 t1037u: terminal tasks stay 1d before prune, so burst closes cannot free slots same-turn. */
 export const INTAKE_LIMITS = { request: 32768, tasks: 512, taskBytes: 131072, events: 128,
   // Original requests and exact lost-response receipts are retained together.
   // The former 4 MiB budget blocked real intake after the initial backfill
