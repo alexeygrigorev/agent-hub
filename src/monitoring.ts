@@ -12,7 +12,7 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { LivenessService } from './liveness';
 import type { StatusMachineAuth } from './status';
-import type { IntakeService } from './intake';
+import { INTAKE_LIMITS, type IntakeService } from './intake';
 import { isValidMachineId } from './machine-id';
 
 export const MONITORING_SCHEMA = `
@@ -839,7 +839,7 @@ export class MonitoringService {
 
     try {
       const count = Number((this.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks').toArray()[0] as any)?.n ?? 0);
-      if (count >= 256) return { taskId: null, error: 'record_capacity' };
+      if (count >= INTAKE_LIMITS.tasks) return { taskId: null, error: 'record_capacity' };
 
       const taskId = crypto.randomUUID();
       const task = {
