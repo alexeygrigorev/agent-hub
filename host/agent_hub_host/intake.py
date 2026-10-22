@@ -80,13 +80,13 @@ def request(method, path, payload=None):
         raise http_error(exc, method, payload) from None
 
 
-def read_file(path):
+def read_file(path, limit=MAX_REQUEST):
     if path == '-':
-        raw = sys.stdin.buffer.read(MAX_REQUEST + 1)
+        raw = sys.stdin.buffer.read(limit + 1)
     else:
         with Path(path).open('rb') as stream:
-            raw = stream.read(MAX_REQUEST + 1)
-    if len(raw) > MAX_REQUEST:
+            raw = stream.read(limit + 1)
+    if len(raw) > limit:
         raise ValueError('Input exceeds capacity')
     return raw.decode('utf-8')
 

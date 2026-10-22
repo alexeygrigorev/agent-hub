@@ -287,6 +287,36 @@ class TestIntakeCli(unittest.TestCase):
         self.assertEqual(result.status, 400)
         self.assertEqual(result.code, 'acceptance_criteria_required')
 
+    def test_create_with_acceptance_criteria_file_reads_bounded_file_t1035u(self):
+        # t1035u: intake create --acceptance-criteria-file never reached the
+        # server (read_file took 1 arg, call site passed 2 -> TypeError hidden
+        # behind the generic CLI message). File and stdin forms must work.
+        with tempfile.TemporaryDirectory(dir=ROOT/'.local/tmp') as directory:
+            body = Path(directory)/'body.txt'
+            body.write_text('hello body', encoding='utf-8')
+            criteria = Path(directory)/'ac.txt'
+            criteria.write_text('Do X then Y.', encoding='utf-8')
+            with patch.object(intake, 'request', return_value={}) as transport:
+                code, _, error = self.run_cli('intake', 'create', '--project', 'demo', '--title', 'T',
+                                              '--text-file', str(body), '--key', 'k-ac-file',
+                                              '--acceptance-criteria-file', str(criteria))
+            self.assertEqual(code, 0, error)
+            self.assertEqual(transport.call_args.args[2]['acceptance_criteria'], 'Do X then Y.')
+            with patch.object(intake, 'request', return_value={}) as transport, \
+                 patch('sys.stdin', io.TextIOWrapper(io.BytesIO('Do Z.'.encode()), encoding='utf-8')):
+                code, _, error = self.run_cli('intake', 'create', '--project', 'demo', '--title', 'T',
+                                              '--text-file', str(body), '--key', 'k-ac-stdin',
+                                              '--acceptance-criteria-file', '-')
+            self.assertEqual(code, 0, error)
+            self.assertEqual(transport.call_args.args[2]['acceptance_criteria'], 'Do Z.')
+        with tempfile.TemporaryDirectory(dir=ROOT/'.local/tmp') as directory:
+            oversized = Path(directory)/'big.txt'
+            oversized.write_bytes(b'x' * 8193)
+            body = Path(directory)/'body.txt'
+            body.write_text('b', encoding='utf-8')
+            with self.assertRaises(ValueError):
+                intake.read_file(oversized, 8192)
+
     def test_grantees_builds_operator_query_url(self):
         with patch.object(intake, 'request', return_value={'items': []}) as transport:
             code, out, error = self.run_cli('intake', 'grantees', '--actor', 'demo:assistant')
