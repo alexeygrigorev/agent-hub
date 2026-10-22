@@ -152,6 +152,19 @@ async function body(request: Request): Promise<any> {
   } catch { return null; } finally { reader.releaseLock(); }
 }
 
+
+/** Exact workspace id or boundary-safe descendant of an advertised root. */
+function workspaceCapable(capsWorkspaces: any, request: any): boolean {
+  if (!Array.isArray(capsWorkspaces) || typeof request !== 'string' || !request) return false;
+  for (const w of capsWorkspaces) {
+    if (typeof w !== 'string' || !w) continue;
+    if (w === request) return true;
+    const prefix = w.endsWith('/') ? w : w + '/';
+    if (request.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
 export class FleetService {
   public routing: RoutingService;
   public admission: ClaimAdmission;
@@ -307,7 +320,7 @@ export class FleetService {
       const account = accounts.get(route.account); const caps = parsed(machine?.capabilities); const hb = parsed(machine?.last_heartbeat);
       let reason = '';
       if (!machine || machine.drained || !fresh(effectiveCheckin(machine.id, machine.last_checkin_at), this.now(), 180000)) reason = 'machine_unavailable';
-      else if (!Array.isArray(caps.engines) || !caps.engines.includes(route.engine) || !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode) || !Array.isArray(caps.workspaces) || !caps.workspaces.includes(request.workspace)) reason = 'capability_unavailable';
+      else if (!Array.isArray(caps.engines) || !caps.engines.includes(route.engine) || !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode) || !workspaceCapable(caps.workspaces, request.workspace)) reason = 'capability_unavailable';
       else if (hb.gate?.launch_allowed !== true || !fresh(hb.gate?.at, this.now(), 300000)) reason = 'admission_unknown';
       else if (!Number.isFinite(hb.mem_avail_mb) || hb.mem_avail_mb < 10240 + 1500 || !Number.isFinite(hb.disk_free_gb) || hb.disk_free_gb < 50.5) reason = 'resource_limit';
       else if (!Array.isArray(hb.load) || !Number.isFinite(hb.load[0]) || hb.load[0] < 0 || !Number.isFinite(caps.cpu_count) || caps.cpu_count < 1) reason = 'load_unknown';

@@ -102,11 +102,12 @@ def _workspace_roots(settings) -> list[str]:
 
 
 def advertised_workspaces(settings) -> list[str]:
-    """Exact Hub capability workspace identifiers this host will accept.
+    """Hub capability workspace identifiers this host will accept.
 
-    Includes configured map keys and absolute values, plus existing directories
-    under workspace_roots (and auto-detected `.../worktrees` parents of mapped
-    absolute paths). Hub placement matches these strings exactly.
+    Includes configured map keys and absolute values, plus workspace_roots
+    (and auto-detected `.../worktrees` parents). Children are NOT enumerated:
+    machine registration caps JSON at 4 KiB, so Hub matches request paths by
+    exact id or boundary-safe prefix under an advertised root (server-side).
     """
     ws = settings.get("workspaces") or {}
     out: set[str] = set()
@@ -116,22 +117,10 @@ def advertised_workspaces(settings) -> list[str]:
         if isinstance(value, str) and (value.startswith("/") or (len(value) >= 3 and value[1] == ":")):
             out.add(value)
     for root in _workspace_roots(settings):
-        rp = Path(root)
-        if not rp.is_dir() or rp.is_symlink():
-            continue
-        out.add(str(rp))
-        try:
-            children = list(rp.iterdir())
-        except OSError:
-            continue
-        for child in children[:256]:
-            if not child.is_dir() or child.is_symlink():
-                continue
-            as_text = str(child)
-            if absolute_workspace_ok(as_text):
-                out.add(as_text)
-    return sorted(out)
-
+        if absolute_workspace_ok(root):
+            out.add(root)
+    # Keep the registration payload safely under the 4 KiB capabilities cap.
+    return sorted(out)[:96]
 
 def resolve_workspace_path(settings, name: str) -> Path:
     """Map an offer workspace id to a real local directory.

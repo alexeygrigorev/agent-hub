@@ -26,7 +26,7 @@ class WorkspaceRootsTests(unittest.TestCase):
             ads = fleet.advertised_workspaces(settings)
             self.assertIn(str(mapped), ads)
             self.assertIn(str(root), ads)
-            self.assertIn(str(child), ads)
+            self.assertNotIn(str(child), ads)  # prefix match covers children; 4KiB register cap
 
     def test_resolve_identity_under_root_without_map_entry(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -74,7 +74,8 @@ class WorkspaceRootsTests(unittest.TestCase):
                 "subscriptions": [],
             }
             ads = fleet.advertised_workspaces(settings)
-            self.assertIn(str(sibling), ads)
+            self.assertIn(str(root), ads)
+            self.assertNotIn(str(sibling), ads)
 
     def test_drop_queued_launcher_task_only(self):
         with tempfile.TemporaryDirectory() as tmp:
