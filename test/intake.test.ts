@@ -828,11 +828,7 @@ describe('private durable intake HTTP/SQLite', () => {
     let before = await state();
     expect((await call('/tasks/' + task.id, { key: 'taskcap', expected_version: 1, next_step: 'x' })).status).toBe(507);
     expect(await state()).toEqual(before);
-    await inDO(stub(), (h: any) => {
-      h.sql.exec('DELETE FROM intake_tasks');
-      for (let i=0;i<INTAKE_LIMITS.tasks;i++) h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-' + i, JSON.stringify({ id: 'fixture-' + i, project: 'demo', status: 'open', history: [] }));
-    });
-    before = await state(); expect((await call('/tasks', { key: 'countcap', project: 'demo', title: 'x', text: 'x', source })).status).toBe(507); expect(await state()).toEqual(before);
+    // t1038u: task row count no longer hard-refuses create (soft warn only).
     await inDO(stub(), (h: any) => {
       h.sql.exec('DELETE FROM intake_tasks');
       for (let i=0;i<128;i++) h.sql.exec('INSERT INTO intake_receipts VALUES(?,?)', 'fixture-padding-' + i, JSON.stringify({ id: 'fixture-padding-' + i, padding: 'x'.repeat(INTAKE_LIMITS.totalBytes/128), captured_at: Date.now() }));
@@ -849,14 +845,15 @@ describe('private durable intake HTTP/SQLite', () => {
     });
     before = await compactState(); expect((await call('/tasks', { key: 'globalcap', project: 'demo', title: 'x', text: 'x', source })).status).toBe(507); expect(await compactState()).toEqual(before);
   });
-  it('prunes long-closed tasks on create so the record cap admits fresh work', async () => {
+  it('prunes long-closed tasks on create (batch of 256 per pass)', async () => {
     const stale = Date.now() - 20 * 86400000;
+    const seed = 300;
     await inDO(stub(), (h: any) => {
-      for (let i = 0; i < INTAKE_LIMITS.tasks; i++) h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-' + i, JSON.stringify({ id: 'fixture-' + i, project: 'demo', status: 'done', updated_at: stale, history: [] }));
+      for (let i = 0; i < seed; i++) h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-' + i, JSON.stringify({ id: 'fixture-' + i, project: 'demo', status: 'done', updated_at: stale, history: [] }));
     });
     const created = await ok('/tasks', { key: 'after-prune', project: 'demo', title: 'Synthetic', text: 'Synthetic', source });
     expect(created.task.id).toBeTruthy();
-    expect(await inDO(stub(), (h: any) => h.sql.exec("SELECT COUNT(*) AS n FROM intake_tasks WHERE id LIKE 'fixture-%'").one().n)).toBe(INTAKE_LIMITS.tasks - 256);
+    expect(await inDO(stub(), (h: any) => h.sql.exec("SELECT COUNT(*) AS n FROM intake_tasks WHERE id LIKE 'fixture-%'").one().n)).toBe(seed - 256);
   });
   it('prunes terminal tasks after their 60s retention while keeping second-fresh closed work', async () => {
     await inDO(stub(), (h: any) => {
@@ -867,13 +864,33 @@ describe('private durable intake HTTP/SQLite', () => {
     expect(await inDO(stub(), (h: any) => h.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks WHERE id=?', 'fixture-aged').one().n)).toBe(0);
     expect(await inDO(stub(), (h: any) => h.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks WHERE id=?', 'fixture-fresh').one().n)).toBe(1);
   });
-  it('never prunes terminal tasks within retention to admit new work', async () => {
+  it('keeps terminal tasks within retention but still admits create (soft task cap)', async () => {
+    const seed = 120;
     await inDO(stub(), (h: any) => {
-      for (let i = 0; i < INTAKE_LIMITS.tasks; i++) h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-' + i, JSON.stringify({ id: 'fixture-' + i, project: 'demo', status: 'done', updated_at: Date.now() - 30_000, history: [] }));
+      for (let i = 0; i < seed; i++) h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-' + i, JSON.stringify({ id: 'fixture-' + i, project: 'demo', status: 'done', updated_at: Date.now() - 30_000, history: [] }));
     });
-    const before = await state();
-    expect((await call('/tasks', { key: 'cap-still', project: 'demo', title: 'Synthetic', text: 'Synthetic', source })).status).toBe(507);
-    expect(await state()).toEqual(before);
+    const created = await ok('/tasks', { key: 'cap-still', project: 'demo', title: 'Synthetic', text: 'Synthetic', source });
+    expect(created.task.id).toBeTruthy();
+    expect(await inDO(stub(), (h: any) => h.sql.exec("SELECT COUNT(*) AS n FROM intake_tasks WHERE id LIKE 'fixture-%'").one().n)).toBe(seed);
+  });
+
+  it('emits intake_open_warning on list/create when open non-terminal count exceeds 100', async () => {
+    await inDO(stub(), (h: any) => {
+      h.sql.exec('DELETE FROM intake_tasks');
+      for (let i = 0; i < 101; i++) {
+        h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-open-' + i, JSON.stringify({
+          id: 'fixture-open-' + i, project: 'demo', title: 'Open ' + i, status: 'open', version: 1,
+          created_at: Date.now(), updated_at: Date.now(), history: [],
+        }));
+      }
+    });
+    const listed = await ok('/tasks?status=open');
+    expect(listed.open_non_terminal_count).toBeGreaterThan(100);
+    expect(listed.intake_open_warning?.code).toBe('intake_open_high');
+    expect(listed.intake_open_warning?.action).toBe('spawn_cleanup_agent');
+    const created = await ok('/tasks', { key: 'warn-create', project: 'demo', title: 'Synthetic', text: 'Synthetic', source });
+    expect(created.task.id).toBeTruthy();
+    expect(created.intake_open_warning?.code).toBe('intake_open_high');
   });
   it('prunes stale and legacy replay receipts on create while fresh receipts keep replaying', async () => {
     const payload = { key: 'receipt-replay', project: 'demo', title: 'Synthetic', text: 'Original', source };

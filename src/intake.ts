@@ -12,13 +12,19 @@ type Tx = <T>(fn: () => T) => T;
  * the caller's own auth, so placement is never duplicated and session
  * identities are never invented here. Absent outside the Hub composition. */
 export type IntakeHooks = { startSession?: (input: Obj, auth: Auth) => Promise<{ status: number; body: any }> };
-/** Raised 256→512 t1037u: terminal tasks stay 1d before prune, so burst closes cannot free slots same-turn. */
-export const INTAKE_LIMITS = { request: 32768, tasks: 512, taskBytes: 131072, events: 128,
+/** Soft intake capacity (t1038u): no hard 507 refuse on task row count for create.
+ * `tasks` remains only as a schema safety-net ceiling (very high). Open (non-terminal)
+ * count > OPEN_INTAKE_WARN_THRESHOLD emits an operator warning; Developer/orchestrator
+ * must spawn a cleanup agent the same turn (standing Alexey rule). */
+export const INTAKE_LIMITS = { request: 32768, tasks: 10000, taskBytes: 131072, events: 128,
   // Original requests and exact lost-response receipts are retained together.
   // The former 4 MiB budget blocked real intake after the initial backfill
   // and normal context updates. Keep an explicit 32 MiB aggregate bound;
   // per-task, per-record, event and count limits still apply independently.
   grants: 256, rules: 128, receipts: 8192, totalBytes: 32 * 1024 * 1024, page: 25 };
+/** When open/in_progress/blocked/pending_approval count exceeds this, Hub surfaces
+ * intake_open_high on status/list/create. Not a create refuse. */
+export const OPEN_INTAKE_WARN_THRESHOLD = 100;
 const OPEN = ['open', 'in_progress', 'blocked', 'pending_approval'];
 const STATUSES = [...OPEN, 'done', 'cancelled'];
 /** Live Hub session states that keep a task assignment active. Anything else
@@ -134,6 +140,24 @@ export class IntakeService {
     if (bytes > INTAKE_LIMITS.totalBytes) fail('storage_capacity', 507);
   }
   private bounded(table: string, max: number) { if (this.rows(table).length >= max) fail('record_capacity', 507); }
+  /** Non-terminal task count used for soft open-intake warnings (never blocks create). */
+  openNonTerminalCount(principal?: Obj): number {
+    const rows = this.rows('tasks');
+    return rows.filter(t => OPEN.includes(t.status) && (!principal || this.allowed(principal, t))).length;
+  }
+  /** Operator-visible soft warning when open intake is high. Null when under threshold. */
+  intakeOpenWarning(principal?: Obj): Obj | null {
+    const open_count = this.openNonTerminalCount(principal);
+    if (open_count <= OPEN_INTAKE_WARN_THRESHOLD) return null;
+    return {
+      code: 'intake_open_high',
+      severity: 'warn',
+      open_count,
+      threshold: OPEN_INTAKE_WARN_THRESHOLD,
+      message: 'Open intake is high (' + open_count + ' non-terminal tasks > ' + OPEN_INTAKE_WARN_THRESHOLD + '). Close inactive/stale/superseded/noise opens (done/cancelled); protect active Contabo DR and in-progress work. Developer/orchestrator: spawn cleanup agent same turn (Alexey standing).',
+      action: 'spawn_cleanup_agent',
+    };
+  }
   /** Terminal tasks and stale replay receipts are pruned lazily on writes so
    * closed work cannot permanently consume record or storage capacity.
    * Terminal tasks retain 60s (t1037u; was one day — burst closes could not free slots same-turn), replay receipts 14 days; at most
@@ -384,9 +408,12 @@ export class IntakeService {
       if (path === '/handoff' || status === 'open') tasks = tasks.filter(t => OPEN.includes(t.status) || this.unresolved(t).length > 0 || this.continuation(t) === 'uncertain');
       else if (status && status !== 'all') tasks = tasks.filter(t => t.status === status);
       const result = this.page(url, tasks, revision);
+      const warn = this.intakeOpenWarning(p);
       return { ...result, authorization_valid_until: p.valid_until ?? null, items: result.items.map((t: Obj) => this.taskView(t, p)), operator_rules: this.rules(tasks),
         data_notice: DATA_NOTICE, authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
-        completeness: 'All authorized matching records are included across pages at snapshot_version. Restart on stale_snapshot.' };
+        completeness: 'All authorized matching records are included across pages at snapshot_version. Restart on stale_snapshot.',
+        open_non_terminal_count: this.openNonTerminalCount(p),
+        ...(warn ? { intake_open_warning: warn } : {}) };
     }
     const match = /^\/tasks\/([A-Za-z0-9._:-]+)(?:\/(history|links|context))?$/.exec(path);
     if (!match) fail('not_found', 404);
@@ -665,10 +692,15 @@ export class IntakeService {
         created_at: now, updated_at: now, current_state: null, next_step: null, owner: null, uncertainty: null,
         acceptance_criteria: acNullable(b.acceptance_criteria), history: [] };
       if (!this.allowed(p, task, true)) fail('forbidden', 403);
-      this.bounded('tasks', INTAKE_LIMITS.tasks);
+      // t1038u: no hard task-row refuse on create; totalBytes/taskBytes/events still apply.
+      // Soft warn when open count is high (surfaced on the response below).
       task.history.push(this.event({ kind: 'intake', text: b.text, source: b.source, transcription: b.transcription }, task, p, now));
       task.history[0].intake_key = b.key;
-      this.put('tasks', task); return { task: this.view(task, p) };
+      this.put('tasks', task);
+      const created = { task: this.view(task, p) } as Obj;
+      const warn = this.intakeOpenWarning(p);
+      if (warn) created.intake_open_warning = warn;
+      return created;
     }
     if (path === '/grants') {
       this.operator(p); keys(b, ['key', 'credential_id', 'scope', 'target', 'access', 'expires_at', 'source']);
@@ -879,6 +911,8 @@ export class IntakeService {
   statusUnresolved(task: Obj): Obj[] { return this.unresolved(task); }
   statusContinuation(task: Obj): string { return this.continuation(task); }
   statusRevision(): number { return this.revision(); }
+  statusOpenNonTerminalCount(p?: Obj): number { return this.openNonTerminalCount(p); }
+  statusIntakeOpenWarning(p?: Obj): Obj | null { return this.intakeOpenWarning(p); }
   /** Service-owned task creation for internal system services (e.g. disk monitoring).
    * Enforces task capacity, total storage capacity, single-record byte limit, and version/revision CAS. */
   serviceCreateTask(input: {
@@ -895,7 +929,7 @@ export class IntakeService {
       const now = input.now ?? Date.now();
       try {
         this.prune(now);
-        this.bounded('tasks', INTAKE_LIMITS.tasks);
+        // t1038u: task row count is soft; only aggregate byte budget refuses create.
         this.capacity();
       } catch (e: any) {
         return { ok: false, error: e?.code || 'capacity_exceeded' };

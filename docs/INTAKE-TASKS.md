@@ -269,19 +269,47 @@ still require CAS. No previous chat, local handoff file or local STATE is used.
 ## Capacity and validation
 
 Limits are explicit: 32 KiB streamed UTF-8 HTTP input; 8 KiB request/event text;
-256 tasks; 128 events per task; 128 rules with 128 amendments each; 256 grants;
+128 events per task; 128 rules with 128 amendments each; 256 grants;
 8,192 retry receipts; 128 KiB stored task; 256 KiB individual stored record; and
-4 MiB combined persisted JSON plus IDs. References have separate smaller bounds.
+32 MiB combined persisted JSON plus IDs. References have separate smaller bounds.
 Pages contain at most 25 complete tasks. Session links share the per-task event
 limit. Rules, receipts and revocations consume the same global byte budget.
 SQLite/index overhead is additionally bounded by row counts; these are logical
 payload limits, not a disk accounting estimate.
 
-Exhaustion returns an explicit 507 capacity error, oversized streamed input 413,
+### Soft open-intake policy (t1038u)
+
+Task **row count no longer hard-refuses** `intake_create` with HTTP 507
+`record_capacity`. Create stays soft-unlimited subject to the aggregate byte
+budget and a very high safety-net ceiling (`INTAKE_LIMITS.tasks`, currently
+10 000) only if the schema must refuse runaway growth. Terminal tasks still
+prune after a short retention so closed work does not permanently consume
+storage.
+
+When the count of **non-terminal** tasks (`open`, `in_progress`, `blocked`,
+`pending_approval`) exceeds **`OPEN_INTAKE_WARN_THRESHOLD` (100)**, Hub emits
+`intake_open_warning` / `intake_open_high` on:
+
+- `GET /api/status` (and POST baseline) as `intake_open_warning`,
+  `open_non_terminal_count`, and a `needs_attention` item
+- `GET /api/intake/tasks` (and handoff) as `intake_open_warning` +
+  `open_non_terminal_count`
+- successful `POST /api/intake/tasks` create responses as `intake_open_warning`
+
+**Operator / Developer / orchestrator standing (Alexey):** on that warning,
+**same turn** spawn a cleanup agent to close inactive/stale/superseded/noise
+opens as `done`/`cancelled` with a short reason. Do **not** touch active Contabo
+DR work or other in-progress sessions that still have a running Hub/aplexer
+worker. Prefer closing report-backfill / podcast / CI stubs that sat idle for
+days. Prefer OpenCode for aplexer backup sessions; no new Claude/Grok engines.
+
+Exhaustion of remaining hard budgets (bytes, events, grants, rules, receipts)
+still returns an explicit 507 capacity error, oversized streamed input 413,
 invalid fields 400 and stale revision/idempotency conflicts 409. The transaction
 rolls back task, history, receipt and global revision together. Successful retry
 receipts are retained; no TTL silently enables duplicate intake after restart.
-Capacity expansion or archival needs a separately reviewed operator workflow.
+Further capacity expansion or archival needs a separately reviewed operator
+workflow.
 
 Focused checks use the real Worker/Hub SQLite HTTP path and stdlib CLI mock HTTP:
 

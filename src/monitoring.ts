@@ -12,7 +12,7 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { LivenessService } from './liveness';
 import type { StatusMachineAuth } from './status';
-import { INTAKE_LIMITS, type IntakeService } from './intake';
+import type { IntakeService } from './intake';
 import { isValidMachineId } from './machine-id';
 
 export const MONITORING_SCHEMA = `
@@ -838,9 +838,8 @@ export class MonitoringService {
     }
 
     try {
-      const count = Number((this.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks').toArray()[0] as any)?.n ?? 0);
-      if (count >= INTAKE_LIMITS.tasks) return { taskId: null, error: 'record_capacity' };
-
+      // t1038u: task row count is soft (safety-net only inside serviceCreateTask path);
+      // disk-monitor fallback no longer hard-refuses on row count.
       const taskId = crypto.randomUUID();
       const task = {
         id: taskId,

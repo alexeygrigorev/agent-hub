@@ -199,13 +199,26 @@ export class StatusService {
 
   /** Operator-only canonical check alerts; agent task grants do not grant
    * visibility into other actors' monitoring details. No second check loop. */
-  private needsAttention(admin: boolean, measured: Obj[]): Obj[] {
-    if (!admin) return measured;
+  private needsAttention(admin: boolean, measured: Obj[], intakeWarn: Obj | null = null): Obj[] {
+    const intakeItems: Obj[] = intakeWarn ? [{
+      severity: 'warn',
+      subject: 'intake:open_high',
+      title: 'Open intake is high',
+      detail: intakeWarn.message,
+      code: intakeWarn.code,
+      open_count: intakeWarn.open_count,
+      threshold: intakeWarn.threshold,
+      action: intakeWarn.action,
+      source: 'intake_open_warning',
+      scope: 'hub',
+    }] : [];
+    const base = [...intakeItems, ...measured];
+    if (!admin) return base;
     let rows: any[];
     try {
       rows = this.sql.exec("SELECT id, subject, state, detail, opened_at FROM liveness_alerts WHERE subject_kind='check' AND resolved_at IS NULL ORDER BY id DESC LIMIT 64").toArray();
-    } catch { return measured; }
-    return [...measured, ...rows.map(row => ({
+    } catch { return base; }
+    return [...base, ...rows.map(row => ({
       severity: 'warn', subject: 'check:' + row.subject,
       title: 'Scheduled check: ' + row.subject, detail: snippet(row.detail),
       state: row.state, alert_id: row.id, opened_at: row.opened_at,
@@ -462,6 +475,7 @@ export class StatusService {
         const built = this.buildItems(p, page, hostFilter, sinceMs, now, nowIso);
         const diskSummary = this.monitoringService ? this.monitoringService.getStatusSummary(now) : null;
         const agentCounts = this.computeAgentCounts(now);
+        const intakeWarn = this.intake.statusIntakeOpenWarning(p);
         return json({
           snapshot_at: nowIso,
           revision,
@@ -470,7 +484,9 @@ export class StatusService {
           tasks: built.items,
           disk: diskSummary?.filesystems ?? [],
           host_health: diskSummary?.host_health ?? [],
-          needs_attention: this.needsAttention(!!(p as any).admin, diskSummary?.needs_attention ?? []),
+          open_non_terminal_count: this.intake.statusOpenNonTerminalCount(p),
+          ...(intakeWarn ? { intake_open_warning: intakeWarn } : {}),
+          needs_attention: this.needsAttention(!!(p as any).admin, diskSummary?.needs_attention ?? [], intakeWarn),
           pagination: { next, total, limit },
           coverage: this.coverageDto(built.missingHosts, built.expectedOffline, built.sessionCoverage, now),
           categories: this.categoriesDto(nowIso, built.missingHosts, built.sessionCoverage, built.reportsCollected, built.probesCollected,
@@ -546,6 +562,7 @@ export class StatusService {
           agents: agentCounts,
         };
         const diskSummary = this.monitoringService ? this.monitoringService.getStatusSummary(now) : null;
+        const intakeWarn = this.intake.statusIntakeOpenWarning(p);
         return json({
           snapshot_at: nowIso,
           revision,
@@ -555,7 +572,9 @@ export class StatusService {
           tasks: built.items,
           disk: diskSummary?.filesystems ?? [],
           host_health: diskSummary?.host_health ?? [],
-          needs_attention: this.needsAttention(!!(p as any).admin, diskSummary?.needs_attention ?? []),
+          open_non_terminal_count: this.intake.statusOpenNonTerminalCount(p),
+          ...(intakeWarn ? { intake_open_warning: intakeWarn } : {}),
+          needs_attention: this.needsAttention(!!(p as any).admin, diskSummary?.needs_attention ?? [], intakeWarn),
           pagination: { next: null, total: tasks.length, limit: tasks.length },
           coverage: this.coverageDto(built.missingHosts, built.expectedOffline, built.sessionCoverage, now),
           categories: this.categoriesDto(nowIso, built.missingHosts, built.sessionCoverage, built.reportsCollected, built.probesCollected,

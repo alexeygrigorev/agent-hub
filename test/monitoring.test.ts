@@ -3,7 +3,6 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 import { formatBytes, DISK_THRESHOLDS } from '../src/monitoring';
-import { INTAKE_LIMITS } from '../src/intake';
 
 const now = Date.parse('2026-10-17T18:00:00Z');
 const iso = (secondsAgo: number) => new Date(now - secondsAgo * 1000).toISOString();
@@ -660,12 +659,12 @@ describe('Disk Monitoring Service', () => {
     expect(history[0].text).toContain('Disk pressure alert');
   }));
 
-  it('handles honest capacity refusals and recovers orphan tasks when slots free', () => fixture(async (hub, clock) => {
+  it('still raises disk intake tasks when many open tasks exist (soft task cap t1038u)', () => fixture(async (hub, clock) => {
     enrollHost(hub.sql, 'host-a');
     const auth = { kind: 'host' as const, machine_id: 'host-a', tokenId: 'cred-host-a' };
 
-    // Fill intake_tasks up to capacity (INTAKE_LIMITS.tasks)
-    for (let i = 0; i < INTAKE_LIMITS.tasks; i++) {
+    // Seed well above the former hard 256/512 refuse without approaching the safety-net ceiling.
+    for (let i = 0; i < 520; i++) {
       const dummyId = `dummy-task-${i.toString().padStart(4, '0')}`;
       hub.sql.exec(
         'INSERT INTO intake_tasks(id, data) VALUES(?, ?)',
@@ -674,53 +673,35 @@ describe('Disk Monitoring Service', () => {
       );
     }
 
-    // Post disk pressure observation with /data at 90% (warn)
-    const postObs = () =>
-      hub.monitoringService.handleObservation(
-        new Request('https://hub.internal/api/monitoring/disk', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            machine_id: 'host-a',
-            observed_at: new Date(clock.t).toISOString(),
-            filesystems: [
-              {
-                mount_point: '/data',
-                device_id: 'dev-data',
-                is_primary: true,
-                total_bytes: 500_000_000_000,
-                used_bytes: 450_000_000_000,
-                free_bytes: 50_000_000_000,
-                percent: 90.0,
-                status: 'warn',
-              },
-            ],
-          }),
+    const res1 = await hub.monitoringService.handleObservation(
+      new Request('https://hub.internal/api/monitoring/disk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          machine_id: 'host-a',
+          observed_at: new Date(clock.t).toISOString(),
+          filesystems: [
+            {
+              mount_point: '/data',
+              device_id: 'dev-data',
+              is_primary: true,
+              total_bytes: 500_000_000_000,
+              used_bytes: 450_000_000_000,
+              free_bytes: 50_000_000_000,
+              percent: 90.0,
+              status: 'warn',
+            },
+          ],
         }),
-        auth,
-      );
-
-    const res1 = await postObs();
+      }),
+      auth,
+    );
     expect(res1.status).toBe(200);
 
-    // Episode should be open, but intake_task_id is null due to honest capacity refusal
     const ep1 = hub.sql.exec('SELECT * FROM disk_episodes WHERE episode_key = "disk:host-a:/data"').toArray()[0] as any;
     expect(ep1).toBeTruthy();
     expect(ep1.state).toBe('warn');
-    expect(ep1.intake_task_id).toBeNull();
-    expect(ep1.details_json).toContain('capacity_refused');
-
-    // Free up 1 slot in intake_tasks
-    hub.sql.exec('DELETE FROM intake_tasks WHERE id = "dummy-task-0000"');
-
-    // Next poll arrives (60s later)
-    clock.t += 60 * 1000;
-    const res2 = await postObs();
-    expect(res2.status).toBe(200);
-
-    // Episode now has a recovered intake task (no permanent orphan!)
-    const ep2 = hub.sql.exec('SELECT * FROM disk_episodes WHERE episode_key = "disk:host-a:/data"').toArray()[0] as any;
-    expect(ep2.intake_task_id).toBeTruthy();
+    expect(ep1.intake_task_id).toBeTruthy();
   }));
 
   it('propagates actual observation timestamps, freshness, and errors in getStatusSummary', () => fixture(async (hub, clock) => {
