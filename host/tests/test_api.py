@@ -92,3 +92,47 @@ class TestUserAgent(unittest.TestCase):
         opener = api._get_opener()
         self.assertIn(('User-Agent', api.USER_AGENT), opener.addheaders)
         self.assertNotIn('Python-urllib', api.USER_AGENT)
+
+
+class TestGetAvailableMachinesAuth(unittest.TestCase):
+    def _http_error(self, code):
+        return urllib.error.HTTPError('https://hub.invalid/api/machines/available', code, 'err', {}, None)
+
+    @patch("agent_hub_host.api.safe_http_json")
+    @patch("agent_hub_host.auth.refresh_token")
+    @patch("agent_hub_host.auth.get_host_access_token")
+    @patch("agent_hub_host.api._host_cfg")
+    def test_401_without_refresh_token_surfaces_401(self, mock_cfg, mock_token, mock_refresh, mock_http):
+        mock_cfg.return_value = {"base_url": "https://hub.invalid"}
+        mock_token.return_value = "admin-bearer-without-host-scope"
+        mock_http.side_effect = self._http_error(401)
+        with self.assertRaises(RuntimeError) as ctx:
+            api.get_available_machines("https://hub.invalid")
+        self.assertIn("401", str(ctx.exception))
+        self.assertNotIn("login", str(ctx.exception).lower())
+        mock_refresh.assert_not_called()
+
+    @patch("agent_hub_host.api.safe_http_json")
+    @patch("agent_hub_host.auth.refresh_token")
+    @patch("agent_hub_host.auth.get_host_access_token")
+    @patch("agent_hub_host.api._host_cfg")
+    def test_401_with_refresh_token_retries(self, mock_cfg, mock_token, mock_refresh, mock_http):
+        mock_cfg.return_value = {"base_url": "https://hub.invalid", "refresh_token": "r123"}
+        mock_token.side_effect = ["expired-token", "fresh-token"]
+        mock_http.side_effect = [self._http_error(401), {"machines": []}]
+        res = api.get_available_machines("https://hub.invalid")
+        self.assertEqual(res, {"machines": []})
+        mock_refresh.assert_called_once_with()
+
+    @patch("agent_hub_host.api.safe_http_json")
+    @patch("agent_hub_host.auth.refresh_token")
+    @patch("agent_hub_host.auth.get_host_access_token")
+    @patch("agent_hub_host.api._host_cfg")
+    def test_non_401_never_refreshes(self, mock_cfg, mock_token, mock_refresh, mock_http):
+        mock_cfg.return_value = {"base_url": "https://hub.invalid", "refresh_token": "r123"}
+        mock_token.return_value = "tok"
+        mock_http.side_effect = self._http_error(500)
+        with self.assertRaises(RuntimeError) as ctx:
+            api.get_available_machines("https://hub.invalid")
+        self.assertIn("500", str(ctx.exception))
+        mock_refresh.assert_not_called()

@@ -226,9 +226,18 @@ def get_available_machines(base_url: str):
         return safe_http_json(req, timeout=10.0)
     except urllib.error.HTTPError as e:
         if e.code == 401:
-            auth.refresh_token()
-            req.add_header("Authorization", f"Bearer {auth.get_host_access_token()}")
-            return safe_http_json(req, timeout=10.0)
+            # A 401 with no refresh token to retry with (e.g. an admin bearer
+            # on this host-only endpoint) must surface as a 401, not as a
+            # login prompt: refresh_token() would fail closed with
+            # "Please login" and hide the real cause.
+            try:
+                has_refresh = bool(_host_cfg().get("refresh_token"))
+            except Exception:
+                has_refresh = False
+            if has_refresh:
+                auth.refresh_token()
+                req.add_header("Authorization", f"Bearer {auth.get_host_access_token()}")
+                return safe_http_json(req, timeout=10.0)
         raise RuntimeError(f"Failed to get available machines: {e.code}")
 
 def get_heartbeat_payload(clock=None, running_jobs=None) -> dict:
