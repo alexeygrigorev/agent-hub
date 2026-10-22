@@ -136,19 +136,19 @@ export class IntakeService {
   private bounded(table: string, max: number) { if (this.rows(table).length >= max) fail('record_capacity', 507); }
   /** Terminal tasks and stale replay receipts are pruned lazily on writes so
    * closed work cannot permanently consume record or storage capacity.
-   * Terminal tasks retain one day (a two-day burst of closed work once filled
-   * the record cap and wedged all intake), replay receipts 14 days; at most
-   * 64 deletes per pass; each delete bumps the snapshot revision so listers
+   * Terminal tasks retain 60s (t1037u; was one day — burst closes could not free slots same-turn), replay receipts 14 days; at most
+   * 256 deletes per pass; each delete bumps the snapshot revision so listers
    * observe the change. */
   private prune(now: number) {
     const dead: Array<[string, string]> = [];
     for (const t of this.rows('tasks')) {
-      if ((t.status === 'done' || t.status === 'cancelled') && (t.updated_at ?? 0) < now - 86400000) dead.push(['tasks', t.id]);
+      // t1037u: 60s retain (was 1d) so closed tasks free create slots after a short settle.
+      if ((t.status === 'done' || t.status === 'cancelled') && (t.updated_at ?? 0) < now - 60_000) dead.push(['tasks', t.id]);
     }
     for (const r of this.rows('receipts')) {
       if ((r.captured_at ?? 0) < now - 14 * 86400000) dead.push(['receipts', r.id]);
     }
-    for (const [table, id] of dead.slice(0, 64)) {
+    for (const [table, id] of dead.slice(0, 256)) {
       this.sql.exec(`DELETE FROM intake_${table} WHERE id=?`, id);
       this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
     }

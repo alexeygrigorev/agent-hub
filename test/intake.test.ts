@@ -856,12 +856,12 @@ describe('private durable intake HTTP/SQLite', () => {
     });
     const created = await ok('/tasks', { key: 'after-prune', project: 'demo', title: 'Synthetic', text: 'Synthetic', source });
     expect(created.task.id).toBeTruthy();
-    expect(await inDO(stub(), (h: any) => h.sql.exec("SELECT COUNT(*) AS n FROM intake_tasks WHERE id LIKE 'fixture-%'").one().n)).toBe(INTAKE_LIMITS.tasks - 64);
+    expect(await inDO(stub(), (h: any) => h.sql.exec("SELECT COUNT(*) AS n FROM intake_tasks WHERE id LIKE 'fixture-%'").one().n)).toBe(INTAKE_LIMITS.tasks - 256);
   });
-  it('prunes terminal tasks after their one-day retention while keeping day-fresh closed work', async () => {
+  it('prunes terminal tasks after their 60s retention while keeping second-fresh closed work', async () => {
     await inDO(stub(), (h: any) => {
-      h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-aged', JSON.stringify({ id: 'fixture-aged', project: 'demo', status: 'done', updated_at: Date.now() - 25 * 3600000, history: [] }));
-      h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-fresh', JSON.stringify({ id: 'fixture-fresh', project: 'demo', status: 'cancelled', updated_at: Date.now() - 23 * 3600000, history: [] }));
+      h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-aged', JSON.stringify({ id: 'fixture-aged', project: 'demo', status: 'done', updated_at: Date.now() - 120_000, history: [] }));
+      h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-fresh', JSON.stringify({ id: 'fixture-fresh', project: 'demo', status: 'cancelled', updated_at: Date.now() - 30_000, history: [] }));
     });
     await ok('/tasks', { key: 'retention-boundary', project: 'demo', title: 'Synthetic', text: 'Synthetic', source });
     expect(await inDO(stub(), (h: any) => h.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks WHERE id=?', 'fixture-aged').one().n)).toBe(0);
@@ -869,7 +869,7 @@ describe('private durable intake HTTP/SQLite', () => {
   });
   it('never prunes terminal tasks within retention to admit new work', async () => {
     await inDO(stub(), (h: any) => {
-      for (let i = 0; i < INTAKE_LIMITS.tasks; i++) h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-' + i, JSON.stringify({ id: 'fixture-' + i, project: 'demo', status: 'done', updated_at: Date.now() - 23 * 3600000, history: [] }));
+      for (let i = 0; i < INTAKE_LIMITS.tasks; i++) h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-' + i, JSON.stringify({ id: 'fixture-' + i, project: 'demo', status: 'done', updated_at: Date.now() - 30_000, history: [] }));
     });
     const before = await state();
     expect((await call('/tasks', { key: 'cap-still', project: 'demo', title: 'Synthetic', text: 'Synthetic', source })).status).toBe(507);
