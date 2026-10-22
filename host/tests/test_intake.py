@@ -202,6 +202,27 @@ class TestIntakeCli(unittest.TestCase):
             self.assertIn('fixture-retry', error)
             self.assertNotIn('private-token', error)
 
+    def test_http_error_surfaces_server_detail_slugs(self):
+        # Auth/grant/operator detail the server actually emits must survive
+        # instead of collapsing to generic request_failed (t1035u).
+        for raw, expected in ((b'{"error":"unauthorized_or_forbidden"}', 'unauthorized_or_forbidden'),
+                              (b'{"error":"operator_required"}', 'operator_required'),
+                              (b'{"error":"unknown_field","field":"notes"}', 'unknown_field'),
+                              (b'{"error":"not_found"}', 'not_found'),
+                              (b'{"error":"invalid_grantee"}', 'invalid_grantee'),
+                              (b'{"error":"unknown_code"}', 'unknown_code')):
+            exc = urllib.error.HTTPError('https://fixture.test', 403, 'private', {}, io.BytesIO(raw))
+            self.assertEqual(intake.http_error(exc, 'POST', {'key': 'k'}).code, expected)
+        # Tokens, URLs, controls, uppercase and oversized values still collapse.
+        for raw in (b'{"error":"Bearer abc123"}', b'{"error":"https://x.test/y"}',
+                    b'{"error":"has space"}', b'{"error":"UPPER"}', b'{"error":"a-b"}',
+                    b'{"error":"' + b'x' * 64 + b'"}', b'{"error":123}',
+                    b'{"error":null}', b'not json', b'["version_conflict"]'):
+            exc = urllib.error.HTTPError('https://fixture.test', 400, 'private', {}, io.BytesIO(raw))
+            result = intake.http_error(exc, 'POST', {'key': 'k'})
+            self.assertEqual(result.code, 'request_failed', raw)
+            self.assertNotIn('Bearer', str(result))
+
     def test_http_error_passes_capacity_codes_through_on_507(self):
         for raw, expected in ((b'{"error":"record_capacity"}', 'record_capacity'),
                               (b'{"error":"storage_capacity"}', 'storage_capacity'),
@@ -212,7 +233,7 @@ class TestIntakeCli(unittest.TestCase):
             self.assertEqual(result.status, 507)
             self.assertEqual(result.code, expected)
         unknown = urllib.error.HTTPError('https://fixture.test', 507, 'private', {}, io.BytesIO(b'{"error":"unknown_code"}'))
-        self.assertEqual(intake.http_error(unknown, 'POST', None).code, 'request_failed')
+        self.assertEqual(intake.http_error(unknown, 'POST', None).code, 'unknown_code')
 
     def test_assign_builds_canonical_session_payload(self):
         with patch.object(intake, 'request', return_value={}) as transport:

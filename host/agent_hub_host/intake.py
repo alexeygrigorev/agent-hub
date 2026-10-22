@@ -2,6 +2,7 @@
 import http.client
 import json
 import os
+import re
 import uuid
 import sys
 import urllib.error
@@ -13,6 +14,12 @@ from .conversations import valid_key
 
 BASE = '/api/intake'
 MAX_REQUEST = 32768
+
+# Server error slugs are lowercase snake_case (longest today is 30 chars).
+# Passing the slug through keeps the exact failure (auth, grant, capacity,
+# field) while tokens, URLs, hex digests and terminal controls can never
+# match and still collapse to request_failed.
+SAFE_ERROR = re.compile(r"[a-z][a-z0-9_]{0,31}\Z")
 
 
 class StaleSnapshot(ValueError):
@@ -33,18 +40,16 @@ def http_error(exc, method, payload):
     if exc.code == 409 and method == 'GET':
         return StaleSnapshot('Snapshot changed')
     # Never echo arbitrary error bodies, tokens, URLs or terminal controls.
-    allowed = {'version_conflict', 'idempotency_conflict', 'invalid_event_kind', 'invalid_object', 'event_or_note_required',
-               'invalid_field', 'unknown_field', 'invalid_source', 'not_found', 'forbidden',
-               'invalid_status', 'empty_update', 'active_assignment_exists', 'history_capacity',
-               'task_capacity', 'assignment_unavailable', 'invalid_identifier', 'unauthorized',
-               'acceptance_criteria_required', 'unknown_intake_task',
-               'record_capacity', 'storage_capacity', 'request_capacity', 'record_byte_capacity'}
+    # The server only emits lowercase snake_case slugs; surface the exact
+    # slug so auth/grant/capacity/field detail survives, collapse the rest.
     try:
         body = json.loads(exc.read(4097))
         code = body.get('error') if isinstance(body, dict) else None
     except Exception:
         code = None
-    return IntakeHTTPError(exc.code, code if code in allowed else 'request_failed',
+    if not isinstance(code, str) or not SAFE_ERROR.match(code):
+        code = 'request_failed'
+    return IntakeHTTPError(exc.code, code,
                            payload.get('key') if payload else None)
 
 
