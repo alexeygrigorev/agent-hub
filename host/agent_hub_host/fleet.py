@@ -63,6 +63,111 @@ def absolute_workspace_ok(value):
     return False
 
 
+
+
+def _path_under_root(path: Path, root: Path) -> bool:
+    """True when path is root or a real descendant (boundary-safe)."""
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _workspace_roots(settings) -> list[str]:
+    roots: list[str] = list(settings.get("workspace_roots") or [])
+    ws = settings.get("workspaces") or {}
+    for item, value in ws.items():
+        for candidate in (item, value):
+            if not isinstance(candidate, str) or not candidate:
+                continue
+            try:
+                parent = Path(candidate)
+                if not parent.is_absolute():
+                    continue
+                if parent.name == "worktrees" and absolute_workspace_ok(str(parent)):
+                    roots.append(str(parent))
+                elif parent.parent.name == "worktrees" and absolute_workspace_ok(str(parent.parent)):
+                    roots.append(str(parent.parent))
+            except Exception:
+                continue
+    seen: set[str] = set()
+    out: list[str] = []
+    for root in roots:
+        if root in seen:
+            continue
+        seen.add(root)
+        out.append(root)
+    return out
+
+
+def advertised_workspaces(settings) -> list[str]:
+    """Exact Hub capability workspace identifiers this host will accept.
+
+    Includes configured map keys and absolute values, plus existing directories
+    under workspace_roots (and auto-detected `.../worktrees` parents of mapped
+    absolute paths). Hub placement matches these strings exactly.
+    """
+    ws = settings.get("workspaces") or {}
+    out: set[str] = set()
+    for key, value in ws.items():
+        if isinstance(key, str) and key:
+            out.add(key)
+        if isinstance(value, str) and (value.startswith("/") or (len(value) >= 3 and value[1] == ":")):
+            out.add(value)
+    for root in _workspace_roots(settings):
+        rp = Path(root)
+        if not rp.is_dir() or rp.is_symlink():
+            continue
+        out.add(str(rp))
+        try:
+            children = list(rp.iterdir())
+        except OSError:
+            continue
+        for child in children[:256]:
+            if not child.is_dir() or child.is_symlink():
+                continue
+            as_text = str(child)
+            if absolute_workspace_ok(as_text):
+                out.add(as_text)
+    return sorted(out)
+
+
+def resolve_workspace_path(settings, name: str) -> Path:
+    """Map an offer workspace id to a real local directory.
+
+    Prefers the operator workspaces map. Absolute paths under configured or
+    auto-detected worktrees roots are accepted as identity mappings so new git
+    worktrees do not require editing subscriptions.json before Hub can place.
+    Free-form paths outside those roots remain refused.
+    """
+    ws = settings.get("workspaces") or {}
+    if name in ws:
+        return Path(ws[name]).resolve(strict=True)
+    if not isinstance(name, str) or not absolute_workspace_ok(name):
+        raise ValueError("Local account/profile/workspace is not configured")
+    path = Path(name)
+    if not path.is_absolute():
+        raise ValueError("Local account/profile/workspace is not configured")
+    try:
+        resolved = path.resolve(strict=True)
+    except (FileNotFoundError, OSError) as exc:
+        raise ValueError("Local account/profile/workspace is not configured") from exc
+    if not resolved.is_dir() or resolved.is_symlink():
+        raise ValueError("Local account/profile/workspace is not configured")
+    ads = set(advertised_workspaces(settings))
+    if name in ads or str(resolved) in ads:
+        return resolved
+    for root in _workspace_roots(settings):
+        try:
+            root_path = Path(root).resolve(strict=True)
+        except Exception:
+            continue
+        if _path_under_root(resolved, root_path):
+            return resolved
+    raise ValueError("Local account/profile/workspace is not configured")
+
+
 def validate_native_start_argv(value: Any) -> list[str]:
     """Optional trusted argv prefix for interactive native CLI starts (e.g. systemd-run)."""
     if not isinstance(value, list) or not value or len(value) > 64:
@@ -92,7 +197,7 @@ def load_settings(path=None):
         if path.stat().st_size > 65536:
             raise ValueError("Subscription configuration exceeds 64 KiB")
         data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv", "role_consumer", "role_config"} or data.get("version") != 1:
+    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "workspace_roots", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv", "role_consumer", "role_config"} or data.get("version") != 1:
         raise ValueError("Invalid subscription configuration")
     if "native_start_argv" in data:
         validate_native_start_argv(data["native_start_argv"])
@@ -156,6 +261,17 @@ def load_settings(path=None):
             continue
         if not absolute_workspace_ok(key):
             raise ValueError("Workspaces must map labels or absolute paths to absolute local paths")
+    workspace_roots = data.get("workspace_roots", [])
+    if not isinstance(workspace_roots, list) or len(workspace_roots) > 32:
+        raise ValueError("Invalid workspace_roots allowlist")
+    cleaned_roots = []
+    for root in workspace_roots:
+        if not isinstance(root, str) or not absolute_workspace_ok(root):
+            raise ValueError("Invalid workspace_roots allowlist")
+        cleaned_roots.append(root)
+    if len(set(cleaned_roots)) != len(cleaned_roots):
+        raise ValueError("Invalid workspace_roots allowlist")
+    data["workspace_roots"] = cleaned_roots
     needs = data.get('capabilities', [])
     if not isinstance(needs, list) or len(needs) > 64 or any(not isinstance(n, str) or not re.fullmatch(r'[a-z0-9][a-z0-9:_-]{0,95}', n) for n in needs) or len(set(needs)) != len(needs):
         raise ValueError('Invalid task capabilities')
@@ -990,8 +1106,10 @@ class Dispatcher:
 
     def _route(self, offer):
         matches = [s for s in self.settings["subscriptions"] if s["account_label"] == offer.get("account") and s.get("engine", s["service"]) == offer.get("engine") and s.get("profile") == offer.get("profile")]
-        if len(matches) != 1 or offer.get("workspace") not in self.settings.get("workspaces", {}):
+        if len(matches) != 1:
             raise ValueError("Local account/profile/workspace is not configured")
+        # Validates map membership or workspace_roots / worktrees identity paths.
+        resolve_workspace_path(self.settings, offer.get("workspace"))
         sub = matches[0]
         if not sub.get("admission_argv"):
             raise ValueError("Maintained fresh admission adapter is not configured")
@@ -1021,6 +1139,40 @@ class Dispatcher:
             if isinstance(row, dict) and str(row.get("id", "")).lower() == native_id.lower():
                 return row.get("cwd") == str(target_cwd)
         return False
+
+    def _drop_queued_launcher_task(self, launcher, task_id):
+        """Best-effort clear of a still-queued launcher row for offer retry.
+
+        Hub may re-dispatch the same offer id after a prior partial attempt
+        whose payload drifted (e.g. account_label omit). Launcher submit then
+        raises Conflicting payload; dropping only `queued` rows lets dispatch
+        resubmit without touching running work.
+        """
+        import sqlite3
+        config_dir = launcher.get("config_dir")
+        if not isinstance(config_dir, str) or not config_dir:
+            return
+        db = Path(config_dir) / "state.db"
+        if not db.is_file() or db.is_symlink():
+            return
+        try:
+            with sqlite3.connect(str(db), timeout=5) as conn:
+                row = conn.execute("SELECT state FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                if not row or row[0] != "queued":
+                    return
+                conn.execute("DELETE FROM task_paths WHERE task_id = ?", (task_id,))
+                conn.execute("DELETE FROM task_resources WHERE task_id = ?", (task_id,))
+                conn.execute("DELETE FROM tasks WHERE id = ? AND state = 'queued'", (task_id,))
+                conn.commit()
+        except Exception:
+            return
+
+    def _submit_launcher_task(self, prefix, launcher, task_id, submit_argv):
+        try:
+            return self.runner(submit_argv, cwd=launcher["root"])
+        except RuntimeError:
+            self._drop_queued_launcher_task(launcher, task_id)
+            return self.runner(submit_argv, cwd=launcher["root"])
 
     def dispatch(self, offer):
         sub = self._route(offer)
@@ -1056,7 +1208,7 @@ class Dispatcher:
         # validated above. A literal offer string must never become a
         # filesystem path on its own (label "demo" is not ./demo, and an
         # unconfigured "/abs/path" is refused before any claim or effect).
-        workspace = Path(self.settings["workspaces"][offer["workspace"]]).resolve(strict=True)
+        workspace = resolve_workspace_path(self.settings, offer["workspace"])
         target_cwd = resolve_offer_cwd(workspace, offer.get("cwd"))
         native = self.settings.get("aplexer_bin", "aplexer")
         if mode == "interactive":
@@ -1128,7 +1280,7 @@ class Dispatcher:
                 from . import provisioning
                 payload["managed_dir"] = str(provisioning.root())
             submit_argv = prefix + ["submit", "--id", task_id, "--key", task_id, "--paths", str(result_path), "--payload", json.dumps(payload), "--json"]
-            self.runner(submit_argv, cwd=launcher["root"])
+            self._submit_launcher_task(prefix, launcher, task_id, submit_argv)
             plan = self.runner(prefix + ["plan", "--id", task_id], cwd=launcher["root"])
             eligible = plan.get("eligible", [])
             # Real maintained-plan contract (verified live against the
@@ -1307,7 +1459,7 @@ class Dispatcher:
         info = system.get_system_info()
         caps = info['capabilities']
         caps.update(engines=sorted({s.get('engine', s['service']) for s in self.settings['subscriptions']}),
-                    workspaces=sorted(self.settings.get('workspaces', {})), cpu_count=os.cpu_count())
+                    workspaces=advertised_workspaces(self.settings), cpu_count=os.cpu_count())
         caps['fleet_modes'] = ['interactive'] + (['headless'] if self.settings.get('launcher') else [])
         qualified_jobs = self._derive_qualified_role_jobs()
         if qualified_jobs:

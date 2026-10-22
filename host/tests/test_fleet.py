@@ -307,7 +307,7 @@ class FleetTests(unittest.TestCase):
             self.assertEqual(results[0]['messages'], 0)
         self.assertEqual([c[1] for c in calls], ['/api/machines/register', '/api/host/poll', '/api/fleet/subscriptions', '/api/fleet/sessions', '/api/sessions/host-bindings', '/api/sessions/host-bindings?kind=imported', '/api/fleet/offers'])
         self.assertTrue(calls[1][2]['gate']['launch_allowed'])
-        self.assertEqual(calls[0][2]['capabilities']['workspaces'], ['demo'])
+        self.assertEqual(calls[0][2]['capabilities']['workspaces'], sorted(['demo', '/repo']))
 
 
 
