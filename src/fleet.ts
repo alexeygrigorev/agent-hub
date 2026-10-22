@@ -217,10 +217,14 @@ export function resolveLabelUnderRoots(capsWorkspaces: any, request: any): strin
   if (!Array.isArray(capsWorkspaces)) return request;
   for (const w of capsWorkspaces) {
     if (typeof w !== 'string' || !w) continue;
-    if (!absoluteWorkspaceOk(w)) continue;
-    const sep = w.includes('\\') ? '\\' : '/';
-    const base = w.endsWith('/') || w.endsWith('\\') ? w.slice(0, -1) : w;
-    const candidate = base + sep + request;
+    // Advertised roots may carry trailing separators (operator map values
+    // only require absoluteness, unlike workspace_roots): normalize before
+    // the canonical check so a trailing slash never blocks label
+    // resolution. The candidate itself is always built canonical.
+    const stripped = w.length > 1 ? w.replace(/[/\\]+$/, '') : w;
+    if (!stripped || !absoluteWorkspaceOk(stripped)) continue;
+    const sep = stripped.includes('\\') ? '\\' : '/';
+    const candidate = stripped + sep + request;
     if (candidate.length > 512) continue;
     if (!absoluteWorkspaceOk(candidate)) continue;
     if (workspaceCapable(capsWorkspaces, candidate)) return candidate;

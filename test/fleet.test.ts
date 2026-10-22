@@ -517,6 +517,15 @@ describe('bare workspace labels resolve under advertised absolute roots', () => 
     expect(plan.selected?.machine).toBe('hetzner');
     expect(plan.request.workspace).toBe(LABEL);
   }));
+  it('resolves labels under an advertised root with a trailing separator', async () => fixture(async (s, sql) => {
+    await configure(s);
+    // Operator map values only require absoluteness, so a trailing slash
+    // can reach capabilities; it must never block label resolution.
+    advertiseRoot(sql, 'hetzner', [ROOT + '/']);
+    const plan: any = s.plan(intent({ workspace: LABEL }));
+    expect(plan.selected?.machine).toBe('hetzner');
+    expect(plan.request.workspace).toBe(RESOLVED);
+  }));
   it('capacity-only queue still works with incidental slugs alongside label resolution', async () => fixture(async (s, sql) => {
     const shared = registry(true);
     expect((await s.handle(request('/accounts', shared, 'PUT'), admin)).status).toBe(200);
