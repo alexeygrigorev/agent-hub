@@ -24,7 +24,7 @@ export const INTAKE_LIMITS = { request: 32768, tasks: 10000, taskBytes: 131072, 
   grants: 256, rules: 128, receipts: 8192, totalBytes: 32 * 1024 * 1024, page: 25 };
 /** When open/in_progress/blocked/pending_approval count exceeds this, Hub surfaces
  * intake_open_high on status/list/create. Not a create refuse. */
-export const OPEN_INTAKE_WARN_THRESHOLD = 100;
+export const OPEN_INTAKE_WARN_THRESHOLD = 100; // t1038u-deploy-marker
 const OPEN = ['open', 'in_progress', 'blocked', 'pending_approval'];
 const STATUSES = [...OPEN, 'done', 'cancelled'];
 /** Live Hub session states that keep a task assignment active. Anything else
@@ -412,7 +412,9 @@ export class IntakeService {
       return { ...result, authorization_valid_until: p.valid_until ?? null, items: result.items.map((t: Obj) => this.taskView(t, p)), operator_rules: this.rules(tasks),
         data_notice: DATA_NOTICE, authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
         completeness: 'All authorized matching records are included across pages at snapshot_version. Restart on stale_snapshot.',
+        intake_policy: 'soft_unlimited_tasks_t1038u',
         open_non_terminal_count: this.openNonTerminalCount(p),
+        open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
         ...(warn ? { intake_open_warning: warn } : {}) };
     }
     const match = /^\/tasks\/([A-Za-z0-9._:-]+)(?:\/(history|links|context))?$/.exec(path);
