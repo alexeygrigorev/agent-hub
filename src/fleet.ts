@@ -20,6 +20,13 @@ type Auth = { caller?: AdmissionCaller; scopes?: string[]; error?: Response };
 const LABEL = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 const PROVIDERS = new Set(['codex', 'codex-orin', 'claude', 'grok', 'gemini', 'zai', 'go', 'copilot']);
 const ACTIVE = "('offered','starting','running','uncertain')";
+/** Orphan observed sessions (live native, no Hub launch) idle longer than
+ * this stop holding account quota. A parked PTY with no activity for hours
+ * consumes no provider concurrency, while a missing/unparseable activity
+ * timestamp keeps counting (fail closed: a host that stops reporting
+ * activity never silently overbooks the pool). Activity refreshes the
+ * hold on the next catalog report. */
+const ORPHAN_OBSERVED_IDLE_TTL_MS = 6 * 3600000;
 const HEADROOM: Record<string, number> = { codex: 15, 'codex-orin': 15, grok: 5 };
 /** Engines whose providers the canonical model policy disables. New grok sessions hold here. */
 function disabledEngines(): Set<string> {
@@ -312,6 +319,9 @@ export class FleetService {
     // block the shared pool for the live host. Stale offered/starting/uncertain
     // reservations (no update for 48h) never had a confirmed native start and
     // must not hold quota forever; running launches may be long-lived and stay.
+    // Orphan observed sessions (no Hub launch) idle past
+    // ORPHAN_OBSERVED_IDLE_TTL_MS release their slot; parked PTYs from
+    // finished work must not pin account_capacity forever.
     const liveIds = new Set<string>();
     try {
       for (const m of this.sql.exec('SELECT id, last_checkin_at, drained FROM machines').toArray() as any[]) {
@@ -325,9 +335,17 @@ export class FleetService {
     const reserved = liveList.length
       ? Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE account = ? AND state IN ${ACTIVE} AND machine_id IN (${liveList.map(() => '?').join(',')}) AND (state = 'running' OR updated_at > ?)`, account.label, ...liveList, staleCutoff).one().n)
       : 0;
-    const observedSessions = liveList.length
-      ? Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown') AND s.machine_id IN (${liveList.map(() => '?').join(',')}) AND NOT EXISTS (SELECT 1 FROM fleet_launches l WHERE l.machine_id = s.machine_id AND l.native_id = s.native_id AND l.state IN ${ACTIVE})`, account.label, ...liveList).one().n)
-      : 0;
+    const observedSessions = (() => {
+      if (!liveList.length) return 0;
+      const orphans = this.sql.exec(`SELECT s.last_activity_at AS last_activity_at FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown') AND s.machine_id IN (${liveList.map(() => '?').join(',')}) AND NOT EXISTS (SELECT 1 FROM fleet_launches l WHERE l.machine_id = s.machine_id AND l.native_id = s.native_id AND l.state IN ${ACTIVE})`, account.label, ...liveList).toArray() as any[];
+      const cutoff = this.now() - ORPHAN_OBSERVED_IDLE_TTL_MS;
+      let counted = 0;
+      for (const row of orphans) {
+        const atMs = typeof row.last_activity_at === 'string' ? Date.parse(row.last_activity_at) : NaN;
+        if (!Number.isFinite(atMs) || atMs > cutoff) counted++;
+      }
+      return counted;
+    })();
     const active = reserved + observedSessions;
     return { label: account.label, provider: account.provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled,
       remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || unknown || remaining === null) ? 'unknown' : 'ok', active, available_slots: Math.max(0, Number(account.max_concurrency) - active),

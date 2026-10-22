@@ -196,6 +196,16 @@ describe('account pinning and existing native occupancy', () => {
     // The linked session deduplicates on win35; hetzner's independent native process still counts.
     expect(f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-zai'").one()).active).toBe(2);
   }));
+  it('releases long-idle unlinked observed sessions from account capacity', () => fixture(async (r, f, sql) => {
+    const active = () => f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-zai'").one()).active;
+    expect(active()).toBe(0);
+    sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account,last_activity_at) VALUES ('hetzner','idle-old','idle-old','zcodex','running',?,'tasks','shared-zai',?)", at(), at(-10 * 3600000));
+    expect(active()).toBe(0);
+    sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account,last_activity_at) VALUES ('hetzner','idle-new','idle-new','zcodex','running',?,'tasks','shared-zai',?)", at(), at(-60000));
+    expect(active()).toBe(1);
+    sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account,last_activity_at) VALUES ('hetzner','idle-null','idle-null','zcodex','running',?,'tasks','shared-zai',NULL)", at());
+    expect(active()).toBe(2);
+  }));
 });
 
 describe('atomic final reports', () => {
