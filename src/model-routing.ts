@@ -1,5 +1,6 @@
 import policy from '../config/model-routing.json';
 import { evaluateQuotaAdmission } from './quota_admission';
+import { grokDemotion, netHeadroom, pacingFor, providerPreference, resetUrgency, routeScore, type ProviderPacing, type RouteScoreFactors } from './pacing';
 export { policy };
 export function taskTier(input: any): string | null {
   if ((input.tier !== undefined && typeof input.tier !== 'string') || (input.difficulty !== undefined && (typeof input.difficulty !== 'string' || !Object.hasOwn(policy.rules.difficulty_tiers, input.difficulty)))) return null;
@@ -9,8 +10,12 @@ export function taskTier(input: any): string | null {
   const tier = (policy.aliases as any)[value] ?? value;
   return Object.hasOwn(policy.tiers, tier) ? tier : null;
 }
-/** Reuses launcher/ranking.py's bounded headroom/reset formula after hard admission gates. */
-export function modelCandidates(input: any, route: any, advertisement: any, quota: any, now: number) {
+/**
+ * Hard admission gates first, then the TBM multi-factor score (src/pacing.ts):
+ * weight = fit * health * preference * headroom * urgency * pacing * grok * banked.
+ * `pacing` comes from tbm_* rows; omitted or empty keeps those factors neutral.
+ */
+export function modelCandidates(input: any, route: any, advertisement: any, quota: any, now: number, pacing?: Map<string, ProviderPacing>) {
   const tier = taskTier(input); if (!tier) return [];
   const members: string[] = (policy.tiers as any)[tier];
   return policy.models.filter(m => {
@@ -28,8 +33,12 @@ export function modelCandidates(input: any, route: any, advertisement: any, quot
     const remaining = Math.min(...windows.map(w => w.percent_remaining)) / 100;
     if (!Number.isFinite(remaining) || remaining <= 0 || remaining * 100 <= ((policy.rules.reserve_percent as any)[m.provider] ?? 0)) return null;
     const hours = Math.min(...windows.map(w => (Date.parse(w.reset_at) - now) / 3600000));
-    const urgency = Number.isFinite(hours) ? remaining * Math.max(0, Math.min(1, (policy.rules.reset_horizon_hours - hours) / policy.rules.reset_horizon_hours)) : 0;
-    const preference = policy.rules.preferred_providers.includes(m.provider) ? policy.rules.provider_preference : 1;
-    return { ...m, tier, headroom: Math.max(policy.rules.headroom_floor, remaining), weight: preference * Math.max(policy.rules.headroom_floor, remaining) * (1 + policy.rules.reset_urgency_factor * urgency) };
+    const paced = pacingFor(pacing, m.provider);
+    if (paced.halted) return null; // tbm kill switch: no auto-routed burn on this provider.
+    const headroom = netHeadroom(remaining * 100, (policy.rules.reserve_percent as any)[m.provider] ?? 0);
+    // Tier membership already enforces exact fit (no cross-tier failover); health stays neutral until measured.
+    const factors: RouteScoreFactors = { fit: 1, health: 1, preference: providerPreference(m.provider), headroom,
+      urgency: resetUrgency(headroom, hours), pacing: paced.pacing, grok: grokDemotion(m.provider), banked: paced.banked };
+    return { ...m, tier, headroom: Math.max(policy.rules.headroom_floor, remaining), weight: routeScore(factors), factors, preempt: paced.preempt };
   }).filter((m): m is NonNullable<typeof m> => m !== null);
 }

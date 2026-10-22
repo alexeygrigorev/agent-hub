@@ -148,9 +148,9 @@
       "zai",
       "go"
     ],
-    "provider_preference": 1.2,
+    "provider_preference": 1.3,
     "reset_horizon_hours": 24,
-    "reset_urgency_factor": 2,
+    "reset_urgency_factor": 2.5,
     "headroom_floor": 0.05,
     "reserve_percent": {
       "codex": 15,

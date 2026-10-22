@@ -2,6 +2,7 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { modelCandidates, taskTier, policy } from './model-routing';
 import { evaluateQuotaAdmission } from './quota_admission';
+import { loadProviderPacing } from './pacing';
 import type { FleetService } from './fleet';
 import { sha256, randomString } from './auth/crypto';
 import { effectiveCheckin } from './registry';
@@ -70,6 +71,8 @@ export class RoutingService {
       if (!queued.length) queued = this.sql.exec("SELECT * FROM routing_jobs WHERE launch_id IS NULL AND state = 'queued' ORDER BY id LIMIT 20").toArray();
       if (queued.length) this.sql.exec('INSERT OR REPLACE INTO routing_cursor VALUES (1, ?)', queued[queued.length - 1].id);
     }
+    // TBM pacing/EDF context is read once per dispatch pass from the Phase 1 tbm_* tables.
+    const pacing = queued.length ? loadProviderPacing(this.sql, this.now()) : undefined;
     for (const queuedRow of queued) this.transaction(() => {
       const row: any = this.sql.exec("SELECT * FROM routing_jobs WHERE id = ? AND launch_id IS NULL AND state = 'queued'", queuedRow.id).toArray()[0];
       if (!row) return;
@@ -113,13 +116,14 @@ export class RoutingService {
               reserves: (((policy as any).rules as any).reserve_percent || {}) as Record<string, number> });
             if (!adm.ok) subQuota = null;
           }
-          const models = modelCandidates(input, { ...r, provider: account.provider }, JSON.parse(ad.runners_json), subQuota, this.now());
+          const models = modelCandidates(input, { ...r, provider: account.provider }, JSON.parse(ad.runners_json), subQuota, this.now(), pacing);
           return models.map(model => ({ ...r, model, score: r.score * model.weight / model.headroom }));
         });
         if (!routes.length) continue;
-        routes.sort((a: any, b: any) => Number(b.engine === input.preferred_runner) - Number(a.engine === input.preferred_runner) || b.score - a.score);
+        // A banked tranche in its critical window preempts other routes (EDF), after an explicit runner preference.
+        routes.sort((a: any, b: any) => Number(b.engine === input.preferred_runner) - Number(a.engine === input.preferred_runner) || Number(b.model.preempt) - Number(a.model.preempt) || b.score - a.score);
         const chosen = routes[0];
-        candidates.push({ ...chosen, prompt, priority: (chosen.machine === input.preferred_machine ? 100 : 0) + (chosen.engine === input.preferred_runner ? 20 : 0) + (/^(hetzner|rmthz)$/i.test(chosen.machine) || /^RMTHZ$/i.test(machine.hostname) ? 10 : 0) });
+        candidates.push({ ...chosen, prompt, priority: (chosen.machine === input.preferred_machine ? 100 : 0) + (chosen.engine === input.preferred_runner ? 20 : 0) + (/^(hetzner|rmthz)$/i.test(chosen.machine) || /^RMTHZ$/i.test(machine.hostname) ? 10 : 0) + (chosen.model.preempt ? 50 : 0) });
       }
       candidates.sort((a, b) => b.priority - a.priority || b.score - a.score || a.machine.localeCompare(b.machine));
       if (!candidates.length) return;
