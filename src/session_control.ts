@@ -621,6 +621,26 @@ export class SessionControlService {
     return { ok: true, session: matches[0] };
   }
 
+  /** Adopt a Fleet-side promotion of a capacity-queued intent (no new placement).
+   *
+   * When the linked fleet launch advanced queued -> offered (fleet drain FIFO
+   * on a freed slot), the session follows. Starting/running/terminal
+   * transitions stay with the binding/result flows, which carry the native
+   * incarnation evidence this sync must never invent. */
+  private syncFleetPlacement(sessionId: string): any | null {
+    const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0];
+    if (!session || !session.fleet_launch_id) return session;
+    if (session.state !== 'queued' && session.state !== 'held') return session;
+    let launch: any = null;
+    try { launch = this.sql.exec('SELECT id, machine_id, engine, state FROM fleet_launches WHERE id = ?', session.fleet_launch_id).toArray()[0]; } catch { return session; }
+    if (!launch || launch.state !== 'offered') return session;
+    try {
+      this.sql.exec('UPDATE session_control_sessions SET machine_id = ?, engine = ?, state = ?, updated_at = ? WHERE id = ? AND state = ?',
+        launch.machine_id ?? null, launch.engine ?? null, 'offered', this.at(), sessionId, session.state);
+    } catch { return session; }
+    return this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0] ?? session;
+  }
+
   /** Cursor pagination over (created_at, id): complete pages, no silent truncation. */
   private cursorClause(cursor: unknown, params: any[], desc: boolean): string {
     if (typeof cursor !== 'string' || !cursor) return '';
@@ -1016,7 +1036,10 @@ export class SessionControlService {
           // fields in a different key order (e.g. backfilled defaults).
           const norm = (o: any) => JSON.stringify(o, Object.keys(o).sort());
           if (norm(priorInput) !== norm(parsed(canonical, {}))) return response({ error: 'idempotency_conflict' }, 409);
-          if (prior.fleet_launch_id || prior.state === 'cancelled') return response({ ...this.view(prior), replay: true });
+          // A Fleet-side promotion (queued -> offered) is adopted before the
+          // replay below, so polling the same key observes placement.
+          const live = this.syncFleetPlacement(prior.id) ?? prior;
+          if (live.fleet_launch_id || live.state === 'cancelled') return response({ ...this.view(live), replay: true });
           // A held intent may be placed once capacity/admission recovers; the fleet
           // reserve stays idempotent on its own derived key, so this cannot double-launch.
         }
@@ -1071,6 +1094,25 @@ export class SessionControlService {
           `UPDATE session_control_sessions SET state = 'cancelled', updated_at = ?
            WHERE actor = ? AND state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL AND id <> ? AND created_at < ?`,
           hygieneAt, actor, prior?.id ?? '', staleBefore);
+        // Fleet-linked capacity-queue hygiene: supersede this actor's older
+        // queued parks for the same workspace+name and expire queued parks
+        // past 48h, releasing their fleet waitlist row while still queued.
+        // Placed rows (a binding, or a fleet launch beyond queued) are never
+        // touched, and the intent being placed (prior) is excluded.
+        const queuedParks: any[] = (() => {
+          try {
+            return this.sql.exec(
+              `SELECT id, fleet_launch_id FROM session_control_sessions WHERE actor = ? AND state = 'queued' AND binding_json IS NULL AND id <> ?
+                 AND (created_at < ? OR (json_extract(request_json, '$.workspace') = ? AND json_extract(request_json, '$.name') = ?))`,
+              actor, prior?.id ?? '', staleBefore, input.workspace, input.name ?? null).toArray() as any[];
+          } catch { return []; }
+        })();
+        for (const park of queuedParks) {
+          this.sql.exec(`UPDATE session_control_sessions SET state = 'cancelled', updated_at = ? WHERE id = ? AND state = 'queued' AND binding_json IS NULL`, hygieneAt, park.id);
+          if (park.fleet_launch_id) {
+            try { this.sql.exec(`UPDATE fleet_launches SET state = 'cancelled', updated_at = ? WHERE id = ? AND state = 'queued'`, hygieneAt, park.fleet_launch_id); } catch { /* fleet table absent in narrow fixtures */ }
+          }
+        }
         // Post-body liveness inside the mutation txn: a credential revoked,
         // expired, or re-enrolled while the request body streamed must not
         // create a session row (or stamp a NULL family). Admins bypass; every
@@ -1118,6 +1160,15 @@ export class SessionControlService {
         if (reserved.status === 400) {
           this.sql.exec('UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE id = ?', 'refused', at, id);
           return response(reserved.value, 400);
+        }
+        // Capacity-only placement parks a waitable queued intent (202) linked
+        // to the fleet waitlist row; the fleet drain auto-places it when a
+        // slot frees and polls adopt the promotion. All other failures hold.
+        if (reserved.status === 202 && reserved.value && typeof reserved.value.id === 'string' && reserved.value.state === 'queued') {
+          this.sql.exec('UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = NULL, engine = ?, state = ?, updated_at = ? WHERE id = ?',
+            reserved.value.id, typeof reserved.value.engine === 'string' && reserved.value.engine ? reserved.value.engine : (input.engine ?? null), 'queued', at, id);
+          const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
+          return response({ ...this.view(row), queued: true, queue_position: reserved.value.queue_position ?? null, rejected: reserved.value.rejected ?? null, requested: { engine: input.engine ?? null, machine: input.machine ?? null, workspace: input.workspace } }, 202);
         }
         if (reserved.status >= 300) {
           this.sql.exec('UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE id = ?', 'held', at, id);
@@ -1687,7 +1738,9 @@ export class SessionControlService {
         });
       }
       if (!session || !this.ownerOk(session, caller)) return response({ error: 'not_found' }, 404);
-      if (!sub && request.method === 'GET') return response(this.view(session));
+      // Polling a capacity-queued intent adopts any Fleet-side promotion, so
+      // the wait is observable without another placement call.
+      if (!sub && request.method === 'GET') return this.transaction(() => response(this.view(this.syncFleetPlacement(session.id) ?? session)));
       if (sub === 'protect' && request.method === 'POST') {
         const input = await body(request);
         if (!obj(input, ['key']) || !label(input.key)) return response({ error: 'invalid_protection' }, 400);
@@ -1723,10 +1776,27 @@ export class SessionControlService {
           }
           const pending = this.sql.exec('SELECT id FROM session_control_commands WHERE session_id = ? LIMIT 1', live.id).toArray();
           const original = parsed(live.request_json, {});
-          if (live.state !== 'held' || live.fleet_launch_id || live.binding_json || pending.length || original.provenance === 'observed_native') {
+          // A capacity-queued intent may be released while its fleet waitlist
+          // row is still queued (never offered/claimed). Anything placed,
+          // bound, commanded, or observed stays non-cancellable as before.
+          const queuedFleet = live.state === 'queued' && live.fleet_launch_id && !live.binding_json && !pending.length && original.provenance !== 'observed_native'
+            ? (() => { try { return this.sql.exec('SELECT state FROM fleet_launches WHERE id = ?', live.fleet_launch_id).toArray()[0] ?? null; } catch { return null; } })()
+            : null;
+          if (queuedFleet && queuedFleet.state !== 'queued') return response({ error: 'session_not_cancellable' }, 409);
+          if ((live.state !== 'held' || live.fleet_launch_id || live.binding_json || pending.length || original.provenance === 'observed_native') && !queuedFleet) {
             return response({ error: 'session_not_cancellable' }, 409);
           }
           const at = this.at();
+          if (queuedFleet) {
+            let released = false;
+            try {
+              const written: any = this.sql.exec(`UPDATE fleet_launches SET state = 'cancelled', updated_at = ? WHERE id = ? AND state = 'queued'`, at, live.fleet_launch_id);
+              released = written?.rowsWritten === 1;
+            } catch { released = false; }
+            // Lost the race with a Fleet-side promotion: refuse rather than
+            // strand an offered launch behind a cancelled session.
+            if (!released) return response({ error: 'session_not_cancellable' }, 409);
+          }
           this.sql.exec('INSERT INTO session_control_cancellations (session_id, actor, request_key, created_at) VALUES (?, ?, ?, ?)', live.id, actorName(caller), input.key, at);
           this.sql.exec('UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE id = ?', 'cancelled', at, live.id);
           const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', live.id).toArray()[0];
@@ -1739,7 +1809,18 @@ export class SessionControlService {
         // Reuse the original actor/key/payload; this cannot create a second
         // intent or bypass the placement/admission/liveness checks below.
         if (!writer || actorName(caller) !== session.actor) return response({ error: 'forbidden' }, 403);
-        if (session.state !== 'held' || session.fleet_launch_id) return response({ error: 'session_not_held' }, 409);
+        // A capacity-queued intent linked to the fleet waitlist reports any
+        // Fleet-side promotion; otherwise it stays queued (the waitlist, not
+        // a blind client retry, owns placement). Anything already placed or
+        // terminal keeps the existing refusal.
+        if (session.fleet_launch_id) {
+          if (session.state !== 'queued' && session.state !== 'held') return response({ error: 'session_not_held' }, 409);
+          return this.transaction(() => {
+            const live = this.syncFleetPlacement(session.id) ?? session;
+            return response(this.view(live));
+          });
+        }
+        if (session.state !== 'held') return response({ error: 'session_not_held' }, 409);
         const original = parsed(session.request_json, {});
         const replay = Object.fromEntries(Object.entries(original).filter(([, value]) => value !== null));
         return this.handle(new Request('https://hub.internal/api/sessions', {

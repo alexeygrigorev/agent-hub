@@ -27,6 +27,27 @@ function disabledEngines(): Set<string> {
   const disabled = new Set<string>(Array.isArray(rules.disabled_providers) ? rules.disabled_providers : []);
   return new Set<string>((((policy as any).models || []) as any[]).filter(m => m && disabled.has(m.provider)).map(m => String(m.engine)));
 }
+/** Reject reasons that mean "no free slot right now" (transient capacity). */
+const CAPACITY_REASONS = new Set(['account_capacity', 'machine_capacity']);
+/** Incidental per-route reasons that may accompany capacity but never queue alone
+ * (stale/drained check-ins, policy-disabled engines). */
+const INCIDENTAL_REASONS = new Set(['machine_unavailable', 'provider_disabled']);
+/** Capacity-only placement failure: every rejected route reports transient
+ * capacity (account/machine), optionally alongside incidental stale/disabled
+ * routes — but incidentals alone never queue. Any other class (capability,
+ * admission, resources, quota evidence, tier) stays a hard reject with its
+ * slug visible. */
+export function isCapacityOnlyHold(rejected: unknown): rejected is { machine: string; engine: string; reason: string }[] {
+  if (!Array.isArray(rejected) || rejected.length === 0) return false;
+  let capacity = false;
+  for (const entry of rejected) {
+    const reason = (entry as any)?.reason;
+    if (CAPACITY_REASONS.has(reason)) { capacity = true; continue; }
+    if (INCIDENTAL_REASONS.has(reason)) continue;
+    return false;
+  }
+  return capacity;
+}
 const HEADERS = { 'Cache-Control': 'private, no-store' };
 function response(value: unknown, status = 200) { return Response.json(value, { status, headers: HEADERS }); }
 function label(value: unknown): value is string { return typeof value === 'string' && LABEL.test(value); }
@@ -350,6 +371,59 @@ export class FleetService {
     return { request, selected: candidates[0] || null, candidates, rejected };
   }
 
+  private queuePosition(id: string): number {
+    try {
+      return Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE state = 'queued' AND rowid <= (SELECT rowid FROM fleet_launches WHERE id = ?)", id).one().n);
+    } catch { return 1; }
+  }
+
+  /** Promote capacity-queued intents FIFO when slots free; expire stale parks.
+   *
+   * Runs inside the ambient transaction on every reserve (new + replay) and
+   * on every capacity-freeing write (terminal results, session catalog
+   * reports) plus host offer polls, so a queued intent places without the
+   * operator retrying blindly. Bounded per call for the CPU budget.
+   * Admission and parent liveness are re-checked at promotion: a deny keeps
+   * the row queued (never launches under dead authority). */
+  drainCapacityQueue(limit = 5): { promoted: number; expired: number } {
+    let promoted = 0, expired = 0;
+    try {
+      const nowIso = new Date(this.now()).toISOString();
+      const staleBefore = new Date(this.now() - 48 * 3600000).toISOString();
+      const stale = this.sql.exec("SELECT id FROM fleet_launches WHERE state = 'queued' AND created_at < ?", staleBefore).toArray() as any[];
+      for (const row of stale) {
+        this.sql.exec("UPDATE fleet_launches SET state = 'expired', updated_at = ? WHERE id = ? AND state = 'queued'", nowIso, row.id);
+        expired++;
+      }
+      const rows = this.sql.exec("SELECT * FROM fleet_launches WHERE state = 'queued' ORDER BY rowid LIMIT ?", limit).toArray() as any[];
+      for (const row of rows) {
+        let bound: any = null;
+        try { bound = JSON.parse(row.request_json); } catch { continue; }
+        if (!bound || typeof bound !== 'object') continue;
+        const input: any = { mode: bound.mode || 'headless', workspace: bound.workspace, prompt: bound.prompt ?? '', idempotency_key: 'drain-' + row.id };
+        for (const key of ['machine', 'engine', 'account', 'tier', 'cwd', 'parent_id', 'summary', 'approved_action', 'access']) {
+          if (bound[key] !== undefined && bound[key] !== null) input[key] = bound[key];
+        }
+        let plan: any;
+        try { plan = this.plan(input); } catch { continue; }
+        if (!plan || (plan as any).error || !(plan as any).selected) continue;
+        if (bound.parent_id) {
+          const parent: any = this.sql.exec('SELECT actor, state FROM fleet_launches WHERE id = ?', bound.parent_id).toArray()[0];
+          if (!parent || parent.actor !== row.actor || !['starting', 'running'].includes(parent.state)) continue;
+        }
+        try {
+          const hold = this.admission.heldReason({ request_json: row.request_json, workspace: bound.workspace, id: row.id });
+          if (hold) continue;
+        } catch { continue; }
+        const selected = (plan as any).selected;
+        const written: any = this.sql.exec("UPDATE fleet_launches SET machine_id = ?, engine = ?, account = ?, profile = ?, state = 'offered', updated_at = ? WHERE id = ? AND state = 'queued'",
+          selected.machine, selected.engine, selected.account, selected.profile ?? null, new Date(this.now()).toISOString(), row.id);
+        if (written && (written as any).rowsWritten === 1) promoted++;
+      }
+    } catch { /* drain is best-effort inside the ambient txn */ }
+    return { promoted, expired };
+  }
+
   /** All final placement gates, authority reads and capacity writes share this transaction. */
   reserve(input: any, auth: Auth, expectedAuthority?: EditAuthority, preview = false): { value: any; status: number } {
     const result = (value: any, status = 200) => ({ value, status });
@@ -357,6 +431,9 @@ export class FleetService {
     if (!caller || !(caller.isAdmin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch')))) return result({ error: 'forbidden' }, 403);
     return this.transaction(() => {
       this.admission.reconcileOffers();
+      // Capacity waitlist first: freed slots promote parked intents FIFO
+      // before a new request can take them, and replays observe promotion.
+      try { this.drainCapacityQueue(); } catch { /* best-effort */ }
       const plan = this.plan(input);
       if ('error' in plan) return result(plan, 400);
       const parsed = this.admission.parseDeclaration(input?.access);
@@ -371,7 +448,13 @@ export class FleetService {
       if (!label(input.idempotency_key)) return result({ error: 'idempotency_key_required' }, 400);
       const actor = caller.actor || caller.machineId || 'admin'; const canonical = JSON.stringify(bound);
       const prior: any = this.sql.exec('SELECT * FROM fleet_launches WHERE actor = ? AND request_key = ?', actor, input.idempotency_key).toArray()[0];
-      if (prior) return sameIntent(prior.request_json, canonical) && sameEditCaller(prior.request_json, caller) ? result({ id: prior.id, state: prior.state, machine: prior.machine_id, engine: prior.engine, account: prior.account, mode: prior.mode, access: JSON.parse(prior.request_json).access?.mode || 'legacy_unspecified', replay: true }) : result({ error: 'idempotency_conflict' }, 409);
+      if (prior) {
+        if (!sameIntent(prior.request_json, canonical) || !sameEditCaller(prior.request_json, caller)) return result({ error: 'idempotency_conflict' }, 409);
+        if (prior.state === 'queued') {
+          return result({ id: prior.id, state: 'queued', queued: true, queue_position: this.queuePosition(prior.id), machine: null, engine: null, account: null, mode: prior.mode, access: JSON.parse(prior.request_json).access?.mode || 'legacy_unspecified', replay: true }, 202);
+        }
+        return result({ id: prior.id, state: prior.state, machine: prior.machine_id, engine: prior.engine, account: prior.account, mode: prior.mode, access: JSON.parse(prior.request_json).access?.mode || 'legacy_unspecified', replay: true });
+      }
       // A disabled execution engine refuses every new reservation, after valid replay.
       const overrideModels = policy.models.filter(m => m.id === plan.request.engine);
       const disabled = disabledEngines();
@@ -387,7 +470,17 @@ export class FleetService {
       }
       const admitted = this.admission.evaluate(caller, plan.request.workspace, parsed.access, 'reserve', { authority: expectedAuthority });
       if (!admitted.ok) return result({ error: admitted.error, access: parsed.access.mode }, admitted.status);
-      if (!plan.selected) return result({ error: 'no_eligible_route', rejected: plan.rejected, access: parsed.access.mode }, 409);
+      if (!plan.selected) {
+        // Capacity-only failure parks a waitable queued intent (202) that the
+        // drain auto-places when a slot frees. Any other reject class stays a
+        // hard 409 with its slugs visible. Never raise max_concurrency here.
+        if (isCapacityOnlyHold(plan.rejected)) {
+          const id = crypto.randomUUID(); const at = new Date(this.now()).toISOString();
+          this.sql.exec('INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', id, actor, caller.kind || 'unknown', plan.request.parent_id, plan.request.summary, input.idempotency_key, JSON.stringify({ ...bound, ...(admitted.authority ? { edit_authority: admitted.authority } : {}) }), '', '', '', null, plan.request.mode, plan.request.workspace, plan.request.prompt, 'queued', at, at);
+          return result({ id, state: 'queued', queued: true, queue_position: this.queuePosition(id), rejected: plan.rejected, access: admitted.access.mode }, 202);
+        }
+        return result({ error: 'no_eligible_route', rejected: plan.rejected, access: parsed.access.mode }, 409);
+      }
       const id = crypto.randomUUID(); const at = new Date(this.now()).toISOString(); const selected = plan.selected;
       this.sql.exec('INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', id, actor, caller.kind || 'unknown', plan.request.parent_id, plan.request.summary, input.idempotency_key, JSON.stringify({ ...bound, ...(admitted.authority ? { edit_authority: admitted.authority } : {}) }), selected.machine, selected.engine, selected.account, selected.profile, plan.request.mode, plan.request.workspace, plan.request.prompt, 'offered', at, at);
       return result({ id, state: 'offered', machine: selected.machine, engine: selected.engine, account: selected.account, mode: plan.request.mode, access: admitted.access.mode }, 201);
@@ -479,6 +572,7 @@ export class FleetService {
       await this.routing.dispatch();
       return this.transaction(() => {
         this.admission.reconcileOffers();
+        try { this.drainCapacityQueue(); } catch { /* best-effort */ };
         const offers: any[] = [];
         for (const row of this.sql.exec("SELECT * FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at, id LIMIT 100", caller.machineId!)) {
           if (this.admission.retireInvalidOffer(row)) continue;
@@ -558,6 +652,8 @@ export class FleetService {
           }
         }
         adoptObservedNativeSessions(this.sql, caller.machineId!, cleanSessions, this.now());
+        // A refreshed catalog can free machine_capacity: promote waiters.
+        try { this.drainCapacityQueue(); } catch { /* best-effort */ }
         return response({ status: 'reported', written });
       });
     }
@@ -649,6 +745,10 @@ export class FleetService {
         // Fleet can run without the optional session-control tables in tests.
         if (['failed', 'exited'].includes(data.state) && this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
           this.sql.exec("UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE fleet_launch_id = ? AND machine_id = ? AND state IN ('queued', 'held', 'offered', 'starting', 'running', 'uncertain')", data.state === 'failed' ? 'failed' : 'stopped', new Date(this.now()).toISOString(), row.id, caller.machineId!);
+        }
+        // A terminal result frees account/machine capacity: promote waiters.
+        if (['failed', 'exited'].includes(data.state)) {
+          try { this.drainCapacityQueue(); } catch { /* best-effort */ }
         }
         return response({ id: row.id, state: data.state });
       });

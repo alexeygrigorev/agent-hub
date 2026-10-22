@@ -174,10 +174,14 @@ describe('generic accounts and launch placement', () => {
     sql.exec('UPDATE host_quota_snapshots SET captured_at = ?', iso(-1200001));
     expect((s.plan(intent()) as any).selected).toBeNull();
   }));
-  it('reserves a shared account once across machines; separate desktop Codex retains independent capacity', async () => fixture(async (s) => {
+  it('reserves a shared account once across machines; the second waiter queues instead of failing', async () => fixture(async (s) => {
     await configure(s, true);
     const results = await Promise.all(['hetzner', 'win35'].map(machine => s.handle(request('/launches', intent({ machine })), admin)));
-    expect(results.map(r => r.status).sort()).toEqual([201, 409]);
+    // One shared slot: the loser parks as a waitable queued intent (202),
+    // never a blind-retry reject — capacity-only failures queue, not 409.
+    expect(results.map(r => r.status).sort()).toEqual([201, 202]);
+    const bodies = await Promise.all(results.map(r => r.json())) as any[];
+    expect(bodies.map(b => b.state).sort()).toEqual(['offered', 'queued']);
   }));
   it('keeps the Win35 account separate from shared Codex', async () => fixture(async s => {
     await configure(s);
@@ -232,17 +236,24 @@ describe('generic accounts and launch placement', () => {
     expect((await s.handle(request(path, claim), host('hetzner'))).status).toBe(200);
     expect((await s.handle(request(path, claim), host('hetzner'))).status).toBe(409);
   }));
-  it('retains capacity on uncertain effects and requires native receipt/confirmed death to release', async () => fixture(async s => {
+  it('retains capacity on uncertain effects and requires native receipt/confirmed death to release', async () => fixture(async (s, sql) => {
     await configure(s);
     const l: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
     await s.handle(request('/launches/' + l.id + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
     const path = '/launches/' + l.id + '/result';
     expect((await s.handle(request(path, { state: 'running' }), host('hetzner'))).status).toBe(409);
     expect((await s.handle(request(path, { state: 'uncertain' }), host('hetzner'))).status).toBe(200);
-    expect((await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).status).toBe(409);
+    // Capacity held by the uncertain reservation queues the next intent (202),
+    // never a blind-retry reject.
+    const waiterInput = intent({ machine: 'hetzner' });
+    const waiter: any = await (await s.handle(request('/launches', waiterInput), admin)).json();
+    expect(waiter.state).toBe('queued');
     expect((await s.handle(request(path, { state: 'exited' }), host('hetzner'))).status).toBe(409);
     expect((await s.handle(request(path, { state: 'exited', confirmed_exit: true }), host('hetzner'))).status).toBe(200);
-    expect((await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).status).toBe(201);
+    // The terminal result frees the slot and auto-places the queued waiter;
+    // a brand-new intent then queues behind it.
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', waiter.id).one().state).toBe('offered');
+    expect((await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).status).toBe(202);
   }));
   it('ignores sessions on stale offline machines when computing shared account capacity', async () => fixture(async (s, sql) => {
     await configure(s, true);
@@ -260,11 +271,15 @@ describe('generic accounts and launch placement', () => {
     const first: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
     await s.handle(request('/launches/' + first.id + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
     expect((await s.handle(request('/launches/' + first.id + '/result', { state: 'uncertain' }), host('hetzner'))).status).toBe(200);
-    // Second launch blocked while the uncertain reservation is fresh.
-    expect((await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).status).toBe(409);
+    // Second launch queues while the uncertain reservation is fresh.
+    const waiterInput = intent({ machine: 'hetzner' });
+    expect((await s.handle(request('/launches', waiterInput), admin)).status).toBe(202);
     // A 3-day-old uncertain hold never confirmed a native start; it must not block forever.
     sql.exec("UPDATE fleet_launches SET updated_at = ? WHERE id = ?", iso(-3 * 86400000), first.id);
-    expect((await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).status).toBe(201);
+    const third = await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin);
+    // The freed slot promotes the earlier waiter FIFO; the newcomer queues.
+    expect(third.status).toBe(202);
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE request_key = ?', waiterInput.idempotency_key).one().state).toBe('offered');
   }));
   for (const terminal of ['exited', 'failed'] as const) {
     it(`replays the identical ${terminal} headless receipt without effects and refuses mismatched receipts`, async () => fixture(async (s, sql) => {
