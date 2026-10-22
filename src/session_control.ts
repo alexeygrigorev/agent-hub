@@ -898,18 +898,45 @@ export class SessionControlService {
     if (path === '/api/sessions' && request.method === 'POST') {
       if (!writer) return response({ error: 'forbidden' }, 403);
       const input = await body(request);
-      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id']) ||
-          !label(input.key) || !workspaceOk(input.workspace) ||
-          (input.engine !== undefined && !label(input.engine)) ||
-          (input.engine_override_reason !== undefined && (typeof input.engine_override_reason !== 'string' || input.engine_override_reason.length > 500)) ||
-          (input.machine !== undefined && !isValidMachineId(input.machine)) ||
-          (input.name !== undefined && !nameOk(input.name)) ||
-          (input.cwd !== undefined && !cwdOk(input.cwd)) ||
-          (input.mode !== undefined && !['headless', 'interactive'].includes(input.mode)) ||
-          (input.parent_id !== undefined && (typeof input.parent_id !== 'string' || !input.parent_id.trim() || input.parent_id.length > 256)) ||
-          (input.intake_task_id !== undefined && (typeof input.intake_task_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.intake_task_id))) ||
-          (input.brief !== undefined && (typeof input.brief !== 'string' || !input.brief.trim() || input.brief.length > 8000))) {
-        return response({ error: 'invalid_session_request' }, 400);
+      // CLI historically used --intake-task while the API field is intake_task_id.
+      // Accept the short alias when it does not conflict, so MCP/CLI parity does
+      // not surface as a spurious invalid_session_request for otherwise valid starts.
+      if (Object.prototype.hasOwnProperty.call(input, 'intake_task')) {
+        if (input.intake_task_id !== undefined && input.intake_task_id !== input.intake_task) {
+          return response({ error: 'invalid_session_request', field: 'intake_task', detail: 'conflicts_with_intake_task_id' }, 400);
+        }
+        input.intake_task_id = input.intake_task;
+        delete input.intake_task;
+      }
+      // null / blank intake_task_id means "missing" so the TBM gate can return
+      // intake_task_id_required instead of a generic invalid_session_request.
+      if (input.intake_task_id === null || input.intake_task_id === '') delete input.intake_task_id;
+      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id'])) {
+        const allowed = new Set(['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id']);
+        const field = input && typeof input === 'object' && !Array.isArray(input)
+          ? Object.keys(input).find(k => !allowed.has(k)) : undefined;
+        return response({ error: 'invalid_session_request', ...(field ? { field, detail: 'unknown_field' } : { detail: 'invalid_object' }) }, 400);
+      }
+      if (!label(input.key)) return response({ error: 'invalid_session_request', field: 'key', detail: 'invalid_key' }, 400);
+      if (!workspaceOk(input.workspace)) return response({ error: 'invalid_session_request', field: 'workspace', detail: 'invalid_workspace' }, 400);
+      if (input.engine !== undefined && !label(input.engine)) return response({ error: 'invalid_session_request', field: 'engine', detail: 'invalid_engine' }, 400);
+      if (input.engine_override_reason !== undefined && (typeof input.engine_override_reason !== 'string' || input.engine_override_reason.length > 500)) {
+        return response({ error: 'invalid_session_request', field: 'engine_override_reason', detail: 'invalid_reason' }, 400);
+      }
+      if (input.machine !== undefined && !isValidMachineId(input.machine)) return response({ error: 'invalid_session_request', field: 'machine', detail: 'invalid_machine' }, 400);
+      if (input.name !== undefined && !nameOk(input.name)) return response({ error: 'invalid_session_request', field: 'name', detail: 'invalid_name' }, 400);
+      if (input.cwd !== undefined && !cwdOk(input.cwd)) return response({ error: 'invalid_session_request', field: 'cwd', detail: 'invalid_cwd' }, 400);
+      if (input.mode !== undefined && !['headless', 'interactive'].includes(input.mode)) {
+        return response({ error: 'invalid_session_request', field: 'mode', detail: 'invalid_mode' }, 400);
+      }
+      if (input.parent_id !== undefined && (typeof input.parent_id !== 'string' || !input.parent_id.trim() || input.parent_id.length > 256)) {
+        return response({ error: 'invalid_session_request', field: 'parent_id', detail: 'invalid_parent_id' }, 400);
+      }
+      if (input.intake_task_id !== undefined && (typeof input.intake_task_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.intake_task_id))) {
+        return response({ error: 'invalid_session_request', field: 'intake_task_id', detail: 'invalid_intake_task_id' }, 400);
+      }
+      if (input.brief !== undefined && (typeof input.brief !== 'string' || !input.brief.trim() || input.brief.length > 8000)) {
+        return response({ error: 'invalid_session_request', field: 'brief', detail: 'invalid_brief' }, 400);
       }
       // Tier resolves through the EXISTING model-routing table inside fleet
       // plan (configured tier membership filters eligible engine/profile
@@ -933,7 +960,7 @@ export class SessionControlService {
         return response({ error: 'interactive_starts_empty' }, 400);
       }
       if (mode === 'headless' && input.brief !== undefined && !input.brief.trim()) {
-        return response({ error: 'invalid_session_request' }, 400);
+        return response({ error: 'invalid_session_request', field: 'brief', detail: 'empty_brief' }, 400);
       }
       const actor = caller.actor || caller.machineId || 'admin';
       return this.transaction(() => {

@@ -395,7 +395,7 @@ mount (same helper shape, narrow operator-token route scope, no global
 hub sessions list [--state running] [--limit 50]
 hub sessions start --workspace demo|/absolute/repo/path [--engine opencode] [--machine hetzner]
     [--cwd demo/project] [--brief-file goal.txt | --prompt "..." | --interactive] [--name friendly] [--key k1]
-    [--intake-task TASK_ID] [--wait] [--timeout 300] [--interval 5]
+    [--intake-task-id TASK_ID] [--wait] [--timeout 300] [--interval 5]
 hub sessions send <session-id|name> --body-file prompt.txt [--key k2] [--wait ...]
 hub sessions capture <session-id|name> [--max-bytes 65536] [--screen] [--key k3] [--wait ...]
 hub sessions stop <session-id|name> [--key k4] [--wait ...]

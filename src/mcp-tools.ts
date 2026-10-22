@@ -16,7 +16,7 @@ for (const [name, mode] of [['start_agent', 'headless'], ['start_session', 'inte
 }
 tool('sessions_list', 'GET', '/api/sessions', 'List sessions; query view=lifecycle gives grouped lifecycle; state, limit, cursor filter.', ['sessions', 'sessions list']);
 tool('sessions_tree', 'GET', '/api/sessions/tree', 'Session requester/parent tree.', ['sessions tree']);
-tool('sessions_start', 'POST', '/api/sessions', 'Queue a session. payload: workspace, engine, machine, mode (headless/interactive), brief, name, parent_id, intake_task_id, key. A start linked to an intake task (intake_task_id) is refused with acceptance_criteria_required when that task has empty acceptance criteria. Admission and quotas remain enforced.', ['sessions start', 'sessions override', 'sessions engine-override']);
+tool('sessions_start', 'POST', '/api/sessions', 'Queue a session. payload: workspace, engine, machine, mode (headless/interactive), brief, name, parent_id, intake_task_id, key. Non-interactive (headless) starts REQUIRE intake_task_id (alias intake_task accepted) or Hub returns intake_task_id_required. Linked starts with empty acceptance criteria return acceptance_criteria_required. Admission and quotas remain enforced.', ['sessions start', 'sessions override', 'sessions engine-override']);
 tool('sessions_show', 'GET', '/api/sessions/{id}', 'Session binding and observed state.', ['sessions show']);
 tool('sessions_commands', 'GET', '/api/sessions/{id}/commands', 'Read command results; recorded/transported is not acknowledged execution.', ['sessions commands']);
 for (const action of ['send', 'capture', 'stop']) tool(`sessions_${action}`, 'POST', `/api/sessions/{id}/${action}`,
@@ -129,6 +129,13 @@ export function toolRequest(origin: string, name: string, args: unknown, authori
   }
   if (a.payload !== undefined && (!a.payload || typeof a.payload !== 'object' || Array.isArray(a.payload))) throw new Error('invalid_payload');
   let payload = a.payload || {};
+  // sessions_start: normalize CLI-shaped intake_task → API intake_task_id before the Hub gate.
+  if (route.name === 'sessions_start' && payload && typeof payload === 'object' && !Array.isArray(payload)
+      && Object.prototype.hasOwnProperty.call(payload, 'intake_task')) {
+    if (payload.intake_task_id !== undefined && payload.intake_task_id !== payload.intake_task) throw new Error('intake_task_conflicts');
+    payload = { ...payload, intake_task_id: payload.intake_task };
+    delete (payload as any).intake_task;
+  }
   const fixedMode = route.name === 'start_session' ? 'interactive' : ['start_agent', 'plan_agent'].includes(route.name) ? 'headless' : null;
   if (fixedMode) {
     if (payload.mode !== undefined && payload.mode !== fixedMode) throw new Error('invalid_launch_mode');

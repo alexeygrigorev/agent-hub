@@ -709,12 +709,21 @@ export class IntakeService {
       task.status = 'in_progress';
       task.history.push({ id: crypto.randomUUID(), kind: 'continuation', actor: p.actor, captured_at: now, evidence: 'recorded_active_not_started', authority: 'untrusted_task_data' });
     } else if (match[2]) {
-      keys(b, ['key', 'expected_version', 'event', 'note']);
+      keys(b, ['key', 'expected_version', 'event', 'note', 'text']);
       // Keep the original event envelope and the documented MCP note shorthand
       // on the same validation/authorization path. Never silently pick one.
+      // Also accept note as a UTF-8 string and top-level text as note text so
+      // common agent payloads do not flake as opaque invalid_object.
       if ('note' in b && 'event' in b) throw new IntakeError('invalid_field', 400, 'note');
-      let event = object('note' in b ? b.note : b.event);
-      if ('note' in b) {
+      if ('text' in b && ('note' in b || 'event' in b)) throw new IntakeError('invalid_field', 400, 'text');
+      if (!('note' in b) && !('event' in b) && !('text' in b)) fail('event_or_note_required');
+      let rawNoteOrEvent: any = 'note' in b ? b.note : ('event' in b ? b.event : { text: b.text });
+      if (typeof rawNoteOrEvent === 'string') {
+        if (!('note' in b) && !('text' in b)) fail('invalid_object');
+        rawNoteOrEvent = { text: rawNoteOrEvent };
+      }
+      let event = object(rawNoteOrEvent);
+      if ('note' in b || 'text' in b) {
         keys(event, ['text', 'source']);
         event = { ...event, kind: 'note' };
       }

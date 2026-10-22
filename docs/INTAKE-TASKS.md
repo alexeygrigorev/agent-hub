@@ -166,7 +166,7 @@ projected in every task view (`payload_data.acceptance_criteria`).
   server-side before any Fleet placement/session row, and is re-checked after
   the start round-trip.
 - `POST /api/sessions` with `intake_task_id` (CLI `hub sessions start
-  --intake-task ID`) runs the same server-side gate before placement: empty
+  --intake-task-id ID`) runs the same server-side gate before placement: empty
   criteria → `400 acceptance_criteria_required`, unknown task id → `404
   unknown_intake_task`. `hub intake assign` passes the task id through, so the
   canonical start path is covered by both gates.

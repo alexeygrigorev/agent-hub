@@ -81,12 +81,19 @@ class TestSessionControlCli(unittest.TestCase):
         with patch.object(session_control, 'read_file', return_value='synthetic goal'), \
                 patch.object(session_control, 'request', return_value={}) as transport:
             session_control.execute(self.parse('start', '--workspace', 'demo', '--brief-file', 'goal.txt',
-                                               '--key', 'k', '--intake-task', 'task-1'))
+                                               '--key', 'k', '--intake-task-id', 'task-1'))
         self.assertEqual(transport.call_args.args[2]['intake_task_id'], 'task-1')
         with patch.object(session_control, 'read_file', return_value='synthetic goal'), \
                 patch.object(session_control, 'request', return_value={}) as transport:
             session_control.execute(self.parse('start', '--workspace', 'demo', '--brief-file', 'goal.txt', '--key', 'k'))
         self.assertNotIn('intake_task_id', transport.call_args.args[2])
+
+    def test_start_accepts_deprecated_intake_task_alias(self):
+        with patch.object(session_control, 'read_file', return_value='synthetic goal'), \
+                patch.object(session_control, 'request', return_value={}) as transport:
+            session_control.execute(self.parse('start', '--workspace', 'demo', '--brief-file', 'goal.txt',
+                                               '--key', 'k-alias', '--intake-task', 'task-alias'))
+        self.assertEqual(transport.call_args.args[2]['intake_task_id'], 'task-alias')
 
     def test_send_capture_stop_payloads(self):
         with patch.object(session_control, 'read_file', return_value='prompt'), \

@@ -286,6 +286,18 @@ describe('private durable intake HTTP/SQLite', () => {
     expect((await ok('/tasks/' + task.id)).task.control.version).toBe(3);
   });
 
+  it('accepts note string and top-level text shorthands; missing note/event is event_or_note_required', async () => {
+    const task = (await create()).task;
+    const path = '/tasks/' + task.id + '/events';
+    const asString = await ok(path, { key: 'note-string', expected_version: 1, note: 'String shorthand note' });
+    expect(asString.task.payload_data.history.at(-1)).toMatchObject({ kind: 'note', text: 'String shorthand note' });
+    const asText = await ok(path, { key: 'note-text', expected_version: 2, text: 'Top-level text note' });
+    expect(asText.task.payload_data.history.at(-1)).toMatchObject({ kind: 'note', text: 'Top-level text note' });
+    const missing = await call(path, { key: 'note-missing', expected_version: 3 });
+    expect(missing.status).toBe(400);
+    expect(await missing.json()).toEqual({ error: 'event_or_note_required' });
+  });
+
   it('accepts concise notes and session aliases without relaxing link checks', async () => {
     const { task } = await create();
     const note = await append(task.id, 1, { kind: 'note', text: 'Concise note' });

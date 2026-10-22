@@ -33,7 +33,7 @@ def http_error(exc, method, payload):
     if exc.code == 409 and method == 'GET':
         return StaleSnapshot('Snapshot changed')
     # Never echo arbitrary error bodies, tokens, URLs or terminal controls.
-    allowed = {'version_conflict', 'idempotency_conflict', 'invalid_event_kind', 'invalid_object',
+    allowed = {'version_conflict', 'idempotency_conflict', 'invalid_event_kind', 'invalid_object', 'event_or_note_required',
                'invalid_field', 'unknown_field', 'invalid_source', 'not_found', 'forbidden',
                'invalid_status', 'empty_update', 'active_assignment_exists', 'history_capacity',
                'task_capacity', 'assignment_unavailable', 'invalid_identifier', 'unauthorized',
