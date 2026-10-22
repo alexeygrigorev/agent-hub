@@ -132,3 +132,74 @@ class SessionHostTests(unittest.TestCase):
                 call_kw = dispatcher.call_args.kwargs
                 self.assertEqual(call_kw.get('journal_dir'), directory)
 
+    def _write_settings(self, path, workspaces, mtime):
+        import json as _json
+        import os as _os
+        pathlib.Path(path).write_text(_json.dumps({
+            "version": 1, "subscriptions": [], "workspaces": workspaces,
+        }))
+        # Explicit mtime so reload detection is deterministic on any fs granularity.
+        _os.utime(path, (mtime, mtime))
+
+    def test_reload_applies_new_workspaces_without_restart(self):
+        import json as _json
+        with tempfile.TemporaryDirectory() as directory:
+            settings_file = str(pathlib.Path(directory) / "subscriptions.json")
+            self._write_settings(settings_file, {"proj": directory}, 1792655000.0)
+            first, mtime = session_host.maybe_reload_fleet_settings(settings_file, None)
+            self.assertIsInstance(first, dict)
+            self.assertIn("proj", first["workspaces"])
+            # Same mtime: no reload.
+            again, same_mtime = session_host.maybe_reload_fleet_settings(settings_file, mtime)
+            self.assertIsNone(again)
+            self.assertEqual(same_mtime, mtime)
+            # Operator adds a repo: reload picks it up.
+            self._write_settings(settings_file, {"proj": directory, "newrepo": directory}, 1792655100.0)
+            reloaded, new_mtime = session_host.maybe_reload_fleet_settings(settings_file, mtime)
+            self.assertIsNotNone(reloaded)
+            self.assertIn("newrepo", reloaded["workspaces"])
+            self.assertNotEqual(new_mtime, mtime)
+
+    def test_reload_invalid_edit_fails_closed_on_last_good(self):
+        import os as _os
+        with tempfile.TemporaryDirectory() as directory:
+            settings_file = str(pathlib.Path(directory) / "subscriptions.json")
+            self._write_settings(settings_file, {"proj": directory}, 1792655000.0)
+            _, mtime = session_host.maybe_reload_fleet_settings(settings_file, None)
+            pathlib.Path(settings_file).write_text("{broken json")
+            _os.utime(settings_file, (1792655100.0, 1792655100.0))
+            kept, attempted = session_host.maybe_reload_fleet_settings(settings_file, mtime)
+            self.assertIsNone(kept)
+            self.assertNotEqual(attempted, mtime)
+            # No spam on the next loop while the file is still broken.
+            kept_again, _ = session_host.maybe_reload_fleet_settings(settings_file, attempted)
+            self.assertIsNone(kept_again)
+
+    def test_reload_missing_file_keeps_running(self):
+        missing = str(pathlib.Path(tempfile.gettempdir()) / "hub-no-such-settings-1792655000.json")
+        kept, mtime = session_host.maybe_reload_fleet_settings(missing, None)
+        self.assertIsNone(kept)
+        self.assertIsNone(mtime)
+        kept, mtime = session_host.maybe_reload_fleet_settings(None, 1234.0)
+        self.assertIsNone(kept)
+        self.assertEqual(mtime, 1234.0)
+
+    def test_run_swaps_dispatcher_settings_on_edit(self):
+        import json as _json
+        with tempfile.TemporaryDirectory() as directory:
+            settings_file = str(pathlib.Path(directory) / "subscriptions.json")
+            self._write_settings(settings_file, {"proj": directory}, 1792655000.0)
+            v1 = {"version": 1, "subscriptions": [], "workspaces": {"proj": directory}}
+            v2 = {"version": 1, "subscriptions": [], "workspaces": {"proj": directory, "newrepo": directory}}
+            with patch.object(session_host.config, 'load_config', return_value={'machine_id': 'test-machine', 'access_token': 'synthetic'}), \
+                 patch.object(session_host.fleet, 'load_settings', side_effect=[v1, v2]) as load_settings, \
+                 patch.object(session_host, 'fleet_settings_mtime', side_effect=[1000.0, 2000.0]) as mtimes, \
+                 patch.object(session_host, 'qualify_sender_binding', return_value=SimpleNamespace(session_id='test-native', workspace=str(pathlib.Path.cwd()))), \
+                 patch.object(session_host.fleet, 'Dispatcher') as dispatcher, \
+                 patch.object(session_host, 'RoleConsumer'), \
+                 patch.object(session_host.session_control, 'execute'):
+                session_host.run(settings_file, directory, cycles=1)
+                instance = dispatcher.return_value
+                self.assertEqual(instance.settings, v2)
+                self.assertEqual(load_settings.call_count, 2)
+

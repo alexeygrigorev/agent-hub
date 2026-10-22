@@ -213,6 +213,39 @@ def get_cleanup_roots(settings: Optional[dict]) -> List[str]:
     return []
 
 
+def fleet_settings_mtime(settings_path) -> Optional[float]:
+    """Best-effort mtime of the operator fleet settings file (None when unreadable)."""
+    if not settings_path:
+        return None
+    try:
+        return Path(settings_path).stat().st_mtime
+    except OSError:
+        return None
+
+
+def maybe_reload_fleet_settings(settings_path, last_mtime: Optional[float]):
+    """Reload operator fleet settings when the file changed since last load.
+
+    Returns (settings_or_None, mtime). None means "keep running with the
+    current settings": unchanged file, missing file, or an invalid edit
+    (invalid edits fail closed on the last good settings and are retried
+    after the next edit; the attempt mtime is remembered so a broken file
+    does not log on every loop iteration). Never raises.
+    """
+    current = fleet_settings_mtime(settings_path)
+    if current is None or (last_mtime is not None and current == last_mtime):
+        return None, last_mtime
+    try:
+        reloaded = fleet.load_settings(settings_path)
+    except Exception as error:
+        print(json.dumps({'event': 'settings_reload_error', 'type': type(error).__name__}), flush=True)
+        return None, current
+    if not isinstance(reloaded, dict):
+        print(json.dumps({'event': 'settings_reload_error', 'type': 'invalid_settings'}), flush=True)
+        return None, current
+    return reloaded, current
+
+
 class RoleConsumer:
     """Explicitly enabled role job consumer hook for session host.
 
@@ -463,8 +496,22 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         role_consumer_thread: Optional[threading.Thread] = None
         next_fleet = 0
         count = 0
+        # Operator fleet settings (workspaces map, workspace_roots,
+        # subscriptions, launcher) are re-read when the file changes, so a
+        # newly added repo becomes placeable without a host restart. The
+        # re-registration in the next fleet cycle then advertises the fresh
+        # workspace list to the Hub. Invalid edits fail closed on the last
+        # good settings (see maybe_reload_fleet_settings).
+        settings_mtime = fleet_settings_mtime(settings_path)
         try:
             while not stop.is_set() and (cycles is None or count < cycles):
+                reloaded, settings_mtime = maybe_reload_fleet_settings(settings_path, settings_mtime)
+                if reloaded is not None:
+                    settings = reloaded
+                    dispatcher.settings = reloaded
+                    native = reloaded.get('aplexer_bin', 'aplexer')
+                    roots = get_cleanup_roots(reloaded)
+                    print(json.dumps({'event': 'settings_reloaded'}), flush=True)
                 if time.monotonic() >= next_fleet:
                     try:
                         results = dispatcher.once()

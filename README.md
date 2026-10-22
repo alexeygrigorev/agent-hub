@@ -175,6 +175,26 @@ Run `TMPDIR="$HOME/tmp-root" scripts/test-full-local.sh` on Hetzner before a pus
 
 For real lifecycle tests, pass an **exact host-configured workspace and canonical Hub engine**. A local aplexer alias is not automatically a Hub route. For example, Hetzner currently maps local `flash` to Antigravity; use `--engine antigravity --workspace /home/alexey/git/agent-hub` when that route has capacity. `capability_unavailable` can mean an unknown workspace label. A configured absolute workspace path can be used directly. `account_unknown` (including failed quota authentication), `account_capacity`, stale machine records and unqualified execution backends continue to hold launches. Refresh the plan and quota rather than increasing limits or controlling another session.
 
+`hub sessions start` returning `409 no_eligible_route` with
+`capability_unavailable, machine_unavailable, provider_disabled` and no
+`--engine` means placement examined every fleet route and each failed a
+different gate (seen 2026-10-22 for normal Hetzner coding workspaces such as
+`/home/alexey/git/ai-shipping-labs`). Read the triple per route, not as one
+cause: `provider_disabled` marks routes on engines the model policy disables
+(Claude/Grok — preferred engines need no override); `machine_unavailable`
+marks drained or stale-checkin machines (the pre-re-enrollment `hetzner`
+record last checked in 2026-10-15 is one — drain or delete it once the live
+`urgent-hetzner` record is confirmed); `capability_unavailable` on the live
+routes means the host's advertised workspace list does not cover the request.
+The host advertises its operator `workspaces` map plus `workspace_roots`
+(this covers `/home/alexey/git`, so every normal repo under it is placeable)
+and re-registers every fleet cycle, picking up operator settings edits without
+a restart. If the running host release predates roots advertisement, roll it
+forward first; the remaining engine with live quota then places without
+`--engine` (currently Antigravity on Hetzner; the shared `urgent-muse`
+opencode account is saturated by observed native sessions, so it honestly
+reports `account_capacity`). `allow_paid` stays false; no secrets are involved.
+
 To verify both clients against **one new session**, build the CLI and run the opt-in driver:
 
 ```bash
