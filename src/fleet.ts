@@ -183,10 +183,49 @@ function workspaceCapable(capsWorkspaces: any, request: any): boolean {
   for (const w of capsWorkspaces) {
     if (typeof w !== 'string' || !w) continue;
     if (w === request) return true;
-    const prefix = w.endsWith('/') ? w : w + '/';
+    // Windows roots use backslash separators; prefix matching must follow
+    // the advertised separator style, never a POSIX-only assumption.
+    const sep = w.includes('\\') ? '\\' : '/';
+    const prefix = w.endsWith('/') || w.endsWith('\\') ? w : w + sep;
     if (request.startsWith(prefix)) return true;
   }
   return false;
+}
+
+/** Resolve a bare workspace label via an advertised absolute root.
+ *
+ * Hosts advertise `workspace_roots` as absolute prefixes (e.g.
+ * `/home/alexey/git`) while callers use bare labels (e.g.
+ * `dataops-knowledge`). Exact/prefix matching alone 409s that class with
+ * `capability_unavailable` and pressures operators into per-repo
+ * `subscriptions.json` map edits — the footgun. Instead, when the request
+ * is a bare label that is not already capable, rewrite it to
+ * `{advertised_absolute_root}/{label}` using the first advertised absolute
+ * entry (in advertised order) whose candidate is a bounded canonical
+ * absolute that passes `workspaceCapable`. Absolute requests are never
+ * rewritten. When no absolute root yields a capable candidate, the request
+ * is returned unchanged so placement still fails closed with
+ * `capability_unavailable`.
+ *
+ * The rewritten absolute is what the host `resolve_workspace_path`
+ * accepts (identity mapping under configured roots); the host's
+ * realpath/CWD confinement stays authoritative. */
+export function resolveLabelUnderRoots(capsWorkspaces: any, request: any): string {
+  if (typeof request !== 'string' || !request) return request;
+  if (!LABEL.test(request)) return request;
+  if (workspaceCapable(capsWorkspaces, request)) return request;
+  if (!Array.isArray(capsWorkspaces)) return request;
+  for (const w of capsWorkspaces) {
+    if (typeof w !== 'string' || !w) continue;
+    if (!absoluteWorkspaceOk(w)) continue;
+    const sep = w.includes('\\') ? '\\' : '/';
+    const base = w.endsWith('/') || w.endsWith('\\') ? w.slice(0, -1) : w;
+    const candidate = base + sep + request;
+    if (candidate.length > 512) continue;
+    if (!absoluteWorkspaceOk(candidate)) continue;
+    if (workspaceCapable(capsWorkspaces, candidate)) return candidate;
+  }
+  return request;
 }
 
 export class FleetService {
@@ -364,9 +403,14 @@ export class FleetService {
       if (disabledEngines().has(route.engine)) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'provider_disabled' }); continue; }
       const machine: any = this.sql.exec('SELECT * FROM machines WHERE id = ?', route.machine_id).toArray()[0];
       const account = accounts.get(route.account); const caps = parsed(machine?.capabilities); const hb = parsed(machine?.last_heartbeat);
+      // Bare labels resolve per-route via that machine's advertised absolute
+      // roots (`{root}/{label}`); absolutes and already-capable labels pass
+      // through unchanged. Each candidate records its effective workspace so
+      // the winner's normalized absolute is what gets stored and offered.
+      const effectiveWorkspace = resolveLabelUnderRoots(caps.workspaces, request.workspace);
       let reason = '';
       if (!machine || machine.drained || !fresh(effectiveCheckin(machine.id, machine.last_checkin_at), this.now(), 180000)) reason = 'machine_unavailable';
-      else if (!Array.isArray(caps.engines) || !caps.engines.includes(route.engine) || !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode) || !workspaceCapable(caps.workspaces, request.workspace)) {
+      else if (!Array.isArray(caps.engines) || !caps.engines.includes(route.engine) || !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode) || !workspaceCapable(caps.workspaces, effectiveWorkspace)) {
         const engineMissing = !Array.isArray(caps.engines) || !caps.engines.includes(route.engine);
         // A route for an engine no live host advertises anymore is stale
         // registry debt, not a workspace/mode defect — but only when the live
@@ -388,9 +432,16 @@ export class FleetService {
       if (limit && pending + observedSessions >= limit.max_agents) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'machine_capacity' }); continue; }
 
       const score = (account!.remaining_percent! / 100) / (1 + hb.load[0] / caps.cpu_count + pending);
-      candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile, score });
+      candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile, score, workspace: effectiveWorkspace });
     }
     candidates.sort((a, b) => b.score - a.score || a.machine.localeCompare(b.machine) || a.engine.localeCompare(b.engine));
+    // The stored intent carries the winner's normalized workspace: a bare
+    // label that resolved under the selected host's root is persisted and
+    // offered as the absolute path the host accepts. Labels that were
+    // already capable keep their exact legacy meaning (host map keys).
+    if (candidates[0] && typeof candidates[0].workspace === 'string' && candidates[0].workspace !== request.workspace) {
+      request.workspace = candidates[0].workspace;
+    }
     return { request, selected: candidates[0] || null, candidates, rejected };
   }
 
@@ -434,13 +485,26 @@ export class FleetService {
           const parent: any = this.sql.exec('SELECT actor, state FROM fleet_launches WHERE id = ?', bound.parent_id).toArray()[0];
           if (!parent || parent.actor !== row.actor || !['starting', 'running'].includes(parent.state)) continue;
         }
+        // A pre-fix queued row may carry a bare label; the re-plan above
+        // normalizes it to the winner's absolute path. Re-check admission
+        // against the normalized workspace (what the host will execute),
+        // never the stale alias alone.
+        const normalizedWorkspace = (plan as any).request?.workspace ?? bound.workspace;
         try {
-          const hold = this.admission.heldReason({ request_json: row.request_json, workspace: bound.workspace, id: row.id });
+          const hold = this.admission.heldReason({ request_json: row.request_json, workspace: normalizedWorkspace, id: row.id });
           if (hold) continue;
         } catch { continue; }
         const selected = (plan as any).selected;
-        const written: any = this.sql.exec("UPDATE fleet_launches SET machine_id = ?, engine = ?, account = ?, profile = ?, state = 'offered', updated_at = ? WHERE id = ? AND state = 'queued'",
-          selected.machine, selected.engine, selected.account, selected.profile ?? null, new Date(this.now()).toISOString(), row.id);
+        // Persist the normalized workspace alongside placement so the offer
+        // carries the absolute path the host accepts (pre-fix bare-label
+        // parks promote with the rewritten workspace, not the stale alias).
+        let patchedJson: string = row.request_json;
+        try {
+          const patched = { ...bound, workspace: normalizedWorkspace };
+          patchedJson = JSON.stringify(patched);
+        } catch { /* keep the stored intent on stringify failure */ }
+        const written: any = this.sql.exec("UPDATE fleet_launches SET machine_id = ?, engine = ?, account = ?, profile = ?, workspace = ?, request_json = ?, state = 'offered', updated_at = ? WHERE id = ? AND state = 'queued'",
+          selected.machine, selected.engine, selected.account, selected.profile ?? null, normalizedWorkspace, patchedJson, new Date(this.now()).toISOString(), row.id);
         if (written && (written as any).rowsWritten === 1) promoted++;
       }
     } catch { /* drain is best-effort inside the ambient txn */ }
@@ -463,9 +527,22 @@ export class FleetService {
       if ('error' in parsed) return result({ error: parsed.error }, 400);
       if (parsed.access.mode === 'edit' && !input.approved_action?.trim()) return result({ error: 'approved_action_required' }, 400);
       const bound = { ...plan.request, access: parsed.access };
+      // Bare-label alias admission: the normalized absolute is what the
+      // host executes and always gates. When the operator additionally
+      // configured a claim policy for the requested alias itself, that
+      // alias check must also pass (fail closed against policy bypass).
+      // Unmapped aliases impose nothing beyond the normalized absolute.
+      const requestedWorkspace = typeof input?.workspace === 'string' ? input.workspace : plan.request.workspace;
+      const rewritten = requestedWorkspace !== plan.request.workspace;
+      const aliasPolicy = rewritten ? this.admission.policy(requestedWorkspace) : null;
+      const aliasConfigured = !!aliasPolicy && (!!aliasPolicy.project || aliasPolicy.require_claim);
       if (preview) {
         const preview = this.admission.evaluate(caller, plan.request.workspace, parsed.access, 'enqueue');
         if (!preview.ok) return result({ error: preview.error, access: parsed.access.mode }, preview.status);
+        if (aliasConfigured) {
+          const alias = this.admission.evaluate(caller, requestedWorkspace, parsed.access, 'enqueue');
+          if (!alias.ok) return result({ error: alias.error, access: parsed.access.mode }, alias.status);
+        }
         return result({ ...plan, access: parsed.access.mode });
       }
       if (!label(input.idempotency_key)) return result({ error: 'idempotency_key_required' }, 400);
@@ -493,6 +570,13 @@ export class FleetService {
       }
       const admitted = this.admission.evaluate(caller, plan.request.workspace, parsed.access, 'reserve', { authority: expectedAuthority });
       if (!admitted.ok) return result({ error: admitted.error, access: parsed.access.mode }, admitted.status);
+      if (aliasConfigured) {
+        const alias = this.admission.evaluate(caller, requestedWorkspace, parsed.access, 'reserve', { authority: expectedAuthority });
+        if (!alias.ok) return result({ error: alias.error, access: parsed.access.mode }, alias.status);
+        if (JSON.stringify((alias as any).authority ?? null) !== JSON.stringify((admitted as any).authority ?? null)) {
+          return result({ error: 'claim_authority_changed', access: parsed.access.mode }, 409);
+        }
+      }
       if (!plan.selected) {
         // Capacity-only failure parks a waitable queued intent (202) that the
         // drain auto-places when a slot frees. Any other reject class stays a

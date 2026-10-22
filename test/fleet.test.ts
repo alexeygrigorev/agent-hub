@@ -463,6 +463,80 @@ describe('absolute workspace identifiers alongside labels', () => {
   }));
 });
 
+describe('bare workspace labels resolve under advertised absolute roots', () => {
+  const ROOT = '/home/alexey/git';
+  const LABEL = 'dataops-knowledge';
+  const RESOLVED = ROOT + '/' + LABEL;
+  function advertiseRoot(sql: any, machine: string, workspaces: string[]) {
+    const caps = { engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces, cpu_count: 8 };
+    sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify(caps), machine);
+  }
+  it('treats a bare label under an advertised root as capable and stores the absolute path', async () => fixture(async (s, sql) => {
+    await configure(s);
+    advertiseRoot(sql, 'hetzner', [ROOT]);
+    const plan: any = s.plan(intent({ workspace: LABEL }));
+    expect(plan.selected?.machine).toBe('hetzner');
+    expect(plan.request.workspace).toBe(RESOLVED);
+    expect(plan.rejected.some((r: any) => r.machine === 'hetzner' && r.reason === 'capability_unavailable')).toBe(false);
+    const launch: any = await (await s.handle(request('/launches', intent({ workspace: LABEL })), admin)).json();
+    expect(launch.machine).toBe('hetzner');
+    const row: any = sql.exec('SELECT workspace, request_json FROM fleet_launches WHERE id = ?', launch.id).one();
+    expect(row.workspace).toBe(RESOLVED);
+    expect(JSON.parse(row.request_json).workspace).toBe(RESOLVED);
+  }));
+  it('leaves absolute workspace requests unchanged', async () => fixture(async (s) => {
+    await configure(s);
+    const plan: any = s.plan(intent({ workspace: RESOLVED }));
+    // Fixture machines advertise only the 'demo' label: the absolute path
+    // stays exactly as requested and fails closed without an advertised root.
+    expect(plan.request.workspace).toBe(RESOLVED);
+    expect(plan.selected).toBeNull();
+  }));
+  it('resolves an absolute path under an advertised root without rewriting', async () => fixture(async (s, sql) => {
+    await configure(s);
+    advertiseRoot(sql, 'hetzner', [ROOT]);
+    const plan: any = s.plan(intent({ workspace: RESOLVED }));
+    expect(plan.selected?.machine).toBe('hetzner');
+    expect(plan.request.workspace).toBe(RESOLVED);
+  }));
+  it('fails closed with capability_unavailable when no absolute root is advertised', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const plan: any = s.plan(intent({ workspace: 'unknown-label' }));
+    expect(plan.selected).toBeNull();
+    expect(plan.rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'capability_unavailable' });
+    const res = await s.handle(request('/launches', intent({ workspace: 'unknown-label' })), admin);
+    expect(res.status).toBe(409);
+    const body: any = await res.json();
+    expect(body.error).toBe('no_eligible_route');
+    expect(sql.exec('SELECT COUNT(*) n FROM fleet_launches').one().n).toBe(0);
+  }));
+  it('keeps an explicitly mapped label exact and never rewrites it', async () => fixture(async (s, sql) => {
+    await configure(s);
+    advertiseRoot(sql, 'hetzner', [LABEL, ROOT]);
+    const plan: any = s.plan(intent({ workspace: LABEL }));
+    expect(plan.selected?.machine).toBe('hetzner');
+    expect(plan.request.workspace).toBe(LABEL);
+  }));
+  it('capacity-only queue still works with incidental slugs alongside label resolution', async () => fixture(async (s, sql) => {
+    const shared = registry(true);
+    expect((await s.handle(request('/accounts', shared, 'PUT'), admin)).status).toBe(200);
+    advertiseRoot(sql, 'hetzner', [ROOT]);
+    // Fill the single shared slot via the resolved label.
+    const first: any = await (await s.handle(request('/launches', intent({ workspace: LABEL, machine: 'hetzner' })), admin)).json();
+    expect(first.state).toBe('offered');
+    // Drain win35 so it reports incidental machine_unavailable (checked
+    // before workspace capability) beside hetzner's account_capacity.
+    sql.exec('UPDATE machines SET drained = 1 WHERE id = ?', 'win35');
+    const queued = await s.handle(request('/launches', intent({ workspace: LABEL, idempotency_key: 'label-capacity-queue' })), admin);
+    expect(queued.status).toBe(202);
+    const body: any = await queued.json();
+    expect(body.state).toBe('queued');
+    expect(body.rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'account_capacity' });
+    expect(body.rejected).toContainEqual({ machine: 'win35', engine: 'codex', reason: 'machine_unavailable' });
+    expect(body.rejected.some((r: any) => r.reason === 'capability_unavailable')).toBe(false);
+  }));
+});
+
 describe('imported session lifecycle and non-resurrection in fleet catalog', () => {
   it('prevents late live-catalog snapshots from resurrecting stopped same-incarnation sessions while allowing new UUID tag reuse', async () => fixture(async (s, sql) => {
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
