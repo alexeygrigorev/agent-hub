@@ -130,6 +130,21 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertIn('account_capacity, capability_unavailable', str(raised.exception))
         self.assertNotIn('private', str(raised.exception))
 
+    def test_disabled_provider_hold_has_actionable_local_guidance(self):
+        import os
+        import urllib.error
+        payload = {'id': 'held-opus', 'state': 'held', 'hold': {'error': 'provider_disabled', 'detail': 'private server body'}}
+        failure = urllib.error.HTTPError('https://hub.test/api/sessions', 409, 'held', {}, io.BytesIO(json.dumps(payload).encode()))
+        with patch.object(session_control.config, 'load_config', return_value={'base_url': 'https://hub.test'}), \
+                patch.dict(os.environ, {'HUB_TOKEN': 'fixture-env-token'}), \
+                patch.object(session_control.api, 'safe_http_json', side_effect=failure):
+            with self.assertRaises(ValueError) as raised:
+                session_control.request('POST', '/api/sessions', {})
+        self.assertIn('provider_disabled', str(raised.exception))
+        self.assertIn('choose an enabled engine/model', str(raised.exception))
+        self.assertIn('fresh host route with verified quota', str(raised.exception))
+        self.assertNotIn('private server body', str(raised.exception))
+
     def test_request_errors_hide_server_bodies(self):
         import os
         import urllib.error

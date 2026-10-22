@@ -68,6 +68,45 @@ describe('generic accounts and launch placement', () => {
     expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).selected).toBeNull();
     expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'tier_unavailable' });
   }));
+  it('resolves Astra to live Codex accounts, preserving pins, tiers and replay', async () => fixture(async (s, sql) => {
+    await configure(s);
+    sql.exec("UPDATE machines SET last_checkin_at = ? WHERE id = 'win35'", iso(-180001));
+    const input = intent({ engine: 'astra', tier: 'deep', access: { mode: 'read' } });
+    const plan = s.plan(input);
+    expect(plan.selected).toMatchObject({ machine: 'hetzner', engine: 'codex', account: 'shared-codex' });
+    expect(plan.request.engine).toBe('astra');
+    expect(s.plan({ ...input, tier: 'quick' }).selected).toBeNull();
+    expect(s.plan({ ...input, machine: 'win35' }).selected).toBeNull();
+    expect(s.plan({ ...input, account: 'desktop-codex' }).selected).toBeNull();
+    const first = s.reserve(input, admin);
+    expect(first.status).toBe(201);
+    expect(first.value.engine).toBe('codex');
+    expect(s.reserve(input, admin).value).toMatchObject({ id: first.value.id, replay: true });
+    expect(s.reserve({ ...input, engine: 'codex' }, admin).status).toBe(409);
+    sql.exec("UPDATE fleet_accounts SET provider='zai' WHERE label='shared-codex'");
+    expect(s.plan(input).selected).toBeNull();
+  }));
+  it('resolves Argon through both policy engine alternatives with the correct account', async () => fixture(async (s, sql) => {
+    await configure(s);
+    sql.exec("UPDATE fleet_accounts SET provider='gemini' WHERE label='shared-codex'");
+    const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
+    for (const engine of ['antigravity', 'gemini']) {
+      sql.exec("UPDATE fleet_routes SET engine=? WHERE machine_id='hetzner'", engine);
+      sql.exec("UPDATE machines SET capabilities=? WHERE id='hetzner'", JSON.stringify({ engines: [engine], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
+      await s.handle(request('/subscriptions', { subscriptions: [{ service: 'gemini', account: 'shared-codex', plan: 'pro', quota }] }, 'PUT'), host('hetzner'));
+      expect(s.plan(intent({ engine: 'argon' })).selected).toMatchObject({ machine: 'hetzner', engine, account: 'shared-codex' });
+    }
+  }));
+  it('refuses Opus and Claude with policy guidance even without a live Claude route', async () => fixture(async (s, sql) => {
+    await configure(s);
+    for (const engine of ['opus', 'claude']) {
+      const result = s.reserve(intent({ engine, machine: 'hetzner', access: { mode: 'read' } }), admin);
+      expect(result.status).toBe(409);
+      expect(result.value.error).toBe('provider_disabled');
+      expect(result.value.detail).toContain('register a fresh host route');
+    }
+    expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches').one().n).toBe(0);
+  }));
   it('treats a null tier from session control as an omitted tier', async () => fixture(async (s) => {
     await configure(s);
     expect(s.plan(intent({ tier: null })).selected).toBeTruthy();

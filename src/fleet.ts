@@ -294,6 +294,9 @@ export class FleetService {
       const members: string[] = (policy.tiers as any)[tier] || [];
       tierModels = policy.models.filter(m => members.includes(m.id));
     }
+    // Model ids are policy selectors, not native executable names. Keep the
+    // caller's selector in the canonical intent for idempotency.
+    const overrideModels = policy.models.filter(m => m.id === input.engine);
     const request: any = { mode: input.mode || 'headless', machine: input.machine || null, engine: input.engine || null, workspace: input.workspace, cwd: input.cwd ?? null, prompt: input.prompt || '', parent_id: input.parent_id || null, summary: input.summary || (input.mode === 'interactive' ? 'Interactive session' : 'Agent task') };
     if (input.account !== undefined) request.account = input.account;
     if (input.approved_action !== undefined) request.approved_action = input.approved_action;
@@ -302,13 +305,19 @@ export class FleetService {
     const accounts = new Map(this.sql.exec('SELECT * FROM fleet_accounts').toArray().map(a => [a.label, this.accountStatus(a)]));
     const definitions = new Map(this.sql.exec('SELECT * FROM fleet_accounts').toArray().map(a => [a.label, a]));
     for (const route of this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray() as any[]) {
-      if ((request.account && route.account !== request.account) || (request.machine && route.machine_id !== request.machine) || (request.engine && route.engine !== request.engine)) continue;
+      if ((request.account && route.account !== request.account) || (request.machine && route.machine_id !== request.machine) || (request.engine && !overrideModels.length && route.engine !== request.engine)) continue;
+      if (overrideModels.length) {
+        const provider = definitions.get(route.account)?.provider;
+        const family = provider === 'codex-orin' ? 'codex' : provider;
+        if (!overrideModels.some(m => m.engine === route.engine && m.provider === family &&
+            (m.profile === route.profile || (m.profile === null && route.profile !== null)))) continue;
+      }
       if (tierModels) {
         const provider = definitions.get(route.account)?.provider;
         // Named profiles share policy membership with their registered provider,
         // never merely with an executable (Z.ai also uses the Codex engine).
         const family = provider === 'codex-orin' ? 'codex' : provider;
-        if (!tierModels.some(m => m.engine === route.engine && m.provider === family &&
+        if (!tierModels.some(m => (!overrideModels.length || overrideModels.some(o => o.id === m.id)) && m.engine === route.engine && m.provider === family &&
             (m.profile === route.profile || (m.profile === null && route.profile !== null)))) {
           rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'tier_unavailable' });
           continue;
@@ -364,8 +373,11 @@ export class FleetService {
       const prior: any = this.sql.exec('SELECT * FROM fleet_launches WHERE actor = ? AND request_key = ?', actor, input.idempotency_key).toArray()[0];
       if (prior) return sameIntent(prior.request_json, canonical) && sameEditCaller(prior.request_json, caller) ? result({ id: prior.id, state: prior.state, machine: prior.machine_id, engine: prior.engine, account: prior.account, mode: prior.mode, access: JSON.parse(prior.request_json).access?.mode || 'legacy_unspecified', replay: true }) : result({ error: 'idempotency_conflict' }, 409);
       // A disabled execution engine refuses every new reservation, after valid replay.
-      if (typeof plan.request.engine === 'string' && plan.request.engine && disabledEngines().has(plan.request.engine)) {
-        return result({ error: 'provider_disabled', access: parsed.access.mode }, 409);
+      const overrideModels = policy.models.filter(m => m.id === plan.request.engine);
+      const disabled = disabledEngines();
+      if (plan.request.engine && (disabled.has(plan.request.engine) ||
+          (overrideModels.length > 0 && overrideModels.every(m => disabled.has(m.engine))))) {
+        return result({ error: 'provider_disabled', detail: 'The requested provider is disabled by model policy. Choose an enabled engine/model or ask the policy owner to enable it and register a fresh host route with verified quota.', access: parsed.access.mode }, 409);
       }
       if (plan.request.parent_id) {
         const parent: any = this.sql.exec('SELECT actor, state FROM fleet_launches WHERE id = ?', plan.request.parent_id).toArray()[0];

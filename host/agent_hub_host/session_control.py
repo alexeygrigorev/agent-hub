@@ -62,6 +62,8 @@ def request(method, path, payload=None):
                 err = hold.get('error')
             if isinstance(err, str) and err and len(err) <= 64 and err.replace('_', '').isalnum():
                 name = ' (%s)' % err
+                if err == 'provider_disabled':
+                    name += ' requested provider disabled by model policy; choose an enabled engine/model or ask the policy owner to enable it and register a fresh host route with verified quota'
             rejection = hold if isinstance(hold, dict) else data
             if isinstance(rejection, dict) and isinstance(rejection.get('rejected'), list):
                 reasons = sorted({r['reason'] for r in rejection['rejected'][:100]
