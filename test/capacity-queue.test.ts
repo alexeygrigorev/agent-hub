@@ -197,6 +197,45 @@ describe('fleet reserve capacity queue', () => {
   }));
 });
 
+describe('fleet account status liveness', () => {
+  it('reports drifted registry routes as zero placeable slots while the raw pool stays honest', () => fleetFixture(async (f, sql) => {
+    await configure(f);
+    const status = (label: string) => f.accountStatus(sql.exec('SELECT * FROM fleet_accounts WHERE label = ?', label).one()) as any;
+    const healthy: any = status('desktop-codex');
+    expect(healthy.available_slots).toBe(1);
+    expect(healthy.placeable_slots).toBe(1);
+    expect(healthy.placeable_machines).toEqual(['win35']);
+    expect(healthy.registry_drift).toBe(false);
+    // A host release stops serving codex on win35 (subscription change) while
+    // the registry route stays: raw pool unchanged, nothing placeable.
+    sql.exec("UPDATE machines SET capabilities = ? WHERE id = 'win35'", JSON.stringify({ engines: ['claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));
+    const drifted: any = status('desktop-codex');
+    expect(drifted.available_slots).toBe(1);
+    expect(drifted.placeable_slots).toBe(0);
+    expect(drifted.placeable_machines).toEqual([]);
+    expect(drifted.registry_drift).toBe(true);
+    expect(drifted.status).toBe('ok');
+    // Once no live machine advertises codex at all, plan() classifies every
+    // codex route engine_unavailable (correct) — the lying half was fleet
+    // status advertising phantom slots.
+    sql.exec("UPDATE machines SET capabilities = ? WHERE id = 'hetzner'", JSON.stringify({ engines: ['claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));
+    const all: any = status('shared-codex');
+    expect(all.available_slots).toBe(1);
+    expect(all.placeable_slots).toBe(0);
+    expect(all.registry_drift).toBe(true);
+    const res = await f.handle(fleetReq('/launches', intent({ idempotency_key: 'drifted-plan' })), admin);
+    expect(res.status).toBe(409);
+    const body: any = await res.json();
+    expect(body.rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'engine_unavailable' });
+    expect(body.rejected).toContainEqual({ machine: 'win35', engine: 'codex', reason: 'engine_unavailable' });
+    // The admin fleet listing carries the liveness fields end to end.
+    const listing: any = await (await f.handle(fleetReq('', undefined, 'GET'), admin)).json();
+    const shared: any = listing.accounts.find((a: any) => a.label === 'desktop-codex');
+    expect(shared.placeable_slots).toBe(0);
+    expect(shared.registry_drift).toBe(true);
+  }));
+});
+
 describe('sessions_start capacity queue', () => {
   it('parks capacity-only starts as waitable queued intents that place when slots free', () => combinedFixture(async (f, s, sql) => {
     await configure(f);

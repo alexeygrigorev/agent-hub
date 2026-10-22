@@ -296,7 +296,7 @@ export class FleetService {
 
   accountStatus(account: any) {
     this.admission.reconcileOffers();
-    const routes = this.sql.exec('SELECT machine_id, profile FROM fleet_routes WHERE account = ?', account.label).toArray();
+    const routes = this.sql.exec('SELECT machine_id, engine, profile FROM fleet_routes WHERE account = ?', account.label).toArray();
     let remaining: number | null = null; let observed = 0; let unknown = false; let blocked = !account.enabled;
     const reserves = (((policy as any).rules as any).reserve_percent || {}) as Record<string, number>;
     for (const route of routes) {
@@ -323,11 +323,18 @@ export class FleetService {
     // ORPHAN_OBSERVED_IDLE_TTL_MS release their slot; parked PTYs from
     // finished work must not pin account_capacity forever.
     const liveIds = new Set<string>();
+    const liveEnginesByMachine = new Map<string, Set<string>>();
     try {
-      for (const m of this.sql.exec('SELECT id, last_checkin_at, drained FROM machines').toArray() as any[]) {
+      for (const m of this.sql.exec('SELECT id, last_checkin_at, drained, capabilities FROM machines').toArray() as any[]) {
         if (m.drained) continue;
         if (!fresh(effectiveCheckin(m.id, m.last_checkin_at), this.now(), 180000)) continue;
         liveIds.add(String(m.id));
+        // Same advertised-engine rule as plan(): a route stays placeable only
+        // while its machine's fresh capabilities still list the engine. A host
+        // release that drops a subscription stops serving the engine, and its
+        // leftover registry routes must not read as placeable capacity.
+        const engines = parsed(m.capabilities)?.engines;
+        if (Array.isArray(engines)) liveEnginesByMachine.set(String(m.id), new Set(engines.filter((e: unknown) => typeof e === 'string')));
       }
     } catch { /* fail closed below when the live set is empty */ }
     const liveList = [...liveIds];
@@ -347,8 +354,20 @@ export class FleetService {
       return counted;
     })();
     const active = reserved + observedSessions;
+    const availableSlots = Math.max(0, Number(account.max_concurrency) - active);
+    const placeableMachines = new Set<string>();
+    for (const route of routes) {
+      if (liveEnginesByMachine.get(String(route.machine_id))?.has(String(route.engine))) placeableMachines.add(String(route.machine_id));
+    }
     return { label: account.label, provider: account.provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled,
-      remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || unknown || remaining === null) ? 'unknown' : 'ok', active, available_slots: Math.max(0, Number(account.max_concurrency) - active),
+      remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || unknown || remaining === null) ? 'unknown' : 'ok', active, available_slots: availableSlots,
+      // available_slots is the raw pool and ignores route liveness: a registry
+      // whose routes all point at engines no live host serves anymore (e.g.
+      // after a host subscription change) used to advertise phantom free
+      // slots. placeable_slots counts only capacity reachable through a live
+      // route; status stays quota health — placement classes live in plan().
+      placeable_slots: placeableMachines.size ? availableSlots : 0, placeable_machines: [...placeableMachines].sort(),
+      registry_drift: routes.length > 0 && placeableMachines.size < routes.length,
       machines: routes.map(r => r.machine_id) };
   }
 
