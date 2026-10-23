@@ -278,6 +278,7 @@ def add_commands(sub):
                        help='Parent session id recording lineage')
     start.add_argument('--intake-task-id', '--intake-task', dest='intake_task_id', default=None,
                        help='Linked intake task id (API field intake_task_id); refused when that task has empty acceptance criteria. --intake-task is a deprecated alias.')
+    start.add_argument('--with-goal', action='store_true', help='Start interactive /goal work on a Codex-family engine; requires --prompt or --brief-file; refuses --headless')
     start.add_argument('--headless', action='store_true', help='Explicitly start in headless mode')
     mode = start.add_mutually_exclusive_group()
     mode.add_argument('--brief-file', help='UTF-8 goal file for headless work (max 8 KiB)')
@@ -537,17 +538,24 @@ def execute(args):
             payload['name'] = check_session_name(args.name)
         if getattr(args, 'parent', None) is not None:
             payload['parent_id'] = args.parent
-        payload['mode'] = 'interactive' if getattr(args, 'interactive', False) else 'headless'
+        with_goal = getattr(args, 'with_goal', False)
+        if with_goal and getattr(args, 'headless', False):
+            raise ValueError('--with-goal requires interactive mode; cannot use --headless')
+        if with_goal:
+            payload['with_goal'] = True
+        payload['mode'] = 'interactive' if getattr(args, 'interactive', False) or with_goal else 'headless'
         if getattr(args, 'headless', False):
             payload['mode'] = 'headless'
         if getattr(args, 'brief_file', None):
-            if payload['mode'] == 'interactive':
+            if payload['mode'] == 'interactive' and not with_goal:
                 raise ValueError('Interactive sessions start at an empty native prompt')
             payload['brief'] = read_file(args.brief_file, MAX_BRIEF)
         if getattr(args, 'prompt', None) is not None:
-            if payload['mode'] == 'interactive':
+            if payload['mode'] == 'interactive' and not with_goal:
                 raise ValueError('Interactive sessions start at an empty native prompt')
             payload['brief'] = read_prompt_text(args.prompt)
+        if with_goal and not payload.get('brief', '').strip():
+            raise ValueError('--with-goal requires --prompt or --brief-file')
         try:
             created = request('POST', '/api/sessions', payload)
         except ValueError as exc:

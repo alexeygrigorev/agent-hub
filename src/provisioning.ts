@@ -65,7 +65,7 @@ export class ProvisioningService {
     const rows = () => this.sql.exec('SELECT * FROM engine_bundles ORDER BY label').toArray() as any[];
     if (path === '/api/engines' && request.method === 'GET') {
       if (!admin) return reply({ error: 'forbidden' }, 403);
-      return reply({ logins: this.sql.exec('SELECT id,machine_id,label,status,url,expires_at FROM engine_logins WHERE expires_at > ?', Date.now()).toArray(), engines: rows().map(({ ciphertext, ...meta }) => meta), installations: this.sql.exec('SELECT * FROM engine_installations ORDER BY machine_id,label').toArray() });
+      return reply({ logins: this.sql.exec('SELECT id,machine_id,label,status,url,expires_at FROM engine_logins WHERE expires_at > ?', Date.now()).toArray(), engines: rows().map(({ ciphertext, ...meta }) => ({ ...meta, supports_goal: ['codex', 'zai'].includes(meta.provider) })), installations: this.sql.exec('SELECT * FROM engine_installations ORDER BY machine_id,label').toArray() });
     }
     if (path === '/api/engines/sync' && request.method === 'GET') {
       if (!host) return reply({ error: 'forbidden' }, 403);

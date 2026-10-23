@@ -135,11 +135,11 @@ describe('generic accounts and launch placement', () => {
     expect((await s.handle(request('/accounts', registry(), 'PUT'), host('hetzner'))).status).toBe(403);
     expect(sql.exec('SELECT COUNT(*) n FROM fleet_accounts').one().n).toBe(0);
   }));
-  it('defaults to headless and preserves machine pinning; interactive requires a machine', async () => fixture(async (s, sql) => {
+  it('defaults to headless and supports automatic interactive placement and machine pinning', async () => fixture(async (s, sql) => {
     await configure(s);
     const plan: any = s.plan(intent({ machine: 'win35' }));
     expect(plan.request.mode).toBe('headless'); expect(plan.selected.machine).toBe('win35');
-    expect(s.plan(intent({ mode: 'interactive' }))).toEqual({ error: 'invalid_launch_request' });
+    expect(s.plan(intent({ mode: 'interactive', prompt: '' })).selected).toMatchObject({ engine: 'codex' });
     expect((s.plan(intent({ mode: 'interactive', machine: 'win35', prompt: '' })) as any).selected.machine).toBe('win35');
     sql.exec("UPDATE machines SET drained = 1 WHERE id = 'win35'");
     expect((s.plan(intent({ machine: 'win35' })) as any).selected).toBeNull();

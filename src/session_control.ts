@@ -940,8 +940,8 @@ export class SessionControlService {
       // null / blank intake_task_id means "missing" so the TBM gate can return
       // intake_task_id_required instead of a generic invalid_session_request.
       if (input.intake_task_id === null || input.intake_task_id === '') delete input.intake_task_id;
-      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id'])) {
-        const allowed = new Set(['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id']);
+      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal'])) {
+        const allowed = new Set(['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal']);
         const field = input && typeof input === 'object' && !Array.isArray(input)
           ? Object.keys(input).find(k => !allowed.has(k)) : undefined;
         return response({ error: 'invalid_session_request', ...(field ? { field, detail: 'unknown_field' } : { detail: 'invalid_object' }) }, 400);
@@ -985,7 +985,10 @@ export class SessionControlService {
         return response({ error: 'invalid_cwd', detail: 'cwd must be a workspace-relative confined path' }, 400);
       }
       const mode = input.mode || 'headless';
-      if (mode === 'interactive' && input.brief !== undefined) {
+      if (input.with_goal !== undefined && (input.with_goal !== true || mode !== 'interactive' || !input.brief?.trim())) {
+        return response({ error: 'interactive_goal_required' }, 400);
+      }
+      if (mode === 'interactive' && input.brief !== undefined && !input.with_goal) {
         return response({ error: 'interactive_starts_empty' }, 400);
       }
       if (mode === 'headless' && input.brief !== undefined && !input.brief.trim()) {
@@ -1029,6 +1032,7 @@ export class SessionControlService {
         const canonical = JSON.stringify({
           engine: input.engine ?? null, machine: input.machine ?? null,
           workspace: input.workspace, cwd: input.cwd ?? null, brief: input.brief ?? null,
+          ...(input.with_goal === true ? { with_goal: true } : {}),
           mode, access: input.access ?? null, name: input.name ?? null,
           parent_id: parentId ?? null, intake_task_id: input.intake_task_id ?? null,
         });
@@ -1163,7 +1167,7 @@ export class SessionControlService {
       const reserved = this.hooks.reserve({
         mode, machine: input.machine, engine: input.engine, tier: input.tier,
         workspace: input.workspace, cwd: input.cwd ?? null,
-        prompt: input.brief || '', access: input.access,
+        prompt: input.brief || '', access: input.access, ...(input.with_goal === true ? { with_goal: true } : {}),
         idempotency_key: 'session-control-' + id,
       }, auth);
         if (reserved.status === 400) {

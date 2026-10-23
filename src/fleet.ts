@@ -363,7 +363,7 @@ export class FleetService {
         placeableMachines.add(String(route.machine_id));
       }
     }
-    return { label: account.label, provider: account.provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled,
+    return { label: account.label, provider: account.provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled, supports_goal: ['codex', 'codex-orin', 'zai'].includes(account.provider),
       remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || unknown || remaining === null) ? 'unknown' : 'ok', active, available_slots: availableSlots,
       // available_slots is the raw pool and ignores route liveness: a registry
       // whose routes all point at engines no live host serves anymore (e.g.
@@ -376,7 +376,7 @@ export class FleetService {
   }
 
   plan(input: any) {
-    if (!object(input, ['mode', 'machine', 'engine', 'engine_override_reason', 'tier', 'account', 'workspace', 'cwd', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access', 'approved_action']) ||
+    if (!object(input, ['mode', 'machine', 'engine', 'engine_override_reason', 'tier', 'account', 'workspace', 'cwd', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access', 'approved_action', 'with_goal']) ||
       !workspaceOk(input.workspace) || (input.mode !== undefined && !['headless', 'interactive'].includes(input.mode)) ||
       (input.account !== undefined && !label(input.account)) || (input.machine !== undefined && !isValidMachineId(input.machine)) || (input.engine !== undefined && !label(input.engine)) ||
       // Optional tier/cwd arrive as null (not just undefined) from the
@@ -384,12 +384,12 @@ export class FleetService {
       // means absent, never a malformed value.
       (input.tier !== undefined && input.tier !== null && (typeof input.tier !== 'string' || !/^[A-Za-z0-9_-]{1,32}$/.test(input.tier))) ||
       (input.cwd !== undefined && input.cwd !== null && !relativeCwdOk(input.cwd)) ||
-      (input.mode === 'interactive' && !input.machine) ||
+      (input.with_goal !== undefined && (input.with_goal !== true || input.mode !== 'interactive' || (typeof input.prompt !== 'string' || !input.prompt.trim()))) ||
       (input.parent_id !== undefined && input.parent_id !== null && (typeof input.parent_id !== 'string' || !/^[a-f0-9-]{36}$/.test(input.parent_id))) ||
       (input.summary !== undefined && (typeof input.summary !== 'string' || input.summary.length > 240 || /[\x00-\x1f\x7f]/.test(input.summary))) ||
       (input.prompt !== undefined && (typeof input.prompt !== 'string' || input.prompt.length > 16000)) ||
       (input.approved_action !== undefined && (typeof input.approved_action !== 'string' || !input.approved_action.trim() || input.approved_action.length > 12000)) ||
-      (input.mode !== 'interactive' && !input.prompt?.trim())) return { error: 'invalid_launch_request' };
+      (input.mode !== 'interactive' && (typeof input.prompt !== 'string' || !input.prompt.trim()))) return { error: 'invalid_launch_request' };
     // Tier resolves through the EXISTING model-routing table (aliases +
     // tier membership), never new ranking: candidates are filtered to routes
     // whose (engine, profile) pair is a configured member of the tier, while
@@ -406,6 +406,7 @@ export class FleetService {
     // caller's selector in the canonical intent for idempotency.
     const overrideModels = policy.models.filter(m => m.id === input.engine);
     const request: any = { mode: input.mode || 'headless', machine: input.machine || null, engine: input.engine || null, workspace: input.workspace, cwd: input.cwd ?? null, prompt: input.prompt || '', parent_id: input.parent_id || null, summary: input.summary || (input.mode === 'interactive' ? 'Interactive session' : 'Agent task') };
+    if (input.with_goal === true) request.with_goal = true;
     if (input.account !== undefined) request.account = input.account;
     if (input.approved_action !== undefined) request.approved_action = input.approved_action;
     if (input.tier !== undefined) request.tier = input.tier;
@@ -444,6 +445,7 @@ export class FleetService {
           continue;
         }
       }
+      if (request.with_goal && !['codex', 'zcodex'].includes(route.engine)) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'goal_unsupported' }); continue; }
       // A disabled execution engine holds all new candidate planning, whatever the account label.
       if (disabledEngines().has(route.engine)) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'provider_disabled' }); continue; }
       const machine: any = this.sql.exec('SELECT * FROM machines WHERE id = ?', route.machine_id).toArray()[0];
@@ -648,7 +650,7 @@ export class FleetService {
     const writer = admin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch'));
     if (path === '/api/fleet' && request.method === 'GET') {
       if (!admin) return response({ error: 'forbidden' }, 403);
-      return response({ accounts: this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray().map(a => this.accountStatus(a)), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray(),
+      return response({ accounts: this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray().map(a => this.accountStatus(a)), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray().map(r => ({ ...r, supports_goal: ['codex', 'zcodex'].includes(String(r.engine)) })),
         machines: this.sql.exec('SELECT id, name, hostname, last_checkin_at, drained FROM machines ORDER BY id').toArray().map((m: any) => ({ ...m, last_checkin_at: effectiveCheckin(m.id, m.last_checkin_at) })),
         agents: this.sql.exec('SELECT tag, project, role, machine_id, engine, session_id, health_state, health_at FROM agents').toArray(),
         sessions: this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray(),
@@ -751,7 +753,7 @@ export class FleetService {
         const offers: any[] = [];
         for (const row of this.sql.exec("SELECT * FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at, id LIMIT 100", caller.machineId!)) {
           if (this.admission.retireInvalidOffer(row)) continue;
-          offers.push({ id: row.id, engine: row.engine, account: row.account, profile: row.profile, mode: row.mode, workspace: row.workspace, cwd: parsed(row.request_json).cwd ?? null, prompt: row.prompt, access: parsed(row.request_json).access?.mode || 'legacy_unspecified' });
+          offers.push({ id: row.id, engine: row.engine, account: row.account, profile: row.profile, mode: row.mode, workspace: row.workspace, cwd: parsed(row.request_json).cwd ?? null, prompt: row.prompt, ...(parsed(row.request_json).with_goal === true ? { with_goal: true } : {}), access: parsed(row.request_json).access?.mode || 'legacy_unspecified' });
           if (offers.length === 20) break;
         }
         return response({ offers: this.routing.enrichOffers(offers) });

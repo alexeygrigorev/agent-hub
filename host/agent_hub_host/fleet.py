@@ -1196,6 +1196,8 @@ class Dispatcher:
             return self.runner(submit_argv, cwd=launcher["root"])
 
     def dispatch(self, offer):
+        if offer.get('with_goal') and offer.get('mode') != 'interactive':
+            raise ValueError('Goal work is interactive only')
         sub = self._route(offer)
         selection = offer.get('selection')
         if offer.get('task_id'):
@@ -1233,18 +1235,26 @@ class Dispatcher:
         target_cwd = resolve_offer_cwd(workspace, offer.get("cwd"))
         native = self.settings.get("aplexer_bin", "aplexer")
         if mode == "interactive":
-            if offer.get("prompt"):
+            with_goal = offer.get('with_goal') is True
+            if with_goal and (offer.get('engine') not in {'codex', 'zcodex'} or not isinstance(offer.get('prompt'), str) or not offer['prompt'].strip()):
+                raise ValueError('Interactive goal requires a Codex-family engine and goal text')
+            if offer.get("prompt") and not with_goal:
                 raise ValueError("Interactive task injection is unsupported; start an empty native session")
             argv = [native, "start", "--workspace", str(workspace), "--tag", "hub-" + offer_id, "--engine", offer["engine"], "--memory", "1500M", "--pids", "256", "--json"]
             if offer.get("profile"):
                 argv += ["--profile", offer["profile"]]
             if target_cwd != workspace:
                 argv += ["--cwd", str(target_cwd)]
-            if sub.get("startup_argv"):
-                launch = sub["startup_argv"]
+            if with_goal or sub.get("startup_argv"):
+                launch = sub.get('startup_argv')
+                if with_goal and sub.get('account_label') in self._managed_labels:
+                    from . import provisioning
+                    launch = provisioning.module_command('execute', sub['account_label'])
+                elif with_goal and not launch:
+                    raise ValueError('Goal startup requires a trusted local command')
                 if not isinstance(launch, list) or not launch or any(not isinstance(a, str) or "\0" in a for a in launch):
                     raise ValueError("Invalid trusted startup argv")
-                argv += ["--"] + launch
+                argv += ["--"] + launch + (['/goal ' + offer['prompt']] if with_goal else [])
             prefix = sub.get("native_start_argv") or self.settings.get("native_start_argv")
             if prefix is not None:
                 prefix = validate_native_start_argv(prefix)
@@ -1571,10 +1581,12 @@ class Dispatcher:
                 continue
         if 'capabilities' in self.settings:
             self.request('PUT', '/api/fleet/routing/capabilities', {'needs': self.settings['capabilities'], 'max_agents': self.settings.get('max_agents', 1), 'runners': [{'engine': s.get('engine', s['service']), 'profile': s.get('profile'), 'account': s['account_label'], 'model': s['launcher_model'], 'effort': s.get('launcher_effort')} for s in self.settings['subscriptions'] if s.get('launcher_model') and s.get('admission_argv')]})
+        from .launcher_recovery import settle_retired_legacy
+        legacy_settled = settle_retired_legacy(self.settings.get('launcher', {}))
         reconciled = self.reconcile_launches()
         imported_reconciled = self.reconcile_imported_sessions()
         offers = self.request("GET", "/api/fleet/offers").get("offers", [])
-        results = list(reconciled) + list(imported_reconciled)
+        results = [{'id': r['task_id'], 'state': 'failed', 'reason': 'legacy_native_finished'} for r in legacy_settled] + list(reconciled) + list(imported_reconciled)
         results.append({"id": "workclaim-sync", **workclaim_summary})
         for offer in offers:
             try:

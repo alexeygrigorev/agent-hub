@@ -533,3 +533,20 @@ Hub authentication and returns the API cancellation receipt.
 A human-created headless worker may be eligible for cleanup when its canonical Hub intent, headless Fleet launch, exact native binding and original human credential provenance agree. Human ownership remains visible separately from workload protection. Interactive, observed, explicitly protected, contradictory and unknown human workloads stay protected. Completion, no pending obligations, containment, retention and clean/merged Git checks still apply.
 
 Cleanup requires a current credential from the creator's exact family, including after ordinary refresh. A different family with the same human actor has no cleanup authority. Older rows may recover family identity only from their immutable creator credential; missing provenance fails closed. Browser-only admin authority cannot establish individual family custody. The host claim repeats credential-family and protection checks. If authority changes after a claim and a host reports removal, the durable outcome records uncertainty rather than an authorized cleanup.
+
+### Start interactive goal work
+
+`hub sessions start --workspace agent-hub --with-goal --prompt 'Fix the repeated binding failure' --key binding-goal-1`
+
+`--with-goal` implies interactive mode and requires `--prompt` or `--brief-file`.
+It refuses `--headless`. Automatic placement selects a Codex-family route;
+`--engine` remains an operator override requiring `--reason`. Fleet accounts
+and engine routes advertise `supports_goal`; Codex, Codex/Orin and ZCodex
+support goals, while other engines report false. Existing disabled-provider,
+quota, resource and profile checks still apply.
+
+The host starts the trusted local engine command with one literal `/goal …`
+argument. It never runs goal text in a shell. Managed accounts keep their
+own profile and protected launch wrapper. Unmanaged routes need a trusted
+`startup_argv`. Ordinary interactive starts still open an empty prompt and
+may use automatic placement without a machine pin.
