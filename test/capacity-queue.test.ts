@@ -198,6 +198,24 @@ describe('fleet reserve capacity queue', () => {
 });
 
 describe('fleet account status liveness', () => {
+  it('counts route health independently from distinct machines and ignores stale siblings for placement', () => fleetFixture(async (f, sql) => {
+    const config = registry();
+    config.routes.push({ machine_id: 'hetzner', engine: 'claude', account: 'shared-codex', profile: null });
+    expect((await f.handle(fleetReq('/accounts', config, 'PUT'), admin)).status).toBe(200);
+    const status = () => f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-codex'").one());
+    expect(status().registry_drift).toBe(false);
+    expect(status().placeable_slots).toBe(1);
+    expect(status().placeable_machines).toEqual(['hetzner']);
+    // A dead host route is diagnostic debt; it never zeros a healthy route.
+    sql.exec("INSERT INTO fleet_routes VALUES ('win35', 'gemini', 'shared-codex', NULL)");
+    sql.exec("UPDATE machines SET drained = 1 WHERE id = 'win35'");
+    expect(status().registry_drift).toBe(true);
+    expect(status().placeable_slots).toBe(1);
+    const plan: any = f.plan(intent());
+    expect(plan.selected.machine).toBe('hetzner');
+    expect(plan.selected.engine).toBe('codex');
+  }));
+
   it('reports drifted registry routes as zero placeable slots while the raw pool stays honest', () => fleetFixture(async (f, sql) => {
     await configure(f);
     const status = (label: string) => f.accountStatus(sql.exec('SELECT * FROM fleet_accounts WHERE label = ?', label).one()) as any;

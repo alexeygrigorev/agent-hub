@@ -186,8 +186,12 @@ def load_settings(path=None):
         if path.stat().st_size > 65536:
             raise ValueError("Subscription configuration exceeds 64 KiB")
         data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "workspace_roots", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv", "role_consumer", "role_config"} or data.get("version") != 1:
+    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "workspace_roots", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv", "role_consumer", "role_config", "journal_dir"} or data.get("version") != 1:
         raise ValueError("Invalid subscription configuration")
+    if "journal_dir" in data:
+        journal = data["journal_dir"]
+        if not isinstance(journal, str) or not journal or "\0" in journal or not Path(journal).is_absolute():
+            raise ValueError("journal_dir must be an absolute local path")
     if "native_start_argv" in data:
         validate_native_start_argv(data["native_start_argv"])
     if "role_consumer" in data:

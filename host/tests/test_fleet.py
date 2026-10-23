@@ -41,6 +41,23 @@ class FleetTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'metadata'):
                 fleet.load_settings(p)
 
+    def test_configured_journal_survives_bounded_dispatcher_restarts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = settings(Path(tmp))
+            cfg['journal_dir'] = str(Path(tmp) / 'journal')
+            Path(cfg['journal_dir']).mkdir(mode=0o700)
+            path = Path(tmp) / 'subscriptions.json'
+            path.write_text(json.dumps(cfg))
+            loaded = fleet.load_settings(path)
+            first = fleet.Dispatcher(loaded)
+            first._set_imported_cursor('next-page')
+            self.assertEqual(fleet.Dispatcher(fleet.load_settings(path))._get_imported_cursor(), 'next-page')
+            for bad in [None, 123, '', 'relative', '/bad\0path']:
+                cfg['journal_dir'] = bad
+                path.write_text(json.dumps(cfg))
+                with self.assertRaisesRegex(ValueError, 'journal_dir'):
+                    fleet.load_settings(path)
+
     def test_default_quota_is_not_copied_to_multiple_accounts_or_nondefault_profile(self):
         cfg = settings(Path('/repo'))
         cfg['subscriptions'].append({**cfg['subscriptions'][0], 'account_label': 'second-codex', 'profile': 'second'})

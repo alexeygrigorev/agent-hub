@@ -214,6 +214,23 @@ describe('generic accounts and launch placement', () => {
     expect(plan.selected).toBeNull();
     expect(plan.rejected).toContainEqual({ machine: 'hetzner', engine: 'antigravity', reason: 'account_capacity' });
   }));
+  it('prunes only unused stale routes while retaining live reservations and subscriptions', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    sql.exec("UPDATE machines SET drained = 1 WHERE id = 'win35'");
+    const before = sql.exec('SELECT * FROM fleet_subscriptions').toArray();
+    const config = registry();
+    config.routes.splice(1, 1);
+    const res = await s.handle(request('/accounts', config, 'PUT'), admin);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ status: 'configured', added_routes: 0, removed_routes: 1 });
+    expect(sql.exec('SELECT * FROM fleet_subscriptions').toArray()).toEqual(before);
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('offered');
+    // Even a stale route retains authority while its exact launch is active.
+    sql.exec("UPDATE machines SET drained = 1 WHERE id = 'hetzner'");
+    config.routes = [];
+    expect((await s.handle(request('/accounts', config, 'PUT'), admin)).status).toBe(409);
+  }));
   it('refuses policy changes or route removal even when another route is added during a launch', async () => fixture(async s => {
     await configure(s);
     await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin);
