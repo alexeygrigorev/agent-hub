@@ -167,14 +167,14 @@ function fresh(value: any, now: number, ttl: number) {
   const at = typeof value === 'string' && /T.*(?:Z|[+-]\d{2}:\d{2})$/i.test(value) ? Date.parse(value) : NaN;
   return Number.isFinite(at) && at <= now && now - at <= ttl;
 }
-async function body(request: Request): Promise<any> {
+async function body(request: Request, maxBytes = 32768): Promise<any> {
   if (!request.body) return null;
   const reader = request.body.getReader(); let size = 0; const chunks: Uint8Array[] = [];
   try {
     for (;;) {
       const part = await reader.read(); if (part.done) break;
       size += part.value.byteLength;
-      if (size > 32768) { await reader.cancel(); return null; }
+      if (size > maxBytes) { await reader.cancel(); return null; }
       chunks.push(part.value);
     }
     const bytes = new Uint8Array(size); let offset = 0;
@@ -759,7 +759,10 @@ export class FleetService {
     }
     if (path === '/api/fleet/sessions' && request.method === 'PUT') {
       if (!host) return response({ error: 'forbidden' }, 403);
-      const data = await body(request);
+      // A complete bounded native catalog can exceed the generic 32 KiB
+      // mutation limit even with fewer than 100 sessions. Preserve the 500
+      // row and field limits below; allow their maximum serialized footprint.
+      const data = await body(request, 3 * 1024 * 1024);
       if (!object(data, ['sessions']) || !Array.isArray(data.sessions) || data.sessions.length > 500) return response({ error: 'invalid_sessions' }, 400);
       const ids = new Set();
       for (const s of data.sessions) {

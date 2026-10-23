@@ -389,6 +389,21 @@ describe('generic accounts and launch placement', () => {
     expect((await s.handle(request('/launches/' + claimed.id + '/reject', receipt), host('hetzner'))).status).toBe(409);
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', claimed.id).one().state).toBe('starting');
   }));
+  it('accepts complete native catalogs above 32 KiB while retaining catalog bounds', async () => fixture(async (s, sql) => {
+    const sessions = Array.from({ length: 100 }, (_, i) => ({
+      native_id: 'native-' + i, tag: 'native-' + i, engine: 'codex', phase: 'running',
+      agent_state: 'idle', workspace: '/demo/' + 'x'.repeat(300), cwd: '/demo/' + 'x'.repeat(300),
+      profile: null, account: null, last_activity_at: iso(), created_at_ms: now - 1000,
+    }));
+    expect(JSON.stringify({ sessions }).length).toBeGreaterThan(32768);
+    expect((await s.handle(request('/sessions', { sessions }, 'PUT'), host('hetzner'))).status).toBe(200);
+    expect(sql.exec("SELECT COUNT(*) AS n FROM fleet_sessions WHERE machine_id = 'hetzner'").one().n).toBe(100);
+    const tooMany = Array.from({ length: 501 }, (_, i) => ({ ...sessions[0], native_id: 'large-' + i }));
+    expect((await s.handle(request('/sessions', { sessions: tooMany }, 'PUT'), host('hetzner'))).status).toBe(400);
+    const oversized = new Request('https://hub.test/api/fleet/sessions', { method: 'PUT', body: ' '.repeat(3 * 1024 * 1024 + 1) });
+    expect((await s.handle(oversized, host('hetzner'))).status).toBe(400);
+    expect(sql.exec("SELECT COUNT(*) AS n FROM fleet_sessions WHERE machine_id = 'hetzner'").one().n).toBe(100);
+  }));
   it('limits dashboards to admins and does not return prompts or credentials', async () => fixture(async s => {
     await configure(s); await s.handle(request('/launches', intent()), admin);
     expect((await s.handle(request('', undefined, 'GET'), host('hetzner'))).status).toBe(403);
