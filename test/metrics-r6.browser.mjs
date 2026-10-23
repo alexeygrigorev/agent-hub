@@ -68,7 +68,7 @@ async function runDetailCase(name, setup) {
       selected: await page.locator('#metrics-host').inputValue(),
       identity: await page.locator('#metrics-host-id').innerText(),
       status: await page.locator('#status').innerText(),
-      usage: await page.locator('#usage').innerText(),
+      usage: await page.locator('#usage').textContent(),
     };
     observations.push({ case: name, ...result });
     assert.equal(result.selected, 'host-C', name + ': selection');
@@ -175,7 +175,7 @@ async function runPaginationCase(failure) {
       selected: await page.locator('#metrics-host').inputValue(),
       identity: await page.locator('#metrics-host-id').innerText(),
       status: await page.locator('#status').innerText(),
-      usage: await page.locator('#usage').innerText(),
+      usage: await page.locator('#usage').textContent(),
     };
     const name = failure ? 'r6-stale-pagination-error' : 'r6-stale-pagination-success';
     all.push({ case: name, ...after, requests });
@@ -234,7 +234,7 @@ await runPaginationCase(true);
       selected: await page.locator('#metrics-host').inputValue(),
       identity: await page.locator('#metrics-host-id').innerText(),
       status: await page.locator('#status').innerText(),
-      usage: await page.locator('#usage').innerText(),
+      usage: await page.locator('#usage').textContent(),
     };
     all.push({ case: 'r6-host-disappearance', ...after, requests });
     assert.equal(after.selected, 'host-B', 'disappearance: selection preserved');

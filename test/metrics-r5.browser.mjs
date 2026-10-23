@@ -65,7 +65,7 @@ async function runCase(name, setup) {
       selected: await page.locator('#metrics-host').inputValue(),
       identity: await page.locator('#metrics-host-id').innerText(),
       status: await page.locator('#status').innerText(),
-      usage: await page.locator('#usage').innerText(),
+      usage: await page.locator('#usage').textContent(),
     };
     observations.push({ case: name, ...result });
     assert.equal(result.selected, 'host-C', name + ': selection');

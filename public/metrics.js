@@ -88,6 +88,7 @@ function coverageLabel(code) {
 }
 
 function renderEmpty(reason) {
+  HubMetricsCharts.clear(reason);
   byId('coverage').replaceChildren(Object.assign(document.createElement('p'), { textContent: reason }));
   byId('buckets').replaceChildren(Object.assign(document.createElement('p'), { textContent: 'No 24h buckets.' }));
   byId('usage').replaceChildren(Object.assign(document.createElement('p'), { textContent: 'Usage unknown.' }));
@@ -99,6 +100,7 @@ function render(data) {
     renderEmpty('No sanitized snapshot for this host.');
     return;
   }
+  HubMetricsCharts.render(data);
   const stale = data.stale === true || data.status === 'stale';
   const cov = data.coverage || {};
   const gaps = Array.isArray(data.gaps) ? data.gaps.map(g => g && g.code).filter(Boolean) : [];
