@@ -94,13 +94,20 @@ describe('capacity-only classifier', () => {
     expect(isCapacityOnlyHold([{ machine: 'w', engine: 'codex', reason: 'machine_unavailable' }])).toBe(false);
     expect(isCapacityOnlyHold([{ machine: 'h', engine: 'codex', reason: 'provider_disabled' }])).toBe(false);
     expect(isCapacityOnlyHold([{ machine: 'h', engine: 'gemini', reason: 'engine_unavailable' }])).toBe(false);
+    for (const reason of ['tier_unavailable', 'goal_unsupported']) {
+      expect(isCapacityOnlyHold([{ machine: 'h', engine: 'opencode', reason }])).toBe(false);
+      expect(isCapacityOnlyHold([
+        { machine: 'h', engine: 'codex', reason: 'account_capacity' },
+        { machine: 'h', engine: 'opencode', reason },
+      ])).toBe(true);
+    }
     expect(isCapacityOnlyHold([
       { machine: 'h', engine: 'codex', reason: 'account_capacity' },
       { machine: 'h', engine: 'gemini', reason: 'engine_unavailable' },
       { machine: 'w', engine: 'codex', reason: 'machine_unavailable' },
       { machine: 'x', engine: 'grok', reason: 'provider_disabled' },
     ])).toBe(true);
-    for (const reason of ['capability_unavailable', 'admission_unknown', 'resource_limit', 'load_unknown', 'tier_unavailable', 'account_blocked', 'account_unknown', 'machine_account_quota_unknown']) {
+    for (const reason of ['capability_unavailable', 'admission_unknown', 'resource_limit', 'load_unknown', 'account_blocked', 'account_unknown', 'machine_account_quota_unknown']) {
       expect(isCapacityOnlyHold([
         { machine: 'h', engine: 'codex', reason: 'account_capacity' },
         { machine: 'w', engine: 'codex', reason },
@@ -231,6 +238,7 @@ describe('fleet account status liveness', () => {
     expect(drifted.available_slots).toBe(1);
     expect(drifted.placeable_slots).toBe(0);
     expect(drifted.placeable_machines).toEqual([]);
+    expect(drifted.placement_reasons).toEqual(['engine_unavailable']);
     expect(drifted.registry_drift).toBe(true);
     expect(drifted.status).toBe('ok');
     // Once no live machine advertises codex at all, plan() classifies every
@@ -252,9 +260,61 @@ describe('fleet account status liveness', () => {
     expect(shared.placeable_slots).toBe(0);
     expect(shared.registry_drift).toBe(true);
   }));
+
+  it('explains free pools without routes and unavailable machines without inventing capacity', () => fleetFixture(async (f, sql) => {
+    await configure(f);
+    const status = () => f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'desktop-codex'").one());
+    expect(status().placement_reasons).toEqual([]);
+    sql.exec("UPDATE machines SET drained = 1 WHERE id = 'win35'");
+    expect(status()).toMatchObject({ available_slots: 1, placeable_slots: 0, placement_reasons: ['machine_unavailable'] });
+    sql.exec("DELETE FROM fleet_routes WHERE account = 'desktop-codex'");
+    expect(status()).toMatchObject({ available_slots: 1, placeable_slots: 0, placement_reasons: ['no_routes'] });
+  }));
 });
 
 describe('sessions_start capacity queue', () => {
+  it('queues tier-selected capacity beside excluded engines, then auto-places the same bare-label intent', () => combinedFixture(async (f, s, sql) => {
+    const config = registry();
+    config.accounts.push({ label: 'muse', provider: 'go', max_concurrency: 1, reserve_percent: 15, enabled: true });
+    config.routes.push({ machine_id: 'hetzner', engine: 'opencode', account: 'muse', profile: null });
+    expect((await f.handle(fleetReq('/accounts', config, 'PUT'), admin)).status).toBe(200);
+    sql.exec("UPDATE machines SET capabilities = ? WHERE id = 'hetzner'", JSON.stringify({ engines: ['codex', 'opencode'], fleet_modes: ['headless', 'interactive'], workspaces: ['/repos'], cpu_count: 8 }));
+    const blocking: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner', engine: 'codex' })), admin)).json();
+    const input = { key: 'tier-capacity', workspace: 'demo', machine: 'hetzner', tier: 'deep', mode: 'headless', brief: 'capacity queue probe' };
+    const response = await s.handle(sessReq('/api/sessions', input), admin);
+    expect(response.status, JSON.stringify(await response.clone().json())).toBe(202);
+    const parked: any = await response.json();
+    expect(parked).toMatchObject({ state: 'queued', queued: true, queue_position: 1 });
+    expect(parked.rejected).toEqual(expect.arrayContaining([
+      { machine: 'hetzner', engine: 'codex', reason: 'account_capacity' },
+      { machine: 'hetzner', engine: 'opencode', reason: 'tier_unavailable' },
+    ]));
+    const replay: any = await (await s.handle(sessReq('/api/sessions', input), admin)).json();
+    expect(replay).toMatchObject({ id: parked.id, state: 'queued', replay: true });
+    await claimAndFinish(f, blocking.id, 'hetzner', 'shared-codex');
+    expect(sql.exec('SELECT state, engine, workspace FROM fleet_launches WHERE id = ?', parked.fleet_launch_id).one()).toMatchObject({ state: 'offered', engine: 'codex', workspace: '/repos/demo' });
+    const placed: any = await (await s.handle(sessReq('/api/sessions/' + parked.id, undefined, 'GET'), admin)).json();
+    expect(placed).toMatchObject({ id: parked.id, state: 'offered', engine: 'codex' });
+    const changed = await s.handle(sessReq('/api/sessions', { ...input, brief: 'different task' }), admin);
+    expect(changed.status).toBe(409);
+  }));
+
+  it('retains goal capability on queue promotion and never diverts to a free non-goal engine', () => combinedFixture(async (f, s, sql) => {
+    const config = registry();
+    config.accounts.push({ label: 'claude', provider: 'claude', max_concurrency: 1, reserve_percent: 15, enabled: true });
+    config.routes.push({ machine_id: 'hetzner', engine: 'claude', account: 'claude', profile: null });
+    expect((await f.handle(fleetReq('/accounts', config, 'PUT'), admin)).status).toBe(200);
+    const blocking: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner', engine: 'codex' })), admin)).json();
+    const response = await s.handle(sessReq('/api/sessions', { key: 'goal-capacity', workspace: 'demo', machine: 'hetzner', mode: 'interactive', with_goal: true, brief: 'Fix capacity' }), admin);
+    expect(response.status).toBe(202);
+    const parked: any = await response.json();
+    expect(parked.rejected).toContainEqual({ machine: 'hetzner', engine: 'claude', reason: 'goal_unsupported' });
+    expect(f.drainCapacityQueue().promoted).toBe(0);
+    await claimAndFinish(f, blocking.id, 'hetzner', 'shared-codex');
+    expect(sql.exec('SELECT state, engine, request_json FROM fleet_launches WHERE id = ?', parked.fleet_launch_id).one()).toMatchObject({ state: 'offered', engine: 'codex' });
+    expect(JSON.parse(String(sql.exec('SELECT request_json FROM fleet_launches WHERE id = ?', parked.fleet_launch_id).one().request_json)).with_goal).toBe(true);
+  }));
+
   it.each(['starting', 'running'])('reconciles a queued intent after Fleet already reached %s, without a client poll', state => combinedFixture(async (f, s, sql) => {
     await configure(f);
     for (const machine of ['hetzner', 'win35']) {

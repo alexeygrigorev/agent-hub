@@ -53,13 +53,16 @@ const CAPACITY_REASONS = new Set(['account_capacity', 'machine_capacity']);
  * (stale/drained check-ins, policy-disabled engines, engines no live host
  * advertises anymore — e.g. registry routes for engines the current host
  * release stopped running). */
-const INCIDENTAL_REASONS = new Set(['machine_unavailable', 'provider_disabled', 'engine_unavailable']);
+const INCIDENTAL_REASONS = new Set(['machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported']);
 /** Capacity-only placement failure: every rejected route reports transient
  * capacity (account/machine), optionally alongside incidental stale/disabled
  * routes (drained/stale check-ins, policy-disabled engines, registry routes
  * for engines no live host advertises) — but incidentals alone never queue.
+ * Routes excluded by the requested tier or goal capability cannot serve this
+ * intent even after capacity frees, so they are incidental too. Their slugs
+ * remain visible; without a capacity rejection they never queue alone.
  * Any other class (workspace/mode capability, admission, resources, quota
- * evidence, tier) stays a hard reject with its slug visible. */
+ * evidence) stays a hard reject with its slug visible. */
 export function isCapacityOnlyHold(rejected: unknown): rejected is { machine: string; engine: string; reason: string }[] {
   if (!Array.isArray(rejected) || rejected.length === 0) return false;
   let capacity = false;
@@ -369,12 +372,15 @@ export class FleetService {
     const active = reserved + observedSessions;
     const availableSlots = Math.max(0, Number(account.max_concurrency) - active);
     const placeableMachines = new Set<string>();
+    const placementReasons = new Set<string>();
+    if (!routes.length) placementReasons.add('no_routes');
+    if (!availableSlots) placementReasons.add('account_capacity');
     let placeableRoutes = 0;
     for (const route of routes) {
       if (liveEnginesByMachine.get(String(route.machine_id))?.has(String(route.engine))) {
         placeableRoutes++;
         placeableMachines.add(String(route.machine_id));
-      }
+      } else placementReasons.add(liveIds.has(String(route.machine_id)) ? 'engine_unavailable' : 'machine_unavailable');
     }
     return { label: account.label, provider: account.provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled, supports_goal: ['codex', 'codex-orin', 'zai'].includes(account.provider),
       remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || unknown || remaining === null) ? 'unknown' : 'ok', active, available_slots: availableSlots,
@@ -384,6 +390,7 @@ export class FleetService {
       // slots. placeable_slots counts only capacity reachable through a live
       // route; status stays quota health — placement classes live in plan().
       placeable_slots: placeableMachines.size ? availableSlots : 0, placeable_machines: [...placeableMachines].sort(),
+      placement_reasons: [...placementReasons].sort(),
       registry_drift: routes.length > 0 && placeableRoutes < routes.length,
       machines: routes.map(r => r.machine_id) };
   }
@@ -535,7 +542,7 @@ export class FleetService {
         try { bound = JSON.parse(row.request_json); } catch { continue; }
         if (!bound || typeof bound !== 'object') continue;
         const input: any = { mode: bound.mode || 'headless', workspace: bound.workspace, prompt: bound.prompt ?? '', idempotency_key: 'drain-' + row.id };
-        for (const key of ['machine', 'engine', 'account', 'tier', 'cwd', 'parent_id', 'summary', 'approved_action', 'access']) {
+        for (const key of ['machine', 'engine', 'account', 'tier', 'cwd', 'parent_id', 'summary', 'approved_action', 'access', 'with_goal']) {
           if (bound[key] !== undefined && bound[key] !== null) input[key] = bound[key];
         }
         let plan: any;
