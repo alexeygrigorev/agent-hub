@@ -864,13 +864,27 @@ export class FleetService {
         return response({ status: 'reported' });
       });
     }
-    const match = /^\/api\/fleet\/launches\/([a-f0-9-]{36})\/(claim|result)$/.exec(path);
+    const match = /^\/api\/fleet\/launches\/([a-f0-9-]{36})\/(claim|result|reject)$/.exec(path);
     if (match && request.method === 'POST') {
       if (!host) return response({ error: 'forbidden' }, 403);
       const data = await body(request);
       return this.transaction(() => {
         const row: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id = ? AND machine_id = ?', match[1], caller.machineId!).toArray()[0];
         if (!row) return response({ error: 'not_found' }, 404);
+        if (match[2] === 'reject') {
+          if (!object(data, ['reason']) || data.reason !== 'workspace_unavailable') return response({ error: 'invalid_rejection' }, 400);
+          // Only an unclaimed offer proves that no start was authorized. The
+          // transaction fences a racing claim; never reject possibly-live work.
+          if (row.state !== 'offered' || row.native_id || row.launcher_task_id) return response({ error: 'already_claimed' }, 409);
+          if (this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) return response({ error: 'task_report_required' }, 409);
+          const at = new Date(this.now()).toISOString();
+          this.sql.exec("UPDATE fleet_launches SET state = 'failed', verification_status = 'not_started', exit_reason = ?, finished_at = ?, updated_at = ? WHERE id = ? AND state = 'offered'", data.reason, at, at, row.id);
+          if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
+            this.sql.exec("UPDATE session_control_sessions SET state = 'failed', updated_at = ? WHERE fleet_launch_id = ? AND machine_id = ? AND binding_json IS NULL AND state IN ('offered','queued','held')", at, row.id, caller.machineId!);
+          }
+          try { this.drainCapacityQueue(); } catch { /* best-effort */ }
+          return response({ id: row.id, state: 'failed', reason: data.reason });
+        }
         if (match[2] === 'claim') {
           if (row.state !== 'offered') return response({ error: 'already_claimed' }, 409);
           // Pre-hold offers on a now-disabled engine are held, never launched.
@@ -903,12 +917,17 @@ export class FleetService {
             !this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) {
           return response({ id: row.id, state: row.state, replay: true });
         }
-        if (!object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit']) || !['running', 'uncertain', 'failed', 'exited'].includes(data.state) || !['starting', 'running', 'uncertain'].includes(row.state)) return response({ error: 'invalid_transition' }, 409);
+        const noStart = object(data, ['state', 'launcher_task_id', 'confirmed_exit', 'reason']) &&
+          data.state === 'failed' && data.confirmed_exit === true && data.reason === 'launcher_not_started' &&
+          data.launcher_task_id === 'hub-' + row.id && !row.native_id;
+        if (noStart && row.state === 'failed' && row.exit_reason === data.reason && row.launcher_task_id === data.launcher_task_id) return response({ id: row.id, state: row.state, replay: true });
+        if ((!noStart && !object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit'])) || !['running', 'uncertain', 'failed', 'exited'].includes(data.state) || !['starting', 'running', 'uncertain'].includes(row.state)) return response({ error: 'invalid_transition' }, 409);
         if (['exited', 'failed'].includes(data.state) && this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) return response({ error: 'task_report_required' }, 409);
         if (['exited', 'failed'].includes(data.state) && data.confirmed_exit !== true) return response({ error: 'confirmed_exit_required' }, 409);
         if (data.state === 'running' && (typeof data.native_id !== 'string' || data.native_id.length < 1 || data.native_id.length > 160 || (row.mode === 'headless' && !label(data.launcher_task_id)))) return response({ error: 'native_receipt_required' }, 409);
         if ((data.native_id !== undefined && (typeof data.native_id !== 'string' || data.native_id.length > 160)) || (data.launcher_task_id !== undefined && !label(data.launcher_task_id))) return response({ error: 'invalid_receipt' }, 400);
         this.sql.exec('UPDATE fleet_launches SET state = ?, native_id = COALESCE(?, native_id), launcher_task_id = COALESCE(?, launcher_task_id), updated_at = ? WHERE id = ?', data.state, data.native_id || null, data.launcher_task_id || null, new Date(this.now()).toISOString(), row.id);
+        if (noStart) this.sql.exec("UPDATE fleet_launches SET exit_reason = 'launcher_not_started', verification_status = 'not_started', finished_at = ? WHERE id = ?", new Date(this.now()).toISOString(), row.id);
         // An attempted start with uncertain effects is no longer an offer.
         // Keep its reservation and missing binding, but expose the real state.
         if (data.state === 'uncertain' && this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {

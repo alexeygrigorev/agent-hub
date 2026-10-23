@@ -358,6 +358,37 @@ describe('generic accounts and launch placement', () => {
     expect((await s.handle(request(path, { state: 'failed', confirmed_exit: true }), host('hetzner'))).status).toBe(200);
     expect(state('matching')).toBe('failed'); expect(state('foreign-host')).toBe('offered'); expect(state('other-launch')).toBe('offered');
   }));
+  it('replays a fenced no-start failure and retains its terminal reason', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    const path = '/launches/' + launch.id;
+    const receipt = { state: 'failed', confirmed_exit: true, reason: 'launcher_not_started', launcher_task_id: 'hub-' + launch.id };
+    expect((await s.handle(request(path + '/result', receipt), host('hetzner'))).status).toBe(409);
+    await s.handle(request(path + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+    expect((await s.handle(request(path + '/result', { ...receipt, launcher_task_id: 'hub-other' }), host('hetzner'))).status).toBe(409);
+    expect((await s.handle(request(path + '/result', receipt), host('hetzner'))).status).toBe(200);
+    expect(await (await s.handle(request(path + '/result', receipt), host('hetzner'))).json()).toMatchObject({ replay: true });
+    expect(sql.exec('SELECT state, exit_reason, verification_status FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'failed', exit_reason: 'launcher_not_started', verification_status: 'not_started' });
+  }));
+  it('rejects only unclaimed own-host offers with an explicit workspace failure', async () => fixture(async (s, sql) => {
+    await configure(s);
+    for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
+    const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES ('pending', 'owner', 'pending', '{}', ?, 'hetzner', 'headless', 'offered', ?, ?)", launch.id, iso(), iso());
+    const path = '/launches/' + launch.id + '/reject';
+    const receipt = { reason: 'workspace_unavailable' };
+    expect((await s.handle(request(path, receipt), host('win35'))).status).toBe(404);
+    expect((await s.handle(request(path, receipt), admin)).status).toBe(403);
+    expect((await s.handle(request(path, { reason: 'arbitrary text' }), host('hetzner'))).status).toBe(400);
+    expect((await s.handle(request(path, receipt), host('hetzner'))).status).toBe(200);
+    expect(sql.exec('SELECT state, exit_reason, verification_status FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'failed', exit_reason: 'workspace_unavailable', verification_status: 'not_started' });
+    expect(sql.exec("SELECT state FROM session_control_sessions WHERE id = 'pending'").one().state).toBe('failed');
+    expect((await s.handle(request(path, receipt), host('hetzner'))).status).toBe(409);
+    const claimed: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    await s.handle(request('/launches/' + claimed.id + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+    expect((await s.handle(request('/launches/' + claimed.id + '/reject', receipt), host('hetzner'))).status).toBe(409);
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', claimed.id).one().state).toBe('starting');
+  }));
   it('limits dashboards to admins and does not return prompts or credentials', async () => fixture(async s => {
     await configure(s); await s.handle(request('/launches', intent()), admin);
     expect((await s.handle(request('', undefined, 'GET'), host('hetzner'))).status).toBe(403);

@@ -665,6 +665,15 @@ class Dispatcher:
                     continue
                 if data.get("settled") is True:
                     continue
+                if data.get("state") == "not_started":
+                    offer_id = data.get("offer_id")
+                    if (isinstance(offer_id, str) and LABEL.fullmatch(offer_id)
+                            and entry.name == f"{offer_id}.json"
+                            and data.get("task_id") == f"hub-{offer_id}"
+                            and data.get("mode") == "headless"
+                            and data.get("reason") == "launcher_not_started"):
+                        self._active_launches[offer_id] = data
+                    continue
                 if data.get("state") != "running":
                     continue
                 offer_id = data.get("offer_id")
@@ -781,6 +790,21 @@ class Dispatcher:
 
         for offer_id, record in list(self._active_launches.items()):
             if record.get("settled") is True:
+                continue
+            if record.get("state") == "not_started":
+                try:
+                    # Repeat the fenced proof, including after process restart.
+                    # Never treat a journal assertion alone as native exit proof.
+                    from .launcher_recovery import settle_unstarted
+                    if not settle_unstarted(launcher, record["task_id"], record["workspace"], record["target_cwd"]):
+                        continue
+                    self.request("POST", "/api/fleet/launches/" + offer_id + "/result", {
+                        "state": "failed", "launcher_task_id": record["task_id"], "confirmed_exit": True, "reason": "launcher_not_started"})
+                    record["settled"] = True
+                    self._persist_launch_record(record)
+                    reconciled.append({"id": offer_id, "state": "failed", "reason": "launcher_not_started"})
+                except Exception:
+                    pass
                 continue
             if (record.get("mode") != "headless" or record.get("offer_id") != offer_id
                     or record.get("task_id") != f"hub-{offer_id}"
@@ -1399,6 +1423,27 @@ class Dispatcher:
                     profile=offer.get("profile") or sub.get("profile"),
                 )
         except Exception as exc:
+            if mode == "headless" and not offer.get("task_id"):
+                from .launcher_recovery import settle_unstarted
+                record = {"offer_id": offer_id, "task_id": task_id, "mode": "headless",
+                          "workspace": str(workspace), "target_cwd": str(target_cwd),
+                          "state": "not_started", "reason": "launcher_not_started", "settled": False}
+                try:
+                    # Persist recovery intent BEFORE changing launcher state.
+                    # A crash after the fence must not lose its Hub receipt.
+                    # The journal alone is never proof: replay rechecks storage.
+                    self._persist_launch_record(record)
+                    self._active_launches[offer_id] = record
+                    if settle_unstarted(launcher, task_id, workspace, target_cwd):
+                        self.request("POST", path + "/result", {
+                            "state": "failed", "launcher_task_id": task_id, "confirmed_exit": True, "reason": "launcher_not_started"})
+                        record["settled"] = True
+                        self._persist_launch_record(record)
+                        return {"id": offer_id, "state": "failed", "reason": "launcher_not_started"}
+                except Exception:
+                    # Leave the task untouched if recovery intent cannot be
+                    # journaled; otherwise retry the receipt without relaunch.
+                    pass
             # Effect may have happened: hold capacity and require reconciliation.
             # Bounded private diagnostic only (type + stage, never argv/goal/
             # tokens/stdout). Returned locally and reported as uncertain reason
@@ -1535,6 +1580,18 @@ class Dispatcher:
             try:
                 results.append(self.dispatch(offer))
             except Exception as exc:
+                if offer.get("mode") == "headless" and not offer.get("task_id"):
+                    try:
+                        resolve_workspace_path(self.settings, offer.get("workspace"))
+                    except (ValueError, OSError):
+                        try:
+                            rejected = self.request("POST", "/api/fleet/launches/" + offer["id"] + "/reject", {"reason": "workspace_unavailable"})
+                            results.append(rejected)
+                            continue
+                        except Exception:
+                            # A racing claim or older server is not no-start
+                            # proof. Keep the offer held and retry next cycle.
+                            pass
                 # Route/claim/admission refusal: no native effect. Bounded
                 # classification only (type + stage, never argv/goal/secrets)
                 # so held-offers stay distinguishable in local counts.
