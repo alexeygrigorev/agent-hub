@@ -231,17 +231,35 @@ describe('generic accounts and launch placement', () => {
     config.routes = [];
     expect((await s.handle(request('/accounts', config, 'PUT'), admin)).status).toBe(409);
   }));
-  it('refuses policy changes or route removal even when another route is added during a launch', async () => fixture(async s => {
+  it('refuses policy decreases or route removal even when another route is added during a launch', async () => fixture(async (s, sql) => {
     await configure(s);
     await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin);
-    for (const change of ['capacity', 'remove', 'profile']) {
+    for (const change of ['remove', 'profile', 'provider', 'reserve', 'enabled']) {
       const config = registry();
       config.routes.push({ ...config.routes[0], engine: 'antigravity' });
-      if (change === 'capacity') config.accounts[0].max_concurrency += 1;
       if (change === 'remove') config.routes.splice(0, 1);
       if (change === 'profile') config.routes[0].profile = 'changed' as any;
+      if (change === 'provider') config.accounts[0].provider = 'zai' as any;
+      if (change === 'reserve') config.accounts[0].reserve_percent += 1;
+      if (change === 'enabled') config.accounts[0].enabled = false as any;
       expect((await s.handle(request('/accounts', config, 'PUT'), admin)).status).toBe(409);
     }
+    // A decrease (2 -> 1) still holds the registry after a raise widened the pool.
+    const raised = registry(); raised.accounts[0].max_concurrency = 2;
+    expect((await s.handle(request('/accounts', raised, 'PUT'), admin)).status).toBe(200);
+    expect(sql.exec('SELECT max_concurrency AS n FROM fleet_accounts WHERE label = ?', 'shared-codex').one().n).toBe(2);
+    expect((await s.handle(request('/accounts', registry(), 'PUT'), admin)).status).toBe(409);
+    expect(sql.exec('SELECT max_concurrency AS n FROM fleet_accounts WHERE label = ?', 'shared-codex').one().n).toBe(2);
+  }));
+  it('applies a max_concurrency raise under live launches without touching reservations', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    const config = registry();
+    config.accounts[0].max_concurrency += 1;
+    const result = await s.handle(request('/accounts', config, 'PUT'), admin);
+    expect(result.status).toBe(200);
+    expect(sql.exec('SELECT max_concurrency AS n FROM fleet_accounts WHERE label = ?', 'shared-codex').one().n).toBe(2);
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('offered');
   }));
   it('binds claims to authenticated host and requires fresh account admission; duplicate claims cannot run twice', async () => fixture(async s => {
     await configure(s);

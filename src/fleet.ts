@@ -694,9 +694,20 @@ export class FleetService {
           // account policy, subscriptions, routes or execution reservations.
           const accounts = this.sql.exec('SELECT * FROM fleet_accounts').toArray() as any[];
           const routes = this.sql.exec('SELECT * FROM fleet_routes').toArray() as any[];
-          const unchangedAccounts = accounts.every(a => data.accounts.some((n: any) =>
-            n.label === a.label && n.provider === a.provider && n.max_concurrency === a.max_concurrency &&
-            n.reserve_percent === a.reserve_percent && Number(n.enabled) === a.enabled));
+          const sameAccountFields = (a: any, n: any) =>
+            n.label === a.label && n.provider === a.provider &&
+            n.reserve_percent === a.reserve_percent && Number(n.enabled) === a.enabled;
+          // Pure concurrency raises (same label/provider/reserve/enabled,
+          // new max >= old max) are safe under live launches: they only widen
+          // the pool, never revoke in-flight reservations. Decreases and any
+          // other field change still hold the registry with 409.
+          const raisesAllowed = accounts.every(a => data.accounts.some((n: any) =>
+            sameAccountFields(a, n) && n.max_concurrency >= a.max_concurrency));
+          const raises = (data.accounts as any[]).filter(n => {
+            const old = accounts.find(a => a.label === n.label);
+            return old && sameAccountFields(old, n) && n.max_concurrency > old.max_concurrency;
+          });
+          const newLabels = (data.accounts as any[]).filter(n => !accounts.some(a => a.label === n.label));
           const sameRoute = (a: any, b: any) => a.machine_id === b.machine_id && a.engine === b.engine && a.account === b.account && a.profile === b.profile;
           const removed = routes.filter(r => !data.routes.some((n: any) => sameRoute(r, n)));
           // Prune obsolete routes without resetting subscriptions or pools.
@@ -710,8 +721,9 @@ export class FleetService {
             return !active && (!live || (Array.isArray(engines) && !engines.includes(r.engine)));
           });
           const added = data.routes.filter((n: any) => !routes.some(r => sameRoute(r, n)));
-          if (!unchangedAccounts || !safeRemoval || (!added.length && !removed.length && accounts.length === data.accounts.length)) return response({ error: 'active_launches_hold_registry' }, 409);
+          if (!raisesAllowed || !safeRemoval || (!added.length && !removed.length && !raises.length && !newLabels.length)) return response({ error: 'active_launches_hold_registry' }, 409);
           for (const a of data.accounts) if (!accounts.some(old => old.label === a.label)) this.sql.exec('INSERT INTO fleet_accounts VALUES (?, ?, ?, ?, ?)', a.label, a.provider, a.max_concurrency, a.reserve_percent, Number(a.enabled));
+          for (const r of raises) this.sql.exec('UPDATE fleet_accounts SET max_concurrency = ? WHERE label = ?', r.max_concurrency, r.label);
           for (const r of added) this.sql.exec('INSERT INTO fleet_routes VALUES (?, ?, ?, ?)', r.machine_id, r.engine, r.account, r.profile);
           for (const r of removed) this.sql.exec('DELETE FROM fleet_routes WHERE machine_id = ? AND engine = ? AND account = ?', r.machine_id, r.engine, r.account);
           return response({ status: 'configured', added_routes: added.length, ...(removed.length ? { removed_routes: removed.length } : {}) });

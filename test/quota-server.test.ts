@@ -57,8 +57,12 @@ describe('Hub server account quota', () => {
         method: 'PUT', body: JSON.stringify({ accounts: data, routes: [] }) }), { caller: { isAdmin: true }, scopes: ['admin'] });
       expect((await update(accounts)).status).toBe(200);
       expect(hub.sql.exec("SELECT state FROM fleet_launches WHERE id = 'live'").one().state).toBe('running');
-      expect((await update([{ ...accounts[0], max_concurrency: 5 }, accounts[1]])).status).toBe(409);
-      expect(hub.sql.exec("SELECT max_concurrency FROM fleet_accounts WHERE label = 'main'").one().max_concurrency).toBe(4);
+      // A pure max_concurrency raise widens the pool under live launches.
+      expect((await update([{ ...accounts[0], max_concurrency: 5 }, accounts[1]])).status).toBe(200);
+      expect(hub.sql.exec("SELECT max_concurrency FROM fleet_accounts WHERE label = 'main'").one().max_concurrency).toBe(5);
+      // A decrease still holds the registry.
+      expect((await update([{ ...accounts[0], max_concurrency: 4 }, accounts[1]])).status).toBe(409);
+      expect(hub.sql.exec("SELECT max_concurrency FROM fleet_accounts WHERE label = 'main'").one().max_concurrency).toBe(5);
     });
   });
 
