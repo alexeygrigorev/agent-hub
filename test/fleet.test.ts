@@ -135,6 +135,36 @@ describe('generic accounts and launch placement', () => {
     expect((await s.handle(request('/accounts', registry(), 'PUT'), host('hetzner'))).status).toBe(403);
     expect(sql.exec('SELECT COUNT(*) n FROM fleet_accounts').one().n).toBe(0);
   }));
+  it('counts an in-flight native spawn once in both account and machine capacity', async () => fixture(async (s, sql) => {
+    await configure(s);
+    sql.exec("UPDATE fleet_accounts SET max_concurrency = 2 WHERE label = 'shared-codex'");
+    sql.exec("INSERT INTO routing_machines (machine_id,needs_json,max_agents,runners_json,observed_at) VALUES ('hetzner','[]',2,'[]',?)", iso());
+    for (const mode of ['headless', 'interactive']) {
+      sql.exec('DELETE FROM fleet_sessions'); sql.exec('DELETE FROM fleet_launches');
+      const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner', mode })), admin)).json();
+      sql.exec("UPDATE fleet_launches SET state = 'starting' WHERE id = ?", launch.id);
+      const tag = (mode === 'headless' ? 'task-hub-' : 'hub-') + launch.id;
+      sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,profile,account,last_activity_at) VALUES ('hetzner','spawned',?,'codex','running',NULL,?,'demo',NULL,'shared-codex',?)", tag, iso(), iso());
+      const active = () => s.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-codex'").one()).active;
+      expect(active()).toBe(1);
+      sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,profile,account,last_activity_at) VALUES ('hetzner','ambiguous',?,'codex','running',NULL,?,'demo',NULL,'shared-codex',?)", tag, iso(), iso());
+      expect(active()).toBe(3); // ambiguous tag reuse never collapses two processes
+      sql.exec("DELETE FROM fleet_sessions WHERE native_id='ambiguous'");
+      expect(s.plan(intent({ machine: 'hetzner' })).selected?.machine).toBe('hetzner');
+      for (const update of ["tag='foreign'", "workspace='foreign'", "engine='claude'", "profile='foreign'"]) {
+        sql.exec('UPDATE fleet_sessions SET ' + update);
+        expect(active()).toBe(2);
+        sql.exec("UPDATE fleet_sessions SET tag=?,workspace='demo',engine='codex',profile=NULL", tag);
+      }
+      sql.exec("UPDATE fleet_sessions SET account='desktop-codex'");
+      expect(s.plan(intent({ machine: 'hetzner' })).selected).toBeNull();
+      sql.exec("UPDATE fleet_sessions SET account='shared-codex'");
+      sql.exec("UPDATE fleet_launches SET state='offered' WHERE id=?", launch.id);
+      expect(active()).toBe(2); // no claim: a tag alone proves no reservation linkage
+      sql.exec("UPDATE fleet_launches SET state='running',native_id='different' WHERE id=?", launch.id);
+      expect(active()).toBe(2); // a known UUID never falls back to matching tags
+    }
+  }));
   it('defaults to headless and supports automatic interactive placement and machine pinning', async () => fixture(async (s, sql) => {
     await configure(s);
     const plan: any = s.plan(intent({ machine: 'win35' }));

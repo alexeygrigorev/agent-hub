@@ -1501,6 +1501,42 @@ class Dispatcher:
             self._maybe_cleanup_worktree(workspace, native_id)
         return {"id": offer_id, **result}
 
+    def report_catalog_bindings(self):
+        """Report authoritative native identity, then bind matching Hub starts.
+
+        Repeat immediately after each confirmed start so later offers and
+        the next poll interval cannot delay its binding or double-count its
+        native process alongside its reservation. Failure is safe to retry:
+        this helper never launches anything.
+        """
+        raw = self.runner([self.settings.get("aplexer_bin", "aplexer"), "list", "--all", "--json"])
+        self.request("PUT", "/api/fleet/sessions", {"sessions": session_metadata(raw, self.settings)})
+        # Reconcile Fleet-owned starts into exact Hub session bindings after
+        # reporting the observed native catalog. Retry is read-before-write.
+        try:
+            pending = self.request("GET", "/api/sessions/host-bindings").get("sessions", [])
+        except ValueError as exc:
+            # Cloudflare may briefly route to the previous DO version during
+            # rollout. Continue Fleet work; reconcile bindings next cycle.
+            if "404" not in str(exc):
+                raise
+            pending = []
+        rows = raw if isinstance(raw, list) else raw.get("sessions", [])
+        for session in pending:
+            if not isinstance(session, dict):
+                continue
+            row = find_binding_row(rows, session)
+            if row is None:
+                continue
+            try:
+                self.request("POST", "/api/sessions/" + session["id"] + "/binding", {"native": {"native_id": row["id"], "tag": row["tag"], "workspace": row["workspace"], "native_created_at_ms": row["created_at_ms"]}})
+            except ValueError:
+                # A refused binding (e.g. server fleet_tag_mismatch for a
+                # launcher-backend tag before the server seam lands) must not
+                # kill the cycle; the entry stays pending for next cycle.
+                continue
+        return raw
+
     def once(self):
         from . import provisioning
         provisioning.tick()
@@ -1535,8 +1571,7 @@ class Dispatcher:
         hb['gate'] = {'launch_allowed': allowed, 'reason': 'fleet local admission' if allowed else 'fleet admission unavailable', 'at': utcnow()}
         self.request('POST', '/api/host/poll', hb)
         self.request("PUT", "/api/fleet/subscriptions", {"subscriptions": collect_subscriptions(self.settings, self.runner)})
-        raw = self.runner([self.settings.get("aplexer_bin", "aplexer"), "list", "--all", "--json"])
-        self.request("PUT", "/api/fleet/sessions", {"sessions": session_metadata(raw, self.settings)})
+        raw = self.report_catalog_bindings()
         # Native work-claim bridge (Phase 1): mirror redacted local `a work`
         # declarations and `work.*` mailbox events into Hub claims/messages so
         # operators see native work in activity views. Best-effort only: a
@@ -1555,30 +1590,6 @@ class Dispatcher:
             )
         except Exception as exc:
             workclaim_summary = {"ok": False, "error": (type(exc).__name__ or "Error")[:64]}
-        # Reconcile Fleet-owned starts into exact Hub session bindings after
-        # reporting the observed native catalog. Retry is read-before-write.
-        try:
-            pending = self.request("GET", "/api/sessions/host-bindings").get("sessions", [])
-        except ValueError as exc:
-            # Cloudflare may briefly route to the previous DO version during
-            # rollout. Continue Fleet work; reconcile bindings next cycle.
-            if "404" not in str(exc):
-                raise
-            pending = []
-        rows = raw if isinstance(raw, list) else raw.get("sessions", [])
-        for session in pending:
-            if not isinstance(session, dict):
-                continue
-            row = find_binding_row(rows, session)
-            if row is None:
-                continue
-            try:
-                self.request("POST", "/api/sessions/" + session["id"] + "/binding", {"native": {"native_id": row["id"], "tag": row["tag"], "workspace": row["workspace"], "native_created_at_ms": row["created_at_ms"]}})
-            except ValueError:
-                # A refused binding (e.g. server fleet_tag_mismatch for a
-                # launcher-backend tag before the server seam lands) must not
-                # kill the cycle; the entry stays pending for next cycle.
-                continue
         if 'capabilities' in self.settings:
             self.request('PUT', '/api/fleet/routing/capabilities', {'needs': self.settings['capabilities'], 'max_agents': self.settings.get('max_agents', 1), 'runners': [{'engine': s.get('engine', s['service']), 'profile': s.get('profile'), 'account': s['account_label'], 'model': s['launcher_model'], 'effort': s.get('launcher_effort')} for s in self.settings['subscriptions'] if s.get('launcher_model') and s.get('admission_argv')]})
         from .launcher_recovery import settle_retired_legacy
@@ -1590,7 +1601,16 @@ class Dispatcher:
         results.append({"id": "workclaim-sync", **workclaim_summary})
         for offer in offers:
             try:
-                results.append(self.dispatch(offer))
+                outcome = self.dispatch(offer)
+                results.append(outcome)
+                if outcome.get('state') == 'running':
+                    try:
+                        self.report_catalog_bindings()
+                    except Exception as exc:
+                        # A catalog/binding transport error is not a failed
+                        # launch. Keep its real receipt and retry next cycle.
+                        results.append({'id': offer.get('id'), 'state': 'binding_pending',
+                                        'error': type(exc).__name__[:64]})
             except Exception as exc:
                 if offer.get("mode") == "headless" and not offer.get("task_id"):
                     try:

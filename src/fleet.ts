@@ -20,6 +20,19 @@ type Auth = { caller?: AdmissionCaller; scopes?: string[]; error?: Response };
 const LABEL = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 const PROVIDERS = new Set(['codex', 'codex-orin', 'claude', 'grok', 'gemini', 'zai', 'go', 'copilot']);
 const ACTIVE = "('offered','starting','running','uncertain')";
+// A native catalog can observe spawn before the launcher posts its receipt.
+// Correlate that narrow in-flight window without trusting a tag alone.
+const NATIVE_RESERVED = `(l.native_id = s.native_id OR (
+  l.native_id IS NULL AND l.state IN ('starting','uncertain') AND
+  l.engine = s.engine AND l.account = s.account AND l.profile IS s.profile AND
+  l.workspace = s.workspace AND
+  (SELECT COUNT(*) FROM fleet_sessions spawned WHERE spawned.machine_id = s.machine_id
+   AND spawned.tag = s.tag AND spawned.engine = s.engine AND spawned.account = s.account
+   AND spawned.profile IS s.profile AND spawned.workspace = s.workspace
+   AND spawned.phase IN ('starting','running','broken','unknown')) = 1 AND
+  ((l.mode = 'headless' AND s.tag = 'task-hub-' || l.id) OR
+   (l.mode = 'interactive' AND s.tag = 'hub-' || l.id))))`;
+
 /** Orphan observed sessions (live native, no Hub launch) idle longer than
  * this stop holding account quota. A parked PTY with no activity for hours
  * consumes no provider concurrency, while a missing/unparseable activity
@@ -344,7 +357,7 @@ export class FleetService {
       : 0;
     const observedSessions = (() => {
       if (!liveList.length) return 0;
-      const orphans = this.sql.exec(`SELECT s.last_activity_at AS last_activity_at FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown') AND s.machine_id IN (${liveList.map(() => '?').join(',')}) AND NOT EXISTS (SELECT 1 FROM fleet_launches l WHERE l.machine_id = s.machine_id AND l.native_id = s.native_id AND l.state IN ${ACTIVE})`, account.label, ...liveList).toArray() as any[];
+      const orphans = this.sql.exec(`SELECT s.last_activity_at AS last_activity_at FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown') AND s.machine_id IN (${liveList.map(() => '?').join(',')}) AND NOT EXISTS (SELECT 1 FROM fleet_launches l WHERE l.machine_id = s.machine_id AND ${NATIVE_RESERVED} AND l.state IN ${ACTIVE})`, account.label, ...liveList).toArray() as any[];
       const cutoff = this.now() - ORPHAN_OBSERVED_IDLE_TTL_MS;
       let counted = 0;
       for (const row of orphans) {
@@ -475,7 +488,7 @@ export class FleetService {
       const pending = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND state IN ${ACTIVE}`, route.machine_id).one().n);
       const routingInstalled = this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'routing_machines'").toArray().length;
       const limit: any = routingInstalled ? this.sql.exec('SELECT max_agents FROM routing_machines WHERE machine_id = ?', route.machine_id).toArray()[0] : null;
-      const observedSessions = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.machine_id = ? AND s.phase IN ('starting','running','broken','unknown') AND NOT EXISTS (SELECT 1 FROM fleet_launches l WHERE l.machine_id = s.machine_id AND l.native_id = s.native_id AND l.state IN ${ACTIVE})`, route.machine_id).one().n);
+      const observedSessions = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.machine_id = ? AND s.phase IN ('starting','running','broken','unknown') AND NOT EXISTS (SELECT 1 FROM fleet_launches l WHERE l.machine_id = s.machine_id AND ${NATIVE_RESERVED} AND l.state IN ${ACTIVE})`, route.machine_id).one().n);
       if (limit && pending + observedSessions >= limit.max_agents) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'machine_capacity' }); continue; }
 
       const score = (account!.remaining_percent! / 100) / (1 + hb.load[0] / caps.cpu_count + pending);
