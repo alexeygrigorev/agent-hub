@@ -6,7 +6,7 @@ import { effectiveCheckin } from './registry';
 import { taskTier, policy } from './model-routing';
 import { QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, ensureTbmQuotaSchema } from './quota';
 import { evaluateQuotaAdmission } from './quota_admission';
-import { adoptObservedNativeSessions } from './session_control';
+import { adoptObservedNativeSessions, reconcileUnboundFleetSessions } from './session_control';
 import { isValidMachineId } from './machine-id';
 
 export const FLEET_SCHEMA = `
@@ -312,6 +312,7 @@ export class FleetService {
 
   accountStatus(account: any) {
     this.admission.reconcileOffers();
+    reconcileUnboundFleetSessions(this.sql, this.now());
     const routes = this.sql.exec('SELECT machine_id, engine, profile FROM fleet_routes WHERE account = ?', account.label).toArray();
     let remaining: number | null = null; let observed = 0; let unknown = false; let blocked = !account.enabled;
     const reserves = (((policy as any).rules as any).reserve_percent || {}) as Record<string, number>;
@@ -670,12 +671,16 @@ export class FleetService {
     const writer = admin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch'));
     if (path === '/api/fleet' && request.method === 'GET') {
       if (!admin) return response({ error: 'forbidden' }, 403);
+      const controlIds = new Map<string, string>();
+      try {
+        for (const row of this.sql.exec('SELECT id, fleet_launch_id FROM session_control_sessions WHERE fleet_launch_id IN (SELECT id FROM fleet_launches ORDER BY created_at DESC LIMIT 200)').toArray() as any[]) controlIds.set(row.fleet_launch_id, row.id);
+      } catch { /* optional session-control store */ }
       return response({ accounts: this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray().map(a => this.accountStatus(a)), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray().map(r => ({ ...r, supports_goal: ['codex', 'zcodex'].includes(String(r.engine)) })),
         machines: this.sql.exec('SELECT id, name, hostname, last_checkin_at, drained FROM machines ORDER BY id').toArray().map((m: any) => ({ ...m, last_checkin_at: effectiveCheckin(m.id, m.last_checkin_at) })),
         agents: this.sql.exec('SELECT tag, project, role, machine_id, engine, session_id, health_state, health_at FROM agents').toArray(),
         sessions: this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray(),
         subscriptions: this.sql.exec('SELECT * FROM fleet_subscriptions ORDER BY machine_id, service, account').toArray().map((s: any) => ({ machine_id: s.machine_id, account: s.account, service: s.service, plan: s.plan, observed_at: s.observed_at, stale: !fresh(s.observed_at, this.now(), 1200000), quota: parsed(s.quota_json) })),
-        launches: this.sql.exec('SELECT * FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => { const { request_json, request_key, prompt, ...view } = row; return { ...view, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; }) });
+        launches: this.sql.exec('SELECT * FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => { const { request_json, request_key, prompt, ...view } = row; return { ...view, hub_session_id: controlIds.get(row.id) ?? null, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; }) });
     }
     if (path === '/api/fleet/claim-policy' && request.method === 'GET') {
       if (!admin) return response({ error: 'forbidden' }, 403);
@@ -838,19 +843,23 @@ export class FleetService {
           written++;
         }
         for (const gone of existing.keys()) { this.sql.exec('DELETE FROM fleet_sessions WHERE machine_id = ? AND native_id = ?', caller.machineId!, gone); written++; }
-        // Terminal catalog evidence settles interactive launches only when it
-        // matches the bound native incarnation. Absence is never exit proof;
-        // headless launches retain the maintained launcher's result contract.
+        // Exact positive terminal evidence releases physical concurrency even
+        // if a headless launch journal was lost. Absence is never exit proof.
+        // Routed jobs retain their separate task-result contract.
         for (const native of cleanSessions) {
           if (!['exited', 'dead'].includes(native.phase) || !native.created_at_ms) continue;
-          const managed = this.sql.exec("SELECT * FROM session_control_sessions WHERE machine_id = ? AND mode = 'interactive' AND fleet_launch_id IS NOT NULL AND binding_json IS NOT NULL", caller.machineId!).toArray() as any[];
+          // Deleted cwd/workspace is a capacity projection above, not positive
+          // native exit evidence. It must never settle a launch reservation.
+          if (native.workspace.endsWith(' (deleted)') || native.cwd?.endsWith(' (deleted)')) continue;
+          const managed = this.sql.exec("SELECT * FROM session_control_sessions WHERE machine_id = ? AND fleet_launch_id IS NOT NULL AND binding_json IS NOT NULL", caller.machineId!).toArray() as any[];
           for (const session of managed) {
             const binding = parsed(session.binding_json);
             if (binding.native_id !== native.native_id || binding.tag !== native.tag ||
                 binding.workspace !== native.workspace || binding.native_created_at_ms !== native.created_at_ms ||
                 session.engine !== native.engine) continue;
+            if (this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', session.fleet_launch_id).toArray().length) continue;
             const at = new Date(this.now()).toISOString();
-            this.sql.exec("UPDATE fleet_launches SET state = 'exited', finished_at = ?, updated_at = ?, verification_status = 'verified' WHERE id = ? AND machine_id = ? AND native_id = ? AND mode = 'interactive' AND state IN ('starting','running','uncertain')", at, at, session.fleet_launch_id, caller.machineId!, native.native_id);
+            this.sql.exec("UPDATE fleet_launches SET state = 'exited', finished_at = ?, updated_at = ?, verification_status = 'verified' WHERE id = ? AND machine_id = ? AND native_id = ? AND state IN ('starting','running','uncertain')", at, at, session.fleet_launch_id, caller.machineId!, native.native_id);
             this.sql.exec("UPDATE session_control_sessions SET state = 'stopped', updated_at = ? WHERE id = ? AND state IN ('starting','running','uncertain')", at, session.id);
           }
         }
@@ -967,10 +976,11 @@ export class FleetService {
         // Fleet can run without the optional session-control tables in tests.
         if (['failed', 'exited'].includes(data.state) && this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
           if (noStart) {
-            // launcher_not_started provably never crossed spawn and has no native binding.
-            // Do NOT leave the canonical session as 'failed unbound'; return to 'held'
-            // so it can recover or be retried rather than permanently dying unbound.
-            this.sql.exec("UPDATE session_control_sessions SET state = 'held', updated_at = ? WHERE fleet_launch_id = ? AND machine_id = ? AND binding_json IS NULL AND state IN ('queued', 'held', 'offered', 'starting', 'running', 'uncertain')", new Date(this.now()).toISOString(), row.id, caller.machineId!);
+            // A held session still linked to this failed launch cannot retry:
+            // Fleet idempotency replays the failure forever. Close the attempt
+            // so intake can recover with a new start key. This also repairs
+            // waitlisted sessions whose machine assignment is still null.
+            reconcileUnboundFleetSessions(this.sql, this.now());
           } else {
             this.sql.exec("UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE fleet_launch_id = ? AND machine_id = ? AND state IN ('queued', 'held', 'offered', 'starting', 'running', 'uncertain')", data.state === 'failed' ? 'failed' : 'stopped', new Date(this.now()).toISOString(), row.id, caller.machineId!);
           }

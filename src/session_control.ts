@@ -628,6 +628,7 @@ export class SessionControlService {
    * stay with the binding/result flows, which carry the incarnation evidence
    * this sync must never invent. */
   private syncFleetPlacement(sessionId: string): any | null {
+    reconcileUnboundFleetSessions(this.sql, this.now());
     const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0];
     if (!session || !session.fleet_launch_id) return session;
     if (session.state !== 'queued' && session.state !== 'held') return session;
@@ -1221,6 +1222,7 @@ export class SessionControlService {
 
     if (path === '/api/sessions' && request.method === 'GET') {
       if (!writer) return response({ error: 'forbidden' }, 403);
+      this.transaction(() => reconcileUnboundFleetSessions(this.sql, this.now()));
       // M15c lifecycle: additive grouped needs-action projection over the
       // canonical stores (never a second registry). Scope is authentication,
       // never a payload flag: non-admin callers always see their own actor.
@@ -1496,6 +1498,15 @@ export class SessionControlService {
       let session: any = null;
       if (UUID_RE.test(rawRef)) {
         session = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', rawRef).toArray()[0] ?? null;
+        // Fleet launch UUIDs are also returned to operators. Resolve them to
+        // their canonical control session, with the same ownership checks.
+        // Hosts must keep using the exact session UUID for binding/retirement.
+        if (!session && sub !== 'binding' && sub !== 'retirement') {
+          const matches = (this.sql.exec('SELECT * FROM session_control_sessions WHERE fleet_launch_id = ?', rawRef).toArray() as any[])
+            .filter(row => this.ownerOk(row, caller));
+          if (matches.length > 1) return response({ error: 'ambiguous_name' }, 409);
+          session = matches[0] ?? null;
+        }
         if (!session) {
           const rows = this.sql.exec('SELECT * FROM session_control_sessions WHERE binding_json IS NOT NULL').toArray() as any[];
           for (const r of rows) {
@@ -1789,13 +1800,12 @@ export class SessionControlService {
           }
           const pending = this.sql.exec('SELECT id FROM session_control_commands WHERE session_id = ? LIMIT 1', live.id).toArray();
           const original = parsed(live.request_json, {});
-          // A capacity-queued intent may be released while its fleet waitlist
-          // row is still queued (never offered/claimed). Anything placed,
-          // bound, commanded, or observed stays non-cancellable as before.
-          const queuedFleet = live.state === 'queued' && live.fleet_launch_id && !live.binding_json && !pending.length && original.provenance !== 'observed_native'
-            ? (() => { try { return this.sql.exec('SELECT state FROM fleet_launches WHERE id = ?', live.fleet_launch_id).toArray()[0] ?? null; } catch { return null; } })()
+          // Queued and offered launches have no start authorization. Cancel
+          // atomically against claim; never treat missing binding as no spawn.
+          const queuedFleet = ['queued', 'held', 'offered'].includes(live.state) && live.fleet_launch_id && !live.binding_json && !pending.length && original.provenance !== 'observed_native'
+            ? (() => { try { return this.sql.exec('SELECT state, native_id, launcher_task_id FROM fleet_launches WHERE id = ?', live.fleet_launch_id).toArray()[0] ?? null; } catch { return null; } })()
             : null;
-          if (queuedFleet && queuedFleet.state !== 'queued') return response({ error: 'session_not_cancellable' }, 409);
+          if (queuedFleet && (!['queued', 'offered'].includes(String(queuedFleet.state)) || queuedFleet.native_id || queuedFleet.launcher_task_id)) return response({ error: 'session_not_cancellable' }, 409);
           if ((live.state !== 'held' || live.fleet_launch_id || live.binding_json || pending.length || original.provenance === 'observed_native') && !queuedFleet) {
             return response({ error: 'session_not_cancellable' }, 409);
           }
@@ -1803,11 +1813,11 @@ export class SessionControlService {
           if (queuedFleet) {
             let released = false;
             try {
-              const written: any = this.sql.exec(`UPDATE fleet_launches SET state = 'cancelled', updated_at = ? WHERE id = ? AND state = 'queued'`, at, live.fleet_launch_id);
+              const written: any = this.sql.exec(`UPDATE fleet_launches SET state = 'cancelled', verification_status = 'not_started', exit_reason = 'session_cancelled', finished_at = ?, updated_at = ? WHERE id = ? AND state IN ('queued','offered') AND native_id IS NULL AND launcher_task_id IS NULL`, at, at, live.fleet_launch_id);
               released = written?.rowsWritten === 1;
             } catch { released = false; }
-            // Lost the race with a Fleet-side promotion: refuse rather than
-            // strand an offered launch behind a cancelled session.
+            // A winning host claim must never be stranded behind a
+            // cancelled control session.
             if (!released) return response({ error: 'session_not_cancellable' }, 409);
           }
           this.sql.exec('INSERT INTO session_control_cancellations (session_id, actor, request_key, created_at) VALUES (?, ?, ?, ?)', live.id, actorName(caller), input.key, at);
@@ -2252,6 +2262,23 @@ function actorName(caller: Caller): string {
  * human authorization controls observed sessions. Normal Hub-started bindings
  * stay completely untouched. Absent records are NOT deleted or stopped.
  */
+/** Repair legacy unbound intents from authoritative Fleet terminal receipts.
+ * A null session machine is expected for a waitlisted launch. Match by launch
+ * identity, never by that stale assignment. Bounded, convergent, and safe to
+ * repeat: live/uncertain launches and bound sessions are never reaped. */
+export function reconcileUnboundFleetSessions(sql: SqlStorage, nowMs: number): void {
+  if (sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('fleet_launches','session_control_sessions')").toArray().length !== 2) return;
+  const rows = sql.exec(`SELECT s.id, f.state FROM session_control_sessions s
+    JOIN fleet_launches f ON f.id = s.fleet_launch_id
+    WHERE s.binding_json IS NULL AND s.state IN ('queued','held','offered','starting','running','uncertain')
+    AND f.state IN ('failed','exited','expired','cancelled') LIMIT 100`).toArray() as any[];
+  for (const row of rows) {
+    sql.exec('UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE id = ?',
+      row.state === 'exited' ? 'stopped' : row.state === 'expired' ? 'failed' : row.state,
+      new Date(nowMs).toISOString(), row.id);
+  }
+}
+
 export function adoptObservedNativeSessions(
   sql: SqlStorage,
   machineId: string,

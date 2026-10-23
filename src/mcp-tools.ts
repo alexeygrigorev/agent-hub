@@ -22,7 +22,7 @@ tool('sessions_commands', 'GET', '/api/sessions/{id}/commands', 'Read command re
 for (const action of ['send', 'capture', 'stop']) tool(`sessions_${action}`, 'POST', `/api/sessions/{id}/${action}`,
   action === 'capture' ? 'Queue a sanitized capture; payload: key, max_bytes, screen. Poll sessions_commands for the result.' :
   `DESTRUCTIVE: queue ${action}; payload: key${action === 'send' ? ', body' : ''}. Never infer completion from enqueue; poll sessions_commands.`, [`sessions ${action}`]);
-tool('sessions_cancel', 'POST', '/api/sessions/{id}/cancel', 'Cancel only an owned held intent before any Fleet/native start. payload: key. Reuse the stable key; the no_native_start receipt is cancellation, not confirmed native stop.', ['sessions cancel']);
+tool('sessions_cancel', 'POST', '/api/sessions/{id}/cancel', 'Cancel an owned held, queued or unclaimed offered intent before start authorization. payload: key. Reuse the stable key; the no_native_start receipt is cancellation, not confirmed native stop.', ['sessions cancel']);
 tool('sessions_protect', 'POST', '/api/sessions/{id}/protect', 'Permanently protect an owned session from automated cleanup. payload: key. No unprotect or native effect. Exact current owner credential family is required.', ['sessions protect']);
 tool('sessions_cleanup', 'POST', '/api/sessions/cleanup', 'DESTRUCTIVE when dry_run=false: plan/apply cleanup through existing custody guards. Explicit payload dry_run=true for a preview.', ['sessions cleanup']);
 tool('sessions_observe', 'POST', '/api/sessions/observations', 'Host-only lifecycle observation; ownership remains server validated.', ['sessions observe']);

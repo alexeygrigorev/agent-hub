@@ -1368,6 +1368,59 @@ describe('held placement recovery', () => {
   });
 });
 
+describe('unbound Fleet recovery', () => {
+  it('reaps old null-machine intents from terminal Fleet receipts without retiring uncertain starts', () => fixture(async (s, sql) => {
+    for (const [fleetState, expected] of [['failed', 'failed'], ['expired', 'failed'], ['cancelled', 'cancelled'], ['exited', 'stopped'], ['uncertain', 'queued']]) {
+      const start = await startOk(s, {}, admin);
+      ensureFleetLaunch(sql, start.fleet_launch_id, 'hetzner', null, fleetState);
+      sql.exec("UPDATE session_control_sessions SET state = 'queued', machine_id = NULL, engine = NULL WHERE id = ?", start.id);
+      const list = await (await s.handle(request('/api/sessions', undefined, 'GET'), admin)).json() as any;
+      expect(list.sessions.find((r: any) => r.id === start.id).state).toBe(expected);
+      expect((await (await s.handle(request('/api/sessions/' + start.id, undefined, 'GET'), admin)).json() as any).state).toBe(fleetState === 'uncertain' ? 'uncertain' : expected);
+    }
+  }, fakeReserve().hook));
+
+  it('resolves a Fleet UUID to the owned canonical session for control without granting foreign access', () => fixture(async (s, sql) => {
+    const start = await startOk(s, {}, agent());
+    const launchId = crypto.randomUUID();
+    sql.exec('UPDATE session_control_sessions SET fleet_launch_id = ? WHERE id = ?', launchId, start.id);
+    ensureFleetLaunch(sql, launchId);
+    const shown = await (await s.handle(request('/api/sessions/' + launchId, undefined, 'GET'), agent())).json() as any;
+    expect(shown.id).toBe(start.id);
+    reportFleetSession(sql, 'hetzner', NATIVE_ID, canonTag(launchId), NATIVE_WS);
+    expect(s.recordBinding(start.id, bound({ tag: canonTag(launchId) })).ok).toBe(true);
+    const stopped = await s.handle(request('/api/sessions/' + launchId + '/stop', { key: 'stop-by-launch' }), agent());
+    expect(stopped.status).toBe(201);
+    expect(sql.exec('SELECT session_id FROM session_control_commands').one().session_id).toBe(start.id);
+    expect((await s.handle(request('/api/sessions/' + launchId, undefined, 'GET'), stranger)).status).toBe(404);
+    expect((await s.handle(request('/api/sessions/' + launchId + '/binding', bound(canonTag(launchId))), host('hetzner'))).status).toBe(404);
+  }, fakeReserve().hook));
+
+  it('cancels an unclaimed offer atomically and replays the receipt', () => fixture(async (s, sql) => {
+    const start = await startOk(s, {}, agent());
+    ensureFleetLaunch(sql, start.fleet_launch_id, 'hetzner', null, 'offered');
+    const path = '/api/sessions/' + start.id + '/cancel';
+    const result = await (await s.handle(request(path, { key: 'cancel-offer' }), agent())).json() as any;
+    expect(result.state).toBe('cancelled');
+    expect(result.cancellation.effect).toBe('no_native_start');
+    expect(sql.exec('SELECT state, verification_status FROM fleet_launches WHERE id = ?', start.fleet_launch_id).one()).toMatchObject({ state: 'cancelled', verification_status: 'not_started' });
+    expect((await (await s.handle(request(path, { key: 'cancel-offer' }), agent())).json() as any).replay).toBe(true);
+  }, fakeReserve().hook));
+
+  it('refuses a cancellation when a claim wins while the body is streaming', () => fixture(async (s, sql) => {
+    const start = await startOk(s, {}, agent());
+    ensureFleetLaunch(sql, start.fleet_launch_id, 'hetzner', null, 'offered');
+    let controller: ReadableStreamDefaultController;
+    const stream = new ReadableStream({ start(c) { controller = c; } });
+    const pending = s.handle(new Request('https://hub.test/api/sessions/' + start.id + '/cancel', { method: 'POST', body: stream }), agent());
+    await Promise.resolve();
+    sql.exec("UPDATE fleet_launches SET state = 'starting' WHERE id = ?", start.fleet_launch_id);
+    controller!.enqueue(new TextEncoder().encode('{"key":"racing-claim"}')); controller!.close();
+    expect((await pending).status).toBe(409);
+    expect(sql.exec('SELECT * FROM session_control_cancellations').toArray()).toHaveLength(0);
+  }, fakeReserve().hook));
+});
+
 describe('owned held intent cancellation', () => {
   const start = { key: 'held-cancel-start', name: 'held-fixture', workspace: 'demo', engine: 'codex', mode: 'headless', brief: 'synthetic cancellation fixture' };
 

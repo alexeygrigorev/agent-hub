@@ -111,20 +111,27 @@ describe('generic accounts and launch placement', () => {
     await configure(s);
     expect(s.plan(intent({ tier: null })).selected).toBeTruthy();
   }));
-  it('settles only a matching terminal interactive incarnation, preserving live and headless launches', async () => fixture(async (s, sql) => {
+  it.each(['headless', 'interactive'])('settles a matching terminal %s incarnation, preserving absent and reused natives', (mode) => fixture(async (s, sql) => {
     await configure(s);
-    const launch = await (await s.handle(request('/launches', intent({ mode: 'interactive', machine: 'hetzner' })), admin)).json() as any;
+    const launch = await (await s.handle(request('/launches', intent({ mode, machine: 'hetzner' })), admin)).json() as any;
     const nativeId = crypto.randomUUID();
     sql.exec("UPDATE fleet_launches SET state='running', native_id=? WHERE id=?", nativeId, launch.id);
     const binding = { native_id: nativeId, tag: 'hub-' + launch.id, workspace: '/demo', native_created_at_ms: now };
     sql.exec("INSERT INTO session_control_sessions (id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-      crypto.randomUUID(), 'test-admin', 'terminal-test', '{}', launch.id, 'hetzner', 'codex', 'interactive', 'running', JSON.stringify(binding), iso(), iso());
+      crypto.randomUUID(), 'test-admin', 'terminal-test', '{}', launch.id, 'hetzner', 'codex', mode, 'running', JSON.stringify(binding), iso(), iso());
     const row = { native_id: nativeId, tag: binding.tag, workspace: binding.workspace, engine: 'codex', phase: 'exited', agent_state: null, profile: null, account: 'shared-codex', created_at_ms: now + 1 };
     const report = (sessions: any[]) => s.handle(request('/sessions', { sessions }, 'PUT'), host('hetzner'));
     expect((await report([row])).status).toBe(200);
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?', launch.id).one().state).toBe('running');
     expect((await report([])).status).toBe(200);
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?', launch.id).one().state).toBe('running');
+    expect((await report([{ ...row, phase: 'running', cwd: '/gone (deleted)', created_at_ms: now }])).status).toBe(200);
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?', launch.id).one().state).toBe('running');
+    // Catalog evidence must not bypass the routed task-result contract.
+    sql.exec("INSERT INTO routing_jobs (id,actor,request_key,request_json,launch_id,state,created_at,updated_at) VALUES ('task','test-admin','task-key','{}',?,'running',?,?)", launch.id, iso(), iso());
+    expect((await report([{ ...row, created_at_ms: now }])).status).toBe(200);
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?', launch.id).one().state).toBe('running');
+    sql.exec("DELETE FROM routing_jobs WHERE id = 'task'");
     expect((await report([{ ...row, created_at_ms: now }])).status).toBe(200);
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?', launch.id).one().state).toBe('exited');
     expect(sql.exec('SELECT state FROM session_control_sessions WHERE fleet_launch_id=?', launch.id).one().state).toBe('stopped');
@@ -400,17 +407,17 @@ describe('generic accounts and launch placement', () => {
     expect(await (await s.handle(request(path + '/result', receipt), host('hetzner'))).json()).toMatchObject({ replay: true });
     expect(sql.exec('SELECT state, exit_reason, verification_status FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'failed', exit_reason: 'launcher_not_started', verification_status: 'not_started' });
   }));
-  it('holds canonical session when launcher_not_started occurs instead of failing unbound', async () => fixture(async (s, sql) => {
+  it('closes an unassigned queued canonical attempt when launcher_not_started occurs', async () => fixture(async (s, sql) => {
     await configure(s);
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
     const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
-    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES ('sess-nostart', 'owner', 'key-nostart', '{}', ?, 'hetzner', 'headless', 'offered', ?, ?)", launch.id, iso(), iso());
+    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES ('sess-nostart', 'owner', 'key-nostart', '{}', ?, NULL, 'headless', 'queued', ?, ?)", launch.id, iso(), iso());
     const path = '/launches/' + launch.id;
     await s.handle(request(path + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
     const receipt = { state: 'failed', confirmed_exit: true, reason: 'launcher_not_started', launcher_task_id: 'hub-' + launch.id };
     expect((await s.handle(request(path + '/result', receipt), host('hetzner'))).status).toBe(200);
     expect(sql.exec('SELECT state, exit_reason, verification_status FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'failed', exit_reason: 'launcher_not_started', verification_status: 'not_started' });
-    expect(sql.exec("SELECT state FROM session_control_sessions WHERE id = 'sess-nostart'").one().state).toBe('held');
+    expect(sql.exec("SELECT state FROM session_control_sessions WHERE id = 'sess-nostart'").one().state).toBe('failed');
   }));
   it('ignores sessions on deleted worktrees when computing account capacity', async () => fixture(async (s, sql) => {
     await configure(s);
