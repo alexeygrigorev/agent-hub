@@ -623,20 +623,24 @@ export class SessionControlService {
 
   /** Adopt a Fleet-side promotion of a capacity-queued intent (no new placement).
    *
-   * When the linked fleet launch advanced queued -> offered (fleet drain FIFO
-   * on a freed slot), the session follows. Starting/running/terminal
-   * transitions stay with the binding/result flows, which carry the native
-   * incarnation evidence this sync must never invent. */
+   * When the linked fleet launch advances, the session follows its assignment
+   * even if no client observed offered. Native running/terminal transitions
+   * stay with the binding/result flows, which carry the incarnation evidence
+   * this sync must never invent. */
   private syncFleetPlacement(sessionId: string): any | null {
     const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0];
     if (!session || !session.fleet_launch_id) return session;
     if (session.state !== 'queued' && session.state !== 'held') return session;
     let launch: any = null;
     try { launch = this.sql.exec('SELECT id, machine_id, engine, state FROM fleet_launches WHERE id = ?', session.fleet_launch_id).toArray()[0]; } catch { return session; }
-    if (!launch || launch.state !== 'offered') return session;
+    if (!launch || !['offered', 'starting', 'running', 'uncertain'].includes(launch.state)) return session;
+    // Fleet may claim and start between session polls. Assignment is safe to
+    // adopt in every live launch state, but running still requires the exact
+    // native binding flow; never infer execution solely from this row.
+    const assignedState = launch.state === 'running' ? 'starting' : launch.state;
     try {
       this.sql.exec('UPDATE session_control_sessions SET machine_id = ?, engine = ?, state = ?, updated_at = ? WHERE id = ? AND state = ?',
-        launch.machine_id ?? null, launch.engine ?? null, 'offered', this.at(), sessionId, session.state);
+        launch.machine_id ?? null, launch.engine ?? null, assignedState, this.at(), sessionId, session.state);
     } catch { return session; }
     return this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0] ?? session;
   }
@@ -909,6 +913,11 @@ export class SessionControlService {
       }
 
       // Default GET /api/sessions/host-bindings: pending Fleet starts only
+      // Reconcile queued assignments here as well as in client polling. A
+      // headless start must bind even when no client observed the brief
+      // offered state before the host claimed it.
+      const promoted = this.sql.exec("SELECT s.id, s.host_family, f.machine_id FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id WHERE f.machine_id = ? AND s.binding_json IS NULL AND s.state IN ('queued','held') AND f.state IN ('starting','running') LIMIT 100", caller.machineId!).toArray() as any[];
+      for (const row of promoted) if (this.hostOk(row, caller).ok) this.syncFleetPlacement(row.id);
       const rows = this.sql.exec("SELECT s.*, f.native_id AS launch_native_id FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id WHERE s.machine_id = ? AND s.binding_json IS NULL AND s.state IN ('offered','starting','uncertain') AND f.state IN ('starting','running') LIMIT 100", caller.machineId!).toArray() as any[];
       return response({
         sessions: rows.filter(row => this.hostOk(row, caller).ok).map(row => ({ id: row.id, fleet_launch_id: row.fleet_launch_id, engine: row.engine, native_id: row.launch_native_id ?? null })),

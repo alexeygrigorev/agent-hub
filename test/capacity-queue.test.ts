@@ -237,6 +237,33 @@ describe('fleet account status liveness', () => {
 });
 
 describe('sessions_start capacity queue', () => {
+  it.each(['starting', 'running'])('reconciles a queued intent after Fleet already reached %s, without a client poll', state => combinedFixture(async (f, s, sql) => {
+    await configure(f);
+    for (const machine of ['hetzner', 'win35']) {
+      sql.exec("INSERT INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, scopes, created_by_sub, created_at, expires_at) VALUES (?, 'host', ?, ?, ?, 'test-host', ?, '[\"host\"]', 'test', ?, ?)", 'host-' + machine, 'hash-' + machine, 'refresh-' + machine, 'family-' + machine, machine, iso(), iso(86400000));
+      sql.exec('UPDATE machines SET credential_id = ? WHERE id = ?', 'host-' + machine, machine);
+    }
+    const enrolled = (machine: string) => ({ ...host(machine), caller: { ...host(machine).caller, tokenId: 'host-' + machine } });
+    const blocking: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    const parked: any = await (await s.handle(sessReq('/api/sessions', { key: 'fast-promotion', workspace: 'demo', machine: 'hetzner', brief: 'queue race probe' }), admin)).json();
+    expect(parked.state).toBe('queued');
+    await claimAndFinish(f, blocking.id, 'hetzner', 'shared-codex');
+    const nativeId = '11111111-2222-4333-8444-555555555555';
+    expect((await f.handle(fleetReq('/launches/' + parked.fleet_launch_id + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'))).status).toBe(200);
+    if (state === 'running') expect((await f.handle(fleetReq('/launches/' + parked.fleet_launch_id + '/result', { state: 'running', native_id: nativeId, launcher_task_id: 'queue-race' }), host('hetzner'))).status).toBe(200);
+    // A foreign host cannot adopt the assignment, and no native identity is invented.
+    const foreign: any = await (await s.handle(sessReq('/api/sessions/host-bindings', undefined, 'GET'), enrolled('win35'))).json();
+    expect(foreign.sessions).toHaveLength(0);
+    const stale: any = await (await s.handle(sessReq('/api/sessions/host-bindings', undefined, 'GET'), host('hetzner'))).json();
+    expect(stale.sessions).toHaveLength(0);
+    expect(sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', parked.id).one().state).toBe('queued');
+    const pending: any = await (await s.handle(sessReq('/api/sessions/host-bindings', undefined, 'GET'), enrolled('hetzner'))).json();
+    expect(pending.sessions).toContainEqual({ id: parked.id, fleet_launch_id: parked.fleet_launch_id, engine: 'codex', native_id: state === 'running' ? nativeId : null });
+    const adopted: any = await (await s.handle(sessReq('/api/sessions/' + parked.id, undefined, 'GET'), admin)).json();
+    expect(adopted.state).toBe('starting');
+    expect(adopted.machine).toBe('hetzner');
+    expect(adopted.binding).toBeNull();
+  }));
   it('parks capacity-only starts as waitable queued intents that place when slots free', () => combinedFixture(async (f, s, sql) => {
     await configure(f);
     const blocking: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner' })), admin)).json();
