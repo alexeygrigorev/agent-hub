@@ -430,6 +430,22 @@ describe('M9 metrics receiver', () => {
     expect(js).toContain('textContent');
     expect(js).not.toContain('innerHTML');
     expect(js).toContain('Accepted outcomes');
+    // The chart bundle must pass the same real Worker/session gate as the page.
+    const chartAnon = await doFetch(new Request('http://example.com/metrics-charts.js', { redirect: 'manual' }));
+    expect(chartAnon.status).toBe(303);
+    const chartAgent = await doFetch(new Request('http://example.com/metrics-charts.js', {
+      headers: { Authorization: `Bearer ${hostA.accessToken}` }, redirect: 'manual',
+    }));
+    expect(chartAgent.status).toBe(303);
+    const chartAuth = await doFetch(new Request('http://example.com/metrics-charts.js', {
+      headers: { Cookie: sessionCookie }, redirect: 'manual',
+    }));
+    expect(chartAuth.status).toBe(200);
+    expect(chartAuth.headers.get('Cache-Control')).toBe('private, no-store');
+    const chartSource = await chartAuth.text();
+    expect(chartSource).toContain('HubMetricsCharts');
+    expect(chartSource).not.toContain('innerHTML');
+    expect(chartSource).not.toContain(hostA.accessToken);
     const jobTok = 'hubt_jobmetrics1';
     const routingTok = 'hubt_routingmetrics1';
     await runInDurableObject(stub, async (instance: Hub) => {

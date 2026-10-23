@@ -107,7 +107,7 @@ export default {
       '/fleet.html', '/fleet.js', '/fleet.css',
       '/engines.html', '/engines.js', '/engines.css',
       '/conversations.html', '/conversations.js', '/conversations.css',
-      '/metrics', '/metrics.html', '/metrics.js', '/metrics.css',
+      '/metrics', '/metrics.html', '/metrics.js', '/metrics-charts.js', '/metrics.css',
       '/usage', '/usage.html',
       '/sessions', '/sessions.html', '/sessions.js', '/sessions.css',
       '/vendor/dakit/dakit.css', '/vendor/dakit/shell.js', '/vendor/dakit/split.js', '/vendor/dakit/dialogs.js',
