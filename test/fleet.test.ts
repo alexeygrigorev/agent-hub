@@ -400,6 +400,27 @@ describe('generic accounts and launch placement', () => {
     expect(await (await s.handle(request(path + '/result', receipt), host('hetzner'))).json()).toMatchObject({ replay: true });
     expect(sql.exec('SELECT state, exit_reason, verification_status FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'failed', exit_reason: 'launcher_not_started', verification_status: 'not_started' });
   }));
+  it('holds canonical session when launcher_not_started occurs instead of failing unbound', async () => fixture(async (s, sql) => {
+    await configure(s);
+    for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
+    const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES ('sess-nostart', 'owner', 'key-nostart', '{}', ?, 'hetzner', 'headless', 'offered', ?, ?)", launch.id, iso(), iso());
+    const path = '/launches/' + launch.id;
+    await s.handle(request(path + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+    const receipt = { state: 'failed', confirmed_exit: true, reason: 'launcher_not_started', launcher_task_id: 'hub-' + launch.id };
+    expect((await s.handle(request(path + '/result', receipt), host('hetzner'))).status).toBe(200);
+    expect(sql.exec('SELECT state, exit_reason, verification_status FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'failed', exit_reason: 'launcher_not_started', verification_status: 'not_started' });
+    expect(sql.exec("SELECT state FROM session_control_sessions WHERE id = 'sess-nostart'").one().state).toBe('held');
+  }));
+  it('ignores sessions on deleted worktrees when computing account capacity', async () => fixture(async (s, sql) => {
+    await configure(s);
+    sql.exec("INSERT INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, profile, account) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      'hetzner', 'deleted-native', 'deleted-tag', 'codex', 'running', null, iso(), '/home/alexey/git/agent-hub-wt-old (deleted)', null, 'shared-codex');
+    const status: any = await (await s.handle(request('', undefined, 'GET'), admin)).json();
+    const account = status.accounts.find((a: any) => a.label === 'shared-codex');
+    expect(account.active).toBe(0);
+    expect(account.available_slots).toBe(account.max_concurrency);
+  }));
   it('rejects only unclaimed own-host offers with an explicit workspace failure', async () => fixture(async (s, sql) => {
     await configure(s);
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);

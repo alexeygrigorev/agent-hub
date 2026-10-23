@@ -29,6 +29,16 @@ class FleetTests(unittest.TestCase):
                 'phase': 'running', 'state': 'broken', 'worker_alive': False}]
         self.assertEqual(fleet.session_metadata(raw, settings(Path('/repo')))[0]['phase'], 'broken')
 
+    def test_session_metadata_marks_deleted_worktree_as_exited(self):
+        raw = [{'id': 'id', 'tag': 'tag', 'workspace': '/repo/deleted-wt (deleted)', 'engine': 'codex',
+                'phase': 'running', 'state': 'running', 'worker_alive': True}]
+        self.assertEqual(fleet.session_metadata(raw, settings(Path('/repo')))[0]['phase'], 'exited')
+
+    def test_session_metadata_marks_enoent_home_workspace_as_exited(self):
+        raw = [{'id': 'id', 'tag': 'tag', 'workspace': '/home/alexey/nonexistent-workspace-path-12345', 'engine': 'codex',
+                'phase': 'running', 'state': 'running', 'worker_alive': True}]
+        self.assertEqual(fleet.session_metadata(raw, settings(Path('/repo')))[0]['phase'], 'exited')
+
     def test_multi_account_config_and_secret_fields_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / 'subscriptions.json'

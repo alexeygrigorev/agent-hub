@@ -520,10 +520,21 @@ def session_metadata(raw, settings):
             created_at_ms = int(created_at_ms)
         elif not isinstance(created_at_ms, int) or created_at_ms <= 0:
             created_at_ms = None
-        clean.append({"native_id": session["id"], "tag": session["tag"], "workspace": session.get("workspace", ""), "engine": engine,
+        ws = session.get("workspace", "")
+        cwd = session.get("cwd") if isinstance(session.get("cwd"), str) else None
+        phase = session.get("state") or session.get("phase", "unknown")
+        if isinstance(ws, str) and ws.endswith(" (deleted)"):
+            phase = "exited"
+        elif isinstance(cwd, str) and cwd.endswith(" (deleted)"):
+            phase = "exited"
+        elif isinstance(ws, str) and ws.startswith(("/home/", "/tmp/")) and not os.path.exists(ws):
+            phase = "exited"
+        elif isinstance(cwd, str) and cwd.startswith(("/home/", "/tmp/")) and not os.path.exists(cwd):
+            phase = "exited"
+        clean.append({"native_id": session["id"], "tag": session["tag"], "workspace": ws, "engine": engine,
                       "profile": profile, "account": matches[0]["account_label"] if len(matches) == 1 else None,
-                      "phase": session.get("state") or session.get("phase", "unknown"), "agent_state": session.get("reported_state"),
-                      "cwd": session.get("cwd") if isinstance(session.get("cwd"), str) else None,
+                      "phase": phase, "agent_state": session.get("reported_state"),
+                      "cwd": cwd,
                       "last_activity_at": _ms_to_iso(session.get("last_activity_ms")),
                       "created_at_ms": created_at_ms})
     return clean

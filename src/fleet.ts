@@ -360,7 +360,7 @@ export class FleetService {
       : 0;
     const observedSessions = (() => {
       if (!liveList.length) return 0;
-      const orphans = this.sql.exec(`SELECT s.last_activity_at AS last_activity_at FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown') AND s.machine_id IN (${liveList.map(() => '?').join(',')}) AND NOT EXISTS (SELECT 1 FROM fleet_launches l WHERE l.machine_id = s.machine_id AND ${NATIVE_RESERVED} AND l.state IN ${ACTIVE})`, account.label, ...liveList).toArray() as any[];
+      const orphans = this.sql.exec(`SELECT s.last_activity_at AS last_activity_at FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown') AND s.workspace NOT LIKE '% (deleted)' AND (s.cwd IS NULL OR s.cwd NOT LIKE '% (deleted)') AND s.machine_id IN (${liveList.map(() => '?').join(',')}) AND NOT EXISTS (SELECT 1 FROM fleet_launches l WHERE l.machine_id = s.machine_id AND ${NATIVE_RESERVED} AND l.state IN ${ACTIVE})`, account.label, ...liveList).toArray() as any[];
       const cutoff = this.now() - ORPHAN_OBSERVED_IDLE_TTL_MS;
       let counted = 0;
       for (const row of orphans) {
@@ -827,6 +827,9 @@ export class FleetService {
               continue;
             }
           }
+          if (s.workspace.endsWith(' (deleted)') || (typeof s.cwd === 'string' && s.cwd.endsWith(' (deleted)'))) {
+            s.phase = 'exited';
+          }
           cleanSessions.push(s);
           const prior = existing.get(s.native_id); existing.delete(s.native_id);
           const row = { ...s, last_activity_at: s.last_activity_at ?? null, cwd: s.cwd ?? null, created_at_ms: s.created_at_ms ?? null };
@@ -963,7 +966,14 @@ export class FleetService {
         // a failed start, preventing recovery despite released Fleet capacity.
         // Fleet can run without the optional session-control tables in tests.
         if (['failed', 'exited'].includes(data.state) && this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
-          this.sql.exec("UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE fleet_launch_id = ? AND machine_id = ? AND state IN ('queued', 'held', 'offered', 'starting', 'running', 'uncertain')", data.state === 'failed' ? 'failed' : 'stopped', new Date(this.now()).toISOString(), row.id, caller.machineId!);
+          if (noStart) {
+            // launcher_not_started provably never crossed spawn and has no native binding.
+            // Do NOT leave the canonical session as 'failed unbound'; return to 'held'
+            // so it can recover or be retried rather than permanently dying unbound.
+            this.sql.exec("UPDATE session_control_sessions SET state = 'held', updated_at = ? WHERE fleet_launch_id = ? AND machine_id = ? AND binding_json IS NULL AND state IN ('queued', 'held', 'offered', 'starting', 'running', 'uncertain')", new Date(this.now()).toISOString(), row.id, caller.machineId!);
+          } else {
+            this.sql.exec("UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE fleet_launch_id = ? AND machine_id = ? AND state IN ('queued', 'held', 'offered', 'starting', 'running', 'uncertain')", data.state === 'failed' ? 'failed' : 'stopped', new Date(this.now()).toISOString(), row.id, caller.machineId!);
+          }
         }
         // A terminal result frees account/machine capacity: promote waiters.
         if (['failed', 'exited'].includes(data.state)) {
