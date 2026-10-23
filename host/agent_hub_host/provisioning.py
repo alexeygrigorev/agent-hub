@@ -367,6 +367,14 @@ def executable_path(bundle, dest, is_windows=None):
 def engine_argv(bundle, dest, is_windows=None):
     if is_windows is None:
         is_windows = (os.name == 'nt')
+    # A host may require its protected quota wrapper for every Codex start.
+    # This is operator environment, never a bundle/request supplied command.
+    wrapper = os.environ.get('CODEX_LAUNCH_WRAPPER') if bundle['provider'] == 'codex' else None
+    if wrapper:
+        path = Path(wrapper)
+        if not path.is_absolute() or not path.is_file() or not os.access(path, os.X_OK):
+            raise ValueError('Configured Codex launch wrapper unavailable')
+        return [str(path)]
     executable = executable_path(bundle, dest, is_windows=is_windows)
     if is_windows and bundle['provider'] in ('codex', 'gemini'):
         node = shutil.which('node')
@@ -620,7 +628,8 @@ def managed_subscriptions():
             pass
         meta = launcher_metadata(b['provider'], bundle)
         sub = {
-            'service': b['provider'],
+            'service': ('codex-orin' if b['provider'] == 'codex' and
+                        (bundle or {}).get('quota_provider') == 'codex-orin' else b['provider']),
             'account_label': b['label'],
             'engine': PACKAGES[b['provider']][2],
             'profile': 'hub-' + b['label'],

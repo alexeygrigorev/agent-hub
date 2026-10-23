@@ -29,6 +29,31 @@ def installer(argv, **kwargs):
     dest.chmod(0o700)
 
 
+def test_codex_operator_wrapper_is_required_when_configured(tmp_path, monkeypatch):
+    wrapper = tmp_path / 'launch-codex.sh'
+    monkeypatch.setenv('CODEX_LAUNCH_WRAPPER', str(wrapper))
+    with pytest.raises(ValueError, match='wrapper unavailable'):
+        p.engine_argv(bundle(), tmp_path)
+    wrapper.write_text('#!/bin/sh\nexit 0\n')
+    wrapper.chmod(0o700)
+    assert p.engine_argv(bundle(), tmp_path) == [str(wrapper)]
+    monkeypatch.setenv('CODEX_LAUNCH_WRAPPER', 'relative-wrapper')
+    with pytest.raises(ValueError, match='wrapper unavailable'):
+        p.engine_argv(bundle(), tmp_path)
+
+
+def test_managed_codex_orin_retains_separate_quota_service(monkeypatch):
+    record = {'label': 'codex-orin', 'provider': 'codex', 'revision': 'rev'}
+    def read(path, fallback=None):
+        return [record] if path.name == 'state.json' else {'quota_provider': 'codex-orin'}
+    monkeypatch.setattr(p, 'read_json', read)
+    sub = p.managed_subscriptions()[0]
+    assert sub['service'] == 'codex-orin'
+    assert sub['engine'] == 'codex'
+    assert sub['account_label'] == 'codex-orin'
+    assert sub['profile'] == 'hub-codex-orin'
+
+
 def test_add_rotate_remove_and_preserve_operator_profile(monkeypatch):
     requests = []
     desired = [bundle()]

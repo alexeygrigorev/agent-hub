@@ -17,6 +17,29 @@ async function fixture(fn: (s: ProvisioningService, sql: any, allow: (v: boolean
   });
 }
 describe('central engine provisioning', () => {
+  it('adopts the Codex Orin quota alias without merging accounts or changing its quota identity', async () => fixture(async (s, sql) => {
+    sql.exec("INSERT INTO fleet_accounts VALUES ('test-account','codex-orin',4,15,1)");
+    expect((await s.handle(req('/test-account?adopt=true', 'PUT', bundle), admin)).status).toBe(200);
+    const synced: any = await (await s.handle(req('/sync'), host)).json();
+    expect(synced.engines[0].provider).toBe('codex');
+    expect(synced.engines[0].quota_provider).toBe('codex-orin');
+    expect(sql.exec("SELECT provider FROM fleet_accounts WHERE label='test-account'").one().provider).toBe('codex-orin');
+  }));
+  it('requires explicit same-provider idle adoption and preserves account limits on rotation', async () => fixture(async (s, sql) => {
+    sql.exec("INSERT INTO fleet_accounts VALUES ('test-account','codex',4,25,0)");
+    expect((await s.handle(req('/test-account', 'PUT', bundle), admin)).status).toBe(409);
+    expect((await s.handle(req('/test-account?adopt=true', 'PUT', {...bundle, provider: 'claude'}), admin)).status).toBe(409);
+    sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, mode, workspace, prompt, state, created_at, updated_at) VALUES ('adoption-live', 'user', 'agent', 'test', 'adoption-live', '{}', 'offline-machine', 'codex', 'test-account', 'headless', 'demo', 'goal', 'running', ?, ?)", new Date().toISOString(), new Date().toISOString());
+    expect((await s.handle(req('/test-account?adopt=true', 'PUT', bundle), admin)).status).toBe(409);
+    expect(sql.exec('SELECT * FROM engine_bundles').toArray()).toHaveLength(0);
+    sql.exec("DELETE FROM fleet_launches WHERE id='adoption-live'");
+    expect((await s.handle(req('/test-account?adopt=true', 'PUT', bundle), admin)).status).toBe(200);
+    expect((await s.handle(req('/test-account', 'PUT', bundle), admin)).status).toBe(200);
+    expect((await s.handle(req('/test-account', 'PUT', {...bundle, provider: 'claude'}), admin)).status).toBe(409);
+    expect(sql.exec("SELECT * FROM fleet_accounts WHERE label='test-account'").one()).toEqual({
+      label: 'test-account', provider: 'codex', max_concurrency: 4, reserve_percent: 25, enabled: 0,
+    });
+  }));
   it('encrypts SQLite secrets, lists metadata only, enables routes only after exact host installation and removes them', async () => fixture(async (s, sql) => {
     const add = await s.handle(req('/test-account', 'PUT', bundle), admin);
     expect(add.status).toBe(200);

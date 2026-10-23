@@ -52,7 +52,8 @@ export class ProvisioningService {
   private async open(row: any) {
     const c = JSON.parse(row.ciphertext);
     const data = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: new Uint8Array(c.iv), additionalData: new TextEncoder().encode(row.label + ':' + row.revision) }, await this.key(), new Uint8Array(c.data));
-    return { ...JSON.parse(new TextDecoder().decode(data)), revision: row.revision };
+    const account: any = this.sql.exec('SELECT provider FROM fleet_accounts WHERE label=?', row.label).toArray()[0];
+    return { ...JSON.parse(new TextDecoder().decode(data)), revision: row.revision, quota_provider: account?.provider ?? row.provider };
   }
   async handle(request: Request, auth: any): Promise<Response> {
     if (auth.error) return auth.error;
@@ -163,13 +164,22 @@ export class ProvisioningService {
     try { ciphertext = await this.seal(bundle, revision); } catch { return reply({ error: 'provisioning_key_unavailable' }, 503); }
     return this.tx(() => {
       const managed = this.sql.exec('SELECT 1 FROM engine_bundles WHERE label=?', label).toArray().length;
-      if (!managed && this.sql.exec('SELECT 1 FROM fleet_accounts WHERE label=?', label).toArray().length) return reply({ error: 'unmanaged_account_exists' }, 409);
+      const existing: any = this.sql.exec('SELECT * FROM fleet_accounts WHERE label=?', label).toArray()[0];
+      const providerFamily = existing?.provider === 'codex-orin' ? 'codex' : existing?.provider;
+      if (existing && providerFamily !== bundle.provider) return reply({ error: 'account_provider_mismatch' }, 409);
+      if (!managed && existing) {
+        // An explicit recovery may attach credentials to a stale registry pool,
+        // but must neither rename the quota pool nor reset its limits.
+        if (new URL(request.url).searchParams.get('adopt') !== 'true') return reply({ error: 'unmanaged_account_exists' }, 409);
+        const reserved = this.sql.exec("SELECT 1 FROM fleet_launches WHERE account=? AND state IN ('offered','starting','running','uncertain') LIMIT 1", label).toArray().length;
+        if (reserved || this.fleet.accountStatus(existing).active > 0) return reply({ error: 'account_active' }, 409);
+      }
       if (!managed && rows().length >= 32) return reply({ error: 'bundle_capacity' }, 409);
       this.sql.exec('INSERT OR REPLACE INTO engine_bundles VALUES (?,?,?,?,?)', label, bundle.provider, bundle.version, revision, ciphertext);
       this.sql.exec('DELETE FROM engine_installations WHERE label=?', label);
       this.sql.exec('DELETE FROM fleet_routes WHERE account=?', label);
       this.sql.exec('DELETE FROM fleet_subscriptions WHERE account=?', label);
-      this.sql.exec('INSERT OR REPLACE INTO fleet_accounts VALUES (?,?,?,?,?)', label, bundle.provider, 1, bundle.provider === 'codex' ? 15 : 0, 1);
+      if (!existing) this.sql.exec('INSERT INTO fleet_accounts VALUES (?,?,?,?,?)', label, bundle.provider, 1, bundle.provider === 'codex' ? 15 : 0, 1);
       return reply({ status: 'configured', label, revision });
     });
   }
