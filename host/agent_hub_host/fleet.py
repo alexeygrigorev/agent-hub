@@ -119,8 +119,12 @@ def advertised_workspaces(settings) -> list[str]:
     for root in _workspace_roots(settings):
         if absolute_workspace_ok(root):
             out.add(root)
+    # Bare labels resolve under the first advertised absolute prefix. Prefer
+    # operator-declared repository roots over a broad home mapping or legacy
+    # per-repository aliases, including when the bounded catalog is truncated.
+    roots = [root for root in _workspace_roots(settings) if absolute_workspace_ok(root)]
     # Keep the registration payload safely under the 4 KiB capabilities cap.
-    return sorted(out)[:96]
+    return (roots + sorted(out - set(roots)))[:96]
 
 def resolve_workspace_path(settings, name: str) -> Path:
     """Map an offer workspace id to a real local directory.

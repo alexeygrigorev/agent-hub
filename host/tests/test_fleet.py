@@ -58,6 +58,20 @@ class FleetTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'journal_dir'):
                     fleet.load_settings(path)
 
+    def test_repository_roots_precede_home_and_legacy_aliases_for_bare_labels(self):
+        cfg = settings(Path('/home/operator/git/demo'))
+        cfg['workspace_roots'] = ['/home/operator/git']
+        cfg['workspaces'].update(home='/home/operator', legacy='/home/operator/old-repo')
+        advertised = fleet.advertised_workspaces(cfg)
+        self.assertEqual(advertised[0], '/home/operator/git')
+        self.assertIn('/home/operator', advertised)
+        self.assertIn('/home/operator/old-repo', advertised)
+        # Many legacy advertisements must not evict the usable repository root.
+        cfg['workspaces'].update({f'old-{n}': f'/archive/{n}' for n in range(100)})
+        advertised = fleet.advertised_workspaces(cfg)
+        self.assertEqual(advertised[0], '/home/operator/git')
+        self.assertEqual(len(advertised), 96)
+
     def test_default_quota_is_not_copied_to_multiple_accounts_or_nondefault_profile(self):
         cfg = settings(Path('/repo'))
         cfg['subscriptions'].append({**cfg['subscriptions'][0], 'account_label': 'second-codex', 'profile': 'second'})

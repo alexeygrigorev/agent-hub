@@ -50,11 +50,18 @@ class TestRuntime(unittest.TestCase):
         self.assertEqual(get_first_action_digest(str(f)), expected)
         self.assertEqual(get_first_action_digest(f), expected)
 
-    @unittest.skipUnless(os.path.isdir("/home/alexey/git/agent-quota-launcher/launcher"), "agent-quota-launcher checkout not available")
     def test_launcher_qualification_e537_detects_unsupported(self):
-        # Point to the actual installed agent-quota-launcher on this host
-        launcher_path = "/home/alexey/git/agent-quota-launcher"
-        qual = LauncherQualification(launcher_path)
+        # Exercise the old unsupported interface regardless of which launcher
+        # release happens to be installed on the developer's host.
+        launcher_path = self.work_dir / "unsupported-launcher"
+        package = launcher_path / "launcher"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("")
+        from agent_hub_host.root_dispatch import ROOT_PROFILE
+        (package / "task_profiles.py").write_text(f"TASK_PROFILES = {{{ROOT_PROFILE!r}: {{}}}}\n")
+        (package / "admission.py").write_text("ADAPTER_ROUTES = ('opencode',)\n")
+        (package / "task_units.py").write_text("def execute_transient_task_unit(task):\n    pass\n")
+        qual = LauncherQualification(str(launcher_path))
         report = qual.inspect_interfaces()
 
         self.assertEqual(report["status"], "UNSUPPORTED")
