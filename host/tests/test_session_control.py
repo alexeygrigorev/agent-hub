@@ -576,6 +576,38 @@ class TestSessionControlCli(unittest.TestCase):
         payload = transport.call_args.args[2]
         self.assertEqual(payload['intake_task_id'], 'task-url-1234')
 
+    def test_commands_rendering_shows_waiting_in_inbox_and_reason(self):
+        args = self.parse('commands', 's1')
+        raw = {
+            'commands': [
+                {
+                    'id': 'cmd-12345678-0000',
+                    'kind': 'send',
+                    'state': 'waiting in inbox for recipient',
+                    'reason': 'aplexer inbox recorded; recipient has not acknowledged',
+                    'created_at': '2026-10-24T06:00:00Z',
+                }
+            ]
+        }
+        rendered = session_control.render_output(args, raw)
+        self.assertIn('waiting in inbox for recipient', rendered)
+        self.assertIn('aplexer inbox recorded; recipient has not acknowledged', rendered)
+
+    def test_send_warns_on_target_no_reported_state(self):
+        import io
+        args = self.parse('send', 's1', '--prompt', 'hello', '--key', 'k-warn')
+        with patch.object(session_control, 'request', return_value={'command_id': 'c1', 'state': 'recorded', 'warning': 'target_no_reported_state'}), \
+                patch('sys.stderr', new_callable=io.StringIO) as fake_err:
+            session_control.execute(args)
+            self.assertIn('Warning: target session has no recent reported state', fake_err.getvalue())
+
+    def test_send_require_ready_passes_flag(self):
+        args = self.parse('send', 's1', '--prompt', 'hello', '--require-ready', '--key', 'k-ready')
+        with patch.object(session_control, 'request', return_value={'command_id': 'c1', 'state': 'recorded'}) as transport:
+            session_control.execute(args)
+            payload = transport.call_args.args[2]
+            self.assertTrue(payload.get('require_ready'))
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -354,8 +354,21 @@ def wait_for_session(session_id, timeout, interval, *, stopping=False):
 
 def wait_for_command(session_id, command_id, timeout, interval):
     deadline = time.monotonic() + timeout
+    last_status = [None]
+    def _fetch():
+        entry = _fetch_command_entry(session_id, command_id)
+        state = entry.get('state')
+        reason = entry.get('reason') or entry.get('host_reason') or (entry.get('ack') or {}).get('reason')
+        if state == 'waiting in inbox for recipient':
+            status_str = f"waiting in inbox for recipient: {reason}" if reason else "waiting in inbox for recipient"
+            if last_status[0] != status_str:
+                last_status[0] = status_str
+                import sys
+                sys.stderr.write(f"Status: {status_str}\n")
+        return entry
+
     return wait_until(deadline, interval,
-                     lambda: _fetch_command_entry(session_id, command_id),
+                     _fetch,
                      lambda entry: entry.get('state') in TERMINAL_COMMAND,
                      'Command wait')
 
@@ -415,6 +428,8 @@ def add_commands(sub):
     body_src.add_argument('--body-file', help='UTF-8 prompt file, or - for stdin (max 16 KiB)')
     body_src.add_argument('--prompt', default=None,
                           help='Inline UTF-8 prompt text (max 16 KiB; same boundaries as --body-file)')
+    send.add_argument('--require-ready', '--refuse-if-unready', dest='require_ready', action='store_true',
+                      help='Refuse send immediately if target session has no recent reported state')
     send.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
     add_wait(send)
     capture = commands.add_parser('capture', help='Enqueue one bounded sanitized capture on a bound session (default raw tail; --screen shows current rendered screen)')
@@ -696,6 +711,8 @@ def execute(args):
             else:
                 raise SessionInputError('Either --body-file or --prompt is required')
             payload = {'key': key, 'body': body}
+            if getattr(args, 'require_ready', False):
+                payload['require_ready'] = True
         elif cmd == 'capture':
             # Default tail wire unchanged (no mode field); --screen encodes
             # explicit mode=screen so the server persists the projection.
@@ -712,6 +729,9 @@ def execute(args):
                 msg = f'{msg} (reconcile with --key {key} via commands)'
             raise ValueError(msg) from None
         queued = dict(queued, client_key=key)
+        if queued.get('warning') == 'target_no_reported_state':
+            import sys
+            sys.stderr.write('Warning: target session has no recent reported state\n')
         timeout, interval = check_wait_args(args)
         if timeout is not None:
             if cmd == 'stop':
@@ -821,6 +841,27 @@ def render_tree(tree_data):
     return '\n'.join(lines)
 
 
+def render_commands(result):
+    commands = result.get('commands', []) if isinstance(result, dict) else (result if isinstance(result, list) else [])
+    if not commands:
+        return 'No commands found.'
+    headers = ['ID', 'KIND', 'STATE', 'REASON', 'CREATED']
+    rows = []
+    for c in commands:
+        cid = str(c.get('id', ''))[:8]
+        kind = str(c.get('kind', ''))
+        state = str(c.get('state', ''))
+        reason = str(c.get('reason') or c.get('host_reason') or (c.get('ack') or {}).get('reason') or '')
+        created = str(c.get('created_at', ''))[:19]
+        rows.append([cid, kind, state, reason[:200], created])
+    col_widths = [max(len(r[i]) for r in [headers] + rows) for i in range(len(headers))]
+    lines = ['  '.join(h.ljust(col_widths[i]) for i, h in enumerate(headers))]
+    lines.append('  '.join('-' * col_widths[i] for i in range(len(headers))))
+    for row in rows:
+        lines.append('  '.join(row[i].ljust(col_widths[i]) for i in range(len(headers))))
+    return '\n'.join(lines)
+
+
 def render_output(args, result):
     """Dispatch text table/tree vs raw machine JSON."""
     if getattr(args, 'json', False):
@@ -831,5 +872,7 @@ def render_output(args, result):
     if cmd == 'list':
         sessions = result.get('sessions', []) if isinstance(result, dict) else (result if isinstance(result, list) else [])
         return render_table(sessions)
+    if cmd == 'commands':
+        return render_commands(result)
     return result
 
