@@ -242,7 +242,7 @@ export class SessionControlService {
       if (!sessionCols.has(col)) this.sql.exec(`ALTER TABLE session_control_sessions ADD COLUMN ${col} ${type}`);
     }
     const commandCols = new Set(this.sql.exec('PRAGMA table_info(session_control_commands)').toArray().map((c: any) => String(c.name)));
-    for (const [col, type] of [['owner_token_id', 'TEXT'], ['owner_family', 'TEXT'], ['holder_machine', 'TEXT'], ['claim_token', 'TEXT'], ['claim_expires_at', 'TEXT'], ['holder_attempt', 'TEXT'], ['attempts', 'INTEGER DEFAULT 0']] as const) {
+    for (const [col, type] of [['owner_token_id', 'TEXT'], ['owner_family', 'TEXT'], ['holder_machine', 'TEXT'], ['claim_token', 'TEXT'], ['claim_expires_at', 'TEXT'], ['holder_attempt', 'TEXT'], ['attempts', 'INTEGER DEFAULT 0'], ['host_status', 'TEXT'], ['host_reason', 'TEXT']] as const) {
       if (!commandCols.has(col)) this.sql.exec(`ALTER TABLE session_control_commands ADD COLUMN ${col} ${type}`);
     }
     // M15c lifecycle: additive observations/decisions tables. Server-owned
@@ -778,6 +778,12 @@ export class SessionControlService {
    * journal. Missing journals on a different attester fail closed.
    */
   private expireClaim(row: any) {
+    const storedInInbox = row.host_status === 'waiting in inbox for recipient';
+    if (storedInInbox) {
+      this.sql.exec("UPDATE session_control_commands SET state = 'failed', ack_json = ?, poll_at = NULL, updated_at = ? WHERE id = ? AND state IN ('claimed','recorded','transported')",
+        JSON.stringify({ outcome: 'failed', reason: 'recipient_not_ready' }), this.at(), row.id);
+      return;
+    }
     const attempts = row.attempts ?? 1;
     const exhausted = attempts >= 3;
     this.sql.exec("UPDATE session_control_commands SET state = ?, ack_json = ?, poll_at = NULL, attempts = ?, claim_expires_at = ?, updated_at = ? WHERE id = ? AND state IN ('claimed','recorded','transported')",
@@ -1906,10 +1912,19 @@ export class SessionControlService {
         const next = rows.length > limit ? `${page[page.length - 1].created_at}|${page[page.length - 1].id}` : null;
         return response({ session_id: session.id,
           commands: page.map((c: any) => {
-            const { claim_token, holder_attempt, owner_token_id, owner_family, ack_json, ...visible } = c;
+            const { claim_token, holder_attempt, owner_token_id, owner_family, ack_json, host_status, host_reason, ...visible } = c;
             const ack = ack_json ? parsed(ack_json, null) : null;
             if (ack) { delete ack.claim_token; delete ack.holder_attempt; }
-            return { ...visible, payload: parsed(c.payload_json, null), ack };
+            const state = (c.state === 'claimed' && host_status) ? host_status : c.state;
+            const reason = host_reason || ack?.reason || null;
+            return {
+              ...visible,
+              state,
+              ...(host_status ? { host_status } : {}),
+              ...(reason ? { reason } : {}),
+              payload: parsed(c.payload_json, null),
+              ack
+            };
           }),
           next_cursor: next });
       }
@@ -1922,20 +1937,36 @@ export class SessionControlService {
         // the awaited body: revocation/expiry/rebound/reenroll — or a
         // concurrent stop/delete — during streaming fails closed with no
         // row, no NULL family stamp, and no state-machine violation.
-        const freshEnqueue = (payload: any, allowed: Set<string>, err: string): Response => {
+        const freshEnqueue = (payload: any, allowed: Set<string>, err: string, warning?: string): Response => {
           return this.transaction(() => {
             const live: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0];
             if (!live || !this.ownerOk(live, caller)) return response({ error: 'not_found' }, 404);
             if (!allowed.has(live.state)) return response({ error: err }, 409);
-            return this.enqueue(live, kind, actorName(caller), caller, input.key, payload);
+            return this.enqueue(live, kind, actorName(caller), caller, input.key, payload, warning);
           });
         };
         if (kind === 'send') {
-          if (!obj(input, ['key', 'body']) || !label(input.key) ||
+          if (!obj(input, ['key', 'body', 'require_ready']) || !label(input.key) ||
               typeof input.body !== 'string' || !input.body.trim() || input.body.length > 16000) {
             return response({ error: 'invalid_send' }, 400);
           }
-          return freshEnqueue({ body: input.body }, BOUND_STATES, 'session_not_bound');
+          return this.transaction(() => {
+            const live: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0];
+            if (!live || !this.ownerOk(live, caller)) return response({ error: 'not_found' }, 404);
+            if (!BOUND_STATES.has(live.state)) return response({ error: 'session_not_bound' }, 409);
+            const binding = live.binding_json ? parsed(live.binding_json, null) : null;
+            const reported: any = (live.machine_id && binding?.native_id) ? this.sql.exec(
+              'SELECT agent_state, observed_at FROM fleet_sessions WHERE machine_id = ? AND native_id = ?',
+              live.machine_id, binding.native_id
+            ).toArray()[0] : null;
+
+            const hasReported = Boolean(reported?.agent_state);
+            if (!hasReported && input.require_ready === true) {
+              return response({ error: 'target_not_ready', message: 'target has no recent reported state' }, 409);
+            }
+            const warning = !hasReported ? 'target_no_reported_state' : undefined;
+            return this.enqueue(live, kind, actorName(caller), caller, input.key, { body: input.body }, warning);
+          });
         }
         if (kind === 'capture') {
           // Screen projection: `mode` ('tail'|'screen') and `screen` bool are
@@ -2042,6 +2073,29 @@ export class SessionControlService {
           if (offers.length >= 20) break;
         }
         return response({ offers });
+      });
+    }
+
+    const statusMatch = /^\/api\/session-commands\/([a-f0-9-]{36})\/(status|progress)$/.exec(path);
+    if (statusMatch && request.method === 'POST') {
+      if (!host) return response({ error: 'forbidden' }, 403);
+      const input = await body(request);
+      if (!obj(input, ['claim_token', 'status', 'reason']) || typeof input.claim_token !== 'string') {
+        return response({ error: 'invalid_status' }, 400);
+      }
+      return this.transaction(() => {
+        const row: any = this.sql.exec('SELECT * FROM session_control_commands WHERE id = ?', statusMatch[1]).toArray()[0];
+        if (!row) return response({ error: 'not_found' }, 404);
+        if (row.holder_machine !== caller.machineId || row.claim_token !== input.claim_token) {
+          return response({ error: 'claim_conflict' }, 409);
+        }
+        const status = typeof input.status === 'string' ? input.status : 'waiting in inbox for recipient';
+        const reason = typeof input.reason === 'string' ? input.reason.slice(0, 512) : null;
+        this.sql.exec(
+          'UPDATE session_control_commands SET host_status = ?, host_reason = ?, updated_at = ? WHERE id = ?',
+          status, reason, this.at(), row.id
+        );
+        return response({ ok: true, command_id: row.id, status, reason });
       });
     }
 
@@ -2272,7 +2326,7 @@ export class SessionControlService {
     return response({ error: 'not_found' }, 404);
   }
 
-  private enqueue(session: any, kind: string, actor: string, caller: Caller, key: string, payload: any) {
+  private enqueue(session: any, kind: string, actor: string, caller: Caller, key: string, payload: any, warning?: string) {
     // Post-body ownership inside the mutation txn: a credential revoked,
     // expired, rebound, or re-enrolled while the body streamed must not
     // enqueue or stamp a NULL family. ownerOk re-verifies the live
@@ -2303,7 +2357,7 @@ export class SessionControlService {
       'INSERT INTO session_control_commands (id, session_id, kind, actor, request_key, payload_json, state, generation, correlation, owner_token_id, owner_family, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       id, session.id, kind, actor, key, JSON.stringify(payload), 'recorded', generation, correlation,
       caller.tokenId ?? null, this.presentingFamily(caller), 0, at, at);
-    return response({ command_id: id, state: 'recorded' }, 201);
+    return response({ command_id: id, state: 'recorded', ...(warning ? { warning } : {}) }, 201);
   }
 }
 
