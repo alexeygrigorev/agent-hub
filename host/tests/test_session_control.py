@@ -130,7 +130,7 @@ class TestSessionControlCli(unittest.TestCase):
             session_control.execute(self.parse('capture', 'sid', '--no-wait', '--max-bytes', '1024', '--key', 'k'))
         self.assertEqual(transport.call_args.args[2], {'key': 'k', 'max_bytes': 1024})
         with patch.object(session_control, 'request', return_value={}) as transport:
-            session_control.execute(self.parse('stop', 'sid', '--key', 'k'))
+            session_control.execute(self.parse('stop', 'sid', '--no-wait', '--key', 'k'))
         self.assertEqual(transport.call_args.args[:2], ('POST', '/api/sessions/sid/stop'))
 
     def test_capture_waits_for_correlated_output_by_default(self):
@@ -236,18 +236,11 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertEqual(result['command_wait']['state'], 'acked')
 
     def test_wait_timeout_names_key_for_reconciliation(self):
-        args = self.parse('stop', 's1', '--key', 'k3', '--wait', '--timeout', '2', '--interval', '1')
-        with patch.object(session_control, 'request', side_effect=[
-                    {'command_id': 'c9', 'state': 'recorded'},
-                    {'id': 's1', 'state': 'offered'},
-                    {'id': 's1', 'state': 'offered'},
-                    {'id': 's1', 'state': 'offered'},
-                ]), \
-                patch.object(session_control.time, 'sleep', return_value=None), \
-                patch.object(session_control.time, 'monotonic', side_effect=[0, 0, 0, 100]):
-            with self.assertRaises(ValueError) as raised:
+        args = self.parse('stop', 's1', '--key', 'k3', '--timeout', '2')
+        with patch.object(session_control, 'request', return_value={'command_id':'c9','state':'recorded'}), \
+                patch.object(session_control, 'wait_for_command', side_effect=ValueError('Command wait timed out')):
+            with self.assertRaisesRegex(ValueError, 'stop_host_unreachable; command c9'):
                 session_control.execute(args)
-        self.assertIn('timed out', str(raised.exception))
 
     def test_lost_response_keeps_key_for_safe_retry(self):
         args = self.parse('send', 's1', '--body-file', 'p.txt', '--key', 'k4')
@@ -366,7 +359,7 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertEqual(transport.call_args.args[:2], ('POST', '/api/sessions/git:crm-redesign/capture'))
 
         with patch.object(session_control, 'request', return_value={'command_id': 'c3', 'state': 'recorded'}) as transport:
-            session_control.execute(self.parse('stop', 'dataops:batching', '--key', 'k3'))
+            session_control.execute(self.parse('stop', 'dataops:batching', '--no-wait', '--key', 'k3'))
         self.assertEqual(transport.call_args.args[:2], ('POST', '/api/sessions/dataops:batching/stop'))
 
         with patch.object(session_control, 'request', return_value={'commands': []}) as transport:

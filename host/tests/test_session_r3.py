@@ -78,7 +78,9 @@ def main():
         hit = [r for r in rows if r["tag"] == tag and r["workspace"] == ws]
         if not hit: sys.stderr.write("no session\n"); sys.exit(1)
         hit[0]["phase"] = "exited"; hit[0]["state"] = "exited"
-        hit[0]["containment_empty"] = True; save(rows)
+        if os.environ.get("FAKE_STOP_NO_PROOF") != "1":
+            hit[0]["containment_empty"] = True
+        save(rows)
         print(json.dumps({"killed": hit[0]["id"]}))
     elif cmd == "message":
         sub = args[1]
@@ -366,9 +368,11 @@ def test_r3_engine_masquerade_refused(env):
         ns.qualify_target(env["fake"], evil)
 
 
-def test_r3_terminal_session_without_proof_stays_uncertain(env):
+def test_r3_terminal_session_without_proof_stays_uncertain(env, monkeypatch):
     """Stop oracle: an already-terminal record with no containment/process
-    proof refuses to confirm; the exit stays unproven, never false stopped."""
+    proof still needs native shutdown verification; a native response with no
+    containment proof remains uncertain, never false stopped."""
+    monkeypatch.setenv("FAKE_STOP_NO_PROOF", "1")
     target = seed_target(env)
     rows = json.load(open(env["sessions_file"]))
     rec = next(r for r in rows if r.get("tag") == "agent1")

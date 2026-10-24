@@ -141,7 +141,7 @@ describe('m15d cleanup apply', () => {
     expect(CLEANUP_APPLY_ALLOWED_STATES.has('stopped')).toBe(true);
   });
 
-  it('allows cleanup --apply for already-stopped sessions while ordinary stop refuses', async () => fixture(async (s, sql) => {
+  it('re-verifies ordinary stops on stopped rows without granting cleanup authority', async () => fixture(async (s, sql) => {
     const created = await startAgentSession(s, 'm15d-already-stopped');
     await bindAgentSession(s, sql, created.id, 'launch-1');
     await finishObservation(s);
@@ -149,11 +149,13 @@ describe('m15d cleanup apply', () => {
     // Mark the canonical session stopped (e.g. naturally exited / host reported exit)
     sql.exec("UPDATE session_control_sessions SET state = 'stopped' WHERE id = ?", created.id);
 
-    // Ordinary stop API must refuse already-stopped sessions
+    // A stopped row can still have a live workload: ordinary stop re-verifies it.
     const ordStop = await s.handle(request(`/api/sessions/${created.id}/stop`, { key: 'ord-stop-1' }), agent());
-    expect(ordStop.status).toBe(409);
+    expect(ordStop.status).toBe(201);
     const ordBody = await ordStop.json() as any;
-    expect(ordBody.error).toBe('session_not_stoppable');
+    expect(ordBody.state).toBe('recorded');
+    const ordinary = sql.exec('SELECT payload_json FROM session_control_commands WHERE id = ?',ordBody.command_id).one() as any;
+    expect(JSON.parse(ordinary.payload_json).cleanup_tree).not.toBe(true);
 
     // Cleanup --apply MUST allow already-stopped sessions and enqueue a cleanup stop command
     const cleanupRes = await s.handle(request('/api/sessions/cleanup', { apply: true, key: 'op-cleanup-stopped' }), agent());
@@ -165,7 +167,7 @@ describe('m15d cleanup apply', () => {
     expect(cleanupPlan.enqueued[0].replay).toBe(false);
 
     // Command must have cleanup_tree authorized
-    const stopCmd = sql.exec("SELECT * FROM session_control_commands WHERE session_id = ? AND kind = 'stop'", created.id).toArray()[0] as any;
+    const stopCmd = sql.exec("SELECT * FROM session_control_commands WHERE session_id = ? AND kind = 'stop' ORDER BY created_at DESC, id DESC", created.id).toArray().find((row: any) => JSON.parse(row.payload_json).cleanup_tree === true) as any;
     expect(stopCmd).toBeTruthy();
     const payload = JSON.parse(stopCmd.payload_json);
     expect(payload.cleanup_tree).toBe(true);

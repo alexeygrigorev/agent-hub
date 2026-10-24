@@ -20,6 +20,7 @@
  * See docs/SESSION-CONTROL.md.
  */
 import { recordIntakeSessionLink, IntakeSessionLinkError } from './intake';
+import { STOP_DELIVERY_MS, expireUnclaimedStops, refreshObservedHostFamily, visibleSessionPrefixMatches } from './session_stop';
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { credentialActor } from './agent_registry';
 import { redact } from './routing';
@@ -644,7 +645,9 @@ export class SessionControlService {
     const scope = caller.actor || caller.machineId || 'admin';
     let rows: any[];
     try {
-      rows = this.sql.exec('SELECT * FROM session_control_sessions WHERE actor = ?', scope).toArray() as any[];
+      rows = caller.isAdmin === true
+        ? this.sql.exec('SELECT * FROM session_control_sessions').toArray() as any[]
+        : this.sql.exec('SELECT * FROM session_control_sessions WHERE actor = ?', scope).toArray() as any[];
     } catch {
       return { ok: false, error: 'not_found', status: 404 };
     }
@@ -857,6 +860,7 @@ export class SessionControlService {
   }
 
   private sweepSessionClaims(sessionId: string) {
+    expireUnclaimedStops(this.sql, this.now(), sessionId);
     const rows = this.sql.exec("SELECT * FROM session_control_commands WHERE session_id = ? AND state IN ('claimed','recorded','transported') AND claim_token IS NOT NULL AND ack_json IS NULL AND (claim_expires_at IS NULL OR claim_expires_at <= ?) LIMIT 100",
       sessionId, this.at()).toArray() as any[];
     for (const row of rows) this.expireClaim(row);
@@ -1623,6 +1627,10 @@ export class SessionControlService {
       const targetMachine = host ? caller.machineId! : (data.machine_id || caller.machineId);
       if (!targetMachine) return response({ error: 'missing_machine_id' }, 400);
       return this.transaction(() => {
+        if (host) {
+          const gate = this.hostOk({ machine_id: targetMachine }, caller);
+          if (!gate.ok) return response({ error: gate.error }, 409);
+        }
         const result = adoptObservedNativeSessions(this.sql, targetMachine, data.sessions, this.now(), this.presentingFamily(caller));
         return response({ status: 'ok', ...result });
       });
@@ -1655,6 +1663,16 @@ export class SessionControlService {
               }
             } catch {}
           }
+        }
+      } else if (/^[a-f0-9][a-f0-9-]{7,34}$/i.test(rawRef) && sub !== 'binding' && sub !== 'retirement') {
+        const matches = visibleSessionPrefixMatches(this.sql, rawRef, row => this.ownerOk(row, caller));
+        if (matches.length > 1) return response({ error: 'ambiguous_session_prefix',
+          matches: matches.map(row => ({ id: row.id, name: parsed(row.request_json, {}).name ?? null })) }, 409);
+        session = matches[0] ?? null;
+        if (!session) {
+          const resolved = this.resolveSessionByName(rawRef, caller);
+          if (!resolved.ok) return response({ error: resolved.error }, resolved.status);
+          session = resolved.session;
         }
       } else if (rawRef.includes(':')) {
         if (sub === 'binding' || sub === 'retirement') return response({ error: 'not_found' }, 404);
@@ -2089,7 +2107,7 @@ export class SessionControlService {
           return freshEnqueue({ max_bytes: input.max_bytes ?? 65536, mode }, BOUND_STATES, 'session_not_bound');
         }
         if (!obj(input, ['key']) || !label(input.key)) return response({ error: 'invalid_stop' }, 400);
-        return freshEnqueue({}, STOPPABLE, 'session_not_stoppable');
+        return freshEnqueue({}, new Set([...STOPPABLE, 'stopped']), 'session_not_stoppable');
       }
       return response({ error: 'not_found' }, 404);
     }
@@ -2097,7 +2115,10 @@ export class SessionControlService {
     if (path === '/api/session-commands/offers' && request.method === 'GET') {
       if (!host) return response({ error: 'forbidden' }, 403);
       return this.transaction(() => {
+        const gate = this.hostOk({ machine_id: caller.machineId }, caller);
+        if (!gate.ok) return response({ offers: [] });
         const at = this.at();
+        expireUnclaimedStops(this.sql, this.now(), undefined, caller.machineId!);
         // Retry expired custody with the original execution fence. Only the
         // CURRENT bound family may age its own machine's claims: foreign or
         // superseded families neither read payloads nor mutate transport here.
@@ -2121,7 +2142,10 @@ export class SessionControlService {
           at, cutoff, caller.machineId!);
         const rows = this.sql.exec(
           `SELECT c.* FROM session_control_commands c JOIN session_control_sessions s ON s.id = c.session_id
-           WHERE s.machine_id = ? AND c.state = 'recorded' ORDER BY c.created_at, c.id LIMIT 20`, caller.machineId!).toArray() as any[];
+           WHERE s.machine_id = ? AND c.state = 'recorded'
+           AND (? = 1 OR s.host_family IS NULL OR s.host_family = ?)
+           ORDER BY CASE WHEN c.kind = 'stop' THEN 0 ELSE 1 END, c.created_at, c.id LIMIT 20`,
+          caller.machineId!, caller.isAdmin === true ? 1 : 0, this.presentingFamily(caller)).toArray() as any[];
         const offers = [];
         for (const row of rows) {
           const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', row.session_id).toArray()[0];
@@ -2219,6 +2243,10 @@ export class SessionControlService {
         const gate = this.hostOk(session, caller);
         if (!gate.ok) return response({ error: gate.error }, gate.error === 'not_found' ? 404 : 409);
         if (input.correlation !== row.correlation) return response({ error: 'correlation_mismatch' }, 409);
+        if (row.kind === 'stop' && !row.claim_token && Date.parse(row.created_at) <= this.now() - STOP_DELIVERY_MS) {
+          expireUnclaimedStops(this.sql, this.now(), session.id);
+          return response({ error: 'stop_host_unreachable' }, 409);
+        }
         // Stored-cleanup fence: a cleanup --apply stop whose owner,
         // incarnation, or M15 eligibility drifted since enqueue MUST NOT
         // execute at all (neither tree nor native stop). Refuse the entire
@@ -2612,6 +2640,7 @@ export function adoptObservedNativeSessions(
       );
       adopted++;
     } else {
+      refreshObservedHostFamily(sql, machineId, existing, s, resolvedFamily);
       // Update existing adopted session if state or phase changed
       let shouldUpdate = false;
       let nextState = existing.state;

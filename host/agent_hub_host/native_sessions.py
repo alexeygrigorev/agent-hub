@@ -1121,14 +1121,14 @@ def reconcile_stop_oracle(
 def stop_session(
     executable: str,
     target: NativeTarget,
-    signal: str = "HUP",
-    grace_ms: int = 2000,
+    signal: str = "TERM",
+    grace_ms: int = 1000,
 ) -> StopResult:
     """Stop ONLY the authorized exact session and confirm its native exit.
 
     Binds UUID+workspace+tag (+engine when expected) before the effect; after
-    ``kill``, the target UUID must be absent from the catalog (records cleaned
-    up per native contract) or in a terminal phase, AND the owned workload
+    ``kill --keep-record``, the target UUID must be in a terminal phase (legacy
+    workers may briefly remove their record during finalization), AND the owned workload
     must be proven gone (reaped cgroup, dead PIDs, or catalog containment
     empty). A still-running UUID — or a vanished record with no containment
     proof — is ``uncertain``, never silently released.
@@ -1169,18 +1169,13 @@ def stop_session(
     generation = before[0].created_at_ms
     oracle = _oracle_from_row(before[0])
     attempt = {"signal": signal, "grace_ms": grace_ms}
-    if before[0].phase in TERMINAL_PHASES:
-        confirmed, why = _confirm_workload_exit(before[0])
-        if confirmed:
-            return StopResult(state="stopped", session_id=target.session_id,
-                              reason="already terminal before kill: %s (%s)" % (before[0].phase, why))
-        raise _uncertain_with_oracle(
-            "Target terminal but workload exit unproven (%s); reconcile" % why,
-            oracle, {**attempt, "killed": False, "result": "no_kill_terminal_unproven"})
+    # Even terminal/exiting records go through retaining native shutdown:
+    # a phase label alone neither proves exit nor protects the record from
+    # a later list/prune sweep. Native containment recovery verifies both.
     proc = run_native(
         executable,
-        ["kill", "--workspace", target.workspace, "--tag", target.tag,
-         "--signal", signal, "--grace-ms", str(grace_ms), "--json"],
+        ["kill", target.session_id, "--workspace", target.workspace, "--tag", target.tag,
+         "--signal", signal, "--grace-ms", str(grace_ms), "--keep-record", "--json"],
         timeout=QUICK_TIMEOUT + grace_ms / 1000.0 + 10,
     )
     if proc.returncode != 0:

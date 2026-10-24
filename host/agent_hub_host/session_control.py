@@ -104,6 +104,11 @@ def http_error(exc, key=None):
         if isinstance(err, str) and err and SAFE_ERROR.match(err):
             code = err
             name = ' (%s)' % err
+            if err == 'ambiguous_session_prefix' and isinstance(data.get('matches'), list):
+                ids = [row.get('id') for row in data['matches'] if isinstance(row, dict)
+                       and isinstance(row.get('id'), str) and re.fullmatch(r'[a-fA-F0-9-]{36}', row['id'])]
+                if ids:
+                    name += ' matches: ' + ', '.join(ids[:100])
             if err == 'provider_disabled':
                 provider_guidance = ' requested provider disabled by model policy; choose an enabled engine/model or ask the policy owner to enable it and register a fresh host route with verified quota'
         rejection = hold if isinstance(hold, dict) else data
@@ -477,7 +482,9 @@ def add_commands(sub):
     stop = commands.add_parser('stop', help='Enqueue stop; the hub releases capacity only on confirmed native exit')
     stop.add_argument('id')
     stop.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
-    add_wait(stop)
+    add_wait(stop, timeout=10.0, interval=1.0)
+    stop.set_defaults(wait=True)
+    stop.add_argument('--no-wait', dest='wait', action='store_false', help='Record the stop intent without waiting for verified exit')
     cancel = commands.add_parser('cancel', help='Cancel an owned held, queued or unclaimed offered intent before native start')
     cancel.add_argument('id')
     cancel.add_argument('--key', required=True, help='Stable cancellation key, reused exactly after a lost response')
@@ -579,7 +586,7 @@ def match_session_state(entry: dict, wanted: str) -> bool:
 def execute(args):
     # Capture's budget covers enqueue, every paginated HTTP request and sleep.
     # A context-local deadline cannot affect concurrent host receiver requests.
-    if getattr(args, 'sessions_cmd', None) == 'capture':
+    if getattr(args, 'sessions_cmd', None) in ('capture', 'stop'):
         timeout, _ = check_wait_args(args)
         if timeout is not None:
             token = _request_deadline.set(time.monotonic() + timeout)
@@ -805,6 +812,8 @@ def _execute(args):
             queued = request('POST', '/api/sessions/' + args.id + '/' + cmd, payload)
         except ValueError as exc:
             msg = str(exc)
+            if cmd == 'stop' and isinstance(exc, SessionTransportError):
+                msg = 'stop_hub_unreachable; ' + msg
             if key and f'reconcile with --key {key}' not in msg:
                 msg = f'{msg} (reconcile with --key {key} via commands)'
             raise ValueError(msg) from None
@@ -813,7 +822,12 @@ def _execute(args):
             sys.stderr.write('Warning: target session has no recent reported state\n')
         if timeout is not None:
             if cmd == 'stop':
-                queued['stop_wait'] = wait_for_session(args.id, timeout, interval, stopping=True)
+                from .session_stop import wait_for_confirmed_stop
+                command_id = queued.get('command_id')
+                if not command_id:
+                    raise SessionInputError('stop_not_recorded; no command receipt returned')
+                queued['stop_wait'] = wait_for_confirmed_stop(args.id, command_id, timeout, interval,
+                    wait_command=wait_for_command, request=request)
             else:
                 command_id = queued['command_id']
                 if cmd == 'capture':

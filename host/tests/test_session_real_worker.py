@@ -541,7 +541,7 @@ class TestSessionRealWorker(unittest.TestCase):
         self.run_cli(["sessions", "capture", sid, "--no-wait", "--max-bytes", "512", "--key", "c-real-1"],
                      token="sess-agent-token")
         self.receive_bounded(custody, sc2.request)
-        self.run_cli(["sessions", "stop", sid, "--key", "t-real-1"], token="sess-agent-token")
+        self.run_cli(["sessions", "stop", sid, "--no-wait", "--key", "t-real-1"], token="sess-agent-token")
         self.receive_bounded(custody, sc2.request)
         view = json.loads(self.run_cli(["sessions", "show", sid], token="sess-agent-token").stdout)
         self.assertEqual(view["state"], "stopped")

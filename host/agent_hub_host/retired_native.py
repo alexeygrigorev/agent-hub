@@ -147,6 +147,10 @@ def validate_retired_tombstone(
     raw_ws = data.get("workspace")
     if not isinstance(raw_ws, str) or not raw_ws:
         raise SessionControlError("Tombstone missing workspace path")
+    # Linux /proc/<pid>/cwd appends this marker after an unlinked cwd.
+    # It describes the original workspace, not a directory named " (deleted)".
+    if raw_ws.endswith(" (deleted)"):
+        raw_ws = raw_ws[:-10]
     canonical_tombstone_ws = canonicalize_workspace(raw_ws)
     if canonical_tombstone_ws != target.workspace:
         raise SessionControlError(
