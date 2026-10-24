@@ -36,6 +36,8 @@ def test_model_survives_default_subscription(engine, provider, model_id, mode):
                 return dict(launch_allowed=True, profile_supported=True, model_supported=True,
                             model=model['model'], effort=model['effort'], account_label='test-account',
                             observed_at=dt.datetime.now(dt.timezone.utc).isoformat())
+            if 'model-support' in argv:
+                return dict(supported=True, provider=provider, model=model['model'])
             if 'submit' in argv:
                 payload = json.loads(argv[argv.index('--payload') + 1])
                 assert payload['model_requirements']['models'] == [model['model']]
@@ -89,3 +91,28 @@ def test_managed_execute_replaces_bundle_model(tmp_path, monkeypatch):
     p.execute()
     assert native_model(calls[0]) == 'gpt-6-astra'
     assert 'gpt-6.1-sol' not in calls[0]
+
+
+def test_interactive_unsupported_adapter_refused_before_claim(tmp_path):
+    selected = next(m for m in policy_models() if m['id'] == 'deepseek-flash')
+    settings = dict(version=1, workspaces={'main': str(tmp_path)}, subscriptions=[dict(
+        service='go', engine='opencode', account_label='test', profile=None,
+        launcher_provider='opencode', launcher_model='opencode-go/muse-spark-1.3-contributor',
+        admission_argv=['gate'], startup_argv=['opencode'])],
+        launcher=dict(argv=['launcher'], root=str(tmp_path), config_dir=str(tmp_path)))
+    requests, calls = [], []
+    def runner(argv, **kw):
+        calls.append(argv)
+        if argv == ['gate']:
+            return dict(launch_allowed=True, profile_supported=True, account_label='test',
+                        observed_at=dt.datetime.now(dt.timezone.utc).isoformat())
+        if 'model-support' in argv:
+            return dict(provider='opencode', model=selected['model'], supported=False)
+        raise AssertionError('Unexpected native effect')
+    with patch('agent_hub_host.provisioning.managed_subscriptions', return_value=[]):
+        dispatcher = Dispatcher(settings, request=lambda *a: requests.append(a), runner=runner)
+        with pytest.raises(ValueError, match='model_unsupported'):
+            dispatcher.dispatch(dict(id='unsupported', mode='interactive', engine='opencode', account='test',
+                                     profile=None, workspace='main', prompt='', selection=selected))
+    assert not requests
+    assert len(calls) == 2

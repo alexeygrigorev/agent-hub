@@ -1305,6 +1305,17 @@ class Dispatcher:
         target_cwd = resolve_offer_cwd(workspace, offer.get("cwd"))
         native = self.settings.get("aplexer_bin", "aplexer")
         if mode == "interactive":
+            if selection:
+                launcher = self.settings.get('launcher', {})
+                if not all(launcher.get(k) for k in ('argv', 'root', 'config_dir')):
+                    raise ValueError('model_unsupported: maintained adapter capability query unavailable')
+                try:
+                    support = self.runner(launcher['argv'] + ['--config-dir', launcher['config_dir'], 'model-support',
+                                          '--provider', sub['launcher_provider'], '--model', selection['model']], cwd=launcher['root'])
+                except Exception:
+                    raise ValueError('model_unsupported: maintained adapter capability query unavailable') from None
+                if support.get('supported') is not True or support.get('provider') != sub['launcher_provider'] or support.get('model') != selection['model']:
+                    raise ValueError('model_unsupported: maintained adapter refused requested model')
             with_goal = offer.get('with_goal') is True
             if with_goal and (offer.get('engine') not in {'codex', 'zcodex'} or not isinstance(offer.get('prompt'), str) or not offer['prompt'].strip()):
                 raise ValueError('Interactive goal requires a Codex-family engine and goal text')
