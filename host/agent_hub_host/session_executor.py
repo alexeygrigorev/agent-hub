@@ -773,6 +773,33 @@ def _reconcile_unknown_locked(
         _write_journal(journal_file, updated)
         return {"op": prior.get("op"), **updated, "ack": {"submitted": updated["ack_submitted"], "payload": payload}}
 
+    now = now_ms if type(now_ms) is int else int(time.time() * 1000)
+    expires_at_ms = prior.get("expires_at_ms")
+    if type(expires_at_ms) is int and now >= expires_at_ms:
+        log_delivery = reconcile_delivery_from_log(executable, target.workspace, original_id)
+        if log_delivery == "recorded":
+            from .native_sessions import retract_inbox_envelope
+            retract_inbox_envelope(executable, target, original_id)
+            reason = "recipient_not_ready"
+            payload = {
+                "correlation": _server_correlation(command_id, int(prior.get("generation", 0))),
+                "outcome": "failed",
+                "native": {"native_id": target.session_id, "tag": target.tag, "workspace": target.workspace},
+                "reason": reason,
+            }
+            updated = {**prior, "state": "failed", "reason": reason,
+                       "ack_payload": payload, "ack_submitted": False}
+            updated.pop("ack_pending", None)
+            if request is not None:
+                try:
+                    request("POST", "/api/session-commands/" + command_id + "/ack",
+                            {**payload, "claim_token": prior.get("claim_token")})
+                    updated["ack_submitted"] = True
+                except Exception as exc:
+                    updated["ack_error"] = str(exc)[:120]
+            _write_journal(journal_file, updated)
+            return {"op": prior.get("op"), **updated, "ack": {"submitted": updated["ack_submitted"], "payload": payload}, "expired": True}
+
     # Reconcile exact original envelope from native message log
     log_delivery = reconcile_delivery_from_log(executable, target.workspace, original_id)
     if log_delivery in ("transported", "pane"):
@@ -1407,6 +1434,14 @@ def handle_claimed_command(
         if outcome.get("state") == "unknown":
             record["ack_submitted"] = False
             record["ack_pending"] = "awaiting_recipient_reply"
+            if request is not None:
+                try:
+                    request("POST", f"/api/session-commands/{command_id}/status",
+                            {"claim_token": proved["claim_token"],
+                             "status": "waiting in inbox for recipient",
+                             "reason": outcome.get("reason", "waiting in inbox for recipient")})
+                except Exception:
+                    pass
             _write_journal(journal_file, record)
             return {"op": op, **record,
                     "ack": {"submitted": False, "pending": "awaiting_recipient_reply"}}

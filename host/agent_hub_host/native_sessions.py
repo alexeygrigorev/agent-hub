@@ -656,6 +656,27 @@ def deliver_recorded(
     raise SessionUncertain("Deliver outcome unknown; reconcile before retry")
 
 
+def retract_inbox_envelope(
+    executable: str,
+    target: NativeTarget,
+    envelope_id: str,
+) -> bool:
+    """Acknowledge/retract an undelivered message from the aplexer inbox so it won't be delivered later."""
+    target = target.validated()
+    if not isinstance(envelope_id, str) or not envelope_id:
+        return False
+    try:
+        proc = run_native(
+            executable,
+            ["message", "ack", envelope_id],
+            cwd=target.workspace,
+            timeout=QUICK_TIMEOUT,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
 def reconcile_delivery_from_log(
     executable: str,
     target_workspace: str,

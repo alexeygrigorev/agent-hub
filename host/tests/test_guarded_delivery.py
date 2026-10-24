@@ -260,6 +260,24 @@ def main():
                 if m.get("workspace") == ws:
                     out.append(m)
             print(json.dumps(out))
+        elif sub == "ack":
+            rest = list(args[2:])
+            mids = []
+            skip = False
+            for a in rest:
+                if skip:
+                    skip = False
+                    continue
+                if a in ("--from", "--workspace"):
+                    skip = True
+                    continue
+                if not a.startswith("-"):
+                    mids.append(a)
+            for mid in mids:
+                fn = os.path.join(MDIR, mid + ".json")
+                if os.path.isfile(fn):
+                    os.remove(fn)
+            print(json.dumps({"acked": mids}))
         else:
             sys.exit(1)
     else:
@@ -273,13 +291,18 @@ if __name__ == "__main__":
 class MockHub:
     def __init__(self):
         self.offers: list[dict] = []
-        self.claims: dict[str, dict] = []
+        self.claims: dict[str, dict] = {}
         self.acks: dict[str, dict] = {}
+        self.statuses: dict[str, dict] = {}
         self.ack_calls = 0
 
     def request(self, method, path, payload=None):
         if method == "GET" and path == "/api/session-commands/offers":
             return {"offers": list(self.offers)}
+        if method == "POST" and (path.endswith("/status") or path.endswith("/progress")):
+            cid = path.split("/")[-2]
+            self.statuses[cid] = dict(payload)
+            return {"ok": True, "command_id": cid}
         if method == "POST" and path.endswith("/claim"):
             cid = path.split("/")[-2]
             match = next((o for o in self.offers if o["command_id"] == cid), None)
@@ -887,3 +910,38 @@ def test_reconciliation_cannot_deliver_an_old_envelope_to_codex_exec(env):
         ns.deliver_recorded(env["fake"], target, "old-persisted-envelope")
     assert not os.path.exists(env["deliver_log"])
     assert not os.path.exists(env["pty_log"])
+
+
+def test_expired_claim_retracts_undelivered_inbox_and_fails_recipient_not_ready(env):
+    env["monkeypatch"].setenv("FAKE_DELIVER_STATUS", "not-ready")
+    target = seed_target(env)
+    cid = str(uuid.uuid4())
+    cmd = {"op": "send", "command_id": cid, "generation": 1,
+           "target": {"session_id": target.session_id, "tag": target.tag,
+                      "workspace": target.workspace, "created_at_ms": target.created_at_ms,
+                      "engine": target.engine}, "body": "pending message", "await_ack": True}
+    hub = MockHub()
+    now_ms = 1700000000000
+    grant = make_claim(cid)
+    grant["expires_at_ms"] = now_ms + 1000
+
+    # Initial send records into inbox; deliver guard refuses because recipient not ready
+    outcome = se.handle_claimed_command(cmd, grant, custody=custody(),
+        journal_dir=env["journal"], executable=env["fake"], request=hub.request,
+        now_ms=now_ms)
+    assert outcome["state"] == "unknown"
+    assert hub.statuses.get(cid, {}).get("status") == "waiting in inbox for recipient"
+    # Ensure message file was created in msgs directory
+    assert len(os.listdir(env["msgs"])) == 1
+
+    # Message is still in inbox. Now reconcile after lease expiry.
+    reconciled = se.reconcile_pending_command(
+        journal_dir=env["journal"], command_id=cid,
+        executable=env["fake"], request=hub.request, now_ms=now_ms + 2000)
+    assert reconciled is not None
+    assert reconciled["state"] == "failed"
+    assert reconciled["reason"] == "recipient_not_ready"
+    assert hub.acks[cid]["outcome"] == "failed"
+    assert hub.acks[cid]["reason"] == "recipient_not_ready"
+    # Undelivered message in inbox was retracted
+    assert len(os.listdir(env["msgs"])) == 0
