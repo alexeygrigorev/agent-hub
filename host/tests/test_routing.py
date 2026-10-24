@@ -40,7 +40,7 @@ class RoutingClientTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             settings = {'subscriptions':[{'service':'zai','engine':'zcodex','profile':None,'account_label':'a','launcher_model':'glm-5.3-flash','launcher_effort':'high','admission_argv':['gate']}], 'workspaces':{'tasks':tmp}}
             offer = {'task_id':'job','needs':[],'account':'a','engine':'zcodex','profile':None,'workspace':'tasks','selection':{'model':'glm-5.3','effort':'high'}}
-            with self.assertRaisesRegex(ValueError, 'model/effort'):
+            with self.assertRaisesRegex(ValueError, 'model_unsupported'):
                 fleet.Dispatcher(settings, request=runner, runner=runner).dispatch(offer)
 
     def test_settings_reject_unknown_capabilities_and_bad_concurrency(self):

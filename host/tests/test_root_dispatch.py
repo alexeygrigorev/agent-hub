@@ -1456,6 +1456,8 @@ class TestB5ExecutorFailureCleanup(unittest.TestCase):
         self.assertIsNotNone(run.wait_bootstrap(10))
         run.acknowledge_start({"status": "started"})
         self.assertTrue(run.wait_done(10))
+        # Result readiness is signalled before the executor thread returns.
+        run._thread.join(timeout=10)
         self.assertFalse(run.thread_alive)
         return run
 
