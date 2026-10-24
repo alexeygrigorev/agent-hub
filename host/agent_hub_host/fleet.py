@@ -781,7 +781,7 @@ class Dispatcher:
             except Exception:
                 continue
 
-    def _record_running_launch(self, offer_id, task_id, workspace, engine, account, native_id, result_path, details, profile=None):
+    def _record_running_launch(self, offer_id, task_id, workspace, engine, account, native_id, result_path, details, profile=None, launched_at_ts=None, log_offsets=None):
         from .native_sessions import NativeTarget, SessionControlError
         from . import private_fs
 
@@ -842,6 +842,8 @@ class Dispatcher:
             "state": "running",
             "settled": False,
             "dispatched_at": utcnow(),
+            "launched_at_ts": launched_at_ts,
+            "log_offsets": log_offsets,
         }
         self._active_launches[offer_id] = record
         self._persist_launch_record(record)
@@ -946,6 +948,16 @@ class Dispatcher:
                 "native_id": record["native_id"],
                 "launcher_task_id": task_id,
             }
+            if fleet_state == "failed":
+                from .launch_diagnostics import check_engine_auth_expired
+                raw_text = str(reconcile_out.get('reason') or reconcile_out.get('error') or '')
+                if check_engine_auth_expired(raw_text, engine=engine, cwd=record.get("workspace"), task_id=task_id, launched_at=record.get("launched_at_ts") or (record.get("incarnation", 0) / 1000.0 if record.get("incarnation") else None), start_offsets=record.get("log_offsets")):
+                    result_payload["diagnostic"] = {
+                        "reason": "engine_auth_expired",
+                        "message": "The engine authentication failed or API key has expired.",
+                        "error_type": "AuthenticationError",
+                        "stage": "dispatch_headless",
+                    }
             path = f"/api/fleet/launches/{offer_id}/result"
             try:
                 acknowledgement = self.request("POST", path, result_payload)
@@ -1457,6 +1469,9 @@ class Dispatcher:
         path = "/api/fleet/launches/" + offer_id
         # An uncertain response here leaves the server reservation intact and performs no native effect.
         self.request("POST", path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": sub["account_label"], **({"model": selection["model"]} if selection else {})})
+        from .launch_diagnostics import capture_log_offsets
+        log_offsets = capture_log_offsets(sub.get("launcher_provider"))
+        launched_at_ts = time.time()
         try:
             receipt = self.runner(argv, cwd=cwd, timeout=120)
             if mode == "interactive":
@@ -1526,6 +1541,18 @@ class Dispatcher:
                     raise ValueError("Native account receipt mismatch")
                 if type(details.get('exit_code')) is int:
                     result = {'state': 'exited' if details['exit_code'] == 0 else 'failed', 'confirmed_exit': True, 'native_id': native_id, 'launcher_task_id': task_id}
+                    if details['exit_code'] != 0:
+                        from .launch_diagnostics import check_engine_auth_expired
+                        engine_name = offer.get("engine") or (sub.get("engine") if 'sub' in locals() and isinstance(sub, dict) else None) or (sub.get("service") if 'sub' in locals() and isinstance(sub, dict) else None)
+                        raw_text = str(details.get('stderr') or details.get('stdout') or details.get('error') or '')
+                        if check_engine_auth_expired(raw_text, engine=engine_name, cwd=target_cwd, task_id=task_id, launched_at=launched_at_ts, start_offsets=log_offsets):
+                            result['diagnostic'] = {
+                                'reason': 'engine_auth_expired',
+                                'message': 'The engine authentication failed or API key has expired.',
+                                'error_type': 'AuthenticationError',
+                                'exit_code': details['exit_code'],
+                                'stage': 'launcher_run',
+                            }
                 elif details.get('state') == 'running' and details.get('first_action_verified') is True:
                     result = {"state": "running", "native_id": native_id, "launcher_task_id": task_id}
                 else:
@@ -1543,30 +1570,80 @@ class Dispatcher:
                     result_path=result_path,
                     details=details,
                     profile=offer.get("profile") or sub.get("profile"),
+                    launched_at_ts=launched_at_ts,
+                    log_offsets=log_offsets,
                 )
         except Exception as exc:
-            from .launch_diagnostics import exception_diagnostic
-            failure = exception_diagnostic(exc, "dispatch_headless" if mode == "headless" else "dispatch_interactive")
-            if mode == "headless" and not offer.get("task_id"):
+            from .launch_diagnostics import exception_diagnostic, LocalCommandError
+            engine_name = offer.get("engine") or (sub.get("engine") if 'sub' in locals() and isinstance(sub, dict) else None) or (sub.get("service") if 'sub' in locals() and isinstance(sub, dict) else None)
+            t_id = locals().get("task_id")
+            t_cwd = locals().get("target_cwd") or locals().get("workspace")
+            l_offsets = locals().get("log_offsets")
+            l_at = locals().get("launched_at_ts")
+            failure = exception_diagnostic(exc, "dispatch_headless" if mode == "headless" else "dispatch_interactive",
+                                           engine=engine_name, cwd=t_cwd, task_id=t_id, launched_at=l_at, start_offsets=l_offsets)
+            if mode == "headless" and not offer.get("task_id") and t_id:
                 from .launcher_recovery import settle_unstarted
                 record = {"offer_id": offer_id, "task_id": task_id, "mode": "headless",
                           "workspace": str(workspace), "target_cwd": str(target_cwd),
                           "state": "not_started", "reason": failure["reason"], "diagnostic": failure, "settled": False}
                 try:
-                    # Persist recovery intent BEFORE changing launcher state.
-                    # A crash after the fence must not lose its Hub receipt.
-                    # The journal alone is never proof: replay rechecks storage.
                     self._persist_launch_record(record)
                     self._active_launches[offer_id] = record
-                    if settle_unstarted(launcher, task_id, workspace, target_cwd, failure):
-                        self.request("POST", path + "/result", {
-                            "state": "failed", "launcher_task_id": task_id, "confirmed_exit": True, "reason": failure["reason"], "diagnostic": failure})
-                        record["settled"] = True
-                        self._persist_launch_record(record)
+                    proven_dead = settle_unstarted(launcher, task_id, workspace, target_cwd, failure)
+                    native_session_id = None
+                    if not proven_dead:
+                        start_path = Path(workspace) / ".local" / f"launch-{task_id}-start.json"
+                        if start_path.exists():
+                            try:
+                                from .native_sessions import NativeTarget
+                                from .retired_native import verify_native_retirement
+                                s_data = json.loads(start_path.read_text())
+                                cand_id = s_data.get("native_id") or s_data.get("session_id") or s_data.get("id")
+                                cand_tag = s_data.get("tag") or f"task-{task_id}"
+                                cand_ws = s_data.get("workspace") or str(workspace)
+                                cand_engine = s_data.get("engine") or offer.get("engine")
+                                cand_inc = s_data.get("created_at_ms") or s_data.get("incarnation")
+                                if cand_id and cand_inc:
+                                    target = NativeTarget(
+                                        session_id=cand_id,
+                                        tag=cand_tag,
+                                        workspace=str(Path(cand_ws).resolve(strict=True)),
+                                        created_at_ms=cand_inc,
+                                        engine=cand_engine,
+                                    ).validated()
+                                    is_retired, tomb, _ = verify_native_retirement(native, target, state_dir=self.settings.get("aplexer_state_dir"))
+                                    if is_retired:
+                                        proven_dead = True
+                                        native_session_id = cand_id
+                            except Exception:
+                                pass
+                        elif not (Path(launcher.get("config_dir", "")) / "state.db").exists() and isinstance(exc, LocalCommandError):
+                            proven_dead = True
+
+                    if proven_dead:
+                        if native_session_id:
+                            payload = {
+                                "state": "failed",
+                                "launcher_task_id": task_id,
+                                "native_id": native_session_id,
+                                "confirmed_exit": True,
+                                "diagnostic": failure,
+                            }
+                        else:
+                            payload = {
+                                "state": "failed",
+                                "launcher_task_id": task_id,
+                                "confirmed_exit": True,
+                                "reason": failure["reason"],
+                                "diagnostic": failure,
+                            }
+                        ack = self.request("POST", path + "/result", payload)
+                        if isinstance(ack, dict) and ack.get("id") == offer_id and ack.get("state") == "failed":
+                            record["settled"] = True
+                            self._persist_launch_record(record)
                         return {"id": offer_id, "state": "failed", "reason": failure["reason"], "diagnostic": failure}
                 except Exception:
-                    # Leave the task untouched if recovery intent cannot be
-                    # journaled; otherwise retry the receipt without relaunch.
                     pass
             # Effect may have happened: hold capacity and require reconciliation.
             # Bounded private diagnostic only (type + stage, never argv/goal/

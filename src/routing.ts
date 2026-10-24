@@ -73,6 +73,12 @@ export class RoutingService {
     }
     // TBM pacing/EDF context is read once per dispatch pass from the Phase 1 tbm_* tables.
     const pacing = queued.length ? loadProviderPacing(this.sql, this.now()) : undefined;
+    const unavailableEngines = new Set<string>();
+    try {
+      for (const r of this.sql.exec("SELECT DISTINCT engine FROM fleet_engine_health WHERE status = 'unavailable'").toArray() as any[]) {
+        if (r.engine) unavailableEngines.add(r.engine);
+      }
+    } catch {}
     for (const queuedRow of queued) this.transaction(() => {
       const row: any = this.sql.exec("SELECT * FROM routing_jobs WHERE id = ? AND launch_id IS NULL AND state = 'queued'", queuedRow.id).toArray()[0];
       if (!row) return;
@@ -116,7 +122,7 @@ export class RoutingService {
               reserves: (((policy as any).rules as any).reserve_percent || {}) as Record<string, number> });
             if (!adm.ok) subQuota = null;
           }
-          const models = modelCandidates(input, { ...r, provider: account.provider }, JSON.parse(ad.runners_json), subQuota, this.now(), pacing);
+          const models = modelCandidates(input, { ...r, provider: account.provider }, JSON.parse(ad.runners_json), subQuota, this.now(), pacing, unavailableEngines);
           return models.map(model => ({ ...r, model, score: r.score * model.weight / model.headroom }));
         });
         if (!routes.length) continue;
@@ -158,7 +164,13 @@ export class RoutingService {
     }
     if (path === '/api/routing/machines' && request.method === 'GET') {
       if (!admin && !client) return reply({ error: 'forbidden' }, 403);
-      return reply({ machines: (this.sql.exec('SELECT r.*, m.hostname, m.capabilities, m.last_heartbeat, m.last_checkin_at, m.drained FROM routing_machines r JOIN machines m ON m.id = r.machine_id').toArray() as any[]).map(m => ({ id: m.machine_id, hostname: m.hostname, needs: JSON.parse(m.needs_json), max_agents: m.max_agents, capabilities: JSON.parse(m.capabilities), runners: JSON.parse(m.runners_json), resources: ((hb: any) => ({ mem_avail_mb: hb.mem_avail_mb ?? null, disk_free_gb: hb.disk_free_gb ?? null }))(JSON.parse(m.last_heartbeat || '{}')), online: !m.drained && this.now() - Date.parse(m.observed_at) <= 180000 && this.now() - Date.parse(effectiveCheckin(m.machine_id, m.last_checkin_at) || '') <= 180000 })) });
+      const unavailable = new Set<string>();
+      try {
+        for (const r of this.sql.exec("SELECT DISTINCT engine FROM fleet_engine_health WHERE status = 'unavailable'").toArray() as any[]) {
+          if (r.engine) unavailable.add(r.engine);
+        }
+      } catch {}
+      return reply({ machines: (this.sql.exec('SELECT r.*, m.hostname, m.capabilities, m.last_heartbeat, m.last_checkin_at, m.drained FROM routing_machines r JOIN machines m ON m.id = r.machine_id').toArray() as any[]).map(m => ({ id: m.machine_id, hostname: m.hostname, needs: JSON.parse(m.needs_json), max_agents: m.max_agents, capabilities: JSON.parse(m.capabilities), runners: JSON.parse(m.runners_json).map((rn: any) => ({ ...rn, available: !unavailable.has(rn.engine), health: unavailable.has(rn.engine) ? 0 : 1 })), resources: ((hb: any) => ({ mem_avail_mb: hb.mem_avail_mb ?? null, disk_free_gb: hb.disk_free_gb ?? null }))(JSON.parse(m.last_heartbeat || '{}')), online: !m.drained && this.now() - Date.parse(m.observed_at) <= 180000 && this.now() - Date.parse(effectiveCheckin(m.machine_id, m.last_checkin_at) || '') <= 180000 })) });
     }
     if (path === '/api/routing/policy' && request.method === 'GET' && (admin || client)) return reply(policy);
     const tokenMatch = /^\/api\/routing\/clients\/([A-Za-z0-9_-]{1,64})$/.exec(path);

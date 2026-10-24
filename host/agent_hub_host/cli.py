@@ -374,7 +374,12 @@ def main():
         launch.add_argument('--summary', default='Agent task', help='Non-secret task summary shown on dashboard')
         launch.add_argument('--parent', help='Parent hub launch id, omitted for a root request')
         launch.add_argument('--key', help='Stable idempotency key for retries')
-    sub.add_parser('fleet', help='Authenticated machines, agents, sessions and account dashboard data')
+    p_fleet = sub.add_parser('fleet', help='Authenticated machines, agents, sessions and account dashboard data')
+    p_fleet.add_argument('subcommand', nargs='?', choices=['probe', 'show', 'status'], help='Optional fleet subcommand')
+    p_fleet.add_argument('engine', nargs='?', help='Engine name for probe')
+    p_fleet.add_argument('--status', choices=['ok', 'unavailable', 'failed'], default='ok')
+    p_fleet.add_argument('--reason', default='manual_probe')
+    p_fleet.add_argument('--machine', default=None)
     heartbeat = sub.add_parser('heartbeat', help='Report that this agent is alive (agent credential with health:report)')
     heartbeat.add_argument('--status', default='working', help='Short state word, for example working, idle or waiting')
     heartbeat.add_argument('--summary', help='Non-secret one-line summary shown on the dashboard (max 240 chars)')
@@ -582,7 +587,16 @@ def main():
         import uuid
         try:
             if args.cmd == 'fleet':
-                result = session_control.request('GET', '/api/fleet')
+                if getattr(args, 'subcommand', None) == 'probe':
+                    if not getattr(args, 'engine', None):
+                        print('hub fleet probe requires an engine argument', file=sys.stderr)
+                        sys.exit(2)
+                    probe_payload = {'engine': args.engine, 'status': args.status, 'reason': args.reason}
+                    if getattr(args, 'machine', None):
+                        probe_payload['machine_id'] = args.machine
+                    result = session_control.request('POST', '/api/fleet/probe', probe_payload)
+                else:
+                    result = session_control.request('GET', '/api/fleet')
             elif args.cmd in ('subscriptions', 'fleet-host'):
                 settings = fleet.load_settings(args.config)
                 if args.cmd == 'fleet-host':

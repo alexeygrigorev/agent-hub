@@ -15,12 +15,13 @@ export function taskTier(input: any): string | null {
  * weight = fit * health * preference * headroom * urgency * pacing * grok * banked.
  * `pacing` comes from tbm_* rows; omitted or empty keeps those factors neutral.
  */
-export function modelCandidates(input: any, route: any, advertisement: any, quota: any, now: number, pacing?: Map<string, ProviderPacing>) {
+export function modelCandidates(input: any, route: any, advertisement: any, quota: any, now: number, pacing?: Map<string, ProviderPacing>, unavailableEngines?: Set<string>) {
   const tier = taskTier(input); if (!tier) return [];
   const members: string[] = (policy.tiers as any)[tier];
   return policy.models.filter(m => {
     if (!members.includes(m.id) || (input.model && ![m.id, m.model].includes(input.model))) return false;
     if (policy.rules.disabled_providers.includes(m.provider)) return false;
+    if (unavailableEngines && unavailableEngines.has(m.engine)) return false;
     if (policy.rules.explicit_only_providers.includes(m.provider) && input.preferred_runner !== m.engine && ![m.id, m.model].includes(input.model)) return false;
     return m.provider === route.provider && m.engine === route.engine && m.profile === route.profile &&
       advertisement.some((a: any) => a.engine === m.engine && a.profile === m.profile && a.model === m.model && a.effort === m.effort && a.account === route.account);

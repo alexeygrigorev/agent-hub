@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS fleet_routes (machine_id TEXT NOT NULL, engine TEXT N
 CREATE TABLE IF NOT EXISTS fleet_subscriptions (machine_id TEXT NOT NULL, account TEXT NOT NULL, service TEXT NOT NULL, plan TEXT, observed_at TEXT NOT NULL, quota_json TEXT NOT NULL, PRIMARY KEY(machine_id, account));
 CREATE TABLE IF NOT EXISTS fleet_sessions (machine_id TEXT NOT NULL, native_id TEXT NOT NULL, tag TEXT NOT NULL, engine TEXT, phase TEXT NOT NULL, agent_state TEXT, observed_at TEXT NOT NULL, workspace TEXT NOT NULL, profile TEXT, account TEXT, last_activity_at TEXT, cwd TEXT, PRIMARY KEY(machine_id, native_id));
 CREATE TABLE IF NOT EXISTS fleet_launches (id TEXT PRIMARY KEY, actor TEXT NOT NULL, requester_kind TEXT NOT NULL, parent_id TEXT, summary TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, mode TEXT NOT NULL, workspace TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL, native_id TEXT, launcher_task_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
+CREATE TABLE IF NOT EXISTS fleet_engine_health (engine TEXT NOT NULL, machine_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, reason TEXT NOT NULL, updated_at TEXT NOT NULL, diagnostics_json TEXT, PRIMARY KEY(engine, machine_id));
+CREATE TABLE IF NOT EXISTS operator_notices (notice_key TEXT PRIMARY KEY, engine TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL);
 `;
 type Auth = { caller?: AdmissionCaller; scopes?: string[]; error?: Response };
 const LABEL = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
@@ -56,7 +58,7 @@ const CAPACITY_REASONS = new Set(['account_capacity', 'machine_capacity', 'launc
  * (stale/drained check-ins, policy-disabled engines, engines no live host
  * advertises anymore — e.g. registry routes for engines the current host
  * release stopped running). */
-const INCIDENTAL_REASONS = new Set(['machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported']);
+const INCIDENTAL_REASONS = new Set(['machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired']);
 /** Capacity-only placement failure: every rejected route reports transient
  * capacity (account/machine), optionally alongside incidental stale/disabled
  * routes (drained/stale check-ins, policy-disabled engines, registry routes
@@ -272,7 +274,7 @@ export class FleetService {
     this.admission.init();
     for (const stmt of FLEET_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
     const launchColumns = this.sql.exec('PRAGMA table_info(fleet_launches)').toArray().map((c: any) => c.name);
-    for (const name of ['verification_status', 'exit_reason', 'finished_at', 'launch_error_json', 'model_selection_json']) {
+    for (const name of ['verification_status', 'exit_reason', 'finished_at', 'launch_error_json', 'model_selection_json', 'retried_launch_id']) {
       if (!launchColumns.includes(name)) this.sql.exec(`ALTER TABLE fleet_launches ADD COLUMN ${name} TEXT`);
     }
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_offered ON fleet_launches(id) WHERE state = 'offered'");
@@ -490,6 +492,11 @@ export class FleetService {
       if (request.with_goal && !['codex', 'zcodex'].includes(route.engine)) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'goal_unsupported' }); continue; }
       // A disabled execution engine holds all new candidate planning, whatever the account label.
       if (disabledEngines().has(route.engine)) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'provider_disabled' }); continue; }
+      const engineHealth: any = this.sql.exec("SELECT status, reason FROM fleet_engine_health WHERE engine = ? AND (machine_id = ? OR machine_id = '' OR machine_id IS NULL)", route.engine, route.machine_id).toArray()[0];
+      if (engineHealth && engineHealth.status === 'unavailable') {
+        rejected.push({ machine: route.machine_id, engine: route.engine, reason: engineHealth.reason || 'engine_auth_expired' });
+        continue;
+      }
       const machine: any = this.sql.exec('SELECT * FROM machines WHERE id = ?', route.machine_id).toArray()[0];
       const account = accounts.get(route.account); const caps = parsed(machine?.capabilities); const hb = parsed(machine?.last_heartbeat);
       // Bare labels resolve per-route via that machine's advertised absolute
@@ -982,6 +989,71 @@ export class FleetService {
         return response({ status: 'reported' });
       });
     }
+    if (path === '/api/fleet/engine-health' && request.method === 'GET') {
+      if (!admin && !caller) return response({ error: 'forbidden' }, 403);
+      const health = this.sql.exec("SELECT * FROM fleet_engine_health").toArray();
+      return response({ health, engines: health });
+    }
+    if (path === '/api/fleet/probe' && request.method === 'POST') {
+      if (!admin && !host) return response({ error: 'forbidden' }, 403);
+      const data = await body(request);
+      if (!data || typeof data !== 'object' || !label(data.engine)) {
+        return response({ error: 'invalid_probe' }, 400);
+      }
+      if (data.status !== undefined && !['ok', 'success', 'unavailable', 'failed'].includes(data.status)) {
+        return response({ error: 'invalid_probe_status' }, 400);
+      }
+      if (data.reason !== undefined && (typeof data.reason !== 'string' || !/^[a-z0-9_-]{1,64}$/.test(data.reason))) {
+        return response({ error: 'invalid_probe_reason' }, 400);
+      }
+      if (data.machine_id !== undefined && !isValidMachineId(data.machine_id)) {
+        return response({ error: 'invalid_machine_id' }, 400);
+      }
+      if (data.probe_id !== undefined && (typeof data.probe_id !== 'string' || data.probe_id.length > 128)) {
+        return response({ error: 'invalid_probe_id' }, 400);
+      }
+
+      let targetMachine = '';
+      if (!admin) {
+        if (data.machine_id && data.machine_id !== caller!.machineId) {
+          return response({ error: 'forbidden_machine_id' }, 403);
+        }
+        targetMachine = caller!.machineId!;
+      } else {
+        targetMachine = data.machine_id || '';
+      }
+
+      const isSuccess = data.status === 'ok' || data.status === 'success' || data.success === true;
+      const nowIso = new Date(this.now()).toISOString();
+
+      return this.transaction(() => {
+        if (isSuccess) {
+          if (targetMachine) {
+            this.sql.exec("UPDATE fleet_engine_health SET status = 'ok', updated_at = ? WHERE engine = ? AND machine_id = ?", nowIso, data.engine, targetMachine);
+          } else {
+            this.sql.exec("UPDATE fleet_engine_health SET status = 'ok', updated_at = ? WHERE engine = ?", nowIso, data.engine);
+          }
+
+          const remaining: any = this.sql.exec("SELECT COUNT(*) as count FROM fleet_engine_health WHERE engine = ? AND status = 'unavailable'", data.engine).toArray()[0];
+          if (!remaining || remaining.count === 0) {
+            this.sql.exec("DELETE FROM operator_notices WHERE engine = ?", data.engine);
+            try {
+              if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'liveness_alerts'").toArray().length) {
+                this.sql.exec("UPDATE liveness_alerts SET resolved_at = ? WHERE resolved_at IS NULL AND subject_kind = 'engine_auth_expired' AND subject = ?",
+                  nowIso, data.engine);
+              }
+            } catch {}
+          }
+
+          return response({ status: 're_enabled', engine: data.engine, machine_id: targetMachine || null });
+        } else {
+          const reason = data.reason || 'engine_auth_expired';
+          this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at) VALUES (?, ?, 'unavailable', ?, ?)",
+            data.engine, targetMachine, reason, nowIso);
+          return response({ status: 'marked_unavailable', engine: data.engine, machine_id: targetMachine || null, reason });
+        }
+      });
+    }
     const match = /^\/api\/fleet\/launches\/([a-f0-9-]{36})\/(claim|result|reject)$/.exec(path);
     if (match && request.method === 'POST') {
       if (!host) return response({ error: 'forbidden' }, 403);
@@ -1040,7 +1112,7 @@ export class FleetService {
         // Host emits fixed, sanitized diagnostics; validate bounds again at storage.
         const diagnostic = data.diagnostic;
         if (diagnostic !== undefined && (!object(diagnostic, ['reason', 'message', 'error_type', 'exit_code', 'stage']) ||
-            typeof diagnostic.reason !== 'string' || !/^launcher_[a-z_]{1,64}$/.test(diagnostic.reason) ||
+            typeof diagnostic.reason !== 'string' || !/^(?:launcher|engine)_[a-z_]{1,64}$/.test(diagnostic.reason) ||
             typeof diagnostic.message !== 'string' || diagnostic.message.length > 300 || /[\x00-\x1f\x7f]/.test(diagnostic.message) ||
             typeof diagnostic.error_type !== 'string' || !/^[A-Za-z]{1,64}$/.test(diagnostic.error_type) ||
             !['launcher_run', 'dispatch_headless', 'dispatch_interactive', 'dispatch_route'].includes(diagnostic.stage) ||
@@ -1079,16 +1151,150 @@ export class FleetService {
         this.sql.exec('UPDATE fleet_launches SET state = ?, native_id = COALESCE(?, native_id), launcher_task_id = COALESCE(?, launcher_task_id), updated_at = ? WHERE id = ?', data.state, data.native_id || null, data.launcher_task_id || null, new Date(this.now()).toISOString(), row.id);
         if (diagnostic) this.sql.exec("UPDATE fleet_launches SET launch_error_json = ?, exit_reason = ? WHERE id = ?", JSON.stringify(diagnostic), diagnostic.reason, row.id);
         if (noStart) this.sql.exec("UPDATE fleet_launches SET exit_reason = ?, verification_status = 'not_started', finished_at = ? WHERE id = ?", data.reason, new Date(this.now()).toISOString(), row.id);
+        if (diagnostic && diagnostic.reason === 'engine_auth_expired') {
+          this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at, diagnostics_json) VALUES (?, ?, 'unavailable', 'engine_auth_expired', ?, ?)", row.engine, row.machine_id, new Date(this.now()).toISOString(), JSON.stringify(diagnostic));
+          const noticeKey = 'engine_auth_expired:' + row.engine;
+          const existingNotice = this.sql.exec("SELECT notice_key FROM operator_notices WHERE notice_key = ?", noticeKey).toArray()[0];
+          if (!existingNotice) {
+            const noticeMsg = `Operator notice: API key for engine '${row.engine}' has expired and must be renewed by Alexey in OpenCode Console / provider settings. Developer cannot renew this key.`;
+            this.sql.exec("INSERT INTO operator_notices (notice_key, engine, message, created_at) VALUES (?, ?, ?, ?)", noticeKey, row.engine, noticeMsg, new Date(this.now()).toISOString());
+            try {
+              if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'liveness_alerts'").toArray().length) {
+                const existingAlert = this.sql.exec("SELECT id FROM liveness_alerts WHERE resolved_at IS NULL AND subject_kind = 'engine_auth_expired' AND subject = ?", row.engine).toArray();
+                if (existingAlert.length === 0) {
+                  this.sql.exec("INSERT INTO liveness_alerts (subject_kind, subject, state, detail, opened_at) VALUES ('engine_auth_expired', ?, 'failing', ?, ?)",
+                    row.engine, noticeMsg, new Date(this.now()).toISOString());
+                }
+              }
+            } catch {}
+          }
+        }
         // An attempted start with uncertain effects is no longer an offer.
         // Keep its reservation and missing binding, but expose the real state.
         if (data.state === 'uncertain' && this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
           this.sql.exec("UPDATE session_control_sessions SET state = 'uncertain', updated_at = ? WHERE fleet_launch_id = ? AND machine_id = ? AND state IN ('queued', 'held', 'offered', 'starting', 'running')", new Date(this.now()).toISOString(), row.id, caller.machineId!);
         }
+        let retried = false;
+        const isAlreadyRetry = (typeof row.request_key === 'string' && row.request_key.startsWith('retry-')) ||
+          this.sql.exec("SELECT id FROM fleet_launches WHERE retried_launch_id = ?", row.id).toArray().length > 0;
+        const origLaunchReq = parsed(row.request_json, {});
+        const hasExplicitEngine = Boolean(origLaunchReq.engine && typeof origLaunchReq.engine === 'string');
+        if (data.state === 'failed' && data.confirmed_exit === true &&
+            (data.reason === 'engine_auth_expired' || diagnostic?.reason === 'engine_auth_expired') &&
+            !row.retried_launch_id && !isAlreadyRetry && !hasExplicitEngine) {
+          const hasSessionTable = this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length > 0;
+          const sessionRow: any = hasSessionTable ? this.sql.exec("SELECT * FROM session_control_sessions WHERE fleet_launch_id = ?", row.id).toArray()[0] : null;
+          if (sessionRow && !sessionRow.retried_launch_id) {
+            const sessionReq = parsed(sessionRow.request_json, {});
+            const retryInput = {
+              mode: sessionRow.mode,
+              workspace: sessionReq.workspace || sessionRow.workspace,
+              tier: sessionReq.tier || origLaunchReq.tier,
+              prompt: sessionReq.brief || sessionReq.prompt || '',
+              summary: sessionReq.summary,
+              cwd: sessionReq.cwd ?? null,
+              parent_id: sessionRow.parent_id ?? sessionReq.parent_id ?? null,
+              access: sessionReq.access || origLaunchReq.access,
+              approved_action: sessionReq.approved_action || origLaunchReq.approved_action,
+              ...(sessionReq.with_goal === true || origLaunchReq.with_goal === true ? { with_goal: true } : {}),
+              idempotency_key: 'retry-' + row.id,
+            };
+
+            let retryAuth: Auth;
+            if (row.requester_kind === 'human' || sessionRow.actor.startsWith('human:') || sessionRow.actor === 'admin') {
+              retryAuth = { caller: { kind: 'human', actor: sessionRow.actor, isAdmin: true }, scopes: ['fleet:launch', 'admin'] };
+            } else {
+              retryAuth = {
+                caller: {
+                  kind: 'agent',
+                  actor: sessionRow.actor,
+                  tokenId: sessionRow.owner_token_id || undefined,
+                },
+                scopes: ['fleet:launch', 'bus:send'],
+              };
+            }
+
+            let ownerRevoked = false;
+            if (retryAuth.caller?.kind === 'agent' && retryAuth.caller?.tokenId) {
+              const cred: any = this.sql.exec('SELECT revoked_at, expires_at FROM credentials WHERE id = ?', retryAuth.caller.tokenId).toArray()[0];
+              if (!cred || cred.revoked_at != null || (cred.expires_at && Date.parse(cred.expires_at) <= this.now())) {
+                ownerRevoked = true;
+              }
+            }
+
+            const wasRunning = sessionRow.state === 'running' || sessionRow.binding_json != null || Boolean(row.native_id);
+            if (!ownerRevoked) {
+              const reserved = this.reserve(retryInput, retryAuth);
+              if (reserved.status < 300) {
+                const nowIso = new Date(this.now()).toISOString();
+                this.sql.exec("UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = ?, engine = ?, state = 'offered', updated_at = ? WHERE id = ?",
+                  reserved.value.id, reserved.value.machine, reserved.value.engine, nowIso, sessionRow.id);
+                this.sql.exec("UPDATE fleet_launches SET retried_launch_id = ? WHERE id = ?", reserved.value.id, row.id);
+                retried = true;
+              } else {
+                const nowIso = new Date(this.now()).toISOString();
+                const termState = wasRunning ? 'failed' : 'held';
+                this.sql.exec("UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE id = ?", termState, nowIso, sessionRow.id);
+              }
+            } else {
+              const nowIso = new Date(this.now()).toISOString();
+              const termState = wasRunning ? 'failed' : 'held';
+              this.sql.exec("UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE id = ?", termState, nowIso, sessionRow.id);
+            }
+          } else if (!sessionRow) {
+            const origReq = parsed(row.request_json, {});
+            const retryInput = {
+              mode: row.mode,
+              workspace: row.workspace,
+              tier: origReq.tier,
+              prompt: row.prompt,
+              summary: row.summary,
+              cwd: origReq.cwd ?? null,
+              parent_id: row.parent_id ?? origReq.parent_id ?? null,
+              access: origReq.access,
+              approved_action: origReq.approved_action,
+              ...(origReq.with_goal === true ? { with_goal: true } : {}),
+              idempotency_key: 'retry-' + row.id,
+            };
+
+            let retryAuth: Auth;
+            if (row.requester_kind === 'human' || row.actor === 'admin') {
+              retryAuth = { caller: { kind: 'human', actor: row.actor, isAdmin: true }, scopes: ['fleet:launch', 'admin'] };
+            } else {
+              const credId = origReq.edit_authority?.credential_id ||
+                (this.sql.exec("SELECT id FROM credentials WHERE actor = ? AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1", row.actor).toArray()[0] as any)?.id;
+              retryAuth = {
+                caller: {
+                  kind: 'agent',
+                  actor: row.actor,
+                  tokenId: credId || undefined,
+                },
+                scopes: ['fleet:launch', 'bus:send'],
+              };
+            }
+
+            let ownerRevoked = false;
+            if (retryAuth.caller?.kind === 'agent' && retryAuth.caller?.tokenId) {
+              const cred: any = this.sql.exec('SELECT revoked_at, expires_at FROM credentials WHERE id = ?', retryAuth.caller.tokenId).toArray()[0];
+              if (!cred || cred.revoked_at != null || (cred.expires_at && Date.parse(cred.expires_at) <= this.now())) {
+                ownerRevoked = true;
+              }
+            }
+
+            if (!ownerRevoked) {
+              const reserved = this.reserve(retryInput, retryAuth, origReq.edit_authority);
+              if (reserved.status < 300) {
+                this.sql.exec("UPDATE fleet_launches SET retried_launch_id = ? WHERE id = ?", reserved.value.id, row.id);
+                retried = true;
+              }
+            }
+          }
+        }
         // A confirmed terminal host result must also close its canonical Hub
         // session. Otherwise intake keeps an active assignment forever after
         // a failed start, preventing recovery despite released Fleet capacity.
         // Fleet can run without the optional session-control tables in tests.
-        if (['failed', 'exited'].includes(data.state) && this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
+        if (!retried && ['failed', 'exited'].includes(data.state) && this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
           if (noStart) {
             // A held session still linked to this failed launch cannot retry:
             // Fleet idempotency replays the failure forever. Close the attempt
@@ -1096,7 +1302,7 @@ export class FleetService {
             // waitlisted sessions whose machine assignment is still null.
             reconcileUnboundFleetSessions(this.sql, this.now());
           } else {
-            this.sql.exec("UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE fleet_launch_id = ? AND machine_id = ? AND state IN ('queued', 'held', 'offered', 'starting', 'running', 'uncertain')", data.state === 'failed' ? 'failed' : 'stopped', new Date(this.now()).toISOString(), row.id, caller.machineId!);
+            this.sql.exec("UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE fleet_launch_id = ? AND machine_id = ? AND state IN ('queued', 'offered', 'starting', 'running', 'uncertain')", data.state === 'failed' ? 'failed' : 'stopped', new Date(this.now()).toISOString(), row.id, caller.machineId!);
           }
         }
         // A terminal result frees account/machine capacity: promote waiters.

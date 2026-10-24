@@ -64,6 +64,7 @@ HOME="${DISPOSABLE_HOME}" \
 PYTHONUSERBASE="${ORIGINAL_USER_BASE}" \
 DTC_AUTH_HOME="${DTC_AUTH_PATH}" \
 PYTHONPATH="host:host/tests" \
+CODEX_LAUNCH_WRAPPER="" \
 "${UV_BIN}" run --frozen --with pytest python -m pytest -q || PYTEST_RC=$?
 
 if [ "${PYTEST_RC}" -ne 0 ]; then

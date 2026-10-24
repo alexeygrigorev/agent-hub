@@ -212,7 +212,23 @@ export class StatusService {
       source: 'intake_open_warning',
       scope: 'hub',
     }] : [];
-    const base = [...intakeItems, ...measured];
+    const noticeItems: Obj[] = [];
+    try {
+      const notices = this.sql.exec("SELECT notice_key, engine, message, created_at FROM operator_notices ORDER BY created_at DESC LIMIT 16").toArray() as any[];
+      for (const n of notices) {
+        noticeItems.push({
+          severity: 'error',
+          subject: 'engine_auth_expired:' + n.engine,
+          title: 'Engine auth expired: ' + n.engine,
+          detail: n.message,
+          engine: n.engine,
+          opened_at: n.created_at,
+          source: 'operator_notices',
+          scope: 'hub',
+        });
+      }
+    } catch { /* optional operator_notices table */ }
+    const base = [...intakeItems, ...noticeItems, ...measured];
     if (!admin) return base;
     let rows: any[];
     try {
