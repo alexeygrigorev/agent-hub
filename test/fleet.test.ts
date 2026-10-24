@@ -335,7 +335,7 @@ describe('generic accounts and launch placement', () => {
       launcher_resources: { active_mem_mb: 22000, observed_at: iso() } };
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'hetzner'", JSON.stringify(hb));
     const input = intent({ machine: 'hetzner', mode: 'headless' });
-    expect(s.plan(input).rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'launcher_memory_reserve' });
+    expect(s.plan(input).rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', engine: 'codex', reason: 'launcher_memory_reserve', memory: expect.objectContaining({ mem_available_mb: 32000, reserved_mb: 22000, floor_mb: 10240 }) }));
     const parked = s.reserve(input, admin);
     expect(parked.status).toBe(202);
     expect(parked.value.state).toBe('queued');
@@ -479,12 +479,22 @@ describe('generic accounts and launch placement', () => {
     expect((await s.handle(request(path + '/result', receipt), host('win35'))).status).toBe(404);
     expect((await s.handle(request(path + '/result', receipt), host('hetzner'))).status).toBe(200);
     expect(JSON.parse(sql.exec('SELECT launch_error_json FROM fleet_launches WHERE id = ?', launch.id).one().launch_error_json)).toEqual(diagnostic);
-    expect(sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', sessionId).one().state).toBe('failed');
+    expect(sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', sessionId).one().state).toBe('queued');
     expect(await (await s.handle(request(path + '/result', receipt), host('hetzner'))).json()).toMatchObject({ replay: true });
     const sessions = new SessionControlService(sql, cb => cb(), () => now);
     sessions.init();
     const viewed = (sessions as any).view(sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionId).one());
-    expect(viewed).toMatchObject({ state: 'failed', reason: diagnostic.reason, message: diagnostic.message, launch_error: diagnostic });
+    expect(viewed).toMatchObject({ state: 'queued', reason: diagnostic.reason, rejected: [expect.objectContaining({ reason: diagnostic.reason, memory: expect.objectContaining({ floor_mb: 10240 }) })] });
+    const retry = sql.exec('SELECT * FROM fleet_launches WHERE id = ?', viewed.fleet_launch_id).one();
+    expect(retry.id).not.toBe(launch.id);
+    expect(retry.state).toBe('queued');
+    expect(sql.exec("SELECT detail FROM liveness_alerts WHERE subject_kind='launch' AND subject=?", launch.id).one().detail).toContain('10240');
+    s.drainCapacityQueue();
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', retry.id).one().state).toBe('queued');
+    const hb = { mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() }, launcher_resources: { active_mem_mb: 0, observed_at: iso(1) } };
+    sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'hetzner'", JSON.stringify(hb));
+    s.drainCapacityQueue();
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', retry.id).one().state).toBe('offered');
   }));
   it('closes an unassigned queued canonical attempt when launcher_not_started occurs', async () => fixture(async (s, sql) => {
     await configure(s);
