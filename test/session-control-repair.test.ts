@@ -265,12 +265,15 @@ describe('F1 late-reply reconciliation after lease expiry', () => {
     const offer = poll.offers[0];
     const claim = await claimAs(s, offer.command_id, offer.correlation);
     // The execution lease lapses with no reply yet: the command goes
-    // uncertain via the sweep and is never re-offered.
+    // back to the queue for reconciliation under the SAME execution fence.
     sql.exec('UPDATE session_control_commands SET claim_expires_at = ? WHERE id = ?',
       new Date(Date.now() - 1000).toISOString(), offer.command_id);
     await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'));
-    const row: any = sql.exec('SELECT state FROM session_control_commands WHERE id = ?', offer.command_id).toArray()[0];
-    expect(row.state).toBe('uncertain');
+    const row: any = sql.exec('SELECT state, attempts, claim_token, holder_attempt FROM session_control_commands WHERE id = ?', offer.command_id).toArray()[0];
+    expect(row.state).toBe('transported');
+    expect(row.attempts).toBe(2);
+    expect(row.claim_token).toBe(claim.claim_token);
+    expect(row.holder_attempt).toBe(ATTEMPT);
     // Minutes later the recipient reply arrives: the SAME attempt (claim
     // token + correlation) with a valid fresh proof reconciles to acked.
     // No new effect exists anywhere on this path (ack is record-only).
@@ -288,7 +291,7 @@ describe('F1 late-reply reconciliation after lease expiry', () => {
     expect(reclaim.status).toBe(409);
   }));
 
-  it('proof-less outcomes stay terminal after expiry; foreign token cannot late-ack', async () => fixture(async (s, sql) => {
+  it('proof-less outcomes need renewed custody after expiry; foreign token cannot late-ack', async () => fixture(async (s, sql) => {
     const session: any = await startOk(s, { machine: 'hetzner' }, admin, 'f1-late-2');
     await bindOk(s, sql, session.id, session.fleet_launch_id);
     const tag = 'hub-' + session.fleet_launch_id;
@@ -300,7 +303,7 @@ describe('F1 late-reply reconciliation after lease expiry', () => {
       new Date(Date.now() - 1000).toISOString(), offer.command_id);
     await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'));
     const ackUrl = `/api/session-commands/${offer.command_id}/ack`;
-    // Capture has no reply proof: stays terminal.
+    // Capture has no reply proof: it needs renewed custody, not a late send proof.
     const late = await s.handle(request(ackUrl, { correlation: offer.correlation, outcome: 'delivered',
       native: { native_id: NATIVE_ID, tag, workspace: NATIVE_WS },
       claim_token: claim.claim_token, capture: 'tail' }), host('hetzner'));
