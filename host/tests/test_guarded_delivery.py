@@ -839,3 +839,37 @@ def test_target_terminal_matcher_requires_workspace_engine_and_created_at_ms(env
     assert reconciled2 is not None
     assert reconciled2["state"] == "refused"
     assert "terminal" in reconciled2["reason"]
+
+@pytest.mark.parametrize("source", ["offer", "catalog"])
+def test_codex_exec_send_fails_fast_without_inbox_or_input(env, source):
+    target = seed_target(env)
+    rows = json.load(open(env["sessions_file"]))
+    rows[-1]["engine"] = "codex"
+    if source == "catalog":
+        rows[-1]["command"] = ["managed-wrapper", "codex-test", "exec", "--json", "original goal"]
+    json.dump(rows, open(env["sessions_file"], "w"))
+    cid = str(uuid.uuid4())
+    cmd = {"op": "send", "command_id": cid, "generation": 1,
+           "target": {"session_id": target.session_id, "tag": target.tag,
+                      "workspace": target.workspace, "created_at_ms": target.created_at_ms,
+                      "engine": "codex"}, "body": "must never enter exec", "await_ack": True}
+    if source == "offer":
+        cmd["mode"] = "headless"
+    hub = MockHub()
+    grant = make_claim(cid)
+    started = time.monotonic()
+    outcome = se.handle_claimed_command(cmd, grant, custody=custody(),
+        journal_dir=env["journal"], executable=env["fake"], request=hub.request)
+    assert time.monotonic() - started < 60
+    assert outcome["state"] == "refused"
+    assert hub.acks[cid]["reason"] == "send_unsupported_headless"
+    assert hub.acks[cid]["outcome"] == "refused"
+    assert not os.listdir(env["msgs"])
+    assert not os.path.exists(env["deliver_log"])
+    assert not os.path.exists(env["pty_log"])
+    # Renewed custody replays the journaled refusal; never sends anything.
+    grant["expires_at_ms"] += 60000
+    again = se.handle_claimed_command(cmd, grant, custody=custody(),
+        journal_dir=env["journal"], executable=env["fake"], request=hub.request)
+    assert again["replayed"] is True
+    assert not os.listdir(env["msgs"])

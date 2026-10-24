@@ -165,6 +165,7 @@ class NativeSession:
     workload_pid: Optional[int] = None
     processes: Optional[int] = None
     agent_state_at_ms: Optional[int] = None
+    headless_exec: bool = False
 
 
 @dataclass(frozen=True)
@@ -341,6 +342,9 @@ def project_session(raw: Any) -> NativeSession:
         agent_state = raw.get("reported_state")
         state_at = raw.get("reported_state_at_ms")
     return NativeSession(
+        headless_exec=(raw.get("engine") in ("codex", "zcodex")
+                       and isinstance(raw.get("command"), list)
+                       and "exec" in raw["command"]),
         session_id=sid,
         tag=tag,
         workspace=ws,

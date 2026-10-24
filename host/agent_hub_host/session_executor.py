@@ -52,6 +52,7 @@ from .native_sessions import (
     capture_output as _capture,
     deliver_recorded,
     list_sessions,
+    qualify_target,
     reconcile_delivery_from_log,
     send_inbox as _send_inbox,
     status_of,
@@ -1689,6 +1690,10 @@ def _run_claimed_effect(
     (flag False/missing) NEVER run the tree even with roots configured.
     """
     if op == "send":
+        observed = qualify_target(executable, target)
+        if observed.headless_exec or (command.get("mode") == "headless"
+                                      and observed.engine in ("codex", "zcodex")):
+            raise SessionControlError("send_unsupported_headless")
         body = command["body"]
         key = "cmdsend-" + str(command["command_id"])
         transport_mode = command.get("transport", "guarded")

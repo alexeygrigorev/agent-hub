@@ -17,8 +17,8 @@ Claim discipline (per command, under local flock BEFORE claim/effect):
 a stable ``attempt_id`` UUID is journaled per command (``recv-<id>.json``) and
 reused for every claim retry, so a lost claim reply replays the SAME attester
 and token but never executes again. A different attempt on the same host gets
-409 already_claimed; an expired claim becomes uncertain with NO blind retry,
-new attempt, or new start. Lost GET/claim/ack responses reconcile via
+409 already_claimed; expired custody is re-offered with the SAME token and
+attempt identity for bounded journal reconciliation, never a new effect. Lost GET/claim/ack responses reconcile via
 re-discovery (offers) and command listing — never duplicate effects.
 
 Ack.native semantics (CORRECTED): ack.native.native_id is ALWAYS the TARGET
@@ -169,6 +169,7 @@ def offer_to_command(offer: dict[str, Any]) -> dict[str, Any]:
             body = payload.get("body")
             if not isinstance(body, str) or not body.strip():
                 raise SessionControlError("Send body is required")
+            command["mode"] = offer.get("mode")
             command["body"] = body
             command["await_ack"] = True
         else:
