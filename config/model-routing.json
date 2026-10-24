@@ -17,6 +17,16 @@
       "argon",
       "opus"
     ],
+    "ask": [
+      "opus",
+      "sonnet",
+      "haiku"
+    ],
+    "review": [
+      "opus",
+      "astra",
+      "argon"
+    ],
     "daily": [
       "sol",
       "sonnet",
@@ -138,7 +148,6 @@
   ],
   "rules": {
     "disabled_providers": [
-      "claude",
       "grok"
     ],
     "explicit_only_providers": [

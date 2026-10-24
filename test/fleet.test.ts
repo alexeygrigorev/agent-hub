@@ -128,13 +128,22 @@ describe('generic accounts and launch placement', () => {
       expect(s.plan(intent({ tier: 'deep', engine })).selected?.selection).toMatchObject({ id: 'argon', model: 'gemini-4-argon-high' });
     }
   }));
-  it('refuses Opus and Claude with policy guidance even without a live Claude route', async () => fixture(async (s, sql) => {
+  it('refuses disabled providers like grok with policy guidance even without a live route', async () => fixture(async (s, sql) => {
     await configure(s);
-    for (const engine of ['opus', 'claude']) {
+    for (const engine of ['grok']) {
       const result = s.reserve(intent({ engine, machine: 'hetzner', access: { mode: 'read' } }), admin);
       expect(result.status).toBe(409);
       expect(result.value.error).toBe('provider_disabled');
       expect(result.value.detail).toContain('register a fresh host route');
+    }
+    expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches').one().n).toBe(0);
+  }));
+  it('refuses Opus and Claude when no live route exists', async () => fixture(async (s, sql) => {
+    await configure(s);
+    for (const engine of ['opus', 'claude']) {
+      const result = s.reserve(intent({ engine, machine: 'hetzner', access: { mode: 'read' } }), admin);
+      expect(result.status).toBe(409);
+      expect(result.value.error).toBe('no_eligible_route');
     }
     expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches').one().n).toBe(0);
   }));

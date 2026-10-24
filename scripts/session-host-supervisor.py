@@ -30,22 +30,39 @@ def same_controller(row, receipt):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--workspace', required=True)
-    parser.add_argument('--config', required=True)
-    parser.add_argument('--credential-config', required=True)
-    parser.add_argument('--journal-dir', required=True)
+    parser.add_argument('--config', default=None, help='Subscription configuration (default: ~/.config/agent-hub/subscriptions.json)')
+    parser.add_argument('--credential-config', default=None, help='Host credentials (default: ~/.config/agent-hub/host.json)')
+    parser.add_argument('--journal-dir', default=None, help='Journal directory')
     args = parser.parse_args()
     workspace = pathlib.Path(args.workspace).resolve(strict=True)
-    journal = pathlib.Path(args.journal_dir).resolve()
+    if args.config:
+        config_path = pathlib.Path(args.config).resolve(strict=True)
+    else:
+        sys.path.insert(0, str(workspace / 'host'))
+        from agent_hub_host import fleet
+        config_path = fleet.subscriptions_path().resolve(strict=True)
+
+    if args.credential_config:
+        cred_path = pathlib.Path(args.credential_config).resolve(strict=True)
+    else:
+        sys.path.insert(0, str(workspace / 'host'))
+        from agent_hub_host import config as host_config
+        cred_path = host_config.get_host_config_path().resolve(strict=True)
+
+    if args.journal_dir:
+        journal = pathlib.Path(args.journal_dir).resolve()
+    else:
+        journal = (pathlib.Path.home() / ".local" / "state" / "agent-hub" / "journal").resolve()
     journal.mkdir(parents=True, exist_ok=True, mode=0o700)
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
     command = [sys.executable, '-u', '-m', 'agent_hub_host.session_host',
-               '--config', str(pathlib.Path(args.config).resolve(strict=True)),
+               '--config', str(config_path),
                '--journal-dir', str(journal)]
     tag = 'hub-controller-' + uuid.uuid4().hex[:12]
     env_args = [
-        '--env', 'HUB_CONFIG_FILE=' + str(pathlib.Path(args.credential_config).resolve(strict=True)),
+        '--env', 'HUB_CONFIG_FILE=' + str(cred_path),
         '--env', 'PYTHONPATH=' + str(workspace / 'host'),
     ]
     for var in ('AGENT_HUB_MANAGED_DIR', 'HUB_MANAGED_DIR', 'CODEX_LAUNCH_WRAPPER'):
