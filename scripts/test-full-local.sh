@@ -77,7 +77,7 @@ fi
 echo "=== 6/7: Phone-width browser UI (390x844, light+dark) ==="
 if [ -n "${SKIP_PHONE_UI:-}" ]; then
   echo "SKIP: SKIP_PHONE_UI is set; phone browser UI not executed."
-elif node test/phone-ui.browser.mjs --out .local/phone-ui && node test/host-health-charts.browser.mjs; then
+elif node test/phone-ui.browser.mjs --out .local/phone-ui && node test/host-health-charts.browser.mjs && node test/session-stall.browser.mjs; then
   echo "PASS: Phone-width and host-history chart browser UI passed"
 else
   PHONE_RC=$?

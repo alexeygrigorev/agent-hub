@@ -8,6 +8,7 @@ import { effectiveCheckin } from './registry';
 import { accountCapacityAlerts } from './account_capacity';
 import { resolveMachineAliases, aliasDetail, projectAliasSessions } from './machine-alias';
 import { freshCatalogs } from './catalog-freshness';
+import { classifySessionStall, initSessionStalls, orphanFailure } from './session_stall';
 
 export const LIVENESS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS agent_heartbeats (actor TEXT PRIMARY KEY, machine_id TEXT, status TEXT NOT NULL, summary TEXT, at TEXT NOT NULL);
@@ -54,6 +55,7 @@ export class LivenessService {
   constructor(private sql: SqlStorage, private thresholds: Thresholds = DEFAULT_THRESHOLDS, private now: () => number = Date.now) {}
 
   init() {
+    initSessionStalls(this.sql);
     for (const stmt of LIVENESS_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
     const columns = this.sql.exec('PRAGMA table_info(liveness_alerts)').toArray().map((c: any) => c.name);
     if (!columns.includes('delivered_to')) this.sql.exec("ALTER TABLE liveness_alerts ADD COLUMN delivered_to TEXT NOT NULL DEFAULT '[]'");
@@ -122,14 +124,15 @@ export class LivenessService {
       const activity = ageSeconds(s.last_activity_at, now);
       const resolved = canonical(s.machine_id);
       const alias = aliasOf.get(String(s.machine_id)) ?? null;
+      const stall = classifySessionStall(this.sql, s, now, t.agentStallS, hostKnown(s.machine_id));
       let state: string; let detail: string;
       if (!hostKnown(s.machine_id)) { state = 'unknown'; detail = `machine ${label(resolved)} is not reporting`; }
       else if (s.alias_observation === 'no_current_native_observation') { state = 'unknown'; detail = 'no current native observation on canonical host'; }
+      else if (stall.stalled) { state = 'stalled'; detail = `${stall.reason}; no native progress for ${stall.idle_for ?? 'unknown'}s (threshold ${t.agentStallS}s)`; }
       else if (s.phase === 'unobserved' || s.phase === 'unknown') { state = 'unknown'; detail = 'no positive current native state'; }
+      else if ((s.phase === 'exited' || s.phase === 'dead') && orphanFailure(s)) { state = 'stalled'; detail = 'headless agent exited while children remained; workload exit is now confirmed'; }
       else if (s.phase === 'exited' || s.phase === 'dead') { state = 'exited'; detail = `phase ${s.phase}`; }
       else if (s.phase !== 'running') { state = ['starting','exiting','uncertain','broken'].includes(s.phase) ? s.phase : 'unknown'; detail = `phase ${s.phase}`; }
-      // Only agent engines can stall; a quiet shell is usually a long-running command.
-      else if (s.agent_state === 'working' && s.engine && s.engine !== 'shell' && activity !== null && activity > t.agentStallS) { state = 'stalled'; detail = `reported working but no terminal activity for ${activity}s`; }
       else if (s.agent_state === 'working') { state = 'working'; detail = activity === null ? 'working' : `active ${activity}s ago`; }
       else { state = s.agent_state ? 'idle' : 'running'; detail = `${s.agent_state || 'no agent state'}${activity === null ? '' : `, active ${activity}s ago`}`; }
       if (alias) detail += ` (same host ${hostnames.get(String(s.machine_id)) ?? 'unknown'}; reporting via ${label(resolved)})`;
@@ -147,7 +150,7 @@ export class LivenessService {
       else if ((l.state === 'offered' || l.state === 'starting') && age !== null && age > t.launchStuckS) { state = 'stuck'; detail = `${l.state} for ${age}s`; }
       else if (alias && l.native_id && !sessionRows.some(s => s.native_id === l.native_id && canonical(s.machine_id) === resolved && !['unobserved','unknown'].includes(s.phase) && (catalogSeen.has(s.machine_id) || (Number.isFinite(Date.parse(s.observed_at)) && now - Date.parse(s.observed_at) <= 180000)))) { state = 'unknown'; detail = 'no current native observation on canonical host'; }
       else if (l.machine_id && !hostKnown(l.machine_id)) { state = 'unknown'; detail = `machine ${label(resolved)} is not reporting`; }
-      else if (l.state === 'running' && l.mode === 'interactive' && l.native_id && !this.sessionReported(l.machine_id, l.native_id, reported) && !this.sessionReported(resolved, l.native_id, reported)) { state = 'missing'; detail = 'session no longer reported by its machine'; }
+      else if (l.state === 'running' && l.native_id && !this.sessionReported(l.machine_id, l.native_id, reported) && !this.sessionReported(resolved, l.native_id, reported)) { state = 'missing'; detail = 'session no longer reported by its machine'; }
       else { state = l.state === 'running' ? 'working' : l.state; detail = `${l.state}${age === null ? '' : ` since ${age}s`}`; }
       subjects.push({ kind: 'launch', id: l.id, state, detail: `${l.summary}: ${detail}`, machine_id: l.machine_id, resolved_machine_id: resolved, alias_of: alias, canonical_id: resolved || null, age_s: age });
     }
@@ -202,10 +205,12 @@ export class LivenessService {
   reconcileAlerts(subjects: Subject[], kinds: string[] = ['machine', 'session', 'launch', 'agent']): any[] {
     const at = new Date(this.now()).toISOString(); const opened: any[] = [];
     const problems = new Map(subjects.filter(s => ALERT_STATES.has(s.state)).map(s => [s.kind + ':' + s.id, s]));
+    const unknown = new Set(subjects.filter(s => s.kind === 'session' && s.state === 'unknown').map(s => s.kind + ':' + s.id));
     const open = this.sql.exec(`SELECT * FROM liveness_alerts WHERE resolved_at IS NULL AND subject_kind IN (${kinds.map(() => '?').join(',')})`, ...kinds).toArray() as any[];
     const openKeys = new Set<string>();
     for (const alert of open) {
       const key = alert.subject_kind + ':' + alert.subject; const current = problems.get(key);
+      if (alert.state === 'stalled' && unknown.has(key)) continue;
       if (!current) this.sql.exec('UPDATE liveness_alerts SET resolved_at = ? WHERE id = ?', at, alert.id);
       else {
         openKeys.add(key);

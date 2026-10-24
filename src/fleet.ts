@@ -304,6 +304,7 @@ export class FleetService {
     if (!columns.includes('last_activity_at')) this.sql.exec('ALTER TABLE fleet_sessions ADD COLUMN last_activity_at TEXT');
     if (!columns.includes('cwd')) this.sql.exec('ALTER TABLE fleet_sessions ADD COLUMN cwd TEXT');
     if (!columns.includes('created_at_ms')) this.sql.exec('ALTER TABLE fleet_sessions ADD COLUMN created_at_ms INTEGER');
+    if (!columns.includes('progress_json')) this.sql.exec('ALTER TABLE fleet_sessions ADD COLUMN progress_json TEXT');
   }
 
   public observationProvenance(account: any, route: any): { quota: any; subscriptionObservedAt: string | null } | null {
@@ -1038,7 +1039,11 @@ export class FleetService {
       if (!object(data, ['sessions']) || !Array.isArray(data.sessions) || data.sessions.length > 500) return response({ error: 'invalid_sessions' }, 400);
       const ids = new Set();
       for (const s of data.sessions) {
-        if (!object(s, ['native_id', 'tag', 'engine', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms', 'confirmed_exit']) ||
+        if (!object(s, ['native_id', 'tag', 'engine', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms', 'confirmed_exit', 'progress']) ||
+            (s.progress !== undefined && (!object(s.progress, ['last_progress_at', 'headless', 'agent_alive', 'orphaned', 'cleanup']) ||
+              typeof s.progress.last_progress_at !== 'string' || !fresh(s.progress.last_progress_at, this.now() + 60000, 366 * 86400000) ||
+              typeof s.progress.headless !== 'boolean' || ![true, false, null].includes(s.progress.agent_alive) ||
+              typeof s.progress.orphaned !== 'boolean' || !['none', 'reaped', 'uncertain'].includes(s.progress.cleanup))) ||
             (s.last_activity_at !== undefined && s.last_activity_at !== null && (typeof s.last_activity_at !== 'string' || !fresh(s.last_activity_at, this.now() + 60000, 366 * 86400000))) ||
             (s.confirmed_exit !== undefined && typeof s.confirmed_exit !== 'boolean') ||
             (s.created_at_ms !== undefined && s.created_at_ms !== null && (!Number.isInteger(s.created_at_ms) || s.created_at_ms <= 0)) ||
@@ -1048,7 +1053,7 @@ export class FleetService {
       return this.transaction(() => {
         // Write only rows that changed: hosts report every minute and Durable Object row writes
         // are metered. observed_at therefore means "last changed"; host freshness comes from heartbeats.
-        const fields = ['tag', 'engine', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms'];
+        const fields = ['tag', 'engine', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms', 'progress_json'];
         const existing = new Map((this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id = ?', caller.machineId!).toArray() as any[]).map(r => [r.native_id, r]));
 
         // Stopped same-incarnation native sessions cannot resurrect from late live-catalog snapshots:
@@ -1084,9 +1089,9 @@ export class FleetService {
           }
           cleanSessions.push(s);
           const prior = existing.get(s.native_id); existing.delete(s.native_id);
-          const row = { ...s, last_activity_at: s.last_activity_at ?? null, cwd: s.cwd ?? null, created_at_ms: s.created_at_ms ?? null };
+          const row = { ...s, last_activity_at: s.last_activity_at ?? null, cwd: s.cwd ?? null, created_at_ms: s.created_at_ms ?? null, progress_json: s.progress ? JSON.stringify(s.progress) : null };
           if (prior && fields.every(f => (prior[f] ?? null) === (row[f] ?? null))) continue;
-          this.sql.exec('INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, cwd, profile, account, last_activity_at, created_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', caller.machineId!, s.native_id, s.tag, s.engine, s.phase, s.agent_state, new Date(this.now()).toISOString(), s.workspace, row.cwd, s.profile, s.account, row.last_activity_at, row.created_at_ms);
+          this.sql.exec('INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, cwd, profile, account, last_activity_at, created_at_ms, progress_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', caller.machineId!, s.native_id, s.tag, s.engine, s.phase, s.agent_state, new Date(this.now()).toISOString(), s.workspace, row.cwd, s.profile, s.account, row.last_activity_at, row.created_at_ms, row.progress_json);
           written++;
         }
         // Preserve historical observations. A missing catalog row is not exit

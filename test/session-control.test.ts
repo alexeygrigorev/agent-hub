@@ -736,7 +736,7 @@ describe('absolute workspace identifiers and friendly names', () => {
         expect(dataops.qualified_alias).toBe('dataops:batching');
         expect(dataops.engine).toBe('argon');
         expect(dataops.machine).toBe('hetzner');
-        expect(dataops.state).toBe('running');
+        expect(dataops).toMatchObject({ state: 'stalled', lifecycle_state: 'running', stalled: true });
         expect(dataops.created_at).toBe(new Date(1792257043571).toISOString());
 
         const crm = data.sessions.find((r: any) => r.id === NATIVE_CRM_ID);
@@ -747,7 +747,7 @@ describe('absolute workspace identifiers and friendly names', () => {
         expect(crm.qualified_alias).toBe('git:crm-redesign');
         expect(crm.engine).toBe('codex');
         expect(crm.machine).toBe('hetzner');
-        expect(crm.state).toBe('running');
+        expect(crm).toMatchObject({ state: 'stalled', lifecycle_state: 'running', stalled: true });
         expect(crm.created_at).toBe(new Date(1792238491217).toISOString());
       });
     });
@@ -880,7 +880,7 @@ describe('absolute workspace identifiers and friendly names', () => {
         const show = await s.handle(request('/api/sessions/dataops:batching', undefined, 'GET'), admin);
         expect(show.status).toBe(200);
         const row = await show.json() as any;
-        expect(row.state).toBe('running');
+        expect(row).toMatchObject({ state: 'stalled', lifecycle_state: 'running', stalled: true });
       });
     });
 
@@ -1062,7 +1062,7 @@ describe('absolute workspace identifiers and friendly names', () => {
 
         // Verify initial state
         const initial = await (await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}`, undefined, 'GET'), admin)).json() as any;
-        expect(initial.state).toBe('running');
+        expect(initial).toMatchObject({ state: 'stalled', lifecycle_state: 'running', stalled: true });
         expect(initial.controllability).toBe('controllable');
 
         const validPayload = {
@@ -1121,9 +1121,10 @@ describe('absolute workspace identifiers and friendly names', () => {
         expect((await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, { ...validPayload, unexpected_extra: true }), host('hetzner'))).status).toBe(400);
         expect((await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, { ...validPayload, tombstone: {} }), host('hetzner'))).status).toBe(400);
 
-        // State remains running after all negative attempts
+        // Negative attempts preserve running custody; these historical
+        // samples remain stalled in the inactivity display.
         const stillRunning = await (await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}`, undefined, 'GET'), admin)).json() as any;
-        expect(stillRunning.state).toBe('running');
+        expect(stillRunning).toMatchObject({ state: 'stalled', lifecycle_state: 'running', stalled: true });
 
         // 4. Valid positive retirement succeeds
         const retireRes = await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}/retirement`, validPayload), host('hetzner'));

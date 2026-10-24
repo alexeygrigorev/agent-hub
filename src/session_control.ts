@@ -20,6 +20,7 @@
  * See docs/SESSION-CONTROL.md.
  */
 import { recordIntakeSessionLink, IntakeSessionLinkError } from './intake';
+import { classifySessionStall, initSessionStalls, nativeObservationFresh, nativeProgress, orphanFailure, stallThreshold } from './session_stall';
 import { STOP_DELIVERY_MS, expireUnclaimedStops, refreshObservedHostFamily, visibleSessionPrefixMatches } from './session_stop';
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { credentialActor } from './agent_registry';
@@ -238,6 +239,7 @@ export class SessionControlService {
   }
 
   init() {
+    initSessionStalls(this.sql);
     for (const stmt of SESSION_CONTROL_SCHEMA.split(';')) {
       if (stmt.trim()) this.sql.exec(stmt);
     }
@@ -549,7 +551,7 @@ export class SessionControlService {
     }
     const now = this.now();
     const started = binding?.native_created_at_ms ?? native?.created_at_ms ?? Date.parse(row.created_at);
-    const outputAt = Date.parse(native?.last_activity_at ?? '');
+    const outputAt = nativeProgress(native) ?? NaN;
     const lastActivity = Number.isFinite(outputAt) ? Math.max(started, outputAt) : started;
     // Imported native sessions can be linked after launch through intake.
     let intakeId = intent.intake_task_id ?? null;
@@ -563,7 +565,7 @@ export class SessionControlService {
     const runtime = Math.max(0, (now - started) / 1000);
     const idleFor = Math.max(0, (now - lastActivity) / 1000);
     const snooze: any = this.sql.exec('SELECT * FROM session_warning_events WHERE session_id = ? ORDER BY rowid DESC LIMIT 1', row.id).toArray()[0];
-    const longRunning = row.state === 'running' && (!native || native.phase === 'running') && runtime > threshold;
+    const longRunning = row.state === 'running' && runtime > threshold;
     return {
       runtime, idle_for: idleFor, last_activity_at: new Date(lastActivity).toISOString(),
       long_running: longRunning, activity_state: idleFor > 3600 ? 'idle' : 'active',
@@ -578,6 +580,15 @@ export class SessionControlService {
     const request = parsed(row.request_json, {});
     const protection: any = this.sql.exec('SELECT request_key, created_at FROM session_control_protections WHERE session_id = ?', row.id).toArray()[0];
     const binding = row.binding_json ? parsed(row.binding_json, null) : null;
+    const observed: any = binding?.native_id && row.machine_id
+      ? this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id = ? AND native_id = ?', row.machine_id, binding.native_id).toArray()[0] : null;
+    const same = observed && observed.tag === binding?.tag && observed.workspace === binding?.workspace &&
+      (!observed.created_at_ms || !binding?.native_created_at_ms || observed.created_at_ms === binding.native_created_at_ms);
+    const native = same ? observed : binding?.native_id && row.machine_id ? {
+      machine_id: row.machine_id, native_id: binding.native_id, phase: 'unobserved',
+      created_at_ms: binding.native_created_at_ms ?? Date.parse(row.created_at), observed_at: row.updated_at,
+    } : null;
+    const stall = classifySessionStall(this.sql, native, this.now(), stallThreshold(this.options.env), nativeObservationFresh(this.sql, native, this.now()));
     const isObserved = (row.actor === 'unknown' || request.provenance === 'observed_native') && !row.fleet_launch_id;
     const provenance = isObserved ? 'observed_native' : 'canonical_hub';
     const controllability = isObserved
@@ -608,7 +619,13 @@ export class SessionControlService {
     const qualified_name = qualified_alias || (typeof request.name === 'string' ? request.name : row.id);
     return {
       ...(threshold === null ? {} : this.warningView(row, threshold)),
-      id: row.id, state: row.state, machine: row.machine_id ?? null, engine: row.engine ?? null,
+      id: row.id, state: row.mode === 'headless' && row.state === 'stopped' && orphanFailure(native) ? 'failed' :
+        row.mode === 'headless' && row.state === 'running' && ['exited', 'dead'].includes(native?.phase) ? 'failed' :
+        row.state === 'running' && stall.stalled ? 'stalled' : row.state,
+      stalled: row.state === 'running' && stall.stalled,
+      stall_reason: orphanFailure(native) ? 'agent_exited_children_running' : stall.reason, stalled_since: stall.since,
+      stall_threshold: stallThreshold(this.options.env), lifecycle_state: row.state,
+      machine: row.machine_id ?? null, engine: row.engine ?? null,
       model_id: modelSelection?.id ?? null, model: modelSelection?.model ?? null,
       mode: row.mode, access: request.access?.mode || 'legacy_unspecified',
       // Friendly name from the stored start intent (null when unnamed). The

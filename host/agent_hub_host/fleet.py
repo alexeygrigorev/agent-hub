@@ -560,8 +560,9 @@ def _ms_to_iso(value):
         return None
 
 
-def session_metadata(raw, settings):
-    from .account_capacity import activity_ms, confirmed_empty
+def session_metadata(raw, settings, progress=None):
+    from .account_capacity import confirmed_empty
+    from .session_progress import event_ms
     sessions = raw if isinstance(raw, list) else raw.get("sessions", [])
     clean = []
     for session in sessions:
@@ -590,8 +591,9 @@ def session_metadata(raw, settings):
                       "profile": profile, "account": matches[0]["account_label"] if len(matches) == 1 else None,
                       "phase": phase, "confirmed_exit": exit_confirmed, "agent_state": session.get("reported_state"),
                       "cwd": cwd,
-                      "last_activity_at": _ms_to_iso(activity_ms(session)),
-                      "created_at_ms": created_at_ms})
+                      "last_activity_at": _ms_to_iso(event_ms(session)),
+                      "created_at_ms": created_at_ms,
+                      **({'progress': progress[session['id']]} if progress and session['id'] in progress else {})})
     return clean
 
 
@@ -1695,7 +1697,13 @@ class Dispatcher:
         this helper never launches anything.
         """
         raw = self.runner([self.settings.get("aplexer_bin", "aplexer"), "list", "--all", "--json"])
-        self.request("PUT", "/api/fleet/sessions", {"sessions": session_metadata(raw, self.settings)})
+        from .session_progress import SessionProgress, stop_orphan
+        if not hasattr(self, '_session_progress'):
+            self._session_progress = SessionProgress(stop=lambda row: stop_orphan(self.settings.get('aplexer_bin', 'aplexer'), row),
+                state_path=Path(self.journal_dir) / 'session-progress.json' if self.journal_dir else None)
+        rows = raw if isinstance(raw, list) else raw.get('sessions', [])
+        progress = self._session_progress.sample(rows, self._active_launches)
+        self.request("PUT", "/api/fleet/sessions", {"sessions": session_metadata(raw, self.settings, progress)})
         # Reconcile Fleet-owned starts into exact Hub session bindings after
         # reporting the observed native catalog. Retry is read-before-write.
         try:

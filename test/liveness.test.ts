@@ -53,10 +53,10 @@ describe('liveness states', () => {
     session(sql, 'laptop', 'remote', 'running', 'working', 10);
     sql.exec("INSERT INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, last_activity_at) VALUES ('hetzner', 'n-sh', 'quiet-shell', 'shell', 'running', 'working', ?, '/repo', ?)", iso(30), iso(9000));
     const { subjects } = live.evaluate();
-    expect(byId(subjects, 'session', 'hetzner/quiet-shell')).toBe('working');
+    expect(byId(subjects, 'session', 'hetzner/quiet-shell')).toBe('stalled');
     expect(byId(subjects, 'session', 'hetzner/busy')).toBe('working');
     expect(byId(subjects, 'session', 'hetzner/hung')).toBe('stalled');
-    expect(byId(subjects, 'session', 'hetzner/waiting')).toBe('idle');
+    expect(byId(subjects, 'session', 'hetzner/waiting')).toBe('stalled');
     expect(byId(subjects, 'session', 'hetzner/done')).toBe('exited');
     expect(byId(subjects, 'session', 'laptop/remote')).toBe('unknown');
   }));
@@ -69,12 +69,14 @@ describe('liveness states', () => {
     launch(sql, 'a0000000-0000-4000-8000-000000000004', 'hetzner', 'running', 30, 'interactive', 'n-gone');
     session(sql, 'hetzner', 'kept', 'running', 'working', 10);
     launch(sql, 'a0000000-0000-4000-8000-000000000005', 'hetzner', 'running', 30, 'interactive', 'n-kept');
+    launch(sql, 'a0000000-0000-4000-8000-000000000006', 'hetzner', 'running', 30, 'headless', 'n-headless-gone');
     const { subjects } = live.evaluate();
     expect(byId(subjects, 'launch', 'a0000000-0000-4000-8000-000000000001')).toBe('stuck');
     expect(byId(subjects, 'launch', 'a0000000-0000-4000-8000-000000000002')).toBe('offered');
     expect(byId(subjects, 'launch', 'a0000000-0000-4000-8000-000000000003')).toBe('uncertain');
     expect(byId(subjects, 'launch', 'a0000000-0000-4000-8000-000000000004')).toBe('missing');
     expect(byId(subjects, 'launch', 'a0000000-0000-4000-8000-000000000005')).toBe('working');
+    expect(byId(subjects, 'launch', 'a0000000-0000-4000-8000-000000000006')).toBe('missing');
   }));
 
   it('records self-reported agent heartbeats and marks them stale after the threshold', () => fixture((live, sql, clock) => {

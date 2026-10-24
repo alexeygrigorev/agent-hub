@@ -445,8 +445,8 @@ function renderSessionDetail(session, commands = []) {
     badgesEl.replaceChildren(stateBadge(session.state), typeBadge(session.session_type));
   }
 
-  const isRunning = session.state === 'running';
-  const isStoppable = ['offered', 'starting', 'running', 'uncertain'].includes(session.state);
+  const isRunning = (session.lifecycle_state || session.state) === 'running';
+  const isStoppable = ['offered', 'starting', 'running', 'stalled', 'uncertain'].includes(session.lifecycle_state || session.state);
   if (capTailBtn) capTailBtn.disabled = !isRunning;
   if (capScreenBtn) capScreenBtn.disabled = !isRunning;
   if (sendBtn) sendBtn.disabled = !isRunning;
