@@ -550,6 +550,16 @@ class TestIntakeCli(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
+    def test_append_unwraps_note_object(self):
+        with tempfile.NamedTemporaryFile(dir=ROOT/'.local/tmp', mode='w', encoding='utf-8') as tf:
+            json.dump({'note': {'text': 'sample text', 'source': 'custom'}}, tf)
+            tf.flush()
+            with patch.object(intake, 'request', return_value={'ok': True}) as transport:
+                code, out, err = self.run_cli('intake', 'append', 'task-1', '--version', '1', '--key', 'k', '--event-file', tf.name)
+            self.assertEqual(code, 0, err)
+            payload = transport.call_args.args[2]
+            self.assertEqual(payload['note'], {'text': 'sample text', 'source': 'custom'})
+
 
 if __name__ == '__main__':
     unittest.main()

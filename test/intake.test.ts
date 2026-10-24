@@ -68,6 +68,36 @@ describe('private durable intake HTTP/SQLite', () => {
     expect(INTAKE_EVENT_KINDS).toContain('session');
     expect(INTAKE_EVENT_KINDS).toContain('obligation_response');
     expect((await ok('/tasks/' + task.id)).task.control.version).toBe(1);
+
+    // Short prefix lookup on /tasks/:id
+    const prefixLookup = await ok('/tasks/' + task.id.slice(0, 8));
+    expect(prefixLookup.task.id).toBe(task.id);
+
+    // Append accepts { note: { text, source } } and string source
+    const noteRes = await ok('/tasks/' + task.id + '/events', {
+      key: 'append-note-shape',
+      expected_version: 1,
+      note: { text: 'Appended note content', source: 'triage-note' },
+    });
+    expect(noteRes.task.control.version).toBe(2);
+    expect(noteRes.task.payload_data.history[1]).toMatchObject({
+      kind: 'note',
+      text: 'Appended note content',
+      source: { type: 'unknown', reference: 'triage-note', timestamp: null },
+    });
+
+    // Append accepts { event: { note: { text, source } } } wrapped shape
+    const wrappedNoteRes = await ok('/tasks/' + task.id + '/events', {
+      key: 'append-wrapped-note',
+      expected_version: 2,
+      event: { note: { text: 'Wrapped note content', source: 'chat' } },
+    });
+    expect(wrappedNoteRes.task.control.version).toBe(3);
+    expect(wrappedNoteRes.task.payload_data.history[2]).toMatchObject({
+      kind: 'note',
+      text: 'Wrapped note content',
+      source: { type: 'chat', reference: null, timestamp: null },
+    });
   });
 
   it('records and replays new intake beyond the former 4 MiB backfill budget', async () => {

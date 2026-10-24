@@ -560,6 +560,13 @@ class TestSessionControlCli(unittest.TestCase):
         json_err = RuntimeError('Expected JSON response')
         self.assertIn('Expected JSON response', session_control.diagnostic(json_err))
 
+    def test_start_extracts_id_from_intake_url(self):
+        args = self.parse('start', '--workspace', 'demo', '--intake-task-id', 'https://hub.test/#/intake/task-url-1234', '--key', 'k')
+        with patch.object(session_control, 'request', return_value={}) as transport:
+            session_control.execute(args)
+        payload = transport.call_args.args[2]
+        self.assertEqual(payload['intake_task_id'], 'task-url-1234')
+
 
 if __name__ == '__main__':
     unittest.main()

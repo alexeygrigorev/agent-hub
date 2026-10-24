@@ -636,7 +636,9 @@ def execute(args):
             if value:
                 payload[field] = value
         if getattr(args, 'intake_task_id', None):
-            payload['intake_task_id'] = args.intake_task_id
+            val = str(args.intake_task_id).strip()
+            m = re.search(r'/intake/([A-Za-z0-9._:-]{6,128})', val)
+            payload['intake_task_id'] = m.group(1) if m else val
         if reason and reason.strip():
             payload['engine_override_reason'] = reason.strip()
         if getattr(args, 'name', None) is not None:

@@ -85,6 +85,12 @@ function canonical(value: any): string {
   return JSON.stringify(value);
 }
 function source(raw: any): Obj {
+  if (typeof raw === 'string') {
+    if (['chat', 'voice', 'forwarded', 'unknown'].includes(raw)) {
+      return { type: raw, reference: null, timestamp: null };
+    }
+    return { type: 'unknown', reference: nullable(raw, 2048), timestamp: null };
+  }
   const s = object(raw); keys(s, ['type', 'reference', 'timestamp']);
   if (!['chat', 'voice', 'forwarded', 'unknown'].includes(s.type)) fail('invalid_source');
   const timestamp = nullable(s.timestamp, 64);
@@ -128,7 +134,11 @@ export class IntakeService {
   }
   private rows(table: string): Obj[] { return this.sql.exec(`SELECT data FROM intake_${table} ORDER BY id`).toArray().map((r: any) => JSON.parse(r.data)); }
   private get(table: string, id: string): Obj | undefined {
-    const r = this.sql.exec(`SELECT data FROM intake_${table} WHERE id=?`, id).toArray()[0] as any;
+    let r = this.sql.exec(`SELECT data FROM intake_${table} WHERE id=?`, id).toArray()[0] as any;
+    if (!r && table === 'tasks' && id.length >= 6) {
+      const candidates = this.sql.exec(`SELECT data FROM intake_tasks WHERE id LIKE ? || '%' LIMIT 2`, id).toArray() as any[];
+      if (candidates.length === 1) r = candidates[0];
+    }
     return r ? JSON.parse(r.data) : undefined;
   }
   private put(table: string, data: Obj) {
@@ -757,12 +767,21 @@ export class IntakeService {
       if ('text' in b && ('note' in b || 'event' in b)) throw new IntakeError('invalid_field', 400, 'text');
       if (!('note' in b) && !('event' in b) && !('text' in b)) fail('event_or_note_required');
       let rawNoteOrEvent: any = 'note' in b ? b.note : ('event' in b ? b.event : { text: b.text });
+      let isNote = 'note' in b || 'text' in b;
+      if (rawNoteOrEvent && typeof rawNoteOrEvent === 'object' && !Array.isArray(rawNoteOrEvent)) {
+        if ('note' in rawNoteOrEvent && !('kind' in rawNoteOrEvent)) {
+          rawNoteOrEvent = rawNoteOrEvent.note;
+          isNote = true;
+        } else if ('event' in rawNoteOrEvent && !('kind' in rawNoteOrEvent)) {
+          rawNoteOrEvent = rawNoteOrEvent.event;
+        }
+      }
       if (typeof rawNoteOrEvent === 'string') {
-        if (!('note' in b) && !('text' in b)) fail('invalid_object');
+        if (!isNote) fail('invalid_object');
         rawNoteOrEvent = { text: rawNoteOrEvent };
       }
       let event = object(rawNoteOrEvent);
-      if ('note' in b || 'text' in b) {
+      if (isNote) {
         keys(event, ['text', 'source']);
         event = { ...event, kind: 'note' };
       }

@@ -109,4 +109,27 @@ describe('intake acceptance-criteria start gate', () => {
     expect(conflict.data.error).toBe('invalid_session_request');
     expect(conflict.data.field).toBe('intake_task');
   });
+
+  it('accepts unambiguous prefix and URL-shaped intake_task_id, rejects ambiguous prefix', async () => {
+    const full = (await create('', { acceptance_criteria: 'Prefix acceptance criteria.' })).task;
+    const prefix = full.id.slice(0, 8);
+    // Unambiguous prefix resolves cleanly
+    const prefixed = await sessionsCall({ key: 'ac-prefix-' + ++seq, workspace: 'demo', brief: 'Synthetic prefix goal', intake_task_id: prefix });
+    expect([201, 409], JSON.stringify(prefixed.data)).toContain(prefixed.status);
+    expect(prefixed.data.error ?? null).not.toBe('unknown_intake_task');
+
+    // URL-shaped intake_task_id extracts the id and resolves cleanly
+    const urlShaped = await sessionsCall({ key: 'ac-url-' + ++seq, workspace: 'demo', brief: 'Synthetic url goal', intake_task_id: 'https://hub.test/#/intake/' + full.id });
+    expect([201, 409], JSON.stringify(urlShaped.data)).toContain(urlShaped.status);
+    expect(urlShaped.data.error ?? null).not.toBe('invalid_session_request');
+
+    // Ambiguous prefix when two tasks share the same prefix
+    await inDO(stub(), (h: any) => {
+      const cloned = { ...full, id: prefix + '-second-task' };
+      h.sql.exec('INSERT INTO intake_tasks (id, data) VALUES (?, ?)', cloned.id, JSON.stringify(cloned));
+    });
+    const ambiguous = await sessionsCall({ key: 'ac-ambig-' + ++seq, workspace: 'demo', brief: 'Synthetic ambig goal', intake_task_id: prefix });
+    expect(ambiguous.status, JSON.stringify(ambiguous.data)).toBe(409);
+    expect(ambiguous.data.error).toBe('ambiguous_intake_task');
+  });
 });

@@ -931,6 +931,14 @@ export class SessionControlService {
       // CLI historically used --intake-task while the API field is intake_task_id.
       // Accept the short alias when it does not conflict, so MCP/CLI parity does
       // not surface as a spurious invalid_session_request for otherwise valid starts.
+      if (typeof input.intake_task === 'string') {
+        const m = /\/intake\/([A-Za-z0-9._:-]{6,128})/.exec(input.intake_task);
+        if (m) input.intake_task = m[1];
+      }
+      if (typeof input.intake_task_id === 'string') {
+        const m = /\/intake\/([A-Za-z0-9._:-]{6,128})/.exec(input.intake_task_id);
+        if (m) input.intake_task_id = m[1];
+      }
       if (Object.prototype.hasOwnProperty.call(input, 'intake_task')) {
         if (input.intake_task_id !== undefined && input.intake_task_id !== input.intake_task) {
           return response({ error: 'invalid_session_request', field: 'intake_task', detail: 'conflicts_with_intake_task_id' }, 400);
@@ -1069,15 +1077,25 @@ export class SessionControlService {
           return response({ error: 'intake_task_id_required' }, 400);
         }
         if (input.intake_task_id) {
-          let ac: unknown;
-          let taskStatus: unknown;
+          let row: any = this.sql.exec('SELECT id, data FROM intake_tasks WHERE id = ?', input.intake_task_id).toArray()[0];
+          if (!row && input.intake_task_id.length >= 6) {
+            const candidates: any[] = this.sql.exec('SELECT id, data FROM intake_tasks WHERE id LIKE ? || "%" LIMIT 2', input.intake_task_id).toArray();
+            if (candidates.length === 1) {
+              row = candidates[0];
+              input.intake_task_id = row.id;
+            } else if (candidates.length > 1) {
+              return response({ error: 'ambiguous_intake_task' }, 409);
+            }
+          }
+          if (!row) return response({ error: 'unknown_intake_task' }, 404);
+          let data: any;
           try {
-            const row: any = this.sql.exec('SELECT data FROM intake_tasks WHERE id = ?', input.intake_task_id).toArray()[0];
-            const data = row ? JSON.parse(row.data) : undefined;
-            ac = data ? data.acceptance_criteria : undefined;
-            taskStatus = data?.status;
-          } catch { return response({ error: 'unknown_intake_task' }, 404); }
-          if (ac === undefined) return response({ error: 'unknown_intake_task' }, 404);
+            data = JSON.parse(row.data);
+          } catch {
+            return response({ error: 'unknown_intake_task' }, 404);
+          }
+          const ac = data ? data.acceptance_criteria : undefined;
+          const taskStatus = data?.status;
           if (taskStatus === 'done' || taskStatus === 'cancelled') return response({ error: 'intake_task_closed' }, 409);
           if (typeof ac !== 'string' || !ac.trim()) return response({ error: 'acceptance_criteria_required' }, 400);
         }

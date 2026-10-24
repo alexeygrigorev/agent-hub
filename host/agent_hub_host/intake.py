@@ -91,6 +91,9 @@ def http_error(exc, method, payload):
     result = IntakeHTTPError(exc.code, code, key)
     detail = ''
     if isinstance(body, dict):
+        reason = body.get('reason')
+        if isinstance(reason, str) and SAFE_ERROR.match(reason):
+            detail += f'; reason: {reason}'
         field = body.get('field')
         if field in ('text', 'title', 'project', 'acceptance_criteria', 'current_state', 'next_step', 'owner', 'uncertainty'):
             detail += f'; field: {field}'
@@ -375,7 +378,13 @@ def execute(args):
                 payload[field] = getattr(args, field)
         return request('POST', path + '/assign', payload)
     if command == 'append':
-        payload['event'] = json_file(args.event_file)
+        ev = json_file(args.event_file)
+        if isinstance(ev, dict) and 'note' in ev and 'kind' not in ev and len(ev) == 1:
+            payload['note'] = ev['note']
+        elif isinstance(ev, dict) and 'event' in ev and 'kind' not in ev and len(ev) == 1:
+            payload['event'] = ev['event']
+        else:
+            payload['event'] = ev
         return request('POST', path + '/events', payload)
     if command == 'update':
         for field in ('status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria'):
