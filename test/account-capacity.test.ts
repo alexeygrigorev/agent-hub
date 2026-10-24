@@ -79,9 +79,13 @@ describe('phantom account reservations', () => {
     sql.exec("UPDATE fleet_launches SET state = 'uncertain' WHERE id = ?", first.id);
     sql.exec('UPDATE fleet_launches SET created_at = ? WHERE id = ?', iso(-600001), waiting.id);
     sql.exec('INSERT INTO fleet_memory_holds (launch_id,since,rejected_json) VALUES (?,?,?)', waiting.id, iso(-600001), JSON.stringify([{reason:'launcher_memory_reserve',memory:{reserved_mb:2000,floor_mb:10240}}]));
-    const live = new LivenessService(sql, () => now); live.init();
+    const live = new LivenessService(sql, undefined, () => now); live.init();
     live.reconcileAlerts(live.evaluate().subjects);
-    const forSubject = (subject: string) => live.alerts().find((a: any) => a.subject_kind === 'launch' && a.subject === subject);
+    const forSubject = (subject: string) => {
+      const alert = live.alerts().find((a: any) => a.subject_kind === 'launch' && a.subject === subject);
+      if (!alert) throw new Error('Expected an alert for ' + subject);
+      return alert;
+    };
     expect(forSubject(waiting.id)).toMatchObject({state:'launcher_memory_reserve',resolved_at:null});
     expect(forSubject(waiting.id).detail).toContain('reserved_mb');
     expect(forSubject('account-capacity/' + waiting.id)).toMatchObject({state:'stuck',resolved_at:null});
