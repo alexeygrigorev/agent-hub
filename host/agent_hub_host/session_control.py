@@ -388,10 +388,28 @@ def wait_for_command(session_id, command_id, timeout, interval):
                      'Command wait')
 
 
+def duration_seconds(value):
+    match = re.fullmatch(r'([1-9][0-9]*)([smhd])', str(value))
+    if not match:
+        raise SessionInputError('Duration must be a positive integer followed by s, m, h or d')
+    seconds = int(match[1]) * {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}[match[2]]
+    if seconds > 31536000:
+        raise SessionInputError('Duration must not exceed 365d')
+    return seconds
+
+
+def threshold_path(args, path):
+    value = getattr(args, 'threshold', None) or os.environ.get('HUB_SESSION_WARNING_THRESHOLD')
+    if value:
+        path += ('&' if '?' in path else '?') + 'threshold=' + str(duration_seconds(value))
+    return path
+
+
 def add_commands(sub):
     root = sub.add_parser('sessions', help='Hub session orchestration: grouped lifecycle listing by default; list/start/send/capture/stop/cleanup/observe')
     commands = root.add_subparsers(dest='sessions_cmd', required=False)
     listing = commands.add_parser('list', help='List sessions visible to this credential')
+    listing.add_argument('--threshold', help='Long-running threshold (default 3h; HUB_SESSION_WARNING_THRESHOLD)')
     listing.add_argument('--state')
     listing.add_argument('--limit', type=int, default=50)
     listing.add_argument('--json', action='store_true', help='Output machine-readable JSON')
@@ -466,8 +484,20 @@ def add_commands(sub):
     protect = commands.add_parser('protect', help='Permanently protect an owned session from automated cleanup; never stops it')
     protect.add_argument('id')
     protect.add_argument('--key', required=True, help='Stable protection key; this operation has no unprotect counterpart')
-    show = commands.add_parser('show', help='Show one session with its binding state')
+    show = commands.add_parser('show', aliases=['status'], help='Show one session with its binding state')
     show.add_argument('id')
+    show.add_argument('--threshold')
+    show.add_argument('--json', action='store_true')
+    warnings = commands.add_parser('warnings', help='Current unsnoozed long-running warnings with output tails')
+    warnings.add_argument('--threshold')
+    warnings.add_argument('--json', action='store_true')
+    ack = commands.add_parser('ack', help='Snooze a warning; does not stop the session')
+    ack.add_argument('id')
+    ack.add_argument('--snooze', help='Duration, e.g. 3h (default: threshold)')
+    ack.add_argument('--threshold')
+    ack.add_argument('--json', action='store_true')
+    events = commands.add_parser('events', help='Show durable warning acknowledgement events')
+    events.add_argument('id')
     history = commands.add_parser('commands', help='List durable commands with recorded/transported/acked states')
     history.add_argument('id')
     receive = commands.add_parser('host-receive', help='Bounded host receiver: poll offers, claim, execute, ack (no daemon; Fleet-owned start rejected)')
@@ -634,7 +664,7 @@ def _execute(args):
             params = ''
             if getattr(args, 'limit', None):
                 params = '?limit=%d' % limit
-            return request('GET', '/api/sessions' + params)
+            return request('GET', threshold_path(args, '/api/sessions' + params))
         # State-filtered listing follows next_cursor (bounded, id-deduped) so
         # filtering is complete instead of first-page-only.
         from urllib.parse import quote
@@ -645,7 +675,7 @@ def _execute(args):
             path = '/api/sessions?limit=%d' % limit
             if cursor:
                 path += '&cursor=' + quote(cursor, safe='')
-            page = request('GET', path)
+            page = request('GET', threshold_path(args, path))
             for entry in page.get('sessions', []):
                 if entry.get('id') in known:
                     continue
@@ -658,8 +688,28 @@ def _execute(args):
             if not cursor:
                 break
         return {'sessions': seen[:limit], 'next_cursor': None}
-    if cmd == 'show':
-        return request('GET', '/api/sessions/' + args.id)
+    if cmd in ('show', 'status'):
+        return request('GET', threshold_path(args, '/api/sessions/' + args.id))
+    if cmd == 'events':
+        return request('GET', '/api/sessions/' + args.id + '/events')
+    if cmd == 'ack':
+        payload = {'snooze': duration_seconds(args.snooze)} if args.snooze else {}
+        return request('POST', threshold_path(args, '/api/sessions/' + args.id + '/ack'), payload)
+    if cmd == 'warnings':
+        result = request('GET', threshold_path(args, '/api/sessions/warnings'))
+        from concurrent.futures import ThreadPoolExecutor
+        def capture_warning(warning):
+            try:
+                captured = execute(argparse.Namespace(sessions_cmd='capture', id=warning['id'],
+                                   max_bytes=4096, wait=True, timeout=CAPTURE_TIMEOUT, interval=1.0))
+                warning['output_tail'] = captured['command_wait']['ack']['capture'].splitlines()[-5:]
+                warning['output_status'] = 'captured'
+            except (ValueError, KeyError):
+                warning['output_tail'] = []
+                warning['output_status'] = 'unavailable; use hub sessions capture ' + warning['id']
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(capture_warning, result.get('warnings', [])))
+        return result
     if cmd == 'commands':
         return request('GET', '/api/sessions/' + args.id + '/commands')
     if cmd in ('start', 'override', 'engine-override'):
@@ -826,13 +876,20 @@ def _execute(args):
     raise ValueError('Unknown sessions command')
 
 
+def format_duration(seconds):
+    if not isinstance(seconds, (int, float)):
+        return '-'
+    seconds = max(0, int(seconds))
+    return f'{seconds // 3600}h{seconds % 3600 // 60:02d}m{seconds % 60:02d}s'
+
+
 def render_table(sessions):
     """Render a compact table for `hub sessions list` with columns:
     TYPE, NAME, ENGINE, STATE, WORKSPACE, UPDATED.
     """
     if not sessions:
         return 'No sessions found.'
-    headers = ['TYPE', 'NAME', 'ENGINE', 'STATE', 'WORKSPACE', 'UPDATED']
+    headers = ['TYPE', 'NAME', 'ENGINE', 'STATE', 'WORKSPACE', 'UPDATED', 'LONG_RUNNING', 'RUNTIME', 'IDLE_FOR', 'ACTIVITY']
     rows = []
     for s in sessions:
         stype = s.get('session_type') or ('aplexer' if s.get('mode') == 'interactive' else 'headless')
@@ -845,7 +902,8 @@ def render_table(sessions):
             state = 'idle'
         ws = s.get('workspace') or '-'
         upd = (s.get('updated_at') or '')[:19].replace('T', ' ')
-        rows.append([stype, name, engine, state, ws, upd])
+        rows.append([stype, name, engine, state, ws, upd, str(s.get('long_running', False)).lower(),
+                     format_duration(s.get('runtime')), format_duration(s.get('idle_for')), s.get('activity_state', '-')])
 
     widths = [len(h) for h in headers]
     for row in rows:
@@ -920,6 +978,18 @@ def render_output(args, result):
     if cmd == 'list':
         sessions = result.get('sessions', []) if isinstance(result, dict) else (result if isinstance(result, list) else [])
         return render_table(sessions)
+    if cmd == 'warnings':
+        lines = []
+        for row in result.get('warnings', []):
+            lines.extend([
+                f"{row['id']}  {row.get('qualified_name') or row.get('name') or '-'}  engine={row.get('engine') or '-'}",
+                f"  intake={row.get('intake_id') or '-'}  runtime={format_duration(row.get('runtime'))}  last_activity={row.get('last_activity_at')}",
+                f"  idle_for={format_duration(row.get('idle_for'))}  long and {row.get('activity_state')}",
+                *['  | ' + line for line in row.get('output_tail', [])],
+                '  output: ' + row.get('output_status', 'unavailable'),
+                '  ' + row['snooze_command'],
+            ])
+        return '\n'.join(lines) or 'No long-running warnings.'
     if cmd == 'commands':
         if getattr(args, 'table', False) or (hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()):
             return render_commands(result)

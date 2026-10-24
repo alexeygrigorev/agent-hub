@@ -76,6 +76,10 @@ tool('monitoring_health', 'GET', '/api/monitoring/health', 'Authorized host heal
 tool('accounts_write', 'PUT', '/api/fleet/accounts', 'Operator-only account registry update.');
 export const MCP_ROUTES = routes;
 export const CLI_EXCLUSIONS: Record<string, string> = {
+  'sessions warnings': 'Long-running warning display is CLI-only by product scope.',
+  'sessions ack': 'Long-running warning snooze is CLI-only by product scope.',
+  'sessions events': 'Warning acknowledgement history is CLI-only by product scope.',
+  'sessions status': 'CLI alias for sessions show.',
   'engines add': 'Operator credential import reads private native files; never expose provider credentials through model tools.',
   'engines list': 'Operator credential-management inventory is inspected through the CLI or dedicated account UI.',
   'engines remove': 'Operator credential withdrawal stays in the explicit credential-management CLI/UI workflow.',
