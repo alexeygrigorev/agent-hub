@@ -24,6 +24,7 @@ import { STOP_DELIVERY_MS, expireUnclaimedStops, refreshObservedHostFamily, visi
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { credentialActor } from './agent_registry';
 import { redact } from './routing';
+import { getScopeBlock } from './intake_scope';
 import { taskTier } from './model-routing';
 import { engineProvider, evaluateTbmAdmission, type TbmPoolRow } from './quota_admission';
 import { ensureTbmQuotaSchema } from './quota';
@@ -1206,6 +1207,8 @@ export class SessionControlService {
           const taskStatus = data?.status;
           if (taskStatus === 'done' || taskStatus === 'cancelled') return response({ error: 'intake_task_closed' }, 409);
           if (typeof ac !== 'string' || !ac.trim()) return response({ error: 'acceptance_criteria_required' }, 400);
+          const scopeBlock = getScopeBlock(data);
+          if (scopeBlock) return response({ error: scopeBlock }, 409);
         }
         // TBM Phase 2: kill-switch + hard floor + dynamic soft reserve for
         // autonomous starts (fail closed; interactive starts unaffected).

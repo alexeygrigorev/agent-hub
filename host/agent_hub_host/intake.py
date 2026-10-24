@@ -14,7 +14,7 @@ from . import api, auth, config
 
 BASE = '/api/intake'
 MAX_REQUEST = 32768
-EVENT_KINDS = ('intake', 'note', 'decision', 'followup', 'blocker', 'pending_approval',
+EVENT_KINDS = ('intake', 'note', 'decision', 'followup', 'blocker', 'pending_approval', 'scope_decision',
                'link', 'session', 'report', 'commit', 'rule_reference', 'resolution',
                'approval_decision', 'owner_acceptance', 'first_action', 'work_action',
                'independent_review', 'accepted_outcome', 'human_delivery', 'obligation', 'obligation_response')
@@ -199,7 +199,7 @@ def add_commands(sub):
     update.add_argument('--version', type=int, help='Explicit CAS version; otherwise fetch and retry version conflicts up to three times')
     update.add_argument('--key', help='Stable retry key; generated automatically when omitted')
     update.add_argument('--clear', action='append', choices=['current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria'], default=[], help='Explicitly clear a context field to unknown (repeatable)')
-    for field in ('status', 'title', 'current-state', 'next-step', 'owner', 'uncertainty', 'acceptance-criteria'):
+    for field in ('project', 'status', 'title', 'current-state', 'next-step', 'owner', 'uncertainty', 'acceptance-criteria'):
         update.add_argument('--' + field)
     event = commands.add_parser('append', help='Append intake/note/session/report/commit/followup/blocker/decision/rule reference as JSON; approval decisions require operator')
     event.add_argument('id')
@@ -426,7 +426,7 @@ def execute(args):
             payload['event'] = ev
         return request('POST', path + '/events', payload)
     if command == 'update':
-        for field in ('status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria'):
+        for field in ('project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria'):
             if getattr(args, field, None) is not None:
                 if field == 'acceptance_criteria' and len(args.acceptance_criteria.encode('utf-8')) > 8192:
                     raise IntakeInputError('Acceptance criteria exceed 8192 UTF-8 bytes')

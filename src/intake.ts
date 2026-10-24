@@ -3,6 +3,7 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import type { CallerContext } from './bus';
 import { credentialActor, registryAddress } from './agent_registry';
 import { sha256Sync } from './conversation-followthrough';
+import { SCOPE_POLICY_VERSION, SCOPE_VERDICTS, classifyScope, getScopeStatus, scopeBasisHash, scopeHint } from './intake_scope';
 
 type Auth = { caller?: CallerContext; scopes?: string[]; error?: Response };
 type Obj = Record<string, any>;
@@ -27,7 +28,7 @@ export const INTAKE_LIMITS = { request: 32768, tasks: 10000, taskBytes: 131072, 
 export const OPEN_INTAKE_WARN_THRESHOLD = 100; // t1038u-deploy-marker
 const OPEN = ['open', 'in_progress', 'blocked', 'pending_approval'];
 const STATUSES = [...OPEN, 'done', 'cancelled'];
-export const INTAKE_EVENT_KINDS = ['intake', 'note', 'decision', 'followup', 'blocker', 'pending_approval',
+export const INTAKE_EVENT_KINDS = ['intake', 'note', 'decision', 'followup', 'blocker', 'pending_approval', 'scope_decision',
   'link', 'session', 'report', 'commit', 'rule_reference', 'resolution', 'approval_decision',
   'owner_acceptance', 'first_action', 'work_action', 'independent_review', 'accepted_outcome',
   'human_delivery', 'obligation', 'obligation_response'];
@@ -350,10 +351,26 @@ export class IntakeService {
     if (task.status === 'in_progress') return 'active';
     return task.status === 'open' ? 'ready' : 'closed_or_waiting';
   }
+  /** F2 scope projection. Null scope = legacy pre-policy task (grandfathered).
+   * The classifier only hints; only an operator scope_decision unblocks. */
+  private scopeView(task: Obj): Obj | null {
+    if (!task.scope || typeof task.scope !== 'object') return null;
+    const status = getScopeStatus(task);
+    return {
+      policy_version: task.scope.policy_version ?? null,
+      flag: task.scope.flag ?? null,
+      matched_terms: Array.isArray(task.scope.matched_terms) ? task.scope.matched_terms : [],
+      decision: status.decision,
+      clear: status.clear,
+      ...(status.block_code ? { block_code: status.block_code } : {}),
+      ...(status.stale_policy ? { stale_policy: true } : {}),
+    };
+  }
   private taskView(task: Obj, p: Obj): Obj {
     const { title, current_state, next_step, owner, uncertainty, acceptance_criteria, history, ...identity } = task;
     return { ...identity, control: { version: task.version, status: task.status, continuation_state: this.continuation(task),
       authority: 'hub_ledger_cas', execution_evidence: 'not_verified_by_intake' },
+      scope_flag: task.scope?.flag ?? null, scope: this.scopeView(task),
       payload_data: { title, current_state, next_step, owner, uncertainty, acceptance_criteria: acceptance_criteria ?? null, history }, unresolved: this.unresolved(task),
       assigned_sessions: this.assignedSessions(task, p) };
   }
@@ -485,7 +502,7 @@ export class IntakeService {
     // Session is the public spelling of an external session link. Keep the
     // existing canonical link validation and ownership checks.
     if (raw.kind === 'session') raw = { ...raw, kind: 'link' };
-    if (['note', 'decision', 'followup', 'blocker', 'pending_approval'].includes(raw.kind) && raw.source === undefined)
+    if (['note', 'decision', 'followup', 'blocker', 'pending_approval', 'scope_decision'].includes(raw.kind) && raw.source === undefined)
       raw = { ...raw, source: { type: 'unknown' } };
     if (raw.kind === 'link' && raw.provenance === undefined) raw = { ...raw, provenance: { type: 'unknown' } };
     const kind = raw.kind; let fields: Obj;
@@ -533,6 +550,20 @@ export class IntakeService {
         this.operator(p); if (ref.kind !== 'pending_approval' || !['granted', 'denied', 'withdrawn'].includes(raw.decision)) fail('invalid_approval_decision');
       } else if (ref.kind === 'pending_approval') fail('operator_required', 403);
       fields = { ref: identifier(raw.ref), text: str(raw.text, 8192, 'text'), source: source(raw.source), ...(kind === 'approval_decision' ? { decision: raw.decision } : {}) };
+    } else if (kind === 'scope_decision') {
+      // F2 scope override: operator-only. Task text (notes/decisions by
+      // non-operators) can never approve itself: only this event, recorded
+      // with operator authority and a server-computed basis hash, unblocks
+      // assign/linked start. Changing project/text/AC changes the basis hash
+      // and invalidates the decision (CAS at gate time).
+      this.operator(p);
+      keys(raw, ['kind', 'verdict', 'text', 'source']);
+      const verdict = str(raw.verdict, 32);
+      if (!(SCOPE_VERDICTS as string[]).includes(verdict)) fail('invalid_scope_verdict');
+      const provenance = source(raw.source);
+      if (verdict === 'gray_adr' && !provenance.reference) fail('scope_adr_required');
+      fields = { verdict, text: str(raw.text, 8192, 'text'), source: provenance,
+        basis_hash: scopeBasisHash(task), policy_version: SCOPE_POLICY_VERSION };
     } else if (kind === 'owner_acceptance') {
       keys(raw, ['kind', 'text', 'source', 'verdict']);
       if (!task.owner) {
@@ -732,6 +763,7 @@ export class IntakeService {
     } else return fail('invalid_event_kind');
     const authority =
       kind === 'approval_decision' ? 'operator_record' :
+      kind === 'scope_decision' ? 'operator_record' :
       kind === 'owner_acceptance' ? 'canonical_owner_acceptance' :
       (kind === 'first_action' || kind === 'work_action') ? 'canonical_hub_action_receipt' :
       kind === 'independent_review' ? 'canonical_independent_review' :
@@ -755,6 +787,8 @@ export class IntakeService {
       // Soft warn when open count is high (surfaced on the response below).
       task.history.push(this.event({ kind: 'intake', text: b.text, source: b.source, transcription: b.transcription }, task, p, now));
       task.history[0].intake_key = b.key;
+      // F2: the intake is ALWAYS saved; the classifier hint is stored as scope_flag.
+      task.scope = scopeHint(task);
       this.put('tasks', task);
       const created = { task: this.view(task, p) } as Obj;
       const warn = this.intakeOpenWarning(p);
@@ -829,18 +863,31 @@ export class IntakeService {
         event = { ...event, kind: 'note' };
       }
       task.history.push(this.event(event, task, p, now));
+      // F2: new intake text changes the decision basis -> re-hint. Other
+      // event kinds (notes, scope decisions themselves) never change the flag.
+      if (task.scope && typeof task.scope === 'object' && task.history[task.history.length - 1]?.kind === 'intake') {
+        task.scope = scopeHint(task, (task.scope.basis_version ?? 1) + 1);
+      }
     } else {
-      keys(b, ['key', 'expected_version', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria']);
-      if (!['status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria'].some(k => k in b)) fail('empty_update');
+      keys(b, ['key', 'expected_version', 'project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria']);
+      if (!['project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria'].some(k => k in b)) fail('empty_update');
       const changes: Obj = {};
-      for (const field of ['status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria']) if (field in b) {
+      for (const field of ['project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria']) if (field in b) {
         if (field === 'status' && !STATUSES.includes(b[field])) fail('invalid_status');
-        task[field] = field === 'status' ? b[field]
+        const previous = task[field];
+        task[field] = field === 'project' ? identifier(b[field]) : field === 'status' ? b[field]
           : field === 'acceptance_criteria' ? acNullable(b[field])
           : nullable(b[field], field === 'title' ? 256 : 8192);
-        changes[field] = task[field];
+        if (previous !== task[field]) changes[field] = task[field];
       }
+      if (!this.allowed(p, task, true)) fail('forbidden', 403);
       task.history.push({ id: crypto.randomUUID(), kind: 'update', changes, actor: p.actor, captured_at: now, authority: 'untrusted_task_data' });
+      // F2: AC (and title, which feeds the hint) can move the flag. The
+      // stored operator decision stays in history but its basis hash no
+      // longer matches, so the gate fails closed until a fresh decision.
+      if (task.scope && typeof task.scope === 'object' && ('project' in changes || 'acceptance_criteria' in changes || 'title' in changes)) {
+        task.scope = scopeHint(task, (task.scope.basis_version ?? 1) + 1);
+      }
     }
     task.history[task.history.length - 1].intake_key = b.key;
     task.version++; task.updated_at = now;
@@ -901,6 +948,11 @@ export class IntakeService {
       this.expected(b, task.version - (ownAdvance ? 1 : 0));
       if (!ownLink && task.history.length >= INTAKE_LIMITS.events) fail('history_capacity', 507);
       if (!hasAcceptanceCriteria(task)) fail('acceptance_criteria_required', 400);
+      // F2 scope gate (single check shared with linked session starts):
+      // the intake is always saved, but assign refuses until an operator
+      // scope decision exists. Research hints never block (classifier only).
+      const preScope = getScopeStatus(task).block_code;
+      if (preScope) fail(preScope, 409);
       const active = this.activeAssignment(task);
       if (active && active !== prior?.id) fail('active_assignment_exists', 409);
       // Persist the original assignment fingerprint before the async start.
@@ -947,6 +999,9 @@ export class IntakeService {
       if (task.history.length + extraEvents > INTAKE_LIMITS.events) fail('history_capacity', 507);
       // Re-check after the start round-trip: AC cleared mid-flight still fails closed.
       if (!hasAcceptanceCriteria(task)) fail('acceptance_criteria_required', 400);
+      // F2: scope decision revoked or basis changed mid-flight still fails closed.
+      const postScope = getScopeStatus(task).block_code;
+      if (postScope) fail(postScope, 409);
       const active = this.activeAssignment(task);
       if (active && active !== created.id) fail('active_assignment_exists', 409);
       // The created (or deterministically replayed) session must still be
@@ -1017,6 +1072,7 @@ export class IntakeService {
         return { ok: false, error: e?.code || 'capacity_exceeded' };
       }
       const taskId = crypto.randomUUID();
+      const flag = classifyScope(input.project, str(input.title, 256), str(input.text, 8192), null);
       const task: Obj = {
         id: taskId,
         project: input.project,
@@ -1029,6 +1085,8 @@ export class IntakeService {
         next_step: input.nextStep ?? null,
         owner: null,
         uncertainty: null,
+        acceptance_criteria: null,
+        scope: { policy_version: SCOPE_POLICY_VERSION, flag: flag.flag, matched_terms: flag.matched_terms },
         history: [
           {
             id: crypto.randomUUID(),
