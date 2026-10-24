@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
+import { LivenessService } from '../src/liveness';
 import { reconcileAccountCapacity, accountCapacityAlerts } from '../src/account_capacity';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
@@ -68,7 +69,30 @@ describe('phantom account reservations', () => {
     sql.exec("UPDATE fleet_launches SET state = 'uncertain' WHERE id = ?", first.id);
     expect(accountCapacityAlerts(sql, now)).toEqual([]);
     sql.exec('UPDATE fleet_launches SET created_at = ? WHERE id = ?', iso(-600001), waiting.id);
-    expect(accountCapacityAlerts(sql, now)).toEqual([{ kind: 'launch', id: waiting.id, state: 'stuck', detail: 'account_capacity queued >10m: account=shared-codex, reserved=1, observed_live=0, max_concurrency=1' }]);
+    expect(accountCapacityAlerts(sql, now)).toEqual([{ kind: 'launch', id: 'account-capacity/' + waiting.id, state: 'stuck', detail: 'account_capacity queued >10m: account=shared-codex, reserved=1, observed_live=0, max_concurrency=1' }]);
+  }));
+
+  it('keeps simultaneous memory and account alerts independently visible and recoverable', () => fixture(async (f, sql) => {
+    await configure(f);
+    const first: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    const waiting: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    sql.exec("UPDATE fleet_launches SET state = 'uncertain' WHERE id = ?", first.id);
+    sql.exec('UPDATE fleet_launches SET created_at = ? WHERE id = ?', iso(-600001), waiting.id);
+    sql.exec('INSERT INTO fleet_memory_holds (launch_id,since,rejected_json) VALUES (?,?,?)', waiting.id, iso(-600001), JSON.stringify([{reason:'launcher_memory_reserve',memory:{reserved_mb:2000,floor_mb:10240}}]));
+    const live = new LivenessService(sql, () => now); live.init();
+    live.reconcileAlerts(live.evaluate().subjects);
+    const forSubject = (subject: string) => live.alerts().find((a: any) => a.subject_kind === 'launch' && a.subject === subject);
+    expect(forSubject(waiting.id)).toMatchObject({state:'launcher_memory_reserve',resolved_at:null});
+    expect(forSubject(waiting.id).detail).toContain('reserved_mb');
+    expect(forSubject('account-capacity/' + waiting.id)).toMatchObject({state:'stuck',resolved_at:null});
+    expect(forSubject('account-capacity/' + waiting.id).detail).toContain('max_concurrency=1');
+    sql.exec("UPDATE fleet_launches SET state = 'exited' WHERE id = ?", first.id);
+    live.reconcileAlerts(live.evaluate().subjects);
+    expect(forSubject('account-capacity/' + waiting.id).resolved_at).not.toBeNull();
+    expect(forSubject(waiting.id).resolved_at).toBeNull();
+    sql.exec('DELETE FROM fleet_memory_holds WHERE launch_id = ?', waiting.id);
+    live.reconcileAlerts(live.evaluate().subjects);
+    expect(forSubject(waiting.id).resolved_at).not.toBeNull();
   }));
 
   it('permits the exact legacy admin-token owner to cancel, with no cross-owner bypass', () => fixture(async (_f, sql) => {

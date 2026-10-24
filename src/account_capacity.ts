@@ -46,7 +46,7 @@ export function accountCapacityAlerts(sql: SqlStorage, now: number) {
       const reserved = Number(sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE account = ? AND state IN ('offered','starting','running','uncertain')", account.label).one().n);
       const live = Number(sql.exec("SELECT COUNT(*) AS n FROM fleet_sessions WHERE account = ? AND phase IN ('starting','running','broken','unknown') AND workspace NOT LIKE '% (deleted)' AND (cwd IS NULL OR cwd NOT LIKE '% (deleted)')", account.label).one().n);
       if (reserved < account.max_concurrency || live >= account.max_concurrency) continue;
-      subjects.push({ kind: 'launch', id: queued.id, state: 'stuck', detail: `account_capacity queued >10m: account=${account.label}, reserved=${reserved}, observed_live=${live}, max_concurrency=${account.max_concurrency}` });
+      subjects.push({ kind: 'launch', id: 'account-capacity/' + queued.id, state: 'stuck', detail: `account_capacity queued >10m: account=${account.label}, reserved=${reserved}, observed_live=${live}, max_concurrency=${account.max_concurrency}` });
       break;
     }
   }
