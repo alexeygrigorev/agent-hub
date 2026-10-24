@@ -44,10 +44,16 @@ def main():
                '--config', str(pathlib.Path(args.config).resolve(strict=True)),
                '--journal-dir', str(journal)]
     tag = 'hub-controller-' + uuid.uuid4().hex[:12]
+    env_args = [
+        '--env', 'HUB_CONFIG_FILE=' + str(pathlib.Path(args.credential_config).resolve(strict=True)),
+        '--env', 'PYTHONPATH=' + str(workspace / 'host'),
+    ]
+    for var in ('AGENT_HUB_MANAGED_DIR', 'HUB_MANAGED_DIR', 'CODEX_LAUNCH_WRAPPER'):
+        if var in os.environ:
+            env_args.extend(['--env', f'{var}={os.environ[var]}'])
     receipt = native('start', '--workspace', str(workspace), '--cwd', str(workspace),
                      '--tag', tag, '--engine', 'shell',
-                     '--env', 'HUB_CONFIG_FILE=' + str(pathlib.Path(args.credential_config).resolve(strict=True)),
-                     '--env', 'PYTHONPATH=' + str(workspace / 'host'),
+                     *env_args,
                      '--memory', '1500M', '--pids', '256', '--history-bytes', '262144',
                      '--', *command)
     # Reuse the receipt only in this process; no user-provided ownership labels

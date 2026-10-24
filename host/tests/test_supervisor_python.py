@@ -28,6 +28,7 @@ def test_supervisor_propagates_venv_python_to_owned_native_child(tmp_path):
             '--credential-config', str(config), '--journal-dir', str(tmp_path / 'journal')]
     with patch.object(supervisor.sys, 'argv', argv), \
          patch.object(supervisor.sys, 'executable', '/release/.venv/bin/python'), \
+         patch.object(supervisor.os, 'environ', {'AGENT_HUB_MANAGED_DIR': '/custom/managed'}), \
          patch.object(supervisor.threading, 'Event', return_value=stopped), \
          patch.object(supervisor.signal, 'signal'), \
          patch.object(supervisor, 'native', side_effect=native):
@@ -35,4 +36,6 @@ def test_supervisor_propagates_venv_python_to_owned_native_child(tmp_path):
     assert receipt['command'][:4] == ['/release/.venv/bin/python', '-u', '-m', 'agent_hub_host.session_host']
     assert calls[0][calls[0].index('--memory') + 1] == '1500M'
     assert calls[0][calls[0].index('--pids') + 1] == '256'
+    assert '--env' in calls[0]
+    assert 'AGENT_HUB_MANAGED_DIR=/custom/managed' in calls[0]
     assert calls[-1][:2] == ('kill', receipt['id'])
