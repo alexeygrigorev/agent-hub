@@ -75,16 +75,30 @@ describe('generic accounts and launch placement', () => {
     const plan = s.plan(input);
     expect(plan.selected).toMatchObject({ machine: 'hetzner', engine: 'codex', account: 'shared-codex' });
     expect(plan.request.engine).toBe('astra');
+    expect(plan.selected.selection).toMatchObject({ id: 'astra', model: 'gpt-6-astra' });
     expect(s.plan({ ...input, tier: 'quick' }).selected).toBeNull();
     expect(s.plan({ ...input, machine: 'win35' }).selected).toBeNull();
     expect(s.plan({ ...input, account: 'desktop-codex' }).selected).toBeNull();
     const first = s.reserve(input, admin);
     expect(first.status).toBe(201);
     expect(first.value.engine).toBe('codex');
+    expect(first.value.selection).toMatchObject({ id: 'astra', model: 'gpt-6-astra' });
+    const offers: any = await (await s.handle(request('/offers', undefined, 'GET'), host('hetzner'))).json();
+    expect(offers.offers.find((o: any) => o.id === first.value.id)?.selection).toMatchObject({ id: 'astra', model: 'gpt-6-astra' });
     expect(s.reserve(input, admin).value).toMatchObject({ id: first.value.id, replay: true });
     expect(s.reserve({ ...input, engine: 'codex' }, admin).status).toBe(409);
     sql.exec("UPDATE fleet_accounts SET provider='zai' WHERE label='shared-codex'");
     expect(s.plan(input).selected).toBeNull();
+  }));
+  it('persists quick-tier Luna and exposes the resolved model in session views', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const launch = s.reserve(intent({ machine: 'hetzner', tier: 'quick', access: { mode: 'read' } }), admin).value;
+    expect(launch.selection).toMatchObject({ id: 'luna', model: 'gpt-6-luna' });
+    const sessions = new SessionControlService(sql, cb => cb(), () => now);
+    sessions.init();
+    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, created_at, updated_at) VALUES ('quick-test', 'owner', 'quick-key', '{}', ?, 'hetzner', 'codex', 'headless', 'offered', ?, ?)", launch.id, iso(), iso());
+    const view = (sessions as any).view(sql.exec("SELECT * FROM session_control_sessions WHERE id='quick-test'").one());
+    expect(view).toMatchObject({ engine: 'codex', model_id: 'luna', model: 'gpt-6-luna' });
   }));
   it('resolves Argon through both policy engine alternatives with the correct account', async () => fixture(async (s, sql) => {
     await configure(s);
@@ -94,7 +108,8 @@ describe('generic accounts and launch placement', () => {
       sql.exec("UPDATE fleet_routes SET engine=? WHERE machine_id='hetzner'", engine);
       sql.exec("UPDATE machines SET capabilities=? WHERE id='hetzner'", JSON.stringify({ engines: [engine], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
       await s.handle(request('/subscriptions', { subscriptions: [{ service: 'gemini', account: 'shared-codex', plan: 'pro', quota }] }, 'PUT'), host('hetzner'));
-      expect(s.plan(intent({ engine: 'argon' })).selected).toMatchObject({ machine: 'hetzner', engine, account: 'shared-codex' });
+      expect(s.plan(intent({ engine: 'argon' })).selected).toMatchObject({ machine: 'hetzner', engine, account: 'shared-codex', selection: { id: 'argon', model: 'gemini-4-argon-high' } });
+      expect(s.plan(intent({ tier: 'deep', engine })).selected?.selection).toMatchObject({ id: 'argon', model: 'gemini-4-argon-high' });
     }
   }));
   it('refuses Opus and Claude with policy guidance even without a live Claude route', async () => fixture(async (s, sql) => {

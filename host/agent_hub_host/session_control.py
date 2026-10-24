@@ -832,7 +832,7 @@ def render_table(sessions):
     """
     if not sessions:
         return 'No sessions found.'
-    headers = ['TYPE', 'NAME', 'ENGINE', 'STATE', 'WORKSPACE', 'UPDATED']
+    headers = ['TYPE', 'NAME', 'ENGINE', 'MODEL', 'STATE', 'WORKSPACE', 'UPDATED']
     rows = []
     for s in sessions:
         stype = s.get('session_type') or ('aplexer' if s.get('mode') == 'interactive' else 'headless')
@@ -845,7 +845,7 @@ def render_table(sessions):
             state = 'idle'
         ws = s.get('workspace') or '-'
         upd = (s.get('updated_at') or '')[:19].replace('T', ' ')
-        rows.append([stype, name, engine, state, ws, upd])
+        rows.append([stype, name, engine, s.get('model_id') or s.get('model') or '-', state, ws, upd])
 
     widths = [len(h) for h in headers]
     for row in rows:

@@ -86,6 +86,7 @@ def build(out_dir: Path, version: str):
     try:
         pkg_dst = staging / "agent_hub_host"
         shutil.copytree(HOST_PKG, pkg_dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        shutil.copyfile(REPO / "config" / "model-routing.json", pkg_dst / "model-routing.json")
         (pkg_dst / "_build_info.py").write_text(
             f'"""Build information stamped during zipapp creation."""\nBUILD_COMMIT = "{sha}"\nBUILD_DATE = "{build_date}"\n',
             encoding="utf-8",

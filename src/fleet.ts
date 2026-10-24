@@ -269,7 +269,7 @@ export class FleetService {
     this.admission.init();
     for (const stmt of FLEET_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
     const launchColumns = this.sql.exec('PRAGMA table_info(fleet_launches)').toArray().map((c: any) => c.name);
-    for (const name of ['verification_status', 'exit_reason', 'finished_at', 'launch_error_json']) {
+    for (const name of ['verification_status', 'exit_reason', 'finished_at', 'launch_error_json', 'model_selection_json']) {
       if (!launchColumns.includes(name)) this.sql.exec(`ALTER TABLE fleet_launches ADD COLUMN ${name} TEXT`);
     }
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_offered ON fleet_launches(id) WHERE state = 'offered'");
@@ -493,6 +493,11 @@ export class FleetService {
       else if (!this.observation(definitions.get(route.account), route)) reason = 'machine_account_quota_unknown';
       else if (account.available_slots < 1) reason = 'account_capacity';
       if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason }); continue; }
+      const family = definitions.get(route.account)?.provider === 'codex-orin' ? 'codex' : definitions.get(route.account)?.provider;
+      const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
+      const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
+      const model = policy.models.find(m => members.includes(m.id) && (!overrideModels.length || m.id === input.engine) && m.engine === route.engine && m.provider === family && (m.profile === route.profile || (m.profile === null && route.profile !== null)));
+      if (!model) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'model_unsupported' }); continue; }
       const pending = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND state IN ${ACTIVE}`, route.machine_id).one().n);
       const routingInstalled = this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'routing_machines'").toArray().length;
       const limit: any = routingInstalled ? this.sql.exec('SELECT max_agents FROM routing_machines WHERE machine_id = ?', route.machine_id).toArray()[0] : null;
@@ -500,7 +505,7 @@ export class FleetService {
       if (limit && pending + observedSessions >= limit.max_agents) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'machine_capacity' }); continue; }
 
       const score = (account!.remaining_percent! / 100) / (1 + hb.load[0] / caps.cpu_count + pending);
-      candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile, score, workspace: effectiveWorkspace });
+      candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile, selection: model, score, workspace: effectiveWorkspace });
     }
     candidates.sort((a, b) => b.score - a.score || a.machine.localeCompare(b.machine) || a.engine.localeCompare(b.engine));
     // The stored intent carries the winner's normalized workspace: a bare
@@ -573,7 +578,10 @@ export class FleetService {
         } catch { /* keep the stored intent on stringify failure */ }
         const written: any = this.sql.exec("UPDATE fleet_launches SET machine_id = ?, engine = ?, account = ?, profile = ?, workspace = ?, request_json = ?, state = 'offered', updated_at = ? WHERE id = ? AND state = 'queued'",
           selected.machine, selected.engine, selected.account, selected.profile ?? null, normalizedWorkspace, patchedJson, new Date(this.now()).toISOString(), row.id);
-        if (written && (written as any).rowsWritten === 1) promoted++;
+        if (written && (written as any).rowsWritten === 1) {
+          this.sql.exec('UPDATE fleet_launches SET model_selection_json = ? WHERE id = ?', JSON.stringify(selected.selection), row.id);
+          promoted++;
+        }
       }
     } catch { /* drain is best-effort inside the ambient txn */ }
     return { promoted, expired };
@@ -658,7 +666,8 @@ export class FleetService {
       }
       const id = crypto.randomUUID(); const at = new Date(this.now()).toISOString(); const selected = plan.selected;
       this.sql.exec('INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', id, actor, caller.kind || 'unknown', plan.request.parent_id, plan.request.summary, input.idempotency_key, JSON.stringify({ ...bound, ...(admitted.authority ? { edit_authority: admitted.authority } : {}) }), selected.machine, selected.engine, selected.account, selected.profile, plan.request.mode, plan.request.workspace, plan.request.prompt, 'offered', at, at);
-      return result({ id, state: 'offered', machine: selected.machine, engine: selected.engine, account: selected.account, mode: plan.request.mode, access: admitted.access.mode }, 201);
+      this.sql.exec('UPDATE fleet_launches SET model_selection_json = ? WHERE id = ?', JSON.stringify(selected.selection), id);
+      return result({ id, selection: selected.selection, state: 'offered', machine: selected.machine, engine: selected.engine, account: selected.account, mode: plan.request.mode, access: admitted.access.mode }, 201);
     });
   }
 
@@ -778,7 +787,7 @@ export class FleetService {
         const offers: any[] = [];
         for (const row of this.sql.exec("SELECT * FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at, id LIMIT 100", caller.machineId!)) {
           if (this.admission.retireInvalidOffer(row)) continue;
-          offers.push({ id: row.id, engine: row.engine, account: row.account, profile: row.profile, mode: row.mode, workspace: row.workspace, cwd: parsed(row.request_json).cwd ?? null, prompt: row.prompt, ...(parsed(row.request_json).with_goal === true ? { with_goal: true } : {}), access: parsed(row.request_json).access?.mode || 'legacy_unspecified' });
+          offers.push({ selection: parsed(row.model_selection_json), id: row.id, engine: row.engine, account: row.account, profile: row.profile, mode: row.mode, workspace: row.workspace, cwd: parsed(row.request_json).cwd ?? null, prompt: row.prompt, ...(parsed(row.request_json).with_goal === true ? { with_goal: true } : {}), access: parsed(row.request_json).access?.mode || 'legacy_unspecified' });
           if (offers.length === 20) break;
         }
         return response({ offers: this.routing.enrichOffers(offers) });
@@ -909,7 +918,7 @@ export class FleetService {
         const row: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id = ? AND machine_id = ?', match[1], caller.machineId!).toArray()[0];
         if (!row) return response({ error: 'not_found' }, 404);
         if (match[2] === 'reject') {
-          if (!object(data, ['reason']) || data.reason !== 'workspace_unavailable') return response({ error: 'invalid_rejection' }, 400);
+          if (!object(data, ['reason']) || !['workspace_unavailable', 'model_unsupported'].includes(data.reason)) return response({ error: 'invalid_rejection' }, 400);
           // Only an unclaimed offer proves that no start was authorized. The
           // transaction fences a racing claim; never reject possibly-live work.
           if (row.state !== 'offered' || row.native_id || row.launcher_task_id) return response({ error: 'already_claimed' }, 409);

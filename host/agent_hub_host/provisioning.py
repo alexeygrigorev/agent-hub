@@ -1291,6 +1291,14 @@ def execute():
         command = engine_argv(b, dest)
         env = engine_environment(b, home, dest)
         extra_argv = list(sys.argv[2:])
+        # An admitted per-session model overrides bundle startup defaults.
+        from .model_contract import native_model
+        requested_model = native_model(extra_argv)
+        if requested_model and b['provider'] != 'go':
+            from .model_contract import replace_model_args, policy_models
+            if not any(m['provider'] == b['provider'] and m['model'] == requested_model for m in policy_models()):
+                raise ValueError('model_unsupported: managed provider model')
+            b = dict(b, args=replace_model_args(b['args'], requested_model)[:-2])
         if b.get('provider') == 'go' and extra_argv and extra_argv[0] == 'run':
             pinned_model = None
             args_copy = list(b.get('args') or [])
@@ -1397,7 +1405,13 @@ def admission():
         if isinstance(selection, dict):
             sel_model = selection.get('model')
             sel_effort = selection.get('effort')
-            if sel_model == meta.get('launcher_model') and sel_effort == meta.get('launcher_effort'):
+            from .model_contract import configured_selection
+            try:
+                configured_selection(selection, payload.get('engine'), meta.get('launcher_provider'))
+                supported = True
+            except ValueError:
+                supported = False
+            if supported or (sel_model == meta.get('launcher_model') and sel_effort == meta.get('launcher_effort')):
                 result['model_supported'] = True
                 result['model'] = sel_model
                 result['effort'] = sel_effort

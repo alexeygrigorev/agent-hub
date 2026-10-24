@@ -537,21 +537,27 @@ export class SessionControlService {
     const parent_id = row.parent_id || null;
     const parent_source = row.parent_source || (row.parent_id ? 'explicit_parent' : 'unknown_external');
     let launchError: any = null;
+    let modelSelection: any = null;
+    let modelReason: string | null = null;
     if (row.fleet_launch_id) {
       try {
-        const launch: any = this.sql.exec('SELECT launch_error_json FROM fleet_launches WHERE id = ?', row.fleet_launch_id).toArray()[0];
+        const launch: any = this.sql.exec('SELECT launch_error_json, model_selection_json, exit_reason FROM fleet_launches WHERE id = ?', row.fleet_launch_id).toArray()[0];
+        modelSelection = parsed(launch?.model_selection_json);
+        modelReason = launch?.exit_reason === 'model_unsupported' ? 'model_unsupported' : null;
         launchError = launch?.launch_error_json ? parsed(launch.launch_error_json, null) : null;
       } catch {} // Fleet is optional in isolated session-control installations.
     }
     const qualified_name = qualified_alias || (typeof request.name === 'string' ? request.name : row.id);
     return {
       id: row.id, state: row.state, machine: row.machine_id ?? null, engine: row.engine ?? null,
+      model_id: modelSelection?.id ?? null, model: modelSelection?.model ?? null,
       mode: row.mode, access: request.access?.mode || 'legacy_unspecified',
       // Friendly name from the stored start intent (null when unnamed). The
       // name is display only: control routes stay Hub-UUID addressed, with an
       // actor-scoped exact-name alias where explicitly resolved below.
       name: typeof request.name === 'string' ? request.name : null,
       fleet_launch_id: row.fleet_launch_id ?? null,
+      ...(modelReason ? { reason: modelReason } : {}),
       ...(launchError ? { reason: launchError.reason, message: launchError.message, launch_error: launchError } : {}),
       cleanup_protection: protection ? { key: protection.request_key, created_at: protection.created_at, permanent: true } : null,
       binding,

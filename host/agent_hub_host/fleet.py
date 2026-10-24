@@ -1196,7 +1196,12 @@ class Dispatcher:
             raise ValueError("Local account/profile/workspace is not configured")
         # Validates map membership or workspace_roots / worktrees identity paths.
         resolve_workspace_path(self.settings, offer.get("workspace"))
-        sub = matches[0]
+        sub = dict(matches[0])
+        if offer.get("selection") is not None:
+            from .model_contract import configured_selection
+            model = configured_selection(offer["selection"], offer["engine"], sub.get("launcher_provider") or sub["service"])
+            sub["launcher_model"] = model["model"]
+            sub["launcher_effort"] = model["effort"]
         if not sub.get("admission_argv"):
             raise ValueError("Maintained fresh admission adapter is not configured")
         return sub
@@ -1279,7 +1284,7 @@ class Dispatcher:
         gate = self.runner(sub["admission_argv"], payload={k: offer.get(k) for k in ["mode", "engine", "profile", "account", "workspace", "selection"]})
         if gate.get("launch_allowed") is not True or gate.get("profile_supported") is not True or gate.get("account_label") != sub["account_label"]:
             raise ValueError("Fresh admission refused")
-        if offer.get('task_id') and (gate.get('model_supported') is not True or gate.get('model') != selection['model'] or gate.get('effort') != selection['effort']):
+        if (offer.get('task_id') or (selection and sub.get("account_label") in self._managed_labels)) and (gate.get('model_supported') is not True or gate.get('model') != selection['model'] or gate.get('effort') != selection['effort']):
             raise ValueError('Selected model/effort requires verified admission')
         at = gate.get("observed_at")
         try:
@@ -1320,15 +1325,20 @@ class Dispatcher:
                 argv += ["--env", f"GIT_AUTHOR_NAME={git_name}", "--env", f"GIT_COMMITTER_NAME={git_name}"]
             if git_email:
                 argv += ["--env", f"GIT_AUTHOR_EMAIL={git_email}", "--env", f"GIT_COMMITTER_EMAIL={git_email}"]
-            if with_goal or sub.get("startup_argv"):
+            if selection and not sub.get("startup_argv") and sub.get("account_label") not in self._managed_labels:
+                argv += ["--model", selection["model"]]
+            if with_goal or sub.get("startup_argv") or (selection and sub.get("account_label") in self._managed_labels):
                 launch = sub.get('startup_argv')
-                if with_goal and sub.get('account_label') in self._managed_labels:
+                if (with_goal or selection) and sub.get('account_label') in self._managed_labels:
                     from . import provisioning
                     launch = provisioning.module_command('execute', sub['account_label'])
                 elif with_goal and not launch:
                     raise ValueError('Goal startup requires a trusted local command')
                 if not isinstance(launch, list) or not launch or any(not isinstance(a, str) or "\0" in a for a in launch):
                     raise ValueError("Invalid trusted startup argv")
+                if selection:
+                    from .model_contract import replace_model_args
+                    launch = replace_model_args(launch, selection["model"])
                 argv += ["--"] + launch + (['/goal ' + offer['prompt'] + '\nContainer hygiene: use docker run --rm for throwaway/test containers; label every test container agent.session=<your Hub session id, or native session id registered in Hub>. Install trap/finally cleanup before creation and clean up all resources you create before session exit, including failed starts and docker create/compose tests. Preserve other sessions and Coolify containers.'] if with_goal else [])
             prefix = sub.get("native_start_argv") or self.settings.get("native_start_argv")
             if prefix is not None:
@@ -1345,7 +1355,7 @@ class Dispatcher:
             launcher = self.settings.get("launcher", {})
             if not all(launcher.get(k) for k in ["argv", "root", "config_dir"]) or not sub.get("launcher_provider") or not sub.get("launcher_model"):
                 raise ValueError("Maintained launcher route is not configured")
-            if sub.get("launcher_provider") not in {"opencode", "antigravity", "zai", "codex", "gemini"}:
+            if sub.get("launcher_provider") not in {"opencode", "antigravity", "zai", "codex", "gemini", "claude"}:
                 raise ValueError(f"Launcher provider {sub.get('launcher_provider')!r} is not supported for headless execution")
             # Only the maintained launcher may run models. argv is a trusted machine-local CLI prefix.
             prefix = launcher["argv"] + ["--config-dir", launcher["config_dir"]]
@@ -1410,11 +1420,11 @@ class Dispatcher:
                     return False
                 return True
             if not isinstance(eligible, list) or not any(_plan_match(r) for r in eligible):
-                raise ValueError("Maintained launcher plan refused")
+                raise ValueError("model_unsupported: maintained launcher plan refused requested model")
             # OpenCode, Antigravity, ZAI, Gemini, and named-profile Codex use the maintained native backend:
             # real engine/UUID plus validated first action for Hub binding.
             # Other unprofiled providers retain their existing task-unit semantics.
-            if sub.get("launcher_provider") in {"opencode", "antigravity", "zai", "gemini"} or (sub.get("launcher_provider") == "codex" and sub.get("profile") is not None):
+            if sub.get("launcher_provider") in {"opencode", "antigravity", "zai", "gemini", "claude"} or (sub.get("launcher_provider") == "codex" and sub.get("profile") is not None):
                 argv = prefix + ["run", "--backend", "aplexer",
                                  "--id", task_id, "--cwd", str(workspace),
                                  "--tmpdir", str(workspace / ".local" / "tmp")]
@@ -1430,6 +1440,10 @@ class Dispatcher:
             receipt = self.runner(argv, cwd=cwd, timeout=120)
             if mode == "interactive":
                 native_id = receipt.get("id")
+                if selection:
+                    from .model_contract import native_model
+                    if native_model(receipt.get("command")) != selection["model"]:
+                        raise ValueError("model_mismatch: native interactive model is unverified")
                 if receipt.get("workspace") != str(workspace) or receipt.get("tag") != "hub-" + offer_id or receipt.get('engine') != offer['engine'] or receipt.get('profile') != offer.get('profile') or receipt.get('phase') != 'running':
                     raise ValueError("Native receipt mismatch")
                 if target_cwd != workspace and not self._verify_native_cwd(native, native_id, target_cwd, receipt):
@@ -1437,7 +1451,9 @@ class Dispatcher:
                 result = {"state": "running", "native_id": native_id}
             else:
                 details = receipt.get("receipt", {})
-                if sub.get("launcher_provider") in {"opencode", "antigravity", "zai", "gemini"} or (sub.get("launcher_provider") == "codex" and sub.get("profile") is not None):
+                if selection and (details.get("model") != selection["model"] or details.get("model_verified") is not True):
+                    raise ValueError("model_mismatch: native launcher model is unverified")
+                if sub.get("launcher_provider") in {"opencode", "antigravity", "zai", "gemini", "claude"} or (sub.get("launcher_provider") == "codex" and sub.get("profile") is not None):
                     # Opencode, Antigravity, ZAI, Gemini, and named-profile Codex bind real M12 sessions only:
                     # a genuine native UUID is required; task-units unit_name/worker_id names
                     # can never bind or control a session.
@@ -1689,6 +1705,13 @@ class Dispatcher:
                         results.append({'id': offer.get('id'), 'state': 'binding_pending',
                                         'error': type(exc).__name__[:64]})
             except Exception as exc:
+                if isinstance(exc, ValueError) and str(exc).startswith('model_unsupported:') and not offer.get('task_id'):
+                    try:
+                        rejected = self.request('POST', '/api/fleet/launches/' + offer['id'] + '/reject', {'reason': 'model_unsupported'})
+                        results.append(rejected)
+                        continue
+                    except Exception:
+                        pass  # A racing claim is never proof of no native effect.
                 if offer.get("mode") == "headless" and not offer.get("task_id"):
                     try:
                         resolve_workspace_path(self.settings, offer.get("workspace"))
@@ -1705,7 +1728,7 @@ class Dispatcher:
                 # classification only (type + stage, never argv/goal/secrets)
                 # so held-offers stay distinguishable in local counts.
                 err = (type(exc).__name__ or "Error")[:64]
-                reason = ("dispatch_refused:%s" % err)[:120]
+                reason = (str(exc).split(":", 1)[0] if isinstance(exc, ValueError) and str(exc).startswith(("model_unsupported:", "model_mismatch:")) else ("dispatch_refused:%s" % err))[:120]
                 results.append({"id": offer.get("id"), "state": "held",
                                 "reason": reason, "stage": "dispatch_route",
                                 "error": err})

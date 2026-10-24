@@ -128,7 +128,7 @@ export class RoutingService {
       candidates.sort((a, b) => b.priority - a.priority || b.score - a.score || a.machine.localeCompare(b.machine));
       if (!candidates.length) return;
       const c = candidates[0];
-      const reserved = this.fleet.reserve({ workspace: input.workspace, machine: c.machine, engine: c.engine, account: c.account, prompt: c.prompt, ...(parsed.access.mode === 'edit' ? { approved_action: JSON.stringify(input.tasks) } : {}), idempotency_key: 'task-' + row.id, access: parsed.access }, { caller: principal, scopes: ['fleet:launch'] }, authority);
+      const reserved = this.fleet.reserve({ workspace: input.workspace, machine: c.machine, engine: c.model.id, tier: c.model.tier, account: c.account, prompt: c.prompt, ...(parsed.access.mode === 'edit' ? { approved_action: JSON.stringify(input.tasks) } : {}), idempotency_key: 'task-' + row.id, access: parsed.access }, { caller: principal, scopes: ['fleet:launch'] }, authority);
       if (reserved.status < 300) this.sql.exec('UPDATE routing_jobs SET launch_id = ?, updated_at = ?, selection_json = ? WHERE id = ? AND launch_id IS NULL', reserved.value.id, this.at(), JSON.stringify(c.model), row.id);
     });
   }
