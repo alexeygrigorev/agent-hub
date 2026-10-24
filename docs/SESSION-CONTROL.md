@@ -58,6 +58,17 @@ Keep each request key/payload when reconciling uncertain responses. Headless
 intake assignments run their brief through the maintained launcher; the example
 above starts an interactive session for subsequent send/capture/stop.
 
+## Interactive vs headless sessions and follow-up choice
+
+Sessions that expect follow-up sends must start interactive (`mode: interactive`, e.g. Codex with `/goal` via `--with-goal`).
+In interactive mode:
+- The session runs its initial brief/goal turn, fires `SessionStart` / `Stop` hooks reporting `working` then `idle`.
+- When `idle`, aplexer delivers subsequent `sessions send` commands directly to the agent's input prompt, where they are executed and acknowledged within 60s.
+
+Headless sessions (`mode: headless`, e.g. `codex exec`, `opencode run`, `-p`) run as one-shot commands without an active interactive input channel.
+- Senders cannot inject input into a running headless execution; Hub fails fast with `send_unsupported_headless` rather than leaving sends stuck in `claimed`.
+- Follow-ups to headless work must go through `codex exec resume <thread-id> <prompt>` to resume execution in a completed thread.
+
 ## Non-goals and holds
 
 - No second dispatcher, scheduler, account oracle, or duplicate fleet consumer.

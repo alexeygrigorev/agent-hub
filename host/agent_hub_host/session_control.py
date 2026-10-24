@@ -383,8 +383,8 @@ def add_commands(sub):
                        help='Parent session id recording lineage')
     start.add_argument('--intake-task-id', '--intake-task', dest='intake_task_id', default=None,
                        help='Linked intake task id (API field intake_task_id); refused when that task has empty acceptance criteria. --intake-task is a deprecated alias.')
-    start.add_argument('--with-goal', action='store_true', help='Start interactive /goal work on a Codex-family engine; requires --prompt or --brief-file; refuses --headless')
-    start.add_argument('--headless', action='store_true', help='Explicitly start in headless mode')
+    start.add_argument('--with-goal', action='store_true', help='Start interactive /goal work on a Codex-family engine (for sessions expecting follow-ups); requires --prompt or --brief-file; refuses --headless')
+    start.add_argument('--headless', action='store_true', help='Explicitly start in one-shot headless mode (no input channel; follow-ups must use codex exec resume)')
     mode = start.add_mutually_exclusive_group()
     mode.add_argument('--brief-file', help='UTF-8 goal file for headless work (max 8 KiB)')
     mode.add_argument('--prompt', '--brief', default=None, help='Inline UTF-8 goal text for headless work (max 8 KiB; same boundaries as --brief-file)')
