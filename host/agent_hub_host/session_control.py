@@ -6,9 +6,11 @@ sibling host worker; this module performs no native effects and imports no
 native adapters. See docs/SESSION-CONTROL.md (proposal, pending head ACK).
 """
 import argparse
+import http.client
 import json
 import os
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -30,6 +32,116 @@ WAIT_MIN_INTERVAL = 1.0
 TERMINAL_COMMAND = ('acked', 'refused', 'uncertain')
 TERMINAL_SESSION = ('running', 'stopped', 'failed', 'refused', 'held', 'uncertain', 'cancelled')
 
+SAFE_ERROR = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+
+
+class SessionHTTPError(ValueError):
+    def __init__(self, status, code='request_failed', message=None):
+        self.status = status
+        self.code = code
+        super().__init__(message or f'Session HTTP request failed with status {status} ({code})')
+
+
+class SessionTransportError(ValueError):
+    pass
+
+
+class SessionInputError(ValueError):
+    pass
+
+
+def diagnostic(exc):
+    """Never interpolate exception bodies: they may contain credentials or payloads."""
+    if isinstance(exc, (SessionHTTPError, SessionTransportError, SessionInputError, config.ConfigPermissionError)):
+        return str(exc)
+    if isinstance(exc, UnicodeDecodeError):
+        return 'Input is not valid UTF-8'
+    if isinstance(exc, json.JSONDecodeError):
+        return 'Invalid JSON input: expected a JSON object'
+    if isinstance(exc, (TimeoutError, socket.timeout)) or (isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, TimeoutError)):
+        return 'Session request timed out (HTTP timeout: 10 seconds)'
+    if isinstance(exc, urllib.error.URLError):
+        if isinstance(exc.reason, socket.gaierror):
+            return 'Session transport failed: DNS lookup failed'
+        return 'Session transport failed: connection or TLS failure'
+    if isinstance(exc, (OSError, http.client.HTTPException)):
+        return 'Session transport failed: connection interrupted'
+    if isinstance(exc, RuntimeError) and str(exc) in ('Expected JSON response', 'Response too large'):
+        return 'Session response error: ' + str(exc)
+    if isinstance(exc, ValueError):
+        msg = str(exc).strip()
+        if msg:
+            return msg
+    return 'Session operation failed; check authentication, grants, capacity and current versions.'
+
+
+def http_error(exc, key=None):
+    # Surface the server error code (top-level or inside a 409 hold
+    # payload) plus the held session id, so the receiver can classify
+    # terminal vs retryable failures without a follow-up call.
+    # Best-effort: an unreadable body keeps the status-only form.
+    name = ''
+    code = 'request_failed'
+    field = None
+    detail = None
+    reason = None
+    routes = ''
+    held_info = ''
+    provider_guidance = ''
+    try:
+        raw = exc.read(4096) if hasattr(exc, 'read') else b''
+        data = json.loads((raw or b'').decode('utf-8', 'replace'))
+        hold = data.get('hold') if isinstance(data, dict) else None
+        err = data.get('error') if isinstance(data, dict) else None
+        if (not isinstance(err, str) or not err) and isinstance(hold, dict):
+            err = hold.get('error')
+        elif (not isinstance(err, str) or not err) and isinstance(hold, str):
+            err = hold
+        if isinstance(err, str) and err and SAFE_ERROR.match(err):
+            code = err
+            name = ' (%s)' % err
+            if err == 'provider_disabled':
+                provider_guidance = ' requested provider disabled by model policy; choose an enabled engine/model or ask the policy owner to enable it and register a fresh host route with verified quota'
+        rejection = hold if isinstance(hold, dict) else data
+        if isinstance(rejection, dict) and isinstance(rejection.get('rejected'), list):
+            reasons = sorted({r['reason'] for r in rejection['rejected'][:100]
+                              if isinstance(r, dict) and isinstance(r.get('reason'), str)
+                              and re.fullmatch(r'[a-z][a-z_]{0,63}', r['reason'])})
+            if reasons:
+                routes = ' routes: ' + ', '.join(reasons)
+        if isinstance(hold, dict) and isinstance(data.get('id'), str) and data.get('id'):
+            held_info = ' held session %s state %s' % (data['id'], data.get('state'))
+        if isinstance(data, dict):
+            f = data.get('field')
+            if isinstance(f, str) and SAFE_ERROR.match(f):
+                field = f
+            d = data.get('detail')
+            if isinstance(d, str) and SAFE_ERROR.match(d):
+                detail = d
+            r = data.get('reason')
+            if isinstance(r, str) and SAFE_ERROR.match(r):
+                reason = r
+    except Exception:
+        name = ''
+
+    parts = [f'Session HTTP request failed with status {exc.code}{name}']
+    if provider_guidance:
+        parts.append(provider_guidance)
+    if routes:
+        parts.append(routes)
+    if held_info:
+        parts.append(held_info)
+    if reason:
+        parts.append(f'; reason: {reason}')
+    if field:
+        parts.append(f'; field: {field}')
+    if detail:
+        parts.append(f'; detail: {detail}')
+    full_message = ''.join(parts)
+    if key and f'reconcile with --key {key}' not in full_message:
+        full_message += f' (reconcile with --key {key} via show/commands)'
+    return SessionHTTPError(exc.code, code=code, message=full_message)
+
 
 def request(method, path, payload=None):
     cfg = config.load_config()
@@ -37,70 +149,60 @@ def request(method, path, payload=None):
     api.check_url(base)
     data = json.dumps(payload, ensure_ascii=False).encode('utf-8') if payload is not None else None
     if data is not None and len(data) > MAX_REQUEST:
-        raise ValueError('Session request exceeds capacity')
+        raise SessionInputError('Session request exceeds capacity')
     env_token = os.environ.get('HUB_TOKEN') or os.environ.get('HUB_JOB_TOKEN')
     token = env_token or auth.get_access_token()
+    payload_key = payload.get('key') if isinstance(payload, dict) else None
 
     def send(access):
         req = urllib.request.Request(base.rstrip('/') + path, data=data, method=method,
                                      headers={'Authorization': 'Bearer ' + access, 'Content-Type': 'application/json'})
-        return api.safe_http_json(req)
-
-    def failure(exc):
-        # Surface the server error code (top-level or inside a 409 hold
-        # payload) plus the held session id, so the receiver can classify
-        # terminal vs retryable failures (claim_expired may heal after the
-        # sweep; proof_replayed never heals) without a follow-up call.
-        # Best-effort: an unreadable body keeps the status-only form.
-        name = ''
         try:
-            raw = exc.read(4096) if hasattr(exc, 'read') else b''
-            data = json.loads((raw or b'').decode('utf-8', 'replace'))
-            hold = data.get('hold') if isinstance(data, dict) else None
-            err = data.get('error') if isinstance(data, dict) else None
-            if (not isinstance(err, str) or not err) and isinstance(hold, dict):
-                err = hold.get('error')
-            if isinstance(err, str) and err and len(err) <= 64 and err.replace('_', '').isalnum():
-                name = ' (%s)' % err
-                if err == 'provider_disabled':
-                    name += ' requested provider disabled by model policy; choose an enabled engine/model or ask the policy owner to enable it and register a fresh host route with verified quota'
-            rejection = hold if isinstance(hold, dict) else data
-            if isinstance(rejection, dict) and isinstance(rejection.get('rejected'), list):
-                reasons = sorted({r['reason'] for r in rejection['rejected'][:100]
-                                  if isinstance(r, dict) and isinstance(r.get('reason'), str)
-                                  and re.fullmatch(r'[a-z][a-z_]{0,63}', r['reason'])})
-                if reasons:
-                    name += ' routes: ' + ', '.join(reasons)
-            if isinstance(hold, dict) and isinstance(data.get('id'), str) and data.get('id'):
-                name += ' held session %s state %s' % (data['id'], data.get('state'))
-        except Exception:
-            name = ''
-        return ValueError('Session HTTP request failed with status %d%s' % (exc.code, name))
+            return api.safe_http_json(req)
+        except urllib.error.HTTPError:
+            raise
+        except (OSError, http.client.HTTPException, ValueError, RuntimeError) as exc:
+            reason = ('Session response error: invalid JSON or UTF-8 response'
+                      if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)) else diagnostic(exc))
+            recovery = '; mutation outcome unknown; inspect before retrying with the same key and payload' if method != 'GET' else ''
+            raise SessionTransportError(reason + recovery) from None
 
     try:
         return send(token)
     except urllib.error.HTTPError as exc:
         if exc.code == 401 and not env_token:
-            auth.refresh_token()
             try:
+                auth.refresh_token()
                 return send(auth.get_access_token())
             except urllib.error.HTTPError as retry:
-                raise failure(retry) from None
-        raise failure(exc) from None
+                raise http_error(retry, key=payload_key) from None
+            except Exception as refresh_exc:
+                raise SessionTransportError(diagnostic(refresh_exc)) from None
+        raise http_error(exc, key=payload_key) from None
 
 
-def read_file(path, limit=MAX_BODY):
-    if path == '-':
-        raw = sys.stdin.buffer.read(limit + 1)
-    else:
-        with Path(path).open('rb') as stream:
-            raw = stream.read(limit + 1)
+def read_file(path, limit=MAX_BODY, max_chars=None, field='Input'):
+    try:
+        if path == '-':
+            raw = sys.stdin.buffer.read(limit + 1)
+        else:
+            with Path(path).open('rb') as stream:
+                raw = stream.read(limit + 1)
+    except OSError as exc:
+        reason = {2: 'file not found', 13: 'permission denied', 21: 'path is a directory'}.get(exc.errno, 'file is unreadable')
+        raise SessionInputError(f'{field}: {reason}') from None
     if len(raw) > limit:
-        raise ValueError('Input exceeds capacity')
-    return raw.decode('utf-8')
+        raise SessionInputError(f'{field} exceeds capacity (max {limit} bytes)')
+    try:
+        text = raw.decode('utf-8')
+    except UnicodeDecodeError:
+        raise SessionInputError(f'{field} is not valid UTF-8') from None
+    if max_chars is not None and len(text) > max_chars:
+        raise SessionInputError(f'{field} exceeds character limit (max {max_chars} characters)')
+    return text
 
 
-def read_prompt_text(text, limit=MAX_BRIEF, max_chars=None):
+def read_prompt_text(text, limit=MAX_BRIEF, max_chars=None, field='Prompt'):
     """Inline `--prompt` with the same boundaries as the corresponding file input.
 
     UTF-8, at most limit bytes (and max_chars chars when set), non-blank.
@@ -108,11 +210,14 @@ def read_prompt_text(text, limit=MAX_BRIEF, max_chars=None):
     server already handles. No shell is ever involved.
     """
     if not isinstance(text, str) or not text.strip():
-        raise ValueError('Prompt must be non-empty text')
+        raise SessionInputError(f'{field} must be non-empty text')
     if max_chars is None and limit == MAX_BRIEF:
         max_chars = MAX_BRIEF_CHARS
-    if len(text.encode('utf-8')) > limit or (max_chars is not None and len(text) > max_chars):
-        raise ValueError('Prompt exceeds capacity')
+    encoded = text.encode('utf-8')
+    if len(encoded) > limit:
+        raise SessionInputError(f'{field} exceeds capacity (max {limit} bytes)')
+    if max_chars is not None and len(text) > max_chars:
+        raise SessionInputError(f'{field} exceeds character limit (max {max_chars} characters)')
     return text
 
 
@@ -282,7 +387,7 @@ def add_commands(sub):
     start.add_argument('--headless', action='store_true', help='Explicitly start in headless mode')
     mode = start.add_mutually_exclusive_group()
     mode.add_argument('--brief-file', help='UTF-8 goal file for headless work (max 8 KiB)')
-    mode.add_argument('--prompt', default=None, help='Inline UTF-8 goal text for headless work (max 8 KiB; same boundaries as --brief-file)')
+    mode.add_argument('--prompt', '--brief', default=None, help='Inline UTF-8 goal text for headless work (max 8 KiB; same boundaries as --brief-file)')
     mode.add_argument('--interactive', action='store_true', help='Start at an empty native prompt')
     start.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
     add_wait(start)
@@ -300,7 +405,7 @@ def add_commands(sub):
     override.add_argument('--headless', action='store_true', help='Explicitly start in headless mode')
     override_mode = override.add_mutually_exclusive_group()
     override_mode.add_argument('--brief-file', help='UTF-8 goal file for headless work (max 8 KiB)')
-    override_mode.add_argument('--prompt', default=None, help='Inline UTF-8 goal text for headless work (max 8 KiB)')
+    override_mode.add_argument('--prompt', '--brief', default=None, help='Inline UTF-8 goal text for headless work (max 8 KiB)')
     override_mode.add_argument('--interactive', action='store_true', help='Start at an empty native prompt')
     override.add_argument('--key', help='Stable idempotency key')
     add_wait(override)
@@ -548,20 +653,23 @@ def execute(args):
             payload['mode'] = 'headless'
         if getattr(args, 'brief_file', None):
             if payload['mode'] == 'interactive' and not with_goal:
-                raise ValueError('Interactive sessions start at an empty native prompt')
-            payload['brief'] = read_file(args.brief_file, MAX_BRIEF)
+                raise SessionInputError('Interactive sessions start at an empty native prompt')
+            payload['brief'] = read_file(args.brief_file, limit=MAX_BRIEF, max_chars=MAX_BRIEF_CHARS, field='Brief file')
         if getattr(args, 'prompt', None) is not None:
             if payload['mode'] == 'interactive' and not with_goal:
-                raise ValueError('Interactive sessions start at an empty native prompt')
-            payload['brief'] = read_prompt_text(args.prompt)
+                raise SessionInputError('Interactive sessions start at an empty native prompt')
+            payload['brief'] = read_prompt_text(args.prompt, limit=MAX_BRIEF, max_chars=MAX_BRIEF_CHARS, field='Prompt')
         if with_goal and not payload.get('brief', '').strip():
-            raise ValueError('--with-goal requires --prompt or --brief-file')
+            raise SessionInputError('--with-goal requires --prompt or --brief-file')
         try:
             created = request('POST', '/api/sessions', payload)
         except ValueError as exc:
             # Lost-response reconciliation: the key decides replay vs conflict,
             # never an unkeyed retry.
-            raise ValueError('%s (reconcile with --key %s via show/commands)' % (exc, key)) from None
+            msg = str(exc)
+            if key and f'reconcile with --key {key}' not in msg:
+                msg = f'{msg} (reconcile with --key {key} via show/commands)'
+            raise ValueError(msg) from None
         created = dict(created, client_key=key)
         timeout, interval = check_wait_args(args)
         if timeout is not None:
@@ -578,13 +686,13 @@ def execute(args):
         key = getattr(args, 'key', None) or str(uuid.uuid4())
         if cmd == 'send':
             if getattr(args, 'prompt', None) is not None and getattr(args, 'body_file', None):
-                raise ValueError('Cannot specify both --body-file and --prompt')
+                raise SessionInputError('Cannot specify both --body-file and --prompt')
             if getattr(args, 'prompt', None) is not None:
-                body = read_prompt_text(args.prompt, limit=MAX_BODY)
+                body = read_prompt_text(args.prompt, limit=MAX_BODY, field='Prompt')
             elif getattr(args, 'body_file', None):
-                body = read_file(args.body_file)
+                body = read_file(args.body_file, limit=MAX_BODY, field='Body file')
             else:
-                raise ValueError('Either --body-file or --prompt is required')
+                raise SessionInputError('Either --body-file or --prompt is required')
             payload = {'key': key, 'body': body}
         elif cmd == 'capture':
             # Default tail wire unchanged (no mode field); --screen encodes
@@ -597,7 +705,10 @@ def execute(args):
         try:
             queued = request('POST', '/api/sessions/' + args.id + '/' + cmd, payload)
         except ValueError as exc:
-            raise ValueError('%s (reconcile with --key %s via commands)' % (exc, key)) from None
+            msg = str(exc)
+            if key and f'reconcile with --key {key}' not in msg:
+                msg = f'{msg} (reconcile with --key {key} via commands)'
+            raise ValueError(msg) from None
         queued = dict(queued, client_key=key)
         timeout, interval = check_wait_args(args)
         if timeout is not None:

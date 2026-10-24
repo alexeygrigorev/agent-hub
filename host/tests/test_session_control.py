@@ -2,6 +2,7 @@
 import argparse
 import io
 import json
+import os
 import unittest
 from unittest.mock import patch
 from agent_hub_host import session_control
@@ -474,6 +475,90 @@ class TestSessionControlCli(unittest.TestCase):
             idle_res = session_control.execute(self.parse('list', '--state', 'idle'))
             self.assertEqual(len(idle_res['sessions']), 2)
             self.assertEqual({s['id'] for s in idle_res['sessions']}, {'s2', 's3'})
+
+    def test_missing_brief_file_raises_session_input_error(self):
+        args = self.parse('start', '--workspace', 'demo', '--brief-file', '/nonexistent/brief.txt', '--key', 'k')
+        with self.assertRaises(session_control.SessionInputError) as ctx:
+            session_control.execute(args)
+        self.assertIn('Brief file: file not found', str(ctx.exception))
+        diag = session_control.diagnostic(ctx.exception)
+        self.assertEqual(diag, 'Brief file: file not found')
+
+    def test_brief_file_exceeding_character_limit_raises_input_error(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False) as tf:
+            tf.write('x' * (session_control.MAX_BRIEF_CHARS + 10))
+            tf_path = tf.name
+        try:
+            args = self.parse('start', '--workspace', 'demo', '--brief-file', tf_path, '--key', 'k')
+            with self.assertRaises(session_control.SessionInputError) as ctx:
+                session_control.execute(args)
+            self.assertIn('character limit', str(ctx.exception))
+            self.assertIn('8000', str(ctx.exception))
+        finally:
+            import os
+            os.unlink(tf_path)
+
+    def test_brief_prompt_alias_and_character_limit(self):
+        args = self.parse('start', '--workspace', 'demo', '--brief', 'do task', '--key', 'k')
+        with patch.object(session_control, 'request', return_value={}) as transport:
+            session_control.execute(args)
+        payload = transport.call_args.args[2]
+        self.assertEqual(payload['brief'], 'do task')
+
+        long_prompt = 'y' * (session_control.MAX_BRIEF_CHARS + 5)
+        bad_args = self.parse('start', '--workspace', 'demo', '--brief', long_prompt, '--key', 'k')
+        with self.assertRaises(session_control.SessionInputError) as ctx:
+            session_control.execute(bad_args)
+        self.assertIn('character limit', str(ctx.exception))
+
+    def test_server_http_error_surfaces_status_error_field_and_detail(self):
+        import urllib.error
+        payload = {
+            'error': 'invalid_session_request',
+            'field': 'brief',
+            'detail': 'invalid_brief',
+        }
+        failure = urllib.error.HTTPError('https://hub.test/api/sessions', 400, 'Bad Request', {}, io.BytesIO(json.dumps(payload).encode()))
+        with patch.object(session_control.config, 'load_config', return_value={'base_url': 'https://hub.test'}), \
+                patch.dict(os.environ, {'HUB_TOKEN': 'fixture-env-token'}), \
+                patch.object(session_control.api, 'safe_http_json', side_effect=failure):
+            with self.assertRaises(session_control.SessionHTTPError) as ctx:
+                session_control.request('POST', '/api/sessions', {'key': 'k-err'})
+        msg = str(ctx.exception)
+        self.assertIn('status 400', msg)
+        self.assertIn('invalid_session_request', msg)
+        self.assertIn('field: brief', msg)
+        self.assertIn('detail: invalid_brief', msg)
+
+    def test_server_tbm_admission_denied_surfaces_reason_code(self):
+        import urllib.error
+        payload = {
+            'error': 'tbm_admission_denied',
+            'reason': 'kill_switch_active',
+        }
+        failure = urllib.error.HTTPError('https://hub.test/api/sessions', 409, 'Conflict', {}, io.BytesIO(json.dumps(payload).encode()))
+        with patch.object(session_control.config, 'load_config', return_value={'base_url': 'https://hub.test'}), \
+                patch.dict(os.environ, {'HUB_TOKEN': 'fixture-env-token'}), \
+                patch.object(session_control.api, 'safe_http_json', side_effect=failure):
+            with self.assertRaises(session_control.SessionHTTPError) as ctx:
+                session_control.request('POST', '/api/sessions', {'key': 'k-tbm'})
+        msg = str(ctx.exception)
+        self.assertIn('status 409', msg)
+        self.assertIn('tbm_admission_denied', msg)
+        self.assertIn('reason: kill_switch_active', msg)
+
+    def test_transport_error_diagnostics(self):
+        import socket
+        import urllib.error
+        dns_err = urllib.error.URLError(socket.gaierror(-2, 'Name or service not known'))
+        self.assertIn('DNS lookup failed', session_control.diagnostic(dns_err))
+
+        timeout_err = TimeoutError('timed out')
+        self.assertIn('timed out', session_control.diagnostic(timeout_err))
+
+        json_err = RuntimeError('Expected JSON response')
+        self.assertIn('Expected JSON response', session_control.diagnostic(json_err))
 
 
 if __name__ == '__main__':

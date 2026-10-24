@@ -553,14 +553,8 @@ def main():
                 print(rendered)
             else:
                 print(json.dumps(rendered, indent=2, ensure_ascii=True))
-        except ValueError as exc:
-            print(str(exc) or 'Session operation failed; check authentication, grants, capacity and current versions.',
-                  file=sys.stderr)
-            sys.exit(1)
-        except Exception:
-            print('Session operation failed; check authentication, grants, capacity and current versions. '
-                  'Retry mutations with the same key and payload after uncertain responses; '
-                  'recorded/transported is not delivery proof, only a correlated ack confirms.', file=sys.stderr)
+        except Exception as exc:
+            print(session_control.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
         return
     if args.cmd in ('submit', 'jobs', 'job', 'task-result', 'routing-machines', 'model-policy', 'task-artifact', 'artifact'):

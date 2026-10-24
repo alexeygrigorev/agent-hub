@@ -337,6 +337,58 @@ class TestCliUpdate(unittest.TestCase):
             self.assertFalse(installed.exists())
             self.assertIn("Checksum mismatch", err.getvalue())
 
+    def test_sessions_start_missing_brief_file_surfaces_input_error(self):
+        from agent_hub_host import cli
+        from unittest.mock import patch
+        import io
+        err = io.StringIO()
+        with patch.object(sys, 'argv', ['hub', 'sessions', 'start', '--workspace', '/test', '--brief-file', '/nonexistent/file.txt', '--key', 'k']), \
+             patch.object(sys, 'stderr', err):
+            with self.assertRaises(SystemExit) as ctx:
+                cli.main()
+            self.assertEqual(ctx.exception.code, 1)
+        output = err.getvalue()
+        self.assertIn('Brief file: file not found', output)
+        self.assertNotIn('Session operation failed; check authentication', output)
+
+    def test_sessions_start_http_error_surfaces_status_and_code(self):
+        from agent_hub_host import cli, session_control
+        from unittest.mock import patch
+        import io
+        err = io.StringIO()
+        http_err = session_control.SessionHTTPError(400, code='invalid_session_request',
+                                                    message='Session HTTP request failed with status 400 (invalid_session_request); field: brief; detail: invalid_brief (reconcile with --key k via show/commands)')
+        with patch.object(sys, 'argv', ['hub', 'sessions', 'start', '--workspace', '/test', '--prompt', 'do something', '--key', 'k']), \
+             patch.object(session_control, 'request', side_effect=http_err), \
+             patch.object(sys, 'stderr', err):
+            with self.assertRaises(SystemExit) as ctx:
+                cli.main()
+            self.assertEqual(ctx.exception.code, 1)
+        output = err.getvalue()
+        self.assertIn('status 400', output)
+        self.assertIn('invalid_session_request', output)
+        self.assertIn('field: brief', output)
+        self.assertNotIn('Session operation failed; check authentication', output)
+
+    def test_sessions_start_tbm_denial_surfaces_reason_code(self):
+        from agent_hub_host import cli, session_control
+        from unittest.mock import patch
+        import io
+        err = io.StringIO()
+        http_err = session_control.SessionHTTPError(409, code='tbm_admission_denied',
+                                                    message='Session HTTP request failed with status 409 (tbm_admission_denied); reason: kill_switch_active (reconcile with --key k via show/commands)')
+        with patch.object(sys, 'argv', ['hub', 'sessions', 'start', '--workspace', '/test', '--prompt', 'do something', '--key', 'k']), \
+             patch.object(session_control, 'request', side_effect=http_err), \
+             patch.object(sys, 'stderr', err):
+            with self.assertRaises(SystemExit) as ctx:
+                cli.main()
+            self.assertEqual(ctx.exception.code, 1)
+        output = err.getvalue()
+        self.assertIn('status 409', output)
+        self.assertIn('tbm_admission_denied', output)
+        self.assertIn('reason: kill_switch_active', output)
+        self.assertNotIn('Session operation failed; check authentication', output)
+
 
 
 class TestHeartbeatCommand(unittest.TestCase):
