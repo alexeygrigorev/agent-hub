@@ -143,12 +143,53 @@ class LauncherRecoveryTests(unittest.TestCase):
             self.assertEqual(dispatcher.dispatch(offer)['state'], 'uncertain')
         self.assertEqual(self.state()[0], 'queued')
         self.assertEqual(dispatcher.dispatch(offer)['state'], 'failed')
-        self.assertEqual(self.state(), ('failed', REASON))
-        self.assertEqual(requests[-1][2]['reason'], 'launcher_not_started')
+        self.assertEqual(self.state()[0], 'failed')
+        self.assertIn('launcher_command_failed', self.state()[1])
+        self.assertEqual(requests[-1][2]['reason'], 'launcher_command_failed')
+        self.assertEqual(requests[-1][2]['diagnostic']['error_type'], 'RuntimeError')
         with sqlite3.connect(self.db) as c:
             c.execute("UPDATE tasks SET state='starting'")
         self.assertEqual(dispatcher.dispatch(offer)['state'], 'uncertain')
-        self.assertEqual(requests[-1][2], {'state': 'uncertain'})
+        self.assertEqual(requests[-1][2]['state'], 'uncertain')
+        self.assertEqual(requests[-1][2]['diagnostic']['reason'], 'launcher_command_failed')
+
+    def test_memory_refusal_journal_and_hub_receipt_survive_restart(self):
+        import datetime
+        from agent_hub_host.launch_diagnostics import LocalCommandError
+        sub = {'service': 'go', 'account_label': 'muse', 'engine': 'opencode',
+               'launcher_provider': 'opencode', 'launcher_model': 'opencode-go/muse-spark-1.3-contributor', 'admission_argv': ['gate']}
+        settings = {'launcher': self.launcher, 'workspaces': {'main': str(self.ws)}, 'subscriptions': [sub]}
+        def runner(argv, **kwargs):
+            if argv[0] == 'gate':
+                return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'muse',
+                        'observed_at': datetime.datetime.now(datetime.timezone.utc).isoformat()}
+            if 'plan' in argv:
+                return {'eligible': [{'provider': 'opencode', 'model': sub['launcher_model'], 'task_fit': 1.0}]}
+            if 'run' in argv:
+                raise LocalCommandError('private-value\nValueError: host MemAvailable < 10GiB', exit_code=1)
+            return {}
+        calls = []
+        def request(*args):
+            calls.append(args)
+            if args[1].endswith('/result'):
+                raise OSError('lost response')
+            return {}
+        journal = self.root / 'memory-journal'
+        journal.mkdir(mode=0o700)
+        d = Dispatcher(settings, runner=runner, request=request, journal_dir=str(journal))
+        offer = {'id': self.offer, 'engine': 'opencode', 'account': 'muse', 'mode': 'headless', 'workspace': 'main', 'prompt': 'review'}
+        self.assertEqual(d.dispatch(offer)['state'], 'uncertain')
+        entry = journal / 'fleet-launches' / (self.offer + '.json')
+        saved = json.loads(entry.read_text())
+        self.assertEqual(saved['reason'], 'launcher_memory_reserve')
+        self.assertEqual(saved['diagnostic']['exit_code'], 1)
+        self.assertNotIn('private-value', entry.read_text())
+        self.assertIn('launcher_memory_reserve', self.state()[1])
+        calls.clear()
+        restored = Dispatcher(settings, request=lambda *a: calls.append(a) or {}, journal_dir=str(journal))
+        self.assertEqual(restored.reconcile_launches()[0]['reason'], 'launcher_memory_reserve')
+        self.assertEqual(calls[0][2]['diagnostic'], saved['diagnostic'])
+        self.assertTrue(json.loads(entry.read_text())['settled'])
 
 
 @unittest.skipUnless(os.name == 'posix', 'POSIX launcher lock contract')

@@ -269,7 +269,7 @@ export class FleetService {
     this.admission.init();
     for (const stmt of FLEET_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
     const launchColumns = this.sql.exec('PRAGMA table_info(fleet_launches)').toArray().map((c: any) => c.name);
-    for (const name of ['verification_status', 'exit_reason', 'finished_at']) {
+    for (const name of ['verification_status', 'exit_reason', 'finished_at', 'launch_error_json']) {
       if (!launchColumns.includes(name)) this.sql.exec(`ALTER TABLE fleet_launches ADD COLUMN ${name} TEXT`);
     }
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_offered ON fleet_launches(id) WHERE state = 'offered'");
@@ -954,17 +954,27 @@ export class FleetService {
             !this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) {
           return response({ id: row.id, state: row.state, replay: true });
         }
-        const noStart = object(data, ['state', 'launcher_task_id', 'confirmed_exit', 'reason']) &&
-          data.state === 'failed' && data.confirmed_exit === true && data.reason === 'launcher_not_started' &&
+        // Host emits fixed, sanitized diagnostics; validate bounds again at storage.
+        const diagnostic = data.diagnostic;
+        if (diagnostic !== undefined && (!object(diagnostic, ['reason', 'message', 'error_type', 'exit_code', 'stage']) ||
+            typeof diagnostic.reason !== 'string' || !/^launcher_[a-z_]{1,64}$/.test(diagnostic.reason) ||
+            typeof diagnostic.message !== 'string' || diagnostic.message.length > 300 || /[\x00-\x1f\x7f]/.test(diagnostic.message) ||
+            typeof diagnostic.error_type !== 'string' || !/^[A-Za-z]{1,64}$/.test(diagnostic.error_type) ||
+            !['launcher_run', 'dispatch_headless', 'dispatch_interactive', 'dispatch_route'].includes(diagnostic.stage) ||
+            (diagnostic.exit_code !== undefined && !Number.isSafeInteger(diagnostic.exit_code)))) return response({ error: 'invalid_launch_diagnostic' }, 400);
+        const noStart = object(data, ['state', 'launcher_task_id', 'confirmed_exit', 'reason', 'diagnostic']) &&
+          data.state === 'failed' && data.confirmed_exit === true &&
+          (data.reason === 'launcher_not_started' || (diagnostic && data.reason === diagnostic.reason)) &&
           data.launcher_task_id === 'hub-' + row.id && !row.native_id;
         if (noStart && row.state === 'failed' && row.exit_reason === data.reason && row.launcher_task_id === data.launcher_task_id) return response({ id: row.id, state: row.state, replay: true });
-        if ((!noStart && !object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit'])) || !['running', 'uncertain', 'failed', 'exited'].includes(data.state) || !['starting', 'running', 'uncertain'].includes(row.state)) return response({ error: 'invalid_transition' }, 409);
+        if ((!noStart && !object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'diagnostic'])) || !['running', 'uncertain', 'failed', 'exited'].includes(data.state) || !['starting', 'running', 'uncertain'].includes(row.state)) return response({ error: 'invalid_transition' }, 409);
         if (['exited', 'failed'].includes(data.state) && this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) return response({ error: 'task_report_required' }, 409);
         if (['exited', 'failed'].includes(data.state) && data.confirmed_exit !== true) return response({ error: 'confirmed_exit_required' }, 409);
         if (data.state === 'running' && (typeof data.native_id !== 'string' || data.native_id.length < 1 || data.native_id.length > 160 || (row.mode === 'headless' && !label(data.launcher_task_id)))) return response({ error: 'native_receipt_required' }, 409);
         if ((data.native_id !== undefined && (typeof data.native_id !== 'string' || data.native_id.length > 160)) || (data.launcher_task_id !== undefined && !label(data.launcher_task_id))) return response({ error: 'invalid_receipt' }, 400);
         this.sql.exec('UPDATE fleet_launches SET state = ?, native_id = COALESCE(?, native_id), launcher_task_id = COALESCE(?, launcher_task_id), updated_at = ? WHERE id = ?', data.state, data.native_id || null, data.launcher_task_id || null, new Date(this.now()).toISOString(), row.id);
-        if (noStart) this.sql.exec("UPDATE fleet_launches SET exit_reason = 'launcher_not_started', verification_status = 'not_started', finished_at = ? WHERE id = ?", new Date(this.now()).toISOString(), row.id);
+        if (diagnostic) this.sql.exec("UPDATE fleet_launches SET launch_error_json = ?, exit_reason = ? WHERE id = ?", JSON.stringify(diagnostic), diagnostic.reason, row.id);
+        if (noStart) this.sql.exec("UPDATE fleet_launches SET exit_reason = ?, verification_status = 'not_started', finished_at = ? WHERE id = ?", data.reason, new Date(this.now()).toISOString(), row.id);
         // An attempted start with uncertain effects is no longer an offer.
         // Keep its reservation and missing binding, but expose the real state.
         if (data.state === 'uncertain' && this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {

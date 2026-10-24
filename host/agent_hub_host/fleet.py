@@ -357,6 +357,7 @@ def run_json(argv, *, payload=None, cwd=None, timeout=30):
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd)
     overflow = threading.Event()
     stdout = bytearray()
+    stderr = bytearray()
     def drain(stream, limit, target=None):
         size = 0
         try:
@@ -382,7 +383,7 @@ def run_json(argv, *, payload=None, cwd=None, timeout=30):
     is_catalog = list(argv[-2:]) == ["list", "--json"] or list(argv[-3:]) == ["list", "--all", "--json"]
     stdout_limit = 8 * 1024 * 1024 if is_catalog else 131072
     threads = [threading.Thread(target=drain, args=(proc.stdout, stdout_limit, stdout), daemon=True),
-               threading.Thread(target=drain, args=(proc.stderr, 16384), daemon=True),
+               threading.Thread(target=drain, args=(proc.stderr, 16384, stderr), daemon=True),
                threading.Thread(target=write, daemon=True)]
     for thread in threads: thread.start()
     deadline = time.monotonic() + timeout
@@ -394,7 +395,8 @@ def run_json(argv, *, payload=None, cwd=None, timeout=30):
             raise RuntimeError('Local command failed or exceeded resource limit')
         for thread in threads: thread.join(timeout=1)
         if proc.returncode != 0 or overflow.is_set() or any(t.is_alive() for t in threads):
-            raise RuntimeError('Local command failed or exceeded output limit')
+            from .launch_diagnostics import LocalCommandError
+            raise LocalCommandError(bytes(stdout + b'\n' + stderr).decode('utf-8', 'replace'), exit_code=proc.returncode)
     finally:
         if proc.poll() is None: proc.kill(); proc.wait(timeout=2)
         # Each reader owns and closes its stream after EOF. Closing its raw descriptor here
@@ -731,7 +733,8 @@ class Dispatcher:
                             and entry.name == f"{offer_id}.json"
                             and data.get("task_id") == f"hub-{offer_id}"
                             and data.get("mode") == "headless"
-                            and data.get("reason") == "launcher_not_started"):
+                            and isinstance(data.get("reason"), str)
+                            and data["reason"].startswith("launcher_")):
                         self._active_launches[offer_id] = data
                     continue
                 if data.get("state") != "running":
@@ -856,13 +859,15 @@ class Dispatcher:
                     # Repeat the fenced proof, including after process restart.
                     # Never treat a journal assertion alone as native exit proof.
                     from .launcher_recovery import settle_unstarted
-                    if not settle_unstarted(launcher, record["task_id"], record["workspace"], record["target_cwd"]):
+                    if not settle_unstarted(launcher, record["task_id"], record["workspace"], record["target_cwd"], record.get("diagnostic")):
                         continue
                     self.request("POST", "/api/fleet/launches/" + offer_id + "/result", {
-                        "state": "failed", "launcher_task_id": record["task_id"], "confirmed_exit": True, "reason": "launcher_not_started"})
+                        "state": "failed", "launcher_task_id": record["task_id"], "confirmed_exit": True, "reason": record["reason"],
+                        **({"diagnostic": record["diagnostic"]} if record.get("diagnostic") else {})})
                     record["settled"] = True
                     self._persist_launch_record(record)
-                    reconciled.append({"id": offer_id, "state": "failed", "reason": "launcher_not_started"})
+                    reconciled.append({"id": offer_id, "state": "failed", "reason": record["reason"],
+                                       **({"diagnostic": record["diagnostic"]} if record.get("diagnostic") else {})})
                 except Exception:
                     pass
                 continue
@@ -1503,23 +1508,25 @@ class Dispatcher:
                     profile=offer.get("profile") or sub.get("profile"),
                 )
         except Exception as exc:
+            from .launch_diagnostics import exception_diagnostic
+            failure = exception_diagnostic(exc, "dispatch_headless" if mode == "headless" else "dispatch_interactive")
             if mode == "headless" and not offer.get("task_id"):
                 from .launcher_recovery import settle_unstarted
                 record = {"offer_id": offer_id, "task_id": task_id, "mode": "headless",
                           "workspace": str(workspace), "target_cwd": str(target_cwd),
-                          "state": "not_started", "reason": "launcher_not_started", "settled": False}
+                          "state": "not_started", "reason": failure["reason"], "diagnostic": failure, "settled": False}
                 try:
                     # Persist recovery intent BEFORE changing launcher state.
                     # A crash after the fence must not lose its Hub receipt.
                     # The journal alone is never proof: replay rechecks storage.
                     self._persist_launch_record(record)
                     self._active_launches[offer_id] = record
-                    if settle_unstarted(launcher, task_id, workspace, target_cwd):
+                    if settle_unstarted(launcher, task_id, workspace, target_cwd, failure):
                         self.request("POST", path + "/result", {
-                            "state": "failed", "launcher_task_id": task_id, "confirmed_exit": True, "reason": "launcher_not_started"})
+                            "state": "failed", "launcher_task_id": task_id, "confirmed_exit": True, "reason": failure["reason"], "diagnostic": failure})
                         record["settled"] = True
                         self._persist_launch_record(record)
-                        return {"id": offer_id, "state": "failed", "reason": "launcher_not_started"}
+                        return {"id": offer_id, "state": "failed", "reason": failure["reason"], "diagnostic": failure}
                 except Exception:
                     # Leave the task untouched if recovery intent cannot be
                     # journaled; otherwise retry the receipt without relaunch.
@@ -1533,11 +1540,11 @@ class Dispatcher:
             stage = ("dispatch_headless" if mode == "headless" else "dispatch_interactive")[:32]
             reason = ("%s:%s" % (stage, err))[:120]
             try:
-                self.request("POST", path + "/result", {"state": "uncertain"})
+                self.request("POST", path + "/result", {"state": "uncertain", "diagnostic": failure})
             except Exception:
                 pass
             return {"id": offer_id, "state": "uncertain", "reason": reason,
-                    "stage": stage, "error": err}
+                    "stage": stage, "error": err, "diagnostic": failure}
         if offer.get('task_id') and result.get('confirmed_exit'):
             from .routing import read_text
             try:

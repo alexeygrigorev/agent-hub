@@ -536,6 +536,13 @@ export class SessionControlService {
     const session_type = row.session_type || (row.mode === 'interactive' || row.interactive ? 'aplexer' : (isObserved ? 'aplexer' : 'headless'));
     const parent_id = row.parent_id || null;
     const parent_source = row.parent_source || (row.parent_id ? 'explicit_parent' : 'unknown_external');
+    let launchError: any = null;
+    if (row.fleet_launch_id) {
+      try {
+        const launch: any = this.sql.exec('SELECT launch_error_json FROM fleet_launches WHERE id = ?', row.fleet_launch_id).toArray()[0];
+        launchError = launch?.launch_error_json ? parsed(launch.launch_error_json, null) : null;
+      } catch {} // Fleet is optional in isolated session-control installations.
+    }
     const qualified_name = qualified_alias || (typeof request.name === 'string' ? request.name : row.id);
     return {
       id: row.id, state: row.state, machine: row.machine_id ?? null, engine: row.engine ?? null,
@@ -545,6 +552,7 @@ export class SessionControlService {
       // actor-scoped exact-name alias where explicitly resolved below.
       name: typeof request.name === 'string' ? request.name : null,
       fleet_launch_id: row.fleet_launch_id ?? null,
+      ...(launchError ? { reason: launchError.reason, message: launchError.message, launch_error: launchError } : {}),
       cleanup_protection: protection ? { key: protection.request_key, created_at: protection.created_at, permanent: true } : null,
       binding,
       provenance,

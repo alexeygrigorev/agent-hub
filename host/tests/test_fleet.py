@@ -171,8 +171,12 @@ class FleetTests(unittest.TestCase):
             # Bounded diagnostic only (type+stage, never argv/goal/secrets).
             self.assertIn("TimeoutError", result.get("reason", ""))
             posted = http[-1][2]
-            self.assertEqual(posted, {'state': 'uncertain'})
-            self.assertTrue(set(posted.keys()).issubset({'state', 'native_id', 'launcher_task_id', 'confirmed_exit'}))
+            self.assertEqual(posted['state'], 'uncertain')
+            self.assertEqual(posted['diagnostic']['error_type'], 'TimeoutError')
+            self.assertEqual(posted['diagnostic']['stage'], 'dispatch_interactive')
+            self.assertEqual(posted['diagnostic']['reason'], 'launcher_command_failed')
+            self.assertNotIn('MUST_NOT_LEAK', json.dumps(posted))
+            self.assertTrue(set(posted.keys()).issubset({'state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'diagnostic'}))
             self.assertNotIn("reason", posted)
             self.assertNotIn("stage", posted)
             self.assertNotIn("error", posted)

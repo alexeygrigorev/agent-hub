@@ -3,7 +3,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
-import { SESSION_CONTROL_SCHEMA } from '../src/session_control';
+import { SESSION_CONTROL_SCHEMA, SessionControlService } from '../src/session_control';
 
 const admin = { caller: { isAdmin: true, actor: 'test-admin', kind: 'human' }, scopes: ['admin'] };
 const host = (id: string) => ({ caller: { machineId: id, kind: 'host', actor: 'machine:' + id }, scopes: ['host'] });
@@ -406,6 +406,27 @@ describe('generic accounts and launch placement', () => {
     expect((await s.handle(request(path + '/result', receipt), host('hetzner'))).status).toBe(200);
     expect(await (await s.handle(request(path + '/result', receipt), host('hetzner'))).json()).toMatchObject({ replay: true });
     expect(sql.exec('SELECT state, exit_reason, verification_status FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'failed', exit_reason: 'launcher_not_started', verification_status: 'not_started' });
+  }));
+  it('persists the actual sanitized refusal and exposes it on the canonical session', async () => fixture(async (s, sql) => {
+    await configure(s);
+    for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
+    const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    const sessionId = crypto.randomUUID();
+    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES (?, 'test-admin', ?, '{}', ?, NULL, 'headless', 'queued', ?, ?)", sessionId, sessionId, launch.id, iso(), iso());
+    const path = '/launches/' + launch.id;
+    await s.handle(request(path + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+    const diagnostic = { reason: 'launcher_memory_reserve', message: 'Host memory headroom after launcher reservations is below 10 GiB.', error_type: 'ValueError', exit_code: 1, stage: 'dispatch_headless' };
+    const receipt = { state: 'failed', confirmed_exit: true, reason: diagnostic.reason, diagnostic, launcher_task_id: 'hub-' + launch.id };
+    expect((await s.handle(request(path + '/result', { ...receipt, diagnostic: { ...diagnostic, message: 'bad\nmessage' } }), host('hetzner'))).status).toBe(400);
+    expect((await s.handle(request(path + '/result', receipt), host('win35'))).status).toBe(404);
+    expect((await s.handle(request(path + '/result', receipt), host('hetzner'))).status).toBe(200);
+    expect(JSON.parse(sql.exec('SELECT launch_error_json FROM fleet_launches WHERE id = ?', launch.id).one().launch_error_json)).toEqual(diagnostic);
+    expect(sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', sessionId).one().state).toBe('failed');
+    expect(await (await s.handle(request(path + '/result', receipt), host('hetzner'))).json()).toMatchObject({ replay: true });
+    const sessions = new SessionControlService(sql, cb => cb(), () => now);
+    sessions.init();
+    const viewed = (sessions as any).view(sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionId).one());
+    expect(viewed).toMatchObject({ state: 'failed', reason: diagnostic.reason, message: diagnostic.message, launch_error: diagnostic });
   }));
   it('closes an unassigned queued canonical attempt when launcher_not_started occurs', async () => fixture(async (s, sql) => {
     await configure(s);

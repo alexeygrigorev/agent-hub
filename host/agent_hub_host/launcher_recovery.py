@@ -15,12 +15,23 @@ import sqlite3
 REASON = "hub-fleet: launcher refused before native start"
 
 
-def settle_unstarted(launcher, task_id, workspace, target_cwd):
+def settle_unstarted(launcher, task_id, workspace, target_cwd, diagnostic=None):
     """Return positive no-start proof, or False on contention/unknown effects.
 
     POSIX maintained-launcher storage only. Unsupported platforms fail closed.
     No native process is killed, and no row or original payload is deleted.
     """
+    # Only locally constructed fixed diagnostics can enter launcher storage.
+    reason = REASON
+    if isinstance(diagnostic, dict):
+        # Messages are already fixed summaries, so validate the complete DTO
+        # against the same registry instead of accepting arbitrary caller text.
+        from .launch_diagnostics import REFUSALS
+        known = {(slug, message) for slug, message in REFUSALS.values()}
+        if (diagnostic.get('reason'), diagnostic.get('message')) in known:
+            reason += ': ' + diagnostic['reason'] + ': ' + diagnostic['message']
+        else:
+            reason += ': launcher_command_failed: Launcher command failed; diagnostic output withheld.'
     if not re.fullmatch(r"hub-[A-Za-z0-9][A-Za-z0-9_-]{0,63}", task_id):
         return False
     try:
@@ -40,7 +51,7 @@ def settle_unstarted(launcher, task_id, workspace, target_cwd):
                 payload = json.loads(row[1])
                 if payload.get("owner") != "hub-fleet" or Path(payload["cwd"]).resolve(strict=True) != Path(target_cwd).resolve(strict=True):
                     return False
-                if row[0] != "queued" and not (row[0] == "failed" and row[3] == REASON):
+                if row[0] != "queued" and not (row[0] == "failed" and isinstance(row[3], str) and (row[3] == REASON or row[3].startswith(REASON + ": "))):
                     return False
                 if conn.execute("SELECT 1 FROM task_native_bindings WHERE task_id = ?", (task_id,)).fetchone():
                     return False
@@ -53,7 +64,7 @@ def settle_unstarted(launcher, task_id, workspace, target_cwd):
                         if artifact.exists() or artifact.is_symlink():
                             return False
                 if row[0] == "queued":
-                    changed = conn.execute("UPDATE tasks SET state = 'failed', reason = ?, reviewer = 'hub-fleet-recovery', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = 'queued'", (REASON, task_id)).rowcount
+                    changed = conn.execute("UPDATE tasks SET state = 'failed', reason = ?, reviewer = 'hub-fleet-recovery', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = 'queued'", (reason, task_id)).rowcount
                     if changed != 1:
                         return False
                 return True
