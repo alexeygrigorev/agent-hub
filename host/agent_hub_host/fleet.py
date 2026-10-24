@@ -1795,6 +1795,18 @@ class Dispatcher:
         legacy_settled = settle_retired_legacy(self.settings.get('launcher', {}))
         reconciled = self.reconcile_launches()
         imported_reconciled = self.reconcile_imported_sessions()
+        # Quota monitoring does not prove launch capability. Group by engine:
+        # a monitor-only account must not disable another runnable account on
+        # the same engine. Never fabricate an admission adapter or bypass it.
+        configured_engines = {s.get('engine', s['service']) for s in self.settings['subscriptions']
+                              if s.get('admission_argv')}
+        unconfigured_engines = {s.get('engine', s['service']) for s in self.settings['subscriptions']} - configured_engines
+        for engine in sorted(unconfigured_engines):
+            try:
+                self.request('POST', '/api/fleet/probe', {'engine': engine, 'status': 'unavailable',
+                                                        'reason': 'admission_unconfigured'})
+            except Exception:
+                pass  # dispatch still refuses locally if health publication fails.
         offer_response = self.request("GET", "/api/fleet/offers")
         offers = offer_response.get("offers", [])
         from .account_capacity import reconcile_unstarted

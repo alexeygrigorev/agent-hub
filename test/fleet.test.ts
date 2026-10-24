@@ -563,6 +563,13 @@ describe('generic accounts and launch placement', () => {
     expect(sql.exec('SELECT state, exit_reason, verification_status FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'failed', exit_reason: reason, verification_status: 'not_started' });
     expect(sql.exec("SELECT state FROM session_control_sessions WHERE id = 'pending'").one().state).toBe('failed');
     expect((await s.handle(request(path, receipt), host('hetzner'))).status).toBe(409);
+    // Recovery requires an explicit successful probe; quota alone never clears the hold.
+    if (reason === 'admission_unconfigured') {
+      expect(s.plan(intent({ machine: 'hetzner' })).selected).toBeNull();
+      expect(s.plan(intent({ machine: 'hetzner' })).rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason });
+      expect(s.plan(intent()).selected?.machine).toBe('win35');
+      await s.handle(request('/probe', { engine: 'codex', machine_id: 'hetzner', status: 'ok' }), admin);
+    }
     const claimed: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
     await s.handle(request('/launches/' + claimed.id + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
     expect((await s.handle(request('/launches/' + claimed.id + '/reject', receipt), host('hetzner'))).status).toBe(409);

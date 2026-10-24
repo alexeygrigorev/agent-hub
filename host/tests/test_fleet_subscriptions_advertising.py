@@ -83,6 +83,27 @@ class FleetSubscriptionsAdvertisingTest(unittest.TestCase):
             self.assertIn("shared-grok", reported_accounts)
             self.assertIn("shared-zai", reported_accounts)
 
+    def test_monitor_only_account_does_not_disable_runnable_account_on_same_engine(self):
+        from unittest.mock import Mock
+        calls = []
+        cfg = {'workspaces': {}, 'subscriptions': [
+            {'service': 'zai', 'engine': 'codex', 'account_label': 'monitor-only'},
+            {'service': 'codex', 'engine': 'codex', 'account_label': 'healthy', 'admission_argv': ['gate']},
+            {'service': 'zai', 'engine': 'zcodex', 'account_label': 'broken'},
+        ]}
+        dispatcher = fleet.Dispatcher(cfg, lambda m, p, b=None: calls.append((m, p, b)) or {}, Mock(return_value={}))
+        with patch('agent_hub_host.provisioning.tick'), \
+             patch('agent_hub_host.provisioning.managed_subscriptions', return_value=[]), \
+             patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {}}), \
+             patch('agent_hub_host.api.get_heartbeat_payload', return_value={}), \
+             patch('agent_hub_host.fleet.collect_subscriptions', return_value=[]), \
+             patch.object(dispatcher, 'report_catalog_bindings', return_value=[]), \
+             patch.object(dispatcher, 'reconcile_launches', return_value=[]), \
+             patch.object(dispatcher, 'reconcile_imported_sessions', return_value=[]):
+            dispatcher.once()
+        self.assertEqual([b for _, p, b in calls if p == '/api/fleet/probe'], [
+            {'engine': 'zcodex', 'status': 'unavailable', 'reason': 'admission_unconfigured'}])
+
     def test_collect_subscriptions_claude(self):
         def runner(argv):
             if argv[:2] == ["quse", "claude"]:

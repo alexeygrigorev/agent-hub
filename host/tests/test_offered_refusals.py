@@ -57,6 +57,11 @@ class OfferedRefusals(unittest.TestCase):
                 results, calls = self.cycle(Path(tmp), [offer])
                 self.assertEqual(results[-1], {'id': offer['id'], 'state': 'failed',
                                                'reason': 'admission_unconfigured'})
+                self.assertEqual([b for _, p, b in calls if p == '/api/fleet/probe'],
+                                 [{'engine': 'zcodex', 'status': 'unavailable',
+                                   'reason': 'admission_unconfigured'}])
+                self.assertLess(next(i for i, c in enumerate(calls) if c[1] == '/api/fleet/probe'),
+                                next(i for i, c in enumerate(calls) if c[1] == '/api/fleet/offers'))
                 self.assertEqual([p for _, p, _ in calls if p.endswith('/claim')], [])
                 self.assertEqual([b for _, p, b in calls if p.endswith('/reject')],
                                  [{'reason': 'admission_unconfigured'}])

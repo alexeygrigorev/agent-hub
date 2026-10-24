@@ -80,7 +80,7 @@ export const PLACEMENT_PRESSURE_REASONS = new Set(['launcher_memory_reserve', 'a
  * (stale/drained check-ins, policy-disabled engines, engines no live host
  * advertises anymore — e.g. registry routes for engines the current host
  * release stopped running). */
-const INCIDENTAL_REASONS = new Set(['machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired']);
+const INCIDENTAL_REASONS = new Set(['machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'admission_unconfigured']);
 /** Capacity-only placement failure: every rejected route reports transient
  * capacity (account/machine), optionally alongside incidental stale/disabled
  * routes (drained/stale check-ins, policy-disabled engines, registry routes
@@ -632,7 +632,7 @@ export class FleetService {
       if (request.with_goal && !['codex', 'zcodex'].includes(route.engine)) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'goal_unsupported' }); continue; }
       // A disabled execution engine holds all new candidate planning, whatever the account label.
       if (disabledEngines().has(route.engine)) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'provider_disabled' }); continue; }
-      const engineHealth: any = this.sql.exec("SELECT status, reason FROM fleet_engine_health WHERE engine = ? AND (machine_id = ? OR machine_id = '' OR machine_id IS NULL)", route.engine, route.machine_id).toArray()[0];
+      const engineHealth: any = this.sql.exec("SELECT status, reason FROM fleet_engine_health WHERE engine = ? AND (machine_id = ? OR machine_id = '' OR machine_id IS NULL) AND status = 'unavailable'", route.engine, route.machine_id).toArray()[0];
       if (engineHealth && engineHealth.status === 'unavailable') {
         rejected.push({ machine: route.machine_id, engine: route.engine, reason: engineHealth.reason || 'engine_auth_expired' });
         continue;
@@ -1243,6 +1243,11 @@ export class FleetService {
           this.sql.exec("UPDATE fleet_launches SET state = 'failed', verification_status = 'not_started', exit_reason = ?, finished_at = ?, updated_at = ? WHERE id = ? AND state = 'offered'", data.reason, at, at, row.id);
           if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
             this.sql.exec("UPDATE session_control_sessions SET state = 'failed', updated_at = ? WHERE fleet_launch_id = ? AND machine_id = ? AND binding_json IS NULL AND state IN ('offered','queued','held')", at, row.id, caller.machineId!);
+          }
+          if (data.reason === 'admission_unconfigured') {
+            // A proven pre-claim refusal is execution-health evidence, even when
+            // quota is healthy. Do not repeatedly offer this broken host engine.
+            this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at) VALUES (?, ?, 'unavailable', ?, ?)", row.engine, row.machine_id, data.reason, at);
           }
           try { this.drainCapacityQueue(); } catch { /* best-effort */ }
           return response({ id: row.id, state: 'failed', reason: data.reason });

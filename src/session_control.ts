@@ -610,6 +610,21 @@ export class SessionControlService {
         modelSelection = parsed(launch?.model_selection_json);
         modelReason = launch?.exit_reason === 'model_unsupported' ? 'model_unsupported' : null;
         launchError = launch?.launch_error_json ? parsed(launch.launch_error_json, null) : null;
+        // Rejections before claim and legacy terminal receipts have no diagnostic
+        // DTO. Preserve their bounded reason without publishing arbitrary logs.
+        if (!launchError && row.state === 'failed') {
+          const reason = typeof launch?.exit_reason === 'string' && /^[a-z][a-z_]{0,63}$/.test(launch.exit_reason)
+            ? launch.exit_reason : 'launcher_failed_without_diagnostic';
+          const messages: Record<string, string> = {
+            admission_unconfigured: 'The host has no fresh admission adapter configured for this engine. Routing is held until it is configured and probed.',
+            admission_refused: 'The host fresh admission gate refused this launch.',
+            workspace_unavailable: 'The requested workspace is unavailable on this host.',
+            model_unsupported: 'The requested model is unsupported by the configured host adapter.',
+            dispatch_refused: 'The host refused the dispatch before native start.',
+            launcher_not_started: 'The maintained launcher did not start a native session.',
+          };
+          launchError = { reason, message: messages[reason] || 'The launch failed without a structured diagnostic; inspect the host launcher receipt.', stage: 'dispatch_route' };
+        }
         if (row.state === 'queued' || row.state === 'held') {
           const hold: any = this.sql.exec('SELECT rejected_json FROM fleet_memory_holds WHERE launch_id = ?', row.fleet_launch_id).toArray()[0];
           memoryRejected = hold ? parsed(hold.rejected_json, []) : [];

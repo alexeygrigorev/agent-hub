@@ -117,6 +117,23 @@ async function claimAs(s: SessionControlService, commandId: string, correlation:
   return data;
 }
 
+describe('failed launch diagnostics', () => {
+  it.each(['admission_unconfigured', 'launcher_not_started', null, 'secret=/private/token'])('projects a safe failure reason for %s', async reason => fixture(async (s, sql) => {
+    const at = new Date().toISOString();
+    ensureFleetLaunch(sql, 'failed-launch', 'hetzner', null, 'failed');
+    sql.exec("UPDATE fleet_launches SET exit_reason = ? WHERE id = 'failed-launch'", reason);
+    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES ('12121212-1212-4212-8212-121212121212', 'test-admin', '12121212-1212-4212-8212-121212121212', '{}', 'failed-launch', 'hetzner', 'headless', 'failed', ?, ?)", at, at);
+    const response = await s.handle(request('/api/sessions/12121212-1212-4212-8212-121212121212', undefined, 'GET'), admin);
+    expect(response.status).toBe(200);
+    const result: any = await response.json();
+    expect(result.state).toBe('failed');
+    expect(result.reason).toBe(reason && /^[a-z][a-z_]{0,63}$/.test(reason) ? reason : 'launcher_failed_without_diagnostic');
+    expect(result.message.length).toBeGreaterThan(10);
+    expect(result.launch_error.reason).toBe(result.reason);
+    expect(JSON.stringify(result)).not.toContain('/private/token');
+  }));
+});
+
 describe('hub session control durable queue', () => {
   it('rejects unauthenticated and unscoped callers', async () => fixture(async (s) => {
     expect((await s.handle(request('/api/sessions', { key: 'k', workspace: 'demo' }), unauth)).status).toBe(401);
