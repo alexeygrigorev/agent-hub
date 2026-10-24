@@ -1,5 +1,7 @@
 # Agent Hub
 
+See [SCOPE.md](SCOPE.md) for ownership and product boundaries.
+
 Generic agent-fleet hub on Cloudflare: authenticated messaging and dashboards, machine subscriptions and shared account quotas, placement of headless agents, and real interactive sessions. See [the generic hub guide](docs/GENERIC-HUB.md) for configuration, CLI commands, execution boundaries and migration. The intended production URL is `https://hub.dtcdev.click`; deployment and physical host acceptance are separate from source availability.
 
 Add an engine account once with `hub engines add --file <private-bundle.json>`; enrolled machines install its binary and isolated aplexer profile automatically. See [account provisioning and the Docker lifecycle test](docs/ENGINE-PROVISIONING.md).
