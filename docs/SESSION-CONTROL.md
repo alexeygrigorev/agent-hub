@@ -561,3 +561,31 @@ argument. It never runs goal text in a shell. Managed accounts keep their
 own profile and protected launch wrapper. Unmanaged routes need a trusted
 `startup_argv`. Ordinary interactive starts still open an empty prompt and
 may use automatic placement without a machine pin.
+
+### Long-running CLI warnings
+
+`hub sessions list` and `hub sessions show <id>` (also `status`) expose
+`long_running`, `runtime` and `idle_for` in seconds, `last_activity_at`, and
+`activity_state`. A running session is long-running strictly after 3 hours;
+no output for more than 1 hour is idle. Runtime starts at native creation when
+available. Activity uses the native output checkpoint reported by the host
+(including output from commits), falling back to creation if no output exists;
+reading status or capturing output does not refresh activity.
+
+Use `--threshold 4h` on list/show/warnings/ack, or set
+`HUB_SESSION_WARNING_THRESHOLD=4h`, to override the 3h default. Durations accept
+positive integer seconds (`s`), minutes (`m`), hours (`h`) or days (`d`).
+
+`hub sessions warnings` lists unsnoozed warnings with the session ID, name/tag,
+intake ID when linked, engine, timing and activity state, five output lines,
+and an exact snooze command. Each output capture has a bounded wait; an
+unreachable host is reported as unavailable without hiding its warning.
+`--json` returns the same information as structured data.
+
+`hub sessions ack <id> [--snooze 3h]` records the authenticated actor, time and
+expiry in a durable `warning_ack` session event. The default snooze duration
+is the selected threshold. Inspect acknowledgements with
+`hub sessions events <id>`. Snoozing hides the warning from `warnings` until
+expiry; list/show still expose the runtime flag and snooze expiry. These
+operations never stop sessions or delete anything. Warnings are displayed
+only in the CLI; no email, webhook or dashboard badge is generated.

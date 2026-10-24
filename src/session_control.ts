@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS session_control_sessions (id TEXT PRIMARY KEY, actor 
 CREATE TABLE IF NOT EXISTS session_control_commands (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, request_key TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, correlation TEXT NOT NULL, poll_at TEXT, ack_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(session_id, actor, request_key));
 CREATE TABLE IF NOT EXISTS session_control_cancellations (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_control_protections (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_warning_events (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, until_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS session_warning_events_session ON session_warning_events(session_id, created_at);
 CREATE TABLE IF NOT EXISTS session_control_proofs (reply_envelope_id TEXT PRIMARY KEY, command_id TEXT NOT NULL, session_id TEXT NOT NULL, created_at TEXT NOT NULL);
 `;
 
@@ -533,7 +535,41 @@ export class SessionControlService {
     }
   }
 
-  private view(row: any) {
+  private warningView(row: any, threshold = 10800) {
+    const binding = parsed(row.binding_json, {});
+    const intent = parsed(row.request_json, {});
+    let native: any = null;
+    if (row.machine_id && binding?.native_id) {
+      native = this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id = ? AND native_id = ?', row.machine_id, binding.native_id).toArray()[0];
+    }
+    const now = this.now();
+    const started = binding?.native_created_at_ms ?? native?.created_at_ms ?? Date.parse(row.created_at);
+    const outputAt = Date.parse(native?.last_activity_at ?? '');
+    const lastActivity = Number.isFinite(outputAt) ? Math.max(started, outputAt) : started;
+    // Imported native sessions can be linked after launch through intake.
+    let intakeId = intent.intake_task_id ?? null;
+    if (!intakeId) {
+      const linked: any = this.sql.exec(`SELECT i.id FROM intake_tasks i, json_each(i.data, '$.history') e
+        WHERE json_extract(e.value, '$.kind') = 'link' AND
+        (json_extract(e.value, '$.hub_session_id') = ? OR
+         (json_extract(e.value, '$.native_id') = ? AND json_extract(e.value, '$.routing_job_id') IS NOT NULL)) LIMIT 1`, row.id, binding?.native_id ?? '').toArray()[0];
+      intakeId = linked?.id ?? null;
+    }
+    const runtime = Math.max(0, (now - started) / 1000);
+    const idleFor = Math.max(0, (now - lastActivity) / 1000);
+    const snooze: any = this.sql.exec('SELECT * FROM session_warning_events WHERE session_id = ? ORDER BY rowid DESC LIMIT 1', row.id).toArray()[0];
+    const longRunning = row.state === 'running' && (!native || native.phase === 'running') && runtime > threshold;
+    return {
+      runtime, idle_for: idleFor, last_activity_at: new Date(lastActivity).toISOString(),
+      long_running: longRunning, activity_state: idleFor > 3600 ? 'idle' : 'active',
+      warning_threshold: threshold, warning_snoozed_until: snooze?.until_at ?? null,
+      warning_active: longRunning && !(snooze && Date.parse(snooze.until_at) > now),
+      intake_id: intakeId,
+      snooze_command: `hub sessions ack ${row.id} --snooze ${threshold}s`,
+    };
+  }
+
+  private view(row: any, threshold: number | null = null) {
     const request = parsed(row.request_json, {});
     const protection: any = this.sql.exec('SELECT request_key, created_at FROM session_control_protections WHERE session_id = ?', row.id).toArray()[0];
     const binding = row.binding_json ? parsed(row.binding_json, null) : null;
@@ -561,6 +597,7 @@ export class SessionControlService {
     }
     const qualified_name = qualified_alias || (typeof request.name === 'string' ? request.name : row.id);
     return {
+      ...(threshold === null ? {} : this.warningView(row, threshold)),
       id: row.id, state: row.state, machine: row.machine_id ?? null, engine: row.engine ?? null,
       model_id: modelSelection?.id ?? null, model: modelSelection?.model ?? null,
       mode: row.mode, access: request.access?.mode || 'legacy_unspecified',
@@ -907,6 +944,9 @@ export class SessionControlService {
     const caller = auth.caller;
     if (!caller) return response({ error: 'unauthorized' }, 401);
 
+    const thresholdRaw = url.searchParams.get('threshold');
+    const threshold = thresholdRaw === null ? 10800 : Number(thresholdRaw);
+    if (!Number.isSafeInteger(threshold) || threshold <= 0 || threshold > 31536000) return response({ error: 'invalid_threshold' }, 400);
     const admin = caller.isAdmin === true;
     const writer = admin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch'));
     const host = caller.kind === 'host' && !!caller.machineId && auth.scopes?.includes('host');
@@ -1298,6 +1338,16 @@ export class SessionControlService {
       return response({ tree: roots, total: views.length });
     }
 
+    if (path === '/api/sessions/warnings' && request.method === 'GET') {
+      if (!writer) return response({ error: 'forbidden' }, 403);
+      this.transaction(() => reconcileUnboundFleetSessions(this.sql, this.now()));
+      const rows = (admin
+        ? this.sql.exec("SELECT * FROM session_control_sessions WHERE state = 'running' ORDER BY created_at, id").toArray()
+        : this.sql.exec("SELECT * FROM session_control_sessions WHERE state = 'running' AND actor = ? ORDER BY created_at, id", caller.actor).toArray()) as any[];
+      const warnings = rows.filter(row => this.ownerOk(row, caller)).map(row => this.view(row, threshold)).filter(row => row.warning_active);
+      return response({ warnings });
+    }
+
     if (path === '/api/sessions' && request.method === 'GET') {
       if (!writer) return response({ error: 'forbidden' }, 403);
       this.transaction(() => reconcileUnboundFleetSessions(this.sql, this.now()));
@@ -1329,7 +1379,7 @@ export class SessionControlService {
       ).filter((r: any) => this.ownerOk(r, caller));
       const page = rows.slice(0, limit);
       const next = rows.length > limit ? `${(page[page.length - 1] as any).created_at}|${(page[page.length - 1] as any).id}` : null;
-      return response({ sessions: page.map(r => this.view(r)), next_cursor: next });
+      return response({ sessions: page.map(r => this.view(r, threshold)), next_cursor: next });
     }
 
     // M15c lifecycle durable seams (narrow; command auth/effect code untouched).
@@ -1569,7 +1619,7 @@ export class SessionControlService {
       });
     }
 
-    const sessionMatch = /^\/api\/sessions\/([^/]{1,128})(\/(send|capture|stop|commands|binding|retry|cancel|protect|retirement))?$/.exec(path);
+    const sessionMatch = /^\/api\/sessions\/([^/]{1,128})(\/(send|capture|stop|commands|binding|retry|cancel|protect|retirement|ack|events))?$/.exec(path);
     if (sessionMatch) {
       const rawRef = decodeURIComponent(sessionMatch[1]);
       const sub = sessionMatch[3];
@@ -1600,7 +1650,7 @@ export class SessionControlService {
       } else if (rawRef.includes(':')) {
         if (sub === 'binding' || sub === 'retirement') return response({ error: 'not_found' }, 404);
         if ((sub === undefined && request.method !== 'GET') ||
-            (sub !== undefined && !(['send', 'capture', 'stop', 'cancel', 'protect'].includes(sub) ? request.method === 'POST' : request.method === 'GET'))) {
+            (sub !== undefined && !(['send', 'capture', 'stop', 'cancel', 'protect', 'ack'].includes(sub) ? request.method === 'POST' : request.method === 'GET'))) {
           return response({ error: 'not_found' }, 404);
         }
         const resolved = this.resolveSessionByQualifiedAlias(rawRef, caller);
@@ -1613,7 +1663,7 @@ export class SessionControlService {
         // binding path stays strict Hub UUID (no alias).
         if (sub === 'binding' || sub === 'retirement') return response({ error: 'not_found' }, 404);
         if ((sub === undefined && request.method !== 'GET') ||
-            (sub !== undefined && !(['send', 'capture', 'stop', 'cancel', 'protect'].includes(sub) ? request.method === 'POST' : request.method === 'GET'))) {
+            (sub !== undefined && !(['send', 'capture', 'stop', 'cancel', 'protect', 'ack'].includes(sub) ? request.method === 'POST' : request.method === 'GET'))) {
           return response({ error: 'not_found' }, 404);
         }
         const resolved = this.resolveSessionByName(rawRef, caller);
@@ -1842,7 +1892,22 @@ export class SessionControlService {
       if (!session || !this.ownerOk(session, caller)) return response({ error: 'not_found' }, 404);
       // Polling a capacity-queued intent adopts any Fleet-side promotion, so
       // the wait is observable without another placement call.
-      if (!sub && request.method === 'GET') return this.transaction(() => response(this.view(this.syncFleetPlacement(session.id) ?? session)));
+      if (!sub && request.method === 'GET') return this.transaction(() => response(this.view(this.syncFleetPlacement(session.id) ?? session, threshold)));
+      if (sub === 'events' && request.method === 'GET') {
+        return response({ events: this.sql.exec('SELECT * FROM session_warning_events WHERE session_id = ? ORDER BY created_at, id', session.id).toArray() });
+      }
+      if (sub === 'ack' && request.method === 'POST') {
+        const input = await body(request);
+        const seconds = input?.snooze ?? threshold;
+        if (!obj(input, ['snooze']) || !Number.isSafeInteger(seconds) || seconds <= 0 || seconds > 31536000) return response({ error: 'invalid_snooze' }, 400);
+        return this.transaction(() => {
+          const live: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0];
+          if (!writer || !live || !this.ownerOk(live, caller)) return response({ error: 'not_found' }, 404);
+          const event = { id: crypto.randomUUID(), session_id: live.id, kind: 'warning_ack', actor: actorName(caller), created_at: this.at(), until_at: new Date(this.now() + seconds * 1000).toISOString() };
+          this.sql.exec('INSERT INTO session_warning_events (id, session_id, kind, actor, created_at, until_at) VALUES (?, ?, ?, ?, ?, ?)', event.id, event.session_id, event.kind, event.actor, event.created_at, event.until_at);
+          return response({ ...this.view(live, threshold), event });
+        });
+      }
       if (sub === 'protect' && request.method === 'POST') {
         const input = await body(request);
         if (!obj(input, ['key']) || !label(input.key)) return response({ error: 'invalid_protection' }, 400);
