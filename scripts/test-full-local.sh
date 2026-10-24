@@ -73,7 +73,18 @@ else
   echo "PASS: Python discovery suite passed"
 fi
 
-echo "=== 6/6: Summary ==="
+echo "=== 6/7: Phone-width browser UI (390x844, light+dark) ==="
+if [ -n "${SKIP_PHONE_UI:-}" ]; then
+  echo "SKIP: SKIP_PHONE_UI is set; phone browser UI not executed."
+elif node test/phone-ui.browser.mjs --out .local/phone-ui; then
+  echo "PASS: Phone-width browser UI passed"
+else
+  PHONE_RC=$?
+  echo "FAIL: Phone-width browser UI exited with code ${PHONE_RC} (needs Playwright Chromium; see test/phone-ui.browser.mjs)"
+  FAILURES=$((FAILURES + 1))
+fi
+
+echo "=== 7/7: Summary ==="
 if [ "${FAILURES}" -gt 0 ]; then
   echo "FAILED: ${FAILURES} suite(s) reported failures. Check logs above."
   exit 1

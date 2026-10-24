@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Intake · Agent Hub</title>
+  <link rel="stylesheet" href="/vendor/dakit/dakit.css"><link rel="stylesheet" href="/auth.css">
+  <link rel="stylesheet" href="/intake.css">
+  <script src="/auth.js"></script>
+  <script src="/intake.js" defer></script>
+</head>
+<body>
+<div class="dk-shell" data-app="agent-hub" data-sidebar="expanded">
+  <a class="dk-skip-link" href="#main-content">Skip to content</a>
+
+  <header class="dk-topbar">
+    <button class="dk-icon-button" type="button" data-dk-drawer-toggle aria-controls="dk-sidebar" aria-expanded="false" aria-label="Open navigation">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+    </button>
+    <a class="dk-topbar__title" href="/">Agent Hub</a>
+    <div class="dk-topbar__end">
+      <nav class="hub-topbar-links" aria-label="Quick links">
+        <a class="hub-topbar-link" href="/sessions.html">Sessions</a>
+        <a class="hub-topbar-link" href="/fleet.html#quota">Usage</a>
+        <a class="hub-topbar-link" href="/metrics.html">Metrics</a>
+      </nav>
+    </div>
+  </header>
+
+  <aside class="dk-sidebar" id="dk-sidebar" aria-label="Workspace">
+    <div class="dk-sidebar__head">
+      <a class="dk-brand" href="/"><span class="dk-brand__tile" aria-hidden="true">AH</span><span class="dk-brand__name">Agent Hub</span></a>
+      <button class="dk-icon-button dk-sidebar__close" type="button" data-dk-drawer-close aria-label="Close navigation">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <nav class="dk-sidebar__nav" aria-label="Primary">
+      <div class="dk-nav-group">
+        <a class="dk-nav-item" href="/intake.html" aria-current="page">
+          <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 4a2 2 0 0 1 6 0M9 11h6M9 15h4"/></svg>
+          <span class="dk-nav-item__label">Intake</span>
+        </a>
+        <a class="dk-nav-item" href="/conversations.html" data-dk-count-label="Conversations">
+          <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a8 8 0 0 1-8 8H5l-2 2V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8Z"/></svg>
+          <span class="dk-nav-item__label">Conversations</span>
+        </a>
+        <a class="dk-nav-item" href="/fleet.html">
+          <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="7" rx="1"/><rect x="3" y="13" width="18" height="7" rx="1"/><path d="M7 8h.01M7 17h.01"/></svg>
+          <span class="dk-nav-item__label">Fleet / Usage</span>
+        </a>
+        <a class="dk-nav-item" href="/sessions.html">
+          <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+          <span class="dk-nav-item__label">Sessions &amp; Lineage</span>
+        </a>
+        <a class="dk-nav-item" href="/metrics.html">
+          <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19V9M10 19V5M16 19v-6M22 19v-3"/></svg>
+          <span class="dk-nav-item__label">Metrics &amp; Usage</span>
+        </a>
+        <a class="dk-nav-item" href="/device">
+          <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M10 18h4"/></svg>
+          <span class="dk-nav-item__label">Pair a device</span>
+        </a>
+      </div>
+    </nav>
+    <div class="dk-sidebar__foot">
+      <button class="dk-account-trigger" type="button" data-dk-popover-trigger="dk-account-menu" aria-expanded="false" aria-controls="dk-account-menu">
+        <span class="dk-avatar dk-avatar--sm" id="account-avatar" aria-hidden="true"><span class="dk-avatar__initials">·</span></span>
+        <span class="dk-account-trigger__name" id="account-name">Signed out</span>
+        <svg class="dk-account-trigger__chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+      </button>
+      <button class="dk-icon-button dk-sidebar__toggle" type="button" data-dk-sidebar-toggle aria-controls="dk-sidebar" aria-expanded="true" aria-label="Collapse sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg>
+      </button>
+    </div>
+  </aside>
+
+  <div class="dk-scrim" data-dk-drawer-close hidden></div>
+
+  <main class="dk-main" id="main-content">
+    <div class="dk-main__inner">
+      <header class="dk-page-header">
+        <div class="dk-page-header__main">
+          <h1 class="dk-page-header__title">Intake</h1>
+          <p class="dk-page-header__subtitle">Tracked work with acceptance criteria. Opening a task reads it; nothing starts.</p>
+        </div>
+      </header>
+
+      <p id="intake-status" role="status" class="dk-muted">Loading intake…</p>
+
+      <section class="dk-card dk-stack intake-card" id="intake-list-section" aria-label="Intake tasks">
+        <div class="dk-cluster intake-controls">
+          <div class="intake-filter-wrap">
+            <label class="dk-visually-hidden" for="intake-filter">Filter tasks</label>
+            <input type="search" id="intake-filter" class="dk-input" placeholder="Filter by title, project, status…" aria-label="Filter tasks">
+          </div>
+          <label class="intake-status-wrap">Status
+            <select id="intake-status-filter" class="dk-select" aria-label="Filter by status">
+              <option value="open">Open</option>
+              <option value="all">All</option>
+              <option value="in_progress">In progress</option>
+              <option value="blocked">Blocked</option>
+              <option value="pending_approval">Pending approval</option>
+              <option value="done">Done</option>
+              <option value="cancelled">Cancelled</option>
+            </select>
+          </label>
+          <button class="dk-button dk-button--secondary" type="button" id="intake-refresh">Refresh</button>
+        </div>
+        <div id="intake-list"></div>
+      </section>
+
+      <section class="dk-card dk-stack intake-card" id="intake-detail-section" aria-label="Task detail" hidden>
+        <div class="intake-detail__bar">
+          <button class="dk-button dk-button--secondary dk-button--sm" type="button" id="intake-detail-back">&larr; Back to intake</button>
+          <button class="dk-button dk-button--secondary dk-button--sm" type="button" id="intake-detail-refresh">Refresh</button>
+        </div>
+        <div class="intake-detail__head">
+          <h2 class="intake-detail__title" id="intake-detail-title">Task</h2>
+          <div class="sessions-card-item__badges" id="intake-detail-badges"></div>
+        </div>
+        <p id="intake-action-status" role="status" class="dk-muted"></p>
+        <div class="intake-detail__meta" id="intake-detail-meta"></div>
+        <div class="dk-stack">
+          <h3 class="session-detail__subtitle">Acceptance criteria</h3>
+          <pre class="session-terminal-pre" id="intake-detail-ac">—</pre>
+        </div>
+        <div class="dk-stack">
+          <h3 class="session-detail__subtitle">Linked sessions</h3>
+          <div id="intake-detail-sessions"></div>
+        </div>
+        <div class="dk-stack">
+          <h3 class="session-detail__subtitle">History</h3>
+          <div id="intake-detail-history"></div>
+        </div>
+        <form class="dk-stack intake-note-form" id="intake-note-form">
+          <label class="dk-field">
+            <span class="dk-field__label">Add a note</span>
+            <textarea class="dk-textarea" id="intake-note-input" rows="3" placeholder="Write a note on this task…"></textarea>
+          </label>
+          <div class="session-send-form__foot">
+            <button class="dk-button dk-button--primary" type="submit" id="intake-note-btn">Add note</button>
+          </div>
+        </form>
+        <form class="dk-stack intake-status-form" id="intake-status-form">
+          <label class="dk-field">Change status
+            <select id="intake-status-select" class="dk-select" aria-label="New status">
+              <option value="open">open</option>
+              <option value="in_progress">in_progress</option>
+              <option value="blocked">blocked</option>
+              <option value="pending_approval">pending_approval</option>
+              <option value="done">done</option>
+              <option value="cancelled">cancelled</option>
+            </select>
+          </label>
+          <div class="session-send-form__foot">
+            <button class="dk-button dk-button--secondary" type="submit" id="intake-status-btn">Save status</button>
+          </div>
+        </form>
+        <div class="dk-stack" id="intake-approve-wrap" hidden>
+          <h3 class="session-detail__subtitle">Pending approval</h3>
+          <p class="dk-muted" id="intake-approve-text"></p>
+          <div class="intake-approve-actions">
+            <button class="dk-button dk-button--primary" type="button" id="intake-approve-btn">Approve</button>
+            <button class="dk-button dk-button--secondary" type="button" id="intake-deny-btn">Deny</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <div class="dk-menu dk-account-menu" id="dk-account-menu" data-dk-popover hidden>
+    <div class="dk-menu__identity">
+      <span class="dk-menu__name" id="menu-name">Signed out</span>
+      <span class="dk-menu__email" id="menu-email"></span>
+    </div>
+    <button class="dk-menu__item" type="button" role="switch" aria-checked="false" data-dk-theme-toggle>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+      Dark mode<span class="dk-switch" aria-hidden="true"></span>
+    </button>
+    <div class="dk-menu__sep" role="separator"></div>
+    <button class="dk-menu__item dk-menu__item--danger" type="button" id="sign-out">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5M21 12H9"/></svg>
+      Sign out
+    </button>
+  </div>
+
+  <div id="dk-live" class="dk-visually-hidden" aria-live="polite"></div>
+</div>
+<script src="/vendor/dakit/shell.js"></script>
+</body>
+</html>

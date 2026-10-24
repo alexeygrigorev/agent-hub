@@ -104,18 +104,23 @@ export default {
     // and the fonts those files reference.
     const PRIVATE_ASSETS = [
       '/', '/index.html',
-      '/fleet.html', '/fleet.js', '/fleet.css',
-      '/engines.html', '/engines.js', '/engines.css',
-      '/conversations.html', '/conversations.js', '/conversations.css',
+      '/fleet', '/fleet.html', '/fleet.js', '/fleet.css',
+      '/engines', '/engines.html', '/engines.js', '/engines.css',
+      '/conversations', '/conversations.html', '/conversations.js', '/conversations.css',
       '/metrics', '/metrics.html', '/metrics.js', '/metrics-charts.js', '/metrics.css',
       '/usage', '/usage.html',
       '/sessions', '/sessions.html', '/sessions.js', '/sessions.css',
+      '/intake', '/intake.html', '/intake.js', '/intake.css',
       '/vendor/dakit/dakit.css', '/vendor/dakit/shell.js', '/vendor/dakit/split.js', '/vendor/dakit/dialogs.js',
       '/vendor/dakit/fonts/inter-var.woff2',
       '/vendor/dakit/fonts/ibm-plex-mono-400.woff2',
       '/vendor/dakit/fonts/ibm-plex-mono-500.woff2'
     ];
-    if (!PRIVATE_ASSETS.includes(url.pathname) && !PUBLIC_AUTH_ASSETS.includes(url.pathname)) {
+    // Phone-friendly intake detail URLs (/intake/<task-id>) are served by the
+    // same static bundle; the client renders the detail from the path and only
+    // ever GETs the task (opening a task never starts a session).
+    const INTAKE_DETAIL = /^\/intake\/[A-Za-z0-9._:-]{1,128}$/;
+    if (!PRIVATE_ASSETS.includes(url.pathname) && !PUBLIC_AUTH_ASSETS.includes(url.pathname) && !INTAKE_DETAIL.test(url.pathname)) {
       return new Response('Not found', { status: 404 });
     }
     const stub = env.HUB.get(env.HUB.idFromName('hub'));
@@ -128,6 +133,10 @@ export default {
     if (url.pathname === '/') url.pathname = '/index.html';
     if (url.pathname === '/metrics' || url.pathname === '/usage' || url.pathname === '/usage.html') url.pathname = '/metrics.html';
     if (url.pathname === '/sessions') url.pathname = '/sessions.html';
+    if (url.pathname === '/fleet') url.pathname = '/fleet.html';
+    if (url.pathname === '/conversations') url.pathname = '/conversations.html';
+    if (url.pathname === '/engines') url.pathname = '/engines.html';
+    if (url.pathname === '/intake' || INTAKE_DETAIL.test(url.pathname)) url.pathname = '/intake.html';
     const asset = await env.ASSETS.fetch(new Request(url, request));
     const headers = new Headers(asset.headers);
     headers.set('Cache-Control', 'private, no-store');
