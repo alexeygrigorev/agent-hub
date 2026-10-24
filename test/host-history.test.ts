@@ -164,11 +164,16 @@ describe('resource history', () => {
   it('shows pre-census native-live counts as unknown without changing stored evidence or valid counted slots', () => fixture((h, hub) => {
     h.record('account','a','',NOW-60000,{used:3,native_live:0},'fleet_account_status');
     h.record('account','a','',NOW,{used:3,native_live:2},'fleet_account_status_census_v2');
+    h.record('sessions','fleet','',NOW-60000,{running:4,failed:7},'fleet_catalog_and_launches');
+    h.record('sessions','fleet','',NOW,{running:35,failed:8},'fleet_catalog_and_launches_census_v2');
     const d=h.query('1h');
+    expect(d.series.find(s=>s.metric==='running').points.filter((p:any)=>p.value!==null).map((p:any)=>p.value)).toEqual([35]);
+    expect(d.series.find(s=>s.metric==='failed').points.filter((p:any)=>p.value!==null).map((p:any)=>p.value)).toEqual([7,8]);
     expect(d.series.find(s=>s.metric==='native_live').points.filter((p:any)=>p.value!==null).map((p:any)=>p.value)).toEqual([2]);
     expect(d.series.find(s=>s.metric==='used').points.filter((p:any)=>p.value!==null).map((p:any)=>p.value)).toEqual([3,3]);
     const old=JSON.parse(String(hub.sql.exec('SELECT payload_json FROM resource_history ORDER BY bucket_ms LIMIT 1').one().payload_json));
     expect(old[0].values.native_live).toBe(0);
+    expect(old.find((o:any)=>o.kind==='sessions').values.running).toBe(4);
   }));
 
   it('prefers simultaneous canonical session counts over stale alias unknowns in either packet order', () => fixture((h, hub) => {

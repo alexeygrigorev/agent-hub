@@ -126,7 +126,8 @@ export class LivenessService {
       if (!hostKnown(s.machine_id)) { state = 'unknown'; detail = `machine ${label(resolved)} is not reporting`; }
       else if (s.alias_observation === 'no_current_native_observation') { state = 'unknown'; detail = 'no current native observation on canonical host'; }
       else if (s.phase === 'unobserved' || s.phase === 'unknown') { state = 'unknown'; detail = 'no positive current native state'; }
-      else if (s.phase !== 'running') { state = 'exited'; detail = `phase ${s.phase}`; }
+      else if (s.phase === 'exited' || s.phase === 'dead') { state = 'exited'; detail = `phase ${s.phase}`; }
+      else if (s.phase !== 'running') { state = ['starting','exiting','uncertain','broken'].includes(s.phase) ? s.phase : 'unknown'; detail = `phase ${s.phase}`; }
       // Only agent engines can stall; a quiet shell is usually a long-running command.
       else if (s.agent_state === 'working' && s.engine && s.engine !== 'shell' && activity !== null && activity > t.agentStallS) { state = 'stalled'; detail = `reported working but no terminal activity for ${activity}s`; }
       else if (s.agent_state === 'working') { state = 'working'; detail = activity === null ? 'working' : `active ${activity}s ago`; }

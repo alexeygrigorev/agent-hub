@@ -240,8 +240,8 @@ describe('fleet health visibility + machine aliasing', () => {
 
  it('keeps absent native observations unknown rather than asserting exit', () => fixture(async ({live,sql}) => {
    machine(sql,'absence-host','absence-host',now);
-   sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('absence-host','n1','missing','unobserved',?,'demo')",iso(-86400000));
+   for(const phase of ['unobserved','unknown','uncertain','starting','exiting']) sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('absence-host',?,?,?,?,'demo')",phase,phase,phase,iso(-86400000));
    sql.exec("INSERT INTO fleet_catalog_seen VALUES('absence-host',?)",iso(0));
-   const s=live.evaluate().subjects.find(s=>s.kind==='session' && s.machine_id==='absence-host');
-   expect(s?.state).toBe('unknown');
+   const subjects=live.evaluate().subjects.filter(s=>s.kind==='session' && s.machine_id==='absence-host');
+   for(const phase of ['unobserved','unknown','uncertain','starting','exiting']) expect(subjects.find(s=>s.id.endsWith('/'+phase))?.state).toBe(['unobserved','unknown'].includes(phase)?'unknown':phase);
  }));

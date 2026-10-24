@@ -147,7 +147,7 @@ export class HostHistoryService {
       (SELECT COUNT(*) FROM fleet_launches f WHERE f.machine_id=ids.machine_id AND f.state='failed') AS failed
       FROM (SELECT id AS machine_id FROM machines UNION SELECT DISTINCT machine_id FROM fleet_launches) ids LIMIT 129`)) {
       this.record('sessions', 'fleet', String(row.machine_id || ''), now,
-        { running: row.machine_id ? this.nativeRunning(row.machine_id, now) : null, queued: Number(row.queued), failed: Number(row.failed) }, 'fleet_catalog_and_launches');
+        { running: row.machine_id ? this.nativeRunning(row.machine_id, now) : null, queued: Number(row.queued), failed: Number(row.failed) }, 'fleet_catalog_and_launches_census_v2');
     }
     this.flush();
     this.sql.exec("INSERT OR REPLACE INTO resource_history_meta VALUES('sample',?)", now);
@@ -221,7 +221,9 @@ export class HostHistoryService {
             groups.set(key,series);
           }
           const index=Math.floor((o.at-first)/step), previous=series.points[index];
-          const proven = o.kind==='account' && metric==='native_live' && o.source==='fleet_account_status' ? null : numeric(value);
+          const legacyNative = o.kind==='account' && metric==='native_live' && o.source==='fleet_account_status';
+          const legacyRunning = o.kind==='sessions' && metric==='running' && o.source==='fleet_catalog_and_launches';
+          const proven = legacyNative || legacyRunning ? null : numeric(value);
           // Simultaneous alias gauges must not overwrite the canonical host's
           // real running count with the stale alias's unknown/zero projection.
           if (!previous.observed_at || o.at>previous.at || (o.at===previous.at && o.machine_id===host)) series.points[index]={at:o.at,value:proven,observed_at:new Date(o.at).toISOString()};
