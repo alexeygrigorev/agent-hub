@@ -7,7 +7,6 @@ import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
 import intakeHtml from '../public/intake.html?raw';
 import intakeJs from '../public/intake.js?raw';
-import intakeCss from '../public/intake.css?raw';
 import enginesHtml from '../public/engines.html?raw';
 import sessionsJs from '../public/sessions.js?raw';
 import conversationsJs from '../public/conversations.js?raw';
@@ -149,7 +148,11 @@ describe('F7 phone routes and intake pages', () => {
       expect(html, name).toContain('data-dk-drawer-toggle');
       expect(html, name).toContain('shell.js');
     }
-    expect(intakeCss).toMatch(/@media\s*\(max-width:\s*820px\)/);
+    // Stylesheet wiring is pinned here; rule content (media queries, tokens)
+    // is pinned on the file bytes in test/test_phone_ui.py, and layout in
+    // test/phone-ui.browser.mjs (Workers turn CSS ?raw imports empty).
+    expect(intakeHtml).toContain('/intake.css');
+    expect(enginesHtml).toContain('/engines.css');
     for (const [name, body] of [['intake.html', intakeHtml], ['intake.js', intakeJs], ['engines.html', enginesHtml]] as const) {
       for (const token of ['xterm', 'node-pty', 'ssh2', 'pocketshell', 'PTY', 'SSHCredential']) {
         expect(body, `${name} must not contain ${token}`).not.toContain(token);
