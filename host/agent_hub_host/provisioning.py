@@ -277,11 +277,34 @@ def set_toml_top_level_keys(content: str, keys: dict[str, str]) -> str:
     return header.rstrip('\n') + '\n'
 
 
-def install_managed_engine_permissions(bundle=None, home=None):
+def ensure_toml_trusted_projects(content: str, paths: list[str]) -> str:
+    """Ensure paths have [projects."<path>"] trust_level = "trusted" in TOML content."""
+    res = content
+    for p in paths:
+        if not p:
+            continue
+        try:
+            p_str = str(Path(p).resolve())
+        except Exception:
+            p_str = str(p)
+        pattern = re.compile(r'^[ \t]*\[projects\.' + re.escape(json.dumps(p_str)) + r'\][ \t]*$', re.M)
+        if pattern.search(res):
+            continue
+        alt_pattern = re.compile(r'^[ \t]*\[projects\."' + re.escape(p_str) + r'"\][ \t]*$', re.M)
+        if alt_pattern.search(res):
+            continue
+        if res and not res.endswith('\n'):
+            res += '\n'
+        res += f'\n[projects.{json.dumps(p_str)}]\ntrust_level = "trusted"\n'
+    return res
+
+
+def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=None):
     """Ensure managed engine home configuration has approval and sandbox prompts disabled.
 
     Reconciles on every bootstrap/re-bootstrap and execution to match operator config:
     - codex / zai: approval_policy = "never", sandbox_mode = "danger-full-access" in .codex/config.toml
+      plus [projects."<path>"] trust_level = "trusted" for workspaces and operator roots.
     - claude: skipDangerousModePermissionPrompt = True in .claude/settings.json
     - go (opencode): permission.* = "allow" in .config/opencode/opencode.json
     """
@@ -289,6 +312,17 @@ def install_managed_engine_permissions(bundle=None, home=None):
         return
     home = Path(home)
     provider = bundle.get('provider') if isinstance(bundle, dict) else None
+
+    # Determine default paths to trust for Codex / Zai
+    paths_to_trust = [
+        str(Path.home().resolve()),
+        str((Path.home() / 'git').resolve()),
+        str((Path.home() / 'tmp').resolve()),
+        '/tmp',
+        '/data/tmp',
+    ]
+    if trusted_paths:
+        paths_to_trust.extend(trusted_paths)
 
     # Codex and Z.ai (zcodex)
     if provider in ('codex', 'zai') or provider is None:
@@ -305,6 +339,7 @@ def install_managed_engine_permissions(bundle=None, home=None):
                 'approval_policy': 'never',
                 'sandbox_mode': 'danger-full-access',
             })
+            updated = ensure_toml_trusted_projects(updated, paths_to_trust)
             with private_fs.parent(config_toml, create=True):
                 pass
             private_fs.atomic_write(config_toml, updated.encode('utf-8'), 131072)
@@ -327,6 +362,7 @@ def install_managed_engine_permissions(bundle=None, home=None):
                 'approval_policy': 'never',
                 'sandbox_mode': 'danger-full-access',
             })
+            updated = ensure_toml_trusted_projects(updated, paths_to_trust)
             with private_fs.parent(zconfig_toml, create=True):
                 pass
             private_fs.atomic_write(zconfig_toml, updated.encode('utf-8'), 131072)
@@ -1207,6 +1243,14 @@ def execute():
         validate(b)
         home = dest / 'home'
         provision_managed_home(b, home, dest)
+        cwd = str(Path(os.getcwd()).resolve())
+        p = Path(cwd)
+        git_root = str(p)
+        for parent in [p] + list(p.parents):
+            if (parent / '.git').exists():
+                git_root = str(parent)
+                break
+        install_managed_engine_permissions(b, home, trusted_paths=[cwd, git_root])
         _, binary, _ = PACKAGES[b['provider']]
         command = engine_argv(b, dest)
         env = engine_environment(b, home, dest)

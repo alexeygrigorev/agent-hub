@@ -1144,6 +1144,9 @@ def test_execute_bypasses_permissions_for_goal_and_interactive(tmp_path, monkeyp
     cfg_text = (dest / 'home' / '.codex' / 'config.toml').read_text()
     assert 'approval_policy = "never"' in cfg_text
     assert 'sandbox_mode = "danger-full-access"' in cfg_text
+    cwd_str = str(Path(os.getcwd()).resolve())
+    assert f'[projects."{cwd_str}"]' in cfg_text or f'[projects.\"{cwd_str}\"]' in cfg_text
+    assert 'trust_level = "trusted"' in cfg_text
     calls.clear()
 
     # Case 2: Interactive launch that already has bypass flag does not duplicate it
@@ -1162,6 +1165,18 @@ def test_execute_bypasses_permissions_for_goal_and_interactive(tmp_path, monkeyp
     assert '--dangerously-bypass-approvals-and-sandbox' not in argv
     assert argv[-1] == '--version'
     calls.clear()
+
+
+def test_ensure_toml_trusted_projects():
+    initial = 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n\n[projects."/home/alexey"]\ntrust_level = "trusted"\n'
+    res = p.ensure_toml_trusted_projects(initial, ['/home/alexey', '/tmp/foo/bar', '/home/alexey/git'])
+    assert '[projects."/home/alexey"]' in res
+    assert '[projects."/tmp/foo/bar"]' in res
+    assert '[projects."/home/alexey/git"]' in res
+    # Ensure idempotency
+    res2 = p.ensure_toml_trusted_projects(res, ['/tmp/foo/bar'])
+    assert res2.count('/tmp/foo/bar') == 1
+
 
 
 
