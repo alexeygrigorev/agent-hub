@@ -314,7 +314,16 @@ export class FleetService {
   }
 
   private reconciliationCandidates(machine: string) {
-    return this.sql.exec("SELECT id, workspace, request_json, launch_error_json, native_id, engine, mode, launcher_task_id FROM fleet_launches WHERE machine_id = ? AND state IN ('starting','running','uncertain') ORDER BY updated_at LIMIT 100", machine).toArray().map((r: any) => {
+    // Hosts report their complete catalog before polling offers. Avoid one
+    // redundant native retirement probe per fresh live workload each cycle;
+    // stale, absent and ambiguous observations still need positive proof.
+    const cutoff = new Date(this.now() - 180000).toISOString();
+    return this.sql.exec(`SELECT l.id, l.workspace, l.request_json, l.launch_error_json, l.native_id, l.engine, l.mode, l.launcher_task_id
+      FROM fleet_launches l WHERE l.machine_id = ? AND l.state IN ('starting','running','uncertain')
+      AND (l.native_id IS NULL OR NOT EXISTS (SELECT 1 FROM fleet_sessions s
+        WHERE s.machine_id = l.machine_id AND s.native_id = l.native_id AND s.engine = l.engine
+        AND s.phase IN ('starting','running') AND s.observed_at >= ?))
+      ORDER BY l.updated_at LIMIT 100`, machine, cutoff).toArray().map((r: any) => {
       let binding = null;
       try { binding = parsed((this.sql.exec('SELECT binding_json FROM session_control_sessions WHERE fleet_launch_id = ? AND machine_id = ?', r.id, machine).toArray()[0] as any)?.binding_json); } catch { /* optional control store */ }
       return { id: r.id, workspace: r.workspace, cwd: parsed(r.request_json).cwd ?? null, diagnostic: parsed(r.launch_error_json), native_id: r.native_id, engine: r.engine, mode: r.mode, launcher_task_id: r.launcher_task_id, binding };

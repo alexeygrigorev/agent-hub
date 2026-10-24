@@ -41,6 +41,26 @@ async function configure(s: FleetService, shared = false) {
 }
 
 describe('phantom account reservations', () => {
+  it('probes missing, stale and ambiguous bindings without polling every fresh live native', () => fixture(async (f, sql) => {
+    await configure(f);
+    const launch: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    sql.exec("UPDATE fleet_launches SET state = 'running', native_id = 'probe-native' WHERE id = ?", launch.id);
+    const candidates = async () => (await (await f.handle(request('/reconciliation', undefined, 'GET'), host('hetzner'))).json() as any).launches.map((r: any) => r.id);
+    expect(await candidates()).toEqual([launch.id]);
+    sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account,created_at_ms) VALUES ('hetzner','probe-native','task','codex','running',?,'/repo','shared-codex',?)", iso(), now);
+    expect(await candidates()).toEqual([]);
+    sql.exec("UPDATE fleet_sessions SET phase = 'starting' WHERE native_id = 'probe-native'");
+    expect(await candidates()).toEqual([]);
+    for (const phase of ['broken', 'unknown', 'unobserved', 'exited']) {
+      sql.exec("UPDATE fleet_sessions SET phase = ? WHERE native_id = 'probe-native'", phase);
+      expect(await candidates()).toEqual([launch.id]);
+    }
+    sql.exec("UPDATE fleet_sessions SET phase = 'running', observed_at = ? WHERE native_id = 'probe-native'", iso(-180001));
+    expect(await candidates()).toEqual([launch.id]);
+    const foreign: any = await (await f.handle(request('/reconciliation', undefined, 'GET'), host('win35'))).json();
+    expect(foreign.launches).toEqual([]);
+  }));
+
   it('alerts with account numbers after ten minutes of phantom capacity queueing', () => fixture(async (f, sql) => {
     await configure(f);
     const first: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
