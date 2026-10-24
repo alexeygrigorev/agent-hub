@@ -42,14 +42,18 @@ def resolve_aplexer_state_dir(state_dir: Optional[str] = None) -> str:
     """Resolve trusted aplexer state directory.
 
     Order of resolution:
-    1. Explicit non-empty `state_dir` argument.
+    1. Explicit non-empty `state_dir` argument (str or path-like).
     2. `APLEXER_STATE_DIR` environment variable.
     3. `$XDG_STATE_HOME/aplexer` if `XDG_STATE_HOME` is set.
     4. Default: `~/.local/state/aplexer`.
     """
-    if isinstance(state_dir, str) and state_dir.strip():
-        candidate = os.path.abspath(state_dir.strip())
-        return canonicalize_workspace(candidate)
+    if state_dir is not None:
+        # F5: accept path-like (tests pass Path); str() first so explicit
+        # Path inputs resolve exactly like the old Path(...) inline logic.
+        text = os.fspath(state_dir) if isinstance(state_dir, os.PathLike) else state_dir
+        if isinstance(text, str) and text.strip():
+            candidate = os.path.abspath(text.strip())
+            return canonicalize_workspace(candidate)
 
     env_state = os.environ.get("APLEXER_STATE_DIR")
     if env_state and env_state.strip():

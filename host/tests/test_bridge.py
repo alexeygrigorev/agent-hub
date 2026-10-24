@@ -747,10 +747,48 @@ sys.exit(0)
             r3 = get_authoritative_runtime_dir(None)
             self.assertEqual(r3, "/xdg/runtime/aplexer")
 
-        # 4. Default /tmp/aplexer-<uid>
+        # 4. Default: /run/user/<uid>/aplexer when the manager provides
+        # /run/user/<uid> (aplexer paths.rs), else /tmp/aplexer-<uid> (F5).
         with patch.dict(os.environ, {}, clear=True):
             r4 = get_authoritative_runtime_dir(None)
-            self.assertTrue(r4.startswith("/tmp/aplexer-"))
+            self.assertTrue(
+                r4.startswith("/run/user/") or r4.startswith("/tmp/aplexer-"),
+                f"unexpected runtime default {r4!r}",
+            )
+
+    def test_runtime_dir_prefers_run_user_when_present(self):
+        """F5: /run/user/<uid> present -> /run/user/<uid>/aplexer (aplexer paths.rs)."""
+        import getpass
+
+        try:
+            uid = os.geteuid()
+        except AttributeError:
+            self.skipTest("no geteuid on this platform")
+        run_user = f"/run/user/{uid}"
+        if not os.path.isdir(run_user):
+            self.skipTest(f"{run_user} absent on this host; tmp fallback covered above")
+        with patch.dict(os.environ, {}, clear=True):
+            resolved = get_authoritative_runtime_dir(None)
+            self.assertEqual(resolved, os.path.abspath(f"{run_user}/aplexer"))
+
+    def test_launcher_recovery_uses_shared_state_dir_helper(self):
+        """F5: launcher_recovery resolves state via retired_native helper (XDG included)."""
+        from agent_hub_host import launcher_recovery
+        from agent_hub_host.retired_native import resolve_aplexer_state_dir
+        import inspect
+
+        source = inspect.getsource(launcher_recovery.settle_retired_legacy)
+        self.assertIn(
+            "resolve_aplexer_state_dir",
+            source,
+            "settle_retired_legacy must use the shared helper, not a fourth copy",
+        )
+        with patch.dict(
+            os.environ, {"XDG_STATE_HOME": "/xdg/state"}, clear=True
+        ):
+            self.assertEqual(
+                resolve_aplexer_state_dir(None), "/xdg/state/aplexer"
+            )
 
     def test_distinct_runtime_and_state_directories_no_mirror(self):
         """Sessions live only in runtime_dir and messages only in state_dir with NO state session mirror."""
