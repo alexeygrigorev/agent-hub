@@ -2446,7 +2446,10 @@ export class SessionControlService {
         }
         if (state === 'acked' && row.kind === 'stop') {
           this.sql.exec("UPDATE session_control_sessions SET state = 'stopped', updated_at = ? WHERE id = ?", at, session.id);
-          this.sql.exec("UPDATE fleet_launches SET state = 'exited', finished_at = ?, updated_at = ?, verification_status = 'verified' WHERE id = ? AND machine_id = ? AND native_id = ?", at, at, session.fleet_launch_id, session.machine_id, input.native.native_id);
+          // The control binding can survive a lost launcher receipt while
+          // Fleet.native_id remains unknown. The exact bound exit proof above
+          // settles that linked reservation too; a conflicting native stays held.
+          this.sql.exec("UPDATE fleet_launches SET state = 'exited', finished_at = ?, updated_at = ?, verification_status = 'verified' WHERE id = ? AND machine_id = ? AND (native_id = ? OR native_id IS NULL)", at, at, session.fleet_launch_id, session.machine_id, input.native.native_id);
         }
         return response({ command_id: row.id, state });
       });

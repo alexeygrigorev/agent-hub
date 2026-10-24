@@ -75,6 +75,32 @@ describe('stop delivery for adopted sessions', () => {
       expect(sql.exec('SELECT state FROM session_control_sessions WHERE id = ?',nativeId).one().state).toBe('stopped');
     });
   });
+  it.each([null, 'deadbeef-aaaa-4aaa-8aaa-aaaaaaaaaaaa'])('settles a linked unknown Fleet native, preserving conflicting custody (%s)', async (fleetNative) => {
+    await fixture(async (s,sql) => {
+      adoptObservedNativeSessions(sql,'stop-host',[native()],Date.now(),'current-family');
+      const launchId = crypto.randomUUID(), at = new Date().toISOString();
+      sql.exec(`INSERT INTO fleet_launches
+        (id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at)
+        VALUES (?,'stop-test','human','stop fixture',?,'{}','stop-host','shell','stop-account','headless','/srv/stop-test','','uncertain',?,?,?)`,
+        launchId,launchId,fleetNative,at,at);
+      sql.exec('UPDATE session_control_sessions SET fleet_launch_id = ? WHERE id = ?',launchId,nativeId);
+      await s.handle(req('/api/sessions/'+nativeId+'/stop',{key:'linked-stop'}),admin);
+      const offers = await (await s.handle(req('/api/session-commands/offers'),host)).json() as any;
+      const offer = offers.offers[0];
+      const claim = await (await s.handle(req('/api/session-commands/'+offer.command_id+'/claim',
+        {correlation:offer.correlation,attempt_id:crypto.randomUUID()}),host)).json() as any;
+      const ack = await s.handle(req('/api/session-commands/'+offer.command_id+'/ack',
+        {correlation:offer.correlation,claim_token:claim.claim_token,outcome:'delivered',confirmed_exit:true,
+          native:{native_id:nativeId,tag:'stop-test',workspace:'/srv/stop-test'}}),host);
+      expect(ack.status).toBe(200);
+      const launch = sql.exec('SELECT state,native_id,verification_status FROM fleet_launches WHERE id = ?',launchId).one();
+      expect(launch.state).toBe(fleetNative === null ? 'exited' : 'uncertain');
+      expect(launch.native_id).toBe(fleetNative);
+      if (fleetNative === null) expect(launch.verification_status).toBe('verified');
+      else expect(launch.verification_status).not.toBe('verified');
+      expect(sql.exec('SELECT state FROM session_control_sessions WHERE id = ?',nativeId).one().state).toBe('stopped');
+    });
+  });
   it('resolves unique UUID prefixes, and reports all visible ambiguous matches', async () => {
     await fixture(async (s,sql) => {
       adoptObservedNativeSessions(sql,'stop-host',[native()],Date.now(),'current-family');
