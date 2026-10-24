@@ -1016,6 +1016,155 @@ def test_managed_home_rebootstrap_reapplies_state_hooks(tmp_path, monkeypatch):
     assert any('state-report idle' in cmd for cmd in stop_cmds)
 
 
+def test_set_toml_top_level_keys():
+    # 1. Empty content
+    res1 = p.set_toml_top_level_keys("", {"approval_policy": "never", "sandbox_mode": "danger-full-access"})
+    assert 'approval_policy = "never"' in res1
+    assert 'sandbox_mode = "danger-full-access"' in res1
+
+    # 2. Existing [subtable] - keys must be inserted before subtable
+    orig2 = '[projects."/test"]\ntrust_level = "trusted"\n'
+    res2 = p.set_toml_top_level_keys(orig2, {"approval_policy": "never", "sandbox_mode": "danger-full-access"})
+    assert 'approval_policy = "never"' in res2
+    assert 'sandbox_mode = "danger-full-access"' in res2
+    assert '[projects."/test"]' in res2
+    # Verify keys appear before the section header
+    sec_idx = res2.index('[projects."/test"]')
+    assert res2.index('approval_policy = "never"') < sec_idx
+    assert res2.index('sandbox_mode = "danger-full-access"') < sec_idx
+
+    # 3. Existing top-level keys updated
+    orig3 = 'approval_policy = "on-request"\nsandbox_mode = "workspace-write"\nmodel = "gpt-5"\n'
+    res3 = p.set_toml_top_level_keys(orig3, {"approval_policy": "never", "sandbox_mode": "danger-full-access"})
+    assert 'approval_policy = "never"' in res3
+    assert 'sandbox_mode = "danger-full-access"' in res3
+    assert 'approval_policy = "on-request"' not in res3
+    assert 'sandbox_mode = "workspace-write"' not in res3
+    assert 'model = "gpt-5"' in res3
+
+
+def test_provision_managed_home_permissions_for_all_engines(tmp_path, monkeypatch):
+    root_dir = tmp_path / 'managed'
+    root_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: root_dir)
+
+    # 1. Codex: ensures .codex/config.toml has approval_policy="never" and sandbox_mode="danger-full-access"
+    b_codex = bundle()
+    b_codex['provider'] = 'codex'
+    b_codex['label'] = 'test-codex'
+    dest_codex = root_dir / f"{b_codex['label']}-{b_codex['revision']}"
+    home_codex = dest_codex / 'home'
+    p.provision_managed_home(b_codex, home_codex, dest_codex)
+
+    codex_conf = home_codex / '.codex' / 'config.toml'
+    assert codex_conf.is_file()
+    assert oct(codex_conf.stat().st_mode & 0o777) == oct(0o600)
+    text = codex_conf.read_text(encoding='utf-8')
+    assert 'approval_policy = "never"' in text
+    assert 'sandbox_mode = "danger-full-access"' in text
+
+    # Simulate existing config.toml with projects and re-provision (reconcile)
+    codex_conf.write_text('[projects."/workspace"]\ntrust_level = "trusted"\n')
+    p.provision_managed_home(b_codex, home_codex, dest_codex)
+    text2 = codex_conf.read_text(encoding='utf-8')
+    assert 'approval_policy = "never"' in text2
+    assert 'sandbox_mode = "danger-full-access"' in text2
+    assert '[projects."/workspace"]' in text2
+
+    # 2. Z.ai (zcodex): ensures .zcodex/config.toml has approval_policy="never" and sandbox_mode="danger-full-access"
+    b_zai = bundle()
+    b_zai['provider'] = 'zai'
+    b_zai['label'] = 'test-zai'
+    dest_zai = root_dir / f"{b_zai['label']}-{b_zai['revision']}"
+    home_zai = dest_zai / 'home'
+    p.provision_managed_home(b_zai, home_zai, dest_zai)
+
+    zcodex_conf = home_zai / '.zcodex' / 'config.toml'
+    assert zcodex_conf.is_file()
+    assert oct(zcodex_conf.stat().st_mode & 0o777) == oct(0o600)
+    ztext = zcodex_conf.read_text(encoding='utf-8')
+    assert 'approval_policy = "never"' in ztext
+    assert 'sandbox_mode = "danger-full-access"' in ztext
+
+    # 3. Claude: ensures .claude/settings.json has skipDangerousModePermissionPrompt=True
+    b_claude = bundle()
+    b_claude['provider'] = 'claude'
+    b_claude['label'] = 'test-claude'
+    dest_claude = root_dir / f"{b_claude['label']}-{b_claude['revision']}"
+    home_claude = dest_claude / 'home'
+    p.provision_managed_home(b_claude, home_claude, dest_claude)
+
+    claude_settings = home_claude / '.claude' / 'settings.json'
+    assert claude_settings.is_file()
+    assert oct(claude_settings.stat().st_mode & 0o777) == oct(0o600)
+    claude_data = json.loads(claude_settings.read_text(encoding='utf-8'))
+    assert claude_data.get('skipDangerousModePermissionPrompt') is True
+
+    # 4. OpenCode (go): ensures .config/opencode/opencode.json has permission.* = "allow"
+    b_go = bundle()
+    b_go['provider'] = 'go'
+    b_go['label'] = 'test-go'
+    dest_go = root_dir / f"{b_go['label']}-{b_go['revision']}"
+    home_go = dest_go / 'home'
+    p.provision_managed_home(b_go, home_go, dest_go)
+
+    opencode_conf = home_go / '.config' / 'opencode' / 'opencode.json'
+    assert opencode_conf.is_file()
+    assert oct(opencode_conf.stat().st_mode & 0o777) == oct(0o600)
+    op_data = json.loads(opencode_conf.read_text(encoding='utf-8'))
+    assert op_data.get('permission', {}).get('*') == 'allow'
+
+
+def test_execute_bypasses_permissions_for_goal_and_interactive(tmp_path, monkeypatch):
+    root_dir = tmp_path / 'managed'
+    root_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: root_dir)
+    monkeypatch.delenv('CODEX_LAUNCH_WRAPPER', raising=False)
+
+    b = bundle()
+    b['provider'] = 'codex'
+    b['label'] = 'my-codex'
+    dest = root_dir / f"{b['label']}-{b['revision']}"
+    dest.mkdir(parents=True, mode=0o700)
+    p.write_json(dest / 'bundle.json', b)
+    p.write_json(root_dir / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': b['provider']}])
+
+    calls = []
+    monkeypatch.setattr(p.os, 'execve', lambda cmd, argv, env: calls.append((cmd, argv, env)))
+    monkeypatch.setattr(p, 'check_codex_quota_gate', lambda env: (True, 'ok'))
+
+    # Case 1: --with-goal execution appends --dangerously-bypass-approvals-and-sandbox
+    monkeypatch.setattr(sys, 'argv', ['execute', 'my-codex', '/goal Fix the flaky binding'])
+    p.execute()
+    assert len(calls) == 1
+    cmd, argv, env = calls[0]
+    assert '--dangerously-bypass-approvals-and-sandbox' in argv
+    assert argv[-1] == '/goal Fix the flaky binding'
+    # Verify config.toml in home was also provisioned with approval_policy="never"
+    cfg_text = (dest / 'home' / '.codex' / 'config.toml').read_text()
+    assert 'approval_policy = "never"' in cfg_text
+    assert 'sandbox_mode = "danger-full-access"' in cfg_text
+    calls.clear()
+
+    # Case 2: Interactive launch that already has bypass flag does not duplicate it
+    monkeypatch.setattr(sys, 'argv', ['execute', 'my-codex', '--dangerously-bypass-approvals-and-sandbox'])
+    p.execute()
+    assert len(calls) == 1
+    cmd, argv, env = calls[0]
+    assert argv.count('--dangerously-bypass-approvals-and-sandbox') == 1
+    calls.clear()
+
+    # Case 3: Diagnostic --version does NOT append bypass flag
+    monkeypatch.setattr(sys, 'argv', ['execute', 'my-codex', '--version'])
+    p.execute()
+    assert len(calls) == 1
+    cmd, argv, env = calls[0]
+    assert '--dangerously-bypass-approvals-and-sandbox' not in argv
+    assert argv[-1] == '--version'
+    calls.clear()
+
+
+
 
 
 

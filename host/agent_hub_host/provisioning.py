@@ -248,10 +248,154 @@ def install_aplexer_state_hooks(bundle=None, home=None):
                     pass
 
 
+def set_toml_top_level_keys(content: str, keys: dict[str, str]) -> str:
+    """Ensure top-level string keys are set in a TOML string without disrupting existing tables."""
+    lines = content.splitlines(keepends=True)
+    split_idx = len(lines)
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith('[') and not stripped.startswith('#'):
+            split_idx = i
+            break
+
+    header = ''.join(lines[:split_idx])
+    rest = ''.join(lines[split_idx:])
+
+    for key, val in keys.items():
+        pattern = re.compile(r'^[ \t]*' + re.escape(key) + r'[ \t]*=.*$', re.M)
+        new_entry = f'{key} = "{val}"'
+        if pattern.search(header):
+            header = pattern.sub(new_entry, header)
+        else:
+            if header and not header.endswith('\n'):
+                header += '\n'
+            header = header + new_entry + '\n'
+
+    if rest:
+        header = header.rstrip('\n') + '\n\n'
+        return header + rest
+    return header.rstrip('\n') + '\n'
+
+
+def install_managed_engine_permissions(bundle=None, home=None):
+    """Ensure managed engine home configuration has approval and sandbox prompts disabled.
+
+    Reconciles on every bootstrap/re-bootstrap and execution to match operator config:
+    - codex / zai: approval_policy = "never", sandbox_mode = "danger-full-access" in .codex/config.toml
+    - claude: skipDangerousModePermissionPrompt = True in .claude/settings.json
+    - go (opencode): permission.* = "allow" in .config/opencode/opencode.json
+    """
+    if home is None:
+        return
+    home = Path(home)
+    provider = bundle.get('provider') if isinstance(bundle, dict) else None
+
+    # Codex and Z.ai (zcodex)
+    if provider in ('codex', 'zai') or provider is None:
+        if provider == 'codex' or provider is None:
+            codex_dir = home / '.codex'
+            config_toml = codex_dir / 'config.toml'
+            content = ''
+            if config_toml.is_file():
+                try:
+                    content = private_fs.read_bytes(config_toml, 131072).decode('utf-8')
+                except Exception:
+                    content = ''
+            updated = set_toml_top_level_keys(content, {
+                'approval_policy': 'never',
+                'sandbox_mode': 'danger-full-access',
+            })
+            with private_fs.parent(config_toml, create=True):
+                pass
+            private_fs.atomic_write(config_toml, updated.encode('utf-8'), 131072)
+            if os.name != 'nt':
+                try:
+                    os.chmod(config_toml, 0o600)
+                except OSError:
+                    pass
+
+        if provider in ('zai', None):
+            zcodex_dir = home / '.zcodex'
+            zconfig_toml = zcodex_dir / 'config.toml'
+            content = ''
+            if zconfig_toml.is_file():
+                try:
+                    content = private_fs.read_bytes(zconfig_toml, 131072).decode('utf-8')
+                except Exception:
+                    content = ''
+            updated = set_toml_top_level_keys(content, {
+                'approval_policy': 'never',
+                'sandbox_mode': 'danger-full-access',
+            })
+            with private_fs.parent(zconfig_toml, create=True):
+                pass
+            private_fs.atomic_write(zconfig_toml, updated.encode('utf-8'), 131072)
+            if os.name != 'nt':
+                try:
+                    os.chmod(zconfig_toml, 0o600)
+                except OSError:
+                    pass
+
+    # Claude Code
+    if provider in ('claude', None):
+        claude_dir = home / '.claude'
+        settings_path = claude_dir / 'settings.json'
+        settings = {}
+        if settings_path.is_file():
+            try:
+                settings = json.loads(private_fs.read_bytes(settings_path, 131072).decode('utf-8'))
+            except Exception:
+                settings = {}
+        if not isinstance(settings, dict):
+            settings = {}
+        settings['skipDangerousModePermissionPrompt'] = True
+        perms = settings.setdefault('permissions', {})
+        if isinstance(perms, dict):
+            perms.setdefault('deny', ['AskUserQuestion'])
+        with private_fs.parent(settings_path, create=True):
+            pass
+        private_fs.atomic_write(settings_path, json.dumps(settings, indent=2).encode('utf-8'), 131072)
+        if os.name != 'nt':
+            try:
+                os.chmod(settings_path, 0o600)
+            except OSError:
+                pass
+
+    # OpenCode (go)
+    if provider in ('go', None):
+        opencode_dir = home / '.config' / 'opencode'
+        opencode_path = opencode_dir / 'opencode.json'
+        opencode_conf = {}
+        if opencode_path.is_file():
+            try:
+                opencode_conf = json.loads(private_fs.read_bytes(opencode_path, 131072).decode('utf-8'))
+            except Exception:
+                opencode_conf = {}
+        if not isinstance(opencode_conf, dict):
+            opencode_conf = {}
+        perm = opencode_conf.setdefault('permission', {})
+        if isinstance(perm, dict):
+            perm['*'] = 'allow'
+            ext = perm.setdefault('external_directory', {})
+            if isinstance(ext, dict):
+                ext.setdefault('**', 'allow')
+                ext.setdefault('~/git/**', 'allow')
+                ext.setdefault('~/tmp/**', 'allow')
+                ext.setdefault('/tmp/**', 'allow')
+        with private_fs.parent(opencode_path, create=True):
+            pass
+        private_fs.atomic_write(opencode_path, json.dumps(opencode_conf, indent=2).encode('utf-8'), 131072)
+        if os.name != 'nt':
+            try:
+                os.chmod(opencode_path, 0o600)
+            except OSError:
+                pass
+
+
 def provision_managed_home(bundle=None, home=None, dest=None):
     """Shared provisioning hook point for managed engine homes.
 
-    Provisions .gitconfig, credentials, and state hooks into home.
+    Provisions .gitconfig, credentials, state hooks, and permission bypass into home.
     Re-applies idempotently on re-bootstrap or home recreation.
     """
     if home is None:
@@ -291,6 +435,9 @@ def provision_managed_home(bundle=None, home=None, dest=None):
 
     # 3. Provision aplexer state hooks
     install_aplexer_state_hooks(bundle, home)
+
+    # 4. Provision engine permissions (approvals disabled, full access)
+    install_managed_engine_permissions(bundle, home)
 
     return home
 
@@ -1094,7 +1241,20 @@ def execute():
                 i += 1
             argv = command + run_cmd
         else:
-            argv = command + b['args'] + extra_argv
+            is_diagnostic = b['args'] + extra_argv in (["--version"], ["-v"], ["--help"], ["-h"])
+            bypass_flags = []
+            if not is_diagnostic:
+                if b['provider'] in ('codex', 'zai'):
+                    if '--dangerously-bypass-approvals-and-sandbox' not in extra_argv and '--dangerously-bypass-approvals-and-sandbox' not in b.get('args', []):
+                        if not extra_argv or extra_argv[0] != 'exec':
+                            bypass_flags = ['--dangerously-bypass-approvals-and-sandbox']
+                elif b['provider'] == 'claude':
+                    if '--dangerously-skip-permissions' not in extra_argv and '--dangerously-skip-permissions' not in b.get('args', []):
+                        bypass_flags = ['--dangerously-skip-permissions']
+                elif b['provider'] == 'gemini':
+                    if '--dangerously-skip-permissions' not in extra_argv and '--dangerously-skip-permissions' not in b.get('args', []):
+                        bypass_flags = ['--dangerously-skip-permissions']
+            argv = command + b['args'] + bypass_flags + extra_argv
         is_diagnostic = b['args'] + extra_argv in (["--version"], ["-v"], ["--help"], ["-h"])
         if b['provider'] == 'codex' and not is_diagnostic:
             allowed, reason = check_codex_quota_gate(env)
@@ -1231,7 +1391,7 @@ def command(args):
                     raise ValueError('Invalid subscription token file')
                 env['ZAI_API_KEY'] = token
                 files['.config/goz/config.json'] = json.dumps({'zai_token': token, 'zai_base_url': 'https://api.z.ai/api/anthropic'})
-                files['.zcodex/config.toml'] = 'model = "glm-5.3-flash"\nmodel_provider = "zcode"\n\n[model_providers.zcode]\nname = "zcode"\nbase_url = "https://api.z.ai/api/anthropic"\nwire_api = "zcode"\n'
+                files['.zcodex/config.toml'] = 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\nmodel = "glm-5.3-flash"\nmodel_provider = "zcode"\n\n[model_providers.zcode]\nname = "zcode"\nbase_url = "https://api.z.ai/api/anthropic"\nwire_api = "zcode"\n'
             elif args.auth_file:
                 raw_auth = private_fs.read_bytes(Path(args.auth_file).expanduser().absolute(), 32768).decode()
                 try:
@@ -1242,7 +1402,7 @@ def command(args):
                         raise ValueError('Invalid auth file content')
                     env['ZAI_API_KEY'] = token
                     files['.config/goz/config.json'] = json.dumps({'zai_token': token, 'zai_base_url': 'https://api.z.ai/api/anthropic'})
-                    files['.zcodex/config.toml'] = 'model = "glm-5.3-flash"\nmodel_provider = "zcode"\n\n[model_providers.zcode]\nname = "zcode"\nbase_url = "https://api.z.ai/api/anthropic"\nwire_api = "zcode"\n'
+                    files['.zcodex/config.toml'] = 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\nmodel = "glm-5.3-flash"\nmodel_provider = "zcode"\n\n[model_providers.zcode]\nname = "zcode"\nbase_url = "https://api.z.ai/api/anthropic"\nwire_api = "zcode"\n'
                 else:
                     if isinstance(auth_json, dict):
                         if 'oauth:zai:access_token' in auth_json or 'zcodejwttoken' in auth_json:
@@ -1264,7 +1424,7 @@ def command(args):
                                 files['.config/goz/config.json'] = json.dumps({'zai_token': tok, 'zai_base_url': 'https://api.z.ai/api/anthropic'})
                         else:
                             raise ValueError('Native file has no Z.ai credential')
-                        files['.zcodex/config.toml'] = 'model = "glm-5.3-flash"\nmodel_provider = "zcode"\n\n[model_providers.zcode]\nname = "zcode"\nbase_url = "https://api.z.ai/api/anthropic"\nwire_api = "zcode"\n'
+                        files['.zcodex/config.toml'] = 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\nmodel = "glm-5.3-flash"\nmodel_provider = "zcode"\n\n[model_providers.zcode]\nname = "zcode"\nbase_url = "https://api.z.ai/api/anthropic"\nwire_api = "zcode"\n'
                     else:
                         raise ValueError('Invalid auth file format')
             else:
@@ -1280,6 +1440,8 @@ def command(args):
                 files[auth_path] = json.dumps({'opencode-go': native_auth['opencode-go']})
         if args.config_file:
             files[config_path] = private_fs.read_bytes(Path(args.config_file).expanduser().absolute(), 16000).decode()
+        elif args.provider == 'codex':
+            files[config_path] = 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n'
         default_args = ['--model', 'opencode-go/muse-spark-1.3-contributor'] if args.provider == 'go' else (['--model', 'glm-5.3-flash'] if args.provider == 'zai' else [])
         bundle = {'label': args.label, 'provider': args.provider, 'version': args.version or version, 'files': files,
                   'env': env, 'args': default_args}
