@@ -453,7 +453,7 @@ export class FleetService {
         const provider = definitions.get(route.account)?.provider;
         const family = provider === 'codex-orin' ? 'codex' : provider;
         if (!overrideModels.some(m => m.engine === route.engine && m.provider === family &&
-            (m.profile === route.profile || (m.profile === null && route.profile !== null)))) continue;
+            (m.profile === route.profile || route.profile === 'hub-' + route.account || (m.profile === null && route.profile !== null)))) continue;
       }
       if (tierModels) {
         const provider = definitions.get(route.account)?.provider;
@@ -461,7 +461,7 @@ export class FleetService {
         // never merely with an executable (Z.ai also uses the Codex engine).
         const family = provider === 'codex-orin' ? 'codex' : provider;
         if (!tierModels.some(m => (!overrideModels.length || overrideModels.some(o => o.id === m.id)) && m.engine === route.engine && m.provider === family &&
-            (m.profile === route.profile || (m.profile === null && route.profile !== null)))) {
+            (m.profile === route.profile || route.profile === 'hub-' + route.account || (m.profile === null && route.profile !== null)))) {
           rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'tier_unavailable' });
           continue;
         }
@@ -502,7 +502,7 @@ export class FleetService {
       const family = definitions.get(route.account)?.provider === 'codex-orin' ? 'codex' : definitions.get(route.account)?.provider;
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
-      const model = policy.models.find(m => members.includes(m.id) && (!overrideModels.length || m.id === input.engine) && m.engine === route.engine && m.provider === family && (m.profile === route.profile || (m.profile === null && route.profile !== null)));
+      const model = policy.models.find(m => members.includes(m.id) && (!overrideModels.length || m.id === input.engine) && m.engine === route.engine && m.provider === family && (m.profile === route.profile || route.profile === 'hub-' + route.account || (m.profile === null && route.profile !== null)));
       if (!model) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'model_unsupported' }); continue; }
       const pending = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND state IN ${ACTIVE}`, route.machine_id).one().n);
       const routingInstalled = this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'routing_machines'").toArray().length;

@@ -13,6 +13,7 @@ from agent_hub_host.session_control import render_table
 
 @pytest.mark.parametrize('engine,provider,model_id', [
     ('antigravity', 'antigravity', 'argon'), ('codex', 'codex', 'astra'),
+    ('codex', 'zai', 'glm-flash'),
     ('codex', 'codex', 'sol'), ('codex', 'codex', 'luna'),
     ('claude', 'claude', 'opus'), ('claude', 'claude', 'haiku'),
 ])
@@ -21,7 +22,7 @@ def test_model_survives_default_subscription(engine, provider, model_id, mode):
     model = next(m for m in policy_models() if m['id'] == model_id and m['engine'] == engine)
     with tempfile.TemporaryDirectory() as tmp:
         workspace = Path(tmp)
-        profile = 'hub-test-account' if provider in ('codex', 'claude') else None
+        profile = 'hub-test-account' if provider in ('codex', 'claude', 'zai') else None
         sub = dict(service=provider, engine=engine, account_label='test-account', profile=profile,
                    launcher_provider=provider, launcher_model='wrong-daily-default', admission_argv=['gate'],
                    startup_argv=['native-bin', '--model', 'wrong-daily-default'])

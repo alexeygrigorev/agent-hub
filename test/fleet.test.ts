@@ -67,6 +67,14 @@ describe('generic accounts and launch placement', () => {
     sql.exec("UPDATE fleet_accounts SET provider='zai' WHERE label='shared-codex'");
     expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).selected).toBeNull();
     expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'tier_unavailable' });
+    // A centrally managed account profile replaces the adapter profile name.
+    sql.exec("UPDATE fleet_routes SET profile='hub-shared-codex' WHERE machine_id='hetzner'");
+    await s.handle(request('/subscriptions', { subscriptions: [{ service: 'zai', account: 'shared-codex', plan: 'pro', quota }] }, 'PUT'), host('hetzner'));
+    for (const selector of [{}, { tier: 'daily' }, { engine: 'glm-flash' }]) {
+      expect(s.plan(intent({ machine: 'hetzner', ...selector })).selected?.selection).toMatchObject({ id: 'glm-flash', model: 'glm-5.3-flash' });
+    }
+    expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).selected).toBeNull();
+
   }));
   it('resolves Astra to live Codex accounts, preserving pins, tiers and replay', async () => fixture(async (s, sql) => {
     await configure(s);
