@@ -380,6 +380,39 @@ def maybe_start_role_consumer_thread(current: Optional[threading.Thread], consum
         return current
 
 
+def maintenance_step_once(dispatcher, quota_collector):
+    """Placement and quota can take minutes; never run them on the command loop."""
+    started = time.monotonic()
+    try:
+        results = dispatcher.once()
+        print(json.dumps({'event': 'fleet_cycle', 'results': len(results)}), flush=True)
+    except Exception as error:
+        print(json.dumps({'event': 'fleet_error', 'type': type(error).__name__}), flush=True)
+    try:
+        before = quota_collector.last_collect_monotonic
+        snapshot = quota_collector.step()
+        if before != quota_collector.last_collect_monotonic:
+            print(json.dumps({'event': 'quota_cycle', 'reported': snapshot is not None,
+                              'held': bool(quota_collector.last_hold),
+                              'error': bool(quota_collector.last_error)}), flush=True)
+    except Exception as error:
+        print(json.dumps({'event': 'quota_error', 'type': type(error).__name__}), flush=True)
+    print(json.dumps({'event': 'maintenance_cycle',
+                      'elapsed_s': round(time.monotonic() - started, 3)}), flush=True)
+
+
+def maybe_start_maintenance_thread(current, dispatcher, quota_collector):
+    # Single inflight preserves Fleet dispatch and quota ownership. No extra
+    # controller or native-effect receiver, and no unbounded executor pool.
+    if current is not None and current.is_alive():
+        return current
+    thread = threading.Thread(target=maintenance_step_once,
+                              args=(dispatcher, quota_collector),
+                              daemon=True, name='fleet-maintenance')
+    thread.start()
+    return thread
+
+
 def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=None):
     if interval < 1 or fleet_interval < interval:
         raise ValueError('Invalid host polling intervals')
@@ -495,6 +528,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         )
         role_consumer_thread: Optional[threading.Thread] = None
         next_fleet = 0
+        maintenance_thread = None
         count = 0
         # Operator fleet settings (workspaces map, workspace_roots,
         # subscriptions, launcher) are re-read when the file changes, so a
@@ -505,7 +539,11 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         settings_mtime = fleet_settings_mtime(settings_path)
         try:
             while not stop.is_set() and (cycles is None or count < cycles):
-                reloaded, settings_mtime = maybe_reload_fleet_settings(settings_path, settings_mtime)
+                # Apply settings between maintenance rounds, so an in-flight
+                # dispatch cannot mix the old allowlist with new credentials.
+                reloaded = None
+                if maintenance_thread is None or not maintenance_thread.is_alive():
+                    reloaded, settings_mtime = maybe_reload_fleet_settings(settings_path, settings_mtime)
                 if reloaded is not None:
                     settings = reloaded
                     dispatcher.settings = reloaded
@@ -513,11 +551,8 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                     roots = get_cleanup_roots(reloaded)
                     print(json.dumps({'event': 'settings_reloaded'}), flush=True)
                 if time.monotonic() >= next_fleet:
-                    try:
-                        results = dispatcher.once()
-                        print(json.dumps({'event': 'fleet_cycle', 'results': len(results)}), flush=True)
-                    except Exception as error:
-                        print(json.dumps({'event': 'fleet_error', 'type': type(error).__name__}), flush=True)
+                    maintenance_thread = maybe_start_maintenance_thread(
+                        maintenance_thread, dispatcher, quota_collector)
                     next_fleet = time.monotonic() + fleet_interval
                 # A failed subscription/placement cycle must not prevent stop,
                 # capture, or late delivery reconciliation on existing sessions.
@@ -533,15 +568,6 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                         cleanup_roots=roots, settings=None))
                 except Exception as error:
                     print(json.dumps({'event': 'commands_error', 'type': type(error).__name__}), flush=True)
-                try:
-                    before = quota_collector.last_collect_monotonic
-                    snapshot = quota_collector.step()
-                    if before != quota_collector.last_collect_monotonic:
-                        print(json.dumps({'event': 'quota_cycle', 'reported': snapshot is not None,
-                                           'held': bool(quota_collector.last_hold),
-                                           'error': bool(quota_collector.last_error)}), flush=True)
-                except Exception as error:
-                    print(json.dumps({'event': 'quota_error', 'type': type(error).__name__}), flush=True)
                 # Status observation never blocks commands/quota: one bounded
                 # single-inflight daemon thread, skipped while alive.
                 status_thread = maybe_start_status_thread(status_thread, status_collector)

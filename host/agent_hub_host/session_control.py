@@ -6,8 +6,10 @@ sibling host worker; this module performs no native effects and imports no
 native adapters. See docs/SESSION-CONTROL.md (proposal, pending head ACK).
 """
 import argparse
+import contextvars
 import http.client
 import json
+import math
 import os
 import re
 import socket
@@ -27,6 +29,8 @@ TIERS = ('quick', 'daily', 'deep')
 WAIT_DEFAULT_TIMEOUT = 300.0
 WAIT_MAX_TIMEOUT = 600.0
 WAIT_MIN_INTERVAL = 1.0
+CAPTURE_TIMEOUT = 30.0
+_request_deadline = contextvars.ContextVar('session_request_deadline', default=None)
 # Terminal command states: only these confirm an outcome. `transported` alone
 # is fetch/PTY bytes, never processing proof; waiting never treats it as done.
 TERMINAL_COMMAND = ('acked', 'refused', 'uncertain', 'failed')
@@ -158,6 +162,12 @@ def request(method, path, payload=None):
         req = urllib.request.Request(base.rstrip('/') + path, data=data, method=method,
                                      headers={'Authorization': 'Bearer ' + access, 'Content-Type': 'application/json'})
         try:
+            deadline = _request_deadline.get()
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SessionTransportError('capture_not_acked')
+                return api.safe_http_json(req, timeout=min(10.0, remaining))
             return api.safe_http_json(req)
         except urllib.error.HTTPError:
             raise
@@ -170,7 +180,7 @@ def request(method, path, payload=None):
     try:
         return send(token)
     except urllib.error.HTTPError as exc:
-        if exc.code == 401 and not env_token:
+        if exc.code == 401 and not env_token and _request_deadline.get() is None:
             try:
                 auth.refresh_token()
                 return send(auth.get_access_token())
@@ -229,12 +239,12 @@ def check_session_name(name):
     return name
 
 
-def add_wait(parser):
+def add_wait(parser, *, timeout=WAIT_DEFAULT_TIMEOUT, interval=5.0):
     parser.add_argument('--wait', action='store_true',
                         help='Poll until a terminal state (bounded); never claims transport as delivery')
-    parser.add_argument('--timeout', type=float, default=WAIT_DEFAULT_TIMEOUT,
-                        help='Max seconds to wait (1..600, default 300)')
-    parser.add_argument('--interval', type=float, default=5.0,
+    parser.add_argument('--timeout', type=float, default=timeout,
+                        help='Max seconds to wait (1..600, default %g)' % timeout)
+    parser.add_argument('--interval', type=float, default=interval,
                         help='Seconds between polls (min 1)')
 
 
@@ -244,7 +254,7 @@ def check_wait_args(args):
         interval = float(getattr(args, 'interval', 5.0))
         if not 1 <= timeout <= WAIT_MAX_TIMEOUT:
             raise ValueError('Timeout must be between 1 and 600 seconds')
-        if interval < WAIT_MIN_INTERVAL:
+        if not math.isfinite(interval) or interval < WAIT_MIN_INTERVAL:
             raise ValueError('Interval must be at least 1 second')
         return timeout, interval
     return None, None
@@ -252,12 +262,15 @@ def check_wait_args(args):
 
 def wait_until(deadline, interval, fetch, done, label):
     while True:
+        if _request_deadline.get() is not None and time.monotonic() >= deadline:
+            raise ValueError('%s timed out; re-check status with the same key, do not blind-retry' % label)
         result = fetch()
         if done(result):
             return result
         if time.monotonic() >= deadline:
             raise ValueError('%s timed out; re-check status with the same key, do not blind-retry' % label)
-        time.sleep(interval)
+        time.sleep(min(interval, max(0, deadline - time.monotonic()))
+                   if _request_deadline.get() is not None else interval)
 
 
 def _fetch_command_entry(session_id, command_id):
@@ -354,6 +367,8 @@ def wait_for_session(session_id, timeout, interval, *, stopping=False):
 
 def wait_for_command(session_id, command_id, timeout, interval):
     deadline = time.monotonic() + timeout
+    if _request_deadline.get() is not None:
+        deadline = min(deadline, _request_deadline.get())
     last_status = [None]
     def _fetch():
         entry = _fetch_command_entry(session_id, command_id)
@@ -437,7 +452,7 @@ def add_commands(sub):
     capture.add_argument('--max-bytes', type=int, default=65536)
     capture.add_argument('--screen', action='store_true', help='Capture current rendered screen (plain) instead of raw tail')
     capture.add_argument('--key', help='Stable idempotency key; printed back for safe retry after lost responses')
-    add_wait(capture)
+    add_wait(capture, timeout=CAPTURE_TIMEOUT, interval=1.0)
     capture.set_defaults(wait=True)
     capture.add_argument('--no-wait', dest='wait', action='store_false',
                          help='Return the queued command receipt without waiting for capture output')
@@ -532,6 +547,20 @@ def match_session_state(entry: dict, wanted: str) -> bool:
 
 
 def execute(args):
+    # Capture's budget covers enqueue, every paginated HTTP request and sleep.
+    # A context-local deadline cannot affect concurrent host receiver requests.
+    if getattr(args, 'sessions_cmd', None) == 'capture':
+        timeout, _ = check_wait_args(args)
+        if timeout is not None:
+            token = _request_deadline.set(time.monotonic() + timeout)
+            try:
+                return _execute(args)
+            finally:
+                _request_deadline.reset(token)
+    return _execute(args)
+
+
+def _execute(args):
     import uuid
     cmd = getattr(args, 'sessions_cmd', None)
     if cmd is None:
@@ -700,6 +729,7 @@ def execute(args):
             raise ValueError('Invalid protection key' if cmd == 'protect' else 'Invalid cancellation key')
         return request('POST', '/api/sessions/' + quote(args.id, safe='') + '/' + cmd, {'key': args.key})
     if cmd in ('send', 'capture', 'stop'):
+        timeout, interval = check_wait_args(args)
         key = getattr(args, 'key', None) or str(uuid.uuid4())
         if cmd == 'send':
             if getattr(args, 'prompt', None) is not None and getattr(args, 'body_file', None):
@@ -730,14 +760,32 @@ def execute(args):
             raise ValueError(msg) from None
         queued = dict(queued, client_key=key)
         if queued.get('warning') == 'target_no_reported_state':
-            import sys
             sys.stderr.write('Warning: target session has no recent reported state\n')
-        timeout, interval = check_wait_args(args)
         if timeout is not None:
             if cmd == 'stop':
                 queued['stop_wait'] = wait_for_session(args.id, timeout, interval, stopping=True)
             else:
-                queued['command_wait'] = wait_for_command(args.id, queued['command_id'], timeout, interval)
+                command_id = queued['command_id']
+                if cmd == 'capture':
+                    print(f'Capture command {command_id}: waiting for host acknowledgement (timeout {timeout:g}s)', file=sys.stderr, flush=True)
+                try:
+                    queued['command_wait'] = wait_for_command(args.id, command_id, timeout, interval)
+                except ValueError as exc:
+                    if cmd != 'capture':
+                        raise
+                    reason = 'host_unreachable' if isinstance(exc, SessionTransportError) and time.monotonic() < _request_deadline.get() else 'capture_not_acked'
+                    raise SessionInputError(f'{reason}; command {command_id}; inspect commands before retrying with the same key') from None
+                if cmd == 'capture':
+                    entry = queued['command_wait']
+                    ack = entry.get('ack') or {}
+                    if entry.get('state') != 'acked':
+                        reason = ack.get('reason')
+                        if not isinstance(reason, str) or not SAFE_ERROR.fullmatch(reason):
+                            reason = 'capture_failed'
+                        raise SessionInputError(f'{reason}; command {command_id}')
+                    capture = ack.get('capture')
+                    if not isinstance(capture, str) or not capture.strip():
+                        raise SessionInputError(f'capture_empty; command {command_id}')
         return queued
     if cmd == 'host-receive':
         if not getattr(args, 'once', False):

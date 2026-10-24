@@ -120,10 +120,10 @@ class TestSessionControlCli(unittest.TestCase):
 
     def test_capture_waits_for_correlated_output_by_default(self):
         with patch.object(session_control, 'request', return_value={'command_id': 'c1'}) as transport, \
-                patch.object(session_control, 'wait_for_command', return_value={'state': 'acked', 'ack': {'output': 'screen'}}) as wait:
+                patch.object(session_control, 'wait_for_command', return_value={'state': 'acked', 'ack': {'capture': 'screen'}}) as wait:
             result = session_control.execute(self.parse('capture', 'sid', '--screen', '--key', 'k'))
-        wait.assert_called_once_with('sid', 'c1', 300.0, 5.0)
-        self.assertEqual(result['command_wait']['ack']['output'], 'screen')
+        wait.assert_called_once_with('sid', 'c1', 30.0, 1.0)
+        self.assertEqual(result['command_wait']['ack']['capture'], 'screen')
 
     def test_route_rejections_are_bounded_codes_without_provider_details(self):
         import os
