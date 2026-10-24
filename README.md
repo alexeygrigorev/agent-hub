@@ -256,3 +256,20 @@ the Client API from the zipapp, run it under `uv run --no-project --with
 aplexer-client==0.1.19 python /path/to/hub.pyz ...`, or use the uv project install
 above. This release changes host/CLI code only; it requires updating the host
 package/environment, with no Worker deployment.
+
+### Managed Engine Git Identity Configuration
+
+Hub-managed engines run with an isolated `HOME` per engine bundle. To ensure `git commit` succeeds across all managed engines without relying on system-wide git config, configure git identity in host configuration (`subscriptions.json` or `host.json`):
+
+```json
+{
+  "version": 1,
+  "git": {
+    "user.name": "Alexey Grigorev",
+    "user.email": "alexey.s.grigoriev@gmail.com",
+    "push.default": "simple"
+  }
+}
+```
+
+During host and engine bootstrap, Hub writes `.gitconfig` to each managed engine's `HOME` and re-applies on re-bootstrap or home recreation. Launched sessions additionally receive `GIT_AUTHOR_*` and `GIT_COMMITTER_*` environment variables as a fallback.

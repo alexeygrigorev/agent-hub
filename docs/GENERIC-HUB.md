@@ -56,12 +56,19 @@ Each machine owns `~/.config/agent-hub/subscriptions.json`, or `%APPDATA%\agent-
 {
   "version":1,
   "workspaces":{"project":"/absolute/path/to/project"},
+  "git":{
+    "user.name":"Alexey Grigorev",
+    "user.email":"alexey.s.grigoriev@gmail.com",
+    "push.default":"simple"
+  },
   "subscriptions":[
     {"service":"codex","account_label":"shared-codex","plan":"pro","engine":"codex","profile":null,"admission_argv":["/absolute/path/to/maintained-admission-adapter"]},
     {"service":"codex","account_label":"second-codex","plan":null,"engine":"codex","profile":"secondary","quota_argv":["/absolute/path/to/secondary-quota-adapter"],"admission_argv":["/absolute/path/to/secondary-admission-adapter"]}
   ]
 }
 ```
+
+Git identity (`user.name`, `user.email`, optional signing keys or push defaults) is configured under `"git"` in `subscriptions.json` (or `host.json`). During host/engine bootstrap, Hub writes `.gitconfig` to each managed engine's `HOME` and re-applies on re-bootstrap or home recreation. Launched sessions also receive `GIT_AUTHOR_*` and `GIT_COMMITTER_*` environment variables as a fallback.
 
 Labels and configured plans are explicit declarations. The default Claude tier can be detected through `claude auth status --json`. The default Codex tier can be detected through local app-server `account/read` with token refresh disabled. Neither probe copies email addresses, account IDs or tokens into reports. Other plans remain unknown unless their status adapter reports a recognized tier or the local configuration supplies one.
 

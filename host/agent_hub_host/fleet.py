@@ -180,6 +180,52 @@ def subscriptions_path():
     return base / "agent-hub" / "subscriptions.json"
 
 
+def validate_git_identity_config(conf):
+    if not isinstance(conf, dict):
+        raise ValueError("git identity setting must be a mapping")
+    for k, v in conf.items():
+        if not isinstance(k, str) or not k or len(k) > 128 or "\0" in k or "\n" in k:
+            raise ValueError("Invalid git config key")
+        if isinstance(v, dict):
+            for sub_k, sub_v in v.items():
+                if not isinstance(sub_k, str) or not sub_k or len(sub_k) > 128 or "\0" in sub_k or "\n" in sub_k:
+                    raise ValueError("Invalid git config subkey")
+                if not isinstance(sub_v, (str, int, float, bool)) or len(str(sub_v)) > 1024 or "\0" in str(sub_v) or "\n" in str(sub_v):
+                    raise ValueError("Invalid git config value")
+        elif not isinstance(v, (str, int, float, bool)) or len(str(v)) > 1024 or "\0" in str(v) or "\n" in str(v):
+            raise ValueError("Invalid git config value")
+
+
+def normalize_git_identity(conf) -> dict[str, str]:
+    if not isinstance(conf, dict):
+        return {}
+    res: dict[str, str] = {}
+    for k, v in conf.items():
+        if isinstance(v, dict):
+            for sub_k, sub_v in v.items():
+                full_key = f"{k}.{sub_k}".lower()
+                res[full_key] = str(sub_v)
+        else:
+            k_lower = k.lower()
+            if k_lower in ("name", "user_name", "user.name"):
+                res["user.name"] = str(v)
+            elif k_lower in ("email", "user_email", "user.email"):
+                res["user.email"] = str(v)
+            elif k_lower in ("signing_key", "signingkey", "user.signingkey"):
+                res["user.signingkey"] = str(v)
+            elif k_lower in ("gpg_sign", "gpgsign", "commit.gpgsign"):
+                res["commit.gpgsign"] = "true" if (v is True or str(v).lower() in ("true", "1", "yes")) else str(v)
+            elif k_lower in ("push_default", "push.default"):
+                res["push.default"] = str(v)
+            elif k_lower in ("push_auto_setup_remote", "push.autosetupremote"):
+                res["push.autosetupremote"] = "true" if (v is True or str(v).lower() in ("true", "1", "yes")) else str(v)
+            elif "." in k:
+                res[k] = str(v)
+            else:
+                res[f"user.{k}"] = str(v)
+    return res
+
+
 def load_settings(path=None):
     """Explicit non-secret machine configuration, including several accounts per service."""
     default_path = path is None
@@ -190,8 +236,11 @@ def load_settings(path=None):
         if path.stat().st_size > 65536:
             raise ValueError("Subscription configuration exceeds 64 KiB")
         data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "workspace_roots", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv", "role_consumer", "role_config", "journal_dir"} or data.get("version") != 1:
+    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "workspace_roots", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv", "role_consumer", "role_config", "journal_dir", "git", "git_identity"} or data.get("version") != 1:
         raise ValueError("Invalid subscription configuration")
+    git_conf = data.get("git") if "git" in data else data.get("git_identity")
+    if git_conf is not None:
+        validate_git_identity_config(git_conf)
     if "journal_dir" in data:
         journal = data["journal_dir"]
         if not isinstance(journal, str) or not journal or "\0" in journal or not Path(journal).is_absolute():
@@ -1256,6 +1305,16 @@ class Dispatcher:
                 argv += ["--profile", offer["profile"]]
             if target_cwd != workspace:
                 argv += ["--cwd", str(target_cwd)]
+            git_ident = normalize_git_identity(self.settings.get("git") if "git" in self.settings else self.settings.get("git_identity"))
+            if not git_ident:
+                from . import provisioning
+                git_ident = provisioning.load_git_identity()
+            git_name = git_ident.get("user.name") or git_ident.get("name")
+            git_email = git_ident.get("user.email") or git_ident.get("email")
+            if git_name:
+                argv += ["--env", f"GIT_AUTHOR_NAME={git_name}", "--env", f"GIT_COMMITTER_NAME={git_name}"]
+            if git_email:
+                argv += ["--env", f"GIT_AUTHOR_EMAIL={git_email}", "--env", f"GIT_COMMITTER_EMAIL={git_email}"]
             if with_goal or sub.get("startup_argv"):
                 launch = sub.get('startup_argv')
                 if with_goal and sub.get('account_label') in self._managed_labels:

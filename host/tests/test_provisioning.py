@@ -830,6 +830,144 @@ def test_claude_uses_native_claude_quota(tmp_path, monkeypatch):
         assert mock_probe.called
 
 
+def test_normalize_and_render_git_identity():
+    # Direct keys
+    raw1 = {"user.name": "Alexey Grigorev", "user.email": "alexey.s.grigoriev@gmail.com", "push.default": "simple"}
+    norm1 = p.normalize_git_identity(raw1)
+    assert norm1["user.name"] == "Alexey Grigorev"
+    assert norm1["user.email"] == "alexey.s.grigoriev@gmail.com"
+    assert norm1["push.default"] == "simple"
+
+    rendered1 = p.render_gitconfig(norm1)
+    assert "[user]" in rendered1
+    assert "\tname = Alexey Grigorev" in rendered1
+    assert "\temail = alexey.s.grigoriev@gmail.com" in rendered1
+    assert "[push]" in rendered1
+    assert "\tdefault = simple" in rendered1
+
+    # Shorthand keys
+    raw2 = {"name": "Alexey Grigorev", "email": "alexey.s.grigoriev@gmail.com", "signing_key": "KEY123", "push_default": "current"}
+    norm2 = p.normalize_git_identity(raw2)
+    assert norm2["user.name"] == "Alexey Grigorev"
+    assert norm2["user.email"] == "alexey.s.grigoriev@gmail.com"
+    assert norm2["user.signingkey"] == "KEY123"
+    assert norm2["push.default"] == "current"
+
+    # Nested section mapping
+    raw3 = {"user": {"name": "Alexey Grigorev", "email": "alexey.s.grigoriev@gmail.com"}, "push": {"default": "matching"}}
+    norm3 = p.normalize_git_identity(raw3)
+    assert norm3["user.name"] == "Alexey Grigorev"
+    assert norm3["user.email"] == "alexey.s.grigoriev@gmail.com"
+    assert norm3["push.default"] == "matching"
+
+
+def test_provision_managed_home_and_rebootstrap(tmp_path, monkeypatch):
+    tmp_path.chmod(0o700)
+    root_dir = tmp_path / 'managed'
+    root_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: root_dir)
+
+    configured_git = {
+        "user.name": "Alexey Grigorev",
+        "user.email": "alexey.s.grigoriev@gmail.com",
+        "push.default": "simple",
+    }
+    monkeypatch.setattr(p, 'load_git_identity', lambda: configured_git)
+
+    b = bundle()
+    dest = root_dir / f"{b['label']}-{b['revision']}"
+    dest.mkdir(parents=True, mode=0o700)
+    home = dest / 'home'
+
+    # Initial home provisioning
+    p.provision_managed_home(b, home, dest)
+    gitconfig = home / '.gitconfig'
+    assert gitconfig.is_file()
+    content = gitconfig.read_text(encoding='utf-8')
+    assert 'name = Alexey Grigorev' in content
+    assert 'email = alexey.s.grigoriev@gmail.com'
+    assert 'default = simple' in content
+    assert oct(gitconfig.stat().st_mode & 0o777) == oct(0o600)
+
+    # Re-apply on home recreation / re-bootstrap even if bundle.json matches receipt
+    p.write_json(dest / 'bundle.json', b)
+    gitconfig.unlink()
+    assert not gitconfig.exists()
+    p.install(b)
+    assert gitconfig.is_file()
+    assert 'name = Alexey Grigorev' in gitconfig.read_text(encoding='utf-8')
+
+
+def test_engine_environment_fallback_git_env(tmp_path, monkeypatch):
+    configured_git = {
+        "user.name": "Alexey Grigorev",
+        "user.email": "alexey.s.grigoriev@gmail.com",
+    }
+    monkeypatch.setattr(p, 'load_git_identity', lambda: configured_git)
+
+    b = bundle()
+    env = p.engine_environment(b, tmp_path / 'home', dest=tmp_path)
+    assert env['GIT_AUTHOR_NAME'] == 'Alexey Grigorev'
+    assert env['GIT_AUTHOR_EMAIL'] == 'alexey.s.grigoriev@gmail.com'
+    assert env['GIT_COMMITTER_NAME'] == 'Alexey Grigorev'
+    assert env['GIT_COMMITTER_EMAIL'] == 'alexey.s.grigoriev@gmail.com'
+
+
+def test_regression_bootstrapped_engine_home_can_git_commit(tmp_path, monkeypatch):
+    """AC (d): A bootstrapped fresh engine home can git commit with the configured identity."""
+    tmp_path.chmod(0o700)
+    root_dir = tmp_path / 'managed'
+    root_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: root_dir)
+
+    configured_git = {
+        "user.name": "Alexey Grigorev",
+        "user.email": "alexey.s.grigoriev@gmail.com",
+    }
+    monkeypatch.setattr(p, 'load_git_identity', lambda: configured_git)
+
+    b = bundle()
+    dest = root_dir / f"{b['label']}-{b['revision']}"
+    dest.mkdir(parents=True, mode=0o700)
+    home = dest / 'home'
+
+    p.provision_managed_home(b, home, dest)
+    assert (home / '.gitconfig').is_file()
+
+    # Create a fresh temporary git repository
+    repo_dir = tmp_path / 'test-repo'
+    repo_dir.mkdir(mode=0o700)
+
+    # Isolated environment: HOME pointing to the engine home, no system config overriding it
+    test_env = {
+        'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
+        'HOME': str(home),
+        'USERPROFILE': str(home),
+        'GIT_CONFIG_NOSYSTEM': '1',  # Ignore system gitconfig to prove identity comes from engine home
+    }
+
+    subprocess.run(['git', 'init'], cwd=str(repo_dir), env=test_env, check=True, capture_output=True)
+    (repo_dir / 'test.txt').write_text('hello world\n')
+    subprocess.run(['git', 'add', 'test.txt'], cwd=str(repo_dir), env=test_env, check=True, capture_output=True)
+    subprocess.run(['git', 'commit', '-m', 'initial commit'], cwd=str(repo_dir), env=test_env, check=True, capture_output=True)
+
+    log_res = subprocess.run(['git', 'log', '-1', '--format=%an <%ae>'], cwd=str(repo_dir), env=test_env, check=True, capture_output=True, text=True)
+    author = log_res.stdout.strip()
+    assert author == 'Alexey Grigorev <alexey.s.grigoriev@gmail.com>'
+
+    # Also test fallback with environment variables when .gitconfig is deleted
+    (home / '.gitconfig').unlink()
+    env_with_fallback = p.engine_environment(b, home, dest)
+    env_with_fallback['GIT_CONFIG_NOSYSTEM'] = '1'
+
+    (repo_dir / 'test2.txt').write_text('second file\n')
+    subprocess.run(['git', 'add', 'test2.txt'], cwd=str(repo_dir), env=env_with_fallback, check=True, capture_output=True)
+    subprocess.run(['git', 'commit', '-m', 'second commit'], cwd=str(repo_dir), env=env_with_fallback, check=True, capture_output=True)
+
+    log_res2 = subprocess.run(['git', 'log', '-1', '--format=%an <%ae>'], cwd=str(repo_dir), env=env_with_fallback, check=True, capture_output=True, text=True)
+    assert log_res2.stdout.strip() == 'Alexey Grigorev <alexey.s.grigoriev@gmail.com>'
+
+
 
 
 

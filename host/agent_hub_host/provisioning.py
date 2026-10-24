@@ -51,6 +51,131 @@ def write_json(path, value):
     private_fs.atomic_write(path, json.dumps(value).encode(), 1048576)
 
 
+def normalize_git_identity(conf) -> dict[str, str]:
+    if not isinstance(conf, dict):
+        return {}
+    res: dict[str, str] = {}
+    for k, v in conf.items():
+        if isinstance(v, dict):
+            for sub_k, sub_v in v.items():
+                full_key = f"{k}.{sub_k}".lower()
+                res[full_key] = str(sub_v)
+        else:
+            k_lower = k.lower()
+            if k_lower in ('name', 'user_name', 'user.name'):
+                res['user.name'] = str(v)
+            elif k_lower in ('email', 'user_email', 'user.email'):
+                res['user.email'] = str(v)
+            elif k_lower in ('signing_key', 'signingkey', 'user.signingkey'):
+                res['user.signingkey'] = str(v)
+            elif k_lower in ('gpg_sign', 'gpgsign', 'commit.gpgsign'):
+                res['commit.gpgsign'] = 'true' if (v is True or str(v).lower() in ('true', '1', 'yes')) else str(v)
+            elif k_lower in ('push_default', 'push.default'):
+                res['push.default'] = str(v)
+            elif k_lower in ('push_auto_setup_remote', 'push.autosetupremote'):
+                res['push.autosetupremote'] = 'true' if (v is True or str(v).lower() in ('true', '1', 'yes')) else str(v)
+            elif '.' in k:
+                res[k] = str(v)
+            else:
+                res[f'user.{k}'] = str(v)
+    return res
+
+
+def render_gitconfig(git_config: dict[str, str]) -> str:
+    sections: dict[str, dict[str, str]] = {}
+    for full_key, val in git_config.items():
+        if '.' in full_key:
+            sec, k = full_key.split('.', 1)
+        else:
+            sec, k = 'user', full_key
+        sections.setdefault(sec, {})[k] = str(val)
+    lines = []
+    sec_keys = list(sections.keys())
+    if 'user' in sec_keys:
+        sec_keys.remove('user')
+        sec_keys.insert(0, 'user')
+    for sec in sec_keys:
+        lines.append(f'[{sec}]')
+        for k, v in sorted(sections[sec].items()):
+            lines.append(f'\t{k} = {v}')
+    return '\n'.join(lines) + '\n'
+
+
+def load_git_identity() -> dict[str, str]:
+    """Resolve configured Git identity from host settings, host config, or environment."""
+    # 1. Host settings: subscriptions.json (fleet.load_settings)
+    try:
+        from . import fleet
+        settings = fleet.load_settings()
+        git_conf = settings.get('git') if 'git' in settings else settings.get('git_identity')
+        if git_conf:
+            return normalize_git_identity(git_conf)
+    except Exception:
+        pass
+
+    # 2. Host config: host.json (config.load_host_config)
+    try:
+        host_cfg = config.load_host_config()
+        git_conf = host_cfg.get('git') if 'git' in host_cfg else host_cfg.get('git_identity')
+        if git_conf:
+            return normalize_git_identity(git_conf)
+    except Exception:
+        pass
+
+    # 3. Environment variables fallback
+    env_name = os.environ.get('HUB_GIT_NAME') or os.environ.get('GIT_AUTHOR_NAME')
+    env_email = os.environ.get('HUB_GIT_EMAIL') or os.environ.get('GIT_AUTHOR_EMAIL')
+    res = {}
+    if env_name:
+        res['user.name'] = env_name
+    if env_email:
+        res['user.email'] = env_email
+    return res
+
+
+def provision_managed_home(bundle=None, home=None, dest=None):
+    """Shared provisioning hook point for managed engine homes.
+
+    Provisions .gitconfig, credentials, and state hooks into home.
+    Re-applies idempotently on re-bootstrap or home recreation.
+    """
+    if home is None:
+        if dest is not None:
+            home = Path(dest) / 'home'
+        elif isinstance(bundle, dict) and 'label' in bundle and 'revision' in bundle:
+            dest = root() / (bundle['label'] + '-' + bundle['revision'])
+            home = dest / 'home'
+        else:
+            raise ValueError('home or dest/bundle must be provided')
+    home = Path(home)
+    with private_fs.parent(home / 'placeholder', create=True):
+        pass
+
+    # 1. Provision git identity
+    git_ident = load_git_identity()
+    if git_ident:
+        content = render_gitconfig(git_ident)
+        gitconfig = home / '.gitconfig'
+        private_fs.atomic_write(gitconfig, content.encode('utf-8'), 32768)
+        if os.name != 'nt':
+            try:
+                os.chmod(gitconfig, 0o600)
+            except OSError:
+                pass
+
+    # 2. Bundle files (credentials, etc.)
+    if isinstance(bundle, dict) and isinstance(bundle.get('files'), dict):
+        for relative, value in bundle['files'].items():
+            target = home / relative
+            private_fs.atomic_write(target, value.encode(), 32768)
+            if os.name != 'nt':
+                try:
+                    os.chmod(target, 0o600)
+                except OSError:
+                    pass
+    return home
+
+
 @contextlib.contextmanager
 def lock():
     """One reconciler/exec reader; owner-only lock stays on disk across processes."""
@@ -387,11 +512,12 @@ def engine_argv(bundle, dest, is_windows=None):
 def install(bundle):
     validate(bundle)
     dest = root() / (bundle['label'] + '-' + bundle['revision'])
+    home = dest / 'home'
     receipt = read_json(dest / 'bundle.json')
     if receipt == bundle:
+        provision_managed_home(bundle, home, dest)
         return
     pkg, binary, _ = PACKAGES[bundle['provider']]
-    home = dest / 'home'
     # Credentials are delivered only after package installation; installers never see them.
     with private_fs.parent(dest / 'placeholder', create=True):
         pass
@@ -490,10 +616,7 @@ def install(bundle):
             subprocess.run(engine_argv(bundle, dest) + ['--version'], env=clean_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=True)
         except (subprocess.SubprocessError, OSError):
             raise ValueError('Native engine verification failed') from None
-    for relative, value in bundle['files'].items():
-        private_fs.atomic_write(home / relative, value.encode(), 32768)
-    with private_fs.parent(home / 'placeholder', create=True):
-        pass
+    provision_managed_home(bundle, home, dest)
     write_json(dest / 'bundle.json', bundle)
 
 
@@ -671,6 +794,15 @@ def engine_environment(bundle, home, dest=None):
         if runtime:
             env['ZCODE_CJS'] = str(runtime)
     env.update(bundle.get('env') or {})
+    git_ident = load_git_identity()
+    name = git_ident.get('user.name') or git_ident.get('name')
+    email = git_ident.get('user.email') or git_ident.get('email')
+    if name:
+        env['GIT_AUTHOR_NAME'] = name
+        env['GIT_COMMITTER_NAME'] = name
+    if email:
+        env['GIT_AUTHOR_EMAIL'] = email
+        env['GIT_COMMITTER_EMAIL'] = email
     if bundle.get('provider') == 'claude':
         for k in (
             'CLAUDE_CODE_USE_BEDROCK',
@@ -808,6 +940,7 @@ def execute():
         b = read_json(dest / 'bundle.json')
         validate(b)
         home = dest / 'home'
+        provision_managed_home(b, home, dest)
         _, binary, _ = PACKAGES[b['provider']]
         command = engine_argv(b, dest)
         env = engine_environment(b, home, dest)

@@ -472,6 +472,55 @@ class FleetTests(unittest.TestCase):
             self.assertEqual(result3['state'], 'running')
             self.assertEqual(calls[1][0][:2], ["aplexer", "start"])
 
+            # Git identity settings are passed as fallback env to interactive start
+            cfg_git = settings(Path(tmp))
+            cfg_git['git'] = {
+                'user.name': 'Alexey Grigorev',
+                'user.email': 'alexey.s.grigoriev@gmail.com'
+            }
+            calls.clear()
+            dispatcher4 = fleet.Dispatcher(cfg_git, lambda *a: {}, runner)
+            result4 = dispatcher4.dispatch(offer())
+            self.assertEqual(result4['state'], 'running')
+            start_argv4 = calls[1][0]
+            self.assertIn("--env", start_argv4)
+            self.assertIn("GIT_AUTHOR_NAME=Alexey Grigorev", start_argv4)
+            self.assertIn("GIT_AUTHOR_EMAIL=alexey.s.grigoriev@gmail.com", start_argv4)
+            self.assertIn("GIT_COMMITTER_NAME=Alexey Grigorev", start_argv4)
+            self.assertIn("GIT_COMMITTER_EMAIL=alexey.s.grigoriev@gmail.com", start_argv4)
+
+    def test_git_identity_config_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'subs.json'
+            valid_cfg = settings(Path(tmp))
+            valid_cfg['git'] = {
+                'name': 'Alexey Grigorev',
+                'email': 'alexey.s.grigoriev@gmail.com',
+                'push_default': 'simple',
+            }
+            p.write_text(json.dumps(valid_cfg))
+            loaded = fleet.load_settings(p)
+            self.assertIn('git', loaded)
+            self.assertEqual(loaded['git']['name'], 'Alexey Grigorev')
+
+            # Rejects non-dict git setting
+            bad_cfg = settings(Path(tmp))
+            bad_cfg['git'] = "not-a-dict"
+            p.write_text(json.dumps(bad_cfg))
+            with self.assertRaisesRegex(ValueError, 'git identity setting must be a mapping'):
+                fleet.load_settings(p)
+
+            # Rejects newlines in key or value
+            bad_cfg['git'] = {'user.name\n': 'evil'}
+            p.write_text(json.dumps(bad_cfg))
+            with self.assertRaisesRegex(ValueError, 'Invalid git config key'):
+                fleet.load_settings(p)
+
+            bad_cfg['git'] = {'user.name': 'evil\nvalue'}
+            p.write_text(json.dumps(bad_cfg))
+            with self.assertRaisesRegex(ValueError, 'Invalid git config value'):
+                fleet.load_settings(p)
+
     def test_registration_derives_qualified_role_jobs_from_trusted_config(self):
         cfg = settings(Path('/repo'))
         calls = []
