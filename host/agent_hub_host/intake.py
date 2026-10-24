@@ -1,5 +1,6 @@
 """Private durable task context. Task text is data; this client never executes it."""
 import http.client
+import socket
 import json
 import os
 import re
@@ -10,10 +11,13 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlencode
 from . import api, auth, config
-from .conversations import valid_key
 
 BASE = '/api/intake'
 MAX_REQUEST = 32768
+EVENT_KINDS = ('intake', 'note', 'decision', 'followup', 'blocker', 'pending_approval',
+               'link', 'session', 'report', 'commit', 'rule_reference', 'resolution',
+               'approval_decision', 'owner_acceptance', 'first_action', 'work_action',
+               'independent_review', 'accepted_outcome', 'human_delivery', 'obligation', 'obligation_response')
 
 # Server error slugs are lowercase snake_case (longest today is 30 chars).
 # Passing the slug through keeps the exact failure (auth, grant, capacity,
@@ -36,12 +40,44 @@ class IntakeTransportError(ValueError):
     pass
 
 
+class IntakeInputError(ValueError):
+    """A client diagnostic containing only fixed labels and limits."""
+
+
+def valid_key(value):
+    # Match the server identifier exactly; rewriting keys breaks idempotency.
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', value):
+        raise IntakeInputError('Invalid retry key: use 1-128 characters, starting with a letter or digit; allowed: letters, digits, . _ : -')
+
+
+def diagnostic(exc):
+    """Never interpolate exception bodies: they may contain credentials or payloads."""
+    if isinstance(exc, (IntakeHTTPError, IntakeTransportError, IntakeInputError, config.ConfigPermissionError)):
+        return str(exc)
+    if isinstance(exc, UnicodeDecodeError):
+        return 'Input is not valid UTF-8'
+    if isinstance(exc, json.JSONDecodeError):
+        return 'Invalid JSON input: expected a JSON object'
+    if isinstance(exc, (TimeoutError, socket.timeout)) or (isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, TimeoutError)):
+        return 'Intake request timed out (HTTP timeout: 10 seconds)'
+    if isinstance(exc, urllib.error.URLError):
+        if isinstance(exc.reason, socket.gaierror):
+            return 'Intake transport failed: DNS lookup failed'
+        return 'Intake transport failed: connection or TLS failure'
+    if isinstance(exc, (OSError, http.client.HTTPException)):
+        return 'Intake transport failed: connection interrupted'
+    if isinstance(exc, RuntimeError) and str(exc) in ('Expected JSON response', 'Response too large'):
+        return 'Intake response error: ' + str(exc)
+    return 'Intake client error; check inputs and authentication (unexpected error details withheld)'
+
+
 def http_error(exc, method, payload):
     if exc.code == 409 and method == 'GET':
         return StaleSnapshot('Snapshot changed')
     # Never echo arbitrary error bodies, tokens, URLs or terminal controls.
     # The server only emits lowercase snake_case slugs; surface the exact
     # slug so auth/grant/capacity/field detail survives, collapse the rest.
+    body = None
     try:
         body = json.loads(exc.read(4097))
         code = body.get('error') if isinstance(body, dict) else None
@@ -49,8 +85,23 @@ def http_error(exc, method, payload):
         code = None
     if not isinstance(code, str) or not SAFE_ERROR.match(code):
         code = 'request_failed'
-    return IntakeHTTPError(exc.code, code,
-                           payload.get('key') if payload else None)
+    key = payload.get('key') if payload else None
+    if not isinstance(key, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', key):
+        key = None
+    result = IntakeHTTPError(exc.code, code, key)
+    detail = ''
+    if isinstance(body, dict):
+        field = body.get('field')
+        if field in ('text', 'title', 'project', 'acceptance_criteria', 'current_state', 'next_step', 'owner', 'uncertainty'):
+            detail += f'; field: {field}'
+            limit = body.get('max_bytes')
+            if type(limit) is int and 0 < limit <= MAX_REQUEST:
+                detail += f'; max {limit} UTF-8 bytes'
+    if code == 'invalid_event_kind':
+        detail += '; valid kinds: ' + ', '.join(EVENT_KINDS)
+    # Only locally generated wording is printed, never arbitrary server messages.
+    result.args = (str(result) + detail,)
+    return result
 
 
 def request(method, path, payload=None):
@@ -59,14 +110,22 @@ def request(method, path, payload=None):
     api.check_url(base)
     data = json.dumps(payload, ensure_ascii=False).encode('utf-8') if payload is not None else None
     if data is not None and len(data) > MAX_REQUEST:
-        raise ValueError('Intake request exceeds capacity')
+        raise IntakeInputError(f'Intake request exceeds {MAX_REQUEST} UTF-8 bytes (JSON envelope included)')
     env_token = os.environ.get('HUB_TOKEN') or os.environ.get('HUB_JOB_TOKEN')
     token = env_token or auth.get_access_token()
 
     def send(access):
         req = urllib.request.Request(base.rstrip('/') + path, data=data, method=method,
                                      headers={'Authorization': 'Bearer ' + access, 'Content-Type': 'application/json'})
-        return api.safe_http_json(req)
+        try:
+            return api.safe_http_json(req)
+        except urllib.error.HTTPError:
+            raise
+        except (OSError, http.client.HTTPException, ValueError, RuntimeError) as exc:
+            reason = ('Intake response error: invalid JSON or UTF-8 response'
+                      if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)) else diagnostic(exc))
+            recovery = '; mutation outcome unknown; inspect before retrying with the same key and payload' if method != 'GET' else ''
+            raise IntakeTransportError(reason + recovery) from None
 
     try:
         return send(token)
@@ -80,14 +139,18 @@ def request(method, path, payload=None):
         raise http_error(exc, method, payload) from None
 
 
-def read_file(path, limit=MAX_REQUEST):
-    if path == '-':
-        raw = sys.stdin.buffer.read(limit + 1)
-    else:
-        with Path(path).open('rb') as stream:
-            raw = stream.read(limit + 1)
+def read_file(path, limit=MAX_REQUEST, field='Input'):
+    try:
+        if path == '-':
+            raw = sys.stdin.buffer.read(limit + 1)
+        else:
+            with Path(path).open('rb') as stream:
+                raw = stream.read(limit + 1)
+    except OSError as exc:
+        reason = {2: 'file not found', 13: 'permission denied', 21: 'path is a directory'}.get(exc.errno, 'file is unreadable')
+        raise IntakeInputError(f'{field}: {reason}') from None
     if len(raw) > limit:
-        raise ValueError('Input exceeds capacity')
+        raise IntakeInputError(f'{field} exceeds {limit} UTF-8 bytes')
     return raw.decode('utf-8')
 
 
@@ -98,6 +161,7 @@ def add_commands(sub):
     create.add_argument('--project', required=True)
     create.add_argument('--title', required=True)
     intake_body = create.add_mutually_exclusive_group(required=True)
+    intake_body.add_argument('--text', help='Verbatim intake text (max 8192 UTF-8 bytes)')
     intake_body.add_argument('--text-file')
     intake_body.add_argument('--voice-pending', action='store_true', help='Capture voice pointer now with null text and pending transcription')
     create.add_argument('--source-type', choices=['chat', 'voice', 'forwarded', 'unknown'], default='unknown')
@@ -173,20 +237,20 @@ def add_commands(sub):
 def safe_id(value):
     valid_key(value)
     if value in ('.', '..') or '/' in value:
-        raise ValueError('Invalid identifier')
+        raise IntakeInputError('Invalid identifier')
     return value
 
 
 def json_file(path):
     result = json.loads(read_file(path))
     if not isinstance(result, dict):
-        raise ValueError('JSON object required')
+        raise IntakeInputError('JSON object required')
     return result
 
 
 def handoff(project=None, page_size=25):
     if not 1 <= page_size <= 25:
-        raise ValueError('Invalid page size')
+        raise IntakeInputError('Invalid page size')
     for _ in range(3):
         tasks, seen, revision, rules = [], set(), None, {}
         after = None
@@ -212,24 +276,24 @@ def handoff(project=None, page_size=25):
                 valid_until = page.get('authorization_valid_until')
                 for task in page['items']:
                     if task['id'] in seen:
-                        raise ValueError('Duplicate snapshot item')
+                        raise IntakeInputError('Duplicate snapshot item')
                     seen.add(task['id'])
                     tasks.append(task)
                 for rule in page['operator_rules']:
                     rules[rule['id']] = rule
                 if len(tasks) > 256:
-                    raise ValueError('Snapshot exceeds capacity')
+                    raise IntakeInputError('Snapshot exceeds capacity')
                 after = page['next']
                 if not after:
                     if len(tasks) != page['total']:
-                        raise ValueError('Incomplete snapshot')
+                        raise IntakeInputError('Incomplete snapshot')
                     return {'snapshot_version': revision, 'complete': True, 'authorized_scope': page['authorized_scope'],
                             'data_notice': page['data_notice'], 'operator_rules': list(rules.values()), 'tasks': tasks,
                             'total': len(tasks)}
-            raise ValueError('Snapshot page bound exceeded')
+            raise IntakeInputError('Snapshot page bound exceeded')
         except StaleSnapshot:
             continue
-    raise ValueError('Snapshot kept changing; retry handoff')
+    raise IntakeInputError('Snapshot kept changing; retry handoff')
 
 
 def execute(args):
@@ -241,13 +305,18 @@ def execute(args):
         criteria = getattr(args, 'acceptance_criteria', None)
         criteria_file = getattr(args, 'acceptance_criteria_file', None)
         if criteria is not None and criteria_file is not None:
-            raise ValueError('Cannot specify both --acceptance-criteria and --acceptance-criteria-file')
+            raise IntakeInputError('Cannot specify both --acceptance-criteria and --acceptance-criteria-file')
+        if args.text_file == '-' and criteria_file == '-':
+            raise IntakeInputError('Cannot read both --text-file and --acceptance-criteria-file from stdin')
         if criteria_file is not None:
-            criteria = read_file(criteria_file, 8192)
+            criteria = read_file(criteria_file, 8192, '--acceptance-criteria-file')
         if criteria is not None and len(criteria.encode('utf-8')) > 8192:
-            raise ValueError('Acceptance criteria exceed capacity')
+            raise IntakeInputError('Acceptance criteria exceed 8192 UTF-8 bytes')
+        text = None if args.voice_pending else (args.text if args.text is not None else read_file(args.text_file, 8192, '--text-file'))
+        if text is not None and len(text.encode('utf-8')) > 8192:
+            raise IntakeInputError('Text exceeds 8192 UTF-8 bytes')
         body = {'key': args.key, 'project': args.project, 'title': args.title,
-                       'text': None if args.voice_pending else read_file(args.text_file),
+                       'text': text,
                        'transcription': 'pending' if args.voice_pending else ('provided' if args.source_type == 'voice' else 'not_applicable'), 'source': {'type': args.source_type,
                        'reference': args.source_reference, 'timestamp': args.source_time}}
         if criteria is not None:
@@ -261,7 +330,7 @@ def execute(args):
         return request('GET', BASE + '/tasks?' + urlencode(params))
     if command == 'grantees':
         if not getattr(args, 'actor', None) or not args.actor.strip():
-            raise ValueError('Actor required')
+            raise IntakeInputError('Actor required')
         params = {'actor': args.actor.strip(), 'limit': args.limit}
         if getattr(args, 'family', None):
             params['family_id'] = args.family.strip()
@@ -292,11 +361,11 @@ def execute(args):
         session['mode'] = 'interactive' if args.interactive else 'headless'
         if args.brief_file:
             if session['mode'] == 'interactive':
-                raise ValueError('Interactive sessions start at an empty native prompt')
+                raise IntakeInputError('Interactive sessions start at an empty native prompt')
             with (sys.stdin.buffer if args.brief_file == '-' else Path(args.brief_file).open('rb')) as stream:
                 raw = stream.read(8192 + 1)
             if len(raw) > 8192:
-                raise ValueError('Brief exceeds capacity')
+                raise IntakeInputError('Brief exceeds capacity')
             session['brief'] = raw.decode('utf-8')
         payload['session'] = session
         payload['provenance'] = {'type': args.source_type, 'reference': args.source_reference,
@@ -312,11 +381,11 @@ def execute(args):
         for field in ('status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria'):
             if getattr(args, field, None) is not None:
                 if field == 'acceptance_criteria' and len(args.acceptance_criteria.encode('utf-8')) > 8192:
-                    raise ValueError('Acceptance criteria exceed capacity')
+                    raise IntakeInputError('Acceptance criteria exceed 8192 UTF-8 bytes')
                 payload[field] = getattr(args, field)
         for field in args.clear:
             if getattr(args, field) is not None:
-                raise ValueError('Cannot set and clear one field together')
+                raise IntakeInputError('Cannot set and clear one field together')
             payload[field] = None
         automatic = args.version is None
         for attempt in range(3):
@@ -328,8 +397,8 @@ def execute(args):
             except IntakeHTTPError as exc:
                 if not automatic or exc.status != 409 or exc.code != 'version_conflict' or attempt == 2:
                     raise
-            except (OSError, TimeoutError, http.client.HTTPException, json.JSONDecodeError, UnicodeDecodeError, RuntimeError):
+            except (IntakeTransportError, OSError, TimeoutError, http.client.HTTPException, json.JSONDecodeError, UnicodeDecodeError, RuntimeError) as exc:
                 attempted = payload.get('expected_version')
                 version_info = f'; attempted version: {attempted}' if attempted is not None else ''
-                raise IntakeTransportError(f'Intake update outcome unknown; inspect the task before retrying. Retry key: {key}{version_info}') from None
-    raise ValueError('Unknown intake operation')
+                raise IntakeTransportError(f'{diagnostic(exc)}; Intake update outcome unknown; inspect the task before retrying. Retry key: {key}{version_info}') from None
+    raise IntakeInputError('Unknown intake operation')

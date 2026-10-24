@@ -377,6 +377,84 @@ class TestIntakeCli(unittest.TestCase):
             with self.assertRaises(UnicodeError):
                 intake.read_file(path)
 
+    def test_create_inline_file_and_stdin_match_mcp_payload(self):
+        text, criteria = '  Verbatim 世界\n', 'Review 世界\n'
+        with tempfile.TemporaryDirectory(dir=ROOT/'.local/tmp') as directory:
+            body, ac = Path(directory)/'body', Path(directory)/'criteria'
+            body.write_text(text, encoding='utf-8')
+            ac.write_text(criteria, encoding='utf-8')
+            for text_args, ac_args, stdin in [
+                    (['--text', text], ['--acceptance-criteria', criteria], ''),
+                    (['--text-file', str(body)], ['--acceptance-criteria-file', str(ac)], ''),
+                    (['--text-file', '-'], ['--acceptance-criteria-file', str(ac)], text),
+                    (['--text-file', str(body)], ['--acceptance-criteria-file', '-'], criteria)]:
+                with self.subTest(text_args=text_args), patch.object(intake, 'request', return_value={}) as send, \
+                     patch('sys.stdin', io.TextIOWrapper(io.BytesIO(stdin.encode()), encoding='utf-8')):
+                    code, _, error = self.run_cli('intake', 'create', '--project', 'demo', '--title', 'Title',
+                                                  '--key', 'gha:run-123', '--source-type', 'chat',
+                                                  '--source-reference', 'fixture:chat', '--source-time', '2026-10-24T00:00:00Z',
+                                                  *text_args, *ac_args)
+                self.assertEqual(code, 0, error)
+                self.assertEqual(send.call_args.args[2], {
+                    'key': 'gha:run-123', 'project': 'demo', 'title': 'Title', 'text': text,
+                    'acceptance_criteria': criteria, 'transcription': 'not_applicable',
+                    'source': {'type': 'chat', 'reference': 'fixture:chat', 'timestamp': '2026-10-24T00:00:00Z'}})
+
+    def test_create_input_diagnostics_are_specific_without_private_values(self):
+        common = ['intake', 'create', '--project', 'demo', '--title', 'Title']
+        cases = [(['--text', 'body', '--key', 'gha/run 123'], 'Invalid retry key'),
+                 (['--text-file', '/absent/private-token', '--key', 'good'], '--text-file: file not found'),
+                 (['--text', 'body', '--key', 'good', '--acceptance-criteria-file', '/absent/private-token'], '--acceptance-criteria-file: file not found'),
+                 (['--text', '界' * 2731, '--key', 'good'], '8192 UTF-8 bytes'),
+                 (['--text-file', '-', '--acceptance-criteria-file', '-', '--key', 'good'], 'Cannot read both')]
+        for args, expected in cases:
+            with self.subTest(expected=expected), patch.object(intake, 'request') as send:
+                code, output, error = self.run_cli(*common, *args)
+            self.assertEqual(code, 1)
+            self.assertEqual(output, '')
+            self.assertIn(expected, error)
+            self.assertNotIn('private-token', error)
+            self.assertNotIn('Intake operation failed', error)
+            send.assert_not_called()
+        with patch('pathlib.Path.open', side_effect=PermissionError(13, 'private-token')):
+            code, _, error = self.run_cli(*common, '--text-file', 'private-token', '--key', 'good')
+        self.assertEqual(code, 1)
+        self.assertIn('permission denied', error)
+        self.assertNotIn('private-token', error)
+
+    def test_transport_and_response_failures_are_specific_and_safe(self):
+        cases = [(TimeoutError('private-token'), 'timed out'),
+                 (urllib.error.URLError(TimeoutError('private-token')), 'timed out'),
+                 (urllib.error.URLError('https://private-token'), 'transport failed'),
+                 (RuntimeError('Expected JSON response'), 'Expected JSON response'),
+                 (json.JSONDecodeError('private-token', 'private-token', 0), 'invalid JSON')]
+        for exc, expected in cases:
+            with self.subTest(expected=expected), \
+                 patch.object(intake.config, 'load_config', return_value={'base_url': 'https://fixture.test'}), \
+                 patch.dict(os.environ, {'HUB_TOKEN': 'private-token', 'HUB_URL': '', 'HUB_BASE_URL': ''}), \
+                 patch.object(intake.api, 'safe_http_json', side_effect=exc):
+                code, output, error = self.run_cli('intake', 'create', '--project', 'demo', '--title', 'Title',
+                                                  '--text', 'body', '--key', 'good')
+            self.assertEqual(code, 1)
+            self.assertEqual(output, '')
+            self.assertIn(expected, error)
+            self.assertIn('outcome unknown', error)
+            self.assertNotIn('private-token', error)
+
+    def test_http_field_limits_and_invalid_event_kinds_are_actionable(self):
+        for body, expected in [({'error': 'invalid_field', 'field': 'text', 'max_bytes': 8192}, 'field: text; max 8192 UTF-8 bytes'),
+                               ({'error': 'invalid_event_kind', 'message': 'private-token'}, 'valid kinds: ' + ', '.join(intake.EVENT_KINDS))]:
+            exc = urllib.error.HTTPError('https://fixture.test', 400, 'private-token', {}, io.BytesIO(json.dumps(body).encode()))
+            with patch.object(intake, 'request', side_effect=intake.http_error(exc, 'POST', {'key': 'good'})), \
+                 patch.object(intake, 'json_file', return_value={'kind': 'update'}):
+                code, _, error = self.run_cli('intake', 'append', 'task-1', '--version', '1', '--key', 'good', '--event-file', '-')
+            self.assertEqual(code, 1)
+            self.assertIn('Intake HTTP 400: ' + body['error'], error)
+            self.assertIn(expected, error)
+            self.assertNotIn('private-token', error)
+        exc = urllib.error.HTTPError('https://fixture.test', 400, 'private', {}, io.BytesIO(b'{"error":"invalid_field","field":"private-token","message":"private-token"}'))
+        self.assertNotIn('private-token', str(intake.http_error(exc, 'POST', None)))
+
     @staticmethod
     def page(ids, next_id=None, revision=1, total=3):
         return {'snapshot_version': revision, 'items': [{'id': x} for x in ids], 'next': next_id,

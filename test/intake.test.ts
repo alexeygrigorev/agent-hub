@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie, tokenAdminSubject, TOKEN_ADMIN_EMAIL } from '../src/auth/session';
 import { sha256 } from '../src/auth/crypto';
-import { IntakeService, INTAKE_LIMITS } from '../src/intake';
+import { IntakeService, INTAKE_LIMITS, INTAKE_EVENT_KINDS } from '../src/intake';
 
 const inDO: any = runInDurableObject;
 const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
@@ -53,6 +53,22 @@ beforeEach(async () => {
 });
 
 describe('private durable intake HTTP/SQLite', () => {
+
+  it('returns field byte limits and every supported event kind without echoing input', async () => {
+    for (const [field, max] of [['text', 8192], ['title', 256], ['acceptance_criteria', 8192]] as const) {
+      const res = await call('/tasks', { key: 'invalid-' + field, project: 'demo', title: 'Title', text: 'Body', source,
+        [field]: '界'.repeat(Math.floor(max / 3) + 1) });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: 'invalid_field', field, max_bytes: max });
+    }
+    const { task } = await create();
+    const res = await call('/tasks/' + task.id + '/events', { key: 'invalid-kind', expected_version: 1, event: { kind: 'update' } });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'invalid_event_kind', valid_kinds: INTAKE_EVENT_KINDS });
+    expect(INTAKE_EVENT_KINDS).toContain('session');
+    expect(INTAKE_EVENT_KINDS).toContain('obligation_response');
+    expect((await ok('/tasks/' + task.id)).task.control.version).toBe(1);
+  });
 
   it('records and replays new intake beyond the former 4 MiB backfill budget', async () => {
     await inDO(stub(), (h: any) => {

@@ -528,13 +528,8 @@ def main():
     if args.cmd in ('intake', 'handoff'):
         try:
             print(json.dumps(intake.execute(args), indent=2, ensure_ascii=True))
-        except (intake.IntakeHTTPError, intake.IntakeTransportError, config.ConfigPermissionError) as exc:
-            print(str(exc), file=sys.stderr)
-            sys.exit(1)
-        except Exception:
-            print('Intake operation failed; check authentication, grants, capacity and current versions. '
-                  'Retry mutations with the same key and payload after uncertain responses; '
-                  'handoff emits only a complete consistent authorized snapshot.', file=sys.stderr)
+        except Exception as exc:
+            print(intake.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
         return
     if args.cmd == 'conversations':
