@@ -584,7 +584,11 @@ def deliver_recorded(
     target = target.validated()
     if not isinstance(envelope_id, str) or not envelope_id or len(envelope_id) > 128:
         raise SessionControlError("Envelope id is required for deliver")
-    qualify_target(executable, target)
+    observed = qualify_target(executable, target)
+    # Reconciliation of an older inbox must obey the same headless input
+    # refusal as a new Hub command, before invoking native delivery.
+    if observed.headless_exec:
+        raise SessionControlError("send_unsupported_headless")
     proc = run_native(
         executable,
         ["message", "deliver", "--workspace", target.workspace, "--json", envelope_id],

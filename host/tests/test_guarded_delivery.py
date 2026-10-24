@@ -873,3 +873,17 @@ def test_codex_exec_send_fails_fast_without_inbox_or_input(env, source):
         journal_dir=env["journal"], executable=env["fake"], request=hub.request)
     assert again["replayed"] is True
     assert not os.listdir(env["msgs"])
+
+
+def test_reconciliation_cannot_deliver_an_old_envelope_to_codex_exec(env):
+    target = seed_target(env)
+    rows = json.load(open(env["sessions_file"]))
+    rows[-1].update(engine="codex", command=["codex", "exec", "--json", "goal"])
+    json.dump(rows, open(env["sessions_file"], "w"))
+    target = NativeTarget(session_id=target.session_id, tag=target.tag,
+                          workspace=target.workspace, created_at_ms=target.created_at_ms,
+                          engine="codex")
+    with pytest.raises(SessionControlError, match="^send_unsupported_headless$"):
+        ns.deliver_recorded(env["fake"], target, "old-persisted-envelope")
+    assert not os.path.exists(env["deliver_log"])
+    assert not os.path.exists(env["pty_log"])
