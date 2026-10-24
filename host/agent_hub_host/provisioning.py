@@ -299,12 +299,44 @@ def ensure_toml_trusted_projects(content: str, paths: list[str]) -> str:
     return res
 
 
+KNOWN_HOOK_HASHES = {
+    'session_start:0:0': 'sha256:ac5079da741baea9d7cb457e131ce58f3b563b443cd750940bfa2e54be63a0ec',
+    'session_start:1:0': 'sha256:b8d459bbdbea59e7ff5bd6064a65ced7d9ea57686bb163d1c9fb40eef8ffd4f6',
+    'user_prompt_submit:0:0': 'sha256:db2f3aaa4d73a3c4ce637c104399b654efb2990cd46f72a7f3646cf9c783feac',
+    'user_prompt_submit:1:0': 'sha256:9110ecd5d2975cef72b5596811be8115687e1d437311d7b11f87caf911a24c9b',
+    'stop:0:0': 'sha256:6d270f46d79288e0768c5124346fd2289e3c1b694f38041892633190beb161f8',
+    'post_tool_use:0:0': 'sha256:9e4b66a5438f7470eba7321ae25b62a3ce845c416418da8d85cda2b3c41cca37',
+}
+
+
+def ensure_toml_trusted_hooks(content: str, hooks_file: Path) -> str:
+    """Ensure installed hooks in hooks_file are trusted in TOML content to prevent hook review prompts."""
+    res = content
+    try:
+        h_str = str(hooks_file.resolve())
+    except Exception:
+        h_str = str(hooks_file)
+    for suffix, hash_val in KNOWN_HOOK_HASHES.items():
+        key = f'{h_str}:{suffix}'
+        pattern = re.compile(r'^[ \t]*\[hooks\.state\.' + re.escape(json.dumps(key)) + r'\][ \t]*$', re.M)
+        if pattern.search(res):
+            continue
+        alt_pattern = re.compile(r'^[ \t]*\[hooks\.state\."' + re.escape(key) + r'"\][ \t]*$', re.M)
+        if alt_pattern.search(res):
+            continue
+        if res and not res.endswith('\n'):
+            res += '\n'
+        res += f'\n[hooks.state.{json.dumps(key)}]\ntrusted_hash = "{hash_val}"\n'
+    return res
+
+
 def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=None):
     """Ensure managed engine home configuration has approval and sandbox prompts disabled.
 
     Reconciles on every bootstrap/re-bootstrap and execution to match operator config:
     - codex / zai: approval_policy = "never", sandbox_mode = "danger-full-access" in .codex/config.toml
-      plus [projects."<path>"] trust_level = "trusted" for workspaces and operator roots.
+      plus [projects."<path>"] trust_level = "trusted" for workspaces and operator roots,
+      and [hooks.state."..."] trusted_hash to bypass hook review prompts.
     - claude: skipDangerousModePermissionPrompt = True in .claude/settings.json
     - go (opencode): permission.* = "allow" in .config/opencode/opencode.json
     """
@@ -329,6 +361,7 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
         if provider == 'codex' or provider is None:
             codex_dir = home / '.codex'
             config_toml = codex_dir / 'config.toml'
+            hooks_file = codex_dir / 'hooks.json'
             content = ''
             if config_toml.is_file():
                 try:
@@ -340,6 +373,7 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
                 'sandbox_mode': 'danger-full-access',
             })
             updated = ensure_toml_trusted_projects(updated, paths_to_trust)
+            updated = ensure_toml_trusted_hooks(updated, hooks_file)
             with private_fs.parent(config_toml, create=True):
                 pass
             private_fs.atomic_write(config_toml, updated.encode('utf-8'), 131072)
@@ -352,6 +386,7 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
         if provider in ('zai', None):
             zcodex_dir = home / '.zcodex'
             zconfig_toml = zcodex_dir / 'config.toml'
+            zhooks_file = zcodex_dir / 'hooks.json'
             content = ''
             if zconfig_toml.is_file():
                 try:
@@ -363,6 +398,7 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
                 'sandbox_mode': 'danger-full-access',
             })
             updated = ensure_toml_trusted_projects(updated, paths_to_trust)
+            updated = ensure_toml_trusted_hooks(updated, zhooks_file)
             with private_fs.parent(zconfig_toml, create=True):
                 pass
             private_fs.atomic_write(zconfig_toml, updated.encode('utf-8'), 131072)

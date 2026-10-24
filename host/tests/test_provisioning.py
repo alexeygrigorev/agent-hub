@@ -1178,6 +1178,18 @@ def test_ensure_toml_trusted_projects():
     assert res2.count('/tmp/foo/bar') == 1
 
 
+def test_ensure_toml_trusted_hooks(tmp_path):
+    initial = 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n'
+    hooks_file = tmp_path / 'hooks.json'
+    res = p.ensure_toml_trusted_hooks(initial, hooks_file)
+    for suffix in p.KNOWN_HOOK_HASHES:
+        assert f':{suffix}"]' in res
+        assert 'trusted_hash =' in res
+    # Ensure idempotency
+    res2 = p.ensure_toml_trusted_hooks(res, hooks_file)
+    assert res2 == res
+
+
 
 
 
