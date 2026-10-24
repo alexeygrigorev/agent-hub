@@ -27,6 +27,45 @@ class TestIntakeCli(unittest.TestCase):
                 code = exc.code
         return code, output.getvalue(), error.getvalue()
 
+    def test_list_all_pins_snapshot_authorization_and_filters(self):
+        first = {'items': [{'id': 'a'}], 'next': 'a', 'snapshot_version': 7,
+                 'authorization_valid_until': 12345, 'total': 2, 'effective_limit': 1}
+        last = dict(first, items=[{'id': 'b'}], next=None)
+        with patch.object(intake, 'request', side_effect=[first, last]) as transport:
+            code, out, error = self.run_cli('intake', 'list', '--all', '--limit', '1', '--project', 'demo')
+        self.assertEqual(code, 0, error)
+        result = json.loads(out)
+        self.assertEqual([t['id'] for t in result['items']], ['a', 'b'])
+        self.assertEqual(result['total'], 2)
+        self.assertIsNone(result['next'])
+        from urllib.parse import urlparse, parse_qs
+        query = parse_qs(urlparse(transport.call_args_list[1].args[1]).query)
+        self.assertEqual(query, {'status': ['open'], 'project': ['demo'], 'limit': ['1'],
+                                'after': ['a'], 'revision': ['7'], 'authorization_valid_until': ['12345']})
+
+    def test_list_all_rejects_inconsistent_or_incomplete_snapshots(self):
+        first = {'items': [{'id': 'a'}], 'next': 'a', 'snapshot_version': 7,
+                 'authorization_valid_until': None, 'total': 2, 'effective_limit': 1}
+        for last in [dict(first, items=[{'id': 'b'}], next=None, snapshot_version=8),
+                     dict(first, items=[], next=None),
+                     dict(first, next=None),
+                     dict(first, items=[{'id': 'b'}], next=None, authorization_valid_until=99),
+                     intake.StaleSnapshot('Snapshot changed')]:
+            with self.subTest(last=last), patch.object(intake, 'request', side_effect=[first, last]):
+                code, out, error = self.run_cli('intake', 'list', '--all')
+                self.assertEqual(code, 1)
+                self.assertEqual(out, '')
+        with patch.object(intake, 'request') as transport:
+            self.assertEqual(self.run_cli('intake', 'list', '--all', '--after', 'a')[0], 1)
+            transport.assert_not_called()
+
+    def test_list_single_page_passes_integer_limit(self):
+        with patch.object(intake, 'request', return_value={'effective_limit': 100}) as transport:
+            code, out, error = self.run_cli('intake', 'list', '--limit', '100')
+        self.assertEqual(code, 0, error)
+        self.assertIn('limit=100', transport.call_args.args[1])
+        self.assertEqual(json.loads(out)['effective_limit'], 100)
+
     def test_public_module_help_and_existing_commands(self):
         fixture = dict(os.environ, PYTHONPATH=str(ROOT/'host'), PYTHONDONTWRITEBYTECODE='1',
                        HUB_CONFIG_FILE=str(ROOT/'.local/intake/absent-fixture.json'))

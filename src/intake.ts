@@ -21,7 +21,7 @@ export const INTAKE_LIMITS = { request: 32768, tasks: 10000, taskBytes: 131072, 
   // The former 4 MiB budget blocked real intake after the initial backfill
   // and normal context updates. Keep an explicit 32 MiB aggregate bound;
   // per-task, per-record, event and count limits still apply independently.
-  grants: 256, rules: 128, receipts: 8192, totalBytes: 32 * 1024 * 1024, page: 25 };
+  grants: 256, rules: 128, receipts: 8192, totalBytes: 32 * 1024 * 1024, page: 100 };
 /** When open/in_progress/blocked/pending_approval count exceeds this, Hub surfaces
  * intake_open_high on status/list/create. Not a create refuse. */
 export const OPEN_INTAKE_WARN_THRESHOLD = 100; // t1038u-deploy-marker
@@ -359,14 +359,21 @@ export class IntakeService {
   }
   private view(task: Obj, p: Obj): Obj { return { ...this.taskView(task, p), operator_rules: this.rules([task]), data_notice: DATA_NOTICE }; }
   private page(url: URL, items: Obj[], revision: number): Obj {
-    const limit = url.searchParams.has('limit') ? integer(Number(url.searchParams.get('limit')), 1, INTAKE_LIMITS.page) : INTAKE_LIMITS.page;
+    const rawLimit = url.searchParams.get('limit');
+    let limit = 25;
+    if (rawLimit !== null) {
+      if (!/^[-+]?\d+$/.test(rawLimit.trim())) throw new IntakeError('invalid_limit', 400, 'limit');
+      const requested = BigInt(rawLimit.trim());
+      if (requested < 1n) throw new IntakeError('limit_out_of_range', 400, 'limit');
+      limit = Number(requested > BigInt(INTAKE_LIMITS.page) ? BigInt(INTAKE_LIMITS.page) : requested);
+    }
     const after = url.searchParams.get('after');
     if (after) credentialId(after);
     if (after && !url.searchParams.has('revision')) fail('revision_required');
     if (url.searchParams.has('revision') && integer(Number(url.searchParams.get('revision'))) !== revision) fail('stale_snapshot', 409);
     const remaining = items.filter(t => !after || t.id > after);
     const page = remaining.slice(0, limit);
-    return { snapshot_version: revision, items: page, next: remaining.length > limit ? page[page.length - 1].id : null, total: items.length };
+    return { snapshot_version: revision, effective_limit: limit, items: page, next: remaining.length > limit ? page[page.length - 1].id : null, total: items.length };
   }
   private read(url: URL, p: Obj): Obj {
     const path = url.pathname.slice('/api/intake'.length); const revision = this.revision();
@@ -1171,6 +1178,7 @@ export class IntakeService {
       return json({ error: e.code,
         ...(e.field !== undefined ? { field: e.field } : {}),
         ...(e.field !== undefined && e.maxBytes !== undefined ? { max_bytes: e.maxBytes } : {}),
+        ...(e.field === 'limit' ? { min: 1, max: INTAKE_LIMITS.page } : {}),
         ...(e.code === 'invalid_event_kind' ? { valid_kinds: INTAKE_EVENT_KINDS } : {}),
       }, e.status);
     }

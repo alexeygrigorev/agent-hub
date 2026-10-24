@@ -58,7 +58,8 @@ dependency, global binary or local STATE file is needed.
 
 ```sh
 hub intake create --project example --title 'Review request' --text-file request.txt --key capture-001 --acceptance-criteria 'Review posted; two findings max'
-hub intake list --status open --project example
+hub intake list --status open --project example --limit 100
+hub intake list --status open --all
 hub intake show TASK_ID
 hub intake history TASK_ID
 hub intake links TASK_ID
@@ -72,6 +73,20 @@ hub intake grantees --actor example:assistant
 hub handoff
 hub handoff --project example --page-size 10
 ```
+
+`hub intake list` and MCP `intake_list` accept a positive integer `limit` (a numeric
+string also works in REST/MCP). The default is 25; values above the maximum of
+100 clamp to 100. Responses include `effective_limit`. Non-integers return HTTP
+400 `invalid_limit`; zero and negative integers return `limit_out_of_range`, with
+`field: "limit"`, `min: 1` and `max: 100` in either error response.
+
+`hub intake list --all` follows `next` internally, preserving filters and pinning
+`snapshot_version` as `revision` and the authorization expiry from the first page.
+It returns one JSON object with all `items`, `next: null`, and `total` equal to the
+item count. It cannot be combined with `--after`. A changed or incomplete
+snapshot fails without partial output; rerun the command to restart. For manual
+REST/MCP paging, pass `next` as `after`, `snapshot_version` as `revision`, and the
+first page's non-null `authorization_valid_until` on subsequent requests.
 
 `--text-file -` reads bounded UTF-8 stdin. Supply `--source-type chat|voice|forwarded|unknown`,
 `--source-reference` and `--source-time` when known. Unknown source reference/time

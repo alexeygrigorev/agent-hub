@@ -51,6 +51,15 @@ beforeAll(async () => {
   cookie = (await createSessionCookie(defaultEnv, { sub, email: 'admin@fake.local', isAdmin: true, csrfToken: csrf, exp: Math.floor(Date.now() / 1000) + 3600 })).split(';')[0];
 });
 describe('Hub MCP protocol and parity', () => {
+  it.each([5, "5", 26, 100, "100", "101", 1000])('accepts MCP limit %s and clamps above 100', async limit => {
+      const response: any = await (await rpc('tools/call', { name: 'intake_list', arguments: { query: { limit } } })).json();
+      expect(JSON.parse(response.result.content[0].text)).toMatchObject({ status: 200, data: { effective_limit: Math.min(Number(limit), 100) } });
+  });
+
+  it.each([['oops', 'invalid_limit'], [1.5, 'invalid_limit'], [0, 'limit_out_of_range'], ['-1', 'limit_out_of_range']])('rejects invalid MCP limit %s precisely', async (limit, error) => {
+    const response: any = await (await rpc('tools/call', { name: 'intake_list', arguments: { query: { limit } } })).json();
+    expect(JSON.parse(response.result.content[0].text)).toMatchObject({ status: 400, data: { error, field: 'limit', min: 1, max: 100 } });
+  });
   it('updates intake with optional key/version and preserves concise append and held diagnostics', async () => {
     const invoke = async (name: string, args: any) => {
       const response: any = await (await rpc('tools/call', { name, arguments: args })).json();
