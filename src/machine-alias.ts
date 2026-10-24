@@ -102,14 +102,16 @@ export function aliasDetail(aliasId: string, canonicalId: string, hostname: unkn
  * Copy a fresher matching native observation; otherwise stale evidence stays
  * unknown even while the canonical host is online. Source rows are untouched.
  */
-export function projectAliasSessions(rows: any[], aliasOf: Map<string, string>, now: number): any[] {
+export function projectAliasSessions(rows: any[], aliasOf: Map<string, string>, now: number, catalogSeen = new Map<string, number>()): any[] {
   const byNative = new Map(rows.map(s => [`${s.machine_id}/${s.native_id}`, s]));
   return rows.map(original => {
     const canonical = aliasOf.get(String(original.machine_id));
     if (!canonical) return { ...original, resolved_machine_id: original.machine_id };
     const current = byNative.get(`${canonical}/${original.native_id}`);
-    const source = current && Date.parse(current.observed_at) > Date.parse(original.observed_at) ? current : original;
-    const at = Date.parse(source.observed_at);
+    const censusAt = catalogSeen.get(canonical);
+    const freshCensus = typeof censusAt === 'number' && censusAt <= now + 60000 && now - censusAt <= 180000;
+    const source = current && (freshCensus || Date.parse(current.observed_at) > Date.parse(original.observed_at)) ? current : original;
+    const at = current && source === current && freshCensus ? censusAt! : Date.parse(source.observed_at);
     const fresh = Number.isFinite(at) && at <= now + 60000 && now - at <= 180000;
     return { ...source, machine_id: original.machine_id, resolved_machine_id: canonical,
       phase: fresh ? source.phase : 'unknown', agent_state: fresh ? source.agent_state : null,

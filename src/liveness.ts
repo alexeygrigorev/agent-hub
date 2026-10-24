@@ -7,6 +7,7 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import { effectiveCheckin } from './registry';
 import { accountCapacityAlerts } from './account_capacity';
 import { resolveMachineAliases, aliasDetail, projectAliasSessions } from './machine-alias';
+import { freshCatalogs } from './catalog-freshness';
 
 export const LIVENESS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS agent_heartbeats (actor TEXT PRIMARY KEY, machine_id TEXT, status TEXT NOT NULL, summary TEXT, at TEXT NOT NULL);
@@ -112,7 +113,8 @@ export class LivenessService {
     const reported = new Set<string>();
     let sessionRows: any[] = [];
     try { sessionRows = this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray() as any[]; } catch { sessionRows = []; }
-    for (const s of projectAliasSessions(sessionRows, aliasOf, now)) {
+    const catalogSeen = freshCatalogs(this.sql, now);
+    for (const s of projectAliasSessions(sessionRows, aliasOf, now, catalogSeen)) {
       reported.add(s.machine_id + '/' + s.native_id);
       // A late catalog may already report under the canonical id while older
       // rows still name the alias; either binding proves the session live.
@@ -123,6 +125,7 @@ export class LivenessService {
       let state: string; let detail: string;
       if (!hostKnown(s.machine_id)) { state = 'unknown'; detail = `machine ${label(resolved)} is not reporting`; }
       else if (s.alias_observation === 'no_current_native_observation') { state = 'unknown'; detail = 'no current native observation on canonical host'; }
+      else if (s.phase === 'unobserved' || s.phase === 'unknown') { state = 'unknown'; detail = 'no positive current native state'; }
       else if (s.phase !== 'running') { state = 'exited'; detail = `phase ${s.phase}`; }
       // Only agent engines can stall; a quiet shell is usually a long-running command.
       else if (s.agent_state === 'working' && s.engine && s.engine !== 'shell' && activity !== null && activity > t.agentStallS) { state = 'stalled'; detail = `reported working but no terminal activity for ${activity}s`; }
@@ -141,7 +144,7 @@ export class LivenessService {
       let state: string; let detail: string;
       if (l.state === 'uncertain') { state = 'uncertain'; detail = 'launch outcome unknown; reconcile before retrying'; }
       else if ((l.state === 'offered' || l.state === 'starting') && age !== null && age > t.launchStuckS) { state = 'stuck'; detail = `${l.state} for ${age}s`; }
-      else if (alias && l.native_id && !sessionRows.some(s => s.native_id === l.native_id && canonical(s.machine_id) === resolved && Number.isFinite(Date.parse(s.observed_at)) && now - Date.parse(s.observed_at) <= 180000)) { state = 'unknown'; detail = 'no current native observation on canonical host'; }
+      else if (alias && l.native_id && !sessionRows.some(s => s.native_id === l.native_id && canonical(s.machine_id) === resolved && !['unobserved','unknown'].includes(s.phase) && (catalogSeen.has(s.machine_id) || (Number.isFinite(Date.parse(s.observed_at)) && now - Date.parse(s.observed_at) <= 180000)))) { state = 'unknown'; detail = 'no current native observation on canonical host'; }
       else if (l.machine_id && !hostKnown(l.machine_id)) { state = 'unknown'; detail = `machine ${label(resolved)} is not reporting`; }
       else if (l.state === 'running' && l.mode === 'interactive' && l.native_id && !this.sessionReported(l.machine_id, l.native_id, reported) && !this.sessionReported(resolved, l.native_id, reported)) { state = 'missing'; detail = 'session no longer reported by its machine'; }
       else { state = l.state === 'running' ? 'working' : l.state; detail = `${l.state}${age === null ? '' : ` since ${age}s`}`; }

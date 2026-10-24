@@ -112,6 +112,7 @@ describe('fleet health visibility + machine aliasing', () => {
       "INSERT INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, profile, account, last_activity_at) VALUES ('hetzner', 'n-orphan', 'parked', 'codex', 'running', 'idle', ?, 'demo', NULL, 'shared-codex', ?)",
       iso(0), iso(0),
     );
+    sql.exec("INSERT INTO fleet_catalog_seen VALUES ('hetzner', ?)", iso(0));
     const status: any = fleet.accountStatus({ label: 'shared-codex', provider: 'codex', max_concurrency: 8, reserve_percent: 15, enabled: 1 });
     expect(status.active).toBe(status.reserved + status.observed_sessions);
     expect(status.reserved).toBe(1);
@@ -221,3 +222,26 @@ describe('fleet health visibility + machine aliasing', () => {
   }));
 
 });
+
+ it('persists complete census freshness without rewriting unchanged session rows or every heartbeat', () => fixture(async ({sql}) => {
+   let tick=now; const fleet=new FleetService(sql, fn=>fn(), ()=>tick);
+   machine(sql,'census-host','census-host',now);
+   const caller={caller:{machineId:'census-host',kind:'host',actor:'machine:census-host'},scopes:['host']};
+   const payload={sessions:[{native_id:'n1',tag:'worker',engine:'codex',phase:'running',agent_state:null,workspace:'demo',profile:null,account:null}]};
+   const send=()=>fleet.handle(new Request('https://hub/api/fleet/sessions',{method:'PUT',body:JSON.stringify(payload)}),caller);
+   expect((await send()).status).toBe(200);
+   const first=sql.exec("SELECT observed_at FROM fleet_catalog_seen WHERE machine_id='census-host'").one().observed_at;
+   tick+=30000; expect((await (await send()).json() as any).written).toBe(0);
+   expect(sql.exec("SELECT observed_at FROM fleet_catalog_seen WHERE machine_id='census-host'").one().observed_at).toBe(first);
+   tick+=60000; expect((await (await send()).json() as any).written).toBe(0);
+   expect(sql.exec("SELECT observed_at FROM fleet_catalog_seen WHERE machine_id='census-host'").one().observed_at).toBe(iso(90000));
+   expect(sql.exec("SELECT observed_at FROM fleet_sessions WHERE machine_id='census-host'").one().observed_at).toBe(first);
+ }));
+
+ it('keeps absent native observations unknown rather than asserting exit', () => fixture(async ({live,sql}) => {
+   machine(sql,'absence-host','absence-host',now);
+   sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('absence-host','n1','missing','unobserved',?,'demo')",iso(-86400000));
+   sql.exec("INSERT INTO fleet_catalog_seen VALUES('absence-host',?)",iso(0));
+   const s=live.evaluate().subjects.find(s=>s.kind==='session' && s.machine_id==='absence-host');
+   expect(s?.state).toBe('unknown');
+ }));

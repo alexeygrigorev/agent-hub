@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { JobsService } from '../src/jobs';
 import { HostHistoryService } from '../src/host-history';
+import { updateHeartbeatMemoryOnly } from '../src/registry';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 const NOW = Date.parse('2026-10-24T15:00:00Z'), DAY = 86400000;
@@ -71,6 +72,7 @@ describe('resource history', () => {
   it('counts running native observations rather than historical launch records and leaves stale-host running unknown', () => fixture((h, hub, c) => {
     const at = new Date(NOW).toISOString();
     hub.sql.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at) VALUES('live','live','live',?,?)",at,at);
+    hub.sql.exec("INSERT INTO fleet_catalog_seen VALUES('live',?)",at);
     hub.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('live','n1','worker','running',?,'/repo')",at);
     hub.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('live','n2','old','unobserved',?,'/repo')",at);
     h.sample();
@@ -146,6 +148,38 @@ describe('resource history', () => {
     h.sample();
     const series=h.query('1h').series.find(s=>s.kind==='sessions' && s.metric==='running');
     expect(series.points.every((p:any)=>p.value===null)).toBe(true);
+  }));
+
+  it('samples unchanged running rows with a fresh census and a batched in-memory heartbeat', () => fixture((h, hub, c) => {
+    c.t=Date.now(); const id='batched-'+crypto.randomUUID(), at=new Date(c.t).toISOString(), old=new Date(c.t-86400000).toISOString();
+    hub.sql.exec('INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at) VALUES(?,?,?,?,?)',id,id,id,old,old);
+    hub.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES(?,'native','worker','running',?,'/repo')",id,old);
+    hub.sql.exec('INSERT INTO fleet_catalog_seen VALUES(?,?)',id,at);
+    updateHeartbeatMemoryOnly(id); h.sample();
+    const series=h.query('1h').series.find(s=>s.kind==='sessions' && s.metric==='running');
+    expect(series.points.filter((p:any)=>p.value!==null).map((p:any)=>p.value)).toEqual([1]);
+    expect(hub.sql.exec('SELECT observed_at FROM fleet_sessions WHERE machine_id=?',id).one().observed_at).toBe(old);
+  }));
+
+  it('shows pre-census native-live counts as unknown without changing stored evidence or valid counted slots', () => fixture((h, hub) => {
+    h.record('account','a','',NOW-60000,{used:3,native_live:0},'fleet_account_status');
+    h.record('account','a','',NOW,{used:3,native_live:2},'fleet_account_status_census_v2');
+    const d=h.query('1h');
+    expect(d.series.find(s=>s.metric==='native_live').points.filter((p:any)=>p.value!==null).map((p:any)=>p.value)).toEqual([2]);
+    expect(d.series.find(s=>s.metric==='used').points.filter((p:any)=>p.value!==null).map((p:any)=>p.value)).toEqual([3,3]);
+    const old=JSON.parse(String(hub.sql.exec('SELECT payload_json FROM resource_history ORDER BY bucket_ms LIMIT 1').one().payload_json));
+    expect(old[0].values.native_live).toBe(0);
+  }));
+
+  it('prefers simultaneous canonical session counts over stale alias unknowns in either packet order', () => fixture((h, hub) => {
+    hub.sql.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at) VALUES('old','old','RMTHZ',?,?),('live','live','RMTHZ',?,?)",new Date(NOW-DAY).toISOString(),new Date(NOW-DAY).toISOString(),new Date(NOW).toISOString(),new Date(NOW).toISOString());
+    h.record('sessions','fleet','live',NOW-60000,{running:3,failed:7},'census');
+    h.record('sessions','fleet','old',NOW-60000,{running:null,failed:0},'census');
+    h.record('sessions','fleet','old',NOW,{running:null,failed:0},'census');
+    h.record('sessions','fleet','live',NOW,{running:4,failed:8},'census');
+    const d=h.query('1h');
+    expect(d.series.find(s=>s.metric==='running').points.filter((p:any)=>p.value!==null).map((p:any)=>p.value)).toEqual([3,4]);
+    expect(d.series.find(s=>s.metric==='failed').points.filter((p:any)=>p.value!==null).map((p:any)=>p.value)).toEqual([7,8]);
   }));
 
 });

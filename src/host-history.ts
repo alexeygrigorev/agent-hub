@@ -5,6 +5,8 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import type { FleetService } from './fleet';
 import { resolveMachineAliases } from './machine-alias';
 import { isValidMachineId } from './machine-id';
+import { effectiveCheckin } from './registry';
+import { freshCatalogs } from './catalog-freshness';
 
 const MINUTE = 60000, DAY = 86400000;
 export const HISTORY_RETENTION_MS = 32 * DAY;
@@ -137,7 +139,7 @@ export class HostHistoryService {
     // Reuse FleetService account accounting/admission; no second slot calculation.
     for (const row of this.rows('SELECT * FROM fleet_accounts ORDER BY label LIMIT 128')) {
       const a = this.fleet.accountStatus(row);
-      this.record('account', a.label, '', now, { used: a.active, max: a.max_concurrency, native_live: numeric((a as any).native_live) }, 'fleet_account_status');
+      this.record('account', a.label, '', now, { used: a.active, max: a.max_concurrency, native_live: numeric((a as any).native_live) }, 'fleet_account_status_census_v2');
       this.record('quota', a.label, '', now, { remaining_percent: a.status === 'unknown' ? null : a.remaining_percent }, 'fleet_account_status');
     }
     for (const row of this.rows(`SELECT ids.machine_id,
@@ -154,11 +156,10 @@ export class HostHistoryService {
   }
   private nativeRunning(machine: string, now: number): number | null {
     const host = this.rows('SELECT last_checkin_at FROM machines WHERE id=?', machine)[0];
-    const at = Date.parse(host?.last_checkin_at);
+    const at = Date.parse(effectiveCheckin(machine, host?.last_checkin_at) || '');
     if (!Number.isFinite(at) || now - at > 180000 || at > now + MINUTE) return null;
-    const census = this.rows('SELECT MAX(observed_at) AS at FROM fleet_sessions WHERE machine_id=?', machine)[0];
-    if (!Number.isFinite(Date.parse(census?.at)) || now - Date.parse(census.at) > 180000) return null;
-    const count = this.rows("SELECT COUNT(*) AS n FROM fleet_sessions WHERE machine_id=? AND phase='running' AND observed_at>=?", machine, new Date(now - 180000).toISOString())[0];
+    if (!freshCatalogs(this.sql, now).has(machine)) return null;
+    const count = this.rows("SELECT COUNT(*) AS n FROM fleet_sessions WHERE machine_id=? AND phase='running'", machine)[0];
     return Number(count.n);
   }
   nextSampleAt(): number {
@@ -220,7 +221,10 @@ export class HostHistoryService {
             groups.set(key,series);
           }
           const index=Math.floor((o.at-first)/step), previous=series.points[index];
-          if (!previous.observed_at || o.at>=previous.at) series.points[index]={at:o.at,value:numeric(value),observed_at:new Date(o.at).toISOString()};
+          const proven = o.kind==='account' && metric==='native_live' && o.source==='fleet_account_status' ? null : numeric(value);
+          // Simultaneous alias gauges must not overwrite the canonical host's
+          // real running count with the stale alias's unknown/zero projection.
+          if (!previous.observed_at || o.at>previous.at || (o.at===previous.at && o.machine_id===host)) series.points[index]={at:o.at,value:proven,observed_at:new Date(o.at).toISOString()};
         }
       }
     }

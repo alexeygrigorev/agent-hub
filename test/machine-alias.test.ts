@@ -60,3 +60,13 @@ describe('machine aliasing', () => {
    expect(projectAliasSessions([old,live],alias,now)[0].phase).toBe('exited');
    expect(old.phase).toBe('running');
  });
+
+ it('uses a fresh complete census for unchanged canonical rows without freshening unmatched aliases', () => {
+   const now=Date.now(), alias=new Map([['old','live']]), seen=new Map([['live',now]]);
+   const old={machine_id:'old',native_id:'n1',phase:'running',agent_state:'working',observed_at:new Date(now-86400000).toISOString()};
+   const live={...old,machine_id:'live',observed_at:new Date(now-172800000).toISOString()};
+   expect(projectAliasSessions([old,live],alias,now,seen)[0].phase).toBe('running');
+   expect(projectAliasSessions([old],alias,now,seen)[0].phase).toBe('unknown');
+   expect(projectAliasSessions([old,live],alias,now,new Map([['live',now-240000]]))[0].phase).toBe('unknown');
+   expect(old.machine_id).toBe('old');
+ });

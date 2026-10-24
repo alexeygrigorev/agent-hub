@@ -11,8 +11,10 @@ import { isValidMachineId } from './machine-id';
 import { LivenessService } from './liveness';
 import { reconcileAccountCapacity } from './account_capacity';
 import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
+import { freshCatalogs } from './catalog-freshness';
 
 export const FLEET_SCHEMA = `
+CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_memory_holds (launch_id TEXT PRIMARY KEY, since TEXT NOT NULL, rejected_json TEXT NOT NULL, refused INTEGER NOT NULL DEFAULT 0, retry_id TEXT);
 CREATE TABLE IF NOT EXISTS fleet_accounts (label TEXT PRIMARY KEY, provider TEXT NOT NULL, max_concurrency INTEGER NOT NULL, reserve_percent REAL NOT NULL, enabled INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_routes (machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, PRIMARY KEY(machine_id, engine, account));
@@ -418,12 +420,11 @@ export class FleetService {
     // launch reservations vs orphan observed sessions, alongside live native
     // processes verified by the host catalog for this account. The sibling
     // capacity fixer owns the counting; this only projects it.
-    let nativeLive = 0;
+    let nativeLive: number | null = null;
     try {
-      nativeLive = liveList.length
-        ? Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.account = ? AND s.phase = 'running' AND s.observed_at >= ? AND s.workspace NOT LIKE '% (deleted)' AND (s.cwd IS NULL OR s.cwd NOT LIKE '% (deleted)') AND s.machine_id IN (${liveList.map(() => '?').join(',')})`, account.label, new Date(this.now() - 180000).toISOString(), ...liveList).one().n)
-        : 0;
-    } catch { nativeLive = 0; }
+      const seen = freshCatalogs(this.sql, this.now());
+      if (liveList.length && liveList.every(id => seen.has(id))) nativeLive = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.account = ? AND s.phase = 'running' AND s.workspace NOT LIKE '% (deleted)' AND (s.cwd IS NULL OR s.cwd NOT LIKE '% (deleted)') AND s.machine_id IN (${liveList.map(() => '?').join(',')})`, account.label, ...liveList).one().n);
+    } catch { nativeLive = null; }
     const availableSlots = Math.max(0, Number(account.max_concurrency) - active);
     const placeableMachines = new Set<string>();
     const placementReasons = new Set<string>();
@@ -916,7 +917,7 @@ export class FleetService {
         const canonical = machineAliases[String(m.id)] ?? null;
         return { ...m, last_checkin_at: effectiveCheckin(m.id, m.last_checkin_at), alias_of: canonical, canonical_id: canonical ?? String(m.id) };
       });
-      const sessions = projectAliasSessions(this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray(), new Map(Object.entries(machineAliases)), this.now());
+      const sessions = projectAliasSessions(this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray(), new Map(Object.entries(machineAliases)), this.now(), freshCatalogs(this.sql, this.now()));
       return response({ accounts: this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray().map(a => this.accountStatus(a)), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray().map(r => ({ ...r, supports_goal: ['codex', 'zcodex'].includes(String(r.engine)) })),
         machines, machine_aliases: machineAliases,
         agents: this.sql.exec('SELECT tag, project, role, machine_id, engine, session_id, health_state, health_at FROM agents').toArray(),
@@ -1115,6 +1116,9 @@ export class FleetService {
         reconcileAccountCapacity(this.sql, this.now());
         // A refreshed catalog can free machine_capacity: promote waiters.
         try { this.drainCapacityQueue(); } catch { /* best-effort */ }
+        // unchanged rows retain last-change timestamps; the complete census
+        // has separate freshness evidence, bounded to one host write/minute.
+        this.sql.exec('INSERT INTO fleet_catalog_seen VALUES (?,?) ON CONFLICT(machine_id) DO UPDATE SET observed_at=excluded.observed_at WHERE fleet_catalog_seen.observed_at <= ?', caller.machineId!, new Date(this.now()).toISOString(), new Date(this.now() - 60000).toISOString());
         return response({ status: 'reported', written });
       });
     }
