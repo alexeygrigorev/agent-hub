@@ -930,7 +930,6 @@ def test_expired_claim_retracts_undelivered_inbox_and_fails_recipient_not_ready(
         journal_dir=env["journal"], executable=env["fake"], request=hub.request,
         now_ms=now_ms)
     assert outcome["state"] == "unknown"
-    assert hub.statuses.get(cid, {}).get("status") == "waiting in inbox for recipient"
     # Ensure message file was created in msgs directory
     assert len(os.listdir(env["msgs"])) == 1
 

@@ -577,7 +577,6 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertEqual(payload['intake_task_id'], 'task-url-1234')
 
     def test_commands_rendering_shows_waiting_in_inbox_and_reason(self):
-        args = self.parse('commands', 's1')
         raw = {
             'commands': [
                 {
@@ -589,7 +588,7 @@ class TestSessionControlCli(unittest.TestCase):
                 }
             ]
         }
-        rendered = session_control.render_output(args, raw)
+        rendered = session_control.render_commands(raw)
         self.assertIn('waiting in inbox for recipient', rendered)
         self.assertIn('aplexer inbox recorded; recipient has not acknowledged', rendered)
 

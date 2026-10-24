@@ -873,6 +873,8 @@ def render_output(args, result):
         sessions = result.get('sessions', []) if isinstance(result, dict) else (result if isinstance(result, list) else [])
         return render_table(sessions)
     if cmd == 'commands':
-        return render_commands(result)
+        if getattr(args, 'table', False) or (hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()):
+            return render_commands(result)
+        return result
     return result
 

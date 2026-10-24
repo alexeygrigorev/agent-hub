@@ -1434,14 +1434,6 @@ def handle_claimed_command(
         if outcome.get("state") == "unknown":
             record["ack_submitted"] = False
             record["ack_pending"] = "awaiting_recipient_reply"
-            if request is not None:
-                try:
-                    request("POST", f"/api/session-commands/{command_id}/status",
-                            {"claim_token": proved["claim_token"],
-                             "status": "waiting in inbox for recipient",
-                             "reason": outcome.get("reason", "waiting in inbox for recipient")})
-                except Exception:
-                    pass
             _write_journal(journal_file, record)
             return {"op": op, **record,
                     "ack": {"submitted": False, "pending": "awaiting_recipient_reply"}}
