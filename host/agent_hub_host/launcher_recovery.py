@@ -83,12 +83,16 @@ def settle_retired_legacy(launcher, *, state_dir=None):
     import datetime as dt
     import uuid
     from .private_fs import read_bytes
+    from .retired_native import resolve_aplexer_state_dir
     settled = []
     try:
         import fcntl
         cfg = Path(launcher['config_dir'])
         db, lock = cfg / 'state.db', cfg / 'launch.lock'
-        native = Path(state_dir or os.environ.get('APLEXER_STATE_DIR') or Path.home() / '.local/state/aplexer')
+        # F5: resolve via the shared helper (explicit > APLEXER_STATE_DIR >
+        # XDG_STATE_HOME/aplexer > ~/.local/state/aplexer), matching aplexer
+        # paths.rs and retired_native.py — never a fourth copy of the logic.
+        native = Path(resolve_aplexer_state_dir(state_dir))
         if cfg.is_symlink() or not db.is_file() or db.is_symlink() or lock.is_symlink():
             return settled
         # Bound directory enumeration too; overflow means incomplete evidence.

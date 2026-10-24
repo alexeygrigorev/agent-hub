@@ -1,10 +1,22 @@
-.engine-page { max-width: 900px; margin: 40px auto; padding: 0 24px 48px; }
+/* Engine accounts structure only; the official kit owns controls, type, palette and shell. */
+.engine-page { max-width: 900px; margin: 0 auto; padding: 0 0 48px; min-width: 0; }
 .engine-page h1 { margin: 16px 0; }
 .engine-page h2 { margin: 24px 0 12px; }
-.engine-page p { margin: 12px 0; overflow-wrap: anywhere; }
-.engine-page section { padding: 20px; margin: 16px 0; border: 1px solid var(--dk-border-default); border-radius: var(--dk-radius-md); }
-.engine-page section h2 { margin-top: 0; }
+.engine-page p { margin: 12px 0; overflow-wrap: anywhere; color: var(--dk-text-muted); }
+.engine-page section { padding: 20px; margin: 16px 0; border: 1px solid var(--dk-border-default); border-radius: var(--dk-radius-md); background: var(--dk-bg-surface); min-width: 0; }
+.engine-page section h2, .engine-page section h3 { margin-top: 0; color: var(--dk-text-heading); overflow-wrap: anywhere; }
+.engine-page section p { color: var(--dk-text-primary); }
 .engine-page form { display: flex; align-items: end; flex-wrap: wrap; gap: 12px; margin-top: 20px; }
-.engine-page label { display: flex; flex-direction: column; gap: 8px; }
+.engine-page label { display: flex; flex-direction: column; gap: 8px; min-width: 0; flex: 1; }
+.engine-page input { min-width: 0; width: 100%; }
 .engine-page button { margin-left: 12px; }
 .engine-page code { white-space: normal; overflow-wrap: anywhere; }
+.engine-page a { overflow-wrap: anywhere; }
+
+@media (max-width: 820px) {
+  .engine-page { padding-bottom: 32px; }
+  .engine-page section { padding: var(--dk-space-3); }
+  .engine-page form { flex-direction: column; align-items: stretch; }
+  .engine-page button { margin-left: 0; width: 100%; min-height: var(--dk-size-touch); }
+  .engine-page section .dk-button { width: 100%; min-height: var(--dk-size-touch); }
+}

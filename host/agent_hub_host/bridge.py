@@ -96,8 +96,9 @@ def _absolute_native_root(value):
 def get_authoritative_runtime_dir(explicit_runtime_dir: str | None = None) -> str:
     """Resolve authoritative native runtime directory per aplexer paths.rs.
 
-    Precedence:
-    explicit runtime_dir > APLEXER_RUNTIME_DIR > XDG_RUNTIME_DIR/aplexer > /tmp/aplexer-<uid>.
+    Precedence (Unix):
+    explicit runtime_dir > APLEXER_RUNTIME_DIR > XDG_RUNTIME_DIR/aplexer
+    > /run/user/<uid>/aplexer (when that dir exists) > /tmp/aplexer-<uid>.
     Never checks workspace-local directories for runtime root.
     """
     if explicit_runtime_dir:
@@ -112,6 +113,12 @@ def get_authoritative_runtime_dir(explicit_runtime_dir: str | None = None) -> st
             raise BridgeCapabilityGap('Absolute Windows LOCALAPPDATA required')
         return os.path.join(base, 'aplexer', 'run')
     uid = os.geteuid() if hasattr(os, "geteuid") else 1000
+    # F5: match aplexer paths.rs default_runtime_root — prefer the
+    # per-user /run/user/<uid>/aplexer dir when the manager provides
+    # /run/user/<uid>; otherwise fall back to /tmp/aplexer-<uid> as before.
+    # Never creates anything here — aplexer's ensure() owns creation.
+    if os.path.isdir(f"/run/user/{uid}"):
+        return os.path.abspath(f"/run/user/{uid}/aplexer")
     return os.path.abspath(f"/tmp/aplexer-{uid}")
 
 
