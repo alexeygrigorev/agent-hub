@@ -54,6 +54,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scope boundary (all pushed commits)
+        run: python3 scripts/ci/scope_guard.py
 
       - name: Shared device login (DataTalksClub/auth)
         uses: actions/checkout@v4
@@ -125,6 +130,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scope boundary (all pushed commits)
+        run: python3 scripts/ci/scope_guard.py
 
       - uses: actions/setup-python@v5
         with:

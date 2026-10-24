@@ -19,6 +19,12 @@ trap cleanup EXIT
 
 FAILURES=0
 
+echo "=== Scope boundary (all new commits and working changes) ==="
+if ! python3 scripts/ci/scope_guard.py --working || ! python3 -m unittest discover -s scripts/ci -p "test_scope_guard.py"; then
+  echo "FAIL: Scope boundary checks failed"
+  FAILURES=$((FAILURES + 1))
+fi
+
 echo "=== 1/6: TypeScript Typecheck ==="
 if ! npm run typecheck; then
   echo "FAIL: Typecheck failed"
