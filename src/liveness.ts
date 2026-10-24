@@ -33,7 +33,7 @@ export function thresholdsFrom(env: any): Thresholds {
 }
 
 /** States that open an alert. `idle`, `working`, `exited` and `drained` are not problems. */
-export const ALERT_STATES = new Set(['stale', 'offline', 'stalled', 'stuck', 'uncertain', 'missing']);
+export const ALERT_STATES = new Set(['stale', 'offline', 'stalled', 'stuck', 'uncertain', 'missing', 'launcher_memory_reserve']);
 
 export type Subject = { kind: 'machine' | 'session' | 'launch' | 'agent'; id: string; state: string; detail: string; machine_id?: string | null; age_s?: number | null };
 
@@ -106,6 +106,23 @@ export class LivenessService {
       else if (l.state === 'running' && l.mode === 'interactive' && l.native_id && !this.sessionReported(l.machine_id, l.native_id, reported)) { state = 'missing'; detail = 'session no longer reported by its machine'; }
       else { state = l.state === 'running' ? 'working' : l.state; detail = `${l.state}${age === null ? '' : ` since ${age}s`}`; }
       subjects.push({ kind: 'launch', id: l.id, state, detail: `${l.summary}: ${detail}`, machine_id: l.machine_id, age_s: age });
+    }
+
+    // Memory waits share the existing operator-alert bus/webhook and dedupe.
+    // A proven pre-spawn refusal alerts immediately; planned holds after 5m.
+    for (const h of this.sql.exec("SELECT h.*, l.state FROM fleet_memory_holds h JOIN fleet_launches l ON l.id = h.launch_id WHERE l.state = 'queued' OR (l.state = 'exited' AND h.retry_id IS NOT NULL AND h.since >= ?)", new Date(now - 86400000).toISOString()).toArray() as any[]) {
+      if (h.state === 'queued' && h.refused && this.sql.exec('SELECT launch_id FROM fleet_memory_holds WHERE retry_id = ?', h.launch_id).toArray().length) continue;
+      const age = ageSeconds(h.since, now) ?? 0;
+      if (!h.refused && age <= 300) continue;
+      subjects.push({ kind: 'launch', id: h.launch_id, state: 'launcher_memory_reserve',
+        detail: `memory hold for ${age}s: ${h.rejected_json}`, age_s: age });
+    }
+    // Preserve visibility of older failures as well as newly queued refusals.
+    for (const l of this.sql.exec("SELECT id, updated_at, machine_id FROM fleet_launches WHERE state = 'failed' AND exit_reason = 'launcher_memory_reserve' AND updated_at >= ?", new Date(now - 86400000).toISOString()).toArray() as any[]) {
+      const m: any = this.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', l.machine_id).toArray()[0];
+      let hb: any = {}; try { hb = JSON.parse(m?.last_heartbeat || '{}'); } catch { /* unknown stays explicit */ }
+      subjects.push({ kind: 'launch', id: l.id, state: 'launcher_memory_reserve', detail:
+        `memory refusal; latest mem_available_mb=${hb.mem_avail_mb ?? 'unknown'}, reserved_mb=${hb.launcher_resources?.active_mem_mb ?? 'unknown'}, floor_mb=10240, requested_mb=1500`, machine_id: l.machine_id });
     }
 
     for (const h of this.sql.exec('SELECT * FROM agent_heartbeats ORDER BY actor').toArray() as any[]) {

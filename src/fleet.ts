@@ -8,8 +8,10 @@ import { QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, ensureTbmQuotaSchema } from './quota'
 import { evaluateQuotaAdmission } from './quota_admission';
 import { adoptObservedNativeSessions, reconcileUnboundFleetSessions } from './session_control';
 import { isValidMachineId } from './machine-id';
+import { LivenessService } from './liveness';
 
 export const FLEET_SCHEMA = `
+CREATE TABLE IF NOT EXISTS fleet_memory_holds (launch_id TEXT PRIMARY KEY, since TEXT NOT NULL, rejected_json TEXT NOT NULL, refused INTEGER NOT NULL DEFAULT 0, retry_id TEXT);
 CREATE TABLE IF NOT EXISTS fleet_accounts (label TEXT PRIMARY KEY, provider TEXT NOT NULL, max_concurrency INTEGER NOT NULL, reserve_percent REAL NOT NULL, enabled INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_routes (machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, PRIMARY KEY(machine_id, engine, account));
 CREATE TABLE IF NOT EXISTS fleet_subscriptions (machine_id TEXT NOT NULL, account TEXT NOT NULL, service TEXT NOT NULL, plan TEXT, observed_at TEXT NOT NULL, quota_json TEXT NOT NULL, PRIMARY KEY(machine_id, account));
@@ -431,7 +433,7 @@ export class FleetService {
     if (input.account !== undefined) request.account = input.account;
     if (input.approved_action !== undefined) request.approved_action = input.approved_action;
     if (input.tier !== undefined) request.tier = input.tier;
-    const rejected: { machine: string; engine: string; reason: string }[] = []; const candidates: any[] = [];
+    const rejected: { machine: string; engine: string; reason: string; memory?: any }[] = []; const candidates: any[] = [];
     const accounts = new Map(this.sql.exec('SELECT * FROM fleet_accounts').toArray().map(a => [a.label, this.accountStatus(a)]));
     const definitions = new Map(this.sql.exec('SELECT * FROM fleet_accounts').toArray().map(a => [a.label, a]));
     // Engines advertised by at least one live (non-drained, fresh-checkin)
@@ -498,7 +500,7 @@ export class FleetService {
       else if (!account || account.status !== 'ok') reason = 'account_' + (account?.status || 'unmapped');
       else if (!this.observation(definitions.get(route.account), route)) reason = 'machine_account_quota_unknown';
       else if (account.available_slots < 1) reason = 'account_capacity';
-      if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason }); continue; }
+      if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'launcher_memory_reserve' ? { memory: this.memoryHeadroom(route.machine_id) } : {}) }); continue; }
       const family = definitions.get(route.account)?.provider === 'codex-orin' ? 'codex' : definitions.get(route.account)?.provider;
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
@@ -522,6 +524,26 @@ export class FleetService {
       request.workspace = candidates[0].workspace;
     }
     return { request, selected: candidates[0] || null, candidates, rejected };
+  }
+
+  private memoryHeadroom(machine: string) {
+    const row: any = this.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', machine).toArray()[0];
+    const hb = parsed(row?.last_heartbeat);
+    const pending = hb.launcher_resources ? Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND (state IN ('offered','starting') OR (state IN ('running','uncertain') AND updated_at >= ?))", machine, hb.launcher_resources.observed_at).one().n) : 0;
+    return { mem_available_mb: Number.isFinite(hb.mem_avail_mb) ? hb.mem_avail_mb : null,
+      reserved_mb: (hb.launcher_resources?.active_mem_mb || 0) + 1500 * pending,
+      floor_mb: 10240, requested_mb: 1500, observed_at: hb.launcher_resources?.observed_at ?? null };
+  }
+
+  private memoryHold(id: string, rejected: any[], refused = false) {
+    if (!rejected.some(r => r.reason === 'launcher_memory_reserve')) return;
+    this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json, refused) VALUES (?, ?, ?, ?) ON CONFLICT(launch_id) DO UPDATE SET rejected_json = excluded.rejected_json, refused = MAX(refused, excluded.refused)',
+      id, new Date(this.now()).toISOString(), JSON.stringify(rejected), refused ? 1 : 0);
+  }
+
+  private memoryRejections(id: string): any[] {
+    const row: any = this.sql.exec('SELECT rejected_json FROM fleet_memory_holds WHERE launch_id = ?', id).toArray()[0];
+    return row ? parsed(row.rejected_json, []) : [];
   }
 
   private queuePosition(id: string): number {
@@ -559,7 +581,11 @@ export class FleetService {
         }
         let plan: any;
         try { plan = this.plan(input); } catch { continue; }
-        if (!plan || (plan as any).error || !(plan as any).selected) continue;
+        if (!plan || (plan as any).error) continue;
+        if (!plan.selected) { this.memoryHold(row.id, plan.rejected || []); continue; }
+        const memoryHold: any = this.sql.exec('SELECT since, refused FROM fleet_memory_holds WHERE launch_id = ?', row.id).toArray()[0];
+        // A refused pre-spawn attempt needs a newer host sample before retry.
+        if (memoryHold?.refused && (this.memoryHeadroom(plan.selected.machine).observed_at || '') <= memoryHold.since) continue;
         if (bound.parent_id) {
           const parent: any = this.sql.exec('SELECT actor, state FROM fleet_launches WHERE id = ?', bound.parent_id).toArray()[0];
           if (!parent || parent.actor !== row.actor || !['starting', 'running'].includes(parent.state)) continue;
@@ -632,7 +658,7 @@ export class FleetService {
       if (prior) {
         if (!sameIntent(prior.request_json, canonical) || !sameEditCaller(prior.request_json, caller)) return result({ error: 'idempotency_conflict' }, 409);
         if (prior.state === 'queued') {
-          return result({ id: prior.id, state: 'queued', queued: true, queue_position: this.queuePosition(prior.id), machine: null, engine: null, account: null, mode: prior.mode, access: JSON.parse(prior.request_json).access?.mode || 'legacy_unspecified', replay: true }, 202);
+          return result({ id: prior.id, state: 'queued', queued: true, queue_position: this.queuePosition(prior.id), rejected: this.memoryRejections(prior.id), machine: null, engine: null, account: null, mode: prior.mode, access: JSON.parse(prior.request_json).access?.mode || 'legacy_unspecified', replay: true }, 202);
         }
         return result({ id: prior.id, state: prior.state, machine: prior.machine_id, engine: prior.engine, account: prior.account, mode: prior.mode, access: JSON.parse(prior.request_json).access?.mode || 'legacy_unspecified', replay: true });
       }
@@ -665,6 +691,7 @@ export class FleetService {
         if (isCapacityOnlyHold(plan.rejected)) {
           const id = crypto.randomUUID(); const at = new Date(this.now()).toISOString();
           this.sql.exec('INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', id, actor, caller.kind || 'unknown', plan.request.parent_id, plan.request.summary, input.idempotency_key, JSON.stringify({ ...bound, ...(admitted.authority ? { edit_authority: admitted.authority } : {}) }), '', '', '', null, plan.request.mode, plan.request.workspace, plan.request.prompt, 'queued', at, at);
+          this.memoryHold(id, plan.rejected);
           return result({ id, state: 'queued', queued: true, queue_position: this.queuePosition(id), rejected: plan.rejected, access: admitted.access.mode }, 202);
         }
         return result({ error: 'no_eligible_route', rejected: plan.rejected, access: parsed.access.mode }, 409);
@@ -694,7 +721,7 @@ export class FleetService {
         agents: this.sql.exec('SELECT tag, project, role, machine_id, engine, session_id, health_state, health_at FROM agents').toArray(),
         sessions: this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray(),
         subscriptions: this.sql.exec('SELECT * FROM fleet_subscriptions ORDER BY machine_id, service, account').toArray().map((s: any) => ({ machine_id: s.machine_id, account: s.account, service: s.service, plan: s.plan, observed_at: s.observed_at, stale: !fresh(s.observed_at, this.now(), 1200000), quota: parsed(s.quota_json) })),
-        launches: this.sql.exec('SELECT * FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => { const { request_json, request_key, prompt, model_selection_json, ...view } = row; const selection = parsed(model_selection_json); return { ...view, model_id: selection?.id ?? null, model: selection?.model ?? null, hub_session_id: controlIds.get(row.id) ?? null, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; }) });
+        launches: this.sql.exec('SELECT * FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => { const { request_json, request_key, prompt, model_selection_json, ...view } = row; const selection = parsed(model_selection_json); return { ...view, rejected: row.state === 'queued' ? this.memoryRejections(row.id) : [], model_id: selection?.id ?? null, model: selection?.model ?? null, hub_session_id: controlIds.get(row.id) ?? null, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; }) });
     }
     if (path === '/api/fleet/claim-policy' && request.method === 'GET') {
       if (!admin) return response({ error: 'forbidden' }, 403);
@@ -982,6 +1009,27 @@ export class FleetService {
           data.state === 'failed' && data.confirmed_exit === true &&
           (data.reason === 'launcher_not_started' || (diagnostic && data.reason === diagnostic.reason)) &&
           data.launcher_task_id === 'hub-' + row.id && !row.native_id;
+        if (noStart && data.reason === 'launcher_memory_reserve') {
+          const prior: any = this.sql.exec('SELECT retry_id FROM fleet_memory_holds WHERE launch_id = ?', row.id).toArray()[0];
+          if (prior?.retry_id) return response({ id: prior.retry_id, state: 'queued', replay: true });
+          if (row.state === 'starting' && !this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) {
+            // Fenced no-start proof: keep the user's session queued, with a new
+            // launcher task identity. Never reset/reuse the failed local task.
+            const id = crypto.randomUUID(), at = new Date(this.now()).toISOString();
+            const rejected = [{ machine: row.machine_id, engine: row.engine, reason: data.reason, memory: this.memoryHeadroom(row.machine_id) }];
+            this.sql.exec("UPDATE fleet_launches SET request_key = ?, state = 'exited', exit_reason = ?, launch_error_json = ?, verification_status = 'not_started', finished_at = ?, updated_at = ? WHERE id = ?", 'memory-retry-' + row.id, data.reason, JSON.stringify(diagnostic), at, at, row.id);
+            this.sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, '', '', '', NULL, ?, ?, ?, 'queued', ?, ?)", id, row.actor, row.requester_kind, row.parent_id, row.summary, row.request_key, row.request_json, row.mode, row.workspace, row.prompt, row.created_at, at);
+            this.memoryHold(row.id, rejected, true); this.memoryHold(id, rejected, true);
+            // Durable alert exists even if a later heartbeat promotes before cron.
+            const alerts = new LivenessService(this.sql); alerts.init();
+            alerts.setAlert('launch', row.id, { state: 'launcher_memory_reserve', detail: JSON.stringify(rejected) });
+            this.sql.exec('UPDATE fleet_memory_holds SET retry_id = ? WHERE launch_id = ?', id, row.id);
+            if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
+              this.sql.exec("UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = NULL, state = 'queued', updated_at = ? WHERE fleet_launch_id = ? AND binding_json IS NULL", id, at, row.id);
+            }
+            return response({ id, state: 'queued', queued: true, rejected });
+          }
+        }
         if (noStart && row.state === 'failed' && row.exit_reason === data.reason && row.launcher_task_id === data.launcher_task_id) return response({ id: row.id, state: row.state, replay: true });
         if ((!noStart && !object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'diagnostic'])) || !['running', 'uncertain', 'failed', 'exited'].includes(data.state) || !['starting', 'running', 'uncertain'].includes(row.state)) return response({ error: 'invalid_transition' }, 409);
         if (['exited', 'failed'].includes(data.state) && this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) return response({ error: 'task_report_required' }, 409);

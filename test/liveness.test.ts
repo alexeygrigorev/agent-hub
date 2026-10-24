@@ -203,3 +203,29 @@ describe('stale alerts', () => {
     expect((await stub.fetch(new Request('https://hub.test/api/checks/liveness/run', { method: 'POST' }))).status).toBe(401);
   });
 });
+
+
+describe('memory pressure alerts', () => {
+  it('alerts once after five minutes with numbers and resolves after promotion', () => fixture((live, sql, clock) => {
+    launch(sql, 'memory-held', '', 'queued', 0);
+    const rejected = [{reason: 'launcher_memory_reserve', memory: {mem_available_mb: 12000, reserved_mb: 2000, floor_mb: 10240}}];
+    sql.exec('INSERT INTO fleet_memory_holds (launch_id,since,rejected_json) VALUES (?,?,?)', 'memory-held', iso(0), JSON.stringify(rejected));
+    expect(live.reconcileAlerts(live.evaluate().subjects)).toHaveLength(0);
+    clock.t += 301000;
+    const opened = live.reconcileAlerts(live.evaluate().subjects);
+    expect(opened).toHaveLength(1);
+    expect(opened[0].detail).toContain('12000');
+    expect(opened[0].detail).toContain('10240');
+    expect(live.reconcileAlerts(live.evaluate().subjects)).toHaveLength(0);
+    sql.exec("UPDATE fleet_launches SET state='offered' WHERE id='memory-held'");
+    live.reconcileAlerts(live.evaluate().subjects);
+    expect(sql.exec('SELECT resolved_at FROM liveness_alerts WHERE id=?', opened[0].id).one().resolved_at).not.toBeNull();
+  }));
+  it('alerts immediately for a fenced launch refusal and older memory failures', () => fixture((live, sql) => {
+    launch(sql, 'memory-retry', '', 'queued', 0);
+    sql.exec("INSERT INTO fleet_memory_holds (launch_id,since,rejected_json,refused) VALUES (?,?,?,1)", 'memory-retry', iso(0), '[{"reason":"launcher_memory_reserve","memory":{"floor_mb":10240}}]');
+    launch(sql, 'memory-failed', '', 'failed', 0);
+    sql.exec("UPDATE fleet_launches SET exit_reason='launcher_memory_reserve' WHERE id='memory-failed'");
+    expect(live.reconcileAlerts(live.evaluate().subjects)).toHaveLength(2);
+  }));
+});
