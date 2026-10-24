@@ -575,23 +575,20 @@ def session_metadata(raw, settings):
         ws = session.get("workspace", "")
         cwd = session.get("cwd") if isinstance(session.get("cwd"), str) else None
         phase = session.get("state") or session.get("phase", "unknown")
-        if confirmed_empty(session):
+        exit_confirmed = confirmed_empty(session)
+        # Kernel annotations affect path spelling, never lifecycle proof. Keep
+        # real existing directories whose literal names end with the suffix.
+        if isinstance(ws, str) and ws.endswith(' (deleted)') and not os.path.exists(ws):
+            ws = ws.removesuffix(' (deleted)')
+        if isinstance(cwd, str) and cwd.endswith(' (deleted)') and not os.path.exists(cwd):
+            cwd = cwd.removesuffix(' (deleted)')
+        if exit_confirmed:
             phase = 'exited'
-            # Linux appends this marker to a deleted process cwd. Normalize
-            # only after positive empty-containment proof, for exact matching
-            # against the original binding; a deleted path alone proves nothing.
-            if isinstance(ws, str):
-                ws = ws.removesuffix(' (deleted)')
-            if isinstance(cwd, str):
-                cwd = cwd.removesuffix(' (deleted)')
         elif phase in ('exited', 'dead', 'pruned', 'forgotten'):
-            # Catalog phase and a missing/deleted workspace are only hints.
-            # Neither proves worker/workload death: publishing a terminal hint
-            # would let adoption mark the Hub row stopped before a real stop.
             phase = 'uncertain'
         clean.append({"native_id": session["id"], "tag": session["tag"], "workspace": ws, "engine": engine,
                       "profile": profile, "account": matches[0]["account_label"] if len(matches) == 1 else None,
-                      "phase": phase, "agent_state": session.get("reported_state"),
+                      "phase": phase, "confirmed_exit": exit_confirmed, "agent_state": session.get("reported_state"),
                       "cwd": cwd,
                       "last_activity_at": _ms_to_iso(activity_ms(session)),
                       "created_at_ms": created_at_ms})

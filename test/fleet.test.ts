@@ -138,6 +138,29 @@ describe('generic accounts and launch placement', () => {
     }
     expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches').one().n).toBe(0);
   }));
+  it('keeps deleted-cwd and unverified terminal census capacity until positive exit', () => fixture(async (s, sql) => {
+    await configure(s);
+    const id = crypto.randomUUID();
+    const row = { native_id: id, tag: 'deleted-live', workspace: '/demo', cwd: '/gone (deleted)',
+      engine: 'codex', phase: 'running', agent_state: null, profile: null, account: 'shared-codex', created_at_ms: now };
+    const report = (value: any) => s.handle(request('/sessions', {sessions:[value]}, 'PUT'), host('hetzner'));
+    const active = () => s.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-codex'").one()).active;
+    expect((await report(row)).status).toBe(200);
+    expect(sql.exec('SELECT phase FROM fleet_sessions WHERE native_id=?',id).one().phase).toBe('running');
+    expect(sql.exec('SELECT state FROM session_control_sessions WHERE id=?',id).one().state).toBe('running');
+    expect(active()).toBe(1);
+    for (const proof of [undefined, false]) {
+      expect((await report({...row,phase:'exited',confirmed_exit:proof})).status).toBe(200);
+      expect(sql.exec('SELECT phase FROM fleet_sessions WHERE native_id=?',id).one().phase).toBe('uncertain');
+      expect(sql.exec('SELECT state FROM session_control_sessions WHERE id=?',id).one().state).toBe('uncertain');
+      expect(active()).toBe(1);
+    }
+    expect((await report({...row,phase:'exited',confirmed_exit:'true'})).status).toBe(400);
+    expect(active()).toBe(1);
+    expect((await report({...row,cwd:'/gone',phase:'exited',confirmed_exit:true})).status).toBe(200);
+    expect(sql.exec('SELECT state FROM session_control_sessions WHERE id=?',id).one().state).toBe('stopped');
+    expect(active()).toBe(0);
+  }));
   it('refuses Opus and Claude when no live route exists', async () => fixture(async (s, sql) => {
     await configure(s);
     for (const engine of ['opus', 'claude']) {
@@ -159,7 +182,7 @@ describe('generic accounts and launch placement', () => {
     const binding = { native_id: nativeId, tag: 'hub-' + launch.id, workspace: '/demo', native_created_at_ms: now };
     sql.exec("INSERT INTO session_control_sessions (id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
       crypto.randomUUID(), 'test-admin', 'terminal-test', '{}', launch.id, 'hetzner', 'codex', mode, 'running', JSON.stringify(binding), iso(), iso());
-    const row = { native_id: nativeId, tag: binding.tag, workspace: binding.workspace, engine: 'codex', phase: 'exited', agent_state: null, profile: null, account: 'shared-codex', created_at_ms: now + 1 };
+    const row = { native_id: nativeId, tag: binding.tag, workspace: binding.workspace, engine: 'codex', phase: 'exited', confirmed_exit: true, agent_state: null, profile: null, account: 'shared-codex', created_at_ms: now + 1 };
     const report = (sessions: any[]) => s.handle(request('/sessions', { sessions }, 'PUT'), host('hetzner'));
     expect((await report([row])).status).toBe(200);
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?', launch.id).one().state).toBe('running');
@@ -517,14 +540,14 @@ describe('generic accounts and launch placement', () => {
     expect(sql.exec('SELECT state, exit_reason, verification_status FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'failed', exit_reason: 'launcher_not_started', verification_status: 'not_started' });
     expect(sql.exec("SELECT state FROM session_control_sessions WHERE id = 'sess-nostart'").one().state).toBe('failed');
   }));
-  it('ignores sessions on deleted worktrees when computing account capacity', async () => fixture(async (s, sql) => {
+  it('retains capacity for running sessions whose worktree disappeared', async () => fixture(async (s, sql) => {
     await configure(s);
     sql.exec("INSERT INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, profile, account) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       'hetzner', 'deleted-native', 'deleted-tag', 'codex', 'running', null, iso(), '/home/alexey/git/agent-hub-wt-old (deleted)', null, 'shared-codex');
     const status: any = await (await s.handle(request('', undefined, 'GET'), admin)).json();
     const account = status.accounts.find((a: any) => a.label === 'shared-codex');
-    expect(account.active).toBe(0);
-    expect(account.available_slots).toBe(account.max_concurrency);
+    expect(account.active).toBe(1);
+    expect(account.available_slots).toBe(account.max_concurrency - 1);
   }));
   it('rejects only unclaimed own-host offers with an explicit workspace failure', async () => fixture(async (s, sql) => {
     await configure(s);

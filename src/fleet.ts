@@ -46,7 +46,7 @@ const NATIVE_RESERVED = `(l.native_id = s.native_id OR (
   (SELECT COUNT(*) FROM fleet_sessions spawned WHERE spawned.machine_id = s.machine_id
    AND spawned.tag = s.tag AND spawned.engine = s.engine AND spawned.account = s.account
    AND spawned.profile IS s.profile AND spawned.workspace = s.workspace
-   AND spawned.phase IN ('starting','running','broken','unknown')) = 1 AND
+   AND spawned.phase IN ('starting','running','broken','unknown','uncertain')) = 1 AND
   ((l.mode = 'headless' AND s.tag = 'task-hub-' || l.id) OR
    (l.mode = 'interactive' AND s.tag = 'hub-' || l.id))))`;
 
@@ -406,7 +406,7 @@ export class FleetService {
       : 0;
     const observedSessions = (() => {
       if (!liveList.length) return 0;
-      const orphans = this.sql.exec(`SELECT s.last_activity_at AS last_activity_at FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown') AND s.workspace NOT LIKE '% (deleted)' AND (s.cwd IS NULL OR s.cwd NOT LIKE '% (deleted)') AND s.machine_id IN (${liveList.map(() => '?').join(',')}) AND NOT EXISTS (SELECT 1 FROM fleet_launches l WHERE l.machine_id = s.machine_id AND ${NATIVE_RESERVED} AND l.state IN ${ACTIVE})`, account.label, ...liveList).toArray() as any[];
+      const orphans = this.sql.exec(`SELECT s.last_activity_at AS last_activity_at FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown','uncertain') AND s.machine_id IN (${liveList.map(() => '?').join(',')}) AND NOT EXISTS (SELECT 1 FROM fleet_launches l WHERE l.machine_id = s.machine_id AND ${NATIVE_RESERVED} AND l.state IN ${ACTIVE})`, account.label, ...liveList).toArray() as any[];
       const cutoff = this.now() - ORPHAN_OBSERVED_IDLE_TTL_MS;
       let counted = 0;
       for (const row of orphans) {
@@ -423,7 +423,7 @@ export class FleetService {
     let nativeLive: number | null = null;
     try {
       const seen = freshCatalogs(this.sql, this.now());
-      if (liveList.length && liveList.every(id => seen.has(id))) nativeLive = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.account = ? AND s.phase = 'running' AND s.workspace NOT LIKE '% (deleted)' AND (s.cwd IS NULL OR s.cwd NOT LIKE '% (deleted)') AND s.machine_id IN (${liveList.map(() => '?').join(',')})`, account.label, ...liveList).one().n);
+      if (liveList.length && liveList.every(id => seen.has(id))) nativeLive = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.account = ? AND s.phase = 'running' AND s.machine_id IN (${liveList.map(() => '?').join(',')})`, account.label, ...liveList).one().n);
     } catch { nativeLive = null; }
     const availableSlots = Math.max(0, Number(account.max_concurrency) - active);
     const placeableMachines = new Set<string>();
@@ -674,7 +674,7 @@ export class FleetService {
       const pending = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND state IN ${ACTIVE}`, route.machine_id).one().n);
       const routingInstalled = this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'routing_machines'").toArray().length;
       const limit: any = routingInstalled ? this.sql.exec('SELECT max_agents FROM routing_machines WHERE machine_id = ?', route.machine_id).toArray()[0] : null;
-      const observedSessions = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.machine_id = ? AND s.phase IN ('starting','running','broken','unknown') AND NOT EXISTS (SELECT 1 FROM fleet_launches l WHERE l.machine_id = s.machine_id AND ${NATIVE_RESERVED} AND l.state IN ${ACTIVE})`, route.machine_id).one().n);
+      const observedSessions = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.machine_id = ? AND s.phase IN ('starting','running','broken','unknown','uncertain') AND NOT EXISTS (SELECT 1 FROM fleet_launches l WHERE l.machine_id = s.machine_id AND ${NATIVE_RESERVED} AND l.state IN ${ACTIVE})`, route.machine_id).one().n);
       if (limit && pending + observedSessions >= limit.max_agents) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'machine_capacity' }); continue; }
 
       const score = (account!.remaining_percent! / 100) / (1 + hb.load[0] / caps.cpu_count + pending);
@@ -1038,8 +1038,9 @@ export class FleetService {
       if (!object(data, ['sessions']) || !Array.isArray(data.sessions) || data.sessions.length > 500) return response({ error: 'invalid_sessions' }, 400);
       const ids = new Set();
       for (const s of data.sessions) {
-        if (!object(s, ['native_id', 'tag', 'engine', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms']) ||
+        if (!object(s, ['native_id', 'tag', 'engine', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms', 'confirmed_exit']) ||
             (s.last_activity_at !== undefined && s.last_activity_at !== null && (typeof s.last_activity_at !== 'string' || !fresh(s.last_activity_at, this.now() + 60000, 366 * 86400000))) ||
+            (s.confirmed_exit !== undefined && typeof s.confirmed_exit !== 'boolean') ||
             (s.created_at_ms !== undefined && s.created_at_ms !== null && (!Number.isInteger(s.created_at_ms) || s.created_at_ms <= 0)) ||
             typeof s.native_id !== 'string' || !/^[a-zA-Z0-9-]{1,160}$/.test(s.native_id) || typeof s.tag !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,159}$/.test(s.tag) || (s.engine !== null && !label(s.engine)) || !label(s.phase) || (s.agent_state !== null && !label(s.agent_state)) || typeof s.workspace !== 'string' || s.workspace.length > 2048 || /[\x00-\x1f\x7f]/.test(s.workspace) || (s.cwd !== undefined && s.cwd !== null && (typeof s.cwd !== 'string' || s.cwd.length > 2048 || /[\x00-\x1f\x7f]/.test(s.cwd))) || (s.profile !== null && !label(s.profile)) || (s.account !== null && !label(s.account)) || ids.has(s.native_id)) return response({ error: 'invalid_session' }, 400);
         ids.add(s.native_id);
@@ -1077,8 +1078,9 @@ export class FleetService {
               continue;
             }
           }
-          if (s.workspace.endsWith(' (deleted)') || (typeof s.cwd === 'string' && s.cwd.endsWith(' (deleted)'))) {
-            s.phase = 'exited';
+          // Terminal catalog labels and deleted paths are not exit receipts.
+          if (['exited', 'dead', 'pruned', 'forgotten'].includes(s.phase) && s.confirmed_exit !== true) {
+            s.phase = 'uncertain';
           }
           cleanSessions.push(s);
           const prior = existing.get(s.native_id); existing.delete(s.native_id);
@@ -1090,7 +1092,7 @@ export class FleetService {
         // Preserve historical observations. A missing catalog row is not exit
         // proof, but an orphan no longer observed is not a live workload.
         for (const gone of existing.keys()) {
-          this.sql.exec("UPDATE fleet_sessions SET phase = 'unobserved' WHERE machine_id = ? AND native_id = ? AND phase IN ('starting','running','broken','unknown')", caller.machineId!, gone); written++;
+          this.sql.exec("UPDATE fleet_sessions SET phase = 'unobserved' WHERE machine_id = ? AND native_id = ? AND phase IN ('starting','running','broken','unknown','uncertain')", caller.machineId!, gone); written++;
         }
         // Exact positive terminal evidence releases physical concurrency even
         // if a headless launch journal was lost. Absence is never exit proof.

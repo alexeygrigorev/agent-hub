@@ -1118,6 +1118,18 @@ def reconcile_stop_oracle(
     return False, "native record gone after kill but %s; reconcile (no re-kill)" % why
 
 
+def _stop_workspace_matches(observed: str, expected: str) -> bool:
+    """Only stop may match an exact kernel annotation on the same workspace.
+
+    Keep UUID/tag/incarnation/engine checks, and never alias an existing
+    directory whose literal name ends in the annotation.
+    """
+    if canonicalize_workspace(observed) == expected:
+        return True
+    return (observed.endswith(' (deleted)') and not Path(observed).exists()
+            and canonicalize_workspace(observed.removesuffix(' (deleted)')) == expected)
+
+
 def stop_session(
     executable: str,
     target: NativeTarget,
@@ -1146,7 +1158,7 @@ def stop_session(
     before = [s for s in list_sessions(executable, include_exited=True)
               if s.session_id.lower() == target.session_id.lower()
               and s.tag == target.tag
-              and canonicalize_workspace(s.workspace) == target.workspace]
+              and _stop_workspace_matches(s.workspace, target.workspace)]
     if not before:
         from .retired_native import verify_native_retirement
         is_retired, tombstone, reason = verify_native_retirement(executable, target)
@@ -1174,7 +1186,7 @@ def stop_session(
     # a later list/prune sweep. Native containment recovery verifies both.
     proc = run_native(
         executable,
-        ["kill", target.session_id, "--workspace", target.workspace, "--tag", target.tag,
+        ["kill", target.session_id, "--workspace", before[0].workspace, "--tag", target.tag,
          "--signal", signal, "--grace-ms", str(grace_ms), "--keep-record", "--json"],
         timeout=QUICK_TIMEOUT + grace_ms / 1000.0 + 10,
     )
@@ -1187,7 +1199,7 @@ def stop_session(
     remaining = [s for s in list_sessions(executable, include_exited=True)
                    if s.session_id.lower() == target.session_id.lower()
                    and s.tag == target.tag
-                   and canonicalize_workspace(s.workspace) == target.workspace]
+                   and _stop_workspace_matches(s.workspace, target.workspace)]
     if not remaining:
         # Kill reported success AND the exact bound UUID/tag/workspace record is
         # gone. Absence WITHOUT our kill proof (forget/prune) is never exit

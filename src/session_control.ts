@@ -2585,7 +2585,8 @@ export function adoptObservedNativeSessions(
     } catch {}
     if (hubManaged) continue;
 
-    const state = TERMINAL_PHASES.has(s.phase) ? 'stopped' : (s.phase === 'starting' ? 'starting' : s.phase === 'running' ? 'running' : 'uncertain');
+    const verifiedTerminal = TERMINAL_PHASES.has(s.phase) && s.confirmed_exit === true;
+    const state = verifiedTerminal ? 'stopped' : (s.phase === 'starting' ? 'starting' : s.phase === 'running' ? 'running' : 'uncertain');
     const createdAtIso = createdAtMs ? new Date(createdAtMs).toISOString() : isoNow;
     const requestName = typeof s.name === 'string' && s.name ? s.name : null;
     const requestOwner = typeof s.owner === 'string' && s.owner ? s.owner : null;
@@ -2647,10 +2648,10 @@ export function adoptObservedNativeSessions(
       // Update existing adopted session if state or phase changed
       let shouldUpdate = false;
       let nextState = existing.state;
-      if (TERMINAL_PHASES.has(s.phase) && existing.state !== 'stopped') {
+      if (verifiedTerminal && existing.state !== 'stopped') {
         nextState = 'stopped';
         shouldUpdate = true;
-      } else if (!TERMINAL_PHASES.has(s.phase) && existing.state !== 'stopped' && existing.state !== state) {
+      } else if (!verifiedTerminal && existing.state !== 'stopped' && existing.state !== state) {
         nextState = state;
         shouldUpdate = true;
       }

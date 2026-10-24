@@ -42,7 +42,7 @@ class AccountCapacityTests(unittest.TestCase):
             self.assertTrue(reconcile_retired(dispatcher, row))
         self.assertTrue(dispatcher.request.call_args.args[2]['confirmed_exit'])
 
-    def test_deleted_marker_normalizes_only_after_native_exit_proof(self):
+    def test_deleted_marker_normalization_never_confers_exit_credit(self):
         from agent_hub_host.fleet import session_metadata
         row = {'id': 'native', 'tag': 'task', 'engine': 'codex', 'workspace': '/repo (deleted)',
                'cwd': '/repo (deleted)', 'phase': 'running', 'containment_empty': True, 'worker_pid': 123}
@@ -50,8 +50,11 @@ class AccountCapacityTests(unittest.TestCase):
         with patch('os.kill', side_effect=ProcessLookupError):
             result = session_metadata([row], settings)[0]
             self.assertEqual((result['phase'], result['workspace'], result['cwd']), ('exited', '/repo', '/repo'))
+            self.assertTrue(result['confirmed_exit'])
         with patch('os.kill', return_value=None):
-            self.assertEqual(session_metadata([row], settings)[0]['workspace'], '/repo (deleted)')
+            result = session_metadata([row], settings)[0]
+            self.assertEqual((result['phase'], result['workspace'], result['cwd']), ('running', '/repo', '/repo'))
+            self.assertFalse(result['confirmed_exit'])
 
     def test_empty_containment_with_dead_pids_proves_exit_and_unknown_does_not(self):
         row = {'containment_empty': True, 'worker_pid': 123, 'workload_pid': 456}

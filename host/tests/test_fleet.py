@@ -58,8 +58,23 @@ class FleetTests(unittest.TestCase):
         with patch('os.kill', side_effect=ProcessLookupError):
             result = fleet.session_metadata([row], settings(Path('/repo')))[0]
         self.assertEqual(result['phase'], 'exited')
+        self.assertTrue(result['confirmed_exit'])
         self.assertEqual(result['workspace'], '/repo/deleted-wt')
         self.assertEqual(result['cwd'], '/repo/deleted-wt/subdir')
+
+    def test_live_kernel_annotation_normalizes_identity_without_exit_credit(self):
+        row = {'id': 'id', 'tag': 'tag', 'workspace': '/repo/gone (deleted)',
+               'cwd': '/repo/gone (deleted)', 'engine': 'codex', 'state': 'running',
+               'worker_alive': True, 'worker_pid': os.getpid(), 'containment_empty': False}
+        result = fleet.session_metadata([row], settings(Path('/repo')))[0]
+        self.assertEqual(result['phase'], 'running')
+        self.assertFalse(result['confirmed_exit'])
+        self.assertEqual(result['workspace'], '/repo/gone')
+        with tempfile.TemporaryDirectory() as tmp:
+            literal = Path(tmp) / 'literal (deleted)'
+            literal.mkdir()
+            row['workspace'] = str(literal)
+            self.assertEqual(fleet.session_metadata([row], settings(Path('/repo')))[0]['workspace'], str(literal))
 
     def test_multi_account_config_and_secret_fields_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

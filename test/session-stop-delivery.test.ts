@@ -57,6 +57,17 @@ describe('stop delivery for adopted sessions', () => {
       expect(offers.offers[0].session_id).toBe(nativeId);
     });
   });
+  it('requires a positive exit receipt for direct adopted terminal observations', async () => {
+    await fixture(async (_s,sql) => {
+      adoptObservedNativeSessions(sql,'stop-host',[native()],Date.now(),'current-family');
+      for (const confirmed_exit of [undefined, false]) {
+        adoptObservedNativeSessions(sql,'stop-host',[{...native(),phase:'exited',confirmed_exit}],Date.now(),'current-family');
+        expect(sql.exec('SELECT state FROM session_control_sessions WHERE id=?',nativeId).one().state).toBe('uncertain');
+      }
+      adoptObservedNativeSessions(sql,'stop-host',[{...native(),phase:'exited',confirmed_exit:true}],Date.now(),'current-family');
+      expect(sql.exec('SELECT state FROM session_control_sessions WHERE id=?',nativeId).one().state).toBe('stopped');
+    });
+  });
   it('marks stopped only after the exact bound host stop acknowledgement', async () => {
     await fixture(async (s,sql) => {
       adoptObservedNativeSessions(sql,'stop-host',[native()],Date.now(),'current-family');
