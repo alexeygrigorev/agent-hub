@@ -246,7 +246,8 @@ describe('M2 Adverse: Registry Runtime & Persistence Cadence', () => {
       quota_balances: { claude_credits: 500, codex_credits: 1000 },
       raw_token: 'hubt_super_secret_raw_token_that_must_never_be_stored',
       transcript: 'confidential conversation data',
-      attacker_payload: 'DROP TABLE machines;'
+      attacker_payload: 'DROP TABLE machines;',
+      launcher_resources: { active_mem_mb: 4500, observed_at: '2026-10-24T12:00:00Z', raw_token: 'withheld' }
     };
 
     const pollRes = await doFetch(new Request('http://example.com/api/host/poll', {
@@ -267,6 +268,7 @@ describe('M2 Adverse: Registry Runtime & Persistence Cadence', () => {
       expect(parsedHb.raw_token).toBeUndefined();
       expect(parsedHb.transcript).toBeUndefined();
       expect(parsedHb.attacker_payload).toBeUndefined();
+      expect(parsedHb.launcher_resources).toEqual({ active_mem_mb: 4500, observed_at: '2026-10-24T12:00:00Z' });
     });
   });
 

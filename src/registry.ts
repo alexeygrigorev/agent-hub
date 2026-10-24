@@ -40,6 +40,11 @@ function sanitizeHeartbeat(body: any) {
   const hb: any = { type: 'heartbeat' };
   if (typeof body.at === 'string' && body.at.length <= 64) hb.at = body.at;
   if (typeof body.mem_avail_mb === 'number' && Number.isFinite(body.mem_avail_mb)) hb.mem_avail_mb = body.mem_avail_mb;
+  if (body.launcher_resources && Number.isFinite(body.launcher_resources.active_mem_mb)
+      && body.launcher_resources.active_mem_mb >= 0 && body.launcher_resources.active_mem_mb <= 1e9
+      && typeof body.launcher_resources.observed_at === 'string' && body.launcher_resources.observed_at.length <= 64) {
+    hb.launcher_resources = { active_mem_mb: body.launcher_resources.active_mem_mb, observed_at: body.launcher_resources.observed_at };
+  }
   if (typeof body.disk_free_gb === 'number' && Number.isFinite(body.disk_free_gb)) hb.disk_free_gb = body.disk_free_gb;
   if (typeof body.load === 'object' && Array.isArray(body.load)) {
     hb.load = body.load.filter((l: any) => typeof l === 'number' && Number.isFinite(l)).slice(0, 3);
@@ -69,6 +74,7 @@ const machineState = new Map<string, { lastSeenAt: number, lastPersistedAt: numb
 function getFingerprint(hb: any): string {
   return JSON.stringify({
     gate: hb.gate,
+    launcher_resources: hb.launcher_resources,
     running_jobs: hb.running_jobs,
     sessions_summary: hb.sessions_summary
   });
