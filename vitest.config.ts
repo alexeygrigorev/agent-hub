@@ -19,5 +19,7 @@ export default defineConfig({
   test: {
     include: ['test/**/*.test.ts'],
     fileParallelism: false,
+    // Preserve the real stylesheet for the phone layout source contract.
+    css: { include: [/intake\.css(?:\?|$)/] },
   },
 });
