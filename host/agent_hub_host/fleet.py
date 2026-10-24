@@ -584,14 +584,11 @@ def session_metadata(raw, settings):
                 ws = ws.removesuffix(' (deleted)')
             if isinstance(cwd, str):
                 cwd = cwd.removesuffix(' (deleted)')
-        if isinstance(ws, str) and ws.endswith(" (deleted)"):
-            phase = "exited"
-        elif isinstance(cwd, str) and cwd.endswith(" (deleted)"):
-            phase = "exited"
-        elif isinstance(ws, str) and ws.startswith(("/home/", "/tmp/")) and not os.path.exists(ws):
-            phase = "exited"
-        elif isinstance(cwd, str) and cwd.startswith(("/home/", "/tmp/")) and not os.path.exists(cwd):
-            phase = "exited"
+        elif phase in ('exited', 'dead', 'pruned', 'forgotten'):
+            # Catalog phase and a missing/deleted workspace are only hints.
+            # Neither proves worker/workload death: publishing a terminal hint
+            # would let adoption mark the Hub row stopped before a real stop.
+            phase = 'uncertain'
         clean.append({"native_id": session["id"], "tag": session["tag"], "workspace": ws, "engine": engine,
                       "profile": profile, "account": matches[0]["account_label"] if len(matches) == 1 else None,
                       "phase": phase, "agent_state": session.get("reported_state"),

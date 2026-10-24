@@ -29,15 +29,37 @@ class FleetTests(unittest.TestCase):
                 'phase': 'running', 'state': 'broken', 'worker_alive': False}]
         self.assertEqual(fleet.session_metadata(raw, settings(Path('/repo')))[0]['phase'], 'broken')
 
-    def test_session_metadata_marks_deleted_worktree_as_exited(self):
+    def test_session_metadata_keeps_live_deleted_worktree_running(self):
         raw = [{'id': 'id', 'tag': 'tag', 'workspace': '/repo/deleted-wt (deleted)', 'engine': 'codex',
                 'phase': 'running', 'state': 'running', 'worker_alive': True}]
-        self.assertEqual(fleet.session_metadata(raw, settings(Path('/repo')))[0]['phase'], 'exited')
+        self.assertEqual(fleet.session_metadata(raw, settings(Path('/repo')))[0]['phase'], 'running')
 
-    def test_session_metadata_marks_enoent_home_workspace_as_exited(self):
+    def test_session_metadata_keeps_live_missing_workspace_running(self):
         raw = [{'id': 'id', 'tag': 'tag', 'workspace': '/home/alexey/nonexistent-workspace-path-12345', 'engine': 'codex',
                 'phase': 'running', 'state': 'running', 'worker_alive': True}]
-        self.assertEqual(fleet.session_metadata(raw, settings(Path('/repo')))[0]['phase'], 'exited')
+        self.assertEqual(fleet.session_metadata(raw, settings(Path('/repo')))[0]['phase'], 'running')
+
+    def test_session_metadata_terminal_hint_requires_positive_death(self):
+        base = {'id': 'id', 'tag': 'tag', 'workspace': '/repo', 'engine': 'codex',
+                'worker_alive': True, 'worker_pid': os.getpid(), 'containment_empty': False}
+        for phase in ('exited', 'dead', 'pruned', 'forgotten'):
+            with self.subTest(phase=phase):
+                row = dict(base, phase=phase, state=phase)
+                self.assertEqual(fleet.session_metadata([row], settings(Path('/repo')))[0]['phase'], 'uncertain')
+        # Empty containment alone is insufficient without recorded process proof.
+        row = dict(base, state='exited', worker_pid=None, worker_alive=False, containment_empty=True)
+        self.assertEqual(fleet.session_metadata([row], settings(Path('/repo')))[0]['phase'], 'uncertain')
+
+    def test_session_metadata_verified_empty_normalizes_deleted_paths(self):
+        row = {'id': 'id', 'tag': 'tag', 'workspace': '/repo/deleted-wt (deleted)',
+               'cwd': '/repo/deleted-wt/subdir (deleted)', 'engine': 'codex',
+               'state': 'exiting', 'worker_alive': False, 'worker_pid': 123456789,
+               'workload_pid': 123456790, 'containment_empty': True}
+        with patch('os.kill', side_effect=ProcessLookupError):
+            result = fleet.session_metadata([row], settings(Path('/repo')))[0]
+        self.assertEqual(result['phase'], 'exited')
+        self.assertEqual(result['workspace'], '/repo/deleted-wt')
+        self.assertEqual(result['cwd'], '/repo/deleted-wt/subdir')
 
     def test_multi_account_config_and_secret_fields_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
