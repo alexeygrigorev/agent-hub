@@ -561,6 +561,7 @@ def _ms_to_iso(value):
 
 
 def session_metadata(raw, settings):
+    from .account_capacity import activity_ms, confirmed_empty
     sessions = raw if isinstance(raw, list) else raw.get("sessions", [])
     clean = []
     for session in sessions:
@@ -574,6 +575,15 @@ def session_metadata(raw, settings):
         ws = session.get("workspace", "")
         cwd = session.get("cwd") if isinstance(session.get("cwd"), str) else None
         phase = session.get("state") or session.get("phase", "unknown")
+        if confirmed_empty(session):
+            phase = 'exited'
+            # Linux appends this marker to a deleted process cwd. Normalize
+            # only after positive empty-containment proof, for exact matching
+            # against the original binding; a deleted path alone proves nothing.
+            if isinstance(ws, str):
+                ws = ws.removesuffix(' (deleted)')
+            if isinstance(cwd, str):
+                cwd = cwd.removesuffix(' (deleted)')
         if isinstance(ws, str) and ws.endswith(" (deleted)"):
             phase = "exited"
         elif isinstance(cwd, str) and cwd.endswith(" (deleted)"):
@@ -586,7 +596,7 @@ def session_metadata(raw, settings):
                       "profile": profile, "account": matches[0]["account_label"] if len(matches) == 1 else None,
                       "phase": phase, "agent_state": session.get("reported_state"),
                       "cwd": cwd,
-                      "last_activity_at": _ms_to_iso(session.get("last_activity_ms")),
+                      "last_activity_at": _ms_to_iso(activity_ms(session)),
                       "created_at_ms": created_at_ms})
     return clean
 
@@ -1706,7 +1716,10 @@ class Dispatcher:
         legacy_settled = settle_retired_legacy(self.settings.get('launcher', {}))
         reconciled = self.reconcile_launches()
         imported_reconciled = self.reconcile_imported_sessions()
-        offers = self.request("GET", "/api/fleet/offers").get("offers", [])
+        offer_response = self.request("GET", "/api/fleet/offers")
+        offers = offer_response.get("offers", [])
+        from .account_capacity import reconcile_unstarted
+        reconciled += [r for r in reconcile_unstarted(self, rows=offer_response.get('reconciliation', [])) if r['state'] in ('failed', 'exited')]
         results = [{'id': r['task_id'], 'state': 'failed', 'reason': 'legacy_native_finished'} for r in legacy_settled] + list(reconciled) + list(imported_reconciled)
         results.append({"id": "workclaim-sync", **workclaim_summary})
         for offer in offers:
