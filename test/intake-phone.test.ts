@@ -5,12 +5,12 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
-import intakeHtml from '../../public/intake.html?raw';
-import intakeJs from '../../public/intake.js?raw';
-import intakeCss from '../../public/intake.css?raw';
-import enginesHtml from '../../public/engines.html?raw';
-import sessionsJs from '../../public/sessions.js?raw';
-import conversationsJs from '../../public/conversations.js?raw';
+import intakeHtml from '../public/intake.html?raw';
+import intakeJs from '../public/intake.js?raw';
+import intakeCss from '../public/intake.css?raw';
+import enginesHtml from '../public/engines.html?raw';
+import sessionsJs from '../public/sessions.js?raw';
+import conversationsJs from '../public/conversations.js?raw';
 import workerSrc from '../src/worker.ts?raw';
 
 const inDO: any = runInDurableObject;
