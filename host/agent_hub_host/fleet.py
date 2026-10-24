@@ -1329,7 +1329,7 @@ class Dispatcher:
                     raise ValueError('Goal startup requires a trusted local command')
                 if not isinstance(launch, list) or not launch or any(not isinstance(a, str) or "\0" in a for a in launch):
                     raise ValueError("Invalid trusted startup argv")
-                argv += ["--"] + launch + (['/goal ' + offer['prompt']] if with_goal else [])
+                argv += ["--"] + launch + (['/goal ' + offer['prompt'] + '\nContainer hygiene: use docker run --rm for throwaway/test containers; label every test container agent.session=<your Hub session id, or native session id registered in Hub>. Install trap/finally cleanup before creation and clean up all resources you create before session exit, including failed starts and docker create/compose tests. Preserve other sessions and Coolify containers.'] if with_goal else [])
             prefix = sub.get("native_start_argv") or self.settings.get("native_start_argv")
             if prefix is not None:
                 prefix = validate_native_start_argv(prefix)
@@ -1350,7 +1350,7 @@ class Dispatcher:
             # Only the maintained launcher may run models. argv is a trusted machine-local CLI prefix.
             prefix = launcher["argv"] + ["--config-dir", launcher["config_dir"]]
             task_id = "hub-" + offer_id
-            goal = offer["prompt"]
+            goal = offer["prompt"] + "\nContainer hygiene: use docker run --rm for throwaway/test containers; label every test container agent.session=<your Hub session id, or native session id registered in Hub>. Install trap/finally cleanup before creation and clean up all resources you create before session exit, including failed starts and docker create/compose tests. Preserve other sessions and Coolify containers."
             curr = workspace
             for seg in (".local", "hub-results"):
                 curr = curr / seg

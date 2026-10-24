@@ -2,6 +2,8 @@
 # Local-only Worker + clean machine container. No production credentials/config mounted.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+SESSION_ID="${HUB_SESSION_ID:-${APLEXER_SESSION_ID:-}}"
+: "${SESSION_ID:?Set HUB_SESSION_ID to the owning registered session id}"
 mkdir -p .local/tmp
 export TMPDIR="$PWD/.local/tmp"
 TEST_DIR=$(mktemp -d "$TMPDIR/engine-docker-XXXXXX")
@@ -28,4 +30,4 @@ for attempt in $(seq 1 60); do
   sleep 1
 done
 DOCKER_BUILDKIT=${DOCKER_BUILDKIT:-0} docker build --memory 1500m -t hub-engine-lifecycle-test "$TEST_DIR"
-docker run --rm --name "$CONTAINER" --network host --memory 1500m --pids-limit 256 ${TEST_PROVIDERS:+-e TEST_PROVIDERS="$TEST_PROVIDERS"} hub-engine-lifecycle-test
+docker run --rm --label "agent.session=${SESSION_ID}" --name "$CONTAINER" --network host --memory 1500m --pids-limit 256 ${TEST_PROVIDERS:+-e TEST_PROVIDERS="$TEST_PROVIDERS"} hub-engine-lifecycle-test
