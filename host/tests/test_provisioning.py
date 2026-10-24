@@ -968,6 +968,53 @@ def test_regression_bootstrapped_engine_home_can_git_commit(tmp_path, monkeypatc
     assert log_res2.stdout.strip() == 'Alexey Grigorev <alexey.s.grigoriev@gmail.com>'
 
 
+def test_managed_home_bootstrap_installs_aplexer_state_hooks(tmp_path, monkeypatch):
+    root_dir = tmp_path / 'managed'
+    root_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: root_dir)
+    b = bundle()
+    dest = root_dir / f"{b['label']}-{b['revision']}"
+
+    with patch.object(p.subprocess, 'run', side_effect=installer):
+        p.install(b)
+
+    codex_hooks = dest / 'home' / '.codex' / 'hooks.json'
+    assert codex_hooks.is_file()
+    assert codex_hooks.stat().st_mode & 0o777 == 0o600
+    data = json.loads(codex_hooks.read_text())
+    assert 'hooks' in data
+    # Stop hook reports idle
+    stop_cmds = [h['command'] for hook_grp in data['hooks'].get('Stop', []) for h in hook_grp.get('hooks', [])]
+    assert any('state-report idle' in cmd for cmd in stop_cmds)
+    # SessionStart / UserPromptSubmit report working
+    start_cmds = [h['command'] for hook_grp in data['hooks'].get('SessionStart', []) for h in hook_grp.get('hooks', [])]
+    assert any('state-report working' in cmd for cmd in start_cmds)
+
+
+def test_managed_home_rebootstrap_reapplies_state_hooks(tmp_path, monkeypatch):
+    root_dir = tmp_path / 'managed'
+    root_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: root_dir)
+    b = bundle()
+    dest = root_dir / f"{b['label']}-{b['revision']}"
+
+    with patch.object(p.subprocess, 'run', side_effect=installer):
+        p.install(b)
+
+    codex_hooks = dest / 'home' / '.codex' / 'hooks.json'
+    assert codex_hooks.is_file()
+
+    # Delete the hooks file to simulate drift or corruption
+    codex_hooks.unlink()
+    assert not codex_hooks.exists()
+
+    # Re-bootstrap (install again with same receipt)
+    p.install(b)
+    assert codex_hooks.is_file()
+    data = json.loads(codex_hooks.read_text())
+    stop_cmds = [h['command'] for hook_grp in data['hooks'].get('Stop', []) for h in hook_grp.get('hooks', [])]
+    assert any('state-report idle' in cmd for cmd in stop_cmds)
+
 
 
 
