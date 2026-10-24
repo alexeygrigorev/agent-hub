@@ -73,6 +73,22 @@ describe('Hub MCP protocol and parity', () => {
     expect(held.data.hold).toBeTruthy();
     expect(held.data.assigned_session.hold).toEqual(held.data.hold);
   });
+  it('sessions_start links its intake once through the canonical server path', async () => {
+    const invoke = async (name: string, args: any) => {
+      const response: any = await (await rpc('tools/call', { name, arguments: args })).json();
+      return JSON.parse(response.result.content[0].text);
+    };
+    const created = await invoke('intake_create', { payload: { key: 'mcp-start-link-task', project: 'demo', title: 'Fixture', text: 'Fixture',
+      source: { type: 'unknown' }, acceptance_criteria: 'Synthetic MCP linkage.' } });
+    const id = created.data.task.id;
+    const payload = { key: 'mcp-start-link', workspace: 'demo', brief: 'Synthetic goal', intake_task_id: id };
+    const start = await invoke('sessions_start', { payload });
+    expect([201, 409]).toContain(start.status);
+    expect((await invoke('sessions_start', { payload })).data.id).toBe(start.data.id);
+    const shown = await invoke('intake_show', { id });
+    expect(shown.data.task.assigned_sessions[0].hub_session_id).toBe(start.data.id);
+    expect(shown.data.task.payload_data.history.filter((e: any) => e.kind === 'link')).toEqual([expect.objectContaining({ evidence: 'hub_launch_verified' })]);
+  });
   it('appends the advertised note payload with and without source and reports unknown fields', async () => {
     const invoke = async (name: string, args: any) => {
       const response: any = await (await rpc('tools/call', { name, arguments: args })).json();

@@ -114,6 +114,42 @@ async function body(request: Request): Promise<Obj> {
   finally { reader.releaseLock(); }
 }
 
+/** Raised outside the session transaction so a refused link rolls back placement too. */
+export class IntakeSessionLinkError extends Error {
+  constructor(public code: string) { super(code); }
+}
+/** Service-only linkage. Call inside the transaction creating/updating the session.
+ * It proves the Hub accepted a launch intent, never that the native process ran.
+ * Manual links are preserved and counted as already linked during backfill. */
+export function recordIntakeSessionLink(sql: SqlStorage, session: Obj, now: number, hold?: any): boolean {
+  const request = JSON.parse(session.request_json);
+  const taskId = request.intake_task_id;
+  if (typeof taskId !== 'string' || !taskId) return false;
+  let rows: any[] = sql.exec('SELECT data FROM intake_tasks WHERE id=?', taskId).toArray();
+  if (!rows.length && taskId.length >= 6) rows = sql.exec("SELECT data FROM intake_tasks WHERE id LIKE ? || '%' LIMIT 2", taskId).toArray();
+  if (rows.length !== 1) return false; // pruned, missing or ambiguous historical task
+  const task = JSON.parse(rows[0].data);
+  if (task.history.some((e: Obj) => ['link', 'session'].includes(e.kind) && e.hub_session_id === session.id)) return false;
+  if (task.history.length >= INTAKE_LIMITS.events) throw new IntakeSessionLinkError('history_capacity');
+  task.history.push({ id: crypto.randomUUID(), kind: 'link', hub_session_id: session.id,
+    native_id: null, engine: session.engine ?? request.engine ?? null, tier: request.tier ?? null,
+    host: session.machine_id ?? null, hub: null, routing_job_id: null,
+    provenance: { type: 'hub_launch_verified', reference: session.id, timestamp: session.created_at },
+    evidence: 'hub_launch_verified', authority: 'hub_launch_verified', actor: session.actor,
+    captured_at: now, intake_key: session.request_key,
+    ...(session.state === 'held' && hold !== undefined ? { assignment_hold: hold } : {}) });
+  task.version++; task.updated_at = now;
+  if (encoded(task) > INTAKE_LIMITS.taskBytes) throw new IntakeSessionLinkError('task_capacity');
+  sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(task), task.id);
+  let bytes = 0;
+  for (const table of ['tasks', 'grants', 'rules', 'receipts']) {
+    bytes += Number((sql.exec(`SELECT COALESCE(SUM(length(CAST(data AS BLOB))+length(CAST(id AS BLOB))),0) AS n FROM intake_${table}`).toArray()[0] as any).n);
+  }
+  if (bytes > INTAKE_LIMITS.totalBytes) throw new IntakeSessionLinkError('storage_capacity');
+  sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
+  return true;
+}
+
 export class IntakeService {
   constructor(public sql: SqlStorage, private tx: Tx = <T>(fn: () => T) => fn(), private hooks: IntakeHooks = {}) {}
   init() {
@@ -825,16 +861,15 @@ export class IntakeService {
    * response, while a changed payload under the same key conflicts. A task
    * with a live (queued/held/offered/starting/running/uncertain) assigned
    * session refuses a second assignment until that session leaves the active
-   * set. Creating the session is not executing the task: link evidence stays
-   * external_unverified_not_launch_proof until the native binding lifecycle
-   * observes it. */
+   * set. The service-owned link verifies the Hub launch intent; native execution
+   * remains separately observed through the session lifecycle. */
   private async assign(taskId: string, raw: any, auth: Auth, json: (data: Obj, status?: number) => Response): Promise<Response> {
     identifier(taskId);
     const b = object(raw);
     keys(b, ['key', 'expected_version', 'session', 'provenance', 'next_step', 'current_state', 'owner']);
     identifier(b.key);
     const session = object(b.session);
-    keys(session, ['engine', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'parent_id']);
+    keys(session, ['engine', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'parent_id', 'with_goal']);
     if (typeof session.workspace !== 'string' || !session.workspace) fail('invalid_field');
     const provenance = source(b.provenance);
     const fingerprint = canonical({ path: '/tasks/' + taskId + '/assign', payload: b });
@@ -844,25 +879,36 @@ export class IntakeService {
       if (!task || !this.allowed(p, task, true)) fail('not_found', 404);
       // Lost-response replay returns the original response even if the task
       // has advanced since; only fresh attempts face CAS and the live guard.
-      const previous = this.get('receipts', p.identity + ':' + b.key);
+      const receiptId = p.identity + ':' + b.key;
+      const previous = this.get('receipts', receiptId);
       if (previous) {
         if (previous.fingerprint !== fingerprint) fail('idempotency_conflict', 409);
-        return { replay: previous.response };
+        if (previous.response) return { replay: previous.response };
       }
-      this.expected(b, task.version);
-      if (task.history.length >= INTAKE_LIMITS.events) fail('history_capacity', 507);
-      // Start gate (server-side, before any Fleet placement): a task is
-      // handed to an agent only with non-empty acceptance criteria. Missing
-      // or whitespace-only values fail closed with acceptance_criteria_required.
+      const sessionKey = 'ia-' + sha256Sync(p.identity + ':' + taskId + ':' + b.key).slice(0, 24);
+      let prior: any = null;
+      try { prior = this.sql.exec('SELECT * FROM session_control_sessions WHERE actor=? AND request_key=?', p.actor, sessionKey).toArray()[0]; } catch { /* session service absent: assignment_unavailable below */ }
+      const ownLink = prior && task.history.find((e: Obj) => e.kind === 'link' && e.hub_session_id === prior.id && e.authority === 'hub_launch_verified');
+      const version = previous?.started_version ?? task.version;
+      const ownAdvance = !!ownLink && task.version === version + 1;
+      this.expected(b, task.version - (ownAdvance ? 1 : 0));
+      if (!ownLink && task.history.length >= INTAKE_LIMITS.events) fail('history_capacity', 507);
       if (!hasAcceptanceCriteria(task)) fail('acceptance_criteria_required', 400);
-      if (this.activeAssignment(task)) fail('active_assignment_exists', 409);
-      return { p };
+      const active = this.activeAssignment(task);
+      if (active && active !== prior?.id) fail('active_assignment_exists', 409);
+      // Persist the original assignment fingerprint before the async start.
+      // A crash after the canonical start/link can then resume the same
+      // assignment, without permitting a different payload under its key.
+      if (!previous) {
+        this.bounded('receipts', INTAKE_LIMITS.receipts);
+        this.put('receipts', { id: receiptId, fingerprint, started_version: version, captured_at: Date.now() });
+        this.capacity();
+      }
+      return { p, version, sessionKey };
     });
     if (pre.replay) return json(pre.replay);
     if (!this.hooks.startSession) fail('assignment_unavailable', 409);
-    const p: Obj = pre.p;
-    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(p.identity + ':' + taskId + ':' + b.key));
-    const sessionKey = 'ia-' + [...new Uint8Array(digest)].map(x => x.toString(16).padStart(2, '0')).join('').slice(0, 24);
+    const sessionKey = pre.sessionKey;
     let started: { status: number; body: any };
     try {
       // The linked intake task id travels with the start so the canonical
@@ -884,10 +930,14 @@ export class IntakeService {
       const previous = this.get('receipts', id);
       if (previous) {
         if (previous.fingerprint !== fingerprint) fail('idempotency_conflict', 409);
-        return json(previous.response);
+        if (previous.response) return json(previous.response);
       }
-      this.expected(b, task.version);
-      if (task.history.length + 2 > INTAKE_LIMITS.events) fail('history_capacity', 507);
+      const startLink = task.history.find((e: Obj) => e.kind === 'link' && e.hub_session_id === created.id && e.authority === 'hub_launch_verified');
+      // The canonical start committed our link. Only that one known version
+      // advance belongs to this assignment; any concurrent edit still conflicts.
+      this.expected(b, task.version - (startLink && task.version === pre.version + 1 ? 1 : 0));
+      const extraEvents = (startLink ? 0 : 1) + (['current_state', 'next_step', 'owner'].some(field => field in b) ? 1 : 0);
+      if (task.history.length + extraEvents > INTAKE_LIMITS.events) fail('history_capacity', 507);
       // Re-check after the start round-trip: AC cleared mid-flight still fails closed.
       if (!hasAcceptanceCriteria(task)) fail('acceptance_criteria_required', 400);
       const active = this.activeAssignment(task);
@@ -904,7 +954,7 @@ export class IntakeService {
         provenance, routing_job_id: null, hub_session_id: created.id }, task, fresh, now);
       link.intake_key = b.key;
       if (created.state === 'held' && created.hold !== undefined) link.assignment_hold = created.hold;
-      task.history.push(link);
+      if (!startLink) task.history.push(link);
       const changes: Obj = {};
       for (const field of ['current_state', 'next_step', 'owner']) if (field in b) {
         task[field] = nullable(b[field], 8192);
@@ -914,7 +964,7 @@ export class IntakeService {
         task.history.push({ id: crypto.randomUUID(), kind: 'update', changes, actor: fresh.actor,
           captured_at: now, authority: 'untrusted_task_data', intake_key: b.key });
       }
-      task.version++; task.updated_at = now;
+      if (!startLink || Object.keys(changes).length) { task.version++; task.updated_at = now; }
       if (encoded(task) > INTAKE_LIMITS.taskBytes) fail('task_capacity', 507);
       this.put('tasks', task);
       const assigned = this.assignedSessions(task, fresh).find(s => s.hub_session_id === created.id) ??

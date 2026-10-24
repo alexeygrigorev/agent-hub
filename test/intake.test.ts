@@ -370,10 +370,10 @@ describe('private durable intake HTTP/SQLite', () => {
     expect(assigned.assigned_session.hold).toEqual(assigned.hold);
     const heldRead = await ok('/tasks/' + task.id);
     expect(heldRead.task.assigned_sessions[0].hold).toEqual(assigned.hold);
-    expect(assigned.task.control.version).toBe(2);
+    expect(assigned.task.control.version).toBe(3);
     expect(assigned.task.payload_data.next_step).toBe('Watch Hub binding');
     const link = assigned.task.payload_data.history.find((e: any) => e.kind === 'link');
-    expect(link).toMatchObject({ hub_session_id: sessionId, evidence: 'external_unverified_not_launch_proof' });
+    expect(link).toMatchObject({ hub_session_id: sessionId, evidence: 'hub_launch_verified' });
     // The same operator controls the real session through hub sessions.
     const sessions = async () => ((await (await SELF.fetch('https://hub.test/api/sessions?limit=50',
       { headers: { Cookie: cookie, 'x-csrf-token': 'csrf' } })).json()) as any).sessions.map((s: any) => s.id);
@@ -389,9 +389,9 @@ describe('private durable intake HTTP/SQLite', () => {
     expect((await call('/tasks/' + task.id + '/assign', { ...payload, next_step: 'Different' })).status).toBe(409);
     // A second assignment is refused while the first session is still live.
     expect((await call('/tasks/' + task.id + '/assign', { ...payload, key: 'assign-second',
-      expected_version: 2, session: { workspace: 'demo' } })).status).toBe(409);
+      expected_version: assigned.task.control.version, session: { workspace: 'demo' } })).status).toBe(409);
     // A forged session identity fails closed without an oracle.
-    expect((await call('/tasks/' + task.id + '/events', { key: 'forged-link', expected_version: 2,
+    expect((await call('/tasks/' + task.id + '/events', { key: 'forged-link', expected_version: 3,
       event: { kind: 'link', hub_session_id: '12345678-1234-4234-8234-123456789012', provenance: source } })).status).toBe(404);
   });
   it('agents assign only through their own canonical session; foreign sessions fail closed', async () => {
