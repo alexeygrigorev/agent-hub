@@ -40,6 +40,10 @@ def test_goal_native_start_uses_trusted_command_and_literal_argument():
         d = fleet.Dispatcher(cfg, lambda *a: http.append(a) or {}, runner)
         result = d.dispatch(offer(with_goal=True, prompt='Fix $(literal) `text`'))
         assert result['state'] == 'running'
-        assert calls[-1][-4:] == ['--', 'trusted-codex', '--safe', '/goal Fix $(literal) `text`']
+        assert calls[-1][-4:-1] == ['--', 'trusted-codex', '--safe']
+        assert calls[-1][-1].startswith('/goal Fix $(literal) `text`\n')
+        assert 'docker run --rm' in calls[-1][-1]
+        assert 'agent.session=' in calls[-1][-1]
+        assert 'trap/finally' in calls[-1][-1]
         with pytest.raises(ValueError):
             d.dispatch(offer(with_goal=True, mode='headless', prompt='fix'))

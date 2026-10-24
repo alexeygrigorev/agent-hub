@@ -43,3 +43,12 @@ Serverless coordination hub for Alexey's multi-agent project: 30-minute headless
 ## Model routing rule (2026-10-14)
 
 OpenCode (`oc`, `--engine opencode`) always runs Muse Spark 1.3 (`opencode-go/muse-spark-1.3-contributor`), never a GLM / Z.ai Coding Plan model. All GLM / Z.ai work goes through zcodex (`--profile zcodex`, launcher `zai` route).
+
+## Throwaway containers
+
+Use `docker run --rm` for every throwaway/test container and attach a unique
+`--label agent.session=<Hub session id>` (or the native session id registered in Hub).
+For `docker create` and Compose test workflows, attach the same label. Register
+cleanup in a shell `trap` or `try/finally` before creating resources, and remove
+every resource you create before the session exits, including failed starts.
+Never remove another session's resources or Coolify-managed containers.

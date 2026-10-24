@@ -1,0 +1,7 @@
+[Unit]
+Description=Check finished agent test containers every minute
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+[Install]
+WantedBy=timers.target
