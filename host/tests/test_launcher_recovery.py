@@ -228,3 +228,20 @@ class LegacyRetirementTests(unittest.TestCase):
             with sqlite3.connect(db) as c:
                 self.assertEqual(c.execute('SELECT state FROM tasks').fetchone()[0], 'failed')
                 self.assertEqual(c.execute('SELECT count(*) FROM task_native_bindings').fetchone()[0], 0)
+
+
+class ResourceReconciliationTests(unittest.TestCase):
+    def test_periodic_scan_uses_launcher_and_returns_only_accounting(self):
+        from agent_hub_host.launcher_recovery import reconcile_resources
+        from unittest.mock import Mock
+        runner = Mock(return_value={"active_mem_mb": 3000, "reconciled": [{"task_id": "stopped"}], "private": "withheld"})
+        config = {"argv": ["python3", "-m", "launcher"], "root": "/launcher", "config_dir": "/state"}
+        result = reconcile_resources(config, runner)
+        self.assertEqual(result["active_mem_mb"], 3000)
+        self.assertEqual(set(result), {"active_mem_mb", "observed_at"})
+        runner.assert_called_once_with(["python3", "-m", "launcher", "--config-dir", "/state", "resource-status"], cwd="/launcher")
+        for bad in (-1, float('nan'), float('inf'), True, "1500"):
+            runner.return_value = {"active_mem_mb": bad}
+            self.assertIsNone(reconcile_resources(config, runner))
+        runner.side_effect = RuntimeError('withheld')
+        self.assertIsNone(reconcile_resources(config, runner))

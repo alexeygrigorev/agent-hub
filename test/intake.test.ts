@@ -53,6 +53,41 @@ beforeEach(async () => {
 });
 
 describe('private durable intake HTTP/SQLite', () => {
+  it.each([1, 25, 26, 100, 101, 1000, "999999999999999999999999999999999999"])('accepts limit %s and reports the effective clamped limit', async limit => {
+    const result = await ok('/tasks?limit=' + limit);
+    expect(result.effective_limit).toBe(Math.min(Number(limit), 100));
+  });
+
+  it('reports precise errors for invalid and nonpositive limits', async () => {
+    for (const limit of ['', 'abc', '1.5', 'NaN', '0x10', '1e2']) {
+      const response = await call('/tasks?limit=' + encodeURIComponent(limit));
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: 'invalid_limit', field: 'limit', min: 1, max: 100 });
+    }
+    for (const limit of ['0', '-1']) {
+      const response = await call('/tasks?limit=' + limit);
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: 'limit_out_of_range', field: 'limit', min: 1, max: 100 });
+    }
+  });
+
+  it('returns 100 items per page with a revision-pinned remainder', async () => {
+    await inDO(stub(), (h: any) => {
+      for (let i = 0; i < 101; i++) {
+        h.sql.exec('INSERT INTO intake_tasks (id, data) VALUES (?, ?)', 'limit-' + String(i).padStart(3, '0'), JSON.stringify({
+          id: 'limit-' + String(i).padStart(3, '0'), project: 'limit-fixture', status: 'open', version: 1,
+          title: 'Fixture', history: [], created_at: 1, updated_at: 1,
+        }));
+      }
+    });
+    const first = await ok('/tasks?project=limit-fixture&limit=100');
+    expect(first.items).toHaveLength(100);
+    expect(first.total).toBe(101);
+    const last = await ok('/tasks?project=limit-fixture&limit=100&after=' + first.next + '&revision=' + first.snapshot_version);
+    expect(last.items).toHaveLength(1);
+    expect(last.next).toBeNull();
+  });
+
 
   it('returns field byte limits and every supported event kind without echoing input', async () => {
     for (const [field, max] of [['text', 8192], ['title', 256], ['acceptance_criteria', 8192]] as const) {
@@ -370,10 +405,10 @@ describe('private durable intake HTTP/SQLite', () => {
     expect(assigned.assigned_session.hold).toEqual(assigned.hold);
     const heldRead = await ok('/tasks/' + task.id);
     expect(heldRead.task.assigned_sessions[0].hold).toEqual(assigned.hold);
-    expect(assigned.task.control.version).toBe(2);
+    expect(assigned.task.control.version).toBe(3);
     expect(assigned.task.payload_data.next_step).toBe('Watch Hub binding');
     const link = assigned.task.payload_data.history.find((e: any) => e.kind === 'link');
-    expect(link).toMatchObject({ hub_session_id: sessionId, evidence: 'external_unverified_not_launch_proof' });
+    expect(link).toMatchObject({ hub_session_id: sessionId, evidence: 'hub_launch_verified' });
     // The same operator controls the real session through hub sessions.
     const sessions = async () => ((await (await SELF.fetch('https://hub.test/api/sessions?limit=50',
       { headers: { Cookie: cookie, 'x-csrf-token': 'csrf' } })).json()) as any).sessions.map((s: any) => s.id);
@@ -389,9 +424,9 @@ describe('private durable intake HTTP/SQLite', () => {
     expect((await call('/tasks/' + task.id + '/assign', { ...payload, next_step: 'Different' })).status).toBe(409);
     // A second assignment is refused while the first session is still live.
     expect((await call('/tasks/' + task.id + '/assign', { ...payload, key: 'assign-second',
-      expected_version: 2, session: { workspace: 'demo' } })).status).toBe(409);
+      expected_version: assigned.task.control.version, session: { workspace: 'demo' } })).status).toBe(409);
     // A forged session identity fails closed without an oracle.
-    expect((await call('/tasks/' + task.id + '/events', { key: 'forged-link', expected_version: 2,
+    expect((await call('/tasks/' + task.id + '/events', { key: 'forged-link', expected_version: 3,
       event: { kind: 'link', hub_session_id: '12345678-1234-4234-8234-123456789012', provenance: source } })).status).toBe(404);
   });
   it('agents assign only through their own canonical session; foreign sessions fail closed', async () => {

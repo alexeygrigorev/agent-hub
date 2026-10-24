@@ -19,6 +19,7 @@
  * are reported as `recorded` / `transported` / `uncertain`, never as processed.
  * See docs/SESSION-CONTROL.md.
  */
+import { recordIntakeSessionLink, IntakeSessionLinkError } from './intake';
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { credentialActor } from './agent_registry';
 import { redact } from './routing';
@@ -249,6 +250,17 @@ export class SessionControlService {
     // DDL (single authority: src/session_lifecycle.ts schema string); the
     // host keeps no DDL copy. No ALTERs to existing tables here.
     initLifecycleTables(this.sql);
+    // Repair this day's pre-fix starts from canonical requests, once per id.
+    // Run each repair atomically; historical manual links are left untouched.
+    const hasIntake = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='intake_tasks'").toArray().length;
+    if (hasIntake) {
+      const today = this.at().slice(0, 10);
+      const sessions = this.sql.exec("SELECT * FROM session_control_sessions WHERE created_at >= ? AND json_extract(request_json, '$.intake_task_id') IS NOT NULL ORDER BY created_at,id", today).toArray();
+      for (const row of sessions) {
+        try { this.transaction(() => recordIntakeSessionLink(this.sql, row, this.now())); }
+        catch { console.warn('intake_session_link_backfill_pending'); }
+      }
+    }
   }
 
   private at() { return new Date(this.now()).toISOString(); }
@@ -1043,7 +1055,11 @@ export class SessionControlService {
         return response({ error: 'invalid_session_request', field: 'brief', detail: 'empty_brief' }, 400);
       }
       const actor = caller.actor || caller.machineId || 'admin';
-      return this.transaction(() => {
+      try { return this.transaction(() => {
+        const finish = (row: any, extra: any = {}, status = 200) => {
+          recordIntakeSessionLink(this.sql, row, this.now(), extra.hold);
+          return response({ ...this.view(row), ...extra }, status);
+        };
         let parentId: string | null = null;
         let parentSource = 'unknown_external';
         if (input.parent_id) {
@@ -1100,7 +1116,7 @@ export class SessionControlService {
           // A Fleet-side promotion (queued -> offered) is adopted before the
           // replay below, so polling the same key observes placement.
           const live = this.syncFleetPlacement(prior.id) ?? prior;
-          if (live.fleet_launch_id || live.state === 'cancelled') return response({ ...this.view(live), replay: true });
+          if (live.fleet_launch_id || live.state === 'cancelled') return finish(live, { replay: true });
           // A held intent may be placed once capacity/admission recovers; the fleet
           // reserve stays idempotent on its own derived key, so this cannot double-launch.
         }
@@ -1206,9 +1222,9 @@ export class SessionControlService {
               'INSERT INTO session_control_sessions (id, actor, request_key, request_json, mode, state, owner_token_id, owner_family, parent_id, parent_source, session_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
               id, actor, input.key, canonical, mode, 'held', caller.tokenId ?? null, creatorFamily, parentId, parentSource, sessionType, at, at);
             const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
-            return response({ ...this.view(row), hold: 'no_placement_authority' }, 409);
+            return finish(row, { hold: 'no_placement_authority' }, 409);
           }
-          return response({ ...this.view(prior), hold: 'no_placement_authority', replay: true }, 409);
+          return finish(prior, { hold: 'no_placement_authority', replay: true }, 409);
         }
         const id = prior?.id || crypto.randomUUID();
         const at = this.at();
@@ -1230,6 +1246,8 @@ export class SessionControlService {
       }, auth);
         if (reserved.status === 400) {
           this.sql.exec('UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE id = ?', 'refused', at, id);
+          const refused: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
+          recordIntakeSessionLink(this.sql, refused, this.now());
           return response(reserved.value, 400);
         }
         // Capacity-only placement parks a waitable queued intent (202) linked
@@ -1239,18 +1257,21 @@ export class SessionControlService {
           this.sql.exec('UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = NULL, engine = ?, state = ?, updated_at = ? WHERE id = ?',
             reserved.value.id, typeof reserved.value.engine === 'string' && reserved.value.engine ? reserved.value.engine : (input.engine ?? null), 'queued', at, id);
           const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
-          return response({ ...this.view(row), queued: true, queue_position: reserved.value.queue_position ?? null, rejected: reserved.value.rejected ?? null, requested: { engine: input.engine ?? null, machine: input.machine ?? null, workspace: input.workspace } }, 202);
+          return finish(row, { queued: true, queue_position: reserved.value.queue_position ?? null, rejected: reserved.value.rejected ?? null, requested: { engine: input.engine ?? null, machine: input.machine ?? null, workspace: input.workspace } }, 202);
         }
         if (reserved.status >= 300) {
           this.sql.exec('UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE id = ?', 'held', at, id);
           const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
-          return response({ ...this.view(row), hold: reserved.value, requested: { engine: input.engine ?? null, machine: input.machine ?? null, workspace: input.workspace } }, 409);
+          return finish(row, { hold: reserved.value, requested: { engine: input.engine ?? null, machine: input.machine ?? null, workspace: input.workspace } }, 409);
         }
         this.sql.exec('UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = ?, engine = ?, state = ?, updated_at = ? WHERE id = ?',
           reserved.value.id, reserved.value.machine ?? null, reserved.value.engine ?? null, reserved.value.state || 'offered', at, id);
         const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
-        return response({ ...this.view(row), replay: !!prior }, prior ? 200 : 201);
-      });
+        return finish(row, { replay: !!prior }, prior ? 200 : 201);
+      }); } catch (e) {
+        if (e instanceof IntakeSessionLinkError) return response({ error: e.code }, 507);
+        throw e;
+      }
     }
 
     if ((path === '/api/sessions/tree' || (path === '/api/sessions' && (url.searchParams.get('view') === 'tree' || url.searchParams.get('tree') === 'true'))) && request.method === 'GET') {

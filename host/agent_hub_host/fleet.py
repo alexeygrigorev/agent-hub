@@ -1642,6 +1642,7 @@ class Dispatcher:
         caps.update(engines=sorted({s.get('engine', s['service']) for s in self.settings['subscriptions']}),
                     workspaces=advertised_workspaces(self.settings), cpu_count=os.cpu_count())
         caps['fleet_modes'] = ['interactive'] + (['headless'] if self.settings.get('launcher') else [])
+        caps['launcher_resources'] = bool(self.settings.get('launcher'))
         qualified_jobs = self._derive_qualified_role_jobs()
         if qualified_jobs:
             caps['jobs'] = qualified_jobs
@@ -1649,6 +1650,11 @@ class Dispatcher:
             caps.pop('jobs', None)
         self.request('POST', '/api/machines/register', info)
         hb = api.get_heartbeat_payload()
+        if self.settings.get('launcher'):
+            from .launcher_recovery import reconcile_resources
+            resources = reconcile_resources(self.settings['launcher'], self.runner)
+            if resources is not None:
+                hb['launcher_resources'] = resources
         allowed = False
         # This is only a scheduling projection. dispatch() repeats the actual mode/account gate.
         for sub in self.settings['subscriptions']:

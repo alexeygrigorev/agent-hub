@@ -159,3 +159,22 @@ def settle_retired_legacy(launcher, *, state_dir=None):
     except (ImportError, OSError, sqlite3.Error, ValueError, KeyError, TypeError):
         return []
     return settled
+
+
+def reconcile_resources(launcher, runner):
+    """Periodic launcher reconciliation also covers stops/failures without journals.
+
+    Launcher owns exact native death proof and resident credit. Unknown or live
+    workers retain their leases; this command never starts or stops a process.
+    """
+    from .fleet import utcnow
+    observed_at = utcnow()  # Do not hide launches that occur during the scan.
+    try:
+        result = runner(list(launcher["argv"]) + ["--config-dir", launcher["config_dir"],
+                                               "resource-status"], cwd=launcher["root"])
+        memory = result["active_mem_mb"]
+        if type(memory) not in (int, float) or not 0 <= memory <= 10**9:
+            return None
+        return {"active_mem_mb": memory, "observed_at": observed_at}
+    except (KeyError, TypeError, ValueError, OSError, RuntimeError):
+        return None

@@ -212,7 +212,7 @@ describe('generic accounts and launch placement', () => {
     sql.exec("UPDATE machines SET capabilities = '{}' WHERE id = 'hetzner'");
     expect((s.plan(intent({ machine: 'hetzner' })) as any).rejected[0].reason).toBe('capability_unavailable');
     sql.exec("UPDATE machines SET last_checkin_at = ?, last_heartbeat = ? WHERE id = 'win35'", iso(), JSON.stringify({ mem_avail_mb: 11000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() } }));
-    expect((s.plan(intent({ machine: 'win35' })) as any).rejected[0].reason).toBe('resource_limit');
+    expect((s.plan(intent({ machine: 'win35' })) as any).rejected[0].reason).toBe('launcher_memory_reserve');
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'win35'", JSON.stringify({ gate: { launch_allowed: true, at: iso(-300001) } }));
     expect((s.plan(intent({ machine: 'win35' })) as any).rejected[0].reason).toBe('admission_unknown');
   }));
@@ -312,6 +312,33 @@ describe('generic accounts and launch placement', () => {
     expect(result.status).toBe(200);
     expect(sql.exec('SELECT max_concurrency AS n FROM fleet_accounts WHERE label = ?', 'shared-codex').one().n).toBe(2);
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('offered');
+  }));
+  it('queues on launcher reservations and promotes when fresh headroom frees', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const hb = { mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() },
+      launcher_resources: { active_mem_mb: 22000, observed_at: iso() } };
+    sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'hetzner'", JSON.stringify(hb));
+    const input = intent({ machine: 'hetzner', mode: 'headless' });
+    expect(s.plan(input).rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'launcher_memory_reserve' });
+    const parked = s.reserve(input, admin);
+    expect(parked.status).toBe(202);
+    expect(parked.value.state).toBe('queued');
+    hb.launcher_resources.active_mem_mb = 1500;
+    sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'hetzner'", JSON.stringify(hb));
+    s.drainCapacityQueue();
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', parked.value.id).one().state).toBe('offered');
+  }));
+  it('fails closed on stale launcher telemetry and counts unstarted offers', async () => fixture(async (s, sql) => {
+    await configure(s);
+    sql.exec("UPDATE machines SET capabilities = ? WHERE id='hetzner'", JSON.stringify({ engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8, launcher_resources: true }));
+    const hb = { mem_avail_mb: 13000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() }, launcher_resources: { active_mem_mb: 0, observed_at: iso(-180001) } };
+    sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id='hetzner'", JSON.stringify(hb));
+    const input = intent({ machine: 'hetzner', mode: 'headless' });
+    expect(s.plan(input).rejected?.[0]?.reason).toBe('admission_unknown');
+    hb.launcher_resources.observed_at = iso();
+    sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id='hetzner'", JSON.stringify(hb));
+    expect(s.reserve(input, admin).status).toBe(201);
+    expect(s.plan(intent({ machine: 'hetzner', mode: 'headless' })).rejected?.[0]?.reason).toBe('launcher_memory_reserve');
   }));
   it('binds claims to authenticated host and requires fresh account admission; duplicate claims cannot run twice', async () => fixture(async s => {
     await configure(s);

@@ -54,6 +54,8 @@ def diagnostic(exc):
     """Never interpolate exception bodies: they may contain credentials or payloads."""
     if isinstance(exc, (IntakeHTTPError, IntakeTransportError, IntakeInputError, config.ConfigPermissionError)):
         return str(exc)
+    if isinstance(exc, StaleSnapshot):
+        return 'Snapshot changed; retry the command to restart pagination'
     if isinstance(exc, UnicodeDecodeError):
         return 'Input is not valid UTF-8'
     if isinstance(exc, json.JSONDecodeError):
@@ -100,6 +102,8 @@ def http_error(exc, method, payload):
             limit = body.get('max_bytes')
             if type(limit) is int and 0 < limit <= MAX_REQUEST:
                 detail += f'; max {limit} UTF-8 bytes'
+    if code in ('invalid_limit', 'limit_out_of_range'):
+        detail += '; limit must be a positive integer; min 1, max 100 (larger values clamp)'
     if code == 'invalid_event_kind':
         detail += '; valid kinds: ' + ', '.join(EVENT_KINDS)
     # Only locally generated wording is printed, never arbitrary server messages.
@@ -175,13 +179,14 @@ def add_commands(sub):
     create.add_argument('--acceptance-criteria-file', default=None,
                         help='Read acceptance criteria from a UTF-8 file, or - for stdin (max 8 KiB)')
     create.add_argument('--key', required=True)
-    listing = commands.add_parser('list', help='One explicit revision-pinned page')
+    listing = commands.add_parser('list', help='List one page, or all matching tasks with --all')
     listing.add_argument('--status', default='open')
     listing.add_argument('--project')
     listing.add_argument('--after')
     listing.add_argument('--revision', type=int)
     listing.add_argument('--authorization-valid-until', type=int)
-    listing.add_argument('--limit', type=int, default=25)
+    listing.add_argument('--limit', type=int, default=25, help='Positive integer; default 25, server clamps above max 100')
+    listing.add_argument('--all', action='store_true', help='Follow all pages with a pinned snapshot; restart if it changes')
     for name in ('show', 'history', 'links', 'context'):
         command = commands.add_parser(name)
         command.add_argument('id')
@@ -299,6 +304,38 @@ def handoff(project=None, page_size=25):
     raise IntakeInputError('Snapshot kept changing; retry handoff')
 
 
+def list_all(params):
+    if 'after' in params:
+        raise IntakeInputError('--all cannot be combined with --after')
+    items, seen, cursors = [], set(), set()
+    first = None
+    for _ in range(10001):
+        page = request('GET', BASE + '/tasks?' + urlencode(params))
+        if first is None:
+            first = page
+        elif (page['snapshot_version'] != first['snapshot_version'] or
+              page.get('authorization_valid_until') != first.get('authorization_valid_until') or
+              page['total'] != first['total']):
+            raise StaleSnapshot('Snapshot changed')
+        for task in page['items']:
+            if task['id'] in seen:
+                raise IntakeInputError('Duplicate snapshot item; retry the command')
+            seen.add(task['id'])
+            items.append(task)
+        after = page['next']
+        if not after:
+            if len(items) != first['total']:
+                raise IntakeInputError('Incomplete snapshot; retry the command')
+            return dict(first, items=items, next=None, total=len(items))
+        if after in cursors or not page['items']:
+            raise IntakeInputError('Invalid snapshot cursor; retry the command')
+        cursors.add(after)
+        params.update(after=after, revision=first['snapshot_version'])
+        if first.get('authorization_valid_until') is not None:
+            params['authorization_valid_until'] = first['authorization_valid_until']
+    raise IntakeInputError('Snapshot page bound exceeded')
+
+
 def execute(args):
     if args.cmd == 'handoff':
         return handoff(args.project, args.page_size)
@@ -330,6 +367,8 @@ def execute(args):
         for field in ('project', 'after', 'revision', 'authorization_valid_until'):
             if getattr(args, field) is not None:
                 params[field] = getattr(args, field)
+        if args.all:
+            return list_all(params)
         return request('GET', BASE + '/tasks?' + urlencode(params))
     if command == 'grantees':
         if not getattr(args, 'actor', None) or not args.actor.strip():

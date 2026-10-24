@@ -39,6 +39,7 @@ beforeEach(async () => {
     h.env.HUB_ADMIN_TOKEN_SHA256 = 'a'.repeat(64);
     for (const t of ['tasks','grants','rules','receipts']) h.sql.exec('DELETE FROM intake_' + t);
     h.sql.exec('UPDATE intake_meta SET revision=0');
+    h.sessionControlService.hooks.reserve = undefined;
     h.sql.exec('DELETE FROM credentials'); h.sql.exec('DELETE FROM agents');
     h.sql.exec("INSERT OR REPLACE INTO users (sub, email, is_admin, first_seen_at, last_seen_at) VALUES ('fixture', 'admin@fake.local', 1, '2026-01-01', '2026-01-01')");
   });
@@ -131,5 +132,127 @@ describe('intake acceptance-criteria start gate', () => {
     const ambiguous = await sessionsCall({ key: 'ac-ambig-' + ++seq, workspace: 'demo', brief: 'Synthetic ambig goal', intake_task_id: prefix });
     expect(ambiguous.status, JSON.stringify(ambiguous.data)).toBe(409);
     expect(ambiguous.data.error).toBe('ambiguous_intake_task');
+  });
+});
+
+
+describe('canonical session start intake links', () => {
+  it('records exactly one verified link on a successful start and same-key retry, with live state', async () => {
+    const { task } = await create('', { acceptance_criteria: 'Synthetic start linkage.' });
+    await inDO(stub(), (h: any) => {
+      h.sessionControlService.hooks.reserve = () => ({ status: 201, value: { id: crypto.randomUUID(), machine: 'fixture-host', engine: 'codex', state: 'offered' } });
+    });
+    const payload = { key: 'linked-' + ++seq, workspace: 'demo', brief: 'Synthetic goal', intake_task_id: task.id };
+    const start = await sessionsCall(payload);
+    expect(start.status, JSON.stringify(start.data)).toBe(201);
+    const shown = (await ok('/tasks/' + task.id)).task;
+    expect(shown.assigned_sessions).toEqual([expect.objectContaining({ hub_session_id: start.data.id, state: 'offered' })]);
+    expect(shown.payload_data.history.filter((e: any) => e.kind === 'link')).toEqual([expect.objectContaining({
+      hub_session_id: start.data.id, evidence: 'hub_launch_verified', provenance: expect.objectContaining({ type: 'hub_launch_verified' }),
+    })]);
+    const retry = await sessionsCall(payload);
+    expect(retry.data.id).toBe(start.data.id);
+    expect((await ok('/tasks/' + task.id)).task.version).toBe(shown.version);
+    await inDO(stub(), (h: any) => { h.sql.exec("UPDATE session_control_sessions SET state='uncertain' WHERE id=?", start.data.id); });
+    expect((await ok('/tasks/' + task.id)).task.assigned_sessions[0].state).toBe('uncertain');
+  });
+});
+
+
+describe('linked start failure and migration boundaries', () => {
+  it('links held and refused starts, preserving the server hold and retry identity', async () => {
+    const { task } = await create('', { acceptance_criteria: 'Synthetic held linkage.' });
+    const payload = { key: 'held-link-' + ++seq, workspace: 'demo', brief: 'Synthetic goal', intake_task_id: task.id };
+    const start = await sessionsCall(payload);
+    expect(start.status).toBe(409);
+    expect(start.data.state).toBe('held');
+    const retry = await sessionsCall(payload);
+    expect(retry.data.id).toBe(start.data.id);
+    let shown = (await ok('/tasks/' + task.id)).task;
+    expect(shown.assigned_sessions).toEqual([expect.objectContaining({ hub_session_id: start.data.id, state: 'held', hold: start.data.hold })]);
+    expect(shown.payload_data.history.filter((e: any) => e.kind === 'link')).toHaveLength(1);
+    await inDO(stub(), (h: any) => { h.sessionControlService.hooks.reserve = () => ({ status: 400, value: { error: 'synthetic_refusal' } }); });
+    const refused = await sessionsCall({ ...payload, key: 'refused-link-' + ++seq });
+    expect(refused.status).toBe(400);
+    shown = (await ok('/tasks/' + task.id)).task;
+    expect(shown.assigned_sessions.some((s: any) => s.state === 'refused')).toBe(true);
+  });
+
+  it('resumes an assignment after a committed start loses its response without duplicate links', async () => {
+    const { task } = await create('', { acceptance_criteria: 'Synthetic crash recovery.' });
+    const payload = assignPayload(1, '-recovery');
+    await inDO(stub(), (h: any) => {
+      const start = h.intakeService.hooks.startSession;
+      h.intakeService.hooks.startSession = async (...args: any[]) => {
+        await start(...args);
+        h.intakeService.hooks.startSession = start;
+        throw new Error('synthetic lost response');
+      };
+    });
+    expect((await call('/tasks/' + task.id + '/assign', payload)).status).toBe(502);
+    const before = (await ok('/tasks/' + task.id)).task;
+    expect(before.assigned_sessions).toHaveLength(1);
+    const changed = await call('/tasks/' + task.id + '/assign', { ...payload, next_step: 'Changed payload' });
+    expect(changed.status).toBe(409);
+    const recovered = await ok('/tasks/' + task.id + '/assign', payload);
+    expect(recovered.assigned_session.hub_session_id).toBe(before.assigned_sessions[0].hub_session_id);
+    expect(recovered.task.payload_data.history.filter((e: any) => e.kind === 'link')).toHaveLength(1);
+    expect(await ok('/tasks/' + task.id + '/assign', payload)).toEqual(recovered);
+  });
+
+  it('links capacity queued starts with their live queued state', async () => {
+    const { task } = await create('', { acceptance_criteria: 'Synthetic queued linkage.' });
+    await inDO(stub(), (h: any) => { h.sessionControlService.hooks.reserve = () => ({ status: 202,
+      value: { id: crypto.randomUUID(), state: 'queued', queue_position: 1 } }); });
+    const start = await sessionsCall({ key: 'queued-link-' + ++seq, workspace: 'demo', brief: 'Synthetic goal', intake_task_id: task.id });
+    expect(start.status).toBe(202);
+    expect((await ok('/tasks/' + task.id)).task.assigned_sessions[0]).toMatchObject({ hub_session_id: start.data.id, state: 'queued' });
+  });
+
+  it('links interactive with_goal starts without manual append', async () => {
+    const { task } = await create('', { acceptance_criteria: 'Synthetic interactive linkage.' });
+    const start = await sessionsCall({ key: 'goal-link-' + ++seq, workspace: 'demo', mode: 'interactive', with_goal: true,
+      brief: 'Synthetic saved goal', intake_task_id: task.id });
+    expect(start.data.state).toBe('held');
+    expect((await ok('/tasks/' + task.id)).task.assigned_sessions[0].hub_session_id).toBe(start.data.id);
+  });
+
+  it('rolls back session creation and placement when link history has no capacity', async () => {
+    const { task } = await create('', { acceptance_criteria: 'Synthetic atomic linkage.' });
+    await inDO(stub(), (h: any) => {
+      const row = h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).toArray()[0];
+      const data = JSON.parse(row.data);
+      while (data.history.length < 128) data.history.push({ kind: 'note', id: crypto.randomUUID(), text: 'fixture' });
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
+    });
+    const before = await sessionCount();
+    const start = await sessionsCall({ key: 'full-link-' + ++seq, workspace: 'demo', brief: 'Synthetic goal', intake_task_id: task.id });
+    expect(start).toMatchObject({ status: 507, data: { error: 'history_capacity' } });
+    expect(await sessionCount()).toBe(before);
+  });
+
+  it('backfills canonical requests idempotently and preserves manual links', async () => {
+    const { task } = await create('', { acceptance_criteria: 'Synthetic backfill linkage.' });
+    const start = await sessionsCall({ key: 'backfill-link-' + ++seq, workspace: 'demo', brief: 'Synthetic goal', intake_task_id: task.id.slice(0, 8) });
+    await inDO(stub(), (h: any) => {
+      const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).toArray()[0].data);
+      data.history = data.history.filter((e: any) => e.kind !== 'link'); data.version = 1;
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
+      h.sessionControlService.init(); h.sessionControlService.init();
+    });
+    let shown = (await ok('/tasks/' + task.id)).task;
+    expect(shown.assigned_sessions[0].hub_session_id).toBe(start.data.id);
+    expect(shown.payload_data.history.filter((e: any) => e.kind === 'link')).toHaveLength(1);
+    const version = shown.version;
+    await inDO(stub(), (h: any) => {
+      const data = JSON.parse(h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).toArray()[0].data);
+      const manual = data.history.find((e: any) => e.kind === 'link');
+      manual.evidence = 'external_unverified_not_launch_proof'; manual.authority = 'untrusted_task_data'; manual.provenance = source;
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(data), task.id);
+      h.sessionControlService.init();
+    });
+    shown = (await ok('/tasks/' + task.id)).task;
+    expect(shown.version).toBe(version);
+    expect(shown.payload_data.history.find((e: any) => e.kind === 'link').evidence).toBe('external_unverified_not_launch_proof');
   });
 });

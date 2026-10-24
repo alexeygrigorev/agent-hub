@@ -51,6 +51,15 @@ beforeAll(async () => {
   cookie = (await createSessionCookie(defaultEnv, { sub, email: 'admin@fake.local', isAdmin: true, csrfToken: csrf, exp: Math.floor(Date.now() / 1000) + 3600 })).split(';')[0];
 });
 describe('Hub MCP protocol and parity', () => {
+  it.each([5, "5", 26, 100, "100", "101", 1000])('accepts MCP limit %s and clamps above 100', async limit => {
+      const response: any = await (await rpc('tools/call', { name: 'intake_list', arguments: { query: { limit } } })).json();
+      expect(JSON.parse(response.result.content[0].text)).toMatchObject({ status: 200, data: { effective_limit: Math.min(Number(limit), 100) } });
+  });
+
+  it.each([['oops', 'invalid_limit'], [1.5, 'invalid_limit'], [0, 'limit_out_of_range'], ['-1', 'limit_out_of_range']])('rejects invalid MCP limit %s precisely', async (limit, error) => {
+    const response: any = await (await rpc('tools/call', { name: 'intake_list', arguments: { query: { limit } } })).json();
+    expect(JSON.parse(response.result.content[0].text)).toMatchObject({ status: 400, data: { error, field: 'limit', min: 1, max: 100 } });
+  });
   it('updates intake with optional key/version and preserves concise append and held diagnostics', async () => {
     const invoke = async (name: string, args: any) => {
       const response: any = await (await rpc('tools/call', { name, arguments: args })).json();
@@ -72,6 +81,22 @@ describe('Hub MCP protocol and parity', () => {
     expect(held.data.assigned_session.state).toBe('held');
     expect(held.data.hold).toBeTruthy();
     expect(held.data.assigned_session.hold).toEqual(held.data.hold);
+  });
+  it('sessions_start links its intake once through the canonical server path', async () => {
+    const invoke = async (name: string, args: any) => {
+      const response: any = await (await rpc('tools/call', { name, arguments: args })).json();
+      return JSON.parse(response.result.content[0].text);
+    };
+    const created = await invoke('intake_create', { payload: { key: 'mcp-start-link-task', project: 'demo', title: 'Fixture', text: 'Fixture',
+      source: { type: 'unknown' }, acceptance_criteria: 'Synthetic MCP linkage.' } });
+    const id = created.data.task.id;
+    const payload = { key: 'mcp-start-link', workspace: 'demo', brief: 'Synthetic goal', intake_task_id: id };
+    const start = await invoke('sessions_start', { payload });
+    expect([201, 409]).toContain(start.status);
+    expect((await invoke('sessions_start', { payload })).data.id).toBe(start.data.id);
+    const shown = await invoke('intake_show', { id });
+    expect(shown.data.task.assigned_sessions[0].hub_session_id).toBe(start.data.id);
+    expect(shown.data.task.payload_data.history.filter((e: any) => e.kind === 'link')).toEqual([expect.objectContaining({ evidence: 'hub_launch_verified' })]);
   });
   it('appends the advertised note payload with and without source and reports unknown fields', async () => {
     const invoke = async (name: string, args: any) => {

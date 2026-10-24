@@ -48,7 +48,7 @@ function disabledEngines(): Set<string> {
   return new Set<string>((((policy as any).models || []) as any[]).filter(m => m && disabled.has(m.provider)).map(m => String(m.engine)));
 }
 /** Reject reasons that mean "no free slot right now" (transient capacity). */
-const CAPACITY_REASONS = new Set(['account_capacity', 'machine_capacity']);
+const CAPACITY_REASONS = new Set(['account_capacity', 'machine_capacity', 'launcher_memory_reserve']);
 /** Incidental per-route reasons that may accompany capacity but never queue alone
  * (stale/drained check-ins, policy-disabled engines, engines no live host
  * advertises anymore — e.g. registry routes for engines the current host
@@ -487,7 +487,13 @@ export class FleetService {
         reason = (engineMissing && liveEngines.size > 0 && !liveEngines.has(route.engine)) ? 'engine_unavailable' : 'capability_unavailable';
       }
       else if (hb.gate?.launch_allowed !== true || !fresh(hb.gate?.at, this.now(), 300000)) reason = 'admission_unknown';
-      else if (!Number.isFinite(hb.mem_avail_mb) || hb.mem_avail_mb < 10240 + 1500 || !Number.isFinite(hb.disk_free_gb) || hb.disk_free_gb < 50.5) reason = 'resource_limit';
+      else if (caps.launcher_resources === true && (!Number.isFinite(hb.launcher_resources?.active_mem_mb)
+        || hb.launcher_resources.active_mem_mb < 0
+        || !fresh(hb.launcher_resources?.observed_at, this.now(), 180000))) reason = 'admission_unknown';
+      else if (Number.isFinite(hb.mem_avail_mb) && hb.mem_avail_mb - (hb.launcher_resources?.active_mem_mb || 0)
+        - 1500 * (hb.launcher_resources ? Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND (state IN ('offered','starting') OR (state IN ('running','uncertain') AND updated_at >= ?))", route.machine_id, hb.launcher_resources.observed_at).one().n) : 0)
+        < 10240 + 1500) reason = 'launcher_memory_reserve';
+      else if (!Number.isFinite(hb.mem_avail_mb) || !Number.isFinite(hb.disk_free_gb) || hb.disk_free_gb < 50.5) reason = 'resource_limit';
       else if (!Array.isArray(hb.load) || !Number.isFinite(hb.load[0]) || hb.load[0] < 0 || !Number.isFinite(caps.cpu_count) || caps.cpu_count < 1) reason = 'load_unknown';
       else if (!account || account.status !== 'ok') reason = 'account_' + (account?.status || 'unmapped');
       else if (!this.observation(definitions.get(route.account), route)) reason = 'machine_account_quota_unknown';
