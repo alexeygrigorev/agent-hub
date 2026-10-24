@@ -42,6 +42,46 @@ async function configure(s: FleetService, shared = false) {
 }
 
 describe('phantom account reservations', () => {
+  it('counts an unbound native in the requested relative cwd once without correlating foreign or ambiguous natives', () => fixture(async (f, sql) => {
+    await configure(f);
+    sql.exec("UPDATE machines SET capabilities = json_set(capabilities, '$.workspaces', json('[\"/repo\"]')) WHERE id = 'hetzner'");
+    sql.exec("UPDATE fleet_accounts SET max_concurrency = 2 WHERE label = 'shared-codex'");
+    const launch: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner', workspace: '/repo', cwd: '.local/probe/wt', mode: 'headless' })), admin)).json();
+    expect(launch.state).toBe('offered');
+    sql.exec("UPDATE fleet_launches SET state = 'uncertain' WHERE id = ?", launch.id);
+    sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account,created_at_ms) VALUES ('hetzner','cwd-native',?,'codex','running',?,'/repo/.local/probe/wt','shared-codex',?)", 'task-hub-' + launch.id, iso(), now);
+    const status = () => f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-codex'").one());
+    expect(status().active).toBe(1);
+    expect(status().available_slots).toBe(1);
+    // The cwd must match the requested directory exactly, not a suffix or
+    // arbitrary descendant with the same task tag.
+    sql.exec("UPDATE fleet_sessions SET workspace = '/foreign/.local/probe/wt' WHERE native_id = 'cwd-native'");
+    expect(status().active).toBe(2);
+    sql.exec("UPDATE fleet_sessions SET workspace = '/repo/.local/probe/wt', engine = 'claude' WHERE native_id = 'cwd-native'");
+    expect(status().active).toBe(2);
+    sql.exec("UPDATE fleet_sessions SET engine = 'codex' WHERE native_id = 'cwd-native'");
+    sql.exec("UPDATE fleet_sessions SET workspace = '/repo/.local/probe/wt', profile = 'foreign' WHERE native_id = 'cwd-native'");
+    expect(status().active).toBe(2);
+    sql.exec("UPDATE fleet_sessions SET profile = NULL WHERE native_id = 'cwd-native'");
+    sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,profile,account,last_activity_at,cwd,created_at_ms) SELECT machine_id,'duplicate-native',tag,engine,phase,agent_state,observed_at,workspace,profile,account,last_activity_at,cwd,created_at_ms FROM fleet_sessions WHERE native_id = 'cwd-native'");
+    expect(status().active).toBe(3);
+    sql.exec("DELETE FROM fleet_sessions WHERE native_id = 'duplicate-native'");
+    const next: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner', workspace: '/repo' })), admin)).json();
+    expect(next.state).toBe('offered');
+    expect(sql.exec('SELECT state, native_id FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'uncertain', native_id: null });
+  }));
+
+  it.each([undefined, null, '.'])('preserves root correlation for cwd %s and holds malformed legacy intent', (cwd) => fixture(async (f, sql) => {
+    await configure(f);
+    const launch: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner', mode: 'headless', cwd })), admin)).json();
+    sql.exec("UPDATE fleet_launches SET state = 'uncertain' WHERE id = ?", launch.id);
+    sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account,created_at_ms) VALUES ('hetzner','root-native',?,'codex','running',?,'demo','shared-codex',?)", 'task-hub-' + launch.id, iso(), now);
+    const status = () => f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-codex'").one());
+    expect(status().active).toBe(1);
+    sql.exec("UPDATE fleet_launches SET request_json = 'invalid-json' WHERE id = ?", launch.id);
+    expect(status().active).toBe(2);
+  }));
+
   it('probes missing, stale and ambiguous bindings without polling every fresh live native', () => fixture(async (f, sql) => {
     await configure(f);
     const launch: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();

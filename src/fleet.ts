@@ -33,7 +33,14 @@ const ACTIVE = "('offered','starting','running','uncertain')";
 const NATIVE_RESERVED = `(l.native_id = s.native_id OR (
   l.native_id IS NULL AND l.state IN ('starting','uncertain') AND
   l.engine = s.engine AND l.account = s.account AND l.profile IS s.profile AND
-  l.workspace = s.workspace AND
+  -- Native start runs in the validated workspace-relative cwd, which can
+  -- differ from the project root stored on the launch. Match that exact
+  -- intended directory; never correlate by a task tag or path suffix alone.
+  CASE WHEN json_valid(l.request_json) THEN
+    CASE WHEN json_extract(l.request_json, '$.cwd') IS NULL OR json_extract(l.request_json, '$.cwd') = '.'
+      THEN l.workspace
+      ELSE rtrim(l.workspace, '/') || '/' || json_extract(l.request_json, '$.cwd') END
+    END = s.workspace AND
   (SELECT COUNT(*) FROM fleet_sessions spawned WHERE spawned.machine_id = s.machine_id
    AND spawned.tag = s.tag AND spawned.engine = s.engine AND spawned.account = s.account
    AND spawned.profile IS s.profile AND spawned.workspace = s.workspace
