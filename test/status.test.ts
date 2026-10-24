@@ -126,6 +126,19 @@ beforeEach(async () => {
 });
 
 describe('M14a authorized one-call status projection', () => {
+  it('surfaces stuck launch work alerts only to operators and removes resolved episodes', async () => {
+    await inDO(stub(), (h: any) => {
+      h.livenessService.setAlert('launch', 'never-claimed', { state: 'stuck', detail: 'offered for 601s' });
+    });
+    expect((await ok('')).needs_attention).toContainEqual(expect.objectContaining({
+      subject: 'launch:never-claimed', title: 'Launch stuck: never-claimed', state: 'stuck',
+    }));
+    const agent = await seedAgent();
+    await grant(agent);
+    expect((await ok('', agent.token)).needs_attention.some((a: any) => a.subject === 'launch:never-claimed')).toBe(false);
+    await inDO(stub(), (h: any) => h.livenessService.setAlert('launch', 'never-claimed', null));
+    expect((await ok('')).needs_attention.some((a: any) => a.subject === 'launch:never-claimed')).toBe(false);
+  });
   it('includes active check alerts in operator status without leaking them to task-granted agents', async () => {
     await inDO(stub(), (h: any) => {
       h.livenessService.setAlert('check', 'status-delivery-slo', { state: 'fail', detail: '2 pending messages exceed the configured SLO' });

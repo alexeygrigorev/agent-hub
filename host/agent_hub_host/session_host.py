@@ -386,6 +386,13 @@ def maintenance_step_once(dispatcher, quota_collector):
     try:
         results = dispatcher.once()
         print(json.dumps({'event': 'fleet_cycle', 'results': len(results)}), flush=True)
+        for result in results:
+            if (isinstance(result, dict) and result.get('state') in {'failed', 'held'}
+                    and result.get('reason') in {'workspace_unavailable', 'model_unsupported',
+                        'admission_unconfigured', 'admission_refused', 'dispatch_refused'}):
+                # Whitelist diagnostics; no arbitrary exception text or payload.
+                print(json.dumps({'event': 'fleet_dispatch_refused',
+                                  'state': result['state'], 'reason': result['reason']}), flush=True)
     except Exception as error:
         print(json.dumps({'event': 'fleet_error', 'type': type(error).__name__}), flush=True)
     try:

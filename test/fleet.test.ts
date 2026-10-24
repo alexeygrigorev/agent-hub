@@ -549,18 +549,18 @@ describe('generic accounts and launch placement', () => {
     expect(account.active).toBe(1);
     expect(account.available_slots).toBe(account.max_concurrency - 1);
   }));
-  it('rejects only unclaimed own-host offers with an explicit workspace failure', async () => fixture(async (s, sql) => {
+  it.each(['workspace_unavailable', 'model_unsupported', 'admission_unconfigured', 'admission_refused', 'dispatch_refused'])('rejects only unclaimed own-host offers with explicit %s', async reason => fixture(async (s, sql) => {
     await configure(s);
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
     const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
     sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES ('pending', 'owner', 'pending', '{}', ?, 'hetzner', 'headless', 'offered', ?, ?)", launch.id, iso(), iso());
     const path = '/launches/' + launch.id + '/reject';
-    const receipt = { reason: 'workspace_unavailable' };
+    const receipt = { reason };
     expect((await s.handle(request(path, receipt), host('win35'))).status).toBe(404);
     expect((await s.handle(request(path, receipt), admin)).status).toBe(403);
     expect((await s.handle(request(path, { reason: 'arbitrary text' }), host('hetzner'))).status).toBe(400);
     expect((await s.handle(request(path, receipt), host('hetzner'))).status).toBe(200);
-    expect(sql.exec('SELECT state, exit_reason, verification_status FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'failed', exit_reason: 'workspace_unavailable', verification_status: 'not_started' });
+    expect(sql.exec('SELECT state, exit_reason, verification_status FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'failed', exit_reason: reason, verification_status: 'not_started' });
     expect(sql.exec("SELECT state FROM session_control_sessions WHERE id = 'pending'").one().state).toBe('failed');
     expect((await s.handle(request(path, receipt), host('hetzner'))).status).toBe(409);
     const claimed: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();

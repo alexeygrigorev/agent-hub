@@ -1221,7 +1221,7 @@ class Dispatcher:
             sub["launcher_model"] = model["model"]
             sub["launcher_effort"] = model["effort"]
         if not sub.get("admission_argv"):
-            raise ValueError("Maintained fresh admission adapter is not configured")
+            raise ValueError("admission_unconfigured: maintained fresh admission adapter is not configured")
         return sub
 
     def _verify_native_cwd(self, native, native_id, target_cwd, receipt):
@@ -1814,30 +1814,32 @@ class Dispatcher:
                         results.append({'id': offer.get('id'), 'state': 'binding_pending',
                                         'error': type(exc).__name__[:64]})
             except Exception as exc:
-                if isinstance(exc, ValueError) and str(exc).startswith('model_unsupported:') and not offer.get('task_id'):
+                # Persist only a bounded slug, never exception text (which may
+                # contain goals, paths or credentials). The server atomically
+                # rejects only unclaimed offers: a lost claim response or a
+                # possibly-live native effect must retain its reservation.
+                reason = 'dispatch_refused'
+                if isinstance(exc, ValueError):
+                    prefix = str(exc).split(':', 1)[0]
+                    if prefix in {'model_unsupported', 'admission_unconfigured'}:
+                        reason = prefix
+                    elif str(exc) in {'Fresh admission refused', 'Fresh admission timestamp required',
+                                      'Selected model/effort requires verified admission'}:
+                        reason = 'admission_refused'
+                try:
+                    resolve_workspace_path(self.settings, offer.get('workspace'))
+                except (ValueError, OSError):
+                    reason = 'workspace_unavailable'
+                if not offer.get('task_id'):
                     try:
-                        rejected = self.request('POST', '/api/fleet/launches/' + offer['id'] + '/reject', {'reason': 'model_unsupported'})
+                        rejected = self.request('POST', '/api/fleet/launches/' + offer['id'] + '/reject', {'reason': reason})
                         results.append(rejected)
                         continue
                     except Exception:
                         pass  # A racing claim is never proof of no native effect.
-                if offer.get("mode") == "headless" and not offer.get("task_id"):
-                    try:
-                        resolve_workspace_path(self.settings, offer.get("workspace"))
-                    except (ValueError, OSError):
-                        try:
-                            rejected = self.request("POST", "/api/fleet/launches/" + offer["id"] + "/reject", {"reason": "workspace_unavailable"})
-                            results.append(rejected)
-                            continue
-                        except Exception:
-                            # A racing claim or older server is not no-start
-                            # proof. Keep the offer held and retry next cycle.
-                            pass
-                # Route/claim/admission refusal: no native effect. Bounded
-                # classification only (type + stage, never argv/goal/secrets)
-                # so held-offers stay distinguishable in local counts.
+                # No successful rejection receipt: keep uncertainty visible
+                # locally and retry reconciliation next cycle.
                 err = (type(exc).__name__ or "Error")[:64]
-                reason = (str(exc).split(":", 1)[0] if isinstance(exc, ValueError) and str(exc).startswith(("model_unsupported:", "model_mismatch:")) else ("dispatch_refused:%s" % err))[:120]
                 results.append({"id": offer.get("id"), "state": "held",
                                 "reason": reason, "stage": "dispatch_route",
                                 "error": err})

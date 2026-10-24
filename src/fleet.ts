@@ -1234,7 +1234,7 @@ export class FleetService {
         const row: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id = ? AND machine_id = ?', match[1], caller.machineId!).toArray()[0];
         if (!row) return response({ error: 'not_found' }, 404);
         if (match[2] === 'reject') {
-          if (!object(data, ['reason']) || !['workspace_unavailable', 'model_unsupported'].includes(data.reason)) return response({ error: 'invalid_rejection' }, 400);
+          if (!object(data, ['reason']) || !['workspace_unavailable', 'model_unsupported', 'admission_unconfigured', 'admission_refused', 'dispatch_refused'].includes(data.reason)) return response({ error: 'invalid_rejection' }, 400);
           // Only an unclaimed offer proves that no start was authorized. The
           // transaction fences a racing claim; never reject possibly-live work.
           if (row.state !== 'offered' || row.native_id || row.launcher_task_id) return response({ error: 'already_claimed' }, 409);

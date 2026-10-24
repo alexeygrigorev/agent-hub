@@ -232,11 +232,11 @@ export class StatusService {
     if (!admin) return base;
     let rows: any[];
     try {
-      rows = this.sql.exec("SELECT id, subject, state, detail, opened_at FROM liveness_alerts WHERE subject_kind='check' AND resolved_at IS NULL ORDER BY id DESC LIMIT 64").toArray();
+      rows = this.sql.exec("SELECT id, subject_kind, subject, state, detail, opened_at FROM liveness_alerts WHERE (subject_kind='check' OR (subject_kind='launch' AND state='stuck')) AND resolved_at IS NULL ORDER BY id DESC LIMIT 64").toArray();
     } catch { return base; }
     return [...base, ...rows.map(row => ({
-      severity: 'warn', subject: 'check:' + row.subject,
-      title: 'Scheduled check: ' + row.subject, detail: snippet(row.detail),
+      severity: 'warn', subject: row.subject_kind + ':' + row.subject,
+      title: (row.subject_kind === 'launch' ? 'Launch stuck: ' : 'Scheduled check: ') + row.subject, detail: snippet(row.detail),
       state: row.state, alert_id: row.id, opened_at: row.opened_at,
       source: 'liveness_alerts', scope: 'hub',
     }))];

@@ -34,6 +34,21 @@ function launch(sql: any, id: string, machineId: string, state: string, updatedA
 const byId = (subjects: any[], kind: string, id: string) => subjects.find(s => s.kind === kind && s.id === id)?.state;
 
 describe('liveness states', () => {
+  it('opens one work alert after ten minutes offered despite fresh host cycles, then resolves it', () => fixture((live, sql, clock) => {
+    machine(sql, 'hetzner', iso(0));
+    launch(sql, 'never-claimed', 'hetzner', 'offered', 600);
+    expect(live.reconcileAlerts(live.evaluate().subjects)).toEqual([]);
+    clock.t += 1000;
+    sql.exec('UPDATE machines SET last_checkin_at = ? WHERE id = ?', new Date(clock.t).toISOString(), 'hetzner');
+    const opened = live.reconcileAlerts(live.evaluate().subjects);
+    expect(opened).toHaveLength(1);
+    expect(opened[0]).toMatchObject({ subject_kind: 'launch', subject: 'never-claimed', state: 'stuck' });
+    expect(opened[0].detail).toContain('offered for 601s');
+    expect(live.reconcileAlerts(live.evaluate().subjects)).toEqual([]);
+    sql.exec("UPDATE fleet_launches SET state='failed', exit_reason='admission_unconfigured' WHERE id='never-claimed'");
+    live.reconcileAlerts(live.evaluate().subjects);
+    expect(live.alerts()[0].resolved_at).not.toBeNull();
+  }));
   it('classifies machines by heartbeat age and drain state', () => fixture((live, sql) => {
     machine(sql, 'fresh', iso(60)); machine(sql, 'late', iso(300)); machine(sql, 'gone', iso(3600)); machine(sql, 'new', null); machine(sql, 'parked', iso(3600), 1);
     const { subjects } = live.evaluate();
