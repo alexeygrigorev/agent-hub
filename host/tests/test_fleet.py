@@ -665,17 +665,17 @@ class FleetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = settings(Path(tmp)); cfg['capabilities'] = []
             cfg['launcher'] = {'argv': ['python3', '-m', 'launcher'], 'root': tmp, 'config_dir': str(Path(tmp) / 'config')}
-            cfg['subscriptions'][0].update(launcher_provider='codex', launcher_model='gpt-6-sol', launcher_effort='high')
+            cfg['subscriptions'][0].update(launcher_provider='codex', launcher_model='gpt-6.1-sol', launcher_effort='high')
             calls, requests = [], []
             def runner(argv, **kw):
                 calls.append(argv)
                 if argv[0] == 'maintained-gate':
                     return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow(),
-                            'model_supported': True, 'model': 'gpt-6-sol', 'effort': 'high'}
+                            'model_supported': True, 'model': 'gpt-6.1-sol', 'effort': 'high'}
                 if 'plan' in argv:
-                    return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol', 'task_fit': 1.0, 'account_label': 'shared-codex', 'profile': None}]}
+                    return {'eligible': [{'provider': 'codex', 'model': 'gpt-6.1-sol', 'task_fit': 1.0, 'account_label': 'shared-codex', 'profile': None}]}
                 if 'run' in argv:
-                    return {'receipt': {'unit_name': 'headless-unit', 'exit_code': 0}}
+                    return {'receipt': {'model': 'gpt-6.1-sol', 'model_verified': True, 'unit_name': 'headless-unit', 'exit_code': 0}}
                 return {}
 
             d = fleet.Dispatcher(cfg, lambda *a: requests.append(a) or {}, runner)
@@ -714,19 +714,19 @@ class FleetTests(unittest.TestCase):
             calls.clear()
             requests.clear()
             legacy_offer = offer(mode='headless', task_id='task-intake-999', prompt='Legacy review task',
-                                 needs=[], selection={'model': 'gpt-6-sol', 'effort': 'high'})
+                                 needs=[], selection={'id': 'sol', 'model': 'gpt-6.1-sol', 'effort': 'high'})
             legacy_result_file = Path(tmp) / '.local' / 'hub-results' / (legacy_offer['id'] + '.json')
 
             def legacy_runner(argv, **kw):
                 calls.append(argv)
                 if argv[0] == 'maintained-gate':
                     return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow(),
-                            'model_supported': True, 'model': 'gpt-6-sol', 'effort': 'high'}
+                            'model_supported': True, 'model': 'gpt-6.1-sol', 'effort': 'high'}
                 if 'plan' in argv:
-                    return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol', 'task_fit': 1.0, 'account_label': 'shared-codex', 'profile': None}]}
+                    return {'eligible': [{'provider': 'codex', 'model': 'gpt-6.1-sol', 'task_fit': 1.0, 'account_label': 'shared-codex', 'profile': None}]}
                 if 'run' in argv:
                     legacy_result_file.write_text(json.dumps({'status': 'done', 'report': 'Finished legacy task', 'artifacts': []}), encoding='utf-8')
-                    return {'receipt': {'unit_name': 'headless-unit', 'exit_code': 0}}
+                    return {'receipt': {'model': 'gpt-6.1-sol', 'model_verified': True, 'unit_name': 'headless-unit', 'exit_code': 0}}
                 return {}
 
             d_legacy = fleet.Dispatcher(cfg, lambda *a: requests.append(a) or {}, legacy_runner)
@@ -848,10 +848,10 @@ class FleetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = settings(Path(tmp)); cfg['capabilities'] = []
             cfg['launcher'] = {'argv': ['python3', '-m', 'launcher'], 'root': tmp, 'config_dir': str(Path(tmp) / 'config')}
-            cfg['subscriptions'][0].update(launcher_provider='codex', launcher_model='gpt-6-sol', launcher_effort='high')
+            cfg['subscriptions'][0].update(launcher_provider='codex', launcher_model='gpt-6.1-sol', launcher_effort='high')
 
             assigned_offer = offer(mode='headless', task_id='task-intake-abc', prompt='Do task',
-                                   needs=[], selection={'model': 'gpt-6-sol', 'effort': 'high'})
+                                   needs=[], selection={'id': 'sol', 'model': 'gpt-6.1-sol', 'effort': 'high'})
             result_file = Path(tmp) / '.local' / 'hub-results' / (assigned_offer['id'] + '.json')
 
             for case_name, file_content, process_exit_code, expected_status, is_symlink in [
@@ -871,9 +871,9 @@ class FleetTests(unittest.TestCase):
                     def runner(argv, **kw):
                         if argv[0] == 'maintained-gate':
                             return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow(),
-                                    'model_supported': True, 'model': 'gpt-6-sol', 'effort': 'high'}
+                                    'model_supported': True, 'model': 'gpt-6.1-sol', 'effort': 'high'}
                         if 'plan' in argv:
-                            return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol', 'task_fit': 1.0, 'account_label': 'shared-codex', 'profile': None}]}
+                            return {'eligible': [{'provider': 'codex', 'model': 'gpt-6.1-sol', 'task_fit': 1.0, 'account_label': 'shared-codex', 'profile': None}]}
                         if 'run' in argv:
                             # Workload writes the result file during execution
                             if is_symlink:
@@ -882,7 +882,7 @@ class FleetTests(unittest.TestCase):
                                 result_file.symlink_to(target)
                             elif file_content is not None:
                                 result_file.write_text(file_content, encoding='utf-8')
-                            return {'receipt': {'unit_name': 'headless-unit', 'exit_code': process_exit_code}}
+                            return {'receipt': {'model': 'gpt-6.1-sol', 'model_verified': True, 'unit_name': 'headless-unit', 'exit_code': process_exit_code}}
                         return {}
 
                     d = fleet.Dispatcher(cfg, lambda *a: requests.append(a) or {}, runner)
