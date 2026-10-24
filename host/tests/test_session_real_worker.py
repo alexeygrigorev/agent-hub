@@ -374,7 +374,7 @@ class TestSessionRealWorker(unittest.TestCase):
         now_ms = int(_now.timestamp() * 1000)
         caps = json.dumps({"mem_avail_mb": 32000, "disk_free_gb": 80, "load": [1],
                            "gate": {"launch_allowed": True, "at": now},
-                           "engines": ["codex"], "fleet_modes": ["headless"],
+                           "engines": ["codex"], "fleet_modes": ["headless", "interactive"],
                            "workspaces": ["demo"], "cpu_count": 8})
         hb = json.dumps({"mem_avail_mb": 32000, "disk_free_gb": 80, "load": [1],
                          "gate": {"launch_allowed": True, "at": now}})
@@ -462,13 +462,12 @@ class TestSessionRealWorker(unittest.TestCase):
 
     def test_real_worker_session_loop_via_cli_and_receiver(self):
         # 1. Public CLI start (real fleet placement, no mock).
-        brief_file = os.path.join(self.native_dir, "goal.txt")
-        with open(brief_file, "w") as f:
-            f.write("real loop goal")
+        # Positive input-delivery fixture: Codex exec is intentionally
+        # unsupported; the native auto-reply fixture models an interactive TUI.
         start = self.run_cli(["sessions", "start", "--workspace", "demo",
                               "--engine", "codex", "--reason", "codex required for real loop test",
                               "--machine", "hetzner",
-                              "--brief-file", brief_file,
+                              "--interactive",
                               "--intake-task", "fixture-intake",
                               "--key", "real-loop-1"], token="sess-agent-token")
         created = json.loads(start.stdout)
