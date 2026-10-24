@@ -19,6 +19,15 @@ class TestSessionControlCli(unittest.TestCase):
     def parse(self, *args):
         return parser().parse_args(['sessions', *args])
 
+    def test_wait_stops_at_failed_send_instead_of_waiting_until_timeout(self):
+        failed = {'id': 'cmd', 'state': 'failed',
+                  'ack': {'reason': 'send_unsupported_headless'}}
+        with patch.object(session_control, '_fetch_command_entry', return_value=failed) as fetch, \
+                patch.object(session_control.time, 'sleep') as sleep:
+            self.assertEqual(session_control.wait_for_command('owned', 'cmd', 60, 1), failed)
+        fetch.assert_called_once_with('owned', 'cmd')
+        sleep.assert_not_called()
+
     def test_protect_uses_the_owner_route_and_never_a_native_stop(self):
         with patch.object(session_control, 'request', return_value={'cleanup_protection': {'permanent': True}}) as transport:
             result = session_control.execute(self.parse('protect', 'owned-worker', '--key', 'protect-once'))

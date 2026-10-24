@@ -1580,3 +1580,67 @@ describe('held cancellation current agent binding and scope', () => {
     }
   });
 });
+
+describe('bounded command custody recovery', () => {
+  it('requeues expired claims, preserves the execution fence, and fails after three leases even without a claimant', async () => {
+    await fixture(async (s, sql) => {
+      const session: any = await startOk(s, { machine: 'hetzner' });
+      await bindHttp(s, sql, session.id);
+      const cmd: any = await (await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'retry', body: 'go' }), admin)).json();
+      const poll: any = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json();
+      const offer = poll.offers[0];
+      const first = await claimAs(s, cmd.command_id, offer.correlation);
+      expect(Date.parse(first.expires_at) - Date.now()).toBeLessThanOrEqual(60000);
+      const expire = () => sql.exec('UPDATE session_control_commands SET claim_expires_at = ? WHERE id = ?', new Date(Date.now() - 1).toISOString(), cmd.command_id);
+      const commands = async () => (await (await s.handle(request(`/api/sessions/${session.id}/commands`, undefined, 'GET'), admin)).json() as any).commands;
+      expire();
+      const requeued = (await commands())[0];
+      expect(requeued.state).toBe('recorded');
+      expect(requeued.attempts).toBe(2);
+      const next: any = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json();
+      expect(next.offers[0].command_id).toBe(cmd.command_id);
+      const rival = await s.handle(request(`/api/session-commands/${cmd.command_id}/claim`, { correlation: offer.correlation, attempt_id: ATTEMPT2 }), host('hetzner'));
+      expect((await rival.json() as any).error).toBe('retry_requires_original_attempt');
+      const second = await claimAs(s, cmd.command_id, offer.correlation);
+      expect(second.claim_token).toBe(first.claim_token);
+      expect(second.attempt).toBe(2);
+      // Host polling also recovers a lease; a dead original claimant cannot
+      // strand its retained retry in transported forever.
+      expire();
+      const retryPoll: any = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json();
+      expect(retryPoll.offers[0].command_id).toBe(cmd.command_id);
+      expect((await commands())[0].attempts).toBe(3);
+      expire();
+      const failed = (await commands())[0];
+      expect(failed.state).toBe('failed');
+      expect(failed.ack.reason).toBe('claim_expired_retry_exhausted');
+      expect((await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json() as any).offers).toEqual([]);
+      expect((await s.handle(request(`/api/session-commands/${cmd.command_id}/claim`, { correlation: offer.correlation, attempt_id: ATTEMPT }), host('hetzner'))).status).toBe(409);
+    }, fakeReserve().hook);
+  });
+
+  it('accepts a proven send within 60 seconds and fails unsupported headless input explicitly', async () => {
+    await fixture(async (s, sql) => {
+      const session: any = await startOk(s, { machine: 'hetzner' });
+      await bindHttp(s, sql, session.id);
+      for (const [key, outcome, reason, expected] of [
+        ['supported', 'delivered', 'verified reply', 'acked'],
+        ['exec', 'refused', 'send_unsupported_headless', 'failed'],
+      ]) {
+        const started = Date.now();
+        await s.handle(request(`/api/sessions/${session.id}/send`, { key, body: 'go' }), admin);
+        const poll: any = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json();
+        const offer = poll.offers[0];
+        expect(offer.mode).toBe('headless');
+        const grant = await claimAs(s, offer.command_id, offer.correlation);
+        const ack = await s.handle(request(`/api/session-commands/${offer.command_id}/ack`, {
+          correlation: offer.correlation, claim_token: grant.claim_token, native: native(), outcome, reason,
+          ...(outcome === 'delivered' ? { proof: goodProof() } : {}),
+        }), host('hetzner'));
+        expect(ack.status).toBe(200);
+        expect((await ack.json() as any).state).toBe(expected);
+        expect(Date.now() - started).toBeLessThan(60000);
+      }
+    }, fakeReserve().hook);
+  });
+});

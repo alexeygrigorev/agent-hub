@@ -12,7 +12,7 @@
  *
  * Concurrent host processes and poll retries cannot execute the same command
  * twice: only the claim holder (machine + claim token, unexpired) may ack, an
- * expired or lost-effect attempt becomes `uncertain` (never blindly reissued),
+ * expired custody is retried with the same fence and bounded to three leases,
  * and a transport mark alone never authorizes an effect. SEND delivery
  * (`acked`) additionally requires a correlated receiver proof validated by
  * `validateSendProof` — host assertion, PTY bytes, or inbox persistence alone
@@ -229,7 +229,7 @@ export class SessionControlService {
   ) {
     this.maxPending = options.maxPendingCommands ?? 2000;
     this.maxPerSession = options.maxSessionCommands ?? 200;
-    this.claimTtlMs = options.claimTtlMs ?? 300000;
+    this.claimTtlMs = options.claimTtlMs ?? 60000;
   }
 
   init() {
@@ -760,9 +760,28 @@ export class SessionControlService {
   }
 
   private claimExpired(row: any): boolean {
-    if (!row.claim_expires_at) return false;
+    if (!row.claim_expires_at) return true;
     const at = Date.parse(row.claim_expires_at);
     return !Number.isFinite(at) || at <= this.now();
+  }
+
+  /** Retry custody of the SAME journaled effect, never authorize a new executor.
+   * Retain token/attempt so a restarted host can only reconcile its original
+   * journal. Missing journals on a different attester fail closed.
+   */
+  private expireClaim(row: any) {
+    const attempts = row.attempts ?? 1;
+    const exhausted = attempts >= 3;
+    this.sql.exec("UPDATE session_control_commands SET state = ?, ack_json = ?, poll_at = NULL, attempts = ?, claim_expires_at = ?, updated_at = ? WHERE id = ? AND state IN ('claimed','recorded','transported')",
+      exhausted ? 'failed' : 'recorded',
+      exhausted ? JSON.stringify({ outcome: 'failed', reason: 'claim_expired_retry_exhausted' }) : null,
+      exhausted ? attempts : attempts + 1, new Date(this.now() + this.claimTtlMs).toISOString(), this.at(), row.id);
+  }
+
+  private sweepSessionClaims(sessionId: string) {
+    const rows = this.sql.exec("SELECT * FROM session_control_commands WHERE session_id = ? AND state IN ('claimed','recorded','transported') AND claim_token IS NOT NULL AND ack_json IS NULL AND (claim_expires_at IS NULL OR claim_expires_at <= ?) LIMIT 100",
+      sessionId, this.at()).toArray() as any[];
+    for (const row of rows) this.expireClaim(row);
   }
 
   private markUncertain(row: any, reason: string) {
@@ -771,7 +790,8 @@ export class SessionControlService {
   }
 
   /** Late-reply reconciliation for an uncertain SEND (the single post-terminal
-   * transition). Real recipients ordinarily reply minutes after the execution
+   * transition), also accepted during same-fence retry custody. Real recipients
+   * ordinarily reply after the execution
    * lease lapses; discarding those replies would strand normal delayed
    * delivery. This path records the proven outcome WITHOUT any new effect
    * and WITHOUT re-opening claiming (claim on uncertain still 409s):
@@ -781,8 +801,7 @@ export class SessionControlService {
    * - outcome `delivered` with a valid, still-unused reply proof against the
    *   CURRENT binding (stale generations fail closed as usual).
    *
-   * Capture/stop and proof-less outcomes stay terminal: without a reply
-   * proof there is nothing to reconcile. Returns the success response, or
+   * Capture/stop and proof-less outcomes cannot use this late proof path. Returns the success response, or
    * null when this ack is not an eligible late reply.
    */
   private lateReplyAck(row: any, input: any, caller: Caller): Response | null {
@@ -1870,6 +1889,7 @@ export class SessionControlService {
       }
 
       if (sub === 'commands' && request.method === 'GET') {
+        this.transaction(() => this.sweepSessionClaims(session.id));
         const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 50));
         const params: any[] = [session.id];
         const cursorSql = this.cursorClause(url.searchParams.get('cursor'), params, false);
@@ -1938,17 +1958,16 @@ export class SessionControlService {
       if (!host) return response({ error: 'forbidden' }, 403);
       return this.transaction(() => {
         const at = this.at();
-        // Expiry sweep: a claim whose lease lapsed is a lost-effect attempt.
-        // Uncertain here, never re-offered, never blindly reissued. Only the
+        // Retry expired custody with the original execution fence. Only the
         // CURRENT bound family may age its own machine's claims: foreign or
         // superseded families neither read payloads nor mutate transport here.
         for (const stale of this.sql.exec(
           `SELECT c.id, c.claim_expires_at, s.host_family, s.machine_id FROM session_control_commands c JOIN session_control_sessions s ON s.id = c.session_id
-           WHERE s.machine_id = ? AND c.state = 'claimed' AND c.holder_machine = ?`, caller.machineId!, caller.machineId!).toArray() as any[]) {
+           WHERE s.machine_id = ? AND c.state IN ('claimed','recorded','transported') AND c.claim_token IS NOT NULL AND c.ack_json IS NULL AND c.holder_machine = ? AND (c.claim_expires_at IS NULL OR c.claim_expires_at <= ?) LIMIT 100`, caller.machineId!, caller.machineId!, at).toArray() as any[]) {
           const session = { machine_id: stale.machine_id, host_family: stale.host_family };
           if (!this.hostOk(session, caller).ok) continue;
           const full: any = this.sql.exec('SELECT * FROM session_control_commands WHERE id = ?', stale.id).toArray()[0];
-          if (full && this.claimExpired(full)) this.markUncertain(full, 'claim_expired');
+          if (full) this.expireClaim(full);
         }
         // A fetch receipt without a claim authorizes nothing: stale unclaimed
         // fetches revert to recorded so a lost poll response self-heals. Rows
@@ -1993,6 +2012,7 @@ export class SessionControlService {
             // Expected session engine for host-side masquerade refusal: the
             // receiver qualifies the live catalog row against it.
             engine: session.engine ?? null,
+            mode: session.mode,
             // Server-owned cleanup-tree authorization (canonical offer
             // exposure): true ONLY for stop commands whose stored payload was
             // written by the cleanup --apply route. Ordinary stops carry
@@ -2049,7 +2069,7 @@ export class SessionControlService {
         }
         if (row.state === 'claimed') {
           if (this.claimExpired(row)) {
-            this.markUncertain(row, 'claim_expired');
+            this.expireClaim(row);
             return response({ error: 'claim_expired' }, 409);
           }
           if (row.holder_machine !== caller.machineId) return response({ error: 'claim_conflict' }, 409);
@@ -2067,9 +2087,18 @@ export class SessionControlService {
           return response({ error: 'already_claimed' }, 409);
         }
         if (!CLAIMABLE.has(row.state)) return response({ error: row.state === 'uncertain' ? 'command_uncertain' : 'invalid_transition' }, 409);
-        const token = crypto.randomUUID();
+        if (row.claim_token && this.claimExpired(row)) {
+          this.expireClaim(row);
+          return response({ error: 'claim_expired' }, 409);
+        }
+        // A retry keeps the original execution fence. A different local
+        // journal/attester must never repeat an effect whose outcome is lost.
+        if (row.claim_token && (row.holder_machine !== caller.machineId || row.holder_attempt !== input.attempt_id)) {
+          return response({ error: 'retry_requires_original_attempt' }, 409);
+        }
+        const token = row.claim_token || crypto.randomUUID();
         const expires = new Date(this.now() + this.claimTtlMs).toISOString();
-        const attempt = (row.attempts ?? 0) + 1;
+        const attempt = row.claim_token ? row.attempts : (row.attempts ?? 0) + 1;
         const written = this.sql.exec(
           "UPDATE session_control_commands SET state = 'claimed', holder_machine = ?, claim_token = ?, claim_expires_at = ?, holder_attempt = ?, attempts = ?, updated_at = ? WHERE id = ? AND state IN ('recorded', 'transported')",
           caller.machineId, token, expires, input.attempt_id, attempt, this.at(), row.id);
@@ -2121,7 +2150,7 @@ export class SessionControlService {
         // narrow path below: late-reply reconciliation on uncertain sends.
         if (row.state !== 'claimed') {
           if (this.sameAck(row, input)) return response({ command_id: row.id, state: row.state });
-          if (row.state === 'uncertain') {
+          if (row.state === 'uncertain' || (CLAIMABLE.has(row.state) && row.claim_token)) {
             const late = this.lateReplyAck(row, input, caller);
             if (late) return late;
             return response({ error: 'command_uncertain' }, 409);
@@ -2142,7 +2171,7 @@ export class SessionControlService {
             const late = this.lateReplyAck(row, input, caller);
             if (late) return late;
           }
-          this.markUncertain(row, 'claim_expired_before_ack');
+          this.expireClaim(row);
           return response({ error: 'claim_expired' }, 409);
         }
         if (input.correlation !== row.correlation) return response({ error: 'correlation_mismatch' }, 409);
@@ -2218,7 +2247,7 @@ export class SessionControlService {
         };
         const state = input.outcome === 'delivered' ? 'acked'
           : input.outcome === 'transported' ? 'transported'
-          : input.outcome === 'refused' ? 'refused' : 'uncertain';
+          : input.outcome === 'refused' ? (row.kind === 'send' && input.reason === 'send_unsupported_headless' ? 'failed' : 'refused') : 'uncertain';
         this.sql.exec('UPDATE session_control_commands SET state = ?, ack_json = ?, updated_at = ? WHERE id = ?', state, JSON.stringify(ack), at, row.id);
         if (state === 'acked' && row.kind === 'send' && input.proof) {
           this.sql.exec('INSERT INTO session_control_proofs (reply_envelope_id, command_id, session_id, created_at) VALUES (?, ?, ?, ?)',

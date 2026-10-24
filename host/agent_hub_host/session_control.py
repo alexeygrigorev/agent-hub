@@ -29,7 +29,7 @@ WAIT_MAX_TIMEOUT = 600.0
 WAIT_MIN_INTERVAL = 1.0
 # Terminal command states: only these confirm an outcome. `transported` alone
 # is fetch/PTY bytes, never processing proof; waiting never treats it as done.
-TERMINAL_COMMAND = ('acked', 'refused', 'uncertain')
+TERMINAL_COMMAND = ('acked', 'refused', 'uncertain', 'failed')
 TERMINAL_SESSION = ('running', 'stopped', 'failed', 'refused', 'held', 'uncertain', 'cancelled')
 
 SAFE_ERROR = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
