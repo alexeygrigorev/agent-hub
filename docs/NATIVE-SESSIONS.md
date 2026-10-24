@@ -4,6 +4,16 @@
 
 All native `aplexer` sessions on host machines (such as Hetzner) are observed through the maintained host catalog pipeline and adopted into the canonical Hub session control view. This provides full visibility and control (`list`, `show`, `send`, `capture`, `stop`, `commands`) over existing native sessions—including long-running background tasks, developer sessions, and psc/a workloads—without requiring duplicate Fleet launches, fake agent registry bindings, or artificial credential minting.
 
+Hub may control any session, including manual PocketShell/psc sessions and
+sessions started by Alexey or another coordinator. Session origin does not
+prohibit sending input, stopping, or deleting a session; ordinary caller
+authorization and exact native identity checks still apply. Host-attested
+adoption needs no separate operator claim. The existing API exposes
+send/capture/stop, not a separate delete endpoint. Observed sessions remain
+protected from automated cleanup; permission to stop/delete a session does
+not authorize deleting its worktree or repository. See
+[SESSION-CONTROL.md](SESSION-CONTROL.md#observed-non-hub-native-sessions-adopted-and-controllable).
+
 ## Key Principles & Design
 
 1. **Host-Attested Observation**:
@@ -26,7 +36,7 @@ All native `aplexer` sessions on host machines (such as Hetzner) are observed th
 3. **Provenance & Controllability**:
    - Each session in `GET /api/sessions` carries explicit provenance:
      - `provenance`: `'observed_native'` for adopted host sessions, `'canonical_hub'` for sessions initiated through Hub intents.
-     - `controllability`: `'controllable'` for active/running sessions, `'historical_read_only'` for stopped/exited sessions.
+     - `controllability`: `'controllable'` for `running`, `active` and `starting` observed sessions; `'historical_read_only'` for other observed states.
      - `workspace`: Canonical absolute workspace path.
      - `qualified_alias`: Pre-computed `<workspace_basename>:<tag>` alias for client convenience.
 

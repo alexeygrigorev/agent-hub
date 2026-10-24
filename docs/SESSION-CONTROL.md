@@ -227,19 +227,32 @@ additional identifiers, never replacements.
   is actor-scoped (admins resolve within their own actor too), exact-match,
   single-hit only: unknown names are `not_found` (404, never an oracle),
   ambiguous names are `ambiguous_name` (409, refused — use the UUID), and a
-  native tag is NEVER a name (no tag-guessing, no foreign-session control,
-  never latest-wins). The host binding route stays strict Hub UUID.
+  bare native tag is never a friendly name (no tag-guessing or latest-wins).
+  Adopted native sessions also support the exact qualified alias described
+  below. The host binding route stays strict Hub UUID.
 
-### Observed (non-Hub) native sessions: read-only inventory, no adoption
+### Observed (non-Hub) native sessions: adopted and controllable
 
-"Can it list/send/capture sessions that psc started?" Honestly: the fleet
-inventory (`fleet_sessions` reports) shows ACTUAL native sessions, including
-ones other coordinators or Alexey started — but there is NO verified Hub
-binding for them (no fleet launch, no UUID/tag/incarnation reconciliation),
-so they are read-only observations. The hub never fakes a binding, never
-claims ownership of another coordinator's or Alexey's sessions, and control
-routes refuse them. Adoption would require a genuine Hub start (or an
-explicit, reviewed adoption flow that does not exist); it is not claimed.
+Hub may control any session, including manual PocketShell/psc sessions and
+sessions started by Alexey or another coordinator. Session origin does not
+prohibit sending input, stopping, or deleting a session; ordinary caller
+authorization and exact native identity checks still apply.
+
+The machine-authenticated host catalog (`PUT /api/fleet/sessions`) invokes
+`adoptObservedNativeSessions` to reconcile the exact native UUID, tag,
+workspace, engine and creation-time incarnation into the canonical session
+control view. No duplicate Fleet launch or separate operator claim is needed.
+Running observed native sessions are reported as `provenance: observed_native`
+and `controllability: controllable`; `active` and `starting` states are also
+controllable. Other observed states report `historical_read_only`.
+
+Authorized human admins can list/show, send, capture and stop these sessions
+by native UUID or exact qualified alias (`<workspace_basename>:<tag>`).
+Non-admin agent credentials retain their existing access restrictions. This
+is the existing send/capture/stop contract, not a separate delete API.
+Observed sessions remain protected from automated cleanup; permission to
+stop/delete a session does not authorize deleting its worktree or repository.
+See [NATIVE-SESSIONS.md](NATIVE-SESSIONS.md) for adoption and lifecycle details.
 
 ### Claim / ack discipline (one-time attempt fence)
 
@@ -372,7 +385,8 @@ Capture output is projected on the host BEFORE upload, bounded
 (`max_bytes` 1..65536), server-redacted with the existing routing `redact`
 (routing regexes cannot prove arbitrary terminal secrets removed — the doc
 and CLI never claim redaction proves privacy), and responses flag
-truncation. No raw archives, no foreign-session capture.
+truncation. Captures require authorization and an exact native binding,
+including for adopted sessions. No raw archives are uploaded.
 
 Stop verifies the intended native exit: `delivered` on a stop requires
 `confirmed_exit: true` with the exact bound native triple before the session
@@ -482,7 +496,7 @@ Host-attested native aplexer sessions (interactive sessions, background work, ta
 1. **Exact incarnation**: Preserves native UUID (`id`), tag, workspace, integer `created_at_ms`, and engine. Machine-bound host authority ensures that only the authorized enrolled host machine can report observations or claims.
 2. **Provenance & Controllability**:
    - `provenance`: `observed_native` (vs `canonical_hub` for Hub-started sessions).
-   - `controllability`: `controllable` for active sessions (`running`, `starting`), `historical_read_only` for stopped sessions.
+   - `controllability`: `controllable` for `running`, `active` and `starting` observed sessions; `historical_read_only` for other observed states.
 3. **Qualified Native Aliases (`<workspace_basename>:<tag>`)**:
    - Mapped from the canonical workspace path basename and native tag (e.g. `/home/alexey/git/dataops` + `batching` -> `dataops:batching`; `/home/alexey/git` + `crm-redesign` -> `git:crm-redesign`).
    - Exact match resolution only. Collisions or reused tags return `409 ambiguous_name` honestly without "latest wins"; callers fall back to the exact canonical native UUID.
