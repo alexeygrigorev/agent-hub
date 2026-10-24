@@ -167,7 +167,79 @@
     }
   }
 
+  // Shared SVG renderer for timestamped host/account measurements. Uses the
+  // same geometry, palette, legends and accessible points as hourly activity.
+  function timeSeries(title, series, start, end, unit = '') {
+    const figure = el('figure', '', 'metrics-chart');
+    figure.append(el('h3', title));
+    const legend = el('ul', '', 'metrics-legend');
+    series.forEach((s, i) => {
+      const item = el('li', '', `metrics-series metrics-series-${i % 5}`);
+      const known = s.points.filter(p => number(p.value));
+      item.append(el('span', '', 'metrics-swatch'), el('span', `${s.label}${s.reference ? ' · reference threshold' : known.length ? ` · latest ${fmt(known.at(-1).value)}${unit}` : ' · unknown'}`));
+      legend.append(item);
+    });
+    figure.append(legend);
+    const values = series.flatMap(s => s.points.map(p => p.value).filter(number));
+    if (!values.length) { figure.append(el('p', 'No measurements in this range. Gaps mean unknown.', 'metrics-chart-empty')); return figure; }
+    const W = mobile.matches ? 340 : 760, H = 250, L = 46, R = 26, T = 18, B = 48;
+    const max = Math.max(...values), scale = max || 1;
+    const x = at => L + (at - start) / (end - start) * (W - L - R);
+    const y = v => T + (1 - v / scale) * (H - T - B);
+    const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, role: 'group', 'aria-label': `${title}. Touch or focus a point for its observation time and value.` });
+    const info = el('figcaption', 'Touch, hover or focus a point for the measured time and value.', 'metrics-point-detail');
+    info.setAttribute('aria-live', 'polite');
+    for (const ratio of max ? [0, 0.5, 1] : [0]) {
+      const v = ratio * scale;
+      svg.append(svgEl('line', { x1: L, x2: W - R, y1: y(v), y2: y(v), class: 'metrics-grid' }));
+      svg.append(svgEl('text', { x: L - 9, y: y(v) + 4, 'text-anchor': 'end', class: 'metrics-axis' }, compact(v)));
+    }
+    for (const ratio of [0, 0.5, 1]) {
+      const at = start + (end - start) * ratio;
+      const label = new Date(at).toISOString().slice(end - start > 86400000 ? 5 : 11, end - start > 86400000 ? 10 : 16);
+      svg.append(svgEl('text', { x: x(at), y: H - 22, 'text-anchor': ratio === 0 ? 'start' : ratio === 1 ? 'end' : 'middle', class: 'metrics-axis' }, label));
+    }
+    svg.append(svgEl('text', { x: W - R, y: H - 3, 'text-anchor': 'end', class: 'metrics-axis' }, `UTC · ${unit || 'count'}`));
+    series.forEach((s, i) => {
+      const group = svgEl('g', { class: `metrics-series metrics-series-${i % 5}`, 'data-series': s.label });
+      let path = '', connected = false;
+      for (const p of s.points) {
+        if (!number(p.value)) { connected = false; continue; }
+        path += `${connected ? 'L' : 'M'}${x(p.at)},${y(p.value)} `;
+        connected = true;
+      }
+      group.append(svgEl('path', { d: path, class: 'metrics-line', 'aria-hidden': 'true' }));
+      for (const p of s.points) {
+        if (!number(p.value)) continue;
+        const description = `${s.label} · ${utc(p.at)} · ${fmt(p.value)}${unit}${s.reference ? ' · reference threshold' : ''}`;
+        const dot = svgEl('circle', { cx: x(p.at), cy: y(p.value), r: 3, tabindex: 0, role: 'img', 'aria-label': description, 'data-value': p.value, class: 'metrics-point' });
+        dot.append(svgEl('title', {}, description));
+        const show = () => { info.textContent = description; };
+        dot.addEventListener('focus', show);
+        dot.addEventListener('pointerenter', show);
+        dot.addEventListener('pointerdown', show);
+        group.append(dot);
+      }
+      svg.append(group);
+    });
+    // Dense minute histories need a usable touch target: touching anywhere
+    // in the plot reports the nearest bucket, including explicit unknowns.
+    svg.addEventListener('pointerdown', event => {
+      const bounds = svg.getBoundingClientRect();
+      const fraction = Math.max(0, Math.min(1, ((event.clientX - bounds.left) / bounds.width * W - L) / (W - L - R)));
+      const at = start + fraction * (end - start);
+      const details = series.map(s => {
+        const p = s.points.reduce((best, p) => !best || Math.abs(p.at - at) < Math.abs(best.at - at) ? p : best, null);
+        return `${s.label}: ${p && number(p.value) ? fmt(p.value) + unit + (s.reference ? ' (reference threshold)' : ' at ' + utc(p.at)) : 'unknown (gap)'}`;
+      });
+      info.textContent = `Nearest observations · ${utc(at)} · ${details.join(' · ')}`;
+    });
+    figure.append(svg, info);
+    return figure;
+  }
+
   window.HubMetricsCharts = {
+    timeSeries,
     render(data) {
       activity(data);
       bars(data, 'usage', 'usage-chart', [['Input', 'total_input_tokens'], ['Output', 'total_output_tokens']]);

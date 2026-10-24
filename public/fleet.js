@@ -25,22 +25,36 @@ async function api(path, method = 'GET', data) {
   if (!r.ok) throw Error(`Hub request failed (${r.status}); request may need reconciliation.`);
   return r.json();
 }
+function slotCell(a) {
+  // Counted vs live: active splits into launch reservations + orphan observed
+  // sessions; live is the host-catalog verified native process count.
+  if (a && (a.reserved !== undefined || a.observed_sessions !== undefined || a.native_live !== undefined)) {
+    const base = `${a.active} (res ${a.reserved ?? '?'} + orph ${a.observed_sessions ?? '?'}; live ${a.native_live ?? '?'}) / ${a.max_concurrency}`;
+    return a.placeable_slots !== undefined ? `${base}; placeable ${a.placeable_slots}` : base;
+  }
+  return `${a.active} / ${a.max_concurrency}`;
+}
 function render(data) {
   const root = byId('machine-view'); root.replaceChildren();
+  const aliases = (data && data.machine_aliases) || {};
   for (const m of data.machines) {
     const section = document.createElement('article'); section.className = 'machine';
-    const title = document.createElement('h3'); title.textContent = `${m.name || m.id} · ${m.drained ? 'drained' : fresh(m.last_checkin_at) ? 'online' : 'stale / offline'}`; section.append(title);
+    const title = document.createElement('h3'); title.textContent = `${m.name || m.id} · ${m.drained ? 'drained' : fresh(m.last_checkin_at) ? 'online' : 'stale / offline'}${m.alias_of ? ` · alias of ${m.canonical_id || m.alias_of} (same physical host; reporting via ${m.canonical_id || m.alias_of})` : ''}`; section.append(title);
     const subscriptions = data.subscriptions.filter(s => s.machine_id === m.id);
     section.append(table(['Service', 'Account label', 'Plan', 'Quota / used allowance / reset'], subscriptions.map(s => [s.service, s.account, s.plan, `${s.stale ? 'stale; ' : ''}${s.quota.status}; ` + Object.entries(s.quota.windows || {}).map(([name, w]) => `${name}: ${w.present ? `${w.percent_remaining ?? 'unknown'}% left / ${w.percent_remaining === null ? 'unknown' : 100 - w.percent_remaining}% used; reset ${w.reset_at || 'unknown'}` : 'not present'}`).join(' | ')])));
     if (!subscriptions.length) { const p = document.createElement('p'); p.textContent = 'No subscription report. Configure this machine and enable its metadata collector.'; section.append(p); }
     root.append(section);
   }
-  root.append(table(['Shared account', 'Service', 'Status', 'Remaining', 'Active / limit', 'Machines'], data.accounts.map(a => [a.label, a.provider, a.status, a.remaining_percent === null ? 'unknown' : `${a.remaining_percent}%`, `${a.active} / ${a.max_concurrency}`, a.machines.join(', ')])));
+  root.append(table(['Shared account', 'Service', 'Status', 'Remaining', 'Active / limit', 'Machines'], data.accounts.map(a => [a.label, a.provider, a.status + (a.placement_reasons && a.placement_reasons.length ? ` (${a.placement_reasons.join(', ')})` : ''), a.remaining_percent === null ? 'unknown' : `${a.remaining_percent}%`, slotCell(a), a.machines.join(', ')])));
   const map = new Map(data.launches.map(a => [a.id, a]));
   const depth = launch => { const seen = new Set(); let p = launch, n = 0; while (p.parent_id && map.has(p.parent_id) && !seen.has(p.parent_id) && n < 20) { seen.add(p.parent_id); p = map.get(p.parent_id); n++; } return n; };
   byId('hub-agents').replaceChildren(table(['Agent / parent', 'Kind', 'Machine', 'Mode', 'Requested by / when', 'Task', 'State / native reference'], data.launches.map(a => [`${'↳ '.repeat(depth(a))}${a.id}${a.parent_id ? `; parent ${a.parent_id}` : '; root request'}`, `${a.engine} / ${a.profile || 'default'} / ${a.account}`, a.machine_id, a.mode, `${a.actor} (${a.requester_kind}) / ${a.created_at}`, a.summary, `${a.state} / ${a.native_id || 'none yet'}`])));
-  const machineName = id => data.machines.find(m => m.id === id)?.name || id;
-  const sessionsWrap = table(['Machine', 'Workspace', 'Tag', 'Engine / profile / account', 'Status', 'Last change'], data.sessions.map(s => [machineName(s.machine_id), s.workspace, s.tag, `${s.engine || 'shell'} / ${s.profile || 'default'} / ${s.account || 'unknown'}`, `${s.phase} / ${s.agent_state || 'unknown'}`, `${s.observed_at}${fresh(data.machines.find(m => m.id === s.machine_id)?.last_checkin_at) ? '' : ' (machine not reporting)'}`]));
+  const machineName = id => {
+    const resolved = (aliases && aliases[id]) || id;
+    const name = data.machines.find(m => m.id === resolved)?.name || resolved;
+    return resolved === id ? name : `${name} (alias ${id})`;
+  };
+  const sessionsWrap = table(['Machine', 'Workspace', 'Tag', 'Engine / profile / account', 'Status', 'Last change'], data.sessions.map(s => [machineName(s.machine_id), s.workspace, s.tag, `${s.engine || 'shell'} / ${s.profile || 'default'} / ${s.account || 'unknown'}`, `${s.phase} / ${s.agent_state || 'unknown'}`, `${s.observed_at}${fresh(data.machines.find(m => m.id === (s.resolved_machine_id || s.machine_id))?.last_checkin_at) ? '' : ' (machine not reporting)'}`]));
   if (data.sessions.length) {
     const trs = sessionsWrap.querySelectorAll('tbody tr');
     data.sessions.forEach((s, i) => {
@@ -266,8 +280,12 @@ function renderActivity(data) {
     fmtTs(m.created_at)
   ])));
 }
-function renderHostHealth(health) {
-  const root = byId('host-health');
+function memMb(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 'unknown';
+  return Math.abs(value) >= 1024 ? `${(value / 1024).toFixed(1)} GiB` : `${Math.round(value)} MiB`;
+}
+function renderHostHealth(health, fleet) {
+  const root = byId('host-health-current');
   if (!root) return;
   root.replaceChildren();
   if (!health || health.error) {
@@ -283,12 +301,21 @@ function renderHostHealth(health) {
     root.append(p);
     return;
   }
+  // Launcher reservation projection comes from /api/fleet (host_resources);
+  // the health payload itself carries reservation + placement when fresh.
+  const resources = new Map();
+  for (const h of (fleet && fleet.host_resources) || []) resources.set(h.machine_id, h);
   const rows = [];
   for (const h of hosts) {
     const loadStr = h.load ? `${h.load.load1.toFixed(2)}, ${h.load.load5.toFixed(2)}, ${h.load.load15.toFixed(2)}` : 'unknown';
     const mem = h.memory || {};
     const memUsage = mem.percent !== undefined && mem.percent !== null ? `${mem.percent}%` : 'unknown';
     const memBytes = `${formatBytes(mem.used_bytes)} / ${formatBytes(mem.total_bytes)} (avail ${formatBytes(mem.available_bytes)})`;
+    const res = h.reservation || resources.get(h.machine_id) || null;
+    const resText = !res ? 'unknown'
+      : res.stale_telemetry ? `stale telemetry (avail ${memMb(res.mem_avail_mb)})`
+      : `avail ${memMb(res.mem_avail_mb)} · reserved ${memMb(res.reserved_mb)} · floor ${memMb(res.floor_mb)} · after next worker ${res.headroom_mb === null || res.headroom_mb === undefined ? 'unknown' : memMb(res.headroom_mb)}${res.headroom_ok === false ? ' (below floor)' : ''}`;
+    const placement = h.placement && h.placement.reason ? h.placement.reason : '';
     rows.push([
       h.machine_id,
       healthBadge(h.freshness),
@@ -296,16 +323,25 @@ function renderHostHealth(health) {
       healthBadge(mem.status),
       memUsage,
       memBytes,
+      resText,
+      placement || 'none',
       ago(Number.isFinite(Date.parse(h.observed_at)) ? Math.max(0, Math.round(age(h.observed_at) / 1000)) : null)
     ]);
   }
-  root.append(richTable(['Machine', 'Freshness', 'Load (1m, 5m, 15m)', 'Memory Status', 'Memory Usage', 'Used / Total (Avail)', 'Observed'], rows));
+  root.append(richTable(['Machine', 'Freshness', 'Load (1m, 5m, 15m)', 'Memory Status', 'Memory Usage', 'Used / Total (Avail)', 'Launcher reservation (avail · reserved · floor · headroom)', 'Placement pressure', 'Observed'], rows));
+  const pressured = hosts.filter(h => h.placement && h.placement.reason);
+  if (pressured.length) {
+    const p = document.createElement('p');
+    p.textContent = `Host health is degraded while launches are rejected/held for memory or capacity: ${pressured.map(h => `${h.machine_id}: ${h.placement.reason}`).join(' | ')}`;
+    root.append(p);
+  }
 }
 async function refresh() {
   if (refreshing) return;
   refreshing = true; byId('fleet-refresh').disabled = true;
   try {
     const me = await api('/auth/me'); csrf = me.csrf_token;
+    HubHostCharts.refresh(api);
     for (const id of ['account-name','menu-name','menu-email']) byId(id).textContent = me.email;
     document.querySelector('.dk-avatar__initials').textContent = me.email.slice(0,1).toUpperCase();
     const [fleet, live, checks] = await Promise.all([api('/api/fleet'), api('/api/liveness'), api('/api/checks')]);
@@ -321,9 +357,9 @@ async function refresh() {
       renderDisk({ error: e.message });
     }
     try {
-      renderHostHealth(await api('/api/monitoring/health'));
+      renderHostHealth(await api('/api/monitoring/health'), fleet);
     } catch (e) {
-      renderHostHealth({ error: e.message });
+      renderHostHealth({ error: e.message }, fleet);
     }
     try {
       renderActivity(await api('/api/bus/activity?limit=10'));

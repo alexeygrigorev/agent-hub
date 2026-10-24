@@ -34,6 +34,8 @@ import { SessionControlService } from './session_control';
 import { StatusService, type StatusMachineAuth } from './status';
 import { MetricsStore, handleMetricsRoutes } from './metrics';
 import { MonitoringService } from './monitoring';
+import { HostHistoryService } from './host-history';
+import { placementPressureSubjects } from './host-pressure';
 
 function parseEpoch(raw: any): number | null {
   if (raw === undefined || raw === null || raw === '' || typeof raw === 'boolean') return null;
@@ -111,6 +113,7 @@ export class Hub extends DurableObject {
   public livenessService: LivenessService;
   public checksService: ChecksService;
   public monitoringService: MonitoringService;
+  public hostHistoryService: HostHistoryService;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -173,6 +176,7 @@ export class Hub extends DurableObject {
     }
     this.livenessService = new LivenessService(this.sql, thresholdsFrom(env));
     this.livenessService.init();
+    this.livenessService.setPressureProjection(() => placementPressureSubjects(this.sql, this.fleetService, Date.now()));
     this.checksService = new ChecksService(this.sql);
     this.checksService.init();
     this.monitoringService = new MonitoringService(
@@ -183,6 +187,9 @@ export class Hub extends DurableObject {
       this.intakeService,
     );
     this.monitoringService.init();
+    this.monitoringService.setResourceProjection(machine => this.fleetService.hostResources(machine)[0]);
+    this.hostHistoryService = new HostHistoryService(this.sql, this.fleetService);
+    this.hostHistoryService.init();
     this.statusService.setMonitoringService(this.monitoringService);
 
     const busForJobs = Object.create(this.busService);
@@ -255,6 +262,7 @@ export class Hub extends DurableObject {
     this.jobsService = new JobsService(this.sql, this.ctx, {
       busService: busForJobs,
       enableAlarms: true,
+      alarmDeadline: () => this.hostHistoryService.nextSampleAt(),
       env: this.env,
     });
     this.jobsService.setBusService(busForJobs);
@@ -458,11 +466,22 @@ export class Hub extends DurableObject {
         if ((resolved as any).error) return (resolved as any).error;
         return this.statusService.handleObservation(request, (resolved as any).auth);
       }
+      if (path === '/api/monitoring/history') {
+        const auth = await this.authenticateBusRequest(request);
+        const response = this.hostHistoryService.handle(request, auth);
+        if (response.ok) {
+          const alarm = await this.ctx.storage.getAlarm();
+          if (alarm === null || alarm > Date.now() + 60000) await this.ctx.storage.setAlarm(Date.now() + 60000);
+        }
+        return response;
+      }
       if (path === '/api/monitoring/disk') {
         if (request.method === 'POST') {
           const resolved = await this.statusObservationAuth(request);
           if ((resolved as any).error) return (resolved as any).error;
-          return this.monitoringService.handleObservation(request, (resolved as any).auth);
+          const response = await this.monitoringService.handleObservation(request, (resolved as any).auth);
+          if (response.ok) await this.sampleHostHistory();
+          return response;
         }
         if (request.method === 'GET') {
           const auth = await this.authenticateBusRequest(request);
@@ -478,7 +497,9 @@ export class Hub extends DurableObject {
         if (request.method === 'POST') {
           const resolved = await this.statusObservationAuth(request);
           if ((resolved as any).error) return (resolved as any).error;
-          return this.monitoringService.handleHostHealthObservation(request, (resolved as any).auth);
+          const response = await this.monitoringService.handleHostHealthObservation(request, (resolved as any).auth);
+          if (response.ok) await this.sampleHostHistory();
+          return response;
         }
         if (request.method === 'GET') {
           const auth = await this.authenticateBusRequest(request);
@@ -1711,7 +1732,7 @@ export class Hub extends DurableObject {
       const nextTime = nextAlarm || this.jobsService.getAlarmTime();
       if (nextTime) {
         try {
-          await this.ctx.storage.setAlarm(Math.max(Date.now(), nextTime));
+          await this.ctx.storage.setAlarm(Math.max(Date.now(), Math.min(nextTime, Date.now() + 60000)));
         } catch {}
       }
     }
@@ -1719,16 +1740,23 @@ export class Hub extends DurableObject {
     return { status: 'ok', retention: cleanup, tick: tickResult };
   }
 
+  async sampleHostHistory() {
+    try { this.hostHistoryService.sample(); } catch { console.warn('resource_history_sampling_failed'); }
+    const alarm = await this.ctx.storage.getAlarm();
+    if (alarm === null || alarm > Date.now() + 60000) await this.ctx.storage.setAlarm(Date.now() + 60000);
+  }
+
   async alarm() {
     const now = (this.jobsService as any).now ? (this.jobsService as any).now() : new Date();
+    try { this.hostHistoryService.sample(); } catch { console.warn('resource_history_sampling_failed'); }
     const cleanup = this.busService.retentionCleanup(now.getTime(), 100);
     const nextAlarm = this.jobsService.processAlarms();
 
     if (cleanup.hasMore) {
       await this.ctx.storage.setAlarm(Date.now() + 1000);
-    } else if (nextAlarm) {
+    } else {
       try {
-        await this.ctx.storage.setAlarm(Math.max(Date.now(), nextAlarm));
+        await this.ctx.storage.setAlarm(Math.max(Date.now(), Math.min(nextAlarm || Infinity, Date.now() + 60000)));
       } catch {}
     }
   }

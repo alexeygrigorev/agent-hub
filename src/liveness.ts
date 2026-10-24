@@ -6,6 +6,7 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { effectiveCheckin } from './registry';
 import { accountCapacityAlerts } from './account_capacity';
+import { resolveMachineAliases, aliasDetail, projectAliasSessions } from './machine-alias';
 
 export const LIVENESS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS agent_heartbeats (actor TEXT PRIMARY KEY, machine_id TEXT, status TEXT NOT NULL, summary TEXT, at TEXT NOT NULL);
@@ -36,7 +37,7 @@ export function thresholdsFrom(env: any): Thresholds {
 /** States that open an alert. `idle`, `working`, `exited` and `drained` are not problems. */
 export const ALERT_STATES = new Set(['stale', 'offline', 'stalled', 'stuck', 'uncertain', 'missing', 'launcher_memory_reserve']);
 
-export type Subject = { kind: 'machine' | 'session' | 'launch' | 'agent'; id: string; state: string; detail: string; machine_id?: string | null; age_s?: number | null };
+export type Subject = { kind: 'machine' | 'session' | 'launch' | 'agent'; id: string; state: string; detail: string; machine_id?: string | null; age_s?: number | null; alias_of?: string | null; canonical_id?: string | null; resolved_machine_id?: string | null };
 
 const STATUS = /^[a-z][a-z_-]{0,31}$/;
 const ACTOR = /^[^\s\x00-\x1f\x7f]{1,128}$/;
@@ -69,44 +70,82 @@ export class LivenessService {
     return { kind: 'machine', id: label, state, detail, machine_id: machine.id, age_s: age };
   }
 
+  private pressureProjection?: () => Subject[];
+  setPressureProjection(project: () => Subject[]) { this.pressureProjection = project; }
+
   /** Every subject the hub can judge, with its current liveness state. */
   evaluate(): { thresholds: Thresholds; subjects: Subject[] } {
     const now = this.now(); const t = this.thresholds; const subjects: Subject[] = [];
     const machines = new Map<string, Subject>();
-    const rows = this.sql.exec('SELECT id, name, last_checkin_at, drained FROM machines ORDER BY id').toArray() as any[];
+    const rows = this.sql.exec('SELECT id, name, hostname, last_checkin_at, drained FROM machines ORDER BY id').toArray() as any[];
     // Show enrolled names; fall back to the opaque id when a name is missing or shared.
     const counts = new Map<string, number>();
     for (const m of rows) if (m.name) counts.set(m.name, (counts.get(m.name) || 0) + 1);
     const names = new Map<string, string>(rows.map(m => [m.id, m.name && counts.get(m.name) === 1 ? m.name : m.id]));
     const label = (id: string) => names.get(id) || id;
+    // Machine aliasing (mark, never delete): records sharing a normalized
+    // hostname are one physical host. The stale id (e.g. hetzner, offline
+    // ~220h) aliases to the live canonical host (e.g. urgent-hetzner, same
+    // host RMTHZ); sessions on the alias resolve to the canonical host and
+    // report the canonical host's real state instead of unknown.
+    let aliasOf = new Map<string, string>();
+    const hostnames = new Map<string, string>();
+    try {
+      const resolution = resolveMachineAliases(rows.map((m: any) => {
+        const best = effectiveCheckin(String(m.id), m.last_checkin_at);
+        const seen = typeof best === 'string' ? Date.parse(best) : NaN;
+        if (typeof m.hostname === 'string' && m.hostname.trim()) hostnames.set(String(m.id), m.hostname.trim());
+        return { id: String(m.id), hostname: m.hostname, drained: m.drained, last_seen_ms: Number.isFinite(seen) ? seen : null };
+      }));
+      aliasOf = resolution.aliasOf;
+    } catch { aliasOf = new Map(); }
+    const canonical = (id: string) => aliasOf.get(id) ?? id;
     for (const m of rows) {
-      const s = this.machineState(m, now, label(m.id)); machines.set(m.id, s); subjects.push(s);
+      const s = this.machineState(m, now, label(m.id)); machines.set(m.id, s);
+      const alias = aliasOf.get(String(m.id)) ?? null;
+      subjects.push(alias
+        ? { ...s, detail: `${s.detail}; ${aliasDetail(String(m.id), alias, hostnames.get(String(m.id)))}`, alias_of: alias, canonical_id: alias }
+        : { ...s, canonical_id: String(m.id) });
     }
-    const hostKnown = (id: string) => machines.get(id)?.state === 'online';
+    const hostKnown = (id: string) => machines.get(canonical(id))?.state === 'online';
 
     const reported = new Set<string>();
-    for (const s of this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray() as any[]) {
+    let sessionRows: any[] = [];
+    try { sessionRows = this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray() as any[]; } catch { sessionRows = []; }
+    for (const s of projectAliasSessions(sessionRows, aliasOf, now)) {
       reported.add(s.machine_id + '/' + s.native_id);
+      // A late catalog may already report under the canonical id while older
+      // rows still name the alias; either binding proves the session live.
+      if (s.alias_observation !== 'no_current_native_observation') reported.add(canonical(s.machine_id) + '/' + s.native_id);
       const activity = ageSeconds(s.last_activity_at, now);
+      const resolved = canonical(s.machine_id);
+      const alias = aliasOf.get(String(s.machine_id)) ?? null;
       let state: string; let detail: string;
-      if (!hostKnown(s.machine_id)) { state = 'unknown'; detail = `machine ${label(s.machine_id)} is not reporting`; }
+      if (!hostKnown(s.machine_id)) { state = 'unknown'; detail = `machine ${label(resolved)} is not reporting`; }
+      else if (s.alias_observation === 'no_current_native_observation') { state = 'unknown'; detail = 'no current native observation on canonical host'; }
       else if (s.phase !== 'running') { state = 'exited'; detail = `phase ${s.phase}`; }
       // Only agent engines can stall; a quiet shell is usually a long-running command.
       else if (s.agent_state === 'working' && s.engine && s.engine !== 'shell' && activity !== null && activity > t.agentStallS) { state = 'stalled'; detail = `reported working but no terminal activity for ${activity}s`; }
       else if (s.agent_state === 'working') { state = 'working'; detail = activity === null ? 'working' : `active ${activity}s ago`; }
       else { state = s.agent_state ? 'idle' : 'running'; detail = `${s.agent_state || 'no agent state'}${activity === null ? '' : `, active ${activity}s ago`}`; }
-      subjects.push({ kind: 'session', id: `${label(s.machine_id)}/${s.tag}`, state, detail: `${detail} (${s.engine || 'shell'} in ${s.workspace})`, machine_id: s.machine_id, age_s: activity });
+      if (alias) detail += ` (same host ${hostnames.get(String(s.machine_id)) ?? 'unknown'}; reporting via ${label(resolved)})`;
+      subjects.push({ kind: 'session', id: `${label(resolved)}/${s.tag}`, state, detail: `${detail} (${s.engine || 'shell'} in ${s.workspace})`, machine_id: s.machine_id, resolved_machine_id: resolved, alias_of: alias, canonical_id: resolved, age_s: activity });
     }
 
-    for (const l of this.sql.exec("SELECT id, machine_id, mode, state, native_id, updated_at, summary FROM fleet_launches WHERE state IN ('offered','starting','running','uncertain') ORDER BY created_at").toArray() as any[]) {
+    let launchRows: any[] = [];
+    try { launchRows = this.sql.exec("SELECT id, machine_id, mode, state, native_id, updated_at, summary FROM fleet_launches WHERE state IN ('offered','starting','running','uncertain') ORDER BY created_at").toArray() as any[]; } catch { launchRows = []; }
+    for (const l of launchRows) {
       const age = ageSeconds(l.updated_at, now);
+      const resolved = l.machine_id ? canonical(l.machine_id) : l.machine_id;
+      const alias = l.machine_id ? (aliasOf.get(String(l.machine_id)) ?? null) : null;
       let state: string; let detail: string;
       if (l.state === 'uncertain') { state = 'uncertain'; detail = 'launch outcome unknown; reconcile before retrying'; }
       else if ((l.state === 'offered' || l.state === 'starting') && age !== null && age > t.launchStuckS) { state = 'stuck'; detail = `${l.state} for ${age}s`; }
-      else if (!hostKnown(l.machine_id)) { state = 'unknown'; detail = `machine ${label(l.machine_id)} is not reporting`; }
-      else if (l.state === 'running' && l.mode === 'interactive' && l.native_id && !this.sessionReported(l.machine_id, l.native_id, reported)) { state = 'missing'; detail = 'session no longer reported by its machine'; }
+      else if (alias && l.native_id && !sessionRows.some(s => s.native_id === l.native_id && canonical(s.machine_id) === resolved && Number.isFinite(Date.parse(s.observed_at)) && now - Date.parse(s.observed_at) <= 180000)) { state = 'unknown'; detail = 'no current native observation on canonical host'; }
+      else if (l.machine_id && !hostKnown(l.machine_id)) { state = 'unknown'; detail = `machine ${label(resolved)} is not reporting`; }
+      else if (l.state === 'running' && l.mode === 'interactive' && l.native_id && !this.sessionReported(l.machine_id, l.native_id, reported) && !this.sessionReported(resolved, l.native_id, reported)) { state = 'missing'; detail = 'session no longer reported by its machine'; }
       else { state = l.state === 'running' ? 'working' : l.state; detail = `${l.state}${age === null ? '' : ` since ${age}s`}`; }
-      subjects.push({ kind: 'launch', id: l.id, state, detail: `${l.summary}: ${detail}`, machine_id: l.machine_id, age_s: age });
+      subjects.push({ kind: 'launch', id: l.id, state, detail: `${l.summary}: ${detail}`, machine_id: l.machine_id, resolved_machine_id: resolved, alias_of: alias, canonical_id: resolved || null, age_s: age });
     }
 
     // Memory waits share the existing operator-alert bus/webhook and dedupe.
@@ -127,6 +166,7 @@ export class LivenessService {
     }
 
     subjects.push(...accountCapacityAlerts(this.sql, now));
+    subjects.push(...(this.pressureProjection?.() || []));
     for (const h of this.sql.exec('SELECT * FROM agent_heartbeats ORDER BY actor').toArray() as any[]) {
       const age = ageSeconds(h.at, now);
       const state = age === null || age > t.heartbeatStaleS ? 'stale' : h.status;

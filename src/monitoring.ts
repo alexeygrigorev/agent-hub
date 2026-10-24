@@ -263,6 +263,23 @@ export type HostHealthPayload = {
   storage?: StorageHygieneStatus[];
 };
 
+export type HostReservation = {
+  mem_avail_mb: number | null;
+  reserved_mb: number | null;
+  floor_mb: number;
+  next_slot_mb: number;
+  headroom_mb: number | null;
+  headroom_ok: boolean | null;
+  stale_telemetry: boolean;
+  observed_at: string | null;
+};
+
+export type HostPlacement = {
+  machine_pressure: boolean;
+  global_pressure: boolean;
+  reason: string | null;
+};
+
 export type HostHealthSummary = {
   machine_id: string;
   observed_at: string;
@@ -272,6 +289,8 @@ export type HostHealthSummary = {
   services?: SupervisorServiceStatus[];
   budget?: CloudBudgetStatus;
   storage?: StorageHygieneStatus[];
+  reservation?: HostReservation;
+  placement?: HostPlacement;
 };
 
 export class MonitoringService {
@@ -1696,6 +1715,14 @@ export class MonitoringService {
     }
 
     const machines: HostHealthSummary[] = [];
+    // Placement pressure is read-only visibility here: queued holds (>5 min),
+    // hard rejections recorded at reserve time, and recent terminal failures
+    // with memory/capacity reasons. Host health must not read 'ok' while
+    // launches are rejected/held for memory or capacity, so a pressured host
+    // degrades to warn (critical when reservations already exceed headroom),
+    // with the reason attached. Accounting verdicts stay with the fleet and
+    // launcher owners; this only projects their inputs.
+    const pressure = this.readPlacementPressure(now);
     for (const r of rows) {
       let payload: any = {};
       try {
@@ -1786,10 +1813,12 @@ export class MonitoringService {
         observed_at: r.observed_at,
         freshness,
         load: payload.load ?? { load1: 0, load5: 0, load15: 0 },
-        memory: payload.memory ?? { total_bytes: 0, available_bytes: 0, used_bytes: 0, percent: 0, status: 'unknown' },
+        memory: this.degradedMemory(payload.memory, r.machine_id, pressure),
         services: projectedServices,
         budget: projectedBudget,
         storage: payload.storage,
+        reservation: this.readHostReservation(String(r.machine_id), now),
+        placement: this.placementFor(String(r.machine_id), pressure),
       });
     }
 
@@ -1797,6 +1826,74 @@ export class MonitoringService {
       snapshot_at: new Date(now).toISOString(),
       machines,
     };
+  }
+
+  /** Read-only placement-pressure snapshot shared by the health projection.
+   * Queued holds older than 5 minutes, hard rejections recorded at reserve
+   * time (24h), and terminal failures with memory/capacity reasons (24h,
+   * per machine). Fail closed to "no pressure" on any storage error. */
+  private readPlacementPressure(now: number): { queuedTotal: number; queuedHeld: number; recentRejects: number; failedByMachine: Map<string, number>; failedTotal: number } {
+    let queuedTotal = 0, queuedHeld = 0, recentRejects = 0, failedTotal = 0;
+    const failedByMachine = new Map<string, number>();
+    try {
+      const heldBefore = new Date(now - 5 * 60000).toISOString();
+      queuedTotal = Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE state = 'queued'").toArray()[0]?.n ?? 0);
+      queuedHeld = Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE state = 'queued' AND created_at <= ?", heldBefore).toArray()[0]?.n ?? 0);
+    } catch { queuedHeld = 0; }
+    try {
+      recentRejects = Number(this.sql.exec('SELECT COUNT(*) AS n FROM placement_rejections WHERE created_at_ms >= ?', now - 24 * 3600000).toArray()[0]?.n ?? 0);
+    } catch { recentRejects = 0; }
+    try {
+      const dayAgoIso = new Date(now - 24 * 3600000).toISOString();
+      const rows = this.sql.exec("SELECT machine_id, exit_reason, launch_error_json FROM fleet_launches WHERE state = 'failed' AND updated_at >= ?", dayAgoIso).toArray() as any[];
+      for (const row of rows) {
+        const reasons: string[] = [];
+        if (typeof row.exit_reason === 'string' && row.exit_reason) reasons.push(row.exit_reason);
+        try {
+          const diag = JSON.parse(row.launch_error_json || 'null');
+          if (diag && typeof diag.reason === 'string' && diag.reason) reasons.push(diag.reason);
+        } catch { /* ignore */ }
+        if (!reasons.some((r) => r === 'launcher_memory_reserve' || r === 'account_capacity' || r === 'machine_capacity')) continue;
+        failedTotal++;
+        if (row.machine_id) failedByMachine.set(String(row.machine_id), (failedByMachine.get(String(row.machine_id)) ?? 0) + 1);
+      }
+    } catch { failedTotal = 0; }
+    return { queuedTotal, queuedHeld, recentRejects, failedByMachine, failedTotal };
+  }
+
+  // The canonical FleetService projection is injected by Hub. This service
+  // must not duplicate launcher admission math or account capacity accounting.
+  private resourceProjection?: (machine: string) => HostReservation | undefined;
+  setResourceProjection(project: (machine: string) => HostReservation | undefined) { this.resourceProjection = project; }
+  private readHostReservation(machineId: string, _now: number): HostReservation {
+    return this.resourceProjection?.(machineId) ?? { mem_avail_mb: null, reserved_mb: null, floor_mb: 10240, next_slot_mb: 1500, headroom_mb: null, headroom_ok: null, stale_telemetry: true, observed_at: null };
+  }
+
+  private placementFor(machineId: string, pressure: { queuedTotal: number; queuedHeld: number; recentRejects: number; failedByMachine: Map<string, number>; failedTotal: number }): HostPlacement {
+    const machineFailures = pressure.failedByMachine.get(machineId) ?? 0;
+    const machinePressure = machineFailures > 0;
+    const globalPressure = pressure.queuedTotal > 0 || pressure.recentRejects > 0 || pressure.failedTotal > 0;
+    const bits: string[] = [];
+    if (pressure.queuedTotal > 0) bits.push(`${pressure.queuedTotal} launch(es) held queued for memory/capacity (${pressure.queuedHeld} >5 min)`);
+    if (pressure.recentRejects > 0) bits.push(`${pressure.recentRejects} launch rejection(s) for memory/capacity in 24h`);
+    if (machineFailures > 0) bits.push(`${machineFailures} terminal failure(s) for memory/capacity on this host in 24h`);
+    else if (pressure.failedTotal > 0) bits.push(`${pressure.failedTotal} terminal failure(s) for memory/capacity elsewhere in 24h`);
+    return { machine_pressure: machinePressure, global_pressure: globalPressure, reason: bits.length ? bits.join('; ') : null };
+  }
+
+  /** Host health is never 'ok' while launches are rejected/held for memory
+   * or capacity: degrade to warn (critical when reservations already exceed
+   * headroom). Unknown/other states pass through untouched. */
+  private degradedMemory(memory: any, machineId: string, pressure: { queuedTotal: number; queuedHeld: number; recentRejects: number; failedByMachine: Map<string, number>; failedTotal: number }): HostMemory {
+    const fallback: HostMemory = { total_bytes: 0, available_bytes: 0, used_bytes: 0, percent: 0, status: 'unknown' };
+    const mem: HostMemory = memory && typeof memory === 'object' ? { ...fallback, ...memory } : fallback;
+    if (mem.status !== 'ok') return mem;
+    const placement = this.placementFor(String(machineId), pressure);
+    if (!placement.machine_pressure && !placement.global_pressure) return mem;
+    let reservation: HostReservation | null = null;
+    try { reservation = this.readHostReservation(String(machineId), this.now()); } catch { reservation = null; }
+    const overdrawn = reservation && reservation.headroom_mb !== null && reservation.headroom_mb < 0 && !reservation.stale_telemetry;
+    return { ...mem, status: overdrawn ? 'critical' : 'warn', error: placement.reason };
   }
 
   /** Condensed summary projection for StatusService (hub status / needs-attention). */
@@ -1830,12 +1927,31 @@ export class MonitoringService {
       }
 
       if (h.memory?.status === 'warn' || h.memory?.status === 'critical') {
+        const placementReason = (h as any).placement?.reason;
         needsAttention.push({
           severity: h.memory.status,
           subject: `${h.machine_id}:memory`,
           title: `Memory pressure on ${h.machine_id}`,
-          detail: `Memory is at ${h.memory.percent}% (${formatBytes(h.memory.used_bytes)} / ${formatBytes(h.memory.total_bytes)})`,
+          detail: placementReason && (h.memory as any).error === placementReason
+            ? `Placement pressure on ${h.machine_id}: ${placementReason}; host memory at ${h.memory.percent}% (${formatBytes(h.memory.used_bytes)} / ${formatBytes(h.memory.total_bytes)})`
+            : `Memory is at ${h.memory.percent}% (${formatBytes(h.memory.used_bytes)} / ${formatBytes(h.memory.total_bytes)})`,
           percent: h.memory.percent,
+        });
+      }
+
+      // Placement pressure is its own needs-attention entry (with numbers),
+      // even when host memory itself is fine: the pool can refuse starts
+      // while every host looks healthy.
+      if ((h as any).placement?.reason) {
+        const reservation = (h as any).reservation;
+        const numbers = reservation && (reservation.mem_avail_mb !== null || reservation.reserved_mb !== null)
+          ? ` mem_avail_mb=${reservation.mem_avail_mb ?? 'unknown'} reserved_mb=${reservation.reserved_mb ?? 'unknown'} floor_mb=10240 next_slot_mb=1500 headroom_mb=${reservation.headroom_mb ?? 'unknown'}`
+          : '';
+        needsAttention.push({
+          severity: h.memory?.status === 'critical' ? 'critical' : 'warn',
+          subject: `${h.machine_id}:placement`,
+          title: `Launch placement pressure on ${h.machine_id}`,
+          detail: `${(h as any).placement.reason}.${numbers}`,
         });
       }
 

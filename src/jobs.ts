@@ -251,6 +251,8 @@ export interface JobsDependencies {
   busService?: any;
   healthService?: any;
   enableAlarms?: boolean;
+  /** Optional shared-DO observer deadline. Jobs must not postpone it. */
+  alarmDeadline?: () => number;
   env?: any;
 }
 
@@ -440,7 +442,9 @@ export class JobsService {
   }
 
   private scheduleAlarm() {
-    const alarmTime = this.getAlarmTime();
+    const jobAlarmTime = this.getAlarmTime();
+    const observer = this.deps?.alarmDeadline?.();
+    const alarmTime = Number.isFinite(observer) ? Math.min(jobAlarmTime || Infinity, observer!) : jobAlarmTime;
     if (alarmTime && this.deps?.enableAlarms && typeof this.ctx?.storage?.setAlarm === 'function') {
       try {
         this.ctx.storage.setAlarm(alarmTime);

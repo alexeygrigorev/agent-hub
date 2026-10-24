@@ -10,6 +10,7 @@ import { adoptObservedNativeSessions, reconcileUnboundFleetSessions } from './se
 import { isValidMachineId } from './machine-id';
 import { LivenessService } from './liveness';
 import { reconcileAccountCapacity } from './account_capacity';
+import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
 
 export const FLEET_SCHEMA = `
 CREATE TABLE IF NOT EXISTS fleet_memory_holds (launch_id TEXT PRIMARY KEY, since TEXT NOT NULL, rejected_json TEXT NOT NULL, refused INTEGER NOT NULL DEFAULT 0, retry_id TEXT);
@@ -20,6 +21,8 @@ CREATE TABLE IF NOT EXISTS fleet_sessions (machine_id TEXT NOT NULL, native_id T
 CREATE TABLE IF NOT EXISTS fleet_launches (id TEXT PRIMARY KEY, actor TEXT NOT NULL, requester_kind TEXT NOT NULL, parent_id TEXT, summary TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, mode TEXT NOT NULL, workspace TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL, native_id TEXT, launcher_task_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
 CREATE TABLE IF NOT EXISTS fleet_engine_health (engine TEXT NOT NULL, machine_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, reason TEXT NOT NULL, updated_at TEXT NOT NULL, diagnostics_json TEXT, PRIMARY KEY(engine, machine_id));
 CREATE TABLE IF NOT EXISTS operator_notices (notice_key TEXT PRIMARY KEY, engine TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS placement_rejections (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, created_at_ms INTEGER NOT NULL, actor TEXT NOT NULL, reasons_json TEXT NOT NULL, detail TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_placement_rejections_recent ON placement_rejections(created_at_ms);
 `;
 type Auth = { caller?: AdmissionCaller; scopes?: string[]; error?: Response };
 const LABEL = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
@@ -54,6 +57,16 @@ function disabledEngines(): Set<string> {
 }
 /** Reject reasons that mean "no free slot right now" (transient capacity). */
 const CAPACITY_REASONS = new Set(['account_capacity', 'machine_capacity', 'launcher_memory_reserve']);
+/** Launcher memory gate inputs, mirrored here for dashboard visibility only.
+ * The placement verdict stays in plan(); this module never changes the math,
+ * it only projects the same inputs (MemAvailable, reserved total, floor for
+ * the next slot) so operators see why starts hold. Owned by the launcher
+ * reservation fixer; visibility reuses its accounting. */
+export const MEMORY_FLOOR_MB = 10240;
+export const NEXT_SLOT_MB = 1500;
+/** Placement-pressure reasons that degrade host health and raise operator
+ * alerts: any launch rejected or held for memory/capacity. */
+export const PLACEMENT_PRESSURE_REASONS = new Set(['launcher_memory_reserve', 'account_capacity', 'machine_capacity']);
 /** Incidental per-route reasons that may accompany capacity but never queue alone
  * (stale/drained check-ins, policy-disabled engines, engines no live host
  * advertises anymore — e.g. registry routes for engines the current host
@@ -394,6 +407,16 @@ export class FleetService {
       return counted;
     })();
     const active = reserved + observedSessions;
+    // Visibility breakdown (no accounting change): counted slots split into
+    // launch reservations vs orphan observed sessions, alongside live native
+    // processes verified by the host catalog for this account. The sibling
+    // capacity fixer owns the counting; this only projects it.
+    let nativeLive = 0;
+    try {
+      nativeLive = liveList.length
+        ? Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.account = ? AND s.phase = 'running' AND s.observed_at >= ? AND s.workspace NOT LIKE '% (deleted)' AND (s.cwd IS NULL OR s.cwd NOT LIKE '% (deleted)') AND s.machine_id IN (${liveList.map(() => '?').join(',')})`, account.label, new Date(this.now() - 180000).toISOString(), ...liveList).one().n)
+        : 0;
+    } catch { nativeLive = 0; }
     const availableSlots = Math.max(0, Number(account.max_concurrency) - active);
     const placeableMachines = new Set<string>();
     const placementReasons = new Set<string>();
@@ -408,6 +431,10 @@ export class FleetService {
     }
     return { label: account.label, provider: account.provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled, supports_goal: ['codex', 'codex-orin', 'zai'].includes(account.provider),
       remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || unknown || remaining === null) ? 'unknown' : 'ok', active, available_slots: availableSlots,
+      // Counted vs live: active splits into launch reservations + orphan
+      // observed sessions; native_live is the host-catalog verified live
+      // process count for this account (includes launch-linked sessions).
+      reserved, observed_sessions: observedSessions, native_live: nativeLive,
       // available_slots is the raw pool and ignores route liveness: a registry
       // whose routes all point at engines no live host serves anymore (e.g.
       // after a host subscription change) used to advertise phantom free
@@ -417,6 +444,110 @@ export class FleetService {
       placement_reasons: [...placementReasons].sort(),
       registry_drift: routes.length > 0 && placeableRoutes < routes.length,
       machines: routes.map(r => r.machine_id) };
+  }
+
+  /** Per-host launcher memory reservation projection for the fleet dashboard.
+   *
+   * Read-only visibility over the sibling fixer's accounting: MemAvailable
+   * (real, from host heartbeat), reserved total
+   * (launcher_resources.active_mem_mb), the 10 GiB floor plus one next slot,
+   * and the resulting headroom. The gate mirrors plan(): headroom after the
+   * next slot below the floor refuses with launcher_memory_reserve. Stale
+   * launcher telemetry reads fail closed (stale_telemetry) exactly like
+   * placement does. */
+  hostResources(machineFilter?: string): any[] {
+    let machines: any[] = [];
+    try {
+      machines = this.sql.exec('SELECT id, last_checkin_at, drained, capabilities, last_heartbeat FROM machines ORDER BY id').toArray() as any[];
+    } catch { return []; }
+    const out: any[] = [];
+    for (const m of machines) {
+      const id = String(m.id);
+      if (machineFilter && id !== machineFilter) continue;
+      let hb: any = {};
+      try { hb = JSON.parse(m.last_heartbeat || '{}'); } catch { hb = {}; }
+      const memAvailMb = typeof hb.mem_avail_mb === 'number' && Number.isFinite(hb.mem_avail_mb) ? hb.mem_avail_mb : null;
+      const launcher = hb.launcher_resources && typeof hb.launcher_resources === 'object' ? hb.launcher_resources : null;
+      const reservedMb = launcher && typeof launcher.active_mem_mb === 'number' && Number.isFinite(launcher.active_mem_mb) && launcher.active_mem_mb >= 0 ? launcher.active_mem_mb : null;
+      const observedAt = launcher && typeof launcher.observed_at === 'string' ? launcher.observed_at : null;
+      let caps: any = {};
+      try { caps = JSON.parse(m.capabilities || '{}'); } catch { caps = {}; }
+      const launcherManaged = caps.launcher_resources === true;
+      const telemetryFresh = launcherManaged
+        ? (reservedMb !== null && observedAt !== null && fresh(observedAt, this.now(), 180000))
+        : true;
+      const memory = this.memoryHeadroom(id);
+      const headroomMb = memory.mem_available_mb !== null && reservedMb !== null && telemetryFresh
+        ? memory.mem_available_mb - memory.reserved_mb - memory.requested_mb
+        : null;
+      out.push({
+        machine_id: id,
+        mem_avail_mb: memAvailMb,
+        reserved_mb: telemetryFresh && reservedMb !== null ? memory.reserved_mb : null,
+        floor_mb: MEMORY_FLOOR_MB,
+        next_slot_mb: NEXT_SLOT_MB,
+        headroom_mb: headroomMb,
+        headroom_ok: headroomMb === null ? null : headroomMb >= MEMORY_FLOOR_MB,
+        launcher_managed: launcherManaged,
+        stale_telemetry: launcherManaged ? !telemetryFresh : false,
+        observed_at: observedAt || m.last_checkin_at || null,
+      });
+    }
+    return out;
+  }
+
+  /** Recent placement-pressure evidence for dashboards and alerts.
+   *
+   * Counts queued holds, hard rejections recorded at reserve time, and
+   * recent terminal failures with memory/capacity reasons. Read-only; the
+   * accounting verdicts stay with plan()/accountStatus(). */
+  placementOverview(): { queued_held: number; queued_total: number; recent_rejects: number; recent_failed: number } {
+    const nowMs = this.now();
+    let queuedTotal = 0, queuedHeld = 0, recentRejects = 0, recentFailed = 0;
+    try {
+      queuedTotal = Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE state = 'queued'").one().n);
+      const heldBefore = new Date(nowMs - 5 * 60000).toISOString();
+      queuedHeld = Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE state = 'queued' AND created_at <= ?", heldBefore).one().n);
+    } catch { /* fail closed: pressure unknown reads as none here; liveness re-checks */ }
+    try {
+      const dayAgo = nowMs - 24 * 3600000;
+      recentRejects = Number(this.sql.exec('SELECT COUNT(*) AS n FROM placement_rejections WHERE created_at_ms >= ?', dayAgo).one().n);
+    } catch { recentRejects = 0; }
+    try {
+      const dayAgoIso = new Date(nowMs - 24 * 3600000).toISOString();
+      const rows = this.sql.exec("SELECT exit_reason, launch_error_json FROM fleet_launches WHERE state = 'failed' AND updated_at >= ?", dayAgoIso).toArray() as any[];
+      for (const row of rows) {
+        const reasons: string[] = [];
+        if (typeof row.exit_reason === 'string') reasons.push(row.exit_reason);
+        try {
+          const diag = JSON.parse(row.launch_error_json || 'null');
+          if (diag && typeof diag.reason === 'string') reasons.push(diag.reason);
+        } catch { /* ignore unparseable diagnostics */ }
+        if (reasons.some((r) => PLACEMENT_PRESSURE_REASONS.has(r))) recentFailed++;
+      }
+    } catch { recentFailed = 0; }
+    return { queued_held: queuedHeld, queued_total: queuedTotal, recent_rejects: recentRejects, recent_failed: recentFailed };
+  }
+
+  /** Record a hard placement rejection for operator alerting.
+   *
+   * Only called when reserve() refuses with memory/capacity reasons in the
+   * rejected set. Best-effort observability row; never affects placement. */
+  private recordPlacementRejection(actor: string, rejected: { machine: string; engine: string; reason: string }[]): void {
+    try {
+      const reasons = [...new Set(rejected.map((r) => String(r.reason)))].sort();
+      const pressure = reasons.filter((r) => PLACEMENT_PRESSURE_REASONS.has(r));
+      if (!pressure.length) return;
+      const nowMs = this.now();
+      const at = new Date(nowMs).toISOString();
+      const machines = pressure.includes('launcher_memory_reserve') ? this.hostResources() : [];
+      const memNote = machines.length
+        ? ' host ' + machines.map((h) => `${h.machine_id}: mem_avail_mb=${h.mem_avail_mb ?? 'unknown'} reserved_mb=${h.reserved_mb ?? 'unknown'} floor_mb=10240 next_slot_mb=1500 headroom_mb=${h.headroom_mb ?? 'unknown'}`).join('; ')
+        : '';
+      const detail = `rejected [${pressure.join(', ')}] (all routes: ${reasons.join(', ')})${memNote}`;
+      this.sql.exec('INSERT OR IGNORE INTO placement_rejections (id, created_at, created_at_ms, actor, reasons_json, detail) VALUES (?, ?, ?, ?, ?, ?)',
+        crypto.randomUUID(), at, nowMs, String(actor).slice(0, 128), JSON.stringify(reasons).slice(0, 1024), detail.slice(0, 2048));
+    } catch { /* alerting never breaks placement */ }
   }
 
   plan(input: any) {
@@ -714,12 +845,16 @@ export class FleetService {
         // Capacity-only failure parks a waitable queued intent (202) that the
         // drain auto-places when a slot frees. Any other reject class stays a
         // hard 409 with its slugs visible. Never raise max_concurrency here.
+        // A hard 409 that still names memory/capacity pressure is recorded
+        // for the operator alert (same liveness-alerts channel); queued holds
+        // and terminal failures surface via the placement overview instead.
         if (isCapacityOnlyHold(plan.rejected)) {
           const id = crypto.randomUUID(); const at = new Date(this.now()).toISOString();
           this.sql.exec('INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', id, actor, caller.kind || 'unknown', plan.request.parent_id, plan.request.summary, input.idempotency_key, JSON.stringify({ ...bound, ...(admitted.authority ? { edit_authority: admitted.authority } : {}) }), '', '', '', null, plan.request.mode, plan.request.workspace, plan.request.prompt, 'queued', at, at);
           this.memoryHold(id, plan.rejected);
           return result({ id, state: 'queued', queued: true, queue_position: this.queuePosition(id), rejected: plan.rejected, access: admitted.access.mode }, 202);
         }
+        try { this.recordPlacementRejection(actor, plan.rejected); } catch { /* alerting never breaks placement */ }
         return result({ error: 'no_eligible_route', rejected: plan.rejected, access: parsed.access.mode }, 409);
       }
       const id = crypto.randomUUID(); const at = new Date(this.now()).toISOString(); const selected = plan.selected;
@@ -758,10 +893,29 @@ export class FleetService {
       try {
         for (const row of this.sql.exec('SELECT id, fleet_launch_id FROM session_control_sessions WHERE fleet_launch_id IN (SELECT id FROM fleet_launches ORDER BY created_at DESC LIMIT 200)').toArray() as any[]) controlIds.set(row.fleet_launch_id, row.id);
       } catch { /* optional session-control store */ }
+      // Machine aliasing (mark, never delete): records sharing a normalized
+      // hostname resolve to the live canonical host; sessions on a stale
+      // alias resolve to the canonical host for display and liveness.
+      let machineAliases: Record<string, string> = {};
+      try {
+        const aliasRows = this.sql.exec('SELECT id, hostname, drained, last_checkin_at FROM machines').toArray() as any[];
+        const resolution = resolveMachineAliases(aliasRows.map((m: any) => {
+          const persisted = typeof m.last_checkin_at === 'string' ? Date.parse(m.last_checkin_at) : NaN;
+          return { id: String(m.id), hostname: m.hostname, drained: m.drained, last_seen_ms: Number.isFinite(persisted) ? persisted : null };
+        }));
+        machineAliases = Object.fromEntries(resolution.aliasOf.entries());
+      } catch { machineAliases = {}; }
+      const machines = this.sql.exec('SELECT id, name, hostname, last_checkin_at, drained FROM machines ORDER BY id').toArray().map((m: any) => {
+        const canonical = machineAliases[String(m.id)] ?? null;
+        return { ...m, last_checkin_at: effectiveCheckin(m.id, m.last_checkin_at), alias_of: canonical, canonical_id: canonical ?? String(m.id) };
+      });
+      const sessions = projectAliasSessions(this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray(), new Map(Object.entries(machineAliases)), this.now());
       return response({ accounts: this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray().map(a => this.accountStatus(a)), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray().map(r => ({ ...r, supports_goal: ['codex', 'zcodex'].includes(String(r.engine)) })),
-        machines: this.sql.exec('SELECT id, name, hostname, last_checkin_at, drained FROM machines ORDER BY id').toArray().map((m: any) => ({ ...m, last_checkin_at: effectiveCheckin(m.id, m.last_checkin_at) })),
+        machines, machine_aliases: machineAliases,
         agents: this.sql.exec('SELECT tag, project, role, machine_id, engine, session_id, health_state, health_at FROM agents').toArray(),
-        sessions: this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray(),
+        sessions,
+        host_resources: this.hostResources(),
+        placement: this.placementOverview(),
         subscriptions: this.sql.exec('SELECT * FROM fleet_subscriptions ORDER BY machine_id, service, account').toArray().map((s: any) => ({ machine_id: s.machine_id, account: s.account, service: s.service, plan: s.plan, observed_at: s.observed_at, stale: !fresh(s.observed_at, this.now(), 1200000), quota: parsed(s.quota_json) })),
         launches: this.sql.exec('SELECT * FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => { const { request_json, request_key, prompt, model_selection_json, ...view } = row; const selection = parsed(model_selection_json); return { ...view, rejected: row.state === 'queued' ? this.memoryRejections(row.id) : [], model_id: selection?.id ?? null, model: selection?.model ?? null, hub_session_id: controlIds.get(row.id) ?? null, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; }) });
     }

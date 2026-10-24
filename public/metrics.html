@@ -1,4 +1,4 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Metrics · Agent Hub</title><link rel="stylesheet" href="/vendor/dakit/dakit.css"><link rel="stylesheet" href="/auth.css"><link rel="stylesheet" href="/metrics.css"><script src="/auth.js"></script><script src="/metrics-charts.js" defer></script><script src="/metrics.js" defer></script></head><body>
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Metrics · Agent Hub</title><link rel="stylesheet" href="/vendor/dakit/dakit.css"><link rel="stylesheet" href="/auth.css"><link rel="stylesheet" href="/metrics.css"><script src="/auth.js"></script><script src="/metrics-charts.js" defer></script><script src="/host-health-charts.js" defer></script><script src="/metrics.js" defer></script></head><body>
 <div class="dk-shell" data-app="agent-hub" data-sidebar="expanded">
   <a class="dk-skip-link" href="#main-content">Skip to content</a>
   <header class="dk-topbar">
@@ -61,13 +61,14 @@
   <main class="dk-main" id="main-content"><div class="dk-main__inner">
     <header class="dk-page-header"><div class="dk-page-header__main"><h1 class="dk-page-header__title">Metrics &amp; Usage</h1><p class="dk-page-header__subtitle">Sanitized 24-hour utilization, usage, and accepted outcomes. Unknown is not zero.</p></div></header>
     <div class="dk-cluster"><p id="status" role="status">Loading authenticated data…</p><button class="dk-button dk-button--secondary" type="button" id="metrics-refresh">Refresh</button></div>
-    <nav class="hub-section-nav" aria-label="Metrics sections"><a class="hub-section-link" href="#trends">Activity charts</a><a class="hub-section-link" href="#usage">Token Usage</a><a class="hub-section-link" href="#coverage">Coverage</a><a class="hub-section-link" href="#buckets">24h Buckets</a><a class="hub-section-link" href="#accepted">Outcomes</a><a class="hub-section-link" href="/fleet.html#quota">Live Quota / Usage</a></nav>
+    <nav class="hub-section-nav" aria-label="Metrics sections"><a class="hub-section-link" href="#host-health">Host health charts</a><a class="hub-section-link" href="#trends">Activity charts</a><a class="hub-section-link" href="#usage">Token Usage</a><a class="hub-section-link" href="#coverage">Coverage</a><a class="hub-section-link" href="#buckets">24h Buckets</a><a class="hub-section-link" href="#accepted">Outcomes</a><a class="hub-section-link" href="/fleet.html#quota">Live Quota / Usage</a></nav>
     <div class="dk-cluster metrics-host-picker">
       <label class="dk-label" for="metrics-host">Host</label>
       <select id="metrics-host" class="dk-select" aria-label="Selected host"></select>
       <button class="dk-button dk-button--secondary" type="button" id="metrics-host-more" hidden>Load more hosts</button>
     </div>
     <p id="metrics-host-id" class="metrics-host-id"></p>
+    <section class="dk-card dk-stack metrics-section" id="host-health"><h2 class="metrics-section-title">Host health, sessions and account capacity</h2><div id="host-history"></div></section>
     <section class="dk-card dk-stack metrics-section" id="trends" aria-labelledby="trends-title"><h2 class="metrics-section-title" id="trends-title">24-hour activity by project</h2><p>Hourly UTC observations for the selected host. Gaps mean unknown; only reported zeroes are plotted at zero.</p><div id="activity-charts"></div></section>
     <section class="dk-card dk-stack metrics-section"><h2 class="metrics-section-title">Coverage</h2><p>Producer coverage for utilization, usage, and accepted outcomes. Partial means unknown, not a filled zero.</p><div id="coverage"></div></section>
     <section class="dk-card dk-stack metrics-section"><h2 class="metrics-section-title">Usage known vs unknown</h2><p>Token totals are proven counts. Missing cache or reasoning stays unknown and is never inferred from quota.</p><div id="usage-chart"></div><details><summary>Token counts and coverage details</summary><div id="usage"></div></details></section>
