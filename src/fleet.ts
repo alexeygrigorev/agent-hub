@@ -582,10 +582,9 @@ export class FleetService {
           const patched = { ...bound, workspace: normalizedWorkspace };
           patchedJson = JSON.stringify(patched);
         } catch { /* keep the stored intent on stringify failure */ }
-        const written: any = this.sql.exec("UPDATE fleet_launches SET machine_id = ?, engine = ?, account = ?, profile = ?, workspace = ?, request_json = ?, state = 'offered', updated_at = ? WHERE id = ? AND state = 'queued'",
-          selected.machine, selected.engine, selected.account, selected.profile ?? null, normalizedWorkspace, patchedJson, new Date(this.now()).toISOString(), row.id);
+        const written: any = this.sql.exec("UPDATE fleet_launches SET machine_id = ?, engine = ?, account = ?, profile = ?, workspace = ?, request_json = ?, model_selection_json = ?, state = 'offered', updated_at = ? WHERE id = ? AND state = 'queued'",
+          selected.machine, selected.engine, selected.account, selected.profile ?? null, normalizedWorkspace, patchedJson, JSON.stringify(selected.selection), new Date(this.now()).toISOString(), row.id);
         if (written && (written as any).rowsWritten === 1) {
-          this.sql.exec('UPDATE fleet_launches SET model_selection_json = ? WHERE id = ?', JSON.stringify(selected.selection), row.id);
           promoted++;
         }
       }
@@ -943,7 +942,9 @@ export class FleetService {
           if (disabledEngines().has(row.engine)) return response({ error: 'provider_disabled' }, 409);
           const held = this.admission.retireInvalidOffer(row);
           if (held) return response({ error: held }, ['claim_inactive', 'claim_conflict', 'claim_authority_changed'].includes(held) ? 409 : 403);
-          if (!object(data, ['gate_allowed', 'observed_at', 'account', 'profile_supported']) || data.gate_allowed !== true || data.profile_supported !== true || data.account !== row.account || !fresh(data.observed_at, this.now(), 30000)) return response({ error: 'fresh_admission_required' }, 409);
+          if (!object(data, ['gate_allowed', 'observed_at', 'account', 'profile_supported', 'model']) || data.gate_allowed !== true || data.profile_supported !== true || data.account !== row.account || !fresh(data.observed_at, this.now(), 30000)) return response({ error: 'fresh_admission_required' }, 409);
+          const selectedModel = parsed(row.model_selection_json)?.model;
+          if (typeof selectedModel !== 'string' || data.model !== selectedModel) return response({ error: 'model_unsupported', detail: 'Host must confirm the resolved model before native launch' }, 409);
           const account: any = this.sql.exec('SELECT * FROM fleet_accounts WHERE label = ?', row.account).toArray()[0];
           if (!account || this.accountStatus(account).status !== 'ok' || !this.observation(account, row)) return response({ error: 'account_unavailable' }, 409);
           // Re-verify the exact launch route quota inside the atomic claim: no manual override bypass.

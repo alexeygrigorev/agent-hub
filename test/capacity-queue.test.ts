@@ -71,7 +71,7 @@ async function configure(f: FleetService) {
   expect((await f.handle(fleetReq('/accounts', registry(), 'PUT'), admin)).status).toBe(200);
 }
 async function claimAndFinish(f: FleetService, launchId: string, machine: string, account: string) {
-  const claim = { gate_allowed: true, observed_at: iso(), account, profile_supported: true };
+  const claim = { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account, profile_supported: true };
   expect((await f.handle(fleetReq('/launches/' + launchId + '/claim', claim), host(machine))).status).toBe(200);
   const native = { state: 'running', native_id: 'native-' + launchId.slice(0, 8), launcher_task_id: 'hubtask1' };
   expect((await f.handle(fleetReq('/launches/' + launchId + '/result', native), host(machine))).status).toBe(200);
@@ -293,6 +293,7 @@ describe('sessions_start capacity queue', () => {
     expect(replay).toMatchObject({ id: parked.id, state: 'queued', replay: true });
     await claimAndFinish(f, blocking.id, 'hetzner', 'shared-codex');
     expect(sql.exec('SELECT state, engine, workspace FROM fleet_launches WHERE id = ?', parked.fleet_launch_id).one()).toMatchObject({ state: 'offered', engine: 'codex', workspace: '/repos/demo' });
+    expect(JSON.parse(String(sql.exec('SELECT model_selection_json FROM fleet_launches WHERE id = ?', parked.fleet_launch_id).one().model_selection_json))).toMatchObject({ id: 'astra', model: 'gpt-6-astra' });
     const placed: any = await (await s.handle(sessReq('/api/sessions/' + parked.id, undefined, 'GET'), admin)).json();
     expect(placed).toMatchObject({ id: parked.id, state: 'offered', engine: 'codex' });
     const changed = await s.handle(sessReq('/api/sessions', { ...input, brief: 'different task' }), admin);
@@ -327,7 +328,8 @@ describe('sessions_start capacity queue', () => {
     expect(parked.state).toBe('queued');
     await claimAndFinish(f, blocking.id, 'hetzner', 'shared-codex');
     const nativeId = '11111111-2222-4333-8444-555555555555';
-    expect((await f.handle(fleetReq('/launches/' + parked.fleet_launch_id + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'))).status).toBe(200);
+    const claimResponse = await f.handle(fleetReq('/launches/' + parked.fleet_launch_id + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+    expect(claimResponse.status, JSON.stringify({ receipt: await claimResponse.clone().json(), selection: sql.exec('SELECT model_selection_json FROM fleet_launches WHERE id = ?', parked.fleet_launch_id).one() })).toBe(200);
     if (state === 'running') expect((await f.handle(fleetReq('/launches/' + parked.fleet_launch_id + '/result', { state: 'running', native_id: nativeId, launcher_task_id: 'queue-race' }), host('hetzner'))).status).toBe(200);
     // A foreign host cannot adopt the assignment, and no native identity is invented.
     const foreign: any = await (await s.handle(sessReq('/api/sessions/host-bindings', undefined, 'GET'), enrolled('win35'))).json();

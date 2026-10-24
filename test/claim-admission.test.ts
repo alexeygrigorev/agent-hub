@@ -157,7 +157,7 @@ describe('fleet edit admission', () => {
   it('revalidates at native start, holds running work after expiry, and does not free capacity', () => fleetFixture(async (f, sql, bus) => {
     const claim = bus.claim(holder.caller, 'projA', 'src', 'worker-1', 3600000, now);
     const offered: any = await (await f.handle(req('/api/fleet/launches', intent({ machine: 'hetzner', access: { mode: 'edit', claim_id: claim.id, scopes: ['src/a.ts'] } })), holder)).json();
-    const start = { gate_allowed: true, observed_at: at(), account: 'shared-codex', profile_supported: true };
+    const start = { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: at(), account: 'shared-codex', profile_supported: true };
     sql.exec('UPDATE claims SET released_at = ? WHERE id = ?', now, claim.id);
     expect((await f.handle(req('/api/fleet/launches/' + offered.id + '/claim', start), host())).status).toBe(409);
     expect(sql.exec('SELECT state, verification_status FROM fleet_launches WHERE id = ?', offered.id).one()).toEqual({ state: 'failed', verification_status: 'not_started' });
@@ -235,7 +235,7 @@ describe('routing edit admission and unchanged legacy routing', () => {
 });
 
 const editAccess = (id: string, scope = 'src/a.ts') => ({ mode: 'edit', claim_id: id, scopes: [scope] });
-const nativeStart = { gate_allowed: true, observed_at: at(), account: 'shared-codex', profile_supported: true };
+const nativeStart = { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: at(), account: 'shared-codex', profile_supported: true };
 
 describe('retained authority and replacement claims', () => {
   it('requires configured resource mapping, a genuine credential and bus authority', () => fleetFixture(async (f, sql, bus) => {
@@ -608,7 +608,7 @@ async function pairedHttp() {
   };
   const edit = (id: string, extra = {}) => task({ access: editAccess(id), approved_action: 'Edit approved source only', ...extra });
   const launch = (id: string, extra = {}) => { const { needs, ...input } = edit(id, extra); return input; };
-  const start = (id: string) => hostCall('/api/fleet/launches/' + id + '/claim', { gate_allowed: true, observed_at: new Date().toISOString(), account: 'paired-zai', profile_supported: true });
+  const start = (id: string) => hostCall('/api/fleet/launches/' + id + '/claim', { gate_allowed: true, model: 'glm-5.3-flash', observed_at: new Date().toISOString(), account: 'paired-zai', profile_supported: true });
   const inspect = async () => {
     const res = await call('/api/fleet'); expect(res.status).toBe(200); return await res.json() as any;
   };

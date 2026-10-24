@@ -465,7 +465,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     expect(planned.selected).toBeFalsy();
     const claimRes = await doFetch(new Request(`http://example.com/api/fleet/launches/${launch.id}/claim`, {
       method: 'POST', headers: authSub,
-      body: JSON.stringify({ gate_allowed: true, observed_at: isoNow(), account: 'm13-claim', profile_supported: true }),
+      body: JSON.stringify({ gate_allowed: true, model: 'gpt-6.1-sol', observed_at: isoNow(), account: 'm13-claim', profile_supported: true }),
     }));
     expect(claimRes.status).toBe(409);
 
@@ -475,7 +475,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     expect(planned2.selected).toBeTruthy();
     const claimRes2 = await doFetch(new Request(`http://example.com/api/fleet/launches/${launch.id}/claim`, {
       method: 'POST', headers: authSub,
-      body: JSON.stringify({ gate_allowed: true, observed_at: isoNow(), account: 'm13-claim', profile_supported: true }),
+      body: JSON.stringify({ gate_allowed: true, model: 'gpt-6.1-sol', observed_at: isoNow(), account: 'm13-claim', profile_supported: true }),
     }));
     expect(claimRes2.status).toBe(200);
     // Finish the launch so later registry writes are not held by an active launch.
@@ -650,7 +650,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     expect(seededCheck).toMatchObject({ actor: 'human:admin-quota-m13', request_key: 'm13-grok-pre', state: 'offered' });
     const claimRes = await doFetch(new Request(`http://example.com/api/fleet/launches/${offerId}/claim`, {
       method: 'POST', headers: authSub,
-      body: JSON.stringify({ gate_allowed: true, observed_at: isoNow(), account: 'm13-grok-main', profile_supported: true }),
+      body: JSON.stringify({ gate_allowed: true, model: 'gpt-6.1-sol', observed_at: isoNow(), account: 'm13-grok-main', profile_supported: true }),
     }));
     expect(claimRes.status).toBe(409);
     expect(((await claimRes.json()) as any).error).toBe('provider_disabled');

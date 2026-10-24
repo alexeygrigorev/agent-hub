@@ -87,6 +87,14 @@ describe('generic accounts and launch placement', () => {
     expect(offers.offers.find((o: any) => o.id === first.value.id)?.selection).toMatchObject({ id: 'astra', model: 'gpt-6-astra' });
     expect(s.reserve(input, admin).value).toMatchObject({ id: first.value.id, replay: true });
     expect(s.reserve({ ...input, engine: 'codex' }, admin).status).toBe(409);
+    const claim = { gate_allowed: true, profile_supported: true, observed_at: iso(), account: 'shared-codex' };
+    for (const model of [undefined, 'gpt-6.1-sol']) {
+      const refused = await s.handle(request('/launches/' + first.value.id + '/claim', { ...claim, model }), host('hetzner'));
+      expect(refused.status).toBe(409);
+      expect(await refused.json()).toMatchObject({ error: 'model_unsupported' });
+      expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', first.value.id).one().state).toBe('offered');
+    }
+    expect((await s.handle(request('/launches/' + first.value.id + '/claim', { ...claim, model: 'gpt-6-astra' }), host('hetzner'))).status).toBe(200);
     sql.exec("UPDATE fleet_accounts SET provider='zai' WHERE label='shared-codex'");
     expect(s.plan(input).selected).toBeNull();
   }));
@@ -344,7 +352,7 @@ describe('generic accounts and launch placement', () => {
     await configure(s);
     const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
     const path = '/launches/' + launch.id + '/claim';
-    const claim = { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true };
+    const claim = { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true };
     expect((await s.handle(request(path, claim), host('win35'))).status).toBe(404);
     expect((await s.handle(request(path, { ...claim, observed_at: iso(-30001) }), host('hetzner'))).status).toBe(409);
     expect((await s.handle(request(path, claim), host('hetzner'))).status).toBe(200);
@@ -353,7 +361,7 @@ describe('generic accounts and launch placement', () => {
   it('retains capacity on uncertain effects and requires native receipt/confirmed death to release', async () => fixture(async (s, sql) => {
     await configure(s);
     const l: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
-    await s.handle(request('/launches/' + l.id + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+    await s.handle(request('/launches/' + l.id + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
     const path = '/launches/' + l.id + '/result';
     expect((await s.handle(request(path, { state: 'running' }), host('hetzner'))).status).toBe(409);
     expect((await s.handle(request(path, { state: 'uncertain' }), host('hetzner'))).status).toBe(200);
@@ -383,7 +391,7 @@ describe('generic accounts and launch placement', () => {
   it('expires stale uncertain reservations without killing live running capacity', async () => fixture(async (s, sql) => {
     await configure(s);
     const first: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
-    await s.handle(request('/launches/' + first.id + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+    await s.handle(request('/launches/' + first.id + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
     expect((await s.handle(request('/launches/' + first.id + '/result', { state: 'uncertain' }), host('hetzner'))).status).toBe(200);
     // Second launch queues while the uncertain reservation is fresh.
     const waiterInput = intent({ machine: 'hetzner' });
@@ -399,7 +407,7 @@ describe('generic accounts and launch placement', () => {
     it(`replays the identical ${terminal} headless receipt without effects and refuses mismatched receipts`, async () => fixture(async (s, sql) => {
       await configure(s);
       const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner', mode: 'headless', prompt: 'owned task' })), admin)).json();
-      await s.handle(request('/launches/' + launch.id + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+      await s.handle(request('/launches/' + launch.id + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
       const path = '/launches/' + launch.id + '/result';
       const receipt = { state: terminal, native_id: 'owned-native', launcher_task_id: 'hub-' + launch.id, confirmed_exit: true };
       expect((await s.handle(request(path, { ...receipt, state: 'running' }), host('hetzner'))).status).toBe(200);
@@ -427,7 +435,7 @@ describe('generic accounts and launch placement', () => {
     const insert = (id: string, launch: string, machine: string) => sql.exec('INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', id, 'owner', id, '{}', launch, machine, 'headless', 'offered', iso(), iso());
     insert('matching', l.id, 'hetzner'); insert('foreign-host', l.id, 'win35'); insert('other-launch', 'other', 'hetzner');
     const state = (id: string) => sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', id).one().state;
-    await s.handle(request('/launches/' + l.id + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+    await s.handle(request('/launches/' + l.id + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
     const path = '/launches/' + l.id + '/result';
     expect((await s.handle(request(path, { state: 'failed' }), host('hetzner'))).status).toBe(409);
     expect(state('matching')).toBe('offered');
@@ -443,7 +451,7 @@ describe('generic accounts and launch placement', () => {
     const path = '/launches/' + launch.id;
     const receipt = { state: 'failed', confirmed_exit: true, reason: 'launcher_not_started', launcher_task_id: 'hub-' + launch.id };
     expect((await s.handle(request(path + '/result', receipt), host('hetzner'))).status).toBe(409);
-    await s.handle(request(path + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+    await s.handle(request(path + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
     expect((await s.handle(request(path + '/result', { ...receipt, launcher_task_id: 'hub-other' }), host('hetzner'))).status).toBe(409);
     expect((await s.handle(request(path + '/result', receipt), host('hetzner'))).status).toBe(200);
     expect(await (await s.handle(request(path + '/result', receipt), host('hetzner'))).json()).toMatchObject({ replay: true });
@@ -456,7 +464,7 @@ describe('generic accounts and launch placement', () => {
     const sessionId = crypto.randomUUID();
     sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES (?, 'test-admin', ?, '{}', ?, NULL, 'headless', 'queued', ?, ?)", sessionId, sessionId, launch.id, iso(), iso());
     const path = '/launches/' + launch.id;
-    await s.handle(request(path + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+    await s.handle(request(path + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
     const diagnostic = { reason: 'launcher_memory_reserve', message: 'Host memory headroom after launcher reservations is below 10 GiB.', error_type: 'ValueError', exit_code: 1, stage: 'dispatch_headless' };
     const receipt = { state: 'failed', confirmed_exit: true, reason: diagnostic.reason, diagnostic, launcher_task_id: 'hub-' + launch.id };
     expect((await s.handle(request(path + '/result', { ...receipt, diagnostic: { ...diagnostic, message: 'bad\nmessage' } }), host('hetzner'))).status).toBe(400);
@@ -476,7 +484,7 @@ describe('generic accounts and launch placement', () => {
     const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
     sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES ('sess-nostart', 'owner', 'key-nostart', '{}', ?, NULL, 'headless', 'queued', ?, ?)", launch.id, iso(), iso());
     const path = '/launches/' + launch.id;
-    await s.handle(request(path + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+    await s.handle(request(path + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
     const receipt = { state: 'failed', confirmed_exit: true, reason: 'launcher_not_started', launcher_task_id: 'hub-' + launch.id };
     expect((await s.handle(request(path + '/result', receipt), host('hetzner'))).status).toBe(200);
     expect(sql.exec('SELECT state, exit_reason, verification_status FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'failed', exit_reason: 'launcher_not_started', verification_status: 'not_started' });
@@ -506,7 +514,7 @@ describe('generic accounts and launch placement', () => {
     expect(sql.exec("SELECT state FROM session_control_sessions WHERE id = 'pending'").one().state).toBe('failed');
     expect((await s.handle(request(path, receipt), host('hetzner'))).status).toBe(409);
     const claimed: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
-    await s.handle(request('/launches/' + claimed.id + '/claim', { gate_allowed: true, observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+    await s.handle(request('/launches/' + claimed.id + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
     expect((await s.handle(request('/launches/' + claimed.id + '/reject', receipt), host('hetzner'))).status).toBe(409);
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', claimed.id).one().state).toBe('starting');
   }));

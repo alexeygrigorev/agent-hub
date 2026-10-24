@@ -1446,7 +1446,7 @@ class Dispatcher:
             raise ValueError("Unsupported launch mode")
         path = "/api/fleet/launches/" + offer_id
         # An uncertain response here leaves the server reservation intact and performs no native effect.
-        self.request("POST", path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": sub["account_label"]})
+        self.request("POST", path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": sub["account_label"], **({"model": selection["model"]} if selection else {})})
         try:
             receipt = self.runner(argv, cwd=cwd, timeout=120)
             if mode == "interactive":

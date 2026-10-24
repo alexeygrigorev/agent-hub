@@ -54,7 +54,11 @@ def test_model_survives_default_subscription(engine, provider, model_id, mode):
                                     engine=engine, workspace=tmp, tag='task-hub-offer1',
                                     profile=profile, account_label='test-account')}
         with patch('agent_hub_host.provisioning.managed_subscriptions', return_value=[]):
-            dispatcher = Dispatcher(settings, request=lambda *a: {}, runner=runner)
+            def request(method, path, payload=None):
+                if path.endswith('/claim'):
+                    assert payload['model'] == model['model']
+                return {}
+            dispatcher = Dispatcher(settings, request=request, runner=runner)
             result = dispatcher.dispatch(offer)
         assert result['state'] == 'running'
         assert sub['launcher_model'] == 'wrong-daily-default'
