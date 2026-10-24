@@ -9,6 +9,7 @@ import { evaluateQuotaAdmission } from './quota_admission';
 import { adoptObservedNativeSessions, reconcileUnboundFleetSessions } from './session_control';
 import { isValidMachineId } from './machine-id';
 import { LivenessService } from './liveness';
+import { reconcileAccountCapacity } from './account_capacity';
 
 export const FLEET_SCHEMA = `
 CREATE TABLE IF NOT EXISTS fleet_memory_holds (launch_id TEXT PRIMARY KEY, since TEXT NOT NULL, rejected_json TEXT NOT NULL, refused INTEGER NOT NULL DEFAULT 0, retry_id TEXT);
@@ -312,8 +313,17 @@ export class FleetService {
     return this.observationProvenance(account, route)?.quota ?? null;
   }
 
+  private reconciliationCandidates(machine: string) {
+    return this.sql.exec("SELECT id, workspace, request_json, launch_error_json, native_id, engine, mode, launcher_task_id FROM fleet_launches WHERE machine_id = ? AND state IN ('starting','running','uncertain') ORDER BY updated_at LIMIT 100", machine).toArray().map((r: any) => {
+      let binding = null;
+      try { binding = parsed((this.sql.exec('SELECT binding_json FROM session_control_sessions WHERE fleet_launch_id = ? AND machine_id = ?', r.id, machine).toArray()[0] as any)?.binding_json); } catch { /* optional control store */ }
+      return { id: r.id, workspace: r.workspace, cwd: parsed(r.request_json).cwd ?? null, diagnostic: parsed(r.launch_error_json), native_id: r.native_id, engine: r.engine, mode: r.mode, launcher_task_id: r.launcher_task_id, binding };
+    });
+  }
+
   accountStatus(account: any) {
     this.admission.reconcileOffers();
+    reconcileAccountCapacity(this.sql, this.now());
     reconcileUnboundFleetSessions(this.sql, this.now());
     const routes = this.sql.exec('SELECT machine_id, engine, profile FROM fleet_routes WHERE account = ?', account.label).toArray();
     let remaining: number | null = null; let observed = 0; let unknown = false; let blocked = !account.enabled;
@@ -710,6 +720,22 @@ export class FleetService {
     if (!caller) return response({ error: 'unauthorized' }, 401);
     const admin = !!caller.isAdmin; const host = caller.kind === 'host' && !!caller.machineId && auth.scopes?.includes('host');
     const writer = admin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch'));
+    if (path === '/api/fleet/reconciliation' && request.method === 'GET') {
+      if (!host) return response({ error: 'forbidden' }, 403);
+      // Legacy failed dispatches predate the host journal. The host must fence
+      // the maintained launcher before sending the existing no-start receipt.
+      return response({ launches: this.reconciliationCandidates(caller.machineId!) });
+    }
+    if (path === '/api/fleet/reconcile' && request.method === 'POST') {
+      if (!admin) return response({ error: 'forbidden' }, 403);
+      const input = await body(request);
+      if (!object(input, ['apply']) || typeof input.apply !== 'boolean') return response({ error: 'invalid_reconcile' }, 400);
+      return this.transaction(() => {
+        const changes = reconcileAccountCapacity(this.sql, this.now(), input.apply);
+        if (input.apply) this.drainCapacityQueue();
+        return response({ applied: input.apply, changes });
+      });
+    }
     if (path === '/api/fleet' && request.method === 'GET') {
       if (!admin) return response({ error: 'forbidden' }, 403);
       const controlIds = new Map<string, string>();
@@ -822,7 +848,7 @@ export class FleetService {
           offers.push({ selection: parsed(row.model_selection_json) ?? {}, id: row.id, engine: row.engine, account: row.account, profile: row.profile, mode: row.mode, workspace: row.workspace, cwd: parsed(row.request_json).cwd ?? null, prompt: row.prompt, ...(parsed(row.request_json).with_goal === true ? { with_goal: true } : {}), access: parsed(row.request_json).access?.mode || 'legacy_unspecified' });
           if (offers.length === 20) break;
         }
-        return response({ offers: this.routing.enrichOffers(offers) });
+        return response({ offers: this.routing.enrichOffers(offers), reconciliation: this.reconciliationCandidates(caller.machineId!) });
       });
     }
     if (path === '/api/fleet/sessions' && request.method === 'PUT') {
@@ -883,7 +909,11 @@ export class FleetService {
           this.sql.exec('INSERT OR REPLACE INTO fleet_sessions (machine_id, native_id, tag, engine, phase, agent_state, observed_at, workspace, cwd, profile, account, last_activity_at, created_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', caller.machineId!, s.native_id, s.tag, s.engine, s.phase, s.agent_state, new Date(this.now()).toISOString(), s.workspace, row.cwd, s.profile, s.account, row.last_activity_at, row.created_at_ms);
           written++;
         }
-        for (const gone of existing.keys()) { this.sql.exec('DELETE FROM fleet_sessions WHERE machine_id = ? AND native_id = ?', caller.machineId!, gone); written++; }
+        // Preserve historical observations. A missing catalog row is not exit
+        // proof, but an orphan no longer observed is not a live workload.
+        for (const gone of existing.keys()) {
+          this.sql.exec("UPDATE fleet_sessions SET phase = 'unobserved' WHERE machine_id = ? AND native_id = ? AND phase IN ('starting','running','broken','unknown')", caller.machineId!, gone); written++;
+        }
         // Exact positive terminal evidence releases physical concurrency even
         // if a headless launch journal was lost. Absence is never exit proof.
         // Routed jobs retain their separate task-result contract.
@@ -905,6 +935,7 @@ export class FleetService {
           }
         }
         adoptObservedNativeSessions(this.sql, caller.machineId!, cleanSessions, this.now());
+        reconcileAccountCapacity(this.sql, this.now());
         // A refreshed catalog can free machine_capacity: promote waiters.
         try { this.drainCapacityQueue(); } catch { /* best-effort */ }
         return response({ status: 'reported', written });

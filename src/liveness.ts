@@ -5,6 +5,7 @@
  */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { effectiveCheckin } from './registry';
+import { accountCapacityAlerts } from './account_capacity';
 
 export const LIVENESS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS agent_heartbeats (actor TEXT PRIMARY KEY, machine_id TEXT, status TEXT NOT NULL, summary TEXT, at TEXT NOT NULL);
@@ -125,6 +126,7 @@ export class LivenessService {
         `memory refusal; latest mem_available_mb=${hb.mem_avail_mb ?? 'unknown'}, reserved_mb=${hb.launcher_resources?.active_mem_mb ?? 'unknown'}, floor_mb=10240, requested_mb=1500`, machine_id: l.machine_id });
     }
 
+    subjects.push(...accountCapacityAlerts(this.sql, now));
     for (const h of this.sql.exec('SELECT * FROM agent_heartbeats ORDER BY actor').toArray() as any[]) {
       const age = ageSeconds(h.at, now);
       const state = age === null || age > t.heartbeatStaleS ? 'stale' : h.status;

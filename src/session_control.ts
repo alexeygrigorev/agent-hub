@@ -313,6 +313,9 @@ export class SessionControlService {
 
   private cancelOwnerLive(row: any, caller: Caller): boolean {
     if (row.actor !== actorName(caller) || !this.ownerOk(row, caller)) return false;
+    // Legacy admin bearers have a stable actor but no credentials-table row.
+    // Exact ownership still applies; browser's shared actor=admin cannot cancel.
+    if (caller.isAdmin && caller.kind === 'human' && typeof caller.actor === 'string' && caller.actor.startsWith('human:admin-token:')) return true;
     if (caller.kind === 'human') {
       // Browser bus auth currently collapses users to actor=admin and cannot
       // establish which human owns a legacy intent. Only a current, explicitly
