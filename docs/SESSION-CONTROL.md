@@ -603,3 +603,31 @@ is the selected threshold. Inspect acknowledgements with
 expiry; list/show still expose the runtime flag and snooze expiry. These
 operations never stop sessions or delete anything. Warnings are displayed
 only in the CLI; no email, webhook or dashboard badge is generated.
+
+
+### Headless tool permission failures
+
+Admission and a native spawn do not prove that an engine can perform work.
+The host checks bounded first-turn output for an exact owned launch, using its
+native UUID, workspace, tag, engine and incarnation. A permission-client refusal
+or unsupported write-tool error produces `engine_tool_permission_refused`, holds
+that engine on that machine for headless placement, and stops only that newly
+launched execution through the existing confirmed-exit adapter. Automatic daily
+work can retry once on an eligible healthy route; explicit engine overrides
+retain their original choice. Interactive placement remains available.
+
+A refused session displays `failed`. If native cleanup is unconfirmed,
+`lifecycle_state` remains `uncertain`, `cleanup_pending` is true, and its capacity
+reservation stays held. A running process, missing catalog entry or a tool error
+alone never proves exit. The persisted stop oracle allows read-only reconciliation
+without repeating a kill. Original output remains local; Hub receives fixed
+sanitized diagnostics.
+
+A fresh quota/configuration observation does not clear this hold. Before an
+operator explicitly re-enables the engine with `hub fleet probe ENGINE --status ok`,
+run a real headless execution through the maintained launcher and verify file
+write, `git status`, and network `git ls-remote`, in addition to genuine first-action
+and native lifecycle evidence. Until that proof passes, leave the hold in place.
+Native ZCodex currently needs this hold: its launcher sandbox/approval contract
+has not passed that execution probe (launcher issue 69). Managed-home permission
+settings do not repair argv used by an unprofiled native launcher route.

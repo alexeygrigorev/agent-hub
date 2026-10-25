@@ -846,6 +846,64 @@ class Dispatcher:
         self._active_launches[offer_id] = record
         self._persist_launch_record(record)
 
+    def _check_headless_health(self, offer_id, task_id, workspace, engine):
+        """Fail only this host-owned launch; never release capacity on refusal alone."""
+        from . import headless_health
+        from .native_sessions import stop_session
+        try:
+            target = headless_health.launch_target(workspace, task_id, engine)
+            prior = self._active_launches.get(offer_id)
+            if prior and prior.get('native_id') and any((
+                    prior.get('native_id') != target.session_id, prior.get('tag') != target.tag,
+                    prior.get('incarnation') != target.created_at_ms,
+                    prior.get('workspace') != target.workspace, prior.get('engine') != target.engine)):
+                return None
+            diagnostic = headless_health.inspect(self.settings.get('aplexer_bin', 'aplexer'), target)
+        except Exception:
+            return None
+        if diagnostic is None:
+            return None
+        # Hold before cleanup: native spawn/admission never proved tool health.
+        self.request('POST', '/api/fleet/probe', {'engine': engine, 'status': 'unavailable',
+                                                'reason': diagnostic['reason']})
+        record = self._active_launches.get(offer_id)
+        if record is None or not record.get('native_id'):
+            self._record_running_launch(offer_id, task_id, Path(workspace), engine, None,
+                                       target.session_id, Path(workspace) / '.local' / 'hub-results' / (offer_id + '.json'),
+                                       {'tag': target.tag, 'created_at_ms': target.created_at_ms})
+            record = self._active_launches.get(offer_id)
+        if record is None:
+            return None
+        record['diagnostic'] = diagnostic
+        self._persist_launch_record(record)
+        confirmed = False
+        try:
+            # A single kill attempt. If its effect is uncertain, persist its
+            # oracle and reconcile read-only on the next cycle.
+            if record.get('health_stop_oracle'):
+                from .native_sessions import reconcile_stop_oracle
+                confirmed, _ = reconcile_stop_oracle(self.settings.get('aplexer_bin', 'aplexer'),
+                                                     record['health_stop_oracle'], record.get('health_stop_kill', {}))
+            elif not record.get('health_stop_attempted'):
+                record['health_stop_attempted'] = True
+                self._persist_launch_record(record)
+                outcome = stop_session(self.settings.get('aplexer_bin', 'aplexer'), target)
+                confirmed = outcome.state == 'stopped'
+        except Exception as exc:
+            oracle = getattr(exc, 'oracle', None)
+            if isinstance(oracle, dict):
+                record['health_stop_oracle'] = oracle
+                record['health_stop_kill'] = getattr(exc, 'kill', {})
+        payload = {'state': 'failed' if confirmed else 'uncertain', 'native_id': target.session_id,
+                   'launcher_task_id': task_id, 'diagnostic': diagnostic}
+        if confirmed:
+            payload['confirmed_exit'] = True
+        ack = self.request('POST', '/api/fleet/launches/' + offer_id + '/result', payload)
+        if confirmed and isinstance(ack, dict) and ack.get('id') == offer_id and ack.get('state') == 'failed':
+            record['state'], record['settled'] = 'failed', True
+        self._persist_launch_record(record)
+        return {'id': offer_id, **payload, 'reason': diagnostic['reason']}
+
     def reconcile_launches(self) -> list[dict[str, Any]]:
         """Reconcile pending owned headless launches via verified positive retirement,
         Launcher reconcile, and own-host Fleet confirmed-exit result.
@@ -905,6 +963,12 @@ class Dispatcher:
             except (SessionControlError, KeyError, ValueError, TypeError):
                 continue
 
+            if time.time() - incarnation / 1000 < 600 or record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused':
+                health = self._check_headless_health(offer_id, record['task_id'], record['workspace'], engine)
+                if health is not None:
+                    reconciled.append(health)
+                    continue
+
             # 2. Positive retirement verification
             try:
                 is_retired, tombstone, detail = verify_native_retirement(native, target, state_dir=state_dir)
@@ -939,13 +1003,15 @@ class Dispatcher:
                 continue
 
             # 4. Own-host Fleet terminal result
-            fleet_state = "failed" if reconciled_state == "failed" else "exited"
+            fleet_state = "failed" if reconciled_state == "failed" or record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused' else "exited"
             result_payload = {
                 "state": fleet_state,
                 "confirmed_exit": True,
                 "native_id": record["native_id"],
                 "launcher_task_id": task_id,
             }
+            if record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused':
+                result_payload['diagnostic'] = record['diagnostic']
             if fleet_state == "failed":
                 from .launch_diagnostics import check_engine_auth_expired
                 raw_text = str(reconcile_out.get('reason') or reconcile_out.get('error') or '')
@@ -1573,6 +1639,9 @@ class Dispatcher:
                     launched_at_ts=launched_at_ts,
                     log_offsets=log_offsets,
                 )
+                health = self._check_headless_health(offer_id, task_id, workspace, offer.get('engine') or sub.get('engine'))
+                if health is not None:
+                    return health
         except Exception as exc:
             from .launch_diagnostics import exception_diagnostic, LocalCommandError
             engine_name = offer.get("engine") or (sub.get("engine") if 'sub' in locals() and isinstance(sub, dict) else None) or (sub.get("service") if 'sub' in locals() and isinstance(sub, dict) else None)
@@ -1583,6 +1652,12 @@ class Dispatcher:
             failure = exception_diagnostic(exc, "dispatch_headless" if mode == "headless" else "dispatch_interactive",
                                            engine=engine_name, cwd=t_cwd, task_id=t_id, launched_at=l_at, start_offsets=l_offsets)
             if mode == "headless" and not offer.get("task_id") and t_id:
+                try:
+                    health = self._check_headless_health(offer_id, t_id, workspace, engine_name)
+                    if health is not None:
+                        return health
+                except Exception:
+                    pass  # Original failure remains durable; no invented exit proof.
                 from .launcher_recovery import settle_unstarted
                 record = {"offer_id": offer_id, "task_id": task_id, "mode": "headless",
                           "workspace": str(workspace), "target_cwd": str(target_cwd),

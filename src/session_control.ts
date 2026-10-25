@@ -644,12 +644,14 @@ export class SessionControlService {
     const qualified_name = qualified_alias || (typeof request.name === 'string' ? request.name : row.id);
     return {
       ...(threshold === null ? {} : this.warningView(row, threshold)),
-      id: row.id, state: row.mode === 'headless' && row.state === 'stopped' && orphanFailure(native) ? 'failed' :
+      id: row.id, state: row.mode === 'headless' && launchError?.reason === 'engine_tool_permission_refused' ? 'failed' :
+        row.mode === 'headless' && row.state === 'stopped' && orphanFailure(native) ? 'failed' :
         row.mode === 'headless' && row.state === 'running' && ['exited', 'dead'].includes(native?.phase) ? 'failed' :
         row.state === 'running' && stall.stalled ? 'stalled' : row.state,
       stalled: row.state === 'running' && stall.stalled,
       stall_reason: orphanFailure(native) ? 'agent_exited_children_running' : stall.reason, stalled_since: stall.since,
       stall_threshold: stallThreshold(this.options.env), lifecycle_state: row.state,
+      ...(row.mode === 'headless' && launchError?.reason === 'engine_tool_permission_refused' ? { cleanup_pending: !['failed', 'stopped'].includes(row.state) } : {}),
       machine: row.machine_id ?? null, engine: row.engine ?? null,
       model_id: modelSelection?.id ?? null, model: modelSelection?.model ?? null,
       mode: row.mode, access: request.access?.mode || 'legacy_unspecified',

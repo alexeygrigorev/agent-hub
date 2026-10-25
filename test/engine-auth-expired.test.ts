@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
 import { RoutingService } from '../src/routing';
+import { SessionControlService } from '../src/session_control';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
@@ -800,5 +801,54 @@ describe('reviewer acceptance regressions', () => {
     const failed = await fleet.handle(request(`/launches/${launch.value.id}/result`, {state:'failed', native_id:'native-review', launcher_task_id:'hub-'+launch.value.id, confirmed_exit:true, diagnostic:authDiagnostic}), host(original.machine_id));
     expect(failed.status).toBe(200);
     expect(sql.exec("SELECT state FROM session_control_sessions WHERE id='review-session'").toArray()[0].state).toBe('failed');
+  }));
+});
+
+
+describe('headless permission refusal recovery', () => {
+  const diagnostic = { reason: 'engine_tool_permission_refused', message: 'Headless engine refused write or network tools; route held until a successful execution probe.', error_type: 'PermissionError', stage: 'dispatch_headless' };
+  it('holds only headless routing and admission refresh cannot clear the refusal', async () => fixture(async (fleet, _routing, sql) => {
+    await fleet.handle(request('/probe', {engine:'opencode', status:'unavailable', reason:diagnostic.reason}), host('hetzner'));
+    await fleet.handle(request('/probe', {engine:'opencode', status:'ok', reason:'admission_configured'}), host('hetzner'));
+    const plan = await (await fleet.handle(request('/plan', {workspace:'demo', tier:'daily', mode:'headless', prompt:'bounded probe'}),admin)).json() as any;
+    expect(plan.selected?.engine).not.toBe('opencode');
+    expect(plan.rejected).toContainEqual(expect.objectContaining({engine:'opencode', reason:diagnostic.reason}));
+    const interactive = await (await fleet.handle(request('/plan', {workspace:'demo', tier:'daily', mode:'interactive', engine:'opencode'}),admin)).json() as any;
+    expect(interactive.selected?.engine).toBe('opencode');
+    expect(sql.exec("SELECT status FROM fleet_engine_health WHERE engine='opencode'").one().status).toBe('unavailable');
+  }));
+  it('persists the failure, automatically holds the engine and retries daily work once', async () => fixture(async (fleet, _routing, sql) => {
+    // Make the initial automatic choice deterministic without an explicit override.
+    sql.exec("UPDATE fleet_accounts SET enabled=0 WHERE provider='zai'");
+    const launch = fleet.reserve({workspace:'demo', tier:'daily', mode:'headless', prompt:'permission smoke', idempotency_key:'permission-smoke'}, admin);
+    expect(launch.status).toBe(201); expect(launch.value.engine).toBe('opencode');
+    await fleet.handle(claim(launch.value.id),host('hetzner'));
+    sql.exec("UPDATE fleet_accounts SET enabled=1 WHERE provider='zai'");
+    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, binding_json, host_family, created_at, updated_at) VALUES ('retry-permission', 'test-admin', 'retry-permission', ?, ?, 'hetzner', 'opencode', 'headless', 'running', ?, 'original-host-family', ?, ?)",JSON.stringify({workspace:'demo',tier:'daily',brief:'permission smoke'}),launch.value.id,JSON.stringify({native_id:'exact-owned-native',tag:'old',generation:1}),iso(),iso());
+    sql.exec("INSERT INTO session_control_commands (id,session_id,kind,actor,request_key,payload_json,state,generation,correlation,created_at,updated_at) VALUES ('old-command','retry-permission','capture','test-admin','old-command','{}','recorded',1,'old-command',?,?)",iso(),iso());
+    const result = await fleet.handle(request(`/launches/${launch.value.id}/result`, {state:'failed', native_id:'exact-owned-native', launcher_task_id:'hub-'+launch.value.id, confirmed_exit:true, diagnostic}),host('hetzner'));
+    expect(result.status).toBe(200);
+    const failed = sql.exec('SELECT * FROM fleet_launches WHERE id=?',launch.value.id).one();
+    expect(failed.state).toBe('failed'); expect(failed.exit_reason).toBe(diagnostic.reason);
+    expect(JSON.parse(failed.launch_error_json)).toEqual(diagnostic);
+    expect(failed.retried_launch_id).toBeTruthy();
+    const retry = sql.exec('SELECT * FROM fleet_launches WHERE id=?',failed.retried_launch_id).one();
+    expect(retry.engine).toBe('codex');
+    expect(sql.exec("SELECT fleet_launch_id, binding_json, host_family FROM session_control_sessions WHERE id='retry-permission'").one()).toMatchObject({fleet_launch_id:retry.id,binding_json:null,host_family:null});
+    expect(sql.exec("SELECT state FROM session_control_commands WHERE id='old-command'").one().state).toBe('failed');
+    expect(sql.exec("SELECT reason FROM fleet_engine_health WHERE engine='opencode'").one().reason).toBe(diagnostic.reason);
+  }));
+  it('holds a refusal even before native cleanup is confirmed, retaining reservation', async () => fixture(async (fleet, _routing, sql) => {
+    const launch = fleet.reserve({workspace:'demo', tier:'daily', mode:'headless', engine:'opencode', prompt:'probe', idempotency_key:'permission-uncertain'},admin);
+    await fleet.handle(claim(launch.value.id),host('hetzner'));
+    const result = await fleet.handle(request(`/launches/${launch.value.id}/result`, {state:'uncertain', native_id:'exact-owned-native', launcher_task_id:'hub-'+launch.value.id, diagnostic}),host('hetzner'));
+    expect(result.status).toBe(200);
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?',launch.value.id).one().state).toBe('uncertain');
+    expect(sql.exec("SELECT status FROM fleet_engine_health WHERE engine='opencode'").one().status).toBe('unavailable');
+    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, created_at, updated_at) VALUES ('22222222-2222-4222-8222-222222222222', 'test-admin', 'permission-session', ?, ?, 'hetzner', 'opencode', 'headless', 'uncertain', ?, ?)", JSON.stringify({workspace:'demo', brief:'probe'}),launch.value.id,iso(),iso());
+    const sessions = new SessionControlService(sql, (cb: any) => cb(), () => now);
+    const shown = await sessions.handle(new Request('https://hub.test/api/sessions/22222222-2222-4222-8222-222222222222'),admin);
+    expect(shown.status).toBe(200);
+    expect(await shown.json()).toMatchObject({state:'failed', lifecycle_state:'uncertain', cleanup_pending:true, reason:diagnostic.reason});
   }));
 });

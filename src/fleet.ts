@@ -88,7 +88,7 @@ export const PLACEMENT_PRESSURE_REASONS = new Set(['launcher_memory_reserve', 'a
  * (stale/drained check-ins, policy-disabled engines, engines no live host
  * advertises anymore — e.g. registry routes for engines the current host
  * release stopped running). */
-const INCIDENTAL_REASONS = new Set(['machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'admission_unconfigured']);
+const INCIDENTAL_REASONS = new Set(['machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'engine_tool_permission_refused', 'admission_unconfigured']);
 /** Capacity-only placement failure: every rejected route reports transient
  * capacity (account/machine), optionally alongside incidental stale/disabled
  * routes (drained/stale check-ins, policy-disabled engines, registry routes
@@ -638,7 +638,7 @@ export class FleetService {
       if (request.with_goal && !['codex', 'zcodex'].includes(route.engine)) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'goal_unsupported' }); continue; }
       // A disabled execution engine holds all new candidate planning, whatever the account label.
       if (disabledEngines().has(route.engine)) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'provider_disabled' }); continue; }
-      const engineHealth: any = this.sql.exec("SELECT status, reason FROM fleet_engine_health WHERE engine = ? AND (machine_id = ? OR machine_id = '' OR machine_id IS NULL) AND status = 'unavailable'", route.engine, route.machine_id).toArray()[0];
+      const engineHealth: any = this.sql.exec("SELECT status, reason FROM fleet_engine_health WHERE engine = ? AND (machine_id = ? OR machine_id = '' OR machine_id IS NULL) AND status = 'unavailable'", route.engine, route.machine_id).toArray().find((h: any) => request.mode === 'headless' || h.reason !== 'engine_tool_permission_refused');
       if (engineHealth && engineHealth.status === 'unavailable') {
         rejected.push({ machine: route.machine_id, engine: route.engine, reason: engineHealth.reason || 'engine_auth_expired' });
         continue;
@@ -1364,6 +1364,9 @@ export class FleetService {
         this.sql.exec('UPDATE fleet_launches SET state = ?, native_id = COALESCE(?, native_id), launcher_task_id = COALESCE(?, launcher_task_id), updated_at = ? WHERE id = ?', data.state, data.native_id || null, data.launcher_task_id || null, new Date(this.now()).toISOString(), row.id);
         if (diagnostic) this.sql.exec("UPDATE fleet_launches SET launch_error_json = ?, exit_reason = ? WHERE id = ?", JSON.stringify(diagnostic), diagnostic.reason, row.id);
         if (noStart) this.sql.exec("UPDATE fleet_launches SET exit_reason = ?, verification_status = 'not_started', finished_at = ? WHERE id = ?", data.reason, new Date(this.now()).toISOString(), row.id);
+        if (diagnostic?.reason === 'engine_tool_permission_refused' && row.mode === 'headless') {
+          this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at, diagnostics_json) VALUES (?, ?, 'unavailable', ?, ?, ?)", row.engine, row.machine_id, diagnostic.reason, new Date(this.now()).toISOString(), JSON.stringify(diagnostic));
+        }
         if (diagnostic && diagnostic.reason === 'engine_auth_expired') {
           this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at, diagnostics_json) VALUES (?, ?, 'unavailable', 'engine_auth_expired', ?, ?)", row.engine, row.machine_id, new Date(this.now()).toISOString(), JSON.stringify(diagnostic));
           const noticeKey = 'engine_auth_expired:' + row.engine;
@@ -1393,7 +1396,7 @@ export class FleetService {
         const origLaunchReq = parsed(row.request_json, {});
         const hasExplicitEngine = Boolean(origLaunchReq.engine && typeof origLaunchReq.engine === 'string');
         if (data.state === 'failed' && data.confirmed_exit === true &&
-            (data.reason === 'engine_auth_expired' || diagnostic?.reason === 'engine_auth_expired') &&
+            (data.reason === 'engine_auth_expired' || ['engine_auth_expired', 'engine_tool_permission_refused'].includes(diagnostic?.reason)) &&
             !row.retried_launch_id && !isAlreadyRetry && !hasExplicitEngine) {
           const hasSessionTable = this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length > 0;
           const sessionRow: any = hasSessionTable ? this.sql.exec("SELECT * FROM session_control_sessions WHERE fleet_launch_id = ?", row.id).toArray()[0] : null;
@@ -1442,6 +1445,12 @@ export class FleetService {
                 const nowIso = new Date(this.now()).toISOString();
                 this.sql.exec("UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = ?, engine = ?, state = 'offered', updated_at = ? WHERE id = ?",
                   reserved.value.id, reserved.value.machine, reserved.value.engine, nowIso, sessionRow.id);
+                if (diagnostic?.reason === 'engine_tool_permission_refused') {
+                  // Retry has a new native identity (and may use a different host).
+                  // Preserve the failed launch history, retire commands for its binding.
+                  this.sql.exec("UPDATE session_control_sessions SET binding_json = NULL, host_family = NULL WHERE id = ?", sessionRow.id);
+                  this.sql.exec("UPDATE session_control_commands SET state = 'failed', ack_json = ?, poll_at = NULL, updated_at = ? WHERE session_id = ? AND state IN ('recorded','transported','claimed','uncertain')", JSON.stringify({ reason: 'engine_tool_permission_refused', message: 'Original execution failed; command cannot follow the replacement binding.' }), nowIso, sessionRow.id);
+                }
                 this.sql.exec("UPDATE fleet_launches SET retried_launch_id = ? WHERE id = ?", reserved.value.id, row.id);
                 retried = true;
               } else {
