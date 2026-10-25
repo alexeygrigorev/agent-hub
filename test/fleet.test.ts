@@ -587,7 +587,7 @@ describe('generic accounts and launch placement', () => {
     expect(account.active).toBe(1);
     expect(account.available_slots).toBe(account.max_concurrency - 1);
   }));
-  it.each(['workspace_unavailable', 'model_unsupported', 'admission_unconfigured', 'admission_refused', 'dispatch_refused'])('rejects only unclaimed own-host offers with explicit %s', async reason => fixture(async (s, sql) => {
+  it.each(['workspace_unavailable', 'admission_unconfigured', 'admission_refused', 'dispatch_refused'])('rejects only unclaimed own-host offers with explicit %s', async reason => fixture(async (s, sql) => {
     await configure(s);
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
     const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
@@ -612,6 +612,44 @@ describe('generic accounts and launch placement', () => {
     await s.handle(request('/launches/' + claimed.id + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
     expect((await s.handle(request('/launches/' + claimed.id + '/reject', receipt), host('hetzner'))).status).toBe(409);
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', claimed.id).one().state).toBe('starting');
+  }));
+  it.each([false, true])('keeps unsupported-model session alive with fallback or explicit hold (pinned=%s)', async pinned => fixture(async (s, sql) => {
+    await configure(s);
+    for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
+    const input = intent({ ...(pinned ? { machine: 'hetzner' } : {}), access: { mode: 'read' } });
+    const launch: any = await (await s.handle(request('/launches', input), admin)).json();
+    expect(launch.machine).toBe('hetzner');
+    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES ('model-retry', 'test-admin', 'model-retry', '{}', ?, 'hetzner', 'headless', 'offered', ?, ?)", launch.id, iso(), iso());
+    const path = '/launches/' + launch.id + '/reject';
+    expect((await s.handle(request(path, { reason: 'model_unsupported' }), host('win35'))).status).toBe(404);
+    const refusal: any = await (await s.handle(request(path, { reason: 'model_unsupported' }), host('hetzner'))).json();
+    expect(refusal.id).not.toBe(launch.id);
+    expect(refusal.state).toBe(pinned ? 'queued' : 'offered');
+    expect(refusal.rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'model_unsupported' });
+    expect(sql.exec('SELECT state, verification_status FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'failed', verification_status: 'not_started' });
+    expect(sql.exec("SELECT state, fleet_launch_id FROM session_control_sessions WHERE id='model-retry'").one()).toMatchObject({ state: 'queued', fleet_launch_id: refusal.id });
+    const retry = sql.exec('SELECT * FROM fleet_launches WHERE id = ?', refusal.id).one();
+    expect(retry.machine_id).toBe(pinned ? '' : 'win35');
+    const replay = s.reserve(input, admin);
+    expect(replay.value.id).toBe(refusal.id);
+    expect(s.plan(intent({ machine: 'hetzner' })).rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'model_unsupported' });
+    // Refusal is scoped: interactive and another model on the same account work.
+    expect(s.plan(intent({ machine: 'hetzner', mode: 'interactive', prompt: '' })).selected).not.toBeNull();
+    expect(s.plan(intent({ machine: 'hetzner', tier: 'quick' })).selected).not.toBeNull();
+    expect((await s.handle(request(path, { reason: 'model_unsupported' }), host('hetzner'))).status).toBe(409);
+    if (!pinned) {
+      await s.handle(request('/launches/' + refusal.id + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'desktop-codex', profile_supported: true }), host('win35'));
+      expect((await s.handle(request('/launches/' + refusal.id + '/reject', { reason: 'model_unsupported' }), host('win35'))).status).toBe(409);
+    }
+  }));
+  it('excludes a host-advertised unsupported route only for its account and mode', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const caps = JSON.parse(sql.exec("SELECT capabilities FROM machines WHERE id='hetzner'").one().capabilities);
+    caps.fleet_route_rejections = [{ engine: 'codex', account: 'shared-codex', profile: null, mode: 'headless', reason: 'model_unsupported' }];
+    sql.exec("UPDATE machines SET capabilities=? WHERE id='hetzner'", JSON.stringify(caps));
+    expect(s.plan(intent()).selected?.machine).toBe('win35');
+    expect(s.plan(intent()).rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'model_unsupported' });
+    expect(s.plan(intent({ mode: 'interactive', prompt: '' })).selected?.machine).toBe('hetzner');
   }));
   it('accepts complete native catalogs above 32 KiB while retaining catalog bounds', async () => fixture(async (s, sql) => {
     const sessions = Array.from({ length: 100 }, (_, i) => ({

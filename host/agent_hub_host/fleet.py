@@ -1217,6 +1217,8 @@ class Dispatcher:
         # Validates map membership or workspace_roots / worktrees identity paths.
         resolve_workspace_path(self.settings, offer.get("workspace"))
         sub = dict(matches[0])
+        if offer.get('mode') == 'headless' and sub.get('launcher_provider') == 'claude' and not sub.get('profile'):
+            raise ValueError('model_unsupported: Claude headless route requires managed profile')
         if offer.get("selection") is not None:
             from .model_contract import configured_selection
             model = configured_selection(offer["selection"], offer["engine"], sub.get("launcher_provider") or sub["service"])
@@ -1745,6 +1747,14 @@ class Dispatcher:
                     workspaces=advertised_workspaces(self.settings), cpu_count=os.cpu_count())
         caps['fleet_modes'] = ['interactive'] + (['headless'] if self.settings.get('launcher') else [])
         caps['launcher_resources'] = bool(self.settings.get('launcher'))
+        # The maintained launcher admits Claude headless work only through a
+        # managed profile. Its global model-support list alone does not prove
+        # this local account route is executable (interactive is independent).
+        caps['fleet_route_rejections'] = [
+            {'engine': s.get('engine', s['service']), 'account': s['account_label'],
+             'profile': s.get('profile'), 'mode': 'headless', 'reason': 'model_unsupported'}
+            for s in self.settings['subscriptions']
+            if s.get('launcher_provider') == 'claude' and not s.get('profile')]
         qualified_jobs = self._derive_qualified_role_jobs()
         if qualified_jobs:
             caps['jobs'] = qualified_jobs

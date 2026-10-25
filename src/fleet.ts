@@ -678,6 +678,13 @@ export class FleetService {
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
       const model = policy.models.find(m => members.includes(m.id) && (!overrideModels.length || m.id === input.engine) && matchesModelRoute(m, route, family));
       if (!model) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'model_unsupported' }); continue; }
+      // Host adapter refusals are scoped to the exact route, mode and model.
+      // Quota refreshes cannot prove that a previously refused adapter works.
+      const unsupported = this.sql.exec("SELECT id FROM fleet_launches WHERE machine_id = ? AND engine = ? AND account = ? AND profile IS ? AND mode = ? AND exit_reason = 'model_unsupported' AND json_extract(model_selection_json, '$.model') = ? AND json_extract(model_selection_json, '$.effort') IS ? LIMIT 1",
+        route.machine_id, route.engine, route.account, route.profile, request.mode, model.model, model.effort).toArray().length;
+      const advertisedRefusal = Array.isArray(caps.fleet_route_rejections) && caps.fleet_route_rejections.some((r: any) =>
+        r.engine === route.engine && r.account === route.account && (r.profile ?? null) === route.profile && r.mode === request.mode && r.reason === 'model_unsupported');
+      if (unsupported || advertisedRefusal) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'model_unsupported' }); continue; }
       const pending = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND state IN ${ACTIVE}`, route.machine_id).one().n);
       const routingInstalled = this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'routing_machines'").toArray().length;
       const limit: any = routingInstalled ? this.sql.exec('SELECT max_agents FROM routing_machines WHERE machine_id = ?', route.machine_id).toArray()[0] : null;
@@ -1254,6 +1261,21 @@ export class FleetService {
           if (row.state !== 'offered' || row.native_id || row.launcher_task_id) return response({ error: 'already_claimed' }, 409);
           if (this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) return response({ error: 'task_report_required' }, 409);
           const at = new Date(this.now()).toISOString();
+          if (data.reason === 'model_unsupported') {
+            // The fenced pre-claim refusal proves no native start. Retain the
+            // failed attempt as route evidence and use a new launcher identity.
+            const id = crypto.randomUUID();
+            const rejected = [{ machine: row.machine_id, engine: row.engine, reason: data.reason }];
+            this.sql.exec("UPDATE fleet_launches SET request_key = ?, state = 'failed', verification_status = 'not_started', exit_reason = ?, finished_at = ?, updated_at = ? WHERE id = ?", 'model-retry-' + row.id, data.reason, at, at, row.id);
+            this.sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, '', '', '', NULL, ?, ?, ?, 'queued', ?, ?)", id, row.actor, row.requester_kind, row.parent_id, row.summary, row.request_key, row.request_json, row.mode, row.workspace, row.prompt, row.created_at, at);
+            this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json) VALUES (?, ?, ?)', id, at, JSON.stringify(rejected));
+            if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
+              this.sql.exec("UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = NULL, state = 'queued', updated_at = ? WHERE fleet_launch_id = ? AND binding_json IS NULL AND state IN ('offered','queued','held')", id, at, row.id);
+            }
+            this.drainCapacityQueue();
+            const next: any = this.sql.exec('SELECT state FROM fleet_launches WHERE id = ?', id).one();
+            return response({ id, state: next.state, queued: next.state === 'queued', rejected });
+          }
           this.sql.exec("UPDATE fleet_launches SET state = 'failed', verification_status = 'not_started', exit_reason = ?, finished_at = ?, updated_at = ? WHERE id = ? AND state = 'offered'", data.reason, at, at, row.id);
           if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
             this.sql.exec("UPDATE session_control_sessions SET state = 'failed', updated_at = ? WHERE fleet_launch_id = ? AND machine_id = ? AND binding_json IS NULL AND state IN ('offered','queued','held')", at, row.id, caller.machineId!);

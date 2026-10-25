@@ -24,6 +24,41 @@ def offer(**kw):
 
 
 class FleetTests(unittest.TestCase):
+    def test_native_claude_headless_rejected_before_admission_or_submission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = settings(Path(tmp))
+            cfg['subscriptions'] = [{'service': 'claude', 'engine': 'claude',
+                                     'account_label': 'shared-claude', 'profile': None,
+                                     'launcher_provider': 'claude', 'admission_argv': ['gate']}]
+            runner = MagicMock()
+            request = MagicMock()
+            dispatcher = fleet.Dispatcher(cfg, request, runner)
+            req = offer(engine='claude', account='shared-claude', mode='headless')
+            with self.assertRaisesRegex(ValueError, 'model_unsupported: Claude headless route requires managed profile'):
+                dispatcher.dispatch(req)
+            runner.assert_not_called()
+            request.assert_not_called()
+            self.assertEqual(dispatcher._route(dict(req, mode='interactive'))['engine'], 'claude')
+
+    def test_registration_advertises_native_claude_headless_refusal_only(self):
+        cfg = settings(Path('/repo'))
+        cfg['subscriptions'] += [
+            {'service': 'claude', 'engine': 'claude', 'account_label': 'native-claude', 'profile': None, 'launcher_provider': 'claude'},
+            {'service': 'claude', 'engine': 'claude', 'account_label': 'managed-claude', 'profile': 'hub-managed-claude', 'launcher_provider': 'claude'},
+        ]
+        calls = []
+        def request(method, path, body=None):
+            calls.append((method, path, body))
+            return {'offers': []}
+        def runner(argv, **kw):
+            return [] if argv[0] == 'aplexer' else {}
+        with patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {}, 'hostname': 'test', 'os': 'test', 'network': 'home', 'roles': []}), \
+             patch('agent_hub_host.api.get_heartbeat_payload', return_value={'type': 'heartbeat'}):
+            fleet.Dispatcher(cfg, request, runner).once()
+        self.assertEqual(calls[0][2]['capabilities']['fleet_route_rejections'], [
+            {'engine': 'claude', 'account': 'native-claude', 'profile': None,
+             'mode': 'headless', 'reason': 'model_unsupported'}])
+
     def test_session_metadata_uses_live_liveness_over_persisted_phase(self):
         raw = [{'id': 'id', 'tag': 'tag', 'workspace': '/repo', 'engine': 'codex',
                 'phase': 'running', 'state': 'broken', 'worker_alive': False}]
