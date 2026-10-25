@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_hub_host.session_progress import SessionProgress, event_ms, file_signature, process, leader_in_containment
+from agent_hub_host.session_progress import SessionProgress, event_ms, process, leader_in_containment
 
 
 class SessionProgressTests(unittest.TestCase):
@@ -18,16 +18,15 @@ class SessionProgressTests(unittest.TestCase):
                                 'engine': 'opencode', 'incarnation': 1000}}
 
     def sampler(self, **kwargs):
-        return SessionProgress(now_ms=lambda: self.clock, files=lambda _: 'same', **kwargs)
+        return SessionProgress(now_ms=lambda: self.clock, output=lambda _: None, **kwargs)
 
-    def test_output_and_state_use_newest_actual_event(self):
-        self.assertEqual(event_ms(self.row), 3000)
+    def test_only_provider_events_count_not_terminal_activity(self):
+        self.assertEqual(event_ms(self.row), 2000)
         self.row['reported_state_event_ms'] = 4000
         self.assertEqual(event_ms(self.row), 4000)
 
-    @patch('agent_hub_host.session_progress.tree_cpu', return_value={})
     @patch('agent_hub_host.session_progress.process', return_value={'pid': 123, 'start': 1, 'cpu': 0})
-    def test_polling_is_not_progress_and_unknown_does_not_prove_death(self, proc, cpu):
+    def test_polling_is_not_progress_and_unknown_does_not_prove_death(self, proc):
         sampler = self.sampler()
         first = sampler.sample([self.row])['native']
         self.clock += 20000
@@ -36,25 +35,28 @@ class SessionProgressTests(unittest.TestCase):
         self.assertIsNone(sampler.sample([self.row])['native']['agent_alive'])
         self.assertFalse(sampler.sample([self.row])['native']['orphaned'])
 
-    @patch('agent_hub_host.session_progress.tree_cpu')
     @patch('agent_hub_host.session_progress.process', return_value={'pid': 123, 'start': 1, 'cpu': 0})
-    def test_real_cpu_and_files_advance_activity_but_pid_reuse_does_not(self, proc, cpu):
-        cpu.return_value = {(123, 1): 0}
+    def test_heartbeat_cpu_and_shared_files_cannot_mask_stale_rollout(self, proc):
         sampler = self.sampler()
+        workspace = tempfile.TemporaryDirectory()
+        self.addCleanup(workspace.cleanup)
+        self.row['cwd'] = workspace.name
+        sampler.output = lambda _: 2500
         first = sampler.sample([self.row])['native']['last_progress_at']
-        cpu.return_value = {(123, 1): 100}
-        self.clock += 5000
-        second = sampler.sample([self.row])['native']['last_progress_at']
-        self.assertNotEqual(first, second)
-        cpu.return_value = {(123, 2): 5000}
-        self.clock += 5000
-        self.assertEqual(second, sampler.sample([self.row])['native']['last_progress_at'])
-        sampler.files = lambda _: 'changed'
-        self.assertNotEqual(second, sampler.sample([self.row])['native']['last_progress_at'])
+        for _ in range(3):
+            self.clock += 1801000
+            self.row['last_activity_ms'] = self.clock  # PTY/heartbeat chatter
+            self.row['updated_at_ms'] = self.clock
+            proc.return_value = {'pid': 123, 'start': 1, 'cpu': self.clock}
+            Path(workspace.name, 'unrelated').write_text(str(self.clock))
+            result = sampler.sample([self.row])['native']
+            self.assertEqual(result['last_progress_at'], first)
+            self.assertGreater(self.clock - 2500, 1800000)
+        sampler.output = lambda _: self.clock
+        self.assertNotEqual(sampler.sample([self.row])['native']['last_progress_at'], first)
 
-    @patch('agent_hub_host.session_progress.tree_cpu', return_value={})
     @patch('agent_hub_host.session_progress.process')
-    def test_orphan_reap_requires_owned_incarnation_and_previously_live_agent(self, proc, cpu):
+    def test_orphan_reap_requires_owned_incarnation_and_previously_live_agent(self, proc):
         calls = []
         sampler = self.sampler(stop=lambda row: calls.append(row['id']) or True)
         proc.return_value = {'pid': 123, 'start': 1, 'cpu': 0}
@@ -75,9 +77,8 @@ class SessionProgressTests(unittest.TestCase):
         sampler.sample([self.row], self.record)
         self.assertEqual(calls, ['native'])
 
-    @patch('agent_hub_host.session_progress.tree_cpu', return_value={})
     @patch('agent_hub_host.session_progress.process')
-    def test_failed_cleanup_stays_uncertain_and_is_not_blindly_retried(self, proc, cpu):
+    def test_failed_cleanup_stays_uncertain_and_is_not_blindly_retried(self, proc):
         calls = []
         sampler = self.sampler(stop=lambda row: calls.append(1) or False)
         proc.return_value = {'pid': 123, 'start': 1, 'cpu': 0}
@@ -86,6 +87,21 @@ class SessionProgressTests(unittest.TestCase):
         self.assertEqual(sampler.sample([self.row], self.record)['native']['cleanup'], 'uncertain')
         sampler.sample([self.row], self.record)
         self.assertEqual(calls, [1])
+
+    def test_upgrade_discards_poisoned_clock_but_preserves_cleanup_dedup(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / 'progress.json'
+            state.write_text(json.dumps([dict(id='native', incarnation=1000, last=999999,
+                seen_alive=True, attempted=True, cleanup='uncertain', orphaned=True)]))
+            state.chmod(0o600)
+            sampler = self.sampler(state_path=state)
+            self.assertEqual(sampler.samples[('native', 1000)]['last'], 1000)
+            self.assertTrue(sampler.samples[('native', 1000)]['attempted'])
+            sampler.output = lambda _: 2500
+            sampler.sample([self.row])
+            restarted = self.sampler(state_path=state)
+            self.assertEqual(restarted.samples[('native', 1000)]['last'], 2500)
 
     def test_bounded_metadata_and_zombie_detection(self):
         with tempfile.TemporaryDirectory() as d:
@@ -97,10 +113,6 @@ class SessionProgressTests(unittest.TestCase):
             (p / 'stat').write_text('123 (process name) ' + ' '.join(fields))
             self.assertIs(process(123, root), False)
             self.assertIs(process(456, root), False)
-            (root / 'file').write_text('one')
-            signature = file_signature(d)
-            (root / 'file').write_text('two with changed size')
-            self.assertNotEqual(file_signature(d), signature)
 
     def test_reused_pid_in_foreign_containment_is_not_alive_or_progress(self):
         with tempfile.TemporaryDirectory() as d:
@@ -116,9 +128,8 @@ class SessionProgressTests(unittest.TestCase):
             (p / 'cgroup').unlink()
             self.assertIsNone(leader_in_containment(row, leader, root))
 
-    @patch('agent_hub_host.session_progress.tree_cpu', return_value={})
     @patch('agent_hub_host.session_progress.process')
-    def test_monitor_restart_keeps_cleanup_dedup_and_failure_evidence(self, proc, cpu):
+    def test_monitor_restart_keeps_cleanup_dedup_and_failure_evidence(self, proc):
         with tempfile.TemporaryDirectory() as d:
             state = Path(d) / 'private' / 'progress.json'
             calls = []

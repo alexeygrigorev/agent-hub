@@ -1,21 +1,19 @@
 """Bounded native progress sampling; never upload argv, filenames or process data.
 
-Polling a catalog is not activity. CPU deltas exclude the aplexer worker;
-file changes are bounded to the session cwd. Only exact owned headless
+Polling, PTY chatter, CPU use and shared workspace changes are not agent
+progress. Only transcript writes and provider events count. Only exact owned headless
 incarnations can have orphan children reaped through the native stop oracle.
 """
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import json
-import os
 from pathlib import Path
 import time
 
 
 def event_ms(row):
-    values = [row.get(k) for k in ('last_activity_ms', 'reported_state_event_ms')]
+    values = [row.get('reported_state_event_ms')]
     return max((v for v in values if type(v) is int and v > 0), default=None)
 
 
@@ -32,25 +30,6 @@ def process(pid, proc_root=Path('/proc')):
         return False
     except (OSError, ValueError, IndexError):
         return None
-
-
-def tree_cpu(pid, proc_root=Path('/proc')):
-    """At most 256 processes/50ms; PID identities prevent reuse as progress."""
-    pending, seen, total = [pid], set(), {}
-    deadline = time.monotonic() + .05
-    while pending and len(seen) < 256 and time.monotonic() < deadline:
-        current = pending.pop()
-        if current in seen or type(current) is not int:
-            continue
-        seen.add(current)
-        p = process(current, proc_root)
-        if isinstance(p, dict):
-            total[(current, p['start'])] = p['cpu']
-            try:
-                pending.extend(int(x) for x in (proc_root / str(current) / 'task' / str(current) / 'children').read_text().split())
-            except (OSError, ValueError):
-                pass
-    return total
 
 
 def leader_in_containment(row, leader, proc_root):
@@ -71,30 +50,6 @@ def leader_in_containment(row, leader, proc_root):
         return None
 
 
-def file_signature(cwd):
-    """Metadata only, no symlinks; incomplete/unreadable scans stay unknown."""
-    if not isinstance(cwd, str) or not Path(cwd).is_absolute():
-        return None
-    digest, count = hashlib.sha256(), 0
-    deadline = time.monotonic() + .05
-    try:
-        if not Path(cwd).is_dir():
-            return None
-        for root, dirs, files in os.walk(cwd, followlinks=False):
-            dirs[:] = sorted(d for d in dirs if d not in {'.git', '.local', 'node_modules', '.venv', '__pycache__', '.wrangler', 'dist'} and not Path(root, d).is_symlink())
-            for name in sorted(files):
-                if count >= 2048 or time.monotonic() > deadline:
-                    return None
-                p = Path(root, name)
-                stat = p.lstat()
-                if not p.is_symlink():
-                    digest.update(str((str(p.relative_to(cwd)), stat.st_mtime_ns, stat.st_size)).encode())
-                count += 1
-        return digest.hexdigest()
-    except OSError:
-        return None
-
-
 def owned_headless(row, records):
     """Journal ownership is required for cleanup, plus the exact native tuple."""
     return next((r for r in records.values() if r.get('mode') == 'headless'
@@ -106,8 +61,10 @@ def owned_headless(row, records):
 
 
 class SessionProgress:
-    def __init__(self, *, now_ms=lambda: int(time.time() * 1000), proc_root=Path('/proc'), files=file_signature, stop=None, state_path=None):
-        self.now_ms, self.proc_root, self.files, self.stop = now_ms, proc_root, files, stop
+    def __init__(self, *, now_ms=lambda: int(time.time() * 1000), proc_root=Path('/proc'), output=None, stop=None, state_path=None):
+        from .native_progress import NativeTranscriptProgress
+        self.now_ms, self.proc_root, self.stop = now_ms, proc_root, stop
+        self.output = output or NativeTranscriptProgress(proc_root=proc_root)
         self.state_path = Path(state_path) if state_path else None
         self.samples = {}
         if self.state_path:
@@ -121,19 +78,21 @@ class SessionProgress:
                                 and r.get('cleanup') in ('none', 'reaped', 'uncertain')
                                 and all(type(r.get(k)) is bool for k in ('seen_alive', 'attempted', 'orphaned'))):
                             self.samples[(r['id'], r['incarnation'])] = {k: r[k] for k in ('last', 'seen_alive', 'attempted', 'cleanup', 'orphaned')}
+                            if r.get('basis') != 'native_output_v2':
+                                self.samples[(r['id'], r['incarnation'])]['last'] = r['incarnation']
             except (OSError, ValueError, TypeError):
                 pass
 
     def persist(self):
         if self.state_path:
             from . import private_fs
-            rows = [dict(id=sid, incarnation=incarnation, **{k: row[k] for k in ('last', 'seen_alive', 'attempted', 'cleanup', 'orphaned')})
+            rows = [dict(id=sid, incarnation=incarnation, basis='native_output_v2', **{k: row[k] for k in ('last', 'seen_alive', 'attempted', 'cleanup', 'orphaned')})
                     for (sid, incarnation), row in self.samples.items()]
             private_fs.atomic_write(self.state_path, json.dumps(rows).encode(), 512 * 1024)
 
     def sample(self, rows, records=None):
         records = records or {}
-        now, files, live = self.now_ms(), {}, set()
+        now, live = self.now_ms(), set()
         budget = time.monotonic() + 4
         cleanup_attempted = False
         result = {}
@@ -145,23 +104,9 @@ class SessionProgress:
             live.add(key)
             previous = self.samples.get(key, {})
             event = event_ms(row)
-            last = max(previous.get('last', incarnation), event or incarnation)
+            output = self.output(row) if time.monotonic() < budget else None
+            last = max(previous.get('last', incarnation), min(event or incarnation, now), min(output or incarnation, now))
             leader = leader_in_containment(row, process(row.get('workload_pid'), self.proc_root), self.proc_root)
-            terminal = row.get('phase') in ('exited', 'dead', 'pruned', 'forgotten') and row.get('containment_empty') is True
-            cpu = tree_cpu(row.get('workload_pid'), self.proc_root) if isinstance(leader, dict) and not terminal and time.monotonic() < budget else {}
-            prior_cpu = previous.get('cpu', {})
-            # Ignore worker housekeeping and process creation alone. A real
-            # workload must consume >=100ms CPU since its preceding sample.
-            ticks = max(1, int(os.sysconf('SC_CLK_TCK') / 10)) if hasattr(os, 'sysconf') else 10
-            cpu_progress = sum(max(0, value - prior_cpu.get(pid, value)) for pid, value in cpu.items()) >= ticks
-            if cpu_progress:
-                last = now
-            cwd = row.get('cwd') or row.get('workspace')
-            if cwd not in files:
-                files[cwd] = self.files(cwd) if not terminal and time.monotonic() < budget else None
-            signature = files[cwd]
-            if previous.get('files') and signature and previous['files'] != signature:
-                last = now
             owned = owned_headless(row, records)
             # A direct exec/run launch is also reportable without journal
             # ownership, but it can never be automatically stopped here.
@@ -185,8 +130,7 @@ class SessionProgress:
                     cleanup = 'reaped' if self.stop(row) else 'uncertain'
                 except Exception:
                     cleanup = 'uncertain'
-            baseline_cpu = cpu if cpu_progress else {pid: prior_cpu.get(pid, value) for pid, value in cpu.items()}
-            self.samples[key] = {'last': last, 'cpu': baseline_cpu, 'files': signature,
+            self.samples[key] = {'last': last,
                                  'seen_alive': previous.get('seen_alive', False) or (headless and alive is True),
                                  'attempted': previous.get('attempted', False), 'cleanup': cleanup,
                                  'orphaned': orphan or previous.get('orphaned', False)}
@@ -194,6 +138,8 @@ class SessionProgress:
                            'headless': headless, 'agent_alive': alive if headless else None,
                            'orphaned': self.samples[key]['orphaned'], 'cleanup': cleanup}
         self.samples = {k: v for k, v in self.samples.items() if k in live}
+        if hasattr(self.output, 'retain'):
+            self.output.retain(live)
         self.persist()
         return result
 

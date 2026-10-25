@@ -107,13 +107,15 @@ The hub judges liveness from timestamps it already receives. Nothing on a host h
 | Subject | Source | States |
 |---|---|---|
 | Machine | `/api/host/poll` heartbeats (the host agent or `hub fleet-host`) | `online` (≤ 3 min), `stale` (≤ 15 min), `offline`, `never`, `drained` |
-| aplexer session | `PUT /api/fleet/sessions`, including each session's last terminal activity | `working`, `idle`, `stalled` (reported working but no terminal activity for 30 min), `exited`, `unknown` (its machine is silent) |
+| aplexer session | `PUT /api/fleet/sessions`, including native transcript/provider progress | `working`, `idle`, `stalled` (no observed agent progress for 30 min by default, including headless sessions with live heartbeats), `exited`, `unknown` (its machine is silent) |
 | Hub launch | `fleet_launches` | `stuck` (offered/starting > 10 min), `uncertain`, `missing` (interactive session vanished), `working` |
 | Agent outside aplexer | `hub heartbeat --status working --summary "..."` (agent credential with `health:report`) | the reported status, or `stale` after 15 min of silence |
 
 Thresholds are Worker vars: `HUB_MACHINE_STALE_S`, `HUB_MACHINE_OFFLINE_S`, `HUB_AGENT_STALL_S`, `HUB_HEARTBEAT_STALE_S`, `HUB_LAUNCH_STUCK_S`.
 
 One alert opens per subject when it enters `stale`, `offline`, `stalled`, `stuck`, `uncertain` or `missing`, updates in place, and resolves on recovery. New alerts are delivered as hub inbox messages from `hub` to every actor in `HUB_ALERT_TO` (comma-separated) and, if set, POSTed as JSON to the `HUB_ALERT_WEBHOOK` secret. Failed or untargeted deliveries retry every 15 minutes while the alert is open. The dashboard shows open alerts and their delivery status. `GET /api/liveness` returns the same data.
+
+Session progress comes from a bound transcript's write time, an unambiguous Codex rollout matching the native launch and cwd, OpenCode message events for the exact native launch, or provider state-event timestamps. Terminal chatter, polling, heartbeats, workload CPU and shared workspace edits do not refresh it. Missing or ambiguous sources never fabricate progress; the native creation time is the initial baseline. The host keeps transcript paths and content local and uploads only the bounded progress timestamp and existing liveness fields. An upgrade discards timestamps from the former CPU/file/terminal sampler while preserving cleanup deduplication. The server uses this progress timestamp even when a legacy terminal timestamp is newer; older hosts without a progress report retain their legacy fallback until upgraded. Stalls preserve the running lifecycle and capacity, report `stall_reason`, and require the existing sustained recovery interval before clearing.
 
 ## Scheduled checks
 

@@ -1791,7 +1791,9 @@ class Dispatcher:
         raw = self.runner([self.settings.get("aplexer_bin", "aplexer"), "list", "--all", "--json"])
         from .session_progress import SessionProgress, stop_orphan
         if not hasattr(self, '_session_progress'):
+            from .native_progress import NativeTranscriptProgress
             self._session_progress = SessionProgress(stop=lambda row: stop_orphan(self.settings.get('aplexer_bin', 'aplexer'), row),
+                output=NativeTranscriptProgress(opencode_data=self.settings.get('opencode_auth', {}).get('target_data')),
                 state_path=Path(self.journal_dir) / 'session-progress.json' if self.journal_dir else None)
         rows = raw if isinstance(raw, list) else raw.get('sessions', [])
         progress = self._session_progress.sample(rows, self._active_launches)

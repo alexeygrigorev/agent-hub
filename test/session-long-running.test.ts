@@ -32,7 +32,7 @@ describe('CLI long-running warning projection and durable snooze', () => {
   it('uses strict thresholds, native creation and output activity, excludes terminal sessions', async () => {
     await fixture(async (s, sql, clock) => {
       let view = await json(s, '/' + id);
-      expect(view).toMatchObject({ long_running: false, runtime: 10800, idle_for: 3600, activity_state: 'active', intake_id: 'test-intake' });
+      expect(view).toMatchObject({ long_running: false, runtime: 10800, idle_for: 3600, activity_state: 'idle', intake_id: 'test-intake' });
       clock.now += 1;
       view = await json(s, '/' + id);
       expect(view).toMatchObject({ long_running: true, activity_state: 'idle', warning_active: true });

@@ -34,6 +34,25 @@ async function view(s: SessionControlService, path = '/' + id) {
 function native(sql: any) { return sql.exec('SELECT * FROM fleet_sessions').toArray()[0]; }
 
 describe('stalled running sessions', () => {
+  it('stalls while heartbeats and terminal activity continue but the agent rollout is frozen', async () => fixture(async (s, live, sql, clock) => {
+    const fleet = new FleetService(sql, cb => cb(), () => clock.now); fleet.init();
+    const progressAt = new Date(start - 4.5 * 3600000).toISOString();
+    for (let i = 0; i < 3; i++) {
+      clock.now += 60000;
+      const at = new Date(clock.now).toISOString();
+      sql.exec('UPDATE machines SET last_checkin_at = ?', at);
+      const response = await fleet.handle(new Request('https://hub.test/api/fleet/sessions', { method: 'PUT', body: JSON.stringify({ sessions: [{
+        native_id: id, tag: 'test', workspace: '/test', engine: 'codex', phase: 'running', agent_state: 'working', profile: null, account: null,
+        created_at_ms: start - 11000000, last_activity_at: at,
+        progress: { last_progress_at: progressAt, headless: true, agent_alive: true, orphaned: false, cleanup: 'none' },
+      }] }) }), { caller: { machineId: 'test-host', kind: 'host', actor: 'machine:test-host' }, scopes: ['host'] });
+      expect(response.status).toBe(200);
+      expect(await view(s)).toMatchObject({ state: 'stalled', stalled: true, lifecycle_state: 'running', activity_state: 'idle', stall_reason: 'no_native_progress' });
+      expect((await view(s)).idle_for).toBeGreaterThan(1800);
+      expect(live.evaluate().subjects.find(x => x.kind === 'session')?.state).toBe('stalled');
+    }
+    expect(sql.exec('SELECT * FROM session_control_commands').toArray()).toEqual([]);
+  }));
   it('round trips bounded host progress and rejects arbitrary process or file payloads', async () => fixture(async (s, live, sql, clock) => {
     const fleet = new FleetService(sql, cb => cb(), () => clock.now); fleet.init();
     const row = { native_id: id, tag: 'test', workspace: '/test', engine: 'codex', phase: 'running', agent_state: 'idle', profile: null, account: null,
@@ -96,7 +115,7 @@ describe('stalled running sessions', () => {
     expect(live.reconcileAlerts(live.evaluate().subjects)).toHaveLength(0);
   }));
 
-  it('uses latest CPU/file/output progress, ignores stale observations and resets on new incarnation or proven exit', async () => fixture(async (s, live, sql, clock) => {
+  it('uses authoritative agent progress, ignores stale observations and resets on new incarnation or proven exit', async () => fixture(async (s, live, sql, clock) => {
     sql.exec('UPDATE fleet_sessions SET progress_json = ?', JSON.stringify({ last_progress_at: new Date(start).toISOString() }));
     clock.now += 1;
     expect((await view(s)).state).toBe('running');

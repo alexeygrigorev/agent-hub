@@ -26,9 +26,12 @@ export function stallThreshold(env?: any): number {
 export function nativeProgress(native: any): number | null {
   let progress: any = null;
   try { progress = JSON.parse(native?.progress_json ?? 'null'); } catch { /* unknown */ }
-  const times = [native?.last_activity_at, progress?.last_progress_at]
-    .map(x => typeof x === 'string' ? Date.parse(x) : NaN).filter(Number.isFinite);
-  if (times.length) return Math.max(...times);
+  // The host's progress observation is authoritative. PTY output can be
+  // housekeeping, retries or hook chatter long after the agent stopped.
+  // Retain the legacy fallback only for hosts without a progress sampler.
+  const at = progress ? progress.last_progress_at : native?.last_activity_at;
+  const time = typeof at === 'string' ? Date.parse(at) : NaN;
+  if (Number.isFinite(time)) return time;
   return Number.isFinite(native?.created_at_ms) ? native.created_at_ms : null;
 }
 
