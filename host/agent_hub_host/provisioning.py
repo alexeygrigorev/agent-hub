@@ -540,6 +540,8 @@ def validate(bundle):
         raise ValueError('Invalid managed bundle')
     if bundle['provider'] == 'gemini' and (bundle.get('auth_method') != 'machine-login' or any(re.search('oauth|credential|token', k, re.I) for k in bundle.get('files', {})) or bundle.get('env')):
         raise ValueError('Gemini uses native per-machine login')
+    if bundle['provider'] == 'go' and (bundle.get('files') or bundle.get('env')):
+        raise ValueError('OpenCode uses native device login; credential bundles are unsupported')
     if not isinstance(bundle.get('version'), str) or not re.fullmatch(r'\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?', bundle['version']):
         raise ValueError('Invalid managed version')
     if not isinstance(bundle.get('files'), dict) or len(bundle['files']) > 24 or not isinstance(bundle.get('env'), dict):
@@ -1132,6 +1134,15 @@ def engine_environment(bundle, home, dest=None):
         if runtime:
             env['ZCODE_CJS'] = str(runtime)
     env.update(bundle.get('env') or {})
+    if bundle.get('provider') == 'go':
+        from .fleet import load_settings
+        from .opencode_auth import environment, prepare
+        inherited = os.environ.get('AGENT_HUB_OPENCODE_AUTH')
+        cfg = json.loads(inherited) if inherited else load_settings().get('opencode_auth')
+        if not cfg:
+            raise ValueError('engine_auth_expired: OpenCode device login configuration required')
+        prepare(cfg)
+        env = environment(cfg, base=env)
     git_ident = load_git_identity()
     name = git_ident.get('user.name') or git_ident.get('name')
     email = git_ident.get('user.email') or git_ident.get('email')
@@ -1456,7 +1467,7 @@ def command(args):
     if args.file:
         bundle = json.loads(private_fs.read_bytes(Path(args.file).expanduser().absolute(), 32768))
     else:
-        if not args.label or not LABEL.fullmatch(args.label) or (args.provider != 'gemini' and not (args.auth_file or getattr(args, 'token_file', None))):
+        if not args.label or not LABEL.fullmatch(args.label) or (args.provider not in ('gemini', 'go') and not (args.auth_file or getattr(args, 'token_file', None))):
             raise ValueError('Native import requires label and auth-file')
         paths = {'codex': ('.codex/auth.json', '.codex/config.toml', '0.163.0'),
                  'claude': ('.claude/.credentials.json', '.claude/settings.json', '2.1.304'),
@@ -1465,7 +1476,11 @@ def command(args):
                  'zai': ('.zcode/v2/credentials.json', '.zcodex/config.toml', '0.155.1')}
         auth_path, config_path, version = paths[args.provider]
         env = {}
-        if args.provider == 'gemini':
+        if args.provider == 'go':
+            if args.auth_file or getattr(args, 'token_file', None) or args.config_file:
+                raise ValueError('OpenCode uses host-local device login; do not import API keys or credential files')
+            files = {}
+        elif args.provider == 'gemini':
             if args.auth_file or getattr(args, 'token_file', None):
                 raise ValueError('Gemini credentials stay local; request native login in Hub')
             files = {}
@@ -1527,11 +1542,6 @@ def command(args):
             if getattr(args, 'token_file', None) or not args.auth_file:
                 raise ValueError('Native import requires auth-file')
             files = {auth_path: private_fs.read_bytes(Path(args.auth_file).expanduser().absolute(), 16000).decode()}
-            if args.provider == 'go':
-                native_auth = json.loads(files[auth_path])
-                if not isinstance(native_auth, dict) or 'opencode-go' not in native_auth:
-                    raise ValueError('Native file has no OpenCode Go credential')
-                files[auth_path] = json.dumps({'opencode-go': native_auth['opencode-go']})
         if args.config_file:
             files[config_path] = private_fs.read_bytes(Path(args.config_file).expanduser().absolute(), 16000).decode()
         elif args.provider == 'codex':
@@ -1541,7 +1551,9 @@ def command(args):
                   'env': env, 'args': default_args}
     if not isinstance(bundle, dict) or not LABEL.fullmatch(bundle.get('label', '')):
         raise ValueError('Invalid managed bundle')
-    if not args.file and args.provider == 'gemini':
+    if bundle.get('provider') == 'go' and (bundle.get('files') or bundle.get('env')):
+        raise ValueError('OpenCode uses host-local device login; credential bundles are unsupported')
+    if not args.file and args.provider in ('gemini', 'go'):
         bundle['auth_method'] = 'machine-login'
     return bus._do_request('PUT', '/api/engines/' + bundle['label'], bundle)
 

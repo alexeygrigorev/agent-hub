@@ -311,11 +311,18 @@ class TestWindowsProvisioningPortability(unittest.TestCase):
             p.write_json(Path(tmp) / 'state.json', state)
 
             executed_argv = []
+            executed_env = []
             def fake_execve(cmd, argv, env):
                 executed_argv.append(list(argv))
+                executed_env.append(dict(env))
+
+            device_cfg = dict(binary='/usr/bin/opencode', source_data=str(Path(tmp) / 'native'),
+                              source_config=str(Path(tmp) / 'config'), target_data=str(Path(tmp) / 'runtime'))
 
             with patch.dict(os.environ, {'AGENT_HUB_MANAGED_DIR': str(tmp)}), \
                  patch('agent_hub_host.provisioning.engine_argv', return_value=['/usr/bin/opencode']), \
+                 patch('agent_hub_host.fleet.load_settings', return_value={'opencode_auth': device_cfg}), \
+                 patch('agent_hub_host.opencode_auth.prepare', return_value={'status': 'ok'}), \
                  patch('os.execve', side_effect=fake_execve):
                 # 1. Standard task run
                 with patch('sys.argv', ['provisioning', 'managed-go', 'run', '--standalone', '--auto', 'my task goal']):
@@ -324,6 +331,8 @@ class TestWindowsProvisioningPortability(unittest.TestCase):
                     '/usr/bin/opencode', 'run', '--model', 'opencode-go/muse-spark-1.3-contributor',
                     '--standalone', '--auto', 'my task goal'
                 ])
+                self.assertEqual(executed_env[-1]['OPENCODE_DB'], str(Path(tmp) / 'runtime/opencode/opencode.db'))
+                self.assertNotIn('OPENCODE_API_KEY', executed_env[-1])
 
                 # 2. Matching model argument should not duplicate
                 with patch('sys.argv', ['provisioning', 'managed-go', 'run', '--standalone', '--model', 'opencode-go/muse-spark-1.3-contributor', 'goal']):

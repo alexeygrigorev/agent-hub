@@ -1221,6 +1221,18 @@ export class FleetService {
             this.sql.exec("UPDATE fleet_engine_health SET status = 'ok', updated_at = ? WHERE engine = ? AND machine_id = ? AND reason = 'admission_unconfigured'", nowIso, data.engine, targetMachine);
             return response({ status: 'configuration_probed', engine: data.engine, machine_id: targetMachine });
           }
+          if (data.reason === 'device_auth_verified') {
+            if (!targetMachine || data.engine !== 'opencode') return response({ error: 'machine_required' }, 400);
+            this.sql.exec("UPDATE fleet_engine_health SET status = 'ok', updated_at = ? WHERE engine = ? AND machine_id = ? AND reason = 'engine_auth_expired'", nowIso, data.engine, targetMachine);
+            const remaining: any = this.sql.exec("SELECT COUNT(*) as count FROM fleet_engine_health WHERE engine = ? AND status = 'unavailable'", data.engine).one();
+            if (remaining.count === 0) {
+              this.sql.exec('DELETE FROM operator_notices WHERE engine = ?', data.engine);
+              if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'liveness_alerts'").toArray().length) {
+                this.sql.exec("UPDATE liveness_alerts SET resolved_at = ? WHERE resolved_at IS NULL AND subject_kind = 'engine_auth_expired' AND subject = ?", nowIso, data.engine);
+              }
+            }
+            return response({ status: 'device_auth_probed', engine: data.engine, machine_id: targetMachine });
+          }
           if (targetMachine) {
             this.sql.exec("UPDATE fleet_engine_health SET status = 'ok', updated_at = ? WHERE engine = ? AND machine_id = ?", nowIso, data.engine, targetMachine);
           } else {
@@ -1255,13 +1267,16 @@ export class FleetService {
         const row: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id = ? AND machine_id = ?', match[1], caller.machineId!).toArray()[0];
         if (!row) return response({ error: 'not_found' }, 404);
         if (match[2] === 'reject') {
-          if (!object(data, ['reason']) || !['workspace_unavailable', 'model_unsupported', 'admission_unconfigured', 'admission_refused', 'dispatch_refused'].includes(data.reason)) return response({ error: 'invalid_rejection' }, 400);
+          if (!object(data, ['reason']) || !['workspace_unavailable', 'model_unsupported', 'admission_unconfigured', 'admission_refused', 'dispatch_refused', 'engine_auth_expired'].includes(data.reason)) return response({ error: 'invalid_rejection' }, 400);
           // Only an unclaimed offer proves that no start was authorized. The
           // transaction fences a racing claim; never reject possibly-live work.
           if (row.state !== 'offered' || row.native_id || row.launcher_task_id) return response({ error: 'already_claimed' }, 409);
           if (this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) return response({ error: 'task_report_required' }, 409);
           const at = new Date(this.now()).toISOString();
-          if (data.reason === 'model_unsupported') {
+          if (data.reason === 'model_unsupported' || data.reason === 'engine_auth_expired') {
+            if (data.reason === 'engine_auth_expired') {
+              this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at) VALUES (?, ?, 'unavailable', ?, ?)", row.engine, row.machine_id, data.reason, at);
+            }
             // The fenced pre-claim refusal proves no native start. Retain the
             // failed attempt as route evidence and use a new launcher identity.
             const id = crypto.randomUUID();
@@ -1372,7 +1387,9 @@ export class FleetService {
           const noticeKey = 'engine_auth_expired:' + row.engine;
           const existingNotice = this.sql.exec("SELECT notice_key FROM operator_notices WHERE notice_key = ?", noticeKey).toArray()[0];
           if (!existingNotice) {
-            const noticeMsg = `Operator notice: API key for engine '${row.engine}' has expired and must be renewed by Alexey in OpenCode Console / provider settings. Developer cannot renew this key.`;
+            const noticeMsg = row.engine === 'opencode'
+              ? 'OpenCode device login is unavailable. Run opencode auth login opencode --method device on the affected host, then verify a launch. No API key is required.'
+              : `Authentication for engine '${row.engine}' is unavailable. Renew its native provider login and verify a launch.`;
             this.sql.exec("INSERT INTO operator_notices (notice_key, engine, message, created_at) VALUES (?, ?, ?, ?)", noticeKey, row.engine, noticeMsg, new Date(this.now()).toISOString());
             try {
               if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'liveness_alerts'").toArray().length) {

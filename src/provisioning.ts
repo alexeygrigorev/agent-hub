@@ -20,6 +20,7 @@ export function validBundle(v: any): boolean {
   if (!object(v) || Object.keys(v).some(k => !['label', 'provider', 'version', 'files', 'env', 'args', 'auth_method'].includes(k)) || !LABEL.test(v.label) || !Object.hasOwn(PACKAGES, v.provider) || typeof v.version !== 'string' || !/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?$/.test(v.version)) return false;
   if (v.provider === 'gemini' && (v.auth_method !== 'machine-login' || Object.keys(v.files || {}).some(k => /oauth|credential|token/i.test(k)) || Object.keys(v.env || {}).length)) return false;
   if (!object(v.files) || Object.keys(v.files).length > 24 || !object(v.env) || Object.keys(v.env).length > 12) return false;
+  if (v.provider === 'go' && (Object.keys(v.files).length || Object.keys(v.env).length)) return false;
   for (const [path, value] of Object.entries(v.files)) {
     if (path.length > 200 || !path.split('/').every(p => /^[A-Za-z0-9_.-]+$/.test(p) && p !== '.' && p !== '..') || typeof value !== 'string' || value.length > 16000) return false;
   }

@@ -256,16 +256,22 @@ def test_default_machine_settings_need_no_account_configuration(tmp_path, monkey
     assert settings['subscriptions'] == []
 
 
-def test_go_import_does_not_copy_other_provider_accounts(tmp_path):
+def test_go_import_refuses_legacy_credentials_and_uses_machine_login(tmp_path):
     from types import SimpleNamespace
     d=tmp_path/'private';d.mkdir(mode=0o700)
     auth=d/'auth.json';auth.write_text(json.dumps({'opencode-go':{'type':'api','key':'go-private'},'unrelated':{'key':'must-not-copy'}}));auth.chmod(0o600)
     args=SimpleNamespace(engines_cmd='add',file=None,provider='go',label='my-go',auth_file=str(auth),token_file=None,config_file=None,version=None)
     with patch.object(p.bus,'_do_request',return_value={'status':'configured'}) as request:
+        with pytest.raises(ValueError, match='device login'):
+            p.command(args)
+        request.assert_not_called()
+        args.auth_file = None
         p.command(args)
     payload=request.call_args.args[2]
     assert 'must-not-copy' not in json.dumps(payload)
     assert payload['args'] == ['--model','opencode-go/muse-spark-1.3-contributor']
+    assert payload['files'] == {} and payload['env'] == {}
+    assert payload['auth_method'] == 'machine-login'
 
 
 def test_go_host_and_server_accept_same_diagnostic_arguments():

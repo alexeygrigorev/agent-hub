@@ -211,7 +211,7 @@ describe('engine_auth_expired handling and routing recovery', () => {
       expect(notices.length).toBe(1);
       expect(notices[0].engine).toBe('opencode');
       expect(notices[0].message).toContain('OpenCode');
-      expect(notices[0].message).toContain('expired');
+      expect(notices[0].message).toContain('opencode auth login opencode --method device');
 
       // Posting again should replay cleanly and not create duplicate operator notices
       const res2 = await fleet.handle(
@@ -764,7 +764,7 @@ describe('engine_auth_expired handling and routing recovery', () => {
       const openAlerts = sql.exec("SELECT * FROM liveness_alerts WHERE subject_kind = 'engine_auth_expired' AND subject = 'opencode' AND resolved_at IS NULL").toArray() as any[];
       expect(openAlerts.length).toBe(1);
       expect(openAlerts[0].state).toBe('failing');
-      expect(openAlerts[0].detail).toContain("API key for engine 'opencode' has expired");
+      expect(openAlerts[0].detail).toContain('opencode auth login opencode --method device');
 
       // Now probe succeeds
       const probeRes = await fleet.handle(
@@ -850,5 +850,49 @@ describe('headless permission refusal recovery', () => {
     const shown = await sessions.handle(new Request('https://hub.test/api/sessions/22222222-2222-4222-8222-222222222222'),admin);
     expect(shown.status).toBe(200);
     expect(await shown.json()).toMatchObject({state:'failed', lifecycle_state:'uncertain', cleanup_pending:true, reason:diagnostic.reason});
+  }));
+});
+
+
+describe('device auth preflight rejection', () => {
+  it('fences an unstarted auth failure, holds the route and places same-tier work elsewhere', async () => fixture(async (fleet, _routing, sql) => {
+    sql.exec("UPDATE fleet_accounts SET enabled=0 WHERE provider='zai'");
+    const launch = fleet.reserve({workspace:'demo', tier:'daily', mode:'headless', prompt:'device auth smoke', idempotency_key:'preflight-auth'}, admin);
+    expect(launch.status).toBe(201); expect(launch.value.engine).toBe('opencode');
+    sql.exec("UPDATE fleet_accounts SET enabled=1 WHERE provider='zai'");
+    const res = await fleet.handle(request(`/launches/${launch.value.id}/reject`, {reason:'engine_auth_expired'}), host('hetzner'));
+    expect(res.status).toBe(200);
+    const data:any = await res.json();
+    expect(data.rejected).toContainEqual(expect.objectContaining({engine:'opencode',reason:'engine_auth_expired'}));
+    const retry = sql.exec('SELECT * FROM fleet_launches WHERE id=?',data.id).one();
+    expect(retry.engine).toBe('codex'); expect(retry.mode).toBe('headless');
+    expect(JSON.parse(retry.request_json).tier).toBe('daily');
+    expect(sql.exec('SELECT verification_status FROM fleet_launches WHERE id=?',launch.value.id).one().verification_status).toBe('not_started');
+    expect(sql.exec("SELECT reason FROM fleet_engine_health WHERE engine='opencode'").one().reason).toBe('engine_auth_expired');
+    // Replaying an old refusal cannot retire a later claim or create extra launches.
+    expect((await fleet.handle(request(`/launches/${launch.value.id}/reject`,{reason:'engine_auth_expired'}),host('hetzner'))).status).toBe(409);
+  }));
+  it('retains an explicit engine request with an auth rejection when alternatives are disallowed', async () => fixture(async (fleet,_routing,sql) => {
+    const launch = fleet.reserve({workspace:'demo',engine:'opencode',tier:'daily',mode:'headless',prompt:'explicit',idempotency_key:'preflight-explicit'},admin);
+    const res = await fleet.handle(request(`/launches/${launch.value.id}/reject`,{reason:'engine_auth_expired'}),host('hetzner'));
+    const data:any = await res.json();
+    expect(res.status).toBe(200); expect(data.state).toBe('queued');
+    expect(data.rejected).toContainEqual(expect.objectContaining({reason:'engine_auth_expired'}));
+    expect(sql.exec('SELECT native_id FROM fleet_launches WHERE id=?',data.id).one().native_id).toBeNull();
+  }));
+});
+
+
+describe('device recovery proof boundaries', () => {
+  it('clears its auth notice after all auth holds recover but preserves unrelated tool holds', async () => fixture(async (fleet,_routing,sql) => {
+    sql.exec("INSERT INTO fleet_engine_health (engine,machine_id,status,reason,updated_at) VALUES ('opencode','hetzner','unavailable','engine_auth_expired',?)",iso());
+    sql.exec("INSERT INTO operator_notices (notice_key,engine,message,created_at) VALUES ('engine_auth_expired:opencode','opencode','device login unavailable',?)",iso());
+    const probe = () => fleet.handle(request('/probe',{engine:'opencode',status:'ok',reason:'device_auth_verified'}),host('hetzner'));
+    expect((await probe()).status).toBe(200);
+    expect(sql.exec("SELECT status FROM fleet_engine_health WHERE engine='opencode'").one().status).toBe('ok');
+    expect(sql.exec("SELECT * FROM operator_notices WHERE engine='opencode'").toArray()).toHaveLength(0);
+    sql.exec("UPDATE fleet_engine_health SET status='unavailable',reason='engine_tool_permission_refused' WHERE engine='opencode'");
+    await probe();
+    expect(sql.exec("SELECT status FROM fleet_engine_health WHERE engine='opencode'").one().status).toBe('unavailable');
   }));
 });

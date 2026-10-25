@@ -236,8 +236,11 @@ def load_settings(path=None):
         if path.stat().st_size > 65536:
             raise ValueError("Subscription configuration exceeds 64 KiB")
         data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "workspace_roots", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv", "role_consumer", "role_config", "journal_dir", "git", "git_identity"} or data.get("version") != 1:
+    if not isinstance(data, dict) or set(data) - {"version", "subscriptions", "workspaces", "workspace_roots", "launcher", "aplexer_bin", "capabilities", "max_agents", "cleanup_roots", "native_start_argv", "role_consumer", "role_config", "journal_dir", "git", "git_identity", "opencode_auth"} or data.get("version") != 1:
         raise ValueError("Invalid subscription configuration")
+    if 'opencode_auth' in data:
+        from .opencode_auth import validate
+        validate(data['opencode_auth'])
     git_conf = data.get("git") if "git" in data else data.get("git_identity")
     if git_conf is not None:
         validate_git_identity_config(git_conf)
@@ -1357,6 +1360,10 @@ class Dispatcher:
         if offer.get('with_goal') and offer.get('mode') != 'interactive':
             raise ValueError('Goal work is interactive only')
         sub = self._route(offer)
+        device_auth = self.settings.get('opencode_auth') if sub.get('launcher_provider') == 'opencode' else None
+        if device_auth:
+            from .opencode_auth import prepare
+            prepare(device_auth)  # Before quota timestamp, task submission and claim.
         selection = offer.get('selection')
         if offer.get('task_id'):
             if not isinstance(offer.get('needs'), list) or not set(offer['needs']).issubset(self.settings.get('capabilities', [])):
@@ -1458,6 +1465,9 @@ class Dispatcher:
                 raise ValueError(f"Launcher provider {sub.get('launcher_provider')!r} is not supported for headless execution")
             # Only the maintained launcher may run models. argv is a trusted machine-local CLI prefix.
             prefix = launcher["argv"] + ["--config-dir", launcher["config_dir"]]
+            if device_auth:
+                from .opencode_auth import launch_argv
+                prefix = launch_argv(device_auth, prefix)
             task_id = "hub-" + offer_id
             goal = offer["prompt"] + "\nContainer hygiene: use docker run --rm for throwaway/test containers; label every test container agent.session=<your Hub session id, or native session id registered in Hub>. Install trap/finally cleanup before creation and clean up all resources you create before session exit, including failed starts and docker create/compose tests. Preserve other sessions and Coolify containers."
             curr = workspace
@@ -1532,6 +1542,9 @@ class Dispatcher:
             cwd = launcher["root"]
         else:
             raise ValueError("Unsupported launch mode")
+        if device_auth and mode == 'interactive':
+            from .opencode_auth import launch_argv
+            argv = launch_argv(device_auth, argv)
         path = "/api/fleet/launches/" + offer_id
         # An uncertain response here leaves the server reservation intact and performs no native effect.
         self.request("POST", path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": sub["account_label"], **({"model": selection["model"]} if selection else {})})
@@ -1865,6 +1878,20 @@ class Dispatcher:
                 self.request('POST', '/api/fleet/probe', {'engine': engine, 'status': 'ok', 'reason': 'admission_configured'})
             except Exception:
                 pass  # A failed projection never replaces dispatch admission.
+        if self.settings.get('opencode_auth'):
+            from .opencode_auth import prepare, AuthBusy
+            try:
+                prepare(self.settings['opencode_auth'])
+                auth_health = {'engine': 'opencode', 'status': 'ok', 'reason': 'device_auth_verified'}
+            except AuthBusy:
+                auth_health = None
+            except ValueError:
+                auth_health = {'engine': 'opencode', 'status': 'unavailable', 'reason': 'engine_auth_expired'}
+            try:
+                if auth_health:
+                    self.request('POST', '/api/fleet/probe', auth_health)
+            except Exception:
+                pass  # dispatch repeats the check before allowing any claim.
         self.request("PUT", "/api/fleet/subscriptions", {"subscriptions": collect_subscriptions(self.settings, self.runner)})
         raw = self.report_catalog_bindings()
         # Native work-claim bridge (Phase 1): mirror redacted local `a work`
@@ -1922,6 +1949,10 @@ class Dispatcher:
                         results.append({'id': offer.get('id'), 'state': 'binding_pending',
                                         'error': type(exc).__name__[:64]})
             except Exception as exc:
+                from .opencode_auth import AuthBusy
+                if isinstance(exc, AuthBusy):
+                    results.append({'id': offer.get('id'), 'state': 'held', 'reason': 'engine_auth_busy'})
+                    continue  # No claim/effect; preserve offer for the next poll.
                 # Persist only a bounded slug, never exception text (which may
                 # contain goals, paths or credentials). The server atomically
                 # rejects only unclaimed offers: a lost claim response or a
@@ -1929,7 +1960,7 @@ class Dispatcher:
                 reason = 'dispatch_refused'
                 if isinstance(exc, ValueError):
                     prefix = str(exc).split(':', 1)[0]
-                    if prefix in {'model_unsupported', 'admission_unconfigured'}:
+                    if prefix in {'model_unsupported', 'admission_unconfigured', 'engine_auth_expired'}:
                         reason = prefix
                     elif str(exc) in {'Fresh admission refused', 'Fresh admission timestamp required',
                                       'Selected model/effort requires verified admission'}:
