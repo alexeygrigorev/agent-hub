@@ -290,13 +290,20 @@ See [NATIVE-SESSIONS.md](NATIVE-SESSIONS.md) for adoption and lifecycle details.
    (`native_id` = bound native session UUID, never an envelope id).    Only
    the live claim holder may ack; an ack after lease expiry marks the command
    `uncertain` (the effect may have happened) and is rejected with
-   `claim_expired` — never marked delivered, never reissued — EXCEPT a send
-   carrying a valid delivered proof on the SAME live claim, which reconciles
-   through `lateReplyAck` whether the row is already `uncertain` or still
-   `claimed` with an elapsed lease: the verdict never depends on offers-sweep
-   ordering (409s stay classified by code + command/attempt/proof: same-
-   command lost-response idempotency converges, `proof_replayed` for another
-   command is terminal and kept as a durable human-obligation fact).
+   `claim_expired` — never marked delivered, never reissued — EXCEPT:
+   (a) a send carrying a valid delivered proof on the SAME live claim, which
+   reconciles through `lateReplyAck` whether the row is already `uncertain`
+   or still `claimed` with an elapsed lease: the verdict never depends on
+   offers-sweep ordering (409s stay classified by code + command/attempt/
+   proof: same-command lost-response idempotency converges, `proof_replayed`
+   for another command is terminal and kept as a durable human-obligation
+   fact); (b) a fenced terminal failure receipt on the SAME claim +
+   correlation (`failed`/`recipient_not_ready` on positive cancellation
+   proof, else `uncertain` with an inbox reason), which is accepted as
+   terminal `failed`/`uncertain` instead of burning another lease. Accepted
+   outcomes are `delivered` | `transported` | `refused` | `uncertain` |
+   `failed` (`failed` maps to state `failed`; `send_unsupported_headless`
+   refusals also map to `failed`).
    A SEND whose recipient reply has not arrived yet is NOT acked at all on
    the first cycle: the host journals the durable attempt with the original
    native envelope id and reconciles read-only (same claim token, no second
@@ -316,6 +323,38 @@ See [NATIVE-SESSIONS.md](NATIVE-SESSIONS.md) for adoption and lifecycle details.
    most one command. Anything else on a finished row keeps the terminal
    errors. A terminal server verdict (HTTP 409) on re-submit closes the
    journal as `uncertain` without a new effect.
+
+### Send readiness, inbox waiting, and expired claims
+
+- Pre-send readiness (AC4): `POST /api/sessions/:id/send` checks
+  `fleet_sessions` for the bound target. A target counts as recently
+  reported only with a non-empty `agent_state` AND a fresh `observed_at`
+  (within 5 minutes, not in the future). Otherwise the send is queued with
+  warning `target_no_reported_state`; with `require_ready: true`
+  (`--require-ready` / `--refuse-if-unready`) it is refused with HTTP 409
+  `target_not_ready`. Stale state never silently passes as ready.
+- Inbox waiting (AC5): a send whose recipient reply has not arrived is
+  journaled as pending with NO terminal ack. Under the live claim fence the
+  host POSTs `POST /api/session-commands/:id/status` with
+  `status: "waiting in inbox for recipient"` + host reason. `GET
+  /api/sessions/:id/commands` projects that `host_status` instead of
+  `claimed`, and `hub sessions commands` / `send --wait` print
+  `waiting in inbox for recipient: <reason>`. The command stays claimed
+  under its lease while bounded read-only reconciliation watches for the
+  delayed reply; no second send is ever issued.
+- Expired claims (AC3): if the lease burns while the envelope is still
+  undelivered in the aplexer inbox (host posted the pending status), the
+  server marks the command `failed` with `recipient_not_ready` and never
+  re-queues it — no blind re-queue, no duplicates. Unclaimed commands, or
+  commands with no stored inbox effect, remain eligible for bounded custody
+  retry (same fence, max 3 leases). Host-side, the controller `message ack`
+  does NOT prove cancellation (it advances a consumer cursor; no
+  original-sender cancel exists in the published aplexer CLI). The host
+  verifies removal via the message log and reports `failed` /
+  `recipient_not_ready` only on positive proof (retract ok + log fetch ok +
+  envelope absent); otherwise it reports `uncertain` with an explicit
+  `recipient_not_ready_uncertain` reason and never re-sends. The server
+  accepts that fenced terminal receipt on the same claim + correlation.
 
 ### Binding reconciliation (Fleet-canonical)
 

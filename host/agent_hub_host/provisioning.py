@@ -138,114 +138,118 @@ def install_aplexer_state_hooks(bundle=None, home=None):
 
     Ensures .codex/hooks.json (and .zcodex/hooks.json for zai) exists with
     aplexer state-report working/idle hooks, matching ~/.codex/hooks.json.
-    Re-applies idempotently on re-bootstrap.
+    Installed for EVERY managed engine home (Codex at least) and re-applied
+    idempotently on re-bootstrap, so interactive managed sessions report
+    idle/waiting and Hub sends can be delivered from the aplexer inbox.
     """
     if home is None:
         return
     home = Path(home)
     provider = bundle.get('provider') if isinstance(bundle, dict) else None
 
-    # Codex / ZCodex state hooks: ensure .codex/hooks.json exists with the state-report hooks
-    if provider in ('codex', 'zai') or provider is None:
-        codex_home = home / '.codex'
-        codex_hooks = codex_home / 'hooks.json'
+    # State hooks for every managed home: .codex/hooks.json always, plus
+    # .zcodex/hooks.json for zai. Other providers (claude/gemini/go) still
+    # get .codex/hooks.json so any Codex-family interactive session in that
+    # home reports state; installing it is harmless when unused.
+    codex_home = home / '.codex'
+    codex_hooks = codex_home / 'hooks.json'
 
-        template_hooks = None
-        user_codex_hooks = Path.home() / '.codex/hooks.json'
-        if user_codex_hooks.is_file():
-            try:
-                template_hooks = json.loads(user_codex_hooks.read_text(encoding='utf-8'))
-            except Exception:
-                template_hooks = None
+    template_hooks = None
+    user_codex_hooks = Path.home() / '.codex/hooks.json'
+    if user_codex_hooks.is_file():
+        try:
+            template_hooks = json.loads(user_codex_hooks.read_text(encoding='utf-8'))
+        except Exception:
+            template_hooks = None
 
-        if not template_hooks or not isinstance(template_hooks, dict) or 'hooks' not in template_hooks:
-            a_cmd = shutil.which('a') or str(Path.home() / '.local/bin/a')
-            aplexer_cmd = shutil.which('aplexer') or str(Path.home() / '.local/bin/aplexer')
-            template_hooks = {
-                "hooks": {
-                    "PostToolUse": [
-                        {
-                            "hooks": [
-                                {
-                                    "command": f"{aplexer_cmd} context hook --engine codex 2>/dev/null || true # aplexer-managed-awareness-hook-v1",
-                                    "timeout": 30,
-                                    "type": "command"
-                                }
-                            ]
-                        }
-                    ],
-                    "SessionStart": [
-                        {
-                            "hooks": [
-                                {
-                                    "command": f"{a_cmd} state-report working || true",
-                                    "type": "command"
-                                }
-                            ]
-                        },
-                        {
-                            "hooks": [
-                                {
-                                    "command": f"{aplexer_cmd} context hook --engine codex 2>/dev/null || true # aplexer-managed-awareness-hook-v1",
-                                    "timeout": 30,
-                                    "type": "command"
-                                }
-                            ]
-                        }
-                    ],
-                    "Stop": [
-                        {
-                            "hooks": [
-                                {
-                                    "command": f"{a_cmd} state-report idle || true",
-                                    "type": "command"
-                                }
-                            ]
-                        }
-                    ],
-                    "UserPromptSubmit": [
-                        {
-                            "hooks": [
-                                {
-                                    "command": f"{a_cmd} state-report working || true",
-                                    "type": "command"
-                                }
-                            ]
-                        },
-                        {
-                            "hooks": [
-                                {
-                                    "command": f"{aplexer_cmd} context hook --engine codex 2>/dev/null || true # aplexer-managed-awareness-hook-v1",
-                                    "timeout": 30,
-                                    "type": "command"
-                                }
-                            ]
-                        }
-                    ]
-                }
+    if not template_hooks or not isinstance(template_hooks, dict) or 'hooks' not in template_hooks:
+        a_cmd = shutil.which('a') or str(Path.home() / '.local/bin/a')
+        aplexer_cmd = shutil.which('aplexer') or str(Path.home() / '.local/bin/aplexer')
+        template_hooks = {
+            "hooks": {
+                "PostToolUse": [
+                    {
+                        "hooks": [
+                            {
+                                "command": f"{aplexer_cmd} context hook --engine codex 2>/dev/null || true # aplexer-managed-awareness-hook-v1",
+                                "timeout": 30,
+                                "type": "command"
+                            }
+                        ]
+                    }
+                ],
+                "SessionStart": [
+                    {
+                        "hooks": [
+                            {
+                                "command": f"{a_cmd} state-report working || true",
+                                "type": "command"
+                            }
+                        ]
+                    },
+                    {
+                        "hooks": [
+                            {
+                                "command": f"{aplexer_cmd} context hook --engine codex 2>/dev/null || true # aplexer-managed-awareness-hook-v1",
+                                "timeout": 30,
+                                "type": "command"
+                            }
+                        ]
+                    }
+                ],
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "command": f"{a_cmd} state-report idle || true",
+                                "type": "command"
+                            }
+                        ]
+                    }
+                ],
+                "UserPromptSubmit": [
+                    {
+                        "hooks": [
+                            {
+                                "command": f"{a_cmd} state-report working || true",
+                                "type": "command"
+                            }
+                        ]
+                    },
+                    {
+                        "hooks": [
+                            {
+                                "command": f"{aplexer_cmd} context hook --engine codex 2>/dev/null || true # aplexer-managed-awareness-hook-v1",
+                                "timeout": 30,
+                                "type": "command"
+                            }
+                        ]
+                    }
+                ]
             }
+        }
 
-        content_bytes = json.dumps(template_hooks, indent=2).encode('utf-8')
-        with private_fs.parent(codex_hooks, create=True):
+    content_bytes = json.dumps(template_hooks, indent=2).encode('utf-8')
+    with private_fs.parent(codex_hooks, create=True):
+        pass
+    private_fs.atomic_write(codex_hooks, content_bytes, 65536)
+    if os.name != 'nt':
+        try:
+            os.chmod(codex_hooks, 0o600)
+        except OSError:
             pass
-        private_fs.atomic_write(codex_hooks, content_bytes, 65536)
+
+    if provider == 'zai':
+        zcodex_home = home / '.zcodex'
+        zcodex_hooks = zcodex_home / 'hooks.json'
+        with private_fs.parent(zcodex_hooks, create=True):
+            pass
+        private_fs.atomic_write(zcodex_hooks, content_bytes, 65536)
         if os.name != 'nt':
             try:
-                os.chmod(codex_hooks, 0o600)
+                os.chmod(zcodex_hooks, 0o600)
             except OSError:
                 pass
-
-        if provider == 'zai':
-            zcodex_home = home / '.zcodex'
-            zcodex_hooks = zcodex_home / 'hooks.json'
-            with private_fs.parent(zcodex_hooks, create=True):
-                pass
-            private_fs.atomic_write(zcodex_hooks, content_bytes, 65536)
-            if os.name != 'nt':
-                try:
-                    os.chmod(zcodex_hooks, 0o600)
-                except OSError:
-                    pass
 
 
 def set_toml_top_level_keys(content: str, keys: dict[str, str]) -> str:

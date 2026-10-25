@@ -296,6 +296,42 @@ _COMPLETED_BY_OUTCOME = {
 }
 
 
+def _post_inbox_status(
+    *,
+    request: Optional[Callable],
+    command_id: str,
+    claim_token: str,
+    reason: str,
+) -> bool:
+    """Best-effort POST of pending inbox status (AC5).
+
+    The server projects ``waiting in inbox for recipient`` + host reason
+    instead of ``claimed`` only after the host reports it under the live claim
+    fence. Failures are ignored by callers: the command stays claimed under
+    its lease and the next reconcile cycle retries. Returns True on 2xx.
+    """
+    if request is None:
+        return False
+    if not isinstance(command_id, str) or not command_id:
+        return False
+    if not isinstance(claim_token, str) or not claim_token:
+        return False
+    bounded_reason = str(reason or "aplexer inbox recorded; recipient has not acknowledged")[:512]
+    try:
+        request(
+            "POST",
+            "/api/session-commands/" + command_id + "/status",
+            {
+                "claim_token": claim_token,
+                "status": "waiting in inbox for recipient",
+                "reason": bounded_reason,
+            },
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _server_correlation(command_id: str, generation: int) -> str:
     return "cmd:%s:gen:%d" % (command_id, generation)
 
@@ -778,17 +814,56 @@ def _reconcile_unknown_locked(
     if type(expires_at_ms) is int and now >= expires_at_ms:
         log_delivery = reconcile_delivery_from_log(executable, target.workspace, original_id)
         if log_delivery == "recorded":
-            from .native_sessions import retract_inbox_envelope
-            retract_inbox_envelope(executable, target, original_id)
-            reason = "recipient_not_ready"
-            payload = {
-                "correlation": _server_correlation(command_id, int(prior.get("generation", 0))),
-                "outcome": "failed",
-                "native": {"native_id": target.session_id, "tag": target.tag, "workspace": target.workspace},
-                "reason": reason,
-            }
-            updated = {**prior, "state": "failed", "reason": reason,
-                       "ack_payload": payload, "ack_submitted": False}
+            # Keep the server projection honest while the lease burns (AC5):
+            # refresh pending status so expireClaim sees the inbox reason.
+            _post_inbox_status(
+                request=request,
+                command_id=command_id,
+                claim_token=str(prior.get("claim_token") or ""),
+                reason=str(prior.get("reason", ""))[:512] or "aplexer inbox recorded; recipient has not acknowledged",
+            )
+            from .native_sessions import fetch_message_log, retract_inbox_envelope
+            # Controller `message ack` advances a consumer cursor; it does NOT
+            # cancel the original sender envelope. Its boolean is never proof
+            # on its own — positive proof is log fetch success + absence.
+            retract_ok = False
+            try:
+                retract_ok = bool(retract_inbox_envelope(executable, target, original_id))
+            except Exception:
+                retract_ok = False
+            log_ok = False
+            removed = False
+            try:
+                rows = fetch_message_log(executable, target.workspace)
+                log_ok = True
+                removed = not any(isinstance(r, dict) and r.get("id") == original_id for r in rows)
+            except Exception:
+                log_ok = False
+                removed = False
+            if retract_ok and log_ok and removed:
+                reason = "recipient_not_ready"
+                payload = {
+                    "correlation": _server_correlation(command_id, int(prior.get("generation", 0))),
+                    "outcome": "failed",
+                    "native": {"native_id": target.session_id, "tag": target.tag, "workspace": target.workspace},
+                    "reason": reason,
+                }
+                updated = {**prior, "state": "failed", "reason": reason,
+                           "ack_payload": payload, "ack_submitted": False}
+            else:
+                reason = (
+                    "recipient_not_ready_uncertain: inbox envelope still undelivered; "
+                    "removal unproven (retract_ok=%s log_ok=%s removed=%s); no duplicate sent"
+                    % (retract_ok, log_ok, removed)
+                )[:512]
+                payload = {
+                    "correlation": _server_correlation(command_id, int(prior.get("generation", 0))),
+                    "outcome": "uncertain",
+                    "native": {"native_id": target.session_id, "tag": target.tag, "workspace": target.workspace},
+                    "reason": reason,
+                }
+                updated = {**prior, "state": "uncertain", "reason": reason[:300],
+                           "ack_payload": payload, "ack_submitted": False}
             updated.pop("ack_pending", None)
             if request is not None:
                 try:
@@ -885,6 +960,20 @@ def _reconcile_unknown_locked(
             _write_journal(journal_file, prior)
         except SessionControlError:
             pass
+        # Still inbox-waiting: refresh pending status so the server keeps
+        # projecting "waiting in inbox for recipient" (AC5) until the lease
+        # burns. Best-effort; failures leave the journal pending.
+        try:
+            still = reconcile_delivery_from_log(executable, target.workspace, original_id)
+        except Exception:
+            still = None
+        if still == "recorded":
+            _post_inbox_status(
+                request=request,
+                command_id=command_id,
+                claim_token=str(prior.get("claim_token") or ""),
+                reason=str(prior.get("reason", ""))[:512] or "aplexer inbox recorded; recipient has not acknowledged",
+            )
 
     return None
 
@@ -1429,14 +1518,23 @@ def handle_claimed_command(
         # pending WITHOUT any server ack: the command stays claimed under its
         # lease while bounded read-only reconciliation watches for the delayed
         # reply. Finalizing terminal `uncertain` on the 0ms check would lock
-        # the server command and strand the later reply, so no POST happens
-        # here by construction.
+        # the server command and strand the later reply, so no terminal ack
+        # POST happens here by construction. The pending inbox status IS
+        # posted (AC5) so `hub sessions commands` shows "waiting in inbox
+        # for recipient" + reason instead of `claimed`.
         if outcome.get("state") == "unknown":
             record["ack_submitted"] = False
             record["ack_pending"] = "awaiting_recipient_reply"
             _write_journal(journal_file, record)
+            status_posted = _post_inbox_status(
+                request=request,
+                command_id=command_id,
+                claim_token=str(proved["claim_token"]),
+                reason=str(outcome.get("reason", ""))[:512] or "aplexer inbox recorded; recipient has not acknowledged",
+            )
             return {"op": op, **record,
-                    "ack": {"submitted": False, "pending": "awaiting_recipient_reply"}}
+                    "ack": {"submitted": False, "pending": "awaiting_recipient_reply",
+                            "status_posted": bool(status_posted)}}
 
         # CORRECTED ack.native semantics: ack.native.native_id is ALWAYS the
         # TARGET NATIVE SESSION UUID (binding match), never an envelope id.

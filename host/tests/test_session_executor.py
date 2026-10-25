@@ -657,6 +657,9 @@ class ClaimHandler(BaseHTTPRequestHandler):
             elif "/ack" in self.path:
                 con.execute("INSERT INTO acks(launch, payload) VALUES(?, ?)",
                             (self.path, json.dumps(body)))
+            elif self.path.endswith("/status"):
+                # Pending inbox status (AC5): accepted, not an ack; no DB row.
+                pass
             else:
                 self.send_response(404)
                 self.end_headers()

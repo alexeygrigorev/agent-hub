@@ -1762,6 +1762,71 @@ describe('bounded command custody recovery', () => {
       expect(sendOk.status).toBe(201);
       const okData: any = await sendOk.json();
       expect(okData.warning).toBeUndefined();
+
+      // AC4 recency: a stale report warns/refuses again (observed_at > 5 min old)
+      sql.exec("UPDATE fleet_sessions SET observed_at = ? WHERE native_id = ?", new Date(Date.now() - 10 * 60 * 1000).toISOString(), NATIVE_ID);
+      const sendStaleWarn = await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'stale-warn', body: 'hi' }), admin);
+      expect(sendStaleWarn.status).toBe(201);
+      expect(((await sendStaleWarn.json()) as any).warning).toBe('target_no_reported_state');
+      const sendStaleRefuse = await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'stale-refuse', body: 'hi', require_ready: true }), admin);
+      expect(sendStaleRefuse.status).toBe(409);
+      expect(((await sendStaleRefuse.json()) as any).error).toBe('target_not_ready');
+    }, fakeReserve().hook);
+  });
+
+  it('accepts fenced failed inbox receipt and replays idempotent failure', async () => {
+    await fixture(async (s, sql) => {
+      const session: any = await startOk(s, { machine: 'hetzner' });
+      await bindHttp(s, sql, session.id);
+      sql.exec("UPDATE fleet_sessions SET agent_state = 'idle' WHERE native_id = ?", NATIVE_ID);
+      const cmd: any = await (await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'fail-ack', body: 'hi' }), admin)).json();
+      const poll: any = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json();
+      const offer = poll.offers[0];
+      const claim = await claimAs(s, cmd.command_id, offer.correlation);
+      // Host reports inbox waiting, then reports proven cancellation as failed.
+      const statusRes = await s.handle(request(`/api/session-commands/${cmd.command_id}/status`, {
+        claim_token: claim.claim_token, status: 'waiting in inbox for recipient', reason: 'inbox recorded',
+      }), host('hetzner'));
+      expect(statusRes.status).toBe(200);
+      const ackRes = await s.handle(request(`/api/session-commands/${cmd.command_id}/ack`, {
+        correlation: offer.correlation, claim_token: claim.claim_token,
+        native: native(canonTag('launch-1')), outcome: 'failed', reason: 'recipient_not_ready',
+      }), host('hetzner'));
+      expect(ackRes.status).toBe(200);
+      expect(((await ackRes.json()) as any).state).toBe('failed');
+      // Idempotent retry with the same correlation + reason replays success.
+      const ackRetry = await s.handle(request(`/api/session-commands/${cmd.command_id}/ack`, {
+        correlation: offer.correlation, claim_token: claim.claim_token,
+        native: native(canonTag('launch-1')), outcome: 'failed', reason: 'recipient_not_ready',
+      }), host('hetzner'));
+      expect(ackRetry.status).toBe(200);
+      expect(((await ackRetry.json()) as any).state).toBe('failed');
+    }, fakeReserve().hook);
+  });
+
+  it('accepts fenced terminal failure after claim expiry instead of burning leases', async () => {
+    await fixture(async (s, sql) => {
+      const session: any = await startOk(s, { machine: 'hetzner' });
+      await bindHttp(s, sql, session.id);
+      sql.exec("UPDATE fleet_sessions SET agent_state = 'idle' WHERE native_id = ?", NATIVE_ID);
+      const cmd: any = await (await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'fenced-expiry', body: 'hi' }), admin)).json();
+      const poll: any = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json();
+      const offer = poll.offers[0];
+      const claim = await claimAs(s, cmd.command_id, offer.correlation);
+      await s.handle(request(`/api/session-commands/${cmd.command_id}/status`, {
+        claim_token: claim.claim_token, status: 'waiting in inbox for recipient', reason: 'inbox recorded',
+      }), host('hetzner'));
+      // Burn the lease, then deliver the fenced terminal receipt on the same claim.
+      sql.exec('UPDATE session_control_commands SET claim_expires_at = ? WHERE id = ?', new Date(Date.now() - 1000).toISOString(), cmd.command_id);
+      const ackRes = await s.handle(request(`/api/session-commands/${cmd.command_id}/ack`, {
+        correlation: offer.correlation, claim_token: claim.claim_token,
+        native: native(canonTag('launch-1')), outcome: 'failed', reason: 'recipient_not_ready',
+      }), host('hetzner'));
+      expect(ackRes.status).toBe(200);
+      expect(((await ackRes.json()) as any).state).toBe('failed');
+      // No retry: the command is terminal failed, not re-offered.
+      const sweep: any = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json();
+      expect(sweep.offers).toEqual([]);
     }, fakeReserve().hook);
   });
 });

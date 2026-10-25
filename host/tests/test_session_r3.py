@@ -217,6 +217,8 @@ class StubHub:
                     "claim_token": "tok-" + cid.replace("-", ""),
                     "holder": "hetzner1", "generation": 1,
                     "expires_at_ms": 9999999999999, "attempt": 1}
+        if method == "POST" and path.endswith("/status"):
+            return {"ok": True, "command_id": path.split("/")[-2], "status": (payload or {}).get("status"), "reason": (payload or {}).get("reason")}
         if method == "POST" and path.endswith("/ack"):
             self.ack_calls += 1
             cid = path.split("/")[-2]
@@ -323,6 +325,8 @@ def test_r3_terminal_409_never_reposted_on_later_cycles(env):
                     "claim_token": "tok-r3-" + cid.replace("-", ""),
                     "holder": "hetzner1", "generation": 1,
                     "expires_at_ms": 9999999999999, "attempt": 1}
+        if method == "POST" and path.endswith("/status"):
+            return {"ok": True, "command_id": path.split("/")[-2], "status": (payload or {}).get("status"), "reason": (payload or {}).get("reason")}
         if method == "POST" and path.endswith("/ack"):
             posts["n"] += 1
             raise ValueError("Session HTTP request failed with status 409 (proof_replayed)")

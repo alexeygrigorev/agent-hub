@@ -225,6 +225,8 @@ class StubHub:
             self.claims[cid] = {"attempt_id": payload.get("attempt_id"), "grant": grant,
                                 "correlation": match[0]["correlation"]}
             return dict(grant)
+        if method == "POST" and path.endswith("/status"):
+            return {"ok": True, "command_id": path.split("/")[-2], "status": (payload or {}).get("status"), "reason": (payload or {}).get("reason")}
         if method == "POST" and path.endswith("/ack"):
             cid = path.split("/")[-2]
             self.ack_calls += 1
@@ -596,6 +598,8 @@ def test_f4_terminal_server_verdict_closes_journal_without_new_effect(env):
     real_request = hub.request
 
     def flaky(method, path, payload):
+        if method == "POST" and path.endswith("/status"):
+            return {"ok": True, "command_id": path.split("/")[-2], "status": (payload or {}).get("status"), "reason": (payload or {}).get("reason")}
         if method == "POST" and path.endswith("/ack"):
             calls["n"] += 1
             if calls["n"] == 1:

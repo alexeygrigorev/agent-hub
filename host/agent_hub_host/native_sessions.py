@@ -661,7 +661,14 @@ def retract_inbox_envelope(
     target: NativeTarget,
     envelope_id: str,
 ) -> bool:
-    """Acknowledge/retract an undelivered message from the aplexer inbox so it won't be delivered later."""
+    """Best-effort controller-side ack of an undelivered inbox message.
+
+    NOTE: this advances the caller's consumer cursor via ``message ack``; it
+    does NOT prove the original sender envelope was cancelled (no
+    original-sender cancel exists in the published aplexer CLI). Callers must
+    verify removal via the message log and report failed/recipient_not_ready
+    only on positive proof, otherwise explicitly uncertain. Never re-send.
+    """
     target = target.validated()
     if not isinstance(envelope_id, str) or not envelope_id:
         return False

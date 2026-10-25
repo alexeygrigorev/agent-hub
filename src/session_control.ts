@@ -63,7 +63,12 @@ const LABEL = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const UUID_RE = /^[a-f0-9-]{36}$/;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const COMMANDS = new Set(['send', 'capture', 'stop']);
-const ACK_OUTCOMES = new Set(['delivered', 'transported', 'refused', 'uncertain']);
+const ACK_OUTCOMES = new Set(['delivered', 'transported', 'refused', 'uncertain', 'failed']);
+// Pre-send readiness: a target counts as recently reported only when it has a
+// non-empty agent_state AND a fresh observed_at. fleet_sessions.observed_at is
+// the last report time; 5 minutes matches host heartbeat staleness (180s)
+// with polling slack. Stale or future timestamps warn/refuse honestly.
+const RECENT_STATE_MS = 5 * 60 * 1000;
 const HEADERS = { 'Cache-Control': 'private, no-store' };
 const BOUND_STATES = new Set(['running']);
 const STOPPABLE = new Set(['offered', 'starting', 'running', 'uncertain']);
@@ -2132,7 +2137,13 @@ export class SessionControlService {
               live.machine_id, binding.native_id
             ).toArray()[0] : null;
 
-            const hasReported = Boolean(reported?.agent_state);
+            // Recency (AC4): agent_state alone is not enough — a stale report
+            // must warn/refuse. observed_at must parse, not be in the future,
+            // and be within RECENT_STATE_MS of now.
+            const observedMs = typeof reported?.observed_at === 'string' ? Date.parse(reported.observed_at) : NaN;
+            const nowMs = this.now();
+            const hasReported = Boolean(reported?.agent_state) && Number.isFinite(observedMs) &&
+              observedMs <= nowMs + 60000 && nowMs - observedMs <= RECENT_STATE_MS;
             if (!hasReported && input.require_ready === true) {
               return response({ error: 'target_not_ready', message: 'target has no recent reported state' }, 409);
             }
@@ -2394,6 +2405,18 @@ export class SessionControlService {
         // narrow path below: late-reply reconciliation on uncertain sends.
         if (row.state !== 'claimed') {
           if (this.sameAck(row, input)) return response({ command_id: row.id, state: row.state });
+          // Idempotent terminal failure (AC3): the server may have already
+          // marked an inbox-waiting send failed/recipient_not_ready via
+          // expireClaim after the host POSTed pending status. A host retry
+          // with the same correlation + reason replays success (no new
+          // effect) instead of 409 claim_required. expireClaim acks carry no
+          // claim_token, so sameAck alone cannot match them.
+          if (row.state === 'failed' && input.outcome === 'failed' && input.correlation === row.correlation) {
+            const stored = row.ack_json ? parsed(row.ack_json, null) : null;
+            if (stored && stored.outcome === 'failed' && stored.reason === input.reason) {
+              return response({ command_id: row.id, state: row.state });
+            }
+          }
           if (row.state === 'uncertain' || (CLAIMABLE.has(row.state) && row.claim_token)) {
             const late = this.lateReplyAck(row, input, caller);
             if (late) return late;
@@ -2409,11 +2432,34 @@ export class SessionControlService {
           // carrying a valid delivered proof on the SAME live claim reconciles
           // through lateReplyAck (no new effect, no re-claim) regardless of
           // whether the offers sweep has marked the row uncertain yet — the
-          // verdict must not depend on sweep ordering. Anything else stays
+          // verdict must not depend on sweep ordering. A fenced terminal
+          // failure receipt (failed/recipient_not_ready, or uncertain with an
+          // inbox reason) on the SAME claim + correlation is accepted as
+          // terminal instead of burning another lease — this is the host path
+          // that reports an undelivered inbox envelope as failed only on
+          // positive cancellation proof, else uncertain. Anything else stays
           // uncertain, never silently reissued or marked delivered.
           if (row.kind === 'send' && input.outcome === 'delivered') {
             const late = this.lateReplyAck(row, input, caller);
             if (late) return late;
+          }
+          if (row.kind === 'send' && (input.outcome === 'failed' || input.outcome === 'uncertain') &&
+              input.correlation === row.correlation) {
+            const binding = session.binding_json ? parsed(session.binding_json, null) : null;
+            if (!binding || (input.native.native_id === binding.native_id && input.native.tag === binding.tag &&
+                input.native.workspace === binding.workspace)) {
+              const at = this.at();
+              const fenced: any = {
+                outcome: input.outcome, native: input.native, claim_attempt: row.attempts ?? 1,
+                claim_token: input.claim_token,
+                ...(row.holder_attempt ? { holder_attempt: row.holder_attempt } : {}),
+                ...(typeof input.reason === 'string' ? { reason: input.reason } : {}),
+              };
+              const fencedState = input.outcome === 'failed' ? 'failed' : 'uncertain';
+              this.sql.exec('UPDATE session_control_commands SET state = ?, ack_json = ?, updated_at = ? WHERE id = ?',
+                fencedState, JSON.stringify(fenced), at, row.id);
+              return response({ command_id: row.id, state: fencedState });
+            }
           }
           this.expireClaim(row);
           return response({ error: 'claim_expired' }, 409);
@@ -2491,6 +2537,7 @@ export class SessionControlService {
         };
         const state = input.outcome === 'delivered' ? 'acked'
           : input.outcome === 'transported' ? 'transported'
+          : input.outcome === 'failed' ? 'failed'
           : input.outcome === 'refused' ? (row.kind === 'send' && input.reason === 'send_unsupported_headless' ? 'failed' : 'refused') : 'uncertain';
         this.sql.exec('UPDATE session_control_commands SET state = ?, ack_json = ?, updated_at = ? WHERE id = ?', state, JSON.stringify(ack), at, row.id);
         if (state === 'acked' && row.kind === 'send' && input.proof) {

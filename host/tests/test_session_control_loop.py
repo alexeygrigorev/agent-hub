@@ -311,7 +311,11 @@ def test_handle_claimed_send_proof_uses_target_uuid_not_envelope(env):
         request=lambda m, p, b: sent["acked"].append((m, p, b)) or {})
     assert outcome["state"] == "unknown"
     assert outcome["ack"]["submitted"] is False
-    assert sent["acked"] == []  # no premature uncertain POST
+    # No premature terminal ack POST; pending inbox status POST is expected (AC5).
+    assert all(p != "/ack" and not p.endswith("/ack") for _, p, _ in sent["acked"])
+    assert any(p.endswith("/status") for _, p, _ in sent["acked"])
+    status_payload = next(b for m, p, b in sent["acked"] if p.endswith("/status"))
+    assert status_payload["status"] == "waiting in inbox for recipient"
     original_id = outcome["original_native_message_id"]
     assert original_id and original_id != rec["id"]
     # The target replies in the native log with correlation + digest echo.
@@ -431,6 +435,8 @@ def test_receive_once_bounded_cycle_with_stub_hub(env):
                     "holder": "hetzner1", "generation": match[0]["generation"],
                     "expires_at": "2030-01-01T00:00:00.000Z",
                     "expires_at_ms": int(time.time() * 1000) + 60000, "attempt": 1}
+        if method == "POST" and path.endswith("/status"):
+            return {"ok": True, "command_id": path.split("/")[-2], "status": (payload or {}).get("status"), "reason": (payload or {}).get("reason")}
         if method == "POST" and path.endswith("/ack"):
             # Server-side shape check (actual contract): native MUST be the
             # target UUID, never an envelope id; send delivered requires proof.
@@ -635,6 +641,8 @@ def test_receive_once_stop_bundles_tree_under_host_roots(env):
                     "expires_at": "2030-01-01T00:00:00.000Z",
                     "expires_at_ms": int(time.time() * 1000) + 60000, "attempt": 1,
                     "cleanup_tree": True}
+        if method == "POST" and path.endswith("/status"):
+            return {"ok": True, "command_id": path.split("/")[-2], "status": (payload or {}).get("status"), "reason": (payload or {}).get("reason")}
         if method == "POST" and path.endswith("/ack"):
             acked.append(payload)
             return {"command_id": cid, "state": "acked"}
@@ -670,6 +678,8 @@ def test_receive_once_ordinary_stop_with_roots_leaves_tree_absent(env):
                     "holder": "hetzner1", "generation": 1,
                     "expires_at": "2030-01-01T00:00:00.000Z",
                     "expires_at_ms": int(time.time() * 1000) + 60000, "attempt": 1}
+        if method == "POST" and path.endswith("/status"):
+            return {"ok": True, "command_id": path.split("/")[-2], "status": (payload or {}).get("status"), "reason": (payload or {}).get("reason")}
         if method == "POST" and path.endswith("/ack"):
             acked.append(payload)
             return {"command_id": cid, "state": "acked"}
