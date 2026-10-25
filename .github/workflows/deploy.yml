@@ -179,15 +179,18 @@ jobs:
           python3 - <<'PYDEV'
           import json, os, time, urllib.error, urllib.request
           base = 'https://agent-hub-dev.cloudflare-ai-agent-de9ca0.workers.dev'
+          def probe(path):
+              request = urllib.request.Request(base + path, headers={'User-Agent': 'AgentHub-Release-Smoke/1.0'})
+              return urllib.request.urlopen(request, timeout=15)
           for attempt in range(6):
               try:
-                  with urllib.request.urlopen(base + '/livez', timeout=15) as response:
+                  with probe('/livez') as response:
                       assert response.status == 200
                       assert json.load(response) == {'status': 'ok', 'component': 'hub-worker'}
-                  with urllib.request.urlopen(base + '/cli/manifest.json?source=' + os.environ['GITHUB_SHA'], timeout=15) as response:
+                  with probe('/cli/manifest.json?source=' + os.environ['GITHUB_SHA']) as response:
                       assert json.load(response)['built_from_commit'] == os.environ['GITHUB_SHA']
                   try:
-                      urllib.request.urlopen(base + '/api/sessions', timeout=15)
+                      probe('/api/sessions')
                   except urllib.error.HTTPError as error:
                       assert error.code in (401, 403), error.code
                   else:
