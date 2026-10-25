@@ -33,6 +33,9 @@ def test_model_survives_default_subscription(engine, provider, model_id, mode):
         calls = []
         def runner(argv, **kw):
             calls.append(argv)
+            if argv[1:3] == ['message', 'send']:
+                assert '--queue' in argv and '--pane' not in argv
+                return {'id': 'preamble-fixture'}
             if argv == ['gate']:
                 return dict(launch_allowed=True, profile_supported=True, model_supported=True,
                             model=model['model'], effort=model['effort'], account_label='test-account',

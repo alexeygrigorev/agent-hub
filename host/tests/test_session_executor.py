@@ -725,6 +725,9 @@ def fleet_settings(env, gate_ok=True):
                         "account_label": "hub", "observed_at": observed}
             return {"launch_allowed": True, "profile_supported": True,
                     "account_label": "hub", "observed_at": observed}
+        if argv[1:3] == ["message", "send"]:
+            assert "--queue" in argv and "--pane" not in argv
+            return {"id": "preamble-fixture"}
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=20)
         assert proc.returncode == 0, proc.stderr
         return json.loads(proc.stdout)
@@ -786,7 +789,7 @@ def test_start_uncertain_adopts_without_duplicate(hub, env):
     calls = {"n": 0}
 
     def flaky(argv, payload=None, cwd=None, timeout=30):
-        if argv == ["admit"]:
+        if argv == ["admit"] or argv[1:3] == ["message", "send"]:
             return base_runner(argv, payload, cwd, timeout)
         calls["n"] += 1
         if calls["n"] == 1:

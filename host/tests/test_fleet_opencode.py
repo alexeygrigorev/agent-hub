@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent_hub_host import fleet, fleet_launch
+from agent_hub_host.session_rules import compose_prompt
 
 
 def settings(workspace, provider="opencode",
@@ -63,7 +64,7 @@ class FleetOpencodeTests(unittest.TestCase):
             self.assertEqual(payload['profile'], 'model-task')
             brief = 'Implement writer-run; preserve root-run authority'
             result_path = Path(tmp) / '.local' / 'hub-results' / (offer()['id'] + '.json')
-            self.assertTrue(payload['goal'].startswith(brief + '\n'))
+            self.assertTrue(payload['goal'].startswith(compose_prompt(brief) + '\n'))
             self.assertIn('Write a final JSON object to ' + str(result_path), payload['goal'])
             self.assertEqual(submitted[submitted.index('--paths') + 1], str(result_path))
             self.assertEqual(result['state'], 'running')

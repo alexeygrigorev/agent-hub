@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 from unittest.mock import patch
 
 from agent_hub_host import fleet
+from agent_hub_host.session_rules import AWS_MAIN_TEMP_RULE, SESSION_PREAMBLE, compose_prompt
 
 
 def settings(workspace):
@@ -213,8 +214,8 @@ class FleetTests(unittest.TestCase):
             dispatcher = fleet.Dispatcher(cfg, lambda *a: http.append(a) or {}, runner)
             result = dispatcher.dispatch(offer(profile='secondary'))
             self.assertEqual(result['state'], 'running')
-            self.assertEqual(calls[1][0][0:2], ['aplexer', 'start'])
-            self.assertIn('--profile', calls[1][0]); self.assertNotIn('exec', calls[1][0])
+            self.assertEqual(calls[-1][0][0:2], ['aplexer', 'start'])
+            self.assertIn('--profile', calls[-1][0]); self.assertNotIn('exec', calls[-1][0])
             self.assertTrue(http[0][1].endswith('/claim'))
 
     def test_unsupported_or_unknown_gate_never_claims_or_launches(self):
@@ -558,7 +559,7 @@ class FleetTests(unittest.TestCase):
             dispatcher = fleet.Dispatcher(cfg, lambda *a: http.append(a) or {}, runner)
             result = dispatcher.dispatch(offer())
             self.assertEqual(result['state'], 'running')
-            start_argv = calls[1][0]
+            start_argv = calls[-1][0]
             # Exact argv prefix applied
             expected_prefix = ["systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", "--property=KillMode=process", "--", "aplexer", "start"]
             self.assertEqual(start_argv[:len(expected_prefix)], expected_prefix)
@@ -571,7 +572,7 @@ class FleetTests(unittest.TestCase):
             dispatcher2 = fleet.Dispatcher(cfg, lambda *a: {}, runner)
             result2 = dispatcher2.dispatch(offer())
             self.assertEqual(result2['state'], 'running')
-            self.assertEqual(calls[1][0][:len(sub_prefix) + 2], sub_prefix + ["aplexer", "start"])
+            self.assertEqual(calls[-1][0][:len(sub_prefix) + 2], sub_prefix + ["aplexer", "start"])
 
             # Default unchanged when prefix omitted
             cfg_no_prefix = settings(Path(tmp))
@@ -579,7 +580,7 @@ class FleetTests(unittest.TestCase):
             dispatcher3 = fleet.Dispatcher(cfg_no_prefix, lambda *a: {}, runner)
             result3 = dispatcher3.dispatch(offer())
             self.assertEqual(result3['state'], 'running')
-            self.assertEqual(calls[1][0][:2], ["aplexer", "start"])
+            self.assertEqual(calls[-1][0][:2], ["aplexer", "start"])
 
             # Git identity settings are passed as fallback env to interactive start
             cfg_git = settings(Path(tmp))
@@ -591,7 +592,7 @@ class FleetTests(unittest.TestCase):
             dispatcher4 = fleet.Dispatcher(cfg_git, lambda *a: {}, runner)
             result4 = dispatcher4.dispatch(offer())
             self.assertEqual(result4['state'], 'running')
-            start_argv4 = calls[1][0]
+            start_argv4 = calls[-1][0]
             self.assertIn("--env", start_argv4)
             self.assertIn("GIT_AUTHOR_NAME=Alexey Grigorev", start_argv4)
             self.assertIn("GIT_AUTHOR_EMAIL=alexey.s.grigoriev@gmail.com", start_argv4)
@@ -814,6 +815,9 @@ class FleetTests(unittest.TestCase):
             payload_str = submit_call[submit_call.index('--payload') + 1]
             payload = json.loads(payload_str)
             self.assertIn(f"Write a final JSON object to {normal_result_file}:", payload['goal'])
+            self.assertTrue(payload['goal'].startswith(compose_prompt(normal_offer['prompt']) + '\n'))
+            self.assertIn(AWS_MAIN_TEMP_RULE, payload['goal'])
+            self.assertEqual(normal_offer['prompt'], 'Normal intake task')
 
             # 2. Legacy task_id-present offer route
             calls.clear()
@@ -861,6 +865,11 @@ class FleetTests(unittest.TestCase):
             result_interactive = d_interactive.dispatch(interactive_offer)
             self.assertEqual(result_interactive['state'], 'running')
             self.assertFalse(any('submit' in c for c in calls))
+            preamble_call = next(c for c in calls if 'hub-session-preamble' in c)
+            self.assertEqual(preamble_call[-1], SESSION_PREAMBLE)
+            self.assertIn('--queue', preamble_call)
+            self.assertNotIn('--pane', preamble_call)
+            self.assertLess(calls.index(preamble_call), next(i for i, c in enumerate(calls) if c[:2] == ['aplexer', 'start']))
 
     def test_headless_prelaunch_path_confinement_and_symlink_refusal_without_outside_writes(self):
         with tempfile.TemporaryDirectory() as tmp:

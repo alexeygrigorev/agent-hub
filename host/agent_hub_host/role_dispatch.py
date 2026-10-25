@@ -35,6 +35,8 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
+from .session_rules import AWS_MAIN_TEMP_RULE
+
 from . import private_fs
 from . import native_sessions as ns
 from .guarded_root import get_pid_starttime_ticks
@@ -2049,7 +2051,8 @@ class RoleRun:
 
         goal = (
             f"Role execution for {self.kind} ({self.role_name}, generation {self.role_generation}, epoch {self.lease_epoch}).\n\n"
-            "Worker rules: after genuine first-action proof, read the applicable AGENTS.md and check your native inbox. "
+            f"Worker rules: {AWS_MAIN_TEMP_RULE} "
+            "After genuine first-action proof, read the applicable AGENTS.md and check your native inbox. "
             "Never post to public channels or groups, publish secrets, purchase services, or change global installations. "
             "Preserve other agents' work, services, histories and worktrees. Do not launch unrelated sessions, control "
             "foreign sessions, or edit unrelated source without separate authorization. Keep reports and outcome "

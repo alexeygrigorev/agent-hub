@@ -13,6 +13,7 @@ import time
 from typing import Any, Optional
 
 from . import bus
+from .session_rules import SESSION_PREAMBLE, compose_prompt
 from .retired_native import verify_native_retirement
 
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
@@ -1445,7 +1446,7 @@ class Dispatcher:
                 if selection:
                     from .model_contract import replace_model_args
                     launch = replace_model_args(launch, selection["model"])
-                argv += ["--"] + launch + (['/goal ' + offer['prompt'] + '\nContainer hygiene: use docker run --rm for throwaway/test containers; label every test container agent.session=<your Hub session id, or native session id registered in Hub>. Install trap/finally cleanup before creation and clean up all resources you create before session exit, including failed starts and docker create/compose tests. Preserve other sessions and Coolify containers.'] if with_goal else [])
+                argv += ["--"] + launch + (['/goal ' + compose_prompt(offer['prompt']) + '\nContainer hygiene: use docker run --rm for throwaway/test containers; label every test container agent.session=<your Hub session id, or native session id registered in Hub>. Install trap/finally cleanup before creation and clean up all resources you create before session exit, including failed starts and docker create/compose tests. Preserve other sessions and Coolify containers.'] if with_goal else [])
             prefix = sub.get("native_start_argv") or self.settings.get("native_start_argv")
             if prefix is not None:
                 prefix = validate_native_start_argv(prefix)
@@ -1469,7 +1470,7 @@ class Dispatcher:
                 from .opencode_auth import launch_argv
                 prefix = launch_argv(device_auth, prefix)
             task_id = "hub-" + offer_id
-            goal = offer["prompt"] + "\nContainer hygiene: use docker run --rm for throwaway/test containers; label every test container agent.session=<your Hub session id, or native session id registered in Hub>. Install trap/finally cleanup before creation and clean up all resources you create before session exit, including failed starts and docker create/compose tests. Preserve other sessions and Coolify containers."
+            goal = compose_prompt(offer["prompt"]) + "\nContainer hygiene: use docker run --rm for throwaway/test containers; label every test container agent.session=<your Hub session id, or native session id registered in Hub>. Install trap/finally cleanup before creation and clean up all resources you create before session exit, including failed starts and docker create/compose tests. Preserve other sessions and Coolify containers."
             curr = workspace
             for seg in (".local", "hub-results"):
                 curr = curr / seg
@@ -1552,6 +1553,13 @@ class Dispatcher:
         log_offsets = capture_log_offsets(sub.get("launcher_provider"))
         launched_at_ts = time.time()
         try:
+            if mode == "interactive" and not offer.get("with_goal"):
+                # Empty interactive starts must remain empty: queue the trusted
+                # preamble in the native inbox before the engine's awareness hook
+                # runs. Never type into a PTY, overwrite a draft, or start a goal.
+                self.runner([native, "message", "send", "--workspace", str(workspace),
+                             "--to", "hub-" + offer_id, "--queue",
+                             "--kind", "hub-session-preamble", "--json", SESSION_PREAMBLE])
             receipt = self.runner(argv, cwd=cwd, timeout=120)
             if mode == "interactive":
                 native_id = receipt.get("id")

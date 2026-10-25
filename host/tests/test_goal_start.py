@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 import pytest
 from agent_hub_host import fleet, session_control
+from agent_hub_host.session_rules import AWS_MAIN_TEMP_RULE, compose_prompt
 from test_fleet import settings, offer
 
 
@@ -41,7 +42,8 @@ def test_goal_native_start_uses_trusted_command_and_literal_argument():
         result = d.dispatch(offer(with_goal=True, prompt='Fix $(literal) `text`'))
         assert result['state'] == 'running'
         assert calls[-1][-4:-1] == ['--', 'trusted-codex', '--safe']
-        assert calls[-1][-1].startswith('/goal Fix $(literal) `text`\n')
+        assert calls[-1][-1].startswith('/goal ' + compose_prompt('Fix $(literal) `text`') + '\n')
+        assert AWS_MAIN_TEMP_RULE in calls[-1][-1]
         assert 'docker run --rm' in calls[-1][-1]
         assert 'agent.session=' in calls[-1][-1]
         assert 'trap/finally' in calls[-1][-1]

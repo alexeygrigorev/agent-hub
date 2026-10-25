@@ -866,6 +866,8 @@ class TestRoleRealBackendAdapter(unittest.TestCase):
         )
         goal = run._build_goal()
 
+        self.assertIn("Never use the main-temp AWS profile or static key unless this brief cites Alexey's explicit approval for this exact job; if you need AWS access that is not otherwise available, stop and report a blocker.", goal)
+        self.assertIn("Worker rules: Never use the main-temp", goal)
         # Secret token must NOT appear in goal
         self.assertNotIn("sensitive-job-secret-token", goal)
         self.assertIn("[redacted]", goal)
