@@ -315,7 +315,17 @@ export class SessionControlService {
     return credentialActor(this.sql, cred) !== null;
   }
 
-  private cancelOwnerLive(row: any, caller: Caller): boolean {
+  private cancelOwnerLive(row: any, caller: Caller, operatorStop = false): boolean {
+    // Explicit human operators already may stop any bound session. Apply the
+    // same authority to a provably unstarted intent, without broadening the
+    // owner-only /cancel endpoint or trusting a collapsed browser actor.
+    if (operatorStop && caller.isAdmin === true && caller.kind === 'human') {
+      if (typeof caller.actor === 'string' && caller.actor.startsWith('human:admin-token:')) return true;
+      if (caller.tokenId) {
+        const cred: any = this.sql.exec('SELECT * FROM credentials WHERE id = ?', caller.tokenId).toArray()[0];
+        if (validateHumanCredentialRecord(this.sql, this.options.env, cred, this.now())?.actor === caller.actor) return true;
+      }
+    }
     if (row.actor !== actorName(caller) || !this.ownerOk(row, caller)) return false;
     // Legacy admin bearers have a stable actor but no credentials-table row.
     // Exact ownership still applies; browser's shared actor=admin cannot cancel.
@@ -1985,7 +1995,11 @@ export class SessionControlService {
           return response({ ...this.view(live), replay: false });
         });
       }
-      if (sub === 'cancel' && request.method === 'POST') {
+      // A stop of an unstarted intent is a cancellation, with the same atomic
+      // claim fence and no fabricated native-exit receipt. Bound stops keep
+      // using host command acknowledgement below.
+      if ((sub === 'cancel' || (sub === 'stop' && !session.binding_json &&
+          ['held', 'queued', 'offered', 'cancelled'].includes(session.state))) && request.method === 'POST') {
         const input = await body(request);
         if (!obj(input, ['key']) || !label(input.key)) return response({ error: 'invalid_cancel' }, 400);
         return this.transaction(() => {
@@ -1995,7 +2009,7 @@ export class SessionControlService {
           // either placement wins and this refuses, or cancellation fences all
           // later starts/retries before reserve can be called.
           const live: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0];
-          if (!writer || !live || !this.cancelOwnerLive(live, caller)) {
+          if (!writer || !live || !this.cancelOwnerLive(live, caller, sub === 'stop')) {
             return response({ error: 'not_found' }, 404);
           }
           const prior: any = this.sql.exec('SELECT * FROM session_control_cancellations WHERE session_id = ?', live.id).toArray()[0];

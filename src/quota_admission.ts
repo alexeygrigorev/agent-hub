@@ -78,8 +78,9 @@ export function evaluateQuotaAdmission(input: QuotaAdmissionInput): QuotaAdmissi
   let remaining: number | null = null;
   let rawMin: number | null = null;
   let available = 0;
+  let timedWindows = 0;
 
-  for (const w of Object.values(quota.windows)) {
+  for (const [name, w] of Object.entries(quota.windows)) {
     if (!isRecord(w) || typeof w.present !== "boolean") return fail("malformed");
     if (w.present === false) {
       // Benign absence: unsupported window with no data and no error.
@@ -94,18 +95,25 @@ export function evaluateQuotaAdmission(input: QuotaAdmissionInput): QuotaAdmissi
     if (typeof pct === "boolean" || typeof pct !== "number" || !Number.isFinite(pct) || pct < 0 || pct > 100) {
       return fail("malformed");
     }
-    if (typeof w.reset_at !== "string") return fail("malformed");
-    const resetMs = Date.parse(w.reset_at);
-    if (!Number.isFinite(resetMs)) return fail("malformed");
-    // A passed reset is not recovery: the observation must be post-reset.
-    if (resetMs <= nowMs && obsMs < resetMs) return fail("reset_passed_since_observation");
+    // Claude's unused five-hour window is explicitly 0% utilized with no
+    // active reset. Preserve that fact without inventing a reset timestamp.
+    // A separate active, timed window is still required (normally weekly).
+    const inactiveClaude = provider === 'claude' && ['5h', 'five_hour'].includes(name) && pct === 100 && w.reset_at === null;
+    if (!inactiveClaude) {
+      if (typeof w.reset_at !== "string") return fail("malformed");
+      const resetMs = Date.parse(w.reset_at);
+      if (!Number.isFinite(resetMs)) return fail("malformed");
+      // A passed reset is not recovery: the observation must be post-reset.
+      if (resetMs <= nowMs && obsMs < resetMs) return fail("reset_passed_since_observation");
+      timedWindows++;
+    }
     rawMin = rawMin === null ? pct : Math.min(rawMin, pct);
     if (pct <= reserve) return { ok: false, reason: "reserve", remaining: rawMin };
     available++;
     remaining = remaining === null ? pct : Math.min(remaining, pct);
   }
 
-  if (!available || remaining === null) return fail("no_available_window");
+  if (!available || !timedWindows || remaining === null) return fail("no_available_window");
   return { ok: true, reason: "eligible", remaining };
 }
 

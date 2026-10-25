@@ -58,6 +58,14 @@ const NATIVE_RESERVED = `(l.native_id = s.native_id OR (
  * hold on the next catalog report. */
 const ORPHAN_OBSERVED_IDLE_TTL_MS = 6 * 3600000;
 const HEADROOM: Record<string, number> = { codex: 15, 'codex-orin': 15, grok: 5 };
+/** The native ZCode adapter and managed Codex profile serve the same ZAI model. */
+function matchesModelRoute(model: any, route: any, family: unknown): boolean {
+  const nativeZai = family === 'zai' && route.engine === 'zcodex' && route.profile === null;
+  return model.provider === family &&
+    (model.engine === route.engine || (nativeZai && model.engine === 'codex' && model.profile === 'zcodex')) &&
+    (model.profile === route.profile || route.profile === 'hub-' + route.account ||
+      (model.profile === null && route.profile !== null) || (nativeZai && model.profile === 'zcodex'));
+}
 /** Engines whose providers the canonical model policy disables. New grok sessions hold here. */
 function disabledEngines(): Set<string> {
   const rules = ((policy as any).rules || {}) as any;
@@ -615,16 +623,14 @@ export class FleetService {
       if (overrideModels.length) {
         const provider = definitions.get(route.account)?.provider;
         const family = provider === 'codex-orin' ? 'codex' : provider;
-        if (!overrideModels.some(m => m.engine === route.engine && m.provider === family &&
-            (m.profile === route.profile || route.profile === 'hub-' + route.account || (m.profile === null && route.profile !== null)))) continue;
+        if (!overrideModels.some(m => matchesModelRoute(m, route, family))) continue;
       }
       if (tierModels) {
         const provider = definitions.get(route.account)?.provider;
         // Named profiles share policy membership with their registered provider,
         // never merely with an executable (Z.ai also uses the Codex engine).
         const family = provider === 'codex-orin' ? 'codex' : provider;
-        if (!tierModels.some(m => (!overrideModels.length || overrideModels.some(o => o.id === m.id)) && m.engine === route.engine && m.provider === family &&
-            (m.profile === route.profile || route.profile === 'hub-' + route.account || (m.profile === null && route.profile !== null)))) {
+        if (!tierModels.some(m => (!overrideModels.length || overrideModels.some(o => o.id === m.id)) && matchesModelRoute(m, route, family))) {
           rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'tier_unavailable' });
           continue;
         }
@@ -670,7 +676,7 @@ export class FleetService {
       const family = definitions.get(route.account)?.provider === 'codex-orin' ? 'codex' : definitions.get(route.account)?.provider;
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
-      const model = policy.models.find(m => members.includes(m.id) && (!overrideModels.length || m.id === input.engine) && m.engine === route.engine && m.provider === family && (m.profile === route.profile || route.profile === 'hub-' + route.account || (m.profile === null && route.profile !== null)));
+      const model = policy.models.find(m => members.includes(m.id) && (!overrideModels.length || m.id === input.engine) && matchesModelRoute(m, route, family));
       if (!model) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'model_unsupported' }); continue; }
       const pending = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND state IN ${ACTIVE}`, route.machine_id).one().n);
       const routingInstalled = this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'routing_machines'").toArray().length;
@@ -1200,6 +1206,14 @@ export class FleetService {
 
       return this.transaction(() => {
         if (isSuccess) {
+          // The host's periodic configuration probe can retire only its own
+          // missing-adapter hold. Authentication failures still require the
+          // explicit recovery probe; a healthy sibling account cannot clear them.
+          if (data.reason === 'admission_configured') {
+            if (!targetMachine) return response({ error: 'machine_required' }, 400);
+            this.sql.exec("UPDATE fleet_engine_health SET status = 'ok', updated_at = ? WHERE engine = ? AND machine_id = ? AND reason = 'admission_unconfigured'", nowIso, data.engine, targetMachine);
+            return response({ status: 'configuration_probed', engine: data.engine, machine_id: targetMachine });
+          }
           if (targetMachine) {
             this.sql.exec("UPDATE fleet_engine_health SET status = 'ok', updated_at = ? WHERE engine = ? AND machine_id = ?", nowIso, data.engine, targetMachine);
           } else {

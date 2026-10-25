@@ -366,6 +366,13 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     expect(ok.ok).toBe(true);
     expect(ok.remaining).toBe(80);
 
+    const inactive = { present: true, percent_remaining: 100, reset_at: null };
+    expect(evaluateQuotaAdmission({ ...good({ '5h': inactive, weekly: weekly(99) }), provider: 'claude' })).toMatchObject({ ok: true, remaining: 99 });
+    expect(evaluateQuotaAdmission({ ...good({ '5h': { ...inactive, percent_remaining: 99 }, weekly: weekly(99) }), provider: 'claude' }).ok).toBe(false);
+    expect(evaluateQuotaAdmission(good({ '5h': inactive, weekly: weekly(99) })).ok).toBe(false);
+    expect(evaluateQuotaAdmission({ ...good({ '5h': inactive }), provider: 'claude' }).ok).toBe(false);
+    expect(evaluateQuotaAdmission({ ...good({ '5h': inactive, weekly: { ...weekly(99), reset_at: null } }), provider: 'claude' }).ok).toBe(false);
+
     // Genuine unavailable sibling fails closed even with a healthy 80% weekly window.
     const sibling = evaluateQuotaAdmission(good({
       five_hour: { present: false, percent_remaining: null, reset_at: null, error: 'unavailable' },

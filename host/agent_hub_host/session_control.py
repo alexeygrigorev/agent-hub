@@ -821,7 +821,9 @@ def _execute(args):
         if queued.get('warning') == 'target_no_reported_state':
             sys.stderr.write('Warning: target session has no recent reported state\n')
         if timeout is not None:
-            if cmd == 'stop':
+            if cmd == 'stop' and queued.get('state') == 'cancelled' and (queued.get('cancellation') or {}).get('effect') == 'no_native_start':
+                queued['stop_wait'] = {'state': 'cancelled', 'effect': 'no_native_start'}
+            elif cmd == 'stop':
                 from .session_stop import wait_for_confirmed_stop
                 command_id = queued.get('command_id')
                 if not command_id:

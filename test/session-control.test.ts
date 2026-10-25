@@ -1442,6 +1442,36 @@ describe('unbound Fleet recovery', () => {
 describe('owned held intent cancellation', () => {
   const start = { key: 'held-cancel-start', name: 'held-fixture', workspace: 'demo', engine: 'codex', mode: 'headless', brief: 'synthetic cancellation fixture' };
 
+  it('stops a never-started held intent by atomic cancellation and replays safely', async () => {
+    const reserve = fakeReserve({ status: 409, error: 'no_eligible_route', rejected: [] });
+    await fixture(async (s, sql) => {
+      const held = await (await s.handle(request('/api/sessions', start), agent())).json() as any;
+      const path = '/api/sessions/' + held.id + '/stop';
+      const value = await (await s.handle(request(path, { key: 'stop-held' }), agent())).json() as any;
+      expect(value.state).toBe('cancelled');
+      expect(value.cancellation.effect).toBe('no_native_start');
+      expect((await (await s.handle(request(path, { key: 'stop-held' }), agent())).json() as any).replay).toBe(true);
+      expect(sql.exec('SELECT id FROM session_control_commands').toArray()).toHaveLength(0);
+      expect((await s.handle(request('/api/sessions/' + held.id + '/retry', {}), agent())).status).toBe(409);
+    }, reserve.hook);
+  });
+
+  it('allows an explicit human operator to stop another owner held intent while cancel stays owner-only', async () => {
+    const reserve = fakeReserve({ status: 409, error: 'no_eligible_route', rejected: [] });
+    await fixture(async (s, sql) => {
+      const held = await (await s.handle(request('/api/sessions', start), agent())).json() as any;
+      const operator = { caller: { kind: 'human', isAdmin: true, actor: 'human:admin-token:synthetic-operator' }, scopes: ['admin'] };
+      const path = '/api/sessions/' + held.id;
+      expect((await s.handle(request(path + '/cancel', { key: 'cancel-other' }), operator)).status).toBe(404);
+      expect((await s.handle(request(path + '/stop', { key: 'stop-other' }), stranger)).status).toBe(404);
+      expect((await s.handle(request(path + '/stop', { key: 'stop-other' }), admin)).status).toBe(404);
+      const value = await (await s.handle(request(path + '/stop', { key: 'stop-other' }), operator)).json() as any;
+      expect(value.state).toBe('cancelled');
+      expect(value.cancellation.effect).toBe('no_native_start');
+      expect(sql.exec('SELECT id FROM session_control_commands').toArray()).toHaveLength(0);
+    }, reserve.hook);
+  });
+
   it('records no-start cancellation, replays it, and fences both original start and retry', async () => {
     const reserve = fakeReserve({ status: 409, error: 'no_capacity' });
     await fixture(async (s, sql) => {

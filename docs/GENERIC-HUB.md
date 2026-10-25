@@ -4,6 +4,14 @@ Agent Hub is a Cloudflare control plane for personal agent fleets. One Worker an
 
 The generic fleet endpoints and dashboard are a source increment. Installing a host configuration and verifying its admission adapter are separate from deploying the Worker. Unknown execution support produces a hold, not a simulated launch.
 
+Host releases use the operator's canonical `~/.config/agent-hub/subscriptions.json` and managed-engine directory. A release override must preserve those paths, the existing credential configuration and journal; task recovery files must not replace the subscription source. Absolute workspace starts require a configured `workspace_roots` entry. Add the narrow existing worktrees root needed by the project; labels and absolute paths use the same admission and realpath confinement.
+
+For an existing native Claude or ZAI account, configure `admission_argv` as the release Python executable followed by `-m agent_hub_host.native_admission --service claude --account shared-claude --engine claude` (ZAI: `--service zai --account shared-zai --engine zcodex`). These explicit, unprofiled routes use native authentication through fresh `quse`; no credentials are imported. Configure the maintained `launcher_provider` and model for headless execution as well. The native ZAI `zcodex` route resolves the policy's `glm-flash` model just like the managed `codex`/`zcodex` profile. A successful admission probe clears only an earlier `admission_unconfigured` hold; it cannot clear an authentication-expiry hold. Grok remains disabled for execution by policy, and read-only placement diagnostics do not start a Grok worker.
+
+`hub sessions stop` cancels a held, queued or unclaimed offered intent when the ledger proves no native start was authorized. Its receipt says `cancelled` with `effect=no_native_start`, including with `--wait`. Stops of bound sessions still require confirmed native exit. Neither cancellation nor a missing binding is exit proof for a claimed launch.
+
+Claude can report a known unused five-hour window as 100% remaining with an explicit null reset. Admission preserves that inactive-window observation and still requires fresh quota plus a valid timed sibling window. It never synthesizes a reset or accepts an unknown reset for a partly used window or another provider.
+
 ## Start work
 
 ```sh

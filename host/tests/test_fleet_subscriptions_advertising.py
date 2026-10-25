@@ -9,6 +9,23 @@ from agent_hub_host import fleet
 
 
 class FleetSubscriptionsAdvertisingTest(unittest.TestCase):
+    def test_canonical_config_and_managed_accounts_merge_without_losing_native_routes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'subscriptions.json'
+            native = [
+                {'service': 'claude', 'engine': 'claude', 'account_label': 'shared-claude', 'admission_argv': ['native-claude-gate']},
+                {'service': 'zai', 'engine': 'zcodex', 'account_label': 'shared-zai', 'admission_argv': ['native-zai-gate']},
+                {'service': 'grok', 'engine': 'grok', 'account_label': 'shared-grok'},
+            ]
+            path.write_text(json.dumps({'version': 1, 'workspaces': {'demo': tmp}, 'subscriptions': native + [
+                {'service': 'codex', 'engine': 'codex', 'account_label': 'shared-codex'},
+            ]}))
+            managed = [{'service': 'codex', 'engine': 'codex', 'account_label': 'shared-codex', 'profile': 'hub-shared-codex', 'admission_argv': ['managed-gate']}]
+            with patch('agent_hub_host.provisioning.managed_subscriptions', return_value=managed):
+                loaded = fleet.load_settings(path)
+            self.assertEqual(loaded['subscriptions'], native + managed)
+            self.assertEqual(len({s['account_label'] for s in loaded['subscriptions']}), 4)
+
     def test_dispatcher_advertises_all_configured_subscription_engines(self):
         calls = []
 

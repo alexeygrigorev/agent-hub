@@ -45,12 +45,20 @@ class TestSessionControlCli(unittest.TestCase):
             result = session_control.execute(self.parse('cancel', 'held-fixture', '--key', 'cancel-once'))
         self.assertEqual(result['state'], 'cancelled')
         transport.assert_called_once_with('POST', '/api/sessions/held-fixture/cancel', {'key': 'cancel-once'})
+
         with patch.object(session_control, 'request') as transport:
             with self.assertRaises(ValueError):
                 session_control.execute(self.parse('cancel', '../other', '--key', 'cancel-once'))
             with self.assertRaises(ValueError):
                 session_control.execute(self.parse('cancel', 'held-fixture', '--key', 'invalid/key'))
         transport.assert_not_called()
+
+    def test_stop_wait_accepts_atomic_no_start_cancellation_without_host_command(self):
+        receipt = {'state': 'cancelled', 'cancellation': {'effect': 'no_native_start'}}
+        with patch.object(session_control, 'request', return_value=receipt) as transport:
+            result = session_control.execute(self.parse('stop', 'held-fixture', '--key', 'stop-held', '--wait', '--timeout', '5'))
+        self.assertEqual(result['stop_wait']['effect'], 'no_native_start')
+        transport.assert_called_once_with('POST', '/api/sessions/held-fixture/stop', {'key': 'stop-held'})
 
     def test_stop_wait_does_not_accept_running(self):
         with patch.object(session_control, 'request', side_effect=[{'state': 'running'}, {'state': 'stopped'}]) as fetch, patch.object(session_control.time, 'sleep'):

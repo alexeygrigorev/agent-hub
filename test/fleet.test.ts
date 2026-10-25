@@ -40,6 +40,44 @@ async function configure(s: FleetService, shared = false) {
 }
 
 describe('generic accounts and launch placement', () => {
+  it('keeps configured Claude, native ZAI and Grok visible and routes policy models under allowed absolute workspace roots', async () => fixture(async (s, sql) => {
+    const entries = [['shared-claude', 'claude', 'claude'], ['shared-zai', 'zai', 'zcodex'], ['shared-grok', 'grok', 'grok']];
+    const config = {
+      accounts: entries.map(([label, provider]) => ({ label, provider, max_concurrency: 8, reserve_percent: 10, enabled: true })),
+      routes: entries.map(([account, , engine]) => ({ machine_id: 'hetzner', engine, account, profile: null })),
+    };
+    expect((await s.handle(request('/accounts', config, 'PUT'), admin)).status).toBe(200);
+    const roots = ['/srv/projects', '/data/agents/project/worktrees'];
+    sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify({ engines: ['claude', 'zcodex', 'grok'], fleet_modes: ['interactive', 'headless'], workspaces: roots, cpu_count: 8 }), 'hetzner');
+    const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false, has_grok_code_access: true }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
+    await s.handle(request('/subscriptions', { subscriptions: entries.map(([account, service]) => ({ account, service, plan: 'pro', quota })) }, 'PUT'), host('hetzner'));
+    const fleet = await (await s.handle(request('', undefined, 'GET'), admin)).json() as any;
+    for (const [label] of entries) {
+      expect(fleet.accounts.find((a: any) => a.label === label)).toMatchObject({ placeable_slots: 8, placement_reasons: [] });
+    }
+    for (const [engine, tier, expected] of [['opus', 'deep', 'claude'], ['glm-flash', 'daily', 'zcodex']]) {
+      const plan = await (await s.handle(request('/plan', intent({ mode: 'headless', workspace: '/data/agents/project/worktrees/recovery', engine, tier })), admin)).json() as any;
+      expect(plan.selected?.engine, JSON.stringify(plan.rejected)).toBe(expected);
+      expect(plan.rejected).toEqual([]);
+    }
+    const grok = await (await s.handle(request('/plan', intent({ engine: 'grok', tier: 'daily' })), admin)).json() as any;
+    expect(grok.selected).toBeNull();
+    expect(grok.rejected).toContainEqual(expect.objectContaining({ engine: 'grok', reason: 'provider_disabled' }));
+    // Prefix siblings must never gain access when a root is added.
+    const outside = await (await s.handle(request('/plan', intent({ engine: 'glm-flash', tier: 'daily', workspace: '/data/agents/project/worktrees-other/recovery' })), admin)).json() as any;
+    expect(outside.selected).toBeNull();
+    expect(outside.rejected).toContainEqual(expect.objectContaining({ reason: 'capability_unavailable' }));
+  }));
+
+  it('retires only a missing-adapter hold after fresh configuration admission', async () => fixture(async (s, sql) => {
+    sql.exec("INSERT INTO fleet_engine_health (engine, machine_id, status, reason, updated_at) VALUES ('zcodex', 'hetzner', 'unavailable', 'admission_unconfigured', ?)", iso());
+    const probe = { engine: 'zcodex', status: 'ok', reason: 'admission_configured' };
+    expect((await s.handle(request('/probe', probe), host('hetzner'))).status).toBe(200);
+    expect(sql.exec("SELECT status FROM fleet_engine_health WHERE engine='zcodex'").one().status).toBe('ok');
+    sql.exec("UPDATE fleet_engine_health SET status='unavailable', reason='engine_auth_expired'");
+    await s.handle(request('/probe', probe), host('hetzner'));
+    expect(sql.exec("SELECT status FROM fleet_engine_health WHERE engine='zcodex'").one().status).toBe('unavailable');
+  }));
   it('authenticates HTTP endpoints and denies an unauthenticated caller', async () => {
     const bindings = env as unknown as Env;
     const stub = bindings.HUB.get(bindings.HUB.idFromName('hub'));

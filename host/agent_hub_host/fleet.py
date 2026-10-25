@@ -336,10 +336,12 @@ def load_settings(path=None):
         raise ValueError('Invalid cleanup roots allowlist')
     from .provisioning import managed_subscriptions
     managed = managed_subscriptions()
-    existing = {s['account_label'] for s in data['subscriptions']}
-    if any(s['account_label'] in existing for s in managed):
-        raise ValueError('Managed and local account labels collide')
-    data['subscriptions'].extend(managed)
+    # Managed state is the authoritative installed revision for that account,
+    # exactly as in Dispatcher.once(). Canonical subscriptions may retain its
+    # local declaration; restarting must not require a reduced recovery file
+    # that accidentally drops unrelated native subscriptions and workspaces.
+    managed_labels = {s['account_label'] for s in managed}
+    data['subscriptions'] = [s for s in data['subscriptions'] if s['account_label'] not in managed_labels] + managed
     return data
 
 
@@ -1756,6 +1758,7 @@ class Dispatcher:
             if resources is not None:
                 hb['launcher_resources'] = resources
         allowed = False
+        admitted_engines = set()
         # This is only a scheduling projection. dispatch() repeats the actual mode/account gate.
         for sub in self.settings['subscriptions']:
             if not sub.get('admission_argv'):
@@ -1764,11 +1767,19 @@ class Dispatcher:
                 gate = self.runner(sub['admission_argv'], payload={'mode': 'interactive', 'engine': sub.get('engine', sub['service']), 'profile': sub.get('profile'), 'account': sub['account_label'], 'workspace': next(iter(self.settings.get('workspaces', {})), None)})
                 at = dt.datetime.fromisoformat(gate['observed_at'].replace('Z', '+00:00'))
                 age = (dt.datetime.now(dt.timezone.utc) - at).total_seconds()
-                allowed |= gate.get('launch_allowed') is True and gate.get('profile_supported') is True and gate.get('account_label') == sub['account_label'] and 0 <= age <= 30
+                admitted = gate.get('launch_allowed') is True and gate.get('profile_supported') is True and gate.get('account_label') == sub['account_label'] and 0 <= age <= 30
+                allowed |= admitted
+                if admitted:
+                    admitted_engines.add(sub.get('engine', sub['service']))
             except Exception:
                 pass
         hb['gate'] = {'launch_allowed': allowed, 'reason': 'fleet local admission' if allowed else 'fleet admission unavailable', 'at': utcnow()}
         self.request('POST', '/api/host/poll', hb)
+        for engine in sorted(admitted_engines):
+            try:
+                self.request('POST', '/api/fleet/probe', {'engine': engine, 'status': 'ok', 'reason': 'admission_configured'})
+            except Exception:
+                pass  # A failed projection never replaces dispatch admission.
         self.request("PUT", "/api/fleet/subscriptions", {"subscriptions": collect_subscriptions(self.settings, self.runner)})
         raw = self.report_catalog_bindings()
         # Native work-claim bridge (Phase 1): mirror redacted local `a work`
