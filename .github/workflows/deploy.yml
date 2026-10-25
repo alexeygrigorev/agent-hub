@@ -114,7 +114,7 @@ jobs:
         run: |
           mkdir -p .local/tmp
           uv sync --frozen
-          uv run --frozen --with pytest python -m pytest -q host/tests/test_aplexer_client.py host/tests/test_supervisor_python.py host/tests/test_human_auth.py host/tests/test_cli.py host/tests/test_session_control.py host/tests/test_intake.py host/tests/test_intake_scope.py host/tests/test_disk_monitor.py host/tests/test_host_health_monitor.py host/tests/test_status.py host/tests/test_status_probe.py host/tests/test_fleet.py host/tests/test_offered_refusals.py host/tests/test_session_executor.py host/tests/test_guarded_delivery.py host/tests/test_capture_evidence.py host/tests/test_retired_native.py host/tests/test_role_runtime.py host/tests/test_role_dispatch.py host/tests/test_jobs.py host/tests/test_runtime.py host/tests/test_session_control_loop.py host/tests/test_session_real_worker.py host/tests/test_real_worker_startup.py host/tests/test_session_lifecycle_m15c.py test/test_scripts.py test/test_mcp_parity.py test/test_phone_ui.py host/tests/test_role_runtime_repair.py host/tests/test_role_dispatch_recovery.py host/tests/test_session_progress.py
+          uv run --frozen --with pytest python -m pytest -q host/tests/test_aplexer_client.py host/tests/test_supervisor_python.py host/tests/test_human_auth.py host/tests/test_cli.py host/tests/test_session_control.py host/tests/test_intake.py host/tests/test_intake_scope.py host/tests/test_disk_monitor.py host/tests/test_host_health_monitor.py host/tests/test_status.py host/tests/test_status_probe.py host/tests/test_fleet.py host/tests/test_offered_refusals.py host/tests/test_session_executor.py host/tests/test_guarded_delivery.py host/tests/test_capture_evidence.py host/tests/test_retired_native.py host/tests/test_role_runtime.py host/tests/test_role_dispatch.py host/tests/test_jobs.py host/tests/test_runtime.py host/tests/test_session_control_loop.py host/tests/test_session_real_worker.py host/tests/test_real_worker_startup.py host/tests/test_session_lifecycle_m15c.py test/test_scripts.py test/test_mcp_parity.py test/test_phone_ui.py host/tests/test_role_runtime_repair.py host/tests/test_role_dispatch_recovery.py host/tests/test_session_progress.py host/tests/test_runtime_diagnostics.py
 
   deploy:
     concurrency:
@@ -152,6 +152,53 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Deploy and verify isolated Hub dev
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          python3 - <<'PYDEV'
+          import json
+          from pathlib import Path
+          root = Path.cwd()
+          config = json.loads((root / 'wrangler.jsonc').read_text())
+          config['name'] = 'agent-hub-dev'
+          config.pop('routes', None)
+          config.pop('route', None)
+          config['workers_dev'] = True
+          config['durable_objects'] = {'bindings': [{'name': 'HUB', 'class_name': 'Hub'}]}
+          config['main'] = str(root / 'src/worker.ts')
+          config['assets']['directory'] = str(root / 'public')
+          config['triggers'] = {'crons': []}
+          Path('.local').mkdir(exist_ok=True)
+          Path('.local/dev-wrangler.json').write_text(json.dumps(config))
+          PYDEV
+          npx wrangler deploy --config .local/dev-wrangler.json --tag "$(git rev-parse --short=12 HEAD)" --message "source_commit=$(git rev-parse HEAD)"
+          python3 - <<'PYDEV'
+          import json, os, time, urllib.error, urllib.request
+          base = 'https://agent-hub-dev.cloudflare-ai-agent-de9ca0.workers.dev'
+          for attempt in range(6):
+              try:
+                  with urllib.request.urlopen(base + '/livez', timeout=15) as response:
+                      assert response.status == 200
+                      assert json.load(response) == {'status': 'ok', 'component': 'hub-worker'}
+                  with urllib.request.urlopen(base + '/cli/manifest.json?source=' + os.environ['GITHUB_SHA'], timeout=15) as response:
+                      assert json.load(response)['built_from_commit'] == os.environ['GITHUB_SHA']
+                  try:
+                      urllib.request.urlopen(base + '/api/sessions', timeout=15)
+                  except urllib.error.HTTPError as error:
+                      assert error.code in (401, 403), error.code
+                  else:
+                      raise RuntimeError('dev sessions must require authentication')
+                  break
+              except (AssertionError, OSError):
+                  if attempt == 5:
+                      raise
+                  time.sleep(5)
+          print('Isolated Hub dev liveness and authentication smoke passed')
+          PYDEV
 
       - name: Deploy to Cloudflare Workers
         env:

@@ -118,6 +118,15 @@ async function claimAs(s: SessionControlService, commandId: string, correlation:
 }
 
 describe('failed launch diagnostics', () => {
+  it('labels a previously bound legacy death as runtime, never dispatch', async () => fixture(async (s, sql) => {
+    const at = new Date().toISOString();
+    ensureFleetLaunch(sql, 'failed-runtime', 'hetzner', null, 'failed');
+    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, binding_json, created_at, updated_at) VALUES ('12121212-1212-4212-8212-121212121212', 'test-admin', 'runtime-key', '{}', 'failed-runtime', 'hetzner', 'headless', 'failed', ?, ?, ?)", JSON.stringify(bound()), at, at);
+    const res = await s.handle(request('/api/sessions/12121212-1212-4212-8212-121212121212', undefined, 'GET'), admin);
+    const view: any = await res.json();
+    expect(view.launch_error).toMatchObject({ reason: 'engine_exited_without_diagnostic', stage: 'runtime' });
+  }));
+
   it.each(['admission_unconfigured', 'launcher_not_started', null, 'secret=/private/token'])('projects a safe failure reason for %s', async reason => fixture(async (s, sql) => {
     const at = new Date().toISOString();
     ensureFleetLaunch(sql, 'failed-launch', 'hetzner', null, 'failed');

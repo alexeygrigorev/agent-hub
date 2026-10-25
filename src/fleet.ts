@@ -1343,8 +1343,20 @@ export class FleetService {
             typeof diagnostic.reason !== 'string' || !/^(?:launcher|engine)_[a-z_]{1,64}$/.test(diagnostic.reason) ||
             typeof diagnostic.message !== 'string' || diagnostic.message.length > 300 || /[\x00-\x1f\x7f]/.test(diagnostic.message) ||
             typeof diagnostic.error_type !== 'string' || !/^[A-Za-z]{1,64}$/.test(diagnostic.error_type) ||
-            !['launcher_run', 'dispatch_headless', 'dispatch_interactive', 'dispatch_route'].includes(diagnostic.stage) ||
+            !['launcher_run', 'dispatch_headless', 'dispatch_interactive', 'dispatch_route', 'runtime'].includes(diagnostic.stage) ||
             (diagnostic.exit_code !== undefined && !Number.isSafeInteger(diagnostic.exit_code)))) return response({ error: 'invalid_launch_diagnostic' }, 400);
+        // An owning host may enrich a legacy failed receipt after collecting
+        // runtime evidence. Identity/state stay fixed; no capacity/lifecycle effect.
+        if (row.mode === 'headless' && row.state === 'failed' && data.state === 'failed' &&
+            diagnostic?.stage === 'runtime' && data.confirmed_exit === true &&
+            object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'diagnostic']) &&
+            !!row.native_id && data.native_id === row.native_id &&
+            !!row.launcher_task_id && data.launcher_task_id === row.launcher_task_id &&
+            (!row.launch_error_json || row.launch_error_json === JSON.stringify(diagnostic)) &&
+            !this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) {
+          this.sql.exec('UPDATE fleet_launches SET launch_error_json = ?, exit_reason = ? WHERE id = ?', JSON.stringify(diagnostic), diagnostic.reason, row.id);
+          return response({ id: row.id, state: row.state, replay: true });
+        }
         const noStart = object(data, ['state', 'launcher_task_id', 'confirmed_exit', 'reason', 'diagnostic']) &&
           data.state === 'failed' && data.confirmed_exit === true &&
           (data.reason === 'launcher_not_started' || (diagnostic && data.reason === diagnostic.reason)) &&

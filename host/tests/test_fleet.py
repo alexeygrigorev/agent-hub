@@ -1196,7 +1196,12 @@ class FleetTests(unittest.TestCase):
             # Post positive retirement: verify_native_retirement returns True
             tombstone = {"cause": "finished", "id": native_id, "tag": f"task-{task_id}",
                          "workspace": str(ws.resolve()), "finished_at_ms": 1792330700000}
-            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, tombstone, "retired_tombstone_verified")):
+            # A completed result remains reviewable even if a tool previously
+            # hit the workload cap; an OOM event alone does not prove the
+            # engine died before producing its completed result.
+            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, tombstone, "retired_tombstone_verified")), \
+                 patch("agent_hub_host.runtime_diagnostics.runtime_diagnostic", return_value={
+                     'reason': 'engine_oom_killed', 'stage': 'runtime'}):
                 reconciled = d.reconcile_launches()
                 self.assertEqual(len(reconciled), 1)
                 self.assertEqual(reconciled[0]['id'], offer_id)
@@ -1210,6 +1215,101 @@ class FleetTests(unittest.TestCase):
             self.assertEqual(terminal_post[2]['launcher_task_id'], task_id)
             self.assertTrue(terminal_post[2]['confirmed_exit'])
 
+            # Verify launcher reconcile was called
+            self.assertTrue(any('reconcile' in c and task_id in c for c in calls))
+
+            # Sub-round: second reconcile pass is idempotent, zero duplicate calls
+            calls_before = len(calls)
+            requests_before = len(requests)
+            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, tombstone, "retired_tombstone_verified")):
+                second_reconciled = d.reconcile_launches()
+                self.assertEqual(second_reconciled, [])
+            self.assertEqual(len(calls), calls_before)
+            self.assertEqual(len(requests), requests_before)
+
+    def test_midrun_failure_keeps_runtime_cause_after_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / 'ws'
+            ws.mkdir()
+            cfg = settings(ws); cfg['capabilities'] = []
+            cfg['launcher'] = {'argv': ['python3', '-m', 'launcher'], 'root': str(ws), 'config_dir': str(ws / 'config')}
+            cfg['subscriptions'][0].update(launcher_provider='codex', launcher_model='gpt-6-sol', launcher_effort='high')
+            native_id = "2ac89cc7-2810-44c2-bab6-34e41633b1e5"
+            offer_id = "38bb1d42-d697-435e-a537-f8a93ac6cf3e"
+            task_id = f"hub-{offer_id}"
+
+            requests = []
+            def request(method, path, body=None):
+                requests.append((method, path, body))
+                if method == "GET" and path == "/api/fleet/offers":
+                    return {"offers": []}
+                if method == "POST" and path == "/api/machines/register":
+                    return {}
+                if method == "POST" and path == "/api/host/poll":
+                    return {}
+                if method == "PUT" and "/api/fleet/" in path:
+                    return {}
+                if method == "GET" and path == "/api/sessions/host-bindings":
+                    return {"sessions": []}
+                if method == "POST" and path == f"/api/fleet/launches/{offer_id}/claim":
+                    return {"id": offer_id, "state": "starting"}
+                if method == "POST" and path == f"/api/fleet/launches/{offer_id}/result":
+                    return {"id": offer_id, "state": body.get("state")}
+                return {}
+
+            calls = []
+            def runner(argv, **kw):
+                calls.append(argv)
+                if argv[0] == 'maintained-gate':
+                    return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+                if 'plan' in argv:
+                    return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol', 'task_fit': 1.0}]}
+                if 'run' in argv:
+                    return {'receipt': {'session_id': native_id, 'state': 'running', 'first_action_verified': True,
+                                        'tag': f"task-{task_id}", 'workspace': str(ws.resolve()), 'engine': 'codex',
+                                        'created_at_ms': 1792330666399}}
+                if 'reconcile' in argv:
+                    return {'task_id': task_id, 'native_id': native_id, 'state': 'failed', 'resources_reserved': False,
+                            'reconciled_action': 'completed-awaiting-review', 'result_evidence_count': 1}
+                if argv[-2:] == ['list', '--json']:
+                    return []
+                return {}
+
+            d = fleet.Dispatcher(cfg, request, runner, journal_dir=str(Path(tmp) / 'journal'))
+            normal_offer = offer(mode='headless', id=offer_id, prompt='Test normal task')
+            disp_res = d.dispatch(normal_offer)
+            self.assertEqual(disp_res['state'], 'running')
+            self.assertEqual(disp_res['native_id'], native_id)
+
+            d._active_launches[offer_id]['runtime_exit'] = {'oom_killed': True, 'signal': 9}
+            d._persist_launch_record(d._active_launches[offer_id])
+            d = fleet.Dispatcher(cfg, request, runner, journal_dir=str(Path(tmp) / 'journal'))
+            # Pre-retirement: reconcile returns no terminal settlement while workload is alive
+            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(False, None, "target_still_active")):
+                pre_reconciled = d.reconcile_launches()
+                self.assertEqual(pre_reconciled, [])
+                self.assertFalse(any(path.endswith('/result') and body.get('confirmed_exit') for m, path, body in requests))
+
+            # Post positive retirement: verify_native_retirement returns True
+            tombstone = {"cause": "finished", "id": native_id, "tag": f"task-{task_id}",
+                         "workspace": str(ws.resolve()), "finished_at_ms": 1792330700000}
+            with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, tombstone, "retired_tombstone_verified")):
+                reconciled = d.reconcile_launches()
+                self.assertEqual(len(reconciled), 1)
+                self.assertEqual(reconciled[0]['id'], offer_id)
+                self.assertEqual(reconciled[0]['state'], 'failed')
+                self.assertTrue(reconciled[0]['reconciled'])
+
+            # Verify terminal result posted to own-host fleet result endpoint
+            terminal_post = next(r for r in requests if r[1] == f"/api/fleet/launches/{offer_id}/result" and r[2].get('confirmed_exit'))
+            self.assertEqual(terminal_post[2]['state'], 'failed')
+            self.assertEqual(terminal_post[2]['native_id'], native_id)
+            self.assertEqual(terminal_post[2]['launcher_task_id'], task_id)
+            self.assertTrue(terminal_post[2]['confirmed_exit'])
+
+            self.assertEqual(terminal_post[2]['diagnostic']['reason'], 'engine_oom_killed')
+            self.assertEqual(terminal_post[2]['diagnostic']['stage'], 'runtime')
+            self.assertEqual(d._active_launches[offer_id]['diagnostic']['reason'], 'engine_oom_killed')
             # Verify launcher reconcile was called
             self.assertTrue(any('reconcile' in c and task_id in c for c in calls))
 

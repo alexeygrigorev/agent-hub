@@ -616,16 +616,18 @@ export class SessionControlService {
     let memoryRejected: any[] = [];
     if (row.fleet_launch_id) {
       try {
-        const launch: any = this.sql.exec('SELECT launch_error_json, model_selection_json, exit_reason FROM fleet_launches WHERE id = ?', row.fleet_launch_id).toArray()[0];
+        const launch: any = this.sql.exec('SELECT launch_error_json, model_selection_json, exit_reason, native_id FROM fleet_launches WHERE id = ?', row.fleet_launch_id).toArray()[0];
         modelSelection = parsed(launch?.model_selection_json);
         modelReason = launch?.exit_reason === 'model_unsupported' ? 'model_unsupported' : null;
         launchError = launch?.launch_error_json ? parsed(launch.launch_error_json, null) : null;
         // Rejections before claim and legacy terminal receipts have no diagnostic
         // DTO. Preserve their bounded reason without publishing arbitrary logs.
         if (!launchError && row.state === 'failed') {
+          const started = !!binding?.native_id || !!launch?.native_id;
           const reason = typeof launch?.exit_reason === 'string' && /^[a-z][a-z_]{0,63}$/.test(launch.exit_reason)
-            ? launch.exit_reason : 'launcher_failed_without_diagnostic';
+            ? launch.exit_reason : started ? 'engine_exited_without_diagnostic' : 'launcher_failed_without_diagnostic';
           const messages: Record<string, string> = {
+            engine_exited_without_diagnostic: 'The engine started and later exited; the legacy receipt did not preserve its runtime cause.',
             admission_unconfigured: 'The host has no fresh admission adapter configured for this engine. Routing is held until it is configured and probed.',
             admission_refused: 'The host fresh admission gate refused this launch.',
             workspace_unavailable: 'The requested workspace is unavailable on this host.',
@@ -633,7 +635,7 @@ export class SessionControlService {
             dispatch_refused: 'The host refused the dispatch before native start.',
             launcher_not_started: 'The maintained launcher did not start a native session.',
           };
-          launchError = { reason, message: messages[reason] || 'The launch failed without a structured diagnostic; inspect the host launcher receipt.', stage: 'dispatch_route' };
+          launchError = { reason, message: messages[reason] || 'The launch failed without a structured diagnostic; inspect the host launcher receipt.', stage: started ? 'runtime' : 'dispatch_route' };
         }
         if (row.state === 'queued' || row.state === 'held') {
           const hold: any = this.sql.exec('SELECT rejected_json FROM fleet_memory_holds WHERE launch_id = ?', row.fleet_launch_id).toArray()[0];

@@ -1017,9 +1017,16 @@ class Dispatcher:
             if record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused':
                 result_payload['diagnostic'] = record['diagnostic']
             if fleet_state == "failed":
+                from .runtime_diagnostics import runtime_diagnostic
+                runtime_failure = runtime_diagnostic(record, tombstone or {})
+                if runtime_failure:
+                    result_payload.setdefault("diagnostic", runtime_failure)
+                fatal_runtime = runtime_failure and (runtime_failure['reason'] in {
+                    'engine_oom_killed', 'engine_runtime_timeout', 'engine_signal_exit'}
+                    or runtime_failure.get('exit_code') not in (None, 0))
                 from .launch_diagnostics import check_engine_auth_expired
                 raw_text = str(reconcile_out.get('reason') or reconcile_out.get('error') or '')
-                if check_engine_auth_expired(raw_text, engine=engine, cwd=record.get("workspace"), task_id=task_id, launched_at=record.get("launched_at_ts") or (record.get("incarnation", 0) / 1000.0 if record.get("incarnation") else None), start_offsets=record.get("log_offsets")):
+                if not fatal_runtime and check_engine_auth_expired(raw_text, engine=engine, cwd=record.get("workspace"), task_id=task_id, launched_at=record.get("launched_at_ts") or (record.get("incarnation", 0) / 1000.0 if record.get("incarnation") else None), start_offsets=record.get("log_offsets")):
                     result_payload["diagnostic"] = {
                         "reason": "engine_auth_expired",
                         "message": "The engine authentication failed or API key has expired.",
@@ -1036,6 +1043,8 @@ class Dispatcher:
                 record["settled"] = True
                 record["state"] = fleet_state
                 record["settled_at"] = utcnow()
+                if result_payload.get("diagnostic"):
+                    record["diagnostic"] = result_payload["diagnostic"]
                 self._persist_launch_record(record)
                 reconciled.append({"id": offer_id, "state": fleet_state, "reconciled": True})
                 if record.get("workspace"):
@@ -1804,6 +1813,22 @@ class Dispatcher:
                 output=NativeTranscriptProgress(opencode_data=self.settings.get('opencode_auth', {}).get('target_data')),
                 state_path=Path(self.journal_dir) / 'session-progress.json' if self.journal_dir else None)
         rows = raw if isinstance(raw, list) else raw.get('sessions', [])
+        # Preserve native exit metadata before automatic retirement removes the row.
+        for record in self._active_launches.values():
+            for row in rows:
+                if (row.get('id') == record.get('native_id')
+                        and row.get('created_at_ms') == record.get('incarnation')
+                        and row.get('tag') == record.get('tag')
+                        and row.get('workspace') == record.get('workspace')
+                        and row.get('engine') == record.get('engine')
+                        and isinstance(row.get('exit'), dict)):
+                    exit_info = row['exit']
+                    safe = {k: exit_info[k] for k in ('code', 'signal', 'exited_at_ms')
+                            if type(exit_info.get(k)) is int}
+                    safe['oom_killed'] = exit_info.get('oom_killed') is True
+                    if record.get('runtime_exit') != safe:
+                        record['runtime_exit'] = safe
+                        self._persist_launch_record(record)
         progress = self._session_progress.sample(rows, self._active_launches)
         self.request("PUT", "/api/fleet/sessions", {"sessions": session_metadata(raw, self.settings, progress)})
         # Reconcile Fleet-owned starts into exact Hub session bindings after

@@ -436,6 +436,24 @@ describe('generic accounts and launch placement', () => {
     expect((await s.handle(request(path, claim), host('hetzner'))).status).toBe(200);
     expect((await s.handle(request(path, claim), host('hetzner'))).status).toBe(409);
   }));
+  it.each([false, true])('stores runtime failure evidence with legacy enrichment=%s', async legacy => fixture(async (s, sql) => {
+    await configure(s);
+    const l: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    await s.handle(request('/launches/' + l.id + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+    const path = '/launches/' + l.id + '/result';
+    const receipt = { state: 'failed', native_id: 'native-runtime', launcher_task_id: 'hub-' + l.id, confirmed_exit: true };
+    await s.handle(request(path, { state: 'running', native_id: receipt.native_id, launcher_task_id: receipt.launcher_task_id }), host('hetzner'));
+    const diagnostic = { reason: 'engine_oom_killed', message: 'The running engine was killed by the kernel OOM killer.', error_type: 'RuntimeError', stage: 'runtime' };
+    if (legacy) expect((await s.handle(request(path, receipt), host('hetzner'))).status).toBe(200);
+    for (let i = 0; i < 2; i++) expect((await s.handle(request(path, { ...receipt, diagnostic }), host('hetzner'))).status).toBe(200);
+    const row: any = sql.exec('SELECT * FROM fleet_launches WHERE id = ?', l.id).one();
+    expect(row.state).toBe('failed');
+    expect(JSON.parse(row.launch_error_json)).toEqual(diagnostic);
+    expect(row.exit_reason).toBe('engine_oom_killed');
+    expect((await s.handle(request(path, { ...receipt, diagnostic, native_id: 'wrong' }), host('hetzner'))).status).toBe(409);
+    expect((await s.handle(request(path, { ...receipt, diagnostic }), host('win35'))).status).toBe(404);
+    expect((await s.handle(request(path, { ...receipt, diagnostic: { ...diagnostic, reason: 'engine_exit_code' } }), host('hetzner'))).status).toBe(409);
+  }));
   it('retains capacity on uncertain effects and requires native receipt/confirmed death to release', async () => fixture(async (s, sql) => {
     await configure(s);
     const l: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
