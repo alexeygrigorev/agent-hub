@@ -305,6 +305,9 @@ describe('sessions_start capacity queue', () => {
     config.accounts.push({ label: 'claude', provider: 'claude', max_concurrency: 1, reserve_percent: 15, enabled: true });
     config.routes.push({ machine_id: 'hetzner', engine: 'claude', account: 'claude', profile: null });
     expect((await f.handle(fleetReq('/accounts', config, 'PUT'), admin)).status).toBe(200);
+    // Goal placement requires host-advertised goal routes: hetzner serves the
+    // Codex goal route, while the free Claude route stays goal-ineligible.
+    sql.exec("UPDATE machines SET capabilities = ? WHERE id = 'hetzner'", JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8, fleet_goal_routes: [{ engine: 'codex', account: 'shared-codex', profile: null }] }));
     const blocking: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner', engine: 'codex' })), admin)).json();
     const response = await s.handle(sessReq('/api/sessions', { key: 'goal-capacity', workspace: 'demo', machine: 'hetzner', mode: 'interactive', with_goal: true, brief: 'Fix capacity' }), admin);
     expect(response.status).toBe(202);

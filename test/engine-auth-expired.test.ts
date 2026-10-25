@@ -613,6 +613,11 @@ describe('engine_auth_expired handling and routing recovery', () => {
 
   it('preserves interactive mode, with_goal constraint and prompt during retry', async () =>
     fixture(async (fleet, _routing, sql) => {
+      // Goal placement requires host-advertised goal routes under the current
+      // contract: both Codex-family routes serve goal starts here.
+      for (const machine of ['hetzner', 'desktop']) {
+        sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify({ engines: ['opencode', 'codex'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8, fleet_goal_routes: [{ engine: 'codex', account: machine === 'hetzner' ? 'zcodex-hetzner' : 'zcodex-desktop', profile: 'zcodex' }] }), machine);
+      }
       // Set up session_control_sessions table
       sql.exec(
         "INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, scopes, created_by_sub, created_at, expires_at) VALUES (?, 'agent', ?, 'fam-goal', 'agent-goal', 'agent-goal', ?, 'admin', ?, ?)",

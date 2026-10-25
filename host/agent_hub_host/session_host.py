@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
 from . import auth, config, fleet, session_control
+from .dispatch_diagnostics import MESSAGES as DISPATCH_MESSAGES
 from .disk_monitor import DiskMonitor
 from .host_health_monitor import HostHealthMonitor
 from .jobs import JobDispatcher
@@ -388,8 +389,7 @@ def maintenance_step_once(dispatcher, quota_collector):
         print(json.dumps({'event': 'fleet_cycle', 'results': len(results)}), flush=True)
         for result in results:
             if (isinstance(result, dict) and result.get('state') in {'failed', 'held'}
-                    and result.get('reason') in {'workspace_unavailable', 'model_unsupported',
-                        'admission_unconfigured', 'admission_refused', 'dispatch_refused'}):
+                    and result.get('reason') in DISPATCH_MESSAGES):
                 # Whitelist diagnostics; no arbitrary exception text or payload.
                 print(json.dumps({'event': 'fleet_dispatch_refused',
                                   'state': result['state'], 'reason': result['reason']}), flush=True)

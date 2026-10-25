@@ -49,3 +49,92 @@ def test_goal_native_start_uses_trusted_command_and_literal_argument():
         assert 'trap/finally' in calls[-1][-1]
         with pytest.raises(ValueError):
             d.dispatch(offer(with_goal=True, mode='headless', prompt='fix'))
+
+
+def test_managed_codex_goal_route_has_admission_and_uses_installed_execution(tmp_path):
+    from agent_hub_host.model_contract import policy_models, native_model
+    selected = next(m for m in policy_models() if m['id'] == 'astra')
+    sub = dict(service='codex', engine='codex', account_label='shared-codex',
+               profile='hub-shared-codex', admission_argv=['managed-admission'],
+               launcher_provider='codex', launcher_model='gpt-6.1-sol')
+    cfg = dict(version=1, workspaces={'demo': str(tmp_path)}, subscriptions=[sub],
+               launcher=dict(argv=['launcher'], root=str(tmp_path), config_dir=str(tmp_path)))
+    calls = []
+    def runner(argv, **kw):
+        calls.append(argv)
+        if argv == ['managed-admission']:
+            return dict(launch_allowed=True, profile_supported=True, model_supported=True,
+                        model=selected['model'], effort=selected['effort'],
+                        account_label='shared-codex', observed_at=fleet.utcnow())
+        if 'model-support' in argv:
+            return dict(supported=True, provider='codex', model=selected['model'])
+        command = argv[argv.index('--') + 1:]
+        assert native_model(command) == selected['model']
+        assert command[-1].startswith('/goal ' + compose_prompt('Literal goal'))
+        assert "from agent_hub_host.provisioning import execute" in command[2]
+        assert 'shared-codex' in command
+        return dict(id='native', workspace=str(tmp_path), tag='hub-' + offer()['id'],
+                    engine='codex', profile=sub['profile'], phase='running', command=command)
+    with patch('agent_hub_host.provisioning.managed_subscriptions', return_value=[sub]):
+        d = fleet.Dispatcher(cfg, lambda *a: {}, runner)
+        assert d.goal_routes() == [dict(engine='codex', account='shared-codex', profile=sub['profile'])]
+        assert d.dispatch(offer(with_goal=True, profile=sub['profile'], prompt='Literal goal', selection=selected))['state'] == 'running'
+    assert len(calls) == 3
+
+
+def test_goal_advertisement_excludes_unlaunchable_accounts(tmp_path):
+    cfg = settings(tmp_path)
+    cfg['subscriptions'] += [dict(service='zai', engine='zcodex', account_label='shared-zai',
+                                  profile=None, admission_argv=['gate']),
+                             dict(service='codex', engine='codex', account_label='monitor-only',
+                                  profile=None, startup_argv=['codex'])]
+    with patch('agent_hub_host.provisioning.managed_subscriptions', return_value=[]):
+        d = fleet.Dispatcher(cfg, lambda *a: {}, lambda *a, **kw: {})
+        assert d.goal_routes() == []
+        cfg['subscriptions'][0]['startup_argv'] = ['codex']
+        assert d.goal_routes() == [dict(engine='codex', account='shared-codex', profile=None)]
+
+
+def test_plain_interactive_preamble_queues_same_workspace(tmp_path):
+    """Empty interactive preamble must be a same-workspace queued send.
+
+    A --workspace send to the not-yet-existing native tag is rejected as a
+    cross-workspace queued target before native binding exists; the host
+    bridge's durable queued-send shape (cwd, no --workspace) is required.
+    Goal starts carry /goal in native argv and must not queue a preamble.
+    """
+    from agent_hub_host.session_rules import SESSION_PREAMBLE
+    cfg = settings(tmp_path)
+    cfg['subscriptions'][0]['startup_argv'] = ['trusted-codex', '--safe']
+    calls, http = [], []
+
+    def runner(argv, **kw):
+        calls.append((argv, kw))
+        if argv[0] == 'maintained-gate':
+            return {'launch_allowed': True, 'profile_supported': True,
+                    'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+        if argv[1:3] == ['message', 'send']:
+            return {'id': 'queued-preamble'}
+        return {'id': 'native', 'workspace': str(tmp_path), 'tag': 'hub-' + offer()['id'],
+                'engine': 'codex', 'profile': None, 'phase': 'running'}
+
+    def request(method, path, body=None):
+        http.append((method, path, body))
+        return {}
+
+    with patch('agent_hub_host.provisioning.managed_subscriptions', return_value=[]):
+        d = fleet.Dispatcher(cfg, request, runner)
+        assert d.dispatch(offer())['state'] == 'running'
+    preamble = [c for c in calls if len(c[0]) > 2 and c[0][1:3] == ['message', 'send']]
+    assert len(preamble) == 1
+    argv, kw = preamble[0]
+    assert argv == ['aplexer', 'message', 'send', '--to', 'hub-' + offer()['id'], '--queue',
+                    '--kind', 'hub-session-preamble', '--json', SESSION_PREAMBLE]
+    assert '--workspace' not in argv
+    assert kw.get('cwd') == str(tmp_path)
+
+    calls.clear()
+    with patch('agent_hub_host.provisioning.managed_subscriptions', return_value=[]):
+        d = fleet.Dispatcher(cfg, request, runner)
+        assert d.dispatch(offer(with_goal=True, prompt='Literal goal'))['state'] == 'running'
+    assert not [c for c in calls if len(c[0]) > 2 and c[0][1:3] == ['message', 'send']]

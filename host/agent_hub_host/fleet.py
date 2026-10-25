@@ -1289,6 +1289,17 @@ class Dispatcher:
 
         return sorted(qualified)
 
+    def goal_routes(self):
+        """Advertise executable local routes, independent of quota admission."""
+        return [{'engine': sub.get('engine', sub['service']), 'account': sub['account_label'],
+                 'profile': sub.get('profile')}
+                for sub in self.settings['subscriptions']
+                if sub.get('engine', sub['service']) in {'codex', 'zcodex'}
+                and sub.get('admission_argv')
+                and (sub['account_label'] in self._managed_labels or
+                     (isinstance(sub.get('startup_argv'), list) and sub['startup_argv']
+                      and all(isinstance(arg, str) and arg and '\0' not in arg for arg in sub['startup_argv'])))]
+
     def _route(self, offer):
         matches = [s for s in self.settings["subscriptions"] if s["account_label"] == offer.get("account") and s.get("engine", s["service"]) == offer.get("engine") and s.get("profile") == offer.get("profile")]
         if len(matches) != 1:
@@ -1566,9 +1577,14 @@ class Dispatcher:
                 # Empty interactive starts must remain empty: queue the trusted
                 # preamble in the native inbox before the engine's awareness hook
                 # runs. Never type into a PTY, overwrite a draft, or start a goal.
-                self.runner([native, "message", "send", "--workspace", str(workspace),
+                # Same-workspace queued send only (cwd, no --workspace): a
+                # --workspace send to a not-yet-existing tag is rejected as a
+                # cross-workspace queued target before native binding exists.
+                # Mirrors the host bridge's durable queued-send shape.
+                self.runner([native, "message", "send",
                              "--to", "hub-" + offer_id, "--queue",
-                             "--kind", "hub-session-preamble", "--json", SESSION_PREAMBLE])
+                             "--kind", "hub-session-preamble", "--json", SESSION_PREAMBLE],
+                            cwd=str(workspace))
             receipt = self.runner(argv, cwd=cwd, timeout=120)
             if mode == "interactive":
                 native_id = receipt.get("id")
@@ -1870,6 +1886,7 @@ class Dispatcher:
                     workspaces=advertised_workspaces(self.settings), cpu_count=os.cpu_count())
         caps['fleet_modes'] = ['interactive'] + (['headless'] if self.settings.get('launcher') else [])
         caps['launcher_resources'] = bool(self.settings.get('launcher'))
+        caps['fleet_goal_routes'] = self.goal_routes()
         # The maintained launcher admits Claude headless work only through a
         # managed profile. Its global model-support list alone does not prove
         # this local account route is executable (interactive is independent).
@@ -1988,25 +2005,24 @@ class Dispatcher:
                 if isinstance(exc, AuthBusy):
                     results.append({'id': offer.get('id'), 'state': 'held', 'reason': 'engine_auth_busy'})
                     continue  # No claim/effect; preserve offer for the next poll.
-                # Persist only a bounded slug, never exception text (which may
-                # contain goals, paths or credentials). The server atomically
-                # rejects only unclaimed offers: a lost claim response or a
-                # possibly-live native effect must retain its reservation.
-                reason = 'dispatch_refused'
-                if isinstance(exc, ValueError):
-                    prefix = str(exc).split(':', 1)[0]
-                    if prefix in {'model_unsupported', 'admission_unconfigured', 'engine_auth_expired'}:
-                        reason = prefix
-                    elif str(exc) in {'Fresh admission refused', 'Fresh admission timestamp required',
-                                      'Selected model/effort requires verified admission'}:
-                        reason = 'admission_refused'
+                from .dispatch_diagnostics import classify
+                workspace_available = True
                 try:
                     resolve_workspace_path(self.settings, offer.get('workspace'))
                 except (ValueError, OSError):
-                    reason = 'workspace_unavailable'
+                    workspace_available = False
+                diagnostic = classify(exc, workspace_available=workspace_available)
+                reason = diagnostic['reason']
+                # Only fixed diagnostics enter the journal; no prompt, argv,
+                # account credentials or arbitrary exception text is retained.
+                record = {'offer_id': offer.get('id'), 'state': 'dispatch_refused',
+                          'reason': reason, 'diagnostic': diagnostic, 'settled': False}
+                self._persist_launch_record(record)
                 if not offer.get('task_id'):
                     try:
-                        rejected = self.request('POST', '/api/fleet/launches/' + offer['id'] + '/reject', {'reason': reason})
+                        rejected = self.request('POST', '/api/fleet/launches/' + offer['id'] + '/reject', {'reason': reason, 'diagnostic': diagnostic})
+                        record['settled'] = True
+                        self._persist_launch_record(record)
                         results.append(rejected)
                         continue
                     except Exception:
@@ -2016,7 +2032,7 @@ class Dispatcher:
                 err = (type(exc).__name__ or "Error")[:64]
                 results.append({"id": offer.get("id"), "state": "held",
                                 "reason": reason, "stage": "dispatch_route",
-                                "error": err})
+                                "error": err, "diagnostic": diagnostic})
         return results
 
 

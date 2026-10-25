@@ -88,6 +88,24 @@ export const PLACEMENT_PRESSURE_REASONS = new Set(['launcher_memory_reserve', 'a
  * (stale/drained check-ins, policy-disabled engines, engines no live host
  * advertises anymore — e.g. registry routes for engines the current host
  * release stopped running). */
+const DISPATCH_MESSAGES: Record<string, string> = {
+  "workspace_unavailable": "The requested workspace is not available on this host.",
+  "dispatch_route_unconfigured": "The offered account, engine and profile do not match a local route.",
+  "goal_startup_unconfigured": "This account has no trusted interactive goal startup command.",
+  "dispatch_startup_invalid": "The configured trusted startup command is invalid.",
+  "dispatch_cwd_invalid": "The requested working directory is not confined to the workspace.",
+  "dispatch_goal_invalid": "Goal work requires an interactive Codex-family route and nonempty text.",
+  "dispatch_prompt_unsupported": "Interactive prompt injection requires an explicit goal start.",
+  "dispatch_offer_invalid": "The offered launch or task identifier is invalid.",
+  "dispatch_capability_unavailable": "The required task capabilities are unavailable on this host.",
+  "dispatch_local_command_failed": "A local dispatch prerequisite command failed before native start.",
+  "dispatch_internal_error": "An unexpected host dispatch error occurred before native start.",
+  "dispatch_claim_refused": "The Hub refused the dispatch claim before native start.",
+  "model_unsupported": "The selected model or effort is unsupported by this local route.",
+  "admission_unconfigured": "This local route has no maintained fresh admission adapter.",
+  "admission_refused": "Fresh admission refused this account or could not verify its timestamp and model.",
+  "engine_auth_expired": "The engine authentication is unavailable or expired."
+};
 const INCIDENTAL_REASONS = new Set(['machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'engine_tool_permission_refused', 'admission_unconfigured']);
 /** Capacity-only placement failure: every rejected route reports transient
  * capacity (account/machine), optionally alongside incidental stale/disabled
@@ -649,6 +667,10 @@ export class FleetService {
       // roots (`{root}/{label}`); absolutes and already-capable labels pass
       // through unchanged. Each candidate records its effective workspace so
       // the winner's normalized absolute is what gets stored and offered.
+      if (request.with_goal && (!Array.isArray(caps.fleet_goal_routes) || !caps.fleet_goal_routes.some((r: any) =>
+          r.engine === route.engine && r.account === route.account && (r.profile ?? null) === route.profile))) {
+        rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'goal_unsupported' }); continue;
+      }
       const effectiveWorkspace = resolveLabelUnderRoots(caps.workspaces, request.workspace);
       let reason = '';
       if (!machine || machine.drained || !fresh(effectiveCheckin(machine.id, machine.last_checkin_at), this.now(), 180000)) reason = 'machine_unavailable';
@@ -932,7 +954,7 @@ export class FleetService {
         return { ...m, last_checkin_at: effectiveCheckin(m.id, m.last_checkin_at), alias_of: canonical, canonical_id: canonical ?? String(m.id) };
       });
       const sessions = projectAliasSessions(this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray(), new Map(Object.entries(machineAliases)), this.now(), freshCatalogs(this.sql, this.now()));
-      return response({ accounts: this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray().map(a => this.accountStatus(a)), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray().map(r => ({ ...r, supports_goal: ['codex', 'zcodex'].includes(String(r.engine)) })),
+      return response({ accounts: this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray().map(a => this.accountStatus(a)), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray().map(r => ({ ...r, supports_goal: (() => { const caps = parsed(this.sql.exec('SELECT capabilities FROM machines WHERE id = ?', r.machine_id).toArray()[0]?.capabilities); return Array.isArray(caps?.fleet_goal_routes) && caps.fleet_goal_routes.some((g: any) => g.engine === r.engine && g.account === r.account && (g.profile ?? null) === r.profile); })() })),
         machines, machine_aliases: machineAliases,
         agents: this.sql.exec('SELECT tag, project, role, machine_id, engine, session_id, health_state, health_at FROM agents').toArray(),
         sessions,
@@ -1267,11 +1289,16 @@ export class FleetService {
         const row: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id = ? AND machine_id = ?', match[1], caller.machineId!).toArray()[0];
         if (!row) return response({ error: 'not_found' }, 404);
         if (match[2] === 'reject') {
-          if (!object(data, ['reason']) || !['workspace_unavailable', 'model_unsupported', 'admission_unconfigured', 'admission_refused', 'dispatch_refused', 'engine_auth_expired'].includes(data.reason)) return response({ error: 'invalid_rejection' }, 400);
+          if (!object(data, ['reason', 'diagnostic']) || (data.reason !== 'dispatch_refused' && !Object.hasOwn(DISPATCH_MESSAGES, data.reason))) return response({ error: 'invalid_rejection' }, 400);
+          const diagnostic = data.diagnostic ?? { reason: data.reason, message: DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.', stage: 'dispatch_route', error_type: 'Error' };
+          if (!object(diagnostic, ['reason', 'message', 'stage', 'error_type']) || diagnostic.reason !== data.reason || diagnostic.stage !== 'dispatch_route' ||
+              diagnostic.message !== (DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.') ||
+              typeof diagnostic.error_type !== 'string' || !/^[A-Za-z]{1,64}$/.test(diagnostic.error_type)) return response({ error: 'invalid_rejection' }, 400);
           // Only an unclaimed offer proves that no start was authorized. The
           // transaction fences a racing claim; never reject possibly-live work.
           if (row.state !== 'offered' || row.native_id || row.launcher_task_id) return response({ error: 'already_claimed' }, 409);
           if (this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) return response({ error: 'task_report_required' }, 409);
+          this.sql.exec('UPDATE fleet_launches SET launch_error_json = ? WHERE id = ?', JSON.stringify(diagnostic), row.id);
           const at = new Date(this.now()).toISOString();
           if (data.reason === 'model_unsupported' || data.reason === 'engine_auth_expired') {
             if (data.reason === 'engine_auth_expired') {
@@ -1301,7 +1328,7 @@ export class FleetService {
             this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at) VALUES (?, ?, 'unavailable', ?, ?)", row.engine, row.machine_id, data.reason, at);
           }
           try { this.drainCapacityQueue(); } catch { /* best-effort */ }
-          return response({ id: row.id, state: 'failed', reason: data.reason });
+          return response({ id: row.id, state: 'failed', reason: data.reason, diagnostic });
         }
         if (match[2] === 'claim') {
           if (row.state !== 'offered') return response({ error: 'already_claimed' }, 409);

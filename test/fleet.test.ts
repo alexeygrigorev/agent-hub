@@ -605,7 +605,7 @@ describe('generic accounts and launch placement', () => {
     expect(account.active).toBe(1);
     expect(account.available_slots).toBe(account.max_concurrency - 1);
   }));
-  it.each(['workspace_unavailable', 'admission_unconfigured', 'admission_refused', 'dispatch_refused'])('rejects only unclaimed own-host offers with explicit %s', async reason => fixture(async (s, sql) => {
+  it.each(['workspace_unavailable', 'admission_unconfigured', 'admission_refused', 'dispatch_refused', 'goal_startup_unconfigured', 'dispatch_route_unconfigured', 'dispatch_internal_error'])('rejects only unclaimed own-host offers with explicit %s', async reason => fixture(async (s, sql) => {
     await configure(s);
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
     const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
@@ -618,6 +618,12 @@ describe('generic accounts and launch placement', () => {
     expect((await s.handle(request(path, receipt), host('hetzner'))).status).toBe(200);
     expect(sql.exec('SELECT state, exit_reason, verification_status FROM fleet_launches WHERE id = ?', launch.id).one()).toMatchObject({ state: 'failed', exit_reason: reason, verification_status: 'not_started' });
     expect(sql.exec("SELECT state FROM session_control_sessions WHERE id = 'pending'").one().state).toBe('failed');
+    const diagnostic = JSON.parse(String(sql.exec('SELECT launch_error_json FROM fleet_launches WHERE id = ?', launch.id).one().launch_error_json));
+    expect(diagnostic).toMatchObject({ reason, stage: 'dispatch_route' });
+    expect(diagnostic.message.length).toBeGreaterThan(10);
+    const sessions = new SessionControlService(sql, cb => cb(), () => now); sessions.init();
+    const shown: any = await (await sessions.handle(new Request('https://hub.test/api/sessions/' + launch.id), admin)).json();
+    expect(shown).toMatchObject({ reason, message: diagnostic.message });
     expect((await s.handle(request(path, receipt), host('hetzner'))).status).toBe(409);
     // Recovery requires an explicit successful probe; quota alone never clears the hold.
     if (reason === 'admission_unconfigured') {
@@ -630,6 +636,49 @@ describe('generic accounts and launch placement', () => {
     await s.handle(request('/launches/' + claimed.id + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
     expect((await s.handle(request('/launches/' + claimed.id + '/reject', receipt), host('hetzner'))).status).toBe(409);
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', claimed.id).one().state).toBe('starting');
+  }));
+  it('round-trips a full host diagnostic and surfaces it on the session', async () => fixture(async (s, sql) => {
+    await configure(s);
+    for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
+    const legacy: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES ('legacy-show', 'owner', 'legacy-show', '{}', ?, 'hetzner', 'headless', 'offered', ?, ?)", legacy.id, iso(), iso());
+    expect((await s.handle(request('/launches/' + legacy.id + '/reject', { reason: 'goal_startup_unconfigured' }), host('hetzner'))).status).toBe(200);
+    const fixed = JSON.parse(String(sql.exec('SELECT launch_error_json FROM fleet_launches WHERE id = ?', legacy.id).one().launch_error_json));
+    expect(fixed).toMatchObject({ reason: 'goal_startup_unconfigured', stage: 'dispatch_route' });
+    const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES ('full-show', 'owner', 'full-show', '{}', ?, 'hetzner', 'headless', 'offered', ?, ?)", launch.id, iso(), iso());
+    const diagnostic = { reason: 'goal_startup_unconfigured', message: fixed.message, stage: 'dispatch_route', error_type: 'ValueError' };
+    const refused: any = await (await s.handle(request('/launches/' + launch.id + '/reject', { reason: diagnostic.reason, diagnostic }), host('hetzner'))).json();
+    expect(refused).toMatchObject({ id: launch.id, state: 'failed', reason: diagnostic.reason, diagnostic });
+    expect(JSON.parse(String(sql.exec('SELECT launch_error_json FROM fleet_launches WHERE id = ?', launch.id).one().launch_error_json))).toEqual(diagnostic);
+    const sessions = new SessionControlService(sql, cb => cb(), () => now); sessions.init();
+    const shown: any = await (await sessions.handle(new Request('https://hub.test/api/sessions/' + launch.id), admin)).json();
+    expect(shown).toMatchObject({ reason: diagnostic.reason, message: diagnostic.message, launch_error: diagnostic });
+  }));
+  it('offers goal starts only to host-advertised Codex-family routes', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
+    await s.handle(request('/subscriptions', { subscriptions: [
+      { service: 'codex', account: 'shared-codex', plan: 'pro', quota },
+      { service: 'codex', account: 'desktop-codex', plan: 'pro', quota },
+    ] }, 'PUT'), host('hetzner'));
+    await s.handle(request('/subscriptions', { subscriptions: [{ service: 'codex', account: 'desktop-codex', plan: 'pro', quota }] }, 'PUT'), host('win35'));
+    const goalCaps = (routes: any[]) => ({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8, fleet_goal_routes: routes });
+    sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify(goalCaps([{ engine: 'codex', account: 'shared-codex', profile: null }])), 'hetzner');
+    const goal = intent({ mode: 'interactive', with_goal: true, tier: 'deep' });
+    const planned = s.plan(goal);
+    expect(planned.selected?.machine, JSON.stringify(planned.rejected)).toBe('hetzner');
+    expect(planned.rejected).toContainEqual({ machine: 'win35', engine: 'codex', reason: 'goal_unsupported' });
+    const listed: any = await (await s.handle(request('', undefined, 'GET'), admin)).json();
+    const routes = listed.routes.filter((r: any) => r.engine === 'codex');
+    expect(routes.find((r: any) => r.machine_id === 'hetzner')).toMatchObject({ supports_goal: true });
+    expect(routes.find((r: any) => r.machine_id === 'win35')).toMatchObject({ supports_goal: false });
+    // A host release that does not advertise goal routes serves no goal start.
+    sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }), 'hetzner');
+    const unsupported = s.plan(goal);
+    expect(unsupported.selected).toBeNull();
+    expect(unsupported.rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'goal_unsupported' });
+    expect(unsupported.rejected).toContainEqual({ machine: 'win35', engine: 'codex', reason: 'goal_unsupported' });
   }));
   it.each([false, true])('keeps unsupported-model session alive with fallback or explicit hold (pinned=%s)', async pinned => fixture(async (s, sql) => {
     await configure(s);

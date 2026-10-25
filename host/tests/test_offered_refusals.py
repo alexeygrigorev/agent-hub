@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from agent_hub_host import fleet, session_host
+from agent_hub_host.dispatch_diagnostics import classify as fleet_diagnostic
 
 
 class OfferedRefusals(unittest.TestCase):
@@ -56,7 +57,7 @@ class OfferedRefusals(unittest.TestCase):
                 offer = self.offer(mode, **({'with_goal': True} if mode == 'interactive' else {}))
                 results, calls = self.cycle(Path(tmp), [offer])
                 self.assertEqual(results[-1], {'id': offer['id'], 'state': 'failed',
-                                               'reason': 'admission_unconfigured'})
+                                               'reason': 'admission_unconfigured', 'diagnostic': fleet_diagnostic(ValueError('admission_unconfigured: missing'))})
                 self.assertEqual([b for _, p, b in calls if p == '/api/fleet/probe'],
                                  [{'engine': 'zcodex', 'status': 'unavailable',
                                    'reason': 'admission_unconfigured'}])
@@ -64,13 +65,13 @@ class OfferedRefusals(unittest.TestCase):
                                 next(i for i, c in enumerate(calls) if c[1] == '/api/fleet/offers'))
                 self.assertEqual([p for _, p, _ in calls if p.endswith('/claim')], [])
                 self.assertEqual([b for _, p, b in calls if p.endswith('/reject')],
-                                 [{'reason': 'admission_unconfigured'}])
+                                 [{'reason': 'admission_unconfigured', 'diagnostic': fleet_diagnostic(ValueError('admission_unconfigured: missing'))}])
 
     def test_unknown_failure_is_redacted_and_does_not_starve_later_offers(self):
         with tempfile.TemporaryDirectory() as tmp:
             offers = [self.offer('headless'), self.offer('interactive', id='22345678-1234-1234-1234-123456789abc')]
             results, calls = self.cycle(Path(tmp), offers, dispatch_error=RuntimeError('Bearer PRIVATE goal /path'))
-            self.assertEqual([r['reason'] for r in results[1:]], ['dispatch_refused'] * 2)
+            self.assertEqual([r['reason'] for r in results[1:]], ['dispatch_local_command_failed'] * 2)
             self.assertNotIn('PRIVATE', json.dumps([results, calls]))
 
     def test_lost_rejection_or_already_claimed_response_is_not_exit_proof(self):
@@ -97,3 +98,23 @@ class OfferedRefusals(unittest.TestCase):
         self.assertIn({'event': 'fleet_dispatch_refused', 'state': 'failed',
                        'reason': 'admission_unconfigured'}, events)
         self.assertNotIn('private', out.getvalue().lower())
+
+    def test_specific_goal_startup_refusal_reaches_journal_and_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            req = self.offer('interactive', with_goal=True)
+            results, calls = self.cycle(Path(tmp), [req], dispatch_error=ValueError('Goal startup requires a trusted local command'))
+            last = results[-1]
+            self.assertEqual(last['reason'], 'goal_startup_unconfigured')
+            self.assertIn('trusted interactive goal startup', last['diagnostic']['message'])
+            journal = json.loads((Path(tmp) / 'fleet-launches' / (req['id'] + '.json')).read_text())
+            self.assertTrue(journal['settled'])
+            self.assertEqual(journal['diagnostic'], last['diagnostic'])
+            self.assertNotIn('private task', json.dumps(journal))
+
+    def test_route_mismatch_and_arbitrary_failure_never_expose_exception_text(self):
+        for error, expected in [(ValueError('Local account/profile/workspace is not configured'), 'dispatch_route_unconfigured'),
+                                (ValueError('Bearer PRIVATE unexpected'), 'dispatch_internal_error')]:
+            with tempfile.TemporaryDirectory() as tmp:
+                results, calls = self.cycle(Path(tmp), [self.offer('interactive', with_goal=True)], dispatch_error=error)
+                self.assertEqual(results[-1]['reason'], expected)
+                self.assertNotIn('PRIVATE', json.dumps([results, calls]))
