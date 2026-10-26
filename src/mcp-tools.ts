@@ -115,7 +115,7 @@ export function publicTools() {
   return routes.map(r => {
     const slots = [...r.path.matchAll(/\{(\w+)\}/g)].map(m => m[1]);
     const properties: Record<string, unknown> = Object.fromEntries(slots.map(s => [s, { type: 'string', minLength: 1, maxLength: 256 }]));
-    if (r.method === 'GET') properties.query = { type: 'object', additionalProperties: { type: ['string', 'number', 'boolean'] } };
+    if (r.method === 'GET' || r.name === 'sessions_cleanup') properties.query = { type: 'object', additionalProperties: { type: ['string', 'number', 'boolean'] } };
     if (r.method !== 'GET') properties.payload = { type: 'object', description: 'JSON request body.', additionalProperties: true };
     return { name: r.name, description: r.description, inputSchema: { type: 'object', properties, ...(slots.length ? { required: slots } : {}), additionalProperties: false },
       annotations: { readOnlyHint: r.method === 'GET', destructiveHint: r.method !== 'GET' && r.name !== 'sessions_capture', idempotentHint: r.method === 'GET', openWorldHint: false } };

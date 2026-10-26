@@ -60,7 +60,11 @@ describe('Hub MCP protocol and parity', () => {
       expect(tool.annotations.destructiveHint).toBe(route.method !== 'GET' && route.name !== 'sessions_capture');
       if (route.method !== 'GET') {
         expect(tool.inputSchema.properties.payload).toMatchObject({ description: 'JSON request body.' });
-        expect(tool.inputSchema.properties).not.toHaveProperty('query');
+        if (route.name === 'sessions_cleanup') {
+          expect(tool.inputSchema.properties).toHaveProperty('query');
+          const request = toolRequest(origin, route.name, { query: { host: 'fixture-host', task: 'fixture-task', owner: 'fixture-owner' }, payload: { dry_run: true } }, 'Bearer fixture');
+          expect(Object.fromEntries(new URL(request.url).searchParams)).toEqual({ host: 'fixture-host', task: 'fixture-task', owner: 'fixture-owner' });
+        } else expect(tool.inputSchema.properties).not.toHaveProperty('query');
         // Legacy query arguments remain accepted by the runtime adapter.
         const args = Object.fromEntries([...route.path.matchAll(/\{(\w+)\}/g)].map(match => [match[1], 'fixture']));
         expect(() => toolRequest(origin, route.name, { ...args, query: {}, payload: {} }, 'Bearer fixture')).not.toThrow();
