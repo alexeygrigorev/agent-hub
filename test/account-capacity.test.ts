@@ -43,6 +43,23 @@ async function configure(s: FleetService, shared = false) {
 }
 
 describe('phantom account reservations', () => {
+  it('preserves legacy duplicate cwd and direct native identity capacity rules', () => fixture(async(f,sql)=>{
+    await configure(f);
+    const launch:any=await (await f.handle(request('/launches',intent({machine:'hetzner',mode:'headless'})),admin)).json();
+    sql.exec("UPDATE fleet_launches SET state='uncertain',request_json=? WHERE id=?",'{"cwd":".","cwd":"other"}',launch.id);
+    sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace,account) VALUES('hetzner','legacy-native',?,'codex','running',?,'demo','shared-codex')",'task-hub-'+launch.id,iso());
+    const active=()=>f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-codex'").one()).active;
+    expect(active()).toBe(1); // Existing SQL correlation uses the first cwd.
+    sql.exec('UPDATE fleet_launches SET request_json=? WHERE id=?','{"cwd":"other","cwd":"."}',launch.id);
+    expect(active()).toBe(2);
+    // Exact native IDs already prove correlation regardless of tag/cwd or
+    // engine metadata; do not narrow that branch while splitting the joins.
+    sql.exec("UPDATE fleet_launches SET native_id='legacy-native',engine='claude' WHERE id=?",launch.id);
+    expect(active()).toBe(1);
+    sql.exec("UPDATE fleet_launches SET state='stopped' WHERE id=?",launch.id);
+    expect(active()).toBe(1); // Orphan now holds the slot instead of reservation.
+  }));
+
   it('counts an unbound native in the requested relative cwd once without correlating foreign or ambiguous natives', () => fixture(async (f, sql) => {
     await configure(f);
     sql.exec("UPDATE machines SET capabilities = json_set(capabilities, '$.workspaces', json('[\"/repo\"]')) WHERE id = 'hetzner'");

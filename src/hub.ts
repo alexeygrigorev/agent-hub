@@ -173,6 +173,7 @@ export class Hub extends DurableObject {
       },
     }, { env: this.env });
     this.sessionControlService.init();
+    this.fleetService.resources.initCatalogCache();
     this.sql.exec(`CREATE INDEX IF NOT EXISTS session_control_native ON session_control_sessions(machine_id,
       CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(binding_json, '$.native_id') = 'text'
         THEN json_extract(binding_json, '$.native_id') END END)`);

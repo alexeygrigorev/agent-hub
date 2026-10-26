@@ -441,6 +441,18 @@ describe('bounded queue maintenance', () => {
       SELECT ?,actor,requester_kind,summary,?,?,machine_id,engine,account,mode,workspace,prompt,'queued',?,? FROM fleet_launches WHERE id=?`,
       id, id, JSON.stringify({...JSON.parse(row.request_json), ...patch}), created, created, template);
   }
+  it('keeps the host poll budget when nested maintenance asks for the default slice',()=>fleetFixture(async(f,sql)=>{
+    await configure(f);
+    const first=f.reserve(intent({machine:'hetzner'}),admin).value;
+    for(let i=0;i<4;i++) park(sql,first.id,'budget-blocked-'+i,{machine:'missing'});
+    const plan=vi.spyOn(f,'plan');
+    f.withMaintenance(()=>{f.drainCapacityQueue();f.drainCapacityQueue(1);},1);
+    expect(plan).toHaveBeenCalledTimes(1);
+    plan.mockClear();
+    // The request scope ends: normal maintenance still advances two rows.
+    f.drainCapacityQueue();expect(plan).toHaveBeenCalledTimes(2);
+    plan.mockRestore();
+  }));
   it('bounds nested maintenance and reaches eligible work past 200 blocked rows after restart', () => fleetFixture(async (f, sql) => {
     await configure(f);
     const first = f.reserve(intent({machine:'hetzner'}), admin).value;

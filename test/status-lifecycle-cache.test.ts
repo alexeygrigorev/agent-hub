@@ -117,3 +117,68 @@ it('keeps decisions and time live, survives rollback ABA, and bypasses absent in
     expect(read().inputs[0].engine).toBe('codex');
   });
 });
+
+it('refreshes cached status control rows and latest observations after writes and rollback',async()=>{
+ const stub=(env as any).HUB.get((env as any).HUB.idFromName('status-source-cache'));
+ await inDO(stub,(h:any)=>{
+  const now=seed(h),service:any=h.statusService;
+  const query='SELECT id,state,binding_json FROM session_control_sessions WHERE id=?';
+  const read=()=>service.cachedSourceRows(query,id);
+  expect(read()).toBe(read());
+  h.sql.exec("UPDATE session_control_sessions SET state='stopped' WHERE id=?",id);
+  expect(read()[0].state).toBe('stopped');
+  const insert=(observation:string,state:string)=>h.sql.exec('INSERT INTO status_observations(id,machine_id,hub_session_id,kind,observed_at,payload_json,reporter,received_at) VALUES(?,?,?,?,?,?,?,?)',observation,'cache-host',id,'session',new Date(now).toISOString(),JSON.stringify({state}),'cache-host',new Date(now).toISOString());
+  const latest=()=>service.latestObservations([id]).get(id+'\nsession');
+  expect(latest()).toBeUndefined();insert('source-observation','working');
+  expect(latest().payload.state).toBe('working');
+  expect(()=>h.ctx.storage.transactionSync(()=>{
+   h.sql.exec("UPDATE status_observations SET payload_json='{\"state\":\"failed\"}' WHERE id='source-observation'");
+   expect(latest().payload.state).toBe('failed');
+   throw new Error('source cache rollback');
+  })).toThrow('source cache rollback');
+  h.sql.exec("UPDATE session_control_sessions SET state='running' WHERE id=?",id);
+  expect(read()[0].state).toBe('running');expect(latest().payload.state).toBe('working');
+  h.sql.exec("DELETE FROM status_observations WHERE id='source-observation'");
+  expect(latest()).toBeUndefined();
+  service.initLifecycleCache();expect(read()).toBe(read());
+  h.sql.exec('DELETE FROM status_lifecycle_revision');
+  expect(read()).not.toBe(read());
+ });
+});
+
+it('invalidates cached agent counts on native, control and observation state changes',async()=>{
+ const stub=(env as any).HUB.get((env as any).HUB.idFromName('status-count-cache'));
+ await inDO(stub,(h:any)=>{
+  const now=seed(h),service:any=h.statusService;
+  const read=()=>service.computeAgentCounts(now);
+  expect(read()).toMatchObject({running:1,waiting:0});
+  const exposed=read();exposed.running=999;expect(read().running).toBe(1);
+  h.sql.exec("UPDATE session_lifecycle_observations SET payload_json='{\"waiting_confirmation\":true}' WHERE native_id='cache-native'");
+  expect(read()).toMatchObject({running:0,idle:1,waiting:1,waiting_confirmation:1});
+  expect(()=>h.ctx.storage.transactionSync(()=>{
+   h.sql.exec("UPDATE fleet_sessions SET phase='exited' WHERE native_id='cache-native'");
+   expect(read().waiting).toBe(0);throw new Error('count rollback');
+  })).toThrow('count rollback');
+  h.sql.exec("UPDATE session_control_sessions SET session_type='probe' WHERE id=?",id);
+  expect(read()).toEqual({running:0,idle:0,waiting:0,waiting_confirmation:0});
+  h.sql.exec("UPDATE session_control_sessions SET session_type='headless',binding_json=NULL WHERE id=?",id);
+  expect(read()).toMatchObject({running:1,waiting:1});
+ });
+});
+
+it('retries agent observations after a failed read instead of caching incomplete counts',async()=>{
+ const stub=(env as any).HUB.get((env as any).HUB.idFromName('status-count-retry'));
+ await inDO(stub,(h:any)=>{
+  const now=seed(h),service:any=h.statusService;
+  h.sql.exec("UPDATE session_lifecycle_observations SET payload_json='{\"waiting_confirmation\":true}' WHERE native_id='cache-native'");
+  const rows=service.rows.bind(service);let failOnce=true;
+  service.rows=(query:string,...args:any[])=>{
+   if(failOnce && query.includes('FROM session_lifecycle_observations')) {failOnce=false;throw new Error('transient observation read');}
+   return rows(query,...args);
+  };
+  try {
+   expect(service.computeAgentCounts(now)).toMatchObject({running:1,waiting:0});
+   expect(service.computeAgentCounts(now)).toMatchObject({running:0,waiting:1,waiting_confirmation:1});
+  } finally {service.rows=rows;}
+ });
+});

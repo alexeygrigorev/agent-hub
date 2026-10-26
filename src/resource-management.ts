@@ -63,6 +63,25 @@ export function memoryVerdict(available: number, ramp: number, estimate: number,
   return finite(available) && finite(ramp) && finite(estimate) && available - ramp - estimate >= config.memory_floor_mb;
 }
 export class ResourceManagement {
+  private catalogReady = false;
+  private catalogStructureRevision:string|null=null;
+  private catalogRawRows=new Map<string,any[]>();
+  private catalogRawBytes=0;
+  private catalogCache = new Map<string, {revision:string;rows:ReturnType<ResourceManagement['buildCanonicalSessions']>;bytes:number}>();
+  /** Install after all canonical source schemas exist. SQLite triggers keep
+   * protection/identity changes and their cache generations in one transaction. */
+  initCatalogCache() {
+    this.catalogReady=false; this.catalogCache.clear(); this.catalogRawRows.clear(); this.catalogRawBytes=0; this.catalogStructureRevision=null;
+    const tables=['session_control_sessions','fleet_launches','fleet_sessions','session_control_protections','resource_reaps','intake_tasks','intake_task_projection','resource_request_projection'];
+    if (tables.some(table=>!this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",table).toArray().length)) return;
+    this.sql.exec('CREATE TABLE IF NOT EXISTS resource_catalog_revision(id INTEGER PRIMARY KEY CHECK(id=1),revision TEXT NOT NULL,structure_revision TEXT NOT NULL)');
+    this.sql.exec("INSERT OR IGNORE INTO resource_catalog_revision VALUES(1,lower(hex(randomblob(16))),lower(hex(randomblob(16))))");
+    for(const table of tables) for(const op of ['INSERT','UPDATE','DELETE']) {
+      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS resource_catalog_${table}_${op.toLowerCase()} AFTER ${op} ON ${table}
+        BEGIN UPDATE resource_catalog_revision SET revision=lower(hex(randomblob(16)))${table==='fleet_sessions' ? '' : ',structure_revision=lower(hex(randomblob(16)))'} WHERE id=1; END`);
+    }
+    this.catalogReady=true;
+  }
   private historyRevision: string | null = null;
   private memoryHistory = new Map<string | null, any[]>();
   private cpuHistory: any[] | null = null;
@@ -264,16 +283,31 @@ export class ResourceManagement {
       if (!parsed.has(key)) parsed.set(key, parse(key));
       return parsed.get(key);
     };
+    // Native activity changes do not require rereading immutable control and
+    // launch projections. These rows contain SQL scalars only; JSON is parsed
+    // afresh below, and every structural/authority write invalidates them.
+    const read=(query:string,...bindings:any[]):any[]=>{
+      const key=JSON.stringify([query,bindings]);
+      const prior=this.catalogRawRows.get(key);
+      if(this.catalogStructureRevision!==null && prior) return prior;
+      const value=this.sql.exec(query,...bindings).toArray();
+      const bytes=value.reduce((n,row)=>n+256+Object.values(row).reduce<number>((sum,v)=>sum+(typeof v==='string'?v.length*2:8),0),0);
+      if(this.catalogStructureRevision!==null && value.length<=10000 && bytes<=2*1024*1024 && value.every(row=>Object.values(row).every(v=>v===null || typeof v!=='object'))) {
+        if(this.catalogRawRows.size>=4 || this.catalogRawBytes+bytes>4*1024*1024) {this.catalogRawRows.clear();this.catalogRawBytes=0;}
+        this.catalogRawRows.set(key,value);this.catalogRawBytes+=bytes;
+      }
+      return value;
+    };
     // Canonical binding, not tag matching; external interactive sessions can be sampled but never reaped.
-    const rows = this.sql.exec(`SELECT s.id,s.machine_id,s.fleet_launch_id,s.binding_json,${resourceRequest('session_control_sessions','s.id','s.request_json')} AS request_json,s.request_key,
+    const rows = read(`SELECT s.id,s.machine_id,s.fleet_launch_id,s.binding_json,${resourceRequest('session_control_sessions','s.id','s.request_json')} AS request_json,s.request_key,
       s.engine,s.mode,s.state,s.created_at,s.updated_at,${resourceRequest('fleet_launches','l.id','l.request_json')} AS launch_request,l.state AS launch_state,l.created_at AS launch_created,
       l.finished_at AS launch_finished,${jsonFields('l.model_selection_json',['model'])} AS model_selection_json,l.workspace AS launch_workspace
       FROM session_control_sessions s LEFT JOIN fleet_launches l ON l.id=s.fleet_launch_id
-      ${machine ? 'WHERE s.machine_id=?' : ''} ORDER BY CASE WHEN s.state IN ('stopped','failed','exited','finished','dead','refused','cancelled') THEN 1 ELSE 0 END,s.updated_at DESC`, ...(machine ? [machine] : [])).toArray() as any[];
-    const launches = this.sql.exec(`SELECT l.id,l.machine_id,l.native_id,l.workspace,l.engine,l.mode,${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,
+      ${machine ? 'WHERE s.machine_id=?' : ''} ORDER BY CASE WHEN s.state IN ('stopped','failed','exited','finished','dead','refused','cancelled') THEN 1 ELSE 0 END,s.updated_at DESC`, ...(machine ? [machine] : []));
+    const launches = read(`SELECT l.id,l.machine_id,l.native_id,l.workspace,l.engine,l.mode,${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,
       ${jsonFields('l.model_selection_json',['model'])} AS model_selection_json,l.state,l.finished_at,l.updated_at
       FROM fleet_launches l WHERE l.native_id IS NOT NULL AND l.native_id<>'' ${machine ? 'AND l.machine_id=?' : ''}`,
-      ...(machine ? [machine] : [])).toArray() as any[];
+      ...(machine ? [machine] : []));
     // Hydrate the complete alias set before selecting canonical sessions. Batch
     // catalog facts instead of re-reading full intake histories for every alias.
     const key = (...parts: any[]) => JSON.stringify(parts);
@@ -349,6 +383,34 @@ export class ResourceManagement {
     return [...bound,...fleetOnly];
   }
   private canonicalSessions(machine?: string) {
+    // No time-based authority cache: every source write changes the durable
+    // random generation, including writes followed by rollback and retry.
+    const raw=this.catalogReady ? this.sql.exec('SELECT revision,structure_revision FROM resource_catalog_revision WHERE id=1').toArray()[0] : null;
+    const revision=typeof raw?.revision==='string' && /^[a-f0-9]{32}$/.test(raw.revision) ? raw.revision : null;
+    const structure=revision!==null && typeof raw?.structure_revision==='string' && /^[a-f0-9]{32}$/.test(raw.structure_revision) ? raw.structure_revision : null;
+    if(structure===null || structure!==this.catalogStructureRevision) {this.catalogRawRows.clear();this.catalogRawBytes=0;}
+    this.catalogStructureRevision=structure;
+    if(revision===null) this.catalogCache.clear();
+    const key=machine ?? ''; const cached=this.catalogCache.get(key);
+    let rows:ReturnType<ResourceManagement['buildCanonicalSessions']>;
+    if(revision!==null && cached?.revision===revision) rows=cached.rows;
+    else {
+      rows=this.buildCanonicalSessions(machine);
+      // Bound retained memory, including aliases; malformed legacy nested
+      // values bypass caching so callers never share mutable nested data.
+      const bytes=rows.reduce((n,row)=>n+256+Object.values(row).reduce<number>((sum,v)=>sum+(typeof v==='string'?v.length*2:Array.isArray(v)?v.reduce((a,b)=>a+String(b).length*2,0):8),0),0);
+      const cacheable=rows.length<=10000 && rows.reduce((n,row)=>n+row.aliases.length,0)<=20000 && bytes<=4*1024*1024
+        && rows.every(row=>Object.entries(row).every(([field,value])=>field==='aliases' || value===null || typeof value!=='object'));
+      if(revision!==null && cacheable) {
+        // Four MiB each for raw and canonical caches, independent of host count.
+        if(this.catalogCache.size>=8 || [...this.catalogCache.values()].reduce((n,v)=>n+v.bytes,0)+bytes>4*1024*1024) this.catalogCache.clear();
+        this.catalogCache.set(key,{revision,rows,bytes});
+      }
+    }
+    // Callers cannot mutate a cached protection or alias list.
+    return rows.map(row=>({...row,aliases:[...row.aliases]}));
+  }
+  private buildCanonicalSessions(machine?: string) {
     type Bound = ReturnType<ResourceManagement['boundSessions']>[number];
     const groups = new Map<string, {canonical: Bound; keep: boolean; reaped: boolean; aliases: Set<string>}>();
     for (const session of this.boundSessions(machine)) {

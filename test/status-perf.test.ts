@@ -84,7 +84,7 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
       clientTimes.push(performance.now() - start);
       expect(response.status, JSON.stringify(body).slice(0, 200)).toBe(status);
       if (path === '/api/status') {
-        expect(response.headers.get('X-Hub-Status-Projection')).toBe('resource-disk-v3');
+        expect(response.headers.get('X-Hub-Status-Projection')).toBe('resource-disk-v4');
         expect(body.tasks).toHaveLength(method === 'GET' ? 25 : 256);
         expect(body.tasks[0].hub_sessions[0].lifecycle.session_key).toBe('perf-host/native-0');
         expect(body.agents.running).toBe(100);
@@ -99,6 +99,19 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
     expect(times[18]).toBeGreaterThan(0);
     expect.soft(times[18], `${method} ${path}`).toBeLessThan(100);
   }
+  // A real host census changes activity before watchdog. Warm-only reads
+  // would miss expensive canonical projection rebuilds after that write.
+  const invalidatedWatchdog:number[]=[];
+  for(let i=0;i<20;i++) {
+    await inDO(stub,(h:any)=>h.sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE machine_id='perf-host' AND native_id='native-0'",new Date(Date.now()+i).toISOString()).toArray());
+    const start=performance.now();
+    const response=await stub.fetch('https://hub.test/api/fleet/resources/watchdog',{headers:{Authorization:'Bearer '+token}});
+    invalidatedWatchdog.push(performance.now()-start);
+    expect(response.status).toBe(200);await response.json();
+  }
+  invalidatedWatchdog.sort((a,b)=>a-b);
+  console.log(`DO fetch/headers watchdog after native write p50=${invalidatedWatchdog[9]}ms p95=${invalidatedWatchdog[18]}ms`);
+  expect.soft(invalidatedWatchdog[18],'watchdog after native write').toBeLessThan(100);
   // Exercise actual admission/transition work as well as terminal replay.
   // An independent healthy host avoids altering the retained workload above.
   const claimToken = 'hubt_perf_synthetic_claim_host';
@@ -171,11 +184,26 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
         SELECT ?,actor,requester_kind,summary,?,request_json,machine_id,engine,account,mode,workspace,prompt,'offered',created_at,updated_at
         FROM fleet_launches WHERE account='claim-account' AND state='stopped' LIMIT 1`, sessionId(41000+i), `perf-offered-${i}`);
     }
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 6; i++) {
       h.sql.exec("INSERT INTO fleet_accounts VALUES (?,'codex',1,15,1)", `history-account-${i}`);
       h.sql.exec("INSERT INTO fleet_routes VALUES ('claim-host','codex',?,NULL)", `history-account-${i}`);
     }
-    h.sql.exec("UPDATE machines SET last_heartbeat=json_set(last_heartbeat,'$.mem_avail_mb',0) WHERE id='claim-host'");
+    // Live account-tagged native history must reach the orphan correlation:
+    // terminal-only history and an early memory refusal hide its scan cost.
+    h.sql.exec("UPDATE fleet_accounts SET max_concurrency=1");
+    h.sql.exec("UPDATE machines SET capabilities=json_set(capabilities,'$.cpu_count',1024),last_heartbeat=? WHERE id='claim-host'",
+      JSON.stringify({mem_avail_mb:640000,disk_free_gb:1000,cpu_usage:freshCpu(at,1024),gate:{launch_allowed:true,at}}));
+    const accounts = ['claim-account',...Array.from({length:6},(_,i)=>`history-account-${i}`)];
+    for (const account of accounts) h.sql.exec("INSERT INTO fleet_subscriptions VALUES('claim-host',?,'codex','synthetic',?,?)",account,at,
+      JSON.stringify({status:'ok',observed_at:at,details:{limit_reached:false},windows:{weekly:{present:true,percent_remaining:80,reset_at:new Date(Date.now()+86400000).toISOString()}}}));
+    for (let i=0;i<200;i++) {
+      const account=accounts[i%accounts.length];
+      h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,account,last_activity_at) VALUES('claim-host',?,?,'codex','running','working',?,'demo',?,?)",
+        `active-${i}`,`active-${i}`,at,account,at);
+      if (i<36) h.sql.exec("UPDATE fleet_launches SET state='running',native_id=?,account=? WHERE id=?",`active-${i}`,account,sessionId(40000+i));
+    }
+    const fixturePlan:any = new FleetService(h.sql,(cb)=>h.ctx.storage.transactionSync(cb)).plan({workspace:'demo',prompt:'Synthetic',machine:'claim-host'});
+    expect(fixturePlan.rejected.length===7 && fixturePlan.rejected.every((r:any)=>r.reason==='account_concurrency')).toBe(true);
     for (let i = 0; i < 200; i++) {
       h.sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
         SELECT ?,actor,requester_kind,summary,?,request_json,machine_id,engine,account,mode,workspace,prompt,'queued',created_at,updated_at
@@ -195,6 +223,7 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
     expect(response.status).toBe(200);
     expect(body.offers).toHaveLength(20);
   }
+  console.log('blocked offers ordered samples ms', JSON.stringify(backlogTimes));
   backlogTimes.sort((a, b) => a - b);
   console.log(`DO fetch/headers offers with blocked backlog p50=${backlogTimes[9]}ms p95=${backlogTimes[18]}ms`);
   expect(backlogTimes[18]).toBeGreaterThan(0);

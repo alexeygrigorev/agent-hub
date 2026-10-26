@@ -250,6 +250,31 @@ export class StatusService {
     }))];
   }
 
+  private agentCountsCache:{revision:string;value:{running:number;idle:number;waiting:number;waiting_confirmation:number}}|null=null;
+  private statusSourceRows=new Map<string,Obj[]>();
+  private statusSourceBytes=0;
+  private refreshLifecycleRevision(): boolean {
+    if(!this.lifecycleCacheReady) return false;
+    const revision=this.one('SELECT revision FROM status_lifecycle_revision WHERE id=1')?.revision;
+    if(typeof revision!=='string' || !revision || revision!==this.lifecycleRevision) {
+      this.lifecycleRevision=typeof revision==='string' && revision ? revision : null;
+      this.lifecycleInputs.clear();this.statusSourceRows.clear();this.statusSourceBytes=0;this.agentCountsCache=null;
+    }
+    return this.lifecycleRevision!==null;
+  }
+  private cachedSourceRows(query:string,...bindings:any[]):Obj[] {
+    const ready=this.refreshLifecycleRevision();
+    const key=JSON.stringify([query,bindings]);
+    const cached=ready ? this.statusSourceRows.get(key) : undefined;
+    if(cached) return cached;
+    const rows=this.rows(query,...bindings);
+    const bytes=rows.reduce((n,row)=>n+256+Object.values(row).reduce<number>((sum,v)=>sum+(typeof v==='string'?v.length*2:8),0),0);
+    if(ready && rows.length<=2048 && bytes<=1024*1024 && rows.every(row=>Object.values(row).every(v=>v===null || typeof v!=='object'))) {
+      if(this.statusSourceRows.size>=16 || this.statusSourceBytes+bytes>4*1024*1024) {this.statusSourceRows.clear();this.statusSourceBytes=0;}
+      this.statusSourceRows.set(key,rows);this.statusSourceBytes+=bytes;
+    }
+    return rows;
+  }
   private lifecycleCacheReady = false;
   private lifecycleRevision: string | null = null;
   private lifecycleInputs = new Map<string, ReturnType<typeof buildSessionInputs>>();
@@ -258,11 +283,11 @@ export class StatusService {
   initLifecycleCache(): void {
     this.lifecycleCacheReady = false;
     this.lifecycleRevision = null;
-    this.lifecycleInputs.clear();
+    this.lifecycleInputs.clear();this.statusSourceRows.clear();this.statusSourceBytes=0;this.agentCountsCache=null;
     this.sql.exec('CREATE TABLE IF NOT EXISTS status_lifecycle_revision(id INTEGER PRIMARY KEY CHECK(id=1),revision TEXT NOT NULL)');
     this.sql.exec("INSERT OR IGNORE INTO status_lifecycle_revision VALUES(1,lower(hex(randomblob(16))))");
     for (const table of ['session_control_sessions','fleet_launches','fleet_sessions','session_control_protections',
-      'session_lifecycle_observations','intake_task_projection','credentials']) {
+      'session_lifecycle_observations','intake_task_projection','credentials','status_observations']) {
       for (const op of ['INSERT','UPDATE','DELETE']) {
         // Authentication restamps last_used_at on every request. Only creator
         // provenance fields are inputs to the lifecycle ownership calculation.
@@ -280,15 +305,7 @@ export class StatusService {
     if (!this.lifecycleCacheReady || !sessionIds) return buildSessionInputs(this.sql,sessionIds);
     // Random durable generations invalidate reads made inside rolled-back
     // transactions as well as later writes (a counter can repeat after rollback).
-    const revision = this.one('SELECT revision FROM status_lifecycle_revision WHERE id=1')?.revision;
-    if (typeof revision !== 'string' || !revision) {
-      this.lifecycleRevision = null; this.lifecycleInputs.clear();
-      return buildSessionInputs(this.sql,sessionIds);
-    }
-    if (revision !== this.lifecycleRevision) {
-      this.lifecycleRevision = revision;
-      this.lifecycleInputs.clear();
-    }
+    if(!this.refreshLifecycleRevision()) return buildSessionInputs(this.sql,sessionIds);
     const key = JSON.stringify([...sessionIds].sort());
     const cached = this.lifecycleInputs.get(key);
     if (cached) return cached;
@@ -382,7 +399,7 @@ export class StatusService {
     const ids = [...sessionIds];
     for (let i = 0; i < ids.length; i += 100) {
       const chunk = ids.slice(i, i + 100);
-      for (const row of this.rows(`SELECT id,actor,state,machine_id,engine,mode,fleet_launch_id,binding_json,updated_at FROM session_control_sessions WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk)) sessionRows.set(row.id, row);
+      for (const row of this.cachedSourceRows(`SELECT id,actor,state,machine_id,engine,mode,fleet_launch_id,binding_json,updated_at FROM session_control_sessions WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk)) sessionRows.set(row.id, row);
     }
     const lifecycleBySession = sessionIds.size ? this.lifecycleBySessionId(now, sessionIds) : new Map<string, Obj>();
     const items = tasks.map(task => this.taskDto(task, p, machines, now, nowIso, sinceMs, hostFilter, lifecycleBySession, aliases, sessionRows));
@@ -418,6 +435,11 @@ export class StatusService {
   }
 
   private computeAgentCounts(now: number): { running: number; idle: number; waiting: number; waiting_confirmation: number } {
+    // Counts depend on stored state, not freshness thresholds. Identity and
+    // observation triggers invalidate them; time-based DTOs stay live below.
+    const ready=this.refreshLifecycleRevision();
+    if(ready && this.agentCountsCache?.revision===this.lifecycleRevision) return {...this.agentCountsCache.value};
+    let complete=true;
     let running = 0;
     let idle = 0;
     let waiting = 0;
@@ -450,7 +472,7 @@ export class StatusService {
             obsMap.set(`${r.machine_id}/${r.native_id}`, p);
           } catch {}
         }
-      } catch {}
+      } catch { complete=false; }
 
       for (const s of fleetSessions) {
         const obs = obsMap.get(`${s.machine_id}/${s.native_id}`) || {};
@@ -490,9 +512,12 @@ export class StatusService {
         running++;
       }
     } catch {
+      complete=false;
       // Degrade gracefully if tables don't exist yet
     }
-    return { running, idle, waiting, waiting_confirmation };
+    const value={ running, idle, waiting, waiting_confirmation };
+    if(ready && complete) this.agentCountsCache={revision:this.lifecycleRevision!,value};
+    return {...value};
   }
 
   private summaryDto(tasks: Obj[], selectedTotal: number): Obj {
@@ -543,7 +568,7 @@ export class StatusService {
   }
 
   async handle(request: Request, authenticate: () => Promise<Auth>): Promise<Response> {
-    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff', 'X-Hub-Status-Projection': 'resource-disk-v3' } });
+    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff', 'X-Hub-Status-Projection': 'resource-disk-v4' } });
     try {
       if (request.method !== 'GET') return json({ error: 'method_not_allowed' }, 405);
       const auth = await authenticate();
@@ -605,7 +630,7 @@ export class StatusService {
    * Cookie callers pass the existing session CSRF (enforced by Hub auth
    * before this handler, as for every POST). */
   async handlePost(request: Request, authenticate: () => Promise<Auth>): Promise<Response> {
-    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff', 'X-Hub-Status-Projection': 'resource-disk-v3' } });
+    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff', 'X-Hub-Status-Projection': 'resource-disk-v4' } });
     try {
       if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
       const auth = await authenticate();
@@ -806,7 +831,7 @@ export class StatusService {
     try {
       for (let i = 0; i < ids.length; i += 100) {
         const chunk = ids.slice(i, i + 100);
-        for (const row of this.rows(`WITH ids(id) AS (VALUES ${chunk.map(() => '(?)').join(',')}),
+        for (const row of this.cachedSourceRows(`WITH ids(id) AS (VALUES ${chunk.map(() => '(?)').join(',')}),
           kinds(kind) AS (VALUES ('session'),('report'),('probe_git'),('probe_ci'),('probe_deploy'))
           SELECT o.* FROM ids CROSS JOIN kinds JOIN status_observations o ON o.id = (
             SELECT id FROM status_observations WHERE hub_session_id=ids.id AND kind=kinds.kind

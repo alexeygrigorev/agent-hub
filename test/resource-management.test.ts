@@ -24,27 +24,107 @@ async function fixture(fn:(r:ResourceManagement,sql:any,f:FleetService)=>Promise
 }
 const sample=(extra={})=>({session_id:'session',native_id:'native',current_rss_mb:200,peak_rss_mb:200,peak_pss_mb:210,cpu_seconds:20,runtime_s:100,observed_at:iso(),...extra});
 describe('resource management',()=>{
- it('reads watchdog failure evidence without changing admission choking semantics',async()=>fixture(async(r,sql)=>{
-  const check=(expected:any)=>{
+ it('keeps cached canonical identities and protections current across writes and rollbacks',async()=>fixture(async(r,sql,f)=>{
+  r.initCatalogCache();
+  let builds=0; const build=(r as any).buildCanonicalSessions.bind(r);
+  (r as any).buildCanonicalSessions=(machine?:string)=>{builds++;return build(machine);};
+  const read=()=>r.sessions('host').find(s=>s.session_id==='session')!;
+  read();read();expect(builds).toBe(1);
+  expect(read().keep).toBe(false);
+  const exposed=r.sessions('host');exposed[0].keep=true;
+  expect(read().keep).toBe(false);
+  sql.exec('INSERT INTO session_control_protections VALUES(?,?,?,?)','session','human','keep',iso());
+  expect(read().keep).toBe(true);
+  sql.exec('DELETE FROM session_control_protections');
+  expect(read().keep).toBe(false);
+  const tx=(f as any).transaction;
+  expect(()=>tx(()=>{
+   sql.exec("UPDATE session_control_sessions SET mode='interactive' WHERE id='session'");
+   expect(read().keep).toBe(true);
+   throw new Error('catalog rollback');
+  })).toThrow('catalog rollback');
+  // A different write after rollback must not reuse the cached generation.
+  sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='native'",iso(-1000));
+  expect(read()).toMatchObject({keep:false,mode:'headless',last_activity_at:iso(-1000)});
+  sql.exec("UPDATE intake_tasks SET data=json_set(data,'$.project','changed') WHERE id='task'");
+  expect(read().project).toBe('changed');
+  sql.exec("UPDATE fleet_launches SET state='exited',finished_at=? WHERE id='launch'",iso());
+  expect(read()).toMatchObject({state:'exited',finished_at:iso()});
+  sql.exec("UPDATE session_control_sessions SET binding_json=json_set(binding_json,'$.native_id','replacement') WHERE id='session'");
+  expect(read().native_id).toBe('replacement');
+  sql.exec("DELETE FROM session_control_sessions WHERE id='session'");
+  expect(read()).toBeUndefined();
+ }));
+
+ it('bypasses incomplete or oversized canonical caches and does not share nested legacy data',async()=>fixture(async(r,sql)=>{
+  r.initCatalogCache();
+  let builds=0;const build=(r as any).buildCanonicalSessions.bind(r);
+  (r as any).buildCanonicalSessions=(machine?:string)=>{builds++;return build(machine);};
+  r.sessions('host');r.sessions('host');expect(builds).toBe(1);
+  r.initCatalogCache();r.sessions('host');expect(builds).toBe(2);
+  sql.exec('DELETE FROM resource_catalog_revision');
+  r.sessions('host');r.sessions('host');expect(builds).toBe(4);
+  r.initCatalogCache();
+  sql.exec("UPDATE intake_tasks SET data=json_remove(data,'$.project') WHERE id='task'");
+  sql.exec("UPDATE session_control_sessions SET request_json=json_set(request_json,'$.project',json('{\"legacy\":true}')) WHERE id='session'");
+  const value=r.sessions('host').find(s=>s.session_id==='session')!;
+  value.project.legacy=false;
+  expect(r.sessions('host').find(s=>s.session_id==='session')!.project).toEqual({legacy:true});
+  const row=build('host')[0];row.project='synthetic';
+  (r as any).buildCanonicalSessions=()=>{builds++;return [{...row,aliases:Array.from({length:20001},(_,i)=>String(i))}];};
+  r.initCatalogCache();const before=builds;
+  r.sessions('host');r.sessions('host');expect(builds-before).toBe(2);
+ }));
+ it('invalidates cached aliases on request projection and reap writes',async()=>fixture(async(r,sql)=>{
+  r.initCatalogCache();
+  const canonical=()=>(r as any).canonicalSessions('host').find((s:any)=>s.session_id==='session');
+  const old=canonical();old.aliases.push('foreign');
+  expect(canonical().aliases).not.toContain('foreign');
+  sql.exec("UPDATE resource_request_projection SET request_json=json_set(request_json,'$.keep',json('true')) WHERE source='session_control_sessions' AND id='session'");
+  expect(canonical().keep).toBe(true);
+  sql.exec("DELETE FROM resource_request_projection WHERE source='session_control_sessions' AND id='session'");
+  expect(canonical().keep).toBe(false);
+  sql.exec("INSERT INTO resource_reaps(id,session_id,machine_id,native_id,intake_id,actor,reason,at,evidence_id) VALUES('cache-reap','session','host','native','task','test','terminal',?,'synthetic')",iso());
+  expect(canonical().reaped).toBe(true);
+  sql.exec("DELETE FROM resource_reaps WHERE id='cache-reap'");
+  expect(canonical().reaped).toBe(false);
+ }));
+ it('projects watchdog and offers failure evidence without changing admission choking semantics',async()=>fixture(async(r,sql,f)=>{
+  for (const [id,cores] of [['offer-a',1],['offer-b',100]] as const) {
+   sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
+     SELECT ?,actor,requester_kind,summary,?,request_json,machine_id,engine,account,mode,workspace,prompt,'offered',?,? FROM fleet_launches WHERE id='launch'`,id,id,iso(),iso());
+   r.freezeCpuStart(id,{expected_cpu_cores:cores,expected_cpu_source:'repo_kind'});
+  }
+  const check=async(expected:any)=>{
    expect(r.resourceChoking('host')).toEqual(expected);
    expect(r.cpuHeadroom('host').resource_choking).toEqual(expected);
+   const response=await f.handle(new Request('https://hub.test/api/fleet/offers'),{caller:{kind:'host',machineId:'host',actor:'host:host'},scopes:['host']});
+   expect(response.status).toBe(200);
+   const body:any=await response.json();
+   expect(body.offers).toHaveLength(2);
+   for(const offer of body.offers) {
+    expect(offer.resource_choking).toEqual(expected);
+    expect(offer.expected_cpu_cores).toBe(offer.id==='offer-a'?1:100);
+    expect(offer.expected_cpu_source).toBe('repo_kind');
+    expect(r.cpuHeadroom('host',{},offer.id).resource_choking).toEqual(expected);
+   }
   };
-  check(null);
+  await check(null);
   sql.exec('INSERT INTO resource_choking_events VALUES(?,?,?)','host','host_oom',iso());
-  check({reason:'host_oom',observed_at:iso()});
+  await check({reason:'host_oom',observed_at:iso()});
   sql.exec('UPDATE resource_choking_events SET observed_at=?',iso(-301000));
-  check(null);
+  await check(null);
   sql.exec("UPDATE fleet_launches SET state='failed',exit_reason='engine_runtime_timeout',updated_at=? WHERE id='launch'",iso());
-  check({reason:'host_runtime_choking',observed_at:iso()});
+  await check({reason:'host_runtime_choking',observed_at:iso()});
   sql.exec("UPDATE fleet_launches SET updated_at=? WHERE id='launch'",iso(-301000));
-  check(null);
+  await check(null);
   const health=(reason:string)=>JSON.stringify({services:[{worker:'broken',reason}]});
   sql.exec('INSERT INTO host_health_observations VALUES(?,?,?,?,?,?)','host',iso(),now,iso(),health('worker_broken'),'test');
-  check(null);
+  await check(null);
   sql.exec('UPDATE host_health_observations SET payload_json=?',health('service_crash'));
-  check({reason:'host_runtime_choking',observed_at:iso()});
+  await check({reason:'host_runtime_choking',observed_at:iso()});
   sql.exec('UPDATE host_health_observations SET observed_at=?',iso(-301000));
-  check(null);
+  await check(null);
  }));
 
  it.each(['fleet_launches','session_control_sessions'] as const)('maintains compact request facts transactionally for %s',async table=>fixture(async(r,sql,f)=>{
