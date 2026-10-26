@@ -153,6 +153,23 @@ describe('fleet reserve capacity queue', () => {
     expect(waiting.queue_position).toBe(1);
   }));
 
+  it('refreshes a parked intent\'s visible reasons when its re-plan now fails for a non-capacity reason', () => fleetFixture(async (f, sql) => {
+    await configure(f);
+    const first: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    expect(first.state).toBe('offered');
+    const parked: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner', idempotency_key: 'stale-hold' })), admin)).json();
+    expect(parked.state).toBe('queued');
+    // The route now refuses the model: the row can never place, and status must say so.
+    const caps = JSON.parse(sql.exec("SELECT capabilities FROM machines WHERE id = 'hetzner'").one().capabilities);
+    caps.fleet_route_rejections = [{ engine: 'codex', account: 'shared-codex', profile: null, mode: 'headless', reason: 'model_unsupported' }];
+    sql.exec("UPDATE machines SET capabilities = ? WHERE id = 'hetzner'", JSON.stringify(caps));
+    await claimAndFinish(f, first.id, 'hetzner', 'shared-codex');
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', parked.id).one().state).toBe('queued');
+    const replay: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner', idempotency_key: 'stale-hold' })), admin)).json();
+    expect(replay.state).toBe('queued');
+    expect(replay.rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'model_unsupported' });
+  }));
+
   it('keeps mixed capacity+capability failures as visible 409 rejects without queueing', () => fleetFixture(async (f, sql) => {
     await configure(f);
     const first: any = await (await f.handle(fleetReq('/launches', intent({ machine: 'hetzner' })), admin)).json();

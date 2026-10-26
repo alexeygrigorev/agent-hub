@@ -827,7 +827,17 @@ export class FleetService {
         let plan: any;
         try { plan = this.plan(input); } catch { continue; }
         if (!plan || (plan as any).error) continue;
-        if (!plan.selected) { this.memoryHold(row.id, plan.rejected || []); continue; }
+        if (!plan.selected) {
+          const rejected = plan.rejected || [];
+          this.memoryHold(row.id, rejected);
+          // Honest parked status: when a re-plan now fails for a non-capacity
+          // reason (e.g. model_unsupported after memory cleared), record the
+          // live reasons so status stops showing the last memory sample forever.
+          if (!isCapacityOnlyHold(rejected) && rejected.length) {
+            this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json, refused) VALUES (?, ?, ?, 0) ON CONFLICT(launch_id) DO UPDATE SET rejected_json = excluded.rejected_json', row.id, nowIso, JSON.stringify(rejected));
+          }
+          continue;
+        }
         const memoryHold: any = this.sql.exec('SELECT since, refused FROM fleet_memory_holds WHERE launch_id = ?', row.id).toArray()[0];
         // A refused pre-spawn attempt needs a newer host sample before retry.
         if (memoryHold?.refused && (this.memoryHeadroom(plan.selected.machine).observed_at || '') <= memoryHold.since) continue;
