@@ -976,6 +976,26 @@ class BatchCadenceTests(unittest.TestCase):
                 counts.append(rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000 + 301_000)["reaps"])
             self.assertEqual(counts, [1, 0, 0])  # Same incarnation stays settled after ACK/restart.
 
+    def test_full_watchdog_catalog_reaches_reporting_past_old_500_slice(self):
+        catalog = [_entry(session_id="s%d" % i, native_id="n%d" % i, state="failed")
+                   for i in range(884)]
+        posted = []
+        def request(method, path, payload=None):
+            if path == "/api/fleet/resources/watchdog":
+                return {"config": {}, "sessions": catalog}
+            if path == "/api/fleet/resources/report":
+                posted.extend(payload["samples"])
+                return {"reported": True}
+            raise AssertionError(path)
+        with patch("agent_hub_host.native_sessions.list_sessions", return_value=[]), \
+             patch("agent_hub_host.native_sessions.stop_session") as stop:
+            out = rm.run_watchdog_cycle(request, journal_dir=None, now_ms=10_000_000)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["samples"], len(catalog))
+        self.assertEqual([r["session_id"] for r in posted], [r["session_id"] for r in catalog])
+        self.assertEqual(out["reaps"], 0)
+        stop.assert_not_called()
+
     def test_all_observations_and_full_receipt_journal_reach_bounded_posts(self):
         # Real host catalogs exceed one body. A per-POST cap cannot silently
         # truncate the catalog or emit a receipt batch the API rejects (>100).

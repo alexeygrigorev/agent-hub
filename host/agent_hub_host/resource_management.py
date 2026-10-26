@@ -55,6 +55,7 @@ REAP_REASONS = ("idle", "terminal", "dead_pid")
 EVIDENCE_MAX_BYTES = 6000
 # Server request body cap is 32768 bytes; every report POST stays well under.
 REPORT_BYTE_BUDGET = 24576
+MAX_CATALOG_SESSIONS = 1000
 MAX_SAMPLES = 200
 MAX_REAPS_PER_POST = 50
 # Bound destructive work per cycle: few stops, bounded wall time, no scheduler.
@@ -1018,6 +1019,8 @@ def run_watchdog_cycle(
         if not isinstance(sessions, list):
             summary.update({"ok": False, "error": "invalid_watchdog_sessions"})
             return summary
+        # Match the server catalog bound; per-POST limits apply only when splitting.
+        sessions = sessions[:MAX_CATALOG_SESSIONS]
         idle_ms = int(config["idle_minutes"] * 60 * 1000)
         rss_flag_mb = float(config["rss_flag_gb"]) * 1024.0
 
@@ -1037,7 +1040,7 @@ def run_watchdog_cycle(
         # WITHOUT a current native row still emit cached/null final rows so
         # finished states are finalized durably instead of skipped.
         samples: list[dict[str, Any]] = []
-        for entry in sessions[:500]:
+        for entry in sessions:
             if not isinstance(entry, dict):
                 continue
             sid = entry.get("session_id")
@@ -1116,7 +1119,7 @@ def run_watchdog_cycle(
             destructive_ran = bool(reaps)
             deadline = time.monotonic() + CYCLE_DEADLINE_S
             if len(reaps) < MAX_REAPS_PER_CYCLE:
-                for entry in sessions[:500]:
+                for entry in sessions:
                     if len(reaps) >= MAX_REAPS_PER_CYCLE:
                         break
                     if time.monotonic() > deadline:
