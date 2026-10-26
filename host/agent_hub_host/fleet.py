@@ -111,6 +111,10 @@ OFFERS_LOCK_NAME = "fleet-offers.lock"
 # plus a slow Hub can exceed that, so the gate is re-run before claiming when
 # the first observation is older than this.
 CLAIM_ADMISSION_REFRESH_S = 15.0
+# Offers are dispatched with bounded concurrency: one dispatch takes 20-40 s
+# (admission, launcher submit/plan, native start), so a serial batch of five
+# left the last offer unclaimed for ~3 min.
+DISPATCH_CONCURRENCY = 3
 
 
 def _iso_age_s(value):
@@ -2548,8 +2552,20 @@ class Dispatcher:
         the in-memory check-in fresh; persistence throttling still applies
         server-side. Transport failures must never break dispatch accounting.
         """
+        # Intake 4398ce2a: never re-post an old cycle snapshot — it overwrote
+        # fresher telemetry (cpu_usage/observed_at) from the fast telemetry
+        # tick. Sample a fresh base heartbeat and keep the latest projections.
         try:
-            self.request('POST', '/api/host/poll', hb)
+            from . import api
+            fresh_hb = api.get_heartbeat_payload()
+            latest = self._last_hb or hb or {}
+            for key in ('gate', 'launcher_resources'):
+                if key in latest:
+                    fresh_hb[key] = latest[key]
+        except Exception:
+            fresh_hb = hb
+        try:
+            self.request('POST', '/api/host/poll', fresh_hb)
         except Exception:
             pass
 
@@ -2744,7 +2760,7 @@ class Dispatcher:
         self._last_hb = hb
         return hb
 
-    def dispatch_offers(self, results, hb=None, offers=None):
+    def dispatch_offers(self, results, hb=None, offers=None, concurrency=1):
         """Claim + dispatch current offers under the offers lock.
 
         Returns (offers_seen, dispatch_max_s); skips (0, 0.0) when the
@@ -2757,20 +2773,35 @@ class Dispatcher:
             if offers is None:
                 offers = self.request("GET", "/api/fleet/offers").get("offers", [])
             hb = hb if hb is not None else getattr(self, '_last_hb', None)
-            dispatch_max_s = 0.0
-            for offer in offers:
-                if getattr(self, 'stop_requested', None) is not None and self.stop_requested.is_set():
-                    break  # Draining for restart: never start a new claim.
+            durations = []
+            guard = threading.Lock()
+
+            def _one(offer):
+                if self.stop_requested.is_set():
+                    return  # Draining for restart: never start a new claim.
                 _dispatch_start = time.monotonic()
-                self._inflight += 1
+                with guard:
+                    self._inflight += 1
+                local = []
                 try:
-                    self._dispatch_one(offer, results)
+                    self._dispatch_one(offer, local)
                 finally:
-                    self._inflight -= 1
+                    with guard:
+                        self._inflight -= 1
+                        results.extend(local)
+                        durations.append(time.monotonic() - _dispatch_start)
                     if hb is not None:
                         self._refresh_checkin(hb)
-                dispatch_max_s = max(dispatch_max_s, time.monotonic() - _dispatch_start)
-            return len(offers), dispatch_max_s
+            if len(offers) <= 1 or concurrency <= 1:
+                for offer in offers:
+                    _one(offer)
+            else:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=min(concurrency, len(offers)),
+                                        thread_name_prefix='fleet-dispatch') as pool:
+                    for future in [pool.submit(_one, offer) for offer in offers]:
+                        future.result()
+            return len(offers), max(durations, default=0.0)
         finally:
             if lock is not None:
                 try:
@@ -2781,7 +2812,7 @@ class Dispatcher:
     def offers_tick(self):
         """Fast offer claiming independent of the slow cycle (4398ce2a)."""
         results = []
-        seen, max_s = self.dispatch_offers(results)
+        seen, max_s = self.dispatch_offers(results, concurrency=DISPATCH_CONCURRENCY)
         return {'offers': seen, 'results': results, 'dispatch_max_s': round(max_s, 3)}
 
     def _once_locked(self, phases, _mark, _skip_telemetry):

@@ -117,3 +117,38 @@ def test_claim_readmits_when_first_observation_ages():
     claim = src.index('path + "/claim"')
     readmit = src.rfind('CLAIM_ADMISSION_REFRESH_S', 0, claim)
     assert readmit != -1 and '_dispatch_admission' in src[readmit:claim]
+
+
+def test_offers_tick_dispatches_concurrently_and_refresh_posts_fresh_heartbeat():
+    import threading
+    import time as _time
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = settings(Path(tmp))
+        items = [offer(id=f"1234567{n}-1234-1234-1234-123456789abc") for n in range(3)]
+        polls = []
+
+        def request(method, path, body=None):
+            if method == "GET" and path == "/api/fleet/offers":
+                return {"offers": items}
+            if path == "/api/host/poll":
+                polls.append(body)
+            return {}
+        dispatcher = fleet.Dispatcher(cfg, request, _gate_runner, journal_dir=tmp)
+        dispatcher._last_hb = {"gate": {"launch_allowed": True, "at": "old"}, "cpu_usage": {"observed_at": "stale"}}
+        active, peak, lock = [0], [0], threading.Lock()
+
+        def slow_dispatch(o):
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            _time.sleep(0.2)
+            with lock:
+                active[0] -= 1
+            return {"id": o["id"], "state": "held", "reason": "test"}
+        with patch.object(dispatcher, "dispatch", side_effect=slow_dispatch), \
+                patch("agent_hub_host.api.get_heartbeat_payload", return_value={"cpu_usage": {"observed_at": "fresh"}}):
+            out = dispatcher.offers_tick()
+        assert out["offers"] == 3 and len(out["results"]) == 3
+        assert peak[0] >= 2, "offers must not be claimed strictly serially"
+        assert polls and all(p["cpu_usage"]["observed_at"] == "fresh" for p in polls)
+        assert all(p["gate"]["launch_allowed"] is True for p in polls)
