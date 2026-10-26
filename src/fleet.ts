@@ -126,7 +126,10 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   "codex_quota_gate_stale_window_evidence": "The managed Codex quota evidence is stale.",
   "codex_quota_gate_quota_check_failed": "The managed Codex quota check failed."
 };
-const INCIDENTAL_REASONS = new Set(['machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'engine_tool_permission_refused', 'admission_unconfigured']);
+// model_unsupported: the route cannot serve this intent's model/tier (plan()
+// tier exclusion or a recorded route refusal); it never frees up, so it must not
+// turn a capacity wait into a hard 409.
+const INCIDENTAL_REASONS = new Set(['model_unsupported', 'machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'engine_tool_permission_refused', 'admission_unconfigured']);
 /** Capacity-only placement failure: every rejected route reports transient
  * capacity (account/machine), optionally alongside incidental stale/disabled
  * routes (drained/stale check-ins, policy-disabled engines, registry routes

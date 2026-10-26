@@ -93,6 +93,14 @@ describe('capacity-only classifier', () => {
       { machine: 'x', engine: 'codex', reason: 'provider_disabled' },
     ])).toBe(true);
     expect(isCapacityOnlyHold([{ machine: 'w', engine: 'codex', reason: 'machine_unavailable' }])).toBe(false);
+    // Real RMTHZ mix after 9af3a16: codex/go full, other engines excluded by tier/route.
+    expect(isCapacityOnlyHold([
+      { machine: 'h', engine: 'codex', reason: 'account_capacity' },
+      { machine: 'h', engine: 'claude', reason: 'model_unsupported' },
+      { machine: 'h', engine: 'grok', reason: 'provider_disabled' },
+      { machine: 'h', engine: 'zcodex', reason: 'engine_tool_permission_refused' },
+    ])).toBe(true);
+    expect(isCapacityOnlyHold([{ machine: 'h', engine: 'claude', reason: 'model_unsupported' }])).toBe(false);
     expect(isCapacityOnlyHold([{ machine: 'h', engine: 'codex', reason: 'provider_disabled' }])).toBe(false);
     expect(isCapacityOnlyHold([{ machine: 'h', engine: 'gemini', reason: 'engine_unavailable' }])).toBe(false);
     for (const reason of ['tier_unavailable', 'goal_unsupported']) {
