@@ -753,10 +753,11 @@ export class FleetService {
       else if (Number.isFinite(hb.mem_avail_mb) && !memoryVerdict(hb.mem_avail_mb,
         this.resources.headroom(route.machine_id, request, route.engine).reserved_mb,
         this.resources.headroom(route.machine_id, request, route.engine).requested_mb, this.resources.config())) reason = 'launcher_memory_reserve';
-      else if (!Number.isFinite(hb.mem_avail_mb) || !Number.isFinite(hb.disk_free_gb)) reason = 'resource_limit';
+      // Missing mem/disk telemetry is not a choking signal: fail OPEN (intake
+      // 4398ce2a, Alexey t1523u). Only a present, real reading below a floor holds.
       // Root-disk floor is configurable (resource_settings.disk_floor_gb, default
       // 15 GiB). Docker and /tmp live on /data, so / only needs modest headroom.
-      else if (hb.disk_free_gb < this.resources.config().disk_floor_gb) reason = 'disk_floor';
+      else if (Number.isFinite(hb.disk_free_gb) && hb.disk_free_gb < this.resources.config().disk_floor_gb) reason = 'disk_floor';
       else if (!this.resources.cpuHeadroom(route.machine_id,request).admitted) reason = this.resources.cpuHeadroom(route.machine_id,request).reason!;
       else if (!account || account.status !== 'ok') reason = 'account_' + (account?.status || 'unmapped');
       else if (!this.observation(definitions.get(route.account), route)) reason = 'machine_account_quota_unknown';

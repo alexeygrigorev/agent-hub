@@ -339,7 +339,12 @@ describe('generic accounts and launch placement', () => {
     expect((s.plan(intent({ machine: 'win35' })) as any).rejected[0].reason).toBe('launcher_memory_reserve');
     // Intake 4398ce2a: stale or failed aggregate gates fail open.
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'win35'", JSON.stringify({ gate: { launch_allowed: true, at: iso(-300001) } }));
-    expect((s.plan(intent({ machine: 'win35' })) as any).rejected[0].reason).not.toBe('admission_unknown');
+    // Missing mem/disk/CPU telemetry fails open too: no admission_unknown/resource_limit hold.
+    const missing = s.plan(intent({ machine: 'win35' })) as any;
+    expect(missing.rejected?.some((r: any) => r.machine === 'win35' && ['admission_unknown', 'resource_limit', 'disk_floor'].includes(r.reason)) ?? false).toBe(false);
+    expect(missing.selected?.machine).toBe('win35');
+    sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'win35'", JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 2, load: [1], cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() } }));
+    expect((s.plan(intent({ machine: 'win35' })) as any).rejected[0].reason).toBe('disk_floor');
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'win35'", JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso()), gate: { launch_allowed: false, at: iso() } }));
     expect((s.plan(intent({ machine: 'win35' })) as any).rejected?.some((r: any) => r.reason === 'admission_unknown') ?? false).toBe(false);
   }));
