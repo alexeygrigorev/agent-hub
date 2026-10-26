@@ -1486,13 +1486,18 @@ export class FleetService {
           return response({ id: row.id, state: row.state, replay: true });
         }
         // Host emits fixed, sanitized diagnostics; validate bounds again at storage.
+        // AC a19cac9e: runtime diagnostics may carry signal, wall_time_ms and
+        // a sanitized tail alongside exit_code; all bounded, no control chars.
         const diagnostic = data.diagnostic;
-        if (diagnostic !== undefined && (!object(diagnostic, ['reason', 'message', 'error_type', 'exit_code', 'stage', 'cpu']) ||
+        if (diagnostic !== undefined && (!object(diagnostic, ['reason', 'message', 'error_type', 'exit_code', 'signal', 'wall_time_ms', 'tail', 'stage', 'cpu']) ||
             typeof diagnostic.reason !== 'string' || !/^(?:(?:launcher|engine)_[a-z_]{1,64}|cpu_headroom|cpu_pressure|memory_pressure|host_oom|host_runtime_choking)$/.test(diagnostic.reason) ||
             typeof diagnostic.message !== 'string' || diagnostic.message.length > 300 || /[\x00-\x1f\x7f]/.test(diagnostic.message) ||
             typeof diagnostic.error_type !== 'string' || !/^[A-Za-z]{1,64}$/.test(diagnostic.error_type) ||
             !['launcher_run', 'dispatch_headless', 'dispatch_interactive', 'dispatch_route', 'runtime'].includes(diagnostic.stage) ||
             (diagnostic.exit_code !== undefined && !Number.isSafeInteger(diagnostic.exit_code)) ||
+            (diagnostic.signal !== undefined && (!Number.isSafeInteger(diagnostic.signal) || diagnostic.signal <= 0 || diagnostic.signal > 128)) ||
+            (diagnostic.wall_time_ms !== undefined && (!Number.isSafeInteger(diagnostic.wall_time_ms) || diagnostic.wall_time_ms < 0)) ||
+            (diagnostic.tail !== undefined && (typeof diagnostic.tail !== 'string' || diagnostic.tail.length > 1024 || /[\x00-\x1f\x7f]/.test(diagnostic.tail))) ||
             (diagnostic.cpu !== undefined && !sanitizeCpuAdmission(diagnostic.cpu)))) return response({ error: 'invalid_launch_diagnostic' }, 400);
         // An owning host may enrich a legacy failed receipt after collecting
         // runtime evidence. Identity/state stay fixed; no capacity/lifecycle effect.

@@ -906,11 +906,78 @@ class Dispatcher:
         except (ValueError, TypeError, AttributeError):
             return False
 
+    def _no_result_partial_report(self, record):
+        """Failed-with-partial-work report when the result JSON is missing.
+
+        Never marks success early: always failed. Includes bounded dirty-file
+        list, recent commits, and the retained per-session log location plus a
+        sanitized tail. Never includes secrets or raw log bodies.
+        """
+        try:
+            from .launch_diagnostics import (
+                describe_partial_work, retain_per_session_opencode_log,
+                _redact_secret_shapes,
+            )
+            from .runtime_diagnostics import _sanitize_tail
+        except Exception:
+            return {'status': 'failed',
+                    'report': 'Agent exited without a valid structured report; no partial-work evidence available.',
+                    'artifacts': [], 'confirmed_exit': True}
+        workspace = record.get('workspace')
+        offer_id = record.get('offer_id', 'unknown')
+        log_dest = None
+        tail = ''
+        try:
+            if isinstance(workspace, str) and workspace:
+                dest = str(Path(workspace) / '.local' / 'hub-logs' / (str(offer_id) + '-opencode.log'))
+                log_dest = retain_per_session_opencode_log(record.get('log_offsets'), dest)
+                if log_dest:
+                    try:
+                        with open(log_dest, 'r', encoding='utf-8', errors='replace') as f:
+                            data = f.read()
+                        tail = _sanitize_tail(data[-8192:])
+                        # Attach the sanitized tail so runtime_diagnostic carries it.
+                        if isinstance(record, dict) and tail and not record.get('runtime_tail'):
+                            record['runtime_tail'] = tail
+                    except Exception:
+                        tail = ''
+        except Exception:
+            log_dest = log_dest or None
+        try:
+            partial = describe_partial_work(workspace, record.get('launched_at_ts'))
+        except Exception:
+            partial = {'dirty': [], 'commits': []}
+        try:
+            dirty = [_redact_secret_shapes(str(x))[:200] for x in (partial.get('dirty') or [])[:20]]
+            commits = [_redact_secret_shapes(str(x))[:200] for x in (partial.get('commits') or [])[:5]]
+        except Exception:
+            dirty, commits = [], []
+        bits = ['Agent exited without a valid structured report (failed-with-partial-work).']
+        if commits:
+            bits.append('Recent commits: ' + '; '.join(commits))
+        if dirty:
+            bits.append('Uncommitted worktree changes: ' + '; '.join(dirty))
+        else:
+            bits.append('Worktree clean or unavailable.')
+        if log_dest:
+            bits.append('Per-session opencode log retained at .local/hub-logs/' + str(offer_id) + '-opencode.log.')
+        if tail:
+            bits.append('Log tail: ' + tail.replace('\n', ' | '))
+        report = ' '.join(bits)[:4000]
+        artifacts = []
+        if commits or dirty:
+            artifacts.append({'label': 'partial-work',
+                              'text': ('commits: ' + '; '.join(commits) + '\ndirty: ' + '; '.join(dirty))[:1024]})
+        return {'status': 'failed', 'report': report, 'artifacts': artifacts, 'confirmed_exit': True,
+                'partial_work': {'dirty': dirty, 'commits': commits, 'log': bool(log_dest)}}
+
     def _routed_finish_report(self, record, fleet_state):
         forwarded = self._read_hub_finish_report(record)
         if not forwarded:
-            return {'status': 'failed', 'report': 'Agent exited without a valid structured report; inspect private local logs.',
-                    'artifacts': [], 'confirmed_exit': True}
+            partial = self._no_result_partial_report(record)
+            return {'status': 'failed', 'report': partial['report'], 'confirmed_exit': True,
+                    'artifacts': [{'name': f'evidence-{i + 1}', 'text': item['label'] + '\n' + item['text']}
+                                  for i, item in enumerate(partial.get('artifacts', []))]}
         return {'status': 'failed' if fleet_state == 'failed' else forwarded['report_status'],
                 'report': forwarded['report'], 'confirmed_exit': True,
                 'artifacts': [{'name': f'evidence-{i + 1}', 'text': item['label'] + '\n' + item['text']}
@@ -1176,12 +1243,31 @@ class Dispatcher:
             # Intake 88b3260d AC1: forward the worker's final result file so
             # the server can append it to the linked intake. Bounded,
             # symlink-confined, truncated; never logs tokens.
+            # Missing result JSON never marks success: attach a
+            # failed-with-partial-work report (dirty worktree, recent commits,
+            # per-session log location + sanitized tail) instead of a bare
+            # terminal receipt. Backgrounded children are already reported as
+            # agent_exited_children_running by stall detection; a missing
+            # result file stays failed, never done.
+            forwarded = None
             try:
                 forwarded = self._read_hub_finish_report(record)
                 if forwarded:
                     result_payload.update(forwarded)
             except Exception:
-                pass
+                forwarded = None
+            if not forwarded:
+                try:
+                    partial = self._no_result_partial_report(record)
+                    result_payload['report_status'] = 'failed'
+                    result_payload['report'] = partial['report']
+                    if partial.get('artifacts'):
+                        result_payload['artifacts'] = [
+                            {'label': a.get('label', 'partial-work')[:120],
+                             'text': a.get('text', '')[:1024]}
+                            for a in partial['artifacts'] if isinstance(a, dict)]
+                except Exception:
+                    pass
             if record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused':
                 result_payload['diagnostic'] = record['diagnostic']
             if fleet_state == "failed":

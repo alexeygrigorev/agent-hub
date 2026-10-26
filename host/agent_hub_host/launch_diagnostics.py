@@ -190,6 +190,105 @@ def check_engine_auth_expired(raw='', engine=None, cwd=None, task_id=None, launc
     return False
 
 
+def retain_per_session_opencode_log(log_offsets, dest_path, max_bytes=65536) -> str | None:
+    """Copy the bounded opencode log delta since launch into the session's .local dir.
+
+    Local-only retention (never uploaded to Hub as-is); callers forward only a
+    sanitized tail. Best-effort: returns the written path or None.
+    """
+    try:
+        dest = Path(dest_path)
+        if dest.is_symlink():
+            return None
+        dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        offsets = log_offsets if isinstance(log_offsets, dict) else {}
+        wrote_any = False
+        with open(dest, 'wb') as out:
+            for log_path in get_opencode_log_paths():
+                try:
+                    key = str(log_path)
+                    start_offset = offsets.get(key, 0) if isinstance(offsets, dict) else 0
+                    if not isinstance(start_offset, int) or start_offset < 0:
+                        start_offset = 0
+                    size = log_path.stat().st_size
+                    if size <= start_offset:
+                        continue
+                    with open(log_path, 'rb') as f:
+                        if start_offset > 0 and start_offset < size:
+                            f.seek(start_offset)
+                        elif size > max_bytes:
+                            f.seek(size - max_bytes)
+                        chunk = f.read(max_bytes)
+                    if chunk:
+                        if wrote_any and out.tell() + len(chunk) > max_bytes:
+                            break
+                        out.write(chunk[-max_bytes:])
+                        wrote_any = True
+                except Exception:
+                    continue
+        if not wrote_any:
+            try:
+                dest.unlink()
+            except Exception:
+                pass
+            return None
+        try:
+            os.chmod(dest, 0o600)
+        except Exception:
+            pass
+        return str(dest)
+    except Exception:
+        return None
+
+
+def _redact_secret_shapes(line: str) -> str:
+    """Redact token-like values from bounded path/status lines (never fail)."""
+    try:
+        line = re.sub(r'sk-[A-Za-z0-9_-]{8,}', 'sk-[redacted]', line)
+        line = re.sub(r'(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+', r'\1[redacted]', line)
+        line = re.sub(r'(?i)(api[_-]?key\s*[:=]\s*)[^\s;]+', r'\1[redacted]', line)
+        line = re.sub(r'(?i)(token\s*[:=]\s*)[^\s;]+', r'\1[redacted]', line)
+        line = re.sub(r'gh[pousr]_[A-Za-z0-9_]{16,}', '[redacted]', line)
+        line = re.sub(r'\bAKIA[0-9A-Z]{16}\b', '[redacted]', line)
+    except Exception:
+        pass
+    return line
+
+
+def describe_partial_work(workspace, launched_at_ts=None, max_files=20) -> dict:
+    """Bounded local description of uncommitted work + recent commits (paths only)."""
+    info: dict = {'dirty': [], 'commits': []}
+    try:
+        ws = Path(workspace)
+        if not ws.is_absolute() or not (ws / '.git').exists():
+            return info
+    except Exception:
+        return info
+    try:
+        import subprocess as _sp
+        out = _sp.run(['git', 'status', '--porcelain=v1', '-uall'], cwd=str(workspace),
+                      capture_output=True, timeout=5, text=True)
+        if out.returncode == 0:
+            for line in (out.stdout or '').splitlines()[:max_files]:
+                line = ''.join(ch if 32 <= ord(ch) < 127 else '?' for ch in line)[:200]
+                if line.strip():
+                    info['dirty'].append(_redact_secret_shapes(line.strip()))
+    except Exception:
+        pass
+    try:
+        import subprocess as _sp
+        argv = ['git', 'log', '--oneline', '-5', '--no-decorate']
+        out = _sp.run(argv, cwd=str(workspace), capture_output=True, timeout=5, text=True)
+        if out.returncode == 0:
+            for line in (out.stdout or '').splitlines()[:5]:
+                line = ''.join(ch if 32 <= ord(ch) < 127 else '?' for ch in line)[:200]
+                if line.strip():
+                    info['commits'].append(_redact_secret_shapes(line.strip()))
+    except Exception:
+        pass
+    return info
+
+
 def diagnostic(raw='', *, error_type='RuntimeError', exit_code=None, stage='launcher_run', engine=None, cwd=None, task_id=None, launched_at=None, start_offsets=None):
     reason, message = 'launcher_command_failed', 'The launcher command failed; unrecognized output was withheld.'
     refusal_found = False

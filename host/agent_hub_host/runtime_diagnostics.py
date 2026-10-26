@@ -8,6 +8,33 @@ import re
 import subprocess
 
 
+def _sanitize_tail(text, limit=1024):
+    """Keep a bounded printable tail; redact likely secret values, never fail."""
+    try:
+        raw = str(text or '')
+    except Exception:
+        return ''
+    raw = re.sub(r'\x1b\[[0-9;]*m', '', raw)
+    raw = raw.replace('\x00', '')
+    lines = raw[-8192:].splitlines()[-10:]
+    cleaned = []
+    for line in lines:
+        line = ''.join(ch if 32 <= ord(ch) < 127 or ch in '\t' else ' ' for ch in line).strip()
+        # Redact bearer/token/key assignments without keeping the value.
+        line = re.sub(r'(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+', r'\1[redacted]', line)
+        line = re.sub(r'(?i)(api[_-]?key\s*[:=]\s*)[^\s;]+', r'\1[redacted]', line)
+        line = re.sub(r'sk-[A-Za-z0-9_-]{8,}', 'sk-[redacted]', line)
+        line = re.sub(r'(?i)(token\s*[:=]\s*)[^\s;]+', r'\1[redacted]', line)
+        if len(line) > 200:
+            line = line[:200]
+        if line:
+            cleaned.append(line)
+    out = '\n'.join(cleaned)
+    if len(out) > limit:
+        out = out[-limit:]
+    return out
+
+
 def runtime_diagnostic(record, tombstone, *, query=None):
     native_id = record.get('native_id', '')
     if not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', native_id):
@@ -44,17 +71,35 @@ def runtime_diagnostic(record, tombstone, *, query=None):
     exit_info = record.get('runtime_exit')
     if not isinstance(exit_info, dict):
         exit_info = {}
+    code = exit_info.get('code') if type(exit_info.get('code')) is int else None
+    signal = exit_info.get('signal') if type(exit_info.get('signal')) is int and exit_info['signal'] > 0 else None
+    wall_ms = None
+    try:
+        if type(start) is int and type(end) is int and 0 < start <= end:
+            wall_ms = end - start
+    except Exception:
+        wall_ms = None
+    tail = _sanitize_tail(record.get('runtime_tail') or tombstone.get('runtime_tail') or '')
+    detail = 'code=' + (str(code) if code is not None else 'unknown')
+    detail += ', signal=' + (str(signal) if signal is not None else 'none')
+    detail += ', wall_time_ms=' + (str(wall_ms) if wall_ms is not None else 'unknown')
     if oom or exit_info.get('oom_killed') is True:
-        reason, message = 'engine_oom_killed', 'The running session experienced a kernel OOM kill.'
+        reason, message = 'engine_oom_killed', 'The running session experienced a kernel OOM kill (' + detail + ').'
     elif timeout:
-        reason, message = 'engine_runtime_timeout', 'The running engine exceeded its host runtime limit.'
-    elif type(exit_info.get('signal')) is int and exit_info['signal'] > 0:
-        reason, message = 'engine_signal_exit', 'The running engine terminated from signal ' + str(exit_info['signal']) + '.'
-    elif type(exit_info.get('code')) is int:
-        reason, message = 'engine_exit_code', 'The running engine exited with code ' + str(exit_info['code']) + ' without a valid result.'
+        reason, message = 'engine_runtime_timeout', 'The running engine exceeded its host runtime limit (' + detail + ').'
+    elif signal is not None:
+        reason, message = 'engine_signal_exit', 'The running engine terminated from signal ' + str(signal) + ' (' + detail + '); no engine result was produced.'
+    elif code is not None:
+        reason, message = 'engine_exit_code', 'The running engine exited with code ' + str(code) + ' (' + detail + '); no engine result was produced.'
     else:
-        reason, message = 'engine_exited_without_result', 'The engine started, then exited without a valid result; the exact runtime cause is unavailable.'
+        reason, message = 'engine_exited_without_result', 'The engine started, then exited without a valid result (' + detail + '); no engine result was produced.'
     value = dict(reason=reason, message=message, error_type='RuntimeError', stage='runtime')
-    if type(exit_info.get('code')) is int:
-        value['exit_code'] = exit_info['code']
+    if code is not None:
+        value['exit_code'] = code
+    if signal is not None:
+        value['signal'] = signal
+    if wall_ms is not None:
+        value['wall_time_ms'] = wall_ms
+    if tail:
+        value['tail'] = tail
     return value
