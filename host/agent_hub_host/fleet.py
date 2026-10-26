@@ -787,6 +787,9 @@ class Dispatcher:
                 workspace = data.get("workspace")
                 engine = data.get("engine")
                 incarnation = data.get("incarnation")
+                routing_task_id = data.get("routing_task_id")
+                if routing_task_id is not None and not self._valid_routing_task_id(routing_task_id):
+                    continue
                 if not (isinstance(offer_id, str) and LABEL.fullmatch(offer_id)):
                     continue
                 if not (isinstance(task_id, str) and LABEL.fullmatch(task_id)):
@@ -872,7 +875,7 @@ class Dispatcher:
             for item in artifacts[:8]:
                 if not isinstance(item, dict):
                     continue
-                label_text = item.get("label")
+                label_text = item.get("label", item.get("name"))
                 text = item.get("text")
                 if not isinstance(label_text, str) or not isinstance(text, str):
                     continue
@@ -885,7 +888,24 @@ class Dispatcher:
         except Exception:
             return {}
 
-    def _record_running_launch(self, offer_id, task_id, workspace, engine, account, native_id, result_path, details, profile=None, launched_at_ts=None, log_offsets=None):
+    @staticmethod
+    def _valid_routing_task_id(value):
+        try:
+            return isinstance(value, str) and str(uuid.UUID(value)) == value
+        except (ValueError, TypeError, AttributeError):
+            return False
+
+    def _routed_finish_report(self, record, fleet_state):
+        forwarded = self._read_hub_finish_report(record)
+        if not forwarded:
+            return {'status': 'failed', 'report': 'Agent exited without a valid structured report; inspect private local logs.',
+                    'artifacts': [], 'confirmed_exit': True}
+        return {'status': 'failed' if fleet_state == 'failed' else forwarded['report_status'],
+                'report': forwarded['report'], 'confirmed_exit': True,
+                'artifacts': [{'name': f'evidence-{i + 1}', 'text': item['label'] + '\n' + item['text']}
+                              for i, item in enumerate(forwarded['artifacts'])]}
+
+    def _record_running_launch(self, offer_id, task_id, workspace, engine, account, native_id, result_path, details, profile=None, launched_at_ts=None, log_offsets=None, routing_task_id=None):
         from .native_sessions import NativeTarget, SessionControlError
         from . import private_fs
 
@@ -949,6 +969,10 @@ class Dispatcher:
             "launched_at_ts": launched_at_ts,
             "log_offsets": log_offsets,
         }
+        if routing_task_id is not None:
+            if not self._valid_routing_task_id(routing_task_id):
+                return
+            record['routing_task_id'] = routing_task_id
         self._active_launches[offer_id] = record
         self._persist_launch_record(record)
 
@@ -1069,7 +1093,7 @@ class Dispatcher:
             except (SessionControlError, KeyError, ValueError, TypeError):
                 continue
 
-            if time.time() - incarnation / 1000 < 600 or record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused':
+            if not record.get('routing_task_id') and (time.time() - incarnation / 1000 < 600 or record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused'):
                 health = self._check_headless_health(offer_id, record['task_id'], record['workspace'], engine)
                 if health is not None:
                     reconciled.append(health)
@@ -1110,6 +1134,28 @@ class Dispatcher:
 
             # 4. Own-host Fleet terminal result
             fleet_state = "failed" if reconciled_state == "failed" or record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused' else "exited"
+            if record.get('routing_task_id'):
+                job_id = record['routing_task_id']
+                payload = self._routed_finish_report(record, fleet_state)
+                try:
+                    try:
+                        acknowledgement = self.request('POST', f'/api/fleet/tasks/{job_id}/result', payload)
+                    except Exception:
+                        # A lost POST response may already have committed the result.
+                        acknowledgement = self.request('GET', f'/api/fleet/tasks/{job_id}')
+                    if (not isinstance(acknowledgement, dict)
+                            or acknowledgement.get('id') != job_id
+                            or acknowledgement.get('launch_id') != offer_id
+                            or acknowledgement.get('status') != payload['status']):
+                        continue
+                    record.update(settled=True, state=payload['status'], settled_at=utcnow())
+                    self._persist_launch_record(record)
+                    reconciled.append({'id': offer_id, 'state': payload['status'], 'reconciled': True})
+                    if payload['status'] in {'done', 'failed'}:
+                        self._maybe_cleanup_worktree(Path(record['workspace']), record['native_id'])
+                except Exception:
+                    pass  # Retain the journal until the assigned task acknowledges this result.
+                continue
             result_payload = {
                 "state": fleet_state,
                 "confirmed_exit": True,
@@ -1817,7 +1863,7 @@ class Dispatcher:
                     raise ValueError('Native lifecycle receipt is incomplete')
             if not isinstance(native_id, str) or not native_id:
                 raise ValueError("No confirmed native execution receipt")
-            if mode == "headless" and not offer.get("task_id") and result.get("state") == "running":
+            if mode == "headless" and result.get("state") == "running":
                 self._record_running_launch(
                     offer_id=offer_id,
                     task_id=task_id,
@@ -1830,8 +1876,9 @@ class Dispatcher:
                     profile=offer.get("profile") or sub.get("profile"),
                     launched_at_ts=launched_at_ts,
                     log_offsets=log_offsets,
+                    routing_task_id=offer.get('task_id'),
                 )
-                health = self._check_headless_health(offer_id, task_id, workspace, offer.get('engine') or sub.get('engine'))
+                health = None if offer.get('task_id') else self._check_headless_health(offer_id, task_id, workspace, offer.get('engine') or sub.get('engine'))
                 if health is not None:
                     return health
         except Exception as exc:
@@ -1943,7 +1990,8 @@ class Dispatcher:
                 report = json.loads(read_text(result_path))
                 if not isinstance(report, dict) or report.get('status') not in {'done', 'failed', 'waiting-on-human', 'stuck'}:
                     raise ValueError('Invalid final report')
-                report = {'status': report['status'], 'report': report['report'], 'artifacts': report.get('artifacts', [])}
+                report = self._routed_finish_report({'offer_id': offer_id, 'workspace': str(workspace),
+                                                    'result_path': str(result_path)}, result['state'])
                 if result['state'] == 'failed': report['status'] = 'failed'
             except Exception:
                 report = {'status': 'failed', 'report': 'Agent exited without a valid structured report; inspect private local logs.', 'artifacts': []}

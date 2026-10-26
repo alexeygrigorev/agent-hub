@@ -1019,7 +1019,7 @@ class FleetTests(unittest.TestCase):
                     self.assertTrue(posted_body['confirmed_exit'])
                     if expected_status == 'done':
                         self.assertEqual(posted_body['report'], 'valid report')
-                        self.assertEqual(posted_body['artifacts'], [{"label": "out", "text": "log"}])
+                        self.assertEqual(posted_body['artifacts'], [{"name": "evidence-1", "text": "out\nlog"}])
                     elif expected_status == 'failed' and case_name != "process_failed_exit":
                         self.assertIn('without a valid structured report', posted_body['report'])
 
