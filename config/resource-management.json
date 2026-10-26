@@ -1,5 +1,6 @@
 {
   "memory_floor_mb": 2048,
+  "disk_floor_gb": 15,
   "ramp_reserve_default_mb": 512,
   "estimate_percentile": 90,
   "estimate_multiplier": 1.25,

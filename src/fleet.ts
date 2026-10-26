@@ -83,7 +83,7 @@ function disabledEngines(): Set<string> {
   return new Set<string>((((policy as any).models || []) as any[]).filter(m => m && disabled.has(m.provider)).map(m => String(m.engine)));
 }
 /** Reject reasons that mean "no free slot right now" (transient capacity). */
-const CAPACITY_REASONS = new Set(['account_capacity', 'machine_capacity', 'launcher_memory_reserve', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
+const CAPACITY_REASONS = new Set(['disk_floor', 'account_capacity', 'machine_capacity', 'launcher_memory_reserve', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
 /** Launcher memory gate inputs, mirrored here for dashboard visibility only.
  * The placement verdict stays in plan(); this module never changes the math,
  * it only projects the same inputs (MemAvailable, reserved total, floor for
@@ -743,12 +743,15 @@ export class FleetService {
       else if (Number.isFinite(hb.mem_avail_mb) && !memoryVerdict(hb.mem_avail_mb,
         this.resources.headroom(route.machine_id, request, route.engine).reserved_mb,
         this.resources.headroom(route.machine_id, request, route.engine).requested_mb, this.resources.config())) reason = 'launcher_memory_reserve';
-      else if (!Number.isFinite(hb.mem_avail_mb) || !Number.isFinite(hb.disk_free_gb) || hb.disk_free_gb < 50.5) reason = 'resource_limit';
+      else if (!Number.isFinite(hb.mem_avail_mb) || !Number.isFinite(hb.disk_free_gb)) reason = 'resource_limit';
+      // Root-disk floor is configurable (resource_settings.disk_floor_gb, default
+      // 15 GiB). Docker and /tmp live on /data, so / only needs modest headroom.
+      else if (hb.disk_free_gb < this.resources.config().disk_floor_gb) reason = 'disk_floor';
       else if (!this.resources.cpuHeadroom(route.machine_id,request).admitted) reason = this.resources.cpuHeadroom(route.machine_id,request).reason!;
       else if (!account || account.status !== 'ok') reason = 'account_' + (account?.status || 'unmapped');
       else if (!this.observation(definitions.get(route.account), route)) reason = 'machine_account_quota_unknown';
       else if (account.available_slots < 1) reason = 'account_capacity';
-      if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'launcher_memory_reserve' ? { memory: this.resources.headroom(route.machine_id, request, route.engine) } : {}), ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:this.resources.cpuHeadroom(route.machine_id,request)} : {}) }); continue; }
+      if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'launcher_memory_reserve' ? { memory: this.resources.headroom(route.machine_id, request, route.engine) } : {}), ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}), ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:this.resources.cpuHeadroom(route.machine_id,request)} : {}) }); continue; }
       const family = canonicalQuotaProvider(definitions.get(route.account)?.provider as string);
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];

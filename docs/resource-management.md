@@ -111,6 +111,7 @@ hard-coded constants.
 | knob | default | used by |
 |---|---|---|
 | `memory_floor_mb` | 2048 | Hub `plan()` gate, launcher `check_resources` |
+| `disk_floor_gb` | 15 | Hub `plan()` root-disk floor in GiB (fractional ok); below it the route is rejected as `disk_floor` (queued as capacity) |
 | `ramp_reserve_default_mb` | measured p90, fallback 512 | placement estimate |
 | `estimate_percentile` | 90 | placement estimate |
 | `estimate_multiplier` | 1.25 | measured estimate growth allowance |
