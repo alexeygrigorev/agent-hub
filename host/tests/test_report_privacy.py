@@ -55,3 +55,56 @@ class ReportPrivacy(unittest.TestCase):
                 self.assertTrue(record['settled'])
                 wire=json.dumps(d.request.call_args.args[2],ensure_ascii=False).encode('utf-8')
                 self.assertIn('Completed'.encode(),wire)
+
+
+    def test_screen_selection_and_git_fallback_cannot_discard_secret_context(self):
+        from agent_hub_host.fleet import Dispatcher
+        from agent_hub_host.runtime_diagnostics import runtime_diagnostic
+        from agent_hub_host.launch_diagnostics import read_native_screen_crash_tail
+        import subprocess
+        secret='short-test-value'
+        screen='password="first line\npanic: '+secret+'\nlast line"\nTransport: The socket connection was closed unexpectedly'
+        subject='abc1234 subject password="'+'ordinary words '*30+secret+' end"'
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);(root/'.git').mkdir()
+            native=root/'native/sessions'/NATIVE;native.mkdir(parents=True)
+            (native/'screen.txt').write_text(screen)
+            d=Dispatcher(dict(version=1,subscriptions=[],workspaces={'main':tmp},aplexer_state_dir=str(root/'native')))
+            record=dict(workspace=tmp,offer_id=OFFER,native_id=NATIVE,engine='opencode',
+                        incarnation=1000,launched_at_ts=1,log_offsets={})
+            def git(argv,**kwargs):
+                return subprocess.CompletedProcess(argv,0,subject if 'log' in argv else '', '')
+            with patch('subprocess.run',side_effect=git),patch.object(d,'_session_log_dest',return_value=(None,None)):
+                partial=d._no_result_partial_report(record)
+            diagnostic=runtime_diagnostic(record,dict(finished_at_ms=2000),query=lambda argv:'')
+            final=bound_finish_fields(dict(report=partial['report'],artifacts=partial['artifacts'],diagnostic=diagnostic))
+            self.assertNotIn(secret,read_native_screen_crash_tail(str(root/'native'),NATIVE))
+            self.assertNotIn(secret,json.dumps(final))
+            self.assertIn('Transport:',final['report'])
+
+    def test_truncated_quoted_value_is_redacted_through_end_of_window(self):
+        from agent_hub_host.log_redaction import redact_log
+        self.assertNotIn('short-test-value',redact_log('password="prefix short-test-value'))
+
+
+    def test_fast_retirement_recovers_and_retains_exact_output_without_catalog_sample(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);native=root/'state/retired-sessions'/NATIVE;native.mkdir(parents=True)
+            (native/'history.bin').write_text('Work completed\npassword="short-test-value"\n')
+            record=dict(offer_id=OFFER,native_id=NATIVE,tag='task-hub-'+OFFER,incarnation=1000,
+                        workspace=tmp,engine='opencode')
+            tombstone=dict(exit=dict(code=0,signal=None,exited_at_ms=2000))
+            evidence=terminal_evidence(record,tombstone,state_dir=str(root/'state'))
+            self.assertEqual(evidence['exit_code'],0)
+            self.assertEqual(evidence['wall_time_ms'],1000)
+            self.assertIn('Work completed',evidence['log_tail'])
+            self.assertNotIn('short-test-value',evidence['log_tail'])
+            self.assertTrue((root/'.local/hub-session-logs'/(OFFER+'.json')).is_file())
+            # Never clip an unlabeled interior of a large history: use the full
+            # bounded native screen snapshot instead.
+            (native/'history.bin').write_text('password="'+'secret fragment '*6000+'"')
+            (native/'screen.txt').write_text('Latest safe output\n')
+            record.pop('exit_evidence',None)
+            evidence=terminal_evidence(record,tombstone,state_dir=str(root/'state'))
+            self.assertIn('Latest safe output',evidence['log_tail'])
+            self.assertNotIn('secret fragment',evidence['log_tail'])

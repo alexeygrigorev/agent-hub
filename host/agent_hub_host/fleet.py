@@ -1285,8 +1285,8 @@ class Dispatcher:
                 if log_dest:
                     try:
                         with open(log_dest, 'r', encoding='utf-8', errors='replace') as f:
-                            data = f.read()
-                        tail = _sanitize_tail(data[-8192:])
+                            data = f.read(65537)
+                        tail = _sanitize_tail(data)
                         # Attach the sanitized tail so runtime_diagnostic carries it.
                         if isinstance(record, dict) and tail and not record.get('runtime_tail'):
                             record['runtime_tail'] = tail
@@ -1616,7 +1616,7 @@ class Dispatcher:
                 (record.get('diagnostic') or {}).get('reason')
                 if isinstance(record.get('diagnostic'), dict) else None)
             from .exit_evidence import terminal_evidence, bound_finish_fields
-            evidence = dict(cached['runtime']) if cached and isinstance(cached.get('runtime'), dict) else terminal_evidence(record, tombstone or {})
+            evidence = dict(cached['runtime']) if cached and isinstance(cached.get('runtime'), dict) else terminal_evidence(record, tombstone or {}, state_dir=state_dir)
             evidence['outcome'] = ('reported' if _peeked else
                 'failed-with-partial-work' if evidence['observed_commits'] or evidence['dirty_paths'] or evidence['log_tail'] else
                 'failed-without-report')
@@ -2742,7 +2742,7 @@ class Dispatcher:
                 'incarnation': details.get('created_at_ms') or int(launched_at_ts * 1000),
                 'runtime_exit': {'code': details.get('exit_code'), 'signal': details.get('signal')},
                 'exit_evidence': {'log_tail': sanitize(str(details.get('stderr') or details.get('stdout') or ''))}}
-            evidence = terminal_evidence(immediate, {'finished_at_ms': int(time.time() * 1000)})
+            evidence = terminal_evidence(immediate, {'finished_at_ms': int(time.time() * 1000)}, state_dir=self.settings.get('aplexer_state_dir'))
             forwarded = self._read_hub_finish_report(immediate)
             evidence['outcome'] = ('reported' if forwarded else 'failed-with-partial-work'
                 if evidence['observed_commits'] or evidence['dirty_paths'] or evidence['log_tail'] else 'failed-without-report')

@@ -75,16 +75,16 @@ def same_native(record, row):
 
 
 def _tail(path):
-    """No-follow, bounded terminal history; discard a partial first line."""
+    """Redact complete bounded output before clipping away credential context."""
     with private_fs.parent(path, private=False) as anchor:
         fd = private_fs._open(anchor, path, os.O_RDONLY, private=False)
         with os.fdopen(fd, 'rb') as stream:
             size = os.fstat(stream.fileno()).st_size
-            offset = max(0, size - 32768)
-            stream.seek(offset)
-            raw = stream.read(32768)
-    if offset:
-        raw = raw.partition(b'\n')[2]
+            if size > 65536:
+                raise ValueError('terminal history exceeds full-context privacy budget')
+            raw = stream.read(65537)
+            if len(raw) > 65536:
+                raise ValueError('terminal output grew beyond privacy budget')
     return sanitize(raw.decode('utf-8', 'replace'), 16384)
 
 
@@ -102,11 +102,14 @@ def snapshot_native(record, row, *, opencode_data=None):
         result['oom_killed'] = info.get('oom_killed') is True
     history = row.get('history_path')
     if isinstance(history, str) and Path(history).is_absolute() and Path(history).parent.name == row['id']:
-        try:
-            result['log_tail'] = sanitize(_tail(history), 2048)
-            result['log_source'] = 'native_history'
-        except (OSError, ValueError):
-            pass
+        for path, source in ((Path(history), 'native_history'),
+                             (Path(history).with_name('screen.txt'), 'native_screen')):
+            try:
+                result['log_tail'] = sanitize(_tail(path), 2048)
+                result['log_source'] = source
+                break
+            except (OSError, ValueError):
+                pass
     if row.get('engine') == 'opencode' and opencode_data:
         outcome = _opencode_outcome(row, opencode_data)
         if outcome:
@@ -141,7 +144,7 @@ def _opencode_outcome(row, data):
     return None
 
 
-def terminal_evidence(record, tombstone, *, git=subprocess.run):
+def terminal_evidence(record, tombstone, *, git=subprocess.run, state_dir=None):
     """Unknown measurements remain null; partial work is observed, not owned."""
     saved = record.get('exit_evidence') or {}
     native_exit = record.get('runtime_exit') or {}
@@ -163,6 +166,30 @@ def terminal_evidence(record, tombstone, *, git=subprocess.run):
     if isinstance(durable, dict):
         native_exit = {**native_exit, **durable}
         record['runtime_exit'] = native_exit
+    if not saved.get('log_tail') and isinstance(record.get('runtime_tail'), str):
+        saved = dict(saved, log_tail=sanitize(record['runtime_tail']))
+    # Fast launches may retire between catalog samples. These fixed, no-follow
+    # native paths supply output only; the caller still proves exact retirement.
+    if (not saved.get('log_tail') and UUID.fullmatch(str(record.get('native_id', '')))
+            and UUID.fullmatch(str(record.get('offer_id', '')))
+            and record.get('tag') == 'task-hub-' + record['offer_id']
+            and type(record.get('incarnation')) is int and record['incarnation'] > 0
+            and isinstance(record.get('workspace'), str) and Path(record['workspace']).is_absolute()
+            and isinstance(record.get('engine'), str)):
+        try:
+            from .retired_native import resolve_aplexer_state_dir
+            base = Path(resolve_aplexer_state_dir(state_dir))
+            for sub in ('retired-sessions', 'sessions'):
+                row = dict(id=record['native_id'], created_at_ms=record['incarnation'],
+                           tag=record['tag'], workspace=record['workspace'], engine=record['engine'],
+                           exit=native_exit, history_path=str(base / sub / record['native_id'] / 'history.bin'))
+                recovered = snapshot_native(record, row)
+                if recovered and recovered.get('log_tail'):
+                    saved = dict(saved, **recovered)
+                    record['exit_evidence'] = saved
+                    break
+        except (OSError, ValueError):
+            pass
     end = saved.get('exited_at_ms') or native_exit.get('exited_at_ms') or tombstone.get('finished_at_ms')
     start = record.get('incarnation')
     code = integer(native_exit.get('code'))

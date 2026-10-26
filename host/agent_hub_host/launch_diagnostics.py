@@ -236,6 +236,8 @@ def retain_per_session_opencode_log(log_offsets, dest_path, max_bytes=65536, eng
                             f.seek(size - max_bytes)
                         chunk = f.read(max_bytes)
                     if chunk:
+                        from .log_redaction import redact_log
+                        chunk = redact_log(chunk.decode('utf-8', 'replace')).encode('utf-8')
                         if wrote_any and out.tell() + len(chunk) > max_bytes:
                             break
                         out.write(chunk[-max_bytes:])
@@ -260,6 +262,8 @@ def retain_per_session_opencode_log(log_offsets, dest_path, max_bytes=65536, eng
 def _redact_secret_shapes(line: str) -> str:
     """Redact token-like values from bounded path/status lines (never fail)."""
     try:
+        from .log_redaction import redact_log
+        line = redact_log(line)
         line = re.sub(r'sk-[A-Za-z0-9_-]{8,}', 'sk-[redacted]', line)
         line = re.sub(r'(?i)\bsk-ant-[A-Za-z0-9_-]{8,}\b', 'sk-ant-[redacted]', line)
         line = re.sub(r'(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+', r'\1[redacted]', line)
@@ -313,13 +317,13 @@ def extract_crash_tail(screen_text, *, max_lines=3, limit=512) -> str:
     except Exception:
         _sanitize_tail = None  # type: ignore[assignment]
     try:
-        from .workclaim import redact_for_bus
+        from .log_redaction import redact_log
         raw = str(screen_text or '')
         if len(raw) > 65536:
             return ''
         # Remove multi-line secrets before selecting matching lines, otherwise
         # selection could discard the PEM delimiters needed by the scrubber.
-        lines = redact_for_bus(raw).splitlines()
+        lines = redact_log(raw).splitlines()
     except Exception:
         return ''
     hits = [ln for ln in lines if _looks_like_crash_line(ln)]
@@ -339,8 +343,9 @@ def extract_crash_tail(screen_text, *, max_lines=3, limit=512) -> str:
 def read_native_screen_crash_tail(state_dir, native_id, *, max_bytes=16384, limit=512) -> str:
     """Best-effort sanitized crash tail from a native screen.txt snapshot.
 
-    Reads ONLY <state_dir>/sessions|retired-sessions/<uuid>/screen.txt for a
-    validated UUID (never follows symlinks, bounded read). Returns the
+    Reads a complete snapshot up to64KiB ONLY from
+    <state_dir>/sessions|retired-sessions/<uuid>/screen.txt for a validated
+    UUID (never follows symlinks). Filters before limiting the returned tail. Returns the
     crash-signature tail or ''. Never raises, never returns raw screen text.
     """
     try:
@@ -359,21 +364,19 @@ def read_native_screen_crash_tail(state_dir, native_id, *, max_bytes=16384, limi
                 if _os.path.islink(path) or not _os.path.isfile(path):
                     continue
                 size = _os.path.getsize(path)
-                if size <= 0 or size > 50 * 1024 * 1024:
+                if size <= 0 or size > 65536:
                     continue
                 with private_fs.parent(path, private=False) as anchor:
                     fd = private_fs._open(anchor, path, _os.O_RDONLY, private=False)
                     with _os.fdopen(fd, 'rb') as f:
                         size = _os.fstat(f.fileno()).st_size
-                        offset = max(0, size - max_bytes)
-                        f.seek(offset)
-                        data = f.read(max_bytes)
-                        if offset:
-                            data = data.partition(b'\n')[2]
+                        data = f.read(65537)
+                        if len(data) > 65536:
+                            continue
                 text = data.decode('utf-8', 'replace')
             except Exception:
                 continue
-            tail = extract_crash_tail(text, limit=limit)
+            tail = extract_crash_tail(text, limit=min(limit, max_bytes))
             if tail:
                 return tail
     except Exception:
@@ -395,7 +398,7 @@ def describe_partial_work(workspace, launched_at_ts=None, max_files=20) -> dict:
         out = _sp.run(['git', 'status', '--porcelain=v1', '-uall'], cwd=str(workspace),
                       capture_output=True, timeout=5, text=True)
         if out.returncode == 0:
-            for line in (out.stdout or '').splitlines()[:max_files]:
+            for line in _redact_secret_shapes(out.stdout or '').splitlines()[:max_files]:
                 line = ''.join(ch if 32 <= ord(ch) < 127 else '?' for ch in line)[:200]
                 if line.strip():
                     info['dirty'].append(_redact_secret_shapes(line.strip()))
@@ -417,7 +420,7 @@ def describe_partial_work(workspace, launched_at_ts=None, max_files=20) -> dict:
                 pass
         out = _sp.run(argv, cwd=str(workspace), capture_output=True, timeout=5, text=True)
         if out.returncode == 0:
-            for line in (out.stdout or '').splitlines()[:5]:
+            for line in _redact_secret_shapes(out.stdout or '').splitlines()[:5]:
                 line = ''.join(ch if 32 <= ord(ch) < 127 else '?' for ch in line)[:200]
                 if line.strip():
                     info['commits'].append(_redact_secret_shapes(line.strip()))

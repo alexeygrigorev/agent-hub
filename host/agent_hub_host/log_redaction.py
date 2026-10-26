@@ -15,6 +15,6 @@ def redact_log(text):
     text = re.sub(r'(?i)\bbearer\s+[^\s\"\x27,;]+', 'Bearer [redacted]', text)
     text = re.sub(r'(?im)((?:authorization|cookie|set-cookie)\s*:\s*)[^\r\n]*', r'\1[redacted]', text)
     text = re.sub(
-        r'''(?ix)(["']?\b(?:password|passwd|secret|token|access_token|refresh_token|api[_-]?key|authorization|cookie|set-cookie|aws_secret_access_key)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)''',
+        r'''(?ix)(["']?\b(?:password|passwd|secret|token|access_token|refresh_token|api[_-]?key|authorization|cookie|set-cookie|aws_secret_access_key)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s,;]+)''',
         r'\1[redacted]', text)
     return redact_for_bus(text)
