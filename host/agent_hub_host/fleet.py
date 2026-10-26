@@ -2760,7 +2760,7 @@ class Dispatcher:
         self._last_hb = hb
         return hb
 
-    def dispatch_offers(self, results, hb=None, offers=None, concurrency=1):
+    def dispatch_offers(self, results, hb=None, offers=None, concurrency=1, refresh=True):
         """Claim + dispatch current offers under the offers lock.
 
         Returns (offers_seen, dispatch_max_s); skips (0, 0.0) when the
@@ -2772,7 +2772,7 @@ class Dispatcher:
         try:
             if offers is None:
                 offers = self.request("GET", "/api/fleet/offers").get("offers", [])
-            hb = hb if hb is not None else getattr(self, '_last_hb', None)
+            hb = (hb if hb is not None else getattr(self, '_last_hb', None)) if refresh else None
             durations = []
             guard = threading.Lock()
 
@@ -2816,7 +2816,10 @@ class Dispatcher:
             concurrency = max(1, min(4, int(self.settings.get("dispatch_concurrency", DISPATCH_CONCURRENCY))))
         except (TypeError, ValueError):
             concurrency = DISPATCH_CONCURRENCY
-        seen, max_s = self.dispatch_offers(results, concurrency=concurrency)
+        # The fast telemetry thread keeps the check-in fresh, so the per-offer
+        # heartbeat re-post (a Hub round trip that stalls with the Hub) is
+        # skipped here to keep queued offers moving.
+        seen, max_s = self.dispatch_offers(results, hb=None, concurrency=concurrency, refresh=False)
         return {'offers': seen, 'results': results, 'dispatch_max_s': round(max_s, 3)}
 
     def _once_locked(self, phases, _mark, _skip_telemetry):

@@ -152,7 +152,9 @@ def test_offers_tick_dispatches_concurrently_and_refresh_posts_fresh_heartbeat()
         with patch.object(dispatcher, "dispatch", side_effect=slow_dispatch), \
                 patch("agent_hub_host.api.get_heartbeat_payload", return_value={"cpu_usage": {"observed_at": "fresh"}}):
             out = dispatcher.offers_tick()
-        assert out["offers"] == 3 and len(out["results"]) == 3
-        assert peak[0] >= 2, "offers must not be claimed strictly serially"
+            assert out["offers"] == 3 and len(out["results"]) == 3
+            assert peak[0] >= 2, "opt-in concurrency must dispatch in parallel"
+            assert polls == [], "fast tick relies on the telemetry thread for check-in"
+            dispatcher._refresh_checkin({"cpu_usage": {"observed_at": "stale"}})
         assert polls and all(p["cpu_usage"]["observed_at"] == "fresh" for p in polls)
         assert all(p["gate"]["launch_allowed"] is True for p in polls)
