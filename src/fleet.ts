@@ -1399,12 +1399,13 @@ export class FleetService {
         }
         // Replay an identical committed normal-headless terminal receipt without effects.
         if (row.mode === 'headless' && ['exited', 'failed'].includes(row.state) &&
-            object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit']) &&
+            object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'report_status', 'report', 'artifacts']) &&
             data.state === row.state && data.confirmed_exit === true &&
             typeof data.native_id === 'string' && data.native_id.length > 0 && data.native_id.length <= 160 &&
             data.native_id === row.native_id && label(data.launcher_task_id) &&
             data.launcher_task_id === row.launcher_task_id &&
             !this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) {
+          this.ingestFinishReport(row.id, data);
           return response({ id: row.id, state: row.state, replay: true });
         }
         // Host emits fixed, sanitized diagnostics; validate bounds again at storage.
@@ -1419,12 +1420,13 @@ export class FleetService {
         // runtime evidence. Identity/state stay fixed; no capacity/lifecycle effect.
         if (row.mode === 'headless' && row.state === 'failed' && data.state === 'failed' &&
             diagnostic?.stage === 'runtime' && data.confirmed_exit === true &&
-            object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'diagnostic']) &&
+            object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'diagnostic', 'report_status', 'report', 'artifacts']) &&
             !!row.native_id && data.native_id === row.native_id &&
             !!row.launcher_task_id && data.launcher_task_id === row.launcher_task_id &&
             (!row.launch_error_json || row.launch_error_json === JSON.stringify(diagnostic)) &&
             !this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) {
           this.sql.exec('UPDATE fleet_launches SET launch_error_json = ?, exit_reason = ? WHERE id = ?', JSON.stringify(diagnostic), diagnostic.reason, row.id);
+          this.ingestFinishReport(row.id, data);
           return response({ id: row.id, state: row.state, replay: true });
         }
         const noStart = object(data, ['state', 'launcher_task_id', 'confirmed_exit', 'reason', 'diagnostic']) &&
@@ -1453,11 +1455,20 @@ export class FleetService {
           }
         }
         if (noStart && row.state === 'failed' && row.exit_reason === data.reason && row.launcher_task_id === data.launcher_task_id) return response({ id: row.id, state: row.state, replay: true });
-        if ((!noStart && !object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'diagnostic'])) || !['running', 'uncertain', 'failed', 'exited'].includes(data.state) || !['starting', 'running', 'uncertain'].includes(row.state)) return response({ error: 'invalid_transition' }, 409);
+        if ((!noStart && !object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'diagnostic', 'report_status', 'report', 'artifacts'])) || !['running', 'uncertain', 'failed', 'exited'].includes(data.state) || !['starting', 'running', 'uncertain'].includes(row.state)) return response({ error: 'invalid_transition' }, 409);
         if (['exited', 'failed'].includes(data.state) && this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) return response({ error: 'task_report_required' }, 409);
         if (['exited', 'failed'].includes(data.state) && data.confirmed_exit !== true) return response({ error: 'confirmed_exit_required' }, 409);
         if (data.state === 'running' && (typeof data.native_id !== 'string' || data.native_id.length < 1 || data.native_id.length > 160 || (row.mode === 'headless' && !label(data.launcher_task_id)))) return response({ error: 'native_receipt_required' }, 409);
         if ((data.native_id !== undefined && (typeof data.native_id !== 'string' || data.native_id.length > 160)) || (data.launcher_task_id !== undefined && !label(data.launcher_task_id))) return response({ error: 'invalid_receipt' }, 400);
+        // Hub finish-report fields (intake 88b3260d): optional, bounded, sanitized host-side.
+        // Accepted on terminal (and replay) receipts; running/uncertain receipts must not carry them.
+        if (data.report_status !== undefined && !['done', 'failed', 'waiting-on-human', 'stuck'].includes(data.report_status)) return response({ error: 'invalid_finish_report' }, 400);
+        if (data.report !== undefined && (typeof data.report !== 'string' || data.report.length > 4096 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(data.report))) return response({ error: 'invalid_finish_report' }, 400);
+        if (data.artifacts !== undefined && (!Array.isArray(data.artifacts) || data.artifacts.length > 8 || data.artifacts.some((a: any) =>
+          a === null || typeof a !== 'object' || Array.isArray(a) ||
+          typeof (a as any).label !== 'string' || (a as any).label.length > 120 ||
+          typeof (a as any).text !== 'string' || (a as any).text.length > 1024))) return response({ error: 'invalid_finish_report' }, 400);
+        if (!['failed', 'exited'].includes(data.state) && (data.report_status !== undefined || data.report !== undefined || data.artifacts !== undefined)) return response({ error: 'invalid_finish_report' }, 400);
         this.sql.exec('UPDATE fleet_launches SET state = ?, native_id = COALESCE(?, native_id), launcher_task_id = COALESCE(?, launcher_task_id), updated_at = ? WHERE id = ?', data.state, data.native_id || null, data.launcher_task_id || null, new Date(this.now()).toISOString(), row.id);
         if (diagnostic) this.sql.exec("UPDATE fleet_launches SET launch_error_json = ?, exit_reason = ? WHERE id = ?", JSON.stringify(diagnostic), diagnostic.reason, row.id);
         if (noStart) this.sql.exec("UPDATE fleet_launches SET exit_reason = ?, verification_status = 'not_started', finished_at = ? WHERE id = ?", data.reason, new Date(this.now()).toISOString(), row.id);
@@ -1628,11 +1639,102 @@ export class FleetService {
         }
         // A terminal result frees account/machine capacity: promote waiters.
         if (['failed', 'exited'].includes(data.state)) {
+          this.sql.exec("UPDATE fleet_launches SET finished_at = COALESCE(finished_at, ?), updated_at = ? WHERE id = ?", new Date(this.now()).toISOString(), new Date(this.now()).toISOString(), row.id);
+          this.ingestFinishReport(row.id, data);
           try { this.drainCapacityQueue(); } catch { /* best-effort */ }
         }
         return response({ id: row.id, state: data.state });
       });
     }
     return response({ error: 'not_found' }, 404);
+  }
+
+  /** Append the Hub-launched session's final result to its linked intake.
+   *
+   * Intake 88b3260d AC1: every Hub-launched headless session's finish report
+   * (.local/hub-results/<fleet_launch_id>.json forwarded by the host as
+   * report_status/report/artifacts) lands on the linked intake as a
+   * Hub-authored report entry within the SAME transaction as the terminal
+   * Fleet receipt (done, waiting-on-human, stuck and failed). No worker auth
+   * required. Never closes the intake, never records scope decisions.
+   * Idempotent: a second terminal receipt (replay) finds the existing
+   * sourceRef and skips. Absent intake link or full task: no-op.
+   *
+   * Inline SQL on purpose: this already runs inside the outer Fleet result
+   * transaction, and a nested transactionSync (e.g. via an intake service
+   * call) throws in workerd, which would silently drop every report. Bounds
+   * mirror IntakeService.serviceRecordEvent (events 128 with hub:service
+   * eviction, taskBytes 131072). */
+  private ingestFinishReport(launchId: string, data: any): void {
+    try {
+      if (!['failed', 'exited'].includes(data?.state)) return;
+      if (data?.report_status !== undefined && !['done', 'failed', 'waiting-on-human', 'stuck'].includes(data.report_status)) return;
+      if (data?.report !== undefined && (typeof data.report !== 'string' || data.report.length > 4096)) return;
+      if (data?.artifacts !== undefined && (!Array.isArray(data.artifacts) || data.artifacts.length > 8 || data.artifacts.some((a: any) =>
+        a === null || typeof a !== 'object' || Array.isArray(a) ||
+        typeof (a as any).label !== 'string' || (a as any).label.length > 120 ||
+        typeof (a as any).text !== 'string' || (a as any).text.length > 1024))) return;
+      if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length === 0) return;
+      if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'intake_tasks'").toArray().length === 0) return;
+      const session: any = this.sql.exec('SELECT id, request_json FROM session_control_sessions WHERE fleet_launch_id = ?', launchId).toArray()[0];
+      if (!session) return;
+      let intakeTaskId: string | null = null;
+      try {
+        const req = JSON.parse(session.request_json || '{}');
+        if (typeof req?.intake_task_id === 'string' && req.intake_task_id) intakeTaskId = req.intake_task_id;
+      } catch { return; }
+      if (!intakeTaskId) return;
+      const sourceRef = 'fleet-finish:' + launchId;
+      const taskRow: any = this.sql.exec('SELECT data FROM intake_tasks WHERE id = ?', intakeTaskId).toArray()[0];
+      if (!taskRow) return;
+      const task = JSON.parse(taskRow.data);
+      if (!task || !Array.isArray(task.history)) return;
+      if (task.history.some((e: any) => e && (e.kind === 'report' || e.kind === 'note') &&
+        (e.source && typeof e.source === 'object' && (e.source as any).reference === sourceRef))) return;
+      const rawStatus = typeof data?.report_status === 'string' ? data.report_status : null;
+      const workerStatus = ['done', 'failed', 'waiting-on-human', 'stuck'].includes(rawStatus || '') ? rawStatus : null;
+      const fleetState = data.state === 'exited' ? 'exited' : 'failed';
+      let reportText = typeof data?.report === 'string' ? data.report.trim() : '';
+      if (reportText.length > 2000) reportText = reportText.slice(0, 2000) + '…';
+      // Belt-and-braces: never persist tokens that slipped through host
+      // sanitization. Redact common secret shapes.
+      reportText = reportText
+        .replace(/gh[pousr]_[A-Za-z0-9_]{16,}/g, '[redacted]')
+        .replace(/ghm?_[A-Za-z0-9_]{16,}|ghc_[A-Za-z0-9_]{16,}/g, '[redacted]')
+        .replace(/github_pat_[A-Za-z0-9_]{16,}/g, '[redacted]')
+        .replace(/\bAKIA[0-9A-Z]{16}\b/g, '[redacted]')
+        .replace(/\bsk-ant-[A-Za-z0-9_-]{8,}\b/g, '[redacted]')
+        .replace(/\bxox[baprs]-[A-Za-z0-9-]{8,}/g, '[redacted]')
+        .replace(/\b[0-9a-f]{40}\b/gi, '[redacted]')
+        .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]{16,}={0,1}/gi, '$1[redacted]');
+      let artifactLine = '';
+      if (Array.isArray(data?.artifacts) && data.artifacts.length) {
+        const labels = (data.artifacts as any[])
+          .map((a: any) => String(a.label).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '').slice(0, 120))
+          .filter((l: string) => l);
+        if (labels.length) artifactLine = `\nArtifacts: ${labels.join(', ').slice(0, 500)}`;
+      }
+      const text = `Hub session ${session.id} finished (${fleetState}${workerStatus ? '/' + workerStatus : ''}, launch ${launchId}).` +
+        (reportText ? ` Worker report: ${reportText}` : ' No worker report file was forwarded by the host.') + artifactLine;
+      if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(text)) return;
+      const at = new Date(this.now()).toISOString();
+      const event = {
+        id: crypto.randomUUID(), kind: 'report', actor: 'hub:service:fleet-finish',
+        captured_at: Date.now(), text: text.slice(0, 8192),
+        source: { type: 'unknown', reference: sourceRef, timestamp: at },
+        authority: 'hub_launch_verified',
+      };
+      if (task.history.length >= 128) {
+        const idx = task.history.findIndex((e: any, i: number) => i > 0 && typeof e?.actor === 'string' && e.actor.startsWith('hub:service:'));
+        if (idx < 0) return;
+        task.history.splice(idx, 1);
+      }
+      task.history.push(event);
+      task.version = (typeof task.version === 'number' ? task.version : 1) + 1;
+      task.updated_at = Date.now();
+      if (JSON.stringify(task).length > 131072) return;
+      this.sql.exec('UPDATE intake_tasks SET data = ? WHERE id = ?', JSON.stringify(task), intakeTaskId);
+      this.sql.exec('UPDATE intake_meta SET revision = revision + 1 WHERE id = 1');
+    } catch { /* best-effort: a finish-report append must never fail the terminal receipt */ }
   }
 }
