@@ -23,6 +23,71 @@ async function fixture(fn:(r:ResourceManagement,sql:any,f:FleetService)=>Promise
 }
 const sample=(extra={})=>({session_id:'session',native_id:'native',current_rss_mb:200,peak_rss_mb:200,peak_pss_mb:210,cpu_seconds:20,runtime_s:100,observed_at:iso(),...extra});
 describe('resource management',()=>{
+ it('clears read-only snapshots after exceptions and observes later admission writes',async()=>fixture(async(r,sql)=>{
+  sql.exec("UPDATE fleet_launches SET state='starting' WHERE id='launch'");
+  r.freezeCpuStart('launch',{expected_cpu_cores:2,expected_cpu_source:'test'});
+  expect(()=>r.withReadSnapshot(()=>{
+    expect(r.cpuHeadroom('host').ramping_cpu_cores).toBe(2);
+    r.withReadSnapshot(()=>expect(r.cpuHeadroom('host',{},'launch').ramping_cpu_cores).toBe(0));
+    expect(r.headroom('host').reserved_mb).toBe(512);
+    throw new Error('abort projection');
+  })).toThrow('abort projection');
+  sql.exec('INSERT INTO resource_cpu_samples VALUES(?,?,?)','launch',1,iso());
+  sql.exec('INSERT INTO resource_resident_samples VALUES(?,?,?)','launch',100,iso());
+  r.withReadSnapshot(()=>{
+    expect(r.cpuHeadroom('host').ramping_cpu_cores).toBe(1);
+    expect(r.headroom('host').reserved_mb).toBe(412);
+  });
+  sql.exec("UPDATE fleet_launches SET state='stopped' WHERE id='launch'");
+  r.configure({memory_floor_mb:4096});
+  sql.exec('INSERT INTO resource_choking_events(machine_id,reason,observed_at) VALUES(?,?,?)','host','host_oom',iso());
+  r.withReadSnapshot(()=>{
+    expect(r.cpuHeadroom('host')).toMatchObject({ramping_cpu_cores:0,reason:'host_oom',admitted:false});
+    expect(r.headroom('host')).toMatchObject({reserved_mb:0,floor_mb:4096});
+  });
+ }));
+ it('invalidates measured-history caches on writes, configuration changes and rolled-back generations',async()=>fixture(async(r,sql,f)=>{
+  r.report('host',{samples:[sample()],reaps:[]});
+  sql.exec("UPDATE session_resource_usage SET finished_at=?,peak_rss_mb=200 WHERE session_id='session'",iso());
+  expect(r.estimate('demo','opencode','goal')).toBe(250);
+  sql.exec("UPDATE session_resource_usage SET peak_rss_mb=400 WHERE session_id='session'");
+  expect(r.estimate('demo','opencode','goal')).toBe(500);
+  expect(()=> (f as any).transaction(()=>{
+    sql.exec("UPDATE session_resource_usage SET peak_rss_mb=800 WHERE session_id='session'");
+    expect(r.estimate('demo','opencode','goal')).toBe(1000);
+    throw new Error('rollback cache generation');
+  })).toThrow('rollback cache generation');
+  // No read between rollback and another write: a reused integer revision
+  // would incorrectly keep the estimate computed in the aborted transaction.
+  sql.exec("UPDATE session_resource_usage SET peak_rss_mb=900 WHERE session_id='session'");
+  expect(r.estimate('demo','opencode','goal')).toBe(1125);
+  r.configure({estimate_multiplier:2});
+  expect(r.estimate('demo','opencode','goal')).toBe(1800);
+  sql.exec("INSERT INTO session_cpu_usage VALUES('session',1,?)",iso());
+  expect(r.cpuEstimate('demo','goal').expected_cpu_cores).toBe(r.config().cpu_estimate_multiplier);
+  sql.exec("UPDATE session_cpu_usage SET p95_cpu_cores=2 WHERE session_id='session'");
+  expect(r.cpuEstimate('demo','goal').expected_cpu_cores).toBe(2*r.config().cpu_estimate_multiplier);
+  const other = new ResourceManagement(sql,()=>now);
+  expect(other.estimate('demo','opencode','goal')).toBe(1800);
+  other.configure({estimate_multiplier:1});
+  expect(r.estimate('demo','opencode','goal')).toBe(900);
+  expect(()=> (f as any).transaction(()=>{
+    sql.exec("UPDATE session_resource_usage SET peak_rss_mb=100 WHERE session_id='session'");
+    expect(r.estimate('demo','opencode','goal')).toBe(100);
+    throw new Error('rollback then read');
+  })).toThrow('rollback then read');
+  expect(r.estimate('demo','opencode','goal')).toBe(900);
+  sql.exec("DELETE FROM session_cpu_usage WHERE session_id='session'");
+  expect(r.cpuEstimate('demo','goal')).toMatchObject({expected_cpu_cores:r.config().cpu_default_cores,expected_cpu_source:'default'});
+  sql.exec("DELETE FROM session_resource_usage WHERE session_id='session'");
+  expect(r.estimate('demo','opencode','goal')).toBe(r.config().ramp_reserve_default_mb);
+  // In-progress samples cannot affect a finished-history cohort or flush it.
+  const revision = sql.exec('SELECT revision FROM resource_history_revision').one().revision;
+  r.report('host',{samples:[sample()],reaps:[]});
+  expect(sql.exec('SELECT revision FROM resource_history_revision').one().revision).toBe(revision);
+  sql.exec("UPDATE session_resource_usage SET finished_at=? WHERE session_id='session'",iso());
+  expect(r.estimate('demo','opencode','goal')).toBe(200);
+ }));
  it('reports a stale same-hostname alias row under its live canonical host, not as an unknown-telemetry host (intake 4398ce2a)',async()=>fixture(async(r,sql)=>{
   sql.exec('INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,last_heartbeat,drained,capabilities) VALUES(?,?,?,?,?,?,?,?)','host-alias-old','old','HOST','2026-01-01T00:00:00.000Z','2026-10-15T10:35:04.921Z','{}',0,JSON.stringify({cpu_count:12}));
   const hosts=r.overview().hosts;

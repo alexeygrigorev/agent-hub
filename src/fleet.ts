@@ -394,6 +394,7 @@ export class FleetService {
     }
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_offered ON fleet_launches(id) WHERE state = 'offered'");
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_state ON fleet_launches(state)');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_machine_state ON fleet_launches(machine_id,state)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_expiry ON fleet_launches(state,created_at)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_account_state ON fleet_launches(account,state)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_account_phase ON fleet_sessions(account,phase)');
@@ -671,7 +672,9 @@ export class FleetService {
     return this.withMaintenance(() => this.planWithinMaintenance(input));
   }
 
-  private planWithinMaintenance(input: any) {
+  private planWithinMaintenance(input: any):
+    { error: string; request?: undefined; selected?: undefined; candidates?: undefined; rejected?: undefined } |
+    { error?: undefined; request: any; selected: any; candidates: any[]; rejected: { machine: string; engine: string; reason: string; memory?: any }[] } {
     if (!object(input, ['mode', 'machine', 'engine', 'engine_override_reason', 'tier', 'account', 'workspace', 'cwd', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access', 'approved_action', 'with_goal', 'task_kind', 'project']) ||
       (input.project !== undefined && (typeof input.project !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.project))) ||
       (input.task_kind !== undefined && !['implement','review','ask','goal'].includes(input.task_kind)) ||
@@ -713,6 +716,10 @@ export class FleetService {
     if (input.approved_action !== undefined) request.approved_action = input.approved_action;
     if (input.tier !== undefined) request.tier = input.tier;
     const rejected: { machine: string; engine: string; reason: string; memory?: any }[] = []; const candidates: any[] = [];
+    this.reconcileCapacity();
+    // Planning below is read-only after reconciliation. Drop the snapshot
+    // before reserve/promotion writes so the next plan sees every commitment.
+    return this.resources.withReadSnapshot(() => {
     const accounts = new Map(this.sql.exec('SELECT * FROM fleet_accounts').toArray().map(a => [a.label, this.accountStatus(a)]));
     const definitions = new Map(this.sql.exec('SELECT * FROM fleet_accounts').toArray().map(a => [a.label, a]));
     // Engines advertised by at least one live (non-drained, fresh-checkin)
@@ -771,6 +778,10 @@ export class FleetService {
         r.engine === route.engine && r.account === route.account && (r.profile ?? null) === route.profile
         && r.mode === request.mode && /^codex_quota_gate_[a-z0-9_]{1,64}$/.test(r.reason)
         && fresh(r.observed_at, this.now(), 300000));
+      let memoryProjection: ReturnType<ResourceManagement['headroom']> | undefined;
+      let cpuProjection: ReturnType<ResourceManagement['cpuHeadroom']> | undefined;
+      const memory = () => memoryProjection ??= this.resources.headroom(route.machine_id, request, route.engine);
+      const cpu = () => cpuProjection ??= this.resources.cpuHeadroom(route.machine_id, request);
       let reason = '';
       if (!machine || machine.drained || !fresh(effectiveCheckin(machine.id, machine.last_checkin_at), this.now(), 180000)) reason = 'machine_unavailable';
       else if (gateRefusal) reason = gateRefusal.reason;
@@ -789,19 +800,19 @@ export class FleetService {
       // signals below still hold. The host re-runs its real admission gate
       // before every claim, and the claim requires a <30 s observation.
       else if (Number.isFinite(hb.mem_avail_mb) && !memoryVerdict(hb.mem_avail_mb,
-        this.resources.headroom(route.machine_id, request, route.engine).reserved_mb,
-        this.resources.headroom(route.machine_id, request, route.engine).requested_mb, this.resources.config())) reason = 'launcher_memory_reserve';
+        memory().reserved_mb,
+        memory().requested_mb, this.resources.config())) reason = 'launcher_memory_reserve';
       // Missing mem/disk telemetry is not a choking signal: fail OPEN (intake
       // 4398ce2a, Alexey t1523u). Only a present, real reading below a floor holds.
       // Root-disk floor is configurable (resource_settings.disk_floor_gb, default
       // 15 GiB). Docker and /tmp live on /data, so / only needs modest headroom.
       else if (Number.isFinite(hb.disk_free_gb) && hb.disk_free_gb < this.resources.config().disk_floor_gb) reason = 'disk_floor';
       else if (request.mode === 'headless' && this.diskHeadroom(route.machine_id, effectiveWorkspace, undefined, request.cwd)?.admitted === false) reason = 'launcher_disk_reserve';
-      else if (!this.resources.cpuHeadroom(route.machine_id,request).admitted) reason = this.resources.cpuHeadroom(route.machine_id,request).reason!;
+      else if (!cpu().admitted) reason = cpu().reason!;
       else if (!account || account.status !== 'ok') reason = 'account_' + (account?.status || 'unmapped');
       else if (!this.observation(definitions.get(route.account), route)) reason = 'machine_account_quota_unknown';
       else if (account.available_slots < 1) reason = 'account_concurrency';
-      if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'account_concurrency' ? { account: route.account, concurrency: { active: account!.active, limit: account!.max_concurrency, available: account!.available_slots }, quota_status: account!.status } : {}), ...(reason === 'launcher_memory_reserve' ? { memory: this.resources.headroom(route.machine_id, request, route.engine) } : {}), ...(reason === 'launcher_disk_reserve' ? { disk: this.diskHeadroom(route.machine_id, effectiveWorkspace, undefined, request.cwd) } : {}), ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}), ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:this.resources.cpuHeadroom(route.machine_id,request)} : {}) }); continue; }
+      if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'account_concurrency' ? { account: route.account, concurrency: { active: account!.active, limit: account!.max_concurrency, available: account!.available_slots }, quota_status: account!.status } : {}), ...(reason === 'launcher_memory_reserve' ? { memory: memory() } : {}), ...(reason === 'launcher_disk_reserve' ? { disk: this.diskHeadroom(route.machine_id, effectiveWorkspace, undefined, request.cwd) } : {}), ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}), ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:cpu()} : {}) }); continue; }
       const family = canonicalQuotaProvider(definitions.get(route.account)?.provider as string);
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
@@ -841,6 +852,7 @@ export class FleetService {
       request.workspace = candidates[0].workspace;
     }
     return { request, selected: candidates[0] || null, candidates, rejected };
+    });
   }
 
   private diskHeadroom(machine: string, workspace?: string, excludeId?: string, cwd?: string) {
@@ -1266,12 +1278,13 @@ export class FleetService {
         this.routing.dispatchNow();
         this.reconcileCapacity();
         try { this.drainCapacityQueue(); } catch { /* best-effort */ };
-        const offers: any[] = [];
+        const valid: any[] = [];
         for (const row of this.sql.exec("SELECT * FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at, id LIMIT 100", caller.machineId!)) {
           if (this.admission.retireInvalidOffer(row)) continue;
-          offers.push({ ...this.resources.cpuStart(String(row.id)), resource_choking:this.resources.cpuHeadroom(caller.machineId!,parsed(row.request_json),String(row.id)).resource_choking, resource_management: this.resources.config(), memory_estimate_mb: this.resources.estimate(parsed(row.request_json).project || String(row.workspace), String(row.engine), parsed(row.request_json).task_kind || 'goal'), selection: parsed(row.model_selection_json) ?? {}, id: row.id, engine: row.engine, account: row.account, profile: row.profile, mode: row.mode, workspace: row.workspace, cwd: parsed(row.request_json).cwd ?? null, prompt: row.prompt, ...(parsed(row.request_json).with_goal === true ? { with_goal: true } : {}), access: parsed(row.request_json).access?.mode || 'legacy_unspecified' });
-          if (offers.length === 20) break;
+          valid.push(row);
+          if (valid.length === 20) break;
         }
+        const offers = this.resources.withReadSnapshot(() => valid.map(row => ({ ...this.resources.cpuStart(String(row.id)), resource_choking:this.resources.cpuHeadroom(caller.machineId!,parsed(row.request_json),String(row.id)).resource_choking, resource_management: this.resources.config(), memory_estimate_mb: this.resources.estimate(parsed(row.request_json).project || String(row.workspace), String(row.engine), parsed(row.request_json).task_kind || 'goal'), selection: parsed(row.model_selection_json) ?? {}, id: row.id, engine: row.engine, account: row.account, profile: row.profile, mode: row.mode, workspace: row.workspace, cwd: parsed(row.request_json).cwd ?? null, prompt: row.prompt, ...(parsed(row.request_json).with_goal === true ? { with_goal: true } : {}), access: parsed(row.request_json).access?.mode || 'legacy_unspecified' })));
         return response({ offers: this.routing.enrichOffers(offers), reconciliation: this.reconciliationCandidates(caller.machineId!) });
       }));
     }

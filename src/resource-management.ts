@@ -29,6 +29,10 @@ CREATE TABLE IF NOT EXISTS session_resource_usage (
  peak_rss_mb REAL, peak_pss_mb REAL, cpu_seconds REAL, runtime_s REAL, avg_cpu_cores REAL,
  observed_at TEXT NOT NULL, UNIQUE(machine_id,native_id));
 CREATE INDEX IF NOT EXISTS session_resource_estimate ON session_resource_usage(engine,project,kind,finished_at);
+CREATE INDEX IF NOT EXISTS resource_memory_recent ON session_resource_usage(engine,observed_at DESC) WHERE finished_at IS NOT NULL AND peak_rss_mb > 0;
+CREATE INDEX IF NOT EXISTS resource_cpu_recent ON session_resource_usage(observed_at DESC) WHERE finished_at IS NOT NULL;
+CREATE TABLE IF NOT EXISTS resource_history_revision(id INTEGER PRIMARY KEY CHECK(id=1), revision TEXT NOT NULL);
+INSERT OR IGNORE INTO resource_history_revision VALUES(1,'initial');
 CREATE TABLE IF NOT EXISTS resource_evidence (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, native_id TEXT NOT NULL, reason TEXT NOT NULL, saved_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_reaps (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, machine_id TEXT NOT NULL, native_id TEXT NOT NULL, intake_id TEXT, actor TEXT NOT NULL, reason TEXT NOT NULL, freed_mb REAL, at TEXT NOT NULL, evidence_id TEXT NOT NULL);
 `;
@@ -57,24 +61,91 @@ export function memoryVerdict(available: number, ramp: number, estimate: number,
   return finite(available) && finite(ramp) && finite(estimate) && available - ramp - estimate >= config.memory_floor_mb;
 }
 export class ResourceManagement {
+  private historyRevision: string | null = null;
+  private memoryHistory = new Map<string | null, any[]>();
+  private cpuHistory: any[] | null = null;
+  private memoryEstimates = new Map<string, number>();
+  private cpuEstimates = new Map<string, {expected_cpu_cores: number; expected_cpu_source: string}>();
+  private historyScope = 0;
+  private readSnapshot: Map<string, any[]> | null = null;
+  private snapshotNow: number | null = null;
+  private cpuPendingSnapshot: Map<string, {id:string;remaining:number}[]> | null = null;
   constructor(private sql: SqlStorage, private now: () => number = Date.now) {}
-  init() { for (const statement of RESOURCE_SCHEMA.split(';')) if (statement.trim()) this.sql.exec(statement); }
-  config(): ResourceConfig { return resourceConfig(parse(this.sql.exec('SELECT data FROM resource_settings WHERE id=1').toArray()[0]?.data)); }
+  init() {
+    for (const statement of RESOURCE_SCHEMA.split(';')) if (statement.trim()) this.sql.exec(statement);
+    for (const table of ['session_resource_usage', 'session_cpu_usage', 'resource_settings']) {
+      for (const op of ['INSERT', 'UPDATE', 'DELETE']) {
+        const sides = op === 'INSERT' ? ['NEW'] : op === 'DELETE' ? ['OLD'] : ['OLD', 'NEW'];
+        const relevant = table === 'session_resource_usage' ? sides.map(s => `${s}.finished_at IS NOT NULL`).join(' OR ')
+          : table === 'session_cpu_usage' ? sides.map(s => `EXISTS(SELECT 1 FROM session_resource_usage WHERE session_id=${s}.session_id AND finished_at IS NOT NULL)`).join(' OR ') : '1';
+        this.sql.exec(`CREATE TRIGGER IF NOT EXISTS resource_history_${table}_${op.toLowerCase()}
+          AFTER ${op} ON ${table} WHEN ${relevant} BEGIN UPDATE resource_history_revision SET revision=lower(hex(randomblob(16))) WHERE id=1; END`);
+      }
+    }
+  }
+  private refreshHistory() {
+    if (this.historyScope) return;
+    // Random generations avoid reusing a cached revision after a transaction
+    // rolls back and another writer subsequently advances the same counter.
+    const revision = String(this.readRows('SELECT revision FROM resource_history_revision WHERE id=1')[0].revision);
+    if (revision === this.historyRevision) return;
+    this.historyRevision = revision;
+    this.memoryHistory.clear(); this.cpuHistory = null;
+    this.memoryEstimates.clear(); this.cpuEstimates.clear();
+  }
+  /** Only synchronous read-only estimation; never cache pending commitments. */
+  private withHistory<T>(fn: () => T): T {
+    this.refreshHistory(); this.historyScope++;
+    try { return fn(); } finally { this.historyScope--; }
+  }
+  /** Synchronous, read-only response projection after all admission writes. */
+  withReadSnapshot<T>(fn: () => T): T {
+    if (this.readSnapshot) return fn();
+    this.readSnapshot = new Map();
+    this.cpuPendingSnapshot = new Map();
+    this.snapshotNow = this.now();
+    try { return fn(); } finally { this.readSnapshot = null; this.cpuPendingSnapshot = null; this.snapshotNow = null; }
+  }
+  private readRows(query: string, ...args: any[]): any[] {
+    const key = JSON.stringify([query,args]);
+    const cached = this.readSnapshot?.get(key);
+    if (cached) return cached;
+    const rows = this.sql.exec(query,...args).toArray();
+    this.readSnapshot?.set(key,rows);
+    return rows;
+  }
+  config(): ResourceConfig { return resourceConfig(parse(this.readRows('SELECT data FROM resource_settings WHERE id=1')[0]?.data)); }
   configure(value: any) {
     const config = resourceConfig(value);
     this.sql.exec('INSERT INTO resource_settings VALUES(1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data', JSON.stringify(config));
     return config;
   }
   estimate(project: string | null, engine: string | null, kind: string | null) {
+    this.refreshHistory();
+    const key = JSON.stringify([project, engine, kind]);
+    const cached = this.memoryEstimates.get(key);
+    if (cached !== undefined) return cached;
     const config = this.config();
     // Only actual measurements, never a cgroup cap or fabricated zero. Bounded recent history.
-    const rows = this.sql.exec('SELECT project,kind,peak_rss_mb FROM session_resource_usage WHERE engine IS ? AND finished_at IS NOT NULL AND peak_rss_mb > 0 ORDER BY observed_at DESC LIMIT 500', engine).toArray() as any[];
+    let rows = this.memoryHistory.get(engine);
+    if (!rows) {
+      rows = this.sql.exec('SELECT project,kind,peak_rss_mb FROM session_resource_usage WHERE engine IS ? AND finished_at IS NOT NULL AND peak_rss_mb > 0 ORDER BY observed_at DESC LIMIT 500', engine).toArray() as any[];
+      if (this.memoryHistory.size >= 64) this.memoryHistory.clear();
+      this.memoryHistory.set(engine, rows);
+    }
     const specific = rows.filter(r => r.project === project && r.kind === kind);
     const measured = percentile((specific.length ? specific : rows).map(r => Number(r.peak_rss_mb)), config.estimate_percentile);
-    return Math.ceil(Math.max(64, measured === null ? config.ramp_reserve_default_mb : measured * config.estimate_multiplier));
+    const result = Math.ceil(Math.max(64, measured === null ? config.ramp_reserve_default_mb : measured * config.estimate_multiplier));
+    if (this.memoryEstimates.size >= 2048) this.memoryEstimates.clear();
+    this.memoryEstimates.set(key, result);
+    return result;
   }
   cpuEstimate(project: string | null, kind: string | null) {
-    const rows = this.sql.exec(`SELECT u.project,u.kind,c.p95_cpu_cores FROM session_resource_usage u
+    this.refreshHistory();
+    const key = JSON.stringify([project, kind]);
+    const cached = this.cpuEstimates.get(key);
+    if (cached) return {...cached};
+    const rows = this.cpuHistory ??= this.sql.exec(`SELECT u.project,u.kind,c.p95_cpu_cores FROM session_resource_usage u
       JOIN session_cpu_usage c ON c.session_id=u.session_id WHERE u.finished_at IS NOT NULL
       AND c.p95_cpu_cores IS NOT NULL ORDER BY u.observed_at DESC LIMIT 500`).toArray() as any[];
     const specific = rows.filter(r=>r.project===project && r.kind===kind);
@@ -82,8 +153,11 @@ export class ResourceManagement {
     const cohort = specific.length ? specific : repo.length ? repo : rows;
     const config=this.config();
     const measured=percentile(cohort.map(r=>Number(r.p95_cpu_cores)),95);
-    return {expected_cpu_cores:measured === null ? config.cpu_default_cores : measured*config.cpu_estimate_multiplier,
+    const result = {expected_cpu_cores:measured === null ? config.cpu_default_cores : measured*config.cpu_estimate_multiplier,
       expected_cpu_source:specific.length?'repo_kind':repo.length?'repo':rows.length?'global':'default'};
+    if (this.cpuEstimates.size >= 2048) this.cpuEstimates.clear();
+    this.cpuEstimates.set(key, result);
+    return {...result};
   }
   freezeCpuStart(launch: string, estimate: {expected_cpu_cores:number,expected_cpu_source:string}) {
     this.sql.exec('INSERT OR IGNORE INTO resource_cpu_starts VALUES(?,?,?)',launch,estimate.expected_cpu_cores,estimate.expected_cpu_source);
@@ -92,34 +166,45 @@ export class ResourceManagement {
     return this.sql.exec('SELECT expected_cpu_cores,expected_cpu_source FROM resource_cpu_starts WHERE launch_id=?',launch).toArray()[0] ?? null;
   }
   cpuHeadroom(machine: string, input: any = {}, excludeLaunch?: string) {
-    const m:any=this.sql.exec('SELECT last_heartbeat,capabilities FROM machines WHERE id=?',machine).toArray()[0];
-    const hb=parse(m?.last_heartbeat),config=this.config(),cutoff=new Date(this.now()-config.ramp_seconds*1000).toISOString();
+    return this.withHistory(() => this.cpuHeadroomFromHistory(machine, input, excludeLaunch));
+  }
+  private cpuHeadroomFromHistory(machine: string, input: any, excludeLaunch?: string) {
+    const now = this.snapshotNow ?? this.now();
+    const m:any=this.readRows('SELECT last_heartbeat,capabilities FROM machines WHERE id=?',machine)[0];
+    const hb=parse(m?.last_heartbeat),config=this.config(),cutoff=new Date(now-config.ramp_seconds*1000).toISOString();
     const estimate:any=(excludeLaunch ? this.cpuStart(excludeLaunch) : null) ?? this.cpuEstimate(input.project || input.workspace || null,input.task_kind || input.kind || 'goal');
-    const pending=this.sql.exec(`SELECT l.id,l.request_json,l.workspace FROM fleet_launches l WHERE machine_id=?
+    const pending=this.readRows(`SELECT l.id,l.request_json,l.workspace,s.expected_cpu_cores,
+      c.current_cpu_cores,c.observed_at AS cpu_observed_at FROM fleet_launches l
+      LEFT JOIN resource_cpu_starts s ON s.launch_id=l.id LEFT JOIN resource_cpu_samples c ON c.launch_id=l.id WHERE machine_id=?
       AND (state IN ('offered','starting','uncertain') OR (state='running' AND
-      COALESCE((SELECT started_at FROM resource_ramps WHERE launch_id=l.id),created_at)>=?))`,machine,cutoff).toArray() as any[];
-    let remaining=0;
-    for(const row of pending) {
-      if(row.id===excludeLaunch) continue;
-      const req=parse(row.request_json);
-      const committed:any=this.cpuStart(row.id) ?? this.cpuEstimate(req.project || row.workspace,req.task_kind || 'goal');
-      const current:any=this.sql.exec('SELECT current_cpu_cores,observed_at FROM resource_cpu_samples WHERE launch_id=?',row.id).toArray()[0];
+      COALESCE((SELECT started_at FROM resource_ramps WHERE launch_id=l.id),created_at)>=?))`,machine,cutoff) as any[];
+    const pendingKey=JSON.stringify([machine,cutoff,now]);
+    let commitments=this.cpuPendingSnapshot?.get(pendingKey);
+    if (!commitments) {
+      commitments=pending.map(row=>{
+        const req=parse(row.request_json);
+        const committed = row.expected_cpu_cores ?? this.cpuEstimate(req.project || row.workspace,req.task_kind || 'goal').expected_cpu_cores;
       // Dispatcher reports per-session counters after the host heartbeat, on
       // separate 30–60s polls. Fresh exact-binding measurements are advisory
       // ramp credit; they need not land inside the 200ms host /proc/stat sample.
-      const at=Date.parse(current?.observed_at);
-      const credit=Number.isFinite(at)&&at>=this.now()-180000&&at<=this.now()+30000&&finite(current?.current_cpu_cores) ? current.current_cpu_cores : 0;
-      remaining+=Math.max(0,committed.expected_cpu_cores-credit);
+        const at=Date.parse(row.cpu_observed_at);
+        const credit=Number.isFinite(at)&&at>=now-180000&&at<=now+30000&&finite(row.current_cpu_cores) ? row.current_cpu_cores : 0;
+        return {id:row.id,remaining:Math.max(0,committed-credit)};
+      });
+      this.cpuPendingSnapshot?.set(pendingKey,commitments);
     }
-    const verdict=cpuVerdict(hb.cpu_usage,parse(m?.capabilities).cpu_count,estimate.expected_cpu_cores,remaining,config,this.now());
-    const cooldown=new Date(this.now()-config.choking_cooldown_seconds*1000).toISOString();
-    const event:any=this.sql.exec(`SELECT reason,observed_at FROM resource_choking_events WHERE machine_id=? AND observed_at>=? AND reason!='host_runtime_choking' ORDER BY observed_at DESC LIMIT 1`,machine,cooldown).toArray()[0];
-    const runtime:any=this.sql.exec(`SELECT exit_reason,updated_at FROM fleet_launches WHERE machine_id=? AND updated_at>=?
+    // Keep the original summation order, excluding only this exact launch.
+    let remaining=0;
+    for(const row of commitments) if(row.id!==excludeLaunch) remaining+=row.remaining;
+    const verdict=cpuVerdict(hb.cpu_usage,parse(m?.capabilities).cpu_count,estimate.expected_cpu_cores,remaining,config,now);
+    const cooldown=new Date(now-config.choking_cooldown_seconds*1000).toISOString();
+    const event:any=this.readRows(`SELECT reason,observed_at FROM resource_choking_events WHERE machine_id=? AND observed_at>=? AND reason!='host_runtime_choking' ORDER BY observed_at DESC LIMIT 1`,machine,cooldown)[0];
+    const runtime:any=this.readRows(`SELECT exit_reason,updated_at FROM fleet_launches WHERE machine_id=? AND updated_at>=?
       AND state IN ('failed','exited') AND exit_reason IN ('engine_runtime_timeout','engine_signal_exit')
-      ORDER BY updated_at DESC LIMIT 1`,machine,cooldown).toArray()[0];
+      ORDER BY updated_at DESC LIMIT 1`,machine,cooldown)[0];
     let serviceChoking=false; let serviceAt:string|null=null;
-    if(this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='host_health_observations'").toArray().length) {
-      const health:any=this.sql.exec('SELECT payload_json,observed_at FROM host_health_observations WHERE machine_id=? AND observed_at>=?',machine,cooldown).toArray()[0];
+    if(this.readRows("SELECT name FROM sqlite_master WHERE type='table' AND name='host_health_observations'").length) {
+      const health:any=this.readRows('SELECT payload_json,observed_at FROM host_health_observations WHERE machine_id=? AND observed_at>=?',machine,cooldown)[0];
       serviceAt=health?.observed_at ?? null;
       // A missing native worker can be an ordinary stop, not a crash. Only
       // explicit runtime probes establish a service timeout/crash. Legacy
@@ -134,17 +219,23 @@ export class ResourceManagement {
       expected_cpu_source:estimate.expected_cpu_source};
   }
   headroom(machine: string, input: any = {}, engine: string | null = null) {
-    const machineRow: any = this.sql.exec('SELECT last_heartbeat FROM machines WHERE id=?', machine).toArray()[0];
+    return this.withHistory(() => this.headroomFromHistory(machine, input, engine));
+  }
+  private headroomFromHistory(machine: string, input: any, engine: string | null) {
+    const now = this.snapshotNow ?? this.now();
+    const machineRow: any = this.readRows('SELECT last_heartbeat FROM machines WHERE id=?', machine)[0];
     const hb = parse(machineRow?.last_heartbeat); const config = this.config();
-    const cutoff = new Date(this.now() - config.ramp_seconds * 1000).toISOString();
+    const cutoff = new Date(now - config.ramp_seconds * 1000).toISOString();
     // Only launch ramps are additional commitments. Resident usage is already in MemAvailable.
-    const pending = this.sql.exec("SELECT id,engine,workspace,request_json FROM fleet_launches WHERE machine_id=? AND (state IN ('offered','starting','uncertain') OR (state='running' AND COALESCE((SELECT started_at FROM resource_ramps WHERE launch_id=fleet_launches.id),created_at) >= ?))", machine, cutoff).toArray() as any[];
+    const pending = this.readRows(`SELECT l.id,l.engine,l.workspace,l.request_json,r.resident_mb FROM fleet_launches l
+      LEFT JOIN resource_resident_samples r ON r.launch_id=l.id AND r.observed_at>=?
+      WHERE l.machine_id=? AND (l.state IN ('offered','starting','uncertain') OR (l.state='running'
+      AND COALESCE((SELECT started_at FROM resource_ramps WHERE launch_id=l.id),l.created_at)>=?))`, cutoff, machine, cutoff) as any[];
     let reserved = 0;
     for (const row of pending) {
       const req = parse(row.request_json);
       const estimate = this.estimate(req.project || row.workspace, row.engine, req.task_kind || req.kind || 'goal');
-      const measured: any = this.sql.exec('SELECT resident_mb FROM resource_resident_samples WHERE launch_id=? AND observed_at>=?', row.id, cutoff).toArray()[0];
-      reserved += Math.max(0, estimate - (finite(measured?.resident_mb) ? measured.resident_mb : 0));
+      reserved += Math.max(0, estimate - (finite(row.resident_mb) ? row.resident_mb : 0));
     }
     return { mem_available_mb: finite(hb.mem_avail_mb) ? hb.mem_avail_mb : null,
       reserved_mb: reserved, floor_mb: config.memory_floor_mb,

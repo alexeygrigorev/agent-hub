@@ -324,6 +324,27 @@ export class MonitoringService {
       const trimmed = stmt.trim();
       if (trimmed) this.sql.exec(trimmed);
     }
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS disk_trend_samples(
+      id TEXT NOT NULL,ordinal INTEGER NOT NULL,observation_rowid INTEGER NOT NULL,
+      machine_id TEXT NOT NULL,observed_at_ms INTEGER NOT NULL,mount_point TEXT NOT NULL,
+      used_bytes,total_bytes,percent,PRIMARY KEY(id,ordinal))`);
+    this.sql.exec('CREATE INDEX IF NOT EXISTS disk_trend_machine_time ON disk_trend_samples(machine_id,observed_at_ms,observation_rowid,ordinal)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS disk_trend_projection_meta(id INTEGER PRIMARY KEY)');
+    const project = (prefix: string, from: string) => `SELECT ${prefix}id,e.key,${prefix}rowid,${prefix}machine_id,${prefix}observed_at_ms,
+      json_extract(e.value,'$.mount_point'),
+      CASE WHEN json_type(e.value,'$.used_bytes') IN ('integer','real') THEN json_extract(e.value,'$.used_bytes') END,
+      CASE WHEN json_type(e.value,'$.total_bytes') IN ('integer','real') THEN json_extract(e.value,'$.total_bytes') END,
+      json_extract(e.value,'$.percent') FROM ${from}json_each(CASE WHEN json_valid(${prefix}payload_json) THEN
+        CASE WHEN json_type(${prefix}payload_json,'$.filesystems')='array' THEN json_extract(${prefix}payload_json,'$.filesystems') ELSE '[]' END ELSE '[]' END) e
+      WHERE e.type='object' AND json_type(e.value,'$.mount_point')='text'`;
+    for (const op of ['INSERT', 'UPDATE']) this.sql.exec(`CREATE TRIGGER IF NOT EXISTS disk_trend_${op.toLowerCase()}
+      AFTER ${op} ON disk_observations BEGIN ${op === 'UPDATE' ? 'DELETE FROM disk_trend_samples WHERE id=OLD.id;' : ''}
+      INSERT INTO disk_trend_samples ${project('NEW.', '')}; END`);
+    this.sql.exec('CREATE TRIGGER IF NOT EXISTS disk_trend_delete AFTER DELETE ON disk_observations BEGIN DELETE FROM disk_trend_samples WHERE id=OLD.id; END');
+    if (!this.sql.exec('SELECT id FROM disk_trend_projection_meta WHERE id=1').toArray().length) {
+      this.sql.exec(`INSERT OR REPLACE INTO disk_trend_samples ${project('d.', 'disk_observations d, ')}`);
+      this.sql.exec('INSERT INTO disk_trend_projection_meta VALUES(1)');
+    }
   }
 
   setLiveness(liveness: LivenessService | undefined): void {
@@ -997,33 +1018,30 @@ export class MonitoringService {
   }
 
   /** Compute growth trend per day for a filesystem on a machine. */
-  private computeTrend(machineId: string, mountPoint: string, now: number): DiskTrend {
+  /** Read numeric trend inputs once per host, never full consumer histories. */
+  private trendSamples(machineId: string, now: number): Map<string, {timeMs:number;usedBytes:number;totalBytes:number;percent:number}[]> | null {
     try {
-      const windowStart = now - DISK_LIMITS.maxTrendWindowMs;
-      const rows = this.sql
-        .exec(
-          'SELECT observed_at_ms, payload_json FROM disk_observations WHERE machine_id = ? AND observed_at_ms >= ? ORDER BY observed_at_ms ASC',
-          machineId,
-          windowStart,
-        )
-        .toArray() as any[];
-
-      const samples: { timeMs: number; usedBytes: number; totalBytes: number; percent: number }[] = [];
-
-      for (const r of rows) {
-        try {
-          const payload = JSON.parse(r.payload_json);
-          const fs = (payload.filesystems || []).find((f: any) => f.mount_point === mountPoint);
-          if (fs && Number.isSafeInteger(fs.used_bytes) && Number.isSafeInteger(fs.total_bytes)) {
-            samples.push({
-              timeMs: r.observed_at_ms,
-              usedBytes: fs.used_bytes,
-              totalBytes: fs.total_bytes,
-              percent: fs.percent,
-            });
-          }
-        } catch {}
+      const rows = this.sql.exec(`SELECT id,observed_at_ms,mount_point,used_bytes,total_bytes,percent
+        FROM disk_trend_samples WHERE machine_id=? AND observed_at_ms>=?
+        ORDER BY observed_at_ms,observation_rowid,ordinal`, machineId, now-DISK_LIMITS.maxTrendWindowMs).toArray() as any[];
+      const result = new Map<string, {timeMs:number;usedBytes:number;totalBytes:number;percent:number}[]>();
+      const seen = new Set<string>();
+      for (const row of rows) {
+        const key = JSON.stringify([row.id,row.mount_point]);
+        if (seen.has(key)) continue;
+        seen.add(key); // Preserve first-mount semantics even if its numbers are invalid.
+        if (!Number.isSafeInteger(row.used_bytes) || !Number.isSafeInteger(row.total_bytes)) continue;
+        const samples = result.get(row.mount_point) ?? [];
+        samples.push({timeMs:row.observed_at_ms,usedBytes:row.used_bytes,totalBytes:row.total_bytes,percent:row.percent});
+        result.set(row.mount_point,samples);
       }
+      return result;
+    } catch { return null; }
+  }
+
+  private computeTrend(samples: {timeMs:number;usedBytes:number;totalBytes:number;percent:number}[] | null, now: number): DiskTrend {
+    try {
+      if (samples === null) throw new Error('trend_query_failed');
 
       // Clip one-off drops (e.g. cleanup drops):
       // Locate the latest drop where used_bytes decreased.
@@ -1121,8 +1139,9 @@ export class MonitoringService {
         continue;
       }
 
+      const samples = (payload.filesystems || []).some(fs => fs.is_primary) ? this.trendSamples(mid, now) : new Map();
       const filesystemsWithTrend: DiskFilesystemWithTrend[] = (payload.filesystems || []).map(fs => {
-        const trend = fs.is_primary ? this.computeTrend(mid, fs.mount_point, now) : {
+        const trend = fs.is_primary ? this.computeTrend(samples === null ? null : samples.get(fs.mount_point) ?? [], now) : {
           state: 'insufficient_history' as const,
           growth_bytes_per_day: null,
           growth_pct_per_day: null,
@@ -1904,18 +1923,20 @@ export class MonitoringService {
         };
       }
 
+      const reservation = this.readHostReservation(String(r.machine_id), now);
+      const placement = this.placementFor(String(r.machine_id), pressure, reservation);
       machines.push({
         machine_id: r.machine_id,
         observed_at: r.observed_at,
         freshness,
         load: payload.load ?? { load1: 0, load5: 0, load15: 0 },
-        memory: this.degradedMemory(payload.memory, r.machine_id, pressure),
+        memory: this.degradedMemory(payload.memory, placement, reservation),
         processes: payload.processes,
         services: projectedServices,
         budget: projectedBudget,
         storage: payload.storage,
-        reservation: this.readHostReservation(String(r.machine_id), now),
-        placement: this.placementFor(String(r.machine_id), pressure),
+        reservation,
+        placement,
       });
     }
 
@@ -1966,9 +1987,7 @@ export class MonitoringService {
     return this.resourceProjection?.(machineId) ?? { mem_avail_mb: null, reserved_mb: null, floor_mb: MEMORY_FLOOR_MB, next_slot_mb: NEXT_SLOT_MB, headroom_mb: null, headroom_ok: null, stale_telemetry: true, observed_at: null };
   }
 
-  private placementFor(machineId: string, pressure: { queuedTotal: number; queuedHeld: number; recentRejects: number; failedByMachine: Map<string, number>; failedTotal: number }): HostPlacement {
-    let reservation: HostReservation | null = null;
-    try { reservation = this.readHostReservation(String(machineId), this.now()); } catch { reservation = null; }
+  private placementFor(machineId: string, pressure: { queuedTotal: number; queuedHeld: number; recentRejects: number; failedByMachine: Map<string, number>; failedTotal: number }, reservation: HostReservation | null): HostPlacement {
     const overdrawn = Boolean(reservation && reservation.headroom_mb !== null && reservation.headroom_mb < 0 && !reservation.stale_telemetry);
     const hostReasons = new Set(['disk_floor', 'launcher_memory_reserve', 'machine_capacity', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
     const reasons = new Set<string>();
@@ -2008,14 +2027,11 @@ export class MonitoringService {
   /** Host health is never 'ok' while launches are rejected/held for memory
    * or capacity: degrade to warn (critical when reservations already exceed
    * headroom). Unknown/other states pass through untouched. */
-  private degradedMemory(memory: any, machineId: string, pressure: { queuedTotal: number; queuedHeld: number; recentRejects: number; failedByMachine: Map<string, number>; failedTotal: number }): HostMemory {
+  private degradedMemory(memory: any, placement: HostPlacement, reservation: HostReservation | null): HostMemory {
     const fallback: HostMemory = { total_bytes: 0, available_bytes: 0, used_bytes: 0, percent: 0, status: 'unknown' };
     const mem: HostMemory = memory && typeof memory === 'object' ? { ...fallback, ...memory } : fallback;
     if (mem.status !== 'ok') return mem;
-    const placement = this.placementFor(String(machineId), pressure);
     if (!placement.machine_pressure && !placement.global_pressure) return mem;
-    let reservation: HostReservation | null = null;
-    try { reservation = this.readHostReservation(String(machineId), this.now()); } catch { reservation = null; }
     const overdrawn = reservation && reservation.headroom_mb !== null && reservation.headroom_mb < 0 && !reservation.stale_telemetry;
     return { ...mem, status: overdrawn ? 'critical' : 'warn', error: placement.reason };
   }

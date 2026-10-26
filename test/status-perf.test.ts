@@ -40,6 +40,22 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
             `perf-host/native-${i}`, `decision-${i}-${j}`, 'resume_on_reset', 'perf:owner', 'Synthetic', at);
         }
       }
+      // Retention permits 200 disk observations per host / 1000 total.
+      // Trend reads must not repeatedly materialize top-consumer histories.
+      for (let host = 0; host < 5; host++) {
+        const machine = host === 0 ? 'perf-host' : `history-host-${host}`;
+        if (host) h.sql.exec('INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,drained) VALUES(?,?,?,?,?,0)', machine, machine, machine, now, now);
+        h.sql.exec('INSERT INTO host_health_observations VALUES(?,?,?,?,?,?)', machine, now, Date.now(), now,
+          JSON.stringify({memory:{total_bytes:64000000000,available_bytes:32000000000,used_bytes:32000000000,percent:50,status:'ok'},services:[]}), machine);
+        for (let i = 0; i < 200; i++) {
+          const at = Date.now() - (199-i)*1800000;
+          const used = 40000000000 + (i < 100 ? i : i-100)*1000000;
+          const filesystems = ['/', '/data', '/backup'].map(mount => ({mount_point:mount,device_id:mount,is_primary:true,total_bytes:100000000000,
+            used_bytes:used,free_bytes:100000000000-used,percent:used/1000000000,status:'ok',
+            top_consumers:Array.from({length:20},(_,j)=>({path:`/synthetic/${j}/`+'x'.repeat(230),bytes:1000000}))}));
+          h.sql.exec('INSERT INTO disk_observations VALUES(?,?,?,?,?,?,?)', `${machine}-${i}`,machine,new Date(at).toISOString(),at,now,JSON.stringify({filesystems}),machine);
+        }
+      }
     });
   });
   // Time the real DO fetch/auth/handler and serialization over local RPC.
@@ -63,6 +79,7 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
       times.push(performance.now() - start);
       expect(response.status, JSON.stringify(body).slice(0, 200)).toBe(status);
       if (path === '/api/status') {
+        expect(response.headers.get('X-Hub-Status-Projection')).toBe('resource-disk-v1');
         expect(body.tasks).toHaveLength(method === 'GET' ? 25 : 256);
         expect(body.tasks[0].hub_sessions[0].lifecycle.session_key).toBe('perf-host/native-0');
         expect(body.agents.running).toBe(100);
@@ -130,6 +147,28 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
   }
   // A busy retained queue must not make every host poll re-plan its backlog.
   await inDO(stub, (h: any) => h.ctx.storage.transactionSync(() => {
+    // Real placement reads measured history for every pending commitment.
+    // Empty history and unroutable workloads hide multiplicative SQL reads.
+    const at = new Date().toISOString();
+    for (let i = 0; i < 2000; i++) {
+      h.sql.exec(`INSERT INTO session_resource_usage(session_id,machine_id,native_id,project,engine,kind,started_at,finished_at,state,peak_rss_mb,observed_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)`, `usage-${i}`, 'claim-host', `usage-${i}`, `project-${i % 20}`, 'codex', 'goal', at, at, 'stopped', 64 + i % 64, at);
+      h.sql.exec('INSERT INTO session_cpu_usage VALUES(?,?,?)', `usage-${i}`, 0.01, at);
+    }
+    for (let i = 0; i < 100; i++) {
+      h.sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
+        SELECT ?,actor,requester_kind,summary,?,request_json,machine_id,engine,account,mode,workspace,prompt,'uncertain',created_at,updated_at
+        FROM fleet_launches WHERE account='claim-account' AND state='stopped' LIMIT 1`, sessionId(40000+i), `perf-pending-${i}`);
+    }
+    for (let i = 0; i < 20; i++) {
+      h.sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
+        SELECT ?,actor,requester_kind,summary,?,request_json,machine_id,engine,account,mode,workspace,prompt,'offered',created_at,updated_at
+        FROM fleet_launches WHERE account='claim-account' AND state='stopped' LIMIT 1`, sessionId(41000+i), `perf-offered-${i}`);
+    }
+    for (let i = 0; i < 4; i++) {
+      h.sql.exec("INSERT INTO fleet_accounts VALUES (?,'codex',1,15,1)", `history-account-${i}`);
+      h.sql.exec("INSERT INTO fleet_routes VALUES ('claim-host','codex',?,NULL)", `history-account-${i}`);
+    }
     h.sql.exec("UPDATE machines SET last_heartbeat=json_set(last_heartbeat,'$.mem_avail_mb',0) WHERE id='claim-host'");
     for (let i = 0; i < 200; i++) {
       h.sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
@@ -145,9 +184,10 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
   for (let i = 0; i < 20; i++) {
     const start = performance.now();
     const response = await stub.fetch('https://hub.test/api/fleet/offers', {headers: {Authorization: 'Bearer ' + claimToken}});
-    await response.json();
+    const body: any = await response.json();
     backlogTimes.push(performance.now() - start);
     expect(response.status).toBe(200);
+    expect(body.offers).toHaveLength(20);
   }
   backlogTimes.sort((a, b) => a - b);
   console.log(`offers with blocked backlog p50=${backlogTimes[9]}ms p95=${backlogTimes[18]}ms`);

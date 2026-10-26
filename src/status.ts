@@ -483,7 +483,7 @@ export class StatusService {
   }
 
   async handle(request: Request, authenticate: () => Promise<Auth>): Promise<Response> {
-    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
+    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff', 'X-Hub-Status-Projection': 'resource-disk-v1' } });
     try {
       if (request.method !== 'GET') return json({ error: 'method_not_allowed' }, 405);
       const auth = await authenticate();
@@ -545,7 +545,7 @@ export class StatusService {
    * Cookie callers pass the existing session CSRF (enforced by Hub auth
    * before this handler, as for every POST). */
   async handlePost(request: Request, authenticate: () => Promise<Auth>): Promise<Response> {
-    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
+    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff', 'X-Hub-Status-Projection': 'resource-disk-v1' } });
     try {
       if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
       const auth = await authenticate();

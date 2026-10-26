@@ -6,8 +6,12 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 export function reconcileAccountCapacity(sql: SqlStorage, now: number, apply = true) {
   const controls = sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length > 0;
   const changes: { id: string; before: string; after: string; reason: string }[] = [];
-  for (const launch of sql.exec("SELECT * FROM fleet_launches WHERE state IN ('starting','running','uncertain')").toArray() as any[]) {
-    if (sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', launch.id).toArray().length) continue;
+  // Only positive terminal native evidence can release a reservation. Filter
+  // candidates in SQLite instead of probing every live launch from JS.
+  for (const launch of sql.exec(`SELECT l.* FROM fleet_launches l JOIN fleet_sessions n
+    ON n.machine_id=l.machine_id AND n.native_id=l.native_id AND n.phase IN ('exited','dead')
+    WHERE l.state IN ('starting','running','uncertain')
+      AND NOT EXISTS(SELECT 1 FROM routing_jobs j WHERE j.launch_id=l.id)`).toArray() as any[]) {
     const native: any = launch.native_id ? sql.exec('SELECT * FROM fleet_sessions WHERE machine_id = ? AND native_id = ?', launch.machine_id, launch.native_id).toArray()[0] : null;
     // A fresh, live native observation takes precedence over stale control state.
     if (native && ['starting', 'running', 'broken', 'unknown'].includes(native.phase)) continue;
