@@ -100,20 +100,20 @@ export function softReserveTokens(
     cycle_ms: pool.cycle_ms,
     window_type: pool.window_type,
   });
-  const windowMs = opts.windowMs ?? inferredWindowMs ?? FLOOR_DEFAULTS.windowMs;
+  const windowMs = opts.windowMs ?? inferredWindowMs;
   const softPct = typeof pool.soft_reserve_percent === 'number' && Number.isFinite(pool.soft_reserve_percent) && pool.soft_reserve_percent > 0
     ? pool.soft_reserve_percent
     : 20;
   if (isPercentPool(pool)) {
     const hard = hardFloorTokens(pool, 0);
     const init = Math.min(100, Math.max(softPct, hard));
-    const fraction = Math.max(0, Math.min(1, (pool.reset_at_ms - nowMs) / Math.max(1, windowMs)));
+    const fraction = windowMs == null ? 1 : Math.max(0, Math.min(1, (pool.reset_at_ms - nowMs) / Math.max(1, windowMs)));
     return hard + (init - hard) * Math.pow(fraction, Math.max(1, pool.convexity_exponent || 1.5));
   }
   const o = { ...FLOOR_DEFAULTS, ...opts, windowMs };
   const hard = hardFloorTokens(pool, o.hardAbsTokens);
   const init = Math.min(pool.total_capacity_tokens, Math.max(pool.total_capacity_tokens * softPct / 100, o.softAbsTokens, hard));
-  const fraction = Math.max(0, Math.min(1, (pool.reset_at_ms - nowMs) / Math.max(1, o.windowMs)));
+  const fraction = windowMs == null ? 1 : Math.max(0, Math.min(1, (pool.reset_at_ms - nowMs) / Math.max(1, windowMs)));
   return hard + (init - hard) * Math.pow(fraction, Math.max(1, pool.convexity_exponent || 1.5));
 }
 

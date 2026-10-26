@@ -11,6 +11,8 @@ import {
   tbmPoolId,
 } from "../src/tbm-ingestion";
 
+import { tickTbm } from '../src/tbm-controller';
+
 const stub = defaultEnv.HUB.get(defaultEnv.HUB.idFromName("hub"));
 const NOW = Date.UTC(2026, 9, 22, 12, 0, 0);
 const DAY = 86_400_000;
@@ -343,5 +345,23 @@ describe("AC1 tbm live ingestion", () => {
       expect(pool.cycle_ms).toBe(7 * DAY);
       expect(Number(pool.capacity_known)).toBe(0);
     });
+  });
+});
+
+
+it('settles a banked expiry once even if a collection removes the expired grant before the next tick', async () => {
+  await runInDurableObject(stub, (hub: Hub) => {
+    const sql: any = hub.sql;
+    const quota: any = { status: 'ok', details: { banked_resets: [
+      { available: true, expires_at: new Date(NOW+HOUR).toISOString(), label: 'Full reset' },
+    ] }, windows: { '5h': { present: true, percent_remaining: 80, reset_at: new Date(NOW+5*HOUR).toISOString() } } };
+    syncTbmFromServerAccounts(sql, [{ provider: 'codex', account: 'expiry-order', quota }], NOW);
+    quota.details.banked_resets = [];
+    syncTbmFromServerAccounts(sql, [{ provider: 'codex', account: 'expiry-order', quota }], NOW+HOUR+60000);
+    tickTbm(sql, NOW+HOUR+60000);
+    tickTbm(sql, NOW+HOUR+2*60000);
+    const rows: any[] = sql.exec("SELECT * FROM tbm_reward_events WHERE pool_id='codex:expiry-order:5h' AND banked_waste_penalty>0").toArray();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].banked_waste_penalty).toBe(250);
   });
 });

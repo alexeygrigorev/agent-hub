@@ -22,13 +22,16 @@ const tranche = (id: string, hours: number, remaining = 1_000_000, o: Partial<Tb
 });
 
 describe('safety floors', () => {
+  it('keeps the initial reserve when the quota cycle is unknown', () => {
+    expect(softReserveTokens(pool({ reset_at_ms: NOW + MIN }), NOW)).toBe(2_000_000);
+  });
   it('hard floor is max(percent, absolute) and capped by the pool', () => {
     expect(hardFloorTokens(pool())).toBe(500_000);
     expect(hardFloorTokens(pool({ total_capacity_tokens: 100_000 }))).toBe(50_000);
     expect(hardFloorTokens(pool({ total_capacity_tokens: 10_000 }))).toBe(10_000);
   });
   it('soft reserve decays convexly from the initial buffer to the hard floor at reset', () => {
-    const p = pool({ reset_at_ms: NOW + 168 * H });
+    const p = pool({ reset_at_ms: NOW + 168 * H, cycle_ms: 168 * H });
     expect(softReserveTokens(p, NOW)).toBeCloseTo(2_000_000);
     expect(softReserveTokens(p, NOW + 168 * H)).toBeCloseTo(500_000);
     // Halfway: R_hard + 1.5M * 0.5^1.5.

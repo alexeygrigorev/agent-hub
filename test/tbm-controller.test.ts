@@ -463,3 +463,31 @@ describe('Staged low-quota floor and kill-switch end-to-end scenario (AC6)', () 
     expect(stage4Interactive.data.error).not.toBe('tbm_admission_denied');
   });
 });
+
+
+describe('TBM late telemetry preserves accepted work', () => {
+  it('preserves custom work and original penalties across cumulative token updates and accepts a later verified result', async () => {
+    await inDO(stub('late-work'), (h: any) => {
+      const sql = h.sql;
+      ensureTbmControllerSchema(sql);
+      const initial: any = recordSessionOutcomeReward(sql, {
+        session_id: 'custom', outcome: 'done', value_weight: 40, verification_fidelity: 0.5,
+      }, NOW);
+      expect(initial.work_units).toBe(20);
+      recordSessionTokens(sql, { session_id: 'custom', total_tokens: 100000 }, NOW + MIN);
+      const first: any = sql.exec("SELECT * FROM tbm_reward_events WHERE event_id='session:custom'").one();
+      expect(first.work_units).toBe(20);
+      expect(first.token_efficiency_eta).toBe(200);
+      recordSessionTokens(sql, { session_id: 'custom', total_tokens: 200000 }, NOW + 2*MIN);
+      const final: any = sql.exec("SELECT * FROM tbm_reward_events WHERE event_id='session:custom'").one();
+      expect(final.work_units).toBe(20);
+      expect(final.token_efficiency_eta).toBe(100);
+      expect(final.engine_mix_penalty).toBe(initial.engine_mix_penalty);
+      expect(final.timestamp_ms).toBe(NOW);
+      recordSessionOutcomeReward(sql, { session_id: 'accepted-late', outcome: 'stopped', tokens_burned: 100000 }, NOW);
+      const accepted: any = recordSessionOutcomeReward(sql, { session_id: 'accepted-late', outcome: 'done', tokens_burned: 100000 }, NOW + MIN);
+      expect(accepted.work_units).toBe(10);
+      expect(accepted.token_efficiency_eta).toBe(100);
+    });
+  });
+});

@@ -92,12 +92,14 @@ function syncBanked(sql: SqlStorage, provider: string, account: string, quota: a
     const state = expires <= at ? 'expired' : grant.available === true ? 'active' : 'exhausted';
     sql.exec(`INSERT INTO tbm_banked_tranches (tranche_id,pool_id,provider,label,allocated_tokens,remaining_tokens,
       granted_at_ms,expires_at_ms,status,updated_at_ms,quantity_known) VALUES (?,?,?,?,0,0,?,?,?,?,0)
-      ON CONFLICT(tranche_id) DO UPDATE SET status=excluded.status,updated_at_ms=excluded.updated_at_ms`,
+      ON CONFLICT(tranche_id) DO UPDATE SET status=CASE
+        WHEN tbm_banked_tranches.status='active' AND tbm_banked_tranches.expires_at_ms<=excluded.updated_at_ms THEN 'active'
+        WHEN tbm_banked_tranches.status='expired' THEN 'expired' ELSE excluded.status END,updated_at_ms=excluded.updated_at_ms`,
       id,pools[0].pool_id,provider,grant.label,at,expires,state,at);
     count++;
   }
   // An explicit complete grant list can mark a consumed grant; omission means unknown.
-  const existing: any[] = sql.exec("SELECT tranche_id FROM tbm_banked_tranches WHERE pool_id=? AND quantity_known=0 AND status='active'",pools[0].pool_id).toArray();
+  const existing: any[] = sql.exec("SELECT tranche_id FROM tbm_banked_tranches WHERE pool_id=? AND quantity_known=0 AND status='active' AND expires_at_ms>?",pools[0].pool_id,at).toArray();
   for (const row of existing) if (!ids.includes(row.tranche_id)) sql.exec("UPDATE tbm_banked_tranches SET status='exhausted',updated_at_ms=? WHERE tranche_id=?",at,row.tranche_id);
   return count;
 }

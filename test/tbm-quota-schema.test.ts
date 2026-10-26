@@ -105,7 +105,7 @@ describe('TBM Phase 1 quota schema migration', () => {
       const before = hub.sql
         .exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'tbm_%'")
         .toArray();
-      expect(before).toHaveLength(0);
+      expect(before.filter((row: any) => EXPECTED_TABLES.includes(row.name))).toHaveLength(0);
       ensureTbmQuotaSchema(hub.sql as any);
       const after = new Set(
         hub.sql

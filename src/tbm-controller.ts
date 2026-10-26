@@ -148,6 +148,7 @@ export function ensureTbmControllerSchema(sql: SqlStorage): void {
     ['tokens_known', 'INTEGER NOT NULL DEFAULT 0'],
     ['efficiency_known', 'INTEGER NOT NULL DEFAULT 0'],
     ['tokens_burned', 'INTEGER'],
+    ['work_units', 'REAL'],
     ['session_id', 'TEXT'],
     ['event_kind', "TEXT NOT NULL DEFAULT 'session'"],
   ] as const) {
@@ -194,6 +195,11 @@ export function recordSessionTokens(sql: SqlStorage, input: SessionTokensInput, 
     ? Math.floor(input.total_tokens)
     : inTok + outTok;
   const atMs = typeof input.observed_at_ms === 'number' && Number.isFinite(input.observed_at_ms) ? input.observed_at_ms : nowMs;
+  const prior: any = sql.exec('SELECT * FROM tbm_session_tokens WHERE session_id = ?', input.session_id).toArray()[0];
+  if (prior && prior.input_tokens === inTok && prior.output_tokens === outTok && prior.total_tokens === totTok
+      && (!input.native_id || prior.native_id === input.native_id)
+      && (!input.tag || prior.tag === input.tag) && (!input.engine || prior.engine === input.engine)
+      && (!input.account || prior.account === input.account)) return;
   sql.exec(
     `INSERT INTO tbm_session_tokens (session_id, native_id, tag, engine, account, input_tokens, output_tokens, total_tokens, observed_at_ms)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -217,7 +223,11 @@ export function recordSessionTokens(sql: SqlStorage, input: SessionTokensInput, 
     atMs
   );
   // Native telemetry may arrive under a native key before the Hub session ends.
-  upgradePendingSessionRewards(sql, nowMs);
+  upgradePendingSessionRewards(sql, nowMs, input.session_id);
+  if (input.native_id && hasTable(sql, 'session_control_sessions')) {
+    const linked = sql.exec("SELECT id FROM session_control_sessions WHERE json_extract(binding_json, '$.native_id') = ?", input.native_id).toArray();
+    for (const row of linked) if (row.id !== input.session_id) upgradePendingSessionRewards(sql, nowMs, String(row.id));
+  }
 }
 
 export interface SessionOutcomeInput {
@@ -403,14 +413,10 @@ export function recordSessionOutcomeReward(
     input.tokens_burned,
     input.input_tokens,
     input.output_tokens
-  );
-  // If already recorded with known tokens (or still unknown), return existing idempotently.
-  if (existing && (resolvedTokens === null || existing.tokens_burned === resolvedTokens)) {
-    return existing as RewardEventRow;
-  }
+  ) ?? existing?.tokens_burned ?? null;
 
   const prov = input.provider ?? (input.engine ? engineProvider(input.engine) : null) ?? 'unknown';
-  const { poolId, pool, provider } = resolvePoolForOutcome(sql, input.pool_id, prov, input.account);
+  const { poolId, pool, provider } = resolvePoolForOutcome(sql, input.pool_id ?? existing?.pool_id, prov, input.account);
   // Manual stop / exit0 alone is not acceptance: require outcome === 'done', explicit verified_outcome,
   // explicit positive verification_fidelity, or a linked accepted routing_jobs row (state = 'done').
   let acceptedJob = input.outcome === 'done' || input.verified_outcome === true;
@@ -433,7 +439,9 @@ export function recordSessionOutcomeReward(
   const weight = typeof input.value_weight === 'number' && Number.isFinite(input.value_weight) && input.value_weight > 0
     ? input.value_weight
     : 10.0;
-  const workUnits = verifiedUseful ? weight * fidelity : 0.0;
+  const previousWork = existing ? (existing.work_units ?? Math.max(0, existing.useful_work_reward - Math.min(5, existing.token_efficiency_eta / 50 * 2))) : 0;
+  const workUnits = Math.max(previousWork, verifiedUseful ? weight * fidelity : 0);
+  if (existing && existing.tokens_burned === resolvedTokens && previousWork === workUnits) return existing as RewardEventRow;
 
   const tokensKnown = resolvedTokens !== null && resolvedTokens > 0 ? 1 : 0;
   const efficiencyKnown = tokensKnown === 1 ? 1 : 0;
@@ -467,7 +475,8 @@ export function recordSessionOutcomeReward(
 
   // Engine mix penalty: Grok carries a small mix penalty; free pool (zai/go) has 0.
   const fam = normalizeProviderFamily(provider) || provider;
-  const engineMixPenalty = fam === 'grok' ? 5.0 : (FREE_POOL_PROVIDERS.includes(fam) ? 0.0 : 0.5);
+  const engineMixPenalty = existing?.engine_mix_penalty ?? (fam === 'grok' ? 5.0 : (FREE_POOL_PROVIDERS.includes(fam) ? 0.0 : 0.5));
+  if (existing) { pacingErrorPenalty = existing.pacing_error_penalty; floorBreachPenalty = existing.floor_breach_penalty; }
   const wasteAtResetPenalty = 0.0;
   const bankedWastePenalty = 0.0;
   const netReward = usefulWorkReward - pacingErrorPenalty - floorBreachPenalty - engineMixPenalty;
@@ -488,7 +497,7 @@ export function recordSessionOutcomeReward(
       `UPDATE tbm_reward_events
        SET useful_work_reward = ?, pacing_error_penalty = ?, floor_breach_penalty = ?,
            engine_mix_penalty = ?, net_reward = ?, token_efficiency_eta = ?,
-           tokens_known = ?, efficiency_known = ?, tokens_burned = ?
+           tokens_known = ?, efficiency_known = ?, tokens_burned = ?, work_units = ?
        WHERE event_id = ?`,
       usefulWorkReward,
       pacingErrorPenalty,
@@ -499,6 +508,7 @@ export function recordSessionOutcomeReward(
       tokensKnown,
       efficiencyKnown,
       tokensBurned,
+      workUnits,
       eventId
     );
   } else {
@@ -507,8 +517,8 @@ export function recordSessionOutcomeReward(
         event_id, timestamp_ms, pool_id, intake_task_id, active_mode, swarm_concurrency,
         useful_work_reward, pacing_error_penalty, floor_breach_penalty, engine_mix_penalty,
         waste_at_reset_penalty, banked_waste_penalty, net_reward, token_efficiency_eta,
-        tokens_known, efficiency_known, tokens_burned, session_id, event_kind
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'session')`,
+        tokens_known, efficiency_known, tokens_burned, session_id, work_units, event_kind
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'session')`,
       eventId,
       tsMs,
       poolId,
@@ -526,7 +536,8 @@ export function recordSessionOutcomeReward(
       tokensKnown,
       efficiencyKnown,
       tokensBurned,
-      input.session_id
+      input.session_id,
+      workUnits
     );
   }
   return sql.exec('SELECT * FROM tbm_reward_events WHERE event_id = ?', eventId).one() as unknown as RewardEventRow;
@@ -543,7 +554,7 @@ export function upgradePendingSessionRewards(sql: SqlStorage, nowMs = Date.now()
     const sid = r.session_id || String(r.event_id).replace(/^session:/, '');
     const tokens = resolveNativeSessionTokens(sql, sid);
     if (tokens !== null && tokens > 0 && tokens !== r.tokens_burned) {
-      const outcome: SessionOutcomeInput['outcome'] = Number(r.useful_work_reward) > 0 ? 'done' : 'failed';
+      const outcome: SessionOutcomeInput['outcome'] = 'failed'; // Preserve recorded work; telemetry alone cannot assert acceptance.
       recordSessionOutcomeReward(sql, {
         session_id: sid,
         intake_task_id: r.intake_task_id,
@@ -773,7 +784,7 @@ function writePoolRollups(sql: SqlStorage, pools: TbmPoolRow[], nowMs: number): 
   const windows: { type: '1h' | '24h' | 'reset_window'; durationMs: number }[] = [
     { type: '1h', durationMs: HOUR },
     { type: '24h', durationMs: DAY },
-    { type: 'reset_window', durationMs: 7 * DAY },
+    { type: 'reset_window', durationMs: 0 },
   ];
 
   // Fleet-wide engine mix & session stats over 24h.
@@ -837,6 +848,7 @@ function writePoolRollups(sql: SqlStorage, pools: TbmPoolRow[], nowMs: number): 
     }
 
     for (const w of windows) {
+      if (w.type === 'reset_window' && !resolveTbmPoolCycleMs(pool)) continue;
       const cycleMs = w.type === 'reset_window'
         ? (resolveTbmPoolCycleMs(pool) ?? w.durationMs)
         : w.durationMs;
@@ -846,7 +858,7 @@ function writePoolRollups(sql: SqlStorage, pools: TbmPoolRow[], nowMs: number): 
       const endMs = nowMs;
       const rewards = sql.exec(
         `SELECT SUM(CASE WHEN tokens_known = 1 AND tokens_burned IS NOT NULL AND event_kind = 'session' THEN tokens_burned ELSE 0 END) AS tok,
-                SUM(CASE WHEN useful_work_reward > 0 THEN useful_work_reward ELSE 0 END) AS work
+                SUM(CASE WHEN work_units > 0 THEN work_units ELSE 0 END) AS work
          FROM tbm_reward_events
          WHERE pool_id = ? AND timestamp_ms >= ? AND timestamp_ms <= ?`,
         pool.pool_id,
