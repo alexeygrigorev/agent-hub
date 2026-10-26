@@ -30,6 +30,7 @@ import { ChecksService, validateCheck, type ActionDeps } from './checks';
 import { approvalAuthorityMatches, assignApprovalAuthority } from './host_enrollment';
 import { ensureRootScheduling, getRootScheduling, isRootSchedulingEnabled, setRootScheduling } from './root_scheduling';
 import { QuotaStore, dedupeAccountsByCanonical, handleQuotaRoutes } from './quota';
+import { handleTbmApi } from './tbm-api';
 import { SessionControlService } from './session_control';
 import { StatusService, type StatusMachineAuth } from './status';
 import { MetricsStore, handleMetricsRoutes } from './metrics';
@@ -614,6 +615,12 @@ export class Hub extends DurableObject {
       if (busResponse) return busResponse;
       const jobsResponse = await this.handleJobsRoutes(request, path, url);
       if (jobsResponse) return jobsResponse;
+      if (['/api/quota/pacing', '/api/quota/banked', '/api/quota/kill-switch', '/api/quota/rewards'].includes(path)) {
+        const auth = await this.sessionControlAuth(request);
+        if (auth.error) return auth.error;
+        if (!auth.caller?.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
+        return handleTbmApi(request, this.sql);
+      }
       const quotaResponse = await handleQuotaRoutes(request, path, this.quotaStore, url, (req) =>
         this.authenticateBusRequest(req)
       );
