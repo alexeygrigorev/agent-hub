@@ -42,6 +42,28 @@ export function orphanFailure(native: any): boolean {
   } catch { return false; }
 }
 
+export function nativeTerminalError(native: any): string | null {
+  try {
+    const p = JSON.parse(native?.progress_json ?? 'null');
+    // Match the phases Fleet invalidates on an absent complete census.
+    return ['running', 'starting', 'broken'].includes(native?.phase)
+      && native?.engine === 'codex' && p?.headless === false && p?.terminal_error === 'codex_reconnect_failed'
+      ? p.terminal_error : null;
+  } catch { return null; }
+}
+
+/** Projection only: the native process and Fleet lease still require exit proof. */
+export function sessionTerminalError(row: any, native: any): string | null {
+  try {
+    const binding = JSON.parse(row?.binding_json ?? 'null');
+    return row?.state === 'running' && row?.mode === 'interactive' && row?.engine === 'codex'
+      && native?.machine_id === row.machine_id && native?.native_id === binding?.native_id
+      && native?.tag === binding?.tag && native?.workspace === binding?.workspace
+      && Number.isInteger(binding?.native_created_at_ms) && binding.native_created_at_ms > 0
+      && native?.created_at_ms === binding.native_created_at_ms ? nativeTerminalError(native) : null;
+  } catch { return null; }
+}
+
 export function classifySessionStall(sql: SqlStorage, native: any, now: number,
   threshold = 1800, hostFresh = true): { stalled: boolean; reason: string | null; since: string | null; idle_for: number | null } {
   if (!native) return { stalled: false, reason: null, since: null, idle_for: null };

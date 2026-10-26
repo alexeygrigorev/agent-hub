@@ -61,12 +61,14 @@ def owned_headless(row, records):
 
 
 class SessionProgress:
-    def __init__(self, *, now_ms=lambda: int(time.time() * 1000), proc_root=Path('/proc'), output=None, stop=None, state_path=None):
+    def __init__(self, *, now_ms=lambda: int(time.time() * 1000), proc_root=Path('/proc'), output=None, stop=None, state_path=None, screen=None):
         from .native_progress import NativeTranscriptProgress
         self.now_ms, self.proc_root, self.stop = now_ms, proc_root, stop
         self.output = output or NativeTranscriptProgress(proc_root=proc_root)
         self.state_path = Path(state_path) if state_path else None
         self.samples = {}
+        self.screen = screen
+        self.screen_checks = {}
         if self.state_path:
             try:
                 from . import private_fs
@@ -78,6 +80,11 @@ class SessionProgress:
                                 and r.get('cleanup') in ('none', 'reaped', 'uncertain')
                                 and all(type(r.get(k)) is bool for k in ('seen_alive', 'attempted', 'orphaned'))):
                             self.samples[(r['id'], r['incarnation'])] = {k: r[k] for k in ('last', 'seen_alive', 'attempted', 'cleanup', 'orphaned')}
+                            checked = r.get('screen_checked')
+                            error = r.get('terminal_error')
+                            if (type(checked) is int and 0 <= checked <= self.now_ms() + 60000
+                                    and error in (None, 'codex_reconnect_failed')):
+                                self.screen_checks[(r['id'], r['incarnation'])] = (checked, error)
                             if r.get('basis') != 'native_output_v2':
                                 self.samples[(r['id'], r['incarnation'])]['last'] = r['incarnation']
             except (OSError, ValueError, TypeError):
@@ -86,7 +93,10 @@ class SessionProgress:
     def persist(self):
         if self.state_path:
             from . import private_fs
-            rows = [dict(id=sid, incarnation=incarnation, basis='native_output_v2', **{k: row[k] for k in ('last', 'seen_alive', 'attempted', 'cleanup', 'orphaned')})
+            rows = [dict(id=sid, incarnation=incarnation, basis='native_output_v2',
+                         screen_checked=self.screen_checks.get((sid, incarnation), (0, None))[0],
+                         terminal_error=self.screen_checks.get((sid, incarnation), (0, None))[1],
+                         **{k: row[k] for k in ('last', 'seen_alive', 'attempted', 'cleanup', 'orphaned')})
                     for (sid, incarnation), row in self.samples.items()]
             private_fs.atomic_write(self.state_path, json.dumps(rows).encode(), 512 * 1024)
 
@@ -137,11 +147,39 @@ class SessionProgress:
             result[sid] = {'last_progress_at': dt.datetime.fromtimestamp(min(last, now) / 1000, dt.timezone.utc).isoformat().replace('+00:00', 'Z'),
                            'headless': headless, 'agent_alive': alive if headless else None,
                            'orphaned': self.samples[key]['orphaned'], 'cleanup': cleanup}
+        self.sample_screens(rows[:500], result, now)
         self.samples = {k: v for k, v in self.samples.items() if k in live}
+        self.screen_checks = {k: v for k, v in self.screen_checks.items() if k in live}
         if hasattr(self.output, 'retain'):
             self.output.retain(live)
         self.persist()
         return result
+
+    def sample_screens(self, rows, result, now):
+        # Independent two-second budget: transcript scanning must neither
+        # starve screen checks nor lose its existing four-second allowance.
+        budget = time.monotonic() + 2
+        ordered = sorted(rows, key=lambda r: self.screen_checks.get((r.get('id'), r.get('created_at_ms')), (0, None))[0])
+        for row in ordered:
+            key = (row.get('id'), row.get('created_at_ms'))
+            progress = result.get(row.get('id'))
+            if (not self.screen or not progress or row.get('engine') != 'codex' or progress['headless']
+                    or not row.get('tag', '').startswith('hub-')
+                    or (row.get('state') or row.get('phase')) in ('exited', 'dead', 'pruned', 'forgotten', 'stopped', 'unobserved', 'unknown')
+                    or now - self.samples[key]['last'] < 60000):
+                continue
+            checked, cached = self.screen_checks.get(key, (0, None))
+            if now - checked >= 60000:
+                if time.monotonic() >= budget:
+                    continue
+                from .codex_interactive import reconnect_failure
+                try:
+                    cached = 'codex_reconnect_failed' if reconnect_failure(self.screen(row)) else None
+                except Exception:
+                    cached = None
+                self.screen_checks[key] = (now, cached)
+            if cached and now - self.screen_checks[key][0] < 60000:
+                progress['terminal_error'] = cached
 
 
 def stop_orphan(executable, row):

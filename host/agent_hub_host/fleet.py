@@ -2828,8 +2828,10 @@ class Dispatcher:
         from .session_progress import SessionProgress, stop_orphan
         if not hasattr(self, '_session_progress'):
             from .native_progress import NativeTranscriptProgress
+            from .codex_interactive import current_screen
             self._session_progress = SessionProgress(stop=lambda row: stop_orphan(self.settings.get('aplexer_bin', 'aplexer'), row),
                 output=NativeTranscriptProgress(opencode_data=self.settings.get('opencode_auth', {}).get('target_data')),
+                screen=lambda row: current_screen(self.settings.get('aplexer_bin', 'aplexer'), row),
                 state_path=Path(self.journal_dir) / 'session-progress.json' if self.journal_dir else None)
         rows = raw if isinstance(raw, list) else raw.get('sessions', [])
         # Preserve native exit metadata before automatic retirement removes the row.

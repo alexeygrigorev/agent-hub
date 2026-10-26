@@ -292,10 +292,20 @@ def ensure_toml_trusted_projects(content: str, paths: list[str]) -> str:
         except Exception:
             p_str = str(p)
         pattern = re.compile(r'^[ \t]*\[projects\.' + re.escape(json.dumps(p_str)) + r'\][ \t]*$', re.M)
-        if pattern.search(res):
-            continue
         alt_pattern = re.compile(r'^[ \t]*\[projects\."' + re.escape(p_str) + r'"\][ \t]*$', re.M)
-        if alt_pattern.search(res):
+        existing = pattern.search(res) or alt_pattern.search(res)
+        if existing:
+            # An existing table may explicitly be untrusted or lack the key.
+            # Upgrade only this authorized path, retaining sibling settings.
+            next_table = re.search(r'^[ \t]*\[', res[existing.end():], re.M)
+            end = existing.end() + next_table.start() if next_table else len(res)
+            section = res[existing.end():end]
+            trust = re.compile(r'^[ \t]*trust_level[ \t]*=.*$', re.M)
+            if trust.search(section):
+                section = trust.sub('trust_level = "trusted"', section, count=1)
+            else:
+                section = '\ntrust_level = "trusted"\n' + section.lstrip('\n')
+            res = res[:existing.end()] + section + res[end:]
             continue
         if res and not res.endswith('\n'):
             res += '\n'
@@ -1512,7 +1522,8 @@ def execute():
                 elif b['provider'] == 'gemini':
                     if '--dangerously-skip-permissions' not in extra_argv and '--dangerously-skip-permissions' not in b.get('args', []):
                         bypass_flags = ['--dangerously-skip-permissions']
-            argv = command + b['args'] + bypass_flags + extra_argv
+            from .codex_interactive import isolated_argv
+            argv = command + isolated_argv(b['provider'], b['args'] + bypass_flags + extra_argv)
         is_diagnostic = b['args'] + extra_argv in (["--version"], ["-v"], ["--help"], ["-h"])
         if b['provider'] == 'codex' and not is_diagnostic:
             allowed, reason = check_codex_quota_gate(env)

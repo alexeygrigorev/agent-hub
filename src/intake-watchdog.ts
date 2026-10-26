@@ -5,6 +5,7 @@ import { intakeCompletionHoldReason, type IntakeService } from './intake';
 import { freshCatalogs } from './catalog-freshness';
 import { parseNativeActor } from './work_claim';
 import { getScopeStatus } from './intake_scope';
+import { nativeTerminalError, sessionTerminalError } from './session_stall';
 type Obj = Record<string, any>;
 const ACTIVE = new Set(['queued', 'held', 'offered', 'starting', 'running', 'uncertain']);
 const FAILED = new Set(['failed', 'refused', 'cancelled', 'engine_failed', 'engine_oom_killed']);
@@ -34,9 +35,14 @@ export class IntakeWatchdog {
   private rows(query: string, ...args: any[]): Obj[] { return this.sql.exec(query, ...args).toArray() as Obj[]; }
   /** One consistent readonly view; callers supply only their authorized tasks. */
   project(tasks: Obj[], now = this.now()): Obj[] {
-    const sessions = this.rows('SELECT * FROM session_control_sessions');
     const native = this.rows('SELECT * FROM fleet_sessions');
+    const nativeById = new Map(native.map(n => [JSON.stringify([n.machine_id, n.native_id]), n]));
     const catalogs = freshCatalogs(this.sql, now);
+    const sessions = this.rows('SELECT * FROM session_control_sessions').map(s => {
+      const binding = parse(s.binding_json);
+      const n = nativeById.get(JSON.stringify([s.machine_id, binding.native_id]));
+      return catalogs.has(s.machine_id) && sessionTerminalError(s, n) ? { ...s, state: 'failed' } : s;
+    });
     const claims = this.rows("SELECT * FROM claims WHERE released_at IS NULL AND (expires_at>? OR claim_source='native')", now);
     const queue = new Map(this.rows('SELECT * FROM intake_restart_queue').map(q => [q.task_id, q]));
     return tasks.filter(t => OPEN.has(t.status) && !t.archived_at).map(t => {
@@ -53,7 +59,8 @@ export class IntakeWatchdog {
         const n = actor && native.find(n => n.machine_id === actor.machineId && n.tag === actor.tag &&
           (!actor.sessionShort || String(n.native_id).replace(/-/g, '').startsWith(actor.sessionShort)));
         if (!actor || !catalogs.has(actor.machineId)) { unknown = true; continue; }
-        if (n && !['exited', 'stopped', 'failed'].includes(n.phase)) live = true;
+        if (n && ['unknown', 'unobserved'].includes(n.phase)) { unknown = true; continue; }
+        if (n && !nativeTerminalError(n) && !['exited', 'stopped', 'failed'].includes(n.phase)) live = true;
       }
       // Manual native links are liveness hints only. A fresh canonical census must
       // independently match the exact native id/host before they suppress restart.
@@ -62,7 +69,8 @@ export class IntakeWatchdog {
         const host = n?.machine_id || e.host;
         if (!host || !catalogs.has(host)) { unknown = true; continue; }
         if (!n) { unknown = true; continue; }
-        if (!['exited', 'stopped', 'failed'].includes(n.phase)) live = true;
+        if (['unknown', 'unobserved'].includes(n.phase)) { unknown = true; continue; }
+        if (!nativeTerminalError(n) && !['exited', 'stopped', 'failed'].includes(n.phase)) live = true;
         else lastEnd = Math.max(lastEnd, ms(n.observed_at));
       }
       for (const s of linked) {
@@ -71,7 +79,8 @@ export class IntakeWatchdog {
         if (!binding.native_id) { live = true; continue; } // queued intent prevents duplicates
         if (!catalogs.has(s.machine_id)) { unknown = true; continue; }
         const n = native.find(n => n.machine_id === s.machine_id && n.native_id === binding.native_id);
-        if (n && !['exited', 'stopped', 'failed'].includes(n.phase)) live = true;
+        if (n && ['unknown', 'unobserved'].includes(n.phase)) unknown = true;
+        else if (n && !['exited', 'stopped', 'failed'].includes(n.phase)) live = true;
         else if (n) lastEnd = Math.max(lastEnd, ms(n.observed_at));
         else unknown = true; // absence without a terminal receipt cannot authorize a duplicate
       }

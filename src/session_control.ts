@@ -22,7 +22,7 @@ import { registeredRepoLabel } from './repos';
  */
 import { recordIntakeSessionLink, IntakeSessionLinkError } from './intake';
 import { ResourceManagement } from './resource-management';
-import { classifySessionStall, initSessionStalls, nativeObservationFresh, nativeProgress, orphanFailure, stallThreshold } from './session_stall';
+import { classifySessionStall, initSessionStalls, nativeObservationFresh, nativeProgress, sessionTerminalError, orphanFailure, stallThreshold } from './session_stall';
 import { STOP_DELIVERY_MS, REACHABLE_STOP_DELIVERY_MS, expireUnclaimedStops, refreshObservedHostFamily, visibleSessionPrefixMatches } from './session_stop';
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { credentialActor } from './agent_registry';
@@ -612,7 +612,9 @@ export class SessionControlService {
       machine_id: row.machine_id, native_id: binding.native_id, phase: 'unobserved',
       created_at_ms: binding.native_created_at_ms ?? Date.parse(row.created_at), observed_at: row.updated_at,
     } : null;
-    const stall = classifySessionStall(this.sql, native, this.now(), stallThreshold(this.options.env), nativeObservationFresh(this.sql, native, this.now()));
+    const hostFresh = nativeObservationFresh(this.sql, native, this.now());
+    const terminalError = hostFresh ? sessionTerminalError(row, observed) : null;
+    const stall = classifySessionStall(this.sql, native, this.now(), stallThreshold(this.options.env), hostFresh);
     const isObserved = (row.actor === 'unknown' || request.provenance === 'observed_native') && !row.fleet_launch_id;
     const provenance = isObserved ? 'observed_native' : 'canonical_hub';
     const controllability = isObserved
@@ -673,12 +675,14 @@ export class SessionControlService {
     const qualified_name = qualified_alias || (typeof request.name === 'string' ? request.name : row.id);
     return {
       ...(threshold === null ? {} : this.warningView(row, threshold)),
-      id: row.id, state: row.mode === 'headless' && launchError?.reason === 'engine_tool_permission_refused' ? 'failed' :
+      id: row.id, state: terminalError ? 'failed' :
+        row.mode === 'headless' && launchError?.reason === 'engine_tool_permission_refused' ? 'failed' :
         row.mode === 'headless' && row.state === 'stopped' && orphanFailure(native) ? 'failed' :
         row.mode === 'headless' && row.state === 'running' && ['exited', 'dead'].includes(native?.phase) ? 'failed' :
         row.state === 'running' && stall.stalled ? 'stalled' : row.state,
-      stalled: row.state === 'running' && stall.stalled,
-      stall_reason: orphanFailure(native) ? 'agent_exited_children_running' : stall.reason, stalled_since: stall.since,
+      stalled: row.state === 'running' && !terminalError && stall.stalled,
+      stall_reason: terminalError ?? (orphanFailure(native) ? 'agent_exited_children_running' : stall.reason), stalled_since: stall.since,
+      ...(terminalError ? { failure_reason: terminalError, cleanup_pending: true } : {}),
       stall_threshold: stallThreshold(this.options.env), lifecycle_state: row.state,
       ...(row.mode === 'headless' && launchError?.reason === 'engine_tool_permission_refused' ? { cleanup_pending: !['failed', 'stopped'].includes(row.state) } : {}),
       machine: row.machine_id ?? null, engine: row.engine ?? null,
