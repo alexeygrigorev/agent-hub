@@ -150,3 +150,23 @@ class LateReports(unittest.TestCase):
                 restarted.request.assert_not_called()
                 self.assertFalse(restarted._active_launches[OFFER]['cleanup_pending'])
                 self.assertNotIn(OFFER,Dispatcher(cfg)._active_launches)
+
+
+    def test_terminal_delivery_rejects_cross_session_receipt_before_persist_or_post(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d,_,record=self.fixture(tmp)
+            record.update(state='running',settled=False)
+            payload=dict(state='failed',confirmed_exit=True,native_id=NATIVE,
+                         launcher_task_id=record['task_id'],report_status='failed',
+                         report='Partial work',artifacts=[])
+            d.request=Mock(side_effect=AssertionError('wrong identity must not post'))
+            with patch.object(d,'_persist_launch_record') as persist, \
+                 patch.object(d,'_maybe_cleanup_worktree') as cleanup:
+                for mismatch in [dict(native_id=OFFER),dict(launcher_task_id='another-task'),
+                                 dict(confirmed_exit=False),dict(state='running')]:
+                    with self.subTest(mismatch=mismatch):
+                        self.assertFalse(late_reports.acknowledge(d,record,dict(payload,**mismatch),False))
+                persist.assert_not_called()
+                cleanup.assert_not_called()
+            d.request.assert_not_called()
+            self.assertNotIn('terminal_payload',record)
