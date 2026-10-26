@@ -76,10 +76,34 @@ WORKSPACE_SEG = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 # the installed aplexer Python Client hardcodes cpu_quota_us=None, so these
 # flags travel the real `aplexer start` CLI path (client_call falls back to
 # subprocess for flags outside its allowlist).
+# Windows hosts (Tabo) must NOT receive Linux cgroup flags: aplexer on
+# Windows contains workloads with Job Objects and reports containment_empty.
 WORKER_MEMORY = "1500M"
 WORKER_PIDS = "256"
 WORKER_CPU_QUOTA_US = "100000"
 WORKER_CPU_PERIOD_US = "100000"
+
+
+def is_windows_host() -> bool:
+    """True on Windows session hosts (Tabo). Centralizes the supervisor/dispatch branch."""
+    try:
+        if os.name == "nt":
+            return True
+    except Exception:
+        pass
+    try:
+        import platform as _platform
+        return _platform.system() == "Windows"
+    except Exception:
+        return False
+
+
+def worker_resource_argv() -> list[str]:
+    """Linux cgroup flags for `aplexer start`, empty on Windows (Job Objects)."""
+    if is_windows_host():
+        return []
+    return ["--memory", WORKER_MEMORY, "--pids", WORKER_PIDS,
+            "--cpu-quota-us", WORKER_CPU_QUOTA_US, "--cpu-period-us", WORKER_CPU_PERIOD_US]
 
 # Advertisement-only cache for qualified role profiles (intake eff9a5ce AC1:
 # derivation costs ~7 s per cycle on DEFLf4 and only feeds registration).
@@ -2285,7 +2309,7 @@ class Dispatcher:
                 raise ValueError('Interactive goal requires a Codex-family engine and goal text')
             if offer.get("prompt") and not with_goal:
                 raise ValueError("Interactive task injection is unsupported; start an empty native session")
-            argv = [native, "start", "--workspace", str(workspace), "--tag", "hub-" + offer_id, "--engine", offer["engine"], "--memory", WORKER_MEMORY, "--pids", WORKER_PIDS, "--cpu-quota-us", WORKER_CPU_QUOTA_US, "--cpu-period-us", WORKER_CPU_PERIOD_US, "--json"]
+            argv = [native, "start", "--workspace", str(workspace), "--tag", "hub-" + offer_id, "--engine", offer["engine"]] + worker_resource_argv() + ["--json"]
             if offer.get("profile"):
                 argv += ["--profile", offer["profile"]]
             if target_cwd != workspace:

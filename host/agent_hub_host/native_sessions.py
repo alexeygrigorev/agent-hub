@@ -952,6 +952,8 @@ def _workload_containment_gone(cgroup: Optional[str]) -> Optional[bool]:
     True = path absent (contained work reaped), False = still present,
     None = no usable path observed (unsupported). Only absolute paths under
     /sys/fs/cgroup are consulted; anything else is unsupported, never probed.
+    Windows hosts (Tabo) never take this path: aplexer contains workloads
+    with Job Objects and reports containment_empty in the catalog instead.
     """
     if not isinstance(cgroup, str) or not cgroup:
         return None
@@ -975,9 +977,11 @@ def _confirm_workload_exit(before: NativeSession) -> tuple[bool, str]:
 
     A missing catalog entry or a lone ``kill`` exit 0 is NOT confirmation.
     Stopped requires at least one positive containment/process proof from the
-    observed row: the workload cgroup path reaped, every observed PID dead,
-    or the catalog itself reporting containment empty. Anything else is
-    unproven (unknown/unsupported oracle stays uncertain/held, never false
+    observed row: the workload cgroup path reaped (Linux), every observed PID
+    dead, or the catalog itself reporting containment empty. On Windows the
+    cgroup path is never consulted; the Job Object proof is the catalog
+    containment_empty flag (True) plus dead PIDs when observed. Anything else
+    is unproven (unknown/unsupported oracle stays uncertain/held, never false
     stopped).
     """
     cgroup_gone = _workload_containment_gone(before.workload_cgroup)

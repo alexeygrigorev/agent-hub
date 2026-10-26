@@ -22,6 +22,28 @@ def native(*argv):
     return json.loads(result.stdout)
 
 
+def is_windows() -> bool:
+    """Windows session hosts (Tabo) use Job Objects, never Linux cgroup flags."""
+    try:
+        if os.name == "nt" or sys.platform == "win32":
+            return True
+    except Exception:
+        pass
+    try:
+        import platform as _platform
+        return _platform.system() == "Windows"
+    except Exception:
+        return False
+
+
+def controller_resource_argv() -> list[str]:
+    """Linux cgroup caps for the controller; empty on Windows (Job Objects)."""
+    if is_windows():
+        return []
+    return ['--memory', '1500M', '--pids', '256',
+            '--cpu-quota-us', '100000', '--cpu-period-us', '100000']
+
+
 def same_controller(row, receipt):
     return all(row.get(key) == receipt.get(key) for key in
                ('id', 'tag', 'workspace', 'engine', 'created_at_ms', 'command'))
@@ -116,10 +138,13 @@ def main():
     receipt = native('start', '--workspace', str(workspace), '--cwd', str(workspace),
                      '--tag', tag, '--engine', 'shell',
                      *env_args,
-                     '--memory', '1500M', '--pids', '256',
-                     '--cpu-quota-us', '100000', '--cpu-period-us', '100000',
+                     *controller_resource_argv(),
                      '--history-bytes', '262144',
                      '--', *command)
+    # Windows hosts contain the controller with a Job Object (containment_empty);
+    # Linux hosts use cgroup caps above. Exit proof never reads /sys/fs/cgroup on
+    # Windows: native_sessions._confirm_workload_exit accepts catalog
+    # containment_empty plus dead PIDs instead.
     # Reuse the receipt only in this process; no user-provided ownership labels
     # or persisted IDs can select another session for cleanup.
     if (receipt.get('engine') != 'shell' or receipt.get('command') != command or receipt.get('workspace') != str(workspace)
