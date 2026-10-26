@@ -192,6 +192,8 @@ survives subsequent clear or unknown heartbeat samples for the configured
 fresh positively observed broken service workers produce `host_runtime_choking`.
 The collector's `worker_broken` result counts even without a status file;
 missing/stale status or a timed-out observer with an unknown worker does not.
+Authenticated positive service observations survive later healthy/unknown
+snapshots for the configured cooldown, then expire normally.
 Old measurements are not positive choking evidence. Unknown/malformed/stale
 telemetry stays visibly unknown and advisory, and does not fabricate healthy
 zeros or create a CPU hold by itself. Memory, quota and disk gates still apply.

@@ -95,6 +95,26 @@ describe('CPU predictive placement integration',()=>{
   sql.exec('UPDATE host_health_observations SET observed_at=?',iso(-301000));
   expect(f.resources.cpuHeadroom('host').admitted).toBe(true);
  }));
+ it('retains authenticated service failure evidence across healthy snapshots only for the cooldown',()=>fixture(async(f,sql)=>{
+  const monitoring=new MonitoringService(sql,cb=>cb(),undefined,undefined,undefined,()=>now);monitoring.init();
+  const post=(worker:string,observed=iso(),source:any=null)=>monitoring.handleHostHealthObservation(new Request('https://hub/api/monitoring/health',{method:'POST',body:JSON.stringify({
+   machine_id:'host',observed_at:observed,load:{load1:1,load5:1,load15:1},
+   memory:{total_bytes:64000,available_bytes:32000,used_bytes:32000,percent:50,status:'ok'},
+   services:[{service_id:'controller',worker,reason:worker==='broken'?'worker_broken':'worker_unknown',observed_at:source}],
+  })}),{kind:'host',machine_id:'host',tokenId:'host-token'});
+  expect((await post('broken',iso(),iso(120000))).status).toBe(200);
+  expect(f.resources.cpuHeadroom('host').admitted).toBe(true); // future source degrades to unknown
+  expect((await post('unknown')).status).toBe(200);
+  expect(f.resources.cpuHeadroom('host').admitted).toBe(true);
+  expect((await post('broken')).status).toBe(200); // positively observed worker, no status file
+  expect(f.resources.cpuHeadroom('host').resource_choking).toEqual({reason:'host_runtime_choking',observed_at:iso()});
+  expect((await post('alive')).status).toBe(200);
+  expect(f.resources.cpuHeadroom('host').reason).toBe('host_runtime_choking');
+  expect((await post('unknown')).status).toBe(200);
+  expect(f.resources.cpuHeadroom('host').reason).toBe('host_runtime_choking');
+  sql.exec('UPDATE resource_choking_events SET observed_at=?',iso(-301000));
+  expect(f.resources.cpuHeadroom('host').admitted).toBe(true);
+ }));
  it('preserves bounded local refusal math through a fenced no-start retry',()=>fixture(async(f,sql)=>{
   const start=f.reserve(req(),admin);expect(start.status).toBe(201);
   sql.exec("UPDATE fleet_launches SET state='starting' WHERE id=?",start.value.id);

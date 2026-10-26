@@ -1505,6 +1505,17 @@ export class MonitoringService {
       reporter,
     );
 
+    // Keep positive recent failure evidence when the next health snapshot is
+    // healthy or unknown. Observation failures alone never create this event.
+    if (payload.services?.some(service => service.worker === 'broken') &&
+        observedMs >= this.now() - 180000 && observedMs <= this.now() + 30000 &&
+        this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='resource_choking_events'").toArray().length) {
+      this.sql.exec(`INSERT INTO resource_choking_events VALUES(?,?,?)
+        ON CONFLICT(machine_id,reason) DO UPDATE SET observed_at=excluded.observed_at
+        WHERE excluded.observed_at>resource_choking_events.observed_at`,
+      payload.machine_id, 'host_runtime_choking', payload.observed_at);
+    }
+
     if (this.liveness) {
       if (payload.memory.status === 'warn' || payload.memory.status === 'critical') {
         this.liveness.setAlert('memory', payload.machine_id, {
