@@ -1236,6 +1236,7 @@ class Dispatcher:
         try:
             from .launch_diagnostics import (
                 describe_partial_work, retain_per_session_opencode_log,
+                read_native_screen_crash_tail,
                 _redact_secret_shapes,
             )
             from .runtime_diagnostics import _sanitize_tail
@@ -1248,6 +1249,7 @@ class Dispatcher:
         log_dest = None
         log_label = None
         tail = ''
+        crash_tail = ''
         try:
             dest, log_label = self._session_log_dest(record)
             if dest:
@@ -1266,6 +1268,24 @@ class Dispatcher:
                         tail = ''
         except Exception:
             log_dest = log_dest or None
+        try:
+            # Intake a19cac9e AC2: the opencode Bun-runtime crash (SIGABRT)
+            # that kills workers before they write the result JSON leaves its
+            # only trace on the native screen, not in opencode.log. Capture a
+            # bounded sanitized crash-signature tail so the exit cause is
+            # recorded instead of "unavailable". Never raw screen text.
+            if isinstance(record, dict) and record.get('native_id'):
+                try:
+                    settings = getattr(self, 'settings', {}) or {}
+                    state_dir = settings.get('aplexer_state_dir') if isinstance(settings, dict) else None
+                except Exception:
+                    state_dir = None
+                crash_tail = read_native_screen_crash_tail(
+                    state_dir, record.get('native_id'))
+                if isinstance(record, dict) and crash_tail and not record.get('runtime_tail'):
+                    record['runtime_tail'] = crash_tail
+        except Exception:
+            crash_tail = crash_tail or ''
         try:
             partial = describe_partial_work(workspace, record.get('launched_at_ts'))
         except Exception:
@@ -1289,6 +1309,8 @@ class Dispatcher:
             bits.append('Per-session opencode log retained at ' + log_label)
         if tail:
             bits.append('Log tail: ' + tail.replace('\n', ' | '))
+        if crash_tail:
+            bits.append('Native crash evidence: ' + crash_tail.replace('\n', ' | '))
         report = ' '.join(bits)[:4000]
         artifacts = []
         if commits or dirty:
@@ -2827,6 +2849,15 @@ class Dispatcher:
                     if record.get('runtime_exit') != safe:
                         record['runtime_exit'] = safe
                         self._persist_launch_record(record)
+                    # Intake a19cac9e ddf55d00: a terminal row whose cgroup is
+                    # still non-empty means backgrounded children outlived the
+                    # main workload. Persist the bounded bool alongside the
+                    # exit metadata so the runtime diagnostic can report
+                    # engine_children_running after retirement removes the row.
+                    if type(row.get('containment_empty')) is bool:
+                        if record.get('containment_empty') is not row.get('containment_empty'):
+                            record['containment_empty'] = row.get('containment_empty')
+                            self._persist_launch_record(record)
         progress = self._session_progress.sample(rows, active_launches)
         self.request("PUT", "/api/fleet/sessions", {"sessions": session_metadata(raw, self.settings, progress)})
         # Reconcile Fleet-owned starts into exact Hub session bindings after

@@ -169,6 +169,94 @@ class NoResultRegression(unittest.TestCase):
         blob = json.dumps(partial)
         self.assertNotIn('sk-abcdef1234567890', blob)
 
+    def test_children_running_reason_when_cgroup_not_empty(self):
+        # Intake a19cac9e ddf55d00: terminal row retired with a non-empty
+        # cgroup and no exit code/signal -> engine_children_running, never
+        # the generic phrase, with wall time and tail preserved.
+        rec = dict(RECORD, containment_empty=False)
+        result = runtime_diagnostic(rec, TOMB, query=lambda a: '')
+        self.assertEqual(result['reason'], 'engine_children_running')
+        self.assertNotIn(FORBIDDEN, result['message'])
+        self.assertIn('wall_time_ms', result)
+        self.assertNotIn('exit_code', result)
+        # A real signal keeps its own reason (precedence).
+        rec_sig = dict(RECORD, containment_empty=False, runtime_exit={'signal': 6})
+        self.assertEqual(runtime_diagnostic(rec_sig, TOMB, query=lambda a: '')['reason'], 'engine_signal_exit')
+        # A real exit code keeps its own reason (precedence).
+        rec_code = dict(RECORD, containment_empty=False, runtime_exit={'code': 1})
+        self.assertEqual(runtime_diagnostic(rec_code, TOMB, query=lambda a: '')['reason'], 'engine_exit_code')
+        # Clean containment without metadata stays generic (but never the
+        # forbidden phrase).
+        rec_clean = dict(RECORD, containment_empty=True)
+        generic = runtime_diagnostic(rec_clean, TOMB, query=lambda a: '')
+        self.assertEqual(generic['reason'], 'engine_exited_without_result')
+        self.assertNotIn(FORBIDDEN, generic['message'])
+
+    def test_crash_tail_extracts_bun_panic_and_redacts(self):
+        screen = ('Args: "/node/opencode" run --standalone\n'
+                  'Elapsed: 555503ms | User: 1521ms | Sys: 634ms\n'
+                  'RSS: 97.25 MB | Peak: 98.84 MB\n'
+                  'panic(main thread): abort() called\n'
+                  'oh no: Bun has crashed. report Bearer abcdefghijklmnop123456\n')
+        tail = ld.extract_crash_tail(screen)
+        self.assertIn('Bun has crashed', tail)
+        self.assertIn('panic', tail)
+        self.assertNotIn('abcdefghijklmnop123456', tail)
+        self.assertNotRegex(tail, r'[\x00-\x1f\x7f]')
+        self.assertLessEqual(len(tail), 512)
+        self.assertEqual(ld.extract_crash_tail('watcher started\nall quiet\n'), '')
+        self.assertEqual(ld.extract_crash_tail(''), '')
+
+    def test_read_screen_crash_tail_guards_paths(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        nid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+        sdir = Path(tmp.name) / 'state'
+        (sdir / 'sessions' / nid).mkdir(parents=True)
+        (sdir / 'sessions' / nid / 'screen.txt').write_text(
+            'Elapsed: 10ms\npanic(main thread): abort() called\noh no: Bun has crashed.\n')
+        tail = ld.read_native_screen_crash_tail(str(sdir), nid)
+        self.assertIn('Bun has crashed', tail)
+        # Unknown UUID, malformed UUID and symlinks yield nothing.
+        self.assertEqual(ld.read_native_screen_crash_tail(str(sdir), 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff'), '')
+        self.assertEqual(ld.read_native_screen_crash_tail(str(sdir), 'not-a-uuid'), '')
+        link_dir = sdir / 'retired-sessions' / nid
+        link_dir.mkdir(parents=True)
+        (sdir / 'sessions' / nid / 'screen.txt').rename(link_dir / 'real.txt')
+        try:
+            (link_dir / 'screen.txt').symlink_to(link_dir / 'real.txt')
+        except OSError:
+            pass
+        else:
+            self.assertEqual(ld.read_native_screen_crash_tail(str(sdir), nid), '')
+
+    def test_partial_report_carries_native_crash_evidence(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ws = Path(tmp.name) / 'ws'
+        ws.mkdir()
+        subprocess.run(['git', 'init', '-q', str(ws)], check=True)
+        nid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+        sdir = Path(tmp.name) / 'state'
+        (sdir / 'sessions' / nid).mkdir(parents=True)
+        (sdir / 'sessions' / nid / 'screen.txt').write_text(
+            'panic(main thread): abort() called\noh no: Bun has crashed.\n')
+        d = Dispatcher({"version": 1, "workspaces": {"main": tmp.name},
+                        "subscriptions": [], "aplexer_bin": "aplexer",
+                        "aplexer_state_dir": str(sdir)})
+        offer = '11111111-2222-4333-8444-555555555555'
+        record = {'offer_id': offer, 'workspace': str(ws), 'native_id': nid,
+                  'engine': 'opencode',
+                  'result_path': str(ws / '.local' / 'hub-results' / (offer + '.json')),
+                  'log_offsets': {}, 'launched_at_ts': 1000.0}
+        partial = d._no_result_partial_report(record)
+        self.assertEqual(partial['status'], 'failed')
+        self.assertIn('Native crash evidence', partial['report'])
+        self.assertIn('Bun has crashed', partial['report'])
+        self.assertIn('Bun has crashed', record.get('runtime_tail', ''))
+        blob = json.dumps(partial)
+        self.assertNotRegex(blob, r'[\x00-\x1f\x7f]')
+
 
 if __name__ == '__main__':
     unittest.main()

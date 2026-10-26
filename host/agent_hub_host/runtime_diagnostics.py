@@ -98,6 +98,13 @@ def runtime_diagnostic(record, tombstone, *, query=None):
         reason, message = 'engine_runtime_timeout', 'The running engine exceeded its host runtime limit (' + detail + ').'
     elif signal is not None:
         reason, message = 'engine_signal_exit', 'The running engine terminated from signal ' + str(signal) + ' (' + detail + '); no engine result was produced.'
+    elif record.get('containment_empty') is False and code in (None, 0):
+        # Intake a19cac9e ddf55d00: the main workload is gone (native row
+        # retired / terminal) but the cgroup was still non-empty at the last
+        # host capture, i.e. backgrounded children outlived the engine while
+        # no result JSON was written. Only used when no exit code/signal
+        # explains the death (a real code/signal keeps its own reason).
+        reason, message = 'engine_children_running', 'The engine exited while backgrounded child processes were still running (' + detail + '); no engine result was produced.'
     elif code is not None:
         reason, message = 'engine_exit_code', 'The running engine exited with code ' + str(code) + ' (' + detail + '); no engine result was produced.'
     else:

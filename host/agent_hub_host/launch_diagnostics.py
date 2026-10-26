@@ -273,6 +273,100 @@ def _redact_secret_shapes(line: str) -> str:
     return line
 
 
+CRASH_SIGNATURES = (
+    'bun has crashed',
+    'panic(',
+    'abort() called',
+    'heap out of memory',
+    'allocation failure',
+    'fatal error',
+    'traceback (most recent call last)',
+    'out of memory',
+    'oom killer',
+    'sigabrt',
+    'sigsegv',
+    'core dumped',
+)
+
+
+def _looks_like_crash_line(line: str) -> bool:
+    """Fixed-substring crash match on a bounded line (never fail, no regex)."""
+    try:
+        lowered = str(line).lower()
+    except Exception:
+        return False
+    return any(sig in lowered for sig in CRASH_SIGNATURES)
+
+
+def extract_crash_tail(screen_text, *, max_lines=3, limit=512) -> str:
+    """Bounded sanitized crash-evidence tail from native screen text.
+
+    Keeps only the last matching crash-signature lines (the Bun panic /
+    abort / OOM shape that kills opencode workers before they write the
+    result JSON). Sanitized with the runtime tail scrubber so secret shapes
+    never survive. Never raises; returns '' when nothing matches.
+    """
+    try:
+        from .runtime_diagnostics import _sanitize_tail
+    except Exception:
+        _sanitize_tail = None  # type: ignore[assignment]
+    try:
+        lines = str(screen_text or '').splitlines()
+    except Exception:
+        return ''
+    hits = [ln for ln in lines if _looks_like_crash_line(ln)]
+    if not hits:
+        return ''
+    tail = ' | '.join(ln.strip()[:200] for ln in hits[-max_lines:] if ln.strip())
+    if _sanitize_tail is not None:
+        try:
+            return _sanitize_tail(tail, limit)[:limit]
+        except Exception:
+            pass
+    return tail[-limit:] if len(tail) > limit else tail
+
+
+def read_native_screen_crash_tail(state_dir, native_id, *, max_bytes=16384, limit=512) -> str:
+    """Best-effort sanitized crash tail from a native screen.txt snapshot.
+
+    Reads ONLY <state_dir>/sessions|retired-sessions/<uuid>/screen.txt for a
+    validated UUID (never follows symlinks, bounded read). Returns the
+    crash-signature tail or ''. Never raises, never returns raw screen text.
+    """
+    try:
+        import uuid as _uuid
+        norm = str(_uuid.UUID(str(native_id))).lower()
+    except Exception:
+        return ''
+    try:
+        base = str(state_dir or '').strip()
+        if not base:
+            import os as _os
+            base = _os.path.expanduser('~/.local/state/aplexer')
+        import os as _os
+        for sub in ('retired-sessions', 'sessions'):
+            path = _os.path.join(base, sub, norm, 'screen.txt')
+            try:
+                if _os.path.islink(path) or not _os.path.isfile(path):
+                    continue
+                size = _os.path.getsize(path)
+                if size <= 0 or size > 50 * 1024 * 1024:
+                    continue
+                with open(path, 'rb') as f:
+                    if size > max_bytes:
+                        f.seek(size - max_bytes)
+                    data = f.read(max_bytes)
+                text = data.decode('utf-8', 'replace')
+            except Exception:
+                continue
+            tail = extract_crash_tail(text, limit=limit)
+            if tail:
+                return tail
+    except Exception:
+        pass
+    return ''
+
+
 def describe_partial_work(workspace, launched_at_ts=None, max_files=20) -> dict:
     """Bounded local description of uncommitted work + recent commits (paths only)."""
     info: dict = {'dirty': [], 'commits': []}

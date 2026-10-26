@@ -56,4 +56,18 @@ describe('runtime diagnostic fields (intake a19cac9e AC1)', () => {
     expect((await s.handle(request(path, { ...receipt, diagnostic: { ...base, signal: 999 } }), host('hetzner'))).status).toBe(400);
     expect((await s.handle(request(path, { ...receipt, diagnostic: { ...base, secret: 1 } }), host('hetzner'))).status).toBe(400);
   }));
+  it('accepts the engine_children_running reason (intake a19cac9e ddf55d00)', async () => fixture(async (s, sql) => {
+    await s.handle(request('/accounts', { accounts: [
+      { label: 'shared-codex', provider: 'codex', max_concurrency: 1, reserve_percent: 15, enabled: true },
+    ], routes: [{ machine_id: 'hetzner', engine: 'codex', account: 'shared-codex', profile: null }] }, 'PUT'), admin);
+    const l: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    await s.handle(request('/launches/' + l.id + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
+    const path = '/launches/' + l.id + '/result';
+    const receipt = { state: 'failed', native_id: 'native-children', launcher_task_id: 'hub-' + l.id, confirmed_exit: true };
+    await s.handle(request(path, { state: 'running', native_id: receipt.native_id, launcher_task_id: receipt.launcher_task_id }), host('hetzner'));
+    const diagnostic = { reason: 'engine_children_running', message: 'The engine exited while backgrounded child processes were still running (code=unknown, signal=none, wall_time_ms=580279); no engine result was produced.', error_type: 'RuntimeError', stage: 'runtime', wall_time_ms: 580279, tail: 'panic(main thread): abort() called | oh no: Bun has crashed.' };
+    expect((await s.handle(request(path, { ...receipt, diagnostic }), host('hetzner'))).status).toBe(200);
+    const row: any = sql.exec('SELECT * FROM fleet_launches WHERE id = ?', l.id).one();
+    expect(JSON.parse(row.launch_error_json)).toEqual(diagnostic);
+  }));
 });
