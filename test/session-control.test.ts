@@ -1869,4 +1869,33 @@ describe('bounded command custody recovery', () => {
       expect(bad.status).toBe(400);
     }, reserve.hook);
   });
+
+  it('surfaces hold reason and rejected[] on held sessions in sessions_show and auto-promotes transient resource holds once capacity recovers', async () => {
+    let available = false;
+    const placed = fakeReserve();
+    const rejectedList = [{ machine: 'hetzner', engine: 'codex', reason: 'resource_limit' }];
+    await fixture(async (s) => {
+      const created = await (await s.handle(request('/api/sessions', {
+        key: 'auto-reconcile-held-1',
+        name: 'drain-test-1',
+        workspace: 'demo',
+        mode: 'interactive',
+      }), admin)).json() as any;
+      expect(created.state).toBe('held');
+      expect(created.reason).toBe('resource_limit');
+      expect(created.rejected).toEqual(rejectedList);
+
+      // Polling GET /api/sessions/:id while still blocked preserves reason and rejected[].
+      const shownWhileHeld = await (await s.handle(request(`/api/sessions/${created.id}`, undefined, 'GET'), admin)).json() as any;
+      expect(shownWhileHeld.state).toBe('held');
+      expect(shownWhileHeld.reason).toBe('resource_limit');
+      expect(shownWhileHeld.rejected).toEqual(rejectedList);
+
+      // Once real capacity exists, polling automatically re-evaluates and promotes the held session out of held.
+      available = true;
+      const shownAfterRecovery = await (await s.handle(request(`/api/sessions/${created.id}`, undefined, 'GET'), admin)).json() as any;
+      expect(shownAfterRecovery.state).toBe('offered');
+      expect(shownAfterRecovery.fleet_launch_id).toBe('launch-1');
+    }, input => available ? placed.hook(input) : { status: 409, value: { error: 'no_eligible_route', rejected: rejectedList } });
+  });
 });

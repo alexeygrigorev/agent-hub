@@ -1480,18 +1480,19 @@ export class MonitoringService {
     let processes: HostProcesses | undefined = undefined;
     if (body.processes !== undefined && body.processes !== null) {
       if (!body.processes || typeof body.processes !== 'object' || Array.isArray(body.processes)) fail('invalid_processes');
-      const numOrNull = (v: any): number | null => {
+      const numOrNull = (v: any, max = 1000000000): number | null => {
         if (v === null || v === undefined) return null;
         const n = Number(v);
-        if (!Number.isFinite(n) || n < 0 || n > 1000000000) fail('invalid_processes');
+        if (!Number.isFinite(n) || n < 0 || n > max) fail('invalid_processes');
         return n;
       };
       const process_count = numOrNull(body.processes.process_count);
       const thread_count = numOrNull(body.processes.thread_count);
-      const forks_total = numOrNull(body.processes.forks_total);
+      const forks_total = numOrNull(body.processes.forks_total, Number.MAX_SAFE_INTEGER);
       const forks_per_sec = numOrNull(body.processes.forks_per_sec);
       if (process_count !== null && !Number.isInteger(process_count)) fail('invalid_processes');
       if (thread_count !== null && !Number.isInteger(thread_count)) fail('invalid_processes');
+      if (forks_total !== null && !Number.isInteger(forks_total)) fail('invalid_processes');
       processes = { process_count, thread_count, forks_total, forks_per_sec };
     }
 
@@ -1850,6 +1851,9 @@ export class MonitoringService {
           if (freshness === 'unavailable' && worker === 'alive') {
             worker = 'unknown';
           }
+          try {
+            this.reconcileSupervisorEpisode(String(r.machine_id), svc, now, r.observed_at_ms);
+          } catch { /* read projection must not fail on episode table state */ }
         }
 
         projectedServices.push({
@@ -1963,24 +1967,41 @@ export class MonitoringService {
   }
 
   private placementFor(machineId: string, pressure: { queuedTotal: number; queuedHeld: number; recentRejects: number; failedByMachine: Map<string, number>; failedTotal: number }): HostPlacement {
-    const machineFailures = pressure.failedByMachine.get(machineId) ?? 0;
-    const machinePressure = machineFailures > 0;
-    const globalPressure = pressure.queuedTotal > 0 || pressure.recentRejects > 0 || pressure.failedTotal > 0;
-    const bits: string[] = [];
+    let reservation: HostReservation | null = null;
+    try { reservation = this.readHostReservation(String(machineId), this.now()); } catch { reservation = null; }
+    const overdrawn = Boolean(reservation && reservation.headroom_mb !== null && reservation.headroom_mb < 0 && !reservation.stale_telemetry);
+    const hostReasons = new Set(['disk_floor', 'launcher_memory_reserve', 'machine_capacity', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
+    const reasons = new Set<string>();
+    let hasHoldRows = false;
+    let hasHostHoldReason = false;
+    let hasMachineHoldReason = false;
     // Show the actual current route reasons, including CPU budget numbers.
     try {
-      const holds=this.sql.exec(`SELECT h.rejected_json FROM fleet_memory_holds h JOIN fleet_launches l ON l.id=h.launch_id WHERE l.state='queued' ORDER BY l.created_at LIMIT 20`).toArray();
-      const reasons=new Set<string>();
-      for(const h of holds) for(const r of JSON.parse(String(h.rejected_json))) {
-        const c=r.cpu;
+      const holds = this.sql.exec(`SELECT h.rejected_json FROM fleet_memory_holds h JOIN fleet_launches l ON l.id=h.launch_id WHERE l.state='queued' ORDER BY l.created_at LIMIT 20`).toArray();
+      hasHoldRows = holds.length > 0;
+      for (const h of holds) for (const r of JSON.parse(String(h.rejected_json))) {
+        if (hostReasons.has(String(r.reason))) {
+          hasHostHoldReason = true;
+          if (!r.machine || String(r.machine) === String(machineId)) hasMachineHoldReason = true;
+        }
+        const c = r.cpu;
         reasons.add(c ? `${r.reason} (current=${c.current_cpu_cores ?? 'unknown'} expected=${c.expected_cpu_cores} ramping=${c.ramping_cpu_cores} limit=${c.limit_cpu_cores} cores; CPU full=${c.psi_full_avg10 ?? 'unknown'}% memory full=${c.memory_psi_full_avg10 ?? 'unknown'}% OOM delta=${c.oom_kills_delta ?? 'unknown'})` : String(r.reason));
       }
-      if(reasons.size) bits.push([...reasons].join(', '));
     } catch { /* old schema: generic placement state stays truthful */ }
-    if (pressure.queuedTotal > 0) bits.push(`${pressure.queuedTotal} launch(es) held queued for placement admission (${pressure.queuedHeld} >5 min)`);
-    if (pressure.recentRejects > 0) bits.push(`${pressure.recentRejects} launch rejection(s) for placement admission in 24h`);
-    if (machineFailures > 0) bits.push(`${machineFailures} terminal failure(s) for placement admission on this host in 24h`);
-    else if (pressure.failedTotal > 0) bits.push(`${pressure.failedTotal} terminal failure(s) for placement admission elsewhere in 24h`);
+    // Historical 24h rejection/failure counts must never by themselves create
+    // placement pressure while real capacity exists on the host (intake e25fa26e).
+    const activeQueuedPressure = pressure.queuedTotal > 0 && (!hasHoldRows || hasHostHoldReason);
+    const machinePressure = overdrawn || (pressure.queuedTotal > 0 && hasMachineHoldReason);
+    const globalPressure = overdrawn || activeQueuedPressure;
+    const bits: string[] = [];
+    if (machinePressure || globalPressure) {
+      if (reasons.size) bits.push([...reasons].join(', '));
+      if (pressure.queuedTotal > 0) bits.push(`${pressure.queuedTotal} launch(es) held queued for placement admission (${pressure.queuedHeld} >5 min)`);
+      if (overdrawn && pressure.recentRejects > 0) bits.push(`${pressure.recentRejects} launch rejection(s) for placement admission in 24h`);
+      const machineFailures = pressure.failedByMachine.get(machineId) ?? 0;
+      if (overdrawn && machineFailures > 0) bits.push(`${machineFailures} terminal failure(s) for placement admission on this host in 24h`);
+      else if (overdrawn && pressure.failedTotal > 0) bits.push(`${pressure.failedTotal} terminal failure(s) for placement admission elsewhere in 24h`);
+    }
     return { machine_pressure: machinePressure, global_pressure: globalPressure, reason: bits.length ? bits.join('; ') : null };
   }
 

@@ -2027,6 +2027,58 @@ describe('Host process alert test-fire (lower then restore)', () => {
     expect((await post({ ...base, observed_at: iso(3) })).status).toBe(200);
     expect(hub.livenessService.alerts().find((a: any) => a.subject_kind === 'processes' && a.resolved_at === null)).toBeUndefined();
   }));
+
+  it('accepts forks_total above 1e9 and does not create self-reinforcing global_pressure from 24h rejections when headroom is healthy', () => fixture(async (hub, clock) => {
+    enrollHost(hub.sql, 'hetzner');
+    const auth = { kind: 'host' as const, machine_id: 'hetzner', tokenId: 'cred-hetzner' };
+    const post = (body: any) => hub.monitoringService.handleHostHealthObservation(new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    }), auth);
+
+    // 1. Long-uptime host with forks_total > 2e9 must be accepted (intake e25fa26e AC3).
+    const res = await post({
+      machine_id: 'hetzner',
+      observed_at: new Date(clock.t).toISOString(),
+      load: { load1: 2.0, load5: 2.0, load15: 2.0 },
+      memory: { total_bytes: 64 * 1024 ** 3, available_bytes: 40 * 1024 ** 3, used_bytes: 24 * 1024 ** 3, percent: 37.5, status: 'ok' },
+      processes: { process_count: 680, thread_count: 2400, forks_total: 2154387449, forks_per_sec: 12.5 },
+      services: [
+        { service_id: 'supervision', worker: 'alive', status_file_age_s: 15, observed_at: new Date(clock.t).toISOString(), reason: 'ok' },
+      ],
+    });
+    expect(res.status).toBe(200);
+
+    // 2. Historical 24h placement_rejections and failed launches must not set global_pressure=true when queuedTotal=0 and headroom is healthy (AC1/AC5).
+    hub.monitoringService.setResourceProjection(() => ({
+      mem_avail_mb: 40960,
+      reserved_mb: 3000,
+      floor_mb: 2048,
+      next_slot_mb: 1500,
+      headroom_mb: 35912,
+      headroom_ok: true,
+      stale_telemetry: false,
+      observed_at: new Date(clock.t).toISOString(),
+    }));
+    hub.sql.exec('CREATE TABLE IF NOT EXISTS placement_rejections (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, created_at_ms INTEGER NOT NULL, actor TEXT NOT NULL, reasons_json TEXT NOT NULL, detail TEXT NOT NULL)');
+    hub.sql.exec("INSERT INTO placement_rejections (id, created_at, created_at_ms, actor, reasons_json, detail) VALUES ('rej-1', ?, ?, 'admin', ?, 'resource_limit')", new Date(clock.t - 60000).toISOString(), clock.t - 60000, JSON.stringify([{ machine: 'hetzner', engine: 'codex', reason: 'resource_limit' }]));
+
+    const status = hub.monitoringService.getHostHealthStatus(clock.t);
+    const machine = status.machines.find(m => m.machine_id === 'hetzner')!;
+    expect(machine.freshness).toBe('fresh');
+    expect(machine.processes?.forks_total).toBe(2154387449);
+    expect(machine.placement?.machine_pressure).toBe(false);
+    expect(machine.placement?.global_pressure).toBe(false);
+    expect(machine.placement?.reason).toBeNull();
+    expect(machine.memory.status).toBe('ok');
+
+    // 3. When host observation stalls (> 15m without a new POST), getHostHealthStatus opens a supervisor liveness alert.
+    clock.t += 20 * 60 * 1000;
+    const staleStatus = hub.monitoringService.getHostHealthStatus(clock.t);
+    const staleMachine = staleStatus.machines.find(m => m.machine_id === 'hetzner')!;
+    expect(staleMachine.freshness).toBe('unavailable');
+    const supAlert = hub.livenessService.alerts().find((a: any) => a.subject_kind === 'supervisor' && a.subject === 'hetzner:supervision' && a.resolved_at === null);
+    expect(supAlert).toBeDefined();
+  }));
 });
 
 function clockSafe(hub: any): number {

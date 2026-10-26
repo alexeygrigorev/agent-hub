@@ -1,6 +1,7 @@
+import subprocess
 import unittest
 
-from agent_hub_host.host_health_monitor import collect_process_stats, collect_host_health
+from agent_hub_host.host_health_monitor import HostHealthMonitor, collect_process_stats, collect_host_health
 
 
 class TestProcessStats(unittest.TestCase):
@@ -52,6 +53,42 @@ class TestProcessStats(unittest.TestCase):
         )
         self.assertEqual(payload["processes"]["process_count"], 123)
         self.assertEqual(payload["processes"]["forks_per_sec"], 1.5)
+
+    def test_monitor_step_retries_without_processes_on_submit_failure_and_restarts_stale_supervision(self):
+        submitted = []
+        restarted = []
+
+        def submit_fn(payload, endpoint="/api/monitoring/health"):
+            submitted.append(dict(payload))
+            if "processes" in payload:
+                raise RuntimeError("HTTP 400: invalid_processes")
+            return {"ok": True}
+
+        mon = HostHealthMonitor(
+            config={"enabled": True, "machine_id": "hetzner", "min_interval_s": 60},
+            submit_fn=submit_fn,
+            getloadavg_fn=lambda: (0.5, 0.5, 0.5),
+            services=[
+                {
+                    "service_id": "supervision",
+                    "workspace": "/nonexistent-ws",
+                    "session_tag": "experiment-supervision",
+                    "status_path": "/nonexistent-ws/status.json",
+                }
+            ],
+            runner_fn=lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout='{"worker_alive": false, "state": "broken"}', stderr=""),
+            restart_fn=lambda svc_id: (restarted.append(svc_id) or True),
+            monotonic_fn=lambda: 1000.0,
+            time_fn=lambda: 1700000000.0,
+        )
+        res = mon.step(submit=True)
+        self.assertTrue(res["posted"])
+        self.assertEqual(res["errors"], [])
+        self.assertEqual(len(submitted), 2)
+        self.assertIn("processes", submitted[0])
+        self.assertNotIn("processes", submitted[1])
+        self.assertEqual(restarted, ["supervision"])
+        self.assertEqual(res["restarted_services"], ["supervision"])
 
 
 if __name__ == "__main__":

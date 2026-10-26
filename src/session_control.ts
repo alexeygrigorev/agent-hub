@@ -255,7 +255,7 @@ export class SessionControlService {
     }
     // Additive migration for tables created by the earlier reserve-only draft.
     const sessionCols = new Set(this.sql.exec('PRAGMA table_info(session_control_sessions)').toArray().map((c: any) => String(c.name)));
-    for (const [col, type] of [['owner_token_id', 'TEXT'], ['owner_family', 'TEXT'], ['host_family', 'TEXT'], ['parent_id', 'TEXT'], ['parent_source', 'TEXT'], ['session_type', 'TEXT']] as const) {
+    for (const [col, type] of [['owner_token_id', 'TEXT'], ['owner_family', 'TEXT'], ['host_family', 'TEXT'], ['parent_id', 'TEXT'], ['parent_source', 'TEXT'], ['session_type', 'TEXT'], ['hold_json', 'TEXT']] as const) {
       if (!sessionCols.has(col)) this.sql.exec(`ALTER TABLE session_control_sessions ADD COLUMN ${col} ${type}`);
     }
     const commandCols = new Set(this.sql.exec('PRAGMA table_info(session_control_commands)').toArray().map((c: any) => String(c.name)));
@@ -629,6 +629,7 @@ export class SessionControlService {
     let expectedCpu: any = null;
     let modelReason: string | null = null;
     let memoryRejected: any[] = [];
+    let holdReason: string | null = null;
     if (row.fleet_launch_id) {
       try {
         const launch: any = this.sql.exec('SELECT launch_error_json, model_selection_json, exit_reason, native_id,request_json,workspace FROM fleet_launches WHERE id = ?', row.fleet_launch_id).toArray()[0];
@@ -664,6 +665,11 @@ export class SessionControlService {
         }
       } catch {} // Fleet is optional in isolated session-control installations.
     }
+    if ((row.state === 'held' || row.state === 'queued' || row.state === 'cancelled') && memoryRejected.length === 0) {
+      const holdInfo = this.readHoldInfo(row, request);
+      if (holdInfo.rejected.length > 0) memoryRejected = holdInfo.rejected;
+      if (holdInfo.reason && row.state === 'held') holdReason = holdInfo.reason;
+    }
     const qualified_name = qualified_alias || (typeof request.name === 'string' ? request.name : row.id);
     return {
       ...(threshold === null ? {} : this.warningView(row, threshold)),
@@ -686,7 +692,7 @@ export class SessionControlService {
       name: typeof request.name === 'string' ? request.name : null,
       fleet_launch_id: row.fleet_launch_id ?? null,
       ...(modelReason ? { reason: modelReason } : {}),
-      ...(memoryRejected.length ? { reason: memoryRejected[0]?.reason ?? 'placement_unknown', rejected: memoryRejected } : {}),
+      ...(memoryRejected.length ? { reason: memoryRejected[0]?.reason ?? holdReason ?? 'placement_unknown', rejected: memoryRejected } : holdReason ? { reason: holdReason } : {}),
       ...(launchError ? { reason: launchError.reason, message: launchError.message, launch_error: launchError } : {}),
       cleanup_protection: protection ? { key: protection.request_key, created_at: protection.created_at, permanent: true } : null,
       binding,
@@ -772,8 +778,130 @@ export class SessionControlService {
    * even if no client observed offered. Native running/terminal transitions
    * stay with the binding/result flows, which carry the incarnation evidence
    * this sync must never invent. */
+  private readHoldInfo(row: any, request?: any): { reason: string | null; rejected: any[]; hold: any } {
+    const req = request ?? parsed(row?.request_json, {});
+    let holdObj: any = row?.hold_json ? parsed(row.hold_json, null) : null;
+    if (!holdObj && typeof req?.intake_task_id === 'string' && req.intake_task_id) {
+      try {
+        let taskRows: any[] = this.sql.exec('SELECT data FROM intake_tasks WHERE id = ?', req.intake_task_id).toArray();
+        if (!taskRows.length && req.intake_task_id.length >= 6) {
+          taskRows = this.sql.exec("SELECT data FROM intake_tasks WHERE id LIKE ? || '%' LIMIT 2", req.intake_task_id).toArray();
+        }
+        if (taskRows.length === 1) {
+          const task = parsed(taskRows[0].data, null);
+          const link = Array.isArray(task?.history)
+            ? [...task.history].reverse().find((e: any) => ['link', 'session'].includes(e?.kind) && e?.hub_session_id === row.id && e?.assignment_hold !== undefined)
+            : null;
+          if (link?.assignment_hold !== undefined) holdObj = link.assignment_hold;
+        }
+      } catch {}
+    }
+    const rejected = Array.isArray(holdObj?.rejected) ? holdObj.rejected : [];
+    const reason = rejected[0]?.reason ?? (typeof holdObj === 'string' ? holdObj : typeof holdObj?.reason === 'string' ? holdObj.reason : typeof holdObj?.error === 'string' ? holdObj.error : null);
+    return { reason, rejected, hold: holdObj };
+  }
+
+  /** Re-evaluate unplaced held sessions whose hold was caused by transient
+   * resource/capacity limits once real capacity exists (intake e25fa26e). */
+  reconcileHeldSessions(limit = 5): { promoted: number; cancelled: number } {
+    let promoted = 0, cancelled = 0;
+    if (!this.hooks.reserve) return { promoted, cancelled };
+    const transientReasons = new Set([
+      'disk_floor', 'resource_limit', 'launcher_memory_reserve', 'account_capacity', 'machine_capacity',
+      'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking',
+    ]);
+    try {
+      const rows = this.sql.exec(
+        "SELECT * FROM session_control_sessions WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL ORDER BY created_at ASC, id ASC LIMIT ?",
+        Math.max(limit * 4, 20),
+      ).toArray() as any[];
+      for (const row of rows) {
+        if (promoted >= limit) break;
+        const req = parsed(row.request_json, {});
+        const holdInfo = this.readHoldInfo(row, req);
+        if (!holdInfo.rejected.length || !holdInfo.rejected.every((r: any) => transientReasons.has(String(r?.reason)))) {
+          continue;
+        }
+        try {
+          const priorCancel = this.sql.exec('SELECT 1 FROM session_control_cancellations WHERE session_id = ? LIMIT 1', row.id).toArray();
+          if (priorCancel.length) continue;
+        } catch {}
+        let project: string | undefined = undefined;
+        if (typeof req.intake_task_id === 'string' && req.intake_task_id) {
+          try {
+            let taskRows: any[] = this.sql.exec('SELECT id, data FROM intake_tasks WHERE id = ?', req.intake_task_id).toArray();
+            if (!taskRows.length && req.intake_task_id.length >= 6) {
+              taskRows = this.sql.exec("SELECT id, data FROM intake_tasks WHERE id LIKE ? || '%' LIMIT 2", req.intake_task_id).toArray();
+            }
+            if (taskRows.length === 1) {
+              const task = parsed(taskRows[0].data, {});
+              project = typeof task?.project === 'string' ? task.project : undefined;
+              if (task?.status === 'done' || task?.status === 'cancelled') {
+                const at = this.at();
+                const closedHold = JSON.stringify({ error: 'intake_task_closed', reason: 'intake_task_closed' });
+                this.sql.exec("UPDATE session_control_sessions SET state = 'cancelled', hold_json = ?, updated_at = ? WHERE id = ? AND state = 'held'", closedHold, at, row.id);
+                cancelled++;
+                continue;
+              }
+            }
+          } catch {}
+        }
+        const mode = row.mode || req.mode || 'headless';
+        if (mode !== 'interactive') {
+          const gate = this.tbmGate(req.engine ?? undefined);
+          if (!gate.ok) continue;
+        }
+        const reserved = this.hooks.reserve({
+          ...(req.task_kind !== undefined && req.task_kind !== null ? { task_kind: req.task_kind } : {}),
+          ...(project ? { project } : {}),
+          mode,
+          ...(req.machine ? { machine: req.machine } : {}),
+          ...(req.engine ? { engine: req.engine } : {}),
+          ...(req.tier ? { tier: req.tier } : {}),
+          workspace: req.workspace,
+          cwd: req.cwd ?? null,
+          prompt: req.brief || '',
+          access: req.access ?? undefined,
+          ...(req.with_goal === true ? { with_goal: true } : {}),
+          idempotency_key: 'session-control-' + row.id,
+        }, { caller: { kind: 'agent', actor: row.actor, isAdmin: true }, scopes: ['fleet:launch', 'admin'] });
+        const at = this.at();
+        if (reserved.status === 202 && reserved.value && typeof reserved.value.id === 'string' && reserved.value.state === 'queued') {
+          this.sql.exec(
+            "UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = NULL, engine = ?, state = 'queued', hold_json = NULL, updated_at = ? WHERE id = ? AND state = 'held'",
+            reserved.value.id,
+            typeof reserved.value.engine === 'string' && reserved.value.engine ? reserved.value.engine : (req.engine ?? null),
+            at,
+            row.id,
+          );
+          promoted++;
+        } else if (reserved.status >= 200 && reserved.status < 300 && reserved.value && typeof reserved.value.id === 'string') {
+          this.sql.exec(
+            "UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = ?, engine = ?, state = ?, hold_json = NULL, updated_at = ? WHERE id = ? AND state = 'held'",
+            reserved.value.id,
+            reserved.value.machine ?? null,
+            reserved.value.engine ?? (req.engine ?? null),
+            reserved.value.state || 'offered',
+            at,
+            row.id,
+          );
+          promoted++;
+        } else if (reserved.status >= 300 && reserved.value) {
+          this.sql.exec(
+            "UPDATE session_control_sessions SET hold_json = ?, updated_at = ? WHERE id = ? AND state = 'held'",
+            JSON.stringify(reserved.value),
+            at,
+            row.id,
+          );
+        }
+      }
+    } catch { /* best-effort inside ambient transaction */ }
+    return { promoted, cancelled };
+  }
+
   private syncFleetPlacement(sessionId: string): any | null {
     reconcileUnboundFleetSessions(this.sql, this.now());
+    this.reconcileHeldSessions();
     const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0];
     if (!session || !session.fleet_launch_id) return session;
     if (session.state !== 'queued' && session.state !== 'held') return session;
@@ -1091,6 +1219,7 @@ export class SessionControlService {
       // Reconcile queued assignments here as well as in client polling. A
       // headless start must bind even when no client observed the brief
       // offered state before the host claimed it.
+      this.transaction(() => this.reconcileHeldSessions());
       const promoted = this.sql.exec("SELECT s.id, s.host_family, f.machine_id FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id WHERE f.machine_id = ? AND s.binding_json IS NULL AND s.state IN ('queued','held') AND f.state IN ('starting','running') LIMIT 100", caller.machineId!).toArray() as any[];
       for (const row of promoted) if (this.hostOk(row, caller).ok) this.syncFleetPlacement(row.id);
       const rows = this.sql.exec("SELECT s.*, f.native_id AS launch_native_id FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id WHERE s.machine_id = ? AND s.binding_json IS NULL AND s.state IN ('offered','starting','uncertain') AND f.state IN ('starting','running') LIMIT 100", caller.machineId!).toArray() as any[];
@@ -1357,9 +1486,10 @@ export class SessionControlService {
           if (!prior) {
             const id = crypto.randomUUID();
             const at = this.at();
+            const noAuthHold = JSON.stringify({ error: 'no_placement_authority', reason: 'no_placement_authority' });
             this.sql.exec(
-              'INSERT INTO session_control_sessions (id, actor, request_key, request_json, mode, state, owner_token_id, owner_family, parent_id, parent_source, session_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-              id, actor, input.key, canonical, mode, 'held', caller.tokenId ?? null, creatorFamily, parentId, parentSource, sessionType, at, at);
+              'INSERT INTO session_control_sessions (id, actor, request_key, request_json, mode, state, hold_json, owner_token_id, owner_family, parent_id, parent_source, session_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+              id, actor, input.key, canonical, mode, 'held', noAuthHold, caller.tokenId ?? null, creatorFamily, parentId, parentSource, sessionType, at, at);
             const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
             return finish(row, { hold: 'no_placement_authority' }, 409);
           }
@@ -1396,17 +1526,19 @@ export class SessionControlService {
         // to the fleet waitlist row; the fleet drain auto-places it when a
         // slot frees and polls adopt the promotion. All other failures hold.
         if (reserved.status === 202 && reserved.value && typeof reserved.value.id === 'string' && reserved.value.state === 'queued') {
-          this.sql.exec('UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = NULL, engine = ?, state = ?, updated_at = ? WHERE id = ?',
-            reserved.value.id, typeof reserved.value.engine === 'string' && reserved.value.engine ? reserved.value.engine : (input.engine ?? null), 'queued', at, id);
+          const queuedHold = Array.isArray(reserved.value.rejected) ? JSON.stringify({ rejected: reserved.value.rejected }) : null;
+          this.sql.exec('UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = NULL, engine = ?, state = ?, hold_json = ?, updated_at = ? WHERE id = ?',
+            reserved.value.id, typeof reserved.value.engine === 'string' && reserved.value.engine ? reserved.value.engine : (input.engine ?? null), 'queued', queuedHold, at, id);
           const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
           return finish(row, { queued: true, queue_position: reserved.value.queue_position ?? null, rejected: reserved.value.rejected ?? null, requested: { engine: input.engine ?? null, machine: input.machine ?? null, workspace: input.workspace } }, 202);
         }
         if (reserved.status >= 300) {
-          this.sql.exec('UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE id = ?', 'held', at, id);
+          const holdPayload = reserved.value !== undefined ? JSON.stringify(reserved.value) : null;
+          this.sql.exec('UPDATE session_control_sessions SET state = ?, hold_json = ?, updated_at = ? WHERE id = ?', 'held', holdPayload, at, id);
           const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
           return finish(row, { hold: reserved.value, requested: { engine: input.engine ?? null, machine: input.machine ?? null, workspace: input.workspace } }, 409);
         }
-        this.sql.exec('UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = ?, engine = ?, state = ?, updated_at = ? WHERE id = ?',
+        this.sql.exec('UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = ?, engine = ?, state = ?, hold_json = NULL, updated_at = ? WHERE id = ?',
           reserved.value.id, reserved.value.machine ?? null, reserved.value.engine ?? null, reserved.value.state || 'offered', at, id);
         const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
         return finish(row, { replay: !!prior }, prior ? 200 : 201);
@@ -1452,7 +1584,10 @@ export class SessionControlService {
 
     if (path === '/api/sessions' && request.method === 'GET') {
       if (!writer) return response({ error: 'forbidden' }, 403);
-      this.transaction(() => reconcileUnboundFleetSessions(this.sql, this.now()));
+      this.transaction(() => {
+        reconcileUnboundFleetSessions(this.sql, this.now());
+        this.reconcileHeldSessions();
+      });
       // M15c lifecycle: additive grouped needs-action projection over the
       // canonical stores (never a second registry). Scope is authentication,
       // never a payload flag: non-admin callers always see their own actor.

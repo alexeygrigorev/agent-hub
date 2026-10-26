@@ -1565,6 +1565,7 @@ class HostHealthMonitor:
         storage_soft_bytes: Optional[int] = None,
         storage_hard_bytes: Optional[int] = None,
         proc_root: str = "/proc",
+        restart_fn: Optional[Callable[[str], bool]] = None,
     ):
         self._config_path = config_path or resolve_config_path()
         self._config_override = config
@@ -1586,7 +1587,9 @@ class HostHealthMonitor:
         self._storage_soft_bytes = storage_soft_bytes
         self._storage_hard_bytes = storage_hard_bytes
         self._proc_root = proc_root
+        self._restart_fn = restart_fn
         self._prev_processes: Optional[Dict[str, Any]] = None
+        self._last_supervisor_restart_mono: Dict[str, float] = {}
 
         self._last_run_monotonic = 0.0
         self._last_result: Optional[Dict[str, Any]] = None
@@ -1681,6 +1684,31 @@ class HostHealthMonitor:
                 merged[key] = service
         services_list = sorted(merged.values(), key=lambda row: row.get("worker") != "broken")[:16]
 
+        restarted_services: List[str] = []
+        restart_cooldown_s = float(cfg.get("runtime_cooldown_s", 600.0))
+        for svc in services_list:
+            svc_id = str(svc.get("service_id", ""))
+            svc_reason = str(svc.get("reason", ""))
+            if svc_id == "supervision" and svc_reason in ("stale_status_file", "worker_broken"):
+                last_restart = self._last_supervisor_restart_mono.get(svc_id)
+                if last_restart is None or (now_mono - last_restart) >= restart_cooldown_s:
+                    self._last_supervisor_restart_mono[svc_id] = now_mono
+                    try:
+                        if self._restart_fn is not None:
+                            if self._restart_fn(svc_id):
+                                restarted_services.append(svc_id)
+                        elif machine_id in DEFAULT_HETZNER_MACHINE_IDS:
+                            res = subprocess.run(
+                                ["systemctl", "--user", "restart", "supervision.service"],
+                                capture_output=True,
+                                text=True,
+                                timeout=10.0,
+                            )
+                            if res.returncode == 0:
+                                restarted_services.append(svc_id)
+                    except Exception:
+                        pass
+
         budget_cfg = self._budget_evidence if self._budget_evidence is not None else cfg.get("budget")
         budget_payload = collect_cloud_budget(budget_cfg, now=now_epoch)
 
@@ -1725,13 +1753,22 @@ class HostHealthMonitor:
                 self._submit_fn(payload, endpoint=endpoint)
                 posted = True
             except Exception as e:
-                errors.append(f"submit_error:{type(e).__name__}")
+                if "processes" in payload:
+                    try:
+                        fallback_payload = {k: v for k, v in payload.items() if k != "processes"}
+                        self._submit_fn(fallback_payload, endpoint=endpoint)
+                        posted = True
+                    except Exception:
+                        errors.append(f"submit_error:{type(e).__name__}")
+                else:
+                    errors.append(f"submit_error:{type(e).__name__}")
 
         result = {
             "disabled": False,
             "rate_limited": False,
             "posted": posted,
             "payload": payload,
+            "restarted_services": restarted_services,
             "errors": errors,
         }
         self._last_result = result
