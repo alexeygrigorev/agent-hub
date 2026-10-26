@@ -149,23 +149,24 @@ function joinedBases(sql: SqlStorage, sessionIds?: Set<string>): JoinedBase[] {
   const read = (table: string): any[] => {
     if (!selected) return sql.exec(`SELECT * FROM ${table} ORDER BY rowid`).toArray() as any[];
     const rows = new Map<string, any>();
-    for (let i = 0; i < selected.length; i += 50) {
-      const ids = selected.slice(i, i + 50);
-      const marks = ids.map(() => '?').join(',');
+    for (let i = 0; i < selected.length; i += 1000) {
+      const ids = selected.slice(i, i + 1000);
       const nativeId = `CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(binding_json, '$.native_id') = 'text' THEN json_extract(binding_json, '$.native_id') END END`;
       // Tuple-IN only seeks machine_id on SQLite's expression index. An
       // equality join with untyped RHS seeks the complete native identity.
       const targetNative = table === 'session_control_sessions'
         ? nativeId.replaceAll('binding_json', 'c.binding_json') : 'c.native_id';
+      const prefix = `WITH selected AS (SELECT id,fleet_launch_id,machine_id,${nativeId} AS native_id
+        FROM session_control_sessions WHERE id IN (SELECT value FROM json_each(?))) `;
       const nativeJoin = `SELECT c.rowid AS _join_order,c.* FROM
-        (SELECT DISTINCT machine_id,${nativeId} AS native_id FROM session_control_sessions WHERE id IN (${marks})) s
+        (SELECT DISTINCT machine_id,native_id FROM selected) s
         JOIN ${table} c ON c.machine_id=s.machine_id AND ${targetNative}=+s.native_id`;
       const query = table === 'session_control_sessions'
-        ? `SELECT rowid AS _join_order,* FROM ${table} WHERE id IN (${marks}) UNION ALL ${nativeJoin}`
+        ? `SELECT rowid AS _join_order,* FROM ${table} WHERE id IN (SELECT id FROM selected) UNION ALL ${nativeJoin}`
         : table === 'fleet_sessions' ? nativeJoin
         : `SELECT rowid AS _join_order,* FROM ${table} WHERE id IN
-          (SELECT fleet_launch_id FROM session_control_sessions WHERE id IN (${marks})) UNION ALL ${nativeJoin}`;
-      for (const row of sql.exec(query, ...ids, ...(table !== 'fleet_sessions' ? ids : [])).toArray() as any[]) rows.set(row.id ?? `${row.machine_id}/${row.native_id}`, row);
+          (SELECT fleet_launch_id FROM selected) UNION ALL ${nativeJoin}`;
+      for (const row of sql.exec(prefix + query, JSON.stringify(ids)).toArray() as any[]) rows.set(row.id ?? `${row.machine_id}/${row.native_id}`, row);
     }
     return [...rows.values()].sort((a, b) => a._join_order - b._join_order);
   };

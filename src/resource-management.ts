@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS resource_history_revision(id INTEGER PRIMARY KEY CHEC
 INSERT OR IGNORE INTO resource_history_revision VALUES(1,'initial');
 CREATE TABLE IF NOT EXISTS resource_evidence (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, native_id TEXT NOT NULL, reason TEXT NOT NULL, saved_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_reaps (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, machine_id TEXT NOT NULL, native_id TEXT NOT NULL, intake_id TEXT, actor TEXT NOT NULL, reason TEXT NOT NULL, freed_mb REAL, at TEXT NOT NULL, evidence_id TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS resource_reaps_native ON resource_reaps(machine_id,native_id,session_id);
 `;
 export function percentile(values: number[], p: number): number | null {
   if (!values.length) return null;
@@ -243,20 +244,60 @@ export class ResourceManagement {
       observed_at: hb.launcher_resources?.observed_at ?? hb.at ?? null };
   }
   private boundSessions(machine?: string) {
+    // Share repeated immutable JSON only within this catalog read. Protection
+    // and binding facts are always re-read on the next request.
+    const parsed = new Map<any, any>();
+    const catalogJson = (raw: any) => {
+      const key = raw || '{}';
+      if (!parsed.has(key)) parsed.set(key, parse(key));
+      return parsed.get(key);
+    };
     // Canonical binding, not tag matching; external interactive sessions can be sampled but never reaped.
-    const rows = this.sql.exec(`SELECT s.*,l.request_json AS launch_request,l.state AS launch_state,l.created_at AS launch_created,
+    const rows = this.sql.exec(`SELECT s.id,s.machine_id,s.fleet_launch_id,s.binding_json,s.request_json,s.request_key,
+      s.engine,s.mode,s.state,s.created_at,s.updated_at,l.request_json AS launch_request,l.state AS launch_state,l.created_at AS launch_created,
       l.finished_at AS launch_finished,l.model_selection_json,l.workspace AS launch_workspace
       FROM session_control_sessions s LEFT JOIN fleet_launches l ON l.id=s.fleet_launch_id
       ${machine ? 'WHERE s.machine_id=?' : ''} ORDER BY CASE WHEN s.state IN ('stopped','failed','exited','finished','dead','refused','cancelled') THEN 1 ELSE 0 END,s.updated_at DESC`, ...(machine ? [machine] : [])).toArray() as any[];
+    const launches = this.sql.exec(`SELECT id,machine_id,native_id,workspace,engine,mode,request_json,model_selection_json,state,finished_at,updated_at
+      FROM fleet_launches WHERE native_id IS NOT NULL AND native_id<>'' ${machine ? 'AND machine_id=?' : ''}`,
+      ...(machine ? [machine] : [])).toArray() as any[];
+    // Hydrate the complete alias set before selecting canonical sessions. Batch
+    // catalog facts instead of re-reading full intake histories for every alias.
+    const key = (...parts: any[]) => JSON.stringify(parts);
+    const observedByNative = new Map(this.sql.exec(`SELECT machine_id,native_id,tag,last_activity_at,created_at_ms,phase
+      FROM fleet_sessions ${machine ? 'WHERE machine_id=?' : ''}`, ...(machine ? [machine] : [])).toArray()
+      .map((r:any)=>[key(r.machine_id,r.native_id),r]));
+    const protectedIds = new Set(this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_protections'").toArray().length
+      ? this.sql.exec(`SELECT p.session_id FROM session_control_protections p JOIN session_control_sessions s ON s.id=p.session_id
+          ${machine ? 'WHERE s.machine_id=?' : ''}`, ...(machine ? [machine] : [])).toArray().map((r:any)=>r.session_id) : []);
+    const reapRows = this.sql.exec(`SELECT session_id,machine_id,native_id FROM resource_reaps ${machine ? 'WHERE machine_id=?' : ''}`,
+      ...(machine ? [machine] : [])).toArray();
+    const reapedAliases = new Set(reapRows.map((r:any)=>key(r.session_id,r.machine_id,r.native_id)));
+    const reapedNatives = new Set(reapRows.map((r:any)=>key(r.machine_id,r.native_id)));
+    const controlData = new Map(rows.flatMap(s=>{
+      const binding=catalogJson(s.binding_json);
+      if(!binding.native_id || !binding.workspace || !binding.tag) return [];
+      return [[s.id,{binding,req:catalogJson(s.request_json),launch:catalogJson(s.launch_request),model:catalogJson(s.model_selection_json)}] as const];
+    }));
+    const launchData = new Map(launches.filter(l=>l.machine_id && l.workspace && l.engine && ['headless','interactive'].includes(l.mode))
+      .map(l=>[l.id,{req:catalogJson(l.request_json),model:catalogJson(l.model_selection_json)}]));
+    const intakeIds = [...new Set([...controlData.values()].map(s=>s.req.intake_task_id || s.launch.intake_task_id)
+      .concat([...launchData.values()].map(l=>l.req.intake_task_id)).filter(Boolean))];
+    const projects = new Map<any,any>();
+    const intakeTable = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='intake_task_projection'").toArray().length
+      ? 'intake_task_projection' : 'intake_tasks';
+    for(let i=0;i<intakeIds.length;i+=100) {
+      const ids=intakeIds.slice(i,i+100);
+      for(const row of this.sql.exec(`SELECT id,json_extract(CASE WHEN json_valid(data) THEN data ELSE '{}' END,'$.project') AS project
+        FROM ${intakeTable} WHERE id IN (${ids.map(()=>'?').join(',')})`,...ids).toArray()) projects.set(row.id,row.project);
+    }
     const bound = rows.flatMap(s => {
-      const binding = parse(s.binding_json); if (!binding.native_id || !binding.workspace || !binding.tag) return [];
-      const req = parse(s.request_json), launch = parse(s.launch_request), model = parse(s.model_selection_json);
+      const data=controlData.get(s.id); if(!data) return [];
+      const {binding,req,launch,model}=data;
       const intakeId=req.intake_task_id || launch.intake_task_id || null;
-      const intakeRow:any=intakeId ? this.sql.exec('SELECT data FROM intake_tasks WHERE id=?',intakeId).toArray()[0] : null;
-      const project=parse(intakeRow?.data).project || req.project || launch.project || s.launch_workspace || binding.workspace;
-      const observed: any = this.sql.exec('SELECT last_activity_at,created_at_ms,phase FROM fleet_sessions WHERE machine_id=? AND native_id=?',s.machine_id,binding.native_id).toArray()[0];
-      const protection = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_protections'").toArray().length
-        ? this.sql.exec('SELECT 1 FROM session_control_protections WHERE session_id=?',s.id).toArray().length > 0 : false;
+      const project=projects.get(intakeId) || req.project || launch.project || s.launch_workspace || binding.workspace;
+      const observed: any = observedByNative.get(key(s.machine_id,binding.native_id));
+      const protection = protectedIds.has(s.id);
       return [{ session_id: s.id, machine_id:s.machine_id, fleet_launch_id:s.fleet_launch_id,
         observed_shadow:!s.fleet_launch_id && s.id===binding.native_id && s.request_key==='native-'+binding.native_id
           && req.provenance==='observed_native' && binding.provenance==='observed_native',
@@ -267,7 +308,7 @@ export class ResourceManagement {
         tier:req.tier || launch.tier || (s.fleet_launch_id ? policy.default_tier : null), kind:req.task_kind || launch.task_kind || 'goal',
         state:TERMINAL.has(s.state) ? s.state : s.launch_state || s.state, keep:protection || req.keep === true || launch.keep === true,
         managed:!!s.fleet_launch_id && s.mode === 'headless',
-        reaped:this.sql.exec('SELECT 1 FROM resource_reaps WHERE session_id=? AND machine_id=? AND native_id=? LIMIT 1',s.id,s.machine_id,binding.native_id).toArray().length>0,
+        reaped:reapedAliases.has(key(s.id,s.machine_id,binding.native_id)),
         last_activity_at:observed?.last_activity_at ?? null, started_at:Number.isFinite(binding.native_created_at_ms) ? new Date(binding.native_created_at_ms).toISOString() : s.launch_created || s.created_at,
         finished_at:s.launch_finished || (TERMINAL.has(s.state) ? s.updated_at : null) }];
     });
@@ -275,22 +316,18 @@ export class ResourceManagement {
     // host-confirmed native identity still needs resource accounting. These
     // entries are accounting only: they create no control binding and grant
     // no new watchdog stop authority, including when an intake is attached.
-    const launches = this.sql.exec(`SELECT * FROM fleet_launches
-      WHERE native_id IS NOT NULL AND native_id<>'' ${machine ? 'AND machine_id=?' : ''}`,
-      ...(machine ? [machine] : [])).toArray() as any[];
     const shadowIds=new Map(bound.filter(s=>s.observed_shadow).map(s=>[JSON.stringify([s.machine_id,s.native_id]),s.session_id]));
     const fleetOnly = launches.flatMap(l => {
       if (!l.machine_id || !l.workspace || !l.engine || !['headless','interactive'].includes(l.mode)) return [];
-      const req=parse(l.request_json), model=parse(l.model_selection_json);
-      const observed:any=this.sql.exec('SELECT tag,last_activity_at,created_at_ms FROM fleet_sessions WHERE machine_id=? AND native_id=?',l.machine_id,l.native_id).toArray()[0];
+      const {req,model}=launchData.get(l.id)!;
+      const observed:any=observedByNative.get(key(l.machine_id,l.native_id));
       const intakeId=req.intake_task_id || null;
-      const intake:any=intakeId ? this.sql.exec('SELECT data FROM intake_tasks WHERE id=?',intakeId).toArray()[0] : null;
       return [{session_id:shadowIds.get(JSON.stringify([l.machine_id,l.native_id])) ?? 'fleet:'+l.id,machine_id:l.machine_id,fleet_launch_id:l.id,observed_shadow:false,
         intake_id:intakeId,native_id:l.native_id,tag:observed?.tag || (l.mode==='headless' ? 'task-hub-' : 'hub-')+l.id,
         workspace:l.workspace,native_created_at_ms:observed?.created_at_ms ?? null,
-        engine:l.engine,mode:l.mode,model:model.model ?? null,project:parse(intake?.data).project || req.project || l.workspace,
+        engine:l.engine,mode:l.mode,model:model.model ?? null,project:projects.get(intakeId) || req.project || l.workspace,
         tier:req.tier || policy.default_tier,kind:req.task_kind || 'goal',state:l.state,keep:req.keep===true,managed:false,
-        reaped:this.sql.exec('SELECT 1 FROM resource_reaps WHERE machine_id=? AND native_id=? LIMIT 1',l.machine_id,l.native_id).toArray().length>0,
+        reaped:reapedNatives.has(key(l.machine_id,l.native_id)),
         last_activity_at:observed?.last_activity_at ?? null,
         // The request may have queued for hours; it is not a native start time.
         started_at:Number.isFinite(observed?.created_at_ms) ? new Date(observed.created_at_ms).toISOString() : null,
@@ -299,23 +336,31 @@ export class ResourceManagement {
     return [...bound,...fleetOnly];
   }
   private canonicalSessions(machine?: string) {
-    const groups=new Map<string,ReturnType<ResourceManagement['boundSessions']>>();
-    for(const session of this.boundSessions(machine)) {
-      const key=JSON.stringify([session.machine_id,session.native_id]);
-      if(!groups.has(key)) groups.set(key,[]);
-      groups.get(key)!.push(session);
+    type Bound = ReturnType<ResourceManagement['boundSessions']>[number];
+    const groups = new Map<string, {canonical: Bound; keep: boolean; reaped: boolean; aliases: Set<string>}>();
+    for (const session of this.boundSessions(machine)) {
+      const key = JSON.stringify([session.machine_id,session.native_id]);
+      let group = groups.get(key);
+      if (!group) {
+        group = {canonical:session,keep:false,reaped:false,aliases:new Set()};
+        groups.set(key,group);
+      }
+      // Keep the first managed alias, otherwise the first non-shadow alias.
+      const old = group.canonical;
+      if (!old.managed && (session.managed || (old.observed_shadow && !session.observed_shadow))) group.canonical=session;
+      // Every explicit interactive alias and protection protects the native,
+      // even when a different alias supplies its canonical metadata.
+      group.keep ||= session.keep || (session.mode==='interactive' && !session.observed_shadow);
+      group.reaped ||= session.reaped;
+      group.aliases.add(session.session_id);
+      if (session.fleet_launch_id) group.aliases.add('fleet:'+session.fleet_launch_id);
     }
-    return [...groups.values()].map(aliases=>{
-      // Imported observations can precede the real Fleet binding. Their inferred
-      // interactive mode is not an operator request; explicit interactive aliases
-      // and every keep/protection flag still protect the physical native worker.
-      const canonical=aliases.find(s=>s.managed) ?? aliases.find(s=>!s.observed_shadow) ?? aliases[0];
-      const {observed_shadow,...session}=canonical;
-      const protectedNative=aliases.some(s=>s.keep || (s.mode==='interactive' && !s.observed_shadow));
-      return {...session,keep:protectedNative,managed:session.managed && !protectedNative,
-        reaped:aliases.some(s=>s.reaped),aliases:[...new Set(aliases.flatMap(s=>s.fleet_launch_id ? [s.session_id,'fleet:'+s.fleet_launch_id] : [s.session_id]))]};
-    }).sort((a,b)=>Number(TERMINAL.has(a.state))-Number(TERMINAL.has(b.state))
-      || Date.parse(b.finished_at || b.started_at)-Date.parse(a.finished_at || a.started_at));
+    return [...groups.values()].map(group=>{
+      const {observed_shadow,...session}=group.canonical;
+      return {session:{...session,keep:group.keep,managed:session.managed && !group.keep,
+        reaped:group.reaped,aliases:[...group.aliases]},
+        terminal:Number(TERMINAL.has(session.state)),at:Date.parse(session.finished_at || session.started_at)};
+    }).sort((a,b)=>a.terminal-b.terminal || b.at-a.at).map(row=>row.session);
   }
   sessions(machine?: string) {
     return this.canonicalSessions(machine).slice(0,1000).map(({aliases,...session})=>session);

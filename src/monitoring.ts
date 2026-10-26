@@ -309,7 +309,9 @@ export type HostHealthSummary = {
   placement?: HostPlacement;
 };
 
+type TrendSample = {timeMs:number;usedBytes:number;totalBytes:number;percent:number};
 export class MonitoringService {
+  private trendCache = new Map<string,{revision:string;samples:Map<string,TrendSample[]>}>();
   constructor(
     private sql: SqlStorage,
     private tx: <T>(fn: () => T) => T,
@@ -320,6 +322,7 @@ export class MonitoringService {
   ) {}
 
   init(): void {
+    this.trendCache.clear();
     for (const stmt of MONITORING_SCHEMA.split(';')) {
       const trimmed = stmt.trim();
       if (trimmed) this.sql.exec(trimmed);
@@ -330,6 +333,16 @@ export class MonitoringService {
       used_bytes,total_bytes,percent,PRIMARY KEY(id,ordinal))`);
     this.sql.exec('CREATE INDEX IF NOT EXISTS disk_trend_machine_time ON disk_trend_samples(machine_id,observed_at_ms,observation_rowid,ordinal)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS disk_trend_projection_meta(id INTEGER PRIMARY KEY)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS disk_trend_revision(machine_id TEXT PRIMARY KEY,revision TEXT NOT NULL)');
+    // One invalidation per observation, not per filesystem. Random revisions
+    // cannot collide with a cached generation after rollback and another write.
+    for(const op of ['INSERT','UPDATE','DELETE']) {
+      const sides=op==='UPDATE'?['NEW','OLD']:op==='INSERT'?['NEW']:['OLD'];
+      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS disk_trend_revision_${op.toLowerCase()} AFTER ${op} ON disk_observations BEGIN
+        ${sides.map(side=>`INSERT INTO disk_trend_revision(machine_id,revision) SELECT ${side}.machine_id,lower(hex(randomblob(16)))
+          WHERE ${op==='UPDATE' && side==='OLD' ? 'OLD.machine_id!=NEW.machine_id' : '1'}
+          ON CONFLICT(machine_id) DO UPDATE SET revision=excluded.revision;`).join('')} END`);
+    }
     const project = (prefix: string, from: string) => `SELECT ${prefix}id,e.key,${prefix}rowid,${prefix}machine_id,${prefix}observed_at_ms,
       json_extract(e.value,'$.mount_point'),
       CASE WHEN json_type(e.value,'$.used_bytes') IN ('integer','real') THEN json_extract(e.value,'$.used_bytes') END,
@@ -343,6 +356,8 @@ export class MonitoringService {
     this.sql.exec('CREATE TRIGGER IF NOT EXISTS disk_trend_delete AFTER DELETE ON disk_observations BEGIN DELETE FROM disk_trend_samples WHERE id=OLD.id; END');
     if (!this.sql.exec('SELECT id FROM disk_trend_projection_meta WHERE id=1').toArray().length) {
       this.sql.exec(`INSERT OR REPLACE INTO disk_trend_samples ${project('d.', 'disk_observations d, ')}`);
+      this.sql.exec(`INSERT INTO disk_trend_revision SELECT machine_id,lower(hex(randomblob(16))) FROM (SELECT DISTINCT machine_id FROM disk_observations) WHERE 1
+        ON CONFLICT(machine_id) DO UPDATE SET revision=excluded.revision`);
       this.sql.exec('INSERT INTO disk_trend_projection_meta VALUES(1)');
     }
   }
@@ -1019,23 +1034,30 @@ export class MonitoringService {
 
   /** Compute growth trend per day for a filesystem on a machine. */
   /** Read numeric trend inputs once per host, never full consumer histories. */
-  private trendSamples(machineId: string, now: number): Map<string, {timeMs:number;usedBytes:number;totalBytes:number;percent:number}[]> | null {
+  private trendSamples(machineId: string, now: number): Map<string, TrendSample[]> | null {
     try {
-      const rows = this.sql.exec(`SELECT id,observed_at_ms,mount_point,used_bytes,total_bytes,percent
-        FROM disk_trend_samples WHERE machine_id=? AND observed_at_ms>=?
-        ORDER BY observed_at_ms,observation_rowid,ordinal`, machineId, now-DISK_LIMITS.maxTrendWindowMs).toArray() as any[];
-      const result = new Map<string, {timeMs:number;usedBytes:number;totalBytes:number;percent:number}[]>();
-      const seen = new Set<string>();
-      for (const row of rows) {
-        const key = JSON.stringify([row.id,row.mount_point]);
-        if (seen.has(key)) continue;
-        seen.add(key); // Preserve first-mount semantics even if its numbers are invalid.
-        if (!Number.isSafeInteger(row.used_bytes) || !Number.isSafeInteger(row.total_bytes)) continue;
-        const samples = result.get(row.mount_point) ?? [];
-        samples.push({timeMs:row.observed_at_ms,usedBytes:row.used_bytes,totalBytes:row.total_bytes,percent:row.percent});
-        result.set(row.mount_point,samples);
+      const revision=String(this.sql.exec('SELECT revision FROM disk_trend_revision WHERE machine_id=?',machineId).toArray()[0]?.revision ?? 'initial');
+      let cached=this.trendCache.get(machineId);
+      if(!cached || cached.revision!==revision) {
+        const rows=this.sql.exec(`SELECT id,observed_at_ms,mount_point,used_bytes,total_bytes,percent
+          FROM disk_trend_samples WHERE machine_id=? ORDER BY observed_at_ms,observation_rowid,ordinal`,machineId).toArray() as any[];
+        const samples=new Map<string,TrendSample[]>(),seen=new Set<string>();
+        for(const row of rows) {
+          const key=JSON.stringify([row.id,row.mount_point]);
+          if(seen.has(key)) continue;
+          seen.add(key); // First-mount semantics include an invalid first mount.
+          if(!Number.isSafeInteger(row.used_bytes) || !Number.isSafeInteger(row.total_bytes)) continue;
+          const values=samples.get(row.mount_point) ?? [];
+          values.push({timeMs:row.observed_at_ms,usedBytes:row.used_bytes,totalBytes:row.total_bytes,percent:row.percent});
+          samples.set(row.mount_point,values);
+        }
+        cached={revision,samples};
+        if(this.trendCache.size>=128) this.trendCache.clear();
+        this.trendCache.set(machineId,cached);
       }
-      return result;
+      // Cache retained facts only. The window and freshness advance on every
+      // call, and an earlier explicit now can still see its original history.
+      return new Map([...cached.samples].map(([mount,samples])=>[mount,samples.filter(s=>s.timeMs>=now-DISK_LIMITS.maxTrendWindowMs)]));
     } catch { return null; }
   }
 

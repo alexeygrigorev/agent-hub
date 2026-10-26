@@ -234,6 +234,7 @@ export class Hub extends DurableObject {
     this.hostHistoryService = new HostHistoryService(this.sql, this.fleetService);
     this.hostHistoryService.init();
     this.statusService.setMonitoringService(this.monitoringService);
+    this.statusService.initLifecycleCache();
 
     const busForJobs = Object.create(this.busService);
     const runInTxn = (this.ctx.storage as any).transactionSync ? (fn: any) => (this.ctx.storage as any).transactionSync(fn) : (fn: any) => fn();

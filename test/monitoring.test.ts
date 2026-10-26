@@ -37,15 +37,32 @@ describe('Disk Monitoring Service', () => {
     const payload = (used: any) => JSON.stringify({filesystems:[{mount_point:'/',is_primary:true,total_bytes:100,used_bytes:used,percent:used}]});
     const insert = (id: string, ago: number, data: string) => sql.exec('INSERT INTO disk_observations VALUES(?,?,?,?,?,?,?)',id,'trend-host',iso(ago),now-ago*1000,iso(0),data,'test');
     insert('old',7200,payload(50)); insert('new',0,payload(60));
-    const trend = () => hub.monitoringService.getDiskStatus(now,'trend-host').machines[0].filesystems[0].trend;
+    const trend = (at=now) => hub.monitoringService.getDiskStatus(at,'trend-host').machines[0].filesystems[0].trend;
+    expect(trend()).toMatchObject({state:'calculated',sample_count:2,growth_bytes_per_day:120});
+    expect(trend(now+25*3600000)).toMatchObject({state:'stale',reason:'latest_sample_stale'});
+    expect(trend(now+8*86400000)).toMatchObject({state:'insufficient_history',reason:'insufficient_samples'});
     expect(trend()).toMatchObject({state:'calculated',sample_count:2,growth_bytes_per_day:120});
     sql.exec('UPDATE disk_observations SET payload_json=? WHERE id=?',payload(40),'old');
     expect(trend()).toMatchObject({sample_count:2,growth_bytes_per_day:240});
     expect(()=> (hub as any).ctx.storage.transactionSync(()=>{
       sql.exec('UPDATE disk_observations SET payload_json=? WHERE id=?',payload(30),'old');
+      expect(trend()).toMatchObject({growth_bytes_per_day:360});
       throw new Error('abort trend update');
     })).toThrow('abort trend update');
     expect(trend()).toMatchObject({sample_count:2,growth_bytes_per_day:240});
+    expect(()=> (hub as any).ctx.storage.transactionSync(()=>{
+      sql.exec('UPDATE disk_observations SET payload_json=? WHERE id=?',payload(20),'old');
+      expect(trend()).toMatchObject({growth_bytes_per_day:480});
+      throw new Error('rollback generation');
+    })).toThrow('rollback generation');
+    // No read between rollback and write: a reused counter would retain 480.
+    sql.exec('UPDATE disk_observations SET payload_json=? WHERE id=?',payload(30),'old');
+    expect(trend()).toMatchObject({growth_bytes_per_day:360});
+    sql.exec('UPDATE disk_observations SET payload_json=? WHERE id=?',payload(40),'old');
+    sql.exec("UPDATE disk_observations SET machine_id='moved-host' WHERE id='old'");
+    expect(trend()).toMatchObject({state:'insufficient_history'});
+    sql.exec("UPDATE disk_observations SET machine_id='trend-host' WHERE id='old'");
+    expect(trend()).toMatchObject({growth_bytes_per_day:240});
     const duplicates = {filesystems:[{mount_point:'/',used_bytes:'40',total_bytes:100,percent:40},{mount_point:'/',used_bytes:40,total_bytes:100,percent:40}]};
     sql.exec('UPDATE disk_observations SET payload_json=? WHERE id=?',JSON.stringify(duplicates),'old');
     expect(trend()).toMatchObject({state:'insufficient_history',reason:'insufficient_samples'});

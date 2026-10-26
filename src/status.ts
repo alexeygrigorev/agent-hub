@@ -245,6 +245,58 @@ export class StatusService {
     }))];
   }
 
+  private lifecycleCacheReady = false;
+  private lifecycleRevision: string | null = null;
+  private lifecycleInputs = new Map<string, ReturnType<typeof buildSessionInputs>>();
+
+  /** Called after Hub has initialized every canonical input table. */
+  initLifecycleCache(): void {
+    this.lifecycleCacheReady = false;
+    this.lifecycleRevision = null;
+    this.lifecycleInputs.clear();
+    this.sql.exec('CREATE TABLE IF NOT EXISTS status_lifecycle_revision(id INTEGER PRIMARY KEY CHECK(id=1),revision TEXT NOT NULL)');
+    this.sql.exec("INSERT OR IGNORE INTO status_lifecycle_revision VALUES(1,lower(hex(randomblob(16))))");
+    for (const table of ['session_control_sessions','fleet_launches','fleet_sessions','session_control_protections',
+      'session_lifecycle_observations','intake_task_projection','credentials']) {
+      for (const op of ['INSERT','UPDATE','DELETE']) {
+        // Authentication restamps last_used_at on every request. Only creator
+        // provenance fields are inputs to the lifecycle ownership calculation.
+        const event = table === 'credentials' && op === 'UPDATE'
+          ? 'UPDATE OF id,kind,actor,subject,created_by_sub,family_id' : op;
+        this.sql.exec(`CREATE TRIGGER IF NOT EXISTS status_lifecycle_${table}_${op.toLowerCase()}
+          AFTER ${event} ON ${table} BEGIN
+          UPDATE status_lifecycle_revision SET revision=lower(hex(randomblob(16))) WHERE id=1; END`);
+      }
+    }
+    this.lifecycleCacheReady = true;
+  }
+
+  private readLifecycleInputs(sessionIds?: Set<string>): ReturnType<typeof buildSessionInputs> {
+    if (!this.lifecycleCacheReady || !sessionIds) return buildSessionInputs(this.sql,sessionIds);
+    // Random durable generations invalidate reads made inside rolled-back
+    // transactions as well as later writes (a counter can repeat after rollback).
+    const revision = this.one('SELECT revision FROM status_lifecycle_revision WHERE id=1')?.revision;
+    if (typeof revision !== 'string' || !revision) {
+      this.lifecycleRevision = null; this.lifecycleInputs.clear();
+      return buildSessionInputs(this.sql,sessionIds);
+    }
+    if (revision !== this.lifecycleRevision) {
+      this.lifecycleRevision = revision;
+      this.lifecycleInputs.clear();
+    }
+    const key = JSON.stringify([...sessionIds].sort());
+    const cached = this.lifecycleInputs.get(key);
+    if (cached) return cached;
+    const value = buildSessionInputs(this.sql,sessionIds);
+    // These normalized facts contain no request/prompt bodies. Large pages
+    // still work but do not displace an unbounded amount of isolate memory.
+    if (value.inputs.length > 0 && value.inputs.length <= 2048 && sessionIds.size <= 2048) {
+      if (this.lifecycleInputs.size >= 4) this.lifecycleInputs.delete(this.lifecycleInputs.keys().next().value!);
+      this.lifecycleInputs.set(key,value);
+    }
+    return value;
+  }
+
   private gate?: HostObservationGate;
   private monitoringService?: MonitoringService;
 
@@ -322,7 +374,7 @@ export class StatusService {
     const ids = [...sessionIds];
     for (let i = 0; i < ids.length; i += 100) {
       const chunk = ids.slice(i, i + 100);
-      for (const row of this.rows(`SELECT * FROM session_control_sessions WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk)) sessionRows.set(row.id, row);
+      for (const row of this.rows(`SELECT id,actor,state,machine_id,engine,mode,fleet_launch_id,binding_json,updated_at FROM session_control_sessions WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk)) sessionRows.set(row.id, row);
     }
     const lifecycleBySession = sessionIds.size ? this.lifecycleBySessionId(now, sessionIds) : new Map<string, Obj>();
     const items = tasks.map(task => this.taskDto(task, p, machines, now, nowIso, sinceMs, hostFilter, lifecycleBySession, aliases, sessionRows));
@@ -483,7 +535,7 @@ export class StatusService {
   }
 
   async handle(request: Request, authenticate: () => Promise<Auth>): Promise<Response> {
-    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff', 'X-Hub-Status-Projection': 'resource-disk-v1' } });
+    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff', 'X-Hub-Status-Projection': 'resource-disk-v2' } });
     try {
       if (request.method !== 'GET') return json({ error: 'method_not_allowed' }, 405);
       const auth = await authenticate();
@@ -545,7 +597,7 @@ export class StatusService {
    * Cookie callers pass the existing session CSRF (enforced by Hub auth
    * before this handler, as for every POST). */
   async handlePost(request: Request, authenticate: () => Promise<Auth>): Promise<Response> {
-    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff', 'X-Hub-Status-Projection': 'resource-disk-v1' } });
+    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff', 'X-Hub-Status-Projection': 'resource-disk-v2' } });
     try {
       if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
       const auth = await authenticate();
@@ -917,7 +969,7 @@ export class StatusService {
   private lifecycleBySessionId(now: number, sessionIds?: Set<string>): Map<string, Obj> {
     const out = new Map<string, Obj>();
     try {
-      const { inputs, refs } = buildSessionInputs(this.sql, sessionIds);
+      const { inputs, refs } = this.readLifecycleInputs(sessionIds);
       const decisions = new Map<string, Obj[]>();
       try {
         const keys = [...refs.keys()];

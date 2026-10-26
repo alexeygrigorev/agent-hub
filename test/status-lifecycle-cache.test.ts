@@ -1,0 +1,106 @@
+import { expect, it } from 'vitest';
+import { env, runInDurableObject } from 'cloudflare:test';
+import { buildSessionInputs } from '../src/session_lifecycle_registry';
+import { StatusService } from '../src/status';
+
+const inDO: any = runInDurableObject;
+const id = '00000000-0000-4000-8000-000000000001';
+const launch = '00000000-0000-4000-8000-000000000002';
+
+function seed(h: any) {
+  const now = new Date().toISOString();
+  h.sql.exec("INSERT INTO machines(id,name,hostname,registered_at) VALUES('cache-host','cache-host','cache-host',?)",now);
+  h.sql.exec(`INSERT INTO credentials(id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at)
+    VALUES('cache-owner','human','cache-hash','cache-family','owner','human:owner','[]','owner',?,?)`,now,now);
+  h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,session_type,state,binding_json,fleet_launch_id,owner_token_id,owner_family,created_at,updated_at)
+    VALUES(?,'human:owner','cache','{}','cache-host','codex','headless','headless','running',?,?,'cache-owner','cache-family',?,?)`,
+    id,JSON.stringify({native_id:'cache-native',workspace:'/cache',tag:'cache-tag',native_created_at_ms:Date.now()}),launch,now,now);
+  h.sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at)
+    VALUES(?,'human:owner','human','cache','cache','{}','cache-host','codex','default','headless','/cache','cache','running','cache-native',?,?)`,launch,now,now);
+  h.sql.exec(`INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,last_activity_at,workspace)
+    VALUES('cache-host','cache-native','cache-tag','codex','running','working',?,?,'/cache')`,now,now);
+  h.sql.exec("INSERT INTO intake_tasks VALUES('cache-task',?)",JSON.stringify({id:'cache-task',project:'cache',status:'open',history:[{kind:'link',hub_session_id:id}]}));
+  h.sql.exec("INSERT INTO session_lifecycle_observations VALUES('cache-host/cache-native','cache-host','cache-native',?,'{}')",now);
+  return Date.parse(now);
+}
+
+it('invalidates warmed lifecycle facts for every source write and preserves creator protections',async()=>{
+  const stub=(env as any).HUB.get((env as any).HUB.idFromName('cache-writes'));
+  await inDO(stub,(h:any)=>{
+    seed(h);
+    const service:any=h.statusService;
+    const ids=new Set([id]);
+    const read=()=>service.readLifecycleInputs(ids);
+    const normalized=(value:any)=>({inputs:value.inputs,refs:[...value.refs]});
+    const fresh=()=>normalized(buildSessionInputs(h.sql,ids));
+    expect(read().refs.get('cache-host/cache-native').protected_session).toBe(false);
+    h.sql.exec("UPDATE credentials SET family_id='other' WHERE id='cache-owner'");
+    expect(read().refs.get('cache-host/cache-native').protected_session).toBe(true);
+    h.sql.exec("UPDATE credentials SET family_id='cache-family' WHERE id='cache-owner'");
+    expect(read().refs.get('cache-host/cache-native').protected_session).toBe(false);
+    const warm=read();
+    h.sql.exec("UPDATE credentials SET last_used_at=? WHERE id='cache-owner'",new Date().toISOString());
+    expect(read()).toBe(warm);
+    h.sql.exec("INSERT INTO session_control_protections(session_id,actor,request_key,created_at) VALUES(?,'human:owner','keep',?)",id,new Date().toISOString());
+    expect(read().refs.get('cache-host/cache-native').protected_session).toBe(true);
+    const sources=[
+      ['session_control_sessions','id',id,'state','stopped'],
+      ['fleet_launches','id',launch,'state','failed'],
+      ['fleet_sessions','native_id','cache-native','phase','stopped'],
+      ['session_control_protections','session_id',id,'request_key','keep updated'],
+      ['session_lifecycle_observations','session_key','cache-host/cache-native','payload_json','{"awaiting_alexey":true}'],
+      ['intake_task_projection','id','cache-task','links',JSON.stringify([{kind:'link',hub_session_id:id},{kind:'report',reference:'cache-report'}])],
+      ['credentials','id','cache-owner','family_id','other-family'],
+    ];
+    for(const [table,pk,key,column,value] of sources) {
+      let before=read();
+      h.sql.exec(`UPDATE ${table} SET ${column}=? WHERE ${pk}=?`,value,key);
+      expect(read(),table+' UPDATE').not.toBe(before);
+      expect(normalized(read())).toEqual(fresh());
+      const row=h.sql.exec(`SELECT * FROM ${table} WHERE ${pk}=?`,key).toArray()[0];
+      before=read();
+      h.sql.exec(`DELETE FROM ${table} WHERE ${pk}=?`,key);
+      expect(read(),table+' DELETE').not.toBe(before);
+      expect(normalized(read())).toEqual(fresh());
+      before=read();
+      const columns=Object.keys(row);
+      h.sql.exec(`INSERT INTO ${table}(${columns.join(',')}) VALUES(${columns.map(()=>'?').join(',')})`,...columns.map(k=>row[k]));
+      expect(read(),table+' INSERT').not.toBe(before);
+      expect(normalized(read())).toEqual(fresh());
+    }
+  });
+});
+
+it('keeps decisions and time live, survives rollback ABA, and bypasses absent initialization',async()=>{
+  const stub=(env as any).HUB.get((env as any).HUB.idFromName('cache-time'));
+  await inDO(stub,(h:any)=>{
+    const now=seed(h),service:any=h.statusService,ids=new Set([id]);
+    const read=()=>service.readLifecycleInputs(ids);
+    const initial=read();
+    expect(service.readLifecycleInputs(new Set([id]))).toBe(initial);
+    const first=service.lifecycleBySessionId(now,ids).get(id);
+    const later=service.lifecycleBySessionId(now+86400000,ids).get(id);
+    expect(later).not.toEqual(first);
+    expect(read()).toBe(initial);
+    h.sql.exec("INSERT INTO session_lifecycle_decisions(session_key,decision_id,kind,actor,reason,created_at) VALUES('cache-host/cache-native','cache-decision','drop','human:owner','new decision',?)",new Date(now).toISOString());
+    expect(service.lifecycleBySessionId(now,ids).get(id).decision.kind).toBe('drop');
+    expect(read()).toBe(initial);
+    expect(()=>h.ctx.storage.transactionSync(()=>{
+      h.sql.exec("UPDATE fleet_sessions SET engine='claude' WHERE native_id='cache-native'");
+      expect(read().inputs[0].engine).toBe('claude');
+      throw new Error('rollback cache read');
+    })).toThrow('rollback cache read');
+    // No intervening read: a reused monotonic generation could wrongly hit.
+    h.sql.exec("UPDATE fleet_sessions SET engine='opencode' WHERE native_id='cache-native'");
+    expect(read().inputs[0].engine).toBe('opencode');
+    const uncached:any=new StatusService(h.sql,(fn:any)=>fn(),h.intakeService);
+    expect(uncached.readLifecycleInputs(ids)).not.toBe(uncached.readLifecycleInputs(ids));
+    service.initLifecycleCache();
+    expect(read()).not.toBe(initial);
+    h.sql.exec('DELETE FROM status_lifecycle_revision');
+    const missing=read();
+    h.sql.exec("UPDATE fleet_sessions SET engine='codex' WHERE native_id='cache-native'");
+    expect(read()).not.toBe(missing);
+    expect(read().inputs[0].engine).toBe('codex');
+  });
+});
