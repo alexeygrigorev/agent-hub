@@ -135,7 +135,6 @@ describe('generic accounts and launch placement', () => {
     const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
     await s.handle(request('/subscriptions', { subscriptions: [{ service: 'codex', account: 'shared-codex', plan: 'pro', quota }] }, 'PUT'), host('hetzner'));
     expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).selected?.profile).toBe('secondary');
-    expect(sql.exec('SELECT started_at FROM resource_ramps WHERE launch_id=?', first.value.id).one().started_at).toBe(iso());
     sql.exec("UPDATE fleet_accounts SET provider='zai' WHERE label='shared-codex'");
     expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).selected).toBeNull();
     expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'tier_unavailable' });
@@ -176,6 +175,7 @@ describe('generic accounts and launch placement', () => {
       expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', first.value.id).one().state).toBe('offered');
     }
     expect((await s.handle(request('/launches/' + first.value.id + '/claim', { ...claim, model: 'gpt-6-astra' }), host('hetzner'))).status).toBe(200);
+    expect(sql.exec('SELECT started_at FROM resource_ramps WHERE launch_id=?', first.value.id).one().started_at).toBe(iso());
     sql.exec("UPDATE fleet_accounts SET provider='zai' WHERE label='shared-codex'");
     expect(s.plan(input).selected).toBeNull();
   }));
