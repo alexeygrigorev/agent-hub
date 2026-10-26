@@ -782,8 +782,12 @@ export class FleetService {
         this.sql.exec("UPDATE fleet_launches SET state = 'expired', updated_at = ? WHERE id = ? AND state = 'queued'", nowIso, row.id);
         expired++;
       }
-      const rows = this.sql.exec("SELECT * FROM fleet_launches WHERE state = 'queued' ORDER BY rowid LIMIT ?", limit).toArray() as any[];
+      // Resource management (intake 4fcd3139): scan past unplaceable heads
+      // (scope/admission holds, goal-only routes) so they cannot block the
+      // whole queue; `limit` caps promotions per drain, not rows examined.
+      const rows = this.sql.exec("SELECT * FROM fleet_launches WHERE state = 'queued' ORDER BY rowid LIMIT ?", Math.max(limit, 200)).toArray() as any[];
       for (const row of rows) {
+        if (promoted >= limit) break;
         let bound: any = null;
         try { bound = JSON.parse(row.request_json); } catch { continue; }
         if (!bound || typeof bound !== 'object') continue;
