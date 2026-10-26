@@ -61,33 +61,47 @@ def collect_accounts(settings, *, runner=None):
         if not isinstance(managed, list):
             managed = []
         now = datetime.datetime.now(datetime.timezone.utc)
-        # Index personal results by (provider, account): dispatch executes the
-        # managed HOME credential, so a managed observation for the identical
-        # pair must replace the personal server-local probe (wrong-account-key
-        # fix for intake f6709905: label collision hid a managed 401 behind a
-        # fresh personal token, routing /goal starts at a dead account while
-        # `hub quota` looked fresh). A managed pair that differs from every
-        # personal pair (e.g. managed (codex, codex-orin) vs personal
-        # (codex-orin, codex-orin)) is an additional dispatchable route and is
-        # appended, never dropped on bare-label collision.
-        by_pair = {}
+        # Merge managed observations by canonical account: dispatch executes
+        # the managed HOME credential, so a managed observation must replace
+        # the personal server-local probe for the same fleet account
+        # (wrong-account-key fix for intake f6709905: bare-label collision
+        # hid a managed 401 behind a fresh personal token, routing /goal
+        # starts at a dead account while `hub quota` looked fresh). The
+        # server dedupes snapshots on canonical account alone
+        # (src/quota.ts putServerSnapshot: duplicate_account 400), so the
+        # payload must carry unique accounts: managed (codex, codex-orin)
+        # replaces personal (codex-orin, codex-orin) in place instead of
+        # appending a second `codex-orin` row. Canonicalization mirrors the
+        # server (codex-orin provider -> codex; urgent-muse account ->
+        # shared-go); every row stays sanitized, no raw material crosses.
+        def _canonical_provider(p):
+            return 'codex' if p == 'codex-orin' else p
+        def _canonical_account(a):
+            return 'shared-go' if a == 'urgent-muse' else a
+        by_account = {}
         for idx, row in enumerate(results):
-            if isinstance(row, dict):
-                by_pair[(row.get('provider'), row.get('account'))] = idx
+            if isinstance(row, dict) and isinstance(row.get('account'), str):
+                by_account.setdefault(_canonical_account(row['account']), idx)
+        managed_seen = set()
         for entry in entries:
             if not isinstance(entry, dict):
                 raise ValueError('Invalid managed account catalog')
             label, provider = entry.get('label'), entry.get('provider')
             if not isinstance(label, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', label) or provider not in quota_snapshot.ALLOWED_PROVIDERS:
                 raise ValueError('Invalid managed account catalog')
-            pair = (provider, label)
+            key = _canonical_account(label)
+            if key in managed_seen:
+                raise ValueError('Invalid managed account catalog')
+            managed_seen.add(key)
             row = next((r for r in managed if isinstance(r, dict) and r.get('account') == label and r.get('provider') == provider), {})
             quota = quota_snapshot.sanitize_provider(provider, row.get('quota'), now)
-            if pair in by_pair:
-                results[by_pair[pair]] = {'account': label, 'provider': provider, 'quota': quota}
+            if key in by_account:
+                results[by_account[key]] = {'account': label, 'provider': provider, 'quota': quota}
                 continue
+            if len(results) >= 32:
+                raise ValueError('Too many account observations')
             seen.add(label)
-            by_pair[pair] = len(results)
+            by_account[key] = len(results)
             results.append({'account': label, 'provider': provider, 'quota': quota})
     return {'captured_at': quota_snapshot.format_iso_utc(datetime.datetime.now(datetime.timezone.utc)), 'accounts': results}
 

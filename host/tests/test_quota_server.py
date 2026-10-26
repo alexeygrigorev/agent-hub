@@ -86,9 +86,11 @@ class ServerQuotaTests(unittest.TestCase):
     def test_managed_pair_replaces_personal_probe_on_same_key(self):
         """Wrong-account-key regression (intake f6709905): a managed 401 for
         (codex, shared-codex) must replace the fresh personal server-local
-        probe for the identical pair, so `hub quota` no longer routes /goal
-        starts at a dead account. A managed (codex, codex-orin) pair that
-        differs from personal (codex-orin, codex-orin) is appended."""
+        probe for the same fleet account, so `hub quota` no longer routes
+        /goal starts at a dead account. Managed (codex, codex-orin) likewise
+        replaces personal (codex-orin, codex-orin) in place: the server
+        dedupes snapshots on account alone (duplicate_account 400), so the
+        payload must carry unique accounts."""
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / 'state.json'
             state.write_text(json.dumps([
@@ -116,10 +118,27 @@ class ServerQuotaTests(unittest.TestCase):
                                       {'provider': 'codex-orin', 'account': 'codex-orin'}],
                         'managed_state_file': str(state)}
             payload = quota_server.collect_accounts(settings, runner=runner)
-            by_pair = {(r['provider'], r['account']): r for r in payload['accounts']}
-            # Identical pair: managed 401 replaces the misleading fresh probe.
-            self.assertEqual(by_pair[('codex', 'shared-codex')]['quota']['status'], 'error')
-            # Distinct managed pair is appended alongside the personal route.
-            self.assertEqual(by_pair[('codex', 'codex-orin')]['quota']['status'], 'ok')
-            self.assertEqual(by_pair[('codex', 'codex-orin')]['quota']['windows']['7d']['percent_remaining'], 54.0)
-            self.assertEqual(by_pair[('codex-orin', 'codex-orin')]['quota']['status'], 'ok')
+            accounts = [r['account'] for r in payload['accounts']]
+            # Server rejects duplicate accounts: payload must stay unique.
+            self.assertEqual(len(accounts), len(set(accounts)))
+            by_account = {r['account']: r for r in payload['accounts']}
+            # Same fleet account: managed 401 replaces the misleading fresh probe.
+            self.assertEqual(by_account['shared-codex']['quota']['status'], 'error')
+            self.assertEqual(by_account['shared-codex']['provider'], 'codex')
+            # codex-orin is one fleet account: managed (codex) replaces the
+            # legacy personal (codex-orin) route key in place.
+            self.assertEqual(by_account['codex-orin']['quota']['status'], 'ok')
+            self.assertEqual(by_account['codex-orin']['provider'], 'codex')
+            self.assertEqual(by_account['codex-orin']['quota']['windows']['7d']['percent_remaining'], 54.0)
+
+    def test_managed_duplicate_labels_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'state.json'
+            state.write_text(json.dumps([
+                {'label': 'dup', 'provider': 'codex', 'revision': 'rev-a'},
+                {'label': 'dup', 'provider': 'claude', 'revision': 'rev-b'},
+            ]))
+            settings = {'accounts': [{'provider': 'go', 'account': 'go'}],
+                        'managed_state_file': str(state)}
+            with self.assertRaises(ValueError):
+                quota_server.collect_accounts(settings, runner=lambda *a, **k: {})
