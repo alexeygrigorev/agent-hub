@@ -120,7 +120,7 @@ OFFERS_LOCK_NAME = "fleet-offers.lock"
 # plus a slow Hub can exceed that, so the gate is re-run before claiming when
 # the first observation is older than this.
 CLAIM_ADMISSION_REFRESH_S = 15.0
-# Bounded offer concurrency (settings "dispatch_concurrency", 1..8).
+# Bounded offer concurrency (settings "dispatch_concurrency", 1..10).
 # Intake eff9a5ce burst fix: serial dispatch (30-60 s per offer) made a
 # 10-launch burst take 5+ minutes. The earlier admission_refused failures with
 # 3 parallel starts came from N concurrent admission-gate subprocesses (quota
@@ -128,8 +128,8 @@ CLAIM_ADMISSION_REFRESH_S = 15.0
 # a short-lived shared result (ADMISSION_SHARE_S), so parallel dispatch no
 # longer multiplies gate runs. Host pressure is enforced by the launcher and
 # Hub placement on real choking signals (PSI, MemAvailable, OOM), never here.
-DISPATCH_CONCURRENCY = 6
-DISPATCH_CONCURRENCY_MAX = 8
+DISPATCH_CONCURRENCY = 10
+DISPATCH_CONCURRENCY_MAX = 10
 # An allowed gate observation is shared by concurrent dispatches for the same
 # account/engine/profile/mode/selection for this long. Well inside the Hub's
 # 30 s claim freshness and CLAIM_ADMISSION_REFRESH_S, so a shared observation
@@ -970,6 +970,11 @@ class Dispatcher:
         self._dispatching: set = set()
         self._dispatching_guard = threading.Lock()
         self._bindings_lock = threading.Lock()
+        self._catalog_sampled_at = 0.0
+        self._catalog_raw = None
+        self._device_auth_guard = threading.Lock()
+        self._device_auth_locks: dict = {}
+        self._device_auth_completed: dict = {}
         if self.journal_dir:
             self._load_pending_launches_from_journal()
 
@@ -2184,14 +2189,34 @@ class Dispatcher:
                         claim_key=key) from exc
                 raise
 
+    def _prepare_device_auth(self, cfg):
+        """Share successful verification only with calls already waiting for it.
+
+        prepare() serializes three native auth commands on the device store.
+        Repeating them for every concurrent offer serialized real burst starts.
+        A later, non-overlapping call always verifies again; failures are never
+        shared. Native store locking and per-launch quota gates remain intact.
+        """
+        requested_at = time.monotonic()
+        key = json.dumps(cfg, sort_keys=True)
+        with self._device_auth_guard:
+            lock = self._device_auth_locks.setdefault(key, threading.Lock())
+        with lock:
+            shared = self._device_auth_completed.get(key, 0.0) >= requested_at
+            if not shared:
+                from .opencode_auth import prepare
+                prepare(cfg)
+                self._device_auth_completed[key] = time.monotonic()
+        print(json.dumps({'event': 'fleet_device_auth', 'shared': shared,
+                          'elapsed_s': round(time.monotonic() - requested_at, 3)}), flush=True)
+
     def dispatch(self, offer):
         if offer.get('with_goal') and offer.get('mode') != 'interactive':
             raise ValueError('Goal work is interactive only')
         sub = self._route(offer)
         device_auth = self.settings.get('opencode_auth') if sub.get('launcher_provider') == 'opencode' else None
         if device_auth:
-            from .opencode_auth import prepare
-            prepare(device_auth)  # Before quota timestamp, task submission and claim.
+            self._prepare_device_auth(device_auth)  # Before quota, submission and claim.
         selection = offer.get('selection')
         if offer.get('task_id'):
             if not isinstance(offer.get('needs'), list) or not set(offer['needs']).issubset(self.settings.get('capabilities', [])):
@@ -2714,7 +2739,62 @@ class Dispatcher:
             self._maybe_cleanup_worktree(workspace, native_id)
         return {"id": offer_id, **result}
 
+    def _report_subscriptions(self):
+        from .quota_snapshot import parse_iso_utc, STALE_AGE_THRESHOLD
+        reports = collect_subscriptions(self.settings, self.runner)
+        now = dt.datetime.now(dt.timezone.utc)
+        downgraded = []
+        for sub in reports:
+            quota = sub['quota']
+            observed = parse_iso_utc(quota.get('observed_at'))
+            age = (now - observed).total_seconds() if observed is not None else None
+            reason = ('invalid_timestamp' if quota.get('observed_at') is not None and observed is None
+                      else 'future_timestamp' if age is not None and age < 0
+                      else 'stale_timestamp' if age is not None and age >= STALE_AGE_THRESHOLD and quota.get('status') == 'ok'
+                      else 'missing_timestamp' if observed is None and quota.get('status') == 'ok' else None)
+            if reason:
+                # A stale/future sample becomes unknown. Never backdate it or
+                # manufacture a new observation to make it pass admission.
+                sub['quota'] = dict(quota, status='unknown', observed_at=None)
+                downgraded.append({'account': sub['account'], 'reason': reason,
+                                   'observed_at': quota.get('observed_at'),
+                                   'age_s': round(age, 3) if age is not None else None})
+        if downgraded:
+            print(json.dumps({'event': 'fleet_subscription_freshness', 'downgraded': downgraded}), flush=True)
+        try:
+            return self.request('PUT', '/api/fleet/subscriptions', {'subscriptions': reports})
+        except ValueError as exc:
+            if 'status 400: subscription_unmapped_or_invalid:invalid_timestamp' not in str(exc):
+                raise
+            # The live 400 is this exact freshness refusal. Local and server
+            # clocks can disagree; make one bounded retry with no freshness
+            # assertions rather than relabeling stale quota as newly observed.
+            print(json.dumps({'event': 'fleet_subscription_freshness',
+                              'reason': 'server_invalid_timestamp',
+                              'samples': [{'account': s['account'],
+                                           'status': s['quota'].get('status'),
+                                           'observed_at': s['quota'].get('observed_at')}
+                                          for s in reports]}), flush=True)
+            unknown = [dict(sub, quota=dict(sub['quota'], status='unknown', observed_at=None)) for sub in reports]
+            return self.request('PUT', '/api/fleet/subscriptions', {'subscriptions': unknown})
+
     def report_catalog_bindings(self):
+        """Share a census only if its sampling began after this call arrived.
+
+        A census started before a native launch must not suppress its followup
+        merely because the preceding PUT finished later. One thread owns the
+        progress sampler and its durable file, including the slow cycle.
+        """
+        requested_at = time.monotonic()
+        with self._bindings_lock:
+            if self._catalog_sampled_at >= requested_at:
+                return self._catalog_raw
+            sampled_at = time.monotonic()
+            raw = self._report_catalog_bindings()
+            self._catalog_sampled_at, self._catalog_raw = sampled_at, raw
+            return raw
+
+    def _report_catalog_bindings(self):
         """Report authoritative native identity, then bind matching Hub starts.
 
         Repeat immediately after each confirmed start so later offers and
@@ -2731,7 +2811,8 @@ class Dispatcher:
                 state_path=Path(self.journal_dir) / 'session-progress.json' if self.journal_dir else None)
         rows = raw if isinstance(raw, list) else raw.get('sessions', [])
         # Preserve native exit metadata before automatic retirement removes the row.
-        for record in self._active_launches.values():
+        active_launches = dict(self._active_launches)
+        for record in active_launches.values():
             for row in rows:
                 if (row.get('id') == record.get('native_id')
                         and row.get('created_at_ms') == record.get('incarnation')
@@ -2746,7 +2827,7 @@ class Dispatcher:
                     if record.get('runtime_exit') != safe:
                         record['runtime_exit'] = safe
                         self._persist_launch_record(record)
-        progress = self._session_progress.sample(rows, self._active_launches)
+        progress = self._session_progress.sample(rows, active_launches)
         self.request("PUT", "/api/fleet/sessions", {"sessions": session_metadata(raw, self.settings, progress)})
         # Reconcile Fleet-owned starts into exact Hub session bindings after
         # reporting the observed native catalog. Retry is read-before-write.
@@ -2884,8 +2965,7 @@ class Dispatcher:
             results.append(outcome)
             if outcome.get('state') == 'running':
                 try:
-                    with self._bindings_lock:
-                        self.report_catalog_bindings()
+                    self.report_catalog_bindings()
                 except Exception as exc:
                     # A catalog/binding transport error is not a failed
                     # launch. Keep its real receipt and retry next cycle.
@@ -3265,7 +3345,7 @@ class Dispatcher:
                 pass  # dispatch repeats the check before allowing any claim.
         _mark('probes')
         try:
-            self.request("PUT", "/api/fleet/subscriptions", {"subscriptions": collect_subscriptions(self.settings, self.runner)})
+            self._report_subscriptions()
         except Exception as exc:
             _skip_telemetry('subscriptions', exc)
         _mark('subscriptions')
