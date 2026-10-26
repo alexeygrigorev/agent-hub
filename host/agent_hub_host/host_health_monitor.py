@@ -4,6 +4,7 @@ Provides:
 - Native Linux stdlib load averages (os.getloadavg 1m, 5m, 15m)
 - Native Linux /proc/meminfo memory statistics (MemTotal, MemAvailable, used bytes, usage percent)
 - Memory pressure evaluation (>=85% warn, >=95% critical)
+- Process telemetry: total process count, thread count and forks/s per host
 - Pure standard library implementation (no psutil or external dependencies)
 - Rate-limited, configuration-driven collector hook for session_host observer threads
 """
@@ -110,6 +111,90 @@ def collect_load_averages(
         }
     except Exception:
         return {"load1": 0.0, "load5": 0.0, "load15": 0.0}
+
+
+def collect_process_stats(
+    proc_root: str = "/proc",
+    *,
+    prev: Optional[Dict[str, Any]] = None,
+    now_mono: Optional[float] = None,
+    listdir_fn: Optional[Callable[[str], List[str]]] = None,
+    read_text_fn: Optional[Callable[[str], str]] = None,
+) -> Dict[str, Any]:
+    """Collect total process count, thread count and forks/s (stdlib /proc).
+
+    - process_count: numeric entries in /proc.
+    - thread_count: sum of Threads: lines in /proc/<pid>/status (best effort).
+    - forks_total: `processes` counter from /proc/stat (cumulative forks).
+    - forks_per_sec: delta vs prev {forks_total, at_mono} divided by elapsed.
+    Missing/unreadable sources degrade to null, never raise.
+    """
+    listdir = listdir_fn or (lambda p: os.listdir(p))
+    def _read(path: str) -> Optional[str]:
+        try:
+            if read_text_fn is not None:
+                return read_text_fn(path)
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                return fh.read(65536)
+        except Exception:
+            return None
+
+    process_count: Optional[int] = None
+    try:
+        entries = listdir(proc_root)
+        process_count = sum(1 for e in entries if e.isdigit())
+    except Exception:
+        process_count = None
+
+    thread_count: Optional[int] = None
+    if process_count is not None:
+        total = 0
+        seen_any = False
+        try:
+            entries = listdir(proc_root)
+        except Exception:
+            entries = []
+        for pid in entries[:32768]:
+            if not pid.isdigit():
+                continue
+            text = _read(os.path.join(proc_root, pid, "status"))
+            if not text:
+                continue
+            for line in text.splitlines():
+                if line.startswith("Threads:"):
+                    try:
+                        total += int(line.split(":", 1)[1].strip().split()[0])
+                        seen_any = True
+                    except (ValueError, IndexError):
+                        continue
+                    break
+        thread_count = total if seen_any else None
+
+    forks_total: Optional[int] = None
+    stat_text = _read(os.path.join(proc_root, "stat"))
+    if stat_text:
+        for line in stat_text.splitlines():
+            if line.startswith("processes "):
+                try:
+                    forks_total = int(line.split()[1])
+                except (ValueError, IndexError):
+                    forks_total = None
+                break
+
+    forks_per_sec: Optional[float] = None
+    at_mono = now_mono if isinstance(now_mono, (int, float)) else time.monotonic()
+    if isinstance(prev, dict) and isinstance(prev.get("forks_total"), int) and isinstance(prev.get("at_mono"), (int, float)):
+        elapsed = at_mono - float(prev["at_mono"])
+        if elapsed > 0 and forks_total is not None:
+            forks_per_sec = round(max(0.0, (forks_total - int(prev["forks_total"])) / elapsed), 2)
+
+    return {
+        "process_count": process_count,
+        "thread_count": thread_count,
+        "forks_total": forks_total,
+        "forks_per_sec": forks_per_sec,
+        "at_mono": at_mono,
+    }
 
 
 def collect_memory_stats(
@@ -1360,8 +1445,12 @@ def collect_host_health(
     services: Optional[List[Dict[str, Any]]] = None,
     budget: Optional[Dict[str, Any]] = None,
     storage: Optional[List[Dict[str, Any]]] = None,
+    processes: Optional[Dict[str, Any]] = None,
+    proc_root: str = "/proc",
+    prev_processes: Optional[Dict[str, Any]] = None,
+    monotonic_fn: Optional[Callable[[], float]] = None,
 ) -> Dict[str, Any]:
-    """Collect complete host health snapshot (load averages + memory + services + budget + storage)."""
+    """Collect complete host health snapshot (load + memory + processes + services + budget + storage)."""
     load = collect_load_averages(getloadavg_fn)
     memory = collect_memory_stats(
         meminfo_path=meminfo_path,
@@ -1369,6 +1458,18 @@ def collect_host_health(
         critical_percent=critical_percent,
         open_fn=open_fn,
     )
+    proc_stats: Optional[Dict[str, Any]] = None
+    if processes is not None:
+        proc_stats = {k: v for k, v in processes.items() if k in ("process_count", "thread_count", "forks_total", "forks_per_sec")}
+    else:
+        try:
+            full = collect_process_stats(
+                proc_root, prev=prev_processes,
+                now_mono=monotonic_fn() if monotonic_fn else None,
+            )
+            proc_stats = {k: full.get(k) for k in ("process_count", "thread_count", "forks_total", "forks_per_sec")}
+        except Exception:
+            proc_stats = None
 
     payload: Dict[str, Any] = {
         "machine_id": machine_id,
@@ -1376,6 +1477,8 @@ def collect_host_health(
         "load": load,
         "memory": memory,
     }
+    if proc_stats is not None:
+        payload["processes"] = proc_stats
     if services is not None:
         payload["services"] = services
     if budget is not None:
@@ -1461,6 +1564,7 @@ class HostHealthMonitor:
         storage_paths: Optional[List[str]] = None,
         storage_soft_bytes: Optional[int] = None,
         storage_hard_bytes: Optional[int] = None,
+        proc_root: str = "/proc",
     ):
         self._config_path = config_path or resolve_config_path()
         self._config_override = config
@@ -1481,6 +1585,8 @@ class HostHealthMonitor:
         self._storage_paths = storage_paths
         self._storage_soft_bytes = storage_soft_bytes
         self._storage_hard_bytes = storage_hard_bytes
+        self._proc_root = proc_root
+        self._prev_processes: Optional[Dict[str, Any]] = None
 
         self._last_run_monotonic = 0.0
         self._last_result: Optional[Dict[str, Any]] = None
@@ -1593,6 +1699,11 @@ class HostHealthMonitor:
         )
 
         try:
+            proc_full = collect_process_stats(
+                self._proc_root, prev=self._prev_processes, now_mono=now_mono,
+            )
+            self._prev_processes = {"forks_total": proc_full.get("forks_total"), "at_mono": now_mono} if isinstance(proc_full.get("forks_total"), int) else self._prev_processes
+            proc_payload = {k: proc_full.get(k) for k in ("process_count", "thread_count", "forks_total", "forks_per_sec")}
             payload = collect_host_health(
                 machine_id=machine_id,
                 getloadavg_fn=self._getloadavg_fn,
@@ -1603,6 +1714,7 @@ class HostHealthMonitor:
                 services=services_list if services_list else None,
                 budget=budget_payload,
                 storage=storage_payload,
+                processes=proc_payload,
             )
         except Exception as e:
             return {"disabled": False, "rate_limited": False, "posted": False, "errors": [f"collection_error:{type(e).__name__}"]}

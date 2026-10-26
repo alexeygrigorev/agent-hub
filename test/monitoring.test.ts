@@ -1920,4 +1920,117 @@ describe('Disk Monitoring Service', () => {
   }));
 });
 
+describe('Host process telemetry', () => {
+  it('accepts processes, shows them on the dashboard payload and alerts on thresholds', () => fixture(async (hub) => {
+    enrollHost(hub.sql, 'hetzner');
+    const auth = { kind: 'host' as const, machine_id: 'hetzner', tokenId: 'cred-hetzner' };
+    const base = {
+      machine_id: 'hetzner',
+      observed_at: iso(10),
+      load: { load1: 0.5, load5: 0.4, load15: 0.3 },
+      memory: { total_bytes: 8000, available_bytes: 4000, used_bytes: 4000, percent: 50, status: 'ok' },
+      processes: { process_count: 123, thread_count: 456, forks_total: 789, forks_per_sec: 5.5 },
+    };
+    const req = new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(base),
+    });
+    const res = await hub.monitoringService.handleHostHealthObservation(req, auth);
+    expect(res.status).toBe(200);
+    const status = hub.monitoringService.getHostHealthStatus(clockSafe(hub));
+    const host = status.machines.find(m => m.machine_id === 'hetzner');
+    expect(host!.processes!.process_count).toBe(123);
+    expect(host!.processes!.forks_per_sec).toBe(5.5);
+    // Below default thresholds (2000 procs, 300 forks/s): no alert.
+    const alerts = hub.livenessService.alerts();
+    expect(alerts.find((a: any) => a.subject_kind === 'processes' && a.resolved_at === null)).toBeUndefined();
+    expect(alerts.find((a: any) => a.subject_kind === 'forks' && a.resolved_at === null)).toBeUndefined();
+  }));
+
+  it('fires process-count immediately and fork-rate only after 10m sustain, resolves on recovery', () => fixture(async (hub, clock) => {
+    enrollHost(hub.sql, 'hetzner');
+    const auth = { kind: 'host' as const, machine_id: 'hetzner', tokenId: 'cred-hetzner' };
+    const post = (body: any) => hub.monitoringService.handleHostHealthObservation(new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    }), auth);
+    const bad = {
+      machine_id: 'hetzner',
+      observed_at: new Date(clock.t).toISOString(),
+      load: { load1: 1, load5: 1, load15: 1 },
+      memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+      processes: { process_count: 2500, thread_count: 9000, forks_total: 100000, forks_per_sec: 450 },
+    };
+    expect((await post(bad)).status).toBe(200);
+    let open = hub.livenessService.alerts();
+    expect(open.find((a: any) => a.subject_kind === 'processes' && a.subject === 'hetzner' && a.resolved_at === null)).toBeDefined();
+    // Fork spike alone does not fire until sustained 10m.
+    expect(open.find((a: any) => a.subject_kind === 'forks' && a.resolved_at === null)).toBeUndefined();
+    // Sustain 10m: advance clock, re-post same high forks.
+    clock.t += 10 * 60 * 1000 + 1000;
+    expect((await post({ ...bad, observed_at: new Date(clock.t).toISOString() })).status).toBe(200);
+    open = hub.livenessService.alerts();
+    const forkAlert = open.find((a: any) => a.subject_kind === 'forks' && a.subject === 'hetzner' && a.resolved_at === null);
+    expect(forkAlert).toBeDefined();
+    expect(forkAlert!.detail).toContain('450/s');
+    // Recovery resolves both.
+    const good = { ...bad, observed_at: new Date(clock.t).toISOString(), processes: { process_count: 200, thread_count: 400, forks_total: 100100, forks_per_sec: 2 } };
+    expect((await post(good)).status).toBe(200);
+    const after = hub.livenessService.alerts();
+    expect(after.find((a: any) => a.subject_kind === 'processes' && a.resolved_at === null)).toBeUndefined();
+    expect(after.find((a: any) => a.subject_kind === 'forks' && a.resolved_at === null)).toBeUndefined();
+  }));
+
+  it('rejects invalid processes payloads', () => fixture(async (hub) => {
+    enrollHost(hub.sql, 'hetzner');
+    const auth = { kind: 'host' as const, machine_id: 'hetzner', tokenId: 'cred-hetzner' };
+    for (const processes of [{ process_count: -1 }, { process_count: 1.5 }, { forks_per_sec: 'fast' }, []]) {
+      const req = new Request('https://hub.internal/api/monitoring/health', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          machine_id: 'hetzner', observed_at: iso(5),
+          load: { load1: 1, load5: 1, load15: 1 },
+          memory: { total_bytes: 1000, available_bytes: 500, used_bytes: 500, percent: 50, status: 'ok' },
+          processes,
+        }),
+      });
+      expect((await hub.monitoringService.handleHostHealthObservation(req, auth)).status).toBe(400);
+    }
+  }));
+});
+
+describe('Host process alert test-fire (lower then restore)', () => {
+  it('fires on lowered threshold and resolves after restore', () => fixture(async (hub) => {
+    enrollHost(hub.sql, 'hetzner');
+    const auth = { kind: 'host' as const, machine_id: 'hetzner', tokenId: 'cred-hetzner' };
+    const base = {
+      machine_id: 'hetzner',
+      observed_at: iso(5),
+      load: { load1: 0.5, load5: 0.4, load15: 0.3 },
+      memory: { total_bytes: 8000, available_bytes: 4000, used_bytes: 4000, percent: 50, status: 'ok' },
+      processes: { process_count: 123, thread_count: 456, forks_total: 789, forks_per_sec: 5.5 },
+    };
+    const post = (body: any) => hub.monitoringService.handleHostHealthObservation(new Request('https://hub.internal/api/monitoring/health', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    }), auth);
+    expect((await post(base)).status).toBe(200);
+    expect(hub.livenessService.alerts().find((a: any) => a.subject_kind === 'processes' && a.resolved_at === null)).toBeUndefined();
+    // Lower threshold: 123 procs now exceeds it.
+    (globalThis as any).__HUB_PROC_COUNT_ALERT = 10;
+    try {
+      expect((await post({ ...base, observed_at: iso(4) })).status).toBe(200);
+      const fired = hub.livenessService.alerts().find((a: any) => a.subject_kind === 'processes' && a.subject === 'hetzner' && a.resolved_at === null);
+      expect(fired).toBeDefined();
+      expect(fired!.detail).toContain('123 processes');
+    } finally {
+      delete (globalThis as any).__HUB_PROC_COUNT_ALERT;
+    }
+    // Restore: same payload resolves.
+    expect((await post({ ...base, observed_at: iso(3) })).status).toBe(200);
+    expect(hub.livenessService.alerts().find((a: any) => a.subject_kind === 'processes' && a.resolved_at === null)).toBeUndefined();
+  }));
+});
+
+function clockSafe(hub: any): number {
+  try { return (hub.monitoringService as any).now(); } catch { return Date.parse('2026-10-17T18:00:00Z'); }
+}
+
 

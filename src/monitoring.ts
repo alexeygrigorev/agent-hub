@@ -64,6 +64,12 @@ CREATE TABLE IF NOT EXISTS supervisor_episodes (
   details_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_supervisor_episodes_open ON supervisor_episodes(resolved_at, machine_id);
+
+CREATE TABLE IF NOT EXISTS host_forks_breaches (
+  machine_id TEXT PRIMARY KEY,
+  since_ms INTEGER NOT NULL,
+  last_value REAL NOT NULL
+);
 `;
 
 export const DISK_LIMITS = {
@@ -254,11 +260,19 @@ export type StorageHygieneStatus = {
   error?: string | null;
 };
 
+export type HostProcesses = {
+  process_count: number | null;
+  thread_count: number | null;
+  forks_total: number | null;
+  forks_per_sec: number | null;
+};
+
 export type HostHealthPayload = {
   machine_id: string;
   observed_at: string;
   load: HostLoad;
   memory: HostMemory;
+  processes?: HostProcesses;
   services?: SupervisorServiceStatus[];
   budget?: CloudBudgetStatus;
   storage?: StorageHygieneStatus[];
@@ -287,6 +301,7 @@ export type HostHealthSummary = {
   freshness: 'fresh' | 'stale' | 'unavailable' | 'unknown';
   load: HostLoad;
   memory: HostMemory;
+  processes?: HostProcesses;
   services?: SupervisorServiceStatus[];
   budget?: CloudBudgetStatus;
   storage?: StorageHygieneStatus[];
@@ -1462,6 +1477,24 @@ export class MonitoringService {
       }
     }
 
+    let processes: HostProcesses | undefined = undefined;
+    if (body.processes !== undefined && body.processes !== null) {
+      if (!body.processes || typeof body.processes !== 'object' || Array.isArray(body.processes)) fail('invalid_processes');
+      const numOrNull = (v: any): number | null => {
+        if (v === null || v === undefined) return null;
+        const n = Number(v);
+        if (!Number.isFinite(n) || n < 0 || n > 1000000000) fail('invalid_processes');
+        return n;
+      };
+      const process_count = numOrNull(body.processes.process_count);
+      const thread_count = numOrNull(body.processes.thread_count);
+      const forks_total = numOrNull(body.processes.forks_total);
+      const forks_per_sec = numOrNull(body.processes.forks_per_sec);
+      if (process_count !== null && !Number.isInteger(process_count)) fail('invalid_processes');
+      if (thread_count !== null && !Number.isInteger(thread_count)) fail('invalid_processes');
+      processes = { process_count, thread_count, forks_total, forks_per_sec };
+    }
+
     return {
       machine_id: body.machine_id,
       observed_at: new Date(observedMs).toISOString(),
@@ -1474,6 +1507,7 @@ export class MonitoringService {
         status,
         error: typeof body.memory.error === 'string' ? body.memory.error.slice(0, 128) : null,
       },
+      processes,
       services,
       budget,
       storage,
@@ -1557,6 +1591,53 @@ export class MonitoringService {
           });
         } else {
           this.liveness.setAlert('storage', payload.machine_id, null);
+        }
+      }
+
+      if (payload.processes) {
+        const g: any = globalThis as any;
+        const procThreshold = Number(g.__HUB_PROC_COUNT_ALERT ?? g.process?.env?.HUB_PROC_COUNT_ALERT ?? 2000);
+        const forksThreshold = Number(g.__HUB_FORKS_ALERT ?? g.process?.env?.HUB_FORKS_ALERT ?? 300);
+        const procLimit = Number.isFinite(procThreshold) && procThreshold > 0 ? procThreshold : 2000;
+        const forksLimit = Number.isFinite(forksThreshold) && forksThreshold > 0 ? forksThreshold : 300;
+        const pc = payload.processes.process_count;
+        if (typeof pc === 'number' && pc > procLimit) {
+          this.liveness.setAlert('processes', payload.machine_id, {
+            state: 'critical',
+            detail: `High process count on ${payload.machine_id}: ${pc} processes (threshold ${procLimit})`,
+          });
+        } else if (typeof pc === 'number') {
+          this.liveness.setAlert('processes', payload.machine_id, null);
+        }
+        const fr = payload.processes.forks_per_sec;
+        const FORKS_SUSTAIN_MS = 10 * 60 * 1000;
+        if (typeof fr === 'number' && fr > forksLimit) {
+          let breach: any = null;
+          try {
+            breach = this.sql.exec('SELECT since_ms FROM host_forks_breaches WHERE machine_id = ?', payload.machine_id).toArray()[0];
+          } catch { breach = null; }
+          const sinceMs = (breach as any)?.since_ms;
+          if (typeof sinceMs !== 'number' || !Number.isFinite(sinceMs)) {
+            try {
+              this.sql.exec('INSERT INTO host_forks_breaches (machine_id, since_ms, last_value) VALUES (?, ?, ?) ON CONFLICT(machine_id) DO UPDATE SET since_ms=excluded.since_ms, last_value=excluded.last_value', payload.machine_id, this.now(), fr);
+            } catch { /* breach tracking best-effort */ }
+            // First breach: pending, do not fire until sustained.
+          } else {
+            try {
+              this.sql.exec('UPDATE host_forks_breaches SET last_value = ? WHERE machine_id = ?', fr, payload.machine_id);
+            } catch { /* ignore */ }
+            if (this.now() - sinceMs >= FORKS_SUSTAIN_MS) {
+              this.liveness.setAlert('forks', payload.machine_id, {
+                state: 'critical',
+                detail: `High fork rate on ${payload.machine_id}: ${fr}/s (threshold ${forksLimit}/s, sustained ${Math.round((this.now() - sinceMs) / 60000)}m)`,
+              });
+            }
+          }
+        } else if (typeof fr === 'number') {
+          try {
+            this.sql.exec('DELETE FROM host_forks_breaches WHERE machine_id = ?', payload.machine_id);
+          } catch { /* ignore */ }
+          this.liveness.setAlert('forks', payload.machine_id, null);
         }
       }
     }
@@ -1825,6 +1906,7 @@ export class MonitoringService {
         freshness,
         load: payload.load ?? { load1: 0, load5: 0, load15: 0 },
         memory: this.degradedMemory(payload.memory, r.machine_id, pressure),
+        processes: payload.processes,
         services: projectedServices,
         budget: projectedBudget,
         storage: payload.storage,

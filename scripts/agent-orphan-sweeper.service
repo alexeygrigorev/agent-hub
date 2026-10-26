@@ -1,0 +1,11 @@
+[Unit]
+Description=Stop headless sessions whose worktree is gone (grace 2h default)
+After=network-online.target
+[Service]
+Type=oneshot
+User=alexey
+Environment=HOME=/home/alexey
+Environment=PATH=/home/alexey/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=ORPHAN_GRACE_HOURS=2
+Environment=HUB_MACHINE_ID=hetzner
+ExecStart=/usr/bin/python3 /usr/local/lib/agent-hub-orphan-sweeper.py --apply --grace-hours 2 --machine-id hetzner --hub-bin /home/alexey/.local/bin/hub

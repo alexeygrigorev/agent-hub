@@ -347,6 +347,9 @@ function renderHostHealth(health, fleet) {
       : res.stale_telemetry ? `stale telemetry (avail ${memMb(res.mem_avail_mb)})`
       : `avail ${memMb(res.mem_avail_mb)} · reserved ${memMb(res.reserved_mb)} · floor ${memMb(res.floor_mb)} · after next worker ${res.headroom_mb === null || res.headroom_mb === undefined ? 'unknown' : memMb(res.headroom_mb)}${res.headroom_ok === false ? ' (below floor)' : ''}`;
     const placement = h.placement && h.placement.reason ? h.placement.reason : '';
+    const proc = h.processes || {};
+    const procText = proc.process_count === null || proc.process_count === undefined ? 'unknown' : `${proc.process_count} procs${proc.thread_count !== null && proc.thread_count !== undefined ? ` / ${proc.thread_count} threads` : ''}`;
+    const forksText = proc.forks_per_sec === null || proc.forks_per_sec === undefined ? 'unknown' : `${proc.forks_per_sec}/s`;
     rows.push([
       h.machine_id,
       healthBadge(h.freshness),
@@ -354,12 +357,14 @@ function renderHostHealth(health, fleet) {
       healthBadge(mem.status),
       memUsage,
       memBytes,
+      procText,
+      forksText,
       resText,
       placement || 'none',
       ago(Number.isFinite(Date.parse(h.observed_at)) ? Math.max(0, Math.round(age(h.observed_at) / 1000)) : null)
     ]);
   }
-  root.append(richTable(['Machine', 'Freshness', 'Load (1m, 5m, 15m)', 'Memory Status', 'Memory Usage', 'Used / Total (Avail)', 'Launcher reservation (avail · reserved · floor · headroom)', 'Placement pressure', 'Observed'], rows));
+  root.append(richTable(['Machine', 'Freshness', 'Load (1m, 5m, 15m)', 'Memory Status', 'Memory Usage', 'Used / Total (Avail)', 'Processes / Threads', 'Forks/s', 'Launcher reservation (avail · reserved · floor · headroom)', 'Placement pressure', 'Observed'], rows));
   const pressured = hosts.filter(h => h.placement && h.placement.reason);
   if (pressured.length) {
     const p = document.createElement('p');
