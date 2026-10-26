@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS resource_choking_events (machine_id TEXT NOT NULL, re
 CREATE TABLE IF NOT EXISTS resource_cpu_samples (launch_id TEXT PRIMARY KEY, current_cpu_cores REAL NOT NULL, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_cpu_starts (launch_id TEXT PRIMARY KEY, expected_cpu_cores REAL NOT NULL, expected_cpu_source TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_cpu_usage (session_id TEXT PRIMARY KEY, p95_cpu_cores REAL, observed_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_cpu_finalized (session_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_resource_metadata (session_id TEXT PRIMARY KEY, workspace TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_ramps (launch_id TEXT PRIMARY KEY, started_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_settings (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
@@ -102,10 +103,11 @@ export class ResourceManagement {
       const req=parse(row.request_json);
       const committed:any=this.cpuStart(row.id) ?? this.cpuEstimate(req.project || row.workspace,req.task_kind || 'goal');
       const current:any=this.sql.exec('SELECT current_cpu_cores,observed_at FROM resource_cpu_samples WHERE launch_id=?',row.id).toArray()[0];
-      // Credit only usage sampled no later than this host busy interval. Later CPU
-      // can have ramped after that interval and is not represented in its busy total.
-      const at=Date.parse(current?.observed_at),hostAt=Date.parse(hb.cpu_usage?.observed_at);
-      const credit=Number.isFinite(at)&&at>=this.now()-180000&&at<=hostAt&&at>=hostAt-(hb.cpu_usage?.interval_s ?? 0)*1000 ? current.current_cpu_cores : 0;
+      // Dispatcher reports per-session counters after the host heartbeat, on
+      // separate 30–60s polls. Fresh exact-binding measurements are advisory
+      // ramp credit; they need not land inside the 200ms host /proc/stat sample.
+      const at=Date.parse(current?.observed_at);
+      const credit=Number.isFinite(at)&&at>=this.now()-180000&&at<=this.now()+30000&&finite(current?.current_cpu_cores) ? current.current_cpu_cores : 0;
       remaining+=Math.max(0,committed.expected_cpu_cores-credit);
     }
     const verdict=cpuVerdict(hb.cpu_usage,parse(m?.capabilities).cpu_count,estimate.expected_cpu_cores,remaining,config,this.now());
@@ -210,7 +212,16 @@ export class ResourceManagement {
       if (!Number.isFinite(at) || at>this.now()+30000 || at<this.now()-86400000) throw new Error('invalid_resource_timestamp');
       this.sql.exec('INSERT OR IGNORE INTO session_resource_metadata VALUES(?,?)',session.session_id,session.workspace);
       if (session.fleet_launch_id && finite(sample.current_cpu_cores)) this.sql.exec('INSERT INTO resource_cpu_samples VALUES(?,?,?) ON CONFLICT(launch_id) DO UPDATE SET current_cpu_cores=excluded.current_cpu_cores,observed_at=excluded.observed_at WHERE excluded.observed_at>resource_cpu_samples.observed_at',session.fleet_launch_id,sample.current_cpu_cores,sample.observed_at);
-      if (finite(sample.p95_cpu_cores)) this.sql.exec('INSERT INTO session_cpu_usage VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET p95_cpu_cores=excluded.p95_cpu_cores,observed_at=excluded.observed_at WHERE excluded.observed_at>session_cpu_usage.observed_at',session.session_id,sample.p95_cpu_cores,sample.observed_at);
+      if (finite(sample.p95_cpu_cores)) {
+        const finalized=this.sql.exec('SELECT 1 FROM session_cpu_finalized WHERE session_id=?',session.session_id).toArray().length>0;
+        const prior:any=this.sql.exec('SELECT observed_at FROM session_cpu_usage WHERE session_id=?',session.session_id).toArray()[0];
+        // Live lifetime p95 can fall as real idle intervals accumulate. Freeze
+        // only an actual terminal CPU report, never a memory-only final row.
+        if (!finalized && (!prior || at>=Date.parse(prior.observed_at))) {
+          this.sql.exec('INSERT INTO session_cpu_usage VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET p95_cpu_cores=excluded.p95_cpu_cores,observed_at=excluded.observed_at',session.session_id,sample.p95_cpu_cores,sample.observed_at);
+          if (TERMINAL.has(session.state)) this.sql.exec('INSERT OR IGNORE INTO session_cpu_finalized VALUES(?,?)',session.session_id,sample.observed_at);
+        }
+      }
       if (session.fleet_launch_id && finite(sample.current_rss_mb)) this.sql.exec('INSERT INTO resource_resident_samples VALUES(?,?,?) ON CONFLICT(launch_id) DO UPDATE SET resident_mb=excluded.resident_mb,observed_at=excluded.observed_at WHERE excluded.observed_at>=resource_resident_samples.observed_at',session.fleet_launch_id,sample.current_rss_mb,sample.observed_at);
       const old: any = this.sql.exec('SELECT * FROM session_resource_usage WHERE session_id=?',session.session_id).toArray()[0];
       const max = (k:string) => finite(sample[k]) ? Math.max(old?.[k] ?? 0,sample[k]) : old?.[k] ?? null;

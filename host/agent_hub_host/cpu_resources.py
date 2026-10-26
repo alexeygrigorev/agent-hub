@@ -129,7 +129,7 @@ def sample_cpu_usage(proc_root="/proc", interval_s=0.2, sleep=time.sleep, monoto
             "observed_at": datetime.fromtimestamp(clock(), timezone.utc).isoformat().replace("+00:00", "Z")}
 
 
-def update_cpu_distribution(state, counter_seconds, identity, observed_ms):
+def update_cpu_distribution(state, counter_seconds, identity, observed_ms, *, terminal=False):
     """Track interval cores in 0.05-core upper buckets, weighted by elapsed time.
 
     The 20481 buckets cover up to 1024 cores; overflow uses the measured
@@ -137,8 +137,13 @@ def update_cpu_distribution(state, counter_seconds, identity, observed_ms):
     First/missing/reset/out-of-order observations cannot earn current CPU credit.
     A counter reset starts a new baseline while retaining prior measured intervals.
     """
+    # A terminal observation is not another idle interval. Keep the lifetime
+    # histogram/baseline unchanged even if an exited cgroup remains readable.
+    frozen = terminal or state.get("cpu_finalized") is True
+    if terminal:
+        state["cpu_finalized"] = True
     current = None
-    valid = _number(counter_seconds) and _number(observed_ms) and isinstance(identity, str) and bool(identity)
+    valid = not frozen and _number(counter_seconds) and _number(observed_ms) and isinstance(identity, str) and bool(identity)
     prior = state.get("cpu_baseline")
     if valid and isinstance(prior, dict) and prior.get("identity") == identity:
         dt = observed_ms - prior["at"]

@@ -60,6 +60,36 @@ describe('CPU predictive placement integration',()=>{
   sql.exec("UPDATE fleet_launches SET state='queued' WHERE id=?",first.value.id);
   expect(f.resources.cpuHeadroom('host',req()).ramping_cpu_cores).toBe(0);
  }));
+ it('credits fresh session CPU across real dispatcher heartbeat ordering and timestamp precision',()=>fixture(async(f,sql,beat)=>{
+  const launch=f.reserve(req(),admin);expect(launch.status).toBe(201);
+  const heartbeat={...freshCpu(iso(-60000)),observed_at:iso(-60000).replace('Z','456Z')};
+  beat(0,{cpu_usage:heartbeat});
+  // A session report follows a separate heartbeat poll, outside its 200ms window.
+  sql.exec('INSERT INTO resource_cpu_samples VALUES(?,?,?)',launch.value.id,.6,iso(-59000));
+  expect(f.resources.cpuHeadroom('host').ramping_cpu_cores).toBeCloseTo(.4);
+  sql.exec('UPDATE resource_cpu_samples SET observed_at=?',iso(-181000));
+  expect(f.resources.cpuHeadroom('host').ramping_cpu_cores).toBe(1);
+  sql.exec('UPDATE resource_cpu_samples SET observed_at=?',iso(31000));
+  expect(f.resources.cpuHeadroom('host').ramping_cpu_cores).toBe(1);
+ }));
+ it('freezes only real terminal CPU p95 while allowing live decreases and late final evidence',()=>fixture(async(f,sql)=>{
+  const sid='cpu-final',binding={native_id:'native-final',tag:'agent',workspace:'/repo'};
+  sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?)`,sid,'admin',sid,'{}','host','codex','interactive','running',JSON.stringify(binding),iso(-100000),iso());
+  const report=(offset:number,extra:any={})=>f.resources.report('host',{samples:[{session_id:sid,native_id:'native-final',observed_at:iso(offset),...extra}],reaps:[]});
+  const p95=()=>sql.exec('SELECT p95_cpu_cores FROM session_cpu_usage WHERE session_id=?',sid).one().p95_cpu_cores;
+  report(-5000,{p95_cpu_cores:2,cpu_seconds:100,runtime_s:100});
+  report(-4000,{p95_cpu_cores:1});expect(p95()).toBe(1);
+  sql.exec("UPDATE session_control_sessions SET state='exited' WHERE id=?",sid);
+  report(-3000,{peak_rss_mb:50});
+  expect(sql.exec('SELECT * FROM session_cpu_finalized').toArray()).toHaveLength(0);
+  report(-6000,{p95_cpu_cores:.1});expect(p95()).toBe(1); // out-of-order live sample cannot finalize
+  expect(sql.exec('SELECT * FROM session_cpu_finalized').toArray()).toHaveLength(0);
+  report(-2000,{p95_cpu_cores:1.5,cpu_seconds:120,runtime_s:110});expect(p95()).toBe(1.5);
+  expect(sql.exec('SELECT * FROM session_cpu_finalized').toArray()).toHaveLength(1);
+  report(-1000,{p95_cpu_cores:0,peak_rss_mb:80});expect(p95()).toBe(1.5);
+  expect(f.resources.usage()[0]).toMatchObject({cpu_seconds:120,runtime_s:110,peak_rss_mb:80,workspace:'/repo'});
+ }));
  it('keeps memory floor, unknown telemetry and PSI cap as distinct reasons',()=>fixture(async(f,_sql,beat)=>{
   beat(0,{mem_avail_mb:2047});expect(f.plan(req()).rejected![0].reason).toBe('launcher_memory_reserve');
   beat(0,{cpu_usage:null});expect(f.resources.cpuHeadroom('host',req())).toMatchObject({admitted:true,telemetry_state:'unknown'});

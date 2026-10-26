@@ -99,3 +99,19 @@ class CpuResourcesTests(unittest.TestCase):
         self.assertEqual(update_cpu_distribution(restored, None, "cg:1", 101000)["p95_cpu_cores"], 1)
         self.assertLessEqual(len(restored["cpu_histogram"]), 20481)
 
+
+    def test_terminal_distribution_freezes_but_live_idle_intervals_remain_real(self):
+        import copy
+        state = {}
+        update_cpu_distribution(state, 0, "native:1", 0)
+        self.assertEqual(update_cpu_distribution(state, 200, "native:1", 100000)["p95_cpu_cores"], 2)
+        before = copy.deepcopy(state)
+        live = copy.deepcopy(state)
+        self.assertEqual(update_cpu_distribution(live, 200, "native:1", 2200000)["p95_cpu_cores"], 0)
+        self.assertEqual(update_cpu_distribution(state, 200, "native:1", 200000, terminal=True),
+                         {"current_cpu_cores": None, "p95_cpu_cores": 2})
+        for at in (2200000, 3600000, 7200000):
+            self.assertEqual(update_cpu_distribution(state, 999, "new-remnant:2", at),
+                             {"current_cpu_cores": None, "p95_cpu_cores": 2})
+        self.assertEqual(state["cpu_histogram"], before["cpu_histogram"])
+        self.assertEqual(state["cpu_baseline"], before["cpu_baseline"])

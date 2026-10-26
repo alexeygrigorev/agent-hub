@@ -32,7 +32,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -625,14 +625,15 @@ def _peak_key(session_id: str, native_id: str) -> str:
     return "%s\x00%s" % (session_id, native_id)
 
 
-def update_peaks(state: dict[str, Any], session_id: str, native_id: str, sample: dict[str, Any], observed_at: str) -> dict[str, Any]:
+def update_peaks(state: dict[str, Any], session_id: str, native_id: str, sample: dict[str, Any], observed_at: str, *, terminal: bool = False) -> dict[str, Any]:
     """Merge one sample into explicit high-water peaks (monotonic per field).
 
     Sample fields map EXPLICITLY onto stored peak fields: ``rss_mb`` feeds
     ``peak_rss_mb``, ``pss_mb`` feeds ``peak_pss_mb``; cumulative
     ``cpu_seconds`` takes the max. ``runtime_s``/``avg_cpu_cores``/
     ``current_mb`` are latest-value (callers freeze runtime for finished
-    sessions before sampling). Unknown (None/non-finite) never clears a peak.
+    sessions before sampling). The first terminal report freezes CPU accounting
+    and histogram state for subsequent polls. Unknown never clears a peak.
     """
     peaks = state.setdefault("peaks", {})
     if not isinstance(peaks, dict):
@@ -661,14 +662,15 @@ def update_peaks(state: dict[str, Any], session_id: str, native_id: str, sample:
         cpu_at = int(datetime.fromisoformat(observed_at.replace("Z", "+00:00")).timestamp() * 1000)
     except (ValueError, TypeError, AttributeError):
         cpu_at = None
-    distribution = update_cpu_distribution(prior, sample.get("cpu_seconds"), sample.get("cpu_identity"), cpu_at)
+    cpu_frozen = prior.get("cpu_finalized") is True
+    distribution = update_cpu_distribution(prior, sample.get("cpu_seconds"), sample.get("cpu_identity"), cpu_at, terminal=terminal)
     peaks[key] = {
         **prior,
         "peak_rss_mb": _peak_max("peak_rss_mb", "rss_mb"),
         "peak_pss_mb": _peak_max("peak_pss_mb", "pss_mb"),
-        "cpu_seconds": _peak_max("cpu_seconds", "cpu_seconds"),
-        "runtime_s": _latest("runtime_s"),
-        "avg_cpu_cores": _latest("avg_cpu_cores"),
+        "cpu_seconds": prior.get("cpu_seconds") if cpu_frozen else _peak_max("cpu_seconds", "cpu_seconds"),
+        "runtime_s": prior.get("runtime_s") if cpu_frozen else _latest("runtime_s"),
+        "avg_cpu_cores": prior.get("avg_cpu_cores") if cpu_frozen else _latest("avg_cpu_cores"),
         "current_mb": _latest("current_mb"),
         "observed_at": observed_at,
         **distribution,
@@ -1027,7 +1029,7 @@ def run_watchdog_cycle(
         if not isinstance(state.get("peaks"), dict):
             state["peaks"] = {}
         _sweep_stale_pending(state, now)
-        observed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now / 1000))
+        observed_at = datetime.fromtimestamp(now / 1000, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         # Sample every heartbeat: live rows update peaks; terminal sessions
         # WITHOUT a current native row still emit cached/null final rows so
         # finished states are finalized durably instead of skipped.
@@ -1055,9 +1057,9 @@ def run_watchdog_cycle(
                         measured["avg_cpu_cores"] = float(measured["cpu_seconds"]) / float(frozen)
                     else:
                         measured["avg_cpu_cores"] = None
-                peak = update_peaks(state, sid, nid, measured, observed_at)
+                peak = update_peaks(state, sid, nid, measured, observed_at, terminal=terminal)
                 row = _sample_row(sid, nid, peak, observed_at)
-                if peak.get("current_cpu_cores") is not None:
+                if not terminal and peak.get("current_cpu_cores") is not None:
                     row["current_cpu_cores"] = peak["current_cpu_cores"]
                 # Fresh current anon RSS each heartbeat: the Hub credits ONLY
                 # this against the launch ramp (never the peak). Cached final
@@ -1077,6 +1079,9 @@ def run_watchdog_cycle(
                 frozen = _frozen_runtime_s(entry, prior, None)
                 if frozen is not None:
                     view["runtime_s"] = frozen
+                view["cpu_finalized"] = True
+                view["current_cpu_cores"] = None
+                state["peaks"][_peak_key(sid, nid)] = view
                 samples.append(_sample_row(sid, nid, view, observed_at))
 
         # Destructive watchdog passes are gated to the configured 300..600s
