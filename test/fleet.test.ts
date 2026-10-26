@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
-import { FleetService } from '../src/fleet';
+import { FleetService, isCapacityOnlyHold } from '../src/fleet';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 import { SESSION_CONTROL_SCHEMA, SessionControlService } from '../src/session_control';
@@ -413,6 +413,18 @@ describe('generic accounts and launch placement', () => {
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'hetzner'", JSON.stringify(hb));
     s.drainCapacityQueue();
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', parked.value.id).one().state).toBe('offered');
+  }));
+  it('holds placement on 5-min CPU load above 1.5x cores and resumes below (resource management)', async () => fixture(async (s, sql) => {
+    await configure(s);
+    sql.exec("UPDATE machines SET capabilities = ? WHERE id='hetzner'", JSON.stringify({ engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
+    const hb: any = { mem_avail_mb: 32000, disk_free_gb: 80, load: [5, 13, 4], gate: { launch_allowed: true, at: iso() } };
+    sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id='hetzner'", JSON.stringify(hb));
+    const input = intent({ machine: 'hetzner', mode: 'headless' });
+    expect(s.plan(input).rejected?.[0]?.reason).toBe('host_cpu_load');
+    expect(isCapacityOnlyHold(s.plan(input).rejected)).toBe(true);
+    hb.load = [30, 11, 20];
+    sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id='hetzner'", JSON.stringify(hb));
+    expect(s.plan(input).rejected?.some((r: any) => r.reason === 'host_cpu_load')).toBe(false);
   }));
   it('fails closed on stale launcher telemetry and counts unstarted offers', async () => fixture(async (s, sql) => {
     await configure(s);
