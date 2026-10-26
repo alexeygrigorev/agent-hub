@@ -44,6 +44,21 @@ Serverless coordination hub for Alexey's multi-agent project: 30-minute headless
 
 OpenCode (`oc`, `--engine opencode`) always runs Muse Spark 1.3 (`opencode-go/muse-spark-1.3-contributor`), never a GLM / Z.ai Coding Plan model. All GLM / Z.ai work goes through zcodex (`--profile zcodex`, launcher `zai` route).
 
+## Local test storage
+
+Before installing dependencies in a fresh checkout, run
+`python3 scripts/local-dependencies.py` to reuse a validated matching canonical
+installation. `scripts/test-full-local.sh` runs this check automatically. Do not
+run `npm ci` in each worktree when matching dependencies already exist; each copy
+can add hundreds of megabytes. When manifests change, choose a matching donor
+with `--source` or deliberately prepare one installation for that lockfile.
+Never replace or remove another checkout's dependencies.
+
+The full runner gives each run a unique temporary directory and zero pytest
+temporary-file retention, removing only that run's new temps on exit. Existing
+scratch, caches and session data need explicit owner approval before cleanup.
+See [local test storage](docs/LOCAL-TEST-STORAGE.md).
+
 ## Throwaway containers
 
 Use `docker run --rm` for every throwaway/test container and attach a unique

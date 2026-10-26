@@ -7,20 +7,29 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}" || exit 1
 
-mkdir -p .local/tmp || exit 1
-export TMPDIR="${TMPDIR:-${REPO_ROOT}/.local/tmp}"
+python3 scripts/local-dependencies.py || exit 1
 
-# Disposable HOME to ensure hermeticity against personal dotfiles / checkouts
-DISPOSABLE_HOME="$(mktemp -d -p "${TMPDIR}" home-hermetic-XXXXXX)" || exit 1
+# Capture the shared cache before the Python suite switches to a disposable HOME.
+export UV_CACHE_DIR="${UV_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/uv}"
+TMP_PARENT="${TMPDIR:-.local/tmp}"
+mkdir -p "${TMP_PARENT}" || exit 1
+# Keep the default relative: long absolute paths can exceed Unix socket limits.
+RUN_TMP="$(mktemp -d -p "${TMP_PARENT}" f-XXXXXX)" || exit 1
 cleanup() {
-  rm -rf "${DISPOSABLE_HOME}"
+  # Retention applies only to this run's newly created temporary files.
+  rm -rf -- "${RUN_TMP}"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+export TMPDIR="${RUN_TMP}"
+DISPOSABLE_HOME="$(cd "${RUN_TMP}" && pwd)/home"
+mkdir "${DISPOSABLE_HOME}" || exit 1
 
 FAILURES=0
 
 echo "=== Scope boundary (all new commits and working changes) ==="
-if ! python3 scripts/ci/scope_guard.py --working || ! python3 -m unittest discover -s scripts/ci -p "test_scope_guard.py"; then
+if ! python3 scripts/ci/scope_guard.py --working || ! python3 -m unittest discover -s scripts/ci -p "test_scope_guard.py" || ! python3 scripts/test_local_dependencies.py || ! python3 scripts/test_full_local_storage.py; then
   echo "FAIL: Scope boundary checks failed"
   FAILURES=$((FAILURES + 1))
 fi
@@ -45,7 +54,7 @@ fi
 
 echo "=== 4/6: Vitest Discovery Suite (all test files, bounded concurrency) ==="
 VITEST_RC=0
-npx vitest run --no-file-parallelism --maxWorkers 1 || VITEST_RC=$?
+npx --no-install vitest run --configLoader runner --no-file-parallelism --maxWorkers 1 || VITEST_RC=$?
 if [ "${VITEST_RC}" -ne 0 ]; then
   echo "FAIL: Vitest discovery suite exited with code ${VITEST_RC}"
   FAILURES=$((FAILURES + 1))
@@ -71,7 +80,9 @@ PYTHONUSERBASE="${ORIGINAL_USER_BASE}" \
 DTC_AUTH_HOME="${DTC_AUTH_PATH}" \
 PYTHONPATH="host:host/tests" \
 CODEX_LAUNCH_WRAPPER="" \
-"${UV_BIN}" run --frozen --with pytest python -m pytest -q || PYTEST_RC=$?
+"${UV_BIN}" run --frozen --with pytest python -m pytest -q \
+  --basetemp "${RUN_TMP}/pytest" \
+  -o tmp_path_retention_count=0 -o tmp_path_retention_policy=none || PYTEST_RC=$?
 
 if [ "${PYTEST_RC}" -ne 0 ]; then
   echo "FAIL: Python discovery suite exited with code ${PYTEST_RC}"
