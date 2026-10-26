@@ -2,6 +2,7 @@ import { SqlStorage, DurableObjectState } from "@cloudflare/workers-types";
 import { Env } from "./env";
 import { sha256 } from "./auth/crypto";
 import { getSession, allowedCallbackUrls, verifyCsrf } from "./auth/session";
+import { syncTbmFromHostSnapshot, syncTbmFromServerAccounts } from "./tbm-ingestion";
 
 export const QUOTA_SCHEMA_version = "1.1";
 export const QUOTA_SCHEMA_VERSIONS = new Set<string>(["1.0", "1.1"]);
@@ -167,6 +168,10 @@ CREATE TABLE IF NOT EXISTS tbm_quota_pools (
     remaining_tokens INTEGER NOT NULL,
     headroom_percentage REAL NOT NULL,
     reset_at_ms INTEGER NOT NULL,
+    cycle_ms INTEGER,
+    window_type TEXT,
+    remaining_percent REAL,
+    capacity_known INTEGER NOT NULL DEFAULT 1,
     hard_floor_percent REAL NOT NULL DEFAULT 5.0,
     soft_reserve_percent REAL NOT NULL DEFAULT 20.0,
     convexity_exponent REAL NOT NULL DEFAULT 1.5,
@@ -246,6 +251,22 @@ export function ensureTbmQuotaSchema(sql: SqlStorage): void {
     if (trimmed) {
       sql.exec(trimmed);
     }
+  }
+  // Additive AC1 columns for live ingestion (cycle_ms/window_type + percent
+  // support). Fresh CREATEs above already include them; existing DBs gain them
+  // here without touching prior columns.
+  try {
+    const cols = new Set(
+      sql.exec("PRAGMA table_info(tbm_quota_pools)").toArray().map((c: any) => c.name as string)
+    );
+    if (!cols.has("cycle_ms")) sql.exec("ALTER TABLE tbm_quota_pools ADD COLUMN cycle_ms INTEGER");
+    if (!cols.has("window_type")) sql.exec("ALTER TABLE tbm_quota_pools ADD COLUMN window_type TEXT");
+    if (!cols.has("remaining_percent"))
+      sql.exec("ALTER TABLE tbm_quota_pools ADD COLUMN remaining_percent REAL");
+    if (!cols.has("capacity_known"))
+      sql.exec("ALTER TABLE tbm_quota_pools ADD COLUMN capacity_known INTEGER NOT NULL DEFAULT 1");
+  } catch {
+    /* best-effort migration; callers stay fail-closed on missing tables */
   }
 }
 
@@ -1253,6 +1274,15 @@ export class QuotaStore {
         routesJson
       );
 
+      // AC1: every accepted host collection fills TBM pools/tranches.
+      // Best-effort inside the same transaction; quota acceptance stays
+      // authoritative even if TBM sync finds no mappable windows.
+      try {
+        syncTbmFromHostSnapshot(this.sql, hostId, snap.routes as Record<string, any>, nowMs);
+      } catch {
+        /* quota acceptance wins; TBM stays to be backfilled on next collection */
+      }
+
       const ageMs = Math.max(0, nowMs - snap.captured_at_ms);
       const isStale = ageMs >= QUOTA_STALE_MS;
 
@@ -1696,9 +1726,16 @@ export class QuotaStore {
       rows.push({ account, provider, quota });
     }
     if (!this.ctx) return jsonResponse({ error: "storage_unavailable" }, 503);
+    const acceptedAtMs = this.now();
     this.ctx.storage.transactionSync(() => {
       for (const row of rows) this.sql.exec("INSERT OR REPLACE INTO server_quota_snapshots VALUES (?, ?, ?, ?)",
         row.account, row.provider, data.captured_at, JSON.stringify(row.quota));
+      // AC1: every accepted server collection fills TBM pools/tranches.
+      try {
+        syncTbmFromServerAccounts(this.sql, rows, acceptedAtMs);
+      } catch {
+        /* server acceptance wins; TBM backfills on the next collection */
+      }
     });
     return jsonResponse({ status: "stored", accounts: rows.length });
   }

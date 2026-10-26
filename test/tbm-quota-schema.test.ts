@@ -16,7 +16,8 @@ const EXPECTED_TABLES = [
 const EXPECTED_COLUMNS: Record<string, string[]> = {
   tbm_quota_pools: [
     'pool_id', 'provider', 'account', 'total_capacity_tokens', 'remaining_tokens',
-    'headroom_percentage', 'reset_at_ms', 'hard_floor_percent', 'soft_reserve_percent',
+    'headroom_percentage', 'reset_at_ms', 'cycle_ms', 'window_type',
+    'remaining_percent', 'capacity_known', 'hard_floor_percent', 'soft_reserve_percent',
     'convexity_exponent', 'current_burn_rate_tpm', 'target_burn_rate_tpm', 'pacing_ratio',
     'kill_switch_active', 'kill_switch_reason', 'kill_switch_updated_at', 'last_updated_ms',
   ],
