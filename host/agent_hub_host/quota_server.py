@@ -61,18 +61,34 @@ def collect_accounts(settings, *, runner=None):
         if not isinstance(managed, list):
             managed = []
         now = datetime.datetime.now(datetime.timezone.utc)
+        # Index personal results by (provider, account): dispatch executes the
+        # managed HOME credential, so a managed observation for the identical
+        # pair must replace the personal server-local probe (wrong-account-key
+        # fix for intake f6709905: label collision hid a managed 401 behind a
+        # fresh personal token, routing /goal starts at a dead account while
+        # `hub quota` looked fresh). A managed pair that differs from every
+        # personal pair (e.g. managed (codex, codex-orin) vs personal
+        # (codex-orin, codex-orin)) is an additional dispatchable route and is
+        # appended, never dropped on bare-label collision.
+        by_pair = {}
+        for idx, row in enumerate(results):
+            if isinstance(row, dict):
+                by_pair[(row.get('provider'), row.get('account'))] = idx
         for entry in entries:
             if not isinstance(entry, dict):
                 raise ValueError('Invalid managed account catalog')
             label, provider = entry.get('label'), entry.get('provider')
             if not isinstance(label, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', label) or provider not in quota_snapshot.ALLOWED_PROVIDERS:
                 raise ValueError('Invalid managed account catalog')
-            if label in seen:
+            pair = (provider, label)
+            row = next((r for r in managed if isinstance(r, dict) and r.get('account') == label and r.get('provider') == provider), {})
+            quota = quota_snapshot.sanitize_provider(provider, row.get('quota'), now)
+            if pair in by_pair:
+                results[by_pair[pair]] = {'account': label, 'provider': provider, 'quota': quota}
                 continue
             seen.add(label)
-            row = next((r for r in managed if isinstance(r, dict) and r.get('account') == label and r.get('provider') == provider), {})
-            results.append({'account': label, 'provider': provider,
-                            'quota': quota_snapshot.sanitize_provider(provider, row.get('quota'), now)})
+            by_pair[pair] = len(results)
+            results.append({'account': label, 'provider': provider, 'quota': quota})
     return {'captured_at': quota_snapshot.format_iso_utc(datetime.datetime.now(datetime.timezone.utc)), 'accounts': results}
 
 

@@ -786,6 +786,54 @@ def test_check_codex_quota_gate_contract(monkeypatch):
     assert reason == 'stale_window_evidence'
 
 
+def test_check_codex_quota_gate_401_error_shape_refuses_with_quota_unavailable(monkeypatch):
+    """Wrong-account-key regression (intake f6709905): the real managed 401
+    payload (status error, all windows null) must refuse closed with the
+    machine-safe quota_unavailable slug, while a fresh 7d window passes."""
+    def mock_proc(stdout_obj, rc=0):
+        class Proc:
+            returncode = rc
+            stdout = json.dumps(stdout_obj) if isinstance(stdout_obj, (dict, list)) else str(stdout_obj)
+        return Proc()
+
+    env = {'HOME': '/tmp'}
+    now = datetime.now(timezone.utc)
+    future_reset = (now + timedelta(days=7)).isoformat()
+
+    quse_401 = {
+        'codex': {
+            'status': 'error',
+            'error': 'HTTP Error 401: Unauthorized',
+            'details': {'limit_reached': False},
+            'windows': {
+                '5h': {'percent_remaining': None, 'reset_at': None},
+                '7d': {'percent_remaining': None, 'reset_at': None},
+                'monthly': {'percent_remaining': None, 'reset_at': None},
+            },
+        }
+    }
+    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_401))
+    allowed, reason = p.check_codex_quota_gate(env)
+    assert allowed is False
+    assert reason == 'quota_unavailable'
+
+    quse_fresh = {
+        'codex': {
+            'status': 'ok',
+            'details': {'limit_reached': False},
+            'windows': {
+                '5h': {'percent_remaining': None, 'reset_at': None},
+                '7d': {'percent_remaining': 54.0, 'reset_at': future_reset},
+                'monthly': {'percent_remaining': None, 'reset_at': None},
+            },
+        }
+    }
+    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_fresh))
+    allowed, reason = p.check_codex_quota_gate(env)
+    assert allowed is True
+    assert reason == 'ok'
+
+
 def test_gemini_launcher_metadata_defaults_to_native_gemini_2_5_pro():
     meta = p.launcher_metadata('gemini', {'args': []})
     assert meta['launcher_provider'] == 'gemini'
