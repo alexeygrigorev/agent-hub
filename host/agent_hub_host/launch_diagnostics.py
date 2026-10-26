@@ -10,6 +10,7 @@ import json
 # Match complete known launcher refusal lines, including traceback final lines.
 # Messages are constants: suffixes, payloads, paths and credentials never survive.
 REFUSALS = {
+    'launcher_disk_reserve': ('launcher_disk_reserve', 'Host disk headroom after launcher reservations is below the maintained disk floor.'),
     'memory_pressure': ('memory_pressure', 'Host memory full pressure exceeds the safety cap.'),
     'host_oom': ('host_oom', 'A recent host OOM kill requires a placement cooldown.'),
     'host_runtime_choking': ('host_runtime_choking', 'Recent session or service failures require a placement cooldown.'),
@@ -341,6 +342,13 @@ def diagnostic(raw='', *, error_type='RuntimeError', exit_code=None, stage='laun
         if typed:
             error_type = typed.group(1)
         candidate = re.sub(r'^(?:ValueError|RuntimeError|PermissionError|OSError|FileNotFoundError|TimeoutError|JSONDecodeError): ', '', clean_line)
+        # The maintained launcher emits this numeric ValueError before spawn.
+        # Match the entire grammar; never forward raw paths, suffixes or payloads.
+        if re.fullmatch(r'(?:cwd|tmpdir) filesystem free < (?:20|50)GiB floor \+ required disk \([0-9]{1,16} B\)', candidate):
+            reason, message = REFUSALS['launcher_disk_reserve']
+            surfaced_tail = candidate
+            refusal_found = True
+            break
         if candidate in REFUSALS:
             reason, message = REFUSALS[candidate]
             refusal_found = True

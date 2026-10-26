@@ -809,7 +809,7 @@ export class SessionControlService {
     let promoted = 0, cancelled = 0;
     if (!this.hooks.reserve) return { promoted, cancelled };
     const transientReasons = new Set([
-      'disk_floor', 'resource_limit', 'launcher_memory_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity',
+      'disk_floor', 'launcher_disk_reserve', 'resource_limit', 'launcher_memory_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity',
       'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking',
     ]);
     try {

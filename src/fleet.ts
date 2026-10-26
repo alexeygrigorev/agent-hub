@@ -1,4 +1,5 @@
 import {sanitizeCpuAdmission} from './cpu-headroom';
+import { launcherDiskHeadroom } from './launcher-disk';
 /** Generic account registry and placement. Provider credentials never enter this service. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { RoutingService } from './routing';
@@ -93,7 +94,7 @@ function disabledEngines(): Set<string> {
   return new Set<string>((((policy as any).models || []) as any[]).filter(m => m && disabled.has(m.provider)).map(m => String(m.engine)));
 }
 /** Reject reasons that mean "no free slot right now" (transient capacity). */
-const CAPACITY_REASONS = new Set(['disk_floor', 'account_capacity', 'account_concurrency', 'machine_capacity', 'launcher_memory_reserve', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
+const CAPACITY_REASONS = new Set(['disk_floor', 'launcher_disk_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity', 'launcher_memory_reserve', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
 /** Launcher memory gate inputs, mirrored here for dashboard visibility only.
  * The placement verdict stays in plan(); this module never changes the math,
  * it only projects the same inputs (MemAvailable, reserved total, floor for
@@ -795,11 +796,12 @@ export class FleetService {
       // Root-disk floor is configurable (resource_settings.disk_floor_gb, default
       // 15 GiB). Docker and /tmp live on /data, so / only needs modest headroom.
       else if (Number.isFinite(hb.disk_free_gb) && hb.disk_free_gb < this.resources.config().disk_floor_gb) reason = 'disk_floor';
+      else if (request.mode === 'headless' && this.diskHeadroom(route.machine_id, effectiveWorkspace, undefined, request.cwd)?.admitted === false) reason = 'launcher_disk_reserve';
       else if (!this.resources.cpuHeadroom(route.machine_id,request).admitted) reason = this.resources.cpuHeadroom(route.machine_id,request).reason!;
       else if (!account || account.status !== 'ok') reason = 'account_' + (account?.status || 'unmapped');
       else if (!this.observation(definitions.get(route.account), route)) reason = 'machine_account_quota_unknown';
       else if (account.available_slots < 1) reason = 'account_concurrency';
-      if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'account_concurrency' ? { account: route.account, concurrency: { active: account!.active, limit: account!.max_concurrency, available: account!.available_slots }, quota_status: account!.status } : {}), ...(reason === 'launcher_memory_reserve' ? { memory: this.resources.headroom(route.machine_id, request, route.engine) } : {}), ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}), ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:this.resources.cpuHeadroom(route.machine_id,request)} : {}) }); continue; }
+      if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'account_concurrency' ? { account: route.account, concurrency: { active: account!.active, limit: account!.max_concurrency, available: account!.available_slots }, quota_status: account!.status } : {}), ...(reason === 'launcher_memory_reserve' ? { memory: this.resources.headroom(route.machine_id, request, route.engine) } : {}), ...(reason === 'launcher_disk_reserve' ? { disk: this.diskHeadroom(route.machine_id, effectiveWorkspace, undefined, request.cwd) } : {}), ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}), ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:this.resources.cpuHeadroom(route.machine_id,request)} : {}) }); continue; }
       const family = canonicalQuotaProvider(definitions.get(route.account)?.provider as string);
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
@@ -839,6 +841,15 @@ export class FleetService {
       request.workspace = candidates[0].workspace;
     }
     return { request, selected: candidates[0] || null, candidates, rejected };
+  }
+
+  private diskHeadroom(machine: string, workspace?: string, excludeId?: string, cwd?: string) {
+    const row: any = this.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', machine).toArray()[0];
+    const hb = parsed(row?.last_heartbeat);
+    if (!fresh(hb.launcher_resources?.observed_at, this.now(), LAUNCHER_TELEMETRY_STALE_MS)) return null;
+    const pending = this.sql.exec("SELECT id FROM fleet_launches WHERE machine_id = ? AND mode = 'headless' AND state IN ('offered','starting','running','uncertain')", machine).toArray()
+      .map((r: any) => String(r.id)).filter(id => id !== excludeId);
+    return launcherDiskHeadroom(hb, pending, this.resources.config().disk_floor_gb, workspace, cwd);
   }
 
   private memoryHeadroom(machine: string) {
@@ -928,8 +939,17 @@ export class FleetService {
           continue;
         }
         const memoryHold: any = this.sql.exec('SELECT since, refused FROM fleet_memory_holds WHERE launch_id = ?', row.id).toArray()[0];
-        // A refused pre-spawn attempt needs a newer host sample before retry.
-        if (memoryHold?.refused && (this.memoryHeadroom(plan.selected.machine).observed_at || '') <= memoryHold.since) continue;
+        // Keep known disk evidence sticky if a later plan reports another
+        // temporary hold. A generic heartbeat cannot clear that refusal.
+        const diskHeld = parsed(row.launch_error_json)?.reason === 'launcher_disk_reserve';
+        if (memoryHold?.refused && !diskHeld && (this.memoryHeadroom(plan.selected.machine).observed_at || '') <= memoryHold.since) continue;
+        const diskOrigin: any = diskHeld ? this.sql.exec('SELECT l.machine_id FROM fleet_launches l JOIN fleet_memory_holds h ON h.launch_id=l.id WHERE h.retry_id=?', row.id).toArray()[0] : null;
+        if (memoryHold?.refused && diskHeld && (!diskOrigin || diskOrigin.machine_id === plan.selected.machine)) {
+          const machine: any = this.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', plan.selected.machine).toArray()[0];
+          const disk = parsed(machine?.last_heartbeat).launcher_resources;
+          const verdict = this.diskHeadroom(plan.selected.machine, plan.request.workspace, undefined, plan.request.cwd);
+          if (!disk || disk.observed_at <= memoryHold.since || !verdict?.admitted) continue;
+        }
         if (bound.parent_id) {
           const parent: any = this.sql.exec('SELECT actor, state FROM fleet_launches WHERE id = ?', bound.parent_id).toArray()[0];
           if (!parent || parent.actor !== row.actor || !['starting', 'running'].includes(parent.state)) continue;
@@ -952,7 +972,7 @@ export class FleetService {
           const patched = { ...bound, workspace: normalizedWorkspace };
           patchedJson = JSON.stringify(patched);
         } catch { /* keep the stored intent on stringify failure */ }
-        const written: any = this.sql.exec("UPDATE fleet_launches SET machine_id = ?, engine = ?, account = ?, profile = ?, workspace = ?, request_json = ?, model_selection_json = ?, state = 'offered', updated_at = ? WHERE id = ? AND state = 'queued' RETURNING id",
+        const written: any = this.sql.exec("UPDATE fleet_launches SET machine_id = ?, engine = ?, account = ?, profile = ?, workspace = ?, request_json = ?, model_selection_json = ?, state = 'offered', launch_error_json = CASE WHEN json_extract(launch_error_json, '$.reason') = 'launcher_disk_reserve' THEN NULL ELSE launch_error_json END, updated_at = ? WHERE id = ? AND state = 'queued' RETURNING id",
           selected.machine, selected.engine, selected.account, selected.profile ?? null, normalizedWorkspace, patchedJson, JSON.stringify(selected.selection), new Date(this.now()).toISOString(), row.id).toArray()[0];
         if (written) {
           this.resources.freezeCpuStart(String(row.id),selected);
@@ -1619,17 +1639,28 @@ export class FleetService {
           data.state === 'failed' && data.confirmed_exit === true &&
           (data.reason === 'launcher_not_started' || (diagnostic && data.reason === diagnostic.reason)) &&
           data.launcher_task_id === 'hub-' + row.id && !row.native_id;
-        if (noStart && ['launcher_memory_reserve','cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(data.reason)) {
+        // Owning-host enrichment of the exact legacy no-start receipt. Keep
+        // its terminal lifecycle and history; never restart the original job.
+        if (noStart && row.mode === 'headless' && row.state === 'failed' &&
+            row.verification_status === 'not_started' && row.exit_reason === 'launcher_command_failed' &&
+            row.launcher_task_id === data.launcher_task_id && data.reason === 'launcher_disk_reserve' &&
+            diagnostic?.error_type === 'ValueError' && diagnostic?.stage === 'dispatch_headless' &&
+            diagnostic?.message === 'Host disk headroom after launcher reservations is below the maintained disk floor.') {
+          this.sql.exec('UPDATE fleet_launches SET launch_error_json = ?, exit_reason = ? WHERE id = ?', JSON.stringify(diagnostic), diagnostic.reason, row.id);
+          return response({ id: row.id, state: row.state, replay: true });
+        }
+        if (noStart && ['launcher_disk_reserve','launcher_memory_reserve','cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(data.reason)) {
           const prior: any = this.sql.exec('SELECT retry_id FROM fleet_memory_holds WHERE launch_id = ?', row.id).toArray()[0];
           if (prior?.retry_id) return response({ id: prior.retry_id, state: 'queued', replay: true });
           if (row.state === 'starting' && !this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) {
             // Fenced no-start proof: keep the user's session queued, with a new
             // launcher task identity. Never reset/reuse the failed local task.
             const id = crypto.randomUUID(), at = new Date(this.now()).toISOString();
-            const rejected = [{ machine: row.machine_id, engine: row.engine, reason: data.reason, ...(data.reason==='launcher_memory_reserve' ? {memory:this.memoryHeadroom(row.machine_id)} : {cpu:{...this.resources.cpuHeadroom(row.machine_id,parsed(row.request_json),row.id),...(diagnostic?.cpu || {})}}) }];
+            const rejected = [{ machine: row.machine_id, engine: row.engine, reason: data.reason, ...(data.reason==='launcher_disk_reserve' ? {disk:this.diskHeadroom(row.machine_id,row.workspace,row.id)} : data.reason==='launcher_memory_reserve' ? {memory:this.memoryHeadroom(row.machine_id)} : {cpu:{...this.resources.cpuHeadroom(row.machine_id,parsed(row.request_json),row.id),...(diagnostic?.cpu || {})}}) }];
             this.sql.exec("UPDATE fleet_launches SET request_key = ?, state = 'exited', exit_reason = ?, launch_error_json = ?, verification_status = 'not_started', finished_at = ?, updated_at = ? WHERE id = ?", 'memory-retry-' + row.id, data.reason, JSON.stringify(diagnostic), at, at, row.id);
             this.sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, '', '', '', NULL, ?, ?, ?, 'queued', ?, ?)", id, row.actor, row.requester_kind, row.parent_id, row.summary, row.request_key, row.request_json, row.mode, row.workspace, row.prompt, row.created_at, at);
             this.memoryHold(row.id, rejected, true); this.memoryHold(id, rejected, true);
+            if (data.reason === 'launcher_disk_reserve') this.sql.exec('UPDATE fleet_launches SET launch_error_json = ? WHERE id = ?', JSON.stringify(diagnostic), id);
             // Durable alert exists even if a later heartbeat promotes before cron.
             const alerts = new LivenessService(this.sql); alerts.init();
             alerts.setAlert('launch', row.id, { state: data.reason, detail: JSON.stringify(rejected) });

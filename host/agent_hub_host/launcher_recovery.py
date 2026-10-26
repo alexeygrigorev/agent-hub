@@ -165,7 +165,7 @@ def settle_retired_legacy(launcher, *, state_dir=None):
     return settled
 
 
-def reconcile_resources(launcher, runner):
+def reconcile_resources(launcher, runner, *, workspace_paths=None, workspace_aliases=None):
     """Periodic launcher reconciliation also covers stops/failures without journals.
 
     Launcher owns exact native death proof and resident credit. Unknown or live
@@ -179,6 +179,51 @@ def reconcile_resources(launcher, runner):
         memory = result["active_mem_mb"]
         if type(memory) not in (int, float) or not 0 <= memory <= 10**9:
             return None
-        return {"active_mem_mb": memory, "observed_at": observed_at}
+        projected = {"active_mem_mb": memory, "observed_at": observed_at}
+        disk = result.get('active_disk_mb')
+        if type(disk) in (int, float) and 0 <= disk <= 10**9:
+            # Maintained launcher/resources.py contract: 20 GiB plus the
+            # ledger's active disk promises and one bounded 512 MiB spike.
+            # This mirrors the gate; it never lowers or configures it.
+            projected.update(active_disk_mb=disk, disk_floor_mb=20480, next_disk_mb=512)
+            if workspace_paths is not None:
+                import shutil
+                paths = []
+                for raw in sorted(set(workspace_paths))[:64]:
+                    try:
+                        path = Path(raw).resolve(strict=True)
+                        if path.is_dir():
+                            paths.append({'path': str(path), 'free_gb': shutil.disk_usage(path).free / (1024**3)})
+                            # Native launches put TMPDIR here. Preserve this
+                            # logical association even when tmp is a symlink or
+                            # separate mount. Before creation, use its nearest
+                            # existing parent without creating any directories.
+                            temp = path / '.local' / 'tmp'
+                            existing = temp
+                            while not existing.exists():
+                                if existing.is_symlink():
+                                    raise ValueError('dangling temp symlink')
+                                existing = existing.parent
+                            if existing.is_dir():
+                                paths.append({'path': str(temp), 'free_gb': shutil.disk_usage(existing).free / (1024**3)})
+                    except (OSError, ValueError, TypeError):
+                        continue
+                projected['disk_paths'] = paths
+                aliases = {}
+                if isinstance(workspace_aliases, dict):
+                    for alias, raw in sorted(workspace_aliases.items())[:64]:
+                        try:
+                            target = str(Path(raw).resolve(strict=True))
+                            if isinstance(alias, str) and 0 < len(alias) <= 512 and any(p['path'] == target for p in paths):
+                                aliases[alias] = target
+                        except (OSError, ValueError, TypeError):
+                            continue
+                projected['disk_aliases'] = aliases
+            breakdown = result.get('breakdown')
+            if isinstance(breakdown, list) and len(breakdown) <= 256 and all(
+                    isinstance(r, dict) and isinstance(r.get('task_id'), str)
+                    and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,127}', r['task_id']) for r in breakdown):
+                projected['disk_task_ids'] = [r['task_id'] for r in breakdown]
+        return projected
     except (KeyError, TypeError, ValueError, OSError, RuntimeError):
         return None

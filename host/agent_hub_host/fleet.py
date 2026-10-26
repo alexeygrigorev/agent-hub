@@ -2612,6 +2612,13 @@ class Dispatcher:
                                 "diagnostic": failure,
                             }
                         ack = self.request("POST", path + "/result", payload)
+                        if (failure["reason"] == "launcher_disk_reserve" and isinstance(ack, dict)
+                                and ack.get("state") == "queued" and (ack.get("queued") is True or ack.get("replay") is True)
+                                and isinstance(ack.get("id"), str) and ack["id"] != offer_id):
+                            record["settled"] = True
+                            self._persist_launch_record(record)
+                            return {"id": offer_id, "state": "held", "retry_id": ack["id"],
+                                    "reason": failure["reason"], "diagnostic": failure}
                         if isinstance(ack, dict) and ack.get("id") == offer_id and ack.get("state") == "failed":
                             record["settled"] = True
                             self._persist_launch_record(record)
@@ -3085,7 +3092,9 @@ class Dispatcher:
         hb = api.get_heartbeat_payload()
         if self.settings.get('launcher'):
             from .launcher_recovery import reconcile_resources
-            resources = reconcile_resources(self.settings['launcher'], self.runner)
+            resources = reconcile_resources(self.settings['launcher'], self.runner,
+                workspace_paths=list(self.settings.get('workspaces', {}).values()) + self.settings.get('workspace_roots', []),
+                workspace_aliases=self.settings.get('workspaces', {}))
             if resources is not None:
                 hb['launcher_resources'] = resources
         caps = {'fleet_modes': ['interactive'] + (['headless'] if self.settings.get('launcher') else []),
@@ -3221,7 +3230,9 @@ class Dispatcher:
         hb = api.get_heartbeat_payload()
         if self.settings.get('launcher'):
             from .launcher_recovery import reconcile_resources
-            resources = reconcile_resources(self.settings['launcher'], self.runner)
+            resources = reconcile_resources(self.settings['launcher'], self.runner,
+                workspace_paths=list(self.settings.get('workspaces', {}).values()) + self.settings.get('workspace_roots', []),
+                workspace_aliases=self.settings.get('workspaces', {}))
             if resources is not None:
                 hb['launcher_resources'] = resources
         allowed, admitted_engines = self._admission_projection(caps)

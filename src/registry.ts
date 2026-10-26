@@ -46,6 +46,26 @@ function sanitizeHeartbeat(body: any) {
       && body.launcher_resources.active_mem_mb >= 0 && body.launcher_resources.active_mem_mb <= 1e9
       && typeof body.launcher_resources.observed_at === 'string' && body.launcher_resources.observed_at.length <= 64) {
     hb.launcher_resources = { active_mem_mb: body.launcher_resources.active_mem_mb, observed_at: body.launcher_resources.observed_at };
+    const disk = body.launcher_resources;
+    if (['active_disk_mb', 'disk_floor_mb', 'next_disk_mb'].every(k =>
+        typeof disk[k] === 'number' && Number.isFinite(disk[k]) && disk[k] >= 0 && disk[k] <= 1e9)) {
+      for (const k of ['active_disk_mb', 'disk_floor_mb', 'next_disk_mb']) hb.launcher_resources[k] = disk[k];
+      if (Array.isArray(disk.disk_paths) && disk.disk_paths.length <= 128 && disk.disk_paths.every((p: any) =>
+          p && typeof p.path === 'string' && p.path.startsWith('/') && p.path.length <= 1024 && !/[\x00-\x1f\x7f]/.test(p.path) &&
+          typeof p.free_gb === 'number' && Number.isFinite(p.free_gb) && p.free_gb >= 0 && p.free_gb <= 1e9)) {
+        hb.launcher_resources.disk_paths = disk.disk_paths.map((p: any) => ({path: p.path, free_gb: p.free_gb}));
+      }
+      if (disk.disk_aliases && typeof disk.disk_aliases === 'object' && !Array.isArray(disk.disk_aliases) &&
+          Object.entries(disk.disk_aliases).length <= 64 && Object.entries(disk.disk_aliases).every(([alias, target]) =>
+            alias.length > 0 && alias.length <= 512 && !/[\x00-\x1f\x7f]/.test(alias) &&
+            typeof target === 'string' && target.startsWith('/') && target.length <= 1024 && !/[\x00-\x1f\x7f]/.test(target))) {
+        hb.launcher_resources.disk_aliases = disk.disk_aliases;
+      }
+      if (Array.isArray(disk.disk_task_ids) && disk.disk_task_ids.length <= 256 &&
+          disk.disk_task_ids.every((id: any) => typeof id === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(id))) {
+        hb.launcher_resources.disk_task_ids = disk.disk_task_ids;
+      }
+    }
   }
   if (typeof body.mem_total_mb === 'number' && Number.isFinite(body.mem_total_mb) && body.mem_total_mb > 0) hb.mem_total_mb = body.mem_total_mb;
   if (typeof body.disk_free_gb === 'number' && Number.isFinite(body.disk_free_gb)) hb.disk_free_gb = body.disk_free_gb;
