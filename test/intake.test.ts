@@ -609,10 +609,11 @@ describe('private durable intake HTTP/SQLite', () => {
       { kind: 'decision', text: 'Use existing router', source },
     ]) task = (await append(task.id, task.version, event)).task;
     expect(task.payload_data.history[1].evidence).toBe('external_unverified_not_launch_proof');
+    task = (await append(task.id, task.version, { kind: 'note', text: 'DONE commit abc1234\nLive check: hub intake show\nResult: HTTP 200' })).task;
     await ok('/tasks/' + task.id, { key: 'close', expected_version: task.version, status: 'done' });
     const briefing = await ok('/handoff');
-    expect(briefing.total).toBe(1); expect(briefing.items[0].unresolved).toHaveLength(3);
-    expect((await ok('/tasks/' + task.id + '/links')).task.payload_data.history).toHaveLength(9);
+    expect(briefing.total).toBe(0);
+    expect((await ok('/tasks/' + task.id + '/links')).task.payload_data.history).toHaveLength(10);
   });
   it('requires current session CSRF and supports current token-admin cookie and human admin bearer', async () => {
     expect((await SELF.fetch('https://hub.test/api/intake/tasks')).status).toBe(401);
@@ -926,7 +927,7 @@ describe('private durable intake HTTP/SQLite', () => {
     });
     before = await compactState(); expect((await call('/tasks', { key: 'globalcap', project: 'demo', title: 'x', text: 'x', source })).status).toBe(507); expect(await compactState()).toEqual(before);
   });
-  it('prunes long-closed tasks on create (batch of 256 per pass)', async () => {
+  it('archives legacy terminal tasks in batches without deleting payloads', async () => {
     const stale = Date.now() - 20 * 86400000;
     const seed = 300;
     await inDO(stub(), (h: any) => {
@@ -934,15 +935,15 @@ describe('private durable intake HTTP/SQLite', () => {
     });
     const created = await ok('/tasks', { key: 'after-prune', project: 'demo', title: 'Synthetic', text: 'Synthetic', source });
     expect(created.task.id).toBeTruthy();
-    expect(await inDO(stub(), (h: any) => h.sql.exec("SELECT COUNT(*) AS n FROM intake_tasks WHERE id LIKE 'fixture-%'").one().n)).toBe(seed - 256);
+    expect(await inDO(stub(), (h: any) => h.sql.exec("SELECT COUNT(*) AS n FROM intake_tasks WHERE id LIKE 'fixture-%'").one().n)).toBe(seed);
   });
-  it('prunes terminal tasks after their 60s retention while keeping second-fresh closed work', async () => {
+  it('retains both old and fresh terminal payloads during archival', async () => {
     await inDO(stub(), (h: any) => {
       h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-aged', JSON.stringify({ id: 'fixture-aged', project: 'demo', status: 'done', updated_at: Date.now() - 120_000, history: [] }));
       h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', 'fixture-fresh', JSON.stringify({ id: 'fixture-fresh', project: 'demo', status: 'cancelled', updated_at: Date.now() - 30_000, history: [] }));
     });
     await ok('/tasks', { key: 'retention-boundary', project: 'demo', title: 'Synthetic', text: 'Synthetic', source });
-    expect(await inDO(stub(), (h: any) => h.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks WHERE id=?', 'fixture-aged').one().n)).toBe(0);
+    expect(await inDO(stub(), (h: any) => h.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks WHERE id=?', 'fixture-aged').one().n)).toBe(1);
     expect(await inDO(stub(), (h: any) => h.sql.exec('SELECT COUNT(*) AS n FROM intake_tasks WHERE id=?', 'fixture-fresh').one().n)).toBe(1);
   });
   it('keeps terminal tasks within retention but still admits create (soft task cap)', async () => {
@@ -968,7 +969,9 @@ describe('private durable intake HTTP/SQLite', () => {
     const listed = await ok('/tasks?status=open');
     expect(listed.open_non_terminal_count).toBeGreaterThan(100);
     expect(listed.intake_open_warning?.code).toBe('intake_open_high');
-    expect(listed.intake_open_warning?.action).toBe('spawn_cleanup_agent');
+    expect(listed.intake_open_warning?.action).toBe('review_done_evidence');
+    expect(listed.intake_open_warning.items).toHaveLength(101);
+    expect(listed.intake_open_warning.items[0]).toMatchObject({ id: expect.any(String), title: expect.any(String), age_ms: expect.any(Number) });
     const created = await ok('/tasks', { key: 'warn-create', project: 'demo', title: 'Synthetic', text: 'Synthetic', source });
     expect(created.task.id).toBeTruthy();
     expect(created.intake_open_warning?.code).toBe('intake_open_high');
@@ -983,5 +986,79 @@ describe('private durable intake HTTP/SQLite', () => {
     expect((await ok('/tasks', { key: 'after-receipt-prune', project: 'demo', title: 'Synthetic', text: 'Synthetic', source })).task.id).toBeTruthy();
     expect(await inDO(stub(), (h: any) => h.sql.exec("SELECT COUNT(*) AS n FROM intake_receipts WHERE id IN ('stale-receipt','legacy-receipt')").one().n)).toBe(0);
     expect(await ok('/tasks', payload)).toEqual(first);
+  });
+});
+
+
+describe('archive retention, evidence gates and durable audit', () => {
+  const done = { kind: 'note', text: 'DONE commit abc1234\nLive check: curl https://fixture.test/health\nResult: HTTP 200 healthy' };
+  it('refuses missing or incomplete evidence, cancels only with explicit reason and disposition', async () => {
+    let { task } = await create();
+    for (const text of ['', 'DONE abc1234', 'DONE\nLive check: curl /health\nResult: OK', 'DONE abc1234\nLive check: curl /health']) {
+      if (text) task = (await append(task.id, task.version, { kind: 'note', text })).task;
+      const res = await call('/tasks/' + task.id, { key: 'bad-close-' + ++seq, expected_version: task.version, status: 'done' });
+      expect(res.status).toBe(409); expect(await res.json()).toMatchObject({ error: 'done_evidence_required' });
+    }
+    const denied = await call('/tasks/' + task.id, { key: 'bad-cancel', expected_version: task.version, status: 'cancelled', reason: 'old' });
+    expect(denied.status).toBe(409);
+    task = (await ok('/tasks/' + task.id, { key: 'cancel-explicit', expected_version: task.version, status: 'cancelled', reason: 'dropped by Alexey: no longer requested' })).task;
+    expect(task.archived_at).toEqual(expect.any(Number));
+    expect((await ok('/tasks/' + task.id + '/audit')).items).toEqual(expect.arrayContaining([expect.objectContaining({ kind: 'cancel', from_status: 'open', to_status: 'cancelled', reason: 'dropped by Alexey: no longer requested' })]));
+  });
+  it('preserves closed payload/history after five minutes; supports archive filters, notes, reopen and fresh evidence', async () => {
+    let { task } = await create();
+    task = (await append(task.id, task.version, done)).task;
+    const close = { key: 'archive-close', expected_version: task.version, status: 'done' };
+    task = (await ok('/tasks/' + task.id, close)).task;
+    expect(await ok('/tasks/' + task.id, close)).toHaveProperty('task.id', task.id);
+    await inDO(stub(), (h: any) => h.sql.exec("UPDATE intake_tasks SET data=json_set(data,'$.updated_at',?) WHERE id=?", Date.now() - 301000, task.id));
+    await create(); // concurrent prune/archive activity triggered through normal write
+    const shown = (await ok('/tasks/' + task.id.slice(0, 8))).task;
+    expect(shown.payload_data.history).toEqual(task.payload_data.history);
+    expect(shown.archived_at).toEqual(task.archived_at);
+    expect((await ok('/tasks')).items.map((t: any) => t.id)).not.toContain(task.id);
+    for (const filter of ['all=true', 'archived=true', 'status=done'])
+      expect((await ok('/tasks?' + filter)).items.map((t: any) => t.id)).toContain(task.id);
+    const events = (await ok('/tasks/' + task.id + '/audit')).items;
+    expect(events.filter((e: any) => e.kind === 'close')).toHaveLength(1);
+    expect(events.map((e: any) => e.kind)).toEqual(['close', 'archive']);
+    expect(events.find((e: any) => e.kind === 'close')).toMatchObject({ actor: 'human:operator', from_status: 'open', to_status: 'done', captured_at: expect.any(Number), reason: done.text });
+    task = (await append(task.id.slice(0, 8), task.version, { kind: 'note', text: 'Post-close observation retained' })).task;
+    task = (await ok('/tasks/' + task.id.slice(0, 8), { key: 'reopen', expected_version: task.version, status: 'open', reason: 'additional work requested' })).task;
+    expect(task.archived_at).toBeNull();
+    expect((await call('/tasks/' + task.id, { key: 'stale-evidence', expected_version: task.version, status: 'done' })).status).toBe(409);
+    expect((await ok('/tasks/' + task.id + '/audit')).items[0].kind).toBe('reopen');
+  });
+  it('list/show/update/history agree for every visible full id and prefix during parallel archive passes', async () => {
+    const first = await create(), second = await create();
+    const closed = await append(second.task.id, 1, done);
+    await ok('/tasks/' + second.task.id, { key: 'agree-close', expected_version: closed.task.version, status: 'done' });
+    for (const query of ['', '?all=true', '?archived=true']) {
+      const list = await ok('/tasks' + query);
+      for (const entry of list.items) {
+        await Promise.all([create('other'), ...[entry.id, entry.id.slice(0, 8)].map(async id => {
+          expect((await ok('/tasks/' + id)).task.id).toBe(entry.id);
+          expect((await ok('/tasks/' + id + '/history')).task.payload_data.history).toEqual(entry.payload_data.history);
+        })]);
+        const updated = await ok('/tasks/' + entry.id.slice(0, 8), { key: 'agree-update-' + ++seq, expected_version: entry.version, next_step: 'verified' });
+        expect(updated.task.id).toBe(entry.id);
+      }
+    }
+    expect((await ok('/tasks/' + first.task.id)).task.status).toBe('open');
+  });
+  it('audit is append-only, survives row loss, and does not disclose other projects', async () => {
+    let { task } = await create('secret');
+    task = (await append(task.id, 1, done)).task;
+    task = (await ok('/tasks/' + task.id, { key: 'audit-close', expected_version: task.version, status: 'done' })).task;
+    const agent = await seedAgent(); await grant(agent);
+    expect((await call('/tasks/' + task.id + '/audit', undefined, agent.token)).status).toBe(404);
+    expect((await ok('/audit', undefined, agent.token)).items.every((e: any) => e.project === 'demo')).toBe(true);
+    await inDO(stub(), (h: any) => {
+      expect(() => h.sql.exec('UPDATE intake_audit SET reason=? WHERE task_id=?', 'tamper', task.id)).toThrow();
+      expect(() => h.sql.exec('DELETE FROM intake_audit WHERE task_id=?', task.id)).toThrow();
+      h.sql.exec('DELETE FROM intake_tasks WHERE id=?', task.id); // disposable fixture only
+    });
+    const events = (await ok('/tasks/' + task.id.slice(0, 8) + '/audit')).items;
+    expect(events.map((e: any) => e.kind)).toEqual(['delete', 'close', 'archive']);
   });
 });

@@ -892,11 +892,10 @@ export class MonitoringService {
     }
   }
 
-  /** Mark an intake task as resolved on recovery. */
+  /** Record recovery evidence; an operator closes the intake after attaching DONE evidence. */
   private resolveIntakeTask(taskId: string, machineId: string, fs: DiskFilesystem, now: number, resolutionDetail?: string): void {
     if (this.intake) {
       this.intake.serviceRecordEvent(taskId, {
-        status: 'done',
         currentState: resolutionDetail ?? `Recovered: ${fs.mount_point} is at ${fs.percent}% (< 85%)`,
         nextStep: null,
         event: {
@@ -915,7 +914,7 @@ export class MonitoringService {
       const row: any = this.sql.exec('SELECT data FROM intake_tasks WHERE id = ?', taskId).toArray()[0];
       if (!row) return;
       const task = JSON.parse(row.data);
-      task.status = 'done';
+      // Recovery is an observation, not evidence-backed acceptance of the intake.
       task.version = (task.version || 1) + 1;
       task.updated_at = now;
       task.current_state = resolutionDetail ?? `Recovered: ${fs.mount_point} is at ${fs.percent}% (< 85%)`;

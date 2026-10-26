@@ -297,9 +297,8 @@ payload limits, not a disk accounting estimate.
 Task **row count no longer hard-refuses** `intake_create` with HTTP 507
 `record_capacity`. Create stays soft-unlimited subject to the aggregate byte
 budget and a very high safety-net ceiling (`INTAKE_LIMITS.tasks`, currently
-10 000) only if the schema must refuse runaway growth. Terminal tasks still
-prune after a short retention so closed work does not permanently consume
-storage.
+10 000) only if the schema must refuse runaway growth. Terminal tasks are archived with full payload and history forever. They do not
+consume the active intake byte budget. Replay receipts still expire after 14 days.
 
 When the count of **non-terminal** tasks (`open`, `in_progress`, `blocked`,
 `pending_approval`) exceeds **`OPEN_INTAKE_WARN_THRESHOLD` (100)**, Hub emits
@@ -311,12 +310,9 @@ When the count of **non-terminal** tasks (`open`, `in_progress`, `blocked`,
   `open_non_terminal_count`
 - successful `POST /api/intake/tasks` create responses as `intake_open_warning`
 
-**Operator / Developer / orchestrator standing (Alexey):** on that warning,
-**same turn** spawn a cleanup agent to close inactive/stale/superseded/noise
-opens as `done`/`cancelled` with a short reason. Do **not** touch active Contabo
-DR work or other in-progress sessions that still have a running Hub/aplexer
-worker. Prefer closing report-backfill / podcast / CI stubs that sat idle for
-days. Prefer OpenCode for aplexer backup sessions; no new Claude/Grok engines.
+The warning lists each open intake's id, title and age in milliseconds.
+Closing requires a DONE note with evidence; review live proof before closing.
+No age or volume threshold authorizes closing unfinished work.
 
 Exhaustion of remaining hard budgets (bytes, events, grants, rules, receipts)
 still returns an explicit 507 capacity error, oversized streamed input 413,
@@ -337,3 +333,34 @@ PYTHONPATH=host python3 -m unittest host.tests.test_intake -v
 All fixtures are synthetic. These checks establish source behavior. They do not
 establish deployment, actual routing/session execution, physical assistant
 adoption, completed backfill, cross-host orchestration or full M12 acceptance.
+
+### Archive and completion evidence
+
+Closed/cancelled tasks receive `archived_at` immediately. Default lists hide them;
+`hub intake list --all` includes archives and follows all pages. Explicit
+`--status done`/`--status cancelled` includes matching archives. `--archived`
+selects only archives. REST/MCP use `all=true` / `archived=true`. Show, history,
+context, append and update accept full ids or unique prefixes for every status.
+Reopening clears `archived_at` and requires new evidence before the next close.
+
+Append a note before updating to done, for example:
+
+```json
+{"kind":"note","text":"DONE commit abc1234\nLive check: curl https://example.com/health\nResult: HTTP 200, healthy"}
+```
+
+The DONE note must contain a 7–40 character hex commit SHA or an HTTPS deploy URL
+with `/actions/runs/` or `/deployments/`, and nonempty `Live check:` and `Result:`
+fields. Evidence is recorded caller testimony, not independent validation.
+A status/title/project/AC change invalidates prior DONE evidence. Refusal is
+`done_evidence_required` (409). Cancellation needs `--reason` plus
+`--superseded-by ID`, or a reason containing `dropped by Alexey`.
+
+`hub intake audit ID` reads a task's lifecycle ledger; `hub intake audit` reads
+recent events. REST endpoints are `/api/intake/tasks/ID/audit` and
+`/api/intake/audit`; MCP tools are `intake_audit` and `intake_audit_recent`.
+Both paginate with `limit`, `after`, `revision`. The append-only SQL ledger records
+close, cancel, archive, reopen and any direct SQL deletion, independently of task
+rows. Deleted-row lookup is operator-only; live-task audit follows task grants.
+Direct SQL deletion attribution is `hub:sql` because SQLite cannot identify its
+caller; no product deletion endpoint exists. Never delete intakes.

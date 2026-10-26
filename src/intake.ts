@@ -15,8 +15,7 @@ type Tx = <T>(fn: () => T) => T;
 export type IntakeHooks = { startSession?: (input: Obj, auth: Auth) => Promise<{ status: number; body: any }> };
 /** Soft intake capacity (t1038u): no hard 507 refuse on task row count for create.
  * `tasks` remains only as a schema safety-net ceiling (very high). Open (non-terminal)
- * count > OPEN_INTAKE_WARN_THRESHOLD emits an operator warning; Developer/orchestrator
- * must spawn a cleanup agent the same turn (standing Alexey rule). */
+ * count > OPEN_INTAKE_WARN_THRESHOLD emits a warning requiring DONE evidence before close. */
 export const INTAKE_LIMITS = { request: 32768, tasks: 10000, taskBytes: 131072, events: 128,
   // Original requests and exact lost-response receipts are retained together.
   // The former 4 MiB budget blocked real intake after the initial backfill
@@ -144,7 +143,7 @@ export function recordIntakeSessionLink(sql: SqlStorage, session: Obj, now: numb
   sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(task), task.id);
   let bytes = 0;
   for (const table of ['tasks', 'grants', 'rules', 'receipts']) {
-    bytes += Number((sql.exec(`SELECT COALESCE(SUM(length(CAST(data AS BLOB))+length(CAST(id AS BLOB))),0) AS n FROM intake_${table}`).toArray()[0] as any).n);
+    bytes += Number((sql.exec(`SELECT COALESCE(SUM(length(CAST(data AS BLOB))+length(CAST(id AS BLOB))),0) AS n FROM intake_${table}${table === 'tasks' ? " WHERE json_extract(data,'$.archived_at') IS NULL AND json_extract(data,'$.status') NOT IN ('done','cancelled')" : ''}`).toArray()[0] as any).n);
   }
   if (bytes > INTAKE_LIMITS.totalBytes) throw new IntakeSessionLinkError('storage_capacity');
   sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
@@ -160,6 +159,33 @@ export class IntakeService {
       for (const table of ['tasks', 'grants', 'rules', 'receipts']) {
         this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_${table} (id TEXT PRIMARY KEY, data TEXT NOT NULL)`);
       }
+      // Independent, append-only lifecycle ledger. No FK: survives loss of a task row.
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_audit (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, project TEXT NOT NULL,
+        kind TEXT NOT NULL, actor TEXT NOT NULL, captured_at INTEGER NOT NULL,
+        from_status TEXT, to_status TEXT, reason TEXT NOT NULL)`);
+      this.sql.exec('CREATE INDEX IF NOT EXISTS intake_audit_task ON intake_audit(task_id,seq)');
+      for (const operation of ['UPDATE', 'DELETE']) this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_audit_no_${operation.toLowerCase()}
+        BEFORE ${operation} ON intake_audit BEGIN SELECT RAISE(ABORT,'append_only_audit'); END`);
+      const oldStatus = "json_extract(OLD.data,'$.status')";
+      const newStatus = "json_extract(NEW.data,'$.status')";
+      const auditActor = "COALESCE(json_extract(NEW.data,'$.lifecycle_actor'),json_extract(NEW.data,'$.history[#-1].actor'),'hub:legacy')";
+      const auditTime = "COALESCE(json_extract(NEW.data,'$.updated_at'),CAST(strftime('%s','now') AS INTEGER)*1000)";
+      const auditReason = "COALESCE(json_extract(NEW.data,'$.lifecycle_reason'),'legacy lifecycle transition')";
+      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_audit_status AFTER UPDATE ON intake_tasks
+        WHEN ${oldStatus} IS NOT ${newStatus} AND (${newStatus} IN ('done','cancelled') OR ${oldStatus} IN ('done','cancelled')) BEGIN
+        INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,from_status,to_status,reason)
+        VALUES(NEW.id,json_extract(NEW.data,'$.project'),CASE ${newStatus} WHEN 'done' THEN 'close' WHEN 'cancelled' THEN 'cancel' ELSE 'reopen' END,
+          ${auditActor},${auditTime},${oldStatus},${newStatus},${auditReason}); END`);
+      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_audit_archive AFTER UPDATE ON intake_tasks
+        WHEN json_extract(OLD.data,'$.archived_at') IS NULL AND json_extract(NEW.data,'$.archived_at') IS NOT NULL BEGIN
+        INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,from_status,to_status,reason)
+        VALUES(NEW.id,json_extract(NEW.data,'$.project'),'archive',${auditActor},json_extract(NEW.data,'$.archived_at'),${oldStatus},${newStatus},${auditReason}); END`);
+      // Defensive audit for any future SQL deletion path. No product deletion endpoint exists.
+      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_audit_delete AFTER DELETE ON intake_tasks BEGIN
+        INSERT INTO intake_audit(task_id,project,kind,actor,captured_at,from_status,to_status,reason)
+        VALUES(OLD.id,json_extract(OLD.data,'$.project'),'delete','hub:sql',CAST(strftime('%s','now') AS INTEGER)*1000,
+        ${oldStatus},NULL,'direct SQL delete; initiating actor unavailable'); END`);
       // A renamed/rebound registry identity cannot revive a former grant by moving back.
       // These triggers affect only our grant store; credential/registry ownership is unchanged.
       const actor = "CASE WHEN COALESCE(OLD.project,'')='' THEN OLD.tag ELSE OLD.project || ':' || OLD.tag END";
@@ -173,7 +199,8 @@ export class IntakeService {
   private get(table: string, id: string): Obj | undefined {
     let r = this.sql.exec(`SELECT data FROM intake_${table} WHERE id=?`, id).toArray()[0] as any;
     if (!r && table === 'tasks' && id.length >= 6) {
-      const candidates = this.sql.exec(`SELECT data FROM intake_tasks WHERE id LIKE ? || '%' LIMIT 2`, id).toArray() as any[];
+      const candidates = this.sql.exec(`SELECT data FROM intake_tasks WHERE substr(id,1,?)=? LIMIT 2`, id.length, id).toArray() as any[];
+      if (candidates.length > 1) fail('ambiguous_prefix');
       if (candidates.length === 1) r = candidates[0];
     }
     return r ? JSON.parse(r.data) : undefined;
@@ -183,18 +210,18 @@ export class IntakeService {
     this.sql.exec(`INSERT INTO intake_${table}(id,data) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data`, data.id, JSON.stringify(data));
   }
   private revision(): number { return (this.sql.exec('SELECT revision FROM intake_meta WHERE id=1').toArray()[0] as any).revision; }
-  private capacity() {
+  private capacity(additionalBytes = 0) {
     let bytes = 0;
     for (const table of ['tasks', 'grants', 'rules', 'receipts']) {
-      bytes += Number((this.sql.exec(`SELECT COALESCE(SUM(length(CAST(data AS BLOB))+length(CAST(id AS BLOB))),0) AS n FROM intake_${table}`).toArray()[0] as any).n);
+      bytes += Number((this.sql.exec(`SELECT COALESCE(SUM(length(CAST(data AS BLOB))+length(CAST(id AS BLOB))),0) AS n FROM intake_${table}${table === 'tasks' ? " WHERE json_extract(data,'$.archived_at') IS NULL AND json_extract(data,'$.status') NOT IN ('done','cancelled')" : ''}`).toArray()[0] as any).n);
     }
-    if (bytes > INTAKE_LIMITS.totalBytes) fail('storage_capacity', 507);
+    if (bytes + additionalBytes > INTAKE_LIMITS.totalBytes) fail('storage_capacity', 507);
   }
   private bounded(table: string, max: number) { if (this.rows(table).length >= max) fail('record_capacity', 507); }
   /** Non-terminal task count used for soft open-intake warnings (never blocks create). */
   openNonTerminalCount(principal?: Obj): number {
     const rows = this.rows('tasks');
-    return rows.filter(t => OPEN.includes(t.status) && (!principal || this.allowed(principal, t))).length;
+    return rows.filter(t => !t.archived_at && OPEN.includes(t.status) && (!principal || this.allowed(principal, t))).length;
   }
   /** Operator-visible soft warning when open intake is high. Null when under threshold. */
   intakeOpenWarning(principal?: Obj): Obj | null {
@@ -205,28 +232,53 @@ export class IntakeService {
       severity: 'warn',
       open_count,
       threshold: OPEN_INTAKE_WARN_THRESHOLD,
-      message: 'Open intake is high (' + open_count + ' non-terminal tasks > ' + OPEN_INTAKE_WARN_THRESHOLD + '). Close inactive/stale/superseded/noise opens (done/cancelled); protect active Contabo DR and in-progress work. Developer/orchestrator: spawn cleanup agent same turn (Alexey standing).',
-      action: 'spawn_cleanup_agent',
+      message: 'Open intake is high. Closing requires a DONE note containing a commit SHA or deploy run URL AND a live check (command/URL plus result). Review evidence for each intake before closing.',
+      action: 'review_done_evidence',
+      items: this.rows('tasks').filter(t => !t.archived_at && OPEN.includes(t.status) && (!principal || this.allowed(principal, t)))
+        .map(t => ({ id: t.id, title: t.title, age_ms: Math.max(0, Date.now() - (t.created_at ?? Date.now())) })),
     };
   }
-  /** Terminal tasks and stale replay receipts are pruned lazily on writes so
-   * closed work cannot permanently consume record or storage capacity.
-   * Terminal tasks retain 60s (t1037u; was one day — burst closes could not free slots same-turn), replay receipts 14 days; at most
-   * 256 deletes per pass; each delete bumps the snapshot revision so listers
-   * observe the change. */
+  /** Retain full terminal payloads forever. Only replay receipts expire (unchanged). */
   private prune(now: number) {
-    const dead: Array<[string, string]> = [];
-    for (const t of this.rows('tasks')) {
-      // t1037u: 60s retain (was 1d) so closed tasks free create slots after a short settle.
-      if ((t.status === 'done' || t.status === 'cancelled') && (t.updated_at ?? 0) < now - 60_000) dead.push(['tasks', t.id]);
-    }
-    for (const r of this.rows('receipts')) {
-      if ((r.captured_at ?? 0) < now - 14 * 86400000) dead.push(['receipts', r.id]);
-    }
-    for (const [table, id] of dead.slice(0, 256)) {
-      this.sql.exec(`DELETE FROM intake_${table} WHERE id=?`, id);
+    for (const task of this.rows('tasks').filter(t => !t.archived_at && !OPEN.includes(t.status)).slice(0, 256)) {
+      task.archived_at = now;
+      task.lifecycle_actor = 'hub:archive'; task.lifecycle_reason = 'archive existing terminal intake; payload retained';
+      this.put('tasks', task);
       this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
     }
+    for (const r of this.rows('receipts').filter(r => (r.captured_at ?? 0) < now - 14 * 86400000).slice(0, 256)) {
+      this.sql.exec('DELETE FROM intake_receipts WHERE id=?', r.id);
+      this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
+    }
+  }
+  private doneNote(task: Obj): Obj | undefined {
+    // A reopened task needs new evidence. Context/AC changes invalidate prior evidence too.
+    const boundary = task.history.reduce((n: number, e: Obj, i: number) =>
+      e.kind === 'update' && ['status', 'title', 'project', 'acceptance_criteria'].some(k => k in (e.changes ?? {})) ? i : n, -1);
+    return task.history.slice(boundary + 1).find((e: Obj) => e.kind === 'note' &&
+      /^DONE\b/m.test(e.text ?? '') &&
+      (/\b[0-9a-f]{7,40}\b/i.test(e.text) || /https:\/\/[^\s]+\/(?:actions\/runs|deployments)\/[^\s]+/.test(e.text)) &&
+      /live check:[ \t]*\S[^\n]*/i.test(e.text) && /result:[ \t]*\S[^\n]*/i.test(e.text));
+  }
+  private transition(task: Obj, status: string, actor: string, now: number, reason?: string, supersededBy?: string) {
+    if (status === task.status) return;
+    if (status === 'done') {
+      const note = this.doneNote(task);
+      if (!note) fail('done_evidence_required', 409);
+      reason = reason || note.text;
+    }
+    if (status === 'cancelled') {
+      if (!reason?.trim() || (!supersededBy && !/\bdropped by Alexey\b/i.test(reason))) fail('cancel_reason_required', 409);
+      if (supersededBy) {
+        const replacement = this.get('tasks', identifier(supersededBy));
+        if (!replacement || replacement.id === task.id) fail('invalid_superseded_by');
+        task.superseded_by = replacement.id;
+      }
+    }
+    task.lifecycle_actor = actor;
+    task.lifecycle_reason = reason?.trim() || 'reopened for continued work';
+    task.status = status;
+    task.archived_at = OPEN.includes(status) ? null : now;
   }
   /** Fresh credential, binding and grant checks run in the same synchronous transaction as the effect. */
   private principal(auth: Auth): Obj {
@@ -472,12 +524,38 @@ export class IntakeService {
     if (path === '/rules') {
       this.operator(p); return { snapshot_version: revision, operator_rules: this.rows('rules'), data_notice: DATA_NOTICE };
     }
+    const auditMatch = /^\/tasks\/([A-Za-z0-9._:-]+)\/audit$/.exec(path);
+    if (path === '/audit' || auditMatch) {
+      let id: string | undefined;
+      if (auditMatch) {
+        const task = this.get('tasks', auditMatch[1]);
+        if (task) { if (!this.allowed(p, task)) fail('not_found', 404); id = task.id; }
+        else {
+          // A deleted task remains operator-readable from its durable audit identity.
+          this.operator(p);
+          const ids = this.sql.exec("SELECT DISTINCT task_id FROM intake_audit WHERE task_id=? OR substr(task_id,1,?)=? LIMIT 2", auditMatch[1], auditMatch[1].length, auditMatch[1]).toArray() as any[];
+          if (ids.length !== 1) fail('not_found', 404);
+          id = ids[0].task_id;
+        }
+      }
+      const events = this.sql.exec('SELECT * FROM intake_audit ORDER BY seq DESC').toArray() as any[];
+      const visible = events.filter(e => (!id || e.task_id === id) && (p.admin || this.allowed(p, { id: e.task_id, project: e.project })));
+      // seq padded for the common revision-pinned cursor implementation.
+      return this.page(url, visible.map(e => ({ ...e, id: String(Number.MAX_SAFE_INTEGER - e.seq).padStart(20, '0') })).sort((a, b) => a.id.localeCompare(b.id)), revision);
+    }
     if (path === '/tasks' || path === '/handoff') {
       if (url.searchParams.has('authorization_valid_until') && Number(url.searchParams.get('authorization_valid_until')) !== (p.valid_until ?? null)) fail('stale_snapshot', 409);
       if (!p.admin && url.searchParams.has('after') && !url.searchParams.has('authorization_valid_until')) fail('authorization_snapshot_required');
       let tasks = this.rows('tasks').filter(t => this.allowed(p, t));
       if (url.searchParams.has('project')) tasks = tasks.filter(t => t.project === url.searchParams.get('project'));
       const status = url.searchParams.get('status');
+      const archived = url.searchParams.get('archived');
+      const all = url.searchParams.get('all');
+      if (archived && archived !== 'true') fail('invalid_archived');
+      if (all && all !== 'true') fail('invalid_all');
+      if (archived === 'true') tasks = tasks.filter(t => t.archived_at);
+      else if (path === '/handoff' || (all !== 'true' && status !== 'all' && !['done', 'cancelled'].includes(status ?? '')))
+        tasks = tasks.filter(t => !t.archived_at && OPEN.includes(t.status));
       if (status && status !== 'all' && status !== 'open' && !STATUSES.includes(status)) fail('invalid_status');
       if (path === '/handoff' || status === 'open') tasks = tasks.filter(t => OPEN.includes(t.status) || this.unresolved(t).length > 0 || this.continuation(t) === 'uncertain');
       else if (status && status !== 'all') tasks = tasks.filter(t => t.status === status);
@@ -832,7 +910,7 @@ export class IntakeService {
     if (match[2] === '/continue') {
       keys(b, ['key', 'expected_version']);
       if (this.continuation(task) !== 'ready') fail('continuation_not_ready', 409);
-      task.status = 'in_progress';
+      this.transition(task, 'in_progress', p.actor, now);
       task.history.push({ id: crypto.randomUUID(), kind: 'continuation', actor: p.actor, captured_at: now, evidence: 'recorded_active_not_started', authority: 'untrusted_task_data' });
     } else if (match[2]) {
       keys(b, ['key', 'expected_version', 'event', 'note', 'text']);
@@ -869,12 +947,15 @@ export class IntakeService {
         task.scope = scopeHint(task, (task.scope.basis_version ?? 1) + 1);
       }
     } else {
-      keys(b, ['key', 'expected_version', 'project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria']);
+      keys(b, ['key', 'expected_version', 'project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'reason', 'superseded_by']);
       if (!['project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria'].some(k => k in b)) fail('empty_update');
       const changes: Obj = {};
+      const previousStatus = task.status;
+      if (b.status === 'done' && ['title', 'project', 'acceptance_criteria'].some(k => k in b && b[k] !== task[k])) fail('done_evidence_required', 409);
+      if ('status' in b) this.transition(task, b.status, p.actor, now, b.reason === undefined ? undefined : str(b.reason, 8192), b.superseded_by);
       for (const field of ['project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria']) if (field in b) {
         if (field === 'status' && !STATUSES.includes(b[field])) fail('invalid_status');
-        const previous = task[field];
+        const previous = field === 'status' ? previousStatus : task[field];
         task[field] = field === 'project' ? identifier(b[field]) : field === 'status' ? b[field]
           : field === 'acceptance_criteria' ? acNullable(b[field])
           : nullable(b[field], field === 'title' ? 256 : 8192);
@@ -1102,14 +1183,10 @@ export class IntakeService {
       if (encoded(task) > INTAKE_LIMITS.taskBytes) {
         return { ok: false, error: 'task_capacity' };
       }
+      try { this.capacity(encoded(task) + new TextEncoder().encode(task.id).byteLength); }
+      catch (e: any) { return { ok: false, error: e.code || 'storage_capacity' }; }
       this.put('tasks', task);
       this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
-      try {
-        this.capacity();
-      } catch (e: any) {
-        this.sql.exec('DELETE FROM intake_tasks WHERE id=?', taskId);
-        return { ok: false, error: e?.code || 'storage_capacity' };
-      }
       return { ok: true, taskId };
     });
   }
@@ -1135,10 +1212,12 @@ export class IntakeService {
       const task = this.get('tasks', taskId);
       if (!task) return { ok: false, error: 'not_found' };
       const now = input.now ?? Date.now();
+      const priorBytes = !task.archived_at && OPEN.includes(task.status) ? encoded(task) : 0;
 
       if (input.status) {
         if (!STATUSES.includes(input.status)) return { ok: false, error: 'invalid_status' };
-        task.status = input.status;
+        try { this.transition(task, input.status, input.event?.actor || 'hub:service:system', now, input.event?.text); }
+        catch (e: any) { return { ok: false, error: e.code }; }
       }
       if (input.currentState !== undefined) {
         task.current_state = input.currentState !== null ? str(input.currentState, 8192) : null;
@@ -1180,13 +1259,10 @@ export class IntakeService {
         return { ok: false, error: 'task_capacity' };
       }
 
+      try { this.capacity((!task.archived_at && OPEN.includes(task.status) ? encoded(task) : 0) - priorBytes); }
+      catch (e: any) { return { ok: false, error: e.code || 'storage_capacity' }; }
       this.put('tasks', task);
       this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
-      try {
-        this.capacity();
-      } catch (e: any) {
-        return { ok: false, error: e?.code || 'storage_capacity' };
-      }
       return { ok: true, task };
     });
   }
@@ -1223,7 +1299,7 @@ export class IntakeService {
           return json(previous.response);
         }
         // Prune before any capacity check: a full receipts table must not
-        // wedge every write forever, closed tasks must yield to fresh intake.
+        // wedge every write forever, terminal payloads are archived and retained.
         this.prune(Date.now());
         this.bounded('receipts', INTAKE_LIMITS.receipts);
         const response = { ...this.write(path, payload, p), snapshot_version: this.revision() + 1, data_notice: DATA_NOTICE };

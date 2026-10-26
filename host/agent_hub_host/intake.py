@@ -104,6 +104,10 @@ def http_error(exc, method, payload):
                 detail += f'; max {limit} UTF-8 bytes'
     if code in ('invalid_limit', 'limit_out_of_range'):
         detail += '; limit must be a positive integer; min 1, max 100 (larger values clamp)'
+    if code == 'done_evidence_required':
+        detail += '; append a DONE note with commit SHA or deploy run URL, Live check: command/URL, and Result: output before closing'
+    if code == 'cancel_reason_required':
+        detail += '; provide --reason and --superseded-by, or reason containing dropped by Alexey'
     if code == 'invalid_event_kind':
         detail += '; valid kinds: ' + ', '.join(EVENT_KINDS)
     # Only locally generated wording is printed, never arbitrary server messages.
@@ -180,13 +184,19 @@ def add_commands(sub):
                         help='Read acceptance criteria from a UTF-8 file, or - for stdin (max 8 KiB)')
     create.add_argument('--key', required=True)
     listing = commands.add_parser('list', help='List one page, or all matching tasks with --all')
-    listing.add_argument('--status', default='open')
+    listing.add_argument('--status', default=None)
     listing.add_argument('--project')
     listing.add_argument('--after')
     listing.add_argument('--revision', type=int)
     listing.add_argument('--authorization-valid-until', type=int)
     listing.add_argument('--limit', type=int, default=25, help='Positive integer; default 25, server clamps above max 100')
     listing.add_argument('--all', action='store_true', help='Follow all pages with a pinned snapshot; restart if it changes')
+    listing.add_argument('--archived', action='store_true', help='List archived intakes')
+    audit = commands.add_parser('audit', help='Durable lifecycle events for one intake, or recent events')
+    audit.add_argument('id', nargs='?')
+    audit.add_argument('--limit', type=int, default=25)
+    audit.add_argument('--after')
+    audit.add_argument('--revision', type=int)
     for name in ('show', 'history', 'links', 'context'):
         command = commands.add_parser(name)
         command.add_argument('id')
@@ -201,6 +211,8 @@ def add_commands(sub):
     update.add_argument('--clear', action='append', choices=['current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria'], default=[], help='Explicitly clear a context field to unknown (repeatable)')
     for field in ('project', 'status', 'title', 'current-state', 'next-step', 'owner', 'uncertainty', 'acceptance-criteria'):
         update.add_argument('--' + field)
+    update.add_argument('--reason', help='Reason for close, cancellation or reopen')
+    update.add_argument('--superseded-by', help='Replacement intake id; required for cancel unless dropped by Alexey')
     event = commands.add_parser('append', help='Append intake/note/session/report/commit/followup/blocker/decision/rule reference as JSON; approval decisions require operator')
     event.add_argument('id')
     event.add_argument('--version', type=int, required=True)
@@ -363,13 +375,23 @@ def execute(args):
             body['acceptance_criteria'] = criteria
         return request('POST', BASE + '/tasks', body)
     if command == 'list':
-        params = {'status': args.status, 'limit': args.limit}
+        params = {'limit': args.limit}
+        if args.status is not None:
+            params['status'] = args.status
+        if args.archived:
+            params['archived'] = 'true'
+        elif args.all:
+            params['all'] = 'true'
         for field in ('project', 'after', 'revision', 'authorization_valid_until'):
             if getattr(args, field) is not None:
                 params[field] = getattr(args, field)
         if args.all:
             return list_all(params)
         return request('GET', BASE + '/tasks?' + urlencode(params))
+    if command == 'audit':
+        path = BASE + ('/tasks/' + safe_id(args.id) + '/audit' if args.id else '/audit')
+        params = {field: getattr(args, field) for field in ('limit', 'after', 'revision') if getattr(args, field) is not None}
+        return request('GET', path + '?' + urlencode(params))
     if command == 'grantees':
         if not getattr(args, 'actor', None) or not args.actor.strip():
             raise IntakeInputError('Actor required')
@@ -426,7 +448,7 @@ def execute(args):
             payload['event'] = ev
         return request('POST', path + '/events', payload)
     if command == 'update':
-        for field in ('project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria'):
+        for field in ('project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'reason', 'superseded_by'):
             if getattr(args, field, None) is not None:
                 if field == 'acceptance_criteria' and len(args.acceptance_criteria.encode('utf-8')) > 8192:
                     raise IntakeInputError('Acceptance criteria exceed 8192 UTF-8 bytes')

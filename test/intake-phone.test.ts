@@ -71,7 +71,8 @@ describe('F7 phone routes and intake pages', () => {
   it('serves the intake bundle behind auth and lists with a status filter', async () => {
     const a = await createTask('phone', 'phone-a');
     const b = await createTask('phone', 'phone-b');
-    await ok('/tasks/' + b.task.id, { key: 'phone-done', expected_version: 1, status: 'done' });
+    await ok('/tasks/' + b.task.id + '/events', { key: 'phone-evidence', expected_version: 1, note: 'DONE commit abc1234\nLive check: curl /health\nResult: HTTP 200' });
+    await ok('/tasks/' + b.task.id, { key: 'phone-done', expected_version: 2, status: 'done' });
     const open = await ok('/tasks?status=open&limit=50');
     expect(open.items.map((t: any) => t.id)).toContain(a.task.id);
     expect(open.items.map((t: any) => t.id)).not.toContain(b.task.id);

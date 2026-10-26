@@ -184,7 +184,7 @@ describe('Disk Monitoring Service', () => {
     expect(active.map(x => x.mount_point)).toEqual(['/data']);
     const aliasTask: any = hub.sql.exec('SELECT data FROM intake_tasks WHERE id=?', oldAlias.intake_task_id).toArray()[0];
     const task = JSON.parse(aliasTask.data);
-    expect(task.status).toBe('done');
+    expect(task.status).toBe('open'); // Recovery alone cannot satisfy DONE evidence.
     expect(task.current_state).toContain('usage remains 93.4% (warn)');
     expect(task.current_state).toContain('not a space recovery');
     const summary = hub.monitoringService.getStatusSummary(clock.t);
@@ -267,10 +267,10 @@ describe('Disk Monitoring Service', () => {
     const alertResolved = hub.livenessService.alerts().find((a: any) => a.subject === 'host-a:/data');
     expect(alertResolved?.resolved_at).toBeTruthy();
 
-    // Verify intake task is resolved (status = 'done')
+    // Recovery observation is recorded while intake awaits completion evidence
     const finalTasks = hub.sql.exec('SELECT * FROM intake_tasks').toArray();
     const finalTaskData = JSON.parse(finalTasks[0].data as string);
-    expect(finalTaskData.status).toBe('done');
+    expect(finalTaskData.status).toBe('open'); // Live observation retained pending evidence-backed close.
     expect(finalTaskData.current_state).toContain('Recovered');
     expect(finalTaskData.history.length).toBe(3); // Intake + severity change + resolution
 

@@ -40,8 +40,17 @@ class TestIntakeCli(unittest.TestCase):
         self.assertIsNone(result['next'])
         from urllib.parse import urlparse, parse_qs
         query = parse_qs(urlparse(transport.call_args_list[1].args[1]).query)
-        self.assertEqual(query, {'status': ['open'], 'project': ['demo'], 'limit': ['1'],
+        self.assertEqual(query, {'all': ['true'], 'project': ['demo'], 'limit': ['1'],
                                 'after': ['a'], 'revision': ['7'], 'authorization_valid_until': ['12345']})
+
+    def test_archive_and_audit_commands(self):
+        with patch.object(intake, 'request', return_value={'items': []}) as transport:
+            self.assertEqual(self.run_cli('intake', 'list', '--archived')[0], 0)
+            self.assertIn('archived=true', transport.call_args.args[1])
+            self.assertEqual(self.run_cli('intake', 'audit', 'abcdef01')[0], 0)
+            self.assertIn('/tasks/abcdef01/audit?', transport.call_args.args[1])
+            self.assertEqual(self.run_cli('intake', 'audit')[0], 0)
+            self.assertIn('/intake/audit?', transport.call_args.args[1])
 
     def test_list_all_rejects_inconsistent_or_incomplete_snapshots(self):
         first = {'items': [{'id': 'a'}], 'next': 'a', 'snapshot_version': 7,
