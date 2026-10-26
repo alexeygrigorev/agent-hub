@@ -459,14 +459,19 @@ export class FleetService {
     // redundant native retirement probe per fresh live workload each cycle;
     // stale, absent and ambiguous observations still need positive proof.
     const cutoff = new Date(this.now() - 180000).toISOString();
-    return this.sql.exec(`SELECT l.id, l.workspace, ${jsonFields('l.request_json',['cwd'])} AS request_json, l.launch_error_json, l.native_id, l.engine, l.mode, l.launcher_task_id
+    const catalogFresh = freshCatalogs(this.sql, this.now()).has(machine);
+    // Fleet-only stores need no control table. Probe once, not once per row.
+    const controlStore = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length > 0;
+    const bindingProjection = controlStore
+      ? '(SELECT binding_json FROM session_control_sessions c WHERE c.fleet_launch_id=l.id AND c.machine_id=l.machine_id LIMIT 1)'
+      : 'NULL';
+    return this.sql.exec(`SELECT l.id, l.workspace, ${jsonFields('l.request_json',['cwd'])} AS request_json, l.launch_error_json, l.native_id, l.engine, l.mode, l.launcher_task_id, ${bindingProjection} AS binding_json
       FROM fleet_launches l WHERE l.machine_id = ? AND l.state IN ('starting','running','uncertain')
       AND (l.native_id IS NULL OR NOT EXISTS (SELECT 1 FROM fleet_sessions s
         WHERE s.machine_id = l.machine_id AND s.native_id = l.native_id AND s.engine = l.engine
-        AND s.phase IN ('starting','running') AND s.observed_at >= ?))
-      ORDER BY l.updated_at LIMIT 100`, machine, cutoff).toArray().map((r: any) => {
-      let binding = null;
-      try { binding = parsed((this.sql.exec('SELECT binding_json FROM session_control_sessions WHERE fleet_launch_id = ? AND machine_id = ?', r.id, machine).toArray()[0] as any)?.binding_json); } catch { /* optional control store */ }
+        AND s.phase IN ('starting','running') AND (s.observed_at >= ? OR ?)))
+      ORDER BY l.updated_at LIMIT 100`, machine, cutoff, catalogFresh ? 1 : 0).toArray().map((r: any) => {
+      const binding = controlStore ? parsed(r.binding_json) : null;
       return { id: r.id, workspace: r.workspace, cwd: parsed(r.request_json).cwd ?? null, diagnostic: parsed(r.launch_error_json), native_id: r.native_id, engine: r.engine, mode: r.mode, launcher_task_id: r.launcher_task_id, binding };
     });
   }

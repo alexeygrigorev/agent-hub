@@ -116,8 +116,60 @@ describe('phantom account reservations', () => {
     }
     sql.exec("UPDATE fleet_sessions SET phase = 'running', observed_at = ? WHERE native_id = 'probe-native'", iso(-180001));
     expect(await candidates()).toEqual([launch.id]);
+    sql.exec('INSERT INTO fleet_catalog_seen VALUES (?,?)', 'hetzner', iso());
+    for (const phase of ['starting', 'running']) {
+      sql.exec("UPDATE fleet_sessions SET phase=? WHERE native_id='probe-native'", phase);
+      expect(await candidates()).toEqual([]);
+    }
+    for (const stamp of [iso(-180001), iso(60001)]) {
+      sql.exec('UPDATE fleet_catalog_seen SET observed_at=?', stamp);
+      expect(await candidates()).toEqual([launch.id]);
+    }
+    sql.exec('UPDATE fleet_catalog_seen SET observed_at=?', iso());
+    for (const phase of ['broken', 'unknown', 'uncertain', 'unobserved', 'exited']) {
+      sql.exec("UPDATE fleet_sessions SET phase=? WHERE native_id='probe-native'", phase);
+      expect(await candidates()).toEqual([launch.id]);
+    }
+    sql.exec("UPDATE fleet_sessions SET phase='running',engine='claude' WHERE native_id='probe-native'");
+    expect(await candidates()).toEqual([launch.id]);
+    sql.exec("UPDATE fleet_sessions SET engine='codex',machine_id='win35' WHERE native_id='probe-native'");
+    expect(await candidates()).toEqual([launch.id]);
+    sql.exec("UPDATE fleet_sessions SET machine_id='hetzner' WHERE native_id='probe-native'");
+    sql.exec('UPDATE fleet_launches SET native_id=NULL WHERE id=?', launch.id);
+    expect(await candidates()).toEqual([launch.id]);
+    sql.exec("UPDATE fleet_launches SET native_id='probe-native' WHERE id=?", launch.id);
+    expect(await candidates()).toEqual([]);
+    expect((await f.handle(request('/sessions', {sessions: []}, 'PUT'), host('hetzner'))).status).toBe(200);
+    expect(sql.exec("SELECT phase FROM fleet_sessions WHERE native_id='probe-native'").one().phase).toBe('unobserved');
+    expect(await candidates()).toEqual([launch.id]);
     const foreign: any = await (await f.handle(request('/reconciliation', undefined, 'GET'), host('win35'))).json();
     expect(foreign.launches).toEqual([]);
+  }));
+
+  it('batches exact-machine bindings while preserving first-row and optional-store fallbacks', () => fixture(async (f, sql) => {
+    await configure(f);
+    const launch: any = await (await f.handle(request('/launches', intent({machine:'hetzner'})), admin)).json();
+    sql.exec("UPDATE fleet_launches SET state='uncertain' WHERE id=?", launch.id);
+    const binding = async () => (await (await f.handle(request('/reconciliation', undefined, 'GET'), host('hetzner'))).json() as any).launches[0].binding;
+    expect(await binding()).toEqual({});
+    for (const [id, machine, value] of [['null',null,'{}'],['foreign','win35','{}'],['first','hetzner','{"tag":"first"}'],['second','hetzner','{"tag":"second"}']]) {
+      sql.exec('INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,mode,state,binding_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)', id,'binding-test',id,'{}',launch.id,machine,'headless','uncertain',value,iso(),iso());
+    }
+    const legacy = sql.exec('SELECT binding_json FROM session_control_sessions WHERE fleet_launch_id=? AND machine_id=?',launch.id,'hetzner').toArray()[0].binding_json;
+    expect(await binding()).toEqual(JSON.parse(legacy));
+    sql.exec("UPDATE session_control_sessions SET binding_json='invalid' WHERE id='first'");
+    expect(await binding()).toEqual({});
+    sql.exec("UPDATE session_control_sessions SET binding_json=NULL WHERE id='first'");
+    expect(await binding()).toEqual({});
+    // Simulate a Fleet-only store without deleting any production state.
+    const withoutControl = new Proxy(sql, {get(target,key) {
+      if(key==='exec') return (query:string,...args:any[]) => query.includes("name='session_control_sessions'")
+        ? {toArray:()=>[]} : target.exec(query,...args);
+      return target[key];
+    }});
+    const standalone = new FleetService(withoutControl, cb=>cb(), ()=>now);
+    const result:any=await (await standalone.handle(request('/reconciliation',undefined,'GET'),host('hetzner'))).json();
+    expect(result.launches[0].binding).toBeNull();
   }));
 
   it('alerts with account numbers after ten minutes of phantom capacity queueing', () => fixture(async (f, sql) => {

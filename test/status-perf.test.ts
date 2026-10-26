@@ -29,9 +29,9 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
         h.sql.exec('INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
           sessionId(i), 'perf:owner', `perf-${i}`, JSON.stringify({prompt:'Retained synthetic prompt. '.repeat(320),intake_task_id:`perf-task-${String(i%500).padStart(4,'0')}`}), 'perf-host', 'codex', 'headless', i < 100 ? 'running' : 'stopped', JSON.stringify({native_id: `native-${i}`,tag:`perf-${i}`,workspace:'/synthetic'}), now, now);
         h.sql.exec('INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace) VALUES (?,?,?,?,?,?,?,?)',
-          'perf-host', `native-${i}`, `perf-${i}`, 'codex', i < 100 ? 'running' : i < 154 ? 'exited' : 'stopped', 'working', now, '/synthetic');
+          'perf-host', `native-${i}`, `perf-${i}`, 'codex', i < 100 ? 'running' : i < 156 ? 'exited' : 'stopped', 'working', new Date(Date.now()-3600000).toISOString(), '/synthetic');
         h.sql.exec('INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-          sessionId(i + 10000), 'perf:owner', 'agent', 'Synthetic', `perf-launch-${i}`, JSON.stringify({prompt:'Retained synthetic prompt. '.repeat(320),intake_task_id:`perf-task-${String(i%500).padStart(4,'0')}`}), 'perf-host', 'codex', 'default', 'headless', '/synthetic', 'Synthetic', i >= 100 && i < 154 ? 'uncertain' : 'stopped', `native-${i}`, now, now);
+          sessionId(i + 10000), 'perf:owner', 'agent', 'Synthetic', `perf-launch-${i}`, JSON.stringify({prompt:'Retained synthetic prompt. '.repeat(320),intake_task_id:`perf-task-${String(i%500).padStart(4,'0')}`}), 'perf-host', 'codex', 'default', 'headless', '/synthetic', 'Synthetic', i < 100 ? 'running' : i < 156 ? 'uncertain' : 'stopped', `native-${i}`, now, now);
         for (let j = 0; j < 3; j++) {
           const at = new Date(Date.now() - (3-j)*1000).toISOString();
           h.sql.exec('INSERT INTO status_observations(id,machine_id,hub_session_id,kind,observed_at,payload_json,reporter,received_at) VALUES (?,?,?,?,?,?,?,?)',
@@ -40,6 +40,11 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
             `perf-host/native-${i}`, `decision-${i}-${j}`, 'resume_on_reset', 'perf:owner', 'Synthetic', at);
         }
       }
+      h.sql.exec('INSERT INTO fleet_catalog_seen VALUES (?,?)','perf-host',now);
+      // Keep 56 genuine reconciliation rows after excluding unchanged live
+      // natives, with production-sized bindings to exercise the batched lookup.
+      for(let i=100;i<156;i++) h.sql.exec('UPDATE session_control_sessions SET fleet_launch_id=?,binding_json=? WHERE id=?',
+        sessionId(i+10000),JSON.stringify({native_id:`native-${i}`,tag:`perf-${i}`,workspace:'/synthetic',detail:'x'.repeat(200)}),sessionId(i));
       // Retention permits 200 disk observations per host / 1000 total.
       // Trend reads must not repeatedly materialize top-consumer histories.
       for (let host = 0; host < 5; host++) {
@@ -83,8 +88,12 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
       const body: any = await response.json();
       clientTimes.push(performance.now() - start);
       expect(response.status, JSON.stringify(body).slice(0, 200)).toBe(status);
+      if(path === '/api/fleet/offers') {
+        expect(body.reconciliation).toHaveLength(56);
+        expect(body.reconciliation[0].binding.detail).toHaveLength(200);
+      }
       if (path === '/api/status') {
-        expect(response.headers.get('X-Hub-Status-Projection')).toBe('resource-disk-v4');
+        expect(response.headers.get('X-Hub-Status-Projection')).toBe('resource-disk-v5');
         expect(body.tasks).toHaveLength(method === 'GET' ? 25 : 256);
         expect(body.tasks[0].hub_sessions[0].lifecycle.session_key).toBe('perf-host/native-0');
         expect(body.agents.running).toBe(100);
