@@ -8,6 +8,7 @@ import type { MonitoringService } from './monitoring';
 import { buildSessionInputs } from './session_lifecycle_registry';
 import { classifySession, toStatusDto } from './session_lifecycle';
 import { EXPECTED_OFFLINE_UNTIL, EXPECTED_OFFLINE_REASON, expectedOfflineWindowActive, isExpectedOffline } from './status_offline';
+import { resolveMachineAliases } from './machine-alias';
 import { isValidMachineId } from './machine-id';
 
 type Auth = { caller?: any; scopes?: string[]; error?: Response };
@@ -311,12 +312,13 @@ export class StatusService {
 
   private buildItems(p: Obj, tasks: Obj[], hostFilter: string | null, sinceMs: number | null, now: number, nowIso: string): { items: Obj[]; machines: Map<string, Obj>; missingHosts: string[]; expectedOffline: string[]; sessionCoverage: string; reportsCollected: boolean; probesCollected: boolean } {
     const machines = new Map(this.rows('SELECT id, hostname, last_checkin_at, drained FROM machines').map(m => [m.id, m]));
+    const aliases = this.machineAliases(machines);
     const lifecycleBySession = this.lifecycleBySessionId(now);
-    const items = tasks.map(task => this.taskDto(task, p, machines, now, nowIso, sinceMs, hostFilter, lifecycleBySession));
+    const items = tasks.map(task => this.taskDto(task, p, machines, now, nowIso, sinceMs, hostFilter, lifecycleBySession, aliases));
     this.attachObservations(items, now, nowIso);
     const reportsCollected = items.some(t => (t.reports ?? []).some((r: Obj) => r.headline !== 'unknown'));
     const probesCollected = items.some(t => (t.commits ?? []).some((c: Obj) => c.git_ancestry || c.ci || c.deploy));
-    const { missing: missingHosts, expectedOffline } = this.missingHosts(machines, now);
+    const { missing: missingHosts, expectedOffline } = this.missingHosts(machines, now, aliases);
     return { items, machines, missingHosts, expectedOffline,
       sessionCoverage: missingHosts.length ? 'partial' : 'complete', reportsCollected, probesCollected };
   }
@@ -849,12 +851,27 @@ export class StatusService {
     }
   }
 
-  private missingHosts(machines: Map<string, Obj>, now: number): { missing: string[]; expectedOffline: string[] } {
+  /** Alias member ids resolve to their canonical host (same physical host
+   * re-registered under a new id; records are marked, never deleted). A
+   * stale alias row is not a missing host while its canonical row is known. */
+  private machineAliases(machines: Map<string, Obj>): Map<string, string> {
+    try {
+      const rows = [...machines.entries()].map(([id, m]) => {
+        const at = m.last_checkin_at ? Date.parse(m.last_checkin_at) : NaN;
+        return { id: String(id), hostname: m.hostname, drained: m.drained, last_seen_ms: Number.isFinite(at) ? at : null };
+      });
+      return resolveMachineAliases(rows).aliasOf;
+    } catch { return new Map(); }
+  }
+
+  private missingHosts(machines: Map<string, Obj>, now: number, aliases: Map<string, string> = new Map()): { missing: string[]; expectedOffline: string[] } {
     const missing: string[] = [];
     const expectedOffline: string[] = [];
     // The expected-offline window expires: after EXPECTED_OFFLINE_UNTIL a
     // stale win35 is an ordinary missing host, never expected forever.
     for (const [id, m] of machines) {
+      // A stale alias row reports via its canonical host; never a missing host.
+      if (aliases.has(id)) continue;
       const at = m.last_checkin_at ? Date.parse(m.last_checkin_at) : NaN;
       const stale = m.drained || !Number.isFinite(at) || now - at > 180000;
       if (!stale) continue;
@@ -904,7 +921,7 @@ export class StatusService {
     } catch { return null; }
   }
 
-  private taskDto(task: Obj, p: Obj, machines: Map<string, Obj>, now: number, nowIso: string, sinceMs: number | null, hostFilter: string | null, lifecycleBySession: Map<string, Obj> = new Map()): Obj {
+  private taskDto(task: Obj, p: Obj, machines: Map<string, Obj>, now: number, nowIso: string, sinceMs: number | null, hostFilter: string | null, lifecycleBySession: Map<string, Obj> = new Map(), aliases: Map<string, string> = new Map()): Obj {
     const unresolved = this.intake.statusUnresolved(task);
     const continuation = this.intake.statusContinuation(task);
     const history = Array.isArray(task.history) ? task.history : [];
@@ -941,7 +958,7 @@ export class StatusService {
 
     let filtered = sessions;
     if (hostFilter) filtered = sessions.filter(s => !s.machine_id || s.machine_id === hostFilter);
-    const missingForTask = [...new Set(links.map((l: Obj) => typeof l.host === 'string' && l.host ? l.host : null).filter(Boolean))].filter(h => !machines.has(h as string) || this.isStaleHost(machines.get(h as string), now));
+    const missingForTask = [...new Set(links.map((l: Obj) => typeof l.host === 'string' && l.host ? (aliases.get(l.host) ?? l.host) : null).filter(Boolean))].filter(h => !machines.has(h as string) || this.isStaleHost(machines.get(h as string), now));
     const hubSessions = this.hubSessionsFor(task, p, machines, now, sinceMs, hostFilter, lifecycleBySession);
 
     return {

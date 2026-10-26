@@ -2094,6 +2094,76 @@ class Dispatcher:
                 continue
         return raw
 
+    def _refresh_checkin(self, hb) -> None:
+        """Best-effort checkin refresh between serial dispatches.
+
+        A multi-offer batch dispatches serially and each dispatch can take a
+        minute or more (launcher admission, quota, native start). Without an
+        interim heartbeat the server-side effective check-in goes stale past
+        the 180 s placement threshold mid-batch, so later offers (and any
+        concurrent placement) flap to machine_unavailable even though this
+        host is alive and dispatching. Re-posting the cycle heartbeat keeps
+        the in-memory check-in fresh; persistence throttling still applies
+        server-side. Transport failures must never break dispatch accounting.
+        """
+        try:
+            self.request('POST', '/api/host/poll', hb)
+        except Exception:
+            pass
+
+    def _dispatch_one(self, offer, results) -> None:
+        """Dispatch a single fleet offer, appending exactly one outcome row.
+
+        Extracted from once() so the per-offer loop can guarantee a checkin
+        refresh after every dispatch (see _refresh_checkin), however the
+        dispatch settles. Behavior is unchanged: running launches bind
+        immediately; refusals and holds keep their existing receipts.
+        """
+        try:
+            outcome = self.dispatch(offer)
+            results.append(outcome)
+            if outcome.get('state') == 'running':
+                try:
+                    self.report_catalog_bindings()
+                except Exception as exc:
+                    # A catalog/binding transport error is not a failed
+                    # launch. Keep its real receipt and retry next cycle.
+                    results.append({'id': offer.get('id'), 'state': 'binding_pending',
+                                    'error': type(exc).__name__[:64]})
+        except Exception as exc:
+            from .opencode_auth import AuthBusy
+            if isinstance(exc, AuthBusy):
+                results.append({'id': offer.get('id'), 'state': 'held', 'reason': 'engine_auth_busy'})
+                return  # No claim/effect; preserve offer for the next poll.
+            from .dispatch_diagnostics import classify
+            workspace_available = True
+            try:
+                resolve_workspace_path(self.settings, offer.get('workspace'))
+            except (ValueError, OSError):
+                workspace_available = False
+            diagnostic = classify(exc, workspace_available=workspace_available)
+            reason = diagnostic['reason']
+            # Only fixed diagnostics enter the journal; no prompt, argv,
+            # account credentials or arbitrary exception text is retained.
+            record = {'offer_id': offer.get('id'), 'state': 'dispatch_refused',
+                      'reason': reason, 'diagnostic': diagnostic, 'settled': False}
+            self._persist_launch_record(record)
+            if not offer.get('task_id'):
+                try:
+                    rejected = self.request('POST', '/api/fleet/launches/' + offer['id'] + '/reject', {'reason': reason, 'diagnostic': diagnostic})
+                    record['settled'] = True
+                    self._persist_launch_record(record)
+                    results.append(rejected)
+                    return
+                except Exception:
+                    pass  # A racing claim is never proof of no native effect.
+            # No successful rejection receipt: keep uncertainty visible
+            # locally and retry reconciliation next cycle.
+            err = (type(exc).__name__ or "Error")[:64]
+            results.append({"id": offer.get("id"), "state": "held",
+                            "reason": reason, "stage": "dispatch_route",
+                            "error": err, "diagnostic": diagnostic})
+
     def once(self):
         from . import provisioning
         provisioning.tick()
@@ -2230,49 +2300,9 @@ class Dispatcher:
         results.append({"id": "workclaim-sync", **workclaim_summary})
         for offer in offers:
             try:
-                outcome = self.dispatch(offer)
-                results.append(outcome)
-                if outcome.get('state') == 'running':
-                    try:
-                        self.report_catalog_bindings()
-                    except Exception as exc:
-                        # A catalog/binding transport error is not a failed
-                        # launch. Keep its real receipt and retry next cycle.
-                        results.append({'id': offer.get('id'), 'state': 'binding_pending',
-                                        'error': type(exc).__name__[:64]})
-            except Exception as exc:
-                from .opencode_auth import AuthBusy
-                if isinstance(exc, AuthBusy):
-                    results.append({'id': offer.get('id'), 'state': 'held', 'reason': 'engine_auth_busy'})
-                    continue  # No claim/effect; preserve offer for the next poll.
-                from .dispatch_diagnostics import classify
-                workspace_available = True
-                try:
-                    resolve_workspace_path(self.settings, offer.get('workspace'))
-                except (ValueError, OSError):
-                    workspace_available = False
-                diagnostic = classify(exc, workspace_available=workspace_available)
-                reason = diagnostic['reason']
-                # Only fixed diagnostics enter the journal; no prompt, argv,
-                # account credentials or arbitrary exception text is retained.
-                record = {'offer_id': offer.get('id'), 'state': 'dispatch_refused',
-                          'reason': reason, 'diagnostic': diagnostic, 'settled': False}
-                self._persist_launch_record(record)
-                if not offer.get('task_id'):
-                    try:
-                        rejected = self.request('POST', '/api/fleet/launches/' + offer['id'] + '/reject', {'reason': reason, 'diagnostic': diagnostic})
-                        record['settled'] = True
-                        self._persist_launch_record(record)
-                        results.append(rejected)
-                        continue
-                    except Exception:
-                        pass  # A racing claim is never proof of no native effect.
-                # No successful rejection receipt: keep uncertainty visible
-                # locally and retry reconciliation next cycle.
-                err = (type(exc).__name__ or "Error")[:64]
-                results.append({"id": offer.get("id"), "state": "held",
-                                "reason": reason, "stage": "dispatch_route",
-                                "error": err, "diagnostic": diagnostic})
+                self._dispatch_one(offer, results)
+            finally:
+                self._refresh_checkin(hb)
         return results
 
 

@@ -465,6 +465,57 @@ class FleetTests(unittest.TestCase):
         self.assertTrue(calls[1][2]['gate']['launch_allowed'])
         self.assertEqual(calls[0][2]['capabilities']['workspaces'], sorted(['demo', '/repo']))
 
+    def test_serial_dispatch_refreshes_checkin_between_offers(self):
+        # Incident 2026-10-26: a serial multi-offer batch blocked heartbeats
+        # long enough for the server-side checkin to pass the 180 s placement
+        # threshold, so concurrent placements flapped to machine_unavailable.
+        # once() must re-post the cycle heartbeat after every dispatch.
+        cfg = settings(Path('/repo')); calls = []
+        offers = [{'id': 'offer-a'}, {'id': 'offer-b'}, {'id': 'offer-c'}]
+        def request(method, path, body=None):
+            calls.append((method, path, body))
+            if method == 'GET' and path == '/api/fleet/offers':
+                return {'offers': offers}
+            return {}
+        def runner(argv, **kw):
+            if argv[0] == 'maintained-gate': return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+            if argv[0] == 'aplexer': return []
+            return {}
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg['aplexer_state_dir'] = tmp
+            with patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {}, 'hostname': 'test', 'os': 'test', 'network': 'home', 'roles': []}), \
+                 patch('agent_hub_host.api.get_heartbeat_payload', return_value={'type': 'heartbeat'}), \
+                 patch.object(fleet.Dispatcher, 'dispatch', side_effect=[{'id': 'offer-a', 'state': 'running'}, {'id': 'offer-b', 'state': 'held', 'reason': 'engine_auth_busy'}, {'id': 'offer-c', 'state': 'running'}]), \
+                 patch.object(fleet.Dispatcher, 'report_catalog_bindings', return_value=[]):
+                results = fleet.Dispatcher(cfg, request, runner).once()
+        polls = [c for c in calls if c[1] == '/api/host/poll']
+        self.assertEqual(len(polls), 1 + len(offers))
+        outcomes = [r for r in results if r.get('id') in {'offer-a', 'offer-b', 'offer-c'}]
+        self.assertEqual([r['state'] for r in outcomes], ['running', 'held', 'running'])
+
+    def test_checkin_refresh_failure_never_breaks_dispatch_accounting(self):
+        cfg = settings(Path('/repo')); calls = []
+        offers = [{'id': 'offer-a'}, {'id': 'offer-b'}]
+        def request(method, path, body=None):
+            calls.append((method, path, body))
+            if path == '/api/host/poll' and len([c for c in calls if c[1] == '/api/host/poll']) > 1:
+                raise RuntimeError('transport down')
+            if method == 'GET' and path == '/api/fleet/offers':
+                return {'offers': offers}
+            return {}
+        def runner(argv, **kw):
+            if argv[0] == 'maintained-gate': return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
+            if argv[0] == 'aplexer': return []
+            return {}
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg['aplexer_state_dir'] = tmp
+            with patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {}, 'hostname': 'test', 'os': 'test', 'network': 'home', 'roles': []}), \
+                 patch('agent_hub_host.api.get_heartbeat_payload', return_value={'type': 'heartbeat'}), \
+                 patch.object(fleet.Dispatcher, 'dispatch', side_effect=[{'id': 'offer-a', 'state': 'running'}, {'id': 'offer-b', 'state': 'running'}]), \
+                 patch.object(fleet.Dispatcher, 'report_catalog_bindings', return_value=[]):
+                results = fleet.Dispatcher(cfg, request, runner).once()
+        outcomes = [r for r in results if r.get('id') in {'offer-a', 'offer-b'}]
+        self.assertEqual([r['state'] for r in outcomes], ['running', 'running'])
 
 
     def test_absolute_workspace_keys_allowed_and_malformed_refused(self):

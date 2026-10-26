@@ -311,6 +311,29 @@ describe('M14a authorized one-call status projection', () => {
     expect(typeof data.coverage.expected_offline_reason).toBe('string');
   });
 
+  it('never reports a stale alias row as a missing host (same physical host, re-registered)', async () => {
+    // Incident 2026-10-26: host SnV2sxRqgWOAr1A81Almuw (Hetzner, stale since
+    // 2026-10-15) is the same physical host as live DEFLf4-rahKf9wE4TQAZfA
+    // (hostname RMTHZ). The stale alias row must not surface as missing.
+    await inDO(stub(), (h: any) => {
+      const now = new Date().toISOString();
+      h.sql.exec("INSERT OR IGNORE INTO machines(id,name,hostname,registered_at,last_checkin_at,drained) VALUES ('host-alias-old','hetzner','RMTHZ','2026-01-01T00:00:00.000Z','2026-10-15T10:35:04.921Z',0)");
+      h.sql.exec("INSERT OR IGNORE INTO machines(id,name,hostname,registered_at,last_checkin_at,drained) VALUES ('host-canon-new','urgent-hetzner','RMTHZ','2026-01-01T00:00:00.000Z',?,0)", now);
+    });
+    const data = await ok('');
+    expect(data.coverage.missing_hosts).not.toContain('host-alias-old');
+    expect(data.coverage.missing_hosts).not.toContain('host-canon-new');
+    expect(data.coverage.sessions).toBe('complete');
+    // A task linked to the stale alias id resolves to the live canonical host.
+    const { task } = await createTask();
+    await intakeOk('/tasks/' + task.id + '/events', { key: 'alias-link-' + ++seq, expected_version: 1,
+      event: { kind: 'link', native_id: 'native-alias', engine: 'opencode', host: 'host-alias-old', provenance: source } });
+    const relinked = await ok('');
+    const row = relinked.tasks.find((t: any) => t.id === task.id);
+    expect(row.session_coverage.coverage).toBe('complete');
+    expect(row.session_coverage.missing_hosts).toEqual([]);
+  });
+
   it('expires the win35 expected-offline window after 2026-10-31T15:23:00Z', async () => {
     // Live-clock expiry is covered deterministically in test/status-window.test.ts
     // (pure status_offline unit tests, plain Node): after the window a stale
