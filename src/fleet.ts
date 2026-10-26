@@ -711,7 +711,11 @@ export class FleetService {
       else if (caps.launcher_resources === true && (!Number.isFinite(hb.launcher_resources?.active_mem_mb)
         || hb.launcher_resources.active_mem_mb < 0
         || !fresh(hb.launcher_resources?.observed_at, this.now(), 180000))) reason = 'admission_unknown';
-      else if (Number.isFinite(hb.mem_avail_mb) && hb.mem_avail_mb - (hb.launcher_resources?.active_mem_mb || 0)
+      // Live MemAvailable already excludes resident session memory; only Hub
+      // launch ramps not yet visible in it are extra commitments. The
+      // launcher's static per-task reservations (incl. stale queued tasks)
+      // overcounted ~30 GB while ~40 GB was free (Alexey t1510u/t1511u).
+      else if (Number.isFinite(hb.mem_avail_mb) && hb.mem_avail_mb
         - 1500 * (hb.launcher_resources ? Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND (state IN ('offered','starting') OR (state IN ('running','uncertain') AND updated_at >= ?))", route.machine_id, hb.launcher_resources.observed_at).one().n) : 0)
         < MEMORY_FLOOR_MB + NEXT_SLOT_MB) reason = 'launcher_memory_reserve';
       else if (!Number.isFinite(hb.mem_avail_mb) || !Number.isFinite(hb.disk_free_gb) || hb.disk_free_gb < 50.5) reason = 'resource_limit';
@@ -768,7 +772,7 @@ export class FleetService {
     const hb = parsed(row?.last_heartbeat);
     const pending = hb.launcher_resources ? Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND (state IN ('offered','starting') OR (state IN ('running','uncertain') AND updated_at >= ?))", machine, hb.launcher_resources.observed_at).one().n) : 0;
     return { mem_available_mb: Number.isFinite(hb.mem_avail_mb) ? hb.mem_avail_mb : null,
-      reserved_mb: (hb.launcher_resources?.active_mem_mb || 0) + 1500 * pending,
+      reserved_mb: 1500 * pending, // Hub launch ramps only; resident usage is already in MemAvailable.
       floor_mb: MEMORY_FLOOR_MB, requested_mb: NEXT_SLOT_MB, observed_at: hb.launcher_resources?.observed_at ?? null };
   }
 
