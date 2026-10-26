@@ -154,7 +154,9 @@ class WatchdogCycleTests(unittest.TestCase):
                 return {"config": {}, "sessions": sessions}
             if path == "/api/fleet/resources/evidence":
                 # Evidence must precede any stop; checked via order list below.
-                return {"saved": True}
+                # Exact {saved:true, evidence_id} confirmation is required.
+                self.assertTrue(payload["output"])
+                return {"saved": True, "evidence_id": payload["id"]}
             if path == "/api/fleet/resources/report":
                 self.assertTrue(any(p == "/api/fleet/resources/evidence" for p in order))
                 self.assertEqual(payload["reaps"][0]["evidence_id"], payload["reaps"][0]["evidence_id"])
@@ -177,6 +179,9 @@ class WatchdogCycleTests(unittest.TestCase):
             out = rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000)
         self.assertEqual(out["reaps"], 1)
         self.assertLess(order.index("/api/fleet/resources/evidence"), order.index("stop"))
+        # Keep/protection is rechecked via an idempotent same-id evidence
+        # re-POST immediately before the stop.
+        self.assertEqual(order.count("/api/fleet/resources/evidence"), 2)
 
     def test_keep_and_unmanaged_never_reaped(self):
         native = [_native(), _native(session_id="22222222-2222-4222-8222-222222222222")]
@@ -218,11 +223,15 @@ class WatchdogCycleTests(unittest.TestCase):
     def test_watchdog_fetch_failure_best_effort(self):
         with patch("agent_hub_host.native_sessions.list_sessions", side_effect=RuntimeError("x")):
             def request(method, path, payload=None):
+                if path == "/api/fleet/resources/report":
+                    return {"reported": True}
                 return {"config": {}, "sessions": [_entry(state="failed")]}
             out = rm.run_watchdog_cycle(request, journal_dir=None, now_ms=10_000_000)
-            # No native rows -> no samples, but still ok (best effort).
+            # No native rows -> terminal sessions still emit cached/null final
+            # rows (never skipped), reported best-effort.
             self.assertTrue(out["ok"])
             self.assertEqual(out["reaps"], 0)
+            self.assertEqual(out["samples"], 1)
 
     def test_lifecycle_journal_idempotent_ids(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -232,14 +241,20 @@ class WatchdogCycleTests(unittest.TestCase):
             self.assertEqual(out["reaps"], 1)
             evidence_calls = [c for c in calls if c[1] == "/api/fleet/resources/evidence"]
             report_calls = [c for c in calls if c[1] == "/api/fleet/resources/report"]
-            self.assertEqual(len(evidence_calls), 1)
+            # Initial evidence POST plus the idempotent keep/protection
+            # recheck immediately before the stop; both carry the same id.
+            self.assertEqual(len(evidence_calls), 2)
+            self.assertEqual(evidence_calls[0][2]["id"], evidence_calls[1][2]["id"])
             self.assertEqual(len(report_calls), 1)
             reap = report_calls[0][2]["reaps"][0]
             self.assertTrue(reap["id"].startswith(sessions[0]["session_id"]))
             self.assertEqual(reap["evidence_id"], evidence_calls[0][2]["id"])
-            # State persisted with peaks.
+            # State persisted with peaks; the acked receipt is cleared, the
+            # pending intent is gone after the confirmed stop.
             saved = json.loads(Path(tmp, rm.STATE_FILENAME).read_bytes())
             self.assertIn("peaks", saved)
+            self.assertEqual(saved.get("pending", {}), {})
+            self.assertEqual(saved.get("reported", {}), {})
 
 
 class HeartbeatTests(unittest.TestCase):
@@ -360,6 +375,793 @@ class DispatcherWiringTests(unittest.TestCase):
                    return_value={"type": "heartbeat"}):
             fleet.Dispatcher(cfg, request, runner).once()
         self.assertNotIn("/api/fleet/resources/watchdog", calls)
+
+
+class EvidenceGateTests(unittest.TestCase):
+    def _reap_cycle(self, sessions, native_rows, now_ms=10_000_000, journal=None,
+                    evidence=None, captures=None, stop=None, samples=None):
+        calls = []
+
+        def request(method, path, payload=None):
+            calls.append((method, path, payload))
+            if path == "/api/fleet/resources/watchdog":
+                return {"config": {"watchdog_interval_s": 300, "idle_minutes": 60, "rss_flag_gb": 4},
+                        "sessions": sessions}
+            if path == "/api/fleet/resources/evidence":
+                if callable(evidence):
+                    return evidence(calls, payload)
+                return {"saved": True, "evidence_id": payload["id"]}
+            if path == "/api/fleet/resources/report":
+                return {"reported": True}
+            raise AssertionError(path)
+
+        cap = captures
+        if cap is None:
+            cap = SimpleNamespace(session_id="x", tag="t", mode="tail", text="tail",
+                                  truncated=False, byte_length=4)
+        stop_result = stop
+        if stop_result is None:
+            stop_result = SimpleNamespace(state="stopped", session_id="x", reason="k")
+        sample = samples
+        if sample is None:
+            sample = {"rss_mb": 64.0, "pss_mb": 32.0, "cpu_seconds": 5.0,
+                      "runtime_s": 50.0, "avg_cpu_cores": 0.1, "current_mb": 64.0}
+        with patch("agent_hub_host.native_sessions.list_sessions", return_value=native_rows), \
+             patch("agent_hub_host.native_sessions.qualify_target", side_effect=lambda exe, t, live_only=True: next(
+                 r for r in native_rows if r.session_id.lower() == t.session_id.lower())), \
+             patch("agent_hub_host.native_sessions.capture_output",
+                   side_effect=None if not isinstance(cap, list) else cap,
+                   return_value=None if isinstance(cap, list) else cap), \
+             patch("agent_hub_host.native_sessions.stop_session",
+                   side_effect=None if isinstance(stop_result, BaseException) else None,
+                   return_value=None if isinstance(stop_result, BaseException) else stop_result) as stop_mock, \
+             patch.object(rm, "sample_session_tree",
+                          side_effect=None if isinstance(sample, list) else None,
+                          return_value=None if isinstance(sample, list) else sample):
+            if isinstance(stop_result, BaseException):
+                with patch("agent_hub_host.native_sessions.stop_session",
+                           side_effect=stop_result) as stop_mock2:
+                    out = rm.run_watchdog_cycle(request, journal_dir=journal, now_ms=now_ms)
+                return out, calls, stop_mock2
+            out = rm.run_watchdog_cycle(request, journal_dir=journal, now_ms=now_ms)
+        return out, calls, stop_mock
+
+    def test_evidence_ack_missing_id_refuses_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = [_native(phase="exited", last_activity_ms=1_000_000)]
+            out, _, stop_mock = self._reap_cycle(
+                [_entry(state="failed")], native, journal=tmp,
+                evidence=lambda calls, payload: {"saved": True})
+            stop_mock.assert_not_called()
+            self.assertEqual(out["reaps"], 0)
+
+    def test_evidence_saved_false_refuses_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = [_native(phase="exited", last_activity_ms=1_000_000)]
+            out, _, stop_mock = self._reap_cycle(
+                [_entry(state="failed")], native, journal=tmp,
+                evidence=lambda calls, payload: {"saved": False, "evidence_id": payload["id"]})
+            stop_mock.assert_not_called()
+            self.assertEqual(out["reaps"], 0)
+
+    def test_output_race_after_evidence_refuses_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = [_native(phase="exited", last_activity_ms=1_000_000)]
+            cap_a = SimpleNamespace(session_id="x", tag="t", mode="tail", text="tail-A",
+                                    truncated=False, byte_length=6)
+            cap_b = SimpleNamespace(session_id="x", tag="t", mode="tail", text="tail-A-MORE",
+                                    truncated=False, byte_length=11)
+            out, _, stop_mock = self._reap_cycle(
+                [_entry(state="failed")], native, journal=tmp, captures=[cap_a, cap_b])
+            # Newer productive output appeared during the evidence window.
+            stop_mock.assert_not_called()
+            self.assertEqual(out["reaps"], 0)
+            # The pre-evidence intent was journaled; a later quiet cycle retries.
+            saved = json.loads(Path(tmp, rm.STATE_FILENAME).read_bytes())
+            self.assertTrue(saved.get("pending"))
+
+    def test_keep_set_after_evidence_refuses_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = [_native(phase="exited", last_activity_ms=1_000_000)]
+
+            def evidence(calls, payload):
+                prior = [c for c in calls if c[1] == "/api/fleet/resources/evidence"]
+                if len(prior) > 1:
+                    # Server re-POST revalidates keep/protection: now kept.
+                    raise RuntimeError("HTTP 400 session_not_reapable")
+                return {"saved": True, "evidence_id": payload["id"]}
+
+            out, _, stop_mock = self._reap_cycle(
+                [_entry(state="failed")], native, journal=tmp, evidence=evidence)
+            stop_mock.assert_not_called()
+            self.assertEqual(out["reaps"], 0)
+
+    def test_idle_uses_full_configured_threshold(self):
+        # Entry says idle (61 min) but the FRESH native stamp is 59 min old:
+        # the full 60-min threshold refuses (the old 60s rule would have fired).
+        with tempfile.TemporaryDirectory() as tmp:
+            fresh_ms = 10_000_000 - 59 * 60 * 1000
+            native = [_native(phase="running", last_activity_ms=fresh_ms)]
+            sessions = [_entry(state="running", last_activity_at="1970-01-01T00:00:00Z")]
+            out, _, stop_mock = self._reap_cycle(sessions, native, journal=tmp)
+            stop_mock.assert_not_called()
+            self.assertEqual(out["reaps"], 0)
+
+    def test_idle_quiet_happy_path_stops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = [_native(phase="running", last_activity_ms=1_000_000)]
+            sessions = [_entry(state="running", last_activity_at="1970-01-01T00:00:00Z")]
+            out, _, stop_mock = self._reap_cycle(sessions, native, journal=tmp)
+            stop_mock.assert_called_once()
+            self.assertEqual(out["reaps"], 1)
+
+    def test_evidence_output_utf8_byte_bound(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = [_native(phase="exited", last_activity_ms=1_000_000)]
+            big = "ü" * 5000  # 10000 UTF-8 bytes, over the 6000 limit.
+            cap = SimpleNamespace(session_id="x", tag="t", mode="tail", text=big,
+                                  truncated=False, byte_length=len(big.encode("utf-8")))
+            out, calls, _ = self._reap_cycle(
+                [_entry(state="failed")], native, journal=tmp, captures=cap)
+            self.assertEqual(out["reaps"], 1)
+            first = next(c for c in calls if c[1] == "/api/fleet/resources/evidence")
+            sent = first[2]["output"].encode("utf-8")
+            self.assertLessEqual(len(sent), rm.EVIDENCE_MAX_BYTES)
+            sent.decode("utf-8")  # Still valid UTF-8 (no split code point).
+
+
+class JournalTests(unittest.TestCase):
+    def test_save_roundtrips_reported_receipts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = {"peaks": {"k": {"peak_rss_mb": 10.0}}, "pending": {},
+                     "reported": {"rid": {"id": "rid", "session_id": "s", "native_id": "n",
+                                          "reason": "terminal", "freed_mb": 5.0, "at": "t",
+                                          "evidence_id": "e", "stopped": True}},
+                     "last_watchdog_ms": 123}
+            self.assertTrue(rm.save_state(tmp, state))
+            loaded = rm.load_state(tmp)
+            self.assertEqual(loaded["reported"]["rid"]["freed_mb"], 5.0)
+            self.assertEqual(loaded["last_watchdog_ms"], 123)
+
+    def test_sweep_drops_only_aborted_stale_intents(self):
+        state: dict = {"peaks": {}, "reported": {},
+                       "pending": {
+                           "old-aborted": {"at_ms": 1_000},
+                           "old-oracle": {"at_ms": 1_000, "oracle": {"a": 1}},
+                           "fresh": {"at_ms": 100_000_000},
+                       }}
+        rm._sweep_stale_pending(state, 100_000_000)
+        self.assertNotIn("old-aborted", state["pending"])
+        self.assertIn("old-oracle", state["pending"])
+        self.assertIn("fresh", state["pending"])
+
+    def test_save_oversize_fails_closed_without_corruption(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pending = {"p%d" % i: {"blob": "x" * 3000} for i in range(200)}
+            state = {"peaks": {}, "pending": pending, "reported": {}}
+            self.assertFalse(rm.save_state(tmp, state))
+            path = Path(tmp, rm.STATE_FILENAME)
+            if path.exists():
+                # Whatever is on disk must still be valid JSON.
+                json.loads(path.read_bytes())
+
+    def test_journal_failure_refuses_destructive_stop(self):
+        native = [_native(phase="exited", last_activity_ms=1_000_000)]
+        sessions = [_entry(state="failed")]
+
+        def request(method, path, payload=None):
+            if path == "/api/fleet/resources/watchdog":
+                return {"config": {}, "sessions": sessions}
+            if path == "/api/fleet/resources/evidence":
+                return {"saved": True, "evidence_id": payload["id"]}
+            if path == "/api/fleet/resources/report":
+                return {"reported": True}
+            raise AssertionError(path)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("agent_hub_host.native_sessions.list_sessions", return_value=native), \
+             patch("agent_hub_host.native_sessions.qualify_target", return_value=native[0]), \
+             patch("agent_hub_host.native_sessions.capture_output",
+                   return_value=SimpleNamespace(text="t")), \
+             patch("agent_hub_host.native_sessions.stop_session") as stop_mock, \
+             patch.object(rm, "sample_session_tree", return_value={"rss_mb": 1.0}), \
+             patch.object(rm, "save_state", return_value=False):
+            out = rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000)
+        stop_mock.assert_not_called()
+        self.assertEqual(out["reaps"], 0)
+
+    def test_lost_report_replays_until_reported_true(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = [_native(phase="exited", last_activity_ms=1_000_000)]
+            sessions = [_entry(state="failed")]
+            reports = []
+            mode = {"fail": True}
+
+            def request(method, path, payload=None):
+                if path == "/api/fleet/resources/watchdog":
+                    return {"config": {}, "sessions": sessions if mode["fail"] else []}
+                if path == "/api/fleet/resources/evidence":
+                    return {"saved": True, "evidence_id": payload["id"]}
+                if path == "/api/fleet/resources/report":
+                    reports.append(payload)
+                    if mode["fail"]:
+                        raise RuntimeError("transport lost")
+                    return {"reported": True}
+                raise AssertionError(path)
+
+            with patch("agent_hub_host.native_sessions.list_sessions", return_value=native), \
+                 patch("agent_hub_host.native_sessions.qualify_target", return_value=native[0]), \
+                 patch("agent_hub_host.native_sessions.capture_output",
+                       return_value=SimpleNamespace(text="t")), \
+                 patch("agent_hub_host.native_sessions.stop_session",
+                       return_value=SimpleNamespace(state="stopped")), \
+                 patch.object(rm, "sample_session_tree",
+                              return_value={"rss_mb": 8.0, "current_mb": 8.0}):
+                out1 = rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000)
+                self.assertFalse(out1["ok"])
+                mid = rm.load_state(tmp)
+                self.assertEqual(len(mid["reported"]), 1)
+                reap_id = next(iter(mid["reported"]))
+                # Second cycle: no candidates, but the unacked receipt replays.
+                mode["fail"] = False
+                out2 = rm.run_watchdog_cycle(request, journal_dir=tmp,
+                                             now_ms=10_000_000 + 301_000)
+            self.assertTrue(out2["ok"])
+            self.assertEqual(len(reports), 2)
+            replayed = [r for r in reports[1]["reaps"] if r["id"] == reap_id]
+            self.assertEqual(len(replayed), 1)
+            self.assertTrue(replayed[0]["stopped"])
+            final = rm.load_state(tmp)
+            self.assertEqual(final["reported"], {})
+
+
+class OracleTests(unittest.TestCase):
+    def _oracle(self, **kw):
+        base = {"version": 1, "session_id": "11111111-1111-4111-8111-111111111111",
+                "tag": "hub-abc", "workspace": "/repo", "created_at_ms": 900_000,
+                "engine": "codex", "phase": "exited", "worker_pid": None,
+                "workload_pid": None, "processes": None, "containment_empty": True,
+                "workload_cgroup": None, "last_activity_ms": 1_000_000}
+        base.update(kw)
+        return base
+
+    def test_uncertain_stop_confirms_without_second_kill(self):
+        from agent_hub_host.native_sessions import _uncertain_with_oracle
+        with tempfile.TemporaryDirectory() as tmp:
+            native = [_native(phase="exited", last_activity_ms=1_000_000,
+                              containment_empty=True)]
+            sessions = [_entry(state="failed")]
+            uncertain = _uncertain_with_oracle("kill ok, exit unproven",
+                                               self._oracle(), {"signal": "TERM"})
+
+            def request(method, path, payload=None):
+                if path == "/api/fleet/resources/watchdog":
+                    return {"config": {}, "sessions": sessions}
+                if path == "/api/fleet/resources/evidence":
+                    return {"saved": True, "evidence_id": payload["id"]}
+                if path == "/api/fleet/resources/report":
+                    return {"reported": True}
+                raise AssertionError(path)
+
+            with patch("agent_hub_host.native_sessions.list_sessions", return_value=native), \
+                 patch("agent_hub_host.native_sessions.qualify_target", return_value=native[0]), \
+                 patch("agent_hub_host.native_sessions.capture_output",
+                       return_value=SimpleNamespace(text="t")), \
+                 patch("agent_hub_host.native_sessions.stop_session",
+                       side_effect=uncertain) as stop_mock, \
+                 patch.object(rm, "sample_session_tree",
+                              return_value={"rss_mb": 8.0, "current_mb": 8.0}):
+                out = rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000)
+            # Read-only reconcile confirmed via the oracle: exactly one kill.
+            stop_mock.assert_called_once()
+            self.assertEqual(out["reaps"], 1)
+
+    def test_uncertain_denied_never_retries_kill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = [_native(phase="running", last_activity_ms=1_000_000)]
+            sessions = [_entry(state="failed")]
+            from agent_hub_host.native_sessions import _uncertain_with_oracle
+            oracle = self._oracle(containment_empty=False)
+
+            def request(method, path, payload=None):
+                if path == "/api/fleet/resources/watchdog":
+                    return {"config": {}, "sessions": sessions}
+                if path == "/api/fleet/resources/evidence":
+                    return {"saved": True, "evidence_id": payload["id"]}
+                if path == "/api/fleet/resources/report":
+                    return {"reported": True}
+                raise AssertionError(path)
+
+            with patch("agent_hub_host.native_sessions.list_sessions", return_value=native), \
+                 patch("agent_hub_host.native_sessions.qualify_target", return_value=native[0]), \
+                 patch("agent_hub_host.native_sessions.capture_output",
+                       return_value=SimpleNamespace(text="t")), \
+                 patch("agent_hub_host.native_sessions.stop_session",
+                       side_effect=_uncertain_with_oracle("still running", oracle, {})) as stop_mock, \
+                 patch("agent_hub_host.native_sessions.reconcile_stop_oracle",
+                       side_effect=[(False, "still running"), (True, "cgroup reaped")]), \
+                 patch.object(rm, "sample_session_tree",
+                              return_value={"rss_mb": 8.0, "current_mb": 8.0}):
+                out1 = rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000)
+                self.assertEqual(out1["reaps"], 0)
+                out2 = rm.run_watchdog_cycle(request, journal_dir=tmp,
+                                             now_ms=10_000_000 + 301_000)
+                self.assertEqual(out2["reaps"], 1)
+            # One kill total across both cycles: the retry was read-only.
+            stop_mock.assert_called_once()
+
+
+class CgroupScopeTests(unittest.TestCase):
+    SCOPE = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/aplexer-workload-abc.scope"
+
+    def test_native_relative_form_resolves(self):
+        self.assertEqual(
+            rm._cgroup_path("/user.slice/user-1000.slice/user@1000.service/app.slice/aplexer-workload-abc.scope"),
+            self.SCOPE)
+
+    def test_shared_slices_rejected(self):
+        for bad in ("/sys/fs/cgroup/user.slice",
+                    "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service",
+                    "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
+                    "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-u1.service",
+                    "/sys/fs/cgroup/user.slice/x.slice/session-3.scope",
+                    "/sys/fs/cgroup/init.scope",
+                    "/sys/fs/cgroup",
+                    "user.slice/x.scope",
+                    "/sys/fs/cgroup/a/../b.scope",
+                    "",
+                    None):
+            self.assertIsNone(rm._cgroup_path(bad), bad)
+
+    def test_foreign_scope_rejected_by_pid(self):
+        scope = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/aplexer-workload-abc.scope"
+        with patch.object(rm, "_pids_in_cgroup", return_value=[9999]):
+            self.assertIsNone(rm._cgroup_path(scope, [1234]))
+            self.assertEqual(rm._cgroup_path(scope, [9999]), scope)
+        with patch.object(rm, "_pids_in_cgroup", return_value=[]):
+            # Unreadable/empty membership proves nothing foreign: accepted,
+            # sampling still falls back per readable counters.
+            self.assertEqual(rm._cgroup_path(scope, [1234]), scope)
+
+    def test_shared_slice_falls_back_to_exact_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp)
+            d = proc / "100"
+            d.mkdir()
+            d.joinpath("stat").write_text(
+                "100 (cmd) R 1 1 1 0 -1 0 0 0 0 0 50 50 0 0 20 0 1 0 100 0 0 0")
+            d.joinpath("smaps_rollup").write_text(
+                "Rss: 10240 kB\nPss: 5120 kB\nAnonymous: 8192 kB\n")
+            row = {"workload_cgroup": "/sys/fs/cgroup/user.slice/user-1000.slice",
+                   "worker_pid": 100, "workload_pid": None, "created_at_ms": 0}
+            out = rm.sample_session_tree(row, 1_000_000, proc_root=str(proc))
+            self.assertIsNotNone(out)
+            self.assertAlmostEqual(out["rss_mb"], 8.0, delta=0.5)
+
+    def test_sampler_never_uses_current_or_peak_as_rss(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cg = Path(tmp) / "aplexer-workload-abc.scope"
+            cg.mkdir()
+            # No memory.stat anon at all: current/peak (page cache) must NOT
+            # become RSS; the tree is unknown.
+            (cg / "memory.current").write_text("209715200\n")
+            (cg / "memory.peak").write_text("314572800\n")
+            (cg / "cpu.stat").write_text("usage_usec 1000000\n")
+            (cg / "cgroup.procs").write_text("")
+            row = {"workload_cgroup": str(cg), "worker_pid": None,
+                   "workload_pid": None, "created_at_ms": 0}
+            with patch.object(rm, "_cgroup_path", return_value=str(cg)):
+                self.assertIsNone(rm.sample_session_tree(row, 180_000_000, proc_root=tmp))
+
+
+class PeakTests(unittest.TestCase):
+    def test_peak_monotonicity_explicit_mapping(self):
+        state: dict = {"peaks": {}, "pending": {}, "reported": {}}
+        first = rm.update_peaks(state, "s", "n",
+                                {"rss_mb": 200.0, "pss_mb": 100.0, "cpu_seconds": 10.0,
+                                 "runtime_s": 50.0, "avg_cpu_cores": 0.2, "current_mb": 200.0}, "t0")
+        self.assertEqual(first["peak_rss_mb"], 200.0)
+        # A smaller sample must NOT reset the stored peak (old code looked up
+        # prior "rss_mb" while storing "peak_rss_mb" and lost peaks).
+        second = rm.update_peaks(state, "s", "n",
+                                 {"rss_mb": 50.0, "pss_mb": None, "cpu_seconds": 30.0,
+                                  "runtime_s": 60.0, "avg_cpu_cores": 0.5, "current_mb": 50.0}, "t1")
+        self.assertEqual(second["peak_rss_mb"], 200.0)
+        self.assertEqual(second["peak_pss_mb"], 100.0)
+        self.assertEqual(second["cpu_seconds"], 30.0)
+        self.assertEqual(second["runtime_s"], 60.0)
+
+    def test_terminal_runtime_frozen_not_growing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = [_native(phase="exited", last_activity_ms=1_000_000)]
+            sessions = [_entry(state="failed", finished_at="1970-01-01T00:20:00Z",
+                               started_at="1970-01-01T00:15:00Z")]
+            seen = []
+
+            def request(method, path, payload=None):
+                if path == "/api/fleet/resources/watchdog":
+                    return {"config": {}, "sessions": sessions}
+                if path == "/api/fleet/resources/evidence":
+                    return {"saved": True, "evidence_id": payload["id"]}
+                if path == "/api/fleet/resources/report":
+                    seen.append(payload)
+                    return {"reported": True}
+                raise AssertionError(path)
+
+            with patch("agent_hub_host.native_sessions.list_sessions", return_value=native), \
+                 patch("agent_hub_host.native_sessions.qualify_target", return_value=native[0]), \
+                 patch("agent_hub_host.native_sessions.capture_output",
+                       return_value=SimpleNamespace(text="t")), \
+                 patch("agent_hub_host.native_sessions.stop_session",
+                       return_value=SimpleNamespace(state="stopped")), \
+                 patch.object(rm, "sample_session_tree",
+                              return_value={"rss_mb": 8.0, "cpu_seconds": 9.0,
+                                            "runtime_s": 9999.0, "current_mb": 8.0}):
+                rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000)
+                # A later heartbeat must not advance the frozen runtime.
+                rm.run_watchdog_cycle(request, journal_dir=None,
+                                      now_ms=10_000_000 + 100_000)
+            # finished 00:20 - started 00:15 = 300s, frozen on both heartbeats.
+            self.assertEqual(seen[0]["samples"][0]["runtime_s"], 300.0)
+            self.assertEqual(seen[1]["samples"][0]["runtime_s"], 300.0)
+
+    def test_terminal_without_native_emits_final_row(self):
+        def request(method, path, payload=None):
+            if path == "/api/fleet/resources/watchdog":
+                return {"config": {}, "sessions": [_entry(state="failed")]}
+            if path == "/api/fleet/resources/report":
+                return {"reported": True}
+            raise AssertionError(path)
+
+        with patch("agent_hub_host.native_sessions.list_sessions", return_value=[]):
+            out = rm.run_watchdog_cycle(request, journal_dir=None, now_ms=10_000_000)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["samples"], 1)
+        self.assertEqual(out["reaps"], 0)
+
+    def test_unknown_cpu_stays_null_never_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cg = Path(tmp) / "aplexer-workload-abc.scope"
+            cg.mkdir()
+            (cg / "memory.stat").write_text("anon 104857600\n")
+            (cg / "memory.current").write_text("104857600\n")
+            (cg / "cgroup.procs").write_text("")
+            row = {"workload_cgroup": str(cg), "worker_pid": None,
+                   "workload_pid": None, "created_at_ms": 0}
+            with patch.object(rm, "_cgroup_path", return_value=str(cg)):
+                out = rm.sample_session_tree(row, 180_000_000, proc_root=tmp)
+            self.assertIsNotNone(out)
+            self.assertAlmostEqual(out["rss_mb"], 100.0, delta=1.0)
+            self.assertIsNone(out["cpu_seconds"])
+            self.assertIsNone(out["avg_cpu_cores"])
+            self.assertIsNone(out["pss_mb"])
+            reported = rm._sample_row("s", "n", {"peak_rss_mb": out["rss_mb"],
+                                                 "peak_pss_mb": None, "cpu_seconds": None,
+                                                 "runtime_s": None, "avg_cpu_cores": None}, "t")
+            self.assertNotIn("cpu_seconds", reported)
+            self.assertNotIn("peak_pss_mb", reported)
+
+
+class BatchCadenceTests(unittest.TestCase):
+    def test_destructive_pass_gated_to_configured_cadence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = [_native(phase="exited", last_activity_ms=1_000_000)]
+            sessions = [_entry(state="failed")]
+            counts = []
+
+            def request(method, path, payload=None):
+                if path == "/api/fleet/resources/watchdog":
+                    return {"config": {}, "sessions": sessions}
+                if path == "/api/fleet/resources/evidence":
+                    return {"saved": True, "evidence_id": payload["id"]}
+                if path == "/api/fleet/resources/report":
+                    return {"reported": True}
+                raise AssertionError(path)
+
+            with patch("agent_hub_host.native_sessions.list_sessions", return_value=native), \
+                 patch("agent_hub_host.native_sessions.qualify_target", return_value=native[0]), \
+                 patch("agent_hub_host.native_sessions.capture_output",
+                       return_value=SimpleNamespace(text="t")), \
+                 patch("agent_hub_host.native_sessions.stop_session",
+                       return_value=SimpleNamespace(state="stopped")), \
+                 patch.object(rm, "sample_session_tree",
+                              return_value={"rss_mb": 8.0, "current_mb": 8.0}):
+                counts.append(rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000)["reaps"])
+                # Same heartbeat immediately after: sampling continues, no stops.
+                mid = rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000 + 60_000)
+                counts.append(mid["reaps"])
+                self.assertGreaterEqual(mid["samples"], 1)
+                # After the 300s cadence: destructive pass runs again.
+                counts.append(rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000 + 301_000)["reaps"])
+            self.assertEqual(counts, [1, 0, 1])
+
+    def test_report_batches_stay_well_under_body_cap(self):
+        fat = [{"session_id": "s%d" % i, "native_id": "n%d" % i, "observed_at": "t",
+                "peak_rss_mb": 1.5, "pad": "x" * 500} for i in range(200)]
+        reaps = [{"id": "r%d" % i, "session_id": "s", "native_id": "n", "reason": "idle",
+                  "freed_mb": 1.0, "at": "t", "evidence_id": "e", "stopped": True} for i in range(3)]
+        posts = rm._split_report_posts(fat, reaps)
+        self.assertGreater(len(posts), 1)
+        total = 0
+        for post in posts:
+            size = len(json.dumps(post).encode("utf-8"))
+            self.assertLess(size, rm.REPORT_BYTE_BUDGET)
+            self.assertLessEqual(len(post["samples"]), 200)
+            total += len(post["samples"])
+        self.assertEqual(total, 200)
+        self.assertEqual(sum(len(p["reaps"]) for p in posts), 3)
+
+    def test_config_clamped_to_server_bounds(self):
+        cfg = rm.normalize_config({"watchdog_interval_s": 5, "idle_minutes": 1, "rss_flag_gb": 0.01})
+        self.assertEqual(cfg["watchdog_interval_s"], 300)
+        self.assertEqual(cfg["idle_minutes"], 10)
+        self.assertEqual(cfg["rss_flag_gb"], 0.125)
+        cfg = rm.normalize_config({"watchdog_interval_s": 3600, "idle_minutes": 99999, "rss_flag_gb": 99999})
+        self.assertEqual(cfg["watchdog_interval_s"], 600)
+        self.assertEqual(cfg["idle_minutes"], 10080)
+        self.assertEqual(cfg["rss_flag_gb"], 1024)
+        self.assertEqual(rm.watchdog_interval_ms({"watchdog_interval_s": 1}), 300_000)
+
+    def test_truncate_utf8_bytes_never_splits_codepoint(self):
+        out = rm._truncate_utf8_bytes("é" * 4000, 6000)
+        raw = out.encode("utf-8")
+        self.assertEqual(len(raw), 6000)
+        raw.decode("utf-8")
+        self.assertEqual(rm._truncate_utf8_bytes("a" * 7000, 6000), "a" * 6000)
+        self.assertEqual(rm._truncate_utf8_bytes("abc", 6000), "abc")
+
+    def test_redact_fallback_never_returns_raw(self):
+        secret = "token=abc sk-12345678901234567890"
+        with patch("agent_hub_host.workclaim.redact_for_bus", side_effect=RuntimeError("down")):
+            red = rm._redact(secret)
+        self.assertNotIn("sk-1234", red)
+        self.assertNotIn("token=abc", red)
+
+    def test_freed_unknown_reports_null_never_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = [_native(phase="exited", last_activity_ms=1_000_000)]
+            sessions = [_entry(state="failed")]
+            seen = []
+
+            def request(method, path, payload=None):
+                if path == "/api/fleet/resources/watchdog":
+                    return {"config": {}, "sessions": sessions}
+                if path == "/api/fleet/resources/evidence":
+                    return {"saved": True, "evidence_id": payload["id"]}
+                if path == "/api/fleet/resources/report":
+                    seen.append(payload)
+                    return {"reported": True}
+                raise AssertionError(path)
+
+            with patch("agent_hub_host.native_sessions.list_sessions", return_value=native), \
+                 patch("agent_hub_host.native_sessions.qualify_target", return_value=native[0]), \
+                 patch("agent_hub_host.native_sessions.capture_output",
+                       return_value=SimpleNamespace(text="t")), \
+                 patch("agent_hub_host.native_sessions.stop_session",
+                       return_value=SimpleNamespace(state="stopped")) as stop_mock, \
+                 patch.object(rm, "sample_session_tree", return_value=None):
+                out = rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000)
+            # Stop confirmed with unproven release: reap reported with
+            # freed_mb null (server stores unknown), never a fabricated 0.
+            stop_mock.assert_called_once()
+            self.assertEqual(out["reaps"], 1)
+            self.assertIsNone(seen[0]["reaps"][0]["freed_mb"])
+            self.assertTrue(seen[0]["reaps"][0]["stopped"])
+            # Acked: nothing retained.
+            self.assertEqual(rm.load_state(tmp)["reported"], {})
+
+    def test_per_attempt_evidence_ids_and_incarnation_reap_id(self):
+        import re
+        self.assertEqual(
+            rm._evidence_id("s", "idle", 900_000, 1_000_000, "ab12"),
+            rm._evidence_id("s", "idle", 900_000, 1_000_000, "ab12"))
+        self.assertNotEqual(
+            rm._evidence_id("s", "idle", 900_000, 1_000_000, "ab12"),
+            rm._evidence_id("s", "idle", 900_001, 1_000_000, "ab12"))
+        self.assertNotEqual(
+            rm._evidence_id("s", "idle", 900_000, 1_000_000, "ab12"),
+            rm._evidence_id("s", "idle", 900_000, 1_000_001, "ab12"))
+        self.assertNotEqual(
+            rm._evidence_id("s", "idle", 900_000, 1_000_000, "ab12"),
+            rm._evidence_id("s", "idle", 900_000, 1_000_000, "cd34"))
+        reap = rm._reap_id("sess-1", "terminal", 900_000, "ab12cd34")
+        self.assertIn("900000", reap)  # Native incarnation included.
+        self.assertTrue(re.match(r"^[\w:-]{1,128}$", reap))
+
+    def test_new_output_mints_new_evidence_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = [_native(phase="exited", last_activity_ms=1_000_000)]
+            sessions = [_entry(state="failed")]
+            evidence_ids = []
+
+            def request(method, path, payload=None):
+                if path == "/api/fleet/resources/watchdog":
+                    return {"config": {}, "sessions": sessions}
+                if path == "/api/fleet/resources/evidence":
+                    evidence_ids.append(payload["id"])
+                    return {"saved": True, "evidence_id": payload["id"]}
+                if path == "/api/fleet/resources/report":
+                    return {"reported": True}
+                raise AssertionError(path)
+
+            def cap_old(exe, target, limit_bytes=1, mode="tail"):
+                return SimpleNamespace(session_id="x", tag="t", mode="tail",
+                                        text="old", truncated=False, byte_length=3)
+
+            def cap_new(exe, target, limit_bytes=1, mode="tail"):
+                return SimpleNamespace(session_id="x", tag="t", mode="tail",
+                                        text="new-output", truncated=False, byte_length=10)
+
+            with patch("agent_hub_host.native_sessions.list_sessions", return_value=native), \
+                 patch("agent_hub_host.native_sessions.qualify_target", return_value=native[0]), \
+                 patch("agent_hub_host.native_sessions.capture_output", side_effect=cap_old), \
+                 patch("agent_hub_host.native_sessions.stop_session",
+                       return_value=SimpleNamespace(state="stopped")) as stop_mock, \
+                 patch.object(rm, "sample_session_tree",
+                              return_value={"rss_mb": 8.0, "current_mb": 8.0}):
+                # Cycle 1: snapshot "old", recheck "old" (stable) -> stops.
+                out1 = rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000)
+            self.assertEqual(out1["reaps"], 1)
+            first_id = evidence_ids[-1]
+            # Cycle 2 (after cadence): capture now shows different output, so
+            # the attempt mints a different evidence id (no stale receipt).
+            with patch("agent_hub_host.native_sessions.list_sessions", return_value=native), \
+                 patch("agent_hub_host.native_sessions.qualify_target", return_value=native[0]), \
+                 patch("agent_hub_host.native_sessions.capture_output", side_effect=cap_new), \
+                 patch("agent_hub_host.native_sessions.stop_session",
+                       return_value=SimpleNamespace(state="stopped")), \
+                 patch.object(rm, "sample_session_tree",
+                              return_value={"rss_mb": 8.0, "current_mb": 8.0}):
+                rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000 + 301_000)
+            self.assertNotEqual(evidence_ids[-1], first_id)
+            _ = stop_mock
+
+    def test_reap_at_uses_post_stop_clock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = [_native(phase="exited", last_activity_ms=1_000_000)]
+            sessions = [_entry(state="failed")]
+            seen = []
+
+            def request(method, path, payload=None):
+                if path == "/api/fleet/resources/watchdog":
+                    return {"config": {}, "sessions": sessions}
+                if path == "/api/fleet/resources/evidence":
+                    return {"saved": True, "evidence_id": payload["id"]}
+                if path == "/api/fleet/resources/report":
+                    seen.append(payload)
+                    return {"reported": True}
+                raise AssertionError(path)
+
+            with patch("agent_hub_host.native_sessions.list_sessions", return_value=native), \
+                 patch("agent_hub_host.native_sessions.qualify_target", return_value=native[0]), \
+                 patch("agent_hub_host.native_sessions.capture_output",
+                       return_value=SimpleNamespace(text="t")), \
+                 patch("agent_hub_host.native_sessions.stop_session",
+                       return_value=SimpleNamespace(state="stopped")), \
+                 patch.object(rm, "sample_session_tree",
+                              return_value={"rss_mb": 8.0, "current_mb": 8.0}):
+                out = rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000,
+                                            clock=lambda: 20_000_000)
+            self.assertEqual(out["reaps"], 1)
+            # 20_000_000 ms = 1970-01-01T05:33:20Z, not the stale cycle start.
+            self.assertEqual(seen[0]["reaps"][0]["at"], "1970-01-01T05:33:20Z")
+
+    def test_current_rss_reported_each_heartbeat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = [_native(phase="running", last_activity_ms=1_000_000)]
+            sessions = [_entry(state="running", last_activity_at="1970-01-01T00:00:00Z",
+                               started_at="1970-01-01T00:15:00Z")]
+            seen = []
+
+            def request(method, path, payload=None):
+                if path == "/api/fleet/resources/watchdog":
+                    return {"config": {}, "sessions": sessions}
+                if path == "/api/fleet/resources/report":
+                    seen.append(payload)
+                    return {"reported": True}
+                raise AssertionError(path)
+
+            with patch("agent_hub_host.native_sessions.list_sessions", return_value=native):
+                with patch.object(rm, "sample_session_tree",
+                                  return_value={"rss_mb": 42.0, "pss_mb": 20.0,
+                                                "cpu_seconds": 3.0, "runtime_s": 100.0,
+                                                "avg_cpu_cores": 0.03, "current_mb": 42.0}):
+                    out = rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000)
+            self.assertTrue(out["ok"])
+            # Fresh current anon RSS credited against the ramp (not the peak).
+            self.assertEqual(seen[0]["samples"][0]["current_rss_mb"], 42.0)
+
+    def test_freed_is_measured_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = [_native(phase="exited", last_activity_ms=1_000_000)]
+            sessions = [_entry(state="failed")]
+            seen = []
+
+            def request(method, path, payload=None):
+                if path == "/api/fleet/resources/watchdog":
+                    return {"config": {}, "sessions": sessions}
+                if path == "/api/fleet/resources/evidence":
+                    return {"saved": True, "evidence_id": payload["id"]}
+                if path == "/api/fleet/resources/report":
+                    seen.append(payload)
+                    return {"reported": True}
+                raise AssertionError(path)
+
+            before = {"rss_mb": 90.0, "current_mb": 100.0}
+            with patch("agent_hub_host.native_sessions.list_sessions", return_value=native), \
+                 patch("agent_hub_host.native_sessions.qualify_target", return_value=native[0]), \
+                 patch("agent_hub_host.native_sessions.capture_output",
+                       return_value=SimpleNamespace(text="t")), \
+                 patch("agent_hub_host.native_sessions.stop_session",
+                       return_value=SimpleNamespace(state="stopped")), \
+                 patch.object(rm, "sample_session_tree",
+                              side_effect=[dict(before), dict(before), None]):
+                out = rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000)
+            self.assertEqual(out["reaps"], 1)
+            # Tree gone after confirmed death: full measured release freed.
+            self.assertEqual(seen[0]["reaps"][0]["freed_mb"], 100.0)
+
+
+class ResourcesCliRenderTests(unittest.TestCase):
+    def test_sessions_text_shows_full_ledger(self):
+        from agent_hub_host import resources
+        data = {"sessions": [{"session_id": "s1", "project": "p", "engine": "codex",
+                              "model": "m", "tier": "quick", "kind": "goal",
+                              "state": "running", "finished_at": None,
+                              "peak_rss_mb": 128.0, "peak_pss_mb": 64.0,
+                              "cpu_seconds": 12.5, "avg_cpu_cores": 0.25,
+                              "runtime_s": 90.0, "rss_flagged": True}]}
+        text = resources.render_text(data, "sessions")
+        for want in ("peak_rss=128 MiB", "peak_pss=64 MiB", "cpu=12.5s", "avg_cpu=0.25",
+                     "runtime=1m30s", "project=p", "engine=codex", "model=m",
+                     "tier=quick", "kind=goal", "state=running", "FLAGGED"):
+            self.assertIn(want, text)
+
+    def test_sessions_text_final_state(self):
+        from agent_hub_host import resources
+        data = {"sessions": [{"session_id": "s1", "state": "stopped",
+                              "finished_at": "2026-10-26T00:00:00Z"}]}
+        text = resources.render_text(data, "sessions")
+        self.assertIn("finished=2026-10-26T00:00:00Z", text)
+        self.assertIn("peak_rss=unknown", text)
+
+    def test_reaps_text_shows_actor_intake(self):
+        from agent_hub_host import resources
+        data = {"reaps": [{"session_id": "s1", "reason": "idle", "freed_mb": 200.0,
+                           "at": "2026-10-26T00:00:00Z", "actor": "machine:h1",
+                           "intake_id": "int-1", "evidence_id": "e1"}]}
+        text = resources.render_text(data, "reaps")
+        for want in ("actor=machine:h1", "intake=int-1", "at=2026-10-26T00:00:00Z",
+                     "reason=idle", "freed=200 MiB", "evidence=e1"):
+            self.assertIn(want, text)
+
+    def test_project_filter_accepts_absolute_path(self):
+        from agent_hub_host import resources
+        seen = {}
+
+        def fake_request(method, path, payload=None):
+            seen["path"] = path
+            return {"sessions": []}
+        with patch("agent_hub_host.bus._do_request", side_effect=fake_request):
+            resources.fetch_sessions(project="/home/alexey/git")
+        self.assertIn("project=%2Fhome%2Falexey%2Fgit", seen["path"])
+
+    def test_project_filter_rejects_traversal(self):
+        from agent_hub_host import resources
+        for bad in ("/a/../b", "/a//b", "bad/project", "/trailing/", "/"):
+            with self.assertRaises(ValueError, msg=bad):
+                resources.fetch_sessions(project=bad)
+
+    def test_task_kind_filter(self):
+        from agent_hub_host import resources
+        seen = {}
+
+        def fake_request(method, path, payload=None):
+            seen["path"] = path
+            return {"sessions": []}
+        with patch("agent_hub_host.bus._do_request", side_effect=fake_request):
+            resources.fetch_sessions(task_kind="review")
+        self.assertIn("kind=review", seen["path"])
 
 
 if __name__ == "__main__":
