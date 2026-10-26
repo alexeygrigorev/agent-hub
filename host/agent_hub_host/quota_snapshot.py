@@ -298,6 +298,18 @@ def sanitize_provider(
         limit_reached = None
 
     sanitized_details: Dict[str, Any] = {"limit_reached": limit_reached}
+    # Full-reset grants expose expiry/availability, never an inferred token size.
+    if isinstance(raw_details.get("banked_resets"), list):
+        grants = []
+        for grant in raw_details["banked_resets"][:32]:
+            if not isinstance(grant, dict) or type(grant.get("available")) is not bool:
+                continue
+            expiry = parse_iso_utc(grant.get("expires_at"))
+            label = grant.get("label", "")
+            if expiry is None or not isinstance(label, str) or not re.fullmatch(r"[A-Za-z0-9 ._-]{0,80}", label):
+                continue
+            grants.append({"expires_at": format_iso_utc(expiry), "available": grant["available"], "label": label})
+        sanitized_details["banked_resets"] = grants
     for native_key, native_val in extract_native_fields(raw_details).items():
         if native_val is not None:
             sanitized_details[native_key] = native_val

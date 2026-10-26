@@ -66,7 +66,7 @@ describe('TBM Phase 1 quota schema migration', () => {
           .exec(`PRAGMA table_info(${table})`)
           .toArray()
           .map((c: any) => c.name);
-        expect(actual).toEqual(cols);
+        expect(actual).toEqual(expect.arrayContaining(cols));
       }
 
       const indexes = new Set(

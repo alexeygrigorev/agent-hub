@@ -7,6 +7,7 @@ import {
   inferCycleMs,
   resolveTokenCapacity,
   syncTbmFromServerAccounts,
+  accountsForHostProvider,
   tbmPoolId,
 } from "../src/tbm-ingestion";
 
@@ -22,6 +23,7 @@ function seedFleet(sql: any): void {
   sql.exec(
     "INSERT OR REPLACE INTO fleet_accounts (label, provider, max_concurrency, reserve_percent, enabled) VALUES ('tbm-ingest-claude', 'claude', 1, 0, 1)"
   );
+  for (const id of [1,2,3,4]) sql.exec("INSERT OR REPLACE INTO fleet_routes (machine_id,engine,account) VALUES (?,'codex','tbm-ingest-main')", `tbm-ingest-host-${id}`);
 }
 
 function hostSnap(hostId: string, capturedIso: string, routes: any): any {
@@ -37,6 +39,35 @@ function hostSnap(hostId: string, capturedIso: string, routes: any): any {
 }
 
 describe("AC1 tbm live ingestion", () => {
+  it('preserves real banked-reset deadlines without inventing token quantities', async () => {
+    await runInDurableObject(stub, async (hub: Hub) => {
+      const sql: any = hub.sql;
+      ensureTbmQuotaSchema(sql);
+      const expires = new Date(NOW + 2 * HOUR).toISOString();
+      const quota = { status: 'ok', details: { banked_resets: [
+        { available: true, expires_at: expires, label: 'Full reset' },
+        { available: true, expires_at: expires, label: 'Full reset' },
+      ] }, windows: { '7d': { present: true, percent_remaining: 72,
+        reset_at: new Date(NOW + 7 * DAY).toISOString(), rolling: false } } };
+      const input = [{ provider: 'codex', account: 'banked-test', quota }];
+      syncTbmFromServerAccounts(sql, input, NOW);
+      syncTbmFromServerAccounts(sql, input, NOW + 60000);
+      const banks: any[] = sql.exec("SELECT * FROM tbm_banked_tranches WHERE pool_id='codex:banked-test:7d'").toArray();
+      expect(banks).toHaveLength(2);
+      expect(banks[0]).toMatchObject({ quantity_known: 0, remaining_tokens: 0,
+        expires_at_ms: NOW + 2 * HOUR, status: 'active' });
+      const pool: any = sql.exec("SELECT * FROM tbm_quota_pools WHERE pool_id='codex:banked-test:7d'").toArray()[0];
+      expect(pool).toMatchObject({ quota_unit: 'percent', capacity_known: 0, remaining_percent: 72 });
+    });
+  });
+  it('never spreads one provider observation across multiple accounts', async () => {
+    await runInDurableObject(stub, async (hub: Hub) => {
+      const sql: any = hub.sql;
+      sql.exec("INSERT OR REPLACE INTO fleet_accounts (label,provider,max_concurrency,reserve_percent,enabled) VALUES ('codex-a','codex',1,15,1)");
+      sql.exec("INSERT OR REPLACE INTO fleet_accounts (label,provider,max_concurrency,reserve_percent,enabled) VALUES ('codex-b','codex',1,15,1)");
+      expect(accountsForHostProvider(sql, 'ambiguous-host', 'codex')).toEqual([]);
+    });
+  });
   it("pure helpers: pool id, cycle inference and token capacity never fabricate", () => {
     expect(tbmPoolId("codex", "main", "7d")).toBe("codex:main:7d");
     // No single hardcoded 7d: each window maps to its own nominal cycle.
@@ -126,7 +157,7 @@ describe("AC1 tbm live ingestion", () => {
     });
   });
 
-  it("token-known windows store real tokens and bank a fixed-window tranche", async () => {
+  it("token-known primary quota is never duplicated into banked quota", async () => {
     await runInDurableObject(stub, async (hub: Hub) => {
       const sql: any = hub.sql;
       ensureTbmQuotaSchema(sql);
@@ -173,11 +204,7 @@ describe("AC1 tbm live ingestion", () => {
         const tranches = sql
           .exec("SELECT * FROM tbm_banked_tranches WHERE pool_id = ?", pool.pool_id)
           .toArray() as any[];
-        expect(tranches).toHaveLength(1);
-        expect(tranches[0].expires_at_ms).toBe(Date.parse(reset));
-        expect(tranches[0].status).toBe("active");
-        // Burnable above R_hard = max(5% of 1M, 50k) = 50k → 750k banked.
-        expect(tranches[0].remaining_tokens).toBe(750_000);
+        expect(tranches).toHaveLength(0);
       } finally {
         hub.quotaStore.setClock(undefined);
       }
@@ -238,6 +265,7 @@ describe("AC1 tbm live ingestion", () => {
     await runInDurableObject(stub, async (hub: Hub) => {
       const sql: any = hub.sql;
       ensureTbmQuotaSchema(sql);
+      seedFleet(sql);
       const hostId = "tbm-ingest-host-4";
       sql.exec("DELETE FROM tbm_banked_tranches WHERE pool_id LIKE 'codex:%tbm-ingest%'");
       sql.exec("DELETE FROM tbm_quota_pools WHERE pool_id LIKE 'codex:%tbm-ingest%'");

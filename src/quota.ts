@@ -255,7 +255,7 @@ export function ensureTbmQuotaSchema(sql: SqlStorage): void {
   // Additive AC1 columns for live ingestion (cycle_ms/window_type + percent
   // support). Fresh CREATEs above already include them; existing DBs gain them
   // here without touching prior columns.
-  try {
+  {
     const cols = new Set(
       sql.exec("PRAGMA table_info(tbm_quota_pools)").toArray().map((c: any) => c.name as string)
     );
@@ -265,8 +265,9 @@ export function ensureTbmQuotaSchema(sql: SqlStorage): void {
       sql.exec("ALTER TABLE tbm_quota_pools ADD COLUMN remaining_percent REAL");
     if (!cols.has("capacity_known"))
       sql.exec("ALTER TABLE tbm_quota_pools ADD COLUMN capacity_known INTEGER NOT NULL DEFAULT 1");
-  } catch {
-    /* best-effort migration; callers stay fail-closed on missing tables */
+    if (!cols.has("quota_unit")) sql.exec("ALTER TABLE tbm_quota_pools ADD COLUMN quota_unit TEXT NOT NULL DEFAULT 'tokens'");
+    const bankCols = new Set(sql.exec('PRAGMA table_info(tbm_banked_tranches)').toArray().map((c: any) => c.name));
+    if (!bankCols.has('quantity_known')) sql.exec('ALTER TABLE tbm_banked_tranches ADD COLUMN quantity_known INTEGER NOT NULL DEFAULT 1');
   }
 }
 
@@ -314,6 +315,7 @@ const OPTIONAL_DETAILS_KEYS = new Set<string>([
   "unit",
   "profile",
   "cooldown_until",
+  "banked_resets",
 ]);
 
 const FORBIDDEN_PROTO_KEYS = new Set<string>([
@@ -354,6 +356,7 @@ export interface QuotaRouteDetailsDTO {
   profile?: string | null;
   /** Known provider backoff deadline (UTC ISO). Active holds block admission even when quota looks fine. */
   cooldown_until?: string | null;
+  banked_resets?: { expires_at: string; available: boolean; label: string }[];
 }
 
 export interface QuotaRouteDTO {
@@ -1001,6 +1004,22 @@ export function validateQuotaSnapshotPayload(
       } else {
         sanitizedDetails.cooldown_until = null;
       }
+      if (detailsVal.banked_resets !== undefined) {
+        if (!Array.isArray(detailsVal.banked_resets) || detailsVal.banked_resets.length > 32) {
+          return { ok: false, status: 400, error: 'invalid_banked_resets' };
+        }
+        sanitizedDetails.banked_resets = [];
+        for (const grant of detailsVal.banked_resets) {
+          if (!isPlainObject(grant) || Object.keys(grant).some(k => !['expires_at', 'available', 'label'].includes(k)) ||
+            typeof grant.available !== 'boolean' || typeof grant.label !== 'string' ||
+            !/^[A-Za-z0-9 ._-]{0,80}$/.test(grant.label)) {
+            return { ok: false, status: 400, error: 'invalid_banked_resets' };
+          }
+          const expiry = parseUtcIso(grant.expires_at);
+          if (!expiry) return { ok: false, status: 400, error: 'invalid_banked_resets' };
+          sanitizedDetails.banked_resets.push({ expires_at: expiry.iso, available: grant.available, label: grant.label });
+        }
+      }
     }
 
     sanitizedRoutes[provider] = {
@@ -1275,13 +1294,7 @@ export class QuotaStore {
       );
 
       // AC1: every accepted host collection fills TBM pools/tranches.
-      // Best-effort inside the same transaction; quota acceptance stays
-      // authoritative even if TBM sync finds no mappable windows.
-      try {
-        syncTbmFromHostSnapshot(this.sql, hostId, snap.routes as Record<string, any>, nowMs);
-      } catch {
-        /* quota acceptance wins; TBM stays to be backfilled on next collection */
-      }
+      syncTbmFromHostSnapshot(this.sql, hostId, snap.routes as Record<string, any>, snap.captured_at_ms);
 
       const ageMs = Math.max(0, nowMs - snap.captured_at_ms);
       const isStale = ageMs >= QUOTA_STALE_MS;
@@ -1726,16 +1739,11 @@ export class QuotaStore {
       rows.push({ account, provider, quota });
     }
     if (!this.ctx) return jsonResponse({ error: "storage_unavailable" }, 503);
-    const acceptedAtMs = this.now();
     this.ctx.storage.transactionSync(() => {
       for (const row of rows) this.sql.exec("INSERT OR REPLACE INTO server_quota_snapshots VALUES (?, ?, ?, ?)",
         row.account, row.provider, data.captured_at, JSON.stringify(row.quota));
       // AC1: every accepted server collection fills TBM pools/tranches.
-      try {
-        syncTbmFromServerAccounts(this.sql, rows, acceptedAtMs);
-      } catch {
-        /* server acceptance wins; TBM backfills on the next collection */
-      }
+      syncTbmFromServerAccounts(this.sql, rows, Date.parse(data.captured_at));
     });
     return jsonResponse({ status: "stored", accounts: rows.length });
   }
