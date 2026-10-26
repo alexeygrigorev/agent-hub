@@ -1686,6 +1686,7 @@ class Dispatcher:
             # Resource-management placement hints from the Hub offer (server
             # policy, never fabricated locally): per-offer memory estimate
             # plus the durable resource-management config snapshot.
+            trusted_choking_json = None
             try:
                 estimate = offer.get("memory_estimate_mb")
                 if isinstance(estimate, bool):
@@ -1697,10 +1698,12 @@ class Dispatcher:
                     payload["expected_cpu_cores"] = cpu_estimate
                     if offer.get("expected_cpu_source") in ("repo_kind", "repo", "global", "default"):
                         payload["expected_cpu_source"] = offer["expected_cpu_source"]
-                choking = offer.get("resource_choking")
-                if isinstance(choking, dict) and set(choking) == {"reason", "observed_at"} and choking.get("reason") in {"host_oom", "host_runtime_choking"} and isinstance(choking.get("observed_at"), str) and len(choking["observed_at"]) <= 64:
-                    payload["resource_choking"] = dict(choking)
                 policy = offer.get("resource_management")
+                from .cpu_resources import sanitize_resource_choking
+                choking = sanitize_resource_choking(offer.get("resource_choking"),
+                    policy.get("choking_cooldown_seconds", 300) if isinstance(policy, dict) else 300)
+                if choking is not None:
+                    trusted_choking_json = json.dumps(choking, separators=(",", ":"))
                 if isinstance(policy, dict) and policy:
                     bounded = {k: policy[k] for k in (
                         "memory_floor_mb", "ramp_reserve_default_mb", "estimate_percentile",
@@ -1752,6 +1755,8 @@ class Dispatcher:
                                  "--tmpdir", str(workspace / ".local" / "tmp")]
             else:
                 argv = prefix + ["run", "--backend", "task-units", "--as-controller", "--id", task_id, "--cwd", str(target_cwd), "--tmpdir", str(workspace / ".local" / "tmp")]
+            if trusted_choking_json is not None:
+                argv += ["--trusted-choking-json", trusted_choking_json]
             cwd = launcher["root"]
         else:
             raise ValueError("Unsupported launch mode")

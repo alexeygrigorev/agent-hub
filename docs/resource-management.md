@@ -248,7 +248,17 @@ Server-owned `resource_choking` hints contain only `reason` (`host_oom` or
 `host_runtime_choking`) and `observed_at`; they travel through offers and a
 separate host-supplied `run --trusted-choking-json` argument. Task payloads
 cannot supply trusted runtime evidence. The launcher checks freshness against the configured
-cooldown and independently measure local full-pressure/OOM signals.
+cooldown and independently measures local full-pressure/OOM signals.
+
+Optional `runtime_services` in the private host-health configuration names
+at most eight exact systemd units or Docker containers. Each read-only probe
+has a three-second limit and a 16 KiB output limit, with eight seconds total
+per collection. No service/container discovery runs. Only a recent confirmed
+failure of the configured incarnation counts; missing units, probe errors,
+ordinary stops and stale failures stay unknown. `runtime_cooldown_s` defaults
+to 300 and accepts 30–3600 seconds. The independent host supervisor also
+reports a confirmed crash of its own exact native controller; intentional
+supervisor shutdown does not create a choking event.
 
 Host releases must include `host/`, `config/`, `scripts/`, `pyproject.toml`
 and `uv.lock` from the same accepted commit, followed by `uv sync --frozen`.

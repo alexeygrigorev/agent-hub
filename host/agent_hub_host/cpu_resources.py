@@ -11,6 +11,27 @@ def _number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
 
 
+def sanitize_resource_choking(value, cooldown_s=300, now=None):
+    """Only a bounded fresh server-owned hint, never task text or payload."""
+    if not isinstance(value, dict) or set(value) != {"reason", "observed_at"}:
+        return None
+    if value.get("reason") not in {"host_oom", "host_runtime_choking"}:
+        return None
+    at = value.get("observed_at")
+    if not isinstance(at, str) or len(at) > 64:
+        return None
+    try:
+        observed = datetime.fromisoformat(at.replace("Z", "+00:00"))
+        if observed.tzinfo is None:
+            return None
+        if type(cooldown_s) not in (int, float) or not math.isfinite(cooldown_s) or not 30 <= cooldown_s <= 3600:
+            cooldown_s = 300
+        age = ((now or datetime.now(timezone.utc)) - observed).total_seconds()
+        return dict(value) if -30 <= age <= cooldown_s else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def sanitize_cpu_admission(value):
     """Fixed numeric refusal DTO. Arbitrary output never crosses this boundary."""
     required = {"expected_cpu_cores", "ramping_cpu_cores", "limit_cpu_cores", "target_utilization"}
