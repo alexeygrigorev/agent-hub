@@ -840,7 +840,7 @@ def _ms_to_iso(value):
         return None
 
 
-def session_metadata(raw, settings, progress=None):
+def session_metadata(raw, settings, progress=None, *, collect_tokens=True):
     from .account_capacity import confirmed_empty
     from .session_progress import event_ms
     sessions = raw if isinstance(raw, list) else raw.get("sessions", [])
@@ -874,7 +874,7 @@ def session_metadata(raw, settings, progress=None):
                       "last_activity_at": _ms_to_iso(event_ms(session)),
                       "created_at_ms": created_at_ms,
                       **({'progress': progress[session['id']]} if progress and session['id'] in progress else {})})
-        if session.get('tag', '').startswith(('hub-', 'task-hub-')):
+        if collect_tokens and session.get('tag', '').startswith(('hub-', 'task-hub-')):
             from .token_usage import native_session_tokens
             usage = native_session_tokens({**session, 'created_at_ms': created_at_ms, 'workspace': ws, 'cwd': cwd})
             if usage is not None:
@@ -994,6 +994,8 @@ class Dispatcher:
         self._dispatching: set = set()
         self._dispatching_guard = threading.Lock()
         self._bindings_lock = threading.Lock()
+        self._catalog_report_lock = threading.Lock()
+        self._catalog_enrichment = {}
         self._catalog_sampled_at = 0.0
         self._catalog_raw = None
         self._device_auth_guard = threading.Lock()
@@ -2946,7 +2948,44 @@ class Dispatcher:
                             record['containment_empty'] = row.get('containment_empty')
                             self._persist_launch_record(record)
         progress = self._session_progress.sample(rows, active_launches)
-        self.request("PUT", "/api/fleet/sessions", {"sessions": session_metadata(raw, self.settings, progress)})
+        enriched = session_metadata(raw, self.settings, progress)
+        with self._catalog_report_lock:
+            # Enrichment is never authoritative for identity or lifecycle.
+            # Replace, rather than grow, the cache on every complete sample.
+            self._catalog_enrichment = {
+                self._catalog_identity(row): {key: row[key] for key in ('progress', 'tokens') if key in row}
+                for row in enriched[:500]
+            }
+            # A native may have appeared during slow transcript/token sampling.
+            # Re-list under the report lock: an older snapshot must never mark
+            # a newly reported native unobserved on this complete-snapshot API.
+            return self._report_native_bindings()
+
+    @staticmethod
+    def _catalog_identity(row):
+        return tuple(row.get(key) for key in (
+            'native_id', 'tag', 'workspace', 'cwd', 'engine', 'profile',
+            'account', 'created_at_ms', 'phase', 'confirmed_exit'))
+
+    def report_native_bindings(self):
+        """Report a complete fresh census without reading transcripts or tokens.
+
+        The server still verifies the catalog before accepting a binding. A
+        separate short lock orders complete reports, independent of sampling.
+        """
+        with self._catalog_report_lock:
+            return self._report_native_bindings()
+
+    def _report_native_bindings(self):
+        started = time.monotonic()
+        raw = self.runner([self.settings.get('aplexer_bin', 'aplexer'), 'list', '--all', '--json'])
+        census_done = time.monotonic()
+        metadata = session_metadata(raw, self.settings, collect_tokens=False)
+        for row in metadata:
+            row.update(self._catalog_enrichment.get(self._catalog_identity(row), {}))
+        metadata_done = time.monotonic()
+        self.request('PUT', '/api/fleet/sessions', {'sessions': metadata})
+        put_done = time.monotonic()
         # Reconcile Fleet-owned starts into exact Hub session bindings after
         # reporting the observed native catalog. Retry is read-before-write.
         try:
@@ -2957,6 +2996,7 @@ class Dispatcher:
             if "404" not in str(exc):
                 raise
             pending = []
+        pending_done = time.monotonic()
         rows = raw if isinstance(raw, list) else raw.get("sessions", [])
         for session in pending:
             if not isinstance(session, dict):
@@ -2971,6 +3011,13 @@ class Dispatcher:
                 # launcher-backend tag before the server seam lands) must not
                 # kill the cycle; the entry stays pending for next cycle.
                 continue
+        print(json.dumps({'event': 'bindings_report_phases', 'sessions': len(metadata),
+                          'pending': len(pending), 'phases_s': {
+                              'census': round(census_done - started, 3),
+                              'metadata': round(metadata_done - census_done, 3),
+                              'sessions_put': round(put_done - metadata_done, 3),
+                              'pending_get': round(pending_done - put_done, 3),
+                              'bindings_post': round(time.monotonic() - pending_done, 3)}}), flush=True)
         return raw
 
     def _cycle_lock_path(self):
