@@ -186,20 +186,54 @@ WantedBy=default.target
 ```
 Run: `systemctl --user daemon-reload`, `systemctl --user enable --now agent-hub-host.service`.
 
-### Windows
-Installed as a Task Scheduler logon task with User-only ACLs (Run only when user is logged on). Actual Windows 47 ACL is PROVISIONAL/unaccepted. Plain actual Windows has NOT been executed.
+### Windows (Tabo session host, ARM64 under x64 emulation)
 
-```cmd
-cd %USERPROFILE%\git\agent-hub
-py -3 -m venv .local\venv
-.local\venv\Scripts\python.exe -m pip install .
-.local\venv\Scripts\hub.exe login https://<hub-domain>
+> Status: Windows host support is source-ported (supervisor/session_host Windows
+> branches, arch detection, needs routing) but has NOT been physically accepted
+> on Tabo yet. The PENDING-HUMAN commands in the Tabo intake report are the
+> acceptance gate; do not claim physical acceptance without their output.
+
+Prerequisites (native ARM64 unless noted): Git for Windows, gh, Node LTS
+(arm64, 22+ for engine provisioning), .NET 10 SDK, PowerShell 7,
+**Python 3.12 x64** (emulated on purpose: aplexer + aplexer-client ship only
+`windows-amd64` v0.1.19; a native ARM64 Python cannot load the `win_amd64`
+wheel), aplexer + `a` `windows-amd64` in
+`%LOCALAPPDATA%\Programs\aplexer`. Clone `agent-hub` to `C:\repos\agent-hub`,
+create an x64 venv, `pip install -e .` (provides `hub.exe` + aplexer-client),
+then `hub login <url> --kind host --name <machine>` (device pairing approved
+by Alexey in `/device`; credential lands in `%APPDATA%\agent-hub\host.json`
+with an owner-only ACL, never printed).
+
+Run the supervisor (not legacy `hub run`) under a Scheduled Task so it
+survives logoff/logon, reboot and sleep/wake. The supervisor starts ONLY its
+own `hub-controller-*` shell session, omits Linux cgroup flags on Windows
+(Job Object containment via `containment_empty`), and restarts it on exit:
+
+```powershell
+# enroll-tabo.ps1 -Phase service does exactly this:
+$TaskName = 'AgentHubSessionHost'
+$runner = "$env:LOCALAPPDATA\agent-hub\run-session-host.ps1"  # wrapper loop, restart 15s
+$psExe = (Get-Command powershell.exe).Source
+$action = New-ScheduledTaskAction -Execute $psExe -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`""
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
+  -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) `
+  -MultipleInstances IgnoreNew -WakeToRun
+$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force
+Start-ScheduledTask -TaskName $TaskName
 ```
 
-Create a Basic Task in Task Scheduler:
-- Trigger: When I log on
-- Action: Start a program
-Resolve your actual user profile path using `echo %USERPROFILE%` (CMD) or `$env:USERPROFILE` (PowerShell). Replace `<USERPROFILE>` below with the absolute result.
-- Program/script: `<USERPROFILE>\git\agent-hub\.local\venv\Scripts\hub.exe`
-- Add arguments: `run`
-- Start in: `<USERPROFILE>\git\agent-hub`
+Wrapper loop (`run-session-host.ps1`): `while ($true)` runs
+`scripts/session-host-supervisor.py --workspace C:\repos\agent-hub --config
+%APPDATA%\agent-hub\subscriptions.json --credential-config
+%APPDATA%\agent-hub\host.json --journal-dir %LOCALAPPDATA%\agent-hub\journal`,
+appending to `%LOCALAPPDATA%\agent-hub\logs\session-host-YYYYMMDD.log`,
+restart 15 s. Interactive (logged-on) principal on purpose: on-device UI
+testing needs the user's desktop. Hosts poll outbound, so no inbound port is
+needed. Logs: `%LOCALAPPDATA%\agent-hub\logs\`. Rollback:
+`Unregister-ScheduledTask AgentHubSessionHost` (revoke the machine in the Hub
+UI, then delete `%APPDATA%\agent-hub\host.json` only after the revoke).
+
+Legacy `hub run` (Basic Task, `hub.exe run`) is superseded for session hosts;
+keep it only for human CLI use.
