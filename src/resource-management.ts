@@ -157,7 +157,7 @@ export class ResourceManagement {
       l.finished_at AS launch_finished,l.model_selection_json,l.workspace AS launch_workspace
       FROM session_control_sessions s LEFT JOIN fleet_launches l ON l.id=s.fleet_launch_id
       ${machine ? 'WHERE s.machine_id=?' : ''} ORDER BY CASE WHEN s.state IN ('stopped','failed','exited','finished','dead','refused','cancelled') THEN 1 ELSE 0 END,s.updated_at DESC`, ...(machine ? [machine] : [])).toArray() as any[];
-    return rows.flatMap(s => {
+    const bound = rows.flatMap(s => {
       const binding = parse(s.binding_json); if (!binding.native_id || !binding.workspace || !binding.tag) return [];
       const req = parse(s.request_json), launch = parse(s.launch_request), model = parse(s.model_selection_json);
       const intakeId=req.intake_task_id || launch.intake_task_id || null;
@@ -180,6 +180,32 @@ export class ResourceManagement {
         last_activity_at:observed?.last_activity_at ?? null, started_at:Number.isFinite(binding.native_created_at_ms) ? new Date(binding.native_created_at_ms).toISOString() : s.launch_created || s.created_at,
         finished_at:s.launch_finished || (TERMINAL.has(s.state) ? s.updated_at : null) }];
     });
+    // Routing can launch through Fleet without a SessionControl intent. Its
+    // host-confirmed native identity still needs resource accounting. These
+    // entries are accounting only: they create no control binding and grant
+    // no new watchdog stop authority, including when an intake is attached.
+    const launches = this.sql.exec(`SELECT * FROM fleet_launches
+      WHERE native_id IS NOT NULL AND native_id<>'' ${machine ? 'AND machine_id=?' : ''}`,
+      ...(machine ? [machine] : [])).toArray() as any[];
+    const shadowIds=new Map(bound.filter(s=>s.observed_shadow).map(s=>[JSON.stringify([s.machine_id,s.native_id]),s.session_id]));
+    const fleetOnly = launches.flatMap(l => {
+      if (!l.machine_id || !l.workspace || !l.engine || !['headless','interactive'].includes(l.mode)) return [];
+      const req=parse(l.request_json), model=parse(l.model_selection_json);
+      const observed:any=this.sql.exec('SELECT tag,last_activity_at,created_at_ms FROM fleet_sessions WHERE machine_id=? AND native_id=?',l.machine_id,l.native_id).toArray()[0];
+      const intakeId=req.intake_task_id || null;
+      const intake:any=intakeId ? this.sql.exec('SELECT data FROM intake_tasks WHERE id=?',intakeId).toArray()[0] : null;
+      return [{session_id:shadowIds.get(JSON.stringify([l.machine_id,l.native_id])) ?? 'fleet:'+l.id,machine_id:l.machine_id,fleet_launch_id:l.id,observed_shadow:false,
+        intake_id:intakeId,native_id:l.native_id,tag:observed?.tag || (l.mode==='headless' ? 'task-hub-' : 'hub-')+l.id,
+        workspace:l.workspace,native_created_at_ms:observed?.created_at_ms ?? null,
+        engine:l.engine,mode:l.mode,model:model.model ?? null,project:parse(intake?.data).project || req.project || l.workspace,
+        tier:req.tier || policy.default_tier,kind:req.task_kind || 'goal',state:l.state,keep:req.keep===true,managed:false,
+        reaped:this.sql.exec('SELECT 1 FROM resource_reaps WHERE machine_id=? AND native_id=? LIMIT 1',l.machine_id,l.native_id).toArray().length>0,
+        last_activity_at:observed?.last_activity_at ?? null,
+        // The request may have queued for hours; it is not a native start time.
+        started_at:Number.isFinite(observed?.created_at_ms) ? new Date(observed.created_at_ms).toISOString() : null,
+        finished_at:l.finished_at || (TERMINAL.has(l.state) ? l.updated_at : null)}];
+    });
+    return [...bound,...fleetOnly];
   }
   private canonicalSessions(machine?: string) {
     const groups=new Map<string,ReturnType<ResourceManagement['boundSessions']>>();
@@ -196,8 +222,9 @@ export class ResourceManagement {
       const {observed_shadow,...session}=canonical;
       const protectedNative=aliases.some(s=>s.keep || (s.mode==='interactive' && !s.observed_shadow));
       return {...session,keep:protectedNative,managed:session.managed && !protectedNative,
-        reaped:aliases.some(s=>s.reaped),aliases:aliases.map(s=>s.session_id)};
-    });
+        reaped:aliases.some(s=>s.reaped),aliases:[...new Set(aliases.flatMap(s=>s.fleet_launch_id ? [s.session_id,'fleet:'+s.fleet_launch_id] : [s.session_id]))]};
+    }).sort((a,b)=>Number(TERMINAL.has(a.state))-Number(TERMINAL.has(b.state))
+      || Date.parse(b.finished_at || b.started_at)-Date.parse(a.finished_at || a.started_at));
   }
   sessions(machine?: string) {
     return this.canonicalSessions(machine).slice(0,1000).map(({aliases,...session})=>session);
@@ -256,11 +283,14 @@ export class ResourceManagement {
       this.sql.exec(`INSERT INTO session_resource_usage VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(session_id) DO UPDATE SET fleet_launch_id=excluded.fleet_launch_id,intake_id=excluded.intake_id,
         project=excluded.project,engine=excluded.engine,model=excluded.model,tier=excluded.tier,kind=excluded.kind,
+        started_at=CASE WHEN session_resource_usage.started_at='' THEN excluded.started_at ELSE session_resource_usage.started_at END,
         finished_at=excluded.finished_at,state=excluded.state,
         peak_rss_mb=excluded.peak_rss_mb,peak_pss_mb=excluded.peak_pss_mb,cpu_seconds=excluded.cpu_seconds,
         runtime_s=excluded.runtime_s,avg_cpu_cores=excluded.avg_cpu_cores,observed_at=excluded.observed_at`,
         ledgerId,machine,session.native_id,session.fleet_launch_id,session.intake_id,session.project,session.engine,session.model,session.tier,session.kind,
-        session.started_at,old?.finished_at ?? session.finished_at,old?.finished_at ? old.state : session.state,max('peak_rss_mb'),max('peak_pss_mb'),cpu,runtime,runtime>0 && cpu!==null ? cpu/runtime : null,sample.observed_at);
+        // Legacy storage requires text; an empty unknown is exposed as null,
+        // never replaced with the time a launch entered the queue.
+        session.started_at ?? '',old?.finished_at ?? session.finished_at,old?.finished_at ? old.state : session.state,max('peak_rss_mb'),max('peak_pss_mb'),cpu,runtime,runtime>0 && cpu!==null ? cpu/runtime : null,sample.observed_at);
     }
     for (const reap of value.reaps) {
       const session=sessions.get(reap.session_id);
@@ -285,7 +315,7 @@ export class ResourceManagement {
   usage(filters: any = {}) {
     const clauses:string[]=[], args:string[]=[];
     for (const k of ['project','engine','kind']) if(filters[k]) { clauses.push(k+'=?');args.push(filters[k]); }
-    return this.sql.exec('SELECT * FROM session_resource_usage'+(clauses.length?' WHERE '+clauses.join(' AND '):'')+' ORDER BY observed_at DESC LIMIT 500',...args).toArray().map((r:any)=>({...r,workspace:this.sql.exec('SELECT workspace FROM session_resource_metadata WHERE session_id=?',r.session_id).toArray()[0]?.workspace ?? null,p95_cpu_cores:this.sql.exec('SELECT p95_cpu_cores FROM session_cpu_usage WHERE session_id=?',r.session_id).toArray()[0]?.p95_cpu_cores ?? null,rss_flagged:r.peak_rss_mb>=this.config().rss_flag_gb*1024,token_join_key:r.machine_id+':'+r.native_id}));
+    return this.sql.exec('SELECT * FROM session_resource_usage'+(clauses.length?' WHERE '+clauses.join(' AND '):'')+' ORDER BY observed_at DESC LIMIT 500',...args).toArray().map((r:any)=>({...r,started_at:r.started_at || null,workspace:this.sql.exec('SELECT workspace FROM session_resource_metadata WHERE session_id=?',r.session_id).toArray()[0]?.workspace ?? null,p95_cpu_cores:this.sql.exec('SELECT p95_cpu_cores FROM session_cpu_usage WHERE session_id=?',r.session_id).toArray()[0]?.p95_cpu_cores ?? null,rss_flagged:r.peak_rss_mb>=this.config().rss_flag_gb*1024,token_join_key:r.machine_id+':'+r.native_id}));
   }
   reaps() { return this.sql.exec('SELECT * FROM resource_reaps ORDER BY at DESC LIMIT 100').toArray(); }
   overview() {

@@ -53,6 +53,15 @@ the running peaks. The row is finalized when the session ends. Rows can be
 joined with `tbm_session_tokens` on its `session_id = machine_id || ":" || native_id` key, so one session gives you its
 tokens, memory and CPU together.
 
+Tasks routed directly through Fleet are included even when no SessionControl
+intent exists. Their accounting ID is `fleet:<actual launch UUID>`; an existing
+imported native ID is retained. A later control binding keeps the same durable
+physical-native ledger row and its accumulated peaks. These accounting entries
+create no control binding or additional watchdog stop authority. Active sessions
+from both sources take priority in the bounded 1,000-entry sampling catalog.
+An unknown native start time stays null until observed; time queued before
+spawn is never counted as process runtime.
+
 ### 3. Placement
 
 Placement is gated on live data, not on a fixed sum of per-session reservations.
