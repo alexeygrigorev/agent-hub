@@ -1270,15 +1270,14 @@ class FleetTests(unittest.TestCase):
                 reconciled = d.reconcile_launches()
                 self.assertEqual(len(reconciled), 1)
                 self.assertEqual(reconciled[0]['id'], offer_id)
-                # AC a19cac9e: no result JSON was written, so the terminal
-                # state is failed-with-partial-work, never exited/done.
-                self.assertEqual(reconciled[0]['state'], 'failed')
+                # The fixture wrote a valid report before exact retirement.
+                self.assertEqual(reconciled[0]['state'], 'exited')
                 self.assertTrue(reconciled[0]['reconciled'])
 
             # Verify terminal result posted to own-host fleet result endpoint
             terminal_post = next(r for r in requests if r[1] == f"/api/fleet/launches/{offer_id}/result" and r[2].get('confirmed_exit'))
-            self.assertEqual(terminal_post[2]['state'], 'failed')
-            self.assertEqual(terminal_post[2]['report_status'], 'failed')
+            self.assertEqual(terminal_post[2]['state'], 'exited')
+            self.assertEqual(terminal_post[2]['report_status'], 'done')
             self.assertEqual(terminal_post[2]['native_id'], native_id)
             self.assertEqual(terminal_post[2]['launcher_task_id'], task_id)
             self.assertTrue(terminal_post[2]['confirmed_exit'])
@@ -1450,14 +1449,13 @@ class FleetTests(unittest.TestCase):
             with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, tombstone, "retired_tombstone_verified")):
                 reconciled = d2.reconcile_launches()
                 self.assertEqual(len(reconciled), 1)
-                # AC a19cac9e: no result JSON was written, so the terminal
-                # state is failed-with-partial-work, never exited/done.
-                self.assertEqual(reconciled[0]['state'], 'failed')
+                # The fixture wrote a valid report before exact retirement.
+                self.assertEqual(reconciled[0]['state'], 'exited')
 
             # Journal on disk updated to settled
             j_data_after = json.loads(j_file.read_text(encoding='utf-8'))
             self.assertTrue(j_data_after['settled'])
-            self.assertEqual(j_data_after['state'], 'failed')
+            self.assertEqual(j_data_after['state'], 'exited')
 
     def test_normal_headless_lost_response_retry_recovers_idempotently(self):
         with tempfile.TemporaryDirectory() as tmp:

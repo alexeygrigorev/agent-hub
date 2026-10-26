@@ -140,6 +140,6 @@ def terminal_evidence(record, tombstone, *, git=subprocess.run):
             result['observed_commits'] = [s for s in proc.stdout.splitlines() if re.fullmatch('[0-9a-f]{40}', s)][:8]
             proc = git(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=cwd, capture_output=True, text=True, timeout=3, check=True)
             result['dirty_paths'] = [sanitize(s, 256) for s in proc.stdout.splitlines()[:16]]
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, ValueError, OverflowError, subprocess.SubprocessError):
             pass
     return result
