@@ -136,6 +136,7 @@ def test_offers_tick_dispatches_concurrently_and_refresh_posts_fresh_heartbeat()
             if path == "/api/host/poll":
                 polls.append(body)
             return {}
+        cfg["dispatch_concurrency"] = 3
         dispatcher = fleet.Dispatcher(cfg, request, _gate_runner, journal_dir=tmp)
         dispatcher._last_hb = {"gate": {"launch_allowed": True, "at": "old"}, "cpu_usage": {"observed_at": "stale"}}
         active, peak, lock = [0], [0], threading.Lock()

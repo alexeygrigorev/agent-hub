@@ -111,10 +111,10 @@ OFFERS_LOCK_NAME = "fleet-offers.lock"
 # plus a slow Hub can exceed that, so the gate is re-run before claiming when
 # the first observation is older than this.
 CLAIM_ADMISSION_REFRESH_S = 15.0
-# Offers are dispatched with bounded concurrency: one dispatch takes 20-40 s
-# (admission, launcher submit/plan, native start), so a serial batch of five
-# left the last offer unclaimed for ~3 min.
-DISPATCH_CONCURRENCY = 3
+# Optional bounded offer concurrency (settings "dispatch_concurrency").
+# Default 1: live RMTHZ test with 3 parallel dispatches made the maintained
+# admission gate refuse concurrent starts (admission_refused), failing offers.
+DISPATCH_CONCURRENCY = 1
 
 
 def _iso_age_s(value):
@@ -2812,7 +2812,11 @@ class Dispatcher:
     def offers_tick(self):
         """Fast offer claiming independent of the slow cycle (4398ce2a)."""
         results = []
-        seen, max_s = self.dispatch_offers(results, concurrency=DISPATCH_CONCURRENCY)
+        try:
+            concurrency = max(1, min(4, int(self.settings.get("dispatch_concurrency", DISPATCH_CONCURRENCY))))
+        except (TypeError, ValueError):
+            concurrency = DISPATCH_CONCURRENCY
+        seen, max_s = self.dispatch_offers(results, concurrency=concurrency)
         return {'offers': seen, 'results': results, 'dispatch_max_s': round(max_s, 3)}
 
     def _once_locked(self, phases, _mark, _skip_telemetry):
