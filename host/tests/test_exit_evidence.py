@@ -11,6 +11,19 @@ OFFER = '11111111-2222-4333-8444-555555555555'
 
 
 class ExitEvidence(unittest.TestCase):
+    def test_malformed_journal_fields_cannot_crash_or_poison_terminal_receipt(self):
+        for malformed in (None, 'legacy', 7, [], {'log_tail': None},
+                          {'log_tail': [], 'engine_outcome': {}, 'exit_code': True, 'exit_signal': 'SIGTERM'},
+                          {'engine_outcome': 'unknown', 'exit_code': 2**60, 'exit_signal': -9}):
+            with self.subTest(saved=malformed):
+                result = terminal_evidence({'exit_evidence': malformed, 'runtime_exit': 'legacy'}, {})
+                self.assertEqual(result['log_tail'], '')
+                self.assertIsNone(result['exit_code'])
+                self.assertIsNone(result['exit_signal'])
+                self.assertIsNone(result['engine_outcome'])
+        result = terminal_evidence({'exit_evidence': {'exit_code': 'bad'}, 'runtime_exit': {'code': 0}}, {})
+        self.assertEqual(result['exit_code'], 0)
+
     def test_engine_exit_zero_without_result_is_failed_with_partial_work(self):
         from agent_hub_host.fleet import Dispatcher
         with tempfile.TemporaryDirectory() as tmp:

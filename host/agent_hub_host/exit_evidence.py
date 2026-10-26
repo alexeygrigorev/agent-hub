@@ -24,6 +24,8 @@ ANSI = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))')
 def sanitize(text, limit=2048):
     # Redact the entire bounded window before truncating; never clip into a
     # credential. Drop control bytes and bare Bearer values as a backstop.
+    if not isinstance(text, str):
+        return ''
     text = ANSI.sub('', text)
     text = re.sub(r'(?i)\bBearer\s+[^\s\"\x27,;]+', 'Bearer [REDACTED]', text)
     text = redact_for_bus(text)
@@ -55,7 +57,8 @@ def snapshot_native(record, row, *, opencode_data=None):
     """Capture before the native catalog retires its history/exit row."""
     if not same_native(record, row) or not UUID.fullmatch(str(record.get('offer_id', ''))):
         return None
-    result = dict(record.get('exit_evidence') or {})
+    saved = record.get('exit_evidence')
+    result = dict(saved) if isinstance(saved, dict) else {}
     info = row.get('exit')
     if isinstance(info, dict):
         for source, target in (('code', 'exit_code'), ('signal', 'exit_signal'), ('exited_at_ms', 'exited_at_ms')):
@@ -107,13 +110,27 @@ def terminal_evidence(record, tombstone, *, git=subprocess.run):
     """Unknown measurements remain null; partial work is observed, not owned."""
     saved = record.get('exit_evidence') or {}
     native_exit = record.get('runtime_exit') or {}
+    # A journal can predate this schema or be malformed. Never let one field
+    # crash reconciliation or create a permanently rejected Fleet receipt.
+    if not isinstance(saved, dict):
+        saved = {}
+    if not isinstance(native_exit, dict):
+        native_exit = {}
+
+    def integer(value, nonnegative=False):
+        return value if (type(value) is int and abs(value) <= 9007199254740991
+                         and (not nonnegative or value >= 0)) else None
+
     end = saved.get('exited_at_ms') or native_exit.get('exited_at_ms') or tombstone.get('finished_at_ms')
     start = record.get('incarnation')
-    result = {'exit_code': saved.get('exit_code', native_exit.get('code')),
-              'exit_signal': saved.get('exit_signal', native_exit.get('signal')),
-              'wall_time_ms': end - start if type(end) is int and type(start) is int and end >= start else None,
+    code = integer(saved.get('exit_code'))
+    signal = integer(saved.get('exit_signal'), True)
+    outcome = saved.get('engine_outcome')
+    result = {'exit_code': code if code is not None else integer(native_exit.get('code')),
+              'exit_signal': signal if signal is not None else integer(native_exit.get('signal'), True),
+              'wall_time_ms': integer(end - start, True) if type(end) is int and type(start) is int else None,
               'log_tail': sanitize(saved.get('log_tail', '')),
-              'engine_outcome': saved.get('engine_outcome'),
+              'engine_outcome': outcome if outcome in ('succeeded', 'failed', 'cancelled') else None,
               'observed_commits': [], 'dirty_paths': []}
     cwd = record.get('target_cwd') or record.get('workspace')
     if isinstance(cwd, str) and Path(cwd).is_absolute() and type(start) is int:
