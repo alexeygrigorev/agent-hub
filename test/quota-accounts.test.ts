@@ -116,6 +116,11 @@ describe('canonical harness/provider/account mapping (codex-orin, go, zai)', () 
       expect(goPools[0]).toMatchObject({ state: 'fresh', source: 'server', remaining_percent: 83 });
       expect(goPools[0].harness).toEqual(['opencode']);
       expect(byAccount['shared-zai'].harness).toEqual(['codex']);
+      // The accounts table reads canonical too: legacy registry labels never
+      // surface in the fleet table.
+      const goStatus = hub.fleetService.accountStatus({ label: 'urgent-muse', provider: 'go', max_concurrency: 1, reserve_percent: 5, enabled: 1 });
+      expect(goStatus.label).toBe('shared-go');
+      expect(goStatus.provider).toBe('go');
       // Legacy provider filter selects both Codex accounts.
       const filtered = store.getFleetView({ host_id: null, provider: 'codex', engine: null, account: null }, now).body as any;
       expect(filtered.pools.every((p: any) => p.provider === 'codex')).toBe(true);
