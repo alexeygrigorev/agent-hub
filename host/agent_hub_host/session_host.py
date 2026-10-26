@@ -425,7 +425,7 @@ def maybe_start_role_consumer_thread(current: Optional[threading.Thread], consum
 
 
 # Must stay below the supervisor kill grace (scripts/session-host-supervisor.py).
-DRAIN_TIMEOUT_S = 45.0
+DRAIN_TIMEOUT_S = 25.0
 
 
 def maintenance_step_once(dispatcher, quota_collector):

@@ -39,7 +39,10 @@ def test_refresh_interval_fits_hub_stale_window_with_margin():
     assert fleet.OFFERS_POLL_S <= 30
     # Claim freshness on the Hub is 30 s; re-admission must trigger well before.
     assert fleet.CLAIM_ADMISSION_REFRESH_S < 30
-    assert session_host.DRAIN_TIMEOUT_S < 55
+    assert session_host.DRAIN_TIMEOUT_S < 30  # aplexer kill grace max 30000 ms
+    sup = (REPO / "scripts" / "session-host-supervisor.py").read_text()
+    grace = int(re.search(r"--grace-ms', '(\d+)'", sup).group(1))
+    assert session_host.DRAIN_TIMEOUT_S * 1000 < grace <= 30000
 
 
 def test_telemetry_tick_posts_fresh_resources_while_slow_cycle_holds_lock():
