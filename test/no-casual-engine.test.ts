@@ -13,6 +13,20 @@ describe('no casual direct engine picker + waiting-idle + headless auto-cleanup'
   });
 
   it('Session control start accepts engine_override_reason and validates length', async () => {
+    // 0. Engine without reason is rejected with 400 engine_reason_required
+    const noReasonRes = await SELF.fetch('https://hub.test/api/sessions', {
+      method: 'POST',
+      headers: { Cookie: cookie, 'x-csrf-token': 'csrf', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        key: 'override-no-reason-1',
+        workspace: 'demo',
+        engine: 'codex',
+      }),
+    });
+    expect(noReasonRes.status).toBe(400);
+    const noReasonData: any = await noReasonRes.json();
+    expect(noReasonData.error).toBe('engine_reason_required');
+
     // 1. Oversized reason is rejected with 400 invalid_session_request
     const badRes = await SELF.fetch('https://hub.test/api/sessions', {
       method: 'POST',

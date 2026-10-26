@@ -1117,6 +1117,12 @@ export class SessionControlService {
       if (input.engine_override_reason !== undefined && (typeof input.engine_override_reason !== 'string' || input.engine_override_reason.length > 500)) {
         return response({ error: 'invalid_session_request', field: 'engine_override_reason', detail: 'invalid_reason' }, 400);
       }
+      // No casual engine picker: an explicit engine is an override and must
+      // carry a non-empty explanation why this specific model/engine is
+      // needed. Default starts omit engine and go through tier/policy.
+      if (input.engine !== undefined && (typeof input.engine_override_reason !== 'string' || !input.engine_override_reason.trim())) {
+        return response({ error: 'engine_reason_required', detail: 'Engine override requires an explanation why this specific model/engine must be chosen (use engine_override_reason). Casual use should prefer auto/policy without engine.' }, 400);
+      }
       if (input.machine !== undefined && !isValidMachineId(input.machine)) return response({ error: 'invalid_session_request', field: 'machine', detail: 'invalid_machine' }, 400);
       if (input.name !== undefined && !nameOk(input.name)) return response({ error: 'invalid_session_request', field: 'name', detail: 'invalid_name' }, 400);
       if (input.cwd !== undefined && !cwdOk(input.cwd)) return response({ error: 'invalid_session_request', field: 'cwd', detail: 'invalid_cwd' }, 400);
