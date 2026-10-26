@@ -18,6 +18,7 @@ MESSAGES = {
     'dispatch_local_command_failed': 'A local dispatch prerequisite command failed before native start.',
     'dispatch_internal_error': 'An unexpected host dispatch error occurred before native start.',
     'dispatch_claim_refused': 'The Hub refused the dispatch claim before native start.',
+    'claim_timeout': 'The launch claim timed out before a confirmed response; the launch is held for an idempotent same-host retry.',
     'model_unsupported': 'The selected model or effort is unsupported by this local route.',
     'admission_unconfigured': 'This local route has no maintained fresh admission adapter.',
     'admission_refused': 'Fresh admission refused this account or could not verify its timestamp and model.',

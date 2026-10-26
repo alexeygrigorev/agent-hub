@@ -147,6 +147,57 @@ def _sanitized_transport_error(exc, limit=160):
     return text[:limit]
 
 
+# Idempotent same-host re-claim after an ambiguous claim timeout (intake
+# 488b860e). The per-attempt key lets a late-landing original claim plus the
+# retry resolve to exactly one server claim; the retry path then starts at
+# most one native process.
+CLAIM_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,128}\Z")
+# Bounded synchronous same-key claim attempts per dispatch: the first attempt
+# may time out client-side while the server already committed the claim.
+CLAIM_ATTEMPTS = 3
+# Opt-in fault flag file (off by default) for tests and the live proof:
+# <journal_dir>/fleet-fault-preclaim.json, e.g.
+# {"mode": "timeout_once", "workspaces": ["/abs/scratch/workspace"]}.
+# A matching dispatch sends the claim, discards the response and raises
+# TimeoutError once per offer, reproducing the production ambiguity (client
+# timeout, unknown server outcome) so the same-key retry must resolve it.
+PRECLAIM_FAULT_FILE = "fleet-fault-preclaim.json"
+
+
+class ClaimTimeoutError(TimeoutError):
+    """A launch claim POST timed out with an unknown server outcome.
+
+    Never a refusal: the launch must be held for an idempotent same-host
+    retry, never rejected. Carries the per-attempt claim_key so the retry
+    replays the same claim instead of opening a second one.
+    """
+
+    def __init__(self, message, *, claim_key=None):
+        super().__init__(message)
+        self.claim_key = claim_key
+
+
+def _is_ambiguous_claim_error(exc):
+    """True for transport errors where a same-key claim retry is safe.
+
+    Timeouts, resets and refused connections from the claim POST all share
+    one property: no native effect could have started yet (native start runs
+    strictly after a confirmed claim in the same dispatch call). A retry with
+    the SAME per-attempt key is therefore always safe: it replays a
+    late-landing claim or opens a fresh one, never a second one. Definitive
+    Hub answers (ValueError from the Hub client, including 409
+    already_claimed) are never ambiguous.
+    """
+    import http.client
+    import urllib.error
+    if isinstance(exc, urllib.error.HTTPError):
+        # A definitive Hub answer (bus converts these to ValueError; this
+        # branch only covers injectable request doubles).
+        return False
+    return isinstance(exc, (OSError, http.client.HTTPException,
+                            urllib.error.URLError))
+
+
 def absolute_workspace_ok(value):
     """Bounded canonical absolute POSIX or Windows workspace identifier.
 
@@ -869,6 +920,9 @@ class Dispatcher:
         self._imported_sessions_cursor: Optional[str] = None
         self._active_launches: dict[str, dict[str, Any]] = {}
         self._role_jobs_cache: Optional[tuple] = None
+        # Intake 488b860e: offers already faulted once this process (fault flag
+        # is once-per-offer; the synchronous same-key retry must run clean).
+        self._preclaim_fault_fired: set = set()
         # Per-phase durations of the most recent once() cycle (intake
         # eff9a5ce AC1). Published as a fleet_cycle_phases stdout event.
         self.last_cycle_phases: dict[str, float] = {}
@@ -1964,6 +2018,105 @@ class Dispatcher:
             raise ValueError("Fresh admission timestamp required") from None
         return at
 
+    def _pending_claim_key(self, offer_id):
+        """Reuse the unsettled attempt key for the same offer, if any.
+
+        Intake 488b860e: the idempotency key spans a host attempt, which may
+        outlive one dispatch cycle (timeout -> held -> re-offered). A stored
+        claim_pending key lets the next cycle replay the same claim instead
+        of opening a second one. Anything unexpected means a fresh key.
+        """
+        try:
+            if not self.journal_dir:
+                return None
+            if not isinstance(offer_id, str) or not LABEL.fullmatch(offer_id):
+                return None
+            from . import private_fs
+            raw = private_fs.read_bytes(
+                str(Path(self.journal_dir) / "fleet-launches" / f"{offer_id}.json"),
+                65536)
+            record = json.loads(raw.decode("utf-8"))
+            if not isinstance(record, dict) or record.get("state") != "claim_pending":
+                return None
+            if record.get("settled") is True:
+                return None
+            key = record.get("claim_key")
+            if isinstance(key, str) and CLAIM_KEY_RE.fullmatch(key):
+                return key
+            return None
+        except Exception:
+            return None
+
+    def _preclaim_fault_armed(self, workspace):
+        """Whether the opt-in pre-claim fault flag targets this workspace.
+
+        Off by default (no flag file, invalid file, or non-matching scope all
+        mean no fault). Never raises; never logs workspace contents.
+        """
+        try:
+            if not self.journal_dir:
+                return False
+            from . import private_fs
+            # Operator affordance, not a secret (mode plus already-advertised
+            # workspace paths): refuse nothing on file mode, fail closed on
+            # content instead.
+            raw = private_fs.read_bytes(
+                str(Path(self.journal_dir) / PRECLAIM_FAULT_FILE), 4096,
+                private=False)
+            spec = json.loads(raw.decode("utf-8"))
+            if not isinstance(spec, dict) or spec.get("mode") != "timeout_once":
+                return False
+            scopes = spec.get("workspaces")
+            if not isinstance(scopes, list) or not scopes:
+                return False
+            try:
+                current = str(workspace)
+            except Exception:
+                return False
+            return any(isinstance(entry, str) and entry and entry == current
+                       for entry in scopes)
+        except Exception:
+            return False
+
+    def _claim_launch(self, claim_path, payload, offer_id, workspace):
+        """Claim with bounded same-key retries on ambiguous transport errors.
+
+        Intake 488b860e: a timeout (or reset/refused connection) on the claim
+        POST leaves the server outcome unknown (the claim may have landed
+        late). Retrying with the SAME per-attempt key replays that claim
+        instead of double-claiming; a different key (sibling loop) still
+        conflicts. When every attempt fails ambiguously, raise
+        ClaimTimeoutError so the launch is held for retry, never rejected
+        as dispatch_local_command_failed.
+        """
+        key = payload.get("claim_key")
+        if not isinstance(key, str) or not CLAIM_KEY_RE.fullmatch(key):
+            raise ValueError("claim payload requires a per-attempt claim_key")
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                if (offer_id not in self._preclaim_fault_fired
+                        and self._preclaim_fault_armed(workspace)):
+                    self._preclaim_fault_fired.add(offer_id)
+                    try:
+                        self.request("POST", claim_path, payload)
+                    except Exception:
+                        raise
+                    raise TimeoutError(
+                        "preclaim fault (intake 488b860e): simulated claim "
+                        "timeout after the request was sent")
+                return self.request("POST", claim_path, payload)
+            except Exception as exc:
+                if _is_ambiguous_claim_error(exc) and attempts < CLAIM_ATTEMPTS:
+                    continue
+                if _is_ambiguous_claim_error(exc):
+                    raise ClaimTimeoutError(
+                        "launch claim timed out before a confirmed response; "
+                        "held for an idempotent same-host retry",
+                        claim_key=key) from exc
+                raise
+
     def dispatch(self, offer):
         if offer.get('with_goal') and offer.get('mode') != 'interactive':
             raise ValueError('Goal work is interactive only')
@@ -2195,7 +2348,11 @@ class Dispatcher:
             # Intake 4398ce2a: launcher submit/plan (and a slow Hub) can push
             # the first observation past the Hub's 30 s claim freshness.
             at = self._dispatch_admission(sub, admission_payload, selection, offer)
-        self.request("POST", path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": offer.get("account") or sub["account_label"], **({"model": selection["model"]} if selection else {})})
+        # Intake 488b860e: the key spans this host attempt (reused across
+        # cycles while the claim stays unconfirmed). A timeout retries with
+        # the same key, so a late-landing claim replays instead of doubling.
+        claim_key = self._pending_claim_key(offer_id) or uuid.uuid4().hex
+        self._claim_launch(path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": offer.get("account") or sub["account_label"], "claim_key": claim_key, **({"model": selection["model"]} if selection else {})}, offer_id, workspace)
         from .launch_diagnostics import capture_log_offsets
         log_offsets = capture_log_offsets(sub.get("launcher_provider"))
         launched_at_ts = time.time()
@@ -2660,6 +2817,25 @@ class Dispatcher:
                     results.append({'id': offer.get('id'), 'state': 'binding_pending',
                                     'error': type(exc).__name__[:64]})
         except Exception as exc:
+            if isinstance(exc, ClaimTimeoutError):
+                # Intake 488b860e: a timeout before/at claim is never proof of
+                # anything, so it is never a refusal. A late-landing claim may
+                # already own the launch server-side; rejecting could fail a
+                # live launch, and a 409 here would be meaningless. Hold with
+                # the attempt key persisted so the same-host retry replays the
+                # same claim instead of opening a second one.
+                from .dispatch_diagnostics import MESSAGES as _DISPATCH_MESSAGES
+                diagnostic = {'reason': 'claim_timeout',
+                              'message': _DISPATCH_MESSAGES['claim_timeout'],
+                              'stage': 'dispatch_route', 'error_type': 'TimeoutError'}
+                record = {'offer_id': offer.get('id'), 'state': 'claim_pending',
+                          'reason': 'claim_timeout', 'diagnostic': diagnostic,
+                          'settled': False, 'claim_key': exc.claim_key}
+                self._persist_launch_record(record)
+                results.append({'id': offer.get('id'), 'state': 'held',
+                                'reason': 'claim_timeout', 'stage': 'dispatch_route',
+                                'error': 'TimeoutError', 'diagnostic': diagnostic})
+                return
             if 'already_claimed' in str(exc):
                 # Lost a claim race to the sibling loop (timer vs
                 # session-host, intake eff9a5ce AC2) or another host. The

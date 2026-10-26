@@ -37,6 +37,10 @@ CREATE INDEX IF NOT EXISTS idx_placement_rejections_recent ON placement_rejectio
 `;
 type Auth = { caller?: AdmissionCaller; scopes?: string[]; error?: Response };
 const LABEL = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+// Idempotency key for same-host claim retries (intake 488b860e): per launch
+// plus host attempt, so a late-landing original claim plus a retry replays
+// instead of double-claiming. UUID hex from the host fits with headroom.
+const CLAIM_KEY = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 // Wire-compatible provider/service namespace: `codex-orin` is accepted as a
 // quota route key and subscription service for hosts that have not updated
 // yet, but it canonicalizes to provider `codex` (the second Codex account)
@@ -363,7 +367,7 @@ export class FleetService {
     this.admission.init();
     for (const stmt of FLEET_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
     const launchColumns = this.sql.exec('PRAGMA table_info(fleet_launches)').toArray().map((c: any) => c.name);
-    for (const name of ['verification_status', 'exit_reason', 'finished_at', 'launch_error_json', 'model_selection_json', 'retried_launch_id']) {
+    for (const name of ['verification_status', 'exit_reason', 'finished_at', 'launch_error_json', 'model_selection_json', 'retried_launch_id', 'claim_key']) {
       if (!launchColumns.includes(name)) this.sql.exec(`ALTER TABLE fleet_launches ADD COLUMN ${name} TEXT`);
     }
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_offered ON fleet_launches(id) WHERE state = 'offered'");
@@ -1089,7 +1093,7 @@ export class FleetService {
         placement: this.placementOverview(),
         subscriptions: this.sql.exec('SELECT * FROM fleet_subscriptions ORDER BY machine_id, service, account').toArray().map((s: any) => ({ machine_id: s.machine_id, account: canonicalAccountLabel(s.account), service: canonicalQuotaProvider(s.service), plan: s.plan, observed_at: s.observed_at, stale: !fresh(s.observed_at, this.now(), 1200000), quota: parsed(s.quota_json),
           harness: [...(routeHarness.get(String(s.machine_id) + ' ' + String(s.account)) ?? [])].sort() })),
-        launches: this.sql.exec('SELECT * FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => { const { request_json, request_key, prompt, model_selection_json, ...view } = row; const selection = parsed(model_selection_json); return { ...view, rejected: row.state === 'queued' ? this.memoryRejections(row.id) : [], model_id: selection?.id ?? null, model: selection?.model ?? null, hub_session_id: controlIds.get(row.id) ?? null, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; }) });
+        launches: this.sql.exec('SELECT * FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => { const { request_json, request_key, claim_key, prompt, model_selection_json, ...view } = row; const selection = parsed(model_selection_json); return { ...view, rejected: row.state === 'queued' ? this.memoryRejections(row.id) : [], model_id: selection?.id ?? null, model: selection?.model ?? null, hub_session_id: controlIds.get(row.id) ?? null, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; }) });
     }
     if (path === '/api/fleet/claim-policy' && request.method === 'GET') {
       if (!admin) return response({ error: 'forbidden' }, 403);
@@ -1477,14 +1481,26 @@ export class FleetService {
           return response({ id: row.id, state: 'failed', reason: data.reason, diagnostic });
         }
         if (match[2] === 'claim') {
-          if (row.state !== 'offered') return response({ error: 'already_claimed' }, 409);
+          // Intake 488b860e: a timeout before/at claim leaves the outcome
+          // unknown. The host retries with the SAME per-attempt claim_key; a
+          // stored key match on a still-effect-free starting launch replays
+          // the claim instead of double-claiming. A different key (sibling
+          // loop or another attempt) stays a 409 conflict.
+          const claimKey = (data as any)?.claim_key;
+          if (claimKey !== undefined && (typeof claimKey !== 'string' || !CLAIM_KEY.test(claimKey))) return response({ error: 'invalid_claim' }, 400);
+          if (row.state !== 'offered') {
+            if (typeof claimKey === 'string' && (row as any).claim_key === claimKey && row.state === 'starting' && !row.native_id && !row.launcher_task_id) {
+              return response({ ...row, state: 'starting', replay: true });
+            }
+            return response({ error: 'already_claimed' }, 409);
+          }
           const cpu=this.resources.cpuHeadroom(row.machine_id,parsed(row.request_json),row.id);
           if(!cpu.admitted) return response({error:cpu.reason,cpu},409);
           // Pre-hold offers on a now-disabled engine are held, never launched.
           if (disabledEngines().has(row.engine)) return response({ error: 'provider_disabled' }, 409);
           const held = this.admission.retireInvalidOffer(row);
           if (held) return response({ error: held }, ['claim_inactive', 'claim_conflict', 'claim_authority_changed'].includes(held) ? 409 : 403);
-          if (!object(data, ['gate_allowed', 'observed_at', 'account', 'profile_supported', 'model']) || data.gate_allowed !== true || data.profile_supported !== true || data.account !== row.account || !fresh(data.observed_at, this.now(), 30000)) return response({ error: 'fresh_admission_required' }, 409);
+          if (!object(data, ['gate_allowed', 'observed_at', 'account', 'profile_supported', 'model', 'claim_key']) || data.gate_allowed !== true || data.profile_supported !== true || data.account !== row.account || !fresh(data.observed_at, this.now(), 30000)) return response({ error: 'fresh_admission_required' }, 409);
           const selectedModel = parsed(row.model_selection_json)?.model;
           if (typeof selectedModel !== 'string' || data.model !== selectedModel) return response({ error: 'model_unsupported', detail: 'Host must confirm the resolved model before native launch' }, 409);
           const account: any = this.sql.exec('SELECT * FROM fleet_accounts WHERE label = ?', row.account).toArray()[0];
@@ -1499,9 +1515,9 @@ export class FleetService {
           const current: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id = ?', row.id).one();
           const finalHold = current.state === 'offered' ? this.admission.retireInvalidOffer(current) : current.exit_reason || 'already_claimed';
           if (finalHold) return response({ error: finalHold }, ['claim_inactive', 'claim_conflict', 'claim_authority_changed', 'already_claimed'].includes(finalHold) ? 409 : 403);
-          this.sql.exec("UPDATE fleet_launches SET state = 'starting', updated_at = ? WHERE id = ? AND state = 'offered'", new Date(this.now()).toISOString(), row.id);
+          this.sql.exec("UPDATE fleet_launches SET state = 'starting', claim_key = COALESCE(?, claim_key), updated_at = ? WHERE id = ? AND state = 'offered'", typeof claimKey === 'string' ? claimKey : null, new Date(this.now()).toISOString(), row.id);
           this.sql.exec('INSERT INTO resource_ramps VALUES(?,?) ON CONFLICT(launch_id) DO UPDATE SET started_at=excluded.started_at', row.id, new Date(this.now()).toISOString());
-          return response({ ...row, state: 'starting' });
+          return response({ ...row, state: 'starting', ...(typeof claimKey === 'string' ? { claim_key: claimKey } : {}) });
         }
         // Replay an identical committed normal-headless terminal receipt without effects.
         if (row.mode === 'headless' && ['exited', 'failed'].includes(row.state) &&
