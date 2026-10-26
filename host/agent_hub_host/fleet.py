@@ -1636,6 +1636,25 @@ class Dispatcher:
             payload = {"goal": goal, "owner": "hub-fleet", "cwd": str(target_cwd), "timeout": 1800,
                        "model_requirements": {"providers": [sub["launcher_provider"]], "models": [sub["launcher_model"]]},
                        "profile": "model-task"}
+            # Resource-management placement hints from the Hub offer (server
+            # policy, never fabricated locally): per-offer memory estimate
+            # plus the durable resource-management config snapshot.
+            try:
+                estimate = offer.get("memory_estimate_mb")
+                if isinstance(estimate, bool):
+                    pass
+                elif isinstance(estimate, (int, float)) and estimate > 0 and estimate < 1_000_000:
+                    payload["memory_estimate_mb"] = estimate
+                policy = offer.get("resource_management")
+                if isinstance(policy, dict) and policy:
+                    bounded = {k: policy[k] for k in (
+                        "memory_floor_mb", "ramp_reserve_default_mb", "estimate_percentile",
+                        "estimate_multiplier", "ramp_seconds", "cpu_load_factor",
+                        "watchdog_interval_s", "idle_minutes", "rss_flag_gb") if k in policy}
+                    if bounded:
+                        payload["resource_management"] = bounded
+            except Exception:
+                pass
             if profile is not None:
                 payload["account_label"] = sub["account_label"]
                 payload["account_profile"] = profile
@@ -2087,6 +2106,21 @@ class Dispatcher:
         legacy_settled = settle_retired_legacy(self.settings.get('launcher', {}))
         reconciled = self.reconcile_launches()
         imported_reconciled = self.reconcile_imported_sessions()
+        # Resource management (intake 4fcd3139): per-session exact sampler +
+        # safe watchdog. Best-effort only with durable local state in the
+        # journal dir; never fails the poll cycle and installs no scheduler.
+        # Skipped without a journal dir: peaks/reap journals require durable
+        # state, and existing callers without one keep their exact call shape.
+        if self.journal_dir:
+            try:
+                from . import resource_management as _rm
+                _ = _rm.run_watchdog_cycle(
+                    self.request,
+                    journal_dir=self.journal_dir,
+                    aplexer_bin=self.settings.get("aplexer_bin", "aplexer"),
+                )
+            except Exception:
+                pass
         # Quota monitoring does not prove launch capability. Group by engine:
         # a monitor-only account must not disable another runnable account on
         # the same engine. Never fabricate an admission adapter or bypass it.

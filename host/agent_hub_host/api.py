@@ -251,6 +251,7 @@ def get_heartbeat_payload(clock=None, running_jobs=None) -> dict:
         jobs_list = []
 
     mem_avail_mb = 0
+    mem_total_mb = None
     if platform.system() == "Windows":
         import ctypes
         class MEMORYSTATUSEX(ctypes.Structure):
@@ -259,17 +260,26 @@ def get_heartbeat_payload(clock=None, running_jobs=None) -> dict:
         stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
         if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
             mem_avail_mb = stat.ullAvailPhys // (1024 * 1024)
+            try:
+                mem_total_mb = stat.ullTotalPhys // (1024 * 1024)
+            except Exception:
+                mem_total_mb = None
     else:
         try:
             with open("/proc/meminfo") as f:
                 for line in f:
                     if line.startswith("MemAvailable:"):
                         mem_avail_mb = int(line.split()[1]) // 1024
-                        break
+                    elif line.startswith("MemTotal:"):
+                        try:
+                            mem_total_mb = int(line.split()[1]) // 1024
+                        except (ValueError, IndexError):
+                            pass
         except Exception:
             pass
-            
-    return {
+        if not isinstance(mem_total_mb, int) or mem_total_mb <= 0:
+            mem_total_mb = None
+    payload: dict = {
         "type": "heartbeat",
         "mem_avail_mb": mem_avail_mb,
         "disk_free_gb": shutil.disk_usage("/").free // (1024**3),
@@ -278,6 +288,9 @@ def get_heartbeat_payload(clock=None, running_jobs=None) -> dict:
         "running_jobs": jobs_list,
         "sessions_summary": {}
     }
+    if isinstance(mem_total_mb, int):
+        payload["mem_total_mb"] = mem_total_mb
+    return payload
 
 def ws_handshake(host: str, port: int, path: str, token: str, is_secure: bool, rng: RNG):
     # Validate hostname / token header injection

@@ -360,6 +360,8 @@ def main():
     quota_cmd.add_commands(sub)
     from . import metrics as metrics_cmd
     metrics_cmd.add_commands(sub)
+    from . import resources as resources_cmd
+    resources_cmd.add_commands(sub)
     from . import provisioning
     provisioning.add_commands(sub)
     add_bridge_resume_command(sub)
@@ -712,6 +714,17 @@ def main():
             raise
         except Exception:
             print('Metrics operation failed; check authentication and report files. Retry post with the same key and payload after uncertain results.', file=sys.stderr)
+            sys.exit(1)
+    elif args.cmd == "resources":
+        from . import resources as resources_mod
+        try:
+            data = resources_mod.execute(args)
+            if getattr(args, "json", False):
+                print(json.dumps(data, indent=2, sort_keys=True))
+            else:
+                print(resources_mod.render_text(data, getattr(args, "view", None)))
+        except Exception:
+            print('Hub resources operation failed; check authentication, filters and resource grants.', file=sys.stderr)
             sys.exit(1)
     elif args.cmd == "bridge":
         cmd_bridge(args)
