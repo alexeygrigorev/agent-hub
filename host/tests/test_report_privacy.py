@@ -108,3 +108,18 @@ class ReportPrivacy(unittest.TestCase):
             evidence=terminal_evidence(record,tombstone,state_dir=str(root/'state'))
             self.assertIn('Latest safe output',evidence['log_tail'])
             self.assertNotIn('secret fragment',evidence['log_tail'])
+
+
+    def test_routed_terminal_exit_includes_evidence_on_assigned_job_result(self):
+        import test_tbm_routed_results as routed
+        case=routed.RoutedResultsTests();case.setUp()
+        try:
+            case.d._active_launches[OFFER]['exit_evidence']=dict(exit_code=0,log_tail='Routed audit complete')
+            results,_=case.reconcile()
+            self.assertEqual(results[0]['state'],'done')
+            payload=case.request.call_args.args[2]
+            self.assertEqual(payload['runtime']['exit_code'],0)
+            self.assertEqual(payload['runtime']['log_tail'],'Routed audit complete')
+            self.assertTrue(payload['confirmed_exit'])
+        finally:
+            case.doCleanups()

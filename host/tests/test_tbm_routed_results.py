@@ -82,6 +82,8 @@ class RoutedResultsTests(unittest.TestCase):
         self.assertEqual(result, [{'id': OFFER, 'state': 'done', 'reconciled': True}])
         method, path, payload = self.request.call_args.args
         self.assertEqual((method, path), ('POST', '/api/fleet/tasks/' + JOB + '/result'))
+        self.assertEqual(payload.pop('runtime'), {'exit_code': None, 'exit_signal': None, 'wall_time_ms': None,
+            'log_tail': '', 'engine_outcome': None, 'observed_commits': [], 'dirty_paths': [], 'outcome': 'reported'})
         self.assertEqual(payload, {'status': 'done', 'report': 'Verified real reset invariant.',
                                   'confirmed_exit': True,
                                   'artifacts': [{'name': 'evidence-1', 'text': 'Useful evidence\nActual functions and tests.'}]})

@@ -1623,6 +1623,7 @@ class Dispatcher:
             if record.get('routing_task_id'):
                 job_id = record['routing_task_id']
                 payload = bound_finish_fields(self._routed_finish_report(record, fleet_state))
+                payload['runtime'] = evidence
                 try:
                     try:
                         acknowledgement = self.request('POST', f'/api/fleet/tasks/{job_id}/result', payload)
@@ -2798,6 +2799,7 @@ class Dispatcher:
             from .exit_evidence import bound_finish_fields
             report = bound_finish_fields(report)
             report['confirmed_exit'] = True
+            report['runtime'] = result['runtime']
             self.request('POST', '/api/fleet/tasks/' + offer['task_id'] + '/result', report)
             if report['status'] in {'done', 'failed'}:
                 self._maybe_cleanup_worktree(workspace, native_id)

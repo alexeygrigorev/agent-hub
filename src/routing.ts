@@ -1,3 +1,4 @@
+import { sanitizeExitEvidence, redactExitText } from './exit-evidence';
 /** Durable client task queue layered over the existing quota-aware fleet launcher. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { modelCandidates, taskTier, policy } from './model-routing';
@@ -63,7 +64,7 @@ export class RoutingService {
     const admissionHold = launch ? (!['exited', 'failed'].includes(launch.state) ? this.fleet.admission.heldReason(launch) : null) :
       row.state === 'queued' ? this.fleet.admission.heldReason({ request_json: row.request_json, workspace: input.workspace }) : null;
     return { id: row.id, status, queue_reason: status === 'queued' && !row.launch_id && !admissionHold ? 'No fresh eligible capability/model route with quota and capacity.' : null, needs: input.needs, task_count: input.tasks.length, machine: launch?.machine_id ?? null,
-      runner: launch?.engine ?? null, tier: input.tier, access, admission_hold: admissionHold, selection: row.selection_json ? JSON.parse(row.selection_json) : null, launch_id: row.launch_id, report: redact(row.report), artifacts: [...JSON.parse(row.artifacts_json), ...this.sql.exec('SELECT name, media_type FROM routing_artifacts WHERE job_id = ?', row.id).toArray()], created_at: row.created_at, updated_at: row.updated_at };
+      runner: launch?.engine ?? null, tier: input.tier, access, admission_hold: admissionHold, selection: row.selection_json ? JSON.parse(row.selection_json) : null, launch_id: row.launch_id, runtime: launch?.runtime_json ? JSON.parse(launch.runtime_json) : null, report: redact(row.report), artifacts: [...JSON.parse(row.artifacts_json), ...this.sql.exec('SELECT name, media_type FROM routing_artifacts WHERE job_id = ?', row.id).toArray()], created_at: row.created_at, updated_at: row.updated_at };
   }
   /** Idempotent fleet requests preserve reservations even if the reply/link write is interrupted. */
   async dispatch(jobId?: string) {
@@ -275,8 +276,10 @@ export class RoutingService {
       if (!match[2] && request.method === 'GET') return reply(this.view(row));
       if (match[2] && request.method === 'POST') {
         if (!host || launch?.machine_id !== caller.machineId) return reply({ error: 'forbidden' }, 403);
-        const data = await jsonBody(request);
-        if (!obj(data, ['status', 'report', 'artifacts', 'confirmed_exit']) || !['running', 'waiting-on-human', 'stuck', 'done', 'failed'].includes(data.status) || typeof data.report !== 'string' || data.report.length > 16000 || !Array.isArray(data.artifacts) || data.artifacts.length > 8 || data.artifacts.some((a: any) => !obj(a, ['name', 'text']) || !label(a.name) || typeof a.text !== 'string' || a.text.length > 4000)) return reply({ error: 'invalid_result' }, 400);
+        const data = await jsonBody(request, 131072);
+        if (!obj(data, ['status', 'report', 'artifacts', 'confirmed_exit', 'runtime']) || !['running', 'waiting-on-human', 'stuck', 'done', 'failed'].includes(data.status) || typeof data.report !== 'string' || data.report.length > 16000 || !Array.isArray(data.artifacts) || data.artifacts.length > 8 || data.artifacts.some((a: any) => !obj(a, ['name', 'text']) || !label(a.name) || typeof a.text !== 'string' || a.text.length > 4000)) return reply({ error: 'invalid_result' }, 400);
+        const runtime = data.runtime === undefined ? null : sanitizeExitEvidence(data.runtime);
+        if (data.runtime !== undefined && (!runtime || data.confirmed_exit !== true)) return reply({ error: 'invalid_exit_evidence' }, 400);
         return this.transaction(() => {
           // Re-read after body I/O: another report may have completed while this request waited.
           const current: any = this.sql.exec('SELECT * FROM routing_jobs WHERE id = ?', row.id).one();
@@ -306,7 +309,8 @@ export class RoutingService {
               }, this.now());
             } catch {}
           }
-          this.sql.exec('UPDATE routing_jobs SET state = ?, report = ?, artifacts_json = ?, updated_at = ? WHERE id = ?', data.status, redact(data.report), JSON.stringify(data.artifacts.map((a: any) => ({ name: redact(a.name), text: redact(a.text) }))), this.at(), row.id);
+          if (runtime) this.sql.exec('UPDATE fleet_launches SET runtime_json = ? WHERE id = ?', JSON.stringify(runtime), execution.id);
+          this.sql.exec('UPDATE routing_jobs SET state = ?, report = ?, artifacts_json = ?, updated_at = ? WHERE id = ?', data.status, redactExitText(data.report), JSON.stringify(data.artifacts.map((a: any) => ({ name: redactExitText(a.name), text: redactExitText(a.text) }))), this.at(), row.id);
           return reply(this.view(this.sql.exec('SELECT * FROM routing_jobs WHERE id = ?', row.id).one()));
         });
       }
