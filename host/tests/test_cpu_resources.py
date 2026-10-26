@@ -3,13 +3,22 @@ from agent_hub_host.cpu_resources import cpu_delta, update_cpu_distribution, rea
 
 
 class CpuResourcesTests(unittest.TestCase):
+    def test_cross_repository_wire_fixture(self):
+        import json
+        from pathlib import Path
+        from agent_hub_host.cpu_resources import sanitize_cpu_admission
+        fixture = json.loads((Path(__file__).resolve().parents[2] / "test/fixtures/cpu-admission-v2.json").read_text())
+        self.assertEqual(sanitize_cpu_admission(fixture["cpu"]), fixture["cpu"])
+
     def test_proc_stat_guest_fields_and_heartbeat_shape(self):
         import tempfile
         from pathlib import Path
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "pressure").mkdir()
-            (root / "pressure/cpu").write_text("some avg10=12.34 avg60=10 total=100\n")
+            (root / "pressure/cpu").write_text("some avg10=12.34 avg60=10 total=100\nfull avg10=0.5 total=10\n")
+            (root / "pressure/memory").write_text("full avg10=0.2 total=2\n")
+            (root / "vmstat").write_text("oom_kill 10\n")
             (root / "stat").write_text("cpu 10 0 0 10 80 0 0 0 900 0\ncpu0 1\ncpu1 1\n")
             self.assertEqual(read_cpu_stat(directory)["ticks"], [10, 0, 0, 10, 80, 0, 0, 0])
             def next_stat(_):
@@ -19,8 +28,12 @@ class CpuResourcesTests(unittest.TestCase):
             self.assertEqual(result["busy_percent"], 10)
             self.assertAlmostEqual(result["busy_cores"], .2)
             self.assertEqual(result["psi_avg10"], 12.34)
+            self.assertEqual(result["psi_full_avg10"], .5)
+            self.assertEqual(result["memory_psi_full_avg10"], .2)
             self.assertEqual(result["observed_at"], "1970-01-01T00:16:40Z")
-            self.assertIsNone(sample_cpu_usage(directory, sleep=lambda _: None))
+            unavailable = sample_cpu_usage(directory, sleep=lambda _: None)
+            self.assertIsNone(unavailable["busy_cores"])
+            self.assertEqual(unavailable["psi_full_avg10"], .5)
 
     def test_peak_journal_and_final_report_keep_lifetime_p95(self):
         from agent_hub_host.resource_management import update_peaks, _sample_row
@@ -40,6 +53,21 @@ class CpuResourcesTests(unittest.TestCase):
             self.assertEqual(diagnostic("RuntimeError: " + reason)["reason"], reason)
             self.assertEqual(classify(ValueError(reason))["reason"], reason)
         self.assertEqual(diagnostic("cpu_headroom: arbitrary private output")["reason"], "launcher_command_failed")
+
+    def test_structured_refusal_numbers_are_bounded_and_private_text_is_rejected(self):
+        import json
+        from agent_hub_host.launch_diagnostics import diagnostic
+        from agent_hub_host.cpu_resources import sanitize_cpu_admission
+        valid = {"expected_cpu_cores": 2, "current_cpu_cores": 12, "ramping_cpu_cores": 1,
+                 "limit_cpu_cores": 12, "target_utilization": 1, "psi_full_avg10": 6}
+        raw = "RuntimeError: cpu_pressure\nCPU_ADMISSION_JSON " + json.dumps(valid)
+        self.assertEqual(diagnostic(raw)["cpu"], valid)
+        for invalid in [{**valid, "secret": "private"}, {**valid, "current_cpu_cores": float('nan')},
+                        {**valid, "psi_full_avg10": 101}, {**valid, "target_utilization": 0},
+                        {**valid, "oom_kills_delta": True}, {**valid, "observed_at": "2026-10-26T00:00:00"}]:
+            self.assertIsNone(sanitize_cpu_admission(invalid))
+            self.assertNotIn("cpu", diagnostic("RuntimeError: cpu_pressure\nCPU_ADMISSION_JSON " + json.dumps(invalid)))
+        self.assertNotIn("cpu", diagnostic("cpu_pressure\nCPU_ADMISSION_JSON {broken"))
 
     def test_iowait_and_guest_not_counted_as_extra_busy(self):
         before = {"cores": 12, "ticks": [0] * 8}

@@ -11,6 +11,32 @@ def _number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
 
 
+def sanitize_cpu_admission(value):
+    """Fixed numeric refusal DTO. Arbitrary output never crosses this boundary."""
+    required = {"expected_cpu_cores", "ramping_cpu_cores", "limit_cpu_cores", "target_utilization"}
+    optional = {"current_cpu_cores", "psi_avg10", "psi_full_avg10", "memory_psi_full_avg10", "oom_kills_delta", "observed_at"}
+    if not isinstance(value, dict) or not required.issubset(value) or set(value) - required - optional:
+        return None
+    for key, number in value.items():
+        if key == "observed_at":
+            if number is not None:
+                try:
+                    parsed = datetime.fromisoformat(number.replace("Z", "+00:00"))
+                    if len(number) > 64 or parsed.tzinfo is None:
+                        return None
+                except (ValueError, AttributeError, TypeError):
+                    return None
+        elif number is None and key in optional:
+            continue
+        elif not _number(number) or number > (100 if "psi" in key else 1 if key == "target_utilization" else 1e9):
+            return None
+        elif key == "target_utilization" and number < .1:
+            return None
+        elif key == "oom_kills_delta" and not isinstance(number, int):
+            return None
+    return dict(value)
+
+
 def read_cpu_stat(proc_root="/proc"):
     """Exclude idle and iowait; guest counters are already included in user/nice."""
     try:
@@ -24,16 +50,33 @@ def read_cpu_stat(proc_root="/proc"):
         return None
 
 
-def read_cpu_psi(proc_root="/proc"):
+def read_cpu_psi(proc_root="/proc", resource="cpu", category="some"):
     try:
-        for line in (Path(proc_root) / "pressure/cpu").read_text().splitlines():
-            if line.startswith("some "):
+        for line in (Path(proc_root) / "pressure" / resource).read_text().splitlines():
+            if line.startswith(category + " "):
                 fields = dict(pair.split("=", 1) for pair in line.split()[1:])
                 value = float(fields["avg10"])
                 return value if _number(value) and value <= 100 else None
     except (OSError, ValueError, KeyError):
         pass
     return None
+
+
+_last_oom_counter = None
+
+
+def read_oom_delta(proc_root="/proc"):
+    global _last_oom_counter
+    try:
+        values = dict(line.split() for line in (Path(proc_root) / "vmstat").read_text().splitlines())
+        counter = int(values["oom_kill"])
+        previous = _last_oom_counter
+        _last_oom_counter = (proc_root, counter)
+        if previous is None or previous[0] != proc_root or counter < previous[1]:
+            return None
+        return counter - previous[1]
+    except (OSError, ValueError, KeyError):
+        return None
 
 
 def cpu_delta(before, after):
@@ -54,9 +97,14 @@ def sample_cpu_usage(proc_root="/proc", interval_s=0.2, sleep=time.sleep, monoto
     after = read_cpu_stat(proc_root)
     elapsed = monotonic() - started
     result = cpu_delta(before, after)
-    if result is None or not _number(elapsed) or elapsed <= 0:
-        return None
-    return {**result, "psi_avg10": read_cpu_psi(proc_root), "interval_s": elapsed,
+    if result is None:
+        result = {"busy_percent": None, "busy_cores": None, "cores": (after or before or {}).get("cores")}
+    if not _number(elapsed) or elapsed <= 0:
+        elapsed = None
+    return {**result, "psi_avg10": read_cpu_psi(proc_root),
+            "psi_full_avg10": read_cpu_psi(proc_root, category="full"),
+            "memory_psi_full_avg10": read_cpu_psi(proc_root, resource="memory", category="full"),
+            "oom_kills_delta": read_oom_delta(proc_root), "interval_s": elapsed,
             "observed_at": datetime.fromtimestamp(clock(), timezone.utc).isoformat().replace("+00:00", "Z")}
 
 

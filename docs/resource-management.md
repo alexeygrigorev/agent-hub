@@ -70,9 +70,10 @@ Placement is gated on live data, not on a fixed sum of per-session reservations.
   is below the floor, new sessions stay queued (`launcher_memory_reserve`).
   Running sessions are never killed or stopped because of memory. Swap (a
   32 GiB partition) is the cushion.
-- **CPU admission:** measured busy cores plus expected new demand and startup
-  remainder must fit the configurable utilization target; CPU PSI retains a
-  separate safety cap. Load average is context only (see below).
+- **CPU admission:** run heavily loaded hosts while they remain responsive.
+  Only known choking signals hold new starts: CPU/memory full PSI, recent OOM
+  kills or verified session/service runtime failures. Load and busy CPU are
+  explanatory measurements, never independent holds (Alexey t1511u).
 - Tune if it crashes: if the OOM killer fires or MemAvailable stays below the
   floor, raise the floor or the estimate multiplier one step and record that here.
 - The cgroup `MemoryMax` per worker (1500M, or 4096M for managed Codex) is a
@@ -115,10 +116,13 @@ hard-coded constants.
 | `estimate_multiplier` | 1.25 | measured estimate growth allowance |
 | `ramp_seconds` | 180 | additional reserve window after starting |
 | `cpu_load_factor` | 1.5 | Deprecated compatibility field; never gates CPU |
-| `cpu_target_utilization` | 0.9 | Real busy CPU plus startup and new-task commitments |
+| `cpu_target_utilization` | 1.0 | Advisory utilization target; never a busy-only gate |
 | `cpu_default_cores` | 1.0 | Conservative no-history task estimate |
 | `cpu_estimate_multiplier` | 1.25 | Growth allowance over measured CPU p95 |
-| `cpu_psi_hard_cap_pct` | 50 | Independent PSI CPU some avg10 safety cap |
+| `cpu_psi_hard_cap_pct` | 50 | Deprecated compatibility field; PSI some is display-only |
+| `cpu_psi_full_hard_cap_pct` | 5 | CPU full PSI hard cap |
+| `memory_psi_full_hard_cap_pct` | 1 | Memory full PSI hard cap |
+| `choking_cooldown_seconds` | 300 | Recent OOM/runtime-failure hold |
 | `watchdog_interval_s` | 300–600 | watchdog |
 | `idle_minutes` | 60 | watchdog |
 | `rss_flag_gb` | 4 | watchdog / overview |
@@ -130,7 +134,7 @@ owns validated defaults, runtime settings, `session_resource_usage`,
 and a measured next-session estimate. Resident session cgroup caps are not
 subtracted again. Offered/starting/uncertain launches retain a conservative
 commitment until their status resolves; recently running sessions receive credit
-for fresh measured current anonymous RSS (a previous peak cannot masquerade as current usage). CPU admission uses the independently configured utilization target and PSI cap.
+for fresh measured current anonymous RSS (a previous peak cannot masquerade as current usage). CPU placement displays the utilization target and gates only on known choking signals.
 
 Read-only MCP tools `resources`, `resource_sessions`, and `resource_reaps` expose the same authenticated projections. Changes to the default config file trigger CI/deployment.
 
@@ -171,13 +175,24 @@ intake linkage or inability to save evidence prevents a stop.
 
 ## Predictive CPU admission
 
-CPU placement (intake `6aadd6c9`) uses real CPU usage, never load average.
+The CPU work is part of umbrella intake `4fcd3139` (the mistakenly separate
+`6aadd6c9` remains open with a pointer). Alexey t1511u supersedes busy-target-only
+admission: "Let it be heavy, just not choking." High utilization, including
+90–100% busy CPU, is acceptable and does not by itself stop placement.
+
 The host samples `/proc/stat` over a bounded 0.2-second interval, subtracts
-idle and iowait, and avoids counting guest time twice. It also reads CPU PSI
-`some avg10`. Heartbeats carry `cpu_usage` with busy percent/cores, logical
-cores, interval, PSI and observation time. Missing, reset or stale (>180 s)
-telemetry queues with `cpu_usage_unknown`; PSI above the configured cap
-queues with `cpu_pressure`. Load average remains visible as context.
+idle and iowait, and avoids counting guest time twice. Heartbeats include
+busy cores/percent, CPU PSI some/full, memory PSI full, OOM counter deltas,
+interval and observation time. PSI some and load average are display-only.
+The configurable CPU-full threshold defaults to 5%, memory-full to 1%.
+Known fresh full-pressure excess queues with `cpu_pressure` or `memory_pressure`.
+A new measured `/proc/vmstat oom_kill` delta produces `host_oom`; its timestamp
+survives subsequent clear or unknown heartbeat samples for the configured
+300-second cooldown. Verified session OOM/runtime-timeout/signal exits and
+fresh broken-service timeout/crash observations produce `host_runtime_choking`.
+Old measurements are not positive choking evidence. Unknown/malformed/stale
+telemetry stays visibly unknown and advisory, and does not fabricate healthy
+zeros or create a CPU hold by itself. Memory, quota and disk gates still apply.
 
 For each new session, the estimator uses the 95th percentile of completed
 sessions' measured p95 cores: same repo/project and task kind, then repo,
@@ -189,7 +204,7 @@ a measured zero remains valid. The multiplier applies to measured history.
 preserved across configuration/history changes, and forwarded to the maintained
 launcher as part of its normal admission policy.
 
-Admission requires:
+The predictive advisory is:
 
 ```
 current busy cores + startup remaining cores + expected new cores
@@ -202,8 +217,9 @@ ramp window. Credit requires a fresh measurement aligned with the host busy
 interval; otherwise the full startup estimate stays reserved. Stable running
 sessions are already in busy CPU, and queued sessions reserve no CPU. The
 claim path rechecks this formula excluding the offer's own commitment.
-`cpu_headroom` includes current, expected, ramping and limit numbers in queued
-reasons, session views and status. The independent 2048 MiB memory floor still
+The advisory includes current, expected, ramping and limit numbers and
+`predicted_over_target`; exceeding it alone never queues a session. Actual
+choking holds retain those numbers alongside their specific reason. The independent 2048 MiB memory floor still
 applies. Status labels name actual placement reasons instead of assuming memory.
 
 Session CPU seconds and average cores use the existing resource ledger and
@@ -211,9 +227,20 @@ canonical native binding. The host journals a bounded lifetime histogram of
 interval cores weighted by duration; p95 uses 0.05-core upper buckets (at most
 0.05-core rounding up), with measured overflow above 1024 cores. First samples,
 counter-source changes, resets and unreadable counters do not fabricate current
-CPU usage. The histogram survives host restarts and finalization. Dedicated
+CPU usage. Host pressure observations are independent: a missing/reset busy
+counter cannot suppress a valid fresh full-pressure or OOM signal. The histogram survives host restarts and finalization. Dedicated
 cgroups are preferred; process-tree fallback includes waited-child CPU time,
 but processes that both start and disappear entirely between polls without a
 readable parent's waited-child counter cannot be reconstructed. Unknown remains
 unknown. Reports retain workspace/project, engine/model, tier and kind metadata;
 resource overview and `hub resources sessions` show average and p95 CPU cores.
+
+The fixed cross-repository fixture is `test/fixtures/cpu-admission-v2.json`.
+The maintained launcher may emit the fixed refusal slug followed by
+`CPU_ADMISSION_JSON ` and the bounded numeric CPU object. The host and Hub
+validate the allowlist, finite numbers, ranges and timestamp before preserving
+those numbers; arbitrary output and unknown fields are not forwarded.
+Server-owned `resource_choking` hints contain only `reason` (`host_oom` or
+`host_runtime_choking`) and `observed_at`; they travel through offers and the
+host payload. The launcher must check their freshness against the configured
+cooldown and independently measure local full-pressure/OOM signals.

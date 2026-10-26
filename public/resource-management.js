@@ -12,7 +12,7 @@
       root.replaceChildren();
       for (const host of data.hosts || []) {
         const p = document.createElement('p');
-        p.textContent = `${host.machine_id}: memory ${gib(host.mem_used_mb)} / ${gib(host.mem_total_mb)} GiB; CPU ${number(host.cpu?.current_cpu_cores)} / ${number(host.cpu?.limit_cpu_cores)} cores target; ${host.cpu?.reason || 'CPU headroom available'}; load5 ${number(host.load5)} / ${number(host.cores)} cores; ${host.running} running, ${host.queued} queued. Floor ${gib(host.floor_mb)} GiB; starting reserve ${number(host.reserved_mb)} MiB.`;
+        p.textContent = `${host.machine_id}: memory ${gib(host.mem_used_mb)} / ${gib(host.mem_total_mb)} GiB; CPU ${number(host.cpu?.current_cpu_cores)} / ${number(host.cpu?.limit_cpu_cores)} cores advisory target; ${host.cpu?.reason || (host.cpu?.telemetry_state === 'unknown' ? 'CPU telemetry unknown (advisory)' : 'no measured choking')}; load5 ${number(host.load5)} / ${number(host.cores)} cores; ${host.running} running, ${host.queued} queued. Floor ${gib(host.floor_mb)} GiB; starting reserve ${number(host.reserved_mb)} MiB.`;
         root.append(p);
       }
       const table = document.createElement('table');

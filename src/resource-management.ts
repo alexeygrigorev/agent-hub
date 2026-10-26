@@ -13,6 +13,7 @@ const finite = (n: any) => typeof n === 'number' && Number.isFinite(n) && n >= 0
 const TERMINAL = new Set(['exited', 'finished', 'failed', 'stopped', 'dead', 'refused']);
 export const RESOURCE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS resource_resident_samples (launch_id TEXT PRIMARY KEY, resident_mb REAL NOT NULL, observed_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS resource_choking_events (machine_id TEXT NOT NULL, reason TEXT NOT NULL, observed_at TEXT NOT NULL, PRIMARY KEY(machine_id,reason));
 CREATE TABLE IF NOT EXISTS resource_cpu_samples (launch_id TEXT PRIMARY KEY, current_cpu_cores REAL NOT NULL, observed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_cpu_starts (launch_id TEXT PRIMARY KEY, expected_cpu_cores REAL NOT NULL, expected_cpu_source TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_cpu_usage (session_id TEXT PRIMARY KEY, p95_cpu_cores REAL, observed_at TEXT NOT NULL);
@@ -40,12 +41,12 @@ export function resourceConfig(value: any = {}): ResourceConfig {
     memory_floor_mb: [128, 1048576], ramp_reserve_default_mb: [64, 65536], estimate_percentile: [50,100],
     estimate_multiplier: [1,4], ramp_seconds: [30,900], cpu_load_factor: [.5,4],
     watchdog_interval_s: [300,600], idle_minutes: [10,10080], rss_flag_gb: [.125,1024],
-    cpu_target_utilization:[.1,1],cpu_default_cores:[.05,128],cpu_estimate_multiplier:[1,4],cpu_psi_hard_cap_pct:[1,100],
+    cpu_target_utilization:[.1,1],cpu_default_cores:[.05,128],cpu_estimate_multiplier:[1,4],cpu_psi_hard_cap_pct:[1,100],cpu_psi_full_hard_cap_pct:[.1,100],memory_psi_full_hard_cap_pct:[.1,100],choking_cooldown_seconds:[30,3600],
   };
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_resource_config');
   for (const [k,v] of Object.entries(value)) {
     if (!bounds[k] || !finite(v) || (v as number) < bounds[k][0] || (v as number) > bounds[k][1]) throw new Error('invalid_resource_config');
-    if (!['cpu_load_factor','estimate_multiplier','rss_flag_gb','cpu_target_utilization','cpu_default_cores','cpu_estimate_multiplier','cpu_psi_hard_cap_pct'].includes(k) && !Number.isSafeInteger(v)) throw new Error('invalid_resource_config');
+    if (!['cpu_load_factor','estimate_multiplier','rss_flag_gb','cpu_target_utilization','cpu_default_cores','cpu_estimate_multiplier','cpu_psi_hard_cap_pct','cpu_psi_full_hard_cap_pct','memory_psi_full_hard_cap_pct'].includes(k) && !Number.isSafeInteger(v)) throw new Error('invalid_resource_config');
     (result as any)[k] = v;
   }
   return result;
@@ -107,7 +108,22 @@ export class ResourceManagement {
       const credit=Number.isFinite(at)&&at>=this.now()-180000&&at<=hostAt&&at>=hostAt-(hb.cpu_usage?.interval_s ?? 0)*1000 ? current.current_cpu_cores : 0;
       remaining+=Math.max(0,committed.expected_cpu_cores-credit);
     }
-    return {...cpuVerdict(hb.cpu_usage,parse(m?.capabilities).cpu_count,estimate.expected_cpu_cores,remaining,config,this.now()),
+    const verdict=cpuVerdict(hb.cpu_usage,parse(m?.capabilities).cpu_count,estimate.expected_cpu_cores,remaining,config,this.now());
+    const cooldown=new Date(this.now()-config.choking_cooldown_seconds*1000).toISOString();
+    const event:any=this.sql.exec('SELECT reason,observed_at FROM resource_choking_events WHERE machine_id=? AND observed_at>=? ORDER BY observed_at DESC LIMIT 1',machine,cooldown).toArray()[0];
+    const runtime:any=this.sql.exec(`SELECT exit_reason,updated_at FROM fleet_launches WHERE machine_id=? AND updated_at>=?
+      AND state IN ('failed','exited') AND exit_reason IN ('engine_oom_killed','engine_runtime_timeout','engine_signal_exit')
+      ORDER BY updated_at DESC LIMIT 1`,machine,cooldown).toArray()[0];
+    let serviceChoking=false; let serviceAt:string|null=null;
+    if(this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='host_health_observations'").toArray().length) {
+      const health:any=this.sql.exec('SELECT payload_json,observed_at FROM host_health_observations WHERE machine_id=? AND observed_at>=?',machine,cooldown).toArray()[0];
+      serviceAt=health?.observed_at ?? null;
+      serviceChoking=(parse(health?.payload_json).services || []).some((s:any)=>s.worker==='broken'&& /timeout|crash/i.test(String(s.reason)));
+    }
+    const reason=event?.reason || (runtime || serviceChoking ? 'host_runtime_choking' : verdict.reason);
+    const chokingAt=event?.observed_at || runtime?.updated_at || (serviceChoking ? serviceAt : null);
+    return {...verdict,reason,admitted:reason===null,choking_observed_at:chokingAt,
+      resource_choking:['host_oom','host_runtime_choking'].includes(reason)&&chokingAt ? {reason,observed_at:chokingAt} : null,
       expected_cpu_source:estimate.expected_cpu_source};
   }
   headroom(machine: string, input: any = {}, engine: string | null = null) {

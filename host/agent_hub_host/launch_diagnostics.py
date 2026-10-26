@@ -5,10 +5,14 @@ import os
 from pathlib import Path
 import re
 import time
+import json
 
 # Match complete known launcher refusal lines, including traceback final lines.
 # Messages are constants: suffixes, payloads, paths and credentials never survive.
 REFUSALS = {
+    'memory_pressure': ('memory_pressure', 'Host memory full pressure exceeds the safety cap.'),
+    'host_oom': ('host_oom', 'A recent host OOM kill requires a placement cooldown.'),
+    'host_runtime_choking': ('host_runtime_choking', 'Recent session or service failures require a placement cooldown.'),
     'cpu_headroom': ('cpu_headroom', 'Host CPU usage plus expected session demand exceeds the CPU target.'),
     'cpu_pressure': ('cpu_pressure', 'Host CPU pressure exceeds the safety cap.'),
     'cpu_usage_unknown': ('cpu_usage_unknown', 'Fresh real CPU usage is unavailable.'),
@@ -218,6 +222,17 @@ def diagnostic(raw='', *, error_type='RuntimeError', exit_code=None, stage='laun
         error_type = 'RuntimeError'
     value = {'reason': reason, 'message': message, 'error_type': error_type,
              'stage': stage if stage in {'launcher_run', 'dispatch_headless', 'dispatch_interactive', 'dispatch_route'} else 'launcher_run'}
+    if reason in {'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking'}:
+        from .cpu_resources import sanitize_cpu_admission
+        for line in raw_str[-16384:].splitlines():
+            if line.startswith('CPU_ADMISSION_JSON ') and len(line) <= 2048:
+                try:
+                    cpu = sanitize_cpu_admission(json.loads(line[len('CPU_ADMISSION_JSON '):]))
+                except (ValueError, TypeError):
+                    cpu = None
+                if cpu is not None:
+                    value['cpu'] = cpu
+                    break
     if type(exit_code) is int:
         value['exit_code'] = exit_code
     return value

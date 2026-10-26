@@ -315,14 +315,15 @@ describe('generic accounts and launch placement', () => {
     sql.exec("UPDATE machines SET drained = 1 WHERE id = 'win35'");
     expect((s.plan(intent({ machine: 'win35' })) as any).selected).toBeNull();
   }));
-  it('chooses by measured CPU and treats unknown CPU as ineligible', async () => fixture(async (s, sql) => {
+  it('chooses by measured CPU and keeps unknown CPU advisory', async () => fixture(async (s, sql) => {
     await configure(s);
     const hb = { mem_avail_mb: 32000, disk_free_gb: 80, load: [30], cpu_usage: freshCpu(iso(),8,7), gate: { launch_allowed: true, at: iso() } };
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'hetzner'", JSON.stringify(hb));
     expect((s.plan(intent()) as any).selected.machine).toBe('win35');
     delete (hb as any).cpu_usage;
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'win35'", JSON.stringify(hb));
-    expect((s.plan(intent({ machine: 'win35' })) as any).rejected[0].reason).toBe('cpu_usage_unknown');
+    expect((s.plan(intent({ machine: 'win35' })) as any).selected.machine).toBe('win35');
+    expect(s.resources.cpuHeadroom('win35').telemetry_state).toBe('unknown');
   }));
   it('rejects stale/offline hosts, missing capabilities, resource floors and stale gates', async () => fixture(async (s, sql) => {
     await configure(s);
@@ -447,17 +448,17 @@ describe('generic accounts and launch placement', () => {
     s.drainCapacityQueue();
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', parked.value.id).one().state).toBe('offered');
   }));
-  it('holds placement on real CPU headroom and resumes despite high iowait load', async () => fixture(async (s, sql) => {
+  it('holds placement on CPU full pressure and admits heavy CPU after recovery', async () => fixture(async (s, sql) => {
     await configure(s);
     sql.exec("UPDATE machines SET capabilities = ? WHERE id='hetzner'", JSON.stringify({ engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
-    const hb: any = { mem_avail_mb: 32000, disk_free_gb: 80, load: [5, 13, 4], cpu_usage: freshCpu(iso(),8,7), gate: { launch_allowed: true, at: iso() } };
+    const hb: any = { mem_avail_mb: 32000, disk_free_gb: 80, load: [5, 13, 4], cpu_usage: {...freshCpu(iso(),8,8),psi_full_avg10:6}, gate: { launch_allowed: true, at: iso() } };
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id='hetzner'", JSON.stringify(hb));
     const input = intent({ machine: 'hetzner', mode: 'headless' });
-    expect(s.plan(input).rejected?.[0]?.reason).toBe('cpu_headroom');
+    expect(s.plan(input).rejected?.[0]?.reason).toBe('cpu_pressure');
     expect(isCapacityOnlyHold(s.plan(input).rejected)).toBe(true);
     hb.load = [30, 30, 30]; hb.cpu_usage = freshCpu(iso(),8,1);
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id='hetzner'", JSON.stringify(hb));
-    expect(s.plan(input).rejected?.some((r: any) => r.reason === 'cpu_headroom')).toBe(false);
+    expect(s.plan(input).rejected?.some((r: any) => r.reason === 'cpu_pressure')).toBe(false);
   }));
   it('fails closed on stale launcher telemetry and counts unstarted offers', async () => fixture(async (s, sql) => {
     await configure(s);

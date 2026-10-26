@@ -97,6 +97,8 @@ export function effectiveCheckin(machineId: string, persisted: unknown): string 
 
 export function updateHeartbeatMemoryOnly(machineId: string) {
   const now = Date.now();
+
+
   const st = machineState.get(machineId);
   if (!st) {
     machineState.set(machineId, { lastSeenAt: now, lastPersistedAt: 0, fingerprint: '', hb: null });
@@ -110,6 +112,11 @@ export function updateHeartbeat(machineId: string, rawPayload: any, sql: SqlStor
   if (!hb) return;
 
   const now = Date.now();
+  const cpu=hb.cpu_usage;
+  if(cpu && cpu.oom_kills_delta>0 && now-Date.parse(cpu.observed_at)>=-30000 && now-Date.parse(cpu.observed_at)<=180000
+    && sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='resource_choking_events'").toArray().length) {
+    sql.exec('INSERT INTO resource_choking_events VALUES(?,?,?) ON CONFLICT(machine_id,reason) DO UPDATE SET observed_at=excluded.observed_at WHERE excluded.observed_at>resource_choking_events.observed_at',machineId,'host_oom',cpu.observed_at);
+  }
   const fingerprint = getFingerprint(hb);
   let st = machineState.get(machineId);
   

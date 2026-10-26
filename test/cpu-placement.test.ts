@@ -3,6 +3,8 @@ import {env,runInDurableObject} from 'cloudflare:test';
 import {FleetService} from '../src/fleet';
 import {SessionControlService} from '../src/session_control';
 import {MonitoringService} from '../src/monitoring';
+import {LivenessService,DEFAULT_THRESHOLDS} from '../src/liveness';
+import {updateHeartbeat} from '../src/registry';
 import {freshCpu} from './cpu-fixture';
 import type {Hub} from '../src/hub';
 import type {Env} from '../src/env';
@@ -35,12 +37,13 @@ describe('CPU predictive placement integration',()=>{
   history(sql,'kind','repo','implement',1);
   expect(f.resources.cpuEstimate('repo','implement')).toEqual({expected_cpu_cores:1.25,expected_cpu_source:'repo_kind'});
  }));
- it('admits idle CPU with history despite iowait-heavy load; busy+heavy queues then drains',()=>fixture(async(f,sql,beat)=>{
+ it('admits idle CPU with history despite iowait-heavy load; busy+heavy admits until actual full pressure queues then drains',()=>fixture(async(f,sql,beat)=>{
   history(sql,'heavy','repo','implement',2);beat(.5);
   expect(f.plan(req()).selected).toMatchObject({expected_cpu_cores:2.5,expected_cpu_source:'repo_kind'});
-  beat(6);
+  beat(8);expect(f.plan(req()).selected).toBeTruthy();
+  beat(8,{cpu_usage:{...freshCpu(iso(),8,8),psi_full_avg10:6}});
   const queued=f.reserve(req(),admin);expect(queued.status).toBe(202);
-  expect(queued.value.rejected[0]).toMatchObject({reason:'cpu_headroom',cpu:{current_cpu_cores:6,expected_cpu_cores:2.5,limit_cpu_cores:7.2}});
+  expect(queued.value.rejected[0]).toMatchObject({reason:'cpu_pressure',cpu:{current_cpu_cores:8,expected_cpu_cores:2.5,limit_cpu_cores:8}});
   beat(.5);expect(f.drainCapacityQueue().promoted).toBe(1);
   expect(f.resources.cpuStart(queued.value.id)).toMatchObject({expected_cpu_cores:2.5,expected_cpu_source:'repo_kind'});
  }));
@@ -59,11 +62,52 @@ describe('CPU predictive placement integration',()=>{
  }));
  it('keeps memory floor, unknown telemetry and PSI cap as distinct reasons',()=>fixture(async(f,_sql,beat)=>{
   beat(0,{mem_avail_mb:2047});expect(f.plan(req()).rejected![0].reason).toBe('launcher_memory_reserve');
-  beat(0,{cpu_usage:null});expect(f.reserve(req(),admin).value.rejected[0].reason).toBe('cpu_usage_unknown');
-  beat(0,{cpu_usage:{...freshCpu(iso()),psi_avg10:51}});expect(f.plan(req()).rejected![0].reason).toBe('cpu_pressure');
+  beat(0,{cpu_usage:null});expect(f.resources.cpuHeadroom('host',req())).toMatchObject({admitted:true,telemetry_state:'unknown'});
+  beat(0,{cpu_usage:{...freshCpu(iso()),psi_full_avg10:6}});expect(f.plan(req()).rejected![0].reason).toBe('cpu_pressure');
+ }));
+ it('retains fresh OOM evidence through clear/unknown samples, then recovers after cooldown',()=>fixture(async(f,sql,beat)=>{
+  beat(8,{cpu_usage:{...freshCpu(iso(),8,8),memory_psi_full_avg10:2}});
+  expect(f.reserve(req(),admin).value.rejected[0].reason).toBe('memory_pressure');
+  sql.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,capabilities,last_heartbeat) SELECT 'oom-host',name,hostname,registered_at,last_checkin_at,capabilities,last_heartbeat FROM machines WHERE id='host'");
+  updateHeartbeat('oom-host',{type:'heartbeat',cpu_usage:{...freshCpu(iso()),oom_kills_delta:1}},sql);
+  sql.exec("UPDATE machines SET last_heartbeat=? WHERE id='oom-host'",JSON.stringify({cpu_usage:freshCpu(iso())}));expect(f.resources.cpuHeadroom('oom-host').reason).toBe('host_oom');
+  sql.exec("UPDATE machines SET last_heartbeat='{}' WHERE id='oom-host'");expect(f.resources.cpuHeadroom('oom-host').reason).toBe('host_oom');
+  sql.exec('UPDATE resource_choking_events SET observed_at=?',iso(-301000));
+  expect(f.resources.cpuHeadroom('oom-host')).toMatchObject({admitted:true,telemetry_state:'unknown'});
+ }));
+ it('holds on verified session runtime failures or fresh service timeout/crash observations',()=>fixture(async(f,sql,beat)=>{
+  const start=f.reserve(req(),admin);expect(start.status,JSON.stringify(start.value)).toBe(201);
+  sql.exec("UPDATE fleet_launches SET state='failed',exit_reason='engine_runtime_timeout' WHERE id=?",start.value.id);
+  expect(f.resources.cpuHeadroom('host').reason).toBe('host_runtime_choking');
+  sql.exec('UPDATE fleet_launches SET updated_at=? WHERE id=?',iso(-301000),start.value.id);
+  expect(f.resources.cpuHeadroom('host').admitted).toBe(true);
+  const monitoring=new MonitoringService(sql,cb=>cb(),undefined,undefined,undefined,()=>now);monitoring.init();
+  sql.exec('INSERT INTO host_health_observations VALUES(?,?,?,?,?,?)','host',iso(),now,iso(),JSON.stringify({services:[{service_id:'controller',worker:'broken',reason:'service_crash'}]}),'test');
+  expect(f.resources.cpuHeadroom('host').reason).toBe('host_runtime_choking');
+ }));
+ it('preserves bounded local refusal math through a fenced no-start retry',()=>fixture(async(f,sql)=>{
+  const start=f.reserve(req(),admin);expect(start.status).toBe(201);
+  sql.exec("UPDATE fleet_launches SET state='starting' WHERE id=?",start.value.id);
+  const cpu={current_cpu_cores:8,expected_cpu_cores:1,ramping_cpu_cores:2,limit_cpu_cores:8,target_utilization:1,psi_full_avg10:7,observed_at:iso()};
+  const diagnostic={reason:'cpu_pressure',message:'Host CPU pressure exceeds the safety cap.',error_type:'RuntimeError',stage:'launcher_run',cpu};
+  const post=(data:any)=>f.handle(new Request('https://hub/api/fleet/launches/'+start.value.id+'/result',{method:'POST',body:JSON.stringify(data)}),{caller:{kind:'host',machineId:'host'},scopes:['host']});
+  const body={state:'failed',confirmed_exit:true,launcher_task_id:'hub-'+start.value.id,reason:'cpu_pressure',diagnostic};
+  expect((await post({...body,diagnostic:{...diagnostic,cpu:{...cpu,secret:'private'}}})).status).toBe(400);
+  const result=await post(body);expect(result.status).toBe(200);
+  const queued:any=await result.json();expect(queued.state).toBe('queued');
+  const hold:any=sql.exec('SELECT rejected_json FROM fleet_memory_holds WHERE launch_id=?',queued.id).one();
+  expect(JSON.parse(hold.rejected_json)[0]).toMatchObject({reason:'cpu_pressure',cpu:{...cpu,expected_cpu_source:'default'}});
+ }));
+ it('samples old active sessions ahead of more than 1000 recent terminal sessions',()=>fixture(async(f,sql)=>{
+  sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+    VALUES('old-live','admin','old-live','{}','host','codex','interactive','running',?,?,?)`,JSON.stringify({native_id:'old-native',tag:'old',workspace:'/repo',native_created_at_ms:now-100000}),iso(-86400000),iso(-86400000));
+  sql.exec(`WITH RECURSIVE n(x) AS(SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1001)
+    INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+    SELECT 'dead-'||x,'admin','dead-'||x,'{}','host','codex','interactive','stopped',json_object('native_id','dead-'||x,'tag','dead','workspace','/repo'),?,? FROM n`,iso(),iso());
+  expect(f.resources.sessions('host')[0]).toMatchObject({session_id:'old-live',started_at:iso(-100000)});
  }));
  it('shows CPU source in session details and truthful status labels',()=>fixture(async(f,sql,beat)=>{
-  const launch=f.reserve(req(),admin);expect(launch.status).toBe(201);
+  const launch=f.reserve(req(),admin);expect(launch.status,JSON.stringify(launch.value)).toBe(201);
   const s=new SessionControlService(sql,cb=>cb(),()=>now);s.init();
   sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,'11111111-1111-4111-8111-111111111111','admin','session-key','{}',launch.value.id,'host','codex','interactive','offered',iso(),iso());
   const response=await s.handle(new Request('https://hub/api/sessions/11111111-1111-4111-8111-111111111111'),admin);
@@ -72,11 +116,14 @@ describe('CPU predictive placement integration',()=>{
   sql.exec('UPDATE session_control_sessions SET binding_json=? WHERE id=?',JSON.stringify(binding),'11111111-1111-4111-8111-111111111111');
   f.resources.report('host',{samples:[{session_id:'11111111-1111-4111-8111-111111111111',native_id:'native',cpu_seconds:40,runtime_s:100,p95_cpu_cores:1.5,current_cpu_cores:.5,observed_at:iso()}],reaps:[]});
   expect(f.resources.usage()[0]).toMatchObject({workspace:'/repo',cpu_seconds:40,avg_cpu_cores:.4,p95_cpu_cores:1.5,engine:'codex'});
-  beat(7);f.reserve(req(),admin);
+  beat(7,{cpu_usage:{...freshCpu(iso(),8,7),psi_full_avg10:6}});f.reserve(req(),admin);
   const monitoring=new MonitoringService(sql,cb=>cb(),undefined,undefined,undefined,()=>now);monitoring.init();
   sql.exec('INSERT INTO host_health_observations VALUES(?,?,?,?,?,?)','host',iso(),now,iso(),JSON.stringify({memory:{total_bytes:64000,available_bytes:32000,used_bytes:32000,percent:50,status:'ok'},load:{load1:1,load5:1,load15:1}}),'test');
   const status=monitoring.getStatusSummary();
-  expect(JSON.stringify(status)).toContain('cpu_headroom');
+  expect(JSON.stringify(status)).toContain('cpu_pressure');
   expect(JSON.stringify(status)).not.toContain('held queued for memory/capacity');
+  sql.exec('UPDATE fleet_memory_holds SET since=?',iso(-301000));
+  const live=new LivenessService(sql,DEFAULT_THRESHOLDS,()=>now);live.init();
+  expect(live.evaluate().subjects.some(s=>s.state==='cpu_pressure'&&s.detail.includes('cpu_pressure hold'))).toBe(true);
  }));
 });

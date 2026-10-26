@@ -1880,7 +1880,7 @@ export class MonitoringService {
       const reasons=new Set<string>();
       for(const h of holds) for(const r of JSON.parse(String(h.rejected_json))) {
         const c=r.cpu;
-        reasons.add(c ? `${r.reason} (current=${c.current_cpu_cores ?? 'unknown'} expected=${c.expected_cpu_cores} ramping=${c.ramping_cpu_cores} limit=${c.limit_cpu_cores} cores)` : String(r.reason));
+        reasons.add(c ? `${r.reason} (current=${c.current_cpu_cores ?? 'unknown'} expected=${c.expected_cpu_cores} ramping=${c.ramping_cpu_cores} limit=${c.limit_cpu_cores} cores; CPU full=${c.psi_full_avg10 ?? 'unknown'}% memory full=${c.memory_psi_full_avg10 ?? 'unknown'}% OOM delta=${c.oom_kills_delta ?? 'unknown'})` : String(r.reason));
       }
       if(reasons.size) bits.push([...reasons].join(', '));
     } catch { /* old schema: generic placement state stays truthful */ }

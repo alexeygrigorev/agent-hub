@@ -9,6 +9,9 @@
   "cpu_default_cores": 1,
   "cpu_estimate_multiplier": 1.25,
   "cpu_psi_hard_cap_pct": 50,
+  "cpu_psi_full_hard_cap_pct": 5,
+  "memory_psi_full_hard_cap_pct": 1,
+  "choking_cooldown_seconds": 300,
   "watchdog_interval_s": 300,
   "idle_minutes": 60,
   "rss_flag_gb": 4

@@ -220,10 +220,10 @@ def render_text(data: dict, view=None) -> str:
             _fmt_mb(host.get("mem_total_mb")), host.get("load5", "?"),
             host.get("cores", "?"), host.get("running", "?"), host.get("queued", "?")))
         cpu = host.get("cpu") or {}
-        lines.append("  CPU current=%s expected=%s ramping=%s limit=%s cores reason=%s source=%s" % (
+        lines.append("  CPU current=%s expected=%s ramping=%s limit=%s cores reason=%s source=%s telemetry=%s" % (
             _fmt_avg(cpu.get("current_cpu_cores")), _fmt_avg(cpu.get("expected_cpu_cores")),
             _fmt_avg(cpu.get("ramping_cpu_cores")), _fmt_avg(cpu.get("limit_cpu_cores")),
-            cpu.get("reason") or "admitted", cpu.get("expected_cpu_source", "unknown")))
+            cpu.get("reason") or "admitted", cpu.get("expected_cpu_source", "unknown"), cpu.get("telemetry_state", "unknown")))
     stats = data.get("stats") if isinstance(data.get("stats"), list) else []
     for group in stats[:20]:
         if not isinstance(group, dict):

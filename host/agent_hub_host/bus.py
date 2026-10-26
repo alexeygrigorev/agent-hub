@@ -48,7 +48,7 @@ def _do_request(method, path, payload=None):
                 body = json.loads(e.read(4097))
             except (ValueError, OSError):
                 body = None
-            if isinstance(body, dict) and body.get('error') in {'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown'}:
+            if isinstance(body, dict) and body.get('error') in {'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'}:
                 raise ValueError(body['error']) from None
         # Never print token, credentials, native full environment or server-controlled error bodies
         raise ValueError(f"HTTP request failed with status {e.code}")

@@ -1651,12 +1651,15 @@ class Dispatcher:
                     payload["expected_cpu_cores"] = cpu_estimate
                     if offer.get("expected_cpu_source") in ("repo_kind", "repo", "global", "default"):
                         payload["expected_cpu_source"] = offer["expected_cpu_source"]
+                choking = offer.get("resource_choking")
+                if isinstance(choking, dict) and set(choking) == {"reason", "observed_at"} and choking.get("reason") in {"host_oom", "host_runtime_choking"} and isinstance(choking.get("observed_at"), str) and len(choking["observed_at"]) <= 64:
+                    payload["resource_choking"] = dict(choking)
                 policy = offer.get("resource_management")
                 if isinstance(policy, dict) and policy:
                     bounded = {k: policy[k] for k in (
                         "memory_floor_mb", "ramp_reserve_default_mb", "estimate_percentile",
                         "estimate_multiplier", "ramp_seconds", "cpu_load_factor",
-                        "cpu_target_utilization", "cpu_default_cores", "cpu_estimate_multiplier", "cpu_psi_hard_cap_pct",
+                        "cpu_target_utilization", "cpu_default_cores", "cpu_estimate_multiplier", "cpu_psi_hard_cap_pct", "cpu_psi_full_hard_cap_pct", "memory_psi_full_hard_cap_pct", "choking_cooldown_seconds",
                         "watchdog_interval_s", "idle_minutes", "rss_flag_gb") if k in policy}
                     if bounded:
                         payload["resource_management"] = bounded
