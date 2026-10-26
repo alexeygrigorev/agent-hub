@@ -86,7 +86,9 @@ Runs every 5–10 minutes (Alexey t1474u: «Надо ещё watchdog чтобы 
 - Releases reservations and reaps process trees of sessions that are finished,
   failed, stopped, or whose PID is dead. Sessions that are done but still alive
   are stopped cleanly once their final report has been saved, without waiting
-  for the live-session idle timeout. Every stop rechecks exact identity and
+  for the live-session idle timeout. Terminal cleanup requires at least five
+  minutes without activity, so a terminal label cannot bypass recent-output
+  protection. Every stop rechecks exact identity and
   unchanged output/activity after saving evidence; a resumed dead workload refuses cleanup.
 - Sessions with no output or activity for more than `idle_minutes` (default 60)
   are flagged. The watchdog captures their output into the intake and then

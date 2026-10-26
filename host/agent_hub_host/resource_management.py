@@ -1231,9 +1231,10 @@ def _reap_one(request: Any, aplexer_bin: str, entry: dict[str, Any], native: Any
     if idle_ms is None or idle_ms < 0 or reason not in REAP_REASONS:
         return None  # Unknown threshold never stops.
     # Terminal/dead workloads qualify independently of the idle timeout.
-    # Every reason still requires stable output/activity across the evidence
-    # window; only a live idle workload must satisfy the full idle threshold.
-    quiet_ms = idle_ms if reason == "idle" else 0
+    # Every reason requires a real quiet period as well as stable output
+    # across the evidence window. Terminal cleanup waits one minimum
+    # watchdog interval, rather than the full live-session idle timeout.
+    quiet_ms = idle_ms if reason == "idle" else min(idle_ms, WATCHDOG_MIN_S * 1000)
     try:
         engine = entry.get("engine")
         target = NativeTarget(

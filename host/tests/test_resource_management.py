@@ -434,9 +434,9 @@ class EvidenceGateTests(unittest.TestCase):
             out = rm.run_watchdog_cycle(request, journal_dir=journal, now_ms=now_ms)
         return out, calls, stop_mock
 
-    def test_recent_terminal_output_is_saved_without_idle_timeout(self):
+    def test_quiet_terminal_output_is_saved_without_full_idle_timeout(self):
         with tempfile.TemporaryDirectory() as tmp:
-            native = [_native(phase="exited", last_activity_ms=9_940_000)]
+            native = [_native(phase="exited", last_activity_ms=9_640_000)]
             out, calls, stop_mock = self._reap_cycle(
                 [_entry(state="failed")], native, journal=tmp)
             stop_mock.assert_called_once()
@@ -446,9 +446,18 @@ class EvidenceGateTests(unittest.TestCase):
             self.assertEqual(evidence[0]["reason"], "terminal")
             self.assertEqual(evidence[0]["output"], "tail")
 
-    def test_dead_workload_resumed_after_evidence_refuses_stop(self):
+    def test_terminal_recent_output_refuses_stop(self):
         with tempfile.TemporaryDirectory() as tmp:
             native = [_native(phase="running", last_activity_ms=9_940_000)]
+            out, calls, stop_mock = self._reap_cycle(
+                [_entry(state="failed")], native, journal=tmp)
+            stop_mock.assert_not_called()
+            self.assertEqual(out["reaps"], 0)
+            self.assertFalse(any(path.endswith("/evidence") for _, path, _ in calls))
+
+    def test_dead_workload_resumed_after_evidence_refuses_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = [_native(phase="running", last_activity_ms=9_640_000)]
             with patch.object(rm, "_native_dead", side_effect=[True, True, False]):
                 out, calls, stop_mock = self._reap_cycle(
                     [_entry(state="running")], native, journal=tmp)
