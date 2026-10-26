@@ -21,6 +21,7 @@ import { registeredRepoLabel } from './repos';
  * See docs/SESSION-CONTROL.md.
  */
 import { recordIntakeSessionLink, IntakeSessionLinkError } from './intake';
+import { ResourceManagement } from './resource-management';
 import { classifySessionStall, initSessionStalls, nativeObservationFresh, nativeProgress, orphanFailure, stallThreshold } from './session_stall';
 import { STOP_DELIVERY_MS, expireUnclaimedStops, refreshObservedHostFamily, visibleSessionPrefixMatches } from './session_stop';
 import type { SqlStorage } from '@cloudflare/workers-types';
@@ -628,10 +629,14 @@ export class SessionControlService {
     let memoryRejected: any[] = [];
     if (row.fleet_launch_id) {
       try {
-        const launch: any = this.sql.exec('SELECT launch_error_json, model_selection_json, exit_reason, native_id FROM fleet_launches WHERE id = ?', row.fleet_launch_id).toArray()[0];
+        const launch: any = this.sql.exec('SELECT launch_error_json, model_selection_json, exit_reason, native_id,request_json,workspace FROM fleet_launches WHERE id = ?', row.fleet_launch_id).toArray()[0];
         modelSelection = parsed(launch?.model_selection_json);
         const cpuTable=this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='resource_cpu_starts'").toArray().length;
-        if(cpuTable) expectedCpu=this.sql.exec('SELECT expected_cpu_cores,expected_cpu_source FROM resource_cpu_starts WHERE launch_id=?',row.fleet_launch_id).toArray()[0] ?? null;
+        if(cpuTable) {
+          const intent=parsed(launch?.request_json);
+          expectedCpu=this.sql.exec('SELECT expected_cpu_cores,expected_cpu_source FROM resource_cpu_starts WHERE launch_id=?',row.fleet_launch_id).toArray()[0]
+            ?? new ResourceManagement(this.sql,this.now).cpuEstimate(intent.project || launch?.workspace || request.workspace || null,intent.task_kind || request.task_kind || 'goal');
+        }
         modelReason = launch?.exit_reason === 'model_unsupported' ? 'model_unsupported' : null;
         launchError = launch?.launch_error_json ? parsed(launch.launch_error_json, null) : null;
         // Rejections before claim and legacy terminal receipts have no diagnostic

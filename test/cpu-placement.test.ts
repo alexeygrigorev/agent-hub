@@ -126,4 +126,12 @@ describe('CPU predictive placement integration',()=>{
   const live=new LivenessService(sql,DEFAULT_THRESHOLDS,()=>now);live.init();
   expect(live.evaluate().subjects.some(s=>s.state==='cpu_pressure'&&s.detail.includes('cpu_pressure hold'))).toBe(true);
  }));
+ it('explains expected CPU for an intent queued by memory before placement',()=>fixture(async(f,sql,beat)=>{
+  beat(0,{mem_avail_mb:2047});const queued=f.reserve(req(),admin);expect(queued.status).toBe(202);
+  const s=new SessionControlService(sql,cb=>cb(),()=>now);s.init();
+  const id='22222222-2222-4222-8222-222222222222';
+  sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,mode,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`,id,'admin','queued-cpu','{}',queued.value.id,'interactive','queued',iso(),iso());
+  const response=await s.handle(new Request('https://hub/api/sessions/'+id),admin);
+  expect(await response.json()).toMatchObject({expected_cpu_cores:1,expected_cpu_source:'default',reason:'launcher_memory_reserve'});
+ }));
 });
