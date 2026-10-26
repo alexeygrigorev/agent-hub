@@ -9,6 +9,7 @@ import { buildSessionInputs } from './session_lifecycle_registry';
 import { classifySession, toStatusDto } from './session_lifecycle';
 import { EXPECTED_OFFLINE_UNTIL, EXPECTED_OFFLINE_REASON, expectedOfflineWindowActive, isExpectedOffline } from './status_offline';
 import { resolveMachineAliases } from './machine-alias';
+import { effectiveCheckin } from './registry';
 import { isValidMachineId } from './machine-id';
 
 type Auth = { caller?: any; scopes?: string[]; error?: Response };
@@ -857,7 +858,11 @@ export class StatusService {
   private machineAliases(machines: Map<string, Obj>): Map<string, string> {
     try {
       const rows = [...machines.entries()].map(([id, m]) => {
-        const at = m.last_checkin_at ? Date.parse(m.last_checkin_at) : NaN;
+        // Same effective check-in as placement (fleet.ts) and liveness: the
+        // persisted row is throttled to one write per 5 min for unchanged
+        // heartbeats, while the in-memory time is fresh. Raw persisted time
+        // here would mis-resolve aliases on a live host (intake fb88e64e).
+        const at = Date.parse(effectiveCheckin(String(id), m.last_checkin_at) ?? '');
         return { id: String(id), hostname: m.hostname, drained: m.drained, last_seen_ms: Number.isFinite(at) ? at : null };
       });
       return resolveMachineAliases(rows).aliasOf;
@@ -872,7 +877,12 @@ export class StatusService {
     for (const [id, m] of machines) {
       // A stale alias row reports via its canonical host; never a missing host.
       if (aliases.has(id)) continue;
-      const at = m.last_checkin_at ? Date.parse(m.last_checkin_at) : NaN;
+      // Effective check-in, not the raw persisted row: storage is written at
+      // most every five minutes for an unchanged heartbeat, so the raw row
+      // goes stale past the 180s threshold on a live host and status would
+      // spuriously report it missing (intake fb88e64e, 2026-10-26: hetzner
+      // missing while placement/fleet saw a 40s-fresh effective check-in).
+      const at = Date.parse(effectiveCheckin(String(id), m.last_checkin_at) ?? '');
       const stale = m.drained || !Number.isFinite(at) || now - at > 180000;
       if (!stale) continue;
       const hostname = typeof m.hostname === 'string' ? m.hostname : '';
@@ -1080,7 +1090,7 @@ export class StatusService {
 
   private isStaleHost(m: Obj | undefined, now: number): boolean {
     if (!m) return true;
-    const at = m.last_checkin_at ? Date.parse(m.last_checkin_at) : NaN;
+    const at = Date.parse(effectiveCheckin(m.id !== undefined ? String(m.id) : '', m.last_checkin_at) ?? '');
     return !!m.drained || !Number.isFinite(at) || now - at > 180000;
   }
 

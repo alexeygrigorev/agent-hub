@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
 import { sha256 } from '../src/auth/crypto';
+import { updateHeartbeatMemoryOnly } from '../src/registry';
 
 const inDO: any = runInDurableObject;
 const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
@@ -332,6 +333,24 @@ describe('M14a authorized one-call status projection', () => {
     const row = relinked.tasks.find((t: any) => t.id === task.id);
     expect(row.session_coverage.coverage).toBe('complete');
     expect(row.session_coverage.missing_hosts).toEqual([]);
+  });
+
+  it('never reports a live host as missing when only the persisted check-in is throttled', async () => {
+    // Incident 2026-10-26 (intake fb88e64e follow-up): heartbeat storage is
+    // written at most every five minutes for an unchanged payload, while the
+    // in-memory check-in is fresh on every heartbeat. Placement (fleet.ts)
+    // and fleet show use effectiveCheckin() and saw a 40s-fresh host, but
+    // status read the raw persisted row and spuriously reported the live
+    // canonical host missing with coverage=partial. Status must use the same
+    // effective check-in as every other consumer.
+    await inDO(stub(), (h: any) => {
+      const stale = new Date(Date.now() - 200000).toISOString();
+      h.sql.exec("INSERT OR IGNORE INTO machines(id,name,hostname,registered_at,last_checkin_at,drained) VALUES ('host-throttled','live','LIVE','2026-01-01T00:00:00.000Z',?,0)", stale);
+      updateHeartbeatMemoryOnly('host-throttled');
+    });
+    const data = await ok('');
+    expect(data.coverage.missing_hosts).not.toContain('host-throttled');
+    expect(data.coverage.sessions).toBe('complete');
   });
 
   it('expires the win35 expected-offline window after 2026-10-31T15:23:00Z', async () => {
