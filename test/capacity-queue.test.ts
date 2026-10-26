@@ -435,12 +435,52 @@ describe('sessions_start capacity queue', () => {
 
 
 describe('bounded queue maintenance', () => {
+  it('performs no durable writes for repeated idle offer polls', () => fleetFixture(async(f,sql)=>{
+    await configure(f);
+    for(const table of ['routing_scan_cursor','fleet_queue_cursor']) expect(sql.exec(`SELECT * FROM ${table}`).toArray()).toEqual([]);
+    await f.handle(fleetReq('/offers',undefined,'GET'),host('hetzner'));
+    for(const table of ['routing_scan_cursor','fleet_queue_cursor']) {
+      expect(sql.exec(`SELECT after_rowid,high_water FROM ${table}`).one()).toEqual({after_rowid:0,high_water:0});
+      // A previous finite round can outlive all its queued rows.
+      sql.exec(`UPDATE ${table} SET after_rowid=50,high_water=50`);
+    }
+    let writes=0;
+    const measured=new Proxy(sql,{get(target,key){
+      if(key==='exec') return (query:string,...args:any[])=>{const result=target.exec(query,...args);writes+=result.rowsWritten;return result;};
+      return target[key];
+    }});
+    const restarted=new FleetService(measured,fn=>fn(),()=>NOW);
+    await restarted.handle(fleetReq('/offers',undefined,'GET'),host('hetzner'));
+    expect(writes).toBe(2); // Persist the now-empty round once.
+    writes=0;
+    for(let i=0;i<3;i++) {
+      const result:any=await (await restarted.handle(fleetReq('/offers',undefined,'GET'),host('hetzner'))).json();
+      expect(result).toEqual({offers:[],reconciliation:[]});
+    }
+    expect(writes).toBe(0);
+  }));
+
   function park(sql: any, template: string, id: string, patch = {}, created = iso()) {
     const row = sql.exec('SELECT request_json FROM fleet_launches WHERE id=?', template).one();
     sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
       SELECT ?,actor,requester_kind,summary,?,?,machine_id,engine,account,mode,workspace,prompt,'queued',?,? FROM fleet_launches WHERE id=?`,
       id, id, JSON.stringify({...JSON.parse(row.request_json), ...patch}), created, created, template);
   }
+  it('retries cursor progress after a rolled-back promotion',()=>fleetFixture(async(f,sql)=>{
+    await configure(f);
+    const first=f.reserve(intent({machine:'hetzner'}),admin).value;
+    park(sql,first.id,'rollback-eligible');
+    sql.exec("UPDATE fleet_launches SET state='stopped' WHERE id=?",first.id);
+    const before=sql.exec('SELECT * FROM fleet_queue_cursor').toArray();
+    expect(()=>(f as any).transaction(()=>{
+      expect(f.drainCapacityQueue().promoted).toBe(1);
+      throw new Error('rollback probe');
+    })).toThrow('rollback probe');
+    expect(sql.exec('SELECT * FROM fleet_queue_cursor').toArray()).toEqual(before);
+    expect(sql.exec("SELECT state FROM fleet_launches WHERE id='rollback-eligible'").one().state).toBe('queued');
+    expect(f.drainCapacityQueue().promoted).toBe(1);
+    expect(sql.exec("SELECT state FROM fleet_launches WHERE id='rollback-eligible'").one().state).toBe('offered');
+  }));
   it('keeps the host poll budget when nested maintenance asks for the default slice',()=>fleetFixture(async(f,sql)=>{
     await configure(f);
     const first=f.reserve(intent({machine:'hetzner'}),admin).value;

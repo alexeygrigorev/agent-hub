@@ -91,7 +91,11 @@ export class RoutingService {
       }
       queued = this.sql.exec("SELECT rowid AS scan_rowid,* FROM routing_jobs WHERE launch_id IS NULL AND state='queued' AND rowid>? AND rowid<=? ORDER BY rowid LIMIT 1", after, high).toArray();
       after = queued.length ? Number(queued[0].scan_rowid) : high;
-      this.sql.exec('INSERT INTO routing_scan_cursor VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET after_rowid=excluded.after_rowid,high_water=excluded.high_water', after, high);
+      // Unchanged idle polls must remain reads: even a no-op UPDATE pays
+      // the Durable Object replicated-write output gate in production.
+      if (!cursor || cursor.after_rowid !== after || cursor.high_water !== high) {
+        this.sql.exec('INSERT INTO routing_scan_cursor VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET after_rowid=excluded.after_rowid,high_water=excluded.high_water', after, high);
+      }
     }
     // TBM pacing/EDF context is read once per dispatch pass from the Phase 1 tbm_* tables.
     const pacing = queued.length ? loadProviderPacing(this.sql, this.now()) : undefined;

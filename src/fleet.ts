@@ -975,6 +975,12 @@ export class FleetService {
       // Host polls and capacity-changing writes drive the next bounded slice.
       const cursor: any = this.sql.exec('SELECT after_rowid,high_water FROM fleet_queue_cursor WHERE singleton=1').toArray()[0];
       let after = Number(cursor?.after_rowid || 0), high = Number(cursor?.high_water || 0);
+      let persistedAfter = cursor?.after_rowid, persistedHigh = cursor?.high_water;
+      const persistCursor = () => {
+        if (persistedAfter === after && persistedHigh === high) return;
+        this.sql.exec('INSERT INTO fleet_queue_cursor VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET after_rowid=excluded.after_rowid,high_water=excluded.high_water', after, high);
+        persistedAfter = after; persistedHigh = high;
+      };
       if (after >= high) {
         after = 0;
         high = Number(this.sql.exec("SELECT COALESCE(MAX(rowid),0) AS n FROM fleet_launches WHERE state='queued'").one().n);
@@ -987,7 +993,7 @@ export class FleetService {
         after = Number(row.queue_rowid);
         // Persist only examined progress, in the promotion transaction. Even
         // malformed or held rows must not strand eligible work behind them.
-        this.sql.exec('INSERT INTO fleet_queue_cursor VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET after_rowid=excluded.after_rowid,high_water=excluded.high_water', after, high);
+        persistCursor();
         let bound: any = null;
         try { bound = JSON.parse(row.request_json); } catch { continue; }
         if (!bound || typeof bound !== 'object') continue;
@@ -1050,7 +1056,7 @@ export class FleetService {
           promoted++;
         }
       }
-      this.sql.exec('INSERT INTO fleet_queue_cursor VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET after_rowid=excluded.after_rowid,high_water=excluded.high_water', after, high);
+      persistCursor();
     } catch { /* drain is best-effort inside the ambient txn */ }
     return { promoted, expired };
   }

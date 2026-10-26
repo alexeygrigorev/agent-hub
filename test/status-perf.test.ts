@@ -93,7 +93,7 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
         expect(body.reconciliation[0].binding.detail).toHaveLength(200);
       }
       if (path === '/api/status') {
-        expect(response.headers.get('X-Hub-Status-Projection')).toBe('resource-disk-v5');
+        expect(response.headers.get('X-Hub-Status-Projection')).toBe('resource-disk-v6');
         expect(body.tasks).toHaveLength(method === 'GET' ? 25 : 256);
         expect(body.tasks[0].hub_sessions[0].lifecycle.session_key).toBe('perf-host/native-0');
         expect(body.agents.running).toBe(100);
