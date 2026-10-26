@@ -2609,6 +2609,12 @@ class Dispatcher:
                 workspace_available = False
             diagnostic = classify(exc, workspace_available=workspace_available)
             reason = diagnostic['reason']
+            if reason == 'dispatch_claim_refused':
+                # Intake 4398ce2a: surface the Hub's refusal slug (bus already
+                # reduced the body to token-shaped error/reason fields).
+                slug = str(exc).split(':', 1)[1].strip()[:129] if ':' in str(exc) else ''
+                print(json.dumps({'event': 'dispatch_claim_refused', 'offer_id': offer.get('id'),
+                                  'hub_error': slug if re.fullmatch(r'[A-Za-z0-9_:.-]{0,129}', slug) else ''}), flush=True)
             # Only fixed diagnostics enter the journal; no prompt, argv,
             # account credentials or arbitrary exception text is retained.
             record = {'offer_id': offer.get('id'), 'state': 'dispatch_refused',
