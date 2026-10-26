@@ -130,7 +130,7 @@ class TbmDispatchTests(unittest.TestCase):
 
     def test_reason_length_bounded(self):
         with self.assertRaises(ValueError):
-            tbm_cli.set_kill_switch(True, "x" * 501)
+            tbm_cli.set_kill_switch(True, "x" * 281)
 
     def test_non_dict_response_rejected(self):
         self.responses[("GET", "/api/quota/pacing")] = ["not", "a", "dict"]

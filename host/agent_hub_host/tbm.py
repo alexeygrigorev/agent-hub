@@ -17,7 +17,7 @@ PACING_PATH = "/api/quota/pacing"
 BANKED_PATH = "/api/quota/banked"
 KILL_SWITCH_PATH = "/api/quota/kill-switch"
 
-MAX_REASON_CHARS = 500
+MAX_REASON_CHARS = 280
 
 
 def _require_dict(data, what):
@@ -94,7 +94,8 @@ def render_pacing_text(data):
         ratio_s = "unknown" if ratio is None else str(ratio)
         reset = pool.get("reset_at_ms")
         reset_s = "unknown" if reset is None else str(reset)
-        lines.append("%s: target %s tpm, pacing %s, reset %s" % (pid, target_s, ratio_s, reset_s))
+        unit = "%/min" if pool.get("capacity_known") == 0 or pool.get("quota_unit") == "percent" else "tokens/min"
+        lines.append("%s: target %s %s, pacing %s, reset %s" % (pid, target_s, unit, ratio_s, reset_s))
     if count == 0:
         lines.append("No pacing pools reported.")
     return "\n".join(lines)
@@ -116,7 +117,7 @@ def render_banked_text(data):
         tid = tranche.get("tranche_id", "?")
         status = tranche.get("status", "unknown")
         remaining = tranche.get("remaining_tokens")
-        left = "unknown" if remaining is None else str(remaining)
+        left = "unknown" if remaining is None or tranche.get("quantity_known") == 0 else str(remaining)
         expires = tranche.get("expires_at_ms")
         exp_s = "unknown" if expires is None else str(expires)
         lines.append("%s: %s (%s tokens left, expires %s)" % (tid, status, left, exp_s))
