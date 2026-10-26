@@ -530,7 +530,7 @@ def main():
                   'After an uncertain result inspect the journal; equal-target replays are refused.', file=sys.stderr)
             sys.exit(1)
         return
-    if args.cmd in ('intake', 'handoff'):
+    if args.cmd in ('intake', 'intakes', 'handoff'):
         try:
             print(json.dumps(intake.execute(args), indent=2, ensure_ascii=True))
         except Exception as exc:

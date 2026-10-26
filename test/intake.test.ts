@@ -458,6 +458,19 @@ describe('private durable intake HTTP/SQLite', () => {
     expect((await call('/tasks/' + unscoped.id + '/assign', { key: 'no-launch', expected_version: 1,
       session: { workspace: 'demo' }, provenance: source }, plain.token)).status).toBe(403);
   });
+  it('forgotten projection includes only authorized open tasks and records scheduled coverage separately', async () => {
+    const {task}=await create();
+    await inDO(stub(), (h:any)=> {
+      const row=h.sql.exec('SELECT data FROM intake_tasks WHERE id=?',task.id).one();
+      const t=JSON.parse(row.data);t.created_at=Date.now()-10800000;
+      h.sql.exec('UPDATE intake_tasks SET data=? WHERE id=?',JSON.stringify(t),t.id);
+    });
+    const data=await ok('/forgotten?project=demo');
+    expect(data.items.some((t:any)=>t.id===task.id)).toBe(true);
+    expect(data.items.find((t:any)=>t.id===task.id)).toMatchObject({reason:'no_live_session_over_two_hours',last_session:null});
+    expect(data.watchdog).toHaveProperty('last_checked_at');
+    const other=await ok('/forgotten?project=other');expect(other.forgotten_count).toBe(0);
+  });
   it('carries session.parent_id to canonical session service, preserving lineage, idempotency, and failure boundaries', async () => {
     const parentTask = (await create()).task;
     const parentRes = await SELF.fetch('https://hub.test/api/sessions', {

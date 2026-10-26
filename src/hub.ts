@@ -1,3 +1,4 @@
+import { IntakeWatchdog } from './intake-watchdog';
 import { IntakeService } from './intake';
 import { UI_HEADERS, tokenPage, authFailure, deviceEntry, deviceReview, deviceReviewHuman, deviceResult } from './ui-pages';
 import { DurableObject } from "cloudflare:workers";
@@ -108,6 +109,7 @@ export class Hub extends DurableObject {
   env: Env;
   jwksCache: JwksCache = new JwksCache();
   public intakeService: IntakeService;
+  public intakeWatchdog: IntakeWatchdog;
   public busService: BusService;
   public jobsService: JobsService;
   public quotaStore: QuotaStore;
@@ -135,6 +137,10 @@ export class Hub extends DurableObject {
     // The closure resolves sessionControlService at call time (it is
     // constructed just below); intake records only the returned real id.
     this.intakeService = new IntakeService(this.sql, fn => this.ctx.storage.transactionSync(fn), {
+      forgotten: tasks => {
+        const items = this.intakeWatchdog.project(tasks).filter(t => t.forgotten);
+        return { items, forgotten_count: items.length, observed_at: Date.now(), watchdog: this.intakeWatchdog.status() };
+      },
       startSession: async (input, auth) => {
         const res = await this.sessionControlService.handle(
           new Request('https://hub.internal/api/sessions', { method: 'POST', body: JSON.stringify(input) }), auth);
@@ -182,6 +188,20 @@ export class Hub extends DurableObject {
     }
     this.livenessService = new LivenessService(this.sql, thresholdsFrom(env));
     this.livenessService.init();
+    this.intakeWatchdog = new IntakeWatchdog(this.sql, this.intakeService, fn => this.ctx.storage.transactionSync(fn), {
+      start: async input => {
+        const r = await this.sessionControlService.handle(new Request('https://hub.internal/api/sessions',
+          { method: 'POST', body: JSON.stringify(input) }),
+          { caller: { isAdmin: true, actor: 'hub:service:intake-watchdog', kind: 'human' }, scopes: ['admin'] });
+        return { status: r.status, body: await r.json() as any };
+      },
+      notify: async (kind, subject, detail) => {
+        const alert = this.livenessService.setAlert(kind, subject, detail === null ? null : { state: 'attention', detail });
+        if (alert) await this.notifyAlert(alert);
+        return !!alert;
+      },
+    });
+    this.intakeWatchdog.init();
     this.livenessService.setPressureProjection(() => placementPressureSubjects(this.sql, this.fleetService, Date.now()));
     this.checksService = new ChecksService(this.sql);
     this.checksService.init();
@@ -1336,7 +1356,7 @@ export class Hub extends DurableObject {
           }
         }
 
-        const res = await this.scheduledTick(slotOverride);
+        const res = await this.scheduledTick(slotOverride, 'manual');
         if (res.status === 'refused' || res.status === 'rejected') {
           return Response.json(res, { status: 400 });
         }
@@ -1713,7 +1733,7 @@ export class Hub extends DurableObject {
     return results;
   }
 
-  async scheduledTick(slotOverride?: string) {
+  async scheduledTick(slotOverride?: string, source = 'scheduled') {
     const now = (this.jobsService as any).now ? (this.jobsService as any).now() : new Date();
     // 1. Bus retention cleanup
     const cleanup = this.busService.retentionCleanup(now.getTime(), 100);
@@ -1768,6 +1788,7 @@ export class Hub extends DurableObject {
       return { status: 'refused', reason: 'future_slot_refused', slot: slotDate.toISOString() };
     }
 
+    const intakeWatchdog = await this.intakeWatchdog.tick(source);
     const slotStartIso = slotDate.toISOString();
     const tickResult = this.jobsService.tickRootSlot(slotStartIso);
 
@@ -1786,7 +1807,7 @@ export class Hub extends DurableObject {
       }
     }
 
-    return { status: 'ok', retention: cleanup, tick: tickResult };
+    return { status: 'ok', retention: cleanup, tick: tickResult, intake_watchdog: intakeWatchdog };
   }
 
   async sampleHostHistory() {

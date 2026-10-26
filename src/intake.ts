@@ -12,7 +12,7 @@ type Tx = <T>(fn: () => T) => T;
  * creates the Hub session through the canonical session-control service with
  * the caller's own auth, so placement is never duplicated and session
  * identities are never invented here. Absent outside the Hub composition. */
-export type IntakeHooks = { startSession?: (input: Obj, auth: Auth) => Promise<{ status: number; body: any }> };
+export type IntakeHooks = { forgotten?: (tasks: Obj[]) => Obj; startSession?: (input: Obj, auth: Auth) => Promise<{ status: number; body: any }> };
 /** Soft intake capacity (t1038u): no hard 507 refuse on task row count for create.
  * `tasks` remains only as a schema safety-net ceiling (very high). Open (non-terminal)
  * count > OPEN_INTAKE_WARN_THRESHOLD emits a warning requiring DONE evidence before close. */
@@ -520,6 +520,11 @@ export class IntakeService {
         actor: actorParam,
         ...(familyParam ? { family_id: familyParam.trim() } : {}),
       };
+    }
+    if (path === '/forgotten') {
+      if (!this.hooks.forgotten) fail('watchdog_unavailable', 503);
+      const project = url.searchParams.get('project');
+      return this.hooks.forgotten(this.statusAuthorizedTasks(p).filter(t => !project || t.project === project));
     }
     if (path === '/rules') {
       this.operator(p); return { snapshot_version: revision, operator_rules: this.rows('rules'), data_notice: DATA_NOTICE };

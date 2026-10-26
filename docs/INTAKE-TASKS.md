@@ -363,3 +363,13 @@ close, cancel, archive, reopen and any direct SQL deletion, independently of tas
 rows. Deleted-row lookup is operator-only; live-task audit follows task grants.
 Direct SQL deletion attribution is `hub:sql` because SQLite cannot identify its
 caller; no product deletion endpoint exists. Never delete intakes.
+
+## Forgotten intakes and daily digest
+
+The Hub's existing 30-minute schedule checks open intakes. No linked live session for more than two hours, or only failed linked sessions, flags the intake. Fresh native work claims and queued/held/starting/running canonical intents suppress duplicate restarts. Unknown host observations remain unknown and cannot authorize a second worker. Notes do not reset the no-live timer.
+
+`hub intake forgotten` and `hub intakes forgotten` return authorized id/title/age/last-session/state/reason and durable restart state; `--project` filters the result. REST: `GET /api/intake/forgotten`; MCP: `intake_forgotten`. The overview shows the authorized forgotten count. The response includes the last watchdog execution timestamp/source separately from the current readonly projection time.
+
+Restarts use canonical Codex interactive `with_goal` admission, retaining configured workspace and existing edit authority where available. Missing AC, unresolved scope, missing workspace configuration, unsupported goal routes, or unavailable concurrency leave a visible queued/held intent. The watchdog never creates an operator scope decision. Canonical idempotency keys survive lost replies. At most eight oldest-unchecked candidates are attempted each tick. Restart attempts/results and notifications are recorded in the append-only intake audit.
+
+A nonzero count sustained for more than 24 hours opens the existing liveness alert path. Each UTC day the same path receives a complete digest grouped by <1d, 1–3d, 3–7d, >7d and marking forgotten intakes. Large digests split into bounded messages without dropping tasks. Existing `HUB_ALERT_TO` inbox targets and optional `HUB_ALERT_WEBHOOK` handle delivery and retry. Routing to inbox/webhook is not proof of email receipt; email transport and received-digest evidence must be verified separately.

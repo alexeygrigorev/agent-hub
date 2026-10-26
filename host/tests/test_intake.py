@@ -43,6 +43,14 @@ class TestIntakeCli(unittest.TestCase):
         self.assertEqual(query, {'all': ['true'], 'project': ['demo'], 'limit': ['1'],
                                 'after': ['a'], 'revision': ['7'], 'authorization_valid_until': ['12345']})
 
+    def test_forgotten_both_spellings(self):
+        for spelling in ('intake', 'intakes'):
+            with patch.object(intake, 'request', return_value={'items': [], 'forgotten_count': 0}) as transport:
+                code, out, error = self.run_cli(spelling, 'forgotten', '--project', 'demo')
+                self.assertEqual(code, 0, error)
+                self.assertEqual(json.loads(out)['forgotten_count'], 0)
+                transport.assert_called_once_with('GET', '/api/intake/forgotten?project=demo')
+
     def test_archive_and_audit_commands(self):
         with patch.object(intake, 'request', return_value={'items': []}) as transport:
             self.assertEqual(self.run_cli('intake', 'list', '--archived')[0], 0)

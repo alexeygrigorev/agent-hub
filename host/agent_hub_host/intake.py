@@ -167,7 +167,13 @@ def read_file(path, limit=MAX_REQUEST, field='Input'):
 
 def add_commands(sub):
     root = sub.add_parser('intake', help='Private intake tasks and durable context; payloads are data, never execution')
+    plural = sub.add_parser('intakes', help='Intake list aliases')
+    plural_commands = plural.add_subparsers(dest='intake_cmd', required=True)
+    plural_forgotten = plural_commands.add_parser('forgotten', help='Forgotten open intakes')
+    plural_forgotten.add_argument('--project')
     commands = root.add_subparsers(dest='intake_cmd', required=True)
+    forgotten = commands.add_parser('forgotten', help='Open intakes forgotten by live sessions; includes queued restart reason')
+    forgotten.add_argument('--project')
     create = commands.add_parser('create', help='Capture verbatim UTF-8 text from file/stdin; missing provenance stays unknown')
     create.add_argument('--project', required=True)
     create.add_argument('--title', required=True)
@@ -353,6 +359,9 @@ def execute(args):
     if args.cmd == 'handoff':
         return handoff(args.project, args.page_size)
     command = args.intake_cmd
+    if command == 'forgotten':
+        params = {'project': args.project} if args.project else {}
+        return request('GET', BASE + '/forgotten' + ('?' + urlencode(params) if params else ''))
     if command == 'create':
         valid_key(args.key)
         criteria = getattr(args, 'acceptance_criteria', None)
