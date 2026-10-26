@@ -8,7 +8,8 @@ def get_hostname() -> str:
     return socket.gethostname()
 
 def get_os() -> str:
-    return platform.system()
+    name = platform.system()
+    return "windows" if name == "Windows" else name
 
 def _normalize_arch(value) -> str | None:
     if not isinstance(value, str) or not value:
@@ -30,7 +31,7 @@ def get_arch() -> str:
     latter first, then PROCESSOR_ARCHITECTURE, then platform.machine().
     Returns "unknown" when nothing normalizes.
     """
-    for key in ("PROCESSOR_ARCHITEW6432", "PROCESSOR_ARCHITECTURE"):
+    for key in (("PROCESSOR_ARCHITEW6432", "PROCESSOR_ARCHITECTURE") if platform.system() == "Windows" else ()):
         try:
             norm = _normalize_arch(os.environ.get(key, ""))
             if norm:

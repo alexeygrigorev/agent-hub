@@ -66,6 +66,14 @@ describe('session needs routing (Tabo AC4)', () => {
     expect(rejected).toContainEqual(expect.objectContaining({ reason: 'needs_unmet' }));
   }));
 
+  it('does not route on expired operator capability labels', async () => fixture(async (service, sql) => {
+    sql.exec(`INSERT OR REPLACE INTO routing_machines (machine_id, needs_json, max_agents, observed_at, runners_json) VALUES ('tabo', ?, 2, ?, ?)`,
+      JSON.stringify(['dotnet:10']), iso(-3600000), JSON.stringify([]));
+    const plan = service.plan(intent({ needs: ['dotnet:10'] }));
+    expect(plan.selected).toBeNull();
+    expect(plan.rejected).toContainEqual(expect.objectContaining({ machine: 'tabo', reason: 'needs_unmet' }));
+  }));
+
   it('matches synthesized arch labels and operator routing needs', async () => fixture(async (service, sql) => {
     sql.exec(`INSERT OR REPLACE INTO routing_machines (machine_id, needs_json, max_agents, observed_at, runners_json) VALUES ('tabo', ?, 2, ?, ?)`,
       JSON.stringify(['os:windows', 'arch:arm64', 'dotnet:10']), iso(), JSON.stringify([]));

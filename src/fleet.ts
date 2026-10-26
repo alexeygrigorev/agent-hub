@@ -678,7 +678,7 @@ export class FleetService {
     { error?: undefined; request: any; selected: any; candidates: any[]; rejected: { machine: string; engine: string; reason: string; memory?: any }[] } {
     if (!object(input, ['mode', 'machine', 'engine', 'engine_override_reason', 'tier', 'account', 'workspace', 'cwd', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access', 'approved_action', 'with_goal', 'task_kind', 'project', 'needs']) ||
       (input.project !== undefined && (typeof input.project !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.project))) ||
-      (input.needs !== undefined && input.needs !== null && (!Array.isArray(input.needs) || input.needs.length > 64 || input.needs.some((n: any) => typeof n !== 'string' || !NEEDS_LABEL.test(n)) || new Set(input.needs).size !== input.needs.length)) ||
+      (input.needs !== undefined && (!Array.isArray(input.needs) || input.needs.length > 64 || input.needs.some((n: any) => typeof n !== 'string' || !NEEDS_LABEL.test(n)) || new Set(input.needs).size !== input.needs.length)) ||
       (input.task_kind !== undefined && !['implement','review','ask','goal'].includes(input.task_kind)) ||
       !workspaceOk(input.workspace) || (input.mode !== undefined && !['headless', 'interactive'].includes(input.mode)) ||
       (input.account !== undefined && !label(input.account)) || (input.machine !== undefined && !isValidMachineId(input.machine)) || (input.engine !== undefined && !label(input.engine)) ||
@@ -774,8 +774,8 @@ export class FleetService {
       if (needs.length) {
         let routingNeeds: unknown = [];
         try {
-          const rn: any = this.sql.exec('SELECT needs_json FROM routing_machines WHERE machine_id = ?', route.machine_id).toArray()[0];
-          if (rn) routingNeeds = JSON.parse(rn.needs_json);
+          const rn: any = this.sql.exec('SELECT needs_json, observed_at FROM routing_machines WHERE machine_id = ?', route.machine_id).toArray()[0];
+          if (rn && fresh(rn.observed_at, this.now(), 180000)) routingNeeds = JSON.parse(rn.needs_json);
         } catch { routingNeeds = []; }
         const labels = new Set<string>(Array.isArray(routingNeeds) ? (routingNeeds as unknown[]).filter((n): n is string => typeof n === 'string') : []);
         if (typeof machine?.os === 'string' && machine.os.trim()) labels.add('os:' + machine.os.trim().toLowerCase());

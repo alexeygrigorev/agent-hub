@@ -984,6 +984,10 @@ def _confirm_workload_exit(before: NativeSession) -> tuple[bool, str]:
     is unproven (unknown/unsupported oracle stays uncertain/held, never false
     stopped).
     """
+    if os.name == "nt":
+        # os.kill(pid, 0) is not a safe Windows liveness oracle. The native
+        # runtime owns the entire Job Object and supplies its empty witness.
+        return (True, "catalog reports containment empty after kill") if before.containment_empty is True else (False, "Windows Job Object containment is unproven")
     cgroup_gone = _workload_containment_gone(before.workload_cgroup)
     if cgroup_gone is False:
         return False, "workload cgroup still present after kill"

@@ -215,11 +215,11 @@ $TaskName = 'AgentHubSessionHost'
 $runner = "$env:LOCALAPPDATA\agent-hub\run-session-host.ps1"  # wrapper loop, restart 15s
 $psExe = (Get-Command powershell.exe).Source
 $action = New-ScheduledTaskAction -Execute $psExe -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`""
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+$trigger = @(New-ScheduledTaskTrigger -AtStartup; New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME")
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
   -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) `
   -MultipleInstances IgnoreNew -WakeToRun
-$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force
 Start-ScheduledTask -TaskName $TaskName
 ```
@@ -229,8 +229,12 @@ Wrapper loop (`run-session-host.ps1`): `while ($true)` runs
 %APPDATA%\agent-hub\subscriptions.json --credential-config
 %APPDATA%\agent-hub\host.json --journal-dir %LOCALAPPDATA%\agent-hub\journal`,
 appending to `%LOCALAPPDATA%\agent-hub\logs\session-host-YYYYMMDD.log`,
-restart 15 s. Interactive (logged-on) principal on purpose: on-device UI
-testing needs the user's desktop. Hosts poll outbound, so no inbound port is
+restart 15 s. The S4U principal keeps background heartbeats running while logged out, without
+storing a password. Register the startup trigger in an elevated PowerShell for
+the same Windows user. S4U tasks have no interactive desktop: desktop testing
+requires a separate logged-on interactive session and must remain PENDING-HUMAN
+until proven on Tabo. Verify HTTPS and engine access in this task context; S4U
+does not provide integrated network authentication or access to EFS files. Hosts poll outbound, so no inbound port is
 needed. Logs: `%LOCALAPPDATA%\agent-hub\logs\`. Rollback:
 `Unregister-ScheduledTask AgentHubSessionHost` (revoke the machine in the Hub
 UI, then delete `%APPDATA%\agent-hub\host.json` only after the revoke).
