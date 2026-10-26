@@ -43,7 +43,10 @@ export class IntakeWatchdog {
       const ids = new Set((t.history || []).map((e: Obj) => e.hub_session_id).filter(Boolean));
       const linked = sessions.filter(s => ids.has(s.id) || parse(s.request_json).intake_task_id === t.id)
         .sort((a, b) => ms(b.created_at) - ms(a.created_at));
-      let live = false, unknown = false;
+      let live = false;
+      // A retained intake link outliving its canonical row is missing evidence,
+      // never proof that its native worker died in another workspace.
+      let unknown = [...ids].some(id => !sessions.some(s => s.id === id));
       let lastEnd = ms(t.created_at);
       for (const c of claims.filter(c => c.work_key === 'task:' + t.id && c.claim_source === 'native')) {
         const actor = parseNativeActor(c.holder);
@@ -166,7 +169,7 @@ export class IntakeWatchdog {
     const since = forgotten.length ? (meta.nonzero_since ?? now) : null;
     this.sql.exec('UPDATE intake_watchdog_meta SET nonzero_since=? WHERE id=1', since);
     if (this.hooks.notify) {
-      const detail = since !== null && now - since > DAY ? `${forgotten.length} forgotten intakes for >24h. Review hub intake forgotten or https://hub.dtcdev.click/. First IDs: ` + forgotten.slice(0, 20).map(t => t.id).join(', ') : null;
+      const detail = since !== null && now - since > DAY ? `${forgotten.length} forgotten intakes for >24h. Review hub intake forgotten or https://hub.dtcdev.click/. First IDs: ` + forgotten.slice(0, 20).map(t => `${t.id} ${Math.floor(t.age_ms / 3600000)}h ${t.restart?.reason || t.reason}`).join('; ') : null;
       const opened = await this.hooks.notify('intake_watchdog', 'forgotten-over-24h', detail);
       if (detail && opened !== false) for (const item of forgotten) this.audit(tasks.find(t => t.id === item.id)!, 'forgotten_alert', 'sustained forgotten count >0 for >24h; routed to existing alerts', now);
       const day = new Date(now).toISOString().slice(0, 10);
@@ -179,12 +182,13 @@ export class IntakeWatchdog {
           if (tail >= 0 && chunks[tail].length + line.length + 1 <= 1800) chunks[tail] += '\n' + line;
           else if (line.length <= 1800) chunks.push(line);
           else { // titles are data; bound individual lines without dropping their id
-            for (let offset = 0; offset < line.length; offset += 1800) chunks.push(line.slice(offset, offset + 1800));
+            const points = Array.from(line);
+            for (let offset = 0; offset < points.length; offset += 1800) chunks.push(points.slice(offset, offset + 1800).join(''));
           }
         }
         for (let i = 0; i < chunks.length; i++) await this.hooks.notify('intake_digest', day + '-part-' + (i + 1), chunks[i]);
         this.sql.exec('UPDATE intake_watchdog_meta SET digest_day=? WHERE id=1', day);
-        for (const t of tasks.filter(t => OPEN.has(t.status))) this.audit(t, 'daily_digest', 'daily open intake digest ' + day + ' routed to existing alerts', now);
+        for (const t of tasks.filter(t => OPEN.has(t.status))) this.audit(t, 'daily_digest', 'daily open intake digest ' + day + ' recorded in existing alerts for delivery/retry; receipt not confirmed', now);
       }
     }
     const ordered = [...forgotten].sort((a, b) => {

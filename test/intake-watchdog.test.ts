@@ -51,6 +51,11 @@ describe('forgotten intake watchdog', () => {
     h.sql.exec("DELETE FROM fleet_sessions WHERE native_id='manual-native'");
     expect(w.project([t])[0]).toMatchObject({forgotten:false,state:'unknown'});
   }));
+  it('holds unknown when retained intake links outlive their canonical session rows', async () => fixture(h => {
+    const t=task();t.history=[{kind:'link',hub_session_id:'missing-canonical-session'}];
+    const w=new IntakeWatchdog(h.sql,h.intakeService,(f:any)=>f(),{},()=>NOW);w.init();
+    expect(w.project([t])[0]).toMatchObject({forgotten:false,state:'unknown',reason:'host_observation_unknown'});
+  }));
   it('does not interpret an unreachable bound worker as dead', async () => fixture(h => {
     const t=task();session(h,'bound',t,'running',{machine:'fixture',binding:{native_id:'native'}});
     const w=new IntakeWatchdog(h.sql,h.intakeService,(f:any)=>f(),{},()=>NOW);w.init();expect(w.project([t])[0]).toMatchObject({forgotten:false,state:'unknown'});
