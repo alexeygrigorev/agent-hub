@@ -315,11 +315,14 @@ def do_import(agents, url, token):
         sys.exit(1)
 
     opener = urllib.request.build_opener(NoRedirectHandler())
+    # Cloudflare error 1010 blocks Python's default User-Agent; identify explicitly.
+    opener.addheaders = [('User-Agent', 'agent-hub-host/1')]
     urllib.request.install_opener(opener)
 
     req = urllib.request.Request(url, method="POST")
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", "agent-hub-host/1")
     
     data = json.dumps({"agents": agents}).encode("utf-8")
     if len(data) > 1024 * 1024:

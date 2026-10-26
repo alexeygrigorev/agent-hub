@@ -181,26 +181,57 @@ jobs:
           PYDEV
           npx wrangler deploy --config .local/dev-wrangler.json --tag "$(git rev-parse --short=12 HEAD)" --message "source_commit=$(git rev-parse HEAD)"
           python3 - <<'PYDEV'
-          import json, os, time, urllib.error, urllib.request
+          import json, os, re, time, urllib.error, urllib.request
           base = 'https://agent-hub-dev.cloudflare-ai-agent-de9ca0.workers.dev'
-          def probe(path):
-              request = urllib.request.Request(base + path, headers={'User-Agent': 'AgentHub-Release-Smoke/1.0'})
-              return urllib.request.urlopen(request, timeout=15)
+          sha = os.environ['GITHUB_SHA']
+          # Cloudflare error 1010 blocks Python's default "Python-urllib/x.y"
+          # User-Agent before the Worker runs, so every smoke request must
+          # identify itself explicitly.
+          SMOKE_UA = 'agent-hub-ci/' + sha
+          # Case-insensitive: edge HTML wording may vary ("error code: 1010").
+          EDGE_1010 = re.compile(rb'error\s*code:?\s*1010', re.IGNORECASE)
+
+          def get(path, timeout=15):
+              req = urllib.request.Request(
+                  base + path,
+                  headers={'User-Agent': SMOKE_UA, 'Accept': 'application/json'},
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as response:
+                      return response.status, response.read()
+              except urllib.error.HTTPError as error:
+                  try:
+                      body = error.read(8192)
+                  except Exception:
+                      body = b''
+                  if EDGE_1010.search(body):
+                      raise RuntimeError(
+                          'Cloudflare edge block (error 1010) at %s: the request was '
+                          'rejected before the worker ran, so HTTP %s is NOT a worker '
+                          'auth response. Check the smoke User-Agent.' % (path, error.code)
+                      ) from None
+                  return error.code, body
+
           for attempt in range(6):
               try:
-                  with probe('/livez') as response:
-                      assert response.status == 200
-                      assert json.load(response) == {'status': 'ok', 'component': 'hub-worker'}
-                  with probe('/cli/manifest.json?source=' + os.environ['GITHUB_SHA']) as response:
-                      assert json.load(response)['built_from_commit'] == os.environ['GITHUB_SHA']
+                  status, body = get('/livez')
+                  assert status == 200, status
+                  assert json.loads(body) == {'status': 'ok', 'component': 'hub-worker'}
+                  status, body = get('/cli/manifest.json?source=' + sha)
+                  assert status == 200, status
+                  assert json.loads(body)['built_from_commit'] == sha
+                  status, body = get('/api/sessions')
+                  assert status in (401, 403), status
+                  # A Cloudflare 1010 edge block raises above; still require the
+                  # worker's own JSON auth body so an HTML edge page can never
+                  # be accepted as the auth 403.
                   try:
-                      probe('/api/sessions')
-                  except urllib.error.HTTPError as error:
-                      assert error.code in (401, 403), error.code
-                  else:
-                      raise RuntimeError('dev sessions must require authentication')
+                      payload = json.loads(body)
+                  except Exception:
+                      raise AssertionError('sessions auth response is not worker JSON')
+                  assert isinstance(payload, dict) and 'error' in payload, payload
                   break
-              except (AssertionError, OSError):
+              except (AssertionError, OSError, ValueError, KeyError):
                   if attempt == 5:
                       raise
                   time.sleep(5)
@@ -223,3 +254,63 @@ jobs:
             echo "Deployment succeeded. Current active versions:"
             npx wrangler versions list
           fi
+
+      - name: Verify production Hub health
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+        run: |
+          python3 - <<'PYPROD'
+          import json, os, re, time, urllib.error, urllib.request
+          base = 'https://agent-hub.cloudflare-ai-agent-de9ca0.workers.dev'
+          sha = os.environ['GITHUB_SHA']
+          # Same Cloudflare error-1010 rule as the dev smoke: never use the
+          # default Python-urllib User-Agent against workers.dev.
+          SMOKE_UA = 'agent-hub-ci/' + sha
+          # Case-insensitive: edge HTML wording may vary ("error code: 1010").
+          EDGE_1010 = re.compile(rb'error\s*code:?\s*1010', re.IGNORECASE)
+
+          def get(path, timeout=15):
+              req = urllib.request.Request(
+                  base + path,
+                  headers={'User-Agent': SMOKE_UA, 'Accept': 'application/json'},
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as response:
+                      return response.status, response.read()
+              except urllib.error.HTTPError as error:
+                  try:
+                      body = error.read(8192)
+                  except Exception:
+                      body = b''
+                  if EDGE_1010.search(body):
+                      raise RuntimeError(
+                          'Cloudflare edge block (error 1010) at %s: the request was '
+                          'rejected before the worker ran (HTTP %s). Check the smoke '
+                          'User-Agent.' % (path, error.code)
+                      ) from None
+                  return error.code, body
+
+          for attempt in range(6):
+              try:
+                  status, body = get('/livez')
+                  assert status == 200, status
+                  assert json.loads(body) == {'status': 'ok', 'component': 'hub-worker'}
+                  status, body = get('/cli/manifest.json?source=' + sha)
+                  assert status == 200, status
+                  assert json.loads(body)['built_from_commit'] == sha
+                  status, body = get('/api/sessions')
+                  assert status in (401, 403), status
+                  # A Cloudflare 1010 edge block raises above; still require the
+                  # worker's own JSON auth body so an HTML edge page can never
+                  # be accepted as the auth 403.
+                  try:
+                      payload = json.loads(body)
+                  except Exception:
+                      raise AssertionError('sessions auth response is not worker JSON')
+                  assert isinstance(payload, dict) and 'error' in payload, payload
+                  break
+              except (AssertionError, OSError, ValueError, KeyError):
+                  if attempt == 5:
+                      raise
+                  time.sleep(5)
+          print('Production Hub health smoke passed')
+          PYPROD

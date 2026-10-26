@@ -43,8 +43,10 @@ def main():
         # Reserve the path before issuing anything. No overwrite and no symlink traversal.
         destination = os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         opener = urllib.request.build_opener(NoRedirect(), urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        # Cloudflare error 1010 blocks Python's default User-Agent; identify explicitly.
+        opener.addheaders = [('User-Agent', 'agent-hub-host/1')]
         base = args.url.rstrip('/')
-        login = urllib.request.Request(base + '/auth/token', data=urllib.parse.urlencode({'token': token}).encode(), method='POST', headers={'Content-Type':'application/x-www-form-urlencoded'})
+        login = urllib.request.Request(base + '/auth/token', data=urllib.parse.urlencode({'token': token}).encode(), method='POST', headers={'Content-Type':'application/x-www-form-urlencoded', 'User-Agent': 'agent-hub-host/1'})
         try:
             response = opener.open(login, timeout=20)
             response.close()
@@ -57,7 +59,7 @@ def main():
         csrf = me.get('csrf_token')
         if me.get('authenticated') is not True or not isinstance(csrf, str):
             raise ValueError('Admin session unavailable')
-        request = urllib.request.Request(base + '/api/fleet/routing/clients/' + args.client, data=b'{}', method='POST', headers={'Content-Type':'application/json','X-CSRF-Token':csrf})
+        request = urllib.request.Request(base + '/api/fleet/routing/clients/' + args.client, data=b'{}', method='POST', headers={'Content-Type':'application/json','X-CSRF-Token':csrf, 'User-Agent': 'agent-hub-host/1'})
         with opener.open(request, timeout=20) as response:
             credential = json.loads(response.read(32768))
         value = credential.get('token')
