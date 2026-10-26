@@ -119,7 +119,7 @@ describe('TBM admission on POST /api/sessions', () => {
   it('rejects unknown and closed intake tasks', async () => {
     expect((await start({ intake_task_id: 'missing-task' })).data.error).toBe('unknown_intake_task');
     const id = await intakeTask();
-    const closed = await api('/api/intake/tasks/' + id, { key: 'tbm-close-' + ++seq, expected_version: 1, status: 'cancelled' });
+    const closed = await api('/api/intake/tasks/' + id, { key: 'tbm-close-' + ++seq, expected_version: 1, status: 'cancelled', reason: 'dropped by Alexey: synthetic admission fixture' });
     expect(closed.status, JSON.stringify(closed.data)).toBe(200);
     const r = await start({ intake_task_id: id });
     expect(r.status).toBe(409);
