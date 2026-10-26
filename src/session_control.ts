@@ -623,12 +623,15 @@ export class SessionControlService {
     const parent_source = row.parent_source || (row.parent_id ? 'explicit_parent' : 'unknown_external');
     let launchError: any = null;
     let modelSelection: any = null;
+    let expectedCpu: any = null;
     let modelReason: string | null = null;
     let memoryRejected: any[] = [];
     if (row.fleet_launch_id) {
       try {
         const launch: any = this.sql.exec('SELECT launch_error_json, model_selection_json, exit_reason, native_id FROM fleet_launches WHERE id = ?', row.fleet_launch_id).toArray()[0];
         modelSelection = parsed(launch?.model_selection_json);
+        const cpuTable=this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='resource_cpu_starts'").toArray().length;
+        if(cpuTable) expectedCpu=this.sql.exec('SELECT expected_cpu_cores,expected_cpu_source FROM resource_cpu_starts WHERE launch_id=?',row.fleet_launch_id).toArray()[0] ?? null;
         modelReason = launch?.exit_reason === 'model_unsupported' ? 'model_unsupported' : null;
         launchError = launch?.launch_error_json ? parsed(launch.launch_error_json, null) : null;
         // Rejections before claim and legacy terminal receipts have no diagnostic
@@ -667,6 +670,8 @@ export class SessionControlService {
       ...(row.mode === 'headless' && launchError?.reason === 'engine_tool_permission_refused' ? { cleanup_pending: !['failed', 'stopped'].includes(row.state) } : {}),
       machine: row.machine_id ?? null, engine: row.engine ?? null,
       model_id: modelSelection?.id ?? null, model: modelSelection?.model ?? null,
+      expected_cpu_cores:expectedCpu?.expected_cpu_cores ?? memoryRejected.find(r=>r.cpu)?.cpu?.expected_cpu_cores ?? null,
+      expected_cpu_source:expectedCpu?.expected_cpu_source ?? memoryRejected.find(r=>r.cpu)?.cpu?.expected_cpu_source ?? null,
       mode: row.mode, access: request.access?.mode || 'legacy_unspecified',
       // Friendly name from the stored start intent (null when unnamed). The
       // name is display only: control routes stay Hub-UUID addressed, with an
@@ -674,7 +679,7 @@ export class SessionControlService {
       name: typeof request.name === 'string' ? request.name : null,
       fleet_launch_id: row.fleet_launch_id ?? null,
       ...(modelReason ? { reason: modelReason } : {}),
-      ...(memoryRejected.length ? { reason: 'launcher_memory_reserve', rejected: memoryRejected } : {}),
+      ...(memoryRejected.length ? { reason: memoryRejected[0]?.reason ?? 'placement_unknown', rejected: memoryRejected } : {}),
       ...(launchError ? { reason: launchError.reason, message: launchError.message, launch_error: launchError } : {}),
       cleanup_protection: protection ? { key: protection.request_key, created_at: protection.created_at, permanent: true } : null,
       binding,

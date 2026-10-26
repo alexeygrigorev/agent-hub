@@ -363,7 +363,7 @@ function renderHostHealth(health, fleet) {
   const pressured = hosts.filter(h => h.placement && h.placement.reason);
   if (pressured.length) {
     const p = document.createElement('p');
-    p.textContent = `Host health is degraded while launches are rejected/held for memory or capacity: ${pressured.map(h => `${h.machine_id}: ${h.placement.reason}`).join(' | ')}`;
+    p.textContent = `Host health is degraded while launches are rejected or queued: ${pressured.map(h => `${h.machine_id}: ${h.placement.reason}`).join(' | ')}`;
     root.append(p);
   }
 }

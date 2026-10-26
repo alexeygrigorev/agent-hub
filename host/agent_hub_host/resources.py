@@ -180,13 +180,13 @@ def render_text(data: dict, view=None) -> str:
             if row.get("finished_at"):
                 state = "%s finished=%s" % (state, row.get("finished_at"))
             lines.append("%s project=%s engine=%s model=%s tier=%s kind=%s state=%s "
-                         "peak_rss=%s peak_pss=%s cpu=%s avg_cpu=%s runtime=%s%s" % (
+                         "peak_rss=%s peak_pss=%s cpu=%s avg_cpu=%s p95_cpu=%s runtime=%s%s" % (
                              row.get("session_id", "?"), row.get("project", "?"),
                              row.get("engine", "?"), row.get("model", "?"),
                              row.get("tier", "?"), row.get("kind", "?"), state,
                              _fmt_mb(row.get("peak_rss_mb")), _fmt_mb(row.get("peak_pss_mb")),
                              _fmt_cpu(row.get("cpu_seconds")), _fmt_avg(row.get("avg_cpu_cores")),
-                             _fmt_runtime(row.get("runtime_s")), flag))
+                             _fmt_avg(row.get("p95_cpu_cores")), _fmt_runtime(row.get("runtime_s")), flag))
         return "\n".join(lines) if lines else "No sessions reported."
     if view == "reaps":
         rows = data.get("reaps")
@@ -219,6 +219,11 @@ def render_text(data: dict, view=None) -> str:
             host.get("machine_id", "?"), _fmt_mb(host.get("mem_used_mb")),
             _fmt_mb(host.get("mem_total_mb")), host.get("load5", "?"),
             host.get("cores", "?"), host.get("running", "?"), host.get("queued", "?")))
+        cpu = host.get("cpu") or {}
+        lines.append("  CPU current=%s expected=%s ramping=%s limit=%s cores reason=%s source=%s" % (
+            _fmt_avg(cpu.get("current_cpu_cores")), _fmt_avg(cpu.get("expected_cpu_cores")),
+            _fmt_avg(cpu.get("ramping_cpu_cores")), _fmt_avg(cpu.get("limit_cpu_cores")),
+            cpu.get("reason") or "admitted", cpu.get("expected_cpu_source", "unknown")))
     stats = data.get("stats") if isinstance(data.get("stats"), list) else []
     for group in stats[:20]:
         if not isinstance(group, dict):

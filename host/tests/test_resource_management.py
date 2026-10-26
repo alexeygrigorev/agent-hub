@@ -790,7 +790,9 @@ class CgroupScopeTests(unittest.TestCase):
             row = {"workload_cgroup": str(cg), "worker_pid": None,
                    "workload_pid": None, "created_at_ms": 0}
             with patch.object(rm, "_cgroup_path", return_value=str(cg)):
-                self.assertIsNone(rm.sample_session_tree(row, 180_000_000, proc_root=tmp))
+                sampled = rm.sample_session_tree(row, 180_000_000, proc_root=tmp)
+                self.assertIsNone(sampled["rss_mb"])
+                self.assertEqual(sampled["cpu_seconds"], 1.0)
 
 
 class PeakTests(unittest.TestCase):

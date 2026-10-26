@@ -1874,10 +1874,20 @@ export class MonitoringService {
     const machinePressure = machineFailures > 0;
     const globalPressure = pressure.queuedTotal > 0 || pressure.recentRejects > 0 || pressure.failedTotal > 0;
     const bits: string[] = [];
-    if (pressure.queuedTotal > 0) bits.push(`${pressure.queuedTotal} launch(es) held queued for memory/capacity (${pressure.queuedHeld} >5 min)`);
-    if (pressure.recentRejects > 0) bits.push(`${pressure.recentRejects} launch rejection(s) for memory/capacity in 24h`);
-    if (machineFailures > 0) bits.push(`${machineFailures} terminal failure(s) for memory/capacity on this host in 24h`);
-    else if (pressure.failedTotal > 0) bits.push(`${pressure.failedTotal} terminal failure(s) for memory/capacity elsewhere in 24h`);
+    // Show the actual current route reasons, including CPU budget numbers.
+    try {
+      const holds=this.sql.exec(`SELECT h.rejected_json FROM fleet_memory_holds h JOIN fleet_launches l ON l.id=h.launch_id WHERE l.state='queued' ORDER BY l.created_at LIMIT 20`).toArray();
+      const reasons=new Set<string>();
+      for(const h of holds) for(const r of JSON.parse(String(h.rejected_json))) {
+        const c=r.cpu;
+        reasons.add(c ? `${r.reason} (current=${c.current_cpu_cores ?? 'unknown'} expected=${c.expected_cpu_cores} ramping=${c.ramping_cpu_cores} limit=${c.limit_cpu_cores} cores)` : String(r.reason));
+      }
+      if(reasons.size) bits.push([...reasons].join(', '));
+    } catch { /* old schema: generic placement state stays truthful */ }
+    if (pressure.queuedTotal > 0) bits.push(`${pressure.queuedTotal} launch(es) held queued for placement admission (${pressure.queuedHeld} >5 min)`);
+    if (pressure.recentRejects > 0) bits.push(`${pressure.recentRejects} launch rejection(s) for placement admission in 24h`);
+    if (machineFailures > 0) bits.push(`${machineFailures} terminal failure(s) for placement admission on this host in 24h`);
+    else if (pressure.failedTotal > 0) bits.push(`${pressure.failedTotal} terminal failure(s) for placement admission elsewhere in 24h`);
     return { machine_pressure: machinePressure, global_pressure: globalPressure, reason: bits.length ? bits.join('; ') : null };
   }
 

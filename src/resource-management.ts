@@ -3,6 +3,7 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import defaults from '../config/resource-management.json';
 import { IntakeService } from './intake';
 import { policy } from './model-routing';
+import { cpuVerdict } from './cpu-headroom';
 export const MEMORY_FLOOR_MB = defaults.memory_floor_mb;
 export const NEXT_SLOT_MB = defaults.ramp_reserve_default_mb;
 export const CPU_LOAD_FACTOR = defaults.cpu_load_factor;
@@ -12,6 +13,10 @@ const finite = (n: any) => typeof n === 'number' && Number.isFinite(n) && n >= 0
 const TERMINAL = new Set(['exited', 'finished', 'failed', 'stopped', 'dead', 'refused']);
 export const RESOURCE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS resource_resident_samples (launch_id TEXT PRIMARY KEY, resident_mb REAL NOT NULL, observed_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS resource_cpu_samples (launch_id TEXT PRIMARY KEY, current_cpu_cores REAL NOT NULL, observed_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS resource_cpu_starts (launch_id TEXT PRIMARY KEY, expected_cpu_cores REAL NOT NULL, expected_cpu_source TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_cpu_usage (session_id TEXT PRIMARY KEY, p95_cpu_cores REAL, observed_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_resource_metadata (session_id TEXT PRIMARY KEY, workspace TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_ramps (launch_id TEXT PRIMARY KEY, started_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_settings (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_resource_usage (
@@ -35,11 +40,12 @@ export function resourceConfig(value: any = {}): ResourceConfig {
     memory_floor_mb: [128, 1048576], ramp_reserve_default_mb: [64, 65536], estimate_percentile: [50,100],
     estimate_multiplier: [1,4], ramp_seconds: [30,900], cpu_load_factor: [.5,4],
     watchdog_interval_s: [300,600], idle_minutes: [10,10080], rss_flag_gb: [.125,1024],
+    cpu_target_utilization:[.1,1],cpu_default_cores:[.05,128],cpu_estimate_multiplier:[1,4],cpu_psi_hard_cap_pct:[1,100],
   };
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_resource_config');
   for (const [k,v] of Object.entries(value)) {
     if (!bounds[k] || !finite(v) || (v as number) < bounds[k][0] || (v as number) > bounds[k][1]) throw new Error('invalid_resource_config');
-    if (!['cpu_load_factor','estimate_multiplier','rss_flag_gb'].includes(k) && !Number.isSafeInteger(v)) throw new Error('invalid_resource_config');
+    if (!['cpu_load_factor','estimate_multiplier','rss_flag_gb','cpu_target_utilization','cpu_default_cores','cpu_estimate_multiplier','cpu_psi_hard_cap_pct'].includes(k) && !Number.isSafeInteger(v)) throw new Error('invalid_resource_config');
     (result as any)[k] = v;
   }
   return result;
@@ -64,6 +70,46 @@ export class ResourceManagement {
     const measured = percentile((specific.length ? specific : rows).map(r => Number(r.peak_rss_mb)), config.estimate_percentile);
     return Math.ceil(Math.max(64, measured === null ? config.ramp_reserve_default_mb : measured * config.estimate_multiplier));
   }
+  cpuEstimate(project: string | null, kind: string | null) {
+    const rows = this.sql.exec(`SELECT u.project,u.kind,c.p95_cpu_cores FROM session_resource_usage u
+      JOIN session_cpu_usage c ON c.session_id=u.session_id WHERE u.finished_at IS NOT NULL
+      AND c.p95_cpu_cores IS NOT NULL ORDER BY u.observed_at DESC LIMIT 500`).toArray() as any[];
+    const specific = rows.filter(r=>r.project===project && r.kind===kind);
+    const repo = rows.filter(r=>r.project===project);
+    const cohort = specific.length ? specific : repo.length ? repo : rows;
+    const config=this.config();
+    const measured=percentile(cohort.map(r=>Number(r.p95_cpu_cores)),95);
+    return {expected_cpu_cores:measured === null ? config.cpu_default_cores : measured*config.cpu_estimate_multiplier,
+      expected_cpu_source:specific.length?'repo_kind':repo.length?'repo':rows.length?'global':'default'};
+  }
+  freezeCpuStart(launch: string, estimate: {expected_cpu_cores:number,expected_cpu_source:string}) {
+    this.sql.exec('INSERT OR IGNORE INTO resource_cpu_starts VALUES(?,?,?)',launch,estimate.expected_cpu_cores,estimate.expected_cpu_source);
+  }
+  cpuStart(launch: string) {
+    return this.sql.exec('SELECT expected_cpu_cores,expected_cpu_source FROM resource_cpu_starts WHERE launch_id=?',launch).toArray()[0] ?? null;
+  }
+  cpuHeadroom(machine: string, input: any = {}, excludeLaunch?: string) {
+    const m:any=this.sql.exec('SELECT last_heartbeat,capabilities FROM machines WHERE id=?',machine).toArray()[0];
+    const hb=parse(m?.last_heartbeat),config=this.config(),cutoff=new Date(this.now()-config.ramp_seconds*1000).toISOString();
+    const estimate:any=(excludeLaunch ? this.cpuStart(excludeLaunch) : null) ?? this.cpuEstimate(input.project || input.workspace || null,input.task_kind || input.kind || 'goal');
+    const pending=this.sql.exec(`SELECT l.id,l.request_json,l.workspace FROM fleet_launches l WHERE machine_id=?
+      AND (state IN ('offered','starting','uncertain') OR (state='running' AND
+      COALESCE((SELECT started_at FROM resource_ramps WHERE launch_id=l.id),created_at)>=?))`,machine,cutoff).toArray() as any[];
+    let remaining=0;
+    for(const row of pending) {
+      if(row.id===excludeLaunch) continue;
+      const req=parse(row.request_json);
+      const committed:any=this.cpuStart(row.id) ?? this.cpuEstimate(req.project || row.workspace,req.task_kind || 'goal');
+      const current:any=this.sql.exec('SELECT current_cpu_cores,observed_at FROM resource_cpu_samples WHERE launch_id=?',row.id).toArray()[0];
+      // Credit only usage sampled no later than this host busy interval. Later CPU
+      // can have ramped after that interval and is not represented in its busy total.
+      const at=Date.parse(current?.observed_at),hostAt=Date.parse(hb.cpu_usage?.observed_at);
+      const credit=Number.isFinite(at)&&at>=this.now()-180000&&at<=hostAt&&at>=hostAt-(hb.cpu_usage?.interval_s ?? 0)*1000 ? current.current_cpu_cores : 0;
+      remaining+=Math.max(0,committed.expected_cpu_cores-credit);
+    }
+    return {...cpuVerdict(hb.cpu_usage,parse(m?.capabilities).cpu_count,estimate.expected_cpu_cores,remaining,config,this.now()),
+      expected_cpu_source:estimate.expected_cpu_source};
+  }
   headroom(machine: string, input: any = {}, engine: string | null = null) {
     const machineRow: any = this.sql.exec('SELECT last_heartbeat FROM machines WHERE id=?', machine).toArray()[0];
     const hb = parse(machineRow?.last_heartbeat); const config = this.config();
@@ -87,7 +133,7 @@ export class ResourceManagement {
     const rows = this.sql.exec(`SELECT s.*,l.request_json AS launch_request,l.state AS launch_state,l.created_at AS launch_created,
       l.finished_at AS launch_finished,l.model_selection_json,l.workspace AS launch_workspace
       FROM session_control_sessions s LEFT JOIN fleet_launches l ON l.id=s.fleet_launch_id
-      ${machine ? 'WHERE s.machine_id=?' : ''} ORDER BY s.updated_at DESC LIMIT 1000`, ...(machine ? [machine] : [])).toArray() as any[];
+      ${machine ? 'WHERE s.machine_id=?' : ''} ORDER BY CASE WHEN s.state IN ('stopped','failed','exited','finished','dead','refused','cancelled') THEN 1 ELSE 0 END,s.updated_at DESC LIMIT 1000`, ...(machine ? [machine] : [])).toArray() as any[];
     return rows.flatMap(s => {
       const binding = parse(s.binding_json); if (!binding.native_id || !binding.workspace || !binding.tag) return [];
       const req = parse(s.request_json), launch = parse(s.launch_request), model = parse(s.model_selection_json);
@@ -105,7 +151,7 @@ export class ResourceManagement {
         tier:req.tier || launch.tier || (s.fleet_launch_id ? policy.default_tier : null), kind:req.task_kind || launch.task_kind || 'goal',
         state:TERMINAL.has(s.state) ? s.state : s.launch_state || s.state, keep:protection || req.keep === true || launch.keep === true,
         managed:!!s.fleet_launch_id && s.mode === 'headless',
-        last_activity_at:observed?.last_activity_at ?? null, started_at:s.launch_created || s.created_at,
+        last_activity_at:observed?.last_activity_at ?? null, started_at:Number.isFinite(binding.native_created_at_ms) ? new Date(binding.native_created_at_ms).toISOString() : s.launch_created || s.created_at,
         finished_at:s.launch_finished || (TERMINAL.has(s.state) ? s.updated_at : null) }];
     });
   }
@@ -137,9 +183,12 @@ export class ResourceManagement {
     for (const sample of value.samples) {
       const session = sessions.get(sample.session_id);
       if (!session || sample.native_id!==session.native_id) throw new Error('resource_binding_mismatch');
-      for (const k of ['current_rss_mb','peak_rss_mb','peak_pss_mb','cpu_seconds','runtime_s','avg_cpu_cores']) if (sample[k]!=null && (!finite(sample[k]) || sample[k]>1e12)) throw new Error('invalid_resource_sample');
+      for (const k of ['current_rss_mb','peak_rss_mb','peak_pss_mb','cpu_seconds','runtime_s','avg_cpu_cores','current_cpu_cores','p95_cpu_cores']) if (sample[k]!=null && (!finite(sample[k]) || sample[k]>1e12)) throw new Error('invalid_resource_sample');
       const at=Date.parse(sample.observed_at);
       if (!Number.isFinite(at) || at>this.now()+30000 || at<this.now()-86400000) throw new Error('invalid_resource_timestamp');
+      this.sql.exec('INSERT OR IGNORE INTO session_resource_metadata VALUES(?,?)',session.session_id,session.workspace);
+      if (session.fleet_launch_id && finite(sample.current_cpu_cores)) this.sql.exec('INSERT INTO resource_cpu_samples VALUES(?,?,?) ON CONFLICT(launch_id) DO UPDATE SET current_cpu_cores=excluded.current_cpu_cores,observed_at=excluded.observed_at WHERE excluded.observed_at>resource_cpu_samples.observed_at',session.fleet_launch_id,sample.current_cpu_cores,sample.observed_at);
+      if (finite(sample.p95_cpu_cores)) this.sql.exec('INSERT INTO session_cpu_usage VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET p95_cpu_cores=excluded.p95_cpu_cores,observed_at=excluded.observed_at WHERE excluded.observed_at>session_cpu_usage.observed_at',session.session_id,sample.p95_cpu_cores,sample.observed_at);
       if (session.fleet_launch_id && finite(sample.current_rss_mb)) this.sql.exec('INSERT INTO resource_resident_samples VALUES(?,?,?) ON CONFLICT(launch_id) DO UPDATE SET resident_mb=excluded.resident_mb,observed_at=excluded.observed_at WHERE excluded.observed_at>=resource_resident_samples.observed_at',session.fleet_launch_id,sample.current_rss_mb,sample.observed_at);
       const old: any = this.sql.exec('SELECT * FROM session_resource_usage WHERE session_id=?',session.session_id).toArray()[0];
       const max = (k:string) => finite(sample[k]) ? Math.max(old?.[k] ?? 0,sample[k]) : old?.[k] ?? null;
@@ -171,7 +220,7 @@ export class ResourceManagement {
   usage(filters: any = {}) {
     const clauses:string[]=[], args:string[]=[];
     for (const k of ['project','engine','kind']) if(filters[k]) { clauses.push(k+'=?');args.push(filters[k]); }
-    return this.sql.exec('SELECT * FROM session_resource_usage'+(clauses.length?' WHERE '+clauses.join(' AND '):'')+' ORDER BY observed_at DESC LIMIT 500',...args).toArray().map((r:any)=>({...r,rss_flagged:r.peak_rss_mb>=this.config().rss_flag_gb*1024,token_join_key:r.machine_id+':'+r.native_id}));
+    return this.sql.exec('SELECT * FROM session_resource_usage'+(clauses.length?' WHERE '+clauses.join(' AND '):'')+' ORDER BY observed_at DESC LIMIT 500',...args).toArray().map((r:any)=>({...r,workspace:this.sql.exec('SELECT workspace FROM session_resource_metadata WHERE session_id=?',r.session_id).toArray()[0]?.workspace ?? null,p95_cpu_cores:this.sql.exec('SELECT p95_cpu_cores FROM session_cpu_usage WHERE session_id=?',r.session_id).toArray()[0]?.p95_cpu_cores ?? null,rss_flagged:r.peak_rss_mb>=this.config().rss_flag_gb*1024,token_join_key:r.machine_id+':'+r.native_id}));
   }
   reaps() { return this.sql.exec('SELECT * FROM resource_reaps ORDER BY at DESC LIMIT 100').toArray(); }
   overview() {
@@ -179,7 +228,7 @@ export class ResourceManagement {
       const hb=parse(m.last_heartbeat),caps=parse(m.capabilities),headroom=this.headroom(m.id);
       return {machine_id:m.id,mem_total_mb:hb.mem_total_mb??null,
         mem_used_mb:finite(hb.mem_total_mb)&&finite(hb.mem_avail_mb)?hb.mem_total_mb-hb.mem_avail_mb:null,
-        load5:hb.load?.[1]??null,cores:caps.cpu_count??null,...headroom,host_observed_at:m.last_checkin_at,
+        load5:hb.load?.[1]??null,cores:caps.cpu_count??null,...headroom,cpu:this.cpuHeadroom(m.id),host_observed_at:m.last_checkin_at,
         running:Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_sessions WHERE machine_id=? AND phase='running'",m.id).one().n),
         queued:Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE state='queued' AND (machine_id=? OR machine_id='')",m.id).one().n)};
     });

@@ -1,3 +1,4 @@
+import {freshCpu} from './cpu-fixture';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
@@ -48,7 +49,7 @@ async function fixture(fn: (fleet: FleetService, routing: RoutingService, sql: a
       'hetzner',
       iso(),
       iso(),
-      JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() } }),
+      JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() } }),
       0,
       JSON.stringify({ engines: ['opencode', 'codex'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 })
     );
@@ -59,7 +60,7 @@ async function fixture(fn: (fleet: FleetService, routing: RoutingService, sql: a
       'desktop',
       iso(),
       iso(),
-      JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() } }),
+      JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() } }),
       0,
       JSON.stringify({ engines: ['opencode', 'codex'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 })
     );

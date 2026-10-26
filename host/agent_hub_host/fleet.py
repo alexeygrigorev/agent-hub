@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -1645,11 +1646,17 @@ class Dispatcher:
                     pass
                 elif isinstance(estimate, (int, float)) and estimate > 0 and estimate < 1_000_000:
                     payload["memory_estimate_mb"] = estimate
+                cpu_estimate = offer.get("expected_cpu_cores")
+                if type(cpu_estimate) in (int, float) and math.isfinite(cpu_estimate) and 0 <= cpu_estimate <= 65536:
+                    payload["expected_cpu_cores"] = cpu_estimate
+                    if offer.get("expected_cpu_source") in ("repo_kind", "repo", "global", "default"):
+                        payload["expected_cpu_source"] = offer["expected_cpu_source"]
                 policy = offer.get("resource_management")
                 if isinstance(policy, dict) and policy:
                     bounded = {k: policy[k] for k in (
                         "memory_floor_mb", "ramp_reserve_default_mb", "estimate_percentile",
                         "estimate_multiplier", "ramp_seconds", "cpu_load_factor",
+                        "cpu_target_utilization", "cpu_default_cores", "cpu_estimate_multiplier", "cpu_psi_hard_cap_pct",
                         "watchdog_interval_s", "idle_minutes", "rss_flag_gb") if k in policy}
                     if bounded:
                         payload["resource_management"] = bounded

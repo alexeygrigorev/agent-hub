@@ -1,3 +1,4 @@
+import {freshCpu} from './cpu-fixture';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { runInDurableObject } from 'cloudflare:test';
 import { doFetch, defaultEnv, createHelpers, loginAndGetState } from './m1-focus-setup';
@@ -451,7 +452,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     await runInDurableObject(stub, async (instance: Hub) => {
       instance.sql.exec(
         "UPDATE machines SET last_checkin_at = ?, last_heartbeat = ?, capabilities = ? WHERE id = ?",
-        isoNow(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: isoNow() } }),
+        isoNow(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(isoNow(),4), gate: { launch_allowed: true, at: isoNow() } }),
         JSON.stringify({ engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 4 }), host.machineId);
     });
     expect((await doFetch(new Request('http://example.com/api/fleet/accounts', {
@@ -528,7 +529,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     await runInDurableObject(stub, async (instance: Hub) => {
       instance.sql.exec(
         "UPDATE machines SET last_checkin_at = ?, last_heartbeat = ?, capabilities = ? WHERE id = ?",
-        isoNow(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: isoNow() } }),
+        isoNow(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(isoNow(),4), gate: { launch_allowed: true, at: isoNow() } }),
         JSON.stringify({ engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 4 }), host.machineId);
     });
     expect((await doFetch(new Request('http://example.com/api/fleet/accounts', {
@@ -610,7 +611,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     await runInDurableObject(stub, async (instance: Hub) => {
       instance.sql.exec(
         "UPDATE machines SET last_checkin_at = ?, last_heartbeat = ?, capabilities = ? WHERE id = ?",
-        isoNow(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: isoNow() } }),
+        isoNow(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(isoNow(),4), gate: { launch_allowed: true, at: isoNow() } }),
         JSON.stringify({ engines: ['grok', 'codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 4 }), host.machineId);
     });
     // A differently labelled grok account is still held: the engine decides, not the label.

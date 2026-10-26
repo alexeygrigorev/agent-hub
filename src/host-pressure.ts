@@ -14,12 +14,18 @@ export function placementPressureSubjects(sql: SqlStorage, fleet: FleetService, 
   for (const q of sql.exec("SELECT id,created_at FROM fleet_launches WHERE state='queued' AND created_at <= ? ORDER BY created_at LIMIT 128", new Date(now - 300000).toISOString()).toArray() as any[]) {
     // Memory owner already emits the exact refusal episode and numbers.
     const memoryHold = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='fleet_memory_holds'").toArray().length
-      && sql.exec('SELECT launch_id FROM fleet_memory_holds WHERE launch_id=?', q.id).toArray().length;
-    if (memoryHold) continue;
-    out.push({ kind: 'launch', id: `placement-queue:${q.id}`, state: 'stuck', detail: `Launch held queued >5 min for memory/capacity${numbers()}`, age_s: Math.max(0, Math.floor((now - Date.parse(q.created_at)) / 1000)) });
+      && sql.exec('SELECT rejected_json FROM fleet_memory_holds WHERE launch_id=?', q.id).toArray().length;
+    if (memoryHold) {
+      const row:any=sql.exec('SELECT rejected_json FROM fleet_memory_holds WHERE launch_id=?',q.id).toArray()[0];
+      let rejected:any[]=[]; try {rejected=JSON.parse(row.rejected_json);} catch {}
+      if(rejected.some(r=>r.reason==='launcher_memory_reserve')) continue;
+      out.push({kind:'launch',id:`placement-queue:${q.id}`,state:'stuck',detail:`Launch held queued >5 min: ${JSON.stringify(rejected).slice(0,3000)}`,age_s:Math.max(0,Math.floor((now-Date.parse(q.created_at))/1000))});
+      continue;
+    }
+    out.push({ kind: 'launch', id: `placement-queue:${q.id}`, state: 'stuck', detail: `Launch held queued >5 min for placement admission${numbers()}`, age_s: Math.max(0, Math.floor((now - Date.parse(q.created_at)) / 1000)) });
   }
   for (const r of sql.exec('SELECT id,created_at,detail FROM placement_rejections WHERE created_at_ms>=? ORDER BY created_at_ms LIMIT 128', now - 86400000).toArray() as any[]) {
-    out.push({ kind: 'launch', id: `placement-reject:${r.id}`, state: 'stuck', detail: `Launch rejected for memory/capacity: ${r.detail}${numbers()}` });
+    out.push({ kind: 'launch', id: `placement-reject:${r.id}`, state: 'stuck', detail: `Launch rejected for placement admission: ${r.detail}${numbers()}` });
   }
   for (const f of sql.exec("SELECT id,machine_id,exit_reason FROM fleet_launches WHERE state='failed' AND updated_at>=? AND exit_reason IN ('account_capacity','machine_capacity') LIMIT 128", new Date(now - 86400000).toISOString()).toArray() as any[]) {
     out.push({ kind:'launch',id:`placement-failed:${f.id}`,state:'stuck',machine_id:f.machine_id,detail:`Launch failed: ${f.exit_reason}${numbers()}` });

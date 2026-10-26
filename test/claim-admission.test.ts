@@ -1,3 +1,4 @@
+import {freshCpu} from './cpu-fixture';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
@@ -38,7 +39,7 @@ async function fleetFixture(fn: (f: FleetService, sql: any, bus: BusService) => 
     const sql = hub.sql;
     const bus = new BusService(sql, cb => state.storage.transactionSync(cb));
     for (const machine of ['hetzner', 'win35']) {
-      sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', machine, machine, machine, at(), at(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: at() } }), 0, JSON.stringify({ engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
+      sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', machine, machine, machine, at(), at(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(at()), gate: { launch_allowed: true, at: at() } }), 0, JSON.stringify({ engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
       sql.exec('INSERT INTO host_quota_snapshots (host_id, schema_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', machine, '1.0', at(), now, at(), now, 'ok', null, JSON.stringify({ codex: { status: 'ok', observed_at: at(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: at(86400000) } } } }));
     }
     sql.exec("INSERT INTO agents (tag, project, role, machine_id, registered_at) VALUES ('worker-1', 'projA', 'worker', 'hetzner', ?)", at());
@@ -59,7 +60,7 @@ async function routingFixture(fn: (r: RoutingService, f: FleetService, sql: any,
     const sql = hub.sql;
     const bus = new BusService(sql, cb => state.storage.transactionSync(cb));
     for (const machine of ['hetzner', 'win35']) {
-      sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?)', machine, machine, machine, at(), at(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: at() } }), JSON.stringify({ engines: ['zcodex'], fleet_modes: ['headless'], workspaces: ['tasks'], cpu_count: 8 }));
+      sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?)', machine, machine, machine, at(), at(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(at()), gate: { launch_allowed: true, at: at() } }), JSON.stringify({ engines: ['zcodex'], fleet_modes: ['headless'], workspaces: ['tasks'], cpu_count: 8 }));
     }
     expect((await f.handle(req('/api/fleet/accounts', { accounts: [{ label: 'shared-zai', provider: 'zai', max_concurrency: 3, reserve_percent: 0, enabled: true }], routes: ['hetzner', 'win35'].map(machine_id => ({ machine_id, engine: 'zcodex', account: 'shared-zai', profile: null })) }, 'PUT'), admin)).status).toBe(200);
     for (const machine of ['hetzner', 'win35']) {
@@ -532,6 +533,7 @@ describe('compatible retries and offer scanning', () => {
 
   it('retires twenty invalid unstarted offers before admitting eligible work', () => fleetFixture(async (f, sql, bus) => {
     sql.exec('UPDATE fleet_accounts SET max_concurrency = 30');
+    sql.exec("UPDATE machines SET capabilities=json_set(capabilities, '$.cpu_count', 32),last_heartbeat=json_set(last_heartbeat,'$.cpu_usage',json(?)) WHERE id='hetzner'",JSON.stringify(freshCpu(at(),32)));
     for (let i = 0; i < 20; i++) {
       const claim = bus.claim(holder.caller, 'projA', 'dir' + i, 'worker-1', 3600000);
       expect((await f.handle(req('/api/fleet/launches', intent({ machine: 'hetzner', access: editAccess(claim.id, 'dir' + i + '/file') })), holder)).status).toBe(201);
@@ -586,7 +588,7 @@ async function pairedHttp() {
   const hostCall = (path: string, data?: any, method?: string) => call(path, data, machine.access_token, method);
   expect((await hostCall('/api/machines/register', { hostname: 'test-host', os: 'linux', network: 'test', roles: [],
     capabilities: { engines: ['zcodex'], fleet_modes: ['headless'], workspaces: ['tasks'], cpu_count: 8 } })).status).toBe(200);
-  expect((await hostCall('/api/host/poll', { type: 'heartbeat', at: at(), mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: at() } })).status).toBe(200);
+  expect((await hostCall('/api/host/poll', { type: 'heartbeat', at: at(), mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(at()), gate: { launch_allowed: true, at: at() } })).status).toBe(200);
   const registry = { accounts: [{ label: 'paired-zai', provider: 'zai', max_concurrency: 2, reserve_percent: 0, enabled: true }],
     routes: [{ machine_id: machineId, engine: 'zcodex', account: 'paired-zai', profile: null }] };
   expect((await call('/api/fleet/accounts', registry, undefined, 'PUT')).status).toBe(200);

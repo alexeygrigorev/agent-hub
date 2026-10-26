@@ -1,3 +1,4 @@
+import {freshCpu} from './cpu-fixture';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
@@ -151,7 +152,7 @@ describe('fleet health visibility + machine aliasing', () => {
   }));
 
   it('records hard rejections naming memory/capacity and alerts with numbers', () => fixture(async ({ fleet, live, sql }) => {
-    machine(sql, 'm1', 'm1', now, 0, { engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }, {mem_avail_mb: 32000, disk_free_gb: 100, load: [1], gate: {launch_allowed: true, at: iso(0)}});
+    machine(sql, 'm1', 'm1', now, 0, { engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }, {mem_avail_mb: 32000, disk_free_gb: 100, load: [1], cpu_usage: freshCpu(iso(0)), gate: {launch_allowed: true, at: iso(0)}});
     machine(sql, 'm2', 'm2', now, 0, { engines: ['codex'], fleet_modes: ['headless'], workspaces: ['other'], cpu_count: 8 });
     for (const m of ['m1', 'm2']) {
       sql.exec('INSERT INTO host_quota_snapshots (host_id, schema_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', m, '1.0', iso(0), now, iso(0), now, 'ok', null,
@@ -180,7 +181,7 @@ describe('fleet health visibility + machine aliasing', () => {
   it('degrades host health while placement pressure exists and shows reservation numbers', () => fixture(async ({ monitoring, sql }) => {
     machine(sql, 'hetzner', 'hetzner', now, 0,
       { engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8, launcher_resources: true },
-      { mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso(0) }, launcher_resources: { active_mem_mb: 29000, observed_at: iso(0) } });
+      { mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso(0)), gate: { launch_allowed: true, at: iso(0) }, launcher_resources: { active_mem_mb: 29000, observed_at: iso(0) } });
     const payload = { load: { load1: 0.5, load5: 0.4, load15: 0.3 }, memory: { total_bytes: 64 * 1024 ** 3, available_bytes: 32 * 1024 ** 3, used_bytes: 32 * 1024 ** 3, percent: 50, status: 'ok' } };
     sql.exec('INSERT INTO host_health_observations (machine_id, observed_at, observed_at_ms, received_at, payload_json, reporter) VALUES (?, ?, ?, ?, ?, ?)',
       'hetzner', iso(0), now, iso(0), JSON.stringify(payload), 'host:test');

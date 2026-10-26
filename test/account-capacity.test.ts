@@ -1,3 +1,4 @@
+import {freshCpu} from './cpu-fixture';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { FleetService } from '../src/fleet';
@@ -21,7 +22,7 @@ async function fixture(fn: (service: FleetService, sql: any) => Promise<void>) {
     const service = new FleetService(hub.sql, (cb) => state.storage.transactionSync(cb), () => now);
     service.init(); const sql = hub.sql;
     for (const machine of ['hetzner', 'win35']) {
-      sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', machine, machine, machine, iso(), iso(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() } }), 0, JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));
+      sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', machine, machine, machine, iso(), iso(), JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() } }), 0, JSON.stringify({ engines: ['codex', 'claude'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 }));
       sql.exec('INSERT INTO host_quota_snapshots (host_id, schema_version, captured_at, captured_at_ms, received_at, received_at_ms, status, error, routes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', machine, '1.0', iso(), now, iso(), now, 'ok', null, JSON.stringify(Object.fromEntries(['codex', 'claude'].map(provider => [provider, { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } }]))));
     }
     await fn(service, sql);
@@ -118,7 +119,7 @@ describe('phantom account reservations', () => {
     const waiting: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
     sql.exec("UPDATE fleet_launches SET state = 'uncertain' WHERE id = ?", first.id);
     sql.exec('UPDATE fleet_launches SET created_at = ? WHERE id = ?', iso(-600001), waiting.id);
-    sql.exec('INSERT INTO fleet_memory_holds (launch_id,since,rejected_json) VALUES (?,?,?)', waiting.id, iso(-600001), JSON.stringify([{reason:'launcher_memory_reserve',memory:{reserved_mb:2000,floor_mb:10240}}]));
+    sql.exec('INSERT OR REPLACE INTO fleet_memory_holds (launch_id,since,rejected_json) VALUES (?,?,?)', waiting.id, iso(-600001), JSON.stringify([{reason:'launcher_memory_reserve',memory:{reserved_mb:2000,floor_mb:10240}}]));
     const live = new LivenessService(sql, undefined, () => now); live.init();
     live.reconcileAlerts(live.evaluate().subjects);
     const forSubject = (subject: string) => {

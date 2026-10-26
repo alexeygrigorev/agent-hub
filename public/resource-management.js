@@ -12,18 +12,18 @@
       root.replaceChildren();
       for (const host of data.hosts || []) {
         const p = document.createElement('p');
-        p.textContent = `${host.machine_id}: memory ${gib(host.mem_used_mb)} / ${gib(host.mem_total_mb)} GiB; load5 ${number(host.load5)} / ${number(host.cores)} cores; ${host.running} running, ${host.queued} queued. Floor ${gib(host.floor_mb)} GiB; starting reserve ${number(host.reserved_mb)} MiB.`;
+        p.textContent = `${host.machine_id}: memory ${gib(host.mem_used_mb)} / ${gib(host.mem_total_mb)} GiB; CPU ${number(host.cpu?.current_cpu_cores)} / ${number(host.cpu?.limit_cpu_cores)} cores target; ${host.cpu?.reason || 'CPU headroom available'}; load5 ${number(host.load5)} / ${number(host.cores)} cores; ${host.running} running, ${host.queued} queued. Floor ${gib(host.floor_mb)} GiB; starting reserve ${number(host.reserved_mb)} MiB.`;
         root.append(p);
       }
       const table = document.createElement('table');
       const header = document.createElement('tr');
-      for (const label of ['Session / engine', 'Peak RSS / PSS MiB', 'CPU seconds / average cores', 'Runtime / state']) {
+      for (const label of ['Session / engine', 'Peak RSS / PSS MiB', 'CPU seconds / average / p95 cores', 'Runtime / state']) {
         const th = document.createElement('th'); th.textContent = label; header.append(th);
       }
       table.append(header);
       for (const session of (data.sessions || []).slice(0, 12)) {
         const tr = document.createElement('tr');
-        const values = [`${session.session_id} / ${session.engine || 'unknown'}`, `${number(session.peak_rss_mb)} / ${number(session.peak_pss_mb)}${session.rss_flagged ? ' · high RSS' : ''}`, `${number(session.cpu_seconds)} / ${number(session.avg_cpu_cores)}`, `${number(session.runtime_s)}s / ${session.state}`];
+        const values = [`${session.session_id} / ${session.engine || 'unknown'}`, `${number(session.peak_rss_mb)} / ${number(session.peak_pss_mb)}${session.rss_flagged ? ' · high RSS' : ''}`, `${number(session.cpu_seconds)} / ${number(session.avg_cpu_cores)} / ${number(session.p95_cpu_cores)}`, `${number(session.runtime_s)}s / ${session.state}`];
         for (const value of values) { const td=document.createElement('td'); td.textContent=value; tr.append(td); }
         table.append(tr);
       }

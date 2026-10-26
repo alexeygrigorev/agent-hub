@@ -9,6 +9,9 @@ import time
 # Match complete known launcher refusal lines, including traceback final lines.
 # Messages are constants: suffixes, payloads, paths and credentials never survive.
 REFUSALS = {
+    'cpu_headroom': ('cpu_headroom', 'Host CPU usage plus expected session demand exceeds the CPU target.'),
+    'cpu_pressure': ('cpu_pressure', 'Host CPU pressure exceeds the safety cap.'),
+    'cpu_usage_unknown': ('cpu_usage_unknown', 'Fresh real CPU usage is unavailable.'),
     'host MemAvailable < 10GiB': ('launcher_memory_reserve', 'Host memory headroom after launcher reservations is below 10 GiB.'),
     'Host memory headroom after launcher reservations is below 10 GiB.': ('launcher_memory_reserve', 'Host memory headroom after launcher reservations is below 10 GiB.'),
     'Host MemAvailable after reservations must retain 10 GiB': ('launcher_memory_reserve', 'Host memory headroom after launcher reservations is below 10 GiB.'),

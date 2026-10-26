@@ -43,6 +43,13 @@ def _do_request(method, path, payload=None):
             headers["Authorization"] = f"Bearer {auth.get_access_token()}"
             req = urllib.request.Request(url, data=data, headers=headers, method=method)
             return safe_http_json(req)
+        if e.code == 409:
+            try:
+                body = json.loads(e.read(4097))
+            except (ValueError, OSError):
+                body = None
+            if isinstance(body, dict) and body.get('error') in {'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown'}:
+                raise ValueError(body['error']) from None
         # Never print token, credentials, native full environment or server-controlled error bodies
         raise ValueError(f"HTTP request failed with status {e.code}")
 

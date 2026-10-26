@@ -279,8 +279,11 @@ def get_heartbeat_payload(clock=None, running_jobs=None) -> dict:
             pass
         if not isinstance(mem_total_mb, int) or mem_total_mb <= 0:
             mem_total_mb = None
+    from .cpu_resources import sample_cpu_usage
+    cpu_usage = sample_cpu_usage()
     payload: dict = {
         "type": "heartbeat",
+      "cpu_usage": cpu_usage,
         "mem_avail_mb": mem_avail_mb,
         "disk_free_gb": shutil.disk_usage("/").free // (1024**3),
         "load": os.getloadavg() if hasattr(os, "getloadavg") else (0.0, 0.0, 0.0),

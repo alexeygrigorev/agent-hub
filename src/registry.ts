@@ -1,3 +1,4 @@
+import { sanitizeCpuUsage } from './cpu-headroom';
 import { SqlStorage, DurableObjectState } from "@cloudflare/workers-types";
 import { Env } from './env';
 import { verifyBearerScope } from './auth/token';
@@ -38,6 +39,7 @@ async function safeJson(req: Request): Promise<any> {
 function sanitizeHeartbeat(body: any) {
   if (!body || body.type !== 'heartbeat') return null;
   const hb: any = { type: 'heartbeat' };
+  const cpu = sanitizeCpuUsage(body.cpu_usage); if (cpu) hb.cpu_usage = cpu;
   if (typeof body.at === 'string' && body.at.length <= 64) hb.at = body.at;
   if (typeof body.mem_avail_mb === 'number' && Number.isFinite(body.mem_avail_mb)) hb.mem_avail_mb = body.mem_avail_mb;
   if (body.launcher_resources && Number.isFinite(body.launcher_resources.active_mem_mb)
@@ -74,6 +76,7 @@ const machineState = new Map<string, { lastSeenAt: number, lastPersistedAt: numb
 
 function getFingerprint(hb: any): string {
   return JSON.stringify({
+    cpu_usage: hb.cpu_usage,
     gate: hb.gate,
     launcher_resources: hb.launcher_resources,
     running_jobs: hb.running_jobs,

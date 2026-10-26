@@ -45,7 +45,7 @@ Each session gets one durable row in the Hub resource ledger
 | project / workspace, engine, model, tier, task kind (implement/review/ask/goal) | Hub launch record |
 | started_at, finished_at, runtime_s | Hub lifecycle |
 | peak_rss_mb (sampled anon high-water mark), peak_pss_mb when available | host sampler: dedicated cgroup `memory.stat anon`, or `/proc/<pid>/smaps_rollup` Anonymous/Pss summed over the exact process tree; cache-inclusive `memory.peak` is not anonymous RSS |
-| avg_cpu_cores, cpu_seconds | cgroup `cpu.stat usage_usec` / runtime |
+| avg_cpu_cores, p95_cpu_cores, cpu_seconds | Dedicated cgroup CPU counter or exact process-tree user/system + reaped-child CPU seconds; average over runtime, time-weighted p95 of sampled interval cores |
 | final state, reap reason (if any) | Hub / watchdog |
 
 The host samples every running session's cgroup on each heartbeat and sends
@@ -70,9 +70,9 @@ Placement is gated on live data, not on a fixed sum of per-session reservations.
   is below the floor, new sessions stay queued (`launcher_memory_reserve`).
   Running sessions are never killed or stopped because of memory. Swap (a
   32 GiB partition) is the cushion.
-- **CPU guard:** no new placements while the 5-minute load average is above
-  `1.5 × cores` (18 on Hetzner). Placement resumes once it drops back below.
-  The rejected reason slug is `host_cpu_load`.
+- **CPU admission:** measured busy cores plus expected new demand and startup
+  remainder must fit the configurable utilization target; CPU PSI retains a
+  separate safety cap. Load average is context only (see below).
 - Tune if it crashes: if the OOM killer fires or MemAvailable stays below the
   floor, raise the floor or the estimate multiplier one step and record that here.
 - The cgroup `MemoryMax` per worker (1500M, or 4096M for managed Codex) is a
@@ -114,7 +114,11 @@ hard-coded constants.
 | `estimate_percentile` | 90 | placement estimate |
 | `estimate_multiplier` | 1.25 | measured estimate growth allowance |
 | `ramp_seconds` | 180 | additional reserve window after starting |
-| `cpu_load_factor` | 1.5 (× cores, 5-min load) | CPU guard |
+| `cpu_load_factor` | 1.5 | Deprecated compatibility field; never gates CPU |
+| `cpu_target_utilization` | 0.9 | Real busy CPU plus startup and new-task commitments |
+| `cpu_default_cores` | 1.0 | Conservative no-history task estimate |
+| `cpu_estimate_multiplier` | 1.25 | Growth allowance over measured CPU p95 |
+| `cpu_psi_hard_cap_pct` | 50 | Independent PSI CPU some avg10 safety cap |
 | `watchdog_interval_s` | 300–600 | watchdog |
 | `idle_minutes` | 60 | watchdog |
 | `rss_flag_gb` | 4 | watchdog / overview |
@@ -126,7 +130,7 @@ owns validated defaults, runtime settings, `session_resource_usage`,
 and a measured next-session estimate. Resident session cgroup caps are not
 subtracted again. Offered/starting/uncertain launches retain a conservative
 commitment until their status resolves; recently running sessions receive credit
-for fresh measured current anonymous RSS (a previous peak cannot masquerade as current usage). The runtime CPU guard uses the configured factor.
+for fresh measured current anonymous RSS (a previous peak cannot masquerade as current usage). CPU admission uses the independently configured utilization target and PSI cap.
 
 Read-only MCP tools `resources`, `resource_sessions`, and `resource_reaps` expose the same authenticated projections. Changes to the default config file trigger CI/deployment.
 
@@ -164,3 +168,52 @@ intake linkage or inability to save evidence prevents a stop.
 - `hub resources reaps`: the watchdog log (who, when, why, MB freed, intake).
 - Hub overview: a "Resource management" section with the same utilization
   line, per-group p90 stats, flagged sessions and recent reaps.
+
+## Predictive CPU admission
+
+CPU placement (intake `6aadd6c9`) uses real CPU usage, never load average.
+The host samples `/proc/stat` over a bounded 0.2-second interval, subtracts
+idle and iowait, and avoids counting guest time twice. It also reads CPU PSI
+`some avg10`. Heartbeats carry `cpu_usage` with busy percent/cores, logical
+cores, interval, PSI and observation time. Missing, reset or stale (>180 s)
+telemetry queues with `cpu_usage_unknown`; PSI above the configured cap
+queues with `cpu_pressure`. Load average remains visible as context.
+
+For each new session, the estimator uses the 95th percentile of completed
+sessions' measured p95 cores: same repo/project and task kind, then repo,
+then global history, then the conservative default. The history is bounded to
+500 recent completed measured sessions. Unknown measurements are excluded;
+a measured zero remains valid. The multiplier applies to measured history.
+`hub sessions show` exposes `expected_cpu_cores` and `expected_cpu_source`
+(`repo_kind`, `repo`, `global`, `default`). The estimate is frozen at placement,
+preserved across configuration/history changes, and forwarded to the maintained
+launcher as part of its normal admission policy.
+
+Admission requires:
+
+```
+current busy cores + startup remaining cores + expected new cores
+    <= logical cores * cpu_target_utilization
+```
+
+Startup remaining is the sum of `max(0, frozen estimate - measured current)`
+for offered/starting/uncertain sessions and running sessions in the configured
+ramp window. Credit requires a fresh measurement aligned with the host busy
+interval; otherwise the full startup estimate stays reserved. Stable running
+sessions are already in busy CPU, and queued sessions reserve no CPU. The
+claim path rechecks this formula excluding the offer's own commitment.
+`cpu_headroom` includes current, expected, ramping and limit numbers in queued
+reasons, session views and status. The independent 2048 MiB memory floor still
+applies. Status labels name actual placement reasons instead of assuming memory.
+
+Session CPU seconds and average cores use the existing resource ledger and
+canonical native binding. The host journals a bounded lifetime histogram of
+interval cores weighted by duration; p95 uses 0.05-core upper buckets (at most
+0.05-core rounding up), with measured overflow above 1024 cores. First samples,
+counter-source changes, resets and unreadable counters do not fabricate current
+CPU usage. The histogram survives host restarts and finalization. Dedicated
+cgroups are preferred; process-tree fallback includes waited-child CPU time,
+but processes that both start and disappear entirely between polls without a
+readable parent's waited-child counter cannot be reconstructed. Unknown remains
+unknown. Reports retain workspace/project, engine/model, tier and kind metadata;
+resource overview and `hub resources sessions` show average and p95 CPU cores.

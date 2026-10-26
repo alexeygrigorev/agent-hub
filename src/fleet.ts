@@ -80,7 +80,7 @@ function disabledEngines(): Set<string> {
   return new Set<string>((((policy as any).models || []) as any[]).filter(m => m && disabled.has(m.provider)).map(m => String(m.engine)));
 }
 /** Reject reasons that mean "no free slot right now" (transient capacity). */
-const CAPACITY_REASONS = new Set(['account_capacity', 'machine_capacity', 'launcher_memory_reserve', 'host_cpu_load']);
+const CAPACITY_REASONS = new Set(['account_capacity', 'machine_capacity', 'launcher_memory_reserve', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown']);
 /** Launcher memory gate inputs, mirrored here for dashboard visibility only.
  * The placement verdict stays in plan(); this module never changes the math,
  * it only projects the same inputs (MemAvailable, reserved total, floor for
@@ -90,12 +90,15 @@ import { MEMORY_FLOOR_MB, NEXT_SLOT_MB, ResourceManagement, memoryVerdict } from
 export { MEMORY_FLOOR_MB, NEXT_SLOT_MB };
 /** Placement-pressure reasons that degrade host health and raise operator
  * alerts: any launch rejected or held for memory/capacity. */
-export const PLACEMENT_PRESSURE_REASONS = new Set(['launcher_memory_reserve', 'account_capacity', 'machine_capacity', 'host_cpu_load']);
+export const PLACEMENT_PRESSURE_REASONS = new Set(['launcher_memory_reserve', 'account_capacity', 'machine_capacity', 'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown']);
 /** Incidental per-route reasons that may accompany capacity but never queue alone
  * (stale/drained check-ins, policy-disabled engines, engines no live host
  * advertises anymore — e.g. registry routes for engines the current host
  * release stopped running). */
 const DISPATCH_MESSAGES: Record<string, string> = {
+  cpu_headroom: 'Host CPU usage plus expected session demand exceeds the CPU target.',
+  cpu_pressure: 'Host CPU pressure exceeds the safety cap.',
+  cpu_usage_unknown: 'Fresh real CPU usage is unavailable.',
   "workspace_unavailable": "The requested workspace is not available on this host.",
   "dispatch_route_unconfigured": "The offered account, engine and profile do not match a local route.",
   "goal_startup_unconfigured": "This account has no trusted interactive goal startup command.",
@@ -722,13 +725,11 @@ export class FleetService {
         this.resources.headroom(route.machine_id, request, route.engine).reserved_mb,
         this.resources.headroom(route.machine_id, request, route.engine).requested_mb, this.resources.config())) reason = 'launcher_memory_reserve';
       else if (!Number.isFinite(hb.mem_avail_mb) || !Number.isFinite(hb.disk_free_gb) || hb.disk_free_gb < 50.5) reason = 'resource_limit';
-      else if (!Array.isArray(hb.load) || !Number.isFinite(hb.load[0]) || hb.load[0] < 0 || !Number.isFinite(caps.cpu_count) || caps.cpu_count < 1) reason = 'load_unknown';
-      // CPU guard (resource management): hold while 5-min load > factor x cores.
-      else if (((Number.isFinite(hb.load[1]) ? hb.load[1] : hb.load[0]) as number) > this.resources.config().cpu_load_factor * caps.cpu_count) reason = 'host_cpu_load';
+      else if (!this.resources.cpuHeadroom(route.machine_id,request).admitted) reason = this.resources.cpuHeadroom(route.machine_id,request).reason!;
       else if (!account || account.status !== 'ok') reason = 'account_' + (account?.status || 'unmapped');
       else if (!this.observation(definitions.get(route.account), route)) reason = 'machine_account_quota_unknown';
       else if (account.available_slots < 1) reason = 'account_capacity';
-      if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'launcher_memory_reserve' ? { memory: this.resources.headroom(route.machine_id, request, route.engine) } : {}) }); continue; }
+      if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'launcher_memory_reserve' ? { memory: this.resources.headroom(route.machine_id, request, route.engine) } : {}), ...(['cpu_headroom','cpu_pressure','cpu_usage_unknown'].includes(reason) ? {cpu:this.resources.cpuHeadroom(route.machine_id,request)} : {}) }); continue; }
       const family = canonicalQuotaProvider(definitions.get(route.account)?.provider as string);
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
@@ -755,9 +756,9 @@ export class FleetService {
       const urgency = ownPools.length ? Math.max(...ownPools.map(p => resetUrgency(netHeadroom(p.headroom_percentage, p.hard_floor_percent),
         (p.reset_at_ms - this.now()) / 3600000))) : 1;
       const tbm_weight = request.mode === 'interactive' ? 1 : tbm.pacing * tbm.banked * (tbm.efficiency ?? 1) * urgency;
-      const score = (account!.remaining_percent! / 100) / (1 + hb.load[0] / caps.cpu_count + pending) * tbm_weight;
+      const score = (account!.remaining_percent! / 100) / (1 + (hb.cpu_usage?.busy_cores ?? caps.cpu_count) / caps.cpu_count + pending) * tbm_weight;
       candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile,
-        selection: model, score, workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency } });
+        ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal'), selection: model, score, workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency } });
     }
     candidates.sort((a, b) => b.score - a.score || a.machine.localeCompare(b.machine) || a.engine.localeCompare(b.engine));
     // The stored intent carries the winner's normalized workspace: a bare
@@ -775,7 +776,7 @@ export class FleetService {
   }
 
   private memoryHold(id: string, rejected: any[], refused = false) {
-    if (!rejected.some(r => r.reason === 'launcher_memory_reserve')) return;
+    if (!rejected.some(r => CAPACITY_REASONS.has(r.reason))) return;
     this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json, refused) VALUES (?, ?, ?, ?) ON CONFLICT(launch_id) DO UPDATE SET rejected_json = excluded.rejected_json, refused = MAX(refused, excluded.refused)',
       id, new Date(this.now()).toISOString(), JSON.stringify(rejected), refused ? 1 : 0);
   }
@@ -861,9 +862,10 @@ export class FleetService {
           const patched = { ...bound, workspace: normalizedWorkspace };
           patchedJson = JSON.stringify(patched);
         } catch { /* keep the stored intent on stringify failure */ }
-        const written: any = this.sql.exec("UPDATE fleet_launches SET machine_id = ?, engine = ?, account = ?, profile = ?, workspace = ?, request_json = ?, model_selection_json = ?, state = 'offered', updated_at = ? WHERE id = ? AND state = 'queued'",
-          selected.machine, selected.engine, selected.account, selected.profile ?? null, normalizedWorkspace, patchedJson, JSON.stringify(selected.selection), new Date(this.now()).toISOString(), row.id);
-        if (written && (written as any).rowsWritten === 1) {
+        const written: any = this.sql.exec("UPDATE fleet_launches SET machine_id = ?, engine = ?, account = ?, profile = ?, workspace = ?, request_json = ?, model_selection_json = ?, state = 'offered', updated_at = ? WHERE id = ? AND state = 'queued' RETURNING id",
+          selected.machine, selected.engine, selected.account, selected.profile ?? null, normalizedWorkspace, patchedJson, JSON.stringify(selected.selection), new Date(this.now()).toISOString(), row.id).toArray()[0];
+        if (written) {
+          this.resources.freezeCpuStart(String(row.id),selected);
           promoted++;
         }
       }
@@ -955,6 +957,7 @@ export class FleetService {
       }
       const id = crypto.randomUUID(); const at = new Date(this.now()).toISOString(); const selected = plan.selected;
       this.sql.exec('INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', id, actor, caller.kind || 'unknown', plan.request.parent_id, plan.request.summary, input.idempotency_key, JSON.stringify({ ...bound, ...(admitted.authority ? { edit_authority: admitted.authority } : {}) }), selected.machine, selected.engine, selected.account, selected.profile, plan.request.mode, plan.request.workspace, plan.request.prompt, 'offered', at, at);
+      this.resources.freezeCpuStart(id,selected);
       this.sql.exec('UPDATE fleet_launches SET model_selection_json = ? WHERE id = ?', JSON.stringify(selected.selection), id);
       return result({ id, selection: selected.selection, state: 'offered', machine: selected.machine, engine: selected.engine, account: selected.account, mode: plan.request.mode, access: admitted.access.mode }, 201);
     });
@@ -1152,7 +1155,7 @@ export class FleetService {
         for (const row of this.sql.exec("SELECT * FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at, id LIMIT 100", caller.machineId!)) {
           if (this.admission.retireInvalidOffer(row)) continue;
           this.sql.exec('INSERT OR IGNORE INTO resource_ramps VALUES(?,?)', row.id, new Date(this.now()).toISOString());
-          offers.push({ resource_management: this.resources.config(), memory_estimate_mb: this.resources.estimate(parsed(row.request_json).project || String(row.workspace), String(row.engine), parsed(row.request_json).task_kind || 'goal'), selection: parsed(row.model_selection_json) ?? {}, id: row.id, engine: row.engine, account: row.account, profile: row.profile, mode: row.mode, workspace: row.workspace, cwd: parsed(row.request_json).cwd ?? null, prompt: row.prompt, ...(parsed(row.request_json).with_goal === true ? { with_goal: true } : {}), access: parsed(row.request_json).access?.mode || 'legacy_unspecified' });
+          offers.push({ ...this.resources.cpuStart(String(row.id)), resource_management: this.resources.config(), memory_estimate_mb: this.resources.estimate(parsed(row.request_json).project || String(row.workspace), String(row.engine), parsed(row.request_json).task_kind || 'goal'), selection: parsed(row.model_selection_json) ?? {}, id: row.id, engine: row.engine, account: row.account, profile: row.profile, mode: row.mode, workspace: row.workspace, cwd: parsed(row.request_json).cwd ?? null, prompt: row.prompt, ...(parsed(row.request_json).with_goal === true ? { with_goal: true } : {}), access: parsed(row.request_json).access?.mode || 'legacy_unspecified' });
           if (offers.length === 20) break;
         }
         return response({ offers: this.routing.enrichOffers(offers), reconciliation: this.reconciliationCandidates(caller.machineId!) });
@@ -1411,14 +1414,14 @@ export class FleetService {
           if (this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) return response({ error: 'task_report_required' }, 409);
           this.sql.exec('UPDATE fleet_launches SET launch_error_json = ? WHERE id = ?', JSON.stringify(diagnostic), row.id);
           const at = new Date(this.now()).toISOString();
-          if (data.reason === 'model_unsupported' || data.reason === 'engine_auth_expired') {
+          if (data.reason === 'model_unsupported' || data.reason === 'engine_auth_expired' || ['cpu_headroom','cpu_pressure','cpu_usage_unknown'].includes(data.reason)) {
             if (data.reason === 'engine_auth_expired') {
               this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at) VALUES (?, ?, 'unavailable', ?, ?)", row.engine, row.machine_id, data.reason, at);
             }
             // The fenced pre-claim refusal proves no native start. Retain the
             // failed attempt as route evidence and use a new launcher identity.
             const id = crypto.randomUUID();
-            const rejected = [{ machine: row.machine_id, engine: row.engine, reason: data.reason }];
+            const rejected = [{ machine: row.machine_id, engine: row.engine, reason: data.reason, ...(['cpu_headroom','cpu_pressure','cpu_usage_unknown'].includes(data.reason) ? {cpu:this.resources.cpuHeadroom(row.machine_id,parsed(row.request_json),row.id)} : {}) }];
             this.sql.exec("UPDATE fleet_launches SET request_key = ?, state = 'failed', verification_status = 'not_started', exit_reason = ?, finished_at = ?, updated_at = ? WHERE id = ?", 'model-retry-' + row.id, data.reason, at, at, row.id);
             this.sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, '', '', '', NULL, ?, ?, ?, 'queued', ?, ?)", id, row.actor, row.requester_kind, row.parent_id, row.summary, row.request_key, row.request_json, row.mode, row.workspace, row.prompt, row.created_at, at);
             this.sql.exec('INSERT INTO fleet_memory_holds (launch_id, since, rejected_json) VALUES (?, ?, ?)', id, at, JSON.stringify(rejected));
@@ -1443,6 +1446,8 @@ export class FleetService {
         }
         if (match[2] === 'claim') {
           if (row.state !== 'offered') return response({ error: 'already_claimed' }, 409);
+          const cpu=this.resources.cpuHeadroom(row.machine_id,parsed(row.request_json),row.id);
+          if(!cpu.admitted) return response({error:cpu.reason,cpu},409);
           // Pre-hold offers on a now-disabled engine are held, never launched.
           if (disabledEngines().has(row.engine)) return response({ error: 'provider_disabled' }, 409);
           const held = this.admission.retireInvalidOffer(row);
@@ -1479,7 +1484,7 @@ export class FleetService {
         // Host emits fixed, sanitized diagnostics; validate bounds again at storage.
         const diagnostic = data.diagnostic;
         if (diagnostic !== undefined && (!object(diagnostic, ['reason', 'message', 'error_type', 'exit_code', 'stage']) ||
-            typeof diagnostic.reason !== 'string' || !/^(?:launcher|engine)_[a-z_]{1,64}$/.test(diagnostic.reason) ||
+            typeof diagnostic.reason !== 'string' || !/^(?:(?:launcher|engine)_[a-z_]{1,64}|cpu_headroom|cpu_pressure|cpu_usage_unknown)$/.test(diagnostic.reason) ||
             typeof diagnostic.message !== 'string' || diagnostic.message.length > 300 || /[\x00-\x1f\x7f]/.test(diagnostic.message) ||
             typeof diagnostic.error_type !== 'string' || !/^[A-Za-z]{1,64}$/.test(diagnostic.error_type) ||
             !['launcher_run', 'dispatch_headless', 'dispatch_interactive', 'dispatch_route', 'runtime'].includes(diagnostic.stage) ||
@@ -1501,20 +1506,20 @@ export class FleetService {
           data.state === 'failed' && data.confirmed_exit === true &&
           (data.reason === 'launcher_not_started' || (diagnostic && data.reason === diagnostic.reason)) &&
           data.launcher_task_id === 'hub-' + row.id && !row.native_id;
-        if (noStart && data.reason === 'launcher_memory_reserve') {
+        if (noStart && ['launcher_memory_reserve','cpu_headroom','cpu_pressure','cpu_usage_unknown'].includes(data.reason)) {
           const prior: any = this.sql.exec('SELECT retry_id FROM fleet_memory_holds WHERE launch_id = ?', row.id).toArray()[0];
           if (prior?.retry_id) return response({ id: prior.retry_id, state: 'queued', replay: true });
           if (row.state === 'starting' && !this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) {
             // Fenced no-start proof: keep the user's session queued, with a new
             // launcher task identity. Never reset/reuse the failed local task.
             const id = crypto.randomUUID(), at = new Date(this.now()).toISOString();
-            const rejected = [{ machine: row.machine_id, engine: row.engine, reason: data.reason, memory: this.memoryHeadroom(row.machine_id) }];
+            const rejected = [{ machine: row.machine_id, engine: row.engine, reason: data.reason, ...(data.reason==='launcher_memory_reserve' ? {memory:this.memoryHeadroom(row.machine_id)} : {cpu:this.resources.cpuHeadroom(row.machine_id,parsed(row.request_json),row.id)}) }];
             this.sql.exec("UPDATE fleet_launches SET request_key = ?, state = 'exited', exit_reason = ?, launch_error_json = ?, verification_status = 'not_started', finished_at = ?, updated_at = ? WHERE id = ?", 'memory-retry-' + row.id, data.reason, JSON.stringify(diagnostic), at, at, row.id);
             this.sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, '', '', '', NULL, ?, ?, ?, 'queued', ?, ?)", id, row.actor, row.requester_kind, row.parent_id, row.summary, row.request_key, row.request_json, row.mode, row.workspace, row.prompt, row.created_at, at);
             this.memoryHold(row.id, rejected, true); this.memoryHold(id, rejected, true);
             // Durable alert exists even if a later heartbeat promotes before cron.
             const alerts = new LivenessService(this.sql); alerts.init();
-            alerts.setAlert('launch', row.id, { state: 'launcher_memory_reserve', detail: JSON.stringify(rejected) });
+            alerts.setAlert('launch', row.id, { state: data.reason, detail: JSON.stringify(rejected) });
             this.sql.exec('UPDATE fleet_memory_holds SET retry_id = ? WHERE launch_id = ?', id, row.id);
             if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
               this.sql.exec("UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = NULL, state = 'queued', updated_at = ? WHERE fleet_launch_id = ? AND binding_json IS NULL", id, at, row.id);

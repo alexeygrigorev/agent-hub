@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -286,7 +287,11 @@ def _stat_cpu_ticks(pid: int, proc_root: str = "/proc") -> Optional[int]:
         stime = int(fields[12])
         if utime < 0 or stime < 0:
             return None
-        return utime + stime
+        # Include children already reaped by this process: they disappeared
+        # from the live tree, but their work still belongs to the session.
+        child_user = max(0, int(fields[13]))
+        child_system = max(0, int(fields[14]))
+        return utime + stime + child_user + child_system
     except (OSError, ValueError, IndexError):
         return None
 
@@ -369,6 +374,7 @@ def sample_session_tree(
             created_at_ms = getattr(native_row, "created_at_ms", None)
         rss_mb = pss_mb = None
         cpu_seconds: Optional[float] = None
+        cpu_identity = None
         roots = [p for p in (worker_pid, workload_pid) if type(p) is int and p > 0]
         cg = _cgroup_path(cgroup, roots or None)
         current_mb: Optional[float] = None
@@ -389,6 +395,7 @@ def sample_session_tree(
                 usage = _parse_kv_int(cpu_raw, "usage_usec")
                 if usage is not None and usage >= 0:
                     cpu_seconds = usage / 1_000_000.0
+                    cpu_identity = "cgroup:%s:%s" % (cg, os.stat(cg).st_ino)
             # PSS from a bounded smaps sum over the scope's exact members
             # (plus the known workload roots when the scope lists none).
             pids = _pids_in_cgroup(cg)
@@ -449,19 +456,19 @@ def sample_session_tree(
                 if ticks is not None:
                     total_ticks += ticks
                     ticked = True
-            if not counted:
+            if not counted and not ticked:
                 return None
             if total_anon > 0:
                 rss_mb = total_anon / 1024.0
             elif total_rss > 0:
                 rss_mb = total_rss / 1024.0
-            else:
+            elif not ticked:
                 return None
             if total_pss > 0:
                 pss_mb = total_pss / 1024.0
             if ticked:
                 cpu_seconds = total_ticks / _clk_tck()
-        if rss_mb is None:
+        if rss_mb is None and cpu_seconds is None:
             return None
         runtime_s: Optional[float] = None
         if type(created_at_ms) is int and created_at_ms > 0 and now_ms > created_at_ms:
@@ -469,13 +476,18 @@ def sample_session_tree(
         avg_cpu = None
         if cpu_seconds is not None and runtime_s and runtime_s > 0:
             avg_cpu = cpu_seconds / runtime_s
+        if cpu_seconds is not None and cpu_identity is None:
+            # Exact native incarnation and counter source, never a tag. A
+            # switch between cgroup and proc counters resets the delta baseline.
+            cpu_identity = "tree:%s:%s" % (created_at_ms, ",".join(str(p) for p in roots))
         return {
-            "rss_mb": float(rss_mb),
+            "rss_mb": float(rss_mb) if rss_mb is not None else None,
             "pss_mb": float(pss_mb) if pss_mb is not None else None,
             "cpu_seconds": float(cpu_seconds) if cpu_seconds is not None else None,
             "runtime_s": float(runtime_s) if runtime_s is not None else None,
             "avg_cpu_cores": float(avg_cpu) if avg_cpu is not None else None,
             "current_mb": float(current_mb) if current_mb is not None else None,
+            "cpu_identity": cpu_identity,
         }
     except Exception:
         return None
@@ -644,7 +656,14 @@ def update_peaks(state: dict[str, Any], session_id: str, native_id: str, sample:
             return sample[field]
         return prior.get(field)
 
+    from .cpu_resources import update_cpu_distribution
+    try:
+        cpu_at = int(datetime.fromisoformat(observed_at.replace("Z", "+00:00")).timestamp() * 1000)
+    except (ValueError, TypeError, AttributeError):
+        cpu_at = None
+    distribution = update_cpu_distribution(prior, sample.get("cpu_seconds"), sample.get("cpu_identity"), cpu_at)
     peaks[key] = {
+        **prior,
         "peak_rss_mb": _peak_max("peak_rss_mb", "rss_mb"),
         "peak_pss_mb": _peak_max("peak_pss_mb", "pss_mb"),
         "cpu_seconds": _peak_max("cpu_seconds", "cpu_seconds"),
@@ -652,6 +671,7 @@ def update_peaks(state: dict[str, Any], session_id: str, native_id: str, sample:
         "avg_cpu_cores": _latest("avg_cpu_cores"),
         "current_mb": _latest("current_mb"),
         "observed_at": observed_at,
+        **distribution,
     }
     return peaks[key]
 
@@ -797,7 +817,7 @@ def _sample_row(sid: str, nid: str, peak: Any, observed_at: str) -> dict[str, An
     """Server report row: unknown fields are omitted (null), never zeroed."""
     row: dict[str, Any] = {"session_id": sid, "native_id": nid, "observed_at": observed_at}
     if isinstance(peak, dict):
-        for field in ("peak_rss_mb", "peak_pss_mb", "cpu_seconds", "runtime_s", "avg_cpu_cores"):
+        for field in ("peak_rss_mb", "peak_pss_mb", "cpu_seconds", "runtime_s", "avg_cpu_cores", "p95_cpu_cores"):
             if _finite_number(peak.get(field)) is not None:
                 row[field] = peak[field]
     return row
@@ -1021,6 +1041,8 @@ def run_watchdog_cycle(
                         measured["avg_cpu_cores"] = None
                 peak = update_peaks(state, sid, nid, measured, observed_at)
                 row = _sample_row(sid, nid, peak, observed_at)
+                if peak.get("current_cpu_cores") is not None:
+                    row["current_cpu_cores"] = peak["current_cpu_cores"]
                 # Fresh current anon RSS each heartbeat: the Hub credits ONLY
                 # this against the launch ramp (never the peak). Cached final
                 # rows below omit it, conservatively retaining the estimate.

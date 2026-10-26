@@ -162,8 +162,10 @@ export class LivenessService {
       if (h.state === 'queued' && h.refused && this.sql.exec('SELECT launch_id FROM fleet_memory_holds WHERE retry_id = ?', h.launch_id).toArray().length) continue;
       const age = ageSeconds(h.since, now) ?? 0;
       if (!h.refused && age <= 300) continue;
-      subjects.push({ kind: 'launch', id: h.launch_id, state: 'launcher_memory_reserve',
-        detail: `memory hold for ${age}s: ${h.rejected_json}`, age_s: age });
+      let reasons:any[]=[]; try {reasons=JSON.parse(h.rejected_json);} catch {}
+      const reason=typeof reasons[0]?.reason==='string' ? reasons[0].reason : 'placement_hold';
+      subjects.push({ kind: 'launch', id: h.launch_id, state: reason,
+        detail: `${reason} hold for ${age}s: ${h.rejected_json}`, age_s: age });
     }
     // Preserve visibility of older failures as well as newly queued refusals.
     for (const l of this.sql.exec("SELECT id, updated_at, machine_id FROM fleet_launches WHERE state = 'failed' AND exit_reason = 'launcher_memory_reserve' AND updated_at >= ?", new Date(now - 86400000).toISOString()).toArray() as any[]) {

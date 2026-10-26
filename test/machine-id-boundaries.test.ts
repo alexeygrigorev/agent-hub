@@ -1,3 +1,4 @@
+import {freshCpu} from './cpu-fixture';
 import { describe, it, expect } from 'vitest';
 import { FIXTURE_INTAKE_ID, seedFixtureIntake } from './tbm-fixture';
 import { env, runInDurableObject } from 'cloudflare:test';
@@ -96,7 +97,7 @@ describe('Machine-ID Boundary Validation', () => {
           sql.exec(
             'INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, last_heartbeat, drained, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
             machine, machine, machine, iso(), iso(),
-            JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() } }),
+            JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso()), gate: { launch_allowed: true, at: iso() } }),
             0,
             JSON.stringify({ engines: ['codex'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8 })
           );
