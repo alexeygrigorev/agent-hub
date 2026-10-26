@@ -1,0 +1,140 @@
+# Resource management
+
+Status: design (2026-10-26). Intake: `4fcd3139-fb34-435c-86ec-5a24ddf6c3ee`.
+Keep this doc updated as each part lands.
+
+## Goal
+
+Use Hetzner to the max (Alexey t1475u, 2026-10-26: «34 это очень много памяти,
+целая половина. Мы реально не используем нашу машину, надо использовать по
+максимум»). Memory should not be what limits us. Queued sessions keep getting
+placed until real MemAvailable gets close to the floor. After that, the limit
+should be CPU or provider capacity.
+
+Baseline that started this (2026-10-26 03:40 Berlin, Hetzner, 12 cores,
+62.7 GiB RAM, 32 GiB swap partition):
+
+- 18 running launcher sessions. Real anon memory per session (cgroup
+  `memory.stat anon`) had a median of about 200 MB, with a range of 13 to 427 MB.
+- The launcher reserved 1500 MB per session (4096 MB for managed Codex), which
+  came to `reservation_mem_mb` = 32192. The Hub saw `active_mem_mb` of about 23 GB.
+- The floor was 10 GiB. MemAvailable was about 36 GiB, yet about 20 sessions
+  stayed queued with `launcher_memory_reserve`.
+- Load average was 23–28. The CPU was about 50–75% busy, and the rest was IO wait.
+
+## Parts
+
+Resource management covers four parts.
+
+### 1. Token manager (TBM)
+
+Covers token and quota pools, banked tranches, pacing and the kill switch. See intake
+`95c1862c` and the `agent-hub-wt-tbm-e2e` branch (`src/tbm-*.ts`,
+`tbm_session_tokens`). This doc does not change TBM. The resource ledger
+below sits next to it as the matching per-session cost record (tokens on one
+side, memory and CPU on the other), joined by Hub session id.
+
+### 2. Memory/CPU accounting (TBM extension)
+
+Each session gets one durable row in the Hub resource ledger
+(`session_resource_usage`, module `src/resource-management.ts`):
+
+| field | source |
+|---|---|
+| session_id, fleet_launch_id, intake_id | Hub |
+| project / workspace, engine, model, tier, task kind (implement/review/ask/goal) | Hub launch record |
+| started_at, finished_at, runtime_s | Hub lifecycle |
+| peak_rss_mb (anon high-water mark), peak_pss_mb when available | host sampler: cgroup `memory.stat anon` / `memory.peak`, or `/proc/<pid>/smaps_rollup` summed over the process tree |
+| avg_cpu_cores, cpu_seconds | cgroup `cpu.stat usage_usec` / runtime |
+| final state, reap reason (if any) | Hub / watchdog |
+
+The host samples every running session's cgroup on each heartbeat and sends
+the running peaks. The row is finalized when the session ends. Rows can be
+joined with `tbm_session_tokens` on session id, so one session gives you its
+tokens, memory and CPU together.
+
+### 3. Placement
+
+Placement is gated on live data, not on a fixed sum of per-session reservations.
+
+- **Memory:** a new session is placed while
+  `MemAvailable - ramp_reserve(inflight starts) - estimate(new) >= floor`.
+  - Resident sessions are already counted inside MemAvailable, so they are not
+    reserved again.
+  - Only sessions still starting up (offered, starting, or the first few
+    minutes of running) hold a ramp reserve.
+  - `estimate(new)` is the p90 `peak_rss_mb` for the same
+    project/engine/kind from the ledger. It falls back to per-engine p90, then
+    to a default.
+- **Floor:** 2 GiB MemAvailable (Alexey t1476u). OOM guard: when MemAvailable
+  is below the floor, new sessions stay queued (`launcher_memory_reserve`).
+  Running sessions are never killed or stopped because of memory. Swap (a
+  32 GiB partition) is the cushion.
+- **CPU guard:** no new placements while the 5-minute load average is above
+  `1.5 × cores` (18 on Hetzner). Placement resumes once it drops back below.
+  The rejected reason slug is `host_cpu_load`.
+- Tune if it crashes: if the OOM killer fires or MemAvailable stays below the
+  floor, raise the floor or the estimate multiplier one step and record that here.
+- The cgroup `MemoryMax` per worker (1500M, or 4096M for managed Codex) is a
+  per-session safety cap. It is separate from the placement estimate.
+
+### 4. Watchdog (memory reaper)
+
+Runs every 5–10 minutes (Alexey t1474u: «Надо ещё watchdog чтобы сессии не
+держали долго память»).
+
+- Releases reservations and reaps process trees of sessions that are finished,
+  failed, stopped, or whose PID is dead. Sessions that are done but still alive
+  are stopped cleanly once their final report has been saved.
+- Sessions with no output or activity for more than `idle_minutes` (default 60)
+  are flagged. The watchdog captures their output into the intake and then
+  stops them.
+- It never kills a session that is producing output. It never touches
+  Alexey's own interactive sessions or sessions marked `keep`.
+- It records each session's RSS high-water mark. Sessions above `rss_flag_gb`
+  (default 4) are flagged in the overview.
+- Every reap is logged with who, when, why and the MB freed, and is visible in
+  Hub. The affected intake gets a note so the forgotten-intake watchdog
+  (ea87fcb3 AC8) restarts it and it is not lost.
+
+## Config knobs
+
+These are Hub config values (`config/resource-management.json` in agent-hub,
+mirrored to the host and launcher through the heartbeat/settings). They are not
+hard-coded constants.
+
+| knob | default | used by |
+|---|---|---|
+| `memory_floor_mb` | 2048 | Hub `plan()` gate, launcher `check_resources` |
+| `ramp_reserve_default_mb` | measured p90, fallback 512 | placement estimate |
+| `estimate_percentile` | 90 | placement estimate |
+| `cpu_load_factor` | 1.5 (× cores, 5-min load) | CPU guard |
+| `watchdog_interval_s` | 300–600 | watchdog |
+| `idle_minutes` | 60 | watchdog |
+| `rss_flag_gb` | 4 | watchdog / overview |
+| `keep` marker | per session | watchdog exclusion |
+
+Interim state (2026-10-26): the floor was lowered from 10 GiB to 2 GiB as
+constants in the launcher (`launcher/resources.py` `MIN_MEM_AVAILABLE_BYTES`)
+and in Hub `src/fleet.ts` (`MEMORY_FLOOR_MB`). The per-session reservation is
+still 1500/4096 MB until part 3 lands.
+
+## How the stats are used for planning
+
+- Placement estimate: p90 `peak_rss_mb` by (project, engine, kind), falling back
+  to the coarser groups.
+- Capacity view: the expected number of more sessions that fit is
+  `(MemAvailable - floor) / p90` and `(1.5 × cores - load5)`, whichever is
+  smaller.
+- Cost per session: tokens (TBM) plus GB-hours and CPU-hours from the ledger.
+
+## CLI and overview
+
+- `hub resources`: a utilization line (memory used/total, load/cores, running,
+  queued), the placement verdict and its reason, the floor and knobs, and
+  sessions flagged by the watchdog.
+- `hub resources sessions [--project P --engine E --kind K]`: rows from the
+  per-session ledger with p50/p90.
+- `hub resources reaps`: the watchdog log (who, when, why, MB freed, intake).
+- Hub overview: a "Resource management" section with the same utilization
+  line, per-group p90 stats, flagged sessions and recent reaps.
