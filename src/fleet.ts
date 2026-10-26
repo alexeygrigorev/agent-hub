@@ -16,6 +16,11 @@ import { freshCatalogs } from './catalog-freshness';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { recordSessionTokens } from './tbm-controller';
 import { loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency } from './pacing';
+// Host telemetry freshness windows (intake 4398ce2a). The host posts a fast
+// heartbeat every TELEMETRY_REFRESH_S (host/agent_hub_host/fleet.py, 45 s);
+// keep LAUNCHER_TELEMETRY_STALE_MS >= 3x that (host regression test parses it).
+export const LAUNCHER_TELEMETRY_STALE_MS = 180000;
+export const GATE_STALE_MS = 300000;
 
 export const FLEET_SCHEMA = `
 CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
@@ -739,10 +744,15 @@ export class FleetService {
         // anything (broken/empty registration), keep capability_unavailable.
         reason = (engineMissing && liveEngines.size > 0 && !liveEngines.has(route.engine)) ? 'engine_unavailable' : 'capability_unavailable';
       }
-      else if (hb.gate?.launch_allowed !== true || !fresh(hb.gate?.at, this.now(), 300000)) reason = 'admission_unknown';
-      else if (caps.launcher_resources === true && (!Number.isFinite(hb.launcher_resources?.active_mem_mb)
-        || hb.launcher_resources.active_mem_mb < 0
-        || !fresh(hb.launcher_resources?.observed_at, this.now(), 180000))) reason = 'admission_unknown';
+      // Intake 4398ce2a (Alexey t1523u): missing/stale host telemetry fails
+      // OPEN. Only a fresh explicit gate refusal or fresh invalid launcher
+      // telemetry holds placement; real MemAvailable/PSI/disk signals below
+      // still apply. The host re-runs its real admission gate before every
+      // claim and the claim itself requires a <30 s admission observation.
+      else if (hb.gate?.launch_allowed === false && fresh(hb.gate?.at, this.now(), GATE_STALE_MS)) reason = 'admission_unknown';
+      else if (caps.launcher_resources === true && hb.launcher_resources
+        && fresh(hb.launcher_resources?.observed_at, this.now(), LAUNCHER_TELEMETRY_STALE_MS)
+        && (!Number.isFinite(hb.launcher_resources?.active_mem_mb) || hb.launcher_resources.active_mem_mb < 0)) reason = 'admission_unknown';
       else if (Number.isFinite(hb.mem_avail_mb) && !memoryVerdict(hb.mem_avail_mb,
         this.resources.headroom(route.machine_id, request, route.engine).reserved_mb,
         this.resources.headroom(route.machine_id, request, route.engine).requested_mb, this.resources.config())) reason = 'launcher_memory_reserve';
