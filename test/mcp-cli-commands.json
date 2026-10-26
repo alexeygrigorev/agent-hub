@@ -65,6 +65,7 @@
   "repos refresh",
   "repos seed",
   "repos show",
+  "resources",
   "routing-machines",
   "run",
   "send",

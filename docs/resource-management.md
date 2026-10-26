@@ -44,7 +44,7 @@ Each session gets one durable row in the Hub resource ledger
 | session_id, fleet_launch_id, intake_id | Hub |
 | project / workspace, engine, model, tier, task kind (implement/review/ask/goal) | Hub launch record |
 | started_at, finished_at, runtime_s | Hub lifecycle |
-| peak_rss_mb (anon high-water mark), peak_pss_mb when available | host sampler: cgroup `memory.stat anon` / `memory.peak`, or `/proc/<pid>/smaps_rollup` summed over the process tree |
+| peak_rss_mb (sampled anon high-water mark), peak_pss_mb when available | host sampler: dedicated cgroup `memory.stat anon`, or `/proc/<pid>/smaps_rollup` Anonymous/Pss summed over the exact process tree; cache-inclusive `memory.peak` is not anonymous RSS |
 | avg_cpu_cores, cpu_seconds | cgroup `cpu.stat usage_usec` / runtime |
 | final state, reap reason (if any) | Hub / watchdog |
 
@@ -116,7 +116,7 @@ hard-coded constants.
 | `rss_flag_gb` | 4 | watchdog / overview |
 | `keep` marker | per session | watchdog exclusion |
 
-Implemented Hub draft (2026-10-26; not deployed yet): `src/resource-management.ts`
+Implemented Hub source (2026-10-26; review and rollout pending): `src/resource-management.ts`
 owns validated defaults, runtime settings, `session_resource_usage`,
 `resource_evidence`, and `resource_reaps`. Hub plan subtracts only ramp headroom
 and a measured next-session estimate. Resident session cgroup caps are not
