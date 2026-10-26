@@ -92,6 +92,7 @@ def http_error(exc, key=None):
     routes = ''
     held_info = ''
     provider_guidance = ''
+    concurrency_guidance = ''
     try:
         raw = exc.read(4096) if hasattr(exc, 'read') else b''
         data = json.loads((raw or b'').decode('utf-8', 'replace'))
@@ -122,6 +123,8 @@ def http_error(exc, key=None):
                               and re.fullmatch(r'[a-z][a-z_]{0,63}', r['reason'])})
             if reasons:
                 routes = ' routes: ' + ', '.join(reasons)
+                if 'account_concurrency' in reasons:
+                    concurrency_guidance = '; configured account concurrency limit reached; quota is healthy'
         if isinstance(hold, dict) and isinstance(data.get('id'), str) and data.get('id'):
             held_info = ' held session %s state %s' % (data['id'], data.get('state'))
         if isinstance(data, dict):
@@ -142,6 +145,8 @@ def http_error(exc, key=None):
         parts.append(provider_guidance)
     if routes:
         parts.append(routes)
+    if concurrency_guidance:
+        parts.append(concurrency_guidance)
     if held_info:
         parts.append(held_info)
     if reason:

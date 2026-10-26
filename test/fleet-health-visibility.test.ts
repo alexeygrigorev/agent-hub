@@ -169,13 +169,13 @@ describe('fleet health visibility + machine aliasing', () => {
     );
     const res = fleet.reserve({ workspace: 'demo', prompt: 'goal reached', idempotency_key: 'pressure-probe-1' }, admin);
     expect(res.status).toBe(409);
-    expect(JSON.stringify(res.value.rejected)).toContain('account_capacity');
+    expect(JSON.stringify(res.value.rejected)).toContain('account_concurrency');
     const count = Number(sql.exec('SELECT COUNT(*) AS n FROM placement_rejections').one().n);
     expect(count).toBe(1);
     const subjects = live.evaluate().subjects.filter((s) => String(s.id).startsWith('placement-reject:'));
     expect(subjects.length).toBe(1);
     expect(subjects[0].state).toBe('stuck');
-    expect(subjects[0].detail).toContain('account_capacity');
+    expect(subjects[0].detail).toContain('account_concurrency');
   }));
 
   it('degrades host health while placement pressure exists and shows reservation numbers', () => fixture(async ({ monitoring, sql }) => {

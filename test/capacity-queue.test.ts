@@ -136,7 +136,7 @@ describe('fleet reserve capacity queue', () => {
     expect(parked.state).toBe('queued');
     expect(parked.queued).toBe(true);
     expect(parked.queue_position).toBe(1);
-    expect(parked.rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'account_capacity' });
+    expect(parked.rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', engine: 'codex', reason: 'account_concurrency' }));
     // Same-key replay observes the same queued intent (no second reservation).
     const replay = await f.handle(fleetReq('/launches', intent({ machine: 'hetzner', idempotency_key: 'queue-second' })), admin);
     expect(replay.status).toBe(202);
@@ -188,7 +188,7 @@ describe('fleet reserve capacity queue', () => {
     expect(res.status).toBe(409);
     const body: any = await res.json();
     expect(body.error).toBe('no_eligible_route');
-    expect(body.rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'account_capacity' });
+    expect(body.rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', engine: 'codex', reason: 'account_concurrency' }));
     expect(body.rejected).toContainEqual({ machine: 'win35', engine: 'codex', reason: 'capability_unavailable' });
     expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches WHERE request_key = ?', 'mixed-reject').one().n).toBe(0);
   }));
@@ -220,7 +220,7 @@ describe('fleet reserve capacity queue', () => {
     expect(res.status).toBe(202);
     const body: any = await res.json();
     expect(body.state).toBe('queued');
-    expect(body.rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'account_capacity' });
+    expect(body.rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', engine: 'codex', reason: 'account_concurrency' }));
     expect(body.rejected).toContainEqual({ machine: 'hetzner', engine: 'gemini', reason: 'engine_unavailable' });
     expect(body.rejected.some((r: any) => r.reason === 'capability_unavailable')).toBe(false);
     // A stale engine alone (no capacity in the mix) still hard-rejects.
@@ -312,7 +312,7 @@ describe('sessions_start capacity queue', () => {
     const parked: any = await response.json();
     expect(parked).toMatchObject({ state: 'queued', queued: true, queue_position: 1 });
     expect(parked.rejected).toEqual(expect.arrayContaining([
-      { machine: 'hetzner', engine: 'codex', reason: 'account_capacity' },
+      expect.objectContaining({ machine: 'hetzner', engine: 'codex', reason: 'account_concurrency' }),
       { machine: 'hetzner', engine: 'opencode', reason: 'tier_unavailable' },
     ]));
     const replay: any = await (await s.handle(sessReq('/api/sessions', input), admin)).json();
@@ -383,7 +383,7 @@ describe('sessions_start capacity queue', () => {
     expect(parked.state).toBe('queued');
     expect(parked.queued).toBe(true);
     expect(typeof parked.fleet_launch_id).toBe('string');
-    expect(parked.rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'account_capacity' });
+    expect(parked.rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', engine: 'codex', reason: 'account_concurrency' }));
     // Same-key polling observes the same queued intent without duplicating it.
     const poll = await s.handle(sessReq('/api/sessions', { key: 'cap-start', workspace: 'demo', machine: 'hetzner', brief: 'capacity queue probe' }), admin);
     expect(poll.status).toBe(200);

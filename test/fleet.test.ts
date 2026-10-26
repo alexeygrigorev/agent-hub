@@ -396,7 +396,7 @@ describe('generic accounts and launch placement', () => {
     sql.exec("UPDATE machines SET capabilities = ? WHERE id = 'hetzner'", JSON.stringify(capabilities));
     const plan: any = s.plan(intent({ machine: 'hetzner', engine: 'antigravity' }));
     expect(plan.selected).toBeNull();
-    expect(plan.rejected).toContainEqual({ machine: 'hetzner', engine: 'antigravity', reason: 'account_capacity' });
+    expect(plan.rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', engine: 'antigravity', reason: 'account_concurrency' }));
   }));
   it('prunes only unused stale routes while retaining live reservations and subscriptions', async () => fixture(async (s, sql) => {
     await configure(s);
@@ -1009,7 +1009,7 @@ describe('bare workspace labels resolve under advertised absolute roots', () => 
     expect(queued.status).toBe(202);
     const body: any = await queued.json();
     expect(body.state).toBe('queued');
-    expect(body.rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'account_capacity' });
+    expect(body.rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', engine: 'codex', reason: 'account_concurrency' }));
     expect(body.rejected).toContainEqual({ machine: 'win35', engine: 'codex', reason: 'machine_unavailable' });
     expect(body.rejected.some((r: any) => r.reason === 'capability_unavailable')).toBe(false);
   }));

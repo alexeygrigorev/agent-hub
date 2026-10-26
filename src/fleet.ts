@@ -88,7 +88,7 @@ function disabledEngines(): Set<string> {
   return new Set<string>((((policy as any).models || []) as any[]).filter(m => m && disabled.has(m.provider)).map(m => String(m.engine)));
 }
 /** Reject reasons that mean "no free slot right now" (transient capacity). */
-const CAPACITY_REASONS = new Set(['disk_floor', 'account_capacity', 'machine_capacity', 'launcher_memory_reserve', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
+const CAPACITY_REASONS = new Set(['disk_floor', 'account_capacity', 'account_concurrency', 'machine_capacity', 'launcher_memory_reserve', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
 /** Launcher memory gate inputs, mirrored here for dashboard visibility only.
  * The placement verdict stays in plan(); this module never changes the math,
  * it only projects the same inputs (MemAvailable, reserved total, floor for
@@ -98,7 +98,7 @@ import { MEMORY_FLOOR_MB, NEXT_SLOT_MB, ResourceManagement, memoryVerdict } from
 export { MEMORY_FLOOR_MB, NEXT_SLOT_MB };
 /** Placement-pressure reasons that degrade host health and raise operator
  * alerts: any launch rejected or held for memory/capacity. */
-export const PLACEMENT_PRESSURE_REASONS = new Set(['launcher_memory_reserve', 'account_capacity', 'machine_capacity', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
+export const PLACEMENT_PRESSURE_REASONS = new Set(['launcher_memory_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity', 'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking']);
 /** Incidental per-route reasons that may accompany capacity but never queue alone
  * (stale/drained check-ins, policy-disabled engines, engines no live host
  * advertises anymore — e.g. registry routes for engines the current host
@@ -504,7 +504,7 @@ export class FleetService {
     const placeableMachines = new Set<string>();
     const placementReasons = new Set<string>();
     if (!routes.length) placementReasons.add('no_routes');
-    if (!availableSlots) placementReasons.add('account_capacity');
+    if (!availableSlots) placementReasons.add('account_concurrency');
     let placeableRoutes = 0;
     for (const route of routes) {
       if (liveEnginesByMachine.get(String(route.machine_id))?.has(String(route.engine))) {
@@ -761,8 +761,8 @@ export class FleetService {
       else if (!this.resources.cpuHeadroom(route.machine_id,request).admitted) reason = this.resources.cpuHeadroom(route.machine_id,request).reason!;
       else if (!account || account.status !== 'ok') reason = 'account_' + (account?.status || 'unmapped');
       else if (!this.observation(definitions.get(route.account), route)) reason = 'machine_account_quota_unknown';
-      else if (account.available_slots < 1) reason = 'account_capacity';
-      if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'launcher_memory_reserve' ? { memory: this.resources.headroom(route.machine_id, request, route.engine) } : {}), ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}), ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:this.resources.cpuHeadroom(route.machine_id,request)} : {}) }); continue; }
+      else if (account.available_slots < 1) reason = 'account_concurrency';
+      if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'account_concurrency' ? { account: route.account, concurrency: { active: account!.active, limit: account!.max_concurrency, available: account!.available_slots }, quota_status: account!.status } : {}), ...(reason === 'launcher_memory_reserve' ? { memory: this.resources.headroom(route.machine_id, request, route.engine) } : {}), ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}), ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:this.resources.cpuHeadroom(route.machine_id,request)} : {}) }); continue; }
       const family = canonicalQuotaProvider(definitions.get(route.account)?.provider as string);
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
