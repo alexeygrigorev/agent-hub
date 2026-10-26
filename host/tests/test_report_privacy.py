@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 
 from agent_hub_host.exit_evidence import snapshot_native, terminal_evidence, bound_finish_fields
 from agent_hub_host import late_reports
-import test_late_reports as fixtures
+from host.tests import test_late_reports as fixtures
 
 OFFER, NATIVE = fixtures.OFFER, fixtures.NATIVE
 
@@ -160,7 +160,7 @@ class ReportPrivacy(unittest.TestCase):
 
 
     def test_routed_terminal_exit_includes_evidence_on_assigned_job_result(self):
-        import test_tbm_routed_results as routed
+        from host.tests import test_tbm_routed_results as routed
         case=routed.RoutedResultsTests();case.setUp()
         try:
             case.d._active_launches[OFFER]['exit_evidence']=dict(exit_code=0,log_tail='Routed audit complete')
