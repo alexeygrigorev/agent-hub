@@ -8,6 +8,28 @@ import { SCOPE_POLICY_VERSION, SCOPE_VERDICTS, classifyScope, getScopeStatus, sc
 type Auth = { caller?: CallerContext; scopes?: string[]; error?: Response };
 type Obj = Record<string, any>;
 type Tx = <T>(fn: () => T) => T;
+/** Context changes invalidate old completion claims; notes never grant launch authority. */
+function currentHistory(task: Obj): Obj[] {
+  const history: Obj[] = task.history ?? [];
+  const boundary = history.reduce((n, e, i) =>
+    e.kind === 'update' && ['status', 'title', 'project', 'acceptance_criteria'].some(k => k in (e.changes ?? {})) ? i : n, -1);
+  return history.slice(boundary + 1);
+}
+function currentDoneNote(task: Obj): Obj | undefined {
+  return currentHistory(task).find(e => e.kind === 'note' &&
+    /^DONE\b/m.test(e.text ?? '') &&
+    (/\b[0-9a-f]{7,40}\b/i.test(e.text) || /https:\/\/[^\s]+\/(?:actions\/runs|deployments)\/[^\s]+/.test(e.text)) &&
+    /live check:[ \t]*\S[^\n]*/i.test(e.text) && /result:[ \t]*\S[^\n]*/i.test(e.text));
+}
+/** Completion claims only pause automatic admission for human review. They cannot
+ * close an intake, validate historical evidence, or alter its acceptance criteria. */
+export function intakeCompletionHoldReason(task: Obj): string | null {
+  if (currentDoneNote(task)) return 'done_evidence_requires_operator_review';
+  const claim = currentHistory(task).some(e => e.kind === 'note' &&
+    (/^DONE\b/m.test(e.text ?? '') ||
+      (/^ORIGINAL FINAL STATE\b/m.test(e.text ?? '') && /\bclosed (?:done|cancelled)\b/i.test(e.text))));
+  return claim ? 'reported_completion_requires_operator_review' : null;
+}
 /** Narrow intake launch-hook composition (wired in src/hub.ts): assignment
  * creates the Hub session through the canonical session-control service with
  * the caller's own auth, so placement is never duplicated and session
@@ -251,15 +273,7 @@ export class IntakeService {
       this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
     }
   }
-  private doneNote(task: Obj): Obj | undefined {
-    // A reopened task needs new evidence. Context/AC changes invalidate prior evidence too.
-    const boundary = task.history.reduce((n: number, e: Obj, i: number) =>
-      e.kind === 'update' && ['status', 'title', 'project', 'acceptance_criteria'].some(k => k in (e.changes ?? {})) ? i : n, -1);
-    return task.history.slice(boundary + 1).find((e: Obj) => e.kind === 'note' &&
-      /^DONE\b/m.test(e.text ?? '') &&
-      (/\b[0-9a-f]{7,40}\b/i.test(e.text) || /https:\/\/[^\s]+\/(?:actions\/runs|deployments)\/[^\s]+/.test(e.text)) &&
-      /live check:[ \t]*\S[^\n]*/i.test(e.text) && /result:[ \t]*\S[^\n]*/i.test(e.text));
-  }
+  private doneNote(task: Obj): Obj | undefined { return currentDoneNote(task); }
   private transition(task: Obj, status: string, actor: string, now: number, reason?: string, supersededBy?: string) {
     if (status === task.status) return;
     if (status === 'done') {

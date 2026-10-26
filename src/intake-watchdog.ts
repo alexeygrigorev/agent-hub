@@ -1,7 +1,7 @@
 /** Forgotten-work projection and durable restart queue. Canonical session/Fleet admission
  * remains the only launcher; notes never count as liveness or restart authority. */
 import type { SqlStorage } from '@cloudflare/workers-types';
-import type { IntakeService } from './intake';
+import { intakeCompletionHoldReason, type IntakeService } from './intake';
 import { freshCatalogs } from './catalog-freshness';
 import { parseNativeActor } from './work_claim';
 import { getScopeStatus } from './intake_scope';
@@ -103,6 +103,8 @@ export class IntakeWatchdog {
     if (!fresh || !this.project([fresh], now)[0]?.forgotten) return;
     const existing = this.rows('SELECT * FROM intake_restart_queue WHERE task_id=?', t.id)[0];
     if (existing && existing.next_at > now) return;
+    const completionHold = intakeCompletionHoldReason(fresh);
+    if (completionHold) return this.hold(fresh, completionHold, now);
     if (!fresh.acceptance_criteria?.trim()) return this.hold(fresh, 'acceptance_criteria_required', now);
     const block = getScopeStatus(fresh).block_code;
     if (block) return this.hold(fresh, block, now);

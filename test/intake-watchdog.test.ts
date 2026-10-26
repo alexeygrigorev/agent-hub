@@ -67,6 +67,22 @@ describe('forgotten intake watchdog', () => {
     expect(h.sql.exec('SELECT state,reason FROM intake_restart_queue').toArray()).toEqual([{state:'queued',reason:'acceptance_criteria_required'}]);
     expect(h.sql.exec("SELECT kind FROM intake_audit WHERE task_id=? AND kind='restart_queued'",t.id).toArray()).toHaveLength(1);
   }));
+  it.each([
+    ['DONE commit 123abcd\nlive check: hub status\nresult: healthy', 'done_evidence_requires_operator_review'],
+    ['DONE awaiting evidence', 'reported_completion_requires_operator_review'],
+    ['ORIGINAL FINAL STATE (restored record, closed done v8): AC met.', 'reported_completion_requires_operator_review'],
+  ])('queues completed-open claims without relaunching: %s', async (text, reason) => fixture(async h => {
+    const t=task();t.history=[{kind:'note',text}];let starts=0;
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{start:async()=>{starts++;return {status:200,body:{}}}},()=>NOW);w.init();await w.tick();
+    expect(starts).toBe(0);expect(t.status).toBe('open');
+    expect(w.project([t])[0]).toMatchObject({forgotten:true,restart:{state:'queued',reason}});
+  }));
+  it('context changes invalidate old completion claims and permit canonical admission', async () => fixture(async h => {
+    const t=task();t.history=[{kind:'note',text:'DONE commit 123abcd\nlive check: hub status\nresult: healthy'},
+      {kind:'update',changes:{acceptance_criteria:'New authorized criterion'}}];session(h,'old-failure',t,'failed');let starts=0;
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{start:async()=>{starts++;return {status:202,body:{id:'new',state:'queued'}}}},()=>NOW);w.init();await w.tick();
+    expect(starts).toBe(1);expect(w.project([t])[0].restart.state).toBe('submitted');
+  }));
   it('keeps unresolved scope in the visible queue without inventing operator approval', async () => fixture(async h => {
     const t={...task(),scope:{flag:'unknown',policy_version:1}};let starts=0;
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{start:async()=>{starts++;return {status:200,body:{}}}},()=>NOW);w.init();await w.tick();
