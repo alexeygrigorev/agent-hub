@@ -468,6 +468,31 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
                 pass
 
 
+def preserve_managed_file(target):
+    """Keep runtime refreshes, validating confinement before repairing mode.
+
+    Provider CLIs can rewrite files with their default umask. Open the exact
+    regular, singly-linked owner file without following symlinks before chmod;
+    never let an existence check hide an unsafe file or parent.
+    """
+    try:
+        if os.name == 'nt':
+            return bool(private_fs.read_bytes(target, 131072))
+        with private_fs.parent(target, create=True) as anchor:
+            fd = private_fs._open(anchor, target, os.O_RDONLY, private=False)
+            try:
+                info = os.fstat(fd)
+                if os.name != 'nt':
+                    if info.st_uid != os.getuid():
+                        raise PermissionError('Unsafe managed file owner')
+                    os.fchmod(fd, 0o600)
+                return info.st_size > 0
+            finally:
+                os.close(fd)
+    except FileNotFoundError:
+        return False
+
+
 def provision_managed_home(bundle=None, home=None, dest=None):
     """Shared provisioning hook point for managed engine homes.
 
@@ -502,6 +527,11 @@ def provision_managed_home(bundle=None, home=None, dest=None):
     if isinstance(bundle, dict) and isinstance(bundle.get('files'), dict):
         for relative, value in bundle['files'].items():
             target = home / relative
+            # Same-revision sync/execute must not restore the original refresh
+            # token over a rotated live token. A central import gets a new
+            # revision/home; missing or truncated files are repaired normally.
+            if preserve_managed_file(target):
+                continue
             private_fs.atomic_write(target, value.encode(), 32768)
             if os.name != 'nt':
                 try:

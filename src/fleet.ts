@@ -719,8 +719,15 @@ export class FleetService {
       }
       const effectiveWorkspace = resolveLabelUnderRoots(caps.workspaces, request.workspace);
       const absoluteCwd = typeof request.cwd === 'string' && (request.cwd.startsWith('/') || /^[A-Za-z]:[\\/]/.test(request.cwd)) ? request.cwd : null;
+      // Host admission probes the credential actually used for execution.
+      // A healthy sibling account must not mask a refusal for this route.
+      const gateRefusal = Array.isArray(caps.fleet_route_rejections) && caps.fleet_route_rejections.find((r: any) =>
+        r.engine === route.engine && r.account === route.account && (r.profile ?? null) === route.profile
+        && r.mode === request.mode && /^codex_quota_gate_[a-z0-9_]{1,64}$/.test(r.reason)
+        && fresh(r.observed_at, this.now(), 300000));
       let reason = '';
       if (!machine || machine.drained || !fresh(effectiveCheckin(machine.id, machine.last_checkin_at), this.now(), 180000)) reason = 'machine_unavailable';
+      else if (gateRefusal) reason = gateRefusal.reason;
       else if (!Array.isArray(caps.engines) || !caps.engines.includes(route.engine) || !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode) || !workspaceCapable(caps.workspaces, effectiveWorkspace) || (absoluteCwd !== null && !workspaceCapable(caps.workspaces, absoluteCwd))) {
         const engineMissing = !Array.isArray(caps.engines) || !caps.engines.includes(route.engine);
         // A route for an engine no live host advertises anymore is stale

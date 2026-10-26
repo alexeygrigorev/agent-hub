@@ -52,6 +52,9 @@ class FleetTests(unittest.TestCase):
             calls.append((method, path, body))
             return {'offers': []}
         def runner(argv, **kw):
+            if argv[0] == 'maintained-gate':
+                return {'launch_allowed': True, 'profile_supported': True,
+                        'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
             return [] if argv[0] == 'aplexer' else {}
         with patch('agent_hub_host.system.get_system_info', return_value={'capabilities': {}, 'hostname': 'test', 'os': 'test', 'network': 'home', 'roles': []}), \
              patch('agent_hub_host.api.get_heartbeat_payload', return_value={'type': 'heartbeat'}):

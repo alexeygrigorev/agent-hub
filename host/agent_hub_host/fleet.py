@@ -2638,8 +2638,6 @@ class Dispatcher:
         else:
             caps.pop('jobs', None)
         _mark('system')
-        self.request('POST', '/api/machines/register', info)
-        _mark('register')
         hb = api.get_heartbeat_payload()
         if self.settings.get('launcher'):
             from .launcher_recovery import reconcile_resources
@@ -2660,10 +2658,28 @@ class Dispatcher:
                 allowed |= admitted
                 if admitted:
                     admitted_engines.add(sub.get('engine', sub['service']))
+                elif sub.get('service') == 'codex':
+                    reason = gate.get('reason', '')
+                    if not re.fullmatch(r'codex_quota_gate_[a-z0-9_]{1,64}', reason):
+                        reason = 'codex_quota_gate_quota_unavailable'
+                    for mode in caps['fleet_modes']:
+                        caps['fleet_route_rejections'].append({
+                            'engine': sub.get('engine', sub['service']), 'account': sub['account_label'],
+                            'profile': sub.get('profile'), 'mode': mode,
+                            'reason': reason, 'observed_at': utcnow()})
             except Exception:
-                pass
-        hb['gate'] = {'launch_allowed': allowed, 'reason': 'fleet local admission' if allowed else 'fleet admission unavailable', 'at': utcnow()}
+                if sub.get('service') == 'codex':
+                    for mode in caps['fleet_modes']:
+                        caps['fleet_route_rejections'].append({
+                            'engine': sub.get('engine', sub['service']), 'account': sub['account_label'],
+                            'profile': sub.get('profile'), 'mode': mode,
+                            'reason': 'codex_quota_gate_quota_check_failed', 'observed_at': utcnow()})
+        # Publish per-account gate truth, not just the OR of every account's
+        # gate. Planning can then fail over before offering a refused route.
         _mark('admission')
+        self.request('POST', '/api/machines/register', info)
+        _mark('register')
+        hb['gate'] = {'launch_allowed': allowed, 'reason': 'fleet local admission' if allowed else 'fleet admission unavailable', 'at': utcnow()}
         self.request('POST', '/api/host/poll', hb)
         _mark('heartbeat')
         for engine in sorted(admitted_engines):
