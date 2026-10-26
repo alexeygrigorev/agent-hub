@@ -1351,13 +1351,37 @@ export class QuotaStore {
   ): { status: number; body: Record<string, any> } {
     const rawAccounts = this.sql.exec("SELECT * FROM fleet_accounts ORDER BY provider, label").toArray() as any[];
     const serverRows = this.sql.exec("SELECT * FROM server_quota_snapshots ORDER BY account").toArray() as any[];
-    for (const row of serverRows) {
-      if (!rawAccounts.some(a => a.label === row.account)) rawAccounts.push({ label: row.account, provider: row.provider });
-    }
-    // Stored rows keyed by old names (provider `codex-orin`) canonicalize to
-    // the provider model: `codex-orin` is an account under provider `codex`.
+    // Stored rows keyed by old names (provider `codex-orin`, label
+    // `urgent-muse`) canonicalize to the provider model: `codex-orin` is an
+    // account under provider `codex`, the Go pool account is `shared-go`.
     for (const a of rawAccounts) a.provider = canonicalQuotaProvider(a.provider);
     for (const r of serverRows) { r.provider = canonicalQuotaProvider(r.provider); r.account = canonicalAccountLabel(r.account); }
+    // One pool per canonical identity: a stale row under a legacy label must
+    // never duplicate the live canonical row (registry wins ties; among
+    // stored server rows a fresh captured_at beats a stale one, then newest
+    // wins).
+    const serverDeduped: any[] = [];
+    {
+      const byIdentity = new Map<string, any>();
+      const rank = (row: any): [number, number] => [
+        isFreshTs(row.captured_at, nowMs, QUOTA_STALE_MS) ? 1 : 0,
+        Date.parse(row.captured_at),
+      ];
+      for (const row of serverRows) {
+        const key = row.account + " " + row.provider;
+        const prev = byIdentity.get(key);
+        if (!prev) { byIdentity.set(key, row); continue; }
+        const [pf, pt] = rank(prev);
+        const [rf, rt] = rank(row);
+        if (rf > pf || (rf === pf && rt > pt)) byIdentity.set(key, row);
+      }
+      serverDeduped.push(...byIdentity.values());
+    }
+    for (const row of serverDeduped) {
+      if (!rawAccounts.some(a => canonicalAccountLabel(a.label) === row.account && canonicalQuotaProvider(a.provider) === row.provider)) {
+        rawAccounts.push({ label: row.account, provider: row.provider });
+      }
+    }
     const knownProviders = new Set(rawAccounts.map((a: any) => a.provider));
     const knownLabels = new Set(rawAccounts.map((a: any) => a.label));
     const extraAccounts: any[] = [];
@@ -1482,7 +1506,7 @@ export class QuotaStore {
         }
       }
 
-      const central = serverRows.find(r => canonicalAccountLabel(r.account) === canonicalAccountLabel(account.label) && canonicalQuotaProvider(r.provider) === canonicalQuotaProvider(account.provider));
+      const central = serverDeduped.find(r => r.account === canonicalAccountLabel(account.label) && r.provider === canonicalQuotaProvider(account.provider));
       let source = "machine-fallback";
       if (central) {
         let quota: any = null;

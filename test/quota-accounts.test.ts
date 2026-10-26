@@ -93,6 +93,10 @@ describe('canonical harness/provider/account mapping (codex-orin, go, zai)', () 
       hub.sql.exec("INSERT INTO fleet_routes VALUES ('m1','codex','codex-orin','hub-codex-orin')");
       hub.sql.exec("INSERT INTO fleet_routes VALUES ('m1','opencode','urgent-muse',NULL)");
       hub.sql.exec("INSERT INTO fleet_routes VALUES ('m1','zcodex','shared-zai',NULL)");
+      // A stale server row under the legacy label must not duplicate the
+      // live canonical row: one pool per canonical identity.
+      hub.sql.exec('INSERT INTO server_quota_snapshots VALUES (?,?,?,?)', 'urgent-muse', 'go', ts(-2000000), JSON.stringify(route(10, ts(-2000000))));
+      hub.sql.exec('INSERT INTO server_quota_snapshots VALUES (?,?,?,?)', 'shared-go', 'go', at, JSON.stringify(route(83, at)));
       // Old host subscription reports (legacy service + legacy label).
       for (const [account, service, pct] of [['codex-orin', 'codex-orin', 72], ['urgent-muse', 'go', 61], ['shared-zai', 'zai', 50]] as const) {
         hub.sql.exec('INSERT INTO fleet_subscriptions VALUES (?,?,?,?,?,?)', 'm1', account, service, null, at, JSON.stringify(route(pct, at)));
@@ -105,10 +109,12 @@ describe('canonical harness/provider/account mapping (codex-orin, go, zai)', () 
       // Every row exposes the harness alongside provider/account.
       expect(byAccount['codex-orin']).toMatchObject({ provider: 'codex', state: 'fresh', remaining_percent: 72 });
       expect(byAccount['codex-orin'].harness).toEqual(['codex']);
-      expect(byAccount['urgent-muse'] ?? byAccount['shared-go']).toBeDefined();
-      const goPool = byAccount['shared-go'];
-      expect(goPool).toMatchObject({ provider: 'go', state: 'fresh', remaining_percent: 61 });
-      expect(goPool.harness).toEqual(['opencode']);
+      // Exactly one Go pool: the fresh canonical server row wins over both
+      // the stale legacy server row and the per-host subscription.
+      const goPools = body.pools.filter((p: any) => p.provider === 'go');
+      expect(goPools.map((p: any) => p.account)).toEqual(['shared-go']);
+      expect(goPools[0]).toMatchObject({ state: 'fresh', source: 'server', remaining_percent: 83 });
+      expect(goPools[0].harness).toEqual(['opencode']);
       expect(byAccount['shared-zai'].harness).toEqual(['codex']);
       // Legacy provider filter selects both Codex accounts.
       const filtered = store.getFleetView({ host_id: null, provider: 'codex', engine: null, account: null }, now).body as any;
