@@ -52,7 +52,8 @@ process.exit(mod.exports.sanitizeExitEvidence(JSON.parse(readFileSync(0,'utf8'))
         self.assertEqual(utf16_clip('ab'+chr(0x1f600),3),'ab')
         self.assertEqual(utf16_clip(chr(0x1f600)+'ab',3,tail=True),'ab')
         git=Mock(side_effect=[Mock(stdout=''),Mock(stdout=' M '+chr(0x1f600)*255)])
-        paths=terminal_evidence({'incarnation':1000,'workspace':'/repo'},{},git=git)['dirty_paths']
+        with patch.object(Path, 'exists', return_value=True):
+            paths=terminal_evidence({'incarnation':1000,'workspace':'/repo'},{},git=git)['dirty_paths']
         self.assertLessEqual(len(paths[0].encode('utf-16-le'))//2,256)
 
     def test_generated_fallback_report_and_artifacts_pass_actual_finish_result_validator(self):
@@ -137,6 +138,7 @@ process.exit(mod.exports.sanitizeExitEvidence(JSON.parse(readFileSync(0,'utf8'))
                        engine='opencode', history_path=str(history), exit=dict(code=17, signal=9, exited_at_ms=3100))
             saved = snapshot_native(record, row)
             record['exit_evidence'] = saved
+            (root / '.git').mkdir()
             git = Mock(side_effect=[Mock(stdout='a' * 40 + '\n'), Mock(stdout=' M host/example.py\n')])
             result = terminal_evidence(record, {}, git=git)
             self.assertEqual((result['exit_code'], result['exit_signal'], result['wall_time_ms']), (17, 9, 2100))

@@ -206,7 +206,11 @@ def terminal_evidence(record, tombstone, *, git=subprocess.run, state_dir=None):
               'engine_outcome': outcome if outcome in ('succeeded', 'failed', 'cancelled') else None,
               'observed_commits': [], 'dirty_paths': []}
     cwd = record.get('target_cwd') or record.get('workspace')
-    if isinstance(cwd, str) and Path(cwd).is_absolute() and type(start) is int:
+    workspace = record.get('workspace') or cwd
+    if (isinstance(cwd, str) and Path(cwd).is_absolute() and type(start) is int
+            and isinstance(workspace, str) and Path(workspace).is_absolute()
+            and (Path(workspace) / '.git').exists()
+            and Path(cwd).resolve().is_relative_to(Path(workspace).resolve())):
         try:
             since = dt.datetime.fromtimestamp(start / 1000, dt.timezone.utc).isoformat()
             proc = git(['git', 'log', '-8', '--format=%H', '--since=' + since], cwd=cwd, capture_output=True, text=True, timeout=3, check=True)

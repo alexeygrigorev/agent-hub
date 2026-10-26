@@ -14,8 +14,8 @@ it('stores sanitized routed exit evidence only with owning-host confirmed exit',
     const routing = new RoutingService(hub.sql, fleet, Date.now, tx); routing.init();
     const sql = hub.sql, now = new Date().toISOString();
     const launch = crypto.randomUUID(), job = crypto.randomUUID();
-    sql.exec(`INSERT INTO fleet_launches(id,actor,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
-      VALUES(?, 'tester', ?, '{}', 'hetzner', 'opencode', 'shared-go', 'headless', 'demo', 'audit', 'running', ?, ?)`, launch, launch, now, now);
+    sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
+      VALUES(?, 'tester', 'agent', 'routed audit', ?, '{}', 'hetzner', 'opencode', 'shared-go', 'headless', 'demo', 'audit', 'running', ?, ?)`, launch, launch, now, now);
     sql.exec(`INSERT INTO routing_jobs(id,actor,request_key,request_json,launch_id,state,created_at,updated_at)
       VALUES(?, 'tester', ?, ?, ?, 'running', ?, ?)`, job, job, JSON.stringify({tier:'daily',tasks:[],needs:[],workspace:'demo'}), launch, now, now);
     const host = (id: string) => ({caller:{kind:'host',machineId:id},scopes:['host']});

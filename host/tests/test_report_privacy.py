@@ -123,3 +123,12 @@ class ReportPrivacy(unittest.TestCase):
             self.assertTrue(payload['confirmed_exit'])
         finally:
             case.doCleanups()
+
+
+    def test_non_repository_workspace_cannot_inherit_parent_repository_commits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            git=Mock(side_effect=AssertionError('must not inspect parent repository'))
+            result=terminal_evidence(dict(workspace=tmp,incarnation=1000),{},git=git)
+            self.assertEqual(result['observed_commits'],[])
+            self.assertEqual(result['dirty_paths'],[])
+            git.assert_not_called()
