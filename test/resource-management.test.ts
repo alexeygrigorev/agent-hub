@@ -23,6 +23,13 @@ async function fixture(fn:(r:ResourceManagement,sql:any,f:FleetService)=>Promise
 }
 const sample=(extra={})=>({session_id:'session',native_id:'native',current_rss_mb:200,peak_rss_mb:200,peak_pss_mb:210,cpu_seconds:20,runtime_s:100,observed_at:iso(),...extra});
 describe('resource management',()=>{
+ it('reports a stale same-hostname alias row under its live canonical host, not as an unknown-telemetry host (intake 4398ce2a)',async()=>fixture(async(r,sql)=>{
+  sql.exec('INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,last_heartbeat,drained,capabilities) VALUES(?,?,?,?,?,?,?,?)','host-alias-old','old','HOST','2026-01-01T00:00:00.000Z','2026-10-15T10:35:04.921Z','{}',0,JSON.stringify({cpu_count:12}));
+  const hosts=r.overview().hosts;
+  expect(hosts.map((h:any)=>h.machine_id)).toEqual(['host']);
+  expect(hosts[0].aliases).toEqual(['host-alias-old']);
+  expect(hosts[0].mem_total_mb).toBe(64000);
+ }));
  it('keeps the configured host floor at the exact boundary and fails closed on invalid math',()=>{
   const cfg=resourceConfig();expect(memoryVerdict(2560,0,512,cfg)).toBe(true);expect(memoryVerdict(2559,0,512,cfg)).toBe(false);
   expect(memoryVerdict(2047,0,0,cfg)).toBe(false);expect(memoryVerdict(NaN,0,512,cfg)).toBe(false);expect(memoryVerdict(8000,-1000,512,cfg)).toBe(false);

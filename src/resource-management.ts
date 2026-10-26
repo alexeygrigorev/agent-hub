@@ -4,6 +4,7 @@ import defaults from '../config/resource-management.json';
 import { IntakeService } from './intake';
 import { policy } from './model-routing';
 import { cpuVerdict } from './cpu-headroom';
+import { resolveMachineAliases } from './machine-alias';
 export const MEMORY_FLOOR_MB = defaults.memory_floor_mb;
 export const NEXT_SLOT_MB = defaults.ramp_reserve_default_mb;
 export const CPU_LOAD_FACTOR = defaults.cpu_load_factor;
@@ -288,9 +289,19 @@ export class ResourceManagement {
   }
   reaps() { return this.sql.exec('SELECT * FROM resource_reaps ORDER BY at DESC LIMIT 100').toArray(); }
   overview() {
-    const hosts=this.sql.exec('SELECT id,capabilities,last_heartbeat,last_checkin_at FROM machines WHERE drained=0').toArray().map((m:any)=>{
+    const rows=this.sql.exec('SELECT id,hostname,drained,capabilities,last_heartbeat,last_checkin_at FROM machines WHERE drained=0').toArray() as any[];
+    // Intake 4398ce2a: a stale re-registered record of the same physical host
+    // (SnV2 for live DEFLf4, hostname RMTHZ) has no telemetry and showed up as
+    // a second host with CPU/memory 'unknown'. Mark-never-delete aliasing:
+    // report the live canonical host only and list its alias ids.
+    let aliasOf=new Map<string,string>();
+    try {
+      aliasOf=resolveMachineAliases(rows.map((m:any)=>{const at=typeof m.last_checkin_at==='string'?Date.parse(m.last_checkin_at):NaN;
+        return {id:String(m.id),hostname:m.hostname,drained:m.drained,last_seen_ms:Number.isFinite(at)?at:null};})).aliasOf;
+    } catch { aliasOf=new Map(); }
+    const hosts=rows.filter((m:any)=>!aliasOf.has(String(m.id))).map((m:any)=>{
       const hb=parse(m.last_heartbeat),caps=parse(m.capabilities),headroom=this.headroom(m.id);
-      return {machine_id:m.id,mem_total_mb:hb.mem_total_mb??null,
+      return {machine_id:m.id,aliases:[...aliasOf].filter(([,c])=>c===String(m.id)).map(([a])=>a).sort(),mem_total_mb:hb.mem_total_mb??null,
         mem_used_mb:finite(hb.mem_total_mb)&&finite(hb.mem_avail_mb)?hb.mem_total_mb-hb.mem_avail_mb:null,
         load5:hb.load?.[1]??null,cores:caps.cpu_count??null,...headroom,cpu:this.cpuHeadroom(m.id),host_observed_at:m.last_checkin_at,
         running:Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_sessions WHERE machine_id=? AND phase='running'",m.id).one().n),
