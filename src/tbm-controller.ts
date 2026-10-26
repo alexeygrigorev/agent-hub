@@ -83,9 +83,9 @@ CREATE INDEX IF NOT EXISTS idx_tbm_session_tokens_tag ON tbm_session_tokens(tag)
 `;
 
 const TBM_RESET_TRIGGER_SQL = `
-CREATE TRIGGER IF NOT EXISTS trg_tbm_pool_reset_capture
+CREATE TRIGGER IF NOT EXISTS trg_tbm_pool_reset_capture_v2
 AFTER UPDATE OF reset_at_ms ON tbm_quota_pools
-WHEN NEW.reset_at_ms > OLD.reset_at_ms AND OLD.pool_id != '*' AND OLD.reset_at_ms > 0
+WHEN NEW.reset_at_ms > OLD.reset_at_ms AND OLD.pool_id != '*' AND OLD.reset_at_ms > 0 AND NEW.last_updated_ms >= OLD.reset_at_ms
 BEGIN
   INSERT OR IGNORE INTO tbm_pool_resets (
     pool_id, reset_at_ms, provider, account,
@@ -166,6 +166,7 @@ export function ensureTbmControllerSchema(sql: SqlStorage): void {
     }
   }
   try {
+    sql.exec('DROP TRIGGER IF EXISTS trg_tbm_pool_reset_capture');
     sql.exec(TBM_RESET_TRIGGER_SQL);
   } catch {}
 }
@@ -184,7 +185,6 @@ export interface SessionTokensInput {
 
 /** Record or update measured native token usage for a session and upgrade any pending reward row. */
 export function recordSessionTokens(sql: SqlStorage, input: SessionTokensInput, nowMs = Date.now()): void {
-  ensureTbmControllerSchema(sql);
   const inTok = typeof input.input_tokens === 'number' && Number.isFinite(input.input_tokens) && input.input_tokens >= 0
     ? Math.floor(input.input_tokens)
     : 0;
@@ -195,11 +195,12 @@ export function recordSessionTokens(sql: SqlStorage, input: SessionTokensInput, 
     ? Math.floor(input.total_tokens)
     : inTok + outTok;
   const atMs = typeof input.observed_at_ms === 'number' && Number.isFinite(input.observed_at_ms) ? input.observed_at_ms : nowMs;
-  const prior: any = sql.exec('SELECT * FROM tbm_session_tokens WHERE session_id = ?', input.session_id).toArray()[0];
+  const prior: any = hasTable(sql, 'tbm_session_tokens') ? sql.exec('SELECT * FROM tbm_session_tokens WHERE session_id = ?', input.session_id).toArray()[0] : null;
   if (prior && prior.input_tokens === inTok && prior.output_tokens === outTok && prior.total_tokens === totTok
       && (!input.native_id || prior.native_id === input.native_id)
       && (!input.tag || prior.tag === input.tag) && (!input.engine || prior.engine === input.engine)
       && (!input.account || prior.account === input.account)) return;
+  ensureTbmControllerSchema(sql);
   sql.exec(
     `INSERT INTO tbm_session_tokens (session_id, native_id, tag, engine, account, input_tokens, output_tokens, total_tokens, observed_at_ms)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -392,7 +393,7 @@ export interface RewardEventRow {
 
 /**
  * Write or idempotently upgrade a terminal session outcome reward event.
- * - Useful outcome (`done` / `stopped`) yields positive `useful_work_reward`.
+ * - Accepted/verified outcome yields positive `useful_work_reward`.
  * - Failed / cancelled / refused / stuck yields 0 `useful_work_reward`.
  * - Real native token counts compute `token_efficiency_eta` (VU/MTok) and set `tokens_known = 1`.
  * - Unknown native token counts stay `tokens_known = 0, tokens_burned = null` with NO fabricated
@@ -581,6 +582,7 @@ export function sweepTerminalSessionRewards(sql: SqlStorage, nowMs = Date.now())
        LEFT JOIN tbm_reward_events r ON r.event_id = ('session:' || s.id)
        WHERE s.state IN ('stopped', 'failed', 'cancelled', 'refused')
          AND r.event_id IS NULL
+         AND (s.mode != 'interactive' OR json_extract(s.request_json, '$.intake_task_id') IS NOT NULL)
        ORDER BY s.updated_at DESC LIMIT 100`
     ).toArray() as any[];
     for (const s of rows) {
@@ -655,7 +657,7 @@ function processResetPenalties(sql: SqlStorage, pools: TbmPoolRow[], nowMs: numb
   for (const p of pools) {
     if (p.pool_id === '*') continue;
     const st = sql.exec('SELECT last_reset_at_ms, last_remaining FROM tbm_controller_state WHERE pool_id = ?', p.pool_id).toArray()[0] as any;
-    if (st && typeof st.last_reset_at_ms === 'number' && st.last_reset_at_ms > 0 && p.reset_at_ms > st.last_reset_at_ms) {
+    if (st && typeof st.last_reset_at_ms === 'number' && st.last_reset_at_ms > 0 && st.last_reset_at_ms <= nowMs && p.reset_at_ms > st.last_reset_at_ms) {
       const rem = typeof st.last_remaining === 'number' ? st.last_remaining : 0;
       const pctOnly = isPercentOnlyTbmPool(p);
       sql.exec(
@@ -679,7 +681,7 @@ function processResetPenalties(sql: SqlStorage, pools: TbmPoolRow[], nowMs: numb
     }
   }
 
-  const unrewarded = sql.exec('SELECT * FROM tbm_pool_resets WHERE rewarded = 0 ORDER BY reset_at_ms ASC').toArray() as any[];
+  const unrewarded = sql.exec('SELECT * FROM tbm_pool_resets WHERE rewarded = 0 AND reset_at_ms <= ? ORDER BY reset_at_ms ASC', nowMs).toArray() as any[];
   for (const r of unrewarded) {
     const eventId = `reset:${r.pool_id}:${r.reset_at_ms}`;
     const pctOnly = Number(r.capacity_known) === 0 || Number(r.total_capacity_tokens) <= 0;

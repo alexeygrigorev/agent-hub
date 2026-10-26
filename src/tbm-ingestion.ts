@@ -1,5 +1,6 @@
 /** TBM projections of the existing account quota observations. Unknown tokens stay unknown. */
 import type { SqlStorage } from '@cloudflare/workers-types';
+import { canonicalQuotaProvider, canonicalAccountLabel, snapshotRouteForAccount } from './quota';
 const HOUR = 3600000, DAY = 24 * HOUR;
 export const tbmPoolId = (provider: string, account: string, window: string) => `${provider}:${account}:${window}`;
 export const WINDOW_CYCLE_MS: Record<string, number> = {
@@ -31,12 +32,16 @@ export const tbmHardFloorTokens = (total: number) => Math.min(total, Math.max(to
 
 /** A provider-wide snapshot must never be copied onto several independent accounts. */
 export function accountsForHostProvider(sql: SqlStorage, host: string, provider: string): string[] {
-  const rows: any[] = sql.exec(`SELECT DISTINCT a.label FROM fleet_routes r JOIN fleet_accounts a
-    ON r.account=a.label WHERE r.machine_id=? AND a.provider=? ORDER BY a.label`, host, provider).toArray();
-  if (rows.length === 1) return [rows[0].label];
+  const canonical = canonicalQuotaProvider(provider);
+  const eligible = (rows: any[]) => rows.filter(row => snapshotRouteForAccount(row.label, row.provider, { [provider]: true }) === true);
+  const rows = eligible(sql.exec(`SELECT DISTINCT a.label,a.provider FROM fleet_routes r JOIN fleet_accounts a
+    ON r.account=a.label WHERE r.machine_id=? ORDER BY a.label`, host).toArray());
+  if (rows.length === 1) return [canonicalAccountLabel(rows[0].label)];
   if (rows.length > 1) return [];
-  const accounts: any[] = sql.exec('SELECT label FROM fleet_accounts WHERE provider=? ORDER BY label', provider).toArray();
-  return accounts.length === 1 ? [accounts[0].label] : accounts.length === 0 ? [provider] : [];
+  const accounts = eligible(sql.exec('SELECT label,provider FROM fleet_accounts ORDER BY label').toArray());
+  return accounts.length === 1 ? [canonicalAccountLabel(accounts[0].label)] : accounts.length === 0
+    && canonical === provider ? [provider] : [];
+
 }
 export interface TbmSyncCounts { pools: number; tranches: number }
 interface WindowIngest { provider: string; account: string; windowName: string; window: any }
@@ -105,7 +110,8 @@ function syncBanked(sql: SqlStorage, provider: string, account: string, quota: a
 }
 export function syncTbmFromServerAccounts(sql: SqlStorage, accounts: {account: string; provider: string; quota: any}[], at: number): TbmSyncCounts {
   const result = { pools: 0, tranches: 0 };
-  for (const {account, provider, quota} of accounts) {
+  for (const row of accounts) {
+    const provider = canonicalQuotaProvider(row.provider), account = canonicalAccountLabel(row.account), quota = row.quota;
     if (quota?.status !== 'ok') continue;
     const windows = Object.entries(quota.windows ?? {}).map(([windowName,window]) => ({provider,account,windowName,window}));
     const added = syncWindowsIntoTbm(sql,windows,at);

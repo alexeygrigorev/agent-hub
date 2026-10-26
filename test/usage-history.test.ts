@@ -95,18 +95,13 @@ describe('quota window history (AC1)', () => {
 });
 
 describe('account display mapping (AC4)', () => {
-  it('shows harness/provider splits while old keys keep joining history', () => {
-    expect(displayAccountLabel('codex-orin', 'ignored-label')).toBe('codex/openai orin');
-    expect(displayAccountLabel('go', 'x')).toBe('opencode/go opencode-go');
-    expect(displayAccountLabel('zai', 'x')).toBe('codex/zai shared-zai');
-    expect(displayAccountLabel('codex', 'x')).toBe('codex/openai shared-codex');
-    expect(displayAccount('codex-orin')).toEqual({ harness: 'codex', provider: 'openai', account: 'orin' });
-    // Sibling rename aliases join: new keys resolve to the same stored key.
-    expect(canonicalProviderKey('codex/orin')).toBe('codex-orin');
-    expect(canonicalProviderKey('opencode-go')).toBe('go');
-    expect(canonicalProviderKey('codex/zai')).toBe('zai');
-    // Unknown providers pass through instead of breaking the UI.
-    expect(displayAccountLabel('brand-new', 'my-acct')).toBe('brand-new/brand-new my-acct');
+  it('reuses canonical quota labels without inventing sibling rename aliases', () => {
+    expect(displayAccountLabel('codex-orin')).toBe('codex/codex codex-orin');
+    expect(displayAccountLabel('go', 'urgent-muse')).toBe('opencode/go shared-go');
+    expect(displayAccountLabel('zai', 'shared-zai')).toBe('codex/zai shared-zai');
+    expect(displayAccountLabel('codex', 'shared-codex')).toBe('codex/codex shared-codex');
+    expect(canonicalProviderKey('codex-orin')).toBe('codex');
+    expect(displayAccountLabel('brand-new','my-acct')).toBe('brand-new/brand-new my-acct');
   });
 });
 

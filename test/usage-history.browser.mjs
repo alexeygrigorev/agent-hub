@@ -49,6 +49,7 @@ try {
         range = u.searchParams.get('range');
         return route.fulfill({ json: { range, start: new Date(start).toISOString(), end: new Date(end).toISOString(), retention_days: 32, series, note: 'Gaps are unknown.' } });
       }
+      if (u.pathname === '/api/quota') return route.fulfill({ json: { canonical: {accounts: {'urgent-muse':'shared-go'}}, pools: [{account:'shared-codex',provider:'codex',harness:['codex']}] } });
       if (u.pathname === '/api/monitoring/tokens') return route.fulfill({ json: { schema_version: '1.0', sources } });
       if (u.pathname === '/api/metrics') {
         if (!u.searchParams.has('host_id')) return route.fulfill({ json: { items: [{ host_id: 'hetzner' }], next_cursor: null } });
@@ -64,7 +65,7 @@ try {
     await page.goto('http://usage.fixture/metrics.html#usage-history');
     await page.waitForSelector('#usage-quota-history svg');
     // One line per window: 7d only (monthly is fully null and leaves no trace).
-    assert.match(await page.locator('#usage-quota-history').innerText(), /codex\/openai shared-codex/);
+    assert.match(await page.locator('#usage-quota-history').innerText(), /codex\/codex shared-codex/);
     assert.equal(await page.locator('#usage-quota-history svg').count(), 1);
     assert.equal(await page.locator('#usage-quota-history .metrics-line').count(), 1);
     // Reset marker drawn where the reset time changed.

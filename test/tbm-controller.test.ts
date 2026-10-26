@@ -7,6 +7,7 @@ import { evaluateTbmAdmission, isPercentOnlyTbmPool } from '../src/quota_admissi
 import {
   hardFloorTokens,
   loadProviderPacing,
+  loadProviderEfficiencies,
   pacingFor,
   selectBurnSource,
   softReserveTokens,
@@ -489,5 +490,39 @@ describe('TBM late telemetry preserves accepted work', () => {
       expect(accepted.work_units).toBe(10);
       expect(accepted.token_efficiency_eta).toBe(100);
     });
+  });
+});
+
+
+it('does not penalize future deadline corrections or contaminate efficiency with unused quota', async () => {
+  await inDO(stub('reset-corrections'), (h: any) => {
+    const sql = h.sql;
+    ensureTbmControllerSchema(sql);
+    sql.exec(`INSERT INTO tbm_quota_pools (pool_id,provider,account,total_capacity_tokens,remaining_tokens,
+      headroom_percentage,reset_at_ms,last_updated_ms,cycle_ms) VALUES ('codex:correction:5h','codex','correction',1000000,800000,80,?,?,?)`, NOW+HOUR,NOW,5*HOUR);
+    recordSessionOutcomeReward(sql, {session_id:'accepted',outcome:'done',tokens_burned:100000,pool_id:'codex:correction:5h'}, NOW);
+    const before = loadProviderEfficiencies(sql,NOW).get('codex:correction');
+    tickTbm(sql, NOW);
+    sql.exec("UPDATE tbm_quota_pools SET reset_at_ms=?,last_updated_ms=? WHERE pool_id='codex:correction:5h'", NOW+2*HOUR, NOW+MIN);
+    tickTbm(sql,NOW+2*MIN);
+    expect(sql.exec("SELECT * FROM tbm_reward_events WHERE event_kind='reset'").toArray()).toHaveLength(0);
+    tickTbm(sql,NOW+2*HOUR+MIN);
+    expect(sql.exec("SELECT * FROM tbm_reward_events WHERE event_kind='reset'").toArray()).toHaveLength(1);
+    expect(loadProviderEfficiencies(sql,NOW+2*HOUR+MIN).get('codex:correction')).toBe(before);
+  });
+});
+
+it('updates an older reward directly even after more than 100 newer outcomes', async () => {
+  await inDO(stub('older-token-final'), (h: any) => {
+    const sql = h.sql;
+    recordSessionOutcomeReward(sql, {session_id:'older',outcome:'done'}, NOW);
+    for(let i=0;i<101;i++) sql.exec(`INSERT INTO tbm_reward_events
+      (event_id,timestamp_ms,pool_id,intake_task_id,active_mode,swarm_concurrency,useful_work_reward,
+      pacing_error_penalty,floor_breach_penalty,engine_mix_penalty,waste_at_reset_penalty,banked_waste_penalty,net_reward,token_efficiency_eta,session_id)
+      SELECT ?,?,pool_id,intake_task_id,active_mode,swarm_concurrency,useful_work_reward,
+      pacing_error_penalty,floor_breach_penalty,engine_mix_penalty,waste_at_reset_penalty,banked_waste_penalty,net_reward,token_efficiency_eta,?
+      FROM tbm_reward_events WHERE event_id='session:older'`, 'session:newer-'+i,NOW+i+1,'newer-'+i);
+    recordSessionTokens(sql, {session_id:'older',total_tokens:12345}, NOW+MIN);
+    expect(sql.exec("SELECT tokens_burned FROM tbm_reward_events WHERE event_id='session:older'").one().tokens_burned).toBe(12345);
   });
 });

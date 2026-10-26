@@ -48,7 +48,7 @@ POST_TIMEOUT_S = 10.0
 
 _CODEX_SOURCES = (
     ("codex", "shared-codex", ".codex"),
-    ("codex", "orin", ".codex-orin"),
+    ("codex", "codex-orin", ".codex-orin"),
     ("zcodex", "shared-zai", ".zcodex"),
 )
 
@@ -191,7 +191,7 @@ def native_session_tokens(row, locator=None):
             _SESSION_TOKEN_CACHE.clear()
         _SESSION_TOKEN_CACHE[key] = latest
         return latest
-    except (OSError, ValueError, TypeError, KeyError, sqlite3.Error):
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, sqlite3.Error):
         return None
 
 
@@ -403,7 +403,7 @@ def build_hours(now_ms: int) -> List[Dict[str, Any]]:
     except Exception:
         pass
     try:
-        merge("opencode", "opencode-go",
+        merge("opencode", "shared-go",
               collect_opencode(os.path.join(home, ".local", "share", "opencode", "opencode.db"), since_ms, now_ms))
     except Exception:
         pass

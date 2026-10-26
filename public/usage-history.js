@@ -6,25 +6,9 @@
   const NS = 'http://www.w3.org/2000/svg';
   const el = (tag, text, cls) => Object.assign(document.createElement(tag), { textContent: text || '', className: cls || '' });
   const RESET_SUFFIX = '__reset_at';
-  // Display-only harness/provider mapping (mirrors src/account-display.ts;
-  // stored history keys never change, so old rows join renamed accounts).
-  // History entities are account labels, so map labels (and provider keys).
-  const DISPLAY = {
-    codex: ['codex/openai', 'shared-codex'],
-    'codex-orin': ['codex/openai', 'orin'],
-    zai: ['codex/zai', 'shared-zai'],
-    go: ['opencode/go', 'opencode-go'],
-    'shared-codex': ['codex/openai', 'shared-codex'],
-    'shared-zai': ['codex/zai', 'shared-zai'],
-    'urgent-muse': ['opencode/go', 'opencode-go'],
-  };
-  const ALIAS = { 'codex/orin': 'codex-orin', 'opencode-go': 'go', 'codex/zai': 'zai' };
-  const displayAccount = label => {
-    const key = ALIAS[label] || label;
-    const known = DISPLAY[key];
-    if (known) return `${known[0]} ${known[1]}`;
-    return label;
-  };
+  // Canonical account aliases come from the shared quota endpoint.
+  let accountAliases = {}, accountLabels = {};
+  const displayAccount = label => accountLabels[accountAliases[label] || label] || accountAliases[label] || label;
   let fetchApi = null, generation = 0, initialized = false;
   let range = '24h';
   const root = () => document.getElementById('usage-history');
@@ -156,11 +140,15 @@
     const current = ++generation;
     const note = root() ? root().querySelector('[data-usage-note]') : null;
     try {
-      const [history, tokens] = await Promise.all([
+      const [history, tokens, quota] = await Promise.all([
         fetchApi(`/api/monitoring/history?range=${range}`),
         fetchApi('/api/monitoring/tokens').catch(() => null),
+        fetchApi('/api/quota?view=fleet').catch(() => null),
       ]);
       if (current !== generation) return;
+      accountAliases = quota?.canonical?.accounts || {};
+      accountLabels = Object.fromEntries((quota?.pools || []).map(p => [p.account,
+        `${(p.harness || p.engines || []).join(', ') || 'unknown'}/${p.provider} ${p.account}`]));
       if (note) note.textContent = statusLine(history);
       drawQuota(history, '');
       drawTokens(history, tokens && tokens.sources);

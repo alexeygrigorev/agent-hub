@@ -437,7 +437,7 @@ export function loadProviderEfficiencies(sql: SqlStorage, nowMs: number): Map<st
     const rows = sql.exec(
       `SELECT pool_id, SUM(token_efficiency_eta * tokens_burned) / SUM(tokens_burned) AS avg_eta, COUNT(*) AS n
        FROM tbm_reward_events
-       WHERE timestamp_ms >= ? ${knownFilter} AND tokens_burned > 0
+       WHERE timestamp_ms >= ? ${knownFilter} AND tokens_burned > 0 AND event_kind = 'session'
        GROUP BY pool_id`,
       sinceMs
     ).toArray() as any[];

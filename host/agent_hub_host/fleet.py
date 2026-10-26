@@ -625,7 +625,7 @@ def session_metadata(raw, settings, progress=None):
                       **({'progress': progress[session['id']]} if progress and session['id'] in progress else {})})
         if session.get('tag', '').startswith(('hub-', 'task-hub-')):
             from .token_usage import native_session_tokens
-            usage = native_session_tokens(session)
+            usage = native_session_tokens({**session, 'created_at_ms': created_at_ms, 'workspace': ws, 'cwd': cwd})
             if usage is not None:
                 clean[-1]['tokens'] = usage
     return clean
