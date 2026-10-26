@@ -135,6 +135,7 @@ describe('generic accounts and launch placement', () => {
     const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
     await s.handle(request('/subscriptions', { subscriptions: [{ service: 'codex', account: 'shared-codex', plan: 'pro', quota }] }, 'PUT'), host('hetzner'));
     expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).selected?.profile).toBe('secondary');
+    expect(sql.exec('SELECT started_at FROM resource_ramps WHERE launch_id=?', first.value.id).one().started_at).toBe(iso());
     sql.exec("UPDATE fleet_accounts SET provider='zai' WHERE label='shared-codex'");
     expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).selected).toBeNull();
     expect(s.plan(intent({ machine: 'hetzner', tier: 'deep' })).rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'tier_unavailable' });
@@ -166,6 +167,7 @@ describe('generic accounts and launch placement', () => {
     expect(offers.offers.find((o: any) => o.id === first.value.id)?.selection).toMatchObject({ id: 'astra', model: 'gpt-6-astra' });
     expect(s.reserve(input, admin).value).toMatchObject({ id: first.value.id, replay: true });
     expect(s.reserve({ ...input, engine: 'codex' }, admin).status).toBe(409);
+    expect(sql.exec('SELECT * FROM resource_ramps WHERE launch_id=?', first.value.id).toArray()).toHaveLength(0); // Listing offers is not a start.
     const claim = { gate_allowed: true, profile_supported: true, observed_at: iso(), account: 'shared-codex' };
     for (const model of [undefined, 'gpt-6.1-sol']) {
       const refused = await s.handle(request('/launches/' + first.value.id + '/claim', { ...claim, model }), host('hetzner'));

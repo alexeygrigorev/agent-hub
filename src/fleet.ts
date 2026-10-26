@@ -1158,7 +1158,6 @@ export class FleetService {
         const offers: any[] = [];
         for (const row of this.sql.exec("SELECT * FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at, id LIMIT 100", caller.machineId!)) {
           if (this.admission.retireInvalidOffer(row)) continue;
-          this.sql.exec('INSERT OR IGNORE INTO resource_ramps VALUES(?,?)', row.id, new Date(this.now()).toISOString());
           offers.push({ ...this.resources.cpuStart(String(row.id)), resource_choking:this.resources.cpuHeadroom(caller.machineId!,parsed(row.request_json),String(row.id)).resource_choking, resource_management: this.resources.config(), memory_estimate_mb: this.resources.estimate(parsed(row.request_json).project || String(row.workspace), String(row.engine), parsed(row.request_json).task_kind || 'goal'), selection: parsed(row.model_selection_json) ?? {}, id: row.id, engine: row.engine, account: row.account, profile: row.profile, mode: row.mode, workspace: row.workspace, cwd: parsed(row.request_json).cwd ?? null, prompt: row.prompt, ...(parsed(row.request_json).with_goal === true ? { with_goal: true } : {}), access: parsed(row.request_json).access?.mode || 'legacy_unspecified' });
           if (offers.length === 20) break;
         }
@@ -1472,6 +1471,7 @@ export class FleetService {
           const finalHold = current.state === 'offered' ? this.admission.retireInvalidOffer(current) : current.exit_reason || 'already_claimed';
           if (finalHold) return response({ error: finalHold }, ['claim_inactive', 'claim_conflict', 'claim_authority_changed', 'already_claimed'].includes(finalHold) ? 409 : 403);
           this.sql.exec("UPDATE fleet_launches SET state = 'starting', updated_at = ? WHERE id = ? AND state = 'offered'", new Date(this.now()).toISOString(), row.id);
+          this.sql.exec('INSERT INTO resource_ramps VALUES(?,?) ON CONFLICT(launch_id) DO UPDATE SET started_at=excluded.started_at', row.id, new Date(this.now()).toISOString());
           return response({ ...row, state: 'starting' });
         }
         // Replay an identical committed normal-headless terminal receipt without effects.
