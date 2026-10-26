@@ -26,6 +26,32 @@ _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 def _strip_control_chars(value: str) -> str:
     return _CONTROL_RE.sub("", value)
+
+
+def _terminal_fleet_state(reconciled_state, has_result, diagnostic_reason=None):
+    """Map launcher reconcile outcome to the terminal Fleet state.
+
+    A missing result JSON never marks success: headless launches without a
+    forwarded result file settle as failed (failed-with-partial-work),
+    never exited/done. Permission-refused and launcher-failed stay failed.
+    """
+    if diagnostic_reason == 'engine_tool_permission_refused':
+        return 'failed'
+    if reconciled_state == 'failed':
+        return 'failed'
+    if not has_result:
+        return 'failed'
+    return 'exited'
+
+
+def _sanitize_launcher_slug(text, limit=64):
+    """Keep a bounded launcher reason slug (alnum plus ._-); never fail."""
+    try:
+        raw = str(text or '').strip().split()[0] if str(text or '').strip() else ''
+        slug = re.sub(r'[^A-Za-z0-9_.-]', '_', raw)[:limit].strip('_.')
+        return slug
+    except Exception:
+        return ''
 # Canonical quota services: `codex-orin` is not a service — it is the second
 # Codex account (service `codex`, account `codex-orin`). The quse wire route
 # key `codex-orin` is still collected by quota_snapshot; only this service
@@ -930,7 +956,9 @@ class Dispatcher:
         try:
             if isinstance(workspace, str) and workspace:
                 dest = str(Path(workspace) / '.local' / 'hub-logs' / (str(offer_id) + '-opencode.log'))
-                log_dest = retain_per_session_opencode_log(record.get('log_offsets'), dest)
+                log_dest = retain_per_session_opencode_log(
+                    record.get('log_offsets'), dest,
+                    engine=record.get('engine'))
                 if log_dest:
                     try:
                         with open(log_dest, 'r', encoding='utf-8', errors='replace') as f:
@@ -978,6 +1006,19 @@ class Dispatcher:
             return {'status': 'failed', 'report': partial['report'], 'confirmed_exit': True,
                     'artifacts': [{'name': f'evidence-{i + 1}', 'text': item['label'] + '\n' + item['text']}
                                   for i, item in enumerate(partial.get('artifacts', []))]}
+        # AC a19cac9e AC1: retain the per-session opencode log on every
+        # headless terminal exit, not only when the result is missing.
+        try:
+            from .launch_diagnostics import retain_per_session_opencode_log
+            ws = record.get('workspace')
+            offer = record.get('offer_id', 'unknown')
+            if isinstance(ws, str) and ws:
+                retain_per_session_opencode_log(
+                    record.get('log_offsets'),
+                    str(Path(ws) / '.local' / 'hub-logs' / (str(offer) + '-opencode.log')),
+                    engine=record.get('engine'))
+        except Exception:
+            pass
         return {'status': 'failed' if fleet_state == 'failed' else forwarded['report_status'],
                 'report': forwarded['report'], 'confirmed_exit': True,
                 'artifacts': [{'name': f'evidence-{i + 1}', 'text': item['label'] + '\n' + item['text']}
@@ -1211,7 +1252,18 @@ class Dispatcher:
                 continue
 
             # 4. Own-host Fleet terminal result
-            fleet_state = "failed" if reconciled_state == "failed" or record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused' else "exited"
+            # Peek at the result file first: a missing result JSON never
+            # marks success (failed-with-partial-work), even when the
+            # launcher reports completed-awaiting-review/accepted.
+            _peeked = None
+            try:
+                _peeked = self._read_hub_finish_report(record)
+            except Exception:
+                _peeked = None
+            fleet_state = _terminal_fleet_state(
+                reconciled_state, bool(_peeked),
+                (record.get('diagnostic') or {}).get('reason')
+                if isinstance(record.get('diagnostic'), dict) else None)
             if record.get('routing_task_id'):
                 job_id = record['routing_task_id']
                 payload = self._routed_finish_report(record, fleet_state)
@@ -1249,14 +1301,28 @@ class Dispatcher:
             # terminal receipt. Backgrounded children are already reported as
             # agent_exited_children_running by stall detection; a missing
             # result file stays failed, never done.
-            forwarded = None
+            forwarded = _peeked
             try:
-                forwarded = self._read_hub_finish_report(record)
-                if forwarded:
-                    result_payload.update(forwarded)
+                if not forwarded:
+                    forwarded = self._read_hub_finish_report(record)
             except Exception:
-                forwarded = None
-            if not forwarded:
+                forwarded = forwarded or None
+            if forwarded:
+                result_payload.update(forwarded)
+                # AC a19cac9e AC1: retain the per-session opencode log on every
+                # headless terminal exit, not only when the result is missing.
+                try:
+                    from .launch_diagnostics import retain_per_session_opencode_log
+                    ws = record.get('workspace')
+                    offer = record.get('offer_id', 'unknown')
+                    if isinstance(ws, str) and ws:
+                        retain_per_session_opencode_log(
+                            record.get('log_offsets'),
+                            str(Path(ws) / '.local' / 'hub-logs' / (str(offer) + '-opencode.log')),
+                            engine=record.get('engine'))
+                except Exception:
+                    pass
+            else:
                 try:
                     partial = self._no_result_partial_report(record)
                     result_payload['report_status'] = 'failed'
@@ -1270,17 +1336,34 @@ class Dispatcher:
                     pass
             if record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused':
                 result_payload['diagnostic'] = record['diagnostic']
+            # AC a19cac9e: missing result JSON now forces failed above, so
+            # every exit-without-result carries exit code/signal/wall-time/
+            # tail here. Exited-with-result receipts keep no failure
+            # diagnostic (the result file is the success evidence; attaching
+            # a "no engine result was produced" message there would be false).
             if fleet_state == "failed":
                 from .runtime_diagnostics import runtime_diagnostic
                 runtime_failure = runtime_diagnostic(record, tombstone or {})
                 if runtime_failure:
+                    # Carry the launcher's terminal slug (bounded, whitelisted
+                    # charset) so the evidence shows why the turn ended.
+                    try:
+                        slug = _sanitize_launcher_slug(
+                            str(reconcile_out.get('reason') or reconcile_out.get('error') or ''))
+                        if slug:
+                            suffix = ' launcher=' + slug + '.'
+                            msg = runtime_failure.get('message', '')
+                            if len(msg) + len(suffix) <= 300:
+                                runtime_failure['message'] = msg + suffix
+                    except Exception:
+                        pass
                     result_payload.setdefault("diagnostic", runtime_failure)
                 fatal_runtime = runtime_failure and (runtime_failure['reason'] in {
                     'engine_oom_killed', 'engine_runtime_timeout', 'engine_signal_exit'}
                     or runtime_failure.get('exit_code') not in (None, 0))
                 from .launch_diagnostics import check_engine_auth_expired
                 raw_text = str(reconcile_out.get('reason') or reconcile_out.get('error') or '')
-                if not fatal_runtime and check_engine_auth_expired(raw_text, engine=engine, cwd=record.get("workspace"), task_id=task_id, launched_at=record.get("launched_at_ts") or (record.get("incarnation", 0) / 1000.0 if record.get("incarnation") else None), start_offsets=record.get("log_offsets")):
+                if fleet_state == 'failed' and not fatal_runtime and check_engine_auth_expired(raw_text, engine=engine, cwd=record.get("workspace"), task_id=task_id, launched_at=record.get("launched_at_ts") or (record.get("incarnation", 0) / 1000.0 if record.get("incarnation") else None), start_offsets=record.get("log_offsets")):
                     result_payload["diagnostic"] = {
                         "reason": "engine_auth_expired",
                         "message": "The engine authentication failed or API key has expired.",
@@ -2107,7 +2190,26 @@ class Dispatcher:
                                                     'result_path': str(result_path)}, result['state'])
                 if result['state'] == 'failed': report['status'] = 'failed'
             except Exception:
-                report = {'status': 'failed', 'report': 'Agent exited without a valid structured report; inspect private local logs.', 'artifacts': []}
+                # Dispatch-window exit with no valid result JSON: same
+                # failed-with-partial-work shape as the reconcile path (never
+                # done), with whatever launch context is available.
+                try:
+                    _disp_engine = None
+                    try:
+                        _disp_engine = offer.get("engine") or sub.get("engine") or sub.get("service")
+                    except Exception:
+                        _disp_engine = None
+                    partial = self._no_result_partial_report({
+                        'offer_id': offer_id, 'workspace': str(workspace),
+                        'result_path': str(result_path),
+                        'engine': _disp_engine,
+                        'log_offsets': locals().get("log_offsets"),
+                        'launched_at_ts': locals().get("launched_at_ts")})
+                    report = {'status': 'failed', 'report': partial['report'],
+                              'artifacts': [{'name': f'evidence-{i + 1}', 'text': item['label'] + '\n' + item['text']}
+                                            for i, item in enumerate(partial.get('artifacts', []))]}
+                except Exception:
+                    report = {'status': 'failed', 'report': 'Agent exited without a valid structured report; inspect private local logs.', 'artifacts': []}
             report['confirmed_exit'] = True
             self.request('POST', '/api/fleet/tasks/' + offer['task_id'] + '/result', report)
             if report['status'] in {'done', 'failed'}:

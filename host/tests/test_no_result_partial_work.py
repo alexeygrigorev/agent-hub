@@ -9,6 +9,7 @@ file after doing work. Asserts the new behavior:
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -18,9 +19,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent_hub_host.runtime_diagnostics import runtime_diagnostic
+from agent_hub_host.runtime_diagnostics import runtime_diagnostic, _sanitize_tail
 from agent_hub_host import launch_diagnostics as ld
-from agent_hub_host.fleet import Dispatcher
+from agent_hub_host.fleet import Dispatcher, _terminal_fleet_state
 
 
 NATIVE = '2505c5ae-605e-426b-8908-a5d293bdc4c8'
@@ -64,6 +65,42 @@ class NoResultRegression(unittest.TestCase):
             TOMB, query=lambda a: '')
         self.assertNotIn('abcdefghijklmnop123456', result.get('tail', ''))
         self.assertIn('normal line', result.get('tail', ''))
+
+    def test_tail_matches_server_charset_and_redacts_secret_shapes(self):
+        # Server rejects [\x00-\x1f\x7f] in diagnostic.tail: the host tail
+        # must never contain newlines, tabs or other control chars.
+        tail = _sanitize_tail('line one\nline two\ttabbed\nBearer abcdefghijklmnop\n'
+                              'key=ghp_abcdefghijklmnop1234\nAKIAIOSFODNN7EXAMPLE\n'
+                              'xoxb-123456789012-abcdefghij\nsk-ant-abcdef1234567890')
+        self.assertNotRegex(tail, r'[\x00-\x1f\x7f]')
+        self.assertNotIn('\n', tail)
+        self.assertNotIn('\t', tail)
+        self.assertIn('line one | line two', tail)
+        for secret in ('abcdefghijklmnop', 'ghp_abcdefghijklmnop1234', 'AKIAIOSFODNN7EXAMPLE',
+                       'xoxb-123456789012-abcdefghij', 'sk-ant-abcdef1234567890'):
+            self.assertNotIn(secret, tail)
+        # runtime_diagnostic tails also satisfy the server predicate.
+        result = runtime_diagnostic(
+            dict(RECORD, runtime_exit={'code': 1}, runtime_tail='a\nb'),
+            TOMB, query=lambda a: '')
+        self.assertNotRegex(result.get('tail', 'x'), r'[\x00-\x1f\x7f]')
+        self.assertLessEqual(len(result.get('tail', '')), 1024)
+
+    def test_terminal_state_never_done_without_result(self):
+        self.assertEqual(_terminal_fleet_state('failed', True), 'failed')
+        self.assertEqual(_terminal_fleet_state('failed', False), 'failed')
+        self.assertEqual(_terminal_fleet_state('completed-awaiting-review', False), 'failed')
+        self.assertEqual(_terminal_fleet_state('accepted', False), 'failed')
+        self.assertEqual(_terminal_fleet_state('completed-awaiting-review', True), 'exited')
+        self.assertEqual(_terminal_fleet_state('accepted', True), 'exited')
+        self.assertEqual(_terminal_fleet_state('completed-awaiting-review', True,
+                                               'engine_tool_permission_refused'), 'failed')
+
+    def test_retain_is_opencode_scoped(self):
+        self.assertIsNone(ld.retain_per_session_opencode_log({}, '/tmp/x.log', engine='opencode'))
+        self.assertIsNone(ld.retain_per_session_opencode_log(
+            {'/tmp/log': 0}, '/tmp/x.log', engine='codex'))
+        self.assertIsNone(ld.retain_per_session_opencode_log(None, '/tmp/x.log'))
 
     def test_missing_result_json_is_failed_with_partial_work(self):
         tmp = tempfile.TemporaryDirectory()

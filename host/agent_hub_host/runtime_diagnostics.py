@@ -9,7 +9,11 @@ import subprocess
 
 
 def _sanitize_tail(text, limit=1024):
-    """Keep a bounded printable tail; redact likely secret values, never fail."""
+    """Keep a bounded printable tail; redact likely secret values, never fail.
+
+    Matches the server charset for diagnostic.tail: no control characters
+    (no newlines/tabs); lines joined with ' | '.
+    """
     try:
         raw = str(text or '')
     except Exception:
@@ -19,17 +23,22 @@ def _sanitize_tail(text, limit=1024):
     lines = raw[-8192:].splitlines()[-10:]
     cleaned = []
     for line in lines:
-        line = ''.join(ch if 32 <= ord(ch) < 127 or ch in '\t' else ' ' for ch in line).strip()
+        line = ''.join(ch if 32 <= ord(ch) < 127 else ' ' for ch in line).strip()
         # Redact bearer/token/key assignments without keeping the value.
         line = re.sub(r'(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+', r'\1[redacted]', line)
         line = re.sub(r'(?i)(api[_-]?key\s*[:=]\s*)[^\s;]+', r'\1[redacted]', line)
         line = re.sub(r'sk-[A-Za-z0-9_-]{8,}', 'sk-[redacted]', line)
+        line = re.sub(r'(?i)\bsk-ant-[A-Za-z0-9_-]{8,}\b', 'sk-ant-[redacted]', line)
         line = re.sub(r'(?i)(token\s*[:=]\s*)[^\s;]+', r'\1[redacted]', line)
+        line = re.sub(r'gh[pousr]_[A-Za-z0-9_]{16,}', '[redacted]', line)
+        line = re.sub(r'github_pat_[A-Za-z0-9_]{16,}', '[redacted]', line)
+        line = re.sub(r'\bAKIA[0-9A-Z]{16}\b', '[redacted]', line)
+        line = re.sub(r'\bxox[baprs]-[A-Za-z0-9-]{8,}', '[redacted]', line)
         if len(line) > 200:
             line = line[:200]
         if line:
             cleaned.append(line)
-    out = '\n'.join(cleaned)
+    out = ' | '.join(cleaned)
     if len(out) > limit:
         out = out[-limit:]
     return out
