@@ -882,10 +882,8 @@ export class FleetService {
         r.engine === route.engine && r.account === route.account && (r.profile ?? null) === route.profile && r.mode === request.mode && r.reason === 'model_unsupported');
       if (unsupported || advertisedRefusal) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'model_unsupported' }); continue; }
       const pending = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND state IN ${ACTIVE}`, route.machine_id).one().n);
-      const routingInstalled = this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'routing_machines'").toArray().length;
-      const limit: any = routingInstalled ? this.sql.exec('SELECT max_agents FROM routing_machines WHERE machine_id = ?', route.machine_id).toArray()[0] : null;
-      const observedSessions = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.machine_id = ? AND s.phase IN ('starting','running','broken','unknown','uncertain') AND ${NATIVE_UNRESERVED}`, route.machine_id).one().n);
-      if (limit && pending + observedSessions >= limit.max_agents) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'machine_capacity' }); continue; }
+      // Machine admission uses the resource verdicts above, not catalog counts.
+      // Idle/stalled sessions are observations, not launch reservations.
 
       const tbm = pacingFor(pacing, account!.provider, route.account, account!.provider);
       if (request.mode !== 'interactive' && tbm.halted) {

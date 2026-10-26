@@ -280,7 +280,7 @@ describe('generic accounts and launch placement', () => {
     expect((await s.handle(request('/accounts', registry(), 'PUT'), host('hetzner'))).status).toBe(403);
     expect(sql.exec('SELECT COUNT(*) n FROM fleet_accounts').one().n).toBe(0);
   }));
-  it('counts an in-flight native spawn once in both account and machine capacity', async () => fixture(async (s, sql) => {
+  it('counts an in-flight native spawn once in account capacity without a machine ceiling', async () => fixture(async (s, sql) => {
     await configure(s);
     sql.exec("UPDATE fleet_accounts SET max_concurrency = 2 WHERE label = 'shared-codex'");
     sql.exec("INSERT INTO routing_machines (machine_id,needs_json,max_agents,runners_json,observed_at) VALUES ('hetzner','[]',2,'[]',?)", iso());
@@ -302,7 +302,7 @@ describe('generic accounts and launch placement', () => {
         sql.exec("UPDATE fleet_sessions SET tag=?,workspace='demo',engine='codex',profile=NULL", tag);
       }
       sql.exec("UPDATE fleet_sessions SET account='desktop-codex'");
-      expect(s.plan(intent({ machine: 'hetzner' })).selected).toBeNull();
+      expect(s.plan(intent({ machine: 'hetzner' })).selected?.account).toBe('shared-codex');
       sql.exec("UPDATE fleet_sessions SET account='shared-codex'");
       sql.exec("UPDATE fleet_launches SET state='offered' WHERE id=?", launch.id);
       expect(active()).toBe(2); // no claim: a tag alone proves no reservation linkage

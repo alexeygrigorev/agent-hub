@@ -228,10 +228,12 @@ describe('routing edit admission and unchanged legacy routing', () => {
     const first: any = await (await r.handle(req('/api/tasks', task({ access: { mode: 'read' } })), routingClient())).json();
     const second: any = await (await r.handle(req('/api/tasks', task()), routingClient())).json();
     const third: any = await (await r.handle(req('/api/tasks', task()), routingClient())).json();
+    const fourth: any = await (await r.handle(req('/api/tasks', task()), routingClient())).json();
     expect(first.access).toBe('read'); expect(first.machine).toBe('hetzner');
-    expect(second.access).toBe('legacy_unspecified'); expect(second.machine).toBe('win35');
-    expect(third.launch_id).toBeNull();
-    expect(f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-zai'").one()).active).toBe(2);
+    expect(second.access).toBe('legacy_unspecified'); expect(second.machine).toBe('hetzner');
+    expect(third.machine).toBe('hetzner'); expect(third.launch_id).toBeTruthy();
+    expect(fourth.launch_id).toBeNull();
+    expect(f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-zai'").one()).active).toBe(3);
   }));
 });
 

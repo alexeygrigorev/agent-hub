@@ -128,8 +128,8 @@ export class RoutingService {
         const machine: any = this.sql.exec('SELECT * FROM machines WHERE id = ?', ad.machine_id).toArray()[0];
         const seen = Date.parse(effectiveCheckin(ad.machine_id, machine?.last_checkin_at) || '');
         if (!machine || this.now() - Date.parse(ad.observed_at) > 180000 || !Number.isFinite(seen) || this.now() - seen > 180000 || !input.needs.every((n: string) => JSON.parse(ad.needs_json).includes(n))) continue;
-        const active = Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND state IN ('offered','starting','running','uncertain')", ad.machine_id).one().n);
-        if (active >= ad.max_agents) continue;
+        // Fleet applies current resource signals and expected task reservations.
+        // A legacy advertised session ceiling is not evidence of host pressure.
         const prompt = taskPrompt(input);
         const plan: any = this.fleet.plan({ workspace: input.workspace, machine: ad.machine_id, prompt });
         if (!plan.selected) continue;

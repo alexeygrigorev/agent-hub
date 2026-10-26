@@ -152,14 +152,16 @@ describe('routing recovery, capacity and private artifacts', () => {
     expect(recovered.launch_id).toBe(job.launch_id); expect(recovered.selection.model).toBe('glm-5.3-flash');
     expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches').one().n).toBe(1);
   }));
-  it('reserves machine concurrency inside fleet placement and enriches offers', () => fixture(async (r, f, sql) => {
+  it('admits above legacy machine ceilings while retaining account reservations and enriched offers', () => fixture(async (r, f, sql) => {
     sql.exec('UPDATE routing_machines SET max_agents = 1');
     const first: any = await (await r.handle(req('/api/tasks', input()), client())).json();
     const second: any = await (await r.handle(req('/api/tasks', input()), client())).json();
     const third: any = await (await r.handle(req('/api/tasks', input()), client())).json();
-    expect(first.machine).toBe('hetzner'); expect(second.machine).toBe('win35'); expect(third.launch_id).toBeNull();
+    const fourth: any = await (await r.handle(req('/api/tasks', input()), client())).json();
+    expect(first.machine).toBe('hetzner'); expect(second.machine).toBe('hetzner'); expect(third.machine).toBe('hetzner');
+    expect(third.launch_id).toBeTruthy(); expect(fourth.launch_id).toBeNull();
     const offered: any = await (await f.handle(req('/api/fleet/offers'), host())).json();
-    expect(offered.offers[0].task_id).toBe(first.id); expect(offered.offers[0].selection.model).toBe('glm-5.3-flash');
+    expect(offered.offers).toContainEqual(expect.objectContaining({ task_id: first.id, selection: expect.objectContaining({ model: 'glm-5.3-flash' }) }));
   }));
   it('requires assigned-host sanitization and protects screenshot contents by job ownership', () => fixture(async (r) => {
     const job: any = await (await r.handle(req('/api/tasks', input()), client())).json();
@@ -186,11 +188,11 @@ describe('account pinning and existing native occupancy', () => {
     const launch = sql.exec('SELECT account FROM fleet_launches WHERE id = ?', job.launch_id).one();
     expect(launch.account).toBe('shared-zai');
   }));
-  it('counts existing unmanaged sessions against machine and account capacity', () => fixture(async (r, f, sql) => {
+  it('admits beside a native session above max_agents while retaining its account occupancy', () => fixture(async (r, f, sql) => {
     sql.exec("UPDATE routing_machines SET max_agents = 1 WHERE machine_id = 'hetzner'");
     sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account) VALUES ('hetzner','existing','existing','zcodex','running',?,'tasks','shared-zai')", at());
     const job: any = await (await r.handle(req('/api/tasks', input()), client())).json();
-    expect(job.machine).toBe('win35');
+    expect(job.machine).toBe('hetzner');
     const account = f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-zai'").one());
     expect(account.active).toBe(2);
     sql.exec('UPDATE fleet_launches SET native_id = ? WHERE id = ?', 'existing', job.launch_id);
