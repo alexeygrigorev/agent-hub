@@ -86,7 +86,7 @@ const CAPACITY_REASONS = new Set(['account_capacity', 'machine_capacity', 'launc
  * it only projects the same inputs (MemAvailable, reserved total, floor for
  * the next slot) so operators see why starts hold. Owned by the launcher
  * reservation fixer; visibility reuses its accounting. */
-import { MEMORY_FLOOR_MB, NEXT_SLOT_MB, CPU_LOAD_FACTOR } from "./resource-management";
+import { MEMORY_FLOOR_MB, NEXT_SLOT_MB, ResourceManagement, memoryVerdict } from "./resource-management";
 export { MEMORY_FLOOR_MB, NEXT_SLOT_MB };
 /** Placement-pressure reasons that degrade host health and raise operator
  * alerts: any launch rejected or held for memory/capacity. */
@@ -326,12 +326,15 @@ export function resolveLabelUnderRoots(capsWorkspaces: any, request: any): strin
 
 export class FleetService {
   public routing: RoutingService;
+  public resources: ResourceManagement;
   public admission: ClaimAdmission;
   constructor(private sql: SqlStorage, private transaction: <T>(fn: () => T) => T, private now: () => number = Date.now) {
+    this.resources = new ResourceManagement(sql, now);
     this.routing = new RoutingService(sql, this, now, transaction);
     this.admission = new ClaimAdmission(sql, transaction, now);
   }
   init() {
+    this.resources.init();
     for (const stmt of QUOTA_SCHEMA_SQL.split(';')) if (stmt.trim()) this.sql.exec(stmt);
     ensureTbmQuotaSchema(this.sql);
     this.routing.init();
@@ -542,10 +545,10 @@ export class FleetService {
         machine_id: id,
         mem_avail_mb: memAvailMb,
         reserved_mb: telemetryFresh && reservedMb !== null ? memory.reserved_mb : null,
-        floor_mb: MEMORY_FLOOR_MB,
-        next_slot_mb: NEXT_SLOT_MB,
+        floor_mb: memory.floor_mb,
+        next_slot_mb: memory.requested_mb,
         headroom_mb: headroomMb,
-        headroom_ok: headroomMb === null ? null : headroomMb >= MEMORY_FLOOR_MB,
+        headroom_ok: headroomMb === null ? null : headroomMb >= memory.floor_mb,
         launcher_managed: launcherManaged,
         stale_telemetry: launcherManaged ? !telemetryFresh : false,
         observed_at: observedAt || m.last_checkin_at || null,
@@ -609,7 +612,9 @@ export class FleetService {
   }
 
   plan(input: any) {
-    if (!object(input, ['mode', 'machine', 'engine', 'engine_override_reason', 'tier', 'account', 'workspace', 'cwd', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access', 'approved_action', 'with_goal']) ||
+    if (!object(input, ['mode', 'machine', 'engine', 'engine_override_reason', 'tier', 'account', 'workspace', 'cwd', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access', 'approved_action', 'with_goal', 'task_kind', 'project']) ||
+      (input.project !== undefined && (typeof input.project !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.project))) ||
+      (input.task_kind !== undefined && !['implement','review','ask','goal'].includes(input.task_kind)) ||
       !workspaceOk(input.workspace) || (input.mode !== undefined && !['headless', 'interactive'].includes(input.mode)) ||
       (input.account !== undefined && !label(input.account)) || (input.machine !== undefined && !isValidMachineId(input.machine)) || (input.engine !== undefined && !label(input.engine)) ||
       // Optional tier/cwd arrive as null (not just undefined) from the
@@ -641,6 +646,8 @@ export class FleetService {
     // caller's selector in the canonical intent for idempotency.
     const overrideModels = policy.models.filter(m => m.id === input.engine);
     const request: any = { mode: input.mode || 'headless', machine: input.machine || null, engine: input.engine || null, workspace: input.workspace, cwd: input.cwd ?? null, prompt: input.prompt || '', parent_id: input.parent_id || null, summary: input.summary || (input.mode === 'interactive' ? 'Interactive session' : 'Agent task') };
+    if (input.project !== undefined) request.project = input.project;
+    if (input.task_kind !== undefined) request.task_kind = input.task_kind;
     if (input.with_goal === true) request.with_goal = true;
     if (input.account !== undefined) request.account = input.account;
     if (input.approved_action !== undefined) request.approved_action = input.approved_action;
@@ -711,21 +718,17 @@ export class FleetService {
       else if (caps.launcher_resources === true && (!Number.isFinite(hb.launcher_resources?.active_mem_mb)
         || hb.launcher_resources.active_mem_mb < 0
         || !fresh(hb.launcher_resources?.observed_at, this.now(), 180000))) reason = 'admission_unknown';
-      // Live MemAvailable already excludes resident session memory; only Hub
-      // launch ramps not yet visible in it are extra commitments. The
-      // launcher's static per-task reservations (incl. stale queued tasks)
-      // overcounted ~30 GB while ~40 GB was free (Alexey t1510u/t1511u).
-      else if (Number.isFinite(hb.mem_avail_mb) && hb.mem_avail_mb
-        - 1500 * (hb.launcher_resources ? Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND (state IN ('offered','starting') OR (state IN ('running','uncertain') AND updated_at >= ?))", route.machine_id, hb.launcher_resources.observed_at).one().n) : 0)
-        < MEMORY_FLOOR_MB + NEXT_SLOT_MB) reason = 'launcher_memory_reserve';
+      else if (Number.isFinite(hb.mem_avail_mb) && !memoryVerdict(hb.mem_avail_mb,
+        this.resources.headroom(route.machine_id, request, route.engine).reserved_mb,
+        this.resources.headroom(route.machine_id, request, route.engine).requested_mb, this.resources.config())) reason = 'launcher_memory_reserve';
       else if (!Number.isFinite(hb.mem_avail_mb) || !Number.isFinite(hb.disk_free_gb) || hb.disk_free_gb < 50.5) reason = 'resource_limit';
       else if (!Array.isArray(hb.load) || !Number.isFinite(hb.load[0]) || hb.load[0] < 0 || !Number.isFinite(caps.cpu_count) || caps.cpu_count < 1) reason = 'load_unknown';
       // CPU guard (resource management): hold while 5-min load > factor x cores.
-      else if (((Number.isFinite(hb.load[1]) ? hb.load[1] : hb.load[0]) as number) > CPU_LOAD_FACTOR * caps.cpu_count) reason = 'host_cpu_load';
+      else if (((Number.isFinite(hb.load[1]) ? hb.load[1] : hb.load[0]) as number) > this.resources.config().cpu_load_factor * caps.cpu_count) reason = 'host_cpu_load';
       else if (!account || account.status !== 'ok') reason = 'account_' + (account?.status || 'unmapped');
       else if (!this.observation(definitions.get(route.account), route)) reason = 'machine_account_quota_unknown';
       else if (account.available_slots < 1) reason = 'account_capacity';
-      if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'launcher_memory_reserve' ? { memory: this.memoryHeadroom(route.machine_id) } : {}) }); continue; }
+      if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'launcher_memory_reserve' ? { memory: this.resources.headroom(route.machine_id, request, route.engine) } : {}) }); continue; }
       const family = canonicalQuotaProvider(definitions.get(route.account)?.provider as string);
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
@@ -768,12 +771,7 @@ export class FleetService {
   }
 
   private memoryHeadroom(machine: string) {
-    const row: any = this.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', machine).toArray()[0];
-    const hb = parsed(row?.last_heartbeat);
-    const pending = hb.launcher_resources ? Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND (state IN ('offered','starting') OR (state IN ('running','uncertain') AND updated_at >= ?))", machine, hb.launcher_resources.observed_at).one().n) : 0;
-    return { mem_available_mb: Number.isFinite(hb.mem_avail_mb) ? hb.mem_avail_mb : null,
-      reserved_mb: 1500 * pending, // Hub launch ramps only; resident usage is already in MemAvailable.
-      floor_mb: MEMORY_FLOOR_MB, requested_mb: NEXT_SLOT_MB, observed_at: hb.launcher_resources?.observed_at ?? null };
+    return this.resources.headroom(machine);
   }
 
   private memoryHold(id: string, rejected: any[], refused = false) {
@@ -821,7 +819,7 @@ export class FleetService {
         try { bound = JSON.parse(row.request_json); } catch { continue; }
         if (!bound || typeof bound !== 'object') continue;
         const input: any = { mode: bound.mode || 'headless', workspace: bound.workspace, prompt: bound.prompt ?? '', idempotency_key: 'drain-' + row.id };
-        for (const key of ['machine', 'engine', 'account', 'tier', 'cwd', 'parent_id', 'summary', 'approved_action', 'access', 'with_goal']) {
+        for (const key of ['machine', 'engine', 'account', 'tier', 'cwd', 'parent_id', 'summary', 'approved_action', 'access', 'with_goal', 'task_kind', 'project']) {
           if (bound[key] !== undefined && bound[key] !== null) input[key] = bound[key];
         }
         let plan: any;
@@ -969,6 +967,35 @@ export class FleetService {
     if (!caller) return response({ error: 'unauthorized' }, 401);
     const admin = !!caller.isAdmin; const host = caller.kind === 'host' && !!caller.machineId && auth.scopes?.includes('host');
     const writer = admin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch'));
+    if (path === '/api/fleet/resources' || path.startsWith('/api/fleet/resources/')) {
+      const suffix = path.slice('/api/fleet/resources'.length);
+      if (request.method === 'GET') {
+        if (suffix === '/watchdog') {
+          if (!host) return response({error:'forbidden'},403);
+          return response({config:this.resources.config(), sessions:this.resources.sessions(caller.machineId!)});
+        }
+        if (!admin) return response({error:'forbidden'},403);
+        if (!suffix) return response(this.resources.overview());
+        if (suffix === '/sessions') return response({sessions:this.resources.usage(Object.fromEntries(new URL(request.url).searchParams))});
+        if (suffix === '/reaps') return response({reaps:this.resources.reaps()});
+      }
+      if (suffix === '/config' && request.method === 'PUT' && admin) {
+        try { const data=await body(request); return response({config:this.resources.configure(data)}); }
+        catch { return response({error:'invalid_resource_config'},400); }
+      }
+      if ((suffix === '/report' || suffix === '/evidence') && request.method === 'POST') {
+        if (!host) return response({error:'forbidden'},403);
+        try {
+          const data=await body(request);
+          return this.transaction(() => response(suffix === '/report' ? this.resources.report(caller.machineId!,data) : this.resources.evidence(caller.machineId!,data)));
+        } catch (error) {
+          const allowed=new Set(['invalid_resource_report','resource_binding_mismatch','invalid_resource_sample','invalid_resource_timestamp','invalid_reap','reap_conflict','session_not_reapable','invalid_evidence','evidence_conflict','intake_required','intake_not_found','intake_history_capacity','intake_capacity']);
+          const code=error instanceof Error && allowed.has(error.message) ? error.message : 'resource_report_failed';
+          return response({error:code},400);
+        }
+      }
+      return response({error:'not_found'},404);
+    }
     if (path === '/api/fleet/reconciliation' && request.method === 'GET') {
       if (!host) return response({ error: 'forbidden' }, 403);
       // Legacy failed dispatches predate the host journal. The host must fence
@@ -1022,6 +1049,7 @@ export class FleetService {
         agents: this.sql.exec('SELECT tag, project, role, machine_id, engine, session_id, health_state, health_at FROM agents').toArray(),
         sessions,
         host_resources: this.hostResources(),
+        resource_management: this.resources.overview(),
         placement: this.placementOverview(),
         subscriptions: this.sql.exec('SELECT * FROM fleet_subscriptions ORDER BY machine_id, service, account').toArray().map((s: any) => ({ machine_id: s.machine_id, account: canonicalAccountLabel(s.account), service: canonicalQuotaProvider(s.service), plan: s.plan, observed_at: s.observed_at, stale: !fresh(s.observed_at, this.now(), 1200000), quota: parsed(s.quota_json),
           harness: [...(routeHarness.get(String(s.machine_id) + ' ' + String(s.account)) ?? [])].sort() })),
@@ -1123,7 +1151,8 @@ export class FleetService {
         const offers: any[] = [];
         for (const row of this.sql.exec("SELECT * FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at, id LIMIT 100", caller.machineId!)) {
           if (this.admission.retireInvalidOffer(row)) continue;
-          offers.push({ selection: parsed(row.model_selection_json) ?? {}, id: row.id, engine: row.engine, account: row.account, profile: row.profile, mode: row.mode, workspace: row.workspace, cwd: parsed(row.request_json).cwd ?? null, prompt: row.prompt, ...(parsed(row.request_json).with_goal === true ? { with_goal: true } : {}), access: parsed(row.request_json).access?.mode || 'legacy_unspecified' });
+          this.sql.exec('INSERT OR IGNORE INTO resource_ramps VALUES(?,?)', row.id, new Date(this.now()).toISOString());
+          offers.push({ resource_management: this.resources.config(), memory_estimate_mb: this.resources.estimate(parsed(row.request_json).project || String(row.workspace), String(row.engine), parsed(row.request_json).task_kind || 'goal'), selection: parsed(row.model_selection_json) ?? {}, id: row.id, engine: row.engine, account: row.account, profile: row.profile, mode: row.mode, workspace: row.workspace, cwd: parsed(row.request_json).cwd ?? null, prompt: row.prompt, ...(parsed(row.request_json).with_goal === true ? { with_goal: true } : {}), access: parsed(row.request_json).access?.mode || 'legacy_unspecified' });
           if (offers.length === 20) break;
         }
         return response({ offers: this.routing.enrichOffers(offers), reconciliation: this.reconciliationCandidates(caller.machineId!) });

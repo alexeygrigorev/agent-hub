@@ -45,6 +45,7 @@ function sanitizeHeartbeat(body: any) {
       && typeof body.launcher_resources.observed_at === 'string' && body.launcher_resources.observed_at.length <= 64) {
     hb.launcher_resources = { active_mem_mb: body.launcher_resources.active_mem_mb, observed_at: body.launcher_resources.observed_at };
   }
+  if (typeof body.mem_total_mb === 'number' && Number.isFinite(body.mem_total_mb) && body.mem_total_mb > 0) hb.mem_total_mb = body.mem_total_mb;
   if (typeof body.disk_free_gb === 'number' && Number.isFinite(body.disk_free_gb)) hb.disk_free_gb = body.disk_free_gb;
   if (typeof body.load === 'object' && Array.isArray(body.load)) {
     hb.load = body.load.filter((l: any) => typeof l === 'number' && Number.isFinite(l)).slice(0, 3);

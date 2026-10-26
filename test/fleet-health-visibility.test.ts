@@ -60,23 +60,22 @@ describe('fleet health visibility + machine aliasing', () => {
     expect(sql.exec("SELECT COUNT(*) AS n FROM fleet_sessions").one().n).toBe(1);
   }));
 
-  it('projects launcher reservation numbers with floor and headroom', () => fixture(async ({ fleet, sql }) => {
+  it('projects live memory with ramp commitments instead of resident cap sums', () => fixture(async ({ fleet, sql }) => {
     const hb = {
-      mem_avail_mb: 3000, disk_free_gb: 80, load: [1],
+      mem_avail_mb: 32000, disk_free_gb: 80, load: [1],
       gate: { launch_allowed: true, at: iso(0) },
       launcher_resources: { active_mem_mb: 29000, observed_at: iso(0) },
     };
     machine(sql, 'hetzner', 'hetzner', now, 0,
       { engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8, launcher_resources: true }, hb);
     const [res] = fleet.hostResources('hetzner');
-    expect(res.mem_avail_mb).toBe(3000);
-    // Launcher static reservations are not double-counted against live MemAvailable.
+    expect(res.mem_avail_mb).toBe(32000);
     expect(res.reserved_mb).toBe(0);
     expect(res.floor_mb).toBe(2048);
-    expect(res.next_slot_mb).toBe(1500);
-    // 3000 - 0*1500 - 1500 = 1500 < 2048 floor.
-    expect(res.headroom_mb).toBe(1500);
-    expect(res.headroom_ok).toBe(false);
+    expect(res.next_slot_mb).toBe(512);
+    // Resident usage is already included in MemAvailable; only the next estimate is subtracted.
+    expect(res.headroom_mb).toBe(31488);
+    expect(res.headroom_ok).toBe(true);
     expect(res.stale_telemetry).toBe(false);
   }));
 
@@ -181,7 +180,7 @@ describe('fleet health visibility + machine aliasing', () => {
   it('degrades host health while placement pressure exists and shows reservation numbers', () => fixture(async ({ monitoring, sql }) => {
     machine(sql, 'hetzner', 'hetzner', now, 0,
       { engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8, launcher_resources: true },
-      { mem_avail_mb: 3000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso(0) }, launcher_resources: { active_mem_mb: 29000, observed_at: iso(0) } });
+      { mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso(0) }, launcher_resources: { active_mem_mb: 29000, observed_at: iso(0) } });
     const payload = { load: { load1: 0.5, load5: 0.4, load15: 0.3 }, memory: { total_bytes: 64 * 1024 ** 3, available_bytes: 32 * 1024 ** 3, used_bytes: 32 * 1024 ** 3, percent: 50, status: 'ok' } };
     sql.exec('INSERT INTO host_health_observations (machine_id, observed_at, observed_at_ms, received_at, payload_json, reporter) VALUES (?, ?, ?, ?, ?, ?)',
       'hetzner', iso(0), now, iso(0), JSON.stringify(payload), 'host:test');
@@ -198,7 +197,7 @@ describe('fleet health visibility + machine aliasing', () => {
     expect(status.machines[0].placement!.reason).toContain('held queued');
     expect(status.machines[0].reservation!.reserved_mb).toBe(0);
     expect(status.machines[0].reservation!.floor_mb).toBe(2048);
-    expect(status.machines[0].reservation!.headroom_mb).toBe(1500);
+    expect(status.machines[0].reservation!.headroom_mb).toBe(31488);
     const summary = monitoring.getStatusSummary(now);
     expect(summary.needs_attention.some((n: any) => String(n.subject).endsWith(':placement') && String(n.detail).includes('held queued'))).toBe(true);
   }));

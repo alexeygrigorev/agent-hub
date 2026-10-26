@@ -430,6 +430,7 @@ def add_commands(sub):
     start.add_argument('--reason', default=None, help='Explanation why this specific model/engine must be chosen (required when --engine is specified)')
     start.add_argument('--machine')
     start.add_argument('--workspace', required=True)
+    start.add_argument('--task-kind', choices=['implement','review','ask','goal'], help='Task kind for measured resource placement and session statistics')
     start.add_argument('--tier', choices=TIERS, help='deep/daily/quick task tier for policy routing')
     start.add_argument('--cwd')
     start.add_argument('--name', default=None,
@@ -740,6 +741,8 @@ def _execute(args):
             value = getattr(args, field, None)
             if value:
                 payload[field] = value
+        if getattr(args, 'task_kind', None) is not None:
+            payload['task_kind'] = args.task_kind
         if getattr(args, 'intake_task_id', None):
             val = str(args.intake_task_id).strip()
             m = re.search(r'/intake/([A-Za-z0-9._:-]{6,128})', val)

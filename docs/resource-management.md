@@ -1,6 +1,6 @@
 # Resource management
 
-Status: design (2026-10-26). Intake: `4fcd3139-fb34-435c-86ec-5a24ddf6c3ee`.
+Status: implementation in progress (2026-10-26); rollout and live acceptance pending. Intake: `4fcd3139-fb34-435c-86ec-5a24ddf6c3ee`.
 Keep this doc updated as each part lands.
 
 ## Goal
@@ -32,7 +32,7 @@ Covers token and quota pools, banked tranches, pacing and the kill switch. See i
 `95c1862c` and the `agent-hub-wt-tbm-e2e` branch (`src/tbm-*.ts`,
 `tbm_session_tokens`). This doc does not change TBM. The resource ledger
 below sits next to it as the matching per-session cost record (tokens on one
-side, memory and CPU on the other), joined by Hub session id.
+side, memory and CPU on the other), joined through the canonical session binding. TBM stores its token key as `machine_id:native_id`; the resource ledger stores both that native identity and canonical Hub `session_id`. Never join by tag.
 
 ### 2. Memory/CPU accounting (TBM extension)
 
@@ -50,7 +50,7 @@ Each session gets one durable row in the Hub resource ledger
 
 The host samples every running session's cgroup on each heartbeat and sends
 the running peaks. The row is finalized when the session ends. Rows can be
-joined with `tbm_session_tokens` on session id, so one session gives you its
+joined with `tbm_session_tokens` on its `session_id = machine_id || ":" || native_id` key, so one session gives you its
 tokens, memory and CPU together.
 
 ### 3. Placement
@@ -100,7 +100,7 @@ Runs every 5–10 minutes (Alexey t1474u: «Надо ещё watchdog чтобы 
 ## Config knobs
 
 These are Hub config values (`config/resource-management.json` in agent-hub,
-mirrored to the host and launcher through the heartbeat/settings). They are not
+loaded as deployment defaults, with validated runtime overrides in Hub SQL and mirrored to the host and launcher in watchdog settings and launch offers). They are not
 hard-coded constants.
 
 | knob | default | used by |
@@ -108,16 +108,35 @@ hard-coded constants.
 | `memory_floor_mb` | 2048 | Hub `plan()` gate, launcher `check_resources` |
 | `ramp_reserve_default_mb` | measured p90, fallback 512 | placement estimate |
 | `estimate_percentile` | 90 | placement estimate |
+| `estimate_multiplier` | 1.25 | measured estimate growth allowance |
+| `ramp_seconds` | 180 | additional reserve window after starting |
 | `cpu_load_factor` | 1.5 (× cores, 5-min load) | CPU guard |
 | `watchdog_interval_s` | 300–600 | watchdog |
 | `idle_minutes` | 60 | watchdog |
 | `rss_flag_gb` | 4 | watchdog / overview |
 | `keep` marker | per session | watchdog exclusion |
 
-Interim state (2026-10-26): the floor was lowered from 10 GiB to 2 GiB as
-constants in the launcher (`launcher/resources.py` `MIN_MEM_AVAILABLE_BYTES`)
-and in Hub `src/fleet.ts` (`MEMORY_FLOOR_MB`). The per-session reservation is
-still 1500/4096 MB until part 3 lands.
+Implemented Hub draft (2026-10-26; not deployed yet): `src/resource-management.ts`
+owns validated defaults, runtime settings, `session_resource_usage`,
+`resource_evidence`, and `resource_reaps`. Hub plan subtracts only ramp headroom
+and a measured next-session estimate. Resident session cgroup caps are not
+subtracted again. Offered/starting/uncertain launches retain a conservative
+commitment until their status resolves; recently running sessions receive credit
+for fresh measured current anonymous RSS (a previous peak cannot masquerade as current usage). The runtime CPU guard uses the configured factor.
+
+The authenticated API is under `/api/fleet/resources`: operator GET summary,
+`/sessions?project=...&engine=...&kind=...`, `/reaps`, and PUT `/config`.
+Own-host GET `/watchdog` supplies exact native bindings plus protected/managed
+flags; POST `/report` accepts bounded samples and confirmed reaps. POST
+`/evidence` first saves a redacted bounded output tail to the affected intake via
+`IntakeService.serviceRecordEvent`; a saved evidence receipt is required before
+reporting a stop. Receipt and note writes are atomic and retries are idempotent.
+A successful reap updates the canonical session and fleet outcome, preserves the
+open intake, and records a restart note for the forgotten-intake watchdog. Unproven freed memory is `null`, never a fabricated zero.
+
+External interactive sessions can be sampled but are never managed reap targets.
+A protected session is excluded even when its launch was Hub-managed. Missing
+intake linkage or inability to save evidence prevents a stop.
 
 ## How the stats are used for planning
 
@@ -130,6 +149,7 @@ still 1500/4096 MB until part 3 lands.
 
 ## CLI and overview
 
+- Session starts optionally accept `--task-kind implement|review|ask|goal`; the intake supplies the project for grouping and placement estimates.
 - `hub resources`: a utilization line (memory used/total, load/cores, running,
   queued), the placement verdict and its reason, the floor and knobs, and
   sessions flagged by the watchdog.

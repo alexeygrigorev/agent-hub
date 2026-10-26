@@ -1111,12 +1111,13 @@ export class SessionControlService {
       // null / blank intake_task_id means "missing" so the TBM gate can return
       // intake_task_id_required instead of a generic invalid_session_request.
       if (input.intake_task_id === null || input.intake_task_id === '') delete input.intake_task_id;
-      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal'])) {
-        const allowed = new Set(['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal']);
+      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind'])) {
+        const allowed = new Set(['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind']);
         const field = input && typeof input === 'object' && !Array.isArray(input)
           ? Object.keys(input).find(k => !allowed.has(k)) : undefined;
         return response({ error: 'invalid_session_request', ...(field ? { field, detail: 'unknown_field' } : { detail: 'invalid_object' }) }, 400);
       }
+      if (input.task_kind !== undefined && !['implement','review','ask','goal'].includes(input.task_kind)) return response({error:'invalid_session_request',field:'task_kind',detail:'invalid_task_kind'},400);
       if (!label(input.key)) return response({ error: 'invalid_session_request', field: 'key', detail: 'invalid_key' }, 400);
       if (!workspaceOk(input.workspace) && !registeredRepoLabel(this.sql, input.workspace)) return response({ error: 'invalid_session_request', field: 'workspace', detail: 'invalid_workspace' }, 400);
       if (input.engine !== undefined && !label(input.engine)) return response({ error: 'invalid_session_request', field: 'engine', detail: 'invalid_engine' }, 400);
@@ -1208,6 +1209,7 @@ export class SessionControlService {
         }
         const sessionType = mode === 'interactive' ? 'aplexer' : 'headless';
         const canonical = JSON.stringify({
+          ...(input.task_kind !== undefined ? {task_kind:input.task_kind} : {}),
           engine: input.engine ?? null, engine_override_reason: (input as any).engine_override_reason ?? null,
           machine: input.machine ?? null,
           workspace: input.workspace, cwd: input.cwd ?? null, brief: input.brief ?? null,
@@ -1364,6 +1366,8 @@ export class SessionControlService {
       // discarded: unknown tiers/cwds are rejected above, and a tier with no
       // eligible route becomes an honest held session.
       const reserved = this.hooks.reserve({
+        ...(input.task_kind !== undefined ? {task_kind:input.task_kind} : {}),
+        ...(input.intake_task_id ? {project:parsed(this.sql.exec('SELECT data FROM intake_tasks WHERE id=?',input.intake_task_id).toArray()[0]?.data,{}).project} : {}),
         mode, machine: input.machine, engine: input.engine, tier: input.tier,
         workspace: input.workspace, cwd: input.cwd ?? null,
         prompt: input.brief || '', access: input.access, ...(input.with_goal === true ? { with_goal: true } : {}),

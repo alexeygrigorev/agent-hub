@@ -329,7 +329,7 @@ describe('generic accounts and launch placement', () => {
     expect((s.plan(intent({ machine: 'win35' })) as any).selected).toBeNull();
     sql.exec("UPDATE machines SET capabilities = '{}' WHERE id = 'hetzner'");
     expect((s.plan(intent({ machine: 'hetzner' })) as any).rejected[0].reason).toBe('capability_unavailable');
-    sql.exec("UPDATE machines SET last_checkin_at = ?, last_heartbeat = ? WHERE id = 'win35'", iso(), JSON.stringify({ mem_avail_mb: 3000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() } }));
+    sql.exec("UPDATE machines SET last_checkin_at = ?, last_heartbeat = ? WHERE id = 'win35'", iso(), JSON.stringify({ mem_avail_mb: 2400, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() } }));
     expect((s.plan(intent({ machine: 'win35' })) as any).rejected[0].reason).toBe('launcher_memory_reserve');
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'win35'", JSON.stringify({ gate: { launch_allowed: true, at: iso(-300001) } }));
     expect((s.plan(intent({ machine: 'win35' })) as any).rejected[0].reason).toBe('admission_unknown');
@@ -431,42 +431,37 @@ describe('generic accounts and launch placement', () => {
     expect(sql.exec('SELECT max_concurrency AS n FROM fleet_accounts WHERE label = ?', 'shared-codex').one().n).toBe(2);
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('offered');
   }));
-  it('queues on launcher reservations and promotes when fresh headroom frees', async () => fixture(async (s, sql) => {
+  it('queues on live MemAvailable and ignores resident launcher cap sums', async () => fixture(async (s, sql) => {
     await configure(s);
-    const hb = { mem_avail_mb: 3000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() },
+    const hb = { mem_avail_mb: 2400, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() },
       launcher_resources: { active_mem_mb: 29000, observed_at: iso() } };
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'hetzner'", JSON.stringify(hb));
     const input = intent({ machine: 'hetzner', mode: 'headless' });
-    expect(s.plan(input).rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', engine: 'codex', reason: 'launcher_memory_reserve', memory: expect.objectContaining({ mem_available_mb: 3000, reserved_mb: 0, floor_mb: 2048 }) }));
+    expect(s.plan(input).rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', engine: 'codex', reason: 'launcher_memory_reserve', memory: expect.objectContaining({ mem_available_mb: 2400, reserved_mb: 0, floor_mb: 2048 }) }));
     const parked = s.reserve(input, admin);
     expect(parked.status).toBe(202);
     expect(parked.value.state).toBe('queued');
-    // Live MemAvailable frees; launcher static reservations (29000) are not subtracted again.
-    hb.mem_avail_mb = 32000;
+    hb.mem_avail_mb = 32000; // resident memory is already represented in this live measurement
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'hetzner'", JSON.stringify(hb));
     s.drainCapacityQueue();
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', parked.value.id).one().state).toBe('offered');
   }));
-  it('holds placement on 5-min CPU load above 3x cores and resumes below (resource management)', async () => fixture(async (s, sql) => {
+  it('holds placement on 5-min CPU load above 1.5x cores and resumes below (resource management)', async () => fixture(async (s, sql) => {
     await configure(s);
     sql.exec("UPDATE machines SET capabilities = ? WHERE id='hetzner'", JSON.stringify({ engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
-    const hb: any = { mem_avail_mb: 32000, disk_free_gb: 80, load: [5, 25, 4], gate: { launch_allowed: true, at: iso() } };
+    const hb: any = { mem_avail_mb: 32000, disk_free_gb: 80, load: [5, 13, 4], gate: { launch_allowed: true, at: iso() } };
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id='hetzner'", JSON.stringify(hb));
     const input = intent({ machine: 'hetzner', mode: 'headless' });
     expect(s.plan(input).rejected?.[0]?.reason).toBe('host_cpu_load');
     expect(isCapacityOnlyHold(s.plan(input).rejected)).toBe(true);
-    hb.load = [30, 23, 20];
-    sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id='hetzner'", JSON.stringify(hb));
-    expect(s.plan(input).rejected?.some((r: any) => r.reason === 'host_cpu_load')).toBe(false);
-    // 1.6x cores (old 1.5x guard held this) now admits (Alexey t1510u).
-    hb.load = [13, 13, 13];
+    hb.load = [30, 11, 20];
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id='hetzner'", JSON.stringify(hb));
     expect(s.plan(input).rejected?.some((r: any) => r.reason === 'host_cpu_load')).toBe(false);
   }));
   it('fails closed on stale launcher telemetry and counts unstarted offers', async () => fixture(async (s, sql) => {
     await configure(s);
     sql.exec("UPDATE machines SET capabilities = ? WHERE id='hetzner'", JSON.stringify({ engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8, launcher_resources: true }));
-    const hb = { mem_avail_mb: 4000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() }, launcher_resources: { active_mem_mb: 0, observed_at: iso(-180001) } };
+    const hb = { mem_avail_mb: 3000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() }, launcher_resources: { active_mem_mb: 0, observed_at: iso(-180001) } };
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id='hetzner'", JSON.stringify(hb));
     const input = intent({ machine: 'hetzner', mode: 'headless' });
     expect(s.plan(input).rejected?.[0]?.reason).toBe('admission_unknown');

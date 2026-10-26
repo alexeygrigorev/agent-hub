@@ -93,6 +93,11 @@
         <p id="status" role="status" class="dk-muted">Checking session…</p>
       </div>
 
+      <section class="dk-card dk-stack hub-overview-card" aria-labelledby="resource-management-title">
+        <h2 class="hub-overview-card__title" id="resource-management-title">Resource management</h2>
+        <div id="resource-management-summary" aria-live="polite">Waiting for host resource measurements.</div>
+        <a href="/fleet">Session statistics and watchdog reaps</a>
+      </section>
       <div class="hub-overview-grid">
         <article class="dk-card dk-stack hub-overview-card">
           <div class="dk-stack dk-stack--tight">
@@ -209,5 +214,6 @@
 </div>
 <script src="/vendor/dakit/shell.js"></script>
 <script src="/intake-overview.js"></script>
+<script src="/resource-management.js" defer></script>
 </body>
 </html>

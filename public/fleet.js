@@ -34,7 +34,23 @@ function slotCell(a) {
   }
   return `${a.active} / ${a.max_concurrency}`;
 }
+function renderResources(data) {
+  const root = byId('resource-management'); if (!root) return;
+  root.replaceChildren();
+  const n = value => Number.isFinite(value) ? value.toFixed(1) : 'unknown';
+  if (!data) { root.textContent = 'Resource measurements unavailable.'; return; }
+  for (const host of data.hosts || []) {
+    const line = document.createElement('p');
+    line.textContent = `${host.machine_id}: memory ${n(Number.isFinite(host.mem_used_mb) ? host.mem_used_mb / 1024 : null)} / ${n(Number.isFinite(host.mem_total_mb) ? host.mem_total_mb / 1024 : null)} GiB; load5 ${n(host.load5)} / ${n(host.cores)} cores; ${host.running} running, ${host.queued} queued. Available ${n(host.mem_available_mb)} MiB; floor ${n(host.floor_mb)} MiB; starting reserve ${n(host.reserved_mb)} MiB. Measured ${host.observed_at || 'unknown'}.`;
+    root.append(line);
+  }
+  root.append(table(['Project / engine / kind', 'Samples', 'p50 / p90 RSS MiB'], (data.stats || []).map(s => [`${s.project} / ${s.engine} / ${s.kind}`, s.samples, `${n(s.p50_rss_mb)} / ${n(s.p90_rss_mb)}`])));
+  root.append(table(['Session', 'State', 'Peak RSS / PSS MiB', 'CPU seconds / average cores', 'Runtime seconds'], (data.sessions || []).slice(0,30).map(s => [s.session_id, `${s.state}${s.rss_flagged ? ' · high RSS' : ''}`, `${n(s.peak_rss_mb)} / ${n(s.peak_pss_mb)}`, `${n(s.cpu_seconds)} / ${n(s.avg_cpu_cores)}`, n(s.runtime_s)])));
+  root.append(table(['Reaped at', 'Session / intake', 'Reason', 'Freed MiB', 'Actor'], (data.reaps || []).slice(0,10).map(r => [r.at, `${r.session_id} / ${r.intake_id}`, r.reason, n(r.freed_mb), r.actor])));
+}
+
 function render(data) {
+  renderResources(data.resource_management);
   const root = byId('machine-view'); root.replaceChildren();
   const aliases = (data && data.machine_aliases) || {};
   for (const m of data.machines) {

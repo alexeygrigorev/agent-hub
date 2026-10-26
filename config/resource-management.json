@@ -1,0 +1,11 @@
+{
+  "memory_floor_mb": 2048,
+  "ramp_reserve_default_mb": 512,
+  "estimate_percentile": 90,
+  "estimate_multiplier": 1.25,
+  "ramp_seconds": 180,
+  "cpu_load_factor": 3.0,
+  "watchdog_interval_s": 300,
+  "idle_minutes": 60,
+  "rss_flag_gb": 4
+}
