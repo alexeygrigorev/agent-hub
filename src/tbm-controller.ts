@@ -663,33 +663,8 @@ function processResetPenalties(sql: SqlStorage, pools: TbmPoolRow[], nowMs: numb
       nowMs
     );
   }
-  // Also check tbm_controller_state watermarks in case a table was replaced without firing UPDATE.
-  for (const p of pools) {
-    if (p.pool_id === '*') continue;
-    const st = sql.exec('SELECT last_reset_at_ms, last_remaining FROM tbm_controller_state WHERE pool_id = ?', p.pool_id).toArray()[0] as any;
-    if (st && typeof st.last_reset_at_ms === 'number' && st.last_reset_at_ms > 0 && st.last_reset_at_ms <= nowMs && st.last_reset_at_ms <= Number((p as any).last_updated_ms) && p.reset_at_ms > st.last_reset_at_ms) {
-      const rem = typeof st.last_remaining === 'number' ? st.last_remaining : 0;
-      const pctOnly = isPercentOnlyTbmPool(p);
-      sql.exec(
-        `INSERT OR IGNORE INTO tbm_pool_resets (
-          pool_id, reset_at_ms, provider, account,
-          total_capacity_tokens, remaining_tokens, headroom_percentage,
-          remaining_percent, capacity_known, hard_floor_percent, captured_at_ms, rewarded
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
-        p.pool_id,
-        st.last_reset_at_ms,
-        p.provider,
-        p.account || 'default',
-        p.total_capacity_tokens,
-        pctOnly ? 0 : Math.round(rem),
-        pctOnly ? rem : (p.total_capacity_tokens > 0 ? (rem / p.total_capacity_tokens) * 100 : 0),
-        pctOnly ? rem : null,
-        pctOnly ? 0 : 1,
-        p.hard_floor_percent || 5,
-        nowMs
-      );
-    }
-  }
+  // Only observed expired boundaries or the ingestion UPDATE trigger prove rollover.
+  // PID watermarks can predate a corrected future deadline and are not expiry evidence.
 
   const unrewarded = sql.exec('SELECT * FROM tbm_pool_resets WHERE rewarded = 0 AND reset_at_ms <= ? ORDER BY reset_at_ms ASC', nowMs).toArray() as any[];
   for (const r of unrewarded) {

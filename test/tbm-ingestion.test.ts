@@ -378,3 +378,23 @@ it('keeps a known cycle across a future deadline correction without treating the
     expect(sql.exec("SELECT cycle_ms FROM tbm_quota_pools WHERE pool_id='codex:deadline-adjustment:5h'").one().cycle_ms).toBe(5*HOUR);
   });
 });
+
+
+it('does not recreate an obsolete reset after repeated collection of a corrected future deadline', async () => {
+  await runInDurableObject(stub, (hub: Hub) => {
+    const sql: any = hub.sql;
+    const item = {provider:'codex',account:'repeat-correction',windowName:'5h',window:{present:true,percent_remaining:80,reset_at:new Date(NOW+HOUR).toISOString()}};
+    syncWindowsIntoTbm(sql,[item],NOW);
+    tickTbm(sql,NOW);
+    item.window.reset_at = new Date(NOW+2*HOUR).toISOString();
+    syncWindowsIntoTbm(sql,[item],NOW+59*60000);
+    syncWindowsIntoTbm(sql,[item],NOW+61*60000);
+    tickTbm(sql,NOW+61*60000);
+    expect(sql.exec("SELECT * FROM tbm_reward_events WHERE pool_id='codex:repeat-correction:5h' AND event_kind='reset'").toArray()).toHaveLength(0);
+    tickTbm(sql,NOW+2*HOUR+60000);
+    tickTbm(sql,NOW+2*HOUR+2*60000);
+    const events: any[] = sql.exec("SELECT * FROM tbm_reward_events WHERE pool_id='codex:repeat-correction:5h' AND event_kind='reset'").toArray();
+    expect(events).toHaveLength(1);
+    expect(events[0].timestamp_ms).toBe(NOW+2*HOUR);
+  });
+});
