@@ -71,11 +71,11 @@ def collect_accounts(settings, *, runner=None):
         # (src/quota.ts putServerSnapshot: duplicate_account 400), so the
         # payload must carry unique accounts: managed (codex, codex-orin)
         # replaces personal (codex-orin, codex-orin) in place instead of
-        # appending a second `codex-orin` row. Canonicalization mirrors the
-        # server (codex-orin provider -> codex; urgent-muse account ->
-        # shared-go); every row stays sanitized, no raw material crosses.
-        def _canonical_provider(p):
-            return 'codex' if p == 'codex-orin' else p
+        # appending a second `codex-orin` row. Account canonicalization mirrors
+        # the server (urgent-muse -> shared-go); provider canonicalization
+        # (codex-orin -> codex) happens server-side on ingest, so the managed
+        # provider is reported as configured. Every row stays sanitized, no
+        # raw material crosses.
         def _canonical_account(a):
             return 'shared-go' if a == 'urgent-muse' else a
         by_account = {}
