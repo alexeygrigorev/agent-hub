@@ -668,7 +668,7 @@ export class SessionControlService {
     if ((row.state === 'held' || row.state === 'queued' || row.state === 'cancelled') && memoryRejected.length === 0) {
       const holdInfo = this.readHoldInfo(row, request);
       if (holdInfo.rejected.length > 0) memoryRejected = holdInfo.rejected;
-      if (holdInfo.reason && row.state === 'held') holdReason = holdInfo.reason;
+      if (holdInfo.reason && (row.state === 'held' || row.state === 'cancelled')) holdReason = holdInfo.reason;
     }
     const qualified_name = qualified_alias || (typeof request.name === 'string' ? request.name : row.id);
     return {
@@ -692,7 +692,7 @@ export class SessionControlService {
       name: typeof request.name === 'string' ? request.name : null,
       fleet_launch_id: row.fleet_launch_id ?? null,
       ...(modelReason ? { reason: modelReason } : {}),
-      ...(memoryRejected.length ? { reason: memoryRejected[0]?.reason ?? holdReason ?? 'placement_unknown', rejected: memoryRejected } : holdReason ? { reason: holdReason } : {}),
+      ...(memoryRejected.length ? { reason: holdReason ?? memoryRejected[0]?.reason ?? 'placement_unknown', rejected: memoryRejected } : holdReason ? { reason: holdReason } : {}),
       ...(launchError ? { reason: launchError.reason, message: launchError.message, launch_error: launchError } : {}),
       cleanup_protection: protection ? { key: protection.request_key, created_at: protection.created_at, permanent: true } : null,
       binding,
@@ -797,17 +797,19 @@ export class SessionControlService {
       } catch {}
     }
     const rejected = Array.isArray(holdObj?.rejected) ? holdObj.rejected : [];
-    const reason = rejected[0]?.reason ?? (typeof holdObj === 'string' ? holdObj : typeof holdObj?.reason === 'string' ? holdObj.reason : typeof holdObj?.error === 'string' ? holdObj.error : null);
+    const reason = (typeof holdObj?.reason === 'string' ? holdObj.reason : null)
+      ?? rejected[0]?.reason
+      ?? (typeof holdObj === 'string' ? holdObj : typeof holdObj?.error === 'string' ? holdObj.error : null);
     return { reason, rejected, hold: holdObj };
   }
 
   /** Re-evaluate unplaced held sessions whose hold was caused by transient
    * resource/capacity limits once real capacity exists (intake e25fa26e). */
-  reconcileHeldSessions(limit = 5): { promoted: number; cancelled: number } {
+  reconcileHeldSessions(limit = 5, targetSessionId?: string): { promoted: number; cancelled: number } {
     let promoted = 0, cancelled = 0;
     if (!this.hooks.reserve) return { promoted, cancelled };
     const transientReasons = new Set([
-      'disk_floor', 'resource_limit', 'launcher_memory_reserve', 'account_capacity', 'machine_capacity',
+      'disk_floor', 'resource_limit', 'launcher_memory_reserve', 'account_capacity', 'account_concurrency', 'machine_capacity',
       'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking',
     ]);
     try {
@@ -815,11 +817,18 @@ export class SessionControlService {
         "SELECT * FROM session_control_sessions WHERE state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL ORDER BY created_at ASC, id ASC LIMIT ?",
         Math.max(limit * 4, 20),
       ).toArray() as any[];
+      if (targetSessionId && !rows.some((r: any) => r.id === targetSessionId)) {
+        const targetRow = this.sql.exec(
+          "SELECT * FROM session_control_sessions WHERE id = ? AND state = 'held' AND fleet_launch_id IS NULL AND binding_json IS NULL",
+          targetSessionId,
+        ).toArray()[0] as any;
+        if (targetRow) rows.unshift(targetRow);
+      }
       for (const row of rows) {
         if (promoted >= limit) break;
         const req = parsed(row.request_json, {});
         const holdInfo = this.readHoldInfo(row, req);
-        if (!holdInfo.rejected.length || !holdInfo.rejected.every((r: any) => transientReasons.has(String(r?.reason)))) {
+        if (!holdInfo.rejected.length || !holdInfo.rejected.some((r: any) => transientReasons.has(String(r?.reason)))) {
           continue;
         }
         try {
@@ -838,8 +847,24 @@ export class SessionControlService {
               project = typeof task?.project === 'string' ? task.project : undefined;
               if (task?.status === 'done' || task?.status === 'cancelled') {
                 const at = this.at();
-                const closedHold = JSON.stringify({ error: 'intake_task_closed', reason: 'intake_task_closed' });
+                const closedHold = JSON.stringify({ error: 'intake_task_closed', reason: 'intake_task_closed', rejected: holdInfo.rejected });
                 this.sql.exec("UPDATE session_control_sessions SET state = 'cancelled', hold_json = ?, updated_at = ? WHERE id = ? AND state = 'held'", closedHold, at, row.id);
+                cancelled++;
+                continue;
+              }
+              const links = Array.isArray(task?.history)
+                ? task.history.filter((e: any) => ['link', 'session'].includes(e?.kind) && typeof e?.hub_session_id === 'string' && e.hub_session_id)
+                : [];
+              const ownIdx = links.findIndex((e: any) => e.hub_session_id === row.id);
+              if (ownIdx >= 0 && ownIdx < links.length - 1) {
+                const at = this.at();
+                const supersededHold = JSON.stringify({
+                  error: 'superseded_by_newer_session',
+                  reason: 'superseded_by_newer_session',
+                  superseded_by: links[links.length - 1].hub_session_id,
+                  rejected: holdInfo.rejected,
+                });
+                this.sql.exec("UPDATE session_control_sessions SET state = 'cancelled', hold_json = ?, updated_at = ? WHERE id = ? AND state = 'held'", supersededHold, at, row.id);
                 cancelled++;
                 continue;
               }
@@ -901,7 +926,7 @@ export class SessionControlService {
 
   private syncFleetPlacement(sessionId: string): any | null {
     reconcileUnboundFleetSessions(this.sql, this.now());
-    this.reconcileHeldSessions();
+    this.reconcileHeldSessions(5, sessionId);
     const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0];
     if (!session || !session.fleet_launch_id) return session;
     if (session.state !== 'queued' && session.state !== 'held') return session;

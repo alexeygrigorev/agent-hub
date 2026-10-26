@@ -1873,8 +1873,11 @@ describe('bounded command custody recovery', () => {
   it('surfaces hold reason and rejected[] on held sessions in sessions_show and auto-promotes transient resource holds once capacity recovers', async () => {
     let available = false;
     const placed = fakeReserve();
-    const rejectedList = [{ machine: 'hetzner', engine: 'codex', reason: 'resource_limit' }];
-    await fixture(async (s) => {
+    const rejectedList = [
+      { machine: 'hetzner', engine: 'codex', reason: 'resource_limit' },
+      { machine: 'hetzner', engine: 'grok', reason: 'provider_disabled' },
+    ];
+    await fixture(async (s, sql) => {
       const created = await (await s.handle(request('/api/sessions', {
         key: 'auto-reconcile-held-1',
         name: 'drain-test-1',
@@ -1891,11 +1894,51 @@ describe('bounded command custody recovery', () => {
       expect(shownWhileHeld.reason).toBe('resource_limit');
       expect(shownWhileHeld.rejected).toEqual(rejectedList);
 
-      // Once real capacity exists, polling automatically re-evaluates and promotes the held session out of held.
+      // A second held session whose intake task already has a newer linked session is auto-cancelled with superseded_by_newer_session.
+      sql.exec('CREATE TABLE IF NOT EXISTS intake_tasks (id TEXT PRIMARY KEY, data TEXT)');
+      sql.exec(
+        'INSERT INTO intake_tasks (id, data) VALUES (?, ?)',
+        'd8a3a82d-6710-4db4-ab2b-394251ebd2d4',
+        JSON.stringify({
+          id: 'd8a3a82d-6710-4db4-ab2b-394251ebd2d4',
+          status: 'open',
+          project: 'ai-shipping-labs',
+          acceptance_criteria: '1. Verify fix',
+          history: [],
+        }),
+      );
+      const superseded = await (await s.handle(request('/api/sessions', {
+        key: 'auto-reconcile-held-2',
+        name: 'drain-superseded-1',
+        workspace: 'demo',
+        mode: 'interactive',
+        intake_task_id: 'd8a3a82d-6710-4db4-ab2b-394251ebd2d4',
+      }), admin)).json() as any;
+      expect(superseded.state).toBe('held');
+      sql.exec(
+        'UPDATE intake_tasks SET data = ? WHERE id = ?',
+        JSON.stringify({
+          id: 'd8a3a82d-6710-4db4-ab2b-394251ebd2d4',
+          status: 'open',
+          project: 'ai-shipping-labs',
+          acceptance_criteria: '1. Verify fix',
+          history: [
+            { kind: 'link', hub_session_id: superseded.id, assignment_hold: { error: 'no_eligible_route', rejected: rejectedList } },
+            { kind: 'link', hub_session_id: '543cc23e-49c6-432c-b80f-65538c594d90' },
+          ],
+        }),
+        'd8a3a82d-6710-4db4-ab2b-394251ebd2d4',
+      );
+
+      // Once real capacity exists, polling automatically re-evaluates: promotes active held session and cancels superseded held session.
       available = true;
       const shownAfterRecovery = await (await s.handle(request(`/api/sessions/${created.id}`, undefined, 'GET'), admin)).json() as any;
       expect(shownAfterRecovery.state).toBe('offered');
       expect(shownAfterRecovery.fleet_launch_id).toBe('launch-1');
+
+      const shownSuperseded = await (await s.handle(request(`/api/sessions/${superseded.id}`, undefined, 'GET'), admin)).json() as any;
+      expect(shownSuperseded.state).toBe('cancelled');
+      expect(shownSuperseded.reason).toBe('superseded_by_newer_session');
     }, input => available ? placed.hook(input) : { status: 409, value: { error: 'no_eligible_route', rejected: rejectedList } });
   });
 });

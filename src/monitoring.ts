@@ -1950,7 +1950,7 @@ export class MonitoringService {
           const diag = JSON.parse(row.launch_error_json || 'null');
           if (diag && typeof diag.reason === 'string' && diag.reason) reasons.push(diag.reason);
         } catch { /* ignore */ }
-        if (!reasons.some((r) => r === 'launcher_memory_reserve' || r === 'account_capacity' || r === 'machine_capacity')) continue;
+        if (!reasons.some((r) => r === 'launcher_memory_reserve' || r === 'account_capacity' || r === 'account_concurrency' || r === 'machine_capacity')) continue;
         failedTotal++;
         if (row.machine_id) failedByMachine.set(String(row.machine_id), (failedByMachine.get(String(row.machine_id)) ?? 0) + 1);
       }
