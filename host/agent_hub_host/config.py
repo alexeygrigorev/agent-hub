@@ -317,6 +317,10 @@ def load_config() -> dict:
     """
     if os.environ.get('HUB_CONFIG_FILE'):
         return _load_from(get_config_path())
+    from .worker_auth import config_path
+    worker = config_path()
+    if worker is not None:
+        return _load_from(worker)
     human = load_human_config()
     if isinstance(human.get("access_token"), str) and human.get("access_token"):
         return human
@@ -325,7 +329,9 @@ def load_config() -> dict:
 
 def save_config(data: dict):
     """Legacy host save (host.json, or HUB_CONFIG_FILE override). Untouched."""
-    _save_to(get_config_path(), data)
+    from .worker_auth import config_path
+    worker = None if os.environ.get('HUB_CONFIG_FILE') else config_path()
+    _save_to(worker if worker is not None else get_config_path(), data)
 
 def update_config(**kwargs):
     # Host-only (hub login / machine binding). Never reads the human

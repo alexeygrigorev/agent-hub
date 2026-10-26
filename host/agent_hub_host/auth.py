@@ -153,12 +153,20 @@ def _active_profile():
     return (kind, cfg, config.load_config, config.save_config)
 
 
-def refresh_token():
-    with _refresh_lock:
+def refresh_token(expected_token=None):
+    from .worker_auth import refresh_guard
+    with _refresh_lock, refresh_guard():
         kind, cfg, load_fn, save_fn = _active_profile()
+        worker = bool(cfg.get('worker_launch_id'))
+        if worker and expected_token and cfg.get('access_token') != expected_token:
+            # A different CLI process already rotated the shared family.
+            if cfg.get('access_token'):
+                return cfg['access_token']
         refresh = cfg.get("refresh_token")
         base_url = cfg.get("base_url")
         if not refresh or not base_url:
+            if worker:
+                raise RuntimeError('Worker credential unavailable; host re-issuance required.')
             if kind == 'human':
                 raise RuntimeError("Human session expired. Run `hub auth login` again.")
             raise RuntimeError("No refresh token or base URL available. Please login.")
@@ -190,6 +198,8 @@ def refresh_token():
                     pass
             
             if should_repair:
+                if worker:
+                    raise RuntimeError('Worker credential revoked or expired; host re-issuance required.') from None
                 if kind == 'human':
                     raise RuntimeError("Human session revoked or expired. Run `hub auth login` again.")
                 name = cfg.get('client_name', 'agent-hub-host')

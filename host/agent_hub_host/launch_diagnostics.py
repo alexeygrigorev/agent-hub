@@ -11,6 +11,7 @@ import json
 # Messages are constants: suffixes, payloads, paths and credentials never survive.
 REFUSALS = {
     'launcher_disk_reserve': ('launcher_disk_reserve', 'Host disk headroom after launcher reservations is below the maintained disk floor.'),
+    'Worker Hub credential could not be prepared': ('launcher_worker_auth_unavailable', 'Worker Hub credential could not be prepared.'),
     'memory_pressure': ('memory_pressure', 'Host memory full pressure exceeds the safety cap.'),
     'host_oom': ('host_oom', 'A recent host OOM kill requires a placement cooldown.'),
     'host_runtime_choking': ('host_runtime_choking', 'Recent session or service failures require a placement cooldown.'),

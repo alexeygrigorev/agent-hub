@@ -78,9 +78,6 @@ def _home_bundle(monkeypatch, tmp_path):
     monkeypatch.setenv('AGENT_HUB_MANAGED_DIR', str(tmp_path / 'managed'))
     monkeypatch.setenv('APLEXER_CONFIG', str(tmp_path / 'aplexer/config.toml'))
     monkeypatch.setattr(p, 'load_git_identity', lambda: {})
-    # Only the unrelated host CLI credential copy is suppressed. The actual
-    # hooks and permissions writers run, including Codex config.toml edits.
-    monkeypatch.setattr(p, '_provision_worker_cli_auth', lambda home: None)
     b = {'label': 'shared-codex', 'provider': 'codex', 'version': '0.163.0',
          'revision': '11111111-1111-4111-8111-111111111111',
          'files': {'.codex/auth.json': '{"token":"initial-test-token"}',

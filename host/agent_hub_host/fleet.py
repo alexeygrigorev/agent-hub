@@ -2503,6 +2503,14 @@ class Dispatcher:
         log_offsets = capture_log_offsets(sub.get("launcher_provider"))
         launched_at_ts = time.time()
         try:
+            if mode == 'headless' and offer.get('worker_credential_required') is True:
+                from .worker_auth import provision
+                try:
+                    provision(str(workspace), offer_id, self.request)
+                except Exception:
+                    # Fixed diagnostic only. A failed/uncertain credential
+                    # response must never leak bytes or start an unscoped worker.
+                    raise ValueError('Worker Hub credential could not be prepared') from None
             if mode == "interactive" and not offer.get("with_goal"):
                 # Empty interactive starts must remain empty: queue the trusted
                 # preamble in the native inbox before the engine's awareness hook

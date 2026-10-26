@@ -1,3 +1,4 @@
+import { WorkerAccess, WORKER_SCOPE, workerRequestAllowed, workerRefreshContext } from './worker-access';
 import { IntakeWatchdog } from './intake-watchdog';
 import { RepoRegistry } from './repos';
 import { IntakeService } from './intake';
@@ -110,6 +111,7 @@ export class Hub extends DurableObject {
   env: Env;
   jwksCache: JwksCache = new JwksCache();
   public intakeService: IntakeService;
+  private workerAccess: WorkerAccess;
   public intakeWatchdog: IntakeWatchdog;
   public busService: BusService;
   public jobsService: JobsService;
@@ -157,6 +159,8 @@ export class Hub extends DurableObject {
     this.busService = new BusService(this.sql, txSync);
     this.fleetService = new FleetService(this.sql, fn => this.ctx.storage.transactionSync(fn));
     this.fleetService.init();
+    this.workerAccess = new WorkerAccess(this.sql, fn => this.ctx.storage.transactionSync(fn), caller => this.sessionControlService.hostObservationAllowed(caller.machineId, caller));
+    this.workerAccess.init();
     this.repoRegistry = new RepoRegistry(this.sql, fn => this.ctx.storage.transactionSync(fn));
     this.repoRegistry.init();
     // M12e session control (narrow seam, owned by platform-session-api-r2):
@@ -681,6 +685,11 @@ export class Hub extends DurableObject {
         if (auth.caller?.isAdmin) {
           const session = await getSession(this.env, request);
           if (session) auth.caller.actor = 'human:' + session.sub;
+        }
+        if (/^\/api\/fleet\/launches\/[0-9a-f-]{36}\/worker-credential$/.test(path)) {
+          if (auth.error) return auth.error;
+          if (!auth.caller || !this.sessionControlService.hostObservationAllowed(auth.caller.machineId, auth.caller)) return Response.json({error:'host_credential_changed'},{status:403});
+          return this.workerAccess.issue(request, auth.caller, auth.scopes);
         }
         return this.fleetService.handle(request, auth);
       }
@@ -1496,6 +1505,8 @@ export class Hub extends DurableObject {
       this.ctx.storage.transactionSync(() => {
       const cred = this.sql.exec('SELECT * FROM credentials WHERE refresh_hash = ?', refreshHash).toArray()[0] as any;
       const nowMs = Date.parse(now);
+      const worker = cred ? workerRefreshContext(this.sql, cred.id, nowMs) : null;
+      let workerScoped = false; try { workerScoped = JSON.parse(cred?.scopes || '[]').includes(WORKER_SCOPE); } catch {}
       const hasMcp = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mcp_grants'").toArray().length > 0;
       const mcpGrant = cred && hasMcp ? this.sql.exec('SELECT * FROM mcp_grants WHERE family=?', cred.family_id).toArray()[0] as any : null;
       // OAuth refresh is usable only through the client/resource-bound server path.
@@ -1510,7 +1521,9 @@ export class Hub extends DurableObject {
         // Replay or explicitly revoked! Revoke family.
         this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
-      } else if (!Number.isFinite(Date.parse(cred.expires_at)) || Date.parse(cred.expires_at) <= nowMs) {
+      } else if (workerScoped && !worker) {
+        errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
+      } else if (!worker && (!Number.isFinite(Date.parse(cred.expires_at)) || Date.parse(cred.expires_at) <= nowMs)) {
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
       } else if (cred.kind === 'agent' && !credentialActor(this.sql, cred)) {
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
@@ -1520,6 +1533,7 @@ export class Hub extends DurableObject {
         this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
         errorResponse = Response.json({ error: 'invalid_grant' }, { status: 400 });
       } else {
+        const accessExpiresAt = worker ? new Date(Math.min(nowMs + 3600000, worker.expires_at)).toISOString() : cred.expires_at;
         const res = this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', now, cred.id);
         if (res.rowsWritten !== 1) {
           this.sql.exec('UPDATE credentials SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL', now, cred.family_id);
@@ -1529,7 +1543,7 @@ export class Hub extends DurableObject {
             INSERT INTO credentials
             (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, registry_actor, approval_seq)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          `, newId, cred.kind, accessHash, newRefreshHash, cred.family_id, cred.subject, cred.machine_id, cred.actor, cred.scopes, cred.created_by_sub, now, cred.expires_at, cred.registry_actor ?? null, cred.approval_seq ?? null);
+          `, newId, cred.kind, accessHash, newRefreshHash, cred.family_id, cred.subject, cred.machine_id, cred.actor, cred.scopes, cred.created_by_sub, now, accessExpiresAt, cred.registry_actor ?? null, cred.approval_seq ?? null);
 
           // Host-enrollment continuity (from f20; M9 metrics-row migration
           // guarded: those tables exist only after MetricsStore.init):
@@ -1571,7 +1585,7 @@ export class Hub extends DurableObject {
           }
 
           scopesResponse = JSON.parse(cred.scopes).join(' ');
-          expiresAtResponse = cred.expires_at;
+          expiresAtResponse = accessExpiresAt;
           machineIdResponse = cred.machine_id ?? null;
         }
       }
@@ -2014,6 +2028,10 @@ export class Hub extends DurableObject {
 
     if (!Array.isArray(scopes)) {
       return { error: Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } }) };
+    }
+
+    if (scopes.includes(WORKER_SCOPE) && !workerRequestAllowed(this.sql, request, cred.id)) {
+      return { error: Response.json({ error: 'worker_scope_forbidden' }, { status: 403 }) };
     }
 
     const lastUsedMs = cred.last_used_at ? Date.parse(cred.last_used_at) : 0;

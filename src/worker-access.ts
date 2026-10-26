@@ -1,0 +1,96 @@
+/** Host-issued, refreshable worker credentials restricted to one linked intake.
+ * Uses the normal credential/registry lifecycle; no host or human bearer is
+ * copied into the worker and no new signing secret is needed.
+ */
+import type { SqlStorage } from '@cloudflare/workers-types';
+import type { CallerContext } from './bus';
+import { generateTokenPair } from './auth/token';
+
+export const WORKER_SCOPE = 'worker:own-intake';
+export const WORKER_ACCESS_SCHEMA = `CREATE TABLE IF NOT EXISTS worker_access (
+  family_id TEXT PRIMARY KEY, launch_id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL,
+  task_id TEXT NOT NULL, workspace TEXT NOT NULL, expires_at INTEGER NOT NULL)`;
+
+export function workerAccessContext(sql: SqlStorage, tokenId: string | undefined, now = Date.now(), allowExpiredAccess = false): any | null {
+  if (!tokenId || !sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='worker_access'").toArray().length) return null;
+  const row: any = sql.exec(`SELECT w.*, c.actor, c.token_hash, c.expires_at AS credential_expires_at,
+    c.revoked_at, c.kind, c.scopes, c.machine_id FROM worker_access w JOIN credentials c ON c.family_id=w.family_id WHERE c.id=?`, tokenId).toArray()[0];
+  if (!row || row.kind !== 'agent' || row.revoked_at || !Number.isSafeInteger(row.expires_at) || row.expires_at <= now || (!Number.isFinite(Date.parse(row.credential_expires_at)) || (!allowExpiredAccess && (!allowExpiredAccess && Date.parse(row.credential_expires_at) <= now)))) return null;
+  let scopes: any; try { scopes = JSON.parse(row.scopes); } catch { return null; }
+  if (!Array.isArray(scopes) || !scopes.includes(WORKER_SCOPE) || scopes.includes('admin')) return null;
+  const parent: any = sql.exec('SELECT fleet_launch_id,request_json,binding_json,state,engine FROM session_control_sessions WHERE id=?',row.session_id).toArray()[0];
+  if (!parent || parent.fleet_launch_id !== row.launch_id) return null;
+  let binding: any; try { binding=JSON.parse(parent.binding_json); } catch {}
+  let task: any; try { task=JSON.parse((sql.exec('SELECT data FROM intake_tasks WHERE id=?',row.task_id).toArray()[0] as any)?.data); } catch {}
+  const native = binding && typeof binding === 'object' && !Array.isArray(binding) ? binding : null;
+  return {...row, task_project: typeof task?.project === 'string' ? task.project : null,
+    native_binding: native, session_state: parent.state,
+    native_workspace: typeof native?.workspace === 'string' ? native.workspace : null};
+}
+
+/** Refresh proves the opaque refresh token separately; job scope retains its hard deadline. */
+export function workerRefreshContext(sql: SqlStorage, tokenId: string, now = Date.now(), allowExpiredAccess = false): any | null {
+  return workerAccessContext(sql, tokenId, now, true);
+}
+
+/** Route containment runs in addition to existing registry/family checks. */
+export function workerRequestAllowed(sql: SqlStorage, request: Request, tokenId: string): boolean {
+  const worker = workerAccessContext(sql, tokenId);
+  if (!worker) return false;
+  const path = new URL(request.url).pathname;
+  const ownIntake = /^\/api\/intake\/tasks\/([a-zA-Z0-9._:-]+)(\/history|\/events)?$/.exec(path);
+  if (ownIntake) {
+    const id = ownIntake[1];
+    if (id !== worker.task_id && !(id.length >= 8 && worker.task_id.startsWith(id))) return false;
+    return request.method === 'GET' ? ownIntake[2] !== '/events' : request.method === 'POST' && ownIntake[2] === '/events';
+  }
+  if (path === '/api/sessions') return ['GET', 'POST'].includes(request.method);
+  const session = /^\/api\/sessions\/([0-9a-f-]{36})(?:\/(commands|capture|send|stop))?$/.exec(path);
+  if (session) {
+    if (session[1] === worker.session_id) return request.method === 'GET' && !session[2];
+    const child: any = sql.exec('SELECT actor,parent_id FROM session_control_sessions WHERE id=?',session[1]).toArray()[0];
+    return !!child && child.actor === worker.actor && child.parent_id === worker.session_id;
+  }
+  return false;
+}
+
+export class WorkerAccess {
+  constructor(private sql: SqlStorage, private tx: <T>(fn: () => T) => T, private hostAllowed: (caller: CallerContext) => boolean) {}
+  init() { this.sql.exec(WORKER_ACCESS_SCHEMA); }
+  async issue(request: Request, caller: CallerContext | undefined, scopes: string[] | undefined): Promise<Response> {
+    const id = /^\/api\/fleet\/launches\/([0-9a-f-]{36})\/worker-credential$/.exec(new URL(request.url).pathname)?.[1];
+    const reply = (data: any, status=200) => Response.json(data,{status,headers:{'Cache-Control':'no-store'}});
+    if (request.method !== 'POST' || !id || caller?.kind !== 'host' || !caller.machineId || !scopes?.includes('host')) return reply({error:'forbidden'},403);
+    const tokens = await generateTokenPair();
+    return this.tx(() => {
+      // Token generation awaited above: host registration, presenting family
+      // and token freshness must be checked again inside the effect transaction.
+      if (!this.hostAllowed(caller)) return reply({error:'host_credential_changed'},403);
+      const launch: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id=? AND machine_id=?',id,caller.machineId!).toArray()[0];
+      if (!launch || launch.mode !== 'headless' || launch.state !== 'starting') return reply({error:'worker_launch_not_starting'},409);
+      const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE fleet_launch_id=?',id).toArray()[0];
+      if (!session) return reply({error:'worker_session_required'},409);
+      let intakeId: any; try { intakeId=JSON.parse(session.request_json).intake_task_id; } catch { return reply({error:'worker_intake_required'},409); }
+      if (typeof intakeId !== 'string' || !/^[a-zA-Z0-9-]{8,128}$/.test(intakeId)) return reply({error:'worker_intake_required'},409);
+      const tasks: any[] = this.sql.exec("SELECT id,data FROM intake_tasks WHERE id=? OR substr(id,1,length(?))=? LIMIT 2",intakeId,intakeId,intakeId).toArray();
+      if (tasks.length !== 1) return reply({error:'worker_intake_required'},409);
+      const task = JSON.parse(tasks[0].data);
+      if (['done','cancelled'].includes(task.status)) return reply({error:'worker_intake_closed'},409);
+      const now=Date.now(), at=new Date(now).toISOString(), expires=now+7*86400000;
+      const tag='worker-'+id, project='hub-workers', actor=project+':'+tag;
+      // One stable registration and family per launch. A lost issuance response
+      // may rotate the pre-start credential without creating unbounded grants.
+      let prior: any = this.sql.exec('SELECT family_id FROM worker_access WHERE launch_id=?',id).toArray()[0];
+      const family=prior?.family_id || crypto.randomUUID();
+      if (!prior) this.sql.exec('INSERT INTO agents(tag,project,role,machine_id,registered_at) VALUES(?,?,?,?,?)',tag,project,'worker',caller.machineId!,at);
+      const credId=crypto.randomUUID();
+      this.sql.exec(`INSERT INTO credentials(id,kind,token_hash,refresh_hash,family_id,subject,machine_id,actor,scopes,created_by_sub,created_at,expires_at)
+        VALUES(?,'agent',?,?,?,?,?,?,?,?,?,?)`,credId,tokens.accessHash,tokens.refreshHash,family,actor,caller.machineId!,actor,
+        JSON.stringify(['bus:read','fleet:launch',WORKER_SCOPE]),'host:'+caller.machineId,at,new Date(now+3600000).toISOString());
+      this.sql.exec(`INSERT INTO worker_access(family_id,launch_id,session_id,task_id,workspace,expires_at) VALUES(?,?,?,?,?,?)
+        ON CONFLICT(family_id) DO UPDATE SET expires_at=excluded.expires_at`,family,id,session.id,tasks[0].id,launch.workspace,expires);
+      return reply({access_token:tokens.accessToken,refresh_token:tokens.refreshToken,client_kind:'agent',
+        worker_launch_id:id,base_url:new URL(request.url).origin,worker_expires_at:expires});
+    });
+  }
+}

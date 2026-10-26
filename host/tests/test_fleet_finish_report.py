@@ -161,54 +161,29 @@ class TestReadHubFinishReport(unittest.TestCase):
 
 
 class TestWorkerCliAuthProvisioning(unittest.TestCase):
-    def test_provisions_gh_copy_and_hub_dir_without_secrets_in_logs(self):
+    def test_normal_gh_config_directory_survives_managed_home_without_auth_file_copy(self):
         from agent_hub_host import provisioning
-        with tempfile.TemporaryDirectory() as real_home, tempfile.TemporaryDirectory() as managed:
-            os.chmod(real_home, 0o700)
-            os.chmod(managed, 0o700)
-            src = Path(real_home) / ".config" / "gh"
-            src.mkdir(mode=0o700, parents=True)
-            (src / "hosts.yml").write_text("github.com:\n  oauth_token: ghp_faketoken1234567890\n")
-            os.chmod(src / "hosts.yml", 0o600)
-            dest_home = Path(managed) / "home"
-            dest_home.mkdir(mode=0o700)
-            with patch.object(Path, "home", return_value=Path(real_home)):
-                provisioning._provision_worker_cli_auth(dest_home)
-            copied = dest_home / ".config" / "gh" / "hosts.yml"
-            self.assertTrue(copied.is_file())
-            self.assertIn("github.com", copied.read_text())
-            hub_dir = dest_home / ".config" / "agent-hub"
-            self.assertTrue(hub_dir.is_dir())
-            # The Hub host credential must never be copied into workers.
-            self.assertFalse((hub_dir / "host.json").exists())
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Path(tmp) / 'host'
+            managed = Path(tmp) / 'managed'
+            for inherited, expected in [({'XDG_CONFIG_HOME':str(host / '.config')}, host / '.config/gh'),
+                                         ({'GH_CONFIG_DIR':str(host / 'custom-gh')}, host / 'custom-gh')]:
+                with patch.dict(os.environ, inherited, clear=True), \
+                     patch.object(provisioning, 'load_git_identity', return_value={}):
+                    env = provisioning.engine_environment({'provider':'codex'}, managed)
+                self.assertEqual(env['HOME'], str(managed))
+                self.assertEqual(env['GH_CONFIG_DIR'], str(expected))
+                self.assertFalse(managed.exists())
 
-    def test_missing_host_gh_auth_is_not_a_failure(self):
+    def test_worker_env_never_inherits_host_hub_credentials(self):
         from agent_hub_host import provisioning
-        with tempfile.TemporaryDirectory() as real_home, tempfile.TemporaryDirectory() as managed:
-            os.chmod(real_home, 0o700)
-            os.chmod(managed, 0o700)
-            dest_home = Path(managed) / "home"
-            dest_home.mkdir(mode=0o700)
-            with patch.object(Path, "home", return_value=Path(real_home)):
-                provisioning._provision_worker_cli_auth(dest_home)
-            self.assertTrue((dest_home / ".config" / "agent-hub").is_dir())
-
-    def test_stale_worker_gh_copy_removed_when_host_deauths(self):
-        from agent_hub_host import provisioning
-        with tempfile.TemporaryDirectory() as real_home, tempfile.TemporaryDirectory() as managed:
-            os.chmod(real_home, 0o700)
-            os.chmod(managed, 0o700)
-            dest_home = Path(managed) / "home"
-            stale = dest_home / ".config" / "gh"
-            stale.mkdir(mode=0o700, parents=True)
-            os.chmod(dest_home, 0o700)
-            os.chmod(dest_home / ".config", 0o700)
-            os.chmod(stale, 0o700)
-            (stale / "hosts.yml").write_text("github.com:\n  oauth_token: stale\n")
-            os.chmod(stale / "hosts.yml", 0o600)
-            with patch.object(Path, "home", return_value=Path(real_home)):
-                provisioning._provision_worker_cli_auth(dest_home)
-            self.assertFalse((stale / "hosts.yml").exists())
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.dict(os.environ, {'HUB_TOKEN':'test-only','HUB_JOB_TOKEN':'test-only',
+                                     'HUB_CONFIG_FILE':'/test-only/host.json'}), \
+             patch.object(provisioning, 'load_git_identity', return_value={}):
+            env = provisioning.engine_environment({'provider':'codex'}, Path(tmp) / 'managed')
+            for key in ['HUB_TOKEN','HUB_JOB_TOKEN','HUB_CONFIG_FILE']:
+                self.assertNotIn(key, env)
 
 
 if __name__ == "__main__":

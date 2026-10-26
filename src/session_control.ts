@@ -1,3 +1,4 @@
+import { workerAccessContext } from './worker-access';
 import { registeredRepoLabel } from './repos';
 import { initResourceRequestProjection } from './sql-json-projection';
 /** Hub session orchestration (M12e): durable start/send/capture/stop intents over existing fleet placement.
@@ -1347,6 +1348,17 @@ export class SessionControlService {
       if (mode === 'headless' && input.brief !== undefined && !input.brief.trim()) {
         return response({ error: 'invalid_session_request', field: 'brief', detail: 'empty_brief' }, 400);
       }
+      const worker = workerAccessContext(this.sql, caller.tokenId);
+      if (worker) {
+        const intake = input.intake_task_id;
+        if (typeof intake !== 'string' || !(intake === worker.task_id || (intake.length >= 8 && worker.task_id.startsWith(intake))) ||
+            ![worker.workspace,worker.native_workspace].includes(input.workspace) || mode !== 'headless' || input.engine !== undefined || input.machine !== undefined ||
+            (input.parent_id !== undefined && input.parent_id !== worker.session_id)) {
+          return response({ error: 'worker_scope_forbidden' }, 403);
+        }
+        input.intake_task_id = worker.task_id;
+        input.parent_id = worker.session_id;
+      }
       const actor = caller.actor || caller.machineId || 'admin';
       try { return this.transaction(() => {
         const finish = (row: any, extra: any = {}, status = 200) => {
@@ -1370,7 +1382,7 @@ export class SessionControlService {
           if (!parentRow) {
             return response({ error: 'parent_session_not_found' }, 404);
           }
-          if (!admin && !this.ownerOk(parentRow, caller)) {
+          if (!admin && !(worker && parentRow.id === worker.session_id) && !this.ownerOk(parentRow, caller)) {
             return response({ error: 'parent_forbidden' }, 403);
           }
           let curr = parentRow;

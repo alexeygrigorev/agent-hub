@@ -142,7 +142,7 @@ def request(method, path, payload=None):
         return send(token)
     except urllib.error.HTTPError as exc:
         if exc.code == 401 and not env_token:
-            auth.refresh_token()
+            auth.refresh_token(expected_token=token) if cfg.get('worker_launch_id') else auth.refresh_token()
             try:
                 return send(auth.get_access_token())
             except urllib.error.HTTPError as retry:

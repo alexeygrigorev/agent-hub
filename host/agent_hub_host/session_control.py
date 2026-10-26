@@ -196,7 +196,7 @@ def request(method, path, payload=None):
     except urllib.error.HTTPError as exc:
         if exc.code == 401 and not env_token and _request_deadline.get() is None:
             try:
-                auth.refresh_token()
+                auth.refresh_token(expected_token=token) if cfg.get('worker_launch_id') else auth.refresh_token()
                 return send(auth.get_access_token())
             except urllib.error.HTTPError as retry:
                 raise http_error(retry, key=payload_key) from None

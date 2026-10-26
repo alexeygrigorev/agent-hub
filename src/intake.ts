@@ -8,6 +8,9 @@ import { SCOPE_POLICY_VERSION, SCOPE_VERDICTS, classifyScope, getScopeStatus, sc
 type Auth = { caller?: CallerContext; scopes?: string[]; error?: Response };
 type Obj = Record<string, any>;
 type Tx = <T>(fn: () => T) => T;
+import { WORKER_SCOPE, workerAccessContext } from './worker-access';
+import { redactClaimData } from './work_claim';
+
 /** Context changes invalidate old completion claims; notes never grant launch authority. */
 function currentHistory(task: Obj): Obj[] {
   const history: Obj[] = task.history ?? [];
@@ -388,6 +391,13 @@ export class IntakeService {
     const c = this.sql.exec('SELECT * FROM credentials WHERE id=?', caller.tokenId).toArray()[0] as any;
     const binding = this.binding(c);
     if (!binding || c.token_hash !== caller.tokenHash || binding.actor !== caller.actor) fail('forbidden', 403);
+    const worker = workerAccessContext(this.sql, c.id);
+    if (JSON.parse(c.scopes).includes(WORKER_SCOPE)) {
+      if (!worker || worker.actor !== binding.actor) fail('forbidden', 403);
+      return { admin: false, worker: true, actor: binding.actor, identity: 'family:' + binding.family_id, caller,
+        grants: [{ scope: 'task', target: worker.task_id, access: 'write', expires_at: worker.expires_at }],
+        valid_until: Math.min(Date.parse(c.expires_at), worker.expires_at) };
+    }
     const grants = this.rows('grants').filter(g => !g.revoked_at && g.expires_at > Date.now() && canonical(g.binding) === canonical(binding));
     if (!grants.length) fail('forbidden', 403);
     return { admin: false, actor: binding.actor, identity: 'family:' + binding.family_id, grants, caller,
@@ -1389,6 +1399,8 @@ export class IntakeService {
         if (!payload) return json(this.read(url, p));
         identifier(payload.key);
         const path = url.pathname.slice('/api/intake'.length);
+        if (p.worker && (!/^\/tasks\/[^/]+\/events$/.test(path) || !['note','report','blocker'].includes(payload.event?.kind))) fail('forbidden', 403);
+        if (p.worker) payload.event = redactClaimData(payload.event);
         // Do not replay a private response after the caller loses its task/operator grant.
         if (path.startsWith('/rules') || path.startsWith('/grants')) this.operator(p);
         const taskMatch = /^\/tasks\/([^/]+)/.exec(path);
