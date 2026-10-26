@@ -127,6 +127,21 @@ describe('failed launch diagnostics', () => {
     expect(view.launch_error).toMatchObject({ reason: 'engine_exited_without_diagnostic', stage: 'runtime' });
   }));
 
+  // Intake 14453011 (launch 984fce21 ran ~33 min with activity, then failed
+  // as launcher_failed_without_diagnostic at dispatch_route): the host
+  // running receipt reached the fleet launch row (native_id set) even when
+  // the session binding POST was missed, so started=true and the fallback
+  // must be runtime engine_exited, never a dispatch-stage launcher failure.
+  it('labels a mid-run death with launch native_id but no binding as runtime, never dispatch', async () => fixture(async (s, sql) => {
+    const at = new Date().toISOString();
+    ensureFleetLaunch(sql, 'failed-midrun', 'hetzner', NATIVE_ID, 'failed');
+    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES ('34343434-3434-4343-8343-343434343434', 'test-admin', 'midrun-key', '{}', 'failed-midrun', 'hetzner', 'headless', 'failed', ?, ?)", at, at);
+    const res = await s.handle(request('/api/sessions/34343434-3434-4343-8343-343434343434', undefined, 'GET'), admin);
+    const view: any = await res.json();
+    expect(view.launch_error).toMatchObject({ reason: 'engine_exited_without_diagnostic', stage: 'runtime' });
+    expect(view.reason).toBe('engine_exited_without_diagnostic');
+  }));
+
   it.each(['admission_unconfigured', 'launcher_not_started', null, 'secret=/private/token'])('projects a safe failure reason for %s', async reason => fixture(async (s, sql) => {
     const at = new Date().toISOString();
     ensureFleetLaunch(sql, 'failed-launch', 'hetzner', null, 'failed');

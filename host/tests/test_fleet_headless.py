@@ -73,6 +73,16 @@ class TestFleetHeadless(unittest.TestCase):
         self.assertEqual(p["model_requirements"]["providers"], ["codex"])
         self.assertEqual(p["model_requirements"]["models"], ["gpt-6.1-sol"])
 
+    def test_launcher_payload_default_timeout_allows_long_runs(self):
+        # Intake 14453011: 1800 s killed a ~33 min headless codex run mid-run.
+        # Default must be the launcher max (7200 s).
+        p = launcher_payload(
+            target_cwd=self.workspace,
+            goal="Do task",
+            account_label="pro-account",
+        )
+        self.assertEqual(p["timeout"], 7200)
+
     def test_headless_dispatch_named_profile_uses_aplexer_backend(self):
         settings = self._settings()
         requests = []

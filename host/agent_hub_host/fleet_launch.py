@@ -98,8 +98,12 @@ def opencode_offer(offer_id, workspace_label, prompt, *, engine="opencode",
 
 
 def launcher_payload(target_cwd, goal, account_label, profile=None,
-                     timeout=1800, model=OPENCODE_MODEL, provider=OPENCODE_PROVIDER):
-    """Exact maintained-launcher submit payload for a headless run."""
+                     timeout=7200, model=OPENCODE_MODEL, provider=OPENCODE_PROVIDER):
+    """Exact maintained-launcher submit payload for a headless run.
+
+    Default timeout is the launcher max (7200 s): 1800 s killed long headless
+    codex jobs mid-run (intake 14453011, ~33 min run with activity).
+    """
     if not account_label or not isinstance(account_label, str):
         raise ValueError("account_label is required")
     from .provisioning import LABEL, root

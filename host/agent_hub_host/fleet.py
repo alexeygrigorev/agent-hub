@@ -1911,7 +1911,13 @@ class Dispatcher:
             # must omit account_label; a bare account_label makes every provider
             # reject with "Named profile requires both account_label and
             # account_profile", leaving Hub launches stuck in offered forever.
-            payload = {"goal": goal, "owner": "hub-fleet", "cwd": str(target_cwd), "timeout": 1800,
+            # Long headless codex jobs routinely exceed 30 min (intake
+            # 14453011: launch 984fce21 ran ~33 min with activity, then the
+            # 1800 s launcher timeout killed it with no result evidence and
+            # the server fell back to launcher_failed_without_diagnostic at
+            # dispatch_route). The maintained launcher supports up to 7200 s
+            # (docs/SPEC.md §8.1), so allow the full 2 h for headless runs.
+            payload = {"goal": goal, "owner": "hub-fleet", "cwd": str(target_cwd), "timeout": 7200,
                        "model_requirements": {"providers": [sub["launcher_provider"]], "models": [sub["launcher_model"]]},
                        "profile": "model-task"}
             # Resource-management placement hints from the Hub offer (server
