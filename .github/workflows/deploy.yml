@@ -87,7 +87,7 @@ jobs:
           python3 scripts/ci/test_ci.py
 
       - name: Focused Worker tests (Vitest)
-        run: npx vitest run test/mcp.test.ts test/human-auth.test.ts test/token-auth.test.ts test/auth-web-repair.test.ts test/proxy-origin.test.ts test/session-control.test.ts test/fleet.test.ts test/role-leases.test.ts test/m4-jobs.test.ts test/intake.test.ts test/intake-scope.test.ts test/intake-phone.test.ts test/host-history.test.ts test/fleet-health-visibility.test.ts test/machine-alias.test.ts test/metrics.test.ts test/monitoring.test.ts test/checks.test.ts test/status.test.ts test/session-lifecycle.test.ts test/session-lifecycle-m15c.test.ts test/human-conversation.test.ts test/conversation-followthrough.test.ts test/conversation-links-r2.test.ts test/machine-id-boundaries.test.ts test/host-authority-r6.test.ts test/session-stall.test.ts
+        run: npx vitest run test/mcp.test.ts test/mcp-oauth-compat.test.ts test/human-auth.test.ts test/token-auth.test.ts test/auth-web-repair.test.ts test/proxy-origin.test.ts test/session-control.test.ts test/fleet.test.ts test/role-leases.test.ts test/m4-jobs.test.ts test/intake.test.ts test/intake-scope.test.ts test/intake-phone.test.ts test/host-history.test.ts test/fleet-health-visibility.test.ts test/machine-alias.test.ts test/metrics.test.ts test/monitoring.test.ts test/checks.test.ts test/status.test.ts test/session-lifecycle.test.ts test/session-lifecycle-m15c.test.ts test/human-conversation.test.ts test/conversation-followthrough.test.ts test/conversation-links-r2.test.ts test/machine-id-boundaries.test.ts test/host-authority-r6.test.ts test/session-stall.test.ts
 
       - name: Phone-width browser UI (390x844, light+dark)
         run: |

@@ -12,12 +12,37 @@ CREATE TABLE IF NOT EXISTS mcp_grants (family TEXT PRIMARY KEY, client TEXT NOT 
 CREATE TABLE IF NOT EXISTS mcp_rate (bucket TEXT PRIMARY KEY, count INTEGER NOT NULL, expires INTEGER NOT NULL);
 `;
 const esc = (s: string) => s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
+// OAuth client compatibility (intake b2f0943b): Cursor/Claude/VSCode custom schemes.
+const CUSTOM_SCHEMES = new Set(['cursor:', 'claude:', 'vscode:']);
+// DCR clients do not expire while in use: long TTL + sliding renewal on authorize/token.
+const CLIENT_TTL_MS = 10 * 365 * 86400000;
 function redirectUri(value: unknown): value is string {
   if (typeof value !== 'string' || value.length > 2048) return false;
   try {
     const u = new URL(value);
-    return !u.username && !u.password && !u.hash && (u.protocol === 'https:' || (u.protocol === 'http:' && ['127.0.0.1', '[::1]', 'localhost'].includes(u.hostname)));
+    if (u.username || u.password || u.hash) return false;
+    if (u.protocol === 'https:') return true;
+    if (u.protocol === 'http:' && ['127.0.0.1', '[::1]', 'localhost'].includes(u.hostname)) return true;
+    if (CUSTOM_SCHEMES.has(u.protocol)) return true;
+    return false;
   } catch { return false; }
+}
+// Unknown scopes are ignored (RFC 6749: server may grant a subset); every
+// accepted scope maps to the existing admin grant.
+function scopeAcceptable(scope: unknown): boolean {
+  if (scope === null || scope === undefined || scope === '') return true;
+  if (typeof scope !== 'string' || scope.length > 2048) return false;
+  // All standard OIDC/MCP scopes (admin, openid, email, profile,
+  // offline_access, claudeai, mcp) are accepted; any unknown scope tokens are
+  // ignored so the flow continues with the admin grant.
+  return true;
+}
+function normalizeResource(raw: string | null, canonical: string): string | null {
+  if (!raw) return canonical;
+  if (raw === canonical) return canonical;
+  const origin = canonical.replace(/\/mcp$/, '');
+  if (raw === origin || raw === origin + '/' || raw === canonical + '/') return canonical;
+  return null;
 }
 export class McpOAuth {
   constructor(private sql: SqlStorage, private env: Env, private tx: <T>(fn: () => T) => T, private refresh: (r: Request, client: string, resource: string) => Promise<Response>) { sql.exec(SCHEMA); }
@@ -67,10 +92,11 @@ export class McpOAuth {
       if (path === '/.well-known/oauth-protected-resource' || path === '/.well-known/oauth-protected-resource/mcp') return json({
         resource, authorization_servers: [origin], scopes_supported: ['admin'], bearer_methods_supported: ['header'], resource_name: 'Agent Hub',
       }, 200, { 'Access-Control-Allow-Origin': '*' });
-      if (path === '/.well-known/oauth-authorization-server') return json({ issuer: origin, authorization_endpoint: origin + '/oauth/authorize',
+      if (path === '/.well-known/oauth-authorization-server' || path === '/.well-known/openid-configuration') return json({ issuer: origin, authorization_endpoint: origin + '/oauth/authorize',
         token_endpoint: origin + '/oauth/token', registration_endpoint: origin + '/oauth/register', revocation_endpoint: origin + '/oauth/revoke',
         response_types_supported: ['code'], grant_types_supported: ['authorization_code', 'refresh_token'], token_endpoint_auth_methods_supported: ['none'],
         code_challenge_methods_supported: ['S256'], scopes_supported: ['admin'], client_id_metadata_document_supported: false,
+        authorization_response_iss_parameter_supported: true,
       }, 200, { 'Access-Control-Allow-Origin': '*' });
       return json({ error: 'not_found' }, 404);
     }
@@ -88,14 +114,17 @@ export class McpOAuth {
         (body.token_endpoint_auth_method && body.token_endpoint_auth_method !== 'none') ||
         (body.grant_types && (!Array.isArray(body.grant_types) || body.grant_types.some((g: unknown) => !['authorization_code', 'refresh_token'].includes(g as string)))) ||
         (body.response_types && JSON.stringify(body.response_types) !== '["code"]') ||
-        (body.scope && body.scope !== 'admin') || (body.client_name !== undefined && (typeof body.client_name !== 'string' || body.client_name.length > 120))) return json({ error: 'invalid_client_metadata' }, 400);
+        !scopeAcceptable(body.scope) || (body.client_name !== undefined && (typeof body.client_name !== 'string' || body.client_name.length > 120))) return json({ error: 'invalid_client_metadata' }, 400);
     this.sql.exec('DELETE FROM mcp_clients WHERE expires<=?', Date.now());
     if (Number(this.sql.exec('SELECT COUNT(*) AS n FROM mcp_clients').one().n) >= 4096) return json({ error: 'temporarily_unavailable' }, 503);
     const id = randomString(24);
     const metadata = { client_id: id, client_name: body.client_name || 'MCP client', redirect_uris: body.redirect_uris,
       token_endpoint_auth_method: 'none', grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'], scope: 'admin' };
-    this.sql.exec('INSERT INTO mcp_clients VALUES(?,?,?)', id, JSON.stringify(metadata), Date.now() + 90 * 86400000);
+    this.sql.exec('INSERT INTO mcp_clients VALUES(?,?,?)', id, JSON.stringify(metadata), Date.now() + CLIENT_TTL_MS);
     return json(metadata, 201, { 'Access-Control-Allow-Origin': '*' });
+  }
+  private touch(id: string) {
+    this.sql.exec('UPDATE mcp_clients SET expires=? WHERE id=?', Date.now() + CLIENT_TTL_MS, id);
   }
   private async authorize(request: Request, resource: string) {
     const url = new URL(request.url);
@@ -103,11 +132,13 @@ export class McpOAuth {
     try { params = request.method === 'POST' ? new URLSearchParams(await boundedText(request, 8192)) : url.searchParams; }
     catch { return json({ error: 'invalid_request' }, 400); }
     const id = params.get('client_id') || '', redirect = params.get('redirect_uri') || '', challenge = params.get('code_challenge') || '';
+    const effectiveResource = normalizeResource(params.get('resource'), resource);
     const client = this.client(id);
     // Validate exact redirect BEFORE sign-in or any redirect back to a client.
     if (!client || !client.redirect_uris.includes(redirect) || params.get('response_type') !== 'code' ||
         params.get('code_challenge_method') !== 'S256' || !/^[A-Za-z0-9_-]{43}$/.test(challenge) ||
-        params.get('resource') !== resource || (params.get('scope') && params.get('scope') !== 'admin') || (params.get('state') || '').length > 2048) return json({ error: 'invalid_request' }, 400);
+        !effectiveResource || !scopeAcceptable(params.get('scope')) || (params.get('state') || '').length > 2048) return json({ error: 'invalid_request' }, 400);
+    this.touch(id);
     const session = await getSession(this.env, request);
     if (!session) {
       if (request.method !== 'GET') return json({ error: 'unauthorized' }, 401);
@@ -116,7 +147,7 @@ export class McpOAuth {
     if (!this.allowed(session.sub, session.email)) return json({ error: 'access_denied' }, 403);
     if (request.method === 'GET') {
       const fields = ['client_id', 'redirect_uri', 'response_type', 'code_challenge', 'code_challenge_method', 'resource', 'scope', 'state'];
-      const hidden = fields.map(k => `<input type="hidden" name="${k}" value="${esc(params.get(k) || '')}">`).join('');
+      const hidden = fields.map(k => `<input type="hidden" name="${k}" value="${esc(k === 'resource' ? (effectiveResource || '') : (params.get(k) || ''))}">`).join('');
       // Same dakit auth shell as device pairing / token sign-in (not plain HTML).
       const html = mcpConnectPage({
         email: session.email,
@@ -137,6 +168,8 @@ export class McpOAuth {
       return json({ error: 'invalid_csrf' }, 403);
     }
     const target = new URL(redirect);
+    // RFC 9207: issuer identification for mix-up protection (ChatGPT uses this).
+    target.searchParams.set('iss', url.origin);
     if (params.has('state')) target.searchParams.set('state', params.get('state')!);
     if (params.get('decision') !== 'allow') target.searchParams.set('error', 'access_denied');
     else {
@@ -146,7 +179,8 @@ export class McpOAuth {
       const current = await getSession(this.env, request);
       if (!current || !this.allowed(current.sub, current.email) || !this.client(id)) return json({ error: 'access_denied' }, 403);
       this.sql.exec('DELETE FROM mcp_codes WHERE expires<=?', Date.now());
-      this.sql.exec('INSERT INTO mcp_codes VALUES(?,?,?,?,?,?,?,?)', hash, id, redirect, challenge, resource, current.sub, current.email, Date.now() + 60000);
+      this.sql.exec('INSERT INTO mcp_codes VALUES(?,?,?,?,?,?,?,?)', hash, id, redirect, challenge, effectiveResource, current.sub, current.email, Date.now() + 60000);
+      this.touch(id);
       target.searchParams.set('code', code);
     }
     return new Response(null, { status: 303, headers: { ...NO_STORE, Location: target.toString() } });
@@ -162,14 +196,16 @@ export class McpOAuth {
     let p: URLSearchParams;
     try { p = await this.form(request); } catch { return json({ error: 'invalid_request' }, 400); }
     const client = p.get('client_id') || '';
-    if (!this.client(client) || p.get('resource') !== resource) return json({ error: 'invalid_target' }, 400);
+    const effectiveResource = normalizeResource(p.get('resource'), resource);
+    if (!this.client(client) || !effectiveResource) return json({ error: 'invalid_target' }, 400);
+    this.touch(client);
     if (p.get('grant_type') === 'refresh_token') {
       const hash = await sha256(p.get('refresh_token') || '');
       const cred = this.sql.exec('SELECT * FROM credentials WHERE refresh_hash=?', hash).toArray()[0] as any;
-      const grant = cred && this.sql.exec('SELECT * FROM mcp_grants WHERE family=? AND client=? AND resource=? AND expires>?', cred.family_id, client, resource, Date.now()).toArray()[0];
+      const grant = cred && this.sql.exec('SELECT * FROM mcp_grants WHERE family=? AND client=? AND resource=? AND expires>?', cred.family_id, client, effectiveResource, Date.now()).toArray()[0];
       if (!grant) return json({ error: 'invalid_grant' }, 400);
       // Existing Hub rotation checks current allowlist, absolute lifetime and replay.
-      const result = await this.refresh(new Request(new URL('/api/token/refresh', request.url), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: p.get('refresh_token') }) }), client, resource);
+      const result = await this.refresh(new Request(new URL('/api/token/refresh', request.url), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: p.get('refresh_token') }) }), client, effectiveResource);
       return new Response(result.body, { status: result.status, headers: { ...NO_STORE, 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
     }
     if (p.get('grant_type') !== 'authorization_code') return json({ error: 'unsupported_grant_type' }, 400);
@@ -179,11 +215,11 @@ export class McpOAuth {
     const tokens = await generateTokenPair();
     const outcome = this.tx(() => {
       const code = this.sql.exec('SELECT * FROM mcp_codes WHERE hash=?', hash).toArray()[0] as any;
-      if (!code || code.expires <= Date.now() || code.client !== client || code.redirect !== p.get('redirect_uri') || code.resource !== resource || code.challenge !== challenge || !this.allowed(code.sub, code.email) || !this.client(client)) return false;
+      if (!code || code.expires <= Date.now() || code.client !== client || code.redirect !== p.get('redirect_uri') || code.resource !== effectiveResource || code.challenge !== challenge || !this.allowed(code.sub, code.email) || !this.client(client)) return false;
       const now = new Date().toISOString(), expiry = new Date(Date.now() + 30 * 86400000).toISOString(), family = randomString(16);
       this.sql.exec(`INSERT INTO credentials(id,kind,token_hash,refresh_hash,family_id,subject,machine_id,actor,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
         randomString(16), 'human', tokens.accessHash, tokens.refreshHash, family, code.email, null, 'human:' + code.sub, '["admin"]', code.sub, now, expiry);
-      this.sql.exec('INSERT INTO mcp_grants VALUES(?,?,?,?)', family, client, resource, Date.parse(expiry));
+      this.sql.exec('INSERT INTO mcp_grants VALUES(?,?,?,?)', family, client, effectiveResource, Date.parse(expiry));
       this.sql.exec('DELETE FROM mcp_codes WHERE hash=?', hash);
       return true;
     });
@@ -193,10 +229,11 @@ export class McpOAuth {
   private async revoke(request: Request, resource: string) {
     let p: URLSearchParams;
     try { p = await this.form(request); } catch { return json({ error: 'invalid_request' }, 400); }
+    const effectiveResource = normalizeResource(p.get('resource'), resource) || resource;
     const hash = await sha256(p.get('token') || '');
     const cred = this.sql.exec('SELECT family_id FROM credentials WHERE token_hash=? OR refresh_hash=?', hash, hash).toArray()[0] as any;
     if (cred) this.tx(() => {
-      if (this.sql.exec('SELECT family FROM mcp_grants WHERE family=? AND client=? AND resource=?', cred.family_id, p.get('client_id') || '', resource).toArray().length)
+      if (this.sql.exec('SELECT family FROM mcp_grants WHERE family=? AND client=? AND resource=?', cred.family_id, p.get('client_id') || '', effectiveResource).toArray().length)
         this.sql.exec('UPDATE credentials SET revoked_at=? WHERE family_id=? AND revoked_at IS NULL', new Date().toISOString(), cred.family_id);
     });
     return json({}, 200, { 'Access-Control-Allow-Origin': '*' });
