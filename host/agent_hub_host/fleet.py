@@ -120,10 +120,43 @@ OFFERS_LOCK_NAME = "fleet-offers.lock"
 # plus a slow Hub can exceed that, so the gate is re-run before claiming when
 # the first observation is older than this.
 CLAIM_ADMISSION_REFRESH_S = 15.0
-# Optional bounded offer concurrency (settings "dispatch_concurrency").
-# Default 1: live RMTHZ test with 3 parallel dispatches made the maintained
-# admission gate refuse concurrent starts (admission_refused), failing offers.
-DISPATCH_CONCURRENCY = 1
+# Bounded offer concurrency (settings "dispatch_concurrency", 1..8).
+# Intake eff9a5ce burst fix: serial dispatch (30-60 s per offer) made a
+# 10-launch burst take 5+ minutes. The earlier admission_refused failures with
+# 3 parallel starts came from N concurrent admission-gate subprocesses (quota
+# probes) racing each other; the gate now runs single-flight per account with
+# a short-lived shared result (ADMISSION_SHARE_S), so parallel dispatch no
+# longer multiplies gate runs. Host pressure is enforced by the launcher and
+# Hub placement on real choking signals (PSI, MemAvailable, OOM), never here.
+DISPATCH_CONCURRENCY = 6
+DISPATCH_CONCURRENCY_MAX = 8
+# An allowed gate observation is shared by concurrent dispatches for the same
+# account/engine/profile/mode/selection for this long. Well inside the Hub's
+# 30 s claim freshness and CLAIM_ADMISSION_REFRESH_S, so a shared observation
+# never forces a stale claim. Refusals are never shared.
+ADMISSION_SHARE_S = 8.0
+# GET /api/fleet/offers transport retries (timeouts while the Hub is slow).
+# A failed offers read is never a launch failure: the offers simply stay
+# offered for the next tick.
+OFFERS_FETCH_ATTEMPTS = 3
+OFFERS_FETCH_BACKOFF_S = 1.0
+
+
+def dispatch_concurrency(settings) -> int:
+    try:
+        value = int((settings or {}).get("dispatch_concurrency", DISPATCH_CONCURRENCY))
+    except (TypeError, ValueError):
+        return DISPATCH_CONCURRENCY
+    return max(1, min(DISPATCH_CONCURRENCY_MAX, value))
+
+
+def _is_transport_error(exc) -> bool:
+    """Timeout/reset/refused style errors (not definitive Hub answers)."""
+    import http.client
+    import urllib.error
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    return isinstance(exc, (OSError, http.client.HTTPException, urllib.error.URLError))
 
 
 def _iso_age_s(value):
@@ -930,6 +963,13 @@ class Dispatcher:
         self._last_hb: Optional[dict] = None
         self._inflight = 0
         self.stop_requested = threading.Event()
+        # Intake eff9a5ce burst fix: parallel dispatch bookkeeping.
+        self._admission_locks: dict = {}
+        self._admission_shared: dict = {}
+        self._admission_guard = threading.Lock()
+        self._dispatching: set = set()
+        self._dispatching_guard = threading.Lock()
+        self._bindings_lock = threading.Lock()
         if self.journal_dir:
             self._load_pending_launches_from_journal()
 
@@ -1993,10 +2033,37 @@ class Dispatcher:
             self._drop_queued_launcher_task(launcher, task_id)
             return self.runner(submit_argv, cwd=launcher["root"])
 
+    def _admission_gate(self, sub, admission_payload):
+        """Single-flight, briefly shared admission gate run per route.
+
+        Concurrent dispatches for the same account/engine/profile/mode/
+        selection wait for one gate subprocess instead of racing N quota
+        probes (which refused concurrent starts live). Only an allowed,
+        fresh observation is shared, for at most ADMISSION_SHARE_S; a
+        refusal or error is never reused, so each dispatch re-checks.
+        Workspace is not part of any gate decision and is not keyed.
+        """
+        key = json.dumps({"argv": sub.get("admission_argv"),
+                          **{k: admission_payload.get(k) for k in ("mode", "engine", "profile", "account", "selection")}},
+                         sort_keys=True, default=str)
+        with self._admission_guard:
+            lock = self._admission_locks.setdefault(key, threading.Lock())
+        with lock:
+            shared = self._admission_shared.get(key)
+            if shared is not None and time.monotonic() - shared[0] <= ADMISSION_SHARE_S \
+                    and _iso_age_s(shared[1].get("observed_at", "")) <= ADMISSION_SHARE_S:
+                return dict(shared[1])
+            gate = self.runner(sub["admission_argv"], payload=admission_payload)
+            if isinstance(gate, dict) and gate.get("launch_allowed") is True:
+                self._admission_shared[key] = (time.monotonic(), dict(gate))
+            else:
+                self._admission_shared.pop(key, None)
+            return gate
+
     def _dispatch_admission(self, sub, admission_payload, selection, offer):
         """Run the local admission gate; return its fresh observed_at."""
         from .model_contract import canonical_account_label
-        gate = self.runner(sub["admission_argv"], payload=admission_payload)
+        gate = self._admission_gate(sub, admission_payload)
         if gate.get("launch_allowed") is not True or gate.get("profile_supported") is not True or canonical_account_label(gate.get("account_label")) != canonical_account_label(sub["account_label"]):
             gate_reason = gate.get("reason") if isinstance(gate.get("reason"), str) else ""
             # Preserve host-side gate slugs (intake 59a6f44a AC3/AC4): a managed
@@ -2810,7 +2877,8 @@ class Dispatcher:
             results.append(outcome)
             if outcome.get('state') == 'running':
                 try:
-                    self.report_catalog_bindings()
+                    with self._bindings_lock:
+                        self.report_catalog_bindings()
                 except Exception as exc:
                     # A catalog/binding transport error is not a failed
                     # launch. Keep its real receipt and retry next cycle.
@@ -3039,14 +3107,33 @@ class Dispatcher:
             return 0, 0.0
         try:
             if offers is None:
-                offers = self.request("GET", "/api/fleet/offers").get("offers", [])
+                offers = self._fetch_offers().get("offers", [])
             hb = (hb if hb is not None else getattr(self, '_last_hb', None)) if refresh else None
             durations = []
             guard = threading.Lock()
+            # One dispatch per launch id per process, even if a caller hands
+            # the same offer twice or two loops overlap without the offers
+            # lock (journal-less). The Hub claim (409 already_claimed plus the
+            # 488b860e claim_key replay) stays the cross-process guard.
+            unique, seen_ids = [], set()
+            for offer in offers:
+                oid = offer.get('id') if isinstance(offer, dict) else None
+                if oid in seen_ids:
+                    continue
+                seen_ids.add(oid)
+                unique.append(offer)
+            offers = unique
 
             def _one(offer):
                 if self.stop_requested.is_set():
                     return  # Draining for restart: never start a new claim.
+                oid = offer.get('id')
+                with self._dispatching_guard:
+                    if oid in self._dispatching:
+                        with guard:
+                            results.append({'id': oid, 'state': 'held', 'reason': 'dispatch_in_progress'})
+                        return
+                    self._dispatching.add(oid)
                 _dispatch_start = time.monotonic()
                 with guard:
                     self._inflight += 1
@@ -3054,6 +3141,8 @@ class Dispatcher:
                 try:
                     self._dispatch_one(offer, local)
                 finally:
+                    with self._dispatching_guard:
+                        self._dispatching.discard(oid)
                     with guard:
                         self._inflight -= 1
                         results.extend(local)
@@ -3077,13 +3166,29 @@ class Dispatcher:
                 except Exception:
                     pass
 
+    def _fetch_offers(self):
+        """GET /api/fleet/offers with bounded retries on transport errors.
+
+        A slow Hub timing out the offers read must not cost a whole tick (or
+        abort the slow cycle): retry briefly, then raise so the caller keeps
+        every offer offered for the next poll. Nothing is rejected here.
+        """
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                return self.request("GET", "/api/fleet/offers") or {}
+            except Exception as exc:
+                if not _is_transport_error(exc) or attempts >= OFFERS_FETCH_ATTEMPTS or self.stop_requested.is_set():
+                    raise
+                print(json.dumps({'event': 'offers_fetch_retry', 'attempt': attempts,
+                                  'error': type(exc).__name__[:64]}), flush=True)
+                time.sleep(OFFERS_FETCH_BACKOFF_S * attempts)
+
     def offers_tick(self):
         """Fast offer claiming independent of the slow cycle (4398ce2a)."""
         results = []
-        try:
-            concurrency = max(1, min(4, int(self.settings.get("dispatch_concurrency", DISPATCH_CONCURRENCY))))
-        except (TypeError, ValueError):
-            concurrency = DISPATCH_CONCURRENCY
+        concurrency = dispatch_concurrency(self.settings)
         # The fast telemetry thread keeps the check-in fresh, so the per-offer
         # heartbeat re-post (a Hub round trip that stalls with the Hub) is
         # skipped here to keep queued offers moving.
@@ -3223,7 +3328,16 @@ class Dispatcher:
             except Exception:
                 pass  # dispatch still refuses locally if health publication fails.
         _mark('unconfigured_probes')
-        offer_response = self.request("GET", "/api/fleet/offers")
+        try:
+            offer_response = self._fetch_offers()
+        except Exception as exc:
+            if not _is_transport_error(exc):
+                raise
+            # Intake eff9a5ce: a Hub timeout on the offers read holds every
+            # offer for the fast tick / next cycle instead of failing the
+            # cycle (and its binding/reconcile work) outright.
+            _skip_telemetry('offers', exc)
+            offer_response = {}
         offers = offer_response.get("offers", [])
         from .account_capacity import reconcile_unstarted
         reconciled += [r for r in reconcile_unstarted(self, rows=offer_response.get('reconciliation', [])) if r['state'] in ('failed', 'exited')]
@@ -3231,7 +3345,8 @@ class Dispatcher:
         results = [{'id': r['task_id'], 'state': 'failed', 'reason': 'legacy_native_finished'} for r in legacy_settled] + list(reconciled) + list(imported_reconciled)
         results.append({"id": "workclaim-sync", **workclaim_summary})
         self._last_hb = hb
-        _, dispatch_max_s = self.dispatch_offers(results, hb=hb, offers=offers)
+        _, dispatch_max_s = self.dispatch_offers(results, hb=hb, offers=offers,
+                                                 concurrency=dispatch_concurrency(self.settings))
         _mark('dispatch')
         print(json.dumps({'event': 'fleet_cycle_phases', 'phases': phases,
                           'offers': len(offers), 'results': len(results),
