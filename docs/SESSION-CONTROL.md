@@ -133,8 +133,11 @@ UUIDs are `crypto.randomUUID()`; ids in paths match
 
 Request: `key` (required idempotency label per `(actor, key)`), `workspace`
 (required: a configured label, or an explicitly allowed absolute POSIX path —
-see below), `engine` / `machine` (optional labels, REAL fleet route
-constraints), `brief` (optional headless prompt, 1..8000 chars), `mode`
+see below), `engine` / `engine_override_reason` / `machine` (optional labels, REAL fleet route
+constraints; default start omits `engine` and goes through tier/policy with no
+casual picker — an explicit `engine` is an override and REQUIRES non-empty
+`engine_override_reason` explaining why, or the start is refused with `400
+engine_reason_required`), `brief` (optional headless prompt, 1..8000 chars), `mode`
 (`headless`|`interactive`, interactive starts empty), `name` (optional
 friendly name, `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`; stored in `request_json`,
 shown in list/show, never identity), `access` (optional
@@ -457,7 +460,7 @@ mount (same helper shape, narrow operator-token route scope, no global
 
 ```sh
 hub sessions list [--state running] [--limit 50]
-hub sessions start --workspace demo|/absolute/repo/path [--engine opencode] [--machine hetzner]
+hub sessions start --workspace demo|/absolute/repo/path [--engine opencode --reason 'Why this engine is needed'] [--machine hetzner]
     [--cwd demo/project] [--brief-file goal.txt | --prompt "..." | --interactive] [--name friendly] [--key k1]
     [--intake-task-id TASK_ID] [--wait] [--timeout 300] [--interval 5]
 hub sessions send <session-id|name> --body-file prompt.txt [--key k2] [--wait ...]

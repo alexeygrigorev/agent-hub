@@ -201,15 +201,15 @@ describe('hub session control durable queue', () => {
   it('starts through placement, replays same key, conflicts on changed intent', async () => {
     const fake = fakeReserve();
     await fixture(async (s, sql) => {
-      const first: any = await startOk(s, { engine: 'codex', machine: 'hetzner' }, admin, 'start-1');
+      const first: any = await startOk(s, { engine: 'codex', engine_override_reason: 'Synthetic override for placement replay test.', machine: 'hetzner' }, admin, 'start-1');
       expect(first.state).toBe('offered');
       expect(first.machine).toBe('hetzner');
       expect(fake.calls.length).toBe(1);
-      const replay = await s.handle(request('/api/sessions', { key: 'start-1', workspace: 'demo', engine: 'codex', machine: 'hetzner' }), admin);
+      const replay = await s.handle(request('/api/sessions', { key: 'start-1', workspace: 'demo', engine: 'codex', engine_override_reason: 'Synthetic override for placement replay test.', machine: 'hetzner' }), admin);
       expect(replay.status).toBe(200);
       expect((await replay.json() as any).replay).toBe(true);
       expect(fake.calls.length).toBe(1);
-      const conflict = await s.handle(request('/api/sessions', { key: 'start-1', workspace: 'demo', engine: 'claude' }), admin);
+      const conflict = await s.handle(request('/api/sessions', { key: 'start-1', workspace: 'demo', engine: 'claude', engine_override_reason: 'Synthetic override for conflict test.', machine: 'hetzner' }), admin);
       expect(conflict.status).toBe(409);
     }, fake.hook);
   });
@@ -217,7 +217,7 @@ describe('hub session control durable queue', () => {
   it('passes engine/machine/workspace/tier/cwd as real placement constraints', async () => {
     const fake = fakeReserve();
     await fixture(async (s, sql) => {
-      await startOk(s, { engine: 'codex', machine: 'hetzner', brief: 'goal', tier: 'daily', cwd: 'demo/project' }, admin, 'constraints-1');
+      await startOk(s, { engine: 'codex', engine_override_reason: 'Synthetic override for placement constraints test.', machine: 'hetzner', brief: 'goal', tier: 'daily', cwd: 'demo/project' }, admin, 'constraints-1');
       expect(fake.calls.length).toBe(1);
       const sent = fake.calls[0];
       expect(sent.engine).toBe('codex');
@@ -1368,7 +1368,7 @@ describe('held placement recovery', () => {
     let available = false;
     const placed = fakeReserve();
     await fixture(async (s, sql) => {
-      const input = { key: 'recover-held', workspace: 'demo', engine: 'codex' };
+      const input = { key: 'recover-held', workspace: 'demo', engine: 'codex', engine_override_reason: 'Synthetic override for held recovery test.' };
       const held = await (await s.handle(request('/api/sessions', input), admin)).json() as any;
       expect(held.state).toBe('held');
       const saved = sql.exec('SELECT request_json FROM session_control_sessions WHERE id = ?', held.id).toArray()[0];
@@ -1449,7 +1449,7 @@ describe('unbound Fleet recovery', () => {
 });
 
 describe('owned held intent cancellation', () => {
-  const start = { key: 'held-cancel-start', name: 'held-fixture', workspace: 'demo', engine: 'codex', mode: 'headless', brief: 'synthetic cancellation fixture' };
+  const start = { key: 'held-cancel-start', name: 'held-fixture', workspace: 'demo', engine: 'codex', engine_override_reason: 'Synthetic override for held cancel test.', mode: 'headless', brief: 'synthetic cancellation fixture' };
 
   it('stops a never-started held intent by atomic cancellation and replays safely', async () => {
     const reserve = fakeReserve({ status: 409, error: 'no_eligible_route', rejected: [] });

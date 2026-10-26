@@ -68,7 +68,7 @@ hub intake update TASK_ID --owner example:assistant --next-step 'Obtain review'
 hub intake update TASK_ID --version 1 --status blocked --next-step 'Obtain review' --key context-001
 hub intake update TASK_ID --acceptance-criteria 'Done means X; verified by Y' --key ac-001
 hub intake append TASK_ID --version 2 --event-file event.json --key event-001
-hub intake assign TASK_ID --version 3 --key assign-001 --workspace example-ws --engine codex --tier daily --next-step 'Watch Hub binding' --brief-file goal.txt
+hub intake assign TASK_ID --version 3 --key assign-001 --workspace example-ws --engine codex --reason 'Why this engine is needed' --tier daily --next-step 'Watch Hub binding' --brief-file goal.txt
 hub intake grantees --actor example:assistant
 hub handoff
 hub handoff --project example --page-size 10
@@ -125,7 +125,7 @@ session. Use `hub intake update ... --clear uncertainty` to explicitly clear a c
 ## Assignment through the canonical Hub session
 
 `hub intake assign TASK_ID --version N --key assign-001 --workspace WS
-[--engine E] [--tier quick|daily|deep] [--machine M] [--cwd DIR]
+[--engine E --reason 'Why this engine is needed'] [--tier quick|daily|deep] [--machine M] [--cwd DIR]
 [--brief-file goal.txt | --interactive] [--next-step ...] [--current-state ...]
 [--owner ...]` (plus the usual `--source-type/--source-reference/--source-time`
 provenance, default `unknown`) creates the task's Hub session through the

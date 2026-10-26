@@ -76,7 +76,7 @@ describe('Hub MCP protocol and parity', () => {
     expect(stale).toMatchObject({ status: 409, data: { error: 'version_conflict' } });
     expect((await invoke('intake_append', { id, payload: { key: 'mcp-note', expected_version: 2, event: { kind: 'note', text: 'Fixture' } } })).status).toBe(200);
     expect((await invoke('intake_append', { id, payload: { key: 'mcp-session', expected_version: 3, event: { kind: 'session', native_id: 'fixture-native' } } })).status).toBe(200);
-    const held = await invoke('intake_assign', { id, payload: { key: 'mcp-assign', expected_version: 4, session: { workspace: 'demo', engine: 'codex', mode: 'headless', brief: 'Synthetic fixture goal' }, provenance: { type: 'unknown' } } });
+    const held = await invoke('intake_assign', { id, payload: { key: 'mcp-assign', expected_version: 4, session: { workspace: 'demo', engine: 'codex', engine_override_reason: 'Synthetic override for MCP assign test.', mode: 'headless', brief: 'Synthetic fixture goal' }, provenance: { type: 'unknown' } } });
     expect(held.status, JSON.stringify(held.data)).toBe(200);
     expect(held.data.assigned_session.state).toBe('held');
     expect(held.data.hold).toBeTruthy();

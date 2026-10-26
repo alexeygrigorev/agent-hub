@@ -223,7 +223,8 @@ def add_commands(sub):
     assign.add_argument('--version', type=int, required=True)
     assign.add_argument('--key', required=True)
     assign.add_argument('--workspace', required=True, help='Configured workspace label on the selected host')
-    assign.add_argument('--engine', help='Requested engine label (existing model tiers still decide placement)')
+    assign.add_argument('--engine', help='Requested engine label (existing model tiers still decide placement; requires --reason)')
+    assign.add_argument('--reason', default=None, help='Explanation why this specific model/engine must be chosen (required when --engine is specified)')
     assign.add_argument('--tier', choices=['quick', 'daily', 'deep'], help='Existing model tier; unknown tiers are refused, never upgraded')
     assign.add_argument('--machine', help='Requested machine label')
     assign.add_argument('--cwd', help='Workspace-relative confined working directory')
@@ -420,6 +421,11 @@ def execute(args):
         for field in ('engine', 'tier', 'machine', 'cwd'):
             if getattr(args, field, None):
                 session[field] = getattr(args, field)
+        if getattr(args, 'engine', None):
+            reason = getattr(args, 'reason', None)
+            if not isinstance(reason, str) or not reason.strip():
+                raise IntakeInputError('Engine override requires an explanation why this specific model/engine must be chosen (use --reason). Casual use should prefer auto/policy without --engine.')
+            session['engine_override_reason'] = reason.strip()
         if getattr(args, 'parent', None):
             session['parent_id'] = args.parent
         session['mode'] = 'interactive' if args.interactive else 'headless'

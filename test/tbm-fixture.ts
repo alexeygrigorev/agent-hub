@@ -13,17 +13,6 @@ export function seedFixtureIntake(sql: any): void {
 /** Adds the fixture intake id to non-interactive session starts that do not set one. */
 export function withFixtureIntake(path: string, data: any, method = 'POST'): any {
   if (method !== 'POST' || path !== '/api/sessions' || !data || typeof data !== 'object' || Array.isArray(data)) return data;
-  if (data.mode === 'interactive' || 'intake_task_id' in data) {
-    // Fixture override carries an explanation so the no-casual-picker gate
-    // exercises placement, not the reason requirement (covered explicitly).
-    if (data && typeof data === 'object' && !Array.isArray(data) && (data as any).engine !== undefined && (data as any).engine_override_reason === undefined) {
-      return { ...(data as any), engine_override_reason: 'Synthetic fixture override explanation.' };
-    }
-    return data;
-  }
-  const withIntake: any = { ...data, intake_task_id: FIXTURE_INTAKE_ID };
-  if (withIntake.engine !== undefined && withIntake.engine_override_reason === undefined) {
-    withIntake.engine_override_reason = 'Synthetic fixture override explanation.';
-  }
-  return withIntake;
+  if (data.mode === 'interactive' || 'intake_task_id' in data) return data;
+  return { ...data, intake_task_id: FIXTURE_INTAKE_ID };
 }

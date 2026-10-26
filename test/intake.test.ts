@@ -394,7 +394,7 @@ describe('private durable intake HTTP/SQLite', () => {
   it('assigns a real Hub session through the canonical session API and projects it live in handoff', async () => {
     const { task } = await create();
     const payload = { key: 'assign-live', expected_version: 1,
-      session: { workspace: 'demo', engine: 'codex', mode: 'headless', brief: 'Synthetic assigned goal' },
+      session: { workspace: 'demo', engine: 'codex', engine_override_reason: 'Synthetic override for intake assign test.', mode: 'headless', brief: 'Synthetic assigned goal' },
       provenance: source, next_step: 'Watch Hub binding' };
     const assigned = await ok('/tasks/' + task.id + '/assign', payload);
     const sessionId = assigned.assigned_session.hub_session_id;

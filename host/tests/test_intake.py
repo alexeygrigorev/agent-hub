@@ -286,7 +286,7 @@ class TestIntakeCli(unittest.TestCase):
     def test_assign_builds_canonical_session_payload(self):
         with patch.object(intake, 'request', return_value={}) as transport:
             code, _, error = self.run_cli('intake', 'assign', 'task-1', '--version', '2', '--key', 'assign',
-                                          '--workspace', 'demo', '--engine', 'codex', '--tier', 'daily',
+                                          '--workspace', 'demo', '--engine', 'codex', '--reason', 'Synthetic override for assign test.', '--tier', 'daily',
                                           '--next-step', 'Watch binding')
         self.assertEqual(code, 0, error)
         self.assertEqual(transport.call_args.args[0], 'POST')
@@ -294,7 +294,7 @@ class TestIntakeCli(unittest.TestCase):
         payload = transport.call_args.args[2]
         self.assertEqual(payload['key'], 'assign')
         self.assertEqual(payload['expected_version'], 2)
-        self.assertEqual(payload['session'], {'workspace': 'demo', 'engine': 'codex', 'tier': 'daily', 'mode': 'headless'})
+        self.assertEqual(payload['session'], {'workspace': 'demo', 'engine': 'codex', 'engine_override_reason': 'Synthetic override for assign test.', 'tier': 'daily', 'mode': 'headless'})
         self.assertNotIn('parent_id', payload['session'])
         self.assertEqual(payload['provenance'], {'type': 'unknown', 'reference': None, 'timestamp': None})
         self.assertEqual(payload['next_step'], 'Watch binding')
@@ -302,12 +302,19 @@ class TestIntakeCli(unittest.TestCase):
     def test_assign_with_parent_carries_parent_id_in_session(self):
         with patch.object(intake, 'request', return_value={}) as transport:
             code, _, error = self.run_cli('intake', 'assign', 'task-1', '--version', '2', '--key', 'assign-parent',
-                                          '--workspace', 'demo', '--engine', 'codex',
+                                          '--workspace', 'demo', '--engine', 'codex', '--reason', 'Synthetic override for parent assign.',
                                           '--parent', 'e3f61b6c-9fda-4bcc-bf3d-cf66cb7ef363')
         self.assertEqual(code, 0, error)
         payload = transport.call_args.args[2]
         self.assertEqual(payload['session']['parent_id'], 'e3f61b6c-9fda-4bcc-bf3d-cf66cb7ef363')
         self.assertEqual(payload['session']['workspace'], 'demo')
+
+    def test_assign_engine_without_reason_is_refused(self):
+        with patch.object(intake, 'request', return_value={}) as transport:
+            code, _, error = self.run_cli('intake', 'assign', 'task-1', '--version', '2', '--key', 'assign-no-reason',
+                                          '--workspace', 'demo', '--engine', 'codex')
+        self.assertNotEqual(code, 0)
+        transport.assert_not_called()
 
     def test_create_and_update_carry_acceptance_criteria(self):
         with patch.object(intake, 'read_file', return_value='  synthetic\n世界\n'), \

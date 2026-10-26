@@ -1004,7 +1004,7 @@ export class IntakeService {
     keys(b, ['key', 'expected_version', 'session', 'provenance', 'next_step', 'current_state', 'owner']);
     identifier(b.key);
     const session = object(b.session);
-    keys(session, ['engine', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'parent_id', 'with_goal']);
+    keys(session, ['engine', 'engine_override_reason', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'parent_id', 'with_goal']);
     if (typeof session.workspace !== 'string' || !session.workspace) fail('invalid_field');
     const provenance = source(b.provenance);
     const fingerprint = canonical({ path: '/tasks/' + taskId + '/assign', payload: b });

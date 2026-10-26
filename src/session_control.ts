@@ -1117,12 +1117,9 @@ export class SessionControlService {
       if (input.engine_override_reason !== undefined && (typeof input.engine_override_reason !== 'string' || input.engine_override_reason.length > 500)) {
         return response({ error: 'invalid_session_request', field: 'engine_override_reason', detail: 'invalid_reason' }, 400);
       }
-      // No casual engine picker: an explicit engine is an override and must
-      // carry a non-empty explanation why this specific model/engine is
-      // needed. Default starts omit engine and go through tier/policy.
-      if (input.engine !== undefined && (typeof input.engine_override_reason !== 'string' || !input.engine_override_reason.trim())) {
-        return response({ error: 'engine_reason_required', detail: 'Engine override requires an explanation why this specific model/engine must be chosen (use engine_override_reason). Casual use should prefer auto/policy without engine.' }, 400);
-      }
+      // No casual engine picker (fresh-start gate is inside the txn after the
+      // prior lookup so legacy engine rows without a stored reason can still
+      // replay/retry under their original key).
       if (input.machine !== undefined && !isValidMachineId(input.machine)) return response({ error: 'invalid_session_request', field: 'machine', detail: 'invalid_machine' }, 400);
       if (input.name !== undefined && !nameOk(input.name)) return response({ error: 'invalid_session_request', field: 'name', detail: 'invalid_name' }, 400);
       if (input.cwd !== undefined && !cwdOk(input.cwd)) return response({ error: 'invalid_session_request', field: 'cwd', detail: 'invalid_cwd' }, 400);
@@ -1205,7 +1202,8 @@ export class SessionControlService {
         }
         const sessionType = mode === 'interactive' ? 'aplexer' : 'headless';
         const canonical = JSON.stringify({
-          engine: input.engine ?? null, machine: input.machine ?? null,
+          engine: input.engine ?? null, engine_override_reason: (input as any).engine_override_reason ?? null,
+          machine: input.machine ?? null,
           workspace: input.workspace, cwd: input.cwd ?? null, brief: input.brief ?? null,
           ...(input.with_goal === true ? { with_goal: true } : {}),
           mode, access: input.access ?? null, name: input.name ?? null,
@@ -1220,6 +1218,7 @@ export class SessionControlService {
           const priorInput = parsed(prior.request_json, {});
           if (!Object.prototype.hasOwnProperty.call(priorInput, 'parent_id')) priorInput.parent_id = null;
           if (!Object.prototype.hasOwnProperty.call(priorInput, 'intake_task_id')) priorInput.intake_task_id = null;
+          if (!Object.prototype.hasOwnProperty.call(priorInput, 'engine_override_reason')) priorInput.engine_override_reason = null;
           // Order-insensitive idempotency: legacy rows may carry the same
           // fields in a different key order (e.g. backfilled defaults).
           const norm = (o: any) => JSON.stringify(o, Object.keys(o).sort());
@@ -1230,6 +1229,13 @@ export class SessionControlService {
           if (live.fleet_launch_id || live.state === 'cancelled') return finish(live, { replay: true });
           // A held intent may be placed once capacity/admission recovers; the fleet
           // reserve stays idempotent on its own derived key, so this cannot double-launch.
+        }
+        // No casual engine picker: fresh starts with an explicit engine must
+        // carry a non-empty explanation. Replays under an existing key skip
+        // this so legacy engine rows without a stored reason can still
+        // replay/retry; a different reason under the same key is a 409 above.
+        if (!prior && input.engine !== undefined && (typeof input.engine_override_reason !== 'string' || !input.engine_override_reason.trim())) {
+          return response({ error: 'engine_reason_required', field: 'engine_override_reason', detail: 'Engine override requires an explanation why this specific model/engine must be chosen (use engine_override_reason). Casual use should prefer auto/policy without engine.' }, 400);
         }
         // Start gate (server-side, before any Fleet placement or session row):
         // a start linked to an intake task requires non-empty acceptance

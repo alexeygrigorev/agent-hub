@@ -42,7 +42,7 @@ describe('no casual direct engine picker + waiting-idle + headless auto-cleanup'
     const badData: any = await badRes.json();
     expect(badData.error).toBe('invalid_session_request');
 
-    // 2. Valid engine_override_reason is accepted (not 400 invalid_session_request)
+    // 2. Valid engine_override_reason passes the reason gate (not 400 engine_reason_required)
     const validRes = await SELF.fetch('https://hub.test/api/sessions', {
       method: 'POST',
       headers: { Cookie: cookie, 'x-csrf-token': 'csrf', 'Content-Type': 'application/json' },
@@ -53,8 +53,10 @@ describe('no casual direct engine picker + waiting-idle + headless auto-cleanup'
         engine_override_reason: 'Legitimate model override explanation',
       }),
     });
-    // It passes schema validation (error is not invalid_session_request)
+    // It passes the reason gate (error is not engine_reason_required; headless
+    // without intake then fails with intake_task_id_required, not a schema error)
     const validData: any = await validRes.json();
+    expect(validData.error).not.toBe('engine_reason_required');
     expect(validData.error).not.toBe('invalid_session_request');
   });
 
