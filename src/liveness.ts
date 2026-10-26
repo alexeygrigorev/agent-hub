@@ -3,7 +3,6 @@
  * self-reporting agents (for example Grok Bot). Liveness is derived from timestamps the hub
  * already receives; an unknown host makes everything on it unknown rather than healthy.
  */
-import { MEMORY_FLOOR_MB, NEXT_SLOT_MB } from "./resource-management";
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { effectiveCheckin } from './registry';
 import { accountCapacityAlerts } from './account_capacity';
@@ -40,7 +39,8 @@ export function thresholdsFrom(env: any): Thresholds {
 /** States that open an alert. `idle`, `working`, `exited` and `drained` are not problems. */
 export const ALERT_STATES = new Set(['stale', 'offline', 'stalled', 'stuck', 'uncertain', 'missing', 'launcher_memory_reserve']);
 
-export type Subject = { kind: 'machine' | 'session' | 'launch' | 'agent'; id: string; state: string; detail: string; machine_id?: string | null; age_s?: number | null; alias_of?: string | null; canonical_id?: string | null; resolved_machine_id?: string | null };
+export type Subject = { kind: 'machine' | 'session' | 'launch' | 'agent'; id: string; state: string; detail: string; machine_id?: string | null; age_s?: number | null; alias_of?: string | null; canonical_id?: string | null; resolved_machine_id?: string | null;
+  memory_event?: { classification: 'active' | 'historical' | 'superseded'; observed_at: string; retry_id?: string; retry_state?: string; native_id?: string | null; verification_status?: string | null } };
 
 const STATUS = /^[a-z][a-z_-]{0,31}$/;
 const ACTOR = /^[^\s\x00-\x1f\x7f]{1,128}$/;
@@ -156,23 +156,32 @@ export class LivenessService {
       subjects.push({ kind: 'launch', id: l.id, state, detail: `${l.summary}: ${detail}`, machine_id: l.machine_id, resolved_machine_id: resolved, alias_of: alias, canonical_id: resolved || null, age_s: age });
     }
 
-    // Memory waits share the existing operator-alert bus/webhook and dedupe.
+    // Only a queued attempt is a current hold. Exited predecessors retain
+    // their refusal evidence, but a retry link never proves retry success.
     // A proven pre-spawn refusal alerts immediately; planned holds after 5m.
     for (const h of this.sql.exec("SELECT h.*, l.state FROM fleet_memory_holds h JOIN fleet_launches l ON l.id = h.launch_id WHERE l.state = 'queued' OR (l.state = 'exited' AND h.retry_id IS NOT NULL AND h.since >= ?)", new Date(now - 86400000).toISOString()).toArray() as any[]) {
-      if (h.state === 'queued' && h.refused && this.sql.exec('SELECT launch_id FROM fleet_memory_holds WHERE retry_id = ?', h.launch_id).toArray().length) continue;
       const age = ageSeconds(h.since, now) ?? 0;
       if (!h.refused && age <= 300) continue;
       let reasons:any[]=[]; try {reasons=JSON.parse(h.rejected_json);} catch {}
       const reason=typeof reasons[0]?.reason==='string' ? reasons[0].reason : 'placement_hold';
+      if (h.state === 'exited') {
+        const retry: any = this.sql.exec('SELECT state FROM fleet_launches WHERE id = ?', h.retry_id).toArray()[0];
+        subjects.push({ kind: 'launch', id: h.launch_id, state: 'historical',
+          detail: `Historical ${reason} refusal at ${h.since}; attempt exited, superseded by retry ${h.retry_id} (${retry?.state ?? 'unknown'}); not a current hold. Refusal evidence: ${h.rejected_json}`,
+          age_s: age, memory_event: { classification: 'superseded', observed_at: h.since, retry_id: h.retry_id, retry_state: retry?.state ?? 'unknown' } });
+        continue;
+      }
       subjects.push({ kind: 'launch', id: h.launch_id, state: reason,
-        detail: `${reason} hold for ${age}s: ${h.rejected_json}`, age_s: age });
+        detail: `${reason} hold for ${age}s: ${h.rejected_json}`, age_s: age,
+        memory_event: { classification: 'active', observed_at: h.since } });
     }
-    // Preserve visibility of older failures as well as newly queued refusals.
-    for (const l of this.sql.exec("SELECT id, updated_at, machine_id FROM fleet_launches WHERE state = 'failed' AND exit_reason = 'launcher_memory_reserve' AND updated_at >= ?", new Date(now - 86400000).toISOString()).toArray() as any[]) {
-      const m: any = this.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', l.machine_id).toArray()[0];
-      let hb: any = {}; try { hb = JSON.parse(m?.last_heartbeat || '{}'); } catch { /* unknown stays explicit */ }
-      subjects.push({ kind: 'launch', id: l.id, state: 'launcher_memory_reserve', detail:
-        `memory refusal; latest mem_available_mb=${hb.mem_avail_mb ?? 'unknown'}, reserved_mb=${hb.launcher_resources?.active_mem_mb ?? 'unknown'}, floor_mb=${MEMORY_FLOOR_MB}, requested_mb=${NEXT_SLOT_MB}`, machine_id: l.machine_id });
+    // A terminal refusal is failure history, not evidence of current pressure.
+    // Never attach today's healthy numbers to yesterday's failure receipt.
+    for (const l of this.sql.exec("SELECT id, updated_at, finished_at, machine_id, native_id, verification_status FROM fleet_launches WHERE state = 'failed' AND exit_reason = 'launcher_memory_reserve' AND updated_at >= ?", new Date(now - 86400000).toISOString()).toArray() as any[]) {
+      const at = l.finished_at ?? l.updated_at;
+      subjects.push({ kind: 'launch', id: l.id, state: 'historical', detail:
+        `Historical launcher_memory_reserve failure at ${at}; verification=${l.verification_status ?? 'unknown'}, native_id=${l.native_id ?? 'none'}. Failure remains recorded; current capacity and retry outcome are separate observations.`, machine_id: l.machine_id,
+        memory_event: { classification: 'historical', observed_at: at, native_id: l.native_id ?? null, verification_status: l.verification_status ?? null } });
     }
 
     subjects.push(...accountCapacityAlerts(this.sql, now));
@@ -255,7 +264,8 @@ export class LivenessService {
     return this.sql.exec('SELECT * FROM liveness_alerts WHERE resolved_at IS NULL AND ((notify_error IS NOT NULL AND notified_at <= ?) OR (notified_at IS NULL AND opened_at <= ?)) ORDER BY id LIMIT 20', cutoff, cutoff).toArray();
   }
 
-  alerts(limit = 100) {
+  alerts(limit = 100, subject?: string) {
+    if (subject !== undefined) return this.sql.exec('SELECT * FROM liveness_alerts WHERE subject = ? ORDER BY resolved_at IS NOT NULL, opened_at DESC LIMIT ?', subject, limit).toArray();
     return this.sql.exec('SELECT * FROM liveness_alerts ORDER BY resolved_at IS NOT NULL, opened_at DESC LIMIT ?', limit).toArray();
   }
 

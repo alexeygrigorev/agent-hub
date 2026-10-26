@@ -1677,6 +1677,13 @@ export class Hub extends DurableObject {
     }
     if (!admin) return json({ error: 'forbidden' }, 403);
     if (path === '/api/liveness' && request.method === 'GET') {
+      // Read one subject's retained history even when newer open alerts fill
+      // the default page. A history read never reconciles or resolves alerts.
+      const subject = new URL(request.url).searchParams.get('alert_subject');
+      if (subject !== null) {
+        if (!subject || subject.length > 128 || /[\s\x00-\x1f\x7f]/.test(subject)) return json({ error: 'invalid_alert_subject' }, 400);
+        return json({ alerts: this.livenessService.alerts(100, subject) });
+      }
       const { thresholds, subjects } = this.livenessService.evaluate();
       return json({ thresholds, subjects, alerts: this.livenessService.alerts() });
     }
