@@ -245,6 +245,14 @@ The maintained launcher may emit the fixed refusal slug followed by
 validate the allowlist, finite numbers, ranges and timestamp before preserving
 those numbers; arbitrary output and unknown fields are not forwarded.
 Server-owned `resource_choking` hints contain only `reason` (`host_oom` or
-`host_runtime_choking`) and `observed_at`; they travel through offers and the
-host payload. The launcher must check their freshness against the configured
+`host_runtime_choking`) and `observed_at`; they travel through offers and a
+separate host-supplied `run --trusted-choking-json` argument. Task payloads
+cannot supply trusted runtime evidence. The launcher checks freshness against the configured
 cooldown and independently measure local full-pressure/OOM signals.
+
+Host releases must include `host/`, `config/`, `scripts/`, `pyproject.toml`
+and `uv.lock` from the same accepted commit, followed by `uv sync --frozen`.
+The controller reads `config/model-routing.json` and invokes the dashboard
+export script at runtime. A host-only archive is insufficient. Activation
+preserves operator subscriptions (including capability scheduling ceilings),
+managed-engine paths, launcher arguments and the existing journal directory.
