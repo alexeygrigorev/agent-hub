@@ -153,10 +153,18 @@ function joinedBases(sql: SqlStorage, sessionIds?: Set<string>): JoinedBase[] {
       const ids = selected.slice(i, i + 50);
       const marks = ids.map(() => '?').join(',');
       const nativeId = `CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(binding_json, '$.native_id') = 'text' THEN json_extract(binding_json, '$.native_id') END END`;
-      const native = `SELECT machine_id, ${nativeId} FROM session_control_sessions WHERE id IN (${marks})`;
-      const query = table === 'session_control_sessions' ? `SELECT rowid AS _join_order, * FROM ${table} WHERE id IN (${marks}) OR (machine_id, ${nativeId}) IN (${native})`
-        : table === 'fleet_sessions' ? `SELECT rowid AS _join_order, * FROM ${table} WHERE (machine_id,native_id) IN (${native})`
-        : `SELECT rowid AS _join_order, * FROM ${table} WHERE id IN (SELECT fleet_launch_id FROM session_control_sessions WHERE id IN (${marks})) OR (machine_id,native_id) IN (${native})`;
+      // Tuple-IN only seeks machine_id on SQLite's expression index. An
+      // equality join with untyped RHS seeks the complete native identity.
+      const targetNative = table === 'session_control_sessions'
+        ? nativeId.replaceAll('binding_json', 'c.binding_json') : 'c.native_id';
+      const nativeJoin = `SELECT c.rowid AS _join_order,c.* FROM
+        (SELECT DISTINCT machine_id,${nativeId} AS native_id FROM session_control_sessions WHERE id IN (${marks})) s
+        JOIN ${table} c ON c.machine_id=s.machine_id AND ${targetNative}=+s.native_id`;
+      const query = table === 'session_control_sessions'
+        ? `SELECT rowid AS _join_order,* FROM ${table} WHERE id IN (${marks}) UNION ALL ${nativeJoin}`
+        : table === 'fleet_sessions' ? nativeJoin
+        : `SELECT rowid AS _join_order,* FROM ${table} WHERE id IN
+          (SELECT fleet_launch_id FROM session_control_sessions WHERE id IN (${marks})) UNION ALL ${nativeJoin}`;
       for (const row of sql.exec(query, ...ids, ...(table !== 'fleet_sessions' ? ids : [])).toArray() as any[]) rows.set(row.id ?? `${row.machine_id}/${row.native_id}`, row);
     }
     return [...rows.values()].sort((a, b) => a._join_order - b._join_order);

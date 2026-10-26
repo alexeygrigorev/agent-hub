@@ -2249,8 +2249,9 @@ export class SessionControlService {
           if (queuedFleet && !provenNoStart) {
             let released = false;
             try {
-              const written: any = this.sql.exec(`UPDATE fleet_launches SET state = 'cancelled', verification_status = 'not_started', exit_reason = 'session_cancelled', finished_at = ?, updated_at = ? WHERE id = ? AND state IN ('queued','offered') AND native_id IS NULL AND launcher_task_id IS NULL`, at, at, live.fleet_launch_id);
-              released = written?.rowsWritten === 1;
+              const written: any = this.sql.exec(`UPDATE fleet_launches SET state = 'cancelled', verification_status = 'not_started', exit_reason = 'session_cancelled', finished_at = ?, updated_at = ? WHERE id = ? AND state IN ('queued','offered') AND native_id IS NULL AND launcher_task_id IS NULL RETURNING id`, at, at, live.fleet_launch_id).toArray();
+              // rowsWritten includes SQLite index writes, not just matched rows.
+              released = written.length === 1;
             } catch { released = false; }
             // A winning host claim must never be stranded behind a
             // cancelled control session.

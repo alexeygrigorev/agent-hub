@@ -298,8 +298,8 @@ export class StatusService {
     return { limit, after, project, singleTask, hostFilter, sinceMs: parseSince(params.get('since')) };
   }
 
-  private selectTasks(p: Obj, project: string | null, singleTask: string | null, sinceMs: number | null): Obj[] {
-    let tasks = this.intake.statusTaskSummaries(p);
+  private selectTasks(p: Obj, project: string | null, singleTask: string | null, sinceMs: number | null, summaries: Obj[]): Obj[] {
+    let tasks = summaries;
     if (project !== null) tasks = tasks.filter(t => t.project === project);
     if (singleTask !== null) {
       const one = this.intake.statusTaskById(p, singleTask);
@@ -495,7 +495,8 @@ export class StatusService {
         const p = this.intake.statusPrincipal(auth);
         const params = new URL(request.url).searchParams;
         const { limit, after, project, singleTask, hostFilter, sinceMs } = this.parseViewParams(params, false);
-        const tasks = this.selectTasks(p, project, singleTask, sinceMs);
+        const summaries = this.intake.statusTaskSummaries(p);
+        const tasks = this.selectTasks(p, project, singleTask, sinceMs, summaries);
         const total = tasks.length;
         const window = tasks.filter(t => !after || t.id > after).slice(0, limit + 1);
         const page = window.slice(0, limit);
@@ -506,7 +507,7 @@ export class StatusService {
         const built = this.buildItems(p, page, hostFilter, sinceMs, now, nowIso);
         const diskSummary = this.monitoringService ? this.monitoringService.getStatusSummary(now) : null;
         const agentCounts = this.computeAgentCounts(now);
-        const intakeWarn = this.intake.statusIntakeOpenWarning(p);
+        const intakeWarn = this.intake.statusIntakeOpenWarning(p, summaries);
         return json({
           snapshot_at: nowIso,
           revision,
@@ -516,7 +517,7 @@ export class StatusService {
           disk: diskSummary?.filesystems ?? [],
           host_health: diskSummary?.host_health ?? [],
           intake_policy: 'soft_unlimited_tasks_t1038u',
-          open_non_terminal_count: this.intake.statusOpenNonTerminalCount(p),
+          open_non_terminal_count: this.intake.statusOpenNonTerminalCount(p, summaries),
           open_intake_warn_threshold: 100,
           ...(intakeWarn ? { intake_open_warning: intakeWarn } : {}),
           needs_attention: this.needsAttention(!!(p as any).admin, diskSummary?.needs_attention ?? [], intakeWarn),
@@ -562,15 +563,16 @@ export class StatusService {
         const p = this.intake.statusPrincipal(auth);
         const params = new URL(request.url).searchParams;
         const { project, singleTask, hostFilter, sinceMs } = this.parseViewParams(params, true);
-        const selected = this.selectTasks(p, project, singleTask, sinceMs);
+        const summaries = this.intake.statusTaskSummaries(p);
+        const selected = this.selectTasks(p, project, singleTask, sinceMs, summaries);
         const tasks = selected.slice(0, STATUS_BASELINE_CAP);
         const revision = this.intake.statusRevision();
         const now = this.now();
         const nowIso = new Date(now).toISOString();
         const built = this.buildItems(p, tasks, hostFilter, sinceMs, now, nowIso);
         const snapshot: Record<string, Obj> = {};
-        for (const task of tasks) snapshot[task.id] = this.taskDigest(
-          built.items.find(t => t.id === task.id) ?? task);
+        const itemsById = new Map(built.items.map(item => [item.id, item]));
+        for (const task of tasks) snapshot[task.id] = this.taskDigest(itemsById.get(task.id) ?? task);
         const filterKey = [project, singleTask, hostFilter, sinceMs].map(v => v === null ? '' : String(v)).join('|');
         const callerKey = String((p as any).identity || (p as any).actor || 'unknown') + '||' + filterKey;
         let previous: Obj | null = null;
@@ -595,7 +597,7 @@ export class StatusService {
           agents: agentCounts,
         };
         const diskSummary = this.monitoringService ? this.monitoringService.getStatusSummary(now) : null;
-        const intakeWarn = this.intake.statusIntakeOpenWarning(p);
+        const intakeWarn = this.intake.statusIntakeOpenWarning(p, summaries);
         return json({
           snapshot_at: nowIso,
           revision,
@@ -606,7 +608,7 @@ export class StatusService {
           disk: diskSummary?.filesystems ?? [],
           host_health: diskSummary?.host_health ?? [],
           intake_policy: 'soft_unlimited_tasks_t1038u',
-          open_non_terminal_count: this.intake.statusOpenNonTerminalCount(p),
+          open_non_terminal_count: this.intake.statusOpenNonTerminalCount(p, summaries),
           open_intake_warn_threshold: 100,
           ...(intakeWarn ? { intake_open_warning: intakeWarn } : {}),
           needs_attention: this.needsAttention(!!(p as any).admin, diskSummary?.needs_attention ?? [], intakeWarn),

@@ -71,7 +71,14 @@ export default {
     if (url.pathname === '/mcp' || url.pathname.startsWith('/oauth/') || url.pathname.startsWith('/.well-known/') || url.pathname.startsWith('/api/') || url.pathname.startsWith('/auth/') || url.pathname.startsWith('/device')) {
       const id = env.HUB.idFromName("hub");
       const stub = env.HUB.get(id);
-      return stub.fetch(request);
+      const started = Date.now();
+      const response = await stub.fetch(request);
+      if (!url.pathname.startsWith('/api/') || response.status === 101) return response;
+      // Edge-to-DO elapsed time includes queueing, authentication and handler
+      // work, excluding the client's TLS/network trip. No payloads are logged.
+      const headers = new Headers(response.headers);
+      headers.append('Server-Timing', `hub;dur=${Math.max(0, Date.now() - started)}`);
+      return new Response(response.body, {status: response.status, statusText: response.statusText, headers});
     }
 
     // Public CLI installer seam (server routing only; CLI worker owns artifacts).

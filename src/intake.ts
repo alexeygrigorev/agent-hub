@@ -317,13 +317,15 @@ export class IntakeService {
   }
   private bounded(table: string, max: number) { if (this.rows(table).length >= max) fail('record_capacity', 507); }
   /** Non-terminal task count used for soft open-intake warnings (never blocks create). */
-  openNonTerminalCount(principal?: Obj): number {
-    const rows = this.sql.exec('SELECT data FROM intake_task_projection').toArray().map((r: any) => JSON.parse(r.data));
+  openNonTerminalCount(principal?: Obj, summaries?: Obj[]): number {
+    const rows = summaries ?? this.sql.exec('SELECT data FROM intake_task_projection').toArray().map((r: any) => JSON.parse(r.data));
     return rows.filter(t => !t.archived_at && OPEN.includes(t.status) && (!principal || this.allowed(principal, t))).length;
   }
   /** Operator-visible soft warning when open intake is high. Null when under threshold. */
-  intakeOpenWarning(principal?: Obj): Obj | null {
-    const open_count = this.openNonTerminalCount(principal);
+  intakeOpenWarning(principal?: Obj, summaries?: Obj[]): Obj | null {
+    const rows = summaries ?? this.sql.exec('SELECT data FROM intake_task_projection').toArray().map((r: any) => JSON.parse(r.data));
+    const open = rows.filter(t => !t.archived_at && OPEN.includes(t.status) && (!principal || this.allowed(principal, t)));
+    const open_count = open.length;
     if (open_count <= OPEN_INTAKE_WARN_THRESHOLD) return null;
     return {
       code: 'intake_open_high',
@@ -332,7 +334,7 @@ export class IntakeService {
       threshold: OPEN_INTAKE_WARN_THRESHOLD,
       message: 'Open intake is high. Closing requires a DONE note containing a commit SHA or deploy run URL AND a live check (command/URL plus result). Review evidence for each intake before closing.',
       action: 'review_done_evidence',
-      items: this.sql.exec('SELECT data FROM intake_task_projection').toArray().map((r: any) => JSON.parse(r.data)).filter(t => !t.archived_at && OPEN.includes(t.status) && (!principal || this.allowed(principal, t)))
+      items: open
         .map(t => ({ id: t.id, title: t.title, age_ms: Math.max(0, Date.now() - (t.created_at ?? Date.now())) })),
     };
   }
@@ -1229,8 +1231,8 @@ export class IntakeService {
   statusUnresolved(task: Obj): Obj[] { return this.unresolved(task); }
   statusContinuation(task: Obj): string { return this.continuation(task); }
   statusRevision(): number { return this.revision(); }
-  statusOpenNonTerminalCount(p?: Obj): number { return this.openNonTerminalCount(p); }
-  statusIntakeOpenWarning(p?: Obj): Obj | null { return this.intakeOpenWarning(p); }
+  statusOpenNonTerminalCount(p?: Obj, summaries?: Obj[]): number { return this.openNonTerminalCount(p, summaries); }
+  statusIntakeOpenWarning(p?: Obj, summaries?: Obj[]): Obj | null { return this.intakeOpenWarning(p, summaries); }
   /** Service-owned task creation for internal system services (e.g. disk monitoring).
    * Enforces task capacity, total storage capacity, single-record byte limit, and version/revision CAS. */
   serviceCreateTask(input: {

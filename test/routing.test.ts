@@ -1,5 +1,5 @@
 import {freshCpu} from './cpu-fixture';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { RoutingService, redact } from '../src/routing';
 import { FleetService } from '../src/fleet';
@@ -255,7 +255,28 @@ describe('fair queue scanning and self-contained capability context', () => {
     backlog(sql); const id = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
     sql.exec('INSERT INTO routing_jobs (id,actor,request_key,request_json,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?)', id, 'client-a', 'ready', JSON.stringify({workspace:'tasks',tier:'daily',model:null,needs:[],tasks:[{prompt:'Read only',approved_action:'Read only'}],preferred_runner:null,preferred_machine:null}), 'queued', at(), at());
     await r.dispatch(); expect(sql.exec('SELECT launch_id FROM routing_jobs WHERE id = ?', id).one().launch_id).toBeNull();
-    await r.dispatch(); expect(sql.exec('SELECT launch_id FROM routing_jobs WHERE id = ?', id).one().launch_id).toBeTruthy();
+    const restarted = new RoutingService(sql, f, () => now); restarted.init();
+    for (let i = 0; i < 21; i++) await restarted.dispatch();
+    expect(sql.exec('SELECT launch_id FROM routing_jobs WHERE id = ?', id).one().launch_id).toBeTruthy();
+  }));
+  it('wraps under new arrivals and shares maintenance through an eligible nested reserve', () => fixture(async (r,f,sql) => {
+    const insert=(id:string,needs:string[])=>sql.exec('INSERT INTO routing_jobs(id,actor,request_key,request_json,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?)',id,'client-a',id,JSON.stringify({workspace:'tasks',tier:'daily',model:null,needs,tasks:[{prompt:'Read only',approved_action:'Read only'}],preferred_runner:null,preferred_machine:null}),'queued',at(),at());
+    insert('early',['unavailable']); insert('blocked',['unavailable']);
+    await r.dispatch();
+    sql.exec("UPDATE routing_jobs SET request_json=json_set(request_json,'$.needs',json('[]')) WHERE id='early'");
+    const restarted=new RoutingService(sql,f,()=>now); restarted.init();
+    const reconcile=vi.spyOn(f.admission,'reconcileOffers');
+    const reserve=vi.spyOn(f,'reserve');
+    const drain=vi.spyOn(f,'plan');
+    for(let i=0;i<4;i++) {
+      insert('new-'+i,['unavailable']);
+      f.withMaintenance(()=>{restarted.dispatchNow();f.drainCapacityQueue();});
+    }
+    expect(sql.exec("SELECT launch_id FROM routing_jobs WHERE id='early'").one().launch_id).toBeTruthy();
+    expect(reserve).toHaveBeenCalledTimes(1);
+    expect(reconcile).toHaveBeenCalledTimes(4);
+    expect(drain.mock.calls.length).toBeLessThanOrEqual(4*5+3);
+    reconcile.mockRestore(); reserve.mockRestore(); drain.mockRestore();
   }));
   it('rejects coerced tier/difficulty types and redacts prefixed secrets and non-HTTP auth URIs', () => fixture(async (r) => {
     for (const data of [input({tier:['daily']}),input({difficulty:['normal']})]) expect((await r.handle(req('/api/tasks', data),client())).status).toBe(400);

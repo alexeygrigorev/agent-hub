@@ -11,6 +11,8 @@ from test_fleet import settings, offer
 def test_new_launch_binds_in_same_cycle_and_catalog_failure_retains_running(catalog_failure):
     with tempfile.TemporaryDirectory() as tmp:
         cfg = settings(Path(tmp)); events = []; active = False
+        # This test asserts serial binding order; burst dispatch is covered separately.
+        cfg['dispatch_concurrency'] = 1
         item = offer()
         row = {'id': '11111111-1111-4111-8111-111111111111', 'tag': 'hub-' + item['id'], 'engine': 'codex', 'workspace': tmp, 'created_at_ms': 1790000000000, 'phase': 'running', 'profile': None}
         def request(method, path, body=None):

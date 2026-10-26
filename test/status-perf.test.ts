@@ -128,4 +128,49 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
     expect(times[18]).toBeGreaterThan(0);
     expect.soft(times[18], name).toBeLessThan(100);
   }
+  // A busy retained queue must not make every host poll re-plan its backlog.
+  await inDO(stub, (h: any) => h.ctx.storage.transactionSync(() => {
+    h.sql.exec("UPDATE machines SET last_heartbeat=json_set(last_heartbeat,'$.mem_avail_mb',0) WHERE id='claim-host'");
+    for (let i = 0; i < 200; i++) {
+      h.sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
+        SELECT ?,actor,requester_kind,summary,?,request_json,machine_id,engine,account,mode,workspace,prompt,'queued',created_at,updated_at
+        FROM fleet_launches WHERE account='claim-account' AND state='stopped' LIMIT 1`, sessionId(20000+i), `perf-parked-${i}`);
+    }
+  }));
+  await inDO(stub, (h: any) => h.ctx.storage.transactionSync(() => {
+    for (let i=0;i<200;i++) h.sql.exec(`INSERT INTO routing_jobs(id,actor,request_key,request_json,state,created_at,updated_at) VALUES(?,?,?,?,'queued',?,?)`,
+      sessionId(30000+i),'perf:owner',`routing-backlog-${i}`,JSON.stringify({workspace:'demo',needs:['unavailable'],tasks:[],access:{mode:'read'}}),new Date().toISOString(),new Date().toISOString());
+  }));
+  const backlogTimes: number[] = [];
+  for (let i = 0; i < 20; i++) {
+    const start = performance.now();
+    const response = await stub.fetch('https://hub.test/api/fleet/offers', {headers: {Authorization: 'Bearer ' + claimToken}});
+    await response.json();
+    backlogTimes.push(performance.now() - start);
+    expect(response.status).toBe(200);
+  }
+  backlogTimes.sort((a, b) => a - b);
+  console.log(`offers with blocked backlog p50=${backlogTimes[9]}ms p95=${backlogTimes[18]}ms`);
+  expect(backlogTimes[18]).toBeGreaterThan(0);
+  expect(backlogTimes[18]).toBeLessThan(100);
+  // Competing requests exercise DO scheduling while both queues are retained.
+  const mixed = [
+    ['status','/api/status', {method:'POST',headers:{Cookie:cookie,'x-csrf-token':'perf'},body:'{}'}],
+    ['sessions','/api/sessions?limit=1',{headers:{Cookie:cookie}}],
+    ['offers','/api/fleet/offers',{headers:{Authorization:'Bearer '+claimToken}}],
+    ['claim',`/api/fleet/launches/${sessionId(11999)}/claim`,{method:'POST',headers:{Authorization:'Bearer '+token},body:'{}'}],
+  ] as const;
+  const mixedTimes: number[][] = mixed.map(()=>[]);
+  for(let i=0;i<20;i++) await Promise.all(mixed.map(async ([name,path,options],j)=>{
+    const start=performance.now();
+    const response=await stub.fetch('https://hub.test'+path,options);
+    await response.json();
+    mixedTimes[j].push(performance.now()-start);
+    expect(response.status,name).toBe(name==='claim'?409:200);
+  }));
+  for(const [j,[name]] of mixed.entries()) {
+    const times=mixedTimes[j].sort((a,b)=>a-b);
+    console.log(`concurrent ${name} p50=${times[9]}ms p95=${times[18]}ms`);
+    expect.soft(times[18],`concurrent ${name}`).toBeLessThan(100);
+  }
 }, 120000);

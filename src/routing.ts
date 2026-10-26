@@ -41,10 +41,12 @@ function taskPrompt(input: any): string {
 export class RoutingService {
   constructor(private sql: SqlStorage, private fleet: FleetService, private now = Date.now, private transaction: <T>(fn: () => T) => T = fn => fn()) {}
   init() {
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS routing_scan_cursor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), after_rowid INTEGER NOT NULL, high_water INTEGER NOT NULL)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS routing_cursor (singleton INTEGER PRIMARY KEY, job_id TEXT NOT NULL)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS routing_machines (machine_id TEXT PRIMARY KEY, needs_json TEXT NOT NULL, max_agents INTEGER NOT NULL, observed_at TEXT NOT NULL, runners_json TEXT NOT NULL DEFAULT '[]')`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS routing_artifacts (job_id TEXT NOT NULL, name TEXT NOT NULL, media_type TEXT NOT NULL, data_base64 TEXT NOT NULL, PRIMARY KEY(job_id, name))`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS routing_jobs (id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, launch_id TEXT, state TEXT NOT NULL, report TEXT NOT NULL DEFAULT '', artifacts_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, selection_json TEXT, UNIQUE(actor, request_key))`);
+    this.sql.exec('CREATE INDEX IF NOT EXISTS routing_pending ON routing_jobs(state, launch_id)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS routing_queued ON routing_jobs(state, launch_id, id)');
     try { ensureTbmControllerSchema(this.sql); } catch {}
   }
@@ -65,14 +67,30 @@ export class RoutingService {
   }
   /** Idempotent fleet requests preserve reservations even if the reply/link write is interrupted. */
   async dispatch(jobId?: string) {
-    this.fleet.admission.reconcileOffers();
+    return this.dispatchNow(jobId);
+  }
+
+  /** Synchronous variant for the host poll transaction and maintenance scope. */
+  dispatchNow(jobId?: string) {
+    return this.fleet.withMaintenance(() => this.dispatchWithinMaintenance(jobId));
+  }
+
+  private dispatchWithinMaintenance(jobId?: string) {
+    this.fleet.reconcileCapacity();
     let queued: any[];
     if (jobId) queued = this.sql.exec("SELECT * FROM routing_jobs WHERE id = ? AND launch_id IS NULL AND state = 'queued'", jobId).toArray();
     else {
-      const cursor: any = this.sql.exec('SELECT job_id FROM routing_cursor WHERE singleton = 1').toArray()[0];
-      queued = this.sql.exec("SELECT * FROM routing_jobs WHERE launch_id IS NULL AND state = 'queued' AND id > ? ORDER BY id LIMIT 20", cursor?.job_id || '').toArray();
-      if (!queued.length) queued = this.sql.exec("SELECT * FROM routing_jobs WHERE launch_id IS NULL AND state = 'queued' ORDER BY id LIMIT 20").toArray();
-      if (queued.length) this.sql.exec('INSERT OR REPLACE INTO routing_cursor VALUES (1, ?)', queued[queued.length - 1].id);
+      // Snapshot a finite round; new arrivals cannot postpone wrapping forever.
+      // Persist rowid progress across service/DO restarts, one candidate per poll.
+      const cursor: any = this.sql.exec('SELECT after_rowid,high_water FROM routing_scan_cursor WHERE singleton=1').toArray()[0];
+      let after = Number(cursor?.after_rowid || 0), high = Number(cursor?.high_water || 0);
+      if (after >= high) {
+        after = 0;
+        high = Number(this.sql.exec("SELECT COALESCE(MAX(rowid),0) AS n FROM routing_jobs WHERE launch_id IS NULL AND state='queued'").one().n);
+      }
+      queued = this.sql.exec("SELECT rowid AS scan_rowid,* FROM routing_jobs WHERE launch_id IS NULL AND state='queued' AND rowid>? AND rowid<=? ORDER BY rowid LIMIT 1", after, high).toArray();
+      after = queued.length ? Number(queued[0].scan_rowid) : high;
+      this.sql.exec('INSERT INTO routing_scan_cursor VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET after_rowid=excluded.after_rowid,high_water=excluded.high_water', after, high);
     }
     // TBM pacing/EDF context is read once per dispatch pass from the Phase 1 tbm_* tables.
     const pacing = queued.length ? loadProviderPacing(this.sql, this.now()) : undefined;

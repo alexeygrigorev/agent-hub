@@ -24,6 +24,7 @@ export const GATE_STALE_MS = 300000;
 
 export const FLEET_SCHEMA = `
 CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS fleet_queue_cursor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), after_rowid INTEGER NOT NULL, high_water INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_memory_holds (launch_id TEXT PRIMARY KEY, since TEXT NOT NULL, rejected_json TEXT NOT NULL, refused INTEGER NOT NULL DEFAULT 0, retry_id TEXT);
 CREATE TABLE IF NOT EXISTS fleet_accounts (label TEXT PRIMARY KEY, provider TEXT NOT NULL, max_concurrency INTEGER NOT NULL, reserve_percent REAL NOT NULL, enabled INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS fleet_routes (machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, PRIMARY KEY(machine_id, engine, account));
@@ -354,6 +355,26 @@ export class FleetService {
   public routing: RoutingService;
   public resources: ResourceManagement;
   public admission: ClaimAdmission;
+  private maintenance: { reconciled: boolean; drained: boolean } | null = null;
+
+  /** Synchronous operation scope: nested routing/reserve/plan calls share work,
+   * never capacity snapshots. No await may cross this scope. */
+  withMaintenance<T>(fn: () => T): T {
+    if (this.maintenance) return fn();
+    this.maintenance = { reconciled: false, drained: false };
+    try { return fn(); } finally { this.maintenance = null; }
+  }
+
+  reconcileCapacity() {
+    return this.withMaintenance(() => {
+      if (this.maintenance!.reconciled) return;
+      this.admission.reconcileOffers();
+      reconcileAccountCapacity(this.sql, this.now());
+      reconcileUnboundFleetSessions(this.sql, this.now());
+      this.maintenance!.reconciled = true;
+    });
+  }
+
   constructor(private sql: SqlStorage, private transaction: <T>(fn: () => T) => T, private now: () => number = Date.now) {
     this.resources = new ResourceManagement(sql, now);
     this.routing = new RoutingService(sql, this, now, transaction);
@@ -371,6 +392,12 @@ export class FleetService {
       if (!launchColumns.includes(name)) this.sql.exec(`ALTER TABLE fleet_launches ADD COLUMN ${name} TEXT`);
     }
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_offered ON fleet_launches(id) WHERE state = 'offered'");
+    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_state ON fleet_launches(state)');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_expiry ON fleet_launches(state,created_at)');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_account_state ON fleet_launches(account,state)');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_session_account_phase ON fleet_sessions(account,phase)');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_route_account ON fleet_routes(account)');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS routing_launch ON routing_jobs(launch_id)');
     const columns = this.sql.exec('PRAGMA table_info(fleet_sessions)').toArray().map((c: any) => c.name);
     if (!columns.includes('last_activity_at')) this.sql.exec('ALTER TABLE fleet_sessions ADD COLUMN last_activity_at TEXT');
     if (!columns.includes('cwd')) this.sql.exec('ALTER TABLE fleet_sessions ADD COLUMN cwd TEXT');
@@ -430,9 +457,11 @@ export class FleetService {
   }
 
   accountStatus(account: any) {
-    this.admission.reconcileOffers();
-    reconcileAccountCapacity(this.sql, this.now());
-    reconcileUnboundFleetSessions(this.sql, this.now());
+    return this.withMaintenance(() => this.accountStatusWithinMaintenance(account));
+  }
+
+  private accountStatusWithinMaintenance(account: any) {
+    this.reconcileCapacity();
     // Canonical provider model: `codex-orin` is an account under provider
     // `codex`, never a separate provider. Stored rows keyed by old names
     // canonicalize here so grouping by provider shows both Codex accounts.
@@ -638,6 +667,10 @@ export class FleetService {
   }
 
   plan(input: any) {
+    return this.withMaintenance(() => this.planWithinMaintenance(input));
+  }
+
+  private planWithinMaintenance(input: any) {
     if (!object(input, ['mode', 'machine', 'engine', 'engine_override_reason', 'tier', 'account', 'workspace', 'cwd', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access', 'approved_action', 'with_goal', 'task_kind', 'project']) ||
       (input.project !== undefined && (typeof input.project !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.project))) ||
       (input.task_kind !== undefined && !['implement','review','ask','goal'].includes(input.task_kind)) ||
@@ -829,7 +862,7 @@ export class FleetService {
     } catch { return 1; }
   }
 
-  /** Promote capacity-queued intents FIFO when slots free; expire stale parks.
+  /** Promote capacity-queued intents in bounded circular order; expire stale parks.
    *
    * Runs inside the ambient transaction on every reserve (new + replay) and
    * on every capacity-freeing write (terminal results, session catalog
@@ -837,22 +870,42 @@ export class FleetService {
    * operator retrying blindly. Bounded per call for the CPU budget.
    * Admission and parent liveness are re-checked at promotion: a deny keeps
    * the row queued (never launches under dead authority). */
-  drainCapacityQueue(limit = 5): { promoted: number; expired: number } {
+  drainCapacityQueue(limit = 2): { promoted: number; expired: number } {
+    return this.withMaintenance(() => {
+      if (this.maintenance!.drained) return { promoted: 0, expired: 0 };
+      this.maintenance!.drained = true;
+      return this.transaction(() => this.drainCapacitySlice(limit));
+    });
+  }
+
+  private drainCapacitySlice(limit: number): { promoted: number; expired: number } {
     let promoted = 0, expired = 0;
     try {
       const nowIso = new Date(this.now()).toISOString();
       const staleBefore = new Date(this.now() - 48 * 3600000).toISOString();
-      const stale = this.sql.exec("SELECT id FROM fleet_launches WHERE state = 'queued' AND created_at < ?", staleBefore).toArray() as any[];
+      const stale = this.sql.exec("SELECT id FROM fleet_launches WHERE state = 'queued' AND created_at < ? ORDER BY created_at LIMIT 5", staleBefore).toArray() as any[];
       for (const row of stale) {
         this.sql.exec("UPDATE fleet_launches SET state = 'expired', updated_at = ? WHERE id = ? AND state = 'queued'", nowIso, row.id);
         expired++;
       }
-      // Resource management (intake 4fcd3139): scan past unplaceable heads
-      // (scope/admission holds, goal-only routes) so they cannot block the
-      // whole queue; `limit` caps promotions per drain, not rows examined.
-      const rows = this.sql.exec("SELECT * FROM fleet_launches WHERE state = 'queued' ORDER BY rowid LIMIT ?", Math.max(limit, 200)).toArray() as any[];
+      // A durable circular scan visits two candidates per operation. A fixed
+      // high-water mark forces a wrap even while new queued work keeps arriving.
+      // Host polls and capacity-changing writes drive the next bounded slice.
+      const cursor: any = this.sql.exec('SELECT after_rowid,high_water FROM fleet_queue_cursor WHERE singleton=1').toArray()[0];
+      let after = Number(cursor?.after_rowid || 0), high = Number(cursor?.high_water || 0);
+      if (after >= high) {
+        after = 0;
+        high = Number(this.sql.exec("SELECT COALESCE(MAX(rowid),0) AS n FROM fleet_launches WHERE state='queued'").one().n);
+      }
+      // Bounded expiry cannot leave old work eligible for promotion.
+      const rows = this.sql.exec("SELECT rowid AS queue_rowid,* FROM fleet_launches WHERE state='queued' AND rowid>? AND rowid<=? AND created_at>=? ORDER BY rowid LIMIT 2", after, high, staleBefore).toArray() as any[];
+      if (!rows.length) after = high;
       for (const row of rows) {
-        if (promoted >= limit) break;
+        if (promoted >= Math.min(2, limit)) break;
+        after = Number(row.queue_rowid);
+        // Persist only examined progress, in the promotion transaction. Even
+        // malformed or held rows must not strand eligible work behind them.
+        this.sql.exec('INSERT INTO fleet_queue_cursor VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET after_rowid=excluded.after_rowid,high_water=excluded.high_water', after, high);
         let bound: any = null;
         try { bound = JSON.parse(row.request_json); } catch { continue; }
         if (!bound || typeof bound !== 'object') continue;
@@ -906,19 +959,24 @@ export class FleetService {
           promoted++;
         }
       }
+      this.sql.exec('INSERT INTO fleet_queue_cursor VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET after_rowid=excluded.after_rowid,high_water=excluded.high_water', after, high);
     } catch { /* drain is best-effort inside the ambient txn */ }
     return { promoted, expired };
   }
 
   /** All final placement gates, authority reads and capacity writes share this transaction. */
   reserve(input: any, auth: Auth, expectedAuthority?: EditAuthority, preview = false): { value: any; status: number } {
+    return this.withMaintenance(() => this.reserveWithinMaintenance(input, auth, expectedAuthority, preview));
+  }
+
+  private reserveWithinMaintenance(input: any, auth: Auth, expectedAuthority?: EditAuthority, preview = false): { value: any; status: number } {
     const result = (value: any, status = 200) => ({ value, status });
     const caller = auth.caller;
     if (!caller || !(caller.isAdmin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch')))) return result({ error: 'forbidden' }, 403);
     return this.transaction(() => {
-      this.admission.reconcileOffers();
-      // Capacity waitlist first: freed slots promote parked intents FIFO
-      // before a new request can take them, and replays observe promotion.
+      this.reconcileCapacity();
+      // Give the retained waitlist a bounded turn before a new reservation;
+      // within each circular slice, older rows are considered first.
       try { this.drainCapacityQueue(); } catch { /* best-effort */ }
       const plan = this.plan(input);
       if ('error' in plan) return result(plan, 400);
@@ -1184,9 +1242,9 @@ export class FleetService {
 
     if (path === '/api/fleet/offers' && request.method === 'GET') {
       if (!host) return response({ error: 'forbidden' }, 403);
-      await this.routing.dispatch();
-      return this.transaction(() => {
-        this.admission.reconcileOffers();
+      return this.withMaintenance(() => this.transaction(() => {
+        this.routing.dispatchNow();
+        this.reconcileCapacity();
         try { this.drainCapacityQueue(); } catch { /* best-effort */ };
         const offers: any[] = [];
         for (const row of this.sql.exec("SELECT * FROM fleet_launches WHERE machine_id = ? AND state = 'offered' ORDER BY created_at, id LIMIT 100", caller.machineId!)) {
@@ -1195,7 +1253,7 @@ export class FleetService {
           if (offers.length === 20) break;
         }
         return response({ offers: this.routing.enrichOffers(offers), reconciliation: this.reconciliationCandidates(caller.machineId!) });
-      });
+      }));
     }
     if (path === '/api/fleet/sessions' && request.method === 'PUT') {
       if (!host) return response({ error: 'forbidden' }, 403);

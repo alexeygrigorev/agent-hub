@@ -17,6 +17,19 @@ describe('separate Worker liveness and authenticated Hub readiness', () => {
     expect(get).not.toHaveBeenCalled();
   });
 
+  it('reports DO elapsed time without replaying or changing API errors', async () => {
+    for (const status of [200, 401, 409]) {
+      const forward = vi.fn(async () => Response.json({original:true}, {status, headers:{'Cache-Control':'no-store','Server-Timing':'existing;dur=1'}}));
+      const env:any = {HUB:{idFromName:()=> 'hub',get:()=>({fetch:forward})}};
+      const response = await worker.fetch(new Request('https://hub.test/api/status'),env,ctx);
+      expect(response.status).toBe(status);
+      expect(await response.json()).toEqual({original:true});
+      expect(response.headers.get('Server-Timing')).toMatch(/^existing;dur=1, hub;dur=\d+$/);
+      expect(response.headers.get('Cache-Control')).toBe('no-store');
+      expect(forward).toHaveBeenCalledTimes(1);
+    }
+  });
+
   for (const path of ['/healthz', '/api/healthz']) {
     it(`preserves credential and method failures on ${path}`, async () => {
       for (const status of [200, 401, 403, 405, 503]) {
