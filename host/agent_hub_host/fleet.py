@@ -80,6 +80,30 @@ WORKER_PIDS = "256"
 WORKER_CPU_QUOTA_US = "100000"
 WORKER_CPU_PERIOD_US = "100000"
 
+# Advertisement-only cache for qualified role profiles (intake eff9a5ce AC1:
+# derivation costs ~7 s per cycle on DEFLf4 and only feeds registration).
+ROLE_JOBS_CACHE_TTL_S = 120.0
+
+# Single-flight offer-claim lock shared by the 60s fleet-host timer and the
+# 20s session-host maintenance loop (intake eff9a5ce AC2). Both load the same
+# host settings, so the journal dir resolves to the same path and exactly
+# one loop owns offers per cycle. fcntl locks release on process death, so
+# a SIGTERMed cycle (TimeoutStartSec=240s) never wedges the other loop.
+CYCLE_LOCK_NAME = "fleet-cycle.lock"
+
+
+def _sanitized_transport_error(exc, limit=160):
+    """Bounded, control-char-free transport error for cycle/telemetry logs."""
+    try:
+        text = str(exc)
+    except Exception:
+        return type(exc).__name__[:64]
+    try:
+        text = _strip_control_chars(text)
+    except Exception:
+        pass
+    return text[:limit]
+
 
 def absolute_workspace_ok(value):
     """Bounded canonical absolute POSIX or Windows workspace identifier.
@@ -768,6 +792,10 @@ class Dispatcher:
         self.journal_dir = journal_dir or settings.get("journal_dir")
         self._imported_sessions_cursor: Optional[str] = None
         self._active_launches: dict[str, dict[str, Any]] = {}
+        self._role_jobs_cache: Optional[tuple] = None
+        # Per-phase durations of the most recent once() cycle (intake
+        # eff9a5ce AC1). Published as a fleet_cycle_phases stdout event.
+        self.last_cycle_phases: dict[str, float] = {}
         if self.journal_dir:
             self._load_pending_launches_from_journal()
 
@@ -1618,7 +1646,50 @@ class Dispatcher:
 
         return reconciled
 
+    def _role_jobs_cache_key(self, path):
+        """Identity for the advertisement cache: file revision when the role
+        config comes from a path (disable/edit propagates on the next cycle),
+        otherwise None (TTL-only backstop)."""
+        if not path or not isinstance(path, str):
+            return None
+        try:
+            st = os.stat(path)
+            return (path, st.st_mtime_ns, st.st_size)
+        except OSError:
+            return (path, None, None)
+
     def _derive_qualified_role_jobs(self) -> list[str]:
+        """Derive only enabled real qualified supported role profiles.
+
+        Advertisement-only cache (120 s TTL): qualification shells out to
+        runtime/quota checks (~7 s measured on DEFLf4, intake eff9a5ce AC1),
+        and the result only feeds the register capabilities snapshot.
+        A path-backed config is also keyed on file revision, so an
+        edit/disable propagates on the next cycle. Dispatch-time admission
+        stays fresh per offer; any stale offer still fails closed in
+        dispatch().
+        """
+        path = self.role_config_path or (self.settings.get("role_config") if isinstance(self.settings.get("role_config"), str) else None)
+        key = self._role_jobs_cache_key(path)
+        try:
+            cached = self._role_jobs_cache
+        except AttributeError:
+            cached = None
+        if cached is not None:
+            try:
+                cached_key, deadline, value = cached
+                if cached_key == key and time.monotonic() < deadline and isinstance(value, list):
+                    return list(value)
+            except Exception:
+                pass
+        value = self._derive_qualified_role_jobs_uncached()
+        try:
+            self._role_jobs_cache = (key, time.monotonic() + ROLE_JOBS_CACHE_TTL_S, list(value))
+        except Exception:
+            pass
+        return value
+
+    def _derive_qualified_role_jobs_uncached(self) -> list[str]:
         """Derive only enabled real qualified supported role profiles via RuntimeManager.
 
         Rejects fixture/mock reports and arbitrary configured jobs text. Missing,
@@ -2382,6 +2453,46 @@ class Dispatcher:
                 continue
         return raw
 
+    def _cycle_lock_path(self):
+        try:
+            base = self.journal_dir or (self.settings or {}).get("journal_dir")
+        except Exception:
+            base = None
+        if not base or not isinstance(base, str):
+            return None
+        return Path(base) / CYCLE_LOCK_NAME
+
+    def _acquire_cycle_lock(self):
+        """Non-blocking single claim-owner lock. True holder: file object.
+
+        Returns the open lock file when this cycle owns offers, False when
+        a sibling loop (timer vs session-host) already owns them, or None
+        when no journal is configured (unit-test callers keep legacy
+        behavior) or the platform lacks fcntl. The caller must close the
+        file to release; fcntl also releases on process death.
+        """
+        path = self._cycle_lock_path()
+        if path is None:
+            return None
+        try:
+            import fcntl
+        except ImportError:
+            return None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fh = open(path, "a+b")
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError):
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+                return False
+            return fh
+        except Exception:
+            return None
+
     def _refresh_checkin(self, hb) -> None:
         """Best-effort checkin refresh between serial dispatches.
 
@@ -2419,6 +2530,14 @@ class Dispatcher:
                     results.append({'id': offer.get('id'), 'state': 'binding_pending',
                                     'error': type(exc).__name__[:64]})
         except Exception as exc:
+            if 'already_claimed' in str(exc):
+                # Lost a claim race to the sibling loop (timer vs
+                # session-host, intake eff9a5ce AC2) or another host. The
+                # winner owns the launch: no reject round-trip (it would
+                # 409 too), no refused-launch journal record, no extra
+                # cycle beyond the normal losing poll.
+                results.append({'id': offer.get('id'), 'state': 'held', 'reason': 'already_claimed'})
+                return
             from .opencode_auth import AuthBusy
             if isinstance(exc, AuthBusy):
                 results.append({'id': offer.get('id'), 'state': 'held', 'reason': 'engine_auth_busy'})
@@ -2453,11 +2572,50 @@ class Dispatcher:
                             "error": err, "diagnostic": diagnostic})
 
     def once(self):
+        # AC1: per-phase timings, published as a fleet_cycle_phases event.
+        phases: dict[str, float] = {}
+        _mark_at = [time.monotonic()]
+
+        def _mark(name: str) -> None:
+            now = time.monotonic()
+            phases[name] = round(now - _mark_at[0], 3)
+            _mark_at[0] = now
+
+        def _skip_telemetry(phase: str, exc: Exception) -> None:
+            # AC3: stale/unmapped/invalid quota snapshots (PUT 400s) must
+            # never kill the cycle before offers are fetched. Log the
+            # sanitized trigger (bus now surfaces the 400 error/reason
+            # slug) and continue to offers.
+            print(json.dumps({'event': 'fleet_telemetry_skipped', 'phase': phase,
+                              'error': _sanitized_transport_error(exc)}), flush=True)
+
         from . import provisioning
         provisioning.tick()
         managed = provisioning.managed_subscriptions()
         self.settings['subscriptions'] = [s for s in self.settings['subscriptions'] if s['account_label'] not in self._managed_labels] + managed
         self._managed_labels = {s['account_label'] for s in managed}
+        _mark('provisioning')
+        # AC2: exactly one of the 60s timer loop and the 20s session-host
+        # loop owns offers per cycle. The loser skips with a receipt instead
+        # of racing claims into already_claimed -> +1 cycle delays.
+        cycle_lock = self._acquire_cycle_lock()
+        if cycle_lock is False:
+            phases['lock'] = 0.0
+            self.last_cycle_phases = phases
+            print(json.dumps({'event': 'fleet_cycle_skipped',
+                              'reason': 'concurrent_cycle'}), flush=True)
+            return [{'id': 'cycle', 'state': 'skipped', 'reason': 'concurrent_cycle'}]
+        try:
+            return self._once_locked(phases, _mark, _skip_telemetry)
+        finally:
+            try:
+                if cycle_lock is not None:
+                    cycle_lock.close()
+            except Exception:
+                pass
+            self.last_cycle_phases = dict(phases)
+
+    def _once_locked(self, phases, _mark, _skip_telemetry):
         from . import api, system
         info = system.get_system_info()
         caps = info['capabilities']
@@ -2479,7 +2637,9 @@ class Dispatcher:
             caps['jobs'] = qualified_jobs
         else:
             caps.pop('jobs', None)
+        _mark('system')
         self.request('POST', '/api/machines/register', info)
+        _mark('register')
         hb = api.get_heartbeat_payload()
         if self.settings.get('launcher'):
             from .launcher_recovery import reconcile_resources
@@ -2503,7 +2663,9 @@ class Dispatcher:
             except Exception:
                 pass
         hb['gate'] = {'launch_allowed': allowed, 'reason': 'fleet local admission' if allowed else 'fleet admission unavailable', 'at': utcnow()}
+        _mark('admission')
         self.request('POST', '/api/host/poll', hb)
+        _mark('heartbeat')
         for engine in sorted(admitted_engines):
             try:
                 self.request('POST', '/api/fleet/probe', {'engine': engine, 'status': 'ok', 'reason': 'admission_configured'})
@@ -2523,8 +2685,18 @@ class Dispatcher:
                     self.request('POST', '/api/fleet/probe', auth_health)
             except Exception:
                 pass  # dispatch repeats the check before allowing any claim.
-        self.request("PUT", "/api/fleet/subscriptions", {"subscriptions": collect_subscriptions(self.settings, self.runner)})
-        raw = self.report_catalog_bindings()
+        _mark('probes')
+        try:
+            self.request("PUT", "/api/fleet/subscriptions", {"subscriptions": collect_subscriptions(self.settings, self.runner)})
+        except Exception as exc:
+            _skip_telemetry('subscriptions', exc)
+        _mark('subscriptions')
+        try:
+            raw = self.report_catalog_bindings()
+        except Exception as exc:
+            raw = None
+            _skip_telemetry('catalog', exc)
+        _mark('catalog')
         # Native work-claim bridge (Phase 1): mirror redacted local `a work`
         # declarations and `work.*` mailbox events into Hub claims/messages so
         # operators see native work in activity views. Best-effort only: a
@@ -2543,16 +2715,23 @@ class Dispatcher:
             )
         except Exception as exc:
             workclaim_summary = {"ok": False, "error": (type(exc).__name__ or "Error")[:64]}
+        _mark('workclaim')
         # Never advertise a defaulted concurrency: a settings state without an
         # explicit max_agents (hand edit mid-relabel, generated file, degraded
         # load) must not overwrite the real host concurrency. The server keeps
         # the last advertised value until a fully specified settings load PUTs.
         if 'capabilities' in self.settings and 'max_agents' in self.settings:
-            self.request('PUT', '/api/fleet/routing/capabilities', {'needs': self.settings['capabilities'], 'max_agents': self.settings['max_agents'], 'runners': [{'engine': s.get('engine', s['service']), 'profile': s.get('profile'), 'account': s['account_label'], 'model': s['launcher_model'], 'effort': s.get('launcher_effort')} for s in self.settings['subscriptions'] if s.get('launcher_model') and s.get('admission_argv')]})
+            try:
+                self.request('PUT', '/api/fleet/routing/capabilities', {'needs': self.settings['capabilities'], 'max_agents': self.settings['max_agents'], 'runners': [{'engine': s.get('engine', s['service']), 'profile': s.get('profile'), 'account': s['account_label'], 'model': s['launcher_model'], 'effort': s.get('launcher_effort')} for s in self.settings['subscriptions'] if s.get('launcher_model') and s.get('admission_argv')]})
+            except Exception as exc:
+                _skip_telemetry('capabilities', exc)
+        _mark('capabilities')
         from .launcher_recovery import settle_retired_legacy
         legacy_settled = settle_retired_legacy(self.settings.get('launcher', {}))
+        _mark('legacy')
         reconciled = self.reconcile_launches()
         imported_reconciled = self.reconcile_imported_sessions()
+        _mark('reconcile')
         # Resource management (intake 4fcd3139): per-session exact sampler +
         # safe watchdog. Best-effort only with durable local state in the
         # journal dir; never fails the poll cycle and installs no scheduler.
@@ -2568,6 +2747,7 @@ class Dispatcher:
                 )
             except Exception:
                 pass
+        _mark('watchdog')
         # Quota monitoring does not prove launch capability. Group by engine:
         # a monitor-only account must not disable another runnable account on
         # the same engine. Never fabricate an admission adapter or bypass it.
@@ -2580,17 +2760,26 @@ class Dispatcher:
                                                         'reason': 'admission_unconfigured'})
             except Exception:
                 pass  # dispatch still refuses locally if health publication fails.
+        _mark('unconfigured_probes')
         offer_response = self.request("GET", "/api/fleet/offers")
         offers = offer_response.get("offers", [])
         from .account_capacity import reconcile_unstarted
         reconciled += [r for r in reconcile_unstarted(self, rows=offer_response.get('reconciliation', [])) if r['state'] in ('failed', 'exited')]
+        _mark('offers')
         results = [{'id': r['task_id'], 'state': 'failed', 'reason': 'legacy_native_finished'} for r in legacy_settled] + list(reconciled) + list(imported_reconciled)
         results.append({"id": "workclaim-sync", **workclaim_summary})
+        dispatch_max_s = 0.0
         for offer in offers:
+            _dispatch_start = time.monotonic()
             try:
                 self._dispatch_one(offer, results)
             finally:
                 self._refresh_checkin(hb)
+            dispatch_max_s = max(dispatch_max_s, time.monotonic() - _dispatch_start)
+        _mark('dispatch')
+        print(json.dumps({'event': 'fleet_cycle_phases', 'phases': phases,
+                          'offers': len(offers), 'results': len(results),
+                          'dispatch_max_s': round(dispatch_max_s, 3)}), flush=True)
         return results
 
 

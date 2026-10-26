@@ -1,10 +1,37 @@
 import os
 import json
+import re
 import uuid
 import urllib.request
 import urllib.parse
 import urllib.error
 from . import auth, config
+
+_SAFE_BODY_TOKEN = re.compile(r"[A-Za-z0-9_.:-]{1,64}\Z")
+
+
+def _sanitized_body_detail(body_bytes) -> str:
+    """Extract a bounded server error slug from a 4xx body for logs.
+
+    Server 4xx bodies are fixed enums (e.g. invalid_subscription, unmapped);
+    only token-shaped error/reason fields are surfaced, never raw bodies.
+    """
+    try:
+        if isinstance(body_bytes, bytes):
+            body_bytes = body_bytes.decode("utf-8", "replace")
+        data = json.loads(body_bytes)
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    parts = []
+    for key in ("error", "reason"):
+        value = data.get(key)
+        if isinstance(value, str) and _SAFE_BODY_TOKEN.match(value):
+            parts.append(value)
+    if not parts:
+        return ""
+    return ": " + ":".join(parts)[:129]
 
 def _do_request(method, path, payload=None):
     cfg = config.load_config()
@@ -43,15 +70,21 @@ def _do_request(method, path, payload=None):
             headers["Authorization"] = f"Bearer {auth.get_access_token()}"
             req = urllib.request.Request(url, data=data, headers=headers, method=method)
             return safe_http_json(req)
+        body_bytes = b""
+        if e.code in (400, 403, 404, 409, 422, 429):
+            try:
+                body_bytes = e.read(4097)
+            except (ValueError, OSError):
+                body_bytes = b""
         if e.code == 409:
             try:
-                body = json.loads(e.read(4097))
+                body = json.loads(body_bytes.decode("utf-8", "replace") if isinstance(body_bytes, bytes) else body_bytes)
             except (ValueError, OSError):
                 body = None
             if isinstance(body, dict) and body.get('error') in {'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'}:
                 raise ValueError(body['error']) from None
         # Never print token, credentials, native full environment or server-controlled error bodies
-        raise ValueError(f"HTTP request failed with status {e.code}")
+        raise ValueError(f"HTTP request failed with status {e.code}{_sanitized_body_detail(body_bytes)}")
 
 def send(sender_actor, to_actor, kind, body, idempotency_key=None, thread_id=None, reply_to=None, lease_epoch=None):
     if idempotency_key is None:
