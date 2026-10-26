@@ -491,6 +491,11 @@ class TestFleetHeadless(unittest.TestCase):
         offer_id = "off-complete"
         task_id = f"hub-{offer_id}"
         native_id = "55555555-5555-4555-8555-555555555555"
+        # AC a19cac9e: only exits WITH a valid result file settle as exited.
+        result_dir = self.workspace / ".local" / "hub-results"
+        result_dir.mkdir(parents=True, exist_ok=True)
+        (result_dir / f"{offer_id}.json").write_text(
+            json.dumps({"status": "done", "report": "natural completion"}))
         d._active_launches[offer_id] = {
             "offer_id": offer_id,
             "task_id": task_id,

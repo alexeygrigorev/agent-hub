@@ -49,9 +49,17 @@ def _sanitize_launcher_slug(text, limit=64):
     try:
         raw = str(text or '').strip().split()[0] if str(text or '').strip() else ''
         slug = re.sub(r'[^A-Za-z0-9_.-]', '_', raw)[:limit].strip('_.')
-        return slug
     except Exception:
         return ''
+    # A token-shaped reason must never reach the diagnostic message: redact
+    # secret shapes and drop the slug if redaction changed anything.
+    try:
+        from .launch_diagnostics import _redact_secret_shapes
+        if _redact_secret_shapes(slug) != slug:
+            return ''
+    except Exception:
+        pass
+    return slug
 # Canonical quota services: `codex-orin` is not a service — it is the second
 # Codex account (service `codex`, account `codex-orin`). The quse wire route
 # key `codex-orin` is still collected by quota_snapshot; only this service
@@ -932,6 +940,18 @@ class Dispatcher:
         except (ValueError, TypeError, AttributeError):
             return False
 
+    def _cleanup_will_remove(self, workspace):
+        """True when the finished worktree is configured for auto-cleanup."""
+        try:
+            roots = self.settings.get("cleanup_roots") or []
+            ws = str(Path(workspace).resolve())
+            for root in roots:
+                if isinstance(root, str) and root and (ws == root or ws.startswith(root.rstrip('/') + '/')):
+                    return True
+        except Exception:
+            pass
+        return False
+
     def _no_result_partial_report(self, record):
         """Failed-with-partial-work report when the result JSON is missing.
 
@@ -952,10 +972,24 @@ class Dispatcher:
         workspace = record.get('workspace')
         offer_id = record.get('offer_id', 'unknown')
         log_dest = None
+        log_label = None
         tail = ''
         try:
             if isinstance(workspace, str) and workspace:
-                dest = str(Path(workspace) / '.local' / 'hub-logs' / (str(offer_id) + '-opencode.log'))
+                # The worktree may be auto-removed right after settlement
+                # (cleanup_roots); then the retained log goes to the
+                # host-owned journal dir so the reported location survives.
+                try:
+                    journal_base = self.journal_dir or self.settings.get("journal_dir")
+                except Exception:
+                    journal_base = None
+                if (isinstance(journal_base, str) and journal_base
+                        and self._cleanup_will_remove(workspace)):
+                    dest = str(Path(journal_base) / 'fleet-logs' / (str(offer_id) + '-opencode.log'))
+                    log_label = 'host journal fleet-logs/' + str(offer_id) + '-opencode.log.'
+                else:
+                    dest = str(Path(workspace) / '.local' / 'hub-logs' / (str(offer_id) + '-opencode.log'))
+                    log_label = '.local/hub-logs/' + str(offer_id) + '-opencode.log.'
                 log_dest = retain_per_session_opencode_log(
                     record.get('log_offsets'), dest,
                     engine=record.get('engine'))
@@ -987,8 +1021,8 @@ class Dispatcher:
             bits.append('Uncommitted worktree changes: ' + '; '.join(dirty))
         else:
             bits.append('Worktree clean or unavailable.')
-        if log_dest:
-            bits.append('Per-session opencode log retained at .local/hub-logs/' + str(offer_id) + '-opencode.log.')
+        if log_dest and log_label:
+            bits.append('Per-session opencode log retained at ' + log_label)
         if tail:
             bits.append('Log tail: ' + tail.replace('\n', ' | '))
         report = ' '.join(bits)[:4000]
@@ -2217,6 +2251,28 @@ class Dispatcher:
                 return {'id': offer_id, 'state': report['status']}
             # Human waits retain reservations even when the reporting process exits.
             return {'id': offer_id, 'state': report['status']}
+        # Dispatch-window headless exit with no valid result JSON is a failure,
+        # never a success: the 120s sync path settles here without reconcile.
+        if mode == "headless" and result.get('confirmed_exit') and result.get('state') == 'exited':
+            try:
+                if not self._read_hub_finish_report({'offer_id': offer_id, 'workspace': str(workspace),
+                                                     'result_path': str(result_path)}):
+                    try:
+                        partial = self._no_result_partial_report({
+                            'offer_id': offer_id, 'workspace': str(workspace),
+                            'result_path': str(result_path),
+                            'engine': offer.get("engine") if isinstance(offer, dict) else None,
+                            'log_offsets': locals().get("log_offsets"),
+                            'launched_at_ts': locals().get("launched_at_ts")})
+                        result = dict(result, state='failed', report_status='failed',
+                                      report=partial['report'], artifacts=[
+                                          {'label': a.get('label', 'partial-work')[:120],
+                                           'text': a.get('text', '')[:1024]}
+                                          for a in partial.get('artifacts', []) if isinstance(a, dict)])
+                    except Exception:
+                        result = dict(result, state='failed')
+            except Exception:
+                pass
         self.request("POST", path + "/result", result)
         if result.get('state') in {'exited', 'failed'}:
             self._maybe_cleanup_worktree(workspace, native_id)

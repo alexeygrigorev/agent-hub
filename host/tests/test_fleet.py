@@ -280,7 +280,9 @@ class FleetTests(unittest.TestCase):
                 return {}
             d = fleet.Dispatcher(cfg, lambda *a: requests.append(a) or {}, runner)
             result = d.dispatch(offer(mode='headless', prompt='Goal with $(literal shell text)'))
-            self.assertEqual(result['state'], 'exited'); self.assertEqual(result['native_id'], 'headless-unit')
+            # AC a19cac9e: exit 0 with no result JSON is failed-with-partial-work.
+            self.assertEqual(result['state'], 'failed'); self.assertEqual(result['native_id'], 'headless-unit')
+            self.assertEqual(result['report_status'], 'failed')
             self.assertIn('--backend', calls[-1]); self.assertIn('task-units', calls[-1]); self.assertNotIn('aplexer', calls[-1])
             def wrong_model_plan(argv, **kw): return {'eligible': [{'provider': 'codex', 'model': 'some-other-model', 'task_fit': 1.0}]} if 'plan' in argv else runner(argv, **kw)
             d.runner = wrong_model_plan; requests.clear()
@@ -847,7 +849,9 @@ class FleetTests(unittest.TestCase):
             normal_result_file = Path(tmp) / '.local' / 'hub-results' / (normal_offer['id'] + '.json')
 
             result_normal = d.dispatch(normal_offer)
-            self.assertEqual(result_normal['state'], 'exited')
+            # AC a19cac9e: exit 0 with no result JSON is failed-with-partial-work.
+            self.assertEqual(result_normal['state'], 'failed')
+            self.assertEqual(result_normal['report_status'], 'failed')
             self.assertTrue(result_normal['confirmed_exit'])
             self.assertEqual(result_normal['launcher_task_id'], f"hub-{normal_offer['id']}")
 
@@ -1007,11 +1011,12 @@ class FleetTests(unittest.TestCase):
 
             d_ok = fleet.Dispatcher(cfg, lambda *a: {}, ok_runner)
             res1 = d_ok.dispatch(offer(mode='headless', id='first-task-1', prompt='First run'))
-            self.assertEqual(res1['state'], 'exited')
+            # AC a19cac9e: exit 0 with no result JSON is failed-with-partial-work.
+            self.assertEqual(res1['state'], 'failed')
             self.assertEqual(stat.S_IMODE((ws / '.local' / 'hub-results').stat().st_mode), 0o700)
 
             res2 = d_ok.dispatch(offer(mode='headless', id='second-task-2', prompt='Second run'))
-            self.assertEqual(res2['state'], 'exited')
+            self.assertEqual(res2['state'], 'failed')
             self.assertEqual(stat.S_IMODE((ws / '.local' / 'hub-results').stat().st_mode), 0o700)
 
     def test_task_assigned_empty_or_malformed_report_refuses_successful_result(self):
@@ -1261,12 +1266,15 @@ class FleetTests(unittest.TestCase):
                 reconciled = d.reconcile_launches()
                 self.assertEqual(len(reconciled), 1)
                 self.assertEqual(reconciled[0]['id'], offer_id)
-                self.assertEqual(reconciled[0]['state'], 'exited')
+                # AC a19cac9e: no result JSON was written, so the terminal
+                # state is failed-with-partial-work, never exited/done.
+                self.assertEqual(reconciled[0]['state'], 'failed')
                 self.assertTrue(reconciled[0]['reconciled'])
 
             # Verify terminal result posted to own-host fleet result endpoint
             terminal_post = next(r for r in requests if r[1] == f"/api/fleet/launches/{offer_id}/result" and r[2].get('confirmed_exit'))
-            self.assertEqual(terminal_post[2]['state'], 'exited')
+            self.assertEqual(terminal_post[2]['state'], 'failed')
+            self.assertEqual(terminal_post[2]['report_status'], 'failed')
             self.assertEqual(terminal_post[2]['native_id'], native_id)
             self.assertEqual(terminal_post[2]['launcher_task_id'], task_id)
             self.assertTrue(terminal_post[2]['confirmed_exit'])
@@ -1437,12 +1445,14 @@ class FleetTests(unittest.TestCase):
             with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, tombstone, "retired_tombstone_verified")):
                 reconciled = d2.reconcile_launches()
                 self.assertEqual(len(reconciled), 1)
-                self.assertEqual(reconciled[0]['state'], 'exited')
+                # AC a19cac9e: no result JSON was written, so the terminal
+                # state is failed-with-partial-work, never exited/done.
+                self.assertEqual(reconciled[0]['state'], 'failed')
 
             # Journal on disk updated to settled
             j_data_after = json.loads(j_file.read_text(encoding='utf-8'))
             self.assertTrue(j_data_after['settled'])
-            self.assertEqual(j_data_after['state'], 'exited')
+            self.assertEqual(j_data_after['state'], 'failed')
 
     def test_normal_headless_lost_response_retry_recovers_idempotently(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1697,7 +1707,14 @@ class FleetTests(unittest.TestCase):
                     commands.append(argv)
                     return output
                 d = fleet.Dispatcher(cfg, request, runner, journal_dir=str(Path(tmp) / "journal"))
-                d._record_running_launch(offer_id, task_id, ws, "codex", "shared-codex", native_id, ws / "result.json", {"tag": "task-" + task_id, "created_at_ms": 1792330666399})
+                # AC a19cac9e: only exits WITH a valid result file settle as
+                # exited; the valid/accepted cases carry one, the rest don't.
+                result_dir = ws / ".local" / "hub-results"
+                result_file = result_dir / (offer_id + ".json")
+                if case in {"valid", "accepted"}:
+                    result_dir.mkdir(parents=True, exist_ok=True)
+                    result_file.write_text(json.dumps({"status": "done", "report": "ok"}))
+                d._record_running_launch(offer_id, task_id, ws, "codex", "shared-codex", native_id, result_file, {"tag": "task-" + task_id, "created_at_ms": 1792330666399})
                 self.assertIn(offer_id, d._active_launches)
                 with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(True, {}, "retired_tombstone_verified")):
                     settled = d.reconcile_launches()
