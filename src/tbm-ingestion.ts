@@ -57,7 +57,9 @@ export function syncWindowsIntoTbm(sql: SqlStorage, windows: WindowIngest[], at:
     const id = tbmPoolId(provider, account, windowName);
     const old: any = sql.exec('SELECT * FROM tbm_quota_pools WHERE pool_id=?', id).toArray()[0];
     if (old && old.last_updated_ms >= at) continue;
-    const cycle = old?.reset_at_ms === reset && old?.cycle_ms > 0 ? old.cycle_ms : inferCycleMs(windowName, old?.reset_at_ms ?? null, reset);
+    const correction = old && at < old.reset_at_ms;
+    const cycle = (old?.reset_at_ms === reset || correction) && old?.cycle_ms > 0 ? old.cycle_ms
+      : inferCycleMs(windowName, old?.reset_at_ms <= at ? old.reset_at_ms : null, reset);
     const unit = cap.known ? 'tokens' : 'percent';
     let burn = 0;
     if (old && old.reset_at_ms === reset && at > old.last_updated_ms) {

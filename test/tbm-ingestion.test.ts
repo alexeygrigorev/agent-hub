@@ -7,6 +7,7 @@ import {
   inferCycleMs,
   resolveTokenCapacity,
   syncTbmFromServerAccounts,
+  syncWindowsIntoTbm,
   accountsForHostProvider,
   tbmPoolId,
 } from "../src/tbm-ingestion";
@@ -363,5 +364,17 @@ it('settles a banked expiry once even if a collection removes the expired grant 
     const rows: any[] = sql.exec("SELECT * FROM tbm_reward_events WHERE pool_id='codex:expiry-order:5h' AND banked_waste_penalty>0").toArray();
     expect(rows).toHaveLength(1);
     expect(rows[0].banked_waste_penalty).toBe(250);
+  });
+});
+
+
+it('keeps a known cycle across a future deadline correction without treating the delta as a new cycle', async () => {
+  await runInDurableObject(stub, (hub: Hub) => {
+    const sql: any = hub.sql;
+    const item = {provider:'codex',account:'deadline-adjustment',windowName:'5h',window:{present:true,percent_remaining:80,reset_at:new Date(NOW+HOUR).toISOString()}};
+    syncWindowsIntoTbm(sql,[item],NOW);
+    item.window.reset_at = new Date(NOW+2*HOUR).toISOString();
+    syncWindowsIntoTbm(sql,[item],NOW+60000);
+    expect(sql.exec("SELECT cycle_ms FROM tbm_quota_pools WHERE pool_id='codex:deadline-adjustment:5h'").one().cycle_ms).toBe(5*HOUR);
   });
 });
