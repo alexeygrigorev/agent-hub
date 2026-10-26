@@ -141,7 +141,7 @@ def main():
         try:
             row = native('status', receipt['id'])
             if same_controller(row, receipt):
-                native('kill', receipt['id'], '--signal', 'TERM', '--grace-ms', '10000')
+                native('kill', receipt['id'], '--signal', 'TERM', '--grace-ms', '55000')  # >= session_host DRAIN_TIMEOUT_S, < TimeoutStopSec=60 (4398ce2a)
         except Exception:
             print(json.dumps({'event': 'controller_cleanup_unconfirmed', 'id': receipt['id']}), flush=True)
 

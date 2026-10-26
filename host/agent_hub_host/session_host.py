@@ -424,6 +424,10 @@ def maybe_start_role_consumer_thread(current: Optional[threading.Thread], consum
         return current
 
 
+# Must stay below the supervisor kill grace (scripts/session-host-supervisor.py).
+DRAIN_TIMEOUT_S = 45.0
+
+
 def maintenance_step_once(dispatcher, quota_collector):
     """Placement and quota can take minutes; never run them on the command loop."""
     started = time.monotonic()
@@ -449,6 +453,59 @@ def maintenance_step_once(dispatcher, quota_collector):
         print(json.dumps({'event': 'quota_error', 'type': type(error).__name__}), flush=True)
     print(json.dumps({'event': 'maintenance_cycle',
                       'elapsed_s': round(time.monotonic() - started, 3)}), flush=True)
+
+
+def telemetry_step_once(dispatcher):
+    """Fast heartbeat independent of the slow cycle (intake 4398ce2a)."""
+    started = time.monotonic()
+    try:
+        hb = dispatcher.telemetry_tick()
+        print(json.dumps({'event': 'telemetry_cycle', 'posted': True,
+                          'launcher_resources': 'launcher_resources' in hb,
+                          'gate': bool((hb.get('gate') or {}).get('launch_allowed')),
+                          'elapsed_s': round(time.monotonic() - started, 3)}), flush=True)
+    except Exception as error:
+        print(json.dumps({'event': 'telemetry_error', 'type': type(error).__name__}), flush=True)
+
+
+def offers_step_once(dispatcher):
+    """Fast offer claiming independent of the slow cycle (intake 4398ce2a)."""
+    try:
+        out = dispatcher.offers_tick()
+        if out.get('offers'):
+            print(json.dumps({'event': 'offers_cycle', 'offers': out['offers'],
+                              'dispatch_max_s': out['dispatch_max_s']}), flush=True)
+        for result in out.get('results', []):
+            if (isinstance(result, dict) and result.get('state') in {'failed', 'held'}
+                    and result.get('reason') in DISPATCH_MESSAGES):
+                print(json.dumps({'event': 'fleet_dispatch_refused',
+                                  'state': result['state'], 'reason': result['reason']}), flush=True)
+    except Exception as error:
+        print(json.dumps({'event': 'offers_error', 'type': type(error).__name__}), flush=True)
+
+
+def maybe_start_named_thread(current, target, args, name):
+    if current is not None and current.is_alive():
+        return current
+    thread = threading.Thread(target=target, args=args, daemon=True, name=name)
+    thread.start()
+    return thread
+
+
+def drain_inflight_dispatch(dispatcher, timeout_s=DRAIN_TIMEOUT_S, clock=time.monotonic, sleep=time.sleep):
+    """On stop, never start new claims and let an in-flight claim finish.
+
+    Intake 4398ce2a: host releases restart the service; killing the daemon
+    thread between claim and native start dropped claims. Bounded so the
+    supervisor's grace period still applies. Returns True when drained.
+    """
+    dispatcher.stop_requested.set()
+    deadline = clock() + timeout_s
+    while getattr(dispatcher, '_inflight', 0) > 0 and clock() < deadline:
+        sleep(0.2)
+    drained = getattr(dispatcher, '_inflight', 0) <= 0
+    print(json.dumps({'event': 'dispatch_drain', 'drained': drained}), flush=True)
+    return drained
 
 
 def maybe_start_maintenance_thread(current, dispatcher, quota_collector):
@@ -588,6 +645,10 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         token_thread: Optional[threading.Thread] = None
         next_fleet = 0
         maintenance_thread = None
+        next_telemetry = 0
+        telemetry_thread = None
+        next_offers = 0
+        offers_thread = None
         count = 0
         # Operator fleet settings (workspaces map, workspace_roots,
         # subscriptions, launcher) are re-read when the file changes, so a
@@ -613,6 +674,16 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                     maintenance_thread = maybe_start_maintenance_thread(
                         maintenance_thread, dispatcher, quota_collector)
                     next_fleet = time.monotonic() + fleet_interval
+                # Intake 4398ce2a: telemetry and offer claiming must not wait
+                # for the multi-minute maintenance cycle.
+                if time.monotonic() >= next_telemetry:
+                    telemetry_thread = maybe_start_named_thread(
+                        telemetry_thread, telemetry_step_once, (dispatcher,), 'fleet-telemetry')
+                    next_telemetry = time.monotonic() + fleet.TELEMETRY_REFRESH_S
+                if time.monotonic() >= next_offers:
+                    offers_thread = maybe_start_named_thread(
+                        offers_thread, offers_step_once, (dispatcher,), 'fleet-offers')
+                    next_offers = time.monotonic() + fleet.OFFERS_POLL_S
                 # A failed subscription/placement cycle must not prevent stop,
                 # capture, or late delivery reconciliation on existing sessions.
                 try:
@@ -649,6 +720,10 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                 if cycles is None or count < cycles:
                     stop.wait(interval)
         finally:
+            try:
+                drain_inflight_dispatch(dispatcher)
+            except Exception:
+                pass
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
 

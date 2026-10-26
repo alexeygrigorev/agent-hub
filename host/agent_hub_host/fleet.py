@@ -10,6 +10,7 @@ import re
 import stat
 import uuid
 import subprocess
+import threading
 import time
 from typing import Any, Optional
 
@@ -90,6 +91,34 @@ ROLE_JOBS_CACHE_TTL_S = 120.0
 # one loop owns offers per cycle. fcntl locks release on process death, so
 # a SIGTERMed cycle (TimeoutStartSec=240s) never wedges the other loop.
 CYCLE_LOCK_NAME = "fleet-cycle.lock"
+
+# Intake 4398ce2a: the full fleet cycle (provisioning, probes, reconcile,
+# watchdog, quota...) takes minutes on RMTHZ, but placement treats launcher
+# telemetry older than HUB_TELEMETRY_STALE_S (src/fleet.ts
+# LAUNCHER_TELEMETRY_STALE_MS) as admission_unknown, and offers were only
+# fetched at the end of that cycle. Telemetry and offer claiming therefore
+# run on their own fast cadence in the session host, independent of the
+# slow cycle. Keep TELEMETRY_REFRESH_S * 3 <= HUB_TELEMETRY_STALE_S
+# (regression test test_telemetry_cadence_4398ce2a.py).
+TELEMETRY_REFRESH_S = 45.0
+OFFERS_POLL_S = 15.0
+HUB_TELEMETRY_STALE_S = 180.0
+# Serialises offer claiming between the slow cycle and the fast offers tick
+# (separate from CYCLE_LOCK_NAME, which the slow cycle holds for minutes).
+OFFERS_LOCK_NAME = "fleet-offers.lock"
+# The Hub refuses a claim whose admission observation is older than 30 s
+# (fresh_admission_required -> dispatch_claim_refused). Launcher submit/plan
+# plus a slow Hub can exceed that, so the gate is re-run before claiming when
+# the first observation is older than this.
+CLAIM_ADMISSION_REFRESH_S = 15.0
+
+
+def _iso_age_s(value):
+    try:
+        observed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return (dt.datetime.now(dt.timezone.utc) - observed).total_seconds()
+    except Exception:
+        return float("inf")
 
 
 def _sanitized_transport_error(exc, limit=160):
@@ -796,6 +825,10 @@ class Dispatcher:
         # Per-phase durations of the most recent once() cycle (intake
         # eff9a5ce AC1). Published as a fleet_cycle_phases stdout event.
         self.last_cycle_phases: dict[str, float] = {}
+        # Intake 4398ce2a: fast telemetry/offer ticks and restart draining.
+        self._last_hb: Optional[dict] = None
+        self._inflight = 0
+        self.stop_requested = threading.Event()
         if self.journal_dir:
             self._load_pending_launches_from_journal()
 
@@ -1859,6 +1892,31 @@ class Dispatcher:
             self._drop_queued_launcher_task(launcher, task_id)
             return self.runner(submit_argv, cwd=launcher["root"])
 
+    def _dispatch_admission(self, sub, admission_payload, selection, offer):
+        """Run the local admission gate; return its fresh observed_at."""
+        from .model_contract import canonical_account_label
+        gate = self.runner(sub["admission_argv"], payload=admission_payload)
+        if gate.get("launch_allowed") is not True or gate.get("profile_supported") is not True or canonical_account_label(gate.get("account_label")) != canonical_account_label(sub["account_label"]):
+            gate_reason = gate.get("reason") if isinstance(gate.get("reason"), str) else ""
+            # Preserve host-side gate slugs (intake 59a6f44a AC3/AC4): a managed
+            # Codex quota-gate refusal must surface as codex_quota_gate_* in
+            # rejected[]/launch_error, never a silent stopped/session_not_bound.
+            if gate_reason.startswith("codex_quota_gate_"):
+                slug = ''.join(c if (c.isalnum() or c == '_') else '_' for c in gate_reason)[:64]
+                raise ValueError(slug + ": managed Codex quota gate refused launch before execution")
+            raise ValueError("Fresh admission refused")
+        if (offer.get('task_id') or (selection and sub.get("account_label") in self._managed_labels)) and (gate.get('model_supported') is not True or gate.get('model') != selection['model'] or gate.get('effort') != selection['effort']):
+            raise ValueError('Selected model/effort requires verified admission')
+        at = gate.get("observed_at")
+        try:
+            observed = dt.datetime.fromisoformat(at.replace("Z", "+00:00"))
+            age = (dt.datetime.now(dt.timezone.utc) - observed).total_seconds()
+            if not 0 <= age <= 30:
+                raise ValueError()
+        except Exception:
+            raise ValueError("Fresh admission timestamp required") from None
+        return at
+
     def dispatch(self, offer):
         if offer.get('with_goal') and offer.get('mode') != 'interactive':
             raise ValueError('Goal work is interactive only')
@@ -1885,26 +1943,7 @@ class Dispatcher:
         # identity; the Hub route label may be its canonical alias during
         # a relabel (_route already pinned canonical identity above).
         admission_payload["account"] = sub["account_label"]
-        gate = self.runner(sub["admission_argv"], payload=admission_payload)
-        if gate.get("launch_allowed") is not True or gate.get("profile_supported") is not True or canonical_account_label(gate.get("account_label")) != canonical_account_label(sub["account_label"]):
-            gate_reason = gate.get("reason") if isinstance(gate.get("reason"), str) else ""
-            # Preserve host-side gate slugs (intake 59a6f44a AC3/AC4): a managed
-            # Codex quota-gate refusal must surface as codex_quota_gate_* in
-            # rejected[]/launch_error, never a silent stopped/session_not_bound.
-            if gate_reason.startswith("codex_quota_gate_"):
-                slug = ''.join(c if (c.isalnum() or c == '_') else '_' for c in gate_reason)[:64]
-                raise ValueError(slug + ": managed Codex quota gate refused launch before execution")
-            raise ValueError("Fresh admission refused")
-        if (offer.get('task_id') or (selection and sub.get("account_label") in self._managed_labels)) and (gate.get('model_supported') is not True or gate.get('model') != selection['model'] or gate.get('effort') != selection['effort']):
-            raise ValueError('Selected model/effort requires verified admission')
-        at = gate.get("observed_at")
-        try:
-            observed = dt.datetime.fromisoformat(at.replace("Z", "+00:00"))
-            age = (dt.datetime.now(dt.timezone.utc) - observed).total_seconds()
-            if not 0 <= age <= 30:
-                raise ValueError()
-        except Exception:
-            raise ValueError("Fresh admission timestamp required") from None
+        at = self._dispatch_admission(sub, admission_payload, selection, offer)
         mode = offer.get("mode")
         # The offer workspace is a configured identifier — a legacy label or
         # an explicitly allowed absolute path — never a free-form path: it is
@@ -2105,6 +2144,10 @@ class Dispatcher:
         # Claim with the offered (registry route) account: the server binds the
         # claim to the offered route, and _route plus the admission gate above
         # already verified canonical identity with the local subscription.
+        if _iso_age_s(at) > CLAIM_ADMISSION_REFRESH_S:
+            # Intake 4398ce2a: launcher submit/plan (and a slow Hub) can push
+            # the first observation past the Hub's 30 s claim freshness.
+            at = self._dispatch_admission(sub, admission_payload, selection, offer)
         self.request("POST", path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": offer.get("account") or sub["account_label"], **({"model": selection["model"]} if selection else {})})
         from .launch_diagnostics import capture_log_offsets
         log_offsets = capture_log_offsets(sub.get("launcher_provider"))
@@ -2615,35 +2658,12 @@ class Dispatcher:
                 pass
             self.last_cycle_phases = dict(phases)
 
-    def _once_locked(self, phases, _mark, _skip_telemetry):
-        from . import api, system
-        info = system.get_system_info()
-        caps = info['capabilities']
-        caps.update(engines=sorted({s.get('engine', s['service']) for s in self.settings['subscriptions']}),
-                    workspaces=advertised_workspaces(self.settings), cpu_count=os.cpu_count())
-        caps['fleet_modes'] = ['interactive'] + (['headless'] if self.settings.get('launcher') else [])
-        caps['launcher_resources'] = bool(self.settings.get('launcher'))
-        caps['fleet_goal_routes'] = self.goal_routes()
-        # The maintained launcher admits Claude headless work only through a
-        # managed profile. Its global model-support list alone does not prove
-        # this local account route is executable (interactive is independent).
-        caps['fleet_route_rejections'] = [
-            {'engine': s.get('engine', s['service']), 'account': s['account_label'],
-             'profile': s.get('profile'), 'mode': 'headless', 'reason': 'model_unsupported'}
-            for s in self.settings['subscriptions']
-            if s.get('launcher_provider') == 'claude' and not s.get('profile')]
-        qualified_jobs = self._derive_qualified_role_jobs()
-        if qualified_jobs:
-            caps['jobs'] = qualified_jobs
-        else:
-            caps.pop('jobs', None)
-        _mark('system')
-        hb = api.get_heartbeat_payload()
-        if self.settings.get('launcher'):
-            from .launcher_recovery import reconcile_resources
-            resources = reconcile_resources(self.settings['launcher'], self.runner)
-            if resources is not None:
-                hb['launcher_resources'] = resources
+    def _admission_projection(self, caps):
+        """Scheduling projection of per-account admission (dispatch re-checks).
+
+        Appends codex refusals to caps['fleet_route_rejections'] and returns
+        (any_allowed, admitted_engines).
+        """
         allowed = False
         admitted_engines = set()
         # This is only a scheduling projection. dispatch() repeats the actual mode/account gate.
@@ -2674,6 +2694,126 @@ class Dispatcher:
                             'engine': sub.get('engine', sub['service']), 'account': sub['account_label'],
                             'profile': sub.get('profile'), 'mode': mode,
                             'reason': 'codex_quota_gate_quota_check_failed', 'observed_at': utcnow()})
+        return allowed, admitted_engines
+
+    def _offers_lock_path(self):
+        base = self._cycle_lock_path()
+        return None if base is None else base.with_name(OFFERS_LOCK_NAME)
+
+    def _acquire_offers_lock(self):
+        """Non-blocking offer-claim lock (file object / False busy / None n/a)."""
+        path = self._offers_lock_path()
+        if path is None:
+            return None
+        try:
+            import fcntl
+        except ImportError:
+            return None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fh = open(path, "a+b")
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError):
+                fh.close()
+                return False
+            return fh
+        except Exception:
+            return None
+
+    def telemetry_tick(self):
+        """Fast heartbeat: fresh launcher_resources + admission gate.
+
+        Intake 4398ce2a: placement needs launcher telemetry younger than
+        HUB_TELEMETRY_STALE_S and a gate younger than 300 s. The full cycle
+        takes minutes, so the session host calls this every
+        TELEMETRY_REFRESH_S on its own thread. Only posts /api/host/poll.
+        """
+        from . import api
+        hb = api.get_heartbeat_payload()
+        if self.settings.get('launcher'):
+            from .launcher_recovery import reconcile_resources
+            resources = reconcile_resources(self.settings['launcher'], self.runner)
+            if resources is not None:
+                hb['launcher_resources'] = resources
+        caps = {'fleet_modes': ['interactive'] + (['headless'] if self.settings.get('launcher') else []),
+                'fleet_route_rejections': []}
+        allowed, _ = self._admission_projection(caps)
+        hb['gate'] = {'launch_allowed': allowed, 'reason': 'fleet local admission' if allowed else 'fleet admission unavailable', 'at': utcnow()}
+        self.request('POST', '/api/host/poll', hb)
+        self._last_hb = hb
+        return hb
+
+    def dispatch_offers(self, results, hb=None, offers=None):
+        """Claim + dispatch current offers under the offers lock.
+
+        Returns (offers_seen, dispatch_max_s); skips (0, 0.0) when the
+        sibling (slow cycle or fast tick) is already dispatching.
+        """
+        lock = self._acquire_offers_lock()
+        if lock is False:
+            return 0, 0.0
+        try:
+            if offers is None:
+                offers = self.request("GET", "/api/fleet/offers").get("offers", [])
+            hb = hb if hb is not None else getattr(self, '_last_hb', None)
+            dispatch_max_s = 0.0
+            for offer in offers:
+                if getattr(self, 'stop_requested', None) is not None and self.stop_requested.is_set():
+                    break  # Draining for restart: never start a new claim.
+                _dispatch_start = time.monotonic()
+                self._inflight += 1
+                try:
+                    self._dispatch_one(offer, results)
+                finally:
+                    self._inflight -= 1
+                    if hb is not None:
+                        self._refresh_checkin(hb)
+                dispatch_max_s = max(dispatch_max_s, time.monotonic() - _dispatch_start)
+            return len(offers), dispatch_max_s
+        finally:
+            if lock is not None:
+                try:
+                    lock.close()
+                except Exception:
+                    pass
+
+    def offers_tick(self):
+        """Fast offer claiming independent of the slow cycle (4398ce2a)."""
+        results = []
+        seen, max_s = self.dispatch_offers(results)
+        return {'offers': seen, 'results': results, 'dispatch_max_s': round(max_s, 3)}
+
+    def _once_locked(self, phases, _mark, _skip_telemetry):
+        from . import api, system
+        info = system.get_system_info()
+        caps = info['capabilities']
+        caps.update(engines=sorted({s.get('engine', s['service']) for s in self.settings['subscriptions']}),
+                    workspaces=advertised_workspaces(self.settings), cpu_count=os.cpu_count())
+        caps['fleet_modes'] = ['interactive'] + (['headless'] if self.settings.get('launcher') else [])
+        caps['launcher_resources'] = bool(self.settings.get('launcher'))
+        caps['fleet_goal_routes'] = self.goal_routes()
+        # The maintained launcher admits Claude headless work only through a
+        # managed profile. Its global model-support list alone does not prove
+        # this local account route is executable (interactive is independent).
+        caps['fleet_route_rejections'] = [
+            {'engine': s.get('engine', s['service']), 'account': s['account_label'],
+             'profile': s.get('profile'), 'mode': 'headless', 'reason': 'model_unsupported'}
+            for s in self.settings['subscriptions']
+            if s.get('launcher_provider') == 'claude' and not s.get('profile')]
+        qualified_jobs = self._derive_qualified_role_jobs()
+        if qualified_jobs:
+            caps['jobs'] = qualified_jobs
+        else:
+            caps.pop('jobs', None)
+        _mark('system')
+        hb = api.get_heartbeat_payload()
+        if self.settings.get('launcher'):
+            from .launcher_recovery import reconcile_resources
+            resources = reconcile_resources(self.settings['launcher'], self.runner)
+            if resources is not None:
+                hb['launcher_resources'] = resources
+        allowed, admitted_engines = self._admission_projection(caps)
         # Publish per-account gate truth, not just the OR of every account's
         # gate. Planning can then fail over before offering a refused route.
         _mark('admission')
@@ -2784,14 +2924,8 @@ class Dispatcher:
         _mark('offers')
         results = [{'id': r['task_id'], 'state': 'failed', 'reason': 'legacy_native_finished'} for r in legacy_settled] + list(reconciled) + list(imported_reconciled)
         results.append({"id": "workclaim-sync", **workclaim_summary})
-        dispatch_max_s = 0.0
-        for offer in offers:
-            _dispatch_start = time.monotonic()
-            try:
-                self._dispatch_one(offer, results)
-            finally:
-                self._refresh_checkin(hb)
-            dispatch_max_s = max(dispatch_max_s, time.monotonic() - _dispatch_start)
+        self._last_hb = hb
+        _, dispatch_max_s = self.dispatch_offers(results, hb=hb, offers=offers)
         _mark('dispatch')
         print(json.dumps({'event': 'fleet_cycle_phases', 'phases': phases,
                           'offers': len(offers), 'results': len(results),
