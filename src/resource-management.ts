@@ -150,12 +150,12 @@ export class ResourceManagement {
       requested_mb: this.estimate(input.project || input.workspace || null, engine, input.task_kind || input.kind || 'goal'),
       observed_at: hb.launcher_resources?.observed_at ?? hb.at ?? null };
   }
-  sessions(machine?: string) {
+  private boundSessions(machine?: string) {
     // Canonical binding, not tag matching; external interactive sessions can be sampled but never reaped.
     const rows = this.sql.exec(`SELECT s.*,l.request_json AS launch_request,l.state AS launch_state,l.created_at AS launch_created,
       l.finished_at AS launch_finished,l.model_selection_json,l.workspace AS launch_workspace
       FROM session_control_sessions s LEFT JOIN fleet_launches l ON l.id=s.fleet_launch_id
-      ${machine ? 'WHERE s.machine_id=?' : ''} ORDER BY CASE WHEN s.state IN ('stopped','failed','exited','finished','dead','refused','cancelled') THEN 1 ELSE 0 END,s.updated_at DESC LIMIT 1000`, ...(machine ? [machine] : [])).toArray() as any[];
+      ${machine ? 'WHERE s.machine_id=?' : ''} ORDER BY CASE WHEN s.state IN ('stopped','failed','exited','finished','dead','refused','cancelled') THEN 1 ELSE 0 END,s.updated_at DESC`, ...(machine ? [machine] : [])).toArray() as any[];
     return rows.flatMap(s => {
       const binding = parse(s.binding_json); if (!binding.native_id || !binding.workspace || !binding.tag) return [];
       const req = parse(s.request_json), launch = parse(s.launch_request), model = parse(s.model_selection_json);
@@ -166,6 +166,8 @@ export class ResourceManagement {
       const protection = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_protections'").toArray().length
         ? this.sql.exec('SELECT 1 FROM session_control_protections WHERE session_id=?',s.id).toArray().length > 0 : false;
       return [{ session_id: s.id, machine_id:s.machine_id, fleet_launch_id:s.fleet_launch_id,
+        observed_shadow:!s.fleet_launch_id && s.id===binding.native_id && s.request_key==='native-'+binding.native_id
+          && req.provenance==='observed_native' && binding.provenance==='observed_native',
         intake_id:intakeId,
         native_id:binding.native_id, tag:binding.tag, workspace:binding.workspace,
         native_created_at_ms:binding.native_created_at_ms ?? observed?.created_at_ms ?? null,
@@ -177,6 +179,27 @@ export class ResourceManagement {
         last_activity_at:observed?.last_activity_at ?? null, started_at:Number.isFinite(binding.native_created_at_ms) ? new Date(binding.native_created_at_ms).toISOString() : s.launch_created || s.created_at,
         finished_at:s.launch_finished || (TERMINAL.has(s.state) ? s.updated_at : null) }];
     });
+  }
+  private canonicalSessions(machine?: string) {
+    const groups=new Map<string,ReturnType<ResourceManagement['boundSessions']>>();
+    for(const session of this.boundSessions(machine)) {
+      const key=JSON.stringify([session.machine_id,session.native_id]);
+      if(!groups.has(key)) groups.set(key,[]);
+      groups.get(key)!.push(session);
+    }
+    return [...groups.values()].map(aliases=>{
+      // Imported observations can precede the real Fleet binding. Their inferred
+      // interactive mode is not an operator request; explicit interactive aliases
+      // and every keep/protection flag still protect the physical native worker.
+      const canonical=aliases.find(s=>s.managed) ?? aliases.find(s=>!s.observed_shadow) ?? aliases[0];
+      const {observed_shadow,...session}=canonical;
+      const protectedNative=aliases.some(s=>s.keep || (s.mode==='interactive' && !s.observed_shadow));
+      return {...session,keep:protectedNative,managed:session.managed && !protectedNative,
+        reaped:aliases.some(s=>s.reaped),aliases:aliases.map(s=>s.session_id)};
+    });
+  }
+  sessions(machine?: string) {
+    return this.canonicalSessions(machine).slice(0,1000).map(({aliases,...session})=>session);
   }
   private note(session: any, key: string, text: string) {
     if (!session.intake_id) throw new Error('intake_required');
@@ -202,7 +225,9 @@ export class ResourceManagement {
     return {saved:true,evidence_id:value.id};
   }
   report(machine: string, value: any) {
-    const sessions = new Map(this.sessions(machine).map(s => [s.session_id,s]));
+    // Accept reports already in flight under an older canonical alias, but put
+    // every physical native in exactly one durable ledger row.
+    const sessions = new Map(this.canonicalSessions(machine).flatMap(s => s.aliases.map(id=>[id,s] as const)));
     if (!value || !Array.isArray(value.samples) || !Array.isArray(value.reaps) || value.samples.length>200 || value.reaps.length>100) throw new Error('invalid_resource_report');
     for (const sample of value.samples) {
       const session = sessions.get(sample.session_id);
@@ -210,27 +235,30 @@ export class ResourceManagement {
       for (const k of ['current_rss_mb','peak_rss_mb','peak_pss_mb','cpu_seconds','runtime_s','avg_cpu_cores','current_cpu_cores','p95_cpu_cores']) if (sample[k]!=null && (!finite(sample[k]) || sample[k]>1e12)) throw new Error('invalid_resource_sample');
       const at=Date.parse(sample.observed_at);
       if (!Number.isFinite(at) || at>this.now()+30000 || at<this.now()-86400000) throw new Error('invalid_resource_timestamp');
-      this.sql.exec('INSERT OR IGNORE INTO session_resource_metadata VALUES(?,?)',session.session_id,session.workspace);
+      const old:any=this.sql.exec('SELECT * FROM session_resource_usage WHERE machine_id=? AND native_id=?',machine,session.native_id).toArray()[0];
+      const ledgerId=old?.session_id ?? session.session_id;
+      this.sql.exec('INSERT INTO session_resource_metadata VALUES(?,?) ON CONFLICT(session_id) DO UPDATE SET workspace=excluded.workspace',ledgerId,session.workspace);
       if (session.fleet_launch_id && finite(sample.current_cpu_cores)) this.sql.exec('INSERT INTO resource_cpu_samples VALUES(?,?,?) ON CONFLICT(launch_id) DO UPDATE SET current_cpu_cores=excluded.current_cpu_cores,observed_at=excluded.observed_at WHERE excluded.observed_at>resource_cpu_samples.observed_at',session.fleet_launch_id,sample.current_cpu_cores,sample.observed_at);
       if (finite(sample.p95_cpu_cores)) {
-        const finalized=this.sql.exec('SELECT 1 FROM session_cpu_finalized WHERE session_id=?',session.session_id).toArray().length>0;
-        const prior:any=this.sql.exec('SELECT observed_at FROM session_cpu_usage WHERE session_id=?',session.session_id).toArray()[0];
+        const finalized=this.sql.exec('SELECT 1 FROM session_cpu_finalized WHERE session_id=?',ledgerId).toArray().length>0;
+        const prior:any=this.sql.exec('SELECT observed_at FROM session_cpu_usage WHERE session_id=?',ledgerId).toArray()[0];
         // Live lifetime p95 can fall as real idle intervals accumulate. Freeze
         // only an actual terminal CPU report, never a memory-only final row.
         if (!finalized && (!prior || at>=Date.parse(prior.observed_at))) {
-          this.sql.exec('INSERT INTO session_cpu_usage VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET p95_cpu_cores=excluded.p95_cpu_cores,observed_at=excluded.observed_at',session.session_id,sample.p95_cpu_cores,sample.observed_at);
-          if (TERMINAL.has(session.state)) this.sql.exec('INSERT OR IGNORE INTO session_cpu_finalized VALUES(?,?)',session.session_id,sample.observed_at);
+          this.sql.exec('INSERT INTO session_cpu_usage VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET p95_cpu_cores=excluded.p95_cpu_cores,observed_at=excluded.observed_at',ledgerId,sample.p95_cpu_cores,sample.observed_at);
+          if (TERMINAL.has(session.state)) this.sql.exec('INSERT OR IGNORE INTO session_cpu_finalized VALUES(?,?)',ledgerId,sample.observed_at);
         }
       }
       if (session.fleet_launch_id && finite(sample.current_rss_mb)) this.sql.exec('INSERT INTO resource_resident_samples VALUES(?,?,?) ON CONFLICT(launch_id) DO UPDATE SET resident_mb=excluded.resident_mb,observed_at=excluded.observed_at WHERE excluded.observed_at>=resource_resident_samples.observed_at',session.fleet_launch_id,sample.current_rss_mb,sample.observed_at);
-      const old: any = this.sql.exec('SELECT * FROM session_resource_usage WHERE session_id=?',session.session_id).toArray()[0];
       const max = (k:string) => finite(sample[k]) ? Math.max(old?.[k] ?? 0,sample[k]) : old?.[k] ?? null;
       const cpu=max('cpu_seconds'),runtime=max('runtime_s');
       this.sql.exec(`INSERT INTO session_resource_usage VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(session_id) DO UPDATE SET finished_at=excluded.finished_at,state=excluded.state,
+        ON CONFLICT(session_id) DO UPDATE SET fleet_launch_id=excluded.fleet_launch_id,intake_id=excluded.intake_id,
+        project=excluded.project,engine=excluded.engine,model=excluded.model,tier=excluded.tier,kind=excluded.kind,
+        finished_at=excluded.finished_at,state=excluded.state,
         peak_rss_mb=excluded.peak_rss_mb,peak_pss_mb=excluded.peak_pss_mb,cpu_seconds=excluded.cpu_seconds,
         runtime_s=excluded.runtime_s,avg_cpu_cores=excluded.avg_cpu_cores,observed_at=excluded.observed_at`,
-        session.session_id,machine,session.native_id,session.fleet_launch_id,session.intake_id,session.project,session.engine,session.model,session.tier,session.kind,
+        ledgerId,machine,session.native_id,session.fleet_launch_id,session.intake_id,session.project,session.engine,session.model,session.tier,session.kind,
         session.started_at,old?.finished_at ?? session.finished_at,old?.finished_at ? old.state : session.state,max('peak_rss_mb'),max('peak_pss_mb'),cpu,runtime,runtime>0 && cpu!==null ? cpu/runtime : null,sample.observed_at);
     }
     for (const reap of value.reaps) {
@@ -246,7 +274,7 @@ export class ResourceManagement {
       if (session.reaped || this.sql.exec('SELECT 1 FROM resource_reaps WHERE session_id=? AND machine_id=? AND native_id=? LIMIT 1',session.session_id,machine,reap.native_id).toArray().length) continue;
       this.note(session,reap.id,`Resource watchdog reaped session ${session.session_id}: ${reap.reason}; freed ${reap.freed_mb ?? 'unknown'} MiB; confirmed stopped at ${reap.at}. Output saved as ${reap.evidence_id}. Unfinished intake remains open for restart.`);
       this.sql.exec('INSERT INTO resource_reaps VALUES(?,?,?,?,?,?,?,?,?,?)',reap.id,session.session_id,machine,reap.native_id,session.intake_id,'machine:'+machine,reap.reason,reap.freed_mb,reap.at,reap.evidence_id);
-      this.sql.exec("UPDATE session_resource_usage SET finished_at=COALESCE(finished_at,?),state=CASE WHEN finished_at IS NULL THEN 'stopped' ELSE state END WHERE session_id=?",reap.at,session.session_id);
+      this.sql.exec("UPDATE session_resource_usage SET finished_at=COALESCE(finished_at,?),state=CASE WHEN finished_at IS NULL THEN 'stopped' ELSE state END WHERE machine_id=? AND native_id=?",reap.at,machine,session.native_id);
       if (!TERMINAL.has(session.state)) this.sql.exec("UPDATE session_control_sessions SET state='stopped',updated_at=? WHERE id=?",reap.at,session.session_id);
       this.sql.exec("UPDATE fleet_launches SET state=CASE WHEN state IN ('exited','failed','stopped') THEN state ELSE 'failed' END,finished_at=COALESCE(finished_at,?),exit_reason=COALESCE(exit_reason,?),updated_at=? WHERE id=?",reap.at,'watchdog_'+reap.reason,reap.at,session.fleet_launch_id);
       this.sql.exec("UPDATE fleet_sessions SET phase='exited',observed_at=? WHERE machine_id=? AND native_id=?",reap.at,machine,session.native_id);

@@ -106,6 +106,45 @@ describe('resource management',()=>{
   expect((await service.handle(req({...start,task_kind:'implement'}),admin)).status).toBe(409);
   expect((await service.handle(req({...start,key:'invalid',task_kind:'shell'}),admin)).status).toBe(400);
  }));
+ it('accounts imported native aliases once and accepts old report IDs without losing managed metadata',async()=>fixture(async(r,sql)=>{
+  sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?)`,'native','machine:host','native-native',JSON.stringify({provenance:'observed_native'}),'host','opencode','interactive','running',
+    JSON.stringify({native_id:'native',tag:'agent',workspace:'/repo',provenance:'observed_native'}),iso(-600000),iso());
+  expect(r.sessions('host')).toHaveLength(1);
+  expect(r.sessions('host')[0]).toMatchObject({session_id:'session',managed:true,keep:false});
+  r.report('host',{samples:[sample({session_id:'native',p95_cpu_cores:2}),sample({p95_cpu_cores:2})],reaps:[]});
+  expect(r.usage()).toHaveLength(1);
+  expect(r.usage()[0]).toMatchObject({session_id:'session',fleet_launch_id:'launch',project:'demo',cpu_seconds:20,p95_cpu_cores:2});
+  expect(sql.exec('SELECT COUNT(*) AS n FROM session_cpu_usage').one().n).toBe(1);
+ }));
+ it('preserves the physical ledger identity when a managed binding arrives after an imported sample',async()=>fixture(async(r,sql)=>{
+  const binding=JSON.stringify({native_id:'native',tag:'agent',workspace:'/repo',provenance:'observed_native'});
+  // Import can win the race with Fleet adoption. Existing ledger rows are never
+  // deleted or duplicated when the managed session later supplies real metadata.
+  sql.exec("UPDATE session_control_sessions SET id='native',fleet_launch_id=NULL,request_key='native-native',request_json=?,mode='interactive',binding_json=? WHERE id='session'",JSON.stringify({provenance:'observed_native'}),binding);
+  r.report('host',{samples:[sample({session_id:'native',peak_rss_mb:500,p95_cpu_cores:3})],reaps:[]});
+  sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,'session','admin','control',JSON.stringify({intake_task_id:'task'}),'launch','host','opencode','headless','running',binding,iso(-600000),iso());
+  r.report('host',{samples:[sample({peak_rss_mb:100,p95_cpu_cores:1})],reaps:[]});
+  expect(r.usage()).toHaveLength(1);
+  expect(r.usage()[0]).toMatchObject({session_id:'native',fleet_launch_id:'launch',project:'demo',peak_rss_mb:500,p95_cpu_cores:1});
+  expect(sql.exec('SELECT COUNT(*) AS n FROM session_cpu_usage').one().n).toBe(1);
+  expect(r.sessions('host')[0].session_id).toBe('session');
+ }));
+ it('unions real interactive and keep protections across every alias before evidence or reap',async()=>fixture(async(r,sql)=>{
+  r.evidence('host',{id:'prior-alias-evidence',session_id:'session',native_id:'native',reason:'idle',output:'saved before protection'});
+  sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?)`,'interactive-alias','human','explicit-interactive','{}','host','opencode','interactive','running',
+    JSON.stringify({native_id:'native',tag:'agent',workspace:'/repo'}),iso(-600000),iso());
+  expect(r.sessions('host')[0]).toMatchObject({managed:false,keep:true});
+  expect(()=>r.report('host',{samples:[],reaps:[{id:'unsafe-reap',session_id:'session',native_id:'native',reason:'idle',freed_mb:null,at:iso(),evidence_id:'prior-alias-evidence',stopped:true}]})).toThrow('invalid_reap');
+  expect(r.reaps()).toHaveLength(0);
+  expect(()=>r.evidence('host',{id:'alias-evidence',session_id:'session',native_id:'native',reason:'idle',output:'saved'})).toThrow('session_not_reapable');
+  sql.exec("UPDATE session_control_sessions SET mode='headless' WHERE id='interactive-alias'");
+  sql.exec('INSERT INTO session_control_protections VALUES(?,?,?,?)','interactive-alias','human','keep',iso());
+  expect(r.sessions('host')[0]).toMatchObject({managed:false,keep:true});
+  expect(()=>r.evidence('host',{id:'alias-evidence',session_id:'session',native_id:'native',reason:'idle',output:'saved'})).toThrow('session_not_reapable');
+ }));
  it('authenticates own-host reporting and operator reads/configuration',async()=>fixture(async(r,sql,f)=>{
   const req=(path:string,method='GET',body?:any)=>new Request('https://hub/api/fleet/resources'+path,{method,body:body?JSON.stringify(body):undefined});
   expect((await f.handle(req(''),{caller:{kind:'host',machineId:'host'},scopes:['host']})).status).toBe(403);

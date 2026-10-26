@@ -271,3 +271,5 @@ The controller reads `config/model-routing.json` and invokes the dashboard
 export script at runtime. A host-only archive is insufficient. Activation
 preserves operator subscriptions (including capability scheduling ceilings),
 managed-engine paths, launcher arguments and the existing journal directory.
+
+Native aliases share one physical accounting record per machine/native ID. The watchdog catalog selects the Fleet binding over an earlier automatic native import; the import’s inferred interactive mode does not override that binding. An explicit interactive alias or any keep/protection flag protects the physical worker across all aliases. Reports already in flight under an older alias remain valid, and an existing ledger ID, CPU history and memory peaks survive later Fleet adoption. Host reports split the complete catalog across byte- and count-bounded requests; the per-request sample limit never truncates the catalog.
