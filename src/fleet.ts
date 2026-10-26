@@ -4,7 +4,7 @@ import { RoutingService } from './routing';
 import { ClaimAdmission, sameIntent, sameEditCaller, type EditAuthority, type AdmissionCaller } from './claim_admission';
 import { effectiveCheckin } from './registry';
 import { taskTier, policy } from './model-routing';
-import { QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
+import { QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
 import { evaluateQuotaAdmission } from './quota_admission';
 import { adoptObservedNativeSessions, reconcileUnboundFleetSessions } from './session_control';
 import { isValidMachineId } from './machine-id';
@@ -984,7 +984,7 @@ export class FleetService {
         return { ...m, last_checkin_at: effectiveCheckin(m.id, m.last_checkin_at), alias_of: canonical, canonical_id: canonical ?? String(m.id) };
       });
       const sessions = projectAliasSessions(this.sql.exec('SELECT * FROM fleet_sessions ORDER BY machine_id, tag').toArray(), new Map(Object.entries(machineAliases)), this.now(), freshCatalogs(this.sql, this.now()));
-      return response({ accounts: this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray().map(a => this.accountStatus(a)), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray().map(r => ({ ...r, supports_goal: (() => { const caps = parsed(this.sql.exec('SELECT capabilities FROM machines WHERE id = ?', r.machine_id).toArray()[0]?.capabilities); return Array.isArray(caps?.fleet_goal_routes) && caps.fleet_goal_routes.some((g: any) => g.engine === r.engine && g.account === r.account && (g.profile ?? null) === r.profile); })() })),
+      return response({ accounts: dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[]).map(a => this.accountStatus(a)), routes: this.sql.exec('SELECT * FROM fleet_routes ORDER BY machine_id, engine').toArray().map(r => ({ ...r, supports_goal: (() => { const caps = parsed(this.sql.exec('SELECT capabilities FROM machines WHERE id = ?', r.machine_id).toArray()[0]?.capabilities); return Array.isArray(caps?.fleet_goal_routes) && caps.fleet_goal_routes.some((g: any) => g.engine === r.engine && g.account === r.account && (g.profile ?? null) === r.profile); })() })),
         machines, machine_aliases: machineAliases,
         agents: this.sql.exec('SELECT tag, project, role, machine_id, engine, session_id, health_state, health_at FROM agents').toArray(),
         sessions,

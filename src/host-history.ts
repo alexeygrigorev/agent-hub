@@ -3,6 +3,7 @@
  */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { FleetService } from './fleet';
+import { dedupeAccountsByCanonical } from './quota';
 import { resolveMachineAliases } from './machine-alias';
 import { isValidMachineId } from './machine-id';
 import { effectiveCheckin } from './registry';
@@ -137,7 +138,9 @@ export class HostHistoryService {
       }, 'fleet_memory_headroom');
     }
     // Reuse FleetService account accounting/admission; no second slot calculation.
-    for (const row of this.rows('SELECT * FROM fleet_accounts ORDER BY label LIMIT 128')) {
+    // Canonical identity: a rename transition can briefly hold two registry
+    // rows for one pool; record the canonical one exactly once.
+    for (const row of dedupeAccountsByCanonical(this.rows('SELECT * FROM fleet_accounts ORDER BY label LIMIT 128'))) {
       const a = this.fleet.accountStatus(row);
       this.record('account', a.label, '', now, { used: a.active, max: a.max_concurrency, native_live: numeric((a as any).native_live) }, 'fleet_account_status_census_v2');
       this.record('quota', a.label, '', now, { remaining_percent: a.status === 'unknown' ? null : a.remaining_percent }, 'fleet_account_status');

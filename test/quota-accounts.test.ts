@@ -8,6 +8,7 @@ import {
   canonicalHarness,
   canonicalQuotaProvider,
   canonicalQuotaProviders,
+  dedupeAccountsByCanonical,
   fleetReadGrant,
   legacyRouteKeyFor,
   parseFleetQuotaFilters,
@@ -77,8 +78,7 @@ describe('canonical harness/provider/account mapping (codex-orin, go, zai)', () 
     expect(view('&provider=nope')).toMatchObject({ ok: false, error: 'invalid_provider' });
   });
 
-  it('fleet view canonicalizes stored rows keyed by old names; groups two codex accounts', async () => {
-    const e = env as unknown as Env;
+  it('fleet view canonicalizes stored rows keyed by old names; groups two codex accounts', async () => {    const e = env as unknown as Env;
     await runInDurableObject(e.HUB.get(e.HUB.idFromName(crypto.randomUUID())), async (hub: Hub) => {
       const now = Date.now();
       hub.fleetService.init();
@@ -127,6 +127,19 @@ describe('canonical harness/provider/account mapping (codex-orin, go, zai)', () 
       expect(filtered.pools.length).toBeGreaterThanOrEqual(2);
       expect(body.canonical).toMatchObject({ providers: { 'codex-orin': 'codex' }, engines: { zcodex: 'codex' }, accounts: { 'urgent-muse': 'shared-go' } });
     });
+  });
+
+  it('dedupes registry rows by canonical identity during a label rename', () => {
+    // A rename transition can briefly hold both rows: prefer canonical.
+    expect(dedupeAccountsByCanonical([
+      { label: 'urgent-muse', provider: 'go' },
+      { label: 'shared-go', provider: 'go' },
+    ])).toEqual([{ label: 'shared-go', provider: 'go' }]);
+    // Distinct pools are untouched.
+    expect(dedupeAccountsByCanonical([
+      { label: 'shared-codex', provider: 'codex' },
+      { label: 'codex-orin', provider: 'codex-orin' },
+    ]).map((r) => r.label).sort()).toEqual(['codex-orin', 'shared-codex']);
   });
 
   it('server snapshots and subscription reports accept legacy names and store canonical rows', async () => {

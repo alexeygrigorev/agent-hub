@@ -29,7 +29,7 @@ import { LivenessService, thresholdsFrom, alertText } from './liveness';
 import { ChecksService, validateCheck, type ActionDeps } from './checks';
 import { approvalAuthorityMatches, assignApprovalAuthority } from './host_enrollment';
 import { ensureRootScheduling, getRootScheduling, isRootSchedulingEnabled, setRootScheduling } from './root_scheduling';
-import { QuotaStore, handleQuotaRoutes } from './quota';
+import { QuotaStore, dedupeAccountsByCanonical, handleQuotaRoutes } from './quota';
 import { SessionControlService } from './session_control';
 import { StatusService, type StatusMachineAuth } from './status';
 import { MetricsStore, handleMetricsRoutes } from './metrics';
@@ -1656,7 +1656,7 @@ export class Hub extends DurableObject {
         return `${result.id} ${result.state} on ${result.machine}`;
       },
       fetch: (url, init) => fetch(url, init),
-      evaluateQuota: () => this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray().map(a => this.fleetService.accountStatus(a)),
+      evaluateQuota: () => dedupeAccountsByCanonical(this.sql.exec('SELECT * FROM fleet_accounts ORDER BY label').toArray() as any[]).map(a => this.fleetService.accountStatus(a)),
       ...this.extraCheckDeps(),
     }, only);
     // Retry alerts whose delivery failed or had no target yet, at most every 15 minutes each.

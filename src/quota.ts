@@ -88,6 +88,34 @@ export function legacyRouteKeyFor(canonicalProvider: string): string | null {
   return null;
 }
 
+/** Reverse lookup: legacy account labels canonicalizing to the given account. */
+export function legacyLabelsFor(canonicalLabel: string): string[] {
+  return Object.entries(LEGACY_ACCOUNT_LABELS)
+    .filter(([, c]) => c === canonicalLabel)
+    .map(([legacy]) => legacy);
+}
+
+/**
+ * One account row per canonical identity. During a label rename transition
+ * the registry can briefly hold both the legacy and the canonical row for
+ * one pool: prefer the canonical label so every consumer surfaces the pool
+ * exactly once. (Stored subscription rows self-canonicalize on every host
+ * report, so observations keep joining through the transition.)
+ */
+export function dedupeAccountsByCanonical<T extends { label: string; provider: string }>(rows: T[]): T[] {
+  const byIdentity = new Map<string, T>();
+  for (const row of rows) {
+    const key = canonicalAccountLabel(row.label) + " " + canonicalQuotaProvider(row.provider);
+    const prev = byIdentity.get(key);
+    if (!prev) {
+      byIdentity.set(key, row);
+    } else if (prev.label !== canonicalAccountLabel(prev.label) && row.label === canonicalAccountLabel(row.label)) {
+      byIdentity.set(key, row);
+    }
+  }
+  return [...byIdentity.values()];
+}
+
 /**
  * Pick the host-snapshot route that backs one fleet account. A snapshot is
  * keyed by quota route key, not by account:
@@ -1349,7 +1377,9 @@ export class QuotaStore {
     filters: FleetQuotaFilters,
     nowMs: number = this.now()
   ): { status: number; body: Record<string, any> } {
-    const rawAccounts = this.sql.exec("SELECT * FROM fleet_accounts ORDER BY provider, label").toArray() as any[];
+    const rawAccounts = dedupeAccountsByCanonical(
+      this.sql.exec("SELECT * FROM fleet_accounts ORDER BY provider, label").toArray() as any[],
+    );
     const serverRows = this.sql.exec("SELECT * FROM server_quota_snapshots ORDER BY account").toArray() as any[];
     // Stored rows keyed by old names (provider `codex-orin`, label
     // `urgent-muse`) canonicalize to the provider model: `codex-orin` is an
