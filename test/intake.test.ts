@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie, tokenAdminSubject, TOKEN_ADMIN_EMAIL } from '../src/auth/session';
 import { sha256 } from '../src/auth/crypto';
-import { IntakeService, INTAKE_LIMITS, INTAKE_EVENT_KINDS } from '../src/intake';
+import { IntakeService, INTAKE_LIMITS, INTAKE_EVENT_KINDS, recordIntakeSessionLink } from '../src/intake';
 
 const inDO: any = runInDurableObject;
 const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
@@ -205,7 +205,7 @@ describe('private durable intake HTTP/SQLite', () => {
     await inDO(stub(), (h: any) => { const grant = JSON.parse(h.sql.exec('SELECT data FROM intake_grants WHERE id=?', g.grant.id).one().data); grant.expires_at=0; h.sql.exec('UPDATE intake_grants SET data=? WHERE id=?', JSON.stringify(grant), g.grant.id); });
     expect((await call('/handoff?after=' + first.next + '&revision=' + first.snapshot_version + '&authorization_valid_until=' + first.authorization_valid_until, undefined, a.token)).status).toBe(409);
   });
-  it.each(['grants','rules','receipts'])('refuses bounded %s count without deleting old records', async table => {
+  it.each(['grants','rules'])('refuses bounded %s count without deleting old records', async table => {
     const a = await seedAgent();
     const count = table === 'grants' ? INTAKE_LIMITS.grants : table === 'rules' ? INTAKE_LIMITS.rules : INTAKE_LIMITS.receipts;
     await inDO(stub(), (h: any) => { for (let i=0;i<count;i++) h.sql.exec('INSERT INTO intake_' + table + ' VALUES(?,?)', 'fixture-' + i, JSON.stringify({ id: 'fixture-' + i, captured_at: Date.now() })); });
@@ -929,7 +929,7 @@ describe('private durable intake HTTP/SQLite', () => {
     // t1038u: task row count no longer hard-refuses create (soft warn only).
     await inDO(stub(), (h: any) => {
       h.sql.exec('DELETE FROM intake_tasks');
-      for (let i=0;i<128;i++) h.sql.exec('INSERT INTO intake_receipts VALUES(?,?)', 'fixture-padding-' + i, JSON.stringify({ id: 'fixture-padding-' + i, padding: 'x'.repeat(INTAKE_LIMITS.totalBytes/128), captured_at: Date.now() }));
+      for (let i=0;i<128;i++) h.sql.exec('INSERT INTO intake_receipts VALUES(?,?)', 'fixture-padding-' + i, JSON.stringify({ id: 'fixture-padding-' + i, padding: 'x'.repeat(32 * 1024 * 1024/128), captured_at: Date.now() }));
     });
     // Hash each bounded record inside the DO instead of cloning a full
     // 32 MiB ledger across the test transport twice to check rollback.
@@ -941,7 +941,8 @@ describe('private durable intake HTTP/SQLite', () => {
       }
       return { receipts, tasks: h.sql.exec('SELECT * FROM intake_tasks ORDER BY id').toArray(), meta: h.sql.exec('SELECT * FROM intake_meta').toArray() };
     });
-    before = await compactState(); expect((await call('/tasks', { key: 'globalcap', project: 'demo', title: 'x', text: 'x', source })).status).toBe(507); expect(await compactState()).toEqual(before);
+    before = await compactState(); expect((await call('/tasks', { key: 'globalcap', project: 'demo', title: 'x', text: 'x', source })).status).toBe(200);
+    expect((await compactState()).receipts.slice(0, before.receipts.length)).toEqual(before.receipts);
   });
   it('archives legacy terminal tasks in batches without deleting payloads', async () => {
     const stale = Date.now() - 20 * 86400000;
@@ -992,7 +993,7 @@ describe('private durable intake HTTP/SQLite', () => {
     expect(created.task.id).toBeTruthy();
     expect(created.intake_open_warning?.code).toBe('intake_open_high');
   });
-  it('prunes stale and legacy replay receipts on create while fresh receipts keep replaying', async () => {
+  it('retains stale and legacy replay receipts on create while fresh receipts keep replaying', async () => {
     const payload = { key: 'receipt-replay', project: 'demo', title: 'Synthetic', text: 'Original', source };
     const first = await ok('/tasks', payload);
     await inDO(stub(), (h: any) => {
@@ -1000,7 +1001,7 @@ describe('private durable intake HTTP/SQLite', () => {
       h.sql.exec('INSERT INTO intake_receipts VALUES(?,?)', 'legacy-receipt', JSON.stringify({ id: 'legacy-receipt', fingerprint: 'x', response: {} }));
     });
     expect((await ok('/tasks', { key: 'after-receipt-prune', project: 'demo', title: 'Synthetic', text: 'Synthetic', source })).task.id).toBeTruthy();
-    expect(await inDO(stub(), (h: any) => h.sql.exec("SELECT COUNT(*) AS n FROM intake_receipts WHERE id IN ('stale-receipt','legacy-receipt')").one().n)).toBe(0);
+    expect(await inDO(stub(), (h: any) => h.sql.exec("SELECT COUNT(*) AS n FROM intake_receipts WHERE id IN ('stale-receipt','legacy-receipt')").one().n)).toBe(2);
     expect(await ok('/tasks', payload)).toEqual(first);
   });
 });
@@ -1076,5 +1077,66 @@ describe('archive retention, evidence gates and durable audit', () => {
     });
     const events = (await ok('/tasks/' + task.id.slice(0, 8) + '/audit')).items;
     expect(events.map((e: any) => e.kind)).toEqual(['delete', 'close', 'archive']);
+  });
+});
+
+
+describe('intake retention accounting', () => {
+  it('measures UTF-8 task/event subsets, retained archives and receipts without writes', async () => {
+    const { task } = await create();
+    const expected = await inDO(stub(), (h: any) => {
+      const row = h.sql.exec('SELECT data FROM intake_tasks WHERE id=?', task.id).one();
+      const archived = { ...JSON.parse(row.data), id: 'archive-fixture', archived_at: Date.now(), status: 'done' };
+      h.sql.exec('INSERT INTO intake_tasks VALUES(?,?)', archived.id, JSON.stringify(archived));
+      const size = (v: string) => new TextEncoder().encode(v).length;
+      return { open: size(row.data) + size(task.id), archive: size(JSON.stringify(archived)) + size(archived.id),
+        events: size(JSON.stringify(JSON.parse(row.data).history)) * 2 };
+    });
+    const before = await state();
+    const stats = await ok('/storage');
+    expect(stats.bytes.open_tasks).toBe(expected.open);
+    expect(stats.bytes.archived_or_terminal_tasks).toBe(expected.archive);
+    expect(stats.bytes.events_within_tasks).toBe(expected.events);
+    expect(stats.bytes.original_requests_within_events).toBeGreaterThan(0);
+    expect(stats.hot_bytes).toBe(expected.open);
+    expect(stats.legacy_aggregate_bytes).toBe(stats.hot_bytes + stats.bytes.receipts);
+    expect(stats.retained_bytes).toBe(expected.open + expected.archive + stats.bytes.receipts + stats.bytes.audit);
+    expect(await state()).toEqual(before);
+    const agent = await seedAgent(); await grant(agent);
+    expect((await call('/storage', undefined, agent.token)).status).toBe(403);
+  });
+  it('warns at exactly 80%, enforces the hot bound and uses the same accounting for session links', async () => {
+    const { task } = await create();
+    const result = await inDO(stub(), (h: any) => {
+      const limit = INTAKE_LIMITS.totalBytes;
+      const service = new IntakeService(h.sql);
+      const used = service.storageUsage().hot_bytes;
+      try {
+        INTAKE_LIMITS.totalBytes = used / 0.8 + 1;
+        const below = service.storageWarning();
+        INTAKE_LIMITS.totalBytes = used / 0.8;
+        const at = service.storageWarning();
+        INTAKE_LIMITS.totalBytes = used - 1;
+        let refused = false;
+        try { (service as any).capacity(); } catch (e: any) { refused = e.code === 'storage_capacity'; }
+        INTAKE_LIMITS.totalBytes = limit;
+        const linked = recordIntakeSessionLink(h.sql, { id: crypto.randomUUID(), request_json: JSON.stringify({ intake_task_id: task.id }), actor: 'fixture', created_at: '2026-01-01' }, Date.now());
+        return { below, at, refused, linked };
+      } finally { INTAKE_LIMITS.totalBytes = limit; }
+    });
+    expect(result.below).toBeNull();
+    expect(result.at.code).toBe('intake_storage_high');
+    expect(result.refused).toBe(true);
+    expect(result.linked).toBe(true);
+  });
+  it('keeps creation working past the old receipt count and preserves exact replay', async () => {
+    const payload = { key: 'retained-count', project: 'demo', title: 'Synthetic', text: 'Original', source };
+    const first = await ok('/tasks', payload);
+    await inDO(stub(), (h: any) => {
+      for (let i = 0; i < 8192; i++) h.sql.exec('INSERT INTO intake_receipts VALUES(?,?)', 'retained-count-' + i, JSON.stringify({ id: 'retained-count-' + i }));
+    });
+    expect((await create()).task.id).toBeTruthy();
+    expect(await ok('/tasks', payload)).toEqual(first);
+    expect((await ok('/storage')).counts.receipts).toBe(8194);
   });
 });

@@ -39,11 +39,20 @@ export type IntakeHooks = { forgotten?: (tasks: Obj[]) => Obj; startSession?: (i
  * `tasks` remains only as a schema safety-net ceiling (very high). Open (non-terminal)
  * count > OPEN_INTAKE_WARN_THRESHOLD emits a warning requiring DONE evidence before close. */
 export const INTAKE_LIMITS = { request: 32768, tasks: 10000, taskBytes: 131072, events: 128,
-  // Original requests and exact lost-response receipts are retained together.
-  // The former 4 MiB budget blocked real intake after the initial backfill
-  // and normal context updates. Keep an explicit 32 MiB aggregate bound;
-  // per-task, per-record, event and count limits still apply independently.
-  grants: 256, rules: 128, receipts: 8192, totalBytes: 32 * 1024 * 1024, page: 100 };
+  // Hot admission budget excludes retained archives and exact replay receipts.
+  // 128 MiB accommodates 1,000 maximum-size task records; retained storage
+  // has a separate 256 MiB planning budget below the Free plan's 1 GB/DO.
+  grants: 256, rules: 128, receipts: 8192, totalBytes: 128 * 1024 * 1024, page: 100 };
+export const INTAKE_RETAINED_WARN_BYTES = 256 * 1024 * 1024;
+const HOT_TASKS = "json_extract(data,'$.archived_at') IS NULL AND json_extract(data,'$.status') NOT IN ('done','cancelled')";
+const ROW_BYTES = 'length(CAST(data AS BLOB))+length(CAST(id AS BLOB))';
+/** SQL aggregates avoid loading retained response snapshots into Worker memory. */
+function intakeBytes(sql: SqlStorage, table: string, where = ''): number {
+  return Number((sql.exec(`SELECT COALESCE(SUM(${ROW_BYTES}),0) AS n FROM intake_${table}${where ? ' WHERE ' + where : ''}`).toArray()[0] as any).n);
+}
+function hotBytes(sql: SqlStorage): number {
+  return intakeBytes(sql, 'tasks', HOT_TASKS) + intakeBytes(sql, 'grants') + intakeBytes(sql, 'rules');
+}
 /** When open/in_progress/blocked/pending_approval count exceeds this, Hub surfaces
  * intake_open_high on status/list/create. Not a create refuse. */
 export const OPEN_INTAKE_WARN_THRESHOLD = 100; // t1038u-deploy-marker
@@ -163,11 +172,7 @@ export function recordIntakeSessionLink(sql: SqlStorage, session: Obj, now: numb
   task.version++; task.updated_at = now;
   if (encoded(task) > INTAKE_LIMITS.taskBytes) throw new IntakeSessionLinkError('task_capacity');
   sql.exec('UPDATE intake_tasks SET data=? WHERE id=?', JSON.stringify(task), task.id);
-  let bytes = 0;
-  for (const table of ['tasks', 'grants', 'rules', 'receipts']) {
-    bytes += Number((sql.exec(`SELECT COALESCE(SUM(length(CAST(data AS BLOB))+length(CAST(id AS BLOB))),0) AS n FROM intake_${table}${table === 'tasks' ? " WHERE json_extract(data,'$.archived_at') IS NULL AND json_extract(data,'$.status') NOT IN ('done','cancelled')" : ''}`).toArray()[0] as any).n);
-  }
-  if (bytes > INTAKE_LIMITS.totalBytes) throw new IntakeSessionLinkError('storage_capacity');
+  if (hotBytes(sql) > INTAKE_LIMITS.totalBytes) throw new IntakeSessionLinkError('storage_capacity');
   sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
   return true;
 }
@@ -233,11 +238,42 @@ export class IntakeService {
   }
   private revision(): number { return (this.sql.exec('SELECT revision FROM intake_meta WHERE id=1').toArray()[0] as any).revision; }
   private capacity(additionalBytes = 0) {
-    let bytes = 0;
-    for (const table of ['tasks', 'grants', 'rules', 'receipts']) {
-      bytes += Number((this.sql.exec(`SELECT COALESCE(SUM(length(CAST(data AS BLOB))+length(CAST(id AS BLOB))),0) AS n FROM intake_${table}${table === 'tasks' ? " WHERE json_extract(data,'$.archived_at') IS NULL AND json_extract(data,'$.status') NOT IN ('done','cancelled')" : ''}`).toArray()[0] as any).n);
+    if (hotBytes(this.sql) + additionalBytes > INTAKE_LIMITS.totalBytes) fail('storage_capacity', 507);
+  }
+  /** Operator-only callers expose this aggregate, never payloads or identities.
+   * Event/original-request bytes are subsets of task bytes, not additive totals. */
+  storageUsage(): Obj {
+    const tasks = intakeBytes(this.sql, 'tasks');
+    const open = intakeBytes(this.sql, 'tasks', HOT_TASKS);
+    const receipts = intakeBytes(this.sql, 'receipts');
+    const grants = intakeBytes(this.sql, 'grants');
+    const rules = intakeBytes(this.sql, 'rules');
+    const history = this.sql.exec(`SELECT
+      COALESCE(SUM(length(CAST(json_extract(data,'$.history') AS BLOB))),0) AS events,
+      COALESCE(SUM((SELECT COALESCE(SUM(length(CAST(e.value AS BLOB))),0)
+        FROM json_each(json_extract(data,'$.history')) e WHERE json_extract(e.value,'$.kind')='intake')),0) AS original_requests
+      FROM intake_tasks`).toArray()[0] as any;
+    const counts: Obj = {};
+    for (const table of ['tasks', 'receipts', 'grants', 'rules', 'audit']) {
+      counts[table] = Number((this.sql.exec(`SELECT COUNT(*) AS n FROM intake_${table}`).toArray()[0] as any).n);
     }
-    if (bytes + additionalBytes > INTAKE_LIMITS.totalBytes) fail('storage_capacity', 507);
+    const audit = Number((this.sql.exec("SELECT COALESCE(SUM(length(CAST(json_object('seq',seq,'task_id',task_id,'project',project,'kind',kind,'actor',actor,'captured_at',captured_at,'from_status',from_status,'to_status',to_status,'reason',reason) AS BLOB))),0) AS n FROM intake_audit").toArray()[0] as any).n);
+    const hot = open + grants + rules;
+    const retained = tasks + receipts + grants + rules + audit;
+    return { accounting: 'utf8_json_and_primary_key_bytes; audit_json_projection; excludes SQLite overhead',
+      bytes: { open_tasks: open, archived_or_terminal_tasks: tasks - open, receipts, grants, rules, audit,
+        events_within_tasks: Number(history.events), original_requests_within_events: Number(history.original_requests) },
+      counts, hot_bytes: hot, hot_limit_bytes: INTAKE_LIMITS.totalBytes,
+      retained_bytes: retained, retained_planning_bytes: INTAKE_RETAINED_WARN_BYTES,
+      legacy_aggregate_bytes: hot + receipts, legacy_limit_bytes: 32 * 1024 * 1024 };
+  }
+  storageWarning(): Obj | null {
+    const usage = this.storageUsage();
+    if (usage.hot_bytes < INTAKE_LIMITS.totalBytes * 0.8 && usage.retained_bytes < INTAKE_RETAINED_WARN_BYTES * 0.8) return null;
+    return { code: 'intake_storage_high', severity: 'warn', subject: 'intake:storage',
+      title: 'Intake storage is high', source: 'intake_storage', scope: 'hub',
+      detail: 'Plan additional retention storage before capacity is exhausted. Preserve every intake, event and replay receipt.',
+      action: 'expand_retention_storage', threshold_ratio: 0.8, ...usage };
   }
   private bounded(table: string, max: number) { if (this.rows(table).length >= max) fail('record_capacity', 507); }
   /** Non-terminal task count used for soft open-intake warnings (never blocks create). */
@@ -260,7 +296,7 @@ export class IntakeService {
         .map(t => ({ id: t.id, title: t.title, age_ms: Math.max(0, Date.now() - (t.created_at ?? Date.now())) })),
     };
   }
-  /** Retain full terminal payloads forever. Only replay receipts expire (unchanged). */
+  /** Retain terminal payloads and replay receipts forever. No data expiration. */
   private prune(now: number) {
     for (const task of this.rows('tasks').filter(t => !t.archived_at && !OPEN.includes(t.status)).slice(0, 256)) {
       task.archived_at = now;
@@ -268,11 +304,8 @@ export class IntakeService {
       this.put('tasks', task);
       this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
     }
-    for (const r of this.rows('receipts').filter(r => (r.captured_at ?? 0) < now - 14 * 86400000).slice(0, 256)) {
-      this.sql.exec('DELETE FROM intake_receipts WHERE id=?', r.id);
-      this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
-    }
   }
+
   private doneNote(task: Obj): Obj | undefined { return currentDoneNote(task); }
   private transition(task: Obj, status: string, actor: string, now: number, reason?: string, supersededBy?: string) {
     if (status === task.status) return;
@@ -460,6 +493,10 @@ export class IntakeService {
   }
   private read(url: URL, p: Obj): Obj {
     const path = url.pathname.slice('/api/intake'.length); const revision = this.revision();
+    if (path === '/storage') {
+      this.operator(p);
+      return { snapshot_version: revision, ...this.storageUsage(), warning: this.storageWarning() };
+    }
     if (path === '/grants') {
       this.operator(p);
       return { snapshot_version: revision, items: this.rows('grants').map(({ binding, ...g }) => ({ ...g, actor: binding.actor, family_id: binding.family_id })) };
@@ -583,6 +620,7 @@ export class IntakeService {
       return { ...result, authorization_valid_until: p.valid_until ?? null, items: result.items.map((t: Obj) => this.taskView(t, p)), operator_rules: this.rules(tasks),
         data_notice: DATA_NOTICE, authorized_scope: p.admin ? 'operator_all' : 'explicit_grants_only',
         completeness: 'All authorized matching records are included across pages at snapshot_version. Restart on stale_snapshot.',
+        ...(p.admin ? { intake_storage_warning: this.storageWarning() } : {}),
         intake_policy: 'soft_unlimited_tasks_t1038u',
         open_non_terminal_count: this.openNonTerminalCount(p),
         open_intake_warn_threshold: OPEN_INTAKE_WARN_THRESHOLD,
@@ -1059,7 +1097,6 @@ export class IntakeService {
       // A crash after the canonical start/link can then resume the same
       // assignment, without permitting a different payload under its key.
       if (!previous) {
-        this.bounded('receipts', INTAKE_LIMITS.receipts);
         this.put('receipts', { id: receiptId, fingerprint, started_version: version, captured_at: Date.now() });
         this.capacity();
       }
@@ -1320,7 +1357,6 @@ export class IntakeService {
         // Prune before any capacity check: a full receipts table must not
         // wedge every write forever, terminal payloads are archived and retained.
         this.prune(Date.now());
-        this.bounded('receipts', INTAKE_LIMITS.receipts);
         const response = { ...this.write(path, payload, p), snapshot_version: this.revision() + 1, data_notice: DATA_NOTICE };
         this.sql.exec('UPDATE intake_meta SET revision=revision+1 WHERE id=1');
         this.put('receipts', { id, fingerprint, response, captured_at: Date.now() }); this.capacity();

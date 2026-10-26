@@ -228,7 +228,8 @@ export class StatusService {
         });
       }
     } catch { /* optional operator_notices table */ }
-    const base = [...intakeItems, ...noticeItems, ...measured];
+    const storageWarning = admin ? this.intake.storageWarning() : null;
+    const base = [...intakeItems, ...(storageWarning ? [storageWarning] : []), ...noticeItems, ...measured];
     if (!admin) return base;
     let rows: any[];
     try {
