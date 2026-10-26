@@ -976,6 +976,19 @@ class BatchCadenceTests(unittest.TestCase):
                 counts.append(rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000 + 301_000)["reaps"])
             self.assertEqual(counts, [1, 0, 0])  # Same incarnation stays settled after ACK/restart.
 
+    def test_all_observations_and_full_receipt_journal_reach_bounded_posts(self):
+        # Real host catalogs exceed one body. A per-POST cap cannot silently
+        # truncate the catalog or emit a receipt batch the API rejects (>100).
+        samples = [{"session_id": str(i)} for i in range(884)]
+        reaps = [{"id": str(i)} for i in range(rm.MAX_REPORTED_ENTRIES)]
+        posts = rm._split_report_posts(samples, reaps)
+        self.assertEqual([s for p in posts for s in p["samples"]], samples)
+        self.assertEqual([r for p in posts for r in p["reaps"]], reaps)
+        for post in posts:
+            self.assertLessEqual(len(post["samples"]), 200)
+            self.assertLessEqual(len(post["reaps"]), 50)
+            self.assertLess(len(json.dumps(post).encode()), rm.REPORT_BYTE_BUDGET)
+
     def test_report_batches_stay_well_under_body_cap(self):
         fat = [{"session_id": "s%d" % i, "native_id": "n%d" % i, "observed_at": "t",
                 "peak_rss_mb": 1.5, "pad": "x" * 500} for i in range(200)]

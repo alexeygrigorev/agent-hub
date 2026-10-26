@@ -874,12 +874,12 @@ def _split_report_posts(samples: list[dict[str, Any]], reaps: list[dict[str, Any
             posts.append({"samples": cur_s, "reaps": cur_r})
         cur_s = []
         cur_r = []
-    for item in samples[:MAX_SAMPLES]:
-        if (cur_s or cur_r) and _bytes() + _json_bytes(item) + 1 > REPORT_BYTE_BUDGET:
+    for item in samples:
+        if len(cur_s) >= MAX_SAMPLES or ((cur_s or cur_r) and _bytes() + _json_bytes(item) + 1 > REPORT_BYTE_BUDGET):
             _flush()
         cur_s.append(item)
     for item in reaps:
-        if (cur_s or cur_r) and _bytes() + _json_bytes(item) + 1 > REPORT_BYTE_BUDGET:
+        if len(cur_r) >= MAX_REAPS_PER_POST or ((cur_s or cur_r) and _bytes() + _json_bytes(item) + 1 > REPORT_BYTE_BUDGET):
             _flush()
         cur_r.append(item)
     _flush()
