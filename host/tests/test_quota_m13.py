@@ -178,17 +178,22 @@ class QuotaCliTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             quota_cli.fetch_quota(provider='openai')
 
-    def test_execute_accepts_codex_orin_provider(self):
+    def test_execute_rejects_legacy_codex_orin_provider_choice(self):
+        # `codex-orin` is the second Codex account, not a provider choice:
+        # filter it with --provider codex --account codex-orin.
+        with self.assertRaises(ValueError):
+            quota_cli.fetch_quota(provider='codex-orin')
         calls = []
         import agent_hub_host.bus as bus
         real = bus._do_request
         bus._do_request = lambda method, path: calls.append((method, path)) or {'pools': []}
         try:
-            quota_cli.fetch_quota(provider='codex-orin')
+            quota_cli.fetch_quota(provider='codex', account='codex-orin')
         finally:
             bus._do_request = real
         self.assertEqual(len(calls), 1)
-        self.assertIn('provider=codex-orin', calls[0][1])
+        self.assertIn('provider=codex', calls[0][1])
+        self.assertIn('account=codex-orin', calls[0][1])
 
     def test_render_text_never_zero_fills_unknown(self):
         text = quota_cli.render_text({'pools': [
@@ -197,6 +202,20 @@ class QuotaCliTests(unittest.TestCase):
             'coverage': {'fresh': [], 'stale': [], 'missing': ['m1'], 'machines_total': 1}})
         self.assertIn('unknown', text)
         self.assertNotIn('0%', text)
+
+    def test_render_text_exposes_harness_provider_account(self):
+        text = quota_cli.render_text({'pools': [
+            {'provider': 'codex', 'account': 'codex-orin', 'harness': ['codex'], 'state': 'fresh',
+             'remaining_percent': 72.0, 'observed_at': '2026-10-26T01:00:00Z', 'observed_by_hosts': ['m1']},
+            {'provider': 'zai', 'account': 'shared-zai', 'harness': ['codex'], 'state': 'fresh',
+             'remaining_percent': 50.0, 'observed_at': '2026-10-26T01:00:00Z', 'observed_by_hosts': ['m1']},
+            {'provider': 'go', 'account': 'shared-go', 'harness': ['opencode'], 'state': 'fresh',
+             'remaining_percent': 61.0, 'observed_at': '2026-10-26T01:00:00Z', 'observed_by_hosts': ['m1']}]})
+        self.assertIn('codex/codex/codex-orin', text)
+        self.assertIn('codex/zai/shared-zai', text)
+        self.assertIn('opencode/go/shared-go', text)
+        self.assertNotIn('codex-orin/codex-orin', text)
+        self.assertNotIn('urgent-muse', text)
 
 
 if __name__ == '__main__':

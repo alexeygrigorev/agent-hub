@@ -33,11 +33,14 @@ beforeEach(async () => {
 
 describe('Hub server account quota', () => {
   it('fresh account quota and routing do not depend on any machine report', async () => {
+    // The second Codex home posts under its legacy wire route key; the pool
+    // surfaces as canonical provider `codex` with its own account.
     expect((await post([{ account: 'main', provider: 'codex', quota: observation(62) },
       { account: 'orin', provider: 'codex-orin', quota: observation(99) }])).status).toBe(200);
     const q = await view();
-    expect(q.pools.find((p: any) => p.account === 'main')).toMatchObject({ state: 'fresh', source: 'server', remaining_percent: 62 });
-    expect(q.pools.find((p: any) => p.account === 'orin')).toMatchObject({ state: 'fresh', source: 'server', remaining_percent: 99 });
+    expect(q.pools.find((p: any) => p.account === 'main')).toMatchObject({ provider: 'codex', state: 'fresh', source: 'server', remaining_percent: 62 });
+    expect(q.pools.find((p: any) => p.account === 'orin')).toMatchObject({ provider: 'codex', state: 'fresh', source: 'server', remaining_percent: 99 });
+    expect(q.pools.some((p: any) => p.provider === 'codex-orin')).toBe(false);
     expect(q.account_coverage).toMatchObject({ total: 2, fresh: ['main', 'orin'], unavailable: [] });
     await runInDurableObject(stub, (hub: Hub) => {
       hub.sql.exec("INSERT INTO fleet_accounts VALUES ('main', 'codex', 4, 15, 1)");

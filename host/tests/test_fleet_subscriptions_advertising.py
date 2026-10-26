@@ -72,7 +72,7 @@ class FleetSubscriptionsAdvertisingTest(unittest.TestCase):
                     {"service": "claude", "account_label": "shared-claude"},
                     {"service": "codex", "account_label": "shared-codex"},
                     {"service": "gemini", "account_label": "shared-gemini", "engine": "antigravity"},
-                    {"service": "go", "account_label": "urgent-muse", "engine": "opencode"},
+                    {"service": "go", "account_label": "shared-go", "engine": "opencode"},
                     {"service": "grok", "account_label": "shared-grok"},
                     {"service": "zai", "account_label": "shared-zai", "engine": "zcodex"},
                 ],
@@ -96,7 +96,7 @@ class FleetSubscriptionsAdvertisingTest(unittest.TestCase):
             self.assertIn("shared-claude", reported_accounts)
             self.assertIn("shared-codex", reported_accounts)
             self.assertIn("shared-gemini", reported_accounts)
-            self.assertIn("urgent-muse", reported_accounts)
+            self.assertIn("shared-go", reported_accounts)
             self.assertIn("shared-grok", reported_accounts)
             self.assertIn("shared-zai", reported_accounts)
 

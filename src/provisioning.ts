@@ -3,6 +3,7 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import type { Env } from './env';
 import { validSessionSecret } from './auth/session';
 import type { FleetService } from './fleet';
+import { canonicalQuotaProvider } from './quota';
 
 const LABEL = /^[a-z][a-z0-9_-]{0,47}$/;
 export const PACKAGES: Record<string, { pkg: string; bin: string; engine: string }> = {
@@ -166,7 +167,9 @@ export class ProvisioningService {
     return this.tx(() => {
       const managed = this.sql.exec('SELECT 1 FROM engine_bundles WHERE label=?', label).toArray().length;
       const existing: any = this.sql.exec('SELECT * FROM fleet_accounts WHERE label=?', label).toArray()[0];
-      const providerFamily = existing?.provider === 'codex-orin' ? 'codex' : existing?.provider;
+      // Canonical provider family: `codex-orin` rows are the second Codex
+      // account under provider `codex`, never a separate provider.
+      const providerFamily = canonicalQuotaProvider(existing?.provider);
       if (existing && providerFamily !== bundle.provider) return reply({ error: 'account_provider_mismatch' }, 409);
       if (!managed && existing) {
         // An explicit recovery may attach credentials to a stale registry pool,

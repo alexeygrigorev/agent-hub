@@ -2,6 +2,7 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { modelCandidates, taskTier, policy } from './model-routing';
 import { evaluateQuotaAdmission } from './quota_admission';
+import { canonicalQuotaProvider } from './quota';
 import { loadProviderPacing } from './pacing';
 import type { FleetService } from './fleet';
 import { sha256, randomString } from './auth/crypto';
@@ -113,16 +114,20 @@ export class RoutingService {
         if (!plan.selected) continue;
         const routes = plan.candidates.flatMap((r: any) => {
           const account: any = this.sql.exec('SELECT provider FROM fleet_accounts WHERE label = ?', r.account).one();
-          const observation = this.fleet.observationProvenance({ ...account, label: r.account },
+          // Canonical provider: stored rows keyed by the legacy `codex-orin`
+          // provider still feed the `codex` policy family (both Codex accounts
+          // serve every codex-family model).
+          const provider = canonicalQuotaProvider(account.provider);
+          const observation = this.fleet.observationProvenance({ ...account, provider, label: r.account },
             { machine_id: ad.machine_id, profile: r.profile });
           let subQuota = observation?.quota ?? null;
           if (subQuota) {
-            const adm = evaluateQuotaAdmission({ provider: account.provider, quota: subQuota,
+            const adm = evaluateQuotaAdmission({ provider, quota: subQuota,
               subscriptionObservedAt: observation!.subscriptionObservedAt, nowMs: this.now(),
               reserves: (((policy as any).rules as any).reserve_percent || {}) as Record<string, number> });
             if (!adm.ok) subQuota = null;
           }
-          const models = modelCandidates(input, { ...r, provider: account.provider }, JSON.parse(ad.runners_json), subQuota, this.now(), pacing, unavailableEngines);
+          const models = modelCandidates(input, { ...r, provider }, JSON.parse(ad.runners_json), subQuota, this.now(), pacing, unavailableEngines);
           return models.map(model => ({ ...r, model, score: r.score * model.weight / model.headroom }));
         });
         if (!routes.length) continue;

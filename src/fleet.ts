@@ -4,7 +4,7 @@ import { RoutingService } from './routing';
 import { ClaimAdmission, sameIntent, sameEditCaller, type EditAuthority, type AdmissionCaller } from './claim_admission';
 import { effectiveCheckin } from './registry';
 import { taskTier, policy } from './model-routing';
-import { QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, ensureTbmQuotaSchema } from './quota';
+import { QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
 import { evaluateQuotaAdmission } from './quota_admission';
 import { adoptObservedNativeSessions, reconcileUnboundFleetSessions } from './session_control';
 import { isValidMachineId } from './machine-id';
@@ -28,6 +28,10 @@ CREATE INDEX IF NOT EXISTS idx_placement_rejections_recent ON placement_rejectio
 `;
 type Auth = { caller?: AdmissionCaller; scopes?: string[]; error?: Response };
 const LABEL = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+// Wire-compatible provider/service namespace: `codex-orin` is accepted as a
+// quota route key and subscription service for hosts that have not updated
+// yet, but it canonicalizes to provider `codex` (the second Codex account)
+// on every read path. Never register new accounts under it.
 const PROVIDERS = new Set(['codex', 'codex-orin', 'claude', 'grok', 'gemini', 'zai', 'go', 'copilot']);
 const ACTIVE = "('offered','starting','running','uncertain')";
 // A native catalog can observe spawn before the launcher posts its receipt.
@@ -334,7 +338,10 @@ export class FleetService {
   }
 
   public observationProvenance(account: any, route: any): { quota: any; subscriptionObservedAt: string | null } | null {
-    const central: any = this.sql.exec('SELECT * FROM server_quota_snapshots WHERE account = ? AND provider = ?', account.label, account.provider).toArray()[0];
+    const provider = canonicalQuotaProvider(account.provider);
+    const label = canonicalAccountLabel(account.label);
+    const legacyLabel = Object.entries(LEGACY_ACCOUNT_LABELS).find(([, c]) => c === label)?.[0] ?? label;
+    const central: any = this.sql.exec('SELECT * FROM server_quota_snapshots WHERE (account = ? OR account = ?) AND (provider = ? OR provider = ?)', label, legacyLabel, provider, legacyRouteKeyFor(provider) ?? provider).toArray()[0];
     if (central && fresh(central.captured_at, this.now(), QUOTA_STALE_MS - 1)) {
       const quota = parsed(central.quota_json);
       if (!quota.observed_at || fresh(quota.observed_at, this.now(), QUOTA_STALE_MS - 1)) {
@@ -343,17 +350,17 @@ export class FleetService {
     }
     const subscription: any = this.sql.exec('SELECT * FROM fleet_subscriptions WHERE machine_id = ? AND account = ?', route.machine_id, account.label).toArray()[0];
     if (subscription) {
-      if (subscription.service !== account.provider || !fresh(subscription.observed_at, this.now(), 1200000)) return null;
+      if (canonicalQuotaProvider(subscription.service) !== provider || !fresh(subscription.observed_at, this.now(), 1200000)) return null;
       const quota = parsed(subscription.quota_json);
       const quotaObs = quota?.observed_at || subscription.observed_at;
       return fresh(quotaObs, this.now(), 1200000) ? { quota: quota?.observed_at ? quota : { ...quota, observed_at: quotaObs }, subscriptionObservedAt: subscription.observed_at } : null;
     }
     // A default CLI reading cannot describe a named profile or two accounts on one service.
-    if (route.profile !== null && route.profile !== account.provider) return null;
-    const count = Number(this.sql.exec('SELECT COUNT(DISTINCT r.account) AS n FROM fleet_routes r JOIN fleet_accounts a ON r.account = a.label WHERE r.machine_id = ? AND a.provider = ?', route.machine_id, account.provider).one().n);
+    if (route.profile !== null && route.profile !== provider) return null;
+    const count = Number(this.sql.exec('SELECT COUNT(DISTINCT r.account) AS n FROM fleet_routes r JOIN fleet_accounts a ON r.account = a.label WHERE r.machine_id = ? AND (a.provider = ? OR a.provider = ?)', route.machine_id, provider, legacyRouteKeyFor(provider) ?? provider).one().n);
     const snapshot: any = this.sql.exec('SELECT * FROM host_quota_snapshots WHERE host_id = ?', route.machine_id).toArray()[0];
     if (count !== 1 || !snapshot || !fresh(snapshot.captured_at, this.now(), 1200000)) return null;
-    const quota = parsed(snapshot.routes_json)[account.provider];
+    const quota = snapshotRouteForAccount(account.label, provider, parsed(snapshot.routes_json));
     const obsTs = quota?.observed_at || snapshot.captured_at;
     if (!quota || !fresh(obsTs, this.now(), 1200000)) return null;
     const quotaWithTs = quota.observed_at ? quota : { ...quota, observed_at: obsTs };
@@ -385,6 +392,10 @@ export class FleetService {
     this.admission.reconcileOffers();
     reconcileAccountCapacity(this.sql, this.now());
     reconcileUnboundFleetSessions(this.sql, this.now());
+    // Canonical provider model: `codex-orin` is an account under provider
+    // `codex`, never a separate provider. Stored rows keyed by old names
+    // canonicalize here so grouping by provider shows both Codex accounts.
+    const provider = canonicalQuotaProvider(account.provider);
     const routes = this.sql.exec('SELECT machine_id, engine, profile FROM fleet_routes WHERE account = ?', account.label).toArray();
     let remaining: number | null = null; let observed = 0; let unknown = false; let blocked = !account.enabled;
     const reserves = (((policy as any).rules as any).reserve_percent || {}) as Record<string, number>;
@@ -392,7 +403,7 @@ export class FleetService {
       const prov = this.observationProvenance(account, route);
       if (!prov) continue;
       observed++;
-      const adm = evaluateQuotaAdmission({ provider: account.provider, quota: prov.quota, subscriptionObservedAt: prov.subscriptionObservedAt, nowMs: this.now(), reserves });
+      const adm = evaluateQuotaAdmission({ provider, quota: prov.quota, subscriptionObservedAt: prov.subscriptionObservedAt, nowMs: this.now(), reserves });
       if (!adm.ok) {
         if (adm.reason === 'limit_reached') blocked = true;
         else if (adm.reason === 'reserve') {
@@ -464,7 +475,7 @@ export class FleetService {
         placeableMachines.add(String(route.machine_id));
       } else placementReasons.add(liveIds.has(String(route.machine_id)) ? 'engine_unavailable' : 'machine_unavailable');
     }
-    return { label: account.label, provider: account.provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled, supports_goal: ['codex', 'codex-orin', 'zai'].includes(account.provider),
+    return { label: account.label, provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled, supports_goal: ['codex', 'zai'].includes(provider),
       remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || unknown || remaining === null) ? 'unknown' : 'ok', active, available_slots: availableSlots,
       // Counted vs live: active splits into launch reservations + orphan
       // observed sessions; native_live is the host-catalog verified live
@@ -640,14 +651,14 @@ export class FleetService {
       if ((request.account && route.account !== request.account) || (request.machine && route.machine_id !== request.machine) || (request.engine && !overrideModels.length && route.engine !== request.engine)) continue;
       if (overrideModels.length) {
         const provider = definitions.get(route.account)?.provider;
-        const family = provider === 'codex-orin' ? 'codex' : provider;
+        const family = canonicalQuotaProvider(provider as string);
         if (!overrideModels.some(m => matchesModelRoute(m, route, family))) continue;
       }
       if (tierModels) {
         const provider = definitions.get(route.account)?.provider;
         // Named profiles share policy membership with their registered provider,
         // never merely with an executable (Z.ai also uses the Codex engine).
-        const family = provider === 'codex-orin' ? 'codex' : provider;
+        const family = canonicalQuotaProvider(provider as string);
         if (!tierModels.some(m => (!overrideModels.length || overrideModels.some(o => o.id === m.id)) && matchesModelRoute(m, route, family))) {
           rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'tier_unavailable' });
           continue;
@@ -695,7 +706,7 @@ export class FleetService {
       else if (!this.observation(definitions.get(route.account), route)) reason = 'machine_account_quota_unknown';
       else if (account.available_slots < 1) reason = 'account_capacity';
       if (reason) { rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'launcher_memory_reserve' ? { memory: this.memoryHeadroom(route.machine_id) } : {}) }); continue; }
-      const family = definitions.get(route.account)?.provider === 'codex-orin' ? 'codex' : definitions.get(route.account)?.provider;
+      const family = canonicalQuotaProvider(definitions.get(route.account)?.provider as string);
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
       const model = policy.models.find(m => members.includes(m.id) && (!overrideModels.length || m.id === input.engine) && matchesModelRoute(m, route, family));
@@ -933,8 +944,17 @@ export class FleetService {
     }
     if (path === '/api/fleet' && request.method === 'GET') {
       if (!admin) return response({ error: 'forbidden' }, 403);
-      const controlIds = new Map<string, string>();
+      // Harness per (machine, account) for the subscriptions table: every
+      // quota row exposes both the harness and the provider/account pair.
+      const routeHarness = new Map<string, Set<string>>();
       try {
+        for (const r of this.sql.exec('SELECT machine_id, account, engine FROM fleet_routes').toArray() as any[]) {
+          const key = String(r.machine_id) + ' ' + String(r.account);
+          if (!routeHarness.has(key)) routeHarness.set(key, new Set());
+          routeHarness.get(key)!.add(canonicalHarness(String(r.engine)));
+        }
+      } catch { /* harness reads as unknown below */ }
+      const controlIds = new Map<string, string>();      try {
         for (const row of this.sql.exec('SELECT id, fleet_launch_id FROM session_control_sessions WHERE fleet_launch_id IN (SELECT id FROM fleet_launches ORDER BY created_at DESC LIMIT 200)').toArray() as any[]) controlIds.set(row.fleet_launch_id, row.id);
       } catch { /* optional session-control store */ }
       // Machine aliasing (mark, never delete): records sharing a normalized
@@ -960,7 +980,8 @@ export class FleetService {
         sessions,
         host_resources: this.hostResources(),
         placement: this.placementOverview(),
-        subscriptions: this.sql.exec('SELECT * FROM fleet_subscriptions ORDER BY machine_id, service, account').toArray().map((s: any) => ({ machine_id: s.machine_id, account: s.account, service: s.service, plan: s.plan, observed_at: s.observed_at, stale: !fresh(s.observed_at, this.now(), 1200000), quota: parsed(s.quota_json) })),
+        subscriptions: this.sql.exec('SELECT * FROM fleet_subscriptions ORDER BY machine_id, service, account').toArray().map((s: any) => ({ machine_id: s.machine_id, account: canonicalAccountLabel(s.account), service: canonicalQuotaProvider(s.service), plan: s.plan, observed_at: s.observed_at, stale: !fresh(s.observed_at, this.now(), 1200000), quota: parsed(s.quota_json),
+          harness: [...(routeHarness.get(String(s.machine_id) + ' ' + String(s.account)) ?? [])].sort() })),
         launches: this.sql.exec('SELECT * FROM fleet_launches ORDER BY created_at DESC LIMIT 200').toArray().map((row: any) => { const { request_json, request_key, prompt, model_selection_json, ...view } = row; const selection = parsed(model_selection_json); return { ...view, rejected: row.state === 'queued' ? this.memoryRejections(row.id) : [], model_id: selection?.id ?? null, model: selection?.model ?? null, hub_session_id: controlIds.get(row.id) ?? null, access: parsed(request_json).access?.mode || 'legacy_unspecified', admission_hold: ['offered', 'starting', 'running', 'uncertain'].includes(row.state) ? this.admission.heldReason(row) : null }; }) });
     }
     if (path === '/api/fleet/claim-policy' && request.method === 'GET') {
@@ -1172,10 +1193,22 @@ export class FleetService {
       for (const sub of data.subscriptions) {
         if (!object(sub, ['service', 'account', 'plan', 'quota']) || !label(sub.account) || !PROVIDERS.has(sub.service) || (sub.plan !== null && (typeof sub.plan !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9 ._+-]{0,63}$/.test(sub.plan))) || labels.has(sub.account)) return response({ error: 'invalid_subscription' }, 400);
         labels.add(sub.account);
-        const mapped = this.sql.exec('SELECT a.label FROM fleet_accounts a JOIN fleet_routes r ON a.label = r.account WHERE r.machine_id = ? AND a.label = ? AND a.provider = ?', caller.machineId!, sub.account, sub.service).toArray();
+        // Canonical provider AND account match: a legacy `codex-orin` service
+        // report maps to an account registered under provider `codex`, and a
+        // legacy `urgent-muse` account report maps to `shared-go` — in either
+        // update order — so a half-updated fleet never fails the whole
+        // per-machine report with unmapped.
+        const canonicalService = canonicalQuotaProvider(sub.service);
+        const canonicalSubAccount = canonicalAccountLabel(sub.account);
+        const legacySubAccount = Object.entries(LEGACY_ACCOUNT_LABELS).find(([, c]) => c === canonicalSubAccount)?.[0];
+        if ([...labels].some((l) => canonicalAccountLabel(l as string) === canonicalSubAccount && l !== sub.account)) return response({ error: 'invalid_subscription', reason: 'duplicate_account' }, 400);
+        const mapped = this.sql.exec('SELECT a.label, a.provider FROM fleet_accounts a JOIN fleet_routes r ON a.label = r.account WHERE r.machine_id = ? AND (a.label = ? OR a.label = ? OR a.label = ?)', caller.machineId!, sub.account, canonicalSubAccount, legacySubAccount ?? sub.account).toArray()
+          .filter((row: any) => canonicalQuotaProvider(row.provider) === canonicalService);
         const quota = sanitizedQuota(sub.quota);
         if (!mapped.length || !quota || (quota.observed_at !== null && Date.parse(quota.observed_at) > this.now()) || (quota.status === 'ok' && !fresh(quota.observed_at, this.now(), 1200000))) return response({ error: 'subscription_unmapped_or_invalid', reason: !mapped.length ? 'unmapped' : !quota ? 'invalid_quota' : 'invalid_timestamp' }, 400);
-        clean.push({ ...sub, quota });
+        // Store canonical names so subscription reads join the canonical
+        // account registry regardless of which legacy name a host reported.
+        clean.push({ ...sub, account: canonicalSubAccount, service: canonicalService, quota });
       }
       return this.transaction(() => {
         const prior = new Map((this.sql.exec('SELECT account, quota_json FROM fleet_subscriptions WHERE machine_id = ?', caller.machineId!).toArray() as any[]).map(r => [r.account, r.quota_json]));

@@ -18,6 +18,9 @@ export const MAX_SPEND_VALUE = 1e15;
 export const ALLOWED_QUOTA_PROVIDERS = new Set<string>([
   "codex",
   // Orin's second Codex account (own CODEX_HOME, own ChatGPT token).
+  // Kept as a wire route key: one host snapshot carries both Codex homes and
+  // provider-keyed routes cannot hold two `codex` entries. All presentation,
+  // filtering and admission canonicalize it to `codex` (see below).
   "codex-orin",
   "claude",
   "gemini",
@@ -26,6 +29,90 @@ export const ALLOWED_QUOTA_PROVIDERS = new Set<string>([
   "go",
   "copilot",
 ]);
+
+/**
+ * Canonical provider model (fleet Usage/Quota mapping, 2026-10-26).
+ *
+ * - `codex-orin` is NOT a separate provider: it is a second Codex account
+ *   (model provider OpenAI) with its own account label. Canonical provider
+ *   is `codex`; the two Codex accounts are distinguished by account label
+ *   (`shared-codex` vs `codex-orin`).
+ * - `zai` (GLM via Z.ai) runs on the Codex harness: canonical harness
+ *   `codex`, provider `zai`, account `shared-zai`.
+ * - `go` (OpenCode Go subscription) runs on the OpenCode harness and serves
+ *   the whole OpenCode model pool, not just muse.
+ *
+ * Legacy wire route keys stay accepted on ingest (stored rows and host
+ * snapshots keyed by old names keep working); every output path
+ * canonicalizes via these helpers.
+ */
+export const LEGACY_QUOTA_ROUTE_PROVIDERS: Record<string, string> = {
+  "codex-orin": "codex",
+};
+
+export function canonicalQuotaProvider(routeKey: string): string {
+  return LEGACY_QUOTA_ROUTE_PROVIDERS[routeKey] ?? routeKey;
+}
+
+/** Canonical output providers: legacy wire route keys never appear here. */
+export function canonicalQuotaProviders(): string[] {
+  return [...ALLOWED_QUOTA_PROVIDERS].filter((p) => !(p in LEGACY_QUOTA_ROUTE_PROVIDERS));
+}
+
+/**
+ * Canonical harness (engine) for display: the native `zcodex` binary is a
+ * Codex harness serving the Z.ai model provider. Routing keeps the raw
+ * route engine; quota rows expose this canonical harness alongside the
+ * provider/account pair.
+ */
+export function canonicalHarness(engine: string): string {
+  return engine === "zcodex" ? "codex" : engine;
+}
+
+/** Legacy account labels accepted on ingest, canonicalized on output. */
+export const LEGACY_ACCOUNT_LABELS: Record<string, string> = {
+  // The OpenCode Go subscription serves the whole Go model pool (muse, glm,
+  // kimi and others); the old muse-only label must not imply muse-only.
+  "urgent-muse": "shared-go",
+};
+
+export function canonicalAccountLabel(label: string): string {
+  return LEGACY_ACCOUNT_LABELS[label] ?? label;
+}
+
+/** Reverse lookup: legacy wire route key for a canonical provider, if any. */
+export function legacyRouteKeyFor(canonicalProvider: string): string | null {
+  for (const [legacy, canonical] of Object.entries(LEGACY_QUOTA_ROUTE_PROVIDERS)) {
+    if (canonical === canonicalProvider) return legacy;
+  }
+  return null;
+}
+
+/**
+ * Pick the host-snapshot route that backs one fleet account. A snapshot is
+ * keyed by quota route key, not by account:
+ * - when the route key equals the account label and canonicalizes to the
+ *   account's provider, that route wins (the Orin second-Codex-home case:
+ *   label `codex-orin` -> provider `codex`);
+ * - otherwise the canonical provider route backs the account — unless the
+ *   label itself names a distinct quota home (a legacy route key with the
+ *   same canonical provider, e.g. `codex-orin`), which must never borrow the
+ *   shared provider route from a host that only has the other home.
+ */
+export function snapshotRouteForAccount(
+  accountLabel: string,
+  provider: string,
+  snapRoutes: Record<string, any> | null | undefined,
+): any | null {
+  if (!snapRoutes || typeof snapRoutes !== "object") return null;
+  const canonical = canonicalQuotaProvider(provider);
+  const labelRoute = (snapRoutes as Record<string, any>)[accountLabel];
+  if (labelRoute !== undefined) {
+    return canonicalQuotaProvider(accountLabel) === canonical ? labelRoute : null;
+  }
+  if (canonicalQuotaProvider(accountLabel) === canonical && accountLabel !== canonical) return null;
+  return (snapRoutes as Record<string, any>)[canonical] ?? null;
+}
 
 export const QUOTA_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS server_quota_snapshots (account TEXT PRIMARY KEY, provider TEXT NOT NULL, captured_at TEXT NOT NULL, quota_json TEXT NOT NULL);
@@ -269,12 +356,17 @@ export interface QuotaFleetAuth {
 
 export type CanonicalQuotaAuth = (request: Request) => Promise<QuotaFleetAuth>;
 
-/** Fleet-wide usage reads: human admins, fleet-launch agents, routing clients. Never hosts. */
+/** Fleet-wide usage reads: human admins, fleet-launch agents, routing clients, and hosts.
+ * Hosts may read only this sanitized usage projection (percentages, native
+ * amounts with unit labels, resets, freshness states); no tokens, cookies or
+ * transcripts ever travel here. This keeps `hub quota` working for
+ * host-credential operators (host kind, `host` scope). */
 export function fleetReadGrant(caller: QuotaFleetAuth["caller"], scopes?: string[]): boolean {
   if (!caller) return false;
   if (caller.isAdmin === true) return true;
   if (caller.kind === "agent" && Array.isArray(scopes) && scopes.includes("fleet:launch")) return true;
   if (caller.kind === "routing-client" && Array.isArray(scopes) && scopes.includes("routing:submit")) return true;
+  if (caller.kind === "host" && Array.isArray(scopes) && scopes.includes("host")) return true;
   return false;
 }
 
@@ -312,11 +404,16 @@ export function parseFleetQuotaFilters(reqUrl: URL): { ok: boolean; filters?: Fl
     if (v === null || v === "") return null;
     return v;
   };
+  // Legacy names stay accepted (stored rows and configs keyed by old names
+  // keep working) and canonicalize before validation: `codex-orin` filters
+  // the two Codex accounts, `urgent-muse` the Go pool account.
+  const rawProvider = pick("provider");
+  const rawAccount = pick("account");
   const filters: FleetQuotaFilters = {
     host_id: pick("host_id"),
-    provider: pick("provider"),
+    provider: rawProvider === null ? null : canonicalQuotaProvider(rawProvider),
     engine: pick("engine"),
-    account: pick("account"),
+    account: rawAccount === null ? null : canonicalAccountLabel(rawAccount),
   };
   if (filters.host_id !== null && !FLEET_HOST_ID.test(filters.host_id)) return { ok: false, error: "invalid_host_id" };
   if (filters.provider !== null && !ALLOWED_QUOTA_PROVIDERS.has(filters.provider)) return { ok: false, error: "invalid_provider" };
@@ -1257,7 +1354,12 @@ export class QuotaStore {
     for (const row of serverRows) {
       if (!rawAccounts.some(a => a.label === row.account)) rawAccounts.push({ label: row.account, provider: row.provider });
     }
+    // Stored rows keyed by old names (provider `codex-orin`) canonicalize to
+    // the provider model: `codex-orin` is an account under provider `codex`.
+    for (const a of rawAccounts) a.provider = canonicalQuotaProvider(a.provider);
+    for (const r of serverRows) { r.provider = canonicalQuotaProvider(r.provider); r.account = canonicalAccountLabel(r.account); }
     const knownProviders = new Set(rawAccounts.map((a: any) => a.provider));
+    const knownLabels = new Set(rawAccounts.map((a: any) => a.label));
     const extraAccounts: any[] = [];
     const allRoutes = this.sql.exec("SELECT * FROM fleet_routes ORDER BY machine_id, engine").toArray() as any[];
     const machines = (this.sql.exec("SELECT id FROM machines ORDER BY id").toArray() as any[])
@@ -1275,14 +1377,26 @@ export class QuotaStore {
       }
       if (!snapRoutes || typeof snapRoutes !== "object") continue;
       for (const prov of Object.keys(snapRoutes)) {
-        if (ALLOWED_QUOTA_PROVIDERS.has(prov) && !knownProviders.has(prov)) {
-          knownProviders.add(prov);
-          extraAccounts.push({ label: prov, provider: prov, max_concurrency: 1, reserve_percent: 0, enabled: 1 });
+        if (!ALLOWED_QUOTA_PROVIDERS.has(prov)) continue;
+        const canonical = canonicalQuotaProvider(prov);
+        if (!knownProviders.has(canonical)) {
+          knownProviders.add(canonical);
+          if (!knownLabels.has(prov)) {
+            knownLabels.add(prov);
+            extraAccounts.push({ label: prov, provider: canonical, max_concurrency: 1, reserve_percent: 0, enabled: 1 });
+          }
+        } else if (!knownLabels.has(prov) && canonicalQuotaProvider(prov) !== prov) {
+          // A legacy wire route key (e.g. `codex-orin`) whose canonical
+          // provider is already registered still identifies an account the
+          // registry has not named yet: surface it under its own label so
+          // the second Codex home is never silently merged away.
+          knownLabels.add(prov);
+          extraAccounts.push({ label: prov, provider: canonical, max_concurrency: 1, reserve_percent: 0, enabled: 1 });
         }
       }
     }
     const accounts = [...rawAccounts, ...extraAccounts].filter(
-      (a) => (!filters.provider || a.provider === filters.provider) && (!filters.account || a.label === filters.account)
+      (a) => (!filters.provider || canonicalQuotaProvider(a.provider) === filters.provider) && (!filters.account || canonicalAccountLabel(a.label) === filters.account)
     );
 
     const pools: Record<string, any>[] = [];
@@ -1315,15 +1429,19 @@ export class QuotaStore {
           continue;
         }
         // Single-account host snapshot fallback: same canonical rule as fleet observation().
-        if (route.profile !== null && route.profile !== account.provider) {
+        // A named profile that is not the provider itself cannot be read from
+        // a default single-route CLI reading (it cannot address a named
+        // profile or two accounts on one service).
+        if (route.profile !== null && route.profile !== canonicalQuotaProvider(account.provider)) {
           hasStale = true;
           continue;
         }
         const countRow: any = this.sql
           .exec(
-            "SELECT COUNT(DISTINCT r.account) AS n FROM fleet_routes r JOIN fleet_accounts a ON r.account = a.label WHERE r.machine_id = ? AND a.provider = ?",
+            "SELECT COUNT(DISTINCT r.account) AS n FROM fleet_routes r JOIN fleet_accounts a ON r.account = a.label WHERE r.machine_id = ? AND (a.provider = ? OR a.provider = ?)",
             route.machine_id,
-            account.provider
+            account.provider,
+            legacyRouteKeyFor(account.provider) ?? account.provider,
           )
           .one();
         const snap: any = this.sql.exec("SELECT * FROM host_quota_snapshots WHERE host_id = ?", route.machine_id).toArray()[0];
@@ -1337,7 +1455,7 @@ export class QuotaStore {
         } catch {
           snapRoutes = null;
         }
-        const quota = snapRoutes ? snapRoutes[account.provider] : null;
+        const quota = snapshotRouteForAccount(account.label, account.provider, snapRoutes);
         const obsTs = quota?.observed_at || snap.captured_at;
         if (quota && isFreshTs(obsTs, nowMs, QUOTA_STALE_MS)) {
           freshObs.push({ machine: route.machine_id, quota: quota.observed_at ? quota : { ...quota, observed_at: obsTs }, kind: "snapshot" });
@@ -1356,7 +1474,7 @@ export class QuotaStore {
           } catch {
             snapRoutes = null;
           }
-          const quota = snapRoutes ? snapRoutes[account.provider] : null;
+          const quota = snapshotRouteForAccount(account.label, account.provider, snapRoutes);
           const obsTs = quota?.observed_at || snap.captured_at;
           if (quota && isFreshTs(obsTs, nowMs, QUOTA_STALE_MS)) {
             freshObs.push({ machine: machineId, quota: quota.observed_at ? quota : { ...quota, observed_at: obsTs }, kind: "snapshot" });
@@ -1364,7 +1482,7 @@ export class QuotaStore {
         }
       }
 
-      const central = serverRows.find(r => r.account === account.label && r.provider === account.provider);
+      const central = serverRows.find(r => canonicalAccountLabel(r.account) === canonicalAccountLabel(account.label) && canonicalQuotaProvider(r.provider) === canonicalQuotaProvider(account.provider));
       let source = "machine-fallback";
       if (central) {
         let quota: any = null;
@@ -1398,9 +1516,13 @@ export class QuotaStore {
       } else if (hasStale) {
         state = "stale";
       }
+      const routeEngines = routes.length ? [...new Set(routes.map((r) => r.engine))].sort() : [canonicalQuotaProvider(account.provider)];
       pools.push({
-        provider: account.provider,
-        account: account.label,
+        // Canonical provider model: the second Codex account surfaces as
+        // provider `codex` (model provider OpenAI) with its own account, so
+        // grouping by provider shows both Codex accounts together.
+        provider: canonicalQuotaProvider(account.provider),
+        account: canonicalAccountLabel(account.label),
         state,
         source,
         windows: freshObs[0]?.quota.windows || {},
@@ -1408,8 +1530,13 @@ export class QuotaStore {
         observed_at: observedAt,
         collector_version: collectorVersion,
         observed_by_hosts: [...new Set(freshObs.map((o) => o.machine))].sort(),
-        engines: routes.length ? [...new Set(routes.map((r) => r.engine))].sort() : [account.provider === 'codex-orin' ? 'codex' : account.provider],
-        profiles: routes.length ? [...new Set(routes.map((r) => r.profile).filter((p: unknown) => p !== null))].sort() : (account.provider === 'codex-orin' ? ['codex-orin'] : []),
+        engines: routeEngines,
+        // Every quota row exposes both the harness (engine) and the
+        // provider/account pair: e.g. harness codex + provider codex +
+        // account shared-codex/orin, harness codex + provider zai + account
+        // shared-zai, harness opencode + provider go + account shared-go.
+        harness: [...new Set(routeEngines.map((e) => canonicalHarness(e)))].sort(),
+        profiles: routes.length ? [...new Set(routes.map((r) => r.profile).filter((p: unknown) => p !== null))].sort() : [],
       });
     }
 
@@ -1419,10 +1546,10 @@ export class QuotaStore {
       const snap = this.getSnapshot(machineId, nowMs);
       const body = snap.body as Record<string, any>;
       if (filters.provider && body.routes) {
-        body.routes = Object.fromEntries(Object.entries(body.routes).filter(([p]) => p === filters.provider));
+        body.routes = Object.fromEntries(Object.entries(body.routes).filter(([p]) => canonicalQuotaProvider(p) === filters.provider));
       }
       const subs = (this.sql.exec("SELECT * FROM fleet_subscriptions WHERE machine_id = ? ORDER BY service, account", machineId).toArray() as any[])
-        .filter((s) => (!filters.provider || s.service === filters.provider) && (!filters.account || s.account === filters.account))
+        .filter((s) => (!filters.provider || canonicalQuotaProvider(s.service) === filters.provider) && (!filters.account || canonicalAccountLabel(s.account) === filters.account))
         .map((s: any) => {
           let quota: any = null;
           try {
@@ -1430,8 +1557,13 @@ export class QuotaStore {
           } catch {
             quota = null;
           }
-          return { machine_id: s.machine_id, account: s.account, service: s.service, plan: s.plan, observed_at: s.observed_at,
-            stale: !isFreshTs(s.observed_at, nowMs, QUOTA_STALE_MS), quota };
+          // Harness serving this subscription, from the machine's routes for
+          // the account (canonicalized: native zcodex reads as harness codex).
+          const subEngines = [...new Set(allRoutes
+            .filter((r) => r.machine_id === s.machine_id && r.account === s.account)
+            .map((r) => canonicalHarness(r.engine)))].sort();
+          return { machine_id: s.machine_id, account: canonicalAccountLabel(s.account), service: canonicalQuotaProvider(s.service), plan: s.plan, observed_at: s.observed_at,
+            stale: !isFreshTs(s.observed_at, nowMs, QUOTA_STALE_MS), quota, engines: subEngines };
         });
       hosts.push({ host_id: machineId, snapshot: body, subscriptions: subs });
       if (snap.status === 200 && body.status === "ok") coverage.fresh.push(machineId);
@@ -1448,6 +1580,15 @@ export class QuotaStore {
         pools,
         hosts,
         coverage,
+        // Canonical name mappings applied to this view: legacy wire route
+        // keys and account labels (kept on ingest for backward compatibility
+        // with stored rows and host snapshots) and their canonical
+        // provider/harness/account names. UIs join per-window rows through it.
+        canonical: {
+          providers: { ...LEGACY_QUOTA_ROUTE_PROVIDERS },
+          engines: { zcodex: "codex" },
+          accounts: { ...LEGACY_ACCOUNT_LABELS },
+        },
         account_coverage: { total: pools.length,
           fresh: pools.filter(p => p.state === "fresh" || p.state === "exhausted").map(p => p.account),
           stale: pools.filter(p => p.state === "stale").map(p => p.account),
@@ -1473,24 +1614,32 @@ export class QuotaStore {
     const seen = new Set<string>();
     for (const row of data.accounts) {
       if (!isPlainObject(row) || Object.keys(row).some(k => !["account", "provider", "quota"].includes(k)) ||
-          typeof row.account !== "string" || !FLEET_LABEL.test(row.account) || seen.has(row.account)) {
+          typeof row.account !== "string" || !FLEET_LABEL.test(row.account)) {
         return jsonResponse({ error: "invalid_account" }, 400);
       }
-      seen.add(row.account);
+      // Dedupe on the canonical account: `urgent-muse` and `shared-go` (or
+      // a `codex-orin` route key under provider `codex`) are the same pool.
+      const account = canonicalAccountLabel(row.account);
+      if (seen.has(account)) return jsonResponse({ error: "invalid_account", reason: "duplicate_account" }, 400);
+      seen.add(account);
+      // Legacy names canonicalize on ingest: a `codex-orin` route key is the
+      // second Codex account (provider `codex`), `urgent-muse` the Go pool
+      // account (`shared-go`). Stored rows keyed by old names keep working.
+      const provider = canonicalQuotaProvider(row.provider);
       const valid = validateQuotaSnapshotPayload({ schema_version: "1.1", collector_version: "hub-server/1.0",
         captured_at: data.captured_at, host_id: "hub-server", status: "ok", error: null,
-        routes: { [row.provider]: row.quota } }, "hub-server", this.now());
+        routes: { [provider]: row.quota } }, "hub-server", this.now());
       if (!valid.ok || !ALLOWED_QUOTA_PROVIDERS.has(row.provider)) return jsonResponse({ error: "invalid_quota" }, 400);
-      const old: any = this.sql.exec("SELECT captured_at, quota_json FROM server_quota_snapshots WHERE account = ?", row.account).toArray()[0];
+      const old: any = this.sql.exec("SELECT captured_at, quota_json FROM server_quota_snapshots WHERE account = ?", account).toArray()[0];
       if (old && Date.parse(old.captured_at) >= valid.snapshot!.captured_at_ms) return jsonResponse({ error: "older_snapshot" }, 409);
-      const definition: any = this.sql.exec("SELECT provider FROM fleet_accounts WHERE label = ?", row.account).toArray()[0];
-      if (definition && definition.provider !== row.provider) return jsonResponse({ error: "provider_mismatch" }, 400);
-      const quota = valid.snapshot!.routes[row.provider];
+      const definition: any = this.sql.exec("SELECT provider FROM fleet_accounts WHERE label = ?", account).toArray()[0];
+      if (definition && canonicalQuotaProvider(definition.provider) !== provider) return jsonResponse({ error: "provider_mismatch" }, 400);
+      const quota = valid.snapshot!.routes[provider];
       if (old && quota.details.cooldown_until == null) {
         const deadline = JSON.parse(old.quota_json)?.details?.cooldown_until;
         if (typeof deadline === "string" && Date.parse(deadline) > this.now()) quota.details.cooldown_until = deadline;
       }
-      rows.push({ account: row.account, provider: row.provider, quota });
+      rows.push({ account, provider, quota });
     }
     if (!this.ctx) return jsonResponse({ error: "storage_unavailable" }, 503);
     this.ctx.storage.transactionSync(() => {

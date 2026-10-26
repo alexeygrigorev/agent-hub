@@ -14,7 +14,10 @@ def policy_models():
 def configured_selection(selection, engine, provider):
     if not isinstance(selection, dict):
         raise ValueError('model_unsupported: missing resolved model')
-    family = {'antigravity': 'gemini', 'opencode': 'go', 'codex-orin': 'codex'}.get(provider, provider)
+    family = {'antigravity': 'gemini', 'opencode': 'go',
+              # Legacy route configs keyed by the old `codex-orin` provider
+              # name still resolve to the canonical `codex` family.
+              'codex-orin': 'codex'}.get(provider, provider)
     # Native ZCode uses engine=zcodex; managed ZAI uses codex/profile=zcodex.
     policy_engine = 'codex' if family == 'zai' and engine == 'zcodex' else engine
     matches = [m for m in policy_models() if m['id'] == selection.get('id') and

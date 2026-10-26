@@ -193,7 +193,7 @@ The host advertises its operator `workspaces` map plus `workspace_roots`
 and re-registers every fleet cycle, picking up operator settings edits without
 a restart. If the running host release predates roots advertisement, roll it
 forward first; the remaining engine with live quota then places without
-`--engine` (currently Antigravity on Hetzner; the shared `urgent-muse`
+`--engine` (currently Antigravity on Hetzner; the shared `shared-go`
 opencode account is saturated by observed native sessions, so it honestly
 reports `account_capacity`). `allow_paid` stays false; no secrets are involved.
 

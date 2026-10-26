@@ -3,12 +3,18 @@
 Read-only projection over GET /api/quota?view=fleet. The DTO is usage-only
 (percentages, native amounts with unit labels, resets, freshness states);
 no tokens, cookies, emails, transcripts or private config ever travel here.
+
+Canonical provider model: `codex-orin` is not a provider choice — it is the
+second Codex account (provider `codex`, account `codex-orin`). Filter it with
+`--provider codex --account codex-orin`. The Go pool account is `shared-go`.
 """
 import json
 import re
 import urllib.parse
 
-ALLOWED_PROVIDERS = ("codex", "codex-orin", "claude", "gemini", "grok", "zai", "go", "copilot")
+# Canonical output providers only: legacy wire route keys (e.g. `codex-orin`,
+# still collected from quse snapshots) never appear as --provider choices.
+ALLOWED_PROVIDERS = ("codex", "claude", "gemini", "grok", "zai", "go", "copilot")
 LABEL_REGEX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 HOST_ID_REGEX = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
@@ -77,8 +83,10 @@ def render_text(data):
             continue
         remaining = pool.get("remaining_percent")
         left = "unknown" if remaining is None else "%s%%" % remaining
-        lines.append("%s/%s: %s (%s left, observed %s by %s)" % (
-            pool.get("provider", "?"), pool.get("account", "?"), pool.get("state", "unknown"),
+        harness = pool.get("harness") or pool.get("engines") or []
+        harness_text = ", ".join(h for h in harness if isinstance(h, str)) if isinstance(harness, list) else "unknown"
+        lines.append("%s/%s/%s: %s (%s left, observed %s by %s)" % (
+            harness_text or "unknown", pool.get("provider", "?"), pool.get("account", "?"), pool.get("state", "unknown"),
             left, pool.get("observed_at") or "never",
             ", ".join(pool.get("observed_by_hosts") or []) or "no host"))
     coverage = data.get("coverage") if isinstance(data.get("coverage"), dict) else {}

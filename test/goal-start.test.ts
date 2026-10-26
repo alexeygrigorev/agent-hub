@@ -29,7 +29,10 @@ it('advertises goal capability and filters non-Codex routes without requiring a 
   await runInDurableObject(e.HUB.get(e.HUB.idFromName(crypto.randomUUID())), async (hub: Hub, state) => {
     const s = new FleetService(hub.sql, cb => state.storage.transactionSync(cb)); s.init();
     for (const provider of ['codex', 'codex-orin', 'zai', 'claude', 'gemini', 'go']) {
+      // Canonical provider model: a legacy `codex-orin` row reads as provider
+      // `codex`, so both Codex accounts advertise goal support.
       expect(s.accountStatus({ label: provider, provider, max_concurrency: 1, reserve_percent: 15, enabled: true }).supports_goal).toBe(['codex', 'codex-orin', 'zai'].includes(provider));
+      expect(s.accountStatus({ label: provider, provider, max_concurrency: 1, reserve_percent: 15, enabled: true }).provider).toBe(provider === 'codex-orin' ? 'codex' : provider);
     }
     hub.sql.exec("INSERT INTO fleet_routes VALUES ('hetzner','claude','claude',NULL)");
     const p = s.plan({ mode: 'interactive', with_goal: true, workspace: 'demo', prompt: 'Fix binding' });

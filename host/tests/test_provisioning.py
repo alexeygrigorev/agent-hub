@@ -42,13 +42,16 @@ def test_codex_operator_wrapper_is_required_when_configured(tmp_path, monkeypatc
         p.engine_argv(bundle(), tmp_path)
 
 
-def test_managed_codex_orin_retains_separate_quota_service(monkeypatch):
+def test_managed_codex_orin_reports_canonical_codex_service(monkeypatch):
     record = {'label': 'codex-orin', 'provider': 'codex', 'revision': 'rev'}
     def read(path, fallback=None):
         return [record] if path.name == 'state.json' else {'quota_provider': 'codex-orin'}
     monkeypatch.setattr(p, 'read_json', read)
     sub = p.managed_subscriptions()[0]
-    assert sub['service'] == 'codex-orin'
+    # Canonical provider model: Orin's second Codex home reports service
+    # `codex` (its label stays `codex-orin`); the legacy quse route key
+    # `codex-orin` remains only inside the quota probe, never as a service.
+    assert sub['service'] == 'codex'
     assert sub['engine'] == 'codex'
     assert sub['account_label'] == 'codex-orin'
     assert sub['profile'] == 'hub-codex-orin'

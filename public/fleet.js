@@ -41,7 +41,7 @@ function render(data) {
     const section = document.createElement('article'); section.className = 'machine';
     const title = document.createElement('h3'); title.textContent = `${m.name || m.id} · ${m.drained ? 'drained' : fresh(m.last_checkin_at) ? 'online' : 'stale / offline'}${m.alias_of ? ` · alias of ${m.canonical_id || m.alias_of} (same physical host; reporting via ${m.canonical_id || m.alias_of})` : ''}`; section.append(title);
     const subscriptions = data.subscriptions.filter(s => s.machine_id === m.id);
-    section.append(table(['Service', 'Account label', 'Plan', 'Quota / used allowance / reset'], subscriptions.map(s => [s.service, s.account, s.plan, `${s.stale ? 'stale; ' : ''}${s.quota.status}; ` + Object.entries(s.quota.windows || {}).map(([name, w]) => `${name}: ${w.present ? `${w.percent_remaining ?? 'unknown'}% left / ${w.percent_remaining === null ? 'unknown' : 100 - w.percent_remaining}% used; reset ${w.reset_at || 'unknown'}` : 'not present'}`).join(' | ')])));
+    section.append(table(['Service', 'Harness', 'Account label', 'Plan', 'Quota / used allowance / reset'], subscriptions.map(s => [s.service, (s.harness && s.harness.length ? s.harness.join(', ') : 'unknown'), s.account, s.plan, `${s.stale ? 'stale; ' : ''}${s.quota.status}; ` + Object.entries(s.quota.windows || {}).map(([name, w]) => `${name}: ${w.present ? `${w.percent_remaining ?? 'unknown'}% left / ${w.percent_remaining === null ? 'unknown' : 100 - w.percent_remaining}% used; reset ${w.reset_at || 'unknown'}` : 'not present'}`).join(' | ')])));
     if (!subscriptions.length) { const p = document.createElement('p'); p.textContent = 'No subscription report. Configure this machine and enable its metadata collector.'; section.append(p); }
     root.append(section);
   }
@@ -108,20 +108,32 @@ function renderQuota(q) {
   if (!q || q.error) {
     const p = document.createElement('p'); p.textContent = q && q.error ? `Quota unavailable: ${q.error}` : 'Quota unavailable: no data.'; root.append(p); return;
   }
+  const canonical = (q && q.canonical) || {};
+  const canonProvider = p => (canonical.providers && canonical.providers[p]) || p;
+  const canonEngine = e => (canonical.engines && canonical.engines[e]) || e;
+  const canonAccount = a => (canonical.accounts && canonical.accounts[a]) || a;
   const pools = Array.isArray(q.pools) ? q.pools : [];
-  root.append(richTable(['Provider', 'Account', 'State', 'Remaining', 'Observed', 'Source'],
-    pools.map(p => [p.provider, p.account, quotaBadge(p.state),
+  const harnessOf = p => ((p.harness && p.harness.length ? p.harness : (p.engines || []).map(canonEngine))).join(', ') || 'unknown';
+  root.append(richTable(['Harness', 'Provider', 'Account', 'State', 'Remaining', 'Observed', 'Source'],
+    pools.map(p => [harnessOf(p), canonProvider(p.provider), canonAccount(p.account), quotaBadge(p.state),
       p.remaining_percent === null || p.remaining_percent === undefined ? 'unknown' : `${p.remaining_percent}%`,
       p.observed_at || 'never',
       p.source === 'server' ? 'Hub server' : `Machine fallback: ${(p.observed_by_hosts || []).join(', ') || 'unavailable'}`])));
-  const cov = q.account_coverage || {};
   const cp = document.createElement('p');
+  const cov = q.account_coverage || {};
   cp.textContent = `Coverage: ${((cov.fresh || []).length)} fresh, ${((cov.stale || []).length)} stale, ${((cov.unavailable || []).length)} unavailable of ${cov.total ?? '?'} accounts. Hub server probes are primary; machine reports are fallback.`;
   root.append(cp);
+  const poolsByProvider = new Map();
+  for (const p of pools) {
+    const key = canonProvider(p.provider);
+    if (!poolsByProvider.has(key)) poolsByProvider.set(key, []);
+    poolsByProvider.get(key).push(p);
+  }
+  const matchPools = routeKey => poolsByProvider.get(canonProvider(routeKey)) || [];
   const winRows = [];
   for (const p of pools.filter(p => p.source === 'server')) {
     for (const [name, w] of Object.entries(p.windows || {})) {
-      winRows.push(['Hub server', `${p.provider} / ${p.account}`, name, quotaBadge(p.state),
+      winRows.push(['Hub server', harnessOf(p), canonProvider(p.provider), canonAccount(p.account), name, quotaBadge(p.state),
         w.present && w.percent_remaining != null ? `${w.percent_remaining}%` : 'unknown', nativeText(w), w.reset_at || 'unknown']);
     }
   }
@@ -130,16 +142,19 @@ function renderQuota(q) {
     const routes = snap.routes && typeof snap.routes === 'object' ? snap.routes : {};
     for (const [provider, route] of Object.entries(routes)) {
       const windows = route && typeof route.windows === 'object' ? route.windows : {};
+      const matched = matchPools(provider);
+      const harness = [...new Set(matched.flatMap(p => (p.harness && p.harness.length ? p.harness : (p.engines || [])).map(canonEngine)))].join(', ') || 'unknown';
+      const accounts = [...new Set(matched.map(p => canonAccount(p.account)))].join(', ') || 'shared pool';
       for (const [name, w] of Object.entries(windows)) {
         const pct = !w || w.percent_remaining === null || w.percent_remaining === undefined ? 'unknown' : `${w.percent_remaining}%`;
-        winRows.push([h.host_id, provider, name, quotaBadge(quotaWindowState(snap, w)), pct, nativeText(w), (w && w.reset_at) || 'unknown']);
+        winRows.push([h.host_id, harness, canonProvider(provider), accounts, name, quotaBadge(quotaWindowState(snap, w)), pct, nativeText(w), (w && w.reset_at) || 'unknown']);
       }
     }
     for (const s of Array.isArray(h.subscriptions) ? h.subscriptions : []) {
-      if (s && s.stale) winRows.push([h.host_id, `${s.service} / ${s.account}`, 'subscription', quotaBadge('stale'), 'unknown', 'unknown', 'unknown']);
+      if (s && s.stale) winRows.push([h.host_id, ((s.engines || []).map(canonEngine).join(', ') || 'unknown'), canonProvider(s.service), canonAccount(s.account), 'subscription', quotaBadge('stale'), 'unknown', 'unknown', 'unknown']);
     }
   }
-  root.append(richTable(['Host', 'Provider', 'Window', 'State', 'Remaining', 'Native units', 'Reset'], winRows));
+  root.append(richTable(['Host', 'Harness', 'Provider', 'Account', 'Window', 'State', 'Remaining', 'Native units', 'Reset'], winRows));
 }
 function richTable(columns, rows) {
   const wrapper = table(columns, []); const body = wrapper.querySelector('tbody'); if (rows.length) body.replaceChildren();

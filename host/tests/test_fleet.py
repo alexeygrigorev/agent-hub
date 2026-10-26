@@ -311,11 +311,11 @@ class FleetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = settings(Path(tmp))
             cfg['launcher'] = {'argv': ['python3', '-m', 'launcher'], 'root': tmp, 'config_dir': str(Path(tmp) / 'config')}
-            cfg['subscriptions'][0].update(service='go', engine='opencode', account_label='urgent-muse', launcher_provider='opencode', launcher_model='opencode-go/muse-spark-1.3-contributor')
+            cfg['subscriptions'][0].update(service='go', engine='opencode', account_label='shared-go', launcher_provider='opencode', launcher_model='opencode-go/muse-spark-1.3-contributor')
             http = []
             def runner(argv, **kw):
                 if argv[0] == 'maintained-gate':
-                    return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'urgent-muse', 'observed_at': fleet.utcnow()}
+                    return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-go', 'observed_at': fleet.utcnow()}
                 if 'plan' in argv:
                     return {'eligible': [{'provider': 'opencode', 'model': 'opencode-go/muse-spark-1.3-contributor', 'task_fit': 1.0}]}
                 if 'run' in argv:
@@ -325,7 +325,7 @@ class FleetTests(unittest.TestCase):
             d = fleet.Dispatcher(cfg, lambda *a: http.append(a) or {}, runner)
             off = offer(mode='headless', prompt='Test goal')
             off['engine'] = 'opencode'
-            off['account'] = 'urgent-muse'
+            off['account'] = 'shared-go'
             result = d.dispatch(off)
             self.assertEqual(result['state'], 'failed')
             self.assertEqual(result['reason'], 'engine_auth_expired')

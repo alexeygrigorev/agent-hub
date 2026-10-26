@@ -17,7 +17,11 @@ from .session_rules import SESSION_PREAMBLE, compose_prompt
 from .retired_native import verify_native_retirement
 
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
-SERVICES = {"codex", "codex-orin", "claude", "grok", "gemini", "zai", "go", "copilot"}
+# Canonical quota services: `codex-orin` is not a service — it is the second
+# Codex account (service `codex`, account `codex-orin`). The quse wire route
+# key `codex-orin` is still collected by quota_snapshot; only this service
+# namespace is canonical.
+SERVICES = {"codex", "claude", "grok", "gemini", "zai", "go", "copilot"}
 WORKSPACE_SEG = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 
 

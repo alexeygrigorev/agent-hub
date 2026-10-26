@@ -295,14 +295,18 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     expect(pool.remaining_percent).toBe(60);
     expect(pool.observed_by_hosts.sort()).toEqual([hostA.machineId, hostB.machineId].sort());
 
-    // Filters narrow; host bearer and unauthenticated callers are denied the fleet view.
+    // Filters narrow; unauthenticated callers are denied the fleet view. Host
+    // bearers hold the read grant for this sanitized usage projection (AC5:
+    // `hub quota` works for host-credential operators).
     const filtered = (await (await doFetch(new Request('http://example.com/api/quota?view=fleet&provider=zai', { headers: { Cookie: sessionCookie } }))).json()) as any;
     expect(filtered.pools.every((p: any) => p.provider === 'zai')).toBe(true);
     expect(filtered.pools.some((p: any) => p.provider === 'codex')).toBe(false);
     const badFilter = await doFetch(new Request('http://example.com/api/quota?view=fleet&provider=nope', { headers: { Cookie: sessionCookie } }));
     expect(badFilter.status).toBe(400);
-    const hostDenied = await doFetch(new Request('http://example.com/api/quota?view=fleet', { headers: { Authorization: `Bearer ${hostA.accessToken}` } }));
-    expect(hostDenied.status).toBe(403);
+    const hostView = await doFetch(new Request('http://example.com/api/quota?view=fleet', { headers: { Authorization: `Bearer ${hostA.accessToken}` } }));
+    expect(hostView.status).toBe(200);
+    const hostBody = (await hostView.json()) as any;
+    expect(Array.isArray(hostBody.pools)).toBe(true);
     const anonDenied = await doFetch(new Request('http://example.com/api/quota?view=fleet'));
     expect(anonDenied.status).toBe(401);
 
@@ -338,11 +342,22 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     };
     expect((await quotaPost(hostA.accessToken, snapOrin)).status).toBe(200);
     const fleetWithOrin = (await (await doFetch(new Request('http://example.com/api/quota?view=fleet', { headers: { Cookie: sessionCookie } }))).json()) as any;
-    const orinPool = fleetWithOrin.pools.find((p: any) => p.provider === 'codex-orin');
+    // Canonical provider model: the second Codex home is provider `codex`
+    // with its own account, never a separate `codex-orin` provider. Grouping
+    // by provider shows both Codex accounts; every row exposes the harness.
+    const orinPool = fleetWithOrin.pools.find((p: any) => p.account === 'codex-orin');
     expect(orinPool).toBeDefined();
+    expect(orinPool.provider).toBe('codex');
     expect(orinPool.state).toBe('fresh');
     expect(orinPool.remaining_percent).toBe(99.0);
     expect(orinPool.observed_by_hosts).toContain(hostA.machineId);
+    expect(orinPool.harness).toContain('codex');
+    expect(fleetWithOrin.pools.some((p: any) => p.provider === 'codex-orin')).toBe(false);
+    expect(fleetWithOrin.canonical.providers['codex-orin']).toBe('codex');
+    // Legacy provider filter keeps working and selects both Codex accounts.
+    const legacyFiltered = (await (await doFetch(new Request('http://example.com/api/quota?view=fleet&provider=codex-orin', { headers: { Cookie: sessionCookie } }))).json()) as any;
+    expect(legacyFiltered.pools.length).toBeGreaterThan(0);
+    expect(legacyFiltered.pools.every((p: any) => p.provider === 'codex')).toBe(true);
 
     // Revoked credentials lose the grant.
     const stub = (defaultEnv as any).HUB.get((defaultEnv as any).HUB.idFromName('hub'));

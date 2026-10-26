@@ -1095,8 +1095,10 @@ def managed_subscriptions():
             pass
         meta = launcher_metadata(b['provider'], bundle)
         sub = {
-            'service': ('codex-orin' if b['provider'] == 'codex' and
-                        (bundle or {}).get('quota_provider') == 'codex-orin' else b['provider']),
+            # Canonical service model: the provider is the service. Orin's
+            # second Codex home reports service `codex` (account `codex-orin`,
+            # its label), never a separate `codex-orin` provider.
+            'service': b['provider'],
             'account_label': b['label'],
             'engine': PACKAGES[b['provider']][2],
             'profile': 'hub-' + b['label'],
