@@ -4,7 +4,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from agent_hub_host.native_sessions import run_native, SessionUncertain, MAX_NATIVE_OUTPUT
+from agent_hub_host.native_sessions import run_native, SessionUncertain, MAX_NATIVE_OUTPUT, MAX_NATIVE_CATALOG_OUTPUT
 
 
 class NativeCatalogBound(unittest.TestCase):
@@ -34,11 +34,23 @@ class NativeCatalogBound(unittest.TestCase):
         with self.assertRaises(SessionUncertain):
             self.call('[]', stderr='x' * (MAX_NATIVE_OUTPUT + 1))
 
+    def test_complete_catalog_above_ordinary_bound_uses_existing_fleet_budget(self):
+        # An already compact catalog cannot be repaired by whitespace removal.
+        # Keep all containment/identity metadata rather than dropping rows.
+        rows = [dict(id='one', tag='task-one', workspace='/repo',
+                     containment=dict(metadata='x' * (MAX_NATIVE_OUTPUT + 1)))]
+        text = json.dumps(rows, separators=(',', ':'))
+        for sdk in [False, True]:
+            with self.subTest(sdk=sdk):
+                proc = self.call(text, sdk=sdk)
+                self.assertEqual(json.loads(proc.stdout), rows)
+                self.assertLessEqual(len(proc.stdout.encode()), MAX_NATIVE_CATALOG_OUTPUT)
+
     def test_oversized_malformed_or_lossy_catalog_is_never_partial_evidence(self):
         padding = ' ' * MAX_NATIVE_OUTPUT
         for text in [padding + '[{"id":1,"id":2}]', padding + '[NaN]', padding + '{"rows":[]}',
-                     padding + '[broken', ' ' * (2 * MAX_NATIVE_OUTPUT + 1),
-                     '[{"text":"' + 'x' * MAX_NATIVE_OUTPUT + '"}]']:
+                     padding + '[broken', ' ' * (MAX_NATIVE_CATALOG_OUTPUT + 1),
+                     '[{"text":"' + 'x' * MAX_NATIVE_CATALOG_OUTPUT + '"}]']:
             with self.subTest(size=len(text)), self.assertRaises(SessionUncertain):
                 self.call(text)
 

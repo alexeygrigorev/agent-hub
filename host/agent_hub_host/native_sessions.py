@@ -89,6 +89,8 @@ MAX_BODY_BYTES = 16 * 1024  # bus limit, reused for prompt bodies
 MAX_CAPTURE_BYTES = 32 * 1024  # default bounded tail
 MAX_CAPTURE_LIMIT = 128 * 1024  # absolute capture ceiling for one call
 MAX_NATIVE_OUTPUT = 1024 * 1024  # native CLI stdout bound
+# Match Fleet's existing complete-catalog budget for up to 500 native rows.
+MAX_NATIVE_CATALOG_OUTPUT = 8 * MAX_NATIVE_OUTPUT
 NATIVE_TIMEOUT = 60.0  # single native call ceiling (send --enter may wait for readiness)
 QUICK_TIMEOUT = 30.0
 
@@ -269,12 +271,12 @@ def _bound_native_response(proc, args):
     size = len(proc.stdout.encode('utf-8', 'replace'))
     if size <= MAX_NATIVE_OUTPUT:
         return proc
-    # CLI pretty-print whitespace can exceed the same catalog's logical wire
-    # budget. Only list reads may normalize it, within a separate finite input
-    # budget; mutations and genuinely oversized catalogs remain uncertain.
+    # Complete catalogs include containment metadata for every native row.
+    # Only list reads use Fleet's existing finite catalog budget; mutations,
+    # status responses and error streams retain their ordinary 1 MiB bound.
     if (proc.returncode != 0 or not args or args[0] != 'list'
             or '--json' not in args or any(a not in ('list', '--all', '--json') for a in args)
-            or size > 2 * MAX_NATIVE_OUTPUT):
+            or size > MAX_NATIVE_CATALOG_OUTPUT):
         raise SessionUncertain('Native response exceeds bound; effect unknown')
 
     def unique_object(pairs):
@@ -293,7 +295,7 @@ def _bound_native_response(proc, args):
         if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
             raise ValueError('Catalog must contain complete object rows')
         compact = json.dumps(rows, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
-        if len(compact.encode('utf-8')) > MAX_NATIVE_OUTPUT:
+        if len(compact.encode('utf-8')) > MAX_NATIVE_CATALOG_OUTPUT:
             raise ValueError('Complete catalog exceeds bound')
     except (ValueError, UnicodeError, RecursionError):
         raise SessionUncertain('Native response exceeds bound; effect unknown') from None
