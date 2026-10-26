@@ -201,14 +201,23 @@ busy cores/percent, CPU PSI some/full, memory PSI full, OOM counter deltas,
 interval and observation time. PSI some and load average are display-only.
 The configurable CPU-full threshold defaults to 5%, memory-full to 1%.
 Known fresh full-pressure excess queues with `cpu_pressure` or `memory_pressure`.
-A new measured `/proc/vmstat oom_kill` delta produces `host_oom`; its timestamp
-survives subsequent clear or unknown heartbeat samples for the configured
-300-second cooldown. Verified session OOM/runtime-timeout/signal exits and
-fresh positively observed broken service workers produce `host_runtime_choking`.
-The collector's `worker_broken` result counts even without a status file;
-missing/stale status or a timed-out observer with an unknown worker does not.
-Authenticated positive service observations survive later healthy/unknown
-snapshots for the configured cooldown, then expire normally.
+The legacy `/proc/vmstat oom_kill` delta is diagnostic only: it also counts
+kills caused by isolated session limits. `host_oom_kills_delta` instead counts
+recent kernel OOM constraint records from the current boot. Global OOMs and
+limits on shared slices or the user manager produce `host_oom`; limiting
+session/workload scopes and container subtrees do not. The host uses the
+existing noninteractive sudo policy to read the kernel journal, with a bounded
+five-minute query and deduplicated events. An empty successful search is zero;
+access or query failures remain unknown. Genuine host events survive later
+clear or unknown heartbeats for the configured 300-second cooldown.
+Session OOM failures remain `engine_oom_killed` on that session and do not
+hold other placements. Verified runtime-timeout/signal exits produce
+`host_runtime_choking` during the configured cooldown. A current fresh service
+observation also holds admission when it explicitly reports `worker: broken`
+with `service_crash` or `service_timeout`. Generic `worker_broken` absence,
+missing/stale status and an observer timeout with an unknown worker do not
+establish a crash. Later healthy or unknown service snapshots clear that service
+observation; legacy generic runtime cooldown rows cannot keep admission held.
 Old measurements are not positive choking evidence. Unknown/malformed/stale
 telemetry stays visibly unknown and advisory, and does not fabricate healthy
 zeros or create a CPU hold by itself. Memory, quota and disk gates still apply.

@@ -115,7 +115,7 @@ export class ResourceManagement {
     const cooldown=new Date(this.now()-config.choking_cooldown_seconds*1000).toISOString();
     const event:any=this.sql.exec(`SELECT reason,observed_at FROM resource_choking_events WHERE machine_id=? AND observed_at>=? AND reason!='host_runtime_choking' ORDER BY observed_at DESC LIMIT 1`,machine,cooldown).toArray()[0];
     const runtime:any=this.sql.exec(`SELECT exit_reason,updated_at FROM fleet_launches WHERE machine_id=? AND updated_at>=?
-      AND state IN ('failed','exited') AND exit_reason IN ('engine_oom_killed','engine_runtime_timeout','engine_signal_exit')
+      AND state IN ('failed','exited') AND exit_reason IN ('engine_runtime_timeout','engine_signal_exit')
       ORDER BY updated_at DESC LIMIT 1`,machine,cooldown).toArray()[0];
     let serviceChoking=false; let serviceAt:string|null=null;
     if(this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='host_health_observations'").toArray().length) {

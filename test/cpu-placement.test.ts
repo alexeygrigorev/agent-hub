@@ -112,11 +112,19 @@ describe('CPU predictive placement integration',()=>{
   beat(8,{cpu_usage:{...freshCpu(iso(),8,8),memory_psi_full_avg10:2}});
   expect(f.reserve(req(),admin).value.rejected[0].reason).toBe('memory_pressure');
   sql.exec("INSERT INTO machines(id,name,hostname,registered_at,last_checkin_at,capabilities,last_heartbeat) SELECT 'oom-host',name,hostname,registered_at,last_checkin_at,capabilities,last_heartbeat FROM machines WHERE id='host'");
-  updateHeartbeat('oom-host',{type:'heartbeat',cpu_usage:{...freshCpu(iso()),oom_kills_delta:1}},sql);
+  updateHeartbeat('oom-host',{type:'heartbeat',cpu_usage:{...freshCpu(iso()),host_oom_kills_delta:1}},sql);
   sql.exec("UPDATE machines SET last_heartbeat=? WHERE id='oom-host'",JSON.stringify({cpu_usage:freshCpu(iso())}));expect(f.resources.cpuHeadroom('oom-host').reason).toBe('host_oom');
   sql.exec("UPDATE machines SET last_heartbeat='{}' WHERE id='oom-host'");expect(f.resources.cpuHeadroom('oom-host').reason).toBe('host_oom');
   sql.exec('UPDATE resource_choking_events SET observed_at=?',iso(-301000));
   expect(f.resources.cpuHeadroom('oom-host')).toMatchObject({admitted:true,telemetry_state:'unknown'});
+ }));
+ it('records a session OOM without blocking other placements',()=>fixture(async(f,sql,beat)=>{
+  beat(1,{cpu_usage:{...freshCpu(iso()),oom_kills_delta:1,host_oom_kills_delta:0}});
+  const start=f.reserve(req(),admin);expect(start.status).toBe(201);
+  sql.exec("UPDATE fleet_launches SET state='failed',exit_reason='engine_oom_killed' WHERE id=?",start.value.id);
+  expect(f.resources.cpuHeadroom('host')).toMatchObject({admitted:true,reason:null});
+  expect(sql.exec('SELECT exit_reason FROM fleet_launches WHERE id=?',start.value.id).one().exit_reason).toBe('engine_oom_killed');
+  expect(f.plan(req()).rejected || []).not.toEqual(expect.arrayContaining([expect.objectContaining({reason:'host_oom'})]));
  }));
  it('holds on verified session runtime failures or fresh service timeout/crash observations',()=>fixture(async(f,sql,beat)=>{
   const start=f.reserve(req(),admin);expect(start.status,JSON.stringify(start.value)).toBe(201);
