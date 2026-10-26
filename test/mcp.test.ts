@@ -51,6 +51,51 @@ beforeAll(async () => {
   cookie = (await createSessionCookie(defaultEnv, { sub, email: 'admin@fake.local', isAdmin: true, csrfToken: csrf, exp: Math.floor(Date.now() / 1000) + 3600 })).split(';')[0];
 });
 describe('Hub MCP protocol and parity', () => {
+  it('keeps the complete tool surface within the compact schema budget', () => {
+    const tools = publicTools();
+    expect(tools.map(tool => tool.name)).toEqual(MCP_ROUTES.map(route => route.name));
+    expect(new TextEncoder().encode(JSON.stringify({ tools })).length).toBeLessThanOrEqual(45000);
+    for (const route of MCP_ROUTES) {
+      const tool = tools.find(tool => tool.name === route.name)!;
+      expect(tool.annotations.destructiveHint).toBe(route.method !== 'GET' && route.name !== 'sessions_capture');
+      if (route.method !== 'GET') {
+        expect(tool.inputSchema.properties.payload).toMatchObject({ description: 'JSON request body.' });
+        expect(tool.inputSchema.properties).not.toHaveProperty('query');
+        // Legacy query arguments remain accepted by the runtime adapter.
+        const args = Object.fromEntries([...route.path.matchAll(/\{(\w+)\}/g)].map(match => [match[1], 'fixture']));
+        expect(() => toolRequest(origin, route.name, { ...args, query: {}, payload: {} }, 'Bearer fixture')).not.toThrow();
+      }
+    }
+  });
+  it('counts authenticated list/call attempts in bounded buckets without payloads', async () => {
+    await inHub(h => h.sql.exec('DELETE FROM mcp_tool_usage'));
+    await rpc('tools/list');
+    await rpc('tools/call', { name: 'status' });
+    await rpc('tools/call', { name: 'secret-unrecognized-tool', arguments: { payload: { secret: bearer } } });
+    await rpc('tools/list', undefined, 'invalid-bearer');
+    const response = await doFetch(new Request(origin + '/api/status', { headers: { Authorization: 'Bearer ' + bearer } }));
+    const data: any = await response.json();
+    expect(data.mcp_tool_usage).toEqual(expect.arrayContaining([
+      expect.objectContaining({ tool_name: 'tools/list', caller_kind: 'human', calls: 1 }),
+      expect.objectContaining({ tool_name: 'status', caller_kind: 'human', calls: 1 }),
+      expect.objectContaining({ tool_name: 'unknown', caller_kind: 'human', calls: 1 }),
+    ]));
+    expect(JSON.stringify(data.mcp_tool_usage)).not.toContain(bearer);
+    expect(JSON.stringify(data.mcp_tool_usage)).not.toContain('secret-unrecognized-tool');
+    await inHub(h => {
+      for (let i = 0; i < 500; i++) h.mcpUsage.record('untrusted-' + i, 'untrusted-' + i);
+      const rows = h.mcpUsage.summary();
+      expect(rows.filter((row: any) => row.caller_kind === 'other')).toEqual([
+        expect.objectContaining({ tool_name: 'unknown', calls: 500 }),
+      ]);
+      h.sql.exec("UPDATE mcp_tool_usage SET calls=9007199254740991 WHERE tool_name='unknown' AND caller_kind='other'");
+      h.mcpUsage.record('untrusted', 'untrusted');
+      expect(h.mcpUsage.summary().find((row: any) => row.caller_kind === 'other').calls).toBe(9007199254740991);
+    });
+    const reread: any = await (await doFetch(new Request(origin + '/api/status', { headers: { Authorization: 'Bearer ' + bearer } }))).json();
+    expect(reread.mcp_tool_usage.find((row: any) => row.tool_name === 'tools/list').calls).toBe(1);
+  });
+
   it.each([5, "5", 26, 100, "100", "101", 1000])('accepts MCP limit %s and clamps above 100', async limit => {
       const response: any = await (await rpc('tools/call', { name: 'intake_list', arguments: { query: { limit } } })).json();
       expect(JSON.parse(response.result.content[0].text)).toMatchObject({ status: 200, data: { effective_limit: Math.min(Number(limit), 100) } });

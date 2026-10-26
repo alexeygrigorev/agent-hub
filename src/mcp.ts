@@ -25,7 +25,7 @@ export async function boundedText(request: Request, limit = 32768): Promise<stri
   for (const part of chunks) { joined.set(part, offset); offset += part.byteLength; }
   return new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(joined);
 }
-export async function handleMcp(request: Request, authenticate: (r: Request) => Promise<any>, dispatch: (r: Request) => Promise<Response>) {
+export async function handleMcp(request: Request, authenticate: (r: Request) => Promise<any>, dispatch: (r: Request) => Promise<Response>, recordUsage: (tool: string, kind: string) => void = () => {}) {
   const url = new URL(request.url);
   const origin = request.headers.get('Origin');
   // No cookie authority: an MCP caller must explicitly present its bearer.
@@ -58,10 +58,12 @@ export async function handleMcp(request: Request, authenticate: (r: Request) => 
   }
   if (rpc.method === 'ping') return result({});
   if (rpc.method === 'tools/list') {
+    recordUsage('tools/list', auth.caller.kind);
     if (rpc.params?.cursor) return error(-32602, 'This tool list has no pagination cursor');
     return result({ tools: publicTools() });
   }
   if (rpc.method !== 'tools/call') return error(-32601, 'Method not found');
+  recordUsage(typeof rpc.params?.name === 'string' ? rpc.params.name : 'unknown', auth.caller.kind);
   if (typeof rpc.params?.name !== 'string') return error(-32602, 'Tool name required');
   let apiRequest: Request;
   try { apiRequest = toolRequest(url.origin, rpc.params.name, rpc.params.arguments ?? {}, request.headers.get('Authorization')!); }
