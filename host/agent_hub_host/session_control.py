@@ -434,6 +434,8 @@ def add_commands(sub):
     start.add_argument('--engine', help='Engine override (operators only; requires --reason explaining why)')
     start.add_argument('--reason', default=None, help='Explanation why this specific model/engine must be chosen (required when --engine is specified)')
     start.add_argument('--machine')
+    start.add_argument('--needs', action='append', default=None,
+                       help='Label filter (repeatable, e.g. --needs os:windows --needs arch:arm64); eligible machines must satisfy all needs, else held with rejected[] reason needs_unmet')
     start.add_argument('--workspace', required=True)
     start.add_argument('--task-kind', choices=['implement','review','ask','goal'], help='Task kind for measured resource placement and session statistics')
     start.add_argument('--tier', choices=TIERS, help='deep/daily/quick task tier for policy routing')
@@ -456,6 +458,8 @@ def add_commands(sub):
     override.add_argument('--engine', required=True, help='Specific model/engine to run')
     override.add_argument('--reason', required=True, help='Explanation why this specific model/engine must be chosen')
     override.add_argument('--machine')
+    override.add_argument('--needs', action='append', default=None,
+                          help='Label filter (repeatable, e.g. --needs os:windows --needs arch:arm64)')
     override.add_argument('--workspace', required=True)
     override.add_argument('--tier', choices=TIERS)
     override.add_argument('--cwd')
@@ -746,6 +750,14 @@ def _execute(args):
             value = getattr(args, field, None)
             if value:
                 payload[field] = value
+        needs = getattr(args, 'needs', None)
+        if needs:
+            if not isinstance(needs, list) or len(needs) > 64 or any(
+                    not isinstance(n, str) or not re.fullmatch(r'[a-z0-9][a-z0-9:_-]{0,95}', n) for n in needs):
+                raise ValueError('Invalid --needs label (lowercase [a-z0-9:_-], e.g. os:windows)')
+            if len(set(needs)) != len(needs):
+                raise ValueError('Duplicate --needs label')
+            payload['needs'] = list(needs)
         if getattr(args, 'task_kind', None) is not None:
             payload['task_kind'] = args.task_kind
         if getattr(args, 'intake_task_id', None):
