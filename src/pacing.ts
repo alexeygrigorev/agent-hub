@@ -435,9 +435,9 @@ export function loadProviderEfficiencies(sql: SqlStorage, nowMs: number): Map<st
     const knownFilter = cols.has('tokens_known') ? 'AND tokens_known = 1' : 'AND token_efficiency_eta > 0';
     const sinceMs = nowMs - 24 * HOUR;
     const rows = sql.exec(
-      `SELECT pool_id, AVG(token_efficiency_eta) AS avg_eta, COUNT(*) AS n
+      `SELECT pool_id, SUM(token_efficiency_eta * tokens_burned) / SUM(tokens_burned) AS avg_eta, COUNT(*) AS n
        FROM tbm_reward_events
-       WHERE timestamp_ms >= ? ${knownFilter} AND token_efficiency_eta > 0
+       WHERE timestamp_ms >= ? ${knownFilter} AND tokens_burned > 0
        GROUP BY pool_id`,
       sinceMs
     ).toArray() as any[];
@@ -445,7 +445,7 @@ export function loadProviderEfficiencies(sql: SqlStorage, nowMs: number): Map<st
     for (const r of rows) {
       const eta = Number(r.avg_eta);
       const count = Number(r.n) || 1;
-      if (!Number.isFinite(eta) || eta <= 0) continue;
+      if (!Number.isFinite(eta) || eta < 0) continue;
       // Smooth efficiency factor in [0.75, 1.25] centered at 1.0 for 50 VU/MTok nominal benchmark.
       const mult = Math.max(0.75, Math.min(1.25, 0.75 + 0.5 * (eta / (eta + 50))));
       const parts = String(r.pool_id || '').split(':');

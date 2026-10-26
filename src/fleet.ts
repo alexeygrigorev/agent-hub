@@ -14,6 +14,7 @@ import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
 import { freshCatalogs } from './catalog-freshness';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
 import { recordSessionTokens } from './tbm-controller';
+import { loadProviderPacing, loadPools, pacingFor, resetUrgency } from './pacing';
 
 export const FLEET_SCHEMA = `
 CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
@@ -627,6 +628,8 @@ export class FleetService {
     // whose (engine, profile) pair is a configured member of the tier, while
     // the existing score order still decides placement. An explicit engine
     // outside the tier simply matches nothing (honest no_eligible_route).
+    const pacing = loadProviderPacing(this.sql, this.now());
+    const pools = loadPools(this.sql);
     let tierModels: typeof policy.models | null = null;
     if (input.tier != null) {
       const tier = taskTier({ tier: input.tier });
@@ -737,8 +740,17 @@ export class FleetService {
       const observedSessions = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_sessions s WHERE s.machine_id = ? AND s.phase IN ('starting','running','broken','unknown','uncertain') AND NOT EXISTS (SELECT 1 FROM fleet_launches l WHERE l.machine_id = s.machine_id AND ${NATIVE_RESERVED} AND l.state IN ${ACTIVE})`, route.machine_id).one().n);
       if (limit && pending + observedSessions >= limit.max_agents) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'machine_capacity' }); continue; }
 
-      const score = (account!.remaining_percent! / 100) / (1 + hb.load[0] / caps.cpu_count + pending);
-      candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile, selection: model, score, workspace: effectiveWorkspace });
+      const tbm = pacingFor(pacing, account!.provider, route.account, account!.provider);
+      if (request.mode !== 'interactive' && tbm.halted) {
+        rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'tbm_admission_denied' }); continue;
+      }
+      const ownPools = pools.filter(p => p.account === route.account && p.reset_at_ms > this.now());
+      const urgency = ownPools.length ? Math.max(...ownPools.map(p => resetUrgency(p.headroom_percentage / 100,
+        (p.reset_at_ms - this.now()) / 3600000))) : 1;
+      const tbm_weight = request.mode === 'interactive' ? 1 : tbm.pacing * tbm.banked * (tbm.efficiency ?? 1) * urgency;
+      const score = (account!.remaining_percent! / 100) / (1 + hb.load[0] / caps.cpu_count + pending) * tbm_weight;
+      candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile,
+        selection: model, score, workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency } });
     }
     candidates.sort((a, b) => b.score - a.score || a.machine.localeCompare(b.machine) || a.engine.localeCompare(b.engine));
     // The stored intent carries the winner's normalized workspace: a bare

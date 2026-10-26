@@ -130,7 +130,7 @@ export class RoutingService {
             if (!adm.ok) subQuota = null;
           }
           const models = modelCandidates(input, { ...r, provider }, JSON.parse(ad.runners_json), subQuota, this.now(), pacing, unavailableEngines);
-          return models.map(model => ({ ...r, model, score: r.score * model.weight / model.headroom }));
+          return models.map(model => ({ ...r, model, score: r.score / (r.tbm_weight ?? 1) * model.weight / model.headroom }));
         });
         if (!routes.length) continue;
         // A banked tranche in its critical window preempts other routes (EDF), after an explicit runner preference.

@@ -4,6 +4,7 @@ import { FleetService, isCapacityOnlyHold } from '../src/fleet';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 import { SESSION_CONTROL_SCHEMA, SessionControlService } from '../src/session_control';
+import { tickTbm } from '../src/tbm-controller';
 
 const admin = { caller: { isAdmin: true, actor: 'test-admin', kind: 'human' }, scopes: ['admin'] };
 const host = (id: string) => ({ caller: { machineId: id, kind: 'host', actor: 'machine:' + id }, scopes: ['host'] });
@@ -40,6 +41,37 @@ async function configure(s: FleetService, shared = false) {
 }
 
 describe('generic accounts and launch placement', () => {
+  it('changes real Fleet placement for banked deadlines and excludes only the depleted account', async () => fixture(async (service, sql) => {
+    await configure(service);
+    const quota = (pct: number, banked = false) => ({ status: 'ok', observed_at: iso(-1000),
+      details: { limit_reached: false, ...(banked ? { banked_resets: [
+        { expires_at: iso(3600000), available: true, label: 'Full reset' },
+      ] } : {}) }, windows: { weekly: { present: true, percent_remaining: pct,
+        reset_at: iso(86400000), rolling: false } } });
+    for (const [machine, account] of [['hetzner', 'shared-codex'], ['win35', 'desktop-codex']]) {
+      const response = await service.handle(request('/subscriptions', { subscriptions: [{
+        service: 'codex', account, plan: 'pro', quota: quota(80),
+      }] }, 'PUT'), host(machine));
+      expect(response.status).toBe(200);
+    }
+    tickTbm(sql, now);
+    const baseline = service.plan(intent());
+    expect(baseline.selected?.account).toBe('shared-codex');
+    await service.handle(request('/subscriptions', { subscriptions: [{ service: 'codex', account: 'desktop-codex',
+      plan: 'pro', quota: quota(80, true) }] }, 'PUT'), host('win35'));
+    tickTbm(sql, now + 1000);
+    const urgent = service.plan(intent());
+    expect(urgent.selected?.account).toBe('desktop-codex');
+    expect(urgent.selected?.tbm.banked).toBeGreaterThan(1);
+    expect(urgent.selected?.tbm.pacing).toBeGreaterThan(1);
+    // One drained account must not deny the healthy account on the same provider.
+    const depleted = await service.handle(request('/subscriptions', { subscriptions: [{ service: 'codex', account: 'desktop-codex',
+      plan: 'pro', quota: { ...quota(3), observed_at: iso() } }] }, 'PUT'), host('win35'));
+    expect(depleted.status).toBe(200);
+    const low = service.plan(intent());
+    expect(low.selected?.account).toBe('shared-codex');
+    expect(low.candidates?.some((r: any) => r.account === 'desktop-codex')).toBe(false);
+  }));
   it('keeps configured Claude, native ZAI and Grok visible and routes policy models under allowed absolute workspace roots', async () => fixture(async (s, sql) => {
     const entries = [['shared-claude', 'claude', 'claude'], ['shared-zai', 'zai', 'zcodex'], ['shared-grok', 'grok', 'grok']];
     const config = {

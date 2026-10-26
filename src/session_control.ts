@@ -27,7 +27,7 @@ import { credentialActor } from './agent_registry';
 import { redact } from './routing';
 import { getScopeBlock } from './intake_scope';
 import { taskTier } from './model-routing';
-import { engineProvider, evaluateTbmAdmission, type TbmPoolRow } from './quota_admission';
+import { engineProvider, evaluateTbmAdmission, normalizeProviderFamily, type TbmPoolRow } from './quota_admission';
 import { ensureTbmQuotaSchema } from './quota';
 import { ensureTbmControllerSchema, recordSessionOutcomeReward } from './tbm-controller';
 import { approvalAuthorityMatches } from './host_enrollment';
@@ -283,7 +283,11 @@ export class SessionControlService {
     try {
       ensureTbmControllerSchema(this.sql);
       const pools = this.sql.exec('SELECT * FROM tbm_quota_pools').toArray() as unknown as TbmPoolRow[];
-      return evaluateTbmAdmission({ pools, provider: engine ? engineProvider(engine) : null, nowMs: this.now(), cycleMs: 7 * 86400000 });
+      const provider = engine ? engineProvider(engine) : null;
+      const accounts = [...new Set(pools.filter(p => provider !== null &&
+        normalizeProviderFamily(p.provider) === normalizeProviderFamily(provider)).map(p => p.account ?? 'default'))];
+      const results = accounts.map(account => evaluateTbmAdmission({ pools, provider, account, nowMs: this.now() }));
+      return results.find(result => result.ok) ?? results[0] ?? evaluateTbmAdmission({ pools, provider, nowMs: this.now() });
     } catch {
       return { ok: false as const, reason: 'malformed_pool' as const, pool_id: null, detail: 'tbm_read_failed' };
     }
