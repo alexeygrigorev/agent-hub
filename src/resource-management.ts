@@ -118,7 +118,11 @@ export class ResourceManagement {
     if(this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='host_health_observations'").toArray().length) {
       const health:any=this.sql.exec('SELECT payload_json,observed_at FROM host_health_observations WHERE machine_id=? AND observed_at>=?',machine,cooldown).toArray()[0];
       serviceAt=health?.observed_at ?? null;
-      serviceChoking=(parse(health?.payload_json).services || []).some((s:any)=>s.worker==='broken'&& /timeout|crash/i.test(String(s.reason)));
+      // The collector positively checks the native worker on each fresh report.
+      // Its actual failure reason is worker_broken; status-file age and reason
+      // describe a separate source and cannot erase that observed failure.
+      // An unknown worker (including a timed-out observer) is not a crash.
+      serviceChoking=(parse(health?.payload_json).services || []).some((s:any)=>s.worker==='broken');
     }
     const reason=event?.reason || (runtime || serviceChoking ? 'host_runtime_choking' : verdict.reason);
     const chokingAt=event?.observed_at || runtime?.updated_at || (serviceChoking ? serviceAt : null);

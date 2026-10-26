@@ -189,7 +189,9 @@ Known fresh full-pressure excess queues with `cpu_pressure` or `memory_pressure`
 A new measured `/proc/vmstat oom_kill` delta produces `host_oom`; its timestamp
 survives subsequent clear or unknown heartbeat samples for the configured
 300-second cooldown. Verified session OOM/runtime-timeout/signal exits and
-fresh broken-service timeout/crash observations produce `host_runtime_choking`.
+fresh positively observed broken service workers produce `host_runtime_choking`.
+The collector's `worker_broken` result counts even without a status file;
+missing/stale status or a timed-out observer with an unknown worker does not.
 Old measurements are not positive choking evidence. Unknown/malformed/stale
 telemetry stays visibly unknown and advisory, and does not fabricate healthy
 zeros or create a CPU hold by itself. Memory, quota and disk gates still apply.

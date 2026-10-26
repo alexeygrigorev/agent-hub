@@ -82,8 +82,18 @@ describe('CPU predictive placement integration',()=>{
   sql.exec('UPDATE fleet_launches SET updated_at=? WHERE id=?',iso(-301000),start.value.id);
   expect(f.resources.cpuHeadroom('host').admitted).toBe(true);
   const monitoring=new MonitoringService(sql,cb=>cb(),undefined,undefined,undefined,()=>now);monitoring.init();
-  sql.exec('INSERT INTO host_health_observations VALUES(?,?,?,?,?,?)','host',iso(),now,iso(),JSON.stringify({services:[{service_id:'controller',worker:'broken',reason:'service_crash'}]}),'test');
+  const health=(worker:string,reason:string)=>JSON.stringify({services:[{service_id:'controller',worker,reason,observed_at:null,status_file_age_s:null}]});
+  sql.exec('INSERT INTO host_health_observations VALUES(?,?,?,?,?,?)','host',iso(),now,iso(),health('unknown','aplexer_timeout'),'test');
+  expect(f.resources.cpuHeadroom('host').admitted).toBe(true);
+  sql.exec('UPDATE host_health_observations SET payload_json=?',health('alive','stale_status_file'));
+  expect(f.resources.cpuHeadroom('host').admitted).toBe(true);
+  // Actual collect_service_status DTO: native worker broken, no status source.
+  sql.exec('UPDATE host_health_observations SET payload_json=?',health('broken','worker_broken'));
   expect(f.resources.cpuHeadroom('host').reason).toBe('host_runtime_choking');
+  sql.exec('UPDATE host_health_observations SET payload_json=?',health('broken','stale_status_file'));
+  expect(f.resources.cpuHeadroom('host').reason).toBe('host_runtime_choking');
+  sql.exec('UPDATE host_health_observations SET observed_at=?',iso(-301000));
+  expect(f.resources.cpuHeadroom('host').admitted).toBe(true);
  }));
  it('preserves bounded local refusal math through a fenced no-start retry',()=>fixture(async(f,sql)=>{
   const start=f.reserve(req(),admin);expect(start.status).toBe(201);
