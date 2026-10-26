@@ -1281,8 +1281,8 @@ export class SessionControlService {
       // null / blank intake_task_id means "missing" so the TBM gate can return
       // intake_task_id_required instead of a generic invalid_session_request.
       if (input.intake_task_id === null || input.intake_task_id === '') delete input.intake_task_id;
-      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind'])) {
-        const allowed = new Set(['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind']);
+      if (!obj(input, ['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind'])) {
+        const allowed = new Set(['key', 'engine', 'engine_override_reason', 'tier', 'machine', 'needs', 'workspace', 'cwd', 'brief', 'access', 'mode', 'name', 'parent_id', 'intake_task_id', 'with_goal', 'task_kind']);
         const field = input && typeof input === 'object' && !Array.isArray(input)
           ? Object.keys(input).find(k => !allowed.has(k)) : undefined;
         return response({ error: 'invalid_session_request', ...(field ? { field, detail: 'unknown_field' } : { detail: 'invalid_object' }) }, 400);
@@ -1308,6 +1308,9 @@ export class SessionControlService {
       }
       if (input.intake_task_id !== undefined && (typeof input.intake_task_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.intake_task_id))) {
         return response({ error: 'invalid_session_request', field: 'intake_task_id', detail: 'invalid_intake_task_id' }, 400);
+      }
+      if (input.needs !== undefined && (!Array.isArray(input.needs) || input.needs.length > 64 || (input.needs as unknown[]).some((n: unknown) => typeof n !== 'string' || !/^[a-z0-9][a-z0-9:_-]{0,95}$/.test(n)) || new Set(input.needs).size !== input.needs.length)) {
+        return response({ error: 'invalid_session_request', field: 'needs', detail: 'invalid_needs' }, 400);
       }
       if (input.brief !== undefined && (typeof input.brief !== 'string' || !input.brief.trim() || input.brief.length > 8000)) {
         return response({ error: 'invalid_session_request', field: 'brief', detail: 'invalid_brief' }, 400);
@@ -1382,6 +1385,7 @@ export class SessionControlService {
           ...(input.task_kind !== undefined ? {task_kind:input.task_kind} : {}),
           engine: input.engine ?? null, engine_override_reason: (input as any).engine_override_reason ?? null,
           machine: input.machine ?? null,
+          ...(input.needs !== undefined ? {needs: input.needs} : {}),
           workspace: input.workspace, cwd: input.cwd ?? null, brief: input.brief ?? null,
           ...(input.with_goal === true ? { with_goal: true } : {}),
           mode, access: input.access ?? null, name: input.name ?? null,
@@ -1540,6 +1544,7 @@ export class SessionControlService {
         ...(input.task_kind !== undefined ? {task_kind:input.task_kind} : {}),
         ...(input.intake_task_id ? {project:parsed(this.sql.exec('SELECT data FROM intake_tasks WHERE id=?',input.intake_task_id).toArray()[0]?.data,{}).project} : {}),
         mode, machine: input.machine, engine: input.engine, tier: input.tier,
+        ...(input.needs !== undefined ? {needs: input.needs} : {}),
         workspace: input.workspace, cwd: input.cwd ?? null,
         prompt: input.brief || '', access: input.access, ...(input.with_goal === true ? { with_goal: true } : {}),
         idempotency_key: 'session-control-' + id,
@@ -1559,13 +1564,13 @@ export class SessionControlService {
           this.sql.exec('UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = NULL, engine = ?, state = ?, hold_json = ?, updated_at = ? WHERE id = ?',
             reserved.value.id, typeof reserved.value.engine === 'string' && reserved.value.engine ? reserved.value.engine : (input.engine ?? null), 'queued', queuedHold, at, id);
           const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
-          return finish(row, { queued: true, queue_position: reserved.value.queue_position ?? null, rejected: reserved.value.rejected ?? null, requested: { engine: input.engine ?? null, machine: input.machine ?? null, workspace: input.workspace } }, 202);
+          return finish(row, { queued: true, queue_position: reserved.value.queue_position ?? null, rejected: reserved.value.rejected ?? null, requested: { engine: input.engine ?? null, machine: input.machine ?? null, needs: input.needs ?? null, workspace: input.workspace } }, 202);
         }
         if (reserved.status >= 300) {
           const holdPayload = reserved.value !== undefined ? JSON.stringify(reserved.value) : null;
           this.sql.exec('UPDATE session_control_sessions SET state = ?, hold_json = ?, updated_at = ? WHERE id = ?', 'held', holdPayload, at, id);
           const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
-          return finish(row, { hold: reserved.value, requested: { engine: input.engine ?? null, machine: input.machine ?? null, workspace: input.workspace } }, 409);
+          return finish(row, { hold: reserved.value, requested: { engine: input.engine ?? null, machine: input.machine ?? null, needs: input.needs ?? null, workspace: input.workspace } }, 409);
         }
         this.sql.exec('UPDATE session_control_sessions SET fleet_launch_id = ?, machine_id = ?, engine = ?, state = ?, hold_json = NULL, updated_at = ? WHERE id = ?',
           reserved.value.id, reserved.value.machine ?? null, reserved.value.engine ?? null, reserved.value.state || 'offered', at, id);

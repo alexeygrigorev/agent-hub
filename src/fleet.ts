@@ -175,6 +175,7 @@ function label(value: unknown): value is string { return typeof value === 'strin
  * configured route. Unadvertised or unmapped paths are refused before any
  * claim or native effect. Host realpath/CWD confinement stays authoritative. */
 const WORKSPACE_SEG = /^[A-Za-z0-9._-]{1,64}$/;
+const NEEDS_LABEL = /^[a-z0-9][a-z0-9:_-]{0,95}$/;
 const WINDOWS_RESERVED = new Set([
   'CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$', 'CLOCK$',
   'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
@@ -675,8 +676,9 @@ export class FleetService {
   private planWithinMaintenance(input: any):
     { error: string; request?: undefined; selected?: undefined; candidates?: undefined; rejected?: undefined } |
     { error?: undefined; request: any; selected: any; candidates: any[]; rejected: { machine: string; engine: string; reason: string; memory?: any }[] } {
-    if (!object(input, ['mode', 'machine', 'engine', 'engine_override_reason', 'tier', 'account', 'workspace', 'cwd', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access', 'approved_action', 'with_goal', 'task_kind', 'project']) ||
+    if (!object(input, ['mode', 'machine', 'engine', 'engine_override_reason', 'tier', 'account', 'workspace', 'cwd', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access', 'approved_action', 'with_goal', 'task_kind', 'project', 'needs']) ||
       (input.project !== undefined && (typeof input.project !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.project))) ||
+      (input.needs !== undefined && input.needs !== null && (!Array.isArray(input.needs) || input.needs.length > 64 || input.needs.some((n: any) => typeof n !== 'string' || !NEEDS_LABEL.test(n)) || new Set(input.needs).size !== input.needs.length)) ||
       (input.task_kind !== undefined && !['implement','review','ask','goal'].includes(input.task_kind)) ||
       !workspaceOk(input.workspace) || (input.mode !== undefined && !['headless', 'interactive'].includes(input.mode)) ||
       (input.account !== undefined && !label(input.account)) || (input.machine !== undefined && !isValidMachineId(input.machine)) || (input.engine !== undefined && !label(input.engine)) ||
@@ -715,6 +717,8 @@ export class FleetService {
     if (input.account !== undefined) request.account = input.account;
     if (input.approved_action !== undefined) request.approved_action = input.approved_action;
     if (input.tier !== undefined) request.tier = input.tier;
+    const needs: string[] = Array.isArray(input.needs) ? [...input.needs] : [];
+    if (needs.length) request.needs = needs;
     const rejected: { machine: string; engine: string; reason: string; memory?: any }[] = []; const candidates: any[] = [];
     this.reconcileCapacity();
     // Planning below is read-only after reconciliation. Drop the snapshot
@@ -762,6 +766,26 @@ export class FleetService {
       }
       const machine: any = this.sql.exec('SELECT * FROM machines WHERE id = ?', route.machine_id).toArray()[0];
       const account = accounts.get(route.account); const caps = parsed(machine?.capabilities); const hb = parsed(machine?.last_heartbeat);
+      // Label filter (Tabo intake AC4): requested needs must be satisfied by
+      // the machine's advertised routing needs plus synthesized os:/arch:
+      // labels from registration (os=Windows/Linux, arch=arm64/amd64).
+      // A start requiring os:windows never lands on Hetzner; when no Windows
+      // host is online the intent holds with rejected[] reason needs_unmet.
+      if (needs.length) {
+        let routingNeeds: unknown = [];
+        try {
+          const rn: any = this.sql.exec('SELECT needs_json FROM routing_machines WHERE machine_id = ?', route.machine_id).toArray()[0];
+          if (rn) routingNeeds = JSON.parse(rn.needs_json);
+        } catch { routingNeeds = []; }
+        const labels = new Set<string>(Array.isArray(routingNeeds) ? (routingNeeds as unknown[]).filter((n): n is string => typeof n === 'string') : []);
+        if (typeof machine?.os === 'string' && machine.os.trim()) labels.add('os:' + machine.os.trim().toLowerCase());
+        const archRaw = typeof (machine as any)?.arch === 'string' ? (machine as any).arch.trim().toLowerCase() : '';
+        if (archRaw) labels.add('arch:' + archRaw);
+        if (!needs.every(n => labels.has(n))) {
+          rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'needs_unmet' });
+          continue;
+        }
+      }
       // Bare labels resolve per-route via that machine's advertised absolute
       // roots (`{root}/{label}`); absolutes and already-capable labels pass
       // through unchanged. Each candidate records its effective workspace so
@@ -933,7 +957,7 @@ export class FleetService {
         try { bound = JSON.parse(row.request_json); } catch { continue; }
         if (!bound || typeof bound !== 'object') continue;
         const input: any = { mode: bound.mode || 'headless', workspace: bound.workspace, prompt: bound.prompt ?? '', idempotency_key: 'drain-' + row.id };
-        for (const key of ['machine', 'engine', 'account', 'tier', 'cwd', 'parent_id', 'summary', 'approved_action', 'access', 'with_goal', 'task_kind', 'project']) {
+        for (const key of ['machine', 'engine', 'account', 'tier', 'cwd', 'parent_id', 'summary', 'approved_action', 'access', 'with_goal', 'task_kind', 'project', 'needs']) {
           if (bound[key] !== undefined && bound[key] !== null) input[key] = bound[key];
         }
         let plan: any;
