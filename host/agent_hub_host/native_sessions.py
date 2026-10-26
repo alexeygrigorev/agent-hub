@@ -262,6 +262,45 @@ def resolve_cwd(workspace_roots: list[str], cwd: str) -> str:
     raise SessionControlError(f"cwd escapes configured workspace roots: {cwd!r}")
 
 
+def _bound_native_response(proc, args):
+    """Normalize bounded read-only catalog formatting without dropping rows."""
+    if len(proc.stderr.encode('utf-8', 'replace')) > MAX_NATIVE_OUTPUT:
+        raise SessionUncertain('Native response exceeds bound; effect unknown')
+    size = len(proc.stdout.encode('utf-8', 'replace'))
+    if size <= MAX_NATIVE_OUTPUT:
+        return proc
+    # CLI pretty-print whitespace can exceed the same catalog's logical wire
+    # budget. Only list reads may normalize it, within a separate finite input
+    # budget; mutations and genuinely oversized catalogs remain uncertain.
+    if (proc.returncode != 0 or not args or args[0] != 'list'
+            or '--json' not in args or any(a not in ('list', '--all', '--json') for a in args)
+            or size > 2 * MAX_NATIVE_OUTPUT):
+        raise SessionUncertain('Native response exceeds bound; effect unknown')
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('Duplicate catalog key')
+            result[key] = value
+        return result
+
+    def invalid_constant(value):
+        raise ValueError('Non-JSON catalog constant')
+
+    try:
+        rows = json.loads(proc.stdout, object_pairs_hook=unique_object, parse_constant=invalid_constant)
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError('Catalog must contain complete object rows')
+        compact = json.dumps(rows, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
+        if len(compact.encode('utf-8')) > MAX_NATIVE_OUTPUT:
+            raise ValueError('Complete catalog exceeds bound')
+    except (ValueError, UnicodeError, RecursionError):
+        raise SessionUncertain('Native response exceeds bound; effect unknown') from None
+    proc.stdout = compact
+    return proc
+
+
 def run_native(
     executable: str,
     args: list[str],
@@ -280,10 +319,7 @@ def run_native(
     from .aplexer_client import client_call
     native = client_call(executable, args)
     if native is not None:
-        for stream in (native.stdout, native.stderr):
-            if len(stream.encode("utf-8", "replace")) > MAX_NATIVE_OUTPUT:
-                raise SessionUncertain("Native response exceeds bound; effect unknown")
-        return native
+        return _bound_native_response(native, args)
     try:
         proc = subprocess.run(
             [executable, *args],
@@ -300,10 +336,7 @@ def run_native(
         ) from exc
     except OSError as exc:
         raise SessionControlError(f"Native executable failed: {type(exc).__name__}") from exc
-    for stream in (proc.stdout, proc.stderr):
-        if len(stream.encode("utf-8", "replace")) > MAX_NATIVE_OUTPUT:
-            raise SessionUncertain("Native response exceeds bound; effect unknown")
-    return proc
+    return _bound_native_response(proc, args)
 
 
 def _parse_json_output(proc: subprocess.CompletedProcess, what: str) -> Any:
