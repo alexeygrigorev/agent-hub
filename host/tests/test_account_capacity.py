@@ -1,4 +1,5 @@
 import tempfile
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -7,6 +8,84 @@ from agent_hub_host.account_capacity import activity_ms, reconcile_unstarted, re
 
 
 class AccountCapacityTests(unittest.TestCase):
+    def test_headless_capacity_recovery_forwards_all_worker_statuses_and_runtime(self):
+        from agent_hub_host.fleet import Dispatcher
+        offer = '11111111-2222-4333-8444-555555555555'
+        native = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+        for status in ['done', 'failed', 'waiting-on-human', 'stuck', None]:
+            for journal_present in [False, True]:
+                with self.subTest(status=status, journal_present=journal_present), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    settings = {'version': 1, 'subscriptions': [], 'workspaces': {'main': tmp},
+                                'journal_dir': str(root / 'journal'),
+                                'launcher': {'argv': ['launcher'], 'root': tmp, 'config_dir': str(root / 'launcher')}}
+                    posts = []
+                    def request(method, path, payload=None):
+                        posts.append((method, path, payload))
+                        return {'id': offer, 'state': payload['state']}
+                    d = Dispatcher(settings, request=request, runner=Mock(return_value={
+                        'state': 'completed-awaiting-review', 'native_id': native, 'resources_reserved': False}))
+                    row = {'id': offer, 'native_id': native, 'engine': 'opencode', 'mode': 'headless',
+                           'launcher_task_id': 'hub-' + offer,
+                           'binding': {'native_id': native, 'tag': 'task-hub-' + offer,
+                                       'workspace': tmp, 'native_created_at_ms': 1000}}
+                    path = root / '.local/hub-results' / (offer + '.json')
+                    path.parent.mkdir(parents=True)
+                    if status:
+                        path.write_text(json.dumps({'status': status, 'report': 'Real worker result hubt_synthetic-private-value'}))
+                    if journal_present:
+                        d._active_launches[offer] = dict(offer_id=offer, native_id=native,
+                            task_id='hub-' + offer, tag='task-hub-' + offer, workspace=tmp,
+                            incarnation=1000, engine='opencode', mode='headless', state='running',
+                            settled=False, result_path='')  # repair an empty legacy path
+                    other = '99999999-2222-4333-8444-555555555555'
+                    d._active_launches[other] = dict(offer_id=other, native_id=native,
+                        task_id='hub-' + other, tag='task-hub-' + other, workspace=tmp,
+                        incarnation=1000, engine='opencode', mode='headless', state='running',
+                        settled=False, result_path=str(root / '.local/hub-results' / (other + '.json')))
+                    tomb = {'finished_at_ms': 2300, 'exit': {'code': 0, 'signal': None}}
+                    with patch('agent_hub_host.retired_native.verify_native_retirement', return_value=(True, tomb, 'verified')), \
+                         patch('agent_hub_host.fleet.verify_native_retirement', return_value=(True, tomb, 'verified')), \
+                         patch.object(d, '_check_headless_health', return_value=None), \
+                         patch.object(d, '_maybe_cleanup_worktree'):
+                        self.assertTrue(reconcile_retired(d, row))
+                    self.assertEqual(len(posts), 1)
+                    payload = posts[0][2]
+                    self.assertEqual(payload['report_status'], status or 'failed')
+                    self.assertEqual(payload['runtime']['exit_code'], 0)
+                    self.assertEqual(payload['runtime']['wall_time_ms'], 1300)
+                    self.assertEqual(payload['runtime']['outcome'], 'reported' if status else 'failed-without-report')
+                    self.assertNotIn('synthetic-private-value', json.dumps(payload))
+                    self.assertTrue(d._active_launches[offer]['settled'])
+                    self.assertEqual(d._active_launches[offer]['result_path'], str(path))
+                    self.assertFalse(d._active_launches[other]['settled'])
+
+    def test_headless_capacity_recovery_never_bypasses_live_launcher_reservation(self):
+        from agent_hub_host.fleet import Dispatcher
+        with tempfile.TemporaryDirectory() as tmp:
+            offer = '11111111-2222-4333-8444-555555555555'
+            native = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+            d = Dispatcher({'version': 1, 'subscriptions': [], 'workspaces': {'main': tmp},
+                            'journal_dir': str(Path(tmp) / 'journal'),
+                            'launcher': {'argv': ['launcher'], 'root': tmp, 'config_dir': tmp}},
+                           request=Mock(), runner=Mock(return_value={
+                               'state': 'running', 'native_id': native, 'resources_reserved': True}))
+            row = {'id': offer, 'native_id': native, 'mode': 'headless', 'engine': 'opencode',
+                   'binding': {'native_id': native, 'tag': 'task-hub-' + offer,
+                               'workspace': tmp, 'native_created_at_ms': 1000}}
+            d._active_launches[offer] = dict(offer_id=offer, native_id=native, task_id='hub-' + offer,
+                tag='task-hub-' + offer, workspace=tmp, incarnation=1000, engine='opencode',
+                mode='headless', state='running', settled=False, result_path='')
+            with patch('agent_hub_host.retired_native.verify_native_retirement', return_value=(True, {}, 'verified')), \
+                 patch('agent_hub_host.fleet.verify_native_retirement', return_value=(True, {}, 'verified')), \
+                 patch.object(d, '_check_headless_health', return_value=None):
+                self.assertFalse(reconcile_retired(d, row))
+            d.request.assert_not_called()
+            self.assertFalse(d._active_launches[offer]['settled'])
+            restarted = Dispatcher(d.settings)
+            self.assertEqual(restarted._active_launches[offer]['result_path'],
+                             str(Path(tmp) / '.local/hub-results' / (offer + '.json')))
+
     def test_failed_first_action_recovers_actual_native_instead_of_claiming_no_start(self):
         native = '11111111-1111-4111-8111-111111111111'
         binding = {'task_id': 'hub-launch', 'native_id': native, 'tag': 'task-hub-launch',

@@ -1492,7 +1492,7 @@ class Dispatcher:
         self._persist_launch_record(record)
         return {'id': offer_id, **payload, 'reason': diagnostic['reason']}
 
-    def reconcile_launches(self) -> list[dict[str, Any]]:
+    def reconcile_launches(self, offer_ids=None) -> list[dict[str, Any]]:
         """Reconcile pending owned headless launches via verified positive retirement,
         Launcher reconcile, and own-host Fleet confirmed-exit result.
         """
@@ -1508,6 +1508,8 @@ class Dispatcher:
         has_launcher = all(launcher.get(k) for k in ["argv", "root", "config_dir"])
 
         for offer_id, record in list(self._active_launches.items()):
+            if offer_ids is not None and offer_id not in offer_ids:
+                continue
             if record.get("settled") is True:
                 from .late_reports import deliver, cleanup
                 try:

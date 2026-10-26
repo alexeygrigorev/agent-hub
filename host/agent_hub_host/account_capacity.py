@@ -73,6 +73,8 @@ def reconcile_launcher_retired(dispatcher, row, cwd, *, dry_run=False):
             return False
         if dry_run:
             return True
+        if row.get('mode') == 'headless':
+            return reconcile_headless_retired(dispatcher, row, target)
         released = dispatcher.runner(prefix + ['reconcile', '--id', task_id, '--json'], cwd=launcher['root'])
         if released.get('native_id') != target.session_id or released.get('resources_reserved') is not False or released.get('state') != 'failed':
             return False
@@ -99,6 +101,8 @@ def reconcile_retired(dispatcher, row, *, dry_run=False):
             return False
         if dry_run:
             return True
+        if row.get('mode') == 'headless':
+            return reconcile_headless_retired(dispatcher, row, target)
         result = {'state': 'exited', 'confirmed_exit': True, 'native_id': row['native_id']}
         if row.get('launcher_task_id'):
             result['launcher_task_id'] = row['launcher_task_id']
@@ -108,6 +112,41 @@ def reconcile_retired(dispatcher, row, *, dry_run=False):
         # Missing/invalid tombstones, unreachable catalog and reused tags all
         # retain capacity. Never turn an unknown native effect into exit proof.
         return False
+
+
+def reconcile_headless_retired(dispatcher, row, target):
+    """Reuse the complete terminal contract instead of racing it with a bare exit.
+
+    Capacity recovery also sees ordinary owned headless launches. The native
+    tombstone alone must not bypass launcher release, worker report forwarding,
+    runtime evidence or the durable acknowledgement/late-file journal.
+    """
+    import re
+    from pathlib import Path
+    offer_id = row.get('id')
+    if not isinstance(offer_id, str) or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', offer_id):
+        return False
+    task_id = 'hub-' + offer_id
+    if row.get('launcher_task_id') not in (None, task_id) or target.tag != 'task-' + task_id:
+        return False
+    records = getattr(dispatcher, '_active_launches', None)
+    if not isinstance(records, dict):
+        return False
+    exact = dict(offer_id=offer_id, task_id=task_id, native_id=target.session_id,
+                 tag=target.tag, workspace=target.workspace, incarnation=target.created_at_ms,
+                 engine=target.engine, mode='headless')
+    result_path = str(Path(target.workspace) / '.local/hub-results' / (offer_id + '.json'))
+    record = records.get(offer_id)
+    if record is None:
+        record = {**exact, 'state': 'running', 'settled': False,
+                  'result_path': result_path}
+        records[offer_id] = record
+    elif not isinstance(record, dict) or any(record.get(k) != v for k, v in exact.items()):
+        return False
+    record['result_path'] = result_path
+    dispatcher._persist_launch_record(record)
+    results = dispatcher.reconcile_launches(offer_ids={offer_id})
+    return any(item.get('id') == offer_id and item.get('reconciled') is True for item in results)
 
 
 def activity_ms(session):
