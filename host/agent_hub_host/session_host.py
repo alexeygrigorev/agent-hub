@@ -484,6 +484,51 @@ def offers_step_once(dispatcher):
         print(json.dumps({'event': 'offers_error', 'type': type(error).__name__}), flush=True)
 
 
+def bindings_step_once(dispatcher):
+    """Report native identity without waiting for launcher first-action readiness."""
+    started = time.monotonic()
+    try:
+        dispatcher.report_catalog_bindings()
+        print(json.dumps({'event': 'bindings_cycle',
+                          'elapsed_s': round(time.monotonic() - started, 3)}), flush=True)
+    except Exception as error:
+        # Preserve dispatch and keep diagnostics bounded, including the common
+        # client ValueError form of a telemetry 400. Never log response bodies.
+        status = getattr(error, 'code', None)
+        if type(status) is not int:
+            status = 400 if 'status 400' in str(error) else None
+        print(json.dumps({'event': 'bindings_error', 'type': type(error).__name__,
+                          'http_status': status,
+                          'elapsed_s': round(time.monotonic() - started, 3)}), flush=True)
+
+
+def bindings_loop(dispatcher, stop, *, clock=time.monotonic):
+    """One observer for in-flight starts and a bounded late-adoption tail.
+
+    A launcher can await its child's first action for minutes. Its offer
+    thread cannot report bindings during that wait, and the slow maintenance
+    census is also minutes apart. Reuse the exact authoritative census and
+    its existing serialization; this observer never claims or starts work.
+    Idle controllers make no additional HTTP requests. A recovered journal
+    receives the same short tail to adopt native starts after a restart.
+    """
+    records = getattr(dispatcher, '_active_launches', None)
+    tail_until = clock() + 30 if isinstance(records, dict) and records else 0
+    while not stop.is_set():
+        started = clock()
+        inflight = getattr(dispatcher, '_inflight', 0)
+        active = type(inflight) is int and inflight > 0
+        if active:
+            tail_until = clock() + 30
+        if clock() < tail_until:
+            bindings_step_once(dispatcher)
+            if active:
+                # A slow census may have sampled before the last native was
+                # born. Keep a fresh followup even if dispatch ended meanwhile.
+                tail_until = clock() + 30
+        stop.wait(max(0, 5 - (clock() - started)))
+
+
 def maybe_start_named_thread(current, target, args, name):
     if current is not None and current.is_alive():
         return current
@@ -649,6 +694,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         telemetry_thread = None
         next_offers = 0
         offers_thread = None
+        bindings_thread = None
         count = 0
         # Operator fleet settings (workspaces map, workspace_roots,
         # subscriptions, launcher) are re-read when the file changes, so a
@@ -658,6 +704,8 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         # good settings (see maybe_reload_fleet_settings).
         settings_mtime = fleet_settings_mtime(settings_path)
         try:
+            bindings_thread = maybe_start_named_thread(
+                None, bindings_loop, (dispatcher, stop), 'fleet-bindings')
             while not stop.is_set() and (cycles is None or count < cycles):
                 # Apply settings between maintenance rounds, so an in-flight
                 # dispatch cannot mix the old allowlist with new credentials.
@@ -720,10 +768,13 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                 if cycles is None or count < cycles:
                     stop.wait(interval)
         finally:
+            stop.set()
             try:
                 drain_inflight_dispatch(dispatcher)
             except Exception:
                 pass
+            if bindings_thread is not None:
+                bindings_thread.join(timeout=1)
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
 
