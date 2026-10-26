@@ -193,12 +193,14 @@ describe('generic accounts and launch placement', () => {
     await configure(s);
     sql.exec("UPDATE fleet_accounts SET provider='gemini' WHERE label='shared-codex'");
     const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
-    for (const engine of ['antigravity', 'gemini']) {
+    // Duplicate model ids are forbidden: each engine alternative has its own
+    // policy id (argon for antigravity, argon-gemini for gemini).
+    for (const [engine, modelId] of [['antigravity', 'argon'], ['gemini', 'argon-gemini']] as const) {
       sql.exec("UPDATE fleet_routes SET engine=? WHERE machine_id='hetzner'", engine);
       sql.exec("UPDATE machines SET capabilities=? WHERE id='hetzner'", JSON.stringify({ engines: [engine], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }));
       await s.handle(request('/subscriptions', { subscriptions: [{ service: 'gemini', account: 'shared-codex', plan: 'pro', quota }] }, 'PUT'), host('hetzner'));
-      expect(s.plan(intent({ engine: 'argon' })).selected).toMatchObject({ machine: 'hetzner', engine, account: 'shared-codex', selection: { id: 'argon', model: 'gemini-4-argon-high' } });
-      expect(s.plan(intent({ tier: 'deep', engine })).selected?.selection).toMatchObject({ id: 'argon', model: 'gemini-4-argon-high' });
+      expect(s.plan(intent({ engine: modelId })).selected).toMatchObject({ machine: 'hetzner', engine, account: 'shared-codex', selection: { id: modelId, model: 'gemini-4-argon-high' } });
+      expect(s.plan(intent({ tier: 'deep', engine })).selected?.selection).toMatchObject({ id: modelId, model: 'gemini-4-argon-high' });
     }
   }));
   it('refuses disabled providers like grok with policy guidance even without a live route', async () => fixture(async (s, sql) => {

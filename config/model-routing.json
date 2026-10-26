@@ -4,6 +4,64 @@
   "account_aliases": {
     "shared-go": ["urgent-muse"]
   },
+  "accounts": [
+    {
+      "account": "shared-codex",
+      "harness": "codex",
+      "provider": "codex",
+      "aplexer_profile": "hub-shared-codex",
+      "credential": {"mode": "managed-bundle", "bundle": "shared-codex"},
+      "quota_probe": ["quse", "codex", "--json"]
+    },
+    {
+      "account": "codex-orin",
+      "harness": "codex",
+      "provider": "codex",
+      "aplexer_profile": "hub-codex-orin",
+      "credential": {"mode": "managed-bundle", "bundle": "codex-orin"},
+      "quota_probe": ["quse", "codex-orin", "--json"]
+    },
+    {
+      "account": "shared-claude",
+      "harness": "claude",
+      "provider": "claude",
+      "aplexer_profile": null,
+      "credential": {"mode": "host-home", "path": "~/.claude"},
+      "quota_probe": ["quse", "claude", "--json"]
+    },
+    {
+      "account": "shared-gemini",
+      "harness": "antigravity",
+      "provider": "gemini",
+      "aplexer_profile": null,
+      "credential": {"mode": "host-home", "path": "~/.gemini"},
+      "quota_probe": ["quse", "gemini", "--json"]
+    },
+    {
+      "account": "shared-zai",
+      "harness": "zcodex",
+      "provider": "zai",
+      "aplexer_profile": null,
+      "credential": {"mode": "host-home", "path": "~/.zcode"},
+      "quota_probe": ["quse", "zai", "--json"]
+    },
+    {
+      "account": "shared-grok",
+      "harness": "grok",
+      "provider": "grok",
+      "aplexer_profile": null,
+      "credential": {"mode": "host-home", "path": "~/.grok"},
+      "quota_probe": ["quse", "grok", "--json"]
+    },
+    {
+      "account": "shared-go",
+      "harness": "opencode",
+      "provider": "go",
+      "aplexer_profile": null,
+      "credential": {"mode": "host-home", "path": "~/.local/share/opencode"},
+      "quota_probe": ["quse", "go", "--json"]
+    }
+  ],
   "aliases": {
     "smart": "deep",
     "hard": "deep",
@@ -18,6 +76,7 @@
     "deep": [
       "astra",
       "argon",
+      "argon-gemini",
       "opus"
     ],
     "ask": [
@@ -28,12 +87,14 @@
     "review": [
       "opus",
       "astra",
-      "argon"
+      "argon",
+      "argon-gemini"
     ],
     "daily": [
       "sol",
       "sonnet",
       "glm-flash",
+      "glm-flash-zcodex",
       "muse",
       "deepseek-flash",
       "grok",
@@ -159,7 +220,7 @@
       "effort": "max"
     },
     {
-      "id": "glm-flash",
+      "id": "glm-flash-zcodex",
       "model": "glm-5.3-flash",
       "provider": "zai",
       "engine": "zcodex",
@@ -167,7 +228,7 @@
       "effort": "high"
     },
     {
-      "id": "argon",
+      "id": "argon-gemini",
       "model": "gemini-4-argon-high",
       "provider": "gemini",
       "engine": "gemini",

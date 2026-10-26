@@ -651,9 +651,9 @@ def module_command(handler, label, managed_dir=None):
     return [sys.executable, '-c', prefix + 'from agent_hub_host.provisioning import ' + handler + '; ' + handler + '()', label]
 
 
-def profiles(bundles):
+def profiles(bundles, path=None):
     """Replace only our marked block; refuse a collision with operator profiles."""
-    path = profile_path()
+    path = Path(path) if path else profile_path()
     # aplexer's ordinary TOML may originally be 0644. Tighten only this owned file
     # and its containing directory after no-follow ownership checks.
     with private_fs.parent(path, create=True, private=False) as anchor:
@@ -1179,6 +1179,16 @@ def managed_subscriptions():
             'admission_argv': module_command('admission', b['label']),
         }
         sub.update(meta)
+        try:
+            # Single source of truth (intake 7fd96369): the canonical catalog
+            # owns the quota probe for every account. Fail soft: a missing or
+            # invalid catalog must never break managed subscription assembly.
+            from .account_registry import policy_accounts
+            for account in policy_accounts():
+                if account["account"] == b["label"]:
+                    sub["quota_argv"] = list(account["quota_probe"])
+        except Exception:
+            pass
         subs.append(sub)
     return subs
 

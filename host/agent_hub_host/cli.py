@@ -379,11 +379,16 @@ def main():
         launch.add_argument('--parent', help='Parent hub launch id, omitted for a root request')
         launch.add_argument('--key', help='Stable idempotency key for retries')
     p_fleet = sub.add_parser('fleet', help='Authenticated machines, agents, sessions and account dashboard data')
-    p_fleet.add_argument('subcommand', nargs='?', choices=['probe', 'show', 'status'], help='Optional fleet subcommand')
+    p_fleet.add_argument('subcommand', nargs='?', choices=['probe', 'show', 'status', 'sync-host-config', 'doctor'], help='Optional fleet subcommand')
     p_fleet.add_argument('engine', nargs='?', help='Engine name for probe')
     p_fleet.add_argument('--status', choices=['ok', 'unavailable', 'failed'], default='ok')
     p_fleet.add_argument('--reason', default='manual_probe')
     p_fleet.add_argument('--machine', default=None)
+    p_fleet.add_argument('--config', default=None, help='Subscriptions file for sync-host-config/doctor (default host settings)')
+    p_fleet.add_argument('--aplexer-config', default=None, help='Aplexer config.toml for sync-host-config/doctor (default host aplexer config)')
+    p_fleet.add_argument('--fleet', default=None, help='Fleet snapshot file for doctor (default: live Hub fleet)')
+    p_fleet.add_argument('--write', action='store_true', help='sync-host-config writes files atomically (default is a dry run)')
+    p_fleet.add_argument('--skip-quse', action='store_true', help='doctor skips live quota probes')
     heartbeat = sub.add_parser('heartbeat', help='Report that this agent is alive (agent credential with health:report)')
     heartbeat.add_argument('--status', default='working', help='Short state word, for example working, idle or waiting')
     heartbeat.add_argument('--summary', help='Non-secret one-line summary shown on the dashboard (max 240 chars)')
@@ -606,6 +611,22 @@ def main():
                     if getattr(args, 'machine', None):
                         probe_payload['machine_id'] = args.machine
                     result = session_control.request('POST', '/api/fleet/probe', probe_payload)
+                elif getattr(args, 'subcommand', None) == 'sync-host-config':
+                    from . import account_registry
+                    accounts = account_registry.policy_accounts()
+                    settings_result = account_registry.sync_settings(args.config, accounts, write=args.write)
+                    aplexer_result = account_registry.sync_aplexer_profiles(args.aplexer_config, accounts, write=args.write)
+                    result = {'sync': settings_result, 'aplexer': aplexer_result}
+                elif getattr(args, 'subcommand', None) == 'doctor':
+                    from . import account_registry
+                    result = account_registry.doctor_command(
+                        settings_path=args.config, aplexer_path=args.aplexer_config,
+                        fleet_snapshot_path=args.fleet, machine=args.machine,
+                        skip_quse=args.skip_quse)
+                    print(json.dumps(result, indent=2))
+                    if result.get('problems'):
+                        sys.exit(1)
+                    return
                 else:
                     result = session_control.request('GET', '/api/fleet')
             elif args.cmd in ('subscriptions', 'fleet-host'):
