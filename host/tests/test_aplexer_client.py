@@ -22,12 +22,27 @@ def test_published_dependency_loads_native_client(tmp_path):
 def test_cpu_limited_start_uses_real_cli_not_client():
     """CPU-capped starts must reach the real CLI: the installed Client.start
     hardcodes cpu_quota_us=None, so client_call refuses the flags and run_json
-    falls back to subprocess (intake 354c03f0)."""
+    falls back to subprocess (intake 354c03f0). The Client import is lazy
+    (function-level `from aplexer import Client`), so patching
+    `aplexer.Client` intercepts any future path that lets CPU flags through.
+    """
+    cpu_argv = ['start', '--workspace', '/own', '--tag', 't',
+                '--engine', 'shell', '--memory', '1500M', '--pids', '256',
+                '--cpu-quota-us', '100000', '--cpu-period-us', '100000',
+                '--json']
     with patch('aplexer.Client', side_effect=AssertionError('Client must not receive CPU flags')):
-        assert client_call('aplexer', ['start', '--workspace', '/own', '--tag', 't',
-                                       '--engine', 'shell', '--memory', '1500M', '--pids', '256',
-                                       '--cpu-quota-us', '100000', '--cpu-period-us', '100000',
-                                       '--json']) is None
+        assert client_call('aplexer', cpu_argv) is None
+    # Discrimination: the same argv WITHOUT the CPU flags is accepted by the
+    # client path, proving the refusal above is caused by the CPU flags alone.
+    plain_argv = ['start', '--workspace', '/own', '--tag', 't',
+                  '--engine', 'shell', '--memory', '1500M', '--pids', '256',
+                  '--json']
+    client = Mock()
+    client.start.return_value.raw = {'id': 'new-id'}
+    with patch('aplexer.Client', return_value=client):
+        receipt = client_call('aplexer', plain_argv)
+    assert receipt is not None and receipt.returncode == 0
+    assert json.loads(receipt.stdout) == {'id': 'new-id'}
 
 
 def test_scoped_target_resolves_uuid_and_kill_signal():
