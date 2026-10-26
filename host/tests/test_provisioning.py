@@ -529,6 +529,9 @@ def test_admission_payload_matching(tmp_path, monkeypatch):
     b = bundle()
     monkeypatch.setattr(p, 'root', lambda: m_dir)
     monkeypatch.setattr(p, 'host_request', lambda m, p, pl: {'launch_allowed': True, 'profile_supported': True})
+    # Intake 59a6f44a: host-side Codex gate is authoritative; synthetic test
+    # bundles have no real quota, so approve the gate explicitly here.
+    monkeypatch.setattr(p, 'check_codex_quota_gate', lambda env: (True, 'ok'))
 
     # Prepare bundle on disk
     dest = m_dir / f"{b['label']}-{b['revision']}"

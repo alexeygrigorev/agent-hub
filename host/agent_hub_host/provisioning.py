@@ -1437,6 +1437,32 @@ def admission():
                 result['launch_allowed'] = False
                 result['reason'] = 'model_mismatch'
 
+    # Host-side Codex quota gate (intake 59a6f44a): the managed bundle's
+    # refresh token can go stale independently of ~/.codex. Server-side
+    # accountStatus may still read fresh until the next server probe, so
+    # admission must refuse here with a specific slug. Canonical root is
+    # provisioning.root() (default ~/.config/agent-hub/managed-engines);
+    # both interactive dispatch and launcher headless use this root.
+    if bundle is not None and isinstance(bundle, dict) and bundle.get('provider') == 'codex':
+        try:
+            with lock():
+                state = read_json(root() / 'state.json', [])
+                record = next((b for b in state if b.get('label') == label), None)
+                if record is not None:
+                    dest = root() / (label + '-' + record['revision'])
+                    home = dest / 'home'
+                    env = engine_environment(bundle, home, dest)
+                    allowed, gate_reason = check_codex_quota_gate(env)
+                    if not allowed:
+                        slug = str(gate_reason or 'quota_unavailable')
+                        slug = ''.join(c if (c.isalnum() or c == '_') else '_' for c in slug)[:64] or 'quota_unavailable'
+                        result['launch_allowed'] = False
+                        result['reason'] = 'codex_quota_gate_' + slug
+        except Exception:
+            result['launch_allowed'] = False
+            if not isinstance(result.get('reason'), str) or not result.get('reason'):
+                result['reason'] = 'codex_quota_gate_quota_check_failed'
+
     print(json.dumps(result))
 
 

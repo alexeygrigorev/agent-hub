@@ -1403,6 +1403,13 @@ class Dispatcher:
                 raise ValueError("Invalid task id")
         gate = self.runner(sub["admission_argv"], payload={k: offer.get(k) for k in ["mode", "engine", "profile", "account", "workspace", "selection"]})
         if gate.get("launch_allowed") is not True or gate.get("profile_supported") is not True or gate.get("account_label") != sub["account_label"]:
+            gate_reason = gate.get("reason") if isinstance(gate.get("reason"), str) else ""
+            # Preserve host-side gate slugs (intake 59a6f44a AC3/AC4): a managed
+            # Codex quota-gate refusal must surface as codex_quota_gate_* in
+            # rejected[]/launch_error, never a silent stopped/session_not_bound.
+            if gate_reason.startswith("codex_quota_gate_"):
+                slug = ''.join(c if (c.isalnum() or c == '_') else '_' for c in gate_reason)[:64]
+                raise ValueError(slug + ": managed Codex quota gate refused launch before execution")
             raise ValueError("Fresh admission refused")
         if (offer.get('task_id') or (selection and sub.get("account_label") in self._managed_labels)) and (gate.get('model_supported') is not True or gate.get('model') != selection['model'] or gate.get('effort') != selection['effort']):
             raise ValueError('Selected model/effort requires verified admission')

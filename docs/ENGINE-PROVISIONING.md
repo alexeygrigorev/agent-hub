@@ -220,6 +220,15 @@ claimed. Existing per-provider credential expiry or provider revocation can requ
 renewal. The current slice does not centralize Codex refresh-token rotations; if a
 copied cache stops refreshing, re-import its current cache once.
 
+## Canonical managed-engine root (intake 59a6f44a AC1)
+
+One source of truth: `host/agent_hub_host/provisioning.py::root()`.
+
+- Default: `~/.config/agent-hub/managed-engines` (`config.get_host_config_path().parent / 'managed-engines'`).
+- Override: `AGENT_HUB_MANAGED_DIR` (or legacy `HUB_MANAGED_DIR`) when explicitly set.
+- Interactive dispatch (`host/agent_hub_host/fleet.py` `provisioning.module_command('execute', ...)` embeds `AGENT_HUB_MANAGED_DIR=<root>`) and launcher headless starts (`fleet.py` sends `payload["managed_dir"] = str(provisioning.root())`, launcher `fetch_managed_quse` falls back to `AGENT_HUB_MANAGED_DIR` then `~/.config/agent-hub/managed-engines`) use the same root per account. Refresh-token rotation in one copy must never break another because there is only one live copy per host; `~/git/agent-hub/.local/placement-recovery/managed-engines` is a legacy recovery snapshot and is not used by the active host (`agent-hub-session-host.service` sets `AGENT_HUB_MANAGED_DIR=/home/alexey/.config/agent-hub/managed-engines`).
+- Healing a stale managed home runs through the normal provisioning/reconcile path (`hub engines sync` on the host, which re-installs the central bundle and re-applies `provision_managed_home`); never hand-copy secrets or print tokens. Verify with `quse codex --json` status `ok` and `check_codex_quota_gate -> (True, 'ok')` in that home (HOME set to the bundle home, since `quse codex` reads `Path.home()/.codex/auth.json`).
+
 ## Multiple profiles and the same launch everywhere
 
 Each managed label is an account, with its own HOME, credential files, aplexer

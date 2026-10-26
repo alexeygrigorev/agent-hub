@@ -16,6 +16,10 @@ MESSAGES = {
     'admission_unconfigured': 'This local route has no maintained fresh admission adapter.',
     'admission_refused': 'Fresh admission refused this account or could not verify its timestamp and model.',
     'engine_auth_expired': 'The engine authentication is unavailable or expired.',
+    'codex_quota_gate_quota_unavailable': 'The managed Codex account quota gate refused launch before execution.',
+    'codex_quota_gate_codex_reserve_15_percent_required': 'The managed Codex account is below the 15% weekly reserve.',
+    'codex_quota_gate_stale_window_evidence': 'The managed Codex quota evidence is stale.',
+    'codex_quota_gate_quota_check_failed': 'The managed Codex quota check failed.',
 }
 EXACT = {
     'Local account/profile/workspace is not configured': 'dispatch_route_unconfigured',
@@ -40,7 +44,14 @@ def classify(exc, *, workspace_available=True):
     if isinstance(exc, ValueError):
         value = str(exc)
         prefix = value.split(':', 1)[0]
-        reason = prefix if prefix in {'model_unsupported', 'admission_unconfigured', 'engine_auth_expired'} else EXACT.get(value, reason)
+        if prefix.startswith('codex_quota_gate_'):
+            slug = ''.join(c if (c.isalnum() or c == '_') else '_' for c in prefix)[:64]
+            if slug in MESSAGES:
+                reason = slug
+            else:
+                reason = 'codex_quota_gate_quota_unavailable'
+        else:
+            reason = prefix if prefix in {'model_unsupported', 'admission_unconfigured', 'engine_auth_expired'} else EXACT.get(value, reason)
         if value.startswith('HTTP request failed with status '):
             reason = 'dispatch_claim_refused'
     elif isinstance(exc, (RuntimeError, OSError)):

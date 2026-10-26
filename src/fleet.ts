@@ -108,7 +108,11 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   "model_unsupported": "The selected model or effort is unsupported by this local route.",
   "admission_unconfigured": "This local route has no maintained fresh admission adapter.",
   "admission_refused": "Fresh admission refused this account or could not verify its timestamp and model.",
-  "engine_auth_expired": "The engine authentication is unavailable or expired."
+  "engine_auth_expired": "The engine authentication is unavailable or expired.",
+  "codex_quota_gate_quota_unavailable": "The managed Codex account quota gate refused launch before execution.",
+  "codex_quota_gate_codex_reserve_15_percent_required": "The managed Codex account is below the 15% weekly reserve.",
+  "codex_quota_gate_stale_window_evidence": "The managed Codex quota evidence is stale.",
+  "codex_quota_gate_quota_check_failed": "The managed Codex quota check failed."
 };
 const INCIDENTAL_REASONS = new Set(['machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'engine_tool_permission_refused', 'admission_unconfigured']);
 /** Capacity-only placement failure: every rejected route reports transient

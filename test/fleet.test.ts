@@ -617,7 +617,7 @@ describe('generic accounts and launch placement', () => {
     expect(account.active).toBe(1);
     expect(account.available_slots).toBe(account.max_concurrency - 1);
   }));
-  it.each(['workspace_unavailable', 'admission_unconfigured', 'admission_refused', 'dispatch_refused', 'goal_startup_unconfigured', 'dispatch_route_unconfigured', 'dispatch_internal_error'])('rejects only unclaimed own-host offers with explicit %s', async reason => fixture(async (s, sql) => {
+  it.each(['workspace_unavailable', 'admission_unconfigured', 'admission_refused', 'dispatch_refused', 'goal_startup_unconfigured', 'dispatch_route_unconfigured', 'dispatch_internal_error', 'codex_quota_gate_quota_unavailable', 'codex_quota_gate_codex_reserve_15_percent_required', 'codex_quota_gate_stale_window_evidence', 'codex_quota_gate_quota_check_failed'])('rejects only unclaimed own-host offers with explicit %s', async reason => fixture(async (s, sql) => {
     await configure(s);
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
     const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
