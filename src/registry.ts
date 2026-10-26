@@ -228,12 +228,14 @@ export async function handleRegistryRoutes(
 
     const hostname = body.hostname;
     const os = body.os;
+    const arch = body.arch ?? '';
     const network = body.network;
     const roles = body.roles;
     const capabilities = body.capabilities;
 
     if (typeof hostname !== 'string' || hostname.length > 256) return Response.json({ error: 'invalid_hostname' }, { status: 400 });
     if (typeof os !== 'string' || os.length > 256) return Response.json({ error: 'invalid_os' }, { status: 400 });
+    if (typeof arch !== 'string' || arch.length > 64 || (arch !== '' && !/^[A-Za-z0-9._-]{1,64}$/.test(arch))) return Response.json({ error: 'invalid_arch' }, { status: 400 });
     if (typeof network !== 'string' || network.length > 256) return Response.json({ error: 'invalid_network' }, { status: 400 });
     
     if (!Array.isArray(roles) || !roles.every((r: any) => typeof r === 'string')) return Response.json({ error: 'invalid_roles' }, { status: 400 });
@@ -305,9 +307,9 @@ export async function handleRegistryRoutes(
 
       const registered = sql.exec(`
         UPDATE machines
-        SET hostname = ?, os = ?, network = ?, roles = ?, capabilities = ?, credential_id = ?
+        SET hostname = ?, os = ?, arch = ?, network = ?, roles = ?, capabilities = ?, credential_id = ?
         WHERE id = ? AND (credential_id IS NULL OR credential_id = '' OR credential_id = ?)
-      `, hostname, os, network, rolesJson, capJson, live.id, machineId, live.id);
+      `, hostname, os, arch, network, rolesJson, capJson, live.id, machineId, live.id);
       if (registered.rowsWritten !== 1) {
         const raced = sql.exec('SELECT credential_id FROM machines WHERE id = ?', machineId).toArray()[0] as any;
         if (!raced) return Response.json({ error: 'unknown_machine' }, { status: 404 });
@@ -341,6 +343,8 @@ export async function handleRegistryRoutes(
       id: m.id,
       name: m.name || m.hostname,
       hostname: m.hostname,
+      os: m.os ?? '',
+      arch: (m as any).arch ?? '',
       ssh: m.network === 'home' ? undefined : m.hostname,
       roles: JSON.parse(m.roles || '[]'),
       capabilities: JSON.parse(m.capabilities || '{}')

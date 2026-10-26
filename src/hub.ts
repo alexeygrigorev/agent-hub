@@ -386,6 +386,7 @@ export class Hub extends DurableObject {
       hostname: 'TEXT',
       network: "TEXT DEFAULT 'home'",
       os: "TEXT DEFAULT ''",
+      arch: "TEXT DEFAULT ''",
       roles: "JSON DEFAULT '[]'",
       capabilities: "JSON DEFAULT '{}'",
       credential_id: 'TEXT',

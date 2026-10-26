@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS machines (
   hostname TEXT NOT NULL,
   network TEXT NOT NULL DEFAULT 'home',
   os TEXT NOT NULL DEFAULT '',
+  arch TEXT NOT NULL DEFAULT '',
   roles JSON NOT NULL DEFAULT '[]',
   capabilities JSON NOT NULL DEFAULT '{}',
   credential_id TEXT,
