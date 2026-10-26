@@ -398,3 +398,22 @@ it('does not recreate an obsolete reset after repeated collection of a corrected
     expect(events[0].timestamp_ms).toBe(NOW+2*HOUR);
   });
 });
+
+
+it('advances real quota after the expiry tick already captured the same boundary', async () => {
+  await runInDurableObject(stub, (hub: Hub) => {
+    const sql: any = hub.sql;
+    const item = {provider:'codex',account:'tick-first-rollover',windowName:'5h',window:{present:true,percent_remaining:80,reset_at:new Date(NOW+HOUR).toISOString()}};
+    syncWindowsIntoTbm(sql,[item],NOW);
+    tickTbm(sql,NOW);
+    tickTbm(sql,NOW+HOUR);
+    item.window.percent_remaining=95;
+    item.window.reset_at=new Date(NOW+6*HOUR).toISOString();
+    syncWindowsIntoTbm(sql,[item],NOW+61*60000);
+    syncWindowsIntoTbm(sql,[item],NOW+62*60000);
+    tickTbm(sql,NOW+62*60000);
+    expect(sql.exec("SELECT reset_at_ms FROM tbm_quota_pools WHERE pool_id='codex:tick-first-rollover:5h'").one().reset_at_ms).toBe(NOW+6*HOUR);
+    const events: any[] = sql.exec("SELECT * FROM tbm_reward_events WHERE pool_id='codex:tick-first-rollover:5h' AND event_kind='reset'").toArray();
+    expect(events).toHaveLength(1);
+  });
+});

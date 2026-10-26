@@ -83,9 +83,10 @@ CREATE INDEX IF NOT EXISTS idx_tbm_session_tokens_tag ON tbm_session_tokens(tag)
 `;
 
 const TBM_RESET_TRIGGER_SQL = `
-CREATE TRIGGER IF NOT EXISTS trg_tbm_pool_reset_capture_v2
+CREATE TRIGGER IF NOT EXISTS trg_tbm_pool_reset_capture_v3
 AFTER UPDATE OF reset_at_ms ON tbm_quota_pools
 WHEN NEW.reset_at_ms > OLD.reset_at_ms AND OLD.pool_id != '*' AND OLD.reset_at_ms > 0 AND NEW.last_updated_ms >= OLD.reset_at_ms
+AND NOT EXISTS (SELECT 1 FROM tbm_pool_resets WHERE pool_id=OLD.pool_id AND reset_at_ms=OLD.reset_at_ms)
 BEGIN
   INSERT OR IGNORE INTO tbm_pool_resets (
     pool_id, reset_at_ms, provider, account,
@@ -167,6 +168,7 @@ export function ensureTbmControllerSchema(sql: SqlStorage): void {
   }
   try {
     sql.exec('DROP TRIGGER IF EXISTS trg_tbm_pool_reset_capture');
+    sql.exec('DROP TRIGGER IF EXISTS trg_tbm_pool_reset_capture_v2');
     sql.exec(TBM_RESET_TRIGGER_SQL);
     sql.exec('CREATE INDEX IF NOT EXISTS idx_tbm_reward_pool_time ON tbm_reward_events(pool_id,timestamp_ms)');
     sql.exec('DROP INDEX IF EXISTS idx_tbm_binding_native');
