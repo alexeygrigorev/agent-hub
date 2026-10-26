@@ -297,7 +297,7 @@ describe('generic accounts and launch placement', () => {
     expect((s.plan(intent({ machine: 'win35' })) as any).selected).toBeNull();
     sql.exec("UPDATE machines SET capabilities = '{}' WHERE id = 'hetzner'");
     expect((s.plan(intent({ machine: 'hetzner' })) as any).rejected[0].reason).toBe('capability_unavailable');
-    sql.exec("UPDATE machines SET last_checkin_at = ?, last_heartbeat = ? WHERE id = 'win35'", iso(), JSON.stringify({ mem_avail_mb: 11000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() } }));
+    sql.exec("UPDATE machines SET last_checkin_at = ?, last_heartbeat = ? WHERE id = 'win35'", iso(), JSON.stringify({ mem_avail_mb: 3000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() } }));
     expect((s.plan(intent({ machine: 'win35' })) as any).rejected[0].reason).toBe('launcher_memory_reserve');
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'win35'", JSON.stringify({ gate: { launch_allowed: true, at: iso(-300001) } }));
     expect((s.plan(intent({ machine: 'win35' })) as any).rejected[0].reason).toBe('admission_unknown');
@@ -402,10 +402,10 @@ describe('generic accounts and launch placement', () => {
   it('queues on launcher reservations and promotes when fresh headroom frees', async () => fixture(async (s, sql) => {
     await configure(s);
     const hb = { mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() },
-      launcher_resources: { active_mem_mb: 22000, observed_at: iso() } };
+      launcher_resources: { active_mem_mb: 29000, observed_at: iso() } };
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'hetzner'", JSON.stringify(hb));
     const input = intent({ machine: 'hetzner', mode: 'headless' });
-    expect(s.plan(input).rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', engine: 'codex', reason: 'launcher_memory_reserve', memory: expect.objectContaining({ mem_available_mb: 32000, reserved_mb: 22000, floor_mb: 10240 }) }));
+    expect(s.plan(input).rejected).toContainEqual(expect.objectContaining({ machine: 'hetzner', engine: 'codex', reason: 'launcher_memory_reserve', memory: expect.objectContaining({ mem_available_mb: 32000, reserved_mb: 29000, floor_mb: 2048 }) }));
     const parked = s.reserve(input, admin);
     expect(parked.status).toBe(202);
     expect(parked.value.state).toBe('queued');
@@ -417,7 +417,7 @@ describe('generic accounts and launch placement', () => {
   it('fails closed on stale launcher telemetry and counts unstarted offers', async () => fixture(async (s, sql) => {
     await configure(s);
     sql.exec("UPDATE machines SET capabilities = ? WHERE id='hetzner'", JSON.stringify({ engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8, launcher_resources: true }));
-    const hb = { mem_avail_mb: 13000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() }, launcher_resources: { active_mem_mb: 0, observed_at: iso(-180001) } };
+    const hb = { mem_avail_mb: 4000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() }, launcher_resources: { active_mem_mb: 0, observed_at: iso(-180001) } };
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id='hetzner'", JSON.stringify(hb));
     const input = intent({ machine: 'hetzner', mode: 'headless' });
     expect(s.plan(input).rejected?.[0]?.reason).toBe('admission_unknown');
@@ -572,11 +572,11 @@ describe('generic accounts and launch placement', () => {
     const sessions = new SessionControlService(sql, cb => cb(), () => now);
     sessions.init();
     const viewed = (sessions as any).view(sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionId).one());
-    expect(viewed).toMatchObject({ state: 'queued', reason: diagnostic.reason, rejected: [expect.objectContaining({ reason: diagnostic.reason, memory: expect.objectContaining({ floor_mb: 10240 }) })] });
+    expect(viewed).toMatchObject({ state: 'queued', reason: diagnostic.reason, rejected: [expect.objectContaining({ reason: diagnostic.reason, memory: expect.objectContaining({ floor_mb: 2048 }) })] });
     const retry = sql.exec('SELECT * FROM fleet_launches WHERE id = ?', viewed.fleet_launch_id).one();
     expect(retry.id).not.toBe(launch.id);
     expect(retry.state).toBe('queued');
-    expect(sql.exec("SELECT detail FROM liveness_alerts WHERE subject_kind='launch' AND subject=?", launch.id).one().detail).toContain('10240');
+    expect(sql.exec("SELECT detail FROM liveness_alerts WHERE subject_kind='launch' AND subject=?", launch.id).one().detail).toContain("2048");
     s.drainCapacityQueue();
     expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', retry.id).one().state).toBe('queued');
     const hb = { mem_avail_mb: 32000, disk_free_gb: 80, load: [1], gate: { launch_allowed: true, at: iso() }, launcher_resources: { active_mem_mb: 0, observed_at: iso(1) } };

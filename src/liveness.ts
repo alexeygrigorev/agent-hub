@@ -3,6 +3,7 @@
  * self-reporting agents (for example Grok Bot). Liveness is derived from timestamps the hub
  * already receives; an unknown host makes everything on it unknown rather than healthy.
  */
+import { MEMORY_FLOOR_MB, NEXT_SLOT_MB } from "./resource-management";
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { effectiveCheckin } from './registry';
 import { accountCapacityAlerts } from './account_capacity';
@@ -169,7 +170,7 @@ export class LivenessService {
       const m: any = this.sql.exec('SELECT last_heartbeat FROM machines WHERE id = ?', l.machine_id).toArray()[0];
       let hb: any = {}; try { hb = JSON.parse(m?.last_heartbeat || '{}'); } catch { /* unknown stays explicit */ }
       subjects.push({ kind: 'launch', id: l.id, state: 'launcher_memory_reserve', detail:
-        `memory refusal; latest mem_available_mb=${hb.mem_avail_mb ?? 'unknown'}, reserved_mb=${hb.launcher_resources?.active_mem_mb ?? 'unknown'}, floor_mb=10240, requested_mb=1500`, machine_id: l.machine_id });
+        `memory refusal; latest mem_available_mb=${hb.mem_avail_mb ?? 'unknown'}, reserved_mb=${hb.launcher_resources?.active_mem_mb ?? 'unknown'}, floor_mb=${MEMORY_FLOOR_MB}, requested_mb=${NEXT_SLOT_MB}`, machine_id: l.machine_id });
     }
 
     subjects.push(...accountCapacityAlerts(this.sql, now));

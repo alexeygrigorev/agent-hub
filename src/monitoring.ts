@@ -9,6 +9,7 @@
  * - Measured history and growth per day trend calculation
  * - Bounded storage retention and data sanitization
  */
+import { MEMORY_FLOOR_MB, NEXT_SLOT_MB } from "./resource-management";
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { LivenessService } from './liveness';
 import type { StatusMachineAuth } from './status';
@@ -1865,7 +1866,7 @@ export class MonitoringService {
   private resourceProjection?: (machine: string) => HostReservation | undefined;
   setResourceProjection(project: (machine: string) => HostReservation | undefined) { this.resourceProjection = project; }
   private readHostReservation(machineId: string, _now: number): HostReservation {
-    return this.resourceProjection?.(machineId) ?? { mem_avail_mb: null, reserved_mb: null, floor_mb: 10240, next_slot_mb: 1500, headroom_mb: null, headroom_ok: null, stale_telemetry: true, observed_at: null };
+    return this.resourceProjection?.(machineId) ?? { mem_avail_mb: null, reserved_mb: null, floor_mb: MEMORY_FLOOR_MB, next_slot_mb: NEXT_SLOT_MB, headroom_mb: null, headroom_ok: null, stale_telemetry: true, observed_at: null };
   }
 
   private placementFor(machineId: string, pressure: { queuedTotal: number; queuedHeld: number; recentRejects: number; failedByMachine: Map<string, number>; failedTotal: number }): HostPlacement {
@@ -1944,7 +1945,7 @@ export class MonitoringService {
       if ((h as any).placement?.reason) {
         const reservation = (h as any).reservation;
         const numbers = reservation && (reservation.mem_avail_mb !== null || reservation.reserved_mb !== null)
-          ? ` mem_avail_mb=${reservation.mem_avail_mb ?? 'unknown'} reserved_mb=${reservation.reserved_mb ?? 'unknown'} floor_mb=10240 next_slot_mb=1500 headroom_mb=${reservation.headroom_mb ?? 'unknown'}`
+          ? ` mem_avail_mb=${reservation.mem_avail_mb ?? 'unknown'} reserved_mb=${reservation.reserved_mb ?? 'unknown'} floor_mb=${MEMORY_FLOOR_MB} next_slot_mb=${NEXT_SLOT_MB} headroom_mb=${reservation.headroom_mb ?? 'unknown'}`
           : '';
         needsAttention.push({
           severity: h.memory?.status === 'critical' ? 'critical' : 'warn',

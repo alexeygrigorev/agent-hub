@@ -83,8 +83,8 @@ const CAPACITY_REASONS = new Set(['account_capacity', 'machine_capacity', 'launc
  * it only projects the same inputs (MemAvailable, reserved total, floor for
  * the next slot) so operators see why starts hold. Owned by the launcher
  * reservation fixer; visibility reuses its accounting. */
-export const MEMORY_FLOOR_MB = 10240;
-export const NEXT_SLOT_MB = 1500;
+import { MEMORY_FLOOR_MB, NEXT_SLOT_MB } from "./resource-management";
+export { MEMORY_FLOOR_MB, NEXT_SLOT_MB };
 /** Placement-pressure reasons that degrade host health and raise operator
  * alerts: any launch rejected or held for memory/capacity. */
 export const PLACEMENT_PRESSURE_REASONS = new Set(['launcher_memory_reserve', 'account_capacity', 'machine_capacity']);
@@ -588,7 +588,7 @@ export class FleetService {
       const at = new Date(nowMs).toISOString();
       const machines = pressure.includes('launcher_memory_reserve') ? this.hostResources() : [];
       const memNote = machines.length
-        ? ' host ' + machines.map((h) => `${h.machine_id}: mem_avail_mb=${h.mem_avail_mb ?? 'unknown'} reserved_mb=${h.reserved_mb ?? 'unknown'} floor_mb=10240 next_slot_mb=1500 headroom_mb=${h.headroom_mb ?? 'unknown'}`).join('; ')
+        ? ' host ' + machines.map((h) => `${h.machine_id}: mem_avail_mb=${h.mem_avail_mb ?? 'unknown'} reserved_mb=${h.reserved_mb ?? 'unknown'} floor_mb=${MEMORY_FLOOR_MB} next_slot_mb=${NEXT_SLOT_MB} headroom_mb=${h.headroom_mb ?? 'unknown'}`).join('; ')
         : '';
       const detail = `rejected [${pressure.join(', ')}] (all routes: ${reasons.join(', ')})${memNote}`;
       this.sql.exec('INSERT OR IGNORE INTO placement_rejections (id, created_at, created_at_ms, actor, reasons_json, detail) VALUES (?, ?, ?, ?, ?, ?)',
@@ -699,7 +699,7 @@ export class FleetService {
         || !fresh(hb.launcher_resources?.observed_at, this.now(), 180000))) reason = 'admission_unknown';
       else if (Number.isFinite(hb.mem_avail_mb) && hb.mem_avail_mb - (hb.launcher_resources?.active_mem_mb || 0)
         - 1500 * (hb.launcher_resources ? Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND (state IN ('offered','starting') OR (state IN ('running','uncertain') AND updated_at >= ?))", route.machine_id, hb.launcher_resources.observed_at).one().n) : 0)
-        < 10240 + 1500) reason = 'launcher_memory_reserve';
+        < MEMORY_FLOOR_MB + NEXT_SLOT_MB) reason = 'launcher_memory_reserve';
       else if (!Number.isFinite(hb.mem_avail_mb) || !Number.isFinite(hb.disk_free_gb) || hb.disk_free_gb < 50.5) reason = 'resource_limit';
       else if (!Array.isArray(hb.load) || !Number.isFinite(hb.load[0]) || hb.load[0] < 0 || !Number.isFinite(caps.cpu_count) || caps.cpu_count < 1) reason = 'load_unknown';
       else if (!account || account.status !== 'ok') reason = 'account_' + (account?.status || 'unmapped');
@@ -744,7 +744,7 @@ export class FleetService {
     const pending = hb.launcher_resources ? Number(this.sql.exec("SELECT COUNT(*) AS n FROM fleet_launches WHERE machine_id = ? AND (state IN ('offered','starting') OR (state IN ('running','uncertain') AND updated_at >= ?))", machine, hb.launcher_resources.observed_at).one().n) : 0;
     return { mem_available_mb: Number.isFinite(hb.mem_avail_mb) ? hb.mem_avail_mb : null,
       reserved_mb: (hb.launcher_resources?.active_mem_mb || 0) + 1500 * pending,
-      floor_mb: 10240, requested_mb: 1500, observed_at: hb.launcher_resources?.observed_at ?? null };
+      floor_mb: MEMORY_FLOOR_MB, requested_mb: NEXT_SLOT_MB, observed_at: hb.launcher_resources?.observed_at ?? null };
   }
 
   private memoryHold(id: string, rejected: any[], refused = false) {
