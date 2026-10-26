@@ -24,6 +24,23 @@ class LaunchDiagnosticTests(unittest.TestCase):
         self.assertIn('10 GiB', info['message'])
         self.assertEqual(info['stage'], 'dispatch_headless')
 
+    def test_real_disk_refusal_preserves_class_message_and_exit_status(self):
+        for filesystem in ('cwd', 'tmpdir'):
+            tail = f'ValueError: {filesystem} filesystem free < 20GiB floor + required disk (39728447488 B)'
+            script = "import sys; print(" + repr(tail) + ", file=sys.stderr); sys.exit(1)"
+            with self.assertRaises(LocalCommandError) as raised:
+                run_json([sys.executable, '-c', script])
+            info = exception_diagnostic(raised.exception, 'dispatch_headless')
+            self.assertEqual(info['reason'], 'launcher_disk_reserve')
+            self.assertEqual(info['error_type'], 'ValueError')
+            self.assertEqual(info['exit_code'], 1)
+            self.assertEqual(info['tail'], tail)
+            self.assertIn('disk headroom', info['message'])
+            for unsafe in (tail + ' secret=private-value', tail.replace('39728447488', '/private/token')):
+                result = diagnostic(unsafe)
+                self.assertEqual(result['reason'], 'launcher_command_failed')
+                self.assertNotIn('private', json.dumps(result))
+
     def test_output_never_copies_arbitrary_secrets_paths_goals_or_suffixes(self):
         for raw in ('secret=private-value /private/path', 'ValueError: host MemAvailable < 10GiB secret=private-value', '{"error":"private-value"}'):
             value = json.dumps(diagnostic(raw))

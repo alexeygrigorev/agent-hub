@@ -440,7 +440,7 @@ def diagnostic(raw='', *, error_type='RuntimeError', exit_code=None, stage='laun
         # Match the entire grammar; never forward raw paths, suffixes or payloads.
         if re.fullmatch(r'(?:cwd|tmpdir) filesystem free < (?:20|50)GiB floor \+ required disk \([0-9]{1,16} B\)', candidate):
             reason, message = REFUSALS['launcher_disk_reserve']
-            surfaced_tail = candidate
+            surfaced_tail = error_type + ': ' + candidate
             refusal_found = True
             break
         if candidate in REFUSALS:
