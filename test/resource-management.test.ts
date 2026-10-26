@@ -63,6 +63,25 @@ describe('resource management',()=>{
   expect(task.status).toBe('open');expect(task.history).toHaveLength(2);expect(task.history[1].text).toContain('restart');
   expect(r.usage()[0]).toMatchObject({state:'stopped',finished_at:iso()});
  }));
+ it('settles a native binding once across changed attempts and preserves its completion state',async()=>fixture(async(r,sql)=>{
+  sql.exec("UPDATE fleet_launches SET state='exited',finished_at=? WHERE id='launch'",iso());
+  sql.exec("UPDATE session_control_sessions SET state='exited' WHERE id='session'");
+  r.report('host',{samples:[sample()],reaps:[]});
+  const evidence={id:'terminal-output',session_id:'session',native_id:'native',reason:'terminal',output:'saved'};
+  r.evidence('host',evidence);
+  const reap={id:'first-stop',session_id:'session',native_id:'native',reason:'terminal',freed_mb:null,at:iso(),evidence_id:evidence.id,stopped:true};
+  r.report('host',{samples:[],reaps:[reap,{...reap,id:'changed-attempt'}]});
+  expect(r.reaps()).toHaveLength(1);
+  expect(r.sessions('host')[0].reaped).toBe(true);
+  expect(r.usage()[0].state).toBe('exited');
+  expect(sql.exec("SELECT state FROM session_control_sessions WHERE id='session'").one().state).toBe('exited');
+  expect(()=>r.evidence('host',{...evidence,id:'new-evidence'})).toThrow('session_already_reaped');
+  expect(r.evidence('host',evidence)).toEqual({saved:true,evidence_id:evidence.id});
+  r.report('host',{samples:[],reaps:[{...reap,id:'later-stop'}]});
+  expect(r.reaps()).toHaveLength(1);
+  const history=JSON.parse(sql.exec("SELECT data FROM intake_tasks WHERE id='task'").one().data).history;
+  expect(history).toHaveLength(2);
+ }));
  it('never exposes protected or externally interactive sessions as managed reap targets',async()=>fixture(async(r,sql)=>{
   sql.exec('INSERT INTO session_control_protections VALUES(?,?,?,?)','session','human','keep',iso());
   expect(r.sessions('host')[0].keep).toBe(true);

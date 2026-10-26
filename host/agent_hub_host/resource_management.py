@@ -724,6 +724,8 @@ def is_reapable_session(entry: Any) -> bool:
         return False
     if not entry.get("managed"):
         return False
+    if entry.get("reaped") is True:
+        return False
     mode = entry.get("mode")
     if mode is not None and mode != "headless":
         return False
@@ -741,6 +743,12 @@ def is_reapable_session(entry: Any) -> bool:
 
 
 def classify_reason(entry: dict[str, Any], native_phase: Optional[str], native_dead: Optional[bool], idle_ms: Optional[int], now_ms: int) -> Optional[str]:
+    if entry.get("reaped") is True:
+        return None
+    # Ordinary native completion needs sampling/finalization, not another stop.
+    # A running/broken native wrapper whose workload died can still be cleaned.
+    if native_dead is True and native_phase in {"exited", "finished", "stopped", "retired", "dead"}:
+        return None
     state = str(entry.get("state") or "")
     if state in TERMINAL_SERVER_STATES:
         return "terminal"
@@ -889,6 +897,14 @@ def _build_reap(state: dict[str, Any], sid: str, nid: str, reason: str,
             "freed_mb": (round(float(freed_mb), 2) if freed_mb is not None else None),
             "at": at_iso, "evidence_id": evidence_id, "stopped": True}
     pending = state.get("pending")
+    if reap_id not in state.get("reported", {}) and len(state.get("reported", {})) >= MAX_REPORTED_ENTRIES:
+        raise ValueError("reported_receipt_capacity")
+    if isinstance(pending, dict):
+        attempt = pending.get(reap_id)
+        created_ms = attempt.get("native_created_at_ms") if isinstance(attempt, dict) else None
+        if type(created_ms) is int and created_ms > 0:
+            peak = state.setdefault("peaks", {}).setdefault(_peak_key(sid, nid), {})
+            peak["reaped_created_at_ms"] = created_ms
     if isinstance(pending, dict):
         pending.pop(reap_id, None)
     reported = state.get("reported")
@@ -1102,6 +1118,9 @@ def run_watchdog_cycle(
                         continue
                     sid = entry["session_id"]
                     nid = entry["native_id"]
+                    peak = state.get("peaks", {}).get(_peak_key(sid, nid), {})
+                    if peak.get("reaped_created_at_ms") == entry.get("native_created_at_ms"):
+                        continue  # Durable completion marker survives report ACK.
                     native = by_native.get(nid.lower())
                     if native is None:
                         continue
@@ -1219,6 +1238,9 @@ def _reap_one(request: Any, aplexer_bin: str, entry: dict[str, Any], native: Any
     sid = entry["session_id"]
     nid = entry["native_id"]
     created_ms = entry.get("native_created_at_ms")
+    peak = state.get("peaks", {}).get(_peak_key(sid, nid), {})
+    if entry.get("reaped") is True or peak.get("reaped_created_at_ms") == created_ms:
+        return None
     pending = state.setdefault("pending", {})
     if not isinstance(pending, dict):
         pending = state["pending"] = {}
@@ -1277,7 +1299,10 @@ def _reap_one(request: Any, aplexer_bin: str, entry: dict[str, Any], native: Any
     # Unknown state never stops.
     if not isinstance(getattr(fresh, "phase", None), str) or not fresh.phase or fresh.phase == "unknown":
         return None
-    if reason == "dead_pid" and _native_dead(fresh) is not True:
+    fresh_dead = _native_dead(fresh)
+    if fresh_dead is True and fresh.phase in {"exited", "finished", "stopped", "retired", "dead"}:
+        return None  # Already naturally complete; no resource stop to perform.
+    if reason == "dead_pid" and fresh_dead is not True:
         return None
     # Snapshot activity AND output BEFORE evidence. Unknown activity refuses;
     # a session already too active refuses before any server mutation.
@@ -1296,6 +1321,10 @@ def _reap_one(request: Any, aplexer_bin: str, entry: dict[str, Any], native: Any
     # any new activity/capture mints new ids (no stop on a stale receipt).
     evidence_id = _evidence_id(sid, reason, created_ms, act0, digest)
     reap_id = _reap_id(sid, reason, created_ms, digest)
+    reported = state.get("reported", {})
+    if ((reap_id not in pending and len(pending) >= MAX_PENDING_ENTRIES) or
+            (reap_id not in reported and len(reported) >= MAX_REPORTED_ENTRIES)):
+        return None  # Never stop when the durable intent/receipt cannot fit.
     before = sample_session_tree(_row_sample_dict(fresh), now_ms, proc_root)
     before_mb: Optional[float] = None
     if before is not None:
@@ -1329,6 +1358,8 @@ def _reap_one(request: Any, aplexer_bin: str, entry: dict[str, Any], native: Any
     except Exception:
         return None
     if not isinstance(getattr(fresh2, "phase", None), str) or not fresh2.phase or fresh2.phase == "unknown":
+        return None
+    if fresh2.phase in {"exited", "finished", "stopped", "retired", "dead"} and _native_dead(fresh2) is True:
         return None
     if reason == "dead_pid" and _native_dead(fresh2) is not True:
         return None

@@ -171,6 +171,7 @@ export class ResourceManagement {
         tier:req.tier || launch.tier || (s.fleet_launch_id ? policy.default_tier : null), kind:req.task_kind || launch.task_kind || 'goal',
         state:TERMINAL.has(s.state) ? s.state : s.launch_state || s.state, keep:protection || req.keep === true || launch.keep === true,
         managed:!!s.fleet_launch_id && s.mode === 'headless',
+        reaped:this.sql.exec('SELECT 1 FROM resource_reaps WHERE session_id=? AND machine_id=? AND native_id=? LIMIT 1',s.id,s.machine_id,binding.native_id).toArray().length>0,
         last_activity_at:observed?.last_activity_at ?? null, started_at:Number.isFinite(binding.native_created_at_ms) ? new Date(binding.native_created_at_ms).toISOString() : s.launch_created || s.created_at,
         finished_at:s.launch_finished || (TERMINAL.has(s.state) ? s.updated_at : null) }];
     });
@@ -191,6 +192,7 @@ export class ResourceManagement {
       || typeof value.output!=='string' || new TextEncoder().encode(value.output).byteLength > 6000) throw new Error('invalid_evidence');
     const prior: any = this.sql.exec('SELECT * FROM resource_evidence WHERE id=?',value.id).toArray()[0];
     if (prior && (prior.session_id!==session.session_id || prior.native_id!==session.native_id || prior.reason!==value.reason)) throw new Error('evidence_conflict');
+    if (!prior && session.reaped) throw new Error('session_already_reaped');
     if (!prior) {
       this.note(session,value.id,`Resource watchdog saved output before ${value.reason} stop. Session ${session.session_id}. Restart unfinished work after reap.\n${value.output}`);
       this.sql.exec('INSERT INTO resource_evidence VALUES(?,?,?,?,?)',value.id,session.session_id,session.native_id,value.reason,new Date(this.now()).toISOString());
@@ -228,10 +230,13 @@ export class ResourceManagement {
         || typeof reap.id!=='string' || !/^[\w:-]{1,128}$/.test(reap.id) || !Number.isFinite(Date.parse(reap.at))) throw new Error('invalid_reap');
       const prior:any=this.sql.exec('SELECT * FROM resource_reaps WHERE id=?',reap.id).toArray()[0];
       if (prior) { if(prior.session_id!==session.session_id || prior.evidence_id!==reap.evidence_id) throw new Error('reap_conflict'); continue; }
+      // Binding-scoped idempotency also covers a host retry that minted a new
+      // attempt/reason after the first receipt was acknowledged.
+      if (session.reaped || this.sql.exec('SELECT 1 FROM resource_reaps WHERE session_id=? AND machine_id=? AND native_id=? LIMIT 1',session.session_id,machine,reap.native_id).toArray().length) continue;
       this.note(session,reap.id,`Resource watchdog reaped session ${session.session_id}: ${reap.reason}; freed ${reap.freed_mb ?? 'unknown'} MiB; confirmed stopped at ${reap.at}. Output saved as ${reap.evidence_id}. Unfinished intake remains open for restart.`);
       this.sql.exec('INSERT INTO resource_reaps VALUES(?,?,?,?,?,?,?,?,?,?)',reap.id,session.session_id,machine,reap.native_id,session.intake_id,'machine:'+machine,reap.reason,reap.freed_mb,reap.at,reap.evidence_id);
-      this.sql.exec("UPDATE session_resource_usage SET finished_at=COALESCE(finished_at,?),state='stopped' WHERE session_id=?",reap.at,session.session_id);
-      this.sql.exec("UPDATE session_control_sessions SET state='stopped',updated_at=? WHERE id=?",reap.at,session.session_id);
+      this.sql.exec("UPDATE session_resource_usage SET finished_at=COALESCE(finished_at,?),state=CASE WHEN finished_at IS NULL THEN 'stopped' ELSE state END WHERE session_id=?",reap.at,session.session_id);
+      if (!TERMINAL.has(session.state)) this.sql.exec("UPDATE session_control_sessions SET state='stopped',updated_at=? WHERE id=?",reap.at,session.session_id);
       this.sql.exec("UPDATE fleet_launches SET state=CASE WHEN state IN ('exited','failed','stopped') THEN state ELSE 'failed' END,finished_at=COALESCE(finished_at,?),exit_reason=COALESCE(exit_reason,?),updated_at=? WHERE id=?",reap.at,'watchdog_'+reap.reason,reap.at,session.fleet_launch_id);
       this.sql.exec("UPDATE fleet_sessions SET phase='exited',observed_at=? WHERE machine_id=? AND native_id=?",reap.at,machine,session.native_id);
     }

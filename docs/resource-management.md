@@ -115,7 +115,7 @@ hard-coded constants.
 | `estimate_percentile` | 90 | placement estimate |
 | `estimate_multiplier` | 1.25 | measured estimate growth allowance |
 | `ramp_seconds` | 180 | additional reserve window after starting |
-| `cpu_load_factor` | 1.5 | Deprecated compatibility field; never gates CPU |
+| `cpu_load_factor` | 3.0 | Deprecated compatibility field; never gates CPU |
 | `cpu_target_utilization` | 1.0 | Advisory utilization target; never a busy-only gate |
 | `cpu_default_cores` | 1.0 | Conservative no-history task estimate |
 | `cpu_estimate_multiplier` | 1.25 | Growth allowance over measured CPU p95 |
@@ -156,9 +156,9 @@ intake linkage or inability to save evidence prevents a stop.
 
 - Placement estimate: p90 `peak_rss_mb` by (project, engine, kind), falling back
   to the coarser groups.
-- Capacity view: the expected number of more sessions that fit is
-  `(MemAvailable - floor) / p90` and `(1.5 × cores - load5)`, whichever is
-  smaller.
+- Capacity view: `(MemAvailable - floor) / p90` estimates memory slots.
+  CPU history, current busy cores and startup commitments are advisory;
+  only fresh choking evidence throttles CPU admission.
 - Cost per session: tokens (TBM) plus GB-hours and CPU-hours from the ledger.
 
 ## CLI and overview

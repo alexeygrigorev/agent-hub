@@ -434,6 +434,25 @@ class EvidenceGateTests(unittest.TestCase):
             out = rm.run_watchdog_cycle(request, journal_dir=journal, now_ms=now_ms)
         return out, calls, stop_mock
 
+    def test_naturally_finished_native_is_sampled_without_reap_or_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for state in ("running", "exited", "failed", "stopped"):
+                with self.subTest(state=state):
+                    native = [_native(phase="exited", containment_empty=True)]
+                    out, calls, stop = self._reap_cycle([_entry(state=state)], native, journal=tmp)
+                    self.assertGreaterEqual(out["samples"], 1)
+                    self.assertEqual(out["reaps"], 0)
+                    stop.assert_not_called()
+                    self.assertFalse(any(path.endswith("/evidence") for _, path, _ in calls))
+
+    def test_server_reap_marker_skips_even_without_local_journal_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out, calls, stop = self._reap_cycle([_entry(state="failed", reaped=True)],
+                                               [_native()], journal=tmp)
+            self.assertEqual(out["reaps"], 0)
+            stop.assert_not_called()
+            self.assertFalse(any(path.endswith("/evidence") for _, path, _ in calls))
+
     def test_quiet_terminal_output_is_saved_without_full_idle_timeout(self):
         with tempfile.TemporaryDirectory() as tmp:
             native = [_native(phase="exited", last_activity_ms=9_640_000)]
@@ -667,8 +686,8 @@ class OracleTests(unittest.TestCase):
     def test_uncertain_stop_confirms_without_second_kill(self):
         from agent_hub_host.native_sessions import _uncertain_with_oracle
         with tempfile.TemporaryDirectory() as tmp:
-            native = [_native(phase="exited", last_activity_ms=1_000_000,
-                              containment_empty=True)]
+            native = [_native(phase="running", last_activity_ms=1_000_000,
+                              containment_empty=False)]
             sessions = [_entry(state="failed")]
             uncertain = _uncertain_with_oracle("kill ok, exit unproven",
                                                self._oracle(), {"signal": "TERM"})
@@ -682,7 +701,9 @@ class OracleTests(unittest.TestCase):
                     return {"reported": True}
                 raise AssertionError(path)
 
-            with patch("agent_hub_host.native_sessions.list_sessions", return_value=native), \
+            with patch.object(rm, "_native_dead", return_value=False), \
+                 patch("agent_hub_host.native_sessions.reconcile_stop_oracle", return_value=(True, "confirmed")), \
+                 patch("agent_hub_host.native_sessions.list_sessions", return_value=native), \
                  patch("agent_hub_host.native_sessions.qualify_target", return_value=native[0]), \
                  patch("agent_hub_host.native_sessions.capture_output",
                        return_value=SimpleNamespace(text="t")), \
@@ -914,7 +935,7 @@ class BatchCadenceTests(unittest.TestCase):
                 self.assertGreaterEqual(mid["samples"], 1)
                 # After the 300s cadence: destructive pass runs again.
                 counts.append(rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000 + 301_000)["reaps"])
-            self.assertEqual(counts, [1, 0, 1])
+            self.assertEqual(counts, [1, 0, 0])  # Same incarnation stays settled after ACK/restart.
 
     def test_report_batches_stay_well_under_body_cap(self):
         fat = [{"session_id": "s%d" % i, "native_id": "n%d" % i, "observed_at": "t",
@@ -1009,7 +1030,7 @@ class BatchCadenceTests(unittest.TestCase):
         self.assertIn("900000", reap)  # Native incarnation included.
         self.assertTrue(re.match(r"^[\w:-]{1,128}$", reap))
 
-    def test_new_output_mints_new_evidence_id(self):
+    def test_acknowledged_stop_never_reaps_same_incarnation_again(self):
         with tempfile.TemporaryDirectory() as tmp:
             native = [_native(phase="exited", last_activity_ms=1_000_000)]
             sessions = [_entry(state="failed")]
@@ -1044,8 +1065,8 @@ class BatchCadenceTests(unittest.TestCase):
                 out1 = rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000)
             self.assertEqual(out1["reaps"], 1)
             first_id = evidence_ids[-1]
-            # Cycle 2 (after cadence): capture now shows different output, so
-            # the attempt mints a different evidence id (no stale receipt).
+            # A stale server/native list after ACK cannot trigger another stop,
+            # even after cadence or when the retained output changes.
             with patch("agent_hub_host.native_sessions.list_sessions", return_value=native), \
                  patch("agent_hub_host.native_sessions.qualify_target", return_value=native[0]), \
                  patch("agent_hub_host.native_sessions.capture_output", side_effect=cap_new), \
@@ -1054,7 +1075,10 @@ class BatchCadenceTests(unittest.TestCase):
                  patch.object(rm, "sample_session_tree",
                               return_value={"rss_mb": 8.0, "current_mb": 8.0}):
                 rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000 + 301_000)
-            self.assertNotEqual(evidence_ids[-1], first_id)
+            self.assertEqual(evidence_ids, [first_id, first_id])
+            saved = json.loads(Path(tmp, rm.STATE_FILENAME).read_bytes())
+            self.assertFalse(saved["reported"])
+            self.assertEqual(saved["peaks"][rm._peak_key("sess-1", native[0].session_id)]["reaped_created_at_ms"], 900_000)
             _ = stop_mock
 
     def test_reap_at_uses_post_stop_clock(self):
