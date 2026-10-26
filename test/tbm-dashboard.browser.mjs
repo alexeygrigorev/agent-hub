@@ -6,7 +6,12 @@ import { createRequire } from 'node:module';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { resolve, extname } from 'node:path';
 
-const { chromium } = createRequire(process.env.PLAYWRIGHT_PACKAGE || '/home/alexey/git/dataops/package.json')('playwright');
+let playwright;
+for (const candidate of [process.env.PLAYWRIGHT_PACKAGE, resolve('node_modules/playwright/package.json'), '/home/alexey/git/dataops/package.json'].filter(Boolean)) {
+  try { playwright = createRequire(candidate)('playwright'); break; } catch { /* use the existing local/CI browser install */ }
+}
+if (!playwright) throw new Error('Playwright unavailable; install the existing CI browser harness or set PLAYWRIGHT_PACKAGE.');
+const { chromium } = playwright;
 const browser = await chromium.launch({
   args: ['--disable-gpu', '--disable-dev-shm-usage', '--no-sandbox', '--num-raster-threads=1'],
 });
