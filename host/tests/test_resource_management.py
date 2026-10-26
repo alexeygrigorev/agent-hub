@@ -97,6 +97,14 @@ class GateTests(unittest.TestCase):
         self.assertFalse(rm.is_reapable_session(_entry(state="")))
         self.assertFalse(rm.is_reapable_session(_entry(native_created_at_ms=None)))
 
+    def test_interactive_mode_never_reaped(self):
+        # RM-PROTECT-5: Hub-linked headless only; interactive goals are
+        # sampled at most even when the managed flag were ever loose.
+        self.assertFalse(rm.is_reapable_session(_entry(mode="interactive")))
+        self.assertTrue(rm.is_reapable_session(_entry(mode="headless")))
+        # Mode absent (older server): the tightened managed flag decides.
+        self.assertTrue(rm.is_reapable_session(_entry()))
+
     def test_classify_terminal_idle_dead(self):
         now = 10_000_000
         self.assertEqual(rm.classify_reason(_entry(state="failed"), "exited", False, 3_600_000, now), "terminal")

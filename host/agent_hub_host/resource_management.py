@@ -693,10 +693,19 @@ def _output_digest(text: str) -> str:
 
 
 def is_reapable_session(entry: Any) -> bool:
-    """Never touch non-managed, keep, or unknown-state sessions."""
+    """Never touch non-managed, non-headless, keep, or unknown-state sessions.
+
+    Interactive sessions (Alexey's own included) are sampled at most, never
+    reaped: the server tightens ``managed`` to Hub-linked headless, and the
+    host additionally refuses any entry whose exposed ``mode`` is present
+    and not ``headless`` (defense in depth for the no-human-session-stop
+    constraint)."""
     if not isinstance(entry, dict):
         return False
     if not entry.get("managed"):
+        return False
+    mode = entry.get("mode")
+    if mode is not None and mode != "headless":
         return False
     if entry.get("keep"):
         return False
