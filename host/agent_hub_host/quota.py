@@ -27,6 +27,11 @@ def add_commands(sub):
     parser.add_argument("--account", default=None, help="Limit to one account label")
     parser.add_argument("--admin-token-file", default=None, help="Use an existing private Hub operator token for this read")
     parser.add_argument("--json", action="store_true", help="Emit raw JSON instead of text")
+    parser.add_argument("tbm", nargs="?", default=None, choices=["pacing", "banked", "kill-switch"],
+                        help="TBM view: pacing, banked, or kill-switch (fleet filters do not apply)")
+    parser.add_argument("kill_action", nargs="?", default=None, choices=["on", "off"],
+                        help="kill-switch write: on|off (read when omitted)")
+    parser.add_argument("--reason", default=None, help="Reason for kill-switch on|off")
 
 
 def _label(value, what):
@@ -66,10 +71,36 @@ def fetch_quota(host=None, provider=None, engine=None, account=None, admin_token
 
 
 def execute(args):
-    kwargs = dict(host=args.host, provider=args.provider, engine=args.engine, account=args.account)
-    if getattr(args, 'admin_token_file', None) is not None:
-        kwargs['admin_token_file'] = args.admin_token_file
-    return fetch_quota(**kwargs)
+    tbm_view = getattr(args, "tbm", None)
+    if tbm_view is None:
+        kwargs = dict(host=args.host, provider=args.provider, engine=args.engine, account=args.account)
+        if getattr(args, 'admin_token_file', None) is not None:
+            kwargs['admin_token_file'] = args.admin_token_file
+        if getattr(args, "kill_action", None) is not None or getattr(args, "reason", None) is not None:
+            raise ValueError("Invalid quota arguments")
+        return fetch_quota(**kwargs)
+    # TBM views do not take fleet filters; fail loudly instead of silently ignoring them.
+    for key in ("host", "provider", "engine", "account", "admin_token_file"):
+        if getattr(args, key, None) is not None:
+            raise ValueError("Invalid quota arguments: filters do not apply to '%s'" % tbm_view)
+    from . import tbm as tbm_cli
+    if tbm_view == "pacing":
+        if getattr(args, "kill_action", None) is not None or getattr(args, "reason", None) is not None:
+            raise ValueError("Invalid quota arguments")
+        return tbm_cli.get_pacing()
+    if tbm_view == "banked":
+        if getattr(args, "kill_action", None) is not None or getattr(args, "reason", None) is not None:
+            raise ValueError("Invalid quota arguments")
+        return tbm_cli.get_banked()
+    if tbm_view == "kill-switch":
+        action = getattr(args, "kill_action", None)
+        reason = getattr(args, "reason", None)
+        if action is None:
+            if reason is not None:
+                raise ValueError("Invalid quota arguments")
+            return tbm_cli.get_kill_switch()
+        return tbm_cli.set_kill_switch(tbm_cli.parse_kill_action(action), reason)
+    raise ValueError("Invalid quota view")
 
 
 def render_text(data):
