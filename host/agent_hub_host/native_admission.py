@@ -12,7 +12,7 @@ from importlib import resources
 from pathlib import Path
 
 from .fleet import quota_metadata, run_json
-from .model_contract import configured_selection
+from .model_contract import canonical_account_label, configured_selection
 
 
 def routing_rules():
@@ -26,7 +26,7 @@ def probe(payload, service, account, engine, runner=run_json):
     now = dt.datetime.now(dt.timezone.utc)
     result = dict(launch_allowed=False, profile_supported=False, account_label=account,
                   observed_at=now.isoformat(), model_supported=False)
-    if (not isinstance(payload, dict) or payload.get('account') != account or
+    if (not isinstance(payload, dict) or canonical_account_label(payload.get('account')) != canonical_account_label(account) or
             payload.get('engine') != engine or payload.get('profile') is not None or
             payload.get('mode') not in ('interactive', 'headless')):
         return result

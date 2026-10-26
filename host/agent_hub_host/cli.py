@@ -799,7 +799,10 @@ def main():
         try:
             settings = load_settings()
         except Exception:
-            settings = {"workspaces": {}, "subscriptions": [], "capabilities": [], "max_agents": 1}
+            # Degraded work-claim sync must never invent host concurrency: no
+            # max_agents key, so no caller can PUT a defaulted value. (sync_once
+            # never PUTs capabilities; this keeps any future consumer safe.)
+            settings = {"workspaces": {}, "subscriptions": [], "capabilities": []}
         if getattr(args, "dry_run", False):
             import time
             from .bridge import get_authoritative_state_dir

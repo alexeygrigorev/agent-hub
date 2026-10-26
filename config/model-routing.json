@@ -1,6 +1,9 @@
 {
   "version": 1,
   "default_tier": "daily",
+  "account_aliases": {
+    "shared-go": ["urgent-muse"]
+  },
   "aliases": {
     "smart": "deep",
     "hard": "deep",

@@ -352,6 +352,17 @@ def load_settings(path=None):
     maximum = data.get('max_agents', 1)
     if type(maximum) is not int or not 1 <= maximum <= 100:
         raise ValueError('Invalid machine concurrency')
+    # A relabel lists ONE side: the local label or its canonical alias, never
+    # both. Two subscriptions canonicalizing to the same (engine, profile,
+    # account) identity would make _route() ambiguous, so fail fast here.
+    from .model_contract import canonical_account_label
+    seen_routes = set()
+    for sub in data.get('subscriptions', []):
+        route_key = (canonical_account_label(sub.get('account_label')),
+                     sub.get('engine', sub.get('service')), sub.get('profile'))
+        if route_key in seen_routes:
+            raise ValueError('Duplicate account route after alias canonicalization')
+        seen_routes.add(route_key)
     # M15d trusted cleanup-root allowlist (plumbing only): explicit absolute
     # host paths under which owned per-session worktrees may be removed after
     # confirmed stop. Validated strictly at use time by
@@ -1458,7 +1469,9 @@ class Dispatcher:
                       and all(isinstance(arg, str) and arg and '\0' not in arg for arg in sub['startup_argv'])))]
 
     def _route(self, offer):
-        matches = [s for s in self.settings["subscriptions"] if s["account_label"] == offer.get("account") and s.get("engine", s["service"]) == offer.get("engine") and s.get("profile") == offer.get("profile")]
+        from .model_contract import canonical_account_label
+        wanted = canonical_account_label(offer.get("account"))
+        matches = [s for s in self.settings["subscriptions"] if canonical_account_label(s["account_label"]) == wanted and s.get("engine", s["service"]) == offer.get("engine") and s.get("profile") == offer.get("profile")]
         if len(matches) != 1:
             raise ValueError("Local account/profile/workspace is not configured")
         # Validates map membership or workspace_roots / worktrees identity paths.
@@ -1554,8 +1567,14 @@ class Dispatcher:
         if offer.get("task_id") is not None:
             if not isinstance(offer["task_id"], str) or not LABEL.fullmatch(offer["task_id"]):
                 raise ValueError("Invalid task id")
-        gate = self.runner(sub["admission_argv"], payload={k: offer.get(k) for k in ["mode", "engine", "profile", "account", "workspace", "selection"]})
-        if gate.get("launch_allowed") is not True or gate.get("profile_supported") is not True or gate.get("account_label") != sub["account_label"]:
+        from .model_contract import canonical_account_label
+        admission_payload = {k: offer.get(k) for k in ["mode", "engine", "profile", "account", "workspace", "selection"]}
+        # The admission gate is configured with the local subscription
+        # identity; the Hub route label may be its canonical alias during
+        # a relabel (_route already pinned canonical identity above).
+        admission_payload["account"] = sub["account_label"]
+        gate = self.runner(sub["admission_argv"], payload=admission_payload)
+        if gate.get("launch_allowed") is not True or gate.get("profile_supported") is not True or canonical_account_label(gate.get("account_label")) != canonical_account_label(sub["account_label"]):
             gate_reason = gate.get("reason") if isinstance(gate.get("reason"), str) else ""
             # Preserve host-side gate slugs (intake 59a6f44a AC3/AC4): a managed
             # Codex quota-gate refusal must surface as codex_quota_gate_* in
@@ -1739,7 +1758,7 @@ class Dispatcher:
                     return False
                 if r.get("task_fit") != 1.0:
                     return False
-                if "account_label" in r and r.get("account_label") != sub["account_label"]:
+                if "account_label" in r and canonical_account_label(r.get("account_label")) != canonical_account_label(sub["account_label"]):
                     return False
                 if "profile" in r and r.get("profile") != sub.get("profile"):
                     return False
@@ -1765,7 +1784,10 @@ class Dispatcher:
             argv = launch_argv(device_auth, argv)
         path = "/api/fleet/launches/" + offer_id
         # An uncertain response here leaves the server reservation intact and performs no native effect.
-        self.request("POST", path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": sub["account_label"], **({"model": selection["model"]} if selection else {})})
+        # Claim with the offered (registry route) account: the server binds the
+        # claim to the offered route, and _route plus the admission gate above
+        # already verified canonical identity with the local subscription.
+        self.request("POST", path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": offer.get("account") or sub["account_label"], **({"model": selection["model"]} if selection else {})})
         from .launch_diagnostics import capture_log_offsets
         log_offsets = capture_log_offsets(sub.get("launcher_provider"))
         launched_at_ts = time.time()
@@ -1844,7 +1866,7 @@ class Dispatcher:
                     if not rec_profile or rec_profile != sub["profile"]:
                         raise ValueError("Native profile receipt mismatch")
                 if "account_label" in details:
-                    if details.get("account_label") != sub["account_label"]:
+                    if canonical_account_label(details.get("account_label")) != canonical_account_label(sub["account_label"]):
                         raise ValueError("Native account receipt mismatch")
                 elif sub.get("profile") is not None:
                     raise ValueError("Native account receipt mismatch")
@@ -2163,8 +2185,12 @@ class Dispatcher:
             )
         except Exception as exc:
             workclaim_summary = {"ok": False, "error": (type(exc).__name__ or "Error")[:64]}
-        if 'capabilities' in self.settings:
-            self.request('PUT', '/api/fleet/routing/capabilities', {'needs': self.settings['capabilities'], 'max_agents': self.settings.get('max_agents', 1), 'runners': [{'engine': s.get('engine', s['service']), 'profile': s.get('profile'), 'account': s['account_label'], 'model': s['launcher_model'], 'effort': s.get('launcher_effort')} for s in self.settings['subscriptions'] if s.get('launcher_model') and s.get('admission_argv')]})
+        # Never advertise a defaulted concurrency: a settings state without an
+        # explicit max_agents (hand edit mid-relabel, generated file, degraded
+        # load) must not overwrite the real host concurrency. The server keeps
+        # the last advertised value until a fully specified settings load PUTs.
+        if 'capabilities' in self.settings and 'max_agents' in self.settings:
+            self.request('PUT', '/api/fleet/routing/capabilities', {'needs': self.settings['capabilities'], 'max_agents': self.settings['max_agents'], 'runners': [{'engine': s.get('engine', s['service']), 'profile': s.get('profile'), 'account': s['account_label'], 'model': s['launcher_model'], 'effort': s.get('launcher_effort')} for s in self.settings['subscriptions'] if s.get('launcher_model') and s.get('admission_argv')]})
         from .launcher_recovery import settle_retired_legacy
         legacy_settled = settle_retired_legacy(self.settings.get('launcher', {}))
         reconciled = self.reconcile_launches()

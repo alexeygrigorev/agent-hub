@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "files": [
+    "config/model-routing.json",
+    "scripts/session-host-supervisor.py",
+    "scripts/metrics-dashboard-export.py",
+    "pyproject.toml",
+    "uv.lock"
+  ],
+  "hashed_trees": [
+    "host"
+  ]
+}

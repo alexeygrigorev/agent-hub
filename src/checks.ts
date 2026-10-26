@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS hub_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS hub_check_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, at TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, action TEXT);
 ` + CHECK_SLOT_SCHEMA;
 
-export const CHECK_KINDS = ['liveness', 'quota', 'http', 'inbox_backlog', 'conversation_backlog', 'delivery_slo', 'routine'] as const;
+export const CHECK_KINDS = ['liveness', 'quota', 'http', 'inbox_backlog', 'conversation_backlog', 'delivery_slo', 'dispatch_route', 'routine'] as const;
 // 40 characters keeps check-<name>-<slot> within the 64-character fleet idempotency key.
 const NAME = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 const LABEL = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
@@ -48,13 +48,20 @@ export function validateCheck(c: any): { row: any } | { error: string } {
   if (!CHECK_KINDS.includes(c.kind)) return { error: 'invalid_check_kind' };
   if (!Number.isInteger(c.interval_s) || c.interval_s < 300 || c.interval_s > 7 * 86400) return { error: 'invalid_interval' };
   const params = c.params ?? {};
-  if (!plain(params, ['url', 'expect_status', 'min_percent', 'actor', 'max_age_s', 'conversation_id'])) return { error: 'invalid_params' };
+  if (!plain(params, ['url', 'expect_status', 'min_percent', 'actor', 'max_age_s', 'conversation_id', 'max_consecutive', 'window_s'])) return { error: 'invalid_params' };
   if (c.kind === 'http') {
     let url: URL | null = null; try { url = new URL(params.url); } catch {}
     if (!url || url.protocol !== 'https:' || url.username || url.password || params.url.length > 512) return { error: 'invalid_http_url' };
     if (params.expect_status !== undefined && (!Number.isInteger(params.expect_status) || params.expect_status < 100 || params.expect_status > 599)) return { error: 'invalid_expect_status' };
   }
   if (c.kind === 'quota' && params.min_percent !== undefined && (typeof params.min_percent !== 'number' || params.min_percent < 0 || params.min_percent > 100)) return { error: 'invalid_min_percent' };
+  if (c.kind === 'dispatch_route') {
+    if (!plain(params, ['max_consecutive', 'window_s'])) return { error: 'invalid_params' };
+    if (params.max_consecutive !== undefined && (!Number.isInteger(params.max_consecutive) || params.max_consecutive < 2 || params.max_consecutive > 20)) return { error: 'invalid_max_consecutive' };
+    if (params.window_s !== undefined && (!Number.isInteger(params.window_s) || params.window_s < 60 || params.window_s > 3600)) return { error: 'invalid_window_s' };
+  } else if (params.max_consecutive !== undefined || params.window_s !== undefined) {
+    return { error: 'invalid_params' };
+  }
   if (c.kind === 'inbox_backlog' && (typeof params.actor !== 'string' || !TEXT(params.actor, 128) || !Number.isInteger(params.max_age_s) || params.max_age_s < 60)) return { error: 'invalid_backlog_params' };
   if (c.kind === 'delivery_slo') {
     if (params.actor !== undefined && (typeof params.actor !== 'string' || !TEXT(params.actor, 128))) return { error: 'invalid_slo_actor' };
@@ -86,6 +93,10 @@ export function validateCheck(c: any): { row: any } | { error: string } {
 
 export const DEFAULT_CHECKS = [
   { name: 'liveness', kind: 'liveness', interval_s: 300, params: {}, action: { type: 'alert' }, enabled: true },
+  // Dispatch-route streak: N consecutive pre-start dispatch failures with the
+  // same reason inside the window (e.g. a bad relabel breaking every offer).
+  // Seeded by default; an operator who removes all checks keeps an empty list.
+  { name: 'dispatch-route', kind: 'dispatch_route', interval_s: 300, params: { max_consecutive: 3, window_s: 900 }, action: { type: 'alert' }, enabled: true },
 ];
 
 export class ChecksService {
@@ -249,6 +260,66 @@ export class ChecksService {
           count = Number(this.sql.exec('SELECT COUNT(*) AS n FROM messages WHERE acked_at IS NULL AND created_at < ? AND expires_at > ?', cutoff, this.now()).one().n);
           return count ? { status: 'fail', detail: `${count} unacknowledged message(s) older than ${maxAgeS}s (delivery SLO violated)` } : { status: 'pass', detail: `delivery SLO met across all inboxes (${maxAgeS}s limit)` };
         }
+      }
+      case 'dispatch_route': {
+        // Consecutive pre-start dispatch failures with the same reason inside
+        // the window (e.g. every offer refused after a bad relabel).
+        // Pre-claim rows ('queued', 'offered') are not outcomes and are
+        // skipped; any other non-matching row breaks its streak. Streaks are
+        // tracked globally and per route (machine/engine/account) so a
+        // healthy route cannot mask a broken one. Reasons are restricted to
+        // the server slug alphabet before entering the detail.
+        const maxConsecutive = p.max_consecutive ?? 3;
+        const windowS = p.window_s ?? 900;
+        if (!Number.isInteger(maxConsecutive) || maxConsecutive < 2 || maxConsecutive > 20) return { status: 'error', detail: 'invalid_max_consecutive' };
+        if (!Number.isInteger(windowS) || windowS < 60 || windowS > 3600) return { status: 'error', detail: 'invalid_window_s' };
+        const slug = (v: unknown): string | null => typeof v === 'string' && /^[a-z0-9_]{1,64}$/.test(v) ? v : null;
+        let rows: any[];
+        try {
+          rows = this.sql.exec(
+            "SELECT state, exit_reason, launch_error_json, machine_id, engine, account FROM fleet_launches WHERE updated_at >= ? ORDER BY updated_at DESC, rowid DESC LIMIT 100",
+            new Date(this.now() - windowS * 1000).toISOString()).toArray() as any[];
+        } catch {
+          return { status: 'error', detail: 'dispatch history unavailable' };
+        }
+        let gReason: string | null = null; let gRun = 0; let gBroken = false;
+        const perRoute = new Map<string, { reason: string | null; run: number; broken: boolean }>();
+        for (const launch of rows) {
+          if (launch.state === 'queued' || launch.state === 'offered') continue;
+          let diagnostic: any = null;
+          try { diagnostic = JSON.parse(launch.launch_error_json || 'null'); } catch { diagnostic = null; }
+          const exitReason = slug(launch.exit_reason);
+          const failed = launch.state === 'failed' && exitReason !== null && diagnostic &&
+            diagnostic.stage === 'dispatch_route' && slug(diagnostic.reason) === exitReason ? exitReason : null;
+          const key = `${launch.machine_id ?? ''}/${launch.engine ?? ''}/${launch.account ?? ''}`;
+          let entry = perRoute.get(key);
+          if (!entry) { entry = { reason: null, run: 0, broken: false }; perRoute.set(key, entry); }
+          if (!entry.broken) {
+            if (failed && (entry.reason === null || failed === entry.reason)) {
+              if (entry.reason === null) entry.reason = failed;
+              entry.run++;
+            } else {
+              entry.broken = true;
+            }
+          }
+          if (!gBroken) {
+            if (failed && (gReason === null || failed === gReason)) {
+              if (gReason === null) gReason = failed;
+              gRun++;
+            } else {
+              gBroken = true;
+            }
+          }
+        }
+        let worst: { key: string; reason: string; run: number } | null = null;
+        for (const [key, entry] of perRoute) {
+          if (entry.reason !== null && entry.run >= maxConsecutive && (!worst || entry.run > worst.run)) {
+            worst = { key, reason: entry.reason, run: entry.run };
+          }
+        }
+        if (worst) return { status: 'fail', detail: `${worst.run} consecutive dispatch_route failures with reason ${worst.reason} on route ${worst.key} in the last ${windowS}s` };
+        if (gReason !== null && gRun >= maxConsecutive) return { status: 'fail', detail: `${gRun} consecutive dispatch_route failures with reason ${gReason} in the last ${windowS}s` };
+        return { status: 'pass', detail: gReason ? `${gRun} recent dispatch_route failure(s) with reason ${gReason}, below threshold ${maxConsecutive}` : 'no recent dispatch_route failures' };
       }
       case 'conversation_backlog': {
         if (!deps.conversation) return { status: 'error', detail: 'conversation_unavailable' };

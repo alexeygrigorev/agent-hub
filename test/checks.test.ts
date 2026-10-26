@@ -33,8 +33,11 @@ async function fixture(fn: (checks: ChecksService, deps: ActionDeps & { log: any
 const row = (c: any) => { const v = validateCheck(c); if ('error' in v) throw new Error(v.error); return v.row; };
 
 describe('check definitions', () => {
-  it('seeds a default liveness check', () => fixture(async checks => {
-    expect(checks.list().map(c => [c.name, c.kind, c.interval_s, c.enabled])).toEqual([['liveness', 'liveness', 300, true]]);
+  it('seeds default liveness and dispatch-route checks', () => fixture(async checks => {
+    expect(checks.list().map(c => [c.name, c.kind, c.interval_s, c.enabled])).toEqual([
+      ['dispatch-route', 'dispatch_route', 300, true],
+      ['liveness', 'liveness', 300, true],
+    ]);
   }));
 
   it('keeps an intentionally empty configuration across restarts', () => fixture(async (checks, deps, clock, sql) => {
@@ -155,12 +158,88 @@ describe('running checks', () => {
 
   it('the liveness check opens per-subject alerts and notifies once', () => fixture(async (checks, deps, clock, sql) => {
     sql.exec('INSERT INTO machines (id, name, hostname, registered_at, last_checkin_at, drained) VALUES (?, ?, ?, ?, ?, 0)', 'laptop', 'laptop', 'laptop', new Date(start).toISOString(), new Date(start - 3600000).toISOString());
+    checks.replace([row({ name: 'liveness', kind: 'liveness', interval_s: 300 })]);
     const [result] = await checks.runDue(deps);
     expect(result.status).toBe('fail');
     expect(deps.log).toEqual([['notify', 'machine', 'laptop', 'offline']]);
     clock.t += 300000;
     await checks.runDue(deps);
     expect(deps.log).toHaveLength(1);
+  }));
+
+  it('validates dispatch_route params', () => {
+    const valid = { name: 'dr', kind: 'dispatch_route', interval_s: 300, params: { max_consecutive: 3, window_s: 900 } };
+    expect('row' in validateCheck(valid)).toBe(true);
+    expect('row' in validateCheck({ ...valid, params: {} })).toBe(true);
+    for (const max_consecutive of [1, 21, 1.5, '3']) expect('error' in validateCheck({ ...valid, params: { max_consecutive } })).toBe(true);
+    for (const window_s of [59, 3601, 1.5]) expect('error' in validateCheck({ ...valid, params: { window_s } })).toBe(true);
+    expect('error' in validateCheck({ ...valid, params: { max_consecutive: 3, actor: 'grok-bot' } })).toBe(true);
+    expect('error' in validateCheck({ name: 'live', kind: 'liveness', interval_s: 300, params: { max_consecutive: 3 } })).toBe(true);
+    expect('error' in validateCheck({ name: 'q', kind: 'quota', interval_s: 300, params: { window_s: 900 } })).toBe(true);
+  });
+
+  it('fires when consecutive dispatches fail at dispatch_route with the same reason', () => fixture(async (checks, deps, clock, sql) => {
+    const diag = (reason: string) => JSON.stringify({ reason, message: 'refused', stage: 'dispatch_route', error_type: 'ValueError' });
+    const fail = (id: string, reason: string, ageMs: number) =>
+      sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, mode, workspace, prompt, state, exit_reason, launch_error_json, created_at, updated_at) VALUES (?, 'a', 'human', 's', ?, '{}', 'm', 'opencode', 'urgent-muse', 'headless', 'w', 'p', 'failed', ?, ?, ?, ?)",
+        id, 'k-' + id, reason, diag(reason), new Date(start - ageMs).toISOString(), new Date(start - ageMs).toISOString());
+    fail('f1', 'dispatch_route_unconfigured', 600000);
+    fail('f2', 'dispatch_route_unconfigured', 300000);
+    fail('f3', 'dispatch_route_unconfigured', 60000);
+    checks.replace([row({ name: 'dr', kind: 'dispatch_route', interval_s: 300, params: { max_consecutive: 3, window_s: 900 } })]);
+    const [result] = await checks.runDue(deps);
+    expect(result.status).toBe('fail');
+    expect(result.detail).toContain('3 consecutive dispatch_route failures with reason dispatch_route_unconfigured');
+    expect(result.action).toBe('alert opened');
+    expect(deps.log).toEqual([['notify', 'check', 'dr', 'fail']]);
+  }));
+
+  it('a success or a different reason breaks the dispatch_route streak', () => fixture(async (checks, deps, clock, sql) => {
+    const diag = (reason: string) => JSON.stringify({ reason, message: 'refused', stage: 'dispatch_route', error_type: 'ValueError' });
+    sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, mode, workspace, prompt, state, created_at, updated_at) VALUES ('ok1', 'a', 'human', 's', 'k-ok1', '{}', 'm', 'opencode', 'urgent-muse', 'headless', 'w', 'p', 'running', ?, ?)",
+      new Date(start - 60000).toISOString(), new Date(start - 60000).toISOString());
+    sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, mode, workspace, prompt, state, exit_reason, launch_error_json, created_at, updated_at) VALUES ('f1', 'a', 'human', 's', 'k-f1', '{}', 'm', 'opencode', 'urgent-muse', 'headless', 'w', 'p', 'failed', 'dispatch_route_unconfigured', ?, ?, ?)",
+      diag('dispatch_route_unconfigured'), new Date(start - 300000).toISOString(), new Date(start - 300000).toISOString());
+    sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, mode, workspace, prompt, state, exit_reason, launch_error_json, created_at, updated_at) VALUES ('f2', 'a', 'human', 's', 'k-f2', '{}', 'm', 'opencode', 'urgent-muse', 'headless', 'w', 'p', 'failed', 'dispatch_route_unconfigured', ?, ?, ?)",
+      diag('dispatch_route_unconfigured'), new Date(start - 600000).toISOString(), new Date(start - 600000).toISOString());
+    checks.replace([row({ name: 'dr', kind: 'dispatch_route', interval_s: 300, params: { max_consecutive: 3, window_s: 900 } })]);
+    const [result] = await checks.runDue(deps);
+    expect(result.status).toBe('pass');
+    checks.replace([row({ name: 'dr2', kind: 'dispatch_route', interval_s: 300, params: { max_consecutive: 2, window_s: 900 } })]);
+    const [second] = await checks.runDue(deps);
+    expect(second.status).toBe('pass');
+  }));
+
+  it('a healthy route does not mask a broken route', () => fixture(async (checks, deps, clock, sql) => {
+    const diag = (reason: string) => JSON.stringify({ reason, message: 'refused', stage: 'dispatch_route', error_type: 'ValueError' });
+    const fail = (id: string, machine: string, engine: string, account: string, reason: string, ageMs: number) =>
+      sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, mode, workspace, prompt, state, exit_reason, launch_error_json, created_at, updated_at) VALUES (?, 'a', 'human', 's', ?, '{}', ?, ?, ?, 'headless', 'w', 'p', 'failed', ?, ?, ?, ?)",
+        id, 'k-' + id, machine, engine, account, reason, diag(reason), new Date(start - ageMs).toISOString(), new Date(start - ageMs).toISOString());
+    fail('b1', 'm', 'opencode', 'urgent-muse', 'dispatch_route_unconfigured', 700000);
+    fail('b2', 'm', 'opencode', 'urgent-muse', 'dispatch_route_unconfigured', 600000);
+    fail('b3', 'm', 'opencode', 'urgent-muse', 'dispatch_route_unconfigured', 500000);
+    // Newest row: a healthy codex launch on the same Hub must not break the
+    // opencode route streak; pre-claim rows never join or break a streak.
+    sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, mode, workspace, prompt, state, created_at, updated_at) VALUES ('ok1', 'a', 'human', 's', 'k-ok1', '{}', 'm', 'codex', 'shared-codex', 'headless', 'w', 'p', 'running', ?, ?)",
+      new Date(start - 60000).toISOString(), new Date(start - 60000).toISOString());
+    sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, mode, workspace, prompt, state, created_at, updated_at) VALUES ('q1', 'a', 'human', 's', 'k-q1', '{}', 'm', 'opencode', 'urgent-muse', 'headless', 'w', 'p', 'offered', ?, ?)",
+      new Date(start - 30000).toISOString(), new Date(start - 30000).toISOString());
+    checks.replace([row({ name: 'dr', kind: 'dispatch_route', interval_s: 300, params: { max_consecutive: 3, window_s: 900 } })]);
+    const [result] = await checks.runDue(deps);
+    expect(result.status).toBe('fail');
+    expect(result.detail).toContain('3 consecutive dispatch_route failures with reason dispatch_route_unconfigured on route m/opencode/urgent-muse');
+  }));
+
+  it('ignores dispatch_route failures outside the window', () => fixture(async (checks, deps, clock, sql) => {
+    const diag = JSON.stringify({ reason: 'dispatch_route_unconfigured', message: 'refused', stage: 'dispatch_route', error_type: 'ValueError' });
+    for (const [id, ageMs] of [['f1', 2000000], ['f2', 1900000], ['f3', 1800000]] as const) {
+      sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, summary, request_key, request_json, machine_id, engine, account, mode, workspace, prompt, state, exit_reason, launch_error_json, created_at, updated_at) VALUES (?, 'a', 'human', 's', ?, '{}', 'm', 'opencode', 'urgent-muse', 'headless', 'w', 'p', 'failed', 'dispatch_route_unconfigured', ?, ?, ?)",
+        id, 'k-' + id, diag, new Date(start - ageMs).toISOString(), new Date(start - ageMs).toISOString());
+    }
+    checks.replace([row({ name: 'dr', kind: 'dispatch_route', interval_s: 300, params: { max_consecutive: 3, window_s: 900 } })]);
+    const [result] = await checks.runDue(deps);
+    expect(result.status).toBe('pass');
+    expect(result.detail).toBe('no recent dispatch_route failures');
   }));
 });
 
