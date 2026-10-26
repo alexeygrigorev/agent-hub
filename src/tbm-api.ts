@@ -15,7 +15,11 @@ export async function handleTbmApi(request: Request, sql: SqlStorage, now = Date
   const as_of = new Date(now).toISOString();
   if (path === '/api/quota/pacing') {
     const pools = sql.exec("SELECT * FROM tbm_quota_pools WHERE pool_id != '*' ORDER BY provider, account, pool_id").toArray();
-    return reply({ as_of, pools, routing_factors: Object.fromEntries(loadProviderPacing(sql, now)) });
+    const tickTable = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='tbm_tick_state'").toArray().length;
+    const tick: any = tickTable ? sql.exec('SELECT * FROM tbm_tick_state WHERE id=1').toArray()[0] : null;
+    return reply({ as_of, pools, last_tick_ms: tick?.last_tick_ms ?? null,
+      controller: sql.exec('SELECT * FROM tbm_controller_state ORDER BY pool_id').toArray(),
+      routing_factors: Object.fromEntries(loadProviderPacing(sql, now)) });
   }
   if (path === '/api/quota/banked') {
     return reply({ as_of, tranches: sql.exec('SELECT * FROM tbm_banked_tranches ORDER BY expires_at_ms, tranche_id LIMIT 1000').toArray() });

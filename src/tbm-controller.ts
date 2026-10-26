@@ -216,7 +216,8 @@ export function recordSessionTokens(sql: SqlStorage, input: SessionTokensInput, 
     totTok,
     atMs
   );
-  upgradePendingSessionRewards(sql, nowMs, input.session_id);
+  // Native telemetry may arrive under a native key before the Hub session ends.
+  upgradePendingSessionRewards(sql, nowMs);
 }
 
 export interface SessionOutcomeInput {
@@ -404,7 +405,7 @@ export function recordSessionOutcomeReward(
     input.output_tokens
   );
   // If already recorded with known tokens (or still unknown), return existing idempotently.
-  if (existing && (Number(existing.tokens_known) === 1 || resolvedTokens === null)) {
+  if (existing && (resolvedTokens === null || existing.tokens_burned === resolvedTokens)) {
     return existing as RewardEventRow;
   }
 
@@ -535,13 +536,13 @@ export function recordSessionOutcomeReward(
 export function upgradePendingSessionRewards(sql: SqlStorage, nowMs = Date.now(), filterSessionId?: string): number {
   if (!hasTable(sql, 'tbm_reward_events')) return 0;
   const rows = filterSessionId
-    ? (sql.exec("SELECT * FROM tbm_reward_events WHERE event_id = ? AND tokens_known = 0", `session:${filterSessionId}`).toArray() as any[])
-    : (sql.exec("SELECT * FROM tbm_reward_events WHERE tokens_known = 0 AND event_id LIKE 'session:%' ORDER BY timestamp_ms DESC LIMIT 100").toArray() as any[]);
+    ? (sql.exec("SELECT * FROM tbm_reward_events WHERE event_id = ?", `session:${filterSessionId}`).toArray() as any[])
+    : (sql.exec("SELECT * FROM tbm_reward_events WHERE event_id LIKE 'session:%' ORDER BY timestamp_ms DESC LIMIT 100").toArray() as any[]);
   let upgraded = 0;
   for (const r of rows) {
     const sid = r.session_id || String(r.event_id).replace(/^session:/, '');
     const tokens = resolveNativeSessionTokens(sql, sid);
-    if (tokens !== null && tokens > 0) {
+    if (tokens !== null && tokens > 0 && tokens !== r.tokens_burned) {
       const outcome: SessionOutcomeInput['outcome'] = Number(r.useful_work_reward) > 0 ? 'done' : 'failed';
       recordSessionOutcomeReward(sql, {
         session_id: sid,
@@ -1005,11 +1006,10 @@ export function tickTbm(sql: SqlStorage, nowMs = Date.now()): TbmTickSummary {
       nowMs
     );
     sql.exec(
-      'UPDATE tbm_quota_pools SET current_burn_rate_tpm = ?, target_burn_rate_tpm = ?, pacing_ratio = ?, last_updated_ms = ? WHERE pool_id = ?',
+      'UPDATE tbm_quota_pools SET current_burn_rate_tpm = ?, target_burn_rate_tpm = ?, pacing_ratio = ? WHERE pool_id = ?',
       observedBurnTpm,
       step.targetTpm,
       step.pacingRatio,
-      nowMs,
       pool.pool_id
     );
     poolsUpdated++;

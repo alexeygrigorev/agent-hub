@@ -13,6 +13,7 @@ import { reconcileAccountCapacity } from './account_capacity';
 import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
 import { freshCatalogs } from './catalog-freshness';
 import { syncTbmFromServerAccounts } from './tbm-ingestion';
+import { recordSessionTokens } from './tbm-controller';
 
 export const FLEET_SCHEMA = `
 CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
@@ -1111,7 +1112,9 @@ export class FleetService {
       if (!object(data, ['sessions']) || !Array.isArray(data.sessions) || data.sessions.length > 500) return response({ error: 'invalid_sessions' }, 400);
       const ids = new Set();
       for (const s of data.sessions) {
-        if (!object(s, ['native_id', 'tag', 'engine', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms', 'confirmed_exit', 'progress']) ||
+        if (!object(s, ['native_id', 'tag', 'engine', 'phase', 'agent_state', 'workspace', 'cwd', 'profile', 'account', 'last_activity_at', 'created_at_ms', 'confirmed_exit', 'progress', 'tokens']) ||
+            (s.tokens !== undefined && (!object(s.tokens, ['input_tokens', 'output_tokens']) ||
+              !['input_tokens', 'output_tokens'].every(k => Number.isInteger(s.tokens[k]) && s.tokens[k] >= 0 && s.tokens[k] <= 1e12))) ||
             (s.progress !== undefined && (!object(s.progress, ['last_progress_at', 'headless', 'agent_alive', 'orphaned', 'cleanup']) ||
               typeof s.progress.last_progress_at !== 'string' || !fresh(s.progress.last_progress_at, this.now() + 60000, 366 * 86400000) ||
               typeof s.progress.headless !== 'boolean' || ![true, false, null].includes(s.progress.agent_alive) ||
@@ -1149,6 +1152,8 @@ export class FleetService {
         let written = 0;
         const cleanSessions: any[] = [];
         for (const s of data.sessions) {
+          if (s.tokens) recordSessionTokens(this.sql, { session_id: `${caller.machineId}:${s.native_id}`,
+            native_id: s.native_id, tag: s.tag, engine: s.engine, account: s.account, ...s.tokens }, this.now());
           if (stoppedSessions.has(s.native_id)) {
             const stoppedCreated = stoppedSessions.get(s.native_id);
             if (stoppedCreated === null || stoppedCreated === undefined || s.created_at_ms === null || s.created_at_ms === undefined || s.created_at_ms <= stoppedCreated) {

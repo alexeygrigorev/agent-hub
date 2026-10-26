@@ -31,6 +31,8 @@ import { approvalAuthorityMatches, assignApprovalAuthority } from './host_enroll
 import { ensureRootScheduling, getRootScheduling, isRootSchedulingEnabled, setRootScheduling } from './root_scheduling';
 import { QuotaStore, dedupeAccountsByCanonical, handleQuotaRoutes } from './quota';
 import { handleTbmApi } from './tbm-api';
+import { tickTbm } from './tbm-controller';
+import { syncStoredTbmSnapshots } from './tbm-ingestion';
 import { SessionControlService } from './session_control';
 import { StatusService, type StatusMachineAuth } from './status';
 import { MetricsStore, handleMetricsRoutes } from './metrics';
@@ -1689,6 +1691,7 @@ export class Hub extends DurableObject {
 
   /** Cron and manual entry point for scheduled checks. */
   async runChecks(only?: string) {
+    this.runTbmTick();
     this.livenessService.prune();
     const results = await this.checksService.runDue({
       liveness: this.livenessService,
@@ -1792,8 +1795,22 @@ export class Hub extends DurableObject {
     if (alarm === null || alarm > Date.now() + 60000) await this.ctx.storage.setAlarm(Date.now() + 60000);
   }
 
+  /** Durable cadence survives hibernation. Alarm plus the existing five-minute cron own the tick. */
+  runTbmTick(nowMs = Date.now()) {
+    this.sql.exec('CREATE TABLE IF NOT EXISTS tbm_tick_state (id INTEGER PRIMARY KEY, last_tick_ms INTEGER NOT NULL, summary_json TEXT NOT NULL)');
+    const previous: any = this.sql.exec('SELECT last_tick_ms FROM tbm_tick_state WHERE id=1').toArray()[0];
+    if (previous && nowMs - previous.last_tick_ms < 240000) return;
+    return this.ctx.storage.transactionSync(() => {
+      syncStoredTbmSnapshots(this.sql, nowMs);
+      const summary = tickTbm(this.sql, nowMs);
+      this.sql.exec('INSERT OR REPLACE INTO tbm_tick_state VALUES (1,?,?)', nowMs, JSON.stringify(summary));
+      return summary;
+    });
+  }
+
   async alarm() {
     const now = (this.jobsService as any).now ? (this.jobsService as any).now() : new Date();
+    this.runTbmTick(now.getTime());
     try { this.hostHistoryService.sample(); } catch { console.warn('resource_history_sampling_failed'); }
     const cleanup = this.busService.retentionCleanup(now.getTime(), 100);
     const nextAlarm = this.jobsService.processAlarms();

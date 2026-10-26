@@ -120,6 +120,81 @@ def _iter_jsonl_files(root: Path, since_ms: int) -> List[Path]:
     return [path for _, path in found[:MAX_FILES_PER_SOURCE]]
 
 
+_SESSION_TOKEN_CACHE = {}
+
+
+def native_session_tokens(row, locator=None):
+    """Return bounded numeric telemetry for one exact native incarnation.
+
+    Reuse the progress adapter's sidecar/cwd/time binding. Never infer identity
+    from the newest transcript, and never send transcript paths or contents.
+    """
+    if row.get('engine') not in ('codex', 'zcodex', 'opencode'):
+        return None
+    if type(row.get('created_at_ms')) is not int or not isinstance(row.get('id'), str):
+        return None
+    from .native_progress import NativeTranscriptProgress
+    locator = locator or NativeTranscriptProgress()
+    try:
+        if row['engine'] == 'opencode':
+            environment = row.get('env') or {}
+            db = Path(environment.get('OPENCODE_DB') or Path(locator.opencode_data) / 'opencode/opencode.db')
+            if not db.is_absolute() or not db.is_file():
+                return None
+            with sqlite3.connect(db.as_uri() + '?mode=ro', uri=True, timeout=.05) as conn:
+                for table in ('session_v2', 'session'):
+                    try:
+                        rows = conn.execute(f'''SELECT tokens_input,tokens_output,tokens_cache_read,tokens_cache_write,tokens_reasoning
+                            FROM {table} WHERE directory=? AND parent_id IS NULL AND time_created BETWEEN ? AND ? LIMIT 2''',
+                            (row.get('cwd') or row.get('workspace'), row['created_at_ms'] - 10000, row['created_at_ms'] + 10000)).fetchall()
+                    except sqlite3.Error:
+                        continue
+                    if len(rows) != 1:
+                        return None
+                    values = rows[0]
+                    if any(_finite_int(v) is None for v in values):
+                        return None
+                    inp, out, cache_read, cache_write, reasoning = values
+                    return {'input_tokens': inp + cache_read + cache_write, 'output_tokens': out + reasoning}
+            return None
+        path = locator.locate(row)
+        if path is None:
+            return None
+        stat = path.stat()
+        key = (row['id'], row['created_at_ms'], stat.st_size, stat.st_mtime_ns)
+        if key in _SESSION_TOKEN_CACHE:
+            return _SESSION_TOKEN_CACHE[key]
+        latest = None
+        with path.open('rb') as stream:
+            if stat.st_size > 4 * 1024 * 1024:
+                stream.seek(-4 * 1024 * 1024, 2)
+                stream.readline()
+            for line in stream:
+                try:
+                    event = json.loads(line)
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                payload = event.get('payload') or {}
+                if event.get('type') == 'token_usage_record':
+                    usage = payload.get('thread_token_usage')
+                elif event.get('type') == 'event_msg' and payload.get('type') == 'token_count':
+                    usage = (payload.get('info') or {}).get('total_token_usage')
+                else:
+                    continue
+                if not isinstance(usage, dict):
+                    continue
+                inp, out = _finite_int(usage.get('input_tokens')), _finite_int(usage.get('output_tokens'))
+                if inp is not None and out is not None:
+                    # Codex cached/reasoning counts are subsets of these totals.
+                    latest = {'input_tokens': inp, 'output_tokens': out}
+        if len(_SESSION_TOKEN_CACHE) >= 500:
+            _SESSION_TOKEN_CACHE.clear()
+        _SESSION_TOKEN_CACHE[key] = latest
+        return latest
+    except (OSError, ValueError, TypeError, KeyError, sqlite3.Error):
+        return None
+
+
 def collect_codex(home: str, since_ms: int, now_ms: int,
                    engine: str, account: str) -> Dict[Tuple[int, str], List[int]]:
     """Scan one codex-family sessions tree. Returns {(hour_ms, project): [in, out]}.

@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
+import { evaluateTbmAdmission } from '../src/quota_admission';
+import { loadPools, loadProviderPacing } from '../src/pacing';
 
 const inDO: any = runInDurableObject;
 const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
@@ -22,6 +24,30 @@ beforeEach(async () => {
 });
 
 describe('TBM public REST composition', () => {
+  it('scheduled controller persists state and real ingestion triggers floors', async () => {
+    const now = Date.now();
+    const response = await call('server', { captured_at: new Date(now - 1000).toISOString(), accounts: [{
+      account: 'staged-low', provider: 'go', quota: { status: 'ok', error: null,
+        observed_at: new Date(now - 1000).toISOString(), details: { limit_reached: false }, windows: {
+          '5h': { present: true, rolling: false, percent_remaining: 3, reset_at: new Date(now + 3600000).toISOString() },
+        } },
+    }] });
+    expect(response.status).toBe(200);
+    await inDO(stub(), async (h: any) => {
+      h.sql.exec('DROP TABLE IF EXISTS tbm_tick_state');
+      await h.alarm();
+      const state: any = h.sql.exec("SELECT * FROM tbm_controller_state WHERE pool_id='go:staged-low:5h'").one();
+      expect(state.last_at_ms).toBeGreaterThanOrEqual(now);
+      const pool = loadPools(h.sql).find(p => p.account === 'staged-low')!;
+      expect(pool.last_updated_ms).toBe(now - 1000); // controller time never falsifies quota observation age
+      expect(evaluateTbmAdmission({ pools: [pool], provider: 'go', nowMs: now })).toMatchObject({ ok: false, reason: 'hard_floor' });
+      expect(loadProviderPacing(h.sql, now).get('go')?.halted).toBe(true);
+      h.runTbmTick(state.last_at_ms + 60000);
+      expect(h.sql.exec('SELECT last_tick_ms FROM tbm_tick_state WHERE id=1').one().last_tick_ms).toBe(state.last_at_ms);
+      h.runTbmTick(state.last_at_ms + 240000);
+      expect(h.sql.exec('SELECT last_tick_ms FROM tbm_tick_state WHERE id=1').one().last_tick_ms).toBe(state.last_at_ms + 240000);
+    });
+  });
   it('requires authenticated admin and cookie CSRF for kill-switch changes', async () => {
     expect((await SELF.fetch('https://hub.test/api/quota/pacing')).status).toBe(401);
     expect((await call('kill-switch', { active: true }, false)).status).toBe(403);

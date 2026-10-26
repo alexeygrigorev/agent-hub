@@ -28,8 +28,8 @@ const quotaJson = (windows: Record<string, { pct: number | null; reset: string |
 });
 
 describe('quota window history (AC1)', () => {
-  it('samples per account AND per window with reset times, sampled within 15 min and retained 32 days', () => fixture((h) => {
-    h.sql.exec("INSERT INTO server_quota_snapshots VALUES('shared-codex','codex',?,?)",
+  it('samples per account AND per window with reset times, sampled within 15 min and retained 32 days', () => fixture((h, hub) => {
+    hub.sql.exec("INSERT INTO server_quota_snapshots VALUES('shared-codex','codex',?,?)",
       new Date(NOW - 5 * 60000).toISOString(), quotaJson({ '5h': { pct: null, reset: null }, '7d': { pct: 75, reset: '2026-11-01T06:10:58Z' }, monthly: { pct: null, reset: null } }));
     h.sample();
     const data = h.query('24h');
@@ -46,7 +46,7 @@ describe('quota window history (AC1)', () => {
   }));
   it('never holds stale snapshots forward: history keeps true timestamps only', () => fixture((h, hub, c) => {
     const staleAt = NOW - QUOTA_WINDOW_STALE_MS - 60000;
-    h.sql.exec("INSERT INTO server_quota_snapshots VALUES('shared-codex','codex',?,?)",
+    hub.sql.exec("INSERT INTO server_quota_snapshots VALUES('shared-codex','codex',?,?)",
       new Date(staleAt).toISOString(), quotaJson({ '7d': { pct: 75, reset: null } }));
     h.sample();
     // The genuine 21-minute-old measurement stays at its true time; nothing
@@ -76,11 +76,11 @@ describe('quota window history (AC1)', () => {
     const rows = hub.sql.exec('SELECT payload_json FROM resource_history').toArray() as any[];
     const kinds = new Set(rows.flatMap((r) => JSON.parse(r.payload_json).map((o: any) => o.kind)));
     expect(kinds.has('quota_window')).toBe(true);
-    h.sql.exec('DELETE FROM resource_history WHERE bucket_ms < ?', NOW - 32 * DAY);
+    hub.sql.exec('DELETE FROM resource_history WHERE bucket_ms < ?', NOW - 32 * DAY);
     expect(hub.sql.exec('SELECT COUNT(*) AS n FROM resource_history').one().n).toBeGreaterThan(0);
   }));
-  it('serves quota windows on the range API for 24h/7d/30d, rejecting bad ranges and anonymous callers', () => fixture(async (h) => {
-    h.sql.exec("INSERT INTO server_quota_snapshots VALUES('shared-codex','codex',?,?)",
+  it('serves quota windows on the range API for 24h/7d/30d, rejecting bad ranges and anonymous callers', () => fixture(async (h, hub) => {
+    hub.sql.exec("INSERT INTO server_quota_snapshots VALUES('shared-codex','codex',?,?)",
       new Date(NOW - 60000).toISOString(), quotaJson({ '7d': { pct: 75, reset: null } }));
     h.sample();
     for (const range of ['24h', '7d', '30d']) {
