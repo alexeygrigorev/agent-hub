@@ -139,3 +139,18 @@ class LaunchDiagnosticTests(unittest.TestCase):
                 # With start_offset after the error, it's skipped
                 info = diagnostic('The launcher command failed; unrecognized output was withheld.', engine='opencode', start_offsets={str(log_file): offset}, launched_at=time.time())
                 self.assertEqual(info['reason'], 'launcher_command_failed')
+
+    def test_unknown_profile_and_launcher_cli_errors_are_surfaced_not_withheld(self):
+        info = diagnostic('a: unknown profile hub-shared-codex\n', exit_code=1, stage='dispatch_interactive')
+        self.assertEqual(info['reason'], 'launcher_unknown_profile')
+        self.assertIn('a: unknown profile hub-shared-codex', info['message'])
+        self.assertEqual(info.get('tail'), 'a: unknown profile hub-shared-codex')
+        self.assertNotIn('withheld', info['message'])
+
+        cli_err = diagnostic('a: session tag already in use: hub-1234 secret=my-secret /private/dir/file\n', exit_code=1)
+        self.assertEqual(cli_err['reason'], 'launcher_command_failed')
+        self.assertIn('a: session tag already in use: hub-1234', cli_err['message'])
+        self.assertNotIn('my-secret', json.dumps(cli_err))
+        self.assertNotIn('/private/dir/file', json.dumps(cli_err))
+        self.assertNotIn('withheld', cli_err['message'])
+

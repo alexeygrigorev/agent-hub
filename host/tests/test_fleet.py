@@ -2287,5 +2287,24 @@ class ImportedCursorPrivateBoundaryTests(unittest.TestCase):
             self.assertIsNone(fleet.Dispatcher({}, journal_dir=tmp)._get_imported_cursor())
             self.assertEqual(json.loads((Path(tmp) / 'imported-cursor.json').read_text()), {'cursor': None})
 
+    def test_resolve_offer_cwd_accepts_configured_worktree_absolute_path_and_rejects_unconfigured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            repo = base / 'repo'
+            repo.mkdir()
+            wt_root = base / 'worktrees'
+            wt_dir = wt_root / 'wt-c4973943'
+            wt_dir.mkdir(parents=True)
+            unconfigured = base / 'outside'
+            unconfigured.mkdir()
+            cfg = {
+                'workspaces': {'demo': str(repo)},
+                'workspace_roots': [str(wt_root)],
+            }
+            resolved = fleet.resolve_offer_cwd(repo, str(wt_dir), cfg)
+            self.assertEqual(resolved, wt_dir)
+            with self.assertRaises(ValueError):
+                fleet.resolve_offer_cwd(repo, str(unconfigured), cfg)
+
 
 if __name__ == '__main__': unittest.main()

@@ -1,14 +1,33 @@
 /** Stop delivery is bounded independently of the native execution lease. */
 export const STOP_DELIVERY_MS = 8000;
+export const REACHABLE_STOP_DELIVERY_MS = 60000;
+const HOST_FRESH_CHECKIN_MS = 180000;
 
 export function expireUnclaimedStops(sql: SqlStorage, now: number, sessionId?: string, machineId?: string): void {
   const at = new Date(now).toISOString();
-  const cutoff = new Date(now - STOP_DELIVERY_MS).toISOString();
+  const offlineCutoff = new Date(now - STOP_DELIVERY_MS).toISOString();
+  const reachableCutoff = new Date(now - REACHABLE_STOP_DELIVERY_MS).toISOString();
+  const freshCheckinCutoff = new Date(now - HOST_FRESH_CHECKIN_MS).toISOString();
   sql.exec(`UPDATE session_control_commands SET state = 'failed', ack_json = ?, updated_at = ?
     WHERE kind = 'stop' AND state IN ('recorded','transported') AND claim_token IS NULL
-    AND created_at <= ? ${sessionId ? 'AND session_id = ?' : ''}
+    AND (
+      created_at <= ?
+      OR (
+        created_at <= ?
+        AND NOT EXISTS (
+          SELECT 1 FROM session_control_sessions s
+          LEFT JOIN machines m ON m.id = s.machine_id
+          WHERE s.id = session_control_commands.session_id
+            AND (
+              s.state = 'uncertain'
+              OR (m.id IS NOT NULL AND COALESCE(m.drained, 0) = 0 AND m.last_checkin_at IS NOT NULL AND m.last_checkin_at >= ?)
+            )
+        )
+      )
+    )
+    ${sessionId ? 'AND session_id = ?' : ''}
     ${machineId ? 'AND session_id IN (SELECT id FROM session_control_sessions WHERE machine_id = ?)' : ''}`,
-    JSON.stringify({outcome:'failed', reason:'stop_host_unreachable'}), at, cutoff,
+    JSON.stringify({outcome:'failed', reason:'stop_host_unreachable'}), at, reachableCutoff, offlineCutoff, freshCheckinCutoff,
     ...(sessionId ? [sessionId] : []), ...(machineId ? [machineId] : []));
 }
 

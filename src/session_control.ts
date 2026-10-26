@@ -23,7 +23,7 @@ import { registeredRepoLabel } from './repos';
 import { recordIntakeSessionLink, IntakeSessionLinkError } from './intake';
 import { ResourceManagement } from './resource-management';
 import { classifySessionStall, initSessionStalls, nativeObservationFresh, nativeProgress, orphanFailure, stallThreshold } from './session_stall';
-import { STOP_DELIVERY_MS, expireUnclaimedStops, refreshObservedHostFamily, visibleSessionPrefixMatches } from './session_stop';
+import { STOP_DELIVERY_MS, REACHABLE_STOP_DELIVERY_MS, expireUnclaimedStops, refreshObservedHostFamily, visibleSessionPrefixMatches } from './session_stop';
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { credentialActor } from './agent_registry';
 import { redact } from './routing';
@@ -90,8 +90,10 @@ const obj = (x: any, keys: string[]) => x !== null && typeof x === 'object' && !
 const parsed = (value: any, fallback: any = null) => { try { return JSON.parse(value); } catch { return fallback; } };
 
 function cwdOk(value: unknown): value is string {
-  if (typeof value !== 'string' || !value || value.length > 256) return false;
-  if (value.startsWith('/') || value.includes('\\') || value.includes(':') || /[\x00-\x1f\x7f]/.test(value)) return false;
+  if (typeof value !== 'string' || !value) return false;
+  if (value.startsWith('/')) return value.split('/').length >= 3 && absoluteWorkspaceOk(value);
+  if (/^[A-Za-z]:[\\/]/.test(value)) return value.slice(3).split(/[\\/]/).length >= 2 && absoluteWorkspaceOk(value);
+  if (value.length > 256 || value.includes('\\') || value.includes(':') || /[\x00-\x1f\x7f]/.test(value)) return false;
   return value.split('/').every(seg => seg.length > 0 && seg !== '.' && seg !== '..' && /^[A-Za-z0-9._-]{1,64}$/.test(seg));
 }
 
@@ -2223,7 +2225,51 @@ export class SessionControlService {
           return freshEnqueue({ max_bytes: input.max_bytes ?? 65536, mode }, BOUND_STATES, 'session_not_bound');
         }
         if (!obj(input, ['key']) || !label(input.key)) return response({ error: 'invalid_stop' }, 400);
-        return freshEnqueue({}, new Set([...STOPPABLE, 'stopped']), 'session_not_stoppable');
+        return this.transaction(() => {
+          const live: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', session.id).toArray()[0];
+          if (!live || !this.ownerOk(live, caller)) return response({ error: 'not_found' }, 404);
+          if (!new Set([...STOPPABLE, 'stopped']).has(live.state)) return response({ error: 'session_not_stoppable' }, 409);
+          const actor = actorName(caller);
+          const resp = this.enqueue(live, kind, actor, caller, input.key, {});
+          if (resp.status >= 400 || live.state !== 'uncertain' || live.binding_json) return resp;
+          // An unbound uncertain session whose fleet launch never recorded a
+          // native start and has no correlated live native row settles to
+          // stopped without stranding on stop_host_unreachable or stop_refused.
+          let noNative = true;
+          if (live.fleet_launch_id) {
+            try {
+              const launch: any = this.sql.exec('SELECT native_id FROM fleet_launches WHERE id = ?', live.fleet_launch_id).toArray()[0];
+              if (launch?.native_id) noNative = false;
+              const liveRows = this.sql.exec(
+                "SELECT 1 FROM fleet_sessions WHERE tag IN (?, ?) AND phase IN ('starting','running','broken','unknown','uncertain') LIMIT 1",
+                'hub-' + live.fleet_launch_id, 'task-hub-' + live.fleet_launch_id
+              ).toArray();
+              if (liveRows.length > 0) noNative = false;
+            } catch {}
+          }
+          if (!noNative) return resp;
+          const cmd: any = this.sql.exec('SELECT * FROM session_control_commands WHERE session_id = ? AND actor = ? AND request_key = ?', live.id, actor, input.key).toArray()[0];
+          if (!cmd) return resp;
+          const at = this.at();
+          const ack = {
+            outcome: 'delivered',
+            confirmed_exit: true,
+            native: { native_id: '00000000-0000-0000-0000-000000000000', tag: 'unbound', workspace: '/' },
+            reason: 'unbound_uncertain_no_native_process',
+          };
+          this.sql.exec("UPDATE session_control_commands SET state = 'acked', ack_json = ?, updated_at = ? WHERE id = ?", JSON.stringify(ack), at, cmd.id);
+          this.sql.exec("UPDATE session_control_sessions SET state = 'stopped', updated_at = ? WHERE id = ?", at, live.id);
+          if (live.fleet_launch_id) {
+            try {
+              this.sql.exec("UPDATE fleet_launches SET state = 'exited', finished_at = COALESCE(finished_at, ?), updated_at = ?, verification_status = 'verified' WHERE id = ? AND native_id IS NULL", at, at, live.fleet_launch_id);
+            } catch {}
+          }
+          return response({
+            command_id: cmd.id, session_id: cmd.session_id, kind: cmd.kind,
+            state: 'acked', generation: cmd.generation, correlation: cmd.correlation,
+            replay: resp.status === 200,
+          }, resp.status);
+        });
       }
       return response({ error: 'not_found' }, 404);
     }
@@ -2359,9 +2405,15 @@ export class SessionControlService {
         const gate = this.hostOk(session, caller);
         if (!gate.ok) return response({ error: gate.error }, gate.error === 'not_found' ? 404 : 409);
         if (input.correlation !== row.correlation) return response({ error: 'correlation_mismatch' }, 409);
-        if (row.kind === 'stop' && !row.claim_token && Date.parse(row.created_at) <= this.now() - STOP_DELIVERY_MS) {
-          expireUnclaimedStops(this.sql, this.now(), session.id);
-          return response({ error: 'stop_host_unreachable' }, 409);
+        if (row.kind === 'stop' && !row.claim_token) {
+          const machineRow: any = session.machine_id ? this.sql.exec('SELECT drained, last_checkin_at FROM machines WHERE id = ?', session.machine_id).toArray()[0] : null;
+          const checkinMs = typeof machineRow?.last_checkin_at === 'string' ? Date.parse(machineRow.last_checkin_at) : NaN;
+          const reachable = session.state === 'uncertain' || (machineRow && !machineRow.drained && Number.isFinite(checkinMs) && this.now() - checkinMs <= 180000);
+          const budgetMs = reachable ? REACHABLE_STOP_DELIVERY_MS : STOP_DELIVERY_MS;
+          if (Date.parse(row.created_at) <= this.now() - budgetMs) {
+            expireUnclaimedStops(this.sql, this.now(), session.id);
+            return response({ error: 'stop_host_unreachable' }, 409);
+          }
         }
         // Stored-cleanup fence: a cleanup --apply stop whose owner,
         // incarnation, or M15 eligibility drifted since enqueue MUST NOT

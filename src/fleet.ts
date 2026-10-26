@@ -49,6 +49,8 @@ const NATIVE_RESERVED = `(l.native_id = s.native_id OR (
   CASE WHEN json_valid(l.request_json) THEN
     CASE WHEN json_extract(l.request_json, '$.cwd') IS NULL OR json_extract(l.request_json, '$.cwd') = '.'
       THEN l.workspace
+      WHEN json_extract(l.request_json, '$.cwd') LIKE '/%' OR json_extract(l.request_json, '$.cwd') GLOB '[A-Za-z]:[/\\]*'
+      THEN json_extract(l.request_json, '$.cwd')
       ELSE rtrim(l.workspace, '/') || '/' || json_extract(l.request_json, '$.cwd') END
     END = s.workspace AND
   (SELECT COUNT(*) FROM fleet_sessions spawned WHERE spawned.machine_id = s.machine_id
@@ -202,6 +204,11 @@ function relativeCwdOk(value: unknown): value is string {
   if (typeof value !== 'string' || !value || value.length > 256) return false;
   if (value.startsWith('/') || value.includes('\\') || value.includes(':') || /[\x00-\x1f\x7f]/.test(value)) return false;
   return value === '.' || value.split('/').every(seg => seg.length > 0 && seg !== '.' && seg !== '..' && /^[A-Za-z0-9._-]{1,64}$/.test(seg));
+}
+function offerCwdOk(value: unknown): value is string {
+  if (relativeCwdOk(value)) return true;
+  if (typeof value !== 'string' || !absoluteWorkspaceOk(value)) return false;
+  return value.startsWith('/') ? value.split('/').length >= 3 : value.slice(3).split(/[\\/]/).length >= 2;
 }
 function object(value: any, keys: string[]): boolean {
   return value !== null && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(k => keys.includes(k));
@@ -628,7 +635,7 @@ export class FleetService {
       // session-control reserve handoff when the client omitted them; null
       // means absent, never a malformed value.
       (input.tier !== undefined && input.tier !== null && (typeof input.tier !== 'string' || !/^[A-Za-z0-9_-]{1,32}$/.test(input.tier))) ||
-      (input.cwd !== undefined && input.cwd !== null && !relativeCwdOk(input.cwd)) ||
+      (input.cwd !== undefined && input.cwd !== null && !offerCwdOk(input.cwd)) ||
       (input.with_goal !== undefined && (input.with_goal !== true || input.mode !== 'interactive' || (typeof input.prompt !== 'string' || !input.prompt.trim()))) ||
       (input.parent_id !== undefined && input.parent_id !== null && (typeof input.parent_id !== 'string' || !/^[a-f0-9-]{36}$/.test(input.parent_id))) ||
       (input.summary !== undefined && (typeof input.summary !== 'string' || input.summary.length > 240 || /[\x00-\x1f\x7f]/.test(input.summary))) ||
@@ -711,9 +718,10 @@ export class FleetService {
         rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'goal_unsupported' }); continue;
       }
       const effectiveWorkspace = resolveLabelUnderRoots(caps.workspaces, request.workspace);
+      const absoluteCwd = typeof request.cwd === 'string' && (request.cwd.startsWith('/') || /^[A-Za-z]:[\\/]/.test(request.cwd)) ? request.cwd : null;
       let reason = '';
       if (!machine || machine.drained || !fresh(effectiveCheckin(machine.id, machine.last_checkin_at), this.now(), 180000)) reason = 'machine_unavailable';
-      else if (!Array.isArray(caps.engines) || !caps.engines.includes(route.engine) || !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode) || !workspaceCapable(caps.workspaces, effectiveWorkspace)) {
+      else if (!Array.isArray(caps.engines) || !caps.engines.includes(route.engine) || !Array.isArray(caps.fleet_modes) || !caps.fleet_modes.includes(request.mode) || !workspaceCapable(caps.workspaces, effectiveWorkspace) || (absoluteCwd !== null && !workspaceCapable(caps.workspaces, absoluteCwd))) {
         const engineMissing = !Array.isArray(caps.engines) || !caps.engines.includes(route.engine);
         // A route for an engine no live host advertises anymore is stale
         // registry debt, not a workspace/mode defect — but only when the live

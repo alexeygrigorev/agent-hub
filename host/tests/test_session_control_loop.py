@@ -693,3 +693,31 @@ def test_receive_once_ordinary_stop_with_roots_leaves_tree_absent(env):
     assert "tree" not in acked[0]
     assert os.path.exists(wt)
     assert "feat-n" in _git(["branch", "--list", "feat-n"], main).stdout
+
+
+def test_receive_once_unbound_stop_acks_delivered_confirmed_exit(env):
+    cid = str(uuid.uuid4())
+    stop_offer = offer(cid, "stop", None, payload={})
+    stop_offer["session_state"] = "uncertain"
+    acked = []
+
+    def stub_request(method, path, payload):
+        if method == "GET" and path == "/api/session-commands/offers":
+            return {"offers": [stop_offer]}
+        if method == "POST" and path.endswith("/claim"):
+            return {"command_id": cid, "claim_token": "tok-" + uuid.uuid4().hex + "uu",
+                    "holder": "hetzner1", "generation": 1,
+                    "expires_at": "2030-01-01T00:00:00.000Z",
+                    "expires_at_ms": int(time.time() * 1000) + 60000, "attempt": 1}
+        if method == "POST" and path.endswith("/ack"):
+            acked.append(payload)
+            return {"command_id": cid, "state": "acked"}
+        raise AssertionError((method, path))
+
+    result = rc.receive_once(custody=custody(), journal_dir=env["journal"],
+                             executable=env["fake"], request=stub_request, limit=20)
+    assert result["offers_seen"] == 1
+    assert result["processed"][0]["state"] == "stopped"
+    assert acked[0]["outcome"] == "delivered"
+    assert acked[0]["confirmed_exit"] is True
+

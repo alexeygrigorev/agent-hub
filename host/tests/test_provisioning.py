@@ -1250,6 +1250,70 @@ def test_ensure_toml_trusted_hooks(tmp_path):
     assert res2 == res
 
 
+def test_sync_rotation_cleans_readonly_go_mod_cache_and_preserves_profile(tmp_path, monkeypatch):
+    """Regression c4973943: Go module cache 0555/0444 inside managed home must not abort sync() rotation."""
+    root_dir = tmp_path / 'managed'
+    root_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: root_dir)
+
+    b1 = bundle('11111111-1111-4111-8111-111111111111')
+    b1['label'] = 'shared-codex'
+    desired = [b1]
+
+    def request(method, path, payload=None):
+        return {'engines': desired} if method == 'GET' else {'status': 'installed'}
+
+    with patch.object(p.subprocess, 'run', side_effect=installer):
+        assert p.sync(request)['profiles'] == ['hub-shared-codex']
+        old_dir = root_dir / f"shared-codex-{b1['revision']}"
+        mod_dir = old_dir / 'home' / 'go' / 'pkg' / 'mod' / 'github.com' / 'gorilla' / 'websocket@v1.5.3'
+        mod_dir.mkdir(parents=True, mode=0o700)
+        ro_file = mod_dir / 'conn.go'
+        ro_file.write_text('package websocket\n')
+        ro_file.chmod(0o444)
+        mod_dir.chmod(0o555)
+
+        b2 = bundle('22222222-2222-4222-8222-222222222222')
+        b2['label'] = 'shared-codex'
+        desired[:] = [b2]
+        assert p.sync(request)['profiles'] == ['hub-shared-codex']
+        assert not old_dir.exists()
+        assert (root_dir / f"shared-codex-{b2['revision']}" / 'bundle.json').is_file()
+        assert '[profiles.hub-shared-codex]' in p.profile_path().read_text()
+
+
+def test_admission_self_heals_missing_aplexer_profile_from_installed_state(tmp_path, monkeypatch, capsys):
+    """Regression c4973943: if config.toml lost [profiles.hub-<label>], admission self-heals it from state.json."""
+    root_dir = tmp_path / 'managed'
+    root_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: root_dir)
+
+    b1 = bundle('33333333-3333-4333-8333-333333333333')
+    b1['label'] = 'shared-codex'
+    with patch.object(p.subprocess, 'run', side_effect=installer):
+        p.sync(lambda method, path, payload=None: {'engines': [b1]} if method == 'GET' else {'status': 'installed'})
+
+    # Simulate wiped profile section in config.toml
+    p.profile_path().write_text('version = 1\n[profiles.operator]\nengine = "shell"\n')
+    assert '[profiles.hub-shared-codex]' not in p.profile_path().read_text()
+
+    monkeypatch.setattr(p, 'host_request', lambda m, path, payload=None: {
+        'launch_allowed': True,
+        'profile_supported': True,
+        'account_label': 'shared-codex',
+        'observed_at': datetime.now(timezone.utc).isoformat(),
+    })
+    monkeypatch.setattr(p, 'check_codex_quota_gate', lambda env: (True, 'ok'))
+    monkeypatch.setattr(sys, 'argv', ['admission', 'shared-codex'])
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+    p.admission()
+    out = json.loads(capsys.readouterr().out)
+    assert out['launch_allowed'] is True
+    assert out['profile_supported'] is True
+    assert '[profiles.hub-shared-codex]' in p.profile_path().read_text()
+
+
+
 
 
 

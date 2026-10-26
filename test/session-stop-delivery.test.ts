@@ -138,6 +138,31 @@ describe('stop delivery for adopted sessions', () => {
       expect(offers.offers).toHaveLength(0);
     });
   });
+  it('settles stop on an unbound uncertain session immediately without reporting stop_host_unreachable', async () => {
+    await fixture(async (s,sql,advance) => {
+      const sessId = crypto.randomUUID(), launchId = crypto.randomUUID(), at = new Date().toISOString();
+      sql.exec(`INSERT INTO fleet_launches
+        (id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at)
+        VALUES (?,'stop-test','human','with-goal failed start',?,'{}','stop-host','codex','shared-codex','interactive','/srv/stop-test','echo ok','uncertain',NULL,?,?)`,
+        launchId,launchId,at,at);
+      sql.exec(`INSERT INTO session_control_sessions
+        (id,actor,request_key,request_json,state,machine_id,engine,mode,fleet_launch_id,binding_json,host_family,created_at,updated_at)
+        VALUES (?,'stop-test','k-uncertain','{"workspace":"/srv/stop-test","mode":"interactive","with_goal":true,"brief":"echo ok"}','uncertain','stop-host','codex','interactive',?,NULL,'current-family',?,?)`,
+        sessId,launchId,at,at);
+      const stopRes = await s.handle(req('/api/sessions/'+sessId+'/stop',{key:'stop-uncertain-1'}),admin);
+      expect(stopRes.status).toBe(201);
+      const stopBody = await stopRes.json() as any;
+      expect(stopBody.state).toBe('acked');
+      advance(15000);
+      const cmds = await (await s.handle(req('/api/sessions/'+sessId+'/commands'),admin)).json() as any;
+      expect(cmds.commands[0].state).toBe('acked');
+      expect(cmds.commands[0].ack.outcome).toBe('delivered');
+      expect(cmds.commands[0].ack.confirmed_exit).toBe(true);
+      expect(cmds.commands[0].ack.reason).not.toBe('stop_host_unreachable');
+      expect(sql.exec('SELECT state FROM session_control_sessions WHERE id = ?',sessId).one().state).toBe('stopped');
+      expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?',launchId).one().state).toBe('exited');
+    });
+  });
 });
 
 

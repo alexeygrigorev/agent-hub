@@ -42,7 +42,9 @@ from .native_sessions import (
     NativeTarget,
     SessionControlError,
     SessionUncertain,
+    list_sessions,
     qualify_sender_binding,
+    stop_session,
 )
 from .session_executor import (
     CallerCustody,
@@ -296,7 +298,10 @@ def receive_once(
         except SessionUncertain as exc:
             skipped.append({"command_id": command_id, "reason": str(exc)[:300]})
             continue
-        # Stop with no native target: fence via claim, then ack refused.
+        # Stop with no native target: fence via claim, verify no live native
+        # process for the linked fleet launch (stopping any correlated tag if
+        # present), then ack delivered with confirmed_exit=True so unbound
+        # uncertain sessions settle to stopped instead of stranding.
         if command.get("target") is None:
             try:
                 attempt_id = get_or_create_attempt(journal_dir, str(command_id), str(correlation or ""))
@@ -307,15 +312,32 @@ def receive_once(
                     skipped.append({"command_id": command_id, "reason": "claim_unresolved_%s_reconcile" % type(exc).__name__})
                     continue
                 token = server_claim.get("claim_token") if isinstance(server_claim, dict) else None
+                launch_id = offer.get("fleet_launch_id") if isinstance(offer, dict) else None
+                native_payload = {"native_id": "00000000-0000-0000-0000-000000000000",
+                                  "tag": "unbound", "workspace": "/"}
+                reason_text = "unbound stop: confirmed no live native process"
+                if isinstance(launch_id, str) and launch_id:
+                    expected_tags = {f"hub-{launch_id}", f"task-hub-{launch_id}"}
+                    for row in list_sessions(executable, include_exited=True):
+                        if row.tag in expected_tags and row.phase not in ("exited", "dead", "forgotten", "pruned"):
+                            stop_session(executable, NativeTarget(
+                                session_id=row.session_id,
+                                tag=row.tag,
+                                workspace=row.workspace,
+                                created_at_ms=row.created_at_ms,
+                            ))
+                            native_payload = {"native_id": row.session_id, "tag": row.tag, "workspace": row.workspace}
+                            reason_text = "unbound stop: correlated native process stopped"
+                            break
                 try:
                     request("POST", "/api/session-commands/" + str(command_id) + "/ack",
-                            {"correlation": correlation, "outcome": "refused",
-                             "native": {"native_id": "00000000-0000-0000-0000-000000000000",
-                                        "tag": "unbound", "workspace": "/"},
-                             "reason": "unbound stop: no native target; nothing to exit",
+                            {"correlation": correlation, "outcome": "delivered",
+                             "confirmed_exit": True,
+                             "native": native_payload,
+                             "reason": reason_text,
                              "claim_token": token})
                     processed.append({"command_id": command_id, "op": "stop",
-                                      "state": "refused", "reason": "unbound_no_target"})
+                                      "state": "stopped", "reason": "unbound_no_target"})
                 except Exception as exc:
                     skipped.append({"command_id": command_id,
                                     "reason": "ack_unresolved_%s_reconcile" % type(exc).__name__})

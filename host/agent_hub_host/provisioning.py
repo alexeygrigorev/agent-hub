@@ -1038,6 +1038,41 @@ def install(bundle):
     write_json(dest / 'bundle.json', bundle)
 
 
+def _rmtree_managed(entry: Path) -> None:
+    """Remove a managed bundle directory even when Go/tool caches created 0555/0444 trees."""
+    if entry.is_symlink():
+        raise PermissionError('Unsafe managed directory')
+    for dirpath, _dirnames, filenames in os.walk(entry, topdown=True, followlinks=False):
+        dpath = Path(dirpath)
+        if not dpath.is_symlink():
+            try:
+                os.chmod(dpath, 0o700)
+            except OSError:
+                pass
+        for fname in filenames:
+            fpath = dpath / fname
+            if not fpath.is_symlink():
+                try:
+                    os.chmod(fpath, 0o600)
+                except OSError:
+                    pass
+
+    def _on_rm_error(func, path, exc_info):
+        p = Path(path)
+        if p.is_symlink():
+            raise exc_info[1]
+        try:
+            parent = p.parent
+            if not parent.is_symlink():
+                os.chmod(parent, 0o700)
+            os.chmod(p, 0o700 if p.is_dir() else 0o600)
+        except OSError:
+            pass
+        func(path)
+
+    shutil.rmtree(entry, onerror=_on_rm_error)
+
+
 def sync(request=None):
     """Called on startup and each machine heartbeat. Failure preserves no new route."""
     request = request or host_request
@@ -1052,7 +1087,11 @@ def sync(request=None):
     with lock():
         previous = read_json(root() / 'state.json', [])
         # Withdraw removed/changed profiles before touching credentials or installing updates.
-        retained = [b for b in bundles if any(p['label'] == b['label'] and p['revision'] == b['revision'] for p in previous)]
+        retained = [
+            b for b in bundles
+            if any(p['label'] == b['label'] and p['revision'] == b['revision'] for p in previous)
+            and (root() / (b['label'] + '-' + b['revision']) / 'bundle.json').is_file()
+        ]
         profiles(retained)
         from . import engine_login
         engine_login.cancel_removed(bundles)
@@ -1062,7 +1101,7 @@ def sync(request=None):
                 # rmtree does not follow directory symlinks; reject them explicitly.
                 if entry.is_symlink():
                     raise PermissionError('Unsafe managed directory')
-                shutil.rmtree(entry)
+                _rmtree_managed(entry)
         write_json(root() / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': b['provider']} for b in retained])
         installed_bundles = []
         failed_bundles = []
@@ -1489,6 +1528,31 @@ def admission():
         result['launch_allowed'] = False
         result['profile_supported'] = False
         result['reason'] = 'local_bundle_missing'
+    elif bundle is not None and result.get('launch_allowed') and profile_path().is_file():
+        expected_header = f'[profiles.hub-{label}]'
+        try:
+            text = profile_path().read_text(encoding='utf-8')
+        except OSError:
+            text = ''
+        if expected_header not in text:
+            try:
+                with lock():
+                    state = read_json(root() / 'state.json', [])
+                    installed = []
+                    for item in state:
+                        b_path = root() / f"{item['label']}-{item['revision']}" / 'bundle.json'
+                        loaded = read_json(b_path)
+                        if isinstance(loaded, dict):
+                            installed.append(loaded)
+                    if installed:
+                        profiles(installed)
+                text = profile_path().read_text(encoding='utf-8')
+            except Exception:
+                text = ''
+            if expected_header not in text:
+                result['launch_allowed'] = False
+                result['profile_supported'] = False
+                result['reason'] = 'local_profile_missing'
 
     if isinstance(payload, dict) and bundle:
         offered_profile = payload.get('profile')

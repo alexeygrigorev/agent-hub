@@ -1844,4 +1844,29 @@ describe('bounded command custody recovery', () => {
       expect(sweep.offers).toEqual([]);
     }, fakeReserve().hook);
   });
+
+  it('accepts a canonical absolute worktree --cwd path alongside a workspace label', async () => {
+    const reserve = fakeReserve();
+    await fixture(async (s) => {
+      const res = await s.handle(request('/api/sessions', {
+        key: 'abs-cwd-wt-1',
+        workspace: 'ai-shipping-labs',
+        cwd: '/data/agents/ai-shipping-labs/worktrees/old-email-cleanup-cec7cfc5',
+        mode: 'interactive',
+        with_goal: true,
+        brief: 'echo ok',
+      }), admin);
+      expect(res.status).toBe(201);
+      expect(reserve.calls[0].cwd).toBe('/data/agents/ai-shipping-labs/worktrees/old-email-cleanup-cec7cfc5');
+      const bad = await s.handle(request('/api/sessions', {
+        key: 'abs-cwd-wt-bad',
+        workspace: 'ai-shipping-labs',
+        cwd: '/data/agents/../escape',
+        mode: 'interactive',
+        with_goal: true,
+        brief: 'echo ok',
+      }), admin);
+      expect(bad.status).toBe(400);
+    }, reserve.hook);
+  });
 });

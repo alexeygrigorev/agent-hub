@@ -25,7 +25,14 @@ REFUSALS = {
     'Configured Codex launch wrapper unavailable': ('launcher_codex_wrapper_unavailable', 'The configured protected Codex wrapper is unavailable.'),
     'Maintained launcher plan refused': ('launcher_plan_refused', 'The maintained launcher plan refused the selected route.'),
     'Native Codex receipt mismatch': ('launcher_receipt_mismatch', 'The native Codex receipt did not match the launch.'),
+    'Native receipt mismatch': ('launcher_receipt_mismatch', 'The native launch receipt did not match the requested session.'),
+    'Native cwd mismatch': ('launcher_cwd_mismatch', 'The native session working directory did not match the requested cwd.'),
     'Native lifecycle receipt is incomplete': ('launcher_receipt_incomplete', 'The native lifecycle receipt is incomplete.'),
+    'No confirmed native execution receipt': ('launcher_receipt_incomplete', 'The launcher exited without a confirmed native execution receipt.'),
+    'Managed profile removed': ('launcher_unknown_profile', 'The managed engine profile is not installed on this host.'),
+    'Managed engine binary missing': ('launcher_binary_missing', 'The managed engine binary is missing on this host.'),
+    'Packaged native engine binary missing': ('launcher_binary_missing', 'The packaged native engine binary is missing on this host.'),
+    'Native zcodex binary missing': ('launcher_binary_missing', 'The native zcodex binary is missing on this host.'),
     'API key has expired': ('engine_auth_expired', 'The engine authentication failed or API key has expired.'),
     'This API key has expired': ('engine_auth_expired', 'The engine authentication failed or API key has expired.'),
     'AI.Error: This API key has expired': ('engine_auth_expired', 'The engine authentication failed or API key has expired.'),
@@ -310,11 +317,23 @@ def describe_partial_work(workspace, launched_at_ts=None, max_files=20) -> dict:
     return info
 
 
+def _sanitize_cli_error_line(line: str) -> str | None:
+    """Return a bounded, secret/path-redacted native launcher CLI error line."""
+    s = ''.join(ch for ch in line.strip() if 32 <= ord(ch) < 127)
+    if not re.match(r'^(?:a|aplexer|systemd-run): ', s):
+        return None
+    s = _redact_secret_shapes(s)
+    s = re.sub(r'\b[A-Za-z0-9_.-]+=\S+', '[redacted]', s)
+    s = re.sub(r'(?<!\w)/[A-Za-z0-9._/-]+', '[path]', s)
+    return s[:220]
+
+
 def diagnostic(raw='', *, error_type='RuntimeError', exit_code=None, stage='launcher_run', engine=None, cwd=None, task_id=None, launched_at=None, start_offsets=None):
     reason, message = 'launcher_command_failed', 'The launcher command failed; unrecognized output was withheld.'
     refusal_found = False
+    surfaced_tail = None
 
-    # Only complete known messages may be copied across the privacy boundary.
+    # Only complete known messages or sanitized launcher CLI diagnostics cross the privacy boundary.
     raw_str = str(raw or '')
     for line in raw_str[-16384:].splitlines():
         clean_line = line.strip()
@@ -330,6 +349,39 @@ def diagnostic(raw='', *, error_type='RuntimeError', exit_code=None, stage='laun
             reason, message = 'launcher_codex_wrapper_unavailable', 'The protected Codex wrapper is not configured in the launcher environment.'
             refusal_found = True
             break
+        elif re.fullmatch(r'(?:a|aplexer): unknown profile [A-Za-z0-9][A-Za-z0-9._-]{0,63}', candidate):
+            reason, message = 'launcher_unknown_profile', f'The native launcher refused start: {candidate}.'
+            surfaced_tail = candidate
+            refusal_found = True
+            break
+        elif re.fullmatch(r'(?:a|aplexer): unknown engine [A-Za-z0-9][A-Za-z0-9._-]{0,63}', candidate):
+            reason, message = 'launcher_unknown_engine', f'The native launcher refused start: {candidate}.'
+            surfaced_tail = candidate
+            refusal_found = True
+            break
+        elif candidate.startswith('model_mismatch:'):
+            reason, message = 'launcher_model_mismatch', 'The native session model did not match the requested model.'
+            refusal_found = True
+            break
+        elif candidate.startswith('model_unsupported:'):
+            reason, message = 'launcher_model_unsupported', 'The requested model is not supported by the host launcher route.'
+            refusal_found = True
+            break
+        elif candidate.startswith('{') and candidate.endswith('}'):
+            try:
+                parsed_json = json.loads(candidate)
+            except Exception:
+                parsed_json = None
+            if isinstance(parsed_json, dict) and parsed_json.get('launch_allowed') is False and isinstance(parsed_json.get('reason'), str):
+                reason, message = 'launcher_quota_gate_refused', 'The host Codex quota gate refused launch before execution.'
+                refusal_found = True
+                break
+        cli_line = _sanitize_cli_error_line(candidate)
+        if cli_line is not None:
+            reason, message = 'launcher_command_failed', f'The launcher command failed: {cli_line}'
+            surfaced_tail = cli_line
+            refusal_found = True
+            break
 
     # If no exact known refusal was present in raw output, check for auth failure in raw or launch-correlated log
     if not refusal_found:
@@ -342,6 +394,8 @@ def diagnostic(raw='', *, error_type='RuntimeError', exit_code=None, stage='laun
         error_type = 'RuntimeError'
     value = {'reason': reason, 'message': message, 'error_type': error_type,
              'stage': stage if stage in {'launcher_run', 'dispatch_headless', 'dispatch_interactive', 'dispatch_route'} else 'launcher_run'}
+    if surfaced_tail is not None:
+        value['tail'] = surfaced_tail
     if reason in {'cpu_headroom', 'cpu_pressure', 'memory_pressure', 'host_oom', 'host_runtime_choking'}:
         from .cpu_resources import sanitize_cpu_admission
         for line in raw_str[-16384:].splitlines():

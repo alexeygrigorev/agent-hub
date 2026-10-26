@@ -602,17 +602,46 @@ def collect_subscriptions(settings, runner=run_json):
     return reports
 
 
-def resolve_offer_cwd(workspace: Path, cwd: object) -> Path:
-    """Resolve a hub launch offer cwd against the workspace root.
+def _no_symlink_components(path: Path) -> bool:
+    cur = path
+    while True:
+        if cur.is_symlink():
+            return False
+        if cur.parent == cur:
+            return True
+        cur = cur.parent
 
-    ``None`` (or ``'.'``) means the workspace root itself. Anything else must
+
+def resolve_offer_cwd(workspace: Path, cwd: object, settings: Optional[dict] = None) -> Path:
+    """Resolve a hub launch offer cwd against the workspace root or configured roots.
+
+    ``None`` (or ``'.'``) means the workspace root itself. A relative path must
     be a workspace-relative confined path; it is resolved with symlink
     confinement and must stay inside the workspace root, else the offer is
-    refused with no native effect. The resolved absolute path is what reaches
-    the native start adapter and what catalog verification compares.
+    refused with no native effect. An absolute path must be a canonical
+    workspace path that either resolves inside ``workspace`` (without symlink
+    traversal) or resolves through the operator-configured ``settings``
+    workspaces / ``workspace_roots`` allowlist (such as a valid worktree path).
     """
     if cwd is None or cwd == '.':
         return workspace
+    if isinstance(cwd, str) and (cwd.startswith('/') or (len(cwd) >= 3 and cwd[1] == ':' and cwd[0].isascii() and cwd[0].isalpha() and cwd[2] in ('\\', '/'))):
+        if not absolute_workspace_ok(cwd):
+            raise ValueError('Offer cwd escapes or is malformed')
+        raw_path = Path(cwd)
+        if not _no_symlink_components(raw_path):
+            raise ValueError('Offer cwd escapes the workspace root')
+        try:
+            resolved = raw_path.resolve(strict=True)
+        except (FileNotFoundError, OSError) as exc:
+            raise ValueError('Offer cwd does not exist on target host') from exc
+        if not resolved.is_dir():
+            raise ValueError('Offer cwd escapes or is malformed')
+        if _path_under_root(resolved, workspace):
+            return resolved
+        if isinstance(settings, dict):
+            return resolve_workspace_path(settings, cwd)
+        raise ValueError('Offer cwd escapes the workspace root')
     if not isinstance(cwd, str) or not cwd or len(cwd) > 256 or cwd.startswith('/') \
             or '\\' in cwd or ':' in cwd or '\x00' in cwd:
         raise ValueError('Offer cwd is not a workspace-relative path')
@@ -1813,7 +1842,7 @@ class Dispatcher:
         # filesystem path on its own (label "demo" is not ./demo, and an
         # unconfigured "/abs/path" is refused before any claim or effect).
         workspace = resolve_workspace_path(self.settings, offer["workspace"])
-        target_cwd = resolve_offer_cwd(workspace, offer.get("cwd"))
+        target_cwd = resolve_offer_cwd(workspace, offer.get("cwd"), self.settings)
         native = self.settings.get("aplexer_bin", "aplexer")
         if mode == "interactive":
             if selection:
