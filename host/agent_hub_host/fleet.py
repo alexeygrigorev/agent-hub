@@ -17,6 +17,14 @@ from .session_rules import SESSION_PREAMBLE, compose_prompt
 from .retired_native import verify_native_retirement
 
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+# Control characters the Hub server rejects in finish-report text
+# (invalid_finish_report). The host strips them before forwarding so a
+# worker-crafted result file can never wedge reconciliation with a 400.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _strip_control_chars(value: str) -> str:
+    return _CONTROL_RE.sub("", value)
 # Canonical quota services: `codex-orin` is not a service — it is the second
 # Codex account (service `codex`, account `codex-orin`). The quse wire route
 # key `codex-orin` is still collected by quota_snapshot; only this service
@@ -798,6 +806,79 @@ class Dispatcher:
             except Exception:
                 continue
 
+    def _read_hub_finish_report(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Read the worker's .local/hub-results/<offer_id>.json for intake ingestion.
+
+        Intake 88b3260d AC1: the host forwards the sanitized final result
+        (status/report/artifacts) inside the terminal Fleet result payload so
+        the server can append it to the linked intake. The result path must be
+        exactly <workspace>/.local/hub-results/<offer_id>.json (no symlinks,
+        no `..` escapes; the path is host-constructed at dispatch). Fields are
+        bounded and control-char-stripped to match the server's
+        invalid_finish_report validation, so a worker-crafted file can never
+        wedge reconciliation with a 400. Never logs file contents. Returns {}
+        when absent or invalid (fail-open to a bare terminal receipt).
+        """
+        try:
+            offer_id = record.get("offer_id")
+            result_path = record.get("result_path")
+            workspace = record.get("workspace")
+            if not isinstance(offer_id, str) or not LABEL.fullmatch(offer_id):
+                return {}
+            if not isinstance(result_path, str) or not isinstance(workspace, str):
+                return {}
+            import os as _os
+            expected = _os.path.join(_os.path.abspath(workspace), ".local", "hub-results", offer_id + ".json")
+            if _os.path.abspath(result_path) != expected:
+                return {}
+            rp = Path(expected)
+            if rp.is_symlink():
+                return {}
+            if not rp.is_file():
+                return {}
+            try:
+                if rp.stat().st_size <= 0 or rp.stat().st_size > 65536:
+                    return {}
+            except OSError:
+                return {}
+            from . import private_fs
+            # Worker-authored and world-readable under its own umask; confine
+            # by the exact-path check above, not by privacy bits.
+            raw = private_fs.read_bytes(str(rp), 65536, private=False).decode("utf-8")
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return {}
+            status = data.get("status")
+            if status not in ("done", "failed", "waiting-on-human", "stuck"):
+                return {}
+            report = data.get("report")
+            if not isinstance(report, str):
+                return {}
+            report = _strip_control_chars(report.strip())
+            if len(report) > 4096:
+                report = report[:4096]
+            if _CONTROL_RE.search(report):
+                return {}
+            artifacts = data.get("artifacts", [])
+            if not isinstance(artifacts, list):
+                artifacts = []
+            clean_artifacts = []
+            for item in artifacts[:8]:
+                if not isinstance(item, dict):
+                    continue
+                label_text = item.get("label")
+                text = item.get("text")
+                if not isinstance(label_text, str) or not isinstance(text, str):
+                    continue
+                label_text = _strip_control_chars(label_text)[:120]
+                text = _strip_control_chars(text)[:1024]
+                if _CONTROL_RE.search(label_text) or _CONTROL_RE.search(text):
+                    continue
+                clean_artifacts.append({"label": label_text, "text": text})
+            return {"report_status": status, "report": report, "artifacts": clean_artifacts}
+        except Exception:
+            return {}
+
     def _record_running_launch(self, offer_id, task_id, workspace, engine, account, native_id, result_path, details, profile=None, launched_at_ts=None, log_offsets=None):
         from .native_sessions import NativeTarget, SessionControlError
         from . import private_fs
@@ -1029,6 +1110,15 @@ class Dispatcher:
                 "native_id": record["native_id"],
                 "launcher_task_id": task_id,
             }
+            # Intake 88b3260d AC1: forward the worker's final result file so
+            # the server can append it to the linked intake. Bounded,
+            # symlink-confined, truncated; never logs tokens.
+            try:
+                forwarded = self._read_hub_finish_report(record)
+                if forwarded:
+                    result_payload.update(forwarded)
+            except Exception:
+                pass
             if record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused':
                 result_payload['diagnostic'] = record['diagnostic']
             if fleet_state == "failed":

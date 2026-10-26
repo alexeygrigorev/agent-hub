@@ -515,7 +515,81 @@ def provision_managed_home(bundle=None, home=None, dest=None):
     # 4. Provision engine permissions (approvals disabled, full access)
     install_managed_engine_permissions(bundle, home)
 
+    # 5. Provision worker CLI auth passthrough (intake 88b3260d AC2/AC3).
+    # Gh: copy the host's gh hosts.yml into the managed home so `gh run list`
+    # works inside Hub-launched workers through the normal gh auth mechanism.
+    # Workers must only run gh commands, never read the file or env dumps.
+    # Hub: the managed home intentionally gets NO Hub token copy here. The
+    # scoped, durable agent credential (auto-refresh/service token) is owned
+    # by intake 6022786b; once it lands, the host writes it to
+    # <managed-home>/.config/agent-hub/worker.json and this hook preserves it.
+    _provision_worker_cli_auth(home)
+
     return home
+
+
+def _provision_worker_cli_auth(home: Path) -> None:
+    """Copy read-only CLI auth into the managed home without logging secrets.
+
+    - gh: ~/.config/gh/hosts.yml -> <home>/.config/gh/hosts.yml (0600).
+      Workers must only run gh commands, never read the file or env dumps.
+      RISK (accepted per intake 88b3260d AC3; same-uid exfiltration is
+      inherent to AC3's "gh works inside workers"): any code exec in the
+      worker can read this file, exactly as it can use the gh command itself.
+      The copy is the host user's own OAuth token (read-only CI proof via
+      `gh run list`); a scoped read-only token is a follow-up, not this intake.
+    - hub: ensure <home>/.config/agent-hub/ exists for the future scoped
+      worker credential (6022786b); never copy host.json (host credential
+      gets 403 on intake append and must not leak into workers).
+    Best-effort: missing host gh auth removes any stale worker copy (never
+    leave a revoked credential behind) and is not a provisioning failure.
+    """
+    try:
+        dest_gh = home / '.config' / 'gh' / 'hosts.yml'
+        with private_fs.parent(dest_gh, create=True):
+            pass
+        copied = False
+        try:
+            src_gh = Path.home() / '.config' / 'gh' / 'hosts.yml'
+            if src_gh.is_file() and not src_gh.is_symlink() and src_gh.stat().st_size <= 16384:
+                # The host file may live under 0755 dirs; confinement here is
+                # the exact-path + symlink + size check, not privacy bits.
+                raw = private_fs.read_bytes(str(src_gh), 16384, private=False)
+                # Fail closed on unexpected content: must look like a gh
+                # hosts.yml (a mapping with at least github.com), never a
+                # private key or an empty file.
+                try:
+                    text = raw.decode('utf-8')
+                except Exception:
+                    text = ''
+                if text.strip() and 'github.com' in text and '-----BEGIN' not in text:
+                    private_fs.atomic_write(dest_gh, raw, 16384)
+                    if os.name != 'nt':
+                        try:
+                            os.chmod(dest_gh, 0o600)
+                        except OSError:
+                            pass
+                    copied = True
+        except Exception:
+            pass
+        if not copied:
+            try:
+                if dest_gh.is_file() or dest_gh.is_symlink():
+                    dest_gh.unlink()
+            except Exception:
+                pass
+        dest_hub_dir = home / '.config' / 'agent-hub'
+        try:
+            dest_hub_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if os.name != 'nt':
+                try:
+                    os.chmod(dest_hub_dir, 0o700)
+                except OSError:
+                    pass
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 @contextlib.contextmanager
