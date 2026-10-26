@@ -36,6 +36,8 @@ def test_supervisor_propagates_venv_python_to_owned_native_child(tmp_path):
     assert receipt['command'][:4] == ['/release/.venv/bin/python', '-u', '-m', 'agent_hub_host.session_host']
     assert calls[0][calls[0].index('--memory') + 1] == '1500M'
     assert calls[0][calls[0].index('--pids') + 1] == '256'
+    assert calls[0][calls[0].index('--cpu-quota-us') + 1] == '100000'
+    assert calls[0][calls[0].index('--cpu-period-us') + 1] == '100000'
     assert '--env' in calls[0]
     assert 'AGENT_HUB_MANAGED_DIR=/custom/managed' in calls[0]
     assert calls[-1][:2] == ('kill', receipt['id'])

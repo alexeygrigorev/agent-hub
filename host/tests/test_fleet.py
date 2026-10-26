@@ -217,6 +217,11 @@ class FleetTests(unittest.TestCase):
             self.assertEqual(calls[-1][0][0:2], ['aplexer', 'start'])
             self.assertIn('--profile', calls[-1][0]); self.assertNotIn('exec', calls[-1][0])
             self.assertTrue(http[0][1].endswith('/claim'))
+            start_argv = calls[-1][0]
+            self.assertEqual(start_argv[start_argv.index('--memory') + 1], '1500M')
+            self.assertEqual(start_argv[start_argv.index('--pids') + 1], '256')
+            self.assertEqual(start_argv[start_argv.index('--cpu-quota-us') + 1], '100000')
+            self.assertEqual(start_argv[start_argv.index('--cpu-period-us') + 1], '100000')
 
     def test_unsupported_or_unknown_gate_never_claims_or_launches(self):
         with tempfile.TemporaryDirectory() as tmp:

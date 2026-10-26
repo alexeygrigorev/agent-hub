@@ -19,6 +19,17 @@ def test_published_dependency_loads_native_client(tmp_path):
     assert Client(state_dir=tmp_path / 'state', runtime_dir=tmp_path / 'run').snapshot() == []
 
 
+def test_cpu_limited_start_uses_real_cli_not_client():
+    """CPU-capped starts must reach the real CLI: the installed Client.start
+    hardcodes cpu_quota_us=None, so client_call refuses the flags and run_json
+    falls back to subprocess (intake 354c03f0)."""
+    with patch('aplexer.Client', side_effect=AssertionError('Client must not receive CPU flags')):
+        assert client_call('aplexer', ['start', '--workspace', '/own', '--tag', 't',
+                                       '--engine', 'shell', '--memory', '1500M', '--pids', '256',
+                                       '--cpu-quota-us', '100000', '--cpu-period-us', '100000',
+                                       '--json']) is None
+
+
 def test_scoped_target_resolves_uuid_and_kill_signal():
     client = Mock()
     client.snapshot.return_value = [dict(id='own-id', tag='same', workspace='/own'),

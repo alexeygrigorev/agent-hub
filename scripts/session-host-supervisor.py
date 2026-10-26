@@ -71,7 +71,9 @@ def main():
     receipt = native('start', '--workspace', str(workspace), '--cwd', str(workspace),
                      '--tag', tag, '--engine', 'shell',
                      *env_args,
-                     '--memory', '1500M', '--pids', '256', '--history-bytes', '262144',
+                     '--memory', '1500M', '--pids', '256',
+                     '--cpu-quota-us', '100000', '--cpu-period-us', '100000',
+                     '--history-bytes', '262144',
                      '--', *command)
     # Reuse the receipt only in this process; no user-provided ownership labels
     # or persisted IDs can select another session for cleanup.

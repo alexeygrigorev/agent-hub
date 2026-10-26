@@ -24,6 +24,17 @@ LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 SERVICES = {"codex", "claude", "grok", "gemini", "zai", "go", "copilot"}
 WORKSPACE_SEG = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 
+# Delegated worker cgroup caps, applied to every Hub native start alongside
+# --memory/--pids (intake 354c03f0, re-file of vanished 942473f7). One full
+# CPU (quota 100000us per 100000us period) matches the aplexer default period;
+# the installed aplexer Python Client hardcodes cpu_quota_us=None, so these
+# flags travel the real `aplexer start` CLI path (client_call falls back to
+# subprocess for flags outside its allowlist).
+WORKER_MEMORY = "1500M"
+WORKER_PIDS = "256"
+WORKER_CPU_QUOTA_US = "100000"
+WORKER_CPU_PERIOD_US = "100000"
+
 
 def absolute_workspace_ok(value):
     """Bounded canonical absolute POSIX or Windows workspace identifier.
@@ -1448,7 +1459,7 @@ class Dispatcher:
                 raise ValueError('Interactive goal requires a Codex-family engine and goal text')
             if offer.get("prompt") and not with_goal:
                 raise ValueError("Interactive task injection is unsupported; start an empty native session")
-            argv = [native, "start", "--workspace", str(workspace), "--tag", "hub-" + offer_id, "--engine", offer["engine"], "--memory", "1500M", "--pids", "256", "--json"]
+            argv = [native, "start", "--workspace", str(workspace), "--tag", "hub-" + offer_id, "--engine", offer["engine"], "--memory", WORKER_MEMORY, "--pids", WORKER_PIDS, "--cpu-quota-us", WORKER_CPU_QUOTA_US, "--cpu-period-us", WORKER_CPU_PERIOD_US, "--json"]
             if offer.get("profile"):
                 argv += ["--profile", offer["profile"]]
             if target_cwd != workspace:
