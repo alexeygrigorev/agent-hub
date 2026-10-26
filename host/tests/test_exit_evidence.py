@@ -1,0 +1,87 @@
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+
+from agent_hub_host.exit_evidence import snapshot_native, terminal_evidence, sanitize
+
+NATIVE = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+OFFER = '11111111-2222-4333-8444-555555555555'
+
+
+class ExitEvidence(unittest.TestCase):
+    def test_engine_exit_zero_without_result_is_failed_with_partial_work(self):
+        from agent_hub_host.fleet import Dispatcher
+        with tempfile.TemporaryDirectory() as tmp:
+            record = dict(offer_id=OFFER, task_id='hub-' + OFFER, mode='headless',
+                          workspace=tmp, engine='opencode', native_id=NATIVE,
+                          tag='task-hub-' + OFFER, incarnation=1000, state='running', settled=False,
+                          result_path=str(Path(tmp) / '.local' / 'hub-results' / (OFFER + '.json')),
+                          runtime_exit={'code': 0}, exit_evidence={'log_tail': 'worked on feature', 'engine_outcome': 'succeeded'})
+            d = Dispatcher({'version': 1, 'workspaces': {'main': tmp}, 'subscriptions': [],
+                            'launcher': {'argv': ['launcher'], 'root': tmp, 'config_dir': tmp}})
+            d._active_launches = {OFFER: record}
+            seen = []
+            def request(method, path, payload=None):
+                seen.append(payload)
+                return {'id': OFFER, 'state': payload['state']}
+            with patch('agent_hub_host.fleet.verify_native_retirement', return_value=(True, {'finished_at_ms': 3100}, {})), \
+                 patch.object(d, 'runner', return_value={'state': 'failed', 'resources_reserved': False, 'native_id': NATIVE}), \
+                 patch.object(d, 'request', side_effect=request), \
+                 patch.object(d, '_persist_launch_record'), patch.object(d, '_maybe_cleanup_worktree'), \
+                 patch('agent_hub_host.runtime_diagnostics.subprocess.run', side_effect=OSError):
+                result = d.reconcile_launches()
+            self.assertEqual(result[0]['state'], 'failed')
+            self.assertEqual(seen[0]['runtime']['exit_code'], 0)
+            self.assertEqual(seen[0]['runtime']['wall_time_ms'], 2100)
+            self.assertEqual(seen[0]['runtime']['engine_outcome'], 'succeeded')
+            self.assertEqual(seen[0]['runtime']['outcome'], 'failed-with-partial-work')
+            self.assertIn('worked on feature', seen[0]['report'])
+
+    def test_exit_without_report_keeps_exact_code_signal_tail_and_wall_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            history = root / NATIVE / 'history.bin'
+            history.parent.mkdir()
+            history.write_text('worked on feature\nBearer private-value\nhubt_fake-private-value\nexiting\n')
+            record = dict(offer_id=OFFER, native_id=NATIVE, incarnation=1000,
+                          tag='task-hub-' + OFFER, workspace=tmp, engine='opencode')
+            row = dict(id=NATIVE, created_at_ms=1000, tag=record['tag'], workspace=tmp,
+                       engine='opencode', history_path=str(history), exit=dict(code=17, signal=9, exited_at_ms=3100))
+            saved = snapshot_native(record, row)
+            record['exit_evidence'] = saved
+            git = Mock(side_effect=[Mock(stdout='a' * 40 + '\n'), Mock(stdout=' M host/example.py\n')])
+            result = terminal_evidence(record, {}, git=git)
+            self.assertEqual((result['exit_code'], result['exit_signal'], result['wall_time_ms']), (17, 9, 2100))
+            self.assertIn('exiting', result['log_tail'])
+            self.assertNotIn('private-value', json.dumps(result))
+            self.assertEqual(result['observed_commits'], ['a' * 40])
+            self.assertEqual(result['dirty_paths'], [' M host/example.py'])
+            retained = root / '.local' / 'hub-session-logs' / (OFFER + '.json')
+            self.assertEqual(retained.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(retained.read_text())['exit_code'], 17)
+
+    def test_other_incarnation_or_symlink_never_supplies_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / NATIVE / 'history.bin'
+            path.parent.mkdir()
+            outside = Path(tmp) / 'private'
+            outside.write_text('private payload')
+            path.symlink_to(outside)
+            record = dict(offer_id=OFFER, native_id=NATIVE, incarnation=1000,
+                          tag='task', workspace=tmp, engine='opencode')
+            row = dict(id=NATIVE, created_at_ms=1001, tag='task', workspace=tmp,
+                       engine='opencode', history_path=str(path))
+            self.assertIsNone(snapshot_native(record, row))
+            row['created_at_ms'] = 1000
+            self.assertNotIn('log_tail', snapshot_native(record, row))
+
+    def test_unknown_measurements_are_null_and_credentials_are_redacted_before_clipping(self):
+        result = terminal_evidence({}, {}, git=Mock())
+        self.assertIsNone(result['exit_code'])
+        self.assertIsNone(result['wall_time_ms'])
+        raw = '\x1b[31mAuthorization: Bearer sensitive-value\nsecret=hidden\nhubt_' + 's' * 3000
+        self.assertNotIn('sensitive-value', sanitize(raw))
+        self.assertNotIn('hidden', sanitize(raw))
+        self.assertNotIn('s' * 20, sanitize(raw))

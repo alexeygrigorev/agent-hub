@@ -1250,6 +1250,7 @@ class FleetTests(unittest.TestCase):
             disp_res = d.dispatch(normal_offer)
             self.assertEqual(disp_res['state'], 'running')
             self.assertEqual(disp_res['native_id'], native_id)
+            Path(d._active_launches[offer_id]['result_path']).write_text(json.dumps({'status': 'done', 'report': 'Completed fixture work.'}))
 
             # Pre-retirement: reconcile returns no terminal settlement while workload is alive
             with patch("agent_hub_host.fleet.verify_native_retirement", return_value=(False, None, "target_still_active")):
@@ -1427,6 +1428,7 @@ class FleetTests(unittest.TestCase):
             # Dispatch with first Dispatcher instance
             d1 = fleet.Dispatcher(cfg, request, runner, journal_dir=str(journal))
             d1.dispatch(offer(mode='headless', id=offer_id, prompt='Test task'))
+            Path(d1._active_launches[offer_id]['result_path']).write_text(json.dumps({'status': 'done', 'report': 'Completed fixture work.'}))
 
             # Check journal file exists on disk
             j_file = journal / 'fleet-launches' / f"{offer_id}.json"

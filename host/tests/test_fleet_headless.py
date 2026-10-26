@@ -522,6 +522,9 @@ class TestFleetHeadless(unittest.TestCase):
             "settled": False,
         }
 
+        result_path = Path(d._active_launches[offer_id]['result_path'])
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(json.dumps({'status': 'done', 'report': 'Completed fixture task.'}))
         mock_tombstone = {
             "cause": "finished",
             "finished_at_ms": 1005000,

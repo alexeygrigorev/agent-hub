@@ -1,4 +1,5 @@
 import { jsonFields, initResourceRequestProjection } from './sql-json-projection';
+import { sanitizeExitEvidence } from './exit-evidence';
 import {sanitizeCpuAdmission} from './cpu-headroom';
 import { launcherDiskHeadroom } from './launcher-disk';
 /** Generic account registry and placement. Provider credentials never enter this service. */
@@ -32,7 +33,7 @@ CREATE TABLE IF NOT EXISTS fleet_accounts (label TEXT PRIMARY KEY, provider TEXT
 CREATE TABLE IF NOT EXISTS fleet_routes (machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, PRIMARY KEY(machine_id, engine, account));
 CREATE TABLE IF NOT EXISTS fleet_subscriptions (machine_id TEXT NOT NULL, account TEXT NOT NULL, service TEXT NOT NULL, plan TEXT, observed_at TEXT NOT NULL, quota_json TEXT NOT NULL, PRIMARY KEY(machine_id, account));
 CREATE TABLE IF NOT EXISTS fleet_sessions (machine_id TEXT NOT NULL, native_id TEXT NOT NULL, tag TEXT NOT NULL, engine TEXT, phase TEXT NOT NULL, agent_state TEXT, observed_at TEXT NOT NULL, workspace TEXT NOT NULL, profile TEXT, account TEXT, last_activity_at TEXT, cwd TEXT, PRIMARY KEY(machine_id, native_id));
-CREATE TABLE IF NOT EXISTS fleet_launches (id TEXT PRIMARY KEY, actor TEXT NOT NULL, requester_kind TEXT NOT NULL, parent_id TEXT, summary TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, mode TEXT NOT NULL, workspace TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL, native_id TEXT, launcher_task_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
+CREATE TABLE IF NOT EXISTS fleet_launches (id TEXT PRIMARY KEY, actor TEXT NOT NULL, requester_kind TEXT NOT NULL, parent_id TEXT, summary TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, machine_id TEXT NOT NULL, engine TEXT NOT NULL, account TEXT NOT NULL, profile TEXT, mode TEXT NOT NULL, workspace TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL, native_id TEXT, launcher_task_id TEXT, runtime_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
 CREATE TABLE IF NOT EXISTS fleet_engine_health (engine TEXT NOT NULL, machine_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, reason TEXT NOT NULL, updated_at TEXT NOT NULL, diagnostics_json TEXT, PRIMARY KEY(engine, machine_id));
 CREATE TABLE IF NOT EXISTS operator_notices (notice_key TEXT PRIMARY KEY, engine TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS placement_rejections (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, created_at_ms INTEGER NOT NULL, actor TEXT NOT NULL, reasons_json TEXT NOT NULL, detail TEXT NOT NULL);
@@ -392,7 +393,7 @@ export class FleetService {
     for (const stmt of FLEET_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
     initResourceRequestProjection(this.sql, 'fleet_launches');
     const launchColumns = this.sql.exec('PRAGMA table_info(fleet_launches)').toArray().map((c: any) => c.name);
-    for (const name of ['verification_status', 'exit_reason', 'finished_at', 'launch_error_json', 'model_selection_json', 'retried_launch_id', 'claim_key']) {
+    for (const name of ['verification_status', 'exit_reason', 'finished_at', 'launch_error_json', 'model_selection_json', 'retried_launch_id', 'claim_key', 'runtime_json']) {
       if (!launchColumns.includes(name)) this.sql.exec(`ALTER TABLE fleet_launches ADD COLUMN ${name} TEXT`);
     }
     this.sql.exec("CREATE INDEX IF NOT EXISTS fleet_offered ON fleet_launches(id) WHERE state = 'offered'");
@@ -1553,6 +1554,8 @@ export class FleetService {
     if (match && request.method === 'POST') {
       if (!host) return response({ error: 'forbidden' }, 403);
       const data = await body(request);
+      const runtime = data?.runtime === undefined ? undefined : sanitizeExitEvidence(data.runtime);
+      if (data?.runtime !== undefined && (!runtime || !['failed', 'exited'].includes(data.state) || data.confirmed_exit !== true)) return response({ error: 'invalid_exit_evidence' }, 400);
       return this.transaction(() => {
         const row: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id = ? AND machine_id = ?', match[1], caller.machineId!).toArray()[0];
         if (!row) return response({ error: 'not_found' }, 404);
@@ -1639,12 +1642,13 @@ export class FleetService {
         }
         // Replay an identical committed normal-headless terminal receipt without effects.
         if (row.mode === 'headless' && ['exited', 'failed'].includes(row.state) &&
-            object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'report_status', 'report', 'artifacts']) &&
+            object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'report_status', 'report', 'artifacts', 'runtime']) &&
             data.state === row.state && data.confirmed_exit === true &&
             typeof data.native_id === 'string' && data.native_id.length > 0 && data.native_id.length <= 160 &&
             data.native_id === row.native_id && label(data.launcher_task_id) &&
             data.launcher_task_id === row.launcher_task_id &&
             !this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) {
+          if (runtime) this.sql.exec('UPDATE fleet_launches SET runtime_json = ? WHERE id = ?', JSON.stringify(runtime), row.id);
           this.ingestFinishReport(row.id, data);
           return response({ id: row.id, state: row.state, replay: true });
         }
@@ -1666,12 +1670,13 @@ export class FleetService {
         // runtime evidence. Identity/state stay fixed; no capacity/lifecycle effect.
         if (row.mode === 'headless' && row.state === 'failed' && data.state === 'failed' &&
             diagnostic?.stage === 'runtime' && data.confirmed_exit === true &&
-            object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'diagnostic', 'report_status', 'report', 'artifacts']) &&
+            object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'diagnostic', 'report_status', 'report', 'artifacts', 'runtime']) &&
             !!row.native_id && data.native_id === row.native_id &&
             !!row.launcher_task_id && data.launcher_task_id === row.launcher_task_id &&
             (!row.launch_error_json || row.launch_error_json === JSON.stringify(diagnostic)) &&
             !this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) {
           this.sql.exec('UPDATE fleet_launches SET launch_error_json = ?, exit_reason = ? WHERE id = ?', JSON.stringify(diagnostic), diagnostic.reason, row.id);
+          if (runtime) this.sql.exec('UPDATE fleet_launches SET runtime_json = ? WHERE id = ?', JSON.stringify(runtime), row.id);
           this.ingestFinishReport(row.id, data);
           return response({ id: row.id, state: row.state, replay: true });
         }
@@ -1712,7 +1717,7 @@ export class FleetService {
           }
         }
         if (noStart && row.state === 'failed' && row.exit_reason === data.reason && row.launcher_task_id === data.launcher_task_id) return response({ id: row.id, state: row.state, replay: true });
-        if ((!noStart && !object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'diagnostic', 'report_status', 'report', 'artifacts'])) || !['running', 'uncertain', 'failed', 'exited'].includes(data.state) || !['starting', 'running', 'uncertain'].includes(row.state)) return response({ error: 'invalid_transition' }, 409);
+        if ((!noStart && !object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'diagnostic', 'report_status', 'report', 'artifacts', 'runtime'])) || !['running', 'uncertain', 'failed', 'exited'].includes(data.state) || !['starting', 'running', 'uncertain'].includes(row.state)) return response({ error: 'invalid_transition' }, 409);
         if (['exited', 'failed'].includes(data.state) && this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) return response({ error: 'task_report_required' }, 409);
         if (['exited', 'failed'].includes(data.state) && data.confirmed_exit !== true) return response({ error: 'confirmed_exit_required' }, 409);
         if (data.state === 'running' && (typeof data.native_id !== 'string' || data.native_id.length < 1 || data.native_id.length > 160 || (row.mode === 'headless' && !label(data.launcher_task_id)))) return response({ error: 'native_receipt_required' }, 409);
@@ -1727,6 +1732,7 @@ export class FleetService {
           typeof (a as any).text !== 'string' || (a as any).text.length > 1024))) return response({ error: 'invalid_finish_report' }, 400);
         if (!['failed', 'exited'].includes(data.state) && (data.report_status !== undefined || data.report !== undefined || data.artifacts !== undefined)) return response({ error: 'invalid_finish_report' }, 400);
         this.sql.exec('UPDATE fleet_launches SET state = ?, native_id = COALESCE(?, native_id), launcher_task_id = COALESCE(?, launcher_task_id), updated_at = ? WHERE id = ?', data.state, data.native_id || null, data.launcher_task_id || null, new Date(this.now()).toISOString(), row.id);
+        if (runtime) this.sql.exec('UPDATE fleet_launches SET runtime_json = ? WHERE id = ?', JSON.stringify(runtime), row.id);
         if (diagnostic) this.sql.exec("UPDATE fleet_launches SET launch_error_json = ?, exit_reason = ? WHERE id = ?", JSON.stringify(diagnostic), diagnostic.reason, row.id);
         if (noStart) this.sql.exec("UPDATE fleet_launches SET exit_reason = ?, verification_status = 'not_started', finished_at = ? WHERE id = ?", data.reason, new Date(this.now()).toISOString(), row.id);
         if (diagnostic?.reason === 'engine_tool_permission_refused' && row.mode === 'headless') {

@@ -1599,6 +1599,11 @@ class Dispatcher:
                 reconciled_state, bool(_peeked),
                 (record.get('diagnostic') or {}).get('reason')
                 if isinstance(record.get('diagnostic'), dict) else None)
+            from .exit_evidence import terminal_evidence
+            evidence = terminal_evidence(record, tombstone or {})
+            evidence['outcome'] = ('reported' if _peeked else
+                'failed-with-partial-work' if evidence['observed_commits'] or evidence['dirty_paths'] or evidence['log_tail'] else
+                'failed-without-report')
             if record.get('routing_task_id'):
                 job_id = record['routing_task_id']
                 payload = self._routed_finish_report(record, fleet_state)
@@ -1626,6 +1631,7 @@ class Dispatcher:
                 "confirmed_exit": True,
                 "native_id": record["native_id"],
                 "launcher_task_id": task_id,
+                "runtime": evidence,
             }
             # Intake 88b3260d AC1: forward the worker's final result file so
             # the server can append it to the linked intake. Bounded,
@@ -1659,6 +1665,8 @@ class Dispatcher:
                             for a in partial['artifacts'] if isinstance(a, dict)]
                 except Exception:
                     pass
+            if not forwarded and evidence['log_tail']:
+                result_payload['report'] = (result_payload.get('report', '') + '; last output: ' + evidence['log_tail'])[:4096]
             if record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused':
                 result_payload['diagnostic'] = record['diagnostic']
             # AC a19cac9e: missing result JSON now forces failed above, so
@@ -2710,6 +2718,25 @@ class Dispatcher:
                 pass
             return {"id": offer_id, "state": "uncertain", "reason": reason,
                     "stage": stage, "error": err, "diagnostic": failure}
+        if mode == 'headless' and result.get('confirmed_exit'):
+            from .exit_evidence import sanitize, terminal_evidence
+            immediate = {'offer_id': offer_id, 'native_id': native_id,
+                'workspace': str(workspace), 'target_cwd': str(target_cwd), 'result_path': str(result_path),
+                'incarnation': details.get('created_at_ms') or int(launched_at_ts * 1000),
+                'runtime_exit': {'code': details.get('exit_code'), 'signal': details.get('signal')},
+                'exit_evidence': {'log_tail': sanitize(str(details.get('stderr') or details.get('stdout') or ''))}}
+            evidence = terminal_evidence(immediate, {'finished_at_ms': int(time.time() * 1000)})
+            forwarded = self._read_hub_finish_report(immediate)
+            evidence['outcome'] = ('reported' if forwarded else 'failed-with-partial-work'
+                if evidence['observed_commits'] or evidence['dirty_paths'] or evidence['log_tail'] else 'failed-without-report')
+            result['runtime'] = evidence
+            if forwarded:
+                result.update(forwarded)
+            else:
+                result.update(state='failed', report_status='failed', report=(evidence['outcome'] +
+                    '; observed commits: ' + ', '.join(evidence['observed_commits']) +
+                    '; dirty paths: ' + ', '.join(evidence['dirty_paths']) +
+                    '; last output: ' + evidence['log_tail'])[:4096])
         if offer.get('task_id') and result.get('confirmed_exit'):
             from .routing import read_text
             try:
@@ -2862,6 +2889,13 @@ class Dispatcher:
         active_launches = dict(self._active_launches)
         for record in active_launches.values():
             for row in rows:
+                from .exit_evidence import same_native, snapshot_native
+                if not record.get('settled') and same_native(record, row):
+                    evidence = snapshot_native(record, row,
+                        opencode_data=self.settings.get('opencode_auth', {}).get('target_data'))
+                    if evidence is not None and evidence != record.get('exit_evidence'):
+                        record['exit_evidence'] = evidence
+                        self._persist_launch_record(record)
                 if (row.get('id') == record.get('native_id')
                         and row.get('created_at_ms') == record.get('incarnation')
                         and row.get('tag') == record.get('tag')

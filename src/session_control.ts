@@ -628,6 +628,7 @@ export class SessionControlService {
     const session_type = row.session_type || (row.mode === 'interactive' || row.interactive ? 'aplexer' : (isObserved ? 'aplexer' : 'headless'));
     const parent_id = row.parent_id || null;
     const parent_source = row.parent_source || (row.parent_id ? 'explicit_parent' : 'unknown_external');
+    let runtime: any = null;
     let launchError: any = null;
     let modelSelection: any = null;
     let expectedCpu: any = null;
@@ -636,7 +637,8 @@ export class SessionControlService {
     let holdReason: string | null = null;
     if (row.fleet_launch_id) {
       try {
-        const launch: any = this.sql.exec('SELECT launch_error_json, model_selection_json, exit_reason, native_id,request_json,workspace FROM fleet_launches WHERE id = ?', row.fleet_launch_id).toArray()[0];
+        const launch: any = this.sql.exec('SELECT launch_error_json, runtime_json, model_selection_json, exit_reason, native_id,request_json,workspace FROM fleet_launches WHERE id = ?', row.fleet_launch_id).toArray()[0];
+        runtime = parsed(launch?.runtime_json, null);
         modelSelection = parsed(launch?.model_selection_json);
         const cpuTable=this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='resource_cpu_starts'").toArray().length;
         if(cpuTable) {
@@ -700,6 +702,7 @@ export class SessionControlService {
       ...(modelReason ? { reason: modelReason } : {}),
       ...(memoryRejected.length ? { reason: holdReason ?? memoryRejected[0]?.reason ?? 'placement_unknown', rejected: memoryRejected } : holdReason ? { reason: holdReason } : {}),
       ...(launchError ? { reason: launchError.reason, message: launchError.message, launch_error: launchError } : {}),
+      ...(runtime ? { runtime } : {}),
       cleanup_protection: protection ? { key: protection.request_key, created_at: protection.created_at, permanent: true } : null,
       binding,
       provenance,

@@ -62,6 +62,22 @@ function history(sql: any, taskId: string): any[] {
 }
 
 describe('fleet finish-report ingestion (intake 88b3260d AC1)', () => {
+  it('stores sanitized exit evidence on success and failure without changing replay identity', async () => setup(async (s, _intake, sql) => {
+    for (const state of ['exited', 'failed']) {
+      const launchId = uuid(), sessionId = uuid(), taskId = uuid();
+      seedIntake(sql, taskId);
+      seedLaunch(sql, launchId, sessionId, taskId);
+      const payload = { state, confirmed_exit: true, native_id: 'native-1', launcher_task_id: 'hub-' + launchId,
+        runtime: { exit_code: state === 'exited' ? 0 : 17, exit_signal: null, wall_time_ms: 1234,
+          log_tail: 'Bearer sensitive-value', engine_outcome: null, observed_commits: [], dirty_paths: [], outcome: 'reported' } };
+      expect((await s.handle(request(`/launches/${launchId}/result`, payload), host('hetzner'))).status).toBe(200);
+      const stored = JSON.parse(sql.exec('SELECT runtime_json FROM fleet_launches WHERE id=?', launchId).one().runtime_json);
+      expect(stored.wall_time_ms).toBe(1234);
+      expect(stored.log_tail).not.toContain('sensitive-value');
+      expect((await s.handle(request(`/launches/${launchId}/result`, payload), host('hetzner'))).status).toBe(200);
+      expect((await s.handle(request(`/launches/${launchId}/result`, { ...payload, native_id: 'other' }), host('hetzner'))).status).toBe(409);
+    }
+  }));
   it('appends a Hub-authored report to the linked intake on terminal result', async () => setup(async (s, _intake, sql) => {
     const launchId = uuid(), sessionId = uuid(), taskId = uuid();
     seedIntake(sql, taskId);
