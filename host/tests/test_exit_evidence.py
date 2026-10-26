@@ -24,6 +24,18 @@ class ExitEvidence(unittest.TestCase):
         result = terminal_evidence({'exit_evidence': {'exit_code': 'bad'}, 'runtime_exit': {'code': 0}}, {})
         self.assertEqual(result['exit_code'], 0)
 
+    def test_durable_native_exit_receipt_survives_absent_catalog_observation(self):
+        for code, signal in [(0,None),(3,None),(None,15)]:
+            record={'incarnation':1000}
+            receipt={'finished_at_ms':3100,'exit':{'code':code,'signal':signal,
+                     'oom_killed':False,'exited_at_ms':3000}}
+            result=terminal_evidence(record,receipt,git=Mock())
+            self.assertEqual((result['exit_code'],result['exit_signal'],result['wall_time_ms']),
+                             (code,signal,2000))
+            self.assertEqual(record['runtime_exit']['code'],code)
+        result=terminal_evidence({'incarnation':1000},{'exit':'malformed','finished_at_ms':3100})
+        self.assertIsNone(result['exit_code'])
+
     def test_engine_exit_zero_without_result_is_failed_with_partial_work(self):
         from agent_hub_host.fleet import Dispatcher
         with tempfile.TemporaryDirectory() as tmp:

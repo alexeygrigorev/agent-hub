@@ -121,10 +121,21 @@ def terminal_evidence(record, tombstone, *, git=subprocess.run):
         return value if (type(value) is int and abs(value) <= 9007199254740991
                          and (not nonnegative or value >= 0)) else None
 
+    # The retirement reader has already qualified this tombstone against the
+    # exact UUID/tag/workspace/incarnation. New native versions retain ExitInfo
+    # durably, so a short-lived catalog exit row is no longer required.
+    durable = tombstone.get('exit')
+    if isinstance(durable, dict):
+        native_exit = {**native_exit, **durable}
+        record['runtime_exit'] = native_exit
     end = saved.get('exited_at_ms') or native_exit.get('exited_at_ms') or tombstone.get('finished_at_ms')
     start = record.get('incarnation')
-    code = integer(saved.get('exit_code'))
-    signal = integer(saved.get('exit_signal'), True)
+    code = integer(native_exit.get('code'))
+    if code is None:
+        code = integer(saved.get('exit_code'))
+    signal = integer(native_exit.get('signal'), True)
+    if signal is None:
+        signal = integer(saved.get('exit_signal'), True)
     outcome = saved.get('engine_outcome')
     result = {'exit_code': code if code is not None else integer(native_exit.get('code')),
               'exit_signal': signal if signal is not None else integer(native_exit.get('signal'), True),
