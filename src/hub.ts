@@ -169,6 +169,14 @@ export class Hub extends DurableObject {
       },
     }, { env: this.env });
     this.sessionControlService.init();
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS session_control_native ON session_control_sessions(machine_id,
+      CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(binding_json, '$.native_id') = 'text'
+        THEN json_extract(binding_json, '$.native_id') END END)`);
+    this.sql.exec('CREATE INDEX IF NOT EXISTS lifecycle_decision_latest ON session_lifecycle_decisions(session_key,created_at DESC,decision_id DESC)');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS status_observation_latest ON status_observations(hub_session_id,kind,observed_at DESC,received_at DESC)');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS fleet_launch_native ON fleet_launches(machine_id,native_id)');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS session_control_created ON session_control_sessions(created_at DESC,id DESC)');
+    this.sql.exec('CREATE INDEX IF NOT EXISTS session_control_actor_created ON session_control_sessions(actor,created_at DESC,id DESC)');
     this.provisioningService = new ProvisioningService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.env, this.fleetService,
       (machine, caller) => this.sessionControlService.hostObservationAllowed(machine, caller));
     this.provisioningService.init();

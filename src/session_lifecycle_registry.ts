@@ -132,7 +132,7 @@ type JoinedBase = {
 /** Canonical identity union. Only sessions with a native identity
  * (bound hub sessions, observed fleet sessions) are keyed; unbound
  * queued/held intents stay in the existing flat list view only. */
-function joinedBases(sql: SqlStorage): JoinedBase[] {
+function joinedBases(sql: SqlStorage, sessionIds?: Set<string>): JoinedBase[] {
   const byKey = new Map<string, JoinedBase>();
   const get = (machine_id: string, native_id: string): JoinedBase => {
     const key = `${machine_id}/${native_id}`;
@@ -143,15 +143,33 @@ function joinedBases(sql: SqlStorage): JoinedBase[] {
     }
     return row;
   };
+  // Status supplies only session ids referenced by its bounded task page.
+  // Batch canonical joins rather than materializing the entire fleet archive.
+  const selected = sessionIds ? [...sessionIds] : null;
+  const read = (table: string): any[] => {
+    if (!selected) return sql.exec(`SELECT * FROM ${table} ORDER BY rowid`).toArray() as any[];
+    const rows = new Map<string, any>();
+    for (let i = 0; i < selected.length; i += 50) {
+      const ids = selected.slice(i, i + 50);
+      const marks = ids.map(() => '?').join(',');
+      const nativeId = `CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(binding_json, '$.native_id') = 'text' THEN json_extract(binding_json, '$.native_id') END END`;
+      const native = `SELECT machine_id, ${nativeId} FROM session_control_sessions WHERE id IN (${marks})`;
+      const query = table === 'session_control_sessions' ? `SELECT rowid AS _join_order, * FROM ${table} WHERE id IN (${marks}) OR (machine_id, ${nativeId}) IN (${native})`
+        : table === 'fleet_sessions' ? `SELECT rowid AS _join_order, * FROM ${table} WHERE (machine_id,native_id) IN (${native})`
+        : `SELECT rowid AS _join_order, * FROM ${table} WHERE id IN (SELECT fleet_launch_id FROM session_control_sessions WHERE id IN (${marks})) OR (machine_id,native_id) IN (${native})`;
+      for (const row of sql.exec(query, ...ids, ...(table !== 'fleet_sessions' ? ids : [])).toArray() as any[]) rows.set(row.id ?? `${row.machine_id}/${row.native_id}`, row);
+    }
+    return [...rows.values()].sort((a, b) => a._join_order - b._join_order);
+  };
   let scRows: any[] = [];
   try {
-    scRows = sql.exec('SELECT * FROM session_control_sessions').toArray() as any[];
+    scRows = read('session_control_sessions');
   } catch {
     scRows = [];
   }
   const launchesById = new Map<string, any>();
   try {
-    for (const launch of sql.exec('SELECT * FROM fleet_launches').toArray() as any[]) {
+    for (const launch of read('fleet_launches')) {
       launchesById.set(launch.id, launch);
     }
   } catch { /* fleet tables predate; join degrades to session-control only */ }
@@ -163,25 +181,24 @@ function joinedBases(sql: SqlStorage): JoinedBase[] {
   }
   let fleetRows: any[] = [];
   try {
-    fleetRows = sql.exec('SELECT * FROM fleet_sessions').toArray() as any[];
+    fleetRows = read('fleet_sessions');
   } catch {
     fleetRows = [];
   }
   for (const fleet of fleetRows) {
     if (!fleet.machine_id || !fleet.native_id) continue;
+    if (sessionIds && !byKey.has(`${fleet.machine_id}/${fleet.native_id}`)) continue;
     const base = get(fleet.machine_id, fleet.native_id);
     if (!base.fleet) base.fleet = fleet;
   }
+  const launchesByNative = new Map<string, any>();
+  for (const launch of launchesById.values()) {
+    const key = `${launch.machine_id}/${launch.native_id}`;
+    if (!launchesByNative.has(key)) launchesByNative.set(key, launch);
+  }
   for (const base of byKey.values()) {
     if (base.sc?.fleet_launch_id) base.launch = launchesById.get(base.sc.fleet_launch_id) ?? null;
-    if (!base.launch) {
-      for (const launch of launchesById.values()) {
-        if (launch.machine_id === base.machine_id && launch.native_id === base.native_id) {
-          base.launch = launch;
-          break;
-        }
-      }
-    }
+    if (!base.launch) base.launch = launchesByNative.get(base.key) ?? null;
   }
   return [...byKey.values()];
 }
@@ -194,37 +211,47 @@ type TaskLinks = { task_refs: string[]; report_refs: string[] };
  * intake authorizes that reference at link time (operator or session owner),
  * so it is already an authenticated join endpoint. Report references ride
  * the linked tasks. Bounded; failures degrade to empty (never a hard error). */
-function taskLinksFor(sql: SqlStorage, native_id: string, hub_session_id: string | null): TaskLinks {
-  const task_refs: string[] = [];
-  const report_refs: string[] = [];
+/** Parse each history once per projection, not once per session. The maps
+ * contain canonical link candidates; union in intake order preserves the
+ * existing 25-task / 5-report bounds when a task links both identities. */
+function taskLinkIndex(sql: SqlStorage): (native: string, hub: string | null) => TaskLinks {
+  type LinkedTask = { order: number; id: string; reports: string[] };
+  const natives = new Map<string, LinkedTask[]>();
+  const hubs = new Map<string, LinkedTask[]>();
   try {
-    const rows = sql.exec('SELECT id, data FROM intake_tasks').toArray() as any[];
-    for (const row of rows) {
-      const task = parsed(row.data, null);
-      if (!task || !Array.isArray(task.history)) continue;
-      let linked = false;
+    const rows = sql.exec('SELECT id, links FROM intake_task_projection').toArray() as any[];
+    for (const [order, row] of rows.entries()) {
+      const task = { id: row.id, history: parsed(row.links, []) };
+      if (!Array.isArray(task.history)) continue;
+      const nativeIds = new Set<string>();
+      const hubIds = new Set<string>();
+      const reports: string[] = [];
       for (const event of task.history) {
-        if (event?.kind === 'link' && event.native_id === native_id && event.routing_job_id) {
-          linked = true;
+        if (event?.kind === 'link') {
+          if (typeof event.native_id === 'string' && event.routing_job_id) nativeIds.add(event.native_id);
+          if (typeof event.hub_session_id === 'string') hubIds.add(event.hub_session_id);
         }
-        if (event?.kind === 'link' && typeof event.hub_session_id === 'string' &&
-            hub_session_id && event.hub_session_id === hub_session_id) {
-          linked = true;
-        }
-        if (event?.kind === 'report' && typeof event.reference === 'string' && event.reference) {
-          (task as any).__reports = [...((task as any).__reports ?? []), event.reference];
+        if (event?.kind === 'report' && typeof event.reference === 'string' && event.reference && reports.length < 5) reports.push(event.reference);
+      }
+      const linked = { order, id: String(task.id ?? row.id), reports };
+      for (const [index, ids] of [[natives, nativeIds], [hubs, hubIds]] as const) {
+        for (const id of ids) {
+          const list = index.get(id) ?? [];
+          list.push(linked);
+          index.set(id, list);
         }
       }
-      if (linked) {
-        task_refs.push(String(task.id ?? row.id));
-        for (const ref of ((task as any).__reports ?? []).slice(0, 5)) {
-          if (report_refs.length < 5 && !report_refs.includes(ref)) report_refs.push(String(ref).slice(0, 512));
-        }
-      }
-      if (task_refs.length >= 25) break;
     }
-  } catch { /* intake tables absent: unknown task linkage, truthfully empty */ }
-  return { task_refs, report_refs };
+  } catch { /* intake tables absent: unknown task linkage */ }
+  return (native, hub) => {
+    const tasks = [...new Set([...(natives.get(native) ?? []), ...(hub ? hubs.get(hub) ?? [] : [])])]
+      .sort((a, b) => a.order - b.order).slice(0, 25);
+    const report_refs: string[] = [];
+    for (const task of tasks) for (const ref of task.reports) {
+      if (report_refs.length < 5 && !report_refs.includes(ref)) report_refs.push(ref.slice(0, 512));
+    }
+    return { task_refs: tasks.map(t => t.id), report_refs };
+  };
 }
 
 function observationsByKey(sql: SqlStorage): Map<string, any> {
@@ -327,8 +354,9 @@ function checkObservationPayload(input: any): { ok: true; stored: Record<string,
 /** Build trusted classifier inputs from canonical joins + stored
  * observations. Owner/provenance/human/engine/task linkage always come
  * from canonical rows; observations supply host-verified flags only. */
-export function buildSessionInputs(sql: SqlStorage): { inputs: SessionInput[]; refs: Map<string, LifecycleRefs> } {
+export function buildSessionInputs(sql: SqlStorage, sessionIds?: Set<string>): { inputs: SessionInput[]; refs: Map<string, LifecycleRefs> } {
   const observations = observationsByKey(sql);
+  const taskLinks = taskLinkIndex(sql);
   const protectedSessions = new Set<string>();
   let protectionKnown = true;
   try {
@@ -336,7 +364,7 @@ export function buildSessionInputs(sql: SqlStorage): { inputs: SessionInput[]; r
   } catch { protectionKnown = false; }
   const inputs: SessionInput[] = [];
   const refs = new Map<string, LifecycleRefs>();
-  for (const base of joinedBases(sql)) {
+  for (const base of joinedBases(sql, sessionIds)) {
     const request = base.sc?.request_json ? parsed(base.sc.request_json, {}) : {};
     const starter: string | null =
       (typeof base.launch?.actor === 'string' && base.launch.actor) ||
@@ -379,7 +407,7 @@ export function buildSessionInputs(sql: SqlStorage): { inputs: SessionInput[]; r
       obs.observation_note = stored.observation_note;
       obs.note_text_opt_in = true;
     }
-    const links = taskLinksFor(sql, base.native_id, base.sc?.id ?? null);
+    const links = taskLinks(base.native_id, base.sc?.id ?? null);
     const input: SessionInput = {
       machine_id: base.machine_id,
       native_id: base.native_id,

@@ -580,7 +580,7 @@ export class SessionControlService {
     // Imported native sessions can be linked after launch through intake.
     let intakeId = intent.intake_task_id ?? null;
     if (!intakeId) {
-      const linked: any = this.sql.exec(`SELECT i.id FROM intake_tasks i, json_each(i.data, '$.history') e
+      const linked: any = this.sql.exec(`SELECT i.id FROM intake_task_projection i, json_each(i.links) e
         WHERE json_extract(e.value, '$.kind') = 'link' AND
         (json_extract(e.value, '$.hub_session_id') = ? OR
          (json_extract(e.value, '$.native_id') = ? AND json_extract(e.value, '$.routing_job_id') IS NOT NULL)) LIMIT 1`, row.id, binding?.native_id ?? '').toArray()[0];

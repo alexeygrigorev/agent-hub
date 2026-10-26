@@ -299,7 +299,7 @@ export class StatusService {
   }
 
   private selectTasks(p: Obj, project: string | null, singleTask: string | null, sinceMs: number | null): Obj[] {
-    let tasks = this.intake.statusAuthorizedTasks(p);
+    let tasks = this.intake.statusTaskSummaries(p);
     if (project !== null) tasks = tasks.filter(t => t.project === project);
     if (singleTask !== null) {
       const one = this.intake.statusTaskById(p, singleTask);
@@ -314,8 +314,18 @@ export class StatusService {
   private buildItems(p: Obj, tasks: Obj[], hostFilter: string | null, sinceMs: number | null, now: number, nowIso: string): { items: Obj[]; machines: Map<string, Obj>; missingHosts: string[]; expectedOffline: string[]; sessionCoverage: string; reportsCollected: boolean; probesCollected: boolean } {
     const machines = new Map(this.rows('SELECT id, hostname, last_checkin_at, drained FROM machines').map(m => [m.id, m]));
     const aliases = this.machineAliases(machines);
-    const lifecycleBySession = this.lifecycleBySessionId(now);
-    const items = tasks.map(task => this.taskDto(task, p, machines, now, nowIso, sinceMs, hostFilter, lifecycleBySession, aliases));
+    const sessionIds = new Set<string>();
+    for (const task of tasks) for (const event of task.history ?? []) {
+      if (event?.kind === 'link' && typeof event.hub_session_id === 'string' && SESSION_UUID.test(event.hub_session_id)) sessionIds.add(event.hub_session_id);
+    }
+    const sessionRows = new Map<string, Obj>();
+    const ids = [...sessionIds];
+    for (let i = 0; i < ids.length; i += 100) {
+      const chunk = ids.slice(i, i + 100);
+      for (const row of this.rows(`SELECT * FROM session_control_sessions WHERE id IN (${chunk.map(() => '?').join(',')})`, ...chunk)) sessionRows.set(row.id, row);
+    }
+    const lifecycleBySession = sessionIds.size ? this.lifecycleBySessionId(now, sessionIds) : new Map<string, Obj>();
+    const items = tasks.map(task => this.taskDto(task, p, machines, now, nowIso, sinceMs, hostFilter, lifecycleBySession, aliases, sessionRows));
     this.attachObservations(items, now, nowIso);
     const reportsCollected = items.some(t => (t.reports ?? []).some((r: Obj) => r.headline !== 'unknown'));
     const probesCollected = items.some(t => (t.commits ?? []).some((c: Obj) => c.git_ancestry || c.ci || c.deploy));
@@ -353,6 +363,9 @@ export class StatusService {
     let waiting = 0;
     let waiting_confirmation = 0;
     try {
+      // The guarded JSON expression returns text. Unary + removes the
+      // native column's affinity so SQLite can seek both expression-index
+      // keys, rather than scanning every binding on the same machine.
       const fleetSessions = this.rows(`
         SELECT s.machine_id, s.native_id, s.tag, s.engine, s.phase, s.agent_state,
                c.session_type, c.state AS control_state
@@ -360,7 +373,7 @@ export class StatusService {
         LEFT JOIN session_control_sessions c ON (c.machine_id = s.machine_id AND
           CASE WHEN json_valid(c.binding_json) THEN
             CASE WHEN json_type(c.binding_json, '$.native_id') = 'text'
-              THEN json_extract(c.binding_json, '$.native_id') END END = s.native_id)
+              THEN json_extract(c.binding_json, '$.native_id') END END = +s.native_id)
         WHERE s.phase IN ('starting', 'running')
           AND s.tag NOT LIKE 'ping-%'
           AND s.tag NOT LIKE 'probe-%'
@@ -406,13 +419,11 @@ export class StatusService {
         WHERE c.state IN ('starting', 'running')
           AND (c.session_type IS NULL OR c.session_type != 'probe')
           AND (c.engine IS NULL OR c.engine != 'probe')
-          AND c.id NOT IN (
-            SELECT COALESCE(c2.id, '')
-            FROM session_control_sessions c2
-            JOIN fleet_sessions s ON (c2.machine_id = s.machine_id AND
-              CASE WHEN json_valid(c2.binding_json) THEN
-                CASE WHEN json_type(c2.binding_json, '$.native_id') = 'text'
-                  THEN json_extract(c2.binding_json, '$.native_id') END END = s.native_id)
+          AND NOT EXISTS (
+            SELECT 1 FROM fleet_sessions s WHERE s.machine_id = c.machine_id AND s.native_id =
+              CASE WHEN json_valid(c.binding_json) THEN
+                CASE WHEN json_type(c.binding_json, '$.native_id') = 'text'
+                  THEN json_extract(c.binding_json, '$.native_id') END END
           )
       `);
       for (const _ of controlSessions) {
@@ -713,10 +724,13 @@ export class StatusService {
     const out = new Map<string, Obj>();
     const ids = [...new Set(sessionIds)].filter(v => typeof v === 'string' && v);
     try {
-      for (let i = 0; i < ids.length; i += 400) {
-        const chunk = ids.slice(i, i + 400);
-        const placeholders = chunk.map(() => '?').join(',');
-        for (const row of this.rows(`SELECT * FROM status_observations WHERE hub_session_id IN (${placeholders}) ORDER BY observed_at DESC, received_at DESC`, ...chunk)) {
+      for (let i = 0; i < ids.length; i += 100) {
+        const chunk = ids.slice(i, i + 100);
+        for (const row of this.rows(`WITH ids(id) AS (VALUES ${chunk.map(() => '(?)').join(',')}),
+          kinds(kind) AS (VALUES ('session'),('report'),('probe_git'),('probe_ci'),('probe_deploy'))
+          SELECT o.* FROM ids CROSS JOIN kinds JOIN status_observations o ON o.id = (
+            SELECT id FROM status_observations WHERE hub_session_id=ids.id AND kind=kinds.kind
+            ORDER BY observed_at DESC, received_at DESC LIMIT 1)`, ...chunk)) {
           const key = row.hub_session_id + '\n' + row.kind;
           if (!out.has(key)) {
             let payload: Obj = {};
@@ -898,16 +912,21 @@ export class StatusService {
   /** Live lifecycle per canonical Hub session id. Reuses the M15 registry
    * joins + pure classifier (no second tracker). Degrades to empty on any
    * failure: hub sessions then report truthful unknown lifecycle. */
-  private lifecycleBySessionId(now: number): Map<string, Obj> {
+  private lifecycleBySessionId(now: number, sessionIds?: Set<string>): Map<string, Obj> {
     const out = new Map<string, Obj>();
     try {
-      const { inputs, refs } = buildSessionInputs(this.sql);
+      const { inputs, refs } = buildSessionInputs(this.sql, sessionIds);
       const decisions = new Map<string, Obj[]>();
       try {
-        for (const row of this.rows('SELECT * FROM session_lifecycle_decisions ORDER BY created_at, decision_id')) {
-          const list = decisions.get(row.session_key) ?? [];
-          list.push(row);
-          decisions.set(row.session_key, list);
+        const keys = [...refs.keys()];
+        for (let i = 0; i < keys.length; i += 100) {
+          const chunk = keys.slice(i, i + 100);
+          for (const row of this.rows(`WITH keys(session_key) AS (VALUES ${chunk.map(() => '(?)').join(',')})
+            SELECT d.* FROM keys k JOIN session_lifecycle_decisions d ON d.decision_id = (
+              SELECT decision_id FROM session_lifecycle_decisions WHERE session_key=k.session_key
+              ORDER BY created_at DESC, decision_id DESC LIMIT 1)`, ...chunk)) {
+            decisions.set(row.session_key, [row]);
+          }
         }
       } catch { /* pre-init: no decisions yet */ }
       for (const input of inputs) {
@@ -931,7 +950,7 @@ export class StatusService {
     } catch { return null; }
   }
 
-  private taskDto(task: Obj, p: Obj, machines: Map<string, Obj>, now: number, nowIso: string, sinceMs: number | null, hostFilter: string | null, lifecycleBySession: Map<string, Obj> = new Map(), aliases: Map<string, string> = new Map()): Obj {
+  private taskDto(task: Obj, p: Obj, machines: Map<string, Obj>, now: number, nowIso: string, sinceMs: number | null, hostFilter: string | null, lifecycleBySession: Map<string, Obj> = new Map(), aliases: Map<string, string> = new Map(), sessionRows: Map<string, Obj> = new Map()): Obj {
     const unresolved = this.intake.statusUnresolved(task);
     const continuation = this.intake.statusContinuation(task);
     const history = Array.isArray(task.history) ? task.history : [];
@@ -969,7 +988,7 @@ export class StatusService {
     let filtered = sessions;
     if (hostFilter) filtered = sessions.filter(s => !s.machine_id || s.machine_id === hostFilter);
     const missingForTask = [...new Set(links.map((l: Obj) => typeof l.host === 'string' && l.host ? (aliases.get(l.host) ?? l.host) : null).filter(Boolean))].filter(h => !machines.has(h as string) || this.isStaleHost(machines.get(h as string), now));
-    const hubSessions = this.hubSessionsFor(task, p, machines, now, sinceMs, hostFilter, lifecycleBySession);
+    const hubSessions = this.hubSessionsFor(task, p, machines, now, sinceMs, hostFilter, lifecycleBySession, sessionRows);
 
     return {
       id: task.id,
@@ -1020,7 +1039,7 @@ export class StatusService {
    * matches intake (operator sees all, others only their own actor rows).
    * Lifecycle group/decision rides along when the session has a bound
    * native identity; unbound intents report truthful unknown lifecycle. */
-  private hubSessionsFor(task: Obj, p: Obj, machines: Map<string, Obj>, now: number, sinceMs: number | null, hostFilter: string | null, lifecycleBySession: Map<string, Obj>): Obj[] {
+  private hubSessionsFor(task: Obj, p: Obj, machines: Map<string, Obj>, now: number, sinceMs: number | null, hostFilter: string | null, lifecycleBySession: Map<string, Obj>, sessionRows: Map<string, Obj>): Obj[] {
     const history = Array.isArray(task.history) ? task.history : [];
     const seen = new Set<string>();
     const out: Obj[] = [];
@@ -1028,7 +1047,7 @@ export class StatusService {
       const e = history[i];
       if (e?.kind !== 'link' || typeof e.hub_session_id !== 'string' || !SESSION_UUID.test(e.hub_session_id) || seen.has(e.hub_session_id)) continue;
       seen.add(e.hub_session_id);
-      const row = this.sessionControlRow(e.hub_session_id);
+      const row = sessionRows.get(e.hub_session_id);
       if (!row) {
         out.push({ hub_session_id: e.hub_session_id, linkage: 'unknown_session',
           provenance: { source: 'intake_history_link_claim', observed_at: null, freshness: 'unknown', coverage: 'unavailable', reason: 'linked_hub_session_row_absent' } });

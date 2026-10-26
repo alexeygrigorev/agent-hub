@@ -186,6 +186,23 @@ export class IntakeService {
       for (const table of ['tasks', 'grants', 'rules', 'receipts']) {
         this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_${table} (id TEXT PRIMARY KEY, data TEXT NOT NULL)`);
       }
+      const projectionExists = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='intake_task_projection'").toArray().length > 0;
+      this.sql.exec('CREATE TABLE IF NOT EXISTS intake_task_projection(id TEXT PRIMARY KEY, data TEXT NOT NULL, links TEXT NOT NULL)');
+      // Only events consumed by status/continuation enter this projection.
+      // Notes and original audit bodies remain exclusively in the full ledger.
+      const project = (prefix: string) => `json_set(json_remove(${prefix}data,'$.history'), '$.history',
+        json((SELECT json_group_array(json(CASE WHEN json_extract(e.value,'$.kind')='intake' THEN
+            json_object('kind','intake','text',CASE WHEN json_type(e.value,'$.text')='null' THEN NULL ELSE '' END,
+              'transcription',json_extract(e.value,'$.transcription'), 'source',json_object('reference',json_extract(e.value,'$.source.reference')))
+            ELSE e.value END)) FROM json_each(${prefix}data,'$.history') e
+          WHERE json_extract(e.value,'$.kind') IN ('intake','link','report','commit','followup','blocker','pending_approval','resolution','approval_decision')))),
+        (SELECT json_group_array(json(e.value)) FROM json_each(${prefix}data,'$.history') e
+         WHERE json_extract(e.value,'$.kind') IN ('link','report'))`;
+      if (!projectionExists) this.sql.exec(`INSERT INTO intake_task_projection SELECT id, ${project('')} FROM intake_tasks`);
+      for (const op of ['INSERT', 'UPDATE']) this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_projection_${op.toLowerCase()} AFTER ${op} ON intake_tasks BEGIN
+        INSERT INTO intake_task_projection(id,data,links) SELECT NEW.id, ${project('NEW.')}
+        ON CONFLICT(id) DO UPDATE SET data=excluded.data,links=excluded.links; END`);
+      this.sql.exec('CREATE TRIGGER IF NOT EXISTS intake_projection_delete AFTER DELETE ON intake_tasks BEGIN DELETE FROM intake_task_projection WHERE id=OLD.id; END');
       // Independent, append-only lifecycle ledger. No FK: survives loss of a task row.
       this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_audit (
         seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, project TEXT NOT NULL,
@@ -194,6 +211,35 @@ export class IntakeService {
       this.sql.exec('CREATE INDEX IF NOT EXISTS intake_audit_task ON intake_audit(task_id,seq)');
       for (const operation of ['UPDATE', 'DELETE']) this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_audit_no_${operation.toLowerCase()}
         BEFORE ${operation} ON intake_audit BEGIN SELECT RAISE(ABORT,'append_only_audit'); END`);
+      // Write-maintained accounting: status must never walk retained histories
+      // and replay bodies just to decide whether to display a storage warning.
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_storage_totals (
+        kind TEXT PRIMARY KEY, bytes INTEGER NOT NULL, hot INTEGER NOT NULL,
+        events INTEGER NOT NULL, original_requests INTEGER NOT NULL, count INTEGER NOT NULL)`);
+      for (const table of ['tasks', 'grants', 'rules', 'receipts', 'audit']) {
+        const values = (prefix: string) => {
+          const c = (name: string) => prefix + name;
+          const bytes = table === 'audit'
+            ? "length(CAST(json_object('seq'," + c('seq') + ",'task_id'," + c('task_id') + ",'project'," + c('project') + ",'kind'," + c('kind') + ",'actor'," + c('actor') + ",'captured_at'," + c('captured_at') + ",'from_status'," + c('from_status') + ",'to_status'," + c('to_status') + ",'reason'," + c('reason') + ") AS BLOB))"
+            : `length(CAST(${c('data')} AS BLOB))+length(CAST(${c('id')} AS BLOB))`;
+          const hot = table === 'tasks' ? `CASE WHEN json_extract(${c('data')},'$.archived_at') IS NULL AND json_extract(${c('data')},'$.status') NOT IN ('done','cancelled') THEN ${bytes} ELSE 0 END`
+            : ['grants', 'rules'].includes(table) ? bytes : '0';
+          const events = table === 'tasks' ? `COALESCE(length(CAST(json_extract(${c('data')},'$.history') AS BLOB)),0)` : '0';
+          const original = table === 'tasks' ? `(SELECT COALESCE(SUM(length(CAST(e.value AS BLOB))),0) FROM json_each(json_extract(${c('data')},'$.history')) e WHERE json_extract(e.value,'$.kind')='intake')` : '0';
+          return [bytes, hot, events, original, '1'];
+        };
+        // Only the first migration reads old retained data. Subsequent cold
+        // starts read five tiny accounting rows, with no backfill scan.
+        if (!this.sql.exec('SELECT 1 FROM intake_storage_totals WHERE kind=?', table).toArray().length) {
+          this.sql.exec(`INSERT INTO intake_storage_totals SELECT ?, ${values('').map(v => `COALESCE(SUM(${v}),0)`).join(',')} FROM intake_${table}`, table);
+        }
+        for (const op of ['INSERT', 'UPDATE', 'DELETE']) {
+          const columns = ['bytes', 'hot', 'events', 'original_requests', 'count'];
+          const before = values('OLD.'); const after = values('NEW.');
+          const updates = columns.map((col, i) => `${col}=${col}${op !== 'DELETE' ? `+(${after[i]})` : ''}${op !== 'INSERT' ? `-(${before[i]})` : ''}`).join(',');
+          this.sql.exec(`CREATE TRIGGER IF NOT EXISTS intake_storage_${table}_${op.toLowerCase()} AFTER ${op} ON intake_${table} BEGIN UPDATE intake_storage_totals SET ${updates} WHERE kind='${table}'; END`);
+        }
+      }
       const oldStatus = "json_extract(OLD.data,'$.status')";
       const newStatus = "json_extract(NEW.data,'$.status')";
       const auditActor = "COALESCE(json_extract(NEW.data,'$.lifecycle_actor'),json_extract(NEW.data,'$.history[#-1].actor'),'hub:legacy')";
@@ -243,21 +289,15 @@ export class IntakeService {
   /** Operator-only callers expose this aggregate, never payloads or identities.
    * Event/original-request bytes are subsets of task bytes, not additive totals. */
   storageUsage(): Obj {
-    const tasks = intakeBytes(this.sql, 'tasks');
-    const open = intakeBytes(this.sql, 'tasks', HOT_TASKS);
-    const receipts = intakeBytes(this.sql, 'receipts');
-    const grants = intakeBytes(this.sql, 'grants');
-    const rules = intakeBytes(this.sql, 'rules');
-    const history = this.sql.exec(`SELECT
-      COALESCE(SUM(length(CAST(json_extract(data,'$.history') AS BLOB))),0) AS events,
-      COALESCE(SUM((SELECT COALESCE(SUM(length(CAST(e.value AS BLOB))),0)
-        FROM json_each(json_extract(data,'$.history')) e WHERE json_extract(e.value,'$.kind')='intake')),0) AS original_requests
-      FROM intake_tasks`).toArray()[0] as any;
-    const counts: Obj = {};
-    for (const table of ['tasks', 'receipts', 'grants', 'rules', 'audit']) {
-      counts[table] = Number((this.sql.exec(`SELECT COUNT(*) AS n FROM intake_${table}`).toArray()[0] as any).n);
-    }
-    const audit = Number((this.sql.exec("SELECT COALESCE(SUM(length(CAST(json_object('seq',seq,'task_id',task_id,'project',project,'kind',kind,'actor',actor,'captured_at',captured_at,'from_status',from_status,'to_status',to_status,'reason',reason) AS BLOB))),0) AS n FROM intake_audit").toArray()[0] as any).n);
+    const totals = new Map((this.sql.exec('SELECT * FROM intake_storage_totals').toArray() as any[]).map(r => [r.kind, r]));
+    const tasks = totals.get('tasks').bytes;
+    const open = totals.get('tasks').hot;
+    const receipts = totals.get('receipts').bytes;
+    const grants = totals.get('grants').bytes;
+    const rules = totals.get('rules').bytes;
+    const history = totals.get('tasks');
+    const counts: Obj = Object.fromEntries([...totals].map(([key, value]) => [key, value.count]));
+    const audit = totals.get('audit').bytes;
     const hot = open + grants + rules;
     const retained = tasks + receipts + grants + rules + audit;
     return { accounting: 'utf8_json_and_primary_key_bytes; audit_json_projection; excludes SQLite overhead',
@@ -278,7 +318,7 @@ export class IntakeService {
   private bounded(table: string, max: number) { if (this.rows(table).length >= max) fail('record_capacity', 507); }
   /** Non-terminal task count used for soft open-intake warnings (never blocks create). */
   openNonTerminalCount(principal?: Obj): number {
-    const rows = this.rows('tasks');
+    const rows = this.sql.exec('SELECT data FROM intake_task_projection').toArray().map((r: any) => JSON.parse(r.data));
     return rows.filter(t => !t.archived_at && OPEN.includes(t.status) && (!principal || this.allowed(principal, t))).length;
   }
   /** Operator-visible soft warning when open intake is high. Null when under threshold. */
@@ -292,7 +332,7 @@ export class IntakeService {
       threshold: OPEN_INTAKE_WARN_THRESHOLD,
       message: 'Open intake is high. Closing requires a DONE note containing a commit SHA or deploy run URL AND a live check (command/URL plus result). Review evidence for each intake before closing.',
       action: 'review_done_evidence',
-      items: this.rows('tasks').filter(t => !t.archived_at && OPEN.includes(t.status) && (!principal || this.allowed(principal, t)))
+      items: this.sql.exec('SELECT data FROM intake_task_projection').toArray().map((r: any) => JSON.parse(r.data)).filter(t => !t.archived_at && OPEN.includes(t.status) && (!principal || this.allowed(principal, t)))
         .map(t => ({ id: t.id, title: t.title, age_ms: Math.max(0, Date.now() - (t.created_at ?? Date.now())) })),
     };
   }
@@ -1181,6 +1221,10 @@ export class IntakeService {
   statusTaskById(p: Obj, id: string): Obj | undefined {
     const task = this.get('tasks', id);
     return task && this.allowed(p, task) ? task : undefined;
+  }
+  statusTaskSummaries(p: Obj): Obj[] {
+    return this.sql.exec('SELECT data FROM intake_task_projection ORDER BY id').toArray()
+      .map((r: any) => JSON.parse(r.data)).filter(t => this.allowed(p, t));
   }
   statusUnresolved(task: Obj): Obj[] { return this.unresolved(task); }
   statusContinuation(task: Obj): string { return this.continuation(task); }
