@@ -101,10 +101,10 @@ export class ResourceManagement {
         intake_id:intakeId,
         native_id:binding.native_id, tag:binding.tag, workspace:binding.workspace,
         native_created_at_ms:binding.native_created_at_ms ?? observed?.created_at_ms ?? null,
-        engine:s.engine, model:model.model ?? null, project,
+        engine:s.engine, mode:s.mode, model:model.model ?? null, project,
         tier:req.tier || launch.tier || (s.fleet_launch_id ? policy.default_tier : null), kind:req.task_kind || launch.task_kind || 'goal',
         state:TERMINAL.has(s.state) ? s.state : s.launch_state || s.state, keep:protection || req.keep === true || launch.keep === true,
-        managed:!!s.fleet_launch_id && (s.mode === 'headless' || launch.with_goal === true || req.with_goal === true),
+        managed:!!s.fleet_launch_id && s.mode === 'headless',
         last_activity_at:observed?.last_activity_at ?? null, started_at:s.launch_created || s.created_at,
         finished_at:s.launch_finished || (TERMINAL.has(s.state) ? s.updated_at : null) }];
     });

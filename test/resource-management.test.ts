@@ -67,7 +67,10 @@ describe('resource management',()=>{
   sql.exec('INSERT INTO session_control_protections VALUES(?,?,?,?)','session','human','keep',iso());
   expect(r.sessions('host')[0].keep).toBe(true);
   expect(()=>r.evidence('host',{id:'e',session_id:'session',native_id:'native',reason:'idle',output:'x'})).toThrow('session_not_reapable');
-  sql.exec("DELETE FROM session_control_protections");sql.exec("UPDATE session_control_sessions SET fleet_launch_id=NULL,mode='interactive'");
+  sql.exec("DELETE FROM session_control_protections");
+  sql.exec("UPDATE session_control_sessions SET mode='interactive',request_json=?",JSON.stringify({intake_task_id:'task',with_goal:true}));
+  expect(r.sessions('host')[0].managed).toBe(false); // even interactive goals cannot prove they are not Alexey's own session
+  sql.exec("UPDATE session_control_sessions SET fleet_launch_id=NULL,mode='interactive'");
   expect(r.sessions('host')[0].managed).toBe(false);
  }));
  it('preserves task kind and intake project through canonical start and replay',async()=>fixture(async(r,sql)=>{

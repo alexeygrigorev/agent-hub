@@ -134,7 +134,7 @@ reporting a stop. Receipt and note writes are atomic and retries are idempotent.
 A successful reap updates the canonical session and fleet outcome, preserves the
 open intake, and records a restart note for the forgotten-intake watchdog. Unproven freed memory is `null`, never a fabricated zero.
 
-External interactive sessions can be sampled but are never managed reap targets.
+Interactive sessions (including interactive goals) can be sampled but are never managed reap targets: their launch metadata cannot prove they are not Alexey's own interactive session. Only positively Hub-managed headless sessions qualify.
 A protected session is excluded even when its launch was Hub-managed. Missing
 intake linkage or inability to save evidence prevents a stop.
 
