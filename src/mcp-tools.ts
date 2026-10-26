@@ -1,10 +1,13 @@
 /** Fixed API routes only. Every call re-enters the ordinary Hub HTTP auth path. */
-type Method = 'GET' | 'POST' | 'PUT' | 'DELETE';
+type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 export interface ToolRoute { name: string; description: string; method: Method; path: string; cli: string[]; }
 const routes: ToolRoute[] = [];
 function tool(name: string, method: Method, path: string, description: string, cli: string[] = []) {
   routes.push({ name, method, path, description, cli });
 }
+tool('repos_list', 'GET', '/api/repos', 'Private repository registry; query org, status (active/archived/duplicate), flagged=true.', ['repos list']);
+tool('repos_show', 'GET', '/api/repos/{name}', 'Repository metadata and canonical duplicate target.', ['repos show']);
+tool('repos_edit', 'PATCH', '/api/repos/{name}', 'Operator-only human fields: payload label, aliases, purpose, stack, key_folders, urls. Refresh never overwrites these.', ['repos edit']);
 tool('status', 'GET', '/api/status', 'Authorized status; query accepts since, task, project, host, after, limit.', ['status']);
 tool('machines_available', 'GET', '/api/machines/available', 'List available machines.', ['machines available']);
 tool('fleet', 'GET', '/api/fleet', 'Fleet machines, native sessions, agents, accounts and launch lineage.', ['fleet']);
@@ -79,6 +82,8 @@ tool('monitoring_health', 'GET', '/api/monitoring/health', 'Authorized host heal
 tool('accounts_write', 'PUT', '/api/fleet/accounts', 'Operator-only account registry update.');
 export const MCP_ROUTES = routes;
 export const CLI_EXCLUSIONS: Record<string, string> = {
+  'repos seed': 'Local-only parser reads the private project map and submits bounded seed batches.',
+  'repos refresh': 'Local-only scanner invokes git/gh on host directories; MCP cannot scan the host filesystem.',
   'sessions warnings': 'Long-running warning display is CLI-only by product scope.',
   'sessions ack': 'Long-running warning snooze is CLI-only by product scope.',
   'sessions events': 'Warning acknowledgement history is CLI-only by product scope.',

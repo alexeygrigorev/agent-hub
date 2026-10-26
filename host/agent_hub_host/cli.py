@@ -352,6 +352,8 @@ def main():
     conversations.add_commands(sub)
     from . import intake
     intake.add_commands(sub)
+    from . import repos
+    repos.add_commands(sub)
     from . import session_control
     session_control.add_commands(sub)
     from . import quota as quota_cmd
@@ -528,6 +530,13 @@ def main():
             print('Bridge recovery HOLD: check native opt-in, acknowledgement, current authority, '
                   'existing journal and empty retained range. Preserve uncertain intents. '
                   'After an uncertain result inspect the journal; equal-target replays are refused.', file=sys.stderr)
+            sys.exit(1)
+        return
+    if args.cmd == 'repos':
+        try:
+            print(json.dumps(repos.execute(args), indent=2, ensure_ascii=True))
+        except Exception as exc:
+            print(intake.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
         return
     if args.cmd in ('intake', 'intakes', 'handoff'):

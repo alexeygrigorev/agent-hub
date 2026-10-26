@@ -1,4 +1,5 @@
 import { IntakeWatchdog } from './intake-watchdog';
+import { RepoRegistry } from './repos';
 import { IntakeService } from './intake';
 import { UI_HEADERS, tokenPage, authFailure, deviceEntry, deviceReview, deviceReviewHuman, deviceResult } from './ui-pages';
 import { DurableObject } from "cloudflare:workers";
@@ -116,6 +117,7 @@ export class Hub extends DurableObject {
   public statusService: StatusService;
   public metricsStore: MetricsStore;
   public fleetService: FleetService;
+  public repoRegistry: RepoRegistry;
   public provisioningService: ProvisioningService;
   public sessionControlService: SessionControlService;
   public livenessService: LivenessService;
@@ -155,11 +157,16 @@ export class Hub extends DurableObject {
     this.busService = new BusService(this.sql, txSync);
     this.fleetService = new FleetService(this.sql, fn => this.ctx.storage.transactionSync(fn));
     this.fleetService.init();
+    this.repoRegistry = new RepoRegistry(this.sql, fn => this.ctx.storage.transactionSync(fn));
+    this.repoRegistry.init();
     // M12e session control (narrow seam, owned by platform-session-api-r2):
     // durable start/send/capture/stop intents over the existing fleet reserve.
     // Placement stays with FleetService; no second dispatcher or consumer here.
     this.sessionControlService = new SessionControlService(this.sql, fn => this.ctx.storage.transactionSync(fn), Date.now, {
-      reserve: (input, auth) => this.fleetService.reserve(input, auth),
+      reserve: (input, auth) => {
+        const prepared = this.repoRegistry.prepareLaunch(input);
+        return prepared.error ? { value: prepared.error, status: 400 } : this.fleetService.reserve(prepared.input, auth);
+      },
     }, { env: this.env });
     this.sessionControlService.init();
     this.provisioningService = new ProvisioningService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.env, this.fleetService,
@@ -654,6 +661,9 @@ export class Hub extends DurableObject {
       }
       if (path === '/api/engines' || path.startsWith('/api/engines/')) {
         return this.provisioningService.handle(request, await this.authenticateBusRequest(request));
+      }
+      if (path === '/api/repos' || path.startsWith('/api/repos/')) {
+        return this.repoRegistry.handle(request, await this.sessionControlAuth(request));
       }
       if (path === '/api/fleet' || path.startsWith('/api/fleet/')) {
         const auth = await this.sessionControlAuth(request);

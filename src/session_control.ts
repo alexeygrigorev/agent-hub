@@ -1,3 +1,4 @@
+import { registeredRepoLabel } from './repos';
 /** Hub session orchestration (M12e): durable start/send/capture/stop intents over existing fleet placement.
  *
  * Placement itself is never reimplemented here: starts delegate to the existing
@@ -130,7 +131,7 @@ function absoluteWorkspaceOk(value: unknown): value is string {
  * above; exact-match against host-advertised capabilities plus the trusted
  * host settings mapping still required downstream). */
 function workspaceOk(value: unknown): value is string {
-  return label(value) || absoluteWorkspaceOk(value);
+  return label(value) || absoluteWorkspaceOk(value) || (typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,127}$/.test(value));
 }
 
 /** Friendly session names: stored in request_json, shown in list/view, never
@@ -1117,7 +1118,7 @@ export class SessionControlService {
         return response({ error: 'invalid_session_request', ...(field ? { field, detail: 'unknown_field' } : { detail: 'invalid_object' }) }, 400);
       }
       if (!label(input.key)) return response({ error: 'invalid_session_request', field: 'key', detail: 'invalid_key' }, 400);
-      if (!workspaceOk(input.workspace)) return response({ error: 'invalid_session_request', field: 'workspace', detail: 'invalid_workspace' }, 400);
+      if (!workspaceOk(input.workspace) && !registeredRepoLabel(this.sql, input.workspace)) return response({ error: 'invalid_session_request', field: 'workspace', detail: 'invalid_workspace' }, 400);
       if (input.engine !== undefined && !label(input.engine)) return response({ error: 'invalid_session_request', field: 'engine', detail: 'invalid_engine' }, 400);
       if (input.engine_override_reason !== undefined && (typeof input.engine_override_reason !== 'string' || input.engine_override_reason.length > 500)) {
         return response({ error: 'invalid_session_request', field: 'engine_override_reason', detail: 'invalid_reason' }, 400);
