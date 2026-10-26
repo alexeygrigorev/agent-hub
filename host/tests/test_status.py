@@ -120,6 +120,30 @@ class TestStatusCli(unittest.TestCase):
         self.assertIn('decision=resume_on_reset', out)
         self.assertIn('expected offline: win35', out)
 
+    def test_remote_status_uses_long_timeout_and_reports_timeouts(self):
+        """Regression 2026-10-26: /api/status took ~12 s, the 10 s default timed
+        out and the catch-all printed a misleading auth/scope error."""
+        seen = {}
+        def slow(req, timeout=10.0, **_):
+            seen['timeout'] = timeout
+            return FIXTURE_DTO
+        with patch.object(status.config, 'load_config', return_value={'base_url': 'https://hub.test'}), \
+             patch.object(status.api, 'check_url'), patch.object(status.auth, 'get_access_token', return_value='t'), \
+             patch.object(status.api, 'safe_http_json', side_effect=slow), patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('HUB_STATUS_TIMEOUT', None)
+            code, _, error = self.run_cli('status')
+        self.assertEqual(code, 0, error)
+        self.assertGreaterEqual(seen['timeout'], 30)
+        def timeout(req, timeout=10.0, **_):
+            raise TimeoutError('The read operation timed out')
+        with patch.object(status.config, 'load_config', return_value={'base_url': 'https://hub.test'}), \
+             patch.object(status.api, 'check_url'), patch.object(status.auth, 'get_access_token', return_value='t'), \
+             patch.object(status.api, 'safe_http_json', side_effect=timeout):
+            code, _, error = self.run_cli('status')
+        self.assertEqual(code, 1)
+        self.assertIn('timed out', error)
+        self.assertNotIn('authentication', error)
+
     def test_default_uses_single_post_and_limit_falls_back_to_get(self):
         with patch.object(status, 'fetch_status_post', return_value=FIXTURE_DTO) as post, \
              patch.object(status, 'fetch_status_get', return_value=FIXTURE_DTO) as get:

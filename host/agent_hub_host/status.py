@@ -1,6 +1,7 @@
 """M14a one-call status over the existing public API. Payloads are data, never execution."""
 import json
 import os
+import socket
 import sys
 import urllib.parse
 import urllib.request
@@ -8,6 +9,26 @@ import urllib.error
 from . import api, auth, config
 
 BASE = '/api/status'
+# /api/status builds a full projection server-side (measured ~12 s on
+# 2026-10-26); the generic 10 s HTTP default made every remote call time out.
+DEFAULT_TIMEOUT_S = 60.0
+
+
+class StatusTimeout(Exception):
+    pass
+
+
+def status_timeout():
+    try:
+        value = float(os.environ.get('HUB_STATUS_TIMEOUT', DEFAULT_TIMEOUT_S))
+    except ValueError:
+        return DEFAULT_TIMEOUT_S
+    return value if 1.0 <= value <= 600.0 else DEFAULT_TIMEOUT_S
+
+
+def _is_timeout(exc):
+    return isinstance(exc, (TimeoutError, socket.timeout)) or (
+        isinstance(exc, urllib.error.URLError) and isinstance(getattr(exc, 'reason', None), (TimeoutError, socket.timeout)))
 CONTROL_CHARS = {'\x1b', '\x9b', '\u202e'}
 
 
@@ -68,7 +89,14 @@ def _call_status(args, method, body):
             method=method,
             headers=headers,
         )
-        return api.safe_http_json(req)
+        try:
+            return api.safe_http_json(req, timeout=status_timeout())
+        except urllib.error.HTTPError:
+            raise
+        except Exception as exc:
+            if _is_timeout(exc):
+                raise StatusTimeout() from None
+            raise
 
     try:
         return send(token)

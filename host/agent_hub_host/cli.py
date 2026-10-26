@@ -706,6 +706,9 @@ def main():
                 status_cmd.execute(args)
             except SystemExit:
                 raise
+            except status_cmd.StatusTimeout:
+                print('Status request timed out after %gs (Hub /api/status is slow; set HUB_STATUS_TIMEOUT to wait longer). No native input was submitted.' % status_cmd.status_timeout(), file=sys.stderr)
+                sys.exit(1)
             except Exception:
                 print('Status operation failed; check authentication, scope and filters. No native input was submitted.', file=sys.stderr)
                 sys.exit(1)
