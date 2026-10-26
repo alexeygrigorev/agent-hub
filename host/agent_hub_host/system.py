@@ -1,3 +1,4 @@
+import os
 import platform
 import socket
 import subprocess
@@ -8,6 +9,41 @@ def get_hostname() -> str:
 
 def get_os() -> str:
     return platform.system()
+
+def _normalize_arch(value) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    v = value.strip().lower()
+    if v in ("arm64", "aarch64", "arm64_8a"):
+        return "arm64"
+    if v in ("amd64", "x86_64", "x64", "x86-64"):
+        return "amd64"
+    if v in ("386", "i386", "i686", "x86"):
+        return "386"
+    return None
+
+def get_arch() -> str:
+    """Normalized CPU arch (arm64/amd64), native even under x64 emulation on ARM64 Windows.
+
+    On Windows under Prism/x64 emulation PROCESSOR_ARCHITECTURE reads AMD64
+    while PROCESSOR_ARCHITEW6432 carries the native arch (ARM64). Check the
+    latter first, then PROCESSOR_ARCHITECTURE, then platform.machine().
+    Returns "unknown" when nothing normalizes.
+    """
+    for key in ("PROCESSOR_ARCHITEW6432", "PROCESSOR_ARCHITECTURE"):
+        try:
+            norm = _normalize_arch(os.environ.get(key, ""))
+            if norm:
+                return norm
+        except Exception:
+            pass
+    try:
+        norm = _normalize_arch(platform.machine())
+        if norm:
+            return norm
+    except Exception:
+        pass
+    return "unknown"
 
 def get_network() -> str:
     return "default"
@@ -45,6 +81,7 @@ def get_system_info() -> dict:
     return {
         "hostname": get_hostname(),
         "os": get_os(),
+        "arch": get_arch(),
         "network": get_network(),
         "roles": get_roles(),
         "capabilities": get_capabilities()
