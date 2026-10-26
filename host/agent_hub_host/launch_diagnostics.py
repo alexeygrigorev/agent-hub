@@ -275,6 +275,7 @@ def _redact_secret_shapes(line: str) -> str:
 
 
 CRASH_SIGNATURES = (
+    'transport: the socket connection was closed unexpectedly',
     'bun has crashed',
     'panic(',
     'abort() called',
@@ -300,11 +301,11 @@ def _looks_like_crash_line(line: str) -> bool:
 
 
 def extract_crash_tail(screen_text, *, max_lines=3, limit=512) -> str:
-    """Bounded sanitized crash-evidence tail from native screen text.
+    """Bounded sanitized runtime-failure tail from native screen text.
 
     Keeps only the last matching crash-signature lines (the Bun panic /
-    abort / OOM shape that kills opencode workers before they write the
-    result JSON). Sanitized with the runtime tail scrubber so secret shapes
+    abort / OOM shape, plus the observed socket-closed transport error).
+    Sanitized with the runtime tail scrubber so secret shapes
     never survive. Never raises; returns '' when nothing matches.
     """
     try:
@@ -312,19 +313,27 @@ def extract_crash_tail(screen_text, *, max_lines=3, limit=512) -> str:
     except Exception:
         _sanitize_tail = None  # type: ignore[assignment]
     try:
-        lines = str(screen_text or '').splitlines()
+        from .workclaim import redact_for_bus
+        raw = str(screen_text or '')
+        if len(raw) > 65536:
+            return ''
+        # Remove multi-line secrets before selecting matching lines, otherwise
+        # selection could discard the PEM delimiters needed by the scrubber.
+        lines = redact_for_bus(raw).splitlines()
     except Exception:
         return ''
     hits = [ln for ln in lines if _looks_like_crash_line(ln)]
     if not hits:
         return ''
-    tail = ' | '.join(ln.strip()[:200] for ln in hits[-max_lines:] if ln.strip())
+    # Sanitize complete lines before clipping: clipping can remove the label
+    # identifying a credential. Failure to sanitize must withhold the tail.
+    tail = '\n'.join(ln.strip() for ln in hits[-max_lines:] if ln.strip())
     if _sanitize_tail is not None:
         try:
             return _sanitize_tail(tail, limit)[:limit]
         except Exception:
             pass
-    return tail[-limit:] if len(tail) > limit else tail
+    return ''
 
 
 def read_native_screen_crash_tail(state_dir, native_id, *, max_bytes=16384, limit=512) -> str:
@@ -340,10 +349,9 @@ def read_native_screen_crash_tail(state_dir, native_id, *, max_bytes=16384, limi
     except Exception:
         return ''
     try:
-        base = str(state_dir or '').strip()
-        if not base:
-            import os as _os
-            base = _os.path.expanduser('~/.local/state/aplexer')
+        from .retired_native import resolve_aplexer_state_dir
+        from . import private_fs
+        base = resolve_aplexer_state_dir(state_dir)
         import os as _os
         for sub in ('retired-sessions', 'sessions'):
             path = _os.path.join(base, sub, norm, 'screen.txt')
@@ -353,10 +361,15 @@ def read_native_screen_crash_tail(state_dir, native_id, *, max_bytes=16384, limi
                 size = _os.path.getsize(path)
                 if size <= 0 or size > 50 * 1024 * 1024:
                     continue
-                with open(path, 'rb') as f:
-                    if size > max_bytes:
-                        f.seek(size - max_bytes)
-                    data = f.read(max_bytes)
+                with private_fs.parent(path, private=False) as anchor:
+                    fd = private_fs._open(anchor, path, _os.O_RDONLY, private=False)
+                    with _os.fdopen(fd, 'rb') as f:
+                        size = _os.fstat(f.fileno()).st_size
+                        offset = max(0, size - max_bytes)
+                        f.seek(offset)
+                        data = f.read(max_bytes)
+                        if offset:
+                            data = data.partition(b'\n')[2]
                 text = data.decode('utf-8', 'replace')
             except Exception:
                 continue
