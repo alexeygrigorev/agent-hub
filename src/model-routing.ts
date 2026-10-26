@@ -1,5 +1,6 @@
 import policy from '../config/model-routing.json';
 import { evaluateQuotaAdmission } from './quota_admission';
+import { canonicalAccountLabel } from './quota';
 import { grokDemotion, netHeadroom, pacingFor, providerPreference, resetUrgency, routeScore, type ProviderPacing, type RouteScoreFactors } from './pacing';
 export { policy };
 export function taskTier(input: any): string | null {
@@ -25,7 +26,8 @@ export function modelCandidates(input: any, route: any, advertisement: any, quot
     if (policy.rules.explicit_only_providers.includes(m.provider) && input.preferred_runner !== m.engine && ![m.id, m.model].includes(input.model)) return false;
     const routeFam = route.provider === 'codex-orin' ? 'codex' : route.provider;
     return m.provider === routeFam && m.engine === route.engine && m.profile === route.profile &&
-      advertisement.some((a: any) => a.engine === m.engine && a.profile === m.profile && a.model === m.model && a.effort === m.effort && a.account === route.account);
+      advertisement.some((a: any) => a.engine === m.engine && a.profile === m.profile && a.model === m.model && a.effort === m.effort &&
+        typeof a.account === 'string' && typeof route.account === 'string' && canonicalAccountLabel(a.account) === canonicalAccountLabel(route.account));
   }).map(m => {
     // Canonical fail-closed admission shared with dispatch/accountStatus/claim.
     // Policy data (reserves, ranking, preferences) is unchanged and still owned here.
