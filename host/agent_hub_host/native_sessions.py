@@ -400,7 +400,8 @@ def qualify_target(
     Never infers idleness/readiness from phase flags: phase is liveness only.
     """
     target = target.validated()
-    sessions = list_sessions(executable, workspace=target.workspace, include_exited=True)
+    sessions = [s for s in list_sessions(executable, include_exited=True)
+                if _stop_workspace_matches(s.workspace, target.workspace)]
     same_tag = [s for s in sessions if s.tag == target.tag]
     if len(same_tag) != 1:
         raise SessionControlError(
@@ -1082,7 +1083,7 @@ def reconcile_stop_oracle(
         rows = [s for s in list_sessions(executable, include_exited=True)
                 if s.session_id.lower() == sid.lower()
                 and s.tag == tag
-                and canonicalize_workspace(s.workspace) == ws]
+                and _stop_workspace_matches(s.workspace, ws)]
     except (SessionControlError, SessionUncertain, OSError):
         # Catalog unreadable: cannot prove exit read-only; stay uncertain.
         return False, "catalog unreadable; exit unproven"
@@ -1125,13 +1126,35 @@ def reconcile_stop_oracle(
     return False, "native record gone after kill but %s; reconcile (no re-kill)" % why
 
 
+def _worktree_parent_workspace(observed: str) -> Optional[str]:
+    """If observed is a git worktree directory, return its canonical parent repository root."""
+    try:
+        p = Path(observed)
+        git_file = p / ".git"
+        if not git_file.is_symlink() and git_file.is_file():
+            raw = git_file.read_text(encoding="utf-8", errors="replace").strip()
+            if raw.startswith("gitdir:"):
+                gitdir = Path(raw[len("gitdir:"):].strip())
+                if not gitdir.is_absolute():
+                    gitdir = (p / gitdir).resolve()
+                worktrees_dir = gitdir.parent
+                dot_git_dir = worktrees_dir.parent
+                if worktrees_dir.name == "worktrees" and dot_git_dir.name == ".git":
+                    return canonicalize_workspace(str(dot_git_dir.parent))
+    except OSError:
+        pass
+    return None
+
+
 def _stop_workspace_matches(observed: str, expected: str) -> bool:
-    """Only stop may match an exact kernel annotation on the same workspace.
+    """Only stop/qualify may match an exact kernel annotation or git worktree of the same workspace.
 
     Keep UUID/tag/incarnation/engine checks, and never alias an existing
     directory whose literal name ends in the annotation.
     """
     if canonicalize_workspace(observed) == expected:
+        return True
+    if _worktree_parent_workspace(observed) == expected:
         return True
     return (observed.endswith(' (deleted)') and not Path(observed).exists()
             and canonicalize_workspace(observed.removesuffix(' (deleted)')) == expected)

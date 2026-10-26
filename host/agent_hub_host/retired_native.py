@@ -152,7 +152,8 @@ def validate_retired_tombstone(
     if raw_ws.endswith(" (deleted)"):
         raw_ws = raw_ws[:-10]
     canonical_tombstone_ws = canonicalize_workspace(raw_ws)
-    if canonical_tombstone_ws != target.workspace:
+    from .native_sessions import _stop_workspace_matches
+    if not _stop_workspace_matches(raw_ws, target.workspace):
         raise SessionControlError(
             f"Tombstone workspace mismatch (tombstone: {canonical_tombstone_ws!r}, target: {target.workspace!r})"
         )

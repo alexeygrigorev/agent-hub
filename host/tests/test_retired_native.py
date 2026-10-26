@@ -647,3 +647,25 @@ class TestRetiredDescriptorSafety(unittest.TestCase):
             with patch.object(private_fs, "read_bytes", side_effect=grow_before_read):
                 with self.assertRaises(SessionControlError):
                     validate_retired_tombstone(str(path), target)
+
+    def test_worktree_observed_workspace_matches_parent_binding_on_stop_and_tombstone(self):
+        with tempfile.TemporaryDirectory(dir=str(REPO_TMP)) as temp:
+            base = Path(temp)
+            repo = base / "repo"
+            wt_git = repo / ".git" / "worktrees" / "wt1"
+            wt_git.mkdir(parents=True)
+            wt = base / "worktrees" / "wt1"
+            wt.mkdir(parents=True)
+            (wt / ".git").write_text(f"gitdir: {wt_git}\n", encoding="utf-8")
+
+            target = make_target(str(repo), tag="hub-wt-test")
+            tomb_path = base / "tombstone.json"
+            tomb_path.write_text(json.dumps({
+                "cause": "finished",
+                "id": target.session_id,
+                "tag": target.tag,
+                "workspace": str(wt),
+                "finished_at_ms": target.created_at_ms + 100,
+            }), encoding="utf-8")
+            validated = validate_retired_tombstone(str(tomb_path), target)
+            self.assertEqual(validated["id"].lower(), target.session_id.lower())
