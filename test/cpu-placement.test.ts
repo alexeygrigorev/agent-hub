@@ -47,6 +47,19 @@ describe('CPU predictive placement integration',()=>{
   beat(.5);expect(f.drainCapacityQueue().promoted).toBe(1);
   expect(f.resources.cpuStart(queued.value.id)).toMatchObject({expected_cpu_cores:2.5,expected_cpu_source:'repo_kind'});
  }));
+ it('admits Alexey healthy 4.8/12 CPU, ramp6.9 and PSI some27.7 regression despite generic worker absence',()=>fixture(async(f,sql,beat)=>{
+  sql.exec('UPDATE machines SET capabilities=? WHERE id=?',JSON.stringify({engines:['codex'],fleet_modes:['interactive','headless'],workspaces:['demo'],cpu_count:12}),'host');
+  f.resources.configure({cpu_default_cores:6.9});
+  const ramp=f.reserve(req(),admin);expect(ramp.status).toBe(201);
+  f.resources.configure({cpu_default_cores:.625});
+  beat(4.8,{cpu_usage:{...freshCpu(iso(),12,4.8),psi_avg10:27.7,psi_full_avg10:0,memory_psi_full_avg10:0,oom_kills_delta:0}});
+  const monitoring=new MonitoringService(sql,cb=>cb(),undefined,undefined,undefined,()=>now);monitoring.init();
+  sql.exec('INSERT INTO host_health_observations VALUES(?,?,?,?,?,?)','host',iso(),now,iso(),JSON.stringify({services:[{service_id:'supervision',worker:'broken',reason:'worker_broken',observed_at:null}]}),'test');
+  // Existing rows from the old absence classifier must not keep refusing starts.
+  sql.exec('INSERT INTO resource_choking_events VALUES(?,?,?)','host','host_runtime_choking',iso());
+  expect(f.resources.cpuHeadroom('host',req())).toMatchObject({admitted:true,reason:null,current_cpu_cores:4.8,ramping_cpu_cores:6.9,psi_avg10:27.7,predicted_over_target:true});
+  expect(f.plan(req()).selected).toBeTruthy();
+ }));
  it('freezes start estimates, reserves startup remainder, and excludes stable/queued work',()=>fixture(async(f,sql)=>{
   const first=f.reserve(req(),admin);expect(first.status).toBe(201);
   f.resources.configure({cpu_default_cores:2});
@@ -117,31 +130,35 @@ describe('CPU predictive placement integration',()=>{
   expect(f.resources.cpuHeadroom('host').admitted).toBe(true);
   sql.exec('UPDATE host_health_observations SET payload_json=?',health('alive','stale_status_file'));
   expect(f.resources.cpuHeadroom('host').admitted).toBe(true);
-  // Actual collect_service_status DTO: native worker broken, no status source.
+  // Generic worker absence does not establish a crash or timeout.
   sql.exec('UPDATE host_health_observations SET payload_json=?',health('broken','worker_broken'));
-  expect(f.resources.cpuHeadroom('host').reason).toBe('host_runtime_choking');
+  expect(f.resources.cpuHeadroom('host').admitted).toBe(true);
   sql.exec('UPDATE host_health_observations SET payload_json=?',health('broken','stale_status_file'));
-  expect(f.resources.cpuHeadroom('host').reason).toBe('host_runtime_choking');
+  expect(f.resources.cpuHeadroom('host').admitted).toBe(true);
+  for(const reason of ['service_crash','service_timeout']) {
+   sql.exec('UPDATE host_health_observations SET payload_json=?',health('broken',reason));
+   expect(f.resources.cpuHeadroom('host').reason).toBe('host_runtime_choking');
+  }
   sql.exec('UPDATE host_health_observations SET observed_at=?',iso(-301000));
   expect(f.resources.cpuHeadroom('host').admitted).toBe(true);
  }));
- it('retains authenticated service failure evidence across healthy snapshots only for the cooldown',()=>fixture(async(f,sql)=>{
+ it('requires positive current service crash evidence instead of a generic absence cooldown',()=>fixture(async(f,sql)=>{
   const monitoring=new MonitoringService(sql,cb=>cb(),undefined,undefined,undefined,()=>now);monitoring.init();
   const post=(worker:string,observed=iso(),source:any=null)=>monitoring.handleHostHealthObservation(new Request('https://hub/api/monitoring/health',{method:'POST',body:JSON.stringify({
    machine_id:'host',observed_at:observed,load:{load1:1,load5:1,load15:1},
    memory:{total_bytes:64000,available_bytes:32000,used_bytes:32000,percent:50,status:'ok'},
-   services:[{service_id:'controller',worker,reason:worker==='broken'?'worker_broken':'worker_unknown',observed_at:source}],
+   services:[{service_id:'controller',worker,reason:worker==='broken'?'service_crash':'worker_unknown',observed_at:source}],
   })}),{kind:'host',machine_id:'host',tokenId:'host-token'});
   expect((await post('broken',iso(),iso(120000))).status).toBe(200);
   expect(f.resources.cpuHeadroom('host').admitted).toBe(true); // future source degrades to unknown
   expect((await post('unknown')).status).toBe(200);
   expect(f.resources.cpuHeadroom('host').admitted).toBe(true);
-  expect((await post('broken')).status).toBe(200); // positively observed worker, no status file
+  expect((await post('broken')).status).toBe(200); // positively observed service crash
   expect(f.resources.cpuHeadroom('host').resource_choking).toEqual({reason:'host_runtime_choking',observed_at:iso()});
   expect((await post('alive')).status).toBe(200);
-  expect(f.resources.cpuHeadroom('host').reason).toBe('host_runtime_choking');
+  expect(f.resources.cpuHeadroom('host').admitted).toBe(true);
   expect((await post('unknown')).status).toBe(200);
-  expect(f.resources.cpuHeadroom('host').reason).toBe('host_runtime_choking');
+  expect(f.resources.cpuHeadroom('host').admitted).toBe(true);
   sql.exec('UPDATE resource_choking_events SET observed_at=?',iso(-301000));
   expect(f.resources.cpuHeadroom('host').admitted).toBe(true);
  }));

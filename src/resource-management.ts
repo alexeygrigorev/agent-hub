@@ -112,7 +112,7 @@ export class ResourceManagement {
     }
     const verdict=cpuVerdict(hb.cpu_usage,parse(m?.capabilities).cpu_count,estimate.expected_cpu_cores,remaining,config,this.now());
     const cooldown=new Date(this.now()-config.choking_cooldown_seconds*1000).toISOString();
-    const event:any=this.sql.exec('SELECT reason,observed_at FROM resource_choking_events WHERE machine_id=? AND observed_at>=? ORDER BY observed_at DESC LIMIT 1',machine,cooldown).toArray()[0];
+    const event:any=this.sql.exec(`SELECT reason,observed_at FROM resource_choking_events WHERE machine_id=? AND observed_at>=? AND reason!='host_runtime_choking' ORDER BY observed_at DESC LIMIT 1`,machine,cooldown).toArray()[0];
     const runtime:any=this.sql.exec(`SELECT exit_reason,updated_at FROM fleet_launches WHERE machine_id=? AND updated_at>=?
       AND state IN ('failed','exited') AND exit_reason IN ('engine_oom_killed','engine_runtime_timeout','engine_signal_exit')
       ORDER BY updated_at DESC LIMIT 1`,machine,cooldown).toArray()[0];
@@ -120,11 +120,11 @@ export class ResourceManagement {
     if(this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='host_health_observations'").toArray().length) {
       const health:any=this.sql.exec('SELECT payload_json,observed_at FROM host_health_observations WHERE machine_id=? AND observed_at>=?',machine,cooldown).toArray()[0];
       serviceAt=health?.observed_at ?? null;
-      // The collector positively checks the native worker on each fresh report.
-      // Its actual failure reason is worker_broken; status-file age and reason
-      // describe a separate source and cannot erase that observed failure.
-      // An unknown worker (including a timed-out observer) is not a crash.
-      serviceChoking=(parse(health?.payload_json).services || []).some((s:any)=>s.worker==='broken');
+      // A missing native worker can be an ordinary stop, not a crash. Only
+      // explicit runtime probes establish a service timeout/crash. Legacy
+      // generic worker-broken cooldowns are likewise not admission evidence.
+      serviceChoking=(parse(health?.payload_json).services || []).some((s:any)=>
+        s.worker==='broken' && ['service_crash','service_timeout'].includes(s.reason));
     }
     const reason=event?.reason || (runtime || serviceChoking ? 'host_runtime_choking' : verdict.reason);
     const chokingAt=event?.observed_at || runtime?.updated_at || (serviceChoking ? serviceAt : null);
