@@ -60,6 +60,8 @@ def _sanitize_launcher_slug(text, limit=64):
     except Exception:
         pass
     return slug
+
+
 # Canonical quota services: `codex-orin` is not a service — it is the second
 # Codex account (service `codex`, account `codex-orin`). The quse wire route
 # key `codex-orin` is still collected by quota_snapshot; only this service
@@ -952,6 +954,42 @@ class Dispatcher:
             pass
         return False
 
+    def _session_log_dest(self, record):
+        """Pick the per-session log location that survives auto-cleanup.
+
+        Returns (dest, label). Worktrees under cleanup_roots go to the
+        host-owned journal dir (with the home-journal default, mirroring
+        _maybe_cleanup_worktree); everything else stays under the session's
+        .local dir.
+        """
+        workspace = record.get('workspace')
+        offer = str(record.get('offer_id', 'unknown'))
+        try:
+            journal_base = self.journal_dir or self.settings.get("journal_dir")
+        except Exception:
+            journal_base = None
+        if not (isinstance(journal_base, str) and journal_base):
+            journal_base = str(Path.home() / ".local" / "agent-hub" / "journal")
+        if isinstance(workspace, str) and workspace and self._cleanup_will_remove(workspace):
+            return (str(Path(journal_base) / 'fleet-logs' / (offer + '-opencode.log')),
+                    'host journal fleet-logs/' + offer + '-opencode.log.')
+        if isinstance(workspace, str) and workspace:
+            return (str(Path(workspace) / '.local' / 'hub-logs' / (offer + '-opencode.log')),
+                    '.local/hub-logs/' + offer + '-opencode.log.')
+        return (None, None)
+
+    def _retain_session_log(self, record):
+        """Best-effort per-session opencode log retention; returns dest or None."""
+        try:
+            from .launch_diagnostics import retain_per_session_opencode_log
+            dest, _label = self._session_log_dest(record)
+            if not dest:
+                return None
+            return retain_per_session_opencode_log(
+                record.get('log_offsets'), dest, engine=record.get('engine'))
+        except Exception:
+            return None
+
     def _no_result_partial_report(self, record):
         """Failed-with-partial-work report when the result JSON is missing.
 
@@ -975,21 +1013,8 @@ class Dispatcher:
         log_label = None
         tail = ''
         try:
-            if isinstance(workspace, str) and workspace:
-                # The worktree may be auto-removed right after settlement
-                # (cleanup_roots); then the retained log goes to the
-                # host-owned journal dir so the reported location survives.
-                try:
-                    journal_base = self.journal_dir or self.settings.get("journal_dir")
-                except Exception:
-                    journal_base = None
-                if (isinstance(journal_base, str) and journal_base
-                        and self._cleanup_will_remove(workspace)):
-                    dest = str(Path(journal_base) / 'fleet-logs' / (str(offer_id) + '-opencode.log'))
-                    log_label = 'host journal fleet-logs/' + str(offer_id) + '-opencode.log.'
-                else:
-                    dest = str(Path(workspace) / '.local' / 'hub-logs' / (str(offer_id) + '-opencode.log'))
-                    log_label = '.local/hub-logs/' + str(offer_id) + '-opencode.log.'
+            dest, log_label = self._session_log_dest(record)
+            if dest:
                 log_dest = retain_per_session_opencode_log(
                     record.get('log_offsets'), dest,
                     engine=record.get('engine'))
@@ -1010,7 +1035,10 @@ class Dispatcher:
         except Exception:
             partial = {'dirty': [], 'commits': []}
         try:
-            dirty = [_redact_secret_shapes(str(x))[:200] for x in (partial.get('dirty') or [])[:20]]
+            # The retained per-session log itself must not show up as
+            # "uncommitted work" in repos that don't ignore .local/.
+            dirty = [_redact_secret_shapes(str(x))[:200] for x in (partial.get('dirty') or [])[:20]
+                     if 'hub-logs' not in str(x)]
             commits = [_redact_secret_shapes(str(x))[:200] for x in (partial.get('commits') or [])[:5]]
         except Exception:
             dirty, commits = [], []
@@ -1041,18 +1069,9 @@ class Dispatcher:
                     'artifacts': [{'name': f'evidence-{i + 1}', 'text': item['label'] + '\n' + item['text']}
                                   for i, item in enumerate(partial.get('artifacts', []))]}
         # AC a19cac9e AC1: retain the per-session opencode log on every
-        # headless terminal exit, not only when the result is missing.
-        try:
-            from .launch_diagnostics import retain_per_session_opencode_log
-            ws = record.get('workspace')
-            offer = record.get('offer_id', 'unknown')
-            if isinstance(ws, str) and ws:
-                retain_per_session_opencode_log(
-                    record.get('log_offsets'),
-                    str(Path(ws) / '.local' / 'hub-logs' / (str(offer) + '-opencode.log')),
-                    engine=record.get('engine'))
-        except Exception:
-            pass
+        # headless terminal exit, not only when the result is missing. The
+        # location survives auto-cleanup via the host journal when needed.
+        self._retain_session_log(record)
         return {'status': 'failed' if fleet_state == 'failed' else forwarded['report_status'],
                 'report': forwarded['report'], 'confirmed_exit': True,
                 'artifacts': [{'name': f'evidence-{i + 1}', 'text': item['label'] + '\n' + item['text']}
@@ -1345,17 +1364,7 @@ class Dispatcher:
                 result_payload.update(forwarded)
                 # AC a19cac9e AC1: retain the per-session opencode log on every
                 # headless terminal exit, not only when the result is missing.
-                try:
-                    from .launch_diagnostics import retain_per_session_opencode_log
-                    ws = record.get('workspace')
-                    offer = record.get('offer_id', 'unknown')
-                    if isinstance(ws, str) and ws:
-                        retain_per_session_opencode_log(
-                            record.get('log_offsets'),
-                            str(Path(ws) / '.local' / 'hub-logs' / (str(offer) + '-opencode.log')),
-                            engine=record.get('engine'))
-                except Exception:
-                    pass
+                self._retain_session_log(record)
             else:
                 try:
                     partial = self._no_result_partial_report(record)

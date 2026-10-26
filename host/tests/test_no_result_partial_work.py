@@ -102,6 +102,30 @@ class NoResultRegression(unittest.TestCase):
             {'/tmp/log': 0}, '/tmp/x.log', engine='codex'))
         self.assertIsNone(ld.retain_per_session_opencode_log(None, '/tmp/x.log'))
 
+    def test_cleanup_roots_send_log_to_journal(self):
+        import tempfile
+        from agent_hub_host.fleet import _sanitize_launcher_slug
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ws = Path(tmp.name) / 'ws'
+        ws.mkdir()
+        d = Dispatcher({"version": 1, "workspaces": {"main": tmp.name},
+                        "subscriptions": [], "aplexer_bin": "aplexer",
+                        "cleanup_roots": [str(ws)], "journal_dir": tmp.name})
+        self.assertTrue(d._cleanup_will_remove(str(ws)))
+        self.assertFalse(d._cleanup_will_remove(tmp.name))
+        dest, label = d._session_log_dest({'workspace': str(ws), 'offer_id': 'abc'})
+        self.assertIn('fleet-logs', dest)
+        self.assertIn('host journal', label)
+        dest2, label2 = Dispatcher({"version": 1, "workspaces": {"main": tmp.name},
+                                    "subscriptions": [], "aplexer_bin": "aplexer"}
+                                   )._session_log_dest({'workspace': str(ws), 'offer_id': 'abc'})
+        self.assertIn('.local/hub-logs', dest2)
+        # Secret-shaped launcher slugs are dropped, plain slugs survive.
+        self.assertEqual(_sanitize_launcher_slug('ghp_abcdefghijklmnop1234'), '')
+        self.assertEqual(_sanitize_launcher_slug('sk-ant-abcdef1234567890'), '')
+        self.assertEqual(_sanitize_launcher_slug('quota_exhausted'), 'quota_exhausted')
+
     def test_missing_result_json_is_failed_with_partial_work(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
