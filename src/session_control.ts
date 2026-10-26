@@ -2212,7 +2212,7 @@ export class SessionControlService {
       // claim fence and no fabricated native-exit receipt. Bound stops keep
       // using host command acknowledgement below.
       if ((sub === 'cancel' || (sub === 'stop' && !session.binding_json &&
-          ['held', 'queued', 'offered', 'cancelled'].includes(session.state))) && request.method === 'POST') {
+          ['held', 'queued', 'offered', 'failed', 'cancelled'].includes(session.state))) && request.method === 'POST') {
         const input = await body(request);
         if (!obj(input, ['key']) || !label(input.key)) return response({ error: 'invalid_cancel' }, 400);
         return this.transaction(() => {
@@ -2234,15 +2234,19 @@ export class SessionControlService {
           const original = parsed(live.request_json, {});
           // Queued and offered launches have no start authorization. Cancel
           // atomically against claim; never treat missing binding as no spawn.
-          const queuedFleet = ['queued', 'held', 'offered'].includes(live.state) && live.fleet_launch_id && !live.binding_json && !pending.length && original.provenance !== 'observed_native'
-            ? (() => { try { return this.sql.exec('SELECT state, native_id, launcher_task_id FROM fleet_launches WHERE id = ?', live.fleet_launch_id).toArray()[0] ?? null; } catch { return null; } })()
+          const queuedFleet = ['queued', 'held', 'offered', 'failed'].includes(live.state) && live.fleet_launch_id && !live.binding_json && !pending.length && original.provenance !== 'observed_native'
+            ? (() => { try { return this.sql.exec('SELECT state, native_id, launcher_task_id, verification_status FROM fleet_launches WHERE id = ?', live.fleet_launch_id).toArray()[0] ?? null; } catch { return null; } })()
             : null;
-          if (queuedFleet && (!['queued', 'offered'].includes(String(queuedFleet.state)) || queuedFleet.native_id || queuedFleet.launcher_task_id)) return response({ error: 'session_not_cancellable' }, 409);
+          // A host-fenced no-start failure retains its failed attempt; an
+          // operator may now cancel the intent without claiming native exit.
+          const provenNoStart = queuedFleet && queuedFleet.state === 'failed' &&
+            queuedFleet.verification_status === 'not_started' && !queuedFleet.native_id;
+          if (queuedFleet && !provenNoStart && (!['queued', 'offered'].includes(String(queuedFleet.state)) || queuedFleet.native_id || queuedFleet.launcher_task_id)) return response({ error: 'session_not_cancellable' }, 409);
           if ((live.state !== 'held' || live.fleet_launch_id || live.binding_json || pending.length || original.provenance === 'observed_native') && !queuedFleet) {
             return response({ error: 'session_not_cancellable' }, 409);
           }
           const at = this.at();
-          if (queuedFleet) {
+          if (queuedFleet && !provenNoStart) {
             let released = false;
             try {
               const written: any = this.sql.exec(`UPDATE fleet_launches SET state = 'cancelled', verification_status = 'not_started', exit_reason = 'session_cancelled', finished_at = ?, updated_at = ? WHERE id = ? AND state IN ('queued','offered') AND native_id IS NULL AND launcher_task_id IS NULL`, at, at, live.fleet_launch_id);

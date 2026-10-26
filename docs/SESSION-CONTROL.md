@@ -589,6 +589,17 @@ use your human device-login CLI profile.
 Use `sessions stop` for a session that reached Fleet or has a native binding.
 Cancellation never stops a workload, removes a worktree or proves native exit.
 
+Claimed headless launches missing both a Hub native receipt and host journal
+are probed by their owning host once their launcher task is five minutes old.
+The timeout only permits a probe. The maintained launcher lock must fence a
+still-queued task before Hub records `failed` / `launcher_not_started`; a
+winning or unknown native start keeps its reservation. `sessions stop` can
+then cancel the proven no-start intent and replay its receipt, preserving the
+failed Fleet attempt. An exact launcher binding plus confirmed native death
+also recovers a lost finish receipt and forwards the bounded `hub-results`
+report. A result file alone cannot prove exit. Recovery does not launch or
+stop a native session, delete data, or clean a worktree.
+
 MCP exposes the same guarded operation as `sessions_cancel` with arguments
 `{"id":"SESSION","payload":{"key":"STABLE_KEY"}}`. It re-enters ordinary
 Hub authentication and returns the API cancellation receipt.

@@ -24,7 +24,8 @@ Serverless coordination hub for Alexey's multi-agent project: 30-minute headless
 ## Gates and limits
 
 - Quota gates: fresh `quse` before every launch; Codex launches go through `~/git/cloudflare-agent-git/scripts/launch-codex.sh` (runs `scripts/quota-gate.py`, 15% reserve, fails closed). Never pick paid options or "usage credits" in agent menus.
-- Resources: follow the launcher's gates (worker memory ≤ 1500 MiB, MemAvailable ≥ 10 GiB after reservation, disk ≥ 50 GiB, TMPDIR under `<repo>/.local/tmp`, never `/tmp`).
+- Resources: follow the launcher's gates (worker memory ≤ 1500 MiB, MemAvailable ≥ 10 GiB after reservation, disk free after launcher reservations/spike ≥ the validated Hub `resource_settings.disk_floor_gb` (default 15 GiB), TMPDIR under `<repo>/.local/tmp`, never `/tmp`).
+- Reviewer-launch policy follows the configured placement disk floor (9af3a16), while preserving any stricter maintained-launcher runtime gate; a separate fixed 50 GiB policy would reject hosts that the validated resource setting admits. Read the current setting before each launch; missing or invalid configuration must fail closed. This policy alignment does not authorize disk cleanup or bypass any runtime gate.
 - Budget: total cloud budget is USD 5/month including any paid plan. Design for the Cloudflare Workers **Free** plan. No purchases, plan upgrades, billing changes, new accounts or keys without Alexey.
 - **No deploys.** Build and test locally only (`wrangler dev`, miniflare, vitest, `python3 -m unittest`, and `wrangler deploy --dry-run --outdir dist` for local bundle validation without API/auth). Do not run `wrangler deploy` without `--dry-run`, `wrangler login`, create Cloudflare resources, or touch DTC AWS (Cognito) resources. Prepare the deploy kit; root asks Alexey for approval.
 - Secrets never go into Git, issues or bus messages. Use `.dev.vars` (gitignored) for local dev values. Private evidence lives in gitignored `.local/`.

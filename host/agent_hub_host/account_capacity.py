@@ -14,6 +14,13 @@ def reconcile_unstarted(dispatcher, *, dry_run=False, rows=None):
         return proposals
     for row in rows:
         try:
+            # Lost claim/finish responses may leave no dispatch diagnostic or
+            # host journal. Recover from the maintained launcher's own ledger.
+            from .wedged_launches import reconcile_claimed_launch
+            recovered = reconcile_claimed_launch(dispatcher, row, dry_run=dry_run)
+            if recovered:
+                proposals.append(recovered)
+                continue
             if row.get('native_id'):
                 if reconcile_retired(dispatcher, row, dry_run=dry_run):
                     proposals.append({'id': row['id'], 'state': 'exited' if not dry_run else 'probe_required'})
@@ -22,7 +29,7 @@ def reconcile_unstarted(dispatcher, *, dry_run=False, rows=None):
             if diagnostic.get('stage') != 'dispatch_headless' or not diagnostic.get('reason', '').startswith('launcher_'):
                 continue
             workspace = resolve_workspace_path(dispatcher.settings, row['workspace'])
-            cwd = resolve_offer_cwd(workspace, row.get('cwd'))
+            cwd = resolve_offer_cwd(workspace, row.get('cwd'), dispatcher.settings)
             task_id = 'hub-' + row['id']
             proposals.append({'id': row['id'], 'state': 'probe_required'})
             if dry_run:
