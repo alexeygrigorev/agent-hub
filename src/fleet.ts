@@ -744,15 +744,12 @@ export class FleetService {
         // anything (broken/empty registration), keep capability_unavailable.
         reason = (engineMissing && liveEngines.size > 0 && !liveEngines.has(route.engine)) ? 'engine_unavailable' : 'capability_unavailable';
       }
-      // Intake 4398ce2a (Alexey t1523u): missing/stale host telemetry fails
-      // OPEN. Only a fresh explicit gate refusal or fresh invalid launcher
-      // telemetry holds placement; real MemAvailable/PSI/disk signals below
-      // still apply. The host re-runs its real admission gate before every
-      // claim and the claim itself requires a <30 s admission observation.
-      else if (hb.gate?.launch_allowed === false && fresh(hb.gate?.at, this.now(), GATE_STALE_MS)) reason = 'admission_unknown';
-      else if (caps.launcher_resources === true && hb.launcher_resources
-        && fresh(hb.launcher_resources?.observed_at, this.now(), LAUNCHER_TELEMETRY_STALE_MS)
-        && (!Number.isFinite(hb.launcher_resources?.active_mem_mb) || hb.launcher_resources.active_mem_mb < 0)) reason = 'admission_unknown';
+      // Intake 4398ce2a (Alexey t1523u): the aggregate host gate and launcher
+      // telemetry are projections, not refusals. Missing, stale, failed or
+      // timed-out projections fail OPEN; per-route quota-gate refusals
+      // (fleet_route_rejections above) and real MemAvailable/PSI/OOM/disk
+      // signals below still hold. The host re-runs its real admission gate
+      // before every claim, and the claim requires a <30 s observation.
       else if (Number.isFinite(hb.mem_avail_mb) && !memoryVerdict(hb.mem_avail_mb,
         this.resources.headroom(route.machine_id, request, route.engine).reserved_mb,
         this.resources.headroom(route.machine_id, request, route.engine).requested_mb, this.resources.config())) reason = 'launcher_memory_reserve';
