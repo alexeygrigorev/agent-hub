@@ -4,6 +4,7 @@ import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 import { ResourceManagement, resourceConfig, memoryVerdict, percentile } from '../src/resource-management';
 import { FleetService } from '../src/fleet';
+import { jsonFields, initResourceRequestProjection } from '../src/sql-json-projection';
 import { SessionControlService } from '../src/session_control';
 const now=Date.now(), iso=(d=0)=>new Date(now+d).toISOString();
 async function fixture(fn:(r:ResourceManagement,sql:any,f:FleetService)=>Promise<void>) {
@@ -23,6 +24,74 @@ async function fixture(fn:(r:ResourceManagement,sql:any,f:FleetService)=>Promise
 }
 const sample=(extra={})=>({session_id:'session',native_id:'native',current_rss_mb:200,peak_rss_mb:200,peak_pss_mb:210,cpu_seconds:20,runtime_s:100,observed_at:iso(),...extra});
 describe('resource management',()=>{
+ it('reads watchdog failure evidence without changing admission choking semantics',async()=>fixture(async(r,sql)=>{
+  const check=(expected:any)=>{
+   expect(r.resourceChoking('host')).toEqual(expected);
+   expect(r.cpuHeadroom('host').resource_choking).toEqual(expected);
+  };
+  check(null);
+  sql.exec('INSERT INTO resource_choking_events VALUES(?,?,?)','host','host_oom',iso());
+  check({reason:'host_oom',observed_at:iso()});
+  sql.exec('UPDATE resource_choking_events SET observed_at=?',iso(-301000));
+  check(null);
+  sql.exec("UPDATE fleet_launches SET state='failed',exit_reason='engine_runtime_timeout',updated_at=? WHERE id='launch'",iso());
+  check({reason:'host_runtime_choking',observed_at:iso()});
+  sql.exec("UPDATE fleet_launches SET updated_at=? WHERE id='launch'",iso(-301000));
+  check(null);
+  const health=(reason:string)=>JSON.stringify({services:[{worker:'broken',reason}]});
+  sql.exec('INSERT INTO host_health_observations VALUES(?,?,?,?,?,?)','host',iso(),now,iso(),health('worker_broken'),'test');
+  check(null);
+  sql.exec('UPDATE host_health_observations SET payload_json=?',health('service_crash'));
+  check({reason:'host_runtime_choking',observed_at:iso()});
+  sql.exec('UPDATE host_health_observations SET observed_at=?',iso(-301000));
+  check(null);
+ }));
+
+ it.each(['fleet_launches','session_control_sessions'] as const)('maintains compact request facts transactionally for %s',async table=>fixture(async(r,sql,f)=>{
+  const id=table==='fleet_launches'?'launch':'session';
+  const read=(key=id)=>sql.exec('SELECT request_json FROM resource_request_projection WHERE source=? AND id=?',table,key).toArray()[0]?.request_json;
+  expect(JSON.parse(read()).intake_task_id).toBe('task');
+  sql.exec(`UPDATE ${table} SET request_json=? WHERE id=?`,JSON.stringify({keep:true,prompt:'long prompt'.repeat(1000)}),id);
+  expect(read().length).toBeLessThan(300);
+  expect(r.sessions('host')[0].keep).toBe(true);
+  expect(()=>(f as any).transaction(()=>{
+   sql.exec(`UPDATE ${table} SET request_json='{"keep":false}' WHERE id=?`,id);
+   expect(JSON.parse(read()).keep).toBe(false);
+   throw new Error('rollback request projection');
+  })).toThrow('rollback request projection');
+  expect(JSON.parse(read()).keep).toBe(true);
+  sql.exec('DELETE FROM resource_request_projection WHERE source=? AND id=?',table,id);
+  expect(r.sessions('host')[0].keep).toBe(true); // Missing projection falls back safely.
+  initResourceRequestProjection(sql,table);
+  expect(JSON.parse(read()).keep).toBe(true);
+  expect(read().length).toBeLessThan(300);
+  sql.exec(`UPDATE ${table} SET id=? WHERE id=?`,id+'-renamed',id);
+  expect(read()).toBeUndefined();
+  expect(JSON.parse(read(id+'-renamed')).keep).toBe(true);
+  sql.exec(`DELETE FROM ${table} WHERE id=?`,id+'-renamed');
+  expect(read(id+'-renamed')).toBeUndefined();
+ }));
+
+ it('projects only resource fields while preserving JSON types and protection semantics',async()=>fixture(async(r,sql)=>{
+  const input={keep:true,project:{nested:['a',false,1]},prompt:'private prompt'.repeat(1000)};
+  const project=(raw:string)=>JSON.parse(sql.exec(`WITH source(body) AS (VALUES (?)) SELECT ${jsonFields('body',['keep','project'])} AS value FROM source`,raw).toArray()[0].value);
+  expect(project(JSON.stringify(input))).toEqual({keep:true,project:input.project});
+  expect(project('{"keep":1,"project":false}')).toEqual({keep:1,project:false});
+  expect(project('broken')).toEqual({keep:null,project:null});
+  expect(project('null')).toBeNull();
+  expect(project('[1,true]')).toEqual([1,true]);
+  expect(project('{"keep":false,"keep":true}').keep).toBe(true);
+  expect(project('{"keep":true,"keep":false}').keep).toBe(false);
+  for (const [raw,keep] of [['{"keep":false,"keep":true}',true],['{"keep":true,"keep":false}',false]] as const) {
+   sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?',raw,'session');
+   expect(r.sessions('host')[0]).toMatchObject({keep,managed:!keep});
+  }
+  sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?',JSON.stringify({intake_task_id:'task',keep:true,prompt:input.prompt}),'session');
+  expect(r.sessions('host')[0]).toMatchObject({keep:true,managed:false});
+  sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?',JSON.stringify({intake_task_id:'task',keep:1,prompt:input.prompt}),'session');
+  expect(r.sessions('host')[0]).toMatchObject({keep:false,managed:true});
+ }));
+
  it('clears read-only snapshots after exceptions and observes later admission writes',async()=>fixture(async(r,sql)=>{
   sql.exec("UPDATE fleet_launches SET state='starting' WHERE id='launch'");
   r.freezeCpuStart('launch',{expected_cpu_cores:2,expected_cpu_source:'test'});

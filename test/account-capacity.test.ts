@@ -187,6 +187,27 @@ describe('phantom account reservations', () => {
     expect(reconcileAccountCapacity(sql, now)).toEqual([]);
   }));
 
+  it.each([false,true])('preserves the first control binding with mixed machine aliases (reverse=%s)', reverse => fixture(async (f,sql) => {
+    await configure(f);
+    const launch:any=await (await f.handle(request('/launches',intent({machine:'hetzner'})),admin)).json();
+    sql.exec("UPDATE fleet_launches SET state='uncertain',native_id='binding-native' WHERE id=?",launch.id);
+    sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,observed_at,workspace,created_at_ms) VALUES('hetzner','binding-native','task','codex','exited',?,'/repo',?)",iso(),now);
+    const machines=reverse ? ['hetzner',null] : [null,'hetzner'];
+    for(const [i,machine] of machines.entries()) {
+      sql.exec("INSERT INTO session_control_sessions(id,actor,request_key,request_json,state,mode,machine_id,fleet_launch_id,binding_json,created_at,updated_at) VALUES(?,'test-admin',?,'{}','running','headless',?,?,?, ?,?)",'binding-'+i,'binding-'+i,machine,launch.id,'{}',iso(),iso());
+    }
+    for(const matchedMachine of machines) {
+      for(const [i,machine] of machines.entries()) {
+        const proof={native_id:'binding-native',tag:machine===matchedMachine?'task':'foreign',workspace:'/repo',native_created_at_ms:now};
+        sql.exec('UPDATE session_control_sessions SET binding_json=? WHERE id=?',JSON.stringify(proof),'binding-'+i);
+      }
+      const legacy=sql.exec('SELECT state,binding_json FROM session_control_sessions WHERE fleet_launch_id=? AND (machine_id IS NULL OR machine_id=?)',launch.id,'hetzner').toArray()[0];
+      const expected=JSON.parse(legacy.binding_json).tag==='task';
+      expect(reconcileAccountCapacity(sql,now,false)).toHaveLength(expected?1:0);
+      expect(sql.exec('SELECT state FROM fleet_launches WHERE id=?',launch.id).one().state).toBe('uncertain');
+    }
+  }));
+
   it('holds ambiguous failures and catalog absence until host no-start proof arrives', () => fixture(async (f, sql) => {
     await configure(f);
     const launch: any = await (await f.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();

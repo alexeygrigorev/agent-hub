@@ -8,17 +8,22 @@ export function reconcileAccountCapacity(sql: SqlStorage, now: number, apply = t
   const changes: { id: string; before: string; after: string; reason: string }[] = [];
   // Only positive terminal native evidence can release a reservation. Filter
   // candidates in SQLite instead of probing every live launch from JS.
-  for (const launch of sql.exec(`SELECT l.* FROM fleet_launches l JOIN fleet_sessions n
+  const binding = controls ? `(SELECT s.binding_json FROM session_control_sessions s
+    WHERE s.fleet_launch_id=l.id AND (s.machine_id IS NULL OR s.machine_id=l.machine_id) LIMIT 1)` : 'NULL';
+  for (const launch of sql.exec(`SELECT l.id,l.machine_id,l.native_id,l.state,l.engine,l.created_at,
+    n.tag,n.workspace,n.cwd,n.created_at_ms,n.phase,n.engine AS native_engine,${binding} AS binding_json
+    FROM fleet_launches l JOIN fleet_sessions n
     ON n.machine_id=l.machine_id AND n.native_id=l.native_id AND n.phase IN ('exited','dead')
     WHERE l.state IN ('starting','running','uncertain')
       AND NOT EXISTS(SELECT 1 FROM routing_jobs j WHERE j.launch_id=l.id)`).toArray() as any[]) {
-    const native: any = launch.native_id ? sql.exec('SELECT * FROM fleet_sessions WHERE machine_id = ? AND native_id = ?', launch.machine_id, launch.native_id).toArray()[0] : null;
+    // The joined native is already the exact current identity. Read its small
+    // proof fields and the first matching control binding in the same query.
+    const native = launch.native_id ? { ...launch, engine: launch.native_engine } : null;
     // A fresh, live native observation takes precedence over stale control state.
     if (native && ['starting', 'running', 'broken', 'unknown'].includes(native.phase)) continue;
-    const session: any = controls ? sql.exec('SELECT state, binding_json FROM session_control_sessions WHERE fleet_launch_id = ? AND (machine_id IS NULL OR machine_id = ?)', launch.id, launch.machine_id).toArray()[0] : null;
     let binding: any = null;
-    try { binding = JSON.parse(session?.binding_json || 'null'); } catch { /* unknown identity */ }
-    const sameIncarnation = !session?.binding_json || (binding && native && binding.native_id === native.native_id && binding.tag === native.tag && binding.workspace === native.workspace && binding.native_created_at_ms === native.created_at_ms);
+    try { binding = JSON.parse(launch.binding_json || 'null'); } catch { /* unknown identity */ }
+    const sameIncarnation = !launch.binding_json || (binding && native && binding.native_id === native.native_id && binding.tag === native.tag && binding.workspace === native.workspace && binding.native_created_at_ms === native.created_at_ms);
     let after: string | null = null;
     let reason = '';
     if (native && sameIncarnation && ['exited', 'dead'].includes(native.phase) && native.engine === launch.engine &&

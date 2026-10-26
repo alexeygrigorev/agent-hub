@@ -1,3 +1,4 @@
+import { jsonFields, initResourceRequestProjection } from './sql-json-projection';
 import {sanitizeCpuAdmission} from './cpu-headroom';
 import { launcherDiskHeadroom } from './launcher-disk';
 /** Generic account registry and placement. Provider credentials never enter this service. */
@@ -389,6 +390,7 @@ export class FleetService {
     this.routing.init();
     this.admission.init();
     for (const stmt of FLEET_SCHEMA.split(';')) if (stmt.trim()) this.sql.exec(stmt);
+    initResourceRequestProjection(this.sql, 'fleet_launches');
     const launchColumns = this.sql.exec('PRAGMA table_info(fleet_launches)').toArray().map((c: any) => c.name);
     for (const name of ['verification_status', 'exit_reason', 'finished_at', 'launch_error_json', 'model_selection_json', 'retried_launch_id', 'claim_key']) {
       if (!launchColumns.includes(name)) this.sql.exec(`ALTER TABLE fleet_launches ADD COLUMN ${name} TEXT`);
@@ -447,7 +449,7 @@ export class FleetService {
     // redundant native retirement probe per fresh live workload each cycle;
     // stale, absent and ambiguous observations still need positive proof.
     const cutoff = new Date(this.now() - 180000).toISOString();
-    return this.sql.exec(`SELECT l.id, l.workspace, l.request_json, l.launch_error_json, l.native_id, l.engine, l.mode, l.launcher_task_id
+    return this.sql.exec(`SELECT l.id, l.workspace, ${jsonFields('l.request_json',['cwd'])} AS request_json, l.launch_error_json, l.native_id, l.engine, l.mode, l.launcher_task_id
       FROM fleet_launches l WHERE l.machine_id = ? AND l.state IN ('starting','running','uncertain')
       AND (l.native_id IS NULL OR NOT EXISTS (SELECT 1 FROM fleet_sessions s
         WHERE s.machine_id = l.machine_id AND s.native_id = l.native_id AND s.engine = l.engine
@@ -1126,7 +1128,7 @@ export class FleetService {
       if (request.method === 'GET') {
         if (suffix === '/watchdog') {
           if (!host) return response({error:'forbidden'},403);
-          return response({config:this.resources.config(), sessions:this.resources.sessions(caller.machineId!), choking:this.resources.cpuHeadroom(caller.machineId!).resource_choking});
+          return response({config:this.resources.config(), sessions:this.resources.sessions(caller.machineId!), choking:this.resources.resourceChoking(caller.machineId!)});
         }
         if (!admin) return response({error:'forbidden'},403);
         if (!suffix) return response(this.resources.overview());

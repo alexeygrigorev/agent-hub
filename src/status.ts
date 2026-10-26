@@ -109,6 +109,11 @@ CREATE TABLE IF NOT EXISTS status_baselines(
   revision INTEGER NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS status_baselines_updated ON status_baselines(updated_at);
+CREATE TABLE IF NOT EXISTS status_baseline_payloads(
+  caller_key TEXT PRIMARY KEY,
+  snapshot_json TEXT NOT NULL
+);
 `;
 
 /** Compact caller baseline: per-task digests only, NEVER full histories. */
@@ -308,6 +313,9 @@ export class StatusService {
         if (trimmed) this.sql.exec(trimmed);
       }
     }
+    this.sql.exec(`CREATE TRIGGER IF NOT EXISTS status_baseline_payload_cleanup
+      AFTER DELETE ON status_baselines BEGIN
+      DELETE FROM status_baseline_payloads WHERE caller_key=OLD.caller_key; END`);
   }
 
   /** Hub injects the live SessionControlService.hostObservationAllowed here
@@ -535,7 +543,7 @@ export class StatusService {
   }
 
   async handle(request: Request, authenticate: () => Promise<Auth>): Promise<Response> {
-    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff', 'X-Hub-Status-Projection': 'resource-disk-v2' } });
+    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff', 'X-Hub-Status-Projection': 'resource-disk-v3' } });
     try {
       if (request.method !== 'GET') return json({ error: 'method_not_allowed' }, 405);
       const auth = await authenticate();
@@ -593,11 +601,11 @@ export class StatusService {
    * authorized matching work (up to 256 tasks, never a silent first page)
    * and advance the caller's own durable baseline in the same transaction:
    * exactly one call total. Canonical task state is never mutated and
-   * intake_meta.revision is untouched; only status_baselines is written.
+   * intake_meta.revision is untouched; only caller baseline tables are written.
    * Cookie callers pass the existing session CSRF (enforced by Hub auth
    * before this handler, as for every POST). */
   async handlePost(request: Request, authenticate: () => Promise<Auth>): Promise<Response> {
-    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff', 'X-Hub-Status-Projection': 'resource-disk-v2' } });
+    const json = (data: Obj, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff', 'X-Hub-Status-Projection': 'resource-disk-v3' } });
     try {
       if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
       const auth = await authenticate();
@@ -628,15 +636,33 @@ export class StatusService {
         const filterKey = [project, singleTask, hostFilter, sinceMs].map(v => v === null ? '' : String(v)).join('|');
         const callerKey = String((p as any).identity || (p as any).actor || 'unknown') + '||' + filterKey;
         let previous: Obj | null = null;
+        let hasPayload = false;
         try {
-          const row = this.one('SELECT snapshot_json FROM status_baselines WHERE caller_key=?', callerKey);
-          if (row?.snapshot_json) previous = JSON.parse(row.snapshot_json);
-        } catch { previous = null; }
+          const row = this.one(`SELECT b.snapshot_json AS legacy_snapshot,b.updated_at,p.snapshot_json
+            FROM status_baselines b LEFT JOIN status_baseline_payloads p USING(caller_key)
+            WHERE b.caller_key=?`, callerKey);
+          if (row) {
+            // A rolled-back older Worker may have written a newer inline
+            // baseline while leaving our payload row behind. Inline wins.
+            hasPayload = row.legacy_snapshot === '{}' && typeof row.snapshot_json === 'string';
+            previous = JSON.parse(hasPayload ? row.snapshot_json : row.legacy_snapshot);
+            if (previous && typeof previous === 'object') previous.snapshot_at = row.updated_at ?? previous.snapshot_at;
+          }
+        } catch { previous = null; hasPayload = false; }
         const diff = this.diffSnapshots(previous, snapshot);
         const record = JSON.stringify({ snapshot_at: nowIso, revision, tasks: snapshot });
         if (record.length > 1048576) fail('baseline_capacity', 507);
+        // Keep large digests separate from the timestamp written on EVERY
+        // POST. The transaction/output gate still durably advances each call;
+        // unchanged polls do not rewrite the identical task payload. Existing
+        // inline baselines migrate lazily without losing their previous time.
+        if (!hasPayload || diff.state === 'first_baseline' || diff.added.length || diff.removed.length || diff.changed.length) {
+          this.sql.exec(`INSERT INTO status_baseline_payloads(caller_key,snapshot_json) VALUES(?,?)
+            ON CONFLICT(caller_key) DO UPDATE SET snapshot_json=excluded.snapshot_json`,
+            callerKey, JSON.stringify({tasks:snapshot}));
+        }
         this.sql.exec('INSERT INTO status_baselines(caller_key,snapshot_json,revision,updated_at) VALUES(?,?,?,?) ON CONFLICT(caller_key) DO UPDATE SET snapshot_json=excluded.snapshot_json, revision=excluded.revision, updated_at=excluded.updated_at',
-          callerKey, record, revision, nowIso);
+          callerKey, '{}', revision, nowIso);
         try {
           const count = Number((this.one('SELECT COUNT(*) AS n FROM status_baselines') as any)?.n ?? 0);
           if (count > STATUS_BASELINE_ROWS_CAP) {

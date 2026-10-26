@@ -5,6 +5,7 @@ import { IntakeService } from './intake';
 import { policy } from './model-routing';
 import { cpuVerdict } from './cpu-headroom';
 import { resolveMachineAliases } from './machine-alias';
+import { jsonFields, resourceRequest } from './sql-json-projection';
 export const MEMORY_FLOOR_MB = defaults.memory_floor_mb;
 export const NEXT_SLOT_MB = defaults.ramp_reserve_default_mb;
 export const CPU_LOAD_FACTOR = defaults.cpu_load_factor;
@@ -174,7 +175,7 @@ export class ResourceManagement {
     const m:any=this.readRows('SELECT last_heartbeat,capabilities FROM machines WHERE id=?',machine)[0];
     const hb=parse(m?.last_heartbeat),config=this.config(),cutoff=new Date(now-config.ramp_seconds*1000).toISOString();
     const estimate:any=(excludeLaunch ? this.cpuStart(excludeLaunch) : null) ?? this.cpuEstimate(input.project || input.workspace || null,input.task_kind || input.kind || 'goal');
-    const pending=this.readRows(`SELECT l.id,l.request_json,l.workspace,s.expected_cpu_cores,
+    const pending=this.readRows(`SELECT l.id,${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,l.workspace,s.expected_cpu_cores,
       c.current_cpu_cores,c.observed_at AS cpu_observed_at FROM fleet_launches l
       LEFT JOIN resource_cpu_starts s ON s.launch_id=l.id LEFT JOIN resource_cpu_samples c ON c.launch_id=l.id WHERE machine_id=?
       AND (state IN ('offered','starting','uncertain') OR (state='running' AND
@@ -198,6 +199,18 @@ export class ResourceManagement {
     let remaining=0;
     for(const row of commitments) if(row.id!==excludeLaunch) remaining+=row.remaining;
     const verdict=cpuVerdict(hb.cpu_usage,parse(m?.capabilities).cpu_count,estimate.expected_cpu_cores,remaining,config,now);
+    const choking=this.chokingState(machine,now,config,verdict.reason);
+    return {...verdict,...choking,admitted:choking.reason===null,expected_cpu_source:estimate.expected_cpu_source};
+  }
+  resourceChoking(machine: string) {
+    // Watchdog needs current failure evidence, not a hypothetical launch's
+    // reservation estimate across every pending request.
+    const now=this.snapshotNow ?? this.now(),config=this.config();
+    const m:any=this.readRows('SELECT last_heartbeat,capabilities FROM machines WHERE id=?',machine)[0];
+    const verdict=cpuVerdict(parse(m?.last_heartbeat).cpu_usage,parse(m?.capabilities).cpu_count,0,0,config,now);
+    return this.chokingState(machine,now,config,verdict.reason).resource_choking;
+  }
+  private chokingState(machine: string, now: number, config: ResourceConfig, verdictReason: string | null) {
     const cooldown=new Date(now-config.choking_cooldown_seconds*1000).toISOString();
     const event:any=this.readRows(`SELECT reason,observed_at FROM resource_choking_events WHERE machine_id=? AND observed_at>=? AND reason!='host_runtime_choking' ORDER BY observed_at DESC LIMIT 1`,machine,cooldown)[0];
     const runtime:any=this.readRows(`SELECT exit_reason,updated_at FROM fleet_launches WHERE machine_id=? AND updated_at>=?
@@ -213,11 +226,10 @@ export class ResourceManagement {
       serviceChoking=(parse(health?.payload_json).services || []).some((s:any)=>
         s.worker==='broken' && ['service_crash','service_timeout'].includes(s.reason));
     }
-    const reason=event?.reason || (runtime || serviceChoking ? 'host_runtime_choking' : verdict.reason);
+    const reason=event?.reason || (runtime || serviceChoking ? 'host_runtime_choking' : verdictReason);
     const chokingAt=event?.observed_at || runtime?.updated_at || (serviceChoking ? serviceAt : null);
-    return {...verdict,reason,admitted:reason===null,choking_observed_at:chokingAt,
-      resource_choking:['host_oom','host_runtime_choking'].includes(reason)&&chokingAt ? {reason,observed_at:chokingAt} : null,
-      expected_cpu_source:estimate.expected_cpu_source};
+    return {reason,choking_observed_at:chokingAt,
+      resource_choking:['host_oom','host_runtime_choking'].includes(reason)&&chokingAt ? {reason,observed_at:chokingAt} : null};
   }
   headroom(machine: string, input: any = {}, engine: string | null = null) {
     return this.withHistory(() => this.headroomFromHistory(machine, input, engine));
@@ -228,7 +240,7 @@ export class ResourceManagement {
     const hb = parse(machineRow?.last_heartbeat); const config = this.config();
     const cutoff = new Date(now - config.ramp_seconds * 1000).toISOString();
     // Only launch ramps are additional commitments. Resident usage is already in MemAvailable.
-    const pending = this.readRows(`SELECT l.id,l.engine,l.workspace,l.request_json,r.resident_mb FROM fleet_launches l
+    const pending = this.readRows(`SELECT l.id,l.engine,l.workspace,${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,r.resident_mb FROM fleet_launches l
       LEFT JOIN resource_resident_samples r ON r.launch_id=l.id AND r.observed_at>=?
       WHERE l.machine_id=? AND (l.state IN ('offered','starting','uncertain') OR (l.state='running'
       AND COALESCE((SELECT started_at FROM resource_ramps WHERE launch_id=l.id),l.created_at)>=?))`, cutoff, machine, cutoff) as any[];
@@ -253,13 +265,14 @@ export class ResourceManagement {
       return parsed.get(key);
     };
     // Canonical binding, not tag matching; external interactive sessions can be sampled but never reaped.
-    const rows = this.sql.exec(`SELECT s.id,s.machine_id,s.fleet_launch_id,s.binding_json,s.request_json,s.request_key,
-      s.engine,s.mode,s.state,s.created_at,s.updated_at,l.request_json AS launch_request,l.state AS launch_state,l.created_at AS launch_created,
-      l.finished_at AS launch_finished,l.model_selection_json,l.workspace AS launch_workspace
+    const rows = this.sql.exec(`SELECT s.id,s.machine_id,s.fleet_launch_id,s.binding_json,${resourceRequest('session_control_sessions','s.id','s.request_json')} AS request_json,s.request_key,
+      s.engine,s.mode,s.state,s.created_at,s.updated_at,${resourceRequest('fleet_launches','l.id','l.request_json')} AS launch_request,l.state AS launch_state,l.created_at AS launch_created,
+      l.finished_at AS launch_finished,${jsonFields('l.model_selection_json',['model'])} AS model_selection_json,l.workspace AS launch_workspace
       FROM session_control_sessions s LEFT JOIN fleet_launches l ON l.id=s.fleet_launch_id
       ${machine ? 'WHERE s.machine_id=?' : ''} ORDER BY CASE WHEN s.state IN ('stopped','failed','exited','finished','dead','refused','cancelled') THEN 1 ELSE 0 END,s.updated_at DESC`, ...(machine ? [machine] : [])).toArray() as any[];
-    const launches = this.sql.exec(`SELECT id,machine_id,native_id,workspace,engine,mode,request_json,model_selection_json,state,finished_at,updated_at
-      FROM fleet_launches WHERE native_id IS NOT NULL AND native_id<>'' ${machine ? 'AND machine_id=?' : ''}`,
+    const launches = this.sql.exec(`SELECT l.id,l.machine_id,l.native_id,l.workspace,l.engine,l.mode,${resourceRequest('fleet_launches','l.id','l.request_json')} AS request_json,
+      ${jsonFields('l.model_selection_json',['model'])} AS model_selection_json,l.state,l.finished_at,l.updated_at
+      FROM fleet_launches l WHERE l.native_id IS NOT NULL AND l.native_id<>'' ${machine ? 'AND l.machine_id=?' : ''}`,
       ...(machine ? [machine] : [])).toArray() as any[];
     // Hydrate the complete alias set before selecting canonical sessions. Batch
     // catalog facts instead of re-reading full intake histories for every alias.

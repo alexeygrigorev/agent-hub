@@ -1,3 +1,4 @@
+import { jsonFields } from './sql-json-projection';
 /** M15c live durable lifecycle registry (server authority).
  *
  * This module is the ONE durable/server authority for lifecycle state. It
@@ -146,8 +147,18 @@ function joinedBases(sql: SqlStorage, sessionIds?: Set<string>): JoinedBase[] {
   // Status supplies only session ids referenced by its bounded task page.
   // Batch canonical joins rather than materializing the entire fleet archive.
   const selected = sessionIds ? [...sessionIds] : null;
+  const columns = (table: string) => {
+    if (table === 'session_control_sessions') return `c.id,c.actor,c.machine_id,c.fleet_launch_id,c.binding_json,c.mode,c.session_type,
+      c.owner_token_id,c.owner_family,c.state,c.updated_at,c.engine,
+      ${jsonFields('c.request_json',['provenance','workspace','cwd'])} AS request_json,
+      json_type(CASE WHEN json_valid(c.request_json) THEN c.request_json ELSE '{}' END,'$.brief')='text' AS has_brief`;
+    if (table === 'fleet_launches') return `c.id,c.machine_id,c.native_id,c.actor,c.requester_kind,c.mode,c.engine,c.workspace,c.state,
+      typeof(c.prompt)='text' AS has_prompt`;
+    return 'c.machine_id,c.native_id,c.engine,c.workspace,c.cwd,c.tag,c.last_activity_at,c.observed_at,c.phase,c.agent_state';
+  };
   const read = (table: string): any[] => {
-    if (!selected) return sql.exec(`SELECT * FROM ${table} ORDER BY rowid`).toArray() as any[];
+    const projection = columns(table);
+    if (!selected) return sql.exec(`SELECT ${projection} FROM ${table} c ORDER BY c.rowid`).toArray() as any[];
     const rows = new Map<string, any>();
     for (let i = 0; i < selected.length; i += 1000) {
       const ids = selected.slice(i, i + 1000);
@@ -158,13 +169,13 @@ function joinedBases(sql: SqlStorage, sessionIds?: Set<string>): JoinedBase[] {
         ? nativeId.replaceAll('binding_json', 'c.binding_json') : 'c.native_id';
       const prefix = `WITH selected AS (SELECT id,fleet_launch_id,machine_id,${nativeId} AS native_id
         FROM session_control_sessions WHERE id IN (SELECT value FROM json_each(?))) `;
-      const nativeJoin = `SELECT c.rowid AS _join_order,c.* FROM
+      const nativeJoin = `SELECT c.rowid AS _join_order,${projection} FROM
         (SELECT DISTINCT machine_id,native_id FROM selected) s
         JOIN ${table} c ON c.machine_id=s.machine_id AND ${targetNative}=+s.native_id`;
       const query = table === 'session_control_sessions'
-        ? `SELECT rowid AS _join_order,* FROM ${table} WHERE id IN (SELECT id FROM selected) UNION ALL ${nativeJoin}`
+        ? `SELECT c.rowid AS _join_order,${projection} FROM ${table} c WHERE c.id IN (SELECT id FROM selected) UNION ALL ${nativeJoin}`
         : table === 'fleet_sessions' ? nativeJoin
-        : `SELECT rowid AS _join_order,* FROM ${table} WHERE id IN
+        : `SELECT c.rowid AS _join_order,${projection} FROM ${table} c WHERE c.id IN
           (SELECT fleet_launch_id FROM selected) UNION ALL ${nativeJoin}`;
       for (const row of sql.exec(prefix + query, JSON.stringify(ids)).toArray() as any[]) rows.set(row.id ?? `${row.machine_id}/${row.native_id}`, row);
     }
@@ -450,7 +461,8 @@ export function buildSessionInputs(sql: SqlStorage, sessionIds?: Set<string>): {
       protected_session,
       task_refs: links.task_refs,
       report_refs: links.report_refs,
-      has_brief: typeof request.brief === 'string' || typeof base.launch?.prompt === 'string',
+      has_brief: (Object.prototype.hasOwnProperty.call(request, 'brief')
+        ? typeof request.brief === 'string' : base.sc?.has_brief === 1) || base.launch?.has_prompt === 1,
     });
   }
   return { inputs, refs };

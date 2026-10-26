@@ -3,6 +3,7 @@ import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
 import { sha256 } from '../src/auth/crypto';
 import { updateHeartbeatMemoryOnly } from '../src/registry';
+import { StatusService } from '../src/status';
 
 const inDO: any = runInDurableObject;
 const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
@@ -619,7 +620,7 @@ describe('M14d caller-scoped durable baseline with complete POST summary', () =>
     expect(await revisionAndTasks()).toEqual(before);
     // Baselines store compact digests only, never task histories or bodies.
     const stored = await inDO(stub(), (h: any) =>
-      h.sql.exec('SELECT snapshot_json FROM status_baselines').toArray().map((r: any) => r.snapshot_json).join('\n'));
+      h.sql.exec('SELECT snapshot_json FROM status_baselines UNION ALL SELECT snapshot_json FROM status_baseline_payloads').toArray().map((r: any) => r.snapshot_json).join('\n'));
     expect(stored).not.toContain('"history"');
     expect(stored).not.toContain('Bulk task');
     // Second identical call: available diff with zero changes.
@@ -639,6 +640,65 @@ describe('M14d caller-scoped durable baseline with complete POST summary', () =>
     const changed = third.categories.diff.changed.find((c: any) => c.id === ids[0]);
     expect(changed.fields).toContain('version');
     expect(JSON.stringify(third.categories.diff)).not.toContain('bump.md');
+  });
+
+  it('durably advances unchanged and empty baselines without rewriting payloads, including legacy and rollback', async () => {
+    await inDO(stub(), async (h: any) => {
+      let at=Date.now();
+      const auth:any={caller:{kind:'human',actor:'baseline-test',isAdmin:true},scopes:['admin']};
+      const call=async(rollback=false)=>{
+        // New service on every call: no in-memory state may supply the baseline.
+        const service=new StatusService(h.sql,fn=>h.ctx.storage.transactionSync(()=>{
+          const result=fn();if(rollback) throw new Error('injected baseline rollback');return result;
+        }),h.intakeService,()=>at);
+        const response=await service.handlePost(new Request('https://hub.test/api/status',{method:'POST',body:'{}'}),async()=>auth);
+        return {status:response.status,body:await response.json() as any};
+      };
+      h.sql.exec('CREATE TABLE baseline_payload_test_writes(n INTEGER)');
+      for(const op of ['INSERT','UPDATE']) h.sql.exec(`CREATE TRIGGER baseline_payload_test_${op} AFTER ${op} ON status_baseline_payloads BEGIN INSERT INTO baseline_payload_test_writes VALUES(1); END`);
+      const writes=()=>h.sql.exec('SELECT COUNT(*) AS n FROM baseline_payload_test_writes').toArray()[0].n;
+      const first=await call();expect(first.status).toBe(200);
+      expect(first.body.categories.diff.state).toBe('first_baseline');expect(writes()).toBe(1);
+      at+=1000;const second=await call();
+      expect(second.body.categories.diff).toMatchObject({state:'available',previous_snapshot_at:first.body.snapshot_at,added:[],removed:[],changed:[]});
+      expect(writes()).toBe(1);
+      at+=1000;const third=await call();
+      expect(third.body.categories.diff.previous_snapshot_at).toBe(second.body.snapshot_at);
+      expect(writes()).toBe(1);
+      const row=h.sql.exec('SELECT * FROM status_baselines').toArray()[0];
+      // Legacy inline baseline survives a restart and migrates on first read.
+      // Retain the old payload, as a rollback to an older Worker would.
+      h.sql.exec('UPDATE status_baselines SET snapshot_json=? WHERE caller_key=?',JSON.stringify({snapshot_at:third.body.snapshot_at,tasks:{'legacy-only':{}}}),row.caller_key);
+      at+=1000;const legacy=await call();
+      expect(legacy.body.categories.diff).toMatchObject({state:'available',previous_snapshot_at:third.body.snapshot_at,removed:['legacy-only']});
+      expect(writes()).toBe(2);
+      h.sql.exec("INSERT INTO intake_tasks(id,data) VALUES('baseline-change',?)",JSON.stringify({id:'baseline-change',project:'baseline',status:'open',version:1,history:[]}));
+      const before=h.sql.exec('SELECT * FROM status_baselines').toArray();
+      at+=1000;expect((await call(true)).status).toBe(500);
+      expect(h.sql.exec('SELECT * FROM status_baselines').toArray()).toEqual(before);
+      expect(writes()).toBe(2);
+      const changed=await call();
+      expect(changed.body.categories.diff).toMatchObject({previous_snapshot_at:legacy.body.snapshot_at,added:['baseline-change']});
+      expect(writes()).toBe(3);
+      h.sql.exec('DROP TRIGGER baseline_payload_test_INSERT');h.sql.exec('DROP TRIGGER baseline_payload_test_UPDATE');
+    });
+  });
+
+  it('evicts baseline payloads with their bounded metadata rows',async()=>{
+    await inDO(stub(),(h:any)=>h.ctx.storage.transactionSync(()=>{
+      for(let i=0;i<5000;i++) {
+        const key='evict-'+i;
+        h.sql.exec("INSERT INTO status_baselines VALUES(?,'{}',0,'2000-01-01T00:00:00.000Z')",key);
+        h.sql.exec("INSERT INTO status_baseline_payloads VALUES(?,'{\"tasks\":{}}')",key);
+      }
+    }));
+    await postOk('',{});
+    const counts=await inDO(stub(),(h:any)=>({
+      metadata:h.sql.exec('SELECT COUNT(*) AS n FROM status_baselines').toArray()[0].n,
+      payloads:h.sql.exec('SELECT COUNT(*) AS n FROM status_baseline_payloads').toArray()[0].n,
+      orphans:h.sql.exec('SELECT COUNT(*) AS n FROM status_baseline_payloads p LEFT JOIN status_baselines b USING(caller_key) WHERE b.caller_key IS NULL').toArray()[0].n,
+    }));
+    expect(counts).toEqual({metadata:4501,payloads:4501,orphans:0});
   });
 
   it('isolates baselines and task visibility across callers', async () => {

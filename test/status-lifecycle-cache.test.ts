@@ -71,6 +71,19 @@ it('invalidates warmed lifecycle facts for every source write and preserves crea
   });
 });
 
+it('preserves last-key brief semantics for legacy duplicate JSON keys',async()=>{
+  const stub=(env as any).HUB.get((env as any).HUB.idFromName('cache-duplicate-brief'));
+  await inDO(stub,(h:any)=>{
+    seed(h);
+    h.sql.exec('UPDATE session_control_sessions SET fleet_launch_id=NULL WHERE id=?',id);
+    h.sql.exec("UPDATE fleet_launches SET native_id='unrelated' WHERE id=?",launch);
+    for(const [raw,expected] of [['{"brief":false,"brief":"yes"}',true],['{"brief":"yes","brief":false}',false]] as const) {
+      h.sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?',raw,id);
+      expect(buildSessionInputs(h.sql,new Set([id])).refs.get('cache-host/cache-native')?.has_brief).toBe(expected);
+    }
+  });
+});
+
 it('keeps decisions and time live, survives rollback ABA, and bypasses absent initialization',async()=>{
   const stub=(env as any).HUB.get((env as any).HUB.idFromName('cache-time'));
   await inDO(stub,(h:any)=>{

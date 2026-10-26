@@ -1,4 +1,5 @@
 import { registeredRepoLabel } from './repos';
+import { initResourceRequestProjection } from './sql-json-projection';
 /** Hub session orchestration (M12e): durable start/send/capture/stop intents over existing fleet placement.
  *
  * Placement itself is never reimplemented here: starts delegate to the existing
@@ -253,6 +254,7 @@ export class SessionControlService {
     for (const stmt of SESSION_CONTROL_SCHEMA.split(';')) {
       if (stmt.trim()) this.sql.exec(stmt);
     }
+    initResourceRequestProjection(this.sql, 'session_control_sessions');
     // Additive migration for tables created by the earlier reserve-only draft.
     const sessionCols = new Set(this.sql.exec('PRAGMA table_info(session_control_sessions)').toArray().map((c: any) => String(c.name)));
     for (const [col, type] of [['owner_token_id', 'TEXT'], ['owner_family', 'TEXT'], ['host_family', 'TEXT'], ['parent_id', 'TEXT'], ['parent_source', 'TEXT'], ['session_type', 'TEXT'], ['hold_json', 'TEXT']] as const) {
