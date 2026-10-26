@@ -286,11 +286,12 @@ still require CAS. No previous chat, local handoff file or local STATE is used.
 Limits are explicit: 32 KiB streamed UTF-8 HTTP input; 8 KiB request/event text;
 128 events per task; 128 rules with 128 amendments each; 256 grants;
 8,192 retry receipts; 128 KiB stored task; 256 KiB individual stored record; and
-32 MiB combined persisted JSON plus IDs. References have separate smaller bounds.
-Pages contain at most 25 complete tasks. Session links share the per-task event
+32 MiB active task/rule/grant/receipt JSON plus IDs. Archived payloads and the
+append-only audit are retained outside this active budget. References have separate smaller bounds.
+Pages default to 25 complete tasks (maximum 100). Session links share the per-task event
 limit. Rules, receipts and revocations consume the same global byte budget.
-SQLite/index overhead is additionally bounded by row counts; these are logical
-payload limits, not a disk accounting estimate.
+These are logical payload limits, not a disk accounting estimate; retained
+archives and audit rows grow with completed work.
 
 ### Soft open-intake policy (t1038u)
 
@@ -317,10 +318,8 @@ No age or volume threshold authorizes closing unfinished work.
 Exhaustion of remaining hard budgets (bytes, events, grants, rules, receipts)
 still returns an explicit 507 capacity error, oversized streamed input 413,
 invalid fields 400 and stale revision/idempotency conflicts 409. The transaction
-rolls back task, history, receipt and global revision together. Successful retry
-receipts are retained; no TTL silently enables duplicate intake after restart.
-Further capacity expansion or archival needs a separately reviewed operator
-workflow.
+rolls back task, history, receipt and global revision together. Successful retry receipts remain replayable for 14 days; archive history persists
+independently. Further active capacity expansion needs operator review.
 
 Focused checks use the real Worker/Hub SQLite HTTP path and stdlib CLI mock HTTP:
 
