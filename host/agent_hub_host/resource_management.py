@@ -1228,8 +1228,12 @@ def _reap_one(request: Any, aplexer_bin: str, entry: dict[str, Any], native: Any
         return _build_reap(state, sid, nid, stored_reason, known_id, stored_evidence,
                            max(0.0, float(before_mb)) if before_mb is not None else None,
                            at_ms)
-    if idle_ms is None or idle_ms < 0:
+    if idle_ms is None or idle_ms < 0 or reason not in REAP_REASONS:
         return None  # Unknown threshold never stops.
+    # Terminal/dead workloads qualify independently of the idle timeout.
+    # Every reason still requires stable output/activity across the evidence
+    # window; only a live idle workload must satisfy the full idle threshold.
+    quiet_ms = idle_ms if reason == "idle" else 0
     try:
         engine = entry.get("engine")
         target = NativeTarget(
@@ -1250,10 +1254,12 @@ def _reap_one(request: Any, aplexer_bin: str, entry: dict[str, Any], native: Any
     # Unknown state never stops.
     if not isinstance(getattr(fresh, "phase", None), str) or not fresh.phase or fresh.phase == "unknown":
         return None
+    if reason == "dead_pid" and _native_dead(fresh) is not True:
+        return None
     # Snapshot activity AND output BEFORE evidence. Unknown activity refuses;
     # a session already too active refuses before any server mutation.
     act0 = _fresh_activity_ms(fresh, entry)
-    if act0 is None or now_ms - act0 < idle_ms:
+    if act0 is None or now_ms - act0 < quiet_ms:
         return None
     try:
         cap0 = capture_output(aplexer_bin, target, limit_bytes=EVIDENCE_MAX_BYTES, mode="tail")
@@ -1293,7 +1299,7 @@ def _reap_one(request: Any, aplexer_bin: str, entry: dict[str, Any], native: Any
         return None
     # Post-evidence requalification for ALL reasons, immediately before the
     # stop: exact incarnation, no newer activity/output since the snapshot,
-    # full configured idle threshold, and a server keep/protection recheck
+    # full configured threshold for idle stops, and a server keep/protection recheck
     # via the idempotent evidence POST (same id re-runs session_not_reapable).
     try:
         fresh2 = qualify_target(aplexer_bin, target, live_only=False)
@@ -1301,8 +1307,10 @@ def _reap_one(request: Any, aplexer_bin: str, entry: dict[str, Any], native: Any
         return None
     if not isinstance(getattr(fresh2, "phase", None), str) or not fresh2.phase or fresh2.phase == "unknown":
         return None
+    if reason == "dead_pid" and _native_dead(fresh2) is not True:
+        return None
     act1 = _fresh_activity_ms(fresh2, entry)
-    if act1 is None or act1 > act0 or now_ms - act1 < idle_ms:
+    if act1 is None or act1 > act0 or now_ms - act1 < quiet_ms:
         return None
     try:
         cap1 = capture_output(aplexer_bin, target, limit_bytes=EVIDENCE_MAX_BYTES, mode="tail")

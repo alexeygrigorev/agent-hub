@@ -11,6 +11,9 @@ tool('repos_edit', 'PATCH', '/api/repos/{name}', 'Operator-only human fields: pa
 tool('status', 'GET', '/api/status', 'Authorized status; query accepts since, task, project, host, after, limit.', ['status']);
 tool('machines_available', 'GET', '/api/machines/available', 'List available machines.', ['machines available']);
 tool('fleet', 'GET', '/api/fleet', 'Fleet machines, native sessions, agents, accounts and launch lineage.', ['fleet']);
+tool('resources', 'GET', '/api/fleet/resources', 'Resource utilization, placement settings, measured session statistics and recent watchdog reaps.', ['resources']);
+tool('resource_sessions', 'GET', '/api/fleet/resources/sessions', 'Durable per-session resource ledger; query filters project, engine and kind.', []);
+tool('resource_reaps', 'GET', '/api/fleet/resources/reaps', 'Confirmed watchdog reaps with actor, time, reason, freed memory and intake linkage.', []);
 tool('quota', 'GET', '/api/quota?view=fleet', 'Quota usage and reset evidence; query filters match hub quota.', ['quota']);
 tool('auth_status', 'GET', '/api/auth/me', 'Safe human login identity (human credentials only).', ['auth status']);
 tool('heartbeat', 'POST', '/api/heartbeat', 'Report own agent liveness (health:report scope).', ['heartbeat']);

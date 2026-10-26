@@ -1,6 +1,6 @@
 # Resource management
 
-Status: implementation in progress (2026-10-26); rollout and live acceptance pending. Intake: `4fcd3139-fb34-435c-86ec-5a24ddf6c3ee`.
+Status: implemented source (2026-10-26). Release gates are the full local suite, independent exact-version review, and green CI/dev before production. Live acceptance evidence belongs in the intake DONE note and operator report. Intake: `4fcd3139-fb34-435c-86ec-5a24ddf6c3ee`.
 Keep this doc updated as each part lands.
 
 ## Goal
@@ -85,7 +85,9 @@ Runs every 5–10 minutes (Alexey t1474u: «Надо ещё watchdog чтобы 
 
 - Releases reservations and reaps process trees of sessions that are finished,
   failed, stopped, or whose PID is dead. Sessions that are done but still alive
-  are stopped cleanly once their final report has been saved.
+  are stopped cleanly once their final report has been saved, without waiting
+  for the live-session idle timeout. Every stop rechecks exact identity and
+  unchanged output/activity after saving evidence; a resumed dead workload refuses cleanup.
 - Sessions with no output or activity for more than `idle_minutes` (default 60)
   are flagged. The watchdog captures their output into the intake and then
   stops them.
@@ -116,13 +118,15 @@ hard-coded constants.
 | `rss_flag_gb` | 4 | watchdog / overview |
 | `keep` marker | per session | watchdog exclusion |
 
-Implemented Hub source (2026-10-26; review and rollout pending): `src/resource-management.ts`
+Implemented Hub source (2026-10-26): `src/resource-management.ts`
 owns validated defaults, runtime settings, `session_resource_usage`,
 `resource_evidence`, and `resource_reaps`. Hub plan subtracts only ramp headroom
 and a measured next-session estimate. Resident session cgroup caps are not
 subtracted again. Offered/starting/uncertain launches retain a conservative
 commitment until their status resolves; recently running sessions receive credit
 for fresh measured current anonymous RSS (a previous peak cannot masquerade as current usage). The runtime CPU guard uses the configured factor.
+
+Read-only MCP tools `resources`, `resource_sessions`, and `resource_reaps` expose the same authenticated projections. Changes to the default config file trigger CI/deployment.
 
 The authenticated API is under `/api/fleet/resources`: operator GET summary,
 `/sessions?project=...&engine=...&kind=...`, `/reaps`, and PUT `/config`.
