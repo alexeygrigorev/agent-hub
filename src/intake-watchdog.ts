@@ -29,7 +29,7 @@ export class IntakeWatchdog {
   }
   status(): Obj {
     const m = this.rows('SELECT last_tick,last_source,last_result FROM intake_watchdog_meta WHERE id=1')[0];
-    return { last_checked_at: m.last_tick, source: m.last_source, result: parse(m.last_result) };
+    return { last_checked_at: m.last_tick, source: m.last_source, state: parse(m.last_result).state ?? 'not_checked' };
   }
   private rows(query: string, ...args: any[]): Obj[] { return this.sql.exec(query, ...args).toArray() as Obj[]; }
   /** One consistent readonly view; callers supply only their authorized tasks. */
@@ -51,6 +51,16 @@ export class IntakeWatchdog {
           (!actor.sessionShort || String(n.native_id).replace(/-/g, '').startsWith(actor.sessionShort)));
         if (!actor || !catalogs.has(actor.machineId)) { unknown = true; continue; }
         if (n && !['exited', 'stopped', 'failed'].includes(n.phase)) live = true;
+      }
+      // Manual native links are liveness hints only. A fresh canonical census must
+      // independently match the exact native id/host before they suppress restart.
+      for (const e of (t.history || []).filter((e: Obj) => !e.hub_session_id && e.native_id && ['link', 'session'].includes(e.kind))) {
+        const n = native.find(n => n.native_id === e.native_id && (!e.host || n.machine_id === e.host));
+        const host = n?.machine_id || e.host;
+        if (!host || !catalogs.has(host)) { unknown = true; continue; }
+        if (!n) { unknown = true; continue; }
+        if (!['exited', 'stopped', 'failed'].includes(n.phase)) live = true;
+        else lastEnd = Math.max(lastEnd, ms(n.observed_at));
       }
       for (const s of linked) {
         if (!ACTIVE.has(s.state)) { lastEnd = Math.max(lastEnd, ms(s.updated_at)); continue; }
@@ -102,6 +112,14 @@ export class IntakeWatchdog {
     });
     const workspace = prior.workspace || (configured ? fresh.project : null);
     if (!workspace) return this.hold(fresh, 'workspace_configuration_required', now);
+    // An unlinked native worker in this exact configured workspace may be the
+    // missing owner when the claim bridge is absent. Queue rather than infer
+    // ownership from its tag or launch a duplicate beside it.
+    const bindings = new Set(this.rows('SELECT machine_id,binding_json FROM session_control_sessions')
+      .map(s => s.machine_id + '/' + parse(s.binding_json).native_id));
+    const orphan = this.rows('SELECT * FROM fleet_sessions').some(n => n.workspace === workspace &&
+      !['exited', 'stopped', 'failed'].includes(n.phase) && !bindings.has(n.machine_id + '/' + n.native_id));
+    if (orphan) return this.hold(fresh, 'unattributed_live_workspace_session', now);
     if (!this.hooks.start) return this.hold(fresh, 'goal_launch_unavailable', now);
     // Persist a deterministic request before awaiting; a lost reply retries the same canonical intent.
     let input = existing?.request_json && !existing.session_id ? parse(existing.request_json) : null;
@@ -155,7 +173,15 @@ export class IntakeWatchdog {
       if (meta.digest_day !== day) {
         const text = 'Daily open intake digest ' + day + '\n' + this.digest(items);
         // Existing inbox envelopes are bounded; split the complete digest without dropping tasks.
-        const chunks = text.match(/[\s\S]{1,1800}/gu) || [text];
+        const chunks: string[] = [];
+        for (const line of text.split('\n')) {
+          const tail = chunks.length - 1;
+          if (tail >= 0 && chunks[tail].length + line.length + 1 <= 1800) chunks[tail] += '\n' + line;
+          else if (line.length <= 1800) chunks.push(line);
+          else { // titles are data; bound individual lines without dropping their id
+            for (let offset = 0; offset < line.length; offset += 1800) chunks.push(line.slice(offset, offset + 1800));
+          }
+        }
         for (let i = 0; i < chunks.length; i++) await this.hooks.notify('intake_digest', day + '-part-' + (i + 1), chunks[i]);
         this.sql.exec('UPDATE intake_watchdog_meta SET digest_day=? WHERE id=1', day);
         for (const t of tasks.filter(t => OPEN.has(t.status))) this.audit(t, 'daily_digest', 'daily open intake digest ' + day + ' routed to existing alerts', now);

@@ -41,6 +41,16 @@ describe('forgotten intake watchdog', () => {
     h.sql.exec('DELETE FROM fleet_catalog_seen');
     expect(w.project([t])[0]).toMatchObject({forgotten:false,state:'unknown'});
   }));
+  it('requires fresh canonical evidence for manual native links, including an unbridged active goal', async () => fixture(h => {
+    const t=task();t.history=[{kind:'link',native_id:'manual-native',host:'fixture'}];
+    session(h,'old-failure',t,'failed');
+    h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('fixture','manual-native','manual-goal','running',?,'fixture')",new Date(NOW).toISOString());
+    h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('fixture',?)",new Date(NOW).toISOString());
+    const w=new IntakeWatchdog(h.sql,h.intakeService,(f:any)=>f(),{},()=>NOW);w.init();
+    expect(w.project([t])[0]).toMatchObject({forgotten:false,state:'active'});
+    h.sql.exec("DELETE FROM fleet_sessions WHERE native_id='manual-native'");
+    expect(w.project([t])[0]).toMatchObject({forgotten:false,state:'unknown'});
+  }));
   it('does not interpret an unreachable bound worker as dead', async () => fixture(h => {
     const t=task();session(h,'bound',t,'running',{machine:'fixture',binding:{native_id:'native'}});
     const w=new IntakeWatchdog(h.sql,h.intakeService,(f:any)=>f(),{},()=>NOW);w.init();expect(w.project([t])[0]).toMatchObject({forgotten:false,state:'unknown'});
@@ -56,6 +66,12 @@ describe('forgotten intake watchdog', () => {
     const t={...task(),scope:{flag:'unknown',policy_version:1}};let starts=0;
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{start:async()=>{starts++;return {status:200,body:{}}}},()=>NOW);w.init();await w.tick();
     expect(starts).toBe(0);expect(w.project([t])[0].restart.reason).toBe('scope_decision_required');
+  }));
+  it('queues rather than duplicating an unlinked native worker when claim bridging is absent', async () => fixture(async h => {
+    const t=task();session(h,'old-failure',t,'failed');let starts=0;
+    h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('fixture','unlinked','worker','running',?,'fixture')",new Date(NOW).toISOString());
+    const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{start:async()=>{starts++;return {status:200,body:{}}}},()=>NOW);w.init();await w.tick();
+    expect(starts).toBe(0);expect(w.project([t])[0].restart.reason).toBe('unattributed_live_workspace_session');
   }));
   it('retries a lost admission reply with the same canonical key and never starts without goal', async () => fixture(async h => {
     const t=task();session(h,'old-failure',t,'failed');let now=NOW;const inputs:any[]=[];
@@ -86,6 +102,19 @@ describe('forgotten intake watchdog', () => {
     const w=new IntakeWatchdog(h.sql,h.intakeService,(f:any)=>f(),{},()=>NOW);w.init();
     const items=w.project([task('day0',3600000),task('day2',2*86400000),task('day4',4*86400000),task('day8',8*86400000)]);
     const text=w.digest(items);for(const value of ['<1d (1)','1–3d (1)','3–7d (1)','>7d (1)','[FORGOTTEN] day8'])expect(text).toContain(value);
+  }));
+  it('resolves delivered informational digests while retaining failed target retries', async () => fixture(async h => {
+    h.env={...h.env,HUB_ALERT_TO:'fixture-alerts'};
+    h.sql.exec("INSERT OR IGNORE INTO agents(tag,project) VALUES('fixture-alerts',NULL)");
+    const delivered=h.livenessService.setAlert('intake_digest','fixture-delivered',{state:'attention',detail:'Synthetic daily digest'});
+    await h.notifyAlert(delivered);
+    const done=h.sql.exec('SELECT * FROM liveness_alerts WHERE id=?',delivered.id).one();
+    expect(done.resolved_at).not.toBeNull();expect(JSON.parse(done.delivered_to)).toContain('inbox:fixture-alerts');
+    h.env={...h.env,HUB_ALERT_TO:'unregistered-fixture-alerts'};
+    const failed=h.livenessService.setAlert('intake_digest','fixture-failed',{state:'attention',detail:'Synthetic failed digest'});
+    await h.notifyAlert(failed);
+    const pending=h.sql.exec('SELECT * FROM liveness_alerts WHERE id=?',failed.id).one();
+    expect(pending.resolved_at).toBeNull();expect(pending.notify_error).toBeTruthy();
   }));
   it('REST refuses unauthenticated readers', async () => {
     const res=await SELF.fetch('https://hub.test/api/intake/forgotten');expect([401,403]).toContain(res.status);

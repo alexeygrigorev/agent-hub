@@ -112,6 +112,7 @@ try {
     for (const p of STATIC_PAGES) {
       await page.goto(base + p);
       await page.locator('h1').first().waitFor();
+      if (p === '/') await page.waitForFunction(() => /^Forgotten: \d+$/.test(document.getElementById('intake-forgotten')?.textContent || ''));
       await capture(`phone${p === '/' ? '-home' : p.replaceAll('/', '-')}-390-${theme}`);
     }
     checks.push(`Theme ${theme}: all 8 routes render at 390x844 with h1, no horizontal scroll, no secret leakage`);

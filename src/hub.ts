@@ -196,6 +196,7 @@ export class Hub extends DurableObject {
         return { status: r.status, body: await r.json() as any };
       },
       notify: async (kind, subject, detail) => {
+        if (kind === 'intake_digest' && this.sql.exec('SELECT id FROM liveness_alerts WHERE subject_kind=? AND subject=? LIMIT 1', kind, subject).toArray().length) return false;
         const alert = this.livenessService.setAlert(kind, subject, detail === null ? null : { state: 'attention', detail });
         if (alert) await this.notifyAlert(alert);
         return !!alert;
@@ -1705,6 +1706,12 @@ export class Hub extends DurableObject {
     }
     const anyTarget = targets.length > 0 || !!webhook;
     this.livenessService.markNotified(alert.id, errors.length ? errors.join('; ') : (anyTarget ? null : 'no alert target configured'), [...delivered]);
+    // A delivered informational digest is not an ongoing incident. Preserve its
+    // receipt/history, but keep it out of the unresolved incident queue. Failed
+    // targets stay open for the ordinary retry path.
+    if (alert.subject_kind === 'intake_digest' && anyTarget && !errors.length) {
+      this.livenessService.setAlert(alert.subject_kind, alert.subject, null);
+    }
   }
 
   protected extraCheckDeps(): Partial<ActionDeps> { return {}; }
