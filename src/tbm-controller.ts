@@ -169,7 +169,8 @@ export function ensureTbmControllerSchema(sql: SqlStorage): void {
     sql.exec('DROP TRIGGER IF EXISTS trg_tbm_pool_reset_capture');
     sql.exec(TBM_RESET_TRIGGER_SQL);
     sql.exec('CREATE INDEX IF NOT EXISTS idx_tbm_reward_pool_time ON tbm_reward_events(pool_id,timestamp_ms)');
-    if (hasTable(sql, 'session_control_sessions')) sql.exec("CREATE INDEX IF NOT EXISTS idx_tbm_binding_native ON session_control_sessions(json_extract(binding_json, '$.native_id'))");
+    sql.exec('DROP INDEX IF EXISTS idx_tbm_binding_native');
+    if (hasTable(sql, 'session_control_sessions')) sql.exec("CREATE INDEX IF NOT EXISTS idx_tbm_binding_native_valid ON session_control_sessions(CASE WHEN json_valid(binding_json) THEN json_extract(binding_json, '$.native_id') END)");
   } catch {}
 }
 
@@ -228,8 +229,13 @@ export function recordSessionTokens(sql: SqlStorage, input: SessionTokensInput, 
   // Native telemetry may arrive under a native key before the Hub session ends.
   upgradePendingSessionRewards(sql, nowMs, input.session_id);
   if (input.native_id && hasTable(sql, 'session_control_sessions')) {
-    const linked = sql.exec("SELECT id FROM session_control_sessions WHERE json_extract(binding_json, '$.native_id') = ?", input.native_id).toArray();
+    const linked = sql.exec("SELECT id FROM session_control_sessions WHERE CASE WHEN json_valid(binding_json) THEN json_extract(binding_json, '$.native_id') END = ? AND machine_id || ':' || ? = ?", input.native_id,input.native_id,input.session_id).toArray();
     for (const row of linked) if (row.id !== input.session_id) upgradePendingSessionRewards(sql, nowMs, String(row.id));
+  }
+  if (input.native_id && hasTable(sql, 'routing_jobs') && hasTable(sql, 'fleet_launches')) {
+    const jobs = sql.exec(`SELECT j.id FROM routing_jobs j JOIN fleet_launches l ON l.id=j.launch_id
+      WHERE l.native_id=? AND l.machine_id || ':' || l.native_id=?`, input.native_id,input.session_id).toArray();
+    for (const row of jobs) upgradePendingSessionRewards(sql,nowMs,String(row.id));
   }
 }
 
@@ -287,6 +293,13 @@ export function resolveNativeSessionTokens(
       return Math.floor(direct.total_tokens);
     }
   }
+  if (hasTable(sql, 'routing_jobs') && hasTable(sql, 'fleet_launches') && hasTable(sql, 'tbm_session_tokens')) {
+    const measured: any = sql.exec(`SELECT t.total_tokens FROM routing_jobs j
+      JOIN fleet_launches l ON l.id=j.launch_id
+      JOIN tbm_session_tokens t ON t.session_id=l.machine_id || ':' || l.native_id AND t.native_id=l.native_id
+      WHERE j.id=? LIMIT 1`, sessionId).toArray()[0];
+    if (measured && typeof measured.total_tokens === 'number' && measured.total_tokens >= 0) return Math.floor(measured.total_tokens);
+  }
   if (hasTable(sql, 'session_control_sessions')) {
     const sRow = sql.exec('SELECT id, fleet_launch_id, machine_id, binding_json, request_json FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0] as any;
     if (sRow) {
@@ -309,17 +322,12 @@ export function resolveNativeSessionTokens(
       const tag = binding?.tag;
       if (hasTable(sql, 'tbm_session_tokens') && (nativeId || tag)) {
         const byNative = nativeId
-          ? (sql.exec('SELECT total_tokens FROM tbm_session_tokens WHERE native_id = ? ORDER BY observed_at_ms DESC LIMIT 1', nativeId).toArray()[0] as any)
+          ? (sql.exec('SELECT total_tokens FROM tbm_session_tokens WHERE native_id = ? AND session_id = ? LIMIT 1', nativeId, `${sRow.machine_id}:${nativeId}`).toArray()[0] as any)
           : null;
         if (byNative && typeof byNative.total_tokens === 'number' && byNative.total_tokens >= 0) {
           return Math.floor(byNative.total_tokens);
         }
-        const byTag = tag
-          ? (sql.exec('SELECT total_tokens FROM tbm_session_tokens WHERE tag = ? ORDER BY observed_at_ms DESC LIMIT 1', tag).toArray()[0] as any)
-          : null;
-        if (byTag && typeof byTag.total_tokens === 'number' && byTag.total_tokens >= 0) {
-          return Math.floor(byTag.total_tokens);
-        }
+
       }
       if (hasTable(sql, 'session_control_commands')) {
         const cmds = sql.exec("SELECT ack_json FROM session_control_commands WHERE session_id = ? AND ack_json IS NOT NULL ORDER BY updated_at DESC LIMIT 5", sessionId).toArray() as any[];
@@ -659,7 +667,7 @@ function processResetPenalties(sql: SqlStorage, pools: TbmPoolRow[], nowMs: numb
   for (const p of pools) {
     if (p.pool_id === '*') continue;
     const st = sql.exec('SELECT last_reset_at_ms, last_remaining FROM tbm_controller_state WHERE pool_id = ?', p.pool_id).toArray()[0] as any;
-    if (st && typeof st.last_reset_at_ms === 'number' && st.last_reset_at_ms > 0 && st.last_reset_at_ms <= nowMs && p.reset_at_ms > st.last_reset_at_ms) {
+    if (st && typeof st.last_reset_at_ms === 'number' && st.last_reset_at_ms > 0 && st.last_reset_at_ms <= nowMs && st.last_reset_at_ms <= Number((p as any).last_updated_ms) && p.reset_at_ms > st.last_reset_at_ms) {
       const rem = typeof st.last_remaining === 'number' ? st.last_remaining : 0;
       const pctOnly = isPercentOnlyTbmPool(p);
       sql.exec(
@@ -862,7 +870,8 @@ function writePoolRollups(sql: SqlStorage, pools: TbmPoolRow[], nowMs: number): 
       const endMs = nowMs;
       const rewards = sql.exec(
         `SELECT SUM(CASE WHEN tokens_known = 1 AND tokens_burned IS NOT NULL AND event_kind = 'session' THEN tokens_burned ELSE 0 END) AS tok,
-                SUM(CASE WHEN work_units > 0 THEN work_units ELSE 0 END) AS work
+                SUM(CASE WHEN event_kind = 'session' AND work_units > 0 THEN work_units ELSE 0 END) AS work,
+                SUM(CASE WHEN event_kind = 'session' AND tokens_known = 1 AND tokens_burned > 0 THEN work_units ELSE 0 END) AS measured_work
          FROM tbm_reward_events
          WHERE pool_id = ? AND timestamp_ms >= ? AND timestamp_ms <= ?`,
         pool.pool_id,
@@ -881,7 +890,7 @@ function writePoolRollups(sql: SqlStorage, pools: TbmPoolRow[], nowMs: number): 
       const usefulWork = Math.max(0, Number(rewards?.work) || 0);
       const tokensKnown = totalTokens > 0 ? 1 : 0;
       const efficiencyKnown = totalTokens > 0 ? 1 : 0;
-      const eta = totalTokens > 0 ? (usefulWork * 1_000_000) / totalTokens : 0;
+      const eta = totalTokens > 0 ? ((Number(rewards?.measured_work) || 0) * 1_000_000) / totalTokens : 0;
       const leftoverAtReset = Math.max(0, Math.round(Number(resets?.leftover) || 0));
       const rollupId = `${pool.pool_id}:${w.type}`;
       sql.exec(

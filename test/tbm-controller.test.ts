@@ -504,7 +504,7 @@ it('does not penalize future deadline corrections or contaminate efficiency with
     const before = loadProviderEfficiencies(sql,NOW).get('codex:correction');
     tickTbm(sql, NOW);
     sql.exec("UPDATE tbm_quota_pools SET reset_at_ms=?,last_updated_ms=? WHERE pool_id='codex:correction:5h'", NOW+2*HOUR, NOW+MIN);
-    tickTbm(sql,NOW+2*MIN);
+    tickTbm(sql,NOW+HOUR+MIN);
     expect(sql.exec("SELECT * FROM tbm_reward_events WHERE event_kind='reset'").toArray()).toHaveLength(0);
     tickTbm(sql,NOW+2*HOUR+MIN);
     expect(sql.exec("SELECT * FROM tbm_reward_events WHERE event_kind='reset'").toArray()).toHaveLength(1);
@@ -524,5 +524,43 @@ it('updates an older reward directly even after more than 100 newer outcomes', a
       FROM tbm_reward_events WHERE event_id='session:older'`, 'session:newer-'+i,NOW+i+1,'newer-'+i);
     recordSessionTokens(sql, {session_id:'older',total_tokens:12345}, NOW+MIN);
     expect(sql.exec("SELECT tokens_burned FROM tbm_reward_events WHERE event_id='session:older'").one().tokens_burned).toBe(12345);
+  });
+});
+
+
+it('links routed task rewards to measured tokens on the exact launch machine', async () => {
+  await inDO(stub('routed-native'), (h: any) => {
+    const sql = h.sql;
+    sql.exec(`INSERT INTO fleet_launches
+      (id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at)
+      VALUES ('route-launch','a','agent','review','route-key','{}','host','codex','acct','headless','demo','review','exited','native',?,?)`,new Date(NOW).toISOString(),new Date(NOW).toISOString());
+    sql.exec(`INSERT INTO routing_jobs (id,actor,request_key,request_json,launch_id,state,created_at,updated_at)
+      VALUES ('route-job','a','job-key','{}','route-launch','done',?,?)`,new Date(NOW).toISOString(),new Date(NOW).toISOString());
+    recordSessionTokens(sql,{session_id:'foreign:native',native_id:'native',total_tokens:999999},NOW);
+    const unknown: any = recordSessionOutcomeReward(sql,{session_id:'route-job',outcome:'done'},NOW);
+    expect(unknown.tokens_known).toBe(0);
+    recordSessionTokens(sql,{session_id:'host:native',native_id:'native',total_tokens:100000},NOW+MIN);
+    const first: any = sql.exec("SELECT * FROM tbm_reward_events WHERE event_id='session:route-job'").one();
+    expect(first.tokens_burned).toBe(100000);
+    expect(first.token_efficiency_eta).toBe(100);
+    recordSessionTokens(sql,{session_id:'host:native',native_id:'native',total_tokens:200000},NOW+2*MIN);
+    const final: any = sql.exec("SELECT * FROM tbm_reward_events WHERE event_id='session:route-job'").one();
+    expect(final.tokens_burned).toBe(200000);
+    expect(final.token_efficiency_eta).toBe(50);
+  });
+});
+
+it('reports total accepted work while measuring efficiency only on the known-cost cohort', async () => {
+  await inDO(stub('rollup-cohort'), (h: any) => {
+    const sql = h.sql;
+    sql.exec(`INSERT INTO tbm_quota_pools (pool_id,provider,account,total_capacity_tokens,remaining_tokens,
+      headroom_percentage,reset_at_ms,last_updated_ms,cycle_ms) VALUES ('codex:cohort:5h','codex','cohort',1000000,800000,80,?,?,?)`,NOW+5*HOUR,NOW,5*HOUR);
+    recordSessionOutcomeReward(sql,{session_id:'known',outcome:'done',pool_id:'codex:cohort:5h',tokens_burned:100000},NOW);
+    recordSessionOutcomeReward(sql,{session_id:'unknown',outcome:'done',pool_id:'codex:cohort:5h'},NOW);
+    tickTbm(sql,NOW+MIN);
+    const row: any = sql.exec("SELECT * FROM tbm_metrics_rollup WHERE pool_id='codex:cohort:5h' AND window_type='1h'").one();
+    expect(row.useful_work_units).toBe(20);
+    expect(row.total_tokens_burned).toBe(100000);
+    expect(row.token_efficiency_eta).toBe(100);
   });
 });
