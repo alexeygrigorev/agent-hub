@@ -1055,7 +1055,7 @@ class Dispatcher:
         entry_file = jdir / f"{offer_id}.json"
         raw = json.dumps(record, sort_keys=True, ensure_ascii=False).encode("utf-8")
         from . import private_fs
-        private_fs.atomic_write(str(entry_file), raw, 65536)
+        private_fs.atomic_write(str(entry_file), raw, 131072)
 
     def _load_pending_launches_from_journal(self) -> None:
         jdir = self._journal_launches_dir()
@@ -1067,13 +1067,15 @@ class Dispatcher:
             if entry.is_symlink() or not entry.is_file() or not entry.name.endswith(".json"):
                 continue
             try:
-                if entry.stat().st_size > 65536 or entry.stat().st_size <= 0:
+                if entry.stat().st_size > 131072 or entry.stat().st_size <= 0:
                     continue
-                raw = private_fs.read_bytes(str(entry), 65536, private=True).decode("utf-8")
+                raw = private_fs.read_bytes(str(entry), 131072, private=True).decode("utf-8")
                 data = json.loads(raw)
                 if not isinstance(data, dict):
                     continue
-                if data.get("settled") is True:
+                from .late_reports import pending as late_report_pending, needs_cleanup
+                late = late_report_pending(data) or needs_cleanup(data)
+                if data.get("settled") is True and not late:
                     continue
                 if data.get("state") == "not_started":
                     offer_id = data.get("offer_id")
@@ -1085,7 +1087,7 @@ class Dispatcher:
                             and data["reason"].startswith("launcher_")):
                         self._active_launches[offer_id] = data
                     continue
-                if data.get("state") != "running":
+                if data.get("state") != "running" and not late:
                     continue
                 offer_id = data.get("offer_id")
                 task_id = data.get("task_id")
@@ -1168,12 +1170,12 @@ class Dispatcher:
             if status not in ("done", "failed", "waiting-on-human", "stuck"):
                 return {}
             report = data.get("report")
-            if not isinstance(report, str):
+            if not isinstance(report, str) or not report.strip():
                 return {}
-            report = _strip_control_chars(report.strip())
-            if len(report) > 4096:
-                report = report[:4096]
-            if _CONTROL_RE.search(report):
+            from .exit_evidence import sanitize, utf16_clip
+            report = sanitize(report.strip(), 65536)
+            report = utf16_clip(report.strip(), 4096)
+            if not report or _CONTROL_RE.search(report):
                 return {}
             artifacts = data.get("artifacts", [])
             if not isinstance(artifacts, list):
@@ -1186,8 +1188,8 @@ class Dispatcher:
                 text = item.get("text")
                 if not isinstance(label_text, str) or not isinstance(text, str):
                     continue
-                label_text = _strip_control_chars(label_text)[:120]
-                text = _strip_control_chars(text)[:1024]
+                label_text = utf16_clip(sanitize(label_text, 65536), 120)
+                text = utf16_clip(sanitize(text, 65536), 1024)
                 if _CONTROL_RE.search(label_text) or _CONTROL_RE.search(text):
                     continue
                 clean_artifacts.append({"label": label_text, "text": text})
@@ -1505,6 +1507,13 @@ class Dispatcher:
 
         for offer_id, record in list(self._active_launches.items()):
             if record.get("settled") is True:
+                from .late_reports import deliver, cleanup
+                try:
+                    if deliver(self, record):
+                        reconciled.append({'id':offer_id,'state':record['state'],'late_report_delivered':True})
+                    cleanup(self, record)
+                except Exception:
+                    pass  # Keep the durable cleanup marker for the next cycle.
                 continue
             if record.get("state") == "not_started":
                 try:
@@ -1595,18 +1604,25 @@ class Dispatcher:
                 _peeked = self._read_hub_finish_report(record)
             except Exception:
                 _peeked = None
-            fleet_state = _terminal_fleet_state(
+            cached = record.get('terminal_payload')
+            if not (isinstance(cached, dict) and cached.get('state') in ('exited', 'failed')
+                    and cached.get('confirmed_exit') is True and cached.get('native_id') == record['native_id']
+                    and cached.get('launcher_task_id') == record['task_id']):
+                cached = None
+            if cached and isinstance(cached.get('runtime'), dict) and cached['runtime'].get('outcome') == 'reported':
+                _peeked = {k: cached[k] for k in ('report_status', 'report', 'artifacts') if k in cached}
+            fleet_state = cached['state'] if cached else _terminal_fleet_state(
                 reconciled_state, bool(_peeked),
                 (record.get('diagnostic') or {}).get('reason')
                 if isinstance(record.get('diagnostic'), dict) else None)
-            from .exit_evidence import terminal_evidence
-            evidence = terminal_evidence(record, tombstone or {})
+            from .exit_evidence import terminal_evidence, bound_finish_fields
+            evidence = dict(cached['runtime']) if cached and isinstance(cached.get('runtime'), dict) else terminal_evidence(record, tombstone or {})
             evidence['outcome'] = ('reported' if _peeked else
                 'failed-with-partial-work' if evidence['observed_commits'] or evidence['dirty_paths'] or evidence['log_tail'] else
                 'failed-without-report')
             if record.get('routing_task_id'):
                 job_id = record['routing_task_id']
-                payload = self._routed_finish_report(record, fleet_state)
+                payload = bound_finish_fields(self._routed_finish_report(record, fleet_state))
                 try:
                     try:
                         acknowledgement = self.request('POST', f'/api/fleet/tasks/{job_id}/result', payload)
@@ -1703,25 +1719,11 @@ class Dispatcher:
                         "error_type": "AuthenticationError",
                         "stage": "dispatch_headless",
                     }
-            path = f"/api/fleet/launches/{offer_id}/result"
-            try:
-                acknowledgement = self.request("POST", path, result_payload)
-                if (not isinstance(acknowledgement, dict)
-                        or acknowledgement.get("id") != offer_id
-                        or acknowledgement.get("state") != fleet_state):
-                    continue
-                record["settled"] = True
-                record["state"] = fleet_state
-                record["settled_at"] = utcnow()
-                if result_payload.get("diagnostic"):
-                    record["diagnostic"] = result_payload["diagnostic"]
-                self._persist_launch_record(record)
-                reconciled.append({"id": offer_id, "state": fleet_state, "reconciled": True})
-                if record.get("workspace"):
-                    self._maybe_cleanup_worktree(Path(record["workspace"]), record.get("native_id"))
-            except Exception:
-                # Retain pending observation until the server explicitly acknowledges it.
-                continue
+            if result_payload.get('diagnostic'):
+                record['diagnostic'] = result_payload['diagnostic']
+            from .late_reports import acknowledge
+            if acknowledge(self, record, result_payload, bool(forwarded)):
+                reconciled.append({'id':offer_id,'state':fleet_state,'reconciled':True})
 
         return reconciled
 
@@ -2729,6 +2731,11 @@ class Dispatcher:
         if mode == 'headless' and result.get('confirmed_exit'):
             from .exit_evidence import sanitize, terminal_evidence
             immediate = {'offer_id': offer_id, 'native_id': native_id,
+                'task_id': task_id, 'tag': 'task-'+task_id, 'mode': 'headless',
+                'engine': offer.get('engine') or sub.get('engine') or sub.get('service'),
+                'state': 'running', 'settled': False, 'account': sub.get('account_label'),
+                'profile': offer.get('profile') or sub.get('profile'),
+                'launched_at_ts': launched_at_ts, 'log_offsets': log_offsets,
                 'workspace': str(workspace), 'target_cwd': str(target_cwd), 'result_path': str(result_path),
                 'incarnation': details.get('created_at_ms') or int(launched_at_ts * 1000),
                 'runtime_exit': {'code': details.get('exit_code'), 'signal': details.get('signal')},
@@ -2786,6 +2793,8 @@ class Dispatcher:
                                             for i, item in enumerate(partial.get('artifacts', []))]}
                 except Exception:
                     report = {'status': 'failed', 'report': 'Agent exited without a valid structured report; inspect private local logs.', 'artifacts': []}
+            from .exit_evidence import bound_finish_fields
+            report = bound_finish_fields(report)
             report['confirmed_exit'] = True
             self.request('POST', '/api/fleet/tasks/' + offer['task_id'] + '/result', report)
             if report['status'] in {'done', 'failed'}:
@@ -2815,9 +2824,15 @@ class Dispatcher:
                         result = dict(result, state='failed')
             except Exception:
                 pass
-        self.request("POST", path + "/result", result)
-        if result.get('state') in {'exited', 'failed'}:
-            self._maybe_cleanup_worktree(workspace, native_id)
+        if mode == 'headless' and result.get('confirmed_exit'):
+            from .late_reports import acknowledge
+            if not acknowledge(self, immediate, result, bool(forwarded)):
+                return {'id':offer_id,'state':'uncertain','native_id':native_id,
+                        'launcher_task_id':task_id,'reason':'terminal_acknowledgement_pending'}
+        else:
+            self.request("POST", path + "/result", result)
+            if result.get('state') in {'exited', 'failed'}:
+                self._maybe_cleanup_worktree(workspace, native_id)
         return {"id": offer_id, **result}
 
     def _report_subscriptions(self):

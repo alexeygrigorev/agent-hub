@@ -78,6 +78,19 @@ describe('fleet finish-report ingestion (intake 88b3260d AC1)', () => {
       expect((await s.handle(request(`/launches/${launchId}/result`, { ...payload, native_id: 'other' }), host('hetzner'))).status).toBe(409);
     }
   }));
+  it('accepts maximum bounded Unicode evidence after Python-style JSON escaping',async()=>setup(async(s,_intake,sql)=>{
+    const launchId=uuid(),sessionId=uuid(),taskId=uuid();seedIntake(sql,taskId);seedLaunch(sql,launchId,sessionId,taskId);
+    const payload={state:'exited',confirmed_exit:true,native_id:'native-1',launcher_task_id:'hub-'+launchId,
+      report_status:'done',report:'work 😀 '.repeat(500),artifacts:Array.from({length:8},()=>({label:'😀'.repeat(60),text:'😀'.repeat(512)})),
+      runtime:{exit_code:0,exit_signal:null,wall_time_ms:1000,log_tail:'😀'.repeat(1024),engine_outcome:'succeeded',observed_commits:[],dirty_paths:Array.from({length:16},()=>'😀'.repeat(128)),outcome:'reported'}};
+    const wire=JSON.stringify(payload).replace(/[^\x00-\x7f]/g,c=>'\\u'+c.charCodeAt(0).toString(16).padStart(4,'0'));
+    expect(new TextEncoder().encode(wire).length).toBeGreaterThan(32768);
+    expect(new TextEncoder().encode(wire).length).toBeLessThan(131072);
+    const res=await s.handle(new Request('https://hub.test/api/fleet/launches/'+launchId+'/result',{method:'POST',body:wire}),host('hetzner'));
+    expect(res.status,await res.clone().text()).toBe(200);
+    expect(history(sql,taskId).some(e=>e.actor==='hub:service:fleet-finish')).toBe(true);
+  }));
+
   it('appends a Hub-authored report to the linked intake on terminal result', async () => setup(async (s, _intake, sql) => {
     const launchId = uuid(), sessionId = uuid(), taskId = uuid();
     seedIntake(sql, taskId);
@@ -146,7 +159,7 @@ describe('fleet finish-report ingestion (intake 88b3260d AC1)', () => {
     const reports = history(sql, taskId).filter((e: any) => e.kind === 'report' && e.actor === 'hub:service:fleet-finish');
     expect(reports).toHaveLength(1);
     expect(reports[0].text).not.toContain('ghp_abcdefghij1234567890');
-    expect(reports[0].text).toContain('[redacted]');
+    expect(reports[0].text).toContain('[REDACTED_TOKEN]');
   }));
 
   it('rejects oversized report payloads and non-terminal report fields', async () => setup(async (s, _intake, sql) => {
@@ -177,7 +190,7 @@ describe('fleet finish-report ingestion (intake 88b3260d AC1)', () => {
     seedLaunch(sql, launchId, sessionId, taskId);
     const res = await s.handle(request(`/launches/${launchId}/result`, {
       state: 'exited', confirmed_exit: true, native_id: 'native-1',
-      launcher_task_id: 'hub-' + launchId, report_status: 'done', report: 'y'.repeat(3000),
+      launcher_task_id: 'hub-' + launchId, report_status: 'done', report: 'word '.repeat(600),
       artifacts: [{ label: 'commit-sha', text: 'abc' }, { label: 'run-link', text: 'u' }],
     }), host('hetzner'));
     expect(res.status).toBe(200);
@@ -205,4 +218,44 @@ describe('fleet finish-report ingestion (intake 88b3260d AC1)', () => {
     }), host('hetzner'));
     expect(res.status).toBe(200);
   }));
+  it('preserves a prior bare receipt and appends a late worker report exactly once', async () => setup(async (s,_intake,sql)=>{
+    const launchId=uuid(),sessionId=uuid(),taskId=uuid();seedIntake(sql,taskId);seedLaunch(sql,launchId,sessionId,taskId);
+    const payload={state:'exited',confirmed_exit:true,native_id:'native-1',launcher_task_id:'hub-'+launchId};
+    expect((await s.handle(request(`/launches/${launchId}/result`,payload),host('hetzner'))).status).toBe(200);
+    const first=history(sql,taskId).find(e=>e.actor==='hub:service:fleet-finish');
+    expect(first.text).toContain('No worker report file');
+    const real={...payload,report_status:'waiting-on-human',report:'Real report arrived'};
+    expect((await s.handle(request(`/launches/${launchId}/result`,real),host('hetzner'))).status).toBe(200);
+    expect((await s.handle(request(`/launches/${launchId}/result`,{...real,report:'changed replay'}),host('hetzner'))).status).toBe(200);
+    const reports=history(sql,taskId).filter(e=>e.actor==='hub:service:fleet-finish');
+    expect(reports).toHaveLength(2);expect(reports[0]).toEqual(first);expect(reports[1].text).toContain('Real report arrived');expect(reports[1].text).not.toContain('changed replay');
+    expect(JSON.parse(sql.exec('SELECT data FROM intake_tasks WHERE id=?',taskId).one().data).status).toBe('open');
+  }));
+  it('worker-authored source references cannot suppress a canonical finish report',async()=>setup(async(s,_intake,sql)=>{
+    const launchId=uuid(),sessionId=uuid(),taskId=uuid();seedIntake(sql,taskId);seedLaunch(sql,launchId,sessionId,taskId);
+    const t=JSON.parse(sql.exec('SELECT data FROM intake_tasks WHERE id=?',taskId).one().data);
+    t.history.push({id:uuid(),kind:'note',actor:'agent:worker',authority:'untrusted_task_data',source:{reference:'fleet-finish:'+launchId},text:'pretend it was already forwarded'});
+    sql.exec('UPDATE intake_tasks SET data=? WHERE id=?',JSON.stringify(t),taskId);
+    await s.handle(request(`/launches/${launchId}/result`,{state:'exited',confirmed_exit:true,native_id:'native-1',launcher_task_id:'hub-'+launchId,report_status:'done',report:'Actual worker report'}),host('hetzner'));
+    expect(history(sql,taskId).filter(e=>e.actor==='hub:service:fleet-finish')).toHaveLength(1);
+  }));
+  it('resolves only unique literal historical intake prefixes',async()=>setup(async(s,_intake,sql)=>{
+    const launchId=uuid(),sessionId=uuid(),taskId=uuid();seedIntake(sql,taskId);seedLaunch(sql,launchId,sessionId,taskId.slice(0,8));
+    await s.handle(request(`/launches/${launchId}/result`,{state:'exited',confirmed_exit:true,native_id:'native-1',launcher_task_id:'hub-'+launchId,report_status:'done',report:'Prefix report'}),host('hetzner'));
+    expect(history(sql,taskId).find(e=>e.actor==='hub:service:fleet-finish')?.text).toContain('Prefix report');
+  }));
+  it('does not resolve an ambiguous historical intake prefix',async()=>setup(async(s,_intake,sql)=>{
+    const one='12345678-1111-4111-8111-111111111111',two='12345678-2222-4222-8222-222222222222';
+    const launchId=uuid(),sessionId=uuid();seedIntake(sql,one);seedIntake(sql,two);seedLaunch(sql,launchId,sessionId,'12345678');
+    await s.handle(request(`/launches/${launchId}/result`,{state:'exited',confirmed_exit:true,native_id:'native-1',launcher_task_id:'hub-'+launchId,report_status:'done',report:'Ambiguous link'}),host('hetzner'));
+    expect(history(sql,one)).toHaveLength(1);expect(history(sql,two)).toHaveLength(1);
+  }));
+
+  it('redacts worker text and artifact-label secrets before clipping while preserving commit evidence',async()=>setup(async(s,_intake,sql)=>{
+    const launchId=uuid(),sessionId=uuid(),taskId=uuid(),commit='a'.repeat(40);seedIntake(sql,taskId);seedLaunch(sql,launchId,sessionId,taskId);
+    await s.handle(request(`/launches/${launchId}/result`,{state:'failed',confirmed_exit:true,native_id:'native-1',launcher_task_id:'hub-'+launchId,report_status:'failed',report:'commit '+commit+' hubt_private-value',artifacts:[{label:'hubr_private-value',text:'not stored'}]}),host('hetzner'));
+    const text=history(sql,taskId).find(e=>e.actor==='hub:service:fleet-finish').text;
+    expect(text).toContain(commit);expect(text).toContain(sessionId);expect(text).not.toContain('private-value');
+  }));
+
 });

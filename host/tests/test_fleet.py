@@ -281,7 +281,7 @@ class FleetTests(unittest.TestCase):
                 if 'plan' in argv: return {'eligible': [{'provider': 'codex', 'model': 'gpt-6-sol', 'task_fit': 1.0, 'account_label': 'shared-codex', 'profile': None}]}
                 if 'run' in argv: return {'receipt': {'unit_name': 'headless-unit', 'exit_code': 0}}
                 return {}
-            d = fleet.Dispatcher(cfg, lambda *a: requests.append(a) or {}, runner)
+            d = fleet.Dispatcher(cfg, lambda *a: requests.append(a) or ({'id': a[1].split('/')[-2], 'state': a[2].get('state')} if a[1].endswith('/result') else {}), runner)
             result = d.dispatch(offer(mode='headless', prompt='Goal with $(literal shell text)'))
             # AC a19cac9e: exit 0 with no result JSON is failed-with-partial-work.
             self.assertEqual(result['state'], 'failed'); self.assertEqual(result['native_id'], 'headless-unit')
@@ -845,7 +845,7 @@ class FleetTests(unittest.TestCase):
                     return {'receipt': {'model': 'gpt-6.1-sol', 'model_verified': True, 'unit_name': 'headless-unit', 'exit_code': 0}}
                 return {}
 
-            d = fleet.Dispatcher(cfg, lambda *a: requests.append(a) or {}, runner)
+            d = fleet.Dispatcher(cfg, lambda *a: requests.append(a) or ({'id': a[1].split('/')[-2], 'state': a[2].get('state')} if a[1].endswith('/result') else {}), runner)
 
             # 1. ACTUAL normal headless offer WITHOUT task_id (canonical session/intake case)
             normal_offer = offer(mode='headless', task_id=None, prompt='Normal intake task')
@@ -952,7 +952,7 @@ class FleetTests(unittest.TestCase):
                     return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'shared-codex', 'observed_at': fleet.utcnow()}
                 return {}
 
-            d = fleet.Dispatcher(cfg, lambda *a: {}, runner)
+            d = fleet.Dispatcher(cfg, lambda *a: ({'id': a[1].split('/')[-2], 'state': a[2].get('state')} if a[1].endswith('/result') else {}), runner)
 
             # Case 1: .local ancestor is a symlink pointing outside
             (ws / '.local').symlink_to(outside)
@@ -1012,7 +1012,7 @@ class FleetTests(unittest.TestCase):
                     return {'receipt': {'unit_name': 'headless-unit', 'exit_code': 0}}
                 return {}
 
-            d_ok = fleet.Dispatcher(cfg, lambda *a: {}, ok_runner)
+            d_ok = fleet.Dispatcher(cfg, lambda *a: ({'id': a[1].split('/')[-2], 'state': a[2].get('state')} if a[1].endswith('/result') else {}), ok_runner)
             res1 = d_ok.dispatch(offer(mode='headless', id='first-task-1', prompt='First run'))
             # AC a19cac9e: exit 0 with no result JSON is failed-with-partial-work.
             self.assertEqual(res1['state'], 'failed')

@@ -21,6 +21,38 @@ UUID = re.compile(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}')
 ANSI = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))')
 
 
+def utf16_clip(text, limit, *, tail=False):
+    """Use the Hub's JavaScript string budget without splitting a code point."""
+    chars = []
+    used = 0
+    for char in reversed(text) if tail else text:
+        width = 2 if ord(char) > 0xffff else 1
+        if used + width > limit:
+            break
+        chars.append(char)
+        used += width
+    return ''.join(reversed(chars) if tail else chars)
+
+
+def bound_finish_fields(payload):
+    """Apply the wire budget after assembling either worker or host reports."""
+    out = dict(payload)
+    if isinstance(out.get('report'), str):
+        out['report'] = utf16_clip(sanitize(out['report'], 65536), 4096)
+    if isinstance(out.get('artifacts'), list):
+        artifacts = []
+        for original in out['artifacts'][:8]:
+            if not isinstance(original, dict):
+                continue
+            item = dict(original)
+            for key, limit in (('label', 120), ('name', 120), ('text', 1024)):
+                if isinstance(item.get(key), str):
+                    item[key] = utf16_clip(sanitize(item[key], 65536), limit)
+            artifacts.append(item)
+        out['artifacts'] = artifacts
+    return out
+
+
 def sanitize(text, limit=2048):
     # Redact the entire bounded window before truncating; never clip into a
     # credential. Drop control bytes and bare Bearer values as a backstop.
@@ -30,7 +62,7 @@ def sanitize(text, limit=2048):
     text = re.sub(r'(?i)\bBearer\s+[^\s\"\x27,;]+', 'Bearer [REDACTED]', text)
     text = redact_for_bus(text)
     text = re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', text)
-    return text[-limit:]
+    return utf16_clip(text, limit, tail=True)
 
 
 def same_native(record, row):
@@ -68,7 +100,7 @@ def snapshot_native(record, row, *, opencode_data=None):
     history = row.get('history_path')
     if isinstance(history, str) and Path(history).is_absolute() and Path(history).parent.name == row['id']:
         try:
-            result['log_tail'] = _tail(history)[-2048:]
+            result['log_tail'] = sanitize(_tail(history), 2048)
             result['log_source'] = 'native_history'
         except (OSError, ValueError):
             pass

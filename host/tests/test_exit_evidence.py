@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -23,6 +24,66 @@ class ExitEvidence(unittest.TestCase):
                 self.assertIsNone(result['engine_outcome'])
         result = terminal_evidence({'exit_evidence': {'exit_code': 'bad'}, 'runtime_exit': {'code': 0}}, {})
         self.assertEqual(result['exit_code'], 0)
+
+    def test_supplementary_unicode_respects_hub_utf16_budget(self):
+        from agent_hub_host.exit_evidence import utf16_clip
+        text=('a ' * 1023)+'b'+chr(0x1f600)
+        record={'exit_evidence':{'log_tail':text}}
+        result=terminal_evidence(record,{})
+        self.assertLessEqual(len(result['log_tail'].encode('utf-16-le'))//2,2048)
+        self.assertTrue(result['log_tail'].endswith(chr(0x1f600)))
+        result['outcome']='failed-without-report'
+        # Exercise the actual bundled Hub validator, rather than duplicating
+        # JavaScript's length rule in another Python assertion.
+        script = """
+import {buildSync} from 'esbuild';
+import {readFileSync} from 'node:fs';
+import {createRequire} from 'node:module';
+const build=buildSync({stdin:{contents:"export {sanitizeExitEvidence} from './src/exit-evidence.ts'",resolveDir:process.cwd()},bundle:true,write:false,platform:'node',format:'cjs'});
+const mod={exports:{}};
+new Function('module','exports','require',build.outputFiles[0].text)(mod,mod.exports,createRequire(import.meta.url));
+process.exit(mod.exports.sanitizeExitEvidence(JSON.parse(readFileSync(0,'utf8'))) ? 0 : 2);
+"""
+        proc=subprocess.run(['node','--input-type=module','-e',script],
+                            input=json.dumps(result),text=True,capture_output=True,timeout=20,
+                            cwd=Path(__file__).resolve().parents[2])
+        self.assertEqual(proc.returncode,0,proc.stderr)
+
+        self.assertEqual(utf16_clip('ab'+chr(0x1f600),3),'ab')
+        self.assertEqual(utf16_clip(chr(0x1f600)+'ab',3,tail=True),'ab')
+        git=Mock(side_effect=[Mock(stdout=''),Mock(stdout=' M '+chr(0x1f600)*255)])
+        paths=terminal_evidence({'incarnation':1000,'workspace':'/repo'},{},git=git)['dirty_paths']
+        self.assertLessEqual(len(paths[0].encode('utf-16-le'))//2,256)
+
+    def test_generated_fallback_report_and_artifacts_pass_actual_finish_result_validator(self):
+        from agent_hub_host.fleet import Dispatcher
+        with tempfile.TemporaryDirectory() as tmp:
+            record=dict(offer_id=OFFER,task_id='hub-'+OFFER,mode='headless',workspace=tmp,
+                        native_id=NATIVE,tag='task-hub-'+OFFER,incarnation=1000,engine='opencode',
+                        state='running',settled=False,result_path=str(Path(tmp)/'.local/hub-results'/(OFFER+'.json')),
+                        runtime_exit={'code':0},exit_evidence={'log_tail':chr(0x1f600)*1024})
+            d=Dispatcher({'version':1,'workspaces':{'main':tmp},'subscriptions':[],
+                          'launcher':{'argv':['launcher'],'root':tmp,'config_dir':tmp}})
+            d._active_launches={OFFER:record}
+            sent=[]
+            def request(method,path,payload=None):
+                sent.append(payload);return {'id':OFFER,'state':payload['state']}
+            with patch('agent_hub_host.fleet.verify_native_retirement',return_value=(True,{'finished_at_ms':3100},'verified')), \
+                 patch.object(d,'runner',return_value={'state':'failed','native_id':NATIVE,'resources_reserved':False}), \
+                 patch.object(d,'request',side_effect=request), patch.object(d,'_persist_launch_record'), \
+                 patch.object(d,'_no_result_partial_report',return_value={'report':'work '*700,
+                    'artifacts':[{'label':'partial work','text':chr(0x1f600)*900}]}), \
+                 patch.object(d,'_maybe_cleanup_worktree'), \
+                 patch('agent_hub_host.runtime_diagnostics.subprocess.run',side_effect=OSError):
+                d.reconcile_launches()
+            payload=sent[0]
+            self.assertLessEqual(len(payload['report'].encode('utf-16-le'))//2,4096)
+            self.assertLessEqual(len(payload['artifacts'][0]['text'].encode('utf-16-le'))//2,1024)
+            script = 'import {buildSync} from \'esbuild\';\nimport {readFileSync} from \'node:fs\';\nimport {createRequire} from \'node:module\';\nconst build=buildSync({stdin:{contents:"export {FleetService} from \'./src/fleet.ts\'",resolveDir:process.cwd()},bundle:true,write:false,platform:\'node\',format:\'cjs\'});\nconst mod={exports:{}};new Function(\'module\',\'exports\',\'require\',build.outputFiles[0].text)(mod,mod.exports,createRequire(import.meta.url));\nconst input=JSON.parse(readFileSync(0,\'utf8\'));\nconst row={id:input.launch_id,state:\'running\',mode:\'headless\',machine_id:\'fixture-host\',engine:\'opencode\',account:\'fixture\',native_id:input.payload.native_id,launcher_task_id:input.payload.launcher_task_id,request_json:\'{}\',request_key:\'fixture\',actor:\'fixture\'};\nconst sql={exec(q,...args){return {toArray:()=>q.startsWith(\'SELECT * FROM fleet_launches WHERE id = ? AND machine_id = ?\')?[row]:[],one:()=>({n:0}),[Symbol.iterator]:function*(){}};}};\nconst fleet=new mod.exports.FleetService(sql,fn=>fn());\nconst res=await fleet.handle(new Request(\'https://hub.test/api/fleet/launches/\'+input.launch_id+\'/result\',{method:\'POST\',body:JSON.stringify(input.payload)}),{caller:{kind:\'host\',machineId:\'fixture-host\'},scopes:[\'host\']});\nconsole.log(JSON.stringify({status:res.status,body:await res.json()}));\nprocess.exit(res.status===200?0:2);\n'
+            proc=subprocess.run(['node','--input-type=module','-e',script],
+                input=json.dumps({'launch_id':OFFER,'payload':payload}),text=True,capture_output=True,timeout=20,
+                cwd=Path(__file__).resolve().parents[2])
+            self.assertEqual(proc.returncode,0,proc.stdout+proc.stderr)
 
     def test_durable_native_exit_receipt_survives_absent_catalog_observation(self):
         for code, signal in [(0,None),(3,None),(None,15)]:

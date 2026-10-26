@@ -54,6 +54,21 @@ class TestReadHubFinishReport(unittest.TestCase):
         self.assertEqual(out["report"], "All green.")
         self.assertEqual(out["artifacts"], [{"label": "sha", "text": "abc"}])
 
+    def test_redacts_before_utf16_clipping_and_rejects_blank_reports(self):
+        d,tmp=_dispatcher();self.addCleanup(tmp.cleanup)
+        ws,res=_mk_results(tmp.name);offer='11111111-2222-4333-8444-555555555555'
+        rp=res/(offer+'.json');record={'offer_id':offer,'workspace':str(ws),'result_path':str(rp)}
+        rp.write_text(json.dumps({'status':'done','report':' ', 'artifacts':[]}))
+        self.assertEqual(d._read_hub_finish_report(record),{})
+        rp.write_text(json.dumps({'status':'done','report':'\x1b[31m\x1b[0m'}))
+        self.assertEqual(d._read_hub_finish_report(record),{})
+        rp.write_text(json.dumps({'status':'done','report':('work '+chr(0x1f600)+' ')*1000+' hubt_private-value',
+                                 'artifacts':[{'label':chr(0x1f600)*120,'text':'hubr_private-value'}]}))
+        out=d._read_hub_finish_report(record)
+        self.assertLessEqual(len(out['report'].encode('utf-16-le'))//2,4096)
+        self.assertLessEqual(len(out['artifacts'][0]['label'].encode('utf-16-le'))//2,120)
+        self.assertNotIn('private-value',json.dumps(out))
+
     def test_missing_file_returns_empty(self):
         d, tmp = _dispatcher()
         self.addCleanup(tmp.cleanup)
@@ -87,7 +102,7 @@ class TestReadHubFinishReport(unittest.TestCase):
         rp.write_text(json.dumps({"status": "bogus", "report": "x"}))
         record = {"offer_id": offer, "workspace": str(ws), "result_path": str(rp)}
         self.assertEqual(d._read_hub_finish_report(record), {})
-        rp.write_text(json.dumps({"status": "stuck", "report": "y" * 9000,
+        rp.write_text(json.dumps({"status": "stuck", "report": "ordinary worker prose " * 500,
                                   "artifacts": [{"label": "l", "text": "t"}] * 30}))
         out = d._read_hub_finish_report(record)
         self.assertEqual(out["report_status"], "stuck")

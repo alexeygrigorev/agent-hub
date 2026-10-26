@@ -1,4 +1,5 @@
 import { jsonFields, initResourceRequestProjection } from './sql-json-projection';
+import { redactForBus } from './work_claim';
 import { sanitizeExitEvidence } from './exit-evidence';
 import {sanitizeCpuAdmission} from './cpu-headroom';
 import { launcherDiskHeadroom } from './launcher-disk';
@@ -1557,8 +1558,11 @@ export class FleetService {
     const match = /^\/api\/fleet\/launches\/([a-f0-9-]{36})\/(claim|result|reject)$/.exec(path);
     if (match && request.method === 'POST') {
       if (!host) return response({ error: 'forbidden' }, 403);
-      const data = await body(request);
-      const runtime = data?.runtime === undefined ? undefined : sanitizeExitEvidence(data.runtime);
+      // A bounded report plus runtime evidence may expand under Python's
+      // JSON Unicode escaping. Keep other mutations on the smaller budget.
+      const data = await body(request, match[2] === 'result' ? 131072 : 32768);
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return response({ error: 'invalid_launch_result' }, 400);
+      const runtime = data.runtime === undefined ? undefined : sanitizeExitEvidence(data.runtime);
       if (data?.runtime !== undefined && (!runtime || !['failed', 'exited'].includes(data.state) || data.confirmed_exit !== true)) return response({ error: 'invalid_exit_evidence' }, 400);
       return this.transaction(() => {
         const row: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id = ? AND machine_id = ?', match[1], caller.machineId!).toArray()[0];
@@ -1952,32 +1956,32 @@ export class FleetService {
       } catch { return; }
       if (!intakeTaskId) return;
       const sourceRef = 'fleet-finish:' + launchId;
-      const taskRow: any = this.sql.exec('SELECT data FROM intake_tasks WHERE id = ?', intakeTaskId).toArray()[0];
-      if (!taskRow) return;
+      let taskRows: any[] = this.sql.exec('SELECT id,data FROM intake_tasks WHERE id=?',intakeTaskId).toArray();
+      if (!taskRows.length && intakeTaskId.length >= 6) taskRows = this.sql.exec('SELECT id,data FROM intake_tasks WHERE substr(id,1,?)=? LIMIT 2',intakeTaskId.length,intakeTaskId).toArray();
+      if (taskRows.length !== 1) return;
+      const taskRow = taskRows[0];
+      intakeTaskId = taskRow.id;
       const task = JSON.parse(taskRow.data);
       if (!task || !Array.isArray(task.history)) return;
-      if (task.history.some((e: any) => e && (e.kind === 'report' || e.kind === 'note') &&
-        (e.source && typeof e.source === 'object' && (e.source as any).reference === sourceRef))) return;
+      const canonical = task.history.filter((e:any) => e?.kind === 'report' && e.actor === 'hub:service:fleet-finish' &&
+        e.authority === 'hub_launch_verified' && e.source?.reference === sourceRef);
+      const received = (e:any) => e.worker_report_received === true || (e.worker_report_received === undefined &&
+        e.text?.includes(' Worker report: ') && !e.text.includes('Worker report: Agent exited without a valid structured report'));
+      const incomingWorkerReport = typeof data.report === 'string' && !!data.report.trim() &&
+        (!data.runtime || data.runtime.outcome === 'reported');
+      if (canonical.some(received) || (canonical.length && !incomingWorkerReport)) return;
+      // Preserve the original receipt. A late worker report is an additional
+      // immutable history entry, accepted once from the same owning host.
+
       const rawStatus = typeof data?.report_status === 'string' ? data.report_status : null;
       const workerStatus = ['done', 'failed', 'waiting-on-human', 'stuck'].includes(rawStatus || '') ? rawStatus : null;
       const fleetState = data.state === 'exited' ? 'exited' : 'failed';
-      let reportText = typeof data?.report === 'string' ? data.report.trim() : '';
-      if (reportText.length > 2000) reportText = reportText.slice(0, 2000) + '…';
-      // Belt-and-braces: never persist tokens that slipped through host
-      // sanitization. Redact common secret shapes.
-      reportText = reportText
-        .replace(/gh[pousr]_[A-Za-z0-9_]{16,}/g, '[redacted]')
-        .replace(/ghm?_[A-Za-z0-9_]{16,}|ghc_[A-Za-z0-9_]{16,}/g, '[redacted]')
-        .replace(/github_pat_[A-Za-z0-9_]{16,}/g, '[redacted]')
-        .replace(/\bAKIA[0-9A-Z]{16}\b/g, '[redacted]')
-        .replace(/\bsk-ant-[A-Za-z0-9_-]{8,}\b/g, '[redacted]')
-        .replace(/\bxox[baprs]-[A-Za-z0-9-]{8,}/g, '[redacted]')
-        .replace(/\b[0-9a-f]{40}\b/gi, '[redacted]')
-        .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]{16,}={0,1}/gi, '$1[redacted]');
+      let reportText = typeof data?.report === 'string' ? String(redactForBus(data.report.trim())) : '';
+      if (reportText.length > 2000) reportText = reportText.slice(0,2000).replace(/[\uD800-\uDBFF]$/, '') + '…';
       let artifactLine = '';
       if (Array.isArray(data?.artifacts) && data.artifacts.length) {
         const labels = (data.artifacts as any[])
-          .map((a: any) => String(a.label).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '').slice(0, 120))
+          .map((a: any) => String(redactForBus(a.label)).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '').slice(0, 120))
           .filter((l: string) => l);
         if (labels.length) artifactLine = `\nArtifacts: ${labels.join(', ').slice(0, 500)}`;
       }
@@ -1989,13 +1993,9 @@ export class FleetService {
         id: crypto.randomUUID(), kind: 'report', actor: 'hub:service:fleet-finish',
         captured_at: Date.now(), text: text.slice(0, 8192),
         source: { type: 'unknown', reference: sourceRef, timestamp: at },
-        authority: 'hub_launch_verified',
+        authority: 'hub_launch_verified', worker_report_received: incomingWorkerReport,
       };
-      if (task.history.length >= 128) {
-        const idx = task.history.findIndex((e: any, i: number) => i > 0 && typeof e?.actor === 'string' && e.actor.startsWith('hub:service:'));
-        if (idx < 0) return;
-        task.history.splice(idx, 1);
-      }
+      if (task.history.length >= 128) return; // Preserve every prior event; durable capacity repair is separate.
       task.history.push(event);
       task.version = (typeof task.version === 'number' ? task.version : 1) + 1;
       task.updated_at = Date.now();
