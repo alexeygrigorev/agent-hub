@@ -716,6 +716,45 @@ class OracleTests(unittest.TestCase):
             stop_mock.assert_called_once()
             self.assertEqual(out["reaps"], 1)
 
+    def test_saturated_receipts_flush_before_recovering_an_uncertain_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            entry, native = _entry(state="failed"), _native()
+            state = {"peaks": {}, "pending": {"pending-stop": {
+                "oracle": self._oracle(), "session_id": entry["session_id"],
+                "native_id": entry["native_id"], "native_created_at_ms": 900_000,
+                "reason": "terminal", "evidence_id": "pending-evidence", "at_ms": 1_000_000}},
+                "reported": {}}
+            for i in range(rm.MAX_REPORTED_ENTRIES):
+                state["reported"][str(i)] = dict(id=str(i), session_id="old-" + str(i),
+                    native_id="native-" + str(i), reason="terminal", evidence_id="e-" + str(i),
+                    at="1970-01-01T00:16:40Z", stopped=True, freed_mb=None)
+            self.assertTrue(rm.save_state(tmp, state))
+            posted = []
+            def request(method, path, payload=None):
+                if path.endswith("/watchdog"):
+                    return {"config": {}, "sessions": [entry]}
+                if path.endswith("/report"):
+                    posted.extend(payload["reaps"])
+                    return {"reported": True}
+                raise AssertionError("Recovery must only report, never capture evidence: " + path)
+            with patch("agent_hub_host.native_sessions.list_sessions", return_value=[native]), \
+                 patch("agent_hub_host.native_sessions.reconcile_stop_oracle", return_value=(True, "confirmed")), \
+                 patch("agent_hub_host.native_sessions.stop_session") as stop, \
+                 patch.object(rm, "_native_dead", return_value=False), \
+                 patch.object(rm, "sample_session_tree", return_value=None):
+                first = rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_000_000)
+                self.assertTrue(first["ok"])
+                self.assertEqual(len(posted), rm.MAX_REPORTED_ENTRIES)
+                saved = rm.load_state(tmp)
+                self.assertFalse(saved["reported"])
+                self.assertIn("pending-stop", saved["pending"])
+                second = rm.run_watchdog_cycle(request, journal_dir=tmp, now_ms=10_301_000)
+                self.assertTrue(second["ok"])
+                self.assertEqual(second["reaps"], 1)
+                self.assertEqual(posted[-1]["id"], "pending-stop")
+                self.assertFalse(rm.load_state(tmp)["pending"])
+                stop.assert_not_called()
+
     def test_uncertain_denied_never_retries_kill(self):
         with tempfile.TemporaryDirectory() as tmp:
             native = [_native(phase="running", last_activity_ms=1_000_000)]

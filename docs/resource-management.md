@@ -152,6 +152,11 @@ Interactive sessions (including interactive goals) can be sampled but are never 
 A protected session is excluded even when its launch was Hub-managed. Missing
 intake linkage or inability to save evidence prevents a stop.
 
+Confirmed stop receipts remain durable until the server acknowledges them.
+If the bounded receipt journal fills, the watchdog flushes saved receipts
+before recovering another uncertain stop; it retains the pending oracle and
+never repeats a kill or drops a receipt to make room.
+
 ## How the stats are used for planning
 
 - Placement estimate: p90 `peak_rss_mb` by (project, engine, kind), falling back

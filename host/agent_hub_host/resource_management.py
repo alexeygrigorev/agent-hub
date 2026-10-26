@@ -936,6 +936,9 @@ def _reconcile_pending_oracles(aplexer_bin: str, state: dict[str, Any], clock: A
             break
         if not isinstance(item, dict) or not isinstance(item.get("oracle"), dict):
             continue
+        reported = state.get("reported", {})
+        if reap_id not in reported and len(reported) >= MAX_REPORTED_ENTRIES:
+            continue  # Flush cached receipts first; retain this oracle intact.
         kill = item.get("kill")
         try:
             confirmed, _why = reconcile_stop_oracle(
@@ -1259,6 +1262,9 @@ def _reap_one(request: Any, aplexer_bin: str, entry: dict[str, Any], native: Any
         if (prior.get("session_id") != sid or prior.get("native_id") != nid
                 or prior.get("native_created_at_ms") != created_ms):
             continue
+        reported = state.get("reported", {})
+        if known_id not in reported and len(reported) >= MAX_REPORTED_ENTRIES:
+            return None  # Same-binding recovery also waits for cached ACKs.
         try:
             from .native_sessions import reconcile_stop_oracle
             kill = prior.get("kill")
