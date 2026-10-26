@@ -43,6 +43,50 @@ def _dispatcher(tmp):
 
 
 class NoResultRegression(unittest.TestCase):
+    def test_partial_report_distinguishes_real_pushed_and_local_only_commits(self):
+        # Own disposable local remote: real git push/ancestry, no network/auth.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ws, remote = root / 'repo', root / 'remote.git'
+            ws.mkdir()
+            def git(*args, cwd=ws):
+                return subprocess.check_output(['git', *args], cwd=cwd, stderr=subprocess.DEVNULL, text=True).strip()
+            git('init', '-q', '--initial-branch=main')
+            git('init', '-q', '--bare', str(remote))
+            git('config', 'user.name', 'Fixture')
+            git('config', 'user.email', 'fixture@example.invalid')
+            (ws / 'work.txt').write_text('first real change')
+            git('add', 'work.txt'); git('commit', '-qm', 'pushed fixture work')
+            first = git('rev-parse', 'HEAD')
+            git('remote', 'add', 'origin', str(remote)); git('push', '-q', 'origin', 'main')
+            (ws / 'work.txt').write_text('second real change')
+            git('commit', '-qam', 'local only fixture work')
+            second = git('rev-parse', 'HEAD')
+            info = ld.describe_partial_work(str(ws))
+            self.assertEqual(info['pushed_commits'], [first])
+            d = _dispatcher(tmp)
+            report = d._no_result_partial_report({'offer_id': 'fixture', 'workspace': str(ws)})
+            self.assertIn('Commits verified on origin/main', report['report'])
+            self.assertIn(first, report['report'])
+            self.assertNotIn(second, report['report'])
+            git('push', '-q', 'origin', 'main')
+            self.assertEqual(ld.describe_partial_work(str(ws))['pushed_commits'], [second, first])
+            git('remote', 'set-url', 'origin', str(root / 'absent.git'))
+            report = d._no_result_partial_report({'offer_id': 'fixture', 'workspace': str(ws)})
+            self.assertIn('Push status unverified', report['report'])
+
+    def test_push_observation_withholds_overflow_and_cleans_its_timed_out_process(self):
+        import time
+        # Git's configured alias executes only our short-lived Python fixture.
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(['git', 'init', '-q', tmp], check=True)
+            args = ['-c', 'alias.fixture=!'+sys.executable+' -c "import time; time.sleep(20)"', 'fixture']
+            started = time.monotonic()
+            self.assertIsNone(ld._git_evidence(tmp, args, started + .15))
+            self.assertLess(time.monotonic() - started, 3)
+            args = ['-c', 'alias.fixture=!'+sys.executable+' -c "print(chr(120)*5000)"', 'fixture']
+            self.assertIsNone(ld._git_evidence(tmp, args, time.monotonic() + 3))
+
     def test_generic_phrase_gone_and_wall_time_present(self):
         for info in ({}, {'code': 1}, {'signal': 9}, {'code': 0}):
             result = runtime_diagnostic(dict(RECORD, runtime_exit=info), TOMB,

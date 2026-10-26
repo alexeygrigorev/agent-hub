@@ -1329,6 +1329,10 @@ class Dispatcher:
         bits = ['Agent exited without a valid structured report (failed-with-partial-work).']
         if commits:
             bits.append('Recent commits: ' + '; '.join(commits))
+            pushed = [sha for sha in partial.get('pushed_commits', [])
+                      if isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}', sha)][:5]
+            bits.append('Commits verified on origin/main (ownership unproven): ' + ', '.join(pushed)
+                        if pushed else 'Push status unverified; recent commits are local observations.')
         if dirty:
             bits.append('Uncommitted worktree changes: ' + '; '.join(dirty))
         else:
@@ -2755,10 +2759,10 @@ class Dispatcher:
             if forwarded:
                 result.update(forwarded)
             else:
-                result.update(state='failed', report_status='failed', report=(evidence['outcome'] +
-                    '; observed commits: ' + ', '.join(evidence['observed_commits']) +
-                    '; dirty paths: ' + ', '.join(evidence['dirty_paths']) +
-                    '; last output: ' + evidence['log_tail'])[:4096])
+                partial = self._no_result_partial_report(immediate)
+                result.update(state='failed', report_status='failed',
+                    report=(partial['report'] + '; last output: ' + evidence['log_tail'])[:4096],
+                    artifacts=partial.get('artifacts', []))
         if offer.get('task_id') and result.get('confirmed_exit'):
             from .routing import read_text
             try:

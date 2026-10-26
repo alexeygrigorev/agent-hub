@@ -371,6 +371,87 @@ def read_native_screen_crash_tail(state_dir, native_id, *, max_bytes=16384, limi
     return ''
 
 
+def _git_evidence(workspace, args, deadline):
+    """Read at most 4 KiB within one shared deadline; never expose stderr.
+
+    Commands use an isolated process group so timeout/overflow cleanup also
+    covers their own SSH/credential-helper children. No remote URL is read.
+    """
+    import os
+    import selectors
+    import signal
+    import subprocess
+    import time
+    if os.name == 'nt' or time.monotonic() >= deadline:
+        return None
+    process = None
+    complete = False
+    try:
+        process = subprocess.Popen(['git', *args], cwd=workspace,
+            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'},
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        data = bytearray()
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0 or not selector.select(left):
+                    return None
+                chunk = os.read(process.stdout.fileno(), 4096)
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > 4096:
+                    return None
+        code = process.wait(timeout=max(.001, deadline - time.monotonic()))
+        complete = True
+        return code, data.decode('utf-8', 'replace')
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    finally:
+        if process is not None:
+            if not complete:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            process.stdout.close()
+            process.wait(timeout=2)
+
+
+def _verified_pushed_commits(workspace, commits):
+    """Positive origin/main containment only; local observation is not a push.
+
+    A remote observation proves where a commit exists, not who authored or
+    pushed it. Missing objects, failed auth and timeouts remain unverified.
+    The entire optional enrichment shares a three-second budget.
+    """
+    import time
+    deadline = time.monotonic() + 3
+    candidates = []
+    for line in commits[:5]:
+        sha = line.split(' ', 1)[0]
+        if not re.fullmatch(r'[0-9a-f]{7,40}', sha):
+            continue
+        value = _git_evidence(workspace, ['rev-parse', '--verify', sha + '^{commit}'], deadline)
+        if value and value[0] == 0 and re.fullmatch(r'[0-9a-f]{40}\n?', value[1]):
+            candidates.append(value[1].strip())
+    if not candidates:
+        return []
+    remote = _git_evidence(workspace, ['ls-remote', '--exit-code', 'origin', 'refs/heads/main'], deadline)
+    match = re.fullmatch(r'([0-9a-f]{40})\trefs/heads/main\n?', remote[1]) if remote and remote[0] == 0 else None
+    if not match:
+        return []
+    tip = match[1]
+    pushed = []
+    for sha in candidates:
+        ancestor = _git_evidence(workspace, ['merge-base', '--is-ancestor', sha, tip], deadline) if sha != tip else (0, '')
+        if ancestor and ancestor[0] == 0:
+            pushed.append(sha)
+    return pushed
+
+
 def describe_partial_work(workspace, launched_at_ts=None, max_files=20) -> dict:
     """Bounded local description of uncommitted work + recent commits (paths only)."""
     info: dict = {'dirty': [], 'commits': []}
@@ -413,6 +494,12 @@ def describe_partial_work(workspace, launched_at_ts=None, max_files=20) -> dict:
                     info['commits'].append(_redact_secret_shapes(line.strip()))
     except Exception:
         pass
+    if info['commits']:
+        try:
+            info['pushed_commits'] = _verified_pushed_commits(str(workspace), info['commits'])
+        except Exception:
+            # Optional remote provenance must never erase local partial work.
+            info['pushed_commits'] = []
     return info
 
 
