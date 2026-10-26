@@ -1,0 +1,18 @@
+/* TBM quota pacing dashboard. Quota-percent only; real token consumption is unknown. */
+.tbm-pool { border: 1px solid var(--dk-border-default); border-radius: var(--dk-radius-md); padding: var(--dk-space-4); margin-block: var(--dk-space-3); background: var(--dk-bg-muted); min-width: 0; }
+.tbm-pool h3 { font-size: var(--dk-text-md, 1rem); font-weight: var(--dk-weight-semibold); overflow-wrap: anywhere; margin: 0 0 var(--dk-space-2); }
+.tbm-pool-meta { color: var(--dk-text-muted); font-size: var(--dk-text-sm); overflow-wrap: anywhere; }
+.tbm-pool svg { display: block; width: 100%; height: auto; min-height: 140px; overflow: visible; }
+.tbm-factors { font-family: var(--dk-font-mono); font-size: var(--dk-text-xs); overflow-wrap: anywhere; color: var(--dk-text-muted); }
+.tbm-kill { display: flex; flex-wrap: wrap; gap: var(--dk-space-3); align-items: end; margin-block: var(--dk-space-3); }
+.tbm-kill .dk-field { display: grid; gap: var(--dk-space-1); min-width: min(100%, 16rem); }
+.tbm-kill input[type="text"] { min-width: min(100%, 16rem); }
+.tbm-status-active { color: #b91c1c; font-weight: var(--dk-weight-semibold); }
+.tbm-status-idle { color: var(--dk-text-muted); }
+.tbm-note { font-size: var(--dk-text-sm); color: var(--dk-text-muted); }
+.tbm-countdown { font-family: var(--dk-font-mono); font-size: var(--dk-text-xs); }
+@media (max-width: 600px) {
+  .tbm-pool { padding: var(--dk-space-3); }
+  .tbm-pool svg { min-height: 0; }
+  .tbm-kill { flex-direction: column; align-items: stretch; }
+}

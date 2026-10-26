@@ -12,6 +12,7 @@ import { LivenessService } from './liveness';
 import { reconcileAccountCapacity } from './account_capacity';
 import { resolveMachineAliases, projectAliasSessions } from './machine-alias';
 import { freshCatalogs } from './catalog-freshness';
+import { syncTbmFromServerAccounts } from './tbm-ingestion';
 
 export const FLEET_SCHEMA = `
 CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
@@ -222,6 +223,11 @@ function sanitizedQuota(raw: any): any {
       if (value !== null && (typeof value !== 'string' || !PROFILE_LABEL.test(value))) return null;
     } else if (key === 'cooldown_until') {
       if (value !== null && (typeof value !== 'string' || value.length > 64 || !UTC_ISO.test(value) || !Number.isFinite(Date.parse(value)))) return null;
+    } else if (key === 'banked_resets') {
+      if (!Array.isArray(value) || value.length > 32 || value.some(g =>
+        !object(g, ['expires_at', 'available', 'label']) || typeof g.available !== 'boolean' ||
+        typeof g.expires_at !== 'string' || !UTC_ISO.test(g.expires_at) || !Number.isFinite(Date.parse(g.expires_at)) ||
+        typeof g.label !== 'string' || !/^[A-Za-z0-9 ._-]{0,80}$/.test(g.label))) return null;
     } else return null;
     details[key] = value;
   }
@@ -1235,6 +1241,8 @@ export class FleetService {
             } catch { /* keep the field absent */ }
           }
           this.sql.exec('INSERT INTO fleet_subscriptions VALUES (?, ?, ?, ?, ?, ?)', caller.machineId!, s.account, s.service, s.plan, new Date(this.now()).toISOString(), JSON.stringify(s.quota));
+          syncTbmFromServerAccounts(this.sql, [{ account: s.account, provider: s.service, quota: s.quota }],
+            Date.parse(s.quota.observed_at));
         }
         return response({ status: 'reported' });
       });
