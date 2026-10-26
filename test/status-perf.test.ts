@@ -20,6 +20,8 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
       h.sql.exec('INSERT INTO credentials(id,kind,token_hash,family_id,subject,machine_id,actor,scopes,created_by_sub,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
         'perf-credential', 'host', hash, 'perf-family', 'host:perf-host', 'perf-host', 'host:perf-host', '["host"]', 'perf-operator', now, new Date(Date.now() + 86400000).toISOString());
       h.sql.exec("UPDATE machines SET credential_id='perf-credential' WHERE id='perf-host'");
+      h.sql.exec('INSERT INTO credentials(id,kind,token_hash,family_id,subject,actor,scopes,created_by_sub,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+        'perf-owner','agent','synthetic-owner-hash','perf-owner-family','perf-owner','perf:owner','[]','perf-operator',now,new Date(Date.now()+86400000).toISOString());
       for (let i = 0; i < 500; i++) {
         const id = `perf-task-${String(i).padStart(4, '0')}`;
         const history = Array.from({length: 40}, (_, j) => ({ kind: 'note', text: 'Synthetic retained history. '.repeat(20), captured_at: Date.now(), id: `${id}-${j}` }));
@@ -40,6 +42,9 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
             `perf-host/native-${i}`, `decision-${i}-${j}`, 'resume_on_reset', 'perf:owner', 'Synthetic', at);
         }
       }
+      h.sql.exec("UPDATE session_control_sessions SET owner_token_id='perf-owner',owner_family='perf-owner-family',session_type='headless' WHERE actor='perf:owner'");
+      for(let i=0;i<850;i++) h.sql.exec('INSERT INTO session_lifecycle_observations VALUES(?,?,?,?,?)',
+        `perf-host/native-${i}`,'perf-host',`native-${i}`,now,'{"waiting_input":false,"report_written":false}');
       h.sql.exec('INSERT INTO fleet_catalog_seen VALUES (?,?)','perf-host',now);
       // Keep 56 genuine reconciliation rows after excluding unchanged live
       // natives, with production-sized bindings to exercise the batched lookup.
@@ -108,6 +113,19 @@ it('keeps status and host handlers below 100ms p95 with retained production-scal
     expect(times[18]).toBeGreaterThan(0);
     expect.soft(times[18], `${method} ${path}`).toBeLessThan(100);
   }
+  // Managed sessions share creator credentials. A census write invalidates
+  // lifecycle facts; cold status must not re-query that creator per session.
+  const coldPost:number[]=[];
+  for(let i=0;i<20;i++) {
+    await inDO(stub,(h:any)=>h.sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE machine_id='perf-host' AND native_id='native-0'",new Date(Date.now()+i).toISOString()).toArray());
+    const start=performance.now();
+    const response=await stub.fetch('https://hub.test/api/status',{method:'POST',headers:{Cookie:cookie,'x-csrf-token':'perf'},body:'{}'});
+    coldPost.push(performance.now()-start);
+    expect(response.status).toBe(200);await response.json();
+  }
+  coldPost.sort((a,b)=>a-b);
+  console.log(`DO fetch/headers POST status after native write p50=${coldPost[9]}ms p95=${coldPost[18]}ms`);
+  expect.soft(coldPost[18],'POST status after native write').toBeLessThan(100);
   // A real host census changes activity before watchdog. Warm-only reads
   // would miss expensive canonical projection rebuilds after that write.
   const invalidatedWatchdog:number[]=[];

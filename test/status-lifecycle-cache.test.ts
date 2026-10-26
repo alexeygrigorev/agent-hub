@@ -182,3 +182,36 @@ it('retries agent observations after a failed read instead of caching incomplete
   } finally {service.rows=rows;}
  });
 });
+
+
+it('reads shared creator provenance once per build and refreshes missing or changed credentials',async()=>{
+  const stub=(env as any).HUB.get((env as any).HUB.idFromName('creator-provenance-batch'));
+  await inDO(stub,(h:any)=>{
+    seed(h);
+    const ids=new Set([id]);
+    for(let i=10;i<35;i++) {
+      const next=`00000000-0000-4000-8000-${String(i).padStart(12,'0')}`;
+      h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,session_type,state,binding_json,owner_token_id,owner_family,created_at,updated_at)
+        SELECT ?,actor,?,request_json,machine_id,engine,mode,session_type,state,?,owner_token_id,owner_family,created_at,updated_at FROM session_control_sessions WHERE id=?`,
+        next,next,JSON.stringify({native_id:`creator-native-${i}`,workspace:'/cache'}),id);
+      ids.add(next);
+    }
+    let reads=0;
+    const measured=new Proxy(h.sql,{get(target,key){
+      if(key==='exec') return (query:string,...args:any[])=>{
+        if(query.startsWith('SELECT kind, actor, subject, created_by_sub, family_id FROM credentials')) reads++;
+        return target.exec(query,...args);
+      };
+      return target[key];
+    }});
+    const read=()=>{reads=0;const value=buildSessionInputs(measured,ids);expect(reads).toBe(1);expect(value.inputs).toHaveLength(26);return value;};
+    expect(read().refs.get('cache-host/cache-native')?.protected_session).toBe(false);
+    h.sql.exec("UPDATE credentials SET family_id='changed' WHERE id='cache-owner'");
+    expect(read().refs.get('cache-host/cache-native')?.protected_session).toBe(true);
+    h.sql.exec("UPDATE session_control_sessions SET owner_token_id='missing'");
+    expect(read().refs.get('cache-host/cache-native')?.protected_session).toBe(true);
+    h.sql.exec("UPDATE session_control_sessions SET owner_token_id='cache-owner'");
+    h.sql.exec("UPDATE credentials SET family_id='cache-family' WHERE id='cache-owner'");
+    expect(read().refs.get('cache-host/cache-native')?.protected_session).toBe(false);
+  });
+});

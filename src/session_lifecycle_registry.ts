@@ -384,6 +384,10 @@ export function buildSessionInputs(sql: SqlStorage, sessionIds?: Set<string>): {
   } catch { protectionKnown = false; }
   const inputs: SessionInput[] = [];
   const refs = new Map<string, LifecycleRefs>();
+  // Creator provenance is immutable during this synchronous read. Many
+  // sessions share one creator; never repeat its lookup for every session.
+  // Keep this cache local so credential changes are visible on the next build.
+  const creators = new Map<string, any>();
   for (const base of joinedBases(sql, sessionIds)) {
     const request = base.sc?.request_json ? parsed(base.sc.request_json, {}) : {};
     const starter: string | null =
@@ -399,7 +403,11 @@ export function buildSessionInputs(sql: SqlStorage, sessionIds?: Set<string>): {
     const binding = parsed(base.sc?.binding_json, null);
     let creator: any = null;
     if (base.sc?.owner_token_id) {
-      try { creator = sql.exec('SELECT kind, actor, subject, created_by_sub, family_id FROM credentials WHERE id = ?', base.sc.owner_token_id).toArray()[0]; } catch {}
+      const id = base.sc.owner_token_id;
+      if (!creators.has(id)) {
+        try { creator = sql.exec('SELECT kind, actor, subject, created_by_sub, family_id FROM credentials WHERE id = ?', id).toArray()[0]; } catch {}
+        creators.set(id, creator);
+      } else creator = creators.get(id);
     }
     const humanCreatorKnown = creator?.kind === 'human' && creator.actor === base.sc?.actor &&
       creator.actor?.startsWith('human:') && creator.created_by_sub === creator.actor.slice(6) &&
