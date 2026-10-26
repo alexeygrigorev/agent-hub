@@ -166,6 +166,14 @@ def terminal_evidence(record, tombstone, *, git=subprocess.run, state_dir=None):
     if isinstance(durable, dict):
         native_exit = {**native_exit, **durable}
         record['runtime_exit'] = native_exit
+    # Managed headless output is captured before native can delete history.
+    # Read this even after a prior census: it can contain the final output
+    # produced between the last sample and a sub-second natural retirement.
+    from .headless_output import retained
+    capture = retained(record)
+    if capture and capture['log_tail']:
+        saved = dict(saved, log_tail=capture['log_tail'], log_source='managed_headless_output')
+        record['exit_evidence'] = saved
     if not saved.get('log_tail') and isinstance(record.get('runtime_tail'), str):
         saved = dict(saved, log_tail=sanitize(record['runtime_tail']))
     # Fast launches may retire between catalog samples. These fixed, no-follow

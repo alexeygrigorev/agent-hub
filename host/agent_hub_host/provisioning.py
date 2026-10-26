@@ -1461,11 +1461,18 @@ def execute():
                 sys.exit(75)
         for var in ('HUB_CONFIG_FILE', 'HUB_TOKEN', 'HUB_JOB_TOKEN', 'AGENT_HUB_MANAGED_DIR', 'HUB_MANAGED_DIR'):
             env.pop(var, None)
-        if os.name == 'nt':
-            res = subprocess.run(argv, env=env)
-            sys.exit(res.returncode)
-        else:
-            os.execve(command[0], argv, env)
+    # Release the provisioning lock before any long-lived provider process.
+    # Headless output must be retained before native automatic retirement;
+    # native containment/exit receipts still determine the session outcome.
+    if os.name != 'nt' and not is_diagnostic:
+        from . import headless_output
+        if headless_output.identity(env, PACKAGES[b['provider']][2]) is not None:
+            headless_output.exit_like_child(headless_output.run(argv, env, PACKAGES[b['provider']][2]))
+    if os.name == 'nt':
+        res = subprocess.run(argv, env=env)
+        sys.exit(res.returncode)
+    else:
+        os.execve(command[0], argv, env)
 
 
 def admission():

@@ -1227,6 +1227,47 @@ def test_execute_bypasses_permissions_for_goal_and_interactive(tmp_path, monkeyp
     calls.clear()
 
 
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX headless output wrapper')
+def test_managed_headless_capture_releases_provisioning_lock_and_keeps_scrubbed_env(tmp_path, monkeypatch):
+    from agent_hub_host import headless_output
+    root_dir = tmp_path / 'managed'
+    root_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(p, 'root', lambda: root_dir)
+    b = bundle()
+    dest = root_dir / (b['label'] + '-' + b['revision'])
+    dest.mkdir(mode=0o700)
+    p.write_json(dest / 'bundle.json', b)
+    p.write_json(root_dir / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': b['provider']}])
+    native = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+    offer = '11111111-2222-4333-8444-555555555555'
+    monkeypatch.setenv('APLEXER_SESSION_ID', native)
+    monkeypatch.setenv('APLEXER_TAG', 'task-hub-' + offer)
+    monkeypatch.setenv('APLEXER_WORKSPACE', str(tmp_path))
+    monkeypatch.setenv('HUB_TOKEN', 'operator-synthetic-token')
+    monkeypatch.setenv('HUB_CONFIG_FILE', '/operator/config.json')
+    monkeypatch.setattr(p, 'check_codex_quota_gate', lambda env: (True, 'ok'))
+    # A real child must acquire this same lock immediately. Keeping the parent
+    # lock throughout capture would block all other managed launches.
+    code = ('import os,fcntl; '
+            'fd=os.open(' + repr(str(root_dir / 'reconcile.lock')) + ',os.O_RDWR); '
+            'fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB); '
+            'assert "HUB_TOKEN" not in os.environ; '
+            'assert "HUB_CONFIG_FILE" not in os.environ; '
+            'print("headless child acquired released lock",flush=True); raise SystemExit(3)')
+    monkeypatch.setattr(p, 'engine_argv', lambda *_: [sys.executable, '-c', code])
+    monkeypatch.setattr(sys, 'argv', ['execute', b['label'], '/goal small real task'])
+    with pytest.raises(SystemExit) as ended:
+        p.execute()
+    assert ended.value.code == 3
+    path = tmp_path / '.local/hub-headless-output' / (offer + '.json')
+    value = json.loads(path.read_text())
+    assert value['engine'] == 'codex'
+    assert value['native_id'] == native
+    assert value['capture_state'] == 'complete'
+    assert 'acquired released lock' in value['log_tail']
+    assert 'operator-synthetic-token' not in path.read_text()
+
+
 def test_ensure_toml_trusted_projects():
     initial = 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n\n[projects."/home/alexey"]\ntrust_level = "trusted"\n'
     res = p.ensure_toml_trusted_projects(initial, ['/home/alexey', '/tmp/foo/bar', '/home/alexey/git'])
