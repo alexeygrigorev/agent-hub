@@ -15,14 +15,14 @@ import subprocess
 import time
 
 from . import private_fs
-from .workclaim import redact_for_bus
+from .log_redaction import redact_log
 
 UUID = re.compile(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}')
-ANSI = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))')
 
 
 def utf16_clip(text, limit, *, tail=False):
     """Use the Hub's JavaScript string budget without splitting a code point."""
+    text = ''.join('\ufffd' if 0xd800 <= ord(c) <= 0xdfff else c for c in text)
     chars = []
     used = 0
     for char in reversed(text) if tail else text:
@@ -50,6 +50,11 @@ def bound_finish_fields(payload):
                     item[key] = utf16_clip(sanitize(item[key], 65536), limit)
             artifacts.append(item)
         out['artifacts'] = artifacts
+    if isinstance(out.get('diagnostic'), dict):
+        out['diagnostic'] = dict(out['diagnostic'])
+        for key, limit in (('message', 300), ('tail', 1024)):
+            if isinstance(out['diagnostic'].get(key), str):
+                out['diagnostic'][key] = utf16_clip(sanitize(out['diagnostic'][key], 65536), limit)
     return out
 
 
@@ -58,9 +63,7 @@ def sanitize(text, limit=2048):
     # credential. Drop control bytes and bare Bearer values as a backstop.
     if not isinstance(text, str):
         return ''
-    text = ANSI.sub('', text)
-    text = re.sub(r'(?i)\bBearer\s+[^\s\"\x27,;]+', 'Bearer [REDACTED]', text)
-    text = redact_for_bus(text)
+    text = redact_log(text)
     text = re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', text)
     return utf16_clip(text, limit, tail=True)
 

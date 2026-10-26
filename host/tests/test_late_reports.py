@@ -170,3 +170,27 @@ class LateReports(unittest.TestCase):
                 cleanup.assert_not_called()
             d.request.assert_not_called()
             self.assertNotIn('terminal_payload',record)
+
+
+    def test_lost_response_restart_preserves_original_authentication_diagnostic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d,cfg,record=self.fixture(tmp)
+            record.update(state='running',settled=False)
+            cfg['launcher']=dict(argv=['launcher'],root=tmp,config_dir=str(Path(tmp)/'launcher'))
+            diagnostic=dict(reason='engine_auth_expired',message='Engine authentication expired.',
+                            error_type='AuthenticationError',stage='launcher_run')
+            payload=dict(state='failed',confirmed_exit=True,native_id=NATIVE,
+                         launcher_task_id=record['task_id'],diagnostic=diagnostic,
+                         report_status='failed',report='Authentication failed before completion',artifacts=[])
+            d.request=Mock(side_effect=TimeoutError('response lost after server commit'))
+            self.assertFalse(late_reports.acknowledge(d,record,payload,False))
+            restarted=Dispatcher(cfg)
+            restarted.request=Mock(return_value=dict(id=OFFER,state='failed'))
+            restarted.runner=Mock(return_value=dict(state='completed-awaiting-review',native_id=NATIVE,resources_reserved=False))
+            with patch.object(restarted,'_check_headless_health',return_value=None), \
+                 patch('agent_hub_host.fleet.verify_native_retirement',return_value=(True,dict(finished_at_ms=3100),'verified')), \
+                 patch.object(restarted,'_maybe_cleanup_worktree'):
+                results=restarted.reconcile_launches()
+            self.assertEqual(results[0]['state'],'failed')
+            self.assertEqual(restarted.request.call_args.args[2]['diagnostic'],diagnostic)
+            self.assertTrue(restarted._active_launches[OFFER]['settled'])

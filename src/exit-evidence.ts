@@ -1,5 +1,15 @@
 import { redactForBus } from './work_claim';
 
+/** Redact the full bounded window before truncating any published field. */
+export function redactExitText(text: string): string {
+  if (text.length > 65536) return '';
+  text = text.replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g, '')
+    .replace(/\bBearer\s+[^\s"',;]+/gi, 'Bearer [redacted]')
+    .replace(/((?:authorization|cookie|set-cookie)\s*:\s*)[^\r\n]*/gim, '$1[redacted]')
+    .replace(/(["']?\b(?:password|passwd|secret|token|access_token|refresh_token|api[_-]?key|authorization|cookie|set-cookie|aws_secret_access_key)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)/gi, '$1[redacted]');
+  return String(redactForBus(text)).replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
+}
+
 /** Host evidence is informational; it never establishes native retirement. */
 export function sanitizeExitEvidence(raw: any): any | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw) ||
@@ -12,8 +22,6 @@ export function sanitizeExitEvidence(raw: any): any | null {
       !['reported', 'failed-with-partial-work', 'failed-without-report'].includes(raw.outcome) ||
       !Array.isArray(raw.observed_commits) || raw.observed_commits.length > 8 || raw.observed_commits.some((s: any) => typeof s !== 'string' || !/^[a-f0-9]{40}$/.test(s)) ||
       !Array.isArray(raw.dirty_paths) || raw.dirty_paths.length > 16 || raw.dirty_paths.some((s: any) => typeof s !== 'string' || s.length > 256)) return null;
-  const clean = (s: string) => String(redactForBus(s))
-    .replace(/\bBearer\s+[^\s"',;]+/gi, 'Bearer [REDACTED]')
-    .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
-  return { ...raw, log_tail: clean(raw.log_tail), dirty_paths: raw.dirty_paths.map(clean) };
+  const clean = redactExitText;
+  return { ...raw, log_tail: clean(raw.log_tail).slice(0, 2048).replace(/[\uD800-\uDBFF]$/, ''), dirty_paths: raw.dirty_paths.map((s: string) => clean(s).slice(0, 256).replace(/[\uD800-\uDBFF]$/, '')) };
 }

@@ -62,6 +62,33 @@ function history(sql: any, taskId: string): any[] {
 }
 
 describe('fleet finish-report ingestion (intake 88b3260d AC1)', () => {
+  it('redacts quoted secrets and cookies at runtime/report/artifact storage boundaries', async () => setup(async (s, _intake, sql) => {
+    const launchId=uuid(), sessionId=uuid(), taskId=uuid();
+    seedIntake(sql,taskId);seedLaunch(sql,launchId,sessionId,taskId);
+    const secret='{"password":"short-test-value"}\nCookie: session=other-short-value';
+    const payload={state:'exited',confirmed_exit:true,native_id:'native-1',launcher_task_id:'hub-'+launchId,
+      report_status:'done',report:secret,artifacts:[{label:secret,text:secret}],
+      runtime:{exit_code:0,exit_signal:null,wall_time_ms:1000,log_tail:secret,engine_outcome:'succeeded',observed_commits:[],dirty_paths:[],outcome:'reported'}};
+    expect((await s.handle(request('/launches/'+launchId+'/result',payload),host('hetzner'))).status).toBe(200);
+    const stored=sql.exec('SELECT runtime_json FROM fleet_launches WHERE id=?',launchId).one().runtime_json;
+    for(const value of [stored,JSON.stringify(history(sql,taskId))]) {
+      expect(value).not.toContain('short-test-value');expect(value).not.toContain('other-short-value');
+    }
+  }));
+  it('replays an exact diagnostic after a lost response despite journal key order', async () => setup(async (s, _intake, sql) => {
+    const launchId=uuid(),sessionId=uuid(),taskId=uuid();seedIntake(sql,taskId);seedLaunch(sql,launchId,sessionId,taskId);
+    const diagnostic={reason:'engine_auth_expired',message:'Engine authentication expired.',error_type:'AuthenticationError',stage:'launcher_run'};
+    const payload={state:'failed',confirmed_exit:true,native_id:'native-1',launcher_task_id:'hub-'+launchId,diagnostic,
+      report_status:'failed',report:'Authentication failed before completion',artifacts:[]};
+    const path='/launches/'+launchId+'/result';
+    expect((await s.handle(request(path,payload),host('hetzner'))).status).toBe(200);
+    const reordered=Object.fromEntries(Object.entries(diagnostic).sort(([a],[b])=>a.localeCompare(b)));
+    expect((await s.handle(request(path,{...payload,diagnostic:reordered}),host('hetzner'))).status).toBe(200);
+    expect((await s.handle(request(path,{...payload,diagnostic:{...diagnostic,stage:'runtime'}}),host('hetzner'))).status).toBe(409);
+    expect((await s.handle(request(path,{...payload,native_id:'another'}),host('hetzner'))).status).toBe(409);
+    expect(JSON.parse(sql.exec('SELECT launch_error_json FROM fleet_launches WHERE id=?',launchId).one().launch_error_json)).toEqual(diagnostic);
+    expect(history(sql,taskId).filter(e=>e.actor==='hub:service:fleet-finish')).toHaveLength(1);
+  }));
   it('stores sanitized exit evidence on success and failure without changing replay identity', async () => setup(async (s, _intake, sql) => {
     for (const state of ['exited', 'failed']) {
       const launchId = uuid(), sessionId = uuid(), taskId = uuid();

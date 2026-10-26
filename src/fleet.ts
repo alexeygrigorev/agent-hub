@@ -1,6 +1,5 @@
 import { jsonFields, initResourceRequestProjection } from './sql-json-projection';
-import { redactForBus } from './work_claim';
-import { sanitizeExitEvidence } from './exit-evidence';
+import { sanitizeExitEvidence, redactExitText } from './exit-evidence';
 import {sanitizeCpuAdmission} from './cpu-headroom';
 import { launcherDiskHeadroom } from './launcher-disk';
 /** Generic account registry and placement. Provider credentials never enter this service. */
@@ -1674,6 +1673,24 @@ export class FleetService {
             (diagnostic.wall_time_ms !== undefined && (!Number.isSafeInteger(diagnostic.wall_time_ms) || diagnostic.wall_time_ms < 0)) ||
             (diagnostic.tail !== undefined && (typeof diagnostic.tail !== 'string' || diagnostic.tail.length > 1024 || /[\x00-\x1f\x7f]/.test(diagnostic.tail))) ||
             (diagnostic.cpu !== undefined && !sanitizeCpuAdmission(diagnostic.cpu)))) return response({ error: 'invalid_launch_diagnostic' }, 400);
+        if (diagnostic) {
+          diagnostic.message = redactExitText(diagnostic.message).slice(0, 300);
+          if (diagnostic.tail !== undefined) diagnostic.tail = redactExitText(diagnostic.tail).slice(0, 1024);
+        }
+        // Replay the original diagnostic after an ambiguous delivery. Journal
+        // serialization may reorder object keys; compare JSON values, not bytes.
+        const sameDiagnostic = diagnostic !== undefined && !!row.launch_error_json &&
+          sameJsonValue(parsed(row.launch_error_json), diagnostic);
+        if (row.mode === 'headless' && ['exited', 'failed'].includes(row.state) &&
+            data.state === row.state && data.confirmed_exit === true && sameDiagnostic &&
+            object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'diagnostic', 'report_status', 'report', 'artifacts', 'runtime']) &&
+            !!row.native_id && data.native_id === row.native_id &&
+            !!row.launcher_task_id && data.launcher_task_id === row.launcher_task_id &&
+            !this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) {
+          if (runtime) this.sql.exec('UPDATE fleet_launches SET runtime_json = ? WHERE id = ?', JSON.stringify(runtime), row.id);
+          this.ingestFinishReport(row.id, data);
+          return response({ id: row.id, state: row.state, replay: true });
+        }
         // An owning host may enrich a legacy failed receipt after collecting
         // runtime evidence. Identity/state stay fixed; no capacity/lifecycle effect.
         if (row.mode === 'headless' && row.state === 'failed' && data.state === 'failed' &&
@@ -1681,7 +1698,7 @@ export class FleetService {
             object(data, ['state', 'native_id', 'launcher_task_id', 'confirmed_exit', 'diagnostic', 'report_status', 'report', 'artifacts', 'runtime']) &&
             !!row.native_id && data.native_id === row.native_id &&
             !!row.launcher_task_id && data.launcher_task_id === row.launcher_task_id &&
-            (!row.launch_error_json || row.launch_error_json === JSON.stringify(diagnostic)) &&
+            (!row.launch_error_json || sameDiagnostic) &&
             !this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) {
           this.sql.exec('UPDATE fleet_launches SET launch_error_json = ?, exit_reason = ? WHERE id = ?', JSON.stringify(diagnostic), diagnostic.reason, row.id);
           if (runtime) this.sql.exec('UPDATE fleet_launches SET runtime_json = ? WHERE id = ?', JSON.stringify(runtime), row.id);
@@ -1976,12 +1993,12 @@ export class FleetService {
       const rawStatus = typeof data?.report_status === 'string' ? data.report_status : null;
       const workerStatus = ['done', 'failed', 'waiting-on-human', 'stuck'].includes(rawStatus || '') ? rawStatus : null;
       const fleetState = data.state === 'exited' ? 'exited' : 'failed';
-      let reportText = typeof data?.report === 'string' ? String(redactForBus(data.report.trim())) : '';
+      let reportText = typeof data?.report === 'string' ? redactExitText(data.report.trim()) : '';
       if (reportText.length > 2000) reportText = reportText.slice(0,2000).replace(/[\uD800-\uDBFF]$/, '') + '…';
       let artifactLine = '';
       if (Array.isArray(data?.artifacts) && data.artifacts.length) {
         const labels = (data.artifacts as any[])
-          .map((a: any) => String(redactForBus(a.label)).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '').slice(0, 120))
+          .map((a: any) => redactExitText(a.label).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '').slice(0, 120))
           .filter((l: string) => l);
         if (labels.length) artifactLine = `\nArtifacts: ${labels.join(', ').slice(0, 500)}`;
       }
@@ -2004,4 +2021,11 @@ export class FleetService {
       this.sql.exec('UPDATE intake_meta SET revision = revision + 1 WHERE id = 1');
     } catch { /* best-effort: a finish-report append must never fail the terminal receipt */ }
   }
+}
+
+function sameJsonValue(a: any, b: any): boolean {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) !== Array.isArray(b)) return false;
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length && keys.every(k => Object.hasOwn(b, k) && sameJsonValue(a[k], b[k]));
 }

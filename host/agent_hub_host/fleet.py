@@ -1719,6 +1719,8 @@ class Dispatcher:
                         "error_type": "AuthenticationError",
                         "stage": "dispatch_headless",
                     }
+            if isinstance(cached, dict) and isinstance(cached.get('diagnostic'), dict):
+                result_payload['diagnostic'] = cached['diagnostic']
             if result_payload.get('diagnostic'):
                 record['diagnostic'] = result_payload['diagnostic']
             from .late_reports import acknowledge

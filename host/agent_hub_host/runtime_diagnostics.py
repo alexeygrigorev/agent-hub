@@ -15,18 +15,8 @@ def _sanitize_tail(text, limit=1024):
     (no newlines/tabs); lines joined with ' | '.
     """
     try:
-        raw = str(text or '')
-        if len(raw) > 65536:
-            return ''  # Never clip away the prefix identifying a secret.
-        from .workclaim import redact_for_bus
-        raw = re.sub(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))', '', raw)
-        raw = raw.replace('\x00', '')
-        raw = re.sub(r'(?i)\bbearer\s+[^\s\"\x27,;]+', 'Bearer [redacted]', raw)
-        raw = re.sub(r'(?im)((?:authorization|cookie|set-cookie)\s*:\s*)[^\r\n]*', r'\1[redacted]', raw)
-        raw = re.sub(
-            r'''(?ix)(["']?\b(?:password|passwd|secret|token|access_token|refresh_token|api[_-]?key|authorization|cookie|set-cookie|aws_secret_access_key)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)''',
-            r'\1[redacted]', raw)
-        raw = redact_for_bus(raw)
+        from .log_redaction import redact_log
+        raw = redact_log(str(text or ''))
     except Exception:
         return ''
     raw = re.sub(r'\x1b\[[0-9;]*m', '', raw)
