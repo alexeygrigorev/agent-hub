@@ -64,6 +64,8 @@ _ALLOWED_CONFIG_KEYS = frozenset({
     "critical_threshold_percent",
     "endpoint",
     "services",
+    "runtime_services",
+    "runtime_cooldown_s",
     "budget",
     "storage_paths",
     "storage_soft_bytes",
@@ -1559,6 +1561,19 @@ class HostHealthMonitor:
             runner_fn=self._runner_fn,
             open_fn=self._open_fn,
         )
+
+        from .service_health import collect_runtime_services
+        runtime_services = collect_runtime_services(
+            cfg.get("runtime_services"), now=now_epoch,
+            cooldown_s=cfg.get("runtime_cooldown_s", 300))
+        # Service IDs are one namespace. Conflicting configuration cannot replace
+        # an independently confirmed positive with unknown/healthy data.
+        merged = {}
+        for service in services_list + runtime_services:
+            key = service["service_id"]
+            if key not in merged or service.get("worker") == "broken":
+                merged[key] = service
+        services_list = sorted(merged.values(), key=lambda row: row.get("worker") != "broken")[:16]
 
         budget_cfg = self._budget_evidence if self._budget_evidence is not None else cfg.get("budget")
         budget_payload = collect_cloud_budget(budget_cfg, now=now_epoch)
