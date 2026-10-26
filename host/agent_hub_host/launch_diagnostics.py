@@ -200,62 +200,49 @@ def check_engine_auth_expired(raw='', engine=None, cwd=None, task_id=None, launc
 
 
 def retain_per_session_opencode_log(log_offsets, dest_path, max_bytes=65536, engine=None) -> str | None:
-    """Copy the bounded opencode log delta since launch into the session's .local dir.
+    """Retain complete bounded new logs, filtered before any excerpt is taken.
 
-    Local-only retention (never uploaded to Hub as-is); callers forward only a
-    sanitized tail. Only opencode/go engines produce opencode logs; other
-    engines (or an empty/unknown offset map) retain nothing so one session's
-    activity is never attributed to another. Best-effort: returns the written
-    path or None.
+    A saved offset can lie inside a multiline credential, so shared-log deltas
+    and oversized files are withheld. The exact native incarnation's private
+    hub-session-logs snapshot remains the primary per-session output evidence.
     """
     try:
+        from . import private_fs
+        from .log_redaction import redact_log
         if engine is not None and engine not in ('opencode', 'go'):
             return None
-        offsets = log_offsets if isinstance(log_offsets, dict) else {}
-        if not offsets:
+        if not isinstance(log_offsets, dict) or not log_offsets:
             return None
-        dest = Path(dest_path)
-        if dest.is_symlink():
+        if type(max_bytes) is not int or not 0 < max_bytes <= 65536:
             return None
-        dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        wrote_any = False
-        with open(dest, 'wb') as out:
-            for log_path in get_opencode_log_paths():
-                try:
-                    key = str(log_path)
-                    start_offset = offsets.get(key, 0) if isinstance(offsets, dict) else 0
-                    if not isinstance(start_offset, int) or start_offset < 0:
-                        start_offset = 0
-                    size = log_path.stat().st_size
-                    if size <= start_offset:
-                        continue
-                    with open(log_path, 'rb') as f:
-                        if start_offset > 0 and start_offset < size:
-                            f.seek(start_offset)
-                        elif size > max_bytes:
-                            f.seek(size - max_bytes)
-                        chunk = f.read(max_bytes)
-                    if chunk:
-                        from .log_redaction import redact_log
-                        chunk = redact_log(chunk.decode('utf-8', 'replace')).encode('utf-8')
-                        if wrote_any and out.tell() + len(chunk) > max_bytes:
-                            break
-                        out.write(chunk[-max_bytes:])
-                        wrote_any = True
-                except Exception:
-                    continue
-        if not wrote_any:
+        chunks = []
+        used = 0
+        for log_path in get_opencode_log_paths():
             try:
-                dest.unlink()
-            except Exception:
-                pass
+                offset = log_offsets.get(str(log_path), 0)
+                if type(offset) is not int or offset != 0:
+                    continue
+                # Read from byte zero only; never discard privacy context.
+                with private_fs.parent(log_path, private=False) as anchor:
+                    fd = private_fs._open(anchor, log_path, os.O_RDONLY, private=False)
+                    with os.fdopen(fd, 'rb') as stream:
+                        if os.fstat(stream.fileno()).st_size > max_bytes:
+                            continue
+                        raw = stream.read(max_bytes + 1)
+                if not raw or len(raw) > max_bytes:
+                    continue
+                chunk = redact_log(raw.decode('utf-8', 'replace')).encode('utf-8')
+                if used + len(chunk) > max_bytes:
+                    break
+                chunks.append(chunk)
+                used += len(chunk)
+            except (OSError, ValueError):
+                continue
+        if not used:
             return None
-        try:
-            os.chmod(dest, 0o600)
-        except Exception:
-            pass
-        return str(dest)
-    except Exception:
+        private_fs.atomic_write(Path(dest_path), b''.join(chunks), max_bytes)
+        return str(dest_path)
+    except (OSError, ValueError):
         return None
 
 

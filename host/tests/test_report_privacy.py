@@ -12,6 +12,55 @@ OFFER, NATIVE = fixtures.OFFER, fixtures.NATIVE
 
 
 class ReportPrivacy(unittest.TestCase):
+    def test_quoted_multiline_headers_redact_before_screen_and_report_selection(self):
+        from agent_hub_host.launch_diagnostics import read_native_screen_crash_tail
+        from agent_hub_host.log_redaction import redact_log
+        for key in ['authorization', 'Cookie', 'Set-Cookie']:
+            for quote in ['"', "'"]:
+                with self.subTest(key=key, quote=quote), tempfile.TemporaryDirectory() as tmp:
+                    text = key + ': ' + quote + 'prefix\npanic: short-test-value\nend' + quote
+                    native = Path(tmp) / 'sessions' / NATIVE
+                    native.mkdir(parents=True)
+                    (native / 'screen.txt').write_text(text)
+                    result = bound_finish_fields(dict(report=text, artifacts=[],
+                                                       diagnostic=dict(message=text, tail=text)))
+                    for rendered in [redact_log(text), json.dumps(result),
+                                     read_native_screen_crash_tail(tmp, NATIVE)]:
+                        self.assertNotIn('short-test-value', rendered)
+
+    def test_uncertain_shared_log_offsets_and_oversized_logs_are_withheld(self):
+        from agent_hub_host.fleet import Dispatcher
+        from agent_hub_host import launch_diagnostics as ld
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'opencode.log'
+            dest = Path(tmp) / '.local' / 'log.txt'
+            d = Dispatcher(dict(version=1, subscriptions=[], workspaces={'main': tmp}))
+            for text, offset in [('password="' + 'padding ' * 11000 + '\nshort-test-value"', 0),
+                                 ('password="prefix\nshort-test-value\nend"', 18)]:
+                with self.subTest(offset=offset):
+                    log.write_text(text)
+                    record = dict(workspace=tmp, offer_id=OFFER, engine='opencode',
+                                  log_offsets={str(log): offset})
+                    with patch.object(ld, 'get_opencode_log_paths', return_value=[log]), \
+                            patch.object(ld, 'describe_partial_work', return_value={}):
+                        self.assertIsNone(ld.retain_per_session_opencode_log(record['log_offsets'], dest))
+                        result = bound_finish_fields(d._no_result_partial_report(record))
+                    self.assertFalse(dest.exists())
+                    self.assertNotIn('short-test-value', json.dumps(result))
+                    self.assertEqual(result['status'], 'failed')
+
+    def test_complete_bounded_new_log_is_retained_privately_after_redaction(self):
+        from agent_hub_host import launch_diagnostics as ld
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'opencode.log'
+            dest = Path(tmp) / '.local' / 'log.txt'
+            log.write_text('password="short-test-value"\nSafe work evidence\n')
+            with patch.object(ld, 'get_opencode_log_paths', return_value=[log]):
+                self.assertEqual(ld.retain_per_session_opencode_log({str(log): 0}, dest), str(dest))
+            self.assertNotIn('short-test-value', dest.read_text())
+            self.assertIn('Safe work evidence', dest.read_text())
+            self.assertEqual(dest.stat().st_mode & 0o777, 0o600)
+
     def test_snapshot_and_terminal_publication_redact_full_quoted_and_cookie_values(self):
         cases = ['{"password":"short-test-value"}', "refresh_token='short-test-value'",
                  'Cookie: session=short-test-value; theme=light', 'Set-Cookie: sid=short-test-value',

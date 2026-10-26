@@ -5,8 +5,8 @@ export function redactExitText(text: string): string {
   if (text.length > 65536) return '';
   text = text.replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g, '')
     .replace(/\bBearer\s+[^\s"',;]+/gi, 'Bearer [redacted]')
-    .replace(/((?:authorization|cookie|set-cookie)\s*:\s*)[^\r\n]*/gim, '$1[redacted]')
-    .replace(/(["']?\b(?:password|passwd|secret|token|access_token|refresh_token|api[_-]?key|authorization|cookie|set-cookie|aws_secret_access_key)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s,;]+)/gi, '$1[redacted]');
+    .replace(/(["']?\b(?:password|passwd|secret|token|access_token|refresh_token|api[_-]?key|authorization|cookie|set-cookie|aws_secret_access_key)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s,;]+)/gi, '$1[redacted]')
+    .replace(/((?:authorization|cookie|set-cookie)\s*:\s*)[^\r\n]*/gim, '$1[redacted]');
   return String(redactForBus(text)).replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
 }
 

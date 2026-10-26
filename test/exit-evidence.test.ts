@@ -1,11 +1,20 @@
 import { describe, it, expect } from 'vitest';
-import { sanitizeExitEvidence } from '../src/exit-evidence';
+import { redactExitText, sanitizeExitEvidence } from '../src/exit-evidence';
 
 const evidence = () => ({ exit_code: 0, exit_signal: null, wall_time_ms: 2100,
   log_tail: 'worked then exited', engine_outcome: 'succeeded', observed_commits: ['a'.repeat(40)],
   dirty_paths: [' M host/example.py'], outcome: 'failed-with-partial-work' });
 
 describe('exit evidence boundary', () => {
+  it('removes complete multiline quoted headers before line filtering', () => {
+    for (const key of ['authorization', 'Cookie', 'Set-Cookie']) {
+      for (const quote of ['"', "'"]) {
+        const text = `${key}: ${quote}prefix\npanic: short-test-value\nend${quote}`;
+        expect(redactExitText(text)).not.toContain('short-test-value');
+        expect(sanitizeExitEvidence({ ...evidence(), log_tail: text }).log_tail).not.toContain('short-test-value');
+      }
+    }
+  });
   it('preserves measured exit data and partial work, sanitizes before storage', () => {
     const raw = evidence();
     raw.log_tail = 'Bearer sensitive-value\nhubt_fake-private-value\x00';
