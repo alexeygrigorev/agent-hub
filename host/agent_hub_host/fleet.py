@@ -91,6 +91,15 @@ ROLE_JOBS_CACHE_TTL_S = 120.0
 # one loop owns offers per cycle. fcntl locks release on process death, so
 # a SIGTERMed cycle (TimeoutStartSec=240s) never wedges the other loop.
 CYCLE_LOCK_NAME = "fleet-cycle.lock"
+# Holder metadata ({pid, acquired_at}) is written into the lock file on every
+# acquisition so a loser can tell a sibling that is cycling normally from a
+# wedged one. flock already releases on process death; a live holder whose
+# current acquisition is older than this (2x the timer TimeoutStartSec=240 s;
+# a healthy session-host cycle takes ~90-130 s) or whose recorded pid is gone
+# (fd inherited by a surviving child) is treated as stuck: the loser logs
+# fleet_cycle_lock_takeover and runs the cycle without the lock instead of
+# skipping forever. Override with settings "cycle_lock_stale_s".
+CYCLE_LOCK_STALE_S = 480.0
 
 # Intake 4398ce2a: the full fleet cycle (provisioning, probes, reconcile,
 # watchdog, quota...) takes minutes on RMTHZ, but placement treats launcher
@@ -812,6 +821,40 @@ def find_binding_row(rows, entry):
     if type(row.get("created_at_ms")) is not int or row["created_at_ms"] <= 0:
         return None
     return row
+
+
+
+def _write_cycle_lock_owner(fh) -> None:
+    """Record {pid, acquired_at} in a freshly acquired cycle lock file."""
+    try:
+        fh.seek(0)
+        fh.truncate()
+        fh.write(json.dumps({"pid": os.getpid(), "acquired_at": time.time()}).encode("ascii"))
+        fh.flush()
+    except Exception:
+        pass  # Metadata is advisory; the flock is the lock.
+
+
+def _read_cycle_lock_owner(path) -> dict:
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(512)
+        data = json.loads(raw.decode("ascii")) if raw else {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 class Dispatcher:
@@ -2536,9 +2579,37 @@ class Dispatcher:
                 except Exception:
                     pass
                 return False
+            _write_cycle_lock_owner(fh)
             return fh
         except Exception:
             return None
+
+    def _cycle_lock_stale_s(self) -> float:
+        try:
+            value = float((self.settings or {}).get("cycle_lock_stale_s", CYCLE_LOCK_STALE_S))
+        except (TypeError, ValueError):
+            return CYCLE_LOCK_STALE_S
+        return value if value > 0 else CYCLE_LOCK_STALE_S
+
+    def _cycle_lock_holder(self, now: Optional[float] = None) -> dict:
+        """Describe the current cycle-lock holder for a losing caller.
+
+        Returns {holder_pid, held_s, holder_alive, stale}. Missing/garbled
+        metadata (pre-upgrade holder) is never stale: skip as before.
+        """
+        info: dict[str, Any] = {"holder_pid": None, "held_s": None, "holder_alive": None, "stale": False}
+        path = self._cycle_lock_path()
+        if path is None:
+            return info
+        owner = _read_cycle_lock_owner(path)
+        pid, acquired_at = owner.get("pid"), owner.get("acquired_at")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0                 or not isinstance(acquired_at, (int, float)):
+            return info
+        held_s = max(0.0, (time.time() if now is None else now) - float(acquired_at))
+        alive = _pid_alive(pid)
+        info.update(holder_pid=pid, held_s=round(held_s, 1), holder_alive=alive,
+                    stale=(not alive) or held_s > self._cycle_lock_stale_s())
+        return info
 
     def _refresh_checkin(self, hb) -> None:
         """Best-effort checkin refresh between serial dispatches.
@@ -2665,11 +2736,26 @@ class Dispatcher:
         # of racing claims into already_claimed -> +1 cycle delays.
         cycle_lock = self._acquire_cycle_lock()
         if cycle_lock is False:
-            phases['lock'] = 0.0
-            self.last_cycle_phases = phases
-            print(json.dumps({'event': 'fleet_cycle_skipped',
-                              'reason': 'concurrent_cycle'}), flush=True)
-            return [{'id': 'cycle', 'state': 'skipped', 'reason': 'concurrent_cycle'}]
+            holder = self._cycle_lock_holder()
+            if not holder['stale']:
+                phases['lock'] = 0.0
+                self.last_cycle_phases = phases
+                print(json.dumps({'event': 'fleet_cycle_skipped',
+                                  'reason': 'concurrent_cycle',
+                                  'holder_pid': holder['holder_pid'],
+                                  'held_s': holder['held_s']}), flush=True)
+                return [{'id': 'cycle', 'state': 'skipped', 'reason': 'concurrent_cycle'}]
+            # Stuck holder (pid gone, or one acquisition held past
+            # CYCLE_LOCK_STALE_S): never let it starve every other loop.
+            # flock cannot be stolen from a live process, so run this cycle
+            # unlocked; Hub claims stay atomic (losers settle as
+            # already_claimed) and the offers lock still serialises dispatch.
+            print(json.dumps({'event': 'fleet_cycle_lock_takeover',
+                              'holder_pid': holder['holder_pid'],
+                              'held_s': holder['held_s'],
+                              'holder_alive': holder['holder_alive'],
+                              'stale_after_s': self._cycle_lock_stale_s()}), flush=True)
+            cycle_lock = None
         try:
             return self._once_locked(phases, _mark, _skip_telemetry)
         finally:
