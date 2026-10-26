@@ -144,22 +144,22 @@ describe('TBM admission on POST /api/sessions', () => {
   it('provider kill-switch denies only that engine', async () => {
     await setPool({ pool_id: 'claude:main', provider: 'claude', kill_switch_active: 1 });
     const id = await intakeTask();
-    expect((await start({ intake_task_id: id, engine: 'claude' })).status).toBe(423);
-    expect((await start({ intake_task_id: id, engine: 'codex' })).data.error).not.toBe('tbm_admission_denied');
+    expect((await start({ intake_task_id: id, engine: 'claude', engine_override_reason: 'Exercise the Claude pool admission gate.' })).status).toBe(423);
+    expect((await start({ intake_task_id: id, engine: 'codex', engine_override_reason: 'Exercise independent Codex pool admission.' })).data.error).not.toBe('tbm_admission_denied');
   });
   it('hard floor denies an explicit-engine start', async () => {
     await setPool({ pool_id: 'claude:main', provider: 'claude', remaining_tokens: 40_000, reset_at_ms: Date.now() + DAY });
-    const r = await start({ intake_task_id: await intakeTask(), engine: 'claude' });
+    const r = await start({ intake_task_id: await intakeTask(), engine: 'claude', engine_override_reason: 'Exercise the Claude pool admission gate.' });
     expect(r.status).toBe(409);
     expect(r.data).toMatchObject({ error: 'tbm_admission_denied', reason: 'hard_floor' });
   });
   it('soft reserve denies near full-cycle remaining below R_soft, admits when above', async () => {
     await setPool({ pool_id: 'claude:main', provider: 'claude', remaining_tokens: 150_000, reset_at_ms: Date.now() + 7 * DAY });
     const id = await intakeTask();
-    const denied = await start({ intake_task_id: id, engine: 'claude' });
+    const denied = await start({ intake_task_id: id, engine: 'claude', engine_override_reason: 'Exercise the Claude pool admission gate.' });
     expect(denied.data).toMatchObject({ error: 'tbm_admission_denied', reason: 'soft_reserve' });
     await setPool({ pool_id: 'claude:main', provider: 'claude', remaining_tokens: 600_000, reset_at_ms: Date.now() + 7 * DAY });
-    const admitted = await start({ intake_task_id: id, engine: 'claude' });
+    const admitted = await start({ intake_task_id: id, engine: 'claude', engine_override_reason: 'Exercise the Claude pool admission gate.' });
     expect(admitted.data.error).not.toBe('tbm_admission_denied');
   });
 });

@@ -476,6 +476,7 @@ describe('private durable intake HTTP/SQLite', () => {
       session: {
         workspace: 'demo',
         engine: 'codex',
+        engine_override_reason: 'Synthetic Codex child lineage test.',
         mode: 'headless',
         brief: 'Child assigned goal',
         parent_id: parentId

@@ -382,6 +382,7 @@ describe('Staged low-quota floor and kill-switch end-to-end scenario (AC6)', () 
       brief: 'Stage 1',
       intake_task_id: intakeId,
       engine: 'claude',
+      engine_override_reason: 'Select Claude to exercise its live percentage pool floor.',
     });
     expect(stage1.status).toBe(409);
     expect(stage1.data).toMatchObject({
@@ -405,6 +406,7 @@ describe('Staged low-quota floor and kill-switch end-to-end scenario (AC6)', () 
       brief: 'Stage 2',
       intake_task_id: intakeId,
       engine: 'claude',
+      engine_override_reason: 'Select Claude to exercise its live percentage pool floor.',
     });
     expect(stage2.data.error).not.toBe('tbm_admission_denied');
 
@@ -422,6 +424,7 @@ describe('Staged low-quota floor and kill-switch end-to-end scenario (AC6)', () 
       brief: 'Stage 3',
       intake_task_id: intakeId,
       engine: 'claude',
+      engine_override_reason: 'Select Claude to exercise its live percentage pool floor.',
     });
     expect(stage3.status).toBe(409);
     expect(stage3.data).toMatchObject({
