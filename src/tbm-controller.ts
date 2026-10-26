@@ -168,6 +168,8 @@ export function ensureTbmControllerSchema(sql: SqlStorage): void {
   try {
     sql.exec('DROP TRIGGER IF EXISTS trg_tbm_pool_reset_capture');
     sql.exec(TBM_RESET_TRIGGER_SQL);
+    sql.exec('CREATE INDEX IF NOT EXISTS idx_tbm_reward_pool_time ON tbm_reward_events(pool_id,timestamp_ms)');
+    if (hasTable(sql, 'session_control_sessions')) sql.exec("CREATE INDEX IF NOT EXISTS idx_tbm_binding_native ON session_control_sessions(json_extract(binding_json, '$.native_id'))");
   } catch {}
 }
 
