@@ -296,6 +296,7 @@ async function showHost(hostId) {
 
 function applyError(code) {
   if (code === 'expired' || code === 'access_denied') HubHostCharts.clear();
+  if (window.HubUsageHistory) HubUsageHistory.clear();
   if (code === 'expired') {
     byId('status').textContent = 'Session expired. Sign in again.';
     renderEmpty('Session expired.');
@@ -322,6 +323,7 @@ async function refresh() {
     if (myRefresh !== refreshGeneration) return;
     csrf = me.csrf_token;
     HubHostCharts.refresh(api);
+    if (window.HubUsageHistory) HubUsageHistory.refresh(api);
     for (const id of ['account-name', 'menu-name', 'menu-email']) byId(id).textContent = me.email;
     document.querySelector('.dk-avatar__initials').textContent = me.email.slice(0, 1).toUpperCase();
     listedHosts = [];
@@ -424,6 +426,7 @@ if (signOut) signOut.addEventListener('click', async () => {
     if (response.type !== 'opaqueredirect' && !response.ok) throw Error('Sign-out failed');
     csrf = null;
     HubHostCharts.clear();
+    if (window.HubUsageHistory) HubUsageHistory.clear();
     location.assign('/auth/login');
   } catch {
     byId('status').textContent = 'Sign-out could not be confirmed. Try again.';

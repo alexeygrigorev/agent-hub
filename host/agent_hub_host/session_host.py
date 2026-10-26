@@ -20,6 +20,7 @@ from .jobs import JobDispatcher
 from .metrics_producer import MetricsProducer
 from .native_sessions import qualify_sender_binding
 from .quota_snapshot import QuotaCollector
+from .token_usage import TokenCollector
 from .role_dispatch import TrustedRoleConfig, load_role_config
 from .runtime import RuntimeManager
 from .status_runtime import StatusCollector
@@ -112,6 +113,48 @@ def maybe_start_metrics_thread(current: Optional[threading.Thread], collector) -
         return thread
     except Exception as error:
         print(json.dumps({'event': 'metrics_error', 'type': type(error).__name__}), flush=True)
+        return current
+
+
+def token_step_once(collector) -> None:
+    """Run ONE isolated native token collection round (observer thread only).
+
+    Bounded count/error log only; rate-limited rounds stay silent. Never
+    raises, never touches quota/command state, never logs token counts beyond
+    the posted hour count.
+    """
+    try:
+        result = collector.step()
+    except Exception as error:
+        print(json.dumps({'event': 'token_error', 'type': type(error).__name__}), flush=True)
+        return
+    try:
+        if not isinstance(result, dict):
+            return
+        print(json.dumps({'event': 'token_cycle',
+                          'hours': result.get('hours', 0),
+                          'held': bool(collector.last_hold),
+                          'error': bool(collector.last_error)}), flush=True)
+    except Exception as error:
+        print(json.dumps({'event': 'token_error', 'type': type(error).__name__}), flush=True)
+
+
+def maybe_start_token_thread(current: Optional[threading.Thread], collector) -> Optional[threading.Thread]:
+    """Start ONE bounded token observer thread, or skip while one is alive.
+
+    Same single-inflight contract as status/metrics/disk: a blocked scan/HTTP
+    never delays commands/quota; the collector's own hourly cadence
+    rate-limits real work. No extra timer/service/dispatcher.
+    """
+    try:
+        if current is not None and current.is_alive():
+            return current
+        thread = threading.Thread(target=token_step_once, args=(collector,),
+                                  daemon=True, name='token-collect')
+        thread.start()
+        return thread
+    except Exception as error:
+        print(json.dumps({'event': 'token_error', 'type': type(error).__name__}), flush=True)
         return current
 
 
@@ -534,6 +577,15 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
             enabled=rc_enabled,
         )
         role_consumer_thread: Optional[threading.Thread] = None
+        # Native token usage hook (usage-history intake): ONE instance for the
+        # controller lifetime, hourly cadence, journal state file. Only
+        # complete hours are posted; identical reposts are idempotent
+        # server-side. The loop below only starts/skips the single-inflight
+        # daemon thread.
+        token_collector = TokenCollector(
+            base_url=cfg.get('base_url'),
+            state_path=str(journal / 'token-usage-state.json'))
+        token_thread: Optional[threading.Thread] = None
         next_fleet = 0
         maintenance_thread = None
         count = 0
@@ -590,6 +642,9 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                 # Role consumption never blocks commands/quota: one bounded
                 # single-inflight daemon thread, skipped while alive.
                 role_consumer_thread = maybe_start_role_consumer_thread(role_consumer_thread, role_consumer)
+                # Native token collection never blocks commands/quota: one
+                # bounded single-inflight daemon thread, skipped while alive.
+                token_thread = maybe_start_token_thread(token_thread, token_collector)
                 count += 1
                 if cycles is None or count < cycles:
                     stop.wait(interval)

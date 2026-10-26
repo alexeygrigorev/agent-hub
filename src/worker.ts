@@ -107,7 +107,7 @@ export default {
       '/fleet', '/fleet.html', '/fleet.js', '/fleet.css',
       '/engines', '/engines.html', '/engines.js', '/engines.css',
       '/conversations', '/conversations.html', '/conversations.js', '/conversations.css',
-      '/metrics', '/metrics.html', '/metrics.js', '/metrics-charts.js', '/metrics.css', '/host-health-charts.js', '/tbm.js', '/tbm.css',
+      '/metrics', '/metrics.html', '/metrics.js', '/metrics-charts.js', '/metrics.css', '/host-health-charts.js', '/tbm.js', '/tbm.css', '/usage-history.js',
       '/usage', '/usage.html',
       '/sessions', '/sessions.html', '/sessions.js', '/sessions.css',
       '/intake', '/intake.html', '/intake.js', '/intake.css',

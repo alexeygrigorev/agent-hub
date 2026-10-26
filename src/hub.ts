@@ -35,7 +35,10 @@ import { SessionControlService } from './session_control';
 import { StatusService, type StatusMachineAuth } from './status';
 import { MetricsStore, handleMetricsRoutes } from './metrics';
 import { MonitoringService } from './monitoring';
+import { isValidMachineId } from './machine-id';
 import { HostHistoryService } from './host-history';
+import { HISTORY_RETENTION_MS } from './host-history';
+import { TOKEN_SCHEMA_VERSION, TOKEN_SOURCES, tokenEntity, tokenPostAt, validateTokenPayload } from './token-history';
 import { placementPressureSubjects } from './host-pressure';
 
 function parseEpoch(raw: any): number | null {
@@ -475,6 +478,42 @@ export class Hub extends DurableObject {
           if (alarm === null || alarm > Date.now() + 60000) await this.ctx.storage.setAlarm(Date.now() + 60000);
         }
         return response;
+      }
+      if (path === '/api/monitoring/tokens') {
+        // Native token usage hours (usage-history intake, AC3). Hosts POST
+        // measured complete hours; reads go through /api/monitoring/history
+        // (kind 'tokens'). Only host credentials (own machine) or admins.
+        if (request.method === 'GET') {
+          const auth = await this.authenticateBusRequest(request);
+          if ((auth as any).error) return (auth as any).error;
+          if (!(auth as any).caller) return Response.json({ error: 'unauthorized' }, { status: 401 });
+          return Response.json({ schema_version: TOKEN_SCHEMA_VERSION, sources: TOKEN_SOURCES }, { headers: { 'Cache-Control': 'private, no-store' } });
+        }
+        if (request.method !== 'POST') return Response.json({ error: 'method_not_allowed' }, { status: 405 });
+        const auth = await this.authenticateBusRequest(request);
+        if ((auth as any).error) return (auth as any).error;
+        const caller = (auth as any).caller;
+        const machineId = caller?.machineId;
+        if (!caller || (caller.kind !== 'host' && !caller.isAdmin) || (!caller.isAdmin && !machineId)) {
+          return Response.json({ error: 'forbidden', reason: 'host_credential_required' }, { status: 403 });
+        }
+        const raw = await safeJson(request);
+        if (!raw) return Response.json({ error: 'invalid_body' }, { status: 400 });
+        const validated = validateTokenPayload(raw, Date.now(), HISTORY_RETENTION_MS);
+        if (!validated.ok || !validated.hours) {
+          return Response.json({ error: validated.error, ...(validated.reason ? { reason: validated.reason } : {}) }, { status: validated.status });
+        }
+        const poster = caller.isAdmin && typeof raw.machine_id === 'string' && isValidMachineId(raw.machine_id) ? raw.machine_id : machineId;
+        const nowMs = Date.now();
+        for (const hour of validated.hours) {
+          const entity = tokenEntity(hour);
+          const at = tokenPostAt(this.sql, entity, hour.hour_ms, hour.input_tokens, hour.output_tokens, nowMs, HISTORY_RETENTION_MS);
+          this.hostHistoryService.record('tokens', entity, String(poster || ''), at,
+            { input_tokens: hour.input_tokens, output_tokens: hour.output_tokens }, 'native_token_usage');
+        }
+        this.hostHistoryService.flush();
+        await this.sampleHostHistory();
+        return Response.json({ ok: true, hours: validated.hours.length }, { headers: { 'Cache-Control': 'private, no-store' } });
       }
       if (path === '/api/monitoring/disk') {
         if (request.method === 'POST') {

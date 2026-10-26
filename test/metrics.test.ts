@@ -461,6 +461,21 @@ describe('M9 metrics receiver', () => {
     expect(hostChartSource).toContain('HubHostCharts');
     expect(hostChartSource).not.toContain('innerHTML');
     expect(hostChartSource).not.toContain(hostA.accessToken);
+    const usageHistoryAnon = await doFetch(new Request('http://example.com/usage-history.js', { redirect: 'manual' }));
+    expect(usageHistoryAnon.status).toBe(303);
+    const usageHistoryAgent = await doFetch(new Request('http://example.com/usage-history.js', {
+      headers: { Authorization: `Bearer ${hostA.accessToken}` }, redirect: 'manual',
+    }));
+    expect(usageHistoryAgent.status).toBe(303);
+    const usageHistoryAuth = await doFetch(new Request('http://example.com/usage-history.js', {
+      headers: { Cookie: sessionCookie }, redirect: 'manual',
+    }));
+    expect(usageHistoryAuth.status).toBe(200);
+    expect(usageHistoryAuth.headers.get('Cache-Control')).toBe('private, no-store');
+    const usageHistorySource = await usageHistoryAuth.text();
+    expect(usageHistorySource).toContain('HubUsageHistory');
+    expect(usageHistorySource).not.toContain('innerHTML');
+    expect(usageHistorySource).not.toContain(hostA.accessToken);
     const jobTok = 'hubt_jobmetrics1';
     const routingTok = 'hubt_routingmetrics1';
     await runInDurableObject(stub, async (instance: Hub) => {

@@ -1,6 +1,7 @@
 import { SqlStorage, DurableObjectState } from "@cloudflare/workers-types";
 import { Env } from "./env";
 import { sha256 } from "./auth/crypto";
+import { displayAccountLabel } from "./account-display";
 import { getSession, allowedCallbackUrls, verifyCsrf } from "./auth/session";
 import { syncTbmFromHostSnapshot, syncTbmFromServerAccounts } from "./tbm-ingestion";
 
@@ -1615,11 +1616,9 @@ export class QuotaStore {
       }
       const routeEngines = routes.length ? [...new Set(routes.map((r) => r.engine))].sort() : [canonicalQuotaProvider(account.provider)];
       pools.push({
-        // Canonical provider model: the second Codex account surfaces as
-        // provider `codex` (model provider OpenAI) with its own account, so
-        // grouping by provider shows both Codex accounts together.
         provider: canonicalQuotaProvider(account.provider),
         account: canonicalAccountLabel(account.label),
+        display: displayAccountLabel(account.provider, account.label),
         state,
         source,
         windows: freshObs[0]?.quota.windows || {},

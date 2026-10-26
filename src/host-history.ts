@@ -11,6 +11,11 @@ import { freshCatalogs } from './catalog-freshness';
 
 const MINUTE = 60000, DAY = 86400000;
 export const HISTORY_RETENTION_MS = 32 * DAY;
+/** Quota freshness gate mirrors QUOTA_STALE_MS (20 minutes). Quota collection
+ * runs every 600 s host-side; a snapshot older than this is stale and must
+ * stay a gap, never a held-forward value. Sampling runs at most once a
+ * minute, so live history holds points at least every 15 minutes. */
+export const QUOTA_WINDOW_STALE_MS = 20 * MINUTE;
 export const HISTORY_RANGES: Record<string, number> = { '1h': 60 * MINUTE, '24h': DAY, '7d': 7 * DAY, '30d': 30 * DAY };
 export const HOST_HISTORY_SCHEMA = `
 CREATE TABLE IF NOT EXISTS resource_history (
@@ -21,6 +26,12 @@ CREATE TABLE IF NOT EXISTS resource_history_entities (
  last_seen_ms INTEGER NOT NULL,PRIMARY KEY(kind,entity,machine_id)
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS resource_history_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS token_hours_posted (
+  entity TEXT NOT NULL, hour_ms INTEGER NOT NULL,
+  input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(entity, hour_ms)
+) WITHOUT ROWID;
 `;
 type Values = Record<string, number | null>;
 const numeric = (v: unknown): number | null => typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
@@ -89,6 +100,49 @@ export class HostHistoryService {
       this.record('disk', fs.mount_point, row.machine_id, Number(row.observed_at_ms), { percent: numeric(fs.percent) }, 'disk_observations');
     }
   }
+  /** Per-account AND per-window quota history (AC1: usage-history intake).
+   * One line per window: metric `<window>` carries percent_remaining (null
+   * stays a gap, never an invented value); metric `<window>__reset_at`
+   * carries the window reset time as epoch milliseconds (null when unknown).
+   * The UI derives reset markers from reset_at changes. Entity stays the
+   * stored account label so old rows join renamed accounts via the display
+   * mapping (sibling intake 9c6d2c0f); stored keys are never rewritten here.
+   */
+  private quotaWindowFromBlob(account: string, quotaJson: string, at: number, source: string) {
+    const p = json(quotaJson);
+    const windows = (p && typeof p === 'object' && (p as any).windows && typeof (p as any).windows === 'object') ? (p as any).windows : {};
+    const names = Object.keys(windows).slice(0, 32);
+    // No windows: record nothing. A gap is the absence of points, and an
+    // explicit null marker would only consume the dimension registry.
+    if (!names.length) return;
+    for (const name of names) {
+      const w = windows[name] || {};
+      const values: Values = {};
+      const remaining = w.present === true ? numeric(w.percent_remaining) : null;
+      if (remaining !== null) values[name] = remaining;
+      const resetMs = typeof w.reset_at === 'string' ? Date.parse(w.reset_at) : NaN;
+      const reset = Number.isFinite(resetMs) && resetMs >= 0 ? resetMs : null;
+      if (reset !== null) values[name + '__reset_at'] = reset;
+      // A fully unknown window (null percent, unknown reset) leaves no
+      // trace; its gap after the last known point is the outage signal.
+      if (Object.keys(values).length) this.record('quota_window', account, '', at, values, source);
+    }
+  }
+  /** Fresh per-window observations from every quota source. Stale snapshots
+   * (older than QUOTA_WINDOW_STALE_MS) are skipped: a stale hold-forward
+   * would masquerade as a live measurement. Unknown windows stay gaps. */
+  private quotaWindows(now: number) {
+    for (const row of this.rows('SELECT account,captured_at,quota_json FROM server_quota_snapshots LIMIT 128')) {
+      const at = Date.parse(row.captured_at);
+      if (!Number.isFinite(at) || now - at > QUOTA_WINDOW_STALE_MS || at > now + MINUTE) continue;
+      this.quotaWindowFromBlob(String(row.account || ''), row.quota_json, at, 'server_quota_snapshots');
+    }
+    for (const row of this.rows('SELECT account,observed_at,quota_json FROM fleet_subscriptions LIMIT 4096')) {
+      const at = Date.parse(row.observed_at);
+      if (!Number.isFinite(at) || now - at > QUOTA_WINDOW_STALE_MS || at > now + MINUTE) continue;
+      this.quotaWindowFromBlob(String(row.account || ''), row.quota_json, at, 'fleet_subscriptions');
+    }
+  }
   /** Import only surviving measurements, preserving their original timestamps.
    * Latest-only tables cannot reconstruct earlier memory/quota and stay gaps.
    * Fleet failures are historical events, not invented past running counts.
@@ -108,11 +162,14 @@ export class HostHistoryService {
       const p = json(row.quota_json);
       const values = Object.values(p.windows || {}).map((w: any) => numeric(w.percent_remaining)).filter((v): v is number => v !== null);
       if (values.length) this.record('quota', row.account, '', Date.parse(row.observed_at), { remaining_percent: Math.min(...values) }, 'fleet_subscriptions');
+      const at = Date.parse(row.observed_at);
+      if (Number.isFinite(at)) this.quotaWindowFromBlob(String(row.account || ''), row.quota_json, at, 'fleet_subscriptions');
     }
     for (const row of this.rows('SELECT account,captured_at,quota_json FROM server_quota_snapshots LIMIT 128')) {
       const p = json(row.quota_json);
       const values = Object.values(p.windows || {}).map((w: any) => numeric(w.percent_remaining)).filter((v): v is number => v !== null);
       if (values.length) this.record('quota', row.account, '', Date.parse(row.captured_at), { remaining_percent: Math.min(...values) }, 'server_quota_snapshots');
+      this.quotaWindowFromBlob(String(row.account || ''), row.quota_json, Date.parse(row.captured_at), 'server_quota_snapshots');
     }
     this.flush();
     this.sql.exec("INSERT OR REPLACE INTO resource_history_meta VALUES('backfill_v1',?)", this.now());
@@ -145,6 +202,10 @@ export class HostHistoryService {
       this.record('account', a.label, '', now, { used: a.active, max: a.max_concurrency, native_live: numeric((a as any).native_live) }, 'fleet_account_status_census_v2');
       this.record('quota', a.label, '', now, { remaining_percent: a.status === 'unknown' ? null : a.remaining_percent }, 'fleet_account_status');
     }
+    // Per-account AND per-window quota history, sampled with every sample
+    // tick (at most once a minute; quota collection refreshes every 600 s,
+    // so live series always hold points at least every 15 minutes).
+    this.quotaWindows(now);
     for (const row of this.rows(`SELECT ids.machine_id,
       (SELECT COUNT(*) FROM fleet_launches f WHERE f.machine_id=ids.machine_id AND f.state='queued') AS queued,
       (SELECT COUNT(*) FROM fleet_launches f WHERE f.machine_id=ids.machine_id AND f.state='failed') AS failed
