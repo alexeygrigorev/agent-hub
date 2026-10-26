@@ -4,6 +4,7 @@ import { modelCandidates, taskTier, policy } from './model-routing';
 import { evaluateQuotaAdmission } from './quota_admission';
 import { canonicalQuotaProvider } from './quota';
 import { loadProviderPacing } from './pacing';
+import { ensureTbmControllerSchema, recordSessionOutcomeReward } from './tbm-controller';
 import type { FleetService } from './fleet';
 import { sha256, randomString } from './auth/crypto';
 import { effectiveCheckin } from './registry';
@@ -45,6 +46,7 @@ export class RoutingService {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS routing_artifacts (job_id TEXT NOT NULL, name TEXT NOT NULL, media_type TEXT NOT NULL, data_base64 TEXT NOT NULL, PRIMARY KEY(job_id, name))`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS routing_jobs (id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, launch_id TEXT, state TEXT NOT NULL, report TEXT NOT NULL DEFAULT '', artifacts_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, selection_json TEXT, UNIQUE(actor, request_key))`);
     this.sql.exec('CREATE INDEX IF NOT EXISTS routing_queued ON routing_jobs(state, launch_id, id)');
+    try { ensureTbmControllerSchema(this.sql); } catch {}
   }
   private at() { return new Date(this.now()).toISOString(); }
   private view(row: any) {
@@ -266,9 +268,25 @@ export class RoutingService {
             if (data.confirmed_exit !== true) return reply({ error: 'confirmed_exit_required' }, 409);
             // The process reservation and its report commit together; a restart cannot lose the report.
             this.sql.exec('UPDATE fleet_launches SET state = ?, updated_at = ? WHERE id = ?', data.status === 'done' ? 'exited' : 'failed', this.at(), current.launch_id);
+            let rewardSessionId = current.id;
+            let rewardIntakeId = 'routing:' + current.id;
             if (this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length) {
+              const linked: any = this.sql.exec('SELECT id, request_json FROM session_control_sessions WHERE fleet_launch_id = ?', current.launch_id).toArray()[0];
+              if (linked) {
+                rewardSessionId = linked.id;
+                try { rewardIntakeId = JSON.parse(linked.request_json || '{}').intake_task_id || rewardIntakeId; } catch {}
+              }
               this.sql.exec("UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE fleet_launch_id = ? AND state IN ('queued', 'held', 'offered', 'starting', 'running', 'uncertain')", data.status === 'done' ? 'stopped' : 'failed', this.at(), current.launch_id);
             }
+            try {
+              recordSessionOutcomeReward(this.sql, {
+                session_id: rewardSessionId,
+                intake_task_id: rewardIntakeId,
+                engine: execution.engine ?? null,
+                account: execution.account ?? null,
+                outcome: data.status === 'done' ? 'done' : 'failed',
+              }, this.now());
+            } catch {}
           }
           this.sql.exec('UPDATE routing_jobs SET state = ?, report = ?, artifacts_json = ?, updated_at = ? WHERE id = ?', data.status, redact(data.report), JSON.stringify(data.artifacts.map((a: any) => ({ name: redact(a.name), text: redact(a.text) }))), this.at(), row.id);
           return reply(this.view(this.sql.exec('SELECT * FROM routing_jobs WHERE id = ?', row.id).one()));

@@ -29,6 +29,7 @@ import { getScopeBlock } from './intake_scope';
 import { taskTier } from './model-routing';
 import { engineProvider, evaluateTbmAdmission, type TbmPoolRow } from './quota_admission';
 import { ensureTbmQuotaSchema } from './quota';
+import { ensureTbmControllerSchema, recordSessionOutcomeReward } from './tbm-controller';
 import { approvalAuthorityMatches } from './host_enrollment';
 import { sha256 } from './auth/crypto';
 import { validateHumanCredentialRecord } from './auth/human-credential';
@@ -261,6 +262,7 @@ export class SessionControlService {
     // DDL (single authority: src/session_lifecycle.ts schema string); the
     // host keeps no DDL copy. No ALTERs to existing tables here.
     initLifecycleTables(this.sql);
+    try { ensureTbmControllerSchema(this.sql); } catch {}
     // Repair this day's pre-fix starts from canonical requests, once per id.
     // Run each repair atomically; historical manual links are left untouched.
     const hasIntake = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='intake_tasks'").toArray().length;
@@ -276,12 +278,11 @@ export class SessionControlService {
 
   private at() { return new Date(this.now()).toISOString(); }
 
-  /** TBM admission over tbm_quota_pools; any read failure fails closed. Cycle length defaults to 7d until pacing (Phase 3) stores it. */
+  /** TBM admission over tbm_quota_pools; any read failure fails closed. Uses per-pool cycle_ms/window_type from ingestion. */
   private tbmGate(engine: string | undefined) {
     try {
-      ensureTbmQuotaSchema(this.sql);
-      const pools = this.sql.exec(
-        'SELECT pool_id, provider, total_capacity_tokens, remaining_tokens, reset_at_ms, convexity_exponent, kill_switch_active, kill_switch_reason, last_updated_ms FROM tbm_quota_pools').toArray() as unknown as TbmPoolRow[];
+      ensureTbmControllerSchema(this.sql);
+      const pools = this.sql.exec('SELECT * FROM tbm_quota_pools').toArray() as unknown as TbmPoolRow[];
       return evaluateTbmAdmission({ pools, provider: engine ? engineProvider(engine) : null, nowMs: this.now(), cycleMs: 7 * 86400000 });
     } catch {
       return { ok: false as const, reason: 'malformed_pool' as const, pool_id: null, detail: 'tbm_read_failed' };
@@ -1367,6 +1368,7 @@ export class SessionControlService {
           this.sql.exec('UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE id = ?', 'refused', at, id);
           const refused: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', id).toArray()[0];
           recordIntakeSessionLink(this.sql, refused, this.now());
+          try { if (mode !== 'interactive') recordSessionOutcomeReward(this.sql, { session_id: id, intake_task_id: input.intake_task_id ?? null, engine: input.engine ?? null, outcome: 'refused' }, this.now()); } catch {}
           return response(reserved.value, 400);
         }
         // Capacity-only placement parks a waitable queued intent (202) linked
@@ -1978,6 +1980,15 @@ export class SessionControlService {
             "UPDATE session_control_sessions SET state = 'stopped', binding_json = ?, updated_at = ? WHERE id = ?",
             JSON.stringify(updatedBinding), at, live.id
           );
+          try {
+            const reqObj = parsed(live.request_json, {});
+            recordSessionOutcomeReward(this.sql, {
+              session_id: live.id,
+              intake_task_id: reqObj?.intake_task_id ?? null,
+              engine: live.engine ?? input.native?.engine ?? null,
+              outcome: 'stopped',
+            }, this.now());
+          } catch {}
           const updatedRow: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', live.id).toArray()[0];
           return response({ ...this.view(updatedRow), id: live.id, state: 'stopped', replay: false });
         });
@@ -2062,6 +2073,16 @@ export class SessionControlService {
           }
           this.sql.exec('INSERT INTO session_control_cancellations (session_id, actor, request_key, created_at) VALUES (?, ?, ?, ?)', live.id, actorName(caller), input.key, at);
           this.sql.exec('UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE id = ?', 'cancelled', at, live.id);
+          try {
+            if (live.mode !== 'interactive') {
+              recordSessionOutcomeReward(this.sql, {
+                session_id: live.id,
+                intake_task_id: original?.intake_task_id ?? null,
+                engine: live.engine ?? original?.engine ?? null,
+                outcome: 'cancelled',
+              }, this.now());
+            }
+          } catch {}
           const row: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', live.id).toArray()[0];
           return response({ ...this.view(row), cancellation: { key: input.key, created_at: at, effect: 'no_native_start' }, replay: false });
         });
@@ -2562,6 +2583,17 @@ export class SessionControlService {
           // Fleet.native_id remains unknown. The exact bound exit proof above
           // settles that linked reservation too; a conflicting native stays held.
           this.sql.exec("UPDATE fleet_launches SET state = 'exited', finished_at = ?, updated_at = ?, verification_status = 'verified' WHERE id = ? AND machine_id = ? AND (native_id = ? OR native_id IS NULL)", at, at, session.fleet_launch_id, session.machine_id, input.native.native_id);
+          try {
+            if (session.mode !== 'interactive') {
+              const reqObj = parsed(session.request_json, {});
+              recordSessionOutcomeReward(this.sql, {
+                session_id: session.id,
+                intake_task_id: reqObj?.intake_task_id ?? null,
+                engine: session.engine ?? input.native?.engine ?? null,
+                outcome: 'stopped',
+              }, this.now());
+            }
+          } catch {}
         }
         return response({ command_id: row.id, state });
       });
@@ -2626,9 +2658,21 @@ export function reconcileUnboundFleetSessions(sql: SqlStorage, nowMs: number): v
     WHERE s.binding_json IS NULL AND s.state IN ('queued','held','offered','starting','running','uncertain')
     AND f.state IN ('failed','exited','expired','cancelled') LIMIT 100`).toArray() as any[];
   for (const row of rows) {
+    const nextState = row.state === 'exited' ? 'stopped' : row.state === 'expired' ? 'failed' : row.state;
     sql.exec('UPDATE session_control_sessions SET state = ?, updated_at = ? WHERE id = ?',
-      row.state === 'exited' ? 'stopped' : row.state === 'expired' ? 'failed' : row.state,
-      new Date(nowMs).toISOString(), row.id);
+      nextState, new Date(nowMs).toISOString(), row.id);
+    try {
+      const sRow: any = sql.exec('SELECT id, engine, mode, request_json FROM session_control_sessions WHERE id = ?', row.id).toArray()[0];
+      if (sRow && sRow.mode !== 'interactive') {
+        const reqObj = parsed(sRow.request_json, {});
+        recordSessionOutcomeReward(sql, {
+          session_id: sRow.id,
+          intake_task_id: reqObj?.intake_task_id ?? null,
+          engine: sRow.engine ?? reqObj?.engine ?? null,
+          outcome: nextState as any,
+        }, nowMs);
+      }
+    } catch {}
   }
 }
 

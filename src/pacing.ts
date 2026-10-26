@@ -2,27 +2,67 @@
  * Token Burning Machine Phase 3: pacing controller, banked-tranche EDF arbiter and
  * multi-factor routing score (tbm-coord.md §2.1 items 1-4, §8 item 3).
  *
- * Everything here is pure arithmetic over the Phase 1 tbm_* rows; the only SQL is
- * reading those tables and writing their existing pacing columns. No new columns.
+ * Supports both token-capacity pools and percentage-only pools (capacity_known=0 /
+ * quota_unit='percent') without fabricating token counts, plus deadline-only banked
+ * grants (quantity_known=0) and persisted PID controller ticks.
  */
 import type { SqlStorage } from '@cloudflare/workers-types';
+import {
+  TBM_FLEET_POOL_ID,
+  evaluateTbmAdmission,
+  isPercentOnlyTbmPool,
+  normalizeProviderFamily,
+  resolveTbmPoolCycleMs,
+} from './quota_admission';
 
 const MINUTE = 60000;
 const HOUR = 3600000;
 
-/** Exactly the Phase 1 tbm_quota_pools columns this module reads or writes. */
+/** Phase 1 + AC1 tbm_quota_pools columns this module reads or writes. */
 export interface TbmPoolRow {
   pool_id: string; provider: string; account: string;
   total_capacity_tokens: number; remaining_tokens: number; headroom_percentage: number;
   reset_at_ms: number; hard_floor_percent: number; soft_reserve_percent: number; convexity_exponent: number;
   current_burn_rate_tpm: number; target_burn_rate_tpm: number; pacing_ratio: number;
   kill_switch_active: number;
+  cycle_ms?: number | null;
+  window_type?: string | null;
+  remaining_percent?: number | null;
+  capacity_known?: number | boolean | null;
+  quota_unit?: string | null;
+  kill_switch_reason?: string | null;
+  last_updated_ms?: number | null;
 }
-/** Exactly the Phase 1 tbm_banked_tranches columns this module reads or writes. */
+/** Phase 1 + AC1 tbm_banked_tranches columns this module reads or writes. */
 export interface TbmTrancheRow {
   tranche_id: string; pool_id: string; provider: string;
   remaining_tokens: number; expires_at_ms: number; status: 'active' | 'exhausted' | 'expired';
   banked_burn_rate_tpm: number; target_banked_burn_rate_tpm: number; expired_unused_tokens: number;
+  allocated_tokens?: number;
+  quantity_known?: number | boolean | null;
+  account?: string | null;
+}
+
+export function isPercentPool(pool: Partial<TbmPoolRow>): boolean {
+  return isPercentOnlyTbmPool(pool);
+}
+
+export function isDeadlineOnlyTranche(t: Partial<TbmTrancheRow>): boolean {
+  return t.quantity_known === 0 || t.quantity_known === false;
+}
+
+export function poolEffectiveTotal(pool: Pick<TbmPoolRow, 'total_capacity_tokens' | 'capacity_known' | 'quota_unit' | 'remaining_tokens' | 'remaining_percent' | 'headroom_percentage'>): number {
+  return isPercentPool(pool) ? 100 : pool.total_capacity_tokens;
+}
+
+export function poolEffectiveRemaining(pool: Pick<TbmPoolRow, 'total_capacity_tokens' | 'capacity_known' | 'quota_unit' | 'remaining_tokens' | 'remaining_percent' | 'headroom_percentage'>): number {
+  if (isPercentPool(pool)) {
+    const pct = typeof pool.remaining_percent === 'number' && Number.isFinite(pool.remaining_percent)
+      ? pool.remaining_percent
+      : (typeof pool.headroom_percentage === 'number' && Number.isFinite(pool.headroom_percentage) ? pool.headroom_percentage : 0);
+    return Math.max(0, Math.min(100, pct));
+  }
+  return pool.remaining_tokens;
 }
 
 // ---------------------------------------------------------------------------
@@ -31,18 +71,49 @@ export interface TbmTrancheRow {
 
 export const FLOOR_DEFAULTS = { hardAbsTokens: 50_000, softAbsTokens: 200_000, windowMs: 7 * 24 * HOUR };
 
-/** R_hard = max(total * hard%, R_hard_abs), never above the pool itself. */
-export function hardFloorTokens(pool: Pick<TbmPoolRow, 'total_capacity_tokens' | 'hard_floor_percent'>, hardAbs = FLOOR_DEFAULTS.hardAbsTokens): number {
-  return Math.min(pool.total_capacity_tokens, Math.max(pool.total_capacity_tokens * pool.hard_floor_percent / 100, hardAbs));
+/**
+ * R_hard = max(total * hard%, R_hard_abs), never above the pool itself.
+ * For percentage-only pools (capacity_known=0), returns hard_floor_percent (default 5%)
+ * in percentage points without applying the 50k token floor.
+ */
+export function hardFloorTokens(
+  pool: Pick<TbmPoolRow, 'total_capacity_tokens' | 'hard_floor_percent'> & Partial<TbmPoolRow>,
+  hardAbs = FLOOR_DEFAULTS.hardAbsTokens
+): number {
+  const hardPct = typeof pool.hard_floor_percent === 'number' && Number.isFinite(pool.hard_floor_percent) && pool.hard_floor_percent > 0
+    ? pool.hard_floor_percent
+    : 5;
+  if (isPercentPool(pool)) {
+    return Math.min(100, Math.max(0, hardPct));
+  }
+  return Math.min(pool.total_capacity_tokens, Math.max(pool.total_capacity_tokens * hardPct / 100, hardAbs));
 }
 
 /** R_soft(t) = R_hard + (R_soft_init - R_hard) * ((T_reset - t) / T_window)^kappa, decaying to R_hard at reset. */
-export function softReserveTokens(pool: Pick<TbmPoolRow, 'total_capacity_tokens' | 'hard_floor_percent' | 'soft_reserve_percent' | 'convexity_exponent' | 'reset_at_ms'>,
-  nowMs: number, opts: Partial<typeof FLOOR_DEFAULTS> = {}): number {
-  const o = { ...FLOOR_DEFAULTS, ...opts };
+export function softReserveTokens(
+  pool: Pick<TbmPoolRow, 'total_capacity_tokens' | 'hard_floor_percent' | 'soft_reserve_percent' | 'convexity_exponent' | 'reset_at_ms'> & Partial<TbmPoolRow>,
+  nowMs: number,
+  opts: Partial<typeof FLOOR_DEFAULTS> = {}
+): number {
+  const inferredWindowMs = resolveTbmPoolCycleMs({
+    pool_id: pool.pool_id ?? '',
+    cycle_ms: pool.cycle_ms,
+    window_type: pool.window_type,
+  });
+  const windowMs = opts.windowMs ?? inferredWindowMs ?? FLOOR_DEFAULTS.windowMs;
+  const softPct = typeof pool.soft_reserve_percent === 'number' && Number.isFinite(pool.soft_reserve_percent) && pool.soft_reserve_percent > 0
+    ? pool.soft_reserve_percent
+    : 20;
+  if (isPercentPool(pool)) {
+    const hard = hardFloorTokens(pool, 0);
+    const init = Math.min(100, Math.max(softPct, hard));
+    const fraction = Math.max(0, Math.min(1, (pool.reset_at_ms - nowMs) / Math.max(1, windowMs)));
+    return hard + (init - hard) * Math.pow(fraction, Math.max(1, pool.convexity_exponent || 1.5));
+  }
+  const o = { ...FLOOR_DEFAULTS, ...opts, windowMs };
   const hard = hardFloorTokens(pool, o.hardAbsTokens);
-  const init = Math.min(pool.total_capacity_tokens, Math.max(pool.total_capacity_tokens * pool.soft_reserve_percent / 100, o.softAbsTokens, hard));
-  const fraction = Math.max(0, Math.min(1, (pool.reset_at_ms - nowMs) / o.windowMs));
+  const init = Math.min(pool.total_capacity_tokens, Math.max(pool.total_capacity_tokens * softPct / 100, o.softAbsTokens, hard));
+  const fraction = Math.max(0, Math.min(1, (pool.reset_at_ms - nowMs) / Math.max(1, o.windowMs)));
   return hard + (init - hard) * Math.pow(fraction, Math.max(1, pool.convexity_exponent || 1.5));
 }
 
@@ -50,18 +121,19 @@ export function softReserveTokens(pool: Pick<TbmPoolRow, 'total_capacity_tokens'
 // Continuous target burn with PID smoothing (§2.1 item 1, tbm-pacing.md §3.1, §3.3)
 // ---------------------------------------------------------------------------
 
-/** Rates are tokens/minute; Kp acts on the cumulative token deficit e(t) = S_planned - S_actual. */
+/** Rates are tokens/minute (or %/minute for percentage-only pools); Kp acts on cumulative deficit e(t) = S_planned - S_actual. */
 export interface PidGains { kp: number; ki: number; kd: number }
 export const PID_DEFAULTS: PidGains = { kp: 1 / 60, ki: 1 / (60 * 240), kd: 0.1 };
-/** Controller memory. Not persisted: tbm_quota_pools has no PID columns, so callers keep it per pool. */
+/** Controller memory per pool (persisted in tbm_controller_state by tickTbm). */
 export interface PidState { deficitTokens: number; integral: number; lastRateError: number; lastAtMs: number | null }
 export const newPidState = (): PidState => ({ deficitTokens: 0, integral: 0, lastRateError: 0, lastAtMs: null });
 
 const EPSILON_MS = 10000;
 
-/** Base term of the AC formula: max(0, Q_rem - R_soft) / max(eps, T_reset - t), in tokens/minute. */
+/** Base term of the AC formula: max(0, Q_rem - R_soft) / max(eps, T_reset - t), in units/minute. */
 export function baseTargetTpm(pool: TbmPoolRow, nowMs: number, opts: Partial<typeof FLOOR_DEFAULTS> = {}): number {
-  const burnable = Math.max(0, pool.remaining_tokens - softReserveTokens(pool, nowMs, opts));
+  const rem = poolEffectiveRemaining(pool);
+  const burnable = Math.max(0, rem - softReserveTokens(pool, nowMs, opts));
   return burnable / (Math.max(EPSILON_MS, pool.reset_at_ms - nowMs) / MINUTE);
 }
 
@@ -99,13 +171,14 @@ export function pacingStep(pool: TbmPoolRow, prev: PidState, nowMs: number, opts
   const unclamped = raw(base, integral);
   const target = held ? 0 : Math.max(0, Math.min(maxBurn, unclamped));
   const hard = hardFloorTokens(pool, opts.hardAbsTokens);
+  const rem = poolEffectiveRemaining(pool);
   const minutesLeft = Math.max(EPSILON_MS, pool.reset_at_ms - nowMs) / MINUTE;
   return {
     baseTpm: base, smoothingTpm: target - base, targetTpm: target, saturated, held,
     pacingRatio: target > 0 ? pool.current_burn_rate_tpm / target : 1,
     softReserveTokens: softReserveTokens(pool, nowMs, opts), hardFloorTokens: hard,
     // Anti-cliff: surplus above R_hard needs > 80% of max feasible burn to clear before reset.
-    antiCliff: Number.isFinite(maxBurn) && (pool.remaining_tokens - hard) / minutesLeft > 0.8 * maxBurn,
+    antiCliff: Number.isFinite(maxBurn) && (rem - hard) / minutesLeft > 0.8 * maxBurn,
     state: { deficitTokens: deficit, integral, lastRateError: rateError, lastAtMs: nowMs },
   };
 }
@@ -116,9 +189,9 @@ export function pacingStep(pool: TbmPoolRow, prev: PidState, nowMs: number, opts
 
 export const EDF_DEFAULTS = { urgentHours: 24, criticalHours: 4, dispatchHours: 6 };
 
-/** Active, non-empty, unexpired tranches by ascending expiry; ties by remaining desc, then id. */
-export function edfOrder<T extends Pick<TbmTrancheRow, 'tranche_id' | 'remaining_tokens' | 'expires_at_ms' | 'status'>>(tranches: T[], nowMs: number): T[] {
-  return tranches.filter(t => t.status === 'active' && t.remaining_tokens > 0 && t.expires_at_ms > nowMs)
+/** Active, non-empty (or deadline-only quantity_known=0), unexpired tranches by ascending expiry; ties by remaining desc, then id. */
+export function edfOrder<T extends Pick<TbmTrancheRow, 'tranche_id' | 'remaining_tokens' | 'expires_at_ms' | 'status'> & Partial<TbmTrancheRow>>(tranches: T[], nowMs: number): T[] {
+  return tranches.filter(t => t.status === 'active' && (t.remaining_tokens > 0 || isDeadlineOnlyTranche(t)) && t.expires_at_ms > nowMs)
     .sort((a, b) => a.expires_at_ms - b.expires_at_ms || b.remaining_tokens - a.remaining_tokens || a.tranche_id.localeCompare(b.tranche_id));
 }
 
@@ -129,12 +202,15 @@ export function bankedUrgencyMultiplier(expiresAtMs: number, nowMs: number, urge
   return 1 + 3 * Math.pow((urgentHours - hours) / urgentHours, 2);
 }
 
-/** mu_i = B_rem / max(eps, T_exp - t), tokens/minute. */
-export const trancheUrgencyTpm = (t: Pick<TbmTrancheRow, 'remaining_tokens' | 'expires_at_ms'>, nowMs: number) =>
-  Math.max(0, t.remaining_tokens) / (Math.max(EPSILON_MS, t.expires_at_ms - nowMs) / MINUTE);
-/** mu_primary = max(0, Q_rem - R_hard) / max(eps, T_reset - t), tokens/minute. */
+/** mu_i = B_rem / max(eps, T_exp - t), tokens/minute. Deadline-only grants (quantity_known=0) never invent a token burn rate (0). */
+export const trancheUrgencyTpm = (t: Pick<TbmTrancheRow, 'remaining_tokens' | 'expires_at_ms'> & Partial<TbmTrancheRow>, nowMs: number) => {
+  if (isDeadlineOnlyTranche(t) && t.remaining_tokens <= 0) return 0;
+  const denomMin = Math.max(EPSILON_MS, t.expires_at_ms - nowMs) / MINUTE;
+  return Math.max(0, t.remaining_tokens) / denomMin;
+};
+/** mu_primary = max(0, Q_rem - R_hard) / max(eps, T_reset - t), units/minute. */
 export const primaryUrgencyTpm = (pool: TbmPoolRow, nowMs: number, hardAbs?: number) =>
-  Math.max(0, pool.remaining_tokens - hardFloorTokens(pool, hardAbs)) / (Math.max(EPSILON_MS, pool.reset_at_ms - nowMs) / MINUTE);
+  Math.max(0, poolEffectiveRemaining(pool) - hardFloorTokens(pool, hardAbs)) / (Math.max(EPSILON_MS, pool.reset_at_ms - nowMs) / MINUTE);
 
 export interface BurnSource { source: 'banked' | 'primary'; tranche: TbmTrancheRow | null; critical: boolean; omega: number }
 
@@ -146,14 +222,15 @@ export interface BurnSource { source: 'banked' | 'primary'; tranche: TbmTrancheR
  */
 export function selectBurnSource(pool: TbmPoolRow | null, tranches: TbmTrancheRow[], nowMs: number, opts: Partial<typeof EDF_DEFAULTS> & { hardAbsTokens?: number } = {}): BurnSource | null {
   const o = { ...EDF_DEFAULTS, ...opts };
-  if (pool && (pool.kill_switch_active || pool.remaining_tokens <= hardFloorTokens(pool, o.hardAbsTokens))) return null;
+  if (pool && (pool.kill_switch_active || poolEffectiveRemaining(pool) <= hardFloorTokens(pool, o.hardAbsTokens))) return null;
   const ordered = edfOrder(tranches, nowMs);
   const head = ordered[0];
   if (head) {
     const muPrimary = pool ? primaryUrgencyTpm(pool, nowMs, o.hardAbsTokens) : 0;
     const hours = (head.expires_at_ms - nowMs) / HOUR;
     const mostUrgent = ordered.reduce((best, t) => trancheUrgencyTpm(t, nowMs) > trancheUrgencyTpm(best, nowMs) ? t : best, head);
-    if (hours <= o.dispatchHours || trancheUrgencyTpm(mostUrgent, nowMs) > muPrimary) {
+    const deadlineUrgent = isDeadlineOnlyTranche(head) && hours <= o.urgentHours;
+    if (hours <= o.dispatchHours || deadlineUrgent || trancheUrgencyTpm(mostUrgent, nowMs) > muPrimary) {
       // Dispatch is always to the EDF head; urgency only decides banked vs primary.
       return { source: 'banked', tranche: head, critical: hours <= o.criticalHours, omega: bankedUrgencyMultiplier(head.expires_at_ms, nowMs, o.urgentHours) };
     }
@@ -205,29 +282,128 @@ export function pacingAlignment(actualTpm: number, targetTpm: number): number {
 }
 export const routeScore = (f: RouteScoreFactors) => f.fit * f.health * f.preference * f.headroom * f.urgency * f.pacing * f.grok * f.banked;
 
-/** Per-provider pacing context for routing, derived from tbm_* rows. */
-export interface ProviderPacing { pacing: number; banked: number; preempt: boolean; halted: boolean }
+/** Per-provider / per-account pacing context for routing, derived from tbm_* rows. */
+export interface ProviderPacing {
+  pacing: number;
+  banked: number;
+  preempt: boolean;
+  halted: boolean;
+  efficiency?: number;
+}
 const NEUTRAL: ProviderPacing = { pacing: 1, banked: 1, preempt: false, halted: false };
 
-export function providerPacing(pools: TbmPoolRow[], tranches: TbmTrancheRow[], nowMs: number): Map<string, ProviderPacing> {
-  const out = new Map<string, ProviderPacing>();
-  for (const provider of new Set([...pools.map(p => p.provider), ...tranches.map(t => t.provider)])) {
-    const providerPools = pools.filter(p => p.provider === provider);
-    const halted = providerPools.some(p => p.kill_switch_active);
-    // Tranches debit their own pool, so pair each tranche with that pool's floors.
-    let banked = 1; let preempt = false;
-    for (const pool of providerPools.length ? providerPools : [null]) {
-      const own = tranches.filter(t => t.provider === provider && (!pool || t.pool_id === pool.pool_id));
-      const choice = selectBurnSource(pool, own, nowMs);
-      if (choice?.source === 'banked') { banked = Math.max(banked, choice.omega); preempt ||= choice.critical; }
+function computeGroupPacing(
+  groupPools: TbmPoolRow[],
+  groupTranches: TbmTrancheRow[],
+  nowMs: number,
+  globalHalted: boolean,
+  enforceFloors: boolean,
+  efficiency?: number
+): ProviderPacing {
+  let floorBlocked = false;
+  if (enforceFloors && groupPools.length > 0) {
+    const adm = evaluateTbmAdmission({
+      pools: groupPools,
+      provider: groupPools[0].provider,
+      nowMs,
+    });
+    if (!adm.ok) floorBlocked = true;
+  }
+  const halted = globalHalted || floorBlocked || groupPools.some(p => Boolean(p.kill_switch_active));
+  let banked = 1;
+  let preempt = false;
+  for (const pool of groupPools.length ? groupPools : [null]) {
+    const own = groupTranches.filter(t => !pool || t.pool_id === pool.pool_id || t.pool_id === '*' || t.pool_id === pool.provider);
+    const choice = selectBurnSource(pool, own, nowMs);
+    if (choice?.source === 'banked') {
+      banked = Math.max(banked, choice.omega);
+      preempt ||= choice.critical;
     }
-    // The most lagging account decides: routing should feed whichever pool is behind its curve.
-    const pacing = providerPools.length ? Math.max(...providerPools.map(p => pacingAlignment(p.current_burn_rate_tpm, p.target_burn_rate_tpm))) : 1;
-    out.set(provider, { pacing, banked, preempt: preempt && !halted, halted });
+  }
+  const pacing = groupPools.length
+    ? Math.max(...groupPools.map(p => {
+        const target = p.target_burn_rate_tpm > 0 ? p.target_burn_rate_tpm : baseTargetTpm(p, nowMs);
+        return pacingAlignment(p.current_burn_rate_tpm, target);
+      }))
+    : 1;
+  const out: ProviderPacing = { pacing, banked, preempt: preempt && !halted, halted };
+  if (typeof efficiency === 'number' && Number.isFinite(efficiency) && efficiency !== 1) {
+    out.efficiency = efficiency;
   }
   return out;
 }
-export const pacingFor = (map: Map<string, ProviderPacing> | undefined, provider: string) => map?.get(provider) ?? NEUTRAL;
+
+export function providerPacing(
+  pools: TbmPoolRow[],
+  tranches: TbmTrancheRow[],
+  nowMs: number,
+  opts: { enforceFloors?: boolean; efficiencies?: Map<string, number> } = {}
+): Map<string, ProviderPacing> {
+  const out = new Map<string, ProviderPacing>();
+  const globalHalted = pools.some(p => p.pool_id === TBM_FLEET_POOL_ID && Boolean(p.kill_switch_active));
+  if (globalHalted) {
+    out.set(TBM_FLEET_POOL_ID, { pacing: 1, banked: 1, preempt: false, halted: true });
+  }
+  const realPools = pools.filter(p => p.pool_id !== TBM_FLEET_POOL_ID && p.provider !== TBM_FLEET_POOL_ID);
+  const providers = new Set([...realPools.map(p => p.provider), ...tranches.map(t => t.provider).filter(p => p !== TBM_FLEET_POOL_ID)]);
+  for (const provider of providers) {
+    const providerPools = realPools.filter(p => p.provider === provider);
+    const providerTranches = tranches.filter(t => t.provider === provider);
+    const eff = opts.efficiencies?.get(provider);
+    // Account-level entries so per-account pacing/banked/floor state steers routing per account.
+    const accounts = new Set(providerPools.map(p => p.account).filter((a): a is string => typeof a === 'string' && a.length > 0 && a !== '*'));
+    const accountEntries: ProviderPacing[] = [];
+    for (const account of accounts) {
+      const acctPools = providerPools.filter(p => p.account === account);
+      const acctPoolIds = new Set(acctPools.map(p => p.pool_id));
+      const acctTranches = providerTranches.filter(t => acctPoolIds.has(t.pool_id) || t.account === account);
+      const acctEff = opts.efficiencies?.get(`${provider}:${account}`) ?? eff;
+      const acctPacing = computeGroupPacing(acctPools, acctTranches, nowMs, globalHalted, Boolean(opts.enforceFloors), acctEff);
+      out.set(`${provider}:${account}`, acctPacing);
+      const fam = normalizeProviderFamily(provider);
+      if (fam && fam !== provider && !out.has(`${fam}:${account}`)) {
+        out.set(`${fam}:${account}`, acctPacing);
+      }
+      accountEntries.push(acctPacing);
+    }
+    const provPacing = computeGroupPacing(providerPools, providerTranches, nowMs, globalHalted, Boolean(opts.enforceFloors), eff);
+    // If multiple accounts exist and at least one account is eligible while another is at floor,
+    // keep the provider aggregate unhalted unless a provider-wide kill switch is active.
+    if (opts.enforceFloors && accountEntries.length > 1 && accountEntries.some(a => !a.halted) && !globalHalted && !providerPools.some(p => p.kill_switch_active)) {
+      provPacing.halted = false;
+    }
+    out.set(provider, provPacing);
+    const fam = normalizeProviderFamily(provider);
+    if (fam && fam !== provider && !out.has(fam)) {
+      out.set(fam, provPacing);
+    }
+  }
+  return out;
+}
+
+export function pacingFor(
+  map: Map<string, ProviderPacing> | undefined,
+  provider: string,
+  account?: string | null,
+  routeProvider?: string | null
+): ProviderPacing {
+  if (!map) return NEUTRAL;
+  const globalHalted = map.get(TBM_FLEET_POOL_ID)?.halted === true;
+  const candidates: string[] = [];
+  if (account) {
+    if (routeProvider) candidates.push(`${routeProvider}:${account}`);
+    candidates.push(`${provider}:${account}`);
+  }
+  if (routeProvider) candidates.push(routeProvider);
+  candidates.push(provider);
+  for (const key of candidates) {
+    const found = map.get(key);
+    if (found) {
+      return globalHalted && !found.halted ? { ...found, halted: true, preempt: false } : found;
+    }
+  }
+  return globalHalted ? { ...NEUTRAL, halted: true } : NEUTRAL;
+}
 
 // ---------------------------------------------------------------------------
 // Phase 1 schema I/O
@@ -236,14 +412,70 @@ export const pacingFor = (map: Map<string, ProviderPacing> | undefined, provider
 const hasTable = (sql: SqlStorage, name: string) =>
   sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", name).toArray().length > 0;
 
-export function loadPools(sql: SqlStorage): TbmPoolRow[] {
-  return hasTable(sql, 'tbm_quota_pools') ? sql.exec('SELECT * FROM tbm_quota_pools').toArray() as unknown as TbmPoolRow[] : [];
+export function loadPools(sql: SqlStorage, includeSentinel = false): TbmPoolRow[] {
+  if (!hasTable(sql, 'tbm_quota_pools')) return [];
+  const query = includeSentinel
+    ? 'SELECT * FROM tbm_quota_pools'
+    : "SELECT * FROM tbm_quota_pools WHERE pool_id != '*'";
+  return sql.exec(query).toArray() as unknown as TbmPoolRow[];
 }
+
 export function loadActiveTranches(sql: SqlStorage, nowMs: number): TbmTrancheRow[] {
-  return hasTable(sql, 'tbm_banked_tranches') ? sql.exec("SELECT * FROM tbm_banked_tranches WHERE status = 'active' AND expires_at_ms > ? ORDER BY expires_at_ms ASC", nowMs).toArray() as unknown as TbmTrancheRow[] : [];
+  return hasTable(sql, 'tbm_banked_tranches')
+    ? sql.exec("SELECT * FROM tbm_banked_tranches WHERE status = 'active' AND expires_at_ms > ? ORDER BY expires_at_ms ASC", nowMs).toArray() as unknown as TbmTrancheRow[]
+    : [];
 }
+
+/** Compute bounded routing efficiency multipliers from measured native-token reward events. */
+export function loadProviderEfficiencies(sql: SqlStorage, nowMs: number): Map<string, number> {
+  const out = new Map<string, number>();
+  if (!hasTable(sql, 'tbm_reward_events')) return out;
+  try {
+    const cols = new Set(sql.exec('PRAGMA table_info(tbm_reward_events)').toArray().map((c: any) => String(c.name)));
+    const knownFilter = cols.has('tokens_known') ? 'AND tokens_known = 1' : 'AND token_efficiency_eta > 0';
+    const sinceMs = nowMs - 24 * HOUR;
+    const rows = sql.exec(
+      `SELECT pool_id, AVG(token_efficiency_eta) AS avg_eta, COUNT(*) AS n
+       FROM tbm_reward_events
+       WHERE timestamp_ms >= ? ${knownFilter} AND token_efficiency_eta > 0
+       GROUP BY pool_id`,
+      sinceMs
+    ).toArray() as any[];
+    const byProvider = new Map<string, { sum: number; n: number }>();
+    for (const r of rows) {
+      const eta = Number(r.avg_eta);
+      const count = Number(r.n) || 1;
+      if (!Number.isFinite(eta) || eta <= 0) continue;
+      // Smooth efficiency factor in [0.75, 1.25] centered at 1.0 for 50 VU/MTok nominal benchmark.
+      const mult = Math.max(0.75, Math.min(1.25, 0.75 + 0.5 * (eta / (eta + 50))));
+      const parts = String(r.pool_id || '').split(':');
+      const prov = parts[0];
+      const acct = parts[1];
+      if (prov && acct) out.set(`${prov}:${acct}`, mult);
+      if (prov) {
+        const cur = byProvider.get(prov) ?? { sum: 0, n: 0 };
+        cur.sum += eta * count;
+        cur.n += count;
+        byProvider.set(prov, cur);
+      }
+    }
+    for (const [prov, agg] of byProvider.entries()) {
+      const avgEta = agg.sum / Math.max(1, agg.n);
+      const mult = Math.max(0.75, Math.min(1.25, 0.75 + 0.5 * (avgEta / (avgEta + 50))));
+      out.set(prov, mult);
+    }
+  } catch {
+    /* ignore if schema not yet migrated */
+  }
+  return out;
+}
+
 /** Routing context from stored rows; empty tables keep routing neutral. */
-export const loadProviderPacing = (sql: SqlStorage, nowMs: number) => providerPacing(loadPools(sql), loadActiveTranches(sql, nowMs), nowMs);
+export const loadProviderPacing = (sql: SqlStorage, nowMs: number) =>
+  providerPacing(loadPools(sql, true), loadActiveTranches(sql, nowMs), nowMs, {
+    enforceFloors: true,
+    efficiencies: loadProviderEfficiencies(sql, nowMs),
+  });
 
 /**
  * One controller tick: settle expired/exhausted tranches, write their EDF targets, and write each
@@ -251,12 +483,16 @@ export const loadProviderPacing = (sql: SqlStorage, nowMs: number) => providerPa
  */
 export function refreshPacing(sql: SqlStorage, nowMs: number, states: Map<string, PidState>, opts: PacingOptions = {}): PacingResult[] {
   if (!hasTable(sql, 'tbm_quota_pools') || !hasTable(sql, 'tbm_banked_tranches')) return [];
+  const trancheCols = new Set(sql.exec('PRAGMA table_info(tbm_banked_tranches)').toArray().map((c: any) => String(c.name)));
+  const exhaustCond = trancheCols.has('quantity_known')
+    ? "status = 'active' AND remaining_tokens <= 0 AND COALESCE(quantity_known, 1) != 0"
+    : "status = 'active' AND remaining_tokens <= 0";
   sql.exec("UPDATE tbm_banked_tranches SET status = 'expired', expired_unused_tokens = expired_unused_tokens + remaining_tokens, remaining_tokens = 0, target_banked_burn_rate_tpm = 0, updated_at_ms = ? WHERE status = 'active' AND expires_at_ms <= ?", nowMs, nowMs);
-  sql.exec("UPDATE tbm_banked_tranches SET status = 'exhausted', target_banked_burn_rate_tpm = 0, updated_at_ms = ? WHERE status = 'active' AND remaining_tokens <= 0", nowMs);
+  sql.exec(`UPDATE tbm_banked_tranches SET status = 'exhausted', target_banked_burn_rate_tpm = 0, updated_at_ms = ? WHERE ${exhaustCond}`, nowMs);
   for (const t of loadActiveTranches(sql, nowMs)) {
     sql.exec('UPDATE tbm_banked_tranches SET target_banked_burn_rate_tpm = ?, updated_at_ms = ? WHERE tranche_id = ?', trancheUrgencyTpm(t, nowMs), nowMs, t.tranche_id);
   }
-  return loadPools(sql).map(pool => {
+  return loadPools(sql, false).map(pool => {
     const result = pacingStep(pool, states.get(pool.pool_id) ?? newPidState(), nowMs, opts);
     states.set(pool.pool_id, result.state);
     sql.exec('UPDATE tbm_quota_pools SET target_burn_rate_tpm = ?, pacing_ratio = ? WHERE pool_id = ?', result.targetTpm, result.pacingRatio, pool.pool_id);

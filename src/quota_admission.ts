@@ -130,6 +130,25 @@ export const TBM_SOFT_INIT_FRACTION = 0.2;
 export const TBM_SOFT_INIT_MIN_TOKENS = 200_000;
 export const TBM_DEFAULT_KAPPA = 1.5;
 
+const HOUR_MS = 3_600_000;
+const DAY_MS = 24 * HOUR_MS;
+const WINDOW_NOMINAL_CYCLE_MS: Record<string, number> = {
+  "1h": HOUR_MS,
+  hourly: HOUR_MS,
+  "5h": 5 * HOUR_MS,
+  five_hour: 5 * HOUR_MS,
+  "5hour": 5 * HOUR_MS,
+  daily: DAY_MS,
+  day: DAY_MS,
+  "24h": DAY_MS,
+  weekly: 7 * DAY_MS,
+  week: 7 * DAY_MS,
+  "7d": 7 * DAY_MS,
+  monthly: 30 * DAY_MS,
+  month: 30 * DAY_MS,
+  "30d": 30 * DAY_MS,
+};
+
 /** Engine -> quota provider (matches config/model-routing.json). */
 const ENGINE_PROVIDER: Record<string, string> = {
   claude: "claude", codex: "codex", grok: "grok", gemini: "gemini", antigravity: "gemini",
@@ -139,32 +158,104 @@ export function engineProvider(engine: string): string | null {
   return ENGINE_PROVIDER[engine] ?? null;
 }
 
+export function normalizeProviderFamily(provider: string | null | undefined): string | null {
+  if (!provider) return null;
+  return provider === "codex-orin" ? "codex" : provider;
+}
+
 export interface TbmPoolRow {
   pool_id: string;
   provider: string;
+  account?: string | null;
   total_capacity_tokens: number;
   remaining_tokens: number;
+  headroom_percentage?: number | null;
+  remaining_percent?: number | null;
+  capacity_known?: number | boolean | null;
+  quota_unit?: string | null;
   reset_at_ms: number;
+  cycle_ms?: number | null;
+  window_type?: string | null;
+  hard_floor_percent?: number | null;
+  soft_reserve_percent?: number | null;
   convexity_exponent?: number | null;
   kill_switch_active: number;
   kill_switch_reason?: string | null;
   last_updated_ms?: number | null;
 }
 
+function finiteNonNeg(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0;
+}
+
+function finitePercent(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 100;
+}
+
+/** True when the pool represents a percentage-only window with unknown token capacity. */
+export function isPercentOnlyTbmPool(p: Partial<TbmPoolRow>): boolean {
+  if (p.capacity_known === 0 || p.capacity_known === false || p.quota_unit === "percent") return true;
+  if (p.total_capacity_tokens === 0 && p.remaining_tokens === 0 && (finitePercent(p.remaining_percent) || finitePercent(p.headroom_percentage))) {
+    return true;
+  }
+  return false;
+}
+
+export function resolveTbmPoolCycleMs(
+  p: Pick<TbmPoolRow, "pool_id" | "cycle_ms" | "window_type">,
+  fallbackCycleMs?: number | null
+): number | null {
+  if (typeof p.cycle_ms === "number" && Number.isFinite(p.cycle_ms) && p.cycle_ms > 0) {
+    return p.cycle_ms;
+  }
+  if (fallbackCycleMs !== undefined) return fallbackCycleMs;
+  const win = typeof p.window_type === "string" && p.window_type
+    ? p.window_type
+    : (typeof p.pool_id === "string" && p.pool_id.split(":").length >= 3 ? p.pool_id.split(":").slice(2).join(":") : "");
+  if (win && WINDOW_NOMINAL_CYCLE_MS[win]) return WINDOW_NOMINAL_CYCLE_MS[win];
+  return null;
+}
+
 /** R_hard = max(5% of Q_total, 50k tokens). */
-export function tbmHardFloor(totalTokens: number): number {
-  return Math.max(totalTokens * TBM_HARD_FLOOR_FRACTION, TBM_HARD_FLOOR_MIN_TOKENS);
+export function tbmHardFloor(totalTokens: number, hardFloorPercent = TBM_HARD_FLOOR_FRACTION * 100): number {
+  const frac = finitePercent(hardFloorPercent) && hardFloorPercent > 0 ? hardFloorPercent / 100 : TBM_HARD_FLOOR_FRACTION;
+  return Math.max(totalTokens * frac, TBM_HARD_FLOOR_MIN_TOKENS);
 }
 
 /**
  * R_soft(t) = R_hard + (R_soft_init - R_hard) * ((T_reset - t) / T_cycle)^kappa.
- * The cycle length is not stored in tbm_quota_pools, so `cycleMs` is supplied by
- * the caller; when the window is unknown the reserve stays at R_soft_init
- * (conservative). Clamped to [R_hard, R_soft_init].
+ * The cycle length comes from `cycleMs` (ingested per pool); when the window is
+ * unknown the reserve stays at R_soft_init (conservative). Clamped to [R_hard, R_soft_init].
  */
-export function tbmSoftReserve(totalTokens: number, nowMs: number, resetAtMs: number, cycleMs: number | null, kappa = TBM_DEFAULT_KAPPA): number {
-  const hard = tbmHardFloor(totalTokens);
-  const init = Math.max(hard, Math.max(totalTokens * TBM_SOFT_INIT_FRACTION, TBM_SOFT_INIT_MIN_TOKENS));
+export function tbmSoftReserve(
+  totalTokens: number,
+  nowMs: number,
+  resetAtMs: number,
+  cycleMs: number | null,
+  kappa = TBM_DEFAULT_KAPPA,
+  hardFloorPercent = TBM_HARD_FLOOR_FRACTION * 100,
+  softReservePercent = TBM_SOFT_INIT_FRACTION * 100
+): number {
+  const hard = tbmHardFloor(totalTokens, hardFloorPercent);
+  const softFrac = finitePercent(softReservePercent) && softReservePercent > 0 ? softReservePercent / 100 : TBM_SOFT_INIT_FRACTION;
+  const init = Math.max(hard, Math.max(totalTokens * softFrac, TBM_SOFT_INIT_MIN_TOKENS));
+  if (cycleMs === null || !(cycleMs > 0) || !Number.isFinite(resetAtMs)) return init;
+  const k = Number.isFinite(kappa) && kappa > 0 ? kappa : TBM_DEFAULT_KAPPA;
+  const frac = Math.min(1, Math.max(0, (resetAtMs - nowMs) / cycleMs));
+  return hard + (init - hard) * Math.pow(frac, k);
+}
+
+/** Percentage-only soft reserve decay (20% -> 5% over cycleMs without 50k/200k token floor). */
+export function tbmSoftReservePercent(
+  nowMs: number,
+  resetAtMs: number,
+  cycleMs: number | null,
+  kappa = TBM_DEFAULT_KAPPA,
+  hardFloorPercent = TBM_HARD_FLOOR_FRACTION * 100,
+  softReservePercent = TBM_SOFT_INIT_FRACTION * 100
+): number {
+  const hard = finitePercent(hardFloorPercent) && hardFloorPercent > 0 ? hardFloorPercent : TBM_HARD_FLOOR_FRACTION * 100;
+  const init = Math.max(hard, finitePercent(softReservePercent) && softReservePercent > 0 ? softReservePercent : TBM_SOFT_INIT_FRACTION * 100);
   if (cycleMs === null || !(cycleMs > 0) || !Number.isFinite(resetAtMs)) return init;
   const k = Number.isFinite(kappa) && kappa > 0 ? kappa : TBM_DEFAULT_KAPPA;
   const frac = Math.min(1, Math.max(0, (resetAtMs - nowMs) / cycleMs));
@@ -189,41 +280,76 @@ export interface TbmAdmissionInput {
   pools: TbmPoolRow[];
   /** Provider the session will burn, when known (explicit engine); null = unknown. */
   provider: string | null;
+  /** Optional account filter when evaluating a specific route. */
+  account?: string | null;
   nowMs: number;
-  /** Assumed provider cycle length for R_soft decay; null keeps R_soft at its initial level. */
+  /** Fallback cycle length when a pool row has no cycle_ms/window_type; null keeps R_soft at its initial level. */
   cycleMs?: number | null;
 }
 
-function finiteNonNeg(v: unknown): v is number {
-  return typeof v === "number" && Number.isFinite(v) && v >= 0;
+function providerMatches(poolProvider: string, targetProvider: string): boolean {
+  if (poolProvider === targetProvider) return true;
+  return normalizeProviderFamily(poolProvider) === normalizeProviderFamily(targetProvider);
+}
+
+function accountMatches(pool: TbmPoolRow, account: string | null | undefined): boolean {
+  if (!account) return true;
+  if (!pool.account || pool.account === "default" || pool.account === "*") return true;
+  return pool.account === account;
 }
 
 /**
  * Autonomous admission: kill-switch (fleet pool "*" or the provider's pools),
  * then hard floor, then dynamic soft reserve. Floors are checked only for
  * pools of the target provider; with no known provider only kill-switches apply
- * (the router enforces floors per route in a later phase). Malformed rows fail closed.
+ * (the router enforces floors per route). Percentage-only pools evaluate
+ * strictly in percent (5% hard, 20%->5% soft) without a 50k token floor.
+ * Malformed rows fail closed.
  */
 export function evaluateTbmAdmission(input: TbmAdmissionInput): TbmAdmissionResult {
-  const { pools, provider, nowMs } = input;
-  const cycleMs = input.cycleMs ?? null;
+  const { pools, provider, account, nowMs } = input;
   for (const p of pools) {
     if (p.kill_switch_active !== 0 && p.kill_switch_active !== 1) {
       return { ok: false, reason: "malformed_pool", pool_id: p.pool_id, detail: "kill_switch_active" };
     }
-    const scoped = p.pool_id === TBM_FLEET_POOL_ID || (provider !== null && p.provider === provider);
+    const scoped = p.pool_id === TBM_FLEET_POOL_ID ||
+      (provider !== null && providerMatches(p.provider, provider) && accountMatches(p, account));
     if (scoped && p.kill_switch_active === 1) {
       return { ok: false, reason: "kill_switch_active", pool_id: p.pool_id, detail: p.kill_switch_reason ?? undefined };
     }
   }
   if (provider === null) return { ok: true, reason: "ok", pool_id: null };
   for (const p of pools) {
-    if (p.pool_id === TBM_FLEET_POOL_ID || p.provider !== provider) continue;
+    if (p.pool_id === TBM_FLEET_POOL_ID || !providerMatches(p.provider, provider) || !accountMatches(p, account)) continue;
+    const cycleMs = resolveTbmPoolCycleMs(p, input.cycleMs);
+    const kappa = p.convexity_exponent ?? TBM_DEFAULT_KAPPA;
+    if (isPercentOnlyTbmPool(p)) {
+      const remPct = finitePercent(p.remaining_percent)
+        ? p.remaining_percent
+        : (finitePercent(p.headroom_percentage) ? p.headroom_percentage : null);
+      if (remPct === null) {
+        return { ok: false, reason: "malformed_pool", pool_id: p.pool_id, detail: "percent" };
+      }
+      const hardPct = finitePercent(p.hard_floor_percent) && p.hard_floor_percent > 0 ? p.hard_floor_percent : TBM_HARD_FLOOR_FRACTION * 100;
+      const softPct = tbmSoftReservePercent(nowMs, p.reset_at_ms, cycleMs, kappa, hardPct, p.soft_reserve_percent ?? TBM_SOFT_INIT_FRACTION * 100);
+      const base = { pool_id: p.pool_id, r_hard: hardPct, r_soft: softPct, remaining: remPct };
+      if (remPct <= hardPct) return { ok: false, reason: "hard_floor", ...base };
+      if (remPct <= softPct) return { ok: false, reason: "soft_reserve", ...base };
+      continue;
+    }
     if (!finiteNonNeg(p.total_capacity_tokens) || !finiteNonNeg(p.remaining_tokens) || p.total_capacity_tokens <= 0) {
       return { ok: false, reason: "malformed_pool", pool_id: p.pool_id, detail: "capacity" };
     }
-    const hard = tbmHardFloor(p.total_capacity_tokens);
-    const soft = tbmSoftReserve(p.total_capacity_tokens, nowMs, p.reset_at_ms, cycleMs, p.convexity_exponent ?? TBM_DEFAULT_KAPPA);
+    const hard = tbmHardFloor(p.total_capacity_tokens, p.hard_floor_percent ?? TBM_HARD_FLOOR_FRACTION * 100);
+    const soft = tbmSoftReserve(
+      p.total_capacity_tokens,
+      nowMs,
+      p.reset_at_ms,
+      cycleMs,
+      kappa,
+      p.hard_floor_percent ?? TBM_HARD_FLOOR_FRACTION * 100,
+      p.soft_reserve_percent ?? TBM_SOFT_INIT_FRACTION * 100
+    );
     const base = { pool_id: p.pool_id, r_hard: hard, r_soft: soft, remaining: p.remaining_tokens };
     if (p.remaining_tokens <= hard) return { ok: false, reason: "hard_floor", ...base };
     if (p.remaining_tokens <= soft) return { ok: false, reason: "soft_reserve", ...base };

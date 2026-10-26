@@ -23,7 +23,8 @@ export function modelCandidates(input: any, route: any, advertisement: any, quot
     if (policy.rules.disabled_providers.includes(m.provider)) return false;
     if (unavailableEngines && unavailableEngines.has(m.engine)) return false;
     if (policy.rules.explicit_only_providers.includes(m.provider) && input.preferred_runner !== m.engine && ![m.id, m.model].includes(input.model)) return false;
-    return m.provider === route.provider && m.engine === route.engine && m.profile === route.profile &&
+    const routeFam = route.provider === 'codex-orin' ? 'codex' : route.provider;
+    return m.provider === routeFam && m.engine === route.engine && m.profile === route.profile &&
       advertisement.some((a: any) => a.engine === m.engine && a.profile === m.profile && a.model === m.model && a.effort === m.effort && a.account === route.account);
   }).map(m => {
     // Canonical fail-closed admission shared with dispatch/accountStatus/claim.
@@ -34,11 +35,11 @@ export function modelCandidates(input: any, route: any, advertisement: any, quot
     const remaining = Math.min(...windows.map(w => w.percent_remaining)) / 100;
     if (!Number.isFinite(remaining) || remaining <= 0 || remaining * 100 <= ((policy.rules.reserve_percent as any)[m.provider] ?? 0)) return null;
     const hours = Math.min(...windows.map(w => (Date.parse(w.reset_at) - now) / 3600000));
-    const paced = pacingFor(pacing, m.provider);
-    if (paced.halted) return null; // tbm kill switch: no auto-routed burn on this provider.
+    const paced = pacingFor(pacing, m.provider, route.account, route.provider);
+    if (paced.halted) return null; // tbm kill switch or floor breach: no auto-routed burn on this route.
     const headroom = netHeadroom(remaining * 100, (policy.rules.reserve_percent as any)[m.provider] ?? 0);
-    // Tier membership already enforces exact fit (no cross-tier failover); health stays neutral until measured.
-    const factors: RouteScoreFactors = { fit: 1, health: 1, preference: providerPreference(m.provider), headroom,
+    const health = typeof paced.efficiency === 'number' && Number.isFinite(paced.efficiency) && paced.efficiency > 0 ? paced.efficiency : 1;
+    const factors: RouteScoreFactors = { fit: 1, health, preference: providerPreference(m.provider), headroom,
       urgency: resetUrgency(headroom, hours), pacing: paced.pacing, grok: grokDemotion(m.provider), banked: paced.banked };
     return { ...m, tier, headroom: Math.max(policy.rules.headroom_floor, remaining), weight: routeScore(factors), factors, preempt: paced.preempt };
   }).filter((m): m is NonNullable<typeof m> => m !== null);
