@@ -37,7 +37,7 @@ describe('resource history', () => {
     expect(hub.sql.exec('SELECT payload_json FROM resource_history').toArray().flatMap((r:any)=>JSON.parse(r.payload_json)).filter((o:any)=>o.kind==='reservation').length).toBe(1); // cached heartbeat is not a new measurement
     expect(hub.sql.exec('SELECT COUNT(*) AS n FROM resource_history').one().n).toBe(n + 1); // fresh session-state read
     const restored = new HostHistoryService(hub.sql, hub.fleetService, () => c.t);
-    expect(restored.query('1h').series.find(s => s.metric === 'reserved_gib').points.some((p: any) => p.value === 0)).toBe(true); // reserved = Hub launch ramps only (launcher static reservations no longer double-counted)
+    expect(restored.query('1h').series.find(s => s.metric === 'reserved_gib').points.some((p: any) => p.value === 0)).toBe(true); // no ramp: resident caps are already in live MemAvailable
   }));
   it('compacts old observations, retains over 30 days and never alters source records', () => fixture((h, hub, c) => {
     for (const day of [0, 3, 8, 30, 31]) for (const minute of [0, 1, 2]) h.record('host', 'a', 'a', NOW - day * DAY - minute * 60000, { load1: minute }, 'test');
