@@ -24,6 +24,9 @@ import { loadProviderPacing, loadPools, netHeadroom, pacingFor, resetUrgency } f
 // keep LAUNCHER_TELEMETRY_STALE_MS >= 3x that (host regression test parses it).
 export const LAUNCHER_TELEMETRY_STALE_MS = 180000;
 export const GATE_STALE_MS = 300000;
+/** Engine holds that expire into a single retrial after this cooldown. */
+export const ENGINE_HEALTH_RETRY_MS = 600000;
+const RETRIABLE_ENGINE_HOLDS = new Set(['engine_auth_expired', 'engine_tool_permission_refused']);
 
 export const FLEET_SCHEMA = `
 CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
@@ -787,7 +790,11 @@ export class FleetService {
       if (request.with_goal && !['codex', 'zcodex'].includes(route.engine)) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'goal_unsupported' }); continue; }
       // A disabled execution engine holds all new candidate planning, whatever the account label.
       if (disabledEngines().has(route.engine)) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'provider_disabled' }); continue; }
-      const engineHealth: any = this.sql.exec("SELECT status, reason FROM fleet_engine_health WHERE engine = ? AND (machine_id = ? OR machine_id = '' OR machine_id IS NULL) AND status = 'unavailable'", route.engine, route.machine_id).toArray().find((h: any) => request.mode === 'headless' || h.reason !== 'engine_tool_permission_refused');
+      // Auth/permission holds are only cleared by a successful launch, which a
+      // held engine can never produce. After a cooldown one retrial may pass;
+      // a failure re-marks the engine (fresh updated_at) and requeues the launch.
+      const engineHealth: any = this.sql.exec("SELECT status, reason, updated_at FROM fleet_engine_health WHERE engine = ? AND (machine_id = ? OR machine_id = '' OR machine_id IS NULL) AND status = 'unavailable'", route.engine, route.machine_id).toArray().find((h: any) => (request.mode === 'headless' || h.reason !== 'engine_tool_permission_refused') &&
+        !(RETRIABLE_ENGINE_HOLDS.has(h.reason) && this.now() - Date.parse(h.updated_at) >= ENGINE_HEALTH_RETRY_MS));
       if (engineHealth && engineHealth.status === 'unavailable') {
         rejected.push({ machine: route.machine_id, engine: route.engine, reason: engineHealth.reason || 'engine_auth_expired' });
         continue;

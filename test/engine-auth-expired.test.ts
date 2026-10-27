@@ -267,6 +267,19 @@ describe('engine_auth_expired handling and routing recovery', () => {
       );
     }));
 
+  it('lets a single retrial through once an engine hold outlives the cooldown', async () =>
+    fixture(async (fleet, _routing, sql) => {
+      for (const reason of ['engine_auth_expired', 'engine_tool_permission_refused']) {
+        sql.exec("DELETE FROM fleet_engine_health");
+        sql.exec("INSERT INTO fleet_engine_health (engine, machine_id, status, reason, updated_at) VALUES ('opencode', 'hetzner', 'unavailable', ?, ?)",
+          reason, new Date(Date.now() - 20 * 60000).toISOString());
+        const planned = fleet.plan({ workspace: 'demo', tier: 'daily', engine: 'opencode', prompt: 'retrial' });
+        expect(planned.selected?.engine).toBe('opencode');
+        sql.exec("UPDATE fleet_engine_health SET updated_at = ?", iso());
+        expect(fleet.plan({ workspace: 'demo', tier: 'daily', engine: 'opencode', prompt: 'retrial' }).selected).toBeNull();
+      }
+    }));
+
   it('re-enables engine automatically when a probe succeeds or a launch succeeds', async () =>
     fixture(async (fleet, _routing, sql) => {
       // Mark opencode unavailable
