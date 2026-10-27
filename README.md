@@ -105,6 +105,11 @@ job returns `409 {"error": "root_scheduling_disabled"}`; root takeover returns
 The examples above are tokenless: they show placeholder cookie, bearer and CSRF
 values only, never a real credential.
 
+## Operations
+
+- Hub DB off-Cloudflare backup (daily export to Hetzner + Storagebox,
+  staleness alert, restore drill): [docs/HUB-DB-BACKUP.md](docs/HUB-DB-BACKUP.md).
+
 ## License
 
 MIT

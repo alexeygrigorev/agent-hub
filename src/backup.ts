@@ -1,0 +1,178 @@
+import type { Env } from './env';
+import type { SqlStorage } from '@cloudflare/workers-types';
+
+/**
+ * Independent off-Cloudflare backup export for the Hub Durable Object SQLite.
+ *
+ * Two read-only operator endpoints (wired in Hub.fetch via sessionControlAuth,
+ * which already enforces mixed-authority refusal, cookie CSRF and the narrow
+ * operator-token fallback):
+ *
+ * - GET /api/backup/export — consistent JSON dump of EVERY user table rows
+ *   plus the full DDL schema (tables, indexes, triggers, views) inside one
+ *   storage transaction, so the snapshot is internally consistent.
+ * - GET /api/backup/status — table names + row counts only (cheap liveness
+ *   proof for the restore drill without shipping the full dataset).
+ *
+ * Both require an admin caller (operator session, human credential or the
+ * configured operator token) and are per-caller sliding-window rate-limited.
+ * They never write business data; the only write is the rate-limit bucket row
+ * (backup_rate, excluded from the export so no caller IP ever lands in a
+ * backup file).
+ *
+ * Export size is bounded (per-table and total row caps); oversize exports
+ * fail closed with 413 instead of risking the 128 MiB DO memory ceiling.
+ */
+
+const RATE_SCHEMA = `
+CREATE TABLE IF NOT EXISTS backup_rate (
+  bucket TEXT PRIMARY KEY,
+  count INTEGER NOT NULL,
+  expires INTEGER NOT NULL
+);
+`;
+
+export interface BackupAuth {
+  caller?: { isAdmin?: boolean; actor?: string };
+  error?: Response;
+}
+
+const EXPORT_LIMIT_PER_HOUR = 30;
+const STATUS_LIMIT_PER_HOUR = 120;
+
+// DO memory is 128 MiB; materializing every table into JS objects peaks at
+// ~2-3x the JSON size. Fail closed well below that ceiling.
+const PER_TABLE_ROW_CAP = 200000;
+const TOTAL_ROW_CAP = 500000;
+
+// Ephemeral rate-limit state: never exported (would leak the caller/IP key).
+const EXCLUDED_FROM_EXPORT = new Set(['backup_rate']);
+
+export class ExportTooLarge extends Error {}
+
+function quoteIdent(name: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error('unexpected_table_name');
+  return '"' + name + '"';
+}
+
+export class BackupService {
+  // env is reserved for future operator-config use; auth arrives per-request.
+  constructor(private sql: SqlStorage, private tx: <T>(fn: () => T) => T, private env: Env) {
+    sql.exec(RATE_SCHEMA);
+    void this.env;
+  }
+
+  init() {}
+
+  /** User tables whose rows are exported (ephemeral state excluded). */
+  private userTables(): { name: string; sql: string }[] {
+    return (this.sql.exec(
+      "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    ).toArray() as any[]).filter(t => !EXCLUDED_FROM_EXPORT.has(String(t.name)));
+  }
+
+  /** Full replayable DDL: tables + indexes + triggers + views (auto-indexes excluded). */
+  private schemaObjects(): { name: string; sql: string }[] {
+    return (this.sql.exec(
+      "SELECT name, sql FROM sqlite_master WHERE type IN ('table','index','trigger','view') AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL ORDER BY name"
+    ).toArray() as any[]).filter(t => !EXCLUDED_FROM_EXPORT.has(String(t.name)));
+  }
+
+  private callerKey(request: Request, auth: BackupAuth): string {
+    const actor = typeof auth.caller?.actor === 'string' ? auth.caller.actor : '';
+    if (/^[A-Za-z0-9:_.-]{1,160}$/.test(actor)) return 'actor:' + actor;
+    const ip = request.headers.get('CF-Connecting-IP') || 'local';
+    if (/^[A-Za-z0-9.:]{1,64}$/.test(ip)) return 'ip:' + ip;
+    return 'ip:local';
+  }
+
+  /** Sliding-window per-caller rate limit; true when the request must be refused. */
+  private rateLimited(request: Request, auth: BackupAuth, kind: string, limit: number): boolean {
+    const now = Date.now();
+    const bucket = `backup:${kind}:${this.callerKey(request, auth)}`;
+    const row = this.sql.exec('SELECT count, expires FROM backup_rate WHERE bucket=?', bucket).one() as any;
+    if (!row || Number(row.expires) <= now) {
+      this.sql.exec(
+        'INSERT INTO backup_rate(bucket,count,expires) VALUES(?,1,?) ON CONFLICT(bucket) DO UPDATE SET count=1, expires=excluded.expires',
+        bucket, now + 3600000
+      );
+      return false;
+    }
+    const next = Number(row.count) + 1;
+    this.sql.exec('UPDATE backup_rate SET count=? WHERE bucket=?', next, bucket);
+    return next > limit;
+  }
+
+  private snapshot(): { exported_at: string; tables: string[]; row_counts: Record<string, number> } {
+    return this.tx(() => {
+      const names: string[] = [];
+      const counts: Record<string, number> = {};
+      for (const t of this.userTables()) {
+        const name = String(t.name);
+        names.push(name);
+        counts[name] = Number((this.sql.exec(`SELECT COUNT(*) AS n FROM ${quoteIdent(name)}`).one() as any).n);
+      }
+      return { exported_at: new Date().toISOString(), tables: names, row_counts: counts };
+    });
+  }
+
+  private fullExport(): {
+    exported_at: string;
+    snapshot: string;
+    schema: Record<string, string>;
+    row_counts: Record<string, number>;
+    tables: Record<string, any[]>;
+  } {
+    return this.tx(() => {
+      const schema: Record<string, string> = {};
+      for (const t of this.schemaObjects()) {
+        schema[String(t.name)] = String(t.sql || '');
+      }
+      const row_counts: Record<string, number> = {};
+      const data: Record<string, any[]> = {};
+      let total = 0;
+      for (const t of this.userTables()) {
+        const name = String(t.name);
+        const rows = this.sql.exec(`SELECT * FROM ${quoteIdent(name)}`).toArray() as any[];
+        if (rows.length > PER_TABLE_ROW_CAP) throw new ExportTooLarge(`table_too_large:${name}`);
+        total += rows.length;
+        if (total > TOTAL_ROW_CAP) throw new ExportTooLarge('export_too_large');
+        data[name] = rows;
+        row_counts[name] = rows.length;
+      }
+      return { exported_at: new Date().toISOString(), snapshot: 'hub-do-sqlite', schema, row_counts, tables: data };
+    });
+  }
+
+  handle(request: Request, auth: BackupAuth): Response {
+    if (auth.error) return auth.error;
+    if (!auth.caller?.isAdmin) {
+      return Response.json({ error: 'forbidden', reason: 'operator_required' }, { status: 403 });
+    }
+    const url = new URL(request.url);
+    try {
+      if (url.pathname === '/api/backup/status') {
+        if (request.method !== 'GET') return Response.json({ error: 'method_not_allowed' }, { status: 405 });
+        if (this.rateLimited(request, auth, 'status', STATUS_LIMIT_PER_HOUR)) {
+          return Response.json({ error: 'rate_limited' }, { status: 429 });
+        }
+        return Response.json({ ...this.snapshot(), snapshot: 'hub-do-sqlite' },
+          { headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
+      }
+      if (url.pathname === '/api/backup/export') {
+        if (request.method !== 'GET') return Response.json({ error: 'method_not_allowed' }, { status: 405 });
+        if (this.rateLimited(request, auth, 'export', EXPORT_LIMIT_PER_HOUR)) {
+          return Response.json({ error: 'rate_limited' }, { status: 429 });
+        }
+        return Response.json(this.fullExport(),
+          { headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
+      }
+    } catch (err) {
+      if (err instanceof ExportTooLarge) {
+        return Response.json({ error: 'export_too_large' }, { status: 413 });
+      }
+      return Response.json({ error: 'export_failed' }, { status: 500 });
+    }
+    return Response.json({ error: 'not_found' }, { status: 404 });
+  }
+}

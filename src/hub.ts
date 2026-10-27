@@ -40,6 +40,7 @@ import { SessionControlService } from './session_control';
 import { StatusService, type StatusMachineAuth } from './status';
 import { MetricsStore, handleMetricsRoutes } from './metrics';
 import { MonitoringService } from './monitoring';
+import { BackupService } from './backup';
 import { isValidMachineId } from './machine-id';
 import { HostHistoryService } from './host-history';
 import { HISTORY_RETENTION_MS } from './host-history';
@@ -125,6 +126,7 @@ export class Hub extends DurableObject {
   public livenessService: LivenessService;
   public checksService: ChecksService;
   public monitoringService: MonitoringService;
+  public backupService: BackupService;
   public hostHistoryService: HostHistoryService;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -236,6 +238,13 @@ export class Hub extends DurableObject {
     );
     this.monitoringService.init();
     this.monitoringService.setResourceProjection(machine => this.fleetService.hostResources(machine)[0]);
+    // Hub DB backup export (intake c1241bea): read-only, operator-auth only,
+    // rate-limited consistent JSON dump of all DO SQLite tables for the
+    // off-Cloudflare daily backup. Auth mirrors the intake/session mounts
+    // (operator-token fallback included); the service itself refuses every
+    // non-admin caller, so host/agent/job credentials get 403.
+    this.backupService = new BackupService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.env);
+    this.backupService.init();
     this.hostHistoryService = new HostHistoryService(this.sql, this.fleetService);
     this.hostHistoryService.init();
     this.statusService.setMonitoringService(this.monitoringService);
@@ -693,6 +702,13 @@ export class Hub extends DurableObject {
           return this.workerAccess.issue(request, auth.caller, auth.scopes);
         }
         return this.fleetService.handle(request, auth);
+      }
+      // Hub DB backup export (intake c1241bea, narrow read-only seam): exact
+      // operator surface for the off-Cloudflare daily backup. Auth mirrors
+      // the intake mount (operator-token fallback included); BackupService
+      // refuses every non-admin caller and only serves GET.
+      if (path === '/api/backup/export' || path === '/api/backup/status') {
+        return this.backupService.handle(request, await this.sessionControlAuth(request));
       }
       // M12e session control (narrow seam, owned by platform-session-api-r2).
       // Auth mirrors the intake mount exactly: bus credentials first, narrow
