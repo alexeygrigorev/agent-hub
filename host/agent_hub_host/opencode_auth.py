@@ -169,8 +169,9 @@ def _verification_identity(cfg, *, source_only=False):
     """Bind a short positive proof to the installed binary and login store.
 
     Native runtime refreshes and session writes change the runtime database,
-    so its incarnation (not its contents/mtime) is checked. Login-source writes
-    invalidate immediately, including uncheckpointed SQLite WAL changes.
+    so its incarnation (not its contents/mtime) is checked. The source uses its
+    incarnation plus semantic credential revision: committed login changes in
+    the WAL invalidate, while quota exports/checkpoints/session writes do not.
     Missing or ambiguous filesystem evidence disables reuse entirely.
     """
     def identity(path, *, contents=True, optional=False):
@@ -191,8 +192,7 @@ def _verification_identity(cfg, *, source_only=False):
         source = Path(cfg['source_data']) / 'opencode' / 'opencode.db'
         target = Path(cfg['target_data']) / 'opencode'
         result = {'config': cfg, 'binary': identity(cfg['binary']),
-                  'source': identity(source),
-                  'source_wal': identity(str(source) + '-wal', optional=True),
+                  'source': identity(source, contents=False),
                   'login_revision': _source_login_revision(cfg)}
         if result['login_revision'] is None:
             return None

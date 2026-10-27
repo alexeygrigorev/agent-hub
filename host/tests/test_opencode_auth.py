@@ -170,10 +170,15 @@ def test_changed_or_expired_device_proof_requires_real_verification(tmp_path, ch
     auth.prepare(cfg, native=proof_native)
     target = Path(cfg['target_data'])
     proof = target / 'device-verification.json'
+    wal = None
     if change == 'source':
         (Path(cfg['source_data']) / 'opencode' / 'opencode.db').write_bytes(b'new-login')
     elif change == 'wal':
-        (Path(cfg['source_data']) / 'opencode' / 'opencode.db-wal').write_bytes(b'uncheckpointed-login')
+        source = Path(cfg['source_data']) / 'opencode' / 'opencode.db'
+        wal = sqlite3.connect(source)
+        wal.execute('PRAGMA journal_mode=WAL')
+        wal.execute('UPDATE credential SET value=?', (json.dumps({'refresh': 'committed-login-in-WAL'}),))
+        wal.commit()  # Keep the connection open so the update remains in WAL.
     elif change == 'binary':
         Path(cfg['binary']).write_bytes(b'new-binary')
     elif change == 'runtime':
@@ -191,8 +196,12 @@ def test_changed_or_expired_device_proof_requires_real_verification(tmp_path, ch
         data['verified_at'] += -61 if change == 'expired' else 61
         proof.write_text(json.dumps(data))
     # A previous success must never hide the next verification failure.
-    with pytest.raises(ValueError, match='engine_auth_expired'):
-        auth.prepare(cfg, native=lambda *a, **k: [])
+    try:
+        with pytest.raises(ValueError, match='engine_auth_expired'):
+            auth.prepare(cfg, native=lambda *a, **k: [])
+    finally:
+        if wal is not None:
+            wal.close()
 
 
 def test_runtime_session_writes_reuse_proof_but_login_change_during_check_does_not(tmp_path):
@@ -227,6 +236,15 @@ def test_native_export_checkpoint_does_not_prevent_positive_proof(tmp_path):
         return result
     auth.prepare(cfg, native=checkpointing_native)
     auth.prepare(cfg, native=lambda *a, **k: pytest.fail('export checkpoint must not defeat sharing'))
+
+
+def test_later_quota_export_state_writes_do_not_defeat_verified_login_reuse(tmp_path):
+    cfg = proof_config(tmp_path)
+    auth.prepare(cfg, native=proof_native)
+    source = Path(cfg['source_data']) / 'opencode' / 'opencode.db'
+    with sqlite3.connect(source) as db:
+        db.execute('INSERT INTO maintenance VALUES(?)', ('independent-quota-export',))
+    auth.prepare(cfg, native=lambda *a, **k: pytest.fail('quota state is not a login change'))
 
 
 def test_login_switch_during_export_never_attests_the_new_source_with_old_login(tmp_path):
