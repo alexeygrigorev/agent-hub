@@ -109,7 +109,8 @@ describe('generic accounts and launch placement', () => {
     }
     const grok = await (await s.handle(request('/plan', intent({ engine: 'grok', tier: 'daily' })), admin)).json() as any;
     expect(grok.selected).toBeNull();
-    expect(grok.rejected).toContainEqual(expect.objectContaining({ engine: 'grok', reason: 'provider_disabled' }));
+    // t1621u: grok is out of every tier and its provider is disabled; either gate may fire first.
+    expect(grok.rejected).toContainEqual(expect.objectContaining({ engine: 'grok', reason: expect.stringMatching(/^(provider_disabled|tier_unavailable)$/) }));
     // Prefix siblings must never gain access when a root is added.
     const outside = await (await s.handle(request('/plan', intent({ engine: 'glm-flash', tier: 'daily', workspace: '/data/agents/project/worktrees-other/recovery' })), admin)).json() as any;
     expect(outside.selected).toBeNull();
