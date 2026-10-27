@@ -279,6 +279,21 @@ def _redeem_locked(rpc, path, account_id, credit_id, *, now=None, idempotency_ke
         return receipt
 
 
+def retained_receipt(path, account_id, credit_id, idempotency_key):
+    """Read an existing exact attempt without creating a journal or sending RPC."""
+    for value in (account_id, credit_id, idempotency_key):
+        _identifier(value)
+    with contextlib.closing(sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True)) as db:
+        row = db.execute('SELECT key,receipt FROM attempts WHERE account=? AND credit=?',
+                         (account_id, credit_id)).fetchone()
+    if not row or row[0] != idempotency_key:
+        raise CreditError('retained_attempt_identity_mismatch')
+    receipt = json.loads(row[1])
+    if (receipt.get('accountId'), receipt.get('creditId'), receipt.get('idempotencyKey')) != (account_id, credit_id, idempotency_key):
+        raise CreditError('retained_attempt_identity_mismatch')
+    return receipt
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--consume', action='store_true')

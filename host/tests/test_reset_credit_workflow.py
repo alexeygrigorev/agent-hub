@@ -1,5 +1,7 @@
 """Offline workflow ordering/correlation tests; never invokes a provider."""
 import copy
+import json
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -15,7 +17,8 @@ class WorkflowTests(unittest.TestCase):
         self.before = {'accountId': 'provider-a', 'observedAt': self.now, 'ordinaryUsageAllowed': False,
             'availableCount': 2, 'credits': [{'id': 'credit-a', 'expiresAt': self.now + 3600,
                 'status': 'available', 'resetType': 'codexRateLimits'}],
-            'windows': [{'usedPercent': 90, 'resetsAt': self.now + 86400}]}
+            'windows': [{'bucket': 'codex', 'window': 'primary', 'usedPercent': 90,
+                         'resetsAt': self.now + 86400, 'windowDurationMins': 10080}]}
         self.event = {'event_id': 'earned-reset:event-a', 'consumption_ready': True, 'decision': {
             'account': 'shared-codex', 'provider_account_id': 'provider-a', 'credit_id': 'credit-a',
             'expires_at_ms': (self.now + 3600) * 1000, 'captured_at_ms': self.now * 1000,
@@ -29,6 +32,8 @@ class WorkflowTests(unittest.TestCase):
     def receipt(self):
         after = copy.deepcopy(self.before)
         after.update(availableCount=1, credits=[])
+        after['windows'][0]['usedPercent'] = 0
+        after['ordinaryUsageAllowed'] = True
         return {'accountId': 'provider-a', 'creditId': 'credit-a', 'idempotencyKey': 'server-key',
                 'outcome': 'reset', 'before': self.before, 'after': after}
 
@@ -93,6 +98,59 @@ class WorkflowTests(unittest.TestCase):
         self.assertIsNone(report['after_count'])
         self.assertIsNone(report['after_at_ms'])
         self.assertEqual(report['selected_credit_state'], 'unknown')
+
+    def test_read_only_reconciliation_after_expiry_preserves_refill_baseline(self):
+        self.event['decision']['captured_at_ms'] -= 301000
+        self.event['consumption_ready'] = False
+        receipt = self.receipt()
+        later = copy.deepcopy(receipt['after'])
+        later['windows'][0]['usedPercent'] = 8
+        rpc = unittest.mock.Mock()
+        with patch.object(native, 'retained_receipt', return_value=receipt), patch.object(native, 'snapshot', return_value=later), patch.object(native, 'redeem') as redeem:
+            flow.reconcile(rpc, self.hub, self.event['event_id'])
+        redeem.assert_not_called()
+        rpc.call.assert_called_once_with(native.READ)
+        self.assertEqual(self.calls[-1][2]['receipt']['after_windows'][0]['used_percent'], 0)
+
+    def test_unknown_disappeared_credit_does_not_become_success(self):
+        receipt = self.receipt()
+        receipt.update(outcome='unknown', after=None)
+        rpc = unittest.mock.Mock()
+        with patch.object(native, 'retained_receipt', return_value=receipt), patch.object(native, 'snapshot', return_value=self.receipt()['after']), patch.object(native, 'redeem') as redeem:
+            result = flow.reconcile(rpc, self.hub, self.event['event_id'])
+        redeem.assert_not_called()
+        rpc.call.assert_called_once_with(native.READ)
+        self.assertFalse(result['reconciled'])
+        self.assertEqual(result['outcome'], 'unknown')
+        self.assertTrue(all(method == 'GET' for method, _, _ in self.calls))
+
+    def test_acknowledged_reset_refresh_recovery_never_consumes(self):
+        receipt = self.receipt()
+        receipt['after'] = None
+        rpc = unittest.mock.Mock()
+        with patch.object(native, 'retained_receipt', return_value=receipt), patch.object(native, 'snapshot', return_value=self.receipt()['after']), patch.object(native, 'redeem') as redeem:
+            result = flow.reconcile(rpc, self.hub, self.event['event_id'])
+        redeem.assert_not_called()
+        rpc.call.assert_called_once_with(native.READ)
+        self.assertEqual(result['recovered_receipt']['outcome'], 'reset')
+        self.assertTrue(result['requires_record'])
+        self.assertTrue(all(method == 'GET' for method, _, _ in self.calls))
+        self.assertIsNone(receipt['after'])
+
+    def test_retained_journal_read_only_exact_key_and_no_creation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'attempts.sqlite3'
+            with self.assertRaises(sqlite3.OperationalError):
+                native.retained_receipt(path, 'provider-a', 'credit-a', 'server-key')
+            self.assertFalse(path.exists())
+            with sqlite3.connect(path) as db:
+                db.execute('CREATE TABLE attempts (account TEXT,credit TEXT,key TEXT,receipt TEXT)')
+                db.execute('INSERT INTO attempts VALUES (?,?,?,?)', ('provider-a', 'credit-a', 'server-key', json.dumps(self.receipt())))
+            before = path.read_bytes()
+            self.assertEqual(native.retained_receipt(path, 'provider-a', 'credit-a', 'server-key')['outcome'], 'reset')
+            with self.assertRaisesRegex(native.CreditError, 'identity_mismatch'):
+                native.retained_receipt(path, 'provider-a', 'credit-a', 'different-key')
+            self.assertEqual(path.read_bytes(), before)
 
 
 if __name__ == '__main__':

@@ -81,11 +81,11 @@ and cookie CSRF checks. `prepare` stores server time/actor, the actual latest
 controller tick, fresh stored pool observations, unique EDF tranche matched by
 account/expiry, current routing factors, other active grants, and the
 operator-attested native credit identity. A global kill switch, stale data,
-ambiguous match or neutral banked factor prevents preparation. This creates an
+ambiguous match, disabled account, explicit pool kill or global engine health hold prevents preparation. A quota-reserve halt can require a reset; its actual routing factor is retained unchanged. The EDF reset-needed decision is separate from runnable-work eligibility. This creates an
 explicit operator-mediated pacing decision; it does not claim a scheduled
 redemption actuator exists. Preparation never changes quota or grants.
 
-The server allocates one stable provider idempotency key per account/credit;
+The server allocates one stable provider idempotency key per provider account ID/credit, independent of Hub alias;
 the native helper now accepts this key and rejects a conflicting journal key.
 This is the necessary replacement of frozen component `48eedf0a`: native RPC
 semantics remain the same, while multiple hosts cannot mint different keys for
@@ -93,17 +93,34 @@ the same Hub decision. Existing helper-only attempts with another key fail
 closed and require operator reconciliation, not journal deletion.
 
 The provider receipt remains an **operator attestation**, with an exact native
-journal SHA-256, separate server receipt time/actor and matching decision/key.
+canonical receipt JSON SHA-256 (not the SQLite database hash), separate server receipt time/actor and matching decision/key.
 The server does not call Codex itself. Provider no-op outcomes retain null
 post-read fields, rather than invented quota. The workflow never falls back to
 a local-only event when Hub transport fails. If preparation fails, no provider
 call occurs. If the receipt upload fails after redemption, preserve the native
 journal and retry uploading that exact receipt with `record --event-id ...
 --receipt-file ...`; that operation never invokes Codex. A stale decision stops
-new `consume` attempts. Use the retained journal to investigate unknown outcomes.
+new `consume` attempts. GET revalidates current controller freshness, EDF tranche, account, kill and health policy immediately before consume; native eligibility is also re-read before a first send. Use the supported read-only recovery command even after five minutes:
+
+```sh
+PYTHONPATH=host python3 -m agent_hub_host.reset_credit_workflow reconcile \
+  --event-id '<earned-reset:UUID>'
+```
+
+This reads the exact retained account/credit/key and fresh provider state; it
+never sends consumption or creates a journal. Pending/unknown outcomes remain
+unknown even if the coupon disappeared. Only an acknowledged reset can recover
+a missing refresh; recovery keeps the original receipt hash and does not
+rewrite the journal. An existing refill baseline is preserved. A prepared event
+with an acknowledged reset but no baseline returns `recovered_receipt` and
+`requires_record: true` with exit 2. Retain that exact JSON receipt privately,
+inspect its recovery hash and refresh, then upload it with `record`. This
+prevents later reads silently replacing the chosen baseline. A prepared event
+without any retained attempt cannot be reconciled into success or given a new
+key. Do not delete evidence or mint another attempt to bypass expiry.
 
 `link-work` reads existing SQL routing/launch/account, completed status, useful
-reward event and fresh post-receipt ingested pool observation. It records those
+reward event, retained native post-refill baseline and fresh post-work ingested pool observation. It requires a positive percentage-point drawdown in the exact same reset window and duration, with normal ingestion after job completion. It records those
 facts without modifying the job, quota, admission, or reward. It refuses work
 predating the reset, a different account, a forced model/runner, and work
 completed after credit expiry. Other grant/work observations support the proof

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
 import { handleResetCreditEvidence } from '../src/reset-credit-evidence';
+import { loadProviderPacing } from '../src/pacing';
 
 const inDO: any = runInDurableObject;
 const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
@@ -11,13 +12,14 @@ const request = (body?: any) => new Request('https://hub.test/api/quota/reset-cr
 });
 const call = (body?: any, at = now): Promise<Response> => inDO(stub(), (h: any) => handleResetCreditEvidence(request(body), h.sql, at));
 const input = () => ({ action: 'prepare', account: 'credit-test', credit_id: 'credit-a',
-  provider_account_id: 'provider-a', expires_at_ms: now + 3600000, observed_at_ms: now, available_count: 2 });
+  provider_account_id: 'provider-a', expires_at_ms: now + 3600000, observed_at_ms: now, available_count: 2, provider_used_percent: 90 });
 async function prepared() { return (await call(input())).json() as Promise<any>; }
 function receipt(e: any, overrides: any = {}) {
   return { action: 'receipt', event_id: e.event_id, receipt: {
     account_id: 'provider-a', credit_id: 'credit-a', idempotency_key: e.decision.idempotency_key,
     outcome: 'reset', before_at_ms: now, after_at_ms: now + 1000, before_count: 2, after_count: 1,
-    selected_credit_state: 'absent', sha256: 'a'.repeat(64), ...overrides } };
+    selected_credit_state: 'absent', sha256: 'a'.repeat(64), after_usage_allowed: true,
+    after_windows: [{ bucket: 'codex', window: 'primary', used_percent: 0, reset_at_ms: now + 86400000, window_minutes: 10080 }], ...overrides } };
 }
 
 beforeEach(async () => {
@@ -27,6 +29,8 @@ beforeEach(async () => {
     h.sql.exec('DROP TABLE IF EXISTS tbm_reset_credit_evidence');
     h.sql.exec('DELETE FROM tbm_banked_tranches');
     h.sql.exec('DELETE FROM tbm_quota_pools');
+    h.sql.exec("INSERT OR REPLACE INTO fleet_accounts VALUES('credit-test','codex',1,15,1)");
+    h.sql.exec("DELETE FROM fleet_engine_health WHERE engine='codex'");
     h.sql.exec('CREATE TABLE IF NOT EXISTS tbm_tick_state (id INTEGER PRIMARY KEY,last_tick_ms INTEGER NOT NULL,summary_json TEXT NOT NULL)');
     h.sql.exec("INSERT OR REPLACE INTO tbm_tick_state VALUES(1,?,'{}')", now);
     h.sql.exec(`INSERT INTO tbm_quota_pools (pool_id,provider,account,total_capacity_tokens,remaining_tokens,
@@ -46,7 +50,33 @@ describe('earned-reset genuine evidence correlation (offline fixtures)', () => {
     expect(e.authority).toBe('operator_attestation_with_hub_state');
     expect(e.ac2_accepted).toBe(false);
     expect(await (await call(input())).json()).toEqual(e);
-    expect((await call({ ...input(), provider_account_id: 'other' })).status).toBe(409);
+    expect((await call({ ...input(), account: 'renamed-alias' })).status).toBe(409);
+    const rows: any = await (await call()).json();
+    expect(rows.events).toHaveLength(1); // same physical credit cannot acquire a new key under another alias
+  });
+  it('prepares genuine EDF reset need at the reserve boundary without inventing a runnable factor', async () => {
+    await inDO(stub(), (h: any) => h.sql.exec('UPDATE tbm_quota_pools SET hard_floor_percent=15,remaining_percent=15,headroom_percentage=15'));
+    const before = await inDO(stub(), (h: any) => loadProviderPacing(h.sql, now).get('codex:credit-test'));
+    expect(before).toMatchObject({ halted: true });
+    expect((await call({ ...input(), provider_used_percent: 84 })).status).toBe(400);
+    const e: any = await (await call({ ...input(), provider_used_percent: 85 })).json();
+    expect(e.decision).toMatchObject({ reset_needed_basis: 'native_quota_at_or_below_reserve', routing_eligibility_unchanged: true });
+    expect(e.decision.routing_factors).toEqual(before);
+    expect(await inDO(stub(), (h: any) => loadProviderPacing(h.sql, now).get('codex:credit-test'))).toEqual(before);
+  });
+  it('does not prepare across actual disabled-account, global health or explicit pool kill policies', async () => {
+    await inDO(stub(), (h: any) => h.sql.exec("UPDATE fleet_accounts SET enabled=0 WHERE label='credit-test'"));
+    expect((await call(input())).status).toBe(409);
+    await inDO(stub(), (h: any) => {
+      h.sql.exec("UPDATE fleet_accounts SET enabled=1 WHERE label='credit-test'");
+      h.sql.exec("INSERT INTO fleet_engine_health(engine,machine_id,status,reason,updated_at) VALUES('codex','','unavailable','engine_auth_expired',?)", new Date(now).toISOString());
+    });
+    expect((await call(input())).status).toBe(409);
+    await inDO(stub(), (h: any) => {
+      h.sql.exec("DELETE FROM fleet_engine_health WHERE engine='codex'");
+      h.sql.exec('UPDATE tbm_quota_pools SET kill_switch_active=1');
+    });
+    expect((await call(input())).status).toBe(409);
   });
   it('fails closed for stale provider facts, stale tick and stale ingested quota', async () => {
     expect((await call({ ...input(), observed_at_ms: now - 60001 })).status).toBe(400);
@@ -89,10 +119,32 @@ describe('earned-reset genuine evidence correlation (offline fixtures)', () => {
     expect(await (await call(r)).json()).toEqual(recorded);
     expect((await call(receipt(e, { sha256: 'b'.repeat(64) }))).status).toBe(409);
   });
+  it('revalidates current policy and EDF state before granting consumption readiness', async () => {
+    await prepared();
+    const ready = async () => (await (await call()).json() as any).events[0].consumption_ready;
+    expect(await ready()).toBe(true);
+    await inDO(stub(), (h: any) => h.sql.exec("UPDATE fleet_accounts SET enabled=0 WHERE label='credit-test'"));
+    expect(await ready()).toBe(false);
+    await inDO(stub(), (h: any) => {
+      h.sql.exec("UPDATE fleet_accounts SET enabled=1 WHERE label='credit-test'");
+      h.sql.exec('UPDATE tbm_quota_pools SET kill_switch_active=1');
+    });
+    expect(await ready()).toBe(false);
+    await inDO(stub(), (h: any) => {
+      h.sql.exec('UPDATE tbm_quota_pools SET kill_switch_active=0');
+      h.sql.exec("UPDATE tbm_banked_tranches SET status='expired'");
+    });
+    expect(await ready()).toBe(false);
+    await inDO(stub(), (h: any) => {
+      h.sql.exec("UPDATE tbm_banked_tranches SET status='active'");
+      h.sql.exec('UPDATE tbm_tick_state SET last_tick_ms=?', now - 300001);
+    });
+    expect(await ready()).toBe(false);
+  });
   it('preserves no-op provider outcome without fabricating a post-read', async () => {
     const e = await prepared();
     const recorded: any = await (await call(receipt(e, { outcome: 'nothingToReset', after_at_ms: null,
-      after_count: null, selected_credit_state: 'unknown' }))).json();
+      after_count: null, selected_credit_state: 'unknown', after_windows: [], after_usage_allowed: null }))).json();
     expect(recorded.receipt.outcome).toBe('nothingToReset');
     expect((await call({ action: 'link-work', event_id: e.event_id, routing_job_id: 'job-a' })).status).toBe(409);
   });
@@ -128,9 +180,14 @@ describe('earned-reset genuine evidence correlation (offline fixtures)', () => {
     });
     expect((await call(body, now + 3000)).status).toBe(409);
     await inDO(stub(), (h: any) => h.sql.exec("UPDATE routing_jobs SET request_json='{}' WHERE id='job-a'"));
+    await inDO(stub(), (h: any) => h.sql.exec('UPDATE tbm_quota_pools SET remaining_percent=100'));
+    expect(await (await call(body, now + 3000)).json()).toMatchObject({ error: 'same_window_post_work_drawdown_required' });
+    await inDO(stub(), (h: any) => h.sql.exec('UPDATE tbm_quota_pools SET remaining_percent=99,reset_at_ms=?', now + 90000000));
+    expect(await (await call(body, now + 3000)).json()).toMatchObject({ error: 'same_window_post_work_drawdown_required' });
+    await inDO(stub(), (h: any) => h.sql.exec('UPDATE tbm_quota_pools SET reset_at_ms=?', now + 86400000));
     const r: any = await (await call(body, now + 3000)).json();
     expect(r.work).toMatchObject({ routing_job_id: 'job-a', reward: { event_id: 'session:job-a', work_units: 10 },
-      pool: { remaining_percent: 99 }, no_starvation_verified: false });
+      pool: { remaining_percent: 99 }, quota_drawdown: { used_delta_percentage_points: 1 }, no_starvation_verified: false });
     expect(r.ac2_accepted).toBe(false);
     expect(await (await call(body, now + 4000)).json()).toEqual(r);
   });

@@ -26,7 +26,9 @@ def prepare(rpc, hub, account, credit_id):
     event = _event(hub('POST', PATH, {'action': 'prepare', 'account': account,
         'credit_id': credit_id, 'provider_account_id': before['accountId'],
         'expires_at_ms': credit['expiresAt'] * 1000,
-        'observed_at_ms': before['observedAt'] * 1000, 'available_count': before['availableCount']}))
+        'observed_at_ms': before['observedAt'] * 1000, 'available_count': before['availableCount'],
+        'provider_used_percent': max(w['usedPercent'] for w in before['windows']
+            if w.get('usedPercent', 0) >= 85 and isinstance(w.get('resetsAt'), int) and w['resetsAt'] > int(time.time()))}))
     decision = event['decision']
     if (decision.get('account') != account or decision.get('credit_id') != credit_id or
             decision.get('provider_account_id') != before['accountId'] or
@@ -58,6 +60,34 @@ def consume(rpc, hub, event_id, journal=None):
     return record(hub, event_id, receipt)
 
 
+def reconcile(rpc, hub, event_id, journal=None):
+    """Read-only recovery after decision expiry; never resends consumption.
+
+    An unknown outcome stays unknown even when a coupon disappeared. Only a
+    retained provider acknowledgement can be published as a successful reset.
+    Preserve an existing refill baseline rather than replacing it after work.
+    """
+    event = _get_event(hub, event_id)
+    d = event['decision']
+    receipt = native.retained_receipt(native.journal_path() if journal is None else journal,
+        d.get('provider_account_id'), d.get('credit_id'), d.get('idempotency_key'))
+    observation = native.snapshot(rpc.call(native.READ))
+    if observation['accountId'] != d['provider_account_id']:
+        raise native.CreditError('account_mismatch')
+    if receipt.get('outcome') in ('pending', 'unknown'):
+        return {'event_id': event_id, 'outcome': receipt['outcome'], 'observation': observation,
+                'reconciled': False, 'consumption_sent': False, 'ac2_accepted': False}
+    if receipt.get('outcome') in ('reset', 'alreadyRedeemed') and receipt.get('after') is None:
+        # Derived recovery evidence retains the original acknowledged receipt.
+        receipt = dict(receipt, after=observation, recovery={'source': 'read_only_refresh',
+            'original_receipt_sha256': hashlib.sha256(json.dumps(receipt, sort_keys=True, separators=(',', ':')).encode()).hexdigest()})
+        # Keep recovery read-only and make this exact baseline reviewable and
+        # retainable before upload; repeated refreshes must not replace it.
+        return {'event_id': event_id, 'recovered_receipt': receipt, 'requires_record': True,
+                'consumption_sent': False, 'ac2_accepted': False}
+    return record(hub, event_id, receipt)
+
+
 def record(hub, event_id, receipt):
     """Publish an actual durable receipt, including retry after a Hub outage.
 
@@ -77,7 +107,12 @@ def record(hub, event_id, receipt):
         'idempotency_key': receipt['idempotencyKey'], 'outcome': receipt['outcome'],
         'before_at_ms': before['observedAt'] * 1000, 'after_at_ms': after['observedAt'] * 1000 if after else None,
         'before_count': before['availableCount'], 'after_count': after['availableCount'] if after else None,
+        'after_usage_allowed': after.get('ordinaryUsageAllowed') if after else None,
+        'after_windows': [{'bucket': w['bucket'], 'window': w['window'], 'used_percent': w['usedPercent'],
+            'reset_at_ms': w['resetsAt'] * 1000 if w.get('resetsAt') is not None else None,
+            'window_minutes': w.get('windowDurationMins')} for w in after.get('windows', [])] if after else [],
         'selected_credit_state': 'unknown' if not after else selected['status'] if selected and selected['status'] in ('available', 'redeemed') else 'unknown' if selected else 'absent',
+        # Hash of the canonical receipt JSON, NOT the SQLite database bytes.
         'sha256': hashlib.sha256(json.dumps(receipt, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
     return _event(hub('POST', PATH, {'action': 'receipt', 'event_id': event_id, 'receipt': evidence}))
 
@@ -90,6 +125,8 @@ def main():
     p.add_argument('--credit-id', required=True)
     p = commands.add_parser('consume')
     p.add_argument('--event-id', required=True)
+    p = commands.add_parser('reconcile')
+    p.add_argument('--event-id', required=True)
     p = commands.add_parser('record')
     p.add_argument('--event-id', required=True)
     p.add_argument('--receipt-file', required=True)
@@ -99,9 +136,14 @@ def main():
     args = parser.parse_args()
     try:
         hub = session_control.request
-        if args.command in ('prepare', 'consume'):
+        if args.command in ('prepare', 'consume', 'reconcile'):
             with native.AppServer() as rpc:
-                result = prepare(rpc, hub, args.account, args.credit_id) if args.command == 'prepare' else consume(rpc, hub, args.event_id)
+                if args.command == 'prepare':
+                    result = prepare(rpc, hub, args.account, args.credit_id)
+                elif args.command == 'consume':
+                    result = consume(rpc, hub, args.event_id)
+                else:
+                    result = reconcile(rpc, hub, args.event_id)
         elif args.command == 'record':
             with open(args.receipt_file, 'rb') as file:
                 data = file.read(65537)
@@ -111,6 +153,8 @@ def main():
         else:
             result = hub('POST', PATH, {'action': 'link-work', 'event_id': args.event_id, 'routing_job_id': args.routing_job_id})
         print(json.dumps(result, sort_keys=True))
+        if args.command == 'reconcile' and (result.get('reconciled') is False or result.get('requires_record')):
+            return 2
         if args.command == 'consume':
             r = result.get('receipt') or {}
             if (r.get('outcome') not in ('reset', 'alreadyRedeemed') or type(r.get('after_count')) is not int or
