@@ -39,6 +39,11 @@ export interface BackupAuth {
 
 const EXPORT_LIMIT_PER_HOUR = 30;
 const STATUS_LIMIT_PER_HOUR = 120;
+// Bounded chunked reads (single table slice): generous budget, since each
+// call is capped to CHUNK_MAX_ROWS rows.
+const CHUNK_LIMIT_PER_HOUR = 2000;
+const CHUNK_MAX_ROWS = 5000;
+const CHUNK_DEFAULT_ROWS = 500;
 
 // Backup export API version. Bump on any BackupService behavior change so
 // operators can tell which code a live (possibly long-lived) DO isolate is
@@ -100,83 +105,132 @@ export class BackupService {
   }
 
   /**
-   * JSON replacer for export rows. SQLite/Workers values are almost always
-   * JSON-native, but production data has contained values JSON.stringify
-   * rejects outright. Everything converts explicitly: BigInts and raw
-   * binary become documented lossless markers; anything else unserializable
-   * (lazy-throwing accessors, unknown host objects, over-deep or circular
-   * shapes) becomes an explicit unreadable/circular marker instead of
-   * failing the whole backup. Conversions are counted so the restore drill
-   * can verify them. Encoding uses only web primitives, no Node Buffer
-   * dependency inside the DO isolate.
+   * JSON-safe sanitizer for export rows. SQLite/Workers values are almost
+   * always JSON-native, but production data has contained values
+   * JSON.stringify rejects outright. Everything converts explicitly:
+   * BigInts and raw binary become documented lossless markers; anything
+   * else unserializable (lazy-throwing accessors, unknown host objects,
+   * over-deep or circular shapes) becomes an explicit unreadable/circular
+   * marker instead of failing the whole backup. Conversions are counted so
+   * the restore drill can verify them. Never throws. Encoding uses only web
+   * primitives, no Node Buffer dependency inside the DO isolate.
    */
-  private exportReplacer(table: string, stats: { bigint: number; blob: number; unreadable: number }) {
-    const seen = new WeakSet<object>();
-    const convert = (key: string, value: unknown, depth: number): unknown => {
-      if (value === null || value === undefined) return null;
-      const t = typeof value;
-      if (t === 'bigint') {
-        stats.bigint++;
-        return { __hub_backup_bigint: (value as bigint).toString() };
+  private sanitizeValue(table: string, stats: { bigint: number; blob: number; unreadable: number }, depth: number, key: string, value: unknown, seen: WeakSet<object> = new WeakSet()): unknown {
+    if (value === null || value === undefined) return null;
+    const t = typeof value;
+    if (t === 'bigint') {
+      stats.bigint++;
+      return { __hub_backup_bigint: (value as bigint).toString() };
+    }
+    if (t === 'string' || t === 'number' || t === 'boolean') return value;
+    if (value instanceof ArrayBuffer) {
+      stats.blob++;
+      const bytes = new Uint8Array(value as ArrayBuffer);
+      let binary = '';
+      const CHUNK = 0x8000;
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as any);
       }
-      if (t === 'string' || t === 'number' || t === 'boolean') return value;
-      if (value instanceof ArrayBuffer) {
-        stats.blob++;
-        const bytes = new Uint8Array(value as ArrayBuffer);
-        let binary = '';
-        const CHUNK = 0x8000;
-        for (let i = 0; i < bytes.length; i += CHUNK) {
-          binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as any);
-        }
-        let b64: string;
-        try {
-          b64 = btoa(binary);
-        } catch (err) {
-          stats.unreadable++;
-          return { __hub_backup_unreadable: key || true };
-        }
-        return { __hub_backup_blob_b64: b64 };
-      }
-      if (depth > 50) {
+      try {
+        return { __hub_backup_blob_b64: btoa(binary) };
+      } catch (err) {
         stats.unreadable++;
         return { __hub_backup_unreadable: key || true };
       }
-      if (t === 'object') {
-        if (seen.has(value as object)) {
-          stats.unreadable++;
-          return { __hub_backup_circular: key || true };
-        }
-        seen.add(value as object);
-        try {
-          if (Array.isArray(value)) return (value as unknown[]).map((v, i) => convert(String(i), v, depth + 1));
-          const out: Record<string, unknown> = {};
-          for (const k of Object.keys(value as Record<string, unknown>)) {
-            let v: unknown;
-            try {
-              v = (value as Record<string, unknown>)[k];
-            } catch (err) {
-              stats.unreadable++;
-              out[k] = { __hub_backup_unreadable: k };
-              continue;
-            }
-            out[k] = convert(k, v, depth + 1);
-          }
-          return out;
-        } finally {
-          seen.delete(value as object);
-        }
-      }
+    }
+    if (depth > 50 || t !== 'object') {
       stats.unreadable++;
-      return { __hub_backup_unreadable: key || typeof value };
-    };
-    return function (_key: string, value: unknown) {
+      return { __hub_backup_unreadable: key || t };
+    }
+    if (seen.has(value as object)) {
+      stats.unreadable++;
+      return { __hub_backup_circular: key || true };
+    }
+    seen.add(value as object);
+    try {
+      if (Array.isArray(value)) return (value as unknown[]).map((v, i) => this.sanitizeValue(table, stats, depth + 1, String(i), v, seen));
+      const out: Record<string, unknown> = {};
+      for (const k of Object.keys(value as Record<string, unknown>)) {
+        let v: unknown;
+        try {
+          v = (value as Record<string, unknown>)[k];
+        } catch (err) {
+          stats.unreadable++;
+          out[k] = { __hub_backup_unreadable: k };
+          continue;
+        }
+        out[k] = this.sanitizeValue(table, stats, depth + 1, k, v, seen);
+      }
+      return out;
+    } finally {
+      seen.delete(value as object);
+    }
+  }
+
+  /** Sanitize every row of one table into guaranteed JSON-safe values. */
+  private sanitizeRows(table: string, rows: any[], stats: { bigint: number; blob: number; unreadable: number }): unknown[] {
+    return rows.map((row, i) => {
       try {
-        return convert(_key, value, 0);
+        return this.sanitizeValue(table, stats, 0, String(i), row);
       } catch (err) {
         stats.unreadable++;
-        return { __hub_backup_unreadable: _key || true };
+        return { __hub_backup_unreadable: i };
       }
-    };
+    });
+  }
+
+  /** Chunked per-table read: bounded rows per request so giant tables (and
+   * giant exports) never exceed DO memory. Each chunk is internally
+   * consistent (single transaction); cross-chunk drift is possible on hot
+   * tables and verified tolerant by the backup script. */
+  private tableChunk(table: string, offset: number, limit: number): {
+    exported_at: string;
+    snapshot: string;
+    table: string;
+    offset: number;
+    limit: number;
+    total: number;
+    ddl: string;
+    rows: unknown[];
+    value_markers: { bigint: number; blob: number; unreadable: number };
+  } {
+    return this.tx(() => {
+      const names = new Set(this.userTables().map(t => String(t.name)));
+      if (!names.has(table)) throw new ExportStageError('table', table);
+      const total = Number((this.sql.exec(`SELECT COUNT(*) AS n FROM ${quoteIdent(table)}`).one() as any).n);
+      if (!Number.isInteger(offset) || !Number.isInteger(limit) || offset < 0 || limit < 1 || limit > CHUNK_MAX_ROWS || offset > total) {
+        throw new ExportStageError('range', table);
+      }
+      const ddlRow = (this.schemaObjects().filter(t => String(t.name) === table)[0] as any);
+      const ddl = String(ddlRow?.sql || '');
+      let rows: any[];
+      try {
+        rows = this.sql.exec(`SELECT * FROM ${quoteIdent(table)} LIMIT ? OFFSET ?`, limit, offset).toArray() as any[];
+      } catch (err) {
+        throw new ExportStageError('export', table);
+      }
+      const stats = { bigint: 0, blob: 0, unreadable: 0 };
+      const clean = this.sanitizeRows(table, rows, stats);
+      return {
+        exported_at: new Date().toISOString(), snapshot: 'hub-do-sqlite',
+        table, offset, limit, total, ddl, rows: clean, value_markers: stats,
+      };
+    });
+  }
+
+  /** Full replayable schema (tables, indexes, triggers, views) without rows. */
+  private schemaDump(): { exported_at: string; snapshot: string; schema: Record<string, string> } {
+    return this.tx(() => {
+      const schema: Record<string, string> = {};
+      let objects: { name: string; sql: string }[];
+      try {
+        objects = this.schemaObjects();
+      } catch (err) {
+        throw new ExportStageError('schema');
+      }
+      for (const t of objects) schema[String(t.name)] = String(t.sql || '');
+      return { exported_at: new Date().toISOString(), snapshot: 'hub-do-sqlite', schema };
+    });
   }
 
   /**
@@ -198,11 +252,17 @@ export class BackupService {
     const encodedTables: string[] = [];
     let first = true;
     for (const name of Object.keys(payload.tables)) {
-      let encoded: string;
+      let sanitized: unknown;
       try {
-        encoded = JSON.stringify(payload.tables[name], this.exportReplacer(name, stats));
+        sanitized = this.sanitizeRows(name, payload.tables[name], stats);
       } catch (err) {
         if (err instanceof ExportStageError) throw err;
+        throw new ExportStageError('serialize', name);
+      }
+      let encoded: string;
+      try {
+        encoded = JSON.stringify(sanitized);
+      } catch (err) {
         throw new ExportStageError('serialize', name);
       }
       encodedTables.push((first ? '' : ',') + JSON.stringify(name) + ':' + encoded);
@@ -338,6 +398,40 @@ export class BackupService {
       }
       if (url.pathname === '/api/backup/export') {
         if (request.method !== 'GET') return Response.json({ error: 'method_not_allowed' }, { status: 405 });
+        // Chunked per-table reads (?table=&offset=&limit=) and the schema
+        // dump (?schema=1) are bounded work per call: they share a generous
+        // per-caller budget. The unbounded full dump keeps the tight budget.
+        const tableParam = url.searchParams.get('table');
+        const schemaOnly = url.searchParams.get('schema');
+        if (tableParam !== null || schemaOnly !== null) {
+          if (this.rateLimited(request, auth, 'chunk', CHUNK_LIMIT_PER_HOUR)) {
+            return Response.json({ error: 'rate_limited' }, { status: 429 });
+          }
+          if (schemaOnly !== null) {
+            if (schemaOnly !== '1') return Response.json({ error: 'invalid_schema_flag' }, { status: 400 });
+            if (tableParam !== null) return Response.json({ error: 'invalid_combination' }, { status: 400 });
+            return Response.json(this.schemaDump(),
+              { headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
+          }
+          const table = String(tableParam);
+          const offset = Number(url.searchParams.get('offset') ?? '0');
+          const limit = Number(url.searchParams.get('limit') ?? String(CHUNK_DEFAULT_ROWS));
+          if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table)) {
+            return Response.json({ error: 'invalid_table' }, { status: 400 });
+          }
+          try {
+            return Response.json(this.tableChunk(table, offset, limit),
+              { headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
+          } catch (err) {
+            if (err instanceof ExportStageError && err.stage === 'table') {
+              return Response.json({ error: 'unknown_table' }, { status: 404 });
+            }
+            if (err instanceof ExportStageError && err.stage === 'range') {
+              return Response.json({ error: 'invalid_range' }, { status: 400 });
+            }
+            throw err;
+          }
+        }
         if (this.rateLimited(request, auth, 'export', EXPORT_LIMIT_PER_HOUR)) {
           return Response.json({ error: 'rate_limited' }, { status: 429 });
         }

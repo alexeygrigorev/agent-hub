@@ -54,23 +54,33 @@ rate limiting (export 429 then status still 200).
 ## 2. Off-Cloudflare daily job
 
 `scripts/hub-db-backup.sh` (cron `scripts/hub-db-backup.cron`,
-`20 4 * * *` Europe/Berlin) on the Hetzner operator host:
+`20 4 * * *` Europe/Berlin) on the Hetzner operator host. Because a single
+monolithic export can exceed DO memory on production data (and a single
+giant JSON string cannot name the failing table), the script fetches
+**chunked** — bounded rows per request, each chunk internally consistent:
 
 1. Reads the operator token from a mode-600 file (`HUB_ADMIN_TOKEN_FILE`,
    default `/home/alexey/.config/agent-hub/admin-token`; the script refuses
    to run unless the file is exactly 600) and passes it to curl via a
    mode-600 `--config` file, so the token never appears in env, history,
    or process argv (`ps aux`).
-2. `GET /api/backup/export` with `Authorization: Bearer`, UA `agent-hub-host/1`
-   (https only; cleartext hosts refused without an explicit local-drill opt-out).
-3. Validates JSON: `snapshot == hub-do-sqlite`, `tables`/`row_counts` key sets
-   match, `schema` covers every table, each count matches its row array
-   length, core tables (`intake_tasks`, `session_control_sessions`,
-   `claims`, `audit`) exist, and `backup_rate` is absent.
-4. `gzip -c`, `chmod 600`, stores to both trees:
+2. `GET /api/backup/status` (table inventory + counts), then
+   `GET /api/backup/export?schema=1` (full DDL, no rows).
+3. Per table: `GET /api/backup/export?table=X&offset=N&limit=M`
+   (`CHUNK_ROWS`, default 500, endpoint caps at 5000) until a short page.
+   Chunked reads share a generous per-caller budget (2000/hour); the
+   unbounded full dump keeps the tight 30/hour budget.
+4. Assembles the canonical export document (same shape as the monolithic
+   endpoint) and validates: `snapshot == hub-do-sqlite`, every table
+   present exactly once, per-table DDL matches the schema dump, core tables
+   (`intake_tasks`, `session_control_sessions`, `claims`, `audit`) exist,
+   `backup_rate`/`sqlite_%`/`_cf_%` absent, `value_markers` shape, and row
+   counts within `max(10 rows, 2%)` of a post-read status (hot-table drift
+   across chunks is expected; larger drift fails the run for cron to retry).
+5. `gzip -c`, `chmod 600`, stores to both trees:
    - `BACKUP_DIR/YYYY/MM/DD/hub-do-<STAMP>.json.gz` (Hetzner local)
    - `STORAGEBOX_DIR/YYYY/MM/DD/hub-do-<STAMP>.json.gz` (Storagebox sshfs mirror)
-5. Prunes ONLY files with age >= `RETENTION_DAYS`+1 whole days
+6. Prunes ONLY files with age >= `RETENTION_DAYS`+1 whole days
    (`find -mtime +N`; `+30` keeps the full 30-day window plus today).
    `RETENTION_DAYS` default 30, enforced `>= 30` — the script fails closed
    otherwise. Temp files live under absolute `$TMPDIR` (default

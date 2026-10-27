@@ -181,4 +181,85 @@ describe('Hub DB backup export', () => {
     expect(status.status).toBe(200);
     await status.arrayBuffer();
   });
+
+  it('serves the schema dump without rows', async () => {
+    const name = 'backup-schema-' + crypto.randomUUID();
+    const token = 'synthetic_operator_backup_schema_0123456789';
+    await configureOperator(name, token);
+    const res = await call(stub(name), '/api/backup/export?schema=1', { Authorization: 'Bearer ' + token });
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.snapshot).toBe('hub-do-sqlite');
+    expect(typeof body.exported_at).toBe('string');
+    expect(Object.keys(body.schema).length).toBeGreaterThan(10);
+    expect(String(body.schema['intake_tasks']).toUpperCase()).toContain('CREATE TABLE');
+    expect(String(body.schema['messages_bind_agents']).toUpperCase()).toContain('CREATE TRIGGER');
+    expect(body.schema).not.toHaveProperty('backup_rate');
+    expect(body).not.toHaveProperty('tables');
+    expect(body).not.toHaveProperty('row_counts');
+  });
+
+  it('serves paged per-table chunks that reassemble exactly', async () => {
+    const name = 'backup-chunks-' + crypto.randomUUID();
+    const token = 'synthetic_operator_backup_chunks_0123456789';
+    await configureOperator(name, token);
+    const s = stub(name);
+    const headers = { Authorization: 'Bearer ' + token };
+    // Seed enough rows to force multiple pages.
+    await runInDurableObject(stub(name), async (hub: Hub) => {
+      hub.sql.exec('CREATE TABLE IF NOT EXISTS chunk_probe (id INTEGER PRIMARY KEY, v TEXT NOT NULL)');
+      for (let i = 0; i < 7; i++) hub.sql.exec('INSERT INTO chunk_probe(v) VALUES(?)', 'row-' + i);
+    });
+    const assembled: any[] = [];
+    let total = -1;
+    for (const offset of [0, 3, 6]) {
+      const res = await call(s, '/api/backup/export?table=chunk_probe&offset=' + offset + '&limit=3', headers);
+      expect(res.status).toBe(200);
+      const body = await res.json() as any;
+      expect(body.snapshot).toBe('hub-do-sqlite');
+      expect(body.table).toBe('chunk_probe');
+      expect(body.offset).toBe(offset);
+      expect(body.limit).toBe(3);
+      if (total < 0) total = body.total;
+      else expect(body.total).toBe(total);
+      expect(body.ddl.toUpperCase()).toContain('CREATE TABLE');
+      expect(body.value_markers).toEqual({ bigint: 0, blob: 0, unreadable: 0 });
+      assembled.push(...body.rows);
+    }
+    expect(total).toBe(7);
+    expect(assembled.map((r: any) => r.v)).toEqual(
+      ['row-0', 'row-1', 'row-2', 'row-3', 'row-4', 'row-5', 'row-6']);
+    // Tail page may be short; paging past the end is refused.
+    expect((await call(s, '/api/backup/export?table=chunk_probe&offset=99&limit=3', headers)).status).toBe(400);
+    // Unknown tables 404 (not 500); bad shapes 400; POST stays 405.
+    expect((await call(s, '/api/backup/export?table=no_such_table_xyz&offset=0&limit=3', headers)).status).toBe(404);
+    expect((await call(s, '/api/backup/export?table=chunk_probe&offset=-1&limit=3', headers)).status).toBe(400);
+    expect((await call(s, '/api/backup/export?table=chunk_probe&offset=0&limit=99999', headers)).status).toBe(400);
+    expect((await call(s, '/api/backup/export?table=chunk_probe', headers)).status).toBe(200);
+    expect((await call(s, '/api/backup/export?schema=1&table=chunk_probe', headers)).status).toBe(400);
+    expect((await call(s, '/api/backup/export?schema=yes', headers)).status).toBe(400);
+    expect((await call(s, '/api/backup/export?table=chunk_probe&offset=0&limit=3', headers, 'POST')).status).toBe(405);
+  });
+
+  it('keeps chunked reads on a separate generous budget', async () => {
+    const name = 'backup-chunkbudget-' + crypto.randomUUID();
+    const token = 'synthetic_operator_backup_chunkbudget_0123456789';
+    await configureOperator(name, token);
+    const s = stub(name);
+    const headers = { Authorization: 'Bearer ' + token };
+    // Exhaust the tight full-export budget: 30 OK, 31st limited.
+    for (let i = 0; i < 30; i++) {
+      const res = await call(s, '/api/backup/export', headers);
+      expect(res.status).toBe(200);
+      await res.arrayBuffer();
+    }
+    expect((await call(s, '/api/backup/export', headers)).status).toBe(429);
+    // Chunked reads still serve after the full-export budget is exhausted.
+    const chunk = await call(s, '/api/backup/export?table=intake_tasks&offset=0&limit=3', headers);
+    expect(chunk.status).toBe(200);
+    await chunk.arrayBuffer();
+    const schema = await call(s, '/api/backup/export?schema=1', headers);
+    expect(schema.status).toBe(200);
+    await schema.arrayBuffer();
+  });
 });

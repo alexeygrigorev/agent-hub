@@ -32,7 +32,7 @@ install -m 0755 "$SRC_STALE" "$PREFIX/hub-db-backup-staleness.sh"
 if [[ -f "$ENV_FILE" ]]; then
   echo "keep existing env: $ENV_FILE (not overwritten)"
   # Fill keys added by newer revisions without touching existing values.
-  for kv in "LOCK_FILE=/var/lib/hub-db-backup/hub-db-backup.lock"; do
+  for kv in "LOCK_FILE=/var/lib/hub-db-backup/hub-db-backup.lock" "MSMTP_ACCOUNT=ses" "CHUNK_ROWS=500"; do
     k="${kv%%=*}"
     grep -qE "^${k}=" "$ENV_FILE" || echo "$kv" >> "$ENV_FILE"
   done
