@@ -1,3 +1,4 @@
+import { IntakeWorktrees } from './intake-worktrees';
 import { workerAccessContext } from './worker-access';
 import { registeredRepoLabel } from './repos';
 import { initResourceRequestProjection } from './sql-json-projection';
@@ -1472,6 +1473,18 @@ export class SessionControlService {
           const scopeBlock = getScopeBlock(data);
           if (scopeBlock) return response({ error: scopeBlock }, 409);
         }
+        // Intake worktrees (4b161918): never share another intake's worktree;
+        // resume on the host that holds this intake's recorded worktree.
+        let worktreeMachine: string | undefined;
+        if (input.intake_task_id) {
+          const guard = (() => {
+            try {
+              return new IntakeWorktrees(this.sql).startGuard(input.intake_task_id, { machine: input.machine ?? null, workspace: input.workspace, cwd: input.cwd ?? null });
+            } catch { return {}; } // registry table absent in narrow fixtures
+          })() as { error?: Record<string, unknown>; machine?: string };
+          if (guard.error) return response(guard.error, 409);
+          worktreeMachine = guard.machine;
+        }
         // TBM Phase 2: kill-switch + hard floor + dynamic soft reserve for
         // autonomous starts (fail closed; interactive starts unaffected).
         if (mode !== 'interactive') {
@@ -1560,7 +1573,7 @@ export class SessionControlService {
       const reserved = this.hooks.reserve({
         ...(input.task_kind !== undefined ? {task_kind:input.task_kind} : {}),
         ...(input.intake_task_id ? {project:parsed(this.sql.exec('SELECT data FROM intake_tasks WHERE id=?',input.intake_task_id).toArray()[0]?.data,{}).project} : {}),
-        mode, machine: input.machine, engine: input.engine, tier: input.tier,
+        mode, machine: input.machine ?? worktreeMachine, engine: input.engine, tier: input.tier,
         ...(input.needs !== undefined ? {needs: input.needs} : {}),
         workspace: input.workspace, cwd: input.cwd ?? null,
         prompt: input.brief || '', access: input.access, ...(input.with_goal === true ? { with_goal: true } : {}),

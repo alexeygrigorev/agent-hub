@@ -690,6 +690,16 @@ export class Hub extends DurableObject {
       if (path === '/api/repos' || path.startsWith('/api/repos/')) {
         return this.repoRegistry.handle(request, await this.sessionControlAuth(request));
       }
+      // Intake worktrees (4b161918): host-agent plan/observe/command channel.
+      // Machine-scoped host credentials only, re-checked for fresh host authority.
+      if (path.startsWith('/api/worktree-host/')) {
+        const auth = await this.sessionControlAuth(request);
+        if (auth.error) return auth.error;
+        const caller = auth.caller;
+        if (!caller || caller.kind !== 'host' || !caller.machineId || !auth.scopes?.includes('host') ||
+            !this.sessionControlService.hostObservationAllowed(caller.machineId, caller)) return Response.json({ error: 'forbidden' }, { status: 403 });
+        return this.intakeService.handleWorktreeHost(request, caller.machineId, caller.actor || ('host:' + caller.machineId));
+      }
       if (path === '/api/fleet' || path.startsWith('/api/fleet/')) {
         const auth = await this.sessionControlAuth(request);
         if (auth.caller?.isAdmin) {
