@@ -7,6 +7,8 @@
  * second list here. modelCandidates() in src/model-routing.ts is owned
  * elsewhere; dispatch filters its shortlist through this evaluator.
  */
+import policy from "../config/model-routing.json";
+
 export const QUOTA_OBSERVATION_TTL_MS = 1_200_000; // 20 minutes, matches QUOTA_STALE_MS
 
 export interface QuotaAdmissionInput {
@@ -216,8 +218,9 @@ export function resolveTbmPoolCycleMs(
   return null;
 }
 
-/** R_hard = max(5% of Q_total, 50k tokens). */
+/** R_hard = max(5% of Q_total, 50k tokens); an explicit 0% disables the floor. */
 export function tbmHardFloor(totalTokens: number, hardFloorPercent = TBM_HARD_FLOOR_FRACTION * 100): number {
+  if (hardFloorPercent === 0) return 0;
   const frac = finitePercent(hardFloorPercent) && hardFloorPercent > 0 ? hardFloorPercent / 100 : TBM_HARD_FLOOR_FRACTION;
   return Math.max(totalTokens * frac, TBM_HARD_FLOOR_MIN_TOKENS);
 }
@@ -237,8 +240,8 @@ export function tbmSoftReserve(
   softReservePercent = TBM_SOFT_INIT_FRACTION * 100
 ): number {
   const hard = tbmHardFloor(totalTokens, hardFloorPercent);
-  const softFrac = finitePercent(softReservePercent) && softReservePercent > 0 ? softReservePercent / 100 : TBM_SOFT_INIT_FRACTION;
-  const init = Math.max(hard, Math.max(totalTokens * softFrac, TBM_SOFT_INIT_MIN_TOKENS));
+  const softFrac = finitePercent(softReservePercent) ? softReservePercent / 100 : TBM_SOFT_INIT_FRACTION;
+  const init = softFrac === 0 ? hard : Math.max(hard, Math.max(totalTokens * softFrac, TBM_SOFT_INIT_MIN_TOKENS));
   if (cycleMs === null || !(cycleMs > 0) || !Number.isFinite(resetAtMs)) return init;
   const k = Number.isFinite(kappa) && kappa > 0 ? kappa : TBM_DEFAULT_KAPPA;
   const frac = Math.min(1, Math.max(0, (resetAtMs - nowMs) / cycleMs));
@@ -254,8 +257,8 @@ export function tbmSoftReservePercent(
   hardFloorPercent = TBM_HARD_FLOOR_FRACTION * 100,
   softReservePercent = TBM_SOFT_INIT_FRACTION * 100
 ): number {
-  const hard = finitePercent(hardFloorPercent) && hardFloorPercent > 0 ? hardFloorPercent : TBM_HARD_FLOOR_FRACTION * 100;
-  const init = Math.max(hard, finitePercent(softReservePercent) && softReservePercent > 0 ? softReservePercent : TBM_SOFT_INIT_FRACTION * 100);
+  const hard = finitePercent(hardFloorPercent) ? hardFloorPercent : TBM_HARD_FLOOR_FRACTION * 100;
+  const init = Math.max(hard, finitePercent(softReservePercent) ? softReservePercent : TBM_SOFT_INIT_FRACTION * 100);
   if (cycleMs === null || !(cycleMs > 0) || !Number.isFinite(resetAtMs)) return init;
   const k = Number.isFinite(kappa) && kappa > 0 ? kappa : TBM_DEFAULT_KAPPA;
   const frac = Math.min(1, Math.max(0, (resetAtMs - nowMs) / cycleMs));
@@ -285,6 +288,21 @@ export interface TbmAdmissionInput {
   nowMs: number;
   /** Fallback cycle length when a pool row has no cycle_ms/window_type; null keeps R_soft at its initial level. */
   cycleMs?: number | null;
+}
+
+/**
+ * Operator floor overrides per provider family (config/model-routing.json
+ * rules.tbm_floor_percent, e.g. { codex: { hard: 0, soft: 0 } }). They replace
+ * the stored pool floors; 0 disables a floor, so only depletion (remaining 0)
+ * still blocks. Invalid entries are ignored and the stored floors apply.
+ */
+export function withPolicyTbmFloors(p: TbmPoolRow, overrides: unknown = (policy.rules as any).tbm_floor_percent): TbmPoolRow {
+  const entry = overrides && typeof overrides === "object" ? (overrides as any)[normalizeProviderFamily(p.provider) ?? ""] : null;
+  if (!entry || typeof entry !== "object") return p;
+  const out = { ...p };
+  if (finitePercent(entry.hard)) out.hard_floor_percent = entry.hard;
+  if (finitePercent(entry.soft)) out.soft_reserve_percent = entry.soft;
+  return out;
 }
 
 function providerMatches(poolProvider: string, targetProvider: string): boolean {
@@ -319,8 +337,9 @@ export function evaluateTbmAdmission(input: TbmAdmissionInput): TbmAdmissionResu
     }
   }
   if (provider === null) return { ok: true, reason: "ok", pool_id: null };
-  for (const p of pools) {
-    if (p.pool_id === TBM_FLEET_POOL_ID || !providerMatches(p.provider, provider) || !accountMatches(p, account)) continue;
+  for (const row of pools) {
+    if (row.pool_id === TBM_FLEET_POOL_ID || !providerMatches(row.provider, provider) || !accountMatches(row, account)) continue;
+    const p = withPolicyTbmFloors(row);
     const cycleMs = resolveTbmPoolCycleMs(p, input.cycleMs);
     const kappa = p.convexity_exponent ?? TBM_DEFAULT_KAPPA;
     if (isPercentOnlyTbmPool(p)) {
@@ -330,7 +349,7 @@ export function evaluateTbmAdmission(input: TbmAdmissionInput): TbmAdmissionResu
       if (remPct === null) {
         return { ok: false, reason: "malformed_pool", pool_id: p.pool_id, detail: "percent" };
       }
-      const hardPct = finitePercent(p.hard_floor_percent) && p.hard_floor_percent > 0 ? p.hard_floor_percent : TBM_HARD_FLOOR_FRACTION * 100;
+      const hardPct = finitePercent(p.hard_floor_percent) ? p.hard_floor_percent : TBM_HARD_FLOOR_FRACTION * 100;
       const softPct = tbmSoftReservePercent(nowMs, p.reset_at_ms, cycleMs, kappa, hardPct, p.soft_reserve_percent ?? TBM_SOFT_INIT_FRACTION * 100);
       const base = { pool_id: p.pool_id, r_hard: hardPct, r_soft: softPct, remaining: remPct };
       if (remPct <= hardPct) return { ok: false, reason: "hard_floor", ...base };

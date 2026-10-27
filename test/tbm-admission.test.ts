@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { createSessionCookie } from '../src/auth/session';
 import {
-  evaluateTbmAdmission, tbmHardFloor, tbmSoftReserve, engineProvider, type TbmPoolRow,
+  evaluateTbmAdmission, tbmHardFloor, tbmSoftReserve, engineProvider, withPolicyTbmFloors, type TbmPoolRow,
 } from '../src/quota_admission';
 
 const inDO: any = runInDurableObject;
@@ -110,6 +110,31 @@ beforeEach(async () => {
   });
 });
 
+describe('policy TBM floors (intake 4f6cf562: burn Codex/zai to 0)', () => {
+  const ev = (pools: TbmPoolRow[], provider: string) =>
+    evaluateTbmAdmission({ pools, provider, nowMs: NOW, cycleMs: 7 * DAY });
+  const pct = (provider: string, remaining: number, account = 'shared-' + provider): TbmPoolRow => pool({
+    pool_id: `${provider}:${account}:weekly`, provider, account, total_capacity_tokens: 0, remaining_tokens: 0,
+    remaining_percent: remaining, capacity_known: 0, quota_unit: 'percent', hard_floor_percent: 5, soft_reserve_percent: 20 });
+  it.each([['codex', 'codex'], ['codex-orin', 'codex'], ['zai', 'zai']])('%s pools admit while remaining > 0 and block at 0', (provider, target) => {
+    for (const remaining of [11, 3, 0.5]) expect(ev([pct(provider, remaining)], target)).toMatchObject({ ok: true });
+    expect(ev([pct(provider, 0)], target)).toMatchObject({ ok: false, reason: 'hard_floor', r_hard: 0 });
+    const tokens = pool({ pool_id: provider + ':t', provider, total_capacity_tokens: 1_000_000, remaining_tokens: 1_000 });
+    expect(ev([tokens], target).ok).toBe(true);
+    expect(ev([{ ...tokens, remaining_tokens: 0 }], target).reason).toBe('hard_floor');
+  });
+  it('keeps stored floors for providers without an override and ignores invalid overrides', () => {
+    expect(ev([pct('claude', 3)], 'claude')).toMatchObject({ ok: false, reason: 'hard_floor', r_hard: 5 });
+    expect(ev([pct('claude', 15)], 'claude').reason).toBe('soft_reserve');
+    expect(withPolicyTbmFloors(pct('codex', 3), { codex: { hard: -1, soft: 'x' } })).toMatchObject({ hard_floor_percent: 5, soft_reserve_percent: 20 });
+    expect(withPolicyTbmFloors(pct('codex', 3), { codex: { hard: 0, soft: 0 } })).toMatchObject({ hard_floor_percent: 0, soft_reserve_percent: 0 });
+  });
+  it('explicit zero token floors skip the absolute token minimums', () => {
+    expect(tbmHardFloor(1_000_000, 0)).toBe(0);
+    expect(tbmSoftReserve(1_000_000, NOW, NOW + 7 * DAY, 7 * DAY, 1.5, 0, 0)).toBe(0);
+  });
+});
+
 describe('TBM admission on POST /api/sessions', () => {
   it('rejects headless starts without intake_task_id (fail closed)', async () => {
     const r = await start();
@@ -161,5 +186,13 @@ describe('TBM admission on POST /api/sessions', () => {
     await setPool({ pool_id: 'claude:main', provider: 'claude', remaining_tokens: 600_000, reset_at_ms: Date.now() + 7 * DAY });
     const admitted = await start({ intake_task_id: id, engine: 'claude', engine_override_reason: 'Exercise the Claude pool admission gate.' });
     expect(admitted.data.error).not.toBe('tbm_admission_denied');
+  });
+  it('codex headless start at 3% remaining is not denied by hard floor or soft reserve (4f6cf562)', async () => {
+    await setPool({ pool_id: 'codex:shared-codex:weekly', provider: 'codex', total_capacity_tokens: 1_000_000, remaining_tokens: 30_000, reset_at_ms: Date.now() + 7 * DAY });
+    const r = await start({ intake_task_id: await intakeTask(), engine: 'codex', engine_override_reason: 'Exercise zero Codex floor admission.' });
+    expect(r.data.error, JSON.stringify(r.data)).not.toBe('tbm_admission_denied');
+    await setPool({ pool_id: 'codex:shared-codex:weekly', provider: 'codex', total_capacity_tokens: 1_000_000, remaining_tokens: 0, reset_at_ms: Date.now() + 7 * DAY });
+    const empty = await start({ intake_task_id: await intakeTask(), engine: 'codex', engine_override_reason: 'Exercise zero Codex floor admission.' });
+    expect(empty.data).toMatchObject({ error: 'tbm_admission_denied', reason: 'hard_floor' });
   });
 });

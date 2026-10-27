@@ -461,6 +461,16 @@
       "codex": 0,
       "grok": 5
     },
+    "tbm_floor_percent": {
+      "codex": {
+        "hard": 0,
+        "soft": 0
+      },
+      "zai": {
+        "hard": 0,
+        "soft": 0
+      }
+    },
     "allow_paid": false,
     "allow_cross_tier_failover": false,
     "difficulty_tiers": {

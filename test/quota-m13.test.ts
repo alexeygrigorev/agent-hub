@@ -587,11 +587,13 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
       windows: { '7d': { present: true, percent_remaining: pct, reset_at: new Date(t + 3600000).toISOString() } },
     });
     expect(modelCandidates({ tier: 'daily' }, goRoute, goAd, quotaFor(80), t).length).toBeGreaterThan(0);
-    // Below the Codex 15% reserve, and with an unavailable sibling, no model is offered.
+    // Codex has no reserve (intake 4f6cf562): 10% is offered, depletion and
+    // an unavailable sibling window offer no model.
     const codexAd = [{ engine: 'codex', profile: null, model: 'gpt-6.1-sol', effort: 'high', account: 'm13-c' }];
     const codexRoute = { provider: 'codex', engine: 'codex', profile: null, account: 'm13-c' };
     const codexInput = { tier: 'daily', preferred_runner: 'codex' };
-    expect(modelCandidates(codexInput, codexRoute, codexAd, quotaFor(10), t)).toEqual([]);
+    expect(modelCandidates(codexInput, codexRoute, codexAd, quotaFor(10), t).length).toBeGreaterThan(0);
+    expect(modelCandidates(codexInput, codexRoute, codexAd, quotaFor(0), t)).toEqual([]);
     expect(modelCandidates(codexInput, codexRoute, codexAd, {
       status: 'ok', observed_at: new Date(t - 1000).toISOString(), details: { limit_reached: false },
       windows: {
