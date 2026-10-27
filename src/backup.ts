@@ -151,13 +151,25 @@ export class BackupService {
   } {
     return this.tx(() => {
       const schema: Record<string, string> = {};
-      for (const t of this.schemaObjects()) {
+      let objects: { name: string; sql: string }[];
+      try {
+        objects = this.schemaObjects();
+      } catch (err) {
+        throw new ExportStageError('schema');
+      }
+      for (const t of objects) {
         schema[String(t.name)] = String(t.sql || '');
       }
       const row_counts: Record<string, number> = {};
       const data: Record<string, any[]> = {};
+      let userTables: { name: string; sql: string }[];
+      try {
+        userTables = this.userTables();
+      } catch (err) {
+        throw new ExportStageError('tables');
+      }
       let total = 0;
-      for (const t of this.userTables()) {
+      for (const t of userTables) {
         const name = String(t.name);
         let rows: any[];
         try {
@@ -195,8 +207,13 @@ export class BackupService {
         if (this.rateLimited(request, auth, 'export', EXPORT_LIMIT_PER_HOUR)) {
           return Response.json({ error: 'rate_limited' }, { status: 429 });
         }
-        return Response.json(this.fullExport(),
-          { headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
+        const payload = this.fullExport();
+        try {
+          return Response.json(payload,
+            { headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
+        } catch (err) {
+          throw new ExportStageError('serialize');
+        }
       }
     } catch (err) {
       if (err instanceof ExportTooLarge) {
