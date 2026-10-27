@@ -13,7 +13,7 @@ CLAIM_TIMEOUT_SECONDS = 300
 
 
 def reconcile_claimed_launch(dispatcher, row, *, dry_run=False):
-    from .fleet import resolve_workspace_path, resolve_offer_cwd, _terminal_fleet_state
+    from .fleet import resolve_workspace_path, resolve_offer_cwd
     from .launcher_recovery import settle_unstarted
     from .native_sessions import NativeTarget, SessionControlError
 
@@ -55,11 +55,14 @@ def reconcile_claimed_launch(dispatcher, row, *, dry_run=False):
         if created.tzinfo is None:
             created = created.replace(tzinfo=dt.timezone.utc)
         age = (dt.datetime.now(dt.timezone.utc) - created).total_seconds()
-        if not CLAIM_TIMEOUT_SECONDS <= age:
+        # Age only gates the no-start fence. An exact bound native retirement
+        # is positive evidence immediately; delaying it five minutes loses
+        # the two-minute reporting deadline for short lost-receipt launches.
+        if age < 0 or (age < CLAIM_TIMEOUT_SECONDS and not status.get('native_binding')):
             return None
         if dry_run:
             return {'id': offer_id, 'state': 'probe_required'}
-        if settle_unstarted(launcher, task_id, workspace, cwd):
+        if age >= CLAIM_TIMEOUT_SECONDS and settle_unstarted(launcher, task_id, workspace, cwd):
             result = {'state': 'failed', 'confirmed_exit': True,
                       'launcher_task_id': task_id, 'reason': 'launcher_not_started'}
         else:
@@ -67,7 +70,7 @@ def reconcile_claimed_launch(dispatcher, row, *, dry_run=False):
             if not isinstance(binding, dict):
                 return None
             if (binding.get('task_id') != task_id or binding.get('tag') != 'task-' + task_id
-                    or binding.get('workspace') != str(cwd) or binding.get('engine') != row.get('engine')):
+                    or binding.get('workspace') != str(workspace) or binding.get('engine') != row.get('engine')):
                 return None
             target = NativeTarget(session_id=binding['native_id'], tag=binding['tag'],
                                   workspace=binding['workspace'], engine=binding['engine'],
@@ -81,17 +84,20 @@ def reconcile_claimed_launch(dispatcher, row, *, dry_run=False):
                     or receipt.get('native_status') not in ('dead', 'retired-finished')
                     or receipt.get('state') not in ('completed-awaiting-review', 'accepted', 'failed')):
                 return None
-            report = dispatcher._read_hub_finish_report({
-                'offer_id': offer_id, 'workspace': str(cwd),
-                'result_path': str(cwd / '.local' / 'hub-results' / (offer_id + '.json'))})
-            result = {'state': _terminal_fleet_state(receipt['state'], bool(report)),
-                      'native_id': target.session_id, 'launcher_task_id': task_id, 'confirmed_exit': True}
-            if report:
-                result.update(report)
-                if result['state'] == 'failed':
-                    result['report_status'] = 'failed'
-            else:
-                result.update(report_status='failed', report='Agent exited without a valid structured report; recovered exact launcher exit receipt.')
+            # Lost first receipts need the same full runtime/report outbox as
+            # ordinary retirement. Never let this older capacity fallback race
+            # it with a bare finish or read results under a nested engine cwd.
+            from .retired_native import verify_native_retirement
+            retired, _, _ = verify_native_retirement(
+                dispatcher.settings.get('aplexer_bin', 'aplexer'), target,
+                state_dir=dispatcher.settings.get('aplexer_state_dir'))
+            if not retired:
+                return None
+            from .account_capacity import reconcile_headless_retired
+            if not reconcile_headless_retired(dispatcher, row, target):
+                return None
+            record = dispatcher._active_launches[offer_id]
+            return {'id': offer_id, 'state': record['state'], 'reconciled': True}
         ack = dispatcher.request('POST', '/api/fleet/launches/' + offer_id + '/result', result)
         if isinstance(ack, dict) and ack.get('id') == offer_id and ack.get('state') == result['state']:
             return {'id': offer_id, 'state': result['state'], 'reconciled': True}

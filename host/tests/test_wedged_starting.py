@@ -27,7 +27,7 @@ class WedgedStartingTests(unittest.TestCase):
         self.row = {'id': self.offer, 'workspace': 'repo', 'mode': 'headless', 'engine': 'opencode', 'native_id': None}
         self.status = {'state': 'queued',
                        'payload': {'owner': 'hub-fleet', 'cwd': str(self.ws)}}
-        self.settings = {'workspaces': {'repo': str(self.ws)}, 'subscriptions': [],
+        self.settings = {'journal_dir': str(self.root / 'journal'), 'workspaces': {'repo': str(self.ws)}, 'subscriptions': [],
                          'launcher': {'argv': ['launcher'], 'root': str(self.cfg), 'config_dir': str(self.cfg)}}
         self.d = Dispatcher(self.settings, request=Mock(), runner=Mock(return_value=self.status))
         self.d.request.side_effect = lambda method, path, data: {'id': self.offer, 'state': data['state']}
@@ -40,6 +40,12 @@ class WedgedStartingTests(unittest.TestCase):
             return c.execute('SELECT state FROM tasks').fetchone()[0]
 
     def completed(self):
+        tomb = {'finished_at_ms': 1793016447393,
+                'exit': {'code': 0, 'signal': None, 'exited_at_ms': 1793016447393}}
+        retirement = patch('agent_hub_host.retired_native.verify_native_retirement', return_value=(True, tomb, 'verified'))
+        retirement.start(); self.addCleanup(retirement.stop)
+        terminal = patch('agent_hub_host.fleet.verify_native_retirement', return_value=(True, tomb, 'verified'))
+        terminal.start(); self.addCleanup(terminal.stop)
         self.status.update(state='completed-awaiting-review', native_binding={
             'task_id': self.task, 'native_id': self.native, 'tag': 'task-' + self.task,
             'workspace': str(self.ws), 'engine': 'opencode', 'incarnation': 1793016446093})
@@ -97,7 +103,55 @@ class WedgedStartingTests(unittest.TestCase):
         result = self.d.request.call_args.args[2]
         self.assertEqual((result['native_id'], result['report_status'], result['report']), (self.native, 'done', 'Finished.'))
         self.assertTrue(result['confirmed_exit'])
+        self.assertEqual(result['runtime']['exit_code'], 0)
+        self.assertIsNone(result['runtime']['exit_signal'])
+        self.assertEqual(result['runtime']['wall_time_ms'], 1300)
+        self.assertEqual(result['runtime']['outcome'], 'reported')
         self.assertTrue((self.ws / '.local/hub-results' / (self.offer + '.json')).exists())
+
+    def test_nested_cwd_lost_receipt_uses_root_result_and_durable_full_replay(self):
+        self.completed()
+        nested = self.ws / 'nested'; nested.mkdir()
+        self.row['cwd'] = 'nested'
+        self.status['payload']['cwd'] = str(nested)
+        with sqlite3.connect(self.cfg / 'state.db') as c:
+            c.execute('UPDATE tasks SET payload=?', (json.dumps(self.status['payload']),))
+        # A tempting nested result belongs to no such launch. Only the
+        # workspace-root result is the launcher's authorized report path.
+        wrong = nested / '.local/hub-results'; wrong.mkdir(parents=True)
+        (wrong / (self.offer + '.json')).write_text(json.dumps({'status': 'failed', 'report': 'Wrong nested result'}))
+        posts = []
+        def request(method, path, payload):
+            posts.append(copy.deepcopy(payload))
+            return {'id': self.offer, 'state': 'failed' if len(posts)==1 else payload['state']}
+        self.d.request = request
+        self.assertIsNone(reconcile_claimed_launch(self.d, self.row))
+        self.assertFalse(self.d._active_launches[self.offer]['settled'])
+        self.d = Dispatcher(self.settings, request=request, runner=self.d.runner)
+        result = reconcile_claimed_launch(self.d, self.row)
+        self.assertEqual(result['state'], 'exited')
+        self.assertEqual(posts[0], posts[1])
+        self.assertEqual(posts[1]['report'], 'Finished.')
+        self.assertEqual(posts[1]['runtime']['wall_time_ms'], 1300)
+        self.assertTrue(self.d._active_launches[self.offer]['settled'])
+        self.assertEqual(self.d._active_launches[self.offer]['target_cwd'], str(nested))
+        self.assertEqual(self.d._active_launches[self.offer]['result_path'], str(self.ws / '.local/hub-results' / (self.offer + '.json')))
+        self.assertEqual(self.d.reconcile_launches(), [])
+
+    def test_positive_bound_exit_reports_before_the_no_start_age_timeout(self):
+        self.completed()
+        with sqlite3.connect(self.cfg / 'state.db') as c:
+            c.execute('UPDATE tasks SET created_at=?', (dt.datetime.now(dt.timezone.utc).isoformat(),))
+        result = reconcile_claimed_launch(self.d, self.row)
+        self.assertEqual(result['state'], 'exited')
+        self.assertEqual(self.d.request.call_args.args[2]['runtime']['wall_time_ms'], 1300)
+
+    def test_launcher_dead_receipt_cannot_replace_independent_native_retirement(self):
+        self.completed()
+        with patch('agent_hub_host.retired_native.verify_native_retirement', return_value=(False, None, 'unknown')):
+            self.assertIsNone(reconcile_claimed_launch(self.d, self.row))
+        self.d.request.assert_not_called()
+        self.assertNotIn(self.offer, self.d._active_launches)
 
     def test_live_unknown_wrong_native_and_reserved_receipts_cannot_finish(self):
         self.completed()
@@ -123,6 +177,9 @@ class WedgedStartingTests(unittest.TestCase):
         (self.ws / '.local/hub-results' / (self.offer + '.json')).write_text('{}')
         self.assertEqual(reconcile_claimed_launch(self.d, self.row)['state'], 'failed')
         self.assertEqual(self.d.request.call_args.args[2]['report_status'], 'failed')
+        self.assertIn('failed-with-partial-work', self.d.request.call_args.args[2]['report'])
+        self.assertEqual(self.d.request.call_args.args[2]['runtime']['exit_code'], 0)
+        self.assertEqual(self.d.request.call_args.args[2]['runtime']['outcome'], 'failed-without-report')
 
     def test_dry_run_and_lost_acknowledgement_are_safe(self):
         self.assertEqual(reconcile_claimed_launch(self.d, self.row, dry_run=True)['state'], 'probe_required')

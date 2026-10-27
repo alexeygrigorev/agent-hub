@@ -157,7 +157,7 @@ def reconcile_headless_retired(dispatcher, row, target):
     record = records.get(offer_id)
     if record is None:
         record = {**exact, 'state': 'running', 'settled': False,
-                  'result_path': result_path}
+                  'target_cwd': str(target_cwd), 'result_path': result_path}
         records[offer_id] = record
     elif not isinstance(record, dict):
         return False
