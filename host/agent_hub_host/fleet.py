@@ -1693,7 +1693,11 @@ class Dispatcher:
                     pass
             if not forwarded and evidence['log_tail']:
                 result_payload['report'] = (result_payload.get('report', '') + '; last output: ' + evidence['log_tail'])[:4096]
-            if record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused':
+            if isinstance(record.get('dispatch_diagnostic'), dict):
+                # Recovery of a spawned first-action failure retains its
+                # original dispatch cause; runtime measurements stay separate.
+                result_payload['diagnostic'] = record['dispatch_diagnostic']
+            elif record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused':
                 result_payload['diagnostic'] = record['diagnostic']
             # AC a19cac9e: missing result JSON now forces failed above, so
             # every exit-without-result carries exit code/signal/wall-time/

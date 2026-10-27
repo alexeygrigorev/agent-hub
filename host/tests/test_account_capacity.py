@@ -8,6 +8,123 @@ from agent_hub_host.account_capacity import activity_ms, reconcile_unstarted, re
 
 
 class AccountCapacityTests(unittest.TestCase):
+    def _real_failed_dispatch(self, tmp):
+        import datetime
+        from agent_hub_host.fleet import Dispatcher
+        offer_id = '11111111-2222-4333-8444-555555555555'
+        sub = {'service': 'go', 'account_label': 'muse', 'engine': 'opencode',
+               'launcher_provider': 'opencode', 'launcher_model': 'opencode-go/muse-spark-1.3-contributor',
+               'admission_argv': ['gate']}
+        settings = {'version': 1, 'subscriptions': [sub], 'workspaces': {'main': tmp},
+                    'journal_dir': str(Path(tmp) / 'journal'),
+                    'launcher': {'argv': ['launcher'], 'root': tmp, 'config_dir': str(Path(tmp) / 'launcher')}}
+        def runner(argv, **kwargs):
+            if argv[0] == 'gate':
+                return {'launch_allowed': True, 'profile_supported': True, 'account_label': 'muse',
+                        'observed_at': datetime.datetime.now(datetime.timezone.utc).isoformat()}
+            if 'plan' in argv:
+                return {'eligible': [{'provider': 'opencode', 'model': sub['launcher_model'], 'task_fit': 1.0}]}
+            if 'run' in argv:
+                raise RuntimeError('first-action handshake failed')
+            return {}
+        d = Dispatcher(settings, runner=runner, request=Mock(return_value={}))
+        offer = {'id': offer_id, 'engine': 'opencode', 'account': 'muse',
+                 'mode': 'headless', 'workspace': 'main', 'prompt': 'inspect one source file'}
+        with patch('agent_hub_host.launcher_recovery.settle_unstarted', return_value=False), \
+             patch.object(d, '_check_headless_health', return_value=None):
+            self.assertEqual(d.dispatch(offer)['state'], 'uncertain')
+        entry = Path(settings['journal_dir']) / 'fleet-launches' / (offer_id + '.json')
+        record = json.loads(entry.read_text())
+        self.assertEqual(record['state'], 'not_started')
+        self.assertEqual(record['reason'], 'launcher_command_failed')
+        self.assertFalse({'native_id', 'tag', 'incarnation', 'engine'} & record.keys())
+        return settings, offer_id, record
+
+    def test_persisted_first_action_failure_promotes_then_replays_after_restart_and_wrong_ack(self):
+        from agent_hub_host.fleet import Dispatcher
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, offer, original = self._real_failed_dispatch(tmp)
+            native = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+            binding = dict(task_id='hub-' + offer, native_id=native, tag='task-hub-' + offer,
+                           workspace=tmp, incarnation=1000, engine='opencode')
+            status = {'state': 'failed', 'payload': {'owner': 'hub-fleet'}, 'native_binding': binding}
+            row = {'id': offer, 'engine': 'opencode', 'mode': 'headless'}
+            d = Dispatcher(settings, request=Mock(), runner=Mock(side_effect=[status, {
+                'state': 'running', 'native_id': native, 'resources_reserved': True}]))
+            self.assertEqual(d._active_launches[offer], original)
+            path = Path(tmp) / '.local/hub-results' / (offer + '.json')
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({'status': 'failed', 'report': 'Real partial worker report'}))
+            tomb = {'finished_at_ms': 2300, 'exit': {'code': 0, 'signal': None}}
+            runtime_failure = dict(reason='engine_exit_code', message='Runtime detail',
+                                   error_type='RuntimeError', stage='runtime', exit_code=0)
+            with patch('agent_hub_host.retired_native.verify_native_retirement', return_value=(True, tomb, 'verified')), \
+                 patch('agent_hub_host.fleet.verify_native_retirement', return_value=(True, tomb, 'verified')), \
+                 patch('agent_hub_host.runtime_diagnostics.runtime_diagnostic', return_value=runtime_failure), \
+                 patch.object(Dispatcher, '_check_headless_health', return_value=None), \
+                 patch.object(Dispatcher, '_maybe_cleanup_worktree') as cleanup:
+                # Promotion is durable even while the launcher still reserves
+                # resources; no terminal POST or cleanup can bypass that fence.
+                self.assertFalse(reconcile_launcher_retired(d, row, Path(tmp)))
+                d.request.assert_not_called()
+                cleanup.assert_not_called()
+                d = Dispatcher(settings)
+                self.assertEqual(d._active_launches[offer]['state'], 'running')
+                self.assertEqual(d._active_launches[offer]['result_path'], str(path))
+                posts = []
+                def request(method, endpoint, payload=None):
+                    posts.append(payload)
+                    return {'id': offer, 'state': 'exited' if len(posts) == 1 else payload['state']}
+                def released(argv, **kwargs):
+                    return status if 'status' in argv else {
+                        'state': 'failed', 'native_id': native, 'resources_reserved': False}
+                d.runner, d.request = released, request
+                self.assertFalse(reconcile_launcher_retired(d, row, Path(tmp)))
+                self.assertFalse(d._active_launches[offer]['settled'])
+                cleanup.assert_not_called()
+                d = Dispatcher(settings, runner=released, request=request)
+                self.assertEqual(d._active_launches[offer]['dispatch_diagnostic'], original['diagnostic'])
+                self.assertTrue(reconcile_launcher_retired(d, row, Path(tmp)))
+                self.assertEqual(posts[0], posts[1])
+                self.assertEqual(posts[1]['state'], 'failed')
+                self.assertEqual(posts[1]['diagnostic'], original['diagnostic'])
+                self.assertEqual(posts[1]['report_status'], 'failed')
+                self.assertEqual(posts[1]['report'], 'Real partial worker report')
+                self.assertEqual(posts[1]['runtime']['exit_code'], 0)
+                self.assertEqual(posts[1]['runtime']['wall_time_ms'], 1300)
+                self.assertTrue(d._active_launches[offer]['settled'])
+                self.assertEqual(d._active_launches[offer]['reason'], original['reason'])
+                self.assertEqual(d._active_launches[offer]['target_cwd'], original['target_cwd'])
+                cleanup.assert_called_once()
+                self.assertEqual(d.reconcile_launches(), [])
+                self.assertEqual(Dispatcher(settings, runner=released, request=request).reconcile_launches(), [])
+                self.assertEqual(len(posts), 2)
+
+    def test_failed_dispatch_promotion_refuses_conflicting_established_identity(self):
+        from agent_hub_host.fleet import Dispatcher
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, offer, original = self._real_failed_dispatch(tmp)
+            native = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+            binding = dict(task_id='hub-' + offer, native_id=native, tag='task-hub-' + offer,
+                           workspace=tmp, incarnation=1000, engine='opencode')
+            status = {'state': 'failed', 'payload': {'owner': 'hub-fleet'}, 'native_binding': binding}
+            row = {'id': offer, 'engine': 'opencode', 'mode': 'headless'}
+            for field, value in [('native_id', 'bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee'),
+                                 ('tag', 'task-hub-other'), ('incarnation', 1001), ('engine', 'codex'),
+                                 ('workspace', tmp + '/other'), ('target_cwd', tmp + '/other'),
+                                 ('task_id', 'hub-other'), ('settled', True)]:
+                with self.subTest(field=field):
+                    d = Dispatcher(settings, runner=Mock(return_value=status), request=Mock())
+                    record = {**original, field: value}
+                    d._active_launches[offer] = record
+                    d._persist_launch_record(record)
+                    before = dict(record)
+                    with patch('agent_hub_host.retired_native.verify_native_retirement', return_value=(True, {}, 'verified')):
+                        self.assertFalse(reconcile_launcher_retired(d, row, Path(tmp)))
+                    d.request.assert_not_called()
+                    self.assertEqual(record, before)
+                    self.assertEqual(d.runner.call_count, 1)  # status only; never release
+
     def test_headless_capacity_recovery_forwards_all_worker_statuses_and_runtime(self):
         from agent_hub_host.fleet import Dispatcher
         offer = '11111111-2222-4333-8444-555555555555'

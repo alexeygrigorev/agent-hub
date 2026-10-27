@@ -141,7 +141,25 @@ def reconcile_headless_retired(dispatcher, row, target):
         record = {**exact, 'state': 'running', 'settled': False,
                   'result_path': result_path}
         records[offer_id] = record
-    elif not isinstance(record, dict) or any(record.get(k) != v for k, v in exact.items()):
+    elif not isinstance(record, dict):
+        return False
+    elif record.get('state') == 'not_started':
+        # A failed first-action handshake can have spawned. The real dispatch
+        # journal deliberately has no native tuple until independent launcher
+        # binding + retirement verification above supplies one. Do not erase
+        # another launch, an established conflicting tuple, or a settled fence.
+        native_fields = {'native_id', 'tag', 'incarnation', 'engine'}
+        if (record.get('settled') is not False
+                or not isinstance(record.get('reason'), str)
+                or not record['reason'].startswith('launcher_')
+                or any(record.get(k) != v for k, v in exact.items() if k not in native_fields)
+                or any(record.get(k) not in (None, '', exact[k]) for k in native_fields)
+                or record.get('target_cwd', target.workspace) != target.workspace):
+            return False
+        if isinstance(record.get('diagnostic'), dict):
+            record['dispatch_diagnostic'] = dict(record['diagnostic'])
+        record.update(exact, state='running', settled=False)
+    elif any(record.get(k) != v for k, v in exact.items()):
         return False
     record['result_path'] = result_path
     dispatcher._persist_launch_record(record)
