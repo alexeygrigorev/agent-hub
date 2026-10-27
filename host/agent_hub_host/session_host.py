@@ -742,6 +742,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                 reloaded = None
                 from .offer_claims import has_inflight
                 if ((maintenance_thread is None or not maintenance_thread.is_alive())
+                        and (offers_thread is None or not offers_thread.is_alive())
                         and not has_inflight(dispatcher)):
                     reloaded, settings_mtime = maybe_reload_fleet_settings(settings_path, settings_mtime)
                 if reloaded is not None:

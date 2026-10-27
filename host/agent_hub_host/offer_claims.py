@@ -8,9 +8,6 @@ from collections import deque
 import json
 import threading
 import time
-import weakref
-
-_STATES = weakref.WeakKeyDictionary()
 _STATES_LOCK = threading.Lock()
 
 
@@ -23,12 +20,15 @@ class _State:
 
 def _state(dispatcher):
     with _STATES_LOCK:
-        return _STATES.setdefault(dispatcher, _State())
+        state = vars(dispatcher).get('_offer_claim_state')
+        if state is None:
+            state = dispatcher._offer_claim_state = _State()
+        return state
 
 
 def has_inflight(dispatcher):
     with _STATES_LOCK:
-        state = _STATES.get(dispatcher)
+        state = vars(dispatcher).get('_offer_claim_state')
     if state is None:
         return False
     with state.lock:

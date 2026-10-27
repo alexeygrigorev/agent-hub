@@ -133,3 +133,103 @@ def test_poll_workers_are_bounded_without_a_stale_offer_queue_and_drain_on_stop(
         for release in releases.values():
             release.set()
         wait_idle(dispatcher)
+
+
+def test_controller_does_not_reload_settings_during_offer_read_or_startup(tmp_path):
+    from contextlib import ExitStack
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    cfg = settings(Path(tmp_path))
+    cfg['revision_marker'] = 'old'
+    dispatcher = fleet.Dispatcher(cfg, lambda *a: {}, lambda *a: {}, journal_dir=str(tmp_path))
+    path = tmp_path / 'settings.json'
+    path.write_text(json.dumps(cfg))
+    fetching, release_fetch = threading.Event(), threading.Event()
+    launching, release_launch = threading.Event(), threading.Event()
+    raced = threading.Event()
+    unchanged = []
+    readers = []
+    commands = []
+    original_start = session_host.maybe_start_named_thread
+
+    def fetch():
+        if fetching.is_set():
+            return {'offers': []}
+        fetching.set()
+        assert release_fetch.wait(5)
+        return {'offers': [offer(id='reload-race-offer')]}
+
+    def dispatch(item, results):
+        snapshot = dispatcher.settings
+        assert snapshot['revision_marker'] == 'old'
+        launching.set()
+        assert release_launch.wait(5)
+        unchanged.append(dispatcher.settings is snapshot)
+
+    def reload_settings(path, mtime):
+        if not fetching.is_set():
+            return None, mtime
+        if not release_fetch.is_set():
+            # Old guard enters load_settings while GET is still in flight.
+            # Let that GET spawn an old-settings worker before loading ends.
+            raced.set()
+            release_fetch.set()
+            assert launching.wait(2)
+        return {**cfg, 'revision_marker': 'new'}, mtime
+
+    def start(current, target, args, name):
+        if name != 'fleet-offers':
+            return None
+        reader = original_start(current, target, args, name)
+        readers.append(reader)
+        return reader
+
+    def command(_):
+        commands.append(True)
+        if len(commands) == 1:
+            assert fetching.wait(2)
+        elif len(commands) == 2:
+            release_fetch.set()
+            try:
+                assert launching.wait(2)
+                assert not raced.is_set(), 'settings reload overlapped the offer reader'
+            except BaseException:
+                release_launch.set()
+                raise
+        elif len(commands) == 3:
+            assert dispatcher.settings['revision_marker'] == 'old'
+            release_launch.set()
+            wait_idle(dispatcher)
+        else:
+            assert dispatcher.settings['revision_marker'] == 'new'
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(session_host.config, 'load_config', return_value={
+            'machine_id': 'synthetic-machine', 'access_token': 'synthetic'}))
+        stack.enter_context(patch.object(session_host.fleet, 'load_settings', return_value=cfg))
+        stack.enter_context(patch.object(session_host, 'qualify_sender_binding', return_value=SimpleNamespace(
+            session_id='synthetic-controller', workspace=str(tmp_path))))
+        stack.enter_context(patch.object(session_host.fleet, 'Dispatcher', return_value=dispatcher))
+        stack.enter_context(patch.object(session_host, 'QuotaCollector', return_value=Mock()))
+        stack.enter_context(patch.object(session_host, 'maybe_reload_fleet_settings', side_effect=reload_settings))
+        stack.enter_context(patch.object(session_host, 'maybe_start_maintenance_thread', return_value=None))
+        stack.enter_context(patch.object(session_host, 'maybe_start_named_thread', side_effect=start))
+        stack.enter_context(patch.object(session_host.session_control, 'execute', side_effect=command))
+        stack.enter_context(patch.object(dispatcher, '_fetch_offers', side_effect=fetch))
+        stack.enter_context(patch.object(dispatcher, '_dispatch_one', side_effect=dispatch))
+        for name in ('status', 'metrics', 'disk', 'host_health', 'role_consumer', 'token'):
+            stack.enter_context(patch.object(session_host, 'maybe_start_' + name + '_thread', return_value=None))
+        try:
+            session_host.run(str(path), str(tmp_path / 'controller'), interval=1, cycles=4)
+        finally:
+            release_fetch.set()
+            release_launch.set()
+            for reader in readers:
+                reader.join(5)
+            wait_idle(dispatcher)
+    assert len(commands) == 4
+    assert unchanged == [True]
+    assert not raced.is_set()
+    assert dispatcher.settings['revision_marker'] == 'new'
