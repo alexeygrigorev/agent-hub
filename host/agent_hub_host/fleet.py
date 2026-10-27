@@ -1055,10 +1055,8 @@ class Dispatcher:
         offer_id = record.get("offer_id")
         if not isinstance(offer_id, str) or not LABEL.fullmatch(offer_id):
             return
-        entry_file = jdir / f"{offer_id}.json"
-        raw = json.dumps(record, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        from . import private_fs
-        private_fs.atomic_write(str(entry_file), raw, 131072)
+        from .terminal_reports import persist
+        persist(self, record)
 
     def _load_pending_launches_from_journal(self) -> None:
         jdir = self._journal_launches_dir()
@@ -1497,7 +1495,7 @@ class Dispatcher:
         self._persist_launch_record(record)
         return {'id': offer_id, **payload, 'reason': diagnostic['reason']}
 
-    def reconcile_launches(self, offer_ids=None) -> list[dict[str, Any]]:
+    def reconcile_launches(self, offer_ids=None, *, terminal_only=False) -> list[dict[str, Any]]:
         """Reconcile pending owned headless launches via verified positive retirement,
         Launcher reconcile, and own-host Fleet confirmed-exit result.
         """
@@ -1512,9 +1510,8 @@ class Dispatcher:
         launcher = self.settings.get("launcher", {})
         has_launcher = all(launcher.get(k) for k in ["argv", "root", "config_dir"])
 
-        for offer_id, record in list(self._active_launches.items()):
-            if offer_ids is not None and offer_id not in offer_ids:
-                continue
+        from .terminal_reports import guarded_records
+        for offer_id, record in guarded_records(self, offer_ids):
             if record.get("settled") is True:
                 from .late_reports import deliver, cleanup
                 try:
@@ -1565,7 +1562,7 @@ class Dispatcher:
             except (SessionControlError, KeyError, ValueError, TypeError):
                 continue
 
-            if not record.get('routing_task_id') and (time.time() - incarnation / 1000 < 600 or record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused'):
+            if not terminal_only and not record.get('routing_task_id') and (time.time() - incarnation / 1000 < 600 or record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused'):
                 health = self._check_headless_health(offer_id, record['task_id'], record['workspace'], engine)
                 if health is not None:
                     reconciled.append(health)
@@ -2926,7 +2923,11 @@ class Dispatcher:
                 state_path=Path(self.journal_dir) / 'session-progress.json' if self.journal_dir else None)
         rows = raw if isinstance(raw, list) else raw.get('sessions', [])
         # Preserve native exit metadata before automatic retirement removes the row.
-        active_launches = dict(self._active_launches)
+        # Observe copies: another thread can acknowledge and settle a launch
+        # while a slow catalog sample is finishing. Never mutate its live
+        # outbox/receipt object; the journal writer fences stale snapshots.
+        from .terminal_reports import persist_observation
+        active_launches = {key: dict(value) for key, value in list(self._active_launches.items())}
         for record in active_launches.values():
             for row in rows:
                 from .exit_evidence import same_native, snapshot_native
@@ -2935,7 +2936,7 @@ class Dispatcher:
                         opencode_data=self.settings.get('opencode_auth', {}).get('target_data'))
                     if evidence is not None and evidence != record.get('exit_evidence'):
                         record['exit_evidence'] = evidence
-                        self._persist_launch_record(record)
+                        persist_observation(self, record)
                 if (row.get('id') == record.get('native_id')
                         and row.get('created_at_ms') == record.get('incarnation')
                         and row.get('tag') == record.get('tag')
@@ -2948,7 +2949,7 @@ class Dispatcher:
                     safe['oom_killed'] = exit_info.get('oom_killed') is True
                     if record.get('runtime_exit') != safe:
                         record['runtime_exit'] = safe
-                        self._persist_launch_record(record)
+                        persist_observation(self, record)
                     # Intake a19cac9e ddf55d00: a terminal row whose cgroup is
                     # still non-empty means backgrounded children outlived the
                     # main workload. Persist the bounded bool alongside the
@@ -2957,7 +2958,7 @@ class Dispatcher:
                     if type(row.get('containment_empty')) is bool:
                         if record.get('containment_empty') is not row.get('containment_empty'):
                             record['containment_empty'] = row.get('containment_empty')
-                            self._persist_launch_record(record)
+                            persist_observation(self, record)
         progress = self._session_progress.sample(rows, active_launches)
         enriched = session_metadata(raw, self.settings, progress)
         with self._catalog_report_lock:

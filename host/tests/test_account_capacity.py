@@ -134,7 +134,12 @@ class AccountCapacityTests(unittest.TestCase):
                     d = Dispatcher(settings, runner=Mock(return_value=status), request=Mock())
                     record = {**original, field: value}
                     d._active_launches[offer] = record
-                    d._persist_launch_record(record)
+                    # Deliberately inject a foreign/corrupt durable fixture.
+                    # The production writer now refuses established-identity
+                    # replacement before this recovery fence can be exercised.
+                    from agent_hub_host import private_fs
+                    private_fs.atomic_write(d._journal_launches_dir() / (offer + '.json'),
+                                            json.dumps(record).encode(), 131072)
                     before = dict(record)
                     with patch('agent_hub_host.retired_native.verify_native_retirement', return_value=(True, {}, 'verified')):
                         self.assertFalse(reconcile_launcher_retired(d, row, Path(tmp)))

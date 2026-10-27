@@ -484,6 +484,18 @@ def offers_step_once(dispatcher):
         print(json.dumps({'event': 'offers_error', 'type': type(error).__name__}), flush=True)
 
 
+def terminal_step_once(dispatcher):
+    """Deliver terminal reports without waiting for slow maintenance or starts."""
+    from .terminal_reports import poll
+    started = time.monotonic()
+    try:
+        results = poll(dispatcher)
+        print(json.dumps({'event': 'terminal_reports_cycle', 'reconciled': len(results),
+                          'elapsed_s': round(time.monotonic() - started, 3)}), flush=True)
+    except Exception as error:
+        print(json.dumps({'event': 'terminal_reports_error', 'type': type(error).__name__}), flush=True)
+
+
 def bindings_step_once(dispatcher, *, enrich=False):
     """Report native identity without waiting for launcher first-action readiness."""
     started = time.monotonic()
@@ -710,6 +722,8 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         next_offers = 0
         offers_thread = None
         bindings_thread = None
+        terminal_thread = None
+        next_terminal = 0
         count = 0
         # Operator fleet settings (workspaces map, workspace_roots,
         # subscriptions, launcher) are re-read when the file changes, so a
@@ -747,6 +761,11 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                     offers_thread = maybe_start_named_thread(
                         offers_thread, offers_step_once, (dispatcher,), 'fleet-offers')
                     next_offers = time.monotonic() + fleet.OFFERS_POLL_S
+                from .terminal_reports import POLL_SECONDS
+                if time.monotonic() >= next_terminal:
+                    terminal_thread = maybe_start_named_thread(
+                        terminal_thread, terminal_step_once, (dispatcher,), 'fleet-terminal-reports')
+                    next_terminal = time.monotonic() + POLL_SECONDS
                 # A failed subscription/placement cycle must not prevent stop,
                 # capture, or late delivery reconciliation on existing sessions.
                 try:
