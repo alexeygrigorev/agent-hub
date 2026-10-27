@@ -215,7 +215,7 @@ def _verified_recently(cfg):
         return (type(verified_at) in (int, float)
                 and 0 <= time.time() - verified_at <= VERIFICATION_TTL_S
                 and proof.get('identity') == identity)
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, AttributeError, OverflowError):
         return False
 
 

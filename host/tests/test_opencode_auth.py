@@ -204,6 +204,22 @@ def test_changed_or_expired_device_proof_requires_real_verification(tmp_path, ch
             wal.close()
 
 
+@pytest.mark.parametrize('verified_at', [10**400, -(10**400)])
+def test_oversized_proof_timestamp_falls_back_to_successful_native_verification(tmp_path, verified_at):
+    cfg = proof_config(tmp_path)
+    auth.prepare(cfg, native=proof_native)
+    target = Path(cfg['target_data'])
+    proof = target / 'device-verification.json'
+    data = json.loads(proof.read_text())
+    data['verified_at'] = verified_at
+    proof.write_text(json.dumps(data))
+    assert auth.prepare(cfg, native=proof_native)['status'] == 'ok'
+    calls = (target / 'fixture-calls.log').read_text().splitlines()
+    assert calls.count('auth export opencode') == 2
+    assert calls.count('api model.list') == 2
+    assert abs(json.loads(proof.read_text())['verified_at']) < 10**400
+
+
 def test_runtime_session_writes_reuse_proof_but_login_change_during_check_does_not(tmp_path):
     cfg = proof_config(tmp_path)
     auth.prepare(cfg, native=proof_native)
