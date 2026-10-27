@@ -1,7 +1,7 @@
 [Unit]
 Description=Check for orphaned sessions with missing worktrees (2h grace)
 [Timer]
-OnBootSec=10min
-OnUnitActiveSec=15min
+OnBootSec=5min
+OnUnitActiveSec=10min
 [Install]
 WantedBy=timers.target

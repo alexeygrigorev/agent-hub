@@ -284,6 +284,7 @@ main()
 def env(tmp_path_factory, monkeypatch):
     base = tempfile.mkdtemp(dir=REPO_TMP, prefix="sess-exec-")
     monkeypatch.setenv("TMPDIR", os.path.join(REPO_TMP))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", os.path.join(REPO_TMP))
     work = os.path.join(base, "work")
     os.makedirs(work)
     sessions_file = os.path.join(base, "sessions.json")
@@ -560,6 +561,26 @@ def test_stop_confirms_exit_and_second_stop_reports_gone(env):
     assert done["state"] == "stopped"
     again = se.stop_controlled_session(env["fake"], target, custody=custody())
     assert again["state"] == "stopped"  # already terminal: idempotent, no new effect
+
+
+def test_ordinary_stop_releases_lock_only_when_intake_closed(env, monkeypatch):
+    """AC1 release: ordinary stop unlocks with closed intake, keeps with open."""
+    from agent_hub_host import worktree_guard as guard
+    rec = seed_session(env)
+    target = make_target(env, "agent1", rec["id"])
+    calls: list = []
+    monkeypatch.setattr(guard, "release_session_lock", lambda *a, **k: calls.append((a, k)) or True)
+    command = {"op": "stop", "command_id": str(uuid.uuid4()), "session_id": "a" * 32}
+    out = se._run_claimed_effect(env["fake"], "stop", command, target, custody=custody(),
+                                 journal_dir=env["journal"], linked_intake_open=False)
+    assert out["confirmed_exit"] is True
+    assert calls == [(("git", env["work"], "a" * 32), {"terminal": True, "intake_state": "done"})]
+    calls.clear()
+    out2 = se._run_claimed_effect(env["fake"], "stop", {**command, "command_id": str(uuid.uuid4())},
+                                  target, custody=custody(), journal_dir=env["journal"],
+                                  linked_intake_open=True)
+    assert out2["confirmed_exit"] is True
+    assert calls == []
 
 
 def test_stop_forgotten_record_is_uncertain_not_stopped(env):

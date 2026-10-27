@@ -241,10 +241,19 @@ sessions started by Alexey or another coordinator. Session origin does not
 prohibit sending input, stopping, or deleting a session; ordinary caller
 authorization and exact native identity checks still apply.
 
-The machine-authenticated host catalog (`PUT /api/fleet/sessions`) invokes
-`adoptObservedNativeSessions` to reconcile the exact native UUID, tag,
-workspace, engine and creation-time incarnation into the canonical session
-control view. No duplicate Fleet launch or separate operator claim is needed.
+The machine-authenticated host catalog (`PUT /api/fleet/sessions`) preserves
+observations and resource/account accounting. Catalog labels alone do not
+transfer custody or authorize locking a user's checkout. For a new external
+native session, an authenticated admin submits its exact catalog tuple and
+`machine_id` to `POST /api/sessions/host-adoption`. HTTP 202 means custody is
+pending, not that adoption completed. The enrolled host polls that same path
+with GET, verifies the actual native UUID, tag, workspace, engine and creation
+time, saves immutable repository evidence, and locks the worktree with the
+canonical session UUID. Only its exact receipt at
+`POST /api/sessions/host-adoption/receipt` creates the canonical binding.
+No duplicate Fleet launch is created. Unverified census-only adoption opens a
+durable `needs_attention` item; existing canonical sessions are not relocked
+by repeating an adoption request.
 Running observed native sessions are reported as `provenance: observed_native`
 and `controllability: controllable`; `active` and `starting` states are also
 controllable. Other observed states report `historical_read_only`.
@@ -533,7 +542,7 @@ rows, complete pagination).
 
 ## Native session adoption & qualified aliases
 
-Host-attested native aplexer sessions (interactive sessions, background work, task sessions) are observed via the maintained host catalog pipeline (`session_metadata` -> `PUT /api/fleet/sessions` and `POST /api/sessions/host-adoption`) and adopted into the canonical session control view:
+Host-attested native aplexer sessions (interactive sessions, background work, task sessions) remain visible through `session_metadata` -> `PUT /api/fleet/sessions`. New canonical adoption requires the explicit operator intent and host lock receipt described above; existing adopted sessions retain their identity and control contract:
 
 1. **Exact incarnation**: Preserves native UUID (`id`), tag, workspace, integer `created_at_ms`, and engine. Machine-bound host authority ensures that only the authorized enrolled host machine can report observations or claims.
 2. **Provenance & Controllability**:
@@ -544,7 +553,7 @@ Host-attested native aplexer sessions (interactive sessions, background work, ta
    - Exact match resolution only. Collisions or reused tags return `409 ambiguous_name` honestly without "latest wins"; callers fall back to the exact canonical native UUID.
    - Separate resolver preserving the friendly name validation (`--name` on start continues to exclude colons).
 4. **Security & Authorization**:
-   - Adopted sessions carry `actor = 'unknown'` with null owner tokens.
+   - Legacy adopted sessions retain their prior `actor = 'unknown'` and null owner tokens. New explicit adoptions retain the authenticated custody actor and credential; census-supplied owner labels are ignored.
    - Admin human device credentials pass authorization and can view, send, capture, and stop adopted sessions.
    - Foreign agent credentials fail closed (`404 not_found` / `403 forbidden`) and cannot view or control observed native sessions.
    - Normal Hub-started sessions with `fleet_launch_id` remain completely unchanged.
@@ -611,6 +620,42 @@ Hub authentication and returns the API cancellation receipt.
 A human-created headless worker may be eligible for cleanup when its canonical Hub intent, headless Fleet launch, exact native binding and original human credential provenance agree. Human ownership remains visible separately from workload protection. Interactive, observed, explicitly protected, contradictory and unknown human workloads stay protected. Completion, no pending obligations, containment, retention and clean/merged Git checks still apply.
 
 Cleanup requires a current credential from the creator's exact family, including after ordinary refresh. A different family with the same human actor has no cleanup authority. Older rows may recover family identity only from their immutable creator credential; missing provenance fails closed. Browser-only admin authority cannot establish individual family custody. The host claim repeats credential-family and protection checks. If authority changes after a claim and a host reports removal, the durable outcome records uncertainty rather than an authorized cleanup.
+
+### Worktree guard: never remove your own worktree (incident 95c1862c)
+
+The 95c1862c session removed its own git worktree (`git worktree remove` +
+branch delete) while its intake was still open, because it treated a shipped
+increment as the final push. Nothing guarded the tree, and the stale
+` (deleted)` kernel label then hid the recreated checkout. Hub now locks
+every session worktree on start/adopt
+(`git worktree lock --reason "hub-session <id> intake <intake-id|none>"`),
+so plain `git worktree remove` and `git worktree prune` refuse while the
+session is live or its intake is open.
+
+Rules for every session brief (also appended to Hub-generated briefs):
+
+- NEVER remove your git worktree yourself — not with `git worktree remove`,
+  `git worktree prune`, `rm -rf`, or branch deletes. The lock refuses; do not
+  work around it.
+- Remove the worktree only after the linked intake has a DONE note with live
+  proof of every AC; while blocked or waiting, keep it.
+- Every automated cleanup path (owned STOP-bundled removal, orphan sweeper,
+  resource/idle watchdog reaps, disk-cleanup scripts) skips worktrees that
+  are locked, belong to a live session, or belong to a session linked to an
+  open intake.
+- The lock releases only when the session is terminal AND (no linked intake,
+  or the linked intake has a DONE note / is archived).
+- If a live session's worktree path disappears, Hub opens a needs_attention
+  item and appends a note to the linked intake within 10 minutes.
+- A cwd that keeps the stale ` (deleted)` label while the same path holds a
+  valid worktree of the original repository is reported as
+  `cwd_stale_path_recreated`. The host compares the original Git common-dir
+  path and device/inode captured before start/adopt; another repository at
+  the same path is not recovery. Legacy sessions without original identity
+  evidence remain unverified until that evidence is available.
+- The installed session host checks worktrees in a separate report-only
+  observer every 60 seconds, using host-authenticated observations. Slow
+  Fleet maintenance and an uninstalled optional orphan timer do not delay it.
 
 ### Start interactive goal work
 

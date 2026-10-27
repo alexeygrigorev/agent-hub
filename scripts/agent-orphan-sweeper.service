@@ -7,5 +7,8 @@ User=alexey
 Environment=HOME=/home/alexey
 Environment=PATH=/home/alexey/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=ORPHAN_GRACE_HOURS=2
+# PYTHONPATH must point to a verified immutable release/host directory.
+EnvironmentFile=/home/alexey/.config/agent-hub/orphan-sweeper.env
+Environment=ORPHAN_STATE_PATH=/home/alexey/.local/state/agent-hub/orphan-sweeper.json
 Environment=HUB_MACHINE_ID=hetzner
-ExecStart=/usr/bin/python3 /usr/local/lib/agent-hub-orphan-sweeper.py --apply --grace-hours 2 --machine-id hetzner --hub-bin /home/alexey/.local/bin/hub
+ExecStart=/usr/bin/python3 -m agent_hub_host.orphan_sweeper --apply --grace-hours 2 --machine-id hetzner --hub-bin /home/alexey/.local/bin/hub

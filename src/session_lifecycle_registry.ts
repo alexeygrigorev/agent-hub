@@ -1,4 +1,5 @@
 import { jsonFields } from './sql-json-projection';
+import { intakeHasDoneEvidence } from './intake';
 /** M15c live durable lifecycle registry (server authority).
  *
  * This module is the ONE durable/server authority for lifecycle state. It
@@ -349,7 +350,7 @@ const OBSERVABLE_FLAGS = new Set([
   'authoritative_no_pending_proof',
   'pending_obligations', 'has_active_children',
   'has_unsubmitted_draft', 'has_unresolved_send_stop',
-  'worktree_missing', 'superseded_by',
+  'worktree_missing', 'superseded_by', 'cwd_path_recreated',
 ]);
 
 const BOOL_FLAGS = new Set([
@@ -357,7 +358,7 @@ const BOOL_FLAGS = new Set([
   'limit_hit', 'report_written', 'screen_done',
   'authoritative_no_pending_proof', 'pending_obligations',
   'has_active_children', 'has_unsubmitted_draft',
-  'has_unresolved_send_stop', 'worktree_missing',
+  'has_unresolved_send_stop', 'worktree_missing', 'cwd_path_recreated',
 ]);
 
 const TEXT_FLAGS = new Set([
@@ -705,16 +706,54 @@ export function collectCleanupEligible(
     };
   });
   const plan = planCleanup(candidates, callerOwner);
-  return {
-    eligible: plan.eligible.map((entry) => ({
+  // Worktree-guard (AC2): finished sessions linked to an OPEN intake stay
+  // ineligible even when every other cleanup condition holds. The lock is
+  // released only after a DONE note / archive; never while work is open.
+  const eligible: CleanupApplyEligible[] = [];
+  const ineligible = [...plan.ineligible];
+  for (const entry of plan.eligible) {
+    const openId = linkedOpenIntake(sql, refs.get(entry.session_key)?.task_refs ?? []);
+    if (openId) {
+      ineligible.push({ key: entry.session_key, reasons: [`linked open intake ${openId} (worktree guard: keep while work is open)`] });
+      continue;
+    }
+    eligible.push({
       session_key: entry.session_key,
       state: entry.state,
       owner: entry.owner,
       refs: refs.get(entry.session_key)!,
-    })),
-    ineligible: plan.ineligible,
-    total: scoped.length,
-  };
+    });
+  }
+  return { eligible, ineligible, total: scoped.length };
+}
+
+/** Worktree-guard (intake a0f01448 AC2): a session linked to an open intake
+ * is never cleanup-eligible, even when finished. An intake is open unless
+ * its ledger row is archived or carries a qualifying
+ * DONE note (live proof). Unknown rows and parse failures fail closed
+ * (treated as open) so a missing ledger never authorizes a removal. */
+export function isIntakeTaskOpen(sql: SqlStorage, taskId: unknown): boolean {
+  try {
+    if (typeof taskId !== 'string' || !taskId) return true;
+    const row: any = sql.exec('SELECT data FROM intake_tasks WHERE id = ?', taskId).toArray()[0];
+    if (!row) return true;
+    const task = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+    if (!task || typeof task !== 'object') return true;
+    if (task.archived_at != null) return false;
+    if (intakeHasDoneEvidence(task)) return false;
+    return true;
+  } catch {
+    return true;
+  }
+}
+
+/** First linked open intake id, or null when none is open. */
+export function linkedOpenIntake(sql: SqlStorage, taskRefs: unknown): string | null {
+  if (!Array.isArray(taskRefs)) return null;
+  for (const id of taskRefs) {
+    if (typeof id === 'string' && id && isIntakeTaskOpen(sql, id)) return id;
+  }
+  return null;
 }
 
 /** Readonly dry-run: pure classification + planning, zero writes. */

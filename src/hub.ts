@@ -177,7 +177,16 @@ export class Hub extends DurableObject {
         const prepared = this.repoRegistry.prepareLaunch(input);
         return prepared.error ? { value: prepared.error, status: 400 } : this.fleetService.reserve(prepared.input, auth);
       },
-    }, { env: this.env });
+    }, { env: this.env,
+      // Worktree-guard AC4: live worktree disappearance opens a
+      // needs_attention alert and appends the linked-intake note.
+      worktreeGuard: {
+        setAlert: (kind, subject, problem) => this.livenessService.setAlert(kind, subject, problem),
+        appendIntakeNote: (taskId, text) => this.intakeService.serviceRecordEvent(taskId, {
+          event: { kind: 'note', text, actor: 'hub:service:worktree-guard', authority: 'operator_record' },
+        }),
+      },
+    });
     this.sessionControlService.init();
     // Inbound webhooks -> session delivery (intake 19ec91c2): the queue
     // resolves targets at delivery time and reuses session-control send

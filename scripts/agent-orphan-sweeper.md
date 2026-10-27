@@ -22,8 +22,10 @@ Default is dry-run report (omit `--apply` to only print actions). State file
 `first_missing_at` per native id for the grace period.
 
 ```sh
-sudo install -m 0755 host/agent_hub_host/orphan_sweeper.py /usr/local/lib/agent-hub-orphan-sweeper.py
-python3 /usr/local/lib/agent-hub-orphan-sweeper.py --hub-bin /home/alexey/.local/bin/hub --machine-id hetzner
+# Pin an already verified immutable host release. Do not copy the module alone.
+# Set PYTHONPATH=<verified-release>/host in this root-owned environment file:
+sudoedit /home/alexey/.config/agent-hub/orphan-sweeper.env
+PYTHONPATH=<verified-release>/host python3 -m agent_hub_host.orphan_sweeper --hub-bin /home/alexey/.local/bin/hub --machine-id hetzner
 # Inspect dry-run, then enable:
 sudo install -m 0644 scripts/agent-orphan-sweeper.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -31,3 +33,16 @@ sudo systemctl enable --now agent-orphan-sweeper.timer
 ```
 
 Logs contain only session ids/tags/actions/reasons, never transcripts.
+
+The normal session host runs the same detection code in report-only mode every
+60 seconds, independently of the slow maintenance loop. It posts observations
+with the existing host credential. No extra timer installation is needed for
+missing-worktree alerts or recreated-path reporting. The optional timer above
+retains the legacy grace/interactive behavior and must use the package from a
+verified release so relative imports resolve.
+
+Before launching into a linked checkout, the host records its original Git
+common directory path and device/inode under
+`~/.local/state/agent-hub/worktree-identities/<launch-id>.json`. A recreated path
+is accepted only when that original identity matches. Unknown legacy evidence
+stays conservative; a valid unrelated repository never counts as recovery.

@@ -1463,13 +1463,35 @@ export class FleetService {
         const scopedWorkers = sessionTable && valid.length ? new Set(this.sql.exec(
           `SELECT fleet_launch_id FROM session_control_sessions WHERE fleet_launch_id IN (${valid.map(() => '?').join(',')}) AND json_extract(request_json,'$.intake_task_id') IS NOT NULL`,
           ...valid.map(row => String(row.id))).toArray().map((row: any) => String(row.fleet_launch_id))) : new Set<string>();
+        // Worktree-guard (AC1): the host locks the session worktree on start
+        // with reason "hub-session <id> intake <intake-id|none>". The offer
+        // carries both ids so the host never invents them.
+        const hubLinks = new Map<string, { hub_session_id: string; intake_task_id: string | null }>();
+        if (sessionTable && valid.length) {
+          try {
+            for (const row of this.sql.exec(
+              `SELECT id, fleet_launch_id, request_json FROM session_control_sessions WHERE fleet_launch_id IN (${valid.map(() => '?').join(',')})`,
+              ...valid.map(row => String(row.id))).toArray() as any[]) {
+              if (!row.fleet_launch_id || hubLinks.has(String(row.fleet_launch_id))) continue;
+              let intake: string | null = null;
+              try {
+                const request = row.request_json ? JSON.parse(row.request_json) : {};
+                if (typeof request.intake_task_id === 'string' && request.intake_task_id) intake = request.intake_task_id;
+              } catch { /* unparseable request: intake stays null */ }
+              hubLinks.set(String(row.fleet_launch_id), { hub_session_id: String(row.id), intake_task_id: intake });
+            }
+          } catch { /* additive enrichment is best-effort */ }
+        }
         const offers = this.resources.withReadSnapshot(() => {
           // Offer metadata needs host failure evidence, not a hypothetical
           // admission estimate for each launch. Claim admission remains live.
           const choking = valid.length ? this.resources.resourceChoking(caller.machineId!) : null;
           return valid.map(row => {
             const request = parsed(row.request_json);
+            const link = hubLinks.get(String(row.id));
             return { ...(scopedWorkers.has(String(row.id)) ? { worker_credential_required: true } : {}),
+              // AC1 lock identity (additive; unknown keys are ignored by hosts).
+              ...(link ? { hub_session_id: link.hub_session_id, ...(link.intake_task_id ? { intake_task_id: link.intake_task_id } : {}) } : {}),
               ...this.resources.cpuStart(String(row.id)), resource_choking: choking, resource_management: this.resources.config(),
               memory_estimate_mb: this.resources.estimate(request.project || String(row.workspace), String(row.engine), request.task_kind || 'goal'),
               selection: parsed(row.model_selection_json) ?? {}, id: row.id, engine: row.engine, account: row.account, profile: row.profile,

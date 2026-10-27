@@ -8,7 +8,7 @@
  * No native/Git effects anywhere in this file.
  */
 import { describe, expect, it } from 'vitest';
-import { seedFixtureIntake, withFixtureIntake } from './tbm-fixture';
+import { closeFixtureIntake, seedFixtureIntake, withFixtureIntake } from './tbm-fixture';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { SessionControlService, deriveCleanupSessionKey, CLEANUP_APPLY_ALLOWED_STATES } from '../src/session_control';
 import type { Hub } from '../src/hub';
@@ -97,11 +97,16 @@ async function finishObservation(s: SessionControlService, nativeId: string = NA
   expect(res.status).toBe(201);
 }
 
+/** Worktree-guard: legacy cleanup tests close the open fixture intake so the
+ * finished session stays tree-eligible; the open-intake refusal has its own
+ * test below. */
+
 describe('m15d cleanup apply', () => {
   it('enqueues a real M12 stop for an eligible own finished session and replays it', async () => fixture(async (s, sql) => {
     const created = await startAgentSession(s, 'm15d-done');
     await bindAgentSession(s, sql, created.id, 'launch-1');
     await finishObservation(s);
+    closeFixtureIntake(sql);
     const key = `hetzner/${NATIVE_ID}`;
     const dry = await (await s.handle(request('/api/sessions/cleanup', { dry_run: true }), agent())).json() as any;
     expect(dry.eligible.map((e: any) => e.session_key)).toContain(key);
@@ -145,6 +150,7 @@ describe('m15d cleanup apply', () => {
     const created = await startAgentSession(s, 'm15d-already-stopped');
     await bindAgentSession(s, sql, created.id, 'launch-1');
     await finishObservation(s);
+    closeFixtureIntake(sql);
 
     // Mark the canonical session stopped (e.g. naturally exited / host reported exit)
     sql.exec("UPDATE session_control_sessions SET state = 'stopped' WHERE id = ?", created.id);
@@ -234,6 +240,7 @@ describe('m15d stop-bundled tree outcome in the stop ack', () => {
     const created = await startAgentSession(s, key);
     await bindAgentSession(s, sql, created.id, launchId, nativeId, workspace);
     await finishObservation(s, nativeId);
+    closeFixtureIntake(sql);
     const plan = await (await s.handle(request('/api/sessions/cleanup', { apply: true, key: opKey }), agent())).json() as any;
     expect(plan.enqueued).toHaveLength(1);
     return { sessionId: created.id, commandId: plan.enqueued[0].command_id };
@@ -342,6 +349,7 @@ describe('m15d cleanup_tree authorization (critical blocker)', () => {
     const created = await startAgentSession(s, 'm15d-auth-1');
     await bindAgentSession(s, sql, created.id, 'launch-1');
     await finishObservation(s);
+    closeFixtureIntake(sql);
     // Ordinary stop first: no flag anywhere.
     const stop = await s.handle(request(`/api/sessions/${created.id}/stop`, { key: 'ordinary-1' }), agent());
     expect(stop.status).toBe(201);
@@ -384,6 +392,7 @@ describe('m15d cleanup_tree authorization (critical blocker)', () => {
     const created = await startAgentSession(s, 'm15d-auth-3');
     await bindAgentSession(s, sql, created.id, 'launch-1');
     await finishObservation(s);
+    closeFixtureIntake(sql);
     const plan = await (await s.handle(request('/api/sessions/cleanup', { apply: true, key: 'op-auth-3' }), agent())).json() as any;
     expect(plan.enqueued).toHaveLength(1);
     const commandId = plan.enqueued[0].command_id;
@@ -403,6 +412,7 @@ describe('m15d cleanup_tree authorization (critical blocker)', () => {
     const created = await startAgentSession(s, 'm15d-auth-4');
     await bindAgentSession(s, sql, created.id, 'launch-1');
     await finishObservation(s);
+    closeFixtureIntake(sql);
     const plan = await (await s.handle(request('/api/sessions/cleanup', { apply: true, key: 'op-auth-4' }), agent())).json() as any;
     expect(plan.enqueued).toHaveLength(1);
     const commandId = plan.enqueued[0].command_id;

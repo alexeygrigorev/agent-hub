@@ -38,7 +38,7 @@ def claim_for(command_id, authorized):
             "claim_token": "tok-" + uuid.uuid4().hex + "zz",
             "holder": "h", "generation": 1,
             "expires_at_ms": 2000000000000,
-            "cleanup_tree": True if authorized else False}
+            "cleanup_tree": True if authorized else False, "linked_intake_open": False}
 
 
 class TestCleanupEvidenceOrder(unittest.TestCase):
@@ -71,18 +71,20 @@ class TestCleanupEvidenceOrder(unittest.TestCase):
             return {"session_id": target.session_id, "state": "stopped", "reason": "exited"}
 
         def fake_tree(exe, target, custody=None, journal_dir=None,
-                      cleanup_roots=None, command_id=None):
+                      cleanup_roots=None, command_id=None, linked_intake_open=None):
             events.append("tree")
             return {"state": "removed", "reason": "owned worktree removed"}
 
         with patch.object(se, "capture_session_output", side_effect=fake_capture), \
              patch.object(se, "stop_controlled_session", side_effect=fake_stop), \
-             patch.object(se, "_run_cleanup_tree_after_stop", side_effect=fake_tree):
+             patch.object(se, "_run_cleanup_tree_after_stop", side_effect=fake_tree), \
+             patch("agent_hub_host.worktree_guard.release_session_lock",
+                   side_effect=lambda *args, **kwargs: events.append("unlock") or True):
             out = se._run_claimed_effect(
                 "fake", "stop", {"command_id": cid}, tgt, custody=custody(),
                 journal_dir=str(self.journal), cleanup_roots=[str(self.roots)],
-                cleanup_tree_authorized=True)
-        self.assertEqual(events, ["capture", "stop", "tree"])
+                cleanup_tree_authorized=True, linked_intake_open=False)
+        self.assertEqual(events, ["capture", "stop", "unlock", "tree"])
         self.assertIn("tree", out)
         # Durable private evidence outside the cleanup roots (split raw+meta
         # so full 64KiB + JSON escaping never overflows the journal bound).
@@ -133,7 +135,7 @@ class TestCleanupEvidenceOrder(unittest.TestCase):
             out = se._run_claimed_effect(
                 "fake", "stop", {"command_id": cid}, tgt, custody=custody(),
                 journal_dir=str(self.journal), cleanup_roots=[str(self.roots)],
-                cleanup_tree_authorized=True)
+                cleanup_tree_authorized=True, linked_intake_open=False)
         # On preservation failure, refuse the WHOLE effect before stop/tree:
         # stop is called 0 times (stop0), tree is called 0 times (tree0).
         self.assertEqual(events, ["capture"])
@@ -181,7 +183,7 @@ class TestCleanupEvidenceOrder(unittest.TestCase):
             return {"session_id": target.session_id, "state": "stopped", "reason": "exited"}
 
         def fake_tree(exe, target, custody=None, journal_dir=None,
-                      cleanup_roots=None, command_id=None):
+                      cleanup_roots=None, command_id=None, linked_intake_open=None):
             return {"state": "removed", "reason": "owned worktree removed"}
 
         def fake_request(method, path, payload):
@@ -236,7 +238,7 @@ class TestCleanupEvidenceOrder(unittest.TestCase):
             out = se._run_claimed_effect(
                 "fake", "stop", {"command_id": cid}, tgt, custody=custody(),
                 journal_dir=str(self.journal), cleanup_roots=[str(self.roots)],
-                cleanup_tree_authorized=True)
+                cleanup_tree_authorized=True, linked_intake_open=False)
         self.assertEqual(events, ["capture"])
         self.assertEqual(out["state"], "refused")
         self.assertFalse(out["confirmed_exit"])
@@ -272,7 +274,7 @@ class TestCleanupEvidenceOrder(unittest.TestCase):
             out = se._run_claimed_effect(
                 "fake", "stop", {"command_id": cid}, tgt, custody=custody(),
                 journal_dir=str(self.journal), cleanup_roots=[str(self.roots)],
-                cleanup_tree_authorized=True)
+                cleanup_tree_authorized=True, linked_intake_open=False)
         self.assertEqual(events, ["capture"])
         self.assertEqual(out["state"], "refused")
         self.assertFalse(out["confirmed_exit"])

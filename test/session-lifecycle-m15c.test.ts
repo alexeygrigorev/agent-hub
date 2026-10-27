@@ -7,7 +7,7 @@
  * nothing, and --apply refuses explicitly. No native/Git effects anywhere.
  */
 import { describe, expect, it } from 'vitest';
-import { seedFixtureIntake, withFixtureIntake } from './tbm-fixture';
+import { closeFixtureIntake, seedFixtureIntake, withFixtureIntake } from './tbm-fixture';
 import { env, runInDurableObject } from 'cloudflare:test';
 import { SessionControlService } from '../src/session_control';
 import type { Hub } from '../src/hub';
@@ -114,6 +114,9 @@ async function humanWorker(s: SessionControlService, sql: any, mode = 'headless'
   expect((await s.handle(request(`/api/sessions/${created.id}/binding`, {native:{native_id:NATIVE_ID,tag:canonTag('launch-1'),workspace:NATIVE_WS,native_created_at_ms:NATIVE_CREATED}}), host('hetzner'))).status).toBe(200);
   const at = new Date().toISOString();
   expect((await s.handle(request('/api/sessions/observations', {machine_id:'hetzner',native_id:NATIVE_ID,payload:{report_written:true,report_at:at,screen_done:true,authoritative_no_pending_proof:true}}),host('hetzner'))).status).toBe(201);
+  // Worktree-guard: legacy cleanup tests run with the linked intake closed;
+  // the open-intake refusal is covered by dedicated tests.
+  closeFixtureIntake(sql);
   return created;
 }
 async function humanPlan(s: SessionControlService, auth = human()) {
@@ -308,6 +311,8 @@ describe('m15c lifecycle view', () => {
       machine_id: 'hetzner', native_id: NATIVE_ID,
       payload: { report_written: true, report_at: now, screen_done: true, authoritative_no_pending_proof: true },
     }), host('hetzner'))).status).toBe(201);
+    // Worktree-guard: run the legacy eligibility flow with the linked intake closed.
+    closeFixtureIntake(sql);
     const count = () => Number(sql.exec('SELECT COUNT(*) AS n FROM session_lifecycle_decisions').one().n)
       + Number(sql.exec('SELECT COUNT(*) AS n FROM session_lifecycle_observations').one().n)
       + Number(sql.exec('SELECT COUNT(*) AS n FROM session_control_sessions').one().n);

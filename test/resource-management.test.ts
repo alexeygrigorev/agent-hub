@@ -23,6 +23,10 @@ async function fixture(fn:(r:ResourceManagement,sql:any,f:FleetService)=>Promise
  });
 }
 const sample=(extra={})=>({session_id:'session',native_id:'native',current_rss_mb:200,peak_rss_mb:200,peak_pss_mb:210,cpu_seconds:20,runtime_s:100,observed_at:iso(),...extra});
+/** Worktree-guard: legacy reap tests run with the linked intake closed; the
+ * open-intake refusal has its own test below. */
+const closeIntake=(sql:any)=>sql.exec("UPDATE intake_tasks SET data=json_set(data,'$.status','done','$.history',json(?)) WHERE id='task'",
+ JSON.stringify([{kind:'note',text:'DONE abc1234\nlive check: synthetic resource fixture\nresult: synthetic acceptance criteria verified'}]));
 describe('resource management',()=>{
  it('keeps cached canonical identities and protections current across writes and rollbacks',async()=>fixture(async(r,sql,f)=>{
   r.initCatalogCache();
@@ -274,6 +278,7 @@ describe('resource management',()=>{
  }));
  it('saves evidence and an intake restart note before accepting an idempotent confirmed reap',async()=>fixture(async(r,sql)=>{
   r.report('host',{samples:[sample()],reaps:[]});
+  closeIntake(sql);
   const evidence={id:'saved-output',session_id:'session',native_id:'native',reason:'idle',output:'Final report saved.'};
   expect(r.evidence('host',evidence)).toEqual({saved:true,evidence_id:'saved-output'});r.evidence('host',evidence);
   const reap={id:'reap-1',session_id:'session',native_id:'native',reason:'idle',freed_mb:200,at:iso(),evidence_id:'saved-output',stopped:true};
@@ -281,7 +286,7 @@ describe('resource management',()=>{
   r.report('host',{samples:[],reaps:[reap]});r.report('host',{samples:[],reaps:[reap]});
   expect(r.reaps()).toHaveLength(1);
   const task=JSON.parse(sql.exec("SELECT data FROM intake_tasks WHERE id='task'").one().data);
-  expect(task.status).toBe('open');expect(task.history).toHaveLength(2);expect(task.history[1].text).toContain('restart');
+  expect(task.status).toBe('done');expect(task.history).toHaveLength(3);expect(task.history[2].text).toContain('restart');
   expect(r.usage()[0]).toMatchObject({state:'stopped',finished_at:iso()});
  }));
  it('records reversible CPU throttle receipts, notes the intake and exposes active state (intake f31b678f)',async()=>fixture(async(r,sql)=>{
@@ -334,6 +339,7 @@ describe('resource management',()=>{
   expect(()=>resourceConfig({cpu_throttle_sustain_s:3601})).toThrow('invalid_resource_config');
  }));
  it('settles a native binding once across changed attempts and preserves its completion state',async()=>fixture(async(r,sql)=>{
+  closeIntake(sql);
   sql.exec("UPDATE fleet_launches SET state='exited',finished_at=? WHERE id='launch'",iso());
   sql.exec("UPDATE session_control_sessions SET state='exited' WHERE id='session'");
   r.report('host',{samples:[sample()],reaps:[]});
@@ -350,7 +356,7 @@ describe('resource management',()=>{
   r.report('host',{samples:[],reaps:[{...reap,id:'later-stop'}]});
   expect(r.reaps()).toHaveLength(1);
   const history=JSON.parse(sql.exec("SELECT data FROM intake_tasks WHERE id='task'").one().data).history;
-  expect(history).toHaveLength(2);
+  expect(history).toHaveLength(3);
  }));
  it('never exposes protected or externally interactive sessions as managed reap targets',async()=>fixture(async(r,sql)=>{
   sql.exec('INSERT INTO session_control_protections VALUES(?,?,?,?)','session','human','keep',iso());
@@ -402,6 +408,7 @@ describe('resource management',()=>{
   expect(r.sessions('host')[0].session_id).toBe('session');
  }));
  it('unions real interactive and keep protections across every alias before evidence or reap',async()=>fixture(async(r,sql)=>{
+  closeIntake(sql);
   r.evidence('host',{id:'prior-alias-evidence',session_id:'session',native_id:'native',reason:'idle',output:'saved before protection'});
   sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
     VALUES(?,?,?,?,?,?,?,?,?,?,?)`,'interactive-alias','human','explicit-interactive','{}','host','opencode','interactive','running',
@@ -424,4 +431,40 @@ describe('resource management',()=>{
   expect((await f.handle(req('/config','PUT',{memory_floor_mb:4096}),admin)).status).toBe(200);
   expect(r.headroom('host').floor_mb).toBe(4096);
  }));
+ it('refuses watchdog evidence while the linked intake is open and resumes after DONE (AC2)',async()=>fixture(async(r,sql)=>{
+  // Fixture intake is open: the watchdog entry is flagged and evidence refused.
+  expect(r.sessions('host')[0]).toMatchObject({linked_intake_open:true});
+  expect(()=>r.evidence('host',{id:'open-evidence',session_id:'session',native_id:'native',reason:'idle',output:'x'})).toThrow('session_not_reapable');
+  // A qualifying DONE note with live proof closes the gate even while open.
+  sql.exec("UPDATE intake_tasks SET data=json_set(data,'$.history',json(?)) WHERE id='task'",
+    JSON.stringify([{id:'n1',kind:'note',text:'DONE abc1234\nlive check: hub sessions show session\nresult: idle reap refused as required'}]));
+  expect(r.sessions('host')[0]).toMatchObject({linked_intake_open:false});
+  r.report('host',{samples:[sample()],reaps:[]});
+  expect(r.evidence('host',{id:'done-evidence',session_id:'session',native_id:'native',reason:'idle',output:'x'})).toEqual({saved:true,evidence_id:'done-evidence'});
+ }));
+ it('protects post-launch links across host and binding aliases with fresh cache invalidation',async()=>fixture(async(r,sql)=>{
+  closeIntake(sql);
+  r.initCatalogCache();
+  const read=()=>r.sessions('host').find(s=>s.session_id==='session')!;
+  expect(read().linked_intake_open).toBe(false);
+  const task={id:'linked-later',project:'demo',status:'open',version:1,updated_at:now,history:[]};
+  sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',task.id,JSON.stringify(task));
+  sql.exec('INSERT OR REPLACE INTO intake_task_projection(id,data,links) VALUES(?,?,?)',task.id,JSON.stringify(task),
+    JSON.stringify([{kind:'link',native_id:'native',host:'host-old'}]));
+  sql.exec('INSERT INTO machines(id,name,hostname,registered_at) VALUES(?,?,?,?)','host-old','old','different',iso());
+  expect(read().linked_intake_open).toBe(false);
+  sql.exec("UPDATE machines SET hostname='HOST' WHERE id='host-old'");
+  expect(read().linked_intake_open).toBe(true);
+  expect(()=>r.evidence('host',{id:'post-link',session_id:'session',native_id:'native',reason:'idle',output:'x'})).toThrow('session_not_reapable');
+  sql.exec("UPDATE intake_tasks SET data=json_set(data,'$.archived_at',123) WHERE id=?",task.id);
+  expect(read().linked_intake_open).toBe(false);
+  const second={id:'binding-alias-task',project:'demo',status:'open',version:1,updated_at:now,history:[]};
+  sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',second.id,JSON.stringify(second));
+  sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at)
+    SELECT 'binding-alias',actor,'binding-alias',?,machine_id,engine,mode,state,binding_json,created_at,updated_at FROM session_control_sessions WHERE id='session'`,JSON.stringify({intake_task_id:second.id}));
+  expect(read().linked_intake_open).toBe(true);
+  sql.exec("INSERT INTO intake_task_projection(id,data,links) VALUES('bad-projection','{}','invalid')");
+  expect(read().linked_intake_open).toBe(true);
+ }));
+
 });

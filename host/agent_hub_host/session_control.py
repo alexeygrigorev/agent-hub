@@ -562,6 +562,8 @@ def add_commands(sub):
     observe.add_argument('--has-unsubmitted-draft', action='store_true')
     observe.add_argument('--has-unresolved-send-stop', action='store_true')
     observe.add_argument('--worktree-missing', action='store_true')
+    observe.add_argument('--cwd-path-recreated', action='store_true',
+                         help='Path with a stale deleted label now holds a valid worktree')
     observe.add_argument('--superseded-by', default=None)
     observe.add_argument('--note', default=None, help='Opt-in free text (bounded, redacted server-side; reason codes preferred)')
 
@@ -666,7 +668,7 @@ def _execute(args):
                 fields[name] = value
         for flag in ('awaiting_alexey', 'report_written', 'screen_done', 'authoritative_no_pending_proof',
                      'pending_obligations', 'has_active_children', 'has_unsubmitted_draft',
-                     'has_unresolved_send_stop', 'worktree_missing'):
+                     'has_unresolved_send_stop', 'worktree_missing', 'cwd_path_recreated'):
             if getattr(args, flag, False):
                 fields[flag] = True
         if getattr(args, 'note', None):

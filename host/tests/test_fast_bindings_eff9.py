@@ -136,6 +136,13 @@ class FastBindingsTests(unittest.TestCase):
 
 
 class CensusIsolationTests(unittest.TestCase):
+    def setUp(self):
+        # This census ordering fixture has virtual paths. Filesystem guard
+        # behavior is tested with real Git trees in test_worktree_guard.
+        guard = patch('agent_hub_host.worktree_guard.protect_adoption', return_value=True)
+        guard.start()
+        self.addCleanup(guard.stop)
+
     def dispatcher(self, directory, rows, requests):
         from agent_hub_host import fleet
         from host.tests.test_fleet import settings
@@ -265,6 +272,20 @@ class CensusIsolationTests(unittest.TestCase):
                 for sampler in threads:
                     sampler.join(5)
                     self.assertFalse(sampler.is_alive())
+
+    def test_actual_binding_path_requires_adoption_guard_before_post(self):
+        rows = [self.row(native='native-new', tag='hub-new-launch')]
+        requests = []
+        with tempfile.TemporaryDirectory() as directory:
+            dispatcher = self.dispatcher(directory, rows, requests)
+            with patch('agent_hub_host.worktree_guard.protect_adoption', return_value=False) as protect:
+                dispatcher.report_native_bindings()
+                protect.assert_called_once()
+                self.assertFalse(any(path.endswith('/binding') for _, path, _ in requests))
+            requests.clear()
+            with patch('agent_hub_host.worktree_guard.protect_adoption', return_value=True):
+                dispatcher.report_native_bindings()
+                self.assertEqual(sum(path.endswith('/binding') for _, path, _ in requests), 1)
 
 
 if __name__ == '__main__':

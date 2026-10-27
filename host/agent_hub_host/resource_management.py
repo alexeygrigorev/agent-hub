@@ -1388,6 +1388,23 @@ def run_watchdog_cycle(
                         continue
                     if reason not in REAP_REASONS:
                         continue
+                    # Worktree-guard (AC2): never reap a session linked to an
+                    # open intake, and never reap out from under a Hub-locked
+                    # worktree. Both fail closed to skip (no stop, no error).
+                    if entry.get("linked_intake_open") is not False:
+                        summary["skipped"] += 1
+                        continue
+                    try:
+                        from . import worktree_guard as _worktree_guard
+                        workspace = entry.get("workspace")
+                        if isinstance(workspace, str) and workspace and (
+                                _worktree_guard.is_locked("git", workspace) is not False or
+                                (not dead and _worktree_guard.bound_worktree_root(workspace) is not None)):
+                            summary["skipped"] += 1
+                            continue
+                    except Exception:
+                        summary["skipped"] += 1
+                        continue
                     if (sid, nid) in settled:
                         continue  # Stop already confirmed; the receipt replays.
                     destructive_ran = True
@@ -1513,6 +1530,18 @@ def _reap_one(request: Any, aplexer_bin: str, entry: dict[str, Any], native: Any
     created_ms = entry.get("native_created_at_ms")
     peak = state.get("peaks", {}).get(_peak_key(sid, nid), {})
     if entry.get("reaped") is True or peak.get("reaped_created_at_ms") == created_ms:
+        return None
+    # Worktree-guard (AC2): an open linked intake refuses every stop reason.
+    if entry.get("linked_intake_open") is not False:
+        return None
+    try:
+        from . import worktree_guard
+        workspace = entry.get("workspace")
+        if not isinstance(workspace, str) or worktree_guard.is_locked("git", workspace) is not False:
+            return None
+        if worktree_guard.bound_worktree_root(workspace) is not None and not _native_dead(native):
+            return None
+    except Exception:
         return None
     pending = state.setdefault("pending", {})
     if not isinstance(pending, dict):

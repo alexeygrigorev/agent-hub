@@ -1,6 +1,7 @@
+import { seedLegacyObservedSessions } from './observed-native-fixture';
 import { describe, expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
-import { SessionControlService, adoptObservedNativeSessions } from '../src/session_control';
+import { SessionControlService } from '../src/session_control';
 import { refreshObservedHostFamily, expireUnclaimedStops, visibleSessionPrefixMatches } from '../src/session_stop';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
@@ -28,10 +29,10 @@ async function fixture(fn: (service: SessionControlService, sql: any, advance: (
 describe('stop delivery for adopted sessions', () => {
   it('refreshes an adopted row family from a fresh authoritative native observation, then claims stop', async () => {
     await fixture(async (s,sql) => {
-      adoptObservedNativeSessions(sql,'stop-host',[native()],Date.now(),'old-family');
+      seedLegacyObservedSessions(sql,'stop-host',[native()],Date.now(),'old-family');
       const queued = await s.handle(req('/api/sessions/'+nativeId+'/stop',{key:'adopted-stop'}),admin);
       expect(queued.status).toBe(201);
-      adoptObservedNativeSessions(sql,'stop-host',[native()],Date.now(),'current-family');
+      seedLegacyObservedSessions(sql,'stop-host',[native()],Date.now(),'current-family');
       const offers = await (await s.handle(req('/api/session-commands/offers'),host)).json() as any;
       expect(offers.offers).toHaveLength(1);
       const offer = offers.offers[0];
@@ -46,11 +47,11 @@ describe('stop delivery for adopted sessions', () => {
     await fixture(async (s,sql,advance) => {
       for (let i=0; i<21; i++) {
         const id = crypto.randomUUID();
-        adoptObservedNativeSessions(sql,'stop-host',[{...native(id),tag:'old-'+i}],Date.now(),'old-family');
+        seedLegacyObservedSessions(sql,'stop-host',[{...native(id),tag:'old-'+i}],Date.now(),'old-family');
         await s.handle(req('/api/sessions/'+id+'/stop',{key:'old-stop-'+i}),admin);
         advance(10);
       }
-      adoptObservedNativeSessions(sql,'stop-host',[{...native(),name:'owned-name'}],Date.now(),'current-family');
+      seedLegacyObservedSessions(sql,'stop-host',[{...native(),name:'owned-name'}],Date.now(),'current-family');
       expect((await s.handle(req('/api/sessions/owned-name/stop',{key:'current-stop'}),admin)).status).toBe(201);
       const offers = await (await s.handle(req('/api/session-commands/offers'),host)).json() as any;
       expect(offers.offers).toHaveLength(1);
@@ -59,18 +60,18 @@ describe('stop delivery for adopted sessions', () => {
   });
   it('requires a positive exit receipt for direct adopted terminal observations', async () => {
     await fixture(async (_s,sql) => {
-      adoptObservedNativeSessions(sql,'stop-host',[native()],Date.now(),'current-family');
+      seedLegacyObservedSessions(sql,'stop-host',[native()],Date.now(),'current-family');
       for (const confirmed_exit of [undefined, false]) {
-        adoptObservedNativeSessions(sql,'stop-host',[{...native(),phase:'exited',confirmed_exit}],Date.now(),'current-family');
+        seedLegacyObservedSessions(sql,'stop-host',[{...native(),phase:'exited',confirmed_exit}],Date.now(),'current-family');
         expect(sql.exec('SELECT state FROM session_control_sessions WHERE id=?',nativeId).one().state).toBe('uncertain');
       }
-      adoptObservedNativeSessions(sql,'stop-host',[{...native(),phase:'exited',confirmed_exit:true}],Date.now(),'current-family');
+      seedLegacyObservedSessions(sql,'stop-host',[{...native(),phase:'exited',confirmed_exit:true}],Date.now(),'current-family');
       expect(sql.exec('SELECT state FROM session_control_sessions WHERE id=?',nativeId).one().state).toBe('stopped');
     });
   });
   it('marks stopped only after the exact bound host stop acknowledgement', async () => {
     await fixture(async (s,sql) => {
-      adoptObservedNativeSessions(sql,'stop-host',[native()],Date.now(),'current-family');
+      seedLegacyObservedSessions(sql,'stop-host',[native()],Date.now(),'current-family');
       await s.handle(req('/api/sessions/'+nativeId+'/stop',{key:'verified-stop'}),admin);
       const listing = await (await s.handle(req('/api/session-commands/offers'),host)).json() as any;
       const offer = listing.offers[0];
@@ -88,7 +89,7 @@ describe('stop delivery for adopted sessions', () => {
   });
   it.each([null, 'deadbeef-aaaa-4aaa-8aaa-aaaaaaaaaaaa'])('settles a linked unknown Fleet native, preserving conflicting custody (%s)', async (fleetNative) => {
     await fixture(async (s,sql) => {
-      adoptObservedNativeSessions(sql,'stop-host',[native()],Date.now(),'current-family');
+      seedLegacyObservedSessions(sql,'stop-host',[native()],Date.now(),'current-family');
       const launchId = crypto.randomUUID(), at = new Date().toISOString();
       sql.exec(`INSERT INTO fleet_launches
         (id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at)
@@ -114,10 +115,10 @@ describe('stop delivery for adopted sessions', () => {
   });
   it('resolves unique UUID prefixes, and reports all visible ambiguous matches', async () => {
     await fixture(async (s,sql) => {
-      adoptObservedNativeSessions(sql,'stop-host',[native()],Date.now(),'current-family');
+      seedLegacyObservedSessions(sql,'stop-host',[native()],Date.now(),'current-family');
       expect((await s.handle(req('/api/sessions/61bba72f/stop',{key:'short-stop'}),admin)).status).toBe(201);
       const secondId = '61bba72f-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
-      adoptObservedNativeSessions(sql,'stop-host',[{...native(secondId),tag:'second'}],Date.now(),'current-family');
+      seedLegacyObservedSessions(sql,'stop-host',[{...native(secondId),tag:'second'}],Date.now(),'current-family');
       const response = await s.handle(req('/api/sessions/61bba72f/stop',{key:'ambiguous-stop'}),admin);
       expect(response.status).toBe(409);
       const body = await response.json() as any;
@@ -127,7 +128,7 @@ describe('stop delivery for adopted sessions', () => {
   });
   it('fails an unclaimed stop within the delivery budget without falsely marking the session stopped', async () => {
     await fixture(async (s,sql,advance) => {
-      adoptObservedNativeSessions(sql,'stop-host',[native()],Date.now(),'current-family');
+      seedLegacyObservedSessions(sql,'stop-host',[native()],Date.now(),'current-family');
       await s.handle(req('/api/sessions/'+nativeId+'/stop',{key:'offline-stop'}),admin);
       advance(9000);
       const body = await (await s.handle(req('/api/sessions/'+nativeId+'/commands'),admin)).json() as any;
@@ -169,7 +170,7 @@ describe('stop delivery for adopted sessions', () => {
 describe('stop custody safety', () => {
   it('renews only current enrolled authority and the exact adopted incarnation', async () => {
     await fixture(async (_s,sql) => {
-      adoptObservedNativeSessions(sql,'stop-host',[native()],Date.now(),'old-family');
+      seedLegacyObservedSessions(sql,'stop-host',[native()],Date.now(),'old-family');
       const existing = sql.exec('SELECT * FROM session_control_sessions WHERE id = ?',nativeId).one();
       refreshObservedHostFamily(sql,'stop-host',existing,{...native(),created_at_ms:1792000000001},'current-family');
       expect(sql.exec('SELECT host_family FROM session_control_sessions WHERE id = ?',nativeId).one().host_family).toBe('old-family');
@@ -183,7 +184,7 @@ describe('stop custody safety', () => {
   });
   it('never expires a stop after a host has acquired execution custody', async () => {
     await fixture(async (s,sql,advance) => {
-      adoptObservedNativeSessions(sql,'stop-host',[native()],Date.now(),'current-family');
+      seedLegacyObservedSessions(sql,'stop-host',[native()],Date.now(),'current-family');
       await s.handle(req('/api/sessions/'+nativeId+'/stop',{key:'claimed-stop'}),admin);
       const offers = await (await s.handle(req('/api/session-commands/offers'),host)).json() as any;
       const offer = offers.offers[0];

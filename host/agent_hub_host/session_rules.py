@@ -14,7 +14,23 @@ CPU_LOAD_RULE = (
 )
 SESSION_PREAMBLE = "Hub session rules:\n" + AWS_MAIN_TEMP_RULE + "\n" + CPU_LOAD_RULE
 
+# Worktree-guard footer (intake a0f01448, RCA 95c1862c): the 95c1862c session
+# removed its own git worktree while its intake was still open, and the stale
+# " (deleted)" label then hid the recreated tree. Hub locks every session
+# worktree on start/adopt, so NEVER remove your worktree yourself — not with
+# `git worktree remove`, `git worktree prune`, `rm -rf`, or branch deletes.
+# Remove the worktree only after the linked intake has a DONE note with live
+# proof of every AC; while blocked or waiting, keep it.
+WORKTREE_CLEANUP_FOOTER = (
+    "Worktree cleanup (incident 95c1862c): NEVER remove your git worktree "
+    "yourself (`git worktree remove`/`prune`, `rm -rf`, branch deletes) — Hub "
+    "locks it on start/adopt and the lock refuses plain removal while the "
+    "session is live or its intake is open. Remove the worktree only after "
+    "the linked intake has a DONE note with live proof of every AC; while "
+    "blocked or waiting, keep it."
+)
+
 
 def compose_prompt(brief: str) -> str:
     """Prefix trusted rules without interpreting or rewriting the brief."""
-    return SESSION_PREAMBLE + "\n\n" + brief
+    return SESSION_PREAMBLE + "\n\n" + brief + "\n\n" + WORKTREE_CLEANUP_FOOTER

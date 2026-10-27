@@ -1,3 +1,4 @@
+import { worktreeIntakeProtected, worktreeIntakeSnapshot } from './worktree-intakes';
 /** Live host admission and durable per-session usage; token usage joins by native identity. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import defaults from '../config/resource-management.json';
@@ -75,12 +76,12 @@ export class ResourceManagement {
    * protection/identity changes and their cache generations in one transaction. */
   initCatalogCache() {
     this.catalogReady=false; this.catalogCache.clear(); this.catalogRawRows.clear(); this.catalogRawBytes=0; this.catalogStructureRevision=null;
-    const tables=['session_control_sessions','fleet_launches','fleet_sessions','session_control_protections','resource_reaps','intake_tasks','intake_task_projection','resource_request_projection'];
+    const tables=['session_control_sessions','fleet_launches','fleet_sessions','session_control_protections','resource_reaps','intake_tasks','intake_task_projection','resource_request_projection','machines'];
     if (tables.some(table=>!this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",table).toArray().length)) return;
     this.sql.exec('CREATE TABLE IF NOT EXISTS resource_catalog_revision(id INTEGER PRIMARY KEY CHECK(id=1),revision TEXT NOT NULL,structure_revision TEXT NOT NULL)');
     this.sql.exec("INSERT OR IGNORE INTO resource_catalog_revision VALUES(1,lower(hex(randomblob(16))),lower(hex(randomblob(16))))");
     for(const table of tables) for(const op of ['INSERT','UPDATE','DELETE']) {
-      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS resource_catalog_${table}_${op.toLowerCase()} AFTER ${op} ON ${table}
+      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS resource_catalog_${table}_${op.toLowerCase()} AFTER ${op} ON ${table} ${table === 'machines' && op === 'UPDATE' ? 'WHEN OLD.hostname IS NOT NEW.hostname OR OLD.id IS NOT NEW.id' : ''}
         BEGIN UPDATE resource_catalog_revision SET revision=lower(hex(randomblob(16)))${table==='fleet_sessions' ? '' : ',structure_revision=lower(hex(randomblob(16)))'} WHERE id=1; END`);
     }
     this.catalogReady=true;
@@ -341,6 +342,7 @@ export class ResourceManagement {
       for(const row of this.sql.exec(`SELECT id,json_extract(CASE WHEN json_valid(data) THEN data ELSE '{}' END,'$.project') AS project
         FROM ${intakeTable} WHERE id IN (${ids.map(()=>'?').join(',')})`,...ids).toArray()) projects.set(row.id,row.project);
     }
+    const worktreeLinks = worktreeIntakeSnapshot(this.sql);
     const bound = rows.flatMap(s => {
       const data=controlData.get(s.id); if(!data) return [];
       const {binding,req,launch,model}=data;
@@ -352,6 +354,7 @@ export class ResourceManagement {
         observed_shadow:!s.fleet_launch_id && s.id===binding.native_id && s.request_key==='native-'+binding.native_id
           && req.provenance==='observed_native' && binding.provenance==='observed_native',
         intake_id:intakeId,
+        linked_intake_open:worktreeIntakeProtected(this.sql, s, worktreeLinks),
         native_id:binding.native_id, tag:binding.tag, workspace:binding.workspace,
         native_created_at_ms:binding.native_created_at_ms ?? observed?.created_at_ms ?? null,
         engine:s.engine, mode:s.mode, model:model.model ?? null, project,
@@ -373,7 +376,7 @@ export class ResourceManagement {
       const observed:any=observedByNative.get(key(l.machine_id,l.native_id));
       const intakeId=req.intake_task_id || null;
       return [{session_id:shadowIds.get(JSON.stringify([l.machine_id,l.native_id])) ?? 'fleet:'+l.id,machine_id:l.machine_id,fleet_launch_id:l.id,observed_shadow:false,
-        intake_id:intakeId,native_id:l.native_id,tag:observed?.tag || (l.mode==='headless' ? 'task-hub-' : 'hub-')+l.id,
+        intake_id:intakeId,linked_intake_open:worktreeIntakeProtected(this.sql, { id: l.id, machine_id: l.machine_id, request_json: l.request_json, binding_json: JSON.stringify({native_id:l.native_id}) }, worktreeLinks),native_id:l.native_id,tag:observed?.tag || (l.mode==='headless' ? 'task-hub-' : 'hub-')+l.id,
         workspace:l.workspace,native_created_at_ms:observed?.created_at_ms ?? null,
         engine:l.engine,mode:l.mode,model:model.model ?? null,project:projects.get(intakeId) || req.project || l.workspace,
         tier:req.tier || policy.default_tier,kind:req.task_kind || 'goal',state:l.state,keep:req.keep===true,managed:false,
@@ -415,12 +418,12 @@ export class ResourceManagement {
   }
   private buildCanonicalSessions(machine?: string) {
     type Bound = ReturnType<ResourceManagement['boundSessions']>[number];
-    const groups = new Map<string, {canonical: Bound; keep: boolean; reaped: boolean; aliases: Set<string>}>();
+    const groups = new Map<string, {canonical: Bound; keep: boolean; reaped: boolean; intakeOpen: boolean; aliases: Set<string>}>();
     for (const session of this.boundSessions(machine)) {
       const key = JSON.stringify([session.machine_id,session.native_id]);
       let group = groups.get(key);
       if (!group) {
-        group = {canonical:session,keep:false,reaped:false,aliases:new Set()};
+        group = {canonical:session,keep:false,reaped:false,intakeOpen:false,aliases:new Set()};
         groups.set(key,group);
       }
       // Keep the first managed alias, otherwise the first non-shadow alias.
@@ -430,13 +433,14 @@ export class ResourceManagement {
       // even when a different alias supplies its canonical metadata.
       group.keep ||= session.keep || (session.mode==='interactive' && !session.observed_shadow);
       group.reaped ||= session.reaped;
+      group.intakeOpen ||= session.linked_intake_open;
       group.aliases.add(session.session_id);
       if (session.fleet_launch_id) group.aliases.add('fleet:'+session.fleet_launch_id);
     }
     return [...groups.values()].map(group=>{
       const {observed_shadow,...session}=group.canonical;
       return {session:{...session,keep:group.keep,managed:session.managed && !group.keep,
-        reaped:group.reaped,aliases:[...group.aliases]},
+        reaped:group.reaped,linked_intake_open:group.intakeOpen,aliases:[...group.aliases]},
         terminal:Number(TERMINAL.has(session.state)),at:Date.parse(session.finished_at || session.started_at)};
     }).sort((a,b)=>a.terminal-b.terminal || b.at-a.at).map(row=>row.session);
   }
@@ -454,6 +458,9 @@ export class ResourceManagement {
   evidence(machine: string, value: any) {
     const session = this.sessions(machine).find(s => s.session_id===value.session_id && s.native_id===value.native_id);
     if (!session?.managed || session.keep || !session.intake_id) throw new Error('session_not_reapable');
+    // Worktree-guard (AC2): never reap for idleness while the linked intake
+    // is open. Nudge/replace instead; reaping resumes after DONE/archive.
+    if ((session as any).linked_intake_open) throw new Error('session_not_reapable');
     if (value.reason === 'terminal' && !TERMINAL.has(session.state)) throw new Error('session_not_reapable');
     if (!['idle','terminal','dead_pid'].includes(value.reason) || typeof value.id!=='string' || !/^[\w:-]{1,128}$/.test(value.id)
       || typeof value.output!=='string' || new TextEncoder().encode(value.output).byteLength > 6000) throw new Error('invalid_evidence');

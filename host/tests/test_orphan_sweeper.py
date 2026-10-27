@@ -6,6 +6,18 @@ from agent_hub_host import orphan_sweeper as sweeper
 
 
 class TestOrphanSweeper(unittest.TestCase):
+    def test_observer_covers_session_after_first_five_hundred(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [{"id": f"{i:032x}", "tag": "notes", "workspace": tmp}
+                    for i in range(510)]
+            late = {"id": "f" * 32, "tag": "notes", "phase": "running",
+                    "workspace": os.path.join(tmp, "missing")}
+            posted = []
+            sweeper.observe_catalog(rows + [late], lambda *args: posted.append(args), "test-host", tmp)
+            self.assertEqual(len(posted), 1)
+            self.assertEqual(posted[0][2]["native_id"], late["id"])
+            self.assertTrue(posted[0][2]["payload"]["worktree_missing"])
+
     def test_strip_deleted_suffix(self):
         with tempfile.TemporaryDirectory() as tmp:
             real = os.path.join(tmp, "wt")
@@ -107,7 +119,7 @@ class TestOrphanSweeper(unittest.TestCase):
                 now=1000000.0 + 7200.0 + 5, grace_hours=2.0,
                 state_path=os.path.join(tmp, "state.json"),
                 stop_fn=stop_fn, observe_fn=observe_fn,
-                out=out3.append, apply=True,
+                out=out3.append, apply=True, cleanup_allowed=lambda row: True,
             )
             self.assertEqual(res3["stopped"], 1)
             self.assertIn(headless["id"], stopped)
@@ -116,3 +128,22 @@ class TestOrphanSweeper(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InstalledSweeperAuthorityTests(unittest.TestCase):
+    def test_apply_runtime_requires_positive_guard_even_after_zero_grace(self):
+        from unittest.mock import patch
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            row = dict(id='d' * 32, tag='task-hub-11111111', engine='codex',
+                       workspace=tmp + '/gone', phase='unknown', command=['codex', 'exec', 'goal'])
+            with patch.object(sweeper, 'run_cmd', return_value=json.dumps([row])) as run, \
+                 patch.object(sweeper, 'default_hub_lookup', return_value=lambda sid: None), \
+                 patch.object(sweeper, 'default_observe', return_value=False), \
+                 patch('agent_hub_host.worktree_guard.cleanup_permitted', return_value=False) as guard:
+                result = sweeper.main(['--apply', '--machine-id', 'host', '--grace-hours', '0',
+                                       '--state-path', tmp + '/state.json'])
+            self.assertEqual(result['stopped'], 0)
+            self.assertGreaterEqual(result['report'], 1)
+            guard.assert_called_once()
+            self.assertFalse(any('kill' in call.args[0] for call in run.call_args_list))

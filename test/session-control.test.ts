@@ -1,7 +1,8 @@
+import { seedLegacyObservedSessions } from './observed-native-fixture';
 import { describe, expect, it } from 'vitest';
 import { seedFixtureIntake, withFixtureIntake } from './tbm-fixture';
 import { env, runInDurableObject } from 'cloudflare:test';
-import { SessionControlService, validateSendProof, adoptObservedNativeSessions } from '../src/session_control';
+import { SessionControlService, validateSendProof } from '../src/session_control';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 
@@ -746,20 +747,20 @@ describe('absolute workspace identifiers and friendly names', () => {
 
     it('projects a broken worker as uncertain and never as a confirmed stop', async () => {
       await fixture(async (s, sql) => {
-        adoptObservedNativeSessions(sql, 'hetzner', [{ ...SAMPLES[0], phase: 'broken' }], Date.now());
+        seedLegacyObservedSessions(sql, 'hetzner', [{ ...SAMPLES[0], phase: 'broken' }], Date.now());
         const row = sql.exec('SELECT state FROM session_control_sessions WHERE id=?', SAMPLES[0].native_id).one();
         expect(row.state).toBe('uncertain');
       });
     });
 
-    it('adopts native sessions with exact incarnation, machine, engine, and deduplicates across polls', async () => {
+    it('preserves legacy adopted native identity, machine and engine across deduplicated polls', async () => {
       await fixture(async (s, sql) => {
-        const firstAdopt = adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+        const firstAdopt = seedLegacyObservedSessions(sql, 'hetzner', SAMPLES, Date.now());
         expect(firstAdopt.adopted).toBe(2);
         expect(firstAdopt.updated).toBe(0);
 
         // Subsequent poll deduplicates: zero new rows, zero unnecessary writes
-        const secondAdopt = adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+        const secondAdopt = seedLegacyObservedSessions(sql, 'hetzner', SAMPLES, Date.now());
         expect(secondAdopt.adopted).toBe(0);
         expect(secondAdopt.updated).toBe(0);
 
@@ -795,7 +796,7 @@ describe('absolute workspace identifiers and friendly names', () => {
 
     it('resolves sessions by exact qualified alias and canonical native UUID', async () => {
       await fixture(async (s, sql) => {
-        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+        seedLegacyObservedSessions(sql, 'hetzner', SAMPLES, Date.now());
 
         // Literal colon
         const r1 = await s.handle(request('/api/sessions/dataops:batching', undefined, 'GET'), admin);
@@ -825,7 +826,7 @@ describe('absolute workspace identifiers and friendly names', () => {
 
     it('refuses collisions / reused tags with 409 ambiguous_name (no latest-wins)', async () => {
       await fixture(async (s, sql) => {
-        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+        seedLegacyObservedSessions(sql, 'hetzner', SAMPLES, Date.now());
 
         // Insert a second session with the same workspace basename and tag (e.g. historical / alternative workspace)
         const COLLIDING_ID = '33333333-3333-4333-8333-333333333333';
@@ -839,7 +840,7 @@ describe('absolute workspace identifiers and friendly names', () => {
             created_at_ms: 1792258000000,
           },
         ];
-        adoptObservedNativeSessions(sql, 'hetzner', collidingSample, Date.now());
+        seedLegacyObservedSessions(sql, 'hetzner', collidingSample, Date.now());
 
         // Alias resolution refuses ambiguous name honestly
         const res = await s.handle(request('/api/sessions/dataops:batching', undefined, 'GET'), admin);
@@ -856,7 +857,7 @@ describe('absolute workspace identifiers and friendly names', () => {
 
     it('enforces admin human control and denies foreign agent access with 404/403', async () => {
       await fixture(async (s, sql) => {
-        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+        seedLegacyObservedSessions(sql, 'hetzner', SAMPLES, Date.now());
 
         // Foreign agent cannot see adopted sessions in list
         const agentList = await s.handle(request('/api/sessions', undefined, 'GET'), stranger);
@@ -879,7 +880,7 @@ describe('absolute workspace identifiers and friendly names', () => {
 
     it('allows send, capture, and stop on adopted session via qualified alias or UUID', async () => {
       await fixture(async (s, sql) => {
-        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+        seedLegacyObservedSessions(sql, 'hetzner', SAMPLES, Date.now());
 
         // Send via alias
         const sendRes = await s.handle(request('/api/sessions/dataops:batching/send', { key: 'send-1', body: 'execute dataops' }), admin);
@@ -911,11 +912,11 @@ describe('absolute workspace identifiers and friendly names', () => {
 
     it('preserves absence honestly without deleting or stopping missing sessions', async () => {
       await fixture(async (s, sql) => {
-        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+        seedLegacyObservedSessions(sql, 'hetzner', SAMPLES, Date.now());
 
         // Next poll only reports crm-redesign (dataops is absent from host poll)
         const nextPoll = [SAMPLES[1]];
-        adoptObservedNativeSessions(sql, 'hetzner', nextPoll, Date.now());
+        seedLegacyObservedSessions(sql, 'hetzner', nextPoll, Date.now());
 
         // dataops is NOT deleted, and NOT marked stopped (absence alone is not exit proof)
         const show = await s.handle(request('/api/sessions/dataops:batching', undefined, 'GET'), admin);
@@ -927,7 +928,7 @@ describe('absolute workspace identifiers and friendly names', () => {
 
     it('protects observed native sessions from automated cleanup', async () => {
       await fixture(async (s, sql) => {
-        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+        seedLegacyObservedSessions(sql, 'hetzner', SAMPLES, Date.now());
 
         // Mark session as stopped in DB to test eligibility filter
         sql.exec("UPDATE session_control_sessions SET state = 'stopped' WHERE id = ?", NATIVE_DATAOPS_ID);
@@ -956,7 +957,7 @@ describe('absolute workspace identifiers and friendly names', () => {
         expect(hubSession.fleet_launch_id).toBeDefined();
 
         // Native sessions report includes both new native session and normal sessions
-        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+        seedLegacyObservedSessions(sql, 'hetzner', SAMPLES, Date.now());
 
         // Hub session retains its fleet_launch_id, name, and canonical_hub provenance
         const checkHub = await s.handle(request(`/api/sessions/${hubSession.id}`, undefined, 'GET'), admin);
@@ -1045,7 +1046,7 @@ describe('absolute workspace identifiers and friendly names', () => {
 
     it('provides machine-scoped imported bindings read endpoint with pagination', async () => {
       await fixture(async (s, sql) => {
-        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+        seedLegacyObservedSessions(sql, 'hetzner', SAMPLES, Date.now());
 
         // Unauthenticated call rejected
         expect((await s.handle(request('/api/sessions/host-bindings?kind=imported', undefined, 'GET'), unauth)).status).toBe(401);
@@ -1099,7 +1100,7 @@ describe('absolute workspace identifiers and friendly names', () => {
 
     it('positively retires imported session from exact authentic tombstone evidence and replays idempotently', async () => {
       await fixture(async (s, sql) => {
-        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+        seedLegacyObservedSessions(sql, 'hetzner', SAMPLES, Date.now());
 
         // Verify initial state
         const initial = await (await s.handle(request(`/api/sessions/${NATIVE_DATAOPS_ID}`, undefined, 'GET'), admin)).json() as any;
@@ -1204,7 +1205,7 @@ describe('absolute workspace identifiers and friendly names', () => {
 
     it('rechecks binding, generation, and host authority inside mutation txn after streamed body yields', async () => {
       await fixture(async (s, sql) => {
-        adoptObservedNativeSessions(sql, 'hetzner', SAMPLES, Date.now());
+        seedLegacyObservedSessions(sql, 'hetzner', SAMPLES, Date.now());
 
         const validPayload = {
           native: {

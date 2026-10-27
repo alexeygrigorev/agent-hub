@@ -74,6 +74,9 @@ export type SessionInput = {
   has_unsubmitted_draft?: boolean;
   has_unresolved_send_stop?: boolean;
   worktree_missing?: boolean;
+  /** Host-verified: the cwd inode was deleted but the same path now holds a
+   * valid worktree of the repo (stale " (deleted)" kernel label, AC5). */
+  cwd_path_recreated?: boolean | null;
   superseded_by?: string | null;
   observation_note?: string | null;
   /** Opt-in to include bounded redacted free text; default false (reason codes only). */
@@ -149,7 +152,8 @@ function hoursSince(iso: string | null | undefined, now: number): number | null 
 function collectFlags(input: SessionInput, now: number): { flags: string[]; obligations: string[] } {
   const flags: string[] = [];
   const obligations: string[] = [];
-  if (input.worktree_missing) flags.push('missing_worktree');
+  if (input.worktree_missing && !input.cwd_path_recreated) flags.push('missing_worktree');
+  if (input.cwd_path_recreated) flags.push('cwd_path_recreated');
   if (input.awaiting_alexey) {
     const at = input.awaiting_alexey_at ? ISO(input.awaiting_alexey_at) : null;
     flags.push(at != null && now >= at && now - at <= 24 * 3600000 ? 'waiting_alexey_fresh' : 'waiting_alexey_stale');
@@ -184,14 +188,17 @@ export function classifySession(input: SessionInput, config: LifecycleConfig = {
   const key = sessionKey(input);
   const reasons: string[] = [];
   const { flags, obligations } = collectFlags(input, now);
-  const note = input.note_text_opt_in ? sanitizeObservationText(input.observation_note ?? null) : null;
-  const classifiedBase = {
+  const note = input.note_text_opt_in ? sanitizeObservationText(input.observation_note ?? null) : null;  const classifiedBase = {
     owner: input.owner ?? null,
     owner_provenance: input.owner_provenance ?? null,
     starter: input.starter ?? null,
     human_owned: Boolean(input.human_owned),
   };
 
+  if (input.cwd_path_recreated) {
+    reasons.push('cwd inode was deleted but the same path now holds a valid worktree (stale deleted label)');
+    return { session_key: key, group: 'unknown', state: 'cwd_stale_path_recreated', reasons, flags, obligations, sanitized_note: note, ...classifiedBase };
+  }
   if (input.worktree_missing) {
     reasons.push('worktree record present but host reports workspace absent');
     return { session_key: key, group: 'unknown', state: 'missing_worktree_unknown', reasons, flags, obligations, sanitized_note: note, ...classifiedBase };

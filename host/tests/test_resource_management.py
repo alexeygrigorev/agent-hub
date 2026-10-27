@@ -28,10 +28,25 @@ def _entry(**kw):
                 native_id="11111111-1111-4111-8111-111111111111", tag="hub-abc",
                 workspace="/repo", native_created_at_ms=900_000, engine="codex",
                 model="m", project="p", tier="quick", kind="goal", state="running",
-                keep=False, managed=True,
+                keep=False, managed=True, linked_intake_open=False,
                 last_activity_at="1970-01-01T00:16:40Z", started_at="1970-01-01T00:15:00Z")
     base.update(kw)
     return base
+
+
+# /repo is this module's synthetic, registered-unlocked workspace. Real Git
+# regression fixtures retain the real parser and lock state.
+def setUpModule():
+    from agent_hub_host import worktree_guard
+    global _synthetic_git_patch
+    actual = worktree_guard.is_locked
+    _synthetic_git_patch = patch.object(worktree_guard, 'is_locked',
+        side_effect=lambda git, path, *args, **kwargs: False if path == '/repo' else actual(git, path, *args, **kwargs))
+    _synthetic_git_patch.start()
+
+
+def tearDownModule():
+    _synthetic_git_patch.stop()
 
 
 class SamplerTests(unittest.TestCase):
@@ -1509,6 +1524,60 @@ class CpuThrottleTests(unittest.TestCase):
             self.assertEqual([r["action"] for r in replayed], ["throttled"])
             state = rm.load_state(journal)
             self.assertEqual(state["throttle_reports"], {})
+
+    """AC2: the watchdog never reaps locked worktrees or open-intake sessions."""
+
+    def test_unknown_intake_and_git_lock_authority_never_reap(self):
+        native = [_native(phase='exited', last_activity_ms=1_000_000)]
+        for unknown in (None, 'false', 0):
+            with tempfile.TemporaryDirectory() as tmp:
+                result, _, stop = WatchdogCycleTests()._cycle([_entry(state='failed', linked_intake_open=unknown)], native, journal=tmp)
+            stop.assert_not_called()
+            self.assertEqual(result['reaps'], 0)
+        for unknown in (None, True):
+            with tempfile.TemporaryDirectory() as tmp, patch('agent_hub_host.worktree_guard.is_locked', return_value=unknown):
+                result, _, stop = WatchdogCycleTests()._cycle([_entry(state='failed')], native, journal=tmp)
+            stop.assert_not_called()
+            self.assertEqual(result['reaps'], 0)
+
+    def test_open_intake_entry_never_reaped(self):
+        native = [_native(phase="running", last_activity_ms=1_000_000)]
+        sessions = [_entry(state="running", last_activity_at="1970-01-01T00:00:00Z",
+                           linked_intake_open=True)]
+        with tempfile.TemporaryDirectory() as tmp:
+            out, calls, stop_mock = WatchdogCycleTests()._cycle(sessions, native, journal=tmp)
+        stop_mock.assert_not_called()
+        self.assertEqual(out["reaps"], 0)
+        self.assertGreaterEqual(out["skipped"], 1)
+
+    def test_reap_one_refuses_open_intake(self):
+        native = _native()
+        entry = _entry(linked_intake_open=True)
+        state = {"peaks": {}, "pending": {}, "reported": {}}
+        self.assertIsNone(rm._reap_one(lambda m, p, b=None: {}, "aplexer", entry,
+                                        native, "idle", state, 10_000_000, idle_ms=3_600_000))
+
+    def test_locked_worktree_skipped(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            origin = os.path.join(tmp, "origin")
+            os.mkdir(origin)
+            subprocess.run(["git", "init", "-q", origin], check=False)
+            subprocess.run(["git", "-C", origin, "config", "user.email", "t@t"], check=False)
+            subprocess.run(["git", "-C", origin, "config", "user.name", "t"], check=False)
+            Path(origin, "f").write_text("x")
+            subprocess.run(["git", "-C", origin, "add", "f"], check=False)
+            subprocess.run(["git", "-C", origin, "commit", "-qm", "i"], check=False)
+            wt = os.path.join(tmp, "wt")
+            subprocess.run(["git", "-C", origin, "worktree", "add", wt, "-b", "b1"],
+                           capture_output=True, check=False)
+            subprocess.run(["git", "worktree", "lock", "--reason", "hub-session test", wt],
+                           capture_output=True, check=False, cwd=wt)
+            native = [_native(workspace=wt)]
+            sessions = [_entry(workspace=wt, state="failed")]
+            out, calls, stop_mock = WatchdogCycleTests()._cycle(sessions, native, journal=tmp)
+            stop_mock.assert_not_called()
+            self.assertEqual(out["reaps"], 0)
 
 
 if __name__ == "__main__":

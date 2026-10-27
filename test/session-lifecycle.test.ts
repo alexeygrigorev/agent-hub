@@ -103,6 +103,15 @@ describe('m15 synthetic lifecycle classification', () => {
     );
     expect(normalIdle.flags).not.toContain('contradicted_resting_state');
   });
+
+  it('reports a recreated worktree path distinctly instead of worktree_missing (AC5)', () => {
+    const recreated = classifySession(base({ worktree_missing: true, cwd_path_recreated: true }), { now_ms: NOW });
+    expect(recreated.state).toBe('cwd_stale_path_recreated');
+    expect(recreated.flags).toContain('cwd_path_recreated');
+    expect(recreated.flags).not.toContain('missing_worktree');
+    const stillMissing = classifySession(base({ worktree_missing: true }), { now_ms: NOW });
+    expect(stillMissing.state).toBe('missing_worktree_unknown');
+  });
 });
 
 describe('m15 synthetic cleanup plan and executor seam', () => {

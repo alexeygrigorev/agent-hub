@@ -256,7 +256,8 @@ export class StatusService {
     let rows: any[];
     try {
       rows = this.sql.exec(`SELECT a.id, a.subject_kind, a.subject, a.state, a.detail, a.opened_at
-        FROM liveness_alerts a WHERE a.resolved_at IS NULL AND (a.subject_kind='check' OR
+        FROM liveness_alerts a WHERE a.resolved_at IS NULL AND ((a.subject_kind='check' OR
+          (a.subject_kind='session' AND a.state='worktree_removed')) OR
           (a.subject_kind='launch' AND a.state='stuck' AND (
             (a.subject LIKE 'placement-queue:%' AND EXISTS
               (SELECT 1 FROM fleet_launches l WHERE l.id=substr(a.subject,17) AND l.state='queued')) OR
@@ -280,7 +281,7 @@ export class StatusService {
     for (const row of rows) {
       const entry: Obj = {
         severity: 'warn', subject: row.subject_kind + ':' + row.subject,
-        title: (row.subject_kind === 'launch' ? 'Launch stuck: ' : 'Scheduled check: ') + row.subject, detail: snippet(row.detail),
+        title: (row.subject_kind === 'launch' ? 'Launch stuck: ' : row.subject_kind === 'session' ? 'Session worktree missing: ' : 'Scheduled check: ') + row.subject, detail: snippet(row.detail),
         state: row.state, alert_id: row.id, opened_at: row.opened_at,
         source: 'liveness_alerts', scope: 'hub',
       };

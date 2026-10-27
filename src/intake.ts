@@ -26,6 +26,12 @@ function currentDoneNote(task: Obj): Obj | undefined {
     (/\b[0-9a-f]{7,40}\b/i.test(e.text) || /https:\/\/[^\s]+\/(?:actions\/runs|deployments)\/[^\s]+/.test(e.text)) &&
     /live check:[ \t]*\S[^\n]*/i.test(e.text) && /result:[ \t]*\S[^\n]*/i.test(e.text));
 }
+/** Worktree-guard (intake a0f01448): an intake counts as closed for cleanup
+ * and reap gating when it carries a qualifying DONE note (live proof of
+ * every AC), even while its status stays open awaiting operator review. */
+export function intakeHasDoneEvidence(task: Obj): boolean {
+  return currentDoneNote(task) !== undefined;
+}
 /** Completion claims only pause automatic admission for human review. They cannot
  * close an intake, validate historical evidence, or alter its acceptance criteria. */
 export function intakeCompletionHoldReason(task: Obj): string | null {

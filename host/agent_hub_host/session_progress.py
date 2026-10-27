@@ -61,13 +61,14 @@ def owned_headless(row, records):
 
 
 class SessionProgress:
-    def __init__(self, *, now_ms=lambda: int(time.time() * 1000), proc_root=Path('/proc'), output=None, stop=None, state_path=None, screen=None):
+    def __init__(self, *, now_ms=lambda: int(time.time() * 1000), proc_root=Path('/proc'), output=None, stop=None, state_path=None, screen=None, allow_cleanup=None):
         from .native_progress import NativeTranscriptProgress
         self.now_ms, self.proc_root, self.stop = now_ms, proc_root, stop
         self.output = output or NativeTranscriptProgress(proc_root=proc_root)
         self.state_path = Path(state_path) if state_path else None
         self.samples = {}
         self.screen = screen
+        self.allow_cleanup = allow_cleanup
         self.screen_checks = {}
         if self.state_path:
             try:
@@ -128,7 +129,13 @@ class SessionProgress:
             cleanup = previous.get('cleanup', 'none')
             # Require a live leader observed by this monitor first. Existing
             # sessions discovered already orphaned are reported, never killed.
-            if orphan and owned and previous.get('seen_alive') and not previous.get('attempted') and self.stop and not cleanup_attempted:
+            permitted = False
+            if orphan and self.allow_cleanup is not None:
+                try:
+                    permitted = self.allow_cleanup(row) is True
+                except Exception:
+                    pass
+            if orphan and owned and permitted and previous.get('seen_alive') and not previous.get('attempted') and self.stop and not cleanup_attempted:
                 cleanup_attempted = True
                 previous['attempted'] = True
                 # Persist the attempt before any effect; a restart must never

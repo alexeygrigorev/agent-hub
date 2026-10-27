@@ -182,8 +182,7 @@ describe('generic accounts and launch placement', () => {
     expect(s.reserve(input, admin).value).toMatchObject({ id: first.value.id, replay: true });
     expect(s.reserve({ ...input, engine: 'codex' }, admin).status).toBe(409);
     expect(sql.exec('SELECT * FROM resource_ramps WHERE launch_id=?', first.value.id).toArray()).toHaveLength(0); // Listing offers is not a start.
-    const claim = { gate_allowed: true, profile_supported: true, observed_at: iso(), account: 'shared-codex' };
-    for (const model of [undefined, 'gpt-6.1-sol']) {
+    const claim = { gate_allowed: true, profile_supported: true, observed_at: iso(), account: 'shared-codex' };    for (const model of [undefined, 'gpt-6.1-sol']) {
       const refused = await s.handle(request('/launches/' + first.value.id + '/claim', { ...claim, model }), host('hetzner'));
       expect(refused.status).toBe(409);
       expect(await refused.json()).toMatchObject({ error: 'model_unsupported' });
@@ -203,6 +202,19 @@ describe('generic accounts and launch placement', () => {
     sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, created_at, updated_at) VALUES ('quick-test', 'owner', 'quick-key', '{}', ?, 'hetzner', 'codex', 'headless', 'offered', ?, ?)", launch.id, iso(), iso());
     const view = (sessions as any).view(sql.exec("SELECT * FROM session_control_sessions WHERE id='quick-test'").one());
     expect(view).toMatchObject({ engine: 'codex', model_id: 'luna', model: 'gpt-6-luna' });
+  }));
+  it('carries hub_session_id and intake_task_id on offers for the host worktree lock (AC1)', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const launch = s.reserve(intent({ machine: 'hetzner', tier: 'quick', access: { mode: 'read' } }), admin).value;
+    const sessions = new SessionControlService(sql, cb => cb(), () => now);
+    sessions.init();
+    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, created_at, updated_at) VALUES ('guard-session', 'owner', 'guard-key', ?, ?, 'hetzner', 'codex', 'headless', 'offered', ?, ?)",
+      JSON.stringify({ intake_task_id: 'guard-intake', workspace: 'demo' }), launch.id, iso(), iso());
+    const offers: any = await (await s.handle(request('/offers', undefined, 'GET'), host('hetzner'))).json();
+    const offer = offers.offers.find((o: any) => o.id === launch.id);
+    expect(offer).toBeTruthy();
+    expect(offer.hub_session_id).toBe('guard-session');
+    expect(offer.intake_task_id).toBe('guard-intake');
   }));
   it('resolves Argon through both policy engine alternatives with the correct account', async () => fixture(async (s, sql) => {
     await configure(s);
@@ -237,18 +249,23 @@ describe('generic accounts and launch placement', () => {
     const active = () => s.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='shared-codex'").one()).active;
     expect((await report(row)).status).toBe(200);
     expect(sql.exec('SELECT phase FROM fleet_sessions WHERE native_id=?',id).one().phase).toBe('running');
-    expect(sql.exec('SELECT state FROM session_control_sessions WHERE id=?',id).one().state).toBe('running');
+    // Worktree-guard R2: a census observation alone never adopts an unknown
+    // native into session_control ownership; it defers with a durable
+    // needs_attention alert. Fleet catalog and account capacity stay held.
+    expect(sql.exec('SELECT id FROM session_control_sessions WHERE id=?',id).toArray().length).toBe(0);
+    expect(sql.exec("SELECT id FROM liveness_alerts WHERE subject_kind='session_adoption' AND subject=? AND resolved_at IS NULL",'hetzner/'+id).toArray().length).toBe(1);
     expect(active()).toBe(1);
     for (const proof of [undefined, false]) {
       expect((await report({...row,phase:'exited',confirmed_exit:proof})).status).toBe(200);
       expect(sql.exec('SELECT phase FROM fleet_sessions WHERE native_id=?',id).one().phase).toBe('uncertain');
-      expect(sql.exec('SELECT state FROM session_control_sessions WHERE id=?',id).one().state).toBe('uncertain');
+      expect(sql.exec('SELECT id FROM session_control_sessions WHERE id=?',id).toArray().length).toBe(0);
       expect(active()).toBe(1);
     }
     expect((await report({...row,phase:'exited',confirmed_exit:'true'})).status).toBe(400);
     expect(active()).toBe(1);
     expect((await report({...row,cwd:'/gone',phase:'exited',confirmed_exit:true})).status).toBe(200);
-    expect(sql.exec('SELECT state FROM session_control_sessions WHERE id=?',id).one().state).toBe('stopped');
+    expect(sql.exec('SELECT phase FROM fleet_sessions WHERE native_id=?',id).one().phase).toBe('exited');
+    expect(sql.exec('SELECT id FROM session_control_sessions WHERE id=?',id).toArray().length).toBe(0);
     expect(active()).toBe(0);
   }));
   it('refuses Opus and Claude when no live route exists', async () => fixture(async (s, sql) => {
@@ -1128,17 +1145,21 @@ describe('imported session lifecycle and non-resurrection in fleet catalog', () 
     const rep1 = await s.handle(request('/sessions', { sessions: [live1] }, 'PUT'), host('hetzner'));
     expect(rep1.status).toBe(200);
 
-    // Verified present in fleet_sessions and session_control_sessions (state=running)
+    // Verified present in fleet_sessions; census-only observation defers
+    // adoption (needs_attention alert) instead of minting ownership.
     const row1 = sql.exec('SELECT * FROM fleet_sessions WHERE native_id = ?', NATIVE_ID_1).toArray()[0];
     expect(row1).toBeDefined();
     expect(row1.phase).toBe('running');
 
     const sc1 = sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', NATIVE_ID_1).toArray()[0];
-    expect(sc1).toBeDefined();
-    expect(sc1.state).toBe('running');
+    expect(sc1).toBeUndefined();
+    expect(sql.exec("SELECT id FROM liveness_alerts WHERE subject_kind='session_adoption' AND subject=? AND resolved_at IS NULL", 'hetzner/' + NATIVE_ID_1).toArray().length).toBe(1);
 
-    // 2. Canonical positive retirement stops the session
-    sql.exec("UPDATE session_control_sessions SET state = 'stopped', updated_at = ? WHERE id = ?", iso(), NATIVE_ID_1);
+    // 2. Canonical positive retirement stops the session (a session row that
+    // genuinely exists — e.g. previously adopted — is stopped canonically).
+    sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, binding_json, parent_id, parent_source, session_type, owner_token_id, owner_family, host_family, created_at, updated_at)
+      VALUES (?, 'unknown', 'native-observed', '{}', NULL, 'hetzner', 'antigravity', 'interactive', 'stopped', ?, NULL, 'unknown_external', 'aplexer', NULL, NULL, NULL, ?, ?)`,
+      NATIVE_ID_1, JSON.stringify({ native_id: NATIVE_ID_1, native_created_at_ms: INCARNATION, provenance: 'observed_native' }), iso(), iso());
 
     // 3. Late live-catalog snapshot arrives reporting the SAME session/incarnation still running
     const lateRep = await s.handle(request('/sessions', { sessions: [live1] }, 'PUT'), host('hetzner'));
@@ -1174,8 +1195,10 @@ describe('imported session lifecycle and non-resurrection in fleet catalog', () 
     expect(row2).toBeDefined();
     expect(row2.phase).toBe('running');
 
-    const sc2 = sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', NATIVE_ID_2).toArray()[0];
-    expect(sc2).toBeDefined();
-    expect(sc2.state).toBe('running');
+    // New UUID tag reuse is accepted at the fleet level; census-only
+    // observation still defers ownership instead of minting a session row.
+    expect(sql.exec('SELECT id FROM session_control_sessions WHERE id = ?', NATIVE_ID_2).toArray().length).toBe(0);
+    // And the canonically stopped same-incarnation row was not resurrected.
+    expect(sql.exec('SELECT state FROM session_control_sessions WHERE id = ?', NATIVE_ID_1).toArray()[0].state).toBe('stopped');
   }));
 });

@@ -203,6 +203,7 @@ _OBSERVABLE_BOOL_FLAGS = (
     "has_unsubmitted_draft",
     "has_unresolved_send_stop",
     "worktree_missing",
+    "cwd_path_recreated",
 )
 _OBSERVABLE_TEXT_FLAGS = (
     "awaiting_alexey_at",

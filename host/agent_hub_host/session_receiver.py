@@ -205,10 +205,10 @@ def offer_to_command(offer: dict[str, Any]) -> dict[str, Any]:
                      workspace=target["workspace"],
                      created_at_ms=target["created_at_ms"],
                      engine=target.get("engine")).validated()
-        return {"op": "stop", "command_id": command_id,
+        return {"op": "stop", "command_id": command_id, "session_id": offer.get("session_id"),
                 "generation": generation, "target": target,
                 "cleanup_tree_offered": offered_cleanup}
-    return {"op": "stop", "command_id": command_id,
+    return {"op": "stop", "command_id": command_id, "session_id": offer.get("session_id"),
             "generation": generation, "target": None,
             "cleanup_tree_offered": offered_cleanup}
 
@@ -231,7 +231,9 @@ def claim_to_host_claim(server_claim: dict[str, Any], command_id: str) -> dict[s
             "generation": server_claim.get("generation"),
             "expires_at_ms": server_claim.get("expires_at_ms"),
             "expires_at": server_claim.get("expires_at"),
-            "cleanup_tree": True if server_claim.get("cleanup_tree") is True else False}
+            "cleanup_tree": True if server_claim.get("cleanup_tree") is True else False,
+            "linked_intake_open": True if server_claim.get("linked_intake_open") is True else (
+                False if server_claim.get("linked_intake_open") is False else None)}
 
 
 def receive_once(

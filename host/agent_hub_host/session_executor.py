@@ -232,9 +232,12 @@ def verify_server_claim(claim: dict[str, Any], *, now_ms: Optional[int] = None) 
     # Anything else (missing/False/non-bool, key prefixes, paths, JSON owner
     # strings) is never authorization.
     cleanup_authorized = claim.get("cleanup_tree") is True
+    raw_intake = claim.get("linked_intake_open")
+    linked_intake_open = True if raw_intake is True else (False if raw_intake is False else None)
     return {"command_id": command_id, "claim_token": token, "holder": holder,
             "generation": generation, "expires_at_ms": expires_at,
-            "cleanup_tree_authorized": cleanup_authorized}
+            "cleanup_tree_authorized": cleanup_authorized,
+            "linked_intake_open": linked_intake_open}
 
 
 def _request_status(exc: BaseException) -> Optional[int]:
@@ -527,7 +530,14 @@ def _reconcile_journal(
         seen = reconcile_native_target(executable, target)
         if seen["known"] and seen["phase"] not in ("exited", "dead", "forgotten", "pruned"):
             if state == "uncertain":
-                # Adopt, do not restart: report through the existing result shape.
+                # Protect the adopted checkout before publishing a running receipt.
+                from . import worktree_guard as adopt_guard
+                if not adopt_guard.protect_bound_worktree(
+                        "git", workspace_path, offer.get("hub_session_id"),
+                        offer.get("intake_task_id")):
+                    return {"id": offer_id, **prior, "reconciled": "worktree-lock-failed"}
+                if adopt_guard.bound_worktree_root(workspace_path) is not None and not adopt_guard.remember_repository(offer_id, workspace_path):
+                    return {"id": offer_id, **prior, "reconciled": "worktree-identity-failed"}
                 try:
                     request("POST", "/api/fleet/launches/" + offer_id + "/result",
                             {"state": "running", "native_id": native_id})
@@ -1365,7 +1375,8 @@ def handle_claimed_command(
                    "target": {"session_id": target.session_id, "tag": target.tag,
                               "workspace": target.workspace,
                               "created_at_ms": target.created_at_ms,
-                              "engine": target.engine}}
+                              "engine": target.engine},
+                   "linked_intake_open": proved.get("linked_intake_open")}
         if op == "send":
             body = command.get("body")
             if not isinstance(body, str):
@@ -1494,7 +1505,8 @@ def handle_claimed_command(
                 executable, op, command, target, custody=custody,
                 journal_dir=journal_dir, sender_workspace=sender_workspace,
                 cleanup_roots=cleanup_roots,
-                cleanup_tree_authorized=proved.get("cleanup_tree_authorized") is True)
+                cleanup_tree_authorized=proved.get("cleanup_tree_authorized") is True,
+                linked_intake_open=proved.get("linked_intake_open"))
         except SessionControlError as exc:
             # Read-only or pre-effect refusal (no mutation): durable refused.
             return _durable_failure("refused", exc)
@@ -1739,6 +1751,7 @@ def _run_cleanup_tree_after_stop(
     journal_dir: str,
     cleanup_roots: Any,
     command_id: str,
+    linked_intake_open: Optional[bool] = None,
 ) -> dict[str, Any]:
     """STOP-bundled owning-host tree step (same claim, same attempt, no new fence).
 
@@ -1784,7 +1797,8 @@ def _run_cleanup_tree_after_stop(
             custody=custody, journal_dir=journal_dir, machine_id=custody.machine_id,
             native_id=target.session_id, canonical_workspace=target.workspace,
             cleanup_roots=cleanup_roots, claim_holder=custody.machine_id,
-            stop_confirmed=True, live_paths=live_paths, command_id=command_id)
+            stop_confirmed=True, live_paths=live_paths, command_id=command_id,
+            linked_intake_open=linked_intake_open)
     except SessionControlError as exc:
         return {"state": "uncertain", "reason": str(exc)[:300]}
     except SessionUncertain as exc:
@@ -1808,6 +1822,7 @@ def _run_claimed_effect(
     sender_workspace: Optional[str] = None,
     cleanup_roots: Optional[list] = None,
     cleanup_tree_authorized: bool = False,
+    linked_intake_open: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Run one claimed native effect; returns the outcome fields for ack mapping.
 
@@ -1823,6 +1838,9 @@ def _run_claimed_effect(
     containment-confirmed stop, the session's own worktree is removed via
     :func:`_run_cleanup_tree_after_stop` under the same claim. Ordinary stops
     (flag False/missing) NEVER run the tree even with roots configured.
+    ``linked_intake_open`` (server claim flag) refuses the tree while the
+    linked intake is open (worktree guard AC2); None preserves the
+    lock-only check for legacy claims.
     """
     if op == "send":
         observed = qualify_target(executable, target)
@@ -1978,10 +1996,23 @@ def _run_claimed_effect(
     # authority. The tree never gates the stop verdict: kept/uncertain trees
     # ride the stop ack as data while the stop itself still reports its
     # confirmed outcome. Raw evidence text never enters the ack.
+    if confirmed and linked_intake_open is False:
+        # AC1 release: the stop is containment-confirmed (terminal) and the
+        # server reports no open linked intake, so the Hub lock is released
+        # even though no tree removal was authorized. Open/unknown intake
+        # keeps the lock. Best-effort: never gates the stop verdict.
+        try:
+            from . import worktree_guard as _release_guard
+            _release_guard.release_session_lock(
+                "git", target.workspace, command.get("session_id"),
+                terminal=True, intake_state="done")
+        except Exception:
+            pass
     if confirmed and want_tree:
         outcome["tree"] = _run_cleanup_tree_after_stop(
             executable, target, custody=custody, journal_dir=journal_dir,
-            cleanup_roots=cleanup_roots, command_id=str(command["command_id"]))
+            cleanup_roots=cleanup_roots, command_id=str(command["command_id"]),
+            linked_intake_open=linked_intake_open)
     return outcome
 
 

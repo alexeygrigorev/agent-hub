@@ -393,5 +393,49 @@ class TestFleetAllowlistAndCli(unittest.TestCase):
                   "--journal-dir", "/srv/j", "--cleanup-root", "/srv")
 
 
+class TestWorktreeGuardIntakeGate(unittest.TestCase):
+    """AC1/AC2: open-intake refusal, locked-tree release gate."""
+
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp(prefix="cleanup-guard-", dir=str(REPO_TMP)))
+        self.journal = self.base / "journals"
+        self.journal.mkdir()
+        self.origin, self.main = make_repo(self.base)
+
+    def tearDown(self):
+        run_git(["worktree", "prune"], self.main)
+        shutil.rmtree(str(self.base), ignore_errors=True)
+
+    def _remove(self, wt, **kw):
+        args = dict(
+            custody=custody(), journal_dir=str(self.journal), machine_id="h",
+            native_id="44444444-4444-4444-8444-444444444444", claim_holder="h", stop_confirmed=True,
+            canonical_workspace=str(wt), cleanup_roots=[str(self.base)], live_paths=[])
+        args.update(kw)
+        return remove_owned_worktree(**args)
+
+    def test_open_intake_refuses_even_clean_merged(self):
+        wt = add_merged_worktree(self.main, self.base, "wt1", "feat-g")
+        out = self._remove(wt, linked_intake_open=True)
+        self.assertEqual(out["state"], "refused")
+        self.assertIn("open intake", out["reason"])
+        self.assertTrue(wt.exists())
+
+    def test_locked_tree_refused_when_intake_unknown(self):
+        wt = add_merged_worktree(self.main, self.base, "wt1", "feat-g")
+        run_git(["worktree", "lock", "--reason", "hub-session %s intake none" % ("5" * 32), str(wt)], self.main)
+        out = self._remove(wt)  # linked_intake_open=None fails closed
+        self.assertEqual(out["state"], "refused")
+        self.assertIn("locked", out["reason"])
+        self.assertTrue(wt.exists())
+
+    def test_cleanup_preserves_locked_tree_even_when_intake_closed(self):
+        wt = add_merged_worktree(self.main, self.base, "wt1", "feat-g")
+        run_git(["worktree", "lock", "--reason", "hub-session %s intake none" % ("6" * 32), str(wt)], self.main)
+        out = self._remove(wt, linked_intake_open=False)
+        self.assertEqual(out["state"], "refused")
+        self.assertTrue(wt.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

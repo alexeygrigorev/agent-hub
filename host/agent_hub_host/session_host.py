@@ -562,6 +562,21 @@ def bindings_step_once(dispatcher, *, enrich=False):
                           'elapsed_s': round(time.monotonic() - started, 3)}), flush=True)
 
 
+def worktree_step_once(dispatcher, machine_id: str, journal_dir: str):
+    """Bounded report-only worktree check, independent of slow Fleet jobs."""
+    try:
+        from .orphan_sweeper import observe_catalog
+        raw = dispatcher.runner([dispatcher.settings.get("aplexer_bin", "aplexer"),
+                                 "list", "--all", "--json"], timeout=30)
+        rows = raw if isinstance(raw, list) else raw.get("sessions", [])
+        from .worktree_guard import reconcile_terminal_locks
+        result = observe_catalog(rows, dispatcher.request, machine_id, journal_dir)
+        result["locks_released"] = reconcile_terminal_locks(dispatcher.request)
+        print(json.dumps({"event": "worktree_observation_cycle", **result}), flush=True)
+    except Exception as error:
+        print(json.dumps({"event": "worktree_observation_error", "type": type(error).__name__}), flush=True)
+
+
 def bindings_loop(dispatcher, stop, *, clock=time.monotonic):
     """One observer for in-flight starts and a bounded late-adoption tail.
 
@@ -835,6 +850,11 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                     checkin_thread = maybe_start_named_thread(
                         checkin_thread, checkin_step_once, (dispatcher,), 'fleet-checkin')
                     next_checkin = time.monotonic() + fleet.CHECKIN_REFRESH_S
+                if time.monotonic() >= next_worktree:
+                    worktree_thread = maybe_start_named_thread(
+                        worktree_thread, worktree_step_once,
+                        (dispatcher, cfg['machine_id'], str(journal)), 'worktree-observer')
+                    next_worktree = time.monotonic() + 60
                 if time.monotonic() >= next_offers:
                     offers_thread = maybe_start_named_thread(
                         offers_thread, offers_step_once, (dispatcher,), 'fleet-offers')

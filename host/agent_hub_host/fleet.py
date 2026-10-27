@@ -1880,13 +1880,59 @@ class Dispatcher:
 
         return reconciled
 
+    def _lock_session_worktree(self, offer, target_path) -> bool:
+        """Protect a linked checkout before native launch; failures refuse start."""
+        from . import worktree_guard as guard
+        if not isinstance(offer, dict):
+            raise ValueError("worktree_lock_failed: missing offer identity")
+        if guard.bound_worktree_root(str(target_path)) is not None:
+            try:
+                guard.lock_reason(offer.get("hub_session_id"), offer.get("intake_task_id"))
+            except ValueError:
+                raise ValueError("worktree_lock_failed: missing canonical session identity") from None
+            if not guard.remember_repository(offer.get("id"), str(target_path)):
+                raise ValueError("worktree_identity_failed: original repository could not be recorded")
+        if not guard.protect_bound_worktree("git", str(target_path),
+                                           offer.get("hub_session_id"),
+                                           offer.get("intake_task_id")):
+            raise ValueError("worktree_lock_failed: checkout could not be protected")
+        return True
+
     def _maybe_cleanup_worktree(self, workspace: Path, native_id: Optional[str] = None):
-        """Attempt safe auto-cleanup of finished headless worktree if configured in cleanup_roots."""
+        """Attempt safe auto-cleanup of finished headless worktree if configured in cleanup_roots.
+
+        Worktree-guard (AC2): Hub-locked trees and trees still referenced by
+        a live native session are skipped here; the owned STOP-bundled path
+        unlocks only after a terminal stop with a closed linked intake.
+        """
         cleanup_roots = self.settings.get("cleanup_roots")
         if not cleanup_roots or not isinstance(cleanup_roots, list):
             return
         try:
             ws_str = str(workspace.resolve())
+            from . import worktree_guard as _guard
+            if _guard.is_locked("git", ws_str) is True:
+                return
+            try:
+                from .native_sessions import list_sessions
+                for row in list_sessions(self.settings.get("aplexer_bin", "aplexer"), include_exited=True):
+                    if getattr(row, "phase", "") in ("exited", "dead", "forgotten", "pruned"):
+                        continue
+                    for cand in (getattr(row, "workspace", None), getattr(row, "cwd", None)):
+                        if isinstance(cand, str) and cand:
+                            norm = os.path.normpath(cand[: -len(" (deleted)")] if cand.endswith(" (deleted)") else cand)
+                            if norm == ws_str or norm.startswith(ws_str + os.sep) or ws_str.startswith(norm + os.sep):
+                                return
+            except Exception:
+                return
+            # A positive terminal + intake-release fact is required even for
+            # legacy unlocked checkouts; lack of a ledger response keeps it.
+            snapshot = self.request("GET", "/api/fleet/resources/watchdog")
+            sessions = snapshot.get("sessions", []) if isinstance(snapshot, dict) else []
+            exact = [row for row in sessions if isinstance(row, dict) and
+                     row.get("native_id") == native_id and row.get("workspace") == ws_str]
+            if len(exact) != 1 or exact[0].get("linked_intake_open") is not False or exact[0].get("state") not in ("stopped", "failed", "exited", "cancelled"):
+                return
             from .session_cleanup import remove_owned_worktree
             from .session_executor import CallerCustody
             machine_id = self.settings.get("machine_id", "local")
@@ -1902,10 +1948,40 @@ class Dispatcher:
                 cleanup_roots=cleanup_roots,
                 claim_holder=machine_id,
                 stop_confirmed=True,
+                linked_intake_open=False,
             )
         except Exception:
             # Cleanup is best-effort and must not break the reporting flow
             pass
+
+    def reconcile_operator_adoptions(self):
+        """Lock only explicit server-custodied requests, with exact native proof."""
+        from .worktree_guard import protect_operator_adoption
+        try:
+            intents = self.request("GET", "/api/sessions/host-adoption").get("sessions")
+            if not isinstance(intents, list) or len(intents) > 100 or not intents:
+                return 0
+            raw = self.runner([self.settings.get('aplexer_bin', 'aplexer'), 'list', '--all', '--json'])
+            rows = raw if isinstance(raw, list) else raw.get("sessions", [])
+        except Exception:
+            return 0
+        completed = 0
+        for intent in intents:
+            if not isinstance(intent, dict):
+                continue
+            matches = [row for row in rows if isinstance(row, dict) and row.get("id") == intent.get("session_id")]
+            if len(matches) != 1:
+                continue
+            receipt = protect_operator_adoption(matches[0], intent)
+            if not receipt:
+                continue
+            try:
+                if self.request("POST", "/api/sessions/host-adoption/receipt", receipt).get("ok") is True:
+                    completed += 1
+            except Exception:
+                # Lock and immutable witness remain for an exact retry.
+                continue
+        return completed
 
     def reconcile_imported_sessions(self, imported_bindings: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
         """Reconcile active imported/observed-native sessions via verified positive retirement
@@ -2738,6 +2814,7 @@ class Dispatcher:
                 if mode == 'headless':
                     fence['task_id'] = task_id
                 self._persist_launch_record(fence)
+            self._lock_session_worktree(offer, target_cwd)
             receipt = self.runner(argv, cwd=cwd, timeout=120)
             if mode == "interactive":
                 native_id = receipt.get("id")
@@ -3130,10 +3207,11 @@ class Dispatcher:
         """
         raw = self.runner([self.settings.get("aplexer_bin", "aplexer"), "list", "--all", "--json"])
         from .session_progress import SessionProgress, stop_orphan
+        from .worktree_guard import cleanup_permitted
         if not hasattr(self, '_session_progress'):
             from .native_progress import NativeTranscriptProgress
             from .codex_interactive import current_screen
-            self._session_progress = SessionProgress(stop=lambda row: stop_orphan(self.settings.get('aplexer_bin', 'aplexer'), row),
+            self._session_progress = SessionProgress(allow_cleanup=lambda row: cleanup_permitted(row, self.request), stop=lambda row: stop_orphan(self.settings.get('aplexer_bin', 'aplexer'), row),
                 output=NativeTranscriptProgress(opencode_data=self.settings.get('opencode_auth', {}).get('target_data')),
                 screen=lambda row: current_screen(self.settings.get('aplexer_bin', 'aplexer'), row),
                 state_path=Path(self.journal_dir) / 'session-progress.json' if self.journal_dir else None)
@@ -3231,6 +3309,9 @@ class Dispatcher:
                 continue
             row = find_binding_row(rows, session)
             if row is None:
+                continue
+            from .worktree_guard import protect_adoption
+            if not protect_adoption(row, session):
                 continue
             try:
                 self.request("POST", "/api/sessions/" + session["id"] + "/binding", {"native": {"native_id": row["id"], "tag": row["tag"], "workspace": row["workspace"], "native_created_at_ms": row["created_at_ms"]}})
@@ -3891,6 +3972,7 @@ class Dispatcher:
         legacy_settled = settle_retired_legacy(self.settings.get('launcher', {}))
         _mark('legacy')
         reconciled = self.reconcile_launches()
+        self.reconcile_operator_adoptions()
         imported_reconciled = self.reconcile_imported_sessions()
         _mark('reconcile')
         # Resource management (intake 4fcd3139): per-session exact sampler +

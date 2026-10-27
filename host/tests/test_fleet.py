@@ -25,6 +25,13 @@ def offer(**kw):
 
 
 class FleetTests(unittest.TestCase):
+    def setUp(self):
+        # Disposable workspaces must not discover the checkout containing TMPDIR.
+        # Real nested-worktree cases create their own .git below this boundary.
+        isolation = patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": tempfile.gettempdir()})
+        isolation.start()
+        self.addCleanup(isolation.stop)
+
     def test_native_claude_headless_rejected_before_admission_or_submission(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = settings(Path(tmp))
@@ -934,7 +941,7 @@ class FleetTests(unittest.TestCase):
             self.assertEqual(result_interactive['state'], 'running')
             self.assertFalse(any('submit' in c for c in calls))
             preamble_call = next(c for c in calls if 'hub-session-preamble' in c)
-            self.assertEqual(preamble_call[-1], SESSION_PREAMBLE)
+            self.assertEqual(preamble_call[-1], compose_prompt(""))
             self.assertIn('--queue', preamble_call)
             self.assertNotIn('--pane', preamble_call)
             self.assertLess(calls.index(preamble_call), next(i for i, c in enumerate(calls) if c[:2] == ['aplexer', 'start']))

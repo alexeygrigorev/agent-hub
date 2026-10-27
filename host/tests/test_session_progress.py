@@ -18,6 +18,7 @@ class SessionProgressTests(unittest.TestCase):
                                 'engine': 'opencode', 'incarnation': 1000}}
 
     def sampler(self, **kwargs):
+        kwargs.setdefault("allow_cleanup", lambda row: True)
         return SessionProgress(now_ms=lambda: self.clock, output=lambda _: None, **kwargs)
 
     def test_only_provider_events_count_not_terminal_activity(self):
@@ -147,6 +148,18 @@ class SessionProgressTests(unittest.TestCase):
             self.assertEqual(calls, [1])
             self.assertEqual(state.stat().st_mode & 0o777, 0o600)
 
-
-if __name__ == '__main__':
-    unittest.main()
+    @patch('agent_hub_host.session_progress.process')
+    def test_protection_is_checked_before_persisting_cleanup_attempt(self, proc):
+        for decision in (False, None):
+            calls = []
+            sampler = self.sampler(stop=lambda row: calls.append(row) or True,
+                                   allow_cleanup=lambda row: decision)
+            proc.return_value = {'pid': 123, 'start': 1, 'cpu': 0}
+            sampler.sample([self.row], self.record)
+            proc.return_value = False
+            sampler.sample([self.row], self.record)
+            self.assertEqual(calls, [])
+            self.assertFalse(sampler.samples[('native', 1000)]['attempted'])
+            sampler.allow_cleanup = lambda row: True
+            sampler.sample([self.row], self.record)
+            self.assertEqual(len(calls), 1)

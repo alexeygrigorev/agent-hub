@@ -1,4 +1,7 @@
 import { IntakeWorktrees } from './intake-worktrees';
+import { ADOPTION_SCHEMA, queueOperatorAdoptions, pendingOperatorAdoptions, completeOperatorAdoption } from './session-adoption';
+import { LivenessService } from './liveness';
+import { openWorktreeIntake, worktreeIntakeProtected, worktreeIntakeSnapshot } from './worktree-intakes';
 import { workerAccessContext } from './worker-access';
 import { registeredRepoLabel } from './repos';
 import { initResourceRequestProjection } from './sql-json-projection';
@@ -50,20 +53,30 @@ import {
   recordObservation,
 } from './session_lifecycle_registry';
 
-export const SESSION_CONTROL_SCHEMA = `
+export const SESSION_CONTROL_SCHEMA = ADOPTION_SCHEMA + `
 CREATE TABLE IF NOT EXISTS session_control_sessions (id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, request_json TEXT NOT NULL, fleet_launch_id TEXT, machine_id TEXT, engine TEXT, mode TEXT NOT NULL, state TEXT NOT NULL, binding_json TEXT, parent_id TEXT, parent_source TEXT, session_type TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(actor, request_key));
 CREATE TABLE IF NOT EXISTS session_control_commands (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, request_key TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, correlation TEXT NOT NULL, poll_at TEXT, ack_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(session_id, actor, request_key));
 CREATE TABLE IF NOT EXISTS session_control_cancellations (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_control_protections (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL, request_key TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_warning_events (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, until_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS session_warning_events_session ON session_warning_events(session_id, created_at);
+CREATE TABLE IF NOT EXISTS session_worktree_episode_notes (subject TEXT NOT NULL, generation INTEGER NOT NULL, intake_id TEXT NOT NULL, PRIMARY KEY(subject, generation, intake_id));
+CREATE TABLE IF NOT EXISTS session_worktree_episodes (subject TEXT PRIMARY KEY, active INTEGER NOT NULL, generation INTEGER NOT NULL, completed INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS session_control_proofs (reply_envelope_id TEXT PRIMARY KEY, command_id TEXT NOT NULL, session_id TEXT NOT NULL, created_at TEXT NOT NULL);
 `;
 
 type Caller = { kind?: string; actor?: string; isAdmin?: boolean; machineId?: string; tokenId?: string };
 type Auth = { caller?: Caller; scopes?: string[]; error?: Response };
 type ReserveHook = (input: any, auth: Auth) => { value: any; status: number };
-export type SessionControlOptions = { maxPendingCommands?: number; maxSessionCommands?: number; claimTtlMs?: number; env?: Env };
+/** Worktree-guard follow-up hooks (intake a0f01448 AC4). Wired in hub.ts;
+ * absent in tests (follow-up is best-effort and never gates the 201). */
+export type WorktreeGuardHooks = {
+  /** Open/update a needs_attention alert (liveness). */
+  setAlert?: (kind: string, subject: string, problem: { state: string; detail: string } | null) => unknown;
+  /** Append a note to the linked intake. */
+  appendIntakeNote?: (taskId: string, text: string) => unknown;
+};
+export type SessionControlOptions = { maxPendingCommands?: number; maxSessionCommands?: number; claimTtlMs?: number; env?: Env; worktreeGuard?: WorktreeGuardHooks };
 
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const UUID_RE = /^[a-f0-9-]{36}$/;
@@ -564,10 +577,78 @@ export class SessionControlService {
       if (!['finished', 'superseded'].includes((live as any).state)) return false;
       if (((live as any).obligations?.length ?? 0) > 0) return false;
       if (live.refs?.owner !== row.actor) return false;
+      // Worktree-guard (AC2): a session linked to an OPEN intake is never
+      // tree-authorized, even when finished. The lock releases only after a
+      // DONE note / archive; ordinary stops still work, the tree stays kept.
+      try {
+        if (this.linkedOpenIntakeForSession(session)) return false;
+      } catch {
+        return false;
+      }
       return true;
     } catch {
       return false;
     }
+  }
+
+  /** First linked OPEN intake id for a session control row, or null.
+   * Considers the start-request intake_task_id plus canonical intake link
+   * events (hub_session_id / verified native_id). Fail-closed callers treat
+   * exceptions as open. */
+  private linkedOpenIntakeForSession(session: any): string | null {
+    return openWorktreeIntake(this.sql, session);
+  }
+
+  private linkedIntakeProtected(session: any): boolean {
+    try { return this.linkedOpenIntakeForSession(session) != null; }
+    catch { return true; }
+  }
+
+  /** Durable episode acknowledgement. Called in the observation transaction;
+   * hook failure rolls back both effects and acknowledgement for host retry. */
+  private worktreeMissingFollowup(machineId: unknown, nativeId: unknown, missing: boolean): boolean {
+    const hooks = this.options.worktreeGuard;
+    if (!hooks?.setAlert || typeof machineId !== 'string' || !machineId || typeof nativeId !== 'string' || !nativeId) return false;
+    const subject = `${machineId}/${nativeId}`;
+    const episode: any = this.sql.exec('SELECT * FROM session_worktree_episodes WHERE subject = ?', subject).toArray()[0];
+    if (!missing) {
+      const recovery = hooks.setAlert('session', subject, null);
+      if (recovery === false || (recovery as any)?.ok === false) throw new Error('worktree_recovery_not_recorded');
+      this.sql.exec('UPDATE session_worktree_episodes SET active = 0, completed = 0 WHERE subject = ?', subject);
+      return true;
+    }
+    const fleet: any = this.sql.exec('SELECT phase,tag FROM fleet_sessions WHERE machine_id = ? AND native_id = ?', machineId, nativeId).toArray()[0];
+    if (!fleet || !['running', 'starting'].includes(fleet.phase)) return false;
+    const rows: any[] = this.sql.exec('SELECT * FROM session_control_sessions WHERE machine_id = ? AND binding_json IS NOT NULL', machineId).toArray();
+    let sessions = rows.filter(row => JSON.parse(row.binding_json)?.native_id === nativeId);
+    if (!sessions.length) {
+      // Missing trees can prevent binding itself. Resolve reporting custody
+      // from the exact host-observed canonical launch tag, without creating
+      // a control binding or manufacturing repository evidence.
+      sessions = this.sql.exec(`SELECT s.* FROM session_control_sessions s JOIN fleet_launches f ON f.id=s.fleet_launch_id
+        WHERE s.machine_id=? AND f.machine_id=? AND s.binding_json IS NULL AND
+          (f.native_id=? OR (?=('hub-' || f.id)) OR (?=('task-hub-' || f.id)))`,
+        machineId, machineId, nativeId, fleet.tag, fleet.tag).toArray() as any[];
+    }
+    if (sessions.length !== 1) return false;
+    const session = sessions[0];
+    const openId = this.linkedOpenIntakeForSession(session);
+    if (openId && !hooks.appendIntakeNote) return false;
+    const generation = episode?.active === 1 ? episode.generation : (episode?.generation ?? 0) + 1;
+    const noted = !openId || this.sql.exec('SELECT 1 FROM session_worktree_episode_notes WHERE subject=? AND generation=? AND intake_id=?', subject, generation, openId).toArray().length > 0;
+    if (episode?.active === 1 && episode.completed === 1 && noted) return true;
+    const alertResult = hooks.setAlert('session', subject, { state: 'worktree_removed', detail:
+      `live session worktree path disappeared (machine ${machineId}); session ${session.id}; episode ${generation}` });
+    if (alertResult === false || (alertResult as any)?.ok === false) throw new Error('worktree_alert_not_recorded');
+    if (openId && !noted) {
+      const noteResult = hooks.appendIntakeNote!(openId,
+      `Worktree guard (incident 95c1862c): live session ${session.id} (native ${nativeId} on ${machineId}) reports its worktree path missing, episode ${generation}. ` +
+      `The tree must NOT be removed while this intake is open; investigate and recreate the checkout if needed.`);
+      if (noteResult === false || (noteResult as any)?.ok === false) throw new Error('worktree_note_not_recorded');
+      this.sql.exec('INSERT INTO session_worktree_episode_notes (subject,generation,intake_id) VALUES (?,?,?)', subject, generation, openId);
+    }
+    this.sql.exec('INSERT INTO session_worktree_episodes (subject, active, generation, completed) VALUES (?, 1, ?, 1) ON CONFLICT(subject) DO UPDATE SET active = 1, generation = excluded.generation, completed = 1', subject, generation);
+    return true;
   }
 
   private warningView(row: any, threshold = 10800) {
@@ -1208,6 +1289,50 @@ export class SessionControlService {
     const writer = admin || (caller.kind === 'agent' && auth.scopes?.includes('fleet:launch'));
     const host = caller.kind === 'host' && !!caller.machineId && auth.scopes?.includes('host');
 
+    if (path === '/api/sessions/worktree-guards' && request.method === 'GET') {
+      if (!host) return response({ error: 'forbidden' }, 403);
+      const rows: any[] = this.sql.exec(`SELECT s.*, f.state AS guard_launch_state, f.native_id AS guard_launch_native,
+        c.kind AS guard_owner_kind, p.session_id AS guard_explicit_protection
+        FROM session_control_sessions s LEFT JOIN fleet_launches f ON f.id=s.fleet_launch_id
+        LEFT JOIN credentials c ON c.id=s.owner_token_id LEFT JOIN session_control_protections p ON p.session_id=s.id
+        WHERE s.machine_id = ?`, caller.machineId!).toArray();
+      const worktreeLinks = worktreeIntakeSnapshot(this.sql);
+      let sessions = rows.filter(row => this.hostOk(row, caller).ok).map(row => {
+        const binding = row.binding_json ? JSON.parse(row.binding_json) : null;
+        const unstarted = !binding && !row.guard_launch_native && ['failed', 'refused'].includes(row.guard_launch_state);
+        const protectedSession = binding
+          ? classifyKey(this.sql, `${row.machine_id}/${binding.native_id}`, this.now())?.refs?.protected_session !== false
+          : !(unstarted && row.guard_owner_kind === 'agent' && !row.guard_explicit_protection);
+        const native: any = binding && this.sql.exec('SELECT * FROM fleet_sessions WHERE machine_id=? AND native_id=?', row.machine_id, binding.native_id).toArray()[0];
+        const nativeTerminal = unstarted || !!(native &&
+          native.created_at_ms === binding.native_created_at_ms && native.tag === binding.tag && native.workspace === binding.workspace &&
+          ['exited', 'dead', 'pruned', 'forgotten'].includes(native.phase));
+        const adoptedLock = binding?.adoption_lock === true && typeof binding.adoption_intent_id === 'string' &&
+          this.sql.exec("SELECT id FROM session_adoption_intents WHERE id=? AND machine_id=? AND native_id=? AND state='completed'",
+            binding.adoption_intent_id, row.machine_id, binding.native_id).toArray().length > 0;
+        return { session_id: row.id, native_terminal: nativeTerminal, native_id: binding?.native_id ?? null,
+          lock_release_permitted: !protectedSession || (adoptedLock && !row.guard_explicit_protection),
+          engine: row.engine, adoption_intent_id: binding?.adoption_intent_id ?? null,
+          tag: binding?.tag ?? ((row.mode === 'headless' ? 'task-hub-' : 'hub-') + row.fleet_launch_id),
+          workspace: binding?.workspace ?? null, native_created_at_ms: binding?.native_created_at_ms ?? null,
+          terminal: ['stopped', 'finished', 'failed', 'refused', 'cancelled'].includes(row.state),
+          linked_intake_open: worktreeIntakeProtected(this.sql, row, worktreeLinks), protected: protectedSession };
+      });
+      // A second binding alias must not weaken protections for the same
+      // exact native incarnation. Never unlock through a terminal alias
+      // while another linked Hub session is live or human-protected.
+      sessions = sessions.map(fact => {
+        if (!fact.native_id) return fact;
+        const aliases = sessions.filter(other => other.native_id === fact.native_id &&
+          other.native_created_at_ms === fact.native_created_at_ms);
+        return { ...fact, terminal: aliases.every(other => other.terminal),
+          protected: aliases.some(other => other.protected),
+          lock_release_permitted: aliases.every(other => other.lock_release_permitted),
+          linked_intake_open: aliases.some(other => other.linked_intake_open) };
+      });
+      return response({ sessions });
+    }
+
     if (path === '/api/sessions/host-bindings' && request.method === 'GET') {
       if (!host) return response({ error: 'forbidden' }, 403);
 
@@ -1270,7 +1395,7 @@ export class SessionControlService {
       for (const row of promoted) if (this.hostOk(row, caller).ok) this.syncFleetPlacement(row.id);
       const rows = this.sql.exec("SELECT s.*, f.native_id AS launch_native_id FROM session_control_sessions s JOIN fleet_launches f ON f.id = s.fleet_launch_id WHERE s.machine_id = ? AND s.binding_json IS NULL AND s.state IN ('offered','starting','uncertain') AND f.state IN ('starting','running') LIMIT 100", caller.machineId!).toArray() as any[];
       return response({
-        sessions: rows.filter(row => this.hostOk(row, caller).ok).map(row => ({ id: row.id, fleet_launch_id: row.fleet_launch_id, engine: row.engine, native_id: row.launch_native_id ?? null })),
+        sessions: rows.filter(row => this.hostOk(row, caller).ok).map(row => ({ id: row.id, fleet_launch_id: row.fleet_launch_id, intake_task_id: JSON.parse(row.request_json).intake_task_id ?? null, engine: row.engine, native_id: row.launch_native_id ?? null })),
       });
     }
 
@@ -1713,7 +1838,15 @@ export class SessionControlService {
           payload: (input as any).payload ?? input,
         });
         if (!stored.ok) return response({ error: stored.error }, stored.status);
-        return response(stored, 201);
+        const payload = ((input as any).payload ?? input) as any;
+        let complete = true;
+        if (payload && typeof payload === 'object' && payload.worktree_missing === true) {
+          complete = this.worktreeMissingFollowup((input as any).machine_id, (input as any).native_id, true);
+        } else if (payload && typeof payload === 'object' &&
+          (payload.worktree_missing === false || payload.cwd_path_recreated === true)) {
+          complete = this.worktreeMissingFollowup((input as any).machine_id, (input as any).native_id, false);
+        }
+        return response({ ...stored, worktree_followup_complete: complete }, 201);
       });
     }
 
@@ -1916,21 +2049,35 @@ export class SessionControlService {
       });
     }
 
-    if (path === '/api/sessions/host-adoption' && request.method === 'POST') {
-      if (!host && !admin) return response({ error: 'forbidden' }, 403);
+    if (path === '/api/sessions/host-adoption' && request.method === 'GET') {
+      if (!host) return response({ error: 'forbidden' }, 403);
+      const gate = this.hostOk({ machine_id: caller.machineId }, caller);
+      if (!gate.ok) return response({ error: gate.error }, 409);
+      return response({ sessions: pendingOperatorAdoptions(this.sql, caller.machineId!, this.now()) });
+    }
+    if (path === '/api/sessions/host-adoption/receipt' && request.method === 'POST') {
+      if (!host) return response({ error: 'forbidden' }, 403);
       const data = await body(request);
-      if (!data || typeof data !== 'object' || !Array.isArray(data.sessions)) {
+      return this.transaction(() => {
+        const gate = this.hostOk({ machine_id: caller.machineId }, caller);
+        if (!gate.ok) return response({ error: gate.error }, 409);
+        const result = completeOperatorAdoption(this.sql, caller.machineId!, data, this.now(), this.presentingFamily(caller));
+        return response(result, result.ok ? 200 : 409);
+      });
+    }
+    if (path === '/api/sessions/host-adoption' && request.method === 'POST') {
+      // A host census cannot grant custody. An authenticated operator records
+      // intent; only the target host can subsequently attest the exact lock.
+      if (!admin) return response({ error: 'operator_adoption_intent_required' }, 403);
+      const data = await body(request);
+      if (!data || typeof data !== 'object' || !Array.isArray(data.sessions) || data.sessions.length > 100) {
         return response({ error: 'invalid_adoption_request' }, 400);
       }
-      const targetMachine = host ? caller.machineId! : (data.machine_id || caller.machineId);
-      if (!targetMachine) return response({ error: 'missing_machine_id' }, 400);
+      const targetMachine = data.machine_id || caller.machineId;
+      if (typeof targetMachine !== 'string' || !targetMachine) return response({ error: 'missing_machine_id' }, 400);
       return this.transaction(() => {
-        if (host) {
-          const gate = this.hostOk({ machine_id: targetMachine }, caller);
-          if (!gate.ok) return response({ error: gate.error }, 409);
-        }
-        const result = adoptObservedNativeSessions(this.sql, targetMachine, data.sessions, this.now(), this.presentingFamily(caller));
-        return response({ status: 'ok', ...result });
+        const result = queueOperatorAdoptions(this.sql, targetMachine, data.sessions, actorName(caller), caller.tokenId ?? null, this.now());
+        return response({ status: 'adoption_pending_host_lock', adopted: 0, ...result }, 202);
       });
     }
 
@@ -2655,7 +2802,7 @@ export class SessionControlService {
           // (owner/incarnation/M15 eligibility NOW, not at enqueue); the host
           // runs the tree ONLY when this is true plus a confirmed stop.
           if (row.holder_attempt === input.attempt_id) {
-            return response({ command_id: row.id, claim_token: row.claim_token, holder: row.holder_machine, generation: row.generation, expires_at: row.claim_expires_at, expires_at_ms: Date.parse(row.claim_expires_at), attempt: row.attempts ?? 1, replay: true, cleanup_tree: this.cleanupAuthorized(row, session) });
+            return response({ command_id: row.id, claim_token: row.claim_token, holder: row.holder_machine, generation: row.generation, expires_at: row.claim_expires_at, expires_at_ms: Date.parse(row.claim_expires_at), attempt: row.attempts ?? 1, replay: true, cleanup_tree: this.cleanupAuthorized(row, session), linked_intake_open: this.linkedIntakeProtected(session) });
           }
           return response({ error: 'already_claimed' }, 409);
         }
@@ -2677,7 +2824,7 @@ export class SessionControlService {
           caller.machineId, token, expires, input.attempt_id, attempt, this.at(), row.id);
         if (written.rowsWritten !== 1) return response({ error: 'claim_conflict' }, 409);
         this.adoptHostFamily(session.id, caller);
-        return response({ command_id: row.id, claim_token: token, holder: caller.machineId, generation: row.generation, expires_at: expires, expires_at_ms: Date.parse(expires), attempt, cleanup_tree: this.cleanupAuthorized(row, session) });
+        return response({ command_id: row.id, claim_token: token, holder: caller.machineId, generation: row.generation, expires_at: expires, expires_at_ms: Date.parse(expires), attempt, cleanup_tree: this.cleanupAuthorized(row, session), linked_intake_open: this.linkedIntakeProtected(session) });
       });
     }
 
@@ -2967,9 +3114,9 @@ export function adoptObservedNativeSessions(
   sessions: any[],
   nowMs: number,
   hostFamily?: string | null,
-): { adopted: number; updated: number } {
+): { adopted: number; updated: number; deferred: number } {
   const hasTable = sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_control_sessions'").toArray().length > 0;
-  if (!hasTable || !Array.isArray(sessions) || !machineId) return { adopted: 0, updated: 0 };
+  if (!hasTable || !Array.isArray(sessions) || !machineId) return { adopted: 0, updated: 0, deferred: 0 };
 
   let resolvedFamily = hostFamily;
   if (!resolvedFamily) {
@@ -2981,6 +3128,7 @@ export function adoptObservedNativeSessions(
 
   const TERMINAL_PHASES = new Set(['exited', 'dead', 'pruned', 'forgotten']);
   let adopted = 0;
+  let deferred = 0;
   let updated = 0;
   const isoNow = new Date(nowMs).toISOString();
 
@@ -3028,62 +3176,31 @@ export function adoptObservedNativeSessions(
 
     const verifiedTerminal = TERMINAL_PHASES.has(s.phase) && s.confirmed_exit === true;
     const state = verifiedTerminal ? 'stopped' : (s.phase === 'starting' ? 'starting' : s.phase === 'running' ? 'running' : 'uncertain');
-    const createdAtIso = createdAtMs ? new Date(createdAtMs).toISOString() : isoNow;
-    const requestName = typeof s.name === 'string' && s.name ? s.name : null;
-    const requestOwner = typeof s.owner === 'string' && s.owner ? s.owner : null;
-    const actor = requestOwner || 'unknown';
-
-    const requestPayload = {
-      provenance: 'observed_native',
-      origin: 'aplexer',
-      workspace,
-      cwd: typeof s.cwd === 'string' ? s.cwd : null,
-      engine: typeof s.engine === 'string' ? s.engine : null,
-      tag,
-      name: requestName,
-      owner: requestOwner,
-      created_at_ms: createdAtMs,
-    };
-
-    const bindingPayload = {
-      native_id: nativeId,
-      tag,
-      workspace,
-      generation: 1,
-      native_created_at_ms: createdAtMs,
-      provenance: 'observed_native',
-      adopted_at: isoNow,
-    };
-
-    const sessionType = (s.session_type === 'headless' || s.mode === 'headless') ? 'headless' : 'aplexer';
     const parentId = typeof s.parent_id === 'string' && s.parent_id ? s.parent_id : null;
     const parentSource = parentId ? 'inferred' : 'unknown_external';
 
     if (!existing) {
-      // Insert new adopted session
-      const requestKey = 'native-' + nativeId;
-      sql.exec(
-        'INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, engine, mode, state, binding_json, parent_id, parent_source, session_type, owner_token_id, owner_family, host_family, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        nativeId,
-        actor,
-        requestKey,
-        JSON.stringify(requestPayload),
-        null,
-        machineId,
-        typeof s.engine === 'string' ? s.engine : null,
-        sessionType === 'headless' ? 'headless' : 'interactive',
-        state,
-        JSON.stringify(bindingPayload),
-        parentId,
-        parentSource,
-        sessionType,
-        null,
-        null,
-        resolvedFamily || null,
-        createdAtIso,
-        isoNow,
-      );
-      adopted++;
+      // A census is observation, never authenticated ownership or authority
+      // to lock another user's checkout. Fleet-owned sessions reconcile via
+      // host-bindings, where the host verifies the exact native/repository
+      // tuple and locks before the canonical binding is accepted. There is
+      // currently no equivalent ownership witness for a new observed native.
+      // Keep it visible in fleet_sessions, but defer the ownership transition.
+      // Caller labels, tags and even an admin adoption request cannot bypass.
+      deferred++;
+      const alertTable = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='liveness_alerts'").toArray().length;
+      const alerts = new LivenessService(sql, undefined, () => nowMs);
+      if (!alertTable) alerts.init();
+      // An unchanged complete catalog must not rewrite every deferred native
+      // on every heartbeat. One unresolved durable alert is sufficient.
+      if (sql.exec("SELECT id FROM liveness_alerts WHERE subject_kind='session_adoption' AND subject=? AND resolved_at IS NULL", machineId + '/' + nativeId).toArray().length) continue;
+      alerts.setAlert('session_adoption', machineId + '/' + nativeId, {
+        state: 'needs_attention',
+        detail: JSON.stringify({ reason: 'adoption_ownership_lock_unverified',
+          native_id: nativeId, machine_id: machineId,
+          required: 'authenticated Hub ownership and exact host native/repository worktree lock receipt' }),
+      });
+      continue;
     } else {
       refreshObservedHostFamily(sql, machineId, existing, s, resolvedFamily);
       // Update existing adopted session if state or phase changed
@@ -3111,5 +3228,5 @@ export function adoptObservedNativeSessions(
     }
   }
 
-  return { adopted, updated };
+  return { adopted, updated, deferred };
 }

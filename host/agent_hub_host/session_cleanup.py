@@ -353,6 +353,7 @@ def remove_owned_worktree(
     command_id: Optional[str] = None,
     git_bin: str = "git",
     runner: Optional[Callable] = None,
+    linked_intake_open: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Remove ONE owned dedicated worktree + branch after confirmed stop.
 
@@ -368,9 +369,13 @@ def remove_owned_worktree(
 
     Fresh guards run on EVERY call (no stale approval): claim-holder match,
     root confinement, discovered-branch registered-worktree exclusivity,
-    clean+unlocked, no live use, and FRESH ancestry proof. Ordinary
-    `git worktree remove` runs first, then `git branch -d` only after the
-    remove verified. No `--force`, no reset.
+    clean+unlocked, no live use, open-intake refusal, and FRESH ancestry
+    proof. Ordinary `git worktree remove` runs first, then `git branch -d`
+    only after the remove verified. No `--force`, no reset.
+
+    Worktree-guard (intake a0f01448): cleanup preserves every lock,
+    including manual locks. Session lifecycle releases its own Hub lock only
+    after a confirmed terminal outcome and no open linked intake.
 
     Durable journal (`cleanup-<machine>-<nativehex>.json`): terminal
     `tree_removed`/`refused` outcomes replay without re-running git;
@@ -476,6 +481,8 @@ def remove_owned_worktree(
         guard_error: Optional[str] = None
         try:
             realpath = resolve_owned_worktree(canonical_workspace, roots)
+            if linked_intake_open is True:
+                raise SessionControlError("linked open intake; refusing (worktree guard listed-only)")
             branch = discover_registered_branch(git_bin, realpath, runner=run)
             info = check_registered_worktree(git_bin, realpath, branch, runner=run)
             common_dir = info["common_dir"]
