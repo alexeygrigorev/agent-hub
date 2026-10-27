@@ -336,6 +336,52 @@ describe('webhook delivery pump', () => {
     });
   });
 
+  it('treats recipient_not_ready as absence: redelivers past the transport budget (AC2, live finding)', async () => {
+    const route = await setup();
+    const { data } = await ingestRoute(route, 'busy session');
+    expect(data.status).toBe('queued');
+    await runInDurableObject(stub, async (instance: Hub) => {
+      const read = () => instance.sql.exec('SELECT * FROM session_deliveries WHERE id = ?', data.delivery_id).toArray()[0] as any;
+      const ackFailed = (row: any) => instance.sql.exec("UPDATE session_control_commands SET state = 'acked', ack_json = ? WHERE id = ?",
+        JSON.stringify({ outcome: 'failed', reason: 'recipient_not_ready' }), row.command_id);
+      // Attempt 1: the live busy session acks its send command failed.
+      ackFailed(read());
+      await instance.webhookService.pump();
+      let row: any = read();
+      expect(row.status).toBe('pending');
+      expect(row.attempts).toBe(1);
+      // Attempts 2-5: each redelivery is refused the same way and must stay
+      // pending — the session exists and can come back, so recipient_not_ready
+      // rides the absence budget, not the 5-attempt transport budget.
+      for (let attempt = 2; attempt <= 5; attempt++) {
+        instance.sql.exec('UPDATE session_deliveries SET attempts = ?, next_attempt_at = ? WHERE id = ?',
+          attempt - 1, new Date(Date.now() - 1000).toISOString(), data.delivery_id);
+        await instance.webhookService.pump();
+        row = read();
+        expect(row.status).toBe('queued');
+        ackFailed(row);
+        await instance.webhookService.pump();
+        row = read();
+        expect(row.status).toBe('pending');
+        expect(row.attempts).toBe(attempt);
+      }
+      const audits = instance.sql.exec("SELECT action FROM audit WHERE resource = 'webhook' AND action = 'webhook.fail'").toArray() as any[];
+      expect(audits).toHaveLength(0);
+      // The long uncertain variant from the live system is absence too, and
+      // the absence budget still terminates honestly at 96 attempts.
+      instance.sql.exec('UPDATE session_deliveries SET attempts = 95, next_attempt_at = ? WHERE id = ?',
+        new Date(Date.now() - 1000).toISOString(), data.delivery_id);
+      await instance.webhookService.pump();
+      row = read();
+      instance.sql.exec("UPDATE session_control_commands SET state = 'acked', ack_json = ? WHERE id = ?",
+        JSON.stringify({ outcome: 'uncertain', reason: 'recipient_not_ready_uncertain: inbox envelope still undelivered; removal unproven' }), row.command_id);
+      await instance.webhookService.pump();
+      row = read();
+      expect(row.status).toBe('failed');
+      expect(row.attempts).toBe(96);
+    });
+  });
+
   it('fails permanently on an ambiguous target, retries absent targets longer', async () => {
     await runInDurableObject(stub, async (instance: Hub) => {
       const now = new Date().toISOString();

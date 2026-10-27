@@ -563,11 +563,15 @@ export class WebhookService {
     return true;
   }
 
-  /** Absence of the target (not yet created, unbound, queue backpressure) is
-   * retryable far longer than transport/refusal failures, so a webhook that
-   * arrives while the session is down is still delivered when it returns. */
+  /** Absence of the target (not yet created, unbound, queue backpressure) or a
+   * target that exists but is not consuming its inbox yet (busy interactive
+   * session, host between turns) is retryable far longer than transport or
+   * refusal failures, so a webhook that arrives while the session is down or
+   * busy is still delivered when it comes back. */
   private absenceError(error: string): boolean {
-    if (['target_not_found', 'session_not_bound', 'queue_full', 'session_queue_full', 'command_lost', 'send_transport_error'].includes(error)) return true;
+    if (['target_not_found', 'session_not_bound', 'queue_full', 'session_queue_full', 'command_lost',
+      'failed:recipient_not_ready', 'send_transport_error'].includes(error)) return true;
+    if (error.startsWith('uncertain:recipient_not_ready')) return true;
     return /^send_(404|409|429|503):/.test(error) || /^send_(404|409|429|503)$/.test(error);
   }
 
