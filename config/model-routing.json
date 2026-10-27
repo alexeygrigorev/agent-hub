@@ -458,7 +458,7 @@
     "reset_urgency_factor": 2.5,
     "headroom_floor": 0.05,
     "reserve_percent": {
-      "codex": 15,
+      "codex": 0,
       "grok": 5
     },
     "allow_paid": false,

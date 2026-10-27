@@ -12,7 +12,7 @@ from importlib import resources
 from pathlib import Path
 
 from .fleet import quota_metadata, run_json
-from .model_contract import canonical_account_label, configured_selection
+from .model_contract import canonical_account_label, configured_selection, reserve_percent
 
 
 def routing_rules():
@@ -30,11 +30,11 @@ def probe(payload, service, account, engine, runner=run_json):
             payload.get('engine') != engine or payload.get('profile') is not None or
             payload.get('mode') not in ('interactive', 'headless')):
         return result
-    rules = routing_rules()
-    # Grok remains disabled for execution. A fleet placement probe is read-only.
-    if service in rules.get('disabled_providers', []):
-        return result
     try:
+        rules = routing_rules()
+        # Grok remains disabled for execution. A fleet placement probe is read-only.
+        if service in rules.get('disabled_providers', []):
+            return result
         selection = payload.get('selection')
         if selection is not None:
             model = configured_selection(selection, engine, service)
@@ -47,7 +47,10 @@ def probe(payload, service, account, engine, runner=run_json):
                 details.get('limit_reached') is not False or details.get('stale') is True or
                 (service == 'grok' and details.get('has_grok_code_access') is not True)):
             return result
-        reserve = rules.get('reserve_percent', {}).get(service, 0)
+        reserve = (reserve_percent('codex') if service == 'codex' else
+                   rules.get('reserve_percent', {}).get(service, 0))
+        if type(reserve) not in (int, float) or not math.isfinite(reserve) or not 0 <= reserve <= 100:
+            return result
         known = 0
         timed = 0
         for name, window in quota['windows'].items():
@@ -75,7 +78,7 @@ def probe(payload, service, account, engine, runner=run_json):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--service', required=True, choices=('claude', 'zai', 'grok'))
+    parser.add_argument('--service', required=True, choices=('codex', 'claude', 'zai', 'grok'))
     parser.add_argument('--account', required=True)
     parser.add_argument('--engine', required=True)
     args = parser.parse_args()

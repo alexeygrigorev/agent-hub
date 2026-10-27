@@ -70,8 +70,8 @@ def test_admission_allows_when_gate_ok(monkeypatch, tmp_path, capsys):
 def test_classify_preserves_gate_slug():
     d = dd.classify(ValueError('codex_quota_gate_quota_unavailable: managed Codex quota gate refused launch before execution'))
     assert d['reason'] == 'codex_quota_gate_quota_unavailable'
-    d2 = dd.classify(ValueError('codex_quota_gate_codex_reserve_15_percent_required: x'))
-    assert d2['reason'] == 'codex_quota_gate_codex_reserve_15_percent_required'
+    d2 = dd.classify(ValueError('codex_quota_gate_codex_reserve_required: x'))
+    assert d2['reason'] == 'codex_quota_gate_codex_reserve_required'
 
 
 def _home_bundle(monkeypatch, tmp_path):

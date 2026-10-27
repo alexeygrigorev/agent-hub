@@ -1358,11 +1358,19 @@ def quse_argv(env):
 
 
 def check_codex_quota_gate(env):
-    """Enforce the mandatory >=15% weekly quota gate for OpenAI Codex before execution.
+    """Enforce the configured weekly quota reserve for OpenAI Codex before execution.
 
-    Fails closed with machine-safe reason codes; never leaks raw stdout/stderr.
+    The reserve comes from config/model-routing.json rules.reserve_percent
+    (codex ships 0 since intake c269353c, so the gate blocks only at 0%
+    remaining); missing or malformed configuration fails closed. Fails closed
+    with machine-safe reason codes; never leaks raw stdout/stderr.
     """
     try:
+        from .model_contract import reserve_percent
+        try:
+            reserve = reserve_percent('codex')
+        except Exception:
+            return False, 'quota_unavailable'
         # UTF-8 both ways: the Windows default code page would otherwise make
         # quse's or our decoding raise on non-ASCII account metadata.
         env = dict(env, PYTHONIOENCODING='utf-8', PYTHONUTF8='1')
@@ -1422,8 +1430,8 @@ def check_codex_quota_gate(env):
 
         if not has_weekly or min_remaining is None:
             return False, 'quota_unavailable'
-        if min_remaining <= 15.0:
-            return False, 'codex_reserve_15_percent_required'
+        if min_remaining <= reserve:
+            return False, 'codex_reserve_required'
         return True, 'ok'
     except FileNotFoundError:
         # No quse anywhere: quota evidence is unavailable, not a failed check.

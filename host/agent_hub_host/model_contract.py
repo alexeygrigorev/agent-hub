@@ -8,6 +8,20 @@ def policy_models():
     return _policy_document()['models']
 
 
+def reserve_percent(service):
+    """Configured admission reserve percent for a provider (rules.reserve_percent).
+
+    Single source of truth is config/model-routing.json. Raises on missing or
+    malformed entries so admission gates can fail closed instead of silently
+    widening the reserve.
+    """
+    rules = _policy_document().get('rules') or {}
+    raw = (rules.get('reserve_percent') or {}).get(service)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not 0 <= raw <= 100:
+        raise ValueError('reserve_percent_invalid')
+    return float(raw)
+
+
 def _policy_document():
     try:
         return json.loads(resources.files(__package__).joinpath('model-routing.json').read_text())

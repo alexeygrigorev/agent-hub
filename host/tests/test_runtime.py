@@ -13,7 +13,6 @@ from agent_hub_host.runtime import (
     LauncherQualification,
     RuntimeManager,
     get_first_action_digest,
-    CODEX_MIN_PERCENT,
 )
 
 
@@ -116,14 +115,14 @@ class TestRuntime(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("quota gate refused", reason)
 
-        # Case 2: Quota gate reports window below 15% floor
+        # Case 2: At zero remaining, even an optimistic external gate is refused.
         mock_subproc.return_value = MagicMock(
             returncode=0,
             stdout=json.dumps({
                 "launch_allowed": True,
                 "reason": "ok",
                 "windows": {
-                    "primary": {"present": True, "percent_remaining": 12.5}
+                    "primary": {"present": True, "percent_remaining": 0}
                 }
             }),
             stderr=""
@@ -132,6 +131,16 @@ class TestRuntime(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("below safety threshold", reason)
         self.assertNotIn("%", reason)
+
+        mock_subproc.return_value.stdout = json.dumps({
+            "launch_allowed": True, "reason": "ok",
+            "windows": {"primary": {"present": True, "percent_remaining": 9}}
+        })
+        self.assertTrue(mgr.check_codex_window()[0])
+        with patch('agent_hub_host.model_contract.reserve_percent', return_value=10):
+            self.assertFalse(mgr.check_codex_window()[0])
+        with patch('agent_hub_host.model_contract.reserve_percent', side_effect=ValueError('invalid')):
+            self.assertFalse(mgr.check_codex_window()[0])
 
         # Case 3: Quota gate check times out
         import subprocess

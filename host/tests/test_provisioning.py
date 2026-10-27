@@ -598,7 +598,7 @@ def test_codex_protected_guard_behavioral_regression(tmp_path, monkeypatch):
     monkeypatch.setenv('HUB_CONFIG_FILE', str(default_m_dir.parent / 'host.json'))
     monkeypatch.setenv('HUB_TOKEN', 'secret-host-token')
 
-    # Case 1: Guard rejects invocation (<15% reserve)
+    # Case 1: Guard rejects invocation (below the configured reserve)
     calls_execve = []
     def fake_execve(cmd, argv, env):
         calls_execve.append((cmd, argv, env))
@@ -606,7 +606,7 @@ def test_codex_protected_guard_behavioral_regression(tmp_path, monkeypatch):
     monkeypatch.setattr(os, 'execve', fake_execve)
 
     def fake_quse_reject(env):
-        return False, 'codex_reserve_15_percent_required'
+        return False, 'codex_reserve_required'
 
     monkeypatch.setattr(p, 'check_codex_quota_gate', fake_quse_reject)
     monkeypatch.setattr(sys, 'argv', ['execute', 'codex-acc', 'run', 'prompt'])
@@ -641,7 +641,7 @@ def test_codex_protected_guard_behavioral_regression(tmp_path, monkeypatch):
     assert len(gate_called) == 1
     assert not calls_execve
 
-    # Case 3: Guard approves invocation (>=15% reserve)
+    # Case 3: Guard approves invocation (remaining above the configured reserve)
     def fake_quse_approve(env):
         return True, 'ok'
 
@@ -669,22 +669,33 @@ def test_codex_protected_guard_behavioral_regression(tmp_path, monkeypatch):
 def test_check_codex_quota_gate_contract(monkeypatch):
     """Direct contract verification of check_codex_quota_gate.
 
+    The weekly reserve comes from config/model-routing.json
+    rules.reserve_percent (codex ships 0 since intake c269353c); each case
+    sets it explicitly to prove the gate honours configuration instead of a
+    hardcoded floor.
+
     1. Real private quse snapshot shape:
        - 7d present with valid reading & future reset
        - 5h and monthly both reading+reset null (not applicable)
        -> passes gate
-    2. Minimum reserve <=15% -> rejected with codex_reserve_15_percent_required
+    2. Remaining <= configured reserve -> rejected with codex_reserve_required
+       (at reserve 0 only 0% is blocked; 9% remaining is admitted)
     3. limit_reached True or missing -> rejected with quota_unavailable
     4. Missing required 7d/weekly window -> rejected with quota_unavailable
     5. Non-finite or NaN reading -> rejected with quota_unavailable
     6. Stale reset_at in the past -> rejected with stale_window_evidence
-    7. Process failure or invalid JSON -> rejected with quota_unavailable
+    7. Missing/malformed reserve configuration -> fails closed quota_unavailable
     """
+    import agent_hub_host.model_contract as mc
+
     def mock_proc(stdout_obj, rc=0):
         class Proc:
             returncode = rc
             stdout = json.dumps(stdout_obj) if isinstance(stdout_obj, (dict, list)) else str(stdout_obj)
         return Proc()
+
+    configured = {'codex': 0.0}
+    monkeypatch.setattr(mc, 'reserve_percent', lambda service: configured[service])
 
     now = datetime.now(timezone.utc)
     future_reset = (now + timedelta(days=7)).isoformat()
@@ -709,7 +720,42 @@ def test_check_codex_quota_gate_contract(monkeypatch):
     assert allowed is True
     assert reason == 'ok'
 
-    # 2. Reserve <= 15%
+    # 2a. Configured reserve honoured: 9% remaining with reserve 0 is admitted
+    # (intake c269353c AC2), and 0% remaining is blocked.
+    quse_9 = {
+        'codex': {
+            'status': 'ok',
+            'details': {'limit_reached': False},
+            'windows': {
+                '5h': {'percent_remaining': None, 'reset_at': None},
+                '7d': {'percent_remaining': 9.0, 'reset_at': future_reset},
+                'monthly': {'percent_remaining': None, 'reset_at': None},
+            }
+        }
+    }
+    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_9))
+    allowed, reason = p.check_codex_quota_gate(env)
+    assert allowed is True
+    assert reason == 'ok'
+
+    quse_zero = {
+        'codex': {
+            'status': 'ok',
+            'details': {'limit_reached': False},
+            'windows': {
+                '5h': {'percent_remaining': None, 'reset_at': None},
+                '7d': {'percent_remaining': 0.0, 'reset_at': future_reset},
+                'monthly': {'percent_remaining': None, 'reset_at': None},
+            }
+        }
+    }
+    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_zero))
+    allowed, reason = p.check_codex_quota_gate(env)
+    assert allowed is False
+    assert reason == 'codex_reserve_required'
+
+    # 2b. Remaining at or below a non-zero configured reserve is blocked.
+    configured['codex'] = 15.0
     quse_low = {
         'codex': {
             'status': 'ok',
@@ -723,7 +769,18 @@ def test_check_codex_quota_gate_contract(monkeypatch):
     monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_low))
     allowed, reason = p.check_codex_quota_gate(env)
     assert allowed is False
-    assert reason == 'codex_reserve_15_percent_required'
+    assert reason == 'codex_reserve_required'
+
+    # 2c. Malformed reserve configuration fails closed.
+    def broken_reserve(service):
+        raise ValueError('reserve_percent_invalid')
+    configured['codex'] = 0.0
+    monkeypatch.setattr(mc, 'reserve_percent', broken_reserve)
+    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_real))
+    allowed, reason = p.check_codex_quota_gate(env)
+    assert allowed is False
+    assert reason == 'quota_unavailable'
+    monkeypatch.setattr(mc, 'reserve_percent', lambda service: configured[service])
 
     # 3. limit_reached True
     quse_limited = {

@@ -83,7 +83,9 @@ const NATIVE_UNRESERVED = `NOT EXISTS (SELECT 1 FROM fleet_launches l
   AND NOT EXISTS (SELECT 1 FROM fleet_launches l
   WHERE l.machine_id=s.machine_id AND ${NATIVE_IN_FLIGHT})`;
 
-const HEADROOM: Record<string, number> = { codex: 15, 'codex-orin': 15, grok: 5 };
+/** Registry reserves cannot fall below the configured admission reserve. */
+const HEADROOM: Record<string, number> = { ...policy.rules.reserve_percent,
+  'codex-orin': policy.rules.reserve_percent.codex };
 /** The native ZCode adapter and managed Codex profile serve the same ZAI model. */
 function matchesModelRoute(model: any, route: any, family: unknown): boolean {
   const nativeZai = family === 'zai' && route.engine === 'zcodex' && route.profile === null;
@@ -138,7 +140,7 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   "admission_refused": "Fresh admission refused this account or could not verify its timestamp and model.",
   "engine_auth_expired": "The engine authentication is unavailable or expired.",
   "codex_quota_gate_quota_unavailable": "The managed Codex account quota gate refused launch before execution.",
-  "codex_quota_gate_codex_reserve_15_percent_required": "The managed Codex account is below the 15% weekly reserve.",
+  "codex_quota_gate_codex_reserve_required": "The managed Codex account is below the configured weekly reserve.",
   "codex_quota_gate_stale_window_evidence": "The managed Codex quota evidence is stale.",
   "codex_quota_gate_quota_check_failed": "The managed Codex quota check failed."
 };
@@ -1285,7 +1287,7 @@ export class FleetService {
       }
       return this.transaction(() => { this.admission.replacePolicy(rows); return response({ status: 'configured', workspaces: this.admission.listPolicy() }); });
     }
-    // A pure cap raise does not need a lossy canonical registry round trip.
+    // Cap raises and reserve lowerings do not need a lossy registry round trip.
     // In particular shared-go may have both canonical and legacy alias rows.
     if (path === '/api/fleet/accounts' && request.method === 'PATCH') {
       if (!admin) return response({ error: 'forbidden' }, 403);
@@ -1293,17 +1295,25 @@ export class FleetService {
       if (!object(data, ['accounts']) || !Array.isArray(data.accounts) || !data.accounts.length || data.accounts.length > 128)
         return response({ error: 'invalid_accounts' }, 400);
       return this.transaction(() => {
-        const updates: {label: string; max: number}[] = [];
+        const updates: {label: string; max: number; reserve: number}[] = [];
         const seen = new Set<string>();
         for (const a of data.accounts) {
-          if (!object(a, ['label', 'max_concurrency']) || !label(a.label) || seen.has(a.label) || !Number.isInteger(a.max_concurrency) || a.max_concurrency < 1 || a.max_concurrency > 100)
+          if (!object(a, ['label', 'max_concurrency', 'reserve_percent']) || !label(a.label) || seen.has(a.label) ||
+              (a.max_concurrency === undefined && a.reserve_percent === undefined) ||
+              (a.max_concurrency !== undefined && (!Number.isInteger(a.max_concurrency) || a.max_concurrency < 1 || a.max_concurrency > 100)) ||
+              (a.reserve_percent !== undefined && (!Number.isFinite(a.reserve_percent) || a.reserve_percent < 0 || a.reserve_percent > 100)))
             return response({ error: 'invalid_account' }, 400);
           seen.add(a.label);
-          const rows = this.sql.exec('SELECT max_concurrency FROM fleet_accounts WHERE label=?', a.label).toArray();
-          if (!rows.length || a.max_concurrency < Number(rows[0].max_concurrency)) return response({ error: 'account_raise_required' }, 409);
-          updates.push({label: a.label, max: a.max_concurrency});
+          const rows = this.sql.exec('SELECT max_concurrency, reserve_percent, provider FROM fleet_accounts WHERE label=?', a.label).toArray();
+          if (!rows.length || (a.max_concurrency !== undefined && a.max_concurrency < Number(rows[0].max_concurrency))) return response({ error: 'account_raise_required' }, 409);
+          if (a.reserve_percent !== undefined) {
+            if (a.reserve_percent < (HEADROOM[String(rows[0].provider)] ?? 0)) return response({ error: 'invalid_account' }, 400);
+            if (a.reserve_percent > Number(rows[0].reserve_percent)) return response({ error: 'account_reserve_lowering_required' }, 409);
+          }
+          updates.push({label: a.label, max: a.max_concurrency ?? Number(rows[0].max_concurrency),
+            reserve: a.reserve_percent ?? Number(rows[0].reserve_percent)});
         }
-        for (const a of updates) this.sql.exec('UPDATE fleet_accounts SET max_concurrency=? WHERE label=?', a.max, a.label);
+        for (const a of updates) this.sql.exec('UPDATE fleet_accounts SET max_concurrency=?, reserve_percent=? WHERE label=?', a.max, a.reserve, a.label);
         return response({status: 'configured', updated_accounts: updates.length});
       });
     }

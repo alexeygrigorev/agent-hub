@@ -1,11 +1,31 @@
 import copy
 import datetime as dt
 import unittest
+from unittest.mock import patch
 from agent_hub_host import native_admission as admission
 from agent_hub_host.model_contract import configured_selection, policy_models
 
 
 class NativeAdmissionTest(unittest.TestCase):
+    def test_codex_configured_zero_reserve_admits_nine_and_blocks_zero(self):
+        for account in ('shared-codex', 'codex-orin'):
+            payload = dict(account=account, engine='codex', mode='interactive')
+            for remaining, allowed in ((9, True), (0, False)):
+                with self.subTest(account=account, remaining=remaining):
+                    quota = self.quota('codex')
+                    quota['codex']['windows']['7d']['percent_remaining'] = remaining
+                    result = admission.probe(payload, 'codex', account, 'codex', lambda _: quota)
+                    self.assertEqual(result['launch_allowed'], allowed)
+
+    def test_codex_reserve_configuration_is_binding_and_invalid_fails_closed(self):
+        payload = dict(account='shared-codex', engine='codex', mode='interactive')
+        quota = self.quota('codex')
+        quota['codex']['windows']['7d']['percent_remaining'] = 9
+        with patch.object(admission, 'reserve_percent', return_value=10):
+            self.assertFalse(admission.probe(payload, 'codex', 'shared-codex', 'codex', lambda _: quota)['launch_allowed'])
+        with patch.object(admission, 'reserve_percent', side_effect=ValueError('invalid')):
+            self.assertFalse(admission.probe(payload, 'codex', 'shared-codex', 'codex', lambda _: quota)['launch_allowed'])
+
     def quota(self, service):
         return {service: {'status': 'ok', 'details': {'limit_reached': False}, 'windows': {
             '5h': {'percent_remaining': 80, 'reset_at': (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=2)).isoformat()},

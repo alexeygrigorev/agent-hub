@@ -4,8 +4,8 @@ Enforces strict launcher interface qualification for root runs and job execution
 - Inspects maintained launcher interfaces (pinned commit, task profiles, the explicit parameters of
   ``execute_transient_task_unit``, adapter routes) and the pinned CAG Root script.
 - Reports actual supported/unsupported/unknown status and required minimal dependency packet (issue59).
-- Hard fail-closed gate: if root-run is unsupported or Codex quota window is unavailable/<=15%,
-  refuses before claim or processing. Never allows direct codex/API launch bypass.
+- Hard fail-closed gate: if root-run is unsupported or Codex quota window is unavailable/below the configured
+  weekly reserve (config/model-routing.json rules.reserve_percent), refuses before claim or processing. Never allows direct codex/API launch bypass.
 - Manages first-action evidence verification, native session binding, and execution tracking.
 """
 
@@ -26,7 +26,6 @@ from . import root_dispatch as rd
 from .root_dispatch import DispatchError
 from . import role_dispatch as rld
 
-CODEX_MIN_PERCENT: float = 15.0
 
 
 def get_first_action_digest(
@@ -486,6 +485,8 @@ class RuntimeManager:
             return False, f"quota gate script missing: {self.quota_gate_script}"
 
         try:
+            from .model_contract import reserve_percent
+            reserve = reserve_percent('codex')
             res = subprocess.run(
                 [sys.executable, str(self.quota_gate_script)],
                 capture_output=True,
@@ -513,7 +514,7 @@ class RuntimeManager:
                 if isinstance(win, dict) and win.get("present") is not False:
                     rem = win.get("percent_remaining")
                     if rem is not None and isinstance(rem, (int, float)):
-                        if rem <= CODEX_MIN_PERCENT:
+                        if rem <= reserve:
                             return False, f"codex window {win_name} below safety threshold"
 
             return True, "quota ok"

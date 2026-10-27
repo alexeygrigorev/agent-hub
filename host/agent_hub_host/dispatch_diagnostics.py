@@ -24,7 +24,7 @@ MESSAGES = {
     'admission_refused': 'Fresh admission refused this account or could not verify its timestamp and model.',
     'engine_auth_expired': 'The engine authentication is unavailable or expired.',
     'codex_quota_gate_quota_unavailable': 'The managed Codex account quota gate refused launch before execution.',
-    'codex_quota_gate_codex_reserve_15_percent_required': 'The managed Codex account is below the 15% weekly reserve.',
+    'codex_quota_gate_codex_reserve_required': 'The managed Codex account is below the configured weekly reserve.',
     'codex_quota_gate_stale_window_evidence': 'The managed Codex quota evidence is stale.',
     'codex_quota_gate_quota_check_failed': 'The managed Codex quota check failed.',
 }
