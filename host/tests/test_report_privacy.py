@@ -163,8 +163,24 @@ class ReportPrivacy(unittest.TestCase):
         from host.tests import test_tbm_routed_results as routed
         case=routed.RoutedResultsTests();case.setUp()
         try:
-            case.d._active_launches[OFFER]['exit_evidence']=dict(exit_code=0,log_tail='Routed audit complete')
-            results,_=case.reconcile()
+            # Drive the production catalog snapshot writer. Reconciliation
+            # deliberately reloads its authoritative durable journal, so an
+            # in-memory-only fixture is not terminal runtime evidence.
+            from types import SimpleNamespace
+            history=case.ws/'native/sessions'/NATIVE/'history.bin'
+            history.parent.mkdir(parents=True)
+            history.write_text('Routed audit complete')
+            record=case.d._active_launches[OFFER]
+            row=dict(id=record['native_id'],tag=record['tag'],workspace=record['workspace'],
+                     engine=record['engine'],created_at_ms=record['incarnation'],phase='exited',
+                     history_path=str(history),containment_empty=True,
+                     exit=dict(code=0,signal=None,exited_at_ms=record['incarnation']+1000))
+            case.d._session_progress=SimpleNamespace(sample=lambda *args:{})
+            with patch.object(case.d,'runner',return_value=[row]):
+                case.d._report_catalog_bindings()
+            restarted=case.dispatcher()
+            self.assertEqual(restarted._active_launches[OFFER]['exit_evidence']['exit_code'],0)
+            results,_=case.reconcile(restarted)
             self.assertEqual(results[0]['state'],'done')
             payload=case.request.call_args.args[2]
             self.assertEqual(payload['runtime']['exit_code'],0)

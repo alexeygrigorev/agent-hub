@@ -47,6 +47,12 @@ class RoutedResultsTests(unittest.TestCase):
         return result, cleanup
 
     def test_real_dispatch_journals_routed_task_before_returning_running(self):
+        # This Codex execution is a distinct launch from the seeded OpenCode
+        # task. Reusing a launch UUID across native identities is forbidden.
+        offer = '33333333-4444-4555-8666-777777777777'
+        native = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff'
+        seeded_path = self.journal / 'fleet-launches' / (OFFER + '.json')
+        seeded = seeded_path.read_bytes()
         settings = dict(self.settings, capabilities=[], workspaces={'demo': str(self.ws)}, subscriptions=[{
             'service': 'codex', 'account_label': 'shared-codex', 'engine': 'codex', 'profile': None,
             'admission_argv': ['maintained-gate'], 'launcher_provider': 'codex',
@@ -61,19 +67,21 @@ class RoutedResultsTests(unittest.TestCase):
             if 'plan' in argv:
                 return {'eligible': [{'provider': 'codex', 'model': 'gpt-6.1-sol', 'task_fit': 1.0}]}
             if 'run' in argv:
-                return {'receipt': {'session_id': NATIVE, 'state': 'running', 'first_action_verified': True,
-                                    'tag': 'task-hub-' + OFFER, 'workspace': str(self.ws),
+                return {'receipt': {'session_id': native, 'state': 'running', 'first_action_verified': True,
+                                    'tag': 'task-hub-' + offer, 'workspace': str(self.ws),
                                     'engine': 'codex', 'created_at_ms': 1700000000000,
                                     'model': 'gpt-6.1-sol', 'model_verified': True}}
             return {}
 
         d = Dispatcher(settings, Mock(return_value={}), runner, journal_dir=str(self.journal))
-        result = d.dispatch({'id': OFFER, 'engine': 'codex', 'account': 'shared-codex', 'profile': None,
+        result = d.dispatch({'id': offer, 'engine': 'codex', 'account': 'shared-codex', 'profile': None,
                              'workspace': 'demo', 'prompt': 'Read committed source.', 'mode': 'headless',
                              'task_id': JOB, 'needs': [], 'selection': {'id': 'sol', 'model': 'gpt-6.1-sol', 'effort': 'high'}})
         self.assertEqual(result['state'], 'running')
-        self.assertEqual(d._active_launches[OFFER]['routing_task_id'], JOB)
-        self.assertEqual(self.dispatcher()._active_launches[OFFER]['routing_task_id'], JOB)
+        self.assertEqual(d._active_launches[offer]['routing_task_id'], JOB)
+        self.assertEqual(self.dispatcher()._active_launches[offer]['routing_task_id'], JOB)
+
+        self.assertEqual(seeded_path.read_bytes(), seeded)
 
     def test_restart_delivers_task_result_and_settles_once(self):
         restarted = self.dispatcher()
