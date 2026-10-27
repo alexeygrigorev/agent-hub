@@ -32,6 +32,35 @@ describe('resource management',()=>{
 
 
 
+
+ it('bounds already-recorded exit reads to incoming native IDs despite retained history',async()=>fixture(async(r,sql)=>{
+  r.report('host',{samples:[sample()],reaps:[]});
+  sql.exec('UPDATE session_resource_usage SET finished_at=?',iso());
+  sql.exec(`WITH RECURSIVE retained(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM retained WHERE n<1001)
+    INSERT INTO session_resource_usage SELECT 'retained-'||n,machine_id,'retained-native-'||n,NULL,NULL,project,engine,model,tier,kind,started_at,finished_at,state,NULL,NULL,NULL,NULL,NULL,observed_at
+    FROM session_resource_usage,retained WHERE session_id='session'`);
+  let reads=0,queries=0;
+  const boundedSql:any={exec:(query:string,...args:any[])=>{
+   const cursor=sql.exec(query,...args);
+   if(query.startsWith('SELECT native_id FROM session_resource_usage')) return {toArray:()=>{const rows=cursor.toArray();reads+=rows.length;queries++;return rows;}};
+   return cursor;
+  }};
+  const observer=new ResourceManagement(boundedSql,()=>now);
+  observer.finishObserved('host',[{native_id:'native',phase:'exited',confirmed_exit:true}]);
+  expect(queries).toBe(1);expect(reads).toBe(1);
+ }));
+ it('excludes negative, fractional and unsafe token counts consistently from period totals',async()=>fixture(async(r,sql)=>{
+  r.report('host',{samples:[sample()],reaps:[]});
+  sql.exec('UPDATE session_resource_usage SET finished_at=?',iso(-1000));
+  sql.exec('INSERT INTO tbm_session_tokens VALUES(?,?,?,?,?,?,?,?,?)','host:native','native','agent','opencode','go',100,20,120,now);
+  for(const field of ['input_tokens','output_tokens','total_tokens']) for(const invalid of [-1,.5,9007199254740992]) {
+   sql.exec('UPDATE tbm_session_tokens SET input_tokens=100,output_tokens=20,total_tokens=120');
+   sql.exec('UPDATE tbm_session_tokens SET '+field+'=?',invalid);
+   expect(r.usage()[0]).toMatchObject({tokens_known:false,total_tokens:null,token_join_reason:'invalid_token_counts'});
+   expect(r.costTotals()['24h'].project[0]).toMatchObject({tokens_known_sessions:0,total_tokens:null});
+   expect(r.costTotals()['7d'].engine[0]).toMatchObject({tokens_known_sessions:0,total_tokens:null});
+  }
+ }));
  it('joins tokens and persists resource rows directly from confirmed Fleet catalog exits',async()=>fixture(async(r,sql,f)=>{
   sql.exec('DELETE FROM session_control_sessions');
   const native={native_id:'native',tag:'agent',workspace:'/repo',engine:'opencode',created_at_ms:now-600000,phase:'exited',confirmed_exit:true,agent_state:null,profile:null,account:'go',tokens:{input_tokens:100,output_tokens:20}};

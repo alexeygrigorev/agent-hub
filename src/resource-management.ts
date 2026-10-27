@@ -638,7 +638,12 @@ export class ResourceManagement {
   finishObserved(machine: string, natives: any[]) {
     const exits=natives.filter(native=>native.confirmed_exit===true && ['exited','dead'].includes(native.phase));
     if(!exits.length) return;
-    const recorded=new Set(this.sql.exec('SELECT native_id FROM session_resource_usage WHERE machine_id=? AND finished_at IS NOT NULL',machine).toArray().map((r:any)=>r.native_id));
+    const recorded=new Set<string>();
+    const ids=[...new Set(exits.map(native=>native.native_id))];
+    for(let i=0;i<ids.length;i+=100) {
+      const batch=ids.slice(i,i+100);
+      for(const row of this.sql.exec('SELECT native_id FROM session_resource_usage WHERE machine_id=? AND finished_at IS NOT NULL AND native_id IN ('+batch.map(()=>'?').join(',')+')',machine,...batch).toArray()) recorded.add(String(row.native_id));
+    }
     const pending=exits.filter(native=>!recorded.has(native.native_id));
     if(!pending.length) return;
     const sessions=new Map(this.canonicalSessions(machine).map(s=>[s.native_id,s]));
