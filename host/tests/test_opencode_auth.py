@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 from unittest.mock import patch
 
@@ -116,7 +117,12 @@ def proof_config(tmp_path):
     cfg['binary'] = str(binary)
     source = Path(cfg['source_data']) / 'opencode' / 'opencode.db'
     source.parent.mkdir(parents=True)
-    source.write_bytes(b'fixture-login-store')
+    with sqlite3.connect(source) as db:
+        db.execute('CREATE TABLE credential(id TEXT, integration_id TEXT,active INTEGER,'
+                   'time_created INTEGER,time_updated INTEGER,value TEXT)')
+        db.execute('INSERT INTO credential VALUES(?,?,?,?,?,?)',
+                   ('fixture-login', 'opencode', 1, 1, 1, json.dumps({'refresh': 'fixture-refresh'})))
+        db.execute('CREATE TABLE maintenance(value TEXT)')
     return cfg
 
 
@@ -216,8 +222,37 @@ def test_native_export_checkpoint_does_not_prevent_positive_proof(tmp_path):
         result = proof_native(cfg, args, env, payload)
         if args[:2] == ['auth', 'export']:
             source = Path(cfg['source_data']) / 'opencode' / 'opencode.db'
-            source.write_bytes(b'native-export-checkpoint')
-            Path(str(source) + '-wal').write_bytes(b'native-export-wal')
+            with sqlite3.connect(source) as db:
+                db.execute('INSERT INTO maintenance VALUES(?)', ('native-export-checkpoint',))
         return result
     auth.prepare(cfg, native=checkpointing_native)
     auth.prepare(cfg, native=lambda *a, **k: pytest.fail('export checkpoint must not defeat sharing'))
+
+
+def test_login_switch_during_export_never_attests_the_new_source_with_old_login(tmp_path):
+    cfg = proof_config(tmp_path)
+    def switched_native(cfg, args, env, payload=None):
+        result = proof_native(cfg, args, env, payload)
+        if args[:2] == ['auth', 'export']:
+            # Return A, but commit B before export returns. Deliberately keep
+            # id/active/timestamps unchanged: value hashing must catch this.
+            source = Path(cfg['source_data']) / 'opencode' / 'opencode.db'
+            with sqlite3.connect(source) as db:
+                db.execute('UPDATE credential SET value=?', (json.dumps({'refresh': 'different-login-B'}),))
+        return result
+    auth.prepare(cfg, native=switched_native)
+    assert not (Path(cfg['target_data']) / 'device-verification.json').exists()
+    with pytest.raises(ValueError, match='engine_auth_expired'):
+        auth.prepare(cfg, native=lambda *a, **k: [])
+
+
+def test_unsupported_native_revision_schema_disables_only_reuse(tmp_path):
+    cfg = proof_config(tmp_path)
+    source = Path(cfg['source_data']) / 'opencode' / 'opencode.db'
+    with sqlite3.connect(source) as db:
+        db.execute('DROP TABLE credential')
+    for _ in range(2):
+        assert auth.prepare(cfg, native=proof_native)['status'] == 'ok'
+    calls = (Path(cfg['target_data']) / 'fixture-calls.log').read_text().splitlines()
+    assert calls.count('auth export opencode') == 2
+    assert not (Path(cfg['target_data']) / 'device-verification.json').exists()

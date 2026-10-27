@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import stat
 import subprocess
 import tempfile
@@ -124,6 +125,46 @@ def _native(cfg, args, env, payload=None):
     return json.loads(raw) if raw.strip() else None
 
 
+def _source_login_revision(cfg):
+    """Read-only attestation of native credential revisions, never auth writes.
+
+    Export also writes unrelated native state, so database data_version/stat
+    alone cannot associate its output with a login. Hash bounded OpenCode
+    records before and after export/model verification. Values stay in memory;
+    only a digest is retained. An unsupported schema simply disables reuse.
+    """
+    source = Path(cfg['source_data']) / 'opencode' / 'opencode.db'
+    conn = None
+    try:
+        before = source.stat()
+        conn = sqlite3.connect(source.as_uri() + '?mode=ro', uri=True, timeout=0.2)
+        rows = conn.execute('SELECT id,active,time_created,time_updated,'
+                            'CASE WHEN length(CAST(value AS BLOB))<=1048576 THEN value END '
+                            'FROM credential WHERE integration_id=? ORDER BY id LIMIT 129', ('opencode',))
+        digest = hashlib.sha256()
+        count, size = 0, 0
+        for row in rows:
+            count += 1
+            value = row[4]
+            if count > 128 or not isinstance(value, str):
+                return None
+            raw = value.encode()
+            size += len(raw)
+            if size > 1048576:
+                return None
+            digest.update(json.dumps(row[:4]).encode())
+            digest.update(hashlib.sha256(raw).digest())
+        after = source.stat()
+        if not count or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            return None
+        return digest.hexdigest()
+    except (OSError, ValueError, TypeError, sqlite3.Error):
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def _verification_identity(cfg, *, source_only=False):
     """Bind a short positive proof to the installed binary and login store.
 
@@ -151,7 +192,10 @@ def _verification_identity(cfg, *, source_only=False):
         target = Path(cfg['target_data']) / 'opencode'
         result = {'config': cfg, 'binary': identity(cfg['binary']),
                   'source': identity(source),
-                  'source_wal': identity(str(source) + '-wal', optional=True)}
+                  'source_wal': identity(str(source) + '-wal', optional=True),
+                  'login_revision': _source_login_revision(cfg)}
+        if result['login_revision'] is None:
+            return None
         if not source_only:
             result.update(runtime=identity(target / 'opencode.db', contents=False),
                           legacy=identity(target / 'auth.json', optional=True),
@@ -194,11 +238,8 @@ def prepare(cfg, *, native=None):
             # A sibling may have completed verification while we waited.
             if _verified_recently(cfg):
                 return {'status': 'ok', 'reason': 'device_auth_verified'}
-            rows = native(cfg, ['auth', 'export', 'opencode'], environment(cfg, source=True))
-            # Native export can checkpoint/write its own SQLite/WAL. Bind the
-            # exported login after that command, then refuse reuse if the
-            # source changes during the remaining runtime/model verification.
             before = _verification_identity(cfg, source_only=True)
+            rows = native(cfg, ['auth', 'export', 'opencode'], environment(cfg, source=True))
             active = [r for r in rows if isinstance(r, dict) and r.get('active') is True
                       and r.get('integrationID') == 'opencode'] if isinstance(rows, list) else []
             if len(active) != 1:
@@ -231,9 +272,13 @@ def prepare(cfg, *, native=None):
                        and r.get('enabled') is True for r in models.get('data', [])):
                 raise ValueError()
             identity = _verification_identity(cfg)
-            source_keys = ('config', 'binary', 'source', 'source_wal')
+            # Native export can write/checkpoint unrelated SQLite state. The
+            # credential revision must stay stable across the ENTIRE check,
+            # including export; never attest login B with an export of A.
+            source_keys = ('config', 'binary', 'login_revision')
             if (identity is not None and before is not None
-                    and all(before[k] == identity[k] for k in source_keys)):
+                    and all(before[k] == identity[k] for k in source_keys)
+                    and before['source'][:4] == identity['source'][:4]):
                 private_fs.atomic_write(target / 'device-verification.json',
                     json.dumps({'identity': identity, 'verified_at': time.time()}).encode(), 8192)
         return {'status': 'ok', 'reason': 'device_auth_verified'}
