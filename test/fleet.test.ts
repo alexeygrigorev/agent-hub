@@ -42,6 +42,20 @@ async function configure(s: FleetService, shared = false) {
 }
 
 describe('generic accounts and launch placement', () => {
+  it.each(['headless', 'interactive'])('%s linked offers require private CLI provisioning', async (mode) => fixture(async (s, sql) => {
+    const id = crypto.randomUUID();
+    sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
+      VALUES(?,'test-admin','human','context',?,'{}','hetzner','codex','shared-codex',?,'demo','','offered',?,?)`, id, id, mode, iso(), iso());
+    sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,created_at,updated_at)
+      VALUES(?,'test-admin',?,?,?,'hetzner','codex',?,'offered',?,?)`, crypto.randomUUID(), id,
+      JSON.stringify({intake_task_id: crypto.randomUUID()}), id, mode, iso(), iso());
+    const offers: any = await (await s.handle(request('/offers', undefined, 'GET'), host('hetzner'))).json();
+    expect(offers.offers.find((o: any) => o.id === id)?.worker_credential_required).toBe(true);
+    sql.exec('UPDATE session_control_sessions SET request_json=? WHERE fleet_launch_id=?', '{}', id);
+    const unlinked: any = await (await s.handle(request('/offers', undefined, 'GET'), host('hetzner'))).json();
+    expect(unlinked.offers.find((o: any) => o.id === id)?.worker_credential_required).toBeUndefined();
+  }));
+
   it('changes real Fleet placement for banked deadlines and excludes only the depleted account', async () => fixture(async (service, sql) => {
     await configure(service);
     const quota = (pct: number, banked = false) => ({ status: 'ok', observed_at: iso(-1000),

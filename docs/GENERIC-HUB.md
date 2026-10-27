@@ -163,3 +163,23 @@ The standalone repository is `alexeygrigorev/agent-hub`. Historical dashboard, A
 The existing DTC OIDC variables in `wrangler.jsonc` identify a deployment, not generic product defaults. Keep provider accounts, machine IDs, workspace paths and role mappings in local/admin configuration. Preserve Worker name `agent-hub`, DO class `Hub` and instance name `hub` when moving the domain. Renaming them can create a different data store.
 
 Deploy to `https://hub.dtcdev.click` after the DNS zone, Cloudflare access and OIDC callback are configured. Keep `assets.run_worker_first=true` so static assets cannot bypass authentication. See [DEPLOY.md](DEPLOY.md) for the exact domain cutover and rollback steps. Do not change the contest demo's deployment or storage.
+
+### Intake context inside launched sessions
+
+A session linked with `--intake-task-id` receives a separate, refreshable agent
+credential before its engine starts, in both interactive and headless modes.
+The host requests it from the Hub after claiming the launch; it never copies a
+human or host credential into the session. The private profile contains the Hub
+origin and token pair in `.local/hub-worker-auth/<launch-id>.json` (owner only).
+The CLI discovers it from `APLEXER_TAG` (`hub-<id>` or `task-hub-<id>`) and
+`APLEXER_WORKSPACE`, including after the agent changes directory or a managed
+engine replaces HOME/XDG. The unprofiled Codex task-unit backend transports the non-secret
+`HUB_WORKER_CONFIG_FILE` selector through the maintained launcher EnvironmentFile
+because it has no native aplexer identity. Tokens never appear in prompts or command arguments.
+A missing profile fails closed without falling back to an operator login.
+
+Inside the session, `hub intake show <linked-id>` reads the task and its context.
+`hub intake append` permits note, report and blocker events on that task.
+Unrelated tasks, intake enumeration, decisions and closing remain forbidden.
+The existing scoped child-session rules and seven-day grant deadline also apply.
+An unlinked session has no intake grant; link the intake when requesting its start.

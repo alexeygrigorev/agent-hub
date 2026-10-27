@@ -1385,7 +1385,7 @@ export class FleetService {
           const choking = valid.length ? this.resources.resourceChoking(caller.machineId!) : null;
           return valid.map(row => {
             const request = parsed(row.request_json);
-            return { ...(row.mode === 'headless' && scopedWorkers.has(String(row.id)) ? { worker_credential_required: true } : {}),
+            return { ...(scopedWorkers.has(String(row.id)) ? { worker_credential_required: true } : {}),
               ...this.resources.cpuStart(String(row.id)), resource_choking: choking, resource_management: this.resources.config(),
               memory_estimate_mb: this.resources.estimate(request.project || String(row.workspace), String(row.engine), request.task_kind || 'goal'),
               selection: parsed(row.model_selection_json) ?? {}, id: row.id, engine: row.engine, account: row.account, profile: row.profile,

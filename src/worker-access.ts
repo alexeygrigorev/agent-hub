@@ -67,7 +67,7 @@ export class WorkerAccess {
       // and token freshness must be checked again inside the effect transaction.
       if (!this.hostAllowed(caller)) return reply({error:'host_credential_changed'},403);
       const launch: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id=? AND machine_id=?',id,caller.machineId!).toArray()[0];
-      if (!launch || launch.mode !== 'headless' || launch.state !== 'starting') return reply({error:'worker_launch_not_starting'},409);
+      if (!launch || !['headless','interactive'].includes(launch.mode) || launch.state !== 'starting') return reply({error:'worker_launch_not_starting'},409);
       const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE fleet_launch_id=?',id).toArray()[0];
       if (!session) return reply({error:'worker_session_required'},409);
       let intakeId: any; try { intakeId=JSON.parse(session.request_json).intake_task_id; } catch { return reply({error:'worker_intake_required'},409); }

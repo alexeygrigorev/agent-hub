@@ -4,7 +4,7 @@ import { sha256 } from '../src/auth/crypto';
 import type { Hub } from '../src/hub';
 import type { Env } from '../src/env';
 const uuid=()=>crypto.randomUUID();
-async function setup(fn: (x:any)=>Promise<void>) {
+async function setup(fn: (x:any)=>Promise<void>, mode = 'headless') {
  const stub=(env as unknown as Env).HUB.get((env as unknown as Env).HUB.idFromName('worker-'+uuid()));
  const id=uuid(), task=uuid(), session=uuid(), other=uuid();
  const token='hubt_host_fixture_'+uuid(), hash=await sha256(token), now=new Date().toISOString();
@@ -13,8 +13,8 @@ async function setup(fn: (x:any)=>Promise<void>) {
   h.sql.exec("INSERT INTO credentials(id,kind,token_hash,refresh_hash,family_id,subject,machine_id,scopes,created_by_sub,created_at,expires_at) VALUES('worker-host-cred','host',?,'fixture-refresh','host-family','worker-host','worker-host','[\"host\"]','fixture',?,?)",hash,now,new Date(Date.now()+3600000).toISOString());
   h.sql.exec("UPDATE machines SET credential_id='worker-host-cred' WHERE id='worker-host'");
   for(const t of [task,other]) h.sql.exec('INSERT INTO intake_tasks(id,data) VALUES(?,?)',t,JSON.stringify({id:t,project:'agent-hub',status:'open',version:1,created_at:Date.now(),updated_at:Date.now(),title:'fixture',scope:null,history:[{id:uuid(),kind:'intake',text:'fixture',authority:'untrusted_task_data',actor:'tester',captured_at:Date.now()}],acceptance_criteria:'read own task, append and forward'}));
-  h.sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at) VALUES(?,'tester','human','s',?,'{}','worker-host','opencode','shared-muse','headless','/repo','task','starting',?,?)`,id,'key-'+id,now,now);
-  h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,created_at,updated_at) VALUES(?,'tester',?,?,?,'worker-host','opencode','headless','starting',?,?)`,session,'session-'+session,JSON.stringify({intake_task_id:task,workspace:'/repo'}),id,now,now);
+  h.sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at) VALUES(?,'tester','human','s',?,'{}','worker-host','opencode','shared-muse',?,'/repo','task','starting',?,?)`,id,'key-'+id,mode,now,now);
+  h.sql.exec(`INSERT INTO session_control_sessions(id,actor,request_key,request_json,fleet_launch_id,machine_id,engine,mode,state,created_at,updated_at) VALUES(?,'tester',?,?,?,'worker-host','opencode',?,'starting',?,?)`,session,'session-'+session,JSON.stringify({intake_task_id:task,workspace:'/repo'}),id,mode,now,now);
  });
  const call=(path:string,body?:any,bearer=token)=>stub.fetch('https://hub.test'+path,{method:body===undefined?'GET':'POST',headers:{Authorization:'Bearer '+bearer,'Content-Type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})});
  const issue=await call('/api/fleet/launches/'+id+'/worker-credential',{});
@@ -23,7 +23,7 @@ async function setup(fn: (x:any)=>Promise<void>) {
  await fn({stub,id,task,session,other,worker,call});
 }
 describe('scoped durable worker access',()=>{
- it('reads only its intake and appends only notes/report/blocker, never decisions or close',()=>setup(async({task,other,worker,call}:any)=>{
+ it.each(['headless','interactive'])('%s reads only its intake and appends only notes/report/blocker, never decisions or close',(mode)=>setup(async({task,other,worker,call}:any)=>{
   const api=(p:string,b?:any)=>call(p,b,worker.access_token);
   expect((await api('/api/intake/tasks/'+task)).status).toBe(200);
   expect((await api('/api/intake/tasks/'+task+'/history')).status).toBe(200);
@@ -38,7 +38,19 @@ describe('scoped durable worker access',()=>{
   expect((await api('/api/intake/tasks/'+task+'/close',{key:uuid(),expected_version:version})).status).toBe(403);
   expect((await api('/api/fleet/launches',{})).status).toBe(403);
   expect((await api('/api/bus/claims')).status).toBe(403);
- }));
+ }, mode));
+ it.each(['headless','interactive'])('%s issuance refuses another host, a missing link, and a running launch',(mode)=>setup(async({stub,id,call}:any)=>{
+  const issue=()=>call('/api/fleet/launches/'+id+'/worker-credential',{});
+  await runInDurableObject<Hub, any>(stub,(h:any)=>h.sql.exec("UPDATE fleet_launches SET machine_id='other-host' WHERE id=?",id));
+  expect((await issue()).status).toBe(409);
+  await runInDurableObject<Hub, any>(stub,(h:any)=>{
+   h.sql.exec("UPDATE fleet_launches SET machine_id='worker-host' WHERE id=?",id);
+   h.sql.exec("UPDATE session_control_sessions SET request_json='{}' WHERE fleet_launch_id=?",id);
+  });
+  expect((await issue()).status).toBe(409);
+  await runInDurableObject<Hub, any>(stub,(h:any)=>h.sql.exec("UPDATE fleet_launches SET state='running' WHERE id=?",id));
+  expect((await issue()).status).toBe(409);
+ }, mode));
  it('retains binding through normal refresh and fails closed after scope expiry',()=>setup(async({stub,task,other,worker,call}:any)=>{
   const refreshed=await stub.fetch('https://hub.test/api/token/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({grant_type:'refresh_token',refresh_token:worker.refresh_token})});
   expect(refreshed.status,await refreshed.clone().text()).toBe(200);

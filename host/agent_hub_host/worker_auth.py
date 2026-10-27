@@ -13,10 +13,21 @@ import re
 import time
 from . import private_fs
 
-LAUNCH = re.compile(r'task-hub-([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\Z')
+# Both native launch identities use the same private, per-launch profile.
+# Interactive engines publish hub-<id>; maintained headless uses task-hub-<id>.
+LAUNCH = re.compile(r'(?:task-)?hub-([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\Z')
 
 
 def config_path():
+    # The task-unit backend has no native aplexer identity. Its supported
+    # EnvironmentFile transport carries only this non-secret profile selector.
+    explicit = os.environ.get('HUB_WORKER_CONFIG_FILE')
+    if explicit:
+        path = Path(explicit)
+        if (not path.is_absolute() or path.parent.name != 'hub-worker-auth'
+                or not LAUNCH.fullmatch('hub-' + path.stem) or path.suffix != '.json'):
+            raise ValueError('Invalid worker profile selector')
+        return path
     match = LAUNCH.fullmatch(os.environ.get('APLEXER_TAG', ''))
     if not match:
         return None

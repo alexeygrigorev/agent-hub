@@ -48,7 +48,7 @@ class WorkerAuthTests(unittest.TestCase):
             path = auth.provision(tmp, OFFER, request)
             with patch.object(Path, 'cwd', return_value=root), patch.dict(os.environ, {
                 'HOME': str(root / 'managed'), 'XDG_CONFIG_HOME': str(root / 'managed/.config'),
-                'APLEXER_TAG': 'task-hub-' + OFFER, 'APLEXER_WORKSPACE': '',
+                'APLEXER_TAG': 'hub-' + OFFER, 'APLEXER_WORKSPACE': '',
             }), patch.dict(sys.modules, {'agent_hub_host.worker_auth': auth}):
                 # Explicit profile override is a separate supported operator path.
                 with patch.dict(os.environ, {}, clear=False):
@@ -79,8 +79,11 @@ class WorkerAuthTests(unittest.TestCase):
         with patch.dict(os.environ, {'APLEXER_TAG':'task-hub-'+OFFER,
                                      'APLEXER_WORKSPACE':'/repo'}):
             self.assertEqual(auth.config_path(), Path('/repo/.local/hub-worker-auth') / (OFFER+'.json'))
-        with patch.dict(os.environ, {'APLEXER_TAG':'hub-'+OFFER}):
-            self.assertIsNone(auth.config_path())
+        with patch.dict(os.environ, {'APLEXER_TAG':'hub-'+OFFER, 'APLEXER_WORKSPACE':'/repo'}):
+            self.assertEqual(auth.config_path(), Path('/repo/.local/hub-worker-auth') / (OFFER+'.json'))
+        for tag in ['hub-not-a-launch', 'task-hub-'+OFFER+'-other', 'unrelated-'+OFFER]:
+            with patch.dict(os.environ, {'APLEXER_TAG':tag}):
+                self.assertIsNone(auth.config_path())
 
     def test_missing_worker_profile_does_not_fall_back_to_host_or_human(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {

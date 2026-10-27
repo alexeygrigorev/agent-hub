@@ -2434,6 +2434,12 @@ class Dispatcher:
             payload = {"goal": goal, "owner": "hub-fleet", "cwd": str(target_cwd), "timeout": 7200,
                        "model_requirements": {"providers": [sub["launcher_provider"]], "models": [sub["launcher_model"]]},
                        "profile": "model-task", "memory_mb": 1500}
+            if profile is None and sub.get('launcher_provider') == 'codex' and offer.get('worker_credential_required') is True:
+                # Task units do not publish APLEXER_TAG/WORKSPACE. Pass only a
+                # file selector via the launcher's private EnvironmentFile, never
+                # a token or an operator profile. Minting still follows claim.
+                payload['extra_env'] = {'HUB_WORKER_CONFIG_FILE': str(
+                    workspace / '.local' / 'hub-worker-auth' / (offer_id + '.json'))}
             # Explicit maintained-launcher request: managed Codex otherwise
             # defaults to 4096 MiB, above Hub's 1500 MiB worker contract.
             # Resource-management placement hints from the Hub offer (server
@@ -2534,7 +2540,7 @@ class Dispatcher:
         log_offsets = capture_log_offsets(sub.get("launcher_provider"))
         launched_at_ts = time.time()
         try:
-            if mode == 'headless' and offer.get('worker_credential_required') is True:
+            if offer.get('worker_credential_required') is True:
                 from .worker_auth import provision
                 try:
                     provision(str(workspace), offer_id, self.request)
