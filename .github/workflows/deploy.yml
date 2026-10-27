@@ -181,7 +181,7 @@ jobs:
           Path('.local').mkdir(exist_ok=True)
           Path('.local/dev-wrangler.json').write_text(json.dumps(config))
           PYDEV
-          npx wrangler deploy --config .local/dev-wrangler.json --tag "$(git rev-parse --short=12 HEAD)" --message "source_commit=$(git rev-parse HEAD)"
+          python3 scripts/ci/wrangler_retry.py npx wrangler deploy --config .local/dev-wrangler.json --tag "$(git rev-parse --short=12 HEAD)" --message "source_commit=$(git rev-parse HEAD)"
           python3 - <<'PYDEV'
           import json, os, re, time, urllib.error, urllib.request
           base = 'https://agent-hub-dev.cloudflare-ai-agent-de9ca0.workers.dev'
@@ -249,12 +249,13 @@ jobs:
           FULL_SHA=$(git rev-parse HEAD)
           if [ "${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true }}" = "true" ]; then
             echo "Dry-run deployment requested..."
+            # Local bundle validation only: no Cloudflare API request, so no retry.
             npx wrangler deploy --dry-run --outdir dist
           else
             echo "Deploying Worker agent-hub: tag=$SHORT_SHA source_commit=$FULL_SHA"
-            npx wrangler deploy --tag "$SHORT_SHA" --message "source_commit=$FULL_SHA"
+            python3 scripts/ci/wrangler_retry.py npx wrangler deploy --tag "$SHORT_SHA" --message "source_commit=$FULL_SHA"
             echo "Deployment succeeded. Current active versions:"
-            npx wrangler versions list
+            python3 scripts/ci/wrangler_retry.py npx wrangler versions list
           fi
 
       - name: Verify production Hub health
