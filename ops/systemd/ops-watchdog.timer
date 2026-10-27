@@ -1,0 +1,10 @@
+[Unit]
+Description=15-minute dead-session watchdog for ops Claude sessions
+
+[Timer]
+OnCalendar=*:0/15
+RandomizedDelaySec=60
+Persistent=false
+
+[Install]
+WantedBy=timers.target

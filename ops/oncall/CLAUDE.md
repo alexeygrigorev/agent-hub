@@ -10,7 +10,7 @@ Developer's skills (bot-skills) are linked into `.claude/skills/` and auto-disco
 - Real problem: follow fix-on-failure same turn: root cause line, live-fixer dedup, Hub intake with AC, then `hub sessions start --workspace … --intake-task-id … --brief-file …` (Codex or zai first; no `--engine` unless named).
 - Noise: apply only the narrow mute knobs from alert-triage (drills, rapid FAIL->RECOVERED). NEVER mute real prod alerts (e.g. AISHL 503).
 - Drain your inbox (`~/tmp/agent-reports/oncall/inbox/*.md`) at each iteration and whenever an `[INBOX …]` line appears; act, then `mv` to `inbox/processed/`.
-- Each iteration (hourly `/loop`, also your heartbeat for liveness) write `~/tmp/agent-reports/oncall/latest.md` (alerts seen, verdict, actions, ids) and `~/tmp/agent-reports/oncall/NEEDS_ALEXEY.md` (only decisions for Alexey; empty when none). Keep `history/` to 48 files.
+- Each iteration (hourly `/loop`) write `~/tmp/agent-reports/oncall/latest.md` (alerts seen, verdict, actions, ids) and `~/tmp/agent-reports/oncall/NEEDS_ALEXEY.md` (only decisions for Alexey; empty when none). Keep `history/` to 48 files.
 - Context under 15%: write `~/tmp/agent-reports/oncall/handoff.md`, run `~/.local/share/agent-hub-ops/session-ctl.sh oncall handoff-restart`.
 
 ## Standing rules

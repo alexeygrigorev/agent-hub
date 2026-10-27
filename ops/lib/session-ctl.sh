@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Shared control for the two interactive Claude ops sessions.
 #   session-ctl.sh <orchestrator|oncall> <start|ensure|check|status|restart|handoff-restart|skills-sync>
+# Watchdog (check) only restarts a dead session; the in-session /loop is the scheduler.
 # Needs: a (aplexer), git, gh, python3. Never prints secrets.
 set -uo pipefail
 
@@ -14,8 +15,7 @@ BASE_REPO="${BASE_REPO:-$HOME/git/agent-hub}"           # donor clone for the ru
 SKILLS_REPO="${SKILLS_REPO:-$HOME/git/bot-skills-ops}"   # read-only clone of alexeygrigorev/bot-skills (~/git/bot-skills is NOT a git repo)
 ENGINE="${ORCH_ENGINE:-sonnet}"                          # cost config: sonnet, explicit
 LOOP_INTERVAL="${LOOP_INTERVAL:-1h}"
-STALE_SEC="${STALE_SEC:-7200}"                           # latest.md older than this => hung
-MIN_RESTART_GAP="${MIN_RESTART_GAP:-1800}"
+MIN_RESTART_GAP="${MIN_RESTART_GAP:-600}"
 STATE="$REPORTS/state"; mkdir -p "$REPORTS/inbox/processed" "$REPORTS/history" "$STATE"
 log() { echo "[$(date -u +%FT%TZ)] $ROLE: $*"; }
 t() { timeout "${T:-60}" "$@"; }
@@ -26,7 +26,7 @@ import json,sys
 w,t=sys.argv[1:3]
 for s in json.load(sys.stdin):
     if s.get("workspace")==w and s.get("tag")==t and s.get("phase")=="running":
-        print(s["id"]); break' "$RUNDIR" "$TAG"
+        print(s["id"]); break' "$RUNDIR/$SUB" "$TAG"
 }
 
 skills_sync() {
@@ -63,7 +63,7 @@ start() {
   prep_worktree || return 1
   [ -n "$(find_session)" ] && { log "already running: $(find_session)"; return 0; }
   date +%s > "$STATE/last_start"
-  a start --workspace "$RUNDIR" --cwd "$RUNDIR/$SUB" --tag "$TAG" --engine "$ENGINE" \
+  a start --workspace "$RUNDIR/$SUB" --tag "$TAG" --engine "$ENGINE" \
     --label "ops.role=$ROLE" --label "hub.intake=$INTAKE" >/dev/null || { log "a start failed"; return 1; }
   local id; id=$(find_session); [ -n "$id" ] || { log "session not found after start"; return 1; }
   log "started session $id; waiting for prompt"
@@ -86,7 +86,7 @@ make_handoff() {  # $1 = reason; keeps a hand-written handoff.md if it is newer 
   local h="$REPORTS/handoff.md" ls_ts; ls_ts=$(cat "$STATE/last_start" 2>/dev/null || echo 0)
   if [ -f "$h" ] && [ "$(stat -c %Y "$h")" -gt "$ls_ts" ]; then log "using existing fresh handoff.md"; return; fi
   { echo "# Auto handoff ($(date -u +%FT%TZ)) reason: $1"
-    echo "A previous $TAG session was restarted by the liveness script. Re-read CLAUDE.md, finish unprocessed inbox items, continue the loop."
+    echo "A previous $TAG session was restarted by the watchdog. Re-read CLAUDE.md, finish unprocessed inbox items, continue the loop."
     echo; echo "## Previous latest.md"; cat "$REPORTS/latest.md" 2>/dev/null || echo "(none)"
     echo; echo "## Previous NEEDS_ALEXEY.md"; cat "$REPORTS/NEEDS_ALEXEY.md" 2>/dev/null || echo "(none)"
     echo; echo "## Unprocessed inbox"; ls "$REPORTS/inbox" 2>/dev/null | grep -v '^processed$' || true
@@ -99,17 +99,12 @@ restart() {  # $1 = reason
   make_handoff "${1:-manual}"; stop_old; start
 }
 
-check() {  # liveness: alive and not hung. Nothing else.
-  local id age; id=$(find_session)
-  if [ -z "$id" ]; then log "DEAD (no running session)"; restart "pane dead/missing"; return; fi
+check() {  # watchdog: restart ONLY a dead session. /loop inside the session is the scheduler.
+  local id; id=$(find_session)
+  if [ -z "$id" ]; then log "DEAD (no running session)"; restart "session process dead/missing"; return; fi
   local alive; alive=$(a status "$id" --json 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin).get("worker_alive"))' 2>/dev/null)
   [ "$alive" = "True" ] || { log "DEAD (worker not alive)"; restart "worker dead"; return; }
-  local ls_ts now; now=$(date +%s); ls_ts=$(cat "$STATE/last_start" 2>/dev/null || echo 0)
-  age=$(( now - $(stat -c %Y "$REPORTS/latest.md" 2>/dev/null || echo 0) ))
-  if [ $((now-ls_ts)) -gt "$STALE_SEC" ] && [ "$age" -gt "$STALE_SEC" ]; then
-    log "HUNG (latest.md ${age}s old, limit ${STALE_SEC}s)"; restart "hung: latest.md ${age}s old"; return
-  fi
-  log "OK session=$id latest.md_age=${age}s"
+  log "OK session=$id"
 }
 
 case "$CMD" in

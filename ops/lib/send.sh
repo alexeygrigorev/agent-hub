@@ -6,8 +6,8 @@
 # session drains it on its next loop), 1 = could not save.
 set -uo pipefail
 case "$(basename "$0")" in
-  orch-send)   ROLE=orchestrator; TAG=orchestrator-main; RUNDIR="$HOME/git/agent-hub-wt-orchestrator-run" ;;
-  oncall-send) ROLE=oncall;       TAG=oncall-engineer;   RUNDIR="$HOME/git/agent-hub-wt-oncall-run" ;;
+  orch-send)   ROLE=orchestrator; TAG=orchestrator-main; RUNDIR="$HOME/git/agent-hub-wt-orchestrator-run"; SUB=ops/orchestrator ;;
+  oncall-send) ROLE=oncall;       TAG=oncall-engineer;   RUNDIR="$HOME/git/agent-hub-wt-oncall-run"; SUB=ops/oncall ;;
   *) echo "run as orch-send or oncall-send" >&2; exit 64 ;;
 esac
 INBOX="$HOME/tmp/agent-reports/$ROLE/inbox"; mkdir -p "$INBOX/processed"
@@ -32,7 +32,7 @@ sid=$(a list --json 2>/dev/null | python3 -c '
 import json,sys
 w,t=sys.argv[1:3]
 for s in json.load(sys.stdin):
-    if s.get("workspace")==w and s.get("tag")==t and s.get("phase")=="running": print(s["id"]); break' "$RUNDIR" "$TAG")
-if [ -z "$sid" ]; then echo "DELIVERY=not-delivered (no running $TAG session; liveness cron will restart it, item stays in inbox)"; exit 2; fi
+    if s.get("workspace")==w and s.get("tag")==t and s.get("phase")=="running": print(s["id"]); break' "$RUNDIR/$SUB" "$TAG")
+if [ -z "$sid" ]; then echo "DELIVERY=not-delivered (no running $TAG session; watchdog will restart it, item stays in inbox)"; exit 2; fi
 if timeout 60 a send "$sid" "$msg" --enter >/dev/null 2>&1; then echo "DELIVERY=delivered to $TAG ($sid)"; exit 0
 else echo "DELIVERY=not-delivered (a send rc=$?; item stays in inbox, drained next loop)"; exit 2; fi

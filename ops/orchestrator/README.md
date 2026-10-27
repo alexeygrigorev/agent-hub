@@ -16,7 +16,7 @@ Reports dir layout: `latest.md`, `NEEDS_ALEXEY.md`, `handoff.md`, `history/` (ma
 ```bash
 git -C ~/git/agent-hub fetch origin && ops/install.sh   # from any checkout of origin/main
 ```
-Copies `session-ctl.sh`, `liveness.sh` to `~/.local/share/agent-hub-ops/`, `orch-send` / `oncall-send` to `~/bin/`, installs and enables the user timer `ops-liveness.timer`.
+Copies `session-ctl.sh`, `watchdog.sh` to `~/.local/share/agent-hub-ops/`, `orch-send` / `oncall-send` to `~/bin/`, installs and enables the user timer `ops-watchdog.timer`.
 
 ## Start
 ```bash
@@ -34,8 +34,8 @@ Claude Code syntax (checked from the `loop` skill and live in the pane): `/loop 
 ## Skills (AC14)
 Source: clone of `alexeygrigorev/bot-skills` at `~/git/bot-skills-ops` (note: `~/git/bot-skills` is not a git repo on Hetzner). `session-ctl.sh <role> skills-sync` runs `git pull --ff-only` and symlinks every `<skill>/SKILL.md` directory into `<run dir>/.claude/skills/` (project skills, auto-discovered by Claude Code; the dir is git-excluded in the run worktree). It runs on every start/restart (so restarts come back with the same skills) and as step 0 of each loop iteration. Both CLAUDE.md files list the skills to read and follow. If a pull fails the last checkout is used and logged.
 
-## Liveness cron (AC4)
-`ops-liveness.timer` (user, `OnCalendar=hourly`) -> `ops-liveness.service` -> `flock -n` + `timeout 900` + `nice -n 10` + `ionice -c3` -> `liveness.sh`. For each role it only checks: session running, worker alive, and `latest.md` not older than 2h (grace of 2h after a start). Dead or hung => write `handoff.md` (from `latest.md`, `NEEDS_ALEXEY.md`, inbox listing; a fresher hand-written handoff is kept), kill the old session, start a new one (skills + `/loop` re-issued). Restarts are rate limited (30 min). Manual run: `systemctl --user start ops-liveness.service`; logs: `journalctl --user -u ops-liveness.service`. Timers: `systemctl --user list-timers ops-liveness.timer`.
+## Scheduler and watchdog (AC4)
+**`/loop` inside the interactive session is the scheduler.** There is no external cron that re-prompts or does work. The only external piece is a tiny restart-if-dead watchdog: `ops-watchdog.timer` (user, every 15 min) -> `ops-watchdog.service` -> `flock -n` + `timeout 900` + `nice -n 10` + `ionice -c3` -> `watchdog.sh` -> `session-ctl.sh <role> check`. It only tests that the session process is running and its worker alive. Dead/missing => write `handoff.md` (from `latest.md`, `NEEDS_ALEXEY.md`, inbox listing; a fresher hand-written handoff is kept), start a new session (skills synced, `/loop` re-issued). Restarts are rate limited (10 min). The unit sets `APLEXER_LAUNCH_SYSTEM_SCOPE=system` so sessions it starts do not die with the oneshot unit's cgroup. Manual run: `systemctl --user start ops-watchdog.service`; logs: `journalctl --user -u ops-watchdog.service`; `systemctl --user list-timers ops-watchdog.timer`.
 
 ## Restart / handoff (AC3)
 - Context under 15%: the session writes `handoff.md` and runs `session-ctl.sh <role> handoff-restart` (detached; kills itself and starts a fresh one, which reads the handoff in step 0).
@@ -55,7 +55,7 @@ oncall-send "text"                                                            # 
 This host cannot read `dev@dtcdev.click` or any alert mailbox: only `msmtp` (send-only) is installed; there is no IMAP client, Maildir, mbsync/fetchmail config, and no Gmail API reader. Missing: a read-only mailbox path (IMAP read credentials or Gmail API read scope for dev@dtcdev.click / the alert label) provisioned for a non-secret-printing fetcher by Alexey. Until then alerts arrive via `oncall-send` (Grok Bot forwards dev@ mail) and, later, the Hub webhook->session routing intake. Credential files were deliberately not read.
 
 ## Moving to another host
-Pick a host with the Hub-validated resource floors, `a`, `claude`, `hub`, `gh` logged in and the repo clone `~/git/agent-hub`. Run `ops/install.sh`, copy `~/tmp/agent-reports/{orchestrator,oncall}` (handoff + inbox), stop the old sessions (`session-ctl.sh <role> status`, `a kill <id>`; ask Alexey first), run `start.sh` on the new host, point Grok Bot's `orch-send`/`oncall-send` at the new host (ssh wrapper). Disable the timer on the old host: `systemctl --user disable --now ops-liveness.timer`.
+Pick a host with the Hub-validated resource floors, `a`, `claude`, `hub`, `gh` logged in and the repo clone `~/git/agent-hub`. Run `ops/install.sh`, copy `~/tmp/agent-reports/{orchestrator,oncall}` (handoff + inbox), stop the old sessions (`session-ctl.sh <role> status`, `a kill <id>`; ask Alexey first), run `start.sh` on the new host, point Grok Bot's `orch-send`/`oncall-send` at the new host (ssh wrapper). Disable the timer on the old host: `systemctl --user disable --now ops-watchdog.timer`.
 
 ## Playbook: Grok Bot limits running out (AC13)
 Also a bot-skills skill: `grok-limits-playbook`.

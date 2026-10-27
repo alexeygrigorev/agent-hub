@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Hourly liveness for orchestrator-main and oncall-engineer. ONLY alive/not-hung check + restart with handoff.
+# Tiny restart-if-dead watchdog. NOT a scheduler: Claude Code's /loop inside each session does the periodic work.
 set -uo pipefail
 CTL="$(dirname "$(readlink -f "$0")")/session-ctl.sh"
 rc=0
