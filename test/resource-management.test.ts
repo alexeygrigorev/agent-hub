@@ -30,6 +30,29 @@ const closeIntake=(sql:any)=>sql.exec("UPDATE intake_tasks SET data=json_set(dat
 describe('resource management',()=>{
 
 
+
+
+ it('joins tokens and persists resource rows directly from confirmed Fleet catalog exits',async()=>fixture(async(r,sql,f)=>{
+  sql.exec('DELETE FROM session_control_sessions');
+  const native={native_id:'native',tag:'agent',workspace:'/repo',engine:'opencode',created_at_ms:now-600000,phase:'exited',confirmed_exit:true,agent_state:null,profile:null,account:'go',tokens:{input_tokens:100,output_tokens:20}};
+  const response=await f.handle(new Request('https://hub.test/api/fleet/sessions',{method:'PUT',body:JSON.stringify({sessions:[native]})}),{caller:{kind:'host',machineId:'host',actor:'host:host'},scopes:['host']});
+  expect(response.status).toBe(200);
+  expect(r.usage()).toHaveLength(1);
+  expect(r.usage()[0]).toMatchObject({state:'exited',finished_at:iso(),tokens_known:true,total_tokens:120,cpu_seconds:null,peak_rss_mb:null});
+ }));
+ it('records confirmed Fleet native death while the routed task remains running, without samples',async()=>fixture(async(r,sql)=>{
+  sql.exec('DELETE FROM session_control_sessions');
+  sql.exec('UPDATE fleet_sessions SET created_at_ms=?',now-600000);
+  const native={native_id:'native',tag:'agent',workspace:'/repo',engine:'opencode',created_at_ms:now-600000,phase:'exited',confirmed_exit:true};
+  for(const mismatch of [{confirmed_exit:false},{tag:'other'},{workspace:'/other'},{engine:'codex'},{created_at_ms:now}]) {
+   r.finishObserved('host',[{...native,...mismatch}]); expect(r.usage()).toHaveLength(0);
+  }
+  r.finishObserved('host',[native]); r.finishObserved('host',[native]);
+  expect(r.usage()).toHaveLength(1);
+  expect(r.usage()[0]).toMatchObject({session_id:'fleet:launch',finished_at:iso(),state:'exited',peak_rss_mb:null,cpu_seconds:null});
+  expect(sql.exec("SELECT state FROM fleet_launches WHERE id='launch'").one().state).toBe('running');
+  expect(sql.exec('SELECT COUNT(*) AS n FROM session_control_sessions').one().n).toBe(0);
+ }));
  it('aggregates the full finish window beyond the 500-row table with honest token coverage',async()=>fixture(async(r,sql)=>{
   r.report('host',{samples:[sample()],reaps:[]});
   sql.exec("UPDATE session_resource_usage SET finished_at=?",iso(-1000));

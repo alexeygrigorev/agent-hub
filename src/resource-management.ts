@@ -632,6 +632,32 @@ export class ResourceManagement {
     }
     return {saved:true,evidence_id:value.id};
   }
+  /** Account for a confirmed native exit even when the process was never
+   * sampled. This records costs only; routed task completion and stop authority
+   * still belong to their existing services. */
+  finishObserved(machine: string, natives: any[]) {
+    const exits=natives.filter(native=>native.confirmed_exit===true && ['exited','dead'].includes(native.phase));
+    if(!exits.length) return;
+    const recorded=new Set(this.sql.exec('SELECT native_id FROM session_resource_usage WHERE machine_id=? AND finished_at IS NOT NULL',machine).toArray().map((r:any)=>r.native_id));
+    const pending=exits.filter(native=>!recorded.has(native.native_id));
+    if(!pending.length) return;
+    const sessions=new Map(this.canonicalSessions(machine).map(s=>[s.native_id,s]));
+    const finished=pending.flatMap(native=>{
+      const session=sessions.get(native.native_id);
+      if(!session || native.confirmed_exit!==true || !['exited','dead'].includes(native.phase)
+        || !Number.isFinite(native.created_at_ms) || native.created_at_ms!==session.native_created_at_ms
+        || native.tag!==session.tag || native.workspace!==session.workspace || native.engine!==session.engine) return [];
+      return [{session,native}];
+    });
+    if(!finished.length) return;
+    const at=new Date(this.now()).toISOString();
+    // Reuse the same native-unique upsert and metadata rules as measurements.
+    for(let i=0;i<finished.length;i+=200) this.report(machine,{samples:finished.slice(i,i+200).map(({session})=>({
+      session_id:session.session_id,native_id:session.native_id,observed_at:at})),reaps:[]});
+    for(const {session,native} of finished) this.sql.exec(`UPDATE session_resource_usage SET
+      state=CASE WHEN finished_at IS NULL THEN ? ELSE state END,finished_at=COALESCE(finished_at,?)
+      WHERE machine_id=? AND native_id=?`,native.phase,at,machine,session.native_id);
+  }
   report(machine: string, value: any) {
     // Accept reports already in flight under an older canonical alias, but put
     // every physical native in exactly one durable ledger row.
