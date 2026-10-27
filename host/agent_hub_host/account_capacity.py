@@ -79,6 +79,9 @@ def reconcile_launcher_retired(dispatcher, row, cwd, *, dry_run=False):
                               created_at_ms=binding['incarnation'], engine=binding['engine']).validated()
         retired, _, _ = verify_native_retirement(dispatcher.settings.get('aplexer_bin', 'aplexer'), target,
                                                 state_dir=dispatcher.settings.get('aplexer_state_dir'))
+        if not retired and row.get('mode') == 'headless':
+            from .terminal_reports import retained_terminal_exit
+            retired, _, _ = retained_terminal_exit(dispatcher, target)
         if not retired:
             return False
         if dry_run:
@@ -107,6 +110,9 @@ def reconcile_retired(dispatcher, row, *, dry_run=False):
                               created_at_ms=binding['native_created_at_ms'], engine=row['engine']).validated()
         retired, _, _ = verify_native_retirement(dispatcher.settings.get('aplexer_bin', 'aplexer'), target,
                                                 state_dir=dispatcher.settings.get('aplexer_state_dir'))
+        if not retired and row.get('mode') == 'headless':
+            from .terminal_reports import retained_terminal_exit
+            retired, _, _ = retained_terminal_exit(dispatcher, target)
         if not retired:
             return False
         if dry_run:
@@ -181,7 +187,7 @@ def reconcile_headless_retired(dispatcher, row, target):
         return False
     record['result_path'] = result_path
     dispatcher._persist_launch_record(record)
-    results = dispatcher.reconcile_launches(offer_ids={offer_id})
+    results = dispatcher.reconcile_launches(offer_ids={offer_id}, terminal_only=True)
     return any(item.get('id') == offer_id and item.get('reconciled') is True for item in results)
 
 

@@ -109,6 +109,26 @@ class WedgedStartingTests(unittest.TestCase):
         self.assertEqual(result['runtime']['outcome'], 'reported')
         self.assertTrue((self.ws / '.local/hub-results' / (self.offer + '.json')).exists())
 
+    def test_lost_receipt_with_retained_terminal_record_uses_full_runtime_path(self):
+        self.completed()
+        self.receipt['native_status']='dead'
+        history=self.ws/'native/sessions'/self.native/'history.bin'
+        history.parent.mkdir(parents=True);history.write_text('Kept final output')
+        row=dict(id=self.native,tag='task-'+self.task,workspace=str(self.ws),engine='opencode',
+                 created_at_ms=1793016446093,phase='exited',worker_alive=False,
+                 containment_empty=True,processes=0,worker_pid=99999999,workload_pid=99999998,
+                 history_path=str(history),exit=dict(code=0,signal=None,exited_at_ms=1793016447393))
+        self.d.runner.side_effect=lambda argv,**kwargs:[row] if 'list' in argv else self.receipt if 'reconcile' in argv else self.status
+        with patch('agent_hub_host.retired_native.verify_native_retirement',return_value=(False,None,'retained')),             patch('agent_hub_host.fleet.verify_native_retirement',return_value=(False,None,'retained')):
+            out=reconcile_claimed_launch(self.d,self.row)
+        self.assertEqual(out['state'],'exited')
+        payload=self.d.request.call_args.args[2]
+        self.assertEqual(payload['report_status'],'done')
+        self.assertEqual(payload['runtime']['exit_code'],0)
+        self.assertEqual(payload['runtime']['wall_time_ms'],1300)
+        self.assertEqual(payload['runtime']['log_tail'],'Kept final output')
+        self.assertTrue(history.is_file())
+
     def test_nested_cwd_lost_receipt_uses_root_result_and_durable_full_replay(self):
         self.completed()
         nested = self.ws / 'nested'; nested.mkdir()

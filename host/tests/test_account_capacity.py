@@ -51,7 +51,52 @@ class AccountCapacityTests(unittest.TestCase):
             with self.subTest(entry=entry):
                 self._assert_persisted_failure_recovers(cwd='nested', entry=entry)
 
-    def _assert_persisted_failure_recovers(self, cwd=None, entry='launcher'):
+    def test_retained_first_action_failure_recovers_through_both_exact_bindings(self):
+        for entry in ['launcher', 'server']:
+            with self.subTest(entry=entry):
+                self._assert_persisted_failure_recovers(entry=entry, retained=True)
+
+    def test_fast_terminal_lane_promotes_real_unbound_retained_spawn_without_maintenance(self):
+        from agent_hub_host.fleet import Dispatcher
+        from agent_hub_host.terminal_reports import poll
+        with tempfile.TemporaryDirectory() as tmp:
+            settings,offer,original=self._real_failed_dispatch(tmp)
+            native='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+            binding=dict(task_id='hub-'+offer,native_id=native,tag='task-hub-'+offer,
+                         workspace=tmp,incarnation=1000,engine='opencode')
+            status=dict(state='failed',payload=dict(owner='hub-fleet',cwd=tmp),native_binding=binding)
+            row=dict(id=offer,engine='opencode',mode='headless',workspace='main',diagnostic=original['diagnostic'])
+            history=Path(tmp)/'native/sessions'/native/'history.bin'
+            history.parent.mkdir(parents=True);history.write_text('Partial spawned task')
+            kept=dict(id=native,tag=binding['tag'],workspace=tmp,engine='opencode',created_at_ms=1000,
+                      phase='exited',worker_alive=False,containment_empty=True,processes=0,
+                      worker_pid=99999999,workload_pid=99999998,history_path=str(history),
+                      exit=dict(code=0,signal=None,exited_at_ms=2300))
+            posts=[]
+            def request(method,path,payload=None):
+                if method=='GET' and path=='/api/fleet/reconciliation':return dict(launches=[row])
+                posts.append(payload)
+                return dict(id=offer,state=payload['state'])
+            def runner(argv,**kwargs):
+                if 'list' in argv:return [kept]
+                if 'status' in argv:return status
+                return dict(state='failed',native_id=native,resources_reserved=False)
+            d=Dispatcher(settings,request=request,runner=runner)
+            with patch('agent_hub_host.retired_native.verify_native_retirement',return_value=(False,None,'kept')),                 patch('agent_hub_host.fleet.verify_native_retirement',return_value=(False,None,'kept')),                 patch('agent_hub_host.launcher_recovery.settle_unstarted',return_value=False),                 patch.object(Dispatcher,'_check_headless_health',return_value=None):
+                try:
+                    self.assertEqual(poll(d),[])
+                    d._terminal_orphan_thread.join(3)
+                    self.assertFalse(d._terminal_orphan_thread.is_alive())
+                finally:
+                    if getattr(d,'_terminal_orphan_thread',None):d._terminal_orphan_thread.join(5)
+            self.assertEqual(len(posts),1)
+            self.assertEqual(posts[0]['runtime']['exit_code'],0)
+            self.assertEqual(posts[0]['runtime']['wall_time_ms'],1300)
+            self.assertEqual(posts[0]['runtime']['outcome'],'failed-with-partial-work')
+            self.assertEqual(posts[0]['runtime']['log_tail'],'Partial spawned task')
+            self.assertEqual(posts[0]['diagnostic'],original['diagnostic'])
+
+    def _assert_persisted_failure_recovers(self, cwd=None, entry='launcher', retained=False):
         from agent_hub_host.fleet import Dispatcher
         with tempfile.TemporaryDirectory() as tmp:
             settings, offer, original = self._real_failed_dispatch(tmp, cwd)
@@ -66,8 +111,13 @@ class AccountCapacityTests(unittest.TestCase):
             def recover(dispatcher):
                 return (reconcile_retired(dispatcher, row) if entry == 'server' else
                         reconcile_launcher_retired(dispatcher, row, Path(original['target_cwd'])))
+            native_row = dict(id=native,tag=binding['tag'],workspace=tmp,engine='opencode',
+                              created_at_ms=1000,phase='exited',worker_alive=False,
+                              containment_empty=True,processes=0,worker_pid=99999999,workload_pid=99999998,
+                              exit=dict(code=0,signal=None,exited_at_ms=2300))
             d = Dispatcher(settings, request=Mock(), runner=Mock(side_effect=lambda argv, **kwargs:
-                status if 'status' in argv else {'state': 'running', 'native_id': native, 'resources_reserved': True}))
+                [native_row] if 'list' in argv else status if 'status' in argv else
+                {'state': 'running', 'native_id': native, 'resources_reserved': True}))
             self.assertEqual(d._active_launches[offer], original)
             path = Path(tmp) / '.local/hub-results' / (offer + '.json')
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -75,8 +125,8 @@ class AccountCapacityTests(unittest.TestCase):
             tomb = {'finished_at_ms': 2300, 'exit': {'code': 0, 'signal': None}}
             runtime_failure = dict(reason='engine_exit_code', message='Runtime detail',
                                    error_type='RuntimeError', stage='runtime', exit_code=0)
-            with patch('agent_hub_host.retired_native.verify_native_retirement', return_value=(True, tomb, 'verified')), \
-                 patch('agent_hub_host.fleet.verify_native_retirement', return_value=(True, tomb, 'verified')), \
+            with patch('agent_hub_host.retired_native.verify_native_retirement', return_value=(not retained, tomb, 'verified')), \
+                 patch('agent_hub_host.fleet.verify_native_retirement', return_value=(not retained, tomb, 'verified')), \
                  patch('agent_hub_host.runtime_diagnostics.runtime_diagnostic', return_value=runtime_failure), \
                  patch.object(Dispatcher, '_check_headless_health', return_value=None), \
                  patch.object(Dispatcher, '_maybe_cleanup_worktree') as cleanup:
@@ -93,7 +143,7 @@ class AccountCapacityTests(unittest.TestCase):
                     posts.append(payload)
                     return {'id': offer, 'state': 'exited' if len(posts) == 1 else payload['state']}
                 def released(argv, **kwargs):
-                    return status if 'status' in argv else {
+                    return [native_row] if 'list' in argv else status if 'status' in argv else {
                         'state': 'failed', 'native_id': native, 'resources_reserved': False}
                 d.runner, d.request = released, request
                 self.assertFalse(recover(d))

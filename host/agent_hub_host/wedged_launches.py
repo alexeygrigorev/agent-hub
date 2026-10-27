@@ -92,6 +92,9 @@ def reconcile_claimed_launch(dispatcher, row, *, dry_run=False):
                 dispatcher.settings.get('aplexer_bin', 'aplexer'), target,
                 state_dir=dispatcher.settings.get('aplexer_state_dir'))
             if not retired:
+                from .terminal_reports import retained_terminal_exit
+                retired, _, _ = retained_terminal_exit(dispatcher, target)
+            if not retired:
                 return None
             from .account_capacity import reconcile_headless_retired
             if not reconcile_headless_retired(dispatcher, row, target):

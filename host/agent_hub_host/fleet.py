@@ -1577,6 +1577,9 @@ class Dispatcher:
                 continue
 
             if not is_retired:
+                from .terminal_reports import retained_terminal_exit
+                is_retired, tombstone, detail = retained_terminal_exit(self, target, record)
+            if not is_retired:
                 continue
 
             # 3. Maintained Launcher reconcile

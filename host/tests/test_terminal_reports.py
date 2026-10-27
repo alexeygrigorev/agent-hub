@@ -73,7 +73,7 @@ class TerminalReportsTests(unittest.TestCase):
             self.assertEqual(self.posts[0]['report_status'], 'done')
             self.assertEqual(self.posts[0]['runtime']['exit_code'], 0)
             self.assertTrue(self.read()['settled'])
-            self.assertTrue(all('reconcile' in call.args[0] for call in self.runner.call_args_list))
+            self.assertTrue(all('reconcile' in call.args[0] or 'list' in call.args[0] for call in self.runner.call_args_list))
             self.assertEqual(terminal.poll(self.d), [])
             self.assertEqual(len(self.posts), 1)
         finally:
@@ -168,9 +168,100 @@ class TerminalReportsTests(unittest.TestCase):
             self.d._persist_launch_record(stale)
         self.assertEqual(self.read(), settled)
 
+    def retained_row(self):
+        return dict(id=self.native,tag=self.record['tag'],workspace=str(self.ws),
+                    engine='opencode',created_at_ms=self.record['incarnation'],phase='exited',
+                    worker_alive=False,worker_pid=99999999,workload_pid=99999998,
+                    containment_empty=True,processes=0,
+                    exit=dict(code=0,signal=None,exited_at_ms=self.record['incarnation']+500))
+
+    def test_blocked_orphan_probe_never_blocks_a_bound_report_or_starts_another_probe(self):
+        entered,release=threading.Event(),threading.Event()
+        orphan='33333333-4444-4555-8666-777777777777'
+        record=dict(offer_id=orphan,task_id='hub-'+orphan,workspace=str(self.ws),target_cwd=str(self.ws),
+                    mode='headless',state='not_started',settled=False,reason='launcher_command_failed')
+        self.d._persist_launch_record(record)
+        original=self.d.request;get_calls=[]
+        def request(method,path,payload=None):
+            if method=='GET':
+                get_calls.append(path);entered.set();release.wait(5)
+                return dict(launches=[])
+            return original(method,path,payload)
+        self.d.request=request
+        try:
+            started=time.monotonic()
+            self.assertTrue(terminal.poll(self.d))
+            self.assertLess(time.monotonic()-started,2)
+            self.assertTrue(entered.wait(1))
+            thread=self.d._terminal_orphan_thread
+            self.assertTrue(thread.is_alive())
+            terminal.poll(self.d)
+            self.assertIs(self.d._terminal_orphan_thread,thread)
+            self.assertEqual(len(get_calls),1)
+            self.assertEqual(len(self.posts),1)
+        finally:
+            release.set()
+            if getattr(self.d,'_terminal_orphan_thread',None):self.d._terminal_orphan_thread.join(3)
+
+    def test_retained_native_stop_without_tombstone_or_worker_json_reports_full_failure(self):
+        self.retired.stop()
+        self.result.unlink()
+        row=self.retained_row()
+        history=self.ws/'native/sessions'/self.native/'history.bin'
+        history.parent.mkdir(parents=True);history.write_text('Retained partial work')
+        row['history_path']=str(history)
+        receipt=copy.deepcopy(self.runner.return_value)
+        self.runner.side_effect=lambda argv,**kwargs:[row] if 'list' in argv else receipt
+        with patch('agent_hub_host.fleet.verify_native_retirement',return_value=(False,None,'retained row present')):
+            result=terminal.poll(self.d)
+        self.assertEqual(result,[dict(id=self.offer,state='failed',reconciled=True)])
+        payload=self.posts[0]
+        self.assertEqual(payload['report_status'],'failed')
+        self.assertEqual(payload['runtime']['exit_code'],0)
+        self.assertEqual(payload['runtime']['wall_time_ms'],500)
+        self.assertEqual(payload['runtime']['outcome'],'failed-with-partial-work')
+        self.assertEqual(payload['runtime']['log_tail'],'Retained partial work')
+        self.assertTrue((self.ws/'.local/hub-session-logs'/(self.offer+'.json')).is_file())
+        self.assertTrue(history.is_file())  # Retained native resources never deleted.
+
+    def test_retained_terminal_identity_containment_worker_and_measurements_fail_closed(self):
+        from agent_hub_host.native_sessions import NativeTarget
+        target=NativeTarget(self.native,self.record['tag'],str(self.ws),self.record['incarnation'],'opencode')
+        row=self.retained_row()
+        cases=[('id','33333333-3333-4333-8333-333333333333'),('tag','foreign'),
+               ('workspace',str(self.root/'foreign')),('engine','codex'),
+               ('created_at_ms',row['created_at_ms']+1),('phase','running'),
+               ('phase','exiting'),('phase','forgotten'),('containment_empty',False),
+               ('containment_empty','true'),('worker_alive',True),('worker_alive',None),
+               ('processes',1),('processes',False),('exit',None),
+               ('exit',dict(code=True,signal=None,exited_at_ms=row['exit']['exited_at_ms'])),
+               ('exit',dict(code=None,signal=None,exited_at_ms=row['exit']['exited_at_ms'])),
+               ('exit',dict(code=0,signal=None,exited_at_ms=self.record['incarnation']-1))]
+        for field,value in cases:
+            with self.subTest(field=field,value=value):
+                self.runner.return_value=[dict(row,**{field:value})]
+                self.assertFalse(terminal.retained_terminal_exit(self.d,target)[0])
+        self.runner.return_value=[row,row]
+        self.assertFalse(terminal.retained_terminal_exit(self.d,target)[0])
+        self.runner.return_value=[row,dict(row,id='33333333-3333-4333-8333-333333333333')]
+        self.assertFalse(terminal.retained_terminal_exit(self.d,target)[0])
+        self.runner.return_value=[row]
+        with patch('agent_hub_host.account_capacity.confirmed_empty',return_value=False):
+            if __import__('os').name!='nt':
+                self.assertFalse(terminal.retained_terminal_exit(self.d,target)[0])
+        with patch('agent_hub_host.native_sessions._confirm_workload_exit',return_value=(False,'live cgroup descendants')):
+            self.assertFalse(terminal.retained_terminal_exit(self.d,target)[0])
+        self.assertTrue(terminal.retained_terminal_exit(self.d,target)[0])
+        self.assertEqual(self.posts,[])
+
     def test_real_health_stop_producer_waits_for_release_then_replays_full_runtime(self):
         from agent_hub_host import headless_health
         self.health.stop()
+        self.retired.stop()
+        retained_only=patch('agent_hub_host.fleet.verify_native_retirement',return_value=(False,None,'--keep-record'))
+        retained_only.start();self.addCleanup(retained_only.stop)
+        row=self.retained_row()
+        self.runner.side_effect=lambda argv,**kwargs:[row] if 'list' in argv else self.runner.return_value
         self.result.unlink()
         doc = dict(id=self.native, tag=self.record['tag'], workspace=str(self.ws),
                    engine='opencode', created_at_ms=self.record['incarnation'])
@@ -188,8 +279,9 @@ class TerminalReportsTests(unittest.TestCase):
             self.assertNotIn('confirmed_exit', self.posts[0])
             self.assertFalse(self.read()['settled'])
             self.assertTrue(self.read()['health_stop_confirmed'])
-            with patch('agent_hub_host.fleet.verify_native_retirement', return_value=(False, None, 'live children')):
-                self.assertEqual(terminal.poll(self.d), [])
+            row.update(phase='running',containment_empty=False,processes=1)
+            self.assertEqual(terminal.poll(self.d), [])
+            row.update(phase='exited',containment_empty=True,processes=0)
             self.runner.return_value['resources_reserved'] = True
             self.assertEqual(terminal.poll(self.d), [])
             self.assertEqual(len(self.posts), 1)

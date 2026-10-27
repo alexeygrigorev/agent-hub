@@ -7,11 +7,13 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 import copy
 import json
+import os
 import re
 from pathlib import Path
 import threading
 import uuid
 import weakref
+import time
 
 from . import private_fs
 
@@ -167,6 +169,108 @@ def _ready_hint(record, state_dir):
             native_id / 'tombstone.json').is_file()
 
 
+def native_catalog(dispatcher):
+    """Bounded complete native census; its contents never enter diagnostics."""
+    try:
+        rows = dispatcher.runner([dispatcher.settings.get('aplexer_bin', 'aplexer'),
+                                  'list', '--all', '--json'])
+        if not isinstance(rows, list) or len(rows) > 500 or any(not isinstance(row, dict) for row in rows):
+            return None
+        return rows
+    except Exception:
+        return None
+
+
+def retained_terminal_exit(dispatcher, target, record=None):
+    """Positive exit proof for native --keep-record, without deleting its row.
+
+    A terminal phase alone is insufficient. Require the exact native birth,
+    explicit empty containment/process count and a dead native worker, then
+    retain the native exit measurements/output. Launcher resource release and
+    authenticated result acknowledgement remain the caller's separate gates.
+    """
+    from .native_bridge import canonicalize_workspace
+    try:
+        target = target.validated()
+        if type(target.created_at_ms) is not int or not isinstance(target.engine, str):
+            return False, None, 'retained_identity_unavailable'
+    except Exception:
+        return False, None, 'retained_identity_unavailable'
+    rows = native_catalog(dispatcher)
+    if rows is None:
+        return False, None, 'retained_catalog_unavailable'
+    matches = []
+    for row in rows:
+        if str(row.get('id', '')).lower() == target.session_id.lower():
+            matches.append(row)
+        elif row.get('tag') == target.tag:
+            try:
+                if canonicalize_workspace(row.get('workspace')) == target.workspace:
+                    return False, None, 'retained_tag_conflict'
+            except (OSError, TypeError, ValueError):
+                return False, None, 'retained_identity_unavailable'
+    if len(matches) != 1:
+        return False, None, 'retained_identity_unavailable'
+    row = matches[0]
+    try:
+        exact = (row.get('tag') == target.tag and row.get('engine') == target.engine
+                 and canonicalize_workspace(row.get('workspace')) == target.workspace
+                 and type(row.get('created_at_ms')) is int
+                 and row['created_at_ms'] == target.created_at_ms)
+    except (OSError, TypeError, ValueError):
+        exact = False
+    if (not exact or row.get('phase') not in ('exited', 'dead')
+            or row.get('containment_empty') is not True or row.get('worker_alive') is not False
+            or type(row.get('processes')) is not int or row['processes'] != 0):
+        return False, None, 'retained_exit_unproven'
+    from .native_sessions import project_session, _confirm_workload_exit
+    if not _confirm_workload_exit(project_session(row))[0]:
+        return False, None, 'retained_containment_exit_unproven'
+    if os.name != 'nt':
+        from .account_capacity import confirmed_empty
+        if not confirmed_empty(row):
+            return False, None, 'retained_process_exit_unproven'
+    info = row.get('exit')
+    if not isinstance(info, dict):
+        return False, None, 'retained_measurements_unavailable'
+    end, code, sig = info.get('exited_at_ms'), info.get('code'), info.get('signal')
+    if (type(end) is not int or not target.created_at_ms <= end <= int(time.time()*1000)+60000
+            or (code is not None and (type(code) is not int or not 0 <= code <= 9007199254740991))
+            or (sig is not None and (type(sig) is not int or not 0 < sig <= 64))
+            or (code is None and sig is None)):
+        return False, None, 'retained_measurements_unavailable'
+    evidence = {'exit': {'code': code, 'signal': sig, 'exited_at_ms': end,
+                         'oom_killed': info.get('oom_killed') is True},
+                'finished_at_ms': end}
+    if record is not None:
+        from .exit_evidence import snapshot_native
+        captured = snapshot_native(record, row)
+        if captured is not None:
+            record['exit_evidence'] = captured
+    return True, evidence, 'qualified_retained_native_exit'
+
+
+def recover_orphan(observer, offer_id):
+    """One bounded recovery on a separate single-inflight lane."""
+    try:
+        response = observer.request('GET', '/api/fleet/reconciliation')
+        rows = response.get('launches') if isinstance(response, dict) else None
+        if not isinstance(rows, list) or len(rows) > 100:
+            return
+        matches = [row for row in rows if isinstance(row, dict) and row.get('id') == offer_id]
+        if len(matches) != 1 or matches[0].get('mode') != 'headless':
+            return
+        from .account_capacity import reconcile_unstarted
+        with launch_guard(observer, offer_id):
+            current = read_record(observer, offer_id)
+            if current is not None and current.get('state') == 'not_started':
+                observer._active_launches[offer_id] = current
+                reconcile_unstarted(observer, rows=matches)
+    except Exception:
+        # Durable state/outbox remain recoverable. Never print remote bodies.
+        return
+
+
 def poll(source):
     """Fresh journal observer, independent of maintenance/admission/auth work.
 
@@ -180,8 +284,31 @@ def poll(source):
     observer = Dispatcher(dict(source.settings), request=source.request,
                           runner=source.runner, journal_dir=source.journal_dir,
                           role_config=source.role_config, role_config_path=source.role_config_path)
+    # One metadata census discovers retained terminal rows even when a stopped
+    # unprofiled worker produced neither JSON nor a managed capture/tombstone.
+    rows = native_catalog(observer) if any(record.get('settled') is not True
+                                         for record in observer._active_launches.values()) else None
+    terminal_ids = {row['id'] for row in rows or [] if isinstance(row.get('id'), str)
+                    and row.get('phase') in ('exited', 'dead')}
     candidates = sorted(offer_id for offer_id, record in observer._active_launches.items()
-                        if ready_hint(record, observer.settings.get('aplexer_state_dir')))
+                        if record.get('state') != 'not_started'
+                        and (record.get('native_id') in terminal_ids
+                             or ready_hint(record, observer.settings.get('aplexer_state_dir'))))
+    # A spawned first-action failure initially lacks a native tuple. Its own
+    # server/launcher probe must never stall delivery for already-bound exits.
+    # One daemon recovery thread per controller, with the same per-offer lock
+    # and durable outbox; no detached queue or new native start/stop effect.
+    orphans = sorted(key for key, record in observer._active_launches.items()
+                     if record.get('state') == 'not_started' and record.get('settled') is not True)
+    current = getattr(source, '_terminal_orphan_thread', None)
+    if orphans and (current is None or not current.is_alive()):
+        cursor = getattr(source, '_terminal_orphan_cursor', '')
+        chosen = next((key for key in orphans if key > cursor), orphans[0])
+        source._terminal_orphan_cursor = chosen
+        thread = threading.Thread(target=recover_orphan, args=(observer, chosen),
+                                  daemon=True, name='terminal-orphan')
+        source._terminal_orphan_thread = thread
+        thread.start()
     if not candidates:
         return []
     previous = getattr(source, '_terminal_cursor', '')
