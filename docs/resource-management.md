@@ -111,6 +111,40 @@ Runs every 5–10 minutes (Alexey t1474u: «Надо ещё watchdog чтобы 
   Hub. The affected intake gets a note so the forgotten-intake watchdog
   (ea87fcb3 AC8) restarts it and it is not lost.
 
+### 5. Reversible CPU throttle (intake f31b678f)
+
+Background: on 2026-10-27 a session ran a per-nproc busy-loop flake check that
+pinned all 12 cores for hours, so the Hub rejected every route with
+`host_runtime_choking` while ~150 other sessions ran. Two defenses landed:
+
+- Hub session rules (the trusted `Hub session rules` preamble on every brief,
+  `host/agent_hub_host/session_rules.py`) forbid artificial host-wide CPU or
+  memory load on shared hosts. Load-dependent flake checks must run inside the
+  session's own cgroup with a CPU cap (for example
+  `systemd-run --user --scope -p CPUQuota=200%`) and a bounded duration.
+- The watchdog reversibly throttles a session that ignores that rule.
+
+Detection and action (host `resource_management.py`):
+
+- Every heartbeat the watchdog samples each session's current CPU cores from
+  its dedicated workload cgroup. When a managed, non-keep session stays above
+  `cpu_throttle_cores` (default 2) for `cpu_throttle_sustain_s` (default 300),
+  the watchdog writes `cpu.max` on that session's own workload scope
+  (`<cap>*1000000 100000`).
+- The throttle is REVERSIBLE and bounded to the offending scope: the previous
+  `cpu.max` value is saved before the write and restored when usage falls
+  below 80% of the cap (hysteresis, so a session at the ceiling never flaps)
+  or when the session finishes. A scope that already died with the session is
+  recorded as `cgroup_gone`.
+- It never stops, kills or signals a process. Keep-marked sessions
+  (including interactive) are never throttled; an existing cap on a session
+  that later gains protection is still lifted. An unreadable `cpu.max` fails
+  safe: no throttle.
+- Every apply and release is a receipt in the resource report, recorded in
+  `resource_throttles`, noted into the linked intake history, and visible in
+  Hub: `hub resources` shows the cap/sustain and active count, and
+  `hub resources throttles` lists applies/releases with outcomes.
+
 ## Config knobs
 
 These are Hub config values (`config/resource-management.json` in agent-hub,
@@ -136,6 +170,8 @@ hard-coded constants.
 | `watchdog_interval_s` | 300–600 | watchdog |
 | `idle_minutes` | 60 | watchdog |
 | `rss_flag_gb` | 4 | watchdog / overview |
+| `cpu_throttle_cores` | 2 | watchdog reversible cpu.max throttle cap (cores, fractional ok) |
+| `cpu_throttle_sustain_s` | 300 | sustained over-cap seconds before the throttle applies |
 | `keep` marker | per session | watchdog exclusion |
 
 Implemented Hub source (2026-10-26): `src/resource-management.ts`
@@ -185,6 +221,8 @@ never repeats a kill or drops a receipt to make room.
 - `hub resources sessions [--project P --engine E --kind K]`: rows from the
   per-session ledger with p50/p90.
 - `hub resources reaps`: the watchdog log (who, when, why, MB freed, intake).
+- `hub resources throttles`: the reversible CPU throttle log (apply/release,
+  cap, cpu.max value, outcome, intake, ACTIVE flag).
 - Hub overview: a "Resource management" section with the same utilization
   line, per-group p90 stats, flagged sessions and recent reaps.
 

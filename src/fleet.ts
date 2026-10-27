@@ -1183,6 +1183,7 @@ export class FleetService {
         if (!suffix) return response(this.resources.overview());
         if (suffix === '/sessions') return response({sessions:this.resources.usage(Object.fromEntries(new URL(request.url).searchParams))});
         if (suffix === '/reaps') return response({reaps:this.resources.reaps()});
+        if (suffix === '/throttles') return response({throttles:this.resources.throttles()});
       }
       if (suffix === '/config' && request.method === 'PUT' && admin) {
         try { const data=await body(request); return response({config:this.resources.configure(data)}); }
@@ -1194,7 +1195,7 @@ export class FleetService {
           const data=await body(request);
           return this.transaction(() => response(suffix === '/report' ? this.resources.report(caller.machineId!,data) : this.resources.evidence(caller.machineId!,data)));
         } catch (error) {
-          const allowed=new Set(['invalid_resource_report','resource_binding_mismatch','invalid_resource_sample','invalid_resource_timestamp','invalid_reap','reap_conflict','session_not_reapable','invalid_evidence','evidence_conflict','intake_required','intake_not_found','intake_history_capacity','intake_capacity']);
+          const allowed=new Set(['invalid_resource_report','resource_binding_mismatch','invalid_resource_sample','invalid_resource_timestamp','invalid_reap','reap_conflict','invalid_throttle','throttle_conflict','session_not_reapable','invalid_evidence','evidence_conflict','intake_required','intake_not_found','intake_history_capacity','intake_capacity']);
           const code=error instanceof Error && allowed.has(error.message) ? error.message : 'resource_report_failed';
           return response({error:code},400);
         }

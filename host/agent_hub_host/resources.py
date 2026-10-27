@@ -4,6 +4,7 @@ Read-only projections over the Hub resource-management endpoints:
   GET /api/fleet/resources            overview (admin)
   GET /api/fleet/resources/sessions   per-session ledger with filters (admin)
   GET /api/fleet/resources/reaps      watchdog reap log (admin)
+  GET /api/fleet/resources/throttles  reversible CPU throttle log (admin)
 
 No tokens, transcripts or private config ever travel here. Filters are
 allowlisted; unknown values are refused client-side.
@@ -23,7 +24,7 @@ TASK_KINDS = ("implement", "review", "ask", "goal")
 
 def add_commands(sub) -> None:
     parser = sub.add_parser("resources", help="Show resource utilization, per-session usage and watchdog reaps")
-    parser.add_argument("view", nargs="?", choices=["sessions", "reaps"], default=None,
+    parser.add_argument("view", nargs="?", choices=["sessions", "reaps", "throttles"], default=None,
                         help="Ledger view (default: utilization overview)")
     parser.add_argument("--project", default=None, help="Filter sessions by project label or workspace absolute path")
     parser.add_argument("--engine", default=None, help="Filter sessions by engine")
@@ -105,6 +106,11 @@ def fetch_reaps() -> dict:
     return bus._do_request("GET", "/api/fleet/resources/reaps")
 
 
+def fetch_throttles() -> dict:
+    from . import bus
+    return bus._do_request("GET", "/api/fleet/resources/throttles")
+
+
 def execute(args) -> dict:
     view = getattr(args, "view", None)
     if view == "sessions":
@@ -114,6 +120,8 @@ def execute(args) -> dict:
                               task_kind=getattr(args, "task_kind", None))
     if view == "reaps":
         return fetch_reaps()
+    if view == "throttles":
+        return fetch_throttles()
     return fetch_overview()
 
 
@@ -202,6 +210,23 @@ def render_text(data: dict, view=None) -> str:
                 row.get("actor", "?"), row.get("intake_id", "?"),
                 row.get("evidence_id", "?")))
         return "\n".join(lines) if lines else "No reaps reported."
+    if view == "throttles":
+        rows = data.get("throttles")
+        if not isinstance(rows, list) or not rows:
+            return "No CPU throttles reported."
+        lines = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                cap = "cap=%s" % float(row.get("cap_cores"))
+            except (TypeError, ValueError):
+                cap = "cap=unknown"
+            lines.append("%s action=%s %s cpu_max=%s outcome=%s at=%s intake=%s%s" % (
+                row.get("session_id", "?"), row.get("action", "?"), cap,
+                row.get("cpu_max", "?"), row.get("outcome", "?"), row.get("at", "?"),
+                row.get("intake_id", "?"), " ACTIVE" if row.get("active") else ""))
+        return "\n".join(lines) if lines else "No reaps reported."
     config = data.get("config") if isinstance(data.get("config"), dict) else {}
     hosts = data.get("hosts") if isinstance(data.get("hosts"), list) else []
     reaps = data.get("reaps") if isinstance(data.get("reaps"), list) else []
@@ -233,4 +258,9 @@ def render_text(data: dict, view=None) -> str:
             group.get("samples", "?"), _fmt_mb(group.get("p50_rss_mb")),
             _fmt_mb(group.get("p90_rss_mb"))))
     lines.append("recent reaps: %d" % len(reaps))
+    throttles = data.get("throttles") if isinstance(data.get("throttles"), list) else []
+    active = sum(1 for row in throttles if isinstance(row, dict) and row.get("active"))
+    lines.append("recent cpu throttles: %d (active: %d) cap=%s sustain=%ss" % (
+        len(throttles), active, config.get("cpu_throttle_cores", "?"),
+        config.get("cpu_throttle_sustain_s", "?")))
     return "\n".join(lines)

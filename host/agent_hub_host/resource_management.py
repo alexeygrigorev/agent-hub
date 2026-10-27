@@ -8,8 +8,16 @@ Server contract (see src/resource-management.ts, src/fleet.ts):
   GET /api/fleet/resources/watchdog -> {config, sessions:[...]}
   POST /api/fleet/resources/evidence {id,session_id,native_id,reason,output}
     (output UTF-8 BYTE limit 6000) -> {saved:true, evidence_id}
-  POST /api/fleet/resources/report {samples:[...], reaps:[...]}
+  POST /api/fleet/resources/report {samples:[...], reaps:[...], throttles:[...]}
     -> {reported:true, ...} (the ONLY receipt acknowledgement)
+
+CPU throttle (intake f31b678f): a Hub-managed non-keep session whose measured
+current CPU stays above the configured cap (default 2 cores) for the
+configured sustain window (default 300s) gets a REVERSIBLE cgroup cpu.max
+throttle on its own workload scope. The previous cpu.max value is restored
+when usage drops below the cap hysteresis or the session finishes. The
+throttle never stops, kills or signals any process, and sessions with the
+keep marker (including interactive) are never throttled.
 
 Evidence is saved server-side as an intake note BEFORE any native stop, and
 its exact {saved:true, evidence_id} confirmation is required before the
@@ -39,6 +47,8 @@ from typing import Any, Optional
 DEFAULT_WATCHDOG_INTERVAL_S = 300
 DEFAULT_IDLE_MINUTES = 60
 DEFAULT_RSS_FLAG_GB = 4
+DEFAULT_CPU_THROTTLE_CORES = 2.0
+DEFAULT_CPU_THROTTLE_SUSTAIN_S = 300
 
 # Server bounds (src/resource-management.ts resourceConfig): host clamps to
 # the same ranges so local gating never disagrees with Hub validation.
@@ -48,6 +58,10 @@ IDLE_MIN_MINUTES = 10
 IDLE_MAX_MINUTES = 10080
 RSS_FLAG_MIN_GB = 0.125
 RSS_FLAG_MAX_GB = 1024
+CPU_THROTTLE_CORES_MIN = 0.25
+CPU_THROTTLE_CORES_MAX = 128
+CPU_THROTTLE_SUSTAIN_MIN_S = 30
+CPU_THROTTLE_SUSTAIN_MAX_S = 3600
 
 TERMINAL_SERVER_STATES = {"exited", "finished", "failed", "stopped", "dead", "refused"}
 REAP_REASONS = ("idle", "terminal", "dead_pid")
@@ -61,6 +75,16 @@ MAX_REAPS_PER_POST = 50
 # Bound destructive work per cycle: few stops, bounded wall time, no scheduler.
 MAX_REAPS_PER_CYCLE = 10
 CYCLE_DEADLINE_S = 120.0
+# CPU throttle: cgroup v2 cpu.max quota period (us) and bounded receipts.
+CPU_THROTTLE_PERIOD_US = 100_000
+# Release hysteresis: restore only when measured usage falls clearly below
+# the cap, so a session sitting AT the throttled ceiling never flaps.
+CPU_THROTTLE_RELEASE_RATIO = 0.8
+# An over-cap streak older than this (watchdog down, host asleep) restarts
+# the sustain window instead of accumulating stale evidence.
+CPU_THROTTLE_OVER_GAP_MS = 300_000
+MAX_THROTTLE_RECEIPTS = 100
+MAX_THROTTLES_PER_POST = 50
 
 STATE_FILENAME = "resource-management.json"
 STATE_CAP_BYTES = 256 * 1024
@@ -95,6 +119,8 @@ def default_config() -> dict[str, Any]:
         "watchdog_interval_s": DEFAULT_WATCHDOG_INTERVAL_S,
         "idle_minutes": DEFAULT_IDLE_MINUTES,
         "rss_flag_gb": DEFAULT_RSS_FLAG_GB,
+        "cpu_throttle_cores": DEFAULT_CPU_THROTTLE_CORES,
+        "cpu_throttle_sustain_s": DEFAULT_CPU_THROTTLE_SUSTAIN_S,
     }
 
 
@@ -106,6 +132,8 @@ def normalize_config(raw: Any) -> dict[str, Any]:
         "watchdog_interval_s": _clamp(raw.get("watchdog_interval_s"), WATCHDOG_MIN_S, WATCHDOG_MAX_S),
         "idle_minutes": _clamp(raw.get("idle_minutes"), IDLE_MIN_MINUTES, IDLE_MAX_MINUTES),
         "rss_flag_gb": _clamp(raw.get("rss_flag_gb"), RSS_FLAG_MIN_GB, RSS_FLAG_MAX_GB),
+        "cpu_throttle_cores": _clamp(raw.get("cpu_throttle_cores"), CPU_THROTTLE_CORES_MIN, CPU_THROTTLE_CORES_MAX),
+        "cpu_throttle_sustain_s": _clamp(raw.get("cpu_throttle_sustain_s"), CPU_THROTTLE_SUSTAIN_MIN_S, CPU_THROTTLE_SUSTAIN_MAX_S),
     }
     for key, val in clamped.items():
         if val is not None:
@@ -489,6 +517,7 @@ def sample_session_tree(
             "avg_cpu_cores": float(avg_cpu) if avg_cpu is not None else None,
             "current_mb": float(current_mb) if current_mb is not None else None,
             "cpu_identity": cpu_identity,
+            "cgroup_path": cg,
         }
     except Exception:
         return None
@@ -538,16 +567,19 @@ def _state_path(journal_dir: Any) -> Optional[Path]:
 def load_state(journal_dir: Any) -> dict[str, Any]:
     path = _state_path(journal_dir)
     if path is None:
-        return {"peaks": {}, "pending": {}, "reported": {}, "last_watchdog_ms": None}
+        return {"peaks": {}, "pending": {}, "reported": {}, "throttle_reports": {},
+                "last_watchdog_ms": None}
     try:
         from . import private_fs
         raw = private_fs.read_bytes(str(path), STATE_CAP_BYTES)
         data = json.loads(raw.decode("utf-8"))
         if not isinstance(data, dict):
-            return {"peaks": {}, "pending": {}, "reported": {}, "last_watchdog_ms": None}
+            return {"peaks": {}, "pending": {}, "reported": {}, "throttle_reports": {},
+                    "last_watchdog_ms": None}
         peaks = data.get("peaks") if isinstance(data.get("peaks"), dict) else {}
         pending = data.get("pending") if isinstance(data.get("pending"), dict) else {}
         reported = data.get("reported") if isinstance(data.get("reported"), dict) else {}
+        throttle_reports = data.get("throttle_reports") if isinstance(data.get("throttle_reports"), dict) else {}
         last_ms = data.get("last_watchdog_ms")
         # Bound and validate; reported receipts are durable until acked.
         clean_peaks = {}
@@ -562,11 +594,16 @@ def load_state(journal_dir: Any) -> dict[str, Any]:
         for key, val in list(reported.items())[:MAX_REPORTED_ENTRIES]:
             if isinstance(key, str) and isinstance(val, dict):
                 clean_reported[key] = val
+        clean_throttles = {}
+        for key, val in list(throttle_reports.items())[:MAX_THROTTLE_RECEIPTS]:
+            if isinstance(key, str) and isinstance(val, dict):
+                clean_throttles[key] = val
         return {"peaks": clean_peaks, "pending": clean_pending,
-                "reported": clean_reported,
+                "reported": clean_reported, "throttle_reports": clean_throttles,
                 "last_watchdog_ms": last_ms if type(last_ms) is int and last_ms > 0 else None}
     except (FileNotFoundError, OSError, ValueError):
-        return {"peaks": {}, "pending": {}, "reported": {}, "last_watchdog_ms": None}
+        return {"peaks": {}, "pending": {}, "reported": {}, "throttle_reports": {},
+                "last_watchdog_ms": None}
 
 
 def _encode_state(state: dict[str, Any]) -> Optional[bytes]:
@@ -574,11 +611,14 @@ def _encode_state(state: dict[str, Any]) -> Optional[bytes]:
     peaks = state.get("peaks") if isinstance(state.get("peaks"), dict) else {}
     pending = state.get("pending") if isinstance(state.get("pending"), dict) else {}
     reported = state.get("reported") if isinstance(state.get("reported"), dict) else {}
+    throttle_reports = state.get("throttle_reports") if isinstance(state.get("throttle_reports"), dict) else {}
     last_ms = state.get("last_watchdog_ms")
     peaks = dict(list(peaks.items())[:MAX_PEAK_ENTRIES])
     pending = dict(list(pending.items())[:MAX_PENDING_ENTRIES])
     reported = dict(list(reported.items())[:MAX_REPORTED_ENTRIES])
-    payload: dict[str, Any] = {"peaks": peaks, "pending": pending, "reported": reported}
+    throttle_reports = dict(list(throttle_reports.items())[:MAX_THROTTLE_RECEIPTS])
+    payload: dict[str, Any] = {"peaks": peaks, "pending": pending, "reported": reported,
+                               "throttle_reports": throttle_reports}
     if type(last_ms) is int and last_ms > 0:
         payload["last_watchdog_ms"] = last_ms
     try:
@@ -677,6 +717,176 @@ def update_peaks(state: dict[str, Any], session_id: str, native_id: str, sample:
         **distribution,
     }
     return peaks[key]
+
+
+def _cpu_max_for_cap(cap_cores: float) -> str:
+    """cgroup v2 cpu.max value capping the scope to ``cap_cores`` cores."""
+    return "%d %d" % (int(round(cap_cores * 1_000_000)), CPU_THROTTLE_PERIOD_US)
+
+
+def _read_cpu_max(cgroup: str) -> Optional[str]:
+    raw = _read_text(os.path.join(cgroup, "cpu.max"), limit=64)
+    if raw is None:
+        return None
+    return raw.strip() or None
+
+
+def _write_cpu_max(cgroup: str, value: str) -> bool:
+    """Verified cpu.max write; a read-back mismatch counts as failure."""
+    try:
+        Path(cgroup, "cpu.max").write_text(value + "\n")
+    except OSError:
+        return False
+    readback = _read_cpu_max(cgroup)
+    if readback == value:
+        return True
+    try:
+        return int(readback.split()[0]) == int(value.split()[0])
+    except (AttributeError, ValueError, IndexError):
+        return False
+
+def _throttle_receipt(session_id: str, native_id: str, action: str, created_ms: Any,
+                      at_ms: int, at: str, detail: dict[str, Any]) -> dict[str, Any]:
+    try:
+        created_part = str(int(created_ms))
+    except (TypeError, ValueError):
+        created_part = "0"
+    rid = ("cpu-throttle:%s:%s:%s:%s:%s" % (session_id, native_id, action, created_part, at_ms))[:128]
+    receipt = {"id": rid, "session_id": session_id, "native_id": native_id,
+               "action": action, "at": at}
+    receipt.update(detail)
+    return receipt
+
+
+def _release_throttle_state(peak: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Pop the throttle marker and return it; window state clears with it."""
+    throttle = peak.pop("cpu_throttle", None)
+    peak.pop("cpu_over_ms", None)
+    peak.pop("cpu_over_last_ms", None)
+    return throttle if isinstance(throttle, dict) else None
+
+
+def _restore_cpu_max(throttle: dict[str, Any]) -> dict[str, Any]:
+    """Restore the saved cpu.max. Best effort, never destructive."""
+    cgroup = throttle.get("cgroup")
+    prior = throttle.get("prior_cpu_max")
+    if not isinstance(cgroup, str) or not isinstance(prior, str) or not prior:
+        return {"cpu_max": None, "outcome": "cgroup_gone"}
+    current = _read_cpu_max(cgroup)
+    if current is None:
+        # Scope already destroyed with the session: the cap died with it.
+        return {"cpu_max": None, "outcome": "cgroup_gone"}
+    if _write_cpu_max(cgroup, prior):
+        return {"cpu_max": prior, "outcome": "restored"}
+    return {"cpu_max": None, "outcome": "unverified"}
+
+
+def evaluate_cpu_throttle(
+    config: dict[str, Any],
+    entry: dict[str, Any],
+    measured: Optional[dict[str, Any]],
+    peak: dict[str, Any],
+    now_ms: int,
+    observed_at: str,
+) -> list[dict[str, Any]]:
+    """One reversible cpu.max throttle decision for a sampled session.
+
+    Applies the throttle only to a live, non-keep session with a dedicated
+    workload cgroup whose measured current CPU stayed above the configured
+    cap for the configured sustain window. Releases when usage falls below
+    the cap hysteresis. The only side effect is a verified cpu.max write on
+    that session's own scope; no process is ever stopped or signaled.
+    Returns the receipts for actions taken this sample.
+    """
+    receipts: list[dict[str, Any]] = []
+    try:
+        cap = float(config["cpu_throttle_cores"])
+        sustain_ms = int(float(config["cpu_throttle_sustain_s"]) * 1000)
+    except (KeyError, TypeError, ValueError):
+        return receipts
+    sid = entry.get("session_id")
+    nid = entry.get("native_id")
+    if not isinstance(sid, str) or not isinstance(nid, str):
+        return receipts
+    throttle = peak.get("cpu_throttle") if isinstance(peak.get("cpu_throttle"), dict) else None
+    current = _finite_number(peak.get("current_cpu_cores"))
+    cgroup = measured.get("cgroup_path") if isinstance(measured, dict) else None
+    if throttle is not None:
+        # Keep-marked sessions are never re-throttled, but an existing cap
+        # is still lifted so protection is restored in full.
+        if current is not None and current < cap * CPU_THROTTLE_RELEASE_RATIO:
+            prior_throttle = _release_throttle_state(peak)
+            if prior_throttle is not None:
+                detail = _restore_cpu_max(prior_throttle)
+                receipts.append(_throttle_receipt(
+                    sid, nid, "released", entry.get("native_created_at_ms"), now_ms, observed_at,
+                    {"cap_cores": cap, "sustain_s": config.get("cpu_throttle_sustain_s"), **detail}))
+        return receipts
+    if entry.get("keep") is True:
+        return receipts
+    if current is None or not isinstance(cgroup, str) or not cgroup:
+        peak.pop("cpu_over_ms", None)
+        peak.pop("cpu_over_last_ms", None)
+        return receipts
+    if current > cap:
+        # Sustained over-cap evidence accrues from MEASURED intervals: each
+        # over-cap sample credits the interval since the previous counter
+        # baseline (bounded against long watchdog outages). A sample under
+        # cap, or a sampling gap, restarts the window.
+        last = peak.get("cpu_over_last_ms")
+        interval = _finite_number(peak.get("current_interval_ms"))
+        credited = min(interval, float(CPU_THROTTLE_OVER_GAP_MS)) if interval is not None else 0.0
+        over_ms = _finite_number(peak.get("cpu_over_ms"))
+        continuing = (type(last) is int and now_ms >= last
+                      and now_ms - last <= CPU_THROTTLE_OVER_GAP_MS and over_ms is not None)
+        peak["cpu_over_ms"] = (over_ms if continuing else 0.0) + credited
+        peak["cpu_over_last_ms"] = now_ms
+        if (peak["cpu_over_ms"] or 0.0) < sustain_ms:
+            return receipts
+        prior = _read_cpu_max(cgroup)
+        if prior is None:
+            return receipts  # Unreadable scope: fail safe, no throttle.
+        value = _cpu_max_for_cap(cap)
+        if not _write_cpu_max(cgroup, value):
+            return receipts
+        peak["cpu_throttle"] = {"cap_cores": cap, "applied_at": observed_at,
+                                "sustain_s": config.get("cpu_throttle_sustain_s"),
+                                "prior_cpu_max": prior, "cpu_max": value, "cgroup": cgroup}
+        peak.pop("cpu_over_ms", None)
+        peak.pop("cpu_over_last_ms", None)
+        receipts.append(_throttle_receipt(
+            sid, nid, "throttled", entry.get("native_created_at_ms"), now_ms, observed_at,
+            {"cap_cores": cap, "sustain_s": config.get("cpu_throttle_sustain_s"),
+             "cpu_max": value, "prior_cpu_max": prior, "outcome": "applied"}))
+    else:
+        peak.pop("cpu_over_ms", None)
+        peak.pop("cpu_over_last_ms", None)
+    return receipts
+
+
+def release_terminal_throttle(
+    entry: dict[str, Any],
+    peak: dict[str, Any],
+    now_ms: int,
+    observed_at: str,
+) -> list[dict[str, Any]]:
+    """Lift any active throttle when the session finishes. Never kills."""
+    receipts: list[dict[str, Any]] = []
+    sid = entry.get("session_id")
+    nid = entry.get("native_id")
+    throttle = peak.get("cpu_throttle") if isinstance(peak.get("cpu_throttle"), dict) else None
+    if throttle is None or not isinstance(sid, str) or not isinstance(nid, str):
+        return receipts
+    prior_throttle = _release_throttle_state(peak)
+    if prior_throttle is None:
+        return receipts
+    detail = _restore_cpu_max(prior_throttle)
+    cap = _finite_number(prior_throttle.get("cap_cores"))
+    receipts.append(_throttle_receipt(
+        sid, nid, "released", entry.get("native_created_at_ms"), now_ms, observed_at,
+        {"cap_cores": cap if cap is not None else 0.0,
+         "sustain_s": prior_throttle.get("sustain_s"), **detail}))
+    return receipts
 
 
 def _evidence_id(session_id: str, reason: str, created_ms: Any, activity_ms: Any, output_digest: str) -> str:
@@ -857,32 +1067,46 @@ def _json_bytes(value: Any) -> int:
         return 10**9
 
 
-def _split_report_posts(samples: list[dict[str, Any]], reaps: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Split samples+reaps into report POSTs each well under the server
-    32768-byte body cap. Samples are idempotent max-merge (trimming only
-    delays peaks); reaps are never dropped, only chunked."""
-    base = len(b'{"samples":[],"reaps":[]}')
+def _split_report_posts(
+    samples: list[dict[str, Any]],
+    reaps: list[dict[str, Any]],
+    throttles: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    """Split samples+reaps+throttles into report POSTs each well under the
+    server 32768-byte body cap. Samples are idempotent max-merge (trimming
+    only delays peaks); reaps and throttle receipts are never dropped, only
+    chunked."""
+    base = len(b'{"samples":[],"reaps":[],"throttles":[]}')
+    throttles = throttles or []
     posts: list[dict[str, Any]] = []
     cur_s: list[dict[str, Any]] = []
     cur_r: list[dict[str, Any]] = []
+    cur_t: list[dict[str, Any]] = []
 
     def _bytes() -> int:
-        return base + sum(_json_bytes(v) + 1 for v in cur_s) + sum(_json_bytes(v) + 1 for v in cur_r)
+        return (base + sum(_json_bytes(v) + 1 for v in cur_s)
+                + sum(_json_bytes(v) + 1 for v in cur_r)
+                + sum(_json_bytes(v) + 1 for v in cur_t))
 
     def _flush() -> None:
-        nonlocal cur_s, cur_r
-        if cur_s or cur_r:
-            posts.append({"samples": cur_s, "reaps": cur_r})
+        nonlocal cur_s, cur_r, cur_t
+        if cur_s or cur_r or cur_t:
+            posts.append({"samples": cur_s, "reaps": cur_r, "throttles": cur_t})
         cur_s = []
         cur_r = []
+        cur_t = []
     for item in samples:
-        if len(cur_s) >= MAX_SAMPLES or ((cur_s or cur_r) and _bytes() + _json_bytes(item) + 1 > REPORT_BYTE_BUDGET):
+        if len(cur_s) >= MAX_SAMPLES or ((cur_s or cur_r or cur_t) and _bytes() + _json_bytes(item) + 1 > REPORT_BYTE_BUDGET):
             _flush()
         cur_s.append(item)
     for item in reaps:
-        if len(cur_r) >= MAX_REAPS_PER_POST or ((cur_s or cur_r) and _bytes() + _json_bytes(item) + 1 > REPORT_BYTE_BUDGET):
+        if len(cur_r) >= MAX_REAPS_PER_POST or ((cur_s or cur_r or cur_t) and _bytes() + _json_bytes(item) + 1 > REPORT_BYTE_BUDGET):
             _flush()
         cur_r.append(item)
+    for item in throttles:
+        if len(cur_t) >= MAX_THROTTLES_PER_POST or ((cur_s or cur_r or cur_t) and _bytes() + _json_bytes(item) + 1 > REPORT_BYTE_BUDGET):
+            _flush()
+        cur_t.append(item)
     _flush()
     return posts
 
@@ -1040,6 +1264,7 @@ def run_watchdog_cycle(
         # WITHOUT a current native row still emit cached/null final rows so
         # finished states are finalized durably instead of skipped.
         samples: list[dict[str, Any]] = []
+        throttles: list[dict[str, Any]] = []
         for entry in sessions:
             if not isinstance(entry, dict):
                 continue
@@ -1076,6 +1301,14 @@ def run_watchdog_cycle(
                 samples.append(row)
                 if _finite_number(peak.get("peak_rss_mb")) is not None and peak["peak_rss_mb"] >= rss_flag_mb:
                     summary["flagged"] += 1
+                if not terminal:
+                    # Reversible CPU throttle (intake f31b678f): sampled every
+                    # heartbeat; only a verified cpu.max write on this
+                    # session's own workload scope, never a stop or signal.
+                    throttles.extend(evaluate_cpu_throttle(
+                        config, entry, measured, peak, now, observed_at))
+                else:
+                    throttles.extend(release_terminal_throttle(entry, peak, now, observed_at))
             elif terminal:
                 # No current native row (or unreadable tree) for a finished
                 # session: finalize from cached peaks, else null fields with
@@ -1089,6 +1322,7 @@ def run_watchdog_cycle(
                 view["current_cpu_cores"] = None
                 state["peaks"][_peak_key(sid, nid)] = view
                 samples.append(_sample_row(sid, nid, view, observed_at))
+                throttles.extend(release_terminal_throttle(entry, view, now, observed_at))
 
         # Destructive watchdog passes are gated to the configured 300..600s
         # cadence with a durable timestamp; sampling/reporting above runs
@@ -1161,8 +1395,9 @@ def run_watchdog_cycle(
                 state["last_watchdog_ms"] = now
         if journal_ready:
             save_state(journal_dir, state)
-        # Report samples + reaps (host auth via Dispatcher.request), replaying
-        # unacknowledged receipts. Only a server {reported:true} clears them.
+        # Report samples + reaps + throttle receipts (host auth via
+        # Dispatcher.request), replaying unacknowledged receipts. Only a
+        # server {reported:true} clears them.
         reported_map = state.get("reported")
         if not isinstance(reported_map, dict):
             reported_map = state["reported"] = {}
@@ -1177,9 +1412,23 @@ def run_watchdog_cycle(
             if fresh_reap["id"] not in seen_ids:
                 seen_ids.add(fresh_reap["id"])
                 merged.append(fresh_reap)
+        throttle_map = state.get("throttle_reports")
+        if not isinstance(throttle_map, dict):
+            throttle_map = state["throttle_reports"] = {}
+        merged_throttles: list[dict[str, Any]] = []
+        throttle_ids: set[str] = set()
+        for cached in list(throttle_map.values()):
+            if isinstance(cached, dict) and isinstance(cached.get("id"), str) and cached["id"] not in throttle_ids:
+                throttle_ids.add(cached["id"])
+                merged_throttles.append(cached)
+        for fresh_throttle in throttles:
+            if fresh_throttle["id"] not in throttle_ids:
+                throttle_ids.add(fresh_throttle["id"])
+                merged_throttles.append(fresh_throttle)
         acked: set[str] = set()
+        throttles_acked: set[str] = set()
         report_error: Optional[str] = None
-        for post in _split_report_posts(samples, merged):
+        for post in _split_report_posts(samples, merged, merged_throttles):
             try:
                 response = request("POST", "/api/fleet/resources/report", post)
             except Exception as exc:
@@ -1191,19 +1440,28 @@ def run_watchdog_cycle(
             for item in post["reaps"]:
                 if isinstance(item, dict) and isinstance(item.get("id"), str):
                     acked.add(item["id"])
+            for item in post["throttles"]:
+                if isinstance(item, dict) and isinstance(item.get("id"), str):
+                    throttles_acked.add(item["id"])
         if report_error is not None:
-            if samples or merged:
+            if samples or merged or merged_throttles:
                 summary.update({"ok": False, "error": report_error})
         else:
             for rid in acked:
                 reported_map.pop(rid, None)
+            for tid in throttles_acked:
+                throttle_map.pop(tid, None)
         for fresh_reap in reaps:
             if fresh_reap["id"] not in acked:
                 if fresh_reap["id"] in reported_map or len(reported_map) < MAX_REPORTED_ENTRIES:
                     reported_map[fresh_reap["id"]] = fresh_reap
+        for fresh_throttle in throttles:
+            if fresh_throttle["id"] not in throttles_acked:
+                if fresh_throttle["id"] in throttle_map or len(throttle_map) < MAX_THROTTLE_RECEIPTS:
+                    throttle_map[fresh_throttle["id"]] = fresh_throttle
         if journal_ready:
             save_state(journal_dir, state)
-        summary.update({"samples": len(samples), "reaps": len(reaps)})
+        summary.update({"samples": len(samples), "reaps": len(reaps), "throttles": len(throttles)})
         return summary
     except Exception as exc:  # Never break Dispatcher.once.
         summary.update({"ok": False, "error": type(exc).__name__[:64]})

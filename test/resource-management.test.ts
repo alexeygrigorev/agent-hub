@@ -284,6 +284,41 @@ describe('resource management',()=>{
   expect(task.status).toBe('open');expect(task.history).toHaveLength(2);expect(task.history[1].text).toContain('restart');
   expect(r.usage()[0]).toMatchObject({state:'stopped',finished_at:iso()});
  }));
+ it('records reversible CPU throttle receipts, notes the intake and exposes active state (intake f31b678f)',async()=>fixture(async(r,sql)=>{
+  const throttled={id:'cpu-throttle:session:native:throttled:1',session_id:'session',native_id:'native',action:'throttled',cap_cores:2,sustain_s:300,cpu_max:'2000000 100000',prior_cpu_max:'max 100000',outcome:'applied',at:iso()};
+  r.report('host',{samples:[sample()],reaps:[],throttles:[throttled]});
+  const rows=r.throttles();
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({session_id:'session',machine_id:'host',action:'throttled',cap_cores:2,active:true});
+  const history=JSON.parse(sql.exec("SELECT data FROM intake_tasks WHERE id='task'").one().data).history;
+  expect(history.some((h:any)=>h.text.includes('throttled session session') && h.text.includes('No process was stopped'))).toBe(true);
+  // Live usage row is marked throttled; the overview carries the active count.
+  expect(r.usage()[0].cpu_throttled).toBe(true);
+  expect(r.overview().active_throttles).toBe(1);
+  // Release lifts the flag: latest action per native decides.
+  const released={...throttled,id:'cpu-throttle:session:native:released:2',action:'released',cpu_max:'max 100000',prior_cpu_max:null,outcome:'restored',at:iso(1000)};
+  r.report('host',{samples:[],reaps:[],throttles:[released]});
+  expect(r.throttles()).toHaveLength(2);
+  expect(r.throttles()[0]).toMatchObject({action:'released',active:false});
+  expect(r.usage()[0].cpu_throttled).toBe(false);
+  expect(r.overview().active_throttles).toBe(0);
+  // Idempotent replay and binding/payload validation.
+  r.report('host',{samples:[],reaps:[],throttles:[released]});
+  expect(r.throttles()).toHaveLength(2);
+  expect(()=>r.report('host',{samples:[],reaps:[],throttles:[{...throttled,id:'spaces not allowed'}]})).toThrow('invalid_throttle');
+  expect(()=>r.report('host',{samples:[],reaps:[],throttles:[{...throttled,action:'killed'}]})).toThrow('invalid_throttle');
+  expect(()=>r.report('host',{samples:[],reaps:[],throttles:[{...throttled,session_id:'other'}]})).toThrow('resource_binding_mismatch');
+  expect(()=>r.report('host',{samples:[],reaps:[],throttles:[{...throttled,at:'not-a-time'}]})).toThrow('invalid_resource_timestamp');
+ }));
+ it('validates CPU throttle config bounds and serves them to hosts',async()=>fixture(async(r,sql)=>{
+  const config=r.config();
+  expect(config).toMatchObject({cpu_throttle_cores:2,cpu_throttle_sustain_s:300});
+  expect(resourceConfig({cpu_throttle_cores:1.5,cpu_throttle_sustain_s:60}).cpu_throttle_cores).toBe(1.5);
+  expect(()=>resourceConfig({cpu_throttle_cores:.1})).toThrow('invalid_resource_config');
+  expect(()=>resourceConfig({cpu_throttle_cores:129})).toThrow('invalid_resource_config');
+  expect(()=>resourceConfig({cpu_throttle_sustain_s:29})).toThrow('invalid_resource_config');
+  expect(()=>resourceConfig({cpu_throttle_sustain_s:3601})).toThrow('invalid_resource_config');
+ }));
  it('settles a native binding once across changed attempts and preserves its completion state',async()=>fixture(async(r,sql)=>{
   sql.exec("UPDATE fleet_launches SET state='exited',finished_at=? WHERE id='launch'",iso());
   sql.exec("UPDATE session_control_sessions SET state='exited' WHERE id='session'");

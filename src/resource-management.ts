@@ -37,6 +37,8 @@ INSERT OR IGNORE INTO resource_history_revision VALUES(1,'initial');
 CREATE TABLE IF NOT EXISTS resource_evidence (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, native_id TEXT NOT NULL, reason TEXT NOT NULL, saved_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_reaps (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, machine_id TEXT NOT NULL, native_id TEXT NOT NULL, intake_id TEXT, actor TEXT NOT NULL, reason TEXT NOT NULL, freed_mb REAL, at TEXT NOT NULL, evidence_id TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS resource_reaps_native ON resource_reaps(machine_id,native_id,session_id);
+CREATE TABLE IF NOT EXISTS resource_throttles (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, machine_id TEXT NOT NULL, native_id TEXT NOT NULL, intake_id TEXT, action TEXT NOT NULL, cap_cores REAL, sustain_s REAL, cpu_max TEXT, outcome TEXT, at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS resource_throttles_native ON resource_throttles(machine_id,native_id,session_id);
 `;
 export function percentile(values: number[], p: number): number | null {
   if (!values.length) return null;
@@ -50,11 +52,12 @@ export function resourceConfig(value: any = {}): ResourceConfig {
     estimate_multiplier: [1,4], ramp_seconds: [30,900], cpu_load_factor: [.5,4],
     watchdog_interval_s: [300,600], idle_minutes: [10,10080], rss_flag_gb: [.125,1024],
     cpu_target_utilization:[.1,1],cpu_default_cores:[.05,128],cpu_estimate_multiplier:[1,4],cpu_psi_hard_cap_pct:[1,100],cpu_psi_full_hard_cap_pct:[.1,100],memory_psi_full_hard_cap_pct:[.1,100],choking_cooldown_seconds:[30,3600],
+    cpu_throttle_cores:[.25,128],cpu_throttle_sustain_s:[30,3600],
   };
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_resource_config');
   for (const [k,v] of Object.entries(value)) {
     if (!bounds[k] || !finite(v) || (v as number) < bounds[k][0] || (v as number) > bounds[k][1]) throw new Error('invalid_resource_config');
-    if (!['disk_floor_gb','cpu_load_factor','estimate_multiplier','rss_flag_gb','cpu_target_utilization','cpu_default_cores','cpu_estimate_multiplier','cpu_psi_hard_cap_pct','cpu_psi_full_hard_cap_pct','memory_psi_full_hard_cap_pct'].includes(k) && !Number.isSafeInteger(v)) throw new Error('invalid_resource_config');
+    if (!['disk_floor_gb','cpu_load_factor','estimate_multiplier','rss_flag_gb','cpu_target_utilization','cpu_default_cores','cpu_estimate_multiplier','cpu_psi_hard_cap_pct','cpu_psi_full_hard_cap_pct','memory_psi_full_hard_cap_pct','cpu_throttle_cores'].includes(k) && !Number.isSafeInteger(v)) throw new Error('invalid_resource_config');
     (result as any)[k] = v;
   }
   return result;
@@ -521,14 +524,53 @@ export class ResourceManagement {
       this.sql.exec("UPDATE fleet_launches SET state=CASE WHEN state IN ('exited','failed','stopped') THEN state ELSE 'failed' END,finished_at=COALESCE(finished_at,?),exit_reason=COALESCE(exit_reason,?),updated_at=? WHERE id=?",reap.at,'watchdog_'+reap.reason,reap.at,session.fleet_launch_id);
       this.sql.exec("UPDATE fleet_sessions SET phase='exited',observed_at=? WHERE machine_id=? AND native_id=?",reap.at,machine,session.native_id);
     }
+    for (const throttle of value.throttles ?? []) {
+      // Reversible CPU-throttle receipts (intake f31b678f): the host only
+      // reports verified cpu.max writes on the session's own workload scope;
+      // a throttle never stops anything, so intake-note failures must not
+      // fail the whole report and unlike reaps there is no replay gate.
+      if (!throttle || typeof throttle.id!=='string' || !/^[\w:-]{1,128}$/.test(throttle.id)
+        || !['throttled','released'].includes(throttle.action)
+        || (throttle.cap_cores!=null && (!finite(throttle.cap_cores) || throttle.cap_cores>10000))
+        || (throttle.sustain_s!=null && (!finite(throttle.sustain_s) || throttle.sustain_s>100000))
+        || (throttle.cpu_max!=null && (typeof throttle.cpu_max!=='string' || throttle.cpu_max.length>64))
+        || (throttle.prior_cpu_max!=null && (typeof throttle.prior_cpu_max!=='string' || throttle.prior_cpu_max.length>64))
+        || (throttle.outcome!=null && (typeof throttle.outcome!=='string' || throttle.outcome.length>32))) throw new Error('invalid_throttle');
+      const tsession=sessions.get(throttle.session_id);
+      if (!tsession || throttle.native_id!==tsession.native_id) throw new Error('resource_binding_mismatch');
+      const at=Date.parse(throttle.at);
+      if (!Number.isFinite(at) || at>this.now()+30000 || at<this.now()-86400000) throw new Error('invalid_resource_timestamp');
+      const prior:any=this.sql.exec('SELECT * FROM resource_throttles WHERE id=?',throttle.id).toArray()[0];
+      if (prior) { if(prior.session_id!==tsession.session_id || prior.action!==throttle.action) throw new Error('throttle_conflict'); continue; }
+      this.sql.exec('INSERT INTO resource_throttles VALUES(?,?,?,?,?,?,?,?,?,?,?)',throttle.id,tsession.session_id,machine,tsession.native_id,tsession.intake_id,throttle.action,throttle.cap_cores ?? null,throttle.sustain_s ?? null,throttle.cpu_max ?? null,throttle.outcome ?? null,throttle.at);
+      if (tsession.intake_id) {
+        const text = throttle.action==='throttled'
+          ? `Resource watchdog throttled session ${tsession.session_id}: CPU stayed above ${throttle.cap_cores ?? 'the configured'} cores for at least ${throttle.sustain_s ?? 'the configured'}s; applied reversible cgroup cpu.max "${throttle.cpu_max ?? ''}" (previous "${throttle.prior_cpu_max ?? 'unknown'}"). No process was stopped; the throttle lifts automatically when usage drops.`
+          : `Resource watchdog lifted the CPU throttle on session ${tsession.session_id}: usage fell below the cap; cgroup cpu.max restore outcome: ${throttle.outcome ?? 'unknown'}${throttle.cpu_max ? ` (restored "${throttle.cpu_max}")` : ''}.`;
+        try { this.note(tsession,throttle.id,text); }
+        catch (error) { if (!(error instanceof Error && ['intake_required','intake_not_found','intake_capacity','intake_history_capacity'].includes(error.message))) throw error; }
+      }
+    }
     return {reported:true,samples:value.samples.length,reaps:value.reaps.length};
   }
   usage(filters: any = {}) {
     const clauses:string[]=[], args:string[]=[];
     for (const k of ['project','engine','kind']) if(filters[k]) { clauses.push(k+'=?');args.push(filters[k]); }
-    return this.sql.exec('SELECT * FROM session_resource_usage'+(clauses.length?' WHERE '+clauses.join(' AND '):'')+' ORDER BY observed_at DESC LIMIT 500',...args).toArray().map((r:any)=>({...r,started_at:r.started_at || null,workspace:this.sql.exec('SELECT workspace FROM session_resource_metadata WHERE session_id=?',r.session_id).toArray()[0]?.workspace ?? null,p95_cpu_cores:this.sql.exec('SELECT p95_cpu_cores FROM session_cpu_usage WHERE session_id=?',r.session_id).toArray()[0]?.p95_cpu_cores ?? null,rss_flagged:r.peak_rss_mb>=this.config().rss_flag_gb*1024,token_join_key:r.machine_id+':'+r.native_id}));
+    const latestThrottle=new Map<string,string>();
+    for (const r of this.sql.exec('SELECT machine_id,native_id,action FROM resource_throttles ORDER BY at ASC LIMIT 1000').toArray() as any[])
+      latestThrottle.set(r.machine_id+':'+r.native_id,r.action);
+    return this.sql.exec('SELECT * FROM session_resource_usage'+(clauses.length?' WHERE '+clauses.join(' AND '):'')+' ORDER BY observed_at DESC LIMIT 500',...args).toArray().map((r:any)=>({...r,started_at:r.started_at || null,workspace:this.sql.exec('SELECT workspace FROM session_resource_metadata WHERE session_id=?',r.session_id).toArray()[0]?.workspace ?? null,p95_cpu_cores:this.sql.exec('SELECT p95_cpu_cores FROM session_cpu_usage WHERE session_id=?',r.session_id).toArray()[0]?.p95_cpu_cores ?? null,rss_flagged:r.peak_rss_mb>=this.config().rss_flag_gb*1024,token_join_key:r.machine_id+':'+r.native_id,cpu_throttled:latestThrottle.get(r.machine_id+':'+r.native_id)==='throttled'}));
   }
   reaps() { return this.sql.exec('SELECT * FROM resource_reaps ORDER BY at DESC LIMIT 100').toArray(); }
+  throttles() {
+    const rows=this.sql.exec('SELECT * FROM resource_throttles ORDER BY at DESC LIMIT 100').toArray();
+    // Latest action per physical native decides the active flag: a release
+    // newer than the last apply means the cap is lifted.
+    const latest=new Map<string,string>();
+    for (const r of this.sql.exec('SELECT machine_id,native_id,action,at FROM resource_throttles ORDER BY at ASC LIMIT 1000').toArray() as any[])
+      latest.set(r.machine_id+':'+r.native_id,r.action);
+    return rows.map((r:any)=>({...r,active:latest.get(r.machine_id+':'+r.native_id)==='throttled'}));
+  }
   overview() {
     const rows=this.sql.exec('SELECT id,hostname,drained,capabilities,last_heartbeat,last_checkin_at FROM machines WHERE drained=0').toArray() as any[];
     // Intake 4398ce2a: a stale re-registered record of the same physical host
@@ -550,7 +592,9 @@ export class ResourceManagement {
     });
     const sessions=this.usage(),groups=new Map<string,any[]>();
     for (const row of sessions as any[]) {const key=JSON.stringify([row.project,row.engine,row.kind]); if(!groups.has(key))groups.set(key,[]);groups.get(key)!.push(row);}
+    const throttles=this.throttles();
     return {config:this.config(),hosts,sessions,stats:[...groups.values()].map(rows=>({project:rows[0].project,engine:rows[0].engine,kind:rows[0].kind,samples:rows.length,
-      p50_rss_mb:percentile(rows.map(r=>r.peak_rss_mb).filter(finite),50),p90_rss_mb:percentile(rows.map(r=>r.peak_rss_mb).filter(finite),90)})),reaps:this.reaps()};
+      p50_rss_mb:percentile(rows.map(r=>r.peak_rss_mb).filter(finite),50),p90_rss_mb:percentile(rows.map(r=>r.peak_rss_mb).filter(finite),90)})),reaps:this.reaps(),
+      throttles,active_throttles:throttles.filter((t:any)=>t.active).length};
   }
 }

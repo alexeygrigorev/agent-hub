@@ -147,11 +147,13 @@ def update_cpu_distribution(state, counter_seconds, identity, observed_ms, *, te
     current = None
     valid = not frozen and _number(counter_seconds) and _number(observed_ms) and isinstance(identity, str) and bool(identity)
     prior = state.get("cpu_baseline")
+    interval_ms = None
     if valid and isinstance(prior, dict) and prior.get("identity") == identity:
         dt = observed_ms - prior["at"]
         dc = counter_seconds - prior["counter"]
         if dt > 0 and dc >= 0:
             current = dc / (dt / 1000)
+            interval_ms = dt
             bucket = min(20480, math.ceil(current * 20))
             histogram = state.setdefault("cpu_histogram", {})
             histogram[str(bucket)] = histogram.get(str(bucket), 0) + dt
@@ -167,4 +169,5 @@ def update_cpu_distribution(state, counter_seconds, identity, observed_ms, *, te
         if accumulated >= total * .95:
             p95 = int(key) / 20 if int(key) < 20480 else max(1024, state["cpu_max_cores"])
             break
-    return {"current_cpu_cores": current, "p95_cpu_cores": p95}
+    return {"current_cpu_cores": current, "p95_cpu_cores": p95,
+            "current_interval_ms": interval_ms}

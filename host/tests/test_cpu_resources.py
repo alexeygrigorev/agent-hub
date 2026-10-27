@@ -83,7 +83,7 @@ class CpuResourcesTests(unittest.TestCase):
     def test_first_reset_missing_identity_and_out_of_order_are_unknown(self):
         state = {}
         self.assertIsNone(update_cpu_distribution(state, 50, "native:1", 1000)["current_cpu_cores"])
-        self.assertEqual(update_cpu_distribution(state, 52, "native:1", 2000), {"current_cpu_cores": 2, "p95_cpu_cores": 2})
+        self.assertEqual(update_cpu_distribution(state, 52, "native:1", 2000), {"current_cpu_cores": 2, "p95_cpu_cores": 2, "current_interval_ms": 1000})
         for counter, identity, at in [(1, "native:1", 3000), (2, "native:2", 4000), (None, "native:2", 5000), (4, "native:2", 3500)]:
             self.assertIsNone(update_cpu_distribution(state, counter, identity, at)["current_cpu_cores"])
         self.assertEqual(state["cpu_baseline"]["at"], 4000)
@@ -109,9 +109,9 @@ class CpuResourcesTests(unittest.TestCase):
         live = copy.deepcopy(state)
         self.assertEqual(update_cpu_distribution(live, 200, "native:1", 2200000)["p95_cpu_cores"], 0)
         self.assertEqual(update_cpu_distribution(state, 200, "native:1", 200000, terminal=True),
-                         {"current_cpu_cores": None, "p95_cpu_cores": 2})
+                         {"current_cpu_cores": None, "p95_cpu_cores": 2, "current_interval_ms": None})
         for at in (2200000, 3600000, 7200000):
             self.assertEqual(update_cpu_distribution(state, 999, "new-remnant:2", at),
-                             {"current_cpu_cores": None, "p95_cpu_cores": 2})
+                             {"current_cpu_cores": None, "p95_cpu_cores": 2, "current_interval_ms": None})
         self.assertEqual(state["cpu_histogram"], before["cpu_histogram"])
         self.assertEqual(state["cpu_baseline"], before["cpu_baseline"])

@@ -1301,5 +1301,184 @@ class ResourcesCliRenderTests(unittest.TestCase):
         self.assertIn("kind=review", seen["path"])
 
 
+class CpuThrottleTests(unittest.TestCase):
+    """Reversible watchdog CPU throttle (intake f31b678f, AC2/AC3)."""
+
+    SESSION = "sess-thr"
+    NATIVE = "22222222-2222-4222-8222-222222222222"
+
+    def _entry(self, **kw):
+        base = _entry(session_id=self.SESSION, native_id=self.NATIVE,
+                      fleet_launch_id="launch-thr", state="running")
+        base.update(kw)
+        return base
+
+    def _native(self, **kw):
+        base = dict(session_id=self.NATIVE, tag="hub-thr", workspace="/repo",
+                    engine="codex", profile=None, phase="running",
+                    last_activity_ms=1_000_000, created_at_ms=900_000, cwd=None,
+                    containment_empty=False, workload_cgroup=None, worker_pid=None,
+                    workload_pid=None, processes=None, agent_state_at_ms=None,
+                    headless_exec=False)
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def _cycle(self, now_ms, sample, journal, entries=None, natives=None,
+               config=None, report_responses=None):
+        """One watchdog cycle with a caller-supplied sampler result."""
+        calls = {"reports": [], "stops": 0}
+        cfg = {"watchdog_interval_s": 300, "idle_minutes": 60, "rss_flag_gb": 4,
+               "cpu_throttle_cores": 2.0, "cpu_throttle_sustain_s": 30}
+        if config:
+            cfg.update(config)
+
+        def request(method, path, payload=None):
+            if path == "/api/fleet/resources/watchdog":
+                return {"config": cfg, "sessions": entries if entries is not None else [self._entry()]}
+            if path == "/api/fleet/resources/report":
+                calls["reports"].append(payload)
+                if report_responses:
+                    response = report_responses.pop(0)
+                    if isinstance(response, Exception):
+                        raise response
+                    return response
+                return {"reported": True}
+            raise AssertionError(path)
+
+        with patch("agent_hub_host.native_sessions.list_sessions",
+                   return_value=natives if natives is not None else [self._native()]), \
+             patch("agent_hub_host.native_sessions.qualify_target",
+                   side_effect=lambda exe, t, live_only=True: (natives or [self._native()])[0]), \
+             patch("agent_hub_host.native_sessions.stop_session") as stop_mock, \
+             patch.object(rm, "sample_session_tree", return_value=sample):
+            out = rm.run_watchdog_cycle(request, journal_dir=journal, now_ms=now_ms)
+            calls["stops"] = stop_mock.call_count
+        return out, calls
+
+    def _cgroup(self, tmp, cpu_max="max 100000"):
+        cg = Path(tmp) / "aplexer-workload-thr.scope"
+        cg.mkdir(exist_ok=True)
+        (cg / "cpu.max").write_text(cpu_max + "\n")
+        return cg
+
+    @staticmethod
+    def _sample(cg, cpu_seconds, previous=None):
+        """Sampler result whose cgroup delta yields >2 cores between samples."""
+        out = {"rss_mb": 100.0, "pss_mb": 50.0, "cpu_seconds": cpu_seconds,
+               "runtime_s": 1000.0, "avg_cpu_cores": 0.1, "current_mb": 100.0,
+               "cpu_identity": "cgroup:%s:4711" % cg,
+               "cgroup_path": str(cg)}
+        if previous is not None:
+            out["cpu_identity"] = previous["cpu_identity"]
+        return out
+
+    def test_throttle_applies_after_sustained_over_cap_and_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = str(Path(tmp) / "journal")
+            Path(journal).mkdir(mode=0o700)
+            cg = self._cgroup(tmp)
+            over = self._sample(cg, 100.0)
+            out1, calls1 = self._cycle(10_000_000, over, journal)
+            self.assertEqual(calls1["stops"], 0)
+            self.assertFalse(any(p.get("throttles") for p in calls1["reports"]))
+            # 31s later the delta is 99 cores-seconds / 31s ~ 3.2 cores > cap 2.
+            over2 = self._sample(cg, 199.0, previous=over)
+            out2, calls2 = self._cycle(10_031_000, over2, journal)
+            self.assertEqual(calls2["stops"], 0)  # Never kills.
+            receipts = [t for p in calls2["reports"] for t in p.get("throttles", [])]
+            self.assertEqual(len(receipts), 1)
+            self.assertEqual(receipts[0]["action"], "throttled")
+            self.assertEqual(receipts[0]["session_id"], self.SESSION)
+            self.assertEqual(receipts[0]["cpu_max"], "2000000 100000")
+            self.assertEqual(receipts[0]["prior_cpu_max"], "max 100000")
+            self.assertEqual((cg / "cpu.max").read_text().strip(), "2000000 100000")
+            self.assertTrue(out2.get("ok"))
+
+    def test_throttle_lifts_when_usage_drops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = str(Path(tmp) / "journal")
+            Path(journal).mkdir(mode=0o700)
+            cg = self._cgroup(tmp)
+            self._cycle(10_000_000, self._sample(cg, 100.0), journal)
+            self._cycle(10_031_000, self._sample(cg, 199.0), journal)
+            self.assertEqual((cg / "cpu.max").read_text().strip(), "2000000 100000")
+            idle = self._sample(cg, 199.5)
+            out3, calls3 = self._cycle(10_062_000, idle, journal)
+            receipts = [t for p in calls3["reports"] for t in p.get("throttles", [])]
+            self.assertEqual(len(receipts), 1)
+            self.assertEqual(receipts[0]["action"], "released")
+            self.assertEqual(receipts[0]["outcome"], "restored")
+            self.assertEqual(receipts[0]["cpu_max"], "max 100000")
+            self.assertEqual((cg / "cpu.max").read_text().strip(), "max 100000")
+
+    def test_throttle_persists_at_cap_without_flapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = str(Path(tmp) / "journal")
+            Path(journal).mkdir(mode=0o700)
+            cg = self._cgroup(tmp)
+            self._cycle(10_000_000, self._sample(cg, 100.0), journal)
+            self._cycle(10_031_000, self._sample(cg, 199.0), journal)
+            # Throttled ceiling over a 31s interval: dc=62 -> 2.0 cores,
+            # NOT below the 80% release line (1.6).
+            at_cap = self._sample(cg, 261.0)
+            _, calls = self._cycle(10_062_000, at_cap, journal)
+            receipts = [t for p in calls["reports"] for t in p.get("throttles", [])]
+            self.assertEqual(receipts, [])
+            self.assertEqual((cg / "cpu.max").read_text().strip(), "2000000 100000")
+
+    def test_throttle_never_applies_to_keep_or_unreadable_cpu_max(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = str(Path(tmp) / "journal")
+            Path(journal).mkdir(mode=0o700)
+            cg = self._cgroup(tmp)
+            keep = self._entry(keep=True)
+            self._cycle(10_000_000, self._sample(cg, 100.0), journal, entries=[keep])
+            _, calls = self._cycle(10_031_000, self._sample(cg, 199.0), journal, entries=[keep])
+            receipts = [t for p in calls["reports"] for t in p.get("throttles", [])]
+            self.assertEqual(receipts, [])
+            self.assertEqual((cg / "cpu.max").read_text().strip(), "max 100000")
+            # Unreadable cpu.max fails safe: no throttle, no crash.
+            (cg / "cpu.max").unlink()
+            out, calls2 = self._cycle(10_062_000, self._sample(cg, 298.0), journal)
+            self.assertTrue(out.get("ok"))
+            self.assertEqual([t for p in calls2["reports"] for t in p.get("throttles", [])], [])
+
+    def test_terminal_session_releases_throttle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = str(Path(tmp) / "journal")
+            Path(journal).mkdir(mode=0o700)
+            cg = self._cgroup(tmp)
+            self._cycle(10_000_000, self._sample(cg, 100.0), journal)
+            self._cycle(10_031_000, self._sample(cg, 199.0), journal)
+            self.assertEqual((cg / "cpu.max").read_text().strip(), "2000000 100000")
+            terminal = self._entry(state="failed")
+            done = self._sample(cg, 199.2)
+            _, calls = self._cycle(10_062_000, done, journal, entries=[terminal])
+            receipts = [t for p in calls["reports"] for t in p.get("throttles", [])]
+            self.assertEqual([r["action"] for r in receipts], ["released"])
+            self.assertEqual((cg / "cpu.max").read_text().strip(), "max 100000")
+
+    def test_unacked_throttle_receipt_replays_until_ack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = str(Path(tmp) / "journal")
+            Path(journal).mkdir(mode=0o700)
+            cg = self._cgroup(tmp)
+            self._cycle(10_000_000, self._sample(cg, 100.0), journal)
+            # The apply cycle's report transport fails: the receipt must
+            # survive durably even though the cpu.max write happened.
+            self._cycle(10_031_000, self._sample(cg, 199.0), journal,
+                        report_responses=[RuntimeError("transport down")])
+            state = rm.load_state(journal)
+            self.assertTrue(state["throttle_reports"])
+            # Next cycle replays the same idempotent receipt; ACK clears it.
+            # Usage stays at the throttled ceiling (2.0 cores), so the only
+            # reported receipt is the replayed apply.
+            _, calls = self._cycle(10_062_000, self._sample(cg, 261.0), journal)
+            replayed = [t for p in calls["reports"] for t in p.get("throttles", [])]
+            self.assertEqual([r["action"] for r in replayed], ["throttled"])
+            state = rm.load_state(journal)
+            self.assertEqual(state["throttle_reports"], {})
+
+
 if __name__ == "__main__":
     unittest.main()
