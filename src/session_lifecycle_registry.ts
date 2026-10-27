@@ -130,6 +130,24 @@ type JoinedBase = {
   fleet: any | null;
 };
 
+/** Request bodies are immutable between canonical request writes. Keep only
+ * lifecycle fields, atomically maintained even when native telemetry changes. */
+export function initLifecycleRequestProjection(sql: SqlStorage): void {
+  sql.exec(`CREATE TABLE IF NOT EXISTS lifecycle_request_projection (
+    id TEXT PRIMARY KEY,request_json TEXT NOT NULL,has_brief INTEGER NOT NULL)`);
+  const brief = (column: string) => `COALESCE(json_type(CASE WHEN json_valid(${column}) THEN ${column} ELSE '{}' END,'$.brief')='text',0)`;
+  const put = `INSERT OR REPLACE INTO lifecycle_request_projection VALUES
+    (NEW.id,${jsonFields('NEW.request_json',['provenance','workspace','cwd'])},${brief('NEW.request_json')});`;
+  sql.exec(`CREATE TRIGGER IF NOT EXISTS lifecycle_request_insert AFTER INSERT ON session_control_sessions BEGIN ${put} END`);
+  sql.exec(`CREATE TRIGGER IF NOT EXISTS lifecycle_request_update AFTER UPDATE OF id,request_json ON session_control_sessions BEGIN
+    DELETE FROM lifecycle_request_projection WHERE id=OLD.id; ${put} END`);
+  sql.exec(`CREATE TRIGGER IF NOT EXISTS lifecycle_request_delete AFTER DELETE ON session_control_sessions BEGIN
+    DELETE FROM lifecycle_request_projection WHERE id=OLD.id; END`);
+  sql.exec(`INSERT INTO lifecycle_request_projection SELECT c.id,
+    ${jsonFields('c.request_json',['provenance','workspace','cwd'])},${brief('c.request_json')}
+    FROM session_control_sessions c WHERE NOT EXISTS(SELECT 1 FROM lifecycle_request_projection p WHERE p.id=c.id)`);
+}
+
 /** Canonical identity union. Only sessions with a native identity
  * (bound hub sessions, observed fleet sessions) are keyed; unbound
  * queued/held intents stay in the existing flat list view only. */
@@ -147,18 +165,22 @@ function joinedBases(sql: SqlStorage, sessionIds?: Set<string>): JoinedBase[] {
   // Status supplies only session ids referenced by its bounded task page.
   // Batch canonical joins rather than materializing the entire fleet archive.
   const selected = sessionIds ? [...sessionIds] : null;
+  let projected = false;
+  try { projected = sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='lifecycle_request_projection'").toArray().length > 0; } catch {}
+  const source = (table: string) => table === 'session_control_sessions' && projected
+    ? `${table} c LEFT JOIN lifecycle_request_projection lp ON lp.id=c.id` : `${table} c`;
   const columns = (table: string) => {
     if (table === 'session_control_sessions') return `c.id,c.actor,c.machine_id,c.fleet_launch_id,c.binding_json,c.mode,c.session_type,
       c.owner_token_id,c.owner_family,c.state,c.updated_at,c.engine,
-      ${jsonFields('c.request_json',['provenance','workspace','cwd'])} AS request_json,
-      json_type(CASE WHEN json_valid(c.request_json) THEN c.request_json ELSE '{}' END,'$.brief')='text' AS has_brief`;
+      ${projected ? `COALESCE(lp.request_json,${jsonFields('c.request_json',['provenance','workspace','cwd'])})` : jsonFields('c.request_json',['provenance','workspace','cwd'])} AS request_json,
+      ${projected ? `CASE WHEN lp.id IS NOT NULL THEN lp.has_brief ELSE json_type(CASE WHEN json_valid(c.request_json) THEN c.request_json ELSE '{}' END,'$.brief')='text' END` : `json_type(CASE WHEN json_valid(c.request_json) THEN c.request_json ELSE '{}' END,'$.brief')='text'`} AS has_brief`;
     if (table === 'fleet_launches') return `c.id,c.machine_id,c.native_id,c.actor,c.requester_kind,c.mode,c.engine,c.workspace,c.state,
       typeof(c.prompt)='text' AS has_prompt`;
     return 'c.machine_id,c.native_id,c.engine,c.workspace,c.cwd,c.tag,c.last_activity_at,c.observed_at,c.phase,c.agent_state';
   };
   const read = (table: string): any[] => {
     const projection = columns(table);
-    if (!selected) return sql.exec(`SELECT ${projection} FROM ${table} c ORDER BY c.rowid`).toArray() as any[];
+    if (!selected) return sql.exec(`SELECT ${projection} FROM ${source(table)} ORDER BY c.rowid`).toArray() as any[];
     const rows = new Map<string, any>();
     for (let i = 0; i < selected.length; i += 1000) {
       const ids = selected.slice(i, i + 1000);
@@ -169,14 +191,19 @@ function joinedBases(sql: SqlStorage, sessionIds?: Set<string>): JoinedBase[] {
         ? nativeId.replaceAll('binding_json', 'c.binding_json') : 'c.native_id';
       const prefix = `WITH selected AS (SELECT id,fleet_launch_id,machine_id,${nativeId} AS native_id
         FROM session_control_sessions WHERE id IN (SELECT value FROM json_each(?))) `;
-      const nativeJoin = `SELECT c.rowid AS _join_order,${projection} FROM
+      const nativeRows = `SELECT c.rowid AS matched_rowid FROM
         (SELECT DISTINCT machine_id,native_id FROM selected) s
         JOIN ${table} c ON c.machine_id=s.machine_id AND ${targetNative}=+s.native_id`;
-      const query = table === 'session_control_sessions'
-        ? `SELECT c.rowid AS _join_order,${projection} FROM ${table} c WHERE c.id IN (SELECT id FROM selected) UNION ALL ${nativeJoin}`
-        : table === 'fleet_sessions' ? nativeJoin
-        : `SELECT c.rowid AS _join_order,${projection} FROM ${table} c WHERE c.id IN
-          (SELECT fleet_launch_id FROM selected) UNION ALL ${nativeJoin}`;
+      const matches = table === 'session_control_sessions'
+        ? `SELECT c.rowid AS matched_rowid FROM ${table} c WHERE c.id IN (SELECT id FROM selected) UNION ${nativeRows}`
+        : table === 'fleet_sessions' ? nativeRows
+        : `SELECT c.rowid AS matched_rowid FROM ${table} c WHERE c.id IN
+          (SELECT fleet_launch_id FROM selected) UNION ${nativeRows}`;
+      // Deduplicate identity before projecting JSON: a selected bound control
+      // row normally matches both branches, but its large request needs parsing
+      // only once. Canonical rowid ordering still selects the oldest alias.
+      const query = `SELECT c.rowid AS _join_order,${projection} FROM ${source(table)}
+        WHERE c.rowid IN (${matches})`;
       for (const row of sql.exec(prefix + query, JSON.stringify(ids)).toArray() as any[]) rows.set(row.id ?? `${row.machine_id}/${row.native_id}`, row);
     }
     return [...rows.values()].sort((a, b) => a._join_order - b._join_order);
@@ -274,11 +301,16 @@ function taskLinkIndex(sql: SqlStorage): (native: string, hub: string | null) =>
   };
 }
 
-function observationsByKey(sql: SqlStorage): Map<string, any> {
+function observationsByKey(sql: SqlStorage, keys?: string[]): Map<string, any> {
   const map = new Map<string, any>();
   try {
-    for (const row of sql.exec('SELECT * FROM session_lifecycle_observations').toArray() as any[]) {
-      map.set(row.session_key, row);
+    if (!keys) {
+      for (const row of sql.exec('SELECT * FROM session_lifecycle_observations').toArray() as any[]) map.set(row.session_key, row);
+    } else {
+      for (let i=0;i<keys.length;i+=1000) {
+        for (const row of sql.exec('SELECT * FROM session_lifecycle_observations WHERE session_key IN (SELECT value FROM json_each(?))',
+          JSON.stringify(keys.slice(i,i+1000))).toArray() as any[]) map.set(row.session_key,row);
+      }
     }
   } catch { /* pre-init: no observations yet */ }
   return map;
@@ -375,7 +407,8 @@ function checkObservationPayload(input: any): { ok: true; stored: Record<string,
  * observations. Owner/provenance/human/engine/task linkage always come
  * from canonical rows; observations supply host-verified flags only. */
 export function buildSessionInputs(sql: SqlStorage, sessionIds?: Set<string>): { inputs: SessionInput[]; refs: Map<string, LifecycleRefs> } {
-  const observations = observationsByKey(sql);
+  const bases = joinedBases(sql, sessionIds);
+  const observations = observationsByKey(sql, sessionIds ? bases.map(base=>base.key) : undefined);
   const taskLinks = taskLinkIndex(sql);
   const protectedSessions = new Set<string>();
   let protectionKnown = true;
@@ -388,7 +421,7 @@ export function buildSessionInputs(sql: SqlStorage, sessionIds?: Set<string>): {
   // sessions share one creator; never repeat its lookup for every session.
   // Keep this cache local so credential changes are visible on the next build.
   const creators = new Map<string, any>();
-  for (const base of joinedBases(sql, sessionIds)) {
+  for (const base of bases) {
     const request = base.sc?.request_json ? parsed(base.sc.request_json, {}) : {};
     const starter: string | null =
       (typeof base.launch?.actor === 'string' && base.launch.actor) ||

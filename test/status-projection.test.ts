@@ -1,6 +1,6 @@
 import { expect, it } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
-import { buildSessionInputs } from '../src/session_lifecycle_registry';
+import { buildSessionInputs, initLifecycleRequestProjection } from '../src/session_lifecycle_registry';
 
 const inDO: any = runInDurableObject;
 const fixture = (fn: (h: any) => void) => inDO((env as any).HUB.get((env as any).HUB.idFromName('projection-' + crypto.randomUUID())), fn);
@@ -77,4 +77,71 @@ it('bounded lifecycle joins preserve duplicate-native session and launch precede
   expect(bounded).toEqual(full);
   expect(bounded.refs.get('machine/native')?.session_id).toBe('z-first');
   expect(bounded.refs.get('machine/native')?.fleet_launch_id).toBe('z-first');
+}));
+
+
+it('bounded observations follow canonical aliases without crossing machines', async () => fixture(h => {
+  const now = new Date().toISOString();
+  for (const [id, machine] of [['z-first', 'machine'], ['a-second', 'machine'], ['other', 'other-machine']]) {
+    h.sql.exec('INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+      id, 'perf:owner', id, '{}', machine, 'codex', 'headless', 'running', '{"native_id":"native"}', now, now);
+  }
+  for (const [machine, payload] of [['machine', '{"waiting_confirmation":true}'], ['other-machine', '{"awaiting_alexey":true}']]) {
+    h.sql.exec('INSERT INTO session_lifecycle_observations VALUES(?,?,?,?,?)', `${machine}/native`, machine, 'native', now, payload);
+  }
+  const all = buildSessionInputs(h.sql);
+  const selected = buildSessionInputs(h.sql, new Set(['a-second']));
+  expect(selected.inputs).toEqual(all.inputs.filter(input => input.machine_id === 'machine'));
+  expect(selected.refs.get('machine/native')).toEqual(all.refs.get('machine/native'));
+  expect(selected.refs.get('machine/native')?.session_id).toBe('z-first');
+  expect(selected.inputs[0]).toMatchObject({waiting_confirmation: true});
+  expect(selected.inputs[0]).not.toHaveProperty('awaiting_alexey');
+  expect(buildSessionInputs(h.sql, new Set())).toEqual({inputs: [], refs: new Map()});
+  h.sql.exec("UPDATE session_lifecycle_observations SET payload_json='not-json' WHERE machine_id='machine'");
+  expect(buildSessionInputs(h.sql, new Set(['a-second'])).inputs[0]).not.toHaveProperty('waiting_confirmation');
+  const withoutObservationStore = { exec(query: string, ...args: any[]) {
+    if (query.includes('FROM session_lifecycle_observations')) throw new Error('pre-init observation store');
+    return h.sql.exec(query, ...args);
+  }} as any;
+  expect(buildSessionInputs(withoutObservationStore, new Set(['a-second'])))
+    .toEqual(buildSessionInputs(h.sql, new Set(['a-second'])));
+}));
+
+
+it('maintains lifecycle request facts through edits, rollback and migration', async () => fixture(h => {
+  const now = new Date().toISOString();
+  h.sql.exec('INSERT INTO session_control_sessions(id,actor,request_key,request_json,machine_id,engine,mode,state,binding_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+    'request-facts', 'perf:owner', 'request-facts', JSON.stringify({cwd:'/first',workspace:'/work',brief:'private brief',prompt:'private prompt'}),
+    'machine','codex','headless','running','{"native_id":"native"}',now,now);
+  const input = () => buildSessionInputs(h.sql,new Set(['request-facts']));
+  const original = input();
+  expect(original.refs.get('machine/native')).toMatchObject({cwd:'/first',has_brief:true});
+  const compact = h.sql.exec("SELECT request_json FROM lifecycle_request_projection WHERE id='request-facts'").one().request_json;
+  expect(compact).not.toContain('private');
+  const change = () => h.sql.exec("UPDATE session_control_sessions SET request_json=? WHERE id='request-facts'",'{"cwd":"/second","brief":false}');
+  expect(() => h.ctx.storage.transactionSync(() => {change();expect(input().refs.get('machine/native')?.cwd).toBe('/second');throw new Error('rollback');})).toThrow('rollback');
+  expect(input()).toEqual(original);
+  change();
+  expect(input().refs.get('machine/native')).toMatchObject({cwd:'/second',has_brief:false});
+  // Legacy duplicate keys retain JSON.parse last-key semantics.
+  h.sql.exec("UPDATE session_control_sessions SET request_json=? WHERE id='request-facts'",'{"cwd":"/old","cwd":"/last","brief":true}');
+  expect(input().refs.get('machine/native')?.cwd).toBe('/last');
+  for(const raw of ['not-json','null','[]','false','{"cwd":{"nested":true}}','{"brief":false,"brief":"yes"}','{"brief":"yes","brief":false}']) {
+    h.sql.exec("UPDATE session_control_sessions SET request_json=? WHERE id='request-facts'",raw);
+    const outcome=()=>{try{return input();}catch(error){return {error:String(error)};}};
+    const projected=outcome();
+    h.sql.exec("DELETE FROM lifecycle_request_projection WHERE id='request-facts'");
+    expect(outcome()).toEqual(projected);
+    initLifecycleRequestProjection(h.sql);
+    expect(outcome()).toEqual(projected);
+  }
+  h.sql.exec("UPDATE session_control_sessions SET id='renamed' WHERE id='request-facts'");
+  expect(h.sql.exec("SELECT id FROM lifecycle_request_projection").toArray()).toEqual([{id:'renamed'}]);
+  h.sql.exec("UPDATE session_control_sessions SET id='request-facts' WHERE id='renamed'");
+  h.sql.exec('DROP TABLE lifecycle_request_projection');
+  const fallback = input();
+  initLifecycleRequestProjection(h.sql);
+  expect(input()).toEqual(fallback);
+  h.sql.exec("DELETE FROM session_control_sessions WHERE id='request-facts'");
+  expect(h.sql.exec('SELECT * FROM lifecycle_request_projection').toArray()).toEqual([]);
 }));

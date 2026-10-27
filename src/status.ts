@@ -5,7 +5,7 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import type { IntakeService } from './intake';
 import type { MonitoringService } from './monitoring';
-import { buildSessionInputs } from './session_lifecycle_registry';
+import { buildSessionInputs, initLifecycleRequestProjection } from './session_lifecycle_registry';
 import { classifySession, toStatusDto } from './session_lifecycle';
 import { EXPECTED_OFFLINE_UNTIL, EXPECTED_OFFLINE_REASON, expectedOfflineWindowActive, isExpectedOffline } from './status_offline';
 import { resolveMachineAliases } from './machine-alias';
@@ -253,17 +253,23 @@ export class StatusService {
   private agentCountsCache:{revision:string;value:{running:number;idle:number;waiting:number;waiting_confirmation:number}}|null=null;
   private statusSourceRows=new Map<string,Obj[]>();
   private statusSourceBytes=0;
+  private statusSourceRevision: string | null = null;
   private refreshLifecycleRevision(): boolean {
     if(!this.lifecycleCacheReady) return false;
     const revision=this.one('SELECT revision FROM status_lifecycle_revision WHERE id=1')?.revision;
     if(typeof revision!=='string' || !revision || revision!==this.lifecycleRevision) {
       this.lifecycleRevision=typeof revision==='string' && revision ? revision : null;
-      this.lifecycleInputs.clear();this.statusSourceRows.clear();this.statusSourceBytes=0;this.agentCountsCache=null;
+      this.lifecycleInputs.clear();this.agentCountsCache=null;
     }
     return this.lifecycleRevision!==null;
   }
   private cachedSourceRows(query:string,...bindings:any[]):Obj[] {
-    const ready=this.refreshLifecycleRevision();
+    const revision=this.lifecycleCacheReady ? this.one('SELECT revision FROM status_source_revision WHERE id=1')?.revision : null;
+    const ready=typeof revision==='string' && !!revision;
+    if(!ready || revision!==this.statusSourceRevision) {
+      this.statusSourceRows.clear();this.statusSourceBytes=0;
+      this.statusSourceRevision=ready ? revision : null;
+    }
     const key=JSON.stringify([query,bindings]);
     const cached=ready ? this.statusSourceRows.get(key) : undefined;
     if(cached) return cached;
@@ -281,6 +287,17 @@ export class StatusService {
 
   /** Called after Hub has initialized every canonical input table. */
   initLifecycleCache(): void {
+    initLifecycleRequestProjection(this.sql);
+    // Native activity changes lifecycle classification, but cannot change raw
+    // control rows or host observation evidence. Give those source reads their
+    // own rollback-safe generation so census writes do not evict them.
+    this.statusSourceRevision=null;
+    this.sql.exec('CREATE TABLE IF NOT EXISTS status_source_revision(id INTEGER PRIMARY KEY CHECK(id=1),revision TEXT NOT NULL)');
+    this.sql.exec("INSERT OR IGNORE INTO status_source_revision VALUES(1,lower(hex(randomblob(16))))");
+    for(const table of ['session_control_sessions','status_observations']) {
+      for(const op of ['INSERT','UPDATE','DELETE']) this.sql.exec(`CREATE TRIGGER IF NOT EXISTS status_source_${table}_${op.toLowerCase()}
+        AFTER ${op} ON ${table} BEGIN UPDATE status_source_revision SET revision=lower(hex(randomblob(16))) WHERE id=1; END`);
+    }
     this.lifecycleCacheReady = false;
     this.lifecycleRevision = null;
     this.lifecycleInputs.clear();this.statusSourceRows.clear();this.statusSourceBytes=0;this.agentCountsCache=null;

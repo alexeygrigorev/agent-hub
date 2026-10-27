@@ -141,7 +141,7 @@ it('refreshes cached status control rows and latest observations after writes an
   h.sql.exec("DELETE FROM status_observations WHERE id='source-observation'");
   expect(latest()).toBeUndefined();
   service.initLifecycleCache();expect(read()).toBe(read());
-  h.sql.exec('DELETE FROM status_lifecycle_revision');
+  h.sql.exec('DELETE FROM status_source_revision');
   expect(read()).not.toBe(read());
  });
 });
@@ -213,5 +213,29 @@ it('reads shared creator provenance once per build and refreshes missing or chan
     h.sql.exec("UPDATE session_control_sessions SET owner_token_id='cache-owner'");
     h.sql.exec("UPDATE credentials SET family_id='cache-family' WHERE id='cache-owner'");
     expect(read().refs.get('cache-host/cache-native')?.protected_session).toBe(false);
+  });
+});
+
+
+it('retains independent source rows across native activity but invalidates canonical edits and rollback',async()=>{
+  const stub=(env as any).HUB.get((env as any).HUB.idFromName('cache-independent-source'));
+  await inDO(stub,(h:any)=>{
+    seed(h);
+    const service:any=h.statusService;
+    const read=()=>service.cachedSourceRows('SELECT id,state FROM session_control_sessions WHERE id=?',id);
+    const original=read();
+    h.sql.exec("UPDATE fleet_sessions SET last_activity_at='changed' WHERE native_id='cache-native'");
+    service.readLifecycleInputs(new Set([id]));
+    expect(read()).toBe(original);
+    expect(()=>h.ctx.storage.transactionSync(()=>{
+      h.sql.exec("UPDATE session_control_sessions SET state='stopped' WHERE id=?",id);
+      expect(read()[0].state).toBe('stopped');throw new Error('rollback');
+    })).toThrow('rollback');
+    expect(read()[0].state).toBe('running');
+    h.sql.exec("UPDATE session_control_sessions SET state='failed' WHERE id=?",id);
+    expect(read()[0].state).toBe('failed');
+    const warm=read();
+    h.sql.exec("INSERT INTO status_observations VALUES('source-obs','cache-host',?,'session',?,'{}','host',?)",id,new Date().toISOString(),new Date().toISOString());
+    expect(read()).not.toBe(warm);
   });
 });
