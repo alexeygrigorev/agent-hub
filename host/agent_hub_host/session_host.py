@@ -468,6 +468,21 @@ def telemetry_step_once(dispatcher):
         print(json.dumps({'event': 'telemetry_error', 'type': type(error).__name__}), flush=True)
 
 
+def checkin_step_once(dispatcher):
+    """Liveness check-in on its own <=60s cadence (intake 056a4131 AC1).
+
+    Re-posts the heartbeat and the routing capabilities advertisement so the
+    Hub online window never expires while a slow cycle phase runs.
+    """
+    started = time.monotonic()
+    try:
+        dispatcher.checkin_tick()
+        print(json.dumps({'event': 'checkin_cycle', 'posted': True,
+                          'elapsed_s': round(time.monotonic() - started, 3)}), flush=True)
+    except Exception as error:
+        print(json.dumps({'event': 'checkin_error', 'type': type(error).__name__}), flush=True)
+
+
 def offers_step_once(dispatcher):
     """Fast offer claiming independent of the slow cycle (intake 4398ce2a)."""
     try:
@@ -740,6 +755,8 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         maintenance_thread = None
         next_telemetry = 0
         telemetry_thread = None
+        next_checkin = 0
+        checkin_thread = None
         next_offers = 0
         offers_thread = None
         bindings_thread = None
@@ -783,6 +800,13 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                     telemetry_thread = maybe_start_named_thread(
                         telemetry_thread, telemetry_step_once, (dispatcher,), 'fleet-telemetry')
                     next_telemetry = time.monotonic() + fleet.TELEMETRY_REFRESH_S
+                # Intake 056a4131 AC1: liveness check-in (heartbeat +
+                # capabilities PUT) on its own bounded cadence, independent of
+                # both the slow cycle and the heavier telemetry tick.
+                if time.monotonic() >= next_checkin:
+                    checkin_thread = maybe_start_named_thread(
+                        checkin_thread, checkin_step_once, (dispatcher,), 'fleet-checkin')
+                    next_checkin = time.monotonic() + fleet.CHECKIN_REFRESH_S
                 if time.monotonic() >= next_offers:
                     offers_thread = maybe_start_named_thread(
                         offers_thread, offers_step_once, (dispatcher,), 'fleet-offers')

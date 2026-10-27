@@ -136,6 +136,13 @@ CYCLE_LOCK_STALE_S = 480.0
 TELEMETRY_REFRESH_S = 45.0
 OFFERS_POLL_S = 2.0
 HUB_TELEMETRY_STALE_S = 180.0
+# Intake 056a4131 AC1: liveness check-in (heartbeat /api/host/poll plus the
+# routing capabilities PUT) on its own bounded cadence. The Hub online window
+# is 180 s over BOTH signals; the slow cycle posts them minutes apart under
+# load (reconcile/watchdog/dispatch phases), so the check-in must not share
+# that cycle. Keep CHECKIN_REFRESH_S <= 60 (regression test
+# test_checkin_cadence_056a4131.py).
+CHECKIN_REFRESH_S = 45.0
 # Serialises offer fetching between the slow cycle and the fast offers tick.
 # Dispatch uses a separate lock per offer so slow startup cannot block a new
 # launch (CYCLE_LOCK_NAME is reserved for slow maintenance).
@@ -3394,6 +3401,54 @@ class Dispatcher:
         self._last_hb = hb
         return hb
 
+    def capabilities_put_payload(self):
+        """Routing capability advertisement for the slow cycle and the fast check-in.
+
+        Returns None when operator settings do not fully specify the
+        advertisement; the Hub then keeps the last advertised value instead
+        of a defaulted concurrency (same guard as the slow cycle).
+        """
+        if 'capabilities' not in self.settings or 'max_agents' not in self.settings:
+            return None
+        return {'needs': self.settings['capabilities'],
+                'max_agents': self.settings['max_agents'],
+                'runners': [{'engine': s.get('engine', s['service']), 'profile': s.get('profile'),
+                             'account': s['account_label'], 'model': s['launcher_model'],
+                             'effort': s.get('launcher_effort')}
+                            for s in self.settings['subscriptions']
+                            if s.get('launcher_model') and s.get('admission_argv')]}
+
+    def checkin_tick(self):
+        """Fast liveness check-in independent of cycle phases (intake 056a4131 AC1).
+
+        The Hub online window (180 s) covers BOTH the host poll and the
+        routing capability advertisement, but only the slow cycle refreshed
+        the latter, so a multi-minute reconcile/watchdog/dispatch phase made
+        a live host read online:false. This tick re-posts both on its own
+        <=60 s cadence with no admission gates or launcher reconciliation,
+        so slow phases never gate liveness. Projection keys (gate,
+        launcher_resources) ride along from the latest telemetry snapshot so
+        the stored heartbeat keeps its placement data; the snapshot owner
+        (_last_hb) is left to the telemetry tick and the slow cycle. Known
+        edge (intake 056a4131 review): the first check-in(s) after host
+        start post a bare heartbeat until the first telemetry tick lands,
+        briefly dropping placement projections from the stored snapshot;
+        the server fails OPEN on missing telemetry and the next tick
+        restores it. A dead host simply stops ticking: both halves age past
+        180 s and the machine reads offline within 180 s.
+        """
+        from . import api
+        hb = api.get_heartbeat_payload()
+        latest = self._last_hb or {}
+        for key in ('gate', 'launcher_resources'):
+            if key in latest:
+                hb[key] = latest[key]
+        self.request('POST', '/api/host/poll', hb)
+        caps = self.capabilities_put_payload()
+        if caps is not None:
+            self.request('PUT', '/api/fleet/routing/capabilities', caps)
+        return hb
+
     def dispatch_offers(self, results, hb=None, offers=None, concurrency=1, refresh=True):
         """Fetch current offers briefly, then claim under per-offer locks.
 
@@ -3601,9 +3656,10 @@ class Dispatcher:
         # explicit max_agents (hand edit mid-relabel, generated file, degraded
         # load) must not overwrite the real host concurrency. The server keeps
         # the last advertised value until a fully specified settings load PUTs.
-        if 'capabilities' in self.settings and 'max_agents' in self.settings:
+        caps_ad = self.capabilities_put_payload()
+        if caps_ad is not None:
             try:
-                self.request('PUT', '/api/fleet/routing/capabilities', {'needs': self.settings['capabilities'], 'max_agents': self.settings['max_agents'], 'runners': [{'engine': s.get('engine', s['service']), 'profile': s.get('profile'), 'account': s['account_label'], 'model': s['launcher_model'], 'effort': s.get('launcher_effort')} for s in self.settings['subscriptions'] if s.get('launcher_model') and s.get('admission_argv')]})
+                self.request('PUT', '/api/fleet/routing/capabilities', caps_ad)
             except Exception as exc:
                 _skip_telemetry('capabilities', exc)
         _mark('capabilities')

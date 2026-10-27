@@ -10,6 +10,7 @@ import type { FleetService } from './fleet';
 import { sha256, randomString } from './auth/crypto';
 import { effectiveCheckin } from './registry';
 import { sameIntent, sameEditCaller, type EditAuthority } from './claim_admission';
+import { blockedEngines, healthRowsFor, runnerHealth } from './engine-health';
 
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const label = (x: unknown): x is string => typeof x === 'string' && LABEL.test(x);
@@ -99,12 +100,13 @@ export class RoutingService {
     }
     // TBM pacing/EDF context is read once per dispatch pass from the Phase 1 tbm_* tables.
     const pacing = queued.length ? loadProviderPacing(this.sql, this.now()) : undefined;
-    const unavailableEngines = new Set<string>();
-    try {
-      for (const r of this.sql.exec("SELECT DISTINCT engine FROM fleet_engine_health WHERE status = 'unavailable'").toArray() as any[]) {
-        if (r.engine) unavailableEngines.add(r.engine);
-      }
-    } catch {}
+    // Intake 056a4131 AC2: the pre-filter must use plan()'s predicate —
+    // machine-scoped rows plus global '' rows, headless (dispatch plans
+    // headless) — so a hold scoped to one machine never shadow-bans an
+    // engine fleet-wide. plan() below stays authoritative per route.
+    const unavailableRows: any[] = (() => { try {
+      return this.sql.exec("SELECT engine, machine_id, reason, updated_at FROM fleet_engine_health WHERE status = 'unavailable'").toArray() as any[];
+    } catch { return []; } })();
     for (const queuedRow of queued) this.transaction(() => {
       const row: any = this.sql.exec("SELECT * FROM routing_jobs WHERE id = ? AND launch_id IS NULL AND state = 'queued'", queuedRow.id).toArray()[0];
       if (!row) return;
@@ -132,6 +134,7 @@ export class RoutingService {
         const machine: any = this.sql.exec('SELECT * FROM machines WHERE id = ?', ad.machine_id).toArray()[0];
         const seen = Date.parse(effectiveCheckin(ad.machine_id, machine?.last_checkin_at) || '');
         if (!machine || this.now() - Date.parse(ad.observed_at) > 180000 || !Number.isFinite(seen) || this.now() - seen > 180000 || !input.needs.every((n: string) => JSON.parse(ad.needs_json).includes(n))) continue;
+        const unavailableEngines = blockedEngines(unavailableRows, ad.machine_id, 'headless', this.now());
         // Fleet applies current resource signals and expected task reservations.
         // A legacy advertised session ceiling is not evidence of host pressure.
         const prompt = taskPrompt(input);
@@ -194,13 +197,14 @@ export class RoutingService {
     }
     if (path === '/api/routing/machines' && request.method === 'GET') {
       if (!admin && !client) return reply({ error: 'forbidden' }, 403);
-      const unavailable = new Set<string>();
-      try {
-        for (const r of this.sql.exec("SELECT DISTINCT engine FROM fleet_engine_health WHERE status = 'unavailable'").toArray() as any[]) {
-          if (r.engine) unavailable.add(r.engine);
-        }
-      } catch {}
-      return reply({ machines: (this.sql.exec('SELECT r.*, m.hostname, m.os, m.arch, m.capabilities, m.last_heartbeat, m.last_checkin_at, m.drained FROM routing_machines r JOIN machines m ON m.id = r.machine_id').toArray() as any[]).map(m => ({ id: m.machine_id, hostname: m.hostname, os: m.os ?? '', arch: (m as any).arch ?? '', needs: JSON.parse(m.needs_json), max_agents: m.max_agents, capabilities: JSON.parse(m.capabilities), runners: JSON.parse(m.runners_json).map((rn: any) => ({ ...rn, available: !unavailable.has(rn.engine), health: unavailable.has(rn.engine) ? 0 : 1 })), resources: ((hb: any) => ({ mem_avail_mb: hb.mem_avail_mb ?? null, disk_free_gb: hb.disk_free_gb ?? null }))(JSON.parse(m.last_heartbeat || '{}')), online: !m.drained && this.now() - Date.parse(m.observed_at) <= 180000 && this.now() - Date.parse(effectiveCheckin(m.machine_id, m.last_checkin_at) || '') <= 180000 })) });
+      // Intake 056a4131 AC2: runner available/health answers with plan()'s
+      // predicate (machine-scoped rows plus global '' rows, mode-aware,
+      // retriable-cooldown aware) and exposes the hold reason + affected mode
+      // per runner instead of a bare engine-global health 0.
+      const unavailableRows: any[] = (() => { try {
+        return this.sql.exec("SELECT engine, machine_id, reason, updated_at FROM fleet_engine_health WHERE status = 'unavailable'").toArray() as any[];
+      } catch { return []; } })();
+      return reply({ machines: (this.sql.exec('SELECT r.*, m.hostname, m.os, m.arch, m.capabilities, m.last_heartbeat, m.last_checkin_at, m.drained FROM routing_machines r JOIN machines m ON m.id = r.machine_id').toArray() as any[]).map(m => ({ id: m.machine_id, hostname: m.hostname, os: m.os ?? '', arch: (m as any).arch ?? '', needs: JSON.parse(m.needs_json), max_agents: m.max_agents, capabilities: JSON.parse(m.capabilities), runners: JSON.parse(m.runners_json).map((rn: any) => ({ ...rn, ...runnerHealth(healthRowsFor(unavailableRows, rn.engine, m.machine_id), this.now()) })), resources: ((hb: any) => ({ mem_avail_mb: hb.mem_avail_mb ?? null, disk_free_gb: hb.disk_free_gb ?? null }))(JSON.parse(m.last_heartbeat || '{}')), online: !m.drained && this.now() - Date.parse(m.observed_at) <= 180000 && this.now() - Date.parse(effectiveCheckin(m.machine_id, m.last_checkin_at) || '') <= 180000 })) });
     }
     if (path === '/api/routing/policy' && request.method === 'GET' && (admin || client)) return reply(policy);
     const tokenMatch = /^\/api\/routing\/clients\/([A-Za-z0-9_-]{1,64})$/.exec(path);

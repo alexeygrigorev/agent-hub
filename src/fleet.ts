@@ -26,7 +26,7 @@ export const LAUNCHER_TELEMETRY_STALE_MS = 180000;
 export const GATE_STALE_MS = 300000;
 /** Engine holds that expire into a single retrial after this cooldown. */
 export const ENGINE_HEALTH_RETRY_MS = 600000;
-const RETRIABLE_ENGINE_HOLDS = new Set(['engine_auth_expired', 'engine_tool_permission_refused']);
+export const RETRIABLE_ENGINE_HOLDS = new Set(['engine_auth_expired', 'engine_tool_permission_refused']);
 
 export const FLEET_SCHEMA = `
 CREATE TABLE IF NOT EXISTS fleet_catalog_seen (machine_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL);
