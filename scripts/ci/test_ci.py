@@ -25,6 +25,13 @@ RETRY = load_retry_module()
 
 
 class TestCICD(unittest.TestCase):
+    def test_reset_credit_safety_suites_are_discovered(self):
+        """The deploy job uses explicit discovery: these money-adjacent guards must run."""
+        workflow = (REPO_ROOT / '.github/workflows/deploy.yml').read_text()
+        for test in ('host/tests/test_codex_reset_credit.py', 'host/tests/test_reset_credit_workflow.py',
+                     'test/reset-credit-evidence.test.ts'):
+            self.assertEqual(workflow.count(test), 1, test)
+
     def test_validate_workflows_passes(self):
         """Verify current repository workflows pass static validation."""
         res = subprocess.run([sys.executable, str(VALIDATE_SCRIPT)], capture_output=True, text=True)

@@ -78,6 +78,15 @@ class ResetCreditTests(unittest.TestCase):
         rpc.on_consume = inspect
         self.run_attempt(rpc)
 
+    def test_server_key_is_used_and_journal_rejects_key_changes(self):
+        rpc = Rpc()
+        redeem(rpc, self.path, 'account-a', 'credit-a', now=NOW, idempotency_key='server-key')
+        self.assertEqual(rpc.calls[1][1]['idempotencyKey'], 'server-key')
+        retry = Rpc()
+        with self.assertRaisesRegex(CreditError, 'key_conflict'):
+            redeem(retry, self.path, 'account-a', 'credit-a', now=NOW, idempotency_key='other-key')
+        self.assertFalse(any(m == CONSUME for m, _ in retry.calls))
+
     def test_terminal_success_never_redeems_twice(self):
         saved = self.run_attempt(Rpc())
         retry = Rpc(before=view(count=1, credit=False))

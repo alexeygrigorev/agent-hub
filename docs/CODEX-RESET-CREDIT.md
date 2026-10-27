@@ -54,3 +54,63 @@ is verified.
 
 Contract verified against installed Codex 0.162.1 generated schemas and
 [official app-server documentation](https://learn.chatgpt.com/docs/app-server#8-earned-rate-limit-resets-chatgpt).
+
+## Hub-correlated operator workflow
+
+The standalone helper above is a component, not Q2 acceptance. Use the workflow
+below for a server-recorded decision and evidence chain. All native mutations
+still require the exact-source review/full/CI/deployment gates first.
+
+```sh
+# Read-only provider observation plus durable Hub decision; no redemption.
+PYTHONPATH=host python3 -m agent_hub_host.reset_credit_workflow prepare \
+  --account shared-codex --credit-id '<exact native credit ID>'
+
+# Within five minutes, after verifying the returned identity/state and gates:
+PYTHONPATH=host python3 -m agent_hub_host.reset_credit_workflow consume \
+  --event-id '<earned-reset:UUID>'
+
+# After normal collection refreshes genuine quota and normally routed useful
+# work completes (no manually forced model/runner):
+PYTHONPATH=host python3 -m agent_hub_host.reset_credit_workflow link-work \
+  --event-id '<earned-reset:UUID>' --routing-job-id '<actual Hub routing job ID>'
+```
+
+`POST /api/quota/reset-credits` is behind the existing TBM admin authentication
+and cookie CSRF checks. `prepare` stores server time/actor, the actual latest
+controller tick, fresh stored pool observations, unique EDF tranche matched by
+account/expiry, current routing factors, other active grants, and the
+operator-attested native credit identity. A global kill switch, stale data,
+ambiguous match or neutral banked factor prevents preparation. This creates an
+explicit operator-mediated pacing decision; it does not claim a scheduled
+redemption actuator exists. Preparation never changes quota or grants.
+
+The server allocates one stable provider idempotency key per account/credit;
+the native helper now accepts this key and rejects a conflicting journal key.
+This is the necessary replacement of frozen component `48eedf0a`: native RPC
+semantics remain the same, while multiple hosts cannot mint different keys for
+the same Hub decision. Existing helper-only attempts with another key fail
+closed and require operator reconciliation, not journal deletion.
+
+The provider receipt remains an **operator attestation**, with an exact native
+journal SHA-256, separate server receipt time/actor and matching decision/key.
+The server does not call Codex itself. Provider no-op outcomes retain null
+post-read fields, rather than invented quota. The workflow never falls back to
+a local-only event when Hub transport fails. If preparation fails, no provider
+call occurs. If the receipt upload fails after redemption, preserve the native
+journal and retry uploading that exact receipt with `record --event-id ...
+--receipt-file ...`; that operation never invokes Codex. A stale decision stops
+new `consume` attempts. Use the retained journal to investigate unknown outcomes.
+
+`link-work` reads existing SQL routing/launch/account, completed status, useful
+reward event and fresh post-receipt ingested pool observation. It records those
+facts without modifying the job, quota, admission, or reward. It refuses work
+predating the reset, a different account, a forced model/runner, and work
+completed after credit expiry. Other grant/work observations support the proof
+owner's separate no-starvation audit; they never automatically establish it.
+
+`GET /api/quota/reset-credits?event_id=...` returns durable decision, receipt and
+work event IDs. `ac2_accepted` and `no_starvation_verified` stay false: the proof
+owner must independently check the actual provider receipt, refilled quota
+drawdown, useful output and other grants. Server evidence linkage alone is not
+acceptance. No live call in this runbook has been executed by unit tests.

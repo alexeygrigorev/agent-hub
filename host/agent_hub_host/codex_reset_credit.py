@@ -174,7 +174,7 @@ def journal_path():
     return home / 'hub-earned-reset' / 'attempts.sqlite3'
 
 
-def redeem(rpc, path, account_id, credit_id, *, now=None):
+def redeem(rpc, path, account_id, credit_id, *, now=None, idempotency_key=None):
     """One durable attempt per account+credit; at most two sends of the same key.
 
     A pending/unknown attempt blocks other credits for this account. Provider
@@ -191,13 +191,15 @@ def redeem(rpc, path, account_id, credit_id, *, now=None):
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise CreditError('account_attempt_busy') from None
-        return _redeem_locked(rpc, path, account_id, credit_id, now=now)
+        return _redeem_locked(rpc, path, account_id, credit_id, now=now, idempotency_key=idempotency_key)
     finally:
         os.close(fd)
 
 
-def _redeem_locked(rpc, path, account_id, credit_id, *, now=None):
+def _redeem_locked(rpc, path, account_id, credit_id, *, now=None, idempotency_key=None):
     account_id, credit_id = _identifier(account_id), _identifier(credit_id)
+    if idempotency_key is not None:
+        _identifier(idempotency_key)
     fixed_now = now
     def stamp():
         return int(time.time() if fixed_now is None else fixed_now)
@@ -216,6 +218,8 @@ def _redeem_locked(rpc, path, account_id, credit_id, *, now=None):
             raise CreditError('account_mismatch')
         if row:
             key, sends, encoded = row
+            if idempotency_key is not None and key != idempotency_key:
+                raise CreditError('idempotency_key_conflict')
             receipt = json.loads(encoded)
             if receipt['outcome'] in OUTCOMES:
                 if receipt['outcome'] not in {'reset', 'alreadyRedeemed'} or receipt.get('creditDecrementVerified'):
@@ -228,7 +232,7 @@ def _redeem_locked(rpc, path, account_id, credit_id, *, now=None):
                 if old['outcome'] in {'pending', 'unknown'} or (old['outcome'] in {'reset', 'alreadyRedeemed'} and not old.get('creditDecrementVerified')):
                     raise CreditError('account_attempt_unresolved')
             _eligible(before, credit_id, now)
-            key, sends = str(uuid.uuid4()), 0
+            key, sends = idempotency_key or str(uuid.uuid4()), 0
             receipt = {'eventId': 'codex-earned-reset:' + hashlib.sha256((account_id + ':' + credit_id).encode()).hexdigest(),
                        'accountId': account_id, 'creditId': credit_id, 'idempotencyKey': key,
                        'before': before, 'startedAt': now, 'outcome': 'pending', 'after': None}

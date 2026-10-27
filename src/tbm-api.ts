@@ -1,13 +1,15 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { loadProviderPacing } from './pacing';
+import { handleResetCreditEvidence } from './reset-credit-evidence';
 
 const reply = (data: unknown, status = 200) => Response.json(data, {
   status, headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' },
 });
 
 /** Caller authentication and cookie CSRF checks run in the Hub mount before this handler. */
-export async function handleTbmApi(request: Request, sql: SqlStorage, now = Date.now()): Promise<Response> {
+export async function handleTbmApi(request: Request, sql: SqlStorage, now = Date.now(), actor = 'unknown'): Promise<Response> {
   const path = new URL(request.url).pathname;
+  if (path === '/api/quota/reset-credits') return handleResetCreditEvidence(request, sql, now, actor);
   const writable = path === '/api/quota/kill-switch';
   if (request.method !== 'GET' && !(writable && request.method === 'POST')) {
     return reply({ error: 'method_not_allowed' }, 405);
