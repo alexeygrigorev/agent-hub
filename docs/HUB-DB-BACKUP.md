@@ -27,6 +27,11 @@ every non-admin caller with 403 and only serves GET:
   closed with 413 (`export_too_large`) instead of risking DO memory;
   unexpected per-table failures fail closed with 500
   `{error:export_failed, stage, table?}` (table name only, never row content).
+  Values JSON cannot natively encode (BigInts, raw binary) become explicit
+  lossless markers (`{"__hub_backup_bigint":"123"}`,
+  `{"__hub_backup_blob_b64":"..."}`, counted in top-level `value_markers`):
+  the backup never 500s on production value shapes, and restore reverses
+  them (`BigInt(s)`, `Buffer.from(b64,'base64')`).
 - `GET /api/backup/status` — table names + row counts only (cheap liveness
   proof for the restore drill without shipping the dataset).
 

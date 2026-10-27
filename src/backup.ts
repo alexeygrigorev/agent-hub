@@ -95,11 +95,40 @@ export class BackupService {
   }
 
   /**
+   * JSON replacer for export rows. SQLite/Workers values are almost always
+   * JSON-native, but production data has contained values JSON.stringify
+   * rejects outright (e.g. BigInts). Those are converted to explicit,
+   * documented, lossless markers instead of failing the whole backup;
+   * conversions are counted so the restore drill can verify them.
+   * Raw binary stays explicit base64 rather than V8's lossy '{}'.
+   */
+  private exportReplacer(table: string, stats: { bigint: number; blob: number }) {
+    return function (_key: string, value: unknown) {
+      if (typeof value === 'bigint') {
+        stats.bigint++;
+        return { __hub_backup_bigint: (value as bigint).toString() };
+      }
+      if (value instanceof ArrayBuffer) {
+        stats.blob++;
+        let b64: string;
+        try {
+          b64 = Buffer.from(value as ArrayBuffer).toString('base64');
+        } catch (err) {
+          throw new ExportStageError('serialize', table);
+        }
+        return { __hub_backup_blob_b64: b64 };
+      }
+      return value as any;
+    };
+  }
+
+  /**
    * Encode the export snapshot incrementally per table. A single
    * Response.json() over the whole snapshot cannot name the table whose
-   * rows fail to serialize (non-JSON values from production data), so each
-   * table is stringified separately and failures carry the table name.
-   * The wire shape is identical to a single-shot encoding.
+   * rows fail to serialize, so each table is stringified separately with a
+   * marker-preserving replacer and failures carry the table name. The wire
+   * shape matches a single-shot encoding plus a transparent value_markers
+   * count (documented in docs/HUB-DB-BACKUP.md).
    */
   private encodeExport(payload: {
     exported_at: string;
@@ -108,35 +137,33 @@ export class BackupService {
     row_counts: Record<string, number>;
     tables: Record<string, any[]>;
   }): string {
-    let head: string;
-    try {
-      head =
-        '{"exported_at":' + JSON.stringify(payload.exported_at) +
-        ',"snapshot":' + JSON.stringify(payload.snapshot) +
-        ',"schema":' + JSON.stringify(payload.schema) +
-        ',"row_counts":' + JSON.stringify(payload.row_counts) +
-        ',"tables":{';
-    } catch (err) {
-      throw new ExportStageError('serialize');
-    }
-    const parts: string[] = [head];
+    const stats = { bigint: 0, blob: 0 };
+    const encodedTables: string[] = [];
     let first = true;
     for (const name of Object.keys(payload.tables)) {
       let encoded: string;
       try {
-        encoded = JSON.stringify(payload.tables[name]);
+        encoded = JSON.stringify(payload.tables[name], this.exportReplacer(name, stats));
       } catch (err) {
+        if (err instanceof ExportStageError) throw err;
         throw new ExportStageError('serialize', name);
       }
-      parts.push((first ? '' : ',') + JSON.stringify(name) + ':' + encoded);
+      encodedTables.push((first ? '' : ',') + JSON.stringify(name) + ':' + encoded);
       first = false;
     }
-    parts.push('}}');
+    let body: string;
     try {
-      return parts.join('');
+      body =
+        '{"exported_at":' + JSON.stringify(payload.exported_at) +
+        ',"snapshot":' + JSON.stringify(payload.snapshot) +
+        ',"schema":' + JSON.stringify(payload.schema) +
+        ',"row_counts":' + JSON.stringify(payload.row_counts) +
+        ',"value_markers":' + JSON.stringify(stats) +
+        ',"tables":{' + encodedTables.join('') + '}}';
     } catch (err) {
       throw new ExportStageError('serialize');
     }
+    return body;
   }
   private callerKey(request: Request, auth: BackupAuth): string {
     const actor = typeof auth.caller?.actor === 'string' ? auth.caller.actor : '';

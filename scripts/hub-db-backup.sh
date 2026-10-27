@@ -126,6 +126,9 @@ schema = body.get("schema")
 assert isinstance(tables, dict) and tables, "tables map missing/empty"
 assert isinstance(counts, dict) and set(counts) == set(tables), "row_counts mismatch"
 assert isinstance(schema, dict) and set(tables) <= set(schema), "schema must cover all tables"
+markers = body.get("value_markers")
+assert isinstance(markers, dict), "value_markers missing"
+assert set(markers) == {"bigint", "blob"} and all(isinstance(markers[k], int) for k in markers), "value_markers shape"
 for name, rows in tables.items():
     assert isinstance(rows, list), f"table is not a list: {name}"
     assert counts[name] == len(rows), f"row count mismatch: {name}"
@@ -134,7 +137,7 @@ for required in ("intake_tasks", "session_control_sessions", "claims", "audit"):
     assert required in tables, f"required table missing: {required}"
 # Ephemeral rate-limit state is never exported (would leak caller keys).
 assert "backup_rate" not in tables, "backup_rate must be excluded from export"
-print(f"validated {len(tables)} tables, {sum(counts.values())} rows, {len(schema)} schema objects")
+print(f"validated {len(tables)} tables, {sum(counts.values())} rows, {len(schema)} schema objects, markers={markers}")
 PY
 
 gzip -c "$TMP_RAW" > "$TMP_GZ"

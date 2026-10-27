@@ -78,6 +78,9 @@ describe('Hub DB backup export', () => {
     const body = await res.json() as any;
     expect(body.snapshot).toBe('hub-do-sqlite');
     expect(typeof body.exported_at).toBe('string');
+    // Non-JSON-native values become explicit lossless markers, counted
+    // transparently (fixtures here are plain JSON: zero conversions).
+    expect(body.value_markers).toEqual({ bigint: 0, blob: 0 });
     const expected = await listTables(name);
     expect(expected.length).toBeGreaterThan(10);
     expect(Object.keys(body.tables).sort()).toEqual(expected);
