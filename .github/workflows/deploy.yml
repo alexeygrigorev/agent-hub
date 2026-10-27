@@ -6,6 +6,7 @@ on:
     paths:
       - "src/**"
       - "config/resource-management.json"
+      - "config/model-routing.json"
       - "host/**"
       - "pyproject.toml"
       - "uv.lock"
@@ -22,6 +23,7 @@ on:
     paths:
       - "src/**"
       - "config/resource-management.json"
+      - "config/model-routing.json"
       - "host/**"
       - "pyproject.toml"
       - "uv.lock"
