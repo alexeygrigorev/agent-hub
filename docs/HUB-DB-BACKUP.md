@@ -20,9 +20,13 @@ every non-admin caller with 403 and only serves GET:
   plus the full replayable DDL schema (tables, indexes, triggers, views —
   including the append-only `intake_audit` guard and projection triggers)
   and per-table `row_counts`, inside one storage transaction.
-  `Cache-Control: private, no-store`. Ephemeral `backup_rate` state is
-  excluded (it would leak the caller key). Oversize exports fail closed
-  with 413 (`export_too_large`) instead of risking DO memory.
+  `Cache-Control: private, no-store`. Ephemeral `backup_rate` state and
+  platform internals (`sqlite_%`, Cloudflare `_cf_%` such as `_cf_METADATA`,
+  which is unreadable through the normal query path) are excluded — they
+  would leak caller keys or break the consistent read. Oversize exports fail
+  closed with 413 (`export_too_large`) instead of risking DO memory;
+  unexpected per-table failures fail closed with 500
+  `{error:export_failed, stage, table?}` (table name only, never row content).
 - `GET /api/backup/status` — table names + row counts only (cheap liveness
   proof for the restore drill without shipping the dataset).
 

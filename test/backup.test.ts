@@ -31,7 +31,7 @@ async function listTables(name: string): Promise<string[]> {
   let names: string[] = [];
   await runInDurableObject(stub(name), async (hub: Hub) => {
     names = (hub.sql.exec(
-      "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name != 'backup_rate' ORDER BY name"
+      "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' AND name != 'backup_rate' ORDER BY name"
     ).toArray() as any[]).map(r => String(r.name));
   });
   return names;
@@ -83,12 +83,17 @@ describe('Hub DB backup export', () => {
     expect(Object.keys(body.tables).sort()).toEqual(expected);
     expect(Object.keys(body.row_counts).sort()).toEqual(expected);
     // Schema carries tables PLUS indexes/triggers/views for a faithful
-    // restore; ephemeral rate-limit state is never exported.
+    // restore; ephemeral rate-limit state and platform internals
+    // (sqlite_%, _cf_) are never exported.
     expect(expected.every(t => t in body.schema)).toBe(true);
     expect(Object.keys(body.schema).length).toBeGreaterThanOrEqual(expected.length);
     expect(body.schema).not.toHaveProperty('backup_rate');
     expect(body.tables).not.toHaveProperty('backup_rate');
     expect(body.row_counts).not.toHaveProperty('backup_rate');
+    for (const key of [...Object.keys(body.tables), ...Object.keys(body.schema)]) {
+      expect(key.startsWith('sqlite_')).toBe(false);
+      expect(key.startsWith('_cf_')).toBe(false);
+    }
     expect(String(body.schema['messages_bind_agents'] || '').toUpperCase()).toContain('CREATE TRIGGER');
     for (const table of expected) {
       expect(body.row_counts[table]).toBe(body.tables[table].length);

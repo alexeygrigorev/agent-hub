@@ -48,6 +48,16 @@ const TOTAL_ROW_CAP = 500000;
 // Ephemeral rate-limit state: never exported (would leak the caller/IP key).
 const EXCLUDED_FROM_EXPORT = new Set(['backup_rate']);
 
+// Cloudflare platform tables inside DO SQLite storage (e.g. _cf_METADATA)
+// are not Hub data and are unreadable through the normal query path; like
+// sqlite_% internals they must never enter the export. LIKE '_' is a
+// wildcard, so the literal underscore is escaped.
+const USER_TABLE_WHERE =
+  "type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\'";
+const SCHEMA_OBJECT_WHERE =
+  "type IN ('table','index','trigger','view') AND name NOT LIKE 'sqlite_%'" +
+  " AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' AND sql IS NOT NULL";
+
 export class ExportTooLarge extends Error {}
 
 export class ExportStageError extends Error {
@@ -73,14 +83,14 @@ export class BackupService {
   /** User tables whose rows are exported (ephemeral state excluded). */
   private userTables(): { name: string; sql: string }[] {
     return (this.sql.exec(
-      "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+      `SELECT name, sql FROM sqlite_master WHERE ${USER_TABLE_WHERE} ORDER BY name`
     ).toArray() as any[]).filter(t => !EXCLUDED_FROM_EXPORT.has(String(t.name)));
   }
 
   /** Full replayable DDL: tables + indexes + triggers + views (auto-indexes excluded). */
   private schemaObjects(): { name: string; sql: string }[] {
     return (this.sql.exec(
-      "SELECT name, sql FROM sqlite_master WHERE type IN ('table','index','trigger','view') AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL ORDER BY name"
+      `SELECT name, sql FROM sqlite_master WHERE ${SCHEMA_OBJECT_WHERE} ORDER BY name`
     ).toArray() as any[]).filter(t => !EXCLUDED_FROM_EXPORT.has(String(t.name)));
   }
 
