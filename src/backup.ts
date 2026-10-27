@@ -94,6 +94,50 @@ export class BackupService {
     ).toArray() as any[]).filter(t => !EXCLUDED_FROM_EXPORT.has(String(t.name)));
   }
 
+  /**
+   * Encode the export snapshot incrementally per table. A single
+   * Response.json() over the whole snapshot cannot name the table whose
+   * rows fail to serialize (non-JSON values from production data), so each
+   * table is stringified separately and failures carry the table name.
+   * The wire shape is identical to a single-shot encoding.
+   */
+  private encodeExport(payload: {
+    exported_at: string;
+    snapshot: string;
+    schema: Record<string, string>;
+    row_counts: Record<string, number>;
+    tables: Record<string, any[]>;
+  }): string {
+    let head: string;
+    try {
+      head =
+        '{"exported_at":' + JSON.stringify(payload.exported_at) +
+        ',"snapshot":' + JSON.stringify(payload.snapshot) +
+        ',"schema":' + JSON.stringify(payload.schema) +
+        ',"row_counts":' + JSON.stringify(payload.row_counts) +
+        ',"tables":{';
+    } catch (err) {
+      throw new ExportStageError('serialize');
+    }
+    const parts: string[] = [head];
+    let first = true;
+    for (const name of Object.keys(payload.tables)) {
+      let encoded: string;
+      try {
+        encoded = JSON.stringify(payload.tables[name]);
+      } catch (err) {
+        throw new ExportStageError('serialize', name);
+      }
+      parts.push((first ? '' : ',') + JSON.stringify(name) + ':' + encoded);
+      first = false;
+    }
+    parts.push('}}');
+    try {
+      return parts.join('');
+    } catch (err) {
+      throw new ExportStageError('serialize');
+    }
+  }
   private callerKey(request: Request, auth: BackupAuth): string {
     const actor = typeof auth.caller?.actor === 'string' ? auth.caller.actor : '';
     if (/^[A-Za-z0-9:_.-]{1,160}$/.test(actor)) return 'actor:' + actor;
@@ -208,12 +252,20 @@ export class BackupService {
           return Response.json({ error: 'rate_limited' }, { status: 429 });
         }
         const payload = this.fullExport();
+        let body: string;
         try {
-          return Response.json(payload,
-            { headers: { 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
+          body = this.encodeExport(payload);
         } catch (err) {
+          if (err instanceof ExportStageError) throw err;
           throw new ExportStageError('serialize');
         }
+        return new Response(body, {
+          headers: {
+            'Content-Type': 'application/json',
+            'Cache-Control': 'private, no-store',
+            'X-Content-Type-Options': 'nosniff',
+          },
+        });
       }
     } catch (err) {
       if (err instanceof ExportTooLarge) {
