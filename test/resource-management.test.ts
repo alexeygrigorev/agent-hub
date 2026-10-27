@@ -28,6 +28,61 @@ const sample=(extra={})=>({session_id:'session',native_id:'native',current_rss_m
 const closeIntake=(sql:any)=>sql.exec("UPDATE intake_tasks SET data=json_set(data,'$.status','done','$.history',json(?)) WHERE id='task'",
  JSON.stringify([{kind:'note',text:'DONE abc1234\nlive check: synthetic resource fixture\nresult: synthetic acceptance criteria verified'}]));
 describe('resource management',()=>{
+
+
+ it('aggregates the full finish window beyond the 500-row table with honest token coverage',async()=>fixture(async(r,sql)=>{
+  r.report('host',{samples:[sample()],reaps:[]});
+  sql.exec("UPDATE session_resource_usage SET finished_at=?",iso(-1000));
+  sql.exec('INSERT INTO tbm_session_tokens VALUES(?,?,?,?,?,?,?,?,?)','host:native','native','agent','opencode','go',100,20,120,now);
+  for(let i=0;i<501;i++) sql.exec(`INSERT INTO session_resource_usage SELECT ?,machine_id,?,NULL,NULL,project,engine,model,tier,kind,started_at,finished_at,state,NULL,NULL,NULL,NULL,NULL,observed_at FROM session_resource_usage WHERE session_id='session'`,'extra'+i,'native'+i);
+  expect(r.usage()).toHaveLength(500);
+  expect(r.costTotals()['24h'].project[0]).toMatchObject({name:'demo',sessions:502,tokens_known_sessions:1,total_tokens:120,cpu_seconds:20,cpu_known_sessions:1});
+  sql.exec("UPDATE session_resource_usage SET finished_at=? WHERE session_id='session'",iso(-2*86400000));
+  expect(r.costTotals()['24h'].project[0]).toMatchObject({sessions:501,tokens_known_sessions:0,total_tokens:null,cpu_seconds:null});
+  expect(r.costTotals()['7d'].engine[0]).toMatchObject({sessions:502,total_tokens:120});
+ }));
+ it('rejects conflicting alias token records in both rows and totals',async()=>fixture(async(r,sql)=>{
+  r.report('host',{samples:[sample()],reaps:[]});
+  sql.exec("UPDATE session_resource_usage SET finished_at=?",iso(-1000));
+  for(const [id,total] of [['host:native',120],['session',150]]) sql.exec('INSERT INTO tbm_session_tokens VALUES(?,?,?,?,?,?,?,?,?)',id,'native','agent','opencode','go',100,20,total,now);
+  expect(r.usage()[0]).toMatchObject({tokens_known:false,total_tokens:null,token_join_reason:'conflicting_token_records'});
+  expect(r.costTotals()['24h'].project[0]).toMatchObject({tokens_known_sessions:0,total_tokens:null});
+ }));
+ it('durably records a Fleet-only finish without inventing missed measurements',async()=>fixture(async(r,sql)=>{
+  sql.exec('DELETE FROM session_control_sessions');
+  sql.exec("UPDATE fleet_launches SET state='exited',finished_at=? WHERE id='launch'",iso());
+  r.report('host',{samples:[],reaps:[]});
+  r.report('host',{samples:[],reaps:[]});
+  expect(r.usage()).toHaveLength(1);
+  expect(r.usage()[0]).toMatchObject({session_id:'fleet:launch',state:'exited',finished_at:iso(),peak_rss_mb:null,cpu_seconds:null,resource_measurement_reason:'host_measurement_missing'});
+  r.report('host',{samples:[sample({session_id:'fleet:launch'})],reaps:[]});
+  expect(r.usage()[0]).toMatchObject({peak_rss_mb:200,cpu_seconds:20,resource_measurement_reason:null});
+ }));
+ it('joins proven machine/native tokens for Hub, observed and Fleet-only ledger identities',async()=>fixture(async(r,sql)=>{
+  sql.exec(`CREATE TABLE IF NOT EXISTS tbm_session_tokens(session_id TEXT PRIMARY KEY,native_id TEXT,tag TEXT,engine TEXT,account TEXT,input_tokens INTEGER,output_tokens INTEGER,total_tokens INTEGER,observed_at_ms INTEGER)`);
+  for (const mode of ['hub','observed','fleet']) {
+   sql.exec('DELETE FROM session_resource_usage');
+   if(mode==='observed') sql.exec("UPDATE session_control_sessions SET fleet_launch_id=NULL");
+   if(mode==='fleet') sql.exec('DELETE FROM session_control_sessions');
+   const session=r.sessions('host')[0];
+   r.report('host',{samples:[sample({session_id:session.session_id})],reaps:[]});
+   sql.exec('INSERT OR REPLACE INTO tbm_session_tokens VALUES(?,?,?,?,?,?,?,?,?)','host:native','native','agent','opencode','go',100,20,120,now);
+   expect(r.usage()).toHaveLength(1);
+   expect(r.usage()[0]).toMatchObject({tokens_known:true,input_tokens:100,output_tokens:20,total_tokens:120,cpu_seconds:20,peak_rss_mb:200,token_join_key:'host:native',token_join_reason:null});
+  }
+ }));
+ it('keeps missing and unproven tokens unknown, and preserves measured zero',async()=>fixture(async(r,sql)=>{
+  r.report('host',{samples:[sample()],reaps:[]});
+  sql.exec('DELETE FROM tbm_session_tokens');
+  expect(r.usage()[0]).toMatchObject({tokens_known:false,total_tokens:null,token_join_reason:'token_record_missing'});
+  sql.exec('INSERT INTO tbm_session_tokens VALUES(?,?,?,?,?,?,?,?,?)','other:native','native','agent','opencode','go',100,20,120,now);
+  expect(r.usage()[0].tokens_known).toBe(false);
+  sql.exec('INSERT INTO tbm_session_tokens VALUES(?,?,?,?,?,?,?,?,?)','host:native','wrong','agent','opencode','go',100,20,120,now);
+  expect(r.usage()[0].token_join_reason).toBe('native_binding_mismatch');
+  sql.exec("UPDATE tbm_session_tokens SET native_id='native',input_tokens=0,output_tokens=0,total_tokens=0 WHERE session_id='host:native'");
+  expect(r.usage()[0]).toMatchObject({tokens_known:true,total_tokens:0});
+ }));
+
  it('keeps cached canonical identities and protections current across writes and rollbacks',async()=>fixture(async(r,sql,f)=>{
   r.initCatalogCache();
   let builds=0; const build=(r as any).buildCanonicalSessions.bind(r);
