@@ -471,7 +471,8 @@ def telemetry_step_once(dispatcher):
 def offers_step_once(dispatcher):
     """Fast offer claiming independent of the slow cycle (intake 4398ce2a)."""
     try:
-        out = dispatcher.offers_tick()
+        from .offer_claims import poll
+        out = poll(dispatcher)
         if out.get('offers'):
             print(json.dumps({'event': 'offers_cycle', 'offers': out['offers'],
                               'dispatch_max_s': out['dispatch_max_s']}), flush=True)
@@ -736,10 +737,12 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
             bindings_thread = maybe_start_named_thread(
                 None, bindings_loop, (dispatcher, stop), 'fleet-bindings')
             while not stop.is_set() and (cycles is None or count < cycles):
-                # Apply settings between maintenance rounds, so an in-flight
+                # Apply settings between maintenance/startup rounds, so an in-flight
                 # dispatch cannot mix the old allowlist with new credentials.
                 reloaded = None
-                if maintenance_thread is None or not maintenance_thread.is_alive():
+                from .offer_claims import has_inflight
+                if ((maintenance_thread is None or not maintenance_thread.is_alive())
+                        and not has_inflight(dispatcher)):
                     reloaded, settings_mtime = maybe_reload_fleet_settings(settings_path, settings_mtime)
                 if reloaded is not None:
                     settings = reloaded
