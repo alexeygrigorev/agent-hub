@@ -1,6 +1,8 @@
 # Hub DB daily export: 04:20 Europe/Berlin (see scripts/hub-db-backup.sh).
 # Installed as /etc/cron.d/hub-db-backup by scripts/install-hub-db-backup.sh.
+# Runs as user alexey: root cannot write the operator's Storagebox sshfs
+# mount (FUSE denies root), while alexey owns both trees and the token file.
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 TZ=Europe/Berlin
-20 4 * * * root /usr/local/sbin/hub-db-backup.sh >> /var/log/hub-db-backup.log 2>&1
+20 4 * * * alexey /usr/local/sbin/hub-db-backup.sh >> /var/log/hub-db-backup.log 2>&1

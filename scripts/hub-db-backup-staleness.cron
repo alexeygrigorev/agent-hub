@@ -1,7 +1,8 @@
 # Hub DB backup staleness watch: every 15 min (see scripts/hub-db-backup-staleness.sh).
 # Alerts (msmtp/sendmail) only when the newest export is older than 36h;
 # repeat pages are deduped to at most one per 24h per host.
+# Runs as user alexey (same reason as hub-db-backup.cron: Storagebox access).
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 TZ=Europe/Berlin
-15 * * * * root /usr/local/sbin/hub-db-backup-staleness.sh >> /var/log/hub-db-backup-staleness.log 2>&1
+15 * * * * alexey /usr/local/sbin/hub-db-backup-staleness.sh >> /var/log/hub-db-backup-staleness.log 2>&1

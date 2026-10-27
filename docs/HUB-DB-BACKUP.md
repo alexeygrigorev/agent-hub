@@ -68,12 +68,13 @@ the existing `coolify-s3-backup-writer` credential is scoped to `coolify/*`
 only, and this job has no approval to use `main-temp` or any static AWS key.
 Hetzner + Storagebox satisfies AC1 ("Hetzner + Storagebox, and/or S3").
 
-Install (operator box, never overwrites env):
+Install (operator box, never overwrites env; the job runs as user `alexey`,
+not root, because root cannot write the Storagebox sshfs mount):
 
 ```bash
 sudo scripts/install-hub-db-backup.sh
-# fill /etc/hub-db-backup.env (600), then:
-sudo /usr/local/sbin/hub-db-backup.sh
+# fill /etc/hub-db-backup.env (0600 alexey), then as alexey:
+sudo -u alexey /usr/local/sbin/hub-db-backup.sh
 ```
 
 Env placeholders: `scripts/hub-db-backup.env.example` (no secrets in git).
@@ -94,8 +95,8 @@ both trees decides; missing dir or zero exports counts as stale.
 Manual tests (no real mail):
 
 ```bash
-# fresh path (uses the real trees)
-sudo /usr/local/sbin/hub-db-backup-staleness.sh --dry-run; echo $?
+# fresh path (uses the real trees; staleness runs as alexey too)
+sudo -u alexey /usr/local/sbin/hub-db-backup-staleness.sh --dry-run; echo $?
 # stale path (throwaway dirs, no mail)
 mkdir -p /tmp/stale-test-local /tmp/stale-test-box /tmp/stale-test-state
 BACKUP_DIR=/tmp/stale-test-local STORAGEBOX_DIR=/tmp/stale-test-box \
