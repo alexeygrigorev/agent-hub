@@ -1,6 +1,6 @@
 # orchestrator-main hourly check
 
-Run once per `/loop` tick. Be brief; use `HUB_CONFIG_FILE=$HOME/.config/agent-hub/cli.json` (`host.json` does not exist on Hetzner). Note: on Hetzner `hub quota` / `hub engines` need a human `hub auth login` on that config (pending Alexey, 2026-10-27); until then read quota via `quse` and `hub fleet`.
+Run once per `/loop` tick. Be brief; use `HUB_CONFIG_FILE=$HOME/.config/agent-hub/cli.json` (`host.json` does not exist on Hetzner). Human `hub auth login` on Hetzner was done 2026-10-27 22:17 (orin@datatalks.club), so `hub quota` / `hub engines` work with cli.json.
 
 0. Setup: `~/.local/share/agent-hub-ops/session-ctl.sh orchestrator skills-sync` (pull bot-skills; relink). If `~/tmp/agent-reports/orchestrator/handoff.md` is newer than your session start, read it first. Drain `inbox/` (see CLAUDE.md duty 9). Check remaining context (<15% => handoff-restart per CLAUDE.md).
 1. Load/memory: `uptime`, `free -g`. If load/MemAvailable are bad, skip starting new sessions this tick and say so.
