@@ -163,9 +163,11 @@ while IFS= read -r table; do
     # An exactly-full last page yields one more empty page; cap iterations.
     got="$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1], encoding='utf-8')).get('rows', [])))" "$part")"
     [[ "$got" =~ ^[0-9]+$ ]] || fail "unparseable chunk table=${table} offset=${offset}"
-    (( offset += got ))
-    (( got < CHUNK_ROWS )) && break
-    (( offset > 1000000 )) && fail "chunk loop exceeded 1M rows table=${table} (endpoint changed?)"
+    # NOTE: plain assignments, not ((..)) arithmetic (which returns non-zero
+    # for a zero result and would trip set -e on empty tables).
+    offset=$((offset + got))
+    if (( got < CHUNK_ROWS )); then break; fi
+    if (( offset > 1000000 )); then fail "chunk loop exceeded 1M rows table=${table} (endpoint changed?)"; fi
   done
   log "table ok ${table} rows=${offset}"
 done < "$TABLES_LIST"
