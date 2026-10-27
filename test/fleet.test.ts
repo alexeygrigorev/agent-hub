@@ -753,6 +753,36 @@ describe('generic accounts and launch placement', () => {
     expect(unsupported.rejected).toContainEqual({ machine: 'hetzner', engine: 'codex', reason: 'goal_unsupported' });
     expect(unsupported.rejected).toContainEqual({ machine: 'win35', engine: 'codex', reason: 'goal_unsupported' });
   }));
+  it('places interactive goal starts on the advertised zcodex route when its quota is healthier (intake 28302c74)', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const config = registry();
+    config.accounts.push({ label: 'shared-zai', provider: 'zai', max_concurrency: 8, reserve_percent: 10, enabled: true });
+    config.routes.push({ machine_id: 'hetzner', engine: 'zcodex', account: 'shared-zai', profile: null });
+    expect((await s.handle(request('/accounts', config, 'PUT'), admin)).status).toBe(200);
+    const quota = (pct: number) => ({ status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: pct, reset_at: iso(86400000) } } });
+    // shared-zai is nearly unused: its healthier quota wins the goal start over Codex.
+    await s.handle(request('/subscriptions', { subscriptions: [
+      { service: 'codex', account: 'shared-codex', plan: 'pro', quota: quota(40) },
+      { service: 'zai', account: 'shared-zai', plan: 'pro', quota: quota(98) },
+    ] }, 'PUT'), host('hetzner'));
+    const caps = { engines: ['codex', 'zcodex'], fleet_modes: ['headless', 'interactive'], workspaces: ['demo'], cpu_count: 8,
+      fleet_goal_routes: [{ engine: 'codex', account: 'shared-codex', profile: null }, { engine: 'zcodex', account: 'shared-zai', profile: null }] };
+    sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify(caps), 'hetzner');
+    const planned = s.plan(intent({ mode: 'interactive', with_goal: true, tier: 'daily' }));
+    expect(planned.selected?.engine, JSON.stringify(planned.rejected)).toBe('zcodex');
+    expect(planned.selected?.account).toBe('shared-zai');
+    const listed: any = await (await s.handle(request('', undefined, 'GET'), admin)).json();
+    expect(listed.routes.find((r: any) => r.engine === 'zcodex')).toMatchObject({ machine_id: 'hetzner', account: 'shared-zai', supports_goal: true });
+    // Without the host advertisement the zcodex route serves no goal start...
+    sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify({ ...caps, fleet_goal_routes: [caps.fleet_goal_routes[0]] }), 'hetzner');
+    const unadvertised = s.plan(intent({ mode: 'interactive', with_goal: true, tier: 'daily' }));
+    expect(unadvertised.rejected).toContainEqual({ machine: 'hetzner', engine: 'zcodex', reason: 'goal_unsupported' });
+    // ...and a tool_permission_refused engine hold never blocks the interactive goal start.
+    sql.exec("INSERT INTO fleet_engine_health (engine, machine_id, status, reason, updated_at, diagnostics_json) VALUES ('zcodex', 'hetzner', 'unavailable', 'engine_tool_permission_refused', ?, '{}')", iso());
+    sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify(caps), 'hetzner');
+    const held = s.plan(intent({ mode: 'interactive', with_goal: true, tier: 'daily' }));
+    expect(held.selected?.engine, JSON.stringify(held.rejected)).toBe('zcodex');
+  }));
   it.each([false, true])('keeps unsupported-model session alive with fallback or explicit hold (pinned=%s)', async pinned => fixture(async (s, sql) => {
     await configure(s);
     for (const statement of SESSION_CONTROL_SCHEMA.split(';').filter(x => x.trim())) sql.exec(statement);
