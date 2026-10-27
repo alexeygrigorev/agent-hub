@@ -497,6 +497,26 @@ def terminal_step_once(dispatcher):
         print(json.dumps({'event': 'terminal_reports_error', 'type': type(error).__name__}), flush=True)
 
 
+WORKTREE_POLL_S = 30
+
+
+def worktree_commands_step_once(dispatcher):
+    """Intake 4b161918: run queued intake-worktree status/remove commands.
+
+    Best effort: an older Hub without the routes (404) is silent, any other
+    failure is logged without bodies and never reaches the main loop.
+    """
+    try:
+        from .intake_worktree import poll_commands_once
+        out = poll_commands_once(dispatcher.request,
+                                 git_bin=(getattr(dispatcher, 'settings', None) or {}).get('git_bin', 'git'))
+        if out.get('handled') or out.get('errors'):
+            print(json.dumps({'event': 'worktree_commands_cycle', 'handled': out['handled'],
+                              'errors': out['errors']}), flush=True)
+    except Exception as error:
+        print(json.dumps({'event': 'worktree_commands_error', 'type': type(error).__name__}), flush=True)
+
+
 def bindings_step_once(dispatcher, *, enrich=False):
     """Report native identity without waiting for launcher first-action readiness."""
     started = time.monotonic()
@@ -725,6 +745,8 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         bindings_thread = None
         terminal_thread = None
         next_terminal = 0
+        worktree_thread = None
+        next_worktree = 0
         count = 0
         # Operator fleet settings (workspaces map, workspace_roots,
         # subscriptions, launcher) are re-read when the file changes, so a
@@ -784,6 +806,13 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                         cleanup_roots=roots, settings=None))
                 except Exception as error:
                     print(json.dumps({'event': 'commands_error', 'type': type(error).__name__}), flush=True)
+                # Intake 4b161918: intake-worktree status/remove commands run in
+                # one single-inflight daemon thread (git fetch can take a minute),
+                # polled every WORKTREE_POLL_S to bound Hub requests.
+                if time.monotonic() >= next_worktree:
+                    worktree_thread = maybe_start_named_thread(
+                        worktree_thread, worktree_commands_step_once, (dispatcher,), 'intake-worktree-commands')
+                    next_worktree = time.monotonic() + WORKTREE_POLL_S
                 # Status observation never blocks commands/quota: one bounded
                 # single-inflight daemon thread, skipped while alive.
                 status_thread = maybe_start_status_thread(status_thread, status_collector)

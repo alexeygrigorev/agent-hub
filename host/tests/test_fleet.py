@@ -219,7 +219,8 @@ class FleetTests(unittest.TestCase):
             self.assertEqual(result['state'], 'running')
             self.assertEqual(calls[-1][0][0:2], ['aplexer', 'start'])
             self.assertIn('--profile', calls[-1][0]); self.assertNotIn('exec', calls[-1][0])
-            self.assertTrue(http[0][1].endswith('/claim'))
+            # Intake 4b161918: the worktree plan query precedes the claim.
+            self.assertTrue([a for a in http if not a[1].startswith('/api/worktree-host/')][0][1].endswith('/claim'))
             start_argv = calls[-1][0]
             self.assertEqual(start_argv[start_argv.index('--memory') + 1], '1500M')
             self.assertEqual(start_argv[start_argv.index('--pids') + 1], '256')
@@ -290,7 +291,8 @@ class FleetTests(unittest.TestCase):
             def wrong_model_plan(argv, **kw): return {'eligible': [{'provider': 'codex', 'model': 'some-other-model', 'task_fit': 1.0}]} if 'plan' in argv else runner(argv, **kw)
             d.runner = wrong_model_plan; requests.clear()
             with self.assertRaises(ValueError): d.dispatch(offer(mode='headless', prompt='Goal'))
-            self.assertFalse(requests)
+            # Intake 4b161918: only the worktree plan query; no claim or result.
+            self.assertFalse([a for a in requests if not a[1].startswith('/api/worktree-host/')])
 
     def test_antigravity_headless_requires_native_first_action_and_uuid(self):
         with tempfile.TemporaryDirectory() as tmp:
