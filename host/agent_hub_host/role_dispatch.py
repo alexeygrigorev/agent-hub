@@ -1339,6 +1339,29 @@ def get_system_boot_time() -> Optional[int]:
     return None
 
 
+def get_system_boot_time_precise() -> Optional[float]:
+    """Read system boot time in epoch seconds with subsecond precision.
+
+    /proc/stat exposes btime truncated to whole seconds, so on a host whose true
+    boot instant falls late in its second, every process start time derived from
+    it is biased early by up to 1s — enough to falsely fail the 1s clock
+    resolution tolerance in started-before-run provenance checks. The boot
+    epoch from the live wall clock minus monotonic uptime (which counts
+    suspension) carries no such truncation; integer btime remains the fallback.
+    """
+    try:
+        uptime_fields = pathlib.Path("/proc/uptime").read_text(encoding="utf-8", errors="replace").split()
+        uptime = float(uptime_fields[0])
+        if uptime >= 0.0:
+            return time.time() - uptime
+    except (OSError, ValueError, IndexError):
+        pass
+    btime = get_system_boot_time()
+    if btime is None:
+        return None
+    return float(btime)
+
+
 def get_clock_ticks_per_sec() -> int:
     """Return system clock ticks per second (SC_CLK_TCK), default 100."""
     try:
@@ -1351,7 +1374,7 @@ def get_clock_ticks_per_sec() -> int:
 
 
 def get_proc_start_time(pid: int) -> Optional[float]:
-    """Inspect start provenance of PID via /proc/<pid>/stat start-ticks and btime.
+    """Inspect start provenance of PID via /proc/<pid>/stat start-ticks and boot time.
 
     Returns authoritative epoch time in seconds with subsecond precision, or None if unreadable.
     Inode mtime is NOT supported process birth proof.
@@ -1361,11 +1384,11 @@ def get_proc_start_time(pid: int) -> Optional[float]:
     ticks = get_pid_starttime_ticks(pid)
     if ticks is None:
         return None
-    btime = get_system_boot_time()
+    btime = get_system_boot_time_precise()
     if btime is None:
         return None
     clk_tck = get_clock_ticks_per_sec()
-    return float(btime) + (float(ticks) / float(clk_tck))
+    return btime + (float(ticks) / float(clk_tck))
 
 
 def normalize_cgroup_path(raw_path: Any) -> Optional[str]:

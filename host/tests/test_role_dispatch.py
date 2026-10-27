@@ -1461,6 +1461,11 @@ class TestRoleRealBackendAdapter(unittest.TestCase):
                     time.sleep(0.02)
                 return {"status": "failed", "business_executed": False}
 
+            # Injected fixture spawns no native workload of its own; declare
+            # verified containment explicitly so cancel() does not depend on
+            # this polling thread exiting within the join window.
+            controlled_executor.cancel_verified = True
+
             cg_list = read_proc_cgroups(proc.pid)
             cgroup_path = cg_list[0][2] if cg_list else "/test.scope"
             mock_backend.is_fixture_only = True
@@ -2052,6 +2057,26 @@ class TestStrictWorkloadPIDContainmentAndProvenance(unittest.TestCase):
         )
         self.assertTrue(valid, f"Expected valid workload, got refusal: {why}")
         self.assertEqual(why, "ok")
+
+    def test_proc_start_time_has_no_boot_truncation_bias(self):
+        """Measured start provenance of a fresh process falls inside its creation window.
+
+        Integer btime biases derived start times early by up to 1s on hosts whose
+        boot instant falls late in their second; that bias falsely fails the 1s
+        started-before-run tolerance and raced role bootstrap into
+        bootstrap_failed_or_timeout instead of server_start_refused.
+        """
+        t0 = time.time()
+        proc = subprocess.Popen(["sleep", "5"])
+        t1 = time.time()
+        try:
+            measured = get_proc_start_time(proc.pid)
+        finally:
+            proc.kill()
+            proc.wait()
+        self.assertIsNotNone(measured)
+        self.assertGreaterEqual(measured, t0 - 0.25)
+        self.assertLessEqual(measured, t1 + 0.25)
 
     def test_refuses_counterexample_1_unreadable_state_and_start_provenance(self):
         """Counterexample 1: unreadable process state and start provenance fail closed."""
