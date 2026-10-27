@@ -16,3 +16,8 @@
   .tbm-pool svg { min-height: 0; }
   .tbm-kill { flex-direction: column; align-items: stretch; }
 }
+
+.tbm-catalog-list { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: .6rem 1rem; }
+.tbm-catalog-list dt, .tbm-catalog-list dd { margin: 0; overflow-wrap: anywhere; }
+.tbm-catalog-list small { display: block; }
+@media (max-width: 600px) { .tbm-catalog-list { grid-template-columns: minmax(0, 1fr); } .tbm-catalog-list dt { font-weight: 600; } }

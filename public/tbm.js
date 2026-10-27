@@ -282,7 +282,7 @@
   }
 
   function renderEmpty(reason) {
-    for (const id of ['tbm-pacing', 'tbm-banked', 'tbm-kill']) {
+    for (const id of ['tbm-pacing', 'tbm-banked', 'tbm-kill', 'tbm-catalog']) {
       const n = byId(id);
       if (n) n.replaceChildren(el('p', reason, 'metrics-chart-empty'));
     }
@@ -323,6 +323,34 @@
     }
   }
 
+  function renderCatalog(data) {
+    const root = byId('tbm-catalog');
+    if (!root) return;
+    root.replaceChildren();
+    for (const pool of [...(data.global ? [data.global] : []), ...(data.pools || [])]) {
+      const card = el('div', '', 'tbm-pool');
+      card.append(el('h3', pool.pool_id));
+      for (const [window, rollup] of Object.entries(pool.windows || {})) {
+        const details = el('details');
+        details.open = window === '24h';
+        details.append(el('summary', window));
+        if (rollup.coverage) details.append(el('p', `${rollup.coverage.pacing_samples} measured pacing samples · ${Number(rollup.coverage.observed_minutes).toFixed(1)} observed minutes · ${rollup.coverage.measured_token_events}/${rollup.coverage.reward_events} outcomes with measured tokens. Gaps remain unknown.`, 'tbm-note'));
+        const list = el('dl', '', 'tbm-catalog-list');
+        for (const [name, m] of Object.entries(rollup.metrics || {})) {
+          list.append(el('dt', name.replaceAll('_', ' ')));
+          const value = m.value === null ? `Unknown · ${m.reason}` : typeof m.value === 'object' ? JSON.stringify(m.value) : Number(m.value).toLocaleString(undefined, { maximumFractionDigits: 3 });
+          const entry = el('dd', `${value} (${m.unit})`);
+          entry.append(el('small', m.source, 'tbm-note'));
+          list.append(entry);
+        }
+        details.append(list);
+        card.append(details);
+      }
+      root.append(card);
+    }
+    if (!(data.pools || []).length) root.append(el('p', 'No quota pools reported.'));
+  }
+
   async function refresh() {
     const status = byId('tbm-status');
     try {
@@ -343,6 +371,9 @@
       if (status) status.textContent = [pacing, banked, kill].some(result => result.status === 'rejected')
         ? 'Burn pacing · partial: some sources unavailable.'
         : `TBM · ${user} · as of ${pacing.value.as_of || banked.value.as_of || 'unknown'}`;
+      // A catalog failure must not erase independently available pacing controls.
+      try { renderCatalog(await apiGet('/api/quota/metrics')); }
+      catch { const root = byId('tbm-catalog'); if (root) root.textContent = 'Metric catalog unavailable. Unknown is not zero.'; }
     } catch (e) {
       if (e && e.code === 'expired') { location.assign('/auth/login'); return; }
       const notice = byId('metrics-routing-notice');
@@ -362,7 +393,7 @@
     refresh();
   }
 
-  window.HubTbm = { refresh, renderPacing, renderBanked, renderKill };
+  window.HubTbm = { refresh, renderPacing, renderBanked, renderKill, renderCatalog };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 })();
