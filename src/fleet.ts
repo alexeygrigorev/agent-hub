@@ -889,10 +889,11 @@ export class FleetService {
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
       const model = policy.models.find(m => members.includes(m.id) && (!overrideModels.length || m.id === input.engine) && matchesModelRoute(m, route, family));
       if (!model) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'model_unsupported' }); continue; }
-      // Host adapter refusals are scoped to the exact route, mode and model.
-      // Quota refreshes cannot prove that a previously refused adapter works.
-      const unsupported = this.sql.exec("SELECT id FROM fleet_launches WHERE machine_id = ? AND engine = ? AND account = ? AND profile IS ? AND mode = ? AND exit_reason = 'model_unsupported' AND json_extract(model_selection_json, '$.model') = ? AND json_extract(model_selection_json, '$.effort') IS ? LIMIT 1",
-        route.machine_id, route.engine, route.account, route.profile, request.mode, model.model, model.effort).toArray().length;
+      // Host adapter refusals are scoped to the exact route, mode and model
+      // within the engine health retry window so transient historical launch
+      // rows cannot permanently poison a route after host/launcher updates.
+      const unsupported = this.sql.exec("SELECT id FROM fleet_launches WHERE machine_id = ? AND engine = ? AND account = ? AND profile IS ? AND mode = ? AND exit_reason = 'model_unsupported' AND COALESCE(finished_at, updated_at) > ? AND json_extract(model_selection_json, '$.model') = ? AND json_extract(model_selection_json, '$.effort') IS ? LIMIT 1",
+        route.machine_id, route.engine, route.account, route.profile, request.mode, new Date(this.now() - ENGINE_HEALTH_RETRY_MS).toISOString(), model.model, model.effort).toArray().length;
       const advertisedRefusal = Array.isArray(caps.fleet_route_rejections) && caps.fleet_route_rejections.some((r: any) =>
         r.engine === route.engine && r.account === route.account && (r.profile ?? null) === route.profile && r.mode === request.mode && r.reason === 'model_unsupported');
       if (unsupported || advertisedRefusal) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'model_unsupported' }); continue; }

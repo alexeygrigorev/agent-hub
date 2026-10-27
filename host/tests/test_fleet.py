@@ -290,7 +290,10 @@ class FleetTests(unittest.TestCase):
             self.assertIn('--backend', calls[-1]); self.assertIn('task-units', calls[-1]); self.assertNotIn('aplexer', calls[-1])
             def wrong_model_plan(argv, **kw): return {'eligible': [{'provider': 'codex', 'model': 'some-other-model', 'task_fit': 1.0}]} if 'plan' in argv else runner(argv, **kw)
             d.runner = wrong_model_plan; requests.clear()
-            with self.assertRaises(ValueError): d.dispatch(offer(mode='headless', prompt='Goal'))
+            with self.assertRaisesRegex(ValueError, '^model_unsupported:'): d.dispatch(offer(mode='headless', prompt='Goal'))
+            def quota_rejected_plan(argv, **kw): return {'eligible': [], 'rejections': {'codex': 'limit_reached'}} if 'plan' in argv else runner(argv, **kw)
+            d.runner = quota_rejected_plan; requests.clear()
+            with self.assertRaisesRegex(ValueError, '^Fresh admission refused$'): d.dispatch(offer(mode='headless', prompt='Goal'))
             # Intake 4b161918: only the worktree plan query; no claim or result.
             self.assertFalse([a for a in requests if not a[1].startswith('/api/worktree-host/')])
 

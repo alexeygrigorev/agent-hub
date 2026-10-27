@@ -243,7 +243,7 @@ export async function handleRegistryRoutes(
 
     const rolesJson = JSON.stringify(roles);
     const capJson = JSON.stringify(capabilities);
-    if (rolesJson.length > 4096 || capJson.length > 4096) return Response.json({ error: 'payload_too_large' }, { status: 400 });
+    if (rolesJson.length > 4096 || capJson.length > 16384) return Response.json({ error: 'payload_too_large' }, { status: 400 });
 
     // Host-enrollment authority (R5 R2 prerequisite, ported from
     // f20b35a60af2de17c91303dd317da70b44f56174 without M9 metrics parts).

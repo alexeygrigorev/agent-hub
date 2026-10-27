@@ -538,6 +538,23 @@ describe('M2 Focus: REGISTRY', () => {
     expect(availBody.machines.length).toBe(1);
     expect(availBody.machines[0].id).toBe(machineId);
     expect(availBody.machines[0].hostname).toBe('testhost-1');
+
+    // 5. Register with >4 KiB capabilities (matching multi-workspace/route hosts up to 16 KiB)
+    const largeCaps = {
+      launcher: true,
+      workspaces: Array.from({ length: 80 }, (_, i) => `workspace-item-${i}-${'x'.repeat(30)}`),
+    };
+    expect(JSON.stringify(largeCaps).length).toBeGreaterThan(4096);
+    expect(JSON.stringify(largeCaps).length).toBeLessThanOrEqual(16384);
+    const largeRegRes = await doFetch(new Request('http://example.com/api/machines/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${hostToken}` },
+      body: JSON.stringify({
+        hostname: 'testhost-1', os: 'Linux', network: 'default',
+        roles: ['host'], capabilities: largeCaps
+      })
+    }));
+    expect(largeRegRes.status).toBe(200);
   });
 
   it('drain/adminCSRF/crosshost binding/malformed inputs', async () => {

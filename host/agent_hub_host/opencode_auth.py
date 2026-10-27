@@ -100,29 +100,33 @@ def launch_argv(cfg, argv):
 def _native(cfg, args, env, payload=None):
     # A native diagnostic can contain credentials. Bound it privately and never
     # attach stdout, stderr, argv or exception strings to an outward diagnostic.
-    with tempfile.TemporaryFile(dir=cfg['target_data']) as output:
-        proc = subprocess.Popen([cfg['binary'], *args, '--standalone'], env=env,
-                                stdin=subprocess.PIPE, stdout=output, stderr=subprocess.DEVNULL,
-                                start_new_session=(os.name != 'nt'))
-        try:
-            proc.communicate(payload, timeout=45)
-        except BaseException:
-            if os.name != 'nt':
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            else:
-                proc.kill()
-            proc.wait()
-            raise
-        if output.tell() > 1048576:
-            raise ValueError('engine_auth_expired: OpenCode device auth check failed')
-        output.seek(0)
-        raw = output.read(1048577)
-    if proc.returncode:
-        raise ValueError('engine_auth_expired: OpenCode device auth check failed')
-    return json.loads(raw) if raw.strip() else None
+    attempts = 2 if payload is None else 1
+    for attempt in range(attempts):
+        with tempfile.TemporaryFile(dir=cfg['target_data']) as output:
+            proc = subprocess.Popen([cfg['binary'], *args, '--standalone'], env=env,
+                                    stdin=subprocess.PIPE, stdout=output, stderr=subprocess.DEVNULL,
+                                    start_new_session=(os.name != 'nt'))
+            try:
+                proc.communicate(payload, timeout=45)
+            except BaseException:
+                if os.name != 'nt':
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    proc.kill()
+                proc.wait()
+                raise
+            if output.tell() > 1048576:
+                raise ValueError('engine_auth_expired: OpenCode device auth check failed')
+            output.seek(0)
+            raw = output.read(1048577)
+        if not proc.returncode:
+            return json.loads(raw) if raw.strip() else None
+        if attempt + 1 < attempts:
+            time.sleep(0.5)
+    raise ValueError('engine_auth_expired: OpenCode device auth check failed')
 
 
 def _source_login_revision(cfg):

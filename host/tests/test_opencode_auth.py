@@ -335,3 +335,32 @@ def test_unsupported_native_revision_schema_disables_only_reuse(tmp_path):
     calls = (Path(cfg['target_data']) / 'fixture-calls.log').read_text().splitlines()
     assert calls.count('auth export opencode') == 2
     assert not (Path(cfg['target_data']) / 'device-verification.json').exists()
+
+
+def test_native_retries_once_on_transient_readonly_failure(tmp_path):
+    cfg = config(tmp_path)
+    Path(cfg['target_data']).mkdir(parents=True, exist_ok=True)
+    attempts = []
+
+    class FakeProc:
+        def __init__(self, rc, out, stdout_file):
+            self.returncode = rc
+            self.pid = 12345
+            self._out = out
+            self._stdout = stdout_file
+
+        def communicate(self, payload, timeout=None):
+            self._stdout.write(self._out)
+            self._stdout.flush()
+
+    def fake_popen(argv, env=None, stdin=None, stdout=None, stderr=None, start_new_session=None):
+        attempts.append(argv)
+        if len(attempts) == 1:
+            return FakeProc(1, b'', stdout)
+        return FakeProc(0, b'[{"id":"ok"}]', stdout)
+
+    with patch.object(auth.subprocess, 'Popen', side_effect=fake_popen), \
+            patch.object(auth.time, 'sleep'):
+        res = auth._native(cfg, ['auth', 'export', 'opencode'], {}, payload=None)
+    assert res == [{'id': 'ok'}]
+    assert len(attempts) == 2

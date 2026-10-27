@@ -807,6 +807,9 @@ describe('generic accounts and launch placement', () => {
     expect(s.plan(intent({ machine: 'hetzner', mode: 'interactive', prompt: '' })).selected).not.toBeNull();
     expect(s.plan(intent({ machine: 'hetzner', tier: 'quick' })).selected).not.toBeNull();
     expect((await s.handle(request(path, { reason: 'model_unsupported' }), host('hetzner'))).status).toBe(409);
+    // Transient historical model_unsupported launch rows expire after ENGINE_HEALTH_RETRY_MS (10 min).
+    sql.exec('UPDATE fleet_launches SET finished_at = ?, updated_at = ? WHERE id = ?', iso(-600001), iso(-600001), launch.id);
+    expect(s.plan(intent({ machine: 'hetzner' })).selected?.machine).toBe('hetzner');
     if (!pinned) {
       await s.handle(request('/launches/' + refusal.id + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'desktop-codex', profile_supported: true }), host('win35'));
       expect((await s.handle(request('/launches/' + refusal.id + '/reject', { reason: 'model_unsupported' }), host('win35'))).status).toBe(409);

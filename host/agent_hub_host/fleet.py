@@ -2565,6 +2565,16 @@ class Dispatcher:
                     return False
                 return True
             if not isinstance(eligible, list) or not any(_plan_match(r) for r in eligible):
+                rejections = plan.get("rejections") if isinstance(plan, dict) else None
+                if isinstance(rejections, dict):
+                    keys = {
+                        sub.get("launcher_provider"),
+                        sub.get("service"),
+                        sub.get("account_label"),
+                        canonical_account_label(sub.get("account_label")),
+                    } - {None, ""}
+                    if any(k in rejections for k in keys):
+                        raise ValueError("Fresh admission refused")
                 raise ValueError("model_unsupported: maintained launcher plan refused requested model")
             # OpenCode, Antigravity, ZAI, Gemini, and named-profile Codex use the maintained native backend:
             # real engine/UUID plus validated first action for Hub binding.
