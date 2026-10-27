@@ -30,6 +30,10 @@ class AuthBusy(ValueError):
     """Another local sync owns the store; this is not authentication evidence."""
 
 
+class AuthCheckUnavailable(ValueError):
+    """Native verification failed without proving that credentials expired."""
+
+
 @contextmanager
 def _lock(path):
     deadline = time.monotonic() + 30
@@ -126,7 +130,10 @@ def _native(cfg, args, env, payload=None):
             return json.loads(raw) if raw.strip() else None
         if attempt + 1 < attempts:
             time.sleep(0.5)
+    if args[:2] == ['auth', 'export']:
+        raise AuthCheckUnavailable('engine_auth_check_unavailable: native device credential export failed')
     raise ValueError('engine_auth_expired: OpenCode device auth check failed')
+
 
 
 def _source_login_revision(cfg):
@@ -288,7 +295,9 @@ def prepare(cfg, *, native=None):
                 private_fs.atomic_write(target / 'device-verification.json',
                     json.dumps({'identity': identity, 'verified_at': time.time()}).encode(), 8192)
         return {'status': 'ok', 'reason': 'device_auth_verified'}
-    except AuthBusy:
+    except (AuthBusy, AuthCheckUnavailable):
         raise
+    except (OSError, subprocess.TimeoutExpired):
+        raise AuthCheckUnavailable('engine_auth_check_unavailable: native device verification could not run') from None
     except Exception:
         raise ValueError('engine_auth_expired: OpenCode device login unavailable; run opencode auth login opencode --method device on this host') from None

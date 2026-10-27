@@ -1,5 +1,6 @@
 import { jsonFields, initResourceRequestProjection } from './sql-json-projection';
 import { sanitizeExitEvidence, redactExitText } from './exit-evidence';
+import { sanitizeCommandFields } from './command-diagnostics';
 import {sanitizeCpuAdmission} from './cpu-headroom';
 import { launcherDiskHeadroom } from './launcher-disk';
 /** Generic account registry and placement. Provider credentials never enter this service. */
@@ -362,6 +363,11 @@ export class FleetService {
   public resources: ResourceManagement;
   public admission: ClaimAdmission;
   private maintenance: { reconciled: boolean; drained: boolean; queueLimit:number } | null = null;
+  // Intake 488b860e: rotation point for re-offered effect-free starting
+  // launches, so no row starves behind others regardless of age order.
+  // The cursor is a value in the ORDER BY key (updated_at, id), never a
+  // row position, so concurrent inserts, removals and wraps stay exact.
+  private reofferCursors = new Map<string, [string, string]>();
 
   /** Synchronous operation scope: nested routing/reserve/plan calls share work,
    * never capacity snapshots. No await may cross this scope. */
@@ -1384,6 +1390,29 @@ export class FleetService {
           valid.push(row);
           if (valid.length === 20) break;
         }
+        // Intake 488b860e follow-up: an all-attempts claim timeout can land
+        // late server-side (state starting, attempt key stored, no native
+        // effect). Offered-only polling would never resurface it, so the
+        // same host could never replay the claim. Re-offer effect-free
+        // starting launches to the owning host with their stored key; the
+        // host resumes only on a journal key match, so a sibling loop's
+        // claim is never stolen. Rotation (not age order) guarantees no row
+        // starves: the retry window is the cycle right after the timeout,
+        // and a flood of newer rows or stale foreign rows can never pin a
+        // resumable launch out of the bounded window forever. The cursor is
+        // a value in the ORDER BY key with a wrap query, so rows past any
+        // fetch bound and rows inserted behind the cursor are still reached.
+        const resumeBase = "FROM fleet_launches WHERE machine_id = ? AND state = 'starting' AND native_id IS NULL AND launcher_task_id IS NULL";
+        const [cat, cid] = this.reofferCursors.get(caller.machineId!) ?? ['', ''];
+        const resumeRows = this.sql.exec(`SELECT * ${resumeBase} AND (updated_at > ? OR (updated_at = ? AND id > ?)) ORDER BY updated_at, id LIMIT 100`, caller.machineId!, cat, cat, cid).toArray() as any[];
+        if (resumeRows.length < 100) {
+          resumeRows.push(...this.sql.exec(`SELECT * ${resumeBase} AND NOT (updated_at > ? OR (updated_at = ? AND id > ?)) ORDER BY updated_at, id LIMIT ?`, caller.machineId!, cat, cat, cid, 100 - resumeRows.length).toArray() as any[]);
+        }
+        for (const row of resumeRows) {
+          valid.push(row);
+          this.reofferCursors.set(caller.machineId!, [row.updated_at, row.id]);
+          if (valid.length === 30) break;
+        }
         const sessionTable = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_sessions'").toArray().length > 0;
         const scopedWorkers = sessionTable && valid.length ? new Set(this.sql.exec(
           `SELECT fleet_launch_id FROM session_control_sessions WHERE fleet_launch_id IN (${valid.map(() => '?').join(',')}) AND json_extract(request_json,'$.intake_task_id') IS NOT NULL`,
@@ -1399,7 +1428,8 @@ export class FleetService {
               memory_estimate_mb: this.resources.estimate(request.project || String(row.workspace), String(row.engine), request.task_kind || 'goal'),
               selection: parsed(row.model_selection_json) ?? {}, id: row.id, engine: row.engine, account: row.account, profile: row.profile,
               mode: row.mode, workspace: row.workspace, cwd: request.cwd ?? null, prompt: row.prompt,
-              ...(request.with_goal === true ? { with_goal: true } : {}), access: request.access?.mode || 'legacy_unspecified' };
+              ...(request.with_goal === true ? { with_goal: true } : {}), access: request.access?.mode || 'legacy_unspecified',
+              ...(row.state !== 'offered' ? { state: row.state, claim_key: row.claim_key ?? null } : {}) };
           });
         });
         return response({ offers: this.routing.enrichOffers(offers), reconciliation: this.reconciliationCandidates(caller.machineId!) });
@@ -1655,9 +1685,10 @@ export class FleetService {
         if (match[2] === 'reject') {
           if (!object(data, ['reason', 'diagnostic']) || (data.reason !== 'dispatch_refused' && !Object.hasOwn(DISPATCH_MESSAGES, data.reason))) return response({ error: 'invalid_rejection' }, 400);
           const diagnostic = data.diagnostic ?? { reason: data.reason, message: DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.', stage: 'dispatch_route', error_type: 'Error' };
-          if (!object(diagnostic, ['reason', 'message', 'stage', 'error_type']) || diagnostic.reason !== data.reason || diagnostic.stage !== 'dispatch_route' ||
+          if (!object(diagnostic, ['reason', 'message', 'stage', 'error_type', 'command', 'exit_code', 'stdout_tail', 'stderr_tail']) || diagnostic.reason !== data.reason || diagnostic.stage !== 'dispatch_route' ||
               diagnostic.message !== (DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.') ||
-              typeof diagnostic.error_type !== 'string' || !/^[A-Za-z]{1,64}$/.test(diagnostic.error_type)) return response({ error: 'invalid_rejection' }, 400);
+              typeof diagnostic.error_type !== 'string' || !/^[A-Za-z]{1,64}$/.test(diagnostic.error_type) ||
+              !sanitizeCommandFields(diagnostic)) return response({ error: 'invalid_rejection' }, 400);
           // Only an unclaimed offer proves that no start was authorized. The
           // transaction fences a racing claim; never reject possibly-live work.
           if (row.state !== 'offered' || row.native_id || row.launcher_task_id) return response({ error: 'already_claimed' }, 409);
@@ -1702,17 +1733,16 @@ export class FleetService {
           // loop or another attempt) stays a 409 conflict.
           const claimKey = (data as any)?.claim_key;
           if (claimKey !== undefined && (typeof claimKey !== 'string' || !CLAIM_KEY.test(claimKey))) return response({ error: 'invalid_claim' }, 400);
-          if (row.state !== 'offered') {
-            if (typeof claimKey === 'string' && (row as any).claim_key === claimKey && row.state === 'starting' && !row.native_id && !row.launcher_task_id) {
-              return response({ ...row, state: 'starting', replay: true });
-            }
-            return response({ error: 'already_claimed' }, 409);
-          }
+          const replay = typeof claimKey === 'string' && row.claim_key === claimKey && row.state === 'starting' && !row.native_id && !row.launcher_task_id;
+          if (row.state !== 'offered' && !replay) return response({ error: 'already_claimed' }, 409);
+          // A delayed first start must still have current edit authority,
+          // fresh admission and enabled providers. Invalid replay holds the
+          // existing reservation: it cannot prove absence of native effects.
           const cpu=this.resources.cpuHeadroom(row.machine_id,parsed(row.request_json),row.id);
           if(!cpu.admitted) return response({error:cpu.reason,cpu},409);
           // Pre-hold offers on a now-disabled engine are held, never launched.
           if (disabledEngines().has(row.engine)) return response({ error: 'provider_disabled' }, 409);
-          const held = this.admission.retireInvalidOffer(row);
+          const held = replay ? this.admission.heldReason(row) : this.admission.retireInvalidOffer(row);
           if (held) return response({ error: held }, ['claim_inactive', 'claim_conflict', 'claim_authority_changed'].includes(held) ? 409 : 403);
           if (!object(data, ['gate_allowed', 'observed_at', 'account', 'profile_supported', 'model', 'claim_key']) || data.gate_allowed !== true || data.profile_supported !== true || data.account !== row.account || !fresh(data.observed_at, this.now(), 30000)) return response({ error: 'fresh_admission_required' }, 409);
           const selectedModel = parsed(row.model_selection_json)?.model;
@@ -1727,6 +1757,12 @@ export class FleetService {
           // Capacity reads reconcile other offers and time may advance during synchronous checks.
           // Never revive a row retired by that sweep; check authority again at the final write.
           const current: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id = ?', row.id).one();
+          if (replay) {
+            if (current.state !== 'starting' || current.claim_key !== claimKey || current.native_id || current.launcher_task_id) return response({ error: 'already_claimed' }, 409);
+            const replayHold = this.admission.heldReason(current);
+            if (replayHold) return response({ error: replayHold }, 409);
+            return response({ ...current, state: 'starting', replay: true });
+          }
           const finalHold = current.state === 'offered' ? this.admission.retireInvalidOffer(current) : current.exit_reason || 'already_claimed';
           if (finalHold) return response({ error: finalHold }, ['claim_inactive', 'claim_conflict', 'claim_authority_changed', 'already_claimed'].includes(finalHold) ? 409 : 403);
           this.sql.exec("UPDATE fleet_launches SET state = 'starting', claim_key = COALESCE(?, claim_key), updated_at = ? WHERE id = ? AND state = 'offered'", typeof claimKey === 'string' ? claimKey : null, new Date(this.now()).toISOString(), row.id);
@@ -1749,7 +1785,7 @@ export class FleetService {
         // AC a19cac9e: runtime diagnostics may carry signal, wall_time_ms and
         // a sanitized tail alongside exit_code; all bounded, no control chars.
         const diagnostic = data.diagnostic;
-        if (diagnostic !== undefined && (!object(diagnostic, ['reason', 'message', 'error_type', 'exit_code', 'signal', 'wall_time_ms', 'tail', 'stage', 'cpu']) ||
+        if (diagnostic !== undefined && (!object(diagnostic, ['reason', 'message', 'error_type', 'exit_code', 'signal', 'wall_time_ms', 'tail', 'stage', 'cpu', 'command', 'stdout_tail', 'stderr_tail']) ||
             typeof diagnostic.reason !== 'string' || !/^(?:(?:launcher|engine)_[a-z_]{1,64}|cpu_headroom|cpu_pressure|memory_pressure|host_oom|host_runtime_choking)$/.test(diagnostic.reason) ||
             typeof diagnostic.message !== 'string' || diagnostic.message.length > 300 || /[\x00-\x1f\x7f]/.test(diagnostic.message) ||
             typeof diagnostic.error_type !== 'string' || !/^[A-Za-z]{1,64}$/.test(diagnostic.error_type) ||
@@ -1758,7 +1794,8 @@ export class FleetService {
             (diagnostic.signal !== undefined && (!Number.isSafeInteger(diagnostic.signal) || diagnostic.signal <= 0 || diagnostic.signal > 128)) ||
             (diagnostic.wall_time_ms !== undefined && (!Number.isSafeInteger(diagnostic.wall_time_ms) || diagnostic.wall_time_ms < 0)) ||
             (diagnostic.tail !== undefined && (typeof diagnostic.tail !== 'string' || diagnostic.tail.length > 1024 || /[\x00-\x1f\x7f]/.test(diagnostic.tail))) ||
-            (diagnostic.cpu !== undefined && !sanitizeCpuAdmission(diagnostic.cpu)))) return response({ error: 'invalid_launch_diagnostic' }, 400);
+            (diagnostic.cpu !== undefined && !sanitizeCpuAdmission(diagnostic.cpu)) ||
+            !sanitizeCommandFields(diagnostic))) return response({ error: 'invalid_launch_diagnostic' }, 400);
         if (diagnostic) {
           diagnostic.message = redactExitText(diagnostic.message).slice(0, 300);
           if (diagnostic.tail !== undefined) diagnostic.tail = redactExitText(diagnostic.tail).slice(0, 1024);

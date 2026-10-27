@@ -215,8 +215,8 @@ def _sanitized_transport_error(exc, limit=160):
 # Idempotent same-host re-claim after an ambiguous claim timeout (intake
 # 488b860e). The per-attempt key lets a late-landing original claim plus the
 # retry resolve to exactly one server claim; the retry path then starts at
-# most one native process.
-CLAIM_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,128}\Z")
+# most one native process. Max 128 chars total, matching the server CLAIM_KEY.
+CLAIM_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,127}\Z")
 # Bounded synchronous same-key claim attempts per dispatch: the first attempt
 # may time out client-side while the server already committed the claim.
 CLAIM_ATTEMPTS = 3
@@ -227,6 +227,10 @@ CLAIM_ATTEMPTS = 3
 # TimeoutError once per offer, reproducing the production ambiguity (client
 # timeout, unknown server outcome) so the same-key retry must resolve it.
 PRECLAIM_FAULT_FILE = "fleet-fault-preclaim.json"
+
+
+class LocalCommandTimeout(TimeoutError, RuntimeError):
+    """A local command reached its deadline, rather than refusing admission."""
 
 
 class ClaimTimeoutError(TimeoutError):
@@ -603,12 +607,16 @@ def load_settings(path=None):
 
 
 def run_json(argv, *, payload=None, cwd=None, timeout=30):
-    """No shell, no provider stdout/stderr in exceptions or logs."""
+    """No shell; typed failures carry bounded redacted evidence, never argv."""
+    from .launch_diagnostics import LocalCommandError
     from .aplexer_client import client_call
     native = client_call(argv[0], argv[1:]) if payload is None else None
     if native is not None:
         if native.returncode:
-            raise RuntimeError("Native client operation failed; reconcile effects")
+            raise LocalCommandError(native.stdout + '\n' + native.stderr,
+                                    command=argv[0], exit_code=native.returncode,
+                                    stdout=native.stdout, stderr=native.stderr,
+                                    reconcile_effects=True)
         if len(native.stdout.encode("utf-8")) > 8 * 1024 * 1024:
             raise RuntimeError("Native client response exceeds bound; reconcile effects")
         return json.loads(native.stdout)
@@ -650,12 +658,18 @@ def run_json(argv, *, payload=None, cwd=None, timeout=30):
         while proc.poll() is None and not overflow.is_set() and time.monotonic() < deadline:
             overflow.wait(.02)
         if proc.poll() is None:
+            expired = time.monotonic() >= deadline and not overflow.is_set()
             proc.kill(); proc.wait(timeout=2)
-            raise RuntimeError('Local command failed or exceeded resource limit')
+            if expired:
+                raise LocalCommandTimeout('Local command timed out')
+            raise LocalCommandError('Local command failed or exceeded resource limit',
+                                    command=argv[0], exit_code=proc.returncode,
+                                    stdout=bytes(stdout), stderr=bytes(stderr))
         for thread in threads: thread.join(timeout=1)
         if proc.returncode != 0 or overflow.is_set() or any(t.is_alive() for t in threads):
-            from .launch_diagnostics import LocalCommandError
-            raise LocalCommandError(bytes(stdout + b'\n' + stderr).decode('utf-8', 'replace'), exit_code=proc.returncode)
+            raise LocalCommandError(bytes(stdout + b'\n' + stderr).decode('utf-8', 'replace'),
+                                    command=argv[0], exit_code=proc.returncode,
+                                    stdout=bytes(stdout), stderr=bytes(stderr))
     finally:
         if proc.poll() is None: proc.kill(); proc.wait(timeout=2)
         # Each reader owns and closes its stream after EOF. Closing its raw descriptor here
@@ -2172,6 +2186,8 @@ class Dispatcher:
     def _submit_launcher_task(self, prefix, launcher, task_id, submit_argv):
         try:
             return self.runner(submit_argv, cwd=launcher["root"])
+        except (TimeoutError, subprocess.TimeoutExpired):
+            raise  # Submission may have landed; retry its original key next cycle.
         except RuntimeError:
             self._drop_queued_launcher_task(launcher, task_id)
             return self.runner(submit_argv, cwd=launcher["root"])
@@ -2348,6 +2364,20 @@ class Dispatcher:
         print(json.dumps({'event': 'fleet_device_auth', 'shared': shared,
                           'elapsed_s': round(time.monotonic() - requested_at, 3)}), flush=True)
 
+    def _preclaim_check(self, offer_id, callback, *args, **kwargs):
+        """Hold timed-out preparation without rejecting or authorizing a start.
+
+        Only use before the claim POST. Definitive refusals and post-claim
+        native failures retain their existing handling. Preserve a pending
+        key when preparation belongs to an ambiguous earlier claim attempt.
+        """
+        try:
+            return callback(*args, **kwargs)
+        except (TimeoutError, subprocess.TimeoutExpired) as exc:
+            raise ClaimTimeoutError(
+                'pre-claim check timed out; held for retry',
+                claim_key=self._pending_claim_key(offer_id)) from exc
+
     def dispatch(self, offer):
         if offer.get('with_goal') and offer.get('mode') != 'interactive':
             raise ValueError('Goal work is interactive only')
@@ -2373,7 +2403,7 @@ class Dispatcher:
         # identity; the Hub route label may be its canonical alias during
         # a relabel (_route already pinned canonical identity above).
         admission_payload["account"] = sub["account_label"]
-        at = self._dispatch_admission(sub, admission_payload, selection, offer)
+        at = self._preclaim_check(offer_id, self._dispatch_admission, sub, admission_payload, selection, offer)
         mode = offer.get("mode")
         # The offer workspace is a configured identifier — a legacy label or
         # an explicitly allowed absolute path — never a free-form path: it is
@@ -2391,8 +2421,10 @@ class Dispatcher:
                 if not all(launcher.get(k) for k in ('argv', 'root', 'config_dir')):
                     raise ValueError('model_unsupported: maintained adapter capability query unavailable')
                 try:
-                    support = self.runner(launcher['argv'] + ['--config-dir', launcher['config_dir'], 'model-support',
+                    support = self._preclaim_check(offer_id, self.runner, launcher['argv'] + ['--config-dir', launcher['config_dir'], 'model-support',
                                           '--provider', sub['launcher_provider'], '--model', selection['model']], cwd=launcher['root'])
+                except ClaimTimeoutError:
+                    raise
                 except Exception:
                     raise ValueError('model_unsupported: maintained adapter capability query unavailable') from None
                 if support.get('supported') is not True or support.get('provider') != sub['launcher_provider'] or support.get('model') != selection['model']:
@@ -2544,8 +2576,8 @@ class Dispatcher:
                 from . import provisioning
                 payload["managed_dir"] = str(provisioning.root())
             submit_argv = prefix + ["submit", "--id", task_id, "--key", task_id, "--paths", str(result_path), "--payload", json.dumps(payload), "--json"]
-            self._submit_launcher_task(prefix, launcher, task_id, submit_argv)
-            plan = self.runner(prefix + ["plan", "--id", task_id], cwd=launcher["root"])
+            self._preclaim_check(offer_id, self._submit_launcher_task, prefix, launcher, task_id, submit_argv)
+            plan = self._preclaim_check(offer_id, self.runner, prefix + ["plan", "--id", task_id], cwd=launcher["root"])
             eligible = plan.get("eligible", [])
             # Real maintained-plan contract (verified live against the
             # maintained CLI dry-run): entries carry provider/model/task_fit
@@ -2604,7 +2636,7 @@ class Dispatcher:
         if _iso_age_s(at) > CLAIM_ADMISSION_REFRESH_S:
             # Intake 4398ce2a: launcher submit/plan (and a slow Hub) can push
             # the first observation past the Hub's 30 s claim freshness.
-            at = self._dispatch_admission(sub, admission_payload, selection, offer)
+            at = self._preclaim_check(offer_id, self._dispatch_admission, sub, admission_payload, selection, offer)
         # Intake 488b860e: the key spans this host attempt (reused across
         # cycles while the claim stays unconfirmed). A timeout retries with
         # the same key, so a late-landing claim replays instead of doubling.
@@ -2634,6 +2666,21 @@ class Dispatcher:
                              "--to", "hub-" + offer_id, "--queue",
                              "--kind", "hub-session-preamble", "--json", wt_note + SESSION_PREAMBLE],
                             cwd=str(workspace))
+            pending_key = self._pending_claim_key(offer_id)
+            if pending_key is not None:
+                # A claim replay may now authorize a native effect. Fence it
+                # durably BEFORE invoking start/run: a lost native receipt,
+                # result POST, or controller death cannot make this claim
+                # look effect-free again on the next host cycle.
+                fence = {'offer_id': offer_id, 'state': 'uncertain',
+                         'reason': 'native_start_pending', 'settled': False,
+                         'claim_key': pending_key, 'mode': mode,
+                         'workspace': str(workspace), 'target_cwd': str(target_cwd),
+                         'engine': offer.get('engine'),
+                         'tag': ('hub-' if mode == 'interactive' else 'task-hub-') + offer_id}
+                if mode == 'headless':
+                    fence['task_id'] = task_id
+                self._persist_launch_record(fence)
             receipt = self.runner(argv, cwd=cwd, timeout=120)
             if mode == "interactive":
                 native_id = receipt.get("id")
@@ -3250,6 +3297,17 @@ class Dispatcher:
         immediately; refusals and holds keep their existing receipts.
         """
         try:
+            # Intake 488b860e follow-up: the server re-offers effect-free
+            # starting launches (all claim attempts timed out, one landed
+            # late) with their stored claim_key. Resume only when this host
+            # holds the matching pending attempt key; a foreign key is a
+            # sibling loop's (or stale) claim and must never be touched.
+            server_key = offer.get('claim_key')
+            if server_key is not None:
+                pending = self._pending_claim_key(offer.get('id'))
+                if not (isinstance(server_key, str) and CLAIM_KEY_RE.fullmatch(server_key) and pending == server_key):
+                    results.append({'id': offer.get('id'), 'state': 'held', 'reason': 'already_claimed'})
+                    return
             outcome = self.dispatch(offer)
             results.append(outcome)
             if outcome.get('state') == 'running':
@@ -3267,7 +3325,10 @@ class Dispatcher:
                 # already own the launch server-side; rejecting could fail a
                 # live launch, and a 409 here would be meaningless. Hold with
                 # the attempt key persisted so the same-host retry replays the
-                # same claim instead of opening a second one.
+                # same claim instead of opening a second one. The server
+                # re-offers an effect-free starting launch with its stored key
+                # (see _dispatch_one), so the retry also fires when every
+                # attempt timed out and the claim landed late.
                 from .dispatch_diagnostics import MESSAGES as _DISPATCH_MESSAGES
                 diagnostic = {'reason': 'claim_timeout',
                               'message': _DISPATCH_MESSAGES['claim_timeout'],
@@ -3288,9 +3349,10 @@ class Dispatcher:
                 # cycle beyond the normal losing poll.
                 results.append({'id': offer.get('id'), 'state': 'held', 'reason': 'already_claimed'})
                 return
-            from .opencode_auth import AuthBusy
-            if isinstance(exc, AuthBusy):
-                results.append({'id': offer.get('id'), 'state': 'held', 'reason': 'engine_auth_busy'})
+            from .opencode_auth import AuthBusy, AuthCheckUnavailable
+            if isinstance(exc, (AuthBusy, AuthCheckUnavailable)):
+                results.append({'id': offer.get('id'), 'state': 'held',
+                                'reason': 'engine_auth_busy' if isinstance(exc, AuthBusy) else 'engine_auth_check_unavailable'})
                 return  # No claim/effect; preserve offer for the next poll.
             from .dispatch_diagnostics import classify
             workspace_available = True
@@ -3306,8 +3368,20 @@ class Dispatcher:
                 slug = str(exc).split(':', 1)[1].strip()[:129] if ':' in str(exc) else ''
                 print(json.dumps({'event': 'dispatch_claim_refused', 'offer_id': offer.get('id'),
                                   'hub_error': slug if re.fullmatch(r'[A-Za-z0-9_:.-]{0,129}', slug) else ''}), flush=True)
-            # Only fixed diagnostics enter the journal; no prompt, argv,
-            # account credentials or arbitrary exception text is retained.
+            pending_key = self._pending_claim_key(offer.get('id'))
+            if pending_key is not None:
+                # This is an already-ambiguous claim attempt, not an
+                # unclaimed offer. Admission can recover on a later cycle;
+                # retain its key and capacity, never attempt an unclaimed
+                # rejection or overwrite the retry state with a refusal.
+                self._persist_launch_record({'offer_id': offer.get('id'),
+                    'state': 'claim_pending', 'claim_key': pending_key,
+                    'reason': reason, 'diagnostic': diagnostic, 'settled': False})
+                results.append({'id': offer.get('id'), 'state': 'held',
+                                'reason': reason, 'diagnostic': diagnostic})
+                return
+            # Fixed reasons and bounded redacted typed command evidence only;
+            # no argv, account credentials or raw exception text is retained.
             record = {'offer_id': offer.get('id'), 'state': 'dispatch_refused',
                       'reason': reason, 'diagnostic': diagnostic, 'settled': False}
             self._persist_launch_record(record)
@@ -3685,11 +3759,11 @@ class Dispatcher:
             except Exception:
                 pass  # A failed projection never replaces dispatch admission.
         if self.settings.get('opencode_auth'):
-            from .opencode_auth import prepare, AuthBusy
+            from .opencode_auth import prepare, AuthBusy, AuthCheckUnavailable
             try:
                 prepare(self.settings['opencode_auth'])
                 auth_health = {'engine': 'opencode', 'status': 'ok', 'reason': 'device_auth_verified'}
-            except AuthBusy:
+            except (AuthBusy, AuthCheckUnavailable):
                 auth_health = None
             except ValueError:
                 auth_health = {'engine': 'opencode', 'status': 'unavailable', 'reason': 'engine_auth_expired'}

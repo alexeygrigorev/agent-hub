@@ -6,8 +6,9 @@ from .workclaim import redact_for_bus
 ANSI = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))')
 
 
-def redact_log(text):
-    if not isinstance(text, str) or len(text) > 65536:
+def redact_log(text, *, max_chars=65536):
+    if (not isinstance(text, str) or type(max_chars) is not int
+            or not 1 <= max_chars <= 8 * 1024 * 1024 or len(text) > max_chars):
         return ''
     # JSON permits lone surrogates, while the private journal uses UTF-8.
     text = ''.join('\ufffd' if 0xd800 <= ord(c) <= 0xdfff else c for c in text)

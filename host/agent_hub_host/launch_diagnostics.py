@@ -616,8 +616,14 @@ def diagnostic(raw='', *, error_type='RuntimeError', exit_code=None, stage='laun
 
 
 class LocalCommandError(RuntimeError):
-    def __init__(self, raw='', *, exit_code=None, engine=None, cwd=None, task_id=None, launched_at=None, start_offsets=None):
+    def __init__(self, raw='', *, exit_code=None, command=None, stdout=None, stderr='', reconcile_effects=False, engine=None, cwd=None, task_id=None, launched_at=None, start_offsets=None):
+        from .command_diagnostics import command_details
         self.diagnostic = diagnostic(raw, exit_code=exit_code, engine=engine, cwd=cwd, task_id=task_id, launched_at=launched_at, start_offsets=start_offsets)
+        # Raw exceptions are classification input, not captured command output.
+        self.command_diagnostic = command_details(command, stdout, stderr)
+        self.diagnostic.update(self.command_diagnostic)
+        if reconcile_effects:
+            self.diagnostic['message'] = 'Native client operation failed; reconcile effects'
         super().__init__(self.diagnostic['message'])
 
 

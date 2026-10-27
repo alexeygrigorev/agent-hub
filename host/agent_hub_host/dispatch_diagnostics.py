@@ -1,4 +1,4 @@
-"""Fixed pre-start diagnostics. Never forward arbitrary exception text."""
+"""Fixed pre-start reasons plus bounded, redacted typed command evidence."""
 MESSAGES = {
     'cpu_headroom': 'Host CPU usage plus expected session demand exceeds the CPU target.',
     'cpu_pressure': 'Host CPU pressure exceeds the safety cap.',
@@ -65,5 +65,11 @@ def classify(exc, *, workspace_available=True):
         reason = 'dispatch_local_command_failed'
     if not workspace_available:
         reason = 'workspace_unavailable'
-    return {'reason': reason, 'message': MESSAGES[reason], 'stage': 'dispatch_route',
+    value = {'reason': reason, 'message': MESSAGES[reason], 'stage': 'dispatch_route',
             'error_type': type(exc).__name__ if type(exc).__name__.isalpha() and len(type(exc).__name__) <= 64 else 'Error'}
+    from .launch_diagnostics import LocalCommandError
+    if isinstance(exc, LocalCommandError):
+        value.update(exc.command_diagnostic)
+        if type(exc.diagnostic.get('exit_code')) is int:
+            value['exit_code'] = exc.diagnostic['exit_code']
+    return value

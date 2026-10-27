@@ -10,6 +10,7 @@ from pathlib import Path
 
 from agent_hub_host.fleet import (
     CLAIM_ATTEMPTS,
+    CLAIM_KEY_RE,
     ClaimTimeoutError,
     Dispatcher,
     _is_ambiguous_claim_error,
@@ -146,6 +147,204 @@ class PreclaimRetry(unittest.TestCase):
                 }
             return {}
         return fake_runner
+
+    def test_preclaim_command_timeout_holds_then_next_cycle_starts_once(self):
+        """AC(a): preparation timeout must not reject an unclaimed launch."""
+        import subprocess
+        from agent_hub_host.fleet import LocalCommandTimeout
+        for phase in ('admission', 'submit', 'plan'):
+            for error in (TimeoutError('slow status'), LocalCommandTimeout('deadline'),
+                          subprocess.TimeoutExpired(['check'], 30)):
+                with self.subTest(phase=phase, error=type(error).__name__):
+                    hub = FakeHub()
+                    launch_id = _valid_uuid4()
+                    hub.offer(launch_id)
+                    calls = []
+                    normal = self._runner(calls, launch_id)
+                    fail = [True]
+                    def runner(argv, **kwargs):
+                        selected = '/bin/true' in argv if phase == 'admission' else phase in argv
+                        if selected and fail[0]:
+                            raise error
+                        return normal(argv, **kwargs)
+                    dispatcher = Dispatcher(self._settings(), hub.request, runner,
+                                            journal_dir=self.tmp.name)
+                    results = []
+                    dispatcher._dispatch_one(self._offer(launch_id), results)
+                    self.assertEqual(results[0]['state'], 'held')
+                    self.assertEqual(results[0]['reason'], 'claim_timeout')
+                    self.assertEqual(hub.state[launch_id], 'offered')
+                    self.assertFalse(any(p.endswith('/reject') for _, p in hub.calls))
+                    self.assertEqual(hub.claim_calls, [])
+                    self.assertFalse(any('run' in argv for argv in calls))
+                    fail[0] = False
+                    results = []
+                    dispatcher._dispatch_one(self._offer(launch_id), results)
+                    self.assertEqual(results[0]['state'], 'running')
+                    self.assertEqual(len(hub.claim_calls), 1)
+                    self.assertEqual(sum('run' in argv for argv in calls), 1)
+
+    def test_preclaim_timeout_preserves_prior_ambiguous_claim_key(self):
+        hub = FakeHub()
+        launch_id = _valid_uuid4()
+        hub.offer(launch_id)
+        hub.fail_claim_with = lambda: TimeoutError('claim response lost')
+        calls = []
+        normal = self._runner(calls, launch_id)
+        dispatcher = Dispatcher(self._settings(), hub.request, normal,
+                                journal_dir=self.tmp.name)
+        dispatcher._dispatch_one(self._offer(launch_id), [])
+        key = hub.claim_calls[0]
+        def slow_plan(argv, **kwargs):
+            if 'plan' in argv:
+                raise TimeoutError('status slow before claim replay')
+            return normal(argv, **kwargs)
+        dispatcher.runner = slow_plan
+        results = []
+        dispatcher._dispatch_one(self._offer(launch_id), results)
+        self.assertEqual(results[0]['state'], 'held')
+        self.assertEqual(dispatcher._pending_claim_key(launch_id), key)
+        dispatcher.runner = normal
+        hub.fail_claim_with = None
+        results = []
+        dispatcher._dispatch_one(self._offer(launch_id), results)
+        self.assertEqual(results[0]['state'], 'running')
+        self.assertEqual(set(hub.claim_calls), {key})
+        self.assertEqual(sum('run' in argv for argv in calls), 1)
+
+    def test_definitive_preclaim_failure_is_not_retried_as_timeout(self):
+        hub = FakeHub()
+        launch_id = _valid_uuid4()
+        hub.offer(launch_id)
+        calls = []
+        normal = self._runner(calls, launch_id)
+        def denied(argv, **kwargs):
+            if 'plan' in argv:
+                raise RuntimeError('command refused')
+            return normal(argv, **kwargs)
+        dispatcher = Dispatcher(self._settings(), hub.request, denied,
+                                journal_dir=self.tmp.name)
+        results = []
+        dispatcher._dispatch_one(self._offer(launch_id), results)
+        self.assertEqual(results[0]['state'], 'failed')
+        self.assertEqual(results[0]['reason'], 'dispatch_local_command_failed')
+        self.assertFalse(hub.claim_calls)
+        self.assertFalse(any('run' in argv for argv in calls))
+
+    def test_real_device_prepare_timeout_holds_before_claim(self):
+        import subprocess
+        from unittest.mock import patch
+        from agent_hub_host import opencode_auth as auth
+        settings = self._settings()
+        settings['subscriptions'][0]['launcher_provider'] = 'opencode'
+        settings['opencode_auth'] = dict(binary='/installed/opencode',
+            source_data=str(Path(self.tmp.name) / 'source'),
+            source_config=str(Path(self.tmp.name) / 'config'),
+            target_data=str(Path(self.tmp.name) / 'runtime'))
+        hub = FakeHub()
+        launch_id = _valid_uuid4()
+        hub.offer(launch_id)
+        calls = []
+        dispatcher = Dispatcher(settings, hub.request, self._runner(calls, launch_id),
+                                journal_dir=self.tmp.name)
+        def slow_native(*args):
+            raise subprocess.TimeoutExpired(['native-auth'], 30)
+        results = []
+        with patch.object(auth, '_verified_recently', return_value=False), \
+             patch.object(auth, '_verification_identity', return_value=None), \
+             patch.object(auth, '_native', side_effect=slow_native):
+            dispatcher._dispatch_one(self._offer(launch_id), results)
+        self.assertEqual(results[0]['state'], 'held')
+        self.assertEqual(results[0]['reason'], 'engine_auth_check_unavailable')
+        self.assertEqual(hub.state[launch_id], 'offered')
+        self.assertFalse(any(p.endswith('/claim') or p.endswith('/reject') for _, p in hub.calls))
+        self.assertFalse(any('run' in argv for argv in calls))
+
+    def test_replay_refusal_preserves_key_until_guard_recovers(self):
+        for guard in ('quota_unavailable', 'provider_disabled', 'fresh_admission_required', 'cpu_pressure'):
+            with self.subTest(guard=guard):
+                hub = FakeHub()
+                launch_id = _valid_uuid4()
+                hub.offer(launch_id)
+                phase = ['lost']
+                def request(method, path, payload=None):
+                    if path.endswith('/claim'):
+                        if phase[0] == 'lost':
+                            hub.request(method, path, payload)
+                            raise TimeoutError('committed claim response lost')
+                        if phase[0] == 'refused':
+                            raise ValueError('HTTP request failed with status 409:' + guard)
+                    return hub.request(method, path, payload)
+                calls = []
+                runner = self._runner(calls, launch_id)
+                dispatcher = Dispatcher(self._settings(), request, runner, journal_dir=self.tmp.name)
+                dispatcher._dispatch_one(self._offer(launch_id), [])
+                key = hub.keys[launch_id]
+                resumed = dict(self._offer(launch_id), state='starting', claim_key=key)
+                phase[0] = 'refused'
+                dispatcher._dispatch_one(resumed, [])
+                self.assertEqual(dispatcher._pending_claim_key(launch_id), key)
+                self.assertFalse(any(p.endswith('/reject') for _, p in hub.calls))
+                phase[0] = 'healthy'
+                restarted = Dispatcher(self._settings(), request, runner, journal_dir=self.tmp.name)
+                results = []
+                restarted._dispatch_one(resumed, results)
+                self.assertEqual(results[0]['state'], 'running')
+                self.assertEqual(set(hub.claim_calls), {key})
+                self.assertEqual(sum('run' in argv for argv in calls), 1)
+
+    def test_native_effect_fence_survives_lost_result_and_process_death(self):
+        from unittest.mock import patch
+        for mode in ('interactive', 'headless'):
+            for failure in (TimeoutError, SystemExit):
+                with self.subTest(mode=mode, failure=failure.__name__):
+                    hub = FakeHub()
+                    launch_id = _valid_uuid4()
+                    hub.offer(launch_id)
+                    phase = ['lost']
+                    def request(method, path, payload=None):
+                        if path.endswith('/claim') and phase[0] == 'lost':
+                            hub.request(method, path, payload)
+                            raise TimeoutError('committed claim response lost')
+                        if path.endswith('/result'):
+                            raise TimeoutError('uncertainty receipt lost')
+                        return hub.request(method, path, payload)
+                    calls = []
+                    normal = self._runner(calls, launch_id)
+                    starts = []
+                    def runner(argv, **kwargs):
+                        if ('start' if mode == 'interactive' else 'run') in argv:
+                            starts.append(argv)
+                            raise failure('native outcome unknown')
+                        return normal(argv, **kwargs)
+                    offer = dict(self._offer(launch_id), mode=mode,
+                                 prompt='' if mode == 'interactive' else 'proof')
+                    dispatcher = Dispatcher(self._settings(), request, runner, journal_dir=self.tmp.name)
+                    dispatcher._dispatch_one(offer, [])
+                    resumed = dict(offer, state='starting', claim_key=hub.keys[launch_id])
+                    phase[0] = 'healthy'
+                    with patch.object(dispatcher, '_check_headless_health', return_value=None), \
+                         patch('agent_hub_host.launcher_recovery.settle_unstarted', return_value=False), \
+                         patch('agent_hub_host.launch_diagnostics.exception_diagnostic', return_value={
+                             'reason': 'dispatch_local_command_failed', 'stage': 'dispatch_route',
+                             'message': 'fixture', 'error_type': 'TimeoutError'}):
+                        if failure is SystemExit:
+                            with self.assertRaises(SystemExit):
+                                dispatcher._dispatch_one(resumed, [])
+                        else:
+                            dispatcher._dispatch_one(resumed, [])
+                    self.assertIsNone(dispatcher._pending_claim_key(launch_id))
+                    restarted = Dispatcher(self._settings(), request, runner, journal_dir=self.tmp.name)
+                    results = []
+                    restarted._dispatch_one(resumed, results)
+                    self.assertEqual(results[0]['reason'], 'already_claimed')
+                    self.assertEqual(len(starts), 1)
+
+    def test_local_command_deadline_has_typed_timeout(self):
+        import sys
+        from agent_hub_host.fleet import LocalCommandTimeout, run_json
+        with self.assertRaises(LocalCommandTimeout):
+            run_json([sys.executable, '-c', 'import time; time.sleep(5)'], timeout=.02)
 
     def test_ambiguous_claim_errors_cover_transport_blips_not_answers(self):
         import http.client
@@ -294,6 +493,99 @@ class PreclaimRetry(unittest.TestCase):
         self.assertEqual(res['state'], 'running')
         # No flag file: exactly one claim call.
         self.assertEqual(len(hub.claim_calls), 1)
+
+    def test_claim_key_max_length_matches_server(self):
+        # The server CLAIM_KEY allows at most 128 chars total; the host
+        # validator must agree so a host-held key is never a server 400.
+        self.assertTrue(CLAIM_KEY_RE.fullmatch('a' + 'b' * 127))
+        self.assertFalse(CLAIM_KEY_RE.fullmatch('a' + 'b' * 128))
+        self.assertTrue(CLAIM_KEY_RE.fullmatch('9' * 32))
+
+    def _runner_with_incarnation(self, calls, offer_id, incarnation):
+        base = self._runner(calls, offer_id)
+
+        def runner(argv, cwd=None, timeout=None, payload=None):
+            out = base(argv, cwd=cwd, timeout=timeout, payload=payload)
+            if isinstance(out, dict) and isinstance(out.get('receipt'), dict):
+                out = dict(out, receipt=dict(out['receipt'], created_at_ms=incarnation))
+            return out
+
+        return runner
+
+    def test_exhausted_attempts_late_landing_resumes_next_cycle(self):
+        """Follow-up: every claim attempt times out but one lands late.
+
+        The launch is held with the attempt key; the server re-offers the
+        effect-free starting launch with its stored key and the next cycle
+        replays the claim exactly once, starting one native process.
+        """
+        hub = FakeHub()
+        launch_id = 'a1b2c3d4-0000-4000-8000-000000000006'
+        hub.offer(launch_id)
+
+        def always_late_request(method, path, payload=None):
+            if path.endswith('/claim'):
+                committed = hub.request(method, path, payload)
+                self.assertEqual(committed.get('state'), 'starting')
+                raise TimeoutError('timed out')
+            return hub.request(method, path, payload)
+
+        offer = self._offer(launch_id)
+        dispatcher = Dispatcher(self._settings(), always_late_request,
+                                self._runner([], launch_id),
+                                journal_dir=self.tmp.name)
+        results = []
+        dispatcher._dispatch_one(offer, results)
+        self.assertEqual(results[0]['state'], 'held')
+        self.assertEqual(results[0]['reason'], 'claim_timeout')
+        self.assertEqual(len(hub.claim_calls), CLAIM_ATTEMPTS)
+        self.assertEqual(len(set(hub.claim_calls)), 1)
+        journal = json.loads((Path(self.tmp.name) / 'fleet-launches' / (launch_id + '.json')).read_text())
+        self.assertEqual(journal['state'], 'claim_pending')
+        key = journal['claim_key']
+        self.assertEqual(hub.keys[launch_id], key)
+        self.assertEqual(hub.state[launch_id], 'starting')
+        # Next cycle: the server re-offers the effect-free starting launch
+        # with its stored key; transport is healthy again.
+        reoffer = dict(offer, state='starting', claim_key=key)
+        runner_calls = []
+        dispatcher2 = Dispatcher(self._settings(), hub.request,
+                                 self._runner_with_incarnation(runner_calls, launch_id, 1793041501000),
+                                 journal_dir=self.tmp.name)
+        results2 = []
+        dispatcher2._dispatch_one(reoffer, results2)
+        self.assertEqual(results2[0]['state'], 'running')
+        # Exactly one more claim call (the replay), same key, one server
+        # claim total, exactly one native start, no reject round-trip.
+        self.assertEqual(len(hub.claim_calls), CLAIM_ATTEMPTS + 1)
+        self.assertEqual(len(set(hub.claim_calls)), 1)
+        self.assertEqual(hub.state[launch_id], 'starting')
+        self.assertEqual(len([c for c in runner_calls if 'run' in c]), 1)
+        self.assertFalse(any(p.endswith('/reject') for _, p in hub.calls))
+        resumed = json.loads((Path(self.tmp.name) / 'fleet-launches' / (launch_id + '.json')).read_text())
+        self.assertEqual(resumed['state'], 'running')
+
+    def test_sibling_key_reoffer_is_never_stolen(self):
+        """A re-offered starting launch with a foreign key is skipped."""
+        hub = FakeHub()
+        launch_id = 'a1b2c3d4-0000-4000-8000-000000000007'
+        hub.offer(launch_id)
+        hub.keys[launch_id] = 'other-attempt-key-0000000000000001'
+        hub.state[launch_id] = 'starting'
+        offer = dict(self._offer(launch_id), state='starting',
+                     claim_key='other-attempt-key-0000000000000001')
+        runner_calls = []
+        dispatcher = Dispatcher(self._settings(), hub.request,
+                                self._runner(runner_calls, launch_id),
+                                journal_dir=self.tmp.name)
+        results = []
+        dispatcher._dispatch_one(offer, results)
+        self.assertEqual(results[0]['state'], 'held')
+        self.assertEqual(results[0]['reason'], 'already_claimed')
+        # No claim attempt, no native effect, no journal record.
+        self.assertEqual(hub.claim_calls, [])
+        self.assertEqual(runner_calls, [])
+        self.assertFalse((Path(self.tmp.name) / 'fleet-launches' / (launch_id + '.json')).exists())
 
 
 if __name__ == '__main__':

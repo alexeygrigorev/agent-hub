@@ -301,6 +301,23 @@ describe('retained authority and replacement claims', () => {
     }));
   }
 
+  for (const mutation of ['claim_expired', 'claim_released', 'credential_revoked', 'credential_expired'] as const) {
+    it(`holds a delayed same-key first start after ${mutation} without releasing its reservation`, () => fleetFixture(async (f, sql, bus) => {
+      const claim = bus.claim(holder.caller, 'projA', 'src', 'worker-1', 3600000, now);
+      const launched: any = await (await f.handle(req('/api/fleet/launches', intent({ access: editAccess(claim.id), machine: 'hetzner' })), holder)).json();
+      const path = '/api/fleet/launches/' + launched.id + '/claim';
+      const start = { ...nativeStart, claim_key: crypto.randomUUID() };
+      expect((await f.handle(req(path, start), host())).status).toBe(200);
+      if (mutation === 'claim_expired') sql.exec('UPDATE claims SET expires_at = ? WHERE id = ?', now - 1, claim.id);
+      if (mutation === 'claim_released') sql.exec('UPDATE claims SET released_at = ? WHERE id = ?', now, claim.id);
+      if (mutation === 'credential_revoked') sql.exec("UPDATE credentials SET revoked_at = ? WHERE id = 'cred-worker-1'", at());
+      if (mutation === 'credential_expired') sql.exec("UPDATE credentials SET expires_at = ? WHERE id = 'cred-worker-1'", at(-1));
+      expect((await f.handle(req(path, start), host())).status).toBeGreaterThanOrEqual(400);
+      expect(sql.exec('SELECT state, native_id, launcher_task_id FROM fleet_launches WHERE id = ?', launched.id).one()).toMatchObject({ state: 'starting', native_id: null, launcher_task_id: null });
+      expect(f.accountStatus(sql.exec('SELECT * FROM fleet_accounts').one()).active).toBe(1);
+    }));
+  }
+
   for (const oldState of ['starting', 'running', 'uncertain']) {
     it(`blocks overlapping replacement authority while old work is ${oldState}, then permits after confirmed exit`, () => fleetFixture(async (f, sql, bus) => {
       sql.exec("DELETE FROM credentials WHERE id = 'cred-worker-2'");
