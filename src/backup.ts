@@ -97,10 +97,11 @@ export class BackupService {
   /**
    * JSON replacer for export rows. SQLite/Workers values are almost always
    * JSON-native, but production data has contained values JSON.stringify
-   * rejects outright (e.g. BigInts). Those are converted to explicit,
-   * documented, lossless markers instead of failing the whole backup;
-   * conversions are counted so the restore drill can verify them.
-   * Raw binary stays explicit base64 rather than V8's lossy '{}'.
+   * rejects outright (BigInts). Those become explicit, documented, lossless
+   * markers instead of failing the whole backup; conversions are counted so
+   * the restore drill can verify them. Raw binary is preserved as explicit
+   * base64 (V8 would otherwise emit lossy '{}'); encoding uses only web
+   * primitives (btoa), no Node Buffer dependency inside the DO isolate.
    */
   private exportReplacer(table: string, stats: { bigint: number; blob: number }) {
     return function (_key: string, value: unknown) {
@@ -110,9 +111,15 @@ export class BackupService {
       }
       if (value instanceof ArrayBuffer) {
         stats.blob++;
+        const bytes = new Uint8Array(value as ArrayBuffer);
+        let binary = '';
+        const CHUNK = 0x8000;
+        for (let i = 0; i < bytes.length; i += CHUNK) {
+          binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as any);
+        }
         let b64: string;
         try {
-          b64 = Buffer.from(value as ArrayBuffer).toString('base64');
+          b64 = btoa(binary);
         } catch (err) {
           throw new ExportStageError('serialize', table);
         }
