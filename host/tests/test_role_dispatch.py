@@ -1213,7 +1213,10 @@ class TestRoleRealBackendAdapter(unittest.TestCase):
                 "workload_cgroup": cgroup_path,
                 "phase": "running",
                 "containment_empty": False,
-                "created_at_ms": int(time.time() * 1000) - 1000,
+                # Anchor session creation to the measured process start so a
+                # host stall between Popen and fixture construction cannot
+                # push sess_start past the stale-before-session tolerance.
+                "created_at_ms": int(get_proc_start_time(pid) * 1000),
                 "is_fixture": True,
             }
             digest_valid = get_role_first_action_digest(
@@ -2088,6 +2091,21 @@ class TestStrictWorkloadPIDContainmentAndProvenance(unittest.TestCase):
         self.assertIsNotNone(measured)
         self.assertGreaterEqual(measured, t0 - 0.5)
         self.assertLessEqual(measured, t1 + 0.5)
+
+    def test_refuses_workload_started_before_run_window(self):
+        """A workload whose start predates run start beyond clock tolerance is refused."""
+        stale = dict(
+            self.valid_workload_info,
+            proc_start_time=time.time() - 5.0,
+            created_at_ms=int((time.time() - 30.0) * 1000),
+        )
+        valid, why = validate_native_workload_pid(
+            self.proc.pid,
+            stale,
+            started_wall=time.time() - 3.0,
+        )
+        self.assertFalse(valid)
+        self.assertIn("stale_pid_started_before_run", why)
 
     def test_refuses_counterexample_1_unreadable_state_and_start_provenance(self):
         """Counterexample 1: unreadable process state and start provenance fail closed."""
