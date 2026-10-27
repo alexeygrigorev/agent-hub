@@ -54,6 +54,7 @@ def reconcile_launcher_retired(dispatcher, row, cwd, *, dry_run=False):
     """A first-action failure can have spawned: recover its real native receipt."""
     from .native_sessions import NativeTarget
     from .retired_native import verify_native_retirement
+    from .fleet import resolve_workspace_path, resolve_offer_cwd
     launcher = dispatcher.settings.get('launcher', {})
     try:
         task_id = 'hub-' + row['id']
@@ -61,9 +62,18 @@ def reconcile_launcher_retired(dispatcher, row, cwd, *, dry_run=False):
         status = dispatcher.runner(prefix + ['status', '--id', task_id], cwd=launcher['root'])
         binding = status.get('native_binding') or {}
         payload = status.get('payload') or {}
+        native_workspace = str(cwd)
+        # The native mailbox stays at the workspace root; the engine's
+        # working directory is independently carried in the launcher payload.
+        if row.get('mode') == 'headless':
+            workspace = resolve_workspace_path(dispatcher.settings, row.get('workspace', binding.get('workspace')))
+            expected_cwd = resolve_offer_cwd(workspace, row.get('cwd'), dispatcher.settings)
+            if str(cwd) != str(expected_cwd) or payload.get('cwd') != str(expected_cwd):
+                return False
+            native_workspace = str(workspace)
         if (status.get('state') != 'failed' or payload.get('owner') != 'hub-fleet'
                 or binding.get('task_id') != task_id or binding.get('tag') != 'task-' + task_id
-                or binding.get('workspace') != str(cwd) or binding.get('engine') != row.get('engine')):
+                or binding.get('workspace') != native_workspace or binding.get('engine') != row.get('engine')):
             return False
         target = NativeTarget(session_id=binding['native_id'], tag=binding['tag'], workspace=binding['workspace'],
                               created_at_ms=binding['incarnation'], engine=binding['engine']).validated()
@@ -123,6 +133,14 @@ def reconcile_headless_retired(dispatcher, row, target):
     """
     import re
     from pathlib import Path
+    from .fleet import resolve_workspace_path, resolve_offer_cwd
+    try:
+        workspace = resolve_workspace_path(dispatcher.settings, row.get('workspace', target.workspace))
+        target_cwd = resolve_offer_cwd(workspace, row.get('cwd'), dispatcher.settings)
+    except (ValueError, TypeError, OSError):
+        return False
+    if str(workspace) != target.workspace:
+        return False
     offer_id = row.get('id')
     if not isinstance(offer_id, str) or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', offer_id):
         return False
@@ -154,7 +172,7 @@ def reconcile_headless_retired(dispatcher, row, target):
                 or not record['reason'].startswith('launcher_')
                 or any(record.get(k) != v for k, v in exact.items() if k not in native_fields)
                 or any(record.get(k) not in (None, '', exact[k]) for k in native_fields)
-                or record.get('target_cwd', target.workspace) != target.workspace):
+                or record.get('target_cwd', str(target_cwd)) != str(target_cwd)):
             return False
         if isinstance(record.get('diagnostic'), dict):
             record['dispatch_diagnostic'] = dict(record['diagnostic'])

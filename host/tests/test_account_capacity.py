@@ -8,7 +8,7 @@ from agent_hub_host.account_capacity import activity_ms, reconcile_unstarted, re
 
 
 class AccountCapacityTests(unittest.TestCase):
-    def _real_failed_dispatch(self, tmp):
+    def _real_failed_dispatch(self, tmp, cwd=None):
         import datetime
         from agent_hub_host.fleet import Dispatcher
         offer_id = '11111111-2222-4333-8444-555555555555'
@@ -30,6 +30,9 @@ class AccountCapacityTests(unittest.TestCase):
         d = Dispatcher(settings, runner=runner, request=Mock(return_value={}))
         offer = {'id': offer_id, 'engine': 'opencode', 'account': 'muse',
                  'mode': 'headless', 'workspace': 'main', 'prompt': 'inspect one source file'}
+        if cwd is not None:
+            offer['cwd'] = cwd
+            (Path(tmp) / cwd).mkdir(parents=True, exist_ok=True)
         with patch('agent_hub_host.launcher_recovery.settle_unstarted', return_value=False), \
              patch.object(d, '_check_headless_health', return_value=None):
             self.assertEqual(d.dispatch(offer)['state'], 'uncertain')
@@ -41,16 +44,30 @@ class AccountCapacityTests(unittest.TestCase):
         return settings, offer_id, record
 
     def test_persisted_first_action_failure_promotes_then_replays_after_restart_and_wrong_ack(self):
+        self._assert_persisted_failure_recovers()
+
+    def test_nested_cwd_failed_dispatch_recovers_through_both_entry_paths_after_restart(self):
+        for entry in ['launcher', 'server']:
+            with self.subTest(entry=entry):
+                self._assert_persisted_failure_recovers(cwd='nested', entry=entry)
+
+    def _assert_persisted_failure_recovers(self, cwd=None, entry='launcher'):
         from agent_hub_host.fleet import Dispatcher
         with tempfile.TemporaryDirectory() as tmp:
-            settings, offer, original = self._real_failed_dispatch(tmp)
+            settings, offer, original = self._real_failed_dispatch(tmp, cwd)
             native = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
             binding = dict(task_id='hub-' + offer, native_id=native, tag='task-hub-' + offer,
                            workspace=tmp, incarnation=1000, engine='opencode')
-            status = {'state': 'failed', 'payload': {'owner': 'hub-fleet'}, 'native_binding': binding}
-            row = {'id': offer, 'engine': 'opencode', 'mode': 'headless'}
-            d = Dispatcher(settings, request=Mock(), runner=Mock(side_effect=[status, {
-                'state': 'running', 'native_id': native, 'resources_reserved': True}]))
+            status = {'state': 'failed', 'payload': {'owner': 'hub-fleet', 'cwd': original['target_cwd']}, 'native_binding': binding}
+            row = {'id': offer, 'engine': 'opencode', 'mode': 'headless', 'workspace': 'main', 'cwd': cwd}
+            if entry == 'server':
+                row.update(native_id=native, binding={'native_id': native, 'tag': binding['tag'],
+                    'workspace': tmp, 'native_created_at_ms': 1000})
+            def recover(dispatcher):
+                return (reconcile_retired(dispatcher, row) if entry == 'server' else
+                        reconcile_launcher_retired(dispatcher, row, Path(original['target_cwd'])))
+            d = Dispatcher(settings, request=Mock(), runner=Mock(side_effect=lambda argv, **kwargs:
+                status if 'status' in argv else {'state': 'running', 'native_id': native, 'resources_reserved': True}))
             self.assertEqual(d._active_launches[offer], original)
             path = Path(tmp) / '.local/hub-results' / (offer + '.json')
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -65,7 +82,7 @@ class AccountCapacityTests(unittest.TestCase):
                  patch.object(Dispatcher, '_maybe_cleanup_worktree') as cleanup:
                 # Promotion is durable even while the launcher still reserves
                 # resources; no terminal POST or cleanup can bypass that fence.
-                self.assertFalse(reconcile_launcher_retired(d, row, Path(tmp)))
+                self.assertFalse(recover(d))
                 d.request.assert_not_called()
                 cleanup.assert_not_called()
                 d = Dispatcher(settings)
@@ -79,12 +96,12 @@ class AccountCapacityTests(unittest.TestCase):
                     return status if 'status' in argv else {
                         'state': 'failed', 'native_id': native, 'resources_reserved': False}
                 d.runner, d.request = released, request
-                self.assertFalse(reconcile_launcher_retired(d, row, Path(tmp)))
+                self.assertFalse(recover(d))
                 self.assertFalse(d._active_launches[offer]['settled'])
                 cleanup.assert_not_called()
                 d = Dispatcher(settings, runner=released, request=request)
                 self.assertEqual(d._active_launches[offer]['dispatch_diagnostic'], original['diagnostic'])
-                self.assertTrue(reconcile_launcher_retired(d, row, Path(tmp)))
+                self.assertTrue(recover(d))
                 self.assertEqual(posts[0], posts[1])
                 self.assertEqual(posts[1]['state'], 'failed')
                 self.assertEqual(posts[1]['diagnostic'], original['diagnostic'])
@@ -107,7 +124,7 @@ class AccountCapacityTests(unittest.TestCase):
             native = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
             binding = dict(task_id='hub-' + offer, native_id=native, tag='task-hub-' + offer,
                            workspace=tmp, incarnation=1000, engine='opencode')
-            status = {'state': 'failed', 'payload': {'owner': 'hub-fleet'}, 'native_binding': binding}
+            status = {'state': 'failed', 'payload': {'owner': 'hub-fleet', 'cwd': original['target_cwd']}, 'native_binding': binding}
             row = {'id': offer, 'engine': 'opencode', 'mode': 'headless'}
             for field, value in [('native_id', 'bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee'),
                                  ('tag', 'task-hub-other'), ('incarnation', 1001), ('engine', 'codex'),
@@ -124,6 +141,47 @@ class AccountCapacityTests(unittest.TestCase):
                     d.request.assert_not_called()
                     self.assertEqual(record, before)
                     self.assertEqual(d.runner.call_count, 1)  # status only; never release
+
+    def test_nested_cwd_recovery_refuses_genuinely_conflicting_paths(self):
+        from agent_hub_host.fleet import Dispatcher
+        for entry in ['launcher', 'server']:
+            cases = ['journal_cwd', 'offer_cwd', 'native_workspace']
+            if entry == 'launcher':
+                cases += ['payload_cwd', 'argument_cwd']
+            for conflict in cases:
+                with self.subTest(entry=entry, conflict=conflict), tempfile.TemporaryDirectory() as tmp:
+                    settings, offer, original = self._real_failed_dispatch(tmp, 'nested')
+                    native = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+                    binding = dict(task_id='hub-' + offer, native_id=native,
+                        tag='task-hub-' + offer, workspace=tmp, incarnation=1000, engine='opencode')
+                    status = {'state': 'failed', 'payload': {'owner': 'hub-fleet',
+                        'cwd': original['target_cwd']}, 'native_binding': binding}
+                    row = {'id': offer, 'engine': 'opencode', 'mode': 'headless',
+                        'workspace': 'main', 'cwd': 'nested', 'native_id': native,
+                        'binding': {'native_id': native, 'tag': binding['tag'],
+                            'workspace': tmp, 'native_created_at_ms': 1000}}
+                    d = Dispatcher(settings, runner=Mock(return_value=status), request=Mock())
+                    argument = Path(original['target_cwd'])
+                    other = str(Path(tmp) / 'other')
+                    if conflict == 'journal_cwd':
+                        d._active_launches[offer]['target_cwd'] = other
+                    elif conflict == 'offer_cwd':
+                        row['cwd'] = 'other'
+                    elif conflict == 'native_workspace':
+                        binding['workspace'] = original['target_cwd']
+                        row['binding']['workspace'] = original['target_cwd']
+                    elif conflict == 'payload_cwd':
+                        status['payload']['cwd'] = other
+                    elif conflict == 'argument_cwd':
+                        argument = Path(other)
+                    before = dict(d._active_launches[offer])
+                    with patch('agent_hub_host.retired_native.verify_native_retirement', return_value=(True, {}, 'verified')):
+                        result = (reconcile_retired(d, row) if entry == 'server' else
+                                  reconcile_launcher_retired(d, row, argument))
+                    self.assertFalse(result)
+                    d.request.assert_not_called()
+                    self.assertEqual(d._active_launches[offer], before)
+                    self.assertFalse(any('reconcile' in call.args[0] for call in d.runner.call_args_list))
 
     def test_headless_capacity_recovery_forwards_all_worker_statuses_and_runtime(self):
         from agent_hub_host.fleet import Dispatcher
