@@ -1469,7 +1469,7 @@ class TestRoleRealBackendAdapter(unittest.TestCase):
             cg_list = read_proc_cgroups(proc.pid)
             cgroup_path = cg_list[0][2] if cg_list else "/test.scope"
             mock_backend.is_fixture_only = True
-            mock_backend.get_task_binding.return_value = {
+            binding = {
                 "native_id": sess_id,
                 "session_id": sess_id,
                 "tag": "task-hub-role-writer-run-job-refused-v-g2-e3",
@@ -1482,6 +1482,17 @@ class TestRoleRealBackendAdapter(unittest.TestCase):
                 "containment_empty": False,
                 "phase": "running",
             }
+
+            def binding_with_live_provenance(task_id):
+                # Provenance anchor evaluated at corroboration time: the digest
+                # compares epoch clocks, so pin proc_start_time through the
+                # fixture channel (validate_native_workload_pid honors it) and
+                # let live /proc still prove pid liveness, state and cgroup.
+                # Otherwise a host scheduling stall between Popen and run start
+                # deterministically fails the 1s started-before-run tolerance.
+                return {**binding, "proc_start_time": time.time()}
+
+            mock_backend.get_task_binding.side_effect = binding_with_live_provenance
 
             adapter = RoleDispatchAdapter(
                 config=self.role_cfg,

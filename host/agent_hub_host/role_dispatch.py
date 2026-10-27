@@ -2277,6 +2277,9 @@ class RoleRun:
                 "worker_pid": store_binding.get("worker_pid"),
                 "workload_cgroup": store_binding.get("workload_cgroup"),
                 "containment_empty": store_binding.get("containment_empty", False),
+                # Passed through for injected-test provenance control; production
+                # store bindings omit it and the digest falls back to live /proc.
+                "proc_start_time": store_binding.get("proc_start_time"),
             }
 
         # Candidate complete check with native catalog qualification
@@ -2396,6 +2399,13 @@ class RoleRun:
                                 "containment_empty": binding_rec.get("containment_empty", False),
                                 "phase": binding_rec.get("phase", "running"),
                                 "created_at_ms": self.created_at_ms,
+                                # Injected bindings may pin live /proc observations
+                                # (validate_native_workload_pid honors these on
+                                # fixtures) so provenance does not depend on
+                                # scheduling between workload creation and start.
+                                "proc_start_time": binding_rec.get("proc_start_time"),
+                                "proc_state": binding_rec.get("proc_state"),
+                                "proc_start_ticks": binding_rec.get("proc_start_ticks"),
                                 "is_fixture": True,
                             }
 
