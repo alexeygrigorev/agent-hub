@@ -521,6 +521,7 @@ def diagnostic(raw='', *, error_type='RuntimeError', exit_code=None, stage='laun
 
     # Only complete known messages or sanitized launcher CLI diagnostics cross the privacy boundary.
     raw_str = str(raw or '')
+    bounded_wait_expired = raw_str.strip() == 'Local command failed or exceeded resource limit'
     for line in raw_str[-16384:].splitlines():
         clean_line = line.strip()
         typed = re.match(r'^(ValueError|RuntimeError|PermissionError|OSError|FileNotFoundError|TimeoutError|JSONDecodeError): ', clean_line)
@@ -585,6 +586,15 @@ def diagnostic(raw='', *, error_type='RuntimeError', exit_code=None, stage='laun
 
     if error_type not in {'ValueError', 'RuntimeError', 'OSError', 'PermissionError', 'FileNotFoundError', 'TimeoutError', 'JSONDecodeError'}:
         error_type = 'RuntimeError'
+    if (reason == 'launcher_command_failed'
+            and message == 'The launcher command failed; unrecognized output was withheld.'):
+        # Intake 643395c0: name the bounded receipt-wait expiry and carry the
+        # exit code instead of a bare withheld claim. Messages stay fixed
+        # constants; raw launcher bytes are never forwarded.
+        if bounded_wait_expired:
+            message = 'The bounded launcher receipt wait expired before a confirmed receipt; any native effect is reconciled separately.'
+        elif type(exit_code) is int:
+            message = 'The launcher command failed with exit code %d; unrecognized output withheld.' % exit_code
     value = {'reason': reason, 'message': message, 'error_type': error_type,
              'stage': stage if stage in {'launcher_run', 'dispatch_headless', 'dispatch_interactive', 'dispatch_route'} else 'launcher_run'}
     if surfaced_tail is not None:

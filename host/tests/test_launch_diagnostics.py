@@ -171,3 +171,31 @@ class LaunchDiagnosticTests(unittest.TestCase):
         self.assertNotIn('/private/dir/file', json.dumps(cli_err))
         self.assertNotIn('withheld', cli_err['message'])
 
+
+
+class ReceiptWaitDiagnosticTests(unittest.TestCase):
+    """Intake 643395c0: bounded receipt-wait expiry and exit codes are named,
+    raw launcher bytes are still never forwarded."""
+
+    def test_bounded_receipt_wait_is_named(self):
+        info = diagnostic('Local command failed or exceeded resource limit')
+        self.assertEqual(info['reason'], 'launcher_command_failed')
+        self.assertEqual(info['error_type'], 'RuntimeError')
+        self.assertIn('receipt wait expired', info['message'])
+        self.assertNotIn('withheld', info['message'])
+        self.assertNotIn('tail', info)
+
+    def test_exit_code_is_surfaced_without_raw_bytes(self):
+        raw = 'private-payload line\nValueError: internal detail /home/secret/path\n'
+        info = diagnostic(raw, exit_code=1)
+        self.assertEqual(info['reason'], 'launcher_command_failed')
+        self.assertEqual(info['exit_code'], 1)
+        self.assertIn('exit code 1', info['message'])
+        self.assertNotIn('private-payload', json.dumps(info))
+        self.assertNotIn('internal detail', json.dumps(info))
+        self.assertNotIn('/home/secret/path', json.dumps(info))
+
+    def test_unknown_output_without_exit_code_keeps_generic_message(self):
+        info = diagnostic('totally unknown refusal text')
+        self.assertEqual(info['reason'], 'launcher_command_failed')
+        self.assertEqual(info['message'], 'The launcher command failed; unrecognized output was withheld.')

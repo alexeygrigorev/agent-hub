@@ -1503,6 +1503,54 @@ class Dispatcher:
         self.request('POST', '/api/fleet/launches/' + offer_id + '/result', payload)
         return {'id': offer_id, **payload, 'reason': diagnostic['reason']}
 
+    def _recover_live_native_after_lost_receipt(self, *, offer_id, task_id, workspace, target,
+                                                start_engine, retire_detail, sub, offer,
+                                                launched_at_ts, log_offsets):
+        """Intake 643395c0: bind a verifiably live native after a lost launch receipt.
+
+        The maintained launcher emits its receipt only after the engine's first
+        validated action; a slow engine start outlives the bounded runner wait
+        and the receipt is lost while the native workload keeps running. The
+        launch's own start receipt plus a live catalog row prove the native
+        runs, so record it as running (bound to its native id) instead of
+        launcher_command_failed/uncertain. Returns the dispatch result dict, or
+        None when identity or aliveness is unproven (caller keeps the existing
+        uncertain path; proven deaths settle failed above).
+        """
+        if not (isinstance(retire_detail, str) and retire_detail.startswith("target_still_active_in_catalog")):
+            return None
+        if target.tag != f"task-{task_id}" or not offer.get("engine") or start_engine != offer.get("engine"):
+            return None
+        if sub.get("launcher_provider") == "zai":
+            # ZAI session control binds a real native ZCodex UUID, exactly like
+            # the receipt path: task-unit identifiers can never bind a session.
+            try:
+                if str(uuid.UUID(str(target.session_id))) != str(target.session_id).lower() or uuid.UUID(str(target.session_id)).version != 4:
+                    return None
+            except (ValueError, TypeError, AttributeError):
+                return None
+        self._record_running_launch(
+            offer_id=offer_id,
+            task_id=task_id,
+            workspace=workspace,
+            engine=start_engine,
+            account=sub.get("account_label"),
+            native_id=str(target.session_id),
+            result_path=Path(workspace) / ".local" / "hub-results" / (offer_id + ".json"),
+            details={"tag": target.tag, "created_at_ms": target.created_at_ms},
+            profile=offer.get("profile") or sub.get("profile"),
+            launched_at_ts=launched_at_ts,
+            log_offsets=log_offsets,
+        )
+        bound = self._active_launches.get(offer_id)
+        if not (isinstance(bound, dict) and bound.get("native_id") == str(target.session_id)
+                and bound.get("state") == "running"):
+            return None
+        running_payload = {"state": "running", "native_id": str(target.session_id),
+                           "launcher_task_id": task_id}
+        self.request("POST", "/api/fleet/launches/" + offer_id + "/result", running_payload)
+        return {"id": offer_id, **running_payload, "recovered_receipt": True}
+
     def reconcile_launches(self, offer_ids=None, *, terminal_only=False) -> list[dict[str, Any]]:
         """Reconcile pending owned headless launches via verified positive retirement,
         Launcher reconcile, and own-host Fleet confirmed-exit result.
@@ -2714,6 +2762,13 @@ class Dispatcher:
                                 cand_ws = s_data.get("workspace") or str(workspace)
                                 cand_engine = s_data.get("engine") or offer.get("engine")
                                 cand_inc = s_data.get("created_at_ms") or s_data.get("incarnation")
+                                if isinstance(s_data, dict) and isinstance(s_data.get("wrapper_start_json"), dict):
+                                    s_data = s_data["wrapper_start_json"]
+                                cand_id = s_data.get("native_id") or s_data.get("session_id") or s_data.get("id")
+                                cand_tag = s_data.get("tag") or f"task-{task_id}"
+                                cand_ws = s_data.get("workspace") or str(workspace)
+                                cand_engine = s_data.get("engine") or offer.get("engine")
+                                cand_inc = s_data.get("created_at_ms") or s_data.get("incarnation")
                                 if cand_id and cand_inc:
                                     target = NativeTarget(
                                         session_id=cand_id,
@@ -2722,10 +2777,19 @@ class Dispatcher:
                                         created_at_ms=cand_inc,
                                         engine=cand_engine,
                                     ).validated()
-                                    is_retired, tomb, _ = verify_native_retirement(native, target, state_dir=self.settings.get("aplexer_state_dir"))
+                                    is_retired, tomb, retire_detail = verify_native_retirement(native, target, state_dir=self.settings.get("aplexer_state_dir"))
                                     if is_retired:
                                         proven_dead = True
                                         native_session_id = cand_id
+                                    else:
+                                        recovered = self._recover_live_native_after_lost_receipt(
+                                            offer_id=offer_id, task_id=task_id, workspace=workspace,
+                                            target=target, start_engine=s_data.get("engine"),
+                                            retire_detail=retire_detail,
+                                            sub=sub if isinstance(locals().get("sub"), dict) else {},
+                                            offer=offer, launched_at_ts=l_at, log_offsets=l_offsets)
+                                        if recovered is not None:
+                                            return recovered
                             except Exception:
                                 pass
                         elif not (Path(launcher.get("config_dir", "")) / "state.db").exists() and isinstance(exc, LocalCommandError):
