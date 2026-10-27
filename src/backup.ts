@@ -40,6 +40,11 @@ export interface BackupAuth {
 const EXPORT_LIMIT_PER_HOUR = 30;
 const STATUS_LIMIT_PER_HOUR = 120;
 
+// Backup export API version. Bump on any BackupService behavior change so
+// operators can tell which code a live (possibly long-lived) DO isolate is
+// actually executing: it is reported by /api/backup/status.
+const BACKUP_API_VERSION = 4;
+
 // DO memory is 128 MiB; materializing every table into JS objects peaks at
 // ~2-3x the JSON size. Fail closed well below that ceiling.
 const PER_TABLE_ROW_CAP = 200000;
@@ -203,7 +208,7 @@ export class BackupService {
     }
   }
 
-  private snapshot(): { exported_at: string; tables: string[]; row_counts: Record<string, number> } {
+  private snapshot(): { exported_at: string; tables: string[]; row_counts: Record<string, number>; api_version: number } {
     return this.tx(() => {
       const names: string[] = [];
       const counts: Record<string, number> = {};
@@ -222,7 +227,7 @@ export class BackupService {
           throw new ExportStageError('snapshot', name);
         }
       }
-      return { exported_at: new Date().toISOString(), tables: names, row_counts: counts };
+      return { exported_at: new Date().toISOString(), tables: names, row_counts: counts, api_version: BACKUP_API_VERSION };
     });
   }
 

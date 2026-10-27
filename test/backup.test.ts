@@ -120,6 +120,7 @@ describe('Hub DB backup export', () => {
     const body = await res.json() as any;
     const expected = await listTables(name);
     expect(body.tables).toEqual(expected);
+    expect(body.api_version).toBe(4);
     expect(Object.keys(body.row_counts).sort()).toEqual(expected);
     expect(body).not.toHaveProperty('schema');
   });
