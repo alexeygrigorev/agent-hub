@@ -401,6 +401,8 @@ def main():
     dispatch.add_argument('--config')
     dispatch.add_argument('--cycles', type=int, default=1)
     dispatch.add_argument('--interval', type=int, default=60)
+    from . import webhooks as webhooks_cli
+    webhooks_cli.add_parser(sub)
     
     p_login = sub.add_parser("login", help="Login to Agent Hub")
     p_login.add_argument("base_url", help="Base URL of the Agent Hub")
@@ -584,6 +586,19 @@ def main():
                 print(json.dumps(rendered, indent=2, ensure_ascii=True))
         except Exception as exc:
             print(session_control.diagnostic(exc), file=sys.stderr)
+            sys.exit(1)
+        return
+    if args.cmd == 'webhooks':
+        from . import webhooks as webhooks_cli
+        try:
+            result = webhooks_cli.execute(args)
+            rendered = webhooks_cli.render_output(args, result)
+            if isinstance(rendered, str):
+                print(rendered)
+            else:
+                print(json.dumps(rendered, indent=2, ensure_ascii=True))
+        except Exception as exc:
+            print(webhooks_cli.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
         return
     if args.cmd in ('submit', 'jobs', 'job', 'task-result', 'routing-machines', 'model-policy', 'task-artifact', 'artifact'):

@@ -69,5 +69,8 @@ Also a bot-skills skill: `grok-limits-playbook`.
 5. **Webhook**: the Hub webhook->session routing (separate intake) replaces the Dapier->Grok mailbox wake: alerts land as messages in oncall-engineer without Grok.
 6. **Restore** after limits reset: re-enable the Grok routines in reverse order, keep the forwarders, verify `latest.md` of both sessions is fresh and `NEEDS_ALEXEY.md` is being relayed; drop any duplicated duties from the Grok side.
 
+## Hub webhooks (dev@ route target)
+The Hub now exposes authenticated webhook endpoints that deliver payloads into a target session (intake `19ec91c2`): routes, delivery status and audit live at hub.dtcdev.click `/webhooks.html`, CLI `hub webhooks create|list|delete|test`. The dev@ mailbox route targets **oncall-engineer** (not orchestrator-main); see [docs/WEBHOOKS.md](../docs/WEBHOOKS.md) for auth (token/HMAC), rate limits, size caps and the test command. Dapier's live webhook is only repointed once the old Grok Bot wake keeps working (dual-deliver); deleting the old webhook needs Alexey.
+
 ## Rules
 Standing rules live in each CLAUDE.md (AC6). Cost: both sessions run engine `sonnet` (`ORCH_ENGINE` overrides, don't).

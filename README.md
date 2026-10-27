@@ -109,6 +109,8 @@ values only, never a real credential.
 
 - Hub DB off-Cloudflare backup (daily export to Hetzner + Storagebox,
   staleness alert, restore drill): [docs/HUB-DB-BACKUP.md](docs/HUB-DB-BACKUP.md).
+- Inbound webhooks delivering payloads into Hub sessions (authenticated
+  routes, rate limits, size caps, durable queue): [docs/WEBHOOKS.md](docs/WEBHOOKS.md).
 
 ## License
 

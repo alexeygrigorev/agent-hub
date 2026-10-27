@@ -68,7 +68,10 @@ export default {
       }
     }
 
-    if (url.pathname === '/mcp' || url.pathname.startsWith('/oauth/') || url.pathname.startsWith('/.well-known/') || url.pathname.startsWith('/api/') || url.pathname.startsWith('/auth/') || url.pathname.startsWith('/device')) {
+    // /webhooks/ is the public authenticated ingest surface (intake 19ec91c2);
+    // it forwards to the DO like /api/ but its responses skip the internal
+    // Server-Timing decoration to keep the hot path minimal.
+    if (url.pathname === '/mcp' || url.pathname.startsWith('/oauth/') || url.pathname.startsWith('/.well-known/') || url.pathname.startsWith('/api/') || url.pathname.startsWith('/auth/') || url.pathname.startsWith('/device') || url.pathname.startsWith('/webhooks/')) {
       const id = env.HUB.idFromName("hub");
       const stub = env.HUB.get(id);
       const started = Date.now();

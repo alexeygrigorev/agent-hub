@@ -41,6 +41,7 @@ import { StatusService, type StatusMachineAuth } from './status';
 import { MetricsStore, handleMetricsRoutes } from './metrics';
 import { MonitoringService } from './monitoring';
 import { BackupService } from './backup';
+import { WebhookService } from './webhooks';
 import { isValidMachineId } from './machine-id';
 import { HostHistoryService } from './host-history';
 import { HISTORY_RETENTION_MS } from './host-history';
@@ -128,6 +129,7 @@ export class Hub extends DurableObject {
   public monitoringService: MonitoringService;
   public backupService: BackupService;
   public hostHistoryService: HostHistoryService;
+  public webhookService: WebhookService;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -175,6 +177,14 @@ export class Hub extends DurableObject {
       },
     }, { env: this.env });
     this.sessionControlService.init();
+    // Inbound webhooks -> session delivery (intake 19ec91c2): the queue
+    // resolves targets at delivery time and reuses session-control send
+    // commands; HMAC route keys are wrapped with the session secret and the
+    // mode fails closed when it is absent.
+    this.webhookService = new WebhookService(this.sql, fn => this.ctx.storage.transactionSync(fn), Date.now,
+      () => this.sessionControlService,
+      validSessionSecret(this.env) ? this.env.SESSION_SECRET : null);
+    this.webhookService.init();
     this.fleetService.resources.initCatalogCache();
     this.sql.exec(`CREATE INDEX IF NOT EXISTS session_control_native ON session_control_sessions(machine_id,
       CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(binding_json, '$.native_id') = 'text'
@@ -727,6 +737,15 @@ export class Hub extends DurableObject {
       if (path === '/api/sessions' || path.startsWith('/api/sessions/') ||
           path === '/api/session-commands' || path.startsWith('/api/session-commands/')) {
         return this.sessionControlService.handle(request, await this.sessionControlAuth(request));
+      }
+      // Inbound webhooks (intake 19ec91c2). Admin management surfaces live
+      // under /api/webhooks with the same operator/cookie authority as
+      // session control; the public ingest path authenticates per route.
+      if (path === '/api/webhooks' || path.startsWith('/api/webhooks/')) {
+        return this.webhookService.handle(request, await this.sessionControlAuth(request));
+      }
+      if (path === '/webhooks' || path.startsWith('/webhooks/')) {
+        return this.webhookService.handleIngest(request, path);
       }
       const registryResponse = await handleRegistryRoutes(request, path, this.sql, this.ctx, this.env);
       if (registryResponse) return registryResponse;
@@ -1814,6 +1833,10 @@ export class Hub extends DurableObject {
     // 1. Bus retention cleanup
     const cleanup = this.busService.retentionCleanup(now.getTime(), 100);
 
+    // 1b. Webhook delivery pump (intake 19ec91c2): safety net beside the DO
+    // alarm so queued deliveries also advance on the cron cadence.
+    try { await this.webhookService.pump(); } catch { console.warn('webhook_delivery_pump_failed'); }
+
     // 2. Jobs root slot tick
     let slotDate: Date;
     if (slotOverride) {
@@ -1910,7 +1933,17 @@ export class Hub extends DurableObject {
     this.runTbmTick(now.getTime());
     try { this.hostHistoryService.sample(); } catch { console.warn('resource_history_sampling_failed'); }
     const cleanup = this.busService.retentionCleanup(now.getTime(), 100);
-    const nextAlarm = this.jobsService.processAlarms();
+    let nextAlarm = this.jobsService.processAlarms();
+    // Webhook delivery pump (intake 19ec91c2): pending redeliveries pull the
+    // next alarm forward so a returning session is served without waiting
+    // for the full cadence.
+    try {
+      const webhookNext = await this.webhookService.pump();
+      if (webhookNext !== undefined) {
+        const current = nextAlarm ?? undefined;
+        nextAlarm = current === undefined ? webhookNext : Math.min(current, webhookNext);
+      }
+    } catch { console.warn('webhook_delivery_pump_failed'); }
 
     if (cleanup.hasMore) {
       await this.ctx.storage.setAlarm(Date.now() + 1000);

@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Webhooks · Agent Hub</title>
+  <link rel="stylesheet" href="/vendor/dakit/dakit.css"><link rel="stylesheet" href="/auth.css">
+  <link rel="stylesheet" href="/sessions.css">
+  <link rel="stylesheet" href="/webhooks.css">
+  <script src="/auth.js"></script>
+  <script src="/webhooks.js" defer></script>
+</head>
+<body>
+<div class="dk-shell" data-app="agent-hub" data-sidebar="expanded">
+  <a class="dk-skip-link" href="#main-content">Skip to content</a>
+
+  <header class="dk-topbar">
+    <button class="dk-icon-button" type="button" data-dk-drawer-toggle aria-controls="dk-sidebar" aria-expanded="false" aria-label="Open navigation">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+    </button>
+    <a class="dk-topbar__title" href="/">Agent Hub</a>
+    <div class="dk-topbar__end">
+      <nav class="hub-topbar-links" aria-label="Quick links">
+        <a class="hub-topbar-link" href="/sessions.html">Sessions</a>
+        <a class="hub-topbar-link" href="/webhooks.html" aria-current="page">Webhooks</a>
+        <a class="hub-topbar-link" href="/fleet.html#quota">Usage</a>
+      </nav>
+    </div>
+  </header>
+
+  <aside class="dk-sidebar" id="dk-sidebar" aria-label="Workspace">
+    <div class="dk-menu__identity">
+      <span class="dk-menu__name" id="menu-name">Signed out</span>
+      <span class="dk-menu__email" id="menu-email"></span>
+    </div>
+    <button class="dk-menu__item" type="button" role="switch" aria-checked="false" data-dk-theme-toggle>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+      Dark mode<span class="dk-switch" aria-hidden="true"></span>
+    </button>
+    <div class="dk-menu__sep" role="separator"></div>
+    <button class="dk-menu__item dk-menu__item--danger" type="button" id="sign-out">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5M21 12H9"/></svg>
+      Sign out
+    </button>
+  </aside>
+
+  <main class="dk-main" id="main-content">
+    <div class="dk-page-head">
+      <h1 class="dk-page-head__title">Webhooks</h1>
+      <p class="dk-page-head__lede">Authenticated inbound routes that deliver payloads into Hub sessions. Secrets are shown once at creation and never stored in readable form.</p>
+    </div>
+
+    <section class="dk-card" aria-labelledby="wh-create-title">
+      <h2 class="dk-card__title" id="wh-create-title">Create route</h2>
+      <form id="wh-create-form" class="wh-form">
+        <label>Name <input id="wh-name" type="text" placeholder="oncall-dev" required pattern="[a-z0-9][a-z0-9-]{1,63}"></label>
+        <label>Target session <input id="wh-target" type="text" placeholder="oncall-engineer" required></label>
+        <label>Auth <select id="wh-auth"><option value="token">token</option><option value="hmac">hmac</option></select></label>
+        <label>Template <input id="wh-template" type="text" placeholder="{{payload_json}} (optional)"></label>
+        <label>Rate/min <input id="wh-rate" type="number" min="1" max="600" value="30"></label>
+        <label>Max body (bytes) <input id="wh-max-body" type="number" min="1024" max="262144" value="65536"></label>
+        <button class="dk-button dk-button--primary" type="submit">Create</button>
+      </form>
+      <div id="wh-created" class="wh-created" hidden></div>
+    </section>
+
+    <section class="dk-card" aria-labelledby="wh-routes-title">
+      <h2 class="dk-card__title" id="wh-routes-title">Routes</h2>
+      <div class="dk-table-wrap">
+        <table class="dk-table" id="wh-routes-table">
+          <thead><tr><th>Name</th><th>Target</th><th>Auth</th><th>Rate/min</th><th>Max body</th><th>Enabled</th><th>Actions</th></tr></thead>
+          <tbody id="wh-routes-body"><tr><td colspan="7" class="dk-muted">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="dk-card" aria-labelledby="wh-detail-title" hidden id="wh-detail">
+      <h2 class="dk-card__title" id="wh-detail-title">Route detail <span class="dk-muted dk-mono" id="wh-detail-name"></span></h2>
+      <p class="wh-hint">Ingest URL: <code class="dk-mono" id="wh-ingest-url"></code>
+        <button class="dk-button dk-button--secondary dk-button--sm" type="button" id="wh-test">Send test</button></p>
+      <div class="dk-table-wrap">
+        <table class="dk-table">
+          <thead><tr><th>Delivery</th><th>Source</th><th>Status</th><th>Attempts</th><th>Session</th><th>Error</th><th>Created</th><th>Delivered</th></tr></thead>
+          <tbody id="wh-deliveries-body"></tbody>
+        </table>
+      </div>
+      <h3 class="dk-card__title">Recent audit</h3>
+      <ul class="wh-audit" id="wh-audit-list"></ul>
+    </section>
+
+    <p class="wh-status" id="wh-status" role="status"></p>
+  </main>
+
+  <div id="dk-live" class="dk-visually-hidden" aria-live="polite"></div>
+</div>
+<script src="/vendor/dakit/shell.js"></script>
+</body>
+</html>

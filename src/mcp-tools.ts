@@ -112,6 +112,12 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'task-artifact': 'Local reviewed PNG upload can exceed the bounded MCP request size; use assigned-host hub task-artifact. Download is exposed as artifact.',
   'metrics post': 'Local dashboard report projection reads host files; hosts publish it and the metrics tool reads authorized reports.',
   'update': 'Local-only CLI zipapp updater; downloads and verifies the current release for local installation.',
+  'webhooks create': 'Mints a one-time route bearer secret that must never flow through model tool output or logs; operator CLI delivers it to a private 0600 file or explicit stdout.',
+  'webhooks delete': 'Operator-only destructive route administration stays in the explicit CLI workflow.',
+  'webhooks list': 'Route administration inventory is operator-only product scope; operators use the CLI or dashboard.',
+  'webhooks show': 'Route administration detail is operator-only product scope; operators use the CLI or dashboard.',
+  'webhooks deliveries': 'Delivery inspection is operator-only product scope; operators use the CLI or dashboard.',
+  'webhooks test': 'Injects payloads into live sessions; stays an explicit operator action in the CLI, not a model tool.',
 };
 export function publicTools() {
   return routes.map(r => {
