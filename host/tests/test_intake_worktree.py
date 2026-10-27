@@ -539,6 +539,59 @@ class FleetHookTests(GitSandbox):
         self.assertEqual(payload["cwd"], path)
         self.assertTrue(payload["goal"].startswith("Hub prepared the dedicated worktree for intake abcd1234: "))
 
+    def test_headless_aplexer_uses_worktree_cwd_and_matches_receipt_workspace(self):
+        cfg = self.settings()
+        launcher_root = os.path.join(self.home, "launcher")
+        os.makedirs(launcher_root)
+        cfg["launcher"] = {"argv": ["python3", "-m", "launcher"], "root": launcher_root,
+                           "config_dir": os.path.join(launcher_root, "config")}
+        cfg["subscriptions"][0].update(
+            service="zcodex",
+            engine="zcodex",
+            account_label="shared-zai",
+            launcher_provider="zai",
+            launcher_model="glm-5.3-flash",
+        )
+        path = os.path.join(self.gitdir, "repo-wt-abcd1234")
+        native_uuid = "55f09886-da2a-408a-bf10-b389947b4fba"
+        calls = []
+
+        def runner(argv, **kw):
+            calls.append(argv)
+            if argv[0] == "maintained-gate":
+                return {"launch_allowed": True, "profile_supported": True, "account_label": "shared-zai",
+                        "observed_at": fleet.utcnow()}
+            if "plan" in argv:
+                return {"eligible": [{"provider": "zai", "model": "glm-5.3-flash", "task_fit": 1.0}]}
+            if "run" in argv:
+                return {"receipt": {
+                    "session_id": native_uuid,
+                    "state": "running",
+                    "first_action_verified": True,
+                    "engine": "zcodex",
+                    "workspace": path,
+                    "tag": "task-hub-" + self.OFFER_ID,
+                }}
+            return {}
+
+        def request(method, p, body=None):
+            if p == "/api/worktree-host/plan":
+                return {"plan": {"mode": "create", "task_id": "abcd1234", "suffix": "wt-abcd1234"}}
+            if p.endswith("/result"):
+                return {"id": p.split("/")[-2], "state": body.get("state")}
+            return {}
+        d = fleet.Dispatcher(cfg, request, runner)
+        res = d.dispatch(self.offer(mode="headless", engine="zcodex", account="shared-zai", prompt="Do the thing"))
+        self.assertEqual(res["state"], "running", res)
+        run = [a for a in calls if "run" in a][-1]
+        self.assertEqual(run[run.index("--backend") + 1], "aplexer")
+        self.assertEqual(run[run.index("--cwd") + 1], path)
+        self.assertEqual(run[run.index("--tmpdir") + 1], os.path.join(path, ".local", "tmp"))
+        submit = [a for a in calls if "submit" in a][-1]
+        payload = json.loads(submit[submit.index("--payload") + 1])
+        self.assertEqual(payload["cwd"], path)
+        self.assertIn(os.path.join(path, ".local", "hub-results", self.OFFER_ID + ".json"), payload["goal"])
+
 
 if __name__ == "__main__":
     unittest.main()

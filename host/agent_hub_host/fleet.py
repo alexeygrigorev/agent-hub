@@ -2382,6 +2382,7 @@ class Dispatcher:
         # filesystem path on its own (label "demo" is not ./demo, and an
         # unconfigured "/abs/path" is refused before any claim or effect).
         workspace = resolve_workspace_path(self.settings, offer["workspace"])
+        offer_workspace = workspace
         target_cwd = resolve_offer_cwd(workspace, offer.get("cwd"), self.settings)
         native = self.settings.get("aplexer_bin", "aplexer")
         if mode == "interactive":
@@ -2459,6 +2460,8 @@ class Dispatcher:
             # Intake 4b161918: Hub-planned intake worktree (fail-open), after local refusals.
             from .intake_worktree import launch_cwd
             target_cwd, wt_note, intake_wt = launch_cwd(self.request, offer, workspace, target_cwd, make_tmp=True)
+            if intake_wt:
+                workspace = target_cwd
             task_id = "hub-" + offer_id
             goal = wt_note + compose_prompt(offer["prompt"]) + "\nContainer hygiene: use docker run --rm for throwaway/test containers; label every test container agent.session=<your Hub session id, or native session id registered in Hub>. Install trap/finally cleanup before creation and clean up all resources you create before session exit, including failed starts and docker create/compose tests. Preserve other sessions and Coolify containers."
             curr = workspace
@@ -2606,7 +2609,7 @@ class Dispatcher:
         # cycles while the claim stays unconfirmed). A timeout retries with
         # the same key, so a late-landing claim replays instead of doubling.
         claim_key = self._pending_claim_key(offer_id) or uuid.uuid4().hex
-        self._claim_launch(path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": offer.get("account") or sub["account_label"], "claim_key": claim_key, **({"model": selection["model"]} if selection else {})}, offer_id, workspace)
+        self._claim_launch(path + "/claim", {"gate_allowed": True, "profile_supported": True, "observed_at": at, "account": offer.get("account") or sub["account_label"], "claim_key": claim_key, **({"model": selection["model"]} if selection else {})}, offer_id, offer_workspace)
         from .launch_diagnostics import capture_log_offsets
         log_offsets = capture_log_offsets(sub.get("launcher_provider"))
         launched_at_ts = time.time()
