@@ -114,6 +114,13 @@ def render_text(data):
             continue
         remaining = pool.get("remaining_percent")
         left = "unknown" if remaining is None else "%s%%" % remaining
+        windows = pool.get("windows")
+        if remaining is None and isinstance(windows, dict):
+            measured = ["%s=%s%%" % (name, window["percent_remaining"])
+                        for name, window in windows.items()
+                        if isinstance(window, dict) and window.get("percent_remaining") is not None]
+            if measured:
+                left += "; windows " + ", ".join(measured)
         harness = pool.get("harness") or pool.get("engines") or []
         harness_text = ", ".join(h for h in harness if isinstance(h, str)) if isinstance(harness, list) else "unknown"
         lines.append("%s/%s/%s: %s (%s left, observed %s by %s)" % (
@@ -126,7 +133,7 @@ def render_text(data):
         lines.append("accounts: %s fresh, %s stale, %s unavailable of %s (server probes; machine reports are fallback)" % (
             len(account_coverage.get("fresh") or []), len(account_coverage.get("stale") or []),
             len(account_coverage.get("unavailable") or []), account_coverage.get("total")))
-    elif coverage:
+    if isinstance(coverage, dict) and coverage.get("machines_total") is not None:
         lines.append("coverage: %s fresh, %s stale, %s missing of %s machines" % (
             len(coverage.get("fresh") or []), len(coverage.get("stale") or []),
             len(coverage.get("missing") or []), coverage.get("machines_total")))

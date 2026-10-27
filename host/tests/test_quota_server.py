@@ -31,7 +31,7 @@ class ServerQuotaTests(unittest.TestCase):
         text = quota_cli.render_text({'pools': [], 'account_coverage': {'total': 2, 'fresh': ['main'], 'unavailable': ['go']},
                                      'coverage': {'machines_total': 999, 'missing': ['offline']}})
         self.assertIn('1 fresh, 0 stale, 1 unavailable of 2', text)
-        self.assertNotIn('999', text)
+        self.assertIn('coverage: 0 fresh, 0 stale, 1 missing of 999 machines', text)
 
     def test_https_origin_validation_precedes_token_read(self):
         for origin in ['https://evil.invalid/path', 'http://localhost', 'https://user:pass@evil.invalid']:

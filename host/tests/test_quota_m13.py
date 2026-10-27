@@ -217,6 +217,29 @@ class QuotaCliTests(unittest.TestCase):
         self.assertNotIn('codex-orin/codex-orin', text)
         self.assertNotIn('urgent-muse', text)
 
+    def test_render_text_prints_machine_coverage_alongside_accounts(self):
+        text = quota_cli.render_text({'pools': [
+            {'provider': 'codex', 'account': 'shared-codex', 'harness': ['codex'], 'state': 'fresh',
+             'remaining_percent': 74.0, 'observed_at': '2026-10-26T02:00:00Z', 'observed_by_hosts': ['hub-server']},
+            {'provider': 'go', 'account': 'shared-go', 'harness': ['opencode'], 'state': 'fresh',
+             'remaining_percent': 83.0, 'observed_at': '2026-10-26T02:00:00Z', 'observed_by_hosts': ['hub-server']}],
+            'account_coverage': {'total': 2, 'fresh': ['shared-codex', 'shared-go'], 'stale': [], 'unavailable': []},
+            'coverage': {'machines_total': 1, 'fresh': ['m1'], 'stale': [], 'missing': []}})
+        self.assertIn('accounts: 2 fresh, 0 stale, 0 unavailable of 2', text)
+        self.assertIn('coverage: 1 fresh, 0 stale, 0 missing of 1 machines', text)
+        self.assertIn('codex/codex/shared-codex', text)
+        self.assertIn('opencode/go/shared-go', text)
+
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ExhaustedWindowDisplayTests(unittest.TestCase):
+    def test_exhausted_pool_keeps_measured_window_visible_without_claiming_headroom(self):
+        from agent_hub_host.quota import render_text
+        text = render_text({"pools": [{"provider": "codex", "account": "codex-orin",
+            "state": "exhausted", "remaining_percent": None,
+            "windows": {"7d": {"percent_remaining": 17}}, "harness": ["codex"]}]})
+        self.assertIn("codex/codex/codex-orin: exhausted", text)
+        self.assertIn("unknown; windows 7d=17%", text)

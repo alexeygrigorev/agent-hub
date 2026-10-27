@@ -3,6 +3,7 @@ import { Env } from "./env";
 import { sha256 } from "./auth/crypto";
 import { getSession, allowedCallbackUrls, verifyCsrf } from "./auth/session";
 import { syncTbmFromHostSnapshot, syncTbmFromServerAccounts } from "./tbm-ingestion";
+import { resolveMachineAliases } from "./machine-alias";
 
 export const QUOTA_SCHEMA_version = "1.1";
 export const QUOTA_SCHEMA_VERSIONS = new Set<string>(["1.0", "1.1"]);
@@ -1459,9 +1460,23 @@ export class QuotaStore {
     const knownLabels = new Set(rawAccounts.map((a: any) => a.label));
     const extraAccounts: any[] = [];
     const allRoutes = this.sql.exec("SELECT * FROM fleet_routes ORDER BY machine_id, engine").toArray() as any[];
+    // Machine aliasing (mark, never delete): stale records that resolve to a
+    // live canonical host (same normalized hostname) are not a fleet of their
+    // own — coverage counts canonical machines only, so a superseded
+    // registration can never show as a missing machine.
+    let aliasOf = new Map<string, string>();
+    try {
+      const aliasRows = this.sql.exec("SELECT id, hostname, drained, last_checkin_at FROM machines").toArray() as any[];
+      aliasOf = resolveMachineAliases(aliasRows.map((m: any) => {
+        const seen = typeof m.last_checkin_at === 'string' ? Date.parse(m.last_checkin_at) : NaN;
+        return { id: String(m.id), hostname: m.hostname, drained: m.drained, last_seen_ms: Number.isFinite(seen) ? seen : null };
+      })).aliasOf;
+    } catch { aliasOf = new Map(); }
+    // A filter naming an alias reads the canonical machine it resolves to.
+    const effectiveHostId = filters.host_id && aliasOf.has(filters.host_id) ? aliasOf.get(filters.host_id)! : filters.host_id;
     const machines = (this.sql.exec("SELECT id FROM machines ORDER BY id").toArray() as any[])
       .map((m: any) => m.id)
-      .filter((id: string) => !filters.host_id || id === filters.host_id);
+      .filter((id: string) => !aliasOf.has(id) && (!effectiveHostId || id === effectiveHostId));
 
     for (const machineId of machines) {
       const snap: any = this.sql.exec("SELECT * FROM host_quota_snapshots WHERE host_id = ?", machineId).toArray()[0];
