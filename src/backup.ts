@@ -50,6 +50,12 @@ const EXCLUDED_FROM_EXPORT = new Set(['backup_rate']);
 
 export class ExportTooLarge extends Error {}
 
+export class ExportStageError extends Error {
+  constructor(readonly stage: string, readonly table?: string) {
+    super(`export_${stage}_failed${table ? ':' + table : ''}`);
+  }
+}
+
 function quoteIdent(name: string): string {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error('unexpected_table_name');
   return '"' + name + '"';
@@ -88,21 +94,25 @@ export class BackupService {
 
   /** Sliding-window per-caller rate limit; true when the request must be refused. */
   private rateLimited(request: Request, auth: BackupAuth, kind: string, limit: number): boolean {
-    const now = Date.now();
-    const bucket = `backup:${kind}:${this.callerKey(request, auth)}`;
-    // .one() throws on zero rows, so read via toArray: a missing row is simply
-    // an expired (never-used) window.
-    const row = (this.sql.exec('SELECT count, expires FROM backup_rate WHERE bucket=?', bucket).toArray() as any[])[0] as any;
-    if (!row || Number(row.expires) <= now) {
-      this.sql.exec(
-        'INSERT INTO backup_rate(bucket,count,expires) VALUES(?,1,?) ON CONFLICT(bucket) DO UPDATE SET count=1, expires=excluded.expires',
-        bucket, now + 3600000
-      );
-      return false;
+    try {
+      const now = Date.now();
+      const bucket = `backup:${kind}:${this.callerKey(request, auth)}`;
+      // .one() throws on zero rows, so read via toArray: a missing row is simply
+      // an expired (never-used) window.
+      const row = (this.sql.exec('SELECT count, expires FROM backup_rate WHERE bucket=?', bucket).toArray() as any[])[0] as any;
+      if (!row || Number(row.expires) <= now) {
+        this.sql.exec(
+          'INSERT INTO backup_rate(bucket,count,expires) VALUES(?,1,?) ON CONFLICT(bucket) DO UPDATE SET count=1, expires=excluded.expires',
+          bucket, now + 3600000
+        );
+        return false;
+      }
+      const next = Number(row.count) + 1;
+      this.sql.exec('UPDATE backup_rate SET count=? WHERE bucket=?', next, bucket);
+      return next > limit;
+    } catch (err) {
+      throw new ExportStageError('rate-limit');
     }
-    const next = Number(row.count) + 1;
-    this.sql.exec('UPDATE backup_rate SET count=? WHERE bucket=?', next, bucket);
-    return next > limit;
   }
 
   private snapshot(): { exported_at: string; tables: string[]; row_counts: Record<string, number> } {
@@ -111,8 +121,12 @@ export class BackupService {
       const counts: Record<string, number> = {};
       for (const t of this.userTables()) {
         const name = String(t.name);
-        names.push(name);
-        counts[name] = Number((this.sql.exec(`SELECT COUNT(*) AS n FROM ${quoteIdent(name)}`).one() as any).n);
+        try {
+          names.push(name);
+          counts[name] = Number((this.sql.exec(`SELECT COUNT(*) AS n FROM ${quoteIdent(name)}`).one() as any).n);
+        } catch (err) {
+          throw new ExportStageError('snapshot', name);
+        }
       }
       return { exported_at: new Date().toISOString(), tables: names, row_counts: counts };
     });
@@ -135,7 +149,12 @@ export class BackupService {
       let total = 0;
       for (const t of this.userTables()) {
         const name = String(t.name);
-        const rows = this.sql.exec(`SELECT * FROM ${quoteIdent(name)}`).toArray() as any[];
+        let rows: any[];
+        try {
+          rows = this.sql.exec(`SELECT * FROM ${quoteIdent(name)}`).toArray() as any[];
+        } catch (err) {
+          throw new ExportStageError('export', name);
+        }
         if (rows.length > PER_TABLE_ROW_CAP) throw new ExportTooLarge(`table_too_large:${name}`);
         total += rows.length;
         if (total > TOTAL_ROW_CAP) throw new ExportTooLarge('export_too_large');
@@ -172,6 +191,13 @@ export class BackupService {
     } catch (err) {
       if (err instanceof ExportTooLarge) {
         return Response.json({ error: 'export_too_large' }, { status: 413 });
+      }
+      // Fail closed with the failing stage (and table, when per-table).
+      // Table names are schema identifiers, never row content.
+      if (err instanceof ExportStageError) {
+        return Response.json(
+          { error: 'export_failed', stage: err.stage, ...(err.table ? { table: err.table } : {}) },
+          { status: 500 });
       }
       return Response.json({ error: 'export_failed' }, { status: 500 });
     }
