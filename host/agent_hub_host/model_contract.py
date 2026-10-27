@@ -29,6 +29,14 @@ def _policy_document():
         return json.loads((Path(__file__).resolve().parents[2] / 'config/model-routing.json').read_text())
 
 
+def model_disabled_by_policy(selection):
+    values = [selection] if isinstance(selection, str) else [selection.get('id'), selection.get('model')] if isinstance(selection, dict) else []
+    patterns = _policy_document().get('rules', {}).get('disabled_model_patterns', [])
+    return any(isinstance(pattern, str) and pattern and
+               any(isinstance(value, str) and pattern.casefold() in value.casefold() for value in values)
+               for pattern in patterns)
+
+
 def account_aliases():
     """Canonical account label -> legacy alias labels (relabel tolerance).
 
@@ -79,6 +87,8 @@ def canonical_account_label(label):
 def configured_selection(selection, engine, provider):
     if not isinstance(selection, dict):
         raise ValueError('model_unsupported: missing resolved model')
+    if model_disabled_by_policy(selection):
+        raise ValueError('model_disabled_by_policy')
     family = {'antigravity': 'gemini', 'opencode': 'go',
               # Legacy route configs keyed by the old `codex-orin` provider
               # name still resolve to the canonical `codex` family.

@@ -3,6 +3,12 @@ import { evaluateLaunchQuota } from './quota_admission';
 import { canonicalAccountLabel } from './quota';
 import { grokDemotion, netHeadroom, pacingFor, providerPreference, resetUrgency, routeScore, type ProviderPacing, type RouteScoreFactors } from './pacing';
 export { policy };
+/** Case-insensitive literal model-family matches, independent of provider. */
+export function modelDisabledByPolicy(model: any): boolean {
+  const values = typeof model === 'string' ? [model] : [model?.id, model?.model];
+  return policy.rules.disabled_model_patterns.some(pattern => pattern.length > 0 &&
+    values.some(value => typeof value === 'string' && value.toLowerCase().includes(pattern.toLowerCase())));
+}
 export function taskTier(input: any): string | null {
   if ((input.tier !== undefined && typeof input.tier !== 'string') || (input.difficulty !== undefined && (typeof input.difficulty !== 'string' || !Object.hasOwn(policy.rules.difficulty_tiers, input.difficulty)))) return null;
   const explicitModel = policy.models.find(m => [m.id, m.model].includes(input.model));
@@ -24,7 +30,7 @@ export function modelCandidates(input: any, route: any, advertisement: any, quot
   const members: string[] = (policy.tiers as any)[tier];
   return policy.models.filter(m => {
     if (!members.includes(m.id) || (input.model && ![m.id, m.model].includes(input.model))) return false;
-    if (policy.rules.disabled_providers.includes(m.provider)) return false;
+    if (modelDisabledByPolicy(m) || policy.rules.disabled_providers.includes(m.provider)) return false;
     if (unavailableEngines && unavailableEngines.has(m.engine)) return false;
     if (policy.rules.explicit_only_providers.includes(m.provider) && input.preferred_runner !== m.engine && ![m.id, m.model].includes(input.model)) return false;
     const routeFam = route.provider === 'codex-orin' ? 'codex' : route.provider;

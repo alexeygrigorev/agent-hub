@@ -12,7 +12,7 @@ import sys
 from importlib import resources
 from pathlib import Path
 
-from .model_contract import canonical_account_label, configured_selection
+from .model_contract import canonical_account_label, configured_selection, model_disabled_by_policy
 
 
 def routing_rules():
@@ -34,6 +34,9 @@ def probe(payload, service, account, engine, request=hub_request):
     if (not isinstance(payload, dict) or canonical_account_label(payload.get('account')) != canonical_account_label(account) or
             payload.get('engine') != engine or payload.get('profile') is not None or
             payload.get('mode') not in ('interactive', 'headless')):
+        return result
+    if any(model_disabled_by_policy(payload.get(key)) for key in ('selection', 'model', 'engine')):
+        result['reason'] = 'model_disabled_by_policy'
         return result
     try:
         rules = routing_rules()

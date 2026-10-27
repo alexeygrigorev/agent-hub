@@ -443,6 +443,7 @@
     }
   ],
   "rules": {
+    "disabled_model_patterns": ["grok"],
     "disabled_providers": [
       "grok"
     ],

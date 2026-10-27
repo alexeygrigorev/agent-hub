@@ -8,7 +8,7 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 import { RoutingService } from './routing';
 import { ClaimAdmission, sameIntent, sameEditCaller, type EditAuthority, type AdmissionCaller } from './claim_admission';
 import { effectiveCheckin } from './registry';
-import { taskTier, policy } from './model-routing';
+import { taskTier, policy, modelDisabledByPolicy } from './model-routing';
 import { QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
 import { evaluateLaunchQuota } from './quota_admission';
 import { adoptObservedNativeSessions, reconcileUnboundFleetSessions } from './session_control';
@@ -163,7 +163,7 @@ function claimFieldsValid(d: any): boolean {
 // model_unsupported: the route cannot serve this intent's model/tier (plan()
 // tier exclusion or a recorded route refusal); it never frees up, so it must not
 // turn a capacity wait into a hard 409.
-const INCIDENTAL_REASONS = new Set(['model_unsupported', 'machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'engine_tool_permission_refused', 'admission_unconfigured']);
+const INCIDENTAL_REASONS = new Set(['model_unsupported', 'model_disabled_by_policy', 'machine_unavailable', 'provider_disabled', 'engine_unavailable', 'tier_unavailable', 'goal_unsupported', 'engine_auth_expired', 'engine_tool_permission_refused', 'admission_unconfigured']);
 /** Capacity-only placement failure: every rejected route reports transient
  * capacity (account/machine), optionally alongside incidental stale/disabled
  * routes (drained/stale check-ins, policy-disabled engines, registry routes
@@ -746,6 +746,8 @@ export class FleetService {
   private planWithinMaintenance(input: any):
     { error: string; request?: undefined; selected?: undefined; candidates?: undefined; rejected?: undefined } |
     { error?: undefined; request: any; selected: any; candidates: any[]; rejected: { machine: string; engine: string; reason: string; memory?: any }[]; evidence: Record<string, any> } {
+    if (input && (modelDisabledByPolicy(input.engine) || modelDisabledByPolicy(input.model) ||
+        policy.models.some(m => [m.id, m.model].includes(input.engine) && modelDisabledByPolicy(m)))) return { error: 'model_disabled_by_policy' };
     if (!object(input, ['mode', 'machine', 'engine', 'engine_override_reason', 'tier', 'account', 'workspace', 'cwd', 'prompt', 'idempotency_key', 'parent_id', 'summary', 'access', 'approved_action', 'with_goal', 'task_kind', 'project', 'needs']) ||
       (input.project !== undefined && (typeof input.project !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.project))) ||
       (input.needs !== undefined && (!Array.isArray(input.needs) || input.needs.length > 64 || input.needs.some((n: any) => typeof n !== 'string' || !NEEDS_LABEL.test(n)) || new Set(input.needs).size !== input.needs.length)) ||
@@ -775,11 +777,11 @@ export class FleetService {
       const tier = taskTier({ tier: input.tier });
       if (!tier) return { error: 'invalid_launch_request' };
       const members: string[] = (policy.tiers as any)[tier] || [];
-      tierModels = policy.models.filter(m => members.includes(m.id));
+      tierModels = policy.models.filter(m => members.includes(m.id) && !modelDisabledByPolicy(m));
     }
     // Model ids are policy selectors, not native executable names. Keep the
     // caller's selector in the canonical intent for idempotency.
-    const overrideModels = policy.models.filter(m => m.id === input.engine);
+    const overrideModels = policy.models.filter(m => m.id === input.engine || m.model === input.engine);
     const request: any = { mode: input.mode || 'headless', machine: input.machine || null, engine: input.engine || null, workspace: input.workspace, cwd: input.cwd ?? null, prompt: input.prompt || '', parent_id: input.parent_id || null, summary: input.summary || (input.mode === 'interactive' ? 'Interactive session' : 'Agent task') };
     if (input.project !== undefined) request.project = input.project;
     if (input.task_kind !== undefined) request.task_kind = input.task_kind;
@@ -971,7 +973,7 @@ export class FleetService {
       const family = canonicalQuotaProvider(definitions.get(route.account)?.provider as string);
       const tier = taskTier({ ...(input.tier != null ? { tier: input.tier } : {}), model: overrideModels[0]?.id });
       const members: string[] = (policy.tiers as any)[tier || policy.default_tier];
-      const model = policy.models.find(m => members.includes(m.id) && (!overrideModels.length || m.id === input.engine) && matchesModelRoute(m, route, family));
+      const model = policy.models.find(m => !modelDisabledByPolicy(m) && members.includes(m.id) && (!overrideModels.length || overrideModels.some(o => o.id === m.id)) && matchesModelRoute(m, route, family));
       if (!model) { rejected.push({ machine: route.machine_id, engine: route.engine, reason: 'model_unsupported' }); continue; }
       // Host adapter refusals are scoped to the exact route, mode and model
       // within the engine health retry window so transient historical launch
@@ -1186,7 +1188,7 @@ export class FleetService {
       // within each circular slice, older rows are considered first.
       try { this.drainCapacityQueue(); } catch { /* best-effort */ }
       const plan = this.plan(input);
-      if ('error' in plan) return result(plan, 400);
+      if ('error' in plan) return result(plan, plan.error === 'model_disabled_by_policy' ? 409 : 400);
       const parsed = this.admission.parseDeclaration(input?.access);
       if ('error' in parsed) return result({ error: parsed.error }, 400);
       if (parsed.access.mode === 'edit' && !input.approved_action?.trim()) return result({ error: 'approved_action_required' }, 400);
@@ -1904,6 +1906,8 @@ export class FleetService {
           if (claimKey !== undefined && (typeof claimKey !== 'string' || !CLAIM_KEY.test(claimKey))) return refuse({ error: 'invalid_claim' }, 400);
           const replay = typeof claimKey === 'string' && row.claim_key === claimKey && row.state === 'starting' && !row.native_id && !row.launcher_task_id;
           if (row.state !== 'offered' && !replay) return refuse({ error: 'already_claimed' }, 409);
+          // Policy also fences effect-free starting claim replays before native start.
+          if (modelDisabledByPolicy(parsed(row.model_selection_json)) || modelDisabledByPolicy(row.engine)) return refuse({ error: 'model_disabled_by_policy' }, 409);
           // A delayed first start must still have current edit authority,
           // fresh admission and enabled providers. Invalid replay holds the
           // existing reservation: it cannot prove absence of native effects.

@@ -1,3 +1,4 @@
+import policy from '../config/model-routing.json';
 import {freshCpu} from './cpu-fixture';
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
@@ -108,9 +109,7 @@ describe('generic accounts and launch placement', () => {
       expect(plan.rejected).toEqual([]);
     }
     const grok = await (await s.handle(request('/plan', intent({ engine: 'grok', tier: 'daily' })), admin)).json() as any;
-    expect(grok.selected).toBeNull();
-    // t1621u: grok is out of every tier and its provider is disabled; either gate may fire first.
-    expect(grok.rejected).toContainEqual(expect.objectContaining({ engine: 'grok', reason: expect.stringMatching(/^(provider_disabled|tier_unavailable)$/) }));
+    expect(grok.error).toBe('model_disabled_by_policy');
     // Prefix siblings must never gain access when a root is added.
     const outside = await (await s.handle(request('/plan', intent({ engine: 'glm-flash', tier: 'daily', workspace: '/data/agents/project/worktrees-other/recovery' })), admin)).json() as any;
     expect(outside.selected).toBeNull();
@@ -230,13 +229,41 @@ describe('generic accounts and launch placement', () => {
       expect(s.plan(intent({ tier: 'deep', engine })).selected?.selection).toMatchObject({ id: modelId, model: 'gemini-4-argon-high' });
     }
   }));
+  it('filters Grok models behind allowed aliases from automatic placement and old offer claims', async () => fixture(async (s, sql) => {
+    await configure(s);
+    expect(s.plan(intent()).selected?.selection.id).toBe('sol');
+    const offered = s.reserve(intent({ access: { mode: 'read' } }), admin);
+    expect(offered.status).toBe(201);
+    sql.exec('UPDATE fleet_launches SET model_selection_json=? WHERE id=?', JSON.stringify({ id: 'alias', model: 'opencode-go/GROK-4.7' }), offered.value.id);
+    const claim = await s.handle(request('/launches/' + offered.value.id + '/claim', { gate_allowed: true, observed_at: iso(), account: offered.value.account, profile_supported: true, model: 'opencode-go/GROK-4.7' }), host(offered.value.machine));
+    expect(claim.status).toBe(409);
+    expect(await claim.json()).toMatchObject({ error: 'model_disabled_by_policy' });
+    const claimKey = crypto.randomUUID();
+    sql.exec("UPDATE fleet_launches SET state='starting', claim_key=? WHERE id=?", claimKey, offered.value.id);
+    const replay = await s.handle(request('/launches/' + offered.value.id + '/claim', { claim_key: claimKey, gate_allowed: true, observed_at: iso(), account: offered.value.account, profile_supported: true, model: 'opencode-go/GROK-4.7' }), host(offered.value.machine));
+    expect(replay.status).toBe(409);
+    expect(await replay.json()).toMatchObject({ error: 'model_disabled_by_policy' });
+    // Release this test's own offer so the model rule, rather than capacity,
+    // is the only difference from the healthy baseline above.
+    sql.exec("UPDATE fleet_launches SET state='failed' WHERE id=?", offered.value.id);
+    const models = policy.models.filter(m => m.engine === 'codex');
+    const originals = models.map(m => m.model);
+    try {
+      for (const model of models) model.model = 'xai/GrOk';
+      for (const mode of ['interactive', 'headless']) {
+        const plan = s.plan(intent({ mode }));
+        expect(plan.selected).toBeNull();
+        expect(plan.candidates).toEqual([]);
+        expect(s.plan(intent({ mode, engine: 'sol' }))).toMatchObject({ error: 'model_disabled_by_policy' });
+      }
+    } finally { models.forEach((m, i) => { m.model = originals[i]; }); }
+  }));
   it('refuses disabled providers like grok with policy guidance even without a live route', async () => fixture(async (s, sql) => {
     await configure(s);
     for (const engine of ['grok']) {
       const result = s.reserve(intent({ engine, machine: 'hetzner', access: { mode: 'read' } }), admin);
       expect(result.status).toBe(409);
-      expect(result.value.error).toBe('provider_disabled');
-      expect(result.value.detail).toContain('register a fresh host route');
+      expect(result.value.error).toBe('model_disabled_by_policy');
     }
     expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches').one().n).toBe(0);
   }));

@@ -1,7 +1,7 @@
 import { sanitizeExitEvidence, redactExitText } from './exit-evidence';
 /** Durable client task queue layered over the existing quota-aware fleet launcher. */
 import type { SqlStorage } from '@cloudflare/workers-types';
-import { modelCandidates, taskTier, policy } from './model-routing';
+import { modelCandidates, taskTier, policy, modelDisabledByPolicy } from './model-routing';
 import { evaluateLaunchQuota } from './quota_admission';
 import { canonicalQuotaProvider } from './quota';
 import { loadProviderPacing } from './pacing';
@@ -257,6 +257,7 @@ export class RoutingService {
       if (!admin && !client) return reply({ error: 'forbidden' }, 403);
       const input = await jsonBody(request);
       if (!obj(input, ['prompt', 'approved_action', 'tasks', 'needs', 'preferred_runner', 'preferred_machine', 'workspace', 'idempotency_key', 'tier', 'model', 'difficulty', 'access']) || !label(input.idempotency_key) || !label(input.workspace ?? 'tasks') || (input.preferred_machine !== undefined && !label(input.preferred_machine)) || (input.preferred_runner !== undefined && !label(input.preferred_runner))) return reply({ error: 'invalid_task' }, 400);
+      if (modelDisabledByPolicy(input.model) || policy.models.some(m => [m.id, m.model].includes(input.model) && modelDisabledByPolicy(m))) return reply({ error: 'model_disabled_by_policy' }, 409);
       if (!taskTier(input) || (input.model !== undefined && !policy.models.some(m => [m.id, m.model].includes(input.model)))) return reply({ error: 'invalid_tier_or_model' }, 400);
       const needs = input.needs ?? [];
       const tasks = input.tasks ?? [{ prompt: input.prompt, approved_action: input.approved_action }];

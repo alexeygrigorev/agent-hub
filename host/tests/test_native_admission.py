@@ -55,6 +55,20 @@ class NativeAdmissionTest(unittest.TestCase):
                 self.assertEqual(result['model'], model['model'])
                 self.assertEqual(configured_selection(model, engine, service), model)
 
+    def test_grok_model_family_denied_across_providers_and_modes(self):
+        for value in ('grok', 'grok-4-7', 'opencode-go/grok-4.7', 'xai/GROK', 'muse/gRoK'):
+            for provider, engine in (('grok', 'grok'), ('go', 'opencode'), ('zai', 'zcodex')):
+                for mode in ('headless', 'interactive'):
+                    with self.subTest(model=value, provider=provider, mode=mode):
+                        model = dict(id='alias', model=value, engine=engine, provider=provider, effort=None)
+                        with self.assertRaisesRegex(ValueError, 'model_disabled_by_policy'):
+                            configured_selection(model, engine, provider)
+                        payload = dict(account='account', engine=engine, profile=None, mode=mode, selection=model)
+                        result = admission.probe(payload, provider, 'account', engine,
+                                                 lambda _: self.fail('disabled model must never probe quota'))
+                        self.assertFalse(result['launch_allowed'])
+                        self.assertEqual(result['reason'], 'model_disabled_by_policy')
+
     def test_mismatched_identity_fails_closed_without_asking_hub(self):
         payload = dict(account='shared-zai', engine='zcodex', profile=None, mode='headless')
         for field, value in [('account', 'other'), ('profile', 'other'), ('engine', 'codex'), ('mode', 'bogus')]:
