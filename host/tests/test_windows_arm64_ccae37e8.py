@@ -5,6 +5,7 @@ inherited WOW64 env, quse outside PATH, contended msvcrt lock) by patching
 the module seams, so the Windows branches run here.
 """
 import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -203,6 +204,18 @@ class CodexQuotaGateWindowsTest(unittest.TestCase):
     def test_missing_quse_is_unavailable_not_check_failed(self):
         with patch.object(provisioning, 'quse_argv', return_value=['quse']), \
                 patch.object(provisioning.subprocess, 'run', side_effect=FileNotFoundError('quse')):
+            self.assertEqual(provisioning.check_codex_quota_gate({}), (False, 'quota_unavailable'))
+
+    def test_probe_timeout_is_unavailable_not_check_failed(self):
+        """A probe that exceeds the 30s budget produced no evidence.
+
+        A slow Windows cold start (antivirus scanning the venv probe) must not
+        resurface quota_check_failed for every Codex route after the quse
+        rollout; an unfinished check is quota_unavailable, like a missing one.
+        """
+        with patch.object(provisioning, 'quse_argv', return_value=['quse']), \
+                patch.object(provisioning.subprocess, 'run',
+                             side_effect=subprocess.TimeoutExpired(cmd=['quse', 'codex'], timeout=30)):
             self.assertEqual(provisioning.check_codex_quota_gate({}), (False, 'quota_unavailable'))
 
     def test_host_package_depends_on_quse(self):

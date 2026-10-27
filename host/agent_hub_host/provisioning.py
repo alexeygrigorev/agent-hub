@@ -1433,8 +1433,11 @@ def check_codex_quota_gate(env):
         if min_remaining <= reserve:
             return False, 'codex_reserve_required'
         return True, 'ok'
-    except FileNotFoundError:
-        # No quse anywhere: quota evidence is unavailable, not a failed check.
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        # No quse anywhere, or the probe did not finish in time: quota
+        # evidence is unavailable, not a failed check. A slow Windows cold
+        # start (antivirus scan, first run of the venv probe) must not
+        # resurface quota_check_failed for every Codex route.
         return False, 'quota_unavailable'
     except Exception:
         return False, 'quota_check_failed'
