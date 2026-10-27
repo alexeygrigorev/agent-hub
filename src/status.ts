@@ -240,7 +240,16 @@ export class StatusService {
     if (!admin) return base;
     let rows: any[];
     try {
-      rows = this.sql.exec("SELECT id, subject_kind, subject, state, detail, opened_at FROM liveness_alerts WHERE (subject_kind='check' OR (subject_kind='launch' AND state='stuck')) AND resolved_at IS NULL ORDER BY id DESC LIMIT 64").toArray();
+      rows = this.sql.exec(`SELECT a.id, a.subject_kind, a.subject, a.state, a.detail, a.opened_at
+        FROM liveness_alerts a WHERE a.resolved_at IS NULL AND (a.subject_kind='check' OR
+          (a.subject_kind='launch' AND a.state='stuck' AND (
+            (a.subject LIKE 'placement-queue:%' AND EXISTS
+              (SELECT 1 FROM fleet_launches l WHERE l.id=substr(a.subject,17) AND l.state='queued')) OR
+            (a.subject LIKE 'account-capacity/%' AND EXISTS
+              (SELECT 1 FROM fleet_launches l WHERE l.id=substr(a.subject,18) AND l.state='queued')) OR
+            (a.subject NOT LIKE 'placement-%' AND EXISTS
+              (SELECT 1 FROM fleet_launches l WHERE l.id=a.subject AND l.state IN ('offered','starting')))
+          ))) ORDER BY a.id DESC LIMIT 64`).toArray();
     } catch { return base; }
     return [...base, ...rows.map(row => ({
       severity: 'warn', subject: row.subject_kind + ':' + row.subject,

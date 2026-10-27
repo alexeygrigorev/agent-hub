@@ -24,11 +24,7 @@ export function placementPressureSubjects(sql: SqlStorage, fleet: FleetService, 
     }
     out.push({ kind: 'launch', id: `placement-queue:${q.id}`, state: 'stuck', detail: `Launch held queued >5 min for placement admission${numbers()}`, age_s: Math.max(0, Math.floor((now - Date.parse(q.created_at)) / 1000)) });
   }
-  for (const r of sql.exec('SELECT id,created_at,detail FROM placement_rejections WHERE created_at_ms>=? ORDER BY created_at_ms LIMIT 128', now - 86400000).toArray() as any[]) {
-    out.push({ kind: 'launch', id: `placement-reject:${r.id}`, state: 'stuck', detail: `Launch rejected for placement admission: ${r.detail}${numbers()}` });
-  }
-  for (const f of sql.exec("SELECT id,machine_id,exit_reason FROM fleet_launches WHERE state='failed' AND updated_at>=? AND exit_reason IN ('account_capacity','account_concurrency','machine_capacity') LIMIT 128", new Date(now - 86400000).toISOString()).toArray() as any[]) {
-    out.push({ kind:'launch',id:`placement-failed:${f.id}`,state:'stuck',machine_id:f.machine_id,detail:`Launch failed: ${f.exit_reason}${numbers()}` });
-  }
+  // Rejections and terminal failures are retained as history. They do not
+  // describe a live queued intent and must not open placement-pressure alerts.
   return out;
 }

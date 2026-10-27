@@ -134,10 +134,11 @@ CYCLE_LOCK_STALE_S = 480.0
 # slow cycle. Keep TELEMETRY_REFRESH_S * 3 <= HUB_TELEMETRY_STALE_S
 # (regression test test_telemetry_cadence_4398ce2a.py).
 TELEMETRY_REFRESH_S = 45.0
-OFFERS_POLL_S = 15.0
+OFFERS_POLL_S = 2.0
 HUB_TELEMETRY_STALE_S = 180.0
-# Serialises offer claiming between the slow cycle and the fast offers tick
-# (separate from CYCLE_LOCK_NAME, which the slow cycle holds for minutes).
+# Serialises offer fetching between the slow cycle and the fast offers tick.
+# Dispatch uses a separate lock per offer so slow startup cannot block a new
+# launch (CYCLE_LOCK_NAME is reserved for slow maintenance).
 OFFERS_LOCK_NAME = "fleet-offers.lock"
 # The Hub refuses a claim whose admission observation is older than 30 s
 # (fresh_admission_required -> dispatch_claim_refused). Launcher submit/plan
@@ -3310,11 +3311,15 @@ class Dispatcher:
         base = self._cycle_lock_path()
         return None if base is None else base.with_name(OFFERS_LOCK_NAME)
 
-    def _acquire_offers_lock(self):
+    def _acquire_offers_lock(self, offer_id=None):
         """Non-blocking offer-claim lock (file object / False busy / None n/a)."""
         path = self._offers_lock_path()
         if path is None:
             return None
+        if offer_id is not None:
+            import hashlib
+            digest = hashlib.sha256(str(offer_id).encode()).hexdigest()
+            path = path.with_name('fleet-offer-' + digest + '.lock')
         try:
             import fcntl
         except ImportError:
@@ -3357,10 +3362,10 @@ class Dispatcher:
         return hb
 
     def dispatch_offers(self, results, hb=None, offers=None, concurrency=1, refresh=True):
-        """Claim + dispatch current offers under the offers lock.
+        """Fetch current offers briefly, then claim under per-offer locks.
 
-        Returns (offers_seen, dispatch_max_s); skips (0, 0.0) when the
-        sibling (slow cycle or fast tick) is already dispatching.
+        Returns (offers_seen, dispatch_max_s); skips (0, 0.0) when a sibling
+        is fetching offers. Unrelated in-flight dispatches do not block it.
         """
         lock = self._acquire_offers_lock()
         if lock is False:
@@ -3368,6 +3373,13 @@ class Dispatcher:
         try:
             if offers is None:
                 offers = self._fetch_offers().get("offers", [])
+            # Do not hold the host-wide offers lock through launcher startup.
+            # A timer dispatch can take a minute; unrelated new offers must be
+            # claimable by the fast loop meanwhile. Per-offer locks below keep
+            # the same launch single-flight across both controller processes.
+            if lock is not None:
+                lock.close()
+                lock = None
             hb = (hb if hb is not None else getattr(self, '_last_hb', None)) if refresh else None
             durations = []
             guard = threading.Lock()
@@ -3394,17 +3406,24 @@ class Dispatcher:
                             results.append({'id': oid, 'state': 'held', 'reason': 'dispatch_in_progress'})
                         return
                     self._dispatching.add(oid)
+                offer_lock = self._acquire_offers_lock(oid)
+                if offer_lock is False:
+                    with self._dispatching_guard:
+                        self._dispatching.discard(oid)
+                    return
                 _dispatch_start = time.monotonic()
-                with guard:
+                with self._dispatching_guard:
                     self._inflight += 1
                 local = []
                 try:
                     self._dispatch_one(offer, local)
                 finally:
+                    if offer_lock is not None:
+                        offer_lock.close()
                     with self._dispatching_guard:
                         self._dispatching.discard(oid)
-                    with guard:
                         self._inflight -= 1
+                    with guard:
                         results.extend(local)
                         durations.append(time.monotonic() - _dispatch_start)
                     if hb is not None:

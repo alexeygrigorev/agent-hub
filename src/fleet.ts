@@ -79,13 +79,6 @@ const NATIVE_UNRESERVED = `NOT EXISTS (SELECT 1 FROM fleet_launches l
   AND NOT EXISTS (SELECT 1 FROM fleet_launches l
   WHERE l.machine_id=s.machine_id AND ${NATIVE_IN_FLIGHT})`;
 
-/** Orphan observed sessions (live native, no Hub launch) idle longer than
- * this stop holding account quota. A parked PTY with no activity for hours
- * consumes no provider concurrency, while a missing/unparseable activity
- * timestamp keeps counting (fail closed: a host that stops reporting
- * activity never silently overbooks the pool). Activity refreshes the
- * hold on the next catalog report. */
-const ORPHAN_OBSERVED_IDLE_TTL_MS = 6 * 3600000;
 const HEADROOM: Record<string, number> = { codex: 15, 'codex-orin': 15, grok: 5 };
 /** The native ZCode adapter and managed Codex profile serve the same ZAI model. */
 function matchesModelRoute(model: any, route: any, family: unknown): boolean {
@@ -509,9 +502,8 @@ export class FleetService {
     // block the shared pool for the live host. Stale offered/starting/uncertain
     // reservations (no update for 48h) never had a confirmed native start and
     // must not hold quota forever; running launches may be long-lived and stay.
-    // Orphan observed sessions (no Hub launch) idle past
-    // ORPHAN_OBSERVED_IDLE_TTL_MS release their slot; parked PTYs from
-    // finished work must not pin account_capacity forever.
+    // Both bound and orphan sessions idle past the configured threshold
+    // release admission slots; parked PTYs must not pin account capacity.
     const liveIds = new Set<string>();
     const liveEnginesByMachine = new Map<string, Set<string>>();
     try {
@@ -529,17 +521,28 @@ export class FleetService {
     } catch { /* fail closed below when the live set is empty */ }
     const liveList = [...liveIds];
     const staleCutoff = new Date(this.now() - 48 * 3600000).toISOString();
+    const idleCutoff = this.now() - this.resources.config().idle_minutes * 60000;
+    const catalogs = freshCatalogs(this.sql, this.now());
+    const isIdle = (row: any) => row.phase === 'running' && catalogs.has(String(row.machine_id))
+      && typeof row.last_activity_at === 'string' && Number.isFinite(Date.parse(row.last_activity_at))
+      && Date.parse(row.last_activity_at) <= idleCutoff;
+    // Native activity, rather than a launch receipt's update timestamp,
+    // determines whether a bound running session still occupies admission.
+    // Stale catalogs, unknown native state/activity and in-flight starts
+    // retain their reservations, even while independent heartbeats are fresh.
     const reserved = liveList.length
-      ? Number(this.sql.exec(`SELECT COUNT(*) AS n FROM fleet_launches WHERE account = ? AND state IN ${ACTIVE} AND machine_id IN (${liveList.map(() => '?').join(',')}) AND (state = 'running' OR updated_at > ?)`, account.label, ...liveList, staleCutoff).one().n)
+      ? (this.sql.exec(`SELECT l.state, l.machine_id, s.phase, s.last_activity_at FROM fleet_launches l
+          LEFT JOIN fleet_sessions s ON s.machine_id=l.machine_id AND s.native_id=l.native_id
+          WHERE l.account = ? AND l.state IN ${ACTIVE} AND l.machine_id IN (${liveList.map(() => '?').join(',')})
+          AND (l.state = 'running' OR l.updated_at > ?)`, account.label, ...liveList, staleCutoff).toArray() as any[])
+          .filter(row => row.state !== 'running' || !isIdle(row)).length
       : 0;
     const observedSessions = (() => {
       if (!liveList.length) return 0;
-      const orphans = this.sql.exec(`SELECT s.last_activity_at AS last_activity_at FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown','uncertain') AND s.machine_id IN (${liveList.map(() => '?').join(',')}) AND ${NATIVE_UNRESERVED}`, account.label, ...liveList).toArray() as any[];
-      const cutoff = this.now() - ORPHAN_OBSERVED_IDLE_TTL_MS;
+      const orphans = this.sql.exec(`SELECT s.machine_id, s.phase, s.last_activity_at FROM fleet_sessions s WHERE s.account = ? AND s.phase IN ('starting','running','broken','unknown','uncertain') AND s.machine_id IN (${liveList.map(() => '?').join(',')}) AND ${NATIVE_UNRESERVED}`, account.label, ...liveList).toArray() as any[];
       let counted = 0;
       for (const row of orphans) {
-        const atMs = typeof row.last_activity_at === 'string' ? Date.parse(row.last_activity_at) : NaN;
-        if (!Number.isFinite(atMs) || atMs > cutoff) counted++;
+        if (!isIdle(row)) counted++;
       }
       return counted;
     })();
@@ -1266,6 +1269,28 @@ export class FleetService {
         rows.push({ workspace: item.workspace, project: item.project, require_claim: item.require_claim });
       }
       return this.transaction(() => { this.admission.replacePolicy(rows); return response({ status: 'configured', workspaces: this.admission.listPolicy() }); });
+    }
+    // A pure cap raise does not need a lossy canonical registry round trip.
+    // In particular shared-go may have both canonical and legacy alias rows.
+    if (path === '/api/fleet/accounts' && request.method === 'PATCH') {
+      if (!admin) return response({ error: 'forbidden' }, 403);
+      const data = await body(request);
+      if (!object(data, ['accounts']) || !Array.isArray(data.accounts) || !data.accounts.length || data.accounts.length > 128)
+        return response({ error: 'invalid_accounts' }, 400);
+      return this.transaction(() => {
+        const updates: {label: string; max: number}[] = [];
+        const seen = new Set<string>();
+        for (const a of data.accounts) {
+          if (!object(a, ['label', 'max_concurrency']) || !label(a.label) || seen.has(a.label) || !Number.isInteger(a.max_concurrency) || a.max_concurrency < 1 || a.max_concurrency > 100)
+            return response({ error: 'invalid_account' }, 400);
+          seen.add(a.label);
+          const rows = this.sql.exec('SELECT max_concurrency FROM fleet_accounts WHERE label=?', a.label).toArray();
+          if (!rows.length || a.max_concurrency < Number(rows[0].max_concurrency)) return response({ error: 'account_raise_required' }, 409);
+          updates.push({label: a.label, max: a.max_concurrency});
+        }
+        for (const a of updates) this.sql.exec('UPDATE fleet_accounts SET max_concurrency=? WHERE label=?', a.max, a.label);
+        return response({status: 'configured', updated_accounts: updates.length});
+      });
     }
     if (path === '/api/fleet/accounts' && request.method === 'PUT') {
       if (!admin) return response({ error: 'forbidden' }, 403);

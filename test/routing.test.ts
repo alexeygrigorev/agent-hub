@@ -201,6 +201,7 @@ describe('account pinning and existing native occupancy', () => {
     expect(f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-zai'").one()).active).toBe(2);
   }));
   it('releases long-idle unlinked observed sessions from account capacity', () => fixture(async (r, f, sql) => {
+    sql.exec("INSERT INTO fleet_catalog_seen VALUES ('hetzner', ?)", at());
     const active = () => f.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-zai'").one()).active;
     expect(active()).toBe(0);
     sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,workspace,account,last_activity_at) VALUES ('hetzner','idle-old','idle-old','zcodex','running',?,'tasks','shared-zai',?)", at(), at(-10 * 3600000));

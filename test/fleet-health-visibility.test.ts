@@ -40,6 +40,52 @@ function machine(sql: any, id: string, hostname: string, checkinMs: number | nul
 }
 
 describe('fleet health visibility + machine aliasing', () => {
+  it('excludes idle bound and orphan sessions at the configured idle threshold', () => fixture(async ({ fleet, sql }) => {
+    machine(sql, 'idle-host', 'idle-host', now);
+    sql.exec("INSERT INTO resource_settings VALUES (1, ?)", JSON.stringify({idle_minutes: 10}));
+    sql.exec("INSERT INTO fleet_catalog_seen VALUES ('idle-host', ?)", iso(0));
+    sql.exec("INSERT INTO fleet_accounts VALUES ('idle-account', 'codex', 8, 15, 1)");
+    const add = (id: string, state: string, activity: string | null, bound = true) => {
+      sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,engine,phase,agent_state,observed_at,workspace,account,last_activity_at) VALUES ('idle-host',?,?, 'codex','running','idle',?,'demo','idle-account',?)", id, id, iso(0), activity);
+      if (bound) sql.exec("INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,native_id,created_at,updated_at) VALUES (?,'admin','human','fixture',?,'{}','idle-host','codex','idle-account','headless','demo','fixture',?,?,?,?)", id, id, state, id, iso(-3600000), iso(0));
+    };
+    add('idle-bound', 'running', iso(-11 * 60000));
+    add('idle-orphan', 'running', iso(-11 * 60000), false);
+    add('fresh-bound', 'running', iso(-60000));
+    add('unknown-bound', 'running', null);
+    add('starting', 'starting', iso(-11 * 60000));
+    const status = () => fleet.accountStatus(sql.exec("SELECT * FROM fleet_accounts WHERE label='idle-account'").one());
+    expect(status()).toMatchObject({active: 3, reserved: 3, observed_sessions: 0});
+    // Productive activity immediately restores the bound admission slot.
+    sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='idle-bound'", iso(0));
+    expect(status().active).toBe(4);
+    expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_sessions').one().n).toBe(5);
+    // Independent host heartbeats do not prove the native catalog is current.
+    sql.exec("UPDATE fleet_catalog_seen SET observed_at=? WHERE machine_id='idle-host'", iso(-20 * 60000));
+    expect(status()).toMatchObject({active: 5, reserved: 4, observed_sessions: 1});
+    sql.exec("UPDATE fleet_catalog_seen SET observed_at=? WHERE machine_id='idle-host'", iso(0));
+    sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='idle-bound'", iso(-11 * 60000));
+    for (const phase of ['unknown', 'uncertain', 'unobserved', 'starting', 'broken']) {
+      sql.exec("UPDATE fleet_sessions SET phase=? WHERE native_id='idle-bound'", phase);
+      expect(status().reserved).toBe(4);
+    }
+    sql.exec("UPDATE fleet_sessions SET phase='running' WHERE native_id='idle-bound'");
+    expect(status().reserved).toBe(3);
+
+  }));
+
+  it('raises account caps atomically without replacing live routes or alias accounts', () => fixture(async ({ fleet, sql }) => {
+    sql.exec("INSERT INTO fleet_accounts VALUES ('shared-zai', 'zai', 8, 10, 1)");
+    sql.exec("INSERT INTO fleet_accounts VALUES ('urgent-muse', 'go', 100, 5, 1)");
+    const patch = (accounts: any[], auth = admin) => fleet.handle(new Request('https://hub.test/api/fleet/accounts', {method:'PATCH', body:JSON.stringify({accounts})}), auth);
+    expect((await patch([{label:'shared-zai', max_concurrency:100}])).status).toBe(200);
+    expect(sql.exec("SELECT max_concurrency FROM fleet_accounts WHERE label='shared-zai'").one().max_concurrency).toBe(100);
+    expect((await patch([{label:'shared-zai', max_concurrency:100}, {label:'missing', max_concurrency:100}])).status).toBe(409);
+    expect((await patch([{label:'shared-zai', max_concurrency:8}])).status).toBe(409);
+    expect((await patch([{label:'shared-zai', max_concurrency:100}], {caller:{isAdmin:false},scopes:[]} as any)).status).toBe(403);
+    expect(sql.exec("SELECT max_concurrency FROM fleet_accounts WHERE label='urgent-muse'").one().max_concurrency).toBe(100);
+  }));
+
   it('maps stale hetzner sessions to the live urgent-hetzner host with real state', () => fixture(async ({ live, sql }) => {
     machine(sql, 'hetzner', 'RMTHZ', now - 220 * 3600000);
     machine(sql, 'urgent-hetzner', 'rmthz', now);
@@ -140,18 +186,17 @@ describe('fleet health visibility + machine aliasing', () => {
     expect(fresh.length).toBe(0);
   }));
 
-  it('surfaces recent machine_capacity failures as stuck subjects', () => fixture(async ({ live, sql }) => {
+  it('keeps terminal machine_capacity failures out of live stuck subjects', () => fixture(async ({ live, sql }) => {
     sql.exec(
       "INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, native_id, launcher_task_id, created_at, updated_at, exit_reason, launch_error_json) VALUES ('c0000000-0000-4000-8000-000000000001', 'admin', 'human', NULL, 'mem work', 'kf', '{}', 'hetzner', 'codex', 'shared-codex', NULL, 'headless', 'demo', 'goal', 'failed', NULL, 'hub-c0000000-0000-4000-8000-000000000001', ?, ?, 'machine_capacity', ?)",
       iso(-3600000), iso(-600000), JSON.stringify({ reason: 'machine_capacity', message: 'below floor', error_type: 'Memory', stage: 'dispatch_headless' }),
     );
     const subjects = live.evaluate().subjects.filter((s) => s.id === 'placement-failed:c0000000-0000-4000-8000-000000000001');
-    expect(subjects.length).toBe(1);
-    expect(subjects[0].state).toBe('stuck');
-    expect(subjects[0].detail).toContain('machine_capacity');
+    expect(subjects).toEqual([]);
+    expect(sql.exec("SELECT state FROM fleet_launches WHERE id='c0000000-0000-4000-8000-000000000001'").one().state).toBe('failed');
   }));
 
-  it('records hard rejections naming memory/capacity and alerts with numbers', () => fixture(async ({ fleet, live, sql }) => {
+  it('records hard rejections without presenting history as a live hold', () => fixture(async ({ fleet, live, sql }) => {
     machine(sql, 'm1', 'm1', now, 0, { engines: ['codex'], fleet_modes: ['headless'], workspaces: ['demo'], cpu_count: 8 }, {mem_avail_mb: 32000, disk_free_gb: 100, load: [1], cpu_usage: freshCpu(iso(0)), gate: {launch_allowed: true, at: iso(0)}});
     machine(sql, 'm2', 'm2', now, 0, { engines: ['codex'], fleet_modes: ['headless'], workspaces: ['other'], cpu_count: 8 });
     for (const m of ['m1', 'm2']) {
@@ -173,9 +218,7 @@ describe('fleet health visibility + machine aliasing', () => {
     const count = Number(sql.exec('SELECT COUNT(*) AS n FROM placement_rejections').one().n);
     expect(count).toBe(1);
     const subjects = live.evaluate().subjects.filter((s) => String(s.id).startsWith('placement-reject:'));
-    expect(subjects.length).toBe(1);
-    expect(subjects[0].state).toBe('stuck');
-    expect(subjects[0].detail).toContain('account_concurrency');
+    expect(subjects).toEqual([]);
   }));
 
   it('degrades host health while placement pressure exists and shows reservation numbers', () => fixture(async ({ monitoring, sql }) => {

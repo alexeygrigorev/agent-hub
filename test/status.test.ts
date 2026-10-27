@@ -129,7 +129,9 @@ beforeEach(async () => {
 
 describe('M14a authorized one-call status projection', () => {
   it('surfaces stuck launch work alerts only to operators and removes resolved episodes', async () => {
+    await seedCanonicalChain('never-job', 'never-claimed', 'host-a', 'never-native', 'never-tag');
     await inDO(stub(), (h: any) => {
+      h.sql.exec("UPDATE fleet_launches SET state='offered' WHERE id='never-claimed'");
       h.livenessService.setAlert('launch', 'never-claimed', { state: 'stuck', detail: 'offered for 601s' });
     });
     expect((await ok('')).needs_attention).toContainEqual(expect.objectContaining({
@@ -140,6 +142,53 @@ describe('M14a authorized one-call status projection', () => {
     expect((await ok('', agent.token)).needs_attention.some((a: any) => a.subject === 'launch:never-claimed')).toBe(false);
     await inDO(stub(), (h: any) => h.livenessService.setAlert('launch', 'never-claimed', null));
     expect((await ok('')).needs_attention.some((a: any) => a.subject === 'launch:never-claimed')).toBe(false);
+  });
+  it('ignores legacy historical placement alerts while retaining live queue alerts', async () => {
+    await seedCanonicalChain('queue-job', 'live', 'host-a', 'queue-native', 'queue-tag');
+    await inDO(stub(), (h: any) => {
+      h.sql.exec("UPDATE fleet_launches SET state='queued' WHERE id='live'");
+      for (const subject of ['placement-reject:old', 'placement-failed:old', 'placement-queue:live']) {
+        h.livenessService.setAlert('launch', subject, { state: 'stuck', detail: 'fixture' });
+      }
+    });
+    const status = await ok('');
+    const subjects = status.needs_attention.map((a: any) => a.subject);
+    expect(subjects).not.toContain('launch:placement-reject:old');
+    expect(subjects).not.toContain('launch:placement-failed:old');
+    expect(subjects).toContain('launch:placement-queue:live');
+    // Recovery is reflected immediately, before periodic alert reconciliation.
+    await inDO(stub(), (h: any) => h.sql.exec("UPDATE fleet_launches SET state='running' WHERE id='live'"));
+    expect((await ok('')).needs_attention.map((a: any) => a.subject)).not.toContain('launch:placement-queue:live');
+    await inDO(stub(), (h: any) => {
+      // Rendering preserves the historical receipts for audit.
+      expect(h.sql.exec("SELECT COUNT(*) AS n FROM liveness_alerts WHERE subject IN ('placement-reject:old','placement-failed:old')").one().n).toBe(2);
+      for (const subject of ['placement-reject:old', 'placement-failed:old', 'placement-queue:live']) h.livenessService.setAlert('launch', subject, null);
+    });
+  });
+  it('keeps live account-capacity diagnostics beside memory holds and hides recovered queues immediately', async () => {
+    await seedCanonicalHosts();
+    await seedCanonicalChain('cap-holder-job', 'cap-holder', 'host-a', 'cap-holder-native', 'cap-holder-tag');
+    await seedCanonicalChain('cap-waiting-job', 'cap-waiting', 'host-a', 'cap-waiting-native', 'cap-waiting-tag');
+    await inDO(stub(), (h: any) => {
+      h.sql.exec("INSERT OR REPLACE INTO fleet_accounts VALUES ('status-cap','go',1,5,1)");
+      h.sql.exec("INSERT OR REPLACE INTO fleet_routes VALUES ('host-a','opencode','status-cap',NULL)");
+      h.sql.exec("UPDATE fleet_launches SET account='status-cap',state='uncertain' WHERE id='cap-holder'");
+      const old = new Date(Date.now() - 11 * 60000).toISOString();
+      h.sql.exec("UPDATE fleet_launches SET account='status-cap',state='queued',created_at=? WHERE id='cap-waiting'", old);
+      h.sql.exec("INSERT INTO fleet_memory_holds(launch_id,since,rejected_json) VALUES ('cap-waiting',?,?)", old,
+        JSON.stringify([{reason:'launcher_memory_reserve',memory:{reserved_mb:2000,floor_mb:10240}}]));
+      h.livenessService.reconcileAlerts(h.livenessService.evaluate().subjects);
+    });
+    const queued = await ok('');
+    expect(queued.needs_attention).toContainEqual(expect.objectContaining({
+      subject: 'launch:account-capacity/cap-waiting', state: 'stuck', detail: expect.stringContaining('account_capacity'),
+    }));
+    expect(queued.needs_attention.some((a: any) => a.subject === 'launch:placement-queue:cap-waiting')).toBe(false);
+    await inDO(stub(), (h: any) => h.sql.exec("UPDATE fleet_launches SET state='running' WHERE id='cap-waiting'"));
+    expect((await ok('')).needs_attention.some((a: any) => a.subject === 'launch:account-capacity/cap-waiting')).toBe(false);
+    await inDO(stub(), (h: any) => {
+      expect(h.sql.exec("SELECT COUNT(*) AS n FROM liveness_alerts WHERE subject='account-capacity/cap-waiting'").one().n).toBe(1);
+    });
   });
   it('includes active check alerts in operator status without leaking them to task-granted agents', async () => {
     await inDO(stub(), (h: any) => {

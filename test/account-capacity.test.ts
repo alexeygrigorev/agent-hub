@@ -321,6 +321,7 @@ describe('phantom account reservations', () => {
 
   it('ignores stale progress on orphan workloads while preserving unknown activity holds', () => fixture(async (f, sql) => {
     await configure(f);
+    sql.exec("INSERT INTO fleet_catalog_seen VALUES ('hetzner', ?)", iso());
     sql.exec("INSERT INTO fleet_sessions (machine_id,native_id,tag,engine,phase,observed_at,last_activity_at,workspace,account) VALUES ('hetzner','orphan','orphan','codex','running',?,?,'/repo','shared-codex')", iso(), iso(-7 * 3600000));
     const account = sql.exec("SELECT * FROM fleet_accounts WHERE label = 'shared-codex'").one();
     expect(f.accountStatus(account).active).toBe(0);
