@@ -36,7 +36,8 @@ class TestStatusHook(unittest.TestCase):
             submit_fn=lambda obs, base, token: submitted.append(True))
         result = collector.step(submit=True)
         self.assertFalse(result["rate_limited"])
-        self.assertTrue(result["errors"])
+        # Missing operator allowlist = disabled (no per-round error), still no HTTP.
+        self.assertTrue(result["disabled"])
         self.assertEqual(result["observations"], [])
         self.assertEqual(submitted, [])
 

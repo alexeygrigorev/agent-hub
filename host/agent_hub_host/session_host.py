@@ -5,10 +5,12 @@ try:
 except ImportError:
     fcntl = None
 import json
+import os
 import signal
 import threading
 import time
 import pathlib
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
@@ -29,8 +31,8 @@ from .status_runtime import StatusCollector
 def status_step_once(collector) -> None:
     """Run ONE isolated status round (call inside the observer thread only).
 
-    Bounded count/error log only; rate-limited rounds stay silent (no log
-    flood); missing allowlist yields an error count with no HTTP. Never
+    Bounded count/error log only; rate-limited and disabled (no allowlist)
+    rounds stay silent (no log flood) and make no HTTP. Never
     raises: every failure is recorded as a bounded error line. Never touches
     quota or command state.
     """
@@ -40,7 +42,7 @@ def status_step_once(collector) -> None:
         print(json.dumps({'event': 'status_error', 'type': type(error).__name__}), flush=True)
         return
     try:
-        if not isinstance(result, dict) or result.get('rate_limited'):
+        if not isinstance(result, dict) or result.get('rate_limited') or result.get('disabled'):
             return
         observations = result.get('observations')
         skipped = result.get('skipped')
@@ -51,6 +53,13 @@ def status_step_once(collector) -> None:
                           'errors': len(errors) if isinstance(errors, list) else 0}), flush=True)
     except Exception as error:
         print(json.dumps({'event': 'status_error', 'type': type(error).__name__}), flush=True)
+
+
+def resolve_quse_cmd():
+    """quse argv for the quota collector; the Windows service PATH lacks the venv Scripts."""
+    from .provisioning import quse_argv
+    argv = quse_argv(dict(os.environ))
+    return argv[0] if len(argv) == 1 else argv + ['--json']
 
 
 def maybe_start_status_thread(current: Optional[threading.Thread], collector) -> Optional[threading.Thread]:
@@ -628,6 +637,34 @@ def maybe_start_maintenance_thread(current, dispatcher, quota_collector):
     return thread
 
 
+@contextmanager
+def acquire_journal_lock(lock):
+    """Exclusive advisory lock on the host journal (one controller per journal).
+
+    POSIX flock where available. Windows has no flock: msvcrt byte-range
+    locking locks a region, which must be non-empty, so a sentinel byte is
+    written before locking offset 0.
+    """
+    if fcntl is not None:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            yield lock
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    else:
+        import msvcrt
+        if os.fstat(lock.fileno()).st_size == 0:
+            lock.write('0')
+            lock.flush()
+        os.lseek(lock.fileno(), 0, os.SEEK_SET)
+        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        try:
+            yield lock
+        finally:
+            os.lseek(lock.fileno(), 0, os.SEEK_SET)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=None):
     if interval < 1 or fleet_interval < interval:
         raise ValueError('Invalid host polling intervals')
@@ -637,16 +674,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
     journal = Path(journal_dir).resolve()
     journal.mkdir(parents=True, exist_ok=True, mode=0o700)
     # One controller per journal; a supervisor restart cannot duplicate effects.
-    with (journal / 'host.lock').open('a') as lock:
-        if fcntl is not None:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        else:
-            import msvcrt
-            if os.fstat(lock.fileno()).st_size == 0:
-                lock.write('0')
-                lock.flush()
-            os.lseek(lock.fileno(), 0, os.SEEK_SET)
-            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+    with (journal / 'host.lock').open('a') as lock, acquire_journal_lock(lock):
         settings = fleet.load_settings(settings_path)
         native = settings.get('aplexer_bin', 'aplexer')
         binding = qualify_sender_binding(native, str(Path.cwd().resolve()))
@@ -686,7 +714,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
             role_config_path=role_cfg_path,
             journal_dir=str(journal),
         )
-        quota_collector = QuotaCollector(base_url=cfg.get('base_url'))
+        quota_collector = QuotaCollector(base_url=cfg.get('base_url'), quse_cmd=resolve_quse_cmd())
         # Status observation hook (released StatusCollector source): ONE
         # instance for the controller lifetime, trusted allowlist path under
         # the existing journal, this machine, 60s floor. The loop below only
@@ -694,7 +722,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         # cadence, and quota/command cycles never wait for it.
         status_collector = StatusCollector(
             allowlist_path=str(journal / 'status-allowlist.json'),
-            machine_id=cfg['machine_id'], min_interval_s=60)
+            machine_id=cfg['machine_id'], min_interval_s=60, aplexer_bin=native)
         status_thread: Optional[threading.Thread] = None
         # Metrics producer hook (M9 freshness): ONE instance for the controller
         # lifetime, trusted config under the existing journal, this machine,

@@ -25,7 +25,8 @@ class SystemArchTest(unittest.TestCase):
         self.assertIsNone(system._normalize_arch('mips'))
 
     def test_prefers_architew6432_under_x64_emulation(self):
-        with patch.object(system.platform, 'system', return_value='Windows'), patch.dict(os.environ, {'PROCESSOR_ARCHITEW6432': 'ARM64', 'PROCESSOR_ARCHITECTURE': 'AMD64'}):
+        # Native probe and platform.machine() unavailable: env is the last resort.
+        with patch.object(system.platform, 'system', return_value='Windows'), patch.object(system, '_windows_native_arch', return_value=None), patch.object(system.platform, 'machine', return_value=''), patch.dict(os.environ, {'PROCESSOR_ARCHITEW6432': 'ARM64', 'PROCESSOR_ARCHITECTURE': 'AMD64'}):
             self.assertEqual(system.get_arch(), 'arm64')
 
     def test_linux_ignores_windows_environment(self):
@@ -33,7 +34,7 @@ class SystemArchTest(unittest.TestCase):
             self.assertEqual(system.get_arch(), 'amd64')
 
     def test_system_info_carries_arch(self):
-        with patch.object(system.platform, 'system', return_value='Windows'), patch.dict(os.environ, {'PROCESSOR_ARCHITEW6432': 'ARM64', 'PROCESSOR_ARCHITECTURE': 'AMD64'}):
+        with patch.object(system.platform, 'system', return_value='Windows'), patch.object(system, '_windows_native_arch', return_value='arm64'), patch.dict(os.environ, {'PROCESSOR_ARCHITEW6432': 'ARM64', 'PROCESSOR_ARCHITECTURE': 'AMD64'}):
             info = system.get_system_info()
         self.assertEqual(info['arch'], 'arm64')
         self.assertEqual(info['os'], 'windows')

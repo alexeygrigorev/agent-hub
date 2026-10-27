@@ -560,6 +560,34 @@ def provision_managed_home(bundle=None, home=None, dest=None):
 
 
 
+WINDOWS_LOCK_WAIT_S = 900.0
+
+
+def _windows_wait_lock(fd, timeout=None, sleep=None):
+    """Block like flock(LOCK_EX) on Windows, bounded by WINDOWS_LOCK_WAIT_S.
+
+    msvcrt LK_LOCK gives up after ten 1s retries, so `hub engines sync` failed
+    whenever the session host's own reconcile held the lock through an npm
+    install. Poll LK_NBLCK instead until the holder finishes.
+    """
+    import msvcrt
+    import time
+    timeout = WINDOWS_LOCK_WAIT_S if timeout is None else timeout
+    sleep = sleep or time.sleep
+    if os.fstat(fd).st_size == 0:
+        os.write(fd, b'0')
+    deadline = time.monotonic() + timeout
+    while True:
+        os.lseek(fd, 0, 0)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            sleep(0.5)
+
+
 @contextlib.contextmanager
 def lock():
     """One reconciler/exec reader; owner-only lock stays on disk across processes."""
@@ -568,11 +596,7 @@ def lock():
         fd = private_fs._open(anchor, path, os.O_CREAT | os.O_RDWR)
         try:
             if os.name == 'nt':
-                import msvcrt
-                if os.fstat(fd).st_size == 0:
-                    os.write(fd, b'0')
-                os.lseek(fd, 0, 0)
-                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                _windows_wait_lock(fd)
             else:
                 import fcntl
                 fcntl.flock(fd, fcntl.LOCK_EX)
@@ -1295,7 +1319,8 @@ def quotas():
                     raw = native_claude_quota.probe(b, dest)
                 else:
                     with tempfile.TemporaryFile(dir=root()) as output:
-                        result = subprocess.run(['quse', b['provider'], '--json'], env=engine_environment(b, dest / 'home', dest),
+                        quota_env = engine_environment(b, dest / 'home', dest)
+                        result = subprocess.run(quse_argv(quota_env) + [b['provider'], '--json'], env=quota_env,
                             stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.DEVNULL, timeout=30)
                         if result.returncode == 0 and output.tell() <= 131072:
                             output.seek(0)
@@ -1306,13 +1331,43 @@ def quotas():
     return {'accounts': accounts}
 
 
+def quse_argv(env):
+    """Resolve the quse quota probe for a subprocess running with ``env``.
+
+    subprocess resolves a bare name only on the child's PATH. A Windows host
+    service runs the venv interpreter without an activated venv, so quse
+    (a host package dependency) lives in the interpreter's Scripts directory
+    and is not on PATH; a missing probe used to surface as
+    codex_quota_gate_quota_check_failed on every Codex route. Prefer quse on
+    the child PATH, then next to the running interpreter, then the installed
+    module; fall back to the bare name so absence still fails closed.
+    """
+    found = shutil.which('quse', path=env.get('PATH') if isinstance(env, dict) else None)
+    if found:
+        return [found]
+    found = shutil.which('quse', path=str(Path(sys.executable).parent))
+    if found:
+        return [found]
+    import importlib.util
+    try:
+        if importlib.util.find_spec('quse.cli') is not None:
+            return [sys.executable, '-m', 'quse.cli']
+    except (ImportError, ValueError):
+        pass
+    return ['quse']
+
+
 def check_codex_quota_gate(env):
     """Enforce the mandatory >=15% weekly quota gate for OpenAI Codex before execution.
 
     Fails closed with machine-safe reason codes; never leaks raw stdout/stderr.
     """
     try:
-        proc = subprocess.run(['quse', 'codex', '--json'], env=env, capture_output=True, text=True, timeout=30)
+        # UTF-8 both ways: the Windows default code page would otherwise make
+        # quse's or our decoding raise on non-ASCII account metadata.
+        env = dict(env, PYTHONIOENCODING='utf-8', PYTHONUTF8='1')
+        proc = subprocess.run(quse_argv(env) + ['codex', '--json'], env=env, capture_output=True,
+                              text=True, encoding='utf-8', errors='replace', timeout=30)
         if proc.returncode != 0 and not proc.stdout:
             return False, 'quota_unavailable'
         text = proc.stdout.lstrip()
@@ -1370,6 +1425,9 @@ def check_codex_quota_gate(env):
         if min_remaining <= 15.0:
             return False, 'codex_reserve_15_percent_required'
         return True, 'ok'
+    except FileNotFoundError:
+        # No quse anywhere: quota evidence is unavailable, not a failed check.
+        return False, 'quota_unavailable'
     except Exception:
         return False, 'quota_check_failed'
 

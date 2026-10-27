@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 
 U32, U16, U8, PTR = C.c_uint32, C.c_uint16, C.c_ubyte, C.c_void_p
+# SYSTEM, BUILTIN\Administrators, OWNER RIGHTS (last: it stands for the owner).
+TRUSTED_DIRECTORY_SIDS = ('S-1-5-18', 'S-1-5-32-544', 'S-1-3-4')
 BOOL = C.c_int
 FULL = 0x1f01ff
 READ_CONTROL = 0x20000
@@ -63,7 +65,13 @@ class API:
         bind(adv, 'GetSecurityDescriptorControl', [PTR, C.POINTER(U16), C.POINTER(U32)])
         bind(adv, 'GetAce', [PTR, U32, C.POINTER(PTR)])
         bind(adv, 'EqualSid', [PTR, PTR])
+        bind(adv, 'ConvertStringSidToSidW', [C.c_wchar_p, C.POINTER(PTR)])
         self.user_buffer, self.user_sid, self.sid_text = self._user()
+        self.trusted_sids = []
+        for text in TRUSTED_DIRECTORY_SIDS:
+            sid = PTR()
+            self.check(self.ConvertStringSidToSidW(text, C.byref(sid)))
+            self.trusted_sids.append(sid)  # process-lifetime singleton; never freed
 
     def check(self, ok):
         if not ok:
@@ -101,7 +109,7 @@ class API:
         finally:
             self.LocalFree(sd)
 
-    def private(self, handle, *, protected=True, inherited=False):
+    def private(self, handle, *, protected=True, inherited=False, directory=False):
         owner, dacl, sd = PTR(), PTR(), PTR()
         error = self.GetSecurityInfo(handle, 1, 5, C.byref(owner), None, C.byref(dacl), None, C.byref(sd))
         if error:
@@ -113,15 +121,27 @@ class API:
                     or (protected and not control.value & 0x1000)):
                 raise PermissionError('Private owner/protected DACL required')
             acl = C.cast(dacl, C.POINTER(ACL)).contents
-            if acl.count != 1:
+            # A directory may also carry the CPython 3.13+ os.mkdir(mode=0o700)
+            # DACL: SYSTEM, Administrators and OWNER RIGHTS (the owner is
+            # verified above). Those principals are already trusted here.
+            trusted = self.trusted_sids if directory else []
+            if not 1 <= acl.count <= 1 + len(trusted):
                 raise PermissionError('Exactly one owner-only full-control ACE required')
-            ptr = PTR()
-            self.check(self.GetAce(dacl, 0, C.byref(ptr)))
-            ace = C.cast(ptr, C.POINTER(ACE)).contents
-            sid = PTR(ptr.value + ACE.sid.offset)
-            if (ace.kind != 0 or ace.flags & ~(1 | 2 | (16 if inherited else 0)) or ace.mask != FULL
-                    or ace.size < ACE.sid.offset + 8 or not self.EqualSid(sid, self.user_sid)):
-                raise PermissionError('Unexpected or inherited private ACE')
+            owner_ace = False
+            for index in range(acl.count):
+                ptr = PTR()
+                self.check(self.GetAce(dacl, index, C.byref(ptr)))
+                ace = C.cast(ptr, C.POINTER(ACE)).contents
+                sid = PTR(ptr.value + ACE.sid.offset)
+                if (ace.kind != 0 or ace.flags & ~(1 | 2 | (16 if inherited else 0)) or ace.mask != FULL
+                        or ace.size < ACE.sid.offset + 8):
+                    raise PermissionError('Unexpected or inherited private ACE')
+                if self.EqualSid(sid, self.user_sid) or (trusted and self.EqualSid(sid, trusted[-1])):
+                    owner_ace = True
+                elif not any(self.EqualSid(sid, other) for other in trusted):
+                    raise PermissionError('Unexpected or inherited private ACE')
+            if not owner_ace:
+                raise PermissionError('Exactly one owner-only full-control ACE required')
             return bool(control.value & 0x1000)
         finally:
             if sd:
@@ -212,12 +232,12 @@ def parent(path, *, create=False, private=True, native=False):
             # complete owner-only suffix back to a protected directory while
             # all ancestors stay pinned; never require rewriting native state.
             for ancestor in reversed(handles):
-                if a.private(ancestor, protected=False, inherited=True):
+                if a.private(ancestor, protected=False, inherited=True, directory=True):
                     break
             else:
                 raise PermissionError('Native registry lacks a protected owner-only root')
         if private:
-            a.private(handle)
+            a.private(handle, directory=True)
         yield handle
 
 

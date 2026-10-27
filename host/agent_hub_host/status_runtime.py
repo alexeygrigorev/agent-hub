@@ -124,8 +124,10 @@ class StatusCollector:
                  probe_runner: Callable | None = None,
                  http_transport: Callable | None = None,
                  submit_fn: Callable | None = None,
-                 time_fn: Callable | None = None) -> None:
+                 time_fn: Callable | None = None,
+                 aplexer_bin: str = 'aplexer') -> None:
         self.allowlist_path = allowlist_path
+        self.aplexer_bin = aplexer_bin or 'aplexer'
         self.allowlist = allowlist
         self.machine_id_override = machine_id
         try:
@@ -148,6 +150,10 @@ class StatusCollector:
         path = resolve_allowlist_path(self.allowlist_path)
         try:
             return load_allowlist(path), None
+        except FileNotFoundError:
+            # No operator allowlist means status observation is disabled
+            # (like the metrics and disk monitors), not a per-round error.
+            return None, 'disabled'
         except (OSError, ValueError) as exc:
             return None, 'allowlist_unreadable:' + type(exc).__name__
 
@@ -155,7 +161,7 @@ class StatusCollector:
         fn = self.list_sessions_fn
         if fn is None:
             from . import native_sessions as _ns
-            fn = _ns.list_sessions
+            fn = lambda: _ns.list_sessions(executable=self.aplexer_bin)
         try:
             rows = fn()
         except TypeError:
@@ -182,6 +188,10 @@ class StatusCollector:
 
         errors: list = []
         allowlist, allow_err = self._load_allowlist()
+        if allowlist is None and allow_err == 'disabled':
+            return {'machine_id': None, 'observed_at': utc_now(), 'observations': [],
+                    'skipped': [], 'errors': [], 'sender': None, 'rate_limited': False,
+                    'disabled': True, 'submit': None}
         if allowlist is None:
             return {'machine_id': None, 'observed_at': utc_now(), 'observations': [],
                     'skipped': [], 'errors': [allow_err or 'allowlist_unreadable'],
@@ -199,7 +209,7 @@ class StatusCollector:
         sender: dict | None = None
         try:
             from . import native_sessions as _ns
-            binding = _ns.qualify_sender_binding('aplexer')
+            binding = _ns.qualify_sender_binding(self.aplexer_bin)
             sender = {'session_id': binding.session_id, 'tag': binding.tag,
                       'workspace': binding.workspace, 'qualified': True}
         except Exception as exc:  # noqa: BLE001 - isolated

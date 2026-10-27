@@ -9,6 +9,7 @@ description = "Agent Hub Host"
 requires-python = ">=3.11"
 dependencies = [
     "aplexer-client==0.1.19",
+    "quse>=0.0.17",
 ]
 
 [project.scripts]

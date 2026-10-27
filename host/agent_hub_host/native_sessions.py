@@ -327,6 +327,8 @@ def run_native(
             [executable, *args],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=False,
             cwd=cwd,

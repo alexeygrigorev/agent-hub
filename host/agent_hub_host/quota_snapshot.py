@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -748,7 +749,7 @@ class QuotaCollector:
         self,
         clock: Any = None,
         base_url: Optional[str] = None,
-        quse_cmd: str = "quse",
+        quse_cmd: Union[str, List[str]] = "quse",
         runner: Optional[Callable[..., Any]] = None,
         http_client: Optional[Callable[..., Any]] = None,
         interval: float = DEFAULT_COLLECT_INTERVAL
@@ -838,6 +839,13 @@ class QuotaCollector:
 
         if target_origin != cfg_origin:
             self.last_hold = "base_url origin mismatch with paired host config"
+            return None
+
+        if self.runner is None and isinstance(self.quse_cmd, str) and not os.path.isabs(self.quse_cmd) \
+                and shutil.which(self.quse_cmd) is None:
+            # quse is not installed on this host: no quota evidence to report,
+            # a hold rather than a failed collection every cycle.
+            self.last_hold = "quse_unavailable"
             return None
 
         self.last_hold = None

@@ -23,21 +23,71 @@ def _normalize_arch(value) -> str | None:
         return "386"
     return None
 
+def _windows_native_arch() -> str | None:
+    """Native Windows machine arch, independent of the calling process's emulation.
+
+    IsWow64Process2 reports the OS's real machine even to an emulated x64
+    Python under Prism; the HKLM Session Manager\\Environment value is the
+    machine-wide arch written at setup. Returns None when neither is
+    available (non-Windows, or restricted environments).
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.IsWow64Process2.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.USHORT), ctypes.POINTER(wintypes.USHORT)]
+        kernel32.IsWow64Process2.restype = wintypes.BOOL
+        process, native = wintypes.USHORT(), wintypes.USHORT()
+        if kernel32.IsWow64Process2(kernel32.GetCurrentProcess(), ctypes.byref(process), ctypes.byref(native)):
+            norm = {0xAA64: "arm64", 0x8664: "amd64", 0x014C: "386"}.get(native.value)
+            if norm:
+                return norm
+    except Exception:
+        pass
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, "PROCESSOR_ARCHITECTURE")
+            return _normalize_arch(value)
+    except Exception:
+        return None
+
+
 def get_arch() -> str:
     """Normalized CPU arch (arm64/amd64), native even under x64 emulation on ARM64 Windows.
 
-    On Windows under Prism/x64 emulation PROCESSOR_ARCHITECTURE reads AMD64
-    while PROCESSOR_ARCHITEW6432 carries the native arch (ARM64). Check the
-    latter first, then PROCESSOR_ARCHITECTURE, then platform.machine().
+    On Windows, native detection (IsWow64Process2 / registry) and
+    platform.machine() are preferred: a native ARM64 Python inherits a WOW64
+    PROCESSOR_ARCHITECTURE=AMD64 environment, so env vars are only the last
+    fallback (W6432 first, the emulation marker, then the emulated value).
     Returns "unknown" when nothing normalizes.
     """
-    for key in (("PROCESSOR_ARCHITEW6432", "PROCESSOR_ARCHITECTURE") if platform.system() == "Windows" else ()):
+    if platform.system() == "Windows":
         try:
-            norm = _normalize_arch(os.environ.get(key, ""))
+            norm = _windows_native_arch()
             if norm:
                 return norm
         except Exception:
             pass
+        try:
+            norm = _normalize_arch(platform.machine())
+            if norm:
+                return norm
+        except Exception:
+            pass
+        for key in ("PROCESSOR_ARCHITEW6432", "PROCESSOR_ARCHITECTURE"):
+            try:
+                norm = _normalize_arch(os.environ.get(key, ""))
+                if norm:
+                    return norm
+            except Exception:
+                pass
+        return "unknown"
     try:
         norm = _normalize_arch(platform.machine())
         if norm:

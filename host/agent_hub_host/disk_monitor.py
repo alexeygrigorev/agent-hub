@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import api, auth, config
@@ -241,6 +243,21 @@ def post_disk_observation(
     return api.safe_http_json(req, timeout=timeout)
 
 
+def _statvfs_from_disk_usage(path):
+    """Windows shim: os.statvfs is absent; synthesize the statvfs fields collect() uses.
+
+    shutil.disk_usage is byte-accurate (f_frsize=1); f_bfree/f_bavail carry
+    the free value (Windows has no separate reserved-block concept here).
+    """
+    usage = shutil.disk_usage(path)
+    return SimpleNamespace(f_blocks=usage.total, f_frsize=1, f_bfree=usage.free, f_bavail=usage.free)
+
+
+def _is_windows_drive_path(mount: str) -> bool:
+    """Accept C:/ and C:\\ mounts, but only on Windows so POSIX stays strict."""
+    return os.name == "nt" and len(mount) >= 2 and mount[0].isalpha() and mount[1] == ":"
+
+
 class DiskMonitor:
     """Linux stdlib disk space monitor for host nodes.
 
@@ -269,7 +286,7 @@ class DiskMonitor:
         self._machine_id_override = machine_id
         self._min_interval_override = min_interval_s
         self.submit_fn = submit_fn or post_disk_observation
-        self.statvfs_fn = statvfs_fn or os.statvfs
+        self.statvfs_fn = statvfs_fn or getattr(os, "statvfs", None) or _statvfs_from_disk_usage
         self.stat_fn = stat_fn or os.stat
         self.listdir_fn = listdir_fn or os.listdir
         self.islink_fn = islink_fn or os.path.islink
@@ -358,7 +375,7 @@ class DiskMonitor:
         scanned_devices: set[int] = set()
 
         for mount in cfg["mounts"]:
-            if not isinstance(mount, str) or not mount.startswith("/"):
+            if not isinstance(mount, str) or not (mount.startswith("/") or _is_windows_drive_path(mount)):
                 errors.append(f"invalid_mount_path:{mount}")
                 continue
 
