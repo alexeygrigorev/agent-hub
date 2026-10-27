@@ -624,5 +624,78 @@ class TestIntakeCli(unittest.TestCase):
             self.assertEqual(payload['note'], {'text': 'sample text', 'source': 'custom'})
 
 
+class TestIntakeCloseGateCli(unittest.TestCase):
+    """Intake 4b161918: close command, closed alias, --force, worktree close gate."""
+    run_cli = TestIntakeCli.run_cli
+
+    GATE = {'error': 'worktree_close_gate', 'hint': 'hub worktree refresh <intake>',
+            'worktrees': [{'worktree_id': 'w1', 'machine': 'hetzner', 'path': '/home/u/git/r-wt-1',
+                           'branch': 'r-wt-1', 'problems': ['still present', 'unmerged commits 2'], 'secret': 'x'}]}
+
+    def test_close_maps_to_done_update_with_explicit_version(self):
+        with patch.object(intake, 'request', return_value={'ok': True}) as transport:
+            code, _, error = self.run_cli('intake', 'close', 'task-1', '--version', '4', '--key', 'close-a')
+        self.assertEqual(code, 0, error)
+        transport.assert_called_once_with('POST', '/api/intake/tasks/task-1',
+                                          {'key': 'close-a', 'expected_version': 4, 'status': 'done'})
+
+    def test_close_auto_version_and_force_reason(self):
+        with patch.object(intake, 'request', side_effect=[{'task': {'control': {'version': 9}}}, {'ok': True}]) as transport:
+            code, _, error = self.run_cli('intake', 'close', '4b161918', '--force', '--reason', 'branch abandoned')
+        self.assertEqual(code, 0, error)
+        self.assertEqual(transport.call_args_list[0].args, ('GET', '/api/intake/tasks/4b161918'))
+        method, path, payload = transport.call_args_list[1].args
+        self.assertEqual((method, path), ('POST', '/api/intake/tasks/4b161918'))
+        self.assertTrue(payload.pop('key').startswith('close-'))
+        self.assertEqual(payload, {'expected_version': 9, 'status': 'done', 'force': True, 'reason': 'branch abandoned'})
+
+    def test_update_status_closed_is_done_alias(self):
+        with patch.object(intake, 'request', return_value={}) as transport:
+            code, _, error = self.run_cli('intake', 'update', 'task-1', '--version', '2', '--key', 'u1', '--status', 'closed')
+            self.assertEqual(code, 0, error)
+            self.assertEqual(transport.call_args.args[2], {'key': 'u1', 'expected_version': 2, 'status': 'done'})
+            code, _, error = self.run_cli('intake', 'update', 'task-1', '--version', '2', '--key', 'u2', '--status', 'done',
+                                          '--force', '--reason', 'gc owns it')
+            self.assertEqual(code, 0, error)
+            self.assertEqual(transport.call_args.args[2], {'key': 'u2', 'expected_version': 2, 'status': 'done',
+                                                           'force': True, 'reason': 'gc owns it'})
+
+    def test_force_requires_nonempty_reason_locally(self):
+        for arguments in (['intake', 'close', 'task-1', '--force'],
+                          ['intake', 'close', 'task-1', '--force', '--reason', '   '],
+                          ['intake', 'update', 'task-1', '--status', 'closed', '--force']):
+            with self.subTest(arguments=arguments), patch.object(intake, 'request') as transport:
+                code, out, error = self.run_cli(*arguments)
+                self.assertEqual(code, 1)
+                self.assertIn('--force requires a non-empty --reason', error)
+                transport.assert_not_called()
+
+    def test_gate_refusal_prints_worktrees_and_exits_nonzero(self):
+        refusal = intake.IntakeHTTPError(409, 'worktree_close_gate', 'close-g', intake.close_gate_refusal(self.GATE))
+        with patch.object(intake, 'request', side_effect=refusal) as transport:
+            code, out, error = self.run_cli('intake', 'close', 'task-1', '--version', '3', '--key', 'close-g')
+        self.assertEqual(code, 1)
+        self.assertEqual(transport.call_count, 1)  # a gate refusal is never retried as a CAS conflict
+        printed = json.loads(out)
+        self.assertEqual(printed['error'], 'worktree_close_gate')
+        self.assertEqual(printed['worktrees'][0]['problems'], ['still present', 'unmerged commits 2'])
+        self.assertNotIn('secret', printed['worktrees'][0])
+        self.assertIn('Intake HTTP 409: worktree_close_gate', error)
+        self.assertIn('close-g', error)
+
+    def test_http_error_parses_gate_body_and_escapes_controls(self):
+        body = dict(self.GATE)
+        body['worktrees'] = [dict(self.GATE['worktrees'][0], path='/home/u/git/r-wt-\x1b[31m')]
+        raw = json.dumps(body).encode()
+        exc = urllib.error.HTTPError('https://hub.test/x', 409, 'Conflict', {}, io.BytesIO(raw))
+        result = intake.http_error(exc, 'POST', {'key': 'close-h'})
+        self.assertEqual(result.code, 'worktree_close_gate')
+        self.assertEqual(result.gate['worktrees'][0]['machine'], 'hetzner')
+        self.assertNotIn('\x1b', json.dumps(result.gate, ensure_ascii=True))
+        other = intake.http_error(urllib.error.HTTPError('https://hub.test/x', 409, 'Conflict', {},
+                                  io.BytesIO(b'{"error":"version_conflict"}')), 'POST', {'key': 'k'})
+        self.assertIsNone(other.gate)
+
+
 if __name__ == '__main__':
     unittest.main()

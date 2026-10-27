@@ -35,6 +35,7 @@
   "intake append",
   "intake assign",
   "intake audit",
+  "intake close",
   "intake context",
   "intake continue",
   "intake create",
@@ -98,5 +99,9 @@
   "task-artifact",
   "task-result",
   "update",
-  "workclaim-sync"
+  "workclaim-sync",
+  "worktree list",
+  "worktree refresh",
+  "worktree register",
+  "worktree remove"
 ]

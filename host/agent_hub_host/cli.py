@@ -352,6 +352,8 @@ def main():
     conversations.add_commands(sub)
     from . import intake
     intake.add_commands(sub)
+    from . import worktree_cli
+    worktree_cli.add_commands(sub)
     from . import repos
     repos.add_commands(sub)
     from . import session_control
@@ -546,10 +548,16 @@ def main():
             print(intake.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
         return
-    if args.cmd in ('intake', 'intakes', 'handoff'):
+    if args.cmd in ('intake', 'intakes', 'handoff', 'worktree'):
         try:
-            print(json.dumps(intake.execute(args), indent=2, ensure_ascii=True))
+            result = worktree_cli.execute(args) if args.cmd == 'worktree' else intake.execute(args)
+            print(json.dumps(result, indent=2, ensure_ascii=True))
         except Exception as exc:
+            # Sanitized close-gate refusal (each worktree and its problems) or
+            # the final command states of an incomplete `hub worktree --wait`.
+            report = getattr(exc, 'gate', None) or getattr(exc, 'report', None)
+            if report:
+                print(json.dumps(report, indent=2, ensure_ascii=True))
             print(intake.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
         return

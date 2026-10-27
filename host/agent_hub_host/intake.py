@@ -31,8 +31,10 @@ class StaleSnapshot(ValueError):
 
 
 class IntakeHTTPError(ValueError):
-    def __init__(self, status, code='request_failed', key=None):
+    def __init__(self, status, code='request_failed', key=None, gate=None):
         self.status, self.code = status, code
+        # Sanitized worktree close-gate refusal (409 worktree_close_gate) or None.
+        self.gate = gate
         super().__init__(f'Intake HTTP {status}: {code}' + (f'; retry key: {key}' if key else ''))
 
 
@@ -73,6 +75,31 @@ def diagnostic(exc):
     return 'Intake client error; check inputs and authentication (unexpected error details withheld)'
 
 
+GATE_FIELDS = ('worktree_id', 'machine', 'path', 'branch')
+
+
+def _bounded_text(value, limit=1024):
+    return value[:limit] if isinstance(value, str) else None
+
+
+def close_gate_refusal(body):
+    """Keep only the documented gate fields; json.dumps escapes controls."""
+    worktrees = body.get('worktrees') if isinstance(body.get('worktrees'), list) else []
+    rows = []
+    for row in worktrees[:64]:
+        if not isinstance(row, dict):
+            continue
+        item = {field: _bounded_text(row.get(field)) for field in GATE_FIELDS}
+        problems = row.get('problems') if isinstance(row.get('problems'), list) else []
+        item['problems'] = [_bounded_text(p, 256) for p in problems[:32] if isinstance(p, str)]
+        rows.append(item)
+    result = {'error': 'worktree_close_gate', 'worktrees': rows}
+    hint = _bounded_text(body.get('hint'), 512)
+    if hint:
+        result['hint'] = hint
+    return result
+
+
 def http_error(exc, method, payload):
     if exc.code == 409 and method == 'GET':
         return StaleSnapshot('Snapshot changed')
@@ -81,7 +108,7 @@ def http_error(exc, method, payload):
     # slug so auth/grant/capacity/field detail survives, collapse the rest.
     body = None
     try:
-        body = json.loads(exc.read(4097))
+        body = json.loads(exc.read(65537))
         code = body.get('error') if isinstance(body, dict) else None
     except Exception:
         code = None
@@ -90,7 +117,8 @@ def http_error(exc, method, payload):
     key = payload.get('key') if payload else None
     if not isinstance(key, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', key):
         key = None
-    result = IntakeHTTPError(exc.code, code, key)
+    gate = close_gate_refusal(body) if code == 'worktree_close_gate' and isinstance(body, dict) else None
+    result = IntakeHTTPError(exc.code, code, key, gate)
     detail = ''
     if isinstance(body, dict):
         reason = body.get('reason')
@@ -108,6 +136,8 @@ def http_error(exc, method, payload):
         detail += '; append a DONE note with commit SHA or deploy run URL, Live check: command/URL, and Result: output before closing'
     if code == 'cancel_reason_required':
         detail += '; provide --reason and --superseded-by, or reason containing dropped by Alexey'
+    if code == 'worktree_close_gate':
+        detail += '; worktrees block close: hub worktree refresh <intake> | hub worktree remove <intake> | --force --reason TEXT'
     if code == 'invalid_event_kind':
         detail += '; valid kinds: ' + ', '.join(EVENT_KINDS)
     # Only locally generated wording is printed, never arbitrary server messages.
@@ -219,6 +249,13 @@ def add_commands(sub):
         update.add_argument('--' + field)
     update.add_argument('--reason', help='Reason for close, cancellation or reopen')
     update.add_argument('--superseded-by', help='Replacement intake id; required for cancel unless dropped by Alexey')
+    update.add_argument('--force', action='store_true', help='Override the worktree close gate when closing; requires --reason')
+    close = commands.add_parser('close', help='CAS status done; refused while intake worktrees are present or unmerged unless --force --reason')
+    close.add_argument('id')
+    close.add_argument('--version', type=int, help='Explicit CAS version; otherwise fetch and retry version conflicts up to three times')
+    close.add_argument('--key', help='Stable retry key; generated automatically when omitted')
+    close.add_argument('--force', action='store_true', help='Override the worktree close gate; requires --reason')
+    close.add_argument('--reason', help='Close reason; required with --force')
     event = commands.add_parser('append', help='Append intake/note/session/report/commit/followup/blocker/decision/rule reference as JSON; approval decisions require operator')
     event.add_argument('id')
     event.add_argument('--version', type=int, required=True)
@@ -420,7 +457,7 @@ def execute(args):
         return request('GET', path + ('' if command == 'show' else '/' + command))
     if command == 'revoke':
         return request('POST', BASE + '/grants/' + safe_id(args.id) + '/revoke', json_file(args.payload_file))
-    key = args.key or ('update-' + uuid.uuid4().hex if command == 'update' else None)
+    key = args.key or (command + '-' + uuid.uuid4().hex if command in ('update', 'close') else None)
     valid_key(key)
     payload = {'key': key, 'expected_version': args.version}
     if command == 'continue':
@@ -462,7 +499,19 @@ def execute(args):
         else:
             payload['event'] = ev
         return request('POST', path + '/events', payload)
+    if command in ('update', 'close') and getattr(args, 'force', False):
+        reason = getattr(args, 'reason', None)
+        if not isinstance(reason, str) or not reason.strip():
+            raise IntakeInputError('--force requires a non-empty --reason')
+        payload['force'] = True
+    if command == 'close':
+        payload['status'] = 'done'
+        if getattr(args, 'reason', None) is not None:
+            payload['reason'] = args.reason
+        return cas_update(path, payload, args.version is None, key)
     if command == 'update':
+        if args.status == 'closed':
+            args.status = 'done'
         for field in ('project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'reason', 'superseded_by'):
             if getattr(args, field, None) is not None:
                 if field == 'acceptance_criteria' and len(args.acceptance_criteria.encode('utf-8')) > 8192:
@@ -472,18 +521,23 @@ def execute(args):
             if getattr(args, field) is not None:
                 raise IntakeInputError('Cannot set and clear one field together')
             payload[field] = None
-        automatic = args.version is None
-        for attempt in range(3):
-            if automatic:
-                current = request('GET', path)
-                payload['expected_version'] = current['task']['control']['version']
-            try:
-                return request('POST', path, dict(payload))
-            except IntakeHTTPError as exc:
-                if not automatic or exc.status != 409 or exc.code != 'version_conflict' or attempt == 2:
-                    raise
-            except (IntakeTransportError, OSError, TimeoutError, http.client.HTTPException, json.JSONDecodeError, UnicodeDecodeError, RuntimeError) as exc:
-                attempted = payload.get('expected_version')
-                version_info = f'; attempted version: {attempted}' if attempted is not None else ''
-                raise IntakeTransportError(f'{diagnostic(exc)}; Intake update outcome unknown; inspect the task before retrying. Retry key: {key}{version_info}') from None
+        return cas_update(path, payload, args.version is None, key)
     raise IntakeInputError('Unknown intake operation')
+
+
+def cas_update(path, payload, automatic, key):
+    """POST a task update, refetching the version on CAS conflicts when automatic."""
+    for attempt in range(3):
+        if automatic:
+            current = request('GET', path)
+            payload['expected_version'] = current['task']['control']['version']
+        try:
+            return request('POST', path, dict(payload))
+        except IntakeHTTPError as exc:
+            if not automatic or exc.status != 409 or exc.code != 'version_conflict' or attempt == 2:
+                raise
+        except (IntakeTransportError, OSError, TimeoutError, http.client.HTTPException, json.JSONDecodeError, UnicodeDecodeError, RuntimeError) as exc:
+            attempted = payload.get('expected_version')
+            version_info = f'; attempted version: {attempted}' if attempted is not None else ''
+            raise IntakeTransportError(f'{diagnostic(exc)}; Intake update outcome unknown; inspect the task before retrying. Retry key: {key}{version_info}') from None
+    raise IntakeInputError('Intake update did not complete')
