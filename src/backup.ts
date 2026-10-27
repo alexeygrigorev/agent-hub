@@ -90,7 +90,9 @@ export class BackupService {
   private rateLimited(request: Request, auth: BackupAuth, kind: string, limit: number): boolean {
     const now = Date.now();
     const bucket = `backup:${kind}:${this.callerKey(request, auth)}`;
-    const row = this.sql.exec('SELECT count, expires FROM backup_rate WHERE bucket=?', bucket).one() as any;
+    // .one() throws on zero rows, so read via toArray: a missing row is simply
+    // an expired (never-used) window.
+    const row = (this.sql.exec('SELECT count, expires FROM backup_rate WHERE bucket=?', bucket).toArray() as any[])[0] as any;
     if (!row || Number(row.expires) <= now) {
       this.sql.exec(
         'INSERT INTO backup_rate(bucket,count,expires) VALUES(?,1,?) ON CONFLICT(bucket) DO UPDATE SET count=1, expires=excluded.expires',
