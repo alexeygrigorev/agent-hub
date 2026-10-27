@@ -62,6 +62,7 @@ class FleetOpencodeTests(unittest.TestCase):
             submitted = next(a for a in calls if 'submit' in a)
             payload = json.loads(submitted[submitted.index('--payload') + 1])
             self.assertEqual(payload['profile'], 'model-task')
+            self.assertEqual(payload['memory_mb'], 1500)
             brief = 'Implement writer-run; preserve root-run authority'
             result_path = Path(tmp) / '.local' / 'hub-results' / (offer()['id'] + '.json')
             self.assertTrue(payload['goal'].startswith(compose_prompt(brief) + '\n'))

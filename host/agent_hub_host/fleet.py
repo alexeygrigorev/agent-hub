@@ -1622,6 +1622,15 @@ class Dispatcher:
                 cached = None
             if cached and isinstance(cached.get('runtime'), dict) and cached['runtime'].get('outcome') == 'reported':
                 _peeked = {k: cached[k] for k in ('report_status', 'report', 'artifacts') if k in cached}
+            if record.get('terminal_enrichment') is True and cached and cached['state'] == 'exited':
+                # The independently requalified native/resource proof above is
+                # still mandatory. Replay the exact durable enrichment after
+                # a lost ACK; do not reattach its original dispatch diagnostic
+                # or change its report while its acceptance is ambiguous.
+                from .late_reports import acknowledge
+                if acknowledge(self, record, cached, cached.get('runtime', {}).get('outcome') == 'reported'):
+                    reconciled.append({'id': offer_id, 'state': 'exited', 'reconciled': True})
+                continue
             fleet_state = cached['state'] if cached else _terminal_fleet_state(
                 reconciled_state, bool(_peeked),
                 (record.get('diagnostic') or {}).get('reason')
@@ -2424,7 +2433,9 @@ class Dispatcher:
             # (docs/SPEC.md §8.1), so allow the full 2 h for headless runs.
             payload = {"goal": goal, "owner": "hub-fleet", "cwd": str(target_cwd), "timeout": 7200,
                        "model_requirements": {"providers": [sub["launcher_provider"]], "models": [sub["launcher_model"]]},
-                       "profile": "model-task"}
+                       "profile": "model-task", "memory_mb": 1500}
+            # Explicit maintained-launcher request: managed Codex otherwise
+            # defaults to 4096 MiB, above Hub's 1500 MiB worker contract.
             # Resource-management placement hints from the Hub offer (server
             # policy, never fabricated locally): per-offer memory estimate
             # plus the durable resource-management config snapshot.

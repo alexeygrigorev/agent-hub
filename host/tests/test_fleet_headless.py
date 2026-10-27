@@ -173,6 +173,7 @@ class TestFleetHeadless(unittest.TestCase):
         sub_payload = json.loads(sub_cmd[p_idx + 1])
         self.assertEqual(sub_payload["account_profile"], "hub-pro-account")
         self.assertEqual(sub_payload["provider_profile"], "hub-pro-account")
+        self.assertEqual(sub_payload["memory_mb"], 1500)
 
     def test_receipt_mismatch_profile_rejected(self):
         settings = self._settings()

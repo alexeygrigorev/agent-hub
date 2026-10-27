@@ -77,11 +77,35 @@ def acknowledge(dispatcher, record, payload, received):
             or payload.get('launcher_task_id') != record.get('task_id')):
         return False
     payload = bound_finish_fields(payload)
+    if record.get('terminal_enrichment') is True and payload['state'] == 'exited':
+        # The original diagnostic remains in the private journal. The existing
+        # same-state API replay accepts runtime/report evidence without one.
+        payload.pop('diagnostic', None)
     record['terminal_payload'] = payload
     dispatcher._active_launches[record['offer_id']] = record
     try:
         dispatcher._persist_launch_record(record)
-        ack = dispatcher.request('POST', '/api/fleet/launches/'+record['offer_id']+'/result', payload)
+        path = '/api/fleet/launches/'+record['offer_id']+'/result'
+        try:
+            ack = dispatcher.request('POST', path, payload)
+        except ValueError as error:
+            # A prior positive native catalog/stop receipt can already have
+            # closed Fleet as exited. Missing JSON still means failed work,
+            # but cannot rewrite that terminal lifecycle. Only this exact
+            # authenticated conflict permits the existing same-native/task
+            # exited replay; transport ambiguity never changes the intent.
+            runtime = payload.get('runtime')
+            if (str(error) != 'HTTP request failed with status 409: invalid_transition'
+                    or record.get('mode') != 'headless' or record.get('routing_task_id')
+                    or payload['state'] != 'failed' or payload.get('report_status') != 'failed'
+                    or not isinstance(runtime, dict)
+                    or runtime.get('outcome') not in ('failed-with-partial-work', 'failed-without-report')):
+                raise
+            payload = dict(payload, state='exited')
+            payload.pop('diagnostic', None)
+            record.update(terminal_enrichment=True, terminal_payload=payload)
+            dispatcher._persist_launch_record(record)
+            ack = dispatcher.request('POST', path, payload)
         if not isinstance(ack, dict) or ack.get('id') != record['offer_id'] or ack.get('state') != payload['state']:
             return False
         record.pop('terminal_payload', None)

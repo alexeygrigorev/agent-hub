@@ -1,4 +1,5 @@
 import json
+import copy
 from pathlib import Path
 import tempfile
 import time
@@ -13,6 +14,128 @@ NATIVE='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
 
 
 class LateReports(unittest.TestCase):
+    def failed_payload(self, record):
+        return dict(state='failed', confirmed_exit=True, native_id=NATIVE,
+                    launcher_task_id=record['task_id'], report_status='failed',
+                    report='Failed with partial work; no final JSON.', artifacts=[],
+                    diagnostic=dict(reason='engine_exit_code', message='Exited without result.',
+                                    error_type='RuntimeError', stage='runtime', exit_code=0),
+                    runtime=copy.deepcopy(record['terminal_runtime']))
+
+    def test_stop_receipt_enrichment_is_durable_before_retry_and_preserves_failed_report(self):
+        from agent_hub_host.terminal_reports import read_record
+        with tempfile.TemporaryDirectory() as tmp:
+            d, _, record = self.fixture(tmp)
+            record.update(state='running', settled=False)
+            payload = self.failed_payload(record)
+            posts = []
+            def request(method, path, value):
+                posts.append(copy.deepcopy(value))
+                self.assertEqual(read_record(d, OFFER)['terminal_payload'], value)
+                if value['state'] == 'failed':
+                    raise ValueError('HTTP request failed with status 409: invalid_transition')
+                self.assertNotIn('diagnostic', value)
+                return dict(id=OFFER, state='exited', replay=True)
+            d.request = request
+            with patch.object(d, '_maybe_cleanup_worktree') as cleanup:
+                self.assertTrue(late_reports.acknowledge(d, record, payload, False))
+                cleanup.assert_not_called()  # Missing report still gets its late-file window.
+            self.assertEqual([p['state'] for p in posts], ['failed', 'exited'])
+            self.assertEqual(posts[1]['report_status'], 'failed')
+            self.assertEqual(posts[1]['runtime'], payload['runtime'])
+            self.assertEqual(payload['state'], 'failed')
+            self.assertTrue(record['settled'])
+            self.assertEqual(record['state'], 'exited')
+            self.assertNotIn('terminal_payload', record)
+
+    def test_real_reconciler_builds_failed_diagnostics_after_an_already_acknowledged_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d, cfg, record = self.fixture(tmp)
+            cfg['launcher'] = dict(argv=['launcher'], root=tmp, config_dir=str(Path(tmp)/'launcher'))
+            record.update(state='running', settled=False)
+            d._active_launches[OFFER] = record
+            d._persist_launch_record(record)
+            d.runner = Mock(return_value=dict(state='failed', native_id=NATIVE, resources_reserved=False))
+            posts = []
+            def server(method, path, payload):
+                posts.append(copy.deepcopy(payload))
+                if payload['state'] == 'failed':
+                    raise ValueError('HTTP request failed with status 409: invalid_transition')
+                return dict(id=OFFER, state='exited', replay=True)
+            d.request = server
+            tomb = dict(finished_at_ms=2234, exit=dict(code=0, signal=None, exited_at_ms=2234))
+            with patch.object(d, '_maybe_cleanup_worktree'), \
+                 patch('agent_hub_host.fleet.verify_native_retirement', return_value=(True, tomb, 'exact')):
+                result = d.reconcile_launches(terminal_only=True)
+            self.assertEqual(len(result), 1)
+            self.assertEqual([p['state'] for p in posts], ['failed', 'exited'])
+            self.assertEqual(posts[1]['report_status'], 'failed')
+            self.assertEqual(posts[1]['runtime']['exit_code'], 0)
+            self.assertEqual(posts[1]['runtime']['wall_time_ms'], 1234)
+            self.assertEqual(posts[1]['runtime']['outcome'], 'failed-without-report')
+            self.assertIn('without a valid structured report', posts[1]['report'])
+            self.assertTrue(d._active_launches[OFFER]['settled'])
+            self.assertEqual(d._active_launches[OFFER]['state'], 'exited')
+
+    def test_enrichment_lost_ack_restart_requalifies_and_replays_exact_intent(self):
+        from agent_hub_host.terminal_reports import read_record
+        with tempfile.TemporaryDirectory() as tmp:
+            d, cfg, record = self.fixture(tmp)
+            cfg['launcher'] = dict(argv=['launcher'], root=tmp, config_dir=str(Path(tmp)/'launcher'))
+            record.update(state='running', settled=False)
+            # Original dispatch diagnostics would otherwise be reattached after restart.
+            record['dispatch_diagnostic'] = dict(reason='engine_auth_expired',
+                message='Original dispatch error.', stage='launcher_run', error_type='AuthenticationError')
+            posts = []
+            def lost(method, path, value):
+                posts.append(copy.deepcopy(value))
+                if value['state'] == 'failed':
+                    raise ValueError('HTTP request failed with status 409: invalid_transition')
+                raise TimeoutError('reply lost')
+            d.request = lost
+            self.assertFalse(late_reports.acknowledge(d, record, self.failed_payload(record), False))
+            durable = read_record(d, OFFER)
+            self.assertEqual(durable['terminal_payload']['state'], 'exited')
+            self.assertEqual(len(posts), 2)
+            restarted = Dispatcher(cfg)
+            restarted.runner = Mock(return_value=dict(state='failed', native_id=NATIVE, resources_reserved=False))
+            restarted.request = Mock(return_value=dict(id=OFFER, state='exited', replay=True))
+            with patch.object(restarted, '_maybe_cleanup_worktree'), \
+                 patch('agent_hub_host.fleet.verify_native_retirement', return_value=(False, None, 'unknown')):
+                self.assertEqual(restarted.reconcile_launches(terminal_only=True), [])
+            restarted.request.assert_not_called()
+            with patch.object(restarted, '_maybe_cleanup_worktree'), \
+                 patch('agent_hub_host.fleet.verify_native_retirement', return_value=(True, dict(finished_at_ms=2234), 'exact')):
+                self.assertEqual(len(restarted.reconcile_launches(terminal_only=True)), 1)
+            replay = restarted.request.call_args.args[2]
+            self.assertEqual(replay, posts[1])
+            self.assertTrue(read_record(restarted, OFFER)['settled'])
+
+    def test_only_exact_confirmed_transition_conflict_allows_one_enrichment_attempt(self):
+        errors = [OSError('ambiguous'), TimeoutError('lost reply'), ValueError('unknown'),
+                  ValueError('HTTP request failed with status 409: other_error'),
+                  ValueError('HTTP request failed with status 401: invalid_transition')]
+        for error in errors:
+            with self.subTest(error=type(error).__name__, message=str(error)), tempfile.TemporaryDirectory() as tmp:
+                d, _, record = self.fixture(tmp)
+                record.update(state='running', settled=False)
+                d.request = Mock(side_effect=error)
+                self.assertFalse(late_reports.acknowledge(d, record, self.failed_payload(record), False))
+                self.assertEqual(d.request.call_count, 1)
+                self.assertEqual(record['terminal_payload']['state'], 'failed')
+                self.assertFalse(record['settled'])
+
+    def test_enrichment_bad_ack_and_non_headless_or_routed_contract_stay_pending(self):
+        for change in [{}, {'mode': 'interactive'}, {'routing_task_id': OFFER}]:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                d, _, record = self.fixture(tmp)
+                record.update(state='running', settled=False, **change)
+                d.request = Mock(side_effect=[ValueError('HTTP request failed with status 409: invalid_transition'),
+                                             dict(id='another', state='exited')])
+                self.assertFalse(late_reports.acknowledge(d, record, self.failed_payload(record), False))
+                self.assertFalse(record['settled'])
+                self.assertEqual(d.request.call_count, 2 if not change else 1)
+
     def fixture(self, tmp):
         root=Path(tmp)
         settings={'version':1,'workspaces':{'main':tmp},'subscriptions':[],
