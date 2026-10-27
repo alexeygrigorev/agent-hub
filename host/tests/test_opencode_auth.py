@@ -107,3 +107,117 @@ def test_managed_bootstrap_preserves_device_contract_across_home_isolation(tmp_p
     prepare.assert_called_once_with(cfg)
     assert env['OPENCODE_DB'] == cfg['target_data'] + '/opencode/opencode.db'
     assert env['XDG_CONFIG_HOME'] == cfg['target_data'] + '/config'
+
+
+def proof_config(tmp_path):
+    cfg = config(tmp_path)
+    binary = tmp_path / 'opencode-fixture'
+    binary.write_bytes(b'fixture-binary')
+    cfg['binary'] = str(binary)
+    source = Path(cfg['source_data']) / 'opencode' / 'opencode.db'
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b'fixture-login-store')
+    return cfg
+
+
+def proof_native(cfg, args, env, payload=None):
+    # Exercise the real private proof/flock protocol; replace only the native
+    # CLI, so tests never open an installed credential store or run inference.
+    with (Path(cfg['target_data']) / 'fixture-calls.log').open('a') as stream:
+        stream.write(' '.join(args) + '\n')
+    if args[:2] == ['auth', 'export']:
+        return [dict(id='fixture-login', integrationID='opencode', active=True,
+                     value=dict(type='oauth', methodID='device', access='fixture-access', refresh='fixture-refresh'))]
+    if args == ['auth', 'import']:
+        db = Path(cfg['target_data']) / 'opencode' / 'opencode.db'
+        db.parent.mkdir(exist_ok=True)
+        db.write_bytes(b'fixture-runtime')
+    if args[:2] == ['auth', 'list']:
+        return [dict(id='opencode', connections=[dict(method='oauth')])]
+    if args == ['api', 'model.list']:
+        return dict(data=[dict(providerID='opencode-go', id=auth.MODEL.split('/')[1], enabled=True)])
+
+
+def proof_child(cfg):
+    return auth.prepare(cfg, native=proof_native)
+
+
+def test_positive_device_proof_is_shared_across_independent_processes(tmp_path):
+    import multiprocessing
+    cfg = proof_config(tmp_path)
+    # Separate process memory models timer, dispatcher and managed bootstrap.
+    with multiprocessing.get_context('spawn').Pool(3) as pool:
+        results = pool.map(proof_child, [cfg] * 3)
+    assert all(r['status'] == 'ok' for r in results)
+    calls = (Path(cfg['target_data']) / 'fixture-calls.log').read_text().splitlines()
+    assert calls.count('auth export opencode') == 1
+    assert calls.count('api model.list') == 1
+    proof = Path(cfg['target_data']) / 'device-verification.json'
+    assert proof.stat().st_mode & 0o777 == 0o600
+    assert 'fixture-access' not in proof.read_text()
+    assert 'fixture-refresh' not in proof.read_text()
+
+
+@pytest.mark.parametrize('change', ['source', 'wal', 'binary', 'runtime', 'legacy', 'receipt', 'expired', 'future', 'malformed'])
+def test_changed_or_expired_device_proof_requires_real_verification(tmp_path, change):
+    cfg = proof_config(tmp_path)
+    auth.prepare(cfg, native=proof_native)
+    target = Path(cfg['target_data'])
+    proof = target / 'device-verification.json'
+    if change == 'source':
+        (Path(cfg['source_data']) / 'opencode' / 'opencode.db').write_bytes(b'new-login')
+    elif change == 'wal':
+        (Path(cfg['source_data']) / 'opencode' / 'opencode.db-wal').write_bytes(b'uncheckpointed-login')
+    elif change == 'binary':
+        Path(cfg['binary']).write_bytes(b'new-binary')
+    elif change == 'runtime':
+        replacement = target / 'replacement.db'
+        replacement.write_bytes(b'different-runtime')
+        replacement.replace(target / 'opencode' / 'opencode.db')
+    elif change == 'legacy':
+        (target / 'opencode' / 'auth.json').write_text('{}')
+    elif change == 'receipt':
+        (target / 'device-source.json').write_text('{}')
+    elif change == 'malformed':
+        proof.write_text('[]')
+    else:
+        data = json.loads(proof.read_text())
+        data['verified_at'] += -61 if change == 'expired' else 61
+        proof.write_text(json.dumps(data))
+    # A previous success must never hide the next verification failure.
+    with pytest.raises(ValueError, match='engine_auth_expired'):
+        auth.prepare(cfg, native=lambda *a, **k: [])
+
+
+def test_runtime_session_writes_reuse_proof_but_login_change_during_check_does_not(tmp_path):
+    cfg = proof_config(tmp_path)
+    auth.prepare(cfg, native=proof_native)
+    runtime = Path(cfg['target_data']) / 'opencode' / 'opencode.db'
+    with runtime.open('ab') as stream:
+        stream.write(b'ordinary-session-write-or-token-refresh')
+    auth.prepare(cfg, native=lambda *a, **k: pytest.fail('fresh positive proof should be shared'))
+    # Force a fresh verification, then alter the source while model discovery
+    # runs: that new source was never exported and cannot receive a proof.
+    source = Path(cfg['source_data']) / 'opencode' / 'opencode.db'
+    source.write_bytes(b'login-before-discovery')
+    def changing_native(cfg, args, env, payload=None):
+        value = proof_native(cfg, args, env, payload)
+        if args == ['api', 'model.list']:
+            source.write_bytes(b'login-changed-during-discovery')
+        return value
+    auth.prepare(cfg, native=changing_native)
+    with pytest.raises(ValueError, match='engine_auth_expired'):
+        auth.prepare(cfg, native=lambda *a, **k: [])
+
+
+def test_native_export_checkpoint_does_not_prevent_positive_proof(tmp_path):
+    cfg = proof_config(tmp_path)
+    def checkpointing_native(cfg, args, env, payload=None):
+        result = proof_native(cfg, args, env, payload)
+        if args[:2] == ['auth', 'export']:
+            source = Path(cfg['source_data']) / 'opencode' / 'opencode.db'
+            source.write_bytes(b'native-export-checkpoint')
+            Path(str(source) + '-wal').write_bytes(b'native-export-wal')
+        return result
+    auth.prepare(cfg, native=checkpointing_native)
+    auth.prepare(cfg, native=lambda *a, **k: pytest.fail('export checkpoint must not defeat sharing'))

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import tempfile
 import time
@@ -17,6 +18,7 @@ from contextlib import contextmanager
 from . import private_fs
 
 MODEL = 'opencode-go/muse-spark-1.3-contributor'
+VERIFICATION_TTL_S = 60
 STRIP = ('OPENCODE_API_KEY', 'OPENCODE_GO_API_KEY', 'OPENCODE_ZEN_API_KEY', 'OPENCODE_CONFIG',
          'OPENCODE_CONFIG_CONTENT', 'OPENCODE_CONFIG_DIR', 'OPENCODE_DB',
          'OPENCODE_SERVER', 'OPENCODE_SERVER_URL', 'OPENCODE_SERVER_PASSWORD',
@@ -122,16 +124,81 @@ def _native(cfg, args, env, payload=None):
     return json.loads(raw) if raw.strip() else None
 
 
+def _verification_identity(cfg, *, source_only=False):
+    """Bind a short positive proof to the installed binary and login store.
+
+    Native runtime refreshes and session writes change the runtime database,
+    so its incarnation (not its contents/mtime) is checked. Login-source writes
+    invalidate immediately, including uncheckpointed SQLite WAL changes.
+    Missing or ambiguous filesystem evidence disables reuse entirely.
+    """
+    def identity(path, *, contents=True, optional=False):
+        try:
+            info = Path(path).stat()
+        except FileNotFoundError:
+            if optional:
+                return None
+            raise
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError('Not a regular device store file')
+        result = [info.st_dev, info.st_ino, info.st_uid, stat.S_IMODE(info.st_mode)]
+        if contents:
+            result += [info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+        return result
+
+    try:
+        source = Path(cfg['source_data']) / 'opencode' / 'opencode.db'
+        target = Path(cfg['target_data']) / 'opencode'
+        result = {'config': cfg, 'binary': identity(cfg['binary']),
+                  'source': identity(source),
+                  'source_wal': identity(str(source) + '-wal', optional=True)}
+        if not source_only:
+            result.update(runtime=identity(target / 'opencode.db', contents=False),
+                          legacy=identity(target / 'auth.json', optional=True),
+                          source_receipt=identity(Path(cfg['target_data']) / 'device-source.json'))
+        return result
+    except (OSError, ValueError):
+        return None
+
+
+def _verified_recently(cfg):
+    identity = _verification_identity(cfg)
+    if identity is None:
+        return False
+    try:
+        proof = json.loads(private_fs.read_bytes(Path(cfg['target_data']) / 'device-verification.json', 8192))
+        verified_at = proof.get('verified_at')
+        return (type(verified_at) in (int, float)
+                and 0 <= time.time() - verified_at <= VERIFICATION_TTL_S
+                and proof.get('identity') == identity)
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def prepare(cfg, *, native=None):
-    """Sync active Console device login and prove pinned model discovery, no inference."""
-    validate(cfg)
+    """Verify device login/model, sharing a positive proof for at most 60s.
+
+    Timer, dispatcher and managed bootstrap processes use the same private
+    proof. Quota/resource admission is independent and still runs per launch.
+    Failures and expired/changed/unknown identities never reuse a proof.
+    """
+    cfg = dict(validate(cfg))
     native = native or _native
     target = Path(cfg['target_data'])
     try:
         with private_fs.parent(target / 'device-source.json', create=True):
             pass
+        if _verified_recently(cfg):
+            return {'status': 'ok', 'reason': 'device_auth_verified'}
         with _lock(target / 'device-auth.lock'):
+            # A sibling may have completed verification while we waited.
+            if _verified_recently(cfg):
+                return {'status': 'ok', 'reason': 'device_auth_verified'}
             rows = native(cfg, ['auth', 'export', 'opencode'], environment(cfg, source=True))
+            # Native export can checkpoint/write its own SQLite/WAL. Bind the
+            # exported login after that command, then refuse reuse if the
+            # source changes during the remaining runtime/model verification.
+            before = _verification_identity(cfg, source_only=True)
             active = [r for r in rows if isinstance(r, dict) and r.get('active') is True
                       and r.get('integrationID') == 'opencode'] if isinstance(rows, list) else []
             if len(active) != 1:
@@ -163,6 +230,12 @@ def prepare(cfg, *, native=None):
             if not any(r.get('providerID') == 'opencode-go' and r.get('id') == MODEL.split('/', 1)[1]
                        and r.get('enabled') is True for r in models.get('data', [])):
                 raise ValueError()
+            identity = _verification_identity(cfg)
+            source_keys = ('config', 'binary', 'source', 'source_wal')
+            if (identity is not None and before is not None
+                    and all(before[k] == identity[k] for k in source_keys)):
+                private_fs.atomic_write(target / 'device-verification.json',
+                    json.dumps({'identity': identity, 'verified_at': time.time()}).encode(), 8192)
         return {'status': 'ok', 'reason': 'device_auth_verified'}
     except AuthBusy:
         raise
