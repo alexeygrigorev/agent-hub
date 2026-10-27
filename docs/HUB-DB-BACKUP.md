@@ -29,9 +29,13 @@ every non-admin caller with 403 and only serves GET:
   `{error:export_failed, stage, table?}` (table name only, never row content).
   Values JSON cannot natively encode (BigInts, raw binary) become explicit
   lossless markers (`{"__hub_backup_bigint":"123"}`,
-  `{"__hub_backup_blob_b64":"..."}`, counted in top-level `value_markers`):
-  the backup never 500s on production value shapes, and restore reverses
-  them (`BigInt(s)`, `Buffer.from(b64,'base64')`).
+  `{"__hub_backup_blob_b64":"..."}`, counted in top-level `value_markers`).
+  Anything else unserializable (lazy-throwing accessors, unknown host
+  objects, over-deep/circular shapes — none expected from SQLite rows)
+  becomes an explicit `__hub_backup_unreadable`/`__hub_backup_circular`
+  marker, also counted, instead of failing the export: the backup never
+  500s on production value shapes, and restore reverses the lossless ones
+  (`BigInt(s)`, `Buffer.from(b64,'base64')`) while reporting the rest.
 - `GET /api/backup/status` — table names + row counts only (cheap liveness
   proof for the restore drill without shipping the dataset).
 

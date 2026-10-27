@@ -102,18 +102,24 @@ export class BackupService {
   /**
    * JSON replacer for export rows. SQLite/Workers values are almost always
    * JSON-native, but production data has contained values JSON.stringify
-   * rejects outright (BigInts). Those become explicit, documented, lossless
-   * markers instead of failing the whole backup; conversions are counted so
-   * the restore drill can verify them. Raw binary is preserved as explicit
-   * base64 (V8 would otherwise emit lossy '{}'); encoding uses only web
-   * primitives (btoa), no Node Buffer dependency inside the DO isolate.
+   * rejects outright. Everything converts explicitly: BigInts and raw
+   * binary become documented lossless markers; anything else unserializable
+   * (lazy-throwing accessors, unknown host objects, over-deep or circular
+   * shapes) becomes an explicit unreadable/circular marker instead of
+   * failing the whole backup. Conversions are counted so the restore drill
+   * can verify them. Encoding uses only web primitives, no Node Buffer
+   * dependency inside the DO isolate.
    */
-  private exportReplacer(table: string, stats: { bigint: number; blob: number }) {
-    return function (_key: string, value: unknown) {
-      if (typeof value === 'bigint') {
+  private exportReplacer(table: string, stats: { bigint: number; blob: number; unreadable: number }) {
+    const seen = new WeakSet<object>();
+    const convert = (key: string, value: unknown, depth: number): unknown => {
+      if (value === null || value === undefined) return null;
+      const t = typeof value;
+      if (t === 'bigint') {
         stats.bigint++;
         return { __hub_backup_bigint: (value as bigint).toString() };
       }
+      if (t === 'string' || t === 'number' || t === 'boolean') return value;
       if (value instanceof ArrayBuffer) {
         stats.blob++;
         const bytes = new Uint8Array(value as ArrayBuffer);
@@ -126,11 +132,50 @@ export class BackupService {
         try {
           b64 = btoa(binary);
         } catch (err) {
-          throw new ExportStageError('serialize', table);
+          stats.unreadable++;
+          return { __hub_backup_unreadable: key || true };
         }
         return { __hub_backup_blob_b64: b64 };
       }
-      return value as any;
+      if (depth > 50) {
+        stats.unreadable++;
+        return { __hub_backup_unreadable: key || true };
+      }
+      if (t === 'object') {
+        if (seen.has(value as object)) {
+          stats.unreadable++;
+          return { __hub_backup_circular: key || true };
+        }
+        seen.add(value as object);
+        try {
+          if (Array.isArray(value)) return (value as unknown[]).map((v, i) => convert(String(i), v, depth + 1));
+          const out: Record<string, unknown> = {};
+          for (const k of Object.keys(value as Record<string, unknown>)) {
+            let v: unknown;
+            try {
+              v = (value as Record<string, unknown>)[k];
+            } catch (err) {
+              stats.unreadable++;
+              out[k] = { __hub_backup_unreadable: k };
+              continue;
+            }
+            out[k] = convert(k, v, depth + 1);
+          }
+          return out;
+        } finally {
+          seen.delete(value as object);
+        }
+      }
+      stats.unreadable++;
+      return { __hub_backup_unreadable: key || typeof value };
+    };
+    return function (_key: string, value: unknown) {
+      try {
+        return convert(_key, value, 0);
+      } catch (err) {
+        stats.unreadable++;
+        return { __hub_backup_unreadable: _key || true };
+      }
     };
   }
 
@@ -149,7 +194,7 @@ export class BackupService {
     row_counts: Record<string, number>;
     tables: Record<string, any[]>;
   }): string {
-    const stats = { bigint: 0, blob: 0 };
+    const stats = { bigint: 0, blob: 0, unreadable: 0 };
     const encodedTables: string[] = [];
     let first = true;
     for (const name of Object.keys(payload.tables)) {

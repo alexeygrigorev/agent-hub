@@ -128,7 +128,7 @@ assert isinstance(counts, dict) and set(counts) == set(tables), "row_counts mism
 assert isinstance(schema, dict) and set(tables) <= set(schema), "schema must cover all tables"
 markers = body.get("value_markers")
 assert isinstance(markers, dict), "value_markers missing"
-assert set(markers) == {"bigint", "blob"} and all(isinstance(markers[k], int) for k in markers), "value_markers shape"
+assert set(markers) == {"bigint", "blob", "unreadable"} and all(isinstance(markers[k], int) for k in markers), "value_markers shape"
 for name, rows in tables.items():
     assert isinstance(rows, list), f"table is not a list: {name}"
     assert counts[name] == len(rows), f"row count mismatch: {name}"
