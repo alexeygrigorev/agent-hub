@@ -215,7 +215,9 @@ def _verified_recently(cfg):
         return (type(verified_at) in (int, float)
                 and 0 <= time.time() - verified_at <= VERIFICATION_TTL_S
                 and proof.get('identity') == identity)
-    except (OSError, ValueError, AttributeError, OverflowError):
+    except Exception:
+        # This optional positive cache never decides auth failure. Decoder,
+        # shape and numeric errors all require the ordinary native check.
         return False
 
 

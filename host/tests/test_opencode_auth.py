@@ -220,6 +220,51 @@ def test_oversized_proof_timestamp_falls_back_to_successful_native_verification(
     assert abs(json.loads(proof.read_text())['verified_at']) < 10**400
 
 
+@pytest.mark.parametrize('raw', [
+    '[' * 2000 + '0' + ']' * 2000,
+    '[]', 'null', 'true', '0', '"unknown"',
+    '{"verified_at": true}', '{"verified_at": NaN}',
+    '{"verified_at": Infinity}', '{"verified_at": {}}',
+    '{"verified_at": []}', '{"verified_at": "unknown"}',
+])
+def test_malformed_optional_proof_falls_back_to_successful_native_verification(tmp_path, raw):
+    cfg = proof_config(tmp_path)
+    auth.prepare(cfg, native=proof_native)
+    target = Path(cfg['target_data'])
+    proof = target / 'device-verification.json'
+    assert len(raw.encode()) <= 8192
+    proof.write_text(raw)
+    assert auth.prepare(cfg, native=proof_native)['status'] == 'ok'
+    calls = (target / 'fixture-calls.log').read_text().splitlines()
+    assert calls.count('auth export opencode') == 2
+    assert calls.count('api model.list') == 2
+    assert isinstance(json.loads(proof.read_text())['identity'], dict)
+
+
+def test_optional_proof_decoder_failure_requires_successful_native_verification(tmp_path):
+    cfg = proof_config(tmp_path)
+    auth.prepare(cfg, native=proof_native)
+    target = Path(cfg['target_data'])
+    proof = target / 'device-verification.json'
+    raw = proof.read_bytes()
+    loads = json.loads
+
+    def limited_decoder(value, *args, **kwargs):
+        # Decoder recursion limits differ across supported Python versions.
+        # Inject that exception only for the optional proof, leaving native
+        # credentials and the replacement proof on the real decoder.
+        if value == raw:
+            raise RecursionError('fixture decoder limit')
+        return loads(value, *args, **kwargs)
+
+    with patch.object(auth.json, 'loads', side_effect=limited_decoder):
+        assert auth.prepare(cfg, native=proof_native)['status'] == 'ok'
+    calls = (target / 'fixture-calls.log').read_text().splitlines()
+    assert calls.count('auth export opencode') == 2
+    assert calls.count('api model.list') == 2
+    assert json.loads(proof.read_text())['verified_at'] > 0
+
+
 def test_runtime_session_writes_reuse_proof_but_login_change_during_check_does_not(tmp_path):
     cfg = proof_config(tmp_path)
     auth.prepare(cfg, native=proof_native)
