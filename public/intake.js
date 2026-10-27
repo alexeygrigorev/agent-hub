@@ -2,7 +2,8 @@
    three operator actions (note, status, approve). Opening a task only ever
    issues GET requests: this file never calls assign, continue, session start,
    or fleet launches. Delivery states are rendered with their real names;
-   nothing here maps a delivery to "accepted". */
+   nothing here maps a delivery to "accepted". Worktree refresh/remove and
+   Close intake (with the worktree close gate) are explicit button POSTs. */
 const byId = id => document.getElementById(id);
 let cachedTasks = [];
 let selectedTaskId = null;
@@ -10,6 +11,7 @@ let detailVersion = null;
 let pendingApprovalRef = null;
 let csrf = null;
 let loading = false;
+let cachedDetail = null;
 
 async function api(path, method = 'GET', data) {
   const headers = {};
@@ -31,11 +33,15 @@ async function api(path, method = 'GET', data) {
   }
   if (!r.ok) {
     let errText = `API request failed (${r.status})`;
+    let errBody = null;
     try {
-      const errBody = await r.json();
+      errBody = await r.json();
       if (errBody && errBody.error) errText = `${errBody.error} (${r.status})`;
     } catch {}
-    throw new Error(errText);
+    const err = new Error(errText);
+    err.status = r.status;
+    err.body = errBody && typeof errBody === 'object' ? errBody : null;
+    throw err;
   }
   return r.json();
 }
@@ -173,6 +179,346 @@ function historyText(e) {
   return '';
 }
 
+/* Worktrees (intake 4b161918). Host status is shown exactly as reported:
+   a null/missing field renders "unknown", never a guessed yes/no. */
+function fmtTime(value) {
+  if (value === null || value === undefined || value === '') return '-';
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? String(value) : d.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+function triState(value) {
+  if (value === null || value === undefined) return 'unknown';
+  if (typeof value === 'number') return value > 0 ? 'yes' : 'no';
+  return value ? 'yes' : 'no';
+}
+
+/* tone: which answer is fine for closing. */
+function statusChip(label, value, goodWhen, count) {
+  const chip = document.createElement('span');
+  const answer = triState(value);
+  let tone = 'dk-badge--neutral';
+  if (answer !== 'unknown') tone = answer === goodWhen ? 'dk-badge--success' : 'dk-badge--warning';
+  chip.className = `dk-badge dk-mono intake-wt-chip ${tone}`;
+  const n = typeof count === 'number' && answer === 'yes' ? ` (${count})` : '';
+  chip.textContent = `${label}: ${answer}${n}`;
+  chip.dataset.state = answer;
+  return chip;
+}
+
+function wtLine(label, value) {
+  const line = document.createElement('div');
+  line.className = 'intake-wt-line';
+  const lbl = document.createElement('span');
+  lbl.className = 'session-meta-item__label';
+  lbl.textContent = label;
+  const val = document.createElement('span');
+  val.className = 'session-meta-item__value';
+  val.textContent = value === null || value === undefined || value === '' ? '-' : String(value);
+  line.append(lbl, val);
+  return line;
+}
+
+function pendingCommands(w) {
+  const list = Array.isArray(w.pending) ? w.pending : (Array.isArray(w.pending_commands) ? w.pending_commands : []);
+  return list.filter(c => c && !['done', 'failed'].includes(c.state));
+}
+
+function renderCloseGate(task) {
+  const el = byId('intake-close-gate');
+  if (!el) return;
+  el.replaceChildren();
+  const gate = task.close_gate;
+  if (!gate || typeof gate !== 'object') { el.hidden = true; return; }
+  el.hidden = false;
+  const badge = document.createElement('span');
+  badge.className = `dk-badge ${gate.ok ? 'dk-badge--success' : 'dk-badge--warning'}`;
+  badge.textContent = gate.ok ? 'close gate: ok' : 'close gate: blocked';
+  el.append(badge);
+  const blocking = Array.isArray(gate.blocking) ? gate.blocking : [];
+  if (!gate.ok && blocking.length) {
+    const t = document.createElement('span');
+    t.className = 'meta-dim';
+    t.textContent = ` ${blocking.length} blocking worktree${blocking.length === 1 ? '' : 's'}: ` + blocking.map(b => {
+      if (typeof b === 'string') return b;
+      const where = b && (b.path || b.worktree_id) || '?';
+      const problems = b && Array.isArray(b.problems) ? b.problems.join(', ') : '';
+      return problems ? `${where} (${problems})` : where;
+    }).join('; ');
+    el.append(t);
+  }
+}
+
+function renderWorktrees(task) {
+  renderCloseGate(task);
+  const el = byId('intake-detail-worktrees');
+  if (!el) return;
+  el.replaceChildren();
+  const rows = Array.isArray(task.worktrees) ? task.worktrees : [];
+  if (!rows.length) {
+    const p = document.createElement('p');
+    p.className = 'dk-muted';
+    p.textContent = 'No recorded worktrees.';
+    el.append(p);
+    return;
+  }
+  const list = document.createElement('div');
+  list.className = 'intake-worktrees-list';
+  for (const w of rows) {
+    const card = document.createElement('div');
+    card.className = 'intake-worktree-card';
+    card.dataset.worktreeId = w.id || '';
+    const head = document.createElement('div');
+    head.className = 'intake-wt-head';
+    const path = document.createElement('span');
+    path.className = 'code-pill intake-wt-path';
+    path.textContent = w.path || '-';
+    path.title = w.path || '';
+    const state = document.createElement('span');
+    state.className = `dk-badge dk-mono ${w.state === 'active' ? 'dk-badge--info' : 'dk-badge--neutral'}`;
+    state.textContent = w.state || 'unknown';
+    head.append(path, state);
+    if (w.origin) {
+      const origin = document.createElement('span');
+      origin.className = 'dk-badge dk-mono';
+      origin.textContent = w.origin;
+      head.append(origin);
+    }
+    card.append(head);
+
+    const st = w.status && typeof w.status === 'object' ? w.status : {};
+    const chips = document.createElement('div');
+    chips.className = 'intake-wt-chips';
+    chips.append(
+      statusChip('merged', st.merged, 'yes'),
+      statusChip('present', st.present, 'no'),
+      statusChip('dirty', st.dirty, 'no', st.dirty_count),
+      statusChip('unpushed', st.unpushed, 'no', st.unpushed)
+    );
+    if (typeof st.unmerged === 'number') {
+      const u = document.createElement('span');
+      u.className = 'meta-dim';
+      u.textContent = `unmerged commits: ${st.unmerged}`;
+      chips.append(u);
+    }
+    card.append(chips);
+
+    const meta = document.createElement('div');
+    meta.className = 'intake-wt-meta';
+    meta.append(
+      wtLine('Machine', w.machine),
+      wtLine('Branch', w.branch || 'unknown'),
+      wtLine('Created', fmtTime(w.created_at)),
+      wtLine('Status checked', w.status ? fmtTime(st.checked_at || w.status_at) : 'never (unknown)')
+    );
+    if (st.error) meta.append(wtLine('Status error', st.error));
+    const lr = w.last_remove && typeof w.last_remove === 'object' ? w.last_remove : null;
+    if (lr) meta.append(wtLine('Last remove', `${lr.result || '-'}${lr.reason ? ` · ${lr.reason}` : ''}${lr.at ? ` · ${fmtTime(lr.at)}` : ''}`));
+    card.append(meta);
+
+    const sessions = Array.isArray(w.session_ids) ? w.session_ids.filter(x => typeof x === 'string' && x) : [];
+    if (sessions.length) {
+      const links = document.createElement('div');
+      links.className = 'intake-wt-sessions';
+      const lbl = document.createElement('span');
+      lbl.className = 'session-meta-item__label';
+      lbl.textContent = 'Sessions';
+      links.append(lbl);
+      for (const sid of sessions) {
+        const a = document.createElement('a');
+        a.className = 'session-meta-link';
+        a.href = `/sessions.html?session=${encodeURIComponent(sid)}`;
+        a.textContent = sid;
+        links.append(a);
+      }
+      card.append(links);
+    }
+
+    const pending = pendingCommands(w);
+    if (pending.length) {
+      const pc = document.createElement('div');
+      pc.className = 'meta-dim intake-wt-pending';
+      pc.textContent = 'Pending: ' + pending.map(c => `${c.kind || 'command'} ${c.state || 'queued'}${c.created_at ? ` since ${fmtTime(c.created_at)}` : ''}`).join('; ');
+      card.append(pc);
+    }
+
+    if (w.state === 'active' && w.id) {
+      const actions = document.createElement('div');
+      actions.className = 'intake-wt-actions';
+      const rm = document.createElement('button');
+      rm.type = 'button';
+      rm.className = 'dk-button dk-button--secondary dk-button--sm intake-wt-remove';
+      rm.textContent = 'Remove worktree';
+      rm.addEventListener('click', () => removeWorktree(w));
+      actions.append(rm);
+      card.append(actions);
+    }
+    list.append(card);
+  }
+  el.append(list);
+}
+
+function renderCloseRefusal(body) {
+  const el = byId('intake-close-refusal');
+  const form = byId('intake-force-form');
+  if (!el) return;
+  el.replaceChildren();
+  if (!body) {
+    el.hidden = true;
+    if (form) form.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  const head = document.createElement('p');
+  head.className = 'intake-close-refusal__title';
+  head.textContent = 'Close refused: these worktrees still block it.';
+  el.append(head);
+  const ul = document.createElement('ul');
+  ul.className = 'intake-close-refusal__list';
+  for (const w of Array.isArray(body.worktrees) ? body.worktrees : []) {
+    const li = document.createElement('li');
+    const where = document.createElement('span');
+    where.className = 'dk-mono';
+    where.textContent = `${w.machine || '?'}:${w.path || w.worktree_id || '?'}${w.branch ? ` (${w.branch})` : ''}`;
+    const problems = document.createElement('span');
+    problems.className = 'meta-dim';
+    problems.textContent = ` — ${Array.isArray(w.problems) && w.problems.length ? w.problems.join(', ') : 'blocked'}`;
+    li.append(where, problems);
+    ul.append(li);
+  }
+  el.append(ul);
+  if (typeof body.hint === 'string' && body.hint) {
+    const hint = document.createElement('p');
+    hint.className = 'meta-dim';
+    hint.textContent = `Hint: ${body.hint}`;
+    el.append(hint);
+  }
+  if (form) form.hidden = false;
+}
+
+function isGateRefusal(err) {
+  return err && err.status === 409 && err.body && err.body.error === 'worktree_close_gate';
+}
+
+function commandIds(resp) {
+  const ids = [];
+  if (resp && Array.isArray(resp.commands)) for (const c of resp.commands) if (c && c.id) ids.push(c.id);
+  if (resp && resp.command && resp.command.id) ids.push(resp.command.id);
+  if (resp && typeof resp.command_id === 'string') ids.push(resp.command_id);
+  return [...new Set(ids)];
+}
+
+const WT_POLL_ATTEMPTS = 10;
+const WT_POLL_MS = 3000;
+const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+/* Bounded follow-up after a refresh/remove: poll the queued commands (or the
+   task when the response names none), then re-render the task once more. */
+async function pollWorktreeCommands(taskId, resp) {
+  const status = byId('intake-worktrees-status');
+  const ids = commandIds(resp);
+  for (let i = 0; i < WT_POLL_ATTEMPTS && selectedTaskId === taskId; i++) {
+    await pause(WT_POLL_MS);
+    if (selectedTaskId !== taskId) return;
+    if (ids.length) {
+      const states = await Promise.all(ids.map(id => api(`/api/intake/worktree-commands/${encodeURIComponent(id)}`)
+        .then(r => (r && r.command) || r || {}).catch(() => ({}))));
+      const done = states.every(c => c.state === 'done' || c.state === 'failed');
+      if (status) status.textContent = states.map(c => {
+        const r = c.result && typeof c.result === 'object' ? c.result : {};
+        return `${c.kind || 'command'}: ${c.state || 'unknown'}${r.outcome ? ` (${r.outcome}${r.reason ? `: ${r.reason}` : ''})` : ''}`;
+      }).join('; ');
+      if (done) break;
+    } else {
+      await refreshTaskDetail(taskId);
+      const data = cachedDetail;
+      const rows = data && Array.isArray(data.worktrees) ? data.worktrees : [];
+      if (!rows.some(w => pendingCommands(w).length)) break;
+    }
+  }
+  await refreshTaskDetail(taskId);
+}
+
+async function refreshWorktrees() {
+  if (!selectedTaskId) return;
+  const taskId = selectedTaskId;
+  const btn = byId('intake-worktrees-refresh');
+  const status = byId('intake-worktrees-status');
+  if (btn) btn.disabled = true;
+  if (status) status.textContent = 'Queuing status check on the owning host…';
+  try {
+    await ensureCsrf();
+    const resp = await api(`/api/intake/tasks/${encodeURIComponent(taskId)}/worktrees/refresh`, 'POST', { key: reqKey('wt') });
+    if (status) status.textContent = 'Status check queued; waiting for the host…';
+    await pollWorktreeCommands(taskId, resp);
+  } catch (err) {
+    if (status) status.textContent = `Refresh failed: ${err.message}`;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function removeWorktree(w) {
+  if (!selectedTaskId || !w || !w.id) return;
+  const taskId = selectedTaskId;
+  const ok = window.confirm(`Remove worktree ${w.path || w.id} on ${w.machine || 'its host'}?\n\nThe host runs git worktree remove (never --force) and refuses if it is dirty, unmerged or in use.`);
+  if (!ok) return;
+  const status = byId('intake-worktrees-status');
+  if (status) status.textContent = 'Queuing remove on the owning host…';
+  try {
+    await ensureCsrf();
+    const resp = await api(`/api/intake/tasks/${encodeURIComponent(taskId)}/worktrees/remove`, 'POST', { key: reqKey('wt'), worktree_id: w.id });
+    const refused = resp && Array.isArray(resp.refused) ? resp.refused : [];
+    if (refused.length && !commandIds(resp).length) {
+      if (status) status.textContent = `Remove refused by Hub: ${refused.map(r => r.reason || 'refused').join('; ')}`;
+      await refreshTaskDetail(taskId);
+      return;
+    }
+    if (status) status.textContent = 'Remove queued; waiting for the host…';
+    await pollWorktreeCommands(taskId, resp);
+  } catch (err) {
+    if (status) status.textContent = `Remove failed: ${err.message}${err.body && err.body.reason ? ` · ${err.body.reason}` : ''}`;
+  }
+}
+
+async function closeIntake(force) {
+  if (!selectedTaskId || detailVersion === null) return;
+  const actionStatus = byId('intake-action-status');
+  const btn = byId(force ? 'intake-force-btn' : 'intake-close-btn');
+  const body = { key: reqKey(force ? 'force-close' : 'close'), expected_version: detailVersion, status: 'done' };
+  if (force) {
+    const reason = (byId('intake-force-reason')?.value || '').trim();
+    if (!reason) {
+      if (actionStatus) actionStatus.textContent = 'Force close needs a reason.';
+      return;
+    }
+    if (!window.confirm('Force close this intake despite the blocking worktrees? The reason is recorded.')) return;
+    body.force = true;
+    body.reason = reason;
+  }
+  if (btn) btn.disabled = true;
+  if (actionStatus) { actionStatus.dataset.sticky = '1'; actionStatus.textContent = force ? 'Force closing…' : 'Closing…'; }
+  try {
+    await ensureCsrf();
+    await api(`/api/intake/tasks/${encodeURIComponent(selectedTaskId)}`, 'POST', body);
+    renderCloseRefusal(null);
+    const reasonEl = byId('intake-force-reason');
+    if (reasonEl) reasonEl.value = '';
+    if (actionStatus) actionStatus.textContent = 'Intake closed.';
+    await Promise.all([refreshTaskDetail(selectedTaskId), loadList().then(() => renderList(cachedTasks, byId('intake-filter')?.value || ''))]);
+  } catch (err) {
+    if (isGateRefusal(err)) {
+      renderCloseRefusal(err.body);
+      if (actionStatus) actionStatus.textContent = 'Close refused by the worktree gate.';
+    } else if (actionStatus) {
+      actionStatus.textContent = `Close failed: ${err.message}`;
+    }
+  } finally {
+    if (btn) btn.disabled = force ? !(byId('intake-force-reason')?.value || '').trim() : false;
+    if (actionStatus) delete actionStatus.dataset.sticky;
+  }
+}
+
 function renderDetail(task) {
   const titleEl = byId('intake-detail-title');
   const badgesEl = byId('intake-detail-badges');
@@ -260,6 +606,7 @@ function renderDetail(task) {
       sessEl.append(list);
     }
   }
+  renderWorktrees(task);
   if (histEl) {
     histEl.replaceChildren();
     const history = Array.isArray(payload.history) ? [...payload.history].reverse() : [];
@@ -312,6 +659,8 @@ function renderDetail(task) {
   } else if (approveWrap) {
     approveWrap.hidden = true;
   }
+  const closeWrap = byId('intake-close-wrap');
+  if (closeWrap) closeWrap.hidden = control.status === 'done';
   const statusSelect = byId('intake-status-select');
   if (statusSelect && control.status) statusSelect.value = control.status;
   if (actionStatus && actionStatus.dataset.sticky !== '1') actionStatus.textContent = '';
@@ -331,6 +680,7 @@ async function refreshTaskDetail(taskId) {
   try {
     const data = await api(`/api/intake/tasks/${encodeURIComponent(taskId)}`);
     if (selectedTaskId !== taskId || !data || !data.task) return;
+    cachedDetail = data.task;
     renderDetail(data.task);
     if (actionStatus && actionStatus.textContent === 'Loading task…') actionStatus.textContent = '';
   } catch (err) {
@@ -343,6 +693,10 @@ function openTaskDetail(taskId, pushHistory = true) {
   selectedTaskId = taskId;
   detailVersion = null;
   pendingApprovalRef = null;
+  cachedDetail = null;
+  renderCloseRefusal(null);
+  const wtStatus = byId('intake-worktrees-status');
+  if (wtStatus) wtStatus.textContent = '';
   const listSec = byId('intake-list-section');
   const detailSec = byId('intake-detail-section');
   if (listSec) listSec.hidden = true;
@@ -427,6 +781,7 @@ async function submitStatus(e) {
     if (actionStatus) actionStatus.textContent = 'Status saved.';
     await Promise.all([refreshTaskDetail(selectedTaskId), loadList().then(() => renderList(cachedTasks, byId('intake-filter')?.value || ''))]);
   } catch (err) {
+    if (isGateRefusal(err)) renderCloseRefusal(err.body);
     if (actionStatus) actionStatus.textContent = `Status failed: ${err.message}`;
   } finally {
     if (btn) btn.disabled = false;
@@ -511,6 +866,13 @@ function setupEvents() {
   byId('intake-note-form')?.addEventListener('submit', submitNote);
   byId('intake-status-form')?.addEventListener('submit', submitStatus);
   byId('intake-approve-btn')?.addEventListener('click', () => decideApproval('granted'));
+  byId('intake-worktrees-refresh')?.addEventListener('click', refreshWorktrees);
+  byId('intake-close-btn')?.addEventListener('click', () => closeIntake(false));
+  byId('intake-force-form')?.addEventListener('submit', e => { e.preventDefault(); closeIntake(true); });
+  byId('intake-force-reason')?.addEventListener('input', () => {
+    const btn = byId('intake-force-btn');
+    if (btn) btn.disabled = !(byId('intake-force-reason')?.value || '').trim();
+  });
   byId('intake-deny-btn')?.addEventListener('click', () => decideApproval('denied'));
   byId('sign-out')?.addEventListener('click', async () => {
     try {

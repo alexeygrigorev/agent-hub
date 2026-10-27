@@ -128,6 +128,15 @@
           <h3 class="session-detail__subtitle">Linked sessions</h3>
           <div id="intake-detail-sessions"></div>
         </div>
+        <div class="dk-stack" id="intake-worktrees-wrap" aria-label="Intake worktrees">
+          <div class="intake-worktrees__head">
+            <h3 class="session-detail__subtitle">Worktrees</h3>
+            <button class="dk-button dk-button--secondary dk-button--sm" type="button" id="intake-worktrees-refresh">Refresh status</button>
+          </div>
+          <p class="dk-muted intake-close-gate" id="intake-close-gate"></p>
+          <p class="dk-muted" id="intake-worktrees-status" role="status"></p>
+          <div id="intake-detail-worktrees"></div>
+        </div>
         <div class="dk-stack">
           <h3 class="session-detail__subtitle">History</h3>
           <div id="intake-detail-history"></div>
@@ -156,6 +165,23 @@
             <button class="dk-button dk-button--secondary" type="submit" id="intake-status-btn">Save status</button>
           </div>
         </form>
+        <div class="dk-stack" id="intake-close-wrap">
+          <h3 class="session-detail__subtitle">Close intake</h3>
+          <p class="dk-muted">Closing sets status done. Hub refuses while a worktree of this intake is still present or unmerged.</p>
+          <div class="intake-close-actions">
+            <button class="dk-button dk-button--primary" type="button" id="intake-close-btn">Close intake</button>
+          </div>
+          <div class="intake-close-refusal" id="intake-close-refusal" role="alert" hidden></div>
+          <form class="dk-stack intake-force-form" id="intake-force-form" hidden>
+            <label class="dk-field">
+              <span class="dk-field__label">Force close: reason (required, recorded in history and audit)</span>
+              <textarea class="dk-textarea" id="intake-force-reason" rows="2" placeholder="Why close despite the worktrees above…"></textarea>
+            </label>
+            <div class="session-send-form__foot">
+              <button class="dk-button dk-button--secondary" type="submit" id="intake-force-btn" disabled>Force close</button>
+            </div>
+          </form>
+        </div>
         <div class="dk-stack" id="intake-approve-wrap" hidden>
           <h3 class="session-detail__subtitle">Pending approval</h3>
           <p class="dk-muted" id="intake-approve-text"></p>

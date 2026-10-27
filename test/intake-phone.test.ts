@@ -163,6 +163,45 @@ describe('F7 phone routes and intake pages', () => {
     expect(intakeJs).toContain('scope_flag');
   });
 
+  it('intake detail renders worktrees, guarded remove/refresh and the close gate (4b161918)', () => {
+    // Section sits after linked sessions, before history.
+    const sessionsAt = intakeHtml.indexOf('id="intake-detail-sessions"');
+    const worktreesAt = intakeHtml.indexOf('id="intake-detail-worktrees"');
+    expect(sessionsAt).toBeGreaterThan(0);
+    expect(worktreesAt).toBeGreaterThan(sessionsAt);
+    expect(worktreesAt).toBeLessThan(intakeHtml.indexOf('id="intake-detail-history"'));
+    for (const id of ['intake-worktrees-refresh', 'intake-close-gate', 'intake-close-btn', 'intake-close-refusal',
+      'intake-force-form', 'intake-force-reason', 'intake-force-btn']) {
+      expect(intakeHtml, id).toContain(`id="${id}"`);
+    }
+    expect(intakeHtml).toContain('>Refresh status<');
+    expect(intakeHtml).toContain('>Close intake<');
+    expect(intakeHtml).toContain('>Force close<');
+    // CSP-safe: no inline scripts or handlers were added.
+    expect(intakeHtml).not.toMatch(/<script(?![^>]*\ssrc=)[^>]*>/);
+    expect(intakeHtml).not.toMatch(/\son[a-z]+=/);
+    // Endpoints from docs/INTAKE-WORKTREES.md.
+    expect(intakeJs).toContain('/worktrees/refresh`');
+    expect(intakeJs).toContain('/worktrees/remove`');
+    expect(intakeJs).toContain('/api/intake/worktree-commands/');
+    expect(intakeJs).toContain('worktree_id: w.id');
+    expect(intakeJs).toContain("status: 'done'");
+    expect(intakeJs).toContain('body.force = true');
+    expect(intakeJs).toContain('body.reason = reason');
+    expect(intakeJs).toContain("'worktree_close_gate'");
+    expect(intakeJs).toContain('task.close_gate');
+    expect(intakeJs).toContain('task.worktrees');
+    // Remove asks first; polling is bounded.
+    expect(intakeJs).toContain('window.confirm(');
+    expect(intakeJs).toMatch(/WT_POLL_ATTEMPTS = \d+/);
+    // Status chips: null is "unknown", never a guessed yes/no.
+    expect(intakeJs).toContain("if (value === null || value === undefined) return 'unknown';");
+    for (const chip of ["'merged'", "'present'", "'dirty'", "'unpushed'"]) expect(intakeJs, chip).toContain(chip);
+    expect(intakeJs).toContain('/sessions.html?session=${encodeURIComponent(sid)}');
+    expect(intakeJs).toContain('last_remove');
+    expect(intakeJs).toContain('checked_at');
+  });
+
   it('worker maps every F7 clean URL to its bundle with no terminal/SSH routes', () => {
     for (const route of ["'/intake'", "'/intake.html'", "'/intake.js'", "'/intake.css'", "'/fleet'", "'/conversations'", "'/engines'"]) {
       expect(workerSrc, route).toContain(route);
