@@ -45,6 +45,9 @@ let killState = { active: false, reason: '' };
 let authStatus = 200;
 let mode = 'normal';
 let lastKillPost = null;
+let grokPreference = 'disabled';
+let grokWriteStatus = 200;
+let lastGrokPost = null;
 const requests = [];
 await mkdir('.local/tbm-dashboard', { recursive: true, mode: 0o700 });
 try {
@@ -63,6 +66,17 @@ try {
       if (u.pathname === '/api/metrics') {
         if (!u.searchParams.has('host_id')) return route.fulfill({ json: { items: [], next_cursor: null } });
         return route.fulfill({ json: { status: 'unknown' } });
+      }
+      if (u.pathname === '/api/fleet/routing/policy/grok') {
+        assert.equal(request.headers()['x-csrf-token'], 'fixture');
+        if (request.method() === 'POST') {
+          if (grokWriteStatus !== 200) return route.fulfill({ status: grokWriteStatus, body: '' });
+          lastGrokPost = JSON.parse(request.postData() || '{}');
+          assert.ok(['minimal', 'disabled', 'normal'].includes(lastGrokPost.mode));
+          assert.ok(lastGrokPost.reason.trim());
+          grokPreference = lastGrokPost.mode;
+        }
+        return route.fulfill({ json: { mode: grokPreference, effective_mode: 'disabled', factor: 0, enabled: false } });
       }
       if (u.pathname === '/api/quota/pacing') {
         assert.equal(request.headers()['x-csrf-token'], 'fixture');
@@ -93,11 +107,25 @@ try {
       } catch { return route.fulfill({ status: 404, body: '' }); }
     });
     killState = { active: false, reason: '' };
+    grokPreference = 'disabled'; grokWriteStatus = 200;
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
     await page.goto('http://tbm.fixture/metrics.html');
     await page.waitForFunction(() => document.getElementById('tbm-status').textContent.includes('TBM ·'));
+    // Preference metadata never implies routing authority, at either viewport.
+    await page.waitForFunction(() => document.getElementById('tbm-grok-mode'));
+    assert.equal(await page.locator('#tbm-grok-mode').inputValue(), 'disabled');
+    assert.match(await page.locator('#tbm-grok').innerText(), /Effective state: disabled/);
+    assert.match(await page.locator('#tbm-grok').innerText(), /unavailable for all Hub tasks/);
+    for (const preference of ['normal', 'minimal', 'disabled']) {
+      await page.locator('#tbm-grok-mode').selectOption(preference);
+      await page.locator('#tbm-grok-reason').fill('browser preference proof');
+      await page.locator('#tbm-grok button[type=submit]').click();
+      await page.waitForFunction((saved) => document.getElementById('tbm-grok').textContent.includes(`Saved preference: ${saved}.`), preference);
+      assert.deepEqual(lastGrokPost, { mode: preference, reason: 'browser preference proof' });
+      assert.match(await page.locator('#tbm-grok').innerText(), /Effective state: disabled/);
+    }
     // Spend-vs-pace per pool.
     assert.equal(await page.locator('#tbm-pacing .tbm-pool').count(), 2);
     assert.equal(await page.locator('#tbm-pacing .tbm-pool svg').count(), 1, 'only the pool with reset renders a chart');
@@ -123,6 +151,14 @@ try {
     await page.screenshot({ path: `.local/tbm-dashboard/${width}-${scheme}.png`, fullPage: true });
 
     if (width === 1440 && scheme === 'light') {
+      grokWriteStatus = 403;
+      await page.locator('#tbm-grok-mode').selectOption('normal');
+      await page.locator('#tbm-grok-reason').fill('unauthorized preference');
+      await page.locator('#tbm-grok button[type=submit]').click();
+      await page.waitForFunction(() => document.getElementById('tbm-grok').textContent.includes('Only an operator'));
+      assert.equal(grokPreference, 'disabled');
+      assert.equal(await page.locator('#tbm-grok button[type=submit]').isEnabled(), true);
+      grokWriteStatus = 200;
       // Empty banked + service failure paths stay honest, never zero-filled.
       const keep = banked;
       banked = () => ({ as_of: new Date(NOW).toISOString(), tranches: [] });
@@ -147,6 +183,6 @@ try {
     assert.deepEqual(errors, []);
     await context.close();
   }
-  await writeFile('.local/tbm-dashboard/results.json', JSON.stringify({ checks: ['pools', 'pace-chart', 'banked', 'kill-switch-csrf', 'empty', 'errors', 'responsive'], requests: requests.length }, null, 2) + '\n');
-  console.log('PASS tbm dashboard: 4 responsive/theme renders, pace chart, banked deadlines, kill-switch CSRF, honest units, error paths.');
+  await writeFile('.local/tbm-dashboard/results.json', JSON.stringify({ checks: ['pools', 'pace-chart', 'banked', 'kill-switch-csrf', 'grok-preference-csrf-effective-disabled', 'grok-operator-denial', 'empty', 'errors', 'responsive'], requests: requests.length }, null, 2) + '\n');
+  console.log('PASS tbm dashboard: 4 responsive/theme renders, pace chart, banked deadlines, kill-switch CSRF, Grok preferences always effectively disabled, honest units, error paths.');
 } finally { await browser.close(); }
