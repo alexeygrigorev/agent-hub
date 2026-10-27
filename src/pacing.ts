@@ -188,6 +188,7 @@ export function pacingStep(pool: TbmPoolRow, prev: PidState, nowMs: number, opts
 // ---------------------------------------------------------------------------
 
 export const EDF_DEFAULTS = { urgentHours: 24, criticalHours: 4, dispatchHours: 6 };
+export const MAX_BANKED_URGENCY = 4;
 
 /** Active, non-empty (or deadline-only quantity_known=0), unexpired tranches by ascending expiry; ties by remaining desc, then id. */
 export function edfOrder<T extends Pick<TbmTrancheRow, 'tranche_id' | 'remaining_tokens' | 'expires_at_ms' | 'status'> & Partial<TbmTrancheRow>>(tranches: T[], nowMs: number): T[] {
@@ -199,12 +200,12 @@ export function edfOrder<T extends Pick<TbmTrancheRow, 'tranche_id' | 'remaining
 export function bankedUrgencyMultiplier(expiresAtMs: number, nowMs: number, urgentHours = EDF_DEFAULTS.urgentHours): number {
   const hours = (expiresAtMs - nowMs) / HOUR;
   if (hours <= 0 || hours > urgentHours) return 1;
-  return 1 + 3 * Math.pow((urgentHours - hours) / urgentHours, 2);
+  return 1 + (MAX_BANKED_URGENCY - 1) * Math.pow((urgentHours - hours) / urgentHours, 2);
 }
 
 /** mu_i = B_rem / max(eps, T_exp - t), tokens/minute. Deadline-only grants (quantity_known=0) never invent a token burn rate (0). */
 export const trancheUrgencyTpm = (t: Pick<TbmTrancheRow, 'remaining_tokens' | 'expires_at_ms'> & Partial<TbmTrancheRow>, nowMs: number) => {
-  if (isDeadlineOnlyTranche(t) && t.remaining_tokens <= 0) return 0;
+  if (isDeadlineOnlyTranche(t)) return 0;
   const denomMin = Math.max(EPSILON_MS, t.expires_at_ms - nowMs) / MINUTE;
   return Math.max(0, t.remaining_tokens) / denomMin;
 };
@@ -229,10 +230,14 @@ export function selectBurnSource(pool: TbmPoolRow | null, tranches: TbmTrancheRo
     const muPrimary = pool ? primaryUrgencyTpm(pool, nowMs, o.hardAbsTokens) : 0;
     const hours = (head.expires_at_ms - nowMs) / HOUR;
     const mostUrgent = ordered.reduce((best, t) => trancheUrgencyTpm(t, nowMs) > trancheUrgencyTpm(best, nowMs) ? t : best, head);
-    const deadlineUrgent = isDeadlineOnlyTranche(head) && hours <= o.urgentHours;
+    const deadlineUrgent = ordered.some(t => isDeadlineOnlyTranche(t) && (t.expires_at_ms - nowMs) / HOUR <= o.urgentHours);
     if (hours <= o.dispatchHours || deadlineUrgent || trancheUrgencyTpm(mostUrgent, nowMs) > muPrimary) {
       // Dispatch is always to the EDF head; urgency only decides banked vs primary.
-      return { source: 'banked', tranche: head, critical: hours <= o.criticalHours, omega: bankedUrgencyMultiplier(head.expires_at_ms, nowMs, o.urgentHours) };
+      // Unknown-size grants get the existing bounded maximum throughout their urgent window.
+      // Do not invent token quantities/rates: once quantity_known changes, the real remaining
+      // amount participates in the normal rate comparison above and deadline multiplier below.
+      const omega = deadlineUrgent ? MAX_BANKED_URGENCY : bankedUrgencyMultiplier(head.expires_at_ms, nowMs, o.urgentHours);
+      return { source: 'banked', tranche: head, critical: hours <= o.criticalHours, omega };
     }
   }
   return pool ? { source: 'primary', tranche: null, critical: false, omega: 1 } : null;
@@ -326,7 +331,7 @@ function computeGroupPacing(
         return pacingAlignment(p.current_burn_rate_tpm, target);
       }))
     : 1;
-  const out: ProviderPacing = { pacing, banked, preempt: preempt && !halted, halted };
+  const out: ProviderPacing = { pacing, banked: halted ? 1 : banked, preempt: preempt && !halted, halted };
   if (typeof efficiency === 'number' && Number.isFinite(efficiency) && efficiency !== 1) {
     out.efficiency = efficiency;
   }
@@ -352,7 +357,7 @@ export function providerPacing(
     const eff = opts.efficiencies?.get(provider);
     // Account-level entries so per-account pacing/banked/floor state steers routing per account.
     const accounts = new Set(providerPools.map(p => p.account).filter((a): a is string => typeof a === 'string' && a.length > 0 && a !== '*'));
-    const accountEntries: ProviderPacing[] = [];
+    const eligibleAccounts = new Set<string>();
     for (const account of accounts) {
       const acctPools = providerPools.filter(p => p.account === account);
       const acctPoolIds = new Set(acctPools.map(p => p.pool_id));
@@ -364,14 +369,20 @@ export function providerPacing(
       if (fam && fam !== provider && !out.has(`${fam}:${account}`)) {
         out.set(`${fam}:${account}`, acctPacing);
       }
-      accountEntries.push(acctPacing);
+      if (!acctPacing.halted) eligibleAccounts.add(account);
     }
-    const provPacing = computeGroupPacing(providerPools, providerTranches, nowMs, globalHalted, Boolean(opts.enforceFloors), eff);
-    // If multiple accounts exist and at least one account is eligible while another is at floor,
-    // keep the provider aggregate unhalted unless a provider-wide kill switch is active.
-    if (opts.enforceFloors && accountEntries.length > 1 && accountEntries.some(a => !a.halted) && !globalHalted && !providerPools.some(p => p.kill_switch_active)) {
-      provPacing.halted = false;
+    let aggregatePools = providerPools;
+    let aggregateTranches = providerTranches;
+    // A floor-blocked account must neither lend urgency to nor suppress critical
+    // work on an eligible sibling account. Preserve global/provider kill gates.
+    if (opts.enforceFloors && accounts.size > 1 && eligibleAccounts.size > 0 && !globalHalted && !providerPools.some(p => p.kill_switch_active)) {
+      aggregatePools = providerPools.filter(p => !p.account || p.account === '*' || eligibleAccounts.has(p.account));
+      const poolIds = new Set(aggregatePools.map(p => p.pool_id));
+      aggregateTranches = providerTranches.filter(t => t.account && t.account !== '*'
+        ? eligibleAccounts.has(t.account)
+        : poolIds.has(t.pool_id) || t.pool_id === '*' || t.pool_id === provider);
     }
+    const provPacing = computeGroupPacing(aggregatePools, aggregateTranches, nowMs, globalHalted, Boolean(opts.enforceFloors), eff);
     out.set(provider, provPacing);
     const fam = normalizeProviderFamily(provider);
     if (fam && fam !== provider && !out.has(fam)) {

@@ -127,6 +127,39 @@ describe('TBM percentage-only pools and cycle_ms (AC2 / AC6)', () => {
 });
 
 describe('Persisted PID controller, reset ledger, rewards, rollups & routing feedback (AC2 / AC3)', () => {
+  it('recomputes persisted urgency and burn rate when an unknown grant gains a real quantity', async () => {
+    await inDO(stub('tbm-unknown-to-known'), async (h: Hub) => {
+      const sql = h.sql;
+      ensureTbmControllerSchema(sql);
+      sql.exec(`INSERT INTO tbm_quota_pools (
+        pool_id, provider, account, total_capacity_tokens, remaining_tokens,
+        headroom_percentage, capacity_known, quota_unit, reset_at_ms, cycle_ms, last_updated_ms
+      ) VALUES ('zai:known:7d', 'zai', 'known', 10000000, 6000000, 60, 1, 'tokens', ?, ?, ?)`,
+      NOW + 10 * HOUR, 7 * DAY, NOW);
+      sql.exec(`INSERT INTO tbm_banked_tranches (
+        tranche_id, pool_id, provider, account, allocated_tokens, remaining_tokens,
+        granted_at_ms, expires_at_ms, status, quantity_known, updated_at_ms
+      ) VALUES ('changing-grant', 'zai:known:7d', 'zai', 'known', 0, 0, ?, ?, 'active', 0, ?)`,
+      NOW - HOUR, NOW + 12 * HOUR, NOW);
+      sql.exec(`INSERT INTO tbm_banked_tranches (
+        tranche_id, pool_id, provider, account, allocated_tokens, remaining_tokens,
+        granted_at_ms, expires_at_ms, status, quantity_known, updated_at_ms
+      ) VALUES ('earlier-known', 'zai:known:7d', 'zai', 'known', 100000, 100000, ?, ?, 'active', 1, ?)`,
+      NOW - HOUR, NOW + 10 * HOUR, NOW);
+
+      expect(tickTbm(sql, NOW).routing_factors['zai:known']?.banked).toBe(4);
+      const unknown = sql.exec("SELECT remaining_tokens, target_banked_burn_rate_tpm, quantity_known FROM tbm_banked_tranches WHERE tranche_id = 'changing-grant'").one() as any;
+      expect(unknown).toMatchObject({ remaining_tokens: 0, target_banked_burn_rate_tpm: 0, quantity_known: 0 });
+
+      sql.exec("UPDATE tbm_banked_tranches SET quantity_known = 1, allocated_tokens = 100, remaining_tokens = 10 WHERE tranche_id = 'changing-grant'");
+      expect(tickTbm(sql, NOW + MIN).routing_factors['zai:known']?.banked).toBe(1);
+      const known = sql.exec("SELECT remaining_tokens, target_banked_burn_rate_tpm, quantity_known FROM tbm_banked_tranches WHERE tranche_id = 'changing-grant'").one() as any;
+      expect(known.remaining_tokens).toBe(10);
+      expect(known.quantity_known).toBe(1);
+      expect(known.target_banked_burn_rate_tpm).toBeCloseTo(10 / (12 * 60 - 1));
+    });
+  });
+
   it('persists PID state across tickTbm calls, captures pre-reset leftover via trigger when ingestion advances reset_at_ms, and settles banked expiry penalties', async () => {
     await inDO(stub('tbm-ctrl-1'), async (h: Hub) => {
       const sql = h.sql;

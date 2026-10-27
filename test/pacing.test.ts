@@ -7,7 +7,7 @@ import { modelCandidates, policy } from '../src/model-routing';
 import {
   bankedUrgencyMultiplier, baseTargetTpm, edfOrder, grokDemotion, hardFloorTokens, loadProviderPacing, netHeadroom,
   newPidState, pacingAlignment, pacingStep, providerPacing, providerPreference, refreshPacing, resetUrgency, routeScore,
-  selectBurnSource, softReserveTokens, taskFit, type PidState, type TbmPoolRow, type TbmTrancheRow,
+  selectBurnSource, softReserveTokens, taskFit, trancheUrgencyTpm, type PidState, type TbmPoolRow, type TbmTrancheRow,
 } from '../src/pacing';
 
 const H = 3600000; const MIN = 60000; const NOW = Date.UTC(2026, 9, 22, 12);
@@ -104,9 +104,81 @@ describe('banked EDF arbiter', () => {
     expect(selectBurnSource(pool(), [tranche('a', 12, 5_000_000)], NOW)!.source).toBe('primary');
     expect(selectBurnSource(pool(), [tranche('a', 12, 9_000_000)], NOW)!.source).toBe('banked');
   });
+  it('gives unknown-size grants high bounded urgency throughout the urgent window without preempting early', () => {
+    for (const hours of [24, 23.99, 12, 4.01]) {
+      const unknown = tranche('unknown', hours, 0, { quantity_known: 0 });
+      const choice = selectBurnSource(pool(), [unknown], NOW)!;
+      expect(choice).toMatchObject({ source: 'banked', omega: 4, critical: false });
+      expect(unknown.remaining_tokens).toBe(0);
+    }
+    expect(selectBurnSource(pool(), [tranche('later', 24.01, 0, { quantity_known: 0 })], NOW)!.source).toBe('primary');
+    expect(selectBurnSource(pool(), [tranche('expired', 0, 0, { quantity_known: 0 })], NOW)!.source).toBe('primary');
+    expect(selectBurnSource(pool(), [tranche('critical', 4, 0, { quantity_known: 0 })], NOW))
+      .toMatchObject({ source: 'banked', omega: 4, critical: true });
+    expect(trancheUrgencyTpm(tranche('unknown-stale-value', 12, 1000, { quantity_known: 0 }), NOW)).toBe(0);
+  });
+  it('recomputes from real remaining quantity when an unknown grant becomes known', () => {
+    const grant = tranche('same-grant', 12, 0, { quantity_known: 0 });
+    expect(selectBurnSource(pool(), [grant], NOW)!.omega).toBe(4);
+    expect(selectBurnSource(pool(), [{ ...grant, quantity_known: 1, remaining_tokens: 10 }], NOW)!.source).toBe('primary');
+    const knownLarge = selectBurnSource(pool(), [{ ...grant, quantity_known: 1, remaining_tokens: 9_000_000 }], NOW)!;
+    expect(knownLarge.source).toBe('banked');
+    expect(knownLarge.omega).toBeCloseTo(1.75);
+    expect(selectBurnSource(pool(), [{ ...grant, quantity_known: 1, remaining_tokens: 0 }], NOW)!.source).toBe('primary');
+  });
+  it('keeps urgent unknown grants visible behind known EDF heads, including equal deadlines', () => {
+    const unknown = tranche('unknown', 12, 0, { quantity_known: 0 });
+    for (const [hours, remaining] of [[10, 100_000], [12, 10], [5, 100_000], [12, 9_000_000]] as const) {
+      const known = tranche('known', hours, remaining, { quantity_known: 1 });
+      for (const grants of [[known, unknown], [unknown, known]]) {
+        expect(selectBurnSource(pool(), grants, NOW)).toMatchObject({
+          source: 'banked', tranche: { tranche_id: 'known' }, omega: 4, critical: false,
+        });
+      }
+    }
+    const earlier = tranche('earlier', 10, 100_000, { quantity_known: 1 });
+    expect(selectBurnSource(pool(), [earlier, { ...unknown, quantity_known: 1, remaining_tokens: 10 }], NOW))
+      .toMatchObject({ source: 'primary', omega: 1 });
+    for (const inactive of [tranche('outside', 25, 0, { quantity_known: 0 }),
+      tranche('expired', 0, 0, { quantity_known: 0 }),
+      tranche('exhausted', 12, 0, { quantity_known: 0, status: 'exhausted' })]) {
+      expect(selectBurnSource(pool(), [earlier, inactive], NOW)).toMatchObject({ source: 'primary', omega: 1 });
+    }
+  });
+  it('preserves the weights of other grants and the safety floors while boosting an unknown grant', () => {
+    const p = pool({ target_burn_rate_tpm: 1000 });
+    const other = pool({ pool_id: 'codex:other', provider: 'codex', account: 'other', target_burn_rate_tpm: 1000 });
+    const baseline = providerPacing([p, other], [], NOW).get('codex:other');
+    const boosted = providerPacing([p, other], [tranche('unknown', 20, 0, { quantity_known: false })], NOW);
+    expect(boosted.get('zai:default')).toMatchObject({ banked: 4, preempt: false, halted: false });
+    expect(boosted.get('codex:other')).toEqual(baseline);
+    expect(boosted.get('codex:other')!.pacing * boosted.get('codex:other')!.banked).toBeGreaterThan(0);
+    expect(selectBurnSource(pool({ kill_switch_active: 1 }), [tranche('unknown', 20, 0, { quantity_known: 0 })], NOW)).toBeNull();
+    expect(selectBurnSource(pool({ remaining_tokens: 400_000 }), [tranche('unknown', 20, 0, { quantity_known: 0 })], NOW)).toBeNull();
+  });
   it('never treats banked as a substitute for primary reserves', () => {
     expect(selectBurnSource(pool({ remaining_tokens: 400_000 }), [tranche('a', 1)], NOW)).toBeNull();
     expect(selectBurnSource(pool({ kill_switch_active: 1 }), [tranche('a', 1)], NOW)).toBeNull();
+  });
+  it('isolates halted accounts in provider fallback without losing healthy critical grants', () => {
+    const healthy = pool({ pool_id: 'zai:b:7d', account: 'b' });
+    const longA = pool({ pool_id: 'zai:a:7d', account: 'a' });
+    const blockedCases = [
+      [longA, pool({ pool_id: 'zai:a:5h', account: 'a', remaining_tokens: 400_000 })],
+      [pool({ ...longA, remaining_tokens: 1_200_000, reset_at_ms: NOW + 168 * H, cycle_ms: 168 * H })],
+    ];
+    const grantA = tranche('grant-a', 12, 0, { pool_id: longA.pool_id, account: 'a', quantity_known: 0 });
+    const grantB = tranche('grant-b', 2, 0, { pool_id: healthy.pool_id, account: 'b', quantity_known: 0 });
+    for (const blocked of blockedCases) {
+      const neutral = providerPacing([...blocked, healthy], [grantA], NOW, { enforceFloors: true });
+      expect(neutral.get('zai:a')).toMatchObject({ halted: true, banked: 1, preempt: false });
+      expect(neutral.get('zai')).toMatchObject({ halted: false, banked: 1, preempt: false });
+      const critical = providerPacing([...blocked, healthy], [grantA, grantB], NOW, { enforceFloors: true });
+      expect(critical.get('zai:b')).toMatchObject({ halted: false, banked: 4, preempt: true });
+      expect(critical.get('zai')).toMatchObject({ halted: false, banked: 4, preempt: true });
+    }
+    const killed = providerPacing([pool({ ...longA, kill_switch_active: 1 }), healthy], [grantA, grantB], NOW, { enforceFloors: true });
+    expect(killed.get('zai')).toMatchObject({ halted: true, banked: 1, preempt: false });
   });
 });
 
