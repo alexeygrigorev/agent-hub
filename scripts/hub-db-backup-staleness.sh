@@ -33,6 +33,12 @@ STALE_AFTER_HOURS="${STALE_AFTER_HOURS:-36}"
 ALERT_TO="${ALERT_TO:-alexey@datatalks.club,dev@dtcdev.click}"
 ALERT_FROM="${ALERT_FROM:-noreply@datatalks.club}"
 ALERT_REPEAT_HOURS="${ALERT_REPEAT_HOURS:-24}"
+# msmtp account for the working alerts path on this box. The default msmtp
+# account cannot send as ALERT_FROM (SES 554 on the sandbox identity), while
+# the 'ses' account demonstrably delivers noreply@datatalks.club to the
+# exact ALERT_TO recipients (see msmtp log 250 Ok). Plain msmtp (default
+# account) remains the fallback.
+MSMTP_ACCOUNT="${MSMTP_ACCOUNT:-ses}"
 STATE_DIR="${STATE_DIR:-/var/lib/hub-db-backup}"
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -132,10 +138,18 @@ send_mail() {
       echo "Subject: ${subject}"
       echo ""
       printf '%s\n' "$body"
+    } | msmtp -a "${MSMTP_ACCOUNT}" -- "${to_args[@]}" 2>/dev/null; then
+      sent="msmtp:${MSMTP_ACCOUNT}"
+    elif {
+      echo "From: ${ALERT_FROM}"
+      echo "To: ${ALERT_TO}"
+      echo "Subject: ${subject}"
+      echo ""
+      printf '%s\n' "$body"
     } | msmtp -- "${to_args[@]}" 2>/dev/null; then
-      sent="msmtp"
+      sent="msmtp:default"
     else
-      log "WARN: msmtp failed"
+      log "WARN: msmtp failed (account ${MSMTP_ACCOUNT} and default)"
     fi
   fi
   if [[ -z "$sent" ]]; then

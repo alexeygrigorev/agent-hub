@@ -99,7 +99,11 @@ both trees decides; missing dir or zero exports counts as stale.
 - Stale (age > 36h): exit 2, mails
   `To: alexey@datatalks.club,dev@dtcdev.click` via sendmail-first/msmtp-fallback
   (same order as `machine-management/monitors/coolify-healthcheck.sh`),
-  `From: noreply@datatalks.club`. Repeat pages deduped to one per 24h.
+  `From: noreply@datatalks.club`. On the Hetzner box the mail goes out via
+  the msmtp `ses` account first (`MSMTP_ACCOUNT`, default account as
+  fallback): the default account's sandbox identity is SES-denied for
+  `noreply@datatalks.club` (554), while `ses` delivers it (250 Ok in the
+  msmtp log). Repeat pages deduped to one per 24h.
 
 Manual tests (no real mail):
 
