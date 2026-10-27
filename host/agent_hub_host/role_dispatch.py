@@ -1687,7 +1687,8 @@ def validate_native_workload_pid(
         return False, "missing_or_invalid_session_created_at_ms"
     sess_start = created_ms / 1000.0
 
-    # Clock precision: kernel btime has 1s resolution, so allow at most 1.0s difference
+    # Clock precision: provenance timestamps carry reading jitter well under 0.1s,
+    # so the 1.0s difference allowance is genuine tolerance, not truncation compensation
     if proc_start < sess_start - 1.0:
         return False, f"stale_pid_started_before_session ({proc_start} < {sess_start})"
     if started_wall is not None and proc_start < started_wall - 1.0:

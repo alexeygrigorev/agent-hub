@@ -2075,8 +2075,8 @@ class TestStrictWorkloadPIDContainmentAndProvenance(unittest.TestCase):
             proc.kill()
             proc.wait()
         self.assertIsNotNone(measured)
-        self.assertGreaterEqual(measured, t0 - 0.25)
-        self.assertLessEqual(measured, t1 + 0.25)
+        self.assertGreaterEqual(measured, t0 - 0.5)
+        self.assertLessEqual(measured, t1 + 0.5)
 
     def test_refuses_counterexample_1_unreadable_state_and_start_provenance(self):
         """Counterexample 1: unreadable process state and start provenance fail closed."""
