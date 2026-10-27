@@ -1443,6 +1443,37 @@ class CpuThrottleTests(unittest.TestCase):
             self.assertTrue(out.get("ok"))
             self.assertEqual([t for p in calls2["reports"] for t in p.get("throttles", [])], [])
 
+    def test_throttle_never_applies_to_unmanaged_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = str(Path(tmp) / "journal")
+            Path(journal).mkdir(mode=0o700)
+            cg = self._cgroup(tmp)
+            unmanaged = self._entry(managed=False)
+            self._cycle(10_000_000, self._sample(cg, 100.0), journal, entries=[unmanaged])
+            _, calls = self._cycle(10_031_000, self._sample(cg, 199.0), journal, entries=[unmanaged])
+            receipts = [t for p in calls["reports"] for t in p.get("throttles", [])]
+            self.assertEqual(receipts, [])
+            self.assertEqual((cg / "cpu.max").read_text().strip(), "max 100000")
+
+    def test_keep_protection_lifts_throttle_immediately_at_ceiling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = str(Path(tmp) / "journal")
+            Path(journal).mkdir(mode=0o700)
+            cg = self._cgroup(tmp)
+            self._cycle(10_000_000, self._sample(cg, 100.0), journal)
+            self._cycle(10_031_000, self._sample(cg, 199.0), journal)
+            self.assertEqual((cg / "cpu.max").read_text().strip(), "2000000 100000")
+            # Protection gained while pinned at the throttled ceiling: the
+            # cap is lifted at once, not held until usage drops.
+            protected = self._entry(keep=True)
+            _, calls = self._cycle(10_062_000, self._sample(cg, 261.0), journal, entries=[protected])
+            receipts = [t for p in calls["reports"] for t in p.get("throttles", [])]
+            self.assertEqual([r["action"] for r in receipts], ["released"])
+            self.assertEqual((cg / "cpu.max").read_text().strip(), "max 100000")
+            # And a protected session is never re-throttled.
+            _, calls2 = self._cycle(10_093_000, self._sample(cg, 323.0), journal, entries=[protected])
+            self.assertEqual([t for p in calls2["reports"] for t in p.get("throttles", [])], [])
+
     def test_terminal_session_releases_throttle(self):
         with tempfile.TemporaryDirectory() as tmp:
             journal = str(Path(tmp) / "journal")

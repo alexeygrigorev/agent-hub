@@ -305,6 +305,20 @@ describe('resource management',()=>{
   // Idempotent replay and binding/payload validation.
   r.report('host',{samples:[],reaps:[],throttles:[released]});
   expect(r.throttles()).toHaveLength(2);
+  // Re-throttle after release: exactly ONE active row (the newest), the
+  // overview count never inflates across the native's receipt history.
+  const rethrottled={...throttled,id:'cpu-throttle:session:native:throttled:3',at:iso(2000)};
+  r.report('host',{samples:[],reaps:[],throttles:[rethrottled]});
+  const rows3=r.throttles();
+  expect(rows3).toHaveLength(3);
+  expect(rows3.filter((t:any)=>t.active)).toHaveLength(1);
+  expect(rows3[0]).toMatchObject({id:'cpu-throttle:session:native:throttled:3',action:'throttled',active:true});
+  expect(rows3.find((t:any)=>t.id==='cpu-throttle:session:native:released:2')!.active).toBe(false);
+  expect(r.overview().active_throttles).toBe(1);
+  expect(r.usage()[0].cpu_throttled).toBe(true);
+  // Envelope validation: a non-array throttles payload is refused as a whole.
+  expect(()=>r.report('host',{samples:[],reaps:[],throttles:5})).toThrow('invalid_resource_report');
+  expect(()=>r.report('host',{samples:[],reaps:[],throttles:[{...throttled,session_id:'nope',id:'cross-native'}]})).toThrow('resource_binding_mismatch');
   expect(()=>r.report('host',{samples:[],reaps:[],throttles:[{...throttled,id:'spaces not allowed'}]})).toThrow('invalid_throttle');
   expect(()=>r.report('host',{samples:[],reaps:[],throttles:[{...throttled,action:'killed'}]})).toThrow('invalid_throttle');
   expect(()=>r.report('host',{samples:[],reaps:[],throttles:[{...throttled,session_id:'other'}]})).toThrow('resource_binding_mismatch');

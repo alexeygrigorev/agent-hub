@@ -791,10 +791,11 @@ def evaluate_cpu_throttle(
 ) -> list[dict[str, Any]]:
     """One reversible cpu.max throttle decision for a sampled session.
 
-    Applies the throttle only to a live, non-keep session with a dedicated
-    workload cgroup whose measured current CPU stayed above the configured
-    cap for the configured sustain window. Releases when usage falls below
-    the cap hysteresis. The only side effect is a verified cpu.max write on
+    Applies the throttle only to a live, managed, non-keep session with a
+    dedicated workload cgroup whose measured current CPU stayed above the
+    configured cap for the configured sustain window. Releases when usage
+    falls below the cap hysteresis, protection changes, or the session
+    finishes. The only side effect is a verified cpu.max write on
     that session's own scope; no process is ever stopped or signaled.
     Returns the receipts for actions taken this sample.
     """
@@ -812,9 +813,12 @@ def evaluate_cpu_throttle(
     current = _finite_number(peak.get("current_cpu_cores"))
     cgroup = measured.get("cgroup_path") if isinstance(measured, dict) else None
     if throttle is not None:
-        # Keep-marked sessions are never re-throttled, but an existing cap
-        # is still lifted so protection is restored in full.
-        if current is not None and current < cap * CPU_THROTTLE_RELEASE_RATIO:
+        # Protection wins immediately at ANY usage level: a session that
+        # gained the keep marker (or was never managed) has its saved
+        # cpu.max restored even while pinned at the throttled ceiling,
+        # otherwise the cap would outlive its authority.
+        if (entry.get("keep") is True or entry.get("managed") is not True
+                or (current is not None and current < cap * CPU_THROTTLE_RELEASE_RATIO)):
             prior_throttle = _release_throttle_state(peak)
             if prior_throttle is not None:
                 detail = _restore_cpu_max(prior_throttle)
@@ -822,7 +826,9 @@ def evaluate_cpu_throttle(
                     sid, nid, "released", entry.get("native_created_at_ms"), now_ms, observed_at,
                     {"cap_cores": cap, "sustain_s": config.get("cpu_throttle_sustain_s"), **detail}))
         return receipts
-    if entry.get("keep") is True:
+    if entry.get("keep") is True or entry.get("managed") is not True:
+        peak.pop("cpu_over_ms", None)
+        peak.pop("cpu_over_last_ms", None)
         return receipts
     if current is None or not isinstance(cgroup, str) or not cgroup:
         peak.pop("cpu_over_ms", None)
@@ -1415,16 +1421,18 @@ def run_watchdog_cycle(
         throttle_map = state.get("throttle_reports")
         if not isinstance(throttle_map, dict):
             throttle_map = state["throttle_reports"] = {}
+        # Journal fresh receipts BEFORE the pre-report save (crash between a
+        # persisted cpu.max apply and the report must still replay them).
+        for fresh_throttle in throttles:
+            if isinstance(fresh_throttle.get("id"), str) and fresh_throttle["id"] not in throttle_map:
+                if len(throttle_map) < MAX_THROTTLE_RECEIPTS or fresh_throttle["id"] in throttle_map:
+                    throttle_map[fresh_throttle["id"]] = fresh_throttle
         merged_throttles: list[dict[str, Any]] = []
         throttle_ids: set[str] = set()
         for cached in list(throttle_map.values()):
             if isinstance(cached, dict) and isinstance(cached.get("id"), str) and cached["id"] not in throttle_ids:
                 throttle_ids.add(cached["id"])
                 merged_throttles.append(cached)
-        for fresh_throttle in throttles:
-            if fresh_throttle["id"] not in throttle_ids:
-                throttle_ids.add(fresh_throttle["id"])
-                merged_throttles.append(fresh_throttle)
         acked: set[str] = set()
         throttles_acked: set[str] = set()
         report_error: Optional[str] = None
@@ -1455,10 +1463,6 @@ def run_watchdog_cycle(
             if fresh_reap["id"] not in acked:
                 if fresh_reap["id"] in reported_map or len(reported_map) < MAX_REPORTED_ENTRIES:
                     reported_map[fresh_reap["id"]] = fresh_reap
-        for fresh_throttle in throttles:
-            if fresh_throttle["id"] not in throttles_acked:
-                if fresh_throttle["id"] in throttle_map or len(throttle_map) < MAX_THROTTLE_RECEIPTS:
-                    throttle_map[fresh_throttle["id"]] = fresh_throttle
         if journal_ready:
             save_state(journal_dir, state)
         summary.update({"samples": len(samples), "reaps": len(reaps), "throttles": len(throttles)})

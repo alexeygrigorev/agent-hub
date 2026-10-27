@@ -470,7 +470,8 @@ export class ResourceManagement {
     // Accept reports already in flight under an older canonical alias, but put
     // every physical native in exactly one durable ledger row.
     const sessions = new Map(this.canonicalSessions(machine).flatMap(s => s.aliases.map(id=>[id,s] as const)));
-    if (!value || !Array.isArray(value.samples) || !Array.isArray(value.reaps) || value.samples.length>200 || value.reaps.length>100) throw new Error('invalid_resource_report');
+    if (!value || !Array.isArray(value.samples) || !Array.isArray(value.reaps) || value.samples.length>200 || value.reaps.length>100
+      || (value.throttles !== undefined && (!Array.isArray(value.throttles) || value.throttles.length>100))) throw new Error('invalid_resource_report');
     for (const sample of value.samples) {
       const session = sessions.get(sample.session_id);
       if (!session || sample.native_id!==session.native_id) throw new Error('resource_binding_mismatch');
@@ -541,7 +542,7 @@ export class ResourceManagement {
       const at=Date.parse(throttle.at);
       if (!Number.isFinite(at) || at>this.now()+30000 || at<this.now()-86400000) throw new Error('invalid_resource_timestamp');
       const prior:any=this.sql.exec('SELECT * FROM resource_throttles WHERE id=?',throttle.id).toArray()[0];
-      if (prior) { if(prior.session_id!==tsession.session_id || prior.action!==throttle.action) throw new Error('throttle_conflict'); continue; }
+      if (prior) { if(prior.session_id!==tsession.session_id || prior.native_id!==tsession.native_id || prior.machine_id!==machine || prior.action!==throttle.action) throw new Error('throttle_conflict'); continue; }
       this.sql.exec('INSERT INTO resource_throttles VALUES(?,?,?,?,?,?,?,?,?,?,?)',throttle.id,tsession.session_id,machine,tsession.native_id,tsession.intake_id,throttle.action,throttle.cap_cores ?? null,throttle.sustain_s ?? null,throttle.cpu_max ?? null,throttle.outcome ?? null,throttle.at);
       if (tsession.intake_id) {
         const text = throttle.action==='throttled'
@@ -557,19 +558,24 @@ export class ResourceManagement {
     const clauses:string[]=[], args:string[]=[];
     for (const k of ['project','engine','kind']) if(filters[k]) { clauses.push(k+'=?');args.push(filters[k]); }
     const latestThrottle=new Map<string,string>();
-    for (const r of this.sql.exec('SELECT machine_id,native_id,action FROM resource_throttles ORDER BY at ASC LIMIT 1000').toArray() as any[])
-      latestThrottle.set(r.machine_id+':'+r.native_id,r.action);
+    for (const r of this.sql.exec('SELECT machine_id,native_id,action FROM resource_throttles ORDER BY at DESC, rowid DESC LIMIT 1000').toArray() as any[]) {
+      const key=r.machine_id+':'+r.native_id;
+      if (!latestThrottle.has(key)) latestThrottle.set(key,r.action);
+    }
     return this.sql.exec('SELECT * FROM session_resource_usage'+(clauses.length?' WHERE '+clauses.join(' AND '):'')+' ORDER BY observed_at DESC LIMIT 500',...args).toArray().map((r:any)=>({...r,started_at:r.started_at || null,workspace:this.sql.exec('SELECT workspace FROM session_resource_metadata WHERE session_id=?',r.session_id).toArray()[0]?.workspace ?? null,p95_cpu_cores:this.sql.exec('SELECT p95_cpu_cores FROM session_cpu_usage WHERE session_id=?',r.session_id).toArray()[0]?.p95_cpu_cores ?? null,rss_flagged:r.peak_rss_mb>=this.config().rss_flag_gb*1024,token_join_key:r.machine_id+':'+r.native_id,cpu_throttled:latestThrottle.get(r.machine_id+':'+r.native_id)==='throttled'}));
   }
   reaps() { return this.sql.exec('SELECT * FROM resource_reaps ORDER BY at DESC LIMIT 100').toArray(); }
   throttles() {
-    const rows=this.sql.exec('SELECT * FROM resource_throttles ORDER BY at DESC LIMIT 100').toArray();
-    // Latest action per physical native decides the active flag: a release
-    // newer than the last apply means the cap is lifted.
-    const latest=new Map<string,string>();
-    for (const r of this.sql.exec('SELECT machine_id,native_id,action,at FROM resource_throttles ORDER BY at ASC LIMIT 1000').toArray() as any[])
-      latest.set(r.machine_id+':'+r.native_id,r.action);
-    return rows.map((r:any)=>({...r,active:latest.get(r.machine_id+':'+r.native_id)==='throttled'}));
+    const rows=this.sql.exec('SELECT * FROM resource_throttles ORDER BY at DESC, rowid DESC LIMIT 100').toArray();
+    // Newest receipt per physical native decides the active flag, and only
+    // that single row may carry it: a released row is never ACTIVE even
+    // when a newer throttled row exists for the same native.
+    const latest=new Map<string,any>();
+    for (const r of this.sql.exec('SELECT id,machine_id,native_id,action FROM resource_throttles ORDER BY at DESC, rowid DESC LIMIT 1000').toArray() as any[]) {
+      const key=r.machine_id+':'+r.native_id;
+      if (!latest.has(key)) latest.set(key,r);
+    }
+    return rows.map((r:any)=>({...r,active:latest.get(r.machine_id+':'+r.native_id)?.id===r.id && r.action==='throttled'}));
   }
   overview() {
     const rows=this.sql.exec('SELECT id,hostname,drained,capabilities,last_heartbeat,last_checkin_at FROM machines WHERE drained=0').toArray() as any[];

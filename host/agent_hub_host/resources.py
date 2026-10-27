@@ -226,7 +226,7 @@ def render_text(data: dict, view=None) -> str:
                 row.get("session_id", "?"), row.get("action", "?"), cap,
                 row.get("cpu_max", "?"), row.get("outcome", "?"), row.get("at", "?"),
                 row.get("intake_id", "?"), " ACTIVE" if row.get("active") else ""))
-        return "\n".join(lines) if lines else "No reaps reported."
+        return "\n".join(lines) if lines else "No CPU throttles reported."
     config = data.get("config") if isinstance(data.get("config"), dict) else {}
     hosts = data.get("hosts") if isinstance(data.get("hosts"), list) else []
     reaps = data.get("reaps") if isinstance(data.get("reaps"), list) else []
