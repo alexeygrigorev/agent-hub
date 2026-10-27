@@ -168,6 +168,59 @@ class TerminalReportsTests(unittest.TestCase):
             self.d._persist_launch_record(stale)
         self.assertEqual(self.read(), settled)
 
+    def test_real_health_stop_producer_waits_for_release_then_replays_full_runtime(self):
+        from agent_hub_host import headless_health
+        self.health.stop()
+        self.result.unlink()
+        doc = dict(id=self.native, tag=self.record['tag'], workspace=str(self.ws),
+                   engine='opencode', created_at_ms=self.record['incarnation'])
+        (self.ws / '.local' / ('launch-' + self.record['task_id'] + '-start.json')).write_text(json.dumps(doc))
+        def request(method, path, payload):
+            if path == '/api/fleet/probe':
+                return dict(status='unavailable')
+            self.posts.append(copy.deepcopy(payload))
+            return dict(id=self.offer, state=payload['state'])
+        self.d.request = request
+        with patch.object(headless_health, 'inspect', return_value=headless_health.failure()), \
+             patch('agent_hub_host.native_sessions.stop_session', return_value=SimpleNamespace(state='stopped')) as stop:
+            out = self.d._check_headless_health(self.offer, self.record['task_id'], str(self.ws), 'opencode')
+            self.assertEqual(out['state'], 'uncertain')
+            self.assertNotIn('confirmed_exit', self.posts[0])
+            self.assertFalse(self.read()['settled'])
+            self.assertTrue(self.read()['health_stop_confirmed'])
+            with patch('agent_hub_host.fleet.verify_native_retirement', return_value=(False, None, 'live children')):
+                self.assertEqual(terminal.poll(self.d), [])
+            self.runner.return_value['resources_reserved'] = True
+            self.assertEqual(terminal.poll(self.d), [])
+            self.assertEqual(len(self.posts), 1)
+            self.runner.return_value['resources_reserved'] = False
+            def wrong_ack(method, path, payload):
+                self.posts.append(copy.deepcopy(payload))
+                return dict(id='foreign', state=payload['state'])
+            self.d.request = wrong_ack
+            with patch('agent_hub_host.headless_output.retained', return_value=dict(capture_state='complete', log_tail='partial task progress')), \
+                 patch.object(Dispatcher, '_maybe_cleanup_worktree') as cleanup:
+                self.assertEqual(terminal.poll(self.d), [])
+                cleanup.assert_not_called()
+                self.assertIn('terminal_payload', self.read())
+                self.d.request = request
+                self.assertEqual(terminal.poll(self.d)[0]['state'], 'failed')
+                # Missing worker JSON keeps the bounded late-report window
+                # and its worktree even after the full failure ACK.
+                cleanup.assert_not_called()
+                self.assertTrue(self.read()['cleanup_pending'])
+                self.assertFalse(self.read()['worker_report_received'])
+            self.assertEqual(stop.call_count, 1)
+        self.assertEqual(self.posts[1], self.posts[2])
+        payload = self.posts[-1]
+        self.assertEqual(payload['report_status'], 'failed')
+        self.assertEqual(payload['diagnostic']['reason'], headless_health.REASON)
+        self.assertEqual(payload['runtime']['exit_code'], 0)
+        self.assertEqual(payload['runtime']['wall_time_ms'], 500)
+        self.assertEqual(payload['runtime']['outcome'], 'failed-with-partial-work')
+        self.assertIn('partial task progress', payload['runtime']['log_tail'])
+        self.assertTrue(self.read()['settled'])
+
     def test_all_worker_statuses_reach_terminal_delivery_with_runtime(self):
         for index, status in enumerate(('done', 'waiting-on-human', 'stuck', 'failed')):
             with self.subTest(status=status):

@@ -58,7 +58,7 @@ class HeadlessHealthTests(unittest.TestCase):
             path.unlink(); path.symlink_to(Path(tmp)/'foreign')
             with self.assertRaises(Exception): health.launch_target(tmp,TASK,'zcodex')
 
-    def test_guard_marks_failed_only_after_confirmed_owned_stop(self):
+    def test_guard_keeps_reservation_pending_full_terminal_reconciliation(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.setup_launch(tmp); requests=[]
             def request(method,path,body=None):
@@ -67,9 +67,10 @@ class HeadlessHealthTests(unittest.TestCase):
             with patch('agent_hub_host.headless_health.inspect',return_value=health.failure()), \
                  patch('agent_hub_host.native_sessions.stop_session',return_value=SimpleNamespace(state='stopped')) as stop:
                 result=d._check_headless_health(OID,TASK,tmp,'zcodex')
-            self.assertEqual(result['state'],'failed'); self.assertTrue(result['confirmed_exit'])
+            self.assertEqual(result['state'],'uncertain'); self.assertNotIn('confirmed_exit', result)
             self.assertEqual(result['native_id'],SID); self.assertEqual(stop.call_args.args[1].session_id,SID)
-            self.assertTrue(d._active_launches[OID]['settled'])
+            self.assertFalse(d._active_launches[OID]['settled'])
+            self.assertTrue(d._active_launches[OID]['health_stop_confirmed'])
             self.assertEqual(requests[0][1]['reason'],health.REASON)
             self.assertNotIn('private-value',str(requests))
 
@@ -105,8 +106,9 @@ class HeadlessHealthTests(unittest.TestCase):
             with patch('agent_hub_host.headless_health.inspect',return_value=health.failure()), \
                  patch('agent_hub_host.native_sessions.stop_session',return_value=SimpleNamespace(state='stopped')):
                 result=d.dispatch({'id':OID,'engine':'zcodex','account':'zai-test','profile':None,'mode':'headless','workspace':'demo','prompt':'perform work'})
-            self.assertEqual(result['state'],'failed'); self.assertEqual(result['reason'],health.REASON)
-            self.assertEqual(requests[-1][1]['state'],'failed')
+            self.assertEqual(result['state'],'uncertain'); self.assertEqual(result['reason'],health.REASON)
+            self.assertEqual(requests[-1][1]['state'],'uncertain')
+            self.assertNotIn('confirmed_exit', requests[-1][1])
 
     def test_journal_incarnation_cannot_be_replaced_by_new_start_receipt(self):
         with tempfile.TemporaryDirectory() as tmp:

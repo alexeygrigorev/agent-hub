@@ -1485,14 +1485,15 @@ class Dispatcher:
             if isinstance(oracle, dict):
                 record['health_stop_oracle'] = oracle
                 record['health_stop_kill'] = getattr(exc, 'kill', {})
-        payload = {'state': 'failed' if confirmed else 'uncertain', 'native_id': target.session_id,
-                   'launcher_task_id': task_id, 'diagnostic': diagnostic}
         if confirmed:
-            payload['confirmed_exit'] = True
-        ack = self.request('POST', '/api/fleet/launches/' + offer_id + '/result', payload)
-        if confirmed and isinstance(ack, dict) and ack.get('id') == offer_id and ack.get('state') == 'failed':
-            record['state'], record['settled'] = 'failed', True
+            # An owned health stop is not the maintained launcher's terminal
+            # resource receipt. Keep the journal pending so ordinary terminal
+            # reconciliation supplies runtime, partial work, outbox and ACK.
+            record['health_stop_confirmed'] = True
         self._persist_launch_record(record)
+        payload = {'state': 'uncertain', 'native_id': target.session_id,
+                   'launcher_task_id': task_id, 'diagnostic': diagnostic}
+        self.request('POST', '/api/fleet/launches/' + offer_id + '/result', payload)
         return {'id': offer_id, **payload, 'reason': diagnostic['reason']}
 
     def reconcile_launches(self, offer_ids=None, *, terminal_only=False) -> list[dict[str, Any]]:
@@ -1562,7 +1563,8 @@ class Dispatcher:
             except (SessionControlError, KeyError, ValueError, TypeError):
                 continue
 
-            if not terminal_only and not record.get('routing_task_id') and (time.time() - incarnation / 1000 < 600 or record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused'):
+            if (not terminal_only and not record.get('health_stop_confirmed')
+                    and not record.get('routing_task_id')) and (time.time() - incarnation / 1000 < 600 or record.get('diagnostic', {}).get('reason') == 'engine_tool_permission_refused'):
                 health = self._check_headless_health(offer_id, record['task_id'], record['workspace'], engine)
                 if health is not None:
                     reconciled.append(health)

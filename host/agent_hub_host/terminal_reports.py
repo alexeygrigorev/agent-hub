@@ -145,7 +145,7 @@ def _ready_hint(record, state_dir):
     from .late_reports import pending, needs_cleanup
     if record.get('settled') is True:
         return pending(record) or needs_cleanup(record)
-    if record.get('terminal_payload'):
+    if record.get('terminal_payload') or record.get('health_stop_confirmed') is True:
         return True
     workspace, offer_id = record.get('workspace'), record.get('offer_id')
     if not isinstance(workspace, str) or not Path(workspace).is_absolute():
