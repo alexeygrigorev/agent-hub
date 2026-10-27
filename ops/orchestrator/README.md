@@ -59,8 +59,11 @@ Pick a host with the Hub-validated resource floors, `a`, `claude`, `hub`, `gh` l
 
 ## Playbook: Grok Bot limits running out (AC13)
 Also a bot-skills skill: `grok-limits-playbook`.
+
+> **/loop is a STOPGAP (AC15).** The ops sessions must be engine-agnostic; `/loop` exists only in Claude Code. Hub scheduled prompts (`hub schedules create --session <label> --cron "0 * * * *" --prompt-file <f>`, intake 19ec91c2 AC8, built in a separate session) replace it. Switch when that lands: (1) create one schedule per session (`orchestrator-main`, `oncall-engineer`) whose prompt file is the existing `hourly-check.md`; (2) verify one scheduled prompt arrives and `latest.md` updates; (3) set `LOOP_INTERVAL=off` in the watchdog unit environment (`session-ctl.sh` then skips the `/loop` send) and cancel the in-session loop (`/loop` cancel or restart the session); (4) the watchdog stays, restarts re-attach to the same schedule by session label. The briefs and `hourly-check.md` are already scheduler-neutral, and the engine (`ORCH_ENGINE`) can then be any engine.
 1. **Signs**: Grok usage near the weekly budget (65% at mid-week on 2026-10-27), or Grok routines failing/refusing for quota.
 2. **Cut order** (cheapest to lose first): hourly Hub report -> pending research follow-ups -> Codex quota check -> open-intake drain -> dev mailbox wake (last, until the Hub webhook exists). Grok keeps only: forwarding Alexey's messages and alerts, relaying `NEEDS_ALEXEY.md`.
+3. **Scheduler note**: today `/loop` (Claude only) drives both sessions; it is a stopgap until Hub scheduled prompts replace it (see above).
 3. **Where each goes**: drain, Codex quota, Hub report, research follow-ups -> orchestrator-main. Alert/outage triage (dev@ mail, Coolify, Contabo-deadman, CloudWatch, CI) -> oncall-engineer.
 4. **Talk to them directly**: attach commands above; `orch-send` / `oncall-send` from a shell on Hetzner; Hub UI (hub.dtcdev.click) sessions list -> open the session.
 5. **Webhook**: the Hub webhook->session routing (separate intake) replaces the Dapier->Grok mailbox wake: alerts land as messages in oncall-engineer without Grok.

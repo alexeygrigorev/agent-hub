@@ -63,7 +63,8 @@ start() {
   prep_worktree || return 1
   [ -n "$(find_session)" ] && { log "already running: $(find_session)"; return 0; }
   date +%s > "$STATE/last_start"
-  a start --workspace "$RUNDIR/$SUB" --tag "$TAG" --engine "$ENGINE" \
+  # own transient scope so the session outlives the (oneshot) watchdog unit cgroup
+  systemd-run --user --scope --collect -q -- a start --workspace "$RUNDIR/$SUB" --tag "$TAG" --engine "$ENGINE" \
     --label "ops.role=$ROLE" --label "hub.intake=$INTAKE" >/dev/null || { log "a start failed"; return 1; }
   local id; id=$(find_session); [ -n "$id" ] || { log "session not found after start"; return 1; }
   log "started session $id; waiting for prompt"
@@ -75,6 +76,7 @@ start() {
     grep -q -E '❯|> $|for shortcuts' <<<"$s" && break
   done
   local prompt="/loop $LOOP_INTERVAL Run the $ROLE check: follow $RUNDIR/$SUB/hourly-check.md, starting with step 0 (skills sync, handoff, inbox)."
+  if [ "${LOOP_INTERVAL}" = off ]; then log "LOOP_INTERVAL=off: scheduler is Hub scheduled prompts; no /loop issued"; return 0; fi
   a send "$id" "$prompt" --enter >/dev/null; local rc=$?
   echo "$prompt" > "$STATE/loop_command"
   log "loop issued (send rc=$rc): $prompt"
