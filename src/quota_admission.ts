@@ -95,11 +95,11 @@ export function evaluateQuotaAdmission(input: QuotaAdmissionInput): QuotaAdmissi
     if (typeof pct === "boolean" || typeof pct !== "number" || !Number.isFinite(pct) || pct < 0 || pct > 100) {
       return fail("malformed");
     }
-    // Claude's unused five-hour window is explicitly 0% utilized with no
-    // active reset. Preserve that fact without inventing a reset timestamp.
+    // Claude and Z.ai's unused five-hour windows are explicitly 0% utilized with
+    // no active reset. Preserve that fact without inventing a reset timestamp.
     // A separate active, timed window is still required (normally weekly).
-    const inactiveClaude = provider === 'claude' && ['5h', 'five_hour'].includes(name) && pct === 100 && w.reset_at === null;
-    if (!inactiveClaude) {
+    const inactiveFiveHour = ['claude', 'zai'].includes(provider) && ['5h', 'five_hour'].includes(name) && pct === 100 && w.reset_at === null;
+    if (!inactiveFiveHour) {
       if (typeof w.reset_at !== "string") return fail("malformed");
       const resetMs = Date.parse(w.reset_at);
       if (!Number.isFinite(resetMs)) return fail("malformed");

@@ -384,7 +384,9 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
 
     const inactive = { present: true, percent_remaining: 100, reset_at: null };
     expect(evaluateQuotaAdmission({ ...good({ '5h': inactive, weekly: weekly(99) }), provider: 'claude' })).toMatchObject({ ok: true, remaining: 99 });
+    expect(evaluateQuotaAdmission({ ...good({ '5h': inactive, '7d': weekly(73) }), provider: 'zai' })).toMatchObject({ ok: true, remaining: 73 });
     expect(evaluateQuotaAdmission({ ...good({ '5h': { ...inactive, percent_remaining: 99 }, weekly: weekly(99) }), provider: 'claude' }).ok).toBe(false);
+    expect(evaluateQuotaAdmission({ ...good({ '5h': { ...inactive, percent_remaining: 99 }, '7d': weekly(73) }), provider: 'zai' }).ok).toBe(false);
     expect(evaluateQuotaAdmission(good({ '5h': inactive, weekly: weekly(99) })).ok).toBe(false);
     expect(evaluateQuotaAdmission({ ...good({ '5h': inactive }), provider: 'claude' }).ok).toBe(false);
     expect(evaluateQuotaAdmission({ ...good({ '5h': inactive, weekly: { ...weekly(99), reset_at: null } }), provider: 'claude' }).ok).toBe(false);

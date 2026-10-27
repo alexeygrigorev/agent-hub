@@ -59,8 +59,8 @@ def probe(payload, service, account, engine, runner=run_json):
             if type(remaining) not in (int, float) or not math.isfinite(remaining) or not reserve < remaining <= 100 or window.get('error'):
                 return result
             reset = window.get('reset_at')
-            inactive_claude = service == 'claude' and name in ('5h', 'five_hour') and remaining == 100 and reset is None
-            if not inactive_claude:
+            inactive_five_hour = service in ('claude', 'zai') and name in ('5h', 'five_hour') and remaining == 100 and reset is None
+            if not inactive_five_hour:
                 reset = dt.datetime.fromisoformat(reset.replace('Z', '+00:00'))
                 if reset.tzinfo is None or reset <= now:
                     return result

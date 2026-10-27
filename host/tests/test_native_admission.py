@@ -52,12 +52,14 @@ class NativeAdmissionTest(unittest.TestCase):
             configured_selection(sol, 'zcodex', 'zai')
 
     def test_unused_claude_short_window_requires_a_valid_timed_weekly_window(self):
-        payload = dict(account='shared-claude', engine='claude', mode='interactive')
-        quota = self.quota('claude')
-        quota['claude']['windows']['5h'].update(percent_remaining=100, reset_at=None)
-        self.assertTrue(admission.probe(payload, 'claude', 'shared-claude', 'claude', lambda _: quota)['launch_allowed'])
-        quota['claude']['windows']['5h']['percent_remaining'] = 99
-        self.assertFalse(admission.probe(payload, 'claude', 'shared-claude', 'claude', lambda _: quota)['launch_allowed'])
-        quota['claude']['windows']['5h']['percent_remaining'] = 100
-        quota['claude']['windows']['7d']['reset_at'] = None
-        self.assertFalse(admission.probe(payload, 'claude', 'shared-claude', 'claude', lambda _: quota)['launch_allowed'])
+        for service, account, engine in [('claude', 'shared-claude', 'claude'), ('zai', 'shared-zai', 'zcodex')]:
+            with self.subTest(service=service):
+                payload = dict(account=account, engine=engine, mode='interactive')
+                quota = self.quota(service)
+                quota[service]['windows']['5h'].update(percent_remaining=100, reset_at=None)
+                self.assertTrue(admission.probe(payload, service, account, engine, lambda _: quota)['launch_allowed'])
+                quota[service]['windows']['5h']['percent_remaining'] = 99
+                self.assertFalse(admission.probe(payload, service, account, engine, lambda _: quota)['launch_allowed'])
+                quota[service]['windows']['5h']['percent_remaining'] = 100
+                quota[service]['windows']['7d']['reset_at'] = None
+                self.assertFalse(admission.probe(payload, service, account, engine, lambda _: quota)['launch_allowed'])
