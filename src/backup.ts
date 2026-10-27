@@ -207,7 +207,13 @@ export class BackupService {
     return this.tx(() => {
       const names: string[] = [];
       const counts: Record<string, number> = {};
-      for (const t of this.userTables()) {
+      let tables: { name: string; sql: string }[];
+      try {
+        tables = this.userTables();
+      } catch (err) {
+        throw new ExportStageError('tables');
+      }
+      for (const t of tables) {
         const name = String(t.name);
         try {
           names.push(name);
