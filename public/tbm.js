@@ -277,6 +277,41 @@
     }
   }
 
+  async function renderGrok() {
+    const root = byId('tbm-grok');
+    if (!root) return;
+    root.replaceChildren();
+    try {
+      const policy = await apiGet('/api/fleet/routing/policy/grok');
+      root.append(el('p', `Saved preference: ${policy.mode}. Effective state: disabled. Grok is reserved for bots and unavailable for all Hub tasks.`));
+      const form = el('form');
+      const label = el('label', 'Saved Grok preference (cannot enable routing)');
+      const select = el('select', null, 'dk-select'); select.id = 'tbm-grok-mode'; label.htmlFor = select.id;
+      for (const mode of ['minimal', 'disabled', 'normal']) {
+        const option = el('option', mode); option.value = mode; option.selected = policy.mode === mode; select.append(option);
+      }
+      const reasonLabel = el('label', 'Reason for change');
+      const reason = el('input', null, 'dk-input'); reason.id = 'tbm-grok-reason'; reasonLabel.htmlFor = reason.id;
+      reason.required = true; reason.maxLength = 500;
+      const save = el('button', 'Save Grok preference', 'dk-button'); save.type = 'submit';
+      const status = el('p'); status.setAttribute('role', 'status');
+      form.append(label, select, reasonLabel, reason, save, status);
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault(); save.disabled = true;
+        try {
+          await apiPost('/api/fleet/routing/policy/grok', { mode: select.value, reason: reason.value });
+          await renderGrok();
+        } catch (e) {
+          status.textContent = e.code === 'access_denied' ? 'Only an operator can change Grok preference.' : 'Could not save Grok preference.';
+          save.disabled = false;
+        }
+      });
+      root.append(form);
+    } catch (e) {
+      root.append(el('p', e.code === 'access_denied' ? 'Grok policy access denied.' : 'Grok policy unavailable.'));
+    }
+  }
+
   async function refresh() {
     const status = byId('tbm-status');
     try {
@@ -291,6 +326,7 @@
       renderPacing(pacing, pacing.routing_factors);
       renderBanked(banked);
       renderKill(kill);
+      await renderGrok();
       if (status) status.textContent = `TBM · ${user} · as of ${pacing.as_of || banked.as_of || 'unknown'}`;
     } catch (e) {
       if (e && e.code === 'expired') { location.assign('/auth/login'); return; }

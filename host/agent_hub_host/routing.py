@@ -23,7 +23,12 @@ def add_commands(sub):
     submit.add_argument('--machine', dest='preferred_machine')
     submit.add_argument('--key', help='Reuse this idempotency key for safe retries')
     sub.add_parser('routing-machines', help='List capability advertisements, model routes and host health')
-    sub.add_parser('model-policy', help='Show configured tiers, aliases and routing policy')
+    policy = sub.add_parser('model-policy', help='Show routing policy or save Grok preference (global policy keeps routing disabled)')
+    policy.add_argument('provider', nargs='?', choices=['grok'])
+    policy.add_argument('action', nargs='?', choices=['set'])
+    policy.add_argument('mode', nargs='?', choices=['minimal', 'disabled', 'normal'])
+    policy.add_argument('--reason')
+    policy.add_argument('--json', action='store_true')
     release = sub.add_parser('host-release', help='Operator: pin the exact main commit a checkout-installed host updates itself to')
     release.add_argument('--machine', required=True, help='Machine id')
     target = release.add_mutually_exclusive_group(required=True)
@@ -73,6 +78,17 @@ def execute(args):
             if getattr(args, key):
                 payload[key] = getattr(args, key)
         return bus._do_request('POST', '/api/fleet/tasks', payload)
+    if args.cmd == 'model-policy' and args.provider:
+        path = '/api/fleet/routing/policy/grok'
+        if args.action == 'set':
+            if not args.mode or not args.reason or not args.reason.strip():
+                raise ValueError('Setting Grok policy requires mode and --reason TEXT')
+            return bus._do_request('POST', path, {'mode': args.mode, 'reason': args.reason})
+        if args.mode or args.reason:
+            raise ValueError('Use grok set MODE --reason TEXT')
+        return bus._do_request('GET', path)
+    if args.cmd == 'model-policy' and (args.action or args.mode or args.reason):
+        raise ValueError('Use model-policy grok set MODE --reason TEXT')
     if args.cmd in ('routing-machines', 'model-policy'):
         return bus._do_request('GET', '/api/fleet/routing/' + ('machines' if args.cmd == 'routing-machines' else 'policy'))
     if args.cmd == 'host-release':

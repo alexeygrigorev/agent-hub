@@ -2,6 +2,7 @@ import { sanitizeExitEvidence, redactExitText } from './exit-evidence';
 /** Durable client task queue layered over the existing quota-aware fleet launcher. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { modelCandidates, taskTier, policy, modelDisabledByPolicy } from './model-routing';
+import { readGrokPolicy, grokMode } from './grok-policy';
 import { evaluateLaunchQuota } from './quota_admission';
 import { canonicalQuotaProvider } from './quota';
 import { loadProviderPacing } from './pacing';
@@ -238,7 +239,23 @@ export class RoutingService {
       const releases = new Map((this.sql.exec('SELECT * FROM host_release_targets').toArray() as any[]).map(r => [r.machine_id, { desired_sha: r.sha ?? null, current_sha: r.current_sha ?? null, state: r.state ?? null, error: r.error ?? null, reported_at: r.reported_at ?? null, set_at: r.set_at ?? null }]));
       return reply({ machines: (this.sql.exec('SELECT r.*, m.hostname, m.os, m.arch, m.capabilities, m.last_heartbeat, m.last_checkin_at, m.drained FROM routing_machines r JOIN machines m ON m.id = r.machine_id').toArray() as any[]).map(m => ({ id: m.machine_id, host_release: releases.get(m.machine_id) ?? null, hostname: m.hostname, os: m.os ?? '', arch: (m as any).arch ?? '', needs: JSON.parse(m.needs_json), max_agents: m.max_agents, capabilities: JSON.parse(m.capabilities), runners: JSON.parse(m.runners_json).map((rn: any) => ({ ...rn, ...runnerHealth(healthRowsFor(unavailableRows, rn.engine, m.machine_id), this.now()) })), resources: ((hb: any) => ({ mem_avail_mb: hb.mem_avail_mb ?? null, disk_free_gb: hb.disk_free_gb ?? null }))(JSON.parse(m.last_heartbeat || '{}')), online: !m.drained && this.now() - Date.parse(m.observed_at) <= 180000 && this.now() - Date.parse(effectiveCheckin(m.machine_id, m.last_checkin_at) || '') <= 180000 })) });
     }
-    if (path === '/api/routing/policy' && request.method === 'GET' && (admin || client)) return reply(policy);
+    if (path === '/api/routing/policy/grok') {
+      if (!admin && !client) return reply({ error: 'forbidden' }, 403);
+      if (request.method === 'GET') return reply(readGrokPolicy(this.sql));
+      if (request.method !== 'POST') return reply({ error: 'method_not_allowed' }, 405);
+      if (!admin) return reply({ error: 'forbidden' }, 403);
+      const data = await jsonBody(request);
+      if (!obj(data, ['mode', 'reason']) || !grokMode(data.mode) || typeof data.reason !== 'string' || !data.reason.trim() || data.reason.length > 500) return reply({ error: 'invalid_grok_policy' }, 400);
+      const reason = redact(data.reason.trim());
+      return this.transaction(() => {
+        const previous = readGrokPolicy(this.sql);
+        const actor = caller.actor || 'admin'; const at = this.at();
+        this.sql.exec('INSERT INTO grok_policy_audit VALUES (?, ?, ?, ?, ?, ?)', crypto.randomUUID(), previous.mode, data.mode, reason, actor, at);
+        this.sql.exec('INSERT OR REPLACE INTO grok_policy VALUES (1, ?, ?, ?, ?)', data.mode, reason, actor, at);
+        return reply(readGrokPolicy(this.sql));
+      });
+    }
+    if (path === '/api/routing/policy' && request.method === 'GET' && (admin || client)) return reply({ ...policy, grok: readGrokPolicy(this.sql) });
     const tokenMatch = /^\/api\/routing\/clients\/([A-Za-z0-9_-]{1,64})$/.exec(path);
     if (tokenMatch && ['POST', 'DELETE'].includes(request.method)) {
       if (!admin) return reply({ error: 'forbidden' }, 403);
