@@ -84,15 +84,17 @@ if [ -z "${ORIGINAL_USER_BASE}" ]; then
 fi
 
 PYTEST_RC=0
+# Native worker-profile discovery bypasses HOME. Test children must not inherit
+# the real session identity, credential selectors, or managed XDG config roots.
 HOME="${DISPOSABLE_HOME}" \
 PYTHONUSERBASE="${ORIGINAL_USER_BASE}" \
 DTC_AUTH_HOME="${DTC_AUTH_PATH}" \
 PYTHONPATH="host:host/tests" \
 CODEX_LAUNCH_WRAPPER="" \
-APLEXER_TAG="" \
-APLEXER_WORKSPACE="" \
-APLEXER_SESSION_ID="" \
-"${UV_BIN}" run --frozen --with pytest python -m pytest -q \
+env -u APLEXER_TAG -u APLEXER_WORKSPACE -u HUB_WORKER_CONFIG_FILE \
+  -u HUB_CONFIG_FILE -u HUB_URL -u HUB_BASE_URL -u HUB_TOKEN -u HUB_JOB_TOKEN \
+  -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_STATE_HOME \
+  "${UV_BIN}" run --frozen --with pytest python -m pytest -q \
   --basetemp "${RUN_TMP}/pytest" \
   -o tmp_path_retention_count=0 -o tmp_path_retention_policy=none || PYTEST_RC=$?
 

@@ -19,7 +19,10 @@ args = sys.argv[1:]
 record = pathlib.Path(os.environ["STORAGE_RECORD"])
 with record.open("a") as out:
     out.write(json.dumps({"tool": name, "args": args, "tmp": os.environ.get("TMPDIR"),
-                          "home": os.environ.get("HOME"), "cache": os.environ.get("UV_CACHE_DIR")}) + "\n")
+                          "home": os.environ.get("HOME"), "cache": os.environ.get("UV_CACHE_DIR"),
+                          "selectors": sorted(k for k in ("APLEXER_TAG", "APLEXER_WORKSPACE", "HUB_WORKER_CONFIG_FILE",
+                            "HUB_CONFIG_FILE", "HUB_URL", "HUB_BASE_URL", "HUB_TOKEN", "HUB_JOB_TOKEN",
+                            "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME") if k in os.environ)}) + "\n")
 if name == "python3" and args[:1] == ["-c"]:
     print("/fixture/user-base")
 if name == "npx" and os.environ.get("FAIL_VITEST"):
@@ -33,6 +36,11 @@ if name == "node":
 if name == "uv" and args[:1] == ["run"] and os.environ.get("CHECK_SOCKET"):
     with socket.socket(socket.AF_UNIX) as server:
         server.bind(str(pathlib.Path(os.environ["TMPDIR"]) / "fixture.sock"))
+if name == "uv" and args[:1] == ["run"] and os.environ.get("CHECK_AUTH_ISOLATION"):
+    sys.path.insert(0, os.environ["STORAGE_HOST_SOURCE"])
+    from agent_hub_host import config
+    config.save_config({"access_token": "synthetic-test-only"})
+    assert (pathlib.Path(os.environ["HOME"]) / ".config/agent-hub/host.json").is_file()
 if name == "uv" and args[:1] == ["sync"]:
     if os.environ.get("FAIL_SYNC"):
         sys.exit(9)
@@ -81,7 +89,7 @@ class FullLocalStorageTests(unittest.TestCase):
         env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
                    TMPDIR=str(self.temp), HOME=str(self.root / "original-home"),
                    UV_CACHE_DIR=str(self.root / "shared-uv-cache"), STORAGE_RECORD=str(record))
-        for key in ("SKIP_PHONE_UI", "FAIL_SYNC", "FAIL_VITEST", "PAUSE_SYNC", "CHECK_SOCKET"):
+        for key in ("SKIP_PHONE_UI", "FAIL_SYNC", "FAIL_VITEST", "PAUSE_SYNC", "CHECK_SOCKET", "CHECK_AUTH_ISOLATION"):
             env.pop(key, None)
         env.update(overrides)
         child = subprocess.Popen(["bash", str(self.repo / "scripts" / RUNNER.name)],
@@ -161,6 +169,33 @@ class FullLocalStorageTests(unittest.TestCase):
         self.assertTrue(all(Path(row["tmp"]) == run for row in rows if row["tool"] == "node"))
         self.assertFalse(run.exists())
         self.assert_preserved()
+
+    def test_python_config_writes_cannot_reach_ambient_native_or_explicit_profiles(self):
+        ambient = self.root / "ambient-workspace"
+        profile = ambient / ".local/hub-worker-auth/11111111-1111-4111-8111-111111111111.json"
+        profile.parent.mkdir(parents=True, mode=0o700)
+        profile.write_text('{"access_token":"ambient-synthetic-sentinel"}')
+        profile.chmod(0o600)
+        original = profile.read_bytes()
+        for explicit in (False, True):
+            with self.subTest(explicit=explicit):
+                child, record = self.start(f"auth-{explicit}", CHECK_AUTH_ISOLATION="1",
+                    STORAGE_HOST_SOURCE=str(RUNNER.parent.parent / "host"),
+                    APLEXER_TAG="hub-11111111-1111-4111-8111-111111111111",
+                    APLEXER_WORKSPACE=str(ambient),
+                    HUB_CONFIG_FILE=str(profile) if explicit else "",
+                    HUB_WORKER_CONFIG_FILE=str(profile) if explicit else "",
+                    HUB_URL="https://fixture.invalid", HUB_BASE_URL="https://fixture.invalid",
+                    HUB_TOKEN="synthetic-token", HUB_JOB_TOKEN="synthetic-token",
+                    XDG_CONFIG_HOME=str(ambient / "config"),
+                    XDG_DATA_HOME=str(ambient / "data"), XDG_STATE_HOME=str(ambient / "state"))
+                code, output = self.finish(child)
+                self.assertEqual(code, 0, output)
+                python = next(row for row in self.records(record)
+                              if row["tool"] == "uv" and row["args"][0] == "run")
+                self.assertEqual(python["selectors"], [])
+                self.assertEqual(profile.read_bytes(), original)
+                self.assertFalse(Path(python["home"]).exists())
 
     def test_term_cleans_run_directory_after_active_command_finishes(self):
         child, record = self.start("terminated", PAUSE_SYNC="1")

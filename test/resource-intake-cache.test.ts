@@ -3,10 +3,11 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { ResourceManagement } from '../src/resource-management';
 
 const done = [{ kind: 'note', text: 'DONE abc1234\nlive check: synthetic cache fixture\nresult: all synthetic criteria proven' }];
+const inDO: any = runInDurableObject;
 
 async function fixture(check: (r: ResourceManagement, sql: any, state: any, scans: () => number) => void) {
   const stub = (env as any).HUB.get((env as any).HUB.idFromName(crypto.randomUUID()));
-  await runInDurableObject(stub, (hub: any, state: any) => {
+  await inDO(stub, (hub: any, state: any) => {
     let scans = 0;
     const sql = hub.sql;
     const measured = { exec(query: string, ...args: any[]) {
@@ -76,4 +77,31 @@ it('bypasses snapshot retention for oversized input and missing structural gener
   sql.exec('DELETE FROM resource_catalog_revision');
   r.sessions('cache-host'); r.sessions('cache-host');
   expect(scans()).toBe(4);
+}));
+
+it('refreshes closure links after launch requests, binding identity and hostname aliases change', async () => fixture((r, sql) => {
+  sql.exec("UPDATE intake_tasks SET data=json_set(data,'$.history',json(?))", JSON.stringify(done));
+  const read=()=>r.sessions('cache-host').find(s=>s.session_id==='cache-session')!;
+  expect(read().linked_intake_open).toBe(false);
+  sql.exec('INSERT INTO intake_tasks VALUES(?,?)','linked',JSON.stringify({id:'linked',status:'open',history:[]}));
+  const at=new Date().toISOString();
+  sql.exec(`INSERT INTO fleet_launches(id,actor,requester_kind,summary,request_key,request_json,machine_id,engine,account,mode,workspace,prompt,state,created_at,updated_at)
+    VALUES('cache-launch','fixture','agent','fixture','cache-launch','{}','cache-host','codex','default','headless','/fixture','fixture','running',?,?)`,at,at);
+  sql.exec("UPDATE session_control_sessions SET fleet_launch_id='cache-launch' WHERE id='cache-session'");
+  expect(read().linked_intake_open).toBe(false);
+  sql.exec("UPDATE fleet_launches SET request_json=? WHERE id='cache-launch'",JSON.stringify({intake_task_id:'linked'}));
+  expect(read().linked_intake_open).toBe(true);
+  sql.exec("UPDATE fleet_launches SET request_json='{}' WHERE id='cache-launch'");
+  expect(read().linked_intake_open).toBe(false);
+  sql.exec("UPDATE intake_tasks SET data=json_set(data,'$.history',json(?)) WHERE id='linked'",
+    JSON.stringify([{kind:'link',native_id:'replacement',host:'cache-host'}]));
+  expect(read().linked_intake_open).toBe(false);
+  sql.exec("UPDATE session_control_sessions SET binding_json=json_set(binding_json,'$.native_id','replacement') WHERE id='cache-session'");
+  expect(read().linked_intake_open).toBe(true);
+  sql.exec("UPDATE intake_tasks SET data=json_set(data,'$.history',json(?)) WHERE id='linked'",
+    JSON.stringify([{kind:'link',native_id:'replacement',host:'cache-alias'}]));
+  sql.exec("INSERT INTO machines(id,name,hostname,registered_at) VALUES('cache-alias','fixture','different',?)",at);
+  expect(read().linked_intake_open).toBe(false);
+  sql.exec("UPDATE machines SET hostname='FIXTURE' WHERE id='cache-alias'");
+  expect(read().linked_intake_open).toBe(true);
 }));

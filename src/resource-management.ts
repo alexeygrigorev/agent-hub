@@ -77,6 +77,8 @@ export class ResourceManagement {
    * protection/identity changes and their cache generations in one transaction. */
   initCatalogCache() {
     this.catalogReady=false; this.catalogCache.clear(); this.catalogRawRows.clear(); this.catalogRawBytes=0; this.catalogStructureRevision=null; this.catalogIntakes=null;
+    // Every table read by worktreeIntakeSnapshot must bump structure_revision.
+    // Its cached closure/DONE verdicts must never survive an authority write.
     const tables=['session_control_sessions','fleet_launches','fleet_sessions','session_control_protections','resource_reaps','intake_tasks','intake_task_projection','resource_request_projection','machines'];
     if (tables.some(table=>!this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",table).toArray().length)) return;
     this.sql.exec('CREATE TABLE IF NOT EXISTS resource_catalog_revision(id INTEGER PRIMARY KEY CHECK(id=1),revision TEXT NOT NULL,structure_revision TEXT NOT NULL)');
@@ -418,7 +420,9 @@ export class ResourceManagement {
       const cacheable=rows.length<=10000 && rows.reduce((n,row)=>n+row.aliases.length,0)<=20000 && bytes<=4*1024*1024
         && rows.every(row=>Object.entries(row).every(([field,value])=>field==='aliases' || value===null || typeof value!=='object'));
       if(revision!==null && cacheable) {
-        // Four MiB each for raw and canonical caches, independent of host count.
+        // Four MiB estimates each for raw, canonical and intake snapshot caches,
+        // independent of host count. Snapshot closures retain only booleans
+        // and row indexes, never raw intake history payloads.
         if(this.catalogCache.size>=8 || [...this.catalogCache.values()].reduce((n,v)=>n+v.bytes,0)+bytes>4*1024*1024) this.catalogCache.clear();
         this.catalogCache.set(key,{revision,rows,bytes});
       }
