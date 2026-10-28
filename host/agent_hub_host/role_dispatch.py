@@ -51,7 +51,6 @@ DEFAULT_CANONICAL_ROOT_STATE_DIR = "~/.local/state/headless-root"
 DEFAULT_LAUNCHER_REPO = "~/git/agent-quota-launcher"
 DEFAULT_LAUNCHER_PROVIDER = "antigravity"
 DEFAULT_ADMISSION_TASK_PROFILE = "model-task"
-SUPPORTED_LAUNCHER_PROVIDERS = ("antigravity", "grok", "zai", "opencode")
 
 MIN_TIMEOUT_SEC: float = 30.0
 MAX_TIMEOUT_SEC: float = 1800.0
@@ -71,7 +70,6 @@ UUID_RE = re.compile(
     re.IGNORECASE,
 )
 NIL_UUID = "00000000-0000-0000-0000-000000000000"
-ROLE_NAME_RE = re.compile(r"^automation:[a-z][a-z0-9-]{0,47}:[a-z][a-z0-9-]{0,47}$")
 
 
 class DispatchError(RuntimeError):

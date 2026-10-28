@@ -60,7 +60,6 @@ DEFAULT_SCRIPT_PATH = "~/git/cloudflare-agent-git/scripts/root/headless-root-run
 DEFAULT_ALLOWED_REPO_ROOT = "~/git/cloudflare-agent-git"
 DEFAULT_CANONICAL_STATE_DIR = "~/.local/state/headless-root"
 DEFAULT_HOST_STATE_DIR = "~/.local/state/agent-hub-host"
-DEFAULT_SCHEDULING_STATE_DIR = DEFAULT_HOST_STATE_DIR
 SCHEDULING_FILENAME = "scheduling.json"
 SCHEDULING_PATH = "/api/root/scheduling"
 BOOTSTRAP_TIMEOUT_SEC = 240.0

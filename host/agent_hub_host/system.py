@@ -102,12 +102,6 @@ def get_network() -> str:
 def get_roles() -> list:
     return ["work"]
 
-def _get_git_sha(path: str) -> str:
-    try:
-        res = subprocess.run(["git", "-C", path, "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
-        return res.stdout.strip()
-    except Exception:
-        return "unknown"
 
 def get_capabilities() -> dict:
     capabilities = {}

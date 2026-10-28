@@ -363,18 +363,6 @@ def render_human(data):
     return '\n'.join(lines) + '\n'
 
 
-def add_commands(sub):
-    parser = sub.add_parser('status', help='One-call authorized task/session/report/commit/pending-action status')
-    parser.add_argument('--since', default=None, help='Filter to changes since duration (e.g. 2h, 30m) or ISO time')
-    parser.add_argument('--json', dest='json', action='store_true', help='Output raw JSON DTO')
-    parser.add_argument('--task', default=None, help='Single task id')
-    parser.add_argument('--project', default=None, help='Project scope filter')
-    parser.add_argument('--host', default=None, help='Host/machine filter')
-    parser.add_argument('--after', default=None, help='Pagination cursor (task id)')
-    parser.add_argument('--limit', type=int, default=None, help='Page size 1..25')
-    parser.add_argument('--local-only', action='store_true', help='Local config diagnostics only, no API call')
-
-
 def execute(args):
     if getattr(args, 'local_only', False):
         cfg = config.load_config()

@@ -60,7 +60,6 @@ ALLOWLIST = {
 REFUSED_GIT_REMOTES = {'fetch', 'push', 'pull', 'clone'}
 _GH_WRITE_TOKENS = {'post', 'patch', 'put', 'delete'}
 _GH_RUN_READONLY = {'list', 'view'}
-_LS_REMOTE_REF_RE = None  # compiled lazily to keep import light
 
 KINDS = ('git_ancestry', 'ci', 'deployment')
 

@@ -35,9 +35,6 @@ LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 HUB_PROFILE = re.compile(r"hub-[a-z0-9-]+\Z")
 CREDENTIAL_MODES = ("managed-bundle", "host-home")
 
-# Subscription keys owned by the catalog. Everything else on an entry is
-# host-local (admission/launch/startup commands, plan) and is preserved.
-OWNED_KEYS = ("service", "engine", "profile", "quota_argv")
 
 
 def policy_accounts(policy=None):

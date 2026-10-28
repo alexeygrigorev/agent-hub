@@ -16,7 +16,6 @@ from pathlib import Path
 
 from . import api, config, session_control
 
-TEST_WAIT_DEFAULT = 60.0
 TEST_INTERVAL = 3.0
 
 

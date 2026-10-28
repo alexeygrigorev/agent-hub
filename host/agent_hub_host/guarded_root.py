@@ -85,11 +85,6 @@ def is_pid_alive(pid: int) -> bool:
         return False
 
 
-class RootLockError(Exception):
-    """Base error for root lock operations."""
-    pass
-
-
 class IncumbentStatus:
     HEALTHY = "healthy"
     STARTING = "starting"

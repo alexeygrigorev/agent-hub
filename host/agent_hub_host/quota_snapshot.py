@@ -46,7 +46,6 @@ MAX_RAW_STDOUT_BYTES = 64 * 1024  # 64 KiB
 MAX_RAW_STDERR_BYTES = 16 * 1024  # 16 KiB
 DEFAULT_COLLECT_INTERVAL = 600.0  # 600 seconds (10 minutes)
 STALE_AGE_THRESHOLD = 1200.0  # 1200 seconds (20 minutes)
-MAX_FUTURE_SKEW_SECONDS = 0.0  # No future timestamps permitted
 
 
 class QuotaError(ValueError):
@@ -93,13 +92,6 @@ def sanitize_percent(val: Any) -> Optional[float]:
         if 0.0 <= val <= 100.0:
             return float(val)
         return None
-    return None
-
-
-def sanitize_bool(val: Any) -> Optional[bool]:
-    """Validate strict boolean."""
-    if type(val) is bool:
-        return val
     return None
 
 
