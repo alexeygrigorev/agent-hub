@@ -8,7 +8,6 @@ metadata verification, and identity boundaries.
 from __future__ import annotations
 
 from contextlib import contextmanager
-import hashlib
 import json
 import os
 import subprocess
@@ -20,6 +19,8 @@ from . import bus, private_fs
 from .native_bridge import (
     BridgeCapabilityGap,
     NativeServiceBinding,
+    canonicalize_workspace,
+    get_workspace_key,
     qualify_native_service_binding,
     read_authoritative_cursor_safe,
     validate_native_reply_provenance,
@@ -142,23 +143,6 @@ def get_authoritative_state_dir(explicit_state_dir: str | None = None) -> str:
         return os.path.abspath(os.path.join(os.environ["XDG_STATE_HOME"], "aplexer"))
     home = os.environ.get("HOME", os.path.expanduser("~"))
     return os.path.abspath(os.path.join(home, ".local", "state", "aplexer"))
-
-
-def canonicalize_workspace(workspace_path: str) -> str:
-    """Canonicalize workspace path matching aplexer's canonical_workspace."""
-    if os.name == 'nt':
-        from .win32_fs import canonical_workspace
-        return canonical_workspace(workspace_path)
-    abs_path = os.path.abspath(workspace_path)
-    try:
-        return os.path.realpath(abs_path)
-    except Exception:
-        return abs_path
-
-
-def get_workspace_key(canonical_workspace_path: str) -> str:
-    """Compute mailbox directory key: first 128 bits of SHA-256 (32 hex characters)."""
-    return hashlib.sha256(canonical_workspace_path.encode("utf-8")).hexdigest()[:32]
 
 
 class MailboxBridge:

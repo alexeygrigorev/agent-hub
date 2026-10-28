@@ -42,51 +42,20 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from . import private_fs
 from .native_sessions import SessionControlError, SessionUncertain
-from .session_executor import CallerCustody
+from .session_executor import (
+    CallerCustody,
+    _journal_path,
+    _locked,
+    _read_journal,
+    _write_journal,
+)
 
-JOURNAL_LIMIT = 64 * 1024
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./-]{0,127}\Z")
 MAX_ROOTS = 16
 GIT_TIMEOUT = 30.0
 GIT_OUTPUT_LIMIT = 1024 * 1024
-
-
-def _journal_path(journal_dir: str, name: str) -> str:
-    if not isinstance(journal_dir, str) or not Path(journal_dir).is_absolute():
-        raise SessionControlError("journal_dir must be an absolute path")
-    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{1,128}", name):
-        raise SessionControlError("Invalid journal name")
-    return os.path.join(journal_dir, name + ".json")
-
-
-def _read_journal(path: str) -> Optional[dict[str, Any]]:
-    import json
-
-    try:
-        raw = private_fs.read_bytes(path, JOURNAL_LIMIT)
-    except FileNotFoundError:
-        return None
-    try:
-        data = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise SessionUncertain(f"Journal corrupt; reconcile before retry: {path}") from exc
-    if not isinstance(data, dict):
-        raise SessionUncertain(f"Journal malformed; reconcile before retry: {path}")
-    return data
-
-
-def _write_journal(path: str, record: dict[str, Any]) -> None:
-    import json
-
-    raw = json.dumps(record, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    private_fs.atomic_write(path, raw, JOURNAL_LIMIT)
-
-
-def _locked(path: str):
-    return private_fs.exclusive_lock(path + ".lock")
 
 
 def _lock_held(path: str):
