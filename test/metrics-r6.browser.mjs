@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
+import { launchBrowser } from './playwright.mjs';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { resolve, extname } from 'node:path';
 
@@ -10,9 +10,7 @@ import { resolve, extname } from 'node:path';
 // NEVER edited. Asserts exact C identity/data/status + API routing.
 const OUT = '.local/metrics-ui-r6/r6-results.json';
 const RENDER_OUT = '.local/metrics-ui-r6/r6-render-results.json';
-const { chromium } = createRequire('/home/alexey/git/dataops/package.json')('playwright');
-const browser = await chromium.launch({
-  executablePath: '/home/alexey/.cache/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-linux64/chrome-headless-shell',
+const browser = await launchBrowser({
   args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
     '--num-raster-threads=1', '--disable-threaded-animation', '--disable-threaded-scrolling'],
 });

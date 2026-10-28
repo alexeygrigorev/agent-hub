@@ -7,6 +7,7 @@
  * grants (quantity_known=0) and persisted PID controller ticks.
  */
 import type { SqlStorage } from '@cloudflare/workers-types';
+import policy from '../config/model-routing.json';
 import {
   TBM_FLEET_POOL_ID,
   evaluateTbmAdmission,
@@ -247,9 +248,8 @@ export function selectBurnSource(pool: TbmPoolRow | null, tranches: TbmTrancheRo
 // Multi-factor routing score (§2.1 item 3, tbm-routing.md §2.4)
 // ---------------------------------------------------------------------------
 
-export const FREE_POOL_PROVIDERS = ['zai', 'go'];
-export const ROUTING_DEFAULTS = { freePoolBoost: 1.3, codexPreference: 0.9, grokDemotion: 0.2, headroomFloor: 0.05,
-  urgencyHorizonHours: 24, urgencyKappa: 2.5, urgencyGamma: 1.5 };
+export const FREE_POOL_PROVIDERS = policy.rules.preferred_providers;
+export const ROUTING_DEFAULTS = { codexPreference: 0.9, grokDemotion: 0.2, urgencyGamma: 1.5 };
 
 /** S(m) factors; the score is their product. */
 export interface RouteScoreFactors { fit: number; health: number; preference: number; headroom: number; urgency: number; pacing: number; grok: number; banked: number }
@@ -261,7 +261,7 @@ export function taskFit(modelTier: string, taskTier: string): number {
 }
 /** P_pref: Free Models Pool 1.3x, Codex 0.9x, others 1.0. Grok is demoted once, by G_grok. */
 export function providerPreference(provider: string): number {
-  if (FREE_POOL_PROVIDERS.includes(provider)) return ROUTING_DEFAULTS.freePoolBoost;
+  if (policy.rules.preferred_providers.includes(provider)) return policy.rules.provider_preference;
   return provider === 'codex' ? ROUTING_DEFAULTS.codexPreference : 1;
 }
 /** G_grok: fixed 0.2x Grok-minimal demotion. */
@@ -269,14 +269,14 @@ export const grokDemotion = (provider: string) => provider === 'grok' ? ROUTING_
 /** N = max(0.05, (Q_rem% - R_floor%) / (100 - R_floor%)). */
 export function netHeadroom(remainingPercent: number, floorPercent: number): number {
   const span = 100 - floorPercent;
-  return Math.max(ROUTING_DEFAULTS.headroomFloor, span > 0 ? (remainingPercent - floorPercent) / span : 0);
+  return Math.max(policy.rules.headroom_floor, span > 0 ? (remainingPercent - floorPercent) / span : 0);
 }
 /** U = 1 + 2.5 * N * ((24 - min(24, dt_h)) / 24)^1.5; N <= 0.05 at the floor suppresses panic burn. */
 export function resetUrgency(headroom: number, hoursToReset: number): number {
-  const h = ROUTING_DEFAULTS.urgencyHorizonHours;
+  const h = policy.rules.reset_horizon_hours;
   if (!Number.isFinite(hoursToReset)) return 1;
   const closeness = Math.max(0, (h - Math.min(h, Math.max(0, hoursToReset))) / h);
-  return 1 + ROUTING_DEFAULTS.urgencyKappa * headroom * Math.pow(closeness, ROUTING_DEFAULTS.urgencyGamma);
+  return 1 + policy.rules.reset_urgency_factor * headroom * Math.pow(closeness, ROUTING_DEFAULTS.urgencyGamma);
 }
 /** A_pacing: lagging (< 0.85 target) boosts up to 2.5x; ahead (> 1.15 target) dampens down to 0.2x. */
 export function pacingAlignment(actualTpm: number, targetTpm: number): number {

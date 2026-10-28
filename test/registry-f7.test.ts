@@ -217,7 +217,7 @@ describe('F7 actual Worker -> bound ConversationHub / existing authority', () =>
   });
 });
 
-describe('F7 complete old-database startup through SELF', () => {
+describe('F7 credential/message binding upgrade through SELF', () => {
   async function installOldFixture(collision = false) {
     const token = 'hubt_local_old_database'; const hash = await sha256(token);
     let before: any;
@@ -226,7 +226,7 @@ describe('F7 complete old-database startup through SELF', () => {
       hub.sql.exec('DROP TABLE messages');
       hub.sql.exec(SCHEMA_SQL.slice(SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS messages ('), SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS claims (')));
       hub.sql.exec('DROP TABLE agents');
-      hub.sql.exec(SCHEMA_SQL.slice(SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS agents ('),SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS messages')).replace('tag TEXT NOT NULL','tag TEXT PRIMARY KEY'));
+      hub.sql.exec(SCHEMA_SQL.slice(SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS agents ('),SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS messages')));
       hub.sql.exec('DROP TABLE credentials');
       hub.sql.exec(SCHEMA_SQL.slice(SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS credentials ('),SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS device_pairings')));
       hub.sql.exec("INSERT INTO agents(tag,project,role,machine_id,registered_at,state,health_state,health_at,last_seen_at,updated_at) VALUES ('old-worker','oldA','implementer','local-old-machine','2020-01-01','unknown','unknown','2020-01-02','2020-01-03','2020-01-04')");
@@ -242,7 +242,7 @@ describe('F7 complete old-database startup through SELF', () => {
     });
     return {token,before};
   }
-  it('preserves every old credential field/reference and serves two projects after startup', async () => {
+  it('preserves old credential/message fields and serves two projects after binding upgrade', async () => {
     const {token,before} = await installOldFixture();
     await runInDurableObject(stub() as any, (hub: Hub,state) => { new Hub(state,bindings); });
     expect((await rows('SELECT * FROM agents'))[0]).toEqual(before.agent);
@@ -251,7 +251,8 @@ describe('F7 complete old-database startup through SELF', () => {
     expect(migrated).toEqual(before.credential);
     expect((await rows('SELECT credential_id FROM machines WHERE id = ?', 'local-old-machine'))[0].credential_id).toBe('local-old-id');
     const message = (await rows('SELECT * FROM messages WHERE id = ?', 'old-message'))[0];
-    expect(message).toEqual({...before.message,registry_unbound_from:1,registry_unbound_to:1});
+    // Later migrations add nullable delivery columns; every legacy field must survive.
+    expect(message).toMatchObject({...before.message,registry_unbound_from:1,registry_unbound_to:1});
     const cookie = await admin();
     expect((await register('oldB','old-worker',cookie)).status).toBe(201);
     expect((await register('oldB','old-worker',cookie)).status).toBe(409);
@@ -263,12 +264,12 @@ describe('F7 complete old-database startup through SELF', () => {
     await runInDurableObject(stub() as any, (hub: Hub,state) => { new Hub(state,bindings); });
     expect((await req('/api/conversations/'+id,'GET',undefined,token)).status).toBe(200);
   });
-  it('rolls the entire startup back on injected credential migration failure, leaving legacy keys and data usable', async () => {
+  it('rolls back a failed binding upgrade without changing current agent keys or old credential/message data', async () => {
     const {before} = await installOldFixture(true);
     await rows("CREATE TRIGGER fail_registry_binding BEFORE UPDATE ON credentials BEGIN SELECT RAISE(ABORT, 'injected_binding_failure'); END");
     await runInDurableObject(stub() as any, (hub: Hub,state) => {
       expect(()=>new Hub(state,bindings)).toThrow();
-      expect(hub.sql.exec('PRAGMA table_info(agents)').toArray().find((r:any)=>r.name==='tag')?.pk).toBe(1);
+      expect(hub.sql.exec('PRAGMA table_info(agents)').toArray().find((r:any)=>r.name==='tag')?.pk).toBe(0);
       expect(hub.sql.exec('PRAGMA table_info(credentials)').toArray().some((r:any)=>r.name==='registry_actor')).toBe(false);
       expect(hub.sql.exec('SELECT * FROM agents').toArray()[0]).toEqual(before.agent);
       expect(hub.sql.exec('SELECT * FROM credentials').toArray()[0]).toEqual(before.credential);

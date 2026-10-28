@@ -1,12 +1,10 @@
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
+import { launchBrowser } from './playwright.mjs';
 import { readFile, mkdir } from 'node:fs/promises';
 import { resolve, extname } from 'node:path';
 
 // Run from the repository root. Uses the shared local browser harness, like metrics-r6.browser.mjs.
-const { chromium } = createRequire(process.env.PLAYWRIGHT_PACKAGE || '/home/alexey/git/dataops/package.json')('playwright');
-const browser = await chromium.launch({
-  executablePath: process.env.CHROMIUM_PATH || '/home/alexey/.cache/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-linux64/chrome-headless-shell',
+const browser = await launchBrowser({
   args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--num-raster-threads=1'],
 });
 const asOf = Date.parse('2026-10-23T12:15:00Z');

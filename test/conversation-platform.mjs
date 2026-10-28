@@ -1,9 +1,9 @@
 // Real workerd HTTP + SQLite + browser + Python CLI. No API request mocks.
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
+import { launchBrowser } from './playwright.mjs';
 import { randomBytes, createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile, chmod, access } from 'node:fs/promises';
-import { resolve, extname } from 'node:path';
+import { resolve, relative, extname } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { build } from 'esbuild';
@@ -14,7 +14,7 @@ const root = resolve(import.meta.dirname, '..');
 const scratch = resolve(root, '.local/path');
 await mkdir(scratch, { recursive: true, mode: 0o700 });
 await chmod(scratch, 0o700);
-assert.equal(process.env.TMPDIR, resolve(root, '.local/tmp'), 'Use the documented task-local TMPDIR');
+assert.ok(process.env.TMPDIR && !relative(resolve(root, '.local/tmp'), resolve(process.env.TMPDIR)).startsWith('..'), 'Use task-local TMPDIR under .local/tmp');
 const nonce = randomBytes(8).toString('hex');
 const key = randomBytes(32).toString('hex');
 const secret = randomBytes(32).toString('hex');
@@ -135,9 +135,7 @@ try {
   const participants = await cli(['participants']);
   assert.equal(participants.self.actor, actor);
   check('actual Python CLI discovers authenticated registered actor');
-  const requireBrowser = createRequire(process.env.PLAYWRIGHT_PACKAGE || '/home/alexey/git/dataops/package.json');
-  const { chromium } = requireBrowser('playwright');
-  browser = await chromium.launch({ args: ['--single-process', '--in-process-gpu', '--disable-gpu', '--disable-dev-shm-usage', '--no-sandbox', '--js-flags=--thread-pool-size=1', '--num-raster-threads=1', '--disable-threaded-animation', '--disable-threaded-scrolling'] });
+  browser = await launchBrowser({ args: ['--single-process', '--in-process-gpu', '--disable-gpu', '--disable-dev-shm-usage', '--no-sandbox', '--js-flags=--thread-pool-size=1', '--num-raster-threads=1', '--disable-threaded-animation', '--disable-threaded-scrolling'] });
   const context = await browser.newContext();
   const [name, value] = fixture.cookie.split('=');
   await context.addCookies([{ name, value, url: base, httpOnly: true, sameSite: 'Lax' }]);

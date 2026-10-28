@@ -1,18 +1,13 @@
 import assert from 'node:assert/strict';
-import { createRequire, stripTypeScriptTypes } from 'node:module';
+import { stripTypeScriptTypes } from 'node:module';
+import { launchBrowser } from './playwright.mjs';
 import { DatabaseSync } from 'node:sqlite';
 import { readFile, mkdir } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
 import { resolve, extname } from 'node:path';
 
 // Usage history charts: per-window quota lines with reset markers and native
 // token lines, 24h/7d/30d selector, real line charts with live data.
-let playwright;
-for (const candidate of [process.env.PLAYWRIGHT_PACKAGE, resolve('node_modules/playwright/package.json'), '/home/alexey/git/dataops/package.json', resolve('package.json')].filter(Boolean)) {
-  try { playwright = createRequire(candidate)('playwright'); break; } catch { /* try the next existing browser harness */ }
-}
-if (!playwright) throw Error('Playwright unavailable; install the existing CI browser harness or set PLAYWRIGHT_PACKAGE.');
-const { chromium } = playwright;
+
 
 
 const end = Date.parse('2026-10-26T01:00:00Z'), start = end - 86400000;
@@ -90,7 +85,7 @@ const sources = [
   { engine: 'gemini', supported: false, detail: 'no native per-session token log on the host; quota percentages only' },
 ];
 await mkdir('.local/usage-history', { recursive: true });
-const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || (existsSync(chromium.executablePath()) ? chromium.executablePath() : '/home/alexey/.cache/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-linux64/chrome-headless-shell'), args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--num-raster-threads=1'] });
+const browser = await launchBrowser({ args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--num-raster-threads=1'] });
 try {
   for (const [width, theme] of [[1440, 'light'], [390, 'light']]) {
     const context = await browser.newContext({ viewport: { width, height: 1000 }, colorScheme: theme, hasTouch: width === 390 });

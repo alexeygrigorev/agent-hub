@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import {build} from 'esbuild';
 import {Miniflare,Log,LogLevel,convertV4MiniflareOptions} from 'miniflare';
-import {createRequire} from 'node:module';
+import { launchBrowser } from './playwright.mjs';
 import {readFile,mkdir} from 'node:fs/promises';
 import {resolve,extname} from 'node:path';
 const root=resolve(import.meta.dirname,'..');
@@ -26,8 +26,7 @@ try {
  await api('/api/machines/register','POST',{hostname:'local',os:'linux',network:'public',roles:[],capabilities:{}},host);
  const added=await api('/api/engines/my-google','PUT',{label:'my-google',provider:'gemini',version:'0.64.0',auth_method:'machine-login',files:{},env:{},args:[]});
  await api('/api/engines/my-google','POST',{revision:added.revision,authenticated:false},host);
- const require=createRequire(process.env.PLAYWRIGHT_PACKAGE||'/home/alexey/git/dataops/package.json');const {chromium}=require('playwright');
- browser=await chromium.launch({args:['--no-sandbox','--disable-dev-shm-usage']});
+ browser=await launchBrowser({args:['--no-sandbox','--disable-dev-shm-usage']});
  const context=await browser.newContext({viewport:{width:1000,height:800}});
  const index=fixture.cookie.indexOf('=');await context.addCookies([{name:fixture.cookie.slice(0,index),value:fixture.cookie.slice(index+1),url:base}]);
  const page=await context.newPage();await page.goto(base+'/engines.html');

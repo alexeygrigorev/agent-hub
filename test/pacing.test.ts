@@ -232,8 +232,48 @@ describe('routing score factors', () => {
   it('score is the product of all factors', () => {
     expect(routeScore({ fit: 1, health: 1, preference: 1.3, headroom: 0.5, urgency: 2, pacing: 1.5, grok: 1, banked: 2 })).toBeCloseTo(3.9);
   });
-  it('config policy mirrors the Phase 3 constants', () => {
-    expect(policy.rules.provider_preference).toBe(1.3); expect(policy.rules.reset_urgency_factor).toBe(2.5);
+  it('reads scoring settings from policy and changes actual candidate weights', () => {
+    const original = structuredClone(policy.rules);
+    const quota = { status: 'ok', observed_at: new Date(NOW - 1000).toISOString(), details: { limit_reached: false },
+      windows: { '7d': { present: true, percent_remaining: 10, reset_at: new Date(NOW + 12 * H).toISOString() } } };
+    const route = { provider: 'go', engine: 'opencode', profile: null, account: 'g' };
+    const ads = [{ engine: 'opencode', profile: null, model: 'opencode-go/muse-spark-1.3-contributor', effort: null, account: 'g' }];
+    const candidates = () => modelCandidates({ tier: 'daily' }, route, ads, quota, NOW);
+    try {
+      const before = candidates()[0]!;
+      policy.rules.preferred_providers = ['gemini'];
+      expect(candidates()[0]!.factors.preference).toBe(1);
+      expect(providerPreference('gemini')).toBe(original.provider_preference);
+      policy.rules.preferred_providers = ['go'];
+      policy.rules.provider_preference = 1.8;
+      policy.rules.reset_horizon_hours = 48;
+      policy.rules.reset_urgency_factor = 4;
+      policy.rules.headroom_floor = 0.2;
+      const after = candidates()[0]!;
+      expect(after.factors.preference).toBe(1.8);
+      expect(after.factors.headroom).toBe(0.2);
+      expect(after.factors.urgency).toBeCloseTo(1 + 4 * 0.2 * Math.pow(0.75, 1.5));
+      expect(after.weight).toBeCloseTo(1.8 * 0.2 * after.factors.urgency);
+      expect(after.weight).not.toBe(before.weight);
+      expect(resetUrgency(1, Infinity)).toBe(1);
+    } finally { Object.assign(policy.rules, original); }
+  });
+  it('refuses paid policy modes and never fails over outside the requested tier', () => {
+    const original = structuredClone(policy.rules);
+    const quota = { status: 'ok', observed_at: new Date(NOW - 1000).toISOString(), details: { limit_reached: false },
+      windows: { '7d': { present: true, percent_remaining: 80, reset_at: new Date(NOW + H).toISOString() } } };
+    const route = { provider: 'go', engine: 'opencode', profile: null, account: 'g' };
+    const ads = [{ engine: 'opencode', profile: null, model: 'opencode-go/muse-spark-1.3-contributor', effort: null, account: 'g' }];
+    const candidates = (tier = 'daily') => modelCandidates({ tier }, route, ads, quota, NOW);
+    try {
+      expect(candidates()).toHaveLength(1);
+      expect(candidates('deep')).toEqual([]);
+      policy.rules.allow_paid = true;
+      expect(candidates()).toEqual([]);
+      policy.rules.allow_paid = false;
+      policy.rules.cost_mode = 'paid';
+      expect(candidates()).toEqual([]);
+    } finally { Object.assign(policy.rules, original); }
   });
   it('providerPacing aggregates lag, banked boost and critical preemption per provider', () => {
     const map = providerPacing([pool({ current_burn_rate_tpm: 0, target_burn_rate_tpm: 1000 }),

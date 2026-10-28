@@ -1,15 +1,9 @@
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
+import { launchBrowser } from './playwright.mjs';
 import { readFile, mkdir } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
 import { resolve, extname } from 'node:path';
-let playwright;
-for (const candidate of [process.env.PLAYWRIGHT_PACKAGE, resolve('node_modules/playwright/package.json'), '/home/alexey/git/dataops/package.json', resolve('package.json')].filter(Boolean)) {
-  try { playwright = createRequire(candidate)('playwright'); break; } catch { /* try the next existing browser harness */ }
-}
-if (!playwright) throw Error('Playwright unavailable; install the existing CI browser harness or set PLAYWRIGHT_PACKAGE.');
-const { chromium } = playwright;
-const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || (existsSync(chromium.executablePath()) ? chromium.executablePath() : '/home/alexey/.cache/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-linux64/chrome-headless-shell'), args: ['--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--num-raster-threads=1'] });
+
+const browser = await launchBrowser({ args: ['--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--num-raster-threads=1'] });
 const end = Date.parse('2026-10-24T15:00:00Z'), start = end - 86400000;
 const series = [];
 for (const [kind, entity, machine_id, metric, value] of [

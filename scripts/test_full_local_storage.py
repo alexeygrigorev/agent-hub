@@ -168,7 +168,9 @@ class FullLocalStorageTests(unittest.TestCase):
         # An absolute socket path here exceeds Linux's 108-byte sun_path.
         self.assertGreater(len(str(self.repo / relative / "fixture.sock").encode()), 108)
         browsers = [row for row in self.records(record) if row["tool"] == "node"]
-        self.assertEqual(len(browsers), 5)
+        self.assertEqual(len(browsers), 2)
+        self.assertEqual(browsers[0]["args"], ["--test", "scripts/test-browser-local.test.mjs"])
+        self.assertEqual(browsers[1]["args"], ["scripts/test-browser-local.mjs"])
         self.assertTrue(all(Path(row["tmp"]) == self.repo / relative for row in browsers))
         self.assertFalse((self.repo / relative).exists())
         self.assertEqual(marker.read_text(), "preserve")

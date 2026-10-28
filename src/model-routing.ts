@@ -17,6 +17,9 @@ export function taskTier(input: any): string | null {
  * `pacing` comes from tbm_* rows; omitted or empty keeps those factors neutral.
  */
 export function modelCandidates(input: any, route: any, advertisement: any, quota: any, now: number, pacing?: Map<string, ProviderPacing>, unavailableEngines?: Set<string>) {
+  // Paid routing is unsupported. Reject an incompatible policy rather than
+  // advertising subscription-only behavior while silently accepting paid mode.
+  if (policy.rules.allow_paid !== false || policy.rules.cost_mode !== 'existing-subscription-only') return [];
   const tier = taskTier(input); if (!tier) return [];
   const members: string[] = (policy.tiers as any)[tier];
   return policy.models.filter(m => {
