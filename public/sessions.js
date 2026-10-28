@@ -824,12 +824,15 @@ async function loadData() {
     } catch (e) {
       if (e && e.message === 'Sign-in required') return;
     }
-    const [sessionsData, treeData] = await Promise.all([
+    const [sessionsData, treeData, auditData] = await Promise.all([
       api('/api/sessions?limit=100'),
-      api('/api/sessions/tree')
+      api('/api/sessions/tree'),
+      // Admin-only; a 403 just means the panel stays hidden.
+      api('/api/sessions/audit?last=5').catch(() => null)
     ]);
     cachedSessions = sessionsData.sessions || [];
     cachedTree = treeData || { tree: [] };
+    renderAudit(auditData);
     updateView();
     if (selectedSessionId) {
       await refreshSessionDetail(selectedSessionId);
@@ -851,6 +854,63 @@ function updateView() {
   } else {
     renderTree(cachedTree, filter);
   }
+}
+
+// Idle audit (intake 27d1e27b): scheduled continue/kill decisions and their
+// outcomes. Admin-only data; any fetch failure keeps the panel hidden.
+function renderAudit(data) {
+  const section = byId('audit-section');
+  if (!section) return;
+  if (!data || !Array.isArray(data.runs)) {
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+  const summary = byId('audit-summary');
+  const latest = data.runs[0];
+  const counts = latest?.counts || {};
+  const countText = Object.entries(counts).filter(([, v]) => v).map(([k, v]) => `${k} ${v}`).join(' · ');
+  if (summary) {
+    summary.textContent = latest
+      ? `Run #${latest.id} at ${latest.at.replace('T', ' ').slice(0, 19)}Z (${latest.source}) · scanned ${latest.scanned}${countText ? ' · ' + countText : ''}`
+      : 'No audit run recorded yet.';
+  }
+  const content = byId('audit-content');
+  if (!content) return;
+  content.replaceChildren();
+  const decisions = data.decisions || [];
+  if (!decisions.length) return;
+  const wrapper = document.createElement('div');
+  wrapper.className = 'scroll sessions-table-wrap';
+  const table = document.createElement('table');
+  table.className = 'dk-table';
+  const columns = ['Time', 'Action', 'Rule', 'Session', 'Idle', 'Outcome', 'Detail'];
+  const thead = document.createElement('thead');
+  const htr = document.createElement('tr');
+  for (const c of columns) {
+    const th = document.createElement('th');
+    th.scope = 'col';
+    th.textContent = c;
+    htr.append(th);
+  }
+  thead.append(htr);
+  table.append(thead);
+  const tbody = document.createElement('tbody');
+  for (const d of decisions) {
+    const tr = document.createElement('tr');
+    tr.className = 'sessions-row';
+    for (const key of ['at', 'action', 'rule', 'session_id', 'idle_s', 'outcome', 'detail']) {
+      const td = document.createElement('td');
+      const raw = d[key];
+      td.textContent = raw === null || raw === undefined ? '-' : String(raw).slice(0, 160);
+      if (key === 'session_id' || key === 'detail') td.className = 'meta-dim';
+      tr.append(td);
+    }
+    tbody.append(tr);
+  }
+  table.append(tbody);
+  wrapper.append(table);
+  content.append(wrapper);
 }
 
 function setupEvents() {
@@ -921,6 +981,18 @@ function setupEvents() {
   });
 
   byId('session-send-form')?.addEventListener('submit', requestSend);
+
+  byId('audit-refresh-btn')?.addEventListener('click', async () => {
+    const btn = byId('audit-refresh-btn');
+    if (btn) btn.disabled = true;
+    try {
+      renderAudit(await api('/api/sessions/audit?last=5'));
+    } catch {
+      renderAudit(null);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  });
 
   window.addEventListener('popstate', () => {
     const sid = new URLSearchParams(location.search).get('session');

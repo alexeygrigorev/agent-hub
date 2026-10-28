@@ -108,6 +108,15 @@
         <div id="sessions-tree-container"></div>
       </section>
 
+      <section class="dk-card dk-stack sessions-card" id="audit-section" hidden>
+        <div class="sessions-audit-bar">
+          <h2 class="sessions-section-title">Idle Audit</h2>
+          <button class="dk-button dk-button--secondary dk-button--sm" type="button" id="audit-refresh-btn">Refresh</button>
+        </div>
+        <p class="dk-muted" id="audit-summary" role="status"></p>
+        <div id="audit-content"></div>
+      </section>
+
       <section class="dk-card dk-stack sessions-card session-detail" id="session-detail-section" aria-label="Session detail" hidden>
         <div class="session-detail__bar">
           <button class="dk-button dk-button--secondary dk-button--sm" type="button" id="session-detail-back">&larr; Back to sessions</button>
