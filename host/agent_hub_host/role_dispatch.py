@@ -37,6 +37,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from .session_rules import AWS_MAIN_TEMP_RULE
 
+from .dispatch_common import _resolve, expand_trusted_path, scrub
 from . import private_fs
 from . import native_sessions as ns
 from .guarded_root import get_pid_starttime_ticks
@@ -78,25 +79,6 @@ class DispatchError(RuntimeError):
     def __init__(self, message: str, prelaunch_refusal: bool = False):
         super().__init__(message)
         self.prelaunch_refusal = prelaunch_refusal
-
-
-def scrub(text: Any, *secrets: Optional[str]) -> str:
-    out = str(text)
-    for s in secrets:
-        if isinstance(s, str) and s:
-            out = out.replace(s, "[redacted]")
-    return out
-
-
-def _resolve(path: str | os.PathLike) -> pathlib.Path:
-    return pathlib.Path(os.path.expanduser(str(path))).resolve()
-
-
-def expand_trusted_path(raw: str | os.PathLike) -> str:
-    s = str(raw)
-    if s == "~" or s.startswith("~/"):
-        s = os.path.expanduser(s)
-    return s
 
 
 def _is_within(child: pathlib.Path, parent: pathlib.Path) -> bool:

@@ -47,6 +47,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from .dispatch_common import _resolve, expand_trusted_path, scrub
 from .guarded_root import (
     HB_STALE_SEC,
     WINDOW_SEC,
@@ -92,28 +93,10 @@ class DispatchError(RuntimeError):
     """Raised when trusted Root dispatch is refused or fails. Never hidden."""
 
 
-def scrub(text: Any, *secrets: Optional[str]) -> str:
-    out = str(text)
-    for s in secrets:
-        if isinstance(s, str) and s:
-            out = out.replace(s, "[redacted]")
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Trusted configuration and entrypoint validation (B4)
 # ---------------------------------------------------------------------------
 
-def _resolve(path: str | os.PathLike) -> pathlib.Path:
-    return pathlib.Path(os.path.expanduser(str(path))).resolve()
-
-
-def expand_trusted_path(raw: str | os.PathLike) -> str:
-    """Expand a configured path: absolute, or ``~`` / ``~/...`` (never ``~user``)."""
-    s = str(raw)
-    if s == "~" or s.startswith("~/"):
-        s = os.path.expanduser(s)
-    return s
 
 
 def validate_entrypoint(
