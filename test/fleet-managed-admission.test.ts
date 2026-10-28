@@ -9,7 +9,7 @@ const admin = { caller: { isAdmin: true, actor: 'test-admin', kind: 'human' }, s
 const now = Date.now();
 const iso = (delta = 0) => new Date(now + delta).toISOString();
 const refusal = { engine: 'codex', account: 'shared-codex', profile: 'hub-shared-codex',
-  mode: 'interactive', reason: 'codex_quota_gate_quota_unavailable', observed_at: iso() };
+  mode: 'interactive', reason: 'codex_quota_gate_codex_reserve_required', observed_at: iso() };
 
 async function fixture(refusals: any[], fn: (service: FleetService) => void) {
   const bindings = env as unknown as Env;

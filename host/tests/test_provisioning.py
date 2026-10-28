@@ -716,7 +716,7 @@ def test_check_codex_quota_gate_contract(monkeypatch):
         }
     }
     monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_real))
-    allowed, reason = p.check_codex_quota_gate(env)
+    allowed, reason = p._probe_codex_quota_gate(env)
     assert allowed is True
     assert reason == 'ok'
 
@@ -734,7 +734,7 @@ def test_check_codex_quota_gate_contract(monkeypatch):
         }
     }
     monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_9))
-    allowed, reason = p.check_codex_quota_gate(env)
+    allowed, reason = p._probe_codex_quota_gate(env)
     assert allowed is True
     assert reason == 'ok'
 
@@ -750,7 +750,7 @@ def test_check_codex_quota_gate_contract(monkeypatch):
         }
     }
     monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_zero))
-    allowed, reason = p.check_codex_quota_gate(env)
+    allowed, reason = p._probe_codex_quota_gate(env)
     assert allowed is False
     assert reason == 'codex_reserve_required'
 
@@ -767,7 +767,7 @@ def test_check_codex_quota_gate_contract(monkeypatch):
         }
     }
     monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_low))
-    allowed, reason = p.check_codex_quota_gate(env)
+    allowed, reason = p._probe_codex_quota_gate(env)
     assert allowed is False
     assert reason == 'codex_reserve_required'
 
@@ -777,9 +777,9 @@ def test_check_codex_quota_gate_contract(monkeypatch):
     configured['codex'] = 0.0
     monkeypatch.setattr(mc, 'reserve_percent', broken_reserve)
     monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_real))
-    allowed, reason = p.check_codex_quota_gate(env)
+    allowed, reason = p._probe_codex_quota_gate(env)
     assert allowed is False
-    assert reason == 'quota_unavailable'
+    assert reason == 'quota_config_invalid'
     monkeypatch.setattr(mc, 'reserve_percent', lambda service: configured[service])
 
     # 3. limit_reached True
@@ -793,9 +793,9 @@ def test_check_codex_quota_gate_contract(monkeypatch):
         }
     }
     monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_limited))
-    allowed, reason = p.check_codex_quota_gate(env)
+    allowed, reason = p._probe_codex_quota_gate(env)
     assert allowed is False
-    assert reason == 'quota_unavailable'
+    assert reason == 'codex_reserve_required'
 
     # 4. Missing required 7d/weekly window
     quse_no_weekly = {
@@ -808,7 +808,7 @@ def test_check_codex_quota_gate_contract(monkeypatch):
         }
     }
     monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_no_weekly))
-    allowed, reason = p.check_codex_quota_gate(env)
+    allowed, reason = p._probe_codex_quota_gate(env)
     assert allowed is False
     assert reason == 'quota_unavailable'
 
@@ -823,7 +823,7 @@ def test_check_codex_quota_gate_contract(monkeypatch):
         }
     }
     monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_nan))
-    allowed, reason = p.check_codex_quota_gate(env)
+    allowed, reason = p._probe_codex_quota_gate(env)
     assert allowed is False
     assert reason == 'quota_unavailable'
 
@@ -838,7 +838,7 @@ def test_check_codex_quota_gate_contract(monkeypatch):
         }
     }
     monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_stale))
-    allowed, reason = p.check_codex_quota_gate(env)
+    allowed, reason = p._probe_codex_quota_gate(env)
     assert allowed is False
     assert reason == 'stale_window_evidence'
 
@@ -870,7 +870,7 @@ def test_check_codex_quota_gate_401_error_shape_refuses_with_quota_unavailable(m
         }
     }
     monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_401))
-    allowed, reason = p.check_codex_quota_gate(env)
+    allowed, reason = p._probe_codex_quota_gate(env)
     assert allowed is False
     assert reason == 'quota_unavailable'
 
@@ -886,7 +886,7 @@ def test_check_codex_quota_gate_401_error_shape_refuses_with_quota_unavailable(m
         }
     }
     monkeypatch.setattr(p.subprocess, 'run', lambda *a, **k: mock_proc(quse_fresh))
-    allowed, reason = p.check_codex_quota_gate(env)
+    allowed, reason = p._probe_codex_quota_gate(env)
     assert allowed is True
     assert reason == 'ok'
 

@@ -119,6 +119,28 @@ export function evaluateQuotaAdmission(input: QuotaAdmissionInput): QuotaAdmissi
   return { ok: true, reason: "eligible", remaining };
 }
 
+/** Placement tolerates probe failure, while positive exhaustion/backoff still holds.
+ * Unknown stays null: callers must use a ranking floor, never invent a balance.
+ */
+export function evaluateLaunchQuota(input: QuotaAdmissionInput): QuotaAdmissionResult {
+  const strict = evaluateQuotaAdmission(input);
+  if (strict.ok) return strict;
+  const q = input.quota;
+  if (q?.details?.limit_reached === true) return { ok: false, reason: 'limit_reached', remaining: null };
+  const until = Date.parse(q?.details?.cooldown_until);
+  if (Number.isFinite(until) && until > input.nowMs) return { ok: false, reason: 'cooldown_active', remaining: null };
+  if (input.provider === 'grok') return strict; // entitlement is positive evidence
+  const reserve = input.reserves[input.provider] ?? 0;
+  let remaining: number | null = null;
+  for (const w of Object.values(q?.windows || {}) as any[]) {
+    if (w?.present === false || typeof w?.percent_remaining !== 'number' || !Number.isFinite(w.percent_remaining)
+        || w.percent_remaining < 0 || w.percent_remaining > 100) continue;
+    remaining = remaining === null ? w.percent_remaining : Math.min(remaining, w.percent_remaining);
+  }
+  if (remaining !== null && remaining <= reserve) return { ok: false, reason: 'reserve', remaining };
+  return { ok: true, reason: 'quota_probe_warning:' + strict.reason, remaining };
+}
+
 /* ------------------------------------------------------------------ */
 /* TBM Phase 2: floors + kill-switch for autonomous (non-interactive)   */
 /* admission. Pure functions over tbm_quota_pools rows; fail closed.    */

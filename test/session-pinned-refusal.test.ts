@@ -36,13 +36,13 @@ describe('pinned session refusal diagnostics (c22a5453)', () => {
       }
       const quota = ['codex-orin', 'shared-codex'].map(account => ({
         engine: 'codex', account, profile: 'hub-' + account, mode: 'interactive',
-        reason: 'codex_quota_gate_quota_check_failed', observed_at: at,
+        reason: 'codex_quota_gate_codex_reserve_required', observed_at: at,
       }));
       hub.sql.exec('UPDATE machines SET capabilities = ? WHERE id = ?', JSON.stringify({ ...caps, fleet_route_rejections: quota }), machine);
       const held: any = plan({ workspace: 'unadvertised' });
       expect(held.selected).toBeNull();
       expect(held.rejected).toHaveLength(2);
-      expect(held.rejected.every((r: any) => r.reason === 'codex_quota_gate_quota_check_failed')).toBe(true);
+      expect(held.rejected.every((r: any) => r.reason === 'codex_quota_gate_codex_reserve_required')).toBe(true);
     });
   });
 

@@ -588,7 +588,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
     });
     expect(modelCandidates({ tier: 'daily' }, goRoute, goAd, quotaFor(80), t).length).toBeGreaterThan(0);
     // Codex has no reserve (intake 4f6cf562): 10% is offered, depletion and
-    // an unavailable sibling window offer no model.
+    // unavailable sibling windows warn while known depletion offers no model.
     const codexAd = [{ engine: 'codex', profile: null, model: 'gpt-6.1-sol', effort: 'high', account: 'm13-c' }];
     const codexRoute = { provider: 'codex', engine: 'codex', profile: null, account: 'm13-c' };
     const codexInput = { tier: 'daily', preferred_runner: 'codex' };
@@ -600,7 +600,7 @@ describe('M13 quota dashboard vertical slice (HTTP + SQLite)', () => {
         '5h': { present: false, percent_remaining: null, reset_at: null, error: 'unavailable' },
         weekly: { present: true, percent_remaining: 80, reset_at: new Date(t + 3600000).toISOString() },
       },
-    }, t)).toEqual([]);
+    }, t).length).toBeGreaterThan(0);
     // Disabled-provider engines offer no models even with healthy quota.
     const grokAd = [{ engine: 'grok', profile: null, model: 'grok-4.6', effort: 'high', account: 'm13-g' }];
     const grokRoute = { provider: 'grok', engine: 'grok', profile: null, account: 'm13-g' };

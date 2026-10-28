@@ -1378,6 +1378,14 @@ def quse_argv(env):
 
 
 def check_codex_quota_gate(env):
+    """Probe failures warn; positive quota exhaustion still refuses execution."""
+    allowed, reason = _probe_codex_quota_gate(env)
+    if not allowed and reason in ('quota_unavailable', 'quota_check_failed', 'stale_window_evidence'):
+        return True, 'quota_probe_warning:' + reason
+    return allowed, reason
+
+
+def _probe_codex_quota_gate(env):
     """Enforce the configured weekly quota reserve for OpenAI Codex before execution.
 
     The reserve comes from config/model-routing.json rules.reserve_percent
@@ -1390,7 +1398,7 @@ def check_codex_quota_gate(env):
         try:
             reserve = reserve_percent('codex')
         except Exception:
-            return False, 'quota_unavailable'
+            return False, 'quota_config_invalid'
         # UTF-8 both ways: the Windows default code page would otherwise make
         # quse's or our decoding raise on non-ASCII account metadata.
         env = dict(env, PYTHONIOENCODING='utf-8', PYTHONUTF8='1')
@@ -1404,7 +1412,22 @@ def check_codex_quota_gate(env):
             return False, 'quota_unavailable'
         data = json.loads(text[idx:])
         codex_data = data.get('codex')
-        if not isinstance(codex_data, dict) or codex_data.get('status') != 'ok':
+        if not isinstance(codex_data, dict):
+            return False, 'quota_unavailable'
+        details = codex_data.get('details')
+        if isinstance(details, dict) and details.get('limit_reached') is True:
+            return False, 'codex_reserve_required'
+        # Preserve positive exhaustion even when status or a sibling window
+        # is unknown. Probe failure cannot erase a known exhausted window.
+        windows = codex_data.get('windows')
+        for win in windows.values() if isinstance(windows, dict) else ():
+            if not isinstance(win, dict) or win.get('present') is False:
+                continue
+            perc = win.get('percent_remaining')
+            if (isinstance(perc, (int, float)) and not isinstance(perc, bool)
+                    and math.isfinite(perc) and 0 <= perc <= reserve):
+                return False, 'codex_reserve_required'
+        if codex_data.get('status') != 'ok':
             return False, 'quota_unavailable'
         details = codex_data.get('details')
         if not isinstance(details, dict) or details.get('limit_reached') is not False:
@@ -1545,6 +1568,8 @@ def execute():
         is_diagnostic = b['args'] + extra_argv in (["--version"], ["-v"], ["--help"], ["-h"])
         if b['provider'] == 'codex' and not is_diagnostic:
             allowed, reason = check_codex_quota_gate(env)
+            if allowed and reason != 'ok':
+                print(json.dumps({'provider': 'codex', 'quota_warning': reason}), file=sys.stderr)
             if not allowed:
                 print(json.dumps({'provider': 'codex', 'launch_allowed': False, 'reason': reason}), file=sys.stderr)
                 sys.exit(75)
@@ -1667,15 +1692,15 @@ def admission():
                     home = dest / 'home'
                     env = engine_environment(bundle, home, dest)
                     allowed, gate_reason = check_codex_quota_gate(env)
+                    if allowed and gate_reason != 'ok':
+                        result['quota_warning'] = gate_reason
                     if not allowed:
                         slug = str(gate_reason or 'quota_unavailable')
                         slug = ''.join(c if (c.isalnum() or c == '_') else '_' for c in slug)[:64] or 'quota_unavailable'
                         result['launch_allowed'] = False
                         result['reason'] = 'codex_quota_gate_' + slug
         except Exception:
-            result['launch_allowed'] = False
-            if not isinstance(result.get('reason'), str) or not result.get('reason'):
-                result['reason'] = 'codex_quota_gate_quota_check_failed'
+            result['quota_warning'] = 'quota_probe_warning:quota_check_failed'
 
     print(json.dumps(result))
 

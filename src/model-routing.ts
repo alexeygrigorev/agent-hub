@@ -1,5 +1,5 @@
 import policy from '../config/model-routing.json';
-import { evaluateQuotaAdmission } from './quota_admission';
+import { evaluateLaunchQuota } from './quota_admission';
 import { canonicalAccountLabel } from './quota';
 import { grokDemotion, netHeadroom, pacingFor, providerPreference, resetUrgency, routeScore, type ProviderPacing, type RouteScoreFactors } from './pacing';
 export { policy };
@@ -31,12 +31,12 @@ export function modelCandidates(input: any, route: any, advertisement: any, quot
   }).map(m => {
     // Canonical fail-closed admission shared with dispatch/accountStatus/claim.
     // Policy data (reserves, ranking, preferences) is unchanged and still owned here.
-    const admission = evaluateQuotaAdmission({ provider: m.provider, quota, subscriptionObservedAt: null, nowMs: now, reserves: ((policy.rules as any).reserve_percent || {}) as Record<string, number> });
+    const admission = evaluateLaunchQuota({ provider: m.provider, quota, subscriptionObservedAt: null, nowMs: now, reserves: ((policy.rules as any).reserve_percent || {}) as Record<string, number> });
     if (!admission.ok) return null;
     const windows: any[] = Object.values(quota?.windows || {}).filter((w: any) => w.present !== false && Number.isFinite(w.percent_remaining));
-    const remaining = Math.min(...windows.map(w => w.percent_remaining)) / 100;
+    const remaining = (admission.remaining ?? policy.rules.headroom_floor * 100) / 100;
     if (!Number.isFinite(remaining) || remaining <= 0 || remaining * 100 <= ((policy.rules.reserve_percent as any)[m.provider] ?? 0)) return null;
-    const hours = Math.min(...windows.map(w => (Date.parse(w.reset_at) - now) / 3600000));
+    const hours = windows.length ? Math.min(...windows.map(w => (Date.parse(w.reset_at) - now) / 3600000)) : Infinity;
     const paced = pacingFor(pacing, m.provider, route.account, route.provider);
     if (paced.halted) return null; // tbm kill switch or floor breach: no auto-routed burn on this route.
     const headroom = netHeadroom(remaining * 100, (policy.rules.reserve_percent as any)[m.provider] ?? 0);

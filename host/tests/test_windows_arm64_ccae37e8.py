@@ -204,7 +204,7 @@ class CodexQuotaGateWindowsTest(unittest.TestCase):
     def test_missing_quse_is_unavailable_not_check_failed(self):
         with patch.object(provisioning, 'quse_argv', return_value=['quse']), \
                 patch.object(provisioning.subprocess, 'run', side_effect=FileNotFoundError('quse')):
-            self.assertEqual(provisioning.check_codex_quota_gate({}), (False, 'quota_unavailable'))
+            self.assertEqual(provisioning.check_codex_quota_gate({}), (True, 'quota_probe_warning:quota_unavailable'))
 
     def test_probe_timeout_is_unavailable_not_check_failed(self):
         """A probe that exceeds the 30s budget produced no evidence.
@@ -216,7 +216,7 @@ class CodexQuotaGateWindowsTest(unittest.TestCase):
         with patch.object(provisioning, 'quse_argv', return_value=['quse']), \
                 patch.object(provisioning.subprocess, 'run',
                              side_effect=subprocess.TimeoutExpired(cmd=['quse', 'codex'], timeout=30)):
-            self.assertEqual(provisioning.check_codex_quota_gate({}), (False, 'quota_unavailable'))
+            self.assertEqual(provisioning.check_codex_quota_gate({}), (True, 'quota_probe_warning:quota_unavailable'))
 
     def test_host_package_depends_on_quse(self):
         text = (Path(__file__).resolve().parents[2] / 'pyproject.toml').read_text()

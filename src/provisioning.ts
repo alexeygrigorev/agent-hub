@@ -82,7 +82,10 @@ export class ProvisioningService {
       if (!data || !LABEL.test(data.label)) return reply({ error: 'invalid_label' }, 400);
       const a = this.sql.exec('SELECT * FROM fleet_accounts WHERE label = ?', data.label).toArray()[0];
       const installed = this.sql.exec('SELECT 1 FROM engine_installations i JOIN engine_bundles b ON b.label=i.label AND b.revision=i.revision WHERE i.machine_id=? AND i.label=?', auth.caller.machineId, data.label).toArray().length;
-      return reply({ launch_allowed: !!installed && !!a && this.fleet.accountStatus(a).status === 'ok', profile_supported: !!installed, account_label: data.label, observed_at: new Date().toISOString() });
+      const quotaStatus = a ? this.fleet.accountStatus(a).status : 'unmapped';
+      return reply({ launch_allowed: !!installed && !!a && quotaStatus !== 'blocked', profile_supported: !!installed,
+        ...(quotaStatus === 'unknown' ? { quota_warning: 'quota_probe_unavailable' } : {}),
+        account_label: data.label, observed_at: new Date().toISOString() });
     }
     if (path === '/api/engines/logins' && request.method === 'POST') {
       if (!admin) return reply({error:'forbidden'},403);

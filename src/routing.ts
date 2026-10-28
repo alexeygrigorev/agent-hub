@@ -2,7 +2,7 @@ import { sanitizeExitEvidence, redactExitText } from './exit-evidence';
 /** Durable client task queue layered over the existing quota-aware fleet launcher. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { modelCandidates, taskTier, policy } from './model-routing';
-import { evaluateQuotaAdmission } from './quota_admission';
+import { evaluateLaunchQuota } from './quota_admission';
 import { canonicalQuotaProvider } from './quota';
 import { loadProviderPacing } from './pacing';
 import { ensureTbmControllerSchema, recordSessionOutcomeReward } from './tbm-controller';
@@ -157,7 +157,7 @@ export class RoutingService {
             { machine_id: ad.machine_id, profile: r.profile });
           let subQuota = observation?.quota ?? null;
           if (subQuota) {
-            const adm = evaluateQuotaAdmission({ provider, quota: subQuota,
+            const adm = evaluateLaunchQuota({ provider, quota: subQuota,
               subscriptionObservedAt: observation!.subscriptionObservedAt, nowMs: this.now(),
               reserves: (((policy as any).rules as any).reserve_percent || {}) as Record<string, number> });
             if (!adm.ok) subQuota = null;

@@ -380,15 +380,15 @@ describe('generic accounts and launch placement', () => {
     sql.exec("UPDATE machines SET last_heartbeat = ? WHERE id = 'win35'", JSON.stringify({ mem_avail_mb: 32000, disk_free_gb: 80, load: [1], cpu_usage: freshCpu(iso()), gate: { launch_allowed: false, at: iso() } }));
     expect((s.plan(intent({ machine: 'win35' })) as any).rejected?.some((r: any) => r.reason === 'admission_unknown') ?? false).toBe(false);
   }));
-  it('uses conservative shared quota, ignores absent windows, and fails closed on unknown/expired snapshots', async () => fixture(async (s, sql) => {
+  it('uses conservative shared quota, ignores absent windows, and warns on unknown/expired snapshots', async () => fixture(async (s, sql) => {
     await configure(s, true);
     const quota = (percent: number | null) => JSON.stringify({ codex: { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { week: { present: true, percent_remaining: percent, reset_at: iso(3600000) }, absent: { present: false, percent_remaining: null } } } });
     sql.exec("UPDATE host_quota_snapshots SET routes_json = ? WHERE host_id = 'win35'", quota(15));
     expect((s.plan(intent()) as any).selected).toBeNull();
     sql.exec("UPDATE host_quota_snapshots SET routes_json = ? WHERE host_id = 'win35'", quota(null));
-    expect((s.plan(intent()) as any).rejected.every((r: any) => r.reason === 'account_unknown')).toBe(true);
+    expect((s.plan(intent()) as any).selected).toBeTruthy();
     sql.exec('UPDATE host_quota_snapshots SET captured_at = ?', iso(-1200001));
-    expect((s.plan(intent()) as any).selected).toBeNull();
+    expect((s.plan(intent()) as any).selected.quota_warning).toBe('quota_probe_unavailable');
   }));
   it('reserves a shared account once across machines; the second waiter queues instead of failing', async () => fixture(async (s) => {
     await configure(s, true);
@@ -907,7 +907,7 @@ describe('generic accounts and launch placement', () => {
     config.routes[1].machine_id = 'hetzner';
     config.routes[1].profile = 'secondary' as any;
     await s.handle(request('/accounts', config, 'PUT'), admin);
-    expect((s.plan(intent({ machine: 'hetzner' })) as any).selected).toBeNull();
+    expect((s.plan(intent({ machine: 'hetzner' })) as any).selected.quota_warning).toBe('quota_probe_unavailable');
     const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
     const reports = { subscriptions: [{ service: 'codex', account: 'desktop-codex', plan: 'pro', quota }] };
     expect((await s.handle(request('/subscriptions', reports, 'PUT'), host('hetzner'))).status).toBe(200);
@@ -943,16 +943,16 @@ describe('generic accounts and launch placement', () => {
     expect(view.sessions[0].machine_id).toBe('win35'); expect(view.sessions[0].workspace).toBe('/repo');
     expect((await s.handle(request('/sessions', { ...sessions, machine_id: 'hetzner' }, 'PUT'), host('win35'))).status).toBe(400);
   }));
-  it('requires a fresh account observation on the selected machine while keeping the other fresh machine usable', async () => fixture(async (s, sql) => {
+  it('warns for a missing machine observation while keeping the fresh machine usable', async () => fixture(async (s, sql) => {
     await configure(s, true);
     sql.exec("UPDATE host_quota_snapshots SET captured_at = ? WHERE host_id = 'win35'", iso(-1200001));
-    expect((s.plan(intent({ machine: 'win35' })) as any).selected).toBeNull();
+    expect((s.plan(intent({ machine: 'win35' })) as any).selected.quota_warning).toBe('quota_probe_unavailable');
     expect((s.plan(intent({ machine: 'hetzner' })) as any).selected.machine).toBe('hetzner');
   }));
   it('does not attribute default quota to a named profile and clears reports on provider remapping', async () => fixture(async (s, sql) => {
     const config = registry(); config.routes[0].profile = 'secondary' as any;
     await s.handle(request('/accounts', config, 'PUT'), admin);
-    expect((s.plan(intent({ machine: 'hetzner' })) as any).selected).toBeNull();
+    expect((s.plan(intent({ machine: 'hetzner' })) as any).selected.quota_warning).toBe('quota_probe_unavailable');
     sql.exec('INSERT INTO fleet_subscriptions VALUES (?, ?, ?, ?, ?, ?)', 'hetzner', 'shared-codex', 'codex', 'pro', iso(), '{}');
     config.accounts[0].provider = 'claude'; config.accounts[0].reserve_percent = 0;
     await s.handle(request('/accounts', config, 'PUT'), admin);

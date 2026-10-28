@@ -10,7 +10,7 @@ import { ClaimAdmission, sameIntent, sameEditCaller, type EditAuthority, type Ad
 import { effectiveCheckin } from './registry';
 import { taskTier, policy } from './model-routing';
 import { QUOTA_SCHEMA_SQL, QUOTA_STALE_MS, LEGACY_ACCOUNT_LABELS, canonicalAccountLabel, canonicalHarness, canonicalQuotaProvider, dedupeAccountsByCanonical, ensureTbmQuotaSchema, legacyRouteKeyFor, snapshotRouteForAccount } from './quota';
-import { evaluateQuotaAdmission } from './quota_admission';
+import { evaluateLaunchQuota } from './quota_admission';
 import { adoptObservedNativeSessions, reconcileUnboundFleetSessions } from './session_control';
 import { isValidMachineId } from './machine-id';
 import { LivenessService } from './liveness';
@@ -502,16 +502,18 @@ export class FleetService {
       const prov = this.observationProvenance(account, route);
       if (!prov) continue;
       observed++;
-      const adm = evaluateQuotaAdmission({ provider, quota: prov.quota, subscriptionObservedAt: prov.subscriptionObservedAt, nowMs: this.now(), reserves });
+      const adm = evaluateLaunchQuota({ provider, quota: prov.quota, subscriptionObservedAt: prov.subscriptionObservedAt, nowMs: this.now(), reserves });
       if (!adm.ok) {
-        if (adm.reason === 'limit_reached') blocked = true;
+        if (['limit_reached', 'cooldown_active'].includes(adm.reason)) blocked = true;
         else if (adm.reason === 'reserve') {
           if (adm.remaining !== null) remaining = remaining === null ? adm.remaining : Math.min(remaining, adm.remaining);
         } else unknown = true;
         continue;
       }
-      remaining = remaining === null ? adm.remaining! : Math.min(remaining, adm.remaining!);
-      healthy = true;
+      if (adm.remaining !== null) {
+        remaining = remaining === null ? adm.remaining : Math.min(remaining, adm.remaining);
+        healthy = true;
+      } else unknown = true;
     }
     if (remaining !== null && remaining <= account.reserve_percent) blocked = true;
     // Capacity counts only live machines (Hetzner urgent live, legacy stale):
@@ -866,10 +868,15 @@ export class FleetService {
       const absoluteCwd = typeof request.cwd === 'string' && (request.cwd.startsWith('/') || /^[A-Za-z]:[\\/]/.test(request.cwd)) ? request.cwd : null;
       // Host admission probes the credential actually used for execution.
       // A healthy sibling account must not mask a refusal for this route.
-      const gateRefusal = Array.isArray(caps.fleet_route_rejections) && caps.fleet_route_rejections.find((r: any) =>
+      const gateProjection = Array.isArray(caps.fleet_route_rejections) && caps.fleet_route_rejections.find((r: any) =>
         r.engine === route.engine && r.account === route.account && (r.profile ?? null) === route.profile
         && r.mode === request.mode && /^codex_quota_gate_[a-z0-9_]{1,64}$/.test(r.reason)
         && fresh(r.observed_at, this.now(), 300000));
+      const gateRefusal = gateProjection && !['codex_quota_gate_quota_unavailable', 'codex_quota_gate_quota_check_failed', 'codex_quota_gate_stale_window_evidence'].includes(gateProjection.reason) ? gateProjection : null;
+      const routeProv = definition ? this.observationProvenance(definition, route) : null;
+      const routeQuota = evaluateLaunchQuota({ provider: String(definition?.provider ?? ''), quota: routeProv?.quota ?? null,
+        subscriptionObservedAt: routeProv?.subscriptionObservedAt ?? null, nowMs: this.now(),
+        reserves: (policy.rules.reserve_percent || {}) as Record<string, number> });
       const memory = () => {
         const key=JSON.stringify([route.machine_id,route.engine]);
         if(!memoryByRoute.has(key)) memoryByRoute.set(key,this.resources.headroom(route.machine_id,request,route.engine));
@@ -928,8 +935,8 @@ export class FleetService {
       else if (Number.isFinite(hb.disk_free_gb) && hb.disk_free_gb < this.resources.config().disk_floor_gb) reason = 'disk_floor';
       else if (request.mode === 'headless' && disk()?.admitted === false) reason = 'launcher_disk_reserve';
       else if (!cpu().admitted) reason = cpu().reason!;
-      else if (!account || account.status !== 'ok') reason = 'account_' + (account?.status || 'unmapped');
-      else if (!this.observation(definitions.get(route.account), route)) reason = 'machine_account_quota_unknown';
+      else if (!account || account.status === 'blocked') reason = 'account_' + (account?.status || 'unmapped');
+      else if (!routeQuota.ok) reason = 'quota_' + routeQuota.reason;
       else if (account.available_slots < 1) reason = 'account_concurrency';
       if (reason) { evidence(); rejected.push({ machine: route.machine_id, engine: route.engine, reason, ...(reason === 'account_concurrency' ? { account: route.account, concurrency: { active: account!.active, limit: account!.max_concurrency, available: account!.available_slots }, quota_status: account!.status } : {}), ...(reason === 'launcher_memory_reserve' ? { memory: memory() } : {}), ...(reason === 'launcher_disk_reserve' ? { disk: disk() } : {}), ...(reason === 'disk_floor' ? { disk_free_gb: hb.disk_free_gb, disk_floor_gb: this.resources.config().disk_floor_gb } : {}), ...(['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(reason) ? {cpu:cpu()} : {}) }); continue; }
       const family = canonicalQuotaProvider(definitions.get(route.account)?.provider as string);
@@ -957,14 +964,14 @@ export class FleetService {
       const urgency = ownPools.length ? Math.max(...ownPools.map(p => resetUrgency(netHeadroom(p.headroom_percentage, p.hard_floor_percent),
         (p.reset_at_ms - this.now()) / 3600000))) : 1;
       const tbm_weight = request.mode === 'interactive' ? 1 : tbm.pacing * tbm.banked * (tbm.efficiency ?? 1) * urgency;
-      const score = (account!.remaining_percent! / 100) / (1 + (hb.cpu_usage?.busy_cores ?? caps.cpu_count) / caps.cpu_count + pending) * tbm_weight;
+      const score = ((routeQuota.remaining ?? 5) / 100) / (1 + (hb.cpu_usage?.busy_cores ?? caps.cpu_count) / caps.cpu_count + pending) * tbm_weight;
       // Windows hosts are overflow for work that does not ask for Windows:
       // agent tooling assumes Linux, so they win only when every Linux route
       // is held (loaded, capped or quota-limited). Pinned and os:windows
       // requests are unaffected (intake a3227276 AC3).
       const overflow = overflowMachine(machine, needs);
       candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile,
-        ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal'), selection: model, score, workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
+        ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal'), selection: model, score, ...(routeQuota.reason !== 'eligible' || (gateProjection && !gateRefusal) ? { quota_warning: 'quota_probe_unavailable' } : {}), workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
     }
     candidates.sort((a, b) => Number(!!a.overflow) - Number(!!b.overflow) || b.score - a.score || a.machine.localeCompare(b.machine) || a.engine.localeCompare(b.engine));
     // The stored intent carries the winner's normalized workspace: a bare
@@ -973,6 +980,12 @@ export class FleetService {
     // already capable keep their exact legacy meaning (host map keys).
     if (candidates[0] && typeof candidates[0].workspace === 'string' && candidates[0].workspace !== request.workspace) {
       request.workspace = candidates[0].workspace;
+    }
+    const codexSelector = input.engine === 'codex' || overrideModels.some(m => m.provider === 'codex');
+    if (!candidates.length && codexSelector && !input.account && rejected.some(r =>
+      r.reason.startsWith('codex_quota_gate_') || ['account_blocked', 'account_unknown', 'engine_auth_expired'].includes(r.reason))) {
+      const fallback: any = this.plan({ ...input, engine: undefined, tier: input.tier ?? taskTier({ model: overrideModels[0]?.id }) });
+      if (!fallback.error) return { ...fallback, request: { ...fallback.request, engine: request.engine }, rejected: [...rejected, ...fallback.rejected], fallback_from: input.engine };
     }
     return { request, selected: candidates[0] || null, candidates, rejected, evidence: Object.fromEntries(evidenceByMachine) };
     });
@@ -1829,11 +1842,11 @@ export class FleetService {
           const selectedModel = parsed(row.model_selection_json)?.model;
           if (typeof selectedModel !== 'string' || data.model !== selectedModel) return response({ error: 'model_unsupported', detail: 'Host must confirm the resolved model before native launch' }, 409);
           const account: any = this.sql.exec('SELECT * FROM fleet_accounts WHERE label = ?', row.account).toArray()[0];
-          if (!account || this.accountStatus(account).status !== 'ok' || !this.observation(account, row)) return response({ error: 'account_unavailable' }, 409);
+          if (!account || this.accountStatus(account).status === 'blocked') return response({ error: 'account_unavailable' }, 409);
           // Re-verify the exact launch route quota inside the atomic claim: no manual override bypass.
           const claimRoute: any = this.sql.exec('SELECT machine_id, profile FROM fleet_routes WHERE machine_id = ? AND account = ?', row.machine_id, row.account).toArray()[0];
           const claimProv = claimRoute ? this.observationProvenance(account, claimRoute) : null;
-          const claimAdm = claimProv ? evaluateQuotaAdmission({ provider: account.provider, quota: claimProv.quota, subscriptionObservedAt: claimProv.subscriptionObservedAt, nowMs: this.now(), reserves: ((((policy as any).rules as any).reserve_percent || {}) as Record<string, number>) }) : null;
+          const claimAdm = evaluateLaunchQuota({ provider: account.provider, quota: claimProv?.quota ?? null, subscriptionObservedAt: claimProv?.subscriptionObservedAt ?? null, nowMs: this.now(), reserves: ((((policy as any).rules as any).reserve_percent || {}) as Record<string, number>) });
           if (!claimAdm || !claimAdm.ok) return response({ error: 'quota_unavailable', reason: claimAdm ? claimAdm.reason : 'no_quota_evidence' }, 409);
           // Capacity reads reconcile other offers and time may advance during synchronous checks.
           // Never revive a row retired by that sweep; check authority again at the final write.
