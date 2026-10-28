@@ -881,9 +881,6 @@ export class JobsService {
         const p = typeof job.payload === 'string' ? JSON.parse(job.payload) : job.payload;
         if (p?.date) date = p.date;
       } catch {}
-      if (!date && job.idempotency_key && job.idempotency_key.startsWith('writer-run:')) {
-        date = job.idempotency_key.slice('writer-run:'.length);
-      }
       return date ? `writer:${date}` : `job:${job.id}`;
     }
     if (job.kind === 'head-recovery') {
@@ -903,12 +900,13 @@ export class JobsService {
     if (job.kind !== 'writer-run') return false;
     const identity = this.getLeaseNameForJob({ ...job, role_name: null });
     if (!identity.startsWith('writer:')) return false;
-    // Match the existing writer identity, including legacy dated keys without a
-    // payload date. Project, role name, request key and epoch are not identities.
+    // Match the existing writer identity by payload date only. The legacy
+    // idempotency-key fallback (dated keys without payload.date) was retired
+    // with intake 19848714: no stored rows used it and fresh offers always
+    // carry payload.date. Project, role name, request key and epoch are not identities.
     return !!this.sql.exec(`SELECT id FROM jobs WHERE kind='writer-run' AND id!=?
       AND role_effect IS NOT NULL AND role_finish IS NULL
-      AND COALESCE(NULLIF(CASE WHEN json_valid(payload) THEN json_extract(payload,'$.date') END,''),
-        CASE WHEN substr(idempotency_key,1,11)='writer-run:' THEN substr(idempotency_key,12) END)=? LIMIT 1`,
+      AND COALESCE(NULLIF(CASE WHEN json_valid(payload) THEN json_extract(payload,'$.date') END,''),'')=? LIMIT 1`,
       job.id, identity.slice('writer:'.length)).toArray()[0];
   }
 
