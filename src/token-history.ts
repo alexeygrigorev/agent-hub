@@ -15,7 +15,6 @@ import { canonicalAccountLabel, canonicalHarness } from './quota';
  */
 
 export const TOKEN_SCHEMA_VERSION = '1.0';
-export const TOKEN_MAX_BODY_BYTES = 32_768;
 export const TOKEN_MAX_HOURS_PER_POST = 48;
 export const TOKEN_MAX_COUNT = 1e12;
 const TOKEN_LABEL_RE = /^[A-Za-z0-9][A-Za-z0-9_./-]{0,63}$/;

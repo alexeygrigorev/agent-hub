@@ -8,7 +8,6 @@ import type { SqlStorage } from '@cloudflare/workers-types';
 
 type Obj = Record<string, any>;
 
-export const WORKTREE_LIVE_SESSION_STATES = new Set(['queued', 'held', 'offered', 'starting', 'running', 'uncertain']);
 const ORIGINS = new Set(['hub_created', 'hub_resumed', 'hub_recreated', 'session_cwd', 'registered']);
 const OBSERVE_ACTIONS: Record<string, string> = { created: 'hub_created', reused: 'hub_resumed', recreated: 'hub_recreated' };
 const CLAIM_TIMEOUT_MS = 15 * 60000;

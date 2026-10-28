@@ -129,7 +129,6 @@ export const DEFAULT_RETENTION_BATCH_LIMIT = 100;
 
 const SAFE_KEY_REGEX = /^[A-Za-z0-9._:-]{1,128}$/;
 const HUMAN_SUB_REGEX = /^[A-Za-z0-9._:-]{1,120}$/;
-const AGENT_SEGMENT_REGEX = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const RESERVED_AGENT_NAMESPACE_REGEX =
   /^(human|role|machine|routing-client|admin|root|principal|system|hub|schedule)$/i;
 const RESERVED_AGENT_PREFIX_REGEX = /^(human|role|machine|routing-client):/i;
@@ -321,46 +320,6 @@ export interface ConversationRetentionResult {
   linksDeleted?: number;
   rowsDeleted: number;
   hasMore: boolean;
-}
-
-/** Child join-table handler owned by ConversationLinksService. */
-export interface ConversationLinksHandler {
-  attach(
-    auth: ConversationAuthInput,
-    conversationId: string,
-    input: { kind?: unknown; ref?: unknown; idempotencyKey?: unknown },
-  ): Record<string, unknown>;
-  list(
-    auth: ConversationAuthInput,
-    conversationId: string,
-    options?: { limit?: number; cursor?: string | null },
-  ): Record<string, unknown>;
-  getLink(
-    auth: ConversationAuthInput,
-    conversationId: string,
-    linkId: string,
-  ): Record<string, unknown>;
-  remove(
-    auth: ConversationAuthInput,
-    conversationId: string,
-    linkId: string,
-  ): Record<string, unknown>;
-  reverse(
-    auth: ConversationAuthInput,
-    options: {
-      kind?: string | null;
-      ref?: string | null;
-      limit?: number;
-      cursor?: string | null;
-    },
-  ): Record<string, unknown>;
-  hasExpiredRows(nowMs: number): boolean;
-  hasRowsForConversation(conversationId: string): boolean;
-  deleteChunkForConversation(conversationId: string, limit: number): number;
-  retentionCleanup(
-    nowMs: number,
-    limit: number,
-  ): { rowsDeleted: number; hasMore: boolean };
 }
 
 /**

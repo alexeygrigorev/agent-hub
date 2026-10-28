@@ -29,7 +29,6 @@ export function resolveTokenCapacity(w: any): { known: boolean; total: number | 
   return { known: total !== null && total > 0 && remaining !== null,
     total, remaining: remaining !== null && total !== null ? Math.min(total, remaining) : remaining };
 }
-export const tbmHardFloorTokens = (total: number) => Math.min(total, Math.max(total * 0.05, 50000));
 
 /** A provider-wide snapshot must never be copied onto several independent accounts. */
 export function accountsForHostProvider(sql: SqlStorage, host: string, provider: string): string[] {

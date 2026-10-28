@@ -21,23 +21,6 @@ export interface CallerContext {
   project?: string;
 }
 
-export function parseUtcExpiry(val: unknown): number | null {
-  if (typeof val === 'number') {
-    return Number.isFinite(val) ? Math.floor(val) : null;
-  }
-  if (typeof val === 'string') {
-    const trimmed = val.trim();
-    if (!trimmed) return null;
-    if (/^\d+(\.\d+)?$/.test(trimmed)) {
-      const n = Number(trimmed);
-      return Number.isFinite(n) ? Math.floor(n) : null;
-    }
-    const ms = Date.parse(trimmed);
-    return Number.isFinite(ms) ? ms : null;
-  }
-  return null;
-}
-
 export interface SendOpts {
   senderActor: string;
   toActor: string;

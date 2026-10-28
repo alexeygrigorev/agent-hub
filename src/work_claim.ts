@@ -63,11 +63,6 @@ export function parseNativeActor(actor: unknown): { machineId: string; tag: stri
   return { machineId: m[1], tag: m[2], sessionShort: m[3] ?? null };
 }
 
-/** `project:<project>` broadcast address for mirrored `work.*` envelopes (design 3.3). */
-export function projectBroadcastActor(project: string): string {
-  return `project:${project}`;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -307,19 +302,4 @@ export function redactClaimData<T>(data: T): T {
     return out as unknown as T;
   }
   return data;
-}
-
-/** Columns added to the existing `claims` table for host-attested native rows. */
-export const NATIVE_CLAIM_COLUMNS: Record<string, string> = {
-  work_key: 'TEXT',
-  claim_mode: 'TEXT',
-  claim_source: 'TEXT',
-  worktree: 'TEXT',
-  session_state: 'TEXT',
-  native_claim_id: 'TEXT',
-};
-
-/** A native declaration carries no exclusive weight (design edge case 9). */
-export function isExclusiveClaimMode(mode: unknown): boolean {
-  return mode === 'edit' || mode === 'coord' || mode === undefined || mode === null;
 }

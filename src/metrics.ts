@@ -32,7 +32,6 @@ export const CANONICAL_PROJECT_IDS = [
   "agent-coordination",
 ] as const;
 
-export const OPTIONAL_PROJECT_IDS = new Set<string>(["unattributed"]);
 export const ALLOWED_PROJECT_IDS = new Set<string>([...CANONICAL_PROJECT_IDS, "unattributed"]);
 
 export const COVERAGE_ENUM = new Set(["observed", "unknown", "missing", "unsupported", "partial"]);

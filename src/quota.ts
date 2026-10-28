@@ -5,8 +5,6 @@ import { getSession, allowedCallbackUrls, verifyCsrf } from "./auth/session";
 import { syncTbmFromHostSnapshot, syncTbmFromServerAccounts } from "./tbm-ingestion";
 import { resolveMachineAliases } from "./machine-alias";
 
-export const QUOTA_SCHEMA_version = "1.1";
-export const QUOTA_SCHEMA_VERSIONS = new Set<string>(["1.0", "1.1"]);
 export const QUOTA_MAX_BODY_BYTES = 32_768;
 export const QUOTA_STALE_MS = 1_200_000; // 1200 seconds (20 minutes) conservative boundary
 export const MAX_WINDOWS_PER_PROVIDER = 32;
@@ -88,13 +86,6 @@ export function legacyRouteKeyFor(canonicalProvider: string): string | null {
     if (canonical === canonicalProvider) return legacy;
   }
   return null;
-}
-
-/** Reverse lookup: legacy account labels canonicalizing to the given account. */
-export function legacyLabelsFor(canonicalLabel: string): string[] {
-  return Object.entries(LEGACY_ACCOUNT_LABELS)
-    .filter(([, c]) => c === canonicalLabel)
-    .map(([legacy]) => legacy);
 }
 
 /**
@@ -1946,8 +1937,6 @@ export class QuotaStore {
     return jsonResponse(getRes.body, getRes.status);
   }
 }
-
-export const TSQuotaStore = QuotaStore;
 
 export async function handleQuotaRoutes(
   request: Request,
