@@ -1085,6 +1085,16 @@ export class SessionControlService {
         JSON.stringify({ outcome: 'failed', reason: 'recipient_not_ready' }), this.at(), row.id);
       return;
     }
+    if (row.host_status === 'delivered; awaiting recipient reply') {
+      // The native effect already landed in the recipient pane; only the
+      // correlated reply proof is pending. Land on uncertain, never failed:
+      // failed is terminal with no late-reply promotion, uncertain keeps the
+      // single post-terminal transition (lateReplyAck) available for the
+      // reply that is still in flight.
+      this.sql.exec("UPDATE session_control_commands SET state = 'uncertain', ack_json = ?, poll_at = NULL, updated_at = ? WHERE id = ? AND state IN ('claimed','recorded','transported')",
+        JSON.stringify({ outcome: 'uncertain', reason: 'recipient_reply_pending' }), this.at(), row.id);
+      return;
+    }
     const attempts = row.attempts ?? 1;
     const exhausted = attempts >= 3;
     this.sql.exec("UPDATE session_control_commands SET state = ?, ack_json = ?, poll_at = NULL, attempts = ?, claim_expires_at = ?, updated_at = ? WHERE id = ? AND state IN ('claimed','recorded','transported')",

@@ -438,6 +438,26 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
         perms = settings.setdefault('permissions', {})
         if isinstance(perms, dict):
             perms.setdefault('deny', ['AskUserQuestion'])
+        # Interactive claude sessions report semantic state through the same
+        # hook contract as .codex/hooks.json: UserPromptSubmit/SessionStart ->
+        # working, Stop -> durable idle. Claude never reads .codex/hooks.json,
+        # so a managed-home claude session without these can never push the
+        # fresh state report the aplexer deferred-deliver guard requires and
+        # Hub sends deadlock (no delivery -> no turn -> no Stop). The set
+        # deliberately has NO Notification entry: claude's idle-reminder
+        # notification fires while the session rests and its expiring
+        # `waiting` push would clobber Stop's durable `idle` (REPORTED_STATE_
+        # STALE_MS is 8s), re-creating the same deadlock.
+        a_cmd = shutil.which('a') or str(Path.home() / '.local/bin/a')
+        hooks = settings.setdefault('hooks', {})
+        if isinstance(hooks, dict):
+            working_hook = {"hooks": [{"command": f"{a_cmd} state-report working || true",
+                                       "type": "command"}]}
+            idle_hook = {"hooks": [{"command": f"{a_cmd} state-report idle || true",
+                                    "type": "command"}]}
+            hooks.setdefault('SessionStart', [dict(working_hook)])
+            hooks.setdefault('UserPromptSubmit', [dict(working_hook)])
+            hooks.setdefault('Stop', [dict(idle_hook)])
         with private_fs.parent(settings_path, create=True):
             pass
         private_fs.atomic_write(settings_path, json.dumps(settings, indent=2).encode('utf-8'), 131072)

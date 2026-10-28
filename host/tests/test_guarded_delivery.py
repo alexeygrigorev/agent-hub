@@ -944,3 +944,32 @@ def test_expired_claim_retracts_undelivered_inbox_and_fails_recipient_not_ready(
     assert hub.acks[cid]["reason"] == "recipient_not_ready"
     # Undelivered message in inbox was retracted
     assert len(os.listdir(env["msgs"])) == 0
+
+
+def test_delivered_awaiting_reply_posts_distinct_pending_status(env):
+    """A pane-delivered send pending its reply must NOT report inbox-waiting.
+
+    "waiting in inbox for recipient" is absence-class: the hub expires it to
+    failed recipient_not_ready, which is terminal and can never be promoted by
+    the late reply. "delivered; awaiting recipient reply" expires to uncertain,
+    keeping lateReplyAck available (intake 4f6cf562 AC4).
+    """
+    target = seed_target(env, "awaiting-reply-target")
+    cid = str(uuid.uuid4())
+    hub = MockHub()
+    claim = make_claim(cid)
+    cmd = {"op": "send", "command_id": cid, "generation": 1,
+           "target": {"session_id": target.session_id, "tag": target.tag,
+                      "workspace": target.workspace, "created_at_ms": target.created_at_ms,
+                      "engine": target.engine}, "body": "delivered, reply pending",
+           "await_ack": True}
+    outcome = se.handle_claimed_command(
+        cmd, claim, custody=custody(), journal_dir=env["journal"],
+        executable=env["fake"], request=hub.request)
+    # Guard submitted (transported) but no reply yet: pending, ack not submitted.
+    assert outcome["state"] == "unknown"
+    assert outcome["delivery_state"] == "transported"
+    assert hub.ack_calls == 0
+    posted = hub.statuses[cid]
+    assert posted["status"] == "delivered; awaiting recipient reply", posted
+    assert posted["claim_token"] == claim["claim_token"]

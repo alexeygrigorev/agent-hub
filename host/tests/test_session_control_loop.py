@@ -315,7 +315,11 @@ def test_handle_claimed_send_proof_uses_target_uuid_not_envelope(env):
     assert all(p != "/ack" and not p.endswith("/ack") for _, p, _ in sent["acked"])
     assert any(p.endswith("/status") for _, p, _ in sent["acked"])
     status_payload = next(b for m, p, b in sent["acked"] if p.endswith("/status"))
-    assert status_payload["status"] == "waiting in inbox for recipient"
+    # The guard submitted the envelope (delivery_state transported): the host
+    # must report the reply-pending class, NOT absence-class inbox-waiting —
+    # the hub expires the former to uncertain (late reply can still promote
+    # to acked), the latter to terminal failed recipient_not_ready.
+    assert status_payload["status"] == "delivered; awaiting recipient reply"
     original_id = outcome["original_native_message_id"]
     assert original_id and original_id != rec["id"]
     # The target replies in the native log with correlation + digest echo.

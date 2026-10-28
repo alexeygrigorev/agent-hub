@@ -302,13 +302,21 @@ def _post_inbox_status(
     command_id: str,
     claim_token: str,
     reason: str,
+    status: str = "waiting in inbox for recipient",
 ) -> bool:
-    """Best-effort POST of pending inbox status (AC5).
+    """Best-effort POST of pending status (AC5).
 
-    The server projects ``waiting in inbox for recipient`` + host reason
-    instead of ``claimed`` only after the host reports it under the live claim
+    The server projects the pending status + host reason instead of
+    ``claimed`` only after the host reports it under the live claim
     fence. Failures are ignored by callers: the command stays claimed under
     its lease and the next reconcile cycle retries. Returns True on 2xx.
+
+    The status distinguishes genuinely-undelivered mail ("waiting in inbox
+    for recipient", absence-class: the hub expires it to failed
+    recipient_not_ready) from an effect that already landed and is only
+    awaiting its correlated reply proof ("delivered; awaiting recipient
+    reply", which the hub expires to uncertain so the late reply can still
+    promote the command to acked).
     """
     if request is None:
         return False
@@ -323,7 +331,7 @@ def _post_inbox_status(
             "/api/session-commands/" + command_id + "/status",
             {
                 "claim_token": claim_token,
-                "status": "waiting in inbox for recipient",
+                "status": status,
                 "reason": bounded_reason,
             },
         )
@@ -1526,11 +1534,13 @@ def handle_claimed_command(
             record["ack_submitted"] = False
             record["ack_pending"] = "awaiting_recipient_reply"
             _write_journal(journal_file, record)
+            delivered = outcome.get("delivery_state") == "transported"
             status_posted = _post_inbox_status(
                 request=request,
                 command_id=command_id,
                 claim_token=str(proved["claim_token"]),
                 reason=str(outcome.get("reason", ""))[:512] or "aplexer inbox recorded; recipient has not acknowledged",
+                status="delivered; awaiting recipient reply" if delivered else "waiting in inbox for recipient",
             )
             return {"op": op, **record,
                     "ack": {"submitted": False, "pending": "awaiting_recipient_reply",

@@ -1754,6 +1754,46 @@ describe('bounded command custody recovery', () => {
     }, fakeReserve().hook);
   });
 
+  it('expires a delivered-awaiting-reply claim to uncertain and promotes the late correlated reply to acked', async () => {
+    await fixture(async (s, sql) => {
+      const session: any = await startOk(s, { machine: 'hetzner' });
+      await bindHttp(s, sql, session.id);
+      const cmd: any = await (await s.handle(request(`/api/sessions/${session.id}/send`, { key: 'await-reply', body: 'hello recipient' }), admin)).json();
+      const poll: any = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json();
+      const offer = poll.offers[0];
+      const claim = await claimAs(s, cmd.command_id, offer.correlation);
+
+      // Host reports the effect already landed; only the reply proof is pending.
+      const statusRes = await s.handle(request(`/api/session-commands/${cmd.command_id}/status`, {
+        claim_token: claim.claim_token,
+        status: 'delivered; awaiting recipient reply',
+        reason: 'pane/inbox delivered; correlated reply proof pending',
+      }), host('hetzner'));
+      expect(statusRes.status).toBe(200);
+
+      // Claim expiry must NOT take the absence-class recipient_not_ready path:
+      // the reply is still in flight, so uncertain keeps lateReplyAck available.
+      sql.exec('UPDATE session_control_commands SET claim_expires_at = ? WHERE id = ?', new Date(Date.now() - 1000).toISOString(), cmd.command_id);
+      const sweepOffers: any = await (await s.handle(request('/api/session-commands/offers', undefined, 'GET'), host('hetzner'))).json();
+      expect(sweepOffers.offers).toEqual([]); // not re-offered, never re-delivered
+
+      const afterExpiry: any = await (await s.handle(request(`/api/sessions/${session.id}/commands`, undefined, 'GET'), admin)).json();
+      const expiredCmd = afterExpiry.commands.find((c: any) => c.id === cmd.command_id);
+      expect(expiredCmd.state).toBe('uncertain');
+      expect(expiredCmd.ack.outcome).toBe('uncertain');
+      expect(expiredCmd.ack.reason).toBe('recipient_reply_pending');
+
+      // The late correlated reply promotes the uncertain send to acked.
+      const late = await s.handle(request(`/api/session-commands/${cmd.command_id}/ack`, {
+        correlation: offer.correlation, claim_token: claim.claim_token,
+        native: native(), outcome: 'delivered',
+        reason: 'correlated native reply verified in message log', proof: goodProof(),
+      }), host('hetzner'));
+      expect(late.status).toBe(200);
+      expect((await late.json() as any).state).toBe('acked');
+    }, fakeReserve().hook);
+  });
+
   it('warns or refuses sends when target has no recent reported state', async () => {
     await fixture(async (s, sql) => {
       const session: any = await startOk(s, { machine: 'hetzner' });
