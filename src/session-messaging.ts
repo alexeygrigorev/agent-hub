@@ -148,7 +148,7 @@ export function afterMessageInsert(sql: SqlStorage, msg: any, opts: { delivery?:
   sql.exec(
     'INSERT INTO session_control_commands (id, session_id, kind, actor, request_key, payload_json, state, generation, correlation, owner_token_id, owner_family, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
     id, sessionId, 'message', msg.from_actor, 'msg-' + msg.id,
-    JSON.stringify({ message_id: msg.id, delivery, body: renderTui(msg) }), 'recorded', generation, `cmd:${id}:gen:${generation}`,
+    JSON.stringify({ message_id: msg.id, delivery, from_actor: msg.from_actor, body: renderTui(msg) }), 'recorded', generation, `cmd:${id}:gen:${generation}`,
     null, null, 0, at, at);
 }
 

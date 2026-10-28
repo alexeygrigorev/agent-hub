@@ -37,7 +37,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from . import private_fs
+from . import private_fs, session_messages
 from .native_sessions import (
     NativeTarget,
     SessionControlError,
@@ -292,6 +292,19 @@ def receive_once(
     for offer in offers:
         command_id = offer.get("command_id") if isinstance(offer, dict) else None
         correlation = offer.get("correlation", "") if isinstance(offer, dict) else ""
+        if isinstance(offer, dict) and offer.get("kind") == "message":
+            # Hub session messages (docs/SESSION-MESSAGING.md §5.2): own
+            # journal, send-once inbox write, at-most-once TUI deliver.
+            try:
+                attempt_id = get_or_create_attempt(journal_dir, str(command_id), str(correlation or ""))
+                processed.append({"op": "message", **session_messages.handle_message_offer(
+                    offer, journal_dir=journal_dir, executable=executable, request=request,
+                    attempt_id=attempt_id, sender_workspace=sender_workspace, now_ms=now_ms)})
+            except (SessionControlError, SessionUncertain) as exc:
+                skipped.append({"command_id": command_id, "reason": str(exc)[:300]})
+            except Exception as exc:
+                skipped.append({"command_id": command_id, "reason": "message_%s" % type(exc).__name__})
+            continue
         try:
             command = offer_to_command(offer)
         except SessionControlError as exc:
@@ -436,8 +449,13 @@ def receive_once(
                                "state": updated.get("state"),
                                "ack_submitted": bool((updated.get("ack") or {}).get("submitted", False)),
                                "reconciled": True})
+    try:
+        relayed = session_messages.relay_replies(journal_dir=journal_dir, executable=executable,
+                                                 request=request, now_ms=now_ms)
+    except Exception:
+        relayed = []
     return {"offers_seen": len(offers), "processed": processed, "skipped": skipped,
-            "reconciled": reconciled}
+            "reconciled": reconciled, "relayed": relayed}
 
 
 def _pending_reconcile_names(journal_dir: str, limit: int = 20) -> list[str]:
