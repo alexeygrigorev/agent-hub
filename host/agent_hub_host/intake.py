@@ -197,10 +197,6 @@ def read_file(path, limit=MAX_REQUEST, field='Input'):
 
 def add_commands(sub):
     root = sub.add_parser('intake', help='Private intake tasks and durable context; payloads are data, never execution')
-    plural = sub.add_parser('intakes', help='Intake list aliases')
-    plural_commands = plural.add_subparsers(dest='intake_cmd', required=True)
-    plural_forgotten = plural_commands.add_parser('forgotten', help='Forgotten open intakes')
-    plural_forgotten.add_argument('--project')
     commands = root.add_subparsers(dest='intake_cmd', required=True)
     forgotten = commands.add_parser('forgotten', help='Open intakes forgotten by live sessions; includes queued restart reason')
     forgotten.add_argument('--project')

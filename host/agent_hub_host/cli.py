@@ -552,7 +552,7 @@ def main():
             print(intake.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
         return
-    if args.cmd in ('intake', 'intakes', 'handoff', 'worktree'):
+    if args.cmd in ('intake', 'handoff', 'worktree'):
         try:
             result = worktree_cli.execute(args) if args.cmd == 'worktree' else intake.execute(args)
             print(json.dumps(result, indent=2, ensure_ascii=True))
