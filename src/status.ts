@@ -321,7 +321,7 @@ export class StatusService {
     const rows=this.rows(query,...bindings);
     const bytes=rows.reduce((n,row)=>n+256+Object.values(row).reduce<number>((sum,v)=>sum+(typeof v==='string'?v.length*2:8),0),0);
     if(ready && rows.length<=2048 && bytes<=1024*1024 && rows.every(row=>Object.values(row).every(v=>v===null || typeof v!=='object'))) {
-      if(this.statusSourceRows.size>=16 || this.statusSourceBytes+bytes>4*1024*1024) {this.statusSourceRows.clear();this.statusSourceBytes=0;}
+      if(this.statusSourceRows.size>=64 || this.statusSourceBytes+bytes>4*1024*1024) {this.statusSourceRows.clear();this.statusSourceBytes=0;}
       this.statusSourceRows.set(key,rows);this.statusSourceBytes+=bytes;
     }
     return rows;
@@ -339,9 +339,13 @@ export class StatusService {
     this.statusSourceRevision=null;
     this.sql.exec('CREATE TABLE IF NOT EXISTS status_source_revision(id INTEGER PRIMARY KEY CHECK(id=1),revision TEXT NOT NULL)');
     this.sql.exec("INSERT OR IGNORE INTO status_source_revision VALUES(1,lower(hex(randomblob(16))))");
-    for(const table of ['session_control_sessions','status_observations']) {
+    // All non-native inputs read by buildSessionInputs, plus status evidence.
+    // Keep this list in sync with the generation-cached SQL reader below.
+    for(const table of ['session_control_sessions','fleet_launches','session_control_protections',
+      'session_lifecycle_observations','intake_task_projection','credentials','lifecycle_request_projection',
+      'status_observations','session_lifecycle_decisions']) {
       for(const op of ['INSERT','UPDATE','DELETE']) this.sql.exec(`CREATE TRIGGER IF NOT EXISTS status_source_${table}_${op.toLowerCase()}
-        AFTER ${op} ON ${table} BEGIN UPDATE status_source_revision SET revision=lower(hex(randomblob(16))) WHERE id=1; END`);
+        AFTER ${table === 'credentials' && op === 'UPDATE' ? 'UPDATE OF id,kind,actor,subject,created_by_sub,family_id' : op} ON ${table} BEGIN UPDATE status_source_revision SET revision=lower(hex(randomblob(16))) WHERE id=1; END`);
     }
     this.lifecycleCacheReady = false;
     this.lifecycleRevision = null;
@@ -349,7 +353,7 @@ export class StatusService {
     this.sql.exec('CREATE TABLE IF NOT EXISTS status_lifecycle_revision(id INTEGER PRIMARY KEY CHECK(id=1),revision TEXT NOT NULL)');
     this.sql.exec("INSERT OR IGNORE INTO status_lifecycle_revision VALUES(1,lower(hex(randomblob(16))))");
     for (const table of ['session_control_sessions','fleet_launches','fleet_sessions','session_control_protections',
-      'session_lifecycle_observations','intake_task_projection','credentials','status_observations']) {
+      'session_lifecycle_observations','intake_task_projection','credentials','status_observations','lifecycle_request_projection']) {
       for (const op of ['INSERT','UPDATE','DELETE']) {
         // Authentication restamps last_used_at on every request. Only creator
         // provenance fields are inputs to the lifecycle ownership calculation.
@@ -371,10 +375,26 @@ export class StatusService {
     const key = JSON.stringify([...sessionIds].sort());
     const cached = this.lifecycleInputs.get(key);
     if (cached) return cached;
-    const value = buildSessionInputs(this.sql,sessionIds);
+    // The builder reads SQL scalars only. Census activity must stay live,
+    // while the other source rows survive native-only generation changes.
+    // All their tables have rollback-safe status_source triggers above;
+    // cachedSourceRows retains at most four MiB and bypasses oversized reads.
+    let complete = true;
+    const source = new Proxy(this.sql, { get: (target, key) => {
+      if (key !== 'exec') return Reflect.get(target, key);
+      return (query: string, ...bindings: any[]) => {
+        return { toArray: () => {
+          try {
+            return /\bfleet_sessions\b/i.test(query)
+              ? target.exec(query, ...bindings).toArray() : this.cachedSourceRows(query, ...bindings);
+          } catch (error) { complete = false; throw error; }
+        }};
+      };
+    }});
+    const value = buildSessionInputs(source,sessionIds);
     // These normalized facts contain no request/prompt bodies. Large pages
     // still work but do not displace an unbounded amount of isolate memory.
-    if (value.inputs.length > 0 && value.inputs.length <= 2048 && sessionIds.size <= 2048) {
+    if (complete && value.inputs.length > 0 && value.inputs.length <= 2048 && sessionIds.size <= 2048) {
       if (this.lifecycleInputs.size >= 4) this.lifecycleInputs.delete(this.lifecycleInputs.keys().next().value!);
       this.lifecycleInputs.set(key,value);
     }
@@ -1088,7 +1108,7 @@ export class StatusService {
         const keys = [...refs.keys()];
         for (let i = 0; i < keys.length; i += 100) {
           const chunk = keys.slice(i, i + 100);
-          for (const row of this.rows(`WITH keys(session_key) AS (VALUES ${chunk.map(() => '(?)').join(',')})
+          for (const row of this.cachedSourceRows(`WITH keys(session_key) AS (VALUES ${chunk.map(() => '(?)').join(',')})
             SELECT d.* FROM keys k JOIN session_lifecycle_decisions d ON d.decision_id = (
               SELECT decision_id FROM session_lifecycle_decisions WHERE session_key=k.session_key
               ORDER BY created_at DESC, decision_id DESC LIMIT 1)`, ...chunk)) {

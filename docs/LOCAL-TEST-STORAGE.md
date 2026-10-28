@@ -50,3 +50,9 @@ small CPU quota and increase wall-clock tails. Explicit caller pool settings
 are preserved; other Node options are kept. These defaults apply only to the
 Vitest command. Console timing reports remain visible for passing tests too.
 No file is excluded, no sample is retried and the 100 ms threshold is unchanged.
+
+The retained-history performance fixture uses one fixed population of 100 samples
+per case, including every sample, with four requests per concurrent cohort.
+Nearest-rank p95 stays below 100 ms; no retries or discarded warm-up samples.
+It retains 500 tasks, 2,000 sessions, native-write invalidation, blocked-work and
+claim cases. Cache changes have separate generation/rollback/authority tests.

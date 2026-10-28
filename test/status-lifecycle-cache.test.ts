@@ -81,6 +81,11 @@ it('preserves last-key brief semantics for legacy duplicate JSON keys',async()=>
       h.sql.exec('UPDATE session_control_sessions SET request_json=? WHERE id=?',raw,id);
       expect(buildSessionInputs(h.sql,new Set([id])).refs.get('cache-host/cache-native')?.has_brief).toBe(expected);
     }
+    h.sql.exec("UPDATE session_control_sessions SET request_json='{}' WHERE id=?",id);
+    const read=()=>h.statusService.readLifecycleInputs(new Set([id])).refs.get('cache-host/cache-native');
+    expect(read().has_brief).toBe(false);
+    h.sql.exec('UPDATE lifecycle_request_projection SET has_brief=1 WHERE id=?',id);
+    expect(read().has_brief).toBe(true);
   });
 });
 
@@ -237,5 +242,59 @@ it('retains independent source rows across native activity but invalidates canon
     const warm=read();
     h.sql.exec("INSERT INTO status_observations VALUES('source-obs','cache-host',?,'session',?,'{}','host',?)",id,new Date().toISOString(),new Date().toISOString());
     expect(read()).not.toBe(warm);
+  });
+});
+
+it('reuses generation-keyed SQL reads across census writes and covers every cached table with triggers', async () => {
+  const stub=(env as any).HUB.get((env as any).HUB.idFromName('cache-source-dependencies'));
+  await inDO(stub,(h:any)=>{
+    const now=seed(h),service:any=h.statusService,ids=new Set([id]);
+    const rows=service.rows.bind(service),queries:string[]=[];
+    service.rows=(query:string,...args:any[])=>{if(!query.includes('_revision')) queries.push(query);return rows(query,...args);};
+    const read=()=>service.lifecycleBySessionId(now,ids);
+    read(); service.latestObservations([id]);
+    const cold=queries.length;
+    expect(cold).toBeGreaterThan(0);
+    h.sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='cache-native'",new Date(now+1).toISOString());
+    read(); service.latestObservations([id]);
+    expect(queries).toHaveLength(cold);
+    const tables=new Set(h.sql.exec("SELECT name FROM sqlite_master WHERE type='table'").toArray().map((r:any)=>r.name));
+    const touched=new Set(queries.flatMap(query=>[...query.matchAll(/\b(?:FROM|JOIN)\s+([a-z_]+)/gi)]
+      .map(match=>match[1]).filter(table=>tables.has(table))));
+    const triggers=new Set(h.sql.exec("SELECT tbl_name FROM sqlite_master WHERE type='trigger' AND name LIKE 'status_source_%'")
+      .toArray().map((r:any)=>r.tbl_name));
+    expect([...touched].sort()).toEqual([...triggers].sort());
+    expect(touched.has('fleet_sessions')).toBe(false);
+    const normalized=(value:any)=>({inputs:value.inputs,refs:[...value.refs]});
+    const fresh=()=>normalized(buildSessionInputs(h.sql,ids));
+    expect(normalized(service.readLifecycleInputs(ids))).toEqual(fresh());
+    expect(()=>h.ctx.storage.transactionSync(()=>{
+      h.sql.exec("UPDATE credentials SET family_id='rollback-family' WHERE id='cache-owner'");
+      expect(service.readLifecycleInputs(ids).refs.get('cache-host/cache-native').protected_session).toBe(true);
+      throw Error('source rollback');
+    })).toThrow('source rollback');
+    h.sql.exec("UPDATE fleet_sessions SET last_activity_at=? WHERE native_id='cache-native'",new Date(now+2).toISOString());
+    expect(normalized(service.readLifecycleInputs(ids))).toEqual(fresh());
+    expect(service.readLifecycleInputs(ids).refs.get('cache-host/cache-native').protected_session).toBe(false);
+  });
+});
+
+it('does not retain degraded lifecycle inputs when a source query fails', async () => {
+  const stub=(env as any).HUB.get((env as any).HUB.idFromName('cache-source-failure'));
+  await inDO(stub,(h:any)=>{
+    seed(h);
+    const service:any=h.statusService,rows=service.rows.bind(service);
+    let fail=true,attempts=0;
+    service.rows=(query:string,...args:any[])=>{
+      if(query.includes('FROM credentials')) {
+        attempts++;
+        if(fail) {fail=false;throw Error('injected read failure');}
+      }
+      return rows(query,...args);
+    };
+    const read=()=>service.readLifecycleInputs(new Set([id])).refs.get('cache-host/cache-native');
+    expect(read().protected_session).toBe(true);
+    expect(read().protected_session).toBe(false);
+    expect(attempts).toBe(2);
   });
 });

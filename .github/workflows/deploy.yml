@@ -93,7 +93,11 @@ jobs:
           python3 scripts/ci/test_ci.py
 
       - name: Worker discovery tests (Vitest)
-        run: npx --no-install vitest run --configLoader runner --no-file-parallelism --maxWorkers 1
+        env:
+          UV_THREADPOOL_SIZE: "1"
+          GOMAXPROCS: "1"
+          NODE_OPTIONS: "--v8-pool-size=1"
+        run: npx --no-install vitest run --configLoader runner --no-file-parallelism --maxWorkers 1 --disableConsoleIntercept
 
       - name: Standalone browser and static checks
         env:
