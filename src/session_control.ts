@@ -1,3 +1,4 @@
+import { setMessageState, messageEvent, notReadyDelay, expireSessionMessages } from './session-messaging';
 import { IntakeWorktrees } from './intake-worktrees';
 import { ADOPTION_SCHEMA, queueOperatorAdoptions, pendingOperatorAdoptions, completeOperatorAdoption } from './session-adoption';
 import { LivenessService } from './liveness';
@@ -2671,12 +2672,19 @@ export class SessionControlService {
            AND poll_at IS NOT NULL AND poll_at < ?
            AND session_id IN (SELECT id FROM session_control_sessions WHERE machine_id = ?)`,
           at, cutoff, caller.machineId!);
+        expireSessionMessages(this.sql, this.now(), caller.machineId!);
+        // Session messages (kind 'message', docs/SESSION-MESSAGING.md §5.1):
+        // offered after stops and before ordinary sends, one at a time per
+        // session in send order, and not before a not-ready backoff ends.
         const rows = this.sql.exec(
           `SELECT c.* FROM session_control_commands c JOIN session_control_sessions s ON s.id = c.session_id
            WHERE s.machine_id = ? AND c.state = 'recorded'
+           AND (c.not_before IS NULL OR c.not_before <= ?)
+           AND (c.kind <> 'message' OR NOT EXISTS (SELECT 1 FROM session_control_commands e WHERE e.session_id = c.session_id
+             AND e.kind = 'message' AND e.state IN ('recorded','transported','claimed') AND (e.created_at < c.created_at OR (e.created_at = c.created_at AND e.id < c.id))))
            AND (? = 1 OR s.host_family IS NULL OR s.host_family = ?)
-           ORDER BY CASE WHEN c.kind = 'stop' THEN 0 ELSE 1 END, c.created_at, c.id LIMIT 20`,
-          caller.machineId!, caller.isAdmin === true ? 1 : 0, this.presentingFamily(caller)).toArray() as any[];
+           ORDER BY CASE WHEN c.kind = 'stop' THEN 0 WHEN c.kind = 'message' THEN 1 ELSE 2 END, c.created_at, c.id LIMIT 20`,
+          caller.machineId!, at, caller.isAdmin === true ? 1 : 0, this.presentingFamily(caller)).toArray() as any[];
         const offers = [];
         for (const row of rows) {
           const session: any = this.sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', row.session_id).toArray()[0];
@@ -2832,6 +2840,10 @@ export class SessionControlService {
           caller.machineId, token, expires, input.attempt_id, attempt, this.at(), row.id);
         if (written.rowsWritten !== 1) return response({ error: 'claim_conflict' }, 409);
         this.adoptHostFamily(session.id, caller);
+        if (row.kind === 'message') {
+          const messageId = parsed(row.payload_json, {})?.message_id;
+          if (typeof messageId === 'string') setMessageState(this.sql, messageId, 'dispatched', null, null, caller.machineId ?? null, this.now(), { command_id: row.id, attempt });
+        }
         return response({ command_id: row.id, claim_token: token, holder: caller.machineId, generation: row.generation, expires_at: expires, expires_at_ms: Date.parse(expires), attempt, cleanup_tree: this.cleanupAuthorized(row, session), linked_intake_open: this.linkedIntakeProtected(session) });
       });
     }
@@ -2995,6 +3007,7 @@ export class SessionControlService {
           // Proof uniqueness was established at the top of this handler for
           // every state; reaching here means this reply envelope is fresh.
         }
+        if (row.kind === 'message') return this.ackMessage(row, session, input, caller);
         const ack: any = {
           outcome: input.outcome, native: input.native, claim_attempt: row.attempts ?? 1,
           // The claim token binds this recorded outcome to exactly one
@@ -3040,6 +3053,43 @@ export class SessionControlService {
     }
 
     return response({ error: 'not_found' }, 404);
+  }
+
+  /** Ack of a session message delivery (claimed, binding already checked).
+   * delivered: the native mailbox has it and, for tui, the deliver guard
+   * submitted it at a ready prompt. refused not_ready*: back to the queue
+   * with backoff and no attempt consumed. Other refusals end delivery;
+   * uncertain is never retyped. */
+  private ackMessage(row: any, session: any, input: any, caller: Caller): Response {
+    const at = this.at(); const now = this.now();
+    const payload = parsed(row.payload_json, {});
+    const messageId: string | null = typeof payload?.message_id === 'string' ? payload.message_id : null;
+    const machine = caller.machineId ?? null;
+    const reason = typeof input.reason === 'string' ? input.reason.slice(0, 512) : null;
+    if (input.outcome === 'refused' && reason && /^not_ready\b/.test(reason)) {
+      const count = Number(parsed(row.ack_json, {})?.not_ready_count ?? 0);
+      this.sql.exec(`UPDATE session_control_commands SET state = 'recorded', holder_machine = NULL, claim_token = NULL, claim_expires_at = NULL,
+        holder_attempt = NULL, attempts = 0, poll_at = NULL, not_before = ?, ack_json = ?, updated_at = ? WHERE id = ?`,
+        new Date(now + notReadyDelay(count)).toISOString(), JSON.stringify({ not_ready_count: count + 1 }), at, row.id);
+      if (messageId) {
+        this.sql.exec("UPDATE messages SET state = 'accepted', state_reason = 'not_ready' WHERE id = ?", messageId);
+        messageEvent(this.sql, messageId, 'not_ready', null, machine, now, { reason, count: count + 1 });
+      }
+      return response({ command_id: row.id, state: 'recorded', not_before_ms: notReadyDelay(count) });
+    }
+    const state = input.outcome === 'delivered' ? 'acked' : input.outcome === 'refused' ? 'refused'
+      : input.outcome === 'failed' ? 'failed' : input.outcome === 'transported' ? 'transported' : 'uncertain';
+    const ack: any = { outcome: input.outcome, native: input.native, claim_attempt: row.attempts ?? 1, claim_token: input.claim_token,
+      ...(row.holder_attempt ? { holder_attempt: row.holder_attempt } : {}), ...(reason !== null ? { reason } : {}),
+      ...(input.proof !== undefined ? { proof: input.proof } : {}) };
+    this.sql.exec('UPDATE session_control_commands SET state = ?, ack_json = ?, updated_at = ? WHERE id = ?', state, JSON.stringify(ack), at, row.id);
+    if (messageId) {
+      const envelope = typeof input.proof?.native_message_id === 'string' ? input.proof.native_message_id.slice(0, 128) : undefined;
+      const messageState = state === 'acked' ? 'delivered' : state === 'uncertain' ? 'uncertain' : state === 'transported' ? 'dispatched' : 'undeliverable';
+      setMessageState(this.sql, messageId, messageState, state === 'acked' ? null : reason, null, machine, now,
+        { command_id: row.id, delivery: payload.delivery, ...(envelope ? { native_message_id: envelope } : {}) });
+    }
+    return response({ command_id: row.id, state });
   }
 
   private enqueue(session: any, kind: string, actor: string, caller: Caller, key: string, payload: any, warning?: string) {

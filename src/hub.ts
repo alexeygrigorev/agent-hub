@@ -1,3 +1,4 @@
+import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, NAMED_AGENT_PROJECT } from './session-messaging';
 import { WorkerAccess, WORKER_SCOPE, workerRequestAllowed, workerRefreshContext } from './worker-access';
 import { IntakeWatchdog } from './intake-watchdog';
 import { RepoRegistry } from './repos';
@@ -162,7 +163,11 @@ export class Hub extends DurableObject {
     this.statusService = new StatusService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.intakeService);
     this.statusService.init();
     this.loadDeployMarker();
-    this.busService = new BusService(this.sql, txSync);
+    initSessionMessaging(this.sql);
+    this.busService = new BusService(this.sql, txSync, {
+      resolveRecipient: (toActor, now) => resolveRecipient(this.sql, toActor, now),
+      afterInsert: (message, opts, now) => afterMessageInsert(this.sql, message, { delivery: opts.delivery, deliverByMs: opts.deliverByMs, now }),
+    });
     this.fleetService = new FleetService(this.sql, fn => this.ctx.storage.transactionSync(fn));
     this.fleetService.init();
     this.workerAccess = new WorkerAccess(this.sql, fn => this.ctx.storage.transactionSync(fn), caller => this.sessionControlService.hostObservationAllowed(caller.machineId, caller));
@@ -188,6 +193,7 @@ export class Hub extends DurableObject {
       },
     });
     this.sessionControlService.init();
+    initSessionMessaging(this.sql); // not_before on the just-created commands table
     // Inbound webhooks -> session delivery (intake 19ec91c2): the queue
     // resolves targets at delivery time and reuses session-control send
     // commands; HMAC route keys are wrapped with the session secret and the
@@ -1745,6 +1751,32 @@ export class Hub extends DurableObject {
         return json({ status: 'registered', tag: b.tag, project, actor: project ? `${project}:${b.tag}` : b.tag }, 201);
       });
     }
+    // Named agents (docs/SESSION-MESSAGING.md §9, Alexey t1840u): a stable
+    // `agent:<name>` address with its own inbox and its own messaging-only
+    // credential, distinct from any human login. Re-issuing rotates: older
+    // credential families of that identity are revoked.
+    const named = /^\/api\/agents\/named\/([A-Za-z0-9][A-Za-z0-9._-]{0,63})\/credential$/.exec(path);
+    if (named && request.method === 'POST') {
+      await safeJson(request);
+      const name = named[1];
+      const actor = `${NAMED_AGENT_PROJECT}:${name}`;
+      if (!registryAddress(actor)) return json({ error: 'invalid_agent' }, 400);
+      const tokens = await generateTokenPair();
+      return this.ctx.storage.transactionSync(() => {
+        const now = new Date().toISOString();
+        if (!this.sql.exec('SELECT 1 FROM agents WHERE project = ? AND tag = ?', NAMED_AGENT_PROJECT, name).toArray().length) {
+          this.sql.exec("INSERT INTO agents (tag, project, role, machine_id, registered_at, imported_from) VALUES (?, ?, NULL, NULL, ?, 'admin')", name, NAMED_AGENT_PROJECT, now);
+        }
+        this.sql.exec("UPDATE credentials SET revoked_at = ? WHERE kind = 'agent' AND registry_actor = ? AND revoked_at IS NULL", now, actor);
+        const id = crypto.randomUUID();
+        const expires = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
+        this.sql.exec(`INSERT INTO credentials (id, kind, token_hash, refresh_hash, family_id, subject, machine_id, actor, scopes, created_by_sub, created_at, expires_at, registry_actor)
+          VALUES (?, 'agent', ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`, id, tokens.accessHash, tokens.refreshHash, id, actor, actor,
+          JSON.stringify(['bus:send', 'bus:read']), String(auth.caller?.actor || 'admin').slice(0, 128), now, expires, actor);
+        // The only response carrying this credential; never logged.
+        return json({ actor, access_token: tokens.accessToken, refresh_token: tokens.refreshToken, expires_at: expires, scopes: ['bus:send', 'bus:read'] }, 201);
+      });
+    }
     if (path.startsWith('/api/agents/') && request.method === 'DELETE') {
       let raw: string;
       try { raw = decodeURIComponent(path.slice('/api/agents/'.length)); } catch { return json({ error: 'invalid_actor' }, 400); }
@@ -2292,7 +2324,7 @@ export class Hub extends DurableObject {
         return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
       }
 
-      const allowedKeys = new Set(['from_actor', 'to_actor', 'kind', 'body', 'idempotency_key', 'thread_id', 'reply_to', 'lease_epoch']);
+      const allowedKeys = new Set(['from_actor', 'to_actor', 'kind', 'body', 'idempotency_key', 'thread_id', 'reply_to', 'lease_epoch', 'delivery', 'deliver_by_s']);
       const parsed = await this.parseSafeBusBody(request, allowedKeys);
       if (parsed.error) return parsed.error;
       const body = parsed.data!;
@@ -2321,9 +2353,15 @@ export class Hub extends DurableObject {
       if (body.lease_epoch !== undefined && (typeof body.lease_epoch !== 'number' || !Number.isInteger(body.lease_epoch) || body.lease_epoch < 0)) {
         return Response.json({ error: 'invalid_lease_epoch' }, { status: 403 });
       }
+      if (body.delivery !== undefined && !DELIVERIES.has(body.delivery)) return Response.json({ error: 'invalid_delivery' }, { status: 400 });
+      if (body.deliver_by_s !== undefined && (!Number.isInteger(body.deliver_by_s) || body.deliver_by_s < 60 || body.deliver_by_s > 7 * 86400)) {
+        return Response.json({ error: 'invalid_deliver_by' }, { status: 400 });
+      }
 
       try {
         const result = this.busService.send(auth.caller!, {
+          delivery: body.delivery,
+          deliverByMs: body.deliver_by_s !== undefined ? body.deliver_by_s * 1000 : undefined,
           senderActor: body.from_actor,
           toActor: body.to_actor,
           kind: body.kind,
@@ -2343,6 +2381,7 @@ export class Hub extends DurableObject {
         if (e.message === 'conflict') return Response.json({ error: 'conflict' }, { status: 409 });
         if (e.message === 'invalid_lease_epoch') return Response.json({ error: 'invalid_lease_epoch' }, { status: 403 });
         if (e.message === 'unknown_recipient') return Response.json({ error: 'unknown_recipient' }, { status: 404 });
+        if (e instanceof RecipientError && e.message === 'ambiguous_recipient') return Response.json({ error: 'ambiguous_recipient', candidates: e.candidates }, { status: 409 });
         if (e.message === 'invalid_reply_to') return Response.json({ error: 'invalid_reply_to' }, { status: 400 });
         return Response.json({ error: 'Internal Server Error' }, { status: 500 });
       }
@@ -2906,6 +2945,24 @@ export class Hub extends DurableObject {
           return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
         }
         if (e.message === 'invalid_stage') return Response.json({ error: 'invalid_stage' }, { status: 400 });
+        return Response.json({ error: 'Internal Server Error' }, { status: 500 });
+      }
+    }
+
+    // GET /api/bus/messages/:id/status (states + audit events, no body)
+    const statusMatch = path.match(/^\/api\/bus\/messages\/([^/]+)\/status$/);
+    if (statusMatch) {
+      if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('admin')) {
+        return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
+      }
+      try {
+        return Response.json(this.busService.status(auth.caller!, decodeURIComponent(statusMatch[1])));
+      } catch (e: any) {
+        if (e.message === 'not_found') return Response.json({ error: 'not_found' }, { status: 404 });
+        if (e.message === 'unauthorized') return Response.json({ error: 'forbidden' }, { status: 403 });
         return Response.json({ error: 'Internal Server Error' }, { status: 500 });
       }
     }

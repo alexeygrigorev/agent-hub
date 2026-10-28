@@ -31,6 +31,15 @@ export interface SendOpts {
   threadId?: string;
   leaseEpoch?: number;
   now?: number;
+  /** Session recipients only: 'tui' (inject into the terminal) or 'inbox'. */
+  delivery?: string;
+  deliverByMs?: number;
+}
+
+/** Session-messaging seams (src/session-messaging.ts), run inside the send transaction. */
+export interface BusSendHooks {
+  resolveRecipient(toActor: string, now: number): string;
+  afterInsert(message: any, opts: SendOpts, now: number): void;
 }
 
 export const BUS_SCHEMA_SQL = `
@@ -247,10 +256,12 @@ export function generateUlid(now: number = Date.now()): string {
 export class BusService {
   public sql: SqlStorage;
   public txSync?: <T>(fn: () => T) => T;
+  public hooks?: BusSendHooks;
 
-  constructor(sql: SqlStorage, txSync?: <T>(fn: () => T) => T) {
+  constructor(sql: SqlStorage, txSync?: <T>(fn: () => T) => T, hooks?: BusSendHooks) {
     this.sql = sql;
     this.txSync = txSync;
+    this.hooks = hooks;
   }
 
   /**
@@ -451,6 +462,7 @@ export class BusService {
         throw new Error("unauthorized");
       }
 
+      if (this.hooks) opts = { ...opts, toActor: this.hooks.resolveRecipient(opts.toActor, now) };
       opts = { ...opts, senderActor: this.canonicalActor(opts.senderActor), toActor: this.canonicalActor(opts.toActor) };
       let existing = this.sql.exec(
         'SELECT id, body, to_actor, kind, thread_id, reply_to, lease_epoch, expires_at FROM messages WHERE from_actor = ? AND idempotency_key = ?',
@@ -510,6 +522,7 @@ export class BusService {
         INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, reply_to, body, idempotency_key, lease_epoch, created_at, expires_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, id, opts.senderActor, opts.toActor, opts.kind, threadId, opts.replyTo || null, opts.body, opts.idempotencyKey, opts.leaseEpoch ?? null, now, expiresAt);
+      if (this.hooks) this.hooks.afterInsert({ id, from_actor: opts.senderActor, to_actor: opts.toActor, kind: opts.kind, thread_id: threadId, reply_to: opts.replyTo || null, body: opts.body }, opts, now);
 
       return { id, threadId, thread_id: threadId };
     });
@@ -580,6 +593,23 @@ export class BusService {
       }
       return msg;
     });
+  }
+
+  /** Delivery status of one message for its sender, recipient or an admin:
+   * state, stage times and the metadata-only audit events (no body). */
+  status(caller: CallerContext, messageId: string): any {
+    const now = Date.now();
+    const msg = this.sql.exec('SELECT * FROM messages WHERE id = ? AND expires_at > ?', messageId, now).toArray()[0] as any;
+    if (!msg) throw new Error("not_found");
+    if (!caller.isAdmin && !this.isAuthorizedForStoredActor(caller, msg.to_actor, now, !!msg.registry_unbound_to) && !this.isAuthorizedForStoredActor(caller, msg.from_actor, now, !!msg.registry_unbound_from)) {
+      throw new Error("unauthorized");
+    }
+    const { body: _body, ...meta } = msg;
+    const events = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='message_events'").toArray().length
+      ? this.sql.exec('SELECT event, actor, machine_id, at, detail_json FROM message_events WHERE message_id = ? ORDER BY id LIMIT 200', messageId).toArray()
+        .map((e: any) => ({ event: e.event, actor: e.actor, machine_id: e.machine_id, at: e.at, detail: e.detail_json ? JSON.parse(e.detail_json) : null }))
+      : [];
+    return { ...meta, events };
   }
 
   private updateMessageStage(caller: CallerContext, messageId: string, stage: 'delivered_at' | 'read_at' | 'acked_at' | 'accepted_at' | 'completed_at', now: number = Date.now(), leaseEpoch?: number) {
