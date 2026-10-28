@@ -528,6 +528,14 @@ def diagnostic(raw='', *, error_type='RuntimeError', exit_code=None, stage='laun
         if typed:
             error_type = typed.group(1)
         candidate = re.sub(r'^(?:ValueError|RuntimeError|PermissionError|OSError|FileNotFoundError|TimeoutError|JSONDecodeError): ', '', clean_line)
+        # Current launcher resource policy uses a configurable MiB floor.
+        # Accept only its complete numeric grammar, never arbitrary exception text.
+        if re.fullmatch(r'host MemAvailable below [0-9]{1,7}MiB floor after reservation \(launcher_memory_reserve\)', candidate):
+            reason = 'launcher_memory_reserve'
+            message = 'The launcher refused start: ' + candidate + '.'
+            surfaced_tail = error_type + ': ' + candidate
+            refusal_found = True
+            break
         # The maintained launcher emits this numeric ValueError before spawn.
         # Match the entire grammar; never forward raw paths, suffixes or payloads.
         if re.fullmatch(r'(?:cwd|tmpdir) filesystem free < (?:20|50)GiB floor \+ required disk \([0-9]{1,16} B\)', candidate):

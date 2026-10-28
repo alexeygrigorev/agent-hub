@@ -13,6 +13,24 @@ from agent_hub_host.launch_diagnostics import LocalCommandError, diagnostic, exc
 
 
 class LaunchDiagnosticTests(unittest.TestCase):
+    def test_current_memory_floor_traceback_survives_failed_process(self):
+        tail = 'host MemAvailable below 2048MiB floor after reservation (launcher_memory_reserve)'
+        script = 'raise ValueError(' + repr(tail) + ')'
+        with self.assertRaises(LocalCommandError) as raised:
+            run_json([sys.executable, '-c', script])
+        info = exception_diagnostic(raised.exception, 'dispatch_headless')
+        self.assertEqual(info['reason'], 'launcher_memory_reserve')
+        self.assertEqual(info['error_type'], 'ValueError')
+        self.assertEqual(info['exit_code'], 1)
+        self.assertEqual(info['stage'], 'dispatch_headless')
+        self.assertEqual(info['tail'], 'ValueError: ' + tail)
+        self.assertIn(tail, info['message'])
+        for unsafe in (tail + ' secret=private-value', tail.replace('2048', '/private/token'),
+                       tail.replace('2048', '9' * 100)):
+            result = diagnostic('ValueError: ' + unsafe)
+            self.assertEqual(result['reason'], 'launcher_command_failed')
+            self.assertNotIn('private', json.dumps(result))
+
     def test_real_failed_process_preserves_launcher_refusal_and_exit_status(self):
         script = "import sys; print('ValueError: host MemAvailable < 10GiB', file=sys.stderr); sys.exit(1)"
         with self.assertRaises(LocalCommandError) as raised:
