@@ -655,7 +655,7 @@ def main():
 
             os.makedirs(cursors_dir, exist_ok=True)
             cpath = os.path.join(cursors_dir, f"{ambient_sid}.json")
-            cdata = {"acked_through": None, "exceptions": []}
+            cdata = {"exceptions": []}
             if os.path.isfile(cpath):
                 try:
                     with open(cpath, "r", encoding="utf-8") as f:

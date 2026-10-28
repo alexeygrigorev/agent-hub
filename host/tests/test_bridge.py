@@ -43,7 +43,6 @@ def create_authoritative_state(
     recipient_tag: str,
     recipient_session_id: str,
     exceptions: list[str] | None = None,
-    acked_through: str | None = None,
     workspace_json_override: dict | None = None,
     runtime_dir: str | None = None,
     service_tag: str = "hub-bridge",
@@ -99,7 +98,6 @@ def create_authoritative_state(
     # 4. Recipient cursor in state_dir/messages/<ws_key>/cursors/<recipient_session_id>.json
     cursor_path = os.path.join(cursors_dir, f"{recipient_session_id}.json")
     cursor_data = {
-        "acked_through": acked_through,
         "exceptions": exceptions or []
     }
     with open(cursor_path, "w", encoding="utf-8") as f:
@@ -151,7 +149,7 @@ class TestBridge(unittest.TestCase):
         # Write cursor for the wrong consumer with the native_id in exceptions
         wrong_cursor = os.path.join(mailbox_dir, "cursors", f"{wrong_consumer_uuid}.json")
         with open(wrong_cursor, "w", encoding="utf-8") as f:
-            json.dump({"exceptions": [native_id], "acked_through": None}, f)
+            json.dump({"exceptions": [native_id]}, f)
 
         bridge = MailboxBridge(work, state_dir=state_dir)
         bridge.receipts["hub_to_native"] = {"hub-proof": native_id}
@@ -267,41 +265,6 @@ class TestBridge(unittest.TestCase):
             # Cycle 2: idempotent, no redundant ACK
             bridge.sync_native_to_hub()
             self.assertEqual(mock_bus.ack.call_count, 1)
-
-    def test_legacy_acked_through_boundaries(self):
-        """Legacy acked_through UUID ordering applies ONLY to recipient cursor, not other consumers."""
-        td = get_test_tmp_dir()
-        work = os.path.join(td, "work")
-        state_dir = os.path.join(td, "native-state")
-        os.makedirs(work, exist_ok=True)
-        canonical_ws = canonicalize_workspace(work)
-
-        rec_uuid = str(uuid.uuid4())
-        id_lower = "00000000-0000-0000-0000-000000000001"
-        id_middle = "00000000-0000-0000-0000-000000000005"
-        id_higher = "00000000-0000-0000-0000-000000000010"
-
-        # Case 1: recipient cursor with acked_through = id_middle. id_lower <= id_middle -> ACK!
-        create_authoritative_state(
-            state_dir, canonical_ws, "agent-1", rec_uuid,
-            exceptions=[],
-            acked_through=id_middle
-        )
-
-        bridge = MailboxBridge(work, state_dir=state_dir)
-        bridge.receipts["hub_to_native"] = {"hub-lower": id_lower, "hub-higher": id_higher}
-        bridge.receipts["hub_messages"] = {
-            id_lower: {"from_actor": "alice", "to_actor": "agent-1", "hub_id": "hub-lower"},
-            id_higher: {"from_actor": "alice", "to_actor": "agent-1", "hub_id": "hub-higher"}
-        }
-
-        with patch("agent_hub_host.bridge.bus") as mock_bus, \
-             patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="[]")):
-            bridge.sync_native_to_hub()
-            # hub-lower is acked (<= middle), hub-higher is NOT acked (> middle)
-            mock_bus.ack.assert_called_once_with("hub-lower")
-            self.assertIn("hub-lower", bridge.receipts["acked_hub_messages"])
-            self.assertNotIn("hub-higher", bridge.receipts["acked_hub_messages"])
 
     def test_failed_empty_malformed_native_reads_no_ack(self):
         """Corrupt cursor JSON, empty cursor file, or failed reads must fail closed with zero ACK."""
@@ -1155,7 +1118,7 @@ sys.exit(0)
 
         # Update recipient cursor with positive ACK for native_id
         with open(cursor_path, "w", encoding="utf-8") as f:
-            json.dump({"exceptions": [native_id], "acked_through": None}, f)
+            json.dump({"exceptions": [native_id]}, f)
 
         # Retry forward reconciles to delivered without running deliver subprocess again
         with patch("subprocess.run") as mock_run:

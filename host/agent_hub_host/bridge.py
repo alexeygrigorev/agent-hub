@@ -12,7 +12,6 @@ import json
 import os
 import subprocess
 import time
-import uuid
 from typing import Any
 
 from . import bus, private_fs
@@ -471,16 +470,10 @@ class MailboxBridge:
         if isinstance(exceptions, list) and native_id in exceptions:
             return True
 
-        # Check legacy acked_through for this recipient only
-        through = cdata.get("acked_through")
-        if through and isinstance(through, str):
-            try:
-                nid_u = uuid.UUID(str(native_id))
-                through_u = uuid.UUID(str(through))
-                if nid_u <= through_u:
-                    return True
-            except (ValueError, TypeError):
-                pass
+        # The legacy acked_through high-water cursor was retired with intake
+        # 19848714 (census: zero of 1385 host cursor files carried it; aplexer
+        # only migrates it away on read and never emits it). Exact-id
+        # exceptions are the sole ack record here, matching aplexer.
 
         return False
 
