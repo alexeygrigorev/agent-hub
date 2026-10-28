@@ -157,6 +157,14 @@ def main():
             if not same_controller(row, receipt):
                 raise RuntimeError('Controller identity changed')
             if row.get('phase') != 'running' or row.get('worker_alive') is False:
+                marker = journal / 'host-release-restart'
+                if marker.exists():
+                    # Planned exit to load a Hub-pinned host release (intake
+                    # a3227276): exit so the service restarts this supervisor
+                    # on the new code too; not a crash.
+                    marker.unlink()
+                    print(json.dumps({'event': 'controller_release_restart', 'id': receipt['id']}), flush=True)
+                    raise SystemExit(75)
                 if not stop.is_set():
                     publish_controller_crash(row, receipt, journal / 'host-health.json')
                 raise RuntimeError('Controller exited; supervisor will restart')

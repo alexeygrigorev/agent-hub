@@ -601,7 +601,7 @@ def main():
             print(webhooks_cli.diagnostic(exc), file=sys.stderr)
             sys.exit(1)
         return
-    if args.cmd in ('submit', 'jobs', 'job', 'task-result', 'routing-machines', 'model-policy', 'task-artifact', 'artifact'):
+    if args.cmd in ('submit', 'jobs', 'job', 'task-result', 'routing-machines', 'model-policy', 'task-artifact', 'artifact', 'host-release'):
         try:
             print(json.dumps(routing.execute(args), indent=2))
         except Exception:

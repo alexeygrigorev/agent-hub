@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
-from . import auth, config, fleet, session_control
+from . import auth, config, fleet, self_update, session_control
 from .dispatch_diagnostics import MESSAGES as DISPATCH_MESSAGES
 from .disk_monitor import DiskMonitor
 from .host_health_monitor import HostHealthMonitor
@@ -652,6 +652,11 @@ def maybe_start_maintenance_thread(current, dispatcher, quota_collector):
     return thread
 
 
+# Written by a controller that exits to load a Hub-pinned host release; the
+# supervisor treats that exit as a planned restart, not a crash.
+RELEASE_RESTART_MARKER = 'host-release-restart'
+
+
 @contextmanager
 def acquire_journal_lock(lock):
     """Exclusive advisory lock on the host journal (one controller per journal).
@@ -815,10 +820,20 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         # workspace list to the Hub. Invalid edits fail closed on the last
         # good settings (see maybe_reload_fleet_settings).
         settings_mtime = fleet_settings_mtime(settings_path)
+        release_stop = threading.Event()
         try:
             bindings_thread = maybe_start_named_thread(
                 None, bindings_loop, (dispatcher, stop), 'fleet-bindings')
+            # Intake a3227276: Hub-pinned host release for checkout installs
+            # (Windows hosts without ssh). An applied update sets ``stop``;
+            # the supervisor restarts the controller on the new code.
+            maybe_start_named_thread(
+                None, self_update.loop, (dispatcher.request, release_stop), 'host-release')
             while not stop.is_set() and (cycles is None or count < cycles):
+                if release_stop.is_set():
+                    (journal / RELEASE_RESTART_MARKER).write_text('restart\n', encoding='utf-8')
+                    print(json.dumps({'event': 'host_release_restart'}), flush=True)
+                    break
                 # Apply settings between maintenance/startup rounds, so an in-flight
                 # dispatch cannot mix the old allowlist with new credentials.
                 reloaded = None
@@ -908,6 +923,7 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                     stop.wait(interval)
         finally:
             stop.set()
+            release_stop.set()
             try:
                 drain_inflight_dispatch(dispatcher)
             except Exception:
