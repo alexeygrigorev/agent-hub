@@ -634,7 +634,7 @@ export class Hub extends DurableObject {
         }
         return Response.json({ error: 'method_not_allowed' }, { status: 405 });
       }
-      if (path === '/api/monitoring/health' || path === '/api/monitoring/host') {
+      if (path === '/api/monitoring/health') {
         if (request.method === 'POST') {
           const resolved = await this.statusObservationAuth(request);
           if ((resolved as any).error) return (resolved as any).error;
