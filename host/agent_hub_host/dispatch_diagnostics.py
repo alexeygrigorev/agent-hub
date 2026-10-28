@@ -47,6 +47,8 @@ EXACT = {
 
 
 def classify(exc, *, workspace_available=True):
+    if isinstance(exc, ClaimRefusedError):
+        return dict(exc.diagnostic)
     reason = 'dispatch_internal_error'
     if isinstance(exc, ValueError):
         value = str(exc)
@@ -73,3 +75,55 @@ def classify(exc, *, workspace_available=True):
         if type(exc.diagnostic.get('exit_code')) is int:
             value['exit_code'] = exc.diagnostic['exit_code']
     return value
+
+
+# Fixed protocol enums only: token-shaped arbitrary strings can still be secrets.
+HTTP_SLUGS = frozenset({
+    'fresh_admission_required', 'account_capacity', 'account_concurrency',
+    'machine_capacity', 'account_unavailable', 'provider_disabled',
+    'quota_unavailable', 'no_quota_evidence', 'quota_unknown', 'quota_stale',
+    'quota_exhausted', 'reserve_required', 'limit_reached', 'stale_window_evidence',
+    'malformed', 'invalid_observed_at', 'future_observation', 'stale_observation',
+    'route_not_ok', 'route_stale', 'cooldown_active', 'grok_entitlement',
+    'window_unavailable', 'reset_passed_since_observation', 'reserve', 'no_available_window',
+    'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure',
+    'host_oom', 'host_runtime_choking', 'model_unsupported', 'already_claimed',
+    'invalid_claim', 'claim_inactive', 'claim_conflict', 'claim_authority_changed',
+    'claim_required', 'claim_workspace_unconfigured', 'claim_project_mismatch',
+    'claim_scope_mismatch', 'claim_authority_unsupported', 'claim_actor_ambiguous',
+    'claim_holder_mismatch', 'worker_scope_forbidden', 'forbidden', 'not_found',
+})
+RETRYABLE_CLAIM_ERRORS = frozenset({
+    'fresh_admission_required', 'account_capacity', 'account_concurrency',
+    'machine_capacity', 'cpu_headroom', 'cpu_pressure', 'memory_pressure',
+    'host_oom', 'host_runtime_choking',
+})
+
+
+class ClaimRefusedError(ValueError):
+    """Definitive claim response; retains only fixed, bounded protocol fields."""
+    def __init__(self, exc, *, no_effects=True):
+        import re
+        status = getattr(exc, 'http_status', None)
+        error = getattr(exc, 'hub_error', None)
+        reason = getattr(exc, 'hub_reason', None)
+        # Compatibility with the installed 4398ce2a transport and test adapters.
+        if status is None:
+            match = re.fullmatch(r'HTTP request failed with status ([45][0-9]{2})(?::\s*([A-Za-z0-9_.:-]{1,129}))?', str(exc))
+            if match:
+                status = int(match[1])
+                parts = (match[2] or '').split(':')
+                error = parts[0]
+                reason = parts[1] if len(parts) == 2 else None
+        self.diagnostic = {
+            'reason': 'dispatch_claim_refused', 'message': MESSAGES['dispatch_claim_refused'],
+            'stage': 'dispatch_route', 'error_type': 'ValueError',
+        }
+        if type(status) is int and 400 <= status <= 599:
+            self.diagnostic['http_status'] = status
+        if isinstance(error, str) and error in HTTP_SLUGS:
+            self.diagnostic['hub_error'] = error
+        if isinstance(reason, str) and reason in HTTP_SLUGS:
+            self.diagnostic['hub_reason'] = reason
+        self.diagnostic['retryable'] = no_effects and status == 409 and isinstance(error, str) and error in RETRYABLE_CLAIM_ERRORS
+        super().__init__('HTTP request failed with status ' + str(status or 'unknown') + ': ' + (error if isinstance(error, str) and error in HTTP_SLUGS else 'unknown'))

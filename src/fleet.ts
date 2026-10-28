@@ -144,6 +144,15 @@ const DISPATCH_MESSAGES: Record<string, string> = {
   "codex_quota_gate_stale_window_evidence": "The managed Codex quota evidence is stale.",
   "codex_quota_gate_quota_check_failed": "The managed Codex quota check failed."
 };
+const CLAIM_HTTP_SLUGS = new Set<string>(["account_capacity", "account_concurrency", "account_unavailable", "already_claimed", "claim_actor_ambiguous", "claim_authority_changed", "claim_authority_unsupported", "claim_conflict", "claim_holder_mismatch", "claim_inactive", "claim_project_mismatch", "claim_required", "claim_scope_mismatch", "claim_workspace_unconfigured", "cooldown_active", "cpu_headroom", "cpu_pressure", "cpu_usage_unknown", "forbidden", "fresh_admission_required", "future_observation", "grok_entitlement", "host_oom", "host_runtime_choking", "invalid_claim", "invalid_observed_at", "limit_reached", "machine_capacity", "malformed", "memory_pressure", "model_unsupported", "no_available_window", "no_quota_evidence", "not_found", "provider_disabled", "quota_exhausted", "quota_stale", "quota_unavailable", "quota_unknown", "reserve", "reserve_required", "reset_passed_since_observation", "route_not_ok", "route_stale", "stale_observation", "stale_window_evidence", "window_unavailable", "worker_scope_forbidden"]);
+const RETRYABLE_CLAIM_ERRORS = new Set<string>(["account_capacity", "account_concurrency", "cpu_headroom", "cpu_pressure", "fresh_admission_required", "host_oom", "host_runtime_choking", "machine_capacity", "memory_pressure"]);
+function claimFieldsValid(d: any): boolean {
+  const fields = ['http_status', 'hub_error', 'hub_reason', 'retryable'];
+  if (d.reason !== 'dispatch_claim_refused') return fields.every(k => d[k] === undefined);
+  if (d.http_status !== undefined && (!Number.isInteger(d.http_status) || d.http_status < 400 || d.http_status > 599)) return false;
+  if (['hub_error', 'hub_reason'].some(k => d[k] !== undefined && !CLAIM_HTTP_SLUGS.has(d[k]))) return false;
+  return d.retryable === undefined || (typeof d.retryable === 'boolean' && (!d.retryable || (d.http_status === 409 && RETRYABLE_CLAIM_ERRORS.has(d.hub_error))));
+}
 // model_unsupported: the route cannot serve this intent's model/tier (plan()
 // tier exclusion or a recorded route refusal); it never frees up, so it must not
 // turn a capacity wait into a hard 409.
@@ -1779,7 +1788,7 @@ export class FleetService {
         if (match[2] === 'reject') {
           if (!object(data, ['reason', 'diagnostic']) || (data.reason !== 'dispatch_refused' && !Object.hasOwn(DISPATCH_MESSAGES, data.reason))) return response({ error: 'invalid_rejection' }, 400);
           const diagnostic = data.diagnostic ?? { reason: data.reason, message: DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.', stage: 'dispatch_route', error_type: 'Error' };
-          if (!object(diagnostic, ['reason', 'message', 'stage', 'error_type', 'command', 'exit_code', 'stdout_tail', 'stderr_tail']) || diagnostic.reason !== data.reason || diagnostic.stage !== 'dispatch_route' ||
+          if (!object(diagnostic, ['reason', 'message', 'stage', 'error_type', 'command', 'exit_code', 'stdout_tail', 'stderr_tail', 'http_status', 'hub_error', 'hub_reason', 'retryable']) || !claimFieldsValid(diagnostic) || diagnostic.reason !== data.reason || diagnostic.stage !== 'dispatch_route' ||
               diagnostic.message !== (DISPATCH_MESSAGES[data.reason] || 'The host refused dispatch before native start.') ||
               typeof diagnostic.error_type !== 'string' || !/^[A-Za-z]{1,64}$/.test(diagnostic.error_type) ||
               !sanitizeCommandFields(diagnostic)) return response({ error: 'invalid_rejection' }, 400);
@@ -1789,6 +1798,11 @@ export class FleetService {
           if (this.sql.exec('SELECT id FROM routing_jobs WHERE launch_id = ?', row.id).toArray().length) return response({ error: 'task_report_required' }, 409);
           this.sql.exec('UPDATE fleet_launches SET launch_error_json = ? WHERE id = ?', JSON.stringify(diagnostic), row.id);
           const at = new Date(this.now()).toISOString();
+          if (diagnostic.reason === 'dispatch_claim_refused' && diagnostic.retryable === true) {
+            // The offered-state fence above proves no native start was authorized.
+            // Retain the same intent; next offer repeats every admission/authority gate.
+            return response({ id: row.id, state: 'held', reason: data.reason, diagnostic, retryable: true });
+          }
           if (data.reason === 'model_unsupported' || data.reason === 'engine_auth_expired' || ['cpu_headroom','cpu_pressure','memory_pressure','host_oom','host_runtime_choking'].includes(data.reason)) {
             if (data.reason === 'engine_auth_expired') {
               this.sql.exec("INSERT OR REPLACE INTO fleet_engine_health (engine, machine_id, status, reason, updated_at) VALUES (?, ?, 'unavailable', ?, ?)", row.engine, row.machine_id, data.reason, at);
@@ -1825,40 +1839,52 @@ export class FleetService {
           // stored key match on a still-effect-free starting launch replays
           // the claim instead of double-claiming. A different key (sibling
           // loop or another attempt) stays a 409 conflict.
+          const refuse = (body: { error: string; reason?: string; [key: string]: unknown }, status: number) => {
+            const diagnostic = { reason: 'dispatch_claim_refused', message: DISPATCH_MESSAGES.dispatch_claim_refused,
+              stage: 'dispatch_route', error_type: 'ValueError', http_status: status,
+              ...(CLAIM_HTTP_SLUGS.has(body.error) ? { hub_error: body.error } : {}),
+              ...(body.reason && CLAIM_HTTP_SLUGS.has(body.reason) ? { hub_reason: body.reason } : {}),
+              retryable: row.state === 'offered' && !row.native_id && !row.launcher_task_id && status === 409 && RETRYABLE_CLAIM_ERRORS.has(body.error) };
+            // A racing post-start attempt must not overwrite native failure proof.
+            if (!row.native_id && !row.launcher_task_id) {
+              this.sql.exec('UPDATE fleet_launches SET launch_error_json = ? WHERE id = ?', JSON.stringify(diagnostic), row.id);
+            }
+            return response(body, status);
+          };
           const claimKey = (data as any)?.claim_key;
-          if (claimKey !== undefined && (typeof claimKey !== 'string' || !CLAIM_KEY.test(claimKey))) return response({ error: 'invalid_claim' }, 400);
+          if (claimKey !== undefined && (typeof claimKey !== 'string' || !CLAIM_KEY.test(claimKey))) return refuse({ error: 'invalid_claim' }, 400);
           const replay = typeof claimKey === 'string' && row.claim_key === claimKey && row.state === 'starting' && !row.native_id && !row.launcher_task_id;
-          if (row.state !== 'offered' && !replay) return response({ error: 'already_claimed' }, 409);
+          if (row.state !== 'offered' && !replay) return refuse({ error: 'already_claimed' }, 409);
           // A delayed first start must still have current edit authority,
           // fresh admission and enabled providers. Invalid replay holds the
           // existing reservation: it cannot prove absence of native effects.
           const cpu=this.resources.cpuHeadroom(row.machine_id,parsed(row.request_json),row.id);
-          if(!cpu.admitted) return response({error:cpu.reason,cpu},409);
+          if(!cpu.admitted) return refuse({error:cpu.reason,cpu},409);
           // Pre-hold offers on a now-disabled engine are held, never launched.
-          if (disabledEngines().has(row.engine)) return response({ error: 'provider_disabled' }, 409);
+          if (disabledEngines().has(row.engine)) return refuse({ error: 'provider_disabled' }, 409);
           const held = replay ? this.admission.heldReason(row) : this.admission.retireInvalidOffer(row);
-          if (held) return response({ error: held }, ['claim_inactive', 'claim_conflict', 'claim_authority_changed'].includes(held) ? 409 : 403);
-          if (!object(data, ['gate_allowed', 'observed_at', 'account', 'profile_supported', 'model', 'claim_key']) || data.gate_allowed !== true || data.profile_supported !== true || data.account !== row.account || !fresh(data.observed_at, this.now(), 30000)) return response({ error: 'fresh_admission_required' }, 409);
+          if (held) return refuse({ error: held }, ['claim_inactive', 'claim_conflict', 'claim_authority_changed'].includes(held) ? 409 : 403);
+          if (!object(data, ['gate_allowed', 'observed_at', 'account', 'profile_supported', 'model', 'claim_key']) || data.gate_allowed !== true || data.profile_supported !== true || data.account !== row.account || !fresh(data.observed_at, this.now(), 30000)) return refuse({ error: 'fresh_admission_required' }, 409);
           const selectedModel = parsed(row.model_selection_json)?.model;
-          if (typeof selectedModel !== 'string' || data.model !== selectedModel) return response({ error: 'model_unsupported', detail: 'Host must confirm the resolved model before native launch' }, 409);
+          if (typeof selectedModel !== 'string' || data.model !== selectedModel) return refuse({ error: 'model_unsupported', detail: 'Host must confirm the resolved model before native launch' }, 409);
           const account: any = this.sql.exec('SELECT * FROM fleet_accounts WHERE label = ?', row.account).toArray()[0];
-          if (!account || this.accountStatus(account).status === 'blocked') return response({ error: 'account_unavailable' }, 409);
+          if (!account || this.accountStatus(account).status === 'blocked') return refuse({ error: 'account_unavailable' }, 409);
           // Re-verify the exact launch route quota inside the atomic claim: no manual override bypass.
           const claimRoute: any = this.sql.exec('SELECT machine_id, profile FROM fleet_routes WHERE machine_id = ? AND account = ?', row.machine_id, row.account).toArray()[0];
           const claimProv = claimRoute ? this.observationProvenance(account, claimRoute) : null;
           const claimAdm = evaluateLaunchQuota({ provider: account.provider, quota: claimProv?.quota ?? null, subscriptionObservedAt: claimProv?.subscriptionObservedAt ?? null, nowMs: this.now(), reserves: ((((policy as any).rules as any).reserve_percent || {}) as Record<string, number>) });
-          if (!claimAdm || !claimAdm.ok) return response({ error: 'quota_unavailable', reason: claimAdm ? claimAdm.reason : 'no_quota_evidence' }, 409);
+          if (!claimAdm || !claimAdm.ok) return refuse({ error: 'quota_unavailable', reason: claimAdm ? claimAdm.reason : 'no_quota_evidence' }, 409);
           // Capacity reads reconcile other offers and time may advance during synchronous checks.
           // Never revive a row retired by that sweep; check authority again at the final write.
           const current: any = this.sql.exec('SELECT * FROM fleet_launches WHERE id = ?', row.id).one();
           if (replay) {
-            if (current.state !== 'starting' || current.claim_key !== claimKey || current.native_id || current.launcher_task_id) return response({ error: 'already_claimed' }, 409);
+            if (current.state !== 'starting' || current.claim_key !== claimKey || current.native_id || current.launcher_task_id) return refuse({ error: 'already_claimed' }, 409);
             const replayHold = this.admission.heldReason(current);
-            if (replayHold) return response({ error: replayHold }, 409);
+            if (replayHold) return refuse({ error: replayHold }, 409);
             return response({ ...current, state: 'starting', replay: true });
           }
           const finalHold = current.state === 'offered' ? this.admission.retireInvalidOffer(current) : current.exit_reason || 'already_claimed';
-          if (finalHold) return response({ error: finalHold }, ['claim_inactive', 'claim_conflict', 'claim_authority_changed', 'already_claimed'].includes(finalHold) ? 409 : 403);
+          if (finalHold) return refuse({ error: finalHold }, ['claim_inactive', 'claim_conflict', 'claim_authority_changed', 'already_claimed'].includes(finalHold) ? 409 : 403);
           this.sql.exec("UPDATE fleet_launches SET state = 'starting', claim_key = COALESCE(?, claim_key), updated_at = ? WHERE id = ? AND state = 'offered'", typeof claimKey === 'string' ? claimKey : null, new Date(this.now()).toISOString(), row.id);
           this.sql.exec('INSERT INTO resource_ramps VALUES(?,?) ON CONFLICT(launch_id) DO UPDATE SET started_at=excluded.started_at', row.id, new Date(this.now()).toISOString());
           return response({ ...row, state: 'starting', ...(typeof claimKey === 'string' ? { claim_key: claimKey } : {}) });

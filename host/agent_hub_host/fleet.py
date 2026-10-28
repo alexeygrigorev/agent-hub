@@ -2481,6 +2481,7 @@ class Dispatcher:
         if not isinstance(key, str) or not CLAIM_KEY_RE.fullmatch(key):
             raise ValueError("claim payload requires a per-attempt claim_key")
         attempts = 0
+        ambiguous = False
         while True:
             attempts += 1
             try:
@@ -2496,13 +2497,32 @@ class Dispatcher:
                         "timeout after the request was sent")
                 return self.request("POST", claim_path, payload)
             except Exception as exc:
-                if _is_ambiguous_claim_error(exc) and attempts < CLAIM_ATTEMPTS:
-                    continue
+                if _is_ambiguous_claim_error(exc):
+                    ambiguous = True
+                    if attempts < CLAIM_ATTEMPTS:
+                        continue
                 if _is_ambiguous_claim_error(exc):
                     raise ClaimTimeoutError(
                         "launch claim timed out before a confirmed response; "
                         "held for an idempotent same-host retry",
                         claim_key=key) from exc
+                from .bus import HttpRequestError
+                from .dispatch_diagnostics import ClaimRefusedError
+                if isinstance(exc, HttpRequestError) or (isinstance(exc, ValueError) and str(exc).startswith('HTTP request failed with status ')):
+                    refused = ClaimRefusedError(exc, no_effects=not ambiguous and self._pending_claim_key(offer_id) is None)
+                    # Separate bounded attempt evidence cannot overwrite a native
+                    # effect fence or another loop's terminal launch outbox.
+                    if self.journal_dir:
+                        from . import private_fs
+                        directory = Path(self.journal_dir) / 'claim-refusals'
+                        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                        private_fs.atomic_write(directory / (offer_id + '.json'),
+                            json.dumps({'offer_id': offer_id, 'diagnostic': refused.diagnostic}).encode(), 4096)
+                    if ambiguous:
+                        held = ClaimTimeoutError('claim response was ambiguous before refusal', claim_key=key)
+                        held.refusal_diagnostic = refused.diagnostic
+                        raise held from None
+                    raise refused from None
                 raise
 
     def _prepare_device_auth(self, cfg):
@@ -3500,7 +3520,8 @@ class Dispatcher:
                 # (see _dispatch_one), so the retry also fires when every
                 # attempt timed out and the claim landed late.
                 from .dispatch_diagnostics import MESSAGES as _DISPATCH_MESSAGES
-                diagnostic = {'reason': 'claim_timeout',
+                diagnostic = getattr(exc, 'refusal_diagnostic', None) or {
+                              'reason': 'claim_timeout',
                               'message': _DISPATCH_MESSAGES['claim_timeout'],
                               'stage': 'dispatch_route', 'error_type': 'TimeoutError'}
                 record = {'offer_id': offer.get('id'), 'state': 'claim_pending',
@@ -3533,11 +3554,8 @@ class Dispatcher:
             diagnostic = classify(exc, workspace_available=workspace_available)
             reason = diagnostic['reason']
             if reason == 'dispatch_claim_refused':
-                # Intake 4398ce2a: surface the Hub's refusal slug (bus already
-                # reduced the body to token-shaped error/reason fields).
-                slug = str(exc).split(':', 1)[1].strip()[:129] if ':' in str(exc) else ''
                 print(json.dumps({'event': 'dispatch_claim_refused', 'offer_id': offer.get('id'),
-                                  'hub_error': slug if re.fullmatch(r'[A-Za-z0-9_:.-]{0,129}', slug) else ''}), flush=True)
+                                  'diagnostic': diagnostic}), flush=True)
             pending_key = self._pending_claim_key(offer.get('id'))
             if pending_key is not None:
                 # This is an already-ambiguous claim attempt, not an
@@ -3558,7 +3576,7 @@ class Dispatcher:
             if not offer.get('task_id'):
                 try:
                     rejected = self.request('POST', '/api/fleet/launches/' + offer['id'] + '/reject', {'reason': reason, 'diagnostic': diagnostic})
-                    record['settled'] = True
+                    record['settled'] = rejected.get('retryable') is not True
                     self._persist_launch_record(record)
                     results.append(rejected)
                     return

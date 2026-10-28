@@ -33,6 +33,21 @@ def _sanitized_body_detail(body_bytes) -> str:
         return ""
     return ": " + ":".join(parts)[:129]
 
+class HttpRequestError(ValueError):
+    def __init__(self, status, body):
+        from .dispatch_diagnostics import HTTP_SLUGS
+        self.http_status = status
+        try:
+            data = json.loads(body)
+        except (ValueError, TypeError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        self.hub_error = data.get('error') if isinstance(data.get('error'), str) and data['error'] in HTTP_SLUGS else None
+        self.hub_reason = data.get('reason') if isinstance(data.get('reason'), str) and data['reason'] in HTTP_SLUGS else None
+        super().__init__(f"HTTP request failed with status {status}{_sanitized_body_detail(body)}")
+
+
 def _do_request(method, path, payload=None):
     cfg = config.load_config()
     base_url = os.environ.get("HUB_URL") or os.environ.get("HUB_BASE_URL") or cfg.get("base_url")
@@ -69,14 +84,17 @@ def _do_request(method, path, payload=None):
             auth.refresh_token(expected_token=token) if cfg.get('worker_launch_id') else auth.refresh_token()
             headers["Authorization"] = f"Bearer {auth.get_access_token()}"
             req = urllib.request.Request(url, data=data, headers=headers, method=method)
-            return safe_http_json(req)
+            try:
+                return safe_http_json(req)
+            except urllib.error.HTTPError as refreshed_error:
+                e = refreshed_error
         body_bytes = b""
-        if e.code in (400, 403, 404, 409, 422, 429):
+        if 400 <= e.code <= 599:
             try:
                 body_bytes = e.read(4097)
             except (ValueError, OSError):
                 body_bytes = b""
-        if e.code == 409:
+        if e.code == 409 and not path.endswith("/claim"):
             try:
                 body = json.loads(body_bytes.decode("utf-8", "replace") if isinstance(body_bytes, bytes) else body_bytes)
             except (ValueError, OSError):
@@ -84,7 +102,7 @@ def _do_request(method, path, payload=None):
             if isinstance(body, dict) and body.get('error') in {'cpu_headroom', 'cpu_pressure', 'cpu_usage_unknown', 'memory_pressure', 'host_oom', 'host_runtime_choking'}:
                 raise ValueError(body['error']) from None
         # Never print token, credentials, native full environment or server-controlled error bodies
-        raise ValueError(f"HTTP request failed with status {e.code}{_sanitized_body_detail(body_bytes)}")
+        raise HttpRequestError(e.code, body_bytes) from None
 
 def send(sender_actor, to_actor, kind, body, idempotency_key=None, thread_id=None, reply_to=None, lease_epoch=None):
     if idempotency_key is None:

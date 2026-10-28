@@ -745,6 +745,42 @@ describe('generic accounts and launch placement', () => {
     const shown: any = await (await sessions.handle(new Request('https://hub.test/api/sessions/' + launch.id), admin)).json();
     expect(shown).toMatchObject({ reason: diagnostic.reason, message: diagnostic.message, launch_error: diagnostic });
   }));
+  it('retains a stale claim cause across service restart and safely retries the same offer', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    const path = '/launches/' + launch.id;
+    const claim = { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(-31000), account: 'shared-codex', profile_supported: true, claim_key: 'a'.repeat(32) };
+    expect((await s.handle(request(path + '/claim', claim), host('hetzner'))).status).toBe(409);
+    const restarted = new FleetService(sql, cb => cb(), () => now); restarted.init();
+    const diagnostic = JSON.parse(sql.exec('SELECT launch_error_json FROM fleet_launches WHERE id = ?', launch.id).one().launch_error_json);
+    expect(diagnostic).toMatchObject({ reason: 'dispatch_claim_refused', http_status: 409, hub_error: 'fresh_admission_required', retryable: true });
+    const sessions = new SessionControlService(sql, cb => cb(), () => now); sessions.init();
+    sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES ('claim-retry-show', 'owner', 'claim-retry-show', '{}', ?, 'hetzner', 'headless', 'offered', ?, ?)", launch.id, iso(), iso());
+    const shown: any = await (await sessions.handle(new Request('https://hub.test/api/sessions/' + launch.id), admin)).json();
+    expect(shown.launch_error).toEqual(diagnostic);
+    const rejected: any = await (await restarted.handle(request(path + '/reject', { reason: diagnostic.reason, diagnostic }), host('hetzner'))).json();
+    expect(rejected).toMatchObject({ id: launch.id, state: 'held', retryable: true });
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('offered');
+    const fresh = { ...claim, observed_at: iso() };
+    expect((await restarted.handle(request(path + '/claim', fresh), host('hetzner'))).status).toBe(200);
+    // A racing refusal can never reset a claimed offer or authorize another start.
+    expect((await restarted.handle(request(path + '/reject', { reason: diagnostic.reason, diagnostic }), host('hetzner'))).status).toBe(409);
+    const replay: any = await (await restarted.handle(request(path + '/claim', fresh), host('hetzner'))).json();
+    expect(replay).toMatchObject({ state: 'starting', replay: true });
+    expect(sql.exec('SELECT COUNT(*) AS n FROM fleet_launches').one().n).toBe(1);
+  }));
+  it('never accepts secrets or a forged retryable authority refusal', async () => fixture(async (s, sql) => {
+    await configure(s);
+    const launch: any = await (await s.handle(request('/launches', intent({ machine: 'hetzner' })), admin)).json();
+    const path = '/launches/' + launch.id;
+    const diagnostic = { reason: 'dispatch_claim_refused', message: 'The Hub refused the dispatch claim before native start.', stage: 'dispatch_route', error_type: 'ValueError', http_status: 403, hub_error: 'claim_authority_unsupported', retryable: false };
+    for (const bad of [{ hub_error: 'opaqueSecret123' }, { hub_reason: 'Bearer token' }, { http_status: 200 }, { retryable: true }, { raw_body: 'prompt secret' }]) {
+      expect((await s.handle(request(path + '/reject', { reason: diagnostic.reason, diagnostic: { ...diagnostic, ...bad } }), host('hetzner'))).status).toBe(400);
+    }
+    expect((await s.handle(request(path + '/reject', { reason: diagnostic.reason, diagnostic }), host('hetzner'))).status).toBe(200);
+    expect(sql.exec('SELECT state FROM fleet_launches WHERE id = ?', launch.id).one().state).toBe('failed');
+    expect((await s.handle(request(path + '/claim', { gate_allowed: true, profile_supported: true, account: 'shared-codex', model: 'gpt-6.1-sol', observed_at: iso() }), host('hetzner'))).status).toBe(409);
+  }));
   it('offers goal starts only to host-advertised Codex-family routes', async () => fixture(async (s, sql) => {
     await configure(s);
     const quota = { status: 'ok', observed_at: iso(), details: { limit_reached: false }, windows: { weekly: { present: true, percent_remaining: 80, reset_at: iso(86400000) } } };
