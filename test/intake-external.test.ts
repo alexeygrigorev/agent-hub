@@ -23,7 +23,7 @@ describe('verified external intake assignments', () => {
         {id,payload:{key:'verify-external',expected_version:1,event}},'Bearer fixture');
       const response = await dispatchToolRequest(mcp,'intake_append',r=>h.intakeService.handle(r,auth));
       expect(response.status,await response.clone().text()).toBe(200);
-      const result = await response.json();
+      const result: any = await response.json();
       expect(result.task.payload_data.history.at(-1)).toMatchObject({evidence:'external_live_verified',authority:'host_census_verified',native_id:native});
       expect(result.task.assigned_sessions).toContainEqual(expect.objectContaining({native_id:native,machine:'external-fixture',state:'running',liveness:'live',linkage:'external_session'}));
       h.sql.exec("DELETE FROM fleet_catalog_seen WHERE machine_id='external-fixture'");
