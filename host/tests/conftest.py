@@ -4,6 +4,14 @@ from pathlib import Path
 
 import pytest
 
+# Hermetic-by-default (intake 6b624e65 AC1): runs at conftest import time,
+# i.e. before pytest imports any test module that imports agent_hub_host.
+# unittest discovery gets the same isolation from host/tests/__init__.py and
+# from agent_hub_host._test_isolation.auto_isolate().
+from agent_hub_host._test_isolation import isolate as _isolate_hermetic_home
+
+_isolate_hermetic_home()
+
 
 def _native_launch_identity_vars():
     """All env selectors that resolve the live per-launch worker profile.

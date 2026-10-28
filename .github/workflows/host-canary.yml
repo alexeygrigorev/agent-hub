@@ -1,0 +1,67 @@
+name: Host canary hermeticity
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "host/**"
+      - "scripts/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "host/**"
+      - "scripts/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Shared device login (DataTalksClub/auth)
+        uses: actions/checkout@v4
+        with:
+          repository: DataTalksClub/auth
+          path: .deps/auth
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.10.11"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Canary hermeticity (full host suite, pytest + unittest discover)
+        env:
+          DTC_AUTH_HOME: ${{ github.workspace }}/.deps/auth
+          TMPDIR: ${{ github.workspace }}/.local/tmp
+        run: |
+          mkdir -p .local/tmp
+          uv sync --frozen
+          uv run --frozen python scripts/ci/host_canary_check.py

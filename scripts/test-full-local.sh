@@ -43,25 +43,25 @@ if ! python3 scripts/ci/scope_guard.py --working || ! python3 -m unittest discov
   FAILURES=$((FAILURES + 1))
 fi
 
-echo "=== 1/6: TypeScript Typecheck ==="
+echo "=== 1/8: TypeScript Typecheck ==="
 if ! npm run typecheck; then
   echo "FAIL: Typecheck failed"
   FAILURES=$((FAILURES + 1))
 fi
 
-echo "=== 2/6: Validate CI/CD Workflows ==="
+echo "=== 2/8: Validate CI/CD Workflows ==="
 if ! python3 scripts/ci/validate-workflow.py || ! python3 scripts/ci/test_ci.py; then
   echo "FAIL: CI/CD workflow validation failed"
   FAILURES=$((FAILURES + 1))
 fi
 
-echo "=== 3/6: Hub CLI zipapp build & Worker dry-run build ==="
+echo "=== 3/8: Hub CLI zipapp build & Worker dry-run build ==="
 if ! python3 scripts/build-hub-cli.py --out-dir public/cli || ! npm run build; then
   echo "FAIL: Build / dry-run verification failed"
   FAILURES=$((FAILURES + 1))
 fi
 
-echo "=== 4/6: Vitest Discovery Suite (all test files, bounded concurrency) ==="
+echo "=== 4/8: Vitest Discovery Suite (all test files, bounded concurrency) ==="
 VITEST_RC=0
 # Serial files still have Node/V8 and esbuild background pools. Bound those
 # pools inside the existing CPU cap rather than competing for its quota.
@@ -80,7 +80,7 @@ else
   echo "PASS: Vitest discovery suite passed"
 fi
 
-echo "=== 5/6: Python Discovery Suite (disposable HOME, CI-matched env) ==="
+echo "=== 5/8: Python Discovery Suite (disposable HOME, CI-matched env) ==="
 DTC_AUTH_PATH="${DTC_AUTH_HOME:-/home/alexey/git/auth}"
 # Resolve the published native client from uv.lock; pytest is a test-only overlay.
 uv sync --frozen || exit 1
@@ -118,7 +118,18 @@ else
   echo "PASS: Python discovery suite passed"
 fi
 
-echo "=== 6/7: All standalone browser and static checks ==="
+echo "=== 6/8: Host canary hermeticity (full suite vs canary HOME, pytest + unittest) ==="
+# Intake 6b624e65: the suite must never touch the real user Hub profiles.
+# Runs the full host suite twice with HOME pointing at a canary home holding
+# human cli.json + host.json and asserts both stay byte-identical.
+if ! python3 scripts/ci/host_canary_check.py; then
+  echo "FAIL: Host canary hermeticity check failed (canary mutated or suite failed)"
+  FAILURES=$((FAILURES + 1))
+else
+  echo "PASS: Host canary hermeticity check passed"
+fi
+
+echo "=== 7/8: All standalone browser and static checks ==="
 # Chromium resolves shared-memory files from a different working directory.
 # Supply an absolute path only here; keep socket-sensitive Python paths short.
 export TMPDIR="${RUN_TMP_ABSOLUTE}"
@@ -132,7 +143,7 @@ else
   FAILURES=$((FAILURES + 1))
 fi
 
-echo "=== 7/7: Summary ==="
+echo "=== 8/8: Summary ==="
 if [ "${FAILURES}" -gt 0 ]; then
   echo "FAILED: ${FAILURES} suite(s) reported failures. Check logs above."
   exit 1

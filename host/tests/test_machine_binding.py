@@ -32,6 +32,11 @@ class TestMachineBinding(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "config" / "host.json"
+        # Intake 6b624e65 AC3: redirect the human profile as well. Patching only
+        # get_config_path left auth._active_profile() free to resolve the real
+        # ~/.config/agent-hub/cli.json through human-first load_config() and
+        # save refresh tokens there (the 2026-10-27 cli.json clobber).
+        self.human_path = Path(self.tmp.name) / "config" / "cli.json"
         self.addCleanup(patch.stopall)
         patch.object(config, "get_config_path", return_value=self.path).start()
         # save_config/load_config prefer the worker profile path, which they
@@ -40,6 +45,7 @@ class TestMachineBinding(unittest.TestCase):
         # aplexer session shell writes fixtures into that session's real
         # hub-worker-auth file (and destroys its credential).
         patch("agent_hub_host.worker_auth.config_path", return_value=None).start()
+        patch.object(config, "get_human_config_path", return_value=self.human_path).start()
         # Reuse the real device polling loop without sleeping or printing codes.
         flow = auth._device_flow()
         real_login = flow.device_login
