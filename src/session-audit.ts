@@ -60,6 +60,7 @@ export type AuditFeatures = {
   engine: string | null;
   mode: string | null;
   state: string;
+  actor: string | null; // owning credential actor; human:* = operator-started
   bound: boolean; // session carries a machine/native binding
   linked: boolean; // bound, running, and its native is observed live (send/stop possible)
   nativePhase: string | null;
@@ -93,6 +94,8 @@ export function makeHeuristicDecider(idleThresholdS: number): SessionDecider {
     decide(f: AuditFeatures): AuditDecision {
       if (f.protected_session)
         return { rule: 'protected_session', action: 'observe', detail: 'operator protection set; audit never acts' };
+      if (f.actor !== null && f.actor.startsWith('human:'))
+        return { rule: 'operator_started', action: 'observe', detail: `operator-started session (${f.actor}); audit never acts on it` };
       if (f.intake_state !== null && HUMAN_BLOCKED.has(f.intake_state))
         return { rule: 'human_blocked_intake', action: 'observe', detail: `intake ${f.intake} is ${f.intake_state} on a human; audit never acts on it` };
       if (f.idle_s === null || f.idle_s < t)
@@ -321,6 +324,7 @@ export class SessionAuditService {
       audits.push({
         session_id: s.id, machine_id: s.machine_id ?? null, native_id: binding?.native_id ?? null,
         intake, engine: s.engine ?? null, mode: s.mode ?? null, state: s.state,
+        actor: typeof s.actor === 'string' ? s.actor : null,
         bound, linked, protected_session: protectedIds.has(s.id),
         runtime_s: Number.isFinite(started) ? Math.max(0, (now - started) / 1000) : null,
         idle_s: last === null ? null : Math.max(0, (now - last) / 1000),
@@ -342,7 +346,7 @@ export class SessionAuditService {
       audits.push({
         session_id: null, machine_id: n.machine_id, native_id: n.native_id, intake: null,
         engine: n.engine ?? null, mode: null, state: 'observed', bound: false, linked: false,
-        protected_session: false,
+        actor: null, protected_session: false,
         runtime_s: Number.isFinite(n.created_at_ms) ? Math.max(0, (now - Number(n.created_at_ms)) / 1000) : null,
         idle_s: last === null ? null : Math.max(0, (now - last) / 1000),
         host_cpu: cpuByMachine.get(n.machine_id) ?? null,

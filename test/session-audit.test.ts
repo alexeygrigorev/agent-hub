@@ -11,7 +11,7 @@ const T = 1800; // idle threshold seconds used everywhere below
 function features(extra: Partial<AuditFeatures> = {}): AuditFeatures {
   return {
     session_id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', machine_id: 'm1', native_id: 'n1',
-    intake: null, engine: 'codex', mode: 'headless', state: 'running',
+    intake: null, engine: 'codex', mode: 'headless', state: 'running', actor: 'agent:fixture-worker',
     bound: true, linked: true, nativePhase: 'running', protected_session: false,
     runtime_s: 10 * HOUR / 1000, idle_s: 2 * T, host_cpu: null, git: null,
     intake_state: null, screen_tail: null, screen_age_s: null, nudges: 0, prior: null,
@@ -23,6 +23,10 @@ const decide = (f: AuditFeatures) => makeHeuristicDecider(T).decide(f);
 describe('idle audit heuristic rules (AC2)', () => {
   it('never acts when the operator protected the session', () => {
     expect(decide(features({ protected_session: true }))).toMatchObject({ rule: 'protected_session', action: 'observe' });
+  });
+  it('never acts on operator-started sessions (Alexey rule)', () => {
+    const f = features({ actor: 'human:admin-token:e42978c858a7a6bd', git: { dirty: true, dirty_count: 5, unpushed: 2, checked_at: iso(NOW) }, screen_tail: 'Press enter to continue', screen_age_s: 60, nudges: 3 });
+    expect(decide(f)).toMatchObject({ rule: 'operator_started', action: 'observe' });
   });
   it('never acts on an intake blocked on a human, whatever else it looks like', () => {
     const f = features({ intake: 't1', intake_state: 'blocked', git: { dirty: true, dirty_count: 5, unpushed: 2, checked_at: iso(NOW) }, nudges: 5, screen_tail: 'press enter to continue', screen_age_s: 60 });
