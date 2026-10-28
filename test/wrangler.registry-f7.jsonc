@@ -1,5 +1,0 @@
-{
-  "name": "agent-hub-registry-local", "main": "registry-f7-worker.ts", "compatibility_date": "2024-04-05", "compatibility_flags": ["nodejs_compat"],
-  "durable_objects": { "bindings": [{ "name": "HUB", "class_name": "Hub" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Hub"] }], "triggers": { "crons": ["*/30 * * * *", "*/5 * * * *"] }
-}

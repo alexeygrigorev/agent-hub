@@ -1,17 +1,12 @@
 // UI contract only; server liveness/progress are exercised in session-stall.test.ts.
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
+import { launchBrowser } from './playwright.mjs';
 import { readFile, mkdir } from 'node:fs/promises';
 import { resolve, extname } from 'node:path';
-let playwright;
-for (const path of [process.env.PLAYWRIGHT_PACKAGE, resolve('node_modules/playwright/package.json'), '/home/alexey/git/dataops/package.json'].filter(Boolean)) {
-  try { playwright = createRequire(path)('playwright'); break; } catch { /* use the existing local/CI browser install */ }
-}
-if (!playwright) throw new Error('Playwright unavailable');
-const { chromium } = playwright;
+
 process.env.TMPDIR ||= resolve('.local/tmp');
 await mkdir(process.env.TMPDIR, { recursive: true });
-const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--num-raster-threads=1'] });
+const browser = await launchBrowser({ args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--num-raster-threads=1'] });
 const id = '11111111-1111-4111-8111-111111111111';
 const session = { id, state: 'stalled', lifecycle_state: 'running', stalled: true, mode: 'interactive', session_type: 'aplexer', engine: 'codex', workspace: '/test', name: 'stalled-test', created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
 try {

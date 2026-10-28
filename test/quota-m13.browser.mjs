@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { build } from 'esbuild';
 import { Miniflare, Log, LogLevel, convertV4MiniflareOptions } from 'miniflare';
 import { randomBytes, createHash } from 'node:crypto';
-import { createRequire } from 'node:module';
+import { launchBrowser } from './playwright.mjs';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { resolve, extname } from 'node:path';
 
@@ -72,7 +72,9 @@ try {
   const hostSnap = fleetView.hosts.find(h => h.host_id === 'ui-machine').snapshot;
   assert.equal(hostSnap.routes.codex.windows['7d'].credits_remaining, 12.5);
   assert.equal(hostSnap.routes.codex.windows['7d'].unit, 'credits');
-  assert.ok((fleetView.coverage.missing.length + fleetView.coverage.fresh.length + fleetView.coverage.stale.length) >= 2);
+  // Coverage describes host quota snapshots, independently of subscription provenance.
+  assert.ok(fleetView.coverage.fresh.includes('ui-machine'));
+  assert.ok(!fleetView.coverage.fresh.includes('ui-other'));
   checks.push('Fleet quota contract: shared pool deduped to min-remaining with host provenance; natives round-trip; honest coverage');
 
   // Filtered view agrees with the fleet view on the same pool.
@@ -80,9 +82,7 @@ try {
   assert.equal(filtered.pools.length, 1);
   assert.equal(filtered.pools[0].remaining_percent, 60);
   checks.push('Filtered quota view agrees with the fleet view on host, units and freshness');
-
-  const require = createRequire(process.env.PLAYWRIGHT_PACKAGE || '/home/alexey/git/dataops/package.json'); const { chromium } = require('playwright');
-  browser = await chromium.launch({ args: ['--single-process', '--in-process-gpu', '--disable-gpu', '--disable-dev-shm-usage', '--no-sandbox', '--js-flags=--thread-pool-size=1', '--num-raster-threads=1', '--disable-threaded-animation', '--disable-threaded-scrolling'] });
+  browser = await launchBrowser({ args: ['--single-process', '--in-process-gpu', '--disable-gpu', '--disable-dev-shm-usage', '--no-sandbox', '--js-flags=--thread-pool-size=1', '--num-raster-threads=1', '--disable-threaded-animation', '--disable-threaded-scrolling'] });
   const context = await browser.newContext(), page = await context.newPage(); page.setDefaultTimeout(15000);
   const errors = []; page.on('pageerror', () => errors.push('browser script error'));
   const cookie = async value => { const [name, v] = value.split('='); await context.addCookies([{ name, value: v, url: base, httpOnly: true, sameSite: 'Lax' }]); };
