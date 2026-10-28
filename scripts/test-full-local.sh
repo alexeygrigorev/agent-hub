@@ -21,7 +21,7 @@ python3 scripts/local-dependencies.py || exit 1
 export UV_CACHE_DIR="${UV_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/uv}"
 TMP_PARENT="${TMPDIR:-.local/tmp}"
 mkdir -p "${TMP_PARENT}" || exit 1
-# Keep the default relative: long absolute paths can exceed Unix socket limits.
+# Python socket fixtures need short paths, even in a long checkout path.
 RUN_TMP="$(mktemp -d -p "${TMP_PARENT}" f-XXXXXX)" || exit 1
 cleanup() {
   # Retention applies only to this run's newly created temporary files.
@@ -31,7 +31,8 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 export TMPDIR="${RUN_TMP}"
-DISPOSABLE_HOME="$(cd "${RUN_TMP}" && pwd)/home"
+RUN_TMP_ABSOLUTE="$(cd "${RUN_TMP}" && pwd)" || exit 1
+DISPOSABLE_HOME="${RUN_TMP_ABSOLUTE}/home"
 mkdir "${DISPOSABLE_HOME}" || exit 1
 
 FAILURES=0
@@ -103,6 +104,9 @@ else
 fi
 
 echo "=== 6/7: Phone-width browser UI (390x844, light+dark) ==="
+# Chromium resolves shared-memory files from a different working directory.
+# Supply an absolute path only here; keep socket-sensitive Python paths short.
+export TMPDIR="${RUN_TMP_ABSOLUTE}"
 if [ -n "${SKIP_PHONE_UI:-}" ]; then
   echo "SKIP: SKIP_PHONE_UI is set; phone browser UI not executed."
 elif node test/phone-ui.browser.mjs --out .local/phone-ui && node test/host-health-charts.browser.mjs && node test/session-stall.browser.mjs && node test/usage-history.browser.mjs && node test/tbm-dashboard.browser.mjs; then

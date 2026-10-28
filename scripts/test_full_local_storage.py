@@ -13,7 +13,7 @@ import unittest
 
 RUNNER = Path(__file__).with_name("test-full-local.sh")
 STUB = r'''
-import json, os, pathlib, sys, time
+import json, os, pathlib, socket, sys, time
 name = pathlib.Path(sys.argv[0]).name
 args = sys.argv[1:]
 record = pathlib.Path(os.environ["STORAGE_RECORD"])
@@ -24,6 +24,15 @@ if name == "python3" and args[:1] == ["-c"]:
     print("/fixture/user-base")
 if name == "npx" and os.environ.get("FAIL_VITEST"):
     sys.exit(7)
+if name == "node":
+    # Model Chromium's different cwd when opening its shared-memory path.
+    os.chdir(record.parent)
+    tmp = pathlib.Path(os.environ["TMPDIR"])
+    assert tmp.is_absolute(), "Browser TMPDIR must be absolute"
+    (tmp / "browser-shared-memory").write_text("owned by this run")
+if name == "uv" and args[:1] == ["run"] and os.environ.get("CHECK_SOCKET"):
+    with socket.socket(socket.AF_UNIX) as server:
+        server.bind(str(pathlib.Path(os.environ["TMPDIR"]) / "fixture.sock"))
 if name == "uv" and args[:1] == ["sync"]:
     if os.environ.get("FAIL_SYNC"):
         sys.exit(9)
@@ -72,7 +81,7 @@ class FullLocalStorageTests(unittest.TestCase):
         env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
                    TMPDIR=str(self.temp), HOME=str(self.root / "original-home"),
                    UV_CACHE_DIR=str(self.root / "shared-uv-cache"), STORAGE_RECORD=str(record))
-        for key in ("SKIP_PHONE_UI", "FAIL_SYNC", "FAIL_VITEST", "PAUSE_SYNC"):
+        for key in ("SKIP_PHONE_UI", "FAIL_SYNC", "FAIL_VITEST", "PAUSE_SYNC", "CHECK_SOCKET"):
             env.pop(key, None)
         env.update(overrides)
         child = subprocess.Popen(["bash", str(self.repo / "scripts" / RUNNER.name)],
@@ -116,7 +125,7 @@ class FullLocalStorageTests(unittest.TestCase):
         parent.mkdir(parents=True)
         marker = parent / "preexisting-sibling"
         marker.write_text("preserve")
-        child, record = self.start("relative-default", TMPDIR="")
+        child, record = self.start("relative-default", TMPDIR="", CHECK_SOCKET="1")
         code, output = self.finish(child)
         self.assertEqual(code, 0, output)
         python = next(row for row in self.records(record)
@@ -125,6 +134,11 @@ class FullLocalStorageTests(unittest.TestCase):
         self.assertFalse(relative.is_absolute())
         self.assertEqual(relative.parent, Path(".local/tmp"))
         self.assertEqual(Path(python["home"]), self.repo / relative / "home")
+        # An absolute socket path here exceeds Linux's 108-byte sun_path.
+        self.assertGreater(len(str(self.repo / relative / "fixture.sock").encode()), 108)
+        browsers = [row for row in self.records(record) if row["tool"] == "node"]
+        self.assertEqual(len(browsers), 5)
+        self.assertTrue(all(Path(row["tmp"]) == self.repo / relative for row in browsers))
         self.assertFalse((self.repo / relative).exists())
         self.assertEqual(marker.read_text(), "preserve")
 
@@ -144,6 +158,7 @@ class FullLocalStorageTests(unittest.TestCase):
         self.assertIn("tmp_path_retention_count=0", python["args"])
         self.assertIn("tmp_path_retention_policy=none", python["args"])
         self.assertTrue(any(row["tool"] == "node" for row in rows), "Later suites must still execute")
+        self.assertTrue(all(Path(row["tmp"]) == run for row in rows if row["tool"] == "node"))
         self.assertFalse(run.exists())
         self.assert_preserved()
 

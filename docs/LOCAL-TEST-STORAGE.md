@@ -32,7 +32,10 @@ The uv cache uses the original HOME/XDG cache location, or explicit
 a new cache into each disposable home. Vitest uses `npx --no-install` so a
 missing binary cannot silently download another installation.
 
-The default TMPDIR remains relative to avoid long Unix socket paths in browser
-tests. Keep supplied paths short. Persistent build output, browser evidence,
+The default TMPDIR stays relative during Python tests to avoid long Unix socket
+paths. Browser subprocesses receive the absolute path to the same owned per-run
+directory: Chromium can open shared-memory files after changing its working
+directory. Keep supplied paths short for Python socket fixtures. Persistent
+build output, browser evidence,
 shared dependency installations, engine session history, and existing test
 scratch are outside this temporary-file retention policy.

@@ -71,11 +71,12 @@ export class ResourceManagement {
   private catalogStructureRevision:string|null=null;
   private catalogRawRows=new Map<string,any[]>();
   private catalogRawBytes=0;
+  private catalogIntakes: ReturnType<typeof worktreeIntakeSnapshot> | null = null;
   private catalogCache = new Map<string, {revision:string;rows:ReturnType<ResourceManagement['buildCanonicalSessions']>;bytes:number}>();
   /** Install after all canonical source schemas exist. SQLite triggers keep
    * protection/identity changes and their cache generations in one transaction. */
   initCatalogCache() {
-    this.catalogReady=false; this.catalogCache.clear(); this.catalogRawRows.clear(); this.catalogRawBytes=0; this.catalogStructureRevision=null;
+    this.catalogReady=false; this.catalogCache.clear(); this.catalogRawRows.clear(); this.catalogRawBytes=0; this.catalogStructureRevision=null; this.catalogIntakes=null;
     const tables=['session_control_sessions','fleet_launches','fleet_sessions','session_control_protections','resource_reaps','intake_tasks','intake_task_projection','resource_request_projection','machines'];
     if (tables.some(table=>!this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",table).toArray().length)) return;
     this.sql.exec('CREATE TABLE IF NOT EXISTS resource_catalog_revision(id INTEGER PRIMARY KEY CHECK(id=1),revision TEXT NOT NULL,structure_revision TEXT NOT NULL)');
@@ -342,7 +343,16 @@ export class ResourceManagement {
       for(const row of this.sql.exec(`SELECT id,json_extract(CASE WHEN json_valid(data) THEN data ELSE '{}' END,'$.project') AS project
         FROM ${intakeTable} WHERE id IN (${ids.map(()=>'?').join(',')})`,...ids).toArray()) projects.set(row.id,row.project);
     }
-    const worktreeLinks = worktreeIntakeSnapshot(this.sql);
+    // Native census activity invalidates the canonical rows, but cannot change
+    // intake closure or binding aliases. Reuse those facts until a structural
+    // write changes the rollback-safe generation. Keep failures uncached.
+    const worktreeLinks = this.catalogIntakes ?? worktreeIntakeSnapshot(this.sql);
+    if (!this.catalogIntakes && this.catalogStructureRevision !== null && worktreeLinks.valid) {
+      const entries = [...worktreeLinks.machines, ...worktreeLinks.projections, ...worktreeLinks.sessions];
+      if (entries.length <= 10000 && entries.reduce((n, row) => n + 512 + JSON.stringify(row).length * 2, 0) <= 4 * 1024 * 1024) {
+        this.catalogIntakes = worktreeLinks;
+      }
+    }
     const bound = rows.flatMap(s => {
       const data=controlData.get(s.id); if(!data) return [];
       const {binding,req,launch,model}=data;
@@ -394,7 +404,7 @@ export class ResourceManagement {
     const raw=this.catalogReady ? this.sql.exec('SELECT revision,structure_revision FROM resource_catalog_revision WHERE id=1').toArray()[0] : null;
     const revision=typeof raw?.revision==='string' && /^[a-f0-9]{32}$/.test(raw.revision) ? raw.revision : null;
     const structure=revision!==null && typeof raw?.structure_revision==='string' && /^[a-f0-9]{32}$/.test(raw.structure_revision) ? raw.structure_revision : null;
-    if(structure===null || structure!==this.catalogStructureRevision) {this.catalogRawRows.clear();this.catalogRawBytes=0;}
+    if(structure===null || structure!==this.catalogStructureRevision) {this.catalogRawRows.clear();this.catalogRawBytes=0;this.catalogIntakes=null;}
     this.catalogStructureRevision=structure;
     if(revision===null) this.catalogCache.clear();
     const key=machine ?? ''; const cached=this.catalogCache.get(key);
