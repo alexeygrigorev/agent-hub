@@ -28,6 +28,30 @@ class TestSessionControlCli(unittest.TestCase):
         fetch.assert_called_once_with('owned', 'cmd')
         sleep.assert_not_called()
 
+    def test_audit_export_returns_full_dataset_without_json_flag(self):
+        dataset = {'exported_at': '2026-10-28T12:00:00Z', 'runs': [],
+                   'decisions': [{'rule': 'stuck_uncommitted', 'features': {'idle_s': 2400},
+                                  'screen_tail': 'continue, commit, report'}]}
+        with patch.object(session_control, 'request', return_value=dataset) as transport:
+            out = session_control.execute(self.parse('audit', '--export', '--limit', '100'))
+        self.assertEqual(transport.call_args.args[:2],
+                         ('GET', '/api/sessions/audit/export?limit=100'))
+        self.assertIs(out, dataset)
+        self.assertEqual(out['decisions'][0]['features']['idle_s'], 2400)
+        rendered = session_control.render_output(
+            self.parse('audit', '--export', '--limit', '100'), dataset)
+        self.assertIs(rendered, dataset)  # --export never discards features/screen tails
+        # The action-log view still renders human-readable text.
+        view = {'audit': {'state': 'not_run'}, 'runs': [{'id': 1, 'at': '2026-10-28T12:00:00Z',
+                'source': 'scheduled', 'scanned': 1, 'counts': {'observed': 1}, 'alert': None}],
+                'decisions': [{'id': 1, 'run_id': 1, 'at': '2026-10-28T12:00:00Z', 'session_id': 's',
+                               'machine_id': 'm', 'native_id': 'n', 'intake': None, 'engine': 'codex',
+                               'mode': 'headless', 'idle_s': 60, 'rule': 'recent_progress',
+                               'action': 'observe', 'detail': 'd', 'dispatched': True,
+                               'outcome': None, 'outcome_at': None}]}
+        rendered = session_control.render_output(self.parse('audit', '--last', '1'), view)
+        self.assertIsInstance(rendered, str)
+
     def test_protect_uses_the_owner_route_and_never_a_native_stop(self):
         with patch.object(session_control, 'request', return_value={'cleanup_protection': {'permanent': True}}) as transport:
             result = session_control.execute(self.parse('protect', 'owned-worker', '--key', 'protect-once'))

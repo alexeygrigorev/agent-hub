@@ -1074,6 +1074,8 @@ def render_output(args, result):
             return render_commands(result)
         return result
     if cmd == 'audit':
+        if 'exported_at' in result:
+            return result  # raw dataset export (AC3): --export always yields the full rows
         return render_audit(result)
     return result
 
