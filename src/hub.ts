@@ -3187,9 +3187,9 @@ export class Hub extends DurableObject {
       return Response.json({ offers });
     }
 
-    // 2. Root endpoints (/api/root/... or /api/jobs/root/...)
+    // 2. Root endpoints (/api/root/...)
     // Root status
-    if (path === '/api/root/status' || path === '/api/jobs/root/status') {
+    if (path === '/api/root/status') {
       if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
       const auth = await this.authenticateBusRequest(request);
       if (auth.error) return auth.error;
@@ -3200,7 +3200,7 @@ export class Hub extends DurableObject {
     }
 
     // Root takeover
-    if (path === '/api/root/takeover' || path === '/api/jobs/root/takeover') {
+    if (path === '/api/root/takeover') {
       if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
       const auth = await this.authenticateBusRequest(request);
       if (auth.error) return auth.error;
@@ -3238,7 +3238,7 @@ export class Hub extends DurableObject {
     }
 
     // Root verify
-    if (path === '/api/root/verify' || path === '/api/jobs/root/verify') {
+    if (path === '/api/root/verify') {
       if (request.method !== 'GET' && request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, POST' } });
       const auth = await this.authenticateBusRequest(request);
       if (auth.error) return auth.error;
@@ -3316,7 +3316,7 @@ export class Hub extends DurableObject {
     }
 
     // Root actions (singular & plural)
-    if (path === '/api/root/action' || path === '/api/root/actions' || path === '/api/jobs/root/actions') {
+    if (path === '/api/root/action' || path === '/api/root/actions') {
       if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
       const auth = await this.authenticateBusRequest(request);
       if (auth.error) return auth.error;
@@ -3386,7 +3386,7 @@ export class Hub extends DurableObject {
     }
 
     // Root handoff
-    if ((path === '/api/root/handoff' || path === '/api/jobs/root/handoff') && request.method === 'POST') {
+    if ((path === '/api/root/handoff') && request.method === 'POST') {
       const auth = await this.authenticateBusRequest(request);
       if (auth.error) return auth.error;
 
@@ -3454,7 +3454,7 @@ export class Hub extends DurableObject {
       return Response.json(res);
     }
 
-    if ((path === '/api/root/handoff' || path === '/api/jobs/root/handoff') && request.method === 'GET') {
+    if ((path === '/api/root/handoff') && request.method === 'GET') {
       const auth = await this.authenticateBusRequest(request);
       if (auth.error) return auth.error;
       if (!auth.scopes?.includes('admin') && !auth.scopes?.includes('host') && !auth.scopes?.includes('lease:root') && !auth.scopes?.includes('jobs:create')) {
