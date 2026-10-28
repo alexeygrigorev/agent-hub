@@ -2514,10 +2514,18 @@ class Dispatcher:
                     # effect fence or another loop's terminal launch outbox.
                     if self.journal_dir:
                         from . import private_fs
-                        directory = Path(self.journal_dir) / 'claim-refusals'
-                        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-                        private_fs.atomic_write(directory / (offer_id + '.json'),
-                            json.dumps({'offer_id': offer_id, 'diagnostic': refused.diagnostic}).encode(), 4096)
+                        try:
+                            directory = Path(self.journal_dir) / 'claim-refusals'
+                            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                            private_fs.atomic_write(directory / (offer_id + '.json'),
+                                json.dumps({'offer_id': offer_id, 'diagnostic': refused.diagnostic}).encode(), 4096)
+                        except (OSError, ValueError):
+                            # A diagnostic sidecar cannot change claim certainty.
+                            # Keep the typed refusal/timeout so the main launch
+                            # journal retains the key and cause; never retry via
+                            # a weaker filesystem writer.
+                            print(json.dumps({'event': 'claim_refusal_journal_unavailable',
+                                              'offer_id': offer_id}), flush=True)
                     if ambiguous:
                         held = ClaimTimeoutError('claim response was ambiguous before refusal', claim_key=key)
                         held.refusal_diagnostic = refused.diagnostic

@@ -91,7 +91,7 @@ HTTP_SLUGS = frozenset({
     'invalid_claim', 'claim_inactive', 'claim_conflict', 'claim_authority_changed',
     'claim_required', 'claim_workspace_unconfigured', 'claim_project_mismatch',
     'claim_scope_mismatch', 'claim_authority_unsupported', 'claim_actor_ambiguous',
-    'claim_holder_mismatch', 'worker_scope_forbidden', 'forbidden', 'not_found',
+    'claim_holder_mismatch', 'worker_scope_forbidden', 'forbidden', 'not_found', 'unauthorized',
 })
 RETRYABLE_CLAIM_ERRORS = frozenset({
     'fresh_admission_required', 'account_capacity', 'account_concurrency',

@@ -81,13 +81,21 @@ def _do_request(method, path, payload=None):
         return safe_http_json(req)
     except urllib.error.HTTPError as e:
         if e.code == 401 and not job_token:
-            auth.refresh_token(expected_token=token) if cfg.get('worker_launch_id') else auth.refresh_token()
-            headers["Authorization"] = f"Bearer {auth.get_access_token()}"
-            req = urllib.request.Request(url, data=data, headers=headers, method=method)
             try:
-                return safe_http_json(req)
-            except urllib.error.HTTPError as refreshed_error:
-                e = refreshed_error
+                auth.refresh_token(expected_token=token) if cfg.get('worker_launch_id') else auth.refresh_token()
+                headers["Authorization"] = f"Bearer {auth.get_access_token()}"
+            except Exception:
+                if not path.endswith('/claim'):
+                    raise
+                # The refused claim is still a definitive 401. A refresh
+                # failure must not erase its sanitized cause or expose auth
+                # exception text in dispatch diagnostics.
+            else:
+                req = urllib.request.Request(url, data=data, headers=headers, method=method)
+                try:
+                    return safe_http_json(req)
+                except urllib.error.HTTPError as refreshed_error:
+                    e = refreshed_error
         body_bytes = b""
         if 400 <= e.code <= 599:
             try:

@@ -138,3 +138,78 @@ class ClaimRefusalTests(unittest.TestCase):
         self.assertEqual(caught.exception.claim_key, 'b' * 32)
         self.assertEqual(caught.exception.refusal_diagnostic['hub_error'], 'fresh_admission_required')
         self.assertFalse(caught.exception.refusal_diagnostic['retryable'])
+
+    def test_claim_401_survives_failed_refresh_without_auth_text(self):
+        secret = 'syntheticRefreshSecret123'
+        error = urllib.error.HTTPError('https://hub.test/', 401, 'Unauthorized', {},
+            io.BytesIO(json.dumps({'error': 'unauthorized', 'reason': secret}).encode()))
+        with patch.dict(os.environ, {'HUB_JOB_TOKEN': '', 'HUB_TOKEN': ''}), \
+             patch.object(bus.config, 'load_config', return_value={'base_url': 'https://hub.test'}), \
+             patch.object(bus.auth, 'get_access_token', return_value='synthetic-access'), \
+             patch.object(bus.auth, 'refresh_token', side_effect=ValueError(secret)), \
+             patch('agent_hub_host.api.safe_http_json', side_effect=error):
+            with self.assertRaises(bus.HttpRequestError) as caught:
+                bus._do_request('POST', '/api/fleet/launches/' + _valid_uuid4() + '/claim', {})
+        refused = ClaimRefusedError(caught.exception)
+        self.assertEqual(refused.diagnostic['http_status'], 401)
+        self.assertEqual(refused.diagnostic['hub_error'], 'unauthorized')
+        self.assertFalse(refused.diagnostic['retryable'])
+        self.assertNotIn(secret, json.dumps(refused.diagnostic))
+        self.assertNotIn(secret, str(refused))
+
+    def test_refreshed_claim_refusal_retains_final_response_status(self):
+        initial = urllib.error.HTTPError('https://hub.test/', 401, 'Unauthorized', {}, io.BytesIO(b'{}'))
+        final = urllib.error.HTTPError('https://hub.test/', 403, 'Forbidden', {},
+            io.BytesIO(b'{"error":"claim_authority_unsupported"}'))
+        with patch.dict(os.environ, {'HUB_JOB_TOKEN': '', 'HUB_TOKEN': ''}), \
+             patch.object(bus.config, 'load_config', return_value={'base_url': 'https://hub.test'}), \
+             patch.object(bus.auth, 'get_access_token', return_value='synthetic-access'), \
+             patch.object(bus.auth, 'refresh_token') as refresh, \
+             patch('agent_hub_host.api.safe_http_json', side_effect=[initial, final]):
+            with self.assertRaises(bus.HttpRequestError) as caught:
+                bus._do_request('POST', '/api/fleet/launches/' + _valid_uuid4() + '/claim', {})
+        refresh.assert_called_once()
+        self.assertEqual(caught.exception.http_status, 403)
+        self.assertEqual(caught.exception.hub_error, 'claim_authority_unsupported')
+
+    def test_sidecar_failure_after_timeout_keeps_key_and_starts_once_after_restart(self):
+        from agent_hub_host import private_fs
+        launch_id = _valid_uuid4()
+        hub = FakeHub(); hub.offer(launch_id)
+        attempts = []
+        phase = ['lost']
+        def request(method, path, payload=None):
+            if path.endswith('/claim'):
+                attempts.append(payload['claim_key'])
+                if phase[0] == 'lost':
+                    phase[0] = 'refused'
+                    hub.request(method, path, payload)  # committed but receipt lost
+                    raise TimeoutError('synthetic uncertain response')
+                if phase[0] == 'refused':
+                    raise bus.HttpRequestError(409, b'{"error":"fresh_admission_required"}')
+            return hub.request(method, path, payload)
+        calls = []
+        runner = self._runner(calls, launch_id)
+        dispatcher = Dispatcher(self._settings(), request, runner, journal_dir=self.tmp.name)
+        original = private_fs.atomic_write
+        def write(path, *args, **kwargs):
+            if Path(path).parent.name == 'claim-refusals':
+                raise PermissionError('synthetic sidecar refusal')
+            return original(path, *args, **kwargs)
+        results = []
+        with patch.object(private_fs, 'atomic_write', side_effect=write):
+            dispatcher._dispatch_one(self._offer(launch_id), results)
+        self.assertEqual(results[0]['state'], 'held')
+        self.assertEqual(results[0]['diagnostic']['http_status'], 409)
+        key = dispatcher._pending_claim_key(launch_id)
+        self.assertIsNotNone(key)
+        self.assertEqual(set(attempts), {key})
+        self.assertFalse(any(path.endswith('/reject') for _, path in hub.calls))
+        self.assertFalse(any('run' in argv for argv in calls))
+        phase[0] = 'healthy'
+        restarted = Dispatcher(self._settings(), request, runner, journal_dir=self.tmp.name)
+        results = []
+        restarted._dispatch_one(self._offer(launch_id), results)
+        self.assertEqual(results[0]['state'], 'running')
+        self.assertEqual(set(attempts), {key})
+        self.assertEqual(sum('run' in argv for argv in calls), 1)
