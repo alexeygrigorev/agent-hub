@@ -13,6 +13,22 @@ from agent_hub_host.launch_diagnostics import LocalCommandError, diagnostic, exc
 
 
 class LaunchDiagnosticTests(unittest.TestCase):
+    def test_worktree_and_tmpdir_refusals_preserve_fixed_diagnostics(self):
+        for raw, reason in (
+            ('worktree_lock_failed: checkout could not be protected', 'worktree_lock_failed'),
+            ('worktree_lock_failed: missing canonical session identity', 'worktree_lock_failed'),
+            ('worktree_identity_failed: original repository could not be recorded', 'worktree_identity_failed'),
+            ('Launcher temporary directory unavailable', 'launcher_tmpdir_unavailable'),
+        ):
+            with self.subTest(raw=raw):
+                info = exception_diagnostic(ValueError(raw), 'dispatch_headless')
+                self.assertEqual(info['reason'], reason)
+                self.assertEqual(info['error_type'], 'ValueError')
+                self.assertNotIn('withheld', info['message'])
+                unsafe = diagnostic('ValueError: ' + raw + ' /private/secret')
+                self.assertEqual(unsafe['reason'], 'launcher_command_failed')
+                self.assertNotIn('/private/secret', json.dumps(unsafe))
+
     def test_current_memory_floor_traceback_survives_failed_process(self):
         tail = 'host MemAvailable below 2048MiB floor after reservation (launcher_memory_reserve)'
         script = 'raise ValueError(' + repr(tail) + ')'
@@ -24,7 +40,11 @@ class LaunchDiagnosticTests(unittest.TestCase):
         self.assertEqual(info['exit_code'], 1)
         self.assertEqual(info['stage'], 'dispatch_headless')
         self.assertEqual(info['tail'], 'ValueError: ' + tail)
-        self.assertIn(tail, info['message'])
+        from agent_hub_host.launch_diagnostics import REFUSALS
+        self.assertEqual(info['message'], 'Host memory headroom after launcher reservations is below the configured floor.')
+        # Settlement validates this pair independently; otherwise restart
+        # recovery silently reduces a known refusal to the generic fallback.
+        self.assertIn((info['reason'], info['message']), set(REFUSALS.values()))
         for unsafe in (tail + ' secret=private-value', tail.replace('2048', '/private/token'),
                        tail.replace('2048', '9' * 100)):
             result = diagnostic('ValueError: ' + unsafe)

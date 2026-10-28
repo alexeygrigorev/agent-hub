@@ -30,6 +30,10 @@ class ZcodexReceiptRecoveryTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        # These synthetic workspaces are not the checkout above TMPDIR.
+        isolation = patch.dict(os.environ, GIT_CEILING_DIRECTORIES=self.tmp.name)
+        isolation.start()
+        self.addCleanup(isolation.stop)
         os.chmod(self.tmp.name, 0o700)
         self.workspace = Path(self.tmp.name) / "ws"
         self.workspace.mkdir(mode=0o700, parents=True)

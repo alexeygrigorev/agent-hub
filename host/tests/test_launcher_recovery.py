@@ -19,6 +19,10 @@ class LauncherRecoveryTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        # Repository-contained TMPDIR must not discover the real checkout.
+        isolation = patch.dict(os.environ, GIT_CEILING_DIRECTORIES=str(self.root))
+        isolation.start()
+        self.addCleanup(isolation.stop)
         self.ws = self.root / 'ws'
         self.ws.mkdir(mode=0o700)
         (self.ws / '.local').mkdir(mode=0o700)
@@ -154,6 +158,12 @@ class LauncherRecoveryTests(unittest.TestCase):
         self.assertEqual(requests[-1][2]['diagnostic']['reason'], 'launcher_command_failed')
 
     def test_memory_refusal_journal_and_hub_receipt_survive_restart(self):
+        self._memory_refusal_survives_restart('host MemAvailable < 10GiB')
+
+    def test_policy_floor_refusal_journal_and_hub_receipt_survive_restart(self):
+        self._memory_refusal_survives_restart('host MemAvailable below 2048MiB floor after reservation (launcher_memory_reserve)')
+
+    def _memory_refusal_survives_restart(self, refusal):
         import datetime
         from agent_hub_host.launch_diagnostics import LocalCommandError
         sub = {'service': 'go', 'account_label': 'muse', 'engine': 'opencode',
@@ -166,7 +176,7 @@ class LauncherRecoveryTests(unittest.TestCase):
             if 'plan' in argv:
                 return {'eligible': [{'provider': 'opencode', 'model': sub['launcher_model'], 'task_fit': 1.0}]}
             if 'run' in argv:
-                raise LocalCommandError('private-value\nValueError: host MemAvailable < 10GiB', exit_code=1)
+                raise LocalCommandError('private-value\nValueError: ' + refusal, exit_code=1)
             return {}
         calls = []
         def request(*args):

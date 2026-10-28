@@ -10,10 +10,17 @@ import json
 # Match complete known launcher refusal lines, including traceback final lines.
 # Messages are constants: suffixes, payloads, paths and credentials never survive.
 REFUSALS = {
+    'Launcher temporary directory unavailable': ('launcher_tmpdir_unavailable', 'The launcher temporary directory could not be safely prepared.'),
+    'worktree_lock_failed: checkout could not be protected': ('worktree_lock_failed', 'The checkout is locked to another session or could not be protected; same-intake reuse requires confirmed terminal ownership.'),
+    'worktree_lock_failed: missing canonical session identity': ('worktree_lock_failed', 'The launch is missing its canonical Hub session identity for worktree protection.'),
+    'worktree_identity_failed: original repository could not be recorded': ('worktree_identity_failed', 'The original worktree repository identity could not be recorded.'),
     'launcher_disk_reserve': ('launcher_disk_reserve', 'Host disk headroom after launcher reservations is below the maintained disk floor.'),
     'Worker Hub credential could not be prepared': ('launcher_worker_auth_unavailable', 'Worker Hub credential could not be prepared.'),
     'memory_pressure': ('memory_pressure', 'Host memory full pressure exceeds the safety cap.'),
     'host_oom': ('host_oom', 'A recent host OOM kill requires a placement cooldown.'),
+    # Also registers the fixed summary accepted by launcher_recovery's
+    # no-start settlement; the numeric policy value stays in the bounded tail.
+    'launcher_memory_reserve': ('launcher_memory_reserve', 'Host memory headroom after launcher reservations is below the configured floor.'),
     'host_runtime_choking': ('host_runtime_choking', 'Recent session or service failures require a placement cooldown.'),
     'cpu_headroom': ('cpu_headroom', 'Host CPU usage plus expected session demand exceeds the CPU target.'),
     'cpu_pressure': ('cpu_pressure', 'Host CPU pressure exceeds the safety cap.'),
@@ -531,8 +538,7 @@ def diagnostic(raw='', *, error_type='RuntimeError', exit_code=None, stage='laun
         # Current launcher resource policy uses a configurable MiB floor.
         # Accept only its complete numeric grammar, never arbitrary exception text.
         if re.fullmatch(r'host MemAvailable below [0-9]{1,7}MiB floor after reservation \(launcher_memory_reserve\)', candidate):
-            reason = 'launcher_memory_reserve'
-            message = 'The launcher refused start: ' + candidate + '.'
+            reason, message = REFUSALS['launcher_memory_reserve']
             surfaced_tail = error_type + ': ' + candidate
             refusal_found = True
             break

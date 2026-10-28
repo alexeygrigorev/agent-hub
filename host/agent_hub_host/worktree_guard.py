@@ -26,6 +26,7 @@ from pathlib import Path
 import re
 import subprocess
 import time
+from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
 SESSION_ID_RE = re.compile(r"[0-9a-fA-F-]{8,64}\Z")
@@ -419,6 +420,89 @@ def protect_bound_worktree(git_bin: str, path: str, session_id: Any, intake_id: 
     return ensure_locked(git_bin, root, session_id, intake_id, runner)
 
 
+@contextmanager
+def _ownership_guard(path):
+    """Serialize successor ownership with lifecycle unlocks on this host."""
+    import hashlib
+    from . import private_fs
+    key = hashlib.sha256(os.path.realpath(path).encode()).hexdigest()
+    with private_fs.exclusive_lock(identity_directory() / ('ownership-' + key + '.lock')):
+        yield
+
+
+def protect_successor_worktree(request, git_bin, path, session_id, intake_id):
+    """Keep a same-intake checkout locked while replacing a terminal owner.
+
+    A fresh host-only Hub response must prove the previous Hub session AND
+    its native incarnation terminal. The saved repository identity must also
+    match. Manual/foreign locks, live owners and unknown evidence fail closed.
+    The Git lock file is atomically replaced, never unlinked/unlocked.
+    """
+    from . import private_fs
+    import stat
+    import uuid
+    try:
+        reason = lock_reason(session_id, intake_id)
+        if not intake_id or intake_id == 'none' or os.name != 'posix':
+            return False
+        root = bound_worktree_root(path, git_bin)
+        if root is None:
+            return False
+        with _ownership_guard(root):
+            entry = find_entry(list_entries(git_bin, root), root)
+            owner = parse_lock_reason(entry.get('reason')) if entry else None
+            if not entry or not entry.get('locked') or not owner or owner[1] != intake_id:
+                return False
+            if owner[0] == session_id:
+                return True
+            facts = request('GET', '/api/sessions/worktree-guards')['sessions']
+            matches = [f for f in facts if isinstance(f, dict) and f.get('session_id') == owner[0]]
+            if len(matches) != 1:
+                return False
+            fact = matches[0]
+            if fact.get('terminal') is not True or fact.get('native_terminal') is not True:
+                return False
+            expected = expected_repository(fact)
+            identity = repository_identity(root, git_bin)
+            saved_path = expected.get('workspace') if expected else None
+            if (not isinstance(saved_path, str) or not identity
+                    or expected.get('repository') != identity
+                    or bound_worktree_root(saved_path, git_bin) != root):
+                return False
+            proc = _default_runner([git_bin, 'rev-parse', '--absolute-git-dir'], root, GIT_TIMEOUT)
+            gitdir = Path(proc.stdout.strip())
+            if proc.returncode or not gitdir.is_absolute() or gitdir.parent != Path(identity['common_dir']) / 'worktrees':
+                return False
+            lock = gitdir / 'locked'
+            with private_fs.parent(lock, private=False) as directory:
+                current = os.stat('locked', dir_fd=directory, follow_symlinks=False)
+                if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1 or current.st_uid != os.getuid():
+                    return False
+                if private_fs.read_bytes(lock, 1024, private=False).decode().strip() != entry['reason']:
+                    return False
+                temporary = 'locked.' + uuid.uuid4().hex + '.tmp'
+                fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+                try:
+                    with os.fdopen(fd, 'wb') as stream:
+                        stream.write((reason + '\n').encode())
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    # Fence replacement against a changed/deleted Git lock.
+                    latest = os.stat('locked', dir_fd=directory, follow_symlinks=False)
+                    if (latest.st_dev, latest.st_ino, latest.st_mtime_ns) != (current.st_dev, current.st_ino, current.st_mtime_ns):
+                        return False
+                    os.replace(temporary, 'locked', src_dir_fd=directory, dst_dir_fd=directory)
+                    os.fsync(directory)
+                finally:
+                    try:
+                        os.unlink(temporary, dir_fd=directory)
+                    except FileNotFoundError:
+                        pass
+            return find_entry(list_entries(git_bin, root), root).get('reason') == reason
+    except Exception:
+        return False
+
+
 def release_session_lock(git_bin: str, path: str, session_id: Any,
                          *, terminal: bool, intake_state: str,
                          runner: Optional[Callable] = None) -> bool:
@@ -434,10 +518,14 @@ def release_session_lock(git_bin: str, path: str, session_id: Any,
         roots = [entry for entry in entries
                  if path == entry["path"] or path.startswith(entry["path"] + os.sep)]
         entry = max(roots, key=lambda entry: len(entry["path"])) if roots else None
-        owner = parse_lock_reason(entry.get("reason")) if entry else None
-        if not entry or not entry.get("locked") or not owner or owner[0] != session_id:
+        if not entry:
             return False
-        return unlock_worktree(git_bin, entry["path"], runner)
+        with _ownership_guard(entry['path']):
+            entry = find_entry(list_entries(git_bin, path, runner), entry['path'])
+            owner = parse_lock_reason(entry.get("reason")) if entry else None
+            if not entry or not entry.get("locked") or not owner or owner[0] != session_id:
+                return False
+            return unlock_worktree(git_bin, entry["path"], runner)
     except Exception:
         return False
 
