@@ -1786,7 +1786,6 @@ export class JobsService {
     host: any;
     registered_root: any;
     current_root: any;
-    incumbent_legacy: any;
     heartbeat_fresh: boolean;
     within_lease: boolean;
     within_hardstop: boolean;
@@ -2013,13 +2012,6 @@ export class JobsService {
       };
     }
 
-    const incumbentLegacy = {
-      type: "retired_win35_root",
-      status: "retired",
-      read_only: true,
-      notes: "Win35 root stood down; do not reactivate"
-    };
-
     const withinLease = Boolean(
       leaseRow.holder_job_id &&
       leaseRow.expires_at &&
@@ -2158,7 +2150,6 @@ export class JobsService {
       host: hostRow,
       registered_root: regAgent || null,
       current_root: currentGrokRoot,
-      incumbent_legacy: incumbentLegacy,
       heartbeat_fresh: heartbeatFresh,
       within_lease: withinLease,
       within_hardstop: withinHardstop,
@@ -2181,7 +2172,6 @@ export class JobsService {
     host: any;
     registered_root: any;
     current_root: any;
-    incumbent_legacy: any;
     heartbeat_fresh: boolean;
     within_lease: boolean;
     within_hardstop: boolean;
@@ -2200,7 +2190,6 @@ export class JobsService {
       host: evalResult.host,
       registered_root: evalResult.registered_root,
       current_root: evalResult.current_root,
-      incumbent_legacy: evalResult.incumbent_legacy,
       heartbeat_fresh: evalResult.heartbeat_fresh,
       within_lease: evalResult.within_lease,
       within_hardstop: evalResult.within_hardstop,

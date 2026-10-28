@@ -70,11 +70,6 @@ describe('Root Coordination Acceptance Criteria (M4 / SPEC §8.1 / Issue 6 - Six
       expect(status.live_session.launcher_task_id).toBe('task-1');
       expect(status.live_session.evidence_digest).toBe('digest-1');
 
-      // Retired Win35 representation is present, marked retired, read-only
-      expect(status.incumbent_legacy).toBeDefined();
-      expect(status.incumbent_legacy.status).toBe('retired');
-      expect(status.incumbent_legacy.read_only).toBe(true);
-
       // Fresh status flags
       expect(status.is_healthy_alive).toBe(true);
       expect(status.confirmed_stale).toBe(false);
