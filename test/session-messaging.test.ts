@@ -171,6 +171,9 @@ describe('per-session messaging credential (M2)', () => {
     });
     const call = (path: string, token: string, data?: any) => stub.fetch(new Request('https://hub.test' + path, {
       method: data === undefined ? 'GET' : 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: data === undefined ? undefined : JSON.stringify(data) }));
+    // No identity yet (never messaged): nothing to provision, no scan.
+    expect((await (await call('/api/session-messaging/credentials', hostToken)).json() as any).sessions).toEqual([]);
+    await runInDurableObject(stub, async (hub: Hub) => { resolveRecipient(hub.sql, 'session:' + SESSION, Date.now()); });
     const pending: any = await (await call('/api/session-messaging/credentials', hostToken)).json();
     expect(pending.sessions).toEqual([{ session_id: SESSION, native_id: NATIVE, tag: 'burn-tabo', workspace: 'C:\\repos\\agent-hub' }]);
     expect((await (await call('/api/session-messaging/credentials', otherHost)).json() as any).sessions).toEqual([]);

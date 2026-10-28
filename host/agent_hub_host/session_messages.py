@@ -222,7 +222,7 @@ def relay_replies(*, journal_dir: str, executable: str, request: Callable,
 
 
 _last_provision = [0.0]
-PROVISION_INTERVAL_S = 60.0
+PROVISION_INTERVAL_S = 120.0
 
 
 def provision_credentials(request: Callable, base_url: Optional[str], *, auth_dir=None,
@@ -241,7 +241,7 @@ def provision_credentials(request: Callable, base_url: Optional[str], *, auth_di
     target_dir = auth_dir or session_auth_dir()
     pending = (request("GET", "/api/session-messaging/credentials", None) or {}).get("sessions", [])
     written = []
-    for row in pending[:50]:
+    for row in pending[:10]:
         sid, native = row.get("session_id"), str(row.get("native_id", "")).lower()
         if not isinstance(sid, str) or len(native) != 36:
             continue

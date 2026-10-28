@@ -36,6 +36,8 @@ export function initSessionMessaging(sql: SqlStorage): void {
     event TEXT NOT NULL, actor TEXT, machine_id TEXT, at INTEGER NOT NULL, detail_json TEXT)`);
   sql.exec('CREATE INDEX IF NOT EXISTS message_events_message ON message_events(message_id, id)');
   sql.exec('CREATE INDEX IF NOT EXISTS message_events_at ON message_events(at)');
+  // Session credential lookups go by registry_actor; never scan credentials.
+  sql.exec('CREATE INDEX IF NOT EXISTS credentials_registry_actor ON credentials(registry_actor)');
   const commandCols = new Set(sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_commands'").toArray().length
     ? sql.exec('PRAGMA table_info(session_control_commands)').toArray().map((c: any) => String(c.name)) : []);
   if (commandCols.size && !commandCols.has('not_before')) sql.exec('ALTER TABLE session_control_commands ADD COLUMN not_before TEXT');
@@ -186,21 +188,26 @@ export function expireSessionMessages(sql: SqlStorage, now: number, machineId: s
 const CREDENTIAL_TTL_MS = 24 * 3600 * 1000;
 const CREDENTIAL_RENEW_MS = 6 * 3600 * 1000;
 
-/** Bound, running sessions on this machine whose messaging credential is
- * missing or due for renewal (docs/SESSION-MESSAGING.md §8, M2). */
+/** Bound, running sessions on this machine that already have a messaging
+ * identity (they were messaged, or an operator created it) and whose
+ * credential is missing or due for renewal (docs/SESSION-MESSAGING.md §8, M2).
+ * Bounded: driven by the small session-identity set, indexed lookups only. */
 export function sessionsNeedingCredentials(sql: SqlStorage, machineId: string, now: number): { session_id: string; native_id: string; tag: string; workspace: string }[] {
-  const rows = sql.exec("SELECT id, binding_json FROM session_control_sessions WHERE machine_id = ? AND state = 'running' AND binding_json IS NOT NULL LIMIT 200", machineId).toArray() as any[];
+  const identities = sql.exec('SELECT tag FROM agents WHERE project = ? AND machine_id = ? LIMIT 200', SESSION_PROJECT, machineId).toArray() as any[];
   const renewBy = new Date(now + CREDENTIAL_RENEW_MS).toISOString();
   const out = [];
-  for (const row of rows) {
+  for (const identity of identities) {
+    const row: any = sql.exec("SELECT id, binding_json FROM session_control_sessions WHERE id = ? AND machine_id = ? AND state = 'running' AND binding_json IS NOT NULL", identity.tag, machineId).toArray()[0];
+    if (!row) continue;
     let binding: any = null;
     try { binding = JSON.parse(row.binding_json); } catch {}
     if (!binding?.native_id || !binding?.tag || !binding?.workspace) continue;
-    const live = sql.exec("SELECT 1 FROM credentials WHERE kind = 'agent' AND registry_actor = ? AND machine_id = ? AND revoked_at IS NULL AND expires_at > ? LIMIT 1",
+    const live = sql.exec("SELECT 1 FROM credentials WHERE registry_actor = ? AND kind = 'agent' AND machine_id = ? AND revoked_at IS NULL AND expires_at > ? LIMIT 1",
       `${SESSION_PROJECT}:${row.id}`, machineId, renewBy).toArray().length;
     if (!live) out.push({ session_id: String(row.id), native_id: String(binding.native_id), tag: String(binding.tag), workspace: String(binding.workspace) });
+    if (out.length >= 10) break;
   }
-  return out.slice(0, 50);
+  return out;
 }
 
 /** Mint the session's own bus-only credential for its bound host; older
@@ -219,9 +226,13 @@ export function mintSessionCredential(sql: SqlStorage, sessionId: string, machin
   return { actor, expires_at: expires };
 }
 
-/** A stopped or ended session's messaging identity stops working at once. */
+/** A stopped or ended session's messaging identity stops working: bounded
+ * by the session-identity rows, indexed revocation by registry_actor. */
 export function revokeEndedSessionCredentials(sql: SqlStorage, now: number): void {
   const at = new Date(now).toISOString();
-  sql.exec(`UPDATE credentials SET revoked_at = ? WHERE kind = 'agent' AND revoked_at IS NULL AND registry_actor LIKE 'session:%'
-    AND NOT EXISTS (SELECT 1 FROM session_control_sessions s WHERE 'session:' || s.id = credentials.registry_actor AND s.state = 'running')`, at);
+  const ended = sql.exec(`SELECT a.tag FROM agents a LEFT JOIN session_control_sessions s ON s.id = a.tag
+    WHERE a.project = ? AND (s.id IS NULL OR s.state <> 'running') LIMIT 100`, SESSION_PROJECT).toArray() as any[];
+  for (const row of ended) {
+    sql.exec("UPDATE credentials SET revoked_at = ? WHERE registry_actor = ? AND kind = 'agent' AND revoked_at IS NULL", at, `${SESSION_PROJECT}:${row.tag}`);
+  }
 }
