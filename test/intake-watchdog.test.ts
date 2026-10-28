@@ -56,6 +56,21 @@ describe('forgotten intake watchdog', () => {
     const w=new IntakeWatchdog(h.sql,h.intakeService,(f:any)=>f(),{},()=>NOW);w.init();
     expect(w.project([t])[0]).toMatchObject({forgotten:false,state:'unknown',reason:'host_observation_unknown'});
   }));
+  it.each([false, true])('77f492ed: failed ebbf4374 plus live aplexer 3261084c never starts 8ecfdacc (combined link %s)', async combined => fixture(async h => {
+    const t = task('77f492ed');
+    session(h, 'ebbf4374', t, 'failed');
+    t.history = [{kind:'link',native_id:'3261084c-1f4f-4d9d-b88c-1eb74aa1810a',
+      host:'fixture',evidence:'external_unverified_not_launch_proof', ...(combined ? {hub_session_id:'ebbf4374'} : {})}];
+    h.sql.exec("INSERT INTO fleet_sessions(machine_id,native_id,tag,phase,observed_at,workspace) VALUES('fixture',?,'autoreset','running',?,'isolated-autoreset-workspace')",t.history[0].native_id,new Date(NOW-3600000).toISOString());
+    h.sql.exec("INSERT OR REPLACE INTO fleet_catalog_seen(machine_id,observed_at) VALUES('fixture',?)",new Date(NOW).toISOString());
+    let starts=0;
+    const w = new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{start:async()=>{starts++;return {status:202,body:{id:'8ecfdacc'}}}},()=>NOW);w.init();
+    await w.tick();
+    expect(starts).toBe(0);
+    expect(w.project([t])[0]).toMatchObject({state:'active',forgotten:false});
+    h.sql.exec('DELETE FROM fleet_catalog_seen');
+    expect(w.project([t])[0]).toMatchObject({state:'unknown',forgotten:false});
+  }));
   it('does not interpret an unreachable bound worker as dead', async () => fixture(h => {
     const t=task();session(h,'bound',t,'running',{machine:'fixture',binding:{native_id:'native'}});
     const w=new IntakeWatchdog(h.sql,h.intakeService,(f:any)=>f(),{},()=>NOW);w.init();expect(w.project([t])[0]).toMatchObject({forgotten:false,state:'unknown'});

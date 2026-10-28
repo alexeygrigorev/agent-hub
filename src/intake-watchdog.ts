@@ -6,6 +6,7 @@ import { freshCatalogs } from './catalog-freshness';
 import { parseNativeActor } from './work_claim';
 import { getScopeStatus } from './intake_scope';
 import { nativeTerminalError, sessionTerminalError } from './session_stall';
+import { externalSession } from './intake-external';
 type Obj = Record<string, any>;
 const ACTIVE = new Set(['queued', 'held', 'offered', 'starting', 'running', 'uncertain']);
 const FAILED = new Set(['failed', 'refused', 'cancelled', 'engine_failed', 'engine_oom_killed']);
@@ -64,13 +65,10 @@ export class IntakeWatchdog {
       }
       // Manual native links are liveness hints only. A fresh canonical census must
       // independently match the exact native id/host before they suppress restart.
-      for (const e of (t.history || []).filter((e: Obj) => !e.hub_session_id && e.native_id && ['link', 'session'].includes(e.kind))) {
-        const n = native.find(n => n.native_id === e.native_id && (!e.host || n.machine_id === e.host));
-        const host = n?.machine_id || e.host;
-        if (!host || !catalogs.has(host)) { unknown = true; continue; }
-        if (!n) { unknown = true; continue; }
-        if (['unknown', 'unobserved'].includes(n.phase)) { unknown = true; continue; }
-        if (!nativeTerminalError(n) && !['exited', 'stopped', 'failed'].includes(n.phase)) live = true;
+      for (const e of (t.history || []).filter((e: Obj) => e.native_id && ['link', 'session'].includes(e.kind))) {
+        const n = externalSession(this.sql, e, now);
+        if (!n || n.liveness === 'unknown') { unknown = true; continue; }
+        if (n.live) live = true;
         else lastEnd = Math.max(lastEnd, ms(n.observed_at));
       }
       for (const s of linked) {

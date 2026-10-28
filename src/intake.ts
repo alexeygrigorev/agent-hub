@@ -11,6 +11,7 @@ type Tx = <T>(fn: () => T) => T;
 import { WORKER_SCOPE, workerAccessContext } from './worker-access';
 import { redactClaimData } from './work_claim';
 import { IntakeWorktrees, WorktreeError } from './intake-worktrees';
+import { externalSession } from './intake-external';
 
 /** Context changes invalidate old completion claims; notes never grant launch authority. */
 function currentHistory(task: Obj): Obj[] {
@@ -496,6 +497,18 @@ export class IntakeService {
     const seen = new Set<string>(); const out: Obj[] = [];
     for (let i = task.history.length - 1; i >= 0; i--) {
       const e = task.history[i];
+      if (e?.kind === 'link' && e.evidence === 'external_live_verified' && e.native_id) {
+        const key = 'external:' + e.host + '/' + e.native_id;
+        if (!seen.has(key)) {
+          seen.add(key);
+          const n = externalSession(this.sql, e, Date.now());
+          out.push({ hub_session_id: null, native_id: e.native_id, machine: e.host,
+            state: n?.liveness === 'unknown' || !n ? 'unknown' : n.liveness === 'terminal' ? 'failed' : n.phase,
+            liveness: n?.liveness ?? 'unknown', engine: n?.engine ?? e.engine,
+            observed_at: n?.observed_at ?? null, linkage: 'external_session',
+            evidence: 'external_live_verified', launch_verified: false });
+        }
+      }
       if (e?.kind !== 'link' || typeof e.hub_session_id !== 'string' || !SESSION_UUID.test(e.hub_session_id) || seen.has(e.hub_session_id)) continue;
       seen.add(e.hub_session_id);
       const row = this.sessionRow(e.hub_session_id);
@@ -736,7 +749,8 @@ export class IntakeService {
     } else if (['note', 'decision', 'followup', 'blocker', 'pending_approval'].includes(kind)) {
       keys(raw, ['kind', 'text', 'source']); fields = { text: str(raw.text, 8192, 'text'), source: source(raw.source) };
     } else if (kind === 'link') {
-      keys(raw, ['kind', 'native_id', 'engine', 'tier', 'host', 'hub', 'provenance', 'routing_job_id', 'hub_session_id']);
+      keys(raw, ['kind', 'native_id', 'engine', 'tier', 'host', 'hub', 'provenance', 'routing_job_id', 'hub_session_id', 'verify_live']);
+      if (raw.verify_live !== undefined && typeof raw.verify_live !== 'boolean') fail('invalid_field');
       let hub_session_id: string | null = null;
       if (raw.hub_session_id != null) {
         if (typeof raw.hub_session_id !== 'string' || !SESSION_UUID.test(raw.hub_session_id)) fail('invalid_field');
@@ -745,6 +759,15 @@ export class IntakeService {
       fields = { native_id: nullable(raw.native_id), engine: nullable(raw.engine, 128), tier: nullable(raw.tier, 128),
         host: nullable(raw.host), hub: nullable(raw.hub, 2048), provenance: source(raw.provenance),
         routing_job_id: nullable(raw.routing_job_id, 128), hub_session_id, evidence: 'external_unverified_not_launch_proof' };
+      if (raw.verify_live === true) {
+        this.operator(p);
+        const n = externalSession(this.sql, fields, now);
+        if (!n?.live) fail('external_session_not_live', 409);
+        fields.host = n.machine_id;
+        fields.engine = n.engine ?? fields.engine;
+        fields.evidence = 'external_live_verified';
+        fields.verified_at = now;
+      }
       if (fields.routing_job_id && !p.admin) fail('canonical_link_requires_operator', 403);
       if (fields.routing_job_id && !this.sql.exec('SELECT id FROM routing_jobs WHERE id=?', fields.routing_job_id).toArray().length) fail('unknown_routing_job');
       // A Hub session link must reference the real canonical session row and is
@@ -981,6 +1004,7 @@ export class IntakeService {
       };
     } else return fail('invalid_event_kind');
     const authority =
+      kind === 'link' && fields.evidence === 'external_live_verified' ? 'host_census_verified' :
       kind === 'approval_decision' ? 'operator_record' :
       kind === 'scope_decision' ? 'operator_record' :
       kind === 'owner_acceptance' ? 'canonical_owner_acceptance' :

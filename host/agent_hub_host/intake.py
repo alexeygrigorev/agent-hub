@@ -260,7 +260,7 @@ def add_commands(sub):
     event.add_argument('id')
     event.add_argument('--version', type=int, required=True)
     event.add_argument('--key', required=True)
-    event.add_argument('--event-file', required=True, help='Bounded UTF-8 JSON event file, or - for stdin')
+    event.add_argument('--event-file', required=True, help='Bounded UTF-8 JSON event file, or - for stdin. Register an aplexer session with {"kind":"session","native_id":"FULL_UUID","host":"MACHINE_ID","verify_live":true}; operator-only, requires fresh host census')
     assign = commands.add_parser('assign', help='Assign work: create the canonical Hub session for a task and record its real id automatically')
     assign.add_argument('id')
     assign.add_argument('--version', type=int, required=True)
