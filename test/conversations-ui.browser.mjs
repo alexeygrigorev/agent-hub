@@ -14,7 +14,7 @@
    Host budget: single-process chromium is the only mode that fits the
    cgroup and survives one context; the suite runs in ONE browser with ONE
    reused page, cleared between tests, and retries once if the browser dies. */
-import { createRequire } from 'node:module';
+import { launchBrowser } from './playwright.mjs';
 import { createServer } from 'node:http';
 import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, join, extname } from 'node:path';
@@ -23,8 +23,6 @@ import assert from 'node:assert/strict';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const outDir = join(root, '.local', 'tmp', 'conversations-ui');
-const requireDataops = createRequire('/home/alexey/git/dataops/package.json');
-const { chromium } = requireDataops('playwright');
 const LAUNCH_ARGS = ['--single-process', '--in-process-gpu', '--disable-gpu', '--disable-dev-shm-usage', '--no-sandbox', '--js-flags=--thread-pool-size=1', '--num-raster-threads=1', '--disable-threaded-animation', '--disable-threaded-scrolling'];
 
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.woff2': 'font/woff2' };
@@ -428,9 +426,9 @@ async function runSuite(page) {
   // Fresh state per test: same-origin blank-ish page, cleared storage, theme set
   // before the app boots (the theme boot reads localStorage at document start).
   async function freshPage({ theme, viewport } = {}) {
-    resetFixtures();
     await page.setViewportSize(viewport || { width: 1440, height: 900 });
-    await page.goto(base + '/conversations.css'); // same origin, no app boot
+    await page.goto(base + '/conversations.css'); // stop the old app before resetting request logs
+    resetFixtures();
     await page.evaluate(() => { try { localStorage.clear(); sessionStorage.clear(); } catch (e) {} });
     if (theme) await page.evaluate((value) => { try { localStorage.setItem('dakit-theme', value); } catch (e) {} }, theme);
     pageErrors.length = 0;
@@ -1189,7 +1187,7 @@ let result = null;
 for (let attempt = 1; attempt <= 3 && !result; attempt++) {
   let browser;
   try {
-    browser = await chromium.launch({ args: LAUNCH_ARGS });
+    browser = await launchBrowser({ args: LAUNCH_ARGS });
     const context = await browser.newContext();
     const page = await context.newPage();
     result = await runSuite(page);

@@ -251,7 +251,8 @@ describe('F7 complete old-database startup through SELF', () => {
     expect(migrated).toEqual(before.credential);
     expect((await rows('SELECT credential_id FROM machines WHERE id = ?', 'local-old-machine'))[0].credential_id).toBe('local-old-id');
     const message = (await rows('SELECT * FROM messages WHERE id = ?', 'old-message'))[0];
-    expect(message).toEqual({...before.message,registry_unbound_from:1,registry_unbound_to:1});
+    // Later migrations add nullable delivery columns; every legacy field must survive.
+    expect(message).toMatchObject({...before.message,registry_unbound_from:1,registry_unbound_to:1});
     const cookie = await admin();
     expect((await register('oldB','old-worker',cookie)).status).toBe(201);
     expect((await register('oldB','old-worker',cookie)).status).toBe(409);

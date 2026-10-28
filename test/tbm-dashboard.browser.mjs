@@ -2,17 +2,12 @@
 // No backend changes; verifies spend-vs-pace, banked deadlines, kill-switch,
 // honest quota-percent wording, CSRF, auth errors, responsive 1440/390 light/dark.
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
+import { launchBrowser } from './playwright.mjs';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { resolve, extname } from 'node:path';
 
-let playwright;
-for (const candidate of [process.env.PLAYWRIGHT_PACKAGE, resolve('node_modules/playwright/package.json'), '/home/alexey/git/dataops/package.json'].filter(Boolean)) {
-  try { playwright = createRequire(candidate)('playwright'); break; } catch { /* use the existing local/CI browser install */ }
-}
-if (!playwright) throw new Error('Playwright unavailable; install the existing CI browser harness or set PLAYWRIGHT_PACKAGE.');
-const { chromium } = playwright;
-const browser = await chromium.launch({
+
+const browser = await launchBrowser({
   args: ['--disable-gpu', '--disable-dev-shm-usage', '--no-sandbox', '--num-raster-threads=1'],
 });
 

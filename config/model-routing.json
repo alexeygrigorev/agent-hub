@@ -472,7 +472,6 @@
       }
     },
     "allow_paid": false,
-    "allow_cross_tier_failover": false,
     "difficulty_tiers": {
       "hard": "deep",
       "normal": "daily",

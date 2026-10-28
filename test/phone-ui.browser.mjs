@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { build } from 'esbuild';
 import { Miniflare, Log, LogLevel, convertV4MiniflareOptions } from 'miniflare';
 import { randomBytes, createHash } from 'node:crypto';
-import { createRequire } from 'node:module';
+import { launchBrowser } from './playwright.mjs';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { resolve, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,22 +22,6 @@ const outIdx = process.argv.indexOf('--out');
 const out = resolve(outIdx >= 0 && process.argv[outIdx + 1] ? process.argv[outIdx + 1] : resolve(root, '.local/phone-ui'));
 await mkdir(out, { recursive: true, mode: 0o700 });
 
-function resolvePlaywright() {
-  const candidates = [];
-  if (process.env.PLAYWRIGHT_PACKAGE) candidates.push(process.env.PLAYWRIGHT_PACKAGE);
-  candidates.push(resolve(root, 'node_modules/playwright/package.json'));
-  candidates.push('/home/alexey/git/dataops/package.json');
-  candidates.push('playwright');
-  let last;
-  for (const c of candidates) {
-    try {
-      const req = c === 'playwright' ? createRequire(resolve(root, 'package.json')) : createRequire(c);
-      return req(c === 'playwright' ? 'playwright' : 'playwright');
-    } catch (e) { last = e; }
-  }
-  throw new Error('Playwright unavailable (tried PLAYWRIGHT_PACKAGE, local, dataops): ' + last?.message);
-}
-const { chromium } = resolvePlaywright();
 const LAUNCH_ARGS = ['--single-process', '--no-zygote', '--renderer-process-limit=1', '--in-process-gpu', '--disable-gpu', '--disable-dev-shm-usage', '--no-sandbox', '--disable-breakpad', '--disable-crash-reporter', '--disable-site-isolation-trials', '--disable-features=site-per-process', '--js-flags=--thread-pool-size=1', '--num-raster-threads=1', '--disable-threaded-animation', '--disable-threaded-scrolling'];
 
 const checks = [], shots = [];
@@ -80,7 +64,7 @@ try {
   const pendingVersion = afterFlag.control.version;
   checks.push('Seeded 2 intake tasks via the real API (one pending approval)');
 
-  browser = await chromium.launch({ args: LAUNCH_ARGS });
+  browser = await launchBrowser({ args: LAUNCH_ARGS });
   const context = await browser.newContext();
   const page = await context.newPage();
   page.setDefaultTimeout(20000);

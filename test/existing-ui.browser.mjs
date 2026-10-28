@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {build} from 'esbuild';
 import {Miniflare,Log,LogLevel,convertV4MiniflareOptions} from 'miniflare';
 import {randomBytes,createHash} from 'node:crypto';
-import {createRequire} from 'node:module';
+import { launchBrowser } from './playwright.mjs';
 import {readFile,mkdir,writeFile} from 'node:fs/promises';
 import {resolve,extname} from 'node:path';
 const root=resolve(import.meta.dirname,'..'),out=resolve(process.env.UI_EVIDENCE_DIR||resolve(root,'.local/ui-evidence'));
@@ -33,8 +33,7 @@ try{
  const subscriptions=()=>({subscriptions:[{service:'codex',account:'ui-account',plan:'Local fixture',quota:{status:'ok',observed_at:new Date().toISOString(),details:{limit_reached:false},windows:{weekly:{present:true,percent_remaining:80,reset_at:new Date(Date.now()+3600000).toISOString()}}}}]});
  assert.equal((await api('/api/fleet/subscriptions','PUT',subscriptions(),ht.access_token)).status,200);
  assert.equal((await api('/api/fleet/sessions','PUT',{sessions:[{native_id:'ui-session',tag:'local-session',engine:'codex',phase:'running',agent_state:'idle',workspace:'demo',profile:null,account:null}]},ht.access_token)).status,200);
- const require=createRequire(process.env.PLAYWRIGHT_PACKAGE||'/home/alexey/git/dataops/package.json');const {chromium}=require('playwright');
- browser=await chromium.launch({args:['--single-process','--in-process-gpu','--disable-gpu','--disable-dev-shm-usage','--no-sandbox','--js-flags=--thread-pool-size=1','--num-raster-threads=1','--disable-threaded-animation','--disable-threaded-scrolling']});
+ browser=await launchBrowser({args:['--single-process','--in-process-gpu','--disable-gpu','--disable-dev-shm-usage','--no-sandbox','--js-flags=--thread-pool-size=1','--num-raster-threads=1','--disable-threaded-animation','--disable-threaded-scrolling']});
  const context=await browser.newContext(),page=await context.newPage();page.setDefaultTimeout(15000);
  const errors=[];page.on('pageerror',()=>errors.push('browser script error'));
  const cookie=async value=>{const [name,v]=value.split('=');await context.addCookies([{name,value:v,url:base,httpOnly:true,sameSite:'Lax'}]);};

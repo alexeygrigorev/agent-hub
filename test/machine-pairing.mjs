@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {build} from 'esbuild';
 import {Miniflare,Log,LogLevel,convertV4MiniflareOptions} from 'miniflare';
 import {randomBytes} from 'node:crypto';
-import {createRequire} from 'node:module';
+import { launchBrowser } from './playwright.mjs';
 import {readFile,mkdir,mkdtemp,rm} from 'node:fs/promises';
 import {resolve,extname} from 'node:path';
 import {execFile} from 'node:child_process';
@@ -34,10 +34,7 @@ try {
  assert.equal(challengeResponse.status,200);const challenge=await challengeResponse.json();
  const poll=()=>fetch(base+'/api/device/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({grant_type:'urn:ietf:params:oauth:grant-type:device_code',device_code:challenge.device_code})});
  assert.equal((await (await poll()).json()).error,'authorization_pending');
- assert.ok(process.env.PLAYWRIGHT_PACKAGE,'Set PLAYWRIGHT_PACKAGE to an existing Playwright dependency package.json; do not install dependencies');
- const require=createRequire(resolve(process.env.PLAYWRIGHT_PACKAGE));
- const {chromium}=require('playwright');
- browser=await chromium.launch({args:['--single-process','--in-process-gpu','--disable-gpu','--disable-dev-shm-usage','--no-sandbox','--js-flags=--thread-pool-size=1','--num-raster-threads=1','--disable-threaded-animation','--disable-threaded-scrolling']});
+ browser=await launchBrowser({args:['--single-process','--in-process-gpu','--disable-gpu','--disable-dev-shm-usage','--no-sandbox','--js-flags=--thread-pool-size=1','--num-raster-threads=1','--disable-threaded-animation','--disable-threaded-scrolling']});
  const context=await browser.newContext();const [name,value]=fixture.cookie.split('=');await context.addCookies([{name,value,url:base,httpOnly:true,sameSite:'Lax'}]);
  const page=await context.newPage();page.setDefaultTimeout(15000);
  const reviewCode=async code=>{await page.goto(base+'/device?code='+code);await page.getByRole('button',{name:'Continue',exact:true}).click();};
@@ -68,10 +65,10 @@ try {
  async function python(script,file,extra={}) {
   return exec('python3',['-c',script],{cwd:nativeWorkspace||root,env:{...pyEnv(file),...extra},timeout:30000});
  }
- async function login(suffix,mid,conflict=false) {
+ async function login(suffix,mid,replaceOldBinding=false) {
   const cliActor=suffix==='bound'?actor:'pair-local:cli-'+suffix;
   const dir=resolve(cliRoot,suffix);await mkdir(dir,{mode:0o700});const file=resolve(dir,'host.json');
-  if(conflict)await python("from agent_hub_host import config; config.update_config(machine_id='wrong-local-machine')",file);
+  if(replaceOldBinding)await python("from agent_hub_host import config; config.update_config(machine_id='wrong-local-machine')",file);
   const child=execFile('python3',['-u','-m','agent_hub_host.cli','login',base,'--kind','agent','--name',cliActor],{cwd:nativeWorkspace||root,env:pyEnv(file),timeout:45000});children.add(child);
   let output='',errorOutput='';
   const done=new Promise((ok,fail)=>{child.on('error',fail);child.on('close',code=>{children.delete(child);ok({code,output,errorOutput});});});
@@ -85,11 +82,8 @@ try {
   const approved=page.waitForResponse(r=>new URL(r.url()).pathname.startsWith('/api/device/approve/'));
   await page.getByRole('button',{name:'Approve',exact:true}).click();assert.equal((await approved).status(),200);
   const result=await done;
-  if(conflict) {
-   assert.equal(result.code,1);assert.ok(result.errorOutput.includes('Conflicting machine_id for paired host config'));
-   await python("from agent_hub_host import config; c=config.load_config(); assert c['machine_id']=='wrong-local-machine' and 'access_token' not in c",file);
-   console.log('PASS real public CLI rejects conflicting preexisting machine config without overwriting it');return;
-  }
+  // A completed authenticated exchange replaces the previous binding atomically.
+  // config._TokenExchange separately rejects concurrent config writes.
   assert.equal(result.code,0);assert.ok(result.output.includes('Login successful.'));
   await python(`import os
 from agent_hub_host import config,auth,conversations
@@ -114,7 +108,7 @@ if os.environ.get('OWN_UUID'):
 `,file,{EXPECTED_MACHINE:mid||'',EXPECTED_ACTOR:cliActor,...(suffix==='bound'&&own?{OWN_UUID:own.id,OWN_TAG:own.tag,OWN_WORKSPACE:nativeWorkspace}:{})});
   console.log('PASS real public CLI '+suffix+' login persists authoritative binding automatically; real HTTP refresh and participants'+(suffix==='bound'&&own?'; genuine own UUID native qualify, no journal or inbox writes':''));
  }
- await login('bound','pair-local-machine');await login('null',null);await login('conflict','pair-local-machine',true);
+ await login('bound','pair-local-machine');await login('null',null);await login('replace-old-binding','pair-local-machine',true);
  // A displayed machine-less choice stays null even if an admin registers a machine while the page is open.
  const stale=await (await fetch(base+'/api/device/code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client_kind:'agent',name:'pair-local:stale-ui',requested_scopes:['bus:read']})})).json();
  await reviewCode(stale.user_code);
