@@ -1,7 +1,7 @@
 import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, setMessageState, expireSessionMessages, expireMessageEvents, readdressMessage, setDelegate, listDelegates } from './session-messaging';
 import { IdleWorkService } from './idle-work';
 import { WorkerAccess, WORKER_SCOPE, workerRequestAllowed, workerRefreshContext } from './worker-access';
-import { IntakeWatchdog } from './intake-watchdog';
+import { IntakeWatchdog, queuePolicyFrom } from './intake-watchdog';
 import { IntakeTriage } from './intake-triage';
 import { IntakeVerifier } from './intake-verifier';
 import { SessionAuditService, makeHeuristicDecider, makeLivenessNotify } from './session-audit';
@@ -157,6 +157,7 @@ export class Hub extends DurableObject {
     // The closure resolves sessionControlService at call time (it is
     // constructed just below); intake records only the returned real id.
     this.intakeService = new IntakeService(this.sql, fn => this.ctx.storage.transactionSync(fn), {
+      queue: tasks => ({ items: this.intakeWatchdog.queue(tasks), observed_at: Date.now(), watchdog: this.intakeWatchdog.status() }),
       forgotten: tasks => {
         const items = this.intakeWatchdog.project(tasks).filter(t => t.forgotten);
         return { items, forgotten_count: items.length, observed_at: Date.now(), watchdog: this.intakeWatchdog.status(), triage: this.intakeTriage.status(), verifier: this.intakeVerifier.status() };
@@ -272,11 +273,38 @@ export class Hub extends DurableObject {
     this.livenessService = new LivenessService(this.sql, thresholdsFrom(env));
     this.livenessService.init();
     this.intakeWatchdog = new IntakeWatchdog(this.sql, this.intakeService, fn => this.ctx.storage.transactionSync(fn), {
+      policy: () => queuePolicyFrom(env as unknown as Record<string, unknown>),
       start: async input => {
         const r = await this.sessionControlService.handle(new Request('https://hub.internal/api/sessions',
           { method: 'POST', body: JSON.stringify(input) }),
           { caller: { isAdmin: true, actor: 'hub:service:intake-watchdog', kind: 'human' }, scopes: ['admin'] });
         return { status: r.status, body: await r.json() as any };
+      },
+      observe: async id => {
+        const row: any = this.sql.exec('SELECT actor FROM session_control_sessions WHERE id=?', id).toArray()[0];
+        if (!row) return { status: 404, body: { error: 'not_found' } };
+        const r = await this.sessionControlService.handle(new Request(`https://hub.internal/api/sessions/${id}`),
+          { caller: { isAdmin: true, actor: row.actor, kind: 'human' }, scopes: ['admin'] });
+        return { status: r.status, body: await r.json() as any };
+      },
+      command: async (id, action, key) => {
+        const row: any = this.sql.exec('SELECT actor FROM session_control_sessions WHERE id=?', id).toArray()[0];
+        if (!row) return { status: 404, body: { error: 'not_found' } };
+        if (row.actor !== 'hub:service:intake-watchdog')
+          return { status: 403, body: { error: 'watchdog_session_not_owned' } };
+        // Canonical retry preserves the stored intent's actor/key; stop retains
+        // native-incarnation fences and requires the normal host exit receipt.
+        const r = await this.sessionControlService.handle(new Request(`https://hub.internal/api/sessions/${id}/${action}`,
+          { method: 'POST', body: JSON.stringify(action === 'retry' ? {} : { key }) }),
+          { caller: { isAdmin: true, actor: row.actor, kind: 'human' }, scopes: ['admin'] });
+        return { status: r.status, body: await r.json() as any };
+      },
+      note: async (task, text, key) => {
+        if ((task.history || []).some((e: any) => e.intake_key === key)) return true;
+        const r = await this.intakeService.handle(new Request(`https://hub.internal/api/intake/tasks/${task.id}/events`,
+          { method: 'POST', body: JSON.stringify({ key, expected_version: task.version, event: { kind: 'note', text } }) }),
+          async () => ({ caller: { isAdmin: true, actor: 'hub:service:intake-watchdog', kind: 'human' }, scopes: ['admin'] }));
+        return r.ok;
       },
       notify: async (kind, subject, detail) => {
         if (kind === 'intake_digest' && this.sql.exec('SELECT id FROM liveness_alerts WHERE subject_kind=? AND subject=? LIMIT 1', kind, subject).toArray().length) return false;
@@ -2239,6 +2267,7 @@ export class Hub extends DurableObject {
   }
 
   async alarm() {
+    try { await this.intakeWatchdog.tick('alarm'); } catch { console.warn('intake_queue_tick_failed'); }
     const now = (this.jobsService as any).now ? (this.jobsService as any).now() : new Date();
     this.ctx.storage.transactionSync(() => {
       expireSessionMessages(this.sql, now.getTime());

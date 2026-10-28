@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
-import { IntakeWatchdog, WATCHDOG_INTERVAL } from '../src/intake-watchdog';
+import { IntakeWatchdog, WATCHDOG_INTERVAL, QUEUE_RETRY_BASE_MS } from '../src/intake-watchdog';
 const inDO: any = runInDurableObject;
 const stub = () => (env as any).HUB.get((env as any).HUB.idFromName('hub'));
 const NOW = Date.parse('2026-10-26T12:00:00Z');
@@ -10,7 +10,7 @@ function task(id = 'synthetic-task', age = 3 * 3600000): any {
 }
 async function fixture(fn: (h: any) => any) {
   return inDO(stub(), async (h: any) => {
-    for (const table of ['intake_restart_queue', 'intake_watchdog_meta', 'session_control_sessions', 'fleet_sessions', 'claims', 'fleet_catalog_seen']) h.sql.exec('DELETE FROM ' + table);
+    for (const table of ['intake_queue_admissions', 'intake_queue_movement', 'intake_restart_queue', 'intake_watchdog_meta', 'session_control_sessions', 'fleet_sessions', 'claims', 'fleet_catalog_seen']) h.sql.exec('DELETE FROM ' + table);
     return fn(h);
   });
 }
@@ -114,9 +114,9 @@ describe('forgotten intake watchdog', () => {
     const w=new IntakeWatchdog(h.sql,{statusAuthorizedTasks:()=>[t]} as any,(f:any)=>f(),{start:async input=>{
       inputs.push(input);if(inputs.length===1)throw new Error('lost response');
       return {status:202,body:{id:'new-session',state:'queued'}};
-    }},()=>now);w.init();await w.tick();now+=WATCHDOG_INTERVAL;await w.tick();
-    expect(inputs).toHaveLength(2);expect(inputs[1]).toEqual(inputs[0]);
-    expect(inputs[0]).toMatchObject({engine:'codex',mode:'interactive',with_goal:true,intake_task_id:t.id,workspace:'fixture'});
+    }},()=>now);w.init();await w.tick();now+=QUEUE_RETRY_BASE_MS;await w.tick();
+    expect(inputs).toHaveLength(2);expect(inputs[1]).toEqual(inputs[0]);expect(inputs[0]).not.toHaveProperty('engine');
+    expect(inputs[0]).toMatchObject({mode:'interactive',with_goal:true,intake_task_id:t.id,workspace:'fixture'});
     expect(w.project([t])[0].restart).toMatchObject({state:'submitted',session_id:'new-session'});
   }));
   it('canonical held session suppresses later duplicate restarts and preserves the queue reason', async () => fixture(async h => {

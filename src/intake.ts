@@ -50,7 +50,7 @@ export function intakeCompletionHoldReason(task: Obj): string | null {
  * creates the Hub session through the canonical session-control service with
  * the caller's own auth, so placement is never duplicated and session
  * identities are never invented here. Absent outside the Hub composition. */
-export type IntakeHooks = { forgotten?: (tasks: Obj[]) => Obj; startSession?: (input: Obj, auth: Auth) => Promise<{ status: number; body: any }> };
+export type IntakeHooks = { queue?: (tasks: Obj[]) => Obj; forgotten?: (tasks: Obj[]) => Obj; startSession?: (input: Obj, auth: Auth) => Promise<{ status: number; body: any }> };
 /** Soft intake capacity (t1038u): no hard 507 refuse on task row count for create.
  * `tasks` remains only as a schema safety-net ceiling (very high). Open (non-terminal)
  * count > OPEN_INTAKE_WARN_THRESHOLD emits a warning requiring DONE evidence before close. */
@@ -229,6 +229,7 @@ export class IntakeService {
         INSERT INTO intake_task_projection(id,data,links) SELECT NEW.id, ${project('NEW.')}
         ON CONFLICT(id) DO UPDATE SET data=excluded.data,links=excluded.links; END`);
       this.sql.exec('CREATE TRIGGER IF NOT EXISTS intake_projection_delete AFTER DELETE ON intake_tasks BEGIN DELETE FROM intake_task_projection WHERE id=OLD.id; END');
+      this.sql.exec("CREATE INDEX IF NOT EXISTS intake_watchdog_open ON intake_task_projection(id) WHERE json_extract(data,'$.status') IN ('open','in_progress','blocked','pending_approval') AND json_extract(data,'$.archived_at') IS NULL");
       // Independent, append-only lifecycle ledger. No FK: survives loss of a task row.
       this.sql.exec(`CREATE TABLE IF NOT EXISTS intake_audit (
         seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, project TEXT NOT NULL,
@@ -676,6 +677,20 @@ export class IntakeService {
         actor: actorParam,
         ...(familyParam ? { family_id: familyParam.trim() } : {}),
       };
+    }
+    if (path === '/queue') {
+      if (!this.hooks.queue) fail('watchdog_unavailable', 503);
+      const project = url.searchParams.get('project');
+      const cursor = Number(url.searchParams.get('cursor') || 0);
+      const limit = Number(url.searchParams.get('limit') || 64);
+      if (!Number.isSafeInteger(cursor) || cursor < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 64) fail('invalid_page',400);
+      // A row ordinal reveals no unauthorized task id; each page remains a
+      // bounded primary-key range even when every candidate is unauthorized.
+      const candidates: any[] = this.sql.exec('SELECT rowid AS ordinal,data FROM intake_tasks WHERE rowid>? ORDER BY rowid LIMIT ?',cursor,limit+1).toArray();
+      const page = candidates.slice(0,limit);
+      const tasks = page.map(r => JSON.parse(r.data)).filter(t => this.allowed(p,t) && (!project || t.project === project));
+      return { ...this.hooks.queue(tasks), next_cursor: candidates.length > limit ? String(page[page.length-1].ordinal) : null,
+        queue_position_scope: 'authorized_page' };
     }
     if (path === '/forgotten') {
       if (!this.hooks.forgotten) fail('watchdog_unavailable', 503);
@@ -1383,6 +1398,13 @@ export class IntakeService {
   }
   /** Readonly status-projection helpers for M14a. No write, grant or permission semantics change. */
   statusPrincipal(auth: Auth): Obj { return this.principal(auth); }  statusAuthorizedTasks(p: Obj): Obj[] { return this.rows('tasks').filter(t => this.allowed(p, t)); }
+  /** Internal watchdog range, including paused work for observation/digests.
+   * Full histories are fetched only for this bounded indexed range. */
+  watchdogTasks(after: string, limit: number): Obj[] {
+    return this.sql.exec(`SELECT t.data FROM intake_task_projection p JOIN intake_tasks t ON t.id=p.id
+      WHERE p.id>? AND json_extract(p.data,'$.status') IN ('open','in_progress','blocked','pending_approval')
+      AND json_extract(p.data,'$.archived_at') IS NULL ORDER BY p.id LIMIT ?`,after,Math.min(64,limit)).toArray().map((r:any)=>JSON.parse(r.data));
+  }
   statusTaskById(p: Obj, id: string): Obj | undefined {
     const task = this.get('tasks', id);
     return task && this.allowed(p, task) ? task : undefined;
