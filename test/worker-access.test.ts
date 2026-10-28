@@ -66,7 +66,7 @@ describe('scoped durable worker access',()=>{
   expect((await api('/api/fleet/launches',{})).status).toBe(403);
   expect((await api('/api/bus/claims')).status).toBe(403);
  }, mode));
- it.each(['headless','interactive'])('%s issuance refuses another host, a missing link, and a running launch',(mode)=>setup(async({stub,id,call}:any)=>{
+ it.each(['headless','interactive'])('%s issuance refuses another host, a missing link, and an unbound running launch',(mode)=>setup(async({stub,id,call}:any)=>{
   const issue=()=>call('/api/fleet/launches/'+id+'/worker-credential',{});
   await runInDurableObject<Hub, any>(stub,(h:any)=>h.sql.exec("UPDATE fleet_launches SET machine_id='other-host' WHERE id=?",id));
   expect((await issue()).status).toBe(409);
@@ -78,6 +78,28 @@ describe('scoped durable worker access',()=>{
   await runInDurableObject<Hub, any>(stub,(h:any)=>h.sql.exec("UPDATE fleet_launches SET state='running' WHERE id=?",id));
   expect((await issue()).status).toBe(409);
  }, mode));
+ it.each(['headless','interactive'])('%s host repairs a running exact native profile with the same intake scope', mode=>setup(async({stub,id,session,task,other,worker,call}:any)=>{
+  const native=uuid(), tag=(mode==='headless'?'task-hub-':'hub-')+id;
+  await runInDurableObject<Hub,any>(stub,(h:any)=>{
+   h.sql.exec("UPDATE fleet_launches SET state='running',native_id=? WHERE id=?",native,id);
+   h.sql.exec("UPDATE session_control_sessions SET state='running',binding_json=? WHERE id=?",JSON.stringify({native_id:native,tag,workspace:'/repo'}),session);
+  });
+  const issue=()=>call('/api/fleet/launches/'+id+'/worker-credential',{});
+  expect((await call('/api/fleet/launches/'+id+'/worker-credential',{},worker.access_token)).status).toBe(403);
+  const repaired=await issue(); expect(repaired.status,await repaired.clone().text()).toBe(200);
+  const profile:any=await repaired.json(); expect(profile.worker_launch_id).toBe(id);
+  expect((await call('/api/intake/tasks/'+task,undefined,profile.access_token)).status).toBe(200);
+  expect((await call('/api/intake/tasks/'+other,undefined,profile.access_token)).status).toBe(403);
+  for(const binding of [null, {native_id:uuid(),tag}, {native_id:native,tag:'hub-'+uuid()}]) {
+   await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec('UPDATE session_control_sessions SET binding_json=? WHERE id=?',JSON.stringify(binding),session));
+   expect((await issue()).status).toBe(409);
+  }
+  await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec('UPDATE session_control_sessions SET binding_json=? WHERE id=?',JSON.stringify({native_id:native,tag,workspace:'/repo'}),session));
+  for(const state of ['stopped','failed','finished']) {
+   await runInDurableObject<Hub,any>(stub,(h:any)=>h.sql.exec('UPDATE fleet_launches SET state=? WHERE id=?',state,id));
+   expect((await issue()).status).toBe(409);
+  }
+ },mode));
  it('retains binding through normal refresh and fails closed after scope expiry',()=>setup(async({stub,task,other,worker,call}:any)=>{
   const refreshed=await stub.fetch('https://hub.test/api/token/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({grant_type:'refresh_token',refresh_token:worker.refresh_token})});
   expect(refreshed.status,await refreshed.clone().text()).toBe(200);

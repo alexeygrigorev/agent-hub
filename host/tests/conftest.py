@@ -1,5 +1,6 @@
 import os
 import tempfile
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -21,17 +22,9 @@ def _native_launch_identity_vars():
     return names
 
 
-def _real_worker_profile_dir():
-    """The checkout's real per-launch profile dir (never a test target)."""
-    root = Path(__file__).resolve().parents[2]
-    if not (root / ".git").exists():
-        return None
-    return root / ".local" / "hub-worker-auth"
-
-
 def _snapshot_profile_dir(path):
     if path is None or not path.is_dir():
-        return None
+        return {}
     snap = {}
     for child in path.iterdir():
         try:
@@ -70,25 +63,37 @@ def isolated_user_config(tmp_path, monkeypatch):
         os.path.realpath(os.environ.get("TMPDIR") or tempfile.gettempdir()))
 
 
+@pytest.fixture(autouse=True)
+def guard_worker_profile_writes(monkeypatch):
+    """Reject profile writes outside this run's temp tree before any I/O."""
+    from agent_hub_host import private_fs
+    original = private_fs.atomic_write
+    temporary = Path(tempfile.gettempdir()).resolve()
+
+    def guarded(path, raw, limit):
+        target = Path(path)
+        if "hub-worker-auth" in target.parts:
+            assert target.resolve().is_relative_to(temporary), (
+                "test attempted a real hub-worker-auth write: " + str(target))
+        return original(path, raw, limit)
+
+    monkeypatch.setattr(private_fs, "atomic_write", guarded)
+
+
 @pytest.fixture(autouse=True, scope="session")
 def guard_real_worker_profiles():
-    """Fail the suite if any test touches the real hub-worker-auth dir.
-
-    Compares mtime/size snapshots only; profile contents (tokens) are
-    never read. Any addition, removal or rewrite — including the
-    .refresh.lock sidecars — fails with the affected file names.
-    """
-    path = _real_worker_profile_dir()
-    before = _snapshot_profile_dir(path)
+    """Detect writes in this checkout AND the canonical shared checkout."""
+    root = Path(__file__).resolve().parents[2]
+    common = subprocess.check_output(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        cwd=root, text=True).strip()
+    directories = {root / ".local/hub-worker-auth",
+                   Path(common).parent / ".local/hub-worker-auth"}
+    before = {path: _snapshot_profile_dir(path) for path in directories}
     yield
-    if before is None:
-        return
-    after = _snapshot_profile_dir(path)
-    if after is None:
-        pytest.fail("real hub-worker-auth directory disappeared during the test session")
-    changed = sorted(
-        name for name in set(before) | set(after)
-        if before.get(name) != after.get(name))
+    after = {path: _snapshot_profile_dir(path) for path in directories}
+    changed = [str(path / name) for path in directories
+               for name in set(before[path]) | set(after[path])
+               if before[path].get(name) != after[path].get(name)]
     assert not changed, (
-        "test session touched the real hub-worker-auth profiles (never a test target): "
-        + ", ".join(changed))
+        "test session touched real hub-worker-auth profiles: " + ", ".join(changed))

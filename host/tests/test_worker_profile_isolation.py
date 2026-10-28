@@ -99,5 +99,37 @@ class WorkerProfileIsolationTests(unittest.TestCase):
                          'provision touched the real hub-worker-auth dir')
 
 
+def test_suite_rejects_profile_write_outside_its_temp_tree(tmp_path):
+    """Run a deliberately unsafe child test against a disposable sentinel."""
+    import subprocess
+    root = Path(__file__).resolve().parents[2]
+    allowed = tmp_path / 'allowed'
+    allowed.mkdir()
+    profile = tmp_path / 'simulated-live/.local/hub-worker-auth' / (OFFER + '.json')
+    profile.parent.mkdir(parents=True, mode=0o700)
+    profile.write_text('preserve sentinel')
+    profile.chmod(0o600)
+    case = tmp_path / 'test_attempt.py'
+    case.write_text(
+        'from pathlib import Path\n'
+        'import os\n'
+        'from agent_hub_host import private_fs\n'
+        'def test_attempt():\n'
+        '    assert not any(k.startswith("APLEXER_") or k == "HUB_WORKER_CONFIG_FILE" for k in os.environ)\n'
+        '    private_fs.atomic_write(Path(' + repr(str(profile)) + "), b'{}', 32768)\n")
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(('APLEXER_', 'HUB_', 'AGENT_HUB_'))}
+    env.update(TMPDIR=str(allowed), HOME=str(allowed),
+               APLEXER_TAG='hub-' + OFFER, APLEXER_WORKSPACE=str(tmp_path / 'simulated-live'),
+               APLEXER_FUTURE_SELECTOR='synthetic-test-only', HUB_WORKER_CONFIG_FILE=str(profile),
+               PYTHONPATH=os.pathsep.join([str(root), str(root / 'host')]))
+    result = subprocess.run(
+        [sys.executable, '-m', 'pytest', '-q', '-p', 'host.tests.conftest', str(case)],
+        cwd=root, env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert 'real hub-worker-auth write' in result.stdout
+    assert profile.read_text() == 'preserve sentinel'
+
+
 if __name__ == '__main__':
     unittest.main()

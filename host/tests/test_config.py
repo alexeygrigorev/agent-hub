@@ -21,7 +21,9 @@ class TestConfig(unittest.TestCase):
         # aplexer session shell writes fixtures into that session's real
         # hub-worker-auth file and destroys its credential (same failure
         # as test_machine_binding before its pin).
-        patch("agent_hub_host.worker_auth.config_path", return_value=None).start()
+        self.worker_path = patch("agent_hub_host.worker_auth.config_path", return_value=None)
+        self.worker_path.start()
+        self.addCleanup(self.worker_path.stop)
 
     def tearDown(self):
         self.patcher.stop()
