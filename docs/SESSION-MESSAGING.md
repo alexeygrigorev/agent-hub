@@ -489,17 +489,28 @@ How it maps onto the design:
   mints through `POST /api/sessions/:id/messaging-credential` (host token).
 - Developer identity: `hub msg agent-credential developer --output
   ~/.config/agent-hub/developer.json` (operator), then `hub msg --profile
-  developer inbox|send|reply`. Through hub-mcp, the human login sends with
-  `from_actor: agent:developer` and reads `bus_inbox actor=agent:developer`
-  (existing admin authority); the `as`/delegate check of §9 is not built.
-- CLI surface is `hub msg …` (new) instead of changing `hub send`, so existing
-  `hub send --from` users keep their behavior.
+  developer inbox|send|reply`. Through hub-mcp, `msg_send … as
+  "agent:developer"` acts as the named agent after the operator granted the
+  MCP client (`hub msg agent-delegate developer --client <id>`); every
+  delegated send records an `on_behalf_of` audit event. `human:<sub>`
+  recipients validate against the users table, `human:me` resolves to the
+  caller's own subject, and `hub inbox`/`hub msg inbox` long-poll up to 60 s
+  in one bounded DO request with `--unread`, `--thread`, `--mark-read`.
+- M5 (intake 3bdf9715) client surface: the top-level `hub send|inbox|show|
+  reply|ack|accept|complete` commands accept the new addresses and
+  `--tui/--inbox`, `--ref`, `--deliver-by` (identities resolve exactly like
+  `hub msg`; exit codes 0/2/3/4; send/reply retry transport failures with the
+  same idempotency key). `hub msg readdress` (operator) points an undelivered
+  session message at a replacement session. MCP tools `msg_send`, `msg_inbox`,
+  `msg_show`, `msg_reply`, `msg_ack`, `msg_status` (all with optional `as`)
+  join the unchanged legacy `bus_*` tools. The web UI gains an Inbox page
+  (unread count, threads, reply box, phone width) for the human inbox
+  (cookie-session operator acting as `human:<sub>` for read semantics) and
+  delegated named-agent inboxes; usage docs live in the hub-sessions skill.
 
-Not built yet (follow-ups): MCP `as` delegation with `on_behalf_of` audit;
-`human:<sub>` recipients and the web Inbox page; `hub msg readdress`; named
-agent forwarding (`agent:orchestrator-main` → its current session) — today
-those coordinators are reachable once they are Hub sessions (operator
-adoption), as `<tag>@<machine>`; capture-marker resolution of `uncertain`
-deliveries (they stay `uncertain` with the inbox copy authoritative); the
-`tui_unverified_platform` fallback (Windows TUI delivery is proven on Tabo
-instead).
+Not built yet (follow-ups): named agent forwarding (`agent:orchestrator-main`
+→ its current session) — today those coordinators are reachable once they are
+Hub sessions (operator adoption), as `<tag>@<machine>`; capture-marker
+resolution of `uncertain` deliveries (they stay `uncertain` with the inbox
+copy authoritative); the `tui_unverified_platform` fallback (Windows TUI
+delivery is proven on Tabo instead).

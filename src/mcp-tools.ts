@@ -37,6 +37,12 @@ for (const action of ['send', 'reply']) tool(`bus_${action}`, 'POST', `/api/bus/
 tool('bus_inbox', 'GET', '/api/bus/inbox', 'Inbox query: actor, limit, cursor.', ['inbox', 'msg inbox']);
 tool('bus_show', 'GET', '/api/bus/messages/{id}', 'Read a message and its delivery state.', ['show', 'msg show', 'msg status']);
 for (const stage of ['ack', 'accept', 'complete']) tool(`bus_${stage}`, 'POST', `/api/bus/messages/{id}/${stage}`, `Explicitly ${stage} a message; optional payload lease_epoch.`, [stage]);
+tool('msg_send', 'POST', '/api/bus/send', 'DESTRUCTIVE: send a durable message: payload to_actor (session:<id>, tag@machine, agent:<name>, human:<sub>), body, idempotency_key (retry with the SAME key); optional delivery tui|inbox, deliver_by_s, thread_id, ref, as (delegate-checked named agent).', ['msg send', 'send']);
+tool('msg_reply', 'POST', '/api/bus/reply', 'DESTRUCTIVE: reply in a thread: payload reply_to, body, idempotency_key; optional from_actor/to_actor, delivery, ref, as (delegate-checked).', ['msg reply', 'reply']);
+tool('msg_inbox', 'GET', '/api/bus/inbox', 'Inbox long poll: query actor (or as), unread=1, thread, wait 0..60 s in one bounded request, limit, cursor. Reading marks delivered.', ['msg inbox', 'inbox']);
+tool('msg_show', 'GET', '/api/bus/messages/{id}', 'Read one message; the recipient view marks it read. Query as optional (delegate-checked).', ['msg show', 'show']);
+tool('msg_ack', 'POST', '/api/bus/messages/{id}/ack', 'DESTRUCTIVE: acknowledge as the recipient; payload lease_epoch, as (delegate-checked) optional.', ['msg ack', 'ack']);
+tool('msg_status', 'GET', '/api/bus/messages/{id}/status', 'Delivery state, stage times and metadata-only audit events (no body). Query as optional.', ['msg status']);
 tool('claims_list', 'GET', '/api/bus/claims', 'Claims query: project, holder, all.', ['claims']);
 tool('bus_activity', 'GET', '/api/bus/activity', 'Work-activity visibility: active claims plus recent bus messages for a workspace, project, holder or actor. Query: workspace, project, holder, actor, limit, all. Read-only; shows whether someone is already on this before starting overlapping work.', ['activity']);
 tool('claims_create', 'POST', '/api/bus/claims', 'Claim a scope using project, scope, holder, ttl_ms, lease_epoch.', ['claim']);
@@ -90,6 +96,8 @@ export const MCP_ROUTES = routes;
 export const CLI_EXCLUSIONS: Record<string, string> = {
   'host-release': 'Operator release pin for a checkout-installed host; deliberate CLI step, not an agent tool.',
   'msg agent-credential': 'Writes a new private local credential file; MCP cannot write host files.',
+  'msg agent-delegate': 'Operator grant of named-agent delegation to an MCP client; deliberate CLI step.',
+  'msg readdress': 'Operator re-address of an undelivered session message; deliberate CLI step.',
   'msg whoami': 'Reports the local CLI identity source; MCP callers are identified by their own login.',
   'repos seed': 'Local-only parser reads the private project map and submits bounded seed batches.',
   'repos refresh': 'Local-only scanner invokes git/gh on host directories; MCP cannot scan the host filesystem.',

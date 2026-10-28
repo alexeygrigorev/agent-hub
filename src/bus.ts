@@ -34,6 +34,8 @@ export interface SendOpts {
   /** Session recipients only: 'tui' (inject into the terminal) or 'inbox'. */
   delivery?: string;
   deliverByMs?: number;
+  /** Validated `ref` JSON string (src/session-messaging validateRef). */
+  refJson?: string | null;
 }
 
 /** Session-messaging seams (src/session-messaging.ts), run inside the send transaction. */
@@ -476,7 +478,7 @@ export class BusService {
       }
       opts = { ...opts, senderActor: this.canonicalActor(opts.senderActor), toActor: this.canonicalActor(opts.toActor) };
       let existing = this.sql.exec(
-        'SELECT id, body, to_actor, kind, thread_id, reply_to, lease_epoch, expires_at FROM messages WHERE from_actor = ? AND idempotency_key = ?',
+        'SELECT id, body, to_actor, kind, thread_id, reply_to, lease_epoch, expires_at, ref_json FROM messages WHERE from_actor = ? AND idempotency_key = ?',
         opts.senderActor,
         opts.idempotencyKey
       ).toArray()[0] as any;
@@ -497,7 +499,8 @@ export class BusService {
           existing.kind !== opts.kind ||
           existing.reply_to !== expectedReplyTo ||
           existing.lease_epoch !== expectedLeaseEpoch ||
-          (opts.threadId !== undefined && existing.thread_id !== opts.threadId)
+          (opts.threadId !== undefined && existing.thread_id !== opts.threadId) ||
+          (existing.ref_json ?? null) !== (opts.refJson ?? null)
         ) {
           throw new Error("conflict");
         }
@@ -530,9 +533,9 @@ export class BusService {
       const expiresAt = now + 30 * 24 * 3600 * 1000;
 
       this.sql.exec(`
-        INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, reply_to, body, idempotency_key, lease_epoch, created_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `, id, opts.senderActor, opts.toActor, opts.kind, threadId, opts.replyTo || null, opts.body, opts.idempotencyKey, opts.leaseEpoch ?? null, now, expiresAt);
+        INSERT INTO messages (id, from_actor, to_actor, kind, thread_id, reply_to, body, idempotency_key, lease_epoch, created_at, expires_at, ref_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, id, opts.senderActor, opts.toActor, opts.kind, threadId, opts.replyTo || null, opts.body, opts.idempotencyKey, opts.leaseEpoch ?? null, now, expiresAt, opts.refJson ?? null);
       if (this.hooks) this.hooks.afterInsert({ id, from_actor: opts.senderActor, to_actor: opts.toActor, kind: opts.kind, thread_id: threadId, reply_to: opts.replyTo || null, body: opts.body }, opts, now);
 
       return { id, threadId, thread_id: threadId };
@@ -543,8 +546,9 @@ export class BusService {
    * Recipient inbox. Matches every alias of the addressed agent (tag, project:tag, unique role),
    * hides expired messages, and marks returned messages delivered when the caller is the recipient
    * (or its host bridge). An admin reading someone else's inbox does not mark anything.
+   * Filters (§11): unread hides read messages; thread narrows to one thread id.
    */
-  inbox(caller: CallerContext, actor: string, limit: number = 50, cursor?: string): any[] {
+  inbox(caller: CallerContext, actor: string, limit: number = 50, cursor?: string, filters?: { unread?: boolean; thread?: string }): any[] {
     const now = Date.now();
     if (isRootRoleAddress(actor)) {
       throw new Error(ROOT_AUTHORITY_ERROR);
@@ -561,6 +565,13 @@ export class BusService {
     return this.runInTxn(() => {
       let query = `SELECT * FROM messages WHERE to_actor IN (${aliases.map(() => '?').join(',')}) AND expires_at > ?${caller.isAdmin ? '' : ' AND registry_unbound_to = 0'}`;
       const params: any[] = [...aliases, now];
+      if (filters?.unread) {
+        query += ' AND read_at IS NULL';
+      }
+      if (filters?.thread) {
+        query += ' AND thread_id = ?';
+        params.push(filters.thread);
+      }
       if (cursor) {
         query += ' AND id > ?';
         params.push(cursor);
@@ -577,6 +588,25 @@ export class BusService {
         }
       }
       return rows;
+    });
+  }
+
+  /** Recipient batch read (`hub inbox --mark-read`, §11): only the recipient
+   * principal marks read; sender and admin views never do. Unknown or
+   * unauthorized ids are skipped; the count of newly read rows is returned. */
+  markRead(caller: CallerContext, ids: string[]): { marked: number } {
+    const now = Date.now();
+    return this.runInTxn(() => {
+      let marked = 0;
+      for (const id of ids.slice(0, 100)) {
+        const msg = this.sql.exec('SELECT to_actor, registry_unbound_to, expires_at, read_at FROM messages WHERE id = ?', id).toArray()[0] as any;
+        if (!msg || msg.expires_at <= now) continue;
+        if (!this.isAuthorizedForStoredActor({ ...caller, isAdmin: false }, msg.to_actor, now, !!msg.registry_unbound_to)) continue;
+        if (msg.read_at) continue;
+        this.sql.exec('UPDATE messages SET delivered_at = COALESCE(delivered_at, ?), read_at = ? WHERE id = ? AND read_at IS NULL', now, now, id);
+        marked++;
+      }
+      return { marked };
     });
   }
 

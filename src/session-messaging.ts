@@ -24,12 +24,37 @@ export const DELIVERIES = new Set(['tui', 'inbox']);
 export const DEFAULT_DELIVER_BY_MS = 24 * 3600 * 1000;
 export const NOT_READY_BACKOFF_MS = [5000, 15000, 30000, 60000];
 const TUI_RENDER_BYTES = 2048;
+const REF_JSON_BYTES = 2048;
+
+/** Large payloads travel by reference, never in Hub storage (§10): bounded
+ * `{kind, value, sha256?, bytes?, machine?}` JSON, ≤ 2 KiB. `path` refs only
+ * point at a named machine and are shown, never fetched. Returns the
+ * normalized JSON string, or null when no ref was given. */
+export function validateRef(ref: unknown): string | null {
+  if (ref === undefined || ref === null) return null;
+  if (typeof ref !== 'object' || Array.isArray(ref)) throw new Error('invalid_ref');
+  const r = ref as Record<string, unknown>;
+  const keys = Object.keys(r);
+  if (keys.some(k => !['kind', 'value', 'sha256', 'bytes', 'machine'].includes(k))) throw new Error('invalid_ref');
+  if (typeof r.kind !== 'string' || !['git', 'intake_artifact', 'url', 'path'].includes(r.kind)) throw new Error('invalid_ref');
+  if (typeof r.value !== 'string' || !r.value || r.value.length > 512) throw new Error('invalid_ref');
+  if (r.sha256 !== undefined && (typeof r.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(r.sha256))) throw new Error('invalid_ref');
+  if (r.bytes !== undefined && (typeof r.bytes !== 'number' || !Number.isInteger(r.bytes) || r.bytes < 0)) throw new Error('invalid_ref');
+  if (r.machine !== undefined && (typeof r.machine !== 'string' || !r.machine || r.machine.length > 128)) throw new Error('invalid_ref');
+  if (r.kind === 'path' && typeof r.machine !== 'string') throw new Error('invalid_ref');
+  const json = JSON.stringify(r);
+  if (new TextEncoder().encode(json).length > REF_JSON_BYTES) throw new Error('invalid_ref');
+  return json;
+}
 
 export function initSessionMessaging(sql: SqlStorage): void {
   const cols = new Set(sql.exec('PRAGMA table_info(messages)').toArray().map((c: any) => String(c.name)));
-  for (const [col, type] of [['delivery', 'TEXT'], ['state', 'TEXT'], ['state_reason', 'TEXT'], ['deliver_by', 'INTEGER'], ['to_session_id', 'TEXT'], ['recipient_seq', 'INTEGER']] as const) {
+  for (const [col, type] of [['delivery', 'TEXT'], ['state', 'TEXT'], ['state_reason', 'TEXT'], ['deliver_by', 'INTEGER'], ['to_session_id', 'TEXT'], ['recipient_seq', 'INTEGER'], ['ref_json', 'TEXT']] as const) {
     if (!cols.has(col)) sql.exec(`ALTER TABLE messages ADD COLUMN ${col} ${type}`);
   }
+  // Delegated named-agent access for MCP callers (§9): the hub-mcp connector
+  // keeps its human login; one row per (named agent, MCP client) grant.
+  sql.exec('CREATE TABLE IF NOT EXISTS named_agent_delegates (agent TEXT NOT NULL, client TEXT NOT NULL, created_by TEXT, created_at TEXT, PRIMARY KEY(agent, client))');
   sql.exec('CREATE TABLE IF NOT EXISTS recipient_cursors (actor TEXT PRIMARY KEY, last_seq INTEGER NOT NULL)');
   // Metadata only, never bodies; retained longer than bodies (180 days).
   sql.exec(`CREATE TABLE IF NOT EXISTS message_events (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL,
@@ -227,7 +252,7 @@ export function renderTui(msg: { id: string; from_actor: string; thread_id: stri
 
 /** Assign the per-recipient sequence, the initial state, and for session
  * recipients the delivery command. Runs inside the bus send transaction. */
-export function afterMessageInsert(sql: SqlStorage, msg: any, opts: { delivery?: string; deliverByMs?: number; now: number }): void {
+export function afterMessageInsert(sql: SqlStorage, msg: any, opts: { delivery?: string; deliverByMs?: number; refJson?: string | null; now: number }): void {
   const prior: any = sql.exec('SELECT last_seq FROM recipient_cursors WHERE actor = ?', msg.to_actor).toArray()[0];
   const seq = (prior ? Number(prior.last_seq) : 0) + 1;
   sql.exec('INSERT INTO recipient_cursors (actor, last_seq) VALUES (?, ?) ON CONFLICT(actor) DO UPDATE SET last_seq = excluded.last_seq', msg.to_actor, seq);
@@ -235,8 +260,8 @@ export function afterMessageInsert(sql: SqlStorage, msg: any, opts: { delivery?:
   const named = msg.from_actor.startsWith(NAMED_AGENT_PROJECT + ':') || msg.from_actor.startsWith('human:') || msg.from_actor === 'admin';
   const delivery = sessionId ? (opts.delivery ?? (named ? 'tui' : 'inbox')) : null;
   const deliverBy = sessionId ? opts.now + Math.min(opts.deliverByMs ?? DEFAULT_DELIVER_BY_MS, 7 * 24 * 3600 * 1000) : null;
-  sql.exec('UPDATE messages SET recipient_seq = ?, state = ?, delivery = ?, deliver_by = ?, to_session_id = ? WHERE id = ?',
-    seq, 'accepted', delivery, deliverBy, sessionId, msg.id);
+  sql.exec('UPDATE messages SET recipient_seq = ?, state = ?, delivery = ?, deliver_by = ?, to_session_id = ?, ref_json = COALESCE(?, ref_json) WHERE id = ?',
+    seq, 'accepted', delivery, deliverBy, sessionId, opts.refJson ?? null, msg.id);
   messageEvent(sql, msg.id, 'accepted', msg.from_actor, null, opts.now, { to: msg.to_actor, seq, ...(delivery ? { delivery } : {}) });
   if (msg.reply_to) {
     const parent: any = sql.exec('SELECT id, to_actor, read_at FROM messages WHERE id = ?', msg.reply_to).toArray()[0];
@@ -246,16 +271,23 @@ export function afterMessageInsert(sql: SqlStorage, msg: any, opts: { delivery?:
       messageEvent(sql, parent.id, 'replied', msg.from_actor, null, opts.now, { reply_id: msg.id });
     }
   }
-  if (!sessionId) return;
+  if (sessionId) queueSessionDelivery(sql, msg.id, msg.from_actor, sessionId, delivery!, opts.now);
+}
+
+/** Enqueue the session-control command of kind `message` that carries a
+ * message to its session's host (§5); one live command per message. */
+export function queueSessionDelivery(sql: SqlStorage, messageId: string, fromActor: string, sessionId: string, delivery: string, now: number): void {
+  const msg: any = sql.exec('SELECT id, from_actor, thread_id, body, ref_json FROM messages WHERE id = ?', messageId).toArray()[0];
+  if (!msg) return;
   const session: any = sql.exec('SELECT id, binding_json FROM session_control_sessions WHERE id = ?', sessionId).toArray()[0];
   const binding = (() => { try { return JSON.parse(session?.binding_json || 'null'); } catch { return null; } })();
   const generation = binding?.generation ?? 0;
   const id = crypto.randomUUID();
-  const at = new Date(opts.now).toISOString();
+  const at = new Date(now).toISOString();
   sql.exec(
     'INSERT INTO session_control_commands (id, session_id, kind, actor, request_key, payload_json, state, generation, correlation, owner_token_id, owner_family, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    id, sessionId, 'message', msg.from_actor, 'msg-' + msg.id,
-    JSON.stringify({ message_id: msg.id, delivery, from_actor: msg.from_actor, body: renderTui(msg) }), 'recorded', generation, `cmd:${id}:gen:${generation}`,
+    id, sessionId, 'message', fromActor, 'msg-' + messageId,
+    JSON.stringify({ message_id: messageId, delivery, from_actor: msg.from_actor, body: renderTui(msg) }), 'recorded', generation, `cmd:${id}:gen:${generation}`,
     null, null, 0, at, at);
 }
 
@@ -355,4 +387,50 @@ export function revokeEndedSessionCredentials(sql: SqlStorage, now: number): voi
   for (const row of ended) {
     sql.exec("UPDATE credentials SET revoked_at = ? WHERE registry_actor = ? AND kind = 'agent' AND revoked_at IS NULL", at, `${SESSION_PROJECT}:${row.tag}`);
   }
+}
+
+/** Operator re-address (§3): point an undelivered session message at a
+ * replacement session and re-queue its delivery. Runs inside a storage
+ * transaction; throws RecipientError for an unknown target and Error for
+ * invalid input. */
+export function readdressMessage(sql: SqlStorage, messageId: string, toActor: string, now: number): { id: string; to_actor: string } {
+  if (!toActor.startsWith(SESSION_PROJECT + ':')) throw new Error('invalid_readdress_target');
+  const msg: any = sql.exec('SELECT id, from_actor, to_actor, to_session_id, delivery, state, read_at, deliver_by, expires_at FROM messages WHERE id = ?', messageId).toArray()[0];
+  if (!msg || Number(msg.expires_at) <= now) throw new Error('not_found');
+  if (msg.read_at) throw new Error('already_read');
+  if (!msg.to_session_id) throw new Error('not_addressed_to_session');
+  const target = resolveRecipient(sql, toActor, now);
+  const targetSession = sessionIdOf(target);
+  if (!targetSession) throw new Error('invalid_readdress_target');
+  // Any still-recorded delivery command for this message stops (old session,
+  // or a previous re-address target); the reason says why.
+  const at = new Date(now).toISOString();
+  sql.exec("UPDATE session_control_commands SET state = 'failed', ack_json = ?, updated_at = ? WHERE kind = 'message' AND state = 'recorded' AND request_key = ?",
+    JSON.stringify({ outcome: 'failed', reason: 'readdressed' }), at, 'msg-' + messageId);
+  const prior: any = sql.exec('SELECT last_seq FROM recipient_cursors WHERE actor = ?', target).toArray()[0];
+  const seq = (prior ? Number(prior.last_seq) : 0) + 1;
+  sql.exec('INSERT INTO recipient_cursors (actor, last_seq) VALUES (?, ?) ON CONFLICT(actor) DO UPDATE SET last_seq = excluded.last_seq', target, seq);
+  const deliverBy = Math.max(Number(msg.deliver_by) || 0, now + DEFAULT_DELIVER_BY_MS);
+  sql.exec('UPDATE messages SET to_actor = ?, to_session_id = ?, recipient_seq = ?, state = ?, state_reason = NULL, deliver_by = ? WHERE id = ?',
+    target, targetSession, seq, 'accepted', deliverBy, messageId);
+  messageEvent(sql, messageId, 'readdressed', null, null, now, { from: msg.to_actor, to: target, seq });
+  queueSessionDelivery(sql, messageId, msg.from_actor, targetSession, msg.delivery || 'inbox', now);
+  return { id: messageId, to_actor: target };
+}
+
+const DELEGATE_CLIENT = /^[\x21-\x7e]{1,128}$/;
+
+/** Delegate grants for one named agent (§9), oldest first. */
+export function listDelegates(sql: SqlStorage, agentName: string): string[] {
+  return (sql.exec('SELECT client FROM named_agent_delegates WHERE agent = ? ORDER BY created_at, client', agentName).toArray() as any[]).map(r => String(r.client));
+}
+
+/** Grant (or revoke with remove) an MCP client's delegation for agent:<name>.
+ * The named agent must exist in the registry. */
+export function setDelegate(sql: SqlStorage, agentName: string, client: unknown, createdBy: string, now: number, remove = false): { agent: string; client: string; delegates: string[] } {
+  if (typeof client !== 'string' || !DELEGATE_CLIENT.test(client)) throw new Error('invalid_client');
+  if (!sql.exec('SELECT 1 FROM agents WHERE project = ? AND tag = ?', NAMED_AGENT_PROJECT, agentName).toArray().length) throw new Error('unknown_agent');
+  if (remove) sql.exec('DELETE FROM named_agent_delegates WHERE agent = ? AND client = ?', agentName, client);
+  else sql.exec('INSERT OR IGNORE INTO named_agent_delegates (agent, client, created_by, created_at) VALUES (?, ?, ?, ?)', agentName, client, createdBy.slice(0, 128), new Date(now).toISOString());
+  return { agent: `${NAMED_AGENT_PROJECT}:${agentName}`, client, delegates: listDelegates(sql, agentName) };
 }

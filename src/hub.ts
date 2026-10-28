@@ -1,4 +1,4 @@
-import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent } from './session-messaging';
+import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, validateRef, readdressMessage, setDelegate, listDelegates } from './session-messaging';
 import { WorkerAccess, WORKER_SCOPE, workerRequestAllowed, workerRefreshContext } from './worker-access';
 import { IntakeWatchdog } from './intake-watchdog';
 import { RepoRegistry } from './repos';
@@ -1843,6 +1843,25 @@ export class Hub extends DurableObject {
         return json({ actor, access_token: tokens.accessToken, refresh_token: tokens.refreshToken, expires_at: expires, scopes: ['bus:send', 'bus:read'] }, 201);
       });
     }
+    // Delegate grants (§9): which MCP client may act as agent:<name> with its
+    // human login. Operator-managed, auditable through the delegates list.
+    const delegates = /^\/api\/agents\/named\/([A-Za-z0-9][A-Za-z0-9._-]{0,63})\/delegates$/.exec(path);
+    if (delegates) {
+      const name = delegates[1];
+      if (request.method === 'GET') return json({ agent: `${NAMED_AGENT_PROJECT}:${name}`, delegates: listDelegates(this.sql, name) });
+      if (request.method === 'POST') {
+        const b = await safeJson(request);
+        try {
+          const result = this.ctx.storage.transactionSync(() => setDelegate(this.sql, name, b?.client, String(auth.caller?.actor ?? 'admin'), Date.now(), b?.remove === true));
+          return json(result, b?.remove === true ? 200 : 201);
+        } catch (e: any) {
+          if (e.message === 'invalid_client') return json({ error: 'invalid_client' }, 400);
+          if (e.message === 'unknown_agent') return json({ error: 'unknown_agent' }, 404);
+          return json({ error: 'Internal Server Error' }, 500);
+        }
+      }
+      return json({ error: 'method_not_allowed' }, 405);
+    }
     if (path.startsWith('/api/agents/') && request.method === 'DELETE') {
       let raw: string;
       try { raw = decodeURIComponent(path.slice('/api/agents/'.length)); } catch { return json({ error: 'invalid_actor' }, 400); }
@@ -2337,6 +2356,45 @@ export class Hub extends DurableObject {
     return { data: parsed };
   }
 
+  private static readonly AS_ACTOR = /^agent:([A-Za-z0-9][A-Za-z0-9._-]{0,63})$/;
+
+  /**
+   * `as` delegation (docs/SESSION-MESSAGING.md §9): a caller may act as a
+   * named agent only when its credential family's MCP client is a registered
+   * delegate of that agent, or when it is the operator (admin, audited).
+   * The human actor and any host authority never carry over into the acting
+   * view, so every downstream bus check runs against the named agent alone.
+   */
+  private actingCallerFor(caller: any, as: unknown): { caller: any; delegated: boolean; client: string | null; error?: Response } {
+    if (as === undefined || as === null) return { caller, delegated: false, client: null };
+    if (typeof as !== 'string') return { caller, delegated: false, client: null, error: Response.json({ error: 'invalid_as' }, { status: 400 }) };
+    const match = Hub.AS_ACTOR.exec(as);
+    if (!match) return { caller, delegated: false, client: null, error: Response.json({ error: 'invalid_as' }, { status: 400 }) };
+    if (caller.actor === as) return { caller, delegated: false, client: null };
+    if (!this.sql.exec('SELECT 1 FROM agents WHERE project = ? AND tag = ?', NAMED_AGENT_PROJECT, match[1]).toArray().length) {
+      return { caller, delegated: false, client: null, error: Response.json({ error: 'unknown_recipient' }, { status: 404 }) };
+    }
+    let client: string | null = null;
+    // mcp_grants exists only once an OAuth flow ran; before that no bearer
+    // has an MCP client, so the lookup is simply empty.
+    const hasGrants = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mcp_grants'").toArray().length > 0;
+    if (caller.tokenId && hasGrants) {
+      const grant: any = this.sql.exec('SELECT g.client FROM credentials c JOIN mcp_grants g ON g.family = c.family_id WHERE c.id = ?', caller.tokenId).toArray()[0];
+      client = grant ? String(grant.client) : null;
+    }
+    const delegate = client !== null && this.sql.exec('SELECT 1 FROM named_agent_delegates WHERE agent = ? AND client = ?', match[1], client).toArray().length > 0;
+    if (!delegate && !caller.isAdmin) {
+      return { caller, delegated: false, client, error: Response.json({ error: 'forbidden', reason: 'delegate_required' }, { status: 403 }) };
+    }
+    return { caller: { ...caller, actor: as, isAdmin: false, machineId: undefined, kind: 'agent' as const }, delegated: true, client };
+  }
+
+  /** Audit trail for a delegated send (§9): `on_behalf_of` on the message. */
+  private auditDelegatedSend(caller: any, acting: { delegated: boolean; client: string | null }, messageId: string): void {
+    if (!acting.delegated) return;
+    messageEvent(this.sql, messageId, 'delegated', String(caller.actor ?? 'unknown'), null, Date.now(), { on_behalf_of: caller.actor ?? null, client: acting.client });
+  }
+
   private async handleBusRoutes(request: Request, path: string): Promise<Response | null> {
     if (!path.startsWith('/api/bus')) return null;
 
@@ -2390,10 +2448,20 @@ export class Hub extends DurableObject {
         return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
       }
 
-      const allowedKeys = new Set(['from_actor', 'to_actor', 'kind', 'body', 'idempotency_key', 'thread_id', 'reply_to', 'lease_epoch', 'delivery', 'deliver_by_s']);
+      const allowedKeys = new Set(['from_actor', 'to_actor', 'kind', 'body', 'idempotency_key', 'thread_id', 'reply_to', 'lease_epoch', 'delivery', 'deliver_by_s', 'ref', 'as']);
       const parsed = await this.parseSafeBusBody(request, allowedKeys);
       if (parsed.error) return parsed.error;
       const body = parsed.data!;
+
+      const acting = this.actingCallerFor(auth.caller!, body.as);
+      if (acting.error) return acting.error;
+      if (body.to_actor === 'human:me') {
+        const sub = auth.caller?.actor;
+        if (!sub || !String(sub).startsWith('human:')) return Response.json({ error: 'invalid_to_actor' }, { status: 400 });
+        body.to_actor = String(sub);
+      }
+      let refJson: string | null = null;
+      try { refJson = validateRef(body.ref); } catch { return Response.json({ error: 'invalid_ref' }, { status: 400 }); }
 
       if (typeof body.from_actor !== 'string' || !body.from_actor || body.from_actor.length > 128) {
         return Response.json({ error: 'invalid_from_actor' }, { status: 400 });
@@ -2425,9 +2493,10 @@ export class Hub extends DurableObject {
       }
 
       try {
-        const result = this.busService.send(auth.caller!, {
+        const result = this.busService.send(acting.caller, {
           delivery: body.delivery,
           deliverByMs: body.deliver_by_s !== undefined ? body.deliver_by_s * 1000 : undefined,
+          refJson,
           senderActor: body.from_actor,
           toActor: body.to_actor,
           kind: body.kind,
@@ -2438,6 +2507,7 @@ export class Hub extends DurableObject {
           leaseEpoch: body.lease_epoch,
           now: Date.now()
         });
+        this.auditDelegatedSend(auth.caller, acting, result.id);
         return Response.json({ id: result.id, thread_id: result.threadId, threadId: result.threadId });
       } catch (e: any) {
         if (e.message === 'body_too_large') return Response.json({ error: 'body_too_large' }, { status: 413 });
@@ -2466,10 +2536,24 @@ export class Hub extends DurableObject {
         return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
       }
 
-      const allowedKeys = new Set(['from_actor', 'to_actor', 'kind', 'body', 'idempotency_key', 'thread_id', 'reply_to', 'lease_epoch']);
+      const allowedKeys = new Set(['from_actor', 'to_actor', 'kind', 'body', 'idempotency_key', 'thread_id', 'reply_to', 'lease_epoch', 'delivery', 'deliver_by_s', 'ref', 'as']);
       const parsed = await this.parseSafeBusBody(request, allowedKeys);
       if (parsed.error) return parsed.error;
       const body = parsed.data!;
+
+      const acting = this.actingCallerFor(auth.caller!, body.as);
+      if (acting.error) return acting.error;
+      if (body.to_actor === 'human:me') {
+        const sub = auth.caller?.actor;
+        if (!sub || !String(sub).startsWith('human:')) return Response.json({ error: 'invalid_to_actor' }, { status: 400 });
+        body.to_actor = String(sub);
+      }
+      let refJson: string | null = null;
+      try { refJson = validateRef(body.ref); } catch { return Response.json({ error: 'invalid_ref' }, { status: 400 }); }
+      if (body.delivery !== undefined && !DELIVERIES.has(body.delivery)) return Response.json({ error: 'invalid_delivery' }, { status: 400 });
+      if (body.deliver_by_s !== undefined && (!Number.isInteger(body.deliver_by_s) || body.deliver_by_s < 60 || body.deliver_by_s > 7 * 86400)) {
+        return Response.json({ error: 'invalid_deliver_by' }, { status: 400 });
+      }
 
       if (!body.reply_to || typeof body.reply_to !== 'string' || body.reply_to.length > 128) {
         return Response.json({ error: 'missing_reply_to' }, { status: 400 });
@@ -2491,7 +2575,10 @@ export class Hub extends DurableObject {
       }
 
       try {
-        const result = this.busService.send(auth.caller!, {
+        const result = this.busService.send(acting.caller, {
+          delivery: body.delivery,
+          deliverByMs: body.deliver_by_s !== undefined ? body.deliver_by_s * 1000 : undefined,
+          refJson,
           senderActor: body.from_actor,
           toActor: body.to_actor,
           kind: body.kind,
@@ -2502,6 +2589,7 @@ export class Hub extends DurableObject {
           leaseEpoch: body.lease_epoch,
           now: Date.now()
         });
+        this.auditDelegatedSend(auth.caller, acting, result.id);
         return Response.json({ id: result.id, thread_id: result.threadId, threadId: result.threadId });
       } catch (e: any) {
         if (e.message === 'body_too_large') return Response.json({ error: 'body_too_large' }, { status: 413 });
@@ -2516,6 +2604,7 @@ export class Hub extends DurableObject {
           this.auditSendRefusal(e, body.from_actor ?? null, auth.caller?.machineId ?? null);
           return Response.json({ error: 'cross_project_forbidden' }, { status: 403 });
         }
+        if (e instanceof RecipientError && e.message === 'ambiguous_recipient') return Response.json({ error: 'ambiguous_recipient', candidates: e.candidates }, { status: 409 });
         return Response.json({ error: 'Internal Server Error' }, { status: 500 });
       }
     }
@@ -2530,13 +2619,44 @@ export class Hub extends DurableObject {
       }
 
       for (const k of url.searchParams.keys()) {
-        if (!['actor', 'limit', 'cursor', 'before'].includes(k)) {
+        if (!['actor', 'limit', 'cursor', 'before', 'unread', 'thread', 'wait', 'as'].includes(k)) {
           return Response.json({ error: 'unknown_query_param', param: k }, { status: 400 });
         }
       }
 
-      const actor = url.searchParams.get('actor');
+      const acting = this.actingCallerFor(auth.caller!, url.searchParams.get('as') ?? undefined);
+      if (acting.error) return acting.error;
+
+      let actor = url.searchParams.get('actor');
+      if (!actor && acting.delegated) actor = acting.caller.actor;
       if (!actor) return Response.json({ error: 'missing_actor' }, { status: 400 });
+      if (acting.delegated && actor !== acting.caller.actor) return Response.json({ error: 'invalid_actor' }, { status: 400 });
+
+      const unreadRaw = url.searchParams.get('unread');
+      const unread = unreadRaw === null ? false : (['1', 'true'].includes(unreadRaw) ? true : null);
+      if (unread === null) return Response.json({ error: 'invalid_unread' }, { status: 400 });
+
+      const thread = url.searchParams.get('thread') || undefined;
+      if (thread && thread.length > 128) return Response.json({ error: 'invalid_thread' }, { status: 400 });
+
+      const waitRaw = url.searchParams.get('wait');
+      let waitMs = 0;
+      if (waitRaw !== null) {
+        if (!/^\d+$/.test(waitRaw)) return Response.json({ error: 'invalid_wait' }, { status: 400 });
+        // Single long-polled Durable Object request with a bounded wait (§11).
+        waitMs = Math.min(parseInt(waitRaw, 10), 60) * 1000;
+      }
+
+      // A web cookie session (abstract 'admin') or an admin-scoped human
+      // bearer reading their own human inbox (§4 delivered/read semantics)
+      // acts as human:<sub> instead, so polling marks delivered; no other
+      // actor is ever remapped.
+      let inboxCaller: any = acting.caller;
+      const session = await getSession(this.env, request);
+      const selfHuman = auth.caller?.actor === 'admin' && session?.sub ? 'human:' + session.sub : auth.caller?.actor ?? null;
+      if (auth.caller?.isAdmin && !acting.delegated && actor === selfHuman) {
+        inboxCaller = { ...acting.caller, isAdmin: false, actor };
+      }
 
       let limit = 50;
       if (url.searchParams.has('limit')) {
@@ -2551,14 +2671,49 @@ export class Hub extends DurableObject {
       if (cursor && cursor.length > 128) return Response.json({ error: 'invalid_cursor' }, { status: 400 });
 
       try {
-        const messages = this.busService.inbox(auth.caller!, actor, limit, cursor);
-        return Response.json(messages);
+        const deadline = Date.now() + waitMs;
+        for (;;) {
+          const messages = this.busService.inbox(inboxCaller, actor!, limit, cursor, { unread, thread });
+          if (messages.length > 0 || Date.now() >= deadline) return Response.json(messages);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
       } catch (e: any) {
         if (e.message === 'unauthorized' || (e.message && e.message.startsWith('missing_m4_root_authority'))) {
           return Response.json({ error: 'forbidden', reason: e.message }, { status: 403 });
         }
         return Response.json({ error: 'Internal Server Error' }, { status: 500 });
       }
+    }
+
+    // GET /api/bus/inboxes — which inboxes this caller may read (§9): its own
+    // actor plus the named agents it is a delegate of (admin: all named agents).
+    if (path === '/api/bus/inboxes') {
+      if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('admin')) {
+        return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
+      }
+      const caller = auth.caller!;
+      let client: string | null = null;
+      const hasGrants = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mcp_grants'").toArray().length > 0;
+      if (caller.tokenId && hasGrants) {
+        const grant: any = this.sql.exec('SELECT g.client FROM credentials c JOIN mcp_grants g ON g.family = c.family_id WHERE c.id = ?', caller.tokenId).toArray()[0];
+        client = grant ? String(grant.client) : null;
+      }
+      // The web Inbox page authenticates with the operator cookie session
+      // ('admin'); its human inbox address comes from the session subject.
+      const session = await getSession(this.env, request);
+      const selfActor = caller.actor === 'admin' && session?.sub ? 'human:' + session.sub : caller.actor ?? null;
+      const allNamed = (this.sql.exec('SELECT tag FROM agents WHERE project = ? ORDER BY tag', NAMED_AGENT_PROJECT).toArray() as any[]).map(r => `${NAMED_AGENT_PROJECT}:${r.tag}`);
+      let namedAgents: string[];
+      if (caller.isAdmin) namedAgents = allNamed;
+      else if (selfActor && allNamed.includes(selfActor)) namedAgents = [selfActor];
+      else if (client !== null) {
+        const granted = new Set((this.sql.exec('SELECT g.agent FROM named_agent_delegates g JOIN mcp_grants m ON m.client = g.client WHERE m.family = (SELECT family_id FROM credentials WHERE id = ?)', caller.tokenId).toArray() as any[]).map((r: any) => `${NAMED_AGENT_PROJECT}:${r.agent}`));
+        namedAgents = allNamed.filter(a => granted.has(a));
+      } else namedAgents = [];
+      return Response.json({ actor: selfActor, kind: caller.kind ?? null, client, named_agents: namedAgents });
     }
 
     // POST /api/bus/native-sync — host-attested bridge for native aplexer work.
@@ -2983,6 +3138,62 @@ export class Hub extends DurableObject {
       }
     }
 
+    // POST /api/bus/messages/read — recipient batch read (`hub inbox --mark-read`)
+    if (path === '/api/bus/messages/read') {
+      if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('admin')) {
+        return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
+      }
+      const parsed = await this.parseSafeBusBody(request, new Set(['ids']), true);
+      if (parsed.error) return parsed.error;
+      const ids = parsed.data?.ids;
+      if (!Array.isArray(ids) || ids.length < 1 || ids.length > 100 || ids.some((id: unknown) => typeof id !== 'string' || !id || id.length > 128)) {
+        return Response.json({ error: 'invalid_ids' }, { status: 400 });
+      }
+      // A cookie-session operator or admin human bearer marking their own
+      // human inbox read acts as human:<sub> (§4); marking anyone else's
+      // inbox read is not offered.
+      let readCaller: any = auth.caller;
+      const session = await getSession(this.env, request);
+      const selfHuman = readCaller.actor === 'admin' && session?.sub ? 'human:' + session.sub : readCaller.actor ?? null;
+      if (readCaller.isAdmin && selfHuman) {
+        readCaller = { ...readCaller, isAdmin: false, actor: selfHuman };
+      }
+      try {
+        return Response.json(this.busService.markRead(readCaller, ids));
+      } catch (e: any) {
+        if (e.message === 'unauthorized') return Response.json({ error: 'forbidden' }, { status: 403 });
+        return Response.json({ error: 'Internal Server Error' }, { status: 500 });
+      }
+    }
+
+    // POST /api/bus/messages/:id/readdress — operator only (§3): point an
+    // undelivered session message at a replacement session and re-queue it.
+    const readdressMatch = path.match(/^\/api\/bus\/messages\/([^/]+)\/readdress$/);
+    if (readdressMatch) {
+      if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+      const auth = await this.authenticateBusRequest(request);
+      if (auth.error) return auth.error;
+      if (!auth.caller?.isAdmin) return Response.json({ error: 'forbidden', reason: 'operator_only' }, { status: 403 });
+      const parsed = await this.parseSafeBusBody(request, new Set(['to']), true);
+      if (parsed.error) return parsed.error;
+      const to = parsed.data?.to;
+      if (typeof to !== 'string' || !to || to.length > 128) return Response.json({ error: 'invalid_readdress_target' }, { status: 400 });
+      try {
+        const result = this.ctx.storage.transactionSync(() => readdressMessage(this.sql, decodeURIComponent(readdressMatch[1]), to, Date.now()));
+        return Response.json({ status: 'readdressed', ...result });
+      } catch (e: any) {
+        if (e.message === 'not_found') return Response.json({ error: 'not_found' }, { status: 404 });
+        if (e.message === 'already_read') return Response.json({ error: 'already_read' }, { status: 409 });
+        if (e.message === 'not_addressed_to_session' || e.message === 'invalid_readdress_target') return Response.json({ error: e.message }, { status: 400 });
+        if (e instanceof RecipientError && e.message === 'ambiguous_recipient') return Response.json({ error: 'ambiguous_recipient', candidates: e.candidates }, { status: 409 });
+        if (e.message === 'unknown_recipient') return Response.json({ error: 'unknown_recipient' }, { status: 404 });
+        return Response.json({ error: 'Internal Server Error' }, { status: 500 });
+      }
+    }
+
     // POST /api/bus/messages/:id/(ack|accept|complete)
     const stageMatch = path.match(/^\/api\/bus\/messages\/([^/]+)\/(ack|accept|complete)$/);
     if (stageMatch) {
@@ -2996,9 +3207,11 @@ export class Hub extends DurableObject {
       const messageId = decodeURIComponent(stageMatch[1]);
       const stage = stageMatch[2] as 'ack' | 'accept' | 'complete';
 
-      const allowedKeys = new Set(['lease_epoch']);
+      const allowedKeys = new Set(['lease_epoch', 'as']);
       const parsed = await this.parseSafeBusBody(request, allowedKeys, true);
       if (parsed.error) return parsed.error;
+      const actingStage = this.actingCallerFor(auth.caller!, parsed.data?.as);
+      if (actingStage.error) return actingStage.error;
       let leaseEpoch: number | undefined;
       if (parsed.data?.lease_epoch !== undefined) {
         if (typeof parsed.data.lease_epoch !== 'number' || !Number.isInteger(parsed.data.lease_epoch) || parsed.data.lease_epoch < 0) {
@@ -3008,9 +3221,9 @@ export class Hub extends DurableObject {
       }
 
       try {
-        if (stage === 'ack') this.busService.ack(auth.caller!, messageId, Date.now(), leaseEpoch);
-        else if (stage === 'accept') this.busService.accept(auth.caller!, messageId, Date.now(), leaseEpoch);
-        else if (stage === 'complete') this.busService.complete(auth.caller!, messageId, Date.now(), leaseEpoch);
+        if (stage === 'ack') this.busService.ack(actingStage.caller, messageId, Date.now(), leaseEpoch);
+        else if (stage === 'accept') this.busService.accept(actingStage.caller, messageId, Date.now(), leaseEpoch);
+        else if (stage === 'complete') this.busService.complete(actingStage.caller, messageId, Date.now(), leaseEpoch);
         return Response.json({ status: 'ok', id: messageId, stage });
       } catch (e: any) {
         if (e.message === 'not_found') return Response.json({ error: 'not_found' }, { status: 404 });
@@ -3032,8 +3245,10 @@ export class Hub extends DurableObject {
       if (!auth.scopes?.includes('bus:read') && !auth.scopes?.includes('msg:read') && !auth.scopes?.includes('admin')) { // msg:* = session messaging credentials (M2)
         return Response.json({ error: 'forbidden', reason: 'scope_missing' }, { status: 403 });
       }
+      const actingStatus = this.actingCallerFor(auth.caller!, url.searchParams.get('as') ?? undefined);
+      if (actingStatus.error) return actingStatus.error;
       try {
-        return Response.json(this.busService.status(auth.caller!, decodeURIComponent(statusMatch[1])));
+        return Response.json(this.busService.status(actingStatus.caller, decodeURIComponent(statusMatch[1])));
       } catch (e: any) {
         if (e.message === 'not_found') return Response.json({ error: 'not_found' }, { status: 404 });
         if (e.message === 'unauthorized') return Response.json({ error: 'forbidden' }, { status: 403 });
@@ -3052,9 +3267,11 @@ export class Hub extends DurableObject {
       }
 
       const messageId = decodeURIComponent(showMatch[1]);
+      const actingShow = this.actingCallerFor(auth.caller!, url.searchParams.get('as') ?? undefined);
+      if (actingShow.error) return actingShow.error;
 
       try {
-        const msg = this.busService.show(auth.caller!, messageId);
+        const msg = this.busService.show(actingShow.caller, messageId);
         return Response.json(msg);
       } catch (e: any) {
         if (e.message === 'not_found') return Response.json({ error: 'not_found' }, { status: 404 });

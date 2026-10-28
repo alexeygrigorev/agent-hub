@@ -114,6 +114,7 @@ export default {
     // and the fonts those files reference.
     const PRIVATE_ASSETS = [
       '/', '/index.html',
+      '/inbox', '/inbox.html', '/inbox.js', '/inbox.css',
       '/fleet', '/fleet.html', '/fleet.js', '/fleet.css',
       '/engines', '/engines.html', '/engines.js', '/engines.css',
       '/banked-resets.html', '/banked-resets.js',
@@ -142,6 +143,7 @@ export default {
     }
     if (!env.ASSETS) return new Response('Not found', { status: 404 });
     if (url.pathname === '/') url.pathname = '/index.html';
+    if (url.pathname === '/inbox') url.pathname = '/inbox.html';
     if (url.pathname === '/metrics' || url.pathname === '/usage' || url.pathname === '/usage.html') url.pathname = '/metrics.html';
     if (url.pathname === '/sessions') url.pathname = '/sessions.html';
     if (url.pathname === '/fleet') url.pathname = '/fleet.html';

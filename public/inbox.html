@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Inbox · Agent Hub</title>
+<link rel="stylesheet" href="/vendor/dakit/dakit.css"><link rel="stylesheet" href="/auth.css">
+<link rel="stylesheet" href="/inbox.css">
+<script src="/inbox.js"></script>
+</head>
+<body>
+<div class="dk-shell" data-app="agent-hub" data-sidebar="expanded">
+  <a class="dk-skip-link" href="#main-content">Skip to content</a>
+
+  <header class="dk-topbar">
+    <button class="dk-icon-button" type="button" data-dk-drawer-toggle aria-controls="dk-sidebar" aria-expanded="false" aria-label="Open navigation">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+    </button>
+    <a class="dk-topbar__title" href="/">Agent Hub</a>
+    <div class="dk-topbar__end">
+      <nav class="hub-topbar-links" aria-label="Quick links">
+        <a class="hub-topbar-link" href="/inbox.html">Inbox</a>
+        <a class="hub-topbar-link" href="/sessions.html">Sessions</a>
+        <a class="hub-topbar-link" href="/fleet.html#quota">Usage</a>
+      </nav>
+    </div>
+  </header>
+
+  <aside class="dk-sidebar" id="dk-sidebar" aria-label="Workspace">
+    <div class="dk-sidebar__head">
+      <a class="dk-brand" href="/"><span class="dk-brand__tile" aria-hidden="true">AH</span><span class="dk-brand__name">Agent Hub</span></a>
+      <button class="dk-icon-button dk-sidebar__close" type="button" data-dk-drawer-close aria-label="Close navigation">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <nav class="dk-sidebar__nav" aria-label="Primary">
+      <div class="dk-nav-group">
+        <a class="dk-nav-item" href="/intake.html">
+          <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 4a2 2 0 0 1 6 0M9 11h6M9 15h4"/></svg>
+          <span class="dk-nav-item__label">Intake</span>
+        </a>
+        <a class="dk-nav-item" href="/inbox.html" aria-current="page">
+          <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
+          <span class="dk-nav-item__label">Inbox</span>
+          <span class="dk-count" id="inbox-unread-badge" aria-hidden="true" hidden></span>
+        </a>
+        <a class="dk-nav-item" href="/conversations.html">
+          <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a8 8 0 0 1-8 8H5l-2 2V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8Z"/></svg>
+          <span class="dk-nav-item__label">Conversations</span>
+        </a>
+        <a class="dk-nav-item" href="/fleet.html">
+          <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="7" rx="1"/><rect x="3" y="13" width="18" height="7" rx="1"/><path d="M7 8h.01M7 17h.01"/></svg>
+          <span class="dk-nav-item__label">Fleet / Usage</span>
+        </a>
+        <a class="dk-nav-item" href="/sessions.html">
+          <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+          <span class="dk-nav-item__label">Sessions &amp; Lineage</span>
+        </a>
+        <a class="dk-nav-item" href="/metrics.html">
+          <svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19V9M10 19V5M16 19v-6M22 19V3"/></svg>
+          <span class="dk-nav-item__label">Metrics &amp; Usage</span>
+        </a>
+        <a class="dk-nav-item" href="/device"><svg class="dk-nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M10 18h4"/></svg><span class="dk-nav-item__label">Pair a device</span></a>
+      </div>
+    </nav>
+    <div class="dk-sidebar__foot">
+      <button class="dk-account-trigger" type="button" data-dk-popover-trigger="dk-account-menu" aria-expanded="false" aria-controls="dk-account-menu">
+        <span class="dk-avatar dk-avatar--sm" aria-hidden="true"><span class="dk-avatar__initials" id="account-initials">·</span></span>
+        <span class="dk-account-trigger__name" id="account-name">Signed out</span>
+        <svg class="dk-account-trigger__chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+      </button>
+      <button class="dk-icon-button dk-sidebar__toggle" type="button" data-dk-sidebar-toggle aria-controls="dk-sidebar" aria-expanded="true" aria-label="Collapse sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg>
+      </button>
+    </div>
+  </aside>
+
+  <div class="dk-scrim" data-dk-drawer-close hidden></div>
+
+  <main class="dk-main" id="main-content">
+    <div class="dk-main__inner dk-fill inbox-inner">
+      <div class="dk-page-header">
+        <div class="dk-page-header__main">
+          <h1 class="dk-page-header__title">Inbox</h1>
+          <p class="dk-page-header__subtitle" id="inbox-state" role="status">Loading…</p>
+        </div>
+        <div class="dk-page-header__actions">
+          <select class="dk-select inbox-actor-select" id="inbox-actor" aria-label="Inbox identity"></select>
+          <button class="dk-button dk-button--secondary" type="button" id="inbox-refresh">Refresh</button>
+        </div>
+      </div>
+
+      <div class="dk-split inbox-split">
+        <section class="dk-split__list" aria-labelledby="inbox-list-title">
+          <header class="dk-split__head">
+            <h2 class="dk-split__title" id="inbox-list-title">Messages</h2>
+            <div class="inbox-list-tools">
+              <label class="inbox-check"><input type="checkbox" id="inbox-unread-only"> Unread</label>
+              <button class="dk-button dk-button--secondary dk-button--sm" type="button" id="inbox-mark-read" hidden>Mark read</button>
+            </div>
+          </header>
+          <div class="dk-split__body" id="inbox-list" role="listbox" aria-label="Messages"></div>
+        </section>
+        <section class="dk-split__detail" aria-labelledby="inbox-detail-title" id="inbox-detail-section" hidden>
+          <header class="dk-split__head">
+            <h2 class="dk-split__title" id="inbox-detail-title">Message</h2>
+            <button class="dk-icon-button inbox-close-detail" type="button" id="inbox-close" aria-label="Close message">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+            </button>
+          </header>
+          <div class="dk-split__body inbox-detail-body">
+            <div id="inbox-detail"></div>
+            <form id="inbox-reply-form" class="inbox-reply" hidden>
+              <p class="inbox-reply__label" id="inbox-reply-label">Reply</p>
+              <textarea class="dk-textarea" id="inbox-reply-body" rows="4" maxlength="16384" placeholder="Write a reply…" required></textarea>
+              <div class="inbox-reply__row">
+                <span class="inbox-reply__hint" id="inbox-reply-meta"></span>
+                <button class="dk-button" type="submit" id="inbox-reply-send">Send reply</button>
+              </div>
+            </form>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+</div>
+</body>
+</html>

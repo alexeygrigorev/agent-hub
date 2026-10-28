@@ -322,3 +322,98 @@ describe('message event retention', () => {
     expect(sql.exec('SELECT message_id FROM message_events').toArray().map((r: any) => r.message_id)).toEqual(['m-new']);
   }));
 });
+
+describe('M5 client surface (intake 3bdf9715)', () => {
+  it('carries refs by reference only: validated, stored, and idempotency-checked', () => fixture(async ({ bus, sql }) => {
+    const { validateRef } = await import('../src/session-messaging');
+    expect(validateRef(undefined)).toBeNull();
+    expect(JSON.parse(validateRef({ kind: 'url', value: 'https://x', sha256: 'a'.repeat(64), bytes: 5 })!)).toMatchObject({ kind: 'url' });
+    for (const bad of [{ kind: 'nope', value: 'x' }, { kind: 'path', value: '/x' }, { kind: 'git', value: '' },
+      { kind: 'git', value: 'x', sha256: 'nope' }, { kind: 'git', value: 'x', extra: 1 }, 'string', ['array']]) {
+      expect(() => validateRef(bad)).toThrow('invalid_ref');
+    }
+    const sent = bus.send(developer, { senderActor: 'agent:developer', toActor: 'agent:developer', kind: 'note', body: 'with ref', idempotencyKey: 'ref-1', refJson: validateRef({ kind: 'url', value: 'https://example/blob' }) });
+    expect(JSON.parse(sql.exec('SELECT ref_json FROM messages WHERE id = ?', sent.id).one().ref_json)).toMatchObject({ kind: 'url' });
+    expect(() => bus.send(developer, { senderActor: 'agent:developer', toActor: 'agent:developer', kind: 'note', body: 'with ref', idempotencyKey: 'ref-1', refJson: validateRef({ kind: 'url', value: 'https://other' }) })).toThrow('conflict');
+    expect(bus.send(developer, { senderActor: 'agent:developer', toActor: 'agent:developer', kind: 'note', body: 'with ref', idempotencyKey: 'ref-1', refJson: validateRef({ kind: 'url', value: 'https://example/blob' }) }).id).toBe(sent.id);
+  }));
+
+  it('delivers to human:<sub> recipients and keeps their inbox private', () => fixture(async ({ bus, sql }) => {
+    const at = new Date().toISOString();
+    sql.exec("INSERT INTO users (sub, email, is_admin, first_seen_at, last_seen_at) VALUES ('alice', 'alice@fake.local', 0, ?, ?)", at, at);
+    const sent = bus.send(developer, { senderActor: 'agent:developer', toActor: 'human:alice', kind: 'note', body: 'for alice', idempotencyKey: 'h-1' });
+    expect(sql.exec('SELECT to_actor FROM messages WHERE id = ?', sent.id).one().to_actor).toBe('human:alice');
+    expect(() => bus.send(developer, { senderActor: 'agent:developer', toActor: 'human:stranger', kind: 'note', body: 'x', idempotencyKey: 'h-2' })).toThrow('unknown_recipient'); // no users row
+    const alice = { kind: 'human', actor: 'human:alice' } as any;
+    expect(bus.inbox(alice, 'human:alice').map((m: any) => m.body)).toEqual(['for alice']);
+    expect(sql.exec('SELECT delivered_at FROM messages WHERE id = ?', sent.id).one().delivered_at).toBeTruthy(); // inbox poll marks delivered
+    expect(() => bus.inbox({ kind: 'human', actor: 'human:zoe' } as any, 'human:alice')).toThrow('unauthorized');
+  }));
+
+  it('filters the inbox by unread and thread, and batch-marks read', () => fixture(async ({ bus }) => {
+    const first = bus.send(developer, { senderActor: 'agent:developer', toActor: 'agent:developer', kind: 'note', body: 't1 first', idempotencyKey: 'u-1', threadId: 'thread-a' });
+    bus.send(developer, { senderActor: 'agent:developer', toActor: 'agent:developer', kind: 'note', body: 't2', idempotencyKey: 'u-2', threadId: 'thread-b' });
+    bus.send(developer, { senderActor: 'agent:developer', toActor: 'agent:developer', kind: 'note', body: 't1 second', idempotencyKey: 'u-3', threadId: 'thread-a' });
+    expect(bus.inbox(developer, 'agent:developer', 50, undefined, { thread: 'thread-a' }).map((m: any) => m.body)).toEqual(['t1 first', 't1 second']);
+    expect(bus.markRead(developer, [first.id])).toEqual({ marked: 1 });
+    // Same-millisecond ULIDs do not promise send order; compare as a set.
+    expect(bus.inbox(developer, 'agent:developer', 50, undefined, { unread: true }).map((m: any) => m.body).sort()).toEqual(['t1 second', 't2'].sort());
+    // Sender and admin views never mark read; unknown ids are skipped.
+    expect(bus.markRead({ kind: 'human', isAdmin: true } as any, [first.id, 'missing'])).toEqual({ marked: 0 });
+  }));
+
+  it('readdresses an undelivered session message to a replacement session (operator only)', () => fixture(async ({ bus, sc, sql }) => {
+    const { readdressMessage, expireSessionMessages } = await import('../src/session-messaging');
+    const sent = bus.send(developer, { senderActor: 'agent:developer', toActor: 'session:' + SESSION, kind: 'note', body: 'follow me', idempotencyKey: 'r-1' });
+    sql.exec("UPDATE session_control_sessions SET state = 'stopped' WHERE id = ?", SESSION);
+    const OTHER = '44444444-4444-4444-8444-444444444444';
+    const at = new Date().toISOString();
+    sql.exec(`INSERT INTO session_control_sessions (id, actor, request_key, request_json, machine_id, engine, mode, state, binding_json, created_at, updated_at)
+      VALUES (?, 'admin', 'k2', '{"workspace":"agent-hub"}', 'tabo', 'codex', 'interactive', 'running', ?, ?, ?)`, OTHER,
+      JSON.stringify({ native_id: NATIVE, tag: 'burn-tabo-2', workspace: 'C:\\repos\\agent-hub', generation: 0 }), at, at);
+    expireSessionMessages(sql, Date.now(), 'tabo'); // the host cycle expires the ended session's queued delivery
+    expect(sql.exec("SELECT state FROM session_control_commands WHERE request_key = 'msg-" + sent.id + "'").one().state).toBe('failed'); // ended session expires the queue
+    const readdressed = readdressMessage(sql, sent.id, 'session:' + OTHER, Date.now());
+    expect(readdressed).toEqual({ id: sent.id, to_actor: 'session:' + OTHER });
+    const row = sql.exec('SELECT to_actor, to_session_id, state FROM messages WHERE id = ?', sent.id).one();
+    expect(row).toMatchObject({ to_actor: 'session:' + OTHER, to_session_id: OTHER, state: 'accepted' });
+    const command: any = sql.exec("SELECT session_id, state FROM session_control_commands WHERE request_key = 'msg-" + sent.id + "'").toArray();
+    expect(Object.fromEntries(command.map((c: any) => [c.session_id, c.state]))).toEqual({ [SESSION]: 'failed', [OTHER]: 'recorded' });
+    expect(sql.exec("SELECT detail_json FROM message_events WHERE message_id = ? AND event = 'readdressed'", sent.id).one().detail_json).toContain(OTHER);
+    sql.exec("UPDATE messages SET read_at = strftime('%s','now') * 1000 WHERE id = ?", sent.id);
+    expect(() => readdressMessage(sql, sent.id, 'session:' + OTHER, Date.now())).toThrow('already_read'); // after read, the inbox copy is authoritative
+  }));
+});
+
+describe('M5 named-agent delegation (§9)', () => {
+  it('acts as a named agent only for granted MCP clients or the operator, and audits the send', () => fixture(async ({ bus, hub, sql }) => {
+    const human = { kind: 'human', actor: 'human:alice', tokenId: 'mcp-cred-alice' } as any;
+    // No delegate grant yet: refused.
+    expect((hub as any).actingCallerFor(human, 'agent:developer').error?.status).toBe(403);
+    expect((hub as any).actingCallerFor(human, 'human:alice').delegated).toBe(false); // own actor passes through
+    expect((hub as any).actingCallerFor(human, 'session:nope').error?.status).toBe(400);
+    // Operator override is allowed without a grant; the acting view drops
+    // admin and any host authority before the bus checks run.
+    const admin = (hub as any).actingCallerFor({ kind: 'human', actor: 'admin', isAdmin: true } as any, 'agent:developer');
+    expect(admin.delegated).toBe(true);
+    expect(admin.caller).toMatchObject({ actor: 'agent:developer', isAdmin: false, machineId: undefined });
+    // A delegate grant binds one MCP client (the caller's credential family) to the agent.
+    const at = new Date().toISOString();
+    sql.exec("INSERT INTO named_agent_delegates (agent, client, created_by, created_at) VALUES ('developer', 'test-client', 'admin', ?)", at);
+    sql.exec(`INSERT INTO credentials (id, kind, token_hash, family_id, subject, actor, scopes, created_by_sub, created_at, expires_at)
+      VALUES ('mcp-cred-alice', 'human', 'hash-alice', 'fam-alice', 'alice@fake.local', 'human:alice', '["admin"]', 'a', ?, ?)`, at, at);
+    sql.exec("INSERT INTO mcp_grants (family, client, resource, expires) VALUES ('fam-alice', 'test-client', 'https://hub.test/mcp', ?)", Date.now() + 3600000);
+    const granted = (hub as any).actingCallerFor(human, 'agent:developer');
+    expect(granted.error).toBeUndefined();
+    expect(granted.delegated).toBe(true);
+    // A delegated send is checked as the named agent and audited on_behalf_of.
+    const sent = bus.send(granted.caller, { senderActor: 'agent:developer', toActor: 'agent:developer', kind: 'note', body: 'as developer', idempotencyKey: 'd-1' });
+    (hub as any).auditDelegatedSend(human, granted, sent.id);
+    const audit: any = sql.exec("SELECT actor, detail_json FROM message_events WHERE message_id = ? AND event = 'delegated'", sent.id).one();
+    expect(audit.actor).toBe('human:alice');
+    expect(audit.detail_json).toContain('test-client');
+    // Revoking the grant stops future delegation.
+    sql.exec("DELETE FROM named_agent_delegates WHERE agent = 'developer' AND client = 'test-client'");
+    expect((hub as any).actingCallerFor(human, 'agent:developer').error?.status).toBe(403);
+  }));
+});

@@ -1,0 +1,80 @@
+/* Hub Inbox page (§9 human + delegated named-agent inboxes). Built on the
+ * shared dakit split layout; the rules below only style message rows, the
+ * detail pane and the phone-width stack. */
+
+.inbox-inner { display: flex; flex-direction: column; }
+.inbox-split { flex: 1; min-height: 320px; }
+
+.inbox-actor-select { max-width: 260px; }
+
+.inbox-list-tools { display: flex; align-items: center; gap: 12px; }
+.inbox-check { display: inline-flex; align-items: center; gap: 6px; font-size: var(--dk-text-sm, 0.85rem); color: var(--dk-text-muted, inherit); }
+
+.inbox-empty { color: var(--dk-text-muted, inherit); padding: 16px; }
+
+.inbox-row {
+  position: relative;
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 10px 36px 10px 14px;
+  border: 0;
+  border-bottom: 1px solid var(--dk-border, rgba(128, 128, 128, 0.25));
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+}
+.inbox-row:hover { background: var(--dk-bg-hover, rgba(128, 128, 128, 0.1)); }
+.inbox-row--active { background: var(--dk-bg-selected, rgba(128, 128, 128, 0.18)); }
+.inbox-row--unread .inbox-row__from { font-weight: 700; }
+.inbox-dot {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dk-accent, #3b82f6);
+}
+.inbox-row__top { display: flex; justify-content: space-between; gap: 8px; }
+.inbox-row__from { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.inbox-row__when { flex-shrink: 0; font-size: var(--dk-text-sm, 0.8rem); opacity: 0.7; }
+.inbox-row__preview {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--dk-text-sm, 0.85rem);
+  opacity: 0.85;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.inbox-row__meta { display: block; margin-top: 2px; font-size: var(--dk-text-xs, 0.75rem); opacity: 0.6; }
+
+.inbox-detail-body { display: flex; flex-direction: column; gap: 16px; }
+.inbox-msg__head, .inbox-msg__meta, .inbox-msg__ref { margin: 0 0 6px; }
+.inbox-msg__meta { font-size: var(--dk-text-sm, 0.8rem); opacity: 0.7; }
+.inbox-msg__ref code { word-break: break-all; font-size: var(--dk-text-xs, 0.75rem); }
+.inbox-msg__body {
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--dk-border, rgba(128, 128, 128, 0.25));
+  border-radius: 8px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: inherit;
+  font-size: var(--dk-text-sm, 0.9rem);
+}
+
+.inbox-reply { display: flex; flex-direction: column; gap: 8px; }
+.inbox-reply__label { margin: 0; font-weight: 600; }
+.inbox-reply__row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.inbox-reply__hint { font-size: var(--dk-text-xs, 0.75rem); opacity: 0.7; }
+
+/* Phone width: single column, detail slides under the list. */
+@media (max-width: 720px) {
+  .inbox-split { display: block; }
+  .inbox-actor-select { max-width: 160px; }
+  .inbox-detail-body { padding-bottom: 32px; }
+  .inbox-reply__row { flex-direction: column; align-items: stretch; }
+}

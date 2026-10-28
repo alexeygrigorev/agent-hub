@@ -281,6 +281,20 @@ MAX_BRIDGE_CYCLES = 1000
 MAX_BRIDGE_PAGES = 100
 
 
+def _messaging_command(args, fn):
+    """§11 messaging commands: exit 0 accepted, 2 refused (auth/validation),
+    3 unknown or ambiguous recipient, 4 transport error after retries."""
+    from . import msg_cli
+    try:
+        print(json.dumps(fn(args)))
+    except SystemExit:
+        raise
+    except Exception as exc:
+        # Bounded diagnostics only; never echo credentials or bodies.
+        print('hub ' + str(args.cmd) + ' failed: ' + str(exc)[:300], file=sys.stderr)
+        sys.exit(msg_cli.exit_code_for(exc))
+
+
 def cmd_bridge(args):
     """Bounded foreground mailbox bridge (SPEC §7.5) for tags the hub registers for this credential.
 
@@ -340,6 +354,7 @@ def add_bridge_resume_command(sub):
 def main():
     parser = argparse.ArgumentParser(description="Agent Hub CLI")
     parser.add_argument("--version", action="version", version=f"%(prog)s {format_version()}")
+    parser.add_argument("--profile", default=None, help="Named agent profile for messaging commands (e.g. developer; see hub msg --help)")
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_update = sub.add_parser("update", help="Update hub CLI to the latest deployed version or check staleness")
     p_update.add_argument("--url", default=None, help="Release URL (default: HUB_URL/HUB_BASE_URL or https://hub.dtcdev.click; ignores stored profile URL)")
@@ -438,21 +453,31 @@ def main():
 
     p_run = sub.add_parser("run", help="Run the host agent in the foreground")
 
-    p_send = sub.add_parser("send", help="Send a message")
-    p_send.add_argument("--from", dest="from_actor", required=True)
+    p_send = sub.add_parser("send", help="Send a message (session:<id>, tag@machine, agent:<name>, human:<sub> or a bus address)")
+    p_send.add_argument("--from", dest="from_actor", required=False, default=None)
     p_send.add_argument("--to", dest="to_actor", required=True)
-    p_send.add_argument("--kind", required=True)
-    p_send.add_argument("--body", required=True)
+    p_send.add_argument("--kind", default="note")
+    p_send.add_argument("--body", required=False, default=None)
+    p_send.add_argument("--body-file", default=None)
     p_send.add_argument("--idempotency-key", default=None)
     p_send.add_argument("--thread-id", help="Thread ID")
     p_send.add_argument("--reply-to", help="Reply to message ID")
     p_send.add_argument("--lease-epoch", type=int, help="Root lease epoch", default=None)
+    p_send_mode = p_send.add_mutually_exclusive_group()
+    p_send_mode.add_argument("--tui", action="store_const", const="tui", dest="delivery", help="Session recipients: type into the prompt")
+    p_send_mode.add_argument("--inbox", action="store_const", const="inbox", dest="delivery", help="Session recipients: native inbox only")
+    p_send.add_argument("--ref", help="Large payload by reference, JSON object")
+    p_send.add_argument("--deliver-by", help="TUI delivery deadline, e.g. 24h")
 
     p_inbox = sub.add_parser("inbox", help="List inbox messages")
-    p_inbox.add_argument("--actor", required=True)
+    p_inbox.add_argument("--actor", required=False, default=None)
     p_inbox.add_argument("--limit", type=int, default=50)
     p_inbox.add_argument("--cursor", help="Pagination cursor")
-    
+    p_inbox.add_argument("--unread", action="store_true", help="Only unread messages")
+    p_inbox.add_argument("--thread", help="Only one thread id")
+    p_inbox.add_argument("--wait", type=int, default=0, help="Long-poll up to N seconds (max 60)")
+    p_inbox.add_argument("--mark-read", action="store_true", help="Mark the returned messages read")
+
     p_show = sub.add_parser("show", help="Show message")
     p_show.add_argument("id", help="Message ID")
     
@@ -470,13 +495,19 @@ def main():
     
     p_reply = sub.add_parser("reply", help="Reply to message")
     p_reply.add_argument("--reply-to", required=True)
-    p_reply.add_argument("--from", dest="from_actor", required=True)
-    p_reply.add_argument("--to", dest="to_actor", required=True)
-    p_reply.add_argument("--kind", required=True)
-    p_reply.add_argument("--body", required=True)
+    p_reply.add_argument("--from", dest="from_actor", required=False, default=None)
+    p_reply.add_argument("--to", dest="to_actor", required=False, default=None)
+    p_reply.add_argument("--kind", default="reply")
+    p_reply.add_argument("--body", required=False, default=None)
+    p_reply.add_argument("--body-file", default=None)
     p_reply.add_argument("--idempotency-key", default=None)
     p_reply.add_argument("--thread-id", help="Thread ID")
     p_reply.add_argument("--lease-epoch", type=int, help="Root lease epoch", default=None)
+    p_reply_mode = p_reply.add_mutually_exclusive_group()
+    p_reply_mode.add_argument("--tui", action="store_const", const="tui", dest="delivery", help="Session recipients: type into the prompt")
+    p_reply_mode.add_argument("--inbox", action="store_const", const="inbox", dest="delivery", help="Session recipients: native inbox only")
+    p_reply.add_argument("--ref", help="Large payload by reference, JSON object")
+    p_reply.add_argument("--deliver-by", help="TUI delivery deadline, e.g. 24h")
     
     p_claim = sub.add_parser("claim", help="Create a claim")
     p_claim.add_argument("--project", required=True)
@@ -610,7 +641,7 @@ def main():
         except Exception as exc:
             # Bounded diagnostics only; never echo credentials.
             print('hub msg failed: ' + str(exc)[:300], file=sys.stderr)
-            sys.exit(2 if 'status 4' in str(exc) or isinstance(exc, ValueError) else 4)
+            sys.exit(msg_cli.exit_code_for(exc))
         return
     if args.cmd in ('submit', 'jobs', 'job', 'task-result', 'routing-machines', 'model-policy', 'task-artifact', 'artifact', 'host-release'):
         try:
@@ -787,58 +818,19 @@ def main():
     elif args.cmd == "bridge":
         cmd_bridge(args)
     elif args.cmd == "send":
-        from . import bus
-        if args.body == "-":
-            raw = sys.stdin.read(16385)
-            if len(raw.encode("utf-8")) > 16384:
-                print("Error: stdin body exceeds 16 KiB limit", file=sys.stderr)
-                sys.exit(1)
-            args.body = raw
-        res = bus.send(
-            args.from_actor,
-            args.to_actor,
-            args.kind,
-            args.body,
-            idempotency_key=getattr(args, 'idempotency_key', None),
-            thread_id=getattr(args, 'thread_id', None),
-            reply_to=getattr(args, 'reply_to', None),
-            lease_epoch=getattr(args, 'lease_epoch', None)
-        )
-        print(json.dumps(res))
+        _messaging_command(args, msg_cli.top_send)
     elif args.cmd == "inbox":
-        from . import bus
-        print(json.dumps(bus.inbox(args.actor, limit=getattr(args, 'limit', 50), cursor=getattr(args, 'cursor', None))))
+        _messaging_command(args, msg_cli.top_inbox)
     elif args.cmd == "show":
-        from . import bus
-        print(json.dumps(bus.show(args.id)))
+        _messaging_command(args, msg_cli.top_show)
     elif args.cmd == "ack":
-        from . import bus
-        print(json.dumps(bus.ack(args.id, lease_epoch=getattr(args, 'lease_epoch', None))))
+        _messaging_command(args, lambda a: msg_cli.top_stage(a, "ack"))
     elif args.cmd == "accept":
-        from . import bus
-        print(json.dumps(bus.accept(args.id, lease_epoch=getattr(args, 'lease_epoch', None))))
+        _messaging_command(args, lambda a: msg_cli.top_stage(a, "accept"))
     elif args.cmd == "complete":
-        from . import bus
-        print(json.dumps(bus.complete(args.id, lease_epoch=getattr(args, 'lease_epoch', None))))
+        _messaging_command(args, lambda a: msg_cli.top_stage(a, "complete"))
     elif args.cmd == "reply":
-        from . import bus
-        if args.body == "-":
-            raw = sys.stdin.read(16385)
-            if len(raw.encode("utf-8")) > 16384:
-                print("Error: stdin body exceeds 16 KiB limit", file=sys.stderr)
-                sys.exit(1)
-            args.body = raw
-        res = bus.reply(
-            args.reply_to,
-            args.from_actor,
-            args.to_actor,
-            args.kind,
-            args.body,
-            idempotency_key=getattr(args, 'idempotency_key', None),
-            thread_id=getattr(args, 'thread_id', None),
-            lease_epoch=getattr(args, 'lease_epoch', None)
-        )
-        print(json.dumps(res))
+        _messaging_command(args, msg_cli.top_reply)
     elif args.cmd == "claim":
         from . import bus
         print(json.dumps(bus.claim(args.project, args.scope, args.holder, args.ttl_ms, lease_epoch=getattr(args, 'lease_epoch', None))))
