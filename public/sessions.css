@@ -222,3 +222,5 @@
   .session-detail__meta { grid-template-columns: 1fr; }
   .session-send-form__foot .dk-button { width: 100%; }
 }
+
+.sessions-audit-bar { display: flex; align-items: center; justify-content: space-between; gap: var(--dk-space-2); }

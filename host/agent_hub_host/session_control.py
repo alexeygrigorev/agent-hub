@@ -574,6 +574,11 @@ def add_commands(sub):
                          help='Path with a stale deleted label now holds a valid worktree')
     observe.add_argument('--superseded-by', default=None)
     observe.add_argument('--note', default=None, help='Opt-in free text (bounded, redacted server-side; reason codes preferred)')
+    audit = commands.add_parser('audit', help='Idle-session audit action log: recent runs, per-action counts and decisions (admin)')
+    audit.add_argument('--last', type=int, default=5, help='How many recent runs to show (1-50)')
+    audit.add_argument('--run', action='store_true', help='Trigger one audit pass now (admin; bypasses the 30-minute gate)')
+    audit.add_argument('--export', action='store_true', help='Export the full decision dataset for decider training')
+    audit.add_argument('--limit', type=int, default=5000, help='Row cap for --export')
 
 def match_session_state(entry: dict, wanted: str) -> bool:
     """Classify session state for filtering, treating confirmation/question waiting as waiting-idle."""
@@ -686,6 +691,12 @@ def _execute(args):
         if getattr(args, 'observed_at', None):
             body['observed_at'] = args.observed_at
         return request('POST', '/api/sessions/observations', body)
+    if cmd == 'audit':
+        if getattr(args, 'run', False):
+            return request('POST', '/api/sessions/audit/run', {})
+        if getattr(args, 'export', False):
+            return request('GET', '/api/sessions/audit/export?limit=%d' % max(1, min(20000, int(getattr(args, 'limit', None) or 5000))))
+        return request('GET', '/api/sessions/audit?last=%d' % max(1, min(50, int(getattr(args, 'last', None) or 5))))
     if cmd == 'tree' or (cmd == 'list' and getattr(args, 'tree', False)):
         return request('GET', '/api/sessions/tree')
     if cmd == 'list':
@@ -1018,6 +1029,24 @@ def render_commands(result):
     return '\n'.join(lines)
 
 
+def render_audit(result):
+    """Compact action log: per-run action counts plus one line per decision."""
+    lines = []
+    info = result.get('audit') or {}
+    lines.append(f"audit: state={info.get('state')} last_run={info.get('last_run_at')} threshold={info.get('threshold_s')}s")
+    for run in result.get('runs', []):
+        counts = run.get('counts') or {}
+        summary = ' '.join(f"{k}={v}" for k, v in sorted(counts.items()) if v)
+        lines.append(f"run {run.get('id')}  {run.get('at')}  {run.get('source')}  scanned={run.get('scanned')}  {summary}")
+    for d in result.get('decisions', []):
+        outcome = f"  outcome={d['outcome']}" if d.get('outcome') else ''
+        target = d.get('session_id') or (f"native {d.get('native_id')}" if d.get('native_id') else '-')
+        lines.append(f"  [{d.get('action')}] {d.get('rule')}  {target}  idle={d.get('idle_s')}s{outcome}")
+        if d.get('detail'):
+            lines.append(f"      {d['detail']}")
+    return '\n'.join(lines)
+
+
 def render_output(args, result):
     """Dispatch text table/tree vs raw machine JSON."""
     if getattr(args, 'json', False):
@@ -1044,5 +1073,9 @@ def render_output(args, result):
         if getattr(args, 'table', False) or (hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()):
             return render_commands(result)
         return result
+    if cmd == 'audit':
+        if 'exported_at' in result:
+            return result  # raw dataset export (AC3): --export always yields the full rows
+        return render_audit(result)
     return result
 

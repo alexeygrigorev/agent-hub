@@ -1,6 +1,7 @@
 import { initSessionMessaging, resolveRecipient, afterMessageInsert, DELIVERIES, RecipientError, ScopingRefusal, NAMED_AGENT_PROJECT, sessionsNeedingCredentials, mintSessionCredential, revokeEndedSessionCredentials, checkSendScoping, sessionIdOf, sessionRefreshAllowed, messagingSettings, updateMessagingSettings, messageEvent, validateRef, readdressMessage, setDelegate, listDelegates } from './session-messaging';
 import { WorkerAccess, WORKER_SCOPE, workerRequestAllowed, workerRefreshContext } from './worker-access';
 import { IntakeWatchdog } from './intake-watchdog';
+import { SessionAuditService, makeHeuristicDecider, makeLivenessNotify } from './session-audit';
 import { RepoRegistry } from './repos';
 import { IntakeService } from './intake';
 import { UI_HEADERS, tokenPage, authFailure, deviceEntry, deviceReview, deviceReviewHuman, deviceResult } from './ui-pages';
@@ -117,6 +118,7 @@ export class Hub extends DurableObject {
   public intakeService: IntakeService;
   private workerAccess: WorkerAccess;
   public intakeWatchdog: IntakeWatchdog;
+  public sessionAudit: SessionAuditService;
   public busService: BusService;
   public jobsService: JobsService;
   public quotaStore: QuotaStore;
@@ -254,6 +256,24 @@ export class Hub extends DurableObject {
       },
     });
     this.intakeWatchdog.init();
+    // Idle-session audit (intake 27d1e27b): scheduled 30-min continue/kill pass
+    // with a durable decision dataset. Actions go through the ordinary
+    // session-control command path; never a cleanup flag, never a worktree.
+    this.sessionAudit = new SessionAuditService(this.sql, {
+      request: async (path, init) => {
+        const r = await this.sessionControlService.handle(new Request('https://hub.internal' + path,
+          { method: init.method, body: init.body }),
+          { caller: { isAdmin: true, actor: 'hub:service:session-audit', kind: 'human' }, scopes: ['admin'] });
+        let body: any = null;
+        try { body = await r.json(); } catch { body = null; }
+        return { status: r.status, body };
+      },
+      notify: makeLivenessNotify({
+        setAlert: (kind, subject, problem) => this.livenessService.setAlert(kind, subject, problem),
+        deliverAlert: alert => this.notifyAlert(alert),
+      }),
+    }, Date.now, makeHeuristicDecider, this.env);
+    this.sessionAudit.init();
     this.livenessService.setPressureProjection(() => placementPressureSubjects(this.sql, Date.now()));
     this.checksService = new ChecksService(this.sql);
     this.checksService.init();
@@ -261,7 +281,7 @@ export class Hub extends DurableObject {
       this.sql,
       fn => this.ctx.storage.transactionSync(fn),
       this.livenessService,
-      alert => this.notifyAlert(alert),
+      alert => { return this.notifyAlert(alert).then(() => undefined); },
       this.intakeService,
     );
     this.monitoringService.init();
@@ -822,6 +842,24 @@ export class Hub extends DurableObject {
             // The only response carrying this credential; never logged.
             return Response.json({ ...minted, access_token: tokens.accessToken, refresh_token: tokens.refreshToken }, { status: 201, headers: { 'Cache-Control': 'private, no-store' } });
           });
+        }
+        return Response.json({ error: 'not_found' }, { status: 404 });
+      }
+      // Idle-session audit (intake 27d1e27b): admin action log, dataset export
+      // and a manual run trigger for live proof. Intercepted before the
+      // session-control dispatch, whose /:id routes would swallow the path.
+      if (path === '/api/sessions/audit' || path.startsWith('/api/sessions/audit/')) {
+        const auditAuth = await this.sessionControlAuth(request);
+        if (auditAuth.error) return auditAuth.error;
+        if (!auditAuth.caller?.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
+        if (path === '/api/sessions/audit' && request.method === 'GET') {
+          return Response.json(this.sessionAudit.view(Math.min(50, Math.max(1, Number(url.searchParams.get('last')) || 5))));
+        }
+        if (path === '/api/sessions/audit/export' && request.method === 'GET') {
+          return Response.json(this.sessionAudit.exportRows(Math.min(20000, Math.max(1, Number(url.searchParams.get('limit')) || 5000))));
+        }
+        if (path === '/api/sessions/audit/run' && request.method === 'POST') {
+          return Response.json(await this.sessionAudit.tick('manual'));
         }
         return Response.json({ error: 'not_found' }, { status: 404 });
       }
@@ -1929,8 +1967,10 @@ export class Hub extends DurableObject {
     return json({ error: 'not_found' }, 404);
   }
 
-  /** Deliver a newly opened alert to the configured inbox actors and optional webhook. */
-  private async notifyAlert(alert: any) {
+  /** Deliver a newly opened alert to the configured inbox actors and optional webhook.
+   * Returns the per-call receipt so callers (session audit) can only count an
+   * escalation as dispatched when it actually reached at least one target. */
+  private async notifyAlert(alert: any): Promise<{ delivered: string[]; errors: string[] }> {
     const text = alertText(alert); const errors: string[] = [];
     // Each target is delivered once; a retry only covers targets that have not succeeded yet.
     const delivered = new Set(this.livenessService.deliveredTo(alert));
@@ -1957,6 +1997,7 @@ export class Hub extends DurableObject {
     if (alert.subject_kind === 'intake_digest' && anyTarget && !errors.length) {
       this.livenessService.setAlert(alert.subject_kind, alert.subject, null);
     }
+    return { delivered: [...delivered], errors };
   }
 
   protected extraCheckDeps(): Partial<ActionDeps> { return {}; }
@@ -1968,7 +2009,7 @@ export class Hub extends DurableObject {
     this.livenessService.prune();
     const results = await this.checksService.runDue({
       liveness: this.livenessService,
-      notify: alert => this.notifyAlert(alert),
+      notify: alert => this.notifyAlert(alert).then(() => undefined),
       message: async (to, body, key) => this.busService.send({ isAdmin: true, actor: 'hub', kind: 'human' }, { senderActor: 'hub', toActor: to, kind: 'note', body, idempotencyKey: 'check-' + key }).id,
       launch: async (name, input, key) => {
         const response = await this.fleetService.handle(new Request('https://hub.internal/api/fleet/launches', { method: 'POST', body: JSON.stringify({ ...input, idempotency_key: 'check-' + key }) }),
@@ -2046,6 +2087,11 @@ export class Hub extends DurableObject {
     }
 
     const intakeWatchdog = await this.intakeWatchdog.tick(source);
+    // The audit must never break the scheduler slot for the jobs/watchdog;
+    // failures surface in the tick result and the next run retries.
+    let sessionAudit: any;
+    try { sessionAudit = await this.sessionAudit.tick(source); }
+    catch (e: any) { sessionAudit = { state: 'error', error: String(e?.message || e).slice(0, 200) }; }
     const slotStartIso = slotDate.toISOString();
     const tickResult = this.jobsService.tickRootSlot(slotStartIso);
 
@@ -2064,7 +2110,7 @@ export class Hub extends DurableObject {
       }
     }
 
-    return { status: 'ok', retention: cleanup, tick: tickResult, intake_watchdog: intakeWatchdog };
+    return { status: 'ok', retention: cleanup, tick: tickResult, intake_watchdog: intakeWatchdog, session_audit: sessionAudit };
   }
 
   async sampleHostHistory() {

@@ -7,6 +7,14 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}" || exit 1
 
+# Aplexer session identity leaks into config resolution: worker_auth and the
+# hub CLI resolve config paths from APLEXER_TAG/APLEXER_WORKSPACE even under a
+# disposable HOME, so fixture tests running unpatched would overwrite that
+# session's LIVE worker credential (observed 2026-10-28: live
+# hub-worker-auth/<session>.json files clobbered with pytest fixture data).
+# The suite must never touch a real profile.
+unset APLEXER_TAG APLEXER_WORKSPACE HUB_WORKER_CONFIG_FILE HUB_CONFIG_FILE
+
 python3 scripts/local-dependencies.py || exit 1
 
 # Capture the shared cache before the Python suite switches to a disposable HOME.
