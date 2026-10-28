@@ -385,6 +385,14 @@ class TestNoPruneCallers(unittest.TestCase):
         ]
         prune_re = re.compile(r'''"worktree"\s*,\s*"prune"|'worktree'\s*,\s*'prune'|worktree\s+prune''')
         force_re = re.compile(r'''"remove"\s*,\s*"--force"|'remove'\s*,\s*'--force'|"remove"\s*,\s*"-f"|'remove'\s*,\s*'-f'|worktree\s+remove\s+--force''')
+        # intake_worktree.py's operator-invoked tool (hub worktree
+        # status/remove, intake 4b161918) prunes only registry metadata next
+        # to its own non-force removal: `git worktree remove` (never --force)
+        # refuses locked trees, live processes are refused before it runs, and
+        # `git worktree prune` never drops locked entries. Hub session trees
+        # are locked on start/adopt (AC1), so neither call can delete a
+        # protected tree. Every other host path stays prune-free.
+        exempt = {"intake_worktree.py"}
         offenders = []
         for root in roots:
             if not root.is_dir():
@@ -394,11 +402,24 @@ class TestNoPruneCallers(unittest.TestCase):
                     text = path.read_text(encoding="utf-8")
                 except OSError:
                     continue
+                in_doc = False
+                delim = ""
                 for i, line in enumerate(text.splitlines(), 1):
                     stripped = line.strip()
-                    if stripped.startswith("#") or stripped.startswith('"""') or stripped.startswith("'''"):
+                    if in_doc:
+                        if delim and delim in stripped:
+                            in_doc = False
                         continue
-                    if prune_re.search(line) or force_re.search(line):
+                    if stripped.startswith("#"):
+                        continue
+                    if stripped.startswith('"""') or stripped.startswith("'''"):
+                        delim = stripped[:3]
+                        if stripped.count(delim) < 2:
+                            in_doc = True
+                        continue
+                    if prune_re.search(stripped) or force_re.search(stripped):
+                        if path.name in exempt:
+                            continue
                         offenders.append("%s:%d: %s" % (path.name, i, stripped[:160]))
         self.assertEqual(offenders, [])
 

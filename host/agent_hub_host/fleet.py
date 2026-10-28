@@ -2795,9 +2795,12 @@ class Dispatcher:
                 # --workspace send to a not-yet-existing tag is rejected as a
                 # cross-workspace queued target before native binding exists.
                 # Mirrors the host bridge's durable queued-send shape.
+                # compose_prompt keeps the worktree-guard footer on this path
+                # too (AC3): an empty interactive brief still carries the
+                # cleanup rules, after the planned-worktree note.
                 self.runner([native, "message", "send",
                              "--to", "hub-" + offer_id, "--queue",
-                             "--kind", "hub-session-preamble", "--json", wt_note + SESSION_PREAMBLE],
+                             "--kind", "hub-session-preamble", "--json", wt_note + compose_prompt("")],
                             cwd=str(workspace))
             pending_key = self._pending_claim_key(offer_id)
             if pending_key is not None:

@@ -437,7 +437,9 @@ class FleetHookTests(GitSandbox):
                 return {"plan": {"mode": "create", "task_id": "abcd1234-5678", "suffix": "wt-abcd1234"}}
             return {}
         d = fleet.Dispatcher(self.settings(), request, self.runner_for(calls, cwd=path))
-        result = d.dispatch(self.offer())
+        # AC1 lock identity: worktree launches carry the canonical Hub session
+        # and intake ids, exactly as /api/fleet/offers enrichment provides.
+        result = d.dispatch(self.offer(hub_session_id=self.OFFER_ID, intake_task_id="abcd1234-5678"))
         self.assertEqual(result["state"], "running", result)
         start = [a for a, _ in calls if a[:2] == ["aplexer", "start"]][0]
         self.assertEqual(start[start.index("--cwd") + 1], path)
@@ -529,7 +531,8 @@ class FleetHookTests(GitSandbox):
                 return {"id": p.split("/")[-2], "state": body.get("state")}
             return {}
         d = fleet.Dispatcher(cfg, request, runner)
-        d.dispatch(self.offer(mode="headless", prompt="Do the thing"))
+        d.dispatch(self.offer(mode="headless", prompt="Do the thing",
+                              hub_session_id=self.OFFER_ID, intake_task_id="abcd1234"))
         run = [a for a in calls if "run" in a][-1]
         self.assertEqual(run[run.index("--cwd") + 1], path)
         self.assertEqual(run[run.index("--tmpdir") + 1], os.path.join(path, ".local", "tmp"))
@@ -581,7 +584,8 @@ class FleetHookTests(GitSandbox):
                 return {"id": p.split("/")[-2], "state": body.get("state")}
             return {}
         d = fleet.Dispatcher(cfg, request, runner)
-        res = d.dispatch(self.offer(mode="headless", engine="zcodex", account="shared-zai", prompt="Do the thing"))
+        res = d.dispatch(self.offer(mode="headless", engine="zcodex", account="shared-zai", prompt="Do the thing",
+                                    hub_session_id=self.OFFER_ID, intake_task_id="abcd1234"))
         self.assertEqual(res["state"], "running", res)
         run = [a for a in calls if "run" in a][-1]
         self.assertEqual(run[run.index("--backend") + 1], "aplexer")

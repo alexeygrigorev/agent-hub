@@ -164,7 +164,7 @@ def test_plain_interactive_preamble_queues_same_workspace(tmp_path):
     bridge's durable queued-send shape (cwd, no --workspace) is required.
     Goal starts carry /goal in native argv and must not queue a preamble.
     """
-    from agent_hub_host.session_rules import SESSION_PREAMBLE
+    from agent_hub_host.session_rules import compose_prompt
     cfg = settings(tmp_path)
     cfg['subscriptions'][0]['startup_argv'] = ['trusted-codex', '--safe']
     calls, http = [], []
@@ -190,7 +190,7 @@ def test_plain_interactive_preamble_queues_same_workspace(tmp_path):
     assert len(preamble) == 1
     argv, kw = preamble[0]
     assert argv == ['aplexer', 'message', 'send', '--to', 'hub-' + offer()['id'], '--queue',
-                    '--kind', 'hub-session-preamble', '--json', SESSION_PREAMBLE]
+                    '--kind', 'hub-session-preamble', '--json', compose_prompt("")]
     assert '--workspace' not in argv
     assert kw.get('cwd') == str(tmp_path)
 
