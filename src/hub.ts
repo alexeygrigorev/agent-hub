@@ -2085,7 +2085,11 @@ export class Hub extends DurableObject {
     }
 
     const intakeWatchdog = await this.intakeWatchdog.tick(source);
-    const sessionAudit = await this.sessionAudit.tick(source);
+    // The audit must never break the scheduler slot for the jobs/watchdog;
+    // failures surface in the tick result and the next run retries.
+    let sessionAudit: any;
+    try { sessionAudit = await this.sessionAudit.tick(source); }
+    catch (e: any) { sessionAudit = { state: 'error', error: String(e?.message || e).slice(0, 200) }; }
     const slotStartIso = slotDate.toISOString();
     const tickResult = this.jobsService.tickRootSlot(slotStartIso);
 
