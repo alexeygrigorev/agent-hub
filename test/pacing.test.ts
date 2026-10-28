@@ -163,9 +163,11 @@ describe('banked EDF arbiter', () => {
   it('isolates halted accounts in provider fallback without losing healthy critical grants', () => {
     const healthy = pool({ pool_id: 'zai:b:7d', account: 'b' });
     const longA = pool({ pool_id: 'zai:a:7d', account: 'a' });
+    // Policy floors for zai are 0 (config rules.tbm_floor_percent), so the stored
+    // 5%/20% floors never block admission here; only depletion does.
     const blockedCases = [
-      [longA, pool({ pool_id: 'zai:a:5h', account: 'a', remaining_tokens: 400_000 })],
-      [pool({ ...longA, remaining_tokens: 1_200_000, reset_at_ms: NOW + 168 * H, cycle_ms: 168 * H })],
+      [longA, pool({ pool_id: 'zai:a:5h', account: 'a', remaining_tokens: 0 })],
+      [pool({ ...longA, remaining_tokens: 0, reset_at_ms: NOW + 168 * H, cycle_ms: 168 * H })],
     ];
     const grantA = tranche('grant-a', 12, 0, { pool_id: longA.pool_id, account: 'a', quantity_known: 0 });
     const grantB = tranche('grant-b', 2, 0, { pool_id: healthy.pool_id, account: 'b', quantity_known: 0 });
