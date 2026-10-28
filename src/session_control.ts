@@ -277,7 +277,7 @@ export class SessionControlService {
       if (!sessionCols.has(col)) this.sql.exec(`ALTER TABLE session_control_sessions ADD COLUMN ${col} ${type}`);
     }
     const commandCols = new Set(this.sql.exec('PRAGMA table_info(session_control_commands)').toArray().map((c: any) => String(c.name)));
-    for (const [col, type] of [['owner_token_id', 'TEXT'], ['owner_family', 'TEXT'], ['holder_machine', 'TEXT'], ['claim_token', 'TEXT'], ['claim_expires_at', 'TEXT'], ['holder_attempt', 'TEXT'], ['attempts', 'INTEGER DEFAULT 0'], ['host_status', 'TEXT'], ['host_reason', 'TEXT']] as const) {
+    for (const [col, type] of [['owner_token_id', 'TEXT'], ['owner_family', 'TEXT'], ['holder_machine', 'TEXT'], ['claim_token', 'TEXT'], ['claim_expires_at', 'TEXT'], ['holder_attempt', 'TEXT'], ['attempts', 'INTEGER DEFAULT 0'], ['host_status', 'TEXT'], ['host_reason', 'TEXT'], ['not_before', 'TEXT']] as const) {
       if (!commandCols.has(col)) this.sql.exec(`ALTER TABLE session_control_commands ADD COLUMN ${col} ${type}`);
     }
     // M15c lifecycle: additive observations/decisions tables. Server-owned

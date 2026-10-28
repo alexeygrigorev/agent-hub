@@ -189,3 +189,13 @@ describe('per-session messaging credential (M2)', () => {
     expect((await send('session:' + SESSION)).status).toBe(401);
   });
 });
+
+describe('message event retention', () => {
+  it('trims audit events older than 180 days on later writes', () => fixture(async ({ sql }) => {
+    const { messageEvent } = await import('../src/session-messaging');
+    const old = Date.now() - 181 * 24 * 3600 * 1000;
+    sql.exec("INSERT INTO message_events (message_id, event, actor, machine_id, at, detail_json) VALUES ('m-old', 'accepted', NULL, NULL, ?, NULL)", old);
+    messageEvent(sql, 'm-new', 'accepted', null, null, Date.now());
+    expect(sql.exec('SELECT message_id FROM message_events').toArray().map((r: any) => r.message_id)).toEqual(['m-new']);
+  }));
+});

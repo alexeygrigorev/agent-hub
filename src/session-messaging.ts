@@ -35,12 +35,17 @@ export function initSessionMessaging(sql: SqlStorage): void {
   sql.exec(`CREATE TABLE IF NOT EXISTS message_events (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL,
     event TEXT NOT NULL, actor TEXT, machine_id TEXT, at INTEGER NOT NULL, detail_json TEXT)`);
   sql.exec('CREATE INDEX IF NOT EXISTS message_events_message ON message_events(message_id, id)');
+  sql.exec('CREATE INDEX IF NOT EXISTS message_events_at ON message_events(at)');
   const commandCols = new Set(sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='session_control_commands'").toArray().length
     ? sql.exec('PRAGMA table_info(session_control_commands)').toArray().map((c: any) => String(c.name)) : []);
   if (commandCols.size && !commandCols.has('not_before')) sql.exec('ALTER TABLE session_control_commands ADD COLUMN not_before TEXT');
 }
 
+const EVENT_RETENTION_MS = 180 * 24 * 3600 * 1000;
+
 export function messageEvent(sql: SqlStorage, messageId: string, event: string, actor: string | null, machineId: string | null, now: number, detail?: Record<string, unknown>): void {
+  // Bounded retention (180 days, metadata only): trim a small slice per write.
+  sql.exec('DELETE FROM message_events WHERE id IN (SELECT id FROM message_events WHERE at < ? ORDER BY at LIMIT 20)', now - EVENT_RETENTION_MS);
   sql.exec('INSERT INTO message_events (message_id, event, actor, machine_id, at, detail_json) VALUES (?, ?, ?, ?, ?, ?)',
     messageId, event, actor, machineId, now, detail ? JSON.stringify(detail).slice(0, 2048) : null);
 }
