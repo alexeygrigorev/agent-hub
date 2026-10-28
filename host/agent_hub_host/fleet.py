@@ -741,11 +741,40 @@ def run_json(argv, *, payload=None, cwd=None, timeout=30):
     return value
 
 
-def quota_metadata(raw, service, profile=None):
-    """Reuse the maintained quota contract; never reimplement its failure/absence semantics."""
+def quota_metadata(raw, service, profile=None, account=None):
+    """Reuse the maintained quota contract; never reimplement its failure/absence semantics.
+
+    The quse probe key is the provider selector (``codex`` or ``codex-orin``),
+    not the aplexer profile (``hub-codex-orin``) nor the service alone. Try the
+    profile, then the account label, then the Orin home key (only when the
+    caller addresses the Orin account), then the service so the Orin home
+    never falls back to the whole raw dict (which sanitizes to status unknown
+    with empty windows).
+    """
     from .quota_snapshot import sanitize_provider, format_iso_utc, COLLECTOR_VERSION_REGEX
-    lookup = profile if (isinstance(raw, dict) and profile and profile in raw) else service
-    route = raw.get(lookup, raw.get(service, raw)) if isinstance(raw, dict) else {}
+    if not isinstance(raw, dict):
+        route = {}
+    else:
+        candidates: list[str] = []
+        if isinstance(profile, str) and profile:
+            candidates.append(profile)
+        if isinstance(account, str) and account:
+            candidates.append(account)
+        # Second-Codex-home key only when the caller actually addresses the
+        # Orin account: a generic service-only lookup must keep resolving the
+        # shared `codex` route as before.
+        if service == 'codex' and (account == 'codex-orin' or profile in ('hub-codex-orin', 'codex-orin')):
+            candidates.append('codex-orin')
+        if isinstance(service, str) and service:
+            candidates.append(service)
+        route = {}
+        for key in candidates:
+            candidate = raw.get(key)
+            if isinstance(candidate, dict):
+                route = candidate
+                break
+        else:
+            route = raw if ('status' in raw or 'windows' in raw) else {}
     if not isinstance(route, dict): route = {}
     details = route.get('details') if isinstance(route.get('details'), dict) else {}
     now = dt.datetime.now(dt.timezone.utc)
@@ -851,7 +880,7 @@ def collect_subscriptions(settings, runner=run_json):
             value = details.get("subscription") if isinstance(details, dict) else None
             if value in {"free", "pro", "max", "team", "enterprise", "SuperGrok", "SuperGrokPlus", "SuperGrokHeavy"}:
                 plan = value
-        reports.append({"service": service, "account": sub["account_label"], "plan": plan, "quota": quota_metadata(raw, service, profile=profile)})
+        reports.append({"service": service, "account": sub["account_label"], "plan": plan, "quota": quota_metadata(raw, service, profile=profile, account=sub.get("account_label"))})
     return reports
 
 

@@ -152,6 +152,26 @@ class FleetMetadataTests(unittest.TestCase):
         self.assertNotIn('raw_stdout', meta['windows']['7d'])
         self.assertIsNone(meta['collector_version'])
 
+    def test_quota_metadata_resolves_codex_orin_home_not_hub_profile(self):
+        now = utcnow()
+        raw = {'codex-orin': {'status': 'ok', 'error': None,
+                             'observed_at': quota_snapshot.format_iso_utc(now),
+                             'details': {'limit_reached': False},
+                             'windows': {
+                                 '5h': {'percent_remaining': None, 'reset_at': None},
+                                 '7d': {'percent_remaining': 80.0,
+                                        'reset_at': '2026-11-04T06:35:41Z'},
+                                 'monthly': {'percent_remaining': None, 'reset_at': None}}}}
+        meta = fleet.quota_metadata(raw, 'codex', profile='hub-codex-orin', account='codex-orin')
+        self.assertEqual(meta['status'], 'ok')
+        self.assertEqual(meta['windows']['7d']['percent_remaining'], 80.0)
+        self.assertTrue(meta['windows']['7d']['present'])
+        self.assertFalse(meta['windows']['5h']['present'])
+        # Without the account hint the legacy service-only lookup must not
+        # silently map the whole raw dict to an empty unknown quota.
+        fallback = fleet.quota_metadata(raw, 'codex', profile='hub-codex-orin')
+        self.assertEqual(fallback['windows']['7d']['percent_remaining'], 80.0)
+
 
 class QuotaCliTests(unittest.TestCase):
     def test_execute_builds_filtered_fleet_query(self):

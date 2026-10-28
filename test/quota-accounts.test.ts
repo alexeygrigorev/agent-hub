@@ -175,4 +175,39 @@ describe('canonical harness/provider/account mapping (codex-orin, go, zai)', () 
       expect(dup.status).toBe(400);
     });
   });
+
+  it('one broken host probe does not hold the pool when another host reports a known 7d window', async () => {
+    const e = env as unknown as Env;
+    await runInDurableObject(e.HUB.get(e.HUB.idFromName(crypto.randomUUID())), async (hub: Hub) => {
+      const now = Date.now();
+      hub.fleetService.init();
+      const store = new QuotaStore(hub.sql, undefined, {} as any, () => now);
+      const at = ts(-1000);
+      hub.sql.exec("INSERT INTO fleet_accounts VALUES ('shared-codex','codex',4,0,1)");
+      hub.sql.exec("INSERT INTO fleet_routes VALUES ('m1','codex','shared-codex','hub-shared-codex')");
+      hub.sql.exec("INSERT INTO fleet_routes VALUES ('m2','codex','shared-codex','hub-shared-codex')");
+      const healthy = {
+        status: 'ok', observed_at: at, details: { limit_reached: false },
+        windows: {
+          '5h': { present: false, percent_remaining: null, reset_at: null, rolling: false, error: null },
+          '7d': { present: true, percent_remaining: 80, reset_at: ts(86400000), rolling: false, error: null },
+          monthly: { present: false, percent_remaining: null, reset_at: null, rolling: false, error: null },
+        },
+      };
+      const broken = { status: 'unknown', observed_at: at, details: { limit_reached: null }, windows: {} };
+      hub.sql.exec('INSERT INTO fleet_subscriptions VALUES (?,?,?,?,?,?)', 'm1', 'shared-codex', 'codex', null, at, JSON.stringify(healthy));
+      hub.sql.exec('INSERT INTO fleet_subscriptions VALUES (?,?,?,?,?,?)', 'm2', 'shared-codex', 'codex', null, at, JSON.stringify(broken));
+      const body = store.getFleetView({ host_id: null, provider: null, engine: null, account: null }, now).body as any;
+      const pool = body.pools.find((p: any) => p.account === 'shared-codex');
+      expect(pool.state).toBe('fresh');
+      expect(pool.remaining_percent).toBe(80);
+      expect(pool.windows['7d']).toMatchObject({ present: true, percent_remaining: 80 });
+      // The healthy observation backs the display even though a sibling probe failed.
+      expect(pool.observed_by_hosts.sort()).toEqual(['m1', 'm2']);
+      // Account health agrees: one healthy route is enough for ok.
+      const status = hub.fleetService.accountStatus({ label: 'shared-codex', provider: 'codex', enabled: 1, reserve_percent: 0, max_concurrency: 4 });
+      expect(status.status).toBe('ok');
+      expect(status.remaining_percent).toBe(80);
+    });
+  });
 });

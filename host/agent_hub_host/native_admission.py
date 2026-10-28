@@ -39,7 +39,7 @@ def probe(payload, service, account, engine, runner=run_json):
         if selection is not None:
             model = configured_selection(selection, engine, service)
             result.update(model_supported=True, model=model['model'], effort=model['effort'])
-        quota = quota_metadata(runner(['quse', service, '--json']), service)
+        quota = quota_metadata(runner(['quse', service, '--json']), service, account=account)
         now = dt.datetime.now(dt.timezone.utc)
         observed = dt.datetime.fromisoformat(quota['observed_at'].replace('Z', '+00:00'))
         details = quota['details']
@@ -54,7 +54,12 @@ def probe(payload, service, account, engine, runner=run_json):
         known = 0
         timed = 0
         for name, window in quota['windows'].items():
-            if window.get('present') is False:
+            # A window without an explicit present flag but with no data and no
+            # error is a benign absent short window (e.g. Codex 5h null/null):
+            # a known 7d window must still admit. Only an explicit error fails.
+            present = window.get('present')
+            if present is False or (present is None and window.get('percent_remaining') is None
+                    and window.get('reset_at') is None and not window.get('error')):
                 if window.get('error') == 'unavailable':
                     return result
                 continue

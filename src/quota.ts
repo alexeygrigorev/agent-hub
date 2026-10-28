@@ -1479,34 +1479,46 @@ export class QuotaStore {
         state = "fresh";
         if (freshObs.some((o) => o.quota.details?.limit_reached === true)) {
           state = "exhausted";
-        } else if (freshObs.some((o) => observationUnavailable(o.quota))) {
-          state = "unavailable";
         } else {
-          for (const o of freshObs) {
-            const m = windowMinPercent(o.quota);
-            if (m !== null) remaining = remaining === null ? m : Math.min(remaining, m);
+          // One broken host probe must not hold the whole pool when another
+          // host reports healthy evidence: a known 7d window with a missing
+          // short window stays placeable. Fail closed only when NO healthy
+          // observation remains (genuine window errors still fail that host).
+          const healthy = freshObs.filter((o) => !observationUnavailable(o.quota));
+          if (!healthy.length) {
+            state = "unavailable";
+          } else {
+            for (const o of healthy) {
+              const m = windowMinPercent(o.quota);
+              if (m !== null) remaining = remaining === null ? m : Math.min(remaining, m);
+            }
           }
         }
-        const times = freshObs.map((o) => o.quota.observed_at).filter((t: unknown) => typeof t === "string") as string[];
+        const healthyForTs = freshObs.some((o) => !observationUnavailable(o.quota))
+          ? freshObs.filter((o) => !observationUnavailable(o.quota)) : freshObs;
+        const times = healthyForTs.map((o) => o.quota.observed_at).filter((t: unknown) => typeof t === "string") as string[];
         if (times.length) observedAt = times.sort().pop()!;
-        const cv = freshObs.map((o) => o.quota.collector_version).find((v: unknown) => typeof v === "string");
+        const cv = healthyForTs.map((o) => o.quota.collector_version).find((v: unknown) => typeof v === "string");
         if (typeof cv === "string") collectorVersion = cv;
       } else if (hasStale) {
         state = "stale";
       }
       const routeEngines = routes.length ? [...new Set(routes.map((r) => r.engine))].sort() : [canonicalQuotaProvider(account.provider)];
+      // Display the first healthy observation when one exists so a broken
+      // sibling probe never masks known windows (e.g. 7d 80% with 5h absent).
+      const displayObs = freshObs.find((o) => !observationUnavailable(o.quota)) ?? freshObs[0];
       pools.push({
         provider: canonicalQuotaProvider(account.provider),
         account: canonicalAccountLabel(account.label),
 
         state,
         source,
-        windows: freshObs[0]?.quota.windows || {},
-        native_balance: freshObs[0]?.quota.status === 'ok' && freshObs[0]?.quota.details?.stale !== true && freshObs[0]?.quota.details &&
-          ['credits', 'usd_cents'].includes(freshObs[0].quota.details.unit) &&
-          typeof freshObs[0].quota.details.credits_remaining === 'number' &&
-          Number.isFinite(freshObs[0].quota.details.credits_remaining)
-          ? {remaining: freshObs[0].quota.details.credits_remaining, unit: freshObs[0].quota.details.unit} : null,
+        windows: displayObs?.quota.windows || {},
+        native_balance: displayObs?.quota.status === 'ok' && displayObs?.quota.details?.stale !== true && displayObs?.quota.details &&
+          ['credits', 'usd_cents'].includes(displayObs.quota.details.unit) &&
+          typeof displayObs.quota.details.credits_remaining === 'number' &&
+          Number.isFinite(displayObs.quota.details.credits_remaining)
+          ? {remaining: displayObs.quota.details.credits_remaining, unit: displayObs.quota.details.unit} : null,
         remaining_percent: remaining,
         observed_at: observedAt,
         collector_version: collectorVersion,

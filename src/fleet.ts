@@ -496,7 +496,7 @@ export class FleetService {
     // canonicalize here so grouping by provider shows both Codex accounts.
     const provider = canonicalQuotaProvider(account.provider);
     const routes = this.sql.exec('SELECT machine_id, engine, profile FROM fleet_routes WHERE account = ?', account.label).toArray();
-    let remaining: number | null = null; let observed = 0; let unknown = false; let blocked = !account.enabled;
+    let remaining: number | null = null; let observed = 0; let unknown = false; let blocked = !account.enabled; let healthy = false;
     const reserves = (((policy as any).rules as any).reserve_percent || {}) as Record<string, number>;
     for (const route of routes) {
       const prov = this.observationProvenance(account, route);
@@ -511,6 +511,7 @@ export class FleetService {
         continue;
       }
       remaining = remaining === null ? adm.remaining! : Math.min(remaining, adm.remaining!);
+      healthy = true;
     }
     if (remaining !== null && remaining <= account.reserve_percent) blocked = true;
     // Capacity counts only live machines (Hetzner urgent live, legacy stale):
@@ -585,7 +586,7 @@ export class FleetService {
       } else placementReasons.add(liveIds.has(String(route.machine_id)) ? 'engine_unavailable' : 'machine_unavailable');
     }
     return { label: canonicalAccountLabel(account.label), provider, max_concurrency: account.max_concurrency, reserve_percent: account.reserve_percent, enabled: !!account.enabled, supports_goal: ['codex', 'zai'].includes(provider),
-      remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || unknown || remaining === null) ? 'unknown' : 'ok', active, available_slots: availableSlots,
+      remaining_percent: remaining, status: blocked ? 'blocked' : (!observed || remaining === null || (!healthy && unknown)) ? 'unknown' : 'ok', active, available_slots: availableSlots,
       // Counted vs live: active splits into launch reservations + orphan
       // observed sessions; native_live is the host-catalog verified live
       // process count for this account (includes launch-linked sessions).
