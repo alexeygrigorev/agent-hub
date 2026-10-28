@@ -323,27 +323,22 @@ class GuardedRootBridge:
         rec_run = state.get("starttime_ticks_run_id")
 
         if rec_ticks is not None:
-            is_uncleaned_finished_legacy = (
-                rec_run is None
-                and rec_pid is None
-                and rec_ticks_epoch is None
-                and state.get("hub_job_id") is None
-                and "end" in state
-                and "result" in state
-            )
-            if not is_uncleaned_finished_legacy:
-                if rec_run is not None and rec_run != state.get("run_id"):
-                    self.log(f"REFUSING signal: starttime ticks run_id mismatch ({rec_run} vs {state.get('run_id')})")
-                    return False
-                if rec_pid is not None and rec_pid != target_pid:
-                    self.log(f"REFUSING signal: starttime ticks pid mismatch ({rec_pid} vs {target_pid})")
-                    return False
-                if rec_ticks_epoch is not None and rec_ticks_epoch != state.get("epoch"):
-                    self.log(f"REFUSING signal: starttime ticks epoch mismatch ({rec_ticks_epoch} vs {state.get('epoch')})")
-                    return False
-                if current_ticks != rec_ticks:
-                    self.log(f"REFUSING signal: starttime ticks mismatch (PID reuse detected): recorded={rec_ticks}, current={current_ticks}")
-                    return False
+            # The pre-ticks-metadata legacy tolerance (uncleaned finished
+            # records without run_id/pid/epoch) was retired with intake
+            # 19848714: a census of 956 host state files found zero legacy
+            # records, and current writers always record all four fields.
+            if rec_run is not None and rec_run != state.get("run_id"):
+                self.log(f"REFUSING signal: starttime ticks run_id mismatch ({rec_run} vs {state.get('run_id')})")
+                return False
+            if rec_pid is not None and rec_pid != target_pid:
+                self.log(f"REFUSING signal: starttime ticks pid mismatch ({rec_pid} vs {target_pid})")
+                return False
+            if rec_ticks_epoch is not None and rec_ticks_epoch != state.get("epoch"):
+                self.log(f"REFUSING signal: starttime ticks epoch mismatch ({rec_ticks_epoch} vs {state.get('epoch')})")
+                return False
+            if current_ticks != rec_ticks:
+                self.log(f"REFUSING signal: starttime ticks mismatch (PID reuse detected): recorded={rec_ticks}, current={current_ticks}")
+                return False
 
         # Safe to signal target root process group
         try:
