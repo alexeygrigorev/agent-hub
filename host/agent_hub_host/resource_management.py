@@ -973,6 +973,8 @@ def classify_reason(entry: dict[str, Any], native_phase: Optional[str], native_d
         return "terminal"
     if native_dead is True:
         return "dead_pid"
+    if entry.get("idle_reap_allowed") is False or (entry.get("intake_id") and entry.get("idle_reap_allowed") is not True):
+        return None
     if idle_ms is not None and idle_ms >= 0:
         last_ms = _parse_iso_ms(entry.get("last_activity_at"))
         if last_ms is None:

@@ -28,6 +28,13 @@ export class IntakeWatchdog {
       reason TEXT NOT NULL, request_key TEXT, request_json TEXT, session_id TEXT, attempts INTEGER NOT NULL DEFAULT 0,
       next_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
   }
+  /** A missed wake enters the existing recovery queue. This is not proof of
+   * death: project/restart still require canonical evidence and no live owner. */
+  enqueueWakeRecovery(taskId: string, wakeId: string): void {
+    const now = this.now();
+    this.sql.exec(`INSERT INTO intake_restart_queue(task_id,state,reason,next_at,updated_at)
+      VALUES(?,'queued',?, ?,?) ON CONFLICT(task_id) DO NOTHING`, taskId, 'missed_wake:' + wakeId, now, now);
+  }
   status(): Obj {
     const m = this.rows('SELECT last_tick,last_source,last_result FROM intake_watchdog_meta WHERE id=1')[0];
     return { last_checked_at: m.last_tick, source: m.last_source, state: parse(m.last_result).state ?? 'not_checked' };
@@ -45,6 +52,9 @@ export class IntakeWatchdog {
     });
     const claims = this.rows("SELECT * FROM claims WHERE released_at IS NULL AND (expires_at>? OR claim_source='native')", now);
     const queue = new Map(this.rows('SELECT * FROM intake_restart_queue').map(q => [q.task_id, q]));
+    let missed: Obj[] = [];
+    try { missed = this.rows("SELECT session_id,intake_task_id FROM session_control_wakes WHERE state='missed'"); } catch { /* optional wakes */ }
+
     return tasks.filter(t => OPEN.has(t.status) && !t.archived_at).map(t => {
       const ids = new Set((t.history || []).map((e: Obj) => e.hub_session_id).filter(Boolean));
       const linked = sessions.filter(s => ids.has(s.id) || parse(s.request_json).intake_task_id === t.id)
@@ -74,6 +84,17 @@ export class IntakeWatchdog {
         else lastEnd = Math.max(lastEnd, ms(n.observed_at));
       }
       for (const s of linked) {
+        // A canonical stop can be stale relative to a newer native incarnation.
+        // Missed wakes never authorize replacing live or unknown native work.
+        if (s.state === 'stopped' && missed.some(w => w.session_id === s.id && w.intake_task_id === t.id)) {
+          const binding = parse(s.binding_json);
+          if (binding.native_id) {
+            const n = nativeById.get(JSON.stringify([s.machine_id, binding.native_id]));
+            if (!catalogs.has(s.machine_id) || !n || !Number.isFinite(binding.native_created_at_ms) || n.created_at_ms !== binding.native_created_at_ms ||
+                n.tag !== binding.tag || n.workspace !== binding.workspace || ['unknown','unobserved'].includes(n.phase)) unknown = true;
+            else if (!['exited','stopped','failed'].includes(n.phase)) live = true;
+          }
+        }
         if (!ACTIVE.has(s.state)) { lastEnd = Math.max(lastEnd, ms(s.updated_at)); continue; }
         const binding = parse(s.binding_json);
         if (!binding.native_id) { live = true; continue; } // queued intent prevents duplicates
@@ -85,12 +106,13 @@ export class IntakeWatchdog {
         else unknown = true; // absence without a terminal receipt cannot authorize a duplicate
       }
       const onlyFailed = linked.length > 0 && linked.every(s => FAILED.has(s.state));
-      const forgotten = !live && !unknown && (onlyFailed || now - lastEnd > 7200000);
+      const wakeRecovery = linked.some(s => missed.some(w => w.session_id === s.id && w.intake_task_id === t.id) && s.state === 'stopped');
+      const forgotten = !live && !unknown && (onlyFailed || wakeRecovery || now - lastEnd > 7200000);
       const q = queue.get(t.id);
       return { id: t.id, title: t.title, project: t.project, age_ms: Math.max(0, now - ms(t.created_at)),
         last_session: linked[0] ? { id: linked[0].id, state: linked[0].state, updated_at: linked[0].updated_at } : null,
         state: forgotten ? (q?.state || 'forgotten') : live ? 'active' : unknown ? 'unknown' : 'waiting',
-        reason: live ? 'live_session_or_pending_intent' : unknown ? 'host_observation_unknown' : onlyFailed ? 'only_failed_sessions' : forgotten ? 'no_live_session_over_two_hours' : 'within_two_hour_grace',
+        reason: live ? 'live_session_or_pending_intent' : unknown ? 'host_observation_unknown' : wakeRecovery ? 'missed_wake_terminal_session' : onlyFailed ? 'only_failed_sessions' : forgotten ? 'no_live_session_over_two_hours' : 'within_two_hour_grace',
         forgotten, restart: q ? { state: q.state, reason: q.reason, session_id: q.session_id, next_at: q.next_at } : null };
     });
   }

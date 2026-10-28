@@ -1,3 +1,4 @@
+import { IdleWorkService } from './idle-work';
 import { WorkerAccess, WORKER_SCOPE, workerRequestAllowed, workerRefreshContext } from './worker-access';
 import { IntakeWatchdog } from './intake-watchdog';
 import { RepoRegistry } from './repos';
@@ -131,6 +132,8 @@ export class Hub extends DurableObject {
   public hostHistoryService: HostHistoryService;
   public webhookService: WebhookService;
 
+  private idleWork: IdleWorkService;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.env = env;
@@ -175,6 +178,7 @@ export class Hub extends DurableObject {
         const prepared = this.repoRegistry.prepareLaunch(input);
         return prepared.error ? { value: prepared.error, status: 400 } : this.fleetService.reserve(prepared.input, auth);
       },
+      wakeMissed: (intakeId, wakeId) => this.intakeWatchdog.enqueueWakeRecovery(intakeId, wakeId),
     }, { env: this.env });
     this.sessionControlService.init();
     // Inbound webhooks -> session delivery (intake 19ec91c2): the queue
@@ -185,6 +189,9 @@ export class Hub extends DurableObject {
       () => this.sessionControlService,
       validSessionSecret(this.env) ? this.env.SESSION_SECRET : null);
     this.webhookService.init();
+    this.idleWork = new IdleWorkService(this.sql, fn => this.ctx.storage.transactionSync(fn), this.sessionControlService, env);
+    this.idleWork.init();
+    this.statusService.setSessionAttention(() => this.sessionControlService.attention());
     this.fleetService.resources.initCatalogCache();
     this.sql.exec(`CREATE INDEX IF NOT EXISTS session_control_native ON session_control_sessions(machine_id,
       CASE WHEN json_valid(binding_json) THEN CASE WHEN json_type(binding_json, '$.native_id') = 'text'
@@ -736,7 +743,15 @@ export class Hub extends DurableObject {
       // existing session/CSRF path. No agent scope changes.
       if (path === '/api/sessions' || path.startsWith('/api/sessions/') ||
           path === '/api/session-commands' || path.startsWith('/api/session-commands/')) {
-        return this.sessionControlService.handle(request, await this.sessionControlAuth(request));
+        const result = await this.sessionControlService.handle(request, await this.sessionControlAuth(request));
+        if (request.method === 'POST' && /\/wakes?$/.test(path) && result.ok) {
+          // Commit the durable wake before arming the existing alarm. Never postpone
+          // an earlier alarm owned by another Hub service.
+          const current = await this.ctx.storage.getAlarm();
+          const next = this.sessionControlService.nextWakeTime();
+          if (next !== null && (current === null || next < current)) await this.ctx.storage.setAlarm(Math.max(Date.now() + 1, next));
+        }
+        return result;
       }
       // Inbound webhooks (intake 19ec91c2). Admin management surfaces live
       // under /api/webhooks with the same operator/cookie authority as
@@ -1887,12 +1902,18 @@ export class Hub extends DurableObject {
       return { status: 'refused', reason: 'future_slot_refused', slot: slotDate.toISOString() };
     }
 
+    await this.idleWork.tick();
     const intakeWatchdog = await this.intakeWatchdog.tick(source);
     const slotStartIso = slotDate.toISOString();
     const tickResult = this.jobsService.tickRootSlot(slotStartIso);
 
     // 3. Process alarms & expiry
     const nextAlarm = this.jobsService.processAlarms();
+    try {
+      this.ctx.storage.transactionSync(() => {
+        try { (this.sessionControlService as any).processDueWakes?.(); } catch {}
+      });
+    } catch {}
 
     // 4. Schedule next alarm with bounded free usage guard
     if (cleanup.hasMore) {
@@ -1931,6 +1952,9 @@ export class Hub extends DurableObject {
   async alarm() {
     const now = (this.jobsService as any).now ? (this.jobsService as any).now() : new Date();
     this.runTbmTick(now.getTime());
+    // Reuse the existing minute alarm so configured idle delays do not wait
+    // for a root slot. Durable episode/command keys fence duplicate delivery.
+    try { await this.idleWork.tick(); } catch { console.warn('idle_work_tick_failed'); }
     try { this.hostHistoryService.sample(); } catch { console.warn('resource_history_sampling_failed'); }
     const cleanup = this.busService.retentionCleanup(now.getTime(), 100);
     let nextAlarm = this.jobsService.processAlarms();
@@ -1944,6 +1968,11 @@ export class Hub extends DurableObject {
         nextAlarm = current === undefined ? webhookNext : Math.min(current, webhookNext);
       }
     } catch { console.warn('webhook_delivery_pump_failed'); }
+    try {
+      this.ctx.storage.transactionSync(() => {
+        try { (this.sessionControlService as any).processDueWakes?.(); } catch {}
+      });
+    } catch {}
 
     if (cleanup.hasMore) {
       await this.ctx.storage.setAlarm(Date.now() + 1000);

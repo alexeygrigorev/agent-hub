@@ -93,6 +93,11 @@
         <p id="status" role="status" class="dk-muted">Checking session…</p>
       </div>
 
+      <section class="dk-card dk-stack hub-overview-card" aria-labelledby="session-attention-title">
+        <h2 class="hub-overview-card__title" id="session-attention-title">Sessions needing attention</h2>
+        <div id="session-attention" style="overflow-x:auto" aria-live="polite">Checking session attention.</div>
+      </section>
+
       <section class="dk-card dk-stack hub-overview-card" aria-labelledby="resource-management-title">
         <h2 class="hub-overview-card__title" id="resource-management-title">Resource management</h2>
         <div id="resource-management-summary" aria-live="polite">Waiting for host resource measurements.</div>
@@ -215,5 +220,6 @@
 <script src="/vendor/dakit/shell.js"></script>
 <script src="/intake-overview.js"></script>
 <script src="/resource-management.js" defer></script>
+<script src="/idle-attention.js" defer></script>
 </body>
 </html>

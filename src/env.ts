@@ -24,6 +24,7 @@ export interface Env {
   HUB_MACHINE_STALE_S?: string;
   HUB_MACHINE_OFFLINE_S?: string;
   HUB_AGENT_STALL_S?: string;
+  HUB_IDLE_OPEN_AC_NUDGE_MINUTES?: string;
   HUB_HEARTBEAT_STALE_S?: string;
   HUB_LAUNCH_STUCK_S?: string;
 }

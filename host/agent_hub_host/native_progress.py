@@ -29,7 +29,7 @@ def codex_roots(row):
             if entry.get('label') == label and entry.get('provider') in ('codex', 'zai'):
                 base = root() / (label + '-' + entry['revision']) / 'home'
                 roots.extend(base / name / 'sessions' for name in ('.codex', '.zcodex'))
-    elif not profile:
+    elif not profile or profile == 'default':
         roots.extend(Path.home() / name / 'sessions' for name in ('.codex', '.zcodex'))
     return roots
 
@@ -71,6 +71,49 @@ class NativeTranscriptProgress:
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             self.paths.pop(key, None)
         return None
+
+    def goal_status(self, row):
+        """Read only the exact bound rollout, bounded tail, no transcript upload."""
+        if row.get('engine') not in ('codex', 'zcodex'):
+            return None
+        path = self.paths.get((row['id'], row['created_at_ms'])) or self.locate(row)
+        if path is None:
+            return None
+        import re
+        latest = None
+        try:
+            with path.open('rb') as stream:
+                stream.seek(max(0, path.stat().st_size - 262144))
+                for line in stream.read(262144).splitlines():
+                    try:
+                        event = json.loads(line)
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    payload = event.get('payload') or {}
+                    if not isinstance(payload, dict):
+                        continue
+                    status = None
+                    if payload.get('type') == 'thread_goal_updated' or event.get('type') == 'thread_goal_updated':
+                        goal = payload.get('goal') or payload.get('thread_goal') or payload
+                        if isinstance(goal, dict):
+                            status = goal.get('status')
+                    if payload.get('type') == 'function_call':
+                        name, arguments = str(payload.get('name') or ''), payload.get('arguments')
+                        if name.split('.')[-1] == 'update_goal':
+                            try:
+                                value = json.loads(arguments) if isinstance(arguments, str) else arguments
+                                status = value.get('status') if isinstance(value, dict) else None
+                            except ValueError:
+                                pass
+                        elif name.split('.')[-1] == 'exec' and isinstance(arguments, str):
+                            matches = re.findall(r'\btools\.update_goal\(\s*\{\s*status\s*:\s*[\"\'](blocked|paused|stalled|active|complete)[\"\']', arguments)
+                            if matches:
+                                status = matches[-1]
+                    if status in ('blocked', 'paused', 'stalled', 'active', 'complete'):
+                        latest = status
+        except (OSError, ValueError, TypeError):
+            return None
+        return latest
 
     def opencode_progress(self, row):
         """Native message events only, never database/global session mtime."""

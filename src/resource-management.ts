@@ -1,3 +1,4 @@
+import { openWorkPreventsIdleReap } from './intake-session';
 /** Live host admission and durable per-session usage; token usage joins by native identity. */
 import type { SqlStorage } from '@cloudflare/workers-types';
 import defaults from '../config/resource-management.json';
@@ -440,8 +441,18 @@ export class ResourceManagement {
         terminal:Number(TERMINAL.has(session.state)),at:Date.parse(session.finished_at || session.started_at)};
     }).sort((a,b)=>a.terminal-b.terminal || b.at-a.at).map(row=>row.session);
   }
+  private idleReapAllowed(session: any): boolean {
+    try {
+      const rows: any[] = this.sql.exec(`SELECT * FROM session_control_sessions WHERE id=? OR
+        (machine_id=? AND json_extract(binding_json,'$.native_id')=?)`, session.session_id,session.machine_id,session.native_id).toArray();
+      if (rows.some(row => openWorkPreventsIdleReap(this.sql,row,this.now()))) return false;
+      return rows.length > 0 || !session.intake_id;
+    } catch { return false; } // corrupt/missing authority is never reap permission
+  }
   sessions(machine?: string) {
-    return this.canonicalSessions(machine).slice(0,1000).map(({aliases,...session})=>session);
+    return this.canonicalSessions(machine).slice(0,1000).map(({aliases,...session}) => {
+      return { ...session, idle_reap_allowed: this.idleReapAllowed(session) };
+    });
   }
   private note(session: any, key: string, text: string) {
     if (!session.intake_id) throw new Error('intake_required');
@@ -453,7 +464,7 @@ export class ResourceManagement {
 
   evidence(machine: string, value: any) {
     const session = this.sessions(machine).find(s => s.session_id===value.session_id && s.native_id===value.native_id);
-    if (!session?.managed || session.keep || !session.intake_id) throw new Error('session_not_reapable');
+    if (!session?.managed || session.keep || (value.reason === 'idle' && !session.idle_reap_allowed) || !session.intake_id) throw new Error('session_not_reapable');
     if (value.reason === 'terminal' && !TERMINAL.has(session.state)) throw new Error('session_not_reapable');
     if (!['idle','terminal','dead_pid'].includes(value.reason) || typeof value.id!=='string' || !/^[\w:-]{1,128}$/.test(value.id)
       || typeof value.output!=='string' || new TextEncoder().encode(value.output).byteLength > 6000) throw new Error('invalid_evidence');
@@ -510,7 +521,7 @@ export class ResourceManagement {
     for (const reap of value.reaps) {
       const session=sessions.get(reap.session_id);
       const evidence: any = this.sql.exec('SELECT * FROM resource_evidence WHERE id=?',reap.evidence_id ?? '').toArray()[0];
-      if (!session?.managed || session.keep || !evidence || evidence.session_id!==session.session_id || evidence.native_id!==reap.native_id || evidence.reason!==reap.reason || reap.stopped!==true || (reap.freed_mb!==null && !finite(reap.freed_mb))
+      if (!session?.managed || session.keep || (reap.reason === 'idle' && !this.idleReapAllowed(session)) || !evidence || evidence.session_id!==session.session_id || evidence.native_id!==reap.native_id || evidence.reason!==reap.reason || reap.stopped!==true || (reap.freed_mb!==null && !finite(reap.freed_mb))
         || reap.freed_mb>1e9 || Date.parse(reap.at)>this.now()+30000 || Date.parse(reap.at)<Date.parse(evidence.saved_at)-1000
         || typeof reap.id!=='string' || !/^[\w:-]{1,128}$/.test(reap.id) || !Number.isFinite(Date.parse(reap.at))) throw new Error('invalid_reap');
       const prior:any=this.sql.exec('SELECT * FROM resource_reaps WHERE id=?',reap.id).toArray()[0];

@@ -18,6 +18,7 @@ class SessionProgressTests(unittest.TestCase):
                                 'engine': 'opencode', 'incarnation': 1000}}
 
     def sampler(self, **kwargs):
+        kwargs.setdefault('can_reap', lambda row: True)  # explicit unlinked fixture authority
         return SessionProgress(now_ms=lambda: self.clock, output=lambda _: None, **kwargs)
 
     def test_only_provider_events_count_not_terminal_activity(self):

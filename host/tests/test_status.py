@@ -30,6 +30,12 @@ FIXTURE_DTO = {
 
 
 class TestStatusCli(unittest.TestCase):
+    def test_idle_attention_retains_all_fields_in_human_status(self):
+        detail = 'idle_with_open_ac; intake_id=intake-fixture; idle_for=1801s; last_activity_at=2026-10-27T07:00:00Z; last_nudge=2026-10-27T07:30:00Z'
+        rendered = status.render_human(dict(FIXTURE_DTO,needs_attention=[dict(severity='warn',subject='session:owned-fixture',detail=detail)]))
+        self.assertIn('session:owned-fixture',rendered)
+        self.assertIn(detail,rendered)
+
     def run_cli(self, *args):
         output, error = io.StringIO(), io.StringIO()
         with patch('sys.argv', ['hub', *args]), patch('sys.stdout', output), patch('sys.stderr', error):

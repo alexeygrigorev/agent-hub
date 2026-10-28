@@ -170,11 +170,13 @@ export function recordIntakeSessionLink(sql: SqlStorage, session: Obj, now: numb
   const task = JSON.parse(rows[0].data);
   if (task.history.some((e: Obj) => ['link', 'session'].includes(e.kind) && e.hub_session_id === session.id)) return false;
   if (task.history.length >= INTAKE_LIMITS.events) throw new IntakeSessionLinkError('history_capacity');
+  const binding = JSON.parse(session.binding_json || '{}');
+  const observed = request.provenance === 'observed_native';
   task.history.push({ id: crypto.randomUUID(), kind: 'link', hub_session_id: session.id,
-    native_id: null, engine: session.engine ?? request.engine ?? null, tier: request.tier ?? null,
+    native_id: observed ? binding.native_id ?? null : null, engine: session.engine ?? request.engine ?? null, tier: request.tier ?? null,
     host: session.machine_id ?? null, hub: null, routing_job_id: null,
-    provenance: { type: 'hub_launch_verified', reference: session.id, timestamp: session.created_at },
-    evidence: 'hub_launch_verified', authority: 'hub_launch_verified', actor: session.actor,
+    provenance: { type: observed ? 'observed_native' : 'hub_launch_verified', reference: session.id, timestamp: session.created_at },
+    evidence: observed ? 'observed_native' : 'hub_launch_verified', authority: observed ? 'untrusted_task_data' : 'hub_launch_verified', actor: session.actor,
     captured_at: now, intake_key: session.request_key,
     ...(session.state === 'held' && hold !== undefined ? { assignment_hold: hold } : {}) });
   task.version++; task.updated_at = now;

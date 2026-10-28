@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 from pathlib import Path
 import time
 
@@ -61,12 +62,13 @@ def owned_headless(row, records):
 
 
 class SessionProgress:
-    def __init__(self, *, now_ms=lambda: int(time.time() * 1000), proc_root=Path('/proc'), output=None, stop=None, state_path=None, screen=None):
+    def __init__(self, *, now_ms=lambda: int(time.time() * 1000), proc_root=Path('/proc'), output=None, stop=None, state_path=None, screen=None, can_reap=None):
         from .native_progress import NativeTranscriptProgress
         self.now_ms, self.proc_root, self.stop = now_ms, proc_root, stop
         self.output = output or NativeTranscriptProgress(proc_root=proc_root)
         self.state_path = Path(state_path) if state_path else None
         self.samples = {}
+        self.can_reap = can_reap or (lambda row: False)
         self.screen = screen
         self.screen_checks = {}
         if self.state_path:
@@ -128,7 +130,7 @@ class SessionProgress:
             cleanup = previous.get('cleanup', 'none')
             # Require a live leader observed by this monitor first. Existing
             # sessions discovered already orphaned are reported, never killed.
-            if orphan and owned and previous.get('seen_alive') and not previous.get('attempted') and self.stop and not cleanup_attempted:
+            if orphan and owned and previous.get('seen_alive') and not previous.get('attempted') and self.stop and not cleanup_attempted and self.can_reap(row):
                 cleanup_attempted = True
                 previous['attempted'] = True
                 # Persist the attempt before any effect; a restart must never
@@ -147,6 +149,14 @@ class SessionProgress:
             result[sid] = {'last_progress_at': dt.datetime.fromtimestamp(min(last, now) / 1000, dt.timezone.utc).isoformat().replace('+00:00', 'Z'),
                            'headless': headless, 'agent_alive': alive if headless else None,
                            'orphaned': self.samples[key]['orphaned'], 'cleanup': cleanup}
+            if output is not None:
+                result[sid]['sampled_at'] = dt.datetime.fromtimestamp(now / 1000, dt.timezone.utc).isoformat().replace('+00:00', 'Z')
+        if hasattr(self.output, 'goal_status'):
+            for row in rows[:500]:
+                if row.get('id') in result:
+                    goal = self.output.goal_status(row)
+                    if goal:
+                        result[row['id']]['goal_status'] = goal
         self.sample_screens(rows[:500], result, now)
         self.samples = {k: v for k, v in self.samples.items() if k in live}
         self.screen_checks = {k: v for k, v in self.screen_checks.items() if k in live}
@@ -164,7 +174,6 @@ class SessionProgress:
             key = (row.get('id'), row.get('created_at_ms'))
             progress = result.get(row.get('id'))
             if (not self.screen or not progress or row.get('engine') != 'codex' or progress['headless']
-                    or not row.get('tag', '').startswith('hub-')
                     or (row.get('state') or row.get('phase')) in ('exited', 'dead', 'pruned', 'forgotten', 'stopped', 'unobserved', 'unknown')
                     or now - self.samples[key]['last'] < 60000):
                 continue
@@ -174,12 +183,19 @@ class SessionProgress:
                     continue
                 from .codex_interactive import reconnect_failure
                 try:
-                    cached = 'codex_reconnect_failed' if reconnect_failure(self.screen(row)) else None
+                    screen = self.screen(row)
+                    footer = '\n'.join(screen.splitlines()[-8:]) if isinstance(screen, str) else ''
+                    stalled_marker = re.search(r'Goal stalled\s*\(/goal resume\)\s*$', footer)
+                    cached = 'codex_reconnect_failed' if reconnect_failure(screen) else ('goal_stalled' if stalled_marker else None)
                 except Exception:
                     cached = None
                 self.screen_checks[key] = (now, cached)
             if cached and now - self.screen_checks[key][0] < 60000:
-                progress['terminal_error'] = cached
+                progress['sampled_at'] = dt.datetime.fromtimestamp(self.screen_checks[key][0] / 1000, dt.timezone.utc).isoformat().replace('+00:00', 'Z')
+                if cached == 'goal_stalled':
+                    progress['goal_status'] = 'stalled'
+                else:
+                    progress['terminal_error'] = cached
 
 
 def stop_orphan(executable, row):
@@ -188,3 +204,16 @@ def stop_orphan(executable, row):
     target = NativeTarget(session_id=row['id'], tag=row['tag'], workspace=row['workspace'],
                           created_at_ms=row['created_at_ms'], engine=row['engine'])
     return stop_session(executable, target, grace_ms=1000).state == 'stopped'
+
+
+def orphan_reap_allowed(request, row):
+    """Require fresh Hub open-work permission and the exact native incarnation."""
+    try:
+        entries = request('GET', '/api/fleet/resources/watchdog').get('sessions', [])
+        return any(e.get('idle_reap_allowed') is True and e.get('managed') is True
+                   and not e.get('keep') and e.get('native_id') == row.get('id')
+                   and e.get('native_created_at_ms') == row.get('created_at_ms')
+                   and e.get('tag') == row.get('tag') and e.get('workspace') == row.get('workspace')
+                   for e in entries if isinstance(e, dict))
+    except Exception:
+        return False

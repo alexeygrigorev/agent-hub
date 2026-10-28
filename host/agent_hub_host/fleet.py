@@ -3072,11 +3072,12 @@ class Dispatcher:
         this helper never launches anything.
         """
         raw = self.runner([self.settings.get("aplexer_bin", "aplexer"), "list", "--all", "--json"])
-        from .session_progress import SessionProgress, stop_orphan
+        from .session_progress import SessionProgress, stop_orphan, orphan_reap_allowed
         if not hasattr(self, '_session_progress'):
             from .native_progress import NativeTranscriptProgress
             from .codex_interactive import current_screen
             self._session_progress = SessionProgress(stop=lambda row: stop_orphan(self.settings.get('aplexer_bin', 'aplexer'), row),
+                can_reap=lambda row: orphan_reap_allowed(self.request, row),
                 output=NativeTranscriptProgress(opencode_data=self.settings.get('opencode_auth', {}).get('target_data')),
                 screen=lambda row: current_screen(self.settings.get('aplexer_bin', 'aplexer'), row),
                 state_path=Path(self.journal_dir) / 'session-progress.json' if self.journal_dir else None)

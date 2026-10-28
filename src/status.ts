@@ -206,6 +206,9 @@ export class StatusService {
 
   /** Operator-only canonical check alerts; agent task grants do not grant
    * visibility into other actors' monitoring details. No second check loop. */
+  private sessionAttention: () => Obj[] = () => [];
+  setSessionAttention(provider: () => Obj[]) { this.sessionAttention = provider; }
+
   private needsAttention(admin: boolean, measured: Obj[], intakeWarn: Obj | null = null): Obj[] {
     const intakeItems: Obj[] = intakeWarn ? [{
       severity: 'warn',
@@ -235,8 +238,18 @@ export class StatusService {
         });
       }
     } catch { /* optional operator_notices table */ }
+    if (admin) {
+      try {
+        const wakes = this.sql.exec(`SELECT a.* FROM session_control_wake_alerts a
+          JOIN session_control_wakes w ON w.id=a.wake_id WHERE w.state='missed'
+          ORDER BY a.created_at DESC LIMIT 64`).toArray() as any[];
+        for (const w of wakes) noticeItems.push({ severity: 'error', subject: 'missed_wake:' + w.wake_id,
+          title: 'Scheduled session wake missed', detail: w.detail, session_id: w.session_id,
+          intake_task_id: w.intake_task_id, opened_at: w.created_at, source: 'session_control_wakes', scope: 'hub' });
+      } catch { /* wakes are additive */ }
+    }
     const storageWarning = admin ? this.intake.storageWarning() : null;
-    const base = [...intakeItems, ...(storageWarning ? [storageWarning] : []), ...noticeItems, ...measured];
+    const base = [...(admin ? this.sessionAttention() : []), ...intakeItems, ...(storageWarning ? [storageWarning] : []), ...noticeItems, ...measured];
     if (!admin) return base;
     let rows: any[];
     try {
@@ -1200,10 +1213,18 @@ export class StatusService {
       const hostStale = machineId ? (machine ? this.isStaleHost(machine, now) : true) : false;
       const live = lifecycleBySession.get(e.hub_session_id);
       const nativeId = binding && typeof (binding as any).native_id === 'string' ? (binding as any).native_id : null;
+      let waitingUntil: string | null = null;
+      if (row.state === 'running') {
+        try {
+          const wake: any = this.sql.exec("SELECT wake_at FROM session_control_wakes WHERE session_id=? AND state='pending' AND wake_at_ms>? ORDER BY wake_at_ms LIMIT 1", row.id, now).toArray()[0];
+          waitingUntil = wake?.wake_at ?? null;
+        } catch { /* wakes are additive */ }
+      }
       out.push({
         hub_session_id: e.hub_session_id,
         linkage: 'hub_session',
-        state: row.state ?? null,
+        state: waitingUntil ? 'waiting_until' : row.state ?? null,
+        ...(waitingUntil ? { waiting_until: waitingUntil } : {}),
         machine: machineId,
         engine: row.engine ?? null,
         mode: row.mode ?? null,

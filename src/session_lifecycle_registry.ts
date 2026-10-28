@@ -528,6 +528,12 @@ export function buildLifecycleView(
     active: [],
     unknown: [],
   } as Record<LifecycleGroup, Record<string, unknown>[]>;
+  const wakes = new Map<string, string>();
+  try {
+    for (const w of sql.exec("SELECT session_id,MIN(wake_at_ms) AS at FROM session_control_wakes WHERE state='pending' AND wake_at_ms>? GROUP BY session_id", now).toArray() as any[]) {
+      wakes.set(w.session_id, new Date(w.at).toISOString());
+    }
+  } catch { /* optional scheduled-wake schema */ }
   const enrich = (entry: ClassifiedSession): Record<string, unknown> => {
     const dto = toStatusDto(entry) as Record<string, unknown>;
     const ref = refs.get(entry.session_key) ?? null;
@@ -535,7 +541,8 @@ export function buildLifecycleView(
     if (latest && entry.group === 'limit_blocked') {
       (dto.reasons as string[]).push(`decision:${latest.kind} by ${latest.actor} at ${latest.created_at}: ${latest.reason}`);
     }
-    return { ...dto, refs: ref, decision: latest };
+    const waitingUntil = ref?.hub_state === 'running' && ref.session_id ? wakes.get(ref.session_id) : null;
+    return { ...dto, ...(waitingUntil ? { state: 'waiting_until', waiting_until: waitingUntil } : {}), refs: ref, decision: latest };
   };
   for (const group of Object.keys(projection.groups) as LifecycleGroup[]) {
     groups[group] = projection.groups[group].map(enrich);
