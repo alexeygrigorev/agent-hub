@@ -37,7 +37,6 @@ from .status_collect import MAX_HEADLINE, sanitize
 
 MAX_OUTPUT = 8192
 DEFAULT_TIMEOUT_S = 30
-DEFAULT_REF_MAX_AGE_S = 3600
 MAX_PROBES = 50
 CF_API_BASE = 'https://api.cloudflare.com/client/v4/'
 MAX_CF_BODY = 1024 * 1024
@@ -288,7 +287,7 @@ def _parse_sha(text: str) -> str | None:
     return None
 
 
-def build_git_ancestry(repo: str, sha: str, ref: str, ref_max_age_s: int,
+def build_git_ancestry(repo: str, sha: str, ref: str,
                        runner: Callable | None = None,
                        timeout_s: int = DEFAULT_TIMEOUT_S) -> dict:
     """Local ancestry facts with FRESH remote verification (no commit-time proxy).
@@ -298,9 +297,7 @@ def build_git_ancestry(repo: str, sha: str, ref: str, ref_max_age_s: int,
     refs/heads/main``. A perfectly current remote with an old commit stays
     fresh (SHA equality is freshness); a stale local ref with a recent commit
     never counts. Network/parse failures fail closed to unknown.
-    ``ref_max_age_s`` is retained for ABI compatibility and ignored.
     """
-    _ = ref_max_age_s
     provenance = {'tool': 'git', 'repo': repo, 'sha': sha, 'ref': ref}
     head = run_argv(['git', 'rev-parse', 'HEAD'], repo, timeout_s, runner)
     if head['exit'] != 0:
@@ -1329,7 +1326,6 @@ def collect_probes(spec: dict, runner: Callable | None = None,
                 continue
             evidence = build_git_ancestry(str(cwd), sha.lower(),
                                           str(probe.get('ref') or 'origin/main'),
-                                          int(probe.get('ref_max_age_s', DEFAULT_REF_MAX_AGE_S)),
                                           runner, timeout_s)
             payload = {'sha': evidence['sha'], 'ancestry': evidence['ancestry']}
             if evidence.get('ref'):

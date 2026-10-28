@@ -95,7 +95,7 @@ class TestGitAncestry(unittest.TestCase):
         return fake_runner(mapping)
 
     def test_merged_only_with_fresh_ref(self):
-        evidence = status_probe.build_git_ancestry('/repo', SHA_A, 'origin/main', 3600,
+        evidence = status_probe.build_git_ancestry('/repo', SHA_A, 'origin/main',
                                                    self.repo_runner(SHA_A, SHA_B, SHA_B, 0))
         self.assertEqual(evidence['ancestry'], 'merged_in_main')
         self.assertEqual(evidence['sha'], SHA_A)
@@ -104,23 +104,23 @@ class TestGitAncestry(unittest.TestCase):
     def test_old_commit_with_current_remote_stays_fresh(self):
         # Commit-time proxy bug: an old commit on a perfectly current remote
         # must NOT go stale. Freshness is exact SHA equality.
-        evidence = status_probe.build_git_ancestry('/repo', SHA_A, 'origin/main', 60,
+        evidence = status_probe.build_git_ancestry('/repo', SHA_A, 'origin/main',
                                                    self.repo_runner(SHA_A, SHA_B, SHA_B, 0))
         self.assertEqual(evidence['ancestry'], 'merged_in_main')
 
     def test_not_merged(self):
-        evidence = status_probe.build_git_ancestry('/repo', SHA_A, 'origin/main', 3600,
+        evidence = status_probe.build_git_ancestry('/repo', SHA_A, 'origin/main',
                                                    self.repo_runner(SHA_A, SHA_B, SHA_B, 1))
         self.assertEqual(evidence['ancestry'], 'not_merged')
 
     def test_stale_ref_fails_closed_to_unknown(self):
-        evidence = status_probe.build_git_ancestry('/repo', SHA_A, 'origin/main', 3600,
+        evidence = status_probe.build_git_ancestry('/repo', SHA_A, 'origin/main',
                                                    self.repo_runner(SHA_A, SHA_B, SHA_A, 0))
         self.assertEqual(evidence['ancestry'], 'unknown')
         self.assertEqual(evidence['reason'], 'stale_ref_fails_closed')
 
     def test_network_unknown_fails_closed(self):
-        evidence = status_probe.build_git_ancestry('/repo', SHA_A, 'origin/main', 3600,
+        evidence = status_probe.build_git_ancestry('/repo', SHA_A, 'origin/main',
                                                    self.repo_runner(SHA_A, SHA_B, '', 0, remote_exit=128))
         self.assertEqual(evidence['ancestry'], 'unknown')
         self.assertEqual(evidence['reason'], 'network_unknown_fails_closed')
@@ -130,7 +130,7 @@ class TestGitAncestry(unittest.TestCase):
             ('git', 'rev-parse', 'HEAD'): (0, SHA_A + '\n'),
             ('git', 'rev-parse', 'origin/main'): (128, 'unknown revision'),
         })
-        evidence = status_probe.build_git_ancestry('/repo', SHA_A, 'origin/main', 3600, runner)
+        evidence = status_probe.build_git_ancestry('/repo', SHA_A, 'origin/main', runner)
         self.assertEqual(evidence['ancestry'], 'unknown')
 
 
@@ -166,14 +166,14 @@ class TestRealGitFixtures(unittest.TestCase):
         self.git('push', '-u', 'origin', 'main')
         head = self.git('rev-parse', 'HEAD')
         self.assertRegex(head, r'^[0-9a-f]{40}$')
-        evidence = status_probe.build_git_ancestry(self.repo, head, 'origin/main', 3600)
+        evidence = status_probe.build_git_ancestry(self.repo, head, 'origin/main')
         self.assertEqual(evidence['ancestry'], 'merged_in_main')
         self.git('checkout', '-b', 'side')
         (Path(self.repo) / 'g.txt').write_text('two', encoding='utf-8')
         self.git('add', 'g.txt')
         self.git('commit', '-m', 'side')
         side = self.git('rev-parse', 'HEAD')
-        evidence = status_probe.build_git_ancestry(self.repo, side, 'origin/main', 3600)
+        evidence = status_probe.build_git_ancestry(self.repo, side, 'origin/main')
         self.assertEqual(evidence['ancestry'], 'not_merged')
 
 
