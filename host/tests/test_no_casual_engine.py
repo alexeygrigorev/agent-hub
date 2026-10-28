@@ -132,6 +132,23 @@ class TestNoCasualEngine(unittest.TestCase):
         human_text = status.render_human(status_data)
         self.assertIn('agents: running=3 idle=2 waiting=1 (waiting-confirmation=1)', human_text)
 
+    def _guarded_cleanup_service(self, watchdog_sessions=()):
+        """Dispatcher whose guard facts are stubbed: no locks, no live sessions.
+
+        Worktree-guard (intake a0f01448): _maybe_cleanup_worktree only acts on
+        fresh positive evidence — an unlocked tree, no live native session
+        referencing it, and a watchdog snapshot row with a terminal state and a
+        closed linked intake. The stubs here provide exactly that evidence so
+        the delegation itself stays testable without real git/aplexer/HTTP.
+        """
+        service = Dispatcher(settings={
+            'cleanup_roots': ['/tmp/worktrees'],
+            'machine_id': 'm1',
+            'journal_dir': '/tmp/journal',
+        })
+        service.request = lambda method, path, body=None: {'sessions': list(watchdog_sessions)}
+        return service
+
     def test_headless_auto_cleanup_worktree_safety(self):
         # 1. Without cleanup_roots, _maybe_cleanup_worktree is a no-op
         service = Dispatcher(settings={'cleanup_roots': []})
@@ -139,20 +156,71 @@ class TestNoCasualEngine(unittest.TestCase):
             service._maybe_cleanup_worktree(Path('/some/path'), 'native-1')
             mock_cleanup.assert_not_called()
 
-        # 2. With cleanup_roots configured, delegates to remove_owned_worktree with stop_confirmed=True
-        service = Dispatcher(settings={
-            'cleanup_roots': ['/tmp/worktrees'],
-            'machine_id': 'm1',
-            'journal_dir': '/tmp/journal',
-        })
-        with patch('agent_hub_host.session_cleanup.remove_owned_worktree') as mock_cleanup, \
-             patch('pathlib.Path.mkdir'):
-            service._maybe_cleanup_worktree(Path('/tmp/worktrees/wt-task-1'), 'task-native-1')
-            mock_cleanup.assert_called_once()
-            call_kwargs = mock_cleanup.call_args.kwargs
-            self.assertEqual(call_kwargs['native_id'], 'task-native-1')
-            self.assertTrue(call_kwargs['stop_confirmed'])
-            self.assertEqual(call_kwargs['cleanup_roots'], ['/tmp/worktrees'])
+        # 2. With cleanup_roots and full guard evidence (unlocked, no live
+        # session, watchdog row terminal with closed intake), delegates to
+        # remove_owned_worktree with stop_confirmed=True.
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td) / 'wt-task-1'
+            service = self._guarded_cleanup_service(watchdog_sessions=[{
+                'native_id': 'task-native-1', 'workspace': str(ws.resolve()),
+                'linked_intake_open': False, 'state': 'stopped'}])
+            with patch('agent_hub_host.session_cleanup.remove_owned_worktree') as mock_cleanup, \
+                 patch('pathlib.Path.mkdir'), \
+                 patch('agent_hub_host.worktree_guard.is_locked', return_value=False), \
+                 patch('agent_hub_host.native_sessions.list_sessions', return_value=[]):
+                service._maybe_cleanup_worktree(ws, 'task-native-1')
+                mock_cleanup.assert_called_once()
+                call_kwargs = mock_cleanup.call_args.kwargs
+                self.assertEqual(call_kwargs['native_id'], 'task-native-1')
+                self.assertTrue(call_kwargs['stop_confirmed'])
+                self.assertEqual(call_kwargs['cleanup_roots'], ['/tmp/worktrees'])
+
+    def test_headless_auto_cleanup_skips_locked_worktree(self):
+        # AC2: a Hub-locked tree is never auto-cleaned, even with terminal evidence.
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td) / 'wt-task-1'
+            service = self._guarded_cleanup_service(watchdog_sessions=[{
+                'native_id': 'task-native-1', 'workspace': str(ws.resolve()),
+                'linked_intake_open': False, 'state': 'stopped'}])
+            with patch('agent_hub_host.session_cleanup.remove_owned_worktree') as mock_cleanup, \
+                 patch('agent_hub_host.worktree_guard.is_locked', return_value=True):
+                service._maybe_cleanup_worktree(ws, 'task-native-1')
+                mock_cleanup.assert_not_called()
+
+    def test_headless_auto_cleanup_skips_live_session_worktree(self):
+        # AC2: a tree still referenced by a live native session is never auto-cleaned.
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td) / 'wt-task-1'
+            live = MagicMock()
+            live.phase = 'running'
+            live.workspace = str(ws.resolve())
+            live.cwd = None
+            service = self._guarded_cleanup_service(watchdog_sessions=[{
+                'native_id': 'task-native-1', 'workspace': str(ws.resolve()),
+                'linked_intake_open': False, 'state': 'stopped'}])
+            with patch('agent_hub_host.session_cleanup.remove_owned_worktree') as mock_cleanup, \
+                 patch('agent_hub_host.worktree_guard.is_locked', return_value=False), \
+                 patch('agent_hub_host.native_sessions.list_sessions', return_value=[live]):
+                service._maybe_cleanup_worktree(ws, 'task-native-1')
+                mock_cleanup.assert_not_called()
+
+    def test_headless_auto_cleanup_requires_released_intake(self):
+        # AC2: without a watchdog row proving terminal state AND closed intake,
+        # the owned cleanup does not run (missing evidence keeps the tree).
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td) / 'wt-task-1'
+            for row in ({'native_id': 'task-native-1', 'workspace': str(ws.resolve()),
+                         'linked_intake_open': True, 'state': 'stopped'},
+                        {'native_id': 'task-native-1', 'workspace': str(ws.resolve()),
+                         'linked_intake_open': False, 'state': 'running'},
+                        {'native_id': 'other-native', 'workspace': str(ws.resolve()),
+                         'linked_intake_open': False, 'state': 'stopped'}):
+                service = self._guarded_cleanup_service(watchdog_sessions=[row])
+                with patch('agent_hub_host.session_cleanup.remove_owned_worktree') as mock_cleanup, \
+                     patch('agent_hub_host.worktree_guard.is_locked', return_value=False), \
+                     patch('agent_hub_host.native_sessions.list_sessions', return_value=[]):
+                    service._maybe_cleanup_worktree(ws, 'task-native-1')
+                    mock_cleanup.assert_not_called()
 
 
 if __name__ == '__main__':
