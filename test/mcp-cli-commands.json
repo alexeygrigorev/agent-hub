@@ -81,6 +81,7 @@
   "send",
   "sessions",
   "sessions ack",
+  "sessions audit",
   "sessions cancel",
   "sessions capture",
   "sessions cleanup",

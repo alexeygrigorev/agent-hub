@@ -102,6 +102,7 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'repos seed': 'Local-only parser reads the private project map and submits bounded seed batches.',
   'repos refresh': 'Local-only scanner invokes git/gh on host directories; MCP cannot scan the host filesystem.',
   'sessions warnings': 'Long-running warning display is CLI-only by product scope.',
+  'sessions audit': 'Idle-audit action log and manual run are operator oversight; the Hub scheduler owns execution and the sessions UI plus hub sessions audit CLI own the display.',
   'sessions ack': 'Long-running warning snooze is CLI-only by product scope.',
   'sessions events': 'Warning acknowledgement history is CLI-only by product scope.',
   'engines add': 'Operator credential import reads private native files; never expose provider credentials through model tools.',
