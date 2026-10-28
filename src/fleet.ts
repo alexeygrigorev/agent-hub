@@ -169,6 +169,9 @@ export function isCapacityOnlyHold(rejected: unknown): rejected is { machine: st
   return capacity;
 }
 const HEADERS = { 'Cache-Control': 'private, no-store' };
+export function overflowMachine(machine: any, needs: string[]): boolean {
+  return String(machine?.os ?? '').trim().toLowerCase() === 'windows' && !needs.includes('os:windows');
+}
 function response(value: unknown, status = 200) { return Response.json(value, { status, headers: HEADERS }); }
 function label(value: unknown): value is string { return typeof value === 'string' && LABEL.test(value); }
 /** Absolute POSIX workspace identifiers, accepted ALONGSIDE existing labels.
@@ -954,10 +957,15 @@ export class FleetService {
         (p.reset_at_ms - this.now()) / 3600000))) : 1;
       const tbm_weight = request.mode === 'interactive' ? 1 : tbm.pacing * tbm.banked * (tbm.efficiency ?? 1) * urgency;
       const score = (account!.remaining_percent! / 100) / (1 + (hb.cpu_usage?.busy_cores ?? caps.cpu_count) / caps.cpu_count + pending) * tbm_weight;
+      // Windows hosts are overflow for work that does not ask for Windows:
+      // agent tooling assumes Linux, so they win only when every Linux route
+      // is held (loaded, capped or quota-limited). Pinned and os:windows
+      // requests are unaffected (intake a3227276 AC3).
+      const overflow = overflowMachine(machine, needs);
       candidates.push({ machine: route.machine_id, engine: route.engine, account: route.account, profile: route.profile,
-        ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal'), selection: model, score, workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency } });
+        ...this.resources.cpuEstimate(request.project || request.workspace,request.task_kind || 'goal'), selection: model, score, workspace: effectiveWorkspace, tbm_weight, tbm: { ...tbm, urgency }, ...(overflow ? { overflow: true } : {}) });
     }
-    candidates.sort((a, b) => b.score - a.score || a.machine.localeCompare(b.machine) || a.engine.localeCompare(b.engine));
+    candidates.sort((a, b) => Number(!!a.overflow) - Number(!!b.overflow) || b.score - a.score || a.machine.localeCompare(b.machine) || a.engine.localeCompare(b.engine));
     // The stored intent carries the winner's normalized workspace: a bare
     // label that resolved under the selected host's root is persisted and
     // offered as the absolute path the host accepts. Labels that were
