@@ -33,9 +33,9 @@ tool('sessions_cancel', 'POST', '/api/sessions/{id}/cancel', 'Cancel an owned he
 tool('sessions_protect', 'POST', '/api/sessions/{id}/protect', 'Permanently protect an owned session from automated cleanup. payload: key. No unprotect or native effect. Exact current owner credential family is required.', ['sessions protect']);
 tool('sessions_cleanup', 'POST', '/api/sessions/cleanup', 'DESTRUCTIVE when dry_run=false: plan/apply cleanup through existing custody guards. Explicit payload dry_run=true for a preview.', ['sessions cleanup']);
 tool('sessions_observe', 'POST', '/api/sessions/observations', 'Host-only lifecycle observation; ownership remains server validated.', ['sessions observe']);
-for (const action of ['send', 'reply']) tool(`bus_${action}`, 'POST', `/api/bus/${action}`, 'DESTRUCTIVE: send a durable message using payload from_actor, to_actor, kind, body, idempotency_key and optional thread_id, reply_to, lease_epoch.', [action]);
-tool('bus_inbox', 'GET', '/api/bus/inbox', 'Inbox query: actor, limit, cursor.', ['inbox']);
-tool('bus_show', 'GET', '/api/bus/messages/{id}', 'Read a message.', ['show']);
+for (const action of ['send', 'reply']) tool(`bus_${action}`, 'POST', `/api/bus/${action}`, 'DESTRUCTIVE: send a durable message using payload from_actor, to_actor, kind, body, idempotency_key and optional thread_id, reply_to, lease_epoch' + (action === 'send' ? '; to_actor session:<id> or tag@machine types into a session on any host' : '') + '.', action === 'send' ? [action, 'msg send'] : [action, 'msg reply']);
+tool('bus_inbox', 'GET', '/api/bus/inbox', 'Inbox query: actor, limit, cursor.', ['inbox', 'msg inbox']);
+tool('bus_show', 'GET', '/api/bus/messages/{id}', 'Read a message and its delivery state.', ['show', 'msg show', 'msg status']);
 for (const stage of ['ack', 'accept', 'complete']) tool(`bus_${stage}`, 'POST', `/api/bus/messages/{id}/${stage}`, `Explicitly ${stage} a message; optional payload lease_epoch.`, [stage]);
 tool('claims_list', 'GET', '/api/bus/claims', 'Claims query: project, holder, all.', ['claims']);
 tool('bus_activity', 'GET', '/api/bus/activity', 'Work-activity visibility: active claims plus recent bus messages for a workspace, project, holder or actor. Query: workspace, project, holder, actor, limit, all. Read-only; shows whether someone is already on this before starting overlapping work.', ['activity']);
@@ -88,6 +88,9 @@ tool('monitoring_health', 'GET', '/api/monitoring/health', 'Authorized host heal
 tool('accounts_write', 'PUT', '/api/fleet/accounts', 'Operator-only account registry update.');
 export const MCP_ROUTES = routes;
 export const CLI_EXCLUSIONS: Record<string, string> = {
+  'host-release': 'Operator release pin for a checkout-installed host; deliberate CLI step, not an agent tool.',
+  'msg agent-credential': 'Writes a new private local credential file; MCP cannot write host files.',
+  'msg whoami': 'Reports the local CLI identity source; MCP callers are identified by their own login.',
   'repos seed': 'Local-only parser reads the private project map and submits bounded seed batches.',
   'repos refresh': 'Local-only scanner invokes git/gh on host directories; MCP cannot scan the host filesystem.',
   'sessions warnings': 'Long-running warning display is CLI-only by product scope.',
