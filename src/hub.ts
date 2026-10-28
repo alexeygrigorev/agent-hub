@@ -3132,12 +3132,11 @@ export class Hub extends DurableObject {
     }
     const isJobsPath = path.startsWith('/api/jobs');
     const isRootPath = path.startsWith('/api/root');
-    const isHostOffers = path === '/api/host/offers';
 
-    if (!isJobsPath && !isRootPath && !isHostOffers) return null;
+    if (!isJobsPath && !isRootPath) return null;
 
-    // 1. GET /api/jobs/offers or GET /api/host/offers
-    if (path === '/api/jobs/offers' || path === '/api/host/offers') {
+    // 1. GET /api/jobs/offers
+    if (path === '/api/jobs/offers') {
       if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
       const auth = await this.authenticateBusRequest(request);
       if (auth.error) return auth.error;

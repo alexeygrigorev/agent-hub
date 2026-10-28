@@ -30,7 +30,7 @@ creates offers and claims: there is no flag-check race window.
   - root lease takeovers, and root-run START transitions (claimed -> running).
 - **Frozen while disabled:** a root-run job that was already offered stays
   `offered` (no offer expiry, no re-offer to another host) and is hidden from
-  `GET /api/jobs/offers`, `GET /api/host/offers` and `POST /api/host/poll`.
+  `GET /api/jobs/offers` and `POST /api/host/poll`.
 - **Not affected:** a root run that is already `running` keeps its lease; renew
   and finish continue to work. Disabling never kills a live root. Lease expiry
   and the no-first-action (claimed, not started) expiry continue.

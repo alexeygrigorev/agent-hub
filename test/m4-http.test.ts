@@ -171,15 +171,6 @@ describe('M4 HTTP Endpoints and Worker/Hub Routing', () => {
     // SECURITY CHECK: Verify token hash is never leaked
     expect((dataAlpha.offers[0] as any).claim_token_hash).toBeUndefined();
     expect(JSON.stringify(dataAlpha)).not.toContain('super-secret-token-hash');
-
-    // 3. /api/host/offers alias behaves identically
-    const resHostAlias = await doFetch(new Request('http://example.com/api/host/offers', {
-      headers: { 'Authorization': 'Bearer token_host_alpha' }
-    }));
-    expect(resHostAlias.status).toBe(200);
-    const dataHostAlias = await resHostAlias.json() as any;
-    expect(dataHostAlias.offers.length).toBe(1);
-    expect(dataHostAlias.offers[0].id).toBe('job-alpha-1');
   });
 
   it('job claim enforces machine binding, server gate check, and returns tokens', async () => {

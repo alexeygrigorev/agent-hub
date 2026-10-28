@@ -147,7 +147,7 @@ describe('public machine-bound agent enrollment through real SELF Worker and bou
   expect((await req('/api/agents','POST',{tag:'agent',project:'foreign',role:'ops',machine_id:'pair-node'},c)).status).toBe(201);
   const launch='11111111-1111-4111-8111-111111111111';
   const negatives:any[]=[
-   ['/api/jobs/offers','GET'],['/api/host/offers','GET'],['/api/jobs/host-job','GET'],['/api/jobs/host-job/status','GET'],['/api/root/status','GET'],
+   ['/api/jobs/offers','GET'],['/api/jobs/host-job','GET'],['/api/jobs/host-job/status','GET'],['/api/root/status','GET'],
    ['/api/fleet/offers','GET'],['/api/fleet/claim-policy','GET'],['/api/fleet/accounts','PUT',{accounts:[],routes:[]}],
    ['/api/fleet/sessions','PUT',{sessions:[]}],['/api/fleet/subscriptions','PUT',{}],
    ['/api/fleet/launches/'+launch+'/claim','POST',{}],['/api/fleet/launches/'+launch+'/result','POST',{}],
