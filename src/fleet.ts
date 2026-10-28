@@ -1977,7 +1977,7 @@ export class FleetService {
             this.sql.exec("UPDATE fleet_launches SET request_key = ?, state = 'exited', exit_reason = ?, launch_error_json = ?, verification_status = 'not_started', finished_at = ?, updated_at = ? WHERE id = ?", 'memory-retry-' + row.id, data.reason, JSON.stringify(diagnostic), at, at, row.id);
             this.sql.exec("INSERT INTO fleet_launches (id, actor, requester_kind, parent_id, summary, request_key, request_json, machine_id, engine, account, profile, mode, workspace, prompt, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, '', '', '', NULL, ?, ?, ?, 'queued', ?, ?)", id, row.actor, row.requester_kind, row.parent_id, row.summary, row.request_key, row.request_json, row.mode, row.workspace, row.prompt, row.created_at, at);
             this.memoryHold(row.id, rejected, true); this.memoryHold(id, rejected, true);
-            if (data.reason === 'launcher_disk_reserve') this.sql.exec('UPDATE fleet_launches SET launch_error_json = ? WHERE id = ?', JSON.stringify(diagnostic), id);
+            if (['launcher_disk_reserve', 'launcher_memory_reserve'].includes(data.reason)) this.sql.exec('UPDATE fleet_launches SET launch_error_json = ? WHERE id = ?', JSON.stringify(diagnostic), id);
             // Durable alert exists even if a later heartbeat promotes before cron.
             const alerts = new LivenessService(this.sql); alerts.init();
             alerts.setAlert('launch', row.id, { state: data.reason, detail: JSON.stringify(rejected) });

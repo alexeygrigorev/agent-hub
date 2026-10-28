@@ -651,7 +651,7 @@ describe('generic accounts and launch placement', () => {
     sql.exec("INSERT INTO session_control_sessions (id, actor, request_key, request_json, fleet_launch_id, machine_id, mode, state, created_at, updated_at) VALUES (?, 'test-admin', ?, '{}', ?, NULL, 'headless', 'queued', ?, ?)", sessionId, sessionId, launch.id, iso(), iso());
     const path = '/launches/' + launch.id;
     await s.handle(request(path + '/claim', { gate_allowed: true, model: 'gpt-6.1-sol', observed_at: iso(), account: 'shared-codex', profile_supported: true }), host('hetzner'));
-    const diagnostic = { reason: 'launcher_memory_reserve', message: 'Host memory headroom after launcher reservations is below 10 GiB.', error_type: 'ValueError', exit_code: 1, stage: 'dispatch_headless' };
+    const diagnostic = { reason: 'launcher_memory_reserve', message: 'The launcher refused start: host MemAvailable below 2048MiB floor after reservation (launcher_memory_reserve).', tail: 'ValueError: host MemAvailable below 2048MiB floor after reservation (launcher_memory_reserve)', error_type: 'ValueError', exit_code: 1, stage: 'dispatch_headless' };
     const receipt = { state: 'failed', confirmed_exit: true, reason: diagnostic.reason, diagnostic, launcher_task_id: 'hub-' + launch.id };
     expect((await s.handle(request(path + '/result', { ...receipt, diagnostic: { ...diagnostic, message: 'bad\nmessage' } }), host('hetzner'))).status).toBe(400);
     expect((await s.handle(request(path + '/result', receipt), host('win35'))).status).toBe(404);
@@ -662,7 +662,7 @@ describe('generic accounts and launch placement', () => {
     const sessions = new SessionControlService(sql, cb => cb(), () => now);
     sessions.init();
     const viewed = (sessions as any).view(sql.exec('SELECT * FROM session_control_sessions WHERE id = ?', sessionId).one());
-    expect(viewed).toMatchObject({ state: 'queued', reason: diagnostic.reason, rejected: [expect.objectContaining({ reason: diagnostic.reason, memory: expect.objectContaining({ floor_mb: 2048 }) })] });
+    expect(viewed).toMatchObject({ state: 'queued', reason: diagnostic.reason, launch_error: diagnostic, rejected: [expect.objectContaining({ reason: diagnostic.reason, memory: expect.objectContaining({ floor_mb: 2048 }) })] });
     const retry = sql.exec('SELECT * FROM fleet_launches WHERE id = ?', viewed.fleet_launch_id).one();
     expect(retry.id).not.toBe(launch.id);
     expect(retry.state).toBe('queued');
